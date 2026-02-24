@@ -1,6 +1,7 @@
 mod http;
 mod monitor;
 mod socket;
+mod tokens;
 mod watcher;
 mod worktree;
 
@@ -23,6 +24,9 @@ async fn main() -> anyhow::Result<()> {
     let (monitor_rx, monitor_handle) = monitor::start_monitor(budget_config);
     tracing::info!("resource monitor started");
 
+    let usage_tracker = tokens::UsageTracker::new().start();
+    tracing::info!("usage tracker initialized (JSONL parsing)");
+
     // Shared session store (populated by Swift app via session.sync RPC)
     let sessions: socket::SessionStore = Arc::new(Mutex::new(Vec::new()));
 
@@ -36,10 +40,11 @@ async fn main() -> anyhow::Result<()> {
     let http_monitor_rx = monitor_rx.clone();
     let http_monitor_handle = monitor_handle.clone();
     let http_watcher_handle = watcher_handle.clone();
+    let http_usage_tracker = usage_tracker.clone();
     tokio::spawn(async move {
         if let Err(e) = http::serve(
             http_addr, http_monitor_rx, http_monitor_handle,
-            http_watcher_handle, http_sessions,
+            http_watcher_handle, http_sessions, http_usage_tracker,
         ).await {
             tracing::error!("HTTP server error: {e}");
         }
@@ -47,5 +52,5 @@ async fn main() -> anyhow::Result<()> {
 
     // Unix socket server (main loop)
     let socket_path = socket::default_socket_path();
-    socket::serve(&socket_path, monitor_rx, monitor_handle, watcher_handle, sessions).await
+    socket::serve(&socket_path, monitor_rx, monitor_handle, watcher_handle, sessions, usage_tracker).await
 }

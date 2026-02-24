@@ -220,8 +220,11 @@ struct cmuxApp: App {
                 }
                 InstallUpdateMenuItem(model: appDelegate.updateViewModel)
                 Divider()
-                Button("term-mesh Dashboard") {
+                Button("term-mesh Dashboard (Window)") {
                     DashboardController.shared.showDashboard()
+                }
+                Button("term-mesh Dashboard (Split)") {
+                    openDashboardSplit()
                 }
                 .keyboardShortcut("d", modifiers: [.command, .shift])
                 Toggle("Worktree Sandbox", isOn: Binding(
@@ -753,6 +756,13 @@ struct cmuxApp: App {
             return
         }
         _ = tabManager.createBrowserSplit(direction: direction)
+    }
+
+    private func openDashboardSplit() {
+        let port = ProcessInfo.processInfo.environment["TERM_MESH_HTTP_ADDR"]
+            .flatMap { $0.split(separator: ":").last.map(String.init) } ?? "9876"
+        guard let url = URL(string: "http://localhost:\(port)") else { return }
+        _ = activeTabManager.createBrowserSplit(direction: .right, url: url)
     }
 
     @ViewBuilder

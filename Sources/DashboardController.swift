@@ -1,4 +1,5 @@
 import AppKit
+import UserNotifications
 import WebKit
 
 /// Manages the term-mesh monitoring dashboard in a separate window.
@@ -17,6 +18,11 @@ final class DashboardController: NSObject, WKNavigationDelegate {
 
     /// Project roots currently being watched — keyed by tab ID to avoid duplicates.
     private var watchedProjects: [UUID: String] = [:]
+
+    /// PIDs that we've already sent a notification for (avoid spamming).
+    private var notifiedAlertPIDs: Set<Int32> = []
+    /// Whether we've requested notification permission.
+    private var notificationPermissionRequested = false
 
     /// Reference to the tab manager (set from AppDelegate.configure)
     weak var tabManager: TabManager? {
@@ -46,6 +52,12 @@ final class DashboardController: NSObject, WKNavigationDelegate {
 
         let config = WKWebViewConfiguration()
         config.preferences.setValue(true, forKey: "developerExtrasEnabled")
+
+        // Register native message handlers for process control
+        let handler = DashboardMessageHandler(controller: self)
+        config.userContentController.add(handler, name: "stopProcess")
+        config.userContentController.add(handler, name: "resumeProcess")
+        config.userContentController.add(handler, name: "setAutoStop")
 
         let wv = WKWebView(frame: .zero, configuration: config)
         wv.navigationDelegate = self
@@ -108,10 +120,12 @@ final class DashboardController: NSObject, WKNavigationDelegate {
 
     private func syncTrackingState() {
         DispatchQueue.global(qos: .utility).async { [weak self] in
-            self?.discoverAndTrackDescendants()
+            let descendants = Self.discoverDescendantPIDs()
             DispatchQueue.main.async {
+                self?.reconcileTrackedPIDs(descendants)
                 self?.watchTabProjects()
                 self?.syncSessionsToDaemon()
+                self?.pollAlerts()
             }
         }
     }
@@ -121,6 +135,7 @@ final class DashboardController: NSObject, WKNavigationDelegate {
     private func syncSessionsToDaemon() {
         guard let tabManager else { return }
 
+        let notificationStore = TerminalNotificationStore.shared
         var sessions: [[String: Any]] = []
         for workspace in tabManager.tabs {
             let cwd = workspace.currentDirectory
@@ -136,6 +151,15 @@ final class DashboardController: NSObject, WKNavigationDelegate {
             if let branch = workspace.gitBranch?.branch {
                 session["git_branch"] = branch
             }
+
+            // Agent notification state
+            let hasUnread = notificationStore.unreadCount(forTabId: workspace.id) > 0
+            session["agent_state"] = hasUnread ? "waiting" : "idle"
+            if let latest = notificationStore.latestNotification(forTabId: workspace.id), !latest.isRead {
+                session["notification_title"] = latest.title
+                session["notification_ts"] = Int(latest.createdAt.timeIntervalSince1970 * 1000)
+            }
+
             sessions.append(session)
         }
 
@@ -144,9 +168,83 @@ final class DashboardController: NSObject, WKNavigationDelegate {
         }
     }
 
+    // MARK: - Budget Guard Alerts
+
+    /// Request notification permission (called once).
+    private func requestNotificationPermission() {
+        guard !notificationPermissionRequested else { return }
+        notificationPermissionRequested = true
+        UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound]) { granted, error in
+            if let error {
+                print("[term-mesh] notification permission error: \(error)")
+            } else {
+                print("[term-mesh] notification permission: \(granted ? "granted" : "denied")")
+            }
+        }
+    }
+
+    /// Poll monitor snapshot for alerts and send native notifications for new SIGSTOP events.
+    private func pollAlerts() {
+        requestNotificationPermission()
+
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            let daemon = TermMeshDaemon.shared
+            guard let response = daemon.rpcCallRaw(method: "monitor.snapshot", params: [:]),
+                  let data = response.data(using: .utf8),
+                  let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let alerts = json["alerts"] as? [[String: Any]] else { return }
+
+            DispatchQueue.main.async {
+                self?.processAlerts(alerts)
+            }
+        }
+    }
+
+    /// Process alerts from monitor snapshot and send notifications.
+    private func processAlerts(_ alerts: [[String: Any]]) {
+        for alert in alerts {
+            guard let pid = alert["pid"] as? Int,
+                  let action = alert["action"] as? String,
+                  action == "stopped" else { continue }
+
+            let pid32 = Int32(pid)
+            guard !notifiedAlertPIDs.contains(pid32) else { continue }
+            notifiedAlertPIDs.insert(pid32)
+
+            let name = alert["name"] as? String ?? "unknown"
+            let kind = alert["kind"] as? String ?? "resource"
+            let value = alert["value"] as? Double ?? 0
+            let threshold = alert["threshold"] as? Double ?? 0
+
+            let content = UNMutableNotificationContent()
+            content.title = "Budget Guard: Process Stopped"
+            if kind == "cpu" {
+                content.body = "\(name) (PID \(pid)) stopped — CPU \(String(format: "%.1f", value))% exceeded \(String(format: "%.0f", threshold))% threshold"
+            } else {
+                let valueMB = value / 1024 / 1024
+                let threshMB = threshold / 1024 / 1024
+                content.body = "\(name) (PID \(pid)) stopped — Memory \(String(format: "%.0f", valueMB))MB exceeded \(String(format: "%.0f", threshMB))MB threshold"
+            }
+            content.sound = .default
+
+            let request = UNNotificationRequest(
+                identifier: "budget-guard-\(pid)-\(kind)",
+                content: content,
+                trigger: nil
+            )
+            UNUserNotificationCenter.current().add(request)
+            print("[term-mesh] Budget Guard notification: \(name) (PID \(pid)) stopped for \(kind) threshold")
+        }
+
+        // Clean up notified PIDs for processes no longer in alerts
+        let alertPIDs = Set(alerts.compactMap { ($0["pid"] as? Int).map { Int32($0) } })
+        notifiedAlertPIDs = notifiedAlertPIDs.intersection(alertPIDs)
+    }
+
     // MARK: - Process Discovery
 
-    private func discoverAndTrackDescendants() {
+    /// Discover all descendant PIDs of this app. Safe to call from any thread (no shared state).
+    private static func discoverDescendantPIDs() -> Set<Int32> {
         let appPID = ProcessInfo.processInfo.processIdentifier
 
         let pipe = Pipe()
@@ -159,7 +257,7 @@ final class DashboardController: NSObject, WKNavigationDelegate {
         proc.waitUntilExit()
 
         let data = pipe.fileHandleForReading.readDataToEndOfFile()
-        guard let output = String(data: data, encoding: .utf8) else { return }
+        guard let output = String(data: data, encoding: .utf8) else { return [] }
 
         var children: [Int32: [Int32]] = [:]
         for line in output.split(separator: "\n").dropFirst() {
@@ -181,21 +279,26 @@ final class DashboardController: NSObject, WKNavigationDelegate {
             }
         }
 
+        return allDescendants
+    }
+
+    /// Reconcile tracked PIDs with discovered descendants. Must be called on @MainActor.
+    private func reconcileTrackedPIDs(_ allDescendants: Set<Int32>) {
         let daemon = TermMeshDaemon.shared
-        for pid in allDescendants {
-            if !trackedPIDs.contains(pid) {
+
+        let newPIDs = allDescendants.subtracting(trackedPIDs)
+        for pid in newPIDs {
+            trackedPIDs.insert(pid)
+            DispatchQueue.global(qos: .utility).async {
                 daemon.trackPID(pid)
-                DispatchQueue.main.async { [weak self] in
-                    self?.trackedPIDs.insert(pid)
-                }
             }
         }
 
         let deadPIDs = trackedPIDs.subtracting(allDescendants)
         for pid in deadPIDs {
-            daemon.untrackPID(pid)
-            DispatchQueue.main.async { [weak self] in
-                self?.trackedPIDs.remove(pid)
+            trackedPIDs.remove(pid)
+            DispatchQueue.global(qos: .utility).async {
+                daemon.untrackPID(pid)
             }
         }
     }
@@ -296,6 +399,7 @@ final class DashboardController: NSObject, WKNavigationDelegate {
             let daemon = TermMeshDaemon.shared
             let monitorData = daemon.rpcCallRaw(method: "monitor.snapshot", params: [:])
             let watcherData = daemon.rpcCallRaw(method: "watcher.snapshot", params: [:])
+            let sessionData = daemon.rpcCallRaw(method: "session.list", params: [:])
 
             DispatchQueue.main.async {
                 if let json = monitorData {
@@ -308,7 +412,49 @@ final class DashboardController: NSObject, WKNavigationDelegate {
                         if let error { print("[dashboard] heatmap error: \(error)") }
                     }
                 }
+                if let json = sessionData {
+                    webView.evaluateJavaScript("if(window.updateAgentStatus)updateAgentStatus(\(json));") { _, _ in }
+                }
             }
+        }
+    }
+}
+
+// MARK: - WKWebView Message Handler
+
+/// Handles messages from the dashboard WKWebView for process control.
+/// Must be a separate class (non-@MainActor) to conform to WKScriptMessageHandler.
+private class DashboardMessageHandler: NSObject, WKScriptMessageHandler {
+    weak var controller: DashboardController?
+
+    init(controller: DashboardController) {
+        self.controller = controller
+    }
+
+    func userContentController(_ userContentController: WKUserContentController,
+                               didReceive message: WKScriptMessage) {
+        let daemon = TermMeshDaemon.shared
+        switch message.name {
+        case "stopProcess":
+            if let pid = message.body as? Int {
+                DispatchQueue.global(qos: .utility).async {
+                    let _ = daemon.stopProcess(pid: Int32(pid))
+                }
+            }
+        case "resumeProcess":
+            if let pid = message.body as? Int {
+                DispatchQueue.global(qos: .utility).async {
+                    let _ = daemon.resumeProcess(pid: Int32(pid))
+                }
+            }
+        case "setAutoStop":
+            if let enabled = message.body as? Bool {
+                DispatchQueue.global(qos: .utility).async {
+                    daemon.setAutoStop(enabled: enabled)
+                }
+            }
+        default:
+            break
         }
     }
 }

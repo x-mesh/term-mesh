@@ -26,8 +26,17 @@ final class TermMeshDaemon {
         queue.async { [weak self] in
             guard let self else { return }
 
-            // Already running?
+            // Already running (tracked process)?
             if let proc = self.daemonProcess, proc.isRunning { return }
+
+            // Already running (orphaned from previous app launch)? Reuse it.
+            if self.ping() {
+                print("[term-mesh] daemon already running on socket, reusing")
+                return
+            }
+
+            // Clean up stale socket before starting
+            try? FileManager.default.removeItem(atPath: self.socketPath)
 
             // Find the daemon binary next to the app bundle, or in the daemon build dir
             let binaryPath = self.daemonBinaryPath()
@@ -101,6 +110,39 @@ final class TermMeshDaemon {
     /// Untrack a process.
     func untrackPID(_ pid: Int32) {
         let _ = rpcCall(method: "monitor.untrack", params: ["pid": pid])
+    }
+
+    // MARK: - Budget Guard (F-03/F-04)
+
+    /// Send SIGSTOP to a process via the daemon.
+    func stopProcess(pid: Int32) -> Bool {
+        guard let response = rpcCall(method: "process.stop", params: ["pid": pid]) as? [String: Any] else { return false }
+        return response["stopped"] as? Bool ?? false
+    }
+
+    /// Send SIGCONT to resume a stopped process via the daemon.
+    func resumeProcess(pid: Int32) -> Bool {
+        guard let response = rpcCall(method: "process.resume", params: ["pid": pid]) as? [String: Any] else { return false }
+        return response["resumed"] as? Bool ?? false
+    }
+
+    /// Enable/disable auto-stop when budget thresholds are exceeded.
+    func setAutoStop(enabled: Bool) {
+        let _ = rpcCall(method: "budget.auto_stop", params: ["enabled": enabled])
+    }
+
+    // MARK: - Token Tracking (F-03/F-04)
+
+    /// Report terminal output text for token counting.
+    /// Accumulates tokens for the given PID.
+    func reportTokens(pid: Int32, text: String) {
+        let _ = rpcCall(method: "tokens.report", params: ["pid": pid, "text": text])
+    }
+
+    /// Get token snapshot for all tracked PIDs.
+    func tokenSnapshot() -> [[String: Any]] {
+        guard let response = rpcCall(method: "tokens.snapshot", params: [:]) as? [[String: Any]] else { return [] }
+        return response
     }
 
     // MARK: - Watcher (F-05)

@@ -21,6 +21,10 @@ serde_json = "1"
 
 # Resource monitoring (F-03/F-04)
 sysinfo = "0.33"
+libc = "0.2"
+
+# JSONL usage tracking (F-03/F-04 Budget Guard)
+# Uses Claude Code's local JSONL logs for real token/cost data
 
 # File watching (F-05)
 notify = "7"

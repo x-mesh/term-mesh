@@ -11,6 +11,7 @@ pub struct ProcessSnapshot {
     pub name: String,
     pub cpu_percent: f32,
     pub memory_bytes: u64,
+    pub stopped: bool,
 }
 
 /// System-wide resource snapshot.
@@ -29,15 +30,18 @@ pub struct SystemSnapshot {
 #[derive(Debug, Clone, Serialize)]
 pub struct BudgetAlert {
     pub pid: u32,
+    pub name: String,
     pub kind: String, // "cpu" | "memory"
     pub value: f64,
     pub threshold: f64,
+    pub action: String, // "warning" | "stopped"
 }
 
 #[derive(Debug, Clone)]
 pub struct BudgetConfig {
     pub cpu_threshold_percent: f32,
     pub memory_threshold_bytes: u64,
+    pub auto_stop: bool,
 }
 
 impl Default for BudgetConfig {
@@ -45,6 +49,7 @@ impl Default for BudgetConfig {
         Self {
             cpu_threshold_percent: 90.0,
             memory_threshold_bytes: 4 * 1024 * 1024 * 1024, // 4 GB
+            auto_stop: true,
         }
     }
 }
@@ -87,6 +92,11 @@ fn find_descendants(sys: &System, root_pid: u32) -> HashSet<u32> {
     result
 }
 
+/// Send a Unix signal to a process. Returns true on success.
+fn send_signal(pid: u32, signal: i32) -> bool {
+    unsafe { libc::kill(pid as i32, signal) == 0 }
+}
+
 /// Start background resource monitor with auto-process-discovery.
 /// Watch paths are managed separately by the Swift app (per terminal tab).
 pub fn start_monitor(
@@ -95,8 +105,14 @@ pub fn start_monitor(
     let (tx, rx) = watch::channel(None);
     let handle = MonitorHandle {
         tracked_pids: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+        stopped_pids: std::sync::Arc::new(std::sync::Mutex::new(HashSet::new())),
+        auto_stop: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(config.auto_stop)),
+        cpu_threshold: config.cpu_threshold_percent,
+        memory_threshold: config.memory_threshold_bytes,
     };
     let pids = handle.tracked_pids.clone();
+    let stopped = handle.stopped_pids.clone();
+    let auto_stop = handle.auto_stop.clone();
     let daemon_pid = std::process::id();
 
     tokio::spawn(async move {
@@ -130,7 +146,15 @@ pub fn start_monitor(
                 tracked.retain(|&pid| sys.process(Pid::from_u32(pid)).is_some());
             }
 
+            // Clean up stopped set for dead processes
+            {
+                let mut stopped_set = stopped.lock().unwrap();
+                stopped_set.retain(|&pid| sys.process(Pid::from_u32(pid)).is_some());
+            }
+
             let tracked: Vec<u32> = pids.lock().unwrap().clone();
+            let stopped_set: HashSet<u32> = stopped.lock().unwrap().clone();
+            let should_auto_stop = auto_stop.load(std::sync::atomic::Ordering::Relaxed);
 
             let mut processes = Vec::new();
             let mut alerts = Vec::new();
@@ -139,27 +163,60 @@ pub fn start_monitor(
                 if let Some(proc) = sys.process(Pid::from_u32(pid)) {
                     let cpu = proc.cpu_usage();
                     let mem = proc.memory();
+                    let is_stopped = stopped_set.contains(&pid);
+                    let name = proc.name().to_string_lossy().into_owned();
+
                     processes.push(ProcessSnapshot {
                         pid,
-                        name: proc.name().to_string_lossy().into_owned(),
+                        name: name.clone(),
                         cpu_percent: cpu,
                         memory_bytes: mem,
+                        stopped: is_stopped,
                     });
 
+                    // Skip threshold checks for already-stopped processes
+                    if is_stopped { continue; }
+
                     if cpu > config.cpu_threshold_percent {
+                        let action = if should_auto_stop {
+                            if send_signal(pid, libc::SIGSTOP) {
+                                stopped.lock().unwrap().insert(pid);
+                                tracing::warn!("SIGSTOP sent to PID {pid} ({name}): CPU {cpu:.1}% > {:.1}%", config.cpu_threshold_percent);
+                                "stopped"
+                            } else {
+                                "warning"
+                            }
+                        } else {
+                            "warning"
+                        };
                         alerts.push(BudgetAlert {
                             pid,
+                            name: name.clone(),
                             kind: "cpu".into(),
                             value: cpu as f64,
                             threshold: config.cpu_threshold_percent as f64,
+                            action: action.into(),
                         });
                     }
                     if mem > config.memory_threshold_bytes {
+                        let action = if should_auto_stop {
+                            if send_signal(pid, libc::SIGSTOP) {
+                                stopped.lock().unwrap().insert(pid);
+                                tracing::warn!("SIGSTOP sent to PID {pid} ({name}): mem {mem} > {}", config.memory_threshold_bytes);
+                                "stopped"
+                            } else {
+                                "warning"
+                            }
+                        } else {
+                            "warning"
+                        };
                         alerts.push(BudgetAlert {
                             pid,
+                            name: name.clone(),
                             kind: "memory".into(),
                             value: mem as f64,
                             threshold: config.memory_threshold_bytes as f64,
+                            action: action.into(),
                         });
                     }
                 }
@@ -184,10 +241,14 @@ pub fn start_monitor(
     (rx, handle)
 }
 
-/// Handle to add/remove tracked PIDs.
+/// Handle to add/remove tracked PIDs and control process signals.
 #[derive(Clone)]
 pub struct MonitorHandle {
     tracked_pids: std::sync::Arc<std::sync::Mutex<Vec<u32>>>,
+    stopped_pids: std::sync::Arc<std::sync::Mutex<HashSet<u32>>>,
+    auto_stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    cpu_threshold: f32,
+    memory_threshold: u64,
 }
 
 impl MonitorHandle {
@@ -207,5 +268,47 @@ impl MonitorHandle {
 
     pub fn tracked_pids(&self) -> Vec<u32> {
         self.tracked_pids.lock().unwrap().clone()
+    }
+
+    /// Send SIGSTOP to a process.
+    pub fn stop_process(&self, pid: u32) -> bool {
+        if send_signal(pid, libc::SIGSTOP) {
+            self.stopped_pids.lock().unwrap().insert(pid);
+            tracing::warn!("manual SIGSTOP sent to PID {pid}");
+            true
+        } else {
+            tracing::error!("failed to SIGSTOP PID {pid}");
+            false
+        }
+    }
+
+    /// Send SIGCONT to resume a stopped process.
+    pub fn resume_process(&self, pid: u32) -> bool {
+        if send_signal(pid, libc::SIGCONT) {
+            self.stopped_pids.lock().unwrap().remove(&pid);
+            tracing::info!("SIGCONT sent to PID {pid}");
+            true
+        } else {
+            tracing::error!("failed to SIGCONT PID {pid}");
+            false
+        }
+    }
+
+    /// Set auto-stop mode.
+    pub fn set_auto_stop(&self, enabled: bool) {
+        self.auto_stop.store(enabled, std::sync::atomic::Ordering::Relaxed);
+        tracing::info!("auto-stop set to {enabled}");
+    }
+
+    pub fn is_auto_stop(&self) -> bool {
+        self.auto_stop.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub fn cpu_threshold(&self) -> f32 {
+        self.cpu_threshold
+    }
+
+    pub fn memory_threshold(&self) -> u64 {
+        self.memory_threshold
     }
 }

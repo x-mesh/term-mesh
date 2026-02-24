@@ -1202,6 +1202,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "term-mesh-cli"
+version = "0.1.0"
+dependencies = [
+ "libc",
+]
+
+[[package]]
 name = "term-meshd"
 version = "0.1.0"
 dependencies = [
@@ -1209,6 +1216,7 @@ dependencies = [
  "axum",
  "dirs",
  "git2",
+ "libc",
  "notify",
  "serde",
  "serde_json",

@@ -6,6 +6,7 @@ use tokio::net::UnixListener;
 use tokio::sync::watch;
 
 use crate::monitor::{MonitorHandle, SystemSnapshot};
+use crate::tokens::UsageTracker;
 use crate::watcher::WatcherHandle;
 use crate::worktree;
 
@@ -42,6 +43,15 @@ pub struct SessionInfo {
     pub project_path: String,
     #[serde(default)]
     pub git_branch: Option<String>,
+    /// Agent notification state: "idle" | "waiting" (has unread notification)
+    #[serde(default)]
+    pub agent_state: Option<String>,
+    /// Notification title (e.g., agent command that completed)
+    #[serde(default)]
+    pub notification_title: Option<String>,
+    /// Timestamp of last notification (ms since epoch)
+    #[serde(default)]
+    pub notification_ts: Option<u64>,
 }
 
 /// Shared session store.
@@ -53,6 +63,7 @@ pub struct Context {
     pub monitor_handle: MonitorHandle,
     pub watcher_handle: WatcherHandle,
     pub sessions: SessionStore,
+    pub usage_tracker: UsageTracker,
 }
 
 pub fn default_socket_path() -> PathBuf {
@@ -68,6 +79,7 @@ pub async fn serve(
     monitor_handle: MonitorHandle,
     watcher_handle: WatcherHandle,
     sessions: SessionStore,
+    usage_tracker: UsageTracker,
 ) -> anyhow::Result<()> {
     if path.exists() {
         std::fs::remove_file(path)?;
@@ -81,6 +93,7 @@ pub async fn serve(
         monitor_handle,
         watcher_handle,
         sessions,
+        usage_tracker,
     });
 
     loop {
@@ -167,7 +180,22 @@ async fn dispatch(req: &Request, ctx: &Context) -> Response {
         "monitor.snapshot" => {
             let snapshot = ctx.monitor_rx.borrow().clone();
             match snapshot {
-                Some(s) => Ok(serde_json::to_value(s).unwrap()),
+                Some(s) => {
+                    let usage = ctx.usage_tracker.snapshot();
+                    let mut value = serde_json::to_value(s).unwrap();
+                    value["usage_summary"] = serde_json::json!({
+                        "total_cost_usd": usage.total_cost_usd,
+                        "active_sessions": usage.sessions.len(),
+                        "total_input_tokens": usage.total_input_tokens,
+                        "total_output_tokens": usage.total_output_tokens,
+                    });
+                    value["budget_config"] = serde_json::json!({
+                        "cpu_threshold_percent": ctx.monitor_handle.cpu_threshold(),
+                        "memory_threshold_bytes": ctx.monitor_handle.memory_threshold(),
+                        "auto_stop": ctx.monitor_handle.is_auto_stop(),
+                    });
+                    Ok(value)
+                }
                 None => Ok(serde_json::json!(null)),
             }
         }
@@ -191,6 +219,39 @@ async fn dispatch(req: &Request, ctx: &Context) -> Response {
             let pids = ctx.monitor_handle.tracked_pids();
             Ok(serde_json::to_value(pids).unwrap())
         }
+        "process.stop" => {
+            #[derive(Deserialize)]
+            struct StopParams { pid: u32 }
+            match serde_json::from_value::<StopParams>(req.params.clone()) {
+                Ok(p) => {
+                    let ok = ctx.monitor_handle.stop_process(p.pid);
+                    Ok(serde_json::json!({"stopped": ok, "pid": p.pid}))
+                }
+                Err(e) => Err(format!("invalid params: {e}")),
+            }
+        }
+        "process.resume" => {
+            #[derive(Deserialize)]
+            struct ResumeParams { pid: u32 }
+            match serde_json::from_value::<ResumeParams>(req.params.clone()) {
+                Ok(p) => {
+                    let ok = ctx.monitor_handle.resume_process(p.pid);
+                    Ok(serde_json::json!({"resumed": ok, "pid": p.pid}))
+                }
+                Err(e) => Err(format!("invalid params: {e}")),
+            }
+        }
+        "budget.auto_stop" => {
+            #[derive(Deserialize)]
+            struct AutoStopParams { enabled: bool }
+            match serde_json::from_value::<AutoStopParams>(req.params.clone()) {
+                Ok(p) => {
+                    ctx.monitor_handle.set_auto_stop(p.enabled);
+                    Ok(serde_json::json!({"auto_stop": p.enabled}))
+                }
+                Err(e) => Err(format!("invalid params: {e}")),
+            }
+        }
 
         // --- File Watcher (F-05) ---
         "watcher.watch" => {
@@ -212,6 +273,18 @@ async fn dispatch(req: &Request, ctx: &Context) -> Response {
         "watcher.snapshot" => {
             let snapshot = ctx.watcher_handle.snapshot();
             Ok(serde_json::to_value(snapshot).unwrap())
+        }
+
+        // --- Usage Tracker (F-03/F-04) — JSONL-based real API usage ---
+        "usage.snapshot" => {
+            let snapshot = ctx.usage_tracker.snapshot();
+            Ok(serde_json::to_value(snapshot).unwrap())
+        }
+        "usage.scan" => {
+            match ctx.usage_tracker.scan_all() {
+                Ok(_) => Ok(serde_json::json!("ok")),
+                Err(e) => Err(format!("scan error: {e}")),
+            }
         }
 
         _ => Err(format!("unknown method: {}", req.method)),

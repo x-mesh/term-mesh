@@ -14,6 +14,7 @@ use tower_http::cors::CorsLayer;
 
 use crate::monitor::{MonitorHandle, SystemSnapshot};
 use crate::socket::SessionStore;
+use crate::tokens::UsageTracker;
 use crate::watcher::WatcherHandle;
 
 pub struct HttpState {
@@ -22,6 +23,7 @@ pub struct HttpState {
     pub monitor_handle: MonitorHandle,
     pub watcher_handle: WatcherHandle,
     pub sessions: SessionStore,
+    pub usage_tracker: UsageTracker,
     pub dashboard_dir: Option<PathBuf>,
 }
 
@@ -31,6 +33,7 @@ pub async fn serve(
     monitor_handle: MonitorHandle,
     watcher_handle: WatcherHandle,
     sessions: SessionStore,
+    usage_tracker: UsageTracker,
 ) -> anyhow::Result<()> {
     let dashboard_dir = find_dashboard_dir();
 
@@ -39,6 +42,7 @@ pub async fn serve(
         monitor_handle,
         watcher_handle,
         sessions,
+        usage_tracker,
         dashboard_dir,
     });
 
@@ -49,6 +53,10 @@ pub async fn serve(
         .route("/api/watcher", get(watcher_handler))
         .route("/api/watcher/watch", post(watch_handler))
         .route("/api/watcher/unwatch", post(unwatch_handler))
+        .route("/api/process/stop", post(process_stop_handler))
+        .route("/api/process/resume", post(process_resume_handler))
+        .route("/api/usage", get(usage_handler))
+        .route("/api/budget/auto-stop", post(budget_auto_stop_handler))
         .layer(CorsLayer::permissive())
         .with_state(state);
 
@@ -79,7 +87,22 @@ async fn sessions_handler(State(state): State<Arc<HttpState>>) -> impl IntoRespo
 async fn monitor_handler(State(state): State<Arc<HttpState>>) -> impl IntoResponse {
     let snapshot = state.monitor_rx.borrow().clone();
     match snapshot {
-        Some(s) => Json(serde_json::to_value(s).unwrap()).into_response(),
+        Some(s) => {
+            let usage = state.usage_tracker.snapshot();
+            let mut value = serde_json::to_value(s).unwrap();
+            value["usage_summary"] = serde_json::json!({
+                "total_cost_usd": usage.total_cost_usd,
+                "active_sessions": usage.sessions.len(),
+                "total_input_tokens": usage.total_input_tokens,
+                "total_output_tokens": usage.total_output_tokens,
+            });
+            value["budget_config"] = serde_json::json!({
+                "cpu_threshold_percent": state.monitor_handle.cpu_threshold(),
+                "memory_threshold_bytes": state.monitor_handle.memory_threshold(),
+                "auto_stop": state.monitor_handle.is_auto_stop(),
+            });
+            Json(value).into_response()
+        }
         None => (StatusCode::SERVICE_UNAVAILABLE, "monitor not ready").into_response(),
     }
 }
@@ -110,6 +133,45 @@ async fn unwatch_handler(
     Json(serde_json::json!({"status": "ok", "unwatched": req.path}))
 }
 
+#[derive(Deserialize)]
+struct ProcessRequest {
+    pid: u32,
+}
+
+async fn process_stop_handler(
+    State(state): State<Arc<HttpState>>,
+    Json(req): Json<ProcessRequest>,
+) -> impl IntoResponse {
+    let ok = state.monitor_handle.stop_process(req.pid);
+    Json(serde_json::json!({"stopped": ok, "pid": req.pid}))
+}
+
+async fn process_resume_handler(
+    State(state): State<Arc<HttpState>>,
+    Json(req): Json<ProcessRequest>,
+) -> impl IntoResponse {
+    let ok = state.monitor_handle.resume_process(req.pid);
+    Json(serde_json::json!({"resumed": ok, "pid": req.pid}))
+}
+
+#[derive(Deserialize)]
+struct AutoStopRequest {
+    enabled: bool,
+}
+
+async fn budget_auto_stop_handler(
+    State(state): State<Arc<HttpState>>,
+    Json(req): Json<AutoStopRequest>,
+) -> impl IntoResponse {
+    state.monitor_handle.set_auto_stop(req.enabled);
+    Json(serde_json::json!({"auto_stop": req.enabled}))
+}
+
+async fn usage_handler(State(state): State<Arc<HttpState>>) -> impl IntoResponse {
+    let snapshot = state.usage_tracker.snapshot();
+    Json(serde_json::to_value(snapshot).unwrap())
+}
+
 fn find_dashboard_dir() -> Option<PathBuf> {
     if let Ok(project_dir) = std::env::var("CMUX_PROJECT_DIR") {
         let path = PathBuf::from(project_dir).join("Resources/dashboard");
@@ -138,14 +200,20 @@ const HTTP_POLL_SCRIPT: &str = r#"<script>
 
   async function poll() {
     try {
-      const [monitorRes, watcherRes, sessionsRes] = await Promise.all([
+      const [monitorRes, watcherRes, sessionsRes, usageRes] = await Promise.all([
         fetch(baseUrl + '/api/monitor'),
         fetch(baseUrl + '/api/watcher'),
         fetch(baseUrl + '/api/sessions'),
+        fetch(baseUrl + '/api/usage'),
       ]);
       if (monitorRes.ok) updateMonitor(await monitorRes.json());
       if (watcherRes.ok) updateHeatmap(await watcherRes.json());
-      if (sessionsRes.ok) updateSessionPicker(await sessionsRes.json());
+      if (sessionsRes.ok) {
+        const sessionsData = await sessionsRes.json();
+        updateSessionPicker(sessionsData);
+        if (window.updateAgentStatus) updateAgentStatus(sessionsData);
+      }
+      if (usageRes.ok && window.updateUsage) updateUsage(await usageRes.json());
     } catch (e) {
       document.getElementById('status').textContent = 'disconnected';
     }
