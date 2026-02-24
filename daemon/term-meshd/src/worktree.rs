@@ -183,6 +183,53 @@ fn worktree_branch(repo: &Repository, wt_name: &str) -> String {
     }
 }
 
+/// Detect orphan worktrees left behind by crashed sessions.
+/// Scans common project directories for `term-mesh_wt_*` directories.
+/// Does NOT auto-delete — only logs warnings so the user or admin can investigate.
+pub fn detect_orphan_worktrees() {
+    let home = match dirs::home_dir() {
+        Some(h) => h,
+        None => return,
+    };
+
+    let search_dirs = [
+        home.join("work"),
+        home.join("projects"),
+        home.join("dev"),
+        home.join("src"),
+        home.clone(),
+    ];
+
+    let mut orphans = Vec::new();
+
+    for dir in &search_dirs {
+        if !dir.is_dir() {
+            continue;
+        }
+        if let Ok(entries) = std::fs::read_dir(dir) {
+            for entry in entries.flatten() {
+                let name = entry.file_name();
+                let name_str = name.to_string_lossy();
+                if name_str.starts_with("term-mesh_wt_") && entry.path().is_dir() {
+                    orphans.push(entry.path());
+                }
+            }
+        }
+    }
+
+    if orphans.is_empty() {
+        tracing::debug!("no orphan worktrees detected");
+    } else {
+        tracing::warn!(
+            "detected {} orphan worktree(s) — manual cleanup may be needed:",
+            orphans.len()
+        );
+        for path in &orphans {
+            tracing::warn!("  orphan: {}", path.display());
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

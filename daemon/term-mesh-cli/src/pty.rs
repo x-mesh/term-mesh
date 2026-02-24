@@ -6,7 +6,9 @@ use std::sync::Arc;
 use std::thread;
 
 /// Run a command inside a PTY, forwarding all I/O.
-pub fn run_with_pty(cmd: &str, args: &[&str]) -> Result<i32, String> {
+/// Returns (exit_code, child_pid).
+/// If `cwd` is Some, the child process changes to that directory before exec.
+pub fn run_with_pty(cmd: &str, args: &[&str], cwd: Option<&str>) -> Result<(i32, u32), String> {
     // Open a PTY pair
     let (master_fd, slave_fd) = open_pty().map_err(|e| format!("openpty: {}", e))?;
 
@@ -37,6 +39,15 @@ pub fn run_with_pty(cmd: &str, args: &[&str]) -> Result<i32, String> {
             drop(slave_fd);
         }
 
+        // Change working directory if requested
+        if let Some(dir) = cwd {
+            let c_dir = CString::new(dir).unwrap();
+            if unsafe { libc::chdir(c_dir.as_ptr()) } != 0 {
+                eprintln!("term-mesh: failed to chdir to '{}': {}", dir, io::Error::last_os_error());
+                unsafe { libc::_exit(126) };
+            }
+        }
+
         // Exec the command
         let c_cmd = CString::new(cmd).unwrap();
         let mut c_args: Vec<CString> = vec![c_cmd.clone()];
@@ -58,6 +69,7 @@ pub fn run_with_pty(cmd: &str, args: &[&str]) -> Result<i32, String> {
     }
 
     // ── Parent process ──
+    let child_pid = pid as u32;
     drop(slave_fd);
 
     // Set terminal to raw mode
@@ -123,7 +135,7 @@ pub fn run_with_pty(cmd: &str, args: &[&str]) -> Result<i32, String> {
         restore_termios(libc::STDIN_FILENO, &termios);
     }
 
-    Ok(exit_code)
+    Ok((exit_code, child_pid))
 }
 
 /// Open a PTY master/slave pair.

@@ -304,6 +304,23 @@ impl MonitorHandle {
         self.auto_stop.load(std::sync::atomic::Ordering::Relaxed)
     }
 
+    /// Resume all stopped processes (SIGCONT) and clear the stopped set.
+    /// Used during graceful shutdown to avoid leaving orphaned stopped processes.
+    pub fn resume_all_stopped(&self) -> usize {
+        let mut stopped = self.stopped_pids.lock().unwrap();
+        let mut resumed = 0;
+        for &pid in stopped.iter() {
+            if send_signal(pid, libc::SIGCONT) {
+                tracing::info!("shutdown: SIGCONT sent to PID {pid}");
+                resumed += 1;
+            } else {
+                tracing::warn!("shutdown: failed to SIGCONT PID {pid} (may have exited)");
+            }
+        }
+        stopped.clear();
+        resumed
+    }
+
     pub fn cpu_threshold(&self) -> f32 {
         self.cpu_threshold
     }
@@ -386,6 +403,26 @@ mod tests {
 
         handle.untrack_pid(5678);
         assert!(handle.tracked_pids().is_empty());
+    }
+
+    #[test]
+    fn monitor_handle_resume_all_stopped() {
+        let handle = MonitorHandle {
+            tracked_pids: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+            stopped_pids: std::sync::Arc::new(std::sync::Mutex::new(HashSet::new())),
+            auto_stop: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            cpu_threshold: 90.0,
+            memory_threshold: 4 * 1024 * 1024 * 1024,
+        };
+
+        // Manually insert fake PIDs into stopped set
+        handle.stopped_pids.lock().unwrap().insert(99999);
+        handle.stopped_pids.lock().unwrap().insert(99998);
+        assert_eq!(handle.stopped_pids.lock().unwrap().len(), 2);
+
+        // resume_all_stopped should clear the set (signals will fail for fake PIDs, that's fine)
+        let _resumed = handle.resume_all_stopped();
+        assert!(handle.stopped_pids.lock().unwrap().is_empty());
     }
 
     #[test]

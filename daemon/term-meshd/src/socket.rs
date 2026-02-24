@@ -74,18 +74,19 @@ pub fn default_socket_path() -> PathBuf {
 }
 
 pub async fn serve(
-    path: &PathBuf,
+    path: PathBuf,
     monitor_rx: watch::Receiver<Option<SystemSnapshot>>,
     monitor_handle: MonitorHandle,
     watcher_handle: WatcherHandle,
     sessions: SessionStore,
     usage_tracker: UsageTracker,
+    mut shutdown_rx: watch::Receiver<bool>,
 ) -> anyhow::Result<()> {
     if path.exists() {
-        std::fs::remove_file(path)?;
+        std::fs::remove_file(&path)?;
     }
 
-    let listener = UnixListener::bind(path)?;
+    let listener = UnixListener::bind(&path)?;
     tracing::info!("listening on {}", path.display());
 
     let ctx = Arc::new(Context {
@@ -97,14 +98,39 @@ pub async fn serve(
     });
 
     loop {
-        let (stream, _) = listener.accept().await?;
-        let ctx = ctx.clone();
-        tokio::spawn(async move {
-            if let Err(e) = handle_connection(stream, &ctx).await {
-                tracing::error!("connection error: {e}");
+        tokio::select! {
+            result = listener.accept() => {
+                match result {
+                    Ok((stream, _)) => {
+                        let ctx = ctx.clone();
+                        tokio::spawn(async move {
+                            if let Err(e) = handle_connection(stream, &ctx).await {
+                                tracing::error!("connection error: {e}");
+                            }
+                        });
+                    }
+                    Err(e) => {
+                        tracing::error!("accept error: {e}");
+                    }
+                }
             }
-        });
+            _ = shutdown_rx.changed() => {
+                tracing::info!("socket server shutting down");
+                break;
+            }
+        }
     }
+
+    // Clean up socket file
+    if path.exists() {
+        if let Err(e) = std::fs::remove_file(&path) {
+            tracing::warn!("failed to remove socket file: {e}");
+        } else {
+            tracing::info!("removed socket file {}", path.display());
+        }
+    }
+
+    Ok(())
 }
 
 async fn handle_connection(

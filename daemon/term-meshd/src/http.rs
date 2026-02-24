@@ -34,6 +34,7 @@ pub async fn serve(
     watcher_handle: WatcherHandle,
     sessions: SessionStore,
     usage_tracker: UsageTracker,
+    mut shutdown_rx: watch::Receiver<bool>,
 ) -> anyhow::Result<()> {
     let dashboard_dir = find_dashboard_dir();
 
@@ -63,7 +64,12 @@ pub async fn serve(
     let listener = tokio::net::TcpListener::bind(addr).await?;
     tracing::info!("HTTP dashboard listening on http://{}", addr);
 
-    axum::serve(listener, app).await?;
+    axum::serve(listener, app)
+        .with_graceful_shutdown(async move {
+            let _ = shutdown_rx.changed().await;
+            tracing::info!("HTTP server shutting down");
+        })
+        .await?;
     Ok(())
 }
 
