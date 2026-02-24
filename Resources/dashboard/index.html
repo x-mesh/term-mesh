@@ -135,6 +135,46 @@
     font-size: 12px;
   }
   .alert .pid { color: var(--danger); font-weight: 600; }
+  .alert.warning { background: rgba(240, 165, 0, 0.15); border-color: #f0a500; }
+  .alert.warning .pid { color: #f0a500; }
+  .alert .action-badge {
+    display: inline-block;
+    padding: 1px 6px;
+    border-radius: 3px;
+    font-size: 10px;
+    font-weight: 600;
+    text-transform: uppercase;
+    margin-left: 6px;
+  }
+  .alert .action-badge.stopped { background: var(--danger); color: #fff; }
+  .alert .action-badge.warning { background: #f0a500; color: #1a1a2e; }
+  /* Process controls */
+  .proc-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 4px 0;
+    border-bottom: 1px solid rgba(255,255,255,0.05);
+  }
+  .proc-info { flex: 1; }
+  .proc-status { font-size: 10px; font-weight: 600; text-transform: uppercase; margin-left: 8px; }
+  .proc-status.running { color: var(--success); }
+  .proc-status.stopped { color: var(--danger); }
+  .proc-btn {
+    background: none;
+    border: 1px solid var(--border);
+    color: var(--text);
+    padding: 2px 8px;
+    border-radius: 3px;
+    font-size: 10px;
+    cursor: pointer;
+    margin-left: 4px;
+  }
+  .proc-btn:hover { border-color: var(--accent); color: var(--accent); }
+  .proc-btn.stop { border-color: var(--danger); color: var(--danger); }
+  .proc-btn.stop:hover { background: rgba(233,69,96,0.15); }
+  .proc-btn.resume { border-color: var(--success); color: var(--success); }
+  .proc-btn.resume:hover { background: rgba(0,200,151,0.15); }
   /* Event log */
   .event-log {
     max-height: 160px;
@@ -153,6 +193,165 @@
   .event .kind.modify { color: var(--accent); }
   .event .kind.remove { color: var(--danger); }
   .event .path { color: var(--text-dim); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  /* Folder tree heatmap */
+  .tree-node { font-family: 'SF Mono', 'Menlo', monospace; font-size: 11px; }
+  .tree-dir {
+    cursor: pointer;
+    padding: 2px 0;
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    user-select: none;
+  }
+  .tree-dir:hover { color: var(--accent); }
+  .tree-dir .arrow {
+    display: inline-block;
+    width: 12px;
+    text-align: center;
+    font-size: 9px;
+    color: var(--text-dim);
+    transition: transform 0.15s;
+  }
+  .tree-dir .arrow.open { transform: rotate(90deg); }
+  .tree-dir .dir-name { color: var(--text); font-weight: 500; }
+  .tree-dir .dir-count {
+    margin-left: auto;
+    font-size: 10px;
+    font-variant-numeric: tabular-nums;
+    padding: 0 4px;
+    border-radius: 3px;
+  }
+  .tree-children { padding-left: 16px; }
+  .tree-children.collapsed { display: none; }
+  .tree-file {
+    padding: 1px 0 1px 16px;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+  }
+  .tree-file .file-name {
+    color: var(--text-dim);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    flex: 1;
+  }
+  .tree-file .file-heat {
+    width: 60px;
+    height: 4px;
+    background: rgba(255,255,255,0.05);
+    border-radius: 2px;
+    overflow: hidden;
+  }
+  .tree-file .file-heat-fill {
+    height: 100%;
+    border-radius: 2px;
+  }
+  .tree-file .file-count {
+    font-size: 10px;
+    font-variant-numeric: tabular-nums;
+    min-width: 24px;
+    text-align: right;
+    color: var(--text-dim);
+  }
+  /* Budget gauge */
+  .budget-gauge {
+    margin-bottom: 6px;
+  }
+  .budget-gauge-header {
+    display: flex;
+    justify-content: space-between;
+    font-size: 11px;
+    margin-bottom: 2px;
+  }
+  .budget-gauge-bar {
+    height: 8px;
+    background: rgba(255,255,255,0.05);
+    border-radius: 4px;
+    overflow: hidden;
+  }
+  .budget-gauge-fill {
+    height: 100%;
+    border-radius: 4px;
+    transition: width 0.3s ease, background 0.3s ease;
+  }
+  .budget-toggle {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin: 8px 0 4px;
+    font-size: 11px;
+  }
+  .toggle-switch {
+    position: relative;
+    width: 32px;
+    height: 18px;
+    cursor: pointer;
+  }
+  .toggle-switch input { opacity: 0; width: 0; height: 0; }
+  .toggle-slider {
+    position: absolute;
+    inset: 0;
+    background: var(--border);
+    border-radius: 9px;
+    transition: 0.2s;
+  }
+  .toggle-slider:before {
+    content: "";
+    position: absolute;
+    height: 14px;
+    width: 14px;
+    left: 2px;
+    bottom: 2px;
+    background: var(--text);
+    border-radius: 50%;
+    transition: 0.2s;
+  }
+  .toggle-switch input:checked + .toggle-slider { background: var(--accent); }
+  .toggle-switch input:checked + .toggle-slider:before { transform: translateX(14px); }
+  /* Agent status */
+  .agent-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 4px 0;
+    border-bottom: 1px solid rgba(255,255,255,0.05);
+  }
+  .agent-dot {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    flex-shrink: 0;
+  }
+  .agent-dot.waiting {
+    background: var(--accent);
+    box-shadow: 0 0 6px var(--accent);
+    animation: pulse 1.5s ease-in-out infinite;
+  }
+  .agent-dot.idle { background: var(--text-dim); }
+  @keyframes pulse {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0.4; }
+  }
+  .agent-name { font-weight: 500; flex: 1; }
+  .agent-badge {
+    font-size: 10px;
+    padding: 1px 6px;
+    border-radius: 3px;
+    font-weight: 600;
+    text-transform: uppercase;
+  }
+  .agent-badge.waiting { background: rgba(0,173,181,0.2); color: var(--accent); }
+  .agent-badge.idle { background: rgba(255,255,255,0.05); color: var(--text-dim); }
+  .agent-notification {
+    font-size: 11px;
+    color: var(--text-dim);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    max-width: 200px;
+  }
+  .agent-time { font-size: 10px; color: var(--text-dim); min-width: 50px; text-align: right; }
   /* No data */
   .empty { color: var(--text-dim); font-style: italic; padding: 20px 0; text-align: center; }
 </style>
@@ -172,6 +371,12 @@
     <div id="watched-projects"><div class="empty">No projects watched</div></div>
   </div>
 
+  <!-- Agent Status -->
+  <div class="card full" id="agent-status-card" style="display:none">
+    <h2>Agent Status</h2>
+    <div id="agent-status"></div>
+  </div>
+
   <!-- System Resources -->
   <div class="card">
     <h2>System</h2>
@@ -181,10 +386,17 @@
     </div>
   </div>
 
-  <!-- Budget Alerts -->
+  <!-- API Usage (Claude Code JSONL) -->
+  <div class="card">
+    <h2>API Usage</h2>
+    <div id="usage-stats"><div class="empty">Scanning...</div></div>
+  </div>
+
+  <!-- Budget Guard -->
   <div class="card">
     <h2>Budget Guard</h2>
-    <div id="alerts"><div class="empty">No alerts</div></div>
+    <div id="budget-overview"></div>
+    <div id="alerts" style="margin-top:8px"></div>
   </div>
 
   <!-- Process Monitor Chart -->
@@ -196,9 +408,17 @@
     </div>
   </div>
 
-  <!-- File Heatmap -->
+  <!-- File Activity Timeline -->
+  <div class="card full">
+    <h2>File Activity Timeline (per minute)</h2>
+    <div class="chart-container" style="height:120px">
+      <canvas id="timelineChart"></canvas>
+    </div>
+  </div>
+
+  <!-- File Heatmap Tree -->
   <div class="card">
-    <h2>File Heatmap — Top 10</h2>
+    <h2>File Heatmap</h2>
     <div id="heatmap"><div class="empty">No files tracked</div></div>
   </div>
 
@@ -214,6 +434,7 @@
 let cpuHistory = [];
 const MAX_HISTORY = 30;
 let cpuChart = null;
+let timelineChart = null;
 let watchedPaths = []; // tracks current watched project roots
 
 // ── Helpers ──
@@ -242,11 +463,65 @@ function initChart() {
   });
 }
 
+function initTimelineChart() {
+  const ctx = document.getElementById('timelineChart').getContext('2d');
+  timelineChart = new Chart(ctx, {
+    type: 'bar',
+    data: { labels: [], datasets: [] },
+    options: {
+      responsive: true,
+      maintainAspectRatio: false,
+      animation: { duration: 300 },
+      scales: {
+        x: {
+          stacked: true,
+          ticks: { color: '#888', font: { size: 9 }, maxRotation: 0 },
+          grid: { display: false }
+        },
+        y: {
+          stacked: true,
+          beginAtZero: true,
+          ticks: { color: '#888', font: { size: 9 }, precision: 0 },
+          grid: { color: 'rgba(255,255,255,0.05)' }
+        }
+      },
+      plugins: {
+        legend: { display: true, position: 'top',
+                  labels: { color: '#888', font: { size: 9 }, boxWidth: 10, padding: 8 } },
+        tooltip: {
+          callbacks: {
+            title: (items) => items[0]?.label || '',
+            label: (item) => `${item.dataset.label}: ${item.raw} events`
+          }
+        }
+      }
+    }
+  });
+}
+
 function formatBytes(bytes) {
   if (bytes < 1024) return bytes + ' B';
   if (bytes < 1024*1024) return (bytes/1024).toFixed(1) + ' KB';
   if (bytes < 1024*1024*1024) return (bytes/1024/1024).toFixed(1) + ' MB';
   return (bytes/1024/1024/1024).toFixed(2) + ' GB';
+}
+
+function formatTokens(count) {
+  if (count < 1000) return count.toString();
+  if (count < 1000000) return (count / 1000).toFixed(1) + 'k';
+  return (count / 1000000).toFixed(2) + 'M';
+}
+
+function formatCost(usd) {
+  if (usd < 0.01) return '<$0.01';
+  if (usd < 1) return '$' + usd.toFixed(3);
+  return '$' + usd.toFixed(2);
+}
+
+function costColor(usd) {
+  if (usd > 50) return '#e94560';
+  if (usd > 10) return '#f0a500';
+  return '#00c897';
 }
 
 function formatTime(ms) {
@@ -285,17 +560,26 @@ function updateMonitor(data) {
     formatBytes(data.used_memory_bytes) + ' / ' + formatBytes(data.total_memory_bytes);
   document.getElementById('cpu-count').textContent = data.cpu_count + ' cores';
 
-  // Process list
+  // Process list with stop/resume controls
   const procEl = document.getElementById('process-list');
   if (data.processes.length === 0) {
     procEl.innerHTML = '<div class="empty">No tracked processes</div>';
   } else {
-    procEl.innerHTML = data.processes.map(p =>
-      `<div class="stat-row">
-        <span class="stat-label">PID ${p.pid} (${p.name})</span>
+    procEl.innerHTML = data.processes.map(p => {
+      const statusClass = p.stopped ? 'stopped' : 'running';
+      const statusText = p.stopped ? 'STOPPED' : 'running';
+      const btn = p.stopped
+        ? `<button class="proc-btn resume" onclick="resumeProcess(${p.pid})">Resume</button>`
+        : `<button class="proc-btn stop" onclick="stopProcess(${p.pid})">Stop</button>`;
+      return `<div class="proc-row">
+        <div class="proc-info">
+          <span class="stat-label">PID ${p.pid} (${p.name})</span>
+          <span class="proc-status ${statusClass}">${statusText}</span>
+        </div>
         <span class="stat-value">${p.cpu_percent.toFixed(1)}% · ${formatBytes(p.memory_bytes)}</span>
-      </div>`
-    ).join('');
+        ${btn}
+      </div>`;
+    }).join('');
   }
 
   // CPU chart
@@ -315,17 +599,74 @@ function updateMonitor(data) {
     cpuChart.update('none');
   }
 
-  // Alerts
+  // Budget overview with gauges and toggle
+  const budgetEl = document.getElementById('budget-overview');
+  if (data.budget_config && data.processes.length > 0) {
+    const cfg = data.budget_config;
+    // Find peak CPU and memory among tracked processes
+    const peakCpu = Math.max(...data.processes.map(p => p.cpu_percent), 0);
+    const totalMem = data.processes.reduce((sum, p) => sum + p.memory_bytes, 0);
+    const cpuPct = Math.min(peakCpu / cfg.cpu_threshold_percent * 100, 100).toFixed(0);
+    const memPct = Math.min(totalMem / cfg.memory_threshold_bytes * 100, 100).toFixed(0);
+    const cpuColor = peakCpu > cfg.cpu_threshold_percent * 0.8 ? '#e94560' : peakCpu > cfg.cpu_threshold_percent * 0.5 ? '#f0a500' : '#00c897';
+    const memColor = totalMem > cfg.memory_threshold_bytes * 0.8 ? '#e94560' : totalMem > cfg.memory_threshold_bytes * 0.5 ? '#f0a500' : '#00c897';
+
+    // API cost from usage_summary
+    const us = data.usage_summary;
+    const costLine = us && us.total_cost_usd > 0
+      ? `<div class="stat-row"><span class="stat-label">API Cost</span><span class="stat-value" style="color:${costColor(us.total_cost_usd)}">${formatCost(us.total_cost_usd)}</span></div>`
+      : '';
+
+    budgetEl.innerHTML = `
+      <div class="budget-gauge">
+        <div class="budget-gauge-header">
+          <span style="color:var(--text-dim)">Peak CPU</span>
+          <span>${peakCpu.toFixed(1)}% / ${cfg.cpu_threshold_percent.toFixed(0)}%</span>
+        </div>
+        <div class="budget-gauge-bar">
+          <div class="budget-gauge-fill" style="width:${cpuPct}%;background:${cpuColor}"></div>
+        </div>
+      </div>
+      <div class="budget-gauge">
+        <div class="budget-gauge-header">
+          <span style="color:var(--text-dim)">Total Memory</span>
+          <span>${formatBytes(totalMem)} / ${formatBytes(cfg.memory_threshold_bytes)}</span>
+        </div>
+        <div class="budget-gauge-bar">
+          <div class="budget-gauge-fill" style="width:${memPct}%;background:${memColor}"></div>
+        </div>
+      </div>
+      ${costLine}
+      <div class="budget-toggle">
+        <label class="toggle-switch">
+          <input type="checkbox" ${cfg.auto_stop ? 'checked' : ''} onchange="toggleAutoStop(this.checked)">
+          <span class="toggle-slider"></span>
+        </label>
+        <span>Auto-stop on threshold (SIGSTOP)</span>
+      </div>
+    `;
+  } else if (data.processes.length === 0) {
+    budgetEl.innerHTML = '<div class="empty" style="padding:8px 0">No tracked processes</div>';
+  }
+
+  // Alerts with action badges
   const alertsEl = document.getElementById('alerts');
   if (data.alerts.length === 0) {
-    alertsEl.innerHTML = '<div class="empty">No alerts</div>';
+    alertsEl.innerHTML = '';
   } else {
-    alertsEl.innerHTML = data.alerts.map(a =>
-      `<div class="alert">
-        <span class="pid">PID ${a.pid}</span> ${a.kind} at ${a.value.toFixed(1)}
-        (threshold: ${a.threshold.toFixed(1)})
-      </div>`
-    ).join('');
+    alertsEl.innerHTML = data.alerts.map(a => {
+      const alertClass = a.action === 'stopped' ? '' : ' warning';
+      const valueStr = a.kind === 'cpu' ? a.value.toFixed(1) + '%' : formatBytes(a.value);
+      const threshStr = a.kind === 'cpu' ? a.threshold.toFixed(0) + '%' : formatBytes(a.threshold);
+      const actionBtn = a.action === 'stopped'
+        ? `<button class="proc-btn resume" onclick="resumeProcess(${a.pid})" style="margin-left:8px">Resume</button>`
+        : '';
+      return `<div class="alert${alertClass}">
+        <span class="pid">PID ${a.pid}</span> ${a.name || ''} — ${a.kind} ${valueStr} &gt; ${threshStr}
+        <span class="action-badge ${a.action}">${a.action}</span>
+        ${actionBtn}
+      </div>`;
+    }).join('');
   }
 }
 
@@ -345,24 +686,45 @@ function updateHeatmap(data) {
     ).join('');
   }
 
-  // Heatmap — show project-relative paths
+  // Heatmap — folder tree with color overlay
   const heatmapEl = document.getElementById('heatmap');
   if (data.top_files.length === 0) {
     heatmapEl.innerHTML = '<div class="empty">No file activity</div>';
   } else {
     const maxCount = Math.max(...data.top_files.map(f => f.event_count), 1);
-    heatmapEl.innerHTML = data.top_files.map(f => {
-      const pct = (f.event_count / maxCount * 100).toFixed(0);
-      const hue = Math.max(0, 120 - (f.event_count / maxCount) * 120);
-      const relPath = toRelativePath(f.path);
-      return `<div class="heatmap-bar">
-        <span class="heatmap-name" title="${f.path}">${relPath}</span>
-        <div class="heatmap-meter">
-          <div class="heatmap-fill" style="width:${pct}%;background:hsl(${hue},70%,50%)"></div>
-        </div>
-        <span class="heatmap-count">${f.event_count}</span>
-      </div>`;
-    }).join('');
+    const tree = buildFileTree(data.top_files);
+    heatmapEl.innerHTML = renderTree(tree, maxCount);
+  }
+
+  // Timeline chart — per-minute stacked bar
+  if (timelineChart && data.timeline) {
+    const now = Date.now();
+    const minuteMs = 60000;
+    // Build 10-minute range with labels
+    const labels = [];
+    const createData = [];
+    const modifyData = [];
+    const removeData = [];
+    const bucketMap = {};
+    for (const b of data.timeline) {
+      bucketMap[b.minute_ms] = b;
+    }
+    for (let i = 9; i >= 0; i--) {
+      const t = Math.floor((now - i * minuteMs) / minuteMs) * minuteMs;
+      const d = new Date(t);
+      labels.push(d.toLocaleTimeString('en-US', { hour12: false, minute: '2-digit', second: '2-digit' }).slice(0, 5));
+      const b = bucketMap[t];
+      createData.push(b ? b.create : 0);
+      modifyData.push(b ? b.modify : 0);
+      removeData.push(b ? b.remove : 0);
+    }
+    timelineChart.data.labels = labels;
+    timelineChart.data.datasets = [
+      { label: 'Create', data: createData, backgroundColor: '#00c89780', borderRadius: 2 },
+      { label: 'Modify', data: modifyData, backgroundColor: '#00adb580', borderRadius: 2 },
+      { label: 'Remove', data: removeData, backgroundColor: '#e9456080', borderRadius: 2 },
+    ];
+    timelineChart.update('none');
   }
 
   // Event log — show project-relative paths
@@ -381,8 +743,236 @@ function updateHeatmap(data) {
   }
 }
 
+// ── Agent Status ──
+function updateAgentStatus(sessions) {
+  if (!sessions || sessions.length === 0) {
+    document.getElementById('agent-status-card').style.display = 'none';
+    return;
+  }
+  const waitingSessions = sessions.filter(s => s.agent_state === 'waiting');
+  if (waitingSessions.length === 0) {
+    document.getElementById('agent-status-card').style.display = 'none';
+    return;
+  }
+  document.getElementById('agent-status-card').style.display = '';
+  const el = document.getElementById('agent-status');
+  el.innerHTML = sessions.map(s => {
+    const isWaiting = s.agent_state === 'waiting';
+    const dotClass = isWaiting ? 'waiting' : 'idle';
+    const badgeClass = isWaiting ? 'waiting' : 'idle';
+    const badgeText = isWaiting ? 'needs input' : 'idle';
+    const notifTitle = s.notification_title ? `<span class="agent-notification">${s.notification_title}</span>` : '';
+    const timeAgo = s.notification_ts ? formatTimeAgo(s.notification_ts) : '';
+    const branchStr = s.git_branch ? ` <span style="color:var(--text-dim);font-size:11px">[${s.git_branch}]</span>` : '';
+    return `<div class="agent-row">
+      <span class="agent-dot ${dotClass}"></span>
+      <span class="agent-name">${s.name}${branchStr}</span>
+      ${notifTitle}
+      <span class="agent-badge ${badgeClass}">${badgeText}</span>
+      <span class="agent-time">${timeAgo}</span>
+    </div>`;
+  }).join('');
+}
+
+function formatTimeAgo(ms) {
+  const diff = Date.now() - ms;
+  if (diff < 60000) return Math.floor(diff / 1000) + 's ago';
+  if (diff < 3600000) return Math.floor(diff / 60000) + 'm ago';
+  return Math.floor(diff / 3600000) + 'h ago';
+}
+
+// ── API Usage (JSONL-based) ──
+function updateUsage(data) {
+  const el = document.getElementById('usage-stats');
+  if (!data || !data.sessions || data.sessions.length === 0) {
+    el.innerHTML = '<div class="empty">No Claude Code sessions found</div>';
+    return;
+  }
+
+  // Total cost
+  let html = `<div class="stat-row" style="margin-bottom:6px">
+    <span class="stat-label" style="font-weight:600">Total Cost</span>
+    <span class="stat-value" style="font-size:16px;color:${costColor(data.total_cost_usd)}">${formatCost(data.total_cost_usd)}</span>
+  </div>`;
+
+  // Totals summary
+  html += `<div class="stat-row">
+    <span class="stat-label">Input</span>
+    <span class="stat-value">${formatTokens(data.total_input_tokens)}</span>
+  </div>
+  <div class="stat-row">
+    <span class="stat-label">Output</span>
+    <span class="stat-value">${formatTokens(data.total_output_tokens)}</span>
+  </div>
+  <div class="stat-row">
+    <span class="stat-label">Cache Read</span>
+    <span class="stat-value">${formatTokens(data.total_cache_read_tokens)}</span>
+  </div>
+  <div class="stat-row" style="margin-bottom:8px">
+    <span class="stat-label">Cache Write</span>
+    <span class="stat-value">${formatTokens(data.total_cache_write_tokens)}</span>
+  </div>`;
+
+  // Per-session breakdown (sorted by cost descending, top 5)
+  const sorted = [...data.sessions].sort((a, b) => b.cost_usd - a.cost_usd).slice(0, 5);
+  for (const s of sorted) {
+    const projName = s.project_path.split('/').pop() || s.project_path;
+    const modelShort = s.model.replace('claude-', '').replace(/-20\d{6}$/, '');
+    html += `<div class="stat-row">
+      <span class="stat-label" title="${s.session_id}">${projName} <span style="color:var(--text-dim);font-size:10px">(${modelShort}, ${s.api_calls} calls)</span></span>
+      <span class="stat-value" style="color:${costColor(s.cost_usd)}">${formatCost(s.cost_usd)}</span>
+    </div>`;
+  }
+
+  el.innerHTML = html;
+}
+
+// ── Folder Tree Heatmap ──
+// Track which directories are expanded (persists across updates)
+const expandedDirs = new Set();
+
+function buildFileTree(files) {
+  const root = { dirs: {}, files: [], totalCount: 0 };
+  for (const f of files) {
+    const relPath = toRelativePath(f.path);
+    const parts = relPath.split('/');
+    let node = root;
+    // Navigate/create directory nodes
+    for (let i = 0; i < parts.length - 1; i++) {
+      if (!node.dirs[parts[i]]) {
+        node.dirs[parts[i]] = { dirs: {}, files: [], totalCount: 0 };
+      }
+      node = node.dirs[parts[i]];
+    }
+    // Add file to leaf directory
+    node.files.push({ name: parts[parts.length - 1], count: f.event_count, path: f.path });
+    // Accumulate counts up to root
+    let acc = root;
+    acc.totalCount += f.event_count;
+    for (let i = 0; i < parts.length - 1; i++) {
+      acc = acc.dirs[parts[i]];
+      acc.totalCount += f.event_count;
+    }
+  }
+  return root;
+}
+
+function heatColor(count, maxCount) {
+  const ratio = count / maxCount;
+  const hue = Math.max(0, 120 - ratio * 120); // green→red
+  return `hsl(${hue},70%,50%)`;
+}
+
+function heatBg(count, maxCount) {
+  const ratio = count / maxCount;
+  const hue = Math.max(0, 120 - ratio * 120);
+  return `hsla(${hue},70%,50%,0.12)`;
+}
+
+function renderTree(node, maxCount, prefix) {
+  let html = '';
+  // Sort dirs by totalCount descending
+  const dirEntries = Object.entries(node.dirs).sort((a, b) => b[1].totalCount - a[1].totalCount);
+  for (const [dirName, dir] of dirEntries) {
+    const dirId = (prefix || '') + dirName + '/';
+    const isOpen = expandedDirs.has(dirId);
+    const color = heatColor(dir.totalCount, maxCount);
+    const bg = heatBg(dir.totalCount, maxCount);
+    html += `<div class="tree-node">
+      <div class="tree-dir" onclick="toggleDir('${dirId}')">
+        <span class="arrow ${isOpen ? 'open' : ''}">▶</span>
+        <span class="dir-name">📁 ${dirName}</span>
+        <span class="dir-count" style="color:${color};background:${bg}">${dir.totalCount}</span>
+      </div>
+      <div class="tree-children ${isOpen ? '' : 'collapsed'}" id="dir-${CSS.escape(dirId)}">
+        ${renderTree(dir, maxCount, dirId)}
+      </div>
+    </div>`;
+  }
+  // Sort files by count descending
+  const sortedFiles = [...node.files].sort((a, b) => b.count - a.count);
+  for (const f of sortedFiles) {
+    const pct = (f.count / maxCount * 100).toFixed(0);
+    const color = heatColor(f.count, maxCount);
+    html += `<div class="tree-file" title="${f.path}">
+      <span class="file-name">${f.name}</span>
+      <div class="file-heat">
+        <div class="file-heat-fill" style="width:${pct}%;background:${color}"></div>
+      </div>
+      <span class="file-count" style="color:${color}">${f.count}</span>
+    </div>`;
+  }
+  return html;
+}
+
+function toggleDir(dirId) {
+  if (expandedDirs.has(dirId)) {
+    expandedDirs.delete(dirId);
+  } else {
+    expandedDirs.add(dirId);
+  }
+  // Re-render is handled by next poll cycle; for instant feedback, toggle manually
+  const el = document.getElementById('dir-' + CSS.escape(dirId));
+  if (el) el.classList.toggle('collapsed');
+  // Toggle arrow
+  const parent = el?.parentElement;
+  if (parent) {
+    const arrow = parent.querySelector('.arrow');
+    if (arrow) arrow.classList.toggle('open');
+  }
+}
+
+// ── Process Control ──
+const isWKWebView = !!(window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.stopProcess);
+
+async function stopProcess(pid) {
+  if (isWKWebView) {
+    window.webkit.messageHandlers.stopProcess.postMessage(pid);
+    return;
+  }
+  const baseUrl = window.location.origin;
+  if (baseUrl.startsWith('http')) {
+    await fetch(baseUrl + '/api/process/stop', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({pid}),
+    });
+  }
+}
+
+async function toggleAutoStop(enabled) {
+  if (isWKWebView) {
+    window.webkit.messageHandlers.setAutoStop.postMessage(enabled);
+    return;
+  }
+  const baseUrl = window.location.origin;
+  if (baseUrl.startsWith('http')) {
+    await fetch(baseUrl + '/api/budget/auto-stop', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({enabled}),
+    });
+  }
+}
+
+async function resumeProcess(pid) {
+  if (isWKWebView) {
+    window.webkit.messageHandlers.resumeProcess.postMessage(pid);
+    return;
+  }
+  const baseUrl = window.location.origin;
+  if (baseUrl.startsWith('http')) {
+    await fetch(baseUrl + '/api/process/resume', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({pid}),
+    });
+  }
+}
+
 // ── Init ──
 initChart();
+initTimelineChart();
 </script>
 </body>
 </html>

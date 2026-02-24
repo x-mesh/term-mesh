@@ -301,6 +301,10 @@ final class Workspace: Identifiable, ObservableObject {
     /// Ordinal for CMUX_PORT range assignment (monotonically increasing per app session)
     var portOrdinal: Int = 0
 
+    /// term-mesh: Worktree metadata for auto-cleanup on tab close.
+    var worktreeName: String?
+    var worktreeRepoPath: String?
+
     /// The bonsplit controller managing the split panes for this workspace
     let bonsplitController: BonsplitController
 

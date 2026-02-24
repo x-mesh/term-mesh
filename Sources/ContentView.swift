@@ -3596,6 +3596,15 @@ struct ContentView: View {
         )
         contributions.append(
             CommandPaletteCommandContribution(
+                commandId: "palette.openDashboard",
+                title: constant("Open Dashboard"),
+                subtitle: constant("term-mesh"),
+                shortcutHint: "⌘⇧D",
+                keywords: ["dashboard", "monitor", "heatmap", "resources", "term-mesh"]
+            )
+        )
+        contributions.append(
+            CommandPaletteCommandContribution(
                 commandId: "palette.browserSplitRight",
                 title: constant("Split Browser Right"),
                 subtitle: constant("Browser Layout"),
@@ -3886,6 +3895,13 @@ struct ContentView: View {
         }
         registry.register(commandId: "palette.browserClearHistory") {
             BrowserHistoryStore.shared.clearHistory()
+        }
+        registry.register(commandId: "palette.openDashboard") {
+            let port = ProcessInfo.processInfo.environment["TERM_MESH_HTTP_ADDR"]
+                .flatMap { $0.split(separator: ":").last.map(String.init) } ?? "9876"
+            if let url = URL(string: "http://localhost:\(port)") {
+                _ = tabManager.createBrowserSplit(direction: .right, url: url)
+            }
         }
         registry.register(commandId: "palette.browserSplitRight") {
             _ = tabManager.createBrowserSplit(direction: .right)

@@ -760,6 +760,7 @@ class TabManager: ObservableObject {
 
         // term-mesh: Create worktree sandbox if enabled and CWD is a git repo
         var worktreeInfo: WorktreeInfo?
+        let originalRepoPath = workingDirectory  // preserve before worktree overrides it
         if TermMeshDaemon.shared.worktreeEnabled, let cwd = workingDirectory {
             if let info = TermMeshDaemon.shared.createWorktree(repoPath: cwd) {
                 workingDirectory = info.path
@@ -777,6 +778,12 @@ class TabManager: ObservableObject {
             portOrdinal: ordinal,
             configTemplate: inheritedConfig
         )
+        // term-mesh: Store worktree metadata for auto-cleanup on tab close
+        if let info = worktreeInfo {
+            newWorkspace.worktreeName = info.name
+            newWorkspace.worktreeRepoPath = originalRepoPath
+        }
+
         // term-mesh: Auto-watch the working directory for file heatmap
         if let cwd = workingDirectory, !cwd.isEmpty {
             DispatchQueue.global(qos: .utility).async {
@@ -986,6 +993,14 @@ class TabManager: ObservableObject {
     func closeWorkspace(_ workspace: Workspace) {
         guard tabs.count > 1 else { return }
         sentryBreadcrumb("workspace.close", data: ["tabCount": tabs.count - 1])
+
+        // term-mesh: Clean up worktree sandbox if this tab was using one
+        if let name = workspace.worktreeName, let repoPath = workspace.worktreeRepoPath {
+            DispatchQueue.global(qos: .utility).async {
+                let success = TermMeshDaemon.shared.removeWorktree(repoPath: repoPath, name: name)
+                print("[term-mesh] worktree cleanup \(name): \(success ? "ok" : "failed")")
+            }
+        }
 
         AppDelegate.shared?.notificationStore?.clearNotifications(forTabId: workspace.id)
         unwireClosedBrowserTracking(for: workspace)
