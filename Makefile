@@ -11,10 +11,10 @@
 TAG           ?= term-mesh
 DERIVED_DATA  := /tmp/cmux-$(TAG)
 BUILD_DIR     := $(DERIVED_DATA)/Build/Products/Debug
-SRC_APP       := $(BUILD_DIR)/cmux DEV $(TAG).app
-BASE_APP      := $(BUILD_DIR)/cmux DEV.app
+SRC_APP       := $(BUILD_DIR)/term-mesh DEV $(TAG).app
+BASE_APP      := $(BUILD_DIR)/term-mesh DEV.app
 INSTALL_APP   := /Applications/term-mesh.app
-BUNDLE_ID     := com.cmuxterm.app.debug.term.mesh
+BUNDLE_ID     := com.term-mesh.app.debug
 PROJECT_DIR   := $(shell pwd)
 
 .PHONY: build deploy run stop clean daemon test

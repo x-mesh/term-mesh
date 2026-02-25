@@ -85,7 +85,7 @@
 			<key>UTTypeIdentifier</key>
 			<string>com.cmux.sidebar-tab-reorder</string>
 			<key>UTTypeDescription</key>
-			<string>cmux Sidebar Tab Reorder</string>
+			<string>term-mesh Sidebar Tab Reorder</string>
 			<key>UTTypeConformsTo</key>
 			<array>
 				<string>public.data</string>
