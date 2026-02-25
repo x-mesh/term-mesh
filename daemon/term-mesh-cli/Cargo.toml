@@ -5,7 +5,7 @@ edition = "2021"
 description = "term-mesh CLI — PTY wrapper for AI agents"
 
 [[bin]]
-name = "term-mesh"
+name = "term-mesh-run"
 path = "src/main.rs"
 
 [dependencies]

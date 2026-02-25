@@ -40,7 +40,7 @@ build:
 daemon:
 	@echo "==> Building Rust daemon (release)..."
 	@cd daemon && cargo build --release
-	@echo "==> daemon: target/release/term-mesh, target/release/term-meshd"
+	@echo "==> daemon: target/release/term-mesh-run, target/release/term-meshd"
 
 test:
 	@cd daemon && cargo test
@@ -48,15 +48,23 @@ test:
 deploy: build
 	@echo "==> Stopping existing app + daemon..."
 	@-pkill -f "term-mesh.app/Contents/MacOS" 2>/dev/null || true
-	@-pkill -f term-meshd 2>/dev/null || true
-	@sleep 0.5
+	@-pkill term-meshd 2>/dev/null || true
+	@sleep 1
+	@# Ensure no stale daemon remains
+	@-pkill -9 term-meshd 2>/dev/null || true
+	@sleep 0.3
 	@echo "==> Deploying to $(INSTALL_APP)..."
 	@rm -rf "$(INSTALL_APP)"
 	@cp -R "$(SRC_APP)" "$(INSTALL_APP)"
-	@# Copy Rust binaries into app bundle
+	@# Copy Rust binaries into app bundle (term-mesh-run = PTY wrapper, term-meshd = daemon)
+	@# Note: term-mesh (Swift CLI, socket controller) is already in the bundle from Xcode "Copy CLI" phase
 	@mkdir -p "$(INSTALL_APP)/Contents/Resources/bin"
 	@cp "$(PROJECT_DIR)/daemon/target/release/term-meshd" "$(INSTALL_APP)/Contents/Resources/bin/term-meshd"
-	@cp "$(PROJECT_DIR)/daemon/target/release/term-mesh" "$(INSTALL_APP)/Contents/Resources/bin/term-mesh"
+	@cp "$(PROJECT_DIR)/daemon/target/release/term-mesh-run" "$(INSTALL_APP)/Contents/Resources/bin/term-mesh-run"
+	@# Update symlinks (term-mesh = Swift CLI from app bundle, term-mesh-run = Rust PTY wrapper)
+	@ln -sf "$(INSTALL_APP)/Contents/Resources/bin/term-mesh" "$(HOME)/bin/term-mesh"
+	@ln -sf "$(PROJECT_DIR)/daemon/target/release/term-meshd" "$(HOME)/bin/term-meshd"
+	@ln -sf "$(PROJECT_DIR)/daemon/target/release/term-mesh-run" "$(HOME)/bin/term-mesh-run"
 	@echo "==> Starting daemon..."
 	@nohup "$(HOME)/bin/term-meshd" > /tmp/term-meshd.log 2>&1 & sleep 0.5
 	@echo "==> Launching term-mesh..."

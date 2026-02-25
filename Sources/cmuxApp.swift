@@ -254,6 +254,10 @@ struct cmuxApp: App {
                     showSpawnAgentsDialog()
                 }
                 .keyboardShortcut("a", modifiers: [.command, .shift])
+                Button("Reconnect Agent…") {
+                    showReconnectAgentDialog()
+                }
+                .keyboardShortcut("a", modifiers: [.command, .option])
             }
 
 #if DEBUG
@@ -791,33 +795,93 @@ struct cmuxApp: App {
     private func showSpawnAgentsDialog() {
         let alert = NSAlert()
         alert.messageText = "Spawn Agents"
-        alert.informativeText = "Number of agent sessions to spawn (each gets its own worktree sandbox):"
+        alert.informativeText = "Select a command and the number of agents to spawn:"
         alert.alertStyle = .informational
         alert.addButton(withTitle: "Spawn")
         alert.addButton(withTitle: "Cancel")
 
-        let stepper = NSStepper(frame: NSRect(x: 0, y: 0, width: 26, height: 22))
+        // Command presets
+        let commands = [
+            "claude --dangerously-skip-permissions",
+            "claude",
+            "aider",
+            "codex",
+        ]
+
+        // -- Command popup --
+        let commandLabel = NSTextField(labelWithString: "Command:")
+        commandLabel.frame = NSRect(x: 0, y: 30, width: 70, height: 18)
+
+        let commandCombo = NSComboBox(frame: NSRect(x: 74, y: 26, width: 260, height: 26))
+        for cmd in commands { commandCombo.addItem(withObjectValue: cmd) }
+        commandCombo.stringValue = commands[0]
+        commandCombo.completes = true
+
+        // -- Count stepper --
+        let countLabel = NSTextField(labelWithString: "Agents:")
+        countLabel.frame = NSRect(x: 0, y: 2, width: 70, height: 18)
+
+        let stepper = NSStepper(frame: NSRect(x: 74, y: 0, width: 26, height: 22))
         stepper.minValue = 1
         stepper.maxValue = 8
         stepper.integerValue = 2
         stepper.valueWraps = false
 
-        let label = NSTextField(labelWithString: "2")
-        label.frame = NSRect(x: 30, y: 2, width: 30, height: 18)
-        label.alignment = .center
+        let countValueLabel = NSTextField(labelWithString: "2")
+        countValueLabel.frame = NSRect(x: 104, y: 2, width: 30, height: 18)
+        countValueLabel.alignment = .center
 
-        stepper.target = label
+        stepper.target = countValueLabel
         stepper.action = #selector(NSTextField.takeIntegerValueFrom(_:))
 
-        let container = NSView(frame: NSRect(x: 0, y: 0, width: 80, height: 22))
+        let container = NSView(frame: NSRect(x: 0, y: 0, width: 340, height: 54))
+        container.addSubview(commandLabel)
+        container.addSubview(commandCombo)
+        container.addSubview(countLabel)
         container.addSubview(stepper)
-        container.addSubview(label)
+        container.addSubview(countValueLabel)
         alert.accessoryView = container
 
         guard alert.runModal() == .alertFirstButtonReturn else { return }
         let count = stepper.integerValue
+        let command = commandCombo.stringValue.isEmpty ? commands[0] : commandCombo.stringValue
 
-        activeTabManager.spawnAgentSessions(count: count)
+        activeTabManager.spawnAgentSessions(count: count, command: command)
+    }
+
+    private func showReconnectAgentDialog() {
+        let agents = TermMeshDaemon.shared.listAgents(includeTerminated: false)
+        let detached = agents.filter { $0.status != "terminated" && $0.panelId == nil }
+
+        guard !detached.isEmpty else {
+            let alert = NSAlert()
+            alert.messageText = "Reconnect Agent"
+            alert.informativeText = "No detached agent sessions found."
+            alert.alertStyle = .informational
+            alert.addButton(withTitle: "OK")
+            alert.runModal()
+            return
+        }
+
+        let alert = NSAlert()
+        alert.messageText = "Reconnect Agent"
+        alert.informativeText = "Select a detached agent session to reconnect:"
+        alert.alertStyle = .informational
+        alert.addButton(withTitle: "Reconnect")
+        alert.addButton(withTitle: "Cancel")
+
+        let popup = NSPopUpButton(frame: NSRect(x: 0, y: 0, width: 340, height: 26), pullsDown: false)
+        for agent in detached {
+            let label = "\(agent.name) [\(agent.worktreeBranch)] — \(agent.worktreePath)"
+            popup.addItem(withTitle: label)
+            popup.lastItem?.representedObject = agent.id as NSString
+        }
+        alert.accessoryView = popup
+
+        guard alert.runModal() == .alertFirstButtonReturn,
+              let selectedId = popup.selectedItem?.representedObject as? String else { return }
+
+        activeTabManager.reconnectAgentSession(sessionId: selectedId)
     }
 
     @ViewBuilder

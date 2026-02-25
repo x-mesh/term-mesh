@@ -352,6 +352,59 @@
     max-width: 200px;
   }
   .agent-time { font-size: 10px; color: var(--text-dim); min-width: 50px; text-align: right; }
+  /* Task Board — Kanban columns */
+  .task-board { display: flex; gap: 8px; overflow-x: auto; }
+  .task-column { flex: 1; min-width: 140px; }
+  .task-column-header { font-size: 10px; text-transform: uppercase; letter-spacing: 0.5px;
+    color: var(--text-dim); margin-bottom: 6px; }
+  .task-card { background: var(--bg); border: 1px solid var(--border); border-radius: 4px;
+    padding: 6px 8px; margin-bottom: 4px; font-size: 11px; cursor: pointer; }
+  .task-card:hover { border-color: var(--accent); }
+  .task-card .title { font-weight: 500; }
+  .task-card .meta { font-size: 10px; color: var(--text-dim); margin-top: 2px; }
+  .task-card .priority-dot { display: inline-block; width: 6px; height: 6px; border-radius: 50%; margin-right: 4px; }
+  .task-card .priority-dot.high { background: var(--danger); }
+  .task-card .priority-dot.medium { background: #f0a500; }
+  .task-card .priority-dot.low { background: var(--text-dim); }
+  .task-card .detail { display: none; margin-top: 6px; padding-top: 6px;
+    border-top: 1px solid rgba(255,255,255,0.05); font-size: 10px; color: var(--text-dim); }
+  .task-card.expanded .detail { display: block; }
+  .task-toolbar { display: flex; gap: 6px; margin-bottom: 8px; align-items: center; }
+  .task-toolbar input { background: var(--bg); border: 1px solid var(--border); color: var(--text);
+    padding: 4px 8px; border-radius: 4px; font-size: 11px; flex: 1; outline: none; }
+  .task-toolbar button { background: var(--accent); border: none; color: #fff;
+    padding: 4px 10px; border-radius: 4px; font-size: 11px; cursor: pointer; white-space: nowrap; }
+
+  /* Agent session row */
+  .agent-session { display: flex; align-items: center; gap: 8px; padding: 4px 0;
+    border-bottom: 1px solid rgba(255,255,255,0.05); font-size: 12px; }
+  .agent-session .name { font-weight: 500; flex: 1; }
+  .agent-session .branch { font-size: 10px; color: var(--text-dim); }
+  .agent-session .status-badge { font-size: 10px; padding: 1px 6px; border-radius: 3px; font-weight: 600; text-transform: uppercase; }
+  .agent-session .status-badge.running { background: rgba(0,200,151,0.2); color: var(--success); }
+  .agent-session .status-badge.detached { background: rgba(255,165,0,0.2); color: orange; }
+  .agent-session .status-badge.terminated { background: rgba(255,255,255,0.05); color: var(--text-dim); }
+  .agent-session .terminate-btn { background: none; border: 1px solid var(--danger); color: var(--danger);
+    padding: 1px 6px; border-radius: 3px; font-size: 10px; cursor: pointer; }
+  .agent-session .terminate-btn:hover { background: rgba(233,69,96,0.15); }
+
+  /* Message card */
+  .msg-toolbar { display: flex; gap: 6px; margin-bottom: 6px; align-items: center; }
+  .msg-toolbar select, .msg-toolbar input, .msg-toolbar textarea {
+    background: var(--bg); border: 1px solid var(--border); color: var(--text);
+    padding: 4px 8px; border-radius: 4px; font-size: 11px; outline: none; }
+  .msg-toolbar select { min-width: 100px; }
+  .msg-toolbar textarea { flex: 1; resize: none; height: 28px; font-family: inherit; }
+  .msg-toolbar button { background: var(--accent); border: none; color: #fff;
+    padding: 4px 10px; border-radius: 4px; font-size: 11px; cursor: pointer; }
+  .msg-row { padding: 4px 0; border-bottom: 1px solid rgba(255,255,255,0.05); font-size: 11px; }
+  .msg-row.unread { background: rgba(0,173,181,0.08); }
+  .msg-from { color: var(--accent); font-weight: 500; }
+  .msg-time { color: var(--text-dim); font-size: 10px; float: right; }
+  .msg-ack-btn { background: none; border: 1px solid var(--border); color: var(--text-dim);
+    padding: 0 4px; border-radius: 2px; font-size: 9px; cursor: pointer; margin-left: 4px; }
+  .msg-ack-btn:hover { border-color: var(--accent); color: var(--accent); }
+
   /* No data */
   .empty { color: var(--text-dim); font-style: italic; padding: 20px 0; text-align: center; }
 </style>
@@ -392,6 +445,19 @@
     <div id="usage-stats"><div class="empty">Scanning...</div></div>
   </div>
 
+  <!-- Agent Sessions (full width) -->
+  <div class="card full" id="agents-card">
+    <h2>Agent Sessions</h2>
+    <div id="agents-list"><div class="empty">No agents</div></div>
+  </div>
+
+  <!-- Task Board (full width) -->
+  <div class="card full" id="tasks-card">
+    <h2>Tasks</h2>
+    <div id="tasks-toolbar"></div>
+    <div id="tasks-board"><div class="empty">No tasks</div></div>
+  </div>
+
   <!-- Budget Guard -->
   <div class="card">
     <h2>Budget Guard</h2>
@@ -426,6 +492,12 @@
   <div class="card">
     <h2>Recent Events</h2>
     <div class="event-log" id="event-log"><div class="empty">No events</div></div>
+  </div>
+
+  <!-- Messages -->
+  <div class="card" id="messages-card">
+    <h2>Messages</h2>
+    <div id="messages-list"><div class="empty">No messages</div></div>
   </div>
 </div>
 
@@ -970,9 +1042,269 @@ async function resumeProcess(pid) {
   }
 }
 
+// ── Agent Sessions ──
+let _cachedAgents = []; // shared with messages dropdown
+
+function updateAgents(agents) {
+  if (!agents) return;
+  _cachedAgents = agents;
+  const el = document.getElementById('agents-list');
+  if (!agents.length) {
+    el.innerHTML = '<div class="empty">No agents</div>';
+    return;
+  }
+  el.innerHTML = agents.map(a => {
+    const isDetached = a.status === 'running' && !a.panel_id;
+    const statusClass = a.status === 'terminated' ? 'terminated' : (isDetached ? 'detached' : 'running');
+    const statusText = isDetached ? 'detached' : a.status;
+    const branch = a.worktree_branch ? ` <span class="branch">[${a.worktree_branch}]</span>` : '';
+    const terminateBtn = a.status !== 'terminated'
+      ? `<button class="terminate-btn" onclick="terminateAgent('${a.id}')">Terminate</button>`
+      : '';
+    return `<div class="agent-session">
+      <span class="name">${a.name}${branch}</span>
+      <span class="status-badge ${statusClass}">${statusText}</span>
+      ${terminateBtn}
+    </div>`;
+  }).join('');
+}
+
+async function terminateAgent(id) {
+  const baseUrl = window.location.origin;
+  if (isWKWebView) return; // handled by native
+  await fetch(baseUrl + '/api/agents/' + id + '/terminate', {
+    method: 'POST', headers: {'Content-Type': 'application/json'}, body: '{}',
+  });
+}
+
+// ── Task Board (Kanban) ──
+let _cachedTasks = [];
+
+function updateTasks(tasks) {
+  if (!tasks) return;
+  _cachedTasks = tasks;
+
+  // Toolbar: new task form
+  const toolbar = document.getElementById('tasks-toolbar');
+  if (!toolbar.querySelector('.task-toolbar')) {
+    toolbar.innerHTML = `<div class="task-toolbar">
+      <input id="new-task-title" type="text" placeholder="New task title…" onkeydown="if(event.key==='Enter')createTask()">
+      <button onclick="createTask()">+ New Task</button>
+    </div>`;
+  }
+
+  const board = document.getElementById('tasks-board');
+  if (!tasks.length) {
+    board.innerHTML = '<div class="empty">No tasks</div>';
+    return;
+  }
+
+  const columns = {
+    pending: { label: 'Pending', items: [] },
+    in_progress: { label: 'In Progress', items: [] },
+    completed: { label: 'Completed', items: [] },
+    other: { label: 'Other', items: [] },
+  };
+
+  for (const t of tasks) {
+    if (t.status === 'pending') columns.pending.items.push(t);
+    else if (t.status === 'in_progress' || t.status === 'assigned') columns.in_progress.items.push(t);
+    else if (t.status === 'completed') columns.completed.items.push(t);
+    else columns.other.items.push(t);
+  }
+
+  let html = '<div class="task-board">';
+  for (const [key, col] of Object.entries(columns)) {
+    if (key === 'other' && col.items.length === 0) continue;
+    html += `<div class="task-column">
+      <div class="task-column-header">${col.label} (${col.items.length})</div>`;
+    for (const t of col.items) {
+      const pClass = t.priority >= 3 ? 'high' : (t.priority === 2 ? 'medium' : 'low');
+      const assignee = t.assignee_name || t.assignee || '';
+      const assigneeStr = assignee ? `→ ${assignee}` : '';
+      html += `<div class="task-card" onclick="toggleTaskDetail(this)" data-id="${t.id}">
+        <div class="title"><span class="priority-dot ${pClass}"></span>${t.title}</div>
+        <div class="meta">${assigneeStr}</div>
+        <div class="detail">
+          <div>${t.description || 'No description'}</div>
+          ${t.deps && t.deps.length ? '<div style="margin-top:4px">Deps: ' + t.deps.join(', ') + '</div>' : ''}
+        </div>
+      </div>`;
+    }
+    html += '</div>';
+  }
+  html += '</div>';
+  board.innerHTML = html;
+}
+
+function toggleTaskDetail(el) {
+  el.classList.toggle('expanded');
+}
+
+async function createTask() {
+  const input = document.getElementById('new-task-title');
+  if (!input) return;
+  const title = input.value.trim();
+  if (!title) return;
+  const baseUrl = window.location.origin;
+  await fetch(baseUrl + '/api/tasks', {
+    method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({ title, priority: 2 }),
+  });
+  input.value = '';
+}
+
+// ── Messages ──
+let _selectedMsgAgent = null;
+
+function updateMessages(msgs) {
+  const el = document.getElementById('messages-list');
+  if (!msgs || !msgs.length) {
+    el.innerHTML = _selectedMsgAgent
+      ? '<div class="empty">No messages for this agent</div>'
+      : '<div class="empty">Select an agent to view messages</div>';
+    return;
+  }
+  el.innerHTML = msgs.map(m => {
+    const fromLabel = m.from_agent || 'dashboard';
+    const time = m.created_at_ms ? formatTime(m.created_at_ms) : '';
+    const unread = m.read ? '' : ' unread';
+    const ackBtn = m.read ? '' : `<button class="msg-ack-btn" onclick="ackMessage(${m.id})">ACK</button>`;
+    return `<div class="msg-row${unread}">
+      <span class="msg-from">${fromLabel}</span>${ackBtn}
+      <span class="msg-time">${time}</span>
+      <div style="margin-top:2px">${m.content}</div>
+    </div>`;
+  }).join('');
+}
+
+function initMessagesUI() {
+  const container = document.getElementById('messages-card');
+  if (!container) return;
+  const listEl = document.getElementById('messages-list');
+  const toolbar = document.createElement('div');
+  toolbar.className = 'msg-toolbar';
+  toolbar.id = 'msg-toolbar';
+  toolbar.innerHTML = `
+    <select id="msg-agent-select" onchange="selectMsgAgent(this.value)">
+      <option value="">Select agent…</option>
+    </select>
+    <textarea id="msg-content" placeholder="Message…" onkeydown="if(event.ctrlKey&&event.key==='Enter')sendMessage()"></textarea>
+    <button id="msg-send-btn" onclick="sendMessage()">Send</button>
+  `;
+  container.insertBefore(toolbar, listEl);
+}
+
+function refreshMsgAgentDropdown() {
+  const select = document.getElementById('msg-agent-select');
+  if (!select) return;
+  const prev = select.value;
+  let html = '<option value="">Select agent…</option>';
+  for (const a of _cachedAgents) {
+    if (a.status === 'terminated') continue;
+    const sel = a.id === prev ? ' selected' : '';
+    html += `<option value="${a.id}"${sel}>${a.name}</option>`;
+  }
+  select.innerHTML = html;
+}
+
+/// Auto-refresh messages for selected agent (called from poll loop)
+async function pollMessages() {
+  if (!_selectedMsgAgent) return;
+  const baseUrl = window.location.origin;
+  try {
+    const res = await fetch(baseUrl + '/api/messages/' + _selectedMsgAgent);
+    if (res.ok) updateMessages(await res.json());
+  } catch (e) { console.error('[messages] poll error:', e); }
+}
+
+async function selectMsgAgent(agentId) {
+  _selectedMsgAgent = agentId || null;
+  if (!agentId) {
+    updateMessages(null);
+    return;
+  }
+  const baseUrl = window.location.origin;
+  try {
+    const res = await fetch(baseUrl + '/api/messages/' + agentId);
+    if (res.ok) updateMessages(await res.json());
+    else console.error('[messages] list failed:', res.status);
+  } catch (e) { console.error('[messages] list error:', e); }
+}
+
+async function sendMessage() {
+  const select = document.getElementById('msg-agent-select');
+  const textarea = document.getElementById('msg-content');
+  const sendBtn = document.getElementById('msg-send-btn');
+  if (!select || !textarea) return;
+
+  const toAgent = select.value;
+  const content = textarea.value.trim();
+
+  // Validation with visual feedback
+  if (!toAgent) {
+    select.style.borderColor = 'var(--danger)';
+    setTimeout(() => { select.style.borderColor = ''; }, 1500);
+    return;
+  }
+  if (!content) {
+    textarea.style.borderColor = 'var(--danger)';
+    setTimeout(() => { textarea.style.borderColor = ''; }, 1500);
+    return;
+  }
+
+  // Disable button during send
+  if (sendBtn) { sendBtn.disabled = true; sendBtn.textContent = '…'; }
+
+  const baseUrl = window.location.origin;
+  try {
+    const res = await fetch(baseUrl + '/api/messages', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({ to_agent: toAgent, content }),
+    });
+    if (res.ok) {
+      textarea.value = '';
+      // Flash success
+      if (sendBtn) { sendBtn.textContent = 'Sent!'; sendBtn.style.background = 'var(--success)'; }
+      setTimeout(() => {
+        if (sendBtn) { sendBtn.textContent = 'Send'; sendBtn.style.background = ''; }
+      }, 1000);
+      // Refresh message list
+      await selectMsgAgent(toAgent);
+    } else {
+      const errText = await res.text();
+      console.error('[messages] send failed:', res.status, errText);
+      if (sendBtn) { sendBtn.textContent = 'Error'; sendBtn.style.background = 'var(--danger)'; }
+      setTimeout(() => {
+        if (sendBtn) { sendBtn.textContent = 'Send'; sendBtn.style.background = ''; }
+      }, 2000);
+    }
+  } catch (e) {
+    console.error('[messages] send error:', e);
+    if (sendBtn) { sendBtn.textContent = 'Error'; sendBtn.style.background = 'var(--danger)'; }
+    setTimeout(() => {
+      if (sendBtn) { sendBtn.textContent = 'Send'; sendBtn.style.background = ''; }
+    }, 2000);
+  } finally {
+    if (sendBtn) sendBtn.disabled = false;
+  }
+}
+
+async function ackMessage(msgId) {
+  const baseUrl = window.location.origin;
+  try {
+    await fetch(baseUrl + '/api/messages/ack', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({ message_ids: [msgId] }),
+    });
+    if (_selectedMsgAgent) selectMsgAgent(_selectedMsgAgent);
+  } catch (e) { console.error('[messages] ack error:', e); }
+}
+
 // ── Init ──
 initChart();
 initTimelineChart();
+initMessagesUI();
 </script>
 </body>
 </html>

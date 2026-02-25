@@ -1402,6 +1402,7 @@ final class TerminalSurface: Identifiable, ObservableObject {
     private let surfaceContext: ghostty_surface_context_e
     private let configTemplate: ghostty_surface_config_s?
     private let workingDirectory: String?
+    private let command: String?
     let hostedView: GhosttySurfaceScrollView
     private let surfaceView: GhosttyNSView
     private var lastPixelWidth: UInt32 = 0
@@ -1447,13 +1448,15 @@ final class TerminalSurface: Identifiable, ObservableObject {
         tabId: UUID,
         context: ghostty_surface_context_e,
         configTemplate: ghostty_surface_config_s?,
-        workingDirectory: String? = nil
+        workingDirectory: String? = nil,
+        command: String? = nil
     ) {
         self.id = UUID()
         self.tabId = tabId
         self.surfaceContext = context
         self.configTemplate = configTemplate
         self.workingDirectory = workingDirectory?.trimmingCharacters(in: .whitespacesAndNewlines)
+        self.command = command
         // Match Ghostty's own SurfaceView: ensure a non-zero initial frame so the backing layer
         // has non-zero bounds and the renderer can initialize without presenting a blank/stretched
         // intermediate frame on the first real resize.
@@ -1750,9 +1753,28 @@ final class TerminalSurface: Identifiable, ObservableObject {
             }
         }
 
+        // Apply optional working directory and command, then create the surface.
+        // withCString keeps the C pointer alive during ghostty_surface_new.
+        // ghostty handles login shell setup via login(1) on macOS, so we pass
+        // the command directly without wrapping.
         if let workingDirectory, !workingDirectory.isEmpty {
-            workingDirectory.withCString { cWorkingDir in
-                surfaceConfig.working_directory = cWorkingDir
+            if let command, !command.isEmpty {
+                workingDirectory.withCString { cWorkingDir in
+                    command.withCString { cCmd in
+                        surfaceConfig.working_directory = cWorkingDir
+                        surfaceConfig.command = cCmd
+                        createSurface()
+                    }
+                }
+            } else {
+                workingDirectory.withCString { cWorkingDir in
+                    surfaceConfig.working_directory = cWorkingDir
+                    createSurface()
+                }
+            }
+        } else if let command, !command.isEmpty {
+            command.withCString { cCmd in
+                surfaceConfig.command = cCmd
                 createSurface()
             }
         } else {
@@ -4116,6 +4138,29 @@ final class GhosttySurfaceScrollView: NSView {
             }
         } else {
             applyFirstResponderIfNeeded()
+        }
+    }
+
+    /// Send a synthetic key press/release directly to the surface NSView.
+    /// Bypasses ghostty_surface_text (and thus bracketed paste mode).
+    func sendSyntheticKeyPress(keycode: UInt16, characters: String) {
+        guard let window = surfaceView.window else { return }
+        let ts = ProcessInfo.processInfo.systemUptime
+        if let down = NSEvent.keyEvent(
+            with: .keyDown, location: .zero, modifierFlags: [],
+            timestamp: ts, windowNumber: window.windowNumber, context: nil,
+            characters: characters, charactersIgnoringModifiers: characters,
+            isARepeat: false, keyCode: keycode
+        ) {
+            surfaceView.keyDown(with: down)
+        }
+        if let up = NSEvent.keyEvent(
+            with: .keyUp, location: .zero, modifierFlags: [],
+            timestamp: ts + 0.001, windowNumber: window.windowNumber, context: nil,
+            characters: characters, charactersIgnoringModifiers: characters,
+            isARepeat: false, keyCode: keycode
+        ) {
+            surfaceView.keyUp(with: up)
         }
     }
 

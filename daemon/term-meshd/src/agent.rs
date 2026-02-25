@@ -249,6 +249,15 @@ pub struct AgentSessionManager {
 struct Inner {
     db: Connection,
     sessions: HashMap<String, AgentSession>,
+    pending_inputs: HashMap<String, Vec<PendingInput>>,
+}
+
+/// A pending text input to be delivered to an agent's PTY via Swift polling.
+#[derive(Debug, Clone, Serialize)]
+pub struct PendingInput {
+    pub session_id: String,
+    pub text: String,
+    pub created_at_ms: u64,
 }
 
 fn now_ms() -> u64 {
@@ -396,7 +405,7 @@ impl AgentSessionManager {
         }
 
         Ok(Self {
-            inner: Mutex::new(Inner { db, sessions }),
+            inner: Mutex::new(Inner { db, sessions, pending_inputs: HashMap::new() }),
         })
     }
 
@@ -983,7 +992,7 @@ impl AgentSessionManager {
 
     /// Send a message to an agent.
     pub fn message_send(&self, params: MessageSendParams) -> Result<AgentMessage, String> {
-        let inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock().unwrap();
 
         // Verify recipient exists and is active
         if !inner.sessions.contains_key(&params.to_agent) {
@@ -996,6 +1005,18 @@ impl AgentSessionManager {
              VALUES (?1, ?2, ?3, 0, ?4)",
             params![params.from_agent, params.to_agent, params.content, ts],
         ).map_err(|e| format!("message insert failed: {e}"))?;
+
+        // Auto-enqueue input for PTY delivery
+        let from_label = params.from_agent.as_deref().unwrap_or("dashboard");
+        let formatted = format!("[MSG from {}]: {}", from_label, params.content);
+        inner.pending_inputs
+            .entry(params.to_agent.clone())
+            .or_default()
+            .push(PendingInput {
+                session_id: params.to_agent.clone(),
+                text: formatted,
+                created_at_ms: ts,
+            });
 
         let id = inner.db.last_insert_rowid();
         Ok(AgentMessage {
@@ -1059,6 +1080,39 @@ impl AgentSessionManager {
         let refs: Vec<&dyn rusqlite::types::ToSql> = message_ids.iter().map(|id| id as &dyn rusqlite::types::ToSql).collect();
         let count = stmt.execute(refs.as_slice()).map_err(|e| format!("ack failed: {e}"))?;
         Ok(count)
+    }
+
+    // -----------------------------------------------------------------------
+    // Pending Input Queue (PTY injection via Swift polling)
+    // -----------------------------------------------------------------------
+
+    /// Enqueue text to be delivered to an agent's PTY.
+    pub fn enqueue_input(&self, session_id: &str, text: &str) -> Result<(), String> {
+        let mut inner = self.inner.lock().unwrap();
+        match inner.sessions.get(session_id) {
+            Some(s) if s.status != SessionStatus::Terminated => {}
+            Some(_) => return Err(format!("session is terminated: {session_id}")),
+            None => return Err(format!("session not found: {session_id}")),
+        }
+        inner.pending_inputs
+            .entry(session_id.to_string())
+            .or_default()
+            .push(PendingInput {
+                session_id: session_id.to_string(),
+                text: text.to_string(),
+                created_at_ms: now_ms(),
+            });
+        Ok(())
+    }
+
+    /// Drain all pending inputs (called by Swift app via polling).
+    pub fn poll_inputs(&self) -> Vec<PendingInput> {
+        let mut inner = self.inner.lock().unwrap();
+        let mut all = Vec::new();
+        for (_, queue) in inner.pending_inputs.drain() {
+            all.extend(queue);
+        }
+        all
     }
 
     // -----------------------------------------------------------------------

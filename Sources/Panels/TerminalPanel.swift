@@ -86,13 +86,15 @@ final class TerminalPanel: Panel, ObservableObject {
         context: ghostty_surface_context_e = GHOSTTY_SURFACE_CONTEXT_SPLIT,
         configTemplate: ghostty_surface_config_s? = nil,
         workingDirectory: String? = nil,
-        portOrdinal: Int = 0
+        portOrdinal: Int = 0,
+        command: String? = nil
     ) {
         let surface = TerminalSurface(
             tabId: workspaceId,
             context: context,
             configTemplate: configTemplate,
-            workingDirectory: workingDirectory
+            workingDirectory: workingDirectory,
+            command: command
         )
         surface.portOrdinal = portOrdinal
         self.init(workspaceId: workspaceId, surface: surface)
@@ -156,6 +158,11 @@ final class TerminalPanel: Panel, ObservableObject {
 
     func sendText(_ text: String) {
         surface.sendText(text)
+    }
+
+    /// Send a synthetic key press via NSEvent (bypasses bracketed paste).
+    func sendKeyPress(keycode: UInt16, characters: String = "\r") {
+        hostedView.sendSyntheticKeyPress(keycode: keycode, characters: characters)
     }
 
     func performBindingAction(_ action: String) -> Bool {

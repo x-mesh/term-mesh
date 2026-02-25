@@ -66,6 +66,7 @@ pub async fn serve(
         .route("/api/agents/spawn", post(agents_spawn_handler))
         .route("/api/agents/{id}", get(agents_get_handler))
         .route("/api/agents/{id}/terminate", post(agents_terminate_handler))
+        .route("/api/agents/{id}/input", post(agents_input_handler))
         // Task & Message endpoints (F-06 Phase 2)
         .route("/api/tasks", get(tasks_list_handler).post(tasks_create_handler))
         .route("/api/tasks/{id}", get(tasks_get_handler).patch(tasks_update_handler))
@@ -258,6 +259,24 @@ async fn agents_terminate_handler(
     }
 }
 
+// --- Agent Input Handler (PTY injection) ---
+
+#[derive(Deserialize)]
+struct InputRequest {
+    text: String,
+}
+
+async fn agents_input_handler(
+    State(state): State<Arc<HttpState>>,
+    Path(id): Path<String>,
+    Json(req): Json<InputRequest>,
+) -> impl IntoResponse {
+    match state.agent_manager.enqueue_input(&id, &req.text) {
+        Ok(_) => StatusCode::OK.into_response(),
+        Err(e) => (StatusCode::BAD_REQUEST, e).into_response(),
+    }
+}
+
 // --- Task Handlers (F-06 Phase 2) ---
 
 #[derive(Deserialize)]
@@ -402,14 +421,21 @@ async fn messages_send_handler(
     State(state): State<Arc<HttpState>>,
     Json(req): Json<MessageSendRequest>,
 ) -> impl IntoResponse {
+    tracing::info!("POST /api/messages: to={} content_len={}", req.to_agent, req.content.len());
     let params = crate::agent::MessageSendParams {
         from_agent: req.from_agent,
         to_agent: req.to_agent,
         content: req.content,
     };
     match state.agent_manager.message_send(params) {
-        Ok(msg) => (StatusCode::CREATED, Json(serde_json::to_value(msg).unwrap())).into_response(),
-        Err(e) => (StatusCode::BAD_REQUEST, e).into_response(),
+        Ok(msg) => {
+            tracing::info!("message sent: id={}", msg.id);
+            (StatusCode::CREATED, Json(serde_json::to_value(msg).unwrap())).into_response()
+        }
+        Err(e) => {
+            tracing::warn!("message send failed: {}", e);
+            (StatusCode::BAD_REQUEST, e).into_response()
+        }
     }
 }
 
@@ -492,6 +518,16 @@ const HTTP_POLL_SCRIPT: &str = r#"<script>
         if (window.updateAgentStatus) updateAgentStatus(sessionsData);
       }
       if (usageRes.ok && window.updateUsage) updateUsage(await usageRes.json());
+
+      // Agents + Tasks + Messages
+      fetch(baseUrl + '/api/agents').then(r => r.ok ? r.json() : []).then(d => {
+        if (window.updateAgents) updateAgents(d);
+        if (window.refreshMsgAgentDropdown) refreshMsgAgentDropdown();
+      });
+      fetch(baseUrl + '/api/tasks').then(r => r.ok ? r.json() : []).then(d => {
+        if (window.updateTasks) updateTasks(d);
+      });
+      if (window.pollMessages) pollMessages();
     } catch (e) {
       document.getElementById('status').textContent = 'disconnected';
     }

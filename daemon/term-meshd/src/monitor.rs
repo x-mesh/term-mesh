@@ -1,5 +1,5 @@
 use serde::Serialize;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use sysinfo::{Pid, ProcessesToUpdate, System};
 use tokio::sync::watch;
 use tokio::time::{interval, Duration};
@@ -49,48 +49,16 @@ impl Default for BudgetConfig {
         Self {
             cpu_threshold_percent: 90.0,
             memory_threshold_bytes: 4 * 1024 * 1024 * 1024, // 4 GB
-            auto_stop: true,
+            auto_stop: false,
         }
     }
 }
 
-/// Detect the daemon's parent PID (typically the Swift app).
-fn detect_root_pid(sys: &mut System) -> Option<u32> {
-    let my_pid = std::process::id();
-    sys.refresh_processes(ProcessesToUpdate::Some(&[Pid::from_u32(my_pid)]), true);
-    let parent = sys
-        .process(Pid::from_u32(my_pid))
-        .and_then(|p| p.parent())
-        .map(|p| p.as_u32());
-    if let Some(ppid) = parent {
-        tracing::info!("auto-discovery root PID: {ppid} (daemon parent)");
-    }
-    parent
-}
-
-/// BFS to find all descendant PIDs of root_pid.
-fn find_descendants(sys: &System, root_pid: u32) -> HashSet<u32> {
-    let mut children_map: HashMap<u32, Vec<u32>> = HashMap::new();
-    for (&pid, proc_info) in sys.processes() {
-        if let Some(ppid) = proc_info.parent() {
-            children_map
-                .entry(ppid.as_u32())
-                .or_default()
-                .push(pid.as_u32());
-        }
-    }
-
-    let mut result = HashSet::new();
-    let mut queue: Vec<u32> = children_map.get(&root_pid).cloned().unwrap_or_default();
-    while let Some(pid) = queue.pop() {
-        if result.insert(pid) {
-            if let Some(kids) = children_map.get(&pid) {
-                queue.extend(kids);
-            }
-        }
-    }
-    result
-}
+// NOTE: Auto-discovery via root PID was removed. When the daemon is started
+// independently (e.g. nohup/make deploy), its parent is PID 1 (launchd),
+// causing find_descendants to return ALL system processes.
+// The Swift app's DashboardController now handles PID discovery and registers
+// the correct descendant PIDs via monitor.track RPC.
 
 /// Send a Unix signal to a process. Returns true on success.
 fn send_signal(pid: u32, signal: i32) -> bool {
@@ -113,36 +81,25 @@ pub fn start_monitor(
     let pids = handle.tracked_pids.clone();
     let stopped = handle.stopped_pids.clone();
     let auto_stop = handle.auto_stop.clone();
-    let daemon_pid = std::process::id();
-
     tokio::spawn(async move {
         let mut sys = System::new_all();
         let mut tick = interval(Duration::from_secs(2));
-
-        // Detect root PID (parent of daemon = Swift app)
-        let root_pid = detect_root_pid(&mut sys);
 
         loop {
             tick.tick().await;
             sys.refresh_memory();
             sys.refresh_cpu_usage();
 
-            // Refresh ALL processes for auto-discovery
-            sys.refresh_processes(ProcessesToUpdate::All, true);
+            // Only refresh tracked PIDs (registered by Swift app via monitor.track RPC)
+            let tracked_snapshot: Vec<u32> = pids.lock().unwrap().clone();
+            let pids_to_refresh: Vec<Pid> = tracked_snapshot.iter().map(|&p| Pid::from_u32(p)).collect();
+            if !pids_to_refresh.is_empty() {
+                sys.refresh_processes(ProcessesToUpdate::Some(&pids_to_refresh), true);
+            }
 
-            // Auto-discover descendants of root PID
-            if let Some(root) = root_pid {
-                let descendants = find_descendants(&sys, root);
+            // Remove dead PIDs from tracked list
+            {
                 let mut tracked = pids.lock().unwrap();
-
-                for &pid in &descendants {
-                    if pid != daemon_pid && !tracked.contains(&pid) {
-                        tracked.push(pid);
-                        tracing::debug!("auto-tracked PID {pid}");
-                    }
-                }
-
-                // Remove dead PIDs
                 tracked.retain(|&pid| sys.process(Pid::from_u32(pid)).is_some());
             }
 
@@ -334,36 +291,6 @@ impl MonitorHandle {
 mod tests {
     use super::*;
 
-    // ── find_descendants tests ──
-
-    #[test]
-    fn find_descendants_returns_children() {
-        // Use the real system — find descendants of PID 1 (launchd)
-        let sys = System::new_all();
-        let descendants = find_descendants(&sys, 1);
-        // PID 1 (launchd) should have many descendants on any macOS system
-        assert!(!descendants.is_empty());
-        // PID 1 itself should NOT be in the descendants
-        assert!(!descendants.contains(&1));
-    }
-
-    #[test]
-    fn find_descendants_nonexistent_pid() {
-        let sys = System::new_all();
-        // Use an impossibly high PID
-        let descendants = find_descendants(&sys, u32::MAX);
-        assert!(descendants.is_empty());
-    }
-
-    #[test]
-    fn find_descendants_no_cycles() {
-        // Ensure BFS terminates even with the full process tree
-        let sys = System::new_all();
-        let descendants = find_descendants(&sys, 1);
-        // If BFS had a cycle bug, this would hang. Completing is the assertion.
-        let _ = descendants.len();
-    }
-
     // ── BudgetConfig defaults ──
 
     #[test]
@@ -371,7 +298,7 @@ mod tests {
         let config = BudgetConfig::default();
         assert_eq!(config.cpu_threshold_percent, 90.0);
         assert_eq!(config.memory_threshold_bytes, 4 * 1024 * 1024 * 1024);
-        assert!(config.auto_stop);
+        assert!(!config.auto_stop);
     }
 
     // ── MonitorHandle PID tracking ──
@@ -381,7 +308,7 @@ mod tests {
         let handle = MonitorHandle {
             tracked_pids: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
             stopped_pids: std::sync::Arc::new(std::sync::Mutex::new(HashSet::new())),
-            auto_stop: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            auto_stop: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             cpu_threshold: 90.0,
             memory_threshold: 4 * 1024 * 1024 * 1024,
         };
@@ -410,7 +337,7 @@ mod tests {
         let handle = MonitorHandle {
             tracked_pids: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
             stopped_pids: std::sync::Arc::new(std::sync::Mutex::new(HashSet::new())),
-            auto_stop: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            auto_stop: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             cpu_threshold: 90.0,
             memory_threshold: 4 * 1024 * 1024 * 1024,
         };
@@ -430,15 +357,15 @@ mod tests {
         let handle = MonitorHandle {
             tracked_pids: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
             stopped_pids: std::sync::Arc::new(std::sync::Mutex::new(HashSet::new())),
-            auto_stop: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            auto_stop: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             cpu_threshold: 90.0,
             memory_threshold: 4 * 1024 * 1024 * 1024,
         };
 
-        assert!(handle.is_auto_stop());
-        handle.set_auto_stop(false);
         assert!(!handle.is_auto_stop());
         handle.set_auto_stop(true);
         assert!(handle.is_auto_stop());
+        handle.set_auto_stop(false);
+        assert!(!handle.is_auto_stop());
     }
 }

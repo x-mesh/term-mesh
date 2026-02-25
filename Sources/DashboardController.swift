@@ -126,6 +126,7 @@ final class DashboardController: NSObject, WKNavigationDelegate {
                 self?.watchTabProjects()
                 self?.syncSessionsToDaemon()
                 self?.pollAlerts()
+                self?.deliverPendingInputs()
             }
         }
     }
@@ -239,6 +240,52 @@ final class DashboardController: NSObject, WKNavigationDelegate {
         // Clean up notified PIDs for processes no longer in alerts
         let alertPIDs = Set(alerts.compactMap { ($0["pid"] as? Int).map { Int32($0) } })
         notifiedAlertPIDs = notifiedAlertPIDs.intersection(alertPIDs)
+    }
+
+    // MARK: - Pending Input Delivery (PTY injection)
+
+    /// Poll the daemon for pending inputs and deliver them to the appropriate terminal panels.
+    private func deliverPendingInputs() {
+        guard let tabManager else { return }
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            let daemon = TermMeshDaemon.shared
+            guard let json = daemon.rpcCallRaw(method: "input.poll", params: [:] as [String: Any]),
+                  let data = json.data(using: .utf8),
+                  let inputs = try? JSONSerialization.jsonObject(with: data) as? [[String: Any]]
+            else { return }
+            guard !inputs.isEmpty else { return }
+
+            DispatchQueue.main.async {
+                guard let self else { return }
+                for input in inputs {
+                    guard let sessionId = input["session_id"] as? String,
+                          let text = input["text"] as? String else { continue }
+                    if let panel = self.findTerminalPanel(agentSessionId: sessionId) {
+                        // Send message text via paste path
+                        panel.sendText(text)
+                        // Send Return key event after a short delay (bypasses
+                        // bracketed paste so it acts as a real Enter keypress).
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
+                            panel.sendKeyPress(keycode: 36, characters: "\r") // kVK_Return
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Find the TerminalPanel bound to a given agent session ID.
+    private func findTerminalPanel(agentSessionId: String) -> TerminalPanel? {
+        guard let tabManager else { return nil }
+        for workspace in tabManager.tabs {
+            for (_, panel) in workspace.panels {
+                if let terminal = panel as? TerminalPanel,
+                   terminal.agentSessionId == agentSessionId {
+                    return terminal
+                }
+            }
+        }
+        return nil
     }
 
     // MARK: - Process Discovery
@@ -401,6 +448,8 @@ final class DashboardController: NSObject, WKNavigationDelegate {
             let watcherData = daemon.rpcCallRaw(method: "watcher.snapshot", params: [:])
             let sessionData = daemon.rpcCallRaw(method: "session.list", params: [:])
             let usageData = daemon.rpcCallRaw(method: "usage.snapshot", params: [:])
+            let agentsData = daemon.rpcCallRaw(method: "agent.list", params: ["include_terminated": false])
+            let tasksData = daemon.rpcCallRaw(method: "task.list", params: [:] as [String: Any])
 
             DispatchQueue.main.async {
                 if let json = monitorData {
@@ -418,6 +467,12 @@ final class DashboardController: NSObject, WKNavigationDelegate {
                 }
                 if let json = usageData {
                     webView.evaluateJavaScript("if(window.updateUsage)updateUsage(\(json));") { _, _ in }
+                }
+                if let json = agentsData {
+                    webView.evaluateJavaScript("if(window.updateAgents)updateAgents(\(json));") { _, _ in }
+                }
+                if let json = tasksData {
+                    webView.evaluateJavaScript("if(window.updateTasks)updateTasks(\(json));") { _, _ in }
                 }
             }
         }

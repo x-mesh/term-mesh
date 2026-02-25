@@ -463,6 +463,21 @@ async fn dispatch(req: &Request, ctx: &Context) -> Response {
             }
         }
 
+        // --- Pending Input (PTY injection via Swift polling) ---
+        "input.enqueue" => {
+            #[derive(Deserialize)]
+            struct P { session_id: String, text: String }
+            match serde_json::from_value::<P>(req.params.clone()) {
+                Ok(p) => ctx.agent_manager.enqueue_input(&p.session_id, &p.text)
+                    .map(|_| serde_json::json!("ok")),
+                Err(e) => Err(format!("invalid params: {e}")),
+            }
+        }
+        "input.poll" => {
+            let inputs = ctx.agent_manager.poll_inputs();
+            Ok(serde_json::to_value(inputs).unwrap())
+        }
+
         _ => Err(format!("unknown method: {}", req.method)),
     };
 

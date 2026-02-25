@@ -15,16 +15,16 @@ fn main() -> ExitCode {
     match args[1].as_str() {
         "run" => {
             if args.len() < 3 {
-                eprintln!("term-mesh run: missing command");
-                eprintln!("Usage: term-mesh run [--sandbox] <command> [args...]");
+                eprintln!("term-mesh-run: missing command");
+                eprintln!("Usage: term-mesh-run [--sandbox] <command> [args...]");
                 return ExitCode::from(1);
             }
 
             // Parse --sandbox flag
             let (sandbox, cmd_start) = if args[2] == "--sandbox" {
                 if args.len() < 4 {
-                    eprintln!("term-mesh run --sandbox: missing command");
-                    eprintln!("Usage: term-mesh run --sandbox <command> [args...]");
+                    eprintln!("term-mesh-run --sandbox: missing command");
+                    eprintln!("Usage: term-mesh-run --sandbox <command> [args...]");
                     return ExitCode::from(1);
                 }
                 (true, 3)
@@ -41,7 +41,7 @@ fn main() -> ExitCode {
                 match pty::run_with_pty(cmd, &cmd_args, None) {
                     Ok((code, _pid)) => ExitCode::from(code as u8),
                     Err(e) => {
-                        eprintln!("term-mesh run: {}", e);
+                        eprintln!("term-mesh-run: {}", e);
                         ExitCode::from(1)
                     }
                 }
@@ -52,7 +52,7 @@ fn main() -> ExitCode {
             ExitCode::SUCCESS
         }
         other => {
-            eprintln!("term-mesh: unknown command '{}'", other);
+            eprintln!("term-mesh-run: unknown command '{}'", other);
             print_usage();
             ExitCode::from(1)
         }
@@ -71,12 +71,12 @@ fn run_sandboxed(cmd: &str, args: &[&str]) -> ExitCode {
     let repo_path = match detect_git_repo() {
         Some(p) => p,
         None => {
-            eprintln!("term-mesh: --sandbox requires a git repository");
+            eprintln!("term-mesh-run: --sandbox requires a git repository");
             eprintln!("  (not inside a git repo, falling back to plain PTY)");
             return match pty::run_with_pty(cmd, args, None) {
                 Ok((code, _)) => ExitCode::from(code as u8),
                 Err(e) => {
-                    eprintln!("term-mesh run: {}", e);
+                    eprintln!("term-mesh-run: {}", e);
                     ExitCode::from(1)
                 }
             };
@@ -86,12 +86,12 @@ fn run_sandboxed(cmd: &str, args: &[&str]) -> ExitCode {
     let mut client = match rpc::RpcClient::connect() {
         Some(c) => c,
         None => {
-            eprintln!("term-mesh: daemon not running, falling back to plain PTY");
+            eprintln!("term-mesh-run: daemon not running, falling back to plain PTY");
             eprintln!("  (start term-meshd for full sandbox support)");
             return match pty::run_with_pty(cmd, args, None) {
                 Ok((code, _)) => ExitCode::from(code as u8),
                 Err(e) => {
-                    eprintln!("term-mesh run: {}", e);
+                    eprintln!("term-mesh-run: {}", e);
                     ExitCode::from(1)
                 }
             };
@@ -105,12 +105,12 @@ fn run_sandboxed(cmd: &str, args: &[&str]) -> ExitCode {
     ) {
         Ok(info) => info,
         Err(e) => {
-            eprintln!("term-mesh: failed to create worktree: {}", e);
+            eprintln!("term-mesh-run: failed to create worktree: {}", e);
             eprintln!("  (falling back to plain PTY)");
             return match pty::run_with_pty(cmd, args, None) {
                 Ok((code, _)) => ExitCode::from(code as u8),
                 Err(e) => {
-                    eprintln!("term-mesh run: {}", e);
+                    eprintln!("term-mesh-run: {}", e);
                     ExitCode::from(1)
                 }
             };
@@ -129,12 +129,12 @@ fn run_sandboxed(cmd: &str, args: &[&str]) -> ExitCode {
         .to_string();
 
     if wt_path.is_empty() || wt_name.is_empty() {
-        eprintln!("term-mesh: invalid worktree response from daemon");
+        eprintln!("term-mesh-run: invalid worktree response from daemon");
         return ExitCode::from(1);
     }
 
     eprintln!(
-        "term-mesh: sandbox created at {}",
+        "term-mesh-run: sandbox created at {}",
         wt_path
     );
 
@@ -147,7 +147,7 @@ fn run_sandboxed(cmd: &str, args: &[&str]) -> ExitCode {
     let (exit_code, child_pid) = match result {
         Ok((code, pid)) => (code, Some(pid)),
         Err(e) => {
-            eprintln!("term-mesh run: {}", e);
+            eprintln!("term-mesh-run: {}", e);
             (1, None)
         }
     };
@@ -160,13 +160,13 @@ fn run_sandboxed(cmd: &str, args: &[&str]) -> ExitCode {
 
 /// Best-effort cleanup of sandbox resources.
 fn cleanup_sandbox(repo_path: &str, wt_name: &str, wt_path: &str, child_pid: Option<u32>) {
-    eprintln!("term-mesh: cleaning up sandbox...");
+    eprintln!("term-mesh-run: cleaning up sandbox...");
 
     // Reconnect (the previous connection may have been dropped)
     let mut client = match rpc::RpcClient::connect() {
         Some(c) => c,
         None => {
-            eprintln!("term-mesh: daemon not available for cleanup");
+            eprintln!("term-mesh-run: daemon not available for cleanup");
             return;
         }
     };
@@ -187,8 +187,8 @@ fn cleanup_sandbox(repo_path: &str, wt_name: &str, wt_path: &str, child_pid: Opt
             "name": wt_name,
         }),
     ) {
-        Ok(_) => eprintln!("term-mesh: sandbox removed"),
-        Err(e) => eprintln!("term-mesh: failed to remove worktree: {}", e),
+        Ok(_) => eprintln!("term-mesh-run: sandbox removed"),
+        Err(e) => eprintln!("term-mesh-run: failed to remove worktree: {}", e),
     }
 }
 
@@ -213,19 +213,19 @@ fn detect_git_repo() -> Option<String> {
 }
 
 fn print_usage() {
-    eprintln!("term-mesh — AI agent control plane CLI");
+    eprintln!("term-mesh-run — PTY wrapper for AI agents");
     eprintln!();
     eprintln!("Usage:");
-    eprintln!("  term-mesh run <command> [args...]            Run command in a PTY wrapper");
-    eprintln!("  term-mesh run --sandbox <command> [args...]  Run in a git worktree sandbox");
-    eprintln!("  term-mesh help                               Show this help");
+    eprintln!("  term-mesh-run <command> [args...]            Run command in a PTY wrapper");
+    eprintln!("  term-mesh-run --sandbox <command> [args...]  Run in a git worktree sandbox");
+    eprintln!("  term-mesh-run help                           Show this help");
     eprintln!();
     eprintln!("Sandbox mode:");
     eprintln!("  Creates a temporary git worktree, runs the command there, and cleans up");
     eprintln!("  on exit. Requires term-meshd daemon and a git repository.");
     eprintln!();
     eprintln!("Examples:");
-    eprintln!("  term-mesh run claude code");
-    eprintln!("  term-mesh run --sandbox claude code");
-    eprintln!("  term-mesh run -- kiro-cli chat \"fix this bug\"");
+    eprintln!("  term-mesh-run claude code");
+    eprintln!("  term-mesh-run --sandbox claude code");
+    eprintln!("  term-mesh-run -- kiro-cli chat \"fix this bug\"");
 }

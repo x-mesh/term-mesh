@@ -1161,7 +1161,8 @@ final class Workspace: Identifiable, ObservableObject {
         orientation: SplitOrientation,
         insertFirst: Bool = false,
         focus: Bool = true,
-        workingDirectory: String? = nil
+        workingDirectory: String? = nil,
+        command: String? = nil
     ) -> TerminalPanel? {
         // Find the pane containing the source panel
         guard let sourceTabId = surfaceIdFromPanelId(panelId) else { return nil }
@@ -1183,7 +1184,8 @@ final class Workspace: Identifiable, ObservableObject {
             context: GHOSTTY_SURFACE_CONTEXT_SPLIT,
             configTemplate: inheritedConfig,
             workingDirectory: workingDirectory,
-            portOrdinal: portOrdinal
+            portOrdinal: portOrdinal,
+            command: command
         )
         panels[newPanel.id] = newPanel
         panelTitles[newPanel.id] = newPanel.displayTitle
