@@ -301,6 +301,10 @@ final class Workspace: Identifiable, ObservableObject {
     /// Ordinal for CMUX_PORT range assignment (monotonically increasing per app session)
     var portOrdinal: Int = 0
 
+    /// term-mesh: Worktree metadata for auto-cleanup on tab close.
+    @Published var worktreeName: String?
+    var worktreeRepoPath: String?
+
     /// The bonsplit controller managing the split panes for this workspace
     let bonsplitController: BonsplitController
 
@@ -1156,7 +1160,9 @@ final class Workspace: Identifiable, ObservableObject {
         from panelId: UUID,
         orientation: SplitOrientation,
         insertFirst: Bool = false,
-        focus: Bool = true
+        focus: Bool = true,
+        workingDirectory: String? = nil,
+        command: String? = nil
     ) -> TerminalPanel? {
         // Find the pane containing the source panel
         guard let sourceTabId = surfaceIdFromPanelId(panelId) else { return nil }
@@ -1177,7 +1183,9 @@ final class Workspace: Identifiable, ObservableObject {
             workspaceId: id,
             context: GHOSTTY_SURFACE_CONTEXT_SPLIT,
             configTemplate: inheritedConfig,
-            portOrdinal: portOrdinal
+            workingDirectory: workingDirectory,
+            portOrdinal: portOrdinal,
+            command: command
         )
         panels[newPanel.id] = newPanel
         panelTitles[newPanel.id] = newPanel.displayTitle

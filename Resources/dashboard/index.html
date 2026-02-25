@@ -1,0 +1,1310 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>term-mesh Dashboard</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4/dist/chart.umd.min.js"></script>
+<style>
+  :root {
+    --bg: #1a1a2e;
+    --surface: #16213e;
+    --border: #0f3460;
+    --text: #e0e0e0;
+    --text-dim: #888;
+    --accent: #00adb5;
+    --danger: #e94560;
+    --success: #00c897;
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, 'SF Pro Text', sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    font-size: 13px;
+    overflow-x: hidden;
+  }
+  .header {
+    padding: 12px 16px;
+    border-bottom: 1px solid var(--border);
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+  .header h1 {
+    font-size: 14px;
+    font-weight: 600;
+    color: var(--accent);
+  }
+  .header .status {
+    font-size: 11px;
+    color: var(--text-dim);
+    margin-left: auto;
+  }
+  .grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 12px;
+    padding: 12px;
+  }
+  .card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 12px;
+  }
+  .card h2 {
+    font-size: 12px;
+    font-weight: 600;
+    color: var(--accent);
+    margin-bottom: 8px;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+  }
+  .card.full { grid-column: 1 / -1; }
+  .stat-row {
+    display: flex;
+    justify-content: space-between;
+    padding: 4px 0;
+    border-bottom: 1px solid rgba(255,255,255,0.05);
+  }
+  .stat-label { color: var(--text-dim); }
+  .stat-value { font-variant-numeric: tabular-nums; font-weight: 500; }
+  .chart-container {
+    position: relative;
+    height: 150px;
+  }
+  /* Watched projects */
+  .project-tag {
+    display: inline-block;
+    background: rgba(0, 173, 181, 0.15);
+    border: 1px solid rgba(0, 173, 181, 0.3);
+    border-radius: 4px;
+    padding: 2px 8px;
+    margin: 2px 4px 2px 0;
+    font-size: 11px;
+    font-family: 'SF Mono', 'Menlo', monospace;
+    color: var(--accent);
+  }
+  .project-tag .remove-btn {
+    cursor: pointer;
+    color: var(--text-dim);
+    margin-left: 4px;
+  }
+  .project-tag .remove-btn:hover { color: var(--danger); }
+  /* Heatmap */
+  .heatmap-bar {
+    display: flex;
+    align-items: center;
+    padding: 3px 0;
+    gap: 8px;
+  }
+  .heatmap-name {
+    flex: 1;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    font-size: 11px;
+    color: var(--text-dim);
+  }
+  .heatmap-meter {
+    width: 100px;
+    height: 6px;
+    background: rgba(255,255,255,0.05);
+    border-radius: 3px;
+    overflow: hidden;
+  }
+  .heatmap-fill {
+    height: 100%;
+    border-radius: 3px;
+    transition: width 0.3s ease;
+  }
+  .heatmap-count {
+    font-size: 11px;
+    font-variant-numeric: tabular-nums;
+    min-width: 30px;
+    text-align: right;
+  }
+  /* Alerts */
+  .alert {
+    background: rgba(233, 69, 96, 0.15);
+    border: 1px solid var(--danger);
+    border-radius: 6px;
+    padding: 8px 12px;
+    margin-bottom: 6px;
+    font-size: 12px;
+  }
+  .alert .pid { color: var(--danger); font-weight: 600; }
+  .alert.warning { background: rgba(240, 165, 0, 0.15); border-color: #f0a500; }
+  .alert.warning .pid { color: #f0a500; }
+  .alert .action-badge {
+    display: inline-block;
+    padding: 1px 6px;
+    border-radius: 3px;
+    font-size: 10px;
+    font-weight: 600;
+    text-transform: uppercase;
+    margin-left: 6px;
+  }
+  .alert .action-badge.stopped { background: var(--danger); color: #fff; }
+  .alert .action-badge.warning { background: #f0a500; color: #1a1a2e; }
+  /* Process controls */
+  .proc-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 4px 0;
+    border-bottom: 1px solid rgba(255,255,255,0.05);
+  }
+  .proc-info { flex: 1; }
+  .proc-status { font-size: 10px; font-weight: 600; text-transform: uppercase; margin-left: 8px; }
+  .proc-status.running { color: var(--success); }
+  .proc-status.stopped { color: var(--danger); }
+  .proc-btn {
+    background: none;
+    border: 1px solid var(--border);
+    color: var(--text);
+    padding: 2px 8px;
+    border-radius: 3px;
+    font-size: 10px;
+    cursor: pointer;
+    margin-left: 4px;
+  }
+  .proc-btn:hover { border-color: var(--accent); color: var(--accent); }
+  .proc-btn.stop { border-color: var(--danger); color: var(--danger); }
+  .proc-btn.stop:hover { background: rgba(233,69,96,0.15); }
+  .proc-btn.resume { border-color: var(--success); color: var(--success); }
+  .proc-btn.resume:hover { background: rgba(0,200,151,0.15); }
+  /* Event log */
+  .event-log {
+    max-height: 160px;
+    overflow-y: auto;
+    font-family: 'SF Mono', 'Menlo', monospace;
+    font-size: 11px;
+  }
+  .event-log .event {
+    padding: 2px 0;
+    display: flex;
+    gap: 8px;
+  }
+  .event .time { color: var(--text-dim); min-width: 65px; }
+  .event .kind { min-width: 48px; }
+  .event .kind.create { color: var(--success); }
+  .event .kind.modify { color: var(--accent); }
+  .event .kind.remove { color: var(--danger); }
+  .event .path { color: var(--text-dim); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  /* Folder tree heatmap */
+  .tree-node { font-family: 'SF Mono', 'Menlo', monospace; font-size: 11px; }
+  .tree-dir {
+    cursor: pointer;
+    padding: 2px 0;
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    user-select: none;
+  }
+  .tree-dir:hover { color: var(--accent); }
+  .tree-dir .arrow {
+    display: inline-block;
+    width: 12px;
+    text-align: center;
+    font-size: 9px;
+    color: var(--text-dim);
+    transition: transform 0.15s;
+  }
+  .tree-dir .arrow.open { transform: rotate(90deg); }
+  .tree-dir .dir-name { color: var(--text); font-weight: 500; }
+  .tree-dir .dir-count {
+    margin-left: auto;
+    font-size: 10px;
+    font-variant-numeric: tabular-nums;
+    padding: 0 4px;
+    border-radius: 3px;
+  }
+  .tree-children { padding-left: 16px; }
+  .tree-children.collapsed { display: none; }
+  .tree-file {
+    padding: 1px 0 1px 16px;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+  }
+  .tree-file .file-name {
+    color: var(--text-dim);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    flex: 1;
+  }
+  .tree-file .file-heat {
+    width: 60px;
+    height: 4px;
+    background: rgba(255,255,255,0.05);
+    border-radius: 2px;
+    overflow: hidden;
+  }
+  .tree-file .file-heat-fill {
+    height: 100%;
+    border-radius: 2px;
+  }
+  .tree-file .file-count {
+    font-size: 10px;
+    font-variant-numeric: tabular-nums;
+    min-width: 24px;
+    text-align: right;
+    color: var(--text-dim);
+  }
+  /* Budget gauge */
+  .budget-gauge {
+    margin-bottom: 6px;
+  }
+  .budget-gauge-header {
+    display: flex;
+    justify-content: space-between;
+    font-size: 11px;
+    margin-bottom: 2px;
+  }
+  .budget-gauge-bar {
+    height: 8px;
+    background: rgba(255,255,255,0.05);
+    border-radius: 4px;
+    overflow: hidden;
+  }
+  .budget-gauge-fill {
+    height: 100%;
+    border-radius: 4px;
+    transition: width 0.3s ease, background 0.3s ease;
+  }
+  .budget-toggle {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin: 8px 0 4px;
+    font-size: 11px;
+  }
+  .toggle-switch {
+    position: relative;
+    width: 32px;
+    height: 18px;
+    cursor: pointer;
+  }
+  .toggle-switch input { opacity: 0; width: 0; height: 0; }
+  .toggle-slider {
+    position: absolute;
+    inset: 0;
+    background: var(--border);
+    border-radius: 9px;
+    transition: 0.2s;
+  }
+  .toggle-slider:before {
+    content: "";
+    position: absolute;
+    height: 14px;
+    width: 14px;
+    left: 2px;
+    bottom: 2px;
+    background: var(--text);
+    border-radius: 50%;
+    transition: 0.2s;
+  }
+  .toggle-switch input:checked + .toggle-slider { background: var(--accent); }
+  .toggle-switch input:checked + .toggle-slider:before { transform: translateX(14px); }
+  /* Agent status */
+  .agent-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 4px 0;
+    border-bottom: 1px solid rgba(255,255,255,0.05);
+  }
+  .agent-dot {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    flex-shrink: 0;
+  }
+  .agent-dot.waiting {
+    background: var(--accent);
+    box-shadow: 0 0 6px var(--accent);
+    animation: pulse 1.5s ease-in-out infinite;
+  }
+  .agent-dot.idle { background: var(--text-dim); }
+  @keyframes pulse {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0.4; }
+  }
+  .agent-name { font-weight: 500; flex: 1; }
+  .agent-badge {
+    font-size: 10px;
+    padding: 1px 6px;
+    border-radius: 3px;
+    font-weight: 600;
+    text-transform: uppercase;
+  }
+  .agent-badge.waiting { background: rgba(0,173,181,0.2); color: var(--accent); }
+  .agent-badge.idle { background: rgba(255,255,255,0.05); color: var(--text-dim); }
+  .agent-notification {
+    font-size: 11px;
+    color: var(--text-dim);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    max-width: 200px;
+  }
+  .agent-time { font-size: 10px; color: var(--text-dim); min-width: 50px; text-align: right; }
+  /* Task Board — Kanban columns */
+  .task-board { display: flex; gap: 8px; overflow-x: auto; }
+  .task-column { flex: 1; min-width: 140px; }
+  .task-column-header { font-size: 10px; text-transform: uppercase; letter-spacing: 0.5px;
+    color: var(--text-dim); margin-bottom: 6px; }
+  .task-card { background: var(--bg); border: 1px solid var(--border); border-radius: 4px;
+    padding: 6px 8px; margin-bottom: 4px; font-size: 11px; cursor: pointer; }
+  .task-card:hover { border-color: var(--accent); }
+  .task-card .title { font-weight: 500; }
+  .task-card .meta { font-size: 10px; color: var(--text-dim); margin-top: 2px; }
+  .task-card .priority-dot { display: inline-block; width: 6px; height: 6px; border-radius: 50%; margin-right: 4px; }
+  .task-card .priority-dot.high { background: var(--danger); }
+  .task-card .priority-dot.medium { background: #f0a500; }
+  .task-card .priority-dot.low { background: var(--text-dim); }
+  .task-card .detail { display: none; margin-top: 6px; padding-top: 6px;
+    border-top: 1px solid rgba(255,255,255,0.05); font-size: 10px; color: var(--text-dim); }
+  .task-card.expanded .detail { display: block; }
+  .task-toolbar { display: flex; gap: 6px; margin-bottom: 8px; align-items: center; }
+  .task-toolbar input { background: var(--bg); border: 1px solid var(--border); color: var(--text);
+    padding: 4px 8px; border-radius: 4px; font-size: 11px; flex: 1; outline: none; }
+  .task-toolbar button { background: var(--accent); border: none; color: #fff;
+    padding: 4px 10px; border-radius: 4px; font-size: 11px; cursor: pointer; white-space: nowrap; }
+
+  /* Agent session row */
+  .agent-session { display: flex; align-items: center; gap: 8px; padding: 4px 0;
+    border-bottom: 1px solid rgba(255,255,255,0.05); font-size: 12px; }
+  .agent-session .name { font-weight: 500; flex: 1; }
+  .agent-session .branch { font-size: 10px; color: var(--text-dim); }
+  .agent-session .status-badge { font-size: 10px; padding: 1px 6px; border-radius: 3px; font-weight: 600; text-transform: uppercase; }
+  .agent-session .status-badge.running { background: rgba(0,200,151,0.2); color: var(--success); }
+  .agent-session .status-badge.detached { background: rgba(255,165,0,0.2); color: orange; }
+  .agent-session .status-badge.terminated { background: rgba(255,255,255,0.05); color: var(--text-dim); }
+  .agent-session .terminate-btn { background: none; border: 1px solid var(--danger); color: var(--danger);
+    padding: 1px 6px; border-radius: 3px; font-size: 10px; cursor: pointer; }
+  .agent-session .terminate-btn:hover { background: rgba(233,69,96,0.15); }
+
+  /* Message card */
+  .msg-toolbar { display: flex; gap: 6px; margin-bottom: 6px; align-items: center; }
+  .msg-toolbar select, .msg-toolbar input, .msg-toolbar textarea {
+    background: var(--bg); border: 1px solid var(--border); color: var(--text);
+    padding: 4px 8px; border-radius: 4px; font-size: 11px; outline: none; }
+  .msg-toolbar select { min-width: 100px; }
+  .msg-toolbar textarea { flex: 1; resize: none; height: 28px; font-family: inherit; }
+  .msg-toolbar button { background: var(--accent); border: none; color: #fff;
+    padding: 4px 10px; border-radius: 4px; font-size: 11px; cursor: pointer; }
+  .msg-row { padding: 4px 0; border-bottom: 1px solid rgba(255,255,255,0.05); font-size: 11px; }
+  .msg-row.unread { background: rgba(0,173,181,0.08); }
+  .msg-from { color: var(--accent); font-weight: 500; }
+  .msg-time { color: var(--text-dim); font-size: 10px; float: right; }
+  .msg-ack-btn { background: none; border: 1px solid var(--border); color: var(--text-dim);
+    padding: 0 4px; border-radius: 2px; font-size: 9px; cursor: pointer; margin-left: 4px; }
+  .msg-ack-btn:hover { border-color: var(--accent); color: var(--accent); }
+
+  /* No data */
+  .empty { color: var(--text-dim); font-style: italic; padding: 20px 0; text-align: center; }
+</style>
+</head>
+<body>
+
+<div class="header">
+  <h1>term-mesh</h1>
+  <div id="session-picker"></div>
+  <span class="status" id="status">connecting...</span>
+</div>
+
+<div class="grid">
+  <!-- Watched Projects (per terminal tab) -->
+  <div class="card full">
+    <h2>Watched Projects (per terminal tab)</h2>
+    <div id="watched-projects"><div class="empty">No projects watched</div></div>
+  </div>
+
+  <!-- Agent Status -->
+  <div class="card full" id="agent-status-card" style="display:none">
+    <h2>Agent Status</h2>
+    <div id="agent-status"></div>
+  </div>
+
+  <!-- System Resources -->
+  <div class="card">
+    <h2>System</h2>
+    <div id="system-stats">
+      <div class="stat-row"><span class="stat-label">Memory</span><span class="stat-value" id="mem-usage">—</span></div>
+      <div class="stat-row"><span class="stat-label">CPUs</span><span class="stat-value" id="cpu-count">—</span></div>
+    </div>
+  </div>
+
+  <!-- API Usage (Claude Code JSONL) -->
+  <div class="card">
+    <h2>API Usage</h2>
+    <div id="usage-stats"><div class="empty">Scanning...</div></div>
+  </div>
+
+  <!-- Agent Sessions (full width) -->
+  <div class="card full" id="agents-card">
+    <h2>Agent Sessions</h2>
+    <div id="agents-list"><div class="empty">No agents</div></div>
+  </div>
+
+  <!-- Task Board (full width) -->
+  <div class="card full" id="tasks-card">
+    <h2>Tasks</h2>
+    <div id="tasks-toolbar"></div>
+    <div id="tasks-board"><div class="empty">No tasks</div></div>
+  </div>
+
+  <!-- Budget Guard -->
+  <div class="card">
+    <h2>Budget Guard</h2>
+    <div id="budget-overview"></div>
+    <div id="alerts" style="margin-top:8px"></div>
+  </div>
+
+  <!-- Process Monitor Chart -->
+  <div class="card full">
+    <h2>Process Monitor</h2>
+    <div id="process-list"></div>
+    <div class="chart-container">
+      <canvas id="cpuChart"></canvas>
+    </div>
+  </div>
+
+  <!-- File Activity Timeline -->
+  <div class="card full">
+    <h2>File Activity Timeline (per minute)</h2>
+    <div class="chart-container" style="height:120px">
+      <canvas id="timelineChart"></canvas>
+    </div>
+  </div>
+
+  <!-- File Heatmap Tree -->
+  <div class="card">
+    <h2>File Heatmap</h2>
+    <div id="heatmap"><div class="empty">No files tracked</div></div>
+  </div>
+
+  <!-- Event Log -->
+  <div class="card">
+    <h2>Recent Events</h2>
+    <div class="event-log" id="event-log"><div class="empty">No events</div></div>
+  </div>
+
+  <!-- Messages -->
+  <div class="card" id="messages-card">
+    <h2>Messages</h2>
+    <div id="messages-list"><div class="empty">No messages</div></div>
+  </div>
+</div>
+
+<script>
+// ── State ──
+let cpuHistory = [];
+const MAX_HISTORY = 30;
+let cpuChart = null;
+let timelineChart = null;
+let watchedPaths = []; // tracks current watched project roots
+
+// ── Helpers ──
+function initChart() {
+  const ctx = document.getElementById('cpuChart').getContext('2d');
+  cpuChart = new Chart(ctx, {
+    type: 'line',
+    data: { labels: Array(MAX_HISTORY).fill(''), datasets: [] },
+    options: {
+      responsive: true,
+      maintainAspectRatio: false,
+      animation: { duration: 300 },
+      scales: {
+        x: { display: false },
+        y: {
+          beginAtZero: true, max: 100,
+          ticks: { color: '#888', font: { size: 10 }, callback: v => v + '%' },
+          grid: { color: 'rgba(255,255,255,0.05)' }
+        }
+      },
+      plugins: {
+        legend: { display: true, position: 'top',
+                  labels: { color: '#888', font: { size: 10 }, boxWidth: 12 } }
+      }
+    }
+  });
+}
+
+function initTimelineChart() {
+  const ctx = document.getElementById('timelineChart').getContext('2d');
+  timelineChart = new Chart(ctx, {
+    type: 'bar',
+    data: { labels: [], datasets: [] },
+    options: {
+      responsive: true,
+      maintainAspectRatio: false,
+      animation: { duration: 300 },
+      scales: {
+        x: {
+          stacked: true,
+          ticks: { color: '#888', font: { size: 9 }, maxRotation: 0 },
+          grid: { display: false }
+        },
+        y: {
+          stacked: true,
+          beginAtZero: true,
+          ticks: { color: '#888', font: { size: 9 }, precision: 0 },
+          grid: { color: 'rgba(255,255,255,0.05)' }
+        }
+      },
+      plugins: {
+        legend: { display: true, position: 'top',
+                  labels: { color: '#888', font: { size: 9 }, boxWidth: 10, padding: 8 } },
+        tooltip: {
+          callbacks: {
+            title: (items) => items[0]?.label || '',
+            label: (item) => `${item.dataset.label}: ${item.raw} events`
+          }
+        }
+      }
+    }
+  });
+}
+
+function formatBytes(bytes) {
+  if (bytes < 1024) return bytes + ' B';
+  if (bytes < 1024*1024) return (bytes/1024).toFixed(1) + ' KB';
+  if (bytes < 1024*1024*1024) return (bytes/1024/1024).toFixed(1) + ' MB';
+  return (bytes/1024/1024/1024).toFixed(2) + ' GB';
+}
+
+function formatTokens(count) {
+  if (count < 1000) return count.toString();
+  if (count < 1000000) return (count / 1000).toFixed(1) + 'k';
+  return (count / 1000000).toFixed(2) + 'M';
+}
+
+function formatCost(usd) {
+  if (usd < 0.01) return '<$0.01';
+  if (usd < 1) return '$' + usd.toFixed(3);
+  return '$' + usd.toFixed(2);
+}
+
+function costColor(usd) {
+  if (usd > 50) return '#e94560';
+  if (usd > 10) return '#f0a500';
+  return '#00c897';
+}
+
+function formatTime(ms) {
+  const d = new Date(ms);
+  return d.toLocaleTimeString('en-US', { hour12: false, hour: '2-digit', minute: '2-digit', second: '2-digit' });
+}
+
+const COLORS = ['#00adb5','#e94560','#00c897','#f0a500','#9b59b6','#3498db','#e74c3c','#2ecc71'];
+
+/// Convert absolute path to project-relative path.
+/// e.g., "/Users/j/work/proj/src/main.rs" → "src/main.rs" if "/Users/j/work/proj" is watched.
+function toRelativePath(absPath) {
+  for (const wp of watchedPaths) {
+    if (absPath.startsWith(wp + '/')) {
+      return absPath.slice(wp.length + 1);
+    }
+  }
+  // Fallback: show last 3 segments
+  return absPath.split('/').slice(-3).join('/');
+}
+
+/// Extract short project name from a watched path.
+function projectName(path) {
+  const parts = path.split('/');
+  return parts[parts.length - 1] || path;
+}
+
+// ── Data Update ──
+
+function updateMonitor(data) {
+  if (!data) return;
+  document.getElementById('status').textContent = 'live';
+
+  // System stats
+  document.getElementById('mem-usage').textContent =
+    formatBytes(data.used_memory_bytes) + ' / ' + formatBytes(data.total_memory_bytes);
+  document.getElementById('cpu-count').textContent = data.cpu_count + ' cores';
+
+  // Process list with stop/resume controls
+  const procEl = document.getElementById('process-list');
+  if (data.processes.length === 0) {
+    procEl.innerHTML = '<div class="empty">No tracked processes</div>';
+  } else {
+    procEl.innerHTML = data.processes.map(p => {
+      const statusClass = p.stopped ? 'stopped' : 'running';
+      const statusText = p.stopped ? 'STOPPED' : 'running';
+      const btn = p.stopped
+        ? `<button class="proc-btn resume" onclick="resumeProcess(${p.pid})">Resume</button>`
+        : `<button class="proc-btn stop" onclick="stopProcess(${p.pid})">Stop</button>`;
+      return `<div class="proc-row">
+        <div class="proc-info">
+          <span class="stat-label">PID ${p.pid} (${p.name})</span>
+          <span class="proc-status ${statusClass}">${statusText}</span>
+        </div>
+        <span class="stat-value">${p.cpu_percent.toFixed(1)}% · ${formatBytes(p.memory_bytes)}</span>
+        ${btn}
+      </div>`;
+    }).join('');
+  }
+
+  // CPU chart
+  if (cpuChart) {
+    cpuHistory.push(data.processes.map(p => ({ pid: p.pid, name: p.name, cpu: p.cpu_percent })));
+    if (cpuHistory.length > MAX_HISTORY) cpuHistory.shift();
+
+    const allPids = [...new Set(cpuHistory.flatMap(h => h.map(p => p.pid)))];
+    cpuChart.data.labels = Array(cpuHistory.length).fill('');
+    cpuChart.data.datasets = allPids.map((pid, i) => ({
+      label: `PID ${pid}`,
+      data: cpuHistory.map(h => { const p = h.find(x => x.pid === pid); return p ? p.cpu : 0; }),
+      borderColor: COLORS[i % COLORS.length],
+      backgroundColor: COLORS[i % COLORS.length] + '20',
+      borderWidth: 1.5, tension: 0.3, fill: true, pointRadius: 0,
+    }));
+    cpuChart.update('none');
+  }
+
+  // Budget overview with gauges and toggle
+  const budgetEl = document.getElementById('budget-overview');
+  if (data.budget_config && data.processes.length > 0) {
+    const cfg = data.budget_config;
+    // Find peak CPU and memory among tracked processes
+    const peakCpu = Math.max(...data.processes.map(p => p.cpu_percent), 0);
+    const totalMem = data.processes.reduce((sum, p) => sum + p.memory_bytes, 0);
+    const cpuPct = Math.min(peakCpu / cfg.cpu_threshold_percent * 100, 100).toFixed(0);
+    const memPct = Math.min(totalMem / cfg.memory_threshold_bytes * 100, 100).toFixed(0);
+    const cpuColor = peakCpu > cfg.cpu_threshold_percent * 0.8 ? '#e94560' : peakCpu > cfg.cpu_threshold_percent * 0.5 ? '#f0a500' : '#00c897';
+    const memColor = totalMem > cfg.memory_threshold_bytes * 0.8 ? '#e94560' : totalMem > cfg.memory_threshold_bytes * 0.5 ? '#f0a500' : '#00c897';
+
+    // API cost from usage_summary
+    const us = data.usage_summary;
+    const costLine = us && us.total_cost_usd > 0
+      ? `<div class="stat-row"><span class="stat-label">API Cost</span><span class="stat-value" style="color:${costColor(us.total_cost_usd)}">${formatCost(us.total_cost_usd)}</span></div>`
+      : '';
+
+    budgetEl.innerHTML = `
+      <div class="budget-gauge">
+        <div class="budget-gauge-header">
+          <span style="color:var(--text-dim)">Peak CPU</span>
+          <span>${peakCpu.toFixed(1)}% / ${cfg.cpu_threshold_percent.toFixed(0)}%</span>
+        </div>
+        <div class="budget-gauge-bar">
+          <div class="budget-gauge-fill" style="width:${cpuPct}%;background:${cpuColor}"></div>
+        </div>
+      </div>
+      <div class="budget-gauge">
+        <div class="budget-gauge-header">
+          <span style="color:var(--text-dim)">Total Memory</span>
+          <span>${formatBytes(totalMem)} / ${formatBytes(cfg.memory_threshold_bytes)}</span>
+        </div>
+        <div class="budget-gauge-bar">
+          <div class="budget-gauge-fill" style="width:${memPct}%;background:${memColor}"></div>
+        </div>
+      </div>
+      ${costLine}
+      <div class="budget-toggle">
+        <label class="toggle-switch">
+          <input type="checkbox" ${cfg.auto_stop ? 'checked' : ''} onchange="toggleAutoStop(this.checked)">
+          <span class="toggle-slider"></span>
+        </label>
+        <span>Auto-stop on threshold (SIGSTOP)</span>
+      </div>
+    `;
+  } else if (data.processes.length === 0) {
+    budgetEl.innerHTML = '<div class="empty" style="padding:8px 0">No tracked processes</div>';
+  }
+
+  // Alerts with action badges
+  const alertsEl = document.getElementById('alerts');
+  if (data.alerts.length === 0) {
+    alertsEl.innerHTML = '';
+  } else {
+    alertsEl.innerHTML = data.alerts.map(a => {
+      const alertClass = a.action === 'stopped' ? '' : ' warning';
+      const valueStr = a.kind === 'cpu' ? a.value.toFixed(1) + '%' : formatBytes(a.value);
+      const threshStr = a.kind === 'cpu' ? a.threshold.toFixed(0) + '%' : formatBytes(a.threshold);
+      const actionBtn = a.action === 'stopped'
+        ? `<button class="proc-btn resume" onclick="resumeProcess(${a.pid})" style="margin-left:8px">Resume</button>`
+        : '';
+      return `<div class="alert${alertClass}">
+        <span class="pid">PID ${a.pid}</span> ${a.name || ''} — ${a.kind} ${valueStr} &gt; ${threshStr}
+        <span class="action-badge ${a.action}">${a.action}</span>
+        ${actionBtn}
+      </div>`;
+    }).join('');
+  }
+}
+
+function updateHeatmap(data) {
+  if (!data) return;
+
+  // Update watched paths state
+  watchedPaths = data.watched_paths || [];
+
+  // Watched projects display
+  const wpEl = document.getElementById('watched-projects');
+  if (watchedPaths.length === 0) {
+    wpEl.innerHTML = '<div class="empty">No projects watched — open terminal tabs to auto-watch project directories</div>';
+  } else {
+    wpEl.innerHTML = watchedPaths.map(p =>
+      `<span class="project-tag" title="${p}">${projectName(p)}</span>`
+    ).join('');
+  }
+
+  // Heatmap — folder tree with color overlay
+  const heatmapEl = document.getElementById('heatmap');
+  if (data.top_files.length === 0) {
+    heatmapEl.innerHTML = '<div class="empty">No file activity</div>';
+  } else {
+    const maxCount = Math.max(...data.top_files.map(f => f.event_count), 1);
+    const tree = buildFileTree(data.top_files);
+    heatmapEl.innerHTML = renderTree(tree, maxCount);
+  }
+
+  // Timeline chart — per-minute stacked bar
+  if (timelineChart && data.timeline) {
+    const now = Date.now();
+    const minuteMs = 60000;
+    // Build 10-minute range with labels
+    const labels = [];
+    const createData = [];
+    const modifyData = [];
+    const removeData = [];
+    const bucketMap = {};
+    for (const b of data.timeline) {
+      bucketMap[b.minute_ms] = b;
+    }
+    for (let i = 9; i >= 0; i--) {
+      const t = Math.floor((now - i * minuteMs) / minuteMs) * minuteMs;
+      const d = new Date(t);
+      labels.push(d.toLocaleTimeString('en-US', { hour12: false, minute: '2-digit', second: '2-digit' }).slice(0, 5));
+      const b = bucketMap[t];
+      createData.push(b ? b.create : 0);
+      modifyData.push(b ? b.modify : 0);
+      removeData.push(b ? b.remove : 0);
+    }
+    timelineChart.data.labels = labels;
+    timelineChart.data.datasets = [
+      { label: 'Create', data: createData, backgroundColor: '#00c89780', borderRadius: 2 },
+      { label: 'Modify', data: modifyData, backgroundColor: '#00adb580', borderRadius: 2 },
+      { label: 'Remove', data: removeData, backgroundColor: '#e9456080', borderRadius: 2 },
+    ];
+    timelineChart.update('none');
+  }
+
+  // Event log — show project-relative paths
+  const logEl = document.getElementById('event-log');
+  if (data.recent_events.length === 0) {
+    logEl.innerHTML = '<div class="empty">No events</div>';
+  } else {
+    logEl.innerHTML = data.recent_events.slice(0, 30).map(e => {
+      const relPath = toRelativePath(e.path);
+      return `<div class="event">
+        <span class="time">${formatTime(e.timestamp_ms)}</span>
+        <span class="kind ${e.kind}">${e.kind}</span>
+        <span class="path" title="${e.path}">${relPath}</span>
+      </div>`;
+    }).join('');
+  }
+}
+
+// ── Agent Status ──
+function updateAgentStatus(sessions) {
+  if (!sessions || sessions.length === 0) {
+    document.getElementById('agent-status-card').style.display = 'none';
+    return;
+  }
+  const waitingSessions = sessions.filter(s => s.agent_state === 'waiting');
+  if (waitingSessions.length === 0) {
+    document.getElementById('agent-status-card').style.display = 'none';
+    return;
+  }
+  document.getElementById('agent-status-card').style.display = '';
+  const el = document.getElementById('agent-status');
+  el.innerHTML = sessions.map(s => {
+    const isWaiting = s.agent_state === 'waiting';
+    const dotClass = isWaiting ? 'waiting' : 'idle';
+    const badgeClass = isWaiting ? 'waiting' : 'idle';
+    const badgeText = isWaiting ? 'needs input' : 'idle';
+    const notifTitle = s.notification_title ? `<span class="agent-notification">${s.notification_title}</span>` : '';
+    const timeAgo = s.notification_ts ? formatTimeAgo(s.notification_ts) : '';
+    const branchStr = s.git_branch ? ` <span style="color:var(--text-dim);font-size:11px">[${s.git_branch}]</span>` : '';
+    return `<div class="agent-row">
+      <span class="agent-dot ${dotClass}"></span>
+      <span class="agent-name">${s.name}${branchStr}</span>
+      ${notifTitle}
+      <span class="agent-badge ${badgeClass}">${badgeText}</span>
+      <span class="agent-time">${timeAgo}</span>
+    </div>`;
+  }).join('');
+}
+
+function formatTimeAgo(ms) {
+  const diff = Date.now() - ms;
+  if (diff < 60000) return Math.floor(diff / 1000) + 's ago';
+  if (diff < 3600000) return Math.floor(diff / 60000) + 'm ago';
+  return Math.floor(diff / 3600000) + 'h ago';
+}
+
+// ── API Usage (JSONL-based) ──
+function updateUsage(data) {
+  const el = document.getElementById('usage-stats');
+  if (!data || !data.sessions || data.sessions.length === 0) {
+    el.innerHTML = '<div class="empty">No Claude Code sessions found</div>';
+    return;
+  }
+
+  // Total cost
+  let html = `<div class="stat-row" style="margin-bottom:6px">
+    <span class="stat-label" style="font-weight:600">Total Cost</span>
+    <span class="stat-value" style="font-size:16px;color:${costColor(data.total_cost_usd)}">${formatCost(data.total_cost_usd)}</span>
+  </div>`;
+
+  // Totals summary
+  html += `<div class="stat-row">
+    <span class="stat-label">Input</span>
+    <span class="stat-value">${formatTokens(data.total_input_tokens)}</span>
+  </div>
+  <div class="stat-row">
+    <span class="stat-label">Output</span>
+    <span class="stat-value">${formatTokens(data.total_output_tokens)}</span>
+  </div>
+  <div class="stat-row">
+    <span class="stat-label">Cache Read</span>
+    <span class="stat-value">${formatTokens(data.total_cache_read_tokens)}</span>
+  </div>
+  <div class="stat-row" style="margin-bottom:8px">
+    <span class="stat-label">Cache Write</span>
+    <span class="stat-value">${formatTokens(data.total_cache_write_tokens)}</span>
+  </div>`;
+
+  // Per-session breakdown (sorted by cost descending, top 5)
+  const sorted = [...data.sessions].sort((a, b) => b.cost_usd - a.cost_usd).slice(0, 5);
+  for (const s of sorted) {
+    const projName = s.project_path.split('/').pop() || s.project_path;
+    const modelShort = s.model.replace('claude-', '').replace(/-20\d{6}$/, '');
+    html += `<div class="stat-row">
+      <span class="stat-label" title="${s.session_id}">${projName} <span style="color:var(--text-dim);font-size:10px">(${modelShort}, ${s.api_calls} calls)</span></span>
+      <span class="stat-value" style="color:${costColor(s.cost_usd)}">${formatCost(s.cost_usd)}</span>
+    </div>`;
+  }
+
+  el.innerHTML = html;
+}
+
+// ── Folder Tree Heatmap ──
+// Track which directories are expanded (persists across updates)
+const expandedDirs = new Set();
+
+function buildFileTree(files) {
+  const root = { dirs: {}, files: [], totalCount: 0 };
+  for (const f of files) {
+    const relPath = toRelativePath(f.path);
+    const parts = relPath.split('/');
+    let node = root;
+    // Navigate/create directory nodes
+    for (let i = 0; i < parts.length - 1; i++) {
+      if (!node.dirs[parts[i]]) {
+        node.dirs[parts[i]] = { dirs: {}, files: [], totalCount: 0 };
+      }
+      node = node.dirs[parts[i]];
+    }
+    // Add file to leaf directory
+    node.files.push({ name: parts[parts.length - 1], count: f.event_count, path: f.path });
+    // Accumulate counts up to root
+    let acc = root;
+    acc.totalCount += f.event_count;
+    for (let i = 0; i < parts.length - 1; i++) {
+      acc = acc.dirs[parts[i]];
+      acc.totalCount += f.event_count;
+    }
+  }
+  return root;
+}
+
+function heatColor(count, maxCount) {
+  const ratio = count / maxCount;
+  const hue = Math.max(0, 120 - ratio * 120); // green→red
+  return `hsl(${hue},70%,50%)`;
+}
+
+function heatBg(count, maxCount) {
+  const ratio = count / maxCount;
+  const hue = Math.max(0, 120 - ratio * 120);
+  return `hsla(${hue},70%,50%,0.12)`;
+}
+
+function renderTree(node, maxCount, prefix) {
+  let html = '';
+  // Sort dirs by totalCount descending
+  const dirEntries = Object.entries(node.dirs).sort((a, b) => b[1].totalCount - a[1].totalCount);
+  for (const [dirName, dir] of dirEntries) {
+    const dirId = (prefix || '') + dirName + '/';
+    const isOpen = expandedDirs.has(dirId);
+    const color = heatColor(dir.totalCount, maxCount);
+    const bg = heatBg(dir.totalCount, maxCount);
+    html += `<div class="tree-node">
+      <div class="tree-dir" onclick="toggleDir('${dirId}')">
+        <span class="arrow ${isOpen ? 'open' : ''}">▶</span>
+        <span class="dir-name">📁 ${dirName}</span>
+        <span class="dir-count" style="color:${color};background:${bg}">${dir.totalCount}</span>
+      </div>
+      <div class="tree-children ${isOpen ? '' : 'collapsed'}" id="dir-${CSS.escape(dirId)}">
+        ${renderTree(dir, maxCount, dirId)}
+      </div>
+    </div>`;
+  }
+  // Sort files by count descending
+  const sortedFiles = [...node.files].sort((a, b) => b.count - a.count);
+  for (const f of sortedFiles) {
+    const pct = (f.count / maxCount * 100).toFixed(0);
+    const color = heatColor(f.count, maxCount);
+    html += `<div class="tree-file" title="${f.path}">
+      <span class="file-name">${f.name}</span>
+      <div class="file-heat">
+        <div class="file-heat-fill" style="width:${pct}%;background:${color}"></div>
+      </div>
+      <span class="file-count" style="color:${color}">${f.count}</span>
+    </div>`;
+  }
+  return html;
+}
+
+function toggleDir(dirId) {
+  if (expandedDirs.has(dirId)) {
+    expandedDirs.delete(dirId);
+  } else {
+    expandedDirs.add(dirId);
+  }
+  // Re-render is handled by next poll cycle; for instant feedback, toggle manually
+  const el = document.getElementById('dir-' + CSS.escape(dirId));
+  if (el) el.classList.toggle('collapsed');
+  // Toggle arrow
+  const parent = el?.parentElement;
+  if (parent) {
+    const arrow = parent.querySelector('.arrow');
+    if (arrow) arrow.classList.toggle('open');
+  }
+}
+
+// ── Process Control ──
+const isWKWebView = !!(window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.stopProcess);
+
+async function stopProcess(pid) {
+  if (isWKWebView) {
+    window.webkit.messageHandlers.stopProcess.postMessage(pid);
+    return;
+  }
+  const baseUrl = window.location.origin;
+  if (baseUrl.startsWith('http')) {
+    await fetch(baseUrl + '/api/process/stop', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({pid}),
+    });
+  }
+}
+
+async function toggleAutoStop(enabled) {
+  if (isWKWebView) {
+    window.webkit.messageHandlers.setAutoStop.postMessage(enabled);
+    return;
+  }
+  const baseUrl = window.location.origin;
+  if (baseUrl.startsWith('http')) {
+    await fetch(baseUrl + '/api/budget/auto-stop', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({enabled}),
+    });
+  }
+}
+
+async function resumeProcess(pid) {
+  if (isWKWebView) {
+    window.webkit.messageHandlers.resumeProcess.postMessage(pid);
+    return;
+  }
+  const baseUrl = window.location.origin;
+  if (baseUrl.startsWith('http')) {
+    await fetch(baseUrl + '/api/process/resume', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({pid}),
+    });
+  }
+}
+
+// ── Agent Sessions ──
+let _cachedAgents = []; // shared with messages dropdown
+
+function updateAgents(agents) {
+  if (!agents) return;
+  _cachedAgents = agents;
+  const el = document.getElementById('agents-list');
+  if (!agents.length) {
+    el.innerHTML = '<div class="empty">No agents</div>';
+    return;
+  }
+  el.innerHTML = agents.map(a => {
+    const isDetached = a.status === 'running' && !a.panel_id;
+    const statusClass = a.status === 'terminated' ? 'terminated' : (isDetached ? 'detached' : 'running');
+    const statusText = isDetached ? 'detached' : a.status;
+    const branch = a.worktree_branch ? ` <span class="branch">[${a.worktree_branch}]</span>` : '';
+    const terminateBtn = a.status !== 'terminated'
+      ? `<button class="terminate-btn" onclick="terminateAgent('${a.id}')">Terminate</button>`
+      : '';
+    return `<div class="agent-session">
+      <span class="name">${a.name}${branch}</span>
+      <span class="status-badge ${statusClass}">${statusText}</span>
+      ${terminateBtn}
+    </div>`;
+  }).join('');
+}
+
+async function terminateAgent(id) {
+  const baseUrl = window.location.origin;
+  if (isWKWebView) return; // handled by native
+  await fetch(baseUrl + '/api/agents/' + id + '/terminate', {
+    method: 'POST', headers: {'Content-Type': 'application/json'}, body: '{}',
+  });
+}
+
+// ── Task Board (Kanban) ──
+let _cachedTasks = [];
+
+function updateTasks(tasks) {
+  if (!tasks) return;
+  _cachedTasks = tasks;
+
+  // Toolbar: new task form
+  const toolbar = document.getElementById('tasks-toolbar');
+  if (!toolbar.querySelector('.task-toolbar')) {
+    toolbar.innerHTML = `<div class="task-toolbar">
+      <input id="new-task-title" type="text" placeholder="New task title…" onkeydown="if(event.key==='Enter')createTask()">
+      <button onclick="createTask()">+ New Task</button>
+    </div>`;
+  }
+
+  const board = document.getElementById('tasks-board');
+  if (!tasks.length) {
+    board.innerHTML = '<div class="empty">No tasks</div>';
+    return;
+  }
+
+  const columns = {
+    pending: { label: 'Pending', items: [] },
+    in_progress: { label: 'In Progress', items: [] },
+    completed: { label: 'Completed', items: [] },
+    other: { label: 'Other', items: [] },
+  };
+
+  for (const t of tasks) {
+    if (t.status === 'pending') columns.pending.items.push(t);
+    else if (t.status === 'in_progress' || t.status === 'assigned') columns.in_progress.items.push(t);
+    else if (t.status === 'completed') columns.completed.items.push(t);
+    else columns.other.items.push(t);
+  }
+
+  let html = '<div class="task-board">';
+  for (const [key, col] of Object.entries(columns)) {
+    if (key === 'other' && col.items.length === 0) continue;
+    html += `<div class="task-column">
+      <div class="task-column-header">${col.label} (${col.items.length})</div>`;
+    for (const t of col.items) {
+      const pClass = t.priority >= 3 ? 'high' : (t.priority === 2 ? 'medium' : 'low');
+      const assignee = t.assignee_name || t.assignee || '';
+      const assigneeStr = assignee ? `→ ${assignee}` : '';
+      html += `<div class="task-card" onclick="toggleTaskDetail(this)" data-id="${t.id}">
+        <div class="title"><span class="priority-dot ${pClass}"></span>${t.title}</div>
+        <div class="meta">${assigneeStr}</div>
+        <div class="detail">
+          <div>${t.description || 'No description'}</div>
+          ${t.deps && t.deps.length ? '<div style="margin-top:4px">Deps: ' + t.deps.join(', ') + '</div>' : ''}
+        </div>
+      </div>`;
+    }
+    html += '</div>';
+  }
+  html += '</div>';
+  board.innerHTML = html;
+}
+
+function toggleTaskDetail(el) {
+  el.classList.toggle('expanded');
+}
+
+async function createTask() {
+  const input = document.getElementById('new-task-title');
+  if (!input) return;
+  const title = input.value.trim();
+  if (!title) return;
+  const baseUrl = window.location.origin;
+  await fetch(baseUrl + '/api/tasks', {
+    method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({ title, priority: 2 }),
+  });
+  input.value = '';
+}
+
+// ── Messages ──
+let _selectedMsgAgent = null;
+
+function updateMessages(msgs) {
+  const el = document.getElementById('messages-list');
+  if (!msgs || !msgs.length) {
+    el.innerHTML = _selectedMsgAgent
+      ? '<div class="empty">No messages for this agent</div>'
+      : '<div class="empty">Select an agent to view messages</div>';
+    return;
+  }
+  el.innerHTML = msgs.map(m => {
+    const fromLabel = m.from_agent || 'dashboard';
+    const time = m.created_at_ms ? formatTime(m.created_at_ms) : '';
+    const unread = m.read ? '' : ' unread';
+    const ackBtn = m.read ? '' : `<button class="msg-ack-btn" onclick="ackMessage(${m.id})">ACK</button>`;
+    return `<div class="msg-row${unread}">
+      <span class="msg-from">${fromLabel}</span>${ackBtn}
+      <span class="msg-time">${time}</span>
+      <div style="margin-top:2px">${m.content}</div>
+    </div>`;
+  }).join('');
+}
+
+function initMessagesUI() {
+  const container = document.getElementById('messages-card');
+  if (!container) return;
+  const listEl = document.getElementById('messages-list');
+  const toolbar = document.createElement('div');
+  toolbar.className = 'msg-toolbar';
+  toolbar.id = 'msg-toolbar';
+  toolbar.innerHTML = `
+    <select id="msg-agent-select" onchange="selectMsgAgent(this.value)">
+      <option value="">Select agent…</option>
+    </select>
+    <textarea id="msg-content" placeholder="Message…" onkeydown="if(event.ctrlKey&&event.key==='Enter')sendMessage()"></textarea>
+    <button id="msg-send-btn" onclick="sendMessage()">Send</button>
+  `;
+  container.insertBefore(toolbar, listEl);
+}
+
+function refreshMsgAgentDropdown() {
+  const select = document.getElementById('msg-agent-select');
+  if (!select) return;
+  const prev = select.value;
+  let html = '<option value="">Select agent…</option>';
+  for (const a of _cachedAgents) {
+    if (a.status === 'terminated') continue;
+    const sel = a.id === prev ? ' selected' : '';
+    html += `<option value="${a.id}"${sel}>${a.name}</option>`;
+  }
+  select.innerHTML = html;
+}
+
+/// Auto-refresh messages for selected agent (called from poll loop)
+async function pollMessages() {
+  if (!_selectedMsgAgent) return;
+  const baseUrl = window.location.origin;
+  try {
+    const res = await fetch(baseUrl + '/api/messages/' + _selectedMsgAgent);
+    if (res.ok) updateMessages(await res.json());
+  } catch (e) { console.error('[messages] poll error:', e); }
+}
+
+async function selectMsgAgent(agentId) {
+  _selectedMsgAgent = agentId || null;
+  if (!agentId) {
+    updateMessages(null);
+    return;
+  }
+  const baseUrl = window.location.origin;
+  try {
+    const res = await fetch(baseUrl + '/api/messages/' + agentId);
+    if (res.ok) updateMessages(await res.json());
+    else console.error('[messages] list failed:', res.status);
+  } catch (e) { console.error('[messages] list error:', e); }
+}
+
+async function sendMessage() {
+  const select = document.getElementById('msg-agent-select');
+  const textarea = document.getElementById('msg-content');
+  const sendBtn = document.getElementById('msg-send-btn');
+  if (!select || !textarea) return;
+
+  const toAgent = select.value;
+  const content = textarea.value.trim();
+
+  // Validation with visual feedback
+  if (!toAgent) {
+    select.style.borderColor = 'var(--danger)';
+    setTimeout(() => { select.style.borderColor = ''; }, 1500);
+    return;
+  }
+  if (!content) {
+    textarea.style.borderColor = 'var(--danger)';
+    setTimeout(() => { textarea.style.borderColor = ''; }, 1500);
+    return;
+  }
+
+  // Disable button during send
+  if (sendBtn) { sendBtn.disabled = true; sendBtn.textContent = '…'; }
+
+  const baseUrl = window.location.origin;
+  try {
+    const res = await fetch(baseUrl + '/api/messages', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({ to_agent: toAgent, content }),
+    });
+    if (res.ok) {
+      textarea.value = '';
+      // Flash success
+      if (sendBtn) { sendBtn.textContent = 'Sent!'; sendBtn.style.background = 'var(--success)'; }
+      setTimeout(() => {
+        if (sendBtn) { sendBtn.textContent = 'Send'; sendBtn.style.background = ''; }
+      }, 1000);
+      // Refresh message list
+      await selectMsgAgent(toAgent);
+    } else {
+      const errText = await res.text();
+      console.error('[messages] send failed:', res.status, errText);
+      if (sendBtn) { sendBtn.textContent = 'Error'; sendBtn.style.background = 'var(--danger)'; }
+      setTimeout(() => {
+        if (sendBtn) { sendBtn.textContent = 'Send'; sendBtn.style.background = ''; }
+      }, 2000);
+    }
+  } catch (e) {
+    console.error('[messages] send error:', e);
+    if (sendBtn) { sendBtn.textContent = 'Error'; sendBtn.style.background = 'var(--danger)'; }
+    setTimeout(() => {
+      if (sendBtn) { sendBtn.textContent = 'Send'; sendBtn.style.background = ''; }
+    }, 2000);
+  } finally {
+    if (sendBtn) sendBtn.disabled = false;
+  }
+}
+
+async function ackMessage(msgId) {
+  const baseUrl = window.location.origin;
+  try {
+    await fetch(baseUrl + '/api/messages/ack', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({ message_ids: [msgId] }),
+    });
+    if (_selectedMsgAgent) selectMsgAgent(_selectedMsgAgent);
+  } catch (e) { console.error('[messages] ack error:', e); }
+}
+
+// ── Init ──
+initChart();
+initTimelineChart();
+initMessagesUI();
+</script>
+</body>
+</html>

@@ -3596,6 +3596,15 @@ struct ContentView: View {
         )
         contributions.append(
             CommandPaletteCommandContribution(
+                commandId: "palette.openDashboard",
+                title: constant("Open Dashboard"),
+                subtitle: constant("term-mesh"),
+                shortcutHint: "⌘⇧D",
+                keywords: ["dashboard", "monitor", "heatmap", "resources", "term-mesh"]
+            )
+        )
+        contributions.append(
+            CommandPaletteCommandContribution(
                 commandId: "palette.browserSplitRight",
                 title: constant("Split Browser Right"),
                 subtitle: constant("Browser Layout"),
@@ -3887,6 +3896,13 @@ struct ContentView: View {
         registry.register(commandId: "palette.browserClearHistory") {
             BrowserHistoryStore.shared.clearHistory()
         }
+        registry.register(commandId: "palette.openDashboard") {
+            let port = ProcessInfo.processInfo.environment["TERM_MESH_HTTP_ADDR"]
+                .flatMap { $0.split(separator: ":").last.map(String.init) } ?? "9876"
+            if let url = URL(string: "http://localhost:\(port)") {
+                _ = tabManager.createBrowserSplit(direction: .right, url: url)
+            }
+        }
         registry.register(commandId: "palette.browserSplitRight") {
             _ = tabManager.createBrowserSplit(direction: .right)
         }
@@ -3949,7 +3965,11 @@ struct ContentView: View {
             return custom
         }
         let title = workspace.title.trimmingCharacters(in: .whitespacesAndNewlines)
-        return title.isEmpty ? "Workspace" : title
+        let base = title.isEmpty ? "Workspace" : title
+        if workspace.worktreeName != nil {
+            return "🔀 " + base
+        }
+        return base
     }
 
     private func panelDisplayName(workspace: Workspace, panelId: UUID, fallback: String) -> String {
@@ -5940,11 +5960,17 @@ private struct TabItemView: View {
                         .foregroundColor(activeSecondaryColor(0.8))
                 }
 
-                Text(tab.title)
-                    .font(.system(size: 12.5, weight: titleFontWeight))
-                    .foregroundColor(activePrimaryTextColor)
-                    .lineLimit(1)
-                    .truncationMode(.tail)
+                HStack(spacing: 4) {
+                    if tab.worktreeName != nil {
+                        Text("🔀")
+                            .font(.system(size: 11))
+                    }
+                    Text(tab.title)
+                        .font(.system(size: 12.5, weight: titleFontWeight))
+                        .foregroundColor(activePrimaryTextColor)
+                        .lineLimit(1)
+                        .truncationMode(.tail)
+                }
 
                 Spacer()
 

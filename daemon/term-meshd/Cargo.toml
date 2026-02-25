@@ -1,0 +1,53 @@
+[package]
+name = "term-meshd"
+version = "0.1.0"
+edition = "2021"
+description = "term-mesh background daemon — worktree orchestration, resource monitoring, file heatmap"
+
+[[bin]]
+name = "term-meshd"
+path = "src/main.rs"
+
+[dependencies]
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# Git worktree orchestration (F-01)
+git2 = "0.19"
+
+# Serialization (JSON-RPC over Unix Socket)
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Resource monitoring (F-03/F-04)
+sysinfo = "0.33"
+libc = "0.2"
+
+# JSONL usage tracking (F-03/F-04 Budget Guard)
+# Uses Claude Code's local JSONL logs for real token/cost data
+
+# File watching (F-05)
+notify = "7"
+
+# HTTP server for external dashboard access
+axum = "0.8"
+tower-http = { version = "0.6", features = ["fs", "cors"] }
+
+# SQLite for agent session persistence (F-06)
+rusqlite = { version = "0.32", features = ["bundled"] }
+
+# Error handling
+anyhow = "1"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# UUID for worktree naming
+uuid = { version = "1", features = ["v4"] }
+
+# Platform directories
+dirs = "6"
+
+[dev-dependencies]
+tempfile = "3"

@@ -21,6 +21,9 @@ final class TerminalPanel: Panel, ObservableObject {
     /// Published directory from the terminal
     @Published private(set) var directory: String = ""
 
+    /// Agent session ID bound to this panel (F-06). nil = plain terminal.
+    var agentSessionId: String?
+
     /// Search state for find functionality
     @Published var searchState: TerminalSurface.SearchState? {
         didSet {
@@ -83,13 +86,15 @@ final class TerminalPanel: Panel, ObservableObject {
         context: ghostty_surface_context_e = GHOSTTY_SURFACE_CONTEXT_SPLIT,
         configTemplate: ghostty_surface_config_s? = nil,
         workingDirectory: String? = nil,
-        portOrdinal: Int = 0
+        portOrdinal: Int = 0,
+        command: String? = nil
     ) {
         let surface = TerminalSurface(
             tabId: workspaceId,
             context: context,
             configTemplate: configTemplate,
-            workingDirectory: workingDirectory
+            workingDirectory: workingDirectory,
+            command: command
         )
         surface.portOrdinal = portOrdinal
         self.init(workspaceId: workspaceId, surface: surface)
@@ -134,6 +139,12 @@ final class TerminalPanel: Panel, ObservableObject {
     }
 
     func close() {
+        // Unbind agent session if bound (session stays alive in daemon)
+        if let sessionId = agentSessionId {
+            DispatchQueue.global(qos: .utility).async {
+                let _ = TermMeshDaemon.shared.unbindAgentPanel(sessionId: sessionId)
+            }
+        }
         // The surface will be cleaned up by its deinit
         // Just unfocus before closing
         unfocus()
@@ -147,6 +158,17 @@ final class TerminalPanel: Panel, ObservableObject {
 
     func sendText(_ text: String) {
         surface.sendText(text)
+    }
+
+    /// Send a synthetic key press via NSEvent (bypasses bracketed paste).
+    func sendKeyPress(keycode: UInt16, characters: String = "\r") {
+        hostedView.sendSyntheticKeyPress(keycode: keycode, characters: characters)
+    }
+
+    /// Send a key press directly through the Ghostty surface API.
+    /// Works even when the panel is not in the active tab (no window required).
+    func sendSurfaceKeyPress(keycode: UInt16) {
+        surface.sendSurfaceKeyPress(keycode: keycode)
     }
 
     func performBindingAction(_ action: String) -> Bool {

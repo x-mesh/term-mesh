@@ -8,6 +8,7 @@ struct cmuxApp: App {
     @StateObject private var notificationStore = TerminalNotificationStore.shared
     @StateObject private var sidebarState = SidebarState()
     @StateObject private var sidebarSelectionState = SidebarSelectionState()
+    @ObservedObject private var termMeshDaemon = TermMeshDaemon.shared
     private let primaryWindowId = UUID()
     @AppStorage(AppearanceSettings.appearanceModeKey) private var appearanceMode = AppearanceSettings.defaultMode.rawValue
     @AppStorage("titlebarControlsStyle") private var titlebarControlsStyle = TitlebarControlsStyle.classic.rawValue
@@ -204,7 +205,7 @@ struct cmuxApp: App {
             }
 
             CommandGroup(replacing: .appInfo) {
-                Button("About cmux") {
+                Button("About term-mesh") {
                     showAboutPanel()
                 }
                 Button("Ghostty Settings…") {
@@ -219,6 +220,44 @@ struct cmuxApp: App {
                     appDelegate.checkForUpdates(nil)
                 }
                 InstallUpdateMenuItem(model: appDelegate.updateViewModel)
+                Divider()
+                Button("term-mesh Dashboard (Window)") {
+                    DashboardController.shared.showDashboard()
+                }
+                Button("term-mesh Dashboard (Split)") {
+                    openDashboardSplit()
+                }
+                .keyboardShortcut("d", modifiers: [.command, .shift])
+                Button(TermMeshDaemon.shared.worktreeEnabled
+                    ? "✓ Worktree Sandbox"
+                    : "  Worktree Sandbox"
+                ) {
+                    let newValue = !TermMeshDaemon.shared.worktreeEnabled
+                    TermMeshDaemon.shared.worktreeEnabled = newValue
+                    if newValue {
+                        DispatchQueue.global(qos: .utility).async {
+                            let connected = TermMeshDaemon.shared.ping()
+                            if !connected {
+                                DispatchQueue.main.async {
+                                    let alert = NSAlert()
+                                    alert.messageText = "Worktree Sandbox"
+                                    alert.informativeText = "term-meshd daemon is not running.\nNew tabs will open without sandbox until the daemon is started."
+                                    alert.alertStyle = .warning
+                                    alert.addButton(withTitle: "OK")
+                                    alert.runModal()
+                                }
+                            }
+                        }
+                    }
+                }
+                Button("Spawn Agents…") {
+                    showSpawnAgentsDialog()
+                }
+                .keyboardShortcut("a", modifiers: [.command, .shift])
+                Button("Reconnect Agent…") {
+                    showReconnectAgentDialog()
+                }
+                .keyboardShortcut("a", modifiers: [.command, .option])
             }
 
 #if DEBUG
@@ -746,6 +785,105 @@ struct cmuxApp: App {
         _ = tabManager.createBrowserSplit(direction: direction)
     }
 
+    private func openDashboardSplit() {
+        let port = ProcessInfo.processInfo.environment["TERM_MESH_HTTP_ADDR"]
+            .flatMap { $0.split(separator: ":").last.map(String.init) } ?? "9876"
+        guard let url = URL(string: "http://localhost:\(port)") else { return }
+        _ = activeTabManager.createBrowserSplit(direction: .right, url: url)
+    }
+
+    private func showSpawnAgentsDialog() {
+        let alert = NSAlert()
+        alert.messageText = "Spawn Agents"
+        alert.informativeText = "Select a command and the number of agents to spawn:"
+        alert.alertStyle = .informational
+        alert.addButton(withTitle: "Spawn")
+        alert.addButton(withTitle: "Cancel")
+
+        // Command presets
+        let commands = [
+            "claude --dangerously-skip-permissions",
+            "claude",
+            "aider",
+            "codex",
+        ]
+
+        // -- Command popup --
+        let commandLabel = NSTextField(labelWithString: "Command:")
+        commandLabel.frame = NSRect(x: 0, y: 30, width: 70, height: 18)
+
+        let commandCombo = NSComboBox(frame: NSRect(x: 74, y: 26, width: 260, height: 26))
+        for cmd in commands { commandCombo.addItem(withObjectValue: cmd) }
+        commandCombo.stringValue = commands[0]
+        commandCombo.completes = true
+
+        // -- Count stepper --
+        let countLabel = NSTextField(labelWithString: "Agents:")
+        countLabel.frame = NSRect(x: 0, y: 2, width: 70, height: 18)
+
+        let stepper = NSStepper(frame: NSRect(x: 74, y: 0, width: 26, height: 22))
+        stepper.minValue = 1
+        stepper.maxValue = 8
+        stepper.integerValue = 2
+        stepper.valueWraps = false
+
+        let countValueLabel = NSTextField(labelWithString: "2")
+        countValueLabel.frame = NSRect(x: 104, y: 2, width: 30, height: 18)
+        countValueLabel.alignment = .center
+
+        stepper.target = countValueLabel
+        stepper.action = #selector(NSTextField.takeIntegerValueFrom(_:))
+
+        let container = NSView(frame: NSRect(x: 0, y: 0, width: 340, height: 54))
+        container.addSubview(commandLabel)
+        container.addSubview(commandCombo)
+        container.addSubview(countLabel)
+        container.addSubview(stepper)
+        container.addSubview(countValueLabel)
+        alert.accessoryView = container
+
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        let count = stepper.integerValue
+        let command = commandCombo.stringValue.isEmpty ? commands[0] : commandCombo.stringValue
+
+        activeTabManager.spawnAgentSessions(count: count, command: command)
+    }
+
+    private func showReconnectAgentDialog() {
+        let agents = TermMeshDaemon.shared.listAgents(includeTerminated: false)
+        let detached = agents.filter { $0.status != "terminated" && $0.panelId == nil }
+
+        guard !detached.isEmpty else {
+            let alert = NSAlert()
+            alert.messageText = "Reconnect Agent"
+            alert.informativeText = "No detached agent sessions found."
+            alert.alertStyle = .informational
+            alert.addButton(withTitle: "OK")
+            alert.runModal()
+            return
+        }
+
+        let alert = NSAlert()
+        alert.messageText = "Reconnect Agent"
+        alert.informativeText = "Select a detached agent session to reconnect:"
+        alert.alertStyle = .informational
+        alert.addButton(withTitle: "Reconnect")
+        alert.addButton(withTitle: "Cancel")
+
+        let popup = NSPopUpButton(frame: NSRect(x: 0, y: 0, width: 340, height: 26), pullsDown: false)
+        for agent in detached {
+            let label = "\(agent.name) [\(agent.worktreeBranch)] — \(agent.worktreePath)"
+            popup.addItem(withTitle: label)
+            popup.lastItem?.representedObject = agent.id as NSString
+        }
+        alert.accessoryView = popup
+
+        guard alert.runModal() == .alertFirstButtonReturn,
+              let selectedId = popup.selectedItem?.representedObject as? String else { return }
+
+        activeTabManager.reconnectAgentSession(sessionId: selectedId)
+    }
+
     @ViewBuilder
     private func splitCommandButton(title: String, shortcut: StoredShortcut, action: @escaping () -> Void) -> some View {
         if let key = shortcut.keyEquivalent {
@@ -810,7 +948,7 @@ private enum SettingsAboutWindowKind: String, CaseIterable, Identifiable {
         case .settings:
             return "Settings"
         case .about:
-            return "About cmux"
+            return "About term-mesh"
         }
     }
 
@@ -923,7 +1061,7 @@ private struct SettingsAboutTitlebarDebugOptions: Equatable {
         case .about:
             return SettingsAboutTitlebarDebugOptions(
                 overridesEnabled: false,
-                windowTitle: "About cmux",
+                windowTitle: "About term-mesh",
                 titleVisibility: .hidden,
                 titlebarAppearsTransparent: true,
                 movableByWindowBackground: false,

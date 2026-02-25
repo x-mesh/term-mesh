@@ -756,16 +756,63 @@ class TabManager: ObservableObject {
     @discardableResult
     func addWorkspace(workingDirectory overrideWorkingDirectory: String? = nil, select: Bool = true) -> Workspace {
         sentryBreadcrumb("workspace.create", data: ["tabCount": tabs.count + 1])
-        let workingDirectory = normalizedWorkingDirectory(overrideWorkingDirectory) ?? preferredWorkingDirectoryForNewTab()
+        var workingDirectory = normalizedWorkingDirectory(overrideWorkingDirectory) ?? preferredWorkingDirectoryForNewTab()
+
+        // term-mesh: Create worktree sandbox if enabled and CWD is a git repo
+        var worktreeInfo: WorktreeInfo?
+        var gitRepoRoot: String?  // git root for worktree cleanup
+        if TermMeshDaemon.shared.worktreeEnabled, let cwd = workingDirectory {
+            gitRepoRoot = TermMeshDaemon.shared.findGitRoot(from: cwd)
+            let result = TermMeshDaemon.shared.createWorktreeWithError(repoPath: cwd)
+            switch result {
+            case .success(let info):
+                workingDirectory = info.path
+                worktreeInfo = info
+                print("[term-mesh] worktree created: \(info.name) at \(info.path)")
+            case .failure(let error):
+                let message: String
+                switch error {
+                case .daemonNotConnected:
+                    message = "term-meshd daemon is not running.\nNew tab will open without sandbox."
+                case .notGitRepo:
+                    message = "Current directory is not a git repository.\nNew tab will open without sandbox."
+                case .rpcError(let detail):
+                    message = "Failed to create worktree: \(detail)\nNew tab will open without sandbox."
+                }
+                print("[term-mesh] worktree error: \(message)")
+                DispatchQueue.main.async {
+                    let alert = NSAlert()
+                    alert.messageText = "Worktree Sandbox"
+                    alert.informativeText = message
+                    alert.alertStyle = .warning
+                    alert.addButton(withTitle: "OK")
+                    alert.runModal()
+                }
+            }
+        }
+
         let inheritedConfig = inheritedTerminalConfigForNewWorkspace()
         let ordinal = Self.nextPortOrdinal
         Self.nextPortOrdinal += 1
         let newWorkspace = Workspace(
-            title: "Terminal \(tabs.count + 1)",
+            title: worktreeInfo.map { "[\($0.branch)] Terminal \(tabs.count + 1)" } ?? "Terminal \(tabs.count + 1)",
             workingDirectory: workingDirectory,
             portOrdinal: ordinal,
             configTemplate: inheritedConfig
         )
+        // term-mesh: Store worktree metadata for auto-cleanup on tab close
+        if let info = worktreeInfo {
+            newWorkspace.worktreeName = info.name
+            newWorkspace.worktreeRepoPath = gitRepoRoot
+        }
+
+        // term-mesh: Auto-watch the working directory for file heatmap
+        if let cwd = workingDirectory, !cwd.isEmpty {
+            DispatchQueue.global(qos: .utility).async {
+                TermMeshDaemon.shared.watchPath(cwd)
+            }
+        }
+
         wireClosedBrowserTracking(for: newWorkspace)
         let insertIndex = newTabInsertIndex()
         if insertIndex >= 0 && insertIndex <= tabs.count {
@@ -968,6 +1015,14 @@ class TabManager: ObservableObject {
     func closeWorkspace(_ workspace: Workspace) {
         guard tabs.count > 1 else { return }
         sentryBreadcrumb("workspace.close", data: ["tabCount": tabs.count - 1])
+
+        // term-mesh: Clean up worktree sandbox if this tab was using one
+        if let name = workspace.worktreeName, let repoPath = workspace.worktreeRepoPath {
+            DispatchQueue.global(qos: .utility).async {
+                let success = TermMeshDaemon.shared.removeWorktree(repoPath: repoPath, name: name)
+                print("[term-mesh] worktree cleanup \(name): \(success ? "ok" : "failed")")
+            }
+        }
 
         AppDelegate.shared?.notificationStore?.clearNotifications(forTabId: workspace.id)
         unwireClosedBrowserTracking(for: workspace)
@@ -1749,6 +1804,150 @@ class TabManager: ObservableObject {
         )
     }
 
+    /// Spawn N agent sessions as splits in the current workspace (F-06).
+    /// Each agent gets its own worktree sandbox and is bound to its panel.
+    func spawnAgentSessions(count: Int, command: String? = nil) {
+        guard let selectedTabId,
+              let tab = tabs.first(where: { $0.id == selectedTabId }),
+              let focusedPanelId = tab.focusedPanelId else { return }
+
+        // Determine repo path from the focused terminal panel's directory
+        let focusedDir = tab.panelDirectories[focusedPanelId] ?? ""
+        let currentDir = focusedDir.isEmpty ? tab.currentDirectory : focusedDir
+        guard let repoPath = TermMeshDaemon.shared.findGitRoot(from: currentDir), !repoPath.isEmpty else {
+            let alert = NSAlert()
+            alert.messageText = "Spawn Agents"
+            alert.informativeText = "Current directory is not inside a git repository."
+            alert.alertStyle = .warning
+            alert.addButton(withTitle: "OK")
+            alert.runModal()
+            return
+        }
+
+        // Spawn agent sessions via daemon (background to avoid blocking UI)
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            let sessions = TermMeshDaemon.shared.spawnAgents(repoPath: repoPath, count: count, command: command)
+            guard !sessions.isEmpty else {
+                DispatchQueue.main.async {
+                    let alert = NSAlert()
+                    alert.messageText = "Spawn Agents"
+                    alert.informativeText = "Failed to spawn agent sessions. Is term-meshd running?"
+                    alert.alertStyle = .warning
+                    alert.addButton(withTitle: "OK")
+                    alert.runModal()
+                }
+                return
+            }
+
+            DispatchQueue.main.async { [weak self] in
+                guard let self,
+                      let tab = self.tabs.first(where: { $0.id == selectedTabId }),
+                      let focusedPanelId = tab.focusedPanelId else { return }
+
+                let count = sessions.count
+                // Grid layout: agent columns right of original, then split down
+                // 1→[O|A], 2→[O|A/B], 3→[O|A/C|B], 4→[O|A/C|B/D], 6→[O|A/D|B/E|C/F]
+                let numCols = max(1, Int(ceil(Double(count) / 2.0)))
+
+                // Helper to bind a session to a newly created panel
+                let bindSession = { (session: AgentSessionInfo, panelId: UUID) in
+                    if let panel = tab.panels[panelId] as? TerminalPanel {
+                        panel.agentSessionId = session.id
+                        panel.updateTitle("🔀 [\(session.worktreeBranch)] \(session.name)")
+                    }
+                    DispatchQueue.global(qos: .utility).async {
+                        let _ = TermMeshDaemon.shared.bindAgentPanel(
+                            sessionId: session.id,
+                            panelId: panelId.uuidString
+                        )
+                    }
+                }
+
+                // Phase 1: Create columns (right splits)
+                var columnPanelIds: [UUID] = []
+                var lastPanelId = focusedPanelId
+                for i in 0..<numCols {
+                    if let panelId = self.newSplit(
+                        tabId: selectedTabId,
+                        surfaceId: lastPanelId,
+                        direction: .right,
+                        focus: false,
+                        workingDirectory: sessions[i].worktreePath,
+                        command: sessions[i].command
+                    ) {
+                        bindSession(sessions[i], panelId)
+                        columnPanelIds.append(panelId)
+                        lastPanelId = panelId
+                    }
+                }
+
+                // Phase 2: Split columns down for remaining sessions
+                for i in numCols..<count {
+                    let colIndex = i - numCols
+                    guard colIndex < columnPanelIds.count else { break }
+                    if let panelId = self.newSplit(
+                        tabId: selectedTabId,
+                        surfaceId: columnPanelIds[colIndex],
+                        direction: .down,
+                        focus: false,
+                        workingDirectory: sessions[i].worktreePath,
+                        command: sessions[i].command
+                    ) {
+                        bindSession(sessions[i], panelId)
+                    }
+                }
+            }
+        }
+    }
+
+    /// Reconnect a detached agent session to a new split panel.
+    /// Unlike spawnAgentSessions, this does NOT create a worktree or run a command —
+    /// it opens a shell in the existing worktree directory and binds the panel to the session.
+    func reconnectAgentSession(sessionId: String) {
+        guard let selectedTabId,
+              let tab = tabs.first(where: { $0.id == selectedTabId }),
+              let focusedPanelId = tab.focusedPanelId else { return }
+
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            guard let session = TermMeshDaemon.shared.getAgent(id: sessionId) else {
+                DispatchQueue.main.async {
+                    let alert = NSAlert()
+                    alert.messageText = "Reconnect Agent"
+                    alert.informativeText = "Agent session not found."
+                    alert.alertStyle = .warning
+                    alert.addButton(withTitle: "OK")
+                    alert.runModal()
+                }
+                return
+            }
+
+            DispatchQueue.main.async { [weak self] in
+                guard let self,
+                      let tab = self.tabs.first(where: { $0.id == selectedTabId }) else { return }
+
+                if let panelId = self.newSplit(
+                    tabId: selectedTabId,
+                    surfaceId: focusedPanelId,
+                    direction: .right,
+                    focus: true,
+                    workingDirectory: session.worktreePath,
+                    command: nil
+                ) {
+                    if let panel = tab.panels[panelId] as? TerminalPanel {
+                        panel.agentSessionId = session.id
+                        panel.updateTitle("🔀 [\(session.worktreeBranch)] \(session.name)")
+                    }
+                    DispatchQueue.global(qos: .utility).async {
+                        let _ = TermMeshDaemon.shared.bindAgentPanel(
+                            sessionId: session.id,
+                            panelId: panelId.uuidString
+                        )
+                    }
+                }
+            }
+        }
+    }
+
     /// Refresh Bonsplit right-side action button tooltips for all workspaces.
     func refreshSplitButtonTooltips() {
         for workspace in tabs {
@@ -1845,13 +2044,15 @@ class TabManager: ObservableObject {
 
     /// Create a new split in the specified direction
     /// Returns the new panel's ID (which is also the surface ID for terminals)
-    func newSplit(tabId: UUID, surfaceId: UUID, direction: SplitDirection, focus: Bool = true) -> UUID? {
+    func newSplit(tabId: UUID, surfaceId: UUID, direction: SplitDirection, focus: Bool = true, workingDirectory: String? = nil, command: String? = nil) -> UUID? {
         guard let tab = tabs.first(where: { $0.id == tabId }) else { return nil }
         return tab.newTerminalSplit(
             from: surfaceId,
             orientation: direction.orientation,
             insertFirst: direction.insertFirst,
-            focus: focus
+            focus: focus,
+            workingDirectory: workingDirectory,
+            command: command
         )?.id
     }
 

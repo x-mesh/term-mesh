@@ -1,209 +1,203 @@
-<h1 align="center">cmux</h1>
-<p align="center">A Ghostty-based macOS terminal with vertical tabs and notifications for AI coding agents</p>
+<h1 align="center">term-mesh</h1>
+<p align="center">AI Agent Control Plane for macOS</p>
 
 <p align="center">
-  <a href="https://github.com/manaflow-ai/cmux/releases/latest/download/cmux-macos.dmg">
-    <img src="./docs/assets/macos-badge.png" alt="Download cmux for macOS" width="180" />
-  </a>
+  Run multiple AI coding agents in parallel with sandboxed worktrees, real-time resource monitoring, and a unified dashboard — all powered by a native GPU-accelerated terminal.
 </p>
 
-<p align="center">
-  English | <a href="README.zh-CN.md">简体中文</a> | <a href="README.zh-TW.md">繁體中文</a> | <a href="README.ko.md">한국어</a> | <a href="README.de.md">Deutsch</a> | <a href="README.es.md">Español</a> | <a href="README.fr.md">Français</a> | <a href="README.it.md">Italiano</a> | <a href="README.da.md">Dansk</a> | <a href="README.ja.md">日本語</a> | <a href="README.pl.md">Polski</a> | <a href="README.ru.md">Русский</a> | <a href="README.bs.md">Bosanski</a> | <a href="README.ar.md">العربية</a> | <a href="README.no.md">Norsk</a> | <a href="README.pt-BR.md">Português (Brasil)</a> | <a href="README.th.md">ไทย</a> | <a href="README.tr.md">Türkçe</a>
-</p>
+## Architecture
 
-<p align="center">
-  <img src="./docs/assets/main-first-image.png" alt="cmux screenshot" width="900" />
-</p>
-
-<p align="center">
-  <a href="https://www.youtube.com/watch?v=i-WxO5YUTOs">▶ Demo video</a>
-</p>
+```
+┌──────────────────────────────────────────────────────────┐
+│                   term-mesh (macOS App)                   │
+│                                                          │
+│  ┌─────────────────┐  ┌──────────────────────────────┐  │
+│  │  Native Shell   │  │     Dashboard (WKWebView)    │  │
+│  │  Swift + AppKit  │  │     Chart.js + HTTP Poll     │  │
+│  │                 │  │     http://localhost:9876     │  │
+│  │  Vertical Tabs  │  │                              │  │
+│  │  Split Panes    │  │  ┌────────┐ ┌────────────┐  │  │
+│  │  Notifications  │  │  │CPU/Mem │ │ File       │  │  │
+│  │                 │  │  │Monitor │ │ Heatmap    │  │  │
+│  ├─────────────────┤  │  ├────────┤ ├────────────┤  │  │
+│  │ Terminal Engine  │  │  │API Cost│ │ Agent      │  │  │
+│  │ libghostty      │  │  │Tracker │ │ Status     │  │  │
+│  │ (Metal GPU)     │  │  └────────┘ └────────────┘  │  │
+│  └─────────────────┘  └──────────────────────────────┘  │
+│          │                         │                     │
+│          │    Unix Socket / HTTP   │                     │
+│          └───────────┬─────────────┘                     │
+│                      ▼                                   │
+│  ┌──────────────────────────────────────────────────┐   │
+│  │              term-meshd (Rust Daemon)             │   │
+│  │                                                    │   │
+│  │  Worktree (git2)  │  Monitor (sysinfo)            │   │
+│  │  Watcher (notify)  │  Usage (JSONL parsing)        │   │
+│  │  Budget Guard (SIGSTOP/SIGCONT)                    │   │
+│  └──────────────────────────────────────────────────┘   │
+└──────────────────────────────────────────────────────────┘
+```
 
 ## Features
 
-<table>
-<tr>
-<td width="40%" valign="middle">
-<h3>Notification rings</h3>
-Panes get a blue ring and tabs light up when coding agents need your attention
-</td>
-<td width="60%">
-<img src="./docs/assets/notification-rings.png" alt="Notification rings" width="100%" />
-</td>
-</tr>
-<tr>
-<td width="40%" valign="middle">
-<h3>Notification panel</h3>
-See all pending notifications in one place, jump to the most recent unread
-</td>
-<td width="60%">
-<img src="./docs/assets/sidebar-notification-badge.png" alt="Sidebar notification badge" width="100%" />
-</td>
-</tr>
-<tr>
-<td width="40%" valign="middle">
-<h3>In-app browser</h3>
-Split a browser alongside your terminal with a scriptable API ported from <a href="https://github.com/vercel-labs/agent-browser">agent-browser</a>
-</td>
-<td width="60%">
-<img src="./docs/assets/built-in-browser.png" alt="Built-in browser" width="100%" />
-</td>
-</tr>
-<tr>
-<td width="40%" valign="middle">
-<h3>Vertical + horizontal tabs</h3>
-Sidebar shows git branch, working directory, listening ports, and latest notification text. Split horizontally and vertically.
-</td>
-<td width="60%">
-<img src="./docs/assets/vertical-horizontal-tabs-and-splits.png" alt="Vertical tabs and split panes" width="100%" />
-</td>
-</tr>
-</table>
+### F-01: Sandbox Worktree Orchestration
+Agents get physically isolated `git worktree` environments. Each agent session runs in its own `../term-mesh_wt_<UUID>` directory, preventing accidental modifications to the main repository. Worktrees are automatically cleaned up when tabs close.
 
-- **Scriptable** — CLI and socket API to create workspaces, split panes, send keystrokes, and automate the browser
-- **Native macOS app** — Built with Swift and AppKit, not Electron. Fast startup, low memory.
-- **Ghostty compatible** — Reads your existing `~/.config/ghostty/config` for themes, fonts, and colors
-- **GPU-accelerated** — Powered by libghostty for smooth rendering
+### F-02: Multi-Agent Native Terminal
+Built on [cmux](https://github.com/manaflow-ai/cmux) with libghostty for Metal GPU-accelerated terminal rendering. Vertical sidebar tabs show git branch, working directory, and notification status for each agent session.
 
-## Install
+### F-03/F-04: Budget Guard & Resource Monitoring
+- **CPU/Memory monitoring** via `sysinfo` with automatic process discovery (BFS tree walk from daemon parent PID)
+- **SIGSTOP/SIGCONT** process control when thresholds are exceeded
+- **Real API cost tracking** by parsing Claude Code's JSONL logs (`~/.claude/projects/`) with byte-offset incremental reads
+- Model-specific pricing: Opus $5/$25, Sonnet $3/$15, Haiku $1/$5 per MTok
 
-### DMG (recommended)
+### F-05: File Access Heatmap
+FSEvents-based file watcher using the `notify` crate tracks create/modify/remove events across watched directories. The dashboard renders a heatmap with top-10 hot files, recent events, and per-minute timeline buckets.
 
-<a href="https://github.com/manaflow-ai/cmux/releases/latest/download/cmux-macos.dmg">
-  <img src="./docs/assets/macos-badge.png" alt="Download cmux for macOS" width="180" />
-</a>
+### Dashboard
+Real-time monitoring dashboard available as:
+- **Split panel** in-app (Cmd+Shift+D) via WKWebView
+- **Standalone browser** at `http://localhost:9876`
 
-Open the `.dmg` and drag cmux to your Applications folder. cmux auto-updates via Sparkle, so you only need to download once.
+## Prerequisites
 
-### Homebrew
+| Component | Version | Notes |
+|-----------|---------|-------|
+| macOS | 13 Ventura+ | Metal 2 required |
+| Xcode | 15+ | Swift 5.9+ |
+| Rust | stable 1.75+ | edition 2021 |
+| Zig | 0.15+ | For libghostty build |
+
+## Quick Start
 
 ```bash
-brew tap manaflow-ai/cmux
-brew install --cask cmux
+# 1. Clone and setup
+git clone <repo-url> && cd cmux-term-mesh
+git checkout term-mesh-mig
+
+# 2. Build libghostty + native app
+./scripts/setup.sh
+./scripts/reload.sh --tag term-mesh
+
+# 3. Run daemon only (for development)
+cd daemon && cargo run --bin term-meshd
 ```
 
-To update later:
+## CLI Usage
+
+The `term-mesh` CLI provides a PTY wrapper for running commands under the control plane:
 
 ```bash
-brew upgrade --cask cmux
+# Run Claude Code in a PTY wrapper
+term-mesh run claude code
+
+# Run any command
+term-mesh run -- kiro-cli chat "fix this bug"
+
+# Show help
+term-mesh help
 ```
 
-On first launch, macOS may ask you to confirm opening an app from an identified developer. Click **Open** to proceed.
+Install location: `~/bin/term-mesh`
 
-## Why cmux?
+## Dashboard
 
-I run a lot of Claude Code and Codex sessions in parallel. I was using Ghostty with a bunch of split panes, and relying on native macOS notifications to know when an agent needed me. But Claude Code's notification body is always just "Claude is waiting for your input" with no context, and with enough tabs open I couldn't even read the titles anymore.
+### HTTP Mode (standalone browser)
 
-I tried a few coding orchestrators but most of them were Electron/Tauri apps and the performance bugged me. I also just prefer the terminal since GUI orchestrators lock you into their workflow. So I built cmux as a native macOS app in Swift/AppKit. It uses libghostty for terminal rendering and reads your existing Ghostty config for themes, fonts, and colors.
+The daemon serves the dashboard at `http://localhost:9876` with 2-second polling.
 
-The main additions are the sidebar and notification system. The sidebar has vertical tabs that show git branch, working directory, listening ports, and the latest notification text for each workspace. The notification system picks up terminal sequences (OSC 9/99/777) and has a CLI (`cmux notify`) you can wire into agent hooks for Claude Code, OpenCode, etc. When an agent is waiting, its pane gets a blue ring and the tab lights up in the sidebar, so I can tell which one needs me across splits and tabs. Cmd+Shift+U jumps to the most recent unread.
+### Split Mode (in-app)
 
-The in-app browser has a scriptable API ported from [agent-browser](https://github.com/vercel-labs/agent-browser). Agents can snapshot the accessibility tree, get element refs, click, fill forms, and evaluate JS. You can split a browser pane next to your terminal and have Claude Code interact with your dev server directly.
+Press **Cmd+Shift+D** to open the dashboard as a split panel alongside your terminal.
 
-Everything is scriptable through the CLI and socket API — create workspaces/tabs, split panes, send keystrokes, open URLs in the browser.
+### API Endpoints
 
-## Keyboard Shortcuts
+#### HTTP REST API (port 9876)
 
-### Workspaces
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| GET | `/api/monitor` | System + process snapshots, budget config, usage summary |
+| GET | `/api/sessions` | Terminal sessions from the Swift app |
+| GET | `/api/watcher` | File heatmap snapshot (top files, events, timeline) |
+| GET | `/api/usage` | Per-session API cost and token usage |
+| POST | `/api/process/stop` | SIGSTOP a process `{"pid": 1234}` |
+| POST | `/api/process/resume` | SIGCONT a process `{"pid": 1234}` |
+| POST | `/api/budget/auto-stop` | Toggle auto-stop `{"enabled": true}` |
+| POST | `/api/watcher/watch` | Start watching a path `{"path": "/..."}` |
+| POST | `/api/watcher/unwatch` | Stop watching a path `{"path": "/..."}` |
 
-| Shortcut | Action |
-|----------|--------|
-| ⌘ N | New workspace |
-| ⌘ 1–8 | Jump to workspace 1–8 |
-| ⌘ 9 | Jump to last workspace |
-| ⌃ ⌘ ] | Next workspace |
-| ⌃ ⌘ [ | Previous workspace |
-| ⌘ ⇧ W | Close workspace |
-| ⌘ ⇧ R | Rename workspace |
-| ⌘ B | Toggle sidebar |
+#### JSON-RPC 2.0 (Unix Socket)
 
-### Surfaces
+Socket path: `$TMPDIR/term-meshd.sock`
 
-| Shortcut | Action |
-|----------|--------|
-| ⌘ T | New surface |
-| ⌘ ⇧ ] | Next surface |
-| ⌘ ⇧ [ | Previous surface |
-| ⌃ Tab | Next surface |
-| ⌃ ⇧ Tab | Previous surface |
-| ⌃ 1–8 | Jump to surface 1–8 |
-| ⌃ 9 | Jump to last surface |
-| ⌘ W | Close surface |
+| Method | Description |
+|--------|-------------|
+| `ping` | Health check (returns `"pong"`) |
+| `worktree.create` | Create a sandboxed worktree |
+| `worktree.remove` | Remove a worktree by name |
+| `worktree.list` | List all term-mesh worktrees |
+| `monitor.snapshot` | Get system/process resource snapshot |
+| `monitor.track` | Track a PID for monitoring |
+| `monitor.untrack` | Stop tracking a PID |
+| `monitor.tracked` | List tracked PIDs |
+| `process.stop` | Send SIGSTOP to a process |
+| `process.resume` | Send SIGCONT to a process |
+| `budget.auto_stop` | Enable/disable auto-stop |
+| `watcher.watch` | Watch a filesystem path |
+| `watcher.unwatch` | Unwatch a filesystem path |
+| `watcher.snapshot` | Get heatmap snapshot |
+| `usage.snapshot` | Get API cost/token snapshot |
+| `usage.scan` | Trigger immediate JSONL scan |
+| `session.sync` | Push session list from Swift app |
+| `session.list` | List terminal sessions |
 
-### Split Panes
+## Development
 
-| Shortcut | Action |
-|----------|--------|
-| ⌘ D | Split right |
-| ⌘ ⇧ D | Split down |
-| ⌥ ⌘ ← → ↑ ↓ | Focus pane directionally |
-| ⌘ ⇧ H | Flash focused panel |
+### Project Structure
 
-### Browser
+```
+daemon/
+  term-meshd/src/
+    main.rs          # Daemon entry point
+    socket.rs        # Unix Socket JSON-RPC server
+    http.rs          # HTTP/REST API server (axum)
+    monitor.rs       # CPU/memory monitoring + Budget Guard
+    tokens.rs        # JSONL usage tracking + cost calculation
+    watcher.rs       # FSEvents file heatmap
+    worktree.rs      # Git worktree orchestration
+  term-mesh-cli/src/
+    main.rs          # CLI entry point
+    pty.rs           # PTY wrapper
+Sources/
+  DashboardController.swift   # WKWebView dashboard + PID tracking
+  TermMeshDaemon.swift         # Swift RPC client
+Resources/
+  dashboard/index.html         # Dashboard UI (Chart.js)
+scripts/
+  setup.sh                     # Initial build setup
+  reload.sh                    # Rebuild and reload
+```
 
-Browser developer-tool shortcuts follow Safari defaults and are customizable in `Settings → Keyboard Shortcuts`.
+### Build & Test
 
-| Shortcut | Action |
-|----------|--------|
-| ⌘ ⇧ L | Open browser in split |
-| ⌘ L | Focus address bar |
-| ⌘ [ | Back |
-| ⌘ ] | Forward |
-| ⌘ R | Reload page |
-| ⌥ ⌘ I | Toggle Developer Tools (Safari default) |
-| ⌥ ⌘ C | Show JavaScript Console (Safari default) |
+```bash
+# Run all Rust tests (39 tests across 4 modules)
+cd daemon && cargo test
 
-### Notifications
+# Run daemon in development mode
+cd daemon && cargo run --bin term-meshd
 
-| Shortcut | Action |
-|----------|--------|
-| ⌘ I | Show notifications panel |
-| ⌘ ⇧ U | Jump to latest unread |
+# Performance benchmarks (requires running daemon + socat)
+bash daemon/scripts/bench.sh
+```
 
-### Find
+### Git Branch
 
-| Shortcut | Action |
-|----------|--------|
-| ⌘ F | Find |
-| ⌘ G / ⌘ ⇧ G | Find next / previous |
-| ⌘ ⇧ F | Hide find bar |
-| ⌘ E | Use selection for find |
-
-### Terminal
-
-| Shortcut | Action |
-|----------|--------|
-| ⌘ K | Clear scrollback |
-| ⌘ C | Copy (with selection) |
-| ⌘ V | Paste |
-| ⌘ + / ⌘ - | Increase / decrease font size |
-| ⌘ 0 | Reset font size |
-
-### Window
-
-| Shortcut | Action |
-|----------|--------|
-| ⌘ ⇧ N | New window |
-| ⌘ , | Settings |
-| ⌘ ⇧ , | Reload configuration |
-| ⌘ Q | Quit |
-
-## Nightly Builds
-
-[Download cmux NIGHTLY](https://github.com/manaflow-ai/cmux/releases/download/nightly/cmux-nightly-macos.dmg)
-
-cmux NIGHTLY is a separate app with its own bundle ID, so it runs alongside the stable version. Built automatically from the latest `main` commit and auto-updates via its own Sparkle feed.
-
-## Community
-
-- [Discord](https://discord.gg/xsgFEVrWCZ)
-- [GitHub](https://github.com/manaflow-ai/cmux)
-- [X / Twitter](https://twitter.com/manaflowai)
-- [YouTube](https://www.youtube.com/channel/UCAa89_j-TWkrXfk9A3CbASw)
-- [LinkedIn](https://www.linkedin.com/company/manaflow-ai/)
+Active development is on the `term-mesh-mig` branch.
 
 ## License
 
 This project is licensed under the GNU Affero General Public License v3.0 or later (`AGPL-3.0-or-later`).
 
-See `LICENSE` for the full text.
+Built as a fork of [cmux](https://github.com/manaflow-ai/cmux). See `LICENSE` for the full text.

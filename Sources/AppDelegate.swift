@@ -744,6 +744,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         installShortcutMonitor()
         installShortcutDefaultsObserver()
         NSApp.servicesProvider = self
+
+        // term-mesh: Start the background daemon
+        if !isRunningUnderXCTest {
+            TermMeshDaemon.shared.startDaemon()
+        }
 #if DEBUG
         UpdateTestSupport.applyIfNeeded(to: updateController.viewModel)
         if env["CMUX_UI_TEST_MODE"] == "1" {
@@ -835,6 +840,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
 
     func applicationWillTerminate(_ notification: Notification) {
         TerminalController.shared.stop()
+        TermMeshDaemon.shared.stopDaemon()
         BrowserHistoryStore.shared.flushPendingSaves()
         PostHogAnalytics.shared.flush()
         notificationStore?.clearAll()
@@ -844,6 +850,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         self.tabManager = tabManager
         self.notificationStore = notificationStore
         self.sidebarState = sidebarState
+        DashboardController.shared.tabManager = tabManager
 #if DEBUG
         setupJumpUnreadUITestIfNeeded()
         setupGotoSplitUITestIfNeeded()
@@ -4471,7 +4478,7 @@ enum MenuBarBuildHintFormatter {
     ) -> String? {
         guard isDebugBuild else { return nil }
         let normalized = appName.trimmingCharacters(in: .whitespacesAndNewlines)
-        let prefix = "cmux DEV"
+        let prefix = "term-mesh DEV"
         guard normalized.hasPrefix(prefix) else { return "Build: DEV" }
 
         let suffix = String(normalized.dropFirst(prefix.count)).trimmingCharacters(in: .whitespacesAndNewlines)
