@@ -356,3 +356,64 @@ class AgentRolePresetManager: ObservableObject {
         save()
     }
 }
+
+// MARK: - Team Templates
+
+/// A saved team configuration: name + ordered list of agent slots.
+struct TeamTemplate: Identifiable, Codable, Equatable {
+    var id: UUID
+    var name: String
+    var leaderMode: String  // "repl" or "claude"
+    var agents: [AgentSlot]
+
+    struct AgentSlot: Codable, Equatable {
+        var roleName: String        // references AgentRolePreset.name
+        var model: String
+        var customInstructions: String
+    }
+
+    init(id: UUID = UUID(), name: String, leaderMode: String = "repl", agents: [AgentSlot]) {
+        self.id = id
+        self.name = name
+        self.leaderMode = leaderMode
+        self.agents = agents
+    }
+}
+
+/// Manages saved team templates.
+class TeamTemplateManager: ObservableObject {
+    static let shared = TeamTemplateManager()
+
+    @Published var templates: [TeamTemplate] = []
+
+    private let fileURL: URL = {
+        let dir = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
+            .appendingPathComponent("cmux", isDirectory: true)
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        return dir.appendingPathComponent("team-templates.json")
+    }()
+
+    init() { load() }
+
+    func save() {
+        if let data = try? JSONEncoder().encode(templates) {
+            try? data.write(to: fileURL, options: .atomic)
+        }
+    }
+
+    func load() {
+        guard let data = try? Data(contentsOf: fileURL),
+              let decoded = try? JSONDecoder().decode([TeamTemplate].self, from: data) else { return }
+        templates = decoded
+    }
+
+    func add(_ template: TeamTemplate) {
+        templates.append(template)
+        save()
+    }
+
+    func delete(_ template: TeamTemplate) {
+        templates.removeAll { $0.id == template.id }
+        save()
+    }
+}

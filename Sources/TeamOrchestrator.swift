@@ -134,6 +134,10 @@ final class TeamOrchestrator {
         }
         let leaderPanelId = leaderPanel.id
 
+        // Set leader pane title
+        let leaderLabel = leaderMode == "claude" ? "👑 Leader (Claude)" : "👑 Leader (REPL)"
+        workspace.setPanelCustomTitle(panelId: leaderPanelId, title: leaderLabel)
+
         // Close the original empty panel
         workspace.closePanel(defaultPanelId)
 
@@ -189,6 +193,10 @@ final class TeamOrchestrator {
                 }
                 panelId = panel.id
             }
+
+            // Set agent name as pane title
+            let colorEmoji = Self.colorEmoji(agentColor)
+            workspace.setPanelCustomTitle(panelId: panelId, title: "\(colorEmoji) \(agent.name)")
 
             let member = AgentMember(
                 id: agentId,
@@ -372,5 +380,17 @@ final class TeamOrchestrator {
         }
 
         return parts.joined(separator: " ")
+    }
+
+    private static func colorEmoji(_ color: String) -> String {
+        switch color {
+        case "green":   return "🟢"
+        case "blue":    return "🔵"
+        case "yellow":  return "🟡"
+        case "red":     return "🔴"
+        case "cyan":    return "🩵"
+        case "magenta": return "🟣"
+        default:        return "⚪"
+        }
     }
 }

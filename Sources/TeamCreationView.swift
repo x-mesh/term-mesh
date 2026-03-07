@@ -11,6 +11,7 @@ struct TeamAgentRow: Identifiable {
 struct TeamCreationView: View {
     @Environment(\.dismiss) private var dismiss
     @ObservedObject var presetManager = AgentRolePresetManager.shared
+    @ObservedObject var templateManager = TeamTemplateManager.shared
 
     var onCreate: ((_ teamName: String, _ leaderMode: String, _ agents: [TeamAgentRow]) -> Void)?
 
@@ -18,6 +19,8 @@ struct TeamCreationView: View {
     @State private var leaderMode = "repl"  // "repl" or "claude"
     @State private var agents: [TeamAgentRow] = []
     @State private var showPresetEditor = false
+    @State private var showSaveTemplate = false
+    @State private var saveTemplateName = ""
 
     private let models = ["sonnet", "opus", "haiku"]
 
@@ -58,6 +61,44 @@ struct TeamCreationView: View {
             Text("New Agent Team")
                 .font(.headline)
             Spacer()
+
+            // Save current config as template
+            Button(action: {
+                saveTemplateName = teamName
+                showSaveTemplate = true
+            }) {
+                Label("Save", systemImage: "square.and.arrow.down")
+                    .font(.caption)
+            }
+            .buttonStyle(.borderless)
+            .help("Save current configuration as template")
+            .disabled(agents.isEmpty)
+
+            // Load saved template
+            if !templateManager.templates.isEmpty {
+                Menu {
+                    ForEach(templateManager.templates) { template in
+                        Button(action: { loadTemplate(template) }) {
+                            Text("\(template.name) (\(template.agents.count) agents)")
+                        }
+                    }
+                    Divider()
+                    Menu("Delete…") {
+                        ForEach(templateManager.templates) { template in
+                            Button(template.name, role: .destructive) {
+                                templateManager.delete(template)
+                            }
+                        }
+                    }
+                } label: {
+                    Label("Load", systemImage: "folder")
+                        .font(.caption)
+                }
+                .menuStyle(.borderlessButton)
+                .fixedSize()
+                .help("Load saved team template")
+            }
+
             Button(action: { showPresetEditor = true }) {
                 Label("Manage Presets", systemImage: "slider.horizontal.3")
                     .font(.caption)
@@ -66,6 +107,13 @@ struct TeamCreationView: View {
         }
         .padding(.horizontal, 20)
         .padding(.vertical, 12)
+        .alert("Save Team Template", isPresented: $showSaveTemplate) {
+            TextField("Template name", text: $saveTemplateName)
+            Button("Save") { saveCurrentAsTemplate() }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("Save the current team configuration for reuse.")
+        }
     }
 
     // MARK: - Team Settings
@@ -113,6 +161,9 @@ struct TeamCreationView: View {
 
             ForEach(Array(agents.enumerated()), id: \.element.id) { index, agent in
                 agentCard(index: index, agent: agent)
+            }
+            .onMove { source, destination in
+                agents.move(fromOffsets: source, toOffset: destination)
             }
 
             Button(action: addAgent) {
@@ -285,6 +336,32 @@ struct TeamCreationView: View {
             }
             // Fallback: use first available preset if role not found
             return available.first.map { TeamAgentRow(preset: $0, customInstructions: "") }
+        }
+    }
+
+    private func saveCurrentAsTemplate() {
+        guard !saveTemplateName.isEmpty, !agents.isEmpty else { return }
+        let slots = agents.map { row in
+            TeamTemplate.AgentSlot(
+                roleName: row.preset.name,
+                model: row.preset.model,
+                customInstructions: row.customInstructions
+            )
+        }
+        let template = TeamTemplate(name: saveTemplateName, leaderMode: leaderMode, agents: slots)
+        templateManager.add(template)
+    }
+
+    private func loadTemplate(_ template: TeamTemplate) {
+        teamName = template.name
+        leaderMode = template.leaderMode
+        let available = presetManager.presets
+        agents = template.agents.compactMap { slot in
+            let preset = available.first(where: { $0.name == slot.roleName })
+                ?? available.first
+            guard var p = preset else { return nil as TeamAgentRow? }
+            p.model = slot.model
+            return TeamAgentRow(preset: p, customInstructions: slot.customInstructions)
         }
     }
 
