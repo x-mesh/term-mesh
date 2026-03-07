@@ -839,6 +839,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
     }
 
     func applicationWillTerminate(_ notification: Notification) {
+        tabManager?.saveSessionState()
         TerminalController.shared.stop()
         TermMeshDaemon.shared.stopDaemon()
         BrowserHistoryStore.shared.flushPendingSaves()

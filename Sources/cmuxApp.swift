@@ -2741,6 +2741,7 @@ struct SettingsView: View {
     private var commandPaletteRenameSelectAllOnFocus = CommandPaletteRenameSelectionSettings.defaultSelectAllOnFocus
     @AppStorage(WorkspacePlacementSettings.placementKey) private var newWorkspacePlacement = WorkspacePlacementSettings.defaultPlacement.rawValue
     @AppStorage(WorkspaceAutoReorderSettings.key) private var workspaceAutoReorder = WorkspaceAutoReorderSettings.defaultValue
+    @AppStorage(SessionRestoreSettings.modeKey) private var sessionRestoreMode = SessionRestoreSettings.defaultMode.rawValue
     @AppStorage(SidebarBranchLayoutSettings.key) private var sidebarBranchVerticalLayout = SidebarBranchLayoutSettings.defaultVerticalLayout
     @AppStorage(SidebarActiveTabIndicatorSettings.styleKey)
     private var sidebarActiveTabIndicatorStyle = SidebarActiveTabIndicatorSettings.defaultStyle.rawValue
@@ -2748,6 +2749,7 @@ struct SettingsView: View {
     @State private var topBlurOpacity: Double = 0
     @State private var topBlurBaselineOffset: CGFloat?
     @State private var settingsTitleLeadingInset: CGFloat = 92
+    @State private var settingsSearchQuery = ""
     @State private var showClearBrowserHistoryConfirmation = false
     @State private var showOpenAccessConfirmation = false
     @State private var pendingOpenAccessMode: SocketControlMode?
@@ -2866,12 +2868,46 @@ struct SettingsView: View {
         }
     }
 
+    private var normalizedSearchQuery: String {
+        settingsSearchQuery.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+    }
+
+    private var isSearching: Bool {
+        !normalizedSearchQuery.isEmpty
+    }
+
+    private func settingsMatch(_ keywords: String...) -> Bool {
+        let q = normalizedSearchQuery
+        guard !q.isEmpty else { return true }
+        return keywords.contains { $0.lowercased().contains(q) }
+    }
+
+    private func sectionVisible(_ sectionKeywords: [String], rowKeywords: [[String]]) -> Bool {
+        let q = normalizedSearchQuery
+        guard !q.isEmpty else { return true }
+        if sectionKeywords.contains(where: { $0.lowercased().contains(q) }) { return true }
+        return rowKeywords.contains { group in
+            group.contains { $0.lowercased().contains(q) }
+        }
+    }
+
     var body: some View {
         ZStack(alignment: .top) {
             ScrollView {
                 VStack(alignment: .leading, spacing: 14) {
+                    if sectionVisible(["app"], rowKeywords: [
+                        ["theme", "appearance", "dark", "light"],
+                        ["workspace", "placement", "new tab", "position"],
+                        ["reorder", "notification"],
+                        ["session", "restore", "resume", "reopen", "directory", "folder", "startup", "launch"],
+                        ["dock", "badge", "unread"],
+                        ["quit", "warn", "confirmation"],
+                        ["rename", "select", "command palette"],
+                        ["sidebar", "branch", "layout", "git"]
+                    ]) {
                     SettingsSectionHeader(title: "App")
                     SettingsCard {
+                        if settingsMatch("theme", "appearance", "dark", "light", "app") {
                         SettingsCardRow("Theme", controlWidth: pickerColumnWidth) {
                             Picker("", selection: $appearanceMode) {
                                 ForEach(AppearanceMode.visibleCases) { mode in
@@ -2881,7 +2917,9 @@ struct SettingsView: View {
                             .labelsHidden()
                             .pickerStyle(.menu)
                         }
+                        }
 
+                        if settingsMatch("workspace", "placement", "new tab", "position", "app") {
                         SettingsCardDivider()
 
                         SettingsCardRow(
@@ -2897,7 +2935,9 @@ struct SettingsView: View {
                             .labelsHidden()
                             .pickerStyle(.menu)
                         }
+                        }
 
+                        if settingsMatch("reorder", "notification", "app") {
                         SettingsCardDivider()
 
                         SettingsCardRow(
@@ -2908,7 +2948,28 @@ struct SettingsView: View {
                                 .labelsHidden()
                                 .controlSize(.small)
                         }
+                        }
 
+                        if settingsMatch("session", "restore", "resume", "reopen", "directory", "folder", "startup", "launch", "app") {
+                        SettingsCardDivider()
+
+                        SettingsCardRow(
+                            "Session Restore",
+                            subtitle: sessionRestoreMode == SessionRestoreMode.always.rawValue
+                                ? "Reopen previous workspaces and directories on launch."
+                                : "Start with a fresh workspace on launch.",
+                            controlWidth: pickerColumnWidth
+                        ) {
+                            Picker("", selection: $sessionRestoreMode) {
+                                ForEach(SessionRestoreMode.allCases) { mode in
+                                    Text(mode.displayName).tag(mode.rawValue)
+                                }
+                            }
+                            .labelsHidden()
+                        }
+                        }
+
+                        if settingsMatch("dock", "badge", "unread", "app") {
                         SettingsCardDivider()
 
                         SettingsCardRow(
@@ -2919,7 +2980,9 @@ struct SettingsView: View {
                                 .labelsHidden()
                                 .controlSize(.small)
                         }
+                        }
 
+                        if settingsMatch("quit", "warn", "confirmation", "app") {
                         SettingsCardDivider()
 
                         SettingsCardRow(
@@ -2932,7 +2995,9 @@ struct SettingsView: View {
                                 .labelsHidden()
                                 .controlSize(.small)
                         }
+                        }
 
+                        if settingsMatch("rename", "select", "command palette", "app") {
                         SettingsCardDivider()
 
                         SettingsCardRow(
@@ -2945,7 +3010,9 @@ struct SettingsView: View {
                                 .labelsHidden()
                                 .controlSize(.small)
                         }
+                        }
 
+                        if settingsMatch("sidebar", "branch", "layout", "git", "app") {
                         SettingsCardDivider()
 
                         SettingsCardRow(
@@ -2961,9 +3028,12 @@ struct SettingsView: View {
                             .labelsHidden()
                             .pickerStyle(.menu)
                         }
+                        }
 
                     }
+                    }
 
+                    if settingsMatch("workspace", "color", "indicator", "palette", "custom") {
                     SettingsSectionHeader(title: "Workspace Colors")
                     SettingsCard {
                         SettingsCardRow(
@@ -3054,7 +3124,9 @@ struct SettingsView: View {
                             .controlSize(.small)
                         }
                     }
+                    }
 
+                    if settingsMatch("automation", "socket", "claude", "port", "integration", "password") {
                     SettingsSectionHeader(title: "Automation")
                     SettingsCard {
                         SettingsCardRow(
@@ -3158,7 +3230,9 @@ struct SettingsView: View {
 
                         SettingsCardNote("Each workspace gets CMUX_PORT and CMUX_PORT_END env vars with a dedicated port range. New terminals inherit these values.")
                     }
+                    }
 
+                    if settingsMatch("browser", "search", "engine", "theme", "link", "history", "http", "insecure", "suggestion") {
                     SettingsSectionHeader(title: "Browser")
                     SettingsCard {
                         SettingsCardRow(
@@ -3324,7 +3398,9 @@ struct SettingsView: View {
                             .disabled(browserHistoryEntryCount == 0)
                         }
                     }
+                    }
 
+                    if settingsMatch("keyboard", "shortcut", "keybinding", "hotkey") {
                     SettingsSectionHeader(title: "Keyboard Shortcuts")
                     SettingsCard {
                         let actions = KeyboardShortcutSettings.Action.allCases
@@ -3343,7 +3419,9 @@ struct SettingsView: View {
                         .font(.caption)
                         .foregroundColor(.secondary)
                         .padding(.leading, 2)
+                    }
 
+                    if settingsMatch("reset", "clear", "defaults") {
                     SettingsSectionHeader(title: "Reset")
                     SettingsCard {
                         HStack {
@@ -3357,6 +3435,28 @@ struct SettingsView: View {
                         }
                         .padding(.horizontal, 14)
                         .padding(.vertical, 10)
+                    }
+                    }
+
+                    if isSearching {
+                        let anyVisible = sectionVisible(["app"], rowKeywords: [["theme"], ["workspace"], ["reorder"], ["session", "restore"], ["dock"], ["quit"], ["rename"], ["sidebar"]])
+                            || settingsMatch("workspace", "color", "indicator", "palette", "custom")
+                            || settingsMatch("automation", "socket", "claude", "port", "integration", "password")
+                            || settingsMatch("browser", "search", "engine", "theme", "link", "history", "http", "insecure", "suggestion")
+                            || settingsMatch("keyboard", "shortcut", "keybinding", "hotkey")
+                            || settingsMatch("reset", "clear", "defaults")
+                        if !anyVisible {
+                            VStack(spacing: 8) {
+                                Image(systemName: "magnifyingglass")
+                                    .font(.system(size: 28))
+                                    .foregroundColor(.secondary.opacity(0.5))
+                                Text("No settings match \"\(settingsSearchQuery)\"")
+                                    .font(.system(size: 13))
+                                    .foregroundColor(.secondary)
+                            }
+                            .frame(maxWidth: .infinity)
+                            .padding(.top, 60)
+                        }
                     }
                 }
                 .padding(.horizontal, 20)
@@ -3413,13 +3513,41 @@ struct SettingsView: View {
                     )
                     .opacity(0.14 + (topBlurOpacity * 0.86))
 
-                HStack {
+                HStack(spacing: 12) {
                     Text("Settings")
                         .font(.system(size: 16, weight: .semibold))
                         .foregroundColor(.primary.opacity(0.92))
                     Spacer(minLength: 0)
+                    HStack(spacing: 4) {
+                        Image(systemName: "magnifyingglass")
+                            .font(.system(size: 12))
+                            .foregroundColor(.secondary)
+                        TextField("Search", text: $settingsSearchQuery)
+                            .textFieldStyle(.plain)
+                            .font(.system(size: 13))
+                            .frame(width: 140)
+                        if !settingsSearchQuery.isEmpty {
+                            Button(action: { settingsSearchQuery = "" }) {
+                                Image(systemName: "xmark.circle.fill")
+                                    .font(.system(size: 12))
+                                    .foregroundColor(.secondary)
+                            }
+                            .buttonStyle(.plain)
+                        }
+                    }
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 4)
+                    .background(
+                        RoundedRectangle(cornerRadius: 8, style: .continuous)
+                            .fill(Color(nsColor: .controlBackgroundColor).opacity(0.6))
+                            .overlay(
+                                RoundedRectangle(cornerRadius: 8, style: .continuous)
+                                    .stroke(Color(nsColor: .separatorColor).opacity(0.4), lineWidth: 1)
+                            )
+                    )
                 }
                 .padding(.leading, settingsTitleLeadingInset)
+                .padding(.trailing, 20)
                 .padding(.top, 12)
             }
                 .frame(height: 62)
@@ -3431,7 +3559,7 @@ struct SettingsView: View {
                         .frame(height: 1),
                     alignment: .bottom
                 )
-                .allowsHitTesting(false)
+                .allowsHitTesting(true)
         }
         .background(Color(nsColor: .windowBackgroundColor).ignoresSafeArea())
         .toggleStyle(.switch)

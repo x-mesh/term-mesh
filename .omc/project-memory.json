@@ -1,0 +1,364 @@
+{
+  "version": "1.0.0",
+  "lastScanned": 1772886570574,
+  "projectRoot": "/Users/jinwoo/work/project/cmux",
+  "techStack": {
+    "languages": [
+      {
+        "name": "JavaScript/TypeScript",
+        "version": null,
+        "confidence": "high",
+        "markers": [
+          "package.json"
+        ]
+      },
+      {
+        "name": "C/C++",
+        "version": null,
+        "confidence": "high",
+        "markers": [
+          "Makefile"
+        ]
+      }
+    ],
+    "frameworks": [],
+    "packageManager": "npm",
+    "runtime": null
+  },
+  "build": {
+    "buildCommand": "make build",
+    "testCommand": "make test",
+    "lintCommand": null,
+    "devCommand": null,
+    "scripts": {}
+  },
+  "conventions": {
+    "namingStyle": null,
+    "importStyle": null,
+    "testPattern": null,
+    "fileOrganization": null
+  },
+  "structure": {
+    "isMonorepo": false,
+    "workspaces": [],
+    "mainDirectories": [
+      "docs",
+      "scripts",
+      "tests"
+    ],
+    "gitBranches": {
+      "defaultBranch": "main",
+      "branchingStrategy": null
+    }
+  },
+  "customNotes": [],
+  "directoryMap": {
+    "Assets.xcassets": {
+      "path": "Assets.xcassets",
+      "purpose": null,
+      "fileCount": 1,
+      "lastAccessed": 1772886570561,
+      "keyFiles": [
+        "Contents.json"
+      ]
+    },
+    "CLI": {
+      "path": "CLI",
+      "purpose": null,
+      "fileCount": 1,
+      "lastAccessed": 1772886570567,
+      "keyFiles": [
+        "cmux.swift"
+      ]
+    },
+    "GhosttyTabs.xcodeproj": {
+      "path": "GhosttyTabs.xcodeproj",
+      "purpose": null,
+      "fileCount": 1,
+      "lastAccessed": 1772886570567,
+      "keyFiles": [
+        "project.pbxproj"
+      ]
+    },
+    "Resources": {
+      "path": "Resources",
+      "purpose": null,
+      "fileCount": 1,
+      "lastAccessed": 1772886570568,
+      "keyFiles": [
+        "Info.plist"
+      ]
+    },
+    "Sources": {
+      "path": "Sources",
+      "purpose": null,
+      "fileCount": 28,
+      "lastAccessed": 1772886570568,
+      "keyFiles": [
+        "AppDelegate.swift",
+        "Backport.swift",
+        "BrowserWindowPortal.swift",
+        "ContentView.swift",
+        "DashboardController.swift"
+      ]
+    },
+    "cmuxTests": {
+      "path": "cmuxTests",
+      "purpose": null,
+      "fileCount": 5,
+      "lastAccessed": 1772886570568,
+      "keyFiles": [
+        "CJKIMEInputTests.swift",
+        "CmuxWebViewKeyEquivalentTests.swift",
+        "GhosttyConfigTests.swift",
+        "UpdatePillReleaseVisibilityTests.swift",
+        "WorkspaceManualUnreadTests.swift"
+      ]
+    },
+    "cmuxUITests": {
+      "path": "cmuxUITests",
+      "purpose": null,
+      "fileCount": 10,
+      "lastAccessed": 1772886570568,
+      "keyFiles": [
+        "AutomationSocketUITests.swift",
+        "BrowserOmnibarSuggestionsUITests.swift",
+        "BrowserPaneNavigationKeybindUITests.swift",
+        "CloseWorkspaceCmdDUITests.swift",
+        "CloseWorkspaceConfirmDialogUITests.swift"
+      ]
+    },
+    "daemon": {
+      "path": "daemon",
+      "purpose": null,
+      "fileCount": 2,
+      "lastAccessed": 1772886570569,
+      "keyFiles": [
+        "Cargo.lock",
+        "Cargo.toml"
+      ]
+    },
+    "docs": {
+      "path": "docs",
+      "purpose": "Documentation",
+      "fileCount": 5,
+      "lastAccessed": 1772886570569,
+      "keyFiles": [
+        "agent-browser-port-spec.md",
+        "ghostty-fork.md",
+        "notifications.md",
+        "socket-focus-steal-audit.todo.md",
+        "v2-api-migration.md"
+      ]
+    },
+    "ghostty": {
+      "path": "ghostty",
+      "purpose": null,
+      "fileCount": 33,
+      "lastAccessed": 1772886570569,
+      "keyFiles": [
+        "AGENTS.md",
+        "AI_POLICY.md",
+        "CODEOWNERS",
+        "CONTRIBUTING.md",
+        "Doxyfile"
+      ]
+    },
+    "homebrew-cmux": {
+      "path": "homebrew-cmux",
+      "purpose": null,
+      "fileCount": 2,
+      "lastAccessed": 1772886570569,
+      "keyFiles": [
+        "README.md"
+      ]
+    },
+    "scripts": {
+      "path": "scripts",
+      "purpose": "Build/utility scripts",
+      "fileCount": 19,
+      "lastAccessed": 1772886570569,
+      "keyFiles": [
+        "build-sign-upload.sh",
+        "bump-version.sh",
+        "derive_sparkle_public_key.swift",
+        "generate_nightly_icon.py",
+        "notify_probe.sh"
+      ]
+    },
+    "skills": {
+      "path": "skills",
+      "purpose": null,
+      "fileCount": 0,
+      "lastAccessed": 1772886570570,
+      "keyFiles": []
+    },
+    "tests": {
+      "path": "tests",
+      "purpose": "Test files",
+      "fileCount": 61,
+      "lastAccessed": 1772886570570,
+      "keyFiles": [
+        "cmux.py",
+        "test_app_keystrokes.sh",
+        "test_blank_screen.py",
+        "test_bonsplit_tab_drag_overlay_gate.py",
+        "test_browser_back_forward.py"
+      ]
+    },
+    "tests_v2": {
+      "path": "tests_v2",
+      "purpose": null,
+      "fileCount": 69,
+      "lastAccessed": 1772886570571,
+      "keyFiles": [
+        "cmux.py",
+        "test_browser_api_comprehensive.py",
+        "test_browser_api_extended_families.py",
+        "test_browser_api_p0.py",
+        "test_browser_api_unsupported_matrix.py"
+      ]
+    },
+    "vendor": {
+      "path": "vendor",
+      "purpose": "Third-party code",
+      "fileCount": 0,
+      "lastAccessed": 1772886570571,
+      "keyFiles": []
+    },
+    "web": {
+      "path": "web",
+      "purpose": null,
+      "fileCount": 9,
+      "lastAccessed": 1772886570572,
+      "keyFiles": [
+        "README.md",
+        "bun.lock",
+        "eslint.config.mjs",
+        "next.config.ts",
+        "package-lock.json"
+      ]
+    },
+    "Resources/bin": {
+      "path": "Resources/bin",
+      "purpose": "Executable scripts",
+      "fileCount": 2,
+      "lastAccessed": 1772886570572,
+      "keyFiles": [
+        "claude",
+        "open"
+      ]
+    },
+    "daemon/scripts": {
+      "path": "daemon/scripts",
+      "purpose": "Build/utility scripts",
+      "fileCount": 1,
+      "lastAccessed": 1772886570573,
+      "keyFiles": [
+        "bench.sh"
+      ]
+    },
+    "docs/assets": {
+      "path": "docs/assets",
+      "purpose": "Static assets",
+      "fileCount": 7,
+      "lastAccessed": 1772886570573,
+      "keyFiles": [
+        "built-in-browser.png",
+        "macos-badge.png",
+        "main-first-image.png"
+      ]
+    },
+    "web/app": {
+      "path": "web/app",
+      "purpose": "Application code",
+      "fileCount": 14,
+      "lastAccessed": 1772886570574,
+      "keyFiles": [
+        "apple-icon.png",
+        "favicon.ico",
+        "globals.css"
+      ]
+    },
+    "web/public": {
+      "path": "web/public",
+      "purpose": "Public files",
+      "fileCount": 4,
+      "lastAccessed": 1772886570574,
+      "keyFiles": [
+        "download-badge.svg",
+        "ghostty-vt.wasm",
+        "logo.png"
+      ]
+    }
+  },
+  "hotPaths": [
+    {
+      "path": "Sources/cmuxApp.swift",
+      "accessCount": 38,
+      "lastAccessed": 1772888088298,
+      "type": "file"
+    },
+    {
+      "path": "Sources/TabManager.swift",
+      "accessCount": 13,
+      "lastAccessed": 1772888509775,
+      "type": "file"
+    },
+    {
+      "path": "Sources/TerminalController.swift",
+      "accessCount": 12,
+      "lastAccessed": 1772888519552,
+      "type": "directory"
+    },
+    {
+      "path": "Sources",
+      "accessCount": 8,
+      "lastAccessed": 1772888496189,
+      "type": "directory"
+    },
+    {
+      "path": "Sources/Workspace.swift",
+      "accessCount": 7,
+      "lastAccessed": 1772888509354,
+      "type": "file"
+    },
+    {
+      "path": "Sources/AppDelegate.swift",
+      "accessCount": 4,
+      "lastAccessed": 1772887608824,
+      "type": "file"
+    },
+    {
+      "path": "Sources/TermMeshDaemon.swift",
+      "accessCount": 2,
+      "lastAccessed": 1772888474870,
+      "type": "file"
+    },
+    {
+      "path": "Sources/DashboardController.swift",
+      "accessCount": 2,
+      "lastAccessed": 1772888509147,
+      "type": "file"
+    },
+    {
+      "path": "",
+      "accessCount": 1,
+      "lastAccessed": 1772887376510,
+      "type": "directory"
+    },
+    {
+      "path": "PRD.md",
+      "accessCount": 1,
+      "lastAccessed": 1772888474621,
+      "type": "file"
+    },
+    {
+      "path": "Sources/Panels/TerminalPanel.swift",
+      "accessCount": 1,
+      "lastAccessed": 1772888492618,
+      "type": "file"
+    }
+  ],
+  "userDirectives": []
+}

@@ -9,6 +9,54 @@ import Combine
 // The old Tab class is replaced by Workspace
 typealias Tab = Workspace
 
+// MARK: - Session Restore
+
+enum SessionRestoreMode: String, CaseIterable, Identifiable {
+    case off
+    case always
+
+    var id: String { rawValue }
+
+    var displayName: String {
+        switch self {
+        case .off: return "Start fresh"
+        case .always: return "Restore previous session"
+        }
+    }
+}
+
+enum SessionRestoreSettings {
+    static let modeKey = "sessionRestoreMode"
+    static let defaultMode: SessionRestoreMode = .always
+
+    static func mode(defaults: UserDefaults = .standard) -> SessionRestoreMode {
+        guard let raw = defaults.string(forKey: modeKey) else { return defaultMode }
+        return SessionRestoreMode(rawValue: raw) ?? defaultMode
+    }
+
+    static var sessionFilePath: String {
+        let appSupport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
+        let bundleId = Bundle.main.bundleIdentifier ?? "com.cmux"
+        let dir = appSupport.appendingPathComponent(bundleId)
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        return dir.appendingPathComponent("session.json").path
+    }
+}
+
+struct SavedWorkspaceState: Codable {
+    let title: String
+    let customTitle: String?
+    let directory: String
+    let isPinned: Bool
+    let customColor: String?
+}
+
+struct SavedSessionState: Codable {
+    let version: Int
+    let workspaces: [SavedWorkspaceState]
+    let selectedIndex: Int?
+}
+
 enum NewWorkspacePlacement: String, CaseIterable, Identifiable {
     case top
     case afterCurrent
@@ -644,7 +692,14 @@ class TabManager: ObservableObject {
 #endif
 
     init(initialWorkingDirectory: String? = nil) {
-        addWorkspace(workingDirectory: initialWorkingDirectory)
+        // Session restore: if enabled and no explicit directory was passed, restore previous workspaces
+        if initialWorkingDirectory == nil,
+           SessionRestoreSettings.mode() == .always,
+           let saved = Self.loadSavedSession() {
+            restoreSession(saved)
+        } else {
+            addWorkspace(workingDirectory: initialWorkingDirectory)
+        }
         observers.append(NotificationCenter.default.addObserver(
             forName: .ghosttyDidSetTitle,
             object: nil,
@@ -841,6 +896,77 @@ class TabManager: ObservableObject {
     // Keep addTab as convenience alias
     @discardableResult
     func addTab(select: Bool = true) -> Workspace { addWorkspace(select: select) }
+
+    // MARK: - Session Save/Restore
+
+    func saveSessionState() {
+        let workspaceStates = tabs.map { workspace in
+            SavedWorkspaceState(
+                title: workspace.title,
+                customTitle: workspace.customTitle,
+                directory: workspace.currentDirectory,
+                isPinned: workspace.isPinned,
+                customColor: workspace.customColor
+            )
+        }
+        let selectedIndex = selectedTabId.flatMap { id in
+            tabs.firstIndex(where: { $0.id == id })
+        }
+        let session = SavedSessionState(
+            version: 1,
+            workspaces: workspaceStates,
+            selectedIndex: selectedIndex
+        )
+        do {
+            let data = try JSONEncoder().encode(session)
+            try data.write(to: URL(fileURLWithPath: SessionRestoreSettings.sessionFilePath), options: .atomic)
+            print("[session-restore] saved \(workspaceStates.count) workspace(s)")
+        } catch {
+            print("[session-restore] save failed: \(error)")
+        }
+    }
+
+    static func loadSavedSession() -> SavedSessionState? {
+        let path = SessionRestoreSettings.sessionFilePath
+        guard FileManager.default.fileExists(atPath: path) else { return nil }
+        do {
+            let data = try Data(contentsOf: URL(fileURLWithPath: path))
+            let session = try JSONDecoder().decode(SavedSessionState.self, from: data)
+            guard session.version == 1, !session.workspaces.isEmpty else { return nil }
+            return session
+        } catch {
+            print("[session-restore] load failed: \(error)")
+            return nil
+        }
+    }
+
+    private func restoreSession(_ session: SavedSessionState) {
+        // Remove the default workspace created by init
+        tabs.removeAll()
+        selectedTabId = nil
+
+        let fm = FileManager.default
+        for saved in session.workspaces {
+            let directory = fm.fileExists(atPath: saved.directory)
+                ? saved.directory
+                : fm.homeDirectoryForCurrentUser.path
+            let workspace = addWorkspace(workingDirectory: directory, select: false)
+            if let customTitle = saved.customTitle {
+                workspace.customTitle = customTitle
+                workspace.title = customTitle
+            }
+            workspace.isPinned = saved.isPinned
+            workspace.customColor = saved.customColor
+        }
+
+        // Restore selected tab
+        if let idx = session.selectedIndex, idx >= 0, idx < tabs.count {
+            selectedTabId = tabs[idx].id
+        } else if let first = tabs.first {
+            selectedTabId = first.id
+        }
+        print("[session-restore] restored \(tabs.count) workspace(s)")
+    }
 
     func terminalPanelForWorkspaceConfigInheritanceSource() -> TerminalPanel? {
         guard let workspace = selectedWorkspace else { return nil }

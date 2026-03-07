@@ -27,11 +27,21 @@ build:
 		-configuration Debug \
 		-destination 'platform=macOS' \
 		-derivedDataPath "$(DERIVED_DATA)" \
-		build 2>&1 | grep -E '(warning:|error:|BUILD|Compiling)' || true
+		build 2>&1 | tee /tmp/cmux-xcodebuild.log | grep -E '(warning:|error:|BUILD|Compiling)'; \
+		RESULT=$${PIPESTATUS[0]}; \
+		if [ $$RESULT -ne 0 ]; then \
+			echo "==> Xcode build FAILED (exit $$RESULT). Full log: /tmp/cmux-xcodebuild.log"; \
+			tail -20 /tmp/cmux-xcodebuild.log; \
+			exit 1; \
+		fi
 	@# Tag the app bundle (always refresh from latest build)
 	@if [ -d "$(BASE_APP)" ]; then \
 		rm -rf "$(SRC_APP)"; \
 		cp -R "$(BASE_APP)" "$(SRC_APP)"; \
+	else \
+		echo "==> ERROR: $(BASE_APP) not found. Xcode build may have failed silently."; \
+		echo "==> Check full log: /tmp/cmux-xcodebuild.log"; \
+		exit 1; \
 	fi
 	@echo "==> Building Rust daemon (release)..."
 	@cd daemon && cargo build --release 2>&1 | grep -v "Compiling " || true

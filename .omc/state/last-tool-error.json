@@ -1,0 +1,7 @@
+{
+  "tool_name": "Read",
+  "tool_input_preview": "{\"file_path\":\"/Users/jinwoo/work/project/cmux/Sources/TerminalController.swift\"}",
+  "error": "File content (500.4KB) exceeds maximum allowed size (256KB). Use offset and limit parameters to read specific portions of the file, or search for specific content instead of reading the whole file.",
+  "timestamp": "2026-03-07T13:01:14.889Z",
+  "retry_count": 1
+}
