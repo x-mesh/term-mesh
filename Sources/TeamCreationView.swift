@@ -137,6 +137,14 @@ struct TeamCreationView: View {
                 Text("Leader")
                     .font(.subheadline.bold())
                 Spacer()
+                if leaderMode != "repl" && !agents.isEmpty {
+                    Button(action: applyLeaderCLIToAll) {
+                        Label("Apply to All", systemImage: "arrow.triangle.2.circlepath")
+                            .font(.caption)
+                    }
+                    .buttonStyle(.borderless)
+                    .help("Change all agents' CLI to \(leaderMode.capitalized)")
+                }
                 Picker("", selection: $leaderMode) {
                     Text("REPL (Manual)").tag("repl")
                     ForEach(AgentRolePreset.supportedCLIs, id: \.self) { cli in
@@ -383,6 +391,13 @@ struct TeamCreationView: View {
             p.cli = slot.cli
             p.model = slot.model
             return TeamAgentRow(preset: p, customInstructions: slot.customInstructions)
+        }
+    }
+
+    private func applyLeaderCLIToAll() {
+        guard leaderMode != "repl" else { return }
+        for i in agents.indices {
+            agents[i].preset.cli = leaderMode
         }
     }
 
