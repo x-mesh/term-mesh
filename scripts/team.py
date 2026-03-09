@@ -2,7 +2,7 @@
 """cmux Team Agent CLI
 
 Usage:
-    ./scripts/team.py create [N] [--claude-leader] [--kiro agent1,agent2]
+    ./scripts/team.py create [N] [--claude-leader] [--kiro agent1,agent2] [--codex agent1] [--gemini agent2]
     ./scripts/team.py send <agent> <text>
     ./scripts/team.py broadcast <text>
     ./scripts/team.py status
@@ -47,6 +47,20 @@ AGENT_NAME = os.environ.get("CMUX_AGENT_NAME", "")
 
 DEFAULT_AGENT_NAMES = ["explorer", "executor", "reviewer", "debugger", "writer", "tester"]
 DEFAULT_AGENT_COLORS = ["green", "blue", "yellow", "magenta", "cyan", "red"]
+
+REPORT_SUFFIX = (
+    '\n\n[IMPORTANT] When you finish this task, you MUST run this command to report your result:\n'
+    'CMUX_AGENT_NAME={agent} ./scripts/team.py report \'<one-paragraph summary of your result>\''
+)
+
+AGENT_INIT_PROMPT = (
+    'You are a team agent named "{agent}" in a cmux multi-agent team. '
+    'When you complete any task assigned by the leader, you MUST report your result by running:\n'
+    'CMUX_AGENT_NAME={agent} ./scripts/team.py report \'<summary of your result>\'\n'
+    'This allows the leader to detect task completion automatically. '
+    'Always include a concise but complete summary in your report. '
+    'Respond with "Agent {agent} ready." to confirm.'
+)
 
 
 # ── Socket helpers ────────────────────────────────────────────────────
@@ -127,20 +141,33 @@ def cmd_create(sock: str, args: argparse.Namespace) -> None:
     count = args.count or 2
     leader_mode = "claude" if args.claude_leader else "repl"
 
-    # Parse --kiro flag: comma-separated agent names (or indices) that should use kiro-cli
-    kiro_agents: set[str] = set()
-    if args.kiro:
-        for item in args.kiro.split(","):
-            item = item.strip()
-            if item:
-                kiro_agents.add(item)
+    # Parse CLI assignment flags: comma-separated agent names (or "all")
+    def _parse_cli_flag(flag_value: str) -> set[str]:
+        result: set[str] = set()
+        if flag_value:
+            for item in flag_value.split(","):
+                item = item.strip()
+                if item:
+                    result.add(item)
+        return result
+
+    kiro_agents = _parse_cli_flag(args.kiro)
+    codex_agents = _parse_cli_flag(getattr(args, "codex", ""))
+    gemini_agents = _parse_cli_flag(getattr(args, "gemini", ""))
 
     agents = []
     for i in range(count):
         name = DEFAULT_AGENT_NAMES[i] if i < len(DEFAULT_AGENT_NAMES) else f"agent-{i}"
         color = DEFAULT_AGENT_COLORS[i % len(DEFAULT_AGENT_COLORS)]
-        # Determine CLI: use kiro if agent name matches or "all" specified
-        cli = "kiro" if (name in kiro_agents or "all" in kiro_agents) else "claude"
+        # Determine CLI: check each flag in priority order
+        if name in codex_agents or "all" in codex_agents:
+            cli = "codex"
+        elif name in gemini_agents or "all" in gemini_agents:
+            cli = "gemini"
+        elif name in kiro_agents or "all" in kiro_agents:
+            cli = "kiro"
+        else:
+            cli = "claude"
         agents.append({"name": name, "cli": cli, "model": "sonnet", "agent_type": name, "color": color})
 
     # Clean up existing team first
@@ -165,20 +192,52 @@ def cmd_create(sock: str, args: argparse.Namespace) -> None:
     print("  ./scripts/team.py status")
     print("  ./scripts/team.py destroy")
 
+    # Option 3: Send init prompt to each agent so they know to report results
+    if r.get("ok"):
+        print("\nSending init prompts to agents...")
+        time.sleep(3)  # Wait for agent CLI to initialize
+        for agent in agents:
+            name = agent["name"]
+            init_text = AGENT_INIT_PROMPT.format(agent=name)
+            rpc(sock, "team.send", {
+                "team_name": TEAM,
+                "agent_name": name,
+                "text": init_text + "\n",
+            }, timeout=3)
+            print(f"  ✓ {name}: init prompt sent")
+            time.sleep(1)  # Stagger sends to avoid race conditions
+
+
+def _append_report_suffix(text: str, agent: str, no_report: bool = False) -> str:
+    """Append report instruction suffix unless --no-report is set."""
+    if no_report:
+        return text
+    return text + REPORT_SUFFIX.format(agent=agent)
+
 
 def cmd_send(sock: str, args: argparse.Namespace) -> None:
+    text = _append_report_suffix(args.text, args.agent, getattr(args, "no_report", False))
     r = rpc(sock, "team.send", {
         "team_name": TEAM,
         "agent_name": args.agent,
-        "text": args.text + "\n",
+        "text": text + "\n",
     })
     print(pretty(r))
 
 
 def cmd_broadcast(sock: str, args: argparse.Namespace) -> None:
+    no_report = getattr(args, "no_report", False)
+    # For broadcast, use a generic agent placeholder — each agent will see their own name in env
+    text = args.text
+    if not no_report:
+        text += (
+            '\n\n[IMPORTANT] When you finish this task, you MUST run this command to report your result:\n'
+            './scripts/team.py report \'<one-paragraph summary of your result>\'\n'
+            '(Make sure CMUX_AGENT_NAME is set to your agent name)'
+        )
     r = rpc(sock, "team.broadcast", {
         "team_name": TEAM,
-        "text": args.text + "\n",
+        "text": text + "\n",
     })
     print(pretty(r))
 
@@ -416,15 +475,23 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--claude-leader", action="store_true")
     sp.add_argument("--kiro", type=str, default="",
                     help="Comma-separated agent names to run with kiro-cli (or 'all')")
+    sp.add_argument("--codex", type=str, default="",
+                    help="Comma-separated agent names to run with Codex CLI (or 'all')")
+    sp.add_argument("--gemini", type=str, default="",
+                    help="Comma-separated agent names to run with Gemini CLI (or 'all')")
 
     # send
     sp = sub.add_parser("send", help="Send text to a specific agent")
     sp.add_argument("agent")
     sp.add_argument("text")
+    sp.add_argument("--no-report", action="store_true",
+                    help="Don't append report instruction suffix")
 
     # broadcast
     sp = sub.add_parser("broadcast", help="Send text to all agents")
     sp.add_argument("text")
+    sp.add_argument("--no-report", action="store_true",
+                    help="Don't append report instruction suffix")
 
     # status / list / destroy
     sub.add_parser("status", help="Show team status")

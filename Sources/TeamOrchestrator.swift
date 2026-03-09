@@ -70,11 +70,15 @@ final class TeamOrchestrator {
 
     // MARK: - Agent CLI Binaries
 
-    /// Resolve the binary path for a given CLI type ("claude", "kiro", etc.)
+    /// Resolve the binary path for a given CLI type ("claude", "kiro", "codex", "gemini").
     private func agentBinaryPath(cli: String) -> String? {
         switch cli {
         case "kiro":
             return kiroBinaryPath()
+        case "codex":
+            return codexBinaryPath()
+        case "gemini":
+            return geminiBinaryPath()
         default:
             return claudeBinaryPath()
         }
@@ -103,6 +107,31 @@ final class TeamOrchestrator {
         if FileManager.default.fileExists(atPath: localBin) { return localBin }
         // Fallback: common install locations
         for path in ["/usr/local/bin/kiro-cli", "/opt/homebrew/bin/kiro-cli"] {
+            if FileManager.default.fileExists(atPath: path) { return path }
+        }
+        return nil
+    }
+
+    private func codexBinaryPath() -> String? {
+        // Codex CLI (OpenAI): typically installed via npm/cargo
+        for path in [
+            "/opt/homebrew/bin/codex",
+            "/usr/local/bin/codex",
+            (NSHomeDirectory() as NSString).appendingPathComponent(".local/bin/codex"),
+            (NSHomeDirectory() as NSString).appendingPathComponent(".cargo/bin/codex"),
+        ] {
+            if FileManager.default.fileExists(atPath: path) { return path }
+        }
+        return nil
+    }
+
+    private func geminiBinaryPath() -> String? {
+        // Gemini CLI (Google): typically installed via npm
+        for path in [
+            "/opt/homebrew/bin/gemini",
+            "/usr/local/bin/gemini",
+            (NSHomeDirectory() as NSString).appendingPathComponent(".local/bin/gemini"),
+        ] {
             if FileManager.default.fileExists(atPath: path) { return path }
         }
         return nil
@@ -277,6 +306,22 @@ final class TeamOrchestrator {
                 // Do NOT auto-send initial prompt — kiro-cli takes 5+ seconds
                 // for MCP server initialization. The leader sends instructions
                 // via team.py send when the agent is ready.
+            case "codex":
+                agentCommand = buildCodexCommand(
+                    codexPath: cliPath,
+                    agentName: agent.name,
+                    teamName: name,
+                    model: agent.model
+                )
+                // Codex CLI starts interactively; leader sends instructions via team.py send.
+            case "gemini":
+                agentCommand = buildGeminiCommand(
+                    geminiPath: cliPath,
+                    agentName: agent.name,
+                    teamName: name,
+                    model: agent.model
+                )
+                // Gemini CLI starts interactively; leader sends instructions via team.py send.
             default:
                 agentCommand = buildClaudeCommand(
                     claudePath: cliPath,
@@ -292,8 +337,8 @@ final class TeamOrchestrator {
             }
             // Wrap so the terminal stays open (drops to shell) if the CLI exits.
             let shellCommand = "\(agentCommand); exec $SHELL"
-            // Select the right environment: kiro agents don't need CLAUDECODE
-            let paneEnv = agentCli == "kiro" ? kiroAgentEnv : claudeAgentEnv
+            // Select the right environment: non-claude agents don't need CLAUDECODE
+            let paneEnv = agentCli == "claude" ? claudeAgentEnv : kiroAgentEnv
 
             let panelId: UUID
             if index == 0 {
@@ -604,6 +649,68 @@ final class TeamOrchestrator {
         // Do NOT pass prompt as positional INPUT — kiro-cli treats it as
         // one-shot mode and exits after answering. Instead, start interactively
         // and send the initial prompt via sendInputText after startup.
+        return parts.joined(separator: " ")
+    }
+
+    /// Map short model names to Codex CLI model identifiers.
+    private static func codexModelName(_ shortName: String) -> String {
+        switch shortName.lowercased() {
+        case "opus":   return "o3"       // highest reasoning
+        case "sonnet": return "o4-mini"  // balanced
+        case "haiku":  return "o4-mini"  // fast
+        default:       return shortName
+        }
+    }
+
+    private func buildCodexCommand(
+        codexPath: String,
+        agentName: String,
+        teamName: String,
+        model: String
+    ) -> String {
+        let path = codexPath.contains(" ") ? "\"\(codexPath)\"" : codexPath
+        var parts = [
+            path,
+            "--ask-for-approval never"  // equivalent to --dangerously-skip-permissions
+        ]
+
+        if !model.isEmpty {
+            let codexModel = Self.codexModelName(model)
+            parts.append("--model \(codexModel)")
+        }
+
+        // Start interactively — leader sends instructions via team.py send.
+        return parts.joined(separator: " ")
+    }
+
+    /// Map short model names to Gemini CLI model identifiers.
+    private static func geminiModelName(_ shortName: String) -> String {
+        switch shortName.lowercased() {
+        case "opus":   return "gemini-2.5-pro"
+        case "sonnet": return "gemini-2.5-flash"
+        case "haiku":  return "gemini-2.5-flash"
+        default:       return shortName
+        }
+    }
+
+    private func buildGeminiCommand(
+        geminiPath: String,
+        agentName: String,
+        teamName: String,
+        model: String
+    ) -> String {
+        let path = geminiPath.contains(" ") ? "\"\(geminiPath)\"" : geminiPath
+        var parts = [
+            path,
+            "--yolo"   // auto-approve all actions (equivalent to --dangerously-skip-permissions)
+        ]
+
+        if !model.isEmpty {
+            let geminiModel = Self.geminiModelName(model)
+            parts.append("--model \(geminiModel)")
+        }
+
+        // Start interactively — leader sends instructions via team.py send.
         return parts.joined(separator: " ")
     }
 
