@@ -139,10 +139,11 @@ struct TeamCreationView: View {
                 Spacer()
                 Picker("", selection: $leaderMode) {
                     Text("REPL (Manual)").tag("repl")
-                    Text("Claude (Auto)").tag("claude")
+                    ForEach(AgentRolePreset.supportedCLIs, id: \.self) { cli in
+                        Text("\(cli.capitalized) (Auto)").tag(cli)
+                    }
                 }
-                .pickerStyle(.segmented)
-                .frame(width: 220)
+                .frame(width: 180)
             }
         }
     }

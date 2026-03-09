@@ -219,9 +219,12 @@ final class TeamOrchestrator {
         // Kiro agents: no CLAUDECODE (kiro-cli is a separate CLI and doesn't need it)
         let kiroAgentEnv = baseEnv
 
-        let leaderEnv = leaderMode == "claude"
-            ? baseEnv  // no CLAUDECODE — leader runs its own Claude instance
-            : claudeAgentEnv
+        // Leader env: Claude leader needs no CLAUDECODE (runs its own instance).
+        // Non-claude CLI leaders (kiro, codex, gemini) also use baseEnv (no CLAUDECODE needed).
+        // REPL leader gets claudeAgentEnv so nested `claude` calls work.
+        let leaderEnv = leaderMode == "repl"
+            ? claudeAgentEnv
+            : baseEnv
 
         // First panel = leader console (left side)
         // Close the default panel and create a new one with the leader script as command
@@ -231,13 +234,32 @@ final class TeamOrchestrator {
         }
 
         // Build leader command
-        let scriptPath = leaderScriptPath(mode: leaderMode)
-        #if DEBUG
-        dlog("[team] leaderMode=\(leaderMode) scriptPath=\(scriptPath ?? "nil")")
-        #endif
-        let leaderCommand: String? = scriptPath.map { script in
-            "\(script) \(socketPath) \(name)"
+        let leaderCommand: String?
+        switch leaderMode {
+        case "repl":
+            let scriptPath = leaderScriptPath(mode: "repl")
+            leaderCommand = scriptPath.map { "\($0) \(socketPath) \(name)" }
+        case "claude":
+            let scriptPath = leaderScriptPath(mode: "claude")
+            leaderCommand = scriptPath.map { "\($0) \(socketPath) \(name)" }
+        case "kiro":
+            if let path = kiroBinaryPath() {
+                leaderCommand = buildKiroCommand(kiroPath: path, agentName: "leader", teamName: name, model: "sonnet")
+            } else { leaderCommand = nil }
+        case "codex":
+            if let path = codexBinaryPath() {
+                leaderCommand = buildCodexCommand(codexPath: path, agentName: "leader", teamName: name, model: "sonnet")
+            } else { leaderCommand = nil }
+        case "gemini":
+            if let path = geminiBinaryPath() {
+                leaderCommand = buildGeminiCommand(geminiPath: path, agentName: "leader", teamName: name, model: "sonnet")
+            } else { leaderCommand = nil }
+        default:
+            leaderCommand = nil
         }
+        #if DEBUG
+        dlog("[team] leaderMode=\(leaderMode) leaderCommand=\(leaderCommand ?? "nil")")
+        #endif
 
         // Replace default panel: split from it with leader command, then close the original
         guard let leaderPanel = workspace.newTerminalSplit(
@@ -255,7 +277,15 @@ final class TeamOrchestrator {
         let leaderPanelId = leaderPanel.id
 
         // Set leader pane title
-        let leaderLabel = leaderMode == "claude" ? "👑 Leader (Claude)" : "👑 Leader (REPL)"
+        let leaderLabel: String
+        switch leaderMode {
+        case "repl":   leaderLabel = "👑 Leader (REPL)"
+        case "claude": leaderLabel = "👑 Leader (Claude)"
+        case "kiro":   leaderLabel = "👑 Leader (Kiro)"
+        case "codex":  leaderLabel = "👑 Leader (Codex)"
+        case "gemini": leaderLabel = "👑 Leader (Gemini)"
+        default:       leaderLabel = "👑 Leader (\(leaderMode))"
+        }
         workspace.setPanelCustomTitle(panelId: leaderPanelId, title: leaderLabel)
 
         // Close the original empty panel

@@ -821,7 +821,7 @@ def test_h20_workspace_switch_back(client: cmux) -> StateChange:
     change = StateChange(
         name="Workspace Switch-Back", group="H",
         description="Create splits, switch to new workspace, switch back — splits intact",
-        command="split right; new_workspace; select_workspace 0",
+        command="split right; new_workspace; select_workspace workspace:1",
     )
     client.new_split("right")
     time.sleep(SPLIT_WAIT)
@@ -983,7 +983,7 @@ def test_i24_browser_drag_split_right_focus_bounce(client: cmux) -> StateChange:
     change = StateChange(
         name="Browser: Focus Bounce Then Drag-To-Split Right", group="I",
         description="Switch focus terminal↔browser before dragging to split right.",
-        command="new_surface --type=browser; navigate; focus_surface 0; focus_surface <browser>; drag_surface_to_split right",
+        command="new_surface --type=browser; navigate; focus_surface surface:1; focus_surface <browser>; drag_surface_to_split right",
     )
     try:
         browser_id = _create_browser_surface(client)
@@ -991,8 +991,10 @@ def test_i24_browser_drag_split_right_focus_bounce(client: cmux) -> StateChange:
         wait_url_contains(client, browser_id, "example.com", timeout=10.0)
         time.sleep(0.4)
 
-        # Focus bounce
-        client._send_command("focus_surface 0")
+        # Focus bounce — use first surface ref from list
+        surfaces = client.list_surfaces()
+        first_ref = surfaces[0][0] if surfaces else "surface:1"
+        client._send_command(f"focus_surface {first_ref}")
         time.sleep(SHORT_WAIT)
         client._send_command(f"focus_surface {browser_id}")
         time.sleep(SHORT_WAIT)
@@ -1023,7 +1025,7 @@ def test_i25_browser_drag_split_right_then_switch_panes(client: cmux) -> StateCh
     change = StateChange(
         name="Browser: Drag-To-Split Right Then Switch Panes", group="I",
         description="After drag-to-split right, focus each pane and ensure views remain in-window.",
-        command="new_surface --type=browser; navigate; drag_surface_to_split right; focus_pane 0/1",
+        command="new_surface --type=browser; navigate; drag_surface_to_split right; focus_pane pane:1/pane:2",
     )
     try:
         browser_id = _create_browser_surface(client)
@@ -1039,10 +1041,11 @@ def test_i25_browser_drag_split_right_then_switch_panes(client: cmux) -> StateCh
             change.passed = False
             change.error = f"Expected 2 panes after drag split, got {pane_count(client)}"
         else:
-            # Switch panes by index (stable order from list_panes).
-            client._send_command("focus_pane 0")
+            # Switch panes by ref (stable order from list_panes).
+            panes = client.list_panes()
+            client._send_command(f"focus_pane {panes[0][0]}")
             time.sleep(SHORT_WAIT)
-            client._send_command("focus_pane 1")
+            client._send_command(f"focus_pane {panes[1][0]}")
             time.sleep(SHORT_WAIT)
 
             blank_err = verify_all_responsive(client, "i25_after_drag")

@@ -326,9 +326,9 @@ class cmux:
         if not response.startswith("OK"):
             raise cmuxError(response)
 
-    def list_surfaces(self, tab: Union[str, int, None] = None) -> List[Tuple[int, str, bool]]:
+    def list_surfaces(self, tab: Union[str, int, None] = None) -> List[Tuple[str, str, bool]]:
         """
-        List surfaces for a tab. Returns list of (index, id, is_focused) tuples.
+        List surfaces for a tab. Returns list of (ref, id, is_focused) tuples.
         If tab is None, uses the current tab.
         """
         arg = "" if tab is None else str(tab)
@@ -341,15 +341,20 @@ class cmux:
             if not line.strip():
                 continue
             selected = line.startswith("*")
-            parts = line.lstrip("* ").split(" ", 1)
+            parts = line.lstrip("* ").split(": ", 1)
             if len(parts) >= 2:
-                index = int(parts[0].rstrip(":"))
-                surface_id = parts[1]
-                surfaces.append((index, surface_id, selected))
+                ref = parts[0].strip()
+                surface_id = parts[1].strip()
+                surfaces.append((ref, surface_id, selected))
         return surfaces
 
     def focus_surface(self, surface: Union[str, int]) -> None:
-        """Focus a surface by ID or index in the current tab."""
+        """Focus a surface by ID, ref, or index in the current tab."""
+        if isinstance(surface, int):
+            surfaces = self.list_surfaces()
+            if surface < 0 or surface >= len(surfaces):
+                raise cmuxError(f"Surface index {surface} out of range (have {len(surfaces)})")
+            surface = surfaces[surface][0]  # Use the ref (e.g. "surface:1")
         response = self._send_command(f"focus_surface {surface}")
         if not response.startswith("OK"):
             raise cmuxError(response)
@@ -657,7 +662,7 @@ class cmux:
         return self._send_command("read_screen")
 
     # Workspace commands
-    def list_workspaces(self) -> List[Tuple[int, str, str, bool]]:
+    def list_workspaces(self) -> List[Tuple[str, str, str, bool]]:
         """List all workspaces."""
         response = self._send_command("list_workspaces")
         if response.startswith("ERROR: Unknown command"):
@@ -670,12 +675,13 @@ class cmux:
             if not line.strip():
                 continue
             selected = line.startswith("*")
-            parts = line.lstrip("* ").split(" ", 2)
-            if len(parts) >= 3:
-                index = int(parts[0].rstrip(":"))
-                workspace_id = parts[1]
-                title = parts[2] if len(parts) > 2 else ""
-                workspaces.append((index, workspace_id, title, selected))
+            parts = line.lstrip("* ").split(": ", 1)
+            if len(parts) >= 2:
+                ref = parts[0].strip()
+                rest = parts[1].split(" ", 1)
+                workspace_id = rest[0]
+                title = rest[1] if len(rest) > 1 else ""
+                workspaces.append((ref, workspace_id, title, selected))
         return workspaces
 
     def new_workspace(self) -> str:
@@ -697,7 +703,12 @@ class cmux:
             raise cmuxError(response)
 
     def select_workspace(self, workspace: Union[str, int]) -> None:
-        """Select a workspace by ID or index."""
+        """Select a workspace by ID, ref, or index."""
+        if isinstance(workspace, int):
+            workspaces = self.list_workspaces()
+            if workspace < 0 or workspace >= len(workspaces):
+                raise cmuxError(f"Workspace index {workspace} out of range (have {len(workspaces)})")
+            workspace = workspaces[workspace][0]  # Use the ref (e.g. "workspace:1")
         response = self._send_command(f"select_workspace {workspace}")
         if response.startswith("ERROR: Unknown command"):
             self.select_tab(workspace)
@@ -706,10 +717,10 @@ class cmux:
             raise cmuxError(response)
 
     # Pane commands
-    def list_panes(self) -> List[Tuple[int, str, int, bool]]:
+    def list_panes(self) -> List[Tuple[str, str, int, bool]]:
         """
         List all panes in the current workspace.
-        Returns list of (index, pane_id, surface_count, is_focused) tuples.
+        Returns list of (ref, pane_id, surface_count, is_focused) tuples.
         """
         response = self._send_command("list_panes")
         if response in ("No panes", "ERROR: No tab selected", "ERROR: No workspace selected"):
@@ -720,16 +731,24 @@ class cmux:
             if not line.strip():
                 continue
             selected = line.startswith("*")
-            parts = line.lstrip("* ").split()
-            if len(parts) >= 4:
-                index = int(parts[0].rstrip(":"))
-                pane_id = parts[1]
-                surface_count = int(parts[2].lstrip("["))
-                panes.append((index, pane_id, surface_count, selected))
+            # Format: "pane:N: <PaneID> [M tabs]"
+            parts = line.lstrip("* ").split(": ", 1)
+            if len(parts) >= 2:
+                ref = parts[0].strip()
+                rest_parts = parts[1].split()
+                if len(rest_parts) >= 3:
+                    pane_id = rest_parts[0]
+                    surface_count = int(rest_parts[1].lstrip("["))
+                    panes.append((ref, pane_id, surface_count, selected))
         return panes
 
     def focus_pane(self, pane: Union[str, int]) -> None:
-        """Focus a pane by ID or index in the current workspace."""
+        """Focus a pane by ID, ref, or index in the current workspace."""
+        if isinstance(pane, int):
+            panes = self.list_panes()
+            if pane < 0 or pane >= len(panes):
+                raise cmuxError(f"Pane index {pane} out of range (have {len(panes)})")
+            pane = panes[pane][0]  # Use the ref (e.g. "pane:1")
         response = self._send_command(f"focus_pane {pane}")
         if not response.startswith("OK"):
             raise cmuxError(response)
@@ -756,12 +775,12 @@ class cmux:
                 continue
             selected = line.startswith("*")
             line2 = line.lstrip("* ").strip()
-            try:
-                idx_part, rest = line2.split(":", 1)
-                index = int(idx_part.strip())
-                rest = rest.strip()
-            except ValueError:
+            # Format: "surface:N: title [panel:UUID]"
+            colon_idx = line2.find(": ")
+            if colon_idx < 0:
                 continue
+            ref = line2[:colon_idx].strip()
+            rest = line2[colon_idx + 2:].strip()
 
             panel_id = ""
             title = rest
@@ -770,7 +789,7 @@ class cmux:
                 title, suffix = rest.split(marker, 1)
                 title = title.strip()
                 panel_id = suffix[:-1]
-            surfaces.append((index, panel_id, title, selected))
+            surfaces.append((ref, panel_id, title, selected))
         return surfaces
 
     def focus_surface_by_panel(self, surface_id: str) -> None:

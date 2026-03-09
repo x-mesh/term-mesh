@@ -2010,6 +2010,12 @@ final class TerminalSurface: Identifiable, ObservableObject {
             keyEvent.text = nil
             _ = ghostty_surface_key(surface, keyEvent)
         }
+        // Send matching RELEASE event — TUI apps (Claude Code, kiro-cli) may
+        // track key state and ignore subsequent PRESS events if the previous
+        // key was never released.
+        keyEvent.action = GHOSTTY_ACTION_RELEASE
+        keyEvent.text = nil
+        _ = ghostty_surface_key(surface, keyEvent)
     }
 
     /// Send text as key events through the ghostty surface API.

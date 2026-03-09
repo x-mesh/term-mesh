@@ -28,10 +28,10 @@ When rebuilding GhosttyKit.xcframework, always use Release optimizations:
 cd ghostty && zig build -Demit-xcframework=true -Doptimize=ReleaseFast
 ```
 
-When rebuilding cmuxd for release/bundling, always use ReleaseFast:
+When rebuilding term-meshd (the Rust daemon, formerly cmuxd):
 
 ```bash
-cd cmuxd && zig build -Doptimize=ReleaseFast
+cd daemon && cargo build --release
 ```
 
 `reload` = kill and launch the Debug app only (tag required):

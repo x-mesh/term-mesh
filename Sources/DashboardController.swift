@@ -261,13 +261,15 @@ final class DashboardController: NSObject, WKNavigationDelegate {
                     guard let sessionId = input["session_id"] as? String,
                           let text = input["text"] as? String else { continue }
                     if let panel = self.findTerminalPanel(agentSessionId: sessionId) {
-                        // Send message text via paste path
-                        panel.sendText(text)
-                        // Send Return key via Ghostty surface API after a short delay.
-                        // Uses sendSurfaceKeyPress instead of sendKeyPress (NSEvent) so
-                        // that it works even when the panel is in a non-active tab
-                        // (sendSyntheticKeyPress silently fails when window is nil).
-                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
+                        // Send text via key events (same mechanism as TeamOrchestrator).
+                        // Using sendInputText instead of sendText ensures text arrives
+                        // through the same input channel as the Return key event.
+                        let trimmed = text.replacingOccurrences(of: "[\\r\\n]+$", with: "", options: .regularExpression)
+                        guard !trimmed.isEmpty else { continue }
+                        panel.sendInputText(trimmed)
+                        // Send Return after 0.3s delay to give TUIs (Claude Code,
+                        // kiro-cli, etc.) time to process text before Enter.
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
                             panel.sendSurfaceKeyPress(keycode: 36) // kVK_Return
                         }
                     }

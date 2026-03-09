@@ -590,8 +590,10 @@ def test_pane_commands(client: cmux) -> TestResult:
 
         response = client._send_command(f"focus_pane {pane_id}")
         if not response.startswith("OK"):
-            # Try with index instead
-            response = client._send_command("focus_pane 0")
+            # Try with first pane ref instead
+            panes = client.list_panes()
+            first_ref = panes[0][0] if panes else "pane:1"
+            response = client._send_command(f"focus_pane {first_ref}")
             if not response.startswith("OK"):
                 result.failure(f"focus_pane failed: {response}")
                 return result

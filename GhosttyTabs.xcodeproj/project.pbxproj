@@ -26,6 +26,14 @@
 		A5001704 /* dashboard in Resources */ = {isa = PBXBuildFile; fileRef = A5001705 /* dashboard */; };
 			A5001006 /* GhosttyKit.xcframework in Frameworks */ = {isa = PBXBuildFile; fileRef = A5001016 /* GhosttyKit.xcframework */; };
 		A5001007 /* TerminalController.swift in Sources */ = {isa = PBXBuildFile; fileRef = A5001019 /* TerminalController.swift */; };
+		TC0B0001 /* TerminalController+Process.swift in Sources */ = {isa = PBXBuildFile; fileRef = TC0F0001 /* TerminalController+Process.swift */; };
+		TC0B0002 /* TerminalController+Workspace.swift in Sources */ = {isa = PBXBuildFile; fileRef = TC0F0002 /* TerminalController+Workspace.swift */; };
+		TC0B0003 /* TerminalController+Surface.swift in Sources */ = {isa = PBXBuildFile; fileRef = TC0F0003 /* TerminalController+Surface.swift */; };
+		TC0B0004 /* TerminalController+Pane.swift in Sources */ = {isa = PBXBuildFile; fileRef = TC0F0004 /* TerminalController+Pane.swift */; };
+		TC0B0005 /* TerminalController+Browser.swift in Sources */ = {isa = PBXBuildFile; fileRef = TC0F0005 /* TerminalController+Browser.swift */; };
+		TC0B0006 /* TerminalController+Debug.swift in Sources */ = {isa = PBXBuildFile; fileRef = TC0F0006 /* TerminalController+Debug.swift */; };
+		TC0B0007 /* TerminalController+V1Commands.swift in Sources */ = {isa = PBXBuildFile; fileRef = TC0F0007 /* TerminalController+V1Commands.swift */; };
+		TC0B0008 /* TerminalController+Parsing.swift in Sources */ = {isa = PBXBuildFile; fileRef = TC0F0008 /* TerminalController+Parsing.swift */; };
 		A5001500 /* CmuxWebView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A5001510 /* CmuxWebView.swift */; };
 		A5001501 /* UITestRecorder.swift in Sources */ = {isa = PBXBuildFile; fileRef = A5001511 /* UITestRecorder.swift */; };
 		A5001226 /* SocketControlSettings.swift in Sources */ = {isa = PBXBuildFile; fileRef = A5001225 /* SocketControlSettings.swift */; };
@@ -161,6 +169,14 @@
 		A5001017 /* ghostty.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = ghostty.h; sourceTree = "<group>"; };
 		A5001018 /* cmux-Bridging-Header.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = "cmux-Bridging-Header.h"; sourceTree = "<group>"; };
 		A5001019 /* TerminalController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TerminalController.swift; sourceTree = "<group>"; };
+		TC0F0001 /* TerminalController+Process.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "TerminalController+Process.swift"; sourceTree = "<group>"; };
+		TC0F0002 /* TerminalController+Workspace.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "TerminalController+Workspace.swift"; sourceTree = "<group>"; };
+		TC0F0003 /* TerminalController+Surface.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "TerminalController+Surface.swift"; sourceTree = "<group>"; };
+		TC0F0004 /* TerminalController+Pane.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "TerminalController+Pane.swift"; sourceTree = "<group>"; };
+		TC0F0005 /* TerminalController+Browser.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "TerminalController+Browser.swift"; sourceTree = "<group>"; };
+		TC0F0006 /* TerminalController+Debug.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "TerminalController+Debug.swift"; sourceTree = "<group>"; };
+		TC0F0007 /* TerminalController+V1Commands.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "TerminalController+V1Commands.swift"; sourceTree = "<group>"; };
+		TC0F0008 /* TerminalController+Parsing.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "TerminalController+Parsing.swift"; sourceTree = "<group>"; };
 		A5001600 /* SentryHelper.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SentryHelper.swift; sourceTree = "<group>"; };
 			A5001510 /* CmuxWebView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Panels/CmuxWebView.swift; sourceTree = "<group>"; };
 			A5001511 /* UITestRecorder.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = UITestRecorder.swift; sourceTree = "<group>"; };
@@ -337,6 +353,14 @@
 				A5001531 /* TerminalWindowPortal.swift */,
 				A5001533 /* BrowserWindowPortal.swift */,
 				A5001019 /* TerminalController.swift */,
+				TC0F0001 /* TerminalController+Process.swift */,
+				TC0F0002 /* TerminalController+Workspace.swift */,
+				TC0F0003 /* TerminalController+Surface.swift */,
+				TC0F0004 /* TerminalController+Pane.swift */,
+				TC0F0005 /* TerminalController+Browser.swift */,
+				TC0F0006 /* TerminalController+Debug.swift */,
+				TC0F0007 /* TerminalController+V1Commands.swift */,
+				TC0F0008 /* TerminalController+Parsing.swift */,
 				A5001541 /* PortScanner.swift */,
 				A5001701 /* TermMeshDaemon.swift */,
 				A5001711 /* TeamOrchestrator.swift */,
@@ -574,6 +598,14 @@
 				A5001532 /* TerminalWindowPortal.swift in Sources */,
 				A5001534 /* BrowserWindowPortal.swift in Sources */,
 				A5001007 /* TerminalController.swift in Sources */,
+				TC0B0001 /* TerminalController+Process.swift in Sources */,
+				TC0B0002 /* TerminalController+Workspace.swift in Sources */,
+				TC0B0003 /* TerminalController+Surface.swift in Sources */,
+				TC0B0004 /* TerminalController+Pane.swift in Sources */,
+				TC0B0005 /* TerminalController+Browser.swift in Sources */,
+				TC0B0006 /* TerminalController+Debug.swift in Sources */,
+				TC0B0007 /* TerminalController+V1Commands.swift in Sources */,
+				TC0B0008 /* TerminalController+Parsing.swift in Sources */,
 				A5001540 /* PortScanner.swift in Sources */,
 				A5001700 /* TermMeshDaemon.swift in Sources */,
 				A5001710 /* TeamOrchestrator.swift in Sources */,
