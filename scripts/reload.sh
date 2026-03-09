@@ -282,9 +282,9 @@ else
   pkill -f "${APP_NAME}.app/Contents/MacOS/${BASE_APP_NAME}" || true
 fi
 sleep 0.3
-TERMMESHD_SRC="$PWD/daemon/zig-out/bin/term-meshd"
-if [[ -d "$PWD/daemon" ]]; then
-  (cd "$PWD/daemon" && zig build -Doptimize=ReleaseFast)
+TERMMESHD_SRC="$PWD/daemon/target/release/term-meshd"
+if [[ -d "$PWD/daemon" && -f "$PWD/daemon/Cargo.toml" ]]; then
+  (cd "$PWD/daemon" && cargo build --release 2>/dev/null) || true
 fi
 if [[ -x "$TERMMESHD_SRC" ]]; then
   BIN_DIR="$APP_PATH/Contents/Resources/bin"

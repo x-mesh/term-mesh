@@ -58,6 +58,8 @@ final class DashboardController: NSObject, WKNavigationDelegate {
         config.userContentController.add(handler, name: "stopProcess")
         config.userContentController.add(handler, name: "resumeProcess")
         config.userContentController.add(handler, name: "setAutoStop")
+        config.userContentController.add(handler, name: "teamTaskAction")
+        config.userContentController.add(handler, name: "teamTaskCreate")
 
         let wv = WKWebView(frame: .zero, configuration: config)
         wv.navigationDelegate = self
@@ -125,6 +127,7 @@ final class DashboardController: NSObject, WKNavigationDelegate {
                 self?.reconcileTrackedPIDs(descendants)
                 self?.watchTabProjects()
                 self?.syncSessionsToDaemon()
+                self?.syncTeamsToDaemon()
                 self?.pollAlerts()
                 self?.deliverPendingInputs()
             }
@@ -166,6 +169,13 @@ final class DashboardController: NSObject, WKNavigationDelegate {
 
         DispatchQueue.global(qos: .utility).async {
             TermMeshDaemon.shared.syncSessions(sessions)
+        }
+    }
+
+    private func syncTeamsToDaemon() {
+        let payload = currentTeamPayload()
+        DispatchQueue.global(qos: .utility).async {
+            TermMeshDaemon.shared.syncTeams(payload)
         }
     }
 
@@ -269,8 +279,11 @@ final class DashboardController: NSObject, WKNavigationDelegate {
                         panel.sendInputText(trimmed)
                         // Send Return after 0.3s delay to give TUIs (Claude Code,
                         // kiro-cli, etc.) time to process text before Enter.
+                        // Use sendInputText("\n") instead of sendSurfaceKeyPress —
+                        // sendInputText passes text: "\r" with the Return key event,
+                        // which is required for ghostty to emit the correct byte to PTY.
                         DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
-                            panel.sendSurfaceKeyPress(keycode: 36) // kVK_Return
+                            panel.sendInputText("\n")
                         }
                     }
                 }
@@ -456,6 +469,12 @@ final class DashboardController: NSObject, WKNavigationDelegate {
             let tasksData = daemon.rpcCallRaw(method: "task.list", params: [:] as [String: Any])
 
             DispatchQueue.main.async {
+                let teamPayload = self.currentTeamPayload()
+                let teamData = teamPayload["teams"] as? [[String: Any]] ?? []
+                let teamTasks = teamPayload["tasks"] as? [[String: Any]] ?? []
+                let teamAttention = teamPayload["attention"] as? [[String: Any]] ?? []
+                let instanceMeta = teamPayload["instance"] as? [String: Any] ?? [:]
+
                 if let json = monitorData {
                     webView.evaluateJavaScript("updateMonitor(\(json));") { _, error in
                         if let error { print("[dashboard] monitor error: \(error)") }
@@ -478,8 +497,142 @@ final class DashboardController: NSObject, WKNavigationDelegate {
                 if let json = tasksData {
                     webView.evaluateJavaScript("if(window.updateTasks)updateTasks(\(json));") { _, _ in }
                 }
+                if let teamsJson = Self.dashboardJSONString(teamData) {
+                    webView.evaluateJavaScript("if(window.updateTeamAgents)updateTeamAgents(\(teamsJson));") { _, _ in }
+                }
+                if let attentionJson = Self.dashboardJSONString(teamAttention) {
+                    webView.evaluateJavaScript("if(window.updateTeamAttention)updateTeamAttention(\(attentionJson));") { _, _ in }
+                }
+                if let tasksJson = Self.dashboardJSONString(teamTasks) {
+                    webView.evaluateJavaScript("if(window.updateTeamTasks)updateTeamTasks(\(tasksJson));") { _, _ in }
+                }
+                if let instanceJson = Self.dashboardJSONString(instanceMeta) {
+                    webView.evaluateJavaScript("if(window.updateInstanceStatus)updateInstanceStatus(\(instanceJson));") { _, _ in }
+                }
             }
         }
+    }
+
+    private static func dashboardJSONString(_ value: Any) -> String? {
+        guard JSONSerialization.isValidJSONObject(value),
+              let data = try? JSONSerialization.data(withJSONObject: value),
+              let string = String(data: data, encoding: .utf8) else { return nil }
+        return string
+    }
+
+    private func pushInstanceStatus() {
+        guard let webView else { return }
+        let instanceMeta = currentTeamPayload()["instance"] as? [String: Any] ?? [:]
+        guard let instanceJson = Self.dashboardJSONString(instanceMeta) else { return }
+        webView.evaluateJavaScript("if(window.updateInstanceStatus)updateInstanceStatus(\(instanceJson));") { _, _ in }
+    }
+
+    private func currentTeamPayload() -> [String: Any] {
+        let teamData = TeamOrchestrator.shared.listTeams()
+        let teamTasks = teamData.flatMap { team -> [[String: Any]] in
+            guard let teamName = team["team_name"] as? String else { return [] }
+            return TeamOrchestrator.shared.listTasks(teamName: teamName).map { task in
+                var dict = TeamOrchestrator.shared.taskDictionary(task)
+                dict["team_name"] = teamName
+                return dict
+            }
+        }
+        let teamAttention = teamData.flatMap { team -> [[String: Any]] in
+            guard let teamName = team["team_name"] as? String else { return [] }
+            return TeamOrchestrator.shared.inboxItems(teamName: teamName)
+        }
+        let instanceMeta: [String: Any] = [
+            "app_name": Bundle.main.object(forInfoDictionaryKey: "CFBundleName") as? String
+                ?? ProcessInfo.processInfo.processName,
+            "socket_path": SocketControlSettings.socketPath(),
+            "team_count": teamData.count
+        ]
+        return [
+            "teams": teamData,
+            "tasks": teamTasks,
+            "attention": teamAttention,
+            "instance": instanceMeta,
+        ]
+    }
+
+    fileprivate func handleTeamTaskAction(teamName: String, taskId: String, action: String, note: String?) {
+        switch action {
+        case "start":
+            _ = TeamOrchestrator.shared.updateTask(
+                teamName: teamName,
+                taskId: taskId,
+                status: "in_progress"
+            )
+            if let tabManager {
+                _ = TeamOrchestrator.shared.dispatchTaskToAssignee(
+                    teamName: teamName,
+                    taskId: taskId,
+                    tabManager: tabManager
+                )
+            }
+        case "block":
+            _ = TeamOrchestrator.shared.updateTask(
+                teamName: teamName,
+                taskId: taskId,
+                status: "blocked",
+                blockedReason: note
+            )
+        case "review":
+            _ = TeamOrchestrator.shared.updateTask(
+                teamName: teamName,
+                taskId: taskId,
+                status: "review_ready",
+                reviewSummary: note
+            )
+        case "done":
+            _ = TeamOrchestrator.shared.updateTask(
+                teamName: teamName,
+                taskId: taskId,
+                status: "completed",
+                result: note
+            )
+        case "reassign":
+            _ = TeamOrchestrator.shared.reassignTask(
+                teamName: teamName,
+                taskId: taskId,
+                assignee: note
+            )
+            if let tabManager {
+                _ = TeamOrchestrator.shared.dispatchTaskToAssignee(
+                    teamName: teamName,
+                    taskId: taskId,
+                    tabManager: tabManager
+                )
+            }
+        case "unblock":
+            _ = TeamOrchestrator.shared.unblockTask(
+                teamName: teamName,
+                taskId: taskId
+            )
+            if let tabManager {
+                _ = TeamOrchestrator.shared.dispatchTaskToAssignee(
+                    teamName: teamName,
+                    taskId: taskId,
+                    tabManager: tabManager
+                )
+            }
+        default:
+            return
+        }
+        fetchAndPush()
+    }
+
+    fileprivate func handleTeamTaskCreate(teamName: String, title: String, assignee: String?) {
+        let trimmedTitle = title.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedTitle.isEmpty else { return }
+        _ = TeamOrchestrator.shared.createTask(
+            teamName: teamName,
+            title: trimmedTitle,
+            assignee: assignee,
+            priority: 2,
+            createdBy: "dashboard"
+        )
+        fetchAndPush()
     }
 }
 
@@ -516,6 +669,27 @@ private class DashboardMessageHandler: NSObject, WKScriptMessageHandler {
                     daemon.setAutoStop(enabled: enabled)
                 }
             }
+        case "teamTaskAction":
+            guard
+                let body = message.body as? [String: Any],
+                let teamName = body["team_name"] as? String,
+                let taskId = body["task_id"] as? String,
+                let action = body["action"] as? String
+            else { return }
+            let note = body["note"] as? String
+            Task { @MainActor in
+                self.controller?.handleTeamTaskAction(teamName: teamName, taskId: taskId, action: action, note: note)
+            }
+        case "teamTaskCreate":
+            guard
+                let body = message.body as? [String: Any],
+                let teamName = body["team_name"] as? String,
+                let title = body["title"] as? String
+            else { return }
+            let assignee = body["assignee"] as? String
+            Task { @MainActor in
+                self.controller?.handleTeamTaskCreate(teamName: teamName, title: title, assignee: assignee)
+            }
         default:
             break
         }
@@ -525,6 +699,11 @@ private class DashboardMessageHandler: NSObject, WKScriptMessageHandler {
 // MARK: - NSWindowDelegate
 
 extension DashboardController: NSWindowDelegate {
+    func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
+        pushInstanceStatus()
+        fetchAndPush()
+    }
+
     nonisolated func windowWillClose(_ notification: Notification) {
         Task { @MainActor in
             stopUIPolling()

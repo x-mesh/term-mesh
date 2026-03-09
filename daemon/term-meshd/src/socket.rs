@@ -57,6 +57,8 @@ pub struct SessionInfo {
 
 /// Shared session store.
 pub type SessionStore = Arc<Mutex<Vec<SessionInfo>>>;
+/// Shared team dashboard state pushed by the Swift app.
+pub type TeamStateStore = Arc<Mutex<serde_json::Value>>;
 
 /// Shared context passed to each connection handler.
 pub struct Context {
@@ -64,6 +66,7 @@ pub struct Context {
     pub monitor_handle: MonitorHandle,
     pub watcher_handle: WatcherHandle,
     pub sessions: SessionStore,
+    pub team_state: TeamStateStore,
     pub usage_tracker: UsageTracker,
     pub agent_manager: Arc<AgentSessionManager>,
 }
@@ -81,6 +84,7 @@ pub async fn serve(
     monitor_handle: MonitorHandle,
     watcher_handle: WatcherHandle,
     sessions: SessionStore,
+    team_state: TeamStateStore,
     usage_tracker: UsageTracker,
     agent_manager: Arc<AgentSessionManager>,
     mut shutdown_rx: watch::Receiver<bool>,
@@ -97,6 +101,7 @@ pub async fn serve(
         monitor_handle,
         watcher_handle,
         sessions,
+        team_state,
         usage_tracker,
         agent_manager,
     });
@@ -196,6 +201,42 @@ async fn dispatch(req: &Request, ctx: &Context) -> Response {
         "session.list" => {
             let sessions = ctx.sessions.lock().unwrap().clone();
             Ok(serde_json::to_value(sessions).unwrap())
+        }
+        "team.sync" => {
+            #[derive(Deserialize)]
+            struct SyncParams {
+                #[serde(default)]
+                teams: Vec<serde_json::Value>,
+                #[serde(default)]
+                tasks: Vec<serde_json::Value>,
+                #[serde(default)]
+                attention: Vec<serde_json::Value>,
+                #[serde(default)]
+                instance: serde_json::Value,
+            }
+            match serde_json::from_value::<SyncParams>(req.params.clone()) {
+                Ok(p) => {
+                    let synced = serde_json::json!({
+                        "teams": p.teams,
+                        "tasks": p.tasks,
+                        "attention": p.attention,
+                        "instance": p.instance,
+                    });
+                    let counts = serde_json::json!({
+                        "teams": synced["teams"].as_array().map(|v| v.len()).unwrap_or(0),
+                        "tasks": synced["tasks"].as_array().map(|v| v.len()).unwrap_or(0),
+                        "attention": synced["attention"].as_array().map(|v| v.len()).unwrap_or(0),
+                    });
+                    *ctx.team_state.lock().unwrap() = synced;
+                    tracing::debug!("team.sync: {:?}", counts);
+                    Ok(counts)
+                }
+                Err(e) => Err(format!("invalid params: {e}")),
+            }
+        }
+        "team.get" => {
+            let team_state = ctx.team_state.lock().unwrap().clone();
+            Ok(team_state)
         }
 
         // --- Worktree (F-01) ---

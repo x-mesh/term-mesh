@@ -2714,6 +2714,12 @@ extension TerminalController {
             keyEvent.text = nil
             _ = ghostty_surface_key(surface, keyEvent)
         }
+        // Send matching RELEASE event — TUI apps (Claude Code, kiro-cli) track
+        // key state and may ignore subsequent PRESS events if the previous key
+        // was never released.
+        keyEvent.action = GHOSTTY_ACTION_RELEASE
+        keyEvent.text = nil
+        _ = ghostty_surface_key(surface, keyEvent)
     }
 
     func sendTextEvent(surface: ghostty_surface_t, text: String) {
@@ -2786,16 +2792,16 @@ extension TerminalController {
     func handleControlScalar(_ scalar: UnicodeScalar, surface: ghostty_surface_t) -> Bool {
         switch scalar.value {
         case 0x0A, 0x0D:
-            sendKeyEvent(surface: surface, keycode: UInt32(kVK_Return))
+            sendKeyEvent(surface: surface, keycode: UInt32(kVK_Return), text: "\r")
             return true
         case 0x09:
-            sendKeyEvent(surface: surface, keycode: UInt32(kVK_Tab))
+            sendKeyEvent(surface: surface, keycode: UInt32(kVK_Tab), text: "\t")
             return true
         case 0x1B:
-            sendKeyEvent(surface: surface, keycode: UInt32(kVK_Escape))
+            sendKeyEvent(surface: surface, keycode: UInt32(kVK_Escape), text: "\u{1b}")
             return true
         case 0x7F:
-            sendKeyEvent(surface: surface, keycode: UInt32(kVK_Delete))
+            sendKeyEvent(surface: surface, keycode: UInt32(kVK_Delete), text: "\u{7f}")
             return true
         default:
             return false
@@ -2849,16 +2855,16 @@ extension TerminalController {
             sendKeyEvent(surface: surface, keycode: UInt32(kVK_ANSI_Backslash), mods: GHOSTTY_MODS_CTRL)
             return true
         case "enter", "return":
-            sendKeyEvent(surface: surface, keycode: UInt32(kVK_Return))
+            sendKeyEvent(surface: surface, keycode: UInt32(kVK_Return), text: "\r")
             return true
         case "tab":
-            sendKeyEvent(surface: surface, keycode: UInt32(kVK_Tab))
+            sendKeyEvent(surface: surface, keycode: UInt32(kVK_Tab), text: "\t")
             return true
         case "escape", "esc":
-            sendKeyEvent(surface: surface, keycode: UInt32(kVK_Escape))
+            sendKeyEvent(surface: surface, keycode: UInt32(kVK_Escape), text: "\u{1b}")
             return true
         case "backspace":
-            sendKeyEvent(surface: surface, keycode: UInt32(kVK_Delete))
+            sendKeyEvent(surface: surface, keycode: UInt32(kVK_Delete), text: "\u{7f}")
             return true
         default:
             if keyName.lowercased().hasPrefix("ctrl-") || keyName.lowercased().hasPrefix("ctrl+") {

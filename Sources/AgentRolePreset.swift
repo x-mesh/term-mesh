@@ -35,6 +35,69 @@ struct AgentRolePreset: Identifiable, Codable, Equatable {
     }
 }
 
+struct WorkflowPresetDefinition: Identifiable, Codable, Equatable {
+    var id: UUID
+    var name: String
+    var icon: String
+    var roles: [String]
+    var leaderMode: String
+    var taskTemplates: [String]
+    var reviewCheckpoints: [String]
+
+    init(
+        id: UUID = UUID(),
+        name: String,
+        icon: String,
+        roles: [String],
+        leaderMode: String,
+        taskTemplates: [String],
+        reviewCheckpoints: [String]
+    ) {
+        self.id = id
+        self.name = name
+        self.icon = icon
+        self.roles = roles
+        self.leaderMode = leaderMode
+        self.taskTemplates = taskTemplates
+        self.reviewCheckpoints = reviewCheckpoints
+    }
+
+    static let builtIn: [WorkflowPresetDefinition] = [
+        WorkflowPresetDefinition(
+            name: "Bug Triage",
+            icon: "ladybug",
+            roles: ["debugger", "explorer", "tester"],
+            leaderMode: "repl",
+            taskTemplates: ["reproduce issue", "isolate root cause", "verify fix"],
+            reviewCheckpoints: ["blocked on repro", "review fix scope"]
+        ),
+        WorkflowPresetDefinition(
+            name: "Feature Build",
+            icon: "hammer",
+            roles: ["planner", "executor", "tester", "reviewer"],
+            leaderMode: "claude",
+            taskTemplates: ["spec slice", "implement slice", "test slice", "review handoff"],
+            reviewCheckpoints: ["implementation review", "final acceptance"]
+        ),
+        WorkflowPresetDefinition(
+            name: "Refactor + Verify",
+            icon: "arrow.triangle.2.circlepath",
+            roles: ["refactorer", "reviewer", "tester"],
+            leaderMode: "claude",
+            taskTemplates: ["map risky areas", "refactor small batch", "run regression checks"],
+            reviewCheckpoints: ["behavior-preserving review", "test pass review"]
+        ),
+        WorkflowPresetDefinition(
+            name: "Release Prep",
+            icon: "shippingbox",
+            roles: ["planner", "reviewer", "tester", "writer", "devops"],
+            leaderMode: "claude",
+            taskTemplates: ["release checklist", "validation pass", "notes + packaging"],
+            reviewCheckpoints: ["go/no-go review", "release artifact review"]
+        ),
+    ]
+}
+
 /// Manages agent role presets — built-in defaults + user-created customs.
 class AgentRolePresetManager: ObservableObject {
     static let shared = AgentRolePresetManager()

@@ -1,6 +1,6 @@
 use serde::Serialize;
 use std::collections::HashSet;
-use sysinfo::{Pid, ProcessesToUpdate, System};
+use sysinfo::{Disks, Pid, ProcessesToUpdate, System};
 use tokio::sync::watch;
 use tokio::time::{interval, Duration};
 
@@ -20,7 +20,15 @@ pub struct SystemSnapshot {
     pub timestamp_ms: u64,
     pub total_memory_bytes: u64,
     pub used_memory_bytes: u64,
+    pub memory_percent: f32,
     pub cpu_count: usize,
+    pub cpu_usage_percent: f32,
+    /// Disk totals
+    pub disk_total_bytes: u64,
+    pub disk_available_bytes: u64,
+    /// Aggregate disk I/O from tracked processes (bytes since last tick)
+    pub disk_read_bytes_per_sec: u64,
+    pub disk_write_bytes_per_sec: u64,
     /// Per-process stats for tracked PIDs
     pub processes: Vec<ProcessSnapshot>,
     /// Budget guard alerts
@@ -83,12 +91,21 @@ pub fn start_monitor(
     let auto_stop = handle.auto_stop.clone();
     tokio::spawn(async move {
         let mut sys = System::new_all();
+        let mut disks = Disks::new_with_refreshed_list();
         let mut tick = interval(Duration::from_secs(2));
+        let mut tick_count: u64 = 0;
 
         loop {
             tick.tick().await;
+            tick_count += 1;
             sys.refresh_memory();
             sys.refresh_cpu_usage();
+            // Refresh all processes every tick for system-wide disk I/O
+            sys.refresh_processes(ProcessesToUpdate::All, true);
+            // Refresh disk space every 15 ticks (30s)
+            if tick_count % 15 == 1 {
+                disks.refresh(false);
+            }
 
             // Only refresh tracked PIDs (registered by Swift app via monitor.track RPC)
             let tracked_snapshot: Vec<u32> = pids.lock().unwrap().clone();
@@ -179,14 +196,41 @@ pub fn start_monitor(
                 }
             }
 
+            // System-wide CPU
+            let cpu_usage = sys.global_cpu_usage();
+
+            // Disk space
+            let (disk_total, disk_avail) = disks.list().iter().fold((0u64, 0u64), |(t, a), d| {
+                (t + d.total_space(), a + d.available_space())
+            });
+
+            // System-wide disk I/O: aggregate across ALL processes
+            // disk_usage().read_bytes is bytes since last refresh (already a delta)
+            let (io_read, io_write) = sys.processes().values().fold((0u64, 0u64), |(r, w), proc| {
+                let du = proc.disk_usage();
+                (r + du.read_bytes, w + du.written_bytes)
+            });
+            let read_per_sec = io_read / 2; // 2s interval
+            let write_per_sec = io_write / 2;
+
+            let total_mem = sys.total_memory();
+            let used_mem = sys.used_memory();
+            let mem_pct = if total_mem > 0 { (used_mem as f64 / total_mem as f64 * 100.0) as f32 } else { 0.0 };
+
             let snapshot = SystemSnapshot {
                 timestamp_ms: std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap_or_default()
                     .as_millis() as u64,
-                total_memory_bytes: sys.total_memory(),
-                used_memory_bytes: sys.used_memory(),
+                total_memory_bytes: total_mem,
+                used_memory_bytes: used_mem,
+                memory_percent: mem_pct,
                 cpu_count: sys.cpus().len(),
+                cpu_usage_percent: cpu_usage,
+                disk_total_bytes: disk_total,
+                disk_available_bytes: disk_avail,
+                disk_read_bytes_per_sec: read_per_sec,
+                disk_write_bytes_per_sec: write_per_sec,
                 processes,
                 alerts,
             };

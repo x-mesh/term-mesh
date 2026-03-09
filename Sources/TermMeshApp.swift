@@ -2785,6 +2785,9 @@ struct SettingsView: View {
     @AppStorage("teamDefaultLeaderMode") private var teamDefaultLeaderMode = "claude"
     @AppStorage("teamDefaultModel") private var teamDefaultModel = "sonnet"
     @AppStorage("teamDefaultWorkingDirectory") private var teamDefaultWorkingDirectory = ""
+    @AppStorage(TermMeshDaemon.dashboardEnabledKey) private var dashboardEnabled = true
+    @AppStorage(TermMeshDaemon.dashboardLocalhostOnlyKey) private var dashboardLocalhostOnly = false
+    @AppStorage(TermMeshDaemon.dashboardPortKey) private var dashboardPort = 9876
 
     @State private var shortcutResetToken = UUID()
     @State private var topBlurOpacity: Double = 0
@@ -3342,6 +3345,53 @@ struct SettingsView: View {
                             }
                         }
                         }
+                    }
+                    }
+
+                    if settingsMatch("dashboard", "http", "localhost", "port", "remote") {
+                    SettingsSectionHeader(title: "Dashboard")
+                    SettingsCard {
+                        SettingsCardRow(
+                            "HTTP Dashboard",
+                            subtitle: dashboardEnabled
+                                ? "Web dashboard at \(dashboardLocalhostOnly ? "localhost" : "0.0.0.0"):\(dashboardPort)"
+                                : "Dashboard is disabled. Daemon runs without HTTP server."
+                        ) {
+                            Toggle("", isOn: $dashboardEnabled)
+                                .labelsHidden()
+                                .controlSize(.small)
+                        }
+
+                        if dashboardEnabled {
+                            SettingsCardDivider()
+
+                            SettingsCardRow(
+                                "Bind Address",
+                                subtitle: dashboardLocalhostOnly
+                                    ? "Only accessible from this Mac."
+                                    : "Accessible from local network. Use with caution.",
+                                controlWidth: pickerColumnWidth
+                            ) {
+                                Picker("", selection: $dashboardLocalhostOnly) {
+                                    Text("localhost (127.0.0.1)").tag(true)
+                                    Text("All interfaces (0.0.0.0)").tag(false)
+                                }
+                                .labelsHidden()
+                                .pickerStyle(.menu)
+                            }
+
+                            SettingsCardDivider()
+
+                            SettingsCardRow("Port", subtitle: "HTTP port for the dashboard.", controlWidth: pickerColumnWidth) {
+                                TextField("", value: $dashboardPort, format: .number)
+                                    .textFieldStyle(.roundedBorder)
+                                    .multilineTextAlignment(.trailing)
+                            }
+                        }
+
+                        SettingsCardDivider()
+
+                        SettingsCardNote("Changes take effect after restarting the daemon (quit and relaunch the app). The dashboard shows system metrics, team status, agents, and task boards.")
                     }
                     }
 

@@ -796,6 +796,8 @@ class TerminalController {
             return v2Result(id: id, self.v2TeamList(params: params))
         case "team.status":
             return v2Result(id: id, self.v2TeamStatus(params: params))
+        case "team.leader.send":
+            return v2Result(id: id, self.v2TeamLeaderSend(params: params))
         case "team.send":
             return v2Result(id: id, self.v2TeamSend(params: params))
         case "team.broadcast":
@@ -820,6 +822,30 @@ class TerminalController {
             return v2Result(id: id, self.v2TeamMessageList(params: params))
         case "team.message.clear":
             return v2Result(id: id, self.v2TeamMessageClear(params: params))
+        case "team.inbox":
+            return v2Result(id: id, self.v2TeamInbox(params: params))
+        case "team.agent.heartbeat":
+            return v2Result(id: id, self.v2TeamAgentHeartbeat(params: params))
+        case "team.agent.status":
+            return v2Result(id: id, self.v2TeamAgentStatus(params: params))
+        case "team.task.get":
+            return v2Result(id: id, self.v2TeamTaskGet(params: params))
+        case "team.task.start":
+            return v2Result(id: id, self.v2TeamTaskStart(params: params))
+        case "team.task.block":
+            return v2Result(id: id, self.v2TeamTaskBlock(params: params))
+        case "team.task.review":
+            return v2Result(id: id, self.v2TeamTaskReview(params: params))
+        case "team.task.done":
+            return v2Result(id: id, self.v2TeamTaskDone(params: params))
+        case "team.task.reassign":
+            return v2Result(id: id, self.v2TeamTaskReassign(params: params))
+        case "team.task.unblock":
+            return v2Result(id: id, self.v2TeamTaskUnblock(params: params))
+        case "team.task.split":
+            return v2Result(id: id, self.v2TeamTaskSplit(params: params))
+        case "team.task.dependents":
+            return v2Result(id: id, self.v2TeamTaskDependents(params: params))
         case "team.task.create":
             return v2Result(id: id, self.v2TeamTaskCreate(params: params))
         case "team.task.update":
@@ -1749,6 +1775,30 @@ class TerminalController {
         return result
     }
 
+    private func v2TeamLeaderSend(params: [String: Any]) -> V2CallResult {
+        guard let tabManager = v2ResolveTabManager(params: params) else {
+            return .err(code: "unavailable", message: "TabManager not available", data: nil)
+        }
+        guard let teamName = params["team_name"] as? String else {
+            return .err(code: "invalid_params", message: "Missing team_name", data: nil)
+        }
+        guard let text = params["text"] as? String else {
+            return .err(code: "invalid_params", message: "Missing text", data: nil)
+        }
+
+        var success = false
+        v2MainSync {
+            success = TeamOrchestrator.shared.sendToLeader(
+                teamName: teamName,
+                text: text,
+                tabManager: tabManager
+            )
+        }
+        return success
+            ? .ok(["sent": true, "team_name": teamName, "target": "leader"])
+            : .err(code: "not_found", message: "Leader or team not found", data: nil)
+    }
+
     private func v2TeamSend(params: [String: Any]) -> V2CallResult {
         guard let tabManager = v2ResolveTabManager(params: params) else {
             return .err(code: "unavailable", message: "TabManager not available", data: nil)
@@ -2001,6 +2051,325 @@ class TerminalController {
         return .ok(["cleared": true, "team_name": teamName])
     }
 
+    private func v2TeamInbox(params: [String: Any]) -> V2CallResult {
+        guard let teamName = params["team_name"] as? String else {
+            return .err(code: "invalid_params", message: "Missing team_name", data: nil)
+        }
+        let topOnly = params["top_only"] as? Bool ?? false
+        var result: V2CallResult = .ok([] as [[String: Any]])
+        v2MainSync {
+            let items = TeamOrchestrator.shared.inboxItems(teamName: teamName, topOnly: topOnly)
+            result = .ok(["team_name": teamName, "items": items, "count": items.count])
+        }
+        return result
+    }
+
+    private func v2TeamAgentHeartbeat(params: [String: Any]) -> V2CallResult {
+        guard let teamName = params["team_name"] as? String else {
+            return .err(code: "invalid_params", message: "Missing team_name", data: nil)
+        }
+        guard let agentName = params["agent_name"] as? String else {
+            return .err(code: "invalid_params", message: "Missing agent_name", data: nil)
+        }
+        let summary = params["summary"] as? String
+        var result: V2CallResult = .ok([:])
+        v2MainSync {
+            TeamOrchestrator.shared.postHeartbeat(teamName: teamName, agentName: agentName, summary: summary)
+            result = .ok(["team_name": teamName, "agent_name": agentName, "summary": summary as Any])
+        }
+        return result
+    }
+
+    private func v2TeamAgentStatus(params: [String: Any]) -> V2CallResult {
+        guard let teamName = params["team_name"] as? String else {
+            return .err(code: "invalid_params", message: "Missing team_name", data: nil)
+        }
+        guard let agentName = params["agent_name"] as? String else {
+            return .err(code: "invalid_params", message: "Missing agent_name", data: nil)
+        }
+        var result: V2CallResult = .err(code: "not_found", message: "Agent not found", data: nil)
+        v2MainSync {
+            guard let status = TeamOrchestrator.shared.teamStatus(name: teamName),
+                  let agents = status["agents"] as? [[String: Any]],
+                  let agent = agents.first(where: { ($0["name"] as? String) == agentName }) else { return }
+            result = .ok(agent)
+        }
+        return result
+    }
+
+    private func v2TeamTaskGet(params: [String: Any]) -> V2CallResult {
+        guard let teamName = params["team_name"] as? String else {
+            return .err(code: "invalid_params", message: "Missing team_name", data: nil)
+        }
+        guard let taskId = params["task_id"] as? String else {
+            return .err(code: "invalid_params", message: "Missing task_id", data: nil)
+        }
+        var result: V2CallResult = .err(code: "not_found", message: "Task not found", data: nil)
+        v2MainSync {
+            if let task = TeamOrchestrator.shared.getTask(teamName: teamName, taskId: taskId) {
+                result = .ok(TeamOrchestrator.shared.taskDictionary(task))
+            }
+        }
+        return result
+    }
+
+    private func v2TeamTaskStart(params: [String: Any]) -> V2CallResult {
+        guard let tabManager = v2ResolveTabManager(params: params) else {
+            return .err(code: "unavailable", message: "TabManager not available", data: nil)
+        }
+        guard let teamName = params["team_name"] as? String else {
+            return .err(code: "invalid_params", message: "Missing team_name", data: nil)
+        }
+        guard let taskId = params["task_id"] as? String else {
+            return .err(code: "invalid_params", message: "Missing task_id", data: nil)
+        }
+        let assignee = params["assignee"] as? String
+        let progressNote = params["progress_note"] as? String
+
+        var result: V2CallResult = .err(code: "not_found", message: "Task not found", data: nil)
+        v2MainSync {
+            guard let task = TeamOrchestrator.shared.updateTask(
+                teamName: teamName,
+                taskId: taskId,
+                status: "in_progress",
+                assignee: assignee,
+                progressNote: progressNote
+            ) else { return }
+            let dispatched = TeamOrchestrator.shared.dispatchTaskToAssignee(
+                teamName: teamName,
+                taskId: taskId,
+                tabManager: tabManager
+            )
+            result = .ok([
+                "task": TeamOrchestrator.shared.taskDictionary(task),
+                "dispatched": dispatched,
+            ])
+        }
+        return result
+    }
+
+    private func v2TeamTaskBlock(params: [String: Any]) -> V2CallResult {
+        guard let tabManager = v2ResolveTabManager(params: params) else {
+            return .err(code: "unavailable", message: "TabManager not available", data: nil)
+        }
+        guard let teamName = params["team_name"] as? String else {
+            return .err(code: "invalid_params", message: "Missing team_name", data: nil)
+        }
+        guard let taskId = params["task_id"] as? String else {
+            return .err(code: "invalid_params", message: "Missing task_id", data: nil)
+        }
+        let reason = params["blocked_reason"] as? String
+
+        var result: V2CallResult = .err(code: "not_found", message: "Task not found", data: nil)
+        v2MainSync {
+            guard let task = TeamOrchestrator.shared.updateTask(
+                teamName: teamName,
+                taskId: taskId,
+                status: "blocked",
+                blockedReason: reason
+            ) else { return }
+            let notified = TeamOrchestrator.shared.notifyTaskLifecycleEvent(
+                teamName: teamName,
+                taskId: taskId,
+                event: "blocked",
+                note: reason,
+                tabManager: tabManager
+            )
+            result = .ok([
+                "task": TeamOrchestrator.shared.taskDictionary(task),
+                "notified": notified,
+            ])
+        }
+        return result
+    }
+
+    private func v2TeamTaskReview(params: [String: Any]) -> V2CallResult {
+        guard let tabManager = v2ResolveTabManager(params: params) else {
+            return .err(code: "unavailable", message: "TabManager not available", data: nil)
+        }
+        guard let teamName = params["team_name"] as? String else {
+            return .err(code: "invalid_params", message: "Missing team_name", data: nil)
+        }
+        guard let taskId = params["task_id"] as? String else {
+            return .err(code: "invalid_params", message: "Missing task_id", data: nil)
+        }
+        let summary = params["review_summary"] as? String
+
+        var result: V2CallResult = .err(code: "not_found", message: "Task not found", data: nil)
+        v2MainSync {
+            guard let task = TeamOrchestrator.shared.updateTask(
+                teamName: teamName,
+                taskId: taskId,
+                status: "review_ready",
+                reviewSummary: summary
+            ) else { return }
+            let notified = TeamOrchestrator.shared.notifyTaskLifecycleEvent(
+                teamName: teamName,
+                taskId: taskId,
+                event: "review_ready",
+                note: summary,
+                tabManager: tabManager
+            )
+            result = .ok([
+                "task": TeamOrchestrator.shared.taskDictionary(task),
+                "notified": notified,
+            ])
+        }
+        return result
+    }
+
+    private func v2TeamTaskDone(params: [String: Any]) -> V2CallResult {
+        guard let tabManager = v2ResolveTabManager(params: params) else {
+            return .err(code: "unavailable", message: "TabManager not available", data: nil)
+        }
+        guard let teamName = params["team_name"] as? String else {
+            return .err(code: "invalid_params", message: "Missing team_name", data: nil)
+        }
+        guard let taskId = params["task_id"] as? String else {
+            return .err(code: "invalid_params", message: "Missing task_id", data: nil)
+        }
+        let taskResult = params["result"] as? String
+
+        var result: V2CallResult = .err(code: "not_found", message: "Task not found", data: nil)
+        v2MainSync {
+            guard let task = TeamOrchestrator.shared.updateTask(
+                teamName: teamName,
+                taskId: taskId,
+                status: "completed",
+                result: taskResult
+            ) else { return }
+            let notified = TeamOrchestrator.shared.notifyTaskLifecycleEvent(
+                teamName: teamName,
+                taskId: taskId,
+                event: "completed",
+                note: taskResult,
+                tabManager: tabManager
+            )
+            result = .ok([
+                "task": TeamOrchestrator.shared.taskDictionary(task),
+                "notified": notified,
+            ])
+        }
+        return result
+    }
+
+    private func v2TeamTaskReassign(params: [String: Any]) -> V2CallResult {
+        guard let teamName = params["team_name"] as? String else {
+            return .err(code: "invalid_params", message: "Missing team_name", data: nil)
+        }
+        guard let taskId = params["task_id"] as? String else {
+            return .err(code: "invalid_params", message: "Missing task_id", data: nil)
+        }
+        let assignee = params["assignee"] as? String
+        let tabManager = v2ResolveTabManager(params: params)
+
+        var result: V2CallResult = .err(code: "not_found", message: "Task not found", data: nil)
+        v2MainSync {
+            guard let task = TeamOrchestrator.shared.reassignTask(
+                teamName: teamName,
+                taskId: taskId,
+                assignee: assignee
+            ) else { return }
+            let dispatched = tabManager.flatMap {
+                TeamOrchestrator.shared.dispatchTaskToAssignee(
+                    teamName: teamName,
+                    taskId: taskId,
+                    tabManager: $0
+                )
+            } ?? false
+            result = .ok([
+                "task": TeamOrchestrator.shared.taskDictionary(task),
+                "dispatched": dispatched,
+            ])
+        }
+        return result
+    }
+
+    private func v2TeamTaskUnblock(params: [String: Any]) -> V2CallResult {
+        guard let tabManager = v2ResolveTabManager(params: params) else {
+            return .err(code: "unavailable", message: "TabManager not available", data: nil)
+        }
+        guard let teamName = params["team_name"] as? String else {
+            return .err(code: "invalid_params", message: "Missing team_name", data: nil)
+        }
+        guard let taskId = params["task_id"] as? String else {
+            return .err(code: "invalid_params", message: "Missing task_id", data: nil)
+        }
+
+        var result: V2CallResult = .err(code: "not_found", message: "Task not found", data: nil)
+        v2MainSync {
+            guard let task = TeamOrchestrator.shared.unblockTask(
+                teamName: teamName,
+                taskId: taskId
+            ) else { return }
+            let dispatched = TeamOrchestrator.shared.dispatchTaskToAssignee(
+                teamName: teamName,
+                taskId: taskId,
+                tabManager: tabManager
+            )
+            result = .ok([
+                "task": TeamOrchestrator.shared.taskDictionary(task),
+                "dispatched": dispatched,
+            ])
+        }
+        return result
+    }
+
+    private func v2TeamTaskSplit(params: [String: Any]) -> V2CallResult {
+        guard let teamName = params["team_name"] as? String else {
+            return .err(code: "invalid_params", message: "Missing team_name", data: nil)
+        }
+        guard let taskId = params["task_id"] as? String else {
+            return .err(code: "invalid_params", message: "Missing task_id", data: nil)
+        }
+        guard let title = params["title"] as? String else {
+            return .err(code: "invalid_params", message: "Missing title", data: nil)
+        }
+        let assignee = params["assignee"] as? String
+        let createdBy = params["created_by"] as? String ?? "leader"
+        let tabManager = v2ResolveTabManager(params: params)
+
+        var result: V2CallResult = .err(code: "not_found", message: "Task not found", data: nil)
+        v2MainSync {
+            guard let task = TeamOrchestrator.shared.splitTask(
+                teamName: teamName,
+                parentTaskId: taskId,
+                title: title,
+                assignee: assignee,
+                createdBy: createdBy
+            ) else { return }
+            if let tabManager {
+                _ = TeamOrchestrator.shared.notifyTaskCreated(
+                    teamName: teamName,
+                    taskId: task.id,
+                    tabManager: tabManager
+                )
+            }
+            result = .ok(TeamOrchestrator.shared.taskDictionary(task))
+        }
+        return result
+    }
+
+    private func v2TeamTaskDependents(params: [String: Any]) -> V2CallResult {
+        guard let teamName = params["team_name"] as? String else {
+            return .err(code: "invalid_params", message: "Missing team_name", data: nil)
+        }
+        guard let taskId = params["task_id"] as? String else {
+            return .err(code: "invalid_params", message: "Missing task_id", data: nil)
+        }
+        var result: V2CallResult = .ok([] as [[String: Any]])
+        v2MainSync {
+            let tasks = TeamOrchestrator.shared.dependentTasks(teamName: teamName, taskId: taskId)
+            result = .ok([
+                "team_name": teamName,
+                "task_id": taskId,
+                "tasks": tasks.map { TeamOrchestrator.shared.taskDictionary($0) },
+                "count": tasks.count,
+            ])
+        }
+        return result
+    }
+
     // Feature D: Create task
     private func v2TeamTaskCreate(params: [String: Any]) -> V2CallResult {
         guard let teamName = params["team_name"] as? String else {
@@ -2009,18 +2378,40 @@ class TerminalController {
         guard let title = params["title"] as? String else {
             return .err(code: "invalid_params", message: "Missing title", data: nil)
         }
+        let details = params["description"] as? String
         let assignee = params["assignee"] as? String
+        let acceptanceCriteria = params["acceptance_criteria"] as? [String] ?? []
+        let labels = params["labels"] as? [String] ?? []
+        let estimatedSize = params["estimated_size"] as? Int
+        let priority = params["priority"] as? Int ?? 2
+        let dependsOn = params["depends_on"] as? [String] ?? []
+        let parentTaskId = params["parent_task_id"] as? String
+        let createdBy = params["created_by"] as? String ?? "leader"
+        let tabManager = v2ResolveTabManager(params: params)
 
         var result: V2CallResult = .err(code: "internal_error", message: "Failed to create task", data: nil)
         v2MainSync {
-            if let task = TeamOrchestrator.shared.createTask(teamName: teamName, title: title, assignee: assignee) {
-                result = .ok([
-                    "id": task.id,
-                    "title": task.title,
-                    "status": task.status,
-                    "assignee": task.assignee as Any,
-                    "team_name": teamName
-                ])
+            if let task = TeamOrchestrator.shared.createTask(
+                teamName: teamName,
+                title: title,
+                details: details,
+                assignee: assignee,
+                acceptanceCriteria: acceptanceCriteria,
+                labels: labels,
+                estimatedSize: estimatedSize,
+                priority: priority,
+                dependsOn: dependsOn,
+                parentTaskId: parentTaskId,
+                createdBy: createdBy
+            ) {
+                if let tabManager {
+                    _ = TeamOrchestrator.shared.notifyTaskCreated(
+                        teamName: teamName,
+                        taskId: task.id,
+                        tabManager: tabManager
+                    )
+                }
+                result = .ok(TeamOrchestrator.shared.taskDictionary(task))
             }
         }
         return result
@@ -2037,20 +2428,23 @@ class TerminalController {
         let status = params["status"] as? String
         let taskResult = params["result"] as? String
         let assignee = params["assignee"] as? String
+        let blockedReason = params["blocked_reason"] as? String
+        let reviewSummary = params["review_summary"] as? String
+        let progressNote = params["progress_note"] as? String
 
         var result: V2CallResult = .err(code: "not_found", message: "Task not found", data: nil)
         v2MainSync {
             if let task = TeamOrchestrator.shared.updateTask(
-                teamName: teamName, taskId: taskId, status: status, result: taskResult, assignee: assignee
+                teamName: teamName,
+                taskId: taskId,
+                status: status,
+                result: taskResult,
+                assignee: assignee,
+                blockedReason: blockedReason,
+                reviewSummary: reviewSummary,
+                progressNote: progressNote
             ) {
-                result = .ok([
-                    "id": task.id,
-                    "title": task.title,
-                    "status": task.status,
-                    "assignee": task.assignee as Any,
-                    "result": task.result as Any,
-                    "team_name": teamName
-                ])
+                result = .ok(TeamOrchestrator.shared.taskDictionary(task))
             }
         }
         return result
@@ -2064,20 +2458,22 @@ class TerminalController {
         let status = params["status"] as? String
         let assignee = params["assignee"] as? String
 
+        let needsAttention = params["needs_attention"] as? Bool ?? false
+        let priority = params["priority"] as? Int
+        let staleOnly = params["stale"] as? Bool ?? false
+        let dependsOn = params["depends_on"] as? String
         var result: V2CallResult = .ok([] as [[String: Any]])
         v2MainSync {
-            let tasks = TeamOrchestrator.shared.listTasks(teamName: teamName, status: status, assignee: assignee)
-            let formatted = tasks.map { task -> [String: Any] in
-                [
-                    "id": task.id,
-                    "title": task.title,
-                    "status": task.status,
-                    "assignee": task.assignee as Any,
-                    "result": task.result as Any,
-                    "created_at": ISO8601DateFormatter().string(from: task.createdAt),
-                    "updated_at": ISO8601DateFormatter().string(from: task.updatedAt)
-                ]
-            }
+            let tasks = TeamOrchestrator.shared.listTasks(
+                teamName: teamName,
+                status: status,
+                assignee: assignee,
+                needsAttention: needsAttention,
+                priority: priority,
+                staleOnly: staleOnly,
+                dependsOn: dependsOn
+            )
+            let formatted = tasks.map { TeamOrchestrator.shared.taskDictionary($0) }
             result = .ok(["team_name": teamName, "tasks": formatted, "count": formatted.count])
         }
         return result

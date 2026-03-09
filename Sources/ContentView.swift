@@ -6108,18 +6108,9 @@ private struct TabItemView: View {
                 .transition(.opacity.combined(with: .move(edge: .top)))
             }
 
-            // Active team indicator
+            // Active team indicator with inbox badge and expandable overview
             if let teamName = activeTeamName {
-                HStack(spacing: 4) {
-                    Image(systemName: "person.3.fill")
-                        .font(.system(size: 8))
-                    Text(teamName)
-                        .font(.system(size: 10, weight: .medium))
-                }
-                .foregroundColor(activeSecondaryColor(0.9))
-                .padding(.horizontal, 6)
-                .padding(.vertical, 2)
-                .background(Capsule().fill(Color.accentColor.opacity(0.15)))
+                teamIndicatorView(teamName: teamName)
             }
 
             // Latest log entry
@@ -6633,6 +6624,69 @@ private struct TabItemView: View {
 
     private var activeTeamName: String? {
         TeamOrchestrator.shared.teams.values.first(where: { $0.workspaceId == tab.id })?.id
+    }
+
+    private var activeTeam: TeamOrchestrator.Team? {
+        TeamOrchestrator.shared.teams.values.first(where: { $0.workspaceId == tab.id })
+    }
+
+    private func teamAttentionCount(teamName: String) -> Int {
+        TeamOrchestrator.shared.inboxItems(teamName: teamName).count
+    }
+
+    @ViewBuilder
+    private func teamIndicatorView(teamName: String) -> some View {
+        let attentionCount = teamAttentionCount(teamName: teamName)
+
+        VStack(alignment: .leading, spacing: 4) {
+            // Team badge row with inbox count
+            HStack(spacing: 4) {
+                Image(systemName: "person.3.fill")
+                    .font(.system(size: 8))
+                Text(teamName)
+                    .font(.system(size: 10, weight: .medium))
+
+                if attentionCount > 0 {
+                    Text("\(attentionCount)")
+                        .font(.system(size: 8, weight: .bold))
+                        .foregroundColor(.white)
+                        .padding(.horizontal, 4)
+                        .padding(.vertical, 1)
+                        .background(Capsule().fill(attentionCount > 2 ? Color.red : Color.orange))
+                }
+            }
+            .foregroundColor(activeSecondaryColor(0.9))
+            .padding(.horizontal, 6)
+            .padding(.vertical, 2)
+            .background(Capsule().fill(Color.accentColor.opacity(0.15)))
+
+            // Agent status dots (compact overview)
+            if let team = activeTeam {
+                HStack(spacing: 3) {
+                    ForEach(team.agents, id: \.id) { agent in
+                        agentDot(teamName: teamName, agent: agent)
+                    }
+                }
+                .padding(.leading, 4)
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func agentDot(teamName: String, agent: TeamOrchestrator.AgentMember) -> some View {
+        let state = TeamOrchestrator.shared.agentState(teamName: teamName, agentName: agent.name)
+        let color: Color = switch state {
+        case "running":      .green
+        case "blocked":      .red
+        case "review_ready": .yellow
+        case "error":        .red.opacity(0.7)
+        default:             .gray  // idle
+        }
+
+        Circle()
+            .fill(color)
+            .frame(width: 6, height: 6)
+            .help("\(agent.name): \(state)")
     }
 
     private var branchDirectoryRow: String? {

@@ -24,6 +24,7 @@ struct TeamCreationView: View {
     @State private var showPresetEditor = false
     @State private var showSaveTemplate = false
     @State private var saveTemplateName = ""
+    @State private var selectedWorkflowName: String?
 
     private let models = ["sonnet", "opus", "haiku"]
 
@@ -34,6 +35,7 @@ struct TeamCreationView: View {
             ScrollView {
                 VStack(alignment: .leading, spacing: 16) {
                     teamSettings
+                    workflowButtons
                     agentList
                     presetButtons
                 }
@@ -42,7 +44,7 @@ struct TeamCreationView: View {
             Divider()
             footer
         }
-        .frame(width: 520, height: 560)
+        .frame(width: 560, height: 640)
         .background(Color(nsColor: .windowBackgroundColor))
         .onAppear {
             leaderMode = defaultLeaderMode
@@ -296,6 +298,50 @@ struct TeamCreationView: View {
         TeamPreset(name: "Full Team", icon: "person.3.sequence", roles: ["planner", "explorer", "executor", "reviewer", "tester"]),
     ]
 
+    private var workflowButtons: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text("Workflow Presets")
+                .font(.caption.bold())
+                .foregroundStyle(.secondary)
+
+            LazyVGrid(columns: [
+                GridItem(.adaptive(minimum: 120), spacing: 6)
+            ], spacing: 6) {
+                ForEach(WorkflowPresetDefinition.builtIn, id: \.name) { preset in
+                    Button(action: { applyWorkflowPreset(preset) }) {
+                        HStack(spacing: 6) {
+                            Image(systemName: preset.icon)
+                                .font(.caption)
+                            Text(preset.name)
+                                .font(.caption)
+                        }
+                        .frame(maxWidth: .infinity)
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .controlSize(.small)
+                    .tint(selectedWorkflowName == preset.name ? .accentColor : .secondary.opacity(0.7))
+                }
+            }
+
+            if let selectedWorkflow = WorkflowPresetDefinition.builtIn.first(where: { $0.name == selectedWorkflowName }) {
+                VStack(alignment: .leading, spacing: 6) {
+                    Text("Suggested leader mode: \(selectedWorkflow.leaderMode.capitalized)")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    Text("Default task templates: \(selectedWorkflow.taskTemplates.joined(separator: " · "))")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                    Text("Review checkpoints: \(selectedWorkflow.reviewCheckpoints.joined(separator: " · "))")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                }
+                .padding(10)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .background(RoundedRectangle(cornerRadius: 8).fill(.quaternary.opacity(0.35)))
+            }
+        }
+    }
+
     private var presetButtons: some View {
         VStack(alignment: .leading, spacing: 6) {
             Text("Team Presets")
@@ -357,12 +403,27 @@ struct TeamCreationView: View {
 
     private func applyTeamPreset(_ preset: TeamPreset) {
         let available = presetManager.presets
+        selectedWorkflowName = nil
         agents = preset.roles.compactMap { roleName in
             if let match = available.first(where: { $0.name == roleName }) {
                 return TeamAgentRow(preset: match, customInstructions: "")
             }
             // Fallback: use first available preset if role not found
             return available.first.map { TeamAgentRow(preset: $0, customInstructions: "") }
+        }
+    }
+
+    private func applyWorkflowPreset(_ preset: WorkflowPresetDefinition) {
+        let available = presetManager.presets
+        selectedWorkflowName = preset.name
+        leaderMode = preset.leaderMode
+        agents = preset.roles.compactMap { roleName in
+            let presetRole = available.first(where: { $0.name == roleName }) ?? available.first
+            guard let presetRole else { return nil as TeamAgentRow? }
+            return TeamAgentRow(preset: presetRole, customInstructions: "")
+        }
+        if teamName == "my-team" || teamName.isEmpty {
+            teamName = preset.name.lowercased().replacingOccurrences(of: " ", with: "-")
         }
     }
 

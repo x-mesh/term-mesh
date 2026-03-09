@@ -13,6 +13,36 @@ final class TermMeshDaemon: ObservableObject {
     /// Whether worktree sandboxing is enabled for new tabs.
     @Published var worktreeEnabled: Bool = false
 
+    // MARK: - Dashboard Settings (UserDefaults)
+
+    /// Whether the HTTP dashboard is enabled.
+    static let dashboardEnabledKey = "termMeshDashboardEnabled"
+    /// Whether to bind to localhost only (true) or 0.0.0.0 (false).
+    static let dashboardLocalhostOnlyKey = "termMeshDashboardLocalhostOnly"
+    /// Dashboard port.
+    static let dashboardPortKey = "termMeshDashboardPort"
+
+    var isDashboardEnabled: Bool {
+        get {
+            if UserDefaults.standard.object(forKey: Self.dashboardEnabledKey) == nil { return true }
+            return UserDefaults.standard.bool(forKey: Self.dashboardEnabledKey)
+        }
+        set { UserDefaults.standard.set(newValue, forKey: Self.dashboardEnabledKey) }
+    }
+
+    var isLocalhostOnly: Bool {
+        get { UserDefaults.standard.bool(forKey: Self.dashboardLocalhostOnlyKey) }
+        set { UserDefaults.standard.set(newValue, forKey: Self.dashboardLocalhostOnlyKey) }
+    }
+
+    var dashboardPort: Int {
+        get {
+            let port = UserDefaults.standard.integer(forKey: Self.dashboardPortKey)
+            return port > 0 ? port : 9876
+        }
+        set { UserDefaults.standard.set(newValue, forKey: Self.dashboardPortKey) }
+    }
+
     // MARK: - Socket Path
 
     var socketPath: String {
@@ -48,7 +78,17 @@ final class TermMeshDaemon: ObservableObject {
 
             let process = Process()
             process.executableURL = URL(fileURLWithPath: binaryPath)
-            process.environment = ProcessInfo.processInfo.environment
+            var env = ProcessInfo.processInfo.environment
+
+            // Dashboard settings
+            if !self.isDashboardEnabled {
+                env["TERM_MESH_HTTP_DISABLED"] = "1"
+            } else {
+                let host = self.isLocalhostOnly ? "127.0.0.1" : "0.0.0.0"
+                env["TERM_MESH_HTTP_ADDR"] = "\(host):\(self.dashboardPort)"
+            }
+
+            process.environment = env
             process.standardOutput = FileHandle.nullDevice
             process.standardError = FileHandle.nullDevice
 
@@ -200,6 +240,11 @@ final class TermMeshDaemon: ObservableObject {
     /// Sync terminal sessions with the daemon (for remote dashboard).
     func syncSessions(_ sessions: [[String: Any]]) {
         let _ = rpcCall(method: "session.sync", params: ["sessions": sessions])
+    }
+
+    /// Sync app-side team dashboard state with the daemon (for remote dashboard).
+    func syncTeams(_ payload: [String: Any]) {
+        let _ = rpcCall(method: "team.sync", params: payload)
     }
 
     // MARK: - Agent Sessions (F-06)

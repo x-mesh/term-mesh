@@ -1,6 +1,6 @@
 use axum::{
     extract::{Path, Query, State},
-    http::StatusCode,
+    http::{header, StatusCode},
     response::{Html, IntoResponse, Json},
     routing::{get, post},
     Router,
@@ -9,12 +9,14 @@ use serde::Deserialize;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::net::UnixStream;
 use tokio::sync::watch;
 use tower_http::cors::CorsLayer;
 
 use crate::agent::AgentSessionManager;
 use crate::monitor::{MonitorHandle, SystemSnapshot};
-use crate::socket::SessionStore;
+use crate::socket::{SessionStore, TeamStateStore};
 use crate::tokens::UsageTracker;
 use crate::watcher::WatcherHandle;
 
@@ -24,9 +26,11 @@ pub struct HttpState {
     pub monitor_handle: MonitorHandle,
     pub watcher_handle: WatcherHandle,
     pub sessions: SessionStore,
+    pub team_state: TeamStateStore,
     pub usage_tracker: UsageTracker,
     pub agent_manager: Arc<AgentSessionManager>,
     pub dashboard_dir: Option<PathBuf>,
+    pub brand_icon_path: Option<PathBuf>,
 }
 
 pub async fn serve(
@@ -35,25 +39,39 @@ pub async fn serve(
     monitor_handle: MonitorHandle,
     watcher_handle: WatcherHandle,
     sessions: SessionStore,
+    team_state: TeamStateStore,
     usage_tracker: UsageTracker,
     agent_manager: Arc<AgentSessionManager>,
     mut shutdown_rx: watch::Receiver<bool>,
 ) -> anyhow::Result<()> {
     let dashboard_dir = find_dashboard_dir();
+    let brand_icon_path = find_brand_icon_path();
 
     let state = Arc::new(HttpState {
         monitor_rx,
         monitor_handle,
         watcher_handle,
         sessions,
+        team_state,
         usage_tracker,
         agent_manager,
         dashboard_dir,
+        brand_icon_path,
     });
 
     let app = Router::new()
         .route("/", get(index_handler))
+        .route("/api/health", get(health_handler))
+        .route("/api/version", get(version_handler))
+        .route("/api/brand-icon", get(brand_icon_handler))
         .route("/api/sessions", get(sessions_handler))
+        .route("/api/team", get(team_handler))
+        .route("/api/team/create", post(team_create_handler))
+        .route("/api/team/teams", get(team_teams_handler))
+        .route("/api/team/tasks", get(team_tasks_handler).post(team_tasks_create_handler))
+        .route("/api/team/tasks/{id}/action", post(team_tasks_action_handler))
+        .route("/api/team/inbox", get(team_inbox_handler))
+        .route("/api/team/instance", get(team_instance_handler))
         .route("/api/monitor", get(monitor_handler))
         .route("/api/watcher", get(watcher_handler))
         .route("/api/watcher/watch", post(watch_handler))
@@ -101,10 +119,402 @@ async fn index_handler(State(state): State<Arc<HttpState>>) -> impl IntoResponse
     Html(FALLBACK_HTML.to_string())
 }
 
+static START_TIME: std::sync::LazyLock<std::time::Instant> =
+    std::sync::LazyLock::new(std::time::Instant::now);
+
+async fn health_handler() -> impl IntoResponse {
+    Json(serde_json::json!({
+        "status": "ok",
+        "uptime_seconds": START_TIME.elapsed().as_secs(),
+    }))
+}
+
+async fn version_handler() -> impl IntoResponse {
+    Json(serde_json::json!({
+        "version": env!("CARGO_PKG_VERSION"),
+        "name": env!("CARGO_PKG_NAME"),
+        "build_timestamp": option_env!("BUILD_TIMESTAMP").unwrap_or("dev"),
+        "git_hash": option_env!("GIT_HASH").unwrap_or("unknown"),
+    }))
+}
+
+async fn brand_icon_handler(State(state): State<Arc<HttpState>>) -> impl IntoResponse {
+    let Some(path) = &state.brand_icon_path else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    match tokio::fs::read(path).await {
+        Ok(bytes) => ([(header::CONTENT_TYPE, "image/png")], bytes).into_response(),
+        Err(_) => StatusCode::NOT_FOUND.into_response(),
+    }
+}
+
 /// GET /api/sessions — list terminal sessions from the Swift app
 async fn sessions_handler(State(state): State<Arc<HttpState>>) -> impl IntoResponse {
     let sessions = state.sessions.lock().unwrap().clone();
     Json(serde_json::to_value(sessions).unwrap())
+}
+
+async fn team_handler(State(state): State<Arc<HttpState>>) -> impl IntoResponse {
+    let team_state = refreshed_team_state(&state).await;
+    Json(team_state)
+}
+
+async fn team_teams_handler(State(state): State<Arc<HttpState>>) -> impl IntoResponse {
+    let team_state = refreshed_team_state(&state).await;
+    Json(team_state.get("teams").cloned().unwrap_or_else(|| serde_json::json!([])))
+}
+
+async fn team_tasks_handler(State(state): State<Arc<HttpState>>) -> impl IntoResponse {
+    let team_state = refreshed_team_state(&state).await;
+    Json(team_state.get("tasks").cloned().unwrap_or_else(|| serde_json::json!([])))
+}
+
+async fn team_inbox_handler(State(state): State<Arc<HttpState>>) -> impl IntoResponse {
+    let team_state = refreshed_team_state(&state).await;
+    Json(team_state.get("attention").cloned().unwrap_or_else(|| serde_json::json!([])))
+}
+
+async fn team_instance_handler(State(state): State<Arc<HttpState>>) -> impl IntoResponse {
+    let team_state = refreshed_team_state(&state).await;
+    Json(team_state.get("instance").cloned().unwrap_or_else(|| serde_json::json!({})))
+}
+
+async fn refreshed_team_state(state: &Arc<HttpState>) -> serde_json::Value {
+    if let Some(live) = fetch_live_team_state(state).await {
+        *state.team_state.lock().unwrap() = live.clone();
+        return live;
+    }
+    state.team_state.lock().unwrap().clone()
+}
+
+async fn fetch_live_team_state(state: &Arc<HttpState>) -> Option<serde_json::Value> {
+    let cached = state.team_state.lock().unwrap().clone();
+    let socket_path = team_socket_path(state).ok()?;
+    let teams = rpc_team_socket(&socket_path, "team.list", serde_json::json!({}))
+        .await
+        .ok()?
+        .as_array()
+        .cloned()?;
+
+    let mut tasks = Vec::new();
+    let mut attention = Vec::new();
+    for team in &teams {
+        let team_name = team.get("team_name").and_then(|v| v.as_str())?;
+        if let Ok(task_result) = rpc_team_socket(
+            &socket_path,
+            "team.task.list",
+            serde_json::json!({ "team_name": team_name }),
+        )
+        .await
+        {
+            if let Some(team_tasks) = task_result.get("tasks").and_then(|v| v.as_array()) {
+                for task in team_tasks {
+                    let mut task = task.clone();
+                    if let Some(obj) = task.as_object_mut() {
+                        obj.insert("team_name".to_string(), serde_json::json!(team_name));
+                    }
+                    tasks.push(task);
+                }
+            }
+        }
+
+        if let Ok(inbox_result) = rpc_team_socket(
+            &socket_path,
+            "team.inbox",
+            serde_json::json!({ "team_name": team_name }),
+        )
+        .await
+        {
+            if let Some(team_items) = inbox_result.get("items").and_then(|v| v.as_array()) {
+                attention.extend(team_items.iter().cloned());
+            }
+        }
+    }
+
+    let mut instance = cached
+        .get("instance")
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!({}));
+    if let Some(obj) = instance.as_object_mut() {
+        obj.insert("socket_path".to_string(), serde_json::json!(socket_path));
+        obj.insert("team_count".to_string(), serde_json::json!(teams.len()));
+    }
+
+    Some(serde_json::json!({
+        "teams": teams,
+        "tasks": tasks,
+        "attention": attention,
+        "instance": instance,
+    }))
+}
+
+fn team_socket_path(state: &HttpState) -> Result<String, String> {
+    let team_state = state.team_state.lock().unwrap().clone();
+    team_state
+        .get("instance")
+        .and_then(|v| v.get("socket_path"))
+        .and_then(|v| v.as_str())
+        .filter(|v| !v.is_empty())
+        .map(|v| v.to_string())
+        .ok_or_else(|| "team instance socket is unavailable".to_string())
+}
+
+async fn rpc_team_socket(
+    socket_path: &str,
+    method: &str,
+    params: serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    let mut stream = UnixStream::connect(socket_path)
+        .await
+        .map_err(|e| format!("socket connect failed: {e}"))?;
+    let request = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": method,
+        "params": params,
+    });
+    let payload = format!("{}\n", request);
+    stream
+        .write_all(payload.as_bytes())
+        .await
+        .map_err(|e| format!("socket write failed: {e}"))?;
+
+    let mut reader = BufReader::new(stream);
+    let mut attempts = 0;
+    let response_line = loop {
+        let mut line = String::new();
+        let bytes = reader
+            .read_line(&mut line)
+            .await
+            .map_err(|e| format!("socket read failed: {e}"))?;
+        if bytes == 0 {
+            return Err("socket closed without a response".to_string());
+        }
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            attempts += 1;
+            if attempts >= 8 {
+                return Err("socket returned only empty lines".to_string());
+            }
+            continue;
+        }
+        if !trimmed.starts_with('{') {
+            return Err(trimmed.to_string());
+        }
+        break trimmed.to_string();
+    };
+    let response: serde_json::Value =
+        serde_json::from_str(&response_line).map_err(|e| format!("invalid rpc response: {e}; raw={response_line}"))?;
+    if let Some(err) = response.get("error") {
+        return Err(err
+            .get("message")
+            .and_then(|v| v.as_str())
+            .unwrap_or("rpc error")
+            .to_string());
+    }
+    Ok(response
+        .get("result")
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!({})))
+}
+
+#[derive(Deserialize)]
+struct TeamCreateAgentRequest {
+    name: String,
+    #[serde(default = "default_team_cli")]
+    cli: String,
+    #[serde(default = "default_team_model")]
+    model: String,
+    #[serde(default = "default_team_agent_type")]
+    agent_type: String,
+    #[serde(default = "default_team_color")]
+    color: String,
+    #[serde(default)]
+    instructions: String,
+}
+
+fn default_team_cli() -> String { "claude".to_string() }
+fn default_team_model() -> String { "sonnet".to_string() }
+fn default_team_agent_type() -> String { "general".to_string() }
+fn default_team_color() -> String { "green".to_string() }
+
+#[derive(Deserialize)]
+struct TeamCreateRequest {
+    team_name: String,
+    working_directory: String,
+    #[serde(default = "default_leader_mode")]
+    leader_mode: String,
+    agents: Vec<TeamCreateAgentRequest>,
+}
+
+fn default_leader_mode() -> String { "repl".to_string() }
+
+async fn team_create_handler(
+    State(state): State<Arc<HttpState>>,
+    Json(req): Json<TeamCreateRequest>,
+) -> impl IntoResponse {
+    let socket_path = match team_socket_path(&state) {
+        Ok(path) => path,
+        Err(err) => return (StatusCode::SERVICE_UNAVAILABLE, err).into_response(),
+    };
+    let params = serde_json::json!({
+        "team_name": req.team_name,
+        "working_directory": req.working_directory,
+        "leader_mode": req.leader_mode,
+        "leader_session_id": format!("http-dashboard-{}", uuid::Uuid::new_v4()),
+        "agents": req.agents.into_iter().map(|agent| serde_json::json!({
+            "name": agent.name,
+            "cli": agent.cli,
+            "model": agent.model,
+            "agent_type": agent.agent_type,
+            "color": agent.color,
+            "instructions": agent.instructions,
+        })).collect::<Vec<_>>(),
+    });
+    match rpc_team_socket(&socket_path, "team.create", params).await {
+        Ok(result) => (StatusCode::CREATED, Json(result)).into_response(),
+        Err(err) => (StatusCode::BAD_GATEWAY, err).into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+struct TeamTaskCreateRequest {
+    team_name: String,
+    title: String,
+    #[serde(default)]
+    assignee: Option<String>,
+}
+
+async fn team_tasks_create_handler(
+    State(state): State<Arc<HttpState>>,
+    Json(req): Json<TeamTaskCreateRequest>,
+) -> impl IntoResponse {
+    let socket_path = match team_socket_path(&state) {
+        Ok(path) => path,
+        Err(err) => return (StatusCode::SERVICE_UNAVAILABLE, err).into_response(),
+    };
+    let params = serde_json::json!({
+        "team_name": req.team_name,
+        "title": req.title,
+        "assignee": req.assignee,
+        "priority": 2,
+        "created_by": "http-dashboard",
+    });
+    match rpc_team_socket(&socket_path, "team.task.create", params).await {
+        Ok(result) => {
+            if let Some(task_id) = result.get("id").and_then(|v| v.as_str()) {
+                let leader_text = format!(
+                    "New task created: {}\nTask id: {task_id}\nAssignee: {}\nStatus: {}\n",
+                    result.get("title").and_then(|v| v.as_str()).unwrap_or(""),
+                    result.get("assignee").and_then(|v| v.as_str()).unwrap_or("unassigned"),
+                    result.get("status").and_then(|v| v.as_str()).unwrap_or("assigned")
+                );
+                let _ = rpc_team_socket(
+                    &socket_path,
+                    "team.leader.send",
+                    serde_json::json!({
+                        "team_name": req.team_name,
+                        "text": leader_text,
+                    }),
+                ).await;
+                if let Some(assignee) = req.assignee.as_deref() {
+                    let assignee_text = format!(
+                        "New assigned task: {}\nTask id: {task_id}\nStatus: {}\n\nA new task has been assigned to you.\nWhen you begin work, run:\n./scripts/team.py task start {task_id}\n",
+                        result.get("title").and_then(|v| v.as_str()).unwrap_or(""),
+                        result.get("status").and_then(|v| v.as_str()).unwrap_or("assigned")
+                    );
+                    let _ = rpc_team_socket(
+                        &socket_path,
+                        "team.send",
+                        serde_json::json!({
+                            "team_name": req.team_name,
+                            "agent_name": assignee,
+                            "text": assignee_text,
+                        }),
+                    ).await;
+                }
+            }
+            (StatusCode::CREATED, Json(result)).into_response()
+        }
+        Err(err) => (StatusCode::BAD_GATEWAY, err).into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+struct TeamTaskActionRequest {
+    action: String,
+    #[serde(default)]
+    note: Option<String>,
+    #[serde(default)]
+    team_name: Option<String>,
+}
+
+async fn team_tasks_action_handler(
+    State(state): State<Arc<HttpState>>,
+    Path(id): Path<String>,
+    Json(req): Json<TeamTaskActionRequest>,
+) -> impl IntoResponse {
+    let socket_path = match team_socket_path(&state) {
+        Ok(path) => path,
+        Err(err) => return (StatusCode::SERVICE_UNAVAILABLE, err).into_response(),
+    };
+    if req.action == "start" {
+        let mut params = serde_json::json!({
+            "team_name": req.team_name,
+            "task_id": id,
+        });
+        if let Some(note) = req.note {
+            params["progress_note"] = serde_json::json!(note);
+        }
+        return match rpc_team_socket(&socket_path, "team.task.start", params).await {
+            Ok(result) => {
+                let team_name = req.team_name.clone().unwrap_or_default();
+                if let Some(task) = result.get("task") {
+                    let task_id = task.get("id").and_then(|v| v.as_str()).unwrap_or("");
+                    let assignee = task.get("assignee").and_then(|v| v.as_str()).unwrap_or("");
+                    let title = task.get("title").and_then(|v| v.as_str()).unwrap_or("");
+                    let leader_text = format!(
+                        "Task started: {title}\nTask id: {task_id}\nAssignee: {assignee}\nStatus: in_progress\n"
+                    );
+                    let _ = rpc_team_socket(
+                        &socket_path,
+                        "team.leader.send",
+                        serde_json::json!({
+                            "team_name": team_name,
+                            "text": leader_text,
+                        }),
+                    ).await;
+                }
+                Json(result).into_response()
+            }
+            Err(err) => (StatusCode::BAD_GATEWAY, err).into_response(),
+        };
+    }
+    let method = match req.action.as_str() {
+        "block" => "team.task.block",
+        "review" => "team.task.review",
+        "done" => "team.task.done",
+        "reassign" => "team.task.reassign",
+        "unblock" => "team.task.unblock",
+        other => return (StatusCode::BAD_REQUEST, format!("unsupported action: {other}")).into_response(),
+    };
+    let mut params = serde_json::json!({
+        "team_name": req.team_name,
+        "task_id": id,
+    });
+    if let Some(note) = req.note {
+        match req.action.as_str() {
+            "block" => params["blocked_reason"] = serde_json::json!(note),
+            "review" => params["review_summary"] = serde_json::json!(note),
+            "done" => params["result"] = serde_json::json!(note),
+            "reassign" => params["assignee"] = serde_json::json!(note),
+            _ => {}
+        }
+    }
+    match rpc_team_socket(&socket_path, method, params).await {
+        Ok(result) => Json(result).into_response(),
+        Err(err) => (StatusCode::BAD_GATEWAY, err).into_response(),
+    }
 }
 
 async fn monitor_handler(State(state): State<Arc<HttpState>>) -> impl IntoResponse {
@@ -492,6 +902,22 @@ fn find_dashboard_dir() -> Option<PathBuf> {
     None
 }
 
+fn find_brand_icon_path() -> Option<PathBuf> {
+    if let Ok(project_dir) = std::env::var("CMUX_PROJECT_DIR") {
+        let path = PathBuf::from(project_dir).join("Assets.xcassets/AppIcon.appiconset/128.png");
+        if path.exists() { return Some(path); }
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(parent) = exe.parent() {
+            let path = parent.join("AppIcon.png");
+            if path.exists() { return Some(path); }
+        }
+    }
+    let dev_path = PathBuf::from("/Users/jinwoo/work/project/cmux/Assets.xcassets/AppIcon.appiconset/128.png");
+    if dev_path.exists() { return Some(dev_path); }
+    None
+}
+
 const HTTP_POLL_SCRIPT: &str = r#"<script>
 // ── HTTP Fetch Polling + Session Picker (injected by term-meshd) ──
 (function() {
@@ -504,11 +930,12 @@ const HTTP_POLL_SCRIPT: &str = r#"<script>
 
   async function poll() {
     try {
-      const [monitorRes, watcherRes, sessionsRes, usageRes] = await Promise.all([
+      const [monitorRes, watcherRes, sessionsRes, usageRes, teamRes] = await Promise.all([
         fetch(baseUrl + '/api/monitor'),
         fetch(baseUrl + '/api/watcher'),
         fetch(baseUrl + '/api/sessions'),
         fetch(baseUrl + '/api/usage'),
+        fetch(baseUrl + '/api/team'),
       ]);
       if (monitorRes.ok) updateMonitor(await monitorRes.json());
       if (watcherRes.ok) updateHeatmap(await watcherRes.json());
@@ -518,6 +945,13 @@ const HTTP_POLL_SCRIPT: &str = r#"<script>
         if (window.updateAgentStatus) updateAgentStatus(sessionsData);
       }
       if (usageRes.ok && window.updateUsage) updateUsage(await usageRes.json());
+      if (teamRes.ok) {
+        const teamData = await teamRes.json();
+        if (window.updateTeamAgents) updateTeamAgents(teamData.teams || []);
+        if (window.updateTeamTasks) updateTeamTasks(teamData.tasks || []);
+        if (window.updateTeamAttention) updateTeamAttention(teamData.attention || []);
+        if (window.updateInstanceStatus) updateInstanceStatus(teamData.instance || {});
+      }
 
       // Agents + Tasks + Messages
       fetch(baseUrl + '/api/agents').then(r => r.ok ? r.json() : []).then(d => {
@@ -539,7 +973,7 @@ const HTTP_POLL_SCRIPT: &str = r#"<script>
     if (!container) return;
 
     // Build select options
-    let html = '<select id="session-select" onchange="window._selectSession(this.value)" style="background:#1a1a2e;border:1px solid #0f3460;color:#e0e0e0;padding:4px 8px;border-radius:4px;font-size:12px;outline:none;min-width:200px;">';
+    let html = '<select id="session-select" onchange="window._selectSession(this.value)" style="background:rgba(255,255,255,0.94);border:1px solid rgba(148,163,184,0.18);color:#27364b;padding:9px 11px;border-radius:6px;font-size:12px;outline:none;min-width:220px;box-shadow:0 8px 18px rgba(15,23,42,0.06);">';
     html += '<option value="all"' + (selectedSession === 'all' ? ' selected' : '') + '>All Sessions (' + sessions.length + ')</option>';
     for (const s of sessions) {
       const label = s.name + (s.git_branch ? ' [' + s.git_branch + ']' : '');
@@ -553,7 +987,7 @@ const HTTP_POLL_SCRIPT: &str = r#"<script>
       const s = sessions.find(x => x.project_path === selectedSession);
       if (s) {
         const projName = s.project_path.split('/').pop();
-        html += '<span style="margin-left:8px;font-size:11px;color:#888;">' + projName + '</span>';
+        html += '<span style="margin-left:8px;font-size:11px;color:#64766f;">' + projName + '</span>';
       }
     }
 

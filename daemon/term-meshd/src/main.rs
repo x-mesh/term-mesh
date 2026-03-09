@@ -43,26 +43,42 @@ async fn main() -> anyhow::Result<()> {
 
     // Shared session store (populated by Swift app via session.sync RPC)
     let sessions: socket::SessionStore = Arc::new(Mutex::new(Vec::new()));
+    let team_state: socket::TeamStateStore = Arc::new(Mutex::new(serde_json::json!({
+        "teams": [],
+        "tasks": [],
+        "attention": [],
+        "instance": {},
+    })));
 
     // 3. Shutdown channel
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
-    // 4. HTTP server
-    let http_addr: SocketAddr = std::env::var("TERM_MESH_HTTP_ADDR")
-        .unwrap_or_else(|_| "0.0.0.0:9876".to_string())
-        .parse()
-        .unwrap_or_else(|_| SocketAddr::from(([0, 0, 0, 0], 9876)));
+    // 4. HTTP server (can be disabled via TERM_MESH_HTTP_DISABLED=1)
+    let http_disabled = std::env::var("TERM_MESH_HTTP_DISABLED")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
 
-    let http_task = tokio::spawn(http::serve(
-        http_addr,
-        monitor_rx.clone(),
-        monitor_handle.clone(),
-        watcher_handle.clone(),
-        sessions.clone(),
-        usage_tracker.clone(),
-        agent_manager.clone(),
-        shutdown_rx.clone(),
-    ));
+    let http_task = if http_disabled {
+        tracing::info!("HTTP dashboard disabled via TERM_MESH_HTTP_DISABLED");
+        tokio::spawn(async { Ok(()) })
+    } else {
+        let http_addr: SocketAddr = std::env::var("TERM_MESH_HTTP_ADDR")
+            .unwrap_or_else(|_| "0.0.0.0:9876".to_string())
+            .parse()
+            .unwrap_or_else(|_| SocketAddr::from(([0, 0, 0, 0], 9876)));
+
+        tokio::spawn(http::serve(
+            http_addr,
+            monitor_rx.clone(),
+            monitor_handle.clone(),
+            watcher_handle.clone(),
+            sessions.clone(),
+            team_state.clone(),
+            usage_tracker.clone(),
+            agent_manager.clone(),
+            shutdown_rx.clone(),
+        ))
+    };
 
     // 5. Unix socket server
     let socket_path = socket::default_socket_path();
@@ -72,6 +88,7 @@ async fn main() -> anyhow::Result<()> {
         monitor_handle.clone(),
         watcher_handle.clone(),
         sessions,
+        team_state,
         usage_tracker,
         agent_manager.clone(),
         shutdown_rx,

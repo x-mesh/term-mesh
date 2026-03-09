@@ -53,22 +53,41 @@ final class TeamOrchestrator {
         let teamName: String
         let content: String
         let timestamp: Date
-        let type: String       // "report", "progress", "error", "complete"
+        let type: String       // "note", "progress", "blocked", "review_ready", "error", "report"
     }
 
     /// D: Shared task board
     struct TeamTask {
         let id: String
         var title: String
+        var details: String?
+        var acceptanceCriteria: [String]
+        var labels: [String]
+        var estimatedSize: Int?
         var assignee: String?
-        var status: String     // "pending", "in_progress", "completed", "failed"
+        var status: String     // "queued", "assigned", "in_progress", "blocked", "review_ready", "completed", "failed", "abandoned"
+        var priority: Int
+        var dependsOn: [String]
+        var parentTaskId: String?
+        var childTaskIds: [String]
+        var reassignmentCount: Int
+        var supersededBy: String?
+        var blockedReason: String?
+        var reviewSummary: String?
+        var createdBy: String
         var result: String?
         let createdAt: Date
         var updatedAt: Date
+        var startedAt: Date?
+        var completedAt: Date?
+        var lastProgressAt: Date?
     }
 
     private(set) var messages: [String: [TeamMessage]] = [:]   // team_name → messages
     private(set) var taskBoards: [String: [TeamTask]] = [:]    // team_name → tasks
+    private var heartbeats: [String: [String: (at: Date, summary: String?)]] = [:]
+    private let staleTaskThreshold: TimeInterval = 10 * 60
+    private let staleHeartbeatThreshold: TimeInterval = 5 * 60
 
     // MARK: - Agent CLI Binaries
 
@@ -446,6 +465,7 @@ final class TeamOrchestrator {
             gitRepoRoot: gitRepoRoot
         )
         teams[name] = team
+        syncTeamStateToDaemon()
         print("[team] created team '\(name)' with \(members.count) agent(s) + leader console")
 
         // For non-Claude CLI leaders (kiro, codex, gemini), inject team instructions
@@ -545,9 +565,22 @@ final class TeamOrchestrator {
         ## Your Agents
         \(agentList)
 
+        ## Operating Model
+
+        Task objects are the canonical unit of delegation.
+        Messages are for conversation. Reports are for result summaries.
+        You should manage by task state and inbox, not by ad hoc chat alone.
+
+        Before sending meaningful work, create a task and assign it.
+
         ## How to Command Agents
 
-        Send a task to a specific agent:
+        Create a task and delegate it to a specific agent:
+        ```
+        \(teamPy) delegate <agent_name> '<your instruction>'
+        ```
+
+        Send a raw direct message to a specific agent:
         ```
         \(teamPy) send <agent_name> '<your instruction>'
         ```
@@ -560,6 +593,11 @@ final class TeamOrchestrator {
         Check team status:
         ```
         \(teamPy) status
+        ```
+
+        Check what needs intervention first:
+        ```
+        \(teamPy) inbox
         ```
 
         ## Reading Agent Results (MANDATORY)
@@ -581,6 +619,12 @@ final class TeamOrchestrator {
         \(teamPy) wait --timeout 120
         ```
 
+        Wait for the next blocked or review-ready item:
+        ```
+        \(teamPy) wait --mode blocked --timeout 120
+        \(teamPy) wait --mode review_ready --timeout 120
+        ```
+
         ## Message Channel
         ```
         \(teamPy) msg list
@@ -589,17 +633,24 @@ final class TeamOrchestrator {
 
         ## Task Board
         ```
-        \(teamPy) task create '<title>' --assign <agent_name>
+        \(teamPy) task create '<title>' --assign <agent_name> --priority 2
         \(teamPy) task list
-        \(teamPy) task update <id> completed '<result>'
+        \(teamPy) task get <id>
+        \(teamPy) task start <id> --assign <agent_name>
+        \(teamPy) task block <id> '<reason>'
+        \(teamPy) task review <id> '<summary>'
+        \(teamPy) task done <id> '<result>'
         ```
         \(worktreeSection)
 
         ## Your Role
-        1. Break down user tasks and delegate to appropriate agents
-        2. ALWAYS read agent results using read/collect/wait before responding
-        3. Coordinate dependencies between agents
-        4. Synthesize results and report back
+        1. Break down user tasks and create explicit tasks before delegating work
+        2. Delegate to appropriate agents with task ids and clear acceptance criteria
+        3. Check `inbox` before responding to the user
+        4. Treat `blocked` and `review_ready` as first-class control points
+        5. ALWAYS read agent results using read/collect/wait before responding
+        6. Coordinate dependencies between agents
+        7. Synthesize results and report back
 
         Environment: TERMMESH_SOCKET=\(socketPath)
         """
@@ -612,29 +663,131 @@ final class TeamOrchestrator {
         return sendTextToPanel(workspaceId: agent.workspaceId, panelId: agent.panelId, text: text, tabManager: tabManager)
     }
 
+    func sendToLeader(teamName: String, text: String, tabManager: TabManager) -> Bool {
+        guard let team = teams[teamName] else { return false }
+        return sendTextToPanel(workspaceId: team.workspaceId, panelId: team.leaderPanelId, text: text, tabManager: tabManager)
+    }
+
+    @discardableResult
+    func notifyTaskCreated(teamName: String, taskId: String, tabManager: TabManager) -> Bool {
+        guard let task = getTask(teamName: teamName, taskId: taskId) else { return false }
+        let leaderSummary = formatLeaderTaskNotification(task: task, event: "created")
+        let leaderSent = sendToLeader(teamName: teamName, text: leaderSummary, tabManager: tabManager)
+        guard let assignee = task.assignee?.nilIfBlank else { return leaderSent }
+        let assigneeNotice = formatTaskAssignmentInstruction(task: task)
+        let agentSent = sendToAgent(teamName: teamName, agentName: assignee, text: assigneeNotice, tabManager: tabManager)
+        return leaderSent || agentSent
+    }
+
+    @discardableResult
+    func notifyTaskLifecycleEvent(
+        teamName: String,
+        taskId: String,
+        event: String,
+        note: String? = nil,
+        tabManager: TabManager
+    ) -> Bool {
+        guard let task = getTask(teamName: teamName, taskId: taskId) else { return false }
+        let leaderSummary = formatLeaderTaskNotification(task: task, event: event, note: note)
+        return sendToLeader(teamName: teamName, text: leaderSummary, tabManager: tabManager)
+    }
+
+    func dispatchTaskToAssignee(teamName: String, taskId: String, tabManager: TabManager) -> Bool {
+        guard let task = getTask(teamName: teamName, taskId: taskId),
+              let assignee = task.assignee?.nilIfBlank
+        else { return false }
+        let instruction = formatTaskDispatchInstruction(task: task)
+        let dispatched = sendToAgent(teamName: teamName, agentName: assignee, text: instruction, tabManager: tabManager)
+        let leaderSummary = formatLeaderTaskNotification(task: task, event: dispatched ? "started" : "start_failed")
+        _ = sendToLeader(teamName: teamName, text: leaderSummary, tabManager: tabManager)
+        return dispatched
+    }
+
+    private func formatTaskDispatchInstruction(task: TeamTask) -> String {
+        var lines = [
+            "Task \(task.id): \(task.title)",
+            "Status: \(task.status)",
+            "Priority: \(task.priority)"
+        ]
+        if !task.acceptanceCriteria.isEmpty {
+            lines.append("Acceptance criteria:")
+            for item in task.acceptanceCriteria {
+                lines.append("- \(item)")
+            }
+        }
+        if !task.dependsOn.isEmpty {
+            lines.append("Dependencies: \(task.dependsOn.joined(separator: ", "))")
+        }
+        if let description = task.details?.nilIfBlank {
+            lines.append("Details: \(description)")
+        }
+        lines.append("")
+        lines.append("Resume or start this assigned task now.")
+        lines.append("")
+        lines.append("Use the task lifecycle commands with this task id:")
+        lines.append("- ./scripts/team.py task start \(task.id)")
+        lines.append("- ./scripts/team.py task block \(task.id) '<reason>'")
+        lines.append("- ./scripts/team.py task review \(task.id) '<summary>'")
+        lines.append("- ./scripts/team.py task done \(task.id) '<result>'")
+        return lines.joined(separator: "\n")
+    }
+
+    private func formatTaskAssignmentInstruction(task: TeamTask) -> String {
+        var lines = [
+            "New assigned task: \(task.title)",
+            "Task id: \(task.id)",
+            "Status: \(task.status)",
+        ]
+        if let description = task.details?.nilIfBlank {
+            lines.append("")
+            lines.append(description)
+        }
+        lines.append("")
+        lines.append("A new task has been assigned to you.")
+        lines.append("When you begin work, run:")
+        lines.append("./scripts/team.py task start \(task.id)")
+        return lines.joined(separator: "\n")
+    }
+
+    private func formatLeaderTaskNotification(task: TeamTask, event: String, note: String? = nil) -> String {
+        let assignee = task.assignee?.nilIfBlank ?? "unassigned"
+        let eventText: String
+        switch event {
+        case "created": eventText = "New task created"
+        case "started": eventText = "Task started"
+        case "blocked": eventText = "Task blocked"
+        case "review_ready": eventText = "Task ready for review"
+        case "completed": eventText = "Task completed"
+        case "start_failed": eventText = "Task start dispatch failed"
+        default: eventText = "Task update"
+        }
+        var lines = [
+            "\(eventText): \(task.title)",
+            "Task id: \(task.id)",
+            "Assignee: \(assignee)",
+            "Status: \(task.status)"
+        ]
+        if let note = note?.nilIfBlank {
+            lines.append("Note: \(note)")
+        }
+        return lines.joined(separator: "\n")
+    }
+
     private func sendTextToPanel(workspaceId: UUID, panelId: UUID, text: String, tabManager: TabManager) -> Bool {
         guard let workspace = tabManager.tabs.first(where: { $0.id == workspaceId }) else { return false }
         guard let panel = workspace.terminalPanel(for: panelId) else { return false }
-        // Strip trailing newlines — we append \n to trigger Return via key events.
         let trimmed = text.replacingOccurrences(of: "[\\r\\n]+$", with: "", options: .regularExpression)
         guard !trimmed.isEmpty else { return true }
 
-        // Send text first, then Return after a short delay.
-        // Sending text + Return synchronously in one call causes a race condition
-        // where Claude Code TUI may not have processed the text input before the
-        // Return key event arrives, causing the Return to be swallowed.
+        // Use key-event input plus delayed Return so TUI apps submit the message
+        // instead of leaving the text in the composer input.
         panel.sendInputText(trimmed)
-        panel.surface.forceRefresh()
-
-        // Delay Return to give the TUI time to process the text input.
-        // 0.3s works for both Claude Code and kiro-cli TUIs.
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
             panel.sendInputText("\n")
-            panel.surface.forceRefresh()
         }
 
         #if DEBUG
-        dlog("[team.sendTextToPanel] sendInputText textLen=\(trimmed.count) text=\(trimmed.prefix(80).debugDescription)")
+        dlog("[team.sendTextToPanel] sendText textLen=\(trimmed.count) text=\(trimmed.prefix(80).debugDescription)")
         #endif
         return true
     }
@@ -654,44 +807,102 @@ final class TeamOrchestrator {
     /// List all teams.
     func listTeams() -> [[String: Any]] {
         teams.values.map { team in
-            [
+            let teamInbox = inboxItems(teamName: team.id)
+            return [
                 "team_name": team.id,
                 "leader_session_id": team.leaderSessionId,
                 "working_directory": team.workingDirectory,
                 "workspace_id": team.workspaceId.uuidString,
                 "agent_count": team.agents.count,
                 "agents": team.agents.map { agent in
-                    [
+                    let activeTask = activeTask(for: team.id, agentName: agent.name)
+                    let heartbeat = heartbeats[team.id]?[agent.name]
+                    return [
                         "id": agent.id,
                         "name": agent.name,
                         "cli": agent.cli,
                         "model": agent.model,
                         "agent_type": agent.agentType,
                         "color": agent.color,
+                        "active_task_id": activeTask?.id as Any,
+                        "active_task_title": activeTask?.title as Any,
+                        "active_task_status": activeTask?.status as Any,
+                        "active_task_is_stale": activeTask.map(isTaskStale) ?? false,
+                        "agent_state": agentRuntimeState(teamName: team.id, agentName: agent.name),
+                        "heartbeat_age_seconds": heartbeatAgeSeconds(teamName: team.id, agentName: agent.name) as Any,
+                        "last_heartbeat_summary": heartbeat?.summary as Any,
+                        "heartbeat_is_stale": heartbeat.map(isHeartbeatStale) ?? false,
                         "workspace_id": agent.workspaceId.uuidString,
                         "panel_id": agent.panelId.uuidString
                     ] as [String: Any]
                 },
+                "attention_count": teamInbox.count,
                 "created_at": ISO8601DateFormatter().string(from: team.createdAt)
             ] as [String: Any]
+        }
+    }
+
+    private func daemonPayload() -> [String: Any] {
+        let teamData = listTeams()
+        let teamTasks = teamData.flatMap { team -> [[String: Any]] in
+            guard let teamName = team["team_name"] as? String else { return [] }
+            return listTasks(teamName: teamName).map { task in
+                var dict = taskDictionary(task)
+                dict["team_name"] = teamName
+                return dict
+            }
+        }
+        let teamAttention = teamData.flatMap { team -> [[String: Any]] in
+            guard let teamName = team["team_name"] as? String else { return [] }
+            return inboxItems(teamName: teamName)
+        }
+        let instanceMeta: [String: Any] = [
+            "app_name": Bundle.main.object(forInfoDictionaryKey: "CFBundleName") as? String
+                ?? ProcessInfo.processInfo.processName,
+            "socket_path": SocketControlSettings.socketPath(),
+            "team_count": teamData.count
+        ]
+        return [
+            "teams": teamData,
+            "tasks": teamTasks,
+            "attention": teamAttention,
+            "instance": instanceMeta,
+        ]
+    }
+
+    private func syncTeamStateToDaemon() {
+        let payload = daemonPayload()
+        DispatchQueue.global(qos: .utility).async {
+            TermMeshDaemon.shared.syncTeams(payload)
         }
     }
 
     /// Get team status.
     func teamStatus(name: String) -> [String: Any]? {
         guard let team = teams[name] else { return nil }
+        let teamInbox = inboxItems(teamName: team.id)
         return [
             "team_name": team.id,
             "leader_session_id": team.leaderSessionId,
             "workspace_id": team.workspaceId.uuidString,
             "agent_count": team.agents.count,
             "agents": team.agents.map { agent in
+                let activeTask = activeTask(for: team.id, agentName: agent.name)
+                let heartbeat = heartbeats[team.id]?[agent.name]
                 var info: [String: Any] = [
                     "id": agent.id,
                     "name": agent.name,
                     "cli": agent.cli,
                     "model": agent.model,
                     "agent_type": agent.agentType,
+                    "active_task_id": activeTask?.id as Any,
+                    "active_task_title": activeTask?.title as Any,
+                    "active_task_status": activeTask?.status as Any,
+                    "active_task_is_stale": activeTask.map(isTaskStale) ?? false,
+                    "agent_state": agentRuntimeState(teamName: team.id, agentName: agent.name),
+                    "heartbeat_age_seconds": heartbeatAgeSeconds(teamName: team.id, agentName: agent.name) as Any,
+                    "last_heartbeat_summary": heartbeat?.summary as Any,
+                    "heartbeat_is_stale": heartbeat.map(isHeartbeatStale) ?? false,
                     "workspace_id": agent.workspaceId.uuidString,
                     "panel_id": agent.panelId.uuidString
                 ]
@@ -702,7 +913,9 @@ final class TeamOrchestrator {
                     info["worktree_path"] = path
                 }
                 return info as [String: Any]
-            }
+            },
+            "attention_count": teamInbox.count,
+            "task_count": taskBoards[team.id, default: []].count
         ] as [String: Any]
     }
 
@@ -712,6 +925,8 @@ final class TeamOrchestrator {
         guard let workspace = tabManager.tabs.first(where: { $0.id == team.workspaceId }) else {
             cleanupWorktrees(team: team)
             teams.removeValue(forKey: name)
+            heartbeats.removeValue(forKey: name)
+            syncTeamStateToDaemon()
             return true
         }
 
@@ -742,8 +957,10 @@ final class TeamOrchestrator {
         clearResults(teamName: name)
         clearMessages(teamName: name)
         clearTasks(teamName: name)
+        heartbeats.removeValue(forKey: name)
 
         teams.removeValue(forKey: name)
+        syncTeamStateToDaemon()
         print("[team] destroyed team '\(name)'")
         return true
     }
@@ -1039,9 +1256,10 @@ final class TeamOrchestrator {
             teamName: teamName,
             content: content,
             timestamp: Date(),
-            type: type
+            type: normalizedMessageType(type)
         )
         messages[teamName, default: []].append(msg)
+        syncTeamStateToDaemon()
         return msg
     }
 
@@ -1059,51 +1277,472 @@ final class TeamOrchestrator {
     /// Clear messages for a team.
     func clearMessages(teamName: String) {
         messages.removeValue(forKey: teamName)
+        syncTeamStateToDaemon()
     }
 
     // MARK: - D: Task Board
 
     /// Create a new task on the team's task board.
     @discardableResult
-    func createTask(teamName: String, title: String, assignee: String? = nil) -> TeamTask? {
+    func createTask(
+        teamName: String,
+        title: String,
+        details: String? = nil,
+        assignee: String? = nil,
+        acceptanceCriteria: [String] = [],
+        labels: [String] = [],
+        estimatedSize: Int? = nil,
+        priority: Int = 2,
+        dependsOn: [String] = [],
+        parentTaskId: String? = nil,
+        createdBy: String = "leader"
+    ) -> TeamTask? {
         guard teams[teamName] != nil else { return nil }
+        let now = Date()
+        let normalizedAssignee = assignee?.nilIfBlank
+        let normalizedCreatedBy = createdBy.nilIfBlank ?? "leader"
+        if normalizedCreatedBy.contains("dashboard"),
+           let duplicate = taskBoards[teamName, default: []].last(where: {
+               $0.title == title &&
+               $0.assignee == normalizedAssignee &&
+               $0.createdBy == normalizedCreatedBy &&
+               now.timeIntervalSince($0.createdAt) < 5
+           }) {
+            return duplicate
+        }
         let task = TeamTask(
             id: UUID().uuidString.prefix(8).lowercased().description,
             title: title,
-            assignee: assignee,
-            status: "pending",
+            details: details?.nilIfBlank,
+            acceptanceCriteria: acceptanceCriteria.compactMap(\.nilIfBlank),
+            labels: labels.compactMap(\.nilIfBlank),
+            estimatedSize: estimatedSize,
+            assignee: normalizedAssignee,
+            status: normalizedAssignee == nil ? "queued" : "assigned",
+            priority: max(1, min(priority, 3)),
+            dependsOn: dependsOn.compactMap(\.nilIfBlank),
+            parentTaskId: parentTaskId?.nilIfBlank,
+            childTaskIds: [],
+            reassignmentCount: 0,
+            supersededBy: nil,
+            blockedReason: nil,
+            reviewSummary: nil,
+            createdBy: normalizedCreatedBy,
             result: nil,
-            createdAt: Date(),
-            updatedAt: Date()
+            createdAt: now,
+            updatedAt: now,
+            startedAt: nil,
+            completedAt: nil,
+            lastProgressAt: nil
         )
         taskBoards[teamName, default: []].append(task)
+        if let parentTaskId,
+           var tasks = taskBoards[teamName],
+           let parentIdx = tasks.firstIndex(where: { $0.id == parentTaskId }) {
+            tasks[parentIdx].childTaskIds.append(task.id)
+            tasks[parentIdx].updatedAt = now
+            taskBoards[teamName] = tasks
+        }
+        syncTeamStateToDaemon()
         return task
     }
 
     /// Update a task's status and optional result.
     @discardableResult
-    func updateTask(teamName: String, taskId: String, status: String? = nil, result: String? = nil, assignee: String? = nil) -> TeamTask? {
+    func updateTask(
+        teamName: String,
+        taskId: String,
+        status: String? = nil,
+        result: String? = nil,
+        assignee: String? = nil,
+        blockedReason: String? = nil,
+        reviewSummary: String? = nil,
+        progressNote: String? = nil
+    ) -> TeamTask? {
         guard var tasks = taskBoards[teamName],
               let idx = tasks.firstIndex(where: { $0.id == taskId }) else { return nil }
-        if let status { tasks[idx].status = status }
+        let now = Date()
+        if let assignee {
+            tasks[idx].assignee = assignee.nilIfBlank
+            if tasks[idx].status == "queued", tasks[idx].assignee != nil {
+                tasks[idx].status = "assigned"
+            }
+        }
+        if let blockedReason {
+            tasks[idx].blockedReason = blockedReason.nilIfBlank
+        }
+        if let reviewSummary {
+            tasks[idx].reviewSummary = reviewSummary.nilIfBlank
+        }
         if let result { tasks[idx].result = result }
-        if let assignee { tasks[idx].assignee = assignee }
-        tasks[idx].updatedAt = Date()
+        if let progressNote = progressNote?.nilIfBlank {
+            tasks[idx].lastProgressAt = now
+            _ = postMessage(
+                teamName: teamName,
+                from: tasks[idx].assignee ?? "leader",
+                content: progressNote,
+                type: "progress"
+            )
+        }
+        if let status {
+            let normalizedStatus = normalizedTaskStatus(status)
+            tasks[idx].status = normalizedStatus
+            switch normalizedStatus {
+            case "in_progress":
+                tasks[idx].startedAt = tasks[idx].startedAt ?? now
+                tasks[idx].lastProgressAt = now
+                tasks[idx].blockedReason = nil
+            case "blocked":
+                tasks[idx].lastProgressAt = now
+            case "review_ready":
+                tasks[idx].lastProgressAt = now
+                tasks[idx].blockedReason = nil
+            case "completed", "failed", "abandoned":
+                tasks[idx].completedAt = now
+                tasks[idx].lastProgressAt = now
+                if normalizedStatus == "completed" {
+                    tasks[idx].blockedReason = nil
+                }
+            default:
+                break
+            }
+        }
+        tasks[idx].updatedAt = now
         taskBoards[teamName] = tasks
+        syncTeamStateToDaemon()
         return tasks[idx]
     }
 
+    func getTask(teamName: String, taskId: String) -> TeamTask? {
+        taskBoards[teamName]?.first(where: { $0.id == taskId })
+    }
+
+    @discardableResult
+    func reassignTask(teamName: String, taskId: String, assignee: String?) -> TeamTask? {
+        guard var tasks = taskBoards[teamName],
+              let idx = tasks.firstIndex(where: { $0.id == taskId }) else { return nil }
+        let now = Date()
+        let previousAssignee = tasks[idx].assignee
+        tasks[idx].assignee = assignee?.nilIfBlank
+        tasks[idx].status = tasks[idx].assignee == nil ? "queued" : "assigned"
+        tasks[idx].blockedReason = nil
+        tasks[idx].reviewSummary = nil
+        tasks[idx].completedAt = nil
+        tasks[idx].updatedAt = now
+        tasks[idx].lastProgressAt = now
+        if previousAssignee != tasks[idx].assignee {
+            tasks[idx].reassignmentCount += 1
+        }
+        taskBoards[teamName] = tasks
+        syncTeamStateToDaemon()
+        return tasks[idx]
+    }
+
+    @discardableResult
+    func unblockTask(teamName: String, taskId: String) -> TeamTask? {
+        guard var tasks = taskBoards[teamName],
+              let idx = tasks.firstIndex(where: { $0.id == taskId }) else { return nil }
+        let now = Date()
+        tasks[idx].blockedReason = nil
+        if tasks[idx].status == "blocked" {
+            if tasks[idx].startedAt != nil {
+                tasks[idx].status = "in_progress"
+            } else {
+                tasks[idx].status = tasks[idx].assignee == nil ? "queued" : "assigned"
+            }
+        }
+        tasks[idx].updatedAt = now
+        tasks[idx].lastProgressAt = now
+        taskBoards[teamName] = tasks
+        syncTeamStateToDaemon()
+        return tasks[idx]
+    }
+
+    @discardableResult
+    func splitTask(
+        teamName: String,
+        parentTaskId: String,
+        title: String,
+        assignee: String? = nil,
+        createdBy: String = "leader"
+    ) -> TeamTask? {
+        guard let parent = getTask(teamName: teamName, taskId: parentTaskId) else { return nil }
+        var details = "Split from \(parent.id): \(parent.title)"
+        if let parentDetails = parent.details?.nilIfBlank {
+            details += "\n\n\(parentDetails)"
+        }
+        return createTask(
+            teamName: teamName,
+            title: title,
+            details: details,
+            assignee: assignee ?? parent.assignee,
+            acceptanceCriteria: [],
+            labels: parent.labels,
+            estimatedSize: parent.estimatedSize,
+            priority: parent.priority,
+            dependsOn: [],
+            parentTaskId: parent.id,
+            createdBy: createdBy
+        )
+    }
+
     /// List tasks, optionally filtered by status or assignee.
-    func listTasks(teamName: String, status: String? = nil, assignee: String? = nil) -> [TeamTask] {
+    func listTasks(
+        teamName: String,
+        status: String? = nil,
+        assignee: String? = nil,
+        needsAttention: Bool = false,
+        priority: Int? = nil,
+        staleOnly: Bool = false,
+        dependsOn: String? = nil
+    ) -> [TeamTask] {
         guard let tasks = taskBoards[teamName] else { return [] }
         var filtered = tasks
-        if let status { filtered = filtered.filter { $0.status == status } }
+        if let status {
+            filtered = filtered.filter { $0.status == normalizedTaskStatus(status) }
+        }
         if let assignee { filtered = filtered.filter { $0.assignee == assignee } }
+        if needsAttention { filtered = filtered.filter(taskNeedsAttention) }
+        if let priority { filtered = filtered.filter { $0.priority == priority } }
+        if staleOnly { filtered = filtered.filter(isTaskStale) }
+        if let dependsOn {
+            filtered = filtered.filter { $0.dependsOn.contains(dependsOn) }
+        }
         return filtered
+    }
+
+    func dependentTasks(teamName: String, taskId: String) -> [TeamTask] {
+        taskBoards[teamName, default: []].filter { $0.dependsOn.contains(taskId) || $0.parentTaskId == taskId }
+    }
+
+    func postHeartbeat(teamName: String, agentName: String, summary: String?) {
+        guard teams[teamName] != nil else { return }
+        heartbeats[teamName, default: [:]][agentName] = (Date(), summary?.nilIfBlank)
+        syncTeamStateToDaemon()
+    }
+
+    func inboxItems(teamName: String, topOnly: Bool = false) -> [[String: Any]] {
+        guard teams[teamName] != nil else { return [] }
+        let now = Date()
+        var items: [[String: Any]] = []
+
+        for task in taskBoards[teamName, default: []] {
+            let staleSeconds = staleAgeSeconds(for: task, now: now)
+            let attention: (Int, String)?
+            switch task.status {
+            case "blocked":
+                attention = (1, task.blockedReason ?? "Blocked")
+            case "review_ready":
+                attention = (2, task.reviewSummary ?? "Ready for review")
+            case "failed":
+                attention = (3, task.result ?? "Task failed")
+            default:
+                if let staleSeconds {
+                    attention = (4, "Stale for \(staleSeconds)s")
+                } else if task.status == "completed" {
+                    attention = (5, task.result ?? "Completed")
+                } else {
+                    attention = nil
+                }
+            }
+            guard let attention else { continue }
+            items.append([
+                "kind": "task",
+                "priority": attention.0,
+                "team_name": teamName,
+                "task_id": task.id,
+                "agent_name": task.assignee as Any,
+                "reason": attention.1,
+                "age_seconds": Int(now.timeIntervalSince(task.updatedAt)),
+                "summary": task.title,
+                "task_title": task.title,
+                "result": task.result as Any,
+                "review_summary": task.reviewSummary as Any,
+                "status": task.status,
+                "is_stale": staleSeconds != nil,
+                "stale_seconds": staleSeconds as Any
+            ])
+        }
+
+        for message in messages[teamName, default: []] {
+            let priority: Int?
+            switch message.type {
+            case "blocked":
+                priority = 1
+            case "review_ready":
+                priority = 2
+            case "error":
+                priority = 3
+            default:
+                priority = nil
+            }
+            guard let priority else { continue }
+            items.append([
+                "kind": "message",
+                "priority": priority,
+                "team_name": teamName,
+                "task_id": NSNull(),
+                "agent_name": message.from,
+                "reason": message.type,
+                "age_seconds": Int(now.timeIntervalSince(message.timestamp)),
+                "summary": message.content,
+                "message_id": message.id
+            ])
+        }
+
+        let sorted = items.sorted {
+            let lhsPriority = $0["priority"] as? Int ?? Int.max
+            let rhsPriority = $1["priority"] as? Int ?? Int.max
+            if lhsPriority != rhsPriority { return lhsPriority < rhsPriority }
+            let lhsAge = $0["age_seconds"] as? Int ?? .max
+            let rhsAge = $1["age_seconds"] as? Int ?? .max
+            return lhsAge > rhsAge
+        }
+        if topOnly, let first = sorted.first { return [first] }
+        return sorted
     }
 
     /// Clear the task board for a team.
     func clearTasks(teamName: String) {
         taskBoards.removeValue(forKey: teamName)
+        syncTeamStateToDaemon()
+    }
+
+    func taskDictionary(_ task: TeamTask) -> [String: Any] {
+        var dict: [String: Any] = [
+            "id": task.id,
+            "title": task.title,
+            "description": task.details as Any,
+            "acceptance_criteria": task.acceptanceCriteria,
+            "labels": task.labels,
+            "estimated_size": task.estimatedSize as Any,
+            "status": task.status,
+            "priority": task.priority,
+            "depends_on": task.dependsOn,
+            "parent_task_id": task.parentTaskId as Any,
+            "child_task_ids": task.childTaskIds,
+            "reassignment_count": task.reassignmentCount,
+            "superseded_by": task.supersededBy as Any,
+            "assignee": task.assignee as Any,
+            "blocked_reason": task.blockedReason as Any,
+            "review_summary": task.reviewSummary as Any,
+            "created_by": task.createdBy,
+            "result": task.result as Any,
+            "created_at": ISO8601DateFormatter().string(from: task.createdAt),
+            "updated_at": ISO8601DateFormatter().string(from: task.updatedAt),
+            "needs_attention": taskNeedsAttention(task),
+            "is_stale": isTaskStale(task)
+        ]
+        if let startedAt = task.startedAt {
+            dict["started_at"] = ISO8601DateFormatter().string(from: startedAt)
+        }
+        if let completedAt = task.completedAt {
+            dict["completed_at"] = ISO8601DateFormatter().string(from: completedAt)
+        }
+        if let lastProgressAt = task.lastProgressAt {
+            dict["last_progress_at"] = ISO8601DateFormatter().string(from: lastProgressAt)
+            dict["stale_seconds"] = max(0, Int(Date().timeIntervalSince(lastProgressAt)))
+        } else {
+            dict["stale_seconds"] = NSNull()
+        }
+        return dict
+    }
+
+    func messageDictionary(_ message: TeamMessage) -> [String: Any] {
+        [
+            "id": message.id,
+            "from": message.from,
+            "type": message.type,
+            "content": message.content,
+            "timestamp": ISO8601DateFormatter().string(from: message.timestamp)
+        ]
+    }
+
+    private func normalizedMessageType(_ type: String) -> String {
+        switch type.lowercased() {
+        case "note", "progress", "blocked", "review_ready", "error", "report":
+            return type.lowercased()
+        case "complete":
+            return "report"
+        default:
+            return "note"
+        }
+    }
+
+    private func normalizedTaskStatus(_ status: String) -> String {
+        switch status.lowercased() {
+        case "pending":
+            return "queued"
+        case "done":
+            return "completed"
+        case "review":
+            return "review_ready"
+        case "queued", "assigned", "in_progress", "blocked", "review_ready", "completed", "failed", "abandoned":
+            return status.lowercased()
+        default:
+            return status.lowercased()
+        }
+    }
+
+    private func heartbeatAgeSeconds(teamName: String, agentName: String) -> Int? {
+        guard let heartbeat = heartbeats[teamName]?[agentName] else { return nil }
+        return max(0, Int(Date().timeIntervalSince(heartbeat.at)))
+    }
+
+    private func isHeartbeatStale(_ heartbeat: (at: Date, summary: String?)) -> Bool {
+        Date().timeIntervalSince(heartbeat.at) >= staleHeartbeatThreshold
+    }
+
+    func agentState(teamName: String, agentName: String) -> String {
+        agentRuntimeState(teamName: teamName, agentName: agentName)
+    }
+
+    private func agentRuntimeState(teamName: String, agentName: String) -> String {
+        guard let task = activeTask(for: teamName, agentName: agentName) else { return "idle" }
+        switch task.status {
+        case "blocked":
+            return "blocked"
+        case "review_ready":
+            return "review_ready"
+        case "failed":
+            return "error"
+        case "queued", "assigned":
+            return "idle"
+        default:
+            return "running"
+        }
+    }
+
+    private func activeTask(for teamName: String, agentName: String) -> TeamTask? {
+        taskBoards[teamName, default: []]
+            .filter { $0.assignee == agentName && !isTerminalTaskStatus($0.status) }
+            .sorted { $0.updatedAt > $1.updatedAt }
+            .first
+    }
+
+    private func isTerminalTaskStatus(_ status: String) -> Bool {
+        ["completed", "failed", "abandoned"].contains(status)
+    }
+
+    private func taskNeedsAttention(_ task: TeamTask) -> Bool {
+        ["blocked", "review_ready", "failed"].contains(task.status) || isTaskStale(task)
+    }
+
+    private func isTaskStale(_ task: TeamTask) -> Bool {
+        staleAgeSeconds(for: task, now: Date()) != nil
+    }
+
+    private func staleAgeSeconds(for task: TeamTask, now: Date) -> Int? {
+        guard !isTerminalTaskStatus(task.status) else { return nil }
+        let anchor = task.lastProgressAt ?? task.startedAt ?? task.updatedAt
+        let age = Int(now.timeIntervalSince(anchor))
+        return age >= Int(staleTaskThreshold) ? age : nil
+    }
+}
+
+private extension String {
+    var nilIfBlank: String? {
+        let trimmed = trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? nil : trimmed
     }
 }
