@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""cmux Team Agent CLI — Python port of team.sh
+"""cmux Team Agent CLI
 
 Usage:
     ./scripts/team.py create [N] [--claude-leader]
