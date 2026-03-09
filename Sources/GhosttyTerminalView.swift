@@ -1992,7 +1992,7 @@ final class TerminalSurface: Identifiable, ObservableObject {
     /// Unlike sendSyntheticKeyPress (which creates an NSEvent and requires the view to be
     /// in a window), this works even when the surface view is not attached to a window —
     /// e.g. when the panel is in a non-active tab.
-    func sendSurfaceKeyPress(keycode: UInt16) {
+    func sendSurfaceKeyPress(keycode: UInt16, text: String? = nil) {
         guard let surface = surface else { return }
         var keyEvent = ghostty_input_key_s()
         keyEvent.action = GHOSTTY_ACTION_PRESS
@@ -2001,8 +2001,15 @@ final class TerminalSurface: Identifiable, ObservableObject {
         keyEvent.consumed_mods = GHOSTTY_MODS_NONE
         keyEvent.unshifted_codepoint = 0
         keyEvent.composing = false
-        keyEvent.text = nil
-        _ = ghostty_surface_key(surface, keyEvent)
+        if let text {
+            text.withCString { ptr in
+                keyEvent.text = ptr
+                _ = ghostty_surface_key(surface, keyEvent)
+            }
+        } else {
+            keyEvent.text = nil
+            _ = ghostty_surface_key(surface, keyEvent)
+        }
     }
 
     /// Send text as key events through the ghostty surface API.
@@ -2032,16 +2039,16 @@ final class TerminalSurface: Identifiable, ObservableObject {
             switch scalar.value {
             case 0x0A, 0x0D:
                 flush()
-                sendSurfaceKeyPress(keycode: 0x24) // kVK_Return
+                sendSurfaceKeyPress(keycode: 0x24, text: "\r") // kVK_Return
             case 0x09:
                 flush()
-                sendSurfaceKeyPress(keycode: 0x30) // kVK_Tab
+                sendSurfaceKeyPress(keycode: 0x30, text: "\t") // kVK_Tab
             case 0x1B:
                 flush()
-                sendSurfaceKeyPress(keycode: 0x35) // kVK_Escape
+                sendSurfaceKeyPress(keycode: 0x35, text: "\u{1b}") // kVK_Escape
             case 0x7F:
                 flush()
-                sendSurfaceKeyPress(keycode: 0x33) // kVK_Delete
+                sendSurfaceKeyPress(keycode: 0x33, text: "\u{7f}") // kVK_Delete
             default:
                 buffered.unicodeScalars.append(scalar)
             }
