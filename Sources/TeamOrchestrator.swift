@@ -266,7 +266,6 @@ final class TeamOrchestrator {
             let agentCli = agent.cli.isEmpty ? "claude" : agent.cli
             let cliPath = cliPaths[agentCli]!
             let agentCommand: String
-            var kiroInitialPrompt: String? = nil
             switch agentCli {
             case "kiro":
                 agentCommand = buildKiroCommand(
@@ -275,13 +274,9 @@ final class TeamOrchestrator {
                     teamName: name,
                     model: agent.model
                 )
-                // Build initial prompt to send after kiro-cli starts interactively
-                var prompt = "You are agent '\(agent.name)' on team '\(name)'. "
-                prompt += "Use the CMUX_SOCKET environment variable to communicate with the team leader via scripts/team.py. "
-                if !agent.instructions.isEmpty {
-                    prompt += agent.instructions
-                }
-                kiroInitialPrompt = prompt
+                // Do NOT auto-send initial prompt — kiro-cli takes 5+ seconds
+                // for MCP server initialization. The leader sends instructions
+                // via team.py send when the agent is ready.
             default:
                 agentCommand = buildClaudeCommand(
                     claudePath: cliPath,
@@ -295,7 +290,6 @@ final class TeamOrchestrator {
                     instructions: agent.instructions
                 )
             }
-            // Wrap so the terminal stays open (drops to shell) if the CLI exits.
             // Wrap so the terminal stays open (drops to shell) if the CLI exits.
             let shellCommand = "\(agentCommand); exec $SHELL"
             // Select the right environment: kiro agents don't need CLAUDECODE
@@ -357,26 +351,6 @@ final class TeamOrchestrator {
                 worktreeBranch: wtBranch
             )
             members.append(member)
-
-            // Kiro agents: send initial prompt after a delay to let the CLI start
-            if let prompt = kiroInitialPrompt {
-                let capturedPanelId = panelId
-                let capturedWsId = workspace.id
-                DispatchQueue.main.asyncAfter(deadline: .now() + 3.0) { [weak self] in
-                    guard let self else { return }
-                    // Find the panel and send the prompt as typed input
-                    if let ws = tabManager.tabs.first(where: { $0.id == capturedWsId }),
-                       let panel = ws.terminalPanel(for: capturedPanelId) {
-                        panel.sendInputText(prompt)
-                        panel.surface.forceRefresh()
-                        // Send Return after a short delay
-                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
-                            panel.sendInputText("\n")
-                            panel.surface.forceRefresh()
-                        }
-                    }
-                }
-            }
         }
 
         let team = Team(
@@ -428,7 +402,8 @@ final class TeamOrchestrator {
         panel.surface.forceRefresh()
 
         // Delay Return to give the TUI time to process the text input.
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+        // 0.3s works for both Claude Code and kiro-cli TUIs.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
             panel.sendInputText("\n")
             panel.surface.forceRefresh()
         }
