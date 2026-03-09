@@ -615,26 +615,18 @@ final class TeamOrchestrator {
     private func sendTextToPanel(workspaceId: UUID, panelId: UUID, text: String, tabManager: TabManager) -> Bool {
         guard let workspace = tabManager.tabs.first(where: { $0.id == workspaceId }) else { return false }
         guard let panel = workspace.terminalPanel(for: panelId) else { return false }
-        // Strip trailing newlines — we append \n to trigger Return via key events.
         let trimmed = text.replacingOccurrences(of: "[\\r\\n]+$", with: "", options: .regularExpression)
         guard !trimmed.isEmpty else { return true }
 
-        // Send text first, then Return after a short delay.
-        // Sending text + Return synchronously in one call causes a race condition
-        // where Claude Code TUI may not have processed the text input before the
-        // Return key event arrives, causing the Return to be swallowed.
-        panel.sendInputText(trimmed)
+        // Direct pty write — text + newline in a single atomic call.
+        // Unlike sendInputText (key simulation + delayed Enter), this avoids
+        // race conditions in multi-turn scenarios where delayed \n events
+        // from previous turns can overlap with new text input.
+        panel.sendText(trimmed + "\n")
         panel.surface.forceRefresh()
 
-        // Delay Return to give the TUI time to process the text input.
-        // 0.3s works for both Claude Code and kiro-cli TUIs.
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
-            panel.sendInputText("\n")
-            panel.surface.forceRefresh()
-        }
-
         #if DEBUG
-        dlog("[team.sendTextToPanel] sendInputText textLen=\(trimmed.count) text=\(trimmed.prefix(80).debugDescription)")
+        dlog("[team.sendTextToPanel] sendText textLen=\(trimmed.count) text=\(trimmed.prefix(80).debugDescription)")
         #endif
         return true
     }
