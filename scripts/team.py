@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""cmux Team Agent CLI
+"""term-mesh Team Agent CLI
 
 Usage:
     ./scripts/team.py create [N] [--claude-leader] [--kiro agent1,agent2] [--codex agent1] [--gemini agent2]
@@ -22,10 +22,10 @@ Usage:
     ./scripts/team.py task clear
 
 Environment:
-    CMUX_SOCKET  — socket path (default: auto-detect)
-    CMUX_TEAM    — team name (default: live-team)
-    CMUX_WORKDIR — working directory
-    CMUX_AGENT_NAME — agent name (for report/msg send)
+    TERMMESH_SOCKET  — socket path (default: auto-detect)
+    TERMMESH_TEAM    — team name (default: live-team)
+    TERMMESH_WORKDIR — working directory
+    TERMMESH_AGENT_NAME — agent name (for report/msg send)
 """
 
 from __future__ import annotations
@@ -41,22 +41,22 @@ from pathlib import Path
 
 # ── Defaults ──────────────────────────────────────────────────────────
 
-TEAM = os.environ.get("CMUX_TEAM", "live-team")
-WORKDIR = os.environ.get("CMUX_WORKDIR", str(Path.home() / "work/project/cmux"))
-AGENT_NAME = os.environ.get("CMUX_AGENT_NAME", "")
+TEAM = os.environ.get("TERMMESH_TEAM", os.environ.get("CMUX_TEAM", "live-team"))
+WORKDIR = os.environ.get("TERMMESH_WORKDIR", os.environ.get("CMUX_WORKDIR", str(Path.home() / "work/project/term-mesh")))
+AGENT_NAME = os.environ.get("TERMMESH_AGENT_NAME", os.environ.get("CMUX_AGENT_NAME", ""))
 
 DEFAULT_AGENT_NAMES = ["explorer", "executor", "reviewer", "debugger", "writer", "tester"]
 DEFAULT_AGENT_COLORS = ["green", "blue", "yellow", "magenta", "cyan", "red"]
 
 REPORT_SUFFIX = (
     '\n\n[IMPORTANT] When you finish this task, you MUST run this command to report your result:\n'
-    'CMUX_AGENT_NAME={agent} ./scripts/team.py report \'<one-paragraph summary of your result>\''
+    'TERMMESH_AGENT_NAME={agent} ./scripts/team.py report \'<one-paragraph summary of your result>\''
 )
 
 AGENT_INIT_PROMPT = (
-    'You are a team agent named "{agent}" in a cmux multi-agent team. '
+    'You are a team agent named "{agent}" in a term-mesh multi-agent team. '
     'When you complete any task assigned by the leader, you MUST report your result by running:\n'
-    'CMUX_AGENT_NAME={agent} ./scripts/team.py report \'<summary of your result>\'\n'
+    'TERMMESH_AGENT_NAME={agent} ./scripts/team.py report \'<summary of your result>\'\n'
     'This allows the leader to detect task completion automatically. '
     'Always include a concise but complete summary in your report. '
     'Respond with "Agent {agent} ready." to confirm.'
@@ -78,13 +78,16 @@ def socket_ok(path: str) -> bool:
 
 
 def detect_socket() -> str:
-    """Auto-detect a connectable cmux socket."""
-    env_socket = os.environ.get("CMUX_SOCKET", "")
+    """Auto-detect a connectable term-mesh socket."""
+    env_socket = os.environ.get("TERMMESH_SOCKET", os.environ.get("CMUX_SOCKET", ""))
     if env_socket and socket_ok(env_socket):
         return env_socket
 
     candidates = sorted(
-        glob.glob("/tmp/cmux.sock")
+        glob.glob("/tmp/term-mesh.sock")
+        + glob.glob("/tmp/term-mesh-debug.sock")
+        + glob.glob("/tmp/term-mesh-debug-*.sock")
+        + glob.glob("/tmp/cmux.sock")
         + glob.glob("/tmp/cmux-debug.sock")
         + glob.glob("/tmp/cmux-debug-*.sock")
     )
@@ -92,11 +95,11 @@ def detect_socket() -> str:
         if os.path.exists(c) and socket_ok(c):
             return c
 
-    print("Error: No connectable cmux socket found.", file=sys.stderr)
-    print("Start the app first or set CMUX_SOCKET.", file=sys.stderr)
+    print("Error: No connectable term-mesh socket found.", file=sys.stderr)
+    print("Start the app first or set TERMMESH_SOCKET.", file=sys.stderr)
     print("", file=sys.stderr)
     print("Available sockets:", file=sys.stderr)
-    avail = glob.glob("/tmp/cmux*.sock")
+    avail = glob.glob("/tmp/term-mesh*.sock") + glob.glob("/tmp/cmux*.sock")
     if avail:
         for a in avail:
             print(f"  {a}", file=sys.stderr)
@@ -362,8 +365,8 @@ def cmd_wait(sock: str, args: argparse.Namespace) -> None:
 def cmd_report(sock: str, args: argparse.Namespace) -> None:
     agent = AGENT_NAME
     if not agent:
-        print("Error: CMUX_AGENT_NAME not set.", file=sys.stderr)
-        print("Use: CMUX_AGENT_NAME=explorer team.py report ...", file=sys.stderr)
+        print("Error: TERMMESH_AGENT_NAME not set.", file=sys.stderr)
+        print("Use: TERMMESH_AGENT_NAME=explorer team.py report ...", file=sys.stderr)
         sys.exit(1)
     r = rpc(sock, "team.report", {
         "team_name": TEAM,
@@ -466,7 +469,7 @@ def cmd_task_clear(sock: str, _args: argparse.Namespace) -> None:
 # ── CLI parser ────────────────────────────────────────────────────────
 
 def build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(prog="team.py", description="cmux Team Agent CLI")
+    p = argparse.ArgumentParser(prog="team.py", description="term-mesh Team Agent CLI")
     sub = p.add_subparsers(dest="command", help="command")
 
     # create
@@ -597,10 +600,10 @@ def main() -> None:
     if not args.command:
         parser.print_help()
         print(f"\nEnvironment:")
-        print(f"  CMUX_SOCKET={os.environ.get('CMUX_SOCKET', '(auto-detect)')}")
-        print(f"  CMUX_TEAM={TEAM}")
-        print(f"  CMUX_WORKDIR={WORKDIR}")
-        print(f"  CMUX_AGENT_NAME={AGENT_NAME or '(not set)'}")
+        print(f"  TERMMESH_SOCKET={os.environ.get('TERMMESH_SOCKET', os.environ.get('CMUX_SOCKET', '(auto-detect)'))}")
+        print(f"  TERMMESH_TEAM={TEAM}")
+        print(f"  TERMMESH_WORKDIR={WORKDIR}")
+        print(f"  TERMMESH_AGENT_NAME={AGENT_NAME or '(not set)'}")
         return
 
     sock = detect_socket()

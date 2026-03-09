@@ -8,17 +8,17 @@ final class BrowserPaneNavigationKeybindUITests: XCTestCase {
     override func setUp() {
         super.setUp()
         continueAfterFailure = false
-        dataPath = "/tmp/cmux-ui-test-goto-split-\(UUID().uuidString).json"
+        dataPath = "/tmp/term-mesh-ui-test-goto-split-\(UUID().uuidString).json"
         try? FileManager.default.removeItem(atPath: dataPath)
-        socketPath = "/tmp/cmux-ui-test-socket-\(UUID().uuidString).sock"
+        socketPath = "/tmp/term-mesh-ui-test-socket-\(UUID().uuidString).sock"
         try? FileManager.default.removeItem(atPath: socketPath)
     }
 
     func testCmdCtrlHMovesLeftWhenWebViewFocused() {
         let app = XCUIApplication()
-        app.launchEnvironment["CMUX_UI_TEST_GOTO_SPLIT_SETUP"] = "1"
-        app.launchEnvironment["CMUX_UI_TEST_GOTO_SPLIT_PATH"] = dataPath
-        app.launchEnvironment["CMUX_SOCKET_PATH"] = socketPath
+        app.launchEnvironment["TERMMESH_UI_TEST_GOTO_SPLIT_SETUP"] = "1"
+        app.launchEnvironment["TERMMESH_UI_TEST_GOTO_SPLIT_PATH"] = dataPath
+        app.launchEnvironment["TERMMESH_SOCKET_PATH"] = socketPath
         app.launch()
         app.activate()
 
@@ -91,10 +91,10 @@ final class BrowserPaneNavigationKeybindUITests: XCTestCase {
         }
 
         let app = XCUIApplication()
-        app.launchEnvironment["CMUX_UI_TEST_GOTO_SPLIT_SETUP"] = "1"
-        app.launchEnvironment["CMUX_UI_TEST_GOTO_SPLIT_PATH"] = dataPath
-        app.launchEnvironment["CMUX_SOCKET_PATH"] = socketPath
-        app.launchEnvironment["CMUX_UI_TEST_GOTO_SPLIT_USE_GHOSTTY_CONFIG"] = "1"
+        app.launchEnvironment["TERMMESH_UI_TEST_GOTO_SPLIT_SETUP"] = "1"
+        app.launchEnvironment["TERMMESH_UI_TEST_GOTO_SPLIT_PATH"] = dataPath
+        app.launchEnvironment["TERMMESH_SOCKET_PATH"] = socketPath
+        app.launchEnvironment["TERMMESH_UI_TEST_GOTO_SPLIT_USE_GHOSTTY_CONFIG"] = "1"
         app.launch()
         app.activate()
 
@@ -129,9 +129,9 @@ final class BrowserPaneNavigationKeybindUITests: XCTestCase {
 
     func testEscapeLeavesOmnibarAndFocusesWebView() {
         let app = XCUIApplication()
-        app.launchEnvironment["CMUX_SOCKET_PATH"] = socketPath
-        app.launchEnvironment["CMUX_UI_TEST_GOTO_SPLIT_SETUP"] = "1"
-        app.launchEnvironment["CMUX_UI_TEST_GOTO_SPLIT_PATH"] = dataPath
+        app.launchEnvironment["TERMMESH_SOCKET_PATH"] = socketPath
+        app.launchEnvironment["TERMMESH_UI_TEST_GOTO_SPLIT_SETUP"] = "1"
+        app.launchEnvironment["TERMMESH_UI_TEST_GOTO_SPLIT_PATH"] = dataPath
         app.launch()
         app.activate()
 
@@ -173,9 +173,9 @@ final class BrowserPaneNavigationKeybindUITests: XCTestCase {
 
     func testCmdLOpensBrowserWhenTerminalFocused() {
         let app = XCUIApplication()
-        app.launchEnvironment["CMUX_SOCKET_PATH"] = socketPath
-        app.launchEnvironment["CMUX_UI_TEST_GOTO_SPLIT_SETUP"] = "1"
-        app.launchEnvironment["CMUX_UI_TEST_GOTO_SPLIT_PATH"] = dataPath
+        app.launchEnvironment["TERMMESH_SOCKET_PATH"] = socketPath
+        app.launchEnvironment["TERMMESH_UI_TEST_GOTO_SPLIT_SETUP"] = "1"
+        app.launchEnvironment["TERMMESH_UI_TEST_GOTO_SPLIT_PATH"] = dataPath
         app.launch()
         app.activate()
 
@@ -222,9 +222,9 @@ final class BrowserPaneNavigationKeybindUITests: XCTestCase {
 
     func testClickingOmnibarFocusesBrowserPane() {
         let app = XCUIApplication()
-        app.launchEnvironment["CMUX_SOCKET_PATH"] = socketPath
-        app.launchEnvironment["CMUX_UI_TEST_GOTO_SPLIT_SETUP"] = "1"
-        app.launchEnvironment["CMUX_UI_TEST_GOTO_SPLIT_PATH"] = dataPath
+        app.launchEnvironment["TERMMESH_SOCKET_PATH"] = socketPath
+        app.launchEnvironment["TERMMESH_UI_TEST_GOTO_SPLIT_SETUP"] = "1"
+        app.launchEnvironment["TERMMESH_UI_TEST_GOTO_SPLIT_PATH"] = dataPath
         app.launch()
         app.activate()
 
@@ -277,9 +277,9 @@ final class BrowserPaneNavigationKeybindUITests: XCTestCase {
 
     func testCmdDSplitsRightWhenWebViewFocused() {
         let app = XCUIApplication()
-        app.launchEnvironment["CMUX_SOCKET_PATH"] = socketPath
-        app.launchEnvironment["CMUX_UI_TEST_GOTO_SPLIT_SETUP"] = "1"
-        app.launchEnvironment["CMUX_UI_TEST_GOTO_SPLIT_PATH"] = dataPath
+        app.launchEnvironment["TERMMESH_SOCKET_PATH"] = socketPath
+        app.launchEnvironment["TERMMESH_UI_TEST_GOTO_SPLIT_SETUP"] = "1"
+        app.launchEnvironment["TERMMESH_UI_TEST_GOTO_SPLIT_PATH"] = dataPath
         app.launch()
         app.activate()
 
@@ -311,9 +311,9 @@ final class BrowserPaneNavigationKeybindUITests: XCTestCase {
 
     func testCmdShiftDSplitsDownWhenWebViewFocused() {
         let app = XCUIApplication()
-        app.launchEnvironment["CMUX_SOCKET_PATH"] = socketPath
-        app.launchEnvironment["CMUX_UI_TEST_GOTO_SPLIT_SETUP"] = "1"
-        app.launchEnvironment["CMUX_UI_TEST_GOTO_SPLIT_PATH"] = dataPath
+        app.launchEnvironment["TERMMESH_SOCKET_PATH"] = socketPath
+        app.launchEnvironment["TERMMESH_UI_TEST_GOTO_SPLIT_SETUP"] = "1"
+        app.launchEnvironment["TERMMESH_UI_TEST_GOTO_SPLIT_PATH"] = dataPath
         app.launch()
         app.activate()
 
@@ -345,9 +345,9 @@ final class BrowserPaneNavigationKeybindUITests: XCTestCase {
 
     func testCmdDSplitsRightWhenOmnibarFocused() {
         let app = XCUIApplication()
-        app.launchEnvironment["CMUX_SOCKET_PATH"] = socketPath
-        app.launchEnvironment["CMUX_UI_TEST_GOTO_SPLIT_SETUP"] = "1"
-        app.launchEnvironment["CMUX_UI_TEST_GOTO_SPLIT_PATH"] = dataPath
+        app.launchEnvironment["TERMMESH_SOCKET_PATH"] = socketPath
+        app.launchEnvironment["TERMMESH_UI_TEST_GOTO_SPLIT_SETUP"] = "1"
+        app.launchEnvironment["TERMMESH_UI_TEST_GOTO_SPLIT_PATH"] = dataPath
         app.launch()
         app.activate()
 
@@ -387,9 +387,9 @@ final class BrowserPaneNavigationKeybindUITests: XCTestCase {
 
     func testCmdShiftDSplitsDownWhenOmnibarFocused() {
         let app = XCUIApplication()
-        app.launchEnvironment["CMUX_SOCKET_PATH"] = socketPath
-        app.launchEnvironment["CMUX_UI_TEST_GOTO_SPLIT_SETUP"] = "1"
-        app.launchEnvironment["CMUX_UI_TEST_GOTO_SPLIT_PATH"] = dataPath
+        app.launchEnvironment["TERMMESH_SOCKET_PATH"] = socketPath
+        app.launchEnvironment["TERMMESH_UI_TEST_GOTO_SPLIT_SETUP"] = "1"
+        app.launchEnvironment["TERMMESH_UI_TEST_GOTO_SPLIT_PATH"] = dataPath
         app.launch()
         app.activate()
 

@@ -1,62 +1,62 @@
 # Changelog
 
-All notable changes to cmux are documented here.
+All notable changes to term-mesh are documented here.
 
 ## [0.60.0] - 2026-02-21
 
 ### Added
-- Tab context menu with rename, close, unread, and workspace actions ([#225](https://github.com/manaflow-ai/cmux/pull/225))
-- Cmd+Shift+T reopens closed browser panels ([#253](https://github.com/manaflow-ai/cmux/pull/253))
+- Tab context menu with rename, close, unread, and workspace actions ([#225](https://github.com/manaflow-ai/term-mesh/pull/225))
+- Cmd+Shift+T reopens closed browser panels ([#253](https://github.com/manaflow-ai/term-mesh/pull/253))
 - Vertical sidebar branch layout setting showing git branch and directory per pane
-- JavaScript alert/confirm/prompt dialogs in browser panel ([#237](https://github.com/manaflow-ai/cmux/pull/237))
-- File drag-and-drop and file input in browser panel ([#214](https://github.com/manaflow-ai/cmux/pull/214))
-- tmux-compatible command set with matrix tests ([#221](https://github.com/manaflow-ai/cmux/pull/221))
-- Pane resize divider control via CLI ([#223](https://github.com/manaflow-ai/cmux/pull/223))
-- Production read-screen capture APIs ([#219](https://github.com/manaflow-ai/cmux/pull/219))
-- Notification rings on terminal panes ([#132](https://github.com/manaflow-ai/cmux/pull/132))
-- Claude Code integration enabled by default ([#247](https://github.com/manaflow-ai/cmux/pull/247))
-- HTTP host allowlist for embedded browser with save and proceed flow ([#206](https://github.com/manaflow-ai/cmux/pull/206), [#203](https://github.com/manaflow-ai/cmux/pull/203))
-- Setting to disable workspace auto-reorder on notification ([#215](https://github.com/manaflow-ai/cmux/issues/205))
-- Browser panel mouse back/forward buttons and middle-click close ([#139](https://github.com/manaflow-ai/cmux/pull/139))
-- Browser DevTools shortcut wiring and persistence ([#117](https://github.com/manaflow-ai/cmux/pull/117))
-- CJK IME input support for Korean, Chinese, and Japanese ([#125](https://github.com/manaflow-ai/cmux/pull/125))
-- `--help` flag on CLI subcommands ([#128](https://github.com/manaflow-ai/cmux/pull/128))
-- `--command` flag for `new-workspace` CLI command ([#121](https://github.com/manaflow-ai/cmux/pull/121))
-- `rename-tab` socket command ([#260](https://github.com/manaflow-ai/cmux/pull/260))
-- Remap-aware bonsplit tooltips and browser split shortcuts ([#200](https://github.com/manaflow-ai/cmux/pull/200))
+- JavaScript alert/confirm/prompt dialogs in browser panel ([#237](https://github.com/manaflow-ai/term-mesh/pull/237))
+- File drag-and-drop and file input in browser panel ([#214](https://github.com/manaflow-ai/term-mesh/pull/214))
+- tmux-compatible command set with matrix tests ([#221](https://github.com/manaflow-ai/term-mesh/pull/221))
+- Pane resize divider control via CLI ([#223](https://github.com/manaflow-ai/term-mesh/pull/223))
+- Production read-screen capture APIs ([#219](https://github.com/manaflow-ai/term-mesh/pull/219))
+- Notification rings on terminal panes ([#132](https://github.com/manaflow-ai/term-mesh/pull/132))
+- Claude Code integration enabled by default ([#247](https://github.com/manaflow-ai/term-mesh/pull/247))
+- HTTP host allowlist for embedded browser with save and proceed flow ([#206](https://github.com/manaflow-ai/term-mesh/pull/206), [#203](https://github.com/manaflow-ai/term-mesh/pull/203))
+- Setting to disable workspace auto-reorder on notification ([#215](https://github.com/manaflow-ai/term-mesh/issues/205))
+- Browser panel mouse back/forward buttons and middle-click close ([#139](https://github.com/manaflow-ai/term-mesh/pull/139))
+- Browser DevTools shortcut wiring and persistence ([#117](https://github.com/manaflow-ai/term-mesh/pull/117))
+- CJK IME input support for Korean, Chinese, and Japanese ([#125](https://github.com/manaflow-ai/term-mesh/pull/125))
+- `--help` flag on CLI subcommands ([#128](https://github.com/manaflow-ai/term-mesh/pull/128))
+- `--command` flag for `new-workspace` CLI command ([#121](https://github.com/manaflow-ai/term-mesh/pull/121))
+- `rename-tab` socket command ([#260](https://github.com/manaflow-ai/term-mesh/pull/260))
+- Remap-aware bonsplit tooltips and browser split shortcuts ([#200](https://github.com/manaflow-ai/term-mesh/pull/200))
 
 ### Fixed
-- IME preedit anchor sizing ([#266](https://github.com/manaflow-ai/cmux/pull/266))
-- Cmd+Shift+T focus against deferred stale callbacks ([#267](https://github.com/manaflow-ai/cmux/pull/267))
-- Unknown Bonsplit tab context actions causing crash ([#264](https://github.com/manaflow-ai/cmux/pull/264))
-- Socket CLI commands stealing macOS app focus ([#260](https://github.com/manaflow-ai/cmux/pull/260))
-- CLI unix socket lag from main-thread blocking ([#259](https://github.com/manaflow-ai/cmux/pull/259))
-- Main-thread notification cascade causing hangs ([#232](https://github.com/manaflow-ai/cmux/pull/232))
-- Favicon out-of-sync during back/forward navigation ([#233](https://github.com/manaflow-ai/cmux/pull/233))
+- IME preedit anchor sizing ([#266](https://github.com/manaflow-ai/term-mesh/pull/266))
+- Cmd+Shift+T focus against deferred stale callbacks ([#267](https://github.com/manaflow-ai/term-mesh/pull/267))
+- Unknown Bonsplit tab context actions causing crash ([#264](https://github.com/manaflow-ai/term-mesh/pull/264))
+- Socket CLI commands stealing macOS app focus ([#260](https://github.com/manaflow-ai/term-mesh/pull/260))
+- CLI unix socket lag from main-thread blocking ([#259](https://github.com/manaflow-ai/term-mesh/pull/259))
+- Main-thread notification cascade causing hangs ([#232](https://github.com/manaflow-ai/term-mesh/pull/232))
+- Favicon out-of-sync during back/forward navigation ([#233](https://github.com/manaflow-ai/term-mesh/pull/233))
 - Stale sidebar git branch after closing a split
-- Browser download UX and crash path ([#235](https://github.com/manaflow-ai/cmux/pull/235))
-- Browser reopen focus across workspace switches ([#257](https://github.com/manaflow-ai/cmux/pull/257))
-- Mark Tab as Unread no-op on focused tab ([#249](https://github.com/manaflow-ai/cmux/pull/249))
-- Split dividers disappearing in tiny panes ([#250](https://github.com/manaflow-ai/cmux/pull/250))
-- Flaky browser download activity accounting ([#246](https://github.com/manaflow-ai/cmux/pull/246))
-- Drag overlay routing and terminal overlay regressions ([#218](https://github.com/manaflow-ai/cmux/pull/218))
+- Browser download UX and crash path ([#235](https://github.com/manaflow-ai/term-mesh/pull/235))
+- Browser reopen focus across workspace switches ([#257](https://github.com/manaflow-ai/term-mesh/pull/257))
+- Mark Tab as Unread no-op on focused tab ([#249](https://github.com/manaflow-ai/term-mesh/pull/249))
+- Split dividers disappearing in tiny panes ([#250](https://github.com/manaflow-ai/term-mesh/pull/250))
+- Flaky browser download activity accounting ([#246](https://github.com/manaflow-ai/term-mesh/pull/246))
+- Drag overlay routing and terminal overlay regressions ([#218](https://github.com/manaflow-ai/term-mesh/pull/218))
 - Initial bonsplit split animation flicker
-- Window top inset on new window creation ([#224](https://github.com/manaflow-ai/cmux/pull/224))
-- Cmd+Enter being routed as browser reload ([#213](https://github.com/manaflow-ai/cmux/pull/213))
-- Child-exit close for last-terminal workspaces ([#254](https://github.com/manaflow-ai/cmux/pull/254))
-- Sidebar resizer hitbox and cursor across portals ([#255](https://github.com/manaflow-ai/cmux/pull/255))
+- Window top inset on new window creation ([#224](https://github.com/manaflow-ai/term-mesh/pull/224))
+- Cmd+Enter being routed as browser reload ([#213](https://github.com/manaflow-ai/term-mesh/pull/213))
+- Child-exit close for last-terminal workspaces ([#254](https://github.com/manaflow-ai/term-mesh/pull/254))
+- Sidebar resizer hitbox and cursor across portals ([#255](https://github.com/manaflow-ai/term-mesh/pull/255))
 - Workspace-scoped tab action resolution
 - IDN host allowlist normalization
-- `setup.sh` cache rebuild and stale lock timeout ([#217](https://github.com/manaflow-ai/cmux/pull/217))
-- Inconsistent Tab/Workspace terminology in settings and menus ([#187](https://github.com/manaflow-ai/cmux/pull/187))
+- `setup.sh` cache rebuild and stale lock timeout ([#217](https://github.com/manaflow-ai/term-mesh/pull/217))
+- Inconsistent Tab/Workspace terminology in settings and menus ([#187](https://github.com/manaflow-ai/term-mesh/pull/187))
 
 ### Changed
-- CLI workspace commands now run off the main thread for better responsiveness ([#270](https://github.com/manaflow-ai/cmux/pull/270))
-- Remove border below titlebar ([#242](https://github.com/manaflow-ai/cmux/pull/242))
-- Slimmer browser omnibar with button hover/press states ([#271](https://github.com/manaflow-ai/cmux/pull/271))
-- Browser under-page background refreshes on theme updates ([#272](https://github.com/manaflow-ai/cmux/pull/272))
-- Command shortcut hints scoped to active window ([#226](https://github.com/manaflow-ai/cmux/pull/226))
-- Nightly and release assets are now immutable (no accidental overwrite) ([#268](https://github.com/manaflow-ai/cmux/pull/268), [#269](https://github.com/manaflow-ai/cmux/pull/269))
+- CLI workspace commands now run off the main thread for better responsiveness ([#270](https://github.com/manaflow-ai/term-mesh/pull/270))
+- Remove border below titlebar ([#242](https://github.com/manaflow-ai/term-mesh/pull/242))
+- Slimmer browser omnibar with button hover/press states ([#271](https://github.com/manaflow-ai/term-mesh/pull/271))
+- Browser under-page background refreshes on theme updates ([#272](https://github.com/manaflow-ai/term-mesh/pull/272))
+- Command shortcut hints scoped to active window ([#226](https://github.com/manaflow-ai/term-mesh/pull/226))
+- Nightly and release assets are now immutable (no accidental overwrite) ([#268](https://github.com/manaflow-ai/term-mesh/pull/268), [#269](https://github.com/manaflow-ai/term-mesh/pull/269))
 
 ## [0.59.0] - 2026-02-19
 
@@ -98,7 +98,7 @@ _No user-facing changes._
 ## [0.53.0] - 2026-02-18
 
 ### Changed
-- CLI commands are now workspace-relative: commands use `CMUX_WORKSPACE_ID` environment variable so background agents target their own workspace instead of the user's focused workspace
+- CLI commands are now workspace-relative: commands use `TERMMESH_WORKSPACE_ID` environment variable so background agents target their own workspace instead of the user's focused workspace
 - Remove all index-based CLI APIs in favor of short ID refs (`surface:1`, `pane:2`, `workspace:3`)
 - CLI `send` and `send-key` support `--workspace` and `--surface` flags for explicit targeting
 - CLI escape sequences (`\n`, `\r`, `\t`) in `send` payloads are now handled correctly
@@ -108,7 +108,7 @@ _No user-facing changes._
 - Fix background agents sending input to the wrong workspace
 - Fix `close-surface` rejecting cross-workspace surface refs
 - Fix malformed surface/pane/workspace/window handles passing through without error
-- Fix `--window` flag being overridden by `CMUX_WORKSPACE_ID` environment variable
+- Fix `--window` flag being overridden by `TERMMESH_WORKSPACE_ID` environment variable
 
 ## [0.52.0] - 2026-02-18
 
@@ -224,7 +224,7 @@ _No user-facing changes._
 - localhost and 127.0.0.1 URLs not resolving correctly in the browser panel
 
 ### Changed
-- `browser open` now targets the caller's workspace by default via CMUX_WORKSPACE_ID
+- `browser open` now targets the caller's workspace by default via TERMMESH_WORKSPACE_ID
 
 ## [0.31.0] - 2026-02-15
 
@@ -306,12 +306,12 @@ _No user-facing changes._
 ## [0.24.0] - 2026-02-09
 
 ### Changed
-- Update bundle identifier to `com.cmuxterm.app` for consistency
+- Update bundle identifier to `com.termmesh.app` for consistency
 
 ## [0.23.0] - 2026-02-09
 
 ### Changed
-- Rename app to cmux — new app name, socket paths, Homebrew tap, and CLI binary name (bundle ID remains `com.cmuxterm.app` for Sparkle update continuity)
+- Rename app to cmux — new app name, socket paths, Homebrew tap, and CLI binary name (bundle ID remains `com.termmesh.app` for Sparkle update continuity)
 - Sidebar now shows tab status as text instead of colored dots, with instant git HEAD change detection
 
 ### Fixed
@@ -398,7 +398,7 @@ _No user-facing changes._
 ### Added
 - Sentry SDK for crash reporting
 - Documentation site with Fumadocs
-- Homebrew installation support (`brew install --cask cmux`)
+- Homebrew installation support (`brew install --cask term-mesh`)
 - Auto-update Homebrew cask on release
 
 ### Fixed
@@ -468,7 +468,7 @@ _No user-facing changes._
 - Update UI error details and pill visibility
 
 ### Changed
-- Renamed app to cmux
+- Renamed app to term-mesh
 - Improved CI UI test stability
 
 ## [0.1.0] - 2025-01-28

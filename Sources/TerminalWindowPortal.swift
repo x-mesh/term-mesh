@@ -4,8 +4,8 @@ import ObjectiveC
 import Bonsplit
 #endif
 
-private var cmuxWindowTerminalPortalKey: UInt8 = 0
-private var cmuxWindowTerminalPortalCloseObserverKey: UInt8 = 0
+private var termMeshWindowTerminalPortalKey: UInt8 = 0
+private var termMeshWindowTerminalPortalCloseObserverKey: UInt8 = 0
 
 #if DEBUG
 private func portalDebugToken(_ view: NSView?) -> String {
@@ -1361,7 +1361,7 @@ enum TerminalWindowPortalRegistry {
     private static var hostedToWindowId: [ObjectIdentifier: ObjectIdentifier] = [:]
 
     private static func installWindowCloseObserverIfNeeded(for window: NSWindow) {
-        guard objc_getAssociatedObject(window, &cmuxWindowTerminalPortalCloseObserverKey) == nil else { return }
+        guard objc_getAssociatedObject(window, &termMeshWindowTerminalPortalCloseObserverKey) == nil else { return }
         let windowId = ObjectIdentifier(window)
         let observer = NotificationCenter.default.addObserver(
             forName: NSWindow.willCloseNotification,
@@ -1378,7 +1378,7 @@ enum TerminalWindowPortalRegistry {
         }
         objc_setAssociatedObject(
             window,
-            &cmuxWindowTerminalPortalCloseObserverKey,
+            &termMeshWindowTerminalPortalCloseObserverKey,
             observer,
             .OBJC_ASSOCIATION_RETAIN_NONATOMIC
         )
@@ -1395,11 +1395,11 @@ enum TerminalWindowPortalRegistry {
         hostedToWindowId = hostedToWindowId.filter { $0.value != windowId }
 
         guard let window else { return }
-        if let observer = objc_getAssociatedObject(window, &cmuxWindowTerminalPortalCloseObserverKey) {
+        if let observer = objc_getAssociatedObject(window, &termMeshWindowTerminalPortalCloseObserverKey) {
             NotificationCenter.default.removeObserver(observer)
         }
-        objc_setAssociatedObject(window, &cmuxWindowTerminalPortalCloseObserverKey, nil, .OBJC_ASSOCIATION_RETAIN_NONATOMIC)
-        objc_setAssociatedObject(window, &cmuxWindowTerminalPortalKey, nil, .OBJC_ASSOCIATION_RETAIN)
+        objc_setAssociatedObject(window, &termMeshWindowTerminalPortalCloseObserverKey, nil, .OBJC_ASSOCIATION_RETAIN_NONATOMIC)
+        objc_setAssociatedObject(window, &termMeshWindowTerminalPortalKey, nil, .OBJC_ASSOCIATION_RETAIN)
     }
 
     private static func pruneHostedMappings(for windowId: ObjectIdentifier, validHostedIds: Set<ObjectIdentifier>) {
@@ -1409,14 +1409,14 @@ enum TerminalWindowPortalRegistry {
     }
 
     private static func portal(for window: NSWindow) -> WindowTerminalPortal {
-        if let existing = objc_getAssociatedObject(window, &cmuxWindowTerminalPortalKey) as? WindowTerminalPortal {
+        if let existing = objc_getAssociatedObject(window, &termMeshWindowTerminalPortalKey) as? WindowTerminalPortal {
             portalsByWindowId[ObjectIdentifier(window)] = existing
             installWindowCloseObserverIfNeeded(for: window)
             return existing
         }
 
         let portal = WindowTerminalPortal(window: window)
-        objc_setAssociatedObject(window, &cmuxWindowTerminalPortalKey, portal, .OBJC_ASSOCIATION_RETAIN)
+        objc_setAssociatedObject(window, &termMeshWindowTerminalPortalKey, portal, .OBJC_ASSOCIATION_RETAIN)
         portalsByWindowId[ObjectIdentifier(window)] = portal
         installWindowCloseObserverIfNeeded(for: window)
         return portal

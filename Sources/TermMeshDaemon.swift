@@ -516,7 +516,7 @@ final class TermMeshDaemon: ObservableObject {
 
     private func daemonBinaryPath() -> String? {
         // Option 1: Built in the daemon/ directory (development)
-        let devPath = (ProcessInfo.processInfo.environment["CMUX_PROJECT_DIR"] ?? "")
+        let devPath = (termMeshEnv("PROJECT_DIR") ?? "")
             + "/daemon/target/debug/term-meshd"
         if FileManager.default.fileExists(atPath: devPath) { return devPath }
 

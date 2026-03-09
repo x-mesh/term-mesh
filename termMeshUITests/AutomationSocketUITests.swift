@@ -18,7 +18,7 @@ final class AutomationSocketUITests: XCTestCase {
     func testSocketToggleDisablesAndEnables() {
         let app = XCUIApplication()
         app.launchArguments += ["-\(modeKey)", "cmuxOnly"]
-        app.launchEnvironment["CMUX_SOCKET_PATH"] = socketPath
+        app.launchEnvironment["TERMMESH_SOCKET_PATH"] = socketPath
         app.launch()
         app.activate()
 
@@ -34,7 +34,7 @@ final class AutomationSocketUITests: XCTestCase {
     func testSocketDisabledWhenSettingOff() {
         let app = XCUIApplication()
         app.launchArguments += ["-\(modeKey)", "off"]
-        app.launchEnvironment["CMUX_SOCKET_PATH"] = socketPath
+        app.launchEnvironment["TERMMESH_SOCKET_PATH"] = socketPath
         app.launch()
         app.activate()
 

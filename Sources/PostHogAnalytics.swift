@@ -9,7 +9,7 @@ final class PostHogAnalytics {
     // The PostHog project API key is intentionally embedded in the app (it's a public key).
     private let apiKey = "phc_opOVu7oFzR9wD3I6ZahFGOV2h3mqGpl5EHyQvmHciDP"
 
-    // PostHog Cloud US default (matches other cmux properties).
+    // PostHog Cloud US default (matches other term-mesh properties).
     private let host = "https://us.i.posthog.com"
 
     private let lastActiveDayUTCKey = "posthog.lastActiveDayUTC"
@@ -20,7 +20,7 @@ final class PostHogAnalytics {
     private var isEnabled: Bool {
 #if DEBUG
         // Avoid polluting production analytics while iterating locally.
-        return ProcessInfo.processInfo.environment["CMUX_POSTHOG_ENABLE"] == "1"
+        return termMeshEnv("POSTHOG_ENABLE") == "1"
 #else
         return !apiKey.isEmpty && apiKey != "REPLACE_WITH_POSTHOG_PUBLIC_KEY"
 #endif
@@ -34,7 +34,7 @@ final class PostHogAnalytics {
         config.captureApplicationLifecycleEvents = false
         config.captureScreenViews = false
 #if DEBUG
-        config.debug = ProcessInfo.processInfo.environment["CMUX_POSTHOG_DEBUG"] == "1"
+        config.debug = termMeshEnv("POSTHOG_DEBUG") == "1"
 #endif
 
         PostHogSDK.shared.setup(config)
@@ -70,7 +70,7 @@ final class PostHogAnalytics {
         defaults.set(today, forKey: lastActiveDayUTCKey)
 
         PostHogSDK.shared.capture(
-            "cmux_daily_active",
+            "term_mesh_daily_active",
             properties: Self.dailyActiveProperties(
                 dayUTC: today,
                 reason: reason,
@@ -97,7 +97,7 @@ final class PostHogAnalytics {
     }
 
     nonisolated static func superProperties(infoDictionary: [String: Any]) -> [String: Any] {
-        var properties: [String: Any] = ["platform": "cmuxterm"]
+        var properties: [String: Any] = ["platform": "termmesh"]
         properties.merge(versionProperties(infoDictionary: infoDictionary)) { _, new in new }
         return properties
     }

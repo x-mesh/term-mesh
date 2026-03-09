@@ -2,10 +2,10 @@ import XCTest
 import Foundation
 import AppKit
 
-#if canImport(cmux_DEV)
-@testable import cmux_DEV
-#elseif canImport(cmux)
-@testable import cmux
+#if canImport(term_mesh_DEV)
+@testable import term_mesh_DEV
+#elseif canImport(term_mesh)
+@testable import term_mesh
 #endif
 
 /// Regression test: ensures UpdatePill is never gated behind #if DEBUG in production code paths.

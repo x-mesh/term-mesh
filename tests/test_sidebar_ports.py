@@ -22,7 +22,7 @@ from pathlib import Path
 # Add the directory containing cmux.py to the path
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from cmux import cmux, cmuxError  # noqa: E402
+from termmesh import termmesh, termmeshError  # noqa: E402
 
 
 # Historically, ports detection only checked a small allowlist. This test

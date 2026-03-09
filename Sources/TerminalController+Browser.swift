@@ -151,19 +151,19 @@ extension TerminalController {
         let scriptLiteral = v2JSONLiteral(script)
         let wrapped = """
         (() => {
-          let __cmuxDoc = document;
+          let __termMeshDoc = document;
           try {
-            const __cmuxFrame = document.querySelector(\(selectorLiteral));
-            if (__cmuxFrame && __cmuxFrame.contentDocument) {
-              __cmuxDoc = __cmuxFrame.contentDocument;
+            const __termMeshFrame = document.querySelector(\(selectorLiteral));
+            if (__termMeshFrame && __termMeshFrame.contentDocument) {
+              __termMeshDoc = __termMeshFrame.contentDocument;
             }
           } catch (_) {}
 
-          const __cmuxEvalInFrame = function() {
-            const document = __cmuxDoc;
+          const __termMeshEvalInFrame = function() {
+            const document = __termMeshDoc;
             return eval(\(scriptLiteral));
           };
-          return __cmuxEvalInFrame();
+          return __termMeshEvalInFrame();
         })()
         """
         return v2RunJavaScript(webView, script: wrapped, timeout: timeout)
@@ -221,7 +221,7 @@ extension TerminalController {
 
         let injector = """
         (() => {
-          window.__cmuxInitScriptsApplied = window.__cmuxInitScriptsApplied || { scripts: [], styles: [] };
+          window.__termMeshInitScriptsApplied = window.__termMeshInitScriptsApplied || { scripts: [], styles: [] };
           return true;
         })()
         """
@@ -234,7 +234,7 @@ extension TerminalController {
             let cssLiteral = v2JSONLiteral(css)
             let styleScript = """
             (() => {
-              const id = 'cmux-init-style-' + btoa(unescape(encodeURIComponent(\(cssLiteral)))).replace(/=+$/g, '');
+              const id = 'term-mesh-init-style-' + btoa(unescape(encodeURIComponent(\(cssLiteral)))).replace(/=+$/g, '');
               if (document.getElementById(id)) return true;
               const el = document.createElement('style');
               el.id = id;
@@ -1633,7 +1633,7 @@ extension TerminalController {
         return v2BrowserWithPanel(params: params) { _, ws, surfaceId, browserPanel in
             let script = """
             (() => {
-              const __cmuxCssPath = (el) => {
+              const __termMeshCssPath = (el) => {
                 if (!el || el.nodeType !== 1) return null;
                 if (el.id) return '#' + CSS.escape(el.id);
                 const parts = [];
@@ -1658,17 +1658,17 @@ extension TerminalController {
                 return parts.join(' > ');
               };
 
-              const __cmuxFound = (() => {
+              const __termMeshFound = (() => {
             \(finderBody)
               })();
-              if (!__cmuxFound) return { ok: false, error: 'not_found' };
-              const selector = __cmuxCssPath(__cmuxFound);
+              if (!__termMeshFound) return { ok: false, error: 'not_found' };
+              const selector = __termMeshCssPath(__termMeshFound);
               if (!selector) return { ok: false, error: 'not_found' };
               return {
                 ok: true,
                 selector,
-                tag: String(__cmuxFound.tagName || '').toLowerCase(),
-                text: String(__cmuxFound.textContent || '').trim()
+                tag: String(__termMeshFound.tagName || '').toLowerCase(),
+                text: String(__termMeshFound.textContent || '').trim()
               };
             })()
             """
@@ -2151,19 +2151,19 @@ extension TerminalController {
     func v2BrowserEnsureTelemetryHooks(surfaceId: UUID, browserPanel: BrowserPanel) {
         let script = """
         (() => {
-          if (window.__cmuxHooksInstalled) return true;
-          window.__cmuxHooksInstalled = true;
+          if (window.__termMeshHooksInstalled) return true;
+          window.__termMeshHooksInstalled = true;
 
-          window.__cmuxConsoleLog = window.__cmuxConsoleLog || [];
+          window.__termMeshConsoleLog = window.__termMeshConsoleLog || [];
           const __pushConsole = (level, args) => {
             try {
               const text = Array.from(args || []).map((x) => {
                 if (typeof x === 'string') return x;
                 try { return JSON.stringify(x); } catch (_) { return String(x); }
               }).join(' ');
-              window.__cmuxConsoleLog.push({ level, text, timestamp_ms: Date.now() });
-              if (window.__cmuxConsoleLog.length > 512) {
-                window.__cmuxConsoleLog.splice(0, window.__cmuxConsoleLog.length - 512);
+              window.__termMeshConsoleLog.push({ level, text, timestamp_ms: Date.now() });
+              if (window.__termMeshConsoleLog.length > 512) {
+                window.__termMeshConsoleLog.splice(0, window.__termMeshConsoleLog.length - 512);
               }
             } catch (_) {}
           };
@@ -2177,16 +2177,16 @@ extension TerminalController {
             };
           }
 
-          window.__cmuxErrorLog = window.__cmuxErrorLog || [];
+          window.__termMeshErrorLog = window.__termMeshErrorLog || [];
           window.addEventListener('error', (ev) => {
             try {
               const message = String((ev && ev.message) || '');
               const source = String((ev && ev.filename) || '');
               const line = Number((ev && ev.lineno) || 0);
               const col = Number((ev && ev.colno) || 0);
-              window.__cmuxErrorLog.push({ message, source, line, column: col, timestamp_ms: Date.now() });
-              if (window.__cmuxErrorLog.length > 512) {
-                window.__cmuxErrorLog.splice(0, window.__cmuxErrorLog.length - 512);
+              window.__termMeshErrorLog.push({ message, source, line, column: col, timestamp_ms: Date.now() });
+              if (window.__termMeshErrorLog.length > 512) {
+                window.__termMeshErrorLog.splice(0, window.__termMeshErrorLog.length - 512);
               }
             } catch (_) {}
           });
@@ -2194,24 +2194,24 @@ extension TerminalController {
             try {
               const reason = ev && ev.reason;
               const message = typeof reason === 'string' ? reason : (reason && reason.message ? String(reason.message) : String(reason));
-              window.__cmuxErrorLog.push({ message, source: 'unhandledrejection', line: 0, column: 0, timestamp_ms: Date.now() });
-              if (window.__cmuxErrorLog.length > 512) {
-                window.__cmuxErrorLog.splice(0, window.__cmuxErrorLog.length - 512);
+              window.__termMeshErrorLog.push({ message, source: 'unhandledrejection', line: 0, column: 0, timestamp_ms: Date.now() });
+              if (window.__termMeshErrorLog.length > 512) {
+                window.__termMeshErrorLog.splice(0, window.__termMeshErrorLog.length - 512);
               }
             } catch (_) {}
           });
 
-          window.__cmuxDialogQueue = window.__cmuxDialogQueue || [];
-          window.__cmuxDialogDefaults = window.__cmuxDialogDefaults || { confirm: false, prompt: null };
+          window.__termMeshDialogQueue = window.__termMeshDialogQueue || [];
+          window.__termMeshDialogDefaults = window.__termMeshDialogDefaults || { confirm: false, prompt: null };
           const __pushDialog = (type, message, defaultText) => {
-            window.__cmuxDialogQueue.push({
+            window.__termMeshDialogQueue.push({
               type,
               message: String(message || ''),
               default_text: defaultText == null ? null : String(defaultText),
               timestamp_ms: Date.now()
             });
-            if (window.__cmuxDialogQueue.length > 128) {
-              window.__cmuxDialogQueue.splice(0, window.__cmuxDialogQueue.length - 128);
+            if (window.__termMeshDialogQueue.length > 128) {
+              window.__termMeshDialogQueue.splice(0, window.__termMeshDialogQueue.length - 128);
             }
           };
 
@@ -2220,11 +2220,11 @@ extension TerminalController {
           };
           window.confirm = function(message) {
             __pushDialog('confirm', message, null);
-            return !!window.__cmuxDialogDefaults.confirm;
+            return !!window.__termMeshDialogDefaults.confirm;
           };
           window.prompt = function(message, defaultValue) {
             __pushDialog('prompt', message, defaultValue == null ? null : defaultValue);
-            const v = window.__cmuxDialogDefaults.prompt;
+            const v = window.__termMeshDialogDefaults.prompt;
             if (v === null || v === undefined) {
               return defaultValue == null ? '' : String(defaultValue);
             }
@@ -2246,19 +2246,19 @@ extension TerminalController {
             let textLiteral = text.map(v2JSONLiteral) ?? "null"
             let script = """
             (() => {
-              const q = window.__cmuxDialogQueue || [];
+              const q = window.__termMeshDialogQueue || [];
               if (!q.length) return { ok: false, error: 'not_found' };
               const entry = q.shift();
               if (entry.type === 'confirm') {
-                window.__cmuxDialogDefaults = window.__cmuxDialogDefaults || { confirm: false, prompt: null };
-                window.__cmuxDialogDefaults.confirm = \(acceptLiteral);
+                window.__termMeshDialogDefaults = window.__termMeshDialogDefaults || { confirm: false, prompt: null };
+                window.__termMeshDialogDefaults.confirm = \(acceptLiteral);
               }
               if (entry.type === 'prompt') {
-                window.__cmuxDialogDefaults = window.__cmuxDialogDefaults || { confirm: false, prompt: null };
+                window.__termMeshDialogDefaults = window.__termMeshDialogDefaults || { confirm: false, prompt: null };
                 if (\(acceptLiteral)) {
-                  window.__cmuxDialogDefaults.prompt = \(textLiteral);
+                  window.__termMeshDialogDefaults.prompt = \(textLiteral);
                 } else {
-                  window.__cmuxDialogDefaults.prompt = null;
+                  window.__termMeshDialogDefaults.prompt = null;
                 }
               }
               return { ok: true, dialog: entry, remaining: q.length };
@@ -2853,9 +2853,9 @@ extension TerminalController {
             let clearLiteral = clear ? "true" : "false"
             let script = """
             (() => {
-              const items = Array.isArray(window.__cmuxConsoleLog) ? window.__cmuxConsoleLog.slice() : [];
+              const items = Array.isArray(window.__termMeshConsoleLog) ? window.__termMeshConsoleLog.slice() : [];
               if (\(clearLiteral)) {
-                window.__cmuxConsoleLog = [];
+                window.__termMeshConsoleLog = [];
               }
               return { ok: true, items };
             })()
@@ -2891,9 +2891,9 @@ extension TerminalController {
             let clearLiteral = clear ? "true" : "false"
             let script = """
             (() => {
-              const items = Array.isArray(window.__cmuxErrorLog) ? window.__cmuxErrorLog.slice() : [];
+              const items = Array.isArray(window.__termMeshErrorLog) ? window.__termMeshErrorLog.slice() : [];
               if (\(clearLiteral)) {
-                window.__cmuxErrorLog = [];
+                window.__termMeshErrorLog = [];
               }
               return { ok: true, items };
             })()

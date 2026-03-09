@@ -150,7 +150,7 @@ Check team status:
 ${SCRIPT_DIR}/team.py status
 \`\`\`
 
-Environment variable is pre-set: CMUX_SOCKET=${SOCKET}
+Environment variable is pre-set: TERMMESH_SOCKET=${SOCKET}
 ${WORKTREE_SECTION}
 ## Reading Agent Results (MANDATORY)
 
@@ -207,14 +207,14 @@ ${SCRIPT_DIR}/team.py task update <id> completed '<result summary>'
 - Prefer parallel work: send independent tasks to multiple agents simultaneously
 - When worktree isolation is active, instruct agents to commit + push + create PR when done"
 
-export CMUX_SOCKET="$SOCKET"
-export CMUX_TEAM="$TEAM"
-# Must unset CLAUDECODE — cmux app may inherit it from a parent Claude session,
+export TERMMESH_SOCKET="$SOCKET"
+export TERMMESH_TEAM="$TEAM"
+# Must unset CLAUDECODE — term-mesh app may inherit it from a parent Claude session,
 # and Claude Code refuses to start inside another CLAUDECODE session.
 unset CLAUDECODE
 
 # Write system prompt to temp file (avoids shell escaping issues with multiline text)
-PROMPT_FILE=$(mktemp /tmp/cmux-leader-prompt-XXXXXX)
+PROMPT_FILE=$(mktemp /tmp/term-mesh-leader-prompt-XXXXXX)
 echo "$SYSTEM_PROMPT" > "$PROMPT_FILE"
 trap "rm -f '$PROMPT_FILE'" EXIT
 

@@ -4,17 +4,17 @@
   <a href="README.md">English</a> | <a href="README.zh-CN.md">简体中文</a> | <a href="README.zh-TW.md">繁體中文</a> | <a href="README.ko.md">한국어</a> | <a href="README.de.md">Deutsch</a> | <a href="README.es.md">Español</a> | <a href="README.fr.md">Français</a> | <a href="README.it.md">Italiano</a> | <a href="README.da.md">Dansk</a> | <a href="README.ja.md">日本語</a> | <a href="README.pl.md">Polski</a> | <a href="README.ru.md">Русский</a> | <a href="README.bs.md">Bosanski</a> | <a href="README.ar.md">العربية</a> | <a href="README.no.md">Norsk</a> | <a href="README.pt-BR.md">Português (Brasil)</a> | <a href="README.th.md">ไทย</a> | Türkçe
 </p>
 
-<h1 align="center">cmux</h1>
+<h1 align="center">term-mesh</h1>
 <p align="center">AI kodlama ajanları için dikey sekmeler ve bildirimler içeren Ghostty tabanlı macOS terminali</p>
 
 <p align="center">
-  <a href="https://github.com/manaflow-ai/cmux/releases/latest/download/cmux-macos.dmg">
-    <img src="./docs/assets/macos-badge.png" alt="macOS için cmux'u indir" width="180" />
+  <a href="https://github.com/manaflow-ai/term-mesh/releases/latest/download/term-mesh-macos.dmg">
+    <img src="./docs/assets/macos-badge.png" alt="term-mesh" width="180" />
   </a>
 </p>
 
 <p align="center">
-  <img src="./docs/assets/screenshot.png" alt="cmux ekran görüntüsü" width="900" />
+  <img src="./docs/assets/screenshot.png" alt="term-mesh" width="900" />
 </p>
 
 ## Özellikler
@@ -33,34 +33,34 @@
 
 ### DMG (önerilen)
 
-<a href="https://github.com/manaflow-ai/cmux/releases/latest/download/cmux-macos.dmg">
-  <img src="./docs/assets/macos-badge.png" alt="macOS için cmux'u indir" width="180" />
+<a href="https://github.com/manaflow-ai/term-mesh/releases/latest/download/term-mesh-macos.dmg">
+  <img src="./docs/assets/macos-badge.png" alt="term-mesh" width="180" />
 </a>
 
-`.dmg` dosyasını açın ve cmux'u Uygulamalar klasörüne sürükleyin. cmux Sparkle aracılığıyla otomatik güncellenir, bu yüzden yalnızca bir kez indirmeniz yeterlidir.
+`.dmg` dosyasını açın ve term-mesh'u Uygulamalar klasörüne sürükleyin. term-mesh Sparkle aracılığıyla otomatik güncellenir, bu yüzden yalnızca bir kez indirmeniz yeterlidir.
 
 ### Homebrew
 
 ```bash
-brew tap manaflow-ai/cmux
-brew install --cask cmux
+brew tap manaflow-ai/term-mesh
+brew install --cask term-mesh
 ```
 
 Daha sonra güncellemek için:
 
 ```bash
-brew upgrade --cask cmux
+brew upgrade --cask term-mesh
 ```
 
 İlk açılışta macOS, tanımlanmış bir geliştiriciden gelen bir uygulamayı açmayı onaylamanızı isteyebilir. Devam etmek için **Aç**'a tıklayın.
 
-## Neden cmux?
+## Why term-mesh?
 
 Birçok Claude Code ve Codex oturumunu paralel olarak çalıştırıyorum. Ghostty'yi bir sürü bölünmüş panelle kullanıyor ve bir ajanın bana ne zaman ihtiyacı olduğunu anlamak için yerel macOS bildirimlerine güveniyordum. Ancak Claude Code'un bildirim metni her zaman sadece "Claude is waiting for your input" oluyor, hiçbir bağlam yok ve yeterince sekme açıkken başlıkları bile okuyamıyordum artık.
 
-Birkaç kodlama orkestratörü denedim ama çoğu Electron/Tauri uygulamasıydı ve performansları beni rahatsız ediyordu. Ayrıca terminali tercih ediyorum çünkü GUI orkestratörleri sizi kendi iş akışlarına kilitliyor. Bu yüzden cmux'u Swift/AppKit'te yerel bir macOS uygulaması olarak geliştirdim. Terminal görüntüleme için libghostty kullanıyor ve temalar, yazı tipleri ve renkler için mevcut Ghostty yapılandırmanızı okuyor.
+Birkaç kodlama orkestratörü denedim ama çoğu Electron/Tauri uygulamasıydı ve performansları beni rahatsız ediyordu. Ayrıca terminali tercih ediyorum çünkü GUI orkestratörleri sizi kendi iş akışlarına kilitliyor. Bu yüzden term-mesh'u Swift/AppKit'te yerel bir macOS uygulaması olarak geliştirdim. Terminal görüntüleme için libghostty kullanıyor ve temalar, yazı tipleri ve renkler için mevcut Ghostty yapılandırmanızı okuyor.
 
-Ana eklemeler kenar çubuğu ve bildirim sistemi. Kenar çubuğunda her çalışma alanı için git dalını, çalışma dizinini, dinlenen portları ve en son bildirim metnini gösteren dikey sekmeler var. Bildirim sistemi terminal dizilerini (OSC 9/99/777) yakalıyor ve Claude Code, OpenCode vb. için ajan kancalarına bağlayabileceğiniz bir CLI'ye (`cmux notify`) sahip. Bir ajan beklerken paneli mavi bir halka alıyor ve sekme kenar çubuğunda yanıyor, böylece bölmeler ve sekmeler arasında hangisinin bana ihtiyacı olduğunu görebiliyorum. Cmd+Shift+U en son okunmamışa atlıyor.
+Ana eklemeler kenar çubuğu ve bildirim sistemi. Kenar çubuğunda her çalışma alanı için git dalını, çalışma dizinini, dinlenen portları ve en son bildirim metnini gösteren dikey sekmeler var. Bildirim sistemi terminal dizilerini (OSC 9/99/777) yakalıyor ve Claude Code, OpenCode vb. için ajan kancalarına bağlayabileceğiniz bir CLI'ye (`term-mesh notify`) sahip. Bir ajan beklerken paneli mavi bir halka alıyor ve sekme kenar çubuğunda yanıyor, böylece bölmeler ve sekmeler arasında hangisinin bana ihtiyacı olduğunu görebiliyorum. Cmd+Shift+U en son okunmamışa atlıyor.
 
 Uygulama içi tarayıcının [agent-browser](https://github.com/vercel-labs/agent-browser)'dan aktarılmış betiklenebilir bir API'si var. Ajanlar erişilebilirlik ağacının anlık görüntüsünü alabilir, öğe referansları elde edebilir, tıklayabilir, formları doldurabilir ve JS çalıştırabilir. Terminalinizin yanında bir tarayıcı paneli bölebilir ve Claude Code'un geliştirme sunucunuzla doğrudan etkileşime girmesini sağlayabilirsiniz.
 

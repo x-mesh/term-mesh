@@ -3,7 +3,7 @@ import SwiftUI
 import Darwin
 
 @main
-struct cmuxApp: App {
+struct TermMeshApp: App {
     @StateObject private var tabManager: TabManager
     @StateObject private var notificationStore = TerminalNotificationStore.shared
     @StateObject private var sidebarState = SidebarState()
@@ -50,7 +50,7 @@ struct cmuxApp: App {
                 defaults.set(migrated.rawValue, forKey: SocketControlSettings.appStorageKey)
             }
         } else if let legacy = defaults.object(forKey: SocketControlSettings.legacyEnabledKey) as? Bool {
-            defaults.set(legacy ? SocketControlMode.cmuxOnly.rawValue : SocketControlMode.off.rawValue,
+            defaults.set(legacy ? SocketControlMode.termMeshOnly.rawValue : SocketControlMode.off.rawValue,
                          forKey: SocketControlSettings.appStorageKey)
         }
         migrateSidebarAppearanceDefaultsIfNeeded(defaults: defaults)
@@ -175,15 +175,15 @@ struct cmuxApp: App {
                 .environmentObject(sidebarSelectionState)
                 .onAppear {
 #if DEBUG
-                    if ProcessInfo.processInfo.environment["CMUX_UI_TEST_MODE"] == "1" {
-                        UpdateLogStore.shared.append("ui test: cmuxApp onAppear")
+                    if termMeshEnv("UI_TEST_MODE") == "1" {
+                        UpdateLogStore.shared.append("ui test: TermMeshApp onAppear")
                     }
 #endif
                     // Start the Unix socket controller for programmatic access
                     updateSocketController()
                     appDelegate.configure(tabManager: tabManager, notificationStore: notificationStore, sidebarState: sidebarState)
                     applyAppearance()
-                    if ProcessInfo.processInfo.environment["CMUX_UI_TEST_SHOW_SETTINGS"] == "1" {
+                    if termMeshEnv("UI_TEST_SHOW_SETTINGS") == "1" {
                         DispatchQueue.main.async {
                             showSettingsPanel()
                         }
@@ -933,7 +933,7 @@ struct cmuxApp: App {
 
     private func closePanelOrWindow() {
         if let window = NSApp.keyWindow,
-           window.identifier?.rawValue == "cmux.settings" {
+           window.identifier?.rawValue == "term-mesh.settings" {
             window.performClose(nil)
             return
         }
@@ -974,9 +974,9 @@ private enum SettingsAboutWindowKind: String, CaseIterable, Identifiable {
     var windowIdentifier: String {
         switch self {
         case .settings:
-            return "cmux.settings"
+            return "term-mesh.settings"
         case .about:
-            return "cmux.about"
+            return "term-mesh.about"
         }
     }
 
@@ -1233,7 +1233,7 @@ private final class SettingsAboutTitlebarDebugStore: ObservableObject {
 
     private func ensureToolbar(on window: NSWindow, kind: SettingsAboutWindowKind) {
         guard window.toolbar == nil else { return }
-        let identifier = NSToolbar.Identifier("cmux.debug.titlebar.\(kind.rawValue)")
+        let identifier = NSToolbar.Identifier("term-mesh.debug.titlebar.\(kind.rawValue)")
         let toolbar = NSToolbar(identifier: identifier)
         toolbar.allowsUserCustomization = false
         toolbar.autosavesConfiguration = false
@@ -1270,7 +1270,7 @@ private final class SettingsAboutTitlebarDebugWindowController: NSWindowControll
         window.titlebarAppearsTransparent = false
         window.isMovableByWindowBackground = true
         window.isReleasedWhenClosed = false
-        window.identifier = NSUserInterfaceItemIdentifier("cmux.settingsAboutTitlebarDebug")
+        window.identifier = NSUserInterfaceItemIdentifier("term-mesh.settingsAboutTitlebarDebug")
         window.center()
         window.contentView = NSHostingView(rootView: SettingsAboutTitlebarDebugView())
         AppDelegate.shared?.applyWindowDecorations(to: window)
@@ -1334,7 +1334,7 @@ private struct SettingsAboutTitlebarDebugView: View {
             VStack(alignment: .leading, spacing: 10) {
                 Toggle("Enable Debug Overrides", isOn: overridesEnabled)
 
-                Text("When disabled, cmux uses normal default titlebar behavior for this window.")
+                Text("When disabled, term-mesh uses normal default titlebar behavior for this window.")
                     .font(.caption)
                     .foregroundColor(.secondary)
 
@@ -1494,7 +1494,7 @@ private final class DebugWindowControlsWindowController: NSWindowController, NSW
         window.titlebarAppearsTransparent = false
         window.isMovableByWindowBackground = true
         window.isReleasedWhenClosed = false
-        window.identifier = NSUserInterfaceItemIdentifier("cmux.debugWindowControls")
+        window.identifier = NSUserInterfaceItemIdentifier("term-mesh.debugWindowControls")
         window.center()
         window.contentView = NSHostingView(rootView: DebugWindowControlsView())
         AppDelegate.shared?.applyWindowDecorations(to: window)
@@ -1781,7 +1781,7 @@ private final class AboutWindowController: NSWindowController, NSWindowDelegate 
             defer: false
         )
         window.isReleasedWhenClosed = false
-        window.identifier = NSUserInterfaceItemIdentifier("cmux.about")
+        window.identifier = NSUserInterfaceItemIdentifier("term-mesh.about")
         window.center()
         window.contentView = NSHostingView(rootView: AboutPanelView())
         SettingsAboutTitlebarDebugStore.shared.applyCurrentOptions(to: window, for: .about)
@@ -1815,7 +1815,7 @@ private final class AcknowledgmentsWindowController: NSWindowController, NSWindo
         )
         window.isReleasedWhenClosed = false
         window.title = "Third-Party Licenses"
-        window.identifier = NSUserInterfaceItemIdentifier("cmux.licenses")
+        window.identifier = NSUserInterfaceItemIdentifier("term-mesh.licenses")
         window.center()
         window.contentView = NSHostingView(rootView: AcknowledgmentsView())
         super.init(window: window)
@@ -1864,7 +1864,7 @@ private final class SettingsWindowController: NSWindowController, NSWindowDelega
             defer: false
         )
         window.isReleasedWhenClosed = false
-        window.identifier = NSUserInterfaceItemIdentifier("cmux.settings")
+        window.identifier = NSUserInterfaceItemIdentifier("term-mesh.settings")
         window.center()
         window.contentView = NSHostingView(rootView: SettingsRootView())
         SettingsAboutTitlebarDebugStore.shared.applyCurrentOptions(to: window, for: .settings)
@@ -1903,7 +1903,7 @@ private final class SidebarDebugWindowController: NSWindowController, NSWindowDe
         window.titlebarAppearsTransparent = false
         window.isMovableByWindowBackground = true
         window.isReleasedWhenClosed = false
-        window.identifier = NSUserInterfaceItemIdentifier("cmux.sidebarDebug")
+        window.identifier = NSUserInterfaceItemIdentifier("term-mesh.sidebarDebug")
         window.center()
         window.contentView = NSHostingView(rootView: SidebarDebugView())
         AppDelegate.shared?.applyWindowDecorations(to: window)
@@ -1925,16 +1925,16 @@ private final class SidebarDebugWindowController: NSWindowController, NSWindowDe
 private struct AboutPanelView: View {
     @Environment(\.openURL) private var openURL
 
-    private let githubURL = URL(string: "https://github.com/manaflow-ai/cmux")
-    private let docsURL = URL(string: "https://cmux.dev/docs")
+    private let githubURL = URL(string: "https://github.com/manaflow-ai/term-mesh")
+    private let docsURL = URL(string: "https://term-mesh.dev/docs")
 
     private var version: String? { Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String }
     private var build: String? { Bundle.main.infoDictionary?["CFBundleVersion"] as? String }
     private var commit: String? {
-        if let value = Bundle.main.infoDictionary?["CMUXCommit"] as? String, !value.isEmpty {
+        if let value = Bundle.main.infoDictionary?["TermMeshCommit"] as? String, !value.isEmpty {
             return value
         }
-        let env = ProcessInfo.processInfo.environment["CMUX_COMMIT"] ?? ""
+        let env = termMeshEnv("COMMIT") ?? ""
         return env.isEmpty ? nil : env
     }
     private var copyright: String? { Bundle.main.infoDictionary?["NSHumanReadableCopyright"] as? String }
@@ -1949,7 +1949,7 @@ private struct AboutPanelView: View {
 
             VStack(alignment: .center, spacing: 32) {
                 VStack(alignment: .center, spacing: 8) {
-                    Text("cmux")
+                    Text("term-mesh")
                         .bold()
                         .font(.title)
                     Text("A Ghostty-based terminal with vertical tabs\nand a notification panel for macOS.")
@@ -1970,7 +1970,7 @@ private struct AboutPanelView: View {
                     }
                     let commitText = commit ?? "—"
                     let commitURL = commit.flatMap { hash in
-                        URL(string: "https://github.com/manaflow-ai/cmux/commit/\(hash)")
+                        URL(string: "https://github.com/manaflow-ai/term-mesh/commit/\(hash)")
                     }
                     AboutPropertyRow(label: "Commit", text: commitText, url: commitURL)
                 }
@@ -2293,7 +2293,7 @@ private final class MenuBarExtraDebugWindowController: NSWindowController, NSWin
         window.titlebarAppearsTransparent = false
         window.isMovableByWindowBackground = true
         window.isReleasedWhenClosed = false
-        window.identifier = NSUserInterfaceItemIdentifier("cmux.menubarDebug")
+        window.identifier = NSUserInterfaceItemIdentifier("term-mesh.menubarDebug")
         window.center()
         window.contentView = NSHostingView(rootView: MenuBarExtraDebugView())
         AppDelegate.shared?.applyWindowDecorations(to: window)
@@ -2463,7 +2463,7 @@ private final class BackgroundDebugWindowController: NSWindowController, NSWindo
         window.titlebarAppearsTransparent = false
         window.isMovableByWindowBackground = true
         window.isReleasedWhenClosed = false
-        window.identifier = NSUserInterfaceItemIdentifier("cmux.backgroundDebug")
+        window.identifier = NSUserInterfaceItemIdentifier("term-mesh.backgroundDebug")
         window.center()
         window.contentView = NSHostingView(rootView: BackgroundDebugView())
         AppDelegate.shared?.applyWindowDecorations(to: window)
@@ -2558,12 +2558,12 @@ private struct BackgroundDebugView: View {
         let window: NSWindow? = {
             if let key = NSApp.keyWindow,
                let raw = key.identifier?.rawValue,
-               raw == "cmux.main" || raw.hasPrefix("cmux.main.") {
+               raw == "term-mesh.main" || raw.hasPrefix("term-mesh.main.") {
                 return key
             }
             return NSApp.windows.first(where: {
                 guard let raw = $0.identifier?.rawValue else { return false }
-                return raw == "cmux.main" || raw.hasPrefix("cmux.main.")
+                return raw == "term-mesh.main" || raw.hasPrefix("term-mesh.main.")
             })
         }()
         guard let window else { return }
@@ -2762,14 +2762,14 @@ struct SettingsView: View {
     @AppStorage(SocketControlSettings.appStorageKey) private var socketControlMode = SocketControlSettings.defaultMode.rawValue
     @AppStorage(ClaudeCodeIntegrationSettings.hooksEnabledKey)
     private var claudeCodeHooksEnabled = ClaudeCodeIntegrationSettings.defaultHooksEnabled
-    @AppStorage("cmuxPortBase") private var cmuxPortBase = 9100
-    @AppStorage("cmuxPortRange") private var cmuxPortRange = 10
+    @AppStorage("termMeshPortBase") private var termMeshPortBase = 9100
+    @AppStorage("termMeshPortRange") private var termMeshPortRange = 10
     @AppStorage(BrowserSearchSettings.searchEngineKey) private var browserSearchEngine = BrowserSearchSettings.defaultSearchEngine.rawValue
     @AppStorage(BrowserSearchSettings.searchSuggestionsEnabledKey) private var browserSearchSuggestionsEnabled = BrowserSearchSettings.defaultSearchSuggestionsEnabled
     @AppStorage(BrowserThemeSettings.modeKey) private var browserThemeMode = BrowserThemeSettings.defaultMode.rawValue
-    @AppStorage(BrowserLinkOpenSettings.openTerminalLinksInCmuxBrowserKey) private var openTerminalLinksInCmuxBrowser = BrowserLinkOpenSettings.defaultOpenTerminalLinksInCmuxBrowser
-    @AppStorage(BrowserLinkOpenSettings.interceptTerminalOpenCommandInCmuxBrowserKey)
-    private var interceptTerminalOpenCommandInCmuxBrowser = BrowserLinkOpenSettings.initialInterceptTerminalOpenCommandInCmuxBrowserValue()
+    @AppStorage(BrowserLinkOpenSettings.openTerminalLinksInTermMeshBrowserKey) private var openTerminalLinksInTermMeshBrowser = BrowserLinkOpenSettings.defaultOpenTerminalLinksInTermMeshBrowser
+    @AppStorage(BrowserLinkOpenSettings.interceptTerminalOpenCommandInTermMeshBrowserKey)
+    private var interceptTerminalOpenCommandInTermMeshBrowser = BrowserLinkOpenSettings.initialInterceptTerminalOpenCommandInTermMeshBrowserValue()
     @AppStorage(BrowserLinkOpenSettings.browserHostWhitelistKey) private var browserHostWhitelist = BrowserLinkOpenSettings.defaultBrowserHostWhitelist
     @AppStorage(BrowserInsecureHTTPSettings.allowlistKey) private var browserInsecureHTTPAllowlist = BrowserInsecureHTTPSettings.defaultAllowlistText
     @AppStorage(NotificationBadgeSettings.dockBadgeEnabledKey) private var notificationDockBadgeEnabled = NotificationBadgeSettings.defaultDockBadgeEnabled
@@ -3231,7 +3231,7 @@ struct SettingsView: View {
                                 .padding(.horizontal, 14)
                                 .padding(.vertical, 8)
                         }
-                        SettingsCardNote("Overrides: CMUX_SOCKET_ENABLE, CMUX_SOCKET_MODE, and CMUX_SOCKET_PATH (set CMUX_ALLOW_SOCKET_OVERRIDE=1 for stable/nightly builds).")
+                        SettingsCardNote("Overrides: TERMMESH_SOCKET_ENABLE, TERMMESH_SOCKET_MODE, and TERMMESH_SOCKET_PATH (set TERMMESH_ALLOW_SOCKET_OVERRIDE=1 for stable/nightly builds). Legacy CMUX_* prefixes also accepted.")
                     }
 
                     SettingsCard {
@@ -3239,7 +3239,7 @@ struct SettingsView: View {
                             "Claude Code Integration",
                             subtitle: claudeCodeHooksEnabled
                                 ? "Sidebar shows Claude session status and notifications."
-                                : "Claude Code runs without cmux integration."
+                                : "Claude Code runs without term-mesh integration."
                         ) {
                             Toggle("", isOn: $claudeCodeHooksEnabled)
                                 .labelsHidden()
@@ -3249,12 +3249,12 @@ struct SettingsView: View {
 
                         SettingsCardDivider()
 
-                        SettingsCardNote("When enabled, cmux wraps the claude command to inject session tracking and notification hooks. Disable if you prefer to manage Claude Code hooks yourself.")
+                        SettingsCardNote("When enabled, term-mesh wraps the claude command to inject session tracking and notification hooks. Disable if you prefer to manage Claude Code hooks yourself.")
                     }
 
                     SettingsCard {
-                        SettingsCardRow("Port Base", subtitle: "Starting port for CMUX_PORT env var.", controlWidth: pickerColumnWidth) {
-                            TextField("", value: $cmuxPortBase, format: .number)
+                        SettingsCardRow("Port Base", subtitle: "Starting port for TERMMESH_PORT env var.", controlWidth: pickerColumnWidth) {
+                            TextField("", value: $termMeshPortBase, format: .number)
                                 .textFieldStyle(.roundedBorder)
                                 .multilineTextAlignment(.trailing)
                         }
@@ -3262,14 +3262,14 @@ struct SettingsView: View {
                         SettingsCardDivider()
 
                         SettingsCardRow("Port Range Size", subtitle: "Number of ports per workspace.", controlWidth: pickerColumnWidth) {
-                            TextField("", value: $cmuxPortRange, format: .number)
+                            TextField("", value: $termMeshPortRange, format: .number)
                                 .textFieldStyle(.roundedBorder)
                                 .multilineTextAlignment(.trailing)
                         }
 
                         SettingsCardDivider()
 
-                        SettingsCardNote("Each workspace gets CMUX_PORT and CMUX_PORT_END env vars with a dedicated port range. New terminals inherit these values.")
+                        SettingsCardNote("Each workspace gets TERMMESH_PORT and TERMMESH_PORT_END env vars with a dedicated port range. New terminals inherit these values.")
                     }
                     }
 
@@ -3391,10 +3391,10 @@ struct SettingsView: View {
                         SettingsCardDivider()
 
                         SettingsCardRow(
-                            "Open Terminal Links in cmux Browser",
+                            "Open Terminal Links in term-mesh Browser",
                             subtitle: "When off, links clicked in terminal output open in your default browser."
                         ) {
-                            Toggle("", isOn: $openTerminalLinksInCmuxBrowser)
+                            Toggle("", isOn: $openTerminalLinksInTermMeshBrowser)
                                 .labelsHidden()
                                 .controlSize(.small)
                         }
@@ -3405,18 +3405,18 @@ struct SettingsView: View {
                             "Intercept open http(s) in Terminal",
                             subtitle: "When off, `open https://...` and `open http://...` always use your default browser."
                         ) {
-                            Toggle("", isOn: $interceptTerminalOpenCommandInCmuxBrowser)
+                            Toggle("", isOn: $interceptTerminalOpenCommandInTermMeshBrowser)
                                 .labelsHidden()
                                 .controlSize(.small)
                         }
 
-                        if openTerminalLinksInCmuxBrowser || interceptTerminalOpenCommandInCmuxBrowser {
+                        if openTerminalLinksInTermMeshBrowser || interceptTerminalOpenCommandInTermMeshBrowser {
                             SettingsCardDivider()
 
                             VStack(alignment: .leading, spacing: 6) {
                                 SettingsCardRow(
                                     "Hosts to Open in Embedded Browser",
-                                    subtitle: "Applies to terminal link clicks and intercepted `open https://...` calls. Only these hosts open in cmux. Others open in your default browser. One host or wildcard per line (for example: example.com, *.internal.example). Leave empty to open all hosts in cmux."
+                                    subtitle: "Applies to terminal link clicks and intercepted `open https://...` calls. Only these hosts open in term-mesh. Others open in your default browser. One host or wildcard per line (for example: example.com, *.internal.example). Leave empty to open all hosts in term-mesh."
                                 ) {
                                     EmptyView()
                                 }
@@ -3443,7 +3443,7 @@ struct SettingsView: View {
                             Text("HTTP Hosts Allowed in Embedded Browser")
                                 .font(.system(size: 13, weight: .semibold))
 
-                            Text("Controls which HTTP (non-HTTPS) hosts can open in cmux without a warning prompt. Defaults include localhost, 127.0.0.1, ::1, 0.0.0.0, and *.localtest.me.")
+                            Text("Controls which HTTP (non-HTTPS) hosts can open in term-mesh without a warning prompt. Defaults include localhost, 127.0.0.1, ::1, 0.0.0.0, and *.localtest.me.")
                                 .font(.caption)
                                 .foregroundStyle(.secondary)
 
@@ -3732,8 +3732,8 @@ struct SettingsView: View {
         browserSearchEngine = BrowserSearchSettings.defaultSearchEngine.rawValue
         browserSearchSuggestionsEnabled = BrowserSearchSettings.defaultSearchSuggestionsEnabled
         browserThemeMode = BrowserThemeSettings.defaultMode.rawValue
-        openTerminalLinksInCmuxBrowser = BrowserLinkOpenSettings.defaultOpenTerminalLinksInCmuxBrowser
-        interceptTerminalOpenCommandInCmuxBrowser = BrowserLinkOpenSettings.defaultInterceptTerminalOpenCommandInCmuxBrowser
+        openTerminalLinksInTermMeshBrowser = BrowserLinkOpenSettings.defaultOpenTerminalLinksInTermMeshBrowser
+        interceptTerminalOpenCommandInTermMeshBrowser = BrowserLinkOpenSettings.defaultInterceptTerminalOpenCommandInTermMeshBrowser
         browserHostWhitelist = BrowserLinkOpenSettings.defaultBrowserHostWhitelist
         browserInsecureHTTPAllowlist = BrowserInsecureHTTPSettings.defaultAllowlistText
         browserInsecureHTTPAllowlistDraft = BrowserInsecureHTTPSettings.defaultAllowlistText
@@ -3965,13 +3965,13 @@ private struct SettingsRootView: View {
     }
 
     private func configureSettingsWindow(_ window: NSWindow) {
-        window.identifier = NSUserInterfaceItemIdentifier("cmux.settings")
+        window.identifier = NSUserInterfaceItemIdentifier("term-mesh.settings")
         applyCurrentSettingsWindowStyle(to: window)
 
         let accessories = window.titlebarAccessoryViewControllers
         for index in accessories.indices.reversed() {
             guard let identifier = accessories[index].view.identifier?.rawValue else { continue }
-            guard identifier.hasPrefix("cmux.") else { continue }
+            guard identifier.hasPrefix("term-mesh.") else { continue }
             window.removeTitlebarAccessoryViewController(at: index)
         }
         AppDelegate.shared?.applyWindowDecorations(to: window)

@@ -2,17 +2,17 @@
 
 <p align="center"><a href="README.md">English</a> | <a href="README.zh-CN.md">简体中文</a> | <a href="README.zh-TW.md">繁體中文</a> | <a href="README.ko.md">한국어</a> | Deutsch | <a href="README.es.md">Español</a> | <a href="README.fr.md">Français</a> | <a href="README.it.md">Italiano</a> | <a href="README.da.md">Dansk</a> | <a href="README.ja.md">日本語</a> | <a href="README.pl.md">Polski</a> | <a href="README.ru.md">Русский</a> | <a href="README.bs.md">Bosanski</a> | <a href="README.ar.md">العربية</a> | <a href="README.no.md">Norsk</a> | <a href="README.pt-BR.md">Português (Brasil)</a> | <a href="README.th.md">ไทย</a> | <a href="README.tr.md">Türkçe</a></p>
 
-<h1 align="center">cmux</h1>
+<h1 align="center">term-mesh</h1>
 <p align="center">Ein Ghostty-basiertes macOS-Terminal mit vertikalen Tabs und Benachrichtigungen für AI-Coding-Agenten</p>
 
 <p align="center">
-  <a href="https://github.com/manaflow-ai/cmux/releases/latest/download/cmux-macos.dmg">
-    <img src="./docs/assets/macos-badge.png" alt="cmux für macOS herunterladen" width="180" />
+  <a href="https://github.com/manaflow-ai/term-mesh/releases/latest/download/term-mesh-macos.dmg">
+    <img src="./docs/assets/macos-badge.png" alt="term-mesh" width="180" />
   </a>
 </p>
 
 <p align="center">
-  <img src="./docs/assets/screenshot.png" alt="cmux Screenshot" width="900" />
+  <img src="./docs/assets/screenshot.png" alt="term-mesh" width="900" />
 </p>
 
 ## Funktionen
@@ -31,34 +31,34 @@
 
 ### DMG (empfohlen)
 
-<a href="https://github.com/manaflow-ai/cmux/releases/latest/download/cmux-macos.dmg">
-  <img src="./docs/assets/macos-badge.png" alt="cmux für macOS herunterladen" width="180" />
+<a href="https://github.com/manaflow-ai/term-mesh/releases/latest/download/term-mesh-macos.dmg">
+  <img src="./docs/assets/macos-badge.png" alt="term-mesh" width="180" />
 </a>
 
-Öffnen Sie die `.dmg`-Datei und ziehen Sie cmux in Ihren Programme-Ordner. cmux aktualisiert sich automatisch über Sparkle, sodass Sie nur einmal herunterladen müssen.
+Öffnen Sie die `.dmg`-Datei und ziehen Sie term-mesh in Ihren Programme-Ordner. term-mesh aktualisiert sich automatisch über Sparkle, sodass Sie nur einmal herunterladen müssen.
 
 ### Homebrew
 
 ```bash
-brew tap manaflow-ai/cmux
-brew install --cask cmux
+brew tap manaflow-ai/term-mesh
+brew install --cask term-mesh
 ```
 
 Später aktualisieren:
 
 ```bash
-brew upgrade --cask cmux
+brew upgrade --cask term-mesh
 ```
 
 Beim ersten Start fordert macOS Sie möglicherweise auf, das Öffnen einer App von einem identifizierten Entwickler zu bestätigen. Klicken Sie auf **Öffnen**, um fortzufahren.
 
-## Warum cmux?
+## Why term-mesh?
 
 Ich führe viele Claude Code- und Codex-Sitzungen parallel aus. Ich habe Ghostty mit einer Menge geteilter Bereiche verwendet und mich auf die nativen macOS-Benachrichtigungen verlassen, um zu wissen, wann ein Agent mich braucht. Aber der Benachrichtigungstext von Claude Code ist immer nur „Claude is waiting for your input" ohne Kontext, und bei genügend offenen Tabs konnte ich nicht einmal mehr die Titel lesen.
 
-Ich habe einige Coding-Orchestratoren ausprobiert, aber die meisten waren Electron/Tauri-Apps und die Performance hat mich gestört. Ich bevorzuge außerdem das Terminal, da GUI-Orchestratoren einen in ihren Workflow einschließen. Also habe ich cmux als native macOS-App in Swift/AppKit gebaut. Es verwendet libghostty für das Terminal-Rendering und liest Ihre vorhandene Ghostty-Konfiguration für Themes, Schriftarten und Farben.
+Ich habe einige Coding-Orchestratoren ausprobiert, aber die meisten waren Electron/Tauri-Apps und die Performance hat mich gestört. Ich bevorzuge außerdem das Terminal, da GUI-Orchestratoren einen in ihren Workflow einschließen. Also habe ich term-mesh als native macOS-App in Swift/AppKit gebaut. Es verwendet libghostty für das Terminal-Rendering und liest Ihre vorhandene Ghostty-Konfiguration für Themes, Schriftarten und Farben.
 
-Die wesentlichen Ergänzungen sind die Seitenleiste und das Benachrichtigungssystem. Die Seitenleiste hat vertikale Tabs, die Git-Branch, Arbeitsverzeichnis, lauschende Ports und den neuesten Benachrichtigungstext für jeden Arbeitsbereich anzeigen. Das Benachrichtigungssystem erkennt Terminal-Sequenzen (OSC 9/99/777) und bietet eine CLI (`cmux notify`), die Sie in Agent-Hooks für Claude Code, OpenCode usw. einbinden können. Wenn ein Agent wartet, bekommt sein Bereich einen blauen Ring und der Tab leuchtet in der Seitenleiste auf, sodass ich über Teilungen und Tabs hinweg erkennen kann, welcher mich braucht. ⌘⇧U springt zur neuesten ungelesenen Benachrichtigung.
+Die wesentlichen Ergänzungen sind die Seitenleiste und das Benachrichtigungssystem. Die Seitenleiste hat vertikale Tabs, die Git-Branch, Arbeitsverzeichnis, lauschende Ports und den neuesten Benachrichtigungstext für jeden Arbeitsbereich anzeigen. Das Benachrichtigungssystem erkennt Terminal-Sequenzen (OSC 9/99/777) und bietet eine CLI (`term-mesh notify`), die Sie in Agent-Hooks für Claude Code, OpenCode usw. einbinden können. Wenn ein Agent wartet, bekommt sein Bereich einen blauen Ring und der Tab leuchtet in der Seitenleiste auf, sodass ich über Teilungen und Tabs hinweg erkennen kann, welcher mich braucht. ⌘⇧U springt zur neuesten ungelesenen Benachrichtigung.
 
 Der integrierte Browser hat eine skriptfähige API, portiert von [agent-browser](https://github.com/vercel-labs/agent-browser). Agenten können den Barrierefreiheitsbaum erfassen, Elementreferenzen erhalten, klicken, Formulare ausfüllen und JS ausführen. Sie können einen Browser-Bereich neben Ihrem Terminal teilen und Claude Code direkt mit Ihrem Entwicklungsserver interagieren lassen.
 

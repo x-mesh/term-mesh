@@ -9,7 +9,7 @@
 #   make test           — run daemon tests
 
 TAG           ?= term-mesh
-DERIVED_DATA  := /tmp/cmux-$(TAG)
+DERIVED_DATA  := /tmp/term-mesh-$(TAG)
 BUILD_DIR     := $(DERIVED_DATA)/Build/Products/Debug
 SRC_APP       := $(BUILD_DIR)/term-mesh DEV $(TAG).app
 BASE_APP      := $(BUILD_DIR)/term-mesh DEV.app
@@ -23,15 +23,15 @@ build:
 	@echo "==> Building Xcode (Debug)..."
 	@xcodebuild \
 		-project GhosttyTabs.xcodeproj \
-		-scheme cmux \
+		-scheme term-mesh \
 		-configuration Debug \
 		-destination 'platform=macOS' \
 		-derivedDataPath "$(DERIVED_DATA)" \
-		build 2>&1 | tee /tmp/cmux-xcodebuild.log | grep -E '(warning:|error:|BUILD|Compiling)'; \
+		build 2>&1 | tee /tmp/term-mesh-xcodebuild.log | grep -E '(warning:|error:|BUILD|Compiling)'; \
 		RESULT=$${PIPESTATUS[0]}; \
 		if [ $$RESULT -ne 0 ]; then \
-			echo "==> Xcode build FAILED (exit $$RESULT). Full log: /tmp/cmux-xcodebuild.log"; \
-			tail -20 /tmp/cmux-xcodebuild.log; \
+			echo "==> Xcode build FAILED (exit $$RESULT). Full log: /tmp/term-mesh-xcodebuild.log"; \
+			tail -20 /tmp/term-mesh-xcodebuild.log; \
 			exit 1; \
 		fi
 	@# Tag the app bundle (always refresh from latest build)
@@ -40,7 +40,7 @@ build:
 		cp -R "$(BASE_APP)" "$(SRC_APP)"; \
 	else \
 		echo "==> ERROR: $(BASE_APP) not found. Xcode build may have failed silently."; \
-		echo "==> Check full log: /tmp/cmux-xcodebuild.log"; \
+		echo "==> Check full log: /tmp/term-mesh-xcodebuild.log"; \
 		exit 1; \
 	fi
 	@echo "==> Building Rust daemon (release)..."

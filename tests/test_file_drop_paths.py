@@ -11,7 +11,7 @@ from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from cmux import cmux
+from termmesh import termmesh
 
 
 SHELL_ESCAPE_CHARS = "\\ ()[]{}<>\"'`!#$&;|*?\t"

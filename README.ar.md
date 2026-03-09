@@ -4,17 +4,17 @@
   <a href="README.md">English</a> | <a href="README.zh-CN.md">简体中文</a> | <a href="README.zh-TW.md">繁體中文</a> | <a href="README.ko.md">한국어</a> | <a href="README.de.md">Deutsch</a> | <a href="README.es.md">Español</a> | <a href="README.fr.md">Français</a> | <a href="README.it.md">Italiano</a> | <a href="README.da.md">Dansk</a> | <a href="README.ja.md">日本語</a> | <a href="README.pl.md">Polski</a> | <a href="README.ru.md">Русский</a> | <a href="README.bs.md">Bosanski</a> | العربية | <a href="README.no.md">Norsk</a> | <a href="README.pt-BR.md">Português (Brasil)</a> | <a href="README.th.md">ไทย</a> | <a href="README.tr.md">Türkçe</a>
 </p>
 
-<h1 align="center">cmux</h1>
+<h1 align="center">term-mesh</h1>
 <p align="center">تطبيق طرفية لنظام macOS مبني على Ghostty مع علامات تبويب عمودية وإشعارات لوكلاء البرمجة بالذكاء الاصطناعي</p>
 
 <p align="center">
-  <a href="https://github.com/manaflow-ai/cmux/releases/latest/download/cmux-macos.dmg">
-    <img src="./docs/assets/macos-badge.png" alt="تحميل cmux لنظام macOS" width="180" />
+  <a href="https://github.com/manaflow-ai/term-mesh/releases/latest/download/term-mesh-macos.dmg">
+    <img src="./docs/assets/macos-badge.png" alt="term-mesh" width="180" />
   </a>
 </p>
 
 <p align="center">
-  <img src="./docs/assets/screenshot.png" alt="لقطة شاشة cmux" width="900" />
+  <img src="./docs/assets/screenshot.png" alt="term-mesh" width="900" />
 </p>
 
 ## الميزات
@@ -33,34 +33,34 @@
 
 ### DMG (مستحسن)
 
-<a href="https://github.com/manaflow-ai/cmux/releases/latest/download/cmux-macos.dmg">
-  <img src="./docs/assets/macos-badge.png" alt="تحميل cmux لنظام macOS" width="180" />
+<a href="https://github.com/manaflow-ai/term-mesh/releases/latest/download/term-mesh-macos.dmg">
+  <img src="./docs/assets/macos-badge.png" alt="term-mesh" width="180" />
 </a>
 
-افتح ملف `.dmg` واسحب cmux إلى مجلد التطبيقات. يتم تحديث cmux تلقائياً عبر Sparkle، لذا تحتاج للتحميل مرة واحدة فقط.
+افتح ملف `.dmg` واسحب term-mesh إلى مجلد التطبيقات. يتم تحديث term-mesh تلقائياً عبر Sparkle، لذا تحتاج للتحميل مرة واحدة فقط.
 
 ### Homebrew
 
 ```bash
-brew tap manaflow-ai/cmux
-brew install --cask cmux
+brew tap manaflow-ai/term-mesh
+brew install --cask term-mesh
 ```
 
 للتحديث لاحقاً:
 
 ```bash
-brew upgrade --cask cmux
+brew upgrade --cask term-mesh
 ```
 
 عند التشغيل الأول، قد يطلب منك macOS تأكيد فتح تطبيق من مطور معروف. انقر **فتح** للمتابعة.
 
-## لماذا cmux؟
+## Why term-mesh؟
 
 أقوم بتشغيل الكثير من جلسات Claude Code وCodex بالتوازي. كنت أستخدم Ghostty مع مجموعة من الأجزاء المقسمة، وأعتمد على إشعارات macOS الأصلية لمعرفة متى يحتاجني وكيل ما. لكن نص إشعار Claude Code يكون دائماً مجرد "Claude is waiting for your input" بدون أي سياق، ومع فتح عدد كافٍ من علامات التبويب لم أعد قادراً حتى على قراءة العناوين.
 
-جربت بعض منظمات البرمجة لكن معظمها كانت تطبيقات Electron/Tauri وأداؤها كان يزعجني. كما أنني أفضل الطرفية لأن منظمات GUI تحبسك في سير عملها. لذا بنيت cmux كتطبيق macOS أصلي بـ Swift/AppKit. يستخدم libghostty لعرض الطرفية ويقرأ إعدادات Ghostty الحالية للسمات والخطوط والألوان.
+جربت بعض منظمات البرمجة لكن معظمها كانت تطبيقات Electron/Tauri وأداؤها كان يزعجني. كما أنني أفضل الطرفية لأن منظمات GUI تحبسك في سير عملها. لذا بنيت term-mesh كتطبيق macOS أصلي بـ Swift/AppKit. يستخدم libghostty لعرض الطرفية ويقرأ إعدادات Ghostty الحالية للسمات والخطوط والألوان.
 
-الإضافات الرئيسية هي الشريط الجانبي ونظام الإشعارات. يحتوي الشريط الجانبي على علامات تبويب عمودية تعرض فرع git ومجلد العمل والمنافذ المستمعة وآخر نص إشعار لكل مساحة عمل. يلتقط نظام الإشعارات تسلسلات الطرفية (OSC 9/99/777) ولديه CLI (`cmux notify`) يمكنك ربطه بخطافات الوكلاء لـ Claude Code وOpenCode وغيرها. عندما ينتظر وكيل ما، يحصل جزؤه على حلقة زرقاء وتضيء علامة التبويب في الشريط الجانبي، حتى أتمكن من معرفة أيها يحتاجني عبر الأقسام وعلامات التبويب. Cmd+Shift+U ينتقل إلى أحدث إشعار غير مقروء.
+الإضافات الرئيسية هي الشريط الجانبي ونظام الإشعارات. يحتوي الشريط الجانبي على علامات تبويب عمودية تعرض فرع git ومجلد العمل والمنافذ المستمعة وآخر نص إشعار لكل مساحة عمل. يلتقط نظام الإشعارات تسلسلات الطرفية (OSC 9/99/777) ولديه CLI (`term-mesh notify`) يمكنك ربطه بخطافات الوكلاء لـ Claude Code وOpenCode وغيرها. عندما ينتظر وكيل ما، يحصل جزؤه على حلقة زرقاء وتضيء علامة التبويب في الشريط الجانبي، حتى أتمكن من معرفة أيها يحتاجني عبر الأقسام وعلامات التبويب. Cmd+Shift+U ينتقل إلى أحدث إشعار غير مقروء.
 
 المتصفح المدمج لديه API قابل للبرمجة مأخوذ من [agent-browser](https://github.com/vercel-labs/agent-browser). يمكن للوكلاء التقاط شجرة إمكانية الوصول والحصول على مراجع العناصر والنقر وملء النماذج وتنفيذ JS. يمكنك تقسيم جزء متصفح بجانب الطرفية وجعل Claude Code يتفاعل مع خادم التطوير مباشرة.
 

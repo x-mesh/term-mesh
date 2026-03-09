@@ -16,7 +16,7 @@ import sys
 import time
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from cmux import cmux, cmuxError
+from termmesh import termmesh, termmeshError
 
 
 def run_osascript(script: str) -> subprocess.CompletedProcess[str]:

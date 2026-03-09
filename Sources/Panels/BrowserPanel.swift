@@ -124,37 +124,37 @@ enum BrowserThemeSettings {
 }
 
 enum BrowserLinkOpenSettings {
-    static let openTerminalLinksInCmuxBrowserKey = "browserOpenTerminalLinksInCmuxBrowser"
-    static let defaultOpenTerminalLinksInCmuxBrowser: Bool = true
+    static let openTerminalLinksInTermMeshBrowserKey = "browserOpenTerminalLinksInTermMeshBrowser"
+    static let defaultOpenTerminalLinksInTermMeshBrowser: Bool = true
 
-    static let interceptTerminalOpenCommandInCmuxBrowserKey = "browserInterceptTerminalOpenCommandInCmuxBrowser"
-    static let defaultInterceptTerminalOpenCommandInCmuxBrowser: Bool = true
+    static let interceptTerminalOpenCommandInTermMeshBrowserKey = "browserInterceptTerminalOpenCommandInTermMeshBrowser"
+    static let defaultInterceptTerminalOpenCommandInTermMeshBrowser: Bool = true
 
     static let browserHostWhitelistKey = "browserHostWhitelist"
     static let defaultBrowserHostWhitelist: String = ""
 
-    static func openTerminalLinksInCmuxBrowser(defaults: UserDefaults = .standard) -> Bool {
-        if defaults.object(forKey: openTerminalLinksInCmuxBrowserKey) == nil {
-            return defaultOpenTerminalLinksInCmuxBrowser
+    static func openTerminalLinksInTermMeshBrowser(defaults: UserDefaults = .standard) -> Bool {
+        if defaults.object(forKey: openTerminalLinksInTermMeshBrowserKey) == nil {
+            return defaultOpenTerminalLinksInTermMeshBrowser
         }
-        return defaults.bool(forKey: openTerminalLinksInCmuxBrowserKey)
+        return defaults.bool(forKey: openTerminalLinksInTermMeshBrowserKey)
     }
 
-    static func interceptTerminalOpenCommandInCmuxBrowser(defaults: UserDefaults = .standard) -> Bool {
-        if defaults.object(forKey: interceptTerminalOpenCommandInCmuxBrowserKey) != nil {
-            return defaults.bool(forKey: interceptTerminalOpenCommandInCmuxBrowserKey)
+    static func interceptTerminalOpenCommandInTermMeshBrowser(defaults: UserDefaults = .standard) -> Bool {
+        if defaults.object(forKey: interceptTerminalOpenCommandInTermMeshBrowserKey) != nil {
+            return defaults.bool(forKey: interceptTerminalOpenCommandInTermMeshBrowserKey)
         }
 
         // Migrate existing behavior for users who only had the link-click toggle.
-        if defaults.object(forKey: openTerminalLinksInCmuxBrowserKey) != nil {
-            return defaults.bool(forKey: openTerminalLinksInCmuxBrowserKey)
+        if defaults.object(forKey: openTerminalLinksInTermMeshBrowserKey) != nil {
+            return defaults.bool(forKey: openTerminalLinksInTermMeshBrowserKey)
         }
 
-        return defaultInterceptTerminalOpenCommandInCmuxBrowser
+        return defaultInterceptTerminalOpenCommandInTermMeshBrowser
     }
 
-    static func initialInterceptTerminalOpenCommandInCmuxBrowserValue(defaults: UserDefaults = .standard) -> Bool {
-        interceptTerminalOpenCommandInCmuxBrowser(defaults: defaults)
+    static func initialInterceptTerminalOpenCommandInTermMeshBrowserValue(defaults: UserDefaults = .standard) -> Bool {
+        interceptTerminalOpenCommandInTermMeshBrowser(defaults: defaults)
     }
 
     static func hostWhitelist(defaults: UserDefaults = .standard) -> [String] {
@@ -403,11 +403,11 @@ enum BrowserUserAgentSettings {
 }
 
 func normalizedBrowserHistoryNamespace(bundleIdentifier: String) -> String {
-    if bundleIdentifier.hasPrefix("com.cmuxterm.app.debug.") {
-        return "com.cmuxterm.app.debug"
+    if bundleIdentifier.hasPrefix("com.termmesh.app.debug.") {
+        return "com.termmesh.app.debug"
     }
-    if bundleIdentifier.hasPrefix("com.cmuxterm.app.staging.") {
-        return "com.cmuxterm.app.staging"
+    if bundleIdentifier.hasPrefix("com.termmesh.app.staging.") {
+        return "com.termmesh.app.staging"
     }
     return bundleIdentifier
 }
@@ -915,7 +915,7 @@ final class BrowserHistoryStore: ObservableObject {
         guard let appSupport = fm.urls(for: .applicationSupportDirectory, in: .userDomainMask).first else {
             return nil
         }
-        let bundleId = Bundle.main.bundleIdentifier ?? "cmux"
+        let bundleId = Bundle.main.bundleIdentifier ?? "term-mesh"
         let namespace = normalizedBrowserHistoryNamespace(bundleIdentifier: bundleId)
         let dir = appSupport.appendingPathComponent(namespace, isDirectory: true)
         return dir.appendingPathComponent("browser_history.json", isDirectory: false)
@@ -953,8 +953,8 @@ actor BrowserSearchSuggestionService {
 
         // Deterministic UI-test hook for validating remote suggestion rendering
         // without relying on external network behavior.
-        let forced = ProcessInfo.processInfo.environment["CMUX_UI_TEST_REMOTE_SUGGESTIONS_JSON"]
-            ?? UserDefaults.standard.string(forKey: "CMUX_UI_TEST_REMOTE_SUGGESTIONS_JSON")
+        let forced = termMeshEnv("UI_TEST_REMOTE_SUGGESTIONS_JSON")
+            ?? UserDefaults.standard.string(forKey: "TERMMESH_UI_TEST_REMOTE_SUGGESTIONS_JSON") ?? UserDefaults.standard.string(forKey: "CMUX_UI_TEST_REMOTE_SUGGESTIONS_JSON")
         if let forced,
            let data = forced.data(using: .utf8),
            let parsed = try? JSONSerialization.jsonObject(with: data) as? [Any] {
@@ -1263,7 +1263,7 @@ final class BrowserPanel: Panel, ObservableObject {
         config.defaultWebpagePreferences.allowsContentJavaScript = true
 
         // Set up web view
-        let webView = CmuxWebView(frame: .zero, configuration: config)
+        let webView = TermMeshWebView(frame: .zero, configuration: config)
         webView.allowsBackForwardNavigationGestures = true
 
         // Required for Web Inspector support on recent WebKit SDKs.
@@ -1765,13 +1765,13 @@ final class BrowserPanel: Panel, ObservableObject {
         alert.informativeText = """
         \(host) uses plain HTTP, so traffic can be read or modified on the network.
 
-        Open this URL in your default browser, or proceed in cmux.
+        Open this URL in your default browser, or proceed in term-mesh.
         """
         alert.addButton(withTitle: "Open in Default Browser")
-        alert.addButton(withTitle: "Proceed in cmux")
+        alert.addButton(withTitle: "Proceed in term-mesh")
         alert.addButton(withTitle: "Cancel")
         alert.showsSuppressionButton = true
-        alert.suppressionButton?.title = "Always allow this host in cmux"
+        alert.suppressionButton?.title = "Always allow this host in term-mesh"
 
         let response = alert.runModal()
         if browserShouldPersistInsecureHTTPAllowlistSelection(
@@ -1884,16 +1884,16 @@ extension BrowserPanel {
             "\(debugDeveloperToolsStateSummary()) \(debugDeveloperToolsGeometrySummary())"
         )
 #endif
-        guard let inspector = webView.cmuxInspectorObject() else { return false }
+        guard let inspector = webView.termMeshInspectorObject() else { return false }
         let isVisibleSelector = NSSelectorFromString("isVisible")
-        let visible = inspector.cmuxCallBool(selector: isVisibleSelector) ?? false
+        let visible = inspector.termMeshCallBool(selector: isVisibleSelector) ?? false
         let targetVisible = !visible
         let selector = NSSelectorFromString(targetVisible ? "show" : "close")
         guard inspector.responds(to: selector) else { return false }
-        inspector.cmuxCallVoid(selector: selector)
+        inspector.termMeshCallVoid(selector: selector)
         preferredDeveloperToolsVisible = targetVisible
         if targetVisible {
-            let visibleAfterToggle = inspector.cmuxCallBool(selector: isVisibleSelector) ?? false
+            let visibleAfterToggle = inspector.termMeshCallBool(selector: isVisibleSelector) ?? false
             if visibleAfterToggle {
                 cancelDeveloperToolsRestoreRetry()
             } else {
@@ -1922,15 +1922,15 @@ extension BrowserPanel {
 
     @discardableResult
     func showDeveloperTools() -> Bool {
-        guard let inspector = webView.cmuxInspectorObject() else { return false }
-        let visible = inspector.cmuxCallBool(selector: NSSelectorFromString("isVisible")) ?? false
+        guard let inspector = webView.termMeshInspectorObject() else { return false }
+        let visible = inspector.termMeshCallBool(selector: NSSelectorFromString("isVisible")) ?? false
         if !visible {
             let showSelector = NSSelectorFromString("show")
             guard inspector.responds(to: showSelector) else { return false }
-            inspector.cmuxCallVoid(selector: showSelector)
+            inspector.termMeshCallVoid(selector: showSelector)
         }
         preferredDeveloperToolsVisible = true
-        if (inspector.cmuxCallBool(selector: NSSelectorFromString("isVisible")) ?? false) {
+        if (inspector.termMeshCallBool(selector: NSSelectorFromString("isVisible")) ?? false) {
             cancelDeveloperToolsRestoreRetry()
         } else {
             scheduleDeveloperToolsRestoreRetry()
@@ -1941,7 +1941,7 @@ extension BrowserPanel {
     @discardableResult
     func showDeveloperToolsConsole() -> Bool {
         guard showDeveloperTools() else { return false }
-        guard let inspector = webView.cmuxInspectorObject() else { return true }
+        guard let inspector = webView.termMeshInspectorObject() else { return true }
         // WebKit private inspector API differs by OS; try known console selectors.
         let consoleSelectors = [
             "showConsole",
@@ -1951,7 +1951,7 @@ extension BrowserPanel {
         for raw in consoleSelectors {
             let selector = NSSelectorFromString(raw)
             if inspector.responds(to: selector) {
-                inspector.cmuxCallVoid(selector: selector)
+                inspector.termMeshCallVoid(selector: selector)
                 break
             }
         }
@@ -1960,8 +1960,8 @@ extension BrowserPanel {
 
     /// Called before WKWebView detaches so manual inspector closes are respected.
     func syncDeveloperToolsPreferenceFromInspector(preserveVisibleIntent: Bool = false) {
-        guard let inspector = webView.cmuxInspectorObject() else { return }
-        guard let visible = inspector.cmuxCallBool(selector: NSSelectorFromString("isVisible")) else { return }
+        guard let inspector = webView.termMeshInspectorObject() else { return }
+        guard let visible = inspector.termMeshCallBool(selector: NSSelectorFromString("isVisible")) else { return }
         if visible {
             preferredDeveloperToolsVisible = true
             cancelDeveloperToolsRestoreRetry()
@@ -1981,7 +1981,7 @@ extension BrowserPanel {
             forceDeveloperToolsRefreshOnNextAttach = false
             return
         }
-        guard let inspector = webView.cmuxInspectorObject() else {
+        guard let inspector = webView.termMeshInspectorObject() else {
             scheduleDeveloperToolsRestoreRetry()
             return
         }
@@ -1989,7 +1989,7 @@ extension BrowserPanel {
         let shouldForceRefresh = forceDeveloperToolsRefreshOnNextAttach
         forceDeveloperToolsRefreshOnNextAttach = false
 
-        let visible = inspector.cmuxCallBool(selector: NSSelectorFromString("isVisible")) ?? false
+        let visible = inspector.termMeshCallBool(selector: NSSelectorFromString("isVisible")) ?? false
         if visible {
             #if DEBUG
             if shouldForceRefresh {
@@ -2010,9 +2010,9 @@ extension BrowserPanel {
             dlog("browser.devtools refresh.forceShowWhenHidden panel=\(id.uuidString.prefix(5)) \(debugDeveloperToolsStateSummary())")
         }
         #endif
-        inspector.cmuxCallVoid(selector: selector)
+        inspector.termMeshCallVoid(selector: selector)
         preferredDeveloperToolsVisible = true
-        let visibleAfterShow = inspector.cmuxCallBool(selector: NSSelectorFromString("isVisible")) ?? false
+        let visibleAfterShow = inspector.termMeshCallBool(selector: NSSelectorFromString("isVisible")) ?? false
         if visibleAfterShow {
             cancelDeveloperToolsRestoreRetry()
         } else {
@@ -2022,18 +2022,18 @@ extension BrowserPanel {
 
     @discardableResult
     func isDeveloperToolsVisible() -> Bool {
-        guard let inspector = webView.cmuxInspectorObject() else { return false }
-        return inspector.cmuxCallBool(selector: NSSelectorFromString("isVisible")) ?? false
+        guard let inspector = webView.termMeshInspectorObject() else { return false }
+        return inspector.termMeshCallBool(selector: NSSelectorFromString("isVisible")) ?? false
     }
 
     @discardableResult
     func hideDeveloperTools() -> Bool {
-        guard let inspector = webView.cmuxInspectorObject() else { return false }
-        let visible = inspector.cmuxCallBool(selector: NSSelectorFromString("isVisible")) ?? false
+        guard let inspector = webView.termMeshInspectorObject() else { return false }
+        let visible = inspector.termMeshCallBool(selector: NSSelectorFromString("isVisible")) ?? false
         if visible {
             let selector = NSSelectorFromString("close")
             guard inspector.responds(to: selector) else { return false }
-            inspector.cmuxCallVoid(selector: selector)
+            inspector.termMeshCallVoid(selector: selector)
         }
         preferredDeveloperToolsVisible = false
         forceDeveloperToolsRefreshOnNextAttach = false
@@ -2221,7 +2221,7 @@ private extension BrowserPanel {
 
         return """
         (() => {
-          const metaId = 'cmux-browser-theme-mode-meta';
+          const metaId = 'term-mesh-browser-theme-mode-meta';
           const colorScheme = \(colorSchemeLiteral);
           const root = document.documentElement || document.body;
           if (!root) return;
@@ -2229,7 +2229,7 @@ private extension BrowserPanel {
           let meta = document.getElementById(metaId);
           if (colorScheme) {
             root.style.setProperty('color-scheme', colorScheme, 'important');
-            root.setAttribute('data-cmux-browser-theme', colorScheme);
+            root.setAttribute('data-term-mesh-browser-theme', colorScheme);
             if (!meta) {
               meta = document.createElement('meta');
               meta.id = metaId;
@@ -2239,7 +2239,7 @@ private extension BrowserPanel {
             meta.setAttribute('content', colorScheme);
           } else {
             root.style.removeProperty('color-scheme');
-            root.removeAttribute('data-cmux-browser-theme');
+            root.removeAttribute('data-term-mesh-browser-theme');
             if (meta) {
               meta.remove();
             }
@@ -2304,7 +2304,7 @@ extension BrowserPanel {
     func debugDeveloperToolsStateSummary() -> String {
         let preferred = preferredDeveloperToolsVisible ? 1 : 0
         let visible = isDeveloperToolsVisible() ? 1 : 0
-        let inspector = webView.cmuxInspectorObject() == nil ? 0 : 1
+        let inspector = webView.termMeshInspectorObject() == nil ? 0 : 1
         let attached = webView.superview == nil ? 0 : 1
         let inWindow = webView.window == nil ? 0 : 1
         let forceRefresh = forceDeveloperToolsRefreshOnNextAttach ? 1 : 0
@@ -2349,7 +2349,7 @@ private extension BrowserPanel {
 }
 
 private extension WKWebView {
-    func cmuxInspectorObject() -> NSObject? {
+    func termMeshInspectorObject() -> NSObject? {
         let selector = NSSelectorFromString("_inspector")
         guard responds(to: selector),
               let inspector = perform(selector)?.takeUnretainedValue() as? NSObject else {
@@ -2360,14 +2360,14 @@ private extension WKWebView {
 }
 
 private extension NSObject {
-    func cmuxCallBool(selector: Selector) -> Bool? {
+    func termMeshCallBool(selector: Selector) -> Bool? {
         guard responds(to: selector) else { return nil }
         typealias Fn = @convention(c) (AnyObject, Selector) -> Bool
         let fn = unsafeBitCast(method(for: selector), to: Fn.self)
         return fn(self, selector)
     }
 
-    func cmuxCallVoid(selector: Selector) {
+    func termMeshCallVoid(selector: Selector) {
         guard responds(to: selector) else { return }
         typealias Fn = @convention(c) (AnyObject, Selector) -> Void
         let fn = unsafeBitCast(method(for: selector), to: Fn.self)
@@ -2393,7 +2393,7 @@ private class BrowserDownloadDelegate: NSObject, WKDownloadDelegate {
     var onDownloadFailed: ((Error) -> Void)?
 
     private static let tempDir: URL = {
-        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("cmux-downloads", isDirectory: true)
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("term-mesh-downloads", isDirectory: true)
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         return dir
     }()

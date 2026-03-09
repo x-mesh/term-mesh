@@ -850,7 +850,7 @@ extension TerminalController {
             NSApp.unhide(nil)
             let hasMainTerminalWindow = NSApp.windows.contains { window in
                 guard let raw = window.identifier?.rawValue else { return false }
-                return raw == "cmux.main" || raw.hasPrefix("cmux.main.")
+                return raw == "term-mesh.main" || raw.hasPrefix("term-mesh.main.")
             }
 
             if !hasMainTerminalWindow {
@@ -861,7 +861,7 @@ extension TerminalController {
                 ?? NSApp.keyWindow
                 ?? NSApp.windows.first(where: { win in
                     guard let raw = win.identifier?.rawValue else { return false }
-                    return raw == "cmux.main" || raw.hasPrefix("cmux.main.")
+                    return raw == "term-mesh.main" || raw.hasPrefix("term-mesh.main.")
                 })
                 ?? NSApp.windows.first {
                 window.makeKeyAndOrderFront(nil)
@@ -1177,7 +1177,7 @@ extension TerminalController {
         case "tabtransfer", "tab-transfer", "com.splittabbar.tabtransfer":
             return DragOverlayRoutingPolicy.bonsplitTabTransferType
         case "sidebarreorder", "sidebar-reorder", "sidebar_tab_reorder",
-            "com.cmux.sidebar-tab-reorder":
+            "com.termmesh.sidebar-tab-reorder":
             return DragOverlayRoutingPolicy.sidebarTabReorderType
         default:
             // Allow explicit UTI strings for ad-hoc debug probes.
@@ -1204,7 +1204,7 @@ extension TerminalController {
                 ?? NSApp.keyWindow
                 ?? NSApp.windows.first(where: { win in
                     guard let raw = win.identifier?.rawValue else { return false }
-                    return raw == "cmux.main" || raw.hasPrefix("cmux.main.")
+                    return raw == "term-mesh.main" || raw.hasPrefix("term-mesh.main.")
                 }),
                   let contentView = window.contentView,
                   let themeFrame = contentView.superview else { return }
@@ -1245,7 +1245,7 @@ extension TerminalController {
                 ?? NSApp.keyWindow
                 ?? NSApp.windows.first(where: { win in
                     guard let raw = win.identifier?.rawValue else { return false }
-                    return raw == "cmux.main" || raw.hasPrefix("cmux.main.")
+                    return raw == "term-mesh.main" || raw.hasPrefix("term-mesh.main.")
                 }),
                   let contentView = window.contentView,
                   let themeFrame = contentView.superview else { return }
@@ -2146,7 +2146,7 @@ extension TerminalController {
         let snapshotId = "\(timestamp)_\(shortId)"
 
         let outputDir = FileManager.default.temporaryDirectory
-            .appendingPathComponent("cmux-screenshots")
+            .appendingPathComponent("term-mesh-screenshots")
         try? FileManager.default.createDirectory(at: outputDir, withIntermediateDirectories: true)
         let filename = label.isEmpty ? "\(snapshotId).png" : "\(label)_\(snapshotId).png"
         let outputPath = outputDir.appendingPathComponent(filename)
@@ -2462,7 +2462,7 @@ extension TerminalController {
 
         // Determine output path
         let outputDir = FileManager.default.temporaryDirectory
-            .appendingPathComponent("cmux-screenshots")
+            .appendingPathComponent("term-mesh-screenshots")
         try? FileManager.default.createDirectory(at: outputDir, withIntermediateDirectories: true)
 
         let filename = label.isEmpty ? "\(screenshotId).png" : "\(label)_\(screenshotId).png"

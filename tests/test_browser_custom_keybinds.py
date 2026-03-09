@@ -19,7 +19,7 @@ import time
 from typing import Optional
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from cmux import cmux
+from termmesh import termmesh
 
 def focused_pane_id(client: cmux) -> Optional[str]:
     for _idx, pane_id, _count, is_focused in client.list_panes():

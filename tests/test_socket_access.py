@@ -25,7 +25,7 @@ import glob
 import plistlib
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from cmux import cmux, cmuxError
+from termmesh import termmesh, termmeshError
 
 
 class TestResult:

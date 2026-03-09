@@ -10,7 +10,7 @@ import Bonsplit
 import IOSurface
 
 #if os(macOS)
-private func cmuxShouldUseTransparentBackgroundWindow() -> Bool {
+private func termMeshShouldUseTransparentBackgroundWindow() -> Bool {
     let defaults = UserDefaults.standard
     let sidebarBlendMode = defaults.string(forKey: "sidebarBlendMode") ?? "withinWindow"
     let bgGlassEnabled = defaults.object(forKey: "bgGlassEnabled") as? Bool ?? true
@@ -19,17 +19,17 @@ private func cmuxShouldUseTransparentBackgroundWindow() -> Bool {
 #endif
 
 #if DEBUG
-private func cmuxChildExitProbePath() -> String? {
+private func termMeshChildExitProbePath() -> String? {
     let env = ProcessInfo.processInfo.environment
-    guard env["CMUX_UI_TEST_CHILD_EXIT_KEYBOARD_SETUP"] == "1",
-          let path = env["CMUX_UI_TEST_CHILD_EXIT_KEYBOARD_PATH"],
+    guard (env["TERMMESH_UI_TEST_CHILD_EXIT_KEYBOARD_SETUP"] ?? env["CMUX_UI_TEST_CHILD_EXIT_KEYBOARD_SETUP"]) == "1",
+          let path = env["TERMMESH_UI_TEST_CHILD_EXIT_KEYBOARD_PATH"] ?? env["CMUX_UI_TEST_CHILD_EXIT_KEYBOARD_PATH"],
           !path.isEmpty else {
         return nil
     }
     return path
 }
 
-private func cmuxLoadChildExitProbe(at path: String) -> [String: String] {
+private func termMeshLoadChildExitProbe(at path: String) -> [String: String] {
     guard let data = try? Data(contentsOf: URL(fileURLWithPath: path)),
           let object = try? JSONSerialization.jsonObject(with: data) as? [String: String] else {
         return [:]
@@ -37,9 +37,9 @@ private func cmuxLoadChildExitProbe(at path: String) -> [String: String] {
     return object
 }
 
-private func cmuxWriteChildExitProbe(_ updates: [String: String], increments: [String: Int] = [:]) {
-    guard let path = cmuxChildExitProbePath() else { return }
-    var payload = cmuxLoadChildExitProbe(at: path)
+private func termMeshWriteChildExitProbe(_ updates: [String: String], increments: [String: Int] = [:]) {
+    guard let path = termMeshChildExitProbePath() else { return }
+    var payload = termMeshLoadChildExitProbe(at: path)
     for (key, by) in increments {
         let current = Int(payload[key] ?? "") ?? 0
         payload[key] = String(current + by)
@@ -51,7 +51,7 @@ private func cmuxWriteChildExitProbe(_ updates: [String: String], increments: [S
     try? out.write(to: URL(fileURLWithPath: path), options: .atomic)
 }
 
-private func cmuxScalarHex(_ value: String?) -> String {
+private func termMeshScalarHex(_ value: String?) -> String {
     guard let value else { return "" }
     return value.unicodeScalars
         .map { String(format: "%04X", $0.value) }
@@ -267,12 +267,12 @@ class GhosttyApp {
     private static func resolveBackgroundLogURL(
         environment: [String: String] = ProcessInfo.processInfo.environment
     ) -> URL {
-        if let explicitPath = environment["CMUX_DEBUG_BG_LOG"],
+        if let explicitPath = environment["TERMMESH_DEBUG_BG_LOG"] ?? environment["CMUX_DEBUG_BG_LOG"],
            !explicitPath.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             return URL(fileURLWithPath: explicitPath)
         }
 
-        if let debugLogPath = environment["CMUX_DEBUG_LOG"],
+        if let debugLogPath = environment["TERMMESH_DEBUG_LOG"] ?? environment["CMUX_DEBUG_LOG"],
            !debugLogPath.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             let baseURL = URL(fileURLWithPath: debugLogPath)
             let extensionSeparatorIndex = baseURL.lastPathComponent.lastIndex(of: ".")
@@ -281,20 +281,20 @@ class GhosttyApp {
             return baseURL.deletingLastPathComponent().appendingPathComponent(bgName)
         }
 
-        return URL(fileURLWithPath: "/tmp/cmux-bg.log")
+        return URL(fileURLWithPath: "/tmp/term-mesh-bg.log")
     }
 
     let backgroundLogEnabled = {
-        if ProcessInfo.processInfo.environment["CMUX_DEBUG_BG"] == "1" {
+        if termMeshEnv("DEBUG_BG") == "1" {
             return true
         }
-        if ProcessInfo.processInfo.environment["CMUX_DEBUG_LOG"] != nil {
+        if termMeshEnv("DEBUG_LOG") != nil {
             return true
         }
         if ProcessInfo.processInfo.environment["GHOSTTYTABS_DEBUG_BG"] == "1" {
             return true
         }
-        if UserDefaults.standard.bool(forKey: "cmuxDebugBG") {
+        if UserDefaults.standard.bool(forKey: "termMeshDebugBG") {
             return true
         }
         return UserDefaults.standard.bool(forKey: "GhosttyTabsDebugBG")
@@ -378,7 +378,7 @@ class GhosttyApp {
     }
 
     #if DEBUG
-    private static let initLogPath = "/tmp/cmux-ghostty-init.log"
+    private static let initLogPath = "/tmp/term-mesh-ghostty-init.log"
 
     private static func initLog(_ message: String) {
         let timestamp = ISO8601DateFormatter().string(from: Date())
@@ -495,7 +495,7 @@ class GhosttyApp {
             let callbackTabId = callbackContext.tabId
 
 #if DEBUG
-            cmuxWriteChildExitProbe(
+            termMeshWriteChildExitProbe(
                 [
                     "probeCloseSurfaceNeedsConfirm": needsConfirmClose ? "1" : "0",
                     "probeCloseSurfaceTabId": callbackTabId?.uuidString ?? "",
@@ -539,7 +539,7 @@ class GhosttyApp {
             #endif
 
             // If the user config is invalid, prefer a minimal fallback configuration so
-            // cmux still launches with working terminals.
+            // term-mesh still launches with working terminals.
             ghostty_config_free(primaryConfig)
 
             guard let fallbackConfig = ghostty_config_new() else {
@@ -976,7 +976,7 @@ class GhosttyApp {
         if action.tag == GHOSTTY_ACTION_SHOW_CHILD_EXITED {
             // The child (shell) exited. Ghostty will fall back to printing
             // "Process exited. Press any key..." into the terminal unless the host
-            // handles this action. For cmux, the correct behavior is to close
+            // handles this action. For term-mesh, the correct behavior is to close
             // the panel immediately (no prompt).
 #if DEBUG
             dlog(
@@ -985,7 +985,7 @@ class GhosttyApp {
             )
 #endif
 #if DEBUG
-            cmuxWriteChildExitProbe(
+            termMeshWriteChildExitProbe(
                 [
                     "probeShowChildExitedTabId": callbackTabId?.uuidString ?? "",
                     "probeShowChildExitedSurfaceId": callbackSurfaceId?.uuidString ?? "",
@@ -1240,7 +1240,7 @@ class GhosttyApp {
             guard let cstr = openUrl.url else { return false }
             let urlString = String(cString: cstr)
             guard let target = resolveTerminalOpenURLTarget(urlString) else { return false }
-            if !BrowserLinkOpenSettings.openTerminalLinksInCmuxBrowser() {
+            if !BrowserLinkOpenSettings.openTerminalLinksInTermMeshBrowser() {
                 return performOnMain {
                     NSWorkspace.shared.open(target.url)
                 }
@@ -1285,7 +1285,7 @@ class GhosttyApp {
 
     private func applyBackgroundToKeyWindow() {
         guard let window = activeMainWindow() else { return }
-        if cmuxShouldUseTransparentBackgroundWindow() {
+        if termMeshShouldUseTransparentBackgroundWindow() {
             window.backgroundColor = .clear
             window.isOpaque = false
             if backgroundLogEnabled {
@@ -1304,12 +1304,12 @@ class GhosttyApp {
     private func activeMainWindow() -> NSWindow? {
         let keyWindow = NSApp.keyWindow
         if let raw = keyWindow?.identifier?.rawValue,
-           raw == "cmux.main" || raw.hasPrefix("cmux.main.") {
+           raw == "term-mesh.main" || raw.hasPrefix("term-mesh.main.") {
             return keyWindow
         }
         return NSApp.windows.first(where: { window in
             guard let raw = window.identifier?.rawValue else { return false }
-            return raw == "cmux.main" || raw.hasPrefix("cmux.main.")
+            return raw == "term-mesh.main" || raw.hasPrefix("term-mesh.main.")
         })
     }
 
@@ -1324,7 +1324,7 @@ class GhosttyApp {
         backgroundLogSequence &+= 1
         let sequence = backgroundLogSequence
         let line =
-            "\(timestamp) seq=\(sequence) t+\(String(format: "%.3f", uptimeMs))ms thread=\(threadLabel) frame60=\(frame60) frame120=\(frame120) cmux bg: \(message)\n"
+            "\(timestamp) seq=\(sequence) t+\(String(format: "%.3f", uptimeMs))ms thread=\(threadLabel) frame60=\(frame60) frame120=\(frame120) term-mesh bg: \(message)\n"
         if let data = line.data(using: .utf8) {
             if FileManager.default.fileExists(atPath: backgroundLogURL.path) == false {
                 FileManager.default.createFile(atPath: backgroundLogURL.path, contents: nil)
@@ -1388,15 +1388,15 @@ final class TerminalSurface: Identifiable, ObservableObject {
     var isViewInWindow: Bool { hostedView.window != nil }
     let id: UUID
     private(set) var tabId: UUID
-    /// Port ordinal for CMUX_PORT range assignment
+    /// Port ordinal for TERMMESH_PORT range assignment
     var portOrdinal: Int = 0
     /// Snapshotted once per app session so all workspaces use consistent values
     private static let sessionPortBase: Int = {
-        let val = UserDefaults.standard.integer(forKey: "cmuxPortBase")
+        let val = UserDefaults.standard.integer(forKey: "termMeshPortBase")
         return val > 0 ? val : 9100
     }()
     private static let sessionPortRangeSize: Int = {
-        let val = UserDefaults.standard.integer(forKey: "cmuxPortRange")
+        let val = UserDefaults.standard.integer(forKey: "termMeshPortRange")
         return val > 0 ? val : 10
     }()
     private let surfaceContext: ghostty_surface_context_e
@@ -1477,8 +1477,8 @@ final class TerminalSurface: Identifiable, ObservableObject {
         surfaceView.tabId = newTabId
     }
     #if DEBUG
-    private static let surfaceLogPath = "/tmp/cmux-ghostty-surface.log"
-    private static let sizeLogPath = "/tmp/cmux-ghostty-size.log"
+    private static let surfaceLogPath = "/tmp/term-mesh-ghostty-surface.log"
+    private static let sizeLogPath = "/tmp/term-mesh-ghostty-size.log"
 
     private static func surfaceLog(_ message: String) {
         let timestamp = ISO8601DateFormatter().string(from: Date())
@@ -1494,7 +1494,7 @@ final class TerminalSurface: Identifiable, ObservableObject {
 
     private static func sizeLog(_ message: String) {
         let env = ProcessInfo.processInfo.environment
-        guard env["CMUX_UI_TEST_SPLIT_CLOSE_RIGHT_VISUAL"] == "1" else { return }
+        guard (env["TERMMESH_UI_TEST_SPLIT_CLOSE_RIGHT_VISUAL"] ?? env["CMUX_UI_TEST_SPLIT_CLOSE_RIGHT_VISUAL"]) == "1" else { return }
         let timestamp = ISO8601DateFormatter().string(from: Date())
         let line = "[\(timestamp)] \(message)\n"
         if let handle = FileHandle(forWritingAtPath: sizeLogPath) {
@@ -1636,7 +1636,7 @@ final class TerminalSurface: Identifiable, ObservableObject {
 #if DEBUG
         let templateFontText = String(format: "%.2f", surfaceConfig.font_size)
         dlog(
-            "zoom.create surface=\(id.uuidString.prefix(5)) context=\(cmuxSurfaceContextName(surfaceContext)) " +
+            "zoom.create surface=\(id.uuidString.prefix(5)) context=\(termMeshSurfaceContextName(surfaceContext)) " +
             "templateFont=\(templateFontText)"
         )
 #endif
@@ -1668,26 +1668,40 @@ final class TerminalSurface: Identifiable, ObservableObject {
             env[key] = value
         }
 
+        env["TERMMESH_SURFACE_ID"] = id.uuidString
         env["CMUX_SURFACE_ID"] = id.uuidString
+        env["TERMMESH_WORKSPACE_ID"] = tabId.uuidString
         env["CMUX_WORKSPACE_ID"] = tabId.uuidString
         // Backward-compatible shell integration keys used by existing scripts/tests.
+        env["TERMMESH_PANEL_ID"] = id.uuidString
         env["CMUX_PANEL_ID"] = id.uuidString
+        env["TERMMESH_TAB_ID"] = tabId.uuidString
         env["CMUX_TAB_ID"] = tabId.uuidString
-        env["CMUX_SOCKET_PATH"] = SocketControlSettings.socketPath()
+        let socketPath = SocketControlSettings.socketPath()
+        env["TERMMESH_SOCKET_PATH"] = socketPath
+        env["CMUX_SOCKET_PATH"] = socketPath
         if let bundleId = Bundle.main.bundleIdentifier, !bundleId.isEmpty {
+            env["TERMMESH_BUNDLE_ID"] = bundleId
             env["CMUX_BUNDLE_ID"] = bundleId
         }
 
         // Port range for this workspace (base/range snapshotted once per app session)
         do {
             let startPort = Self.sessionPortBase + portOrdinal * Self.sessionPortRangeSize
-            env["CMUX_PORT"] = String(startPort)
-            env["CMUX_PORT_END"] = String(startPort + Self.sessionPortRangeSize - 1)
-            env["CMUX_PORT_RANGE"] = String(Self.sessionPortRangeSize)
+            let portStr = String(startPort)
+            let portEndStr = String(startPort + Self.sessionPortRangeSize - 1)
+            let portRangeStr = String(Self.sessionPortRangeSize)
+            env["TERMMESH_PORT"] = portStr
+            env["CMUX_PORT"] = portStr
+            env["TERMMESH_PORT_END"] = portEndStr
+            env["CMUX_PORT_END"] = portEndStr
+            env["TERMMESH_PORT_RANGE"] = portRangeStr
+            env["CMUX_PORT_RANGE"] = portRangeStr
         }
 
         let claudeHooksEnabled = ClaudeCodeIntegrationSettings.hooksEnabled()
         if !claudeHooksEnabled {
+            env["TERMMESH_CLAUDE_HOOKS_DISABLED"] = "1"
             env["CMUX_CLAUDE_HOOKS_DISABLED"] = "1"
         }
 
@@ -1706,7 +1720,9 @@ final class TerminalSurface: Identifiable, ObservableObject {
         let shellIntegrationEnabled = UserDefaults.standard.object(forKey: "sidebarShellIntegration") as? Bool ?? true
         if shellIntegrationEnabled,
            let integrationDir = Bundle.main.resourceURL?.appendingPathComponent("shell-integration").path {
+            env["TERMMESH_SHELL_INTEGRATION"] = "1"
             env["CMUX_SHELL_INTEGRATION"] = "1"
+            env["TERMMESH_SHELL_INTEGRATION_DIR"] = integrationDir
             env["CMUX_SHELL_INTEGRATION_DIR"] = integrationDir
 
             let shell = (env["SHELL"]?.isEmpty == false ? env["SHELL"] : nil)
@@ -1730,6 +1746,7 @@ final class TerminalSurface: Identifiable, ObservableObject {
                         isGhosttyInjected = (candidateZdotdir == ghosttyZdotdir)
                     }
                     if !isGhosttyInjected {
+                        env["TERMMESH_ZSH_ZDOTDIR"] = candidateZdotdir
                         env["CMUX_ZSH_ZDOTDIR"] = candidateZdotdir
                     }
                 }
@@ -1842,7 +1859,7 @@ final class TerminalSurface: Identifiable, ObservableObject {
         // (new surface, split, new workspace) preserve zoom from the source terminal.
         if let inheritedFontPoints = configTemplate?.font_size,
            inheritedFontPoints > 0 {
-            let currentFontPoints = cmuxCurrentSurfaceFontSizePoints(createdSurface)
+            let currentFontPoints = termMeshCurrentSurfaceFontSizePoints(createdSurface)
             let shouldReapply = {
                 guard let currentFontPoints else { return true }
                 return abs(currentFontPoints - inheritedFontPoints) > 0.05
@@ -1856,11 +1873,11 @@ final class TerminalSurface: Identifiable, ObservableObject {
         flushPendingTextIfNeeded()
 
 #if DEBUG
-        let runtimeFontText = cmuxCurrentSurfaceFontSizePoints(createdSurface).map {
+        let runtimeFontText = termMeshCurrentSurfaceFontSizePoints(createdSurface).map {
             String(format: "%.2f", $0)
         } ?? "nil"
         dlog(
-            "zoom.create.done surface=\(id.uuidString.prefix(5)) context=\(cmuxSurfaceContextName(surfaceContext)) " +
+            "zoom.create.done surface=\(id.uuidString.prefix(5)) context=\(termMeshSurfaceContextName(surfaceContext)) " +
             "runtimeFont=\(runtimeFontText)"
         )
 #endif
@@ -1928,7 +1945,7 @@ final class TerminalSurface: Identifiable, ObservableObject {
         #if DEBUG
         let ts = ISO8601DateFormatter().string(from: Date())
         let line = "[\(ts)] forceRefresh: \(id) \(viewState)\n"
-        let logPath = "/tmp/cmux-refresh-debug.log"
+        let logPath = "/tmp/term-mesh-refresh-debug.log"
         if let handle = FileHandle(forWritingAtPath: logPath) {
             handle.seekToEndOfFile()
             handle.write(line.data(using: .utf8)!)
@@ -2166,10 +2183,10 @@ final class TerminalSurface: Identifiable, ObservableObject {
 
 class GhosttyNSView: NSView, NSUserInterfaceValidations {
     private static let focusDebugEnabled: Bool = {
-        if ProcessInfo.processInfo.environment["CMUX_FOCUS_DEBUG"] == "1" {
+        if termMeshEnv("FOCUS_DEBUG") == "1" {
             return true
         }
-        return UserDefaults.standard.bool(forKey: "cmuxFocusDebug")
+        return UserDefaults.standard.bool(forKey: "termMeshFocusDebug")
     }()
     private static let dropTypes: Set<NSPasteboard.PasteboardType> = [
         .string,
@@ -2200,10 +2217,10 @@ class GhosttyNSView: NSView, NSUserInterfaceValidations {
     private var keyTables: [String] = []
 #if DEBUG
     private static let keyLatencyProbeEnabled: Bool = {
-        if ProcessInfo.processInfo.environment["CMUX_KEY_LATENCY_PROBE"] == "1" {
+        if termMeshEnv("KEY_LATENCY_PROBE") == "1" {
             return true
         }
-        return UserDefaults.standard.bool(forKey: "cmuxKeyLatencyProbe")
+        return UserDefaults.standard.bool(forKey: "termMeshKeyLatencyProbe")
     }()
 #endif
     private var eventMonitor: Any?
@@ -2280,7 +2297,7 @@ class GhosttyNSView: NSView, NSUserInterfaceValidations {
         }
         applySurfaceBackground()
         let color = effectiveBackgroundColor()
-        if cmuxShouldUseTransparentBackgroundWindow() {
+        if termMeshShouldUseTransparentBackgroundWindow() {
             window.backgroundColor = .clear
             window.isOpaque = false
         } else {
@@ -2288,11 +2305,11 @@ class GhosttyNSView: NSView, NSUserInterfaceValidations {
             window.isOpaque = color.alphaComponent >= 1.0
         }
         if GhosttyApp.shared.backgroundLogEnabled {
-            let signature = "\(cmuxShouldUseTransparentBackgroundWindow() ? "transparent" : color.hexString()):\(String(format: "%.3f", color.alphaComponent))"
+            let signature = "\(termMeshShouldUseTransparentBackgroundWindow() ? "transparent" : color.hexString()):\(String(format: "%.3f", color.alphaComponent))"
             if signature != lastLoggedWindowBackgroundSignature {
                 lastLoggedWindowBackgroundSignature = signature
                 GhosttyApp.shared.logBackground(
-                    "window background applied tab=\(tabId?.uuidString ?? "unknown") surface=\(terminalSurface?.id.uuidString ?? "unknown") transparent=\(cmuxShouldUseTransparentBackgroundWindow()) color=\(color.hexString()) opacity=\(String(format: "%.3f", color.alphaComponent))"
+                    "window background applied tab=\(tabId?.uuidString ?? "unknown") surface=\(terminalSurface?.id.uuidString ?? "unknown") transparent=\(termMeshShouldUseTransparentBackgroundWindow()) color=\(color.hexString()) opacity=\(String(format: "%.3f", color.alphaComponent))"
                 )
             }
         }
@@ -2762,10 +2779,10 @@ class GhosttyNSView: NSView, NSUserInterfaceValidations {
 #endif
 
 #if DEBUG
-        cmuxWriteChildExitProbe(
+        termMeshWriteChildExitProbe(
             [
-                "probePerformCharsHex": cmuxScalarHex(event.characters),
-                "probePerformCharsIgnoringHex": cmuxScalarHex(event.charactersIgnoringModifiers),
+                "probePerformCharsHex": termMeshScalarHex(event.characters),
+                "probePerformCharsIgnoringHex": termMeshScalarHex(event.charactersIgnoringModifiers),
                 "probePerformKeyCode": String(event.keyCode),
                 "probePerformModsRaw": String(event.modifierFlags.rawValue),
                 "probePerformSurfaceId": terminalSurface?.id.uuidString ?? "",
@@ -2874,10 +2891,10 @@ class GhosttyNSView: NSView, NSUserInterfaceValidations {
 #endif
 
 #if DEBUG
-        cmuxWriteChildExitProbe(
+        termMeshWriteChildExitProbe(
             [
-                "probeKeyDownCharsHex": cmuxScalarHex(event.characters),
-                "probeKeyDownCharsIgnoringHex": cmuxScalarHex(event.charactersIgnoringModifiers),
+                "probeKeyDownCharsHex": termMeshScalarHex(event.characters),
+                "probeKeyDownCharsIgnoringHex": termMeshScalarHex(event.charactersIgnoringModifiers),
                 "probeKeyDownKeyCode": String(event.keyCode),
                 "probeKeyDownModsRaw": String(event.modifierFlags.rawValue),
                 "probeKeyDownSurfaceId": terminalSurface?.id.uuidString ?? "",
@@ -2916,8 +2933,8 @@ class GhosttyNSView: NSView, NSUserInterfaceValidations {
 #if DEBUG
             dlog(
                 "key.ctrl path=ghostty surface=\(terminalSurface?.id.uuidString.prefix(5) ?? "nil") " +
-                "handled=\(handled ? 1 : 0) keyCode=\(event.keyCode) chars=\(cmuxScalarHex(event.characters)) " +
-                "ign=\(cmuxScalarHex(event.charactersIgnoringModifiers)) mods=\(event.modifierFlags.rawValue)"
+                "handled=\(handled ? 1 : 0) keyCode=\(event.keyCode) chars=\(termMeshScalarHex(event.characters)) " +
+                "ign=\(termMeshScalarHex(event.charactersIgnoringModifiers)) mods=\(event.modifierFlags.rawValue)"
             )
 #endif
             return
@@ -3429,7 +3446,7 @@ class GhosttyNSView: NSView, NSUserInterfaceValidations {
     fileprivate func debugSimulateFileDrop(paths: [String]) -> Bool {
         guard !paths.isEmpty else { return false }
         let urls = paths.map { URL(fileURLWithPath: $0) as NSURL }
-        let pbName = NSPasteboard.Name("cmux.debug.drop.\(UUID().uuidString)")
+        let pbName = NSPasteboard.Name("term-mesh.debug.drop.\(UUID().uuidString)")
         let pasteboard = NSPasteboard(name: pbName)
         pasteboard.clearContents()
         pasteboard.writeObjects(urls)
@@ -4196,7 +4213,7 @@ final class GhosttySurfaceScrollView: NSView {
                     return CAMediaTimingFunction(name: .easeOut)
                 }
             }
-            self.flashLayer.add(animation, forKey: "cmux.flash")
+            self.flashLayer.add(animation, forKey: "term-mesh.flash")
         }
     }
 
@@ -4886,9 +4903,9 @@ extension GhosttyNSView: NSTextInputClient {
     fileprivate func sendTextToSurface(_ chars: String) {
         guard let surface = surface else { return }
 #if DEBUG
-        cmuxWriteChildExitProbe(
+        termMeshWriteChildExitProbe(
             [
-                "probeInsertTextCharsHex": cmuxScalarHex(chars),
+                "probeInsertTextCharsHex": termMeshScalarHex(chars),
                 "probeInsertTextSurfaceId": terminalSurface?.id.uuidString ?? "",
             ],
             increments: ["probeInsertTextCount": 1]

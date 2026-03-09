@@ -1,10 +1,10 @@
 import XCTest
 import AppKit
 
-#if canImport(cmux_DEV)
-@testable import cmux_DEV
-#elseif canImport(cmux)
-@testable import cmux
+#if canImport(term_mesh_DEV)
+@testable import term_mesh_DEV
+#elseif canImport(term_mesh)
+@testable import term_mesh
 #endif
 
 final class GhosttyConfigTests: XCTestCase {
@@ -587,7 +587,7 @@ final class SocketControlSettingsTests: XCTestCase {
             environment: [
                 "CMUX_SOCKET_PATH": "/tmp/cmux-debug-issue-153-tmux-compat.sock",
             ],
-            bundleIdentifier: "com.cmuxterm.app",
+            bundleIdentifier: "com.termmesh.app",
             isDebugBuild: false
         )
 
@@ -599,7 +599,7 @@ final class SocketControlSettingsTests: XCTestCase {
             environment: [
                 "CMUX_SOCKET_PATH": "/tmp/cmux-debug-issue-153-tmux-compat.sock",
             ],
-            bundleIdentifier: "com.cmuxterm.app.nightly",
+            bundleIdentifier: "com.termmesh.app.nightly",
             isDebugBuild: false
         )
 
@@ -611,7 +611,7 @@ final class SocketControlSettingsTests: XCTestCase {
             environment: [
                 "CMUX_SOCKET_PATH": "/tmp/cmux-debug-my-tag.sock",
             ],
-            bundleIdentifier: "com.cmuxterm.app.debug.my-tag",
+            bundleIdentifier: "com.termmesh.app.debug.my-tag",
             isDebugBuild: false
         )
 
@@ -623,7 +623,7 @@ final class SocketControlSettingsTests: XCTestCase {
             environment: [
                 "CMUX_SOCKET_PATH": "/tmp/cmux-staging-my-tag.sock",
             ],
-            bundleIdentifier: "com.cmuxterm.app.staging.my-tag",
+            bundleIdentifier: "com.termmesh.app.staging.my-tag",
             isDebugBuild: false
         )
 
@@ -636,7 +636,7 @@ final class SocketControlSettingsTests: XCTestCase {
                 "CMUX_SOCKET_PATH": "/tmp/cmux-debug-forced.sock",
                 "CMUX_ALLOW_SOCKET_OVERRIDE": "1",
             ],
-            bundleIdentifier: "com.cmuxterm.app",
+            bundleIdentifier: "com.termmesh.app",
             isDebugBuild: false
         )
 
@@ -645,19 +645,19 @@ final class SocketControlSettingsTests: XCTestCase {
 
     func testDefaultSocketPathByChannel() {
         XCTAssertEqual(
-            SocketControlSettings.defaultSocketPath(bundleIdentifier: "com.cmuxterm.app", isDebugBuild: false),
+            SocketControlSettings.defaultSocketPath(bundleIdentifier: "com.termmesh.app", isDebugBuild: false),
             "/tmp/cmux.sock"
         )
         XCTAssertEqual(
-            SocketControlSettings.defaultSocketPath(bundleIdentifier: "com.cmuxterm.app.nightly", isDebugBuild: false),
+            SocketControlSettings.defaultSocketPath(bundleIdentifier: "com.termmesh.app.nightly", isDebugBuild: false),
             "/tmp/cmux-nightly.sock"
         )
         XCTAssertEqual(
-            SocketControlSettings.defaultSocketPath(bundleIdentifier: "com.cmuxterm.app.debug.tag", isDebugBuild: false),
+            SocketControlSettings.defaultSocketPath(bundleIdentifier: "com.termmesh.app.debug.tag", isDebugBuild: false),
             "/tmp/cmux-debug.sock"
         )
         XCTAssertEqual(
-            SocketControlSettings.defaultSocketPath(bundleIdentifier: "com.cmuxterm.app.staging.tag", isDebugBuild: false),
+            SocketControlSettings.defaultSocketPath(bundleIdentifier: "com.termmesh.app.staging.tag", isDebugBuild: false),
             "/tmp/cmux-staging.sock"
         )
     }

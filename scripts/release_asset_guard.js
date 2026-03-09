@@ -1,6 +1,6 @@
 "use strict";
 
-const IMMUTABLE_RELEASE_ASSETS = ["cmux-macos.dmg", "appcast.xml"];
+const IMMUTABLE_RELEASE_ASSETS = ["term-mesh-macos.dmg", "appcast.xml"];
 const RELEASE_ASSET_GUARD_STATE = Object.freeze({
   CLEAR: "clear",
   PARTIAL: "partial",

@@ -41,7 +41,7 @@ final class TeamOrchestrator {
 
     /// B: File-based results — convention directory
     static func resultDirectory(teamName: String) -> String {
-        "/tmp/cmux-team-\(teamName)"
+        "/tmp/term-mesh-team-\(teamName)"
     }
 
     /// C: In-memory message queue (agent → leader)
@@ -204,9 +204,13 @@ final class TeamOrchestrator {
         let currentPath = (appPath.isEmpty ? essentialPaths : appPath.split(separator: ":").map(String.init) + missingPaths).joined(separator: ":")
         let socketPath = SocketControlSettings.socketPath()
         let baseEnv: [String: String] = [
+            "TERMMESH_TEAM_AGENT": "1",
             "CMUX_TEAM_AGENT": "1",
+            "TERMMESH_TEAM_NAME": name,
             "CMUX_TEAM_NAME": name,
+            "TERMMESH_TEAM": name,
             "CMUX_TEAM": name,
+            "TERMMESH_SOCKET": socketPath,
             "CMUX_SOCKET": socketPath,
             "PATH": currentPath,
         ]

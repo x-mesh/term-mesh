@@ -4,17 +4,17 @@
   <a href="README.md">English</a> | <a href="README.zh-CN.md">简体中文</a> | <a href="README.zh-TW.md">繁體中文</a> | <a href="README.ko.md">한국어</a> | <a href="README.de.md">Deutsch</a> | <a href="README.es.md">Español</a> | <a href="README.fr.md">Français</a> | <a href="README.it.md">Italiano</a> | <a href="README.da.md">Dansk</a> | <a href="README.ja.md">日本語</a> | <a href="README.pl.md">Polski</a> | <a href="README.ru.md">Русский</a> | <a href="README.bs.md">Bosanski</a> | <a href="README.ar.md">العربية</a> | <a href="README.no.md">Norsk</a> | <a href="README.pt-BR.md">Português (Brasil)</a> | ไทย | <a href="README.tr.md">Türkçe</a>
 </p>
 
-<h1 align="center">cmux</h1>
+<h1 align="center">term-mesh</h1>
 <p align="center">เทอร์มินัล macOS ที่ใช้ Ghostty พร้อมแท็บแนวตั้งและการแจ้งเตือนสำหรับเอเจนต์เขียนโค้ด AI</p>
 
 <p align="center">
-  <a href="https://github.com/manaflow-ai/cmux/releases/latest/download/cmux-macos.dmg">
-    <img src="./docs/assets/macos-badge.png" alt="ดาวน์โหลด cmux สำหรับ macOS" width="180" />
+  <a href="https://github.com/manaflow-ai/term-mesh/releases/latest/download/term-mesh-macos.dmg">
+    <img src="./docs/assets/macos-badge.png" alt="term-mesh" width="180" />
   </a>
 </p>
 
 <p align="center">
-  <img src="./docs/assets/screenshot.png" alt="ภาพหน้าจอ cmux" width="900" />
+  <img src="./docs/assets/screenshot.png" alt="term-mesh" width="900" />
 </p>
 
 ## คุณสมบัติ
@@ -33,34 +33,34 @@
 
 ### DMG (แนะนำ)
 
-<a href="https://github.com/manaflow-ai/cmux/releases/latest/download/cmux-macos.dmg">
-  <img src="./docs/assets/macos-badge.png" alt="ดาวน์โหลด cmux สำหรับ macOS" width="180" />
+<a href="https://github.com/manaflow-ai/term-mesh/releases/latest/download/term-mesh-macos.dmg">
+  <img src="./docs/assets/macos-badge.png" alt="term-mesh" width="180" />
 </a>
 
-เปิดไฟล์ `.dmg` แล้วลาก cmux ไปยังโฟลเดอร์แอปพลิเคชัน cmux อัปเดตอัตโนมัติผ่าน Sparkle คุณจึงต้องดาวน์โหลดเพียงครั้งเดียว
+เปิดไฟล์ `.dmg` แล้วลาก term-mesh ไปยังโฟลเดอร์แอปพลิเคชัน term-mesh อัปเดตอัตโนมัติผ่าน Sparkle คุณจึงต้องดาวน์โหลดเพียงครั้งเดียว
 
 ### Homebrew
 
 ```bash
-brew tap manaflow-ai/cmux
-brew install --cask cmux
+brew tap manaflow-ai/term-mesh
+brew install --cask term-mesh
 ```
 
 สำหรับอัปเดตในภายหลัง:
 
 ```bash
-brew upgrade --cask cmux
+brew upgrade --cask term-mesh
 ```
 
 เมื่อเปิดใช้งานครั้งแรก macOS อาจขอให้คุณยืนยันการเปิดแอปจากนักพัฒนาที่ได้รับการระบุตัวตน คลิก **เปิด** เพื่อดำเนินการต่อ
 
-## ทำไมต้อง cmux?
+## Why term-mesh?
 
 ผมรันเซสชัน Claude Code และ Codex จำนวนมากพร้อมกัน ผมใช้ Ghostty กับแผงแบ่งหลายอัน และพึ่งพาการแจ้งเตือนดั้งเดิมของ macOS เพื่อรู้ว่าเมื่อไหร่ที่เอเจนต์ต้องการผม แต่ข้อความแจ้งเตือนของ Claude Code มีแค่ "Claude is waiting for your input" โดยไม่มีบริบท และเมื่อเปิดแท็บมากพอ ผมไม่สามารถอ่านชื่อแท็บได้เลย
 
-ผมลองใช้ออร์เคสเตรเตอร์สำหรับเขียนโค้ดบางตัว แต่ส่วนใหญ่เป็นแอป Electron/Tauri และประสิทธิภาพทำให้ผมรำคาญ ผมยังชอบเทอร์มินัลมากกว่าเพราะออร์เคสเตรเตอร์ GUI บังคับให้คุณใช้เวิร์กโฟลว์ของมัน ผมจึงสร้าง cmux เป็นแอป macOS ดั้งเดิมด้วย Swift/AppKit มันใช้ libghostty สำหรับการแสดงผลเทอร์มินัลและอ่านการตั้งค่า Ghostty ที่มีอยู่ของคุณสำหรับธีม ฟอนต์ และสี
+ผมลองใช้ออร์เคสเตรเตอร์สำหรับเขียนโค้ดบางตัว แต่ส่วนใหญ่เป็นแอป Electron/Tauri และประสิทธิภาพทำให้ผมรำคาญ ผมยังชอบเทอร์มินัลมากกว่าเพราะออร์เคสเตรเตอร์ GUI บังคับให้คุณใช้เวิร์กโฟลว์ของมัน ผมจึงสร้าง term-mesh เป็นแอป macOS ดั้งเดิมด้วย Swift/AppKit มันใช้ libghostty สำหรับการแสดงผลเทอร์มินัลและอ่านการตั้งค่า Ghostty ที่มีอยู่ของคุณสำหรับธีม ฟอนต์ และสี
 
-สิ่งที่เพิ่มเติมหลักคือแถบด้านข้างและระบบแจ้งเตือน แถบด้านข้างมีแท็บแนวตั้งที่แสดง git branch, ไดเรกทอรีทำงาน, พอร์ตที่กำลังฟัง และข้อความแจ้งเตือนล่าสุดสำหรับแต่ละเวิร์กสเปซ ระบบแจ้งเตือนจับลำดับเทอร์มินัล (OSC 9/99/777) และมี CLI (`cmux notify`) ที่คุณสามารถเชื่อมต่อกับ hook ของเอเจนต์สำหรับ Claude Code, OpenCode เป็นต้น เมื่อเอเจนต์กำลังรอ แผงของมันจะมีวงแหวนสีน้ำเงินและแท็บจะสว่างขึ้นในแถบด้านข้าง เพื่อให้ผมบอกได้ว่าอันไหนต้องการผมข้ามแผงแบ่งและแท็บต่าง ๆ Cmd+Shift+U ข้ามไปยังรายการที่ยังไม่ได้อ่านล่าสุด
+สิ่งที่เพิ่มเติมหลักคือแถบด้านข้างและระบบแจ้งเตือน แถบด้านข้างมีแท็บแนวตั้งที่แสดง git branch, ไดเรกทอรีทำงาน, พอร์ตที่กำลังฟัง และข้อความแจ้งเตือนล่าสุดสำหรับแต่ละเวิร์กสเปซ ระบบแจ้งเตือนจับลำดับเทอร์มินัล (OSC 9/99/777) และมี CLI (`term-mesh notify`) ที่คุณสามารถเชื่อมต่อกับ hook ของเอเจนต์สำหรับ Claude Code, OpenCode เป็นต้น เมื่อเอเจนต์กำลังรอ แผงของมันจะมีวงแหวนสีน้ำเงินและแท็บจะสว่างขึ้นในแถบด้านข้าง เพื่อให้ผมบอกได้ว่าอันไหนต้องการผมข้ามแผงแบ่งและแท็บต่าง ๆ Cmd+Shift+U ข้ามไปยังรายการที่ยังไม่ได้อ่านล่าสุด
 
 เบราว์เซอร์ในแอปมี API ที่เขียนสคริปต์ได้ ย้ายมาจาก [agent-browser](https://github.com/vercel-labs/agent-browser) เอเจนต์สามารถจับภาพ accessibility tree, รับ element refs, คลิก, กรอกฟอร์ม และรัน JS ได้ คุณสามารถแบ่งแผงเบราว์เซอร์ข้างเทอร์มินัลและให้ Claude Code โต้ตอบกับเซิร์ฟเวอร์สำหรับพัฒนาของคุณโดยตรง
 

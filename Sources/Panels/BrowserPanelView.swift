@@ -157,7 +157,7 @@ private struct OmnibarAddressButtonStyleBody: View {
 
 private extension View {
     @ViewBuilder
-    func cmuxFlatSymbolColorRendering() -> some View {
+    func termMeshFlatSymbolColorRendering() -> some View {
         if #available(macOS 26.0, *) {
             self.symbolColorRenderingMode(.flat)
         } else {
@@ -244,12 +244,12 @@ struct BrowserPanelView: View {
     private var remoteSuggestionsEnabled: Bool {
         // Deterministic UI-test hook: force remote path on even if a persisted
         // setting disabled suggestions in previous sessions.
-        if ProcessInfo.processInfo.environment["CMUX_UI_TEST_REMOTE_SUGGESTIONS_JSON"] != nil ||
-            UserDefaults.standard.string(forKey: "CMUX_UI_TEST_REMOTE_SUGGESTIONS_JSON") != nil {
+        if termMeshEnv("UI_TEST_REMOTE_SUGGESTIONS_JSON") != nil ||
+            UserDefaults.standard.string(forKey: "TERMMESH_UI_TEST_REMOTE_SUGGESTIONS_JSON") ?? UserDefaults.standard.string(forKey: "CMUX_UI_TEST_REMOTE_SUGGESTIONS_JSON") != nil {
             return true
         }
         // Keep UI tests deterministic by disabling network suggestions when requested.
-        if ProcessInfo.processInfo.environment["CMUX_UI_TEST_DISABLE_REMOTE_SUGGESTIONS"] == "1" {
+        if termMeshEnv("UI_TEST_DISABLE_REMOTE_SUGGESTIONS") == "1" {
             return false
         }
         return searchSuggestionsEnabled
@@ -320,7 +320,7 @@ struct BrowserPanelView: View {
         }
         .onReceive(NotificationCenter.default.publisher(for: .webViewDidReceiveClick).filter { [weak panel] note in
             // Only handle clicks from our own webview.
-            guard let webView = note.object as? CmuxWebView else { return false }
+            guard let webView = note.object as? TermMeshWebView else { return false }
             return webView === panel?.webView
         }) { _ in
 #if DEBUG
@@ -333,7 +333,7 @@ struct BrowserPanelView: View {
             onRequestPanelFocus()
         }
         .onReceive(NotificationCenter.default.publisher(for: .webViewMiddleClickedLink).filter { [weak panel] note in
-            guard let webView = note.object as? CmuxWebView else { return false }
+            guard let webView = note.object as? TermMeshWebView else { return false }
             return webView === panel?.webView
         }) { note in
             if let url = note.userInfo?["url"] as? URL {
@@ -554,7 +554,7 @@ struct BrowserPanelView: View {
         }) {
             Image(systemName: devToolsIconOption.rawValue)
                 .symbolRenderingMode(.monochrome)
-                .cmuxFlatSymbolColorRendering()
+                .termMeshFlatSymbolColorRendering()
                 .font(.system(size: devToolsButtonIconSize, weight: .medium))
                 .foregroundStyle(devToolsColorOption.color)
                 .frame(width: addressBarButtonSize, height: addressBarButtonSize, alignment: .center)
@@ -571,7 +571,7 @@ struct BrowserPanelView: View {
         }) {
             Image(systemName: browserThemeMode.iconName)
                 .symbolRenderingMode(.monochrome)
-                .cmuxFlatSymbolColorRendering()
+                .termMeshFlatSymbolColorRendering()
                 .font(.system(size: devToolsButtonIconSize, weight: .medium))
                 .foregroundStyle(browserThemeModeIconColor)
                 .frame(width: addressBarButtonSize, height: addressBarButtonSize, alignment: .center)
@@ -769,18 +769,18 @@ struct BrowserPanelView: View {
     }
 
     private func syncWebViewResponderPolicyWithViewState(reason: String) {
-        guard let cmuxWebView = panel.webView as? CmuxWebView else { return }
+        guard let termMeshWebView = panel.webView as? TermMeshWebView else { return }
         let next = isFocused && !panel.shouldSuppressWebViewFocus()
-        if cmuxWebView.allowsFirstResponderAcquisition != next {
+        if termMeshWebView.allowsFirstResponderAcquisition != next {
 #if DEBUG
             dlog(
                 "browser.focus.policy.resync panel=\(panel.id.uuidString.prefix(5)) " +
-                "web=\(ObjectIdentifier(cmuxWebView)) old=\(cmuxWebView.allowsFirstResponderAcquisition ? 1 : 0) " +
+                "web=\(ObjectIdentifier(termMeshWebView)) old=\(termMeshWebView.allowsFirstResponderAcquisition ? 1 : 0) " +
                 "new=\(next ? 1 : 0) reason=\(reason)"
             )
 #endif
         }
-        cmuxWebView.allowsFirstResponderAcquisition = next
+        termMeshWebView.allowsFirstResponderAcquisition = next
     }
 
     private func syncURLFromPanel() {
@@ -1149,8 +1149,8 @@ struct BrowserPanelView: View {
     }
 
     private func forcedRemoteSuggestionsForUITest() -> [String]? {
-        let raw = ProcessInfo.processInfo.environment["CMUX_UI_TEST_REMOTE_SUGGESTIONS_JSON"]
-            ?? UserDefaults.standard.string(forKey: "CMUX_UI_TEST_REMOTE_SUGGESTIONS_JSON")
+        let raw = termMeshEnv("UI_TEST_REMOTE_SUGGESTIONS_JSON")
+            ?? UserDefaults.standard.string(forKey: "TERMMESH_UI_TEST_REMOTE_SUGGESTIONS_JSON") ?? UserDefaults.standard.string(forKey: "CMUX_UI_TEST_REMOTE_SUGGESTIONS_JSON")
         guard let raw,
               let data = raw.data(using: .utf8),
               let parsed = try? JSONSerialization.jsonObject(with: data) as? [Any] else {
@@ -3456,19 +3456,19 @@ struct WebViewRepresentable: NSViewRepresentable {
         webView: WKWebView,
         isPanelFocused: Bool
     ) {
-        guard let cmuxWebView = webView as? CmuxWebView else { return }
+        guard let termMeshWebView = webView as? TermMeshWebView else { return }
         let next = isPanelFocused && !panel.shouldSuppressWebViewFocus()
-        if cmuxWebView.allowsFirstResponderAcquisition != next {
+        if termMeshWebView.allowsFirstResponderAcquisition != next {
 #if DEBUG
             dlog(
                 "browser.focus.policy panel=\(panel.id.uuidString.prefix(5)) " +
-                "web=\(ObjectIdentifier(cmuxWebView)) old=\(cmuxWebView.allowsFirstResponderAcquisition ? 1 : 0) " +
+                "web=\(ObjectIdentifier(termMeshWebView)) old=\(termMeshWebView.allowsFirstResponderAcquisition ? 1 : 0) " +
                 "new=\(next ? 1 : 0) isPanelFocused=\(isPanelFocused ? 1 : 0) " +
                 "suppress=\(panel.shouldSuppressWebViewFocus() ? 1 : 0)"
             )
 #endif
         }
-        cmuxWebView.allowsFirstResponderAcquisition = next
+        termMeshWebView.allowsFirstResponderAcquisition = next
     }
 
     static func dismantleNSView(_ nsView: NSView, coordinator: Coordinator) {

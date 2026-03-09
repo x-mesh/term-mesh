@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """
-cmux Python Client
+term-mesh Python Client
 
-A client library for programmatically controlling cmux via Unix socket.
+A client library for programmatically controlling term-mesh via Unix socket.
 
 Usage:
-    from cmux import cmux
+    from termmesh import termmesh
 
-    client = cmux()
+    client = termmesh()
     client.connect()
 
     # Send text to terminal
@@ -40,13 +40,13 @@ import re
 from typing import Optional, List, Tuple, Union
 
 
-class cmuxError(Exception):
-    """Exception raised for cmux errors"""
+class termmeshError(Exception):
+    """Exception raised for term-mesh errors"""
     pass
 
 
-_LAST_SOCKET_PATH_FILE = "/tmp/cmux-last-socket-path"
-_DEFAULT_DEBUG_BUNDLE_ID = "com.cmuxterm.app.debug"
+_LAST_SOCKET_PATH_FILE = "/tmp/term-mesh-last-socket-path"
+_DEFAULT_DEBUG_BUNDLE_ID = "com.termmesh.app.debug"
 
 
 def _sanitize_tag_slug(raw: str) -> str:
@@ -70,11 +70,11 @@ def _quote_option_value(value: str) -> str:
 
 
 def _default_bundle_id() -> str:
-    override = os.environ.get("CMUX_BUNDLE_ID")
+    override = os.environ.get("TERMMESH_BUNDLE_ID")
     if override:
         return override
 
-    tag = os.environ.get("CMUX_TAG")
+    tag = os.environ.get("TERMMESH_TAG")
     if tag:
         suffix = _sanitize_bundle_suffix(tag)
         return f"{_DEFAULT_DEBUG_BUNDLE_ID}.{suffix}"
@@ -112,12 +112,12 @@ def _can_connect(path: str, timeout: float = 0.15, retries: int = 4) -> bool:
 
 
 def _default_socket_path() -> str:
-    tag = os.environ.get("CMUX_TAG")
+    tag = os.environ.get("TERMMESH_TAG")
     if tag:
         slug = _sanitize_tag_slug(tag)
         tagged_candidates = [
-            f"/tmp/cmux-debug-{slug}.sock",
-            f"/tmp/cmux-{slug}.sock",
+            f"/tmp/term-mesh-debug-{slug}.sock",
+            f"/tmp/term-mesh-{slug}.sock",
         ]
         for path in tagged_candidates:
             if os.path.exists(path) and _can_connect(path):
@@ -130,7 +130,7 @@ def _default_socket_path() -> str:
         # Prefer the debug naming convention when we have to guess.
         return tagged_candidates[0]
 
-    override = os.environ.get("CMUX_SOCKET_PATH")
+    override = os.environ.get("TERMMESH_SOCKET_PATH")
     if override:
         if os.path.exists(override) and _can_connect(override):
             return override
@@ -144,13 +144,13 @@ def _default_socket_path() -> str:
             return last_socket
 
     # Prefer the non-tagged sockets when present.
-    candidates = ["/tmp/cmux-debug.sock", "/tmp/cmux.sock"]
+    candidates = ["/tmp/term-mesh-debug.sock", "/tmp/term-mesh.sock"]
     for path in candidates:
         if os.path.exists(path) and _can_connect(path):
             return path
 
     # Otherwise, fall back to the newest tagged debug socket if there is one.
-    tagged = glob.glob("/tmp/cmux-debug-*.sock")
+    tagged = glob.glob("/tmp/term-mesh-debug-*.sock")
     tagged = [p for p in tagged if os.path.exists(p)]
     if tagged:
         tagged.sort(key=lambda p: os.path.getmtime(p), reverse=True)
@@ -161,8 +161,8 @@ def _default_socket_path() -> str:
     return candidates[0]
 
 
-class cmux:
-    """Client for controlling cmux via Unix socket"""
+class termmesh:
+    """Client for controlling term-mesh via Unix socket"""
 
     DEFAULT_SOCKET_PATH = _default_socket_path()
     DEFAULT_BUNDLE_ID = _default_bundle_id()
@@ -182,16 +182,16 @@ class cmux:
         self._recv_buffer: str = ""
 
     def connect(self) -> None:
-        """Connect to the cmux socket"""
+        """Connect to the term-mesh socket"""
         if self._socket is not None:
             return
 
         start = time.time()
         while not os.path.exists(self.socket_path):
             if time.time() - start >= 2.0:
-                raise cmuxError(
+                raise termmeshError(
                     f"Socket not found at {self.socket_path}. "
-                    "Is cmux running?"
+                    "Is term-mesh running?"
                 )
             time.sleep(0.1)
 
@@ -209,7 +209,7 @@ class cmux:
                 if e.errno in (errno.ECONNREFUSED, errno.ENOENT) and time.time() - start < 2.0:
                     time.sleep(0.1)
                     continue
-                raise cmuxError(f"Failed to connect: {e}")
+                raise termmeshError(f"Failed to connect: {e}")
 
     def close(self) -> None:
         """Close the connection"""
@@ -228,7 +228,7 @@ class cmux:
     def _send_command(self, command: str) -> str:
         """Send a command and receive response"""
         if self._socket is None:
-            raise cmuxError("Not connected")
+            raise termmeshError("Not connected")
 
         try:
             self._socket.sendall((command + "\n").encode())
@@ -247,7 +247,7 @@ class cmux:
                     if saw_newline:
                         break
                     if time.time() - start >= 5.0:
-                        raise cmuxError("Command timed out")
+                        raise termmeshError("Command timed out")
                     continue
                 if not chunk:
                     break
@@ -258,9 +258,9 @@ class cmux:
                 data = data[:-1]
             return data
         except socket.timeout:
-            raise cmuxError("Command timed out")
+            raise termmeshError("Command timed out")
         except socket.error as e:
-            raise cmuxError(f"Socket error: {e}")
+            raise termmeshError(f"Socket error: {e}")
 
     def ping(self) -> bool:
         """Check if the server is responding"""
@@ -298,7 +298,7 @@ class cmux:
             response = self._send_command("new_workspace")
         if response.startswith("OK "):
             return response[3:]
-        raise cmuxError(response)
+        raise termmeshError(response)
 
     def new_split(self, direction: str) -> str:
         """Create a split in the given direction (left/right/up/down). Returns new panel ID when available."""
@@ -308,7 +308,7 @@ class cmux:
         if response.startswith("OK"):
             return ""
         if not response.startswith("OK"):
-            raise cmuxError(response)
+            raise termmeshError(response)
 
     def close_tab(self, tab_id: str) -> None:
         """Close a tab by ID"""
@@ -316,7 +316,7 @@ class cmux:
         if response.startswith("ERROR: Unknown command"):
             response = self._send_command(f"close_workspace {tab_id}")
         if not response.startswith("OK"):
-            raise cmuxError(response)
+            raise termmeshError(response)
 
     def select_tab(self, tab: Union[str, int]) -> None:
         """Select a tab by ID or index"""
@@ -324,7 +324,7 @@ class cmux:
         if response.startswith("ERROR: Unknown command"):
             response = self._send_command(f"select_workspace {tab}")
         if not response.startswith("OK"):
-            raise cmuxError(response)
+            raise termmeshError(response)
 
     def list_surfaces(self, tab: Union[str, int, None] = None) -> List[Tuple[str, str, bool]]:
         """
@@ -353,11 +353,11 @@ class cmux:
         if isinstance(surface, int):
             surfaces = self.list_surfaces()
             if surface < 0 or surface >= len(surfaces):
-                raise cmuxError(f"Surface index {surface} out of range (have {len(surfaces)})")
+                raise termmeshError(f"Surface index {surface} out of range (have {len(surfaces)})")
             surface = surfaces[surface][0]  # Use the ref (e.g. "surface:1")
         response = self._send_command(f"focus_surface {surface}")
         if not response.startswith("OK"):
-            raise cmuxError(response)
+            raise termmeshError(response)
 
     def current_tab(self) -> str:
         """Get the current tab's ID"""
@@ -365,14 +365,14 @@ class cmux:
         if response.startswith("ERROR: Unknown command"):
             response = self._send_command("current_workspace")
         if response.startswith("ERROR"):
-            raise cmuxError(response)
+            raise termmeshError(response)
         return response
 
     def current_workspace(self) -> str:
         """Get the current workspace's ID."""
         response = self._send_command("current_workspace")
         if response.startswith("ERROR"):
-            raise cmuxError(response)
+            raise termmeshError(response)
         return response
 
     def send(self, text: str) -> None:
@@ -389,14 +389,14 @@ class cmux:
         escaped = text.replace("\n", "\\n").replace("\r", "\\r").replace("\t", "\\t")
         response = self._send_command(f"send {escaped}")
         if not response.startswith("OK"):
-            raise cmuxError(response)
+            raise termmeshError(response)
 
     def send_surface(self, surface: Union[str, int], text: str) -> None:
         """Send text to a specific surface by ID or index in the current tab."""
         escaped = text.replace("\n", "\\n").replace("\r", "\\r").replace("\t", "\\t")
         response = self._send_command(f"send_surface {surface} {escaped}")
         if not response.startswith("OK"):
-            raise cmuxError(response)
+            raise termmeshError(response)
 
     def send_key(self, key: str) -> None:
         """
@@ -409,13 +409,13 @@ class cmux:
         """
         response = self._send_command(f"send_key {key}")
         if not response.startswith("OK"):
-            raise cmuxError(response)
+            raise termmeshError(response)
 
     def send_key_surface(self, surface: Union[str, int], key: str) -> None:
         """Send a special key to a specific surface by ID or index in the current tab."""
         response = self._send_command(f"send_key_surface {surface} {key}")
         if not response.startswith("OK"):
-            raise cmuxError(response)
+            raise termmeshError(response)
 
     def send_line(self, text: str) -> None:
         """Send text followed by Enter"""
@@ -441,7 +441,7 @@ class cmux:
             payload = title
         response = self._send_command(f"notify {payload}")
         if not response.startswith("OK"):
-            raise cmuxError(response)
+            raise termmeshError(response)
 
     def notify_surface(self, surface: Union[str, int], title: str, subtitle: str = "", body: str = "") -> None:
         """Create a notification for a specific surface by ID or index."""
@@ -451,7 +451,7 @@ class cmux:
             payload = title
         response = self._send_command(f"notify_surface {surface} {payload}")
         if not response.startswith("OK"):
-            raise cmuxError(response)
+            raise termmeshError(response)
 
     def list_notifications(self) -> list[dict]:
         """
@@ -487,7 +487,7 @@ class cmux:
         """Clear all notifications."""
         response = self._send_command("clear_notifications")
         if not response.startswith("OK"):
-            raise cmuxError(response)
+            raise termmeshError(response)
 
     def set_app_focus(self, active: Union[bool, None]) -> None:
         """Override app focus state. Use None to clear override."""
@@ -497,13 +497,13 @@ class cmux:
             value = "active" if active else "inactive"
         response = self._send_command(f"set_app_focus {value}")
         if not response.startswith("OK"):
-            raise cmuxError(response)
+            raise termmeshError(response)
 
     def simulate_app_active(self) -> None:
         """Trigger the app active handler."""
         response = self._send_command("simulate_app_active")
         if not response.startswith("OK"):
-            raise cmuxError(response)
+            raise termmeshError(response)
 
     def set_status(self, key: str, value: str, icon: str = None, color: str = None, tab: str = None) -> None:
         """Set a sidebar status entry."""
@@ -518,7 +518,7 @@ class cmux:
         cmd += f" -- {_quote_option_value(value)}"
         response = self._send_command(cmd)
         if not response.startswith("OK"):
-            raise cmuxError(response)
+            raise termmeshError(response)
 
     def clear_status(self, key: str, tab: str = None) -> None:
         """Remove a sidebar status entry."""
@@ -527,7 +527,7 @@ class cmux:
             cmd += f" --tab={tab}"
         response = self._send_command(cmd)
         if not response.startswith("OK"):
-            raise cmuxError(response)
+            raise termmeshError(response)
 
     def log(self, message: str, level: str = None, source: str = None, tab: str = None) -> None:
         """Append a sidebar log entry."""
@@ -544,7 +544,7 @@ class cmux:
         cmd += f" -- {_quote_option_value(message)}"
         response = self._send_command(cmd)
         if not response.startswith("OK"):
-            raise cmuxError(response)
+            raise termmeshError(response)
 
     def set_progress(self, value: float, label: str = None, tab: str = None) -> None:
         """Set sidebar progress bar (0.0-1.0)."""
@@ -555,7 +555,7 @@ class cmux:
             cmd += f" --tab={tab}"
         response = self._send_command(cmd)
         if not response.startswith("OK"):
-            raise cmuxError(response)
+            raise termmeshError(response)
 
     def clear_progress(self, tab: str = None) -> None:
         """Clear sidebar progress bar."""
@@ -564,7 +564,7 @@ class cmux:
             cmd += f" --tab={tab}"
         response = self._send_command(cmd)
         if not response.startswith("OK"):
-            raise cmuxError(response)
+            raise termmeshError(response)
 
     def report_git_branch(self, branch: str, status: str = None, tab: str = None) -> None:
         """Report git branch for sidebar display."""
@@ -575,7 +575,7 @@ class cmux:
             cmd += f" --tab={tab}"
         response = self._send_command(cmd)
         if not response.startswith("OK"):
-            raise cmuxError(response)
+            raise termmeshError(response)
 
     def report_ports(self, *ports: int, tab: str = None) -> None:
         """Report listening ports for sidebar display."""
@@ -585,7 +585,7 @@ class cmux:
             cmd += f" --tab={tab}"
         response = self._send_command(cmd)
         if not response.startswith("OK"):
-            raise cmuxError(response)
+            raise termmeshError(response)
 
     def clear_ports(self, tab: str = None) -> None:
         """Clear listening ports for sidebar display."""
@@ -594,7 +594,7 @@ class cmux:
             cmd += f" --tab={tab}"
         response = self._send_command(cmd)
         if not response.startswith("OK"):
-            raise cmuxError(response)
+            raise termmeshError(response)
 
     def report_tty(self, tty_name: str, tab: str = None, panel: str = None) -> None:
         """Register a TTY for batched port scanning."""
@@ -605,7 +605,7 @@ class cmux:
             cmd += f" --panel={panel}"
         response = self._send_command(cmd)
         if not response.startswith("OK"):
-            raise cmuxError(response)
+            raise termmeshError(response)
 
     def ports_kick(self, tab: str = None, panel: str = None) -> None:
         """Request a batched port scan for the given panel."""
@@ -616,7 +616,7 @@ class cmux:
             cmd += f" --panel={panel}"
         response = self._send_command(cmd)
         if not response.startswith("OK"):
-            raise cmuxError(response)
+            raise termmeshError(response)
 
     def sidebar_state(self, tab: str = None) -> str:
         """Dump all sidebar metadata for a tab."""
@@ -632,7 +632,7 @@ class cmux:
             cmd += f" --tab={tab}"
         response = self._send_command(cmd)
         if not response.startswith("OK"):
-            raise cmuxError(response)
+            raise termmeshError(response)
 
     def focus_notification(self, tab: Union[str, int], surface: Union[str, int, None] = None) -> None:
         """Focus tab/surface using the notification flow."""
@@ -642,20 +642,20 @@ class cmux:
             command = f"focus_notification {tab} {surface}"
         response = self._send_command(command)
         if not response.startswith("OK"):
-            raise cmuxError(response)
+            raise termmeshError(response)
 
     def flash_count(self, surface: Union[str, int]) -> int:
         """Get flash count for a surface by ID or index."""
         response = self._send_command(f"flash_count {surface}")
         if response.startswith("OK "):
             return int(response.split(" ", 1)[1])
-        raise cmuxError(response)
+        raise termmeshError(response)
 
     def reset_flash_counts(self) -> None:
         """Reset flash counters."""
         response = self._send_command("reset_flash_counts")
         if not response.startswith("OK"):
-            raise cmuxError(response)
+            raise termmeshError(response)
 
     def read_screen(self) -> str:
         """Read the visible terminal text from the focused surface."""
@@ -691,7 +691,7 @@ class cmux:
             return self.new_tab()
         if response.startswith("OK "):
             return response[3:]
-        raise cmuxError(response)
+        raise termmeshError(response)
 
     def close_workspace(self, workspace_id: str) -> None:
         """Close a workspace by ID."""
@@ -700,21 +700,21 @@ class cmux:
             self.close_tab(workspace_id)
             return
         if not response.startswith("OK"):
-            raise cmuxError(response)
+            raise termmeshError(response)
 
     def select_workspace(self, workspace: Union[str, int]) -> None:
         """Select a workspace by ID, ref, or index."""
         if isinstance(workspace, int):
             workspaces = self.list_workspaces()
             if workspace < 0 or workspace >= len(workspaces):
-                raise cmuxError(f"Workspace index {workspace} out of range (have {len(workspaces)})")
+                raise termmeshError(f"Workspace index {workspace} out of range (have {len(workspaces)})")
             workspace = workspaces[workspace][0]  # Use the ref (e.g. "workspace:1")
         response = self._send_command(f"select_workspace {workspace}")
         if response.startswith("ERROR: Unknown command"):
             self.select_tab(workspace)
             return
         if not response.startswith("OK"):
-            raise cmuxError(response)
+            raise termmeshError(response)
 
     # Pane commands
     def list_panes(self) -> List[Tuple[str, str, int, bool]]:
@@ -747,11 +747,11 @@ class cmux:
         if isinstance(pane, int):
             panes = self.list_panes()
             if pane < 0 or pane >= len(panes):
-                raise cmuxError(f"Pane index {pane} out of range (have {len(panes)})")
+                raise termmeshError(f"Pane index {pane} out of range (have {len(panes)})")
             pane = panes[pane][0]  # Use the ref (e.g. "pane:1")
         response = self._send_command(f"focus_pane {pane}")
         if not response.startswith("OK"):
-            raise cmuxError(response)
+            raise termmeshError(response)
 
     def list_pane_surfaces(self, pane: Union[str, int, None] = None) -> List[Tuple[int, str, str, bool]]:
         """
@@ -767,7 +767,7 @@ class cmux:
         if response in ("No surfaces", "No tabs in pane"):
             return []
         if response.startswith("ERROR:"):
-            raise cmuxError(response)
+            raise termmeshError(response)
 
         surfaces = []
         for line in response.split("\n"):
@@ -796,19 +796,19 @@ class cmux:
         """Focus a surface by its panel ID."""
         response = self._send_command(f"focus_surface_by_panel {surface_id}")
         if not response.startswith("OK"):
-            raise cmuxError(response)
+            raise termmeshError(response)
 
     def focus_webview(self, panel_id: str) -> None:
         """Move keyboard focus into a browser panel's WKWebView."""
         response = self._send_command(f"focus_webview {panel_id}")
         if not response.startswith("OK"):
-            raise cmuxError(response)
+            raise termmeshError(response)
 
     def is_webview_focused(self, panel_id: str) -> bool:
         """Return True if the browser panel's WKWebView is first responder."""
         response = self._send_command(f"is_webview_focused {panel_id}")
         if response.startswith("ERROR"):
-            raise cmuxError(response)
+            raise termmeshError(response)
         return response.strip().lower() == "true"
 
     def wait_for_webview_focus(self, panel_id: str, timeout_s: float = 2.0) -> None:
@@ -818,19 +818,19 @@ class cmux:
             if self.is_webview_focused(panel_id):
                 return
             time.sleep(0.05)
-        raise cmuxError(f"Timed out waiting for webview focus: {panel_id}")
+        raise termmeshError(f"Timed out waiting for webview focus: {panel_id}")
 
     def set_shortcut(self, name: str, combo: str) -> None:
         """Set a keyboard shortcut via the debug socket."""
         response = self._send_command(f"set_shortcut {name} {combo}")
         if not response.startswith("OK"):
-            raise cmuxError(response)
+            raise termmeshError(response)
 
     def simulate_shortcut(self, combo: str) -> None:
         """Simulate a keyDown shortcut via the debug socket."""
         response = self._send_command(f"simulate_shortcut {combo}")
         if not response.startswith("OK"):
-            raise cmuxError(response)
+            raise termmeshError(response)
 
     def simulate_type(self, text: str) -> None:
         """Insert text into the current first responder (debug builds only)."""
@@ -843,76 +843,76 @@ class cmux:
         )
         response = self._send_command(f"simulate_type {escaped}")
         if not response.startswith("OK"):
-            raise cmuxError(response)
+            raise termmeshError(response)
 
     def simulate_file_drop(self, surface: Union[str, int], paths: Union[str, List[str]]) -> None:
         """Simulate dropping file path(s) onto a terminal surface (debug builds only)."""
         payload = paths if isinstance(paths, str) else "|".join(paths)
         response = self._send_command(f"simulate_file_drop {surface} {payload}")
         if not response.startswith("OK"):
-            raise cmuxError(response)
+            raise termmeshError(response)
 
     def seed_drag_pasteboard_fileurl(self) -> None:
         """Seed NSDrag pasteboard with public.file-url in the app process (debug builds only)."""
         response = self._send_command("seed_drag_pasteboard_fileurl")
         if not response.startswith("OK"):
-            raise cmuxError(response)
+            raise termmeshError(response)
 
     def seed_drag_pasteboard_tabtransfer(self) -> None:
         """Seed NSDrag pasteboard with tab transfer type in the app process (debug builds only)."""
         response = self._send_command("seed_drag_pasteboard_tabtransfer")
         if not response.startswith("OK"):
-            raise cmuxError(response)
+            raise termmeshError(response)
 
     def seed_drag_pasteboard_sidebar_reorder(self) -> None:
         """Seed NSDrag pasteboard with sidebar reorder type in the app process (debug builds only)."""
         response = self._send_command("seed_drag_pasteboard_sidebar_reorder")
         if not response.startswith("OK"):
-            raise cmuxError(response)
+            raise termmeshError(response)
 
     def seed_drag_pasteboard_types(self, types: List[str]) -> None:
         """Seed NSDrag pasteboard with comma/space-separated types in app process."""
         if not types:
-            raise cmuxError("seed_drag_pasteboard_types requires at least one type")
+            raise termmeshError("seed_drag_pasteboard_types requires at least one type")
         payload = ",".join(t.strip() for t in types if t and t.strip())
         if not payload:
-            raise cmuxError("seed_drag_pasteboard_types requires at least one non-empty type")
+            raise termmeshError("seed_drag_pasteboard_types requires at least one non-empty type")
         response = self._send_command(f"seed_drag_pasteboard_types {payload}")
         if not response.startswith("OK"):
-            raise cmuxError(response)
+            raise termmeshError(response)
 
     def clear_drag_pasteboard(self) -> None:
         """Clear NSDrag pasteboard in the app process (debug builds only)."""
         response = self._send_command("clear_drag_pasteboard")
         if not response.startswith("OK"):
-            raise cmuxError(response)
+            raise termmeshError(response)
 
     def overlay_hit_gate(self, event_type: str) -> bool:
         """Return whether FileDropOverlayView would capture hit-testing for event_type."""
         response = self._send_command(f"overlay_hit_gate {event_type}")
         if response.startswith("ERROR"):
-            raise cmuxError(response)
+            raise termmeshError(response)
         return response.strip().lower() == "true"
 
     def overlay_drop_gate(self, source: str = "external") -> bool:
         """Return whether FileDropOverlayView would capture drag-destination routing."""
         response = self._send_command(f"overlay_drop_gate {source}")
         if response.startswith("ERROR"):
-            raise cmuxError(response)
+            raise termmeshError(response)
         return response.strip().lower() == "true"
 
     def portal_hit_gate(self, event_type: str) -> bool:
         """Return whether terminal portal hit-testing should pass through to SwiftUI drag targets."""
         response = self._send_command(f"portal_hit_gate {event_type}")
         if response.startswith("ERROR"):
-            raise cmuxError(response)
+            raise termmeshError(response)
         return response.strip().lower() == "true"
 
     def sidebar_overlay_gate(self, state: str = "active") -> bool:
         """Return whether sidebar outside-drop overlay would capture for drag state."""
         response = self._send_command(f"sidebar_overlay_gate {state}")
         if response.startswith("ERROR"):
-            raise cmuxError(response)
+            raise termmeshError(response)
         return response.strip().lower() == "true"
 
     def drop_hit_test(self, x: float, y: float) -> Optional[str]:
@@ -922,7 +922,7 @@ class cmux:
         """
         response = self._send_command(f"drop_hit_test {x} {y}")
         if response.startswith("ERROR"):
-            raise cmuxError(response)
+            raise termmeshError(response)
         val = response.strip()
         return None if val == "none" else val
 
@@ -930,27 +930,27 @@ class cmux:
         """Return hit-view chain at normalised (0-1) coordinates."""
         response = self._send_command(f"drag_hit_chain {x} {y}")
         if response.startswith("ERROR"):
-            raise cmuxError(response)
+            raise termmeshError(response)
         return response.strip()
 
     def activate_app(self) -> None:
         """Bring app + main window to front (debug builds only)."""
         response = self._send_command("activate_app")
         if not response.startswith("OK"):
-            raise cmuxError(response)
+            raise termmeshError(response)
 
     def is_terminal_focused(self, panel: Union[str, int]) -> bool:
         """Return True if the terminal panel's Ghostty view is first responder."""
         response = self._send_command(f"is_terminal_focused {panel}")
         if response.startswith("ERROR"):
-            raise cmuxError(response)
+            raise termmeshError(response)
         return response.strip().lower() == "true"
 
     def identify(self) -> dict:
         """Best-effort legacy identify helper."""
         response = self._send_command("identify")
         if response.startswith("ERROR"):
-            raise cmuxError(response)
+            raise termmeshError(response)
         try:
             return json.loads(response)
         except Exception:
@@ -960,12 +960,12 @@ class cmux:
         """Return bonsplit layout snapshot + selected panel bounds."""
         response = self._send_command("layout_debug")
         if not response.startswith("OK "):
-            raise cmuxError(response)
+            raise termmeshError(response)
         payload = response[3:].strip()
         try:
             return json.loads(payload)
         except json.JSONDecodeError as e:
-            raise cmuxError(f"layout_debug JSON decode failed: {e}: {payload[:200]}")
+            raise termmeshError(f"layout_debug JSON decode failed: {e}: {payload[:200]}")
 
     def read_terminal_text(self, panel: Union[str, int, None] = None) -> str:
         """
@@ -977,7 +977,7 @@ class cmux:
             cmd += f" {panel}"
         response = self._send_command(cmd)
         if not response.startswith("OK "):
-            raise cmuxError(response)
+            raise termmeshError(response)
         b64 = response[3:].strip()
         raw = base64.b64decode(b64) if b64 else b""
         return raw.decode("utf-8", errors="replace")
@@ -989,18 +989,18 @@ class cmux:
             cmd += f" {panel}"
         response = self._send_command(cmd)
         if not response.startswith("OK "):
-            raise cmuxError(response)
+            raise termmeshError(response)
         payload = response[3:].strip()
         try:
             return json.loads(payload)
         except json.JSONDecodeError as e:
-            raise cmuxError(f"render_stats JSON decode failed: {e}: {payload[:200]}")
+            raise termmeshError(f"render_stats JSON decode failed: {e}: {payload[:200]}")
 
     def panel_snapshot_reset(self, panel: Union[str, int]) -> None:
         """Reset the stored snapshot for a panel (debug builds only)."""
         response = self._send_command(f"panel_snapshot_reset {panel}")
         if not response.startswith("OK"):
-            raise cmuxError(response)
+            raise termmeshError(response)
 
     def panel_snapshot(self, panel: Union[str, int], label: str = "") -> dict:
         """
@@ -1012,11 +1012,11 @@ class cmux:
             cmd += f" {label}"
         response = self._send_command(cmd)
         if not response.startswith("OK "):
-            raise cmuxError(response)
+            raise termmeshError(response)
         payload = response[3:].strip()
         parts = payload.split(" ", 4)
         if len(parts) != 5:
-            raise cmuxError(f"panel_snapshot parse failed: {response}")
+            raise termmeshError(f"panel_snapshot parse failed: {response}")
         panel_id, changed, width, height, path = parts
         return {
             "panel_id": panel_id,
@@ -1031,26 +1031,26 @@ class cmux:
         response = self._send_command("bonsplit_underflow_count")
         if response.startswith("OK "):
             return int(response.split(" ", 1)[1])
-        raise cmuxError(response)
+        raise termmeshError(response)
 
     def reset_bonsplit_underflow_count(self) -> None:
         """Reset bonsplit arranged-subview underflow counter."""
         response = self._send_command("reset_bonsplit_underflow_count")
         if not response.startswith("OK"):
-            raise cmuxError(response)
+            raise termmeshError(response)
 
     def empty_panel_count(self) -> int:
         """Return the number of EmptyPanelView appearances."""
         response = self._send_command("empty_panel_count")
         if response.startswith("OK "):
             return int(response.split(" ", 1)[1])
-        raise cmuxError(response)
+        raise termmeshError(response)
 
     def reset_empty_panel_count(self) -> None:
         """Reset the EmptyPanelView appearance counter."""
         response = self._send_command("reset_empty_panel_count")
         if not response.startswith("OK"):
-            raise cmuxError(response)
+            raise termmeshError(response)
 
     def new_surface(self, pane: Union[str, int, None] = None,
                     panel_type: str = "terminal", url: str = None) -> str:
@@ -1073,7 +1073,7 @@ class cmux:
         response = self._send_command(cmd)
         if response.startswith("OK "):
             return response[3:]
-        raise cmuxError(response)
+        raise termmeshError(response)
 
     def new_pane(self, direction: str = "right", panel_type: str = "terminal",
                  url: str = None) -> str:
@@ -1091,7 +1091,7 @@ class cmux:
         response = self._send_command(cmd)
         if response.startswith("OK "):
             return response[3:]
-        raise cmuxError(response)
+        raise termmeshError(response)
 
     def close_surface(self, surface: Union[str, int, None] = None) -> None:
         """
@@ -1103,7 +1103,7 @@ class cmux:
         else:
             response = self._send_command(f"close_surface {surface}")
         if not response.startswith("OK"):
-            raise cmuxError(response)
+            raise termmeshError(response)
 
     def surface_health(self, workspace: Union[str, int, None] = None) -> List[dict]:
         """
@@ -1159,11 +1159,11 @@ class cmux:
 
 
 def main():
-    """CLI interface for cmux"""
+    """CLI interface for term-mesh"""
     import sys
     import argparse
 
-    parser = argparse.ArgumentParser(description="cmux CLI")
+    parser = argparse.ArgumentParser(description="term-mesh CLI")
     parser.add_argument("command", nargs="?", help="Command to send")
     parser.add_argument("args", nargs="*", help="Command arguments")
     parser.add_argument("-s", "--socket", default=None,
@@ -1172,10 +1172,10 @@ def main():
     args = parser.parse_args()
 
     try:
-        with cmux(args.socket) as client:
+        with termmesh(args.socket) as client:
             if not args.command:
                 # Interactive mode
-                print("cmux CLI (type 'help' for commands, 'quit' to exit)")
+                print("term-mesh CLI (type 'help' for commands, 'quit' to exit)")
                 while True:
                     try:
                         line = input("> ").strip()
@@ -1196,7 +1196,7 @@ def main():
                     command += " " + " ".join(args.args)
                 response = client._send_command(command)
                 print(response)
-    except cmuxError as e:
+    except termmeshError as e:
         print(f"Error: {e}", file=sys.stderr)
         sys.exit(1)
 

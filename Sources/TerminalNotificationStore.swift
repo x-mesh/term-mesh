@@ -15,11 +15,12 @@ enum NotificationBadgeSettings {
 }
 
 enum TaggedRunBadgeSettings {
-    static let environmentKey = "CMUX_TAG"
+    static let environmentKey = "TERMMESH_TAG"
+    static let environmentKeyLegacy = "CMUX_TAG"
     private static let maxTagLength = 10
 
     static func normalizedTag(from env: [String: String] = ProcessInfo.processInfo.environment) -> String? {
-        normalizedTag(env[environmentKey])
+        normalizedTag(env[environmentKey] ?? env[environmentKeyLegacy])
     }
 
     static func normalizedTag(_ rawTag: String?) -> String? {
@@ -52,7 +53,7 @@ enum AppFocusState {
         // Only treat the app as "focused" for notification suppression when a main terminal window
         // is key. If Settings/About/debug panels are key, we still want notifications to show.
         if let raw = keyWindow.identifier?.rawValue {
-            return raw == "cmux.main" || raw.hasPrefix("cmux.main.")
+            return raw == "term-mesh.main" || raw.hasPrefix("term-mesh.main.")
         }
         return false
     }
@@ -73,8 +74,8 @@ struct TerminalNotification: Identifiable, Hashable {
 final class TerminalNotificationStore: ObservableObject {
     static let shared = TerminalNotificationStore()
 
-    static let categoryIdentifier = "com.cmuxterm.app.userNotification"
-    static let actionShowIdentifier = "com.cmuxterm.app.userNotification.show"
+    static let categoryIdentifier = "com.termmesh.app.userNotification"
+    static let actionShowIdentifier = "com.termmesh.app.userNotification.show"
 
     @Published private(set) var notifications: [TerminalNotification] = [] {
         didSet {
@@ -272,7 +273,7 @@ final class TerminalNotificationStore: ObservableObject {
             let content = UNMutableNotificationContent()
             let appName = Bundle.main.object(forInfoDictionaryKey: "CFBundleDisplayName") as? String
                 ?? Bundle.main.object(forInfoDictionaryKey: "CFBundleName") as? String
-                ?? "cmux"
+                ?? "term-mesh"
             content.title = notification.title.isEmpty ? appName : notification.title
             content.subtitle = notification.subtitle
             content.body = notification.body
@@ -338,8 +339,8 @@ final class TerminalNotificationStore: ObservableObject {
             self.hasPromptedForSettings = true
 
             let alert = NSAlert()
-            alert.messageText = "Enable Notifications for cmux"
-            alert.informativeText = "Notifications are disabled for cmux. Enable them in System Settings to see alerts."
+            alert.messageText = "Enable Notifications for term-mesh"
+            alert.informativeText = "Notifications are disabled for term-mesh. Enable them in System Settings to see alerts."
             alert.addButton(withTitle: "Open Settings")
             alert.addButton(withTitle: "Not Now")
             let response = alert.runModal()

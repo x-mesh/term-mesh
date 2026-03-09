@@ -7,7 +7,7 @@ final class BrowserOmnibarSuggestionsUITests: XCTestCase {
     override func setUp() {
         super.setUp()
         continueAfterFailure = false
-        dataPath = "/tmp/cmux-ui-test-omnibar-suggestions-\(UUID().uuidString).json"
+        dataPath = "/tmp/term-mesh-ui-test-omnibar-suggestions-\(UUID().uuidString).json"
         try? FileManager.default.removeItem(atPath: dataPath)
 
         // Terminate any lingering app from a prior test so its debounced
@@ -21,11 +21,11 @@ final class BrowserOmnibarSuggestionsUITests: XCTestCase {
         seedBrowserHistoryForTest()
 
         let app = XCUIApplication()
-        app.launchEnvironment["CMUX_UI_TEST_MODE"] = "1"
-        app.launchEnvironment["CMUX_UI_TEST_GOTO_SPLIT_SETUP"] = "1"
-        app.launchEnvironment["CMUX_UI_TEST_GOTO_SPLIT_PATH"] = dataPath
+        app.launchEnvironment["TERMMESH_UI_TEST_MODE"] = "1"
+        app.launchEnvironment["TERMMESH_UI_TEST_GOTO_SPLIT_SETUP"] = "1"
+        app.launchEnvironment["TERMMESH_UI_TEST_GOTO_SPLIT_PATH"] = dataPath
         // Keep suggestions deterministic for the keyboard-nav assertions.
-        app.launchEnvironment["CMUX_UI_TEST_DISABLE_REMOTE_SUGGESTIONS"] = "1"
+        app.launchEnvironment["TERMMESH_UI_TEST_DISABLE_REMOTE_SUGGESTIONS"] = "1"
         app.launch()
         app.activate()
 
@@ -99,11 +99,11 @@ final class BrowserOmnibarSuggestionsUITests: XCTestCase {
         seedBrowserHistoryForTest()
 
         let app = XCUIApplication()
-        app.launchEnvironment["CMUX_UI_TEST_MODE"] = "1"
-        app.launchEnvironment["CMUX_UI_TEST_GOTO_SPLIT_SETUP"] = "1"
-        app.launchEnvironment["CMUX_UI_TEST_GOTO_SPLIT_PATH"] = dataPath
+        app.launchEnvironment["TERMMESH_UI_TEST_MODE"] = "1"
+        app.launchEnvironment["TERMMESH_UI_TEST_GOTO_SPLIT_SETUP"] = "1"
+        app.launchEnvironment["TERMMESH_UI_TEST_GOTO_SPLIT_PATH"] = dataPath
         // Keep suggestions deterministic.
-        app.launchEnvironment["CMUX_UI_TEST_DISABLE_REMOTE_SUGGESTIONS"] = "1"
+        app.launchEnvironment["TERMMESH_UI_TEST_DISABLE_REMOTE_SUGGESTIONS"] = "1"
         app.launch()
         app.activate()
 
@@ -184,11 +184,11 @@ final class BrowserOmnibarSuggestionsUITests: XCTestCase {
         seedBrowserHistoryForTest()
 
         let app = XCUIApplication()
-        app.launchEnvironment["CMUX_UI_TEST_MODE"] = "1"
-        app.launchEnvironment["CMUX_UI_TEST_GOTO_SPLIT_SETUP"] = "1"
-        app.launchEnvironment["CMUX_UI_TEST_GOTO_SPLIT_PATH"] = dataPath
-        app.launchEnvironment["CMUX_UI_TEST_DISABLE_REMOTE_SUGGESTIONS"] = "1"
-        app.launchEnvironment["CMUX_UI_TEST_REMOTE_SUGGESTIONS_JSON"] = #"["go tutorial","go json","go fmt"]"#
+        app.launchEnvironment["TERMMESH_UI_TEST_MODE"] = "1"
+        app.launchEnvironment["TERMMESH_UI_TEST_GOTO_SPLIT_SETUP"] = "1"
+        app.launchEnvironment["TERMMESH_UI_TEST_GOTO_SPLIT_PATH"] = dataPath
+        app.launchEnvironment["TERMMESH_UI_TEST_DISABLE_REMOTE_SUGGESTIONS"] = "1"
+        app.launchEnvironment["TERMMESH_UI_TEST_REMOTE_SUGGESTIONS_JSON"] = #"["go tutorial","go json","go fmt"]"#
         app.launch()
         app.activate()
 
@@ -220,11 +220,11 @@ final class BrowserOmnibarSuggestionsUITests: XCTestCase {
         seedBrowserHistoryForTest()
 
         let app = XCUIApplication()
-        app.launchEnvironment["CMUX_UI_TEST_MODE"] = "1"
-        app.launchEnvironment["CMUX_UI_TEST_GOTO_SPLIT_SETUP"] = "1"
-        app.launchEnvironment["CMUX_UI_TEST_GOTO_SPLIT_PATH"] = dataPath
-        app.launchEnvironment["CMUX_UI_TEST_DISABLE_REMOTE_SUGGESTIONS"] = "1"
-        app.launchEnvironment["CMUX_UI_TEST_REMOTE_SUGGESTIONS_JSON"] = #"["go tutorial","go json","go fmt"]"#
+        app.launchEnvironment["TERMMESH_UI_TEST_MODE"] = "1"
+        app.launchEnvironment["TERMMESH_UI_TEST_GOTO_SPLIT_SETUP"] = "1"
+        app.launchEnvironment["TERMMESH_UI_TEST_GOTO_SPLIT_PATH"] = dataPath
+        app.launchEnvironment["TERMMESH_UI_TEST_DISABLE_REMOTE_SUGGESTIONS"] = "1"
+        app.launchEnvironment["TERMMESH_UI_TEST_REMOTE_SUGGESTIONS_JSON"] = #"["go tutorial","go json","go fmt"]"#
         app.launch()
         app.activate()
 
@@ -249,10 +249,10 @@ final class BrowserOmnibarSuggestionsUITests: XCTestCase {
         seedBrowserHistoryForTest()
 
         let app = XCUIApplication()
-        app.launchEnvironment["CMUX_UI_TEST_MODE"] = "1"
-        app.launchEnvironment["CMUX_UI_TEST_GOTO_SPLIT_SETUP"] = "1"
-        app.launchEnvironment["CMUX_UI_TEST_GOTO_SPLIT_PATH"] = dataPath
-        app.launchEnvironment["CMUX_UI_TEST_DISABLE_REMOTE_SUGGESTIONS"] = "1"
+        app.launchEnvironment["TERMMESH_UI_TEST_MODE"] = "1"
+        app.launchEnvironment["TERMMESH_UI_TEST_GOTO_SPLIT_SETUP"] = "1"
+        app.launchEnvironment["TERMMESH_UI_TEST_GOTO_SPLIT_PATH"] = dataPath
+        app.launchEnvironment["TERMMESH_UI_TEST_DISABLE_REMOTE_SUGGESTIONS"] = "1"
         app.launch()
         app.activate()
 
@@ -311,10 +311,10 @@ final class BrowserOmnibarSuggestionsUITests: XCTestCase {
         seedBrowserHistoryForTest()
 
         let app = XCUIApplication()
-        app.launchEnvironment["CMUX_UI_TEST_MODE"] = "1"
-        app.launchEnvironment["CMUX_UI_TEST_GOTO_SPLIT_SETUP"] = "1"
-        app.launchEnvironment["CMUX_UI_TEST_GOTO_SPLIT_PATH"] = dataPath
-        app.launchEnvironment["CMUX_UI_TEST_DISABLE_REMOTE_SUGGESTIONS"] = "1"
+        app.launchEnvironment["TERMMESH_UI_TEST_MODE"] = "1"
+        app.launchEnvironment["TERMMESH_UI_TEST_GOTO_SPLIT_SETUP"] = "1"
+        app.launchEnvironment["TERMMESH_UI_TEST_GOTO_SPLIT_PATH"] = dataPath
+        app.launchEnvironment["TERMMESH_UI_TEST_DISABLE_REMOTE_SUGGESTIONS"] = "1"
         app.launch()
         app.activate()
 
@@ -369,10 +369,10 @@ final class BrowserOmnibarSuggestionsUITests: XCTestCase {
         )
 
         let app = XCUIApplication()
-        app.launchEnvironment["CMUX_UI_TEST_MODE"] = "1"
-        app.launchEnvironment["CMUX_UI_TEST_GOTO_SPLIT_SETUP"] = "1"
-        app.launchEnvironment["CMUX_UI_TEST_GOTO_SPLIT_PATH"] = dataPath
-        app.launchEnvironment["CMUX_UI_TEST_DISABLE_REMOTE_SUGGESTIONS"] = "1"
+        app.launchEnvironment["TERMMESH_UI_TEST_MODE"] = "1"
+        app.launchEnvironment["TERMMESH_UI_TEST_GOTO_SPLIT_SETUP"] = "1"
+        app.launchEnvironment["TERMMESH_UI_TEST_GOTO_SPLIT_PATH"] = dataPath
+        app.launchEnvironment["TERMMESH_UI_TEST_DISABLE_REMOTE_SUGGESTIONS"] = "1"
         app.launch()
         app.activate()
 
@@ -411,10 +411,10 @@ final class BrowserOmnibarSuggestionsUITests: XCTestCase {
 
     func testOmnibarSingleRowPopupUsesMinimumHeight() {
         let app = XCUIApplication()
-        app.launchEnvironment["CMUX_UI_TEST_MODE"] = "1"
-        app.launchEnvironment["CMUX_UI_TEST_GOTO_SPLIT_SETUP"] = "1"
-        app.launchEnvironment["CMUX_UI_TEST_GOTO_SPLIT_PATH"] = dataPath
-        app.launchEnvironment["CMUX_UI_TEST_DISABLE_REMOTE_SUGGESTIONS"] = "1"
+        app.launchEnvironment["TERMMESH_UI_TEST_MODE"] = "1"
+        app.launchEnvironment["TERMMESH_UI_TEST_GOTO_SPLIT_SETUP"] = "1"
+        app.launchEnvironment["TERMMESH_UI_TEST_GOTO_SPLIT_PATH"] = dataPath
+        app.launchEnvironment["TERMMESH_UI_TEST_DISABLE_REMOTE_SUGGESTIONS"] = "1"
         app.launch()
         app.activate()
 
@@ -457,10 +457,10 @@ final class BrowserOmnibarSuggestionsUITests: XCTestCase {
         seedBrowserHistoryForTest()
 
         let app = XCUIApplication()
-        app.launchEnvironment["CMUX_UI_TEST_MODE"] = "1"
-        app.launchEnvironment["CMUX_UI_TEST_GOTO_SPLIT_SETUP"] = "1"
-        app.launchEnvironment["CMUX_UI_TEST_GOTO_SPLIT_PATH"] = dataPath
-        app.launchEnvironment["CMUX_UI_TEST_DISABLE_REMOTE_SUGGESTIONS"] = "1"
+        app.launchEnvironment["TERMMESH_UI_TEST_MODE"] = "1"
+        app.launchEnvironment["TERMMESH_UI_TEST_GOTO_SPLIT_SETUP"] = "1"
+        app.launchEnvironment["TERMMESH_UI_TEST_GOTO_SPLIT_PATH"] = dataPath
+        app.launchEnvironment["TERMMESH_UI_TEST_DISABLE_REMOTE_SUGGESTIONS"] = "1"
         app.launch()
         app.activate()
 
@@ -495,10 +495,10 @@ final class BrowserOmnibarSuggestionsUITests: XCTestCase {
         seedBrowserHistoryForTest()
 
         let app = XCUIApplication()
-        app.launchEnvironment["CMUX_UI_TEST_MODE"] = "1"
-        app.launchEnvironment["CMUX_UI_TEST_GOTO_SPLIT_SETUP"] = "1"
-        app.launchEnvironment["CMUX_UI_TEST_GOTO_SPLIT_PATH"] = dataPath
-        app.launchEnvironment["CMUX_UI_TEST_DISABLE_REMOTE_SUGGESTIONS"] = "1"
+        app.launchEnvironment["TERMMESH_UI_TEST_MODE"] = "1"
+        app.launchEnvironment["TERMMESH_UI_TEST_GOTO_SPLIT_SETUP"] = "1"
+        app.launchEnvironment["TERMMESH_UI_TEST_GOTO_SPLIT_PATH"] = dataPath
+        app.launchEnvironment["TERMMESH_UI_TEST_DISABLE_REMOTE_SUGGESTIONS"] = "1"
         app.launch()
         app.activate()
 

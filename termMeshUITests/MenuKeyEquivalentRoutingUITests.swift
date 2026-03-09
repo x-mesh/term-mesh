@@ -13,9 +13,9 @@ final class MenuKeyEquivalentRoutingUITests: XCTestCase {
         super.setUp()
         continueAfterFailure = false
 
-        gotoSplitPath = "/tmp/cmux-ui-test-goto-split-\(UUID().uuidString).json"
-        keyequivPath = "/tmp/cmux-ui-test-keyequiv-\(UUID().uuidString).json"
-        socketPath = "/tmp/cmux-ui-test-socket-\(UUID().uuidString).sock"
+        gotoSplitPath = "/tmp/term-mesh-ui-test-goto-split-\(UUID().uuidString).json"
+        keyequivPath = "/tmp/term-mesh-ui-test-keyequiv-\(UUID().uuidString).json"
+        socketPath = "/tmp/term-mesh-ui-test-socket-\(UUID().uuidString).sock"
 
         try? FileManager.default.removeItem(atPath: gotoSplitPath)
         try? FileManager.default.removeItem(atPath: keyequivPath)
@@ -81,10 +81,10 @@ final class MenuKeyEquivalentRoutingUITests: XCTestCase {
 
     private func launchWithBrowserSetup() -> XCUIApplication {
         let app = XCUIApplication()
-        app.launchEnvironment["CMUX_SOCKET_PATH"] = socketPath
-        app.launchEnvironment["CMUX_UI_TEST_GOTO_SPLIT_SETUP"] = "1"
-        app.launchEnvironment["CMUX_UI_TEST_GOTO_SPLIT_PATH"] = gotoSplitPath
-        app.launchEnvironment["CMUX_UI_TEST_KEYEQUIV_PATH"] = keyequivPath
+        app.launchEnvironment["TERMMESH_SOCKET_PATH"] = socketPath
+        app.launchEnvironment["TERMMESH_UI_TEST_GOTO_SPLIT_SETUP"] = "1"
+        app.launchEnvironment["TERMMESH_UI_TEST_GOTO_SPLIT_PATH"] = gotoSplitPath
+        app.launchEnvironment["TERMMESH_UI_TEST_KEYEQUIV_PATH"] = keyequivPath
         app.launch()
         app.activate()
 
@@ -193,9 +193,9 @@ final class SplitCloseRightBlankRegressionUITests: XCTestCase {
         super.setUp()
         continueAfterFailure = false
 
-        dataPath = "/tmp/cmux-ui-test-split-close-right-\(UUID().uuidString).json"
-        socketPath = "/tmp/cmux-ui-test-socket-\(UUID().uuidString).sock"
-        diagnosticsPath = "/tmp/cmux-ui-test-diagnostics-\(UUID().uuidString).json"
+        dataPath = "/tmp/term-mesh-ui-test-split-close-right-\(UUID().uuidString).json"
+        socketPath = "/tmp/term-mesh-ui-test-socket-\(UUID().uuidString).sock"
+        diagnosticsPath = "/tmp/term-mesh-ui-test-diagnostics-\(UUID().uuidString).json"
         // Prefer a globally accessible dir so we can pull screenshots from the VM for debugging.
         // If sandbox rules prevent this, fall back to the runner's container temp dir.
         let leaf = "cmux-ui-test-split-close-right-shots-\(UUID().uuidString)"
@@ -216,10 +216,10 @@ final class SplitCloseRightBlankRegressionUITests: XCTestCase {
 
     func testClosingBothRightSplitsDoesNotLeaveBlankPane() {
         let app = XCUIApplication()
-        app.launchEnvironment["CMUX_UI_TEST_SPLIT_CLOSE_RIGHT_SETUP"] = "1"
-        app.launchEnvironment["CMUX_UI_TEST_SPLIT_CLOSE_RIGHT_PATH"] = dataPath
-        app.launchEnvironment["CMUX_SOCKET_PATH"] = socketPath
-        app.launchEnvironment["CMUX_UI_TEST_DIAGNOSTICS_PATH"] = diagnosticsPath
+        app.launchEnvironment["TERMMESH_UI_TEST_SPLIT_CLOSE_RIGHT_SETUP"] = "1"
+        app.launchEnvironment["TERMMESH_UI_TEST_SPLIT_CLOSE_RIGHT_PATH"] = dataPath
+        app.launchEnvironment["TERMMESH_SOCKET_PATH"] = socketPath
+        app.launchEnvironment["TERMMESH_UI_TEST_DIAGNOSTICS_PATH"] = diagnosticsPath
         app.launch()
         app.activate()
 
@@ -262,18 +262,18 @@ final class SplitCloseRightBlankRegressionUITests: XCTestCase {
 
     func testReproBlankAfterClosingRightSplitsViaShortcuts() {
         let app = XCUIApplication()
-        app.launchEnvironment["CMUX_UI_TEST_DIAGNOSTICS_PATH"] = diagnosticsPath
-        app.launchEnvironment["CMUX_UI_TEST_SPLIT_CLOSE_RIGHT_SETUP"] = "1"
-        app.launchEnvironment["CMUX_UI_TEST_SPLIT_CLOSE_RIGHT_PATH"] = dataPath
-        app.launchEnvironment["CMUX_UI_TEST_SPLIT_CLOSE_RIGHT_VISUAL"] = "1"
+        app.launchEnvironment["TERMMESH_UI_TEST_DIAGNOSTICS_PATH"] = diagnosticsPath
+        app.launchEnvironment["TERMMESH_UI_TEST_SPLIT_CLOSE_RIGHT_SETUP"] = "1"
+        app.launchEnvironment["TERMMESH_UI_TEST_SPLIT_CLOSE_RIGHT_PATH"] = dataPath
+        app.launchEnvironment["TERMMESH_UI_TEST_SPLIT_CLOSE_RIGHT_VISUAL"] = "1"
         // The regression can be a single compositor frame; capture enough post-close frames to
         // deterministically catch it.
-        app.launchEnvironment["CMUX_UI_TEST_SPLIT_CLOSE_RIGHT_ITERATIONS"] = "12"
+        app.launchEnvironment["TERMMESH_UI_TEST_SPLIT_CLOSE_RIGHT_ITERATIONS"] = "12"
         // Close quickly (closer to how a user can click two close buttons back-to-back).
-        app.launchEnvironment["CMUX_UI_TEST_SPLIT_CLOSE_RIGHT_CLOSE_DELAY_MS"] = "0"
-        app.launchEnvironment["CMUX_UI_TEST_SPLIT_CLOSE_RIGHT_BURST_FRAMES"] = "32"
+        app.launchEnvironment["TERMMESH_UI_TEST_SPLIT_CLOSE_RIGHT_CLOSE_DELAY_MS"] = "0"
+        app.launchEnvironment["TERMMESH_UI_TEST_SPLIT_CLOSE_RIGHT_BURST_FRAMES"] = "32"
         // Repro order that still flashes for users: split left/right first, then split top/down.
-        app.launchEnvironment["CMUX_UI_TEST_SPLIT_CLOSE_RIGHT_PATTERN"] = "close_right_lrtd"
+        app.launchEnvironment["TERMMESH_UI_TEST_SPLIT_CLOSE_RIGHT_PATTERN"] = "close_right_lrtd"
         app.launch()
         app.activate()
 
@@ -316,14 +316,14 @@ final class SplitCloseRightBlankRegressionUITests: XCTestCase {
 
     func testReproStretchAfterClosingSingleRightSplit() {
         let app = XCUIApplication()
-        app.launchEnvironment["CMUX_UI_TEST_DIAGNOSTICS_PATH"] = diagnosticsPath
-        app.launchEnvironment["CMUX_UI_TEST_SPLIT_CLOSE_RIGHT_SETUP"] = "1"
-        app.launchEnvironment["CMUX_UI_TEST_SPLIT_CLOSE_RIGHT_PATH"] = dataPath
-        app.launchEnvironment["CMUX_UI_TEST_SPLIT_CLOSE_RIGHT_VISUAL"] = "1"
-        app.launchEnvironment["CMUX_UI_TEST_SPLIT_CLOSE_RIGHT_ITERATIONS"] = "16"
-        app.launchEnvironment["CMUX_UI_TEST_SPLIT_CLOSE_RIGHT_CLOSE_DELAY_MS"] = "0"
-        app.launchEnvironment["CMUX_UI_TEST_SPLIT_CLOSE_RIGHT_BURST_FRAMES"] = "36"
-        app.launchEnvironment["CMUX_UI_TEST_SPLIT_CLOSE_RIGHT_PATTERN"] = "close_right_single"
+        app.launchEnvironment["TERMMESH_UI_TEST_DIAGNOSTICS_PATH"] = diagnosticsPath
+        app.launchEnvironment["TERMMESH_UI_TEST_SPLIT_CLOSE_RIGHT_SETUP"] = "1"
+        app.launchEnvironment["TERMMESH_UI_TEST_SPLIT_CLOSE_RIGHT_PATH"] = dataPath
+        app.launchEnvironment["TERMMESH_UI_TEST_SPLIT_CLOSE_RIGHT_VISUAL"] = "1"
+        app.launchEnvironment["TERMMESH_UI_TEST_SPLIT_CLOSE_RIGHT_ITERATIONS"] = "16"
+        app.launchEnvironment["TERMMESH_UI_TEST_SPLIT_CLOSE_RIGHT_CLOSE_DELAY_MS"] = "0"
+        app.launchEnvironment["TERMMESH_UI_TEST_SPLIT_CLOSE_RIGHT_BURST_FRAMES"] = "36"
+        app.launchEnvironment["TERMMESH_UI_TEST_SPLIT_CLOSE_RIGHT_PATTERN"] = "close_right_single"
         app.launch()
         app.activate()
 
@@ -360,14 +360,14 @@ final class SplitCloseRightBlankRegressionUITests: XCTestCase {
 
     func testReproBlankAfterClosingBottomSplitsViaShortcuts() {
         let app = XCUIApplication()
-        app.launchEnvironment["CMUX_UI_TEST_DIAGNOSTICS_PATH"] = diagnosticsPath
-        app.launchEnvironment["CMUX_UI_TEST_SPLIT_CLOSE_RIGHT_SETUP"] = "1"
-        app.launchEnvironment["CMUX_UI_TEST_SPLIT_CLOSE_RIGHT_PATH"] = dataPath
-        app.launchEnvironment["CMUX_UI_TEST_SPLIT_CLOSE_RIGHT_VISUAL"] = "1"
-        app.launchEnvironment["CMUX_UI_TEST_SPLIT_CLOSE_RIGHT_ITERATIONS"] = "12"
-        app.launchEnvironment["CMUX_UI_TEST_SPLIT_CLOSE_RIGHT_CLOSE_DELAY_MS"] = "0"
-        app.launchEnvironment["CMUX_UI_TEST_SPLIT_CLOSE_RIGHT_BURST_FRAMES"] = "32"
-        app.launchEnvironment["CMUX_UI_TEST_SPLIT_CLOSE_RIGHT_PATTERN"] = "close_bottom"
+        app.launchEnvironment["TERMMESH_UI_TEST_DIAGNOSTICS_PATH"] = diagnosticsPath
+        app.launchEnvironment["TERMMESH_UI_TEST_SPLIT_CLOSE_RIGHT_SETUP"] = "1"
+        app.launchEnvironment["TERMMESH_UI_TEST_SPLIT_CLOSE_RIGHT_PATH"] = dataPath
+        app.launchEnvironment["TERMMESH_UI_TEST_SPLIT_CLOSE_RIGHT_VISUAL"] = "1"
+        app.launchEnvironment["TERMMESH_UI_TEST_SPLIT_CLOSE_RIGHT_ITERATIONS"] = "12"
+        app.launchEnvironment["TERMMESH_UI_TEST_SPLIT_CLOSE_RIGHT_CLOSE_DELAY_MS"] = "0"
+        app.launchEnvironment["TERMMESH_UI_TEST_SPLIT_CLOSE_RIGHT_BURST_FRAMES"] = "32"
+        app.launchEnvironment["TERMMESH_UI_TEST_SPLIT_CLOSE_RIGHT_PATTERN"] = "close_bottom"
         app.launch()
         app.activate()
 
@@ -409,15 +409,15 @@ final class SplitCloseRightBlankRegressionUITests: XCTestCase {
 
     func testReproBlankAfterClosingRightSplitsTopFirstWithGap() {
         let app = XCUIApplication()
-        app.launchEnvironment["CMUX_UI_TEST_DIAGNOSTICS_PATH"] = diagnosticsPath
-        app.launchEnvironment["CMUX_UI_TEST_SPLIT_CLOSE_RIGHT_SETUP"] = "1"
-        app.launchEnvironment["CMUX_UI_TEST_SPLIT_CLOSE_RIGHT_PATH"] = dataPath
-        app.launchEnvironment["CMUX_UI_TEST_SPLIT_CLOSE_RIGHT_VISUAL"] = "1"
-        app.launchEnvironment["CMUX_UI_TEST_SPLIT_CLOSE_RIGHT_ITERATIONS"] = "14"
+        app.launchEnvironment["TERMMESH_UI_TEST_DIAGNOSTICS_PATH"] = diagnosticsPath
+        app.launchEnvironment["TERMMESH_UI_TEST_SPLIT_CLOSE_RIGHT_SETUP"] = "1"
+        app.launchEnvironment["TERMMESH_UI_TEST_SPLIT_CLOSE_RIGHT_PATH"] = dataPath
+        app.launchEnvironment["TERMMESH_UI_TEST_SPLIT_CLOSE_RIGHT_VISUAL"] = "1"
+        app.launchEnvironment["TERMMESH_UI_TEST_SPLIT_CLOSE_RIGHT_ITERATIONS"] = "14"
         // Reproduce manual close cadence: close top-right, observe one frame, then close bottom-right.
-        app.launchEnvironment["CMUX_UI_TEST_SPLIT_CLOSE_RIGHT_CLOSE_DELAY_MS"] = "120"
-        app.launchEnvironment["CMUX_UI_TEST_SPLIT_CLOSE_RIGHT_BURST_FRAMES"] = "40"
-        app.launchEnvironment["CMUX_UI_TEST_SPLIT_CLOSE_RIGHT_PATTERN"] = "close_right_lrtd"
+        app.launchEnvironment["TERMMESH_UI_TEST_SPLIT_CLOSE_RIGHT_CLOSE_DELAY_MS"] = "120"
+        app.launchEnvironment["TERMMESH_UI_TEST_SPLIT_CLOSE_RIGHT_BURST_FRAMES"] = "40"
+        app.launchEnvironment["TERMMESH_UI_TEST_SPLIT_CLOSE_RIGHT_PATTERN"] = "close_right_lrtd"
         app.launch()
         app.activate()
 
@@ -459,16 +459,16 @@ final class SplitCloseRightBlankRegressionUITests: XCTestCase {
 
     func testReproBlankAfterClosingRightSplitsBottomFirstViaShortcuts() {
         let app = XCUIApplication()
-        app.launchEnvironment["CMUX_UI_TEST_DIAGNOSTICS_PATH"] = diagnosticsPath
-        app.launchEnvironment["CMUX_UI_TEST_SPLIT_CLOSE_RIGHT_SETUP"] = "1"
-        app.launchEnvironment["CMUX_UI_TEST_SPLIT_CLOSE_RIGHT_PATH"] = dataPath
-        app.launchEnvironment["CMUX_UI_TEST_SPLIT_CLOSE_RIGHT_VISUAL"] = "1"
-        app.launchEnvironment["CMUX_UI_TEST_SPLIT_CLOSE_RIGHT_ITERATIONS"] = "12"
+        app.launchEnvironment["TERMMESH_UI_TEST_DIAGNOSTICS_PATH"] = diagnosticsPath
+        app.launchEnvironment["TERMMESH_UI_TEST_SPLIT_CLOSE_RIGHT_SETUP"] = "1"
+        app.launchEnvironment["TERMMESH_UI_TEST_SPLIT_CLOSE_RIGHT_PATH"] = dataPath
+        app.launchEnvironment["TERMMESH_UI_TEST_SPLIT_CLOSE_RIGHT_VISUAL"] = "1"
+        app.launchEnvironment["TERMMESH_UI_TEST_SPLIT_CLOSE_RIGHT_ITERATIONS"] = "12"
         // Keep a short but non-zero delay so we sample the transient frame after BR closes
         // and before TR closes (the user-visible stretched-text repro window).
-        app.launchEnvironment["CMUX_UI_TEST_SPLIT_CLOSE_RIGHT_CLOSE_DELAY_MS"] = "120"
-        app.launchEnvironment["CMUX_UI_TEST_SPLIT_CLOSE_RIGHT_BURST_FRAMES"] = "40"
-        app.launchEnvironment["CMUX_UI_TEST_SPLIT_CLOSE_RIGHT_PATTERN"] = "close_right_lrtd_bottom_first"
+        app.launchEnvironment["TERMMESH_UI_TEST_SPLIT_CLOSE_RIGHT_CLOSE_DELAY_MS"] = "120"
+        app.launchEnvironment["TERMMESH_UI_TEST_SPLIT_CLOSE_RIGHT_BURST_FRAMES"] = "40"
+        app.launchEnvironment["TERMMESH_UI_TEST_SPLIT_CLOSE_RIGHT_PATTERN"] = "close_right_lrtd_bottom_first"
         app.launch()
         app.activate()
 
@@ -510,14 +510,14 @@ final class SplitCloseRightBlankRegressionUITests: XCTestCase {
 
     func testReproBlankAfterClosingRightSplitsWithoutFocusingRightPanes() {
         let app = XCUIApplication()
-        app.launchEnvironment["CMUX_UI_TEST_DIAGNOSTICS_PATH"] = diagnosticsPath
-        app.launchEnvironment["CMUX_UI_TEST_SPLIT_CLOSE_RIGHT_SETUP"] = "1"
-        app.launchEnvironment["CMUX_UI_TEST_SPLIT_CLOSE_RIGHT_PATH"] = dataPath
-        app.launchEnvironment["CMUX_UI_TEST_SPLIT_CLOSE_RIGHT_VISUAL"] = "1"
-        app.launchEnvironment["CMUX_UI_TEST_SPLIT_CLOSE_RIGHT_ITERATIONS"] = "16"
-        app.launchEnvironment["CMUX_UI_TEST_SPLIT_CLOSE_RIGHT_CLOSE_DELAY_MS"] = "0"
-        app.launchEnvironment["CMUX_UI_TEST_SPLIT_CLOSE_RIGHT_BURST_FRAMES"] = "36"
-        app.launchEnvironment["CMUX_UI_TEST_SPLIT_CLOSE_RIGHT_PATTERN"] = "close_right_lrtd_unfocused"
+        app.launchEnvironment["TERMMESH_UI_TEST_DIAGNOSTICS_PATH"] = diagnosticsPath
+        app.launchEnvironment["TERMMESH_UI_TEST_SPLIT_CLOSE_RIGHT_SETUP"] = "1"
+        app.launchEnvironment["TERMMESH_UI_TEST_SPLIT_CLOSE_RIGHT_PATH"] = dataPath
+        app.launchEnvironment["TERMMESH_UI_TEST_SPLIT_CLOSE_RIGHT_VISUAL"] = "1"
+        app.launchEnvironment["TERMMESH_UI_TEST_SPLIT_CLOSE_RIGHT_ITERATIONS"] = "16"
+        app.launchEnvironment["TERMMESH_UI_TEST_SPLIT_CLOSE_RIGHT_CLOSE_DELAY_MS"] = "0"
+        app.launchEnvironment["TERMMESH_UI_TEST_SPLIT_CLOSE_RIGHT_BURST_FRAMES"] = "36"
+        app.launchEnvironment["TERMMESH_UI_TEST_SPLIT_CLOSE_RIGHT_PATTERN"] = "close_right_lrtd_unfocused"
         app.launch()
         app.activate()
 

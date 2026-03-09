@@ -4,17 +4,17 @@
   <a href="README.md">English</a> | <a href="README.zh-CN.md">简体中文</a> | <a href="README.zh-TW.md">繁體中文</a> | <a href="README.ko.md">한국어</a> | <a href="README.de.md">Deutsch</a> | <a href="README.es.md">Español</a> | <a href="README.fr.md">Français</a> | <a href="README.it.md">Italiano</a> | <a href="README.da.md">Dansk</a> | <a href="README.ja.md">日本語</a> | <a href="README.pl.md">Polski</a> | <a href="README.ru.md">Русский</a> | Bosanski | <a href="README.ar.md">العربية</a> | <a href="README.no.md">Norsk</a> | <a href="README.pt-BR.md">Português (Brasil)</a> | <a href="README.th.md">ไทย</a> | <a href="README.tr.md">Türkçe</a>
 </p>
 
-<h1 align="center">cmux</h1>
+<h1 align="center">term-mesh</h1>
 <p align="center">macOS terminal baziran na Ghostty sa vertikalnim tabovima i obavještenjima za AI agente za programiranje</p>
 
 <p align="center">
-  <a href="https://github.com/manaflow-ai/cmux/releases/latest/download/cmux-macos.dmg">
-    <img src="./docs/assets/macos-badge.png" alt="Preuzmi cmux za macOS" width="180" />
+  <a href="https://github.com/manaflow-ai/term-mesh/releases/latest/download/term-mesh-macos.dmg">
+    <img src="./docs/assets/macos-badge.png" alt="term-mesh" width="180" />
   </a>
 </p>
 
 <p align="center">
-  <img src="./docs/assets/screenshot.png" alt="cmux snimak ekrana" width="900" />
+  <img src="./docs/assets/screenshot.png" alt="term-mesh" width="900" />
 </p>
 
 ## Funkcije
@@ -33,34 +33,34 @@
 
 ### DMG (preporučeno)
 
-<a href="https://github.com/manaflow-ai/cmux/releases/latest/download/cmux-macos.dmg">
-  <img src="./docs/assets/macos-badge.png" alt="Preuzmi cmux za macOS" width="180" />
+<a href="https://github.com/manaflow-ai/term-mesh/releases/latest/download/term-mesh-macos.dmg">
+  <img src="./docs/assets/macos-badge.png" alt="term-mesh" width="180" />
 </a>
 
-Otvorite `.dmg` datoteku i prevucite cmux u folder Aplikacije. cmux se automatski ažurira putem Sparkle, tako da trebate preuzeti samo jednom.
+Otvorite `.dmg` datoteku i prevucite term-mesh u folder Aplikacije. term-mesh se automatski ažurira putem Sparkle, tako da trebate preuzeti samo jednom.
 
 ### Homebrew
 
 ```bash
-brew tap manaflow-ai/cmux
-brew install --cask cmux
+brew tap manaflow-ai/term-mesh
+brew install --cask term-mesh
 ```
 
 Za ažuriranje kasnije:
 
 ```bash
-brew upgrade --cask cmux
+brew upgrade --cask term-mesh
 ```
 
 Pri prvom pokretanju, macOS vas može zamoliti da potvrdite otvaranje aplikacije od identificiranog programera. Kliknite **Otvori** da nastavite.
 
-## Zašto cmux?
+## Why term-mesh?
 
 Pokrećem mnogo Claude Code i Codex sesija paralelno. Koristio sam Ghostty sa gomilom podijeljenih panela i oslanjao se na nativna macOS obavještenja da znam kada agent treba mene. Ali tijelo obavještenja Claude Code je uvijek samo „Claude is waiting for your input" bez konteksta, a sa dovoljno otvorenih tabova nisam mogao ni pročitati naslove.
 
-Isprobao sam nekoliko orkestratora za kodiranje, ali većina ih je bila Electron/Tauri aplikacije i performanse su me nervirale. Također jednostavno preferiram terminal jer GUI orkestratori vas zaključavaju u svoj radni tok. Zato sam izgradio cmux kao nativnu macOS aplikaciju u Swift/AppKit. Koristi libghostty za renderiranje terminala i čita vašu postojeću Ghostty konfiguraciju za teme, fontove i boje.
+Isprobao sam nekoliko orkestratora za kodiranje, ali većina ih je bila Electron/Tauri aplikacije i performanse su me nervirale. Također jednostavno preferiram terminal jer GUI orkestratori vas zaključavaju u svoj radni tok. Zato sam izgradio term-mesh kao nativnu macOS aplikaciju u Swift/AppKit. Koristi libghostty za renderiranje terminala i čita vašu postojeću Ghostty konfiguraciju za teme, fontove i boje.
 
-Glavni dodaci su bočna traka i sistem obavještenja. Bočna traka ima vertikalne tabove koji prikazuju git granu, radni direktorij, portove koji slušaju i tekst posljednjeg obavještenja za svaki radni prostor. Sistem obavještenja hvata terminalne sekvence (OSC 9/99/777) i ima CLI (`cmux notify`) koji možete povezati sa hookovima agenata za Claude Code, OpenCode itd. Kada agent čeka, njegov panel dobija plavi prsten, a tab se osvjetljava u bočnoj traci, tako da mogu vidjeti koji me treba kroz podjele i tabove. Cmd+Shift+U skače na najnovije nepročitano.
+Glavni dodaci su bočna traka i sistem obavještenja. Bočna traka ima vertikalne tabove koji prikazuju git granu, radni direktorij, portove koji slušaju i tekst posljednjeg obavještenja za svaki radni prostor. Sistem obavještenja hvata terminalne sekvence (OSC 9/99/777) i ima CLI (`term-mesh notify`) koji možete povezati sa hookovima agenata za Claude Code, OpenCode itd. Kada agent čeka, njegov panel dobija plavi prsten, a tab se osvjetljava u bočnoj traci, tako da mogu vidjeti koji me treba kroz podjele i tabove. Cmd+Shift+U skače na najnovije nepročitano.
 
 Ugrađeni preglednik ima skriptabilni API portiran iz [agent-browser](https://github.com/vercel-labs/agent-browser). Agenti mogu snimiti stablo pristupačnosti, dobiti reference elemenata, kliknuti, popuniti formulare i evaluirati JS. Možete podijeliti panel preglednika pored terminala i omogućiti Claude Code da direktno komunicira sa vašim razvojnim serverom.
 

@@ -5,8 +5,8 @@ import WebKit
 import Bonsplit
 #endif
 
-private var cmuxWindowBrowserPortalKey: UInt8 = 0
-private var cmuxWindowBrowserPortalCloseObserverKey: UInt8 = 0
+private var termMeshWindowBrowserPortalKey: UInt8 = 0
+private var termMeshWindowBrowserPortalCloseObserverKey: UInt8 = 0
 
 #if DEBUG
 private func browserPortalDebugToken(_ view: NSView?) -> String {
@@ -1082,7 +1082,7 @@ enum BrowserWindowPortalRegistry {
     private static var webViewToWindowId: [ObjectIdentifier: ObjectIdentifier] = [:]
 
     private static func installWindowCloseObserverIfNeeded(for window: NSWindow) {
-        guard objc_getAssociatedObject(window, &cmuxWindowBrowserPortalCloseObserverKey) == nil else { return }
+        guard objc_getAssociatedObject(window, &termMeshWindowBrowserPortalCloseObserverKey) == nil else { return }
         let windowId = ObjectIdentifier(window)
         let observer = NotificationCenter.default.addObserver(
             forName: NSWindow.willCloseNotification,
@@ -1099,7 +1099,7 @@ enum BrowserWindowPortalRegistry {
         }
         objc_setAssociatedObject(
             window,
-            &cmuxWindowBrowserPortalCloseObserverKey,
+            &termMeshWindowBrowserPortalCloseObserverKey,
             observer,
             .OBJC_ASSOCIATION_RETAIN_NONATOMIC
         )
@@ -1116,11 +1116,11 @@ enum BrowserWindowPortalRegistry {
         webViewToWindowId = webViewToWindowId.filter { $0.value != windowId }
 
         guard let window else { return }
-        if let observer = objc_getAssociatedObject(window, &cmuxWindowBrowserPortalCloseObserverKey) {
+        if let observer = objc_getAssociatedObject(window, &termMeshWindowBrowserPortalCloseObserverKey) {
             NotificationCenter.default.removeObserver(observer)
         }
-        objc_setAssociatedObject(window, &cmuxWindowBrowserPortalCloseObserverKey, nil, .OBJC_ASSOCIATION_RETAIN_NONATOMIC)
-        objc_setAssociatedObject(window, &cmuxWindowBrowserPortalKey, nil, .OBJC_ASSOCIATION_RETAIN)
+        objc_setAssociatedObject(window, &termMeshWindowBrowserPortalCloseObserverKey, nil, .OBJC_ASSOCIATION_RETAIN_NONATOMIC)
+        objc_setAssociatedObject(window, &termMeshWindowBrowserPortalKey, nil, .OBJC_ASSOCIATION_RETAIN)
     }
 
     private static func pruneWebViewMappings(for windowId: ObjectIdentifier, validWebViewIds: Set<ObjectIdentifier>) {
@@ -1130,14 +1130,14 @@ enum BrowserWindowPortalRegistry {
     }
 
     private static func portal(for window: NSWindow) -> WindowBrowserPortal {
-        if let existing = objc_getAssociatedObject(window, &cmuxWindowBrowserPortalKey) as? WindowBrowserPortal {
+        if let existing = objc_getAssociatedObject(window, &termMeshWindowBrowserPortalKey) as? WindowBrowserPortal {
             portalsByWindowId[ObjectIdentifier(window)] = existing
             installWindowCloseObserverIfNeeded(for: window)
             return existing
         }
 
         let portal = WindowBrowserPortal(window: window)
-        objc_setAssociatedObject(window, &cmuxWindowBrowserPortalKey, portal, .OBJC_ASSOCIATION_RETAIN)
+        objc_setAssociatedObject(window, &termMeshWindowBrowserPortalKey, portal, .OBJC_ASSOCIATION_RETAIN)
         portalsByWindowId[ObjectIdentifier(window)] = portal
         installWindowCloseObserverIfNeeded(for: window)
         return portal

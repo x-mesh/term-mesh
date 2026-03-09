@@ -9,8 +9,8 @@ final class MultiWindowNotificationsUITests: XCTestCase {
     override func setUp() {
         super.setUp()
         continueAfterFailure = false
-        dataPath = "/tmp/cmux-ui-test-multi-window-notifs-\(UUID().uuidString).json"
-        socketPath = "/tmp/cmux-ui-test-socket-\(UUID().uuidString).sock"
+        dataPath = "/tmp/term-mesh-ui-test-multi-window-notifs-\(UUID().uuidString).json"
+        socketPath = "/tmp/term-mesh-ui-test-socket-\(UUID().uuidString).sock"
         try? FileManager.default.removeItem(atPath: dataPath)
         try? FileManager.default.removeItem(atPath: socketPath)
     }
@@ -23,8 +23,8 @@ final class MultiWindowNotificationsUITests: XCTestCase {
 
     func testNotificationsRouteToCorrectWindow() {
         let app = XCUIApplication()
-        app.launchEnvironment["CMUX_UI_TEST_MULTI_WINDOW_NOTIF_SETUP"] = "1"
-        app.launchEnvironment["CMUX_UI_TEST_MULTI_WINDOW_NOTIF_PATH"] = dataPath
+        app.launchEnvironment["TERMMESH_UI_TEST_MULTI_WINDOW_NOTIF_SETUP"] = "1"
+        app.launchEnvironment["TERMMESH_UI_TEST_MULTI_WINDOW_NOTIF_PATH"] = dataPath
         app.launch()
         app.activate()
 
@@ -106,8 +106,8 @@ final class MultiWindowNotificationsUITests: XCTestCase {
 
     func testNotificationsPopoverCanCloseViaShortcutAndEscape() {
         let app = XCUIApplication()
-        app.launchEnvironment["CMUX_UI_TEST_MULTI_WINDOW_NOTIF_SETUP"] = "1"
-        app.launchEnvironment["CMUX_UI_TEST_MULTI_WINDOW_NOTIF_PATH"] = dataPath
+        app.launchEnvironment["TERMMESH_UI_TEST_MULTI_WINDOW_NOTIF_SETUP"] = "1"
+        app.launchEnvironment["TERMMESH_UI_TEST_MULTI_WINDOW_NOTIF_PATH"] = dataPath
         app.launch()
         app.activate()
 
@@ -139,7 +139,7 @@ final class MultiWindowNotificationsUITests: XCTestCase {
 
     func testEmptyNotificationsPopoverBlocksTerminalTyping() {
         let app = XCUIApplication()
-        app.launchEnvironment["CMUX_SOCKET_PATH"] = socketPath
+        app.launchEnvironment["TERMMESH_SOCKET_PATH"] = socketPath
         app.launch()
         app.activate()
 

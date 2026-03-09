@@ -971,7 +971,7 @@ final class UpdateTitlebarAccessoryController {
     private var observers: [NSObjectProtocol] = []
     private var pendingAttachRetries: [ObjectIdentifier: Int] = [:]
     private var startupScanWorkItems: [DispatchWorkItem] = []
-    private let controlsIdentifier = NSUserInterfaceItemIdentifier("cmux.titlebarControls")
+    private let controlsIdentifier = NSUserInterfaceItemIdentifier("term-mesh.titlebarControls")
     private let controlsControllers = NSHashTable<TitlebarControlsAccessoryViewController>.weakObjects()
 
     init(viewModel: UpdateViewModel) {
@@ -1036,7 +1036,7 @@ final class UpdateTitlebarAccessoryController {
                 self?.attachToExistingWindows()
 #if DEBUG
                 let env = ProcessInfo.processInfo.environment
-                if env["CMUX_UI_TEST_MODE"] == "1" {
+                if (env["TERMMESH_UI_TEST_MODE"] ?? env["CMUX_UI_TEST_MODE"]) == "1" {
                     let ids = NSApp.windows.map { $0.identifier?.rawValue ?? "<nil>" }
                     let delayText = String(format: "%.2f", delay)
                     UpdateLogStore.shared.append("startup window scan (delay=\(delayText)) count=\(NSApp.windows.count) ids=\(ids.joined(separator: ","))")
@@ -1086,7 +1086,7 @@ final class UpdateTitlebarAccessoryController {
 
 #if DEBUG
         let env = ProcessInfo.processInfo.environment
-        if env["CMUX_UI_TEST_MODE"] == "1" {
+        if (env["TERMMESH_UI_TEST_MODE"] ?? env["CMUX_UI_TEST_MODE"]) == "1" {
             let ident = window.identifier?.rawValue ?? "<nil>"
             UpdateLogStore.shared.append("attached titlebar accessories to window id=\(ident)")
         }
@@ -1094,7 +1094,7 @@ final class UpdateTitlebarAccessoryController {
     }
 
     private func isSettingsWindow(_ window: NSWindow) -> Bool {
-        if window.identifier?.rawValue == "cmux.settings" {
+        if window.identifier?.rawValue == "term-mesh.settings" {
             return true
         }
         return window.title == "Settings"
@@ -1102,7 +1102,7 @@ final class UpdateTitlebarAccessoryController {
 
     private func isMainTerminalWindow(_ window: NSWindow) -> Bool {
         guard let raw = window.identifier?.rawValue else { return false }
-        return raw == "cmux.main" || raw.hasPrefix("cmux.main.")
+        return raw == "term-mesh.main" || raw.hasPrefix("term-mesh.main.")
     }
 
     private func preferredNotificationsController(

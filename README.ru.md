@@ -4,17 +4,17 @@
   <a href="README.md">English</a> | <a href="README.zh-CN.md">简体中文</a> | <a href="README.zh-TW.md">繁體中文</a> | <a href="README.ko.md">한국어</a> | <a href="README.de.md">Deutsch</a> | <a href="README.es.md">Español</a> | <a href="README.fr.md">Français</a> | <a href="README.it.md">Italiano</a> | <a href="README.da.md">Dansk</a> | <a href="README.ja.md">日本語</a> | <a href="README.pl.md">Polski</a> | Русский | <a href="README.bs.md">Bosanski</a> | <a href="README.ar.md">العربية</a> | <a href="README.no.md">Norsk</a> | <a href="README.pt-BR.md">Português (Brasil)</a> | <a href="README.th.md">ไทย</a> | <a href="README.tr.md">Türkçe</a>
 </p>
 
-<h1 align="center">cmux</h1>
+<h1 align="center">term-mesh</h1>
 <p align="center">Терминал macOS на базе Ghostty с вертикальными вкладками и уведомлениями для AI-агентов программирования</p>
 
 <p align="center">
-  <a href="https://github.com/manaflow-ai/cmux/releases/latest/download/cmux-macos.dmg">
-    <img src="./docs/assets/macos-badge.png" alt="Скачать cmux для macOS" width="180" />
+  <a href="https://github.com/manaflow-ai/term-mesh/releases/latest/download/term-mesh-macos.dmg">
+    <img src="./docs/assets/macos-badge.png" alt="term-mesh" width="180" />
   </a>
 </p>
 
 <p align="center">
-  <img src="./docs/assets/screenshot.png" alt="Скриншот cmux" width="900" />
+  <img src="./docs/assets/screenshot.png" alt="term-mesh" width="900" />
 </p>
 
 ## Возможности
@@ -33,34 +33,34 @@
 
 ### DMG (рекомендуется)
 
-<a href="https://github.com/manaflow-ai/cmux/releases/latest/download/cmux-macos.dmg">
-  <img src="./docs/assets/macos-badge.png" alt="Скачать cmux для macOS" width="180" />
+<a href="https://github.com/manaflow-ai/term-mesh/releases/latest/download/term-mesh-macos.dmg">
+  <img src="./docs/assets/macos-badge.png" alt="term-mesh" width="180" />
 </a>
 
-Откройте файл `.dmg` и перетащите cmux в папку «Программы». cmux автоматически обновляется через Sparkle, поэтому скачивание требуется только один раз.
+Откройте файл `.dmg` и перетащите term-mesh в папку «Программы». term-mesh автоматически обновляется через Sparkle, поэтому скачивание требуется только один раз.
 
 ### Homebrew
 
 ```bash
-brew tap manaflow-ai/cmux
-brew install --cask cmux
+brew tap manaflow-ai/term-mesh
+brew install --cask term-mesh
 ```
 
 Для обновления в дальнейшем:
 
 ```bash
-brew upgrade --cask cmux
+brew upgrade --cask term-mesh
 ```
 
 При первом запуске macOS может попросить вас подтвердить открытие приложения от идентифицированного разработчика. Нажмите **Открыть**, чтобы продолжить.
 
-## Почему cmux?
+## Why term-mesh?
 
 Я запускаю множество сессий Claude Code и Codex параллельно. Я использовал Ghostty с кучей разделённых панелей и полагался на нативные уведомления macOS, чтобы знать, когда агент нуждается во мне. Но тело уведомления Claude Code — это всегда просто «Claude is waiting for your input» без контекста, а при достаточном количестве открытых вкладок я даже не мог прочитать заголовки.
 
-Я попробовал несколько оркестраторов для кодирования, но большинство из них были приложениями Electron/Tauri, и их производительность меня раздражала. К тому же я просто предпочитаю терминал, поскольку GUI-оркестраторы привязывают вас к своему рабочему процессу. Поэтому я создал cmux как нативное приложение macOS на Swift/AppKit. Оно использует libghostty для рендеринга терминала и читает вашу существующую конфигурацию Ghostty для тем, шрифтов и цветов.
+Я попробовал несколько оркестраторов для кодирования, но большинство из них были приложениями Electron/Tauri, и их производительность меня раздражала. К тому же я просто предпочитаю терминал, поскольку GUI-оркестраторы привязывают вас к своему рабочему процессу. Поэтому я создал term-mesh как нативное приложение macOS на Swift/AppKit. Оно использует libghostty для рендеринга терминала и читает вашу существующую конфигурацию Ghostty для тем, шрифтов и цветов.
 
-Основные дополнения — это боковая панель и система уведомлений. Боковая панель имеет вертикальные вкладки, которые показывают ветку git, рабочий каталог, прослушиваемые порты и текст последнего уведомления для каждого рабочего пространства. Система уведомлений перехватывает терминальные последовательности (OSC 9/99/777) и имеет CLI (`cmux notify`), который можно подключить к хукам агентов для Claude Code, OpenCode и т.д. Когда агент ожидает, его панель получает синее кольцо, а вкладка подсвечивается в боковой панели, так что я могу определить, какой из них нуждается во мне, среди разделений и вкладок. Cmd+Shift+U переходит к последнему непрочитанному.
+Основные дополнения — это боковая панель и система уведомлений. Боковая панель имеет вертикальные вкладки, которые показывают ветку git, рабочий каталог, прослушиваемые порты и текст последнего уведомления для каждого рабочего пространства. Система уведомлений перехватывает терминальные последовательности (OSC 9/99/777) и имеет CLI (`term-mesh notify`), который можно подключить к хукам агентов для Claude Code, OpenCode и т.д. Когда агент ожидает, его панель получает синее кольцо, а вкладка подсвечивается в боковой панели, так что я могу определить, какой из них нуждается во мне, среди разделений и вкладок. Cmd+Shift+U переходит к последнему непрочитанному.
 
 Встроенный браузер имеет скриптуемый API, портированный из [agent-browser](https://github.com/vercel-labs/agent-browser). Агенты могут делать снимок дерева доступности, получать ссылки на элементы, кликать, заполнять формы и выполнять JS. Вы можете разделить панель браузера рядом с терминалом и позволить Claude Code взаимодействовать с вашим сервером разработки напрямую.
 

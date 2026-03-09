@@ -1,5 +1,5 @@
 #!/bin/bash
-# cmux Team Agent CLI — thin wrapper around team.py
+# term-mesh Team Agent CLI — thin wrapper around team.py
 # All functionality has been moved to team.py.
 # This wrapper exists for backward compatibility.
 

@@ -10,13 +10,13 @@ import WebKit
 class TerminalController {
     static let shared = TerminalController()
 
-    nonisolated(unsafe) var socketPath = "/tmp/cmux.sock"
+    nonisolated(unsafe) var socketPath = "/tmp/term-mesh.sock"
     nonisolated(unsafe) var serverSocket: Int32 = -1
     nonisolated(unsafe) var isRunning = false
     nonisolated(unsafe) var acceptLoopAlive = false
     private var clientHandlers: [Int32: Thread] = [:]
     var tabManager: TabManager?
-    var accessMode: SocketControlMode = .cmuxOnly
+    var accessMode: SocketControlMode = .termMeshOnly
     let myPid = getpid()
     private nonisolated(unsafe) static var socketCommandPolicyDepth: Int = 0
     private nonisolated(unsafe) static var socketCommandFocusAllowanceStack: [Bool] = []
@@ -202,7 +202,7 @@ class TerminalController {
     }
 
     final class SocketFastPathState: @unchecked Sendable {
-        private let queue = DispatchQueue(label: "com.cmux.socket-fast-path")
+        private let queue = DispatchQueue(label: "com.termmesh.socket-fast-path")
         private var lastReportedDirectories: [SocketSurfaceKey: String] = [:]
         private let maxTrackedDirectories = 4096
 
@@ -255,15 +255,15 @@ class TerminalController {
     func handleClient(_ socket: Int32, peerPid: pid_t? = nil) {
         defer { close(socket) }
 
-        // In cmuxOnly mode, verify the connecting process is a descendant of cmux.
+        // In termMeshOnly mode, verify the connecting process is a descendant of term-mesh.
         // Other modes allow external clients and apply separate auth controls.
-        if accessMode == .cmuxOnly {
+        if accessMode == .termMeshOnly {
             // Use pre-captured peer PID if available (captured in accept loop before
             // the peer can disconnect), falling back to live lookup.
             let pid = peerPid ?? getPeerPid(socket)
             if let pid {
                 guard isDescendant(pid) else {
-                    let msg = "ERROR: Access denied — only processes started inside cmux can connect\n"
+                    let msg = "ERROR: Access denied — only processes started inside term-mesh can connect\n"
                     msg.withCString { ptr in _ = write(socket, ptr, strlen(ptr)) }
                     return
                 }
@@ -1274,7 +1274,7 @@ class TerminalController {
 #endif
 
         return [
-            "protocol": "cmux-socket",
+            "protocol": "term-mesh-socket",
             "version": 2,
             "socket_path": socketPath,
             "access_mode": accessMode.rawValue,

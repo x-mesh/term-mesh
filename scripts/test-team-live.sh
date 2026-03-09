@@ -4,9 +4,9 @@
 #
 # Press Enter to destroy the team when done.
 
-SOCKET="${1:-/tmp/cmux-debug-test-team.sock}"
+SOCKET="${1:-/tmp/term-mesh-debug-test-team.sock}"
 TEAM="live-team"
-WORKDIR="$HOME/work/project/cmux"
+WORKDIR="$HOME/work/project/term-mesh"
 
 rpc() {
     python3 -c "
@@ -40,8 +40,8 @@ R=$(rpc "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"team.create\",\"params\":{\"
 echo "$R" | python3 -m json.tool 2>/dev/null || echo "$R"
 
 echo ""
-echo "[2] Team is running! Check the cmux app:"
-echo "    - Tab: [live-team] explorer  (Claude agent in Explore mode)"
+echo "[2] Team is running! Check the term-mesh app:"
+echo "    - Tab: [live-team] explorer  (Claude agent in explore mode)"
 echo "    - Tab: [live-team] executor  (Claude agent in executor mode)"
 echo ""
 echo "    Each tab has the Claude CLI running with team flags."

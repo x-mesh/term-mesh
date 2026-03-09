@@ -51,7 +51,7 @@ private struct ClaudeHookSessionStoreFile: Codable {
 }
 
 private final class ClaudeHookSessionStore {
-    private static let defaultStatePath = "~/.cmuxterm/claude-hook-sessions.json"
+    private static let defaultStatePath = "~/.termmesh/claude-hook-sessions.json"
     private static let maxStateAgeSeconds: TimeInterval = 60 * 60 * 24 * 7
 
     private let statePath: String
@@ -63,7 +63,7 @@ private final class ClaudeHookSessionStore {
         processEnv: [String: String] = ProcessInfo.processInfo.environment,
         fileManager: FileManager = .default
     ) {
-        if let overridePath = processEnv["CMUX_CLAUDE_HOOK_STATE_PATH"]?.trimmingCharacters(in: .whitespacesAndNewlines),
+        if let overridePath = (processEnv["TERMMESH_CLAUDE_HOOK_STATE_PATH"] ?? processEnv["CMUX_CLAUDE_HOOK_STATE_PATH"])?.trimmingCharacters(in: .whitespacesAndNewlines),
            !overridePath.isEmpty {
             self.statePath = NSString(string: overridePath).expandingTildeInPath
         } else {
@@ -237,14 +237,14 @@ enum CLIIDFormat: String {
 }
 
 private enum SocketPasswordResolver {
-    private static let service = "com.cmuxterm.app.socket-control"
+    private static let service = "com.termmesh.app.socket-control"
     private static let account = "local-socket-password"
 
     static func resolve(explicit: String?) -> String? {
         if let explicit = normalized(explicit), !explicit.isEmpty {
             return explicit
         }
-        if let env = normalized(ProcessInfo.processInfo.environment["CMUX_SOCKET_PASSWORD"]), !env.isEmpty {
+        if let env = normalized((ProcessInfo.processInfo.environment["TERMMESH_SOCKET_PASSWORD"] ?? ProcessInfo.processInfo.environment["CMUX_SOCKET_PASSWORD"])), !env.isEmpty {
             return env
         }
         return loadFromKeychain()
@@ -282,7 +282,7 @@ final class SocketClient {
     private static let defaultResponseTimeoutSeconds: TimeInterval = 15.0
     private static let responseTimeoutSeconds: TimeInterval = {
         let env = ProcessInfo.processInfo.environment
-        if let raw = env["CMUXTERM_CLI_RESPONSE_TIMEOUT_SEC"],
+        if let raw = (env["TERMMESH_CLI_RESPONSE_TIMEOUT_SEC"] ?? env["CMUXTERM_CLI_RESPONSE_TIMEOUT_SEC"]),
            let seconds = Double(raw),
            seconds > 0 {
             return seconds
@@ -435,11 +435,11 @@ final class SocketClient {
     }
 }
 
-struct CMUXCLI {
+struct TermMeshCLI {
     let args: [String]
 
     func run() throws {
-        var socketPath = ProcessInfo.processInfo.environment["CMUX_SOCKET_PATH"] ?? "/tmp/cmux.sock"
+        var socketPath = (ProcessInfo.processInfo.environment["TERMMESH_SOCKET_PATH"] ?? ProcessInfo.processInfo.environment["CMUX_SOCKET_PATH"]) ?? "/tmp/term-mesh.sock"
         var jsonOutput = false
         var idFormatArg: String? = nil
         var windowId: String? = nil
@@ -510,7 +510,7 @@ struct CMUXCLI {
         }
 
         // Check for --help/-h on subcommands before connecting to the socket,
-        // so help text is available even when cmux is not running.
+        // so help text is available even when term-mesh is not running.
         if commandArgs.contains("--help") || commandArgs.contains("-h") {
             if dispatchSubcommandHelp(command: command, commandArgs: commandArgs) {
                 return
@@ -551,8 +551,8 @@ struct CMUXCLI {
             let includeCaller = !hasFlag(commandArgs, name: "--no-caller")
             if includeCaller {
                 let idWsFlag = optionValue(commandArgs, name: "--workspace")
-                let workspaceArg = idWsFlag ?? (windowId == nil ? ProcessInfo.processInfo.environment["CMUX_WORKSPACE_ID"] : nil)
-                let surfaceArg = optionValue(commandArgs, name: "--surface") ?? (idWsFlag == nil && windowId == nil ? ProcessInfo.processInfo.environment["CMUX_SURFACE_ID"] : nil)
+                let workspaceArg = idWsFlag ?? (windowId == nil ? (ProcessInfo.processInfo.environment["TERMMESH_WORKSPACE_ID"] ?? ProcessInfo.processInfo.environment["CMUX_WORKSPACE_ID"]) : nil)
+                let surfaceArg = optionValue(commandArgs, name: "--surface") ?? (idWsFlag == nil && windowId == nil ? (ProcessInfo.processInfo.environment["TERMMESH_SURFACE_ID"] ?? ProcessInfo.processInfo.environment["CMUX_SURFACE_ID"]) : nil)
                 if workspaceArg != nil || surfaceArg != nil {
                     let workspaceId = try normalizeWorkspaceHandle(
                         workspaceArg,
@@ -703,8 +703,8 @@ struct CMUXCLI {
             let (wsArg, rem0) = parseOption(commandArgs, name: "--workspace")
             let (panelArg, rem1) = parseOption(rem0, name: "--panel")
             let (sfArg, rem2) = parseOption(rem1, name: "--surface")
-            let workspaceArg = wsArg ?? (windowId == nil ? ProcessInfo.processInfo.environment["CMUX_WORKSPACE_ID"] : nil)
-            let surfaceRaw = sfArg ?? panelArg ?? (wsArg == nil && windowId == nil ? ProcessInfo.processInfo.environment["CMUX_SURFACE_ID"] : nil)
+            let workspaceArg = wsArg ?? (windowId == nil ? (ProcessInfo.processInfo.environment["TERMMESH_WORKSPACE_ID"] ?? ProcessInfo.processInfo.environment["CMUX_WORKSPACE_ID"]) : nil)
+            let surfaceRaw = sfArg ?? panelArg ?? (wsArg == nil && windowId == nil ? (ProcessInfo.processInfo.environment["TERMMESH_SURFACE_ID"] ?? ProcessInfo.processInfo.environment["CMUX_SURFACE_ID"]) : nil)
             guard let direction = rem2.first else {
                 throw CLIError(message: "new-split requires a direction")
             }
@@ -810,8 +810,8 @@ struct CMUXCLI {
 
         case "close-surface":
             let csWsFlag = optionValue(commandArgs, name: "--workspace")
-            let workspaceArg = csWsFlag ?? (windowId == nil ? ProcessInfo.processInfo.environment["CMUX_WORKSPACE_ID"] : nil)
-            let surfaceRaw = optionValue(commandArgs, name: "--surface") ?? optionValue(commandArgs, name: "--panel") ?? (csWsFlag == nil && windowId == nil ? ProcessInfo.processInfo.environment["CMUX_SURFACE_ID"] : nil)
+            let workspaceArg = csWsFlag ?? (windowId == nil ? (ProcessInfo.processInfo.environment["TERMMESH_WORKSPACE_ID"] ?? ProcessInfo.processInfo.environment["CMUX_WORKSPACE_ID"]) : nil)
+            let surfaceRaw = optionValue(commandArgs, name: "--surface") ?? optionValue(commandArgs, name: "--panel") ?? (csWsFlag == nil && windowId == nil ? (ProcessInfo.processInfo.environment["TERMMESH_SURFACE_ID"] ?? ProcessInfo.processInfo.environment["CMUX_SURFACE_ID"]) : nil)
             var params: [String: Any] = [:]
             let wsId = try normalizeWorkspaceHandle(workspaceArg, client: client)
             if let wsId { params["workspace_id"] = wsId }
@@ -867,8 +867,8 @@ struct CMUXCLI {
 
         case "trigger-flash":
             let tfWsFlag = optionValue(commandArgs, name: "--workspace")
-            let workspaceArg = tfWsFlag ?? (windowId == nil ? ProcessInfo.processInfo.environment["CMUX_WORKSPACE_ID"] : nil)
-            let surfaceArg = optionValue(commandArgs, name: "--surface") ?? optionValue(commandArgs, name: "--panel") ?? (tfWsFlag == nil && windowId == nil ? ProcessInfo.processInfo.environment["CMUX_SURFACE_ID"] : nil)
+            let workspaceArg = tfWsFlag ?? (windowId == nil ? (ProcessInfo.processInfo.environment["TERMMESH_WORKSPACE_ID"] ?? ProcessInfo.processInfo.environment["CMUX_WORKSPACE_ID"]) : nil)
+            let surfaceArg = optionValue(commandArgs, name: "--surface") ?? optionValue(commandArgs, name: "--panel") ?? (tfWsFlag == nil && windowId == nil ? (ProcessInfo.processInfo.environment["TERMMESH_SURFACE_ID"] ?? ProcessInfo.processInfo.environment["CMUX_SURFACE_ID"]) : nil)
             var params: [String: Any] = [:]
             let wsId = try normalizeWorkspaceHandle(workspaceArg, client: client)
             if let wsId { params["workspace_id"] = wsId }
@@ -938,7 +938,7 @@ struct CMUXCLI {
 
         case "rename-workspace", "rename-window":
             let (wsArg, rem0) = parseOption(commandArgs, name: "--workspace")
-            let workspaceArg = wsArg ?? (windowId == nil ? ProcessInfo.processInfo.environment["CMUX_WORKSPACE_ID"] : nil)
+            let workspaceArg = wsArg ?? (windowId == nil ? (ProcessInfo.processInfo.environment["TERMMESH_WORKSPACE_ID"] ?? ProcessInfo.processInfo.environment["CMUX_WORKSPACE_ID"]) : nil)
             let titleArgs = rem0.dropFirst(rem0.first == "--" ? 1 : 0)
             let title = titleArgs.joined(separator: " ").trimmingCharacters(in: .whitespacesAndNewlines)
             guard !title.isEmpty else {
@@ -966,8 +966,8 @@ struct CMUXCLI {
                 throw CLIError(message: "read-screen: unexpected arguments: \(trailing.joined(separator: " "))")
             }
 
-            let workspaceArg = wsArg ?? (windowId == nil ? ProcessInfo.processInfo.environment["CMUX_WORKSPACE_ID"] : nil)
-            let surfaceArg = sfArg ?? (wsArg == nil && windowId == nil ? ProcessInfo.processInfo.environment["CMUX_SURFACE_ID"] : nil)
+            let workspaceArg = wsArg ?? (windowId == nil ? (ProcessInfo.processInfo.environment["TERMMESH_WORKSPACE_ID"] ?? ProcessInfo.processInfo.environment["CMUX_WORKSPACE_ID"]) : nil)
+            let surfaceArg = sfArg ?? (wsArg == nil && windowId == nil ? (ProcessInfo.processInfo.environment["TERMMESH_SURFACE_ID"] ?? ProcessInfo.processInfo.environment["CMUX_SURFACE_ID"]) : nil)
 
             var params: [String: Any] = [:]
             let wsId = try normalizeWorkspaceHandle(workspaceArg, client: client)
@@ -997,8 +997,8 @@ struct CMUXCLI {
         case "send":
             let (wsArg, rem0) = parseOption(commandArgs, name: "--workspace")
             let (sfArg, rem1) = parseOption(rem0, name: "--surface")
-            let workspaceArg = wsArg ?? (windowId == nil ? ProcessInfo.processInfo.environment["CMUX_WORKSPACE_ID"] : nil)
-            let surfaceArg = sfArg ?? (wsArg == nil && windowId == nil ? ProcessInfo.processInfo.environment["CMUX_SURFACE_ID"] : nil)
+            let workspaceArg = wsArg ?? (windowId == nil ? (ProcessInfo.processInfo.environment["TERMMESH_WORKSPACE_ID"] ?? ProcessInfo.processInfo.environment["CMUX_WORKSPACE_ID"]) : nil)
+            let surfaceArg = sfArg ?? (wsArg == nil && windowId == nil ? (ProcessInfo.processInfo.environment["TERMMESH_SURFACE_ID"] ?? ProcessInfo.processInfo.environment["CMUX_SURFACE_ID"]) : nil)
             let rawText = rem1.dropFirst(rem1.first == "--" ? 1 : 0).joined(separator: " ")
             guard !rawText.isEmpty else { throw CLIError(message: "send requires text") }
             let text = unescapeSendText(rawText)
@@ -1013,8 +1013,8 @@ struct CMUXCLI {
         case "send-key":
             let (wsArg, rem0) = parseOption(commandArgs, name: "--workspace")
             let (sfArg, rem1) = parseOption(rem0, name: "--surface")
-            let workspaceArg = wsArg ?? (windowId == nil ? ProcessInfo.processInfo.environment["CMUX_WORKSPACE_ID"] : nil)
-            let surfaceArg = sfArg ?? (wsArg == nil && windowId == nil ? ProcessInfo.processInfo.environment["CMUX_SURFACE_ID"] : nil)
+            let workspaceArg = wsArg ?? (windowId == nil ? (ProcessInfo.processInfo.environment["TERMMESH_WORKSPACE_ID"] ?? ProcessInfo.processInfo.environment["CMUX_WORKSPACE_ID"]) : nil)
+            let surfaceArg = sfArg ?? (wsArg == nil && windowId == nil ? (ProcessInfo.processInfo.environment["TERMMESH_SURFACE_ID"] ?? ProcessInfo.processInfo.environment["CMUX_SURFACE_ID"]) : nil)
             let keyArgs = rem1.first == "--" ? Array(rem1.dropFirst()) : rem1
             guard let key = keyArgs.first else { throw CLIError(message: "send-key requires a key") }
             var params: [String: Any] = ["key": key]
@@ -1028,7 +1028,7 @@ struct CMUXCLI {
         case "send-panel":
             let (wsArg, rem0) = parseOption(commandArgs, name: "--workspace")
             let (panelArg, rem1) = parseOption(rem0, name: "--panel")
-            let workspaceArg = wsArg ?? (windowId == nil ? ProcessInfo.processInfo.environment["CMUX_WORKSPACE_ID"] : nil)
+            let workspaceArg = wsArg ?? (windowId == nil ? (ProcessInfo.processInfo.environment["TERMMESH_WORKSPACE_ID"] ?? ProcessInfo.processInfo.environment["CMUX_WORKSPACE_ID"]) : nil)
             guard let panelArg else {
                 throw CLIError(message: "send-panel requires --panel")
             }
@@ -1046,7 +1046,7 @@ struct CMUXCLI {
         case "send-key-panel":
             let (wsArg, rem0) = parseOption(commandArgs, name: "--workspace")
             let (panelArg, rem1) = parseOption(rem0, name: "--panel")
-            let workspaceArg = wsArg ?? (windowId == nil ? ProcessInfo.processInfo.environment["CMUX_WORKSPACE_ID"] : nil)
+            let workspaceArg = wsArg ?? (windowId == nil ? (ProcessInfo.processInfo.environment["TERMMESH_WORKSPACE_ID"] ?? ProcessInfo.processInfo.environment["CMUX_WORKSPACE_ID"]) : nil)
             guard let panelArg else {
                 throw CLIError(message: "send-key-panel requires --panel")
             }
@@ -1067,8 +1067,8 @@ struct CMUXCLI {
             let body = optionValue(commandArgs, name: "--body") ?? ""
 
             let notifyWsFlag = optionValue(commandArgs, name: "--workspace")
-            let workspaceArg = notifyWsFlag ?? (windowId == nil ? ProcessInfo.processInfo.environment["CMUX_WORKSPACE_ID"] : nil)
-            let surfaceArg = optionValue(commandArgs, name: "--surface") ?? (notifyWsFlag == nil && windowId == nil ? ProcessInfo.processInfo.environment["CMUX_SURFACE_ID"] : nil)
+            let workspaceArg = notifyWsFlag ?? (windowId == nil ? (ProcessInfo.processInfo.environment["TERMMESH_WORKSPACE_ID"] ?? ProcessInfo.processInfo.environment["CMUX_WORKSPACE_ID"]) : nil)
+            let surfaceArg = optionValue(commandArgs, name: "--surface") ?? (notifyWsFlag == nil && windowId == nil ? (ProcessInfo.processInfo.environment["TERMMESH_SURFACE_ID"] ?? ProcessInfo.processInfo.environment["CMUX_SURFACE_ID"]) : nil)
 
             let targetWorkspace = try resolveWorkspaceId(workspaceArg, client: client)
             let targetSurface = try resolveSurfaceId(surfaceArg, workspaceId: targetWorkspace, client: client)
@@ -1117,7 +1117,7 @@ struct CMUXCLI {
             guard !value.isEmpty else {
                 throw CLIError(message: "set-status requires a non-empty value")
             }
-            let workspaceArg = wsFlag ?? (windowId == nil ? ProcessInfo.processInfo.environment["CMUX_WORKSPACE_ID"] : nil)
+            let workspaceArg = wsFlag ?? (windowId == nil ? (ProcessInfo.processInfo.environment["TERMMESH_WORKSPACE_ID"] ?? ProcessInfo.processInfo.environment["CMUX_WORKSPACE_ID"]) : nil)
             let wsId = try resolveWorkspaceId(workspaceArg, client: client)
             var socketCmd = "set_status \(key) \(socketQuote(value))"
             if let icon { socketCmd += " --icon=\(socketQuote(icon))" }
@@ -1131,14 +1131,14 @@ struct CMUXCLI {
             guard let key = csRemaining.first else {
                 throw CLIError(message: "clear-status requires a <key>")
             }
-            let workspaceArg = wsFlag ?? (windowId == nil ? ProcessInfo.processInfo.environment["CMUX_WORKSPACE_ID"] : nil)
+            let workspaceArg = wsFlag ?? (windowId == nil ? (ProcessInfo.processInfo.environment["TERMMESH_WORKSPACE_ID"] ?? ProcessInfo.processInfo.environment["CMUX_WORKSPACE_ID"]) : nil)
             let wsId = try resolveWorkspaceId(workspaceArg, client: client)
             let response = try sendV1Command("clear_status \(key) --tab=\(wsId)", client: client)
             print(response)
 
         case "list-status":
             let (wsFlag, _) = parseOption(commandArgs, name: "--workspace")
-            let workspaceArg = wsFlag ?? (windowId == nil ? ProcessInfo.processInfo.environment["CMUX_WORKSPACE_ID"] : nil)
+            let workspaceArg = wsFlag ?? (windowId == nil ? (ProcessInfo.processInfo.environment["TERMMESH_WORKSPACE_ID"] ?? ProcessInfo.processInfo.environment["CMUX_WORKSPACE_ID"]) : nil)
             let wsId = try resolveWorkspaceId(workspaceArg, client: client)
             let response = try sendV1Command("list_status --tab=\(wsId)", client: client)
             print(response)
@@ -1149,7 +1149,7 @@ struct CMUXCLI {
             guard let valueStr = spR2.first else {
                 throw CLIError(message: "set-progress requires a progress value (0.0-1.0)")
             }
-            let workspaceArg = wsFlag ?? (windowId == nil ? ProcessInfo.processInfo.environment["CMUX_WORKSPACE_ID"] : nil)
+            let workspaceArg = wsFlag ?? (windowId == nil ? (ProcessInfo.processInfo.environment["TERMMESH_WORKSPACE_ID"] ?? ProcessInfo.processInfo.environment["CMUX_WORKSPACE_ID"]) : nil)
             let wsId = try resolveWorkspaceId(workspaceArg, client: client)
             var socketCmd = "set_progress \(valueStr)"
             if let label { socketCmd += " --label=\(socketQuote(label))" }
@@ -1159,7 +1159,7 @@ struct CMUXCLI {
 
         case "clear-progress":
             let (wsFlag, _) = parseOption(commandArgs, name: "--workspace")
-            let workspaceArg = wsFlag ?? (windowId == nil ? ProcessInfo.processInfo.environment["CMUX_WORKSPACE_ID"] : nil)
+            let workspaceArg = wsFlag ?? (windowId == nil ? (ProcessInfo.processInfo.environment["TERMMESH_WORKSPACE_ID"] ?? ProcessInfo.processInfo.environment["CMUX_WORKSPACE_ID"]) : nil)
             let wsId = try resolveWorkspaceId(workspaceArg, client: client)
             let response = try sendV1Command("clear_progress --tab=\(wsId)", client: client)
             print(response)
@@ -1174,7 +1174,7 @@ struct CMUXCLI {
             guard !message.isEmpty else {
                 throw CLIError(message: "log requires a message")
             }
-            let workspaceArg = wsFlag ?? (windowId == nil ? ProcessInfo.processInfo.environment["CMUX_WORKSPACE_ID"] : nil)
+            let workspaceArg = wsFlag ?? (windowId == nil ? (ProcessInfo.processInfo.environment["TERMMESH_WORKSPACE_ID"] ?? ProcessInfo.processInfo.environment["CMUX_WORKSPACE_ID"]) : nil)
             let wsId = try resolveWorkspaceId(workspaceArg, client: client)
             var socketCmd = "log"
             if let level { socketCmd += " --level=\(level)" }
@@ -1185,7 +1185,7 @@ struct CMUXCLI {
 
         case "clear-log":
             let (wsFlag, _) = parseOption(commandArgs, name: "--workspace")
-            let workspaceArg = wsFlag ?? (windowId == nil ? ProcessInfo.processInfo.environment["CMUX_WORKSPACE_ID"] : nil)
+            let workspaceArg = wsFlag ?? (windowId == nil ? (ProcessInfo.processInfo.environment["TERMMESH_WORKSPACE_ID"] ?? ProcessInfo.processInfo.environment["CMUX_WORKSPACE_ID"]) : nil)
             let wsId = try resolveWorkspaceId(workspaceArg, client: client)
             let response = try sendV1Command("clear_log --tab=\(wsId)", client: client)
             print(response)
@@ -1193,7 +1193,7 @@ struct CMUXCLI {
         case "list-log":
             let (limitStr, r1) = parseOption(commandArgs, name: "--limit")
             let (wsFlag, _) = parseOption(r1, name: "--workspace")
-            let workspaceArg = wsFlag ?? (windowId == nil ? ProcessInfo.processInfo.environment["CMUX_WORKSPACE_ID"] : nil)
+            let workspaceArg = wsFlag ?? (windowId == nil ? (ProcessInfo.processInfo.environment["TERMMESH_WORKSPACE_ID"] ?? ProcessInfo.processInfo.environment["CMUX_WORKSPACE_ID"]) : nil)
             let wsId = try resolveWorkspaceId(workspaceArg, client: client)
             var socketCmd = "list_log"
             if let limitStr { socketCmd += " --limit=\(limitStr)" }
@@ -1203,7 +1203,7 @@ struct CMUXCLI {
 
         case "sidebar-state":
             let (wsFlag, _) = parseOption(commandArgs, name: "--workspace")
-            let workspaceArg = wsFlag ?? (windowId == nil ? ProcessInfo.processInfo.environment["CMUX_WORKSPACE_ID"] : nil)
+            let workspaceArg = wsFlag ?? (windowId == nil ? (ProcessInfo.processInfo.environment["TERMMESH_WORKSPACE_ID"] ?? ProcessInfo.processInfo.environment["CMUX_WORKSPACE_ID"]) : nil)
             let wsId = try resolveWorkspaceId(workspaceArg, client: client)
             let response = try sendV1Command("sidebar_state --tab=\(wsId)", client: client)
             print(response)
@@ -1787,7 +1787,7 @@ struct CMUXCLI {
         }
 
         let action = actionRaw.lowercased().replacingOccurrences(of: "-", with: "_")
-        let workspaceArg = workspaceOpt ?? (windowOverride == nil ? ProcessInfo.processInfo.environment["CMUX_WORKSPACE_ID"] : nil)
+        let workspaceArg = workspaceOpt ?? (windowOverride == nil ? (ProcessInfo.processInfo.environment["TERMMESH_WORKSPACE_ID"] ?? ProcessInfo.processInfo.environment["CMUX_WORKSPACE_ID"]) : nil)
         let workspaceId = try normalizeWorkspaceHandle(workspaceArg, client: client, allowCurrent: true)
 
         let inferredTitle = positional.joined(separator: " ").trimmingCharacters(in: .whitespacesAndNewlines)
@@ -1852,11 +1852,11 @@ struct CMUXCLI {
         }
 
         let action = actionRaw.lowercased().replacingOccurrences(of: "-", with: "_")
-        let workspaceArg = workspaceOpt ?? (windowOverride == nil ? ProcessInfo.processInfo.environment["CMUX_WORKSPACE_ID"] : nil)
+        let workspaceArg = workspaceOpt ?? (windowOverride == nil ? (ProcessInfo.processInfo.environment["TERMMESH_WORKSPACE_ID"] ?? ProcessInfo.processInfo.environment["CMUX_WORKSPACE_ID"]) : nil)
         let tabArg = tabOpt
             ?? surfaceOpt
             ?? (workspaceOpt == nil && windowOverride == nil
-                ? (ProcessInfo.processInfo.environment["CMUX_TAB_ID"] ?? ProcessInfo.processInfo.environment["CMUX_SURFACE_ID"])
+                ? ((ProcessInfo.processInfo.environment["TERMMESH_TAB_ID"] ?? ProcessInfo.processInfo.environment["CMUX_TAB_ID"]) ?? (ProcessInfo.processInfo.environment["TERMMESH_SURFACE_ID"] ?? ProcessInfo.processInfo.environment["CMUX_SURFACE_ID"]))
                 : nil)
 
         let workspaceId = try normalizeWorkspaceHandle(workspaceArg, client: client, allowCurrent: true)
@@ -2051,7 +2051,7 @@ struct CMUXCLI {
             if let sourceSurface = try normalizeSurfaceHandle(surfaceRaw, client: client) {
                 params["surface_id"] = sourceSurface
             }
-            let workspaceRaw = workspaceOpt ?? (windowOpt == nil ? ProcessInfo.processInfo.environment["CMUX_WORKSPACE_ID"] : nil)
+            let workspaceRaw = workspaceOpt ?? (windowOpt == nil ? (ProcessInfo.processInfo.environment["TERMMESH_WORKSPACE_ID"] ?? ProcessInfo.processInfo.environment["CMUX_WORKSPACE_ID"]) : nil)
             if let workspaceRaw {
                 if let workspace = try normalizeWorkspaceHandle(workspaceRaw, client: client) {
                     params["workspace_id"] = workspace
@@ -3136,7 +3136,7 @@ struct CMUXCLI {
         switch command {
         case "focus-window":
             return """
-            Usage: cmux focus-window --window <id|ref|index>
+            Usage: term-mesh focus-window --window <id|ref|index>
 
             Focus (bring to front) the specified window.
 
@@ -3144,12 +3144,12 @@ struct CMUXCLI {
               --window <id|ref|index>   Window to focus (required)
 
             Example:
-              cmux focus-window --window 0
-              cmux focus-window --window window:1
+              term-mesh focus-window --window 0
+              term-mesh focus-window --window window:1
             """
         case "close-window":
             return """
-            Usage: cmux close-window --window <id|ref|index>
+            Usage: term-mesh close-window --window <id|ref|index>
 
             Close the specified window.
 
@@ -3157,12 +3157,12 @@ struct CMUXCLI {
               --window <id|ref|index>   Window to close (required)
 
             Example:
-              cmux close-window --window 0
-              cmux close-window --window window:1
+              term-mesh close-window --window 0
+              term-mesh close-window --window window:1
             """
         case "move-workspace-to-window":
             return """
-            Usage: cmux move-workspace-to-window --workspace <id|ref> --window <id|ref>
+            Usage: term-mesh move-workspace-to-window --workspace <id|ref> --window <id|ref>
 
             Move a workspace to a different window.
 
@@ -3171,11 +3171,11 @@ struct CMUXCLI {
               --window <id|ref>      Target window (required)
 
             Example:
-              cmux move-workspace-to-window --workspace workspace:2 --window window:1
+              term-mesh move-workspace-to-window --workspace workspace:2 --window window:1
             """
         case "move-surface":
             return """
-            Usage: cmux move-surface --surface <id|ref|index> [flags]
+            Usage: term-mesh move-surface --surface <id|ref|index> [flags]
 
             Move a surface to a different pane, workspace, or window.
 
@@ -3190,12 +3190,12 @@ struct CMUXCLI {
               --focus <true|false>       Focus the surface after moving
 
             Example:
-              cmux move-surface --surface surface:1 --workspace workspace:2
-              cmux move-surface --surface 0 --pane pane:2 --index 0
+              term-mesh move-surface --surface surface:1 --workspace workspace:2
+              term-mesh move-surface --surface 0 --pane pane:2 --index 0
             """
         case "reorder-surface":
             return """
-            Usage: cmux reorder-surface --surface <id|ref|index> [flags]
+            Usage: term-mesh reorder-surface --surface <id|ref|index> [flags]
 
             Reorder a surface within its pane.
 
@@ -3206,12 +3206,12 @@ struct CMUXCLI {
               --index <n>                Place at this index
 
             Example:
-              cmux reorder-surface --surface surface:1 --index 0
-              cmux reorder-surface --surface surface:3 --after surface:1
+              term-mesh reorder-surface --surface surface:1 --index 0
+              term-mesh reorder-surface --surface surface:3 --after surface:1
             """
         case "reorder-workspace":
             return """
-            Usage: cmux reorder-workspace --workspace <id|ref|index> [flags]
+            Usage: term-mesh reorder-workspace --workspace <id|ref|index> [flags]
 
             Reorder a workspace within its window.
 
@@ -3223,12 +3223,12 @@ struct CMUXCLI {
               --window <id|ref|index>      Window context
 
             Example:
-              cmux reorder-workspace --workspace workspace:2 --index 0
-              cmux reorder-workspace --workspace workspace:3 --after workspace:1
+              term-mesh reorder-workspace --workspace workspace:2 --index 0
+              term-mesh reorder-workspace --workspace workspace:3 --after workspace:1
             """
         case "workspace-action":
             return """
-            Usage: cmux workspace-action --action <name> [flags]
+            Usage: term-mesh workspace-action --action <name> [flags]
 
             Perform workspace context-menu actions from CLI/socket.
 
@@ -3241,17 +3241,17 @@ struct CMUXCLI {
 
             Flags:
               --action <name>              Action name (required if not positional)
-              --workspace <id|ref|index>   Target workspace (default: current/$CMUX_WORKSPACE_ID)
+              --workspace <id|ref|index>   Target workspace (default: current/$TERMMESH_WORKSPACE_ID)
               --title <text>               Title for rename
 
             Example:
-              cmux workspace-action --workspace workspace:2 --action pin
-              cmux workspace-action --action rename --title "infra"
-              cmux workspace-action close-others
+              term-mesh workspace-action --workspace workspace:2 --action pin
+              term-mesh workspace-action --action rename --title "infra"
+              term-mesh workspace-action close-others
             """
         case "tab-action":
             return """
-            Usage: cmux tab-action --action <name> [flags]
+            Usage: term-mesh tab-action --action <name> [flags]
 
             Perform horizontal tab context-menu actions from CLI/socket.
 
@@ -3267,123 +3267,123 @@ struct CMUXCLI {
               --action <name>              Action name (required if not positional)
               --tab <id|ref|index>         Target tab (accepts tab:<n> or surface:<n>; alias: --surface)
               --surface <id|ref|index>     Alias for --tab (backward compatibility)
-              --workspace <id|ref|index>   Workspace context (default: current/$CMUX_WORKSPACE_ID)
+              --workspace <id|ref|index>   Workspace context (default: current/$TERMMESH_WORKSPACE_ID)
               --title <text>               Title for rename
               --url <url>                  Optional URL for new-browser-right
 
             Example:
-              cmux tab-action --tab tab:3 --action pin
-              cmux tab-action --action close-right
-              cmux tab-action --tab tab:2 --action rename --title "build logs"
+              term-mesh tab-action --tab tab:3 --action pin
+              term-mesh tab-action --action close-right
+              term-mesh tab-action --tab tab:2 --action rename --title "build logs"
             """
         case "rename-tab":
             return """
-            Usage: cmux rename-tab [--workspace <id|ref>] [--tab <id|ref>] [--surface <id|ref>] [--] <title>
+            Usage: term-mesh rename-tab [--workspace <id|ref>] [--tab <id|ref>] [--surface <id|ref>] [--] <title>
 
             Rename a tab (surface). Defaults to the focused tab, using:
             1) explicit --tab/--surface
-            2) $CMUX_TAB_ID / $CMUX_SURFACE_ID
+            2) $TERMMESH_TAB_ID / $TERMMESH_SURFACE_ID
             3) focused tab in the resolved workspace context
 
             Flags:
-              --workspace <id|ref>   Workspace context (default: current/$CMUX_WORKSPACE_ID)
+              --workspace <id|ref>   Workspace context (default: current/$TERMMESH_WORKSPACE_ID)
               --tab <id|ref>         Target tab (accepts tab:<n> or surface:<n>)
               --surface <id|ref>     Alias for --tab
               --title <text>         New title (or pass trailing title)
 
             Example:
-              cmux rename-tab "build logs"
-              cmux rename-tab --tab tab:3 "staging server"
-              cmux rename-tab --workspace workspace:2 --surface surface:5 --title "agent run"
+              term-mesh rename-tab "build logs"
+              term-mesh rename-tab --tab tab:3 "staging server"
+              term-mesh rename-tab --workspace workspace:2 --surface surface:5 --title "agent run"
             """
         case "new-workspace":
             return """
-            Usage: cmux new-workspace
+            Usage: term-mesh new-workspace
 
             Create a new workspace in the current window.
 
             Example:
-              cmux new-workspace
+              term-mesh new-workspace
             """
         case "new-split":
             return """
-            Usage: cmux new-split <left|right|up|down> [flags]
+            Usage: term-mesh new-split <left|right|up|down> [flags]
 
             Split the current pane in the given direction.
 
             Flags:
-              --workspace <id|ref>   Target workspace (default: $CMUX_WORKSPACE_ID)
-              --surface <id|ref>     Surface to split from (default: $CMUX_SURFACE_ID)
+              --workspace <id|ref>   Target workspace (default: $TERMMESH_WORKSPACE_ID)
+              --surface <id|ref>     Surface to split from (default: $TERMMESH_SURFACE_ID)
               --panel <id|ref>       Alias for --surface
 
             Example:
-              cmux new-split right
-              cmux new-split down --workspace workspace:1
+              term-mesh new-split right
+              term-mesh new-split down --workspace workspace:1
             """
         case "focus-pane":
             return """
-            Usage: cmux focus-pane --pane <id|ref> [flags]
+            Usage: term-mesh focus-pane --pane <id|ref> [flags]
 
             Focus the specified pane.
 
             Flags:
               --pane <id|ref>          Pane to focus (required)
-              --workspace <id|ref>     Workspace context (default: $CMUX_WORKSPACE_ID)
+              --workspace <id|ref>     Workspace context (default: $TERMMESH_WORKSPACE_ID)
 
             Example:
-              cmux focus-pane --pane pane:2
-              cmux focus-pane --pane pane:1 --workspace workspace:2
+              term-mesh focus-pane --pane pane:2
+              term-mesh focus-pane --pane pane:1 --workspace workspace:2
             """
         case "new-pane":
             return """
-            Usage: cmux new-pane [flags]
+            Usage: term-mesh new-pane [flags]
 
             Create a new pane in the workspace.
 
             Flags:
               --type <terminal|browser>           Pane type (default: terminal)
               --direction <left|right|up|down>    Split direction (default: right)
-              --workspace <id|ref>                Target workspace (default: $CMUX_WORKSPACE_ID)
+              --workspace <id|ref>                Target workspace (default: $TERMMESH_WORKSPACE_ID)
               --url <url>                         URL for browser panes
 
             Example:
-              cmux new-pane
-              cmux new-pane --type browser --direction down --url https://example.com
+              term-mesh new-pane
+              term-mesh new-pane --type browser --direction down --url https://example.com
             """
         case "new-surface":
             return """
-            Usage: cmux new-surface [flags]
+            Usage: term-mesh new-surface [flags]
 
             Create a new surface (tab) in a pane.
 
             Flags:
               --type <terminal|browser>   Surface type (default: terminal)
               --pane <id|ref>             Target pane
-              --workspace <id|ref>        Target workspace (default: $CMUX_WORKSPACE_ID)
+              --workspace <id|ref>        Target workspace (default: $TERMMESH_WORKSPACE_ID)
               --url <url>                 URL for browser surfaces
 
             Example:
-              cmux new-surface
-              cmux new-surface --type browser --pane pane:1 --url https://example.com
+              term-mesh new-surface
+              term-mesh new-surface --type browser --pane pane:1 --url https://example.com
             """
         case "close-surface":
             return """
-            Usage: cmux close-surface [flags]
+            Usage: term-mesh close-surface [flags]
 
             Close a surface. Defaults to the focused surface if none specified.
 
             Flags:
-              --surface <id|ref>     Surface to close (default: $CMUX_SURFACE_ID)
+              --surface <id|ref>     Surface to close (default: $TERMMESH_SURFACE_ID)
               --panel <id|ref>       Alias for --surface
-              --workspace <id|ref>   Workspace context (default: $CMUX_WORKSPACE_ID)
+              --workspace <id|ref>   Workspace context (default: $TERMMESH_WORKSPACE_ID)
 
             Example:
-              cmux close-surface
-              cmux close-surface --surface surface:3
+              term-mesh close-surface
+              term-mesh close-surface --surface surface:3
             """
         case "drag-surface-to-split":
             return """
-            Usage: cmux drag-surface-to-split --surface <id|ref> <left|right|up|down>
+            Usage: term-mesh drag-surface-to-split --surface <id|ref> <left|right|up|down>
 
             Drag a surface into a new split in the given direction.
 
@@ -3392,12 +3392,12 @@ struct CMUXCLI {
               --panel <id|ref>     Alias for --surface
 
             Example:
-              cmux drag-surface-to-split --surface surface:1 right
-              cmux drag-surface-to-split --panel surface:2 down
+              term-mesh drag-surface-to-split --surface surface:1 right
+              term-mesh drag-surface-to-split --panel surface:2 down
             """
         case "close-workspace":
             return """
-            Usage: cmux close-workspace --workspace <id|ref>
+            Usage: term-mesh close-workspace --workspace <id|ref>
 
             Close the specified workspace.
 
@@ -3405,11 +3405,11 @@ struct CMUXCLI {
               --workspace <id|ref>   Workspace to close (required)
 
             Example:
-              cmux close-workspace --workspace workspace:2
+              term-mesh close-workspace --workspace workspace:2
             """
         case "select-workspace":
             return """
-            Usage: cmux select-workspace --workspace <id|ref>
+            Usage: term-mesh select-workspace --workspace <id|ref>
 
             Select (switch to) the specified workspace.
 
@@ -3417,12 +3417,12 @@ struct CMUXCLI {
               --workspace <id|ref>   Workspace to select (required)
 
             Example:
-              cmux select-workspace --workspace workspace:2
-              cmux select-workspace --workspace 0
+              term-mesh select-workspace --workspace workspace:2
+              term-mesh select-workspace --workspace 0
             """
         case "rename-workspace", "rename-window":
             return """
-            Usage: cmux rename-workspace [--workspace <id|ref>] [--] <title>
+            Usage: term-mesh rename-workspace [--workspace <id|ref>] [--] <title>
 
             Rename a workspace. Defaults to the current workspace.
             tmux-compatible alias: rename-window
@@ -3431,117 +3431,117 @@ struct CMUXCLI {
               --workspace <id|ref>   Workspace to rename (default: current workspace)
 
             Example:
-              cmux rename-workspace "backend logs"
-              cmux rename-window --workspace workspace:2 "agent run"
+              term-mesh rename-workspace "backend logs"
+              term-mesh rename-window --workspace workspace:2 "agent run"
             """
         case "capture-pane":
             return """
-            Usage: cmux capture-pane [--workspace <id|ref>] [--surface <id|ref>] [--scrollback] [--lines <n>]
+            Usage: term-mesh capture-pane [--workspace <id|ref>] [--surface <id|ref>] [--scrollback] [--lines <n>]
 
             tmux-compatible alias for reading terminal text from a pane.
 
             Example:
-              cmux capture-pane --workspace workspace:2 --surface surface:1 --scrollback --lines 200
+              term-mesh capture-pane --workspace workspace:2 --surface surface:1 --scrollback --lines 200
             """
         case "resize-pane":
             return """
-            Usage: cmux resize-pane --pane <id|ref> [--workspace <id|ref>] (-L|-R|-U|-D) [--amount <n>]
+            Usage: term-mesh resize-pane --pane <id|ref> [--workspace <id|ref>] (-L|-R|-U|-D) [--amount <n>]
 
             tmux-compatible pane resize command.
             Note: currently returns not_supported until programmable divider resize is implemented.
             """
         case "pipe-pane":
             return """
-            Usage: cmux pipe-pane --command <shell-command> [--workspace <id|ref>] [--surface <id|ref>]
+            Usage: term-mesh pipe-pane --command <shell-command> [--workspace <id|ref>] [--surface <id|ref>]
 
             Capture pane text and pipe it to a shell command via stdin.
             """
         case "wait-for":
             return """
-            Usage: cmux wait-for [-S|--signal] <name> [--timeout <seconds>]
+            Usage: term-mesh wait-for [-S|--signal] <name> [--timeout <seconds>]
 
             Wait for or signal a named synchronization token.
             """
         case "swap-pane", "break-pane", "join-pane", "next-window", "previous-window", "last-window", "last-pane", "find-window", "clear-history", "set-hook", "popup", "bind-key", "unbind-key", "copy-mode", "set-buffer", "paste-buffer", "list-buffers", "respawn-pane", "display-message":
             return """
-            Usage: cmux \(command) --help
+            Usage: term-mesh \(command) --help
 
-            tmux compatibility command. See `cmux --help` for exact syntax.
+            tmux compatibility command. See `term-mesh --help` for exact syntax.
             """
         case "read-screen":
             return """
-            Usage: cmux read-screen [flags]
+            Usage: term-mesh read-screen [flags]
 
             Read terminal text from a surface as plain text.
 
             Flags:
-              --workspace <id|ref>   Target workspace (default: $CMUX_WORKSPACE_ID)
-              --surface <id|ref>     Target surface (default: $CMUX_SURFACE_ID)
+              --workspace <id|ref>   Target workspace (default: $TERMMESH_WORKSPACE_ID)
+              --surface <id|ref>     Target surface (default: $TERMMESH_SURFACE_ID)
               --scrollback           Include scrollback (not just visible viewport)
               --lines <n>            Limit to the last n lines (implies --scrollback)
 
             Example:
-              cmux read-screen
-              cmux read-screen --surface surface:2 --scrollback --lines 200
+              term-mesh read-screen
+              term-mesh read-screen --surface surface:2 --scrollback --lines 200
             """
         case "send":
             return """
-            Usage: cmux send [flags] [--] <text>
+            Usage: term-mesh send [flags] [--] <text>
 
             Send text to a terminal surface. Escape sequences: \\n and \\r send Enter, \\t sends Tab.
 
             Flags:
-              --workspace <id|ref>   Target workspace (default: $CMUX_WORKSPACE_ID)
-              --surface <id|ref>     Target surface (default: $CMUX_SURFACE_ID)
+              --workspace <id|ref>   Target workspace (default: $TERMMESH_WORKSPACE_ID)
+              --surface <id|ref>     Target surface (default: $TERMMESH_SURFACE_ID)
 
             Example:
-              cmux send "echo hello"
-              cmux send --surface surface:2 "ls -la\\n"
+              term-mesh send "echo hello"
+              term-mesh send --surface surface:2 "ls -la\\n"
             """
         case "send-key":
             return """
-            Usage: cmux send-key [flags] [--] <key>
+            Usage: term-mesh send-key [flags] [--] <key>
 
             Send a key event to a terminal surface.
 
             Flags:
-              --workspace <id|ref>   Target workspace (default: $CMUX_WORKSPACE_ID)
-              --surface <id|ref>     Target surface (default: $CMUX_SURFACE_ID)
+              --workspace <id|ref>   Target workspace (default: $TERMMESH_WORKSPACE_ID)
+              --surface <id|ref>     Target surface (default: $TERMMESH_SURFACE_ID)
 
             Example:
-              cmux send-key enter
-              cmux send-key --surface surface:2 ctrl+c
+              term-mesh send-key enter
+              term-mesh send-key --surface surface:2 ctrl+c
             """
         case "send-panel":
             return """
-            Usage: cmux send-panel --panel <id|ref> [flags] [--] <text>
+            Usage: term-mesh send-panel --panel <id|ref> [flags] [--] <text>
 
             Send text to a specific panel (surface). Escape sequences: \\n and \\r send Enter, \\t sends Tab.
 
             Flags:
               --panel <id|ref>       Target panel (required)
-              --workspace <id|ref>   Target workspace (default: $CMUX_WORKSPACE_ID)
+              --workspace <id|ref>   Target workspace (default: $TERMMESH_WORKSPACE_ID)
 
             Example:
-              cmux send-panel --panel surface:2 "echo hello\\n"
+              term-mesh send-panel --panel surface:2 "echo hello\\n"
             """
         case "send-key-panel":
             return """
-            Usage: cmux send-key-panel --panel <id|ref> [flags] [--] <key>
+            Usage: term-mesh send-key-panel --panel <id|ref> [flags] [--] <key>
 
             Send a key event to a specific panel (surface).
 
             Flags:
               --panel <id|ref>       Target panel (required)
-              --workspace <id|ref>   Target workspace (default: $CMUX_WORKSPACE_ID)
+              --workspace <id|ref>   Target workspace (default: $TERMMESH_WORKSPACE_ID)
 
             Example:
-              cmux send-key-panel --panel surface:2 enter
-              cmux send-key-panel --panel surface:2 ctrl+c
+              term-mesh send-key-panel --panel surface:2 enter
+              term-mesh send-key-panel --panel surface:2 ctrl+c
             """
         case "notify":
             return """
-            Usage: cmux notify [flags]
+            Usage: term-mesh notify [flags]
 
             Send a notification to a workspace/surface.
 
@@ -3549,16 +3549,16 @@ struct CMUXCLI {
               --title <text>         Notification title (default: "Notification")
               --subtitle <text>      Notification subtitle
               --body <text>          Notification body
-              --workspace <id|ref>   Target workspace (default: $CMUX_WORKSPACE_ID)
-              --surface <id|ref>     Target surface (default: $CMUX_SURFACE_ID)
+              --workspace <id|ref>   Target workspace (default: $TERMMESH_WORKSPACE_ID)
+              --surface <id|ref>     Target surface (default: $TERMMESH_SURFACE_ID)
 
             Example:
-              cmux notify --title "Build done" --body "All tests passed"
-              cmux notify --title "Error" --subtitle "test.swift" --body "Line 42: syntax error"
+              term-mesh notify --title "Build done" --body "All tests passed"
+              term-mesh notify --title "Error" --subtitle "test.swift" --body "Line 42: syntax error"
             """
         case "set-status":
             return """
-            Usage: cmux set-status <key> <value> [flags]
+            Usage: term-mesh set-status <key> <value> [flags]
 
             Set a sidebar status entry for a workspace. Status entries appear as
             pills in the sidebar tab row. Use a unique key so different tools
@@ -3567,122 +3567,122 @@ struct CMUXCLI {
             Flags:
               --icon <name>          Icon name (e.g. "sparkle", "hammer")
               --color <#hex>         Pill color (e.g. "#ff9500")
-              --workspace <id|ref>   Target workspace (default: $CMUX_WORKSPACE_ID)
+              --workspace <id|ref>   Target workspace (default: $TERMMESH_WORKSPACE_ID)
 
             Example:
-              cmux set-status build "compiling" --icon hammer --color "#ff9500"
-              cmux set-status deploy "v1.2.3" --workspace workspace:2
+              term-mesh set-status build "compiling" --icon hammer --color "#ff9500"
+              term-mesh set-status deploy "v1.2.3" --workspace workspace:2
             """
         case "clear-status":
             return """
-            Usage: cmux clear-status <key> [flags]
+            Usage: term-mesh clear-status <key> [flags]
 
             Remove a sidebar status entry by key.
 
             Flags:
-              --workspace <id|ref>   Target workspace (default: $CMUX_WORKSPACE_ID)
+              --workspace <id|ref>   Target workspace (default: $TERMMESH_WORKSPACE_ID)
 
             Example:
-              cmux clear-status build
+              term-mesh clear-status build
             """
         case "list-status":
             return """
-            Usage: cmux list-status [flags]
+            Usage: term-mesh list-status [flags]
 
             List all sidebar status entries for a workspace.
 
             Flags:
-              --workspace <id|ref>   Target workspace (default: $CMUX_WORKSPACE_ID)
+              --workspace <id|ref>   Target workspace (default: $TERMMESH_WORKSPACE_ID)
 
             Example:
-              cmux list-status
-              cmux list-status --workspace workspace:2
+              term-mesh list-status
+              term-mesh list-status --workspace workspace:2
             """
         case "set-progress":
             return """
-            Usage: cmux set-progress <0.0-1.0> [flags]
+            Usage: term-mesh set-progress <0.0-1.0> [flags]
 
             Set a progress bar in the sidebar for a workspace.
 
             Flags:
               --label <text>         Label shown next to the progress bar
-              --workspace <id|ref>   Target workspace (default: $CMUX_WORKSPACE_ID)
+              --workspace <id|ref>   Target workspace (default: $TERMMESH_WORKSPACE_ID)
 
             Example:
-              cmux set-progress 0.5 --label "Building..."
-              cmux set-progress 1.0 --label "Done"
+              term-mesh set-progress 0.5 --label "Building..."
+              term-mesh set-progress 1.0 --label "Done"
             """
         case "clear-progress":
             return """
-            Usage: cmux clear-progress [flags]
+            Usage: term-mesh clear-progress [flags]
 
             Clear the sidebar progress bar for a workspace.
 
             Flags:
-              --workspace <id|ref>   Target workspace (default: $CMUX_WORKSPACE_ID)
+              --workspace <id|ref>   Target workspace (default: $TERMMESH_WORKSPACE_ID)
 
             Example:
-              cmux clear-progress
+              term-mesh clear-progress
             """
         case "log":
             return """
-            Usage: cmux log [flags] [--] <message>
+            Usage: term-mesh log [flags] [--] <message>
 
             Append a log entry to the sidebar for a workspace.
 
             Flags:
               --level <level>        Log level: info, progress, success, warning, error (default: info)
               --source <name>        Source label (e.g. "build", "test")
-              --workspace <id|ref>   Target workspace (default: $CMUX_WORKSPACE_ID)
+              --workspace <id|ref>   Target workspace (default: $TERMMESH_WORKSPACE_ID)
 
             Example:
-              cmux log "Build started"
-              cmux log --level error --source build "Compilation failed"
-              cmux log --level success -- "All 42 tests passed"
+              term-mesh log "Build started"
+              term-mesh log --level error --source build "Compilation failed"
+              term-mesh log --level success -- "All 42 tests passed"
             """
         case "clear-log":
             return """
-            Usage: cmux clear-log [flags]
+            Usage: term-mesh clear-log [flags]
 
             Clear all sidebar log entries for a workspace.
 
             Flags:
-              --workspace <id|ref>   Target workspace (default: $CMUX_WORKSPACE_ID)
+              --workspace <id|ref>   Target workspace (default: $TERMMESH_WORKSPACE_ID)
 
             Example:
-              cmux clear-log
+              term-mesh clear-log
             """
         case "list-log":
             return """
-            Usage: cmux list-log [flags]
+            Usage: term-mesh list-log [flags]
 
             List sidebar log entries for a workspace.
 
             Flags:
               --limit <n>            Show only the last N entries
-              --workspace <id|ref>   Target workspace (default: $CMUX_WORKSPACE_ID)
+              --workspace <id|ref>   Target workspace (default: $TERMMESH_WORKSPACE_ID)
 
             Example:
-              cmux list-log
-              cmux list-log --limit 5
+              term-mesh list-log
+              term-mesh list-log --limit 5
             """
         case "sidebar-state":
             return """
-            Usage: cmux sidebar-state [flags]
+            Usage: term-mesh sidebar-state [flags]
 
             Dump all sidebar metadata for a workspace (cwd, git branch, ports,
             status entries, progress, log entries).
 
             Flags:
-              --workspace <id|ref>   Target workspace (default: $CMUX_WORKSPACE_ID)
+              --workspace <id|ref>   Target workspace (default: $TERMMESH_WORKSPACE_ID)
 
             Example:
-              cmux sidebar-state
-              cmux sidebar-state --workspace workspace:2
+              term-mesh sidebar-state
+              term-mesh sidebar-state --workspace workspace:2
             """
         case "claude-hook":
             return """
-            Usage: cmux claude-hook <session-start|stop|notification> [flags]
+            Usage: term-mesh claude-hook <session-start|stop|notification> [flags]
 
             Hook for Claude Code integration. Reads JSON from stdin.
 
@@ -3692,16 +3692,16 @@ struct CMUXCLI {
               notification    Forward a Claude notification
 
             Flags:
-              --workspace <id|ref>   Target workspace (default: $CMUX_WORKSPACE_ID)
-              --surface <id|ref>     Target surface (default: $CMUX_SURFACE_ID)
+              --workspace <id|ref>   Target workspace (default: $TERMMESH_WORKSPACE_ID)
+              --surface <id|ref>     Target surface (default: $TERMMESH_SURFACE_ID)
 
             Example:
-              echo '{"session_id":"abc"}' | cmux claude-hook session-start
-              echo '{}' | cmux claude-hook stop
+              echo '{"session_id":"abc"}' | term-mesh claude-hook session-start
+              echo '{}' | term-mesh claude-hook stop
             """
         case "browser":
             return """
-            Usage: cmux browser [--surface <id|ref|index> | <surface>] <subcommand> [args]
+            Usage: term-mesh browser [--surface <id|ref|index> | <surface>] <subcommand> [args]
 
             Browser automation commands. Most subcommands require a surface handle.
 
@@ -3723,9 +3723,9 @@ struct CMUXCLI {
               identify                       Identify browser surface
 
             Example:
-              cmux browser open https://example.com
-              cmux browser surface:1 navigate https://google.com
-              cmux browser --surface surface:1 snapshot --interactive
+              term-mesh browser open https://example.com
+              term-mesh browser surface:1 navigate https://google.com
+              term-mesh browser --surface surface:1 snapshot --interactive
             """
         default:
             return nil
@@ -3736,7 +3736,7 @@ struct CMUXCLI {
     private func dispatchSubcommandHelp(command: String, commandArgs: [String]) -> Bool {
         guard commandArgs.contains("--help") || commandArgs.contains("-h") else { return false }
         guard let text = subcommandUsage(command) else { return false }
-        print("cmux \(command)")
+        print("term-mesh \(command)")
         print("")
         print(text)
         return true
@@ -3807,7 +3807,7 @@ struct CMUXCLI {
         if let explicit = optionValue(args, name: "--workspace") { return explicit }
         // When --window is explicitly targeted, don't fall back to env workspace from a different window
         if windowOverride != nil { return nil }
-        return ProcessInfo.processInfo.environment["CMUX_WORKSPACE_ID"]
+        return (ProcessInfo.processInfo.environment["TERMMESH_WORKSPACE_ID"] ?? ProcessInfo.processInfo.environment["CMUX_WORKSPACE_ID"])
     }
 
     /// Pick the display handle for an item dict based on --id-format.
@@ -3850,7 +3850,7 @@ struct CMUXCLI {
     }
 
     private func tmuxCompatStoreURL() -> URL {
-        let root = NSString(string: "~/.cmuxterm").expandingTildeInPath
+        let root = NSString(string: "~/.termmesh").expandingTildeInPath
         return URL(fileURLWithPath: root).appendingPathComponent("tmux-compat-store.json")
     }
 
@@ -3898,7 +3898,7 @@ struct CMUXCLI {
     private func tmuxWaitForSignalURL(name: String) -> URL {
         let allowed = CharacterSet.alphanumerics.union(CharacterSet(charactersIn: "._-"))
         let sanitized = name.unicodeScalars.map { allowed.contains($0) ? Character($0) : "_" }
-        return URL(fileURLWithPath: "/tmp/cmux-wait-for-\(String(sanitized)).sig")
+        return URL(fileURLWithPath: "/tmp/term-mesh-wait-for-\(String(sanitized)).sig")
     }
 
     private func runTmuxCompatCommand(
@@ -3914,8 +3914,8 @@ struct CMUXCLI {
             let (wsArg, rem0) = parseOption(commandArgs, name: "--workspace")
             let (sfArg, rem1) = parseOption(rem0, name: "--surface")
             let (linesArg, rem2) = parseOption(rem1, name: "--lines")
-            let workspaceArg = wsArg ?? (windowOverride == nil ? ProcessInfo.processInfo.environment["CMUX_WORKSPACE_ID"] : nil)
-            let surfaceArg = sfArg ?? (wsArg == nil && windowOverride == nil ? ProcessInfo.processInfo.environment["CMUX_SURFACE_ID"] : nil)
+            let workspaceArg = wsArg ?? (windowOverride == nil ? (ProcessInfo.processInfo.environment["TERMMESH_WORKSPACE_ID"] ?? ProcessInfo.processInfo.environment["CMUX_WORKSPACE_ID"]) : nil)
+            let surfaceArg = sfArg ?? (wsArg == nil && windowOverride == nil ? (ProcessInfo.processInfo.environment["TERMMESH_SURFACE_ID"] ?? ProcessInfo.processInfo.environment["CMUX_SURFACE_ID"]) : nil)
 
             var params: [String: Any] = [:]
             let wsId = try normalizeWorkspaceHandle(workspaceArg, client: client)
@@ -4190,10 +4190,10 @@ struct CMUXCLI {
             print("OK")
 
         case "popup":
-            throw CLIError(message: "popup is not supported yet in cmux CLI parity mode")
+            throw CLIError(message: "popup is not supported yet in term-mesh CLI parity mode")
 
         case "bind-key", "unbind-key", "copy-mode":
-            throw CLIError(message: "\(command) is not supported yet in cmux CLI parity mode")
+            throw CLIError(message: "\(command) is not supported yet in term-mesh CLI parity mode")
 
         case "set-buffer":
             let (nameArg, rem0) = parseOption(commandArgs, name: "--name")
@@ -4264,7 +4264,7 @@ struct CMUXCLI {
                 print(message)
                 return
             }
-            let payload = try client.sendV2(method: "notification.create", params: ["title": "cmux", "body": message])
+            let payload = try client.sendV2(method: "notification.create", params: ["title": "term-mesh", "body": message])
             if jsonOutput {
                 print(jsonString(payload))
             } else {
@@ -4280,8 +4280,8 @@ struct CMUXCLI {
         let subcommand = commandArgs.first?.lowercased() ?? "help"
         let hookArgs = Array(commandArgs.dropFirst())
         let hookWsFlag = optionValue(hookArgs, name: "--workspace")
-        let workspaceArg = hookWsFlag ?? ProcessInfo.processInfo.environment["CMUX_WORKSPACE_ID"]
-        let surfaceArg = optionValue(hookArgs, name: "--surface") ?? (hookWsFlag == nil ? ProcessInfo.processInfo.environment["CMUX_SURFACE_ID"] : nil)
+        let workspaceArg = hookWsFlag ?? (ProcessInfo.processInfo.environment["TERMMESH_WORKSPACE_ID"] ?? ProcessInfo.processInfo.environment["CMUX_WORKSPACE_ID"])
+        let surfaceArg = optionValue(hookArgs, name: "--surface") ?? (hookWsFlag == nil ? (ProcessInfo.processInfo.environment["TERMMESH_SURFACE_ID"] ?? ProcessInfo.processInfo.environment["CMUX_SURFACE_ID"]) : nil)
         let rawInput = String(data: FileHandle.standardInput.readDataToEndOfFile(), encoding: .utf8) ?? ""
         let parsedInput = parseClaudeHookInput(rawInput: rawInput)
         let sessionStore = ClaudeHookSessionStore()
@@ -4388,7 +4388,7 @@ struct CMUXCLI {
         case "help", "--help", "-h":
             print(
                 """
-                cmux claude-hook <session-start|stop|notification> [--workspace <id|index>] [--surface <id|index>]
+                term-mesh claude-hook <session-start|stop|notification> [--workspace <id|index>] [--surface <id|index>]
                 """
             )
 
@@ -4712,15 +4712,15 @@ struct CMUXCLI {
     private func versionSummary() -> String {
         let info = resolvedVersionInfo()
         if let version = info["CFBundleShortVersionString"], let build = info["CFBundleVersion"] {
-            return "cmux \(version) (\(build))"
+            return "term-mesh \(version) (\(build))"
         }
         if let version = info["CFBundleShortVersionString"] {
-            return "cmux \(version)"
+            return "term-mesh \(version)"
         }
         if let build = info["CFBundleVersion"] {
-            return "cmux build \(build)"
+            return "term-mesh build \(build)"
         }
-        return "cmux version unknown"
+        return "term-mesh version unknown"
     }
 
     private func resolvedVersionInfo() -> [String: String] {
@@ -4844,7 +4844,7 @@ struct CMUXCLI {
             }
 
             // Local dev fallback: resolve version from the repo's app Info.plist
-            // when running a standalone cmux-cli binary from build/Debug.
+            // when running a standalone term-mesh-cli binary from build/Debug.
             let projectMarker = current.appendingPathComponent("GhosttyTabs.xcodeproj/project.pbxproj")
             let repoInfo = current.appendingPathComponent("Resources/Info.plist")
             if fileManager.fileExists(atPath: projectMarker.path),
@@ -4903,10 +4903,10 @@ struct CMUXCLI {
 
     private func usage() -> String {
         return """
-        cmux - control cmux via Unix socket
+        term-mesh - control term-mesh via Unix socket
 
         Usage:
-          cmux [--socket PATH] [--window WINDOW] [--password PASSWORD] [--json] [--id-format refs|uuids|both] [--version] <command> [options]
+          term-mesh [--socket PATH] [--window WINDOW] [--password PASSWORD] [--json] [--id-format refs|uuids|both] [--version] <command> [options]
 
         Handle Inputs:
           For most v2-backed commands you can use UUIDs, short refs (window:1/workspace:2/pane:3/surface:4), or indexes.
@@ -4914,7 +4914,7 @@ struct CMUXCLI {
           Output defaults to refs; pass --id-format uuids or --id-format both to include UUIDs.
 
         Socket Auth:
-          --password takes precedence, then CMUX_SOCKET_PASSWORD env var, then keychain password saved in Settings.
+          --password takes precedence, then TERMMESH_SOCKET_PASSWORD env var, then keychain password saved in Settings.
 
         Commands:
           version
@@ -5042,19 +5042,19 @@ struct CMUXCLI {
           help
 
         Environment:
-          CMUX_WORKSPACE_ID   Auto-set in cmux terminals. Used as default --workspace for
+          TERMMESH_WORKSPACE_ID   Auto-set in term-mesh terminals. Used as default --workspace for
                               ALL commands (send, list-panels, new-split, notify, etc.).
-          CMUX_TAB_ID         Optional alias used by `tab-action`/`rename-tab` as default --tab.
-          CMUX_SURFACE_ID     Auto-set in cmux terminals. Used as default --surface.
-          CMUX_SOCKET_PATH    Override the default Unix socket path (/tmp/cmux.sock).
+          TERMMESH_TAB_ID         Optional alias used by `tab-action`/`rename-tab` as default --tab.
+          TERMMESH_SURFACE_ID     Auto-set in term-mesh terminals. Used as default --surface.
+          TERMMESH_SOCKET_PATH    Override the default Unix socket path (/tmp/term-mesh.sock).
         """
     }
 }
 
 @main
-struct CMUXTermMain {
+struct TermMeshMain {
     static func main() {
-        let cli = CMUXCLI(args: CommandLine.arguments)
+        let cli = TermMeshCLI(args: CommandLine.arguments)
         do {
             try cli.run()
         } catch {

@@ -23,7 +23,7 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from cmux import cmux, cmuxError
+from termmesh import termmesh, termmeshError
 
 MAX_CPU_PERCENT = 30.0
 SETTLE_AFTER_FOCUS_S = 1.5

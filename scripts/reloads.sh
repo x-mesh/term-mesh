@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-APP_NAME="cmux STAGING"
-BUNDLE_ID="com.cmuxterm.app.staging"
-BASE_APP_NAME="cmux"
+APP_NAME="term-mesh STAGING"
+BUNDLE_ID="com.termmesh.app.staging"
+BASE_APP_NAME="term-mesh"
 DERIVED_DATA=""
 NAME_SET=0
 BUNDLE_SET=0
@@ -14,8 +14,8 @@ usage() {
   cat <<'EOF'
 Usage: ./scripts/reloads.sh [options]
 
-Release build with isolated "cmux STAGING" identity. Runs side-by-side with
-the production cmux app.
+Release build with isolated "term-mesh STAGING" identity. Runs side-by-side with
+the production term-mesh app.
 
 Options:
   --tag <name>           Short tag for parallel builds (e.g., feature-xyz-lol).
@@ -100,19 +100,19 @@ if [[ -n "$TAG" ]]; then
   TAG_ID="$(sanitize_bundle "$TAG")"
   TAG_SLUG="$(sanitize_path "$TAG")"
   if [[ "$NAME_SET" -eq 0 ]]; then
-    APP_NAME="cmux STAGING ${TAG}"
+    APP_NAME="term-mesh STAGING ${TAG}"
   fi
   if [[ "$BUNDLE_SET" -eq 0 ]]; then
-    BUNDLE_ID="com.cmuxterm.app.staging.${TAG_ID}"
+    BUNDLE_ID="com.termmesh.app.staging.${TAG_ID}"
   fi
   if [[ "$DERIVED_SET" -eq 0 ]]; then
-    DERIVED_DATA="/tmp/cmux-staging-${TAG_SLUG}"
+    DERIVED_DATA="/tmp/term-mesh-staging-${TAG_SLUG}"
   fi
 fi
 
 XCODEBUILD_ARGS=(
   -project GhosttyTabs.xcodeproj
-  -scheme cmux
+  -scheme term-mesh
   -configuration Release
   -destination 'platform=macOS'
 )
@@ -172,7 +172,7 @@ fi
 
 # Staging always copies the built app and patches the plist to set an isolated
 # socket path, bundle id, and display name. This prevents conflicts with the
-# production cmux app.
+# production term-mesh app.
 STAGING_APP_PATH="$(dirname "$APP_PATH")/${APP_NAME}.app"
 rm -rf "$STAGING_APP_PATH"
 cp -R "$APP_PATH" "$STAGING_APP_PATH"
@@ -186,25 +186,25 @@ if [[ -f "$INFO_PLIST" ]]; then
     || /usr/libexec/PlistBuddy -c "Add :CFBundleIdentifier string $BUNDLE_ID" "$INFO_PLIST"
 
   # Inject staging socket paths via LSEnvironment so the Release binary
-  # (which defaults to /tmp/cmux.sock) uses isolated sockets instead.
+  # (which defaults to /tmp/term-mesh.sock) uses isolated sockets instead.
   STAGING_SLUG="${TAG_SLUG:-staging}"
-  APP_SUPPORT_DIR="$HOME/Library/Application Support/cmux"
-  CMUXD_SOCKET="${APP_SUPPORT_DIR}/cmuxd-${STAGING_SLUG}.sock"
-  CMUX_SOCKET="/tmp/cmux-${STAGING_SLUG}.sock"
-  echo "$CMUX_SOCKET" > /tmp/cmux-last-socket-path || true
+  APP_SUPPORT_DIR="$HOME/Library/Application Support/term-mesh"
+  TERMMESH_DAEMON_SOCKET="${APP_SUPPORT_DIR}/term-meshd-${STAGING_SLUG}.sock"
+  TERMMESH_SOCKET="/tmp/term-mesh-${STAGING_SLUG}.sock"
+  echo "$TERMMESH_SOCKET" > /tmp/term-mesh-last-socket-path || true
   /usr/libexec/PlistBuddy -c "Add :LSEnvironment dict" "$INFO_PLIST" 2>/dev/null || true
-  /usr/libexec/PlistBuddy -c "Set :LSEnvironment:CMUXD_UNIX_PATH \"${CMUXD_SOCKET}\"" "$INFO_PLIST" 2>/dev/null \
-    || /usr/libexec/PlistBuddy -c "Add :LSEnvironment:CMUXD_UNIX_PATH string \"${CMUXD_SOCKET}\"" "$INFO_PLIST"
-  /usr/libexec/PlistBuddy -c "Set :LSEnvironment:CMUX_SOCKET_PATH \"${CMUX_SOCKET}\"" "$INFO_PLIST" 2>/dev/null \
-    || /usr/libexec/PlistBuddy -c "Add :LSEnvironment:CMUX_SOCKET_PATH string \"${CMUX_SOCKET}\"" "$INFO_PLIST"
-  if [[ -S "$CMUXD_SOCKET" ]]; then
-    for PID in $(lsof -t "$CMUXD_SOCKET" 2>/dev/null); do
+  /usr/libexec/PlistBuddy -c "Set :LSEnvironment:TERMMESH_DAEMON_UNIX_PATH \"${TERMMESH_DAEMON_SOCKET}\"" "$INFO_PLIST" 2>/dev/null \
+    || /usr/libexec/PlistBuddy -c "Add :LSEnvironment:TERMMESH_DAEMON_UNIX_PATH string \"${TERMMESH_DAEMON_SOCKET}\"" "$INFO_PLIST"
+  /usr/libexec/PlistBuddy -c "Set :LSEnvironment:TERMMESH_SOCKET_PATH \"${TERMMESH_SOCKET}\"" "$INFO_PLIST" 2>/dev/null \
+    || /usr/libexec/PlistBuddy -c "Add :LSEnvironment:TERMMESH_SOCKET_PATH string \"${TERMMESH_SOCKET}\"" "$INFO_PLIST"
+  if [[ -S "$TERMMESH_DAEMON_SOCKET" ]]; then
+    for PID in $(lsof -t "$TERMMESH_DAEMON_SOCKET" 2>/dev/null); do
       kill "$PID" 2>/dev/null || true
     done
-    rm -f "$CMUXD_SOCKET"
+    rm -f "$TERMMESH_DAEMON_SOCKET"
   fi
-  if [[ -S "$CMUX_SOCKET" ]]; then
-    rm -f "$CMUX_SOCKET"
+  if [[ -S "$TERMMESH_SOCKET" ]]; then
+    rm -f "$TERMMESH_SOCKET"
   fi
   /usr/bin/codesign --force --sign - --timestamp=none --generate-entitlement-der "$STAGING_APP_PATH" >/dev/null 2>&1 || true
 fi
@@ -216,21 +216,28 @@ sleep 0.3
 # Kill any running staging instance; allow side-by-side with the main and dev apps.
 pkill -f "${APP_NAME}.app/Contents/MacOS/${BASE_APP_NAME}" || true
 sleep 0.3
-CMUXD_SRC="$PWD/cmuxd/zig-out/bin/cmuxd"
-if [[ -d "$PWD/cmuxd" ]]; then
-  (cd "$PWD/cmuxd" && zig build -Doptimize=ReleaseFast)
+TERMMESHD_SRC="$PWD/daemon/zig-out/bin/term-meshd"
+if [[ -d "$PWD/daemon" ]]; then
+  (cd "$PWD/daemon" && zig build -Doptimize=ReleaseFast)
 fi
-if [[ -x "$CMUXD_SRC" ]]; then
+if [[ -x "$TERMMESHD_SRC" ]]; then
   BIN_DIR="$APP_PATH/Contents/Resources/bin"
   mkdir -p "$BIN_DIR"
-  cp "$CMUXD_SRC" "$BIN_DIR/cmuxd"
-  chmod +x "$BIN_DIR/cmuxd"
+  cp "$TERMMESHD_SRC" "$BIN_DIR/term-meshd"
+  chmod +x "$BIN_DIR/term-meshd"
 fi
-# Avoid inheriting cmux/ghostty environment variables from the terminal that
-# runs this script (often inside another cmux instance), which can cause
+# Avoid inheriting term-mesh/ghostty environment variables from the terminal that
+# runs this script (often inside another term-mesh instance), which can cause
 # socket and resource-path conflicts.
 OPEN_CLEAN_ENV=(
   env
+  -u TERMMESH_SOCKET_PATH
+  -u TERMMESH_TAB_ID
+  -u TERMMESH_PANEL_ID
+  -u TERMMESH_DAEMON_UNIX_PATH
+  -u TERMMESH_TAG
+  -u TERMMESH_BUNDLE_ID
+  -u TERMMESH_SHELL_INTEGRATION
   -u CMUX_SOCKET_PATH
   -u CMUX_TAB_ID
   -u CMUX_PANEL_ID
@@ -242,7 +249,7 @@ OPEN_CLEAN_ENV=(
   -u GHOSTTY_RESOURCES_DIR
   -u GHOSTTY_SHELL_FEATURES
   # Dev shells (including CI/Codex) often force-disable paging by exporting these.
-  # Don't leak that into cmux, otherwise `git diff` won't page even with PAGER=less.
+  # Don't leak that into term-mesh, otherwise `git diff` won't page even with PAGER=less.
   -u GIT_PAGER
   -u GH_PAGER
   -u TERMINFO
@@ -251,7 +258,7 @@ OPEN_CLEAN_ENV=(
 
 # Always inject staging socket paths via env to ensure they take effect
 # (LSEnvironment requires app restart to pick up plist changes).
-"${OPEN_CLEAN_ENV[@]}" CMUX_SOCKET_PATH="$CMUX_SOCKET" CMUXD_UNIX_PATH="$CMUXD_SOCKET" open "$APP_PATH"
+"${OPEN_CLEAN_ENV[@]}" TERMMESH_SOCKET_PATH="$TERMMESH_SOCKET" TERMMESH_DAEMON_UNIX_PATH="$TERMMESH_DAEMON_SOCKET" open "$APP_PATH"
 osascript -e "tell application id \"${BUNDLE_ID}\" to activate" || true
 
 # Safety: ensure only one instance is running.

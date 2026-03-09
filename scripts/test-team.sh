@@ -1,13 +1,13 @@
 #!/bin/bash
-# cmux Multi-Agent Team Test Script
+# term-mesh Multi-Agent Team Test Script
 # Usage: ./scripts/test-team.sh [socket_path]
 #
 # Prerequisites:
-#   CMUX_SOCKET_MODE=allowAll ./scripts/reload.sh --tag test-team
+#   TERMMESH_SOCKET_MODE=allowAll ./scripts/reload.sh --tag test-team
 
-SOCKET="${1:-/tmp/cmux-debug-test-team.sock}"
+SOCKET="${1:-/tmp/term-mesh-debug-test-team.sock}"
 TEAM="test-team-$$"
-WORKDIR="$HOME/work/project/cmux"
+WORKDIR="$HOME/work/project/term-mesh"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -77,7 +77,7 @@ check() {
     fi
 }
 
-echo -e "${CYAN}=== cmux Team Agent Test ===${NC}"
+echo -e "${CYAN}=== term-mesh Team Agent Test ===${NC}"
 echo "Socket: $SOCKET"
 echo "Team:   $TEAM"
 echo ""
@@ -88,7 +88,7 @@ if [ ! -S "$SOCKET" ]; then
     echo -e "  ${RED}FAIL${NC} Socket not found: $SOCKET"
     echo ""
     echo "  Start the app first:"
-    echo -e "  ${CYAN}CMUX_SOCKET_MODE=allowAll ./scripts/reload.sh --tag test-team${NC}"
+    echo -e "  ${CYAN}TERMMESH_SOCKET_MODE=allowAll ./scripts/reload.sh --tag test-team${NC}"
     exit 1
 fi
 R=$(rpc '{"jsonrpc":"2.0","id":0,"method":"team.list","params":{}}')

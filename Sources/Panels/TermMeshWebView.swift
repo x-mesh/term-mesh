@@ -7,7 +7,7 @@ import WebKit
 /// preventing the app menu/SwiftUI Commands from receiving them. Route menu
 /// key equivalents first so app-level shortcuts continue to work when WebKit is
 /// the first responder.
-final class CmuxWebView: WKWebView {
+final class TermMeshWebView: WKWebView {
     private final class ContextMenuFallbackBox: NSObject {
         weak var target: AnyObject?
         let action: Selector?
@@ -21,7 +21,7 @@ final class CmuxWebView: WKWebView {
     private static var contextMenuFallbackKey: UInt8 = 0
 
     var onContextMenuDownloadStateChanged: ((Bool) -> Void)?
-    var contextMenuLinkURLProvider: ((CmuxWebView, NSPoint, @escaping (URL?) -> Void) -> Void)?
+    var contextMenuLinkURLProvider: ((TermMeshWebView, NSPoint, @escaping (URL?) -> Void) -> Void)?
     var contextMenuDefaultBrowserOpener: ((URL) -> Bool)?
     /// Guard against background panes stealing first responder (e.g. page autofocus).
     /// BrowserPanelView updates this as pane focus state changes.
@@ -400,7 +400,7 @@ final class CmuxWebView: WKWebView {
         if target === self,
            action == #selector(contextMenuDownloadImage(_:))
             || action == #selector(contextMenuDownloadLinkedFile(_:)) {
-            NSLog("CmuxWebView context fallback skipped (recursive self action)")
+            NSLog("TermMeshWebView context fallback skipped (recursive self action)")
             return
         }
         _ = NSApp.sendAction(action, to: target, from: sender)
@@ -506,7 +506,7 @@ final class CmuxWebView: WKWebView {
         fallbackAction: Selector?,
         fallbackTarget: AnyObject?
     ) {
-        NSLog("CmuxWebView context download start: %@", url.absoluteString)
+        NSLog("TermMeshWebView context download start: %@", url.absoluteString)
         downloadURLViaSession(
             url,
             suggestedFilename: nil,
@@ -531,7 +531,7 @@ final class CmuxWebView: WKWebView {
         NSPasteboard.PasteboardType("public.text"),
         NSPasteboard.PasteboardType("public.plain-text"),
         NSPasteboard.PasteboardType("com.splittabbar.tabtransfer"),
-        NSPasteboard.PasteboardType("com.cmux.sidebar-tab-reorder"),
+        NSPasteboard.PasteboardType("com.termmesh.sidebar-tab-reorder"),
     ]
 
     override func registerForDraggedTypes(_ newTypes: [NSPasteboard.PasteboardType]) {
@@ -570,7 +570,7 @@ final class CmuxWebView: WKWebView {
 
             if item.identifier?.rawValue == "WKMenuItemIdentifierDownloadImage"
                 || item.title == "Download Image" {
-                NSLog("CmuxWebView context menu hook: download image")
+                NSLog("TermMeshWebView context menu hook: download image")
                 captureFallbackForMenuItemIfNeeded(item)
                 // Keep global fallback as a secondary safety net.
                 if let box = objc_getAssociatedObject(item, &Self.contextMenuFallbackKey) as? ContextMenuFallbackBox {
@@ -586,7 +586,7 @@ final class CmuxWebView: WKWebView {
 
             if item.identifier?.rawValue == "WKMenuItemIdentifierDownloadLinkedFile"
                 || item.title == "Download Linked File" {
-                NSLog("CmuxWebView context menu hook: download linked file")
+                NSLog("TermMeshWebView context menu hook: download linked file")
                 captureFallbackForMenuItemIfNeeded(item)
                 // Keep global fallback as a secondary safety net.
                 if let box = objc_getAssociatedObject(item, &Self.contextMenuFallbackKey) as? ContextMenuFallbackBox {
@@ -633,7 +633,7 @@ final class CmuxWebView: WKWebView {
             if let url {
                 let scheme = url.scheme?.lowercased() ?? ""
                 if scheme == "http" || scheme == "https" || scheme == "file" {
-                    NSLog("CmuxWebView context download image URL: %@", url.absoluteString)
+                    NSLog("TermMeshWebView context download image URL: %@", url.absoluteString)
                     self.startContextMenuDownload(
                         url,
                         sender: sender,
@@ -648,7 +648,7 @@ final class CmuxWebView: WKWebView {
             // If image URL is not directly downloadable, fall back to the nearby link URL.
             self.findLinkURLAtPoint(point) { linkURL in
                 guard let linkURL else {
-                    NSLog("CmuxWebView context download image: no downloadable image/link URL, using fallback action")
+                    NSLog("TermMeshWebView context download image: no downloadable image/link URL, using fallback action")
                     self.runContextMenuFallback(
                         action: fallback.action,
                         target: fallback.target,
@@ -658,7 +658,7 @@ final class CmuxWebView: WKWebView {
                 }
                 let linkScheme = linkURL.scheme?.lowercased() ?? ""
                 guard linkScheme == "http" || linkScheme == "https" || linkScheme == "file" else {
-                    NSLog("CmuxWebView context download image: link URL not downloadable (%@), using fallback action", linkURL.absoluteString)
+                    NSLog("TermMeshWebView context download image: link URL not downloadable (%@), using fallback action", linkURL.absoluteString)
                     self.runContextMenuFallback(
                         action: fallback.action,
                         target: fallback.target,
@@ -667,7 +667,7 @@ final class CmuxWebView: WKWebView {
                     return
                 }
 
-                NSLog("CmuxWebView context download image fallback to link URL: %@", linkURL.absoluteString)
+                NSLog("TermMeshWebView context download image fallback to link URL: %@", linkURL.absoluteString)
                 self.startContextMenuDownload(
                     linkURL,
                     sender: sender,
@@ -690,7 +690,7 @@ final class CmuxWebView: WKWebView {
             if let url {
                 let normalized = self.normalizedLinkedDownloadURL(url)
                 if self.isDownloadableScheme(normalized) {
-                    NSLog("CmuxWebView context download linked file URL: %@ (normalized=%@)", url.absoluteString, normalized.absoluteString)
+                    NSLog("TermMeshWebView context download linked file URL: %@ (normalized=%@)", url.absoluteString, normalized.absoluteString)
                     self.startContextMenuDownload(
                         normalized,
                         sender: sender,
@@ -704,7 +704,7 @@ final class CmuxWebView: WKWebView {
             // Fallback 1: image URL under cursor (useful on image-heavy result pages).
             self.findImageURLAtPoint(point) { imageURL in
                 if let imageURL, self.isDownloadableScheme(imageURL) {
-                    NSLog("CmuxWebView context download linked file fallback image URL: %@", imageURL.absoluteString)
+                    NSLog("TermMeshWebView context download linked file fallback image URL: %@", imageURL.absoluteString)
                     self.startContextMenuDownload(
                         imageURL,
                         sender: sender,
@@ -717,7 +717,7 @@ final class CmuxWebView: WKWebView {
                 // Fallback 2: simpler nearest-anchor lookup.
                 self.findLinkAtPoint(point) { fallbackURL in
                     guard let fallbackURL else {
-                        NSLog("CmuxWebView context download linked file: URL nil, using fallback action")
+                        NSLog("TermMeshWebView context download linked file: URL nil, using fallback action")
                         self.runContextMenuFallback(
                             action: fallback.action,
                             target: fallback.target,
@@ -727,7 +727,7 @@ final class CmuxWebView: WKWebView {
                     }
                     let normalized = self.normalizedLinkedDownloadURL(fallbackURL)
                     guard self.isDownloadableScheme(normalized) else {
-                        NSLog("CmuxWebView context download linked file: unsupported URL %@, using fallback action", fallbackURL.absoluteString)
+                        NSLog("TermMeshWebView context download linked file: unsupported URL %@, using fallback action", fallbackURL.absoluteString)
                         self.runContextMenuFallback(
                             action: fallback.action,
                             target: fallback.target,
@@ -735,7 +735,7 @@ final class CmuxWebView: WKWebView {
                         )
                         return
                     }
-                    NSLog("CmuxWebView context download linked file fallback URL: %@ (normalized=%@)", fallbackURL.absoluteString, normalized.absoluteString)
+                    NSLog("TermMeshWebView context download linked file fallback URL: %@ (normalized=%@)", fallbackURL.absoluteString, normalized.absoluteString)
                     self.startContextMenuDownload(
                         normalized,
                         sender: sender,

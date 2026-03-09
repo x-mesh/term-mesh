@@ -2,17 +2,17 @@
 
 <p align="center"><a href="README.md">English</a> | 简体中文 | <a href="README.zh-TW.md">繁體中文</a> | <a href="README.ko.md">한국어</a> | <a href="README.de.md">Deutsch</a> | <a href="README.es.md">Español</a> | <a href="README.fr.md">Français</a> | <a href="README.it.md">Italiano</a> | <a href="README.da.md">Dansk</a> | <a href="README.ja.md">日本語</a> | <a href="README.pl.md">Polski</a> | <a href="README.ru.md">Русский</a> | <a href="README.bs.md">Bosanski</a> | <a href="README.ar.md">العربية</a> | <a href="README.no.md">Norsk</a> | <a href="README.pt-BR.md">Português (Brasil)</a> | <a href="README.th.md">ไทย</a> | <a href="README.tr.md">Türkçe</a></p>
 
-<h1 align="center">cmux</h1>
+<h1 align="center">term-mesh</h1>
 <p align="center">基于 Ghostty 的 macOS 终端，带有垂直标签页和为 AI 编程代理设计的通知系统</p>
 
 <p align="center">
-  <a href="https://github.com/manaflow-ai/cmux/releases/latest/download/cmux-macos.dmg">
-    <img src="./docs/assets/macos-badge.png" alt="下载 cmux macOS 版" width="180" />
+  <a href="https://github.com/manaflow-ai/term-mesh/releases/latest/download/term-mesh-macos.dmg">
+    <img src="./docs/assets/macos-badge.png" alt="term-mesh" width="180" />
   </a>
 </p>
 
 <p align="center">
-  <img src="./docs/assets/screenshot.png" alt="cmux 截图" width="900" />
+  <img src="./docs/assets/screenshot.png" alt="term-mesh" width="900" />
 </p>
 
 ## 功能特性
@@ -31,34 +31,34 @@
 
 ### DMG（推荐）
 
-<a href="https://github.com/manaflow-ai/cmux/releases/latest/download/cmux-macos.dmg">
-  <img src="./docs/assets/macos-badge.png" alt="下载 cmux macOS 版" width="180" />
+<a href="https://github.com/manaflow-ai/term-mesh/releases/latest/download/term-mesh-macos.dmg">
+  <img src="./docs/assets/macos-badge.png" alt="term-mesh" width="180" />
 </a>
 
-打开 `.dmg` 文件并将 cmux 拖动到"应用程序"文件夹。cmux 通过 Sparkle 自动更新，您只需下载一次。
+打开 `.dmg` 文件并将 term-mesh 拖动到"应用程序"文件夹。term-mesh 通过 Sparkle 自动更新，您只需下载一次。
 
 ### Homebrew
 
 ```bash
-brew tap manaflow-ai/cmux
-brew install --cask cmux
+brew tap manaflow-ai/term-mesh
+brew install --cask term-mesh
 ```
 
 稍后更新：
 
 ```bash
-brew upgrade --cask cmux
+brew upgrade --cask term-mesh
 ```
 
 首次启动时，macOS 可能会要求您确认打开来自已验证开发者的应用。点击**打开**即可继续。
 
-## 为什么做 cmux？
+## Why term-mesh？
 
 我同时运行大量 Claude Code 和 Codex 会话。之前我用 Ghostty 开了一堆分割窗格，依靠 macOS 原生通知来了解代理何时需要我。但 Claude Code 的通知内容总是千篇一律的"Claude is waiting for your input"，没有任何上下文信息，而且标签页一多，连标题都看不清了。
 
-我试过几个编程协调工具，但大多数都是 Electron/Tauri 应用，性能让我不满意。我也更喜欢终端，因为 GUI 协调工具会把你锁定在它们的工作流里。所以我用 Swift/AppKit 构建了 cmux，作为一个原生 macOS 应用。它使用 libghostty 进行终端渲染，并读取您现有的 Ghostty 配置中的主题、字体和颜色设置。
+我试过几个编程协调工具，但大多数都是 Electron/Tauri 应用，性能让我不满意。我也更喜欢终端，因为 GUI 协调工具会把你锁定在它们的工作流里。所以我用 Swift/AppKit 构建了 term-mesh，作为一个原生 macOS 应用。它使用 libghostty 进行终端渲染，并读取您现有的 Ghostty 配置中的主题、字体和颜色设置。
 
-主要新增的是侧边栏和通知系统。侧边栏有垂直标签页，显示每个工作区的 git 分支、工作目录、监听端口和最新通知文本。通知系统能捕获终端序列（OSC 9/99/777），并提供 CLI（`cmux notify`），您可以将其接入 Claude Code、OpenCode 等代理的钩子。当代理等待时，其窗格会显示蓝色光环，标签页会在侧边栏高亮，这样我就能在多个分割窗格和标签页之间一眼看出哪个需要我。⌘⇧U 可以跳转到最新的未读通知。
+主要新增的是侧边栏和通知系统。侧边栏有垂直标签页，显示每个工作区的 git 分支、工作目录、监听端口和最新通知文本。通知系统能捕获终端序列（OSC 9/99/777），并提供 CLI（`term-mesh notify`），您可以将其接入 Claude Code、OpenCode 等代理的钩子。当代理等待时，其窗格会显示蓝色光环，标签页会在侧边栏高亮，这样我就能在多个分割窗格和标签页之间一眼看出哪个需要我。⌘⇧U 可以跳转到最新的未读通知。
 
 内置浏览器拥有从 [agent-browser](https://github.com/vercel-labs/agent-browser) 移植的可脚本化 API。代理可以抓取无障碍树快照、获取元素引用、执行点击、填写表单和执行 JS。您可以在终端旁边分割出浏览器窗格，让 Claude Code 直接与您的开发服务器交互。
 

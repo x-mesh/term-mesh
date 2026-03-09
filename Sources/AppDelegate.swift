@@ -387,20 +387,20 @@ func shouldRouteTerminalFontZoomShortcutToGhostty(
     return browserZoomShortcutAction(flags: flags, chars: chars, keyCode: keyCode) != nil
 }
 
-func cmuxOwningGhosttyView(for responder: NSResponder?) -> GhosttyNSView? {
+func termMeshOwningGhosttyView(for responder: NSResponder?) -> GhosttyNSView? {
     guard let responder else { return nil }
     if let ghosttyView = responder as? GhosttyNSView {
         return ghosttyView
     }
 
     if let view = responder as? NSView,
-       let ghosttyView = cmuxOwningGhosttyView(for: view) {
+       let ghosttyView = termMeshOwningGhosttyView(for: view) {
         return ghosttyView
     }
 
     if let textView = responder as? NSTextView,
        let delegateView = textView.delegate as? NSView,
-       let ghosttyView = cmuxOwningGhosttyView(for: delegateView) {
+       let ghosttyView = termMeshOwningGhosttyView(for: delegateView) {
         return ghosttyView
     }
 
@@ -410,7 +410,7 @@ func cmuxOwningGhosttyView(for responder: NSResponder?) -> GhosttyNSView? {
             return ghosttyView
         }
         if let view = next as? NSView,
-           let ghosttyView = cmuxOwningGhosttyView(for: view) {
+           let ghosttyView = termMeshOwningGhosttyView(for: view) {
             return ghosttyView
         }
         current = next.nextResponder
@@ -419,7 +419,7 @@ func cmuxOwningGhosttyView(for responder: NSResponder?) -> GhosttyNSView? {
     return nil
 }
 
-private func cmuxOwningGhosttyView(for view: NSView) -> GhosttyNSView? {
+private func termMeshOwningGhosttyView(for view: NSView) -> GhosttyNSView? {
     if let ghosttyView = view as? GhosttyNSView {
         return ghosttyView
     }
@@ -517,7 +517,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         if env["XCInjectBundle"] != nil { return true }
         if env["XCInjectBundleInto"] != nil { return true }
         if env["DYLD_INSERT_LIBRARIES"]?.contains("libXCTest") == true { return true }
-        if env.keys.contains(where: { $0.hasPrefix("CMUX_UI_TEST_") }) { return true }
+        if env.keys.contains(where: { $0.hasPrefix("TERMMESH_UI_TEST_") || $0.hasPrefix("CMUX_UI_TEST_") }) { return true }
         return false
     }
 
@@ -581,7 +581,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
     private static let didInstallWindowKeyEquivalentSwizzle: Void = {
         let targetClass: AnyClass = NSWindow.self
         let originalSelector = #selector(NSWindow.performKeyEquivalent(with:))
-        let swizzledSelector = #selector(NSWindow.cmux_performKeyEquivalent(with:))
+        let swizzledSelector = #selector(NSWindow.termMesh_performKeyEquivalent(with:))
         guard let originalMethod = class_getInstanceMethod(targetClass, originalSelector),
               let swizzledMethod = class_getInstanceMethod(targetClass, swizzledSelector) else {
             return
@@ -591,7 +591,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
     private static let didInstallWindowFirstResponderSwizzle: Void = {
         let targetClass: AnyClass = NSWindow.self
         let originalSelector = #selector(NSWindow.makeFirstResponder(_:))
-        let swizzledSelector = #selector(NSWindow.cmux_makeFirstResponder(_:))
+        let swizzledSelector = #selector(NSWindow.termMesh_makeFirstResponder(_:))
         guard let originalMethod = class_getInstanceMethod(targetClass, originalSelector),
               let swizzledMethod = class_getInstanceMethod(targetClass, swizzledSelector) else {
             return
@@ -601,7 +601,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
     private static let didInstallWindowSendEventSwizzle: Void = {
         let targetClass: AnyClass = NSWindow.self
         let originalSelector = #selector(NSWindow.sendEvent(_:))
-        let swizzledSelector = #selector(NSWindow.cmux_sendEvent(_:))
+        let swizzledSelector = #selector(NSWindow.termMesh_sendEvent(_:))
         guard let originalMethod = class_getInstanceMethod(targetClass, originalSelector),
               let swizzledMethod = class_getInstanceMethod(targetClass, swizzledSelector) else {
             return
@@ -619,8 +619,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
 
     private func childExitKeyboardProbePath() -> String? {
         let env = ProcessInfo.processInfo.environment
-        guard env["CMUX_UI_TEST_CHILD_EXIT_KEYBOARD_SETUP"] == "1",
-              let path = env["CMUX_UI_TEST_CHILD_EXIT_KEYBOARD_PATH"],
+        guard (env["TERMMESH_UI_TEST_CHILD_EXIT_KEYBOARD_SETUP"] ?? env["CMUX_UI_TEST_CHILD_EXIT_KEYBOARD_SETUP"]) == "1",
+              let path = (env["TERMMESH_UI_TEST_CHILD_EXIT_KEYBOARD_PATH"] ?? env["CMUX_UI_TEST_CHILD_EXIT_KEYBOARD_PATH"]),
               !path.isEmpty else {
             return nil
         }
@@ -732,7 +732,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
             configureUserNotifications()
             setupMenuBarExtra()
             // Sparkle updater is started lazily on first manual check. This avoids any
-            // first-launch permission prompts and keeps cmux aligned with the update pill UI.
+            // first-launch permission prompts and keeps term-mesh aligned with the update pill UI.
         }
         titlebarAccessoryController.start()
         windowDecorationsController.start()
@@ -751,12 +751,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         }
 #if DEBUG
         UpdateTestSupport.applyIfNeeded(to: updateController.viewModel)
-        if env["CMUX_UI_TEST_MODE"] == "1" {
-            let trigger = env["CMUX_UI_TEST_TRIGGER_UPDATE_CHECK"] ?? "<nil>"
-            let feed = env["CMUX_UI_TEST_FEED_URL"] ?? "<nil>"
+        if (env["TERMMESH_UI_TEST_MODE"] ?? env["CMUX_UI_TEST_MODE"]) == "1" {
+            let trigger = (env["TERMMESH_UI_TEST_TRIGGER_UPDATE_CHECK"] ?? env["CMUX_UI_TEST_TRIGGER_UPDATE_CHECK"]) ?? "<nil>"
+            let feed = (env["TERMMESH_UI_TEST_FEED_URL"] ?? env["CMUX_UI_TEST_FEED_URL"]) ?? "<nil>"
             UpdateLogStore.shared.append("ui test env: trigger=\(trigger) feed=\(feed)")
         }
-        if env["CMUX_UI_TEST_TRIGGER_UPDATE_CHECK"] == "1" {
+        if (env["TERMMESH_UI_TEST_TRIGGER_UPDATE_CHECK"] ?? env["CMUX_UI_TEST_TRIGGER_UPDATE_CHECK"]) == "1" {
             UpdateLogStore.shared.append("ui test trigger update check detected")
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) { [weak self] in
                 guard let self else { return }
@@ -787,7 +787,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
 #if DEBUG
     private func writeUITestDiagnosticsIfNeeded(stage: String) {
         let env = ProcessInfo.processInfo.environment
-        guard let path = env["CMUX_UI_TEST_DIAGNOSTICS_PATH"], !path.isEmpty else { return }
+        guard let path = (env["TERMMESH_UI_TEST_DIAGNOSTICS_PATH"] ?? env["CMUX_UI_TEST_DIAGNOSTICS_PATH"]), !path.isEmpty else { return }
 
         var payload = loadUITestDiagnostics(at: path)
         let isRunningUnderXCTest = isRunningUnderXCTest(env)
@@ -1111,7 +1111,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
            let window = ctx.window {
             return window
         }
-        let expectedIdentifier = "cmux.main.\(windowId.uuidString)"
+        let expectedIdentifier = "term-mesh.main.\(windowId.uuidString)"
         return NSApp.windows.first(where: { $0.identifier?.rawValue == expectedIdentifier })
     }
 
@@ -1120,8 +1120,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
             return context.windowId
         }
         guard let rawIdentifier = window.identifier?.rawValue,
-              rawIdentifier.hasPrefix("cmux.main.") else { return nil }
-        let idPart = String(rawIdentifier.dropFirst("cmux.main.".count))
+              rawIdentifier.hasPrefix("term-mesh.main.") else { return nil }
+        let idPart = String(rawIdentifier.dropFirst("term-mesh.main.".count))
         return UUID(uuidString: idPart)
     }
 
@@ -1708,7 +1708,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         guard !didSetupJumpUnreadUITest else { return }
         didSetupJumpUnreadUITest = true
         let env = ProcessInfo.processInfo.environment
-        guard env["CMUX_UI_TEST_JUMP_UNREAD_SETUP"] == "1" else { return }
+        guard (env["TERMMESH_UI_TEST_JUMP_UNREAD_SETUP"] ?? env["CMUX_UI_TEST_JUMP_UNREAD_SETUP"]) == "1" else { return }
         guard let notificationStore else { return }
 
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) { [weak self] in
@@ -1778,7 +1778,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
 
     func armJumpUnreadFocusRecord(tabId: UUID, surfaceId: UUID) {
         let env = ProcessInfo.processInfo.environment
-        guard let path = env["CMUX_UI_TEST_JUMP_UNREAD_PATH"], !path.isEmpty else { return }
+        guard let path = (env["TERMMESH_UI_TEST_JUMP_UNREAD_PATH"] ?? env["CMUX_UI_TEST_JUMP_UNREAD_PATH"]), !path.isEmpty else { return }
         jumpUnreadFocusExpectation = (tabId: tabId, surfaceId: surfaceId)
         installJumpUnreadFocusObserverIfNeeded()
     }
@@ -1810,7 +1810,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
 
     private func writeJumpUnreadTestData(_ updates: [String: String]) {
         let env = ProcessInfo.processInfo.environment
-        guard let path = env["CMUX_UI_TEST_JUMP_UNREAD_PATH"], !path.isEmpty else { return }
+        guard let path = (env["TERMMESH_UI_TEST_JUMP_UNREAD_PATH"] ?? env["CMUX_UI_TEST_JUMP_UNREAD_PATH"]), !path.isEmpty else { return }
         var payload = loadJumpUnreadTestData(at: path)
         for (key, value) in updates {
             payload[key] = value
@@ -1831,10 +1831,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         guard !didSetupGotoSplitUITest else { return }
         didSetupGotoSplitUITest = true
         let env = ProcessInfo.processInfo.environment
-        guard env["CMUX_UI_TEST_GOTO_SPLIT_SETUP"] == "1" else { return }
+        guard (env["TERMMESH_UI_TEST_GOTO_SPLIT_SETUP"] ?? env["CMUX_UI_TEST_GOTO_SPLIT_SETUP"]) == "1" else { return }
         guard tabManager != nil else { return }
 
-        let useGhosttyConfig = env["CMUX_UI_TEST_GOTO_SPLIT_USE_GHOSTTY_CONFIG"] == "1"
+        let useGhosttyConfig = (env["TERMMESH_UI_TEST_GOTO_SPLIT_USE_GHOSTTY_CONFIG"] ?? env["CMUX_UI_TEST_GOTO_SPLIT_USE_GHOSTTY_CONFIG"]) == "1"
 
         if useGhosttyConfig {
             // Keep the test hermetic: ensure the app does not accidentally pass using a persisted
@@ -1857,7 +1857,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         func hasMainTerminalWindow() -> Bool {
             NSApp.windows.contains { window in
                 guard let raw = window.identifier?.rawValue else { return false }
-                return raw == "cmux.main" || raw.hasPrefix("cmux.main.")
+                return raw == "term-mesh.main" || raw.hasPrefix("term-mesh.main.")
             }
         }
 
@@ -2022,7 +2022,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
 
     private func recordGotoSplitMoveIfNeeded(direction: NavigationDirection) {
         let env = ProcessInfo.processInfo.environment
-        guard env["CMUX_UI_TEST_GOTO_SPLIT_SETUP"] == "1" else { return }
+        guard (env["TERMMESH_UI_TEST_GOTO_SPLIT_SETUP"] ?? env["CMUX_UI_TEST_GOTO_SPLIT_SETUP"]) == "1" else { return }
         guard let tabManager,
               let focusedPaneId = tabManager.selectedWorkspace?.bonsplitController.focusedPaneId else { return }
 
@@ -2046,7 +2046,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
 
     private func recordGotoSplitSplitIfNeeded(direction: SplitDirection) {
         let env = ProcessInfo.processInfo.environment
-        guard env["CMUX_UI_TEST_GOTO_SPLIT_SETUP"] == "1" else { return }
+        guard (env["TERMMESH_UI_TEST_GOTO_SPLIT_SETUP"] ?? env["CMUX_UI_TEST_GOTO_SPLIT_SETUP"]) == "1" else { return }
         guard let workspace = tabManager?.selectedWorkspace else { return }
 
         let directionValue: String
@@ -2070,7 +2070,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
 
     private func writeGotoSplitTestData(_ updates: [String: String]) {
         let env = ProcessInfo.processInfo.environment
-        guard let path = env["CMUX_UI_TEST_GOTO_SPLIT_PATH"], !path.isEmpty else { return }
+        guard let path = (env["TERMMESH_UI_TEST_GOTO_SPLIT_PATH"] ?? env["CMUX_UI_TEST_GOTO_SPLIT_PATH"]), !path.isEmpty else { return }
         var payload = loadGotoSplitTestData(at: path)
         for (key, value) in updates {
             payload[key] = value
@@ -2092,8 +2092,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         didSetupMultiWindowNotificationsUITest = true
 
         let env = ProcessInfo.processInfo.environment
-        guard env["CMUX_UI_TEST_MULTI_WINDOW_NOTIF_SETUP"] == "1" else { return }
-        guard let path = env["CMUX_UI_TEST_MULTI_WINDOW_NOTIF_PATH"], !path.isEmpty else { return }
+        guard (env["TERMMESH_UI_TEST_MULTI_WINDOW_NOTIF_SETUP"] ?? env["CMUX_UI_TEST_MULTI_WINDOW_NOTIF_SETUP"]) == "1" else { return }
+        guard let path = (env["TERMMESH_UI_TEST_MULTI_WINDOW_NOTIF_PATH"] ?? env["CMUX_UI_TEST_MULTI_WINDOW_NOTIF_PATH"]), !path.isEmpty else { return }
 
         try? FileManager.default.removeItem(atPath: path)
 
@@ -2180,7 +2180,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         sidebarSelection: SidebarSelection
     ) {
         let env = ProcessInfo.processInfo.environment
-        guard let path = env["CMUX_UI_TEST_MULTI_WINDOW_NOTIF_PATH"], !path.isEmpty else { return }
+        guard let path = (env["TERMMESH_UI_TEST_MULTI_WINDOW_NOTIF_PATH"] ?? env["CMUX_UI_TEST_MULTI_WINDOW_NOTIF_PATH"]), !path.isEmpty else { return }
         let sidebarSelectionString: String = {
             switch sidebarSelection {
             case .tabs: return "tabs"
@@ -2213,7 +2213,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
     func jumpToLatestUnread() {
         guard let notificationStore else { return }
 #if DEBUG
-        if ProcessInfo.processInfo.environment["CMUX_UI_TEST_JUMP_UNREAD_SETUP"] == "1" {
+        if termMeshEnv("UI_TEST_JUMP_UNREAD_SETUP") == "1" {
             writeJumpUnreadTestData([
                 "jumpUnreadInvoked": "1",
                 "jumpUnreadNotificationCount": String(notificationStore.notifications.count),
@@ -2238,13 +2238,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
 
 #if DEBUG
     static func setWindowFirstResponderGuardTesting(currentEvent: NSEvent?, hitView: NSView?) {
-        cmuxFirstResponderGuardCurrentEventOverride = currentEvent
-        cmuxFirstResponderGuardHitViewOverride = hitView
+        termMeshFirstResponderGuardCurrentEventOverride = currentEvent
+        termMeshFirstResponderGuardHitViewOverride = hitView
     }
 
     static func clearWindowFirstResponderGuardTesting() {
-        cmuxFirstResponderGuardCurrentEventOverride = nil
-        cmuxFirstResponderGuardHitViewOverride = nil
+        termMeshFirstResponderGuardCurrentEventOverride = nil
+        termMeshFirstResponderGuardHitViewOverride = nil
     }
 #endif
 
@@ -2260,8 +2260,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
             guard let self else { return event }
             if event.type == .keyDown {
 #if DEBUG
-                if (ProcessInfo.processInfo.environment["CMUX_KEY_LATENCY_PROBE"] == "1"
-                    || UserDefaults.standard.bool(forKey: "cmuxKeyLatencyProbe")),
+                if (termMeshEnv("KEY_LATENCY_PROBE") == "1"
+                    || UserDefaults.standard.bool(forKey: "termMeshKeyLatencyProbe")),
                    event.timestamp > 0 {
                     let delayMs = max(0, (ProcessInfo.processInfo.systemUptime - event.timestamp) * 1000)
                     let delayText = String(format: "%.2f", delayMs)
@@ -2457,7 +2457,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
 
         let alert = NSAlert()
         alert.alertStyle = .warning
-        alert.messageText = "Quit cmux?"
+        alert.messageText = "Quit term-mesh?"
         alert.informativeText = "This will close all windows and workspaces."
         alert.addButton(withTitle: "Quit")
         alert.addButton(withTitle: "Cancel")
@@ -2597,7 +2597,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
 
         // When the terminal has active IME composition (e.g. Korean, Japanese, Chinese
         // input), don't intercept key events — let them flow through to the input method.
-        if let ghosttyView = cmuxOwningGhosttyView(for: NSApp.keyWindow?.firstResponder),
+        if let ghosttyView = termMeshOwningGhosttyView(for: NSApp.keyWindow?.firstResponder),
            ghosttyView.hasMarkedText() {
             return false
         }
@@ -2642,7 +2642,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         // (e.g., split that doesn't properly blur the address bar). If the first responder
         // is a terminal surface, the address bar can't be focused.
         if browserAddressBarFocusedPanelId != nil,
-           cmuxOwningGhosttyView(for: NSApp.keyWindow?.firstResponder) != nil {
+           termMeshOwningGhosttyView(for: NSApp.keyWindow?.firstResponder) != nil {
 #if DEBUG
             dlog("handleCustomShortcut: clearing stale browserAddressBarFocusedPanelId")
 #endif
@@ -2711,7 +2711,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         // Check Jump to Unread shortcut
         if matchShortcut(event: event, shortcut: KeyboardShortcutSettings.shortcut(for: .jumpToUnread)) {
 #if DEBUG
-            if ProcessInfo.processInfo.environment["CMUX_UI_TEST_JUMP_UNREAD_SETUP"] == "1" {
+            if termMeshEnv("UI_TEST_JUMP_UNREAD_SETUP") == "1" {
                 writeJumpUnreadTestData(["jumpUnreadShortcutHandled": "1"])
             }
 #endif
@@ -3792,7 +3792,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
             return true
         }
         guard let raw = window.identifier?.rawValue else { return false }
-        return raw == "cmux.main" || raw.hasPrefix("cmux.main.")
+        return raw == "term-mesh.main" || raw.hasPrefix("term-mesh.main.")
     }
 
     private func contextContainingTabId(_ tabId: UUID) -> MainWindowContext? {
@@ -3811,7 +3811,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
 
     func closeMainWindowContainingTabId(_ tabId: UUID) {
         guard let context = contextContainingTabId(tabId) else { return }
-        let expectedIdentifier = "cmux.main.\(context.windowId.uuidString)"
+        let expectedIdentifier = "term-mesh.main.\(context.windowId.uuidString)"
         let window: NSWindow? = context.window ?? NSApp.windows.first(where: { $0.identifier?.rawValue == expectedIdentifier })
         window?.performClose(nil)
     }
@@ -3819,7 +3819,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
     @discardableResult
     func openNotification(tabId: UUID, surfaceId: UUID?, notificationId: UUID?) -> Bool {
 #if DEBUG
-        let isJumpUnreadUITest = ProcessInfo.processInfo.environment["CMUX_UI_TEST_JUMP_UNREAD_SETUP"] == "1"
+        let isJumpUnreadUITest = termMeshEnv("UI_TEST_JUMP_UNREAD_SETUP") == "1"
         if isJumpUnreadUITest {
             writeJumpUnreadTestData([
                 "jumpUnreadOpenCalled": "1",
@@ -3859,7 +3859,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
     }
 
     private func openNotificationInContext(_ context: MainWindowContext, tabId: UUID, surfaceId: UUID?, notificationId: UUID?) -> Bool {
-        let expectedIdentifier = "cmux.main.\(context.windowId.uuidString)"
+        let expectedIdentifier = "term-mesh.main.\(context.windowId.uuidString)"
         let window: NSWindow? = context.window ?? NSApp.windows.first(where: { $0.identifier?.rawValue == expectedIdentifier })
         guard let window else {
 #if DEBUG
@@ -3904,7 +3904,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
             surfaceId: surfaceId,
             sidebarSelection: context.sidebarSelectionState.selection
         )
-        if ProcessInfo.processInfo.environment["CMUX_UI_TEST_JUMP_UNREAD_SETUP"] == "1" {
+        if termMeshEnv("UI_TEST_JUMP_UNREAD_SETUP") == "1" {
             writeJumpUnreadTestData(["jumpUnreadOpenInContext": "1", "jumpUnreadOpenResult": "1"])
         }
 #endif
@@ -3915,7 +3915,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         // If the owning window context hasn't been registered yet, fall back to the "active" window.
         guard let tabManager else {
 #if DEBUG
-            if ProcessInfo.processInfo.environment["CMUX_UI_TEST_JUMP_UNREAD_SETUP"] == "1" {
+            if termMeshEnv("UI_TEST_JUMP_UNREAD_SETUP") == "1" {
                 writeJumpUnreadTestData(["jumpUnreadFallbackFail": "missing_tabManager"])
             }
 #endif
@@ -3923,7 +3923,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         }
         guard tabManager.tabs.contains(where: { $0.id == tabId }) else {
 #if DEBUG
-            if ProcessInfo.processInfo.environment["CMUX_UI_TEST_JUMP_UNREAD_SETUP"] == "1" {
+            if termMeshEnv("UI_TEST_JUMP_UNREAD_SETUP") == "1" {
                 writeJumpUnreadTestData(["jumpUnreadFallbackFail": "tab_not_in_active_manager"])
             }
 #endif
@@ -3931,7 +3931,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         }
         guard let window = (NSApp.keyWindow ?? NSApp.windows.first(where: { isMainTerminalWindow($0) })) else {
 #if DEBUG
-            if ProcessInfo.processInfo.environment["CMUX_UI_TEST_JUMP_UNREAD_SETUP"] == "1" {
+            if termMeshEnv("UI_TEST_JUMP_UNREAD_SETUP") == "1" {
                 writeJumpUnreadTestData(["jumpUnreadFallbackFail": "missing_window"])
             }
 #endif
@@ -3960,7 +3960,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
             )
         }
 #if DEBUG
-        if ProcessInfo.processInfo.environment["CMUX_UI_TEST_JUMP_UNREAD_SETUP"] == "1" {
+        if termMeshEnv("UI_TEST_JUMP_UNREAD_SETUP") == "1" {
             writeJumpUnreadTestData(["jumpUnreadOpenInFallback": "1", "jumpUnreadOpenResult": "1"])
         }
 #endif
@@ -3975,7 +3975,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         attempt: Int = 0
     ) {
         let env = ProcessInfo.processInfo.environment
-        guard env["CMUX_UI_TEST_JUMP_UNREAD_SETUP"] == "1" else { return }
+        guard (env["TERMMESH_UI_TEST_JUMP_UNREAD_SETUP"] ?? env["CMUX_UI_TEST_JUMP_UNREAD_SETUP"]) == "1" else { return }
         guard let expectedSurfaceId else { return }
 
         // Ensure the expectation is armed even if the view doesn't become first responder.
@@ -4042,7 +4042,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         reason: String
     ) {
         let env = ProcessInfo.processInfo.environment
-        guard let path = env["CMUX_UI_TEST_MULTI_WINDOW_NOTIF_PATH"], !path.isEmpty else { return }
+        guard let path = (env["TERMMESH_UI_TEST_MULTI_WINDOW_NOTIF_PATH"] ?? env["CMUX_UI_TEST_MULTI_WINDOW_NOTIF_PATH"]), !path.isEmpty else { return }
 
         let contextSummaries: [String] = mainWindowContexts.values.map { ctx in
             let tabIds = ctx.tabManager.tabs.map { $0.id.uuidString }.joined(separator: ",")
@@ -4066,7 +4066,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
 @MainActor
 final class MenuBarExtraController: NSObject, NSMenuDelegate {
     private let statusItem: NSStatusItem
-    private let menu = NSMenu(title: "cmux")
+    private let menu = NSMenu(title: "term-mesh")
     private let notificationStore: TerminalNotificationStore
     private let onShowNotifications: () -> Void
     private let onOpenNotification: (TerminalNotification) -> Void
@@ -4087,7 +4087,7 @@ final class MenuBarExtraController: NSObject, NSMenuDelegate {
     private let clearAllItem = NSMenuItem(title: "Clear All", action: nil, keyEquivalent: "")
     private let checkForUpdatesItem = NSMenuItem(title: "Check for Updates…", action: nil, keyEquivalent: "")
     private let preferencesItem = NSMenuItem(title: "Preferences…", action: nil, keyEquivalent: "")
-    private let quitItem = NSMenuItem(title: "Quit cmux", action: nil, keyEquivalent: "")
+    private let quitItem = NSMenuItem(title: "Quit term-mesh", action: nil, keyEquivalent: "")
 
     private var notificationItems: [NSMenuItem] = []
     private let maxInlineNotificationItems = 6
@@ -4118,7 +4118,7 @@ final class MenuBarExtraController: NSObject, NSMenuDelegate {
             button.imagePosition = .imageOnly
             button.imageScaling = .scaleProportionallyDown
             button.image = MenuBarIconRenderer.makeImage(unreadCount: 0)
-            button.toolTip = "cmux"
+            button.toolTip = "term-mesh"
         }
 
         notificationsCancellable = notificationStore.$notifications
@@ -4215,8 +4215,8 @@ final class MenuBarExtraController: NSObject, NSMenuDelegate {
         if let button = statusItem.button {
             button.image = MenuBarIconRenderer.makeImage(unreadCount: displayedUnreadCount)
             button.toolTip = displayedUnreadCount == 0
-                ? "cmux"
-                : "cmux: \(displayedUnreadCount) unread notification\(displayedUnreadCount == 1 ? "" : "s")"
+                ? "term-mesh"
+                : "term-mesh: \(displayedUnreadCount) unread notification\(displayedUnreadCount == 1 ? "" : "s")"
         }
     }
 
@@ -4647,7 +4647,7 @@ enum MenuBarIconRenderer {
     }
 
     private static func drawGlyph(in rect: NSRect) {
-        // Match the canonical cmux center-mark path from Icon Center Image Artwork.svg.
+        // Match the canonical term-mesh center-mark path from Icon Center Image Artwork.svg.
         let srcMinX: CGFloat = 384.0
         let srcMinY: CGFloat = 255.0
         let srcWidth: CGFloat = 369.0
@@ -4698,12 +4698,12 @@ enum MenuBarIconRenderer {
 
 
 #if DEBUG
-private var cmuxFirstResponderGuardCurrentEventOverride: NSEvent?
-private var cmuxFirstResponderGuardHitViewOverride: NSView?
+private var termMeshFirstResponderGuardCurrentEventOverride: NSEvent?
+private var termMeshFirstResponderGuardHitViewOverride: NSView?
 #endif
 
 private extension NSWindow {
-    @objc func cmux_makeFirstResponder(_ responder: NSResponder?) -> Bool {
+    @objc func termMesh_makeFirstResponder(_ responder: NSResponder?) -> Bool {
         if AppDelegate.shared?.shouldBlockFirstResponderChangeWhileCommandPaletteVisible(
             window: self,
             responder: responder
@@ -4718,10 +4718,10 @@ private extension NSWindow {
         }
 
         if let responder,
-           let webView = Self.cmuxOwningWebView(for: responder),
+           let webView = Self.termMeshOwningWebView(for: responder),
            !webView.allowsFirstResponderAcquisitionEffective {
-            let currentEvent = Self.cmuxCurrentEvent(for: self)
-            let pointerInitiatedFocus = Self.cmuxShouldAllowPointerInitiatedWebViewFocus(
+            let currentEvent = Self.termMeshCurrentEvent(for: self)
+            let pointerInitiatedFocus = Self.termMeshShouldAllowPointerInitiatedWebViewFocus(
                 window: self,
                 webView: webView,
                 event: currentEvent
@@ -4753,7 +4753,7 @@ private extension NSWindow {
         }
 #if DEBUG
         if let responder,
-           let webView = Self.cmuxOwningWebView(for: responder) {
+           let webView = Self.termMeshOwningWebView(for: responder) {
             dlog(
                 "focus.guard allowFirstResponder responder=\(String(describing: type(of: responder))) " +
                 "window=\(ObjectIdentifier(self)) " +
@@ -4763,13 +4763,13 @@ private extension NSWindow {
             )
         }
 #endif
-        return cmux_makeFirstResponder(responder)
+        return termMesh_makeFirstResponder(responder)
     }
 
-    @objc func cmux_sendEvent(_ event: NSEvent) {
+    @objc func termMesh_sendEvent(_ event: NSEvent) {
         guard shouldSuppressWindowMoveForFolderDrag(window: self, event: event),
               let contentView = self.contentView else {
-            cmux_sendEvent(event)
+            termMesh_sendEvent(event)
             return
         }
 
@@ -4785,7 +4785,7 @@ private extension NSWindow {
         dlog("window.sendEvent.folderDown suppress=1 hit=\(hitDesc) wasMovable=\(previousMovableState)")
         #endif
 
-        cmux_sendEvent(event)
+        termMesh_sendEvent(event)
 
         if previousMovableState {
             isMovable = previousMovableState
@@ -4796,7 +4796,7 @@ private extension NSWindow {
         #endif
     }
 
-    @objc func cmux_performKeyEquivalent(with event: NSEvent) -> Bool {
+    @objc func termMesh_performKeyEquivalent(with event: NSEvent) -> Bool {
 #if DEBUG
         let frType = self.firstResponder.map { String(describing: type(of: $0)) } ?? "nil"
         dlog("performKeyEquiv: \(Self.keyDescription(event)) fr=\(frType)")
@@ -4817,12 +4817,12 @@ private extension NSWindow {
         // Command shortcuts when the terminal is focused — the local event monitor
         // (handleCustomShortcut) already handles app-level shortcuts, and anything
         // remaining should be menu items.
-        let firstResponderGhosttyView = cmuxOwningGhosttyView(for: self.firstResponder)
+        let firstResponderGhosttyView = termMeshOwningGhosttyView(for: self.firstResponder)
         if let ghosttyView = firstResponderGhosttyView {
             // If the IME is composing, don't intercept key events — let them flow
             // through normal AppKit event dispatch so the input method can process them.
             if ghosttyView.hasMarkedText() {
-                return cmux_performKeyEquivalent(with: event)
+                return termMesh_performKeyEquivalent(with: event)
             }
 
             let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
@@ -4887,7 +4887,7 @@ private extension NSWindow {
             }
         }
 
-        let result = cmux_performKeyEquivalent(with: event)
+        let result = termMesh_performKeyEquivalent(with: event)
 #if DEBUG
         if result { dlog("  → consumed by original performKeyEquivalent") }
 #endif
@@ -4906,29 +4906,29 @@ private extension NSWindow {
         return parts.joined(separator: "+")
     }
 
-    private static func cmuxOwningWebView(for responder: NSResponder) -> CmuxWebView? {
-        if let webView = responder as? CmuxWebView {
+    private static func termMeshOwningWebView(for responder: NSResponder) -> TermMeshWebView? {
+        if let webView = responder as? TermMeshWebView {
             return webView
         }
 
         if let view = responder as? NSView,
-           let webView = cmuxOwningWebView(for: view) {
+           let webView = termMeshOwningWebView(for: view) {
             return webView
         }
 
         if let textView = responder as? NSTextView,
            let delegateView = textView.delegate as? NSView,
-           let webView = cmuxOwningWebView(for: delegateView) {
+           let webView = termMeshOwningWebView(for: delegateView) {
             return webView
         }
 
         var current = responder.nextResponder
         while let next = current {
-            if let webView = next as? CmuxWebView {
+            if let webView = next as? TermMeshWebView {
                 return webView
             }
             if let view = next as? NSView,
-               let webView = cmuxOwningWebView(for: view) {
+               let webView = termMeshOwningWebView(for: view) {
                 return webView
             }
             current = next.nextResponder
@@ -4937,14 +4937,14 @@ private extension NSWindow {
         return nil
     }
 
-    private static func cmuxOwningWebView(for view: NSView) -> CmuxWebView? {
-        if let webView = view as? CmuxWebView {
+    private static func termMeshOwningWebView(for view: NSView) -> TermMeshWebView? {
+        if let webView = view as? TermMeshWebView {
             return webView
         }
 
         var current: NSView? = view.superview
         while let candidate = current {
-            if let webView = candidate as? CmuxWebView {
+            if let webView = candidate as? TermMeshWebView {
                 return webView
             }
             current = candidate.superview
@@ -4953,27 +4953,27 @@ private extension NSWindow {
         return nil
     }
 
-    private static func cmuxCurrentEvent(for _: NSWindow) -> NSEvent? {
+    private static func termMeshCurrentEvent(for _: NSWindow) -> NSEvent? {
 #if DEBUG
-        if let override = cmuxFirstResponderGuardCurrentEventOverride {
+        if let override = termMeshFirstResponderGuardCurrentEventOverride {
             return override
         }
 #endif
         return NSApp.currentEvent
     }
 
-    private static func cmuxHitViewForCurrentEvent(in window: NSWindow, event: NSEvent) -> NSView? {
+    private static func termMeshHitViewForCurrentEvent(in window: NSWindow, event: NSEvent) -> NSView? {
 #if DEBUG
-        if let override = cmuxFirstResponderGuardHitViewOverride {
+        if let override = termMeshFirstResponderGuardHitViewOverride {
             return override
         }
 #endif
         return window.contentView?.hitTest(event.locationInWindow)
     }
 
-    private static func cmuxShouldAllowPointerInitiatedWebViewFocus(
+    private static func termMeshShouldAllowPointerInitiatedWebViewFocus(
         window: NSWindow,
-        webView: CmuxWebView,
+        webView: TermMeshWebView,
         event: NSEvent?
     ) -> Bool {
         guard let event else { return false }
@@ -4991,8 +4991,8 @@ private extension NSWindow {
             return false
         }
 
-        guard let hitView = cmuxHitViewForCurrentEvent(in: window, event: event),
-              let hitWebView = cmuxOwningWebView(for: hitView) else {
+        guard let hitView = termMeshHitViewForCurrentEvent(in: window, event: event),
+              let hitWebView = termMeshOwningWebView(for: hitView) else {
             return false
         }
         return hitWebView === webView

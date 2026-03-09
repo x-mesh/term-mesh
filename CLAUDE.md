@@ -1,4 +1,4 @@
-# cmux agent notes
+# term-mesh agent notes
 
 ## Initial setup
 
@@ -19,7 +19,7 @@ After making code changes, always run the reload script with a tag to launch the
 After making code changes, always run the build:
 
 ```bash
-xcodebuild -project GhosttyTabs.xcodeproj -scheme cmux -configuration Debug -destination 'platform=macOS' build
+xcodebuild -project GhosttyTabs.xcodeproj -scheme term-mesh -configuration Debug -destination 'platform=macOS' build
 ```
 
 When rebuilding GhosttyKit.xcframework, always use Release optimizations:
@@ -28,7 +28,7 @@ When rebuilding GhosttyKit.xcframework, always use Release optimizations:
 cd ghostty && zig build -Demit-xcframework=true -Doptimize=ReleaseFast
 ```
 
-When rebuilding term-meshd (the Rust daemon, formerly cmuxd):
+When rebuilding term-meshd (the Rust daemon):
 
 ```bash
 cd daemon && cargo build --release
@@ -46,7 +46,7 @@ cd daemon && cargo build --release
 ./scripts/reloadp.sh
 ```
 
-`reloads` = kill and launch the Release app as "cmux STAGING" (isolated from production cmux):
+`reloads` = kill and launch the Release app as "term-mesh STAGING" (isolated from production term-mesh):
 
 ```bash
 ./scripts/reloads.sh
@@ -73,12 +73,12 @@ Before launching a new tagged run, clean up any older tags you started in this s
 All debug events (keys, mouse, focus, splits, tabs) go to a unified log in DEBUG builds:
 
 ```bash
-tail -f "$(cat /tmp/cmux-last-debug-log-path 2>/dev/null || echo /tmp/cmux-debug.log)"
+tail -f "$(cat /tmp/term-mesh-last-debug-log-path 2>/dev/null || echo /tmp/term-mesh-debug.log)"
 ```
 
-- Untagged Debug app: `/tmp/cmux-debug.log`
-- Tagged Debug app (`./scripts/reload.sh --tag <tag>`): `/tmp/cmux-debug-<tag>.log`
-- `reload.sh` writes the current path to `/tmp/cmux-last-debug-log-path`
+- Untagged Debug app: `/tmp/term-mesh-debug.log`
+- Tagged Debug app (`./scripts/reload.sh --tag <tag>`): `/tmp/term-mesh-debug-<tag>.log`
+- `reload.sh` writes the current path to `/tmp/term-mesh-last-debug-log-path`
 
 - Implementation: `vendor/bonsplit/Sources/Bonsplit/Public/DebugEventLog.swift`
 - Free function `dlog("message")` — logs with timestamp and appends to file in real time
@@ -91,7 +91,7 @@ tail -f "$(cat /tmp/cmux-last-debug-log-path 2>/dev/null || echo /tmp/cmux-debug
 
 ## Pitfalls
 
-- **Custom UTTypes** for drag-and-drop must be declared in `Resources/Info.plist` under `UTExportedTypeDeclarations` (e.g. `com.splittabbar.tabtransfer`, `com.cmux.sidebar-tab-reorder`).
+- **Custom UTTypes** for drag-and-drop must be declared in `Resources/Info.plist` under `UTExportedTypeDeclarations` (e.g. `com.splittabbar.tabtransfer`, `com.termmesh.sidebar-tab-reorder`).
 - Do not add an app-level display link or manual `ghostty_surface_draw` loop; rely on Ghostty wakeups/renderer to avoid typing lag.
 - **Terminal find layering contract:** `SurfaceSearchOverlay` must be mounted from `GhosttySurfaceScrollView` in `Sources/GhosttyTerminalView.swift` (AppKit portal layer), not from SwiftUI panel containers such as `Sources/Panels/TerminalPanelView.swift`. Portal-hosted terminal views can sit above SwiftUI during split/workspace churn.
 - **Submodule safety:** When modifying a submodule (ghostty, vendor/bonsplit, etc.), always push the submodule commit to its remote `main` branch BEFORE committing the updated pointer in the parent repo. Never commit on a detached HEAD or temporary branch — the commit will be orphaned and lost. Verify with: `cd <submodule> && git merge-base --is-ancestor HEAD origin/main`.
@@ -112,19 +112,19 @@ tail -f "$(cat /tmp/cmux-last-debug-log-path 2>/dev/null || echo /tmp/cmux-debug
 - Only explicit focus-intent commands may mutate in-app focus/selection (`window.focus`, `workspace.select/next/previous/last`, `surface.focus`, `pane.focus/last`, browser focus commands, and v1 focus equivalents).
 - All non-focus commands should preserve current user focus context while still applying data/model changes.
 
-## Team agent system (OMC → cmux integration)
+## Team agent system (OMC → term-mesh integration)
 
-When using multi-agent teams inside cmux (e.g., via OMC `/team` skill or manual team creation),
-**always use cmux's native team API** via `scripts/team.py` instead of Claude Code's built-in
+When using multi-agent teams inside term-mesh (e.g., via OMC `/team` skill or manual team creation),
+**always use term-mesh's native team API** via `scripts/team.py` instead of Claude Code's built-in
 Team/Task tools (`TeamCreate`, `SendMessage`, `TaskCreate`, etc.).
 
-cmux's team system provides GPU-accelerated terminal panes, pane buffer reading, and socket-based
+term-mesh's team system provides GPU-accelerated terminal panes, pane buffer reading, and socket-based
 bidirectional communication — capabilities that Claude Code's native team API does not have.
 
 ### CLI reference
 
 ```bash
-# Create team (agents get split panes in cmux)
+# Create team (agents get split panes in term-mesh)
 ./scripts/team.py create [N] [--claude-leader]
 
 # Send commands to agents
@@ -149,7 +149,7 @@ bidirectional communication — capabilities that Claude Code's native team API 
 ### When OMC `/team` skill is triggered
 
 If the OMC keyword detector fires `[MAGIC KEYWORD: TEAM]`, the LLM should:
-1. Use `./scripts/team.py create` to spawn agents in cmux panes (NOT `TeamCreate`)
+1. Use `./scripts/team.py create` to spawn agents in term-mesh panes (NOT `TeamCreate`)
 2. Use `./scripts/team.py send` to assign work (NOT `SendMessage`)
 3. Use `./scripts/team.py read/collect/wait` to get results (NOT poll via `TaskGet`)
 4. Use `./scripts/team.py task` for task tracking (NOT `TaskCreate/TaskList`)
@@ -162,7 +162,7 @@ This ensures a single team infrastructure with no state duplication.
 Run UI tests on the UTM macOS VM (never on the host machine). Always run e2e UI tests via `ssh cmux-vm`:
 
 ```bash
-ssh cmux-vm 'cd /Users/cmux/GhosttyTabs && xcodebuild -project GhosttyTabs.xcodeproj -scheme cmux -configuration Debug -destination "platform=macOS" -only-testing:cmuxUITests/UpdatePillUITests test'
+ssh cmux-vm 'cd /Users/cmux/GhosttyTabs && xcodebuild -project GhosttyTabs.xcodeproj -scheme term-mesh -configuration Debug -destination "platform=macOS" -only-testing:termMeshUITests/UpdatePillUITests test'
 ```
 
 ## Basic tests
@@ -170,7 +170,7 @@ ssh cmux-vm 'cd /Users/cmux/GhosttyTabs && xcodebuild -project GhosttyTabs.xcode
 Run basic automated tests on the UTM macOS VM (never on the host machine):
 
 ```bash
-ssh cmux-vm 'cd /Users/cmux/GhosttyTabs && xcodebuild -project GhosttyTabs.xcodeproj -scheme cmux -configuration Debug -destination "platform=macOS" build && pkill -x "cmux DEV" || true && APP=$(find /Users/cmux/Library/Developer/Xcode/DerivedData -path "*/Build/Products/Debug/cmux DEV.app" -print -quit) && open "$APP" --env CMUX_SOCKET_MODE=allowAll && for i in {1..20}; do [ -S /tmp/cmux-debug.sock ] && break; sleep 0.5; done && python3 tests/test_update_timing.py && python3 tests/test_signals_auto.py && python3 tests/test_ctrl_socket.py && python3 tests/test_notifications.py'
+ssh cmux-vm 'cd /Users/cmux/GhosttyTabs && xcodebuild -project GhosttyTabs.xcodeproj -scheme term-mesh -configuration Debug -destination "platform=macOS" build && pkill -x "term-mesh DEV" || true && APP=$(find /Users/cmux/Library/Developer/Xcode/DerivedData -path "*/Build/Products/Debug/term-mesh DEV.app" -print -quit) && open "$APP" --env TERMMESH_SOCKET_MODE=allowAll && for i in {1..20}; do [ -S /tmp/term-mesh-debug.sock ] && break; sleep 0.5; done && python3 tests/test_update_timing.py && python3 tests/test_signals_auto.py && python3 tests/test_ctrl_socket.py && python3 tests/test_notifications.py'
 ```
 
 ## Ghostty submodule workflow
@@ -230,13 +230,13 @@ Manual release steps (if not using the command):
 ```bash
 git tag vX.Y.Z
 git push origin vX.Y.Z
-gh run watch --repo manaflow-ai/cmux
+gh run watch --repo manaflow-ai/term-mesh
 ```
 
 Notes:
 - Requires GitHub secrets: `APPLE_CERTIFICATE_BASE64`, `APPLE_CERTIFICATE_PASSWORD`,
   `APPLE_SIGNING_IDENTITY`, `APPLE_ID`, `APPLE_APP_SPECIFIC_PASSWORD`, `APPLE_TEAM_ID`.
-- The release asset is `cmux-macos.dmg` attached to the tag.
-- README download button points to `releases/latest/download/cmux-macos.dmg`.
+- The release asset is `term-mesh-macos.dmg` attached to the tag.
+- README download button points to `releases/latest/download/term-mesh-macos.dmg`.
 - Versioning: bump the minor version for updates unless explicitly asked otherwise.
 - Changelog: always update both `CHANGELOG.md` and the docs-site version.

@@ -5,7 +5,7 @@ import Bonsplit
 import Combine
 import CoreText
 
-func cmuxSurfaceContextName(_ context: ghostty_surface_context_e) -> String {
+func termMeshSurfaceContextName(_ context: ghostty_surface_context_e) -> String {
     switch context {
     case GHOSTTY_SURFACE_CONTEXT_WINDOW:
         return "window"
@@ -18,7 +18,7 @@ func cmuxSurfaceContextName(_ context: ghostty_surface_context_e) -> String {
     }
 }
 
-func cmuxCurrentSurfaceFontSizePoints(_ surface: ghostty_surface_t) -> Float? {
+func termMeshCurrentSurfaceFontSizePoints(_ surface: ghostty_surface_t) -> Float? {
     guard let quicklookFont = ghostty_surface_quicklook_font(surface) else {
         return nil
     }
@@ -29,7 +29,7 @@ func cmuxCurrentSurfaceFontSizePoints(_ surface: ghostty_surface_t) -> Float? {
     return points
 }
 
-func cmuxInheritedSurfaceConfig(
+func termMeshInheritedSurfaceConfig(
     sourceSurface: ghostty_surface_t,
     context: ghostty_surface_context_e
 ) -> ghostty_surface_config_s {
@@ -38,7 +38,7 @@ func cmuxInheritedSurfaceConfig(
 
     // Make runtime zoom inheritance explicit, even when Ghostty's
     // inherit-font-size config is disabled.
-    let runtimePoints = cmuxCurrentSurfaceFontSizePoints(sourceSurface)
+    let runtimePoints = termMeshCurrentSurfaceFontSizePoints(sourceSurface)
     if let points = runtimePoints {
         config.font_size = points
     }
@@ -48,7 +48,7 @@ func cmuxInheritedSurfaceConfig(
     let runtimeText = runtimePoints.map { String(format: "%.2f", $0) } ?? "nil"
     let finalText = String(format: "%.2f", config.font_size)
     dlog(
-        "zoom.inherit context=\(cmuxSurfaceContextName(context)) " +
+        "zoom.inherit context=\(termMeshSurfaceContextName(context)) " +
         "inherited=\(inheritedText) runtime=\(runtimeText) final=\(finalText)"
     )
 #endif
@@ -299,7 +299,7 @@ final class Workspace: Identifiable, ObservableObject {
     @Published var customColor: String?  // hex string, e.g. "#C0392B"
     @Published var currentDirectory: String
 
-    /// Ordinal for CMUX_PORT range assignment (monotonically increasing per app session)
+    /// Ordinal for TERMMESH_PORT range assignment (monotonically increasing per app session)
     var portOrdinal: Int = 0
 
     /// term-mesh: Worktree metadata for auto-cleanup on tab close.
@@ -1006,7 +1006,7 @@ final class Workspace: Identifiable, ObservableObject {
         sourceSurface: ghostty_surface_t,
         inheritedConfig: ghostty_surface_config_s
     ) -> Float? {
-        let runtimePoints = cmuxCurrentSurfaceFontSizePoints(sourceSurface)
+        let runtimePoints = termMeshCurrentSurfaceFontSizePoints(sourceSurface)
         if let rooted = terminalInheritanceFontPointsByPanelId[terminalPanel.id], rooted > 0 {
             if let runtimePoints, abs(runtimePoints - rooted) > 0.05 {
                 // Runtime zoom changed after lineage was seeded (manual zoom on descendant);
@@ -1024,7 +1024,7 @@ final class Workspace: Identifiable, ObservableObject {
     private func rememberTerminalConfigInheritanceSource(_ terminalPanel: TerminalPanel) {
         lastTerminalConfigInheritancePanelId = terminalPanel.id
         if let sourceSurface = terminalPanel.surface.surface,
-           let runtimePoints = cmuxCurrentSurfaceFontSizePoints(sourceSurface) {
+           let runtimePoints = termMeshCurrentSurfaceFontSizePoints(sourceSurface) {
             let existing = terminalInheritanceFontPointsByPanelId[terminalPanel.id]
             if existing == nil || abs((existing ?? runtimePoints) - runtimePoints) > 0.05 {
                 terminalInheritanceFontPointsByPanelId[terminalPanel.id] = runtimePoints
@@ -1122,7 +1122,7 @@ final class Workspace: Identifiable, ObservableObject {
             inPane: preferredPaneId
         ) {
             guard let sourceSurface = terminalPanel.surface.surface else { continue }
-            var config = cmuxInheritedSurfaceConfig(
+            var config = termMeshInheritedSurfaceConfig(
                 sourceSurface: sourceSurface,
                 context: GHOSTTY_SURFACE_CONTEXT_SPLIT
             )
@@ -2725,7 +2725,7 @@ extension Workspace: BonsplitDelegate {
         // If the new pane already has a tab, this split moved an existing tab (drag-to-split).
         //
         // In the "drag the only tab to split edge" case, bonsplit inserts a placeholder "Empty"
-        // tab in the source pane to avoid leaving it tabless. In cmux, this is undesirable:
+        // tab in the source pane to avoid leaving it tabless. In term-mesh, this is undesirable:
         // it creates a pane with no real surfaces and leaves an "Empty" tab in the tab bar.
         //
         // Replace placeholder-only source panes with a real terminal surface, then drop the

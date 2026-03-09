@@ -29,9 +29,9 @@ final class UpdatePillUITests: XCTestCase {
         let systemSettings = XCUIApplication(bundleIdentifier: "com.apple.systempreferences")
         systemSettings.terminate()
         let app = XCUIApplication()
-        app.launchEnvironment["CMUX_UI_TEST_MODE"] = "1"
-        app.launchEnvironment["CMUX_UI_TEST_UPDATE_STATE"] = "available"
-        app.launchEnvironment["CMUX_UI_TEST_UPDATE_VERSION"] = "9.9.9"
+        app.launchEnvironment["TERMMESH_UI_TEST_MODE"] = "1"
+        app.launchEnvironment["TERMMESH_UI_TEST_UPDATE_STATE"] = "available"
+        app.launchEnvironment["TERMMESH_UI_TEST_UPDATE_VERSION"] = "9.9.9"
         launchAndActivate(app)
 
         let pill = pillButton(app: app, expectedLabel: "Update Available: 9.9.9")
@@ -50,9 +50,9 @@ final class UpdatePillUITests: XCTestCase {
         let timingPath = FileManager.default.temporaryDirectory
             .appendingPathComponent("cmux-ui-test-timing-\(UUID().uuidString).json")
         let app = XCUIApplication()
-        app.launchEnvironment["CMUX_UI_TEST_MODE"] = "1"
-        app.launchEnvironment["CMUX_UI_TEST_UPDATE_STATE"] = "notFound"
-        app.launchEnvironment["CMUX_UI_TEST_TIMING_PATH"] = timingPath.path
+        app.launchEnvironment["TERMMESH_UI_TEST_MODE"] = "1"
+        app.launchEnvironment["TERMMESH_UI_TEST_UPDATE_STATE"] = "notFound"
+        app.launchEnvironment["TERMMESH_UI_TEST_TIMING_PATH"] = timingPath.path
         launchAndActivate(app)
 
         let pill = pillButton(app: app, expectedLabel: "No Updates Available")
@@ -109,7 +109,7 @@ final class UpdatePillUITests: XCTestCase {
             mode: "none",
             version: "9.9.9",
             extraEnvironment: [
-                "CMUX_UI_TEST_MOCK_FEED_DELAY_MS": "7000",
+                "TERMMESH_UI_TEST_MOCK_FEED_DELAY_MS": "7000",
             ]
         )
 
@@ -130,7 +130,7 @@ final class UpdatePillUITests: XCTestCase {
 
         let app = XCUIApplication()
         // Make Sparkle re-request permission on startup, but we should auto-handle it with no UI.
-        app.launchEnvironment["CMUX_UI_TEST_RESET_SPARKLE_PERMISSION"] = "1"
+        app.launchEnvironment["TERMMESH_UI_TEST_RESET_SPARKLE_PERMISSION"] = "1"
         launchAndActivate(app)
 
         XCTAssertTrue(waitForWindowCount(atLeast: 1, app: app, timeout: 6.0))
@@ -200,14 +200,14 @@ final class UpdatePillUITests: XCTestCase {
         extraEnvironment: [String: String] = [:]
     ) -> XCUIApplication {
         let app = XCUIApplication()
-        app.launchEnvironment["CMUX_UI_TEST_MODE"] = "1"
-        app.launchEnvironment["CMUX_UI_TEST_FEED_URL"] = "https://cmux.test/appcast.xml"
-        app.launchEnvironment["CMUX_UI_TEST_FEED_MODE"] = mode
-        app.launchEnvironment["CMUX_UI_TEST_UPDATE_VERSION"] = version
-        app.launchEnvironment["CMUX_UI_TEST_AUTO_ALLOW_PERMISSION"] = "1"
-        app.launchEnvironment["CMUX_UI_TEST_TRIGGER_UPDATE_CHECK"] = "1"
+        app.launchEnvironment["TERMMESH_UI_TEST_MODE"] = "1"
+        app.launchEnvironment["TERMMESH_UI_TEST_FEED_URL"] = "https://cmux.test/appcast.xml"
+        app.launchEnvironment["TERMMESH_UI_TEST_FEED_MODE"] = mode
+        app.launchEnvironment["TERMMESH_UI_TEST_UPDATE_VERSION"] = version
+        app.launchEnvironment["TERMMESH_UI_TEST_AUTO_ALLOW_PERMISSION"] = "1"
+        app.launchEnvironment["TERMMESH_UI_TEST_TRIGGER_UPDATE_CHECK"] = "1"
         if let timingPath {
-            app.launchEnvironment["CMUX_UI_TEST_TIMING_PATH"] = timingPath.path
+            app.launchEnvironment["TERMMESH_UI_TEST_TIMING_PATH"] = timingPath.path
         }
         for (key, value) in extraEnvironment {
             app.launchEnvironment[key] = value
@@ -310,7 +310,7 @@ final class TitlebarShortcutHintsUITests: XCTestCase {
 
     private func launchApp(alwaysShowHints: Bool) -> XCUIApplication {
         let app = XCUIApplication()
-        app.launchEnvironment["CMUX_UI_TEST_MODE"] = "1"
+        app.launchEnvironment["TERMMESH_UI_TEST_MODE"] = "1"
         app.launchArguments += ["-shortcutHintAlwaysShow", alwaysShowHints ? "YES" : "NO"]
         app.launchArguments += ["-shortcutHintTitlebarXOffset", "4"]
         app.launchArguments += ["-shortcutHintTitlebarYOffset", "0"]

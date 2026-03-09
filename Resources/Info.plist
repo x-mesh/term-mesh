@@ -83,7 +83,7 @@
 		</dict>
 		<dict>
 			<key>UTTypeIdentifier</key>
-			<string>com.cmux.sidebar-tab-reorder</string>
+			<string>com.termmesh.sidebar-tab-reorder</string>
 			<key>UTTypeDescription</key>
 			<string>term-mesh Sidebar Tab Reorder</string>
 			<key>UTTypeConformsTo</key>
@@ -98,7 +98,7 @@
 		<true/>
 	</dict>
 	<key>SUFeedURL</key>
-	<string>https://github.com/manaflow-ai/cmux/releases/latest/download/appcast.xml</string>
+	<string>https://github.com/manaflow-ai/term-mesh/releases/latest/download/appcast.xml</string>
 	<key>SUPublicEDKey</key>
 	<string>$(SPARKLE_PUBLIC_KEY)</string>
 </dict>

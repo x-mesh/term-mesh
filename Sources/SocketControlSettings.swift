@@ -3,7 +3,7 @@ import Security
 
 enum SocketControlMode: String, CaseIterable, Identifiable {
     case off
-    case cmuxOnly
+    case termMeshOnly
     case automation
     case password
     /// Full open access (all local users/processes) with no ancestry or password gate.
@@ -11,14 +11,14 @@ enum SocketControlMode: String, CaseIterable, Identifiable {
 
     var id: String { rawValue }
 
-    static var uiCases: [SocketControlMode] { [.off, .cmuxOnly, .automation, .password, .allowAll] }
+    static var uiCases: [SocketControlMode] { [.off, .termMeshOnly, .automation, .password, .allowAll] }
 
     var displayName: String {
         switch self {
         case .off:
             return "Off"
-        case .cmuxOnly:
-            return "cmux processes only"
+        case .termMeshOnly:
+            return "term-mesh processes only"
         case .automation:
             return "Automation mode"
         case .password:
@@ -32,8 +32,8 @@ enum SocketControlMode: String, CaseIterable, Identifiable {
         switch self {
         case .off:
             return "Disable the local control socket."
-        case .cmuxOnly:
-            return "Only processes started inside cmux terminals can send commands."
+        case .termMeshOnly:
+            return "Only processes started inside term-mesh terminals can send commands."
         case .automation:
             return "Allow external local automation clients from this macOS user (no ancestry check)."
         case .password:
@@ -47,7 +47,7 @@ enum SocketControlMode: String, CaseIterable, Identifiable {
         switch self {
         case .allowAll:
             return 0o666
-        case .off, .cmuxOnly, .automation, .password:
+        case .off, .termMeshOnly, .automation, .password:
             return 0o600
         }
     }
@@ -58,7 +58,7 @@ enum SocketControlMode: String, CaseIterable, Identifiable {
 }
 
 enum SocketControlPasswordStore {
-    static let service = "com.cmuxterm.app.socket-control"
+    static let service = "com.termmesh.app.socket-control"
     static let account = "local-socket-password"
 
     private static var baseQuery: [String: Any] {
@@ -72,7 +72,7 @@ enum SocketControlPasswordStore {
     static func configuredPassword(
         environment: [String: String] = ProcessInfo.processInfo.environment
     ) -> String? {
-        if let envPassword = environment[SocketControlSettings.socketPasswordEnvKey], !envPassword.isEmpty {
+        if let envPassword = environment[SocketControlSettings.socketPasswordEnvKey] ?? environment[SocketControlSettings.socketPasswordEnvKeyLegacy], !envPassword.isEmpty {
             return envPassword
         }
         return try? loadPassword()
@@ -161,8 +161,10 @@ enum SocketControlPasswordStore {
 struct SocketControlSettings {
     static let appStorageKey = "socketControlMode"
     static let legacyEnabledKey = "socketControlEnabled"
-    static let allowSocketPathOverrideKey = "CMUX_ALLOW_SOCKET_OVERRIDE"
-    static let socketPasswordEnvKey = "CMUX_SOCKET_PASSWORD"
+    static let allowSocketPathOverrideKey = "TERMMESH_ALLOW_SOCKET_OVERRIDE"
+    static let allowSocketPathOverrideKeyLegacy = "CMUX_ALLOW_SOCKET_OVERRIDE"
+    static let socketPasswordEnvKey = "TERMMESH_SOCKET_PASSWORD"
+    static let socketPasswordEnvKeyLegacy = "CMUX_SOCKET_PASSWORD"
 
     private static func normalizeMode(_ raw: String) -> String {
         raw
@@ -176,8 +178,8 @@ struct SocketControlSettings {
         switch normalizeMode(raw) {
         case "off":
             return .off
-        case "cmuxonly":
-            return .cmuxOnly
+        case "termmeshonly":
+            return .termMeshOnly
         case "automation":
             return .automation
         case "password":
@@ -200,7 +202,7 @@ struct SocketControlSettings {
     }
 
     static var defaultMode: SocketControlMode {
-        return .cmuxOnly
+        return .termMeshOnly
     }
 
     private static var isDebugBuild: Bool {
@@ -218,7 +220,7 @@ struct SocketControlSettings {
     ) -> String {
         let fallback = defaultSocketPath(bundleIdentifier: bundleIdentifier, isDebugBuild: isDebugBuild)
 
-        guard let override = environment["CMUX_SOCKET_PATH"], !override.isEmpty else {
+        guard let override = environment["TERMMESH_SOCKET_PATH"] ?? environment["CMUX_SOCKET_PATH"], !override.isEmpty else {
             return fallback
         }
 
@@ -234,16 +236,16 @@ struct SocketControlSettings {
     }
 
     static func defaultSocketPath(bundleIdentifier: String?, isDebugBuild: Bool) -> String {
-        if bundleIdentifier == "com.cmuxterm.app.nightly" {
-            return "/tmp/cmux-nightly.sock"
+        if bundleIdentifier == "com.termmesh.app.nightly" {
+            return "/tmp/term-mesh-nightly.sock"
         }
         if isDebugLikeBundleIdentifier(bundleIdentifier) || isDebugBuild {
-            return "/tmp/cmux-debug.sock"
+            return "/tmp/term-mesh-debug.sock"
         }
         if isStagingBundleIdentifier(bundleIdentifier) {
-            return "/tmp/cmux-staging.sock"
+            return "/tmp/term-mesh-staging.sock"
         }
-        return "/tmp/cmux.sock"
+        return "/tmp/term-mesh.sock"
     }
 
     static func shouldHonorSocketPathOverride(
@@ -251,7 +253,7 @@ struct SocketControlSettings {
         bundleIdentifier: String?,
         isDebugBuild: Bool
     ) -> Bool {
-        if isTruthy(environment[allowSocketPathOverrideKey]) {
+        if isTruthy(environment[allowSocketPathOverrideKey] ?? environment[allowSocketPathOverrideKeyLegacy]) {
             return true
         }
         if isDebugLikeBundleIdentifier(bundleIdentifier) || isStagingBundleIdentifier(bundleIdentifier) {
@@ -262,14 +264,14 @@ struct SocketControlSettings {
 
     static func isDebugLikeBundleIdentifier(_ bundleIdentifier: String?) -> Bool {
         guard let bundleIdentifier else { return false }
-        return bundleIdentifier == "com.cmuxterm.app.debug"
-            || bundleIdentifier.hasPrefix("com.cmuxterm.app.debug.")
+        return bundleIdentifier == "com.termmesh.app.debug"
+            || bundleIdentifier.hasPrefix("com.termmesh.app.debug.")
     }
 
     static func isStagingBundleIdentifier(_ bundleIdentifier: String?) -> Bool {
         guard let bundleIdentifier else { return false }
-        return bundleIdentifier == "com.cmuxterm.app.staging"
-            || bundleIdentifier.hasPrefix("com.cmuxterm.app.staging.")
+        return bundleIdentifier == "com.termmesh.app.staging"
+            || bundleIdentifier.hasPrefix("com.termmesh.app.staging.")
     }
 
     static func isTruthy(_ raw: String?) -> Bool {
@@ -285,7 +287,7 @@ struct SocketControlSettings {
     static func envOverrideEnabled(
         environment: [String: String] = ProcessInfo.processInfo.environment
     ) -> Bool? {
-        guard let raw = environment["CMUX_SOCKET_ENABLE"], !raw.isEmpty else {
+        guard let raw = environment["TERMMESH_SOCKET_ENABLE"] ?? environment["CMUX_SOCKET_ENABLE"], !raw.isEmpty else {
             return nil
         }
 
@@ -302,7 +304,7 @@ struct SocketControlSettings {
     static func envOverrideMode(
         environment: [String: String] = ProcessInfo.processInfo.environment
     ) -> SocketControlMode? {
-        guard let raw = environment["CMUX_SOCKET_MODE"], !raw.isEmpty else {
+        guard let raw = environment["TERMMESH_SOCKET_MODE"] ?? environment["CMUX_SOCKET_MODE"], !raw.isEmpty else {
             return nil
         }
         return parseMode(raw)
@@ -319,7 +321,7 @@ struct SocketControlSettings {
             if let overrideMode = envOverrideMode(environment: environment) {
                 return overrideMode
             }
-            return userMode == .off ? .cmuxOnly : userMode
+            return userMode == .off ? .termMeshOnly : userMode
         }
 
         if let overrideMode = envOverrideMode(environment: environment) {

@@ -725,7 +725,7 @@ final class FileDropOverlayView: NSView {
 
 var fileDropOverlayKey: UInt8 = 0
 private var commandPaletteWindowOverlayKey: UInt8 = 0
-let commandPaletteOverlayContainerIdentifier = NSUserInterfaceItemIdentifier("cmux.commandPalette.overlay.container")
+let commandPaletteOverlayContainerIdentifier = NSUserInterfaceItemIdentifier("term-mesh.commandPalette.overlay.container")
 
 @MainActor
 private final class CommandPaletteOverlayContainerView: NSView {
@@ -1700,7 +1700,7 @@ struct ContentView: View {
     @AppStorage("debugTitlebarLeadingExtra") private var debugTitlebarLeadingExtra: Double = 0
 
     @State private var titlebarLeadingInset: CGFloat = 12
-    private var windowIdentifier: String { "cmux.main.\(windowId.uuidString)" }
+    private var windowIdentifier: String { "term-mesh.main.\(windowId.uuidString)" }
     private var fakeTitlebarBackground: Color {
         _ = titlebarThemeGeneration
         let ghosttyBackground = GhosttyApp.shared.defaultBackgroundColor
@@ -2211,7 +2211,7 @@ struct ContentView: View {
                 }
             }
 #if DEBUG
-            if ProcessInfo.processInfo.environment["CMUX_UI_TEST_MODE"] == "1" {
+            if termMeshEnv("UI_TEST_MODE") == "1" {
                 UpdateLogStore.shared.append("ui test window accessor: id=\(windowIdentifier) visible=\(window.isVisible)")
             }
 #endif
@@ -2310,7 +2310,7 @@ struct ContentView: View {
     }
 
     private func setTitlebarControlsHidden(_ hidden: Bool, in window: NSWindow) {
-        let controlsId = NSUserInterfaceItemIdentifier("cmux.titlebarControls")
+        let controlsId = NSUserInterfaceItemIdentifier("term-mesh.titlebarControls")
         for accessory in window.titlebarAccessoryViewControllers {
             if accessory.view.identifier == controlsId {
                 accessory.isHidden = hidden
@@ -5372,8 +5372,8 @@ enum ShortcutHintDebugSettings {
 }
 
 enum SidebarDragLifecycleNotification {
-    static let stateDidChange = Notification.Name("cmux.sidebarDragStateDidChange")
-    static let requestClear = Notification.Name("cmux.sidebarDragRequestClear")
+    static let stateDidChange = Notification.Name("term-mesh.sidebarDragStateDidChange")
+    static let requestClear = Notification.Name("term-mesh.sidebarDragRequestClear")
     static let tabIdKey = "tabId"
     static let reasonKey = "reason"
 
@@ -7166,8 +7166,8 @@ private final class SidebarDragAutoScrollController: ObservableObject {
 }
 
 private enum SidebarTabDragPayload {
-    static let typeIdentifier = "com.cmux.sidebar-tab-reorder"
-    private static let prefix = "cmux.sidebar-tab."
+    static let typeIdentifier = "com.termmesh.sidebar-tab-reorder"
+    private static let prefix = "term-mesh.sidebar-tab."
 
     static func provider(for tabId: UUID) -> NSItemProvider {
         let provider = NSItemProvider()

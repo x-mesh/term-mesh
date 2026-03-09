@@ -5,53 +5,53 @@ import WebKit
 import SwiftUI
 import ObjectiveC.runtime
 
-#if canImport(cmux_DEV)
-@testable import cmux_DEV
-#elseif canImport(cmux)
-@testable import cmux
+#if canImport(term_mesh_DEV)
+@testable import term_mesh_DEV
+#elseif canImport(term_mesh)
+@testable import term_mesh
 #endif
 
-private var cmuxUnitTestInspectorAssociationKey: UInt8 = 0
-private var cmuxUnitTestInspectorOverrideInstalled = false
+private var termMeshUnitTestInspectorAssociationKey: UInt8 = 0
+private var termMeshUnitTestInspectorOverrideInstalled = false
 
-private extension CmuxWebView {
-    @objc func cmuxUnitTestInspector() -> NSObject? {
-        objc_getAssociatedObject(self, &cmuxUnitTestInspectorAssociationKey) as? NSObject
+private extension TermMeshWebView {
+    @objc func termMeshUnitTestInspector() -> NSObject? {
+        objc_getAssociatedObject(self, &termMeshUnitTestInspectorAssociationKey) as? NSObject
     }
 }
 
 private extension WKWebView {
-    func cmuxSetUnitTestInspector(_ inspector: NSObject?) {
+    func termMeshSetUnitTestInspector(_ inspector: NSObject?) {
         objc_setAssociatedObject(
             self,
-            &cmuxUnitTestInspectorAssociationKey,
+            &termMeshUnitTestInspectorAssociationKey,
             inspector,
             .OBJC_ASSOCIATION_RETAIN_NONATOMIC
         )
     }
 }
 
-private func installCmuxUnitTestInspectorOverride() {
-    guard !cmuxUnitTestInspectorOverrideInstalled else { return }
+private func installTermMeshUnitTestInspectorOverride() {
+    guard !termMeshUnitTestInspectorOverrideInstalled else { return }
 
     guard let replacementMethod = class_getInstanceMethod(
-        CmuxWebView.self,
-        #selector(CmuxWebView.cmuxUnitTestInspector)
+        TermMeshWebView.self,
+        #selector(TermMeshWebView.termMeshUnitTestInspector)
     ) else {
         fatalError("Unable to locate test inspector replacement method")
     }
 
     let added = class_addMethod(
-        CmuxWebView.self,
+        TermMeshWebView.self,
         NSSelectorFromString("_inspector"),
         method_getImplementation(replacementMethod),
         method_getTypeEncoding(replacementMethod)
     )
     guard added else {
-        fatalError("Unable to install CmuxWebView _inspector test override")
+        fatalError("Unable to install TermMeshWebView _inspector test override")
     }
 
-    cmuxUnitTestInspectorOverrideInstalled = true
+    termMeshUnitTestInspectorOverrideInstalled = true
 }
 
 final class SplitShortcutTransientFocusGuardTests: XCTestCase {
@@ -100,7 +100,7 @@ final class SplitShortcutTransientFocusGuardTests: XCTestCase {
     }
 }
 
-final class CmuxWebViewKeyEquivalentTests: XCTestCase {
+final class TermMeshWebViewKeyEquivalentTests: XCTestCase {
     private final class ActionSpy: NSObject {
         private(set) var invoked: Bool = false
 
@@ -117,7 +117,7 @@ final class CmuxWebViewKeyEquivalentTests: XCTestCase {
         let spy = ActionSpy()
         installMenu(spy: spy, key: "n", modifiers: [.command])
 
-        let webView = CmuxWebView(frame: .zero, configuration: WKWebViewConfiguration())
+        let webView = TermMeshWebView(frame: .zero, configuration: WKWebViewConfiguration())
         let event = makeKeyDownEvent(key: "n", modifiers: [.command], keyCode: 45) // kVK_ANSI_N
         XCTAssertNotNil(event)
 
@@ -129,7 +129,7 @@ final class CmuxWebViewKeyEquivalentTests: XCTestCase {
         let spy = ActionSpy()
         installMenu(spy: spy, key: "w", modifiers: [.command])
 
-        let webView = CmuxWebView(frame: .zero, configuration: WKWebViewConfiguration())
+        let webView = TermMeshWebView(frame: .zero, configuration: WKWebViewConfiguration())
         let event = makeKeyDownEvent(key: "w", modifiers: [.command], keyCode: 13) // kVK_ANSI_W
         XCTAssertNotNil(event)
 
@@ -141,7 +141,7 @@ final class CmuxWebViewKeyEquivalentTests: XCTestCase {
         let spy = ActionSpy()
         installMenu(spy: spy, key: "r", modifiers: [.command])
 
-        let webView = CmuxWebView(frame: .zero, configuration: WKWebViewConfiguration())
+        let webView = TermMeshWebView(frame: .zero, configuration: WKWebViewConfiguration())
         let event = makeKeyDownEvent(key: "r", modifiers: [.command], keyCode: 15) // kVK_ANSI_R
         XCTAssertNotNil(event)
 
@@ -162,7 +162,7 @@ final class CmuxWebViewKeyEquivalentTests: XCTestCase {
         let container = NSView(frame: window.contentRect(forFrameRect: window.frame))
         window.contentView = container
 
-        let webView = CmuxWebView(frame: container.bounds, configuration: WKWebViewConfiguration())
+        let webView = TermMeshWebView(frame: container.bounds, configuration: WKWebViewConfiguration())
         webView.autoresizingMask = [.width, .height]
         container.addSubview(webView)
 
@@ -195,7 +195,7 @@ final class CmuxWebViewKeyEquivalentTests: XCTestCase {
         let container = NSView(frame: window.contentRect(forFrameRect: window.frame))
         window.contentView = container
 
-        let webView = CmuxWebView(frame: container.bounds, configuration: WKWebViewConfiguration())
+        let webView = TermMeshWebView(frame: container.bounds, configuration: WKWebViewConfiguration())
         webView.autoresizingMask = [.width, .height]
         container.addSubview(webView)
 
@@ -228,7 +228,7 @@ final class CmuxWebViewKeyEquivalentTests: XCTestCase {
         let container = NSView(frame: window.contentRect(forFrameRect: window.frame))
         window.contentView = container
 
-        let webView = CmuxWebView(frame: container.bounds, configuration: WKWebViewConfiguration())
+        let webView = TermMeshWebView(frame: container.bounds, configuration: WKWebViewConfiguration())
         webView.autoresizingMask = [.width, .height]
         container.addSubview(webView)
 
@@ -264,7 +264,7 @@ final class CmuxWebViewKeyEquivalentTests: XCTestCase {
         let container = NSView(frame: window.contentRect(forFrameRect: window.frame))
         window.contentView = container
 
-        let webView = CmuxWebView(frame: container.bounds, configuration: WKWebViewConfiguration())
+        let webView = TermMeshWebView(frame: container.bounds, configuration: WKWebViewConfiguration())
         webView.autoresizingMask = [.width, .height]
         container.addSubview(webView)
 
@@ -301,7 +301,7 @@ final class CmuxWebViewKeyEquivalentTests: XCTestCase {
         let container = NSView(frame: window.contentRect(forFrameRect: window.frame))
         window.contentView = container
 
-        let webView = CmuxWebView(frame: container.bounds, configuration: WKWebViewConfiguration())
+        let webView = TermMeshWebView(frame: container.bounds, configuration: WKWebViewConfiguration())
         webView.autoresizingMask = [.width, .height]
         container.addSubview(webView)
 
@@ -534,7 +534,7 @@ final class FocusFlashPatternTests: XCTestCase {
 }
 
 @MainActor
-final class CmuxWebViewContextMenuTests: XCTestCase {
+final class TermMeshWebViewContextMenuTests: XCTestCase {
     private func makeRightMouseDownEvent() -> NSEvent {
         guard let event = NSEvent.mouseEvent(
             with: .rightMouseDown,
@@ -554,7 +554,7 @@ final class CmuxWebViewContextMenuTests: XCTestCase {
 
     func testWillOpenMenuAddsOpenLinkInDefaultBrowserAndRoutesSelectionToDefaultBrowserOpener() {
         _ = NSApplication.shared
-        let webView = CmuxWebView(frame: NSRect(x: 0, y: 0, width: 800, height: 600), configuration: WKWebViewConfiguration())
+        let webView = TermMeshWebView(frame: NSRect(x: 0, y: 0, width: 800, height: 600), configuration: WKWebViewConfiguration())
         let menu = NSMenu()
         let openLinkItem = NSMenuItem(title: "Open Link", action: nil, keyEquivalent: "")
         openLinkItem.identifier = NSUserInterfaceItemIdentifier("WKMenuItemIdentifierOpenLink")
@@ -596,7 +596,7 @@ final class CmuxWebViewContextMenuTests: XCTestCase {
     }
 
     func testWillOpenMenuSkipsDefaultBrowserItemWhenContextHasNoOpenLinkEntry() {
-        let webView = CmuxWebView(frame: .zero, configuration: WKWebViewConfiguration())
+        let webView = TermMeshWebView(frame: .zero, configuration: WKWebViewConfiguration())
         let menu = NSMenu()
         menu.addItem(NSMenuItem(title: "Back", action: nil, keyEquivalent: ""))
         menu.addItem(NSMenuItem(title: "Forward", action: nil, keyEquivalent: ""))
@@ -1048,13 +1048,13 @@ final class BrowserDeveloperToolsVisibilityPersistenceTests: XCTestCase {
 
     override class func setUp() {
         super.setUp()
-        installCmuxUnitTestInspectorOverride()
+        installTermMeshUnitTestInspectorOverride()
     }
 
     private func makePanelWithInspector() -> (BrowserPanel, FakeInspector) {
         let panel = BrowserPanel(workspaceId: UUID())
         let inspector = FakeInspector()
-        panel.webView.cmuxSetUnitTestInspector(inspector)
+        panel.webView.termMeshSetUnitTestInspector(inspector)
         return (panel, inspector)
     }
 
@@ -1448,17 +1448,17 @@ final class GhosttyResponderResolutionTests: XCTestCase {
         let descendant = FocusProbeView(frame: NSRect(x: 0, y: 0, width: 40, height: 40))
         ghosttyView.addSubview(descendant)
 
-        XCTAssertTrue(cmuxOwningGhosttyView(for: descendant) === ghosttyView)
+        XCTAssertTrue(termMeshOwningGhosttyView(for: descendant) === ghosttyView)
     }
 
     func testResolvesGhosttyViewFromGhosttyResponder() {
         let ghosttyView = GhosttyNSView(frame: NSRect(x: 0, y: 0, width: 200, height: 120))
-        XCTAssertTrue(cmuxOwningGhosttyView(for: ghosttyView) === ghosttyView)
+        XCTAssertTrue(termMeshOwningGhosttyView(for: ghosttyView) === ghosttyView)
     }
 
     func testReturnsNilForUnrelatedResponder() {
         let view = FocusProbeView(frame: NSRect(x: 0, y: 0, width: 40, height: 40))
-        XCTAssertNil(cmuxOwningGhosttyView(for: view))
+        XCTAssertNil(termMeshOwningGhosttyView(for: view))
     }
 }
 
@@ -4183,19 +4183,19 @@ final class NotificationMenuSnapshotBuilderTests: XCTestCase {
 
 final class MenuBarBuildHintFormatterTests: XCTestCase {
     func testReleaseBuildShowsNoHint() {
-        XCTAssertNil(MenuBarBuildHintFormatter.menuTitle(appName: "cmux DEV menubar-extra", isDebugBuild: false))
+        XCTAssertNil(MenuBarBuildHintFormatter.menuTitle(appName: "term-mesh DEV menubar-extra", isDebugBuild: false))
     }
 
     func testDebugBuildWithTagShowsTag() {
         XCTAssertEqual(
-            MenuBarBuildHintFormatter.menuTitle(appName: "cmux DEV menubar-extra", isDebugBuild: true),
+            MenuBarBuildHintFormatter.menuTitle(appName: "term-mesh DEV menubar-extra", isDebugBuild: true),
             "Build Tag: menubar-extra"
         )
     }
 
     func testDebugBuildWithoutTagShowsUntagged() {
         XCTAssertEqual(
-            MenuBarBuildHintFormatter.menuTitle(appName: "cmux DEV", isDebugBuild: true),
+            MenuBarBuildHintFormatter.menuTitle(appName: "term-mesh DEV", isDebugBuild: true),
             "Build: DEV (untagged)"
         )
     }
@@ -5443,7 +5443,7 @@ final class BrowserWindowPortalLifecycleTests: XCTestCase {
         contentView.addSubview(anchor1)
         contentView.addSubview(anchor2)
 
-        let webView = CmuxWebView(frame: .zero, configuration: WKWebViewConfiguration())
+        let webView = TermMeshWebView(frame: .zero, configuration: WKWebViewConfiguration())
         portal.bind(webView: webView, to: anchor1, visibleInUI: true)
         let firstSuperview = webView.superview
 
@@ -5486,7 +5486,7 @@ final class BrowserWindowPortalLifecycleTests: XCTestCase {
         let anchor = NSView(frame: NSRect(x: 120, y: 20, width: 260, height: 150))
         contentView.addSubview(anchor)
 
-        let webView = CmuxWebView(frame: .zero, configuration: WKWebViewConfiguration())
+        let webView = TermMeshWebView(frame: .zero, configuration: WKWebViewConfiguration())
         portal.bind(webView: webView, to: anchor, visibleInUI: true)
         contentView.layoutSubtreeIfNeeded()
         portal.synchronizeWebViewForAnchor(anchor)
@@ -5521,7 +5521,7 @@ final class BrowserWindowPortalLifecycleTests: XCTestCase {
         let anchor = NSView(frame: NSRect(x: 40, y: 20, width: 220, height: 160))
         contentView.addSubview(anchor)
 
-        let webView = CmuxWebView(frame: .zero, configuration: WKWebViewConfiguration())
+        let webView = TermMeshWebView(frame: .zero, configuration: WKWebViewConfiguration())
         portal.bind(webView: webView, to: anchor, visibleInUI: true)
         contentView.layoutSubtreeIfNeeded()
         portal.synchronizeWebViewForAnchor(anchor)
@@ -5560,7 +5560,7 @@ final class BrowserWindowPortalLifecycleTests: XCTestCase {
         let anchor = NSView(frame: NSRect(x: 40, y: 24, width: 220, height: 160))
         contentView.addSubview(anchor)
 
-        let webView = CmuxWebView(frame: .zero, configuration: WKWebViewConfiguration())
+        let webView = TermMeshWebView(frame: .zero, configuration: WKWebViewConfiguration())
         portal.bind(webView: webView, to: anchor, visibleInUI: true)
         portal.synchronizeWebViewForAnchor(anchor)
 
@@ -5589,7 +5589,7 @@ final class BrowserWindowPortalLifecycleTests: XCTestCase {
 
         let anchor = NSView(frame: NSRect(x: 20, y: 20, width: 180, height: 120))
         contentView.addSubview(anchor)
-        let webView = CmuxWebView(frame: .zero, configuration: WKWebViewConfiguration())
+        let webView = TermMeshWebView(frame: .zero, configuration: WKWebViewConfiguration())
 
         BrowserWindowPortalRegistry.bind(webView: webView, to: anchor, visibleInUI: true)
         XCTAssertNotNil(webView.superview)

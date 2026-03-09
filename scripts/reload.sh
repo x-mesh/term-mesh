@@ -2,14 +2,14 @@
 set -euo pipefail
 
 APP_NAME="term-mesh DEV"
-BUNDLE_ID="com.cmuxterm.app.debug"
+BUNDLE_ID="com.termmesh.app.debug"
 BASE_APP_NAME="term-mesh DEV"
 DERIVED_DATA=""
 NAME_SET=0
 BUNDLE_SET=0
 DERIVED_SET=0
 TAG=""
-CMUX_DEBUG_LOG=""
+TERMMESH_DEBUG_LOG=""
 
 usage() {
   cat <<'EOF'
@@ -53,7 +53,7 @@ print_tag_cleanup_reminder() {
   local -a stale_tags=()
 
   while IFS= read -r -d '' path; do
-    tag="${path#/tmp/cmux-}"
+    tag="${path#/tmp/term-mesh-}"
     if [[ "$tag" == "$current_slug" ]]; then
       continue
     fi
@@ -66,7 +66,7 @@ print_tag_cleanup_reminder() {
     fi
     seen="${seen}${tag} "
     stale_tags+=("$tag")
-  done < <(find /tmp -maxdepth 1 -type d -name 'cmux-*' -print0 2>/dev/null)
+  done < <(find /tmp -maxdepth 1 -type d -name 'term-mesh-*' -print0 2>/dev/null)
 
   echo
   echo "Tag cleanup status:"
@@ -82,16 +82,16 @@ print_tag_cleanup_reminder() {
     echo "Cleanup stale tags only:"
     for tag in "${stale_tags[@]}"; do
       echo "  pkill -f \"term-mesh DEV ${tag}.app/Contents/MacOS/term-mesh DEV\""
-      echo "  rm -rf \"/tmp/cmux-${tag}\" \"/tmp/cmux-debug-${tag}.sock\""
-      echo "  rm -f \"/tmp/cmux-debug-${tag}.log\""
-      echo "  rm -f \"$HOME/Library/Application Support/cmux/cmuxd-dev-${tag}.sock\""
+      echo "  rm -rf \"/tmp/term-mesh-${tag}\" \"/tmp/term-mesh-debug-${tag}.sock\""
+      echo "  rm -f \"/tmp/term-mesh-debug-${tag}.log\""
+      echo "  rm -f \"$HOME/Library/Application Support/term-mesh/term-meshd-dev-${tag}.sock\""
     done
   fi
   echo "After you verify current tag, cleanup command:"
   echo "  pkill -f \"term-mesh DEV ${current_slug}.app/Contents/MacOS/term-mesh DEV\""
-  echo "  rm -rf \"/tmp/cmux-${current_slug}\" \"/tmp/cmux-debug-${current_slug}.sock\""
-  echo "  rm -f \"/tmp/cmux-debug-${current_slug}.log\""
-  echo "  rm -f \"$HOME/Library/Application Support/cmux/cmuxd-dev-${current_slug}.sock\""
+  echo "  rm -rf \"/tmp/term-mesh-${current_slug}\" \"/tmp/term-mesh-debug-${current_slug}.sock\""
+  echo "  rm -f \"/tmp/term-mesh-debug-${current_slug}.log\""
+  echo "  rm -f \"$HOME/Library/Application Support/term-mesh/term-meshd-dev-${current_slug}.sock\""
 }
 
 while [[ $# -gt 0 ]]; do
@@ -156,16 +156,16 @@ if [[ -n "$TAG" ]]; then
     APP_NAME="term-mesh DEV ${TAG}"
   fi
   if [[ "$BUNDLE_SET" -eq 0 ]]; then
-    BUNDLE_ID="com.cmuxterm.app.debug.${TAG_ID}"
+    BUNDLE_ID="com.termmesh.app.debug.${TAG_ID}"
   fi
   if [[ "$DERIVED_SET" -eq 0 ]]; then
-    DERIVED_DATA="/tmp/cmux-${TAG_SLUG}"
+    DERIVED_DATA="/tmp/term-mesh-${TAG_SLUG}"
   fi
 fi
 
 XCODEBUILD_ARGS=(
   -project GhosttyTabs.xcodeproj
-  -scheme cmux
+  -scheme term-mesh
   -configuration Debug
   -destination 'platform=macOS'
 )
@@ -181,7 +181,7 @@ if [[ -z "$TAG" ]]; then
 fi
 XCODEBUILD_ARGS+=(build)
 
-XCODE_LOG="/tmp/cmux-xcodebuild-${TAG_SLUG}.log"
+XCODE_LOG="/tmp/term-mesh-xcodebuild-${TAG_SLUG}.log"
 xcodebuild "${XCODEBUILD_ARGS[@]}" 2>&1 | tee "$XCODE_LOG" | grep -E '(warning:|error:|fatal:|BUILD FAILED|BUILD SUCCEEDED|\*\* BUILD)' || true
 XCODE_EXIT="${PIPESTATUS[0]}"
 echo "Full build log: $XCODE_LOG"
@@ -243,27 +243,27 @@ if [[ -n "$TAG" && "$APP_NAME" != "$SEARCH_APP_NAME" ]]; then
     /usr/libexec/PlistBuddy -c "Set :CFBundleIdentifier $BUNDLE_ID" "$INFO_PLIST" 2>/dev/null \
       || /usr/libexec/PlistBuddy -c "Add :CFBundleIdentifier string $BUNDLE_ID" "$INFO_PLIST"
     if [[ -n "${TAG_SLUG:-}" ]]; then
-      APP_SUPPORT_DIR="$HOME/Library/Application Support/cmux"
-      CMUXD_SOCKET="${APP_SUPPORT_DIR}/cmuxd-dev-${TAG_SLUG}.sock"
-      CMUX_SOCKET="/tmp/cmux-debug-${TAG_SLUG}.sock"
-      CMUX_DEBUG_LOG="/tmp/cmux-debug-${TAG_SLUG}.log"
-      echo "$CMUX_SOCKET" > /tmp/cmux-last-socket-path || true
-      echo "$CMUX_DEBUG_LOG" > /tmp/cmux-last-debug-log-path || true
+      APP_SUPPORT_DIR="$HOME/Library/Application Support/term-mesh"
+      TERMMESH_DAEMON_SOCKET="${APP_SUPPORT_DIR}/term-meshd-dev-${TAG_SLUG}.sock"
+      TERMMESH_SOCKET="/tmp/term-mesh-debug-${TAG_SLUG}.sock"
+      TERMMESH_DEBUG_LOG="/tmp/term-mesh-debug-${TAG_SLUG}.log"
+      echo "$TERMMESH_SOCKET" > /tmp/term-mesh-last-socket-path || true
+      echo "$TERMMESH_DEBUG_LOG" > /tmp/term-mesh-last-debug-log-path || true
       /usr/libexec/PlistBuddy -c "Add :LSEnvironment dict" "$INFO_PLIST" 2>/dev/null || true
-      /usr/libexec/PlistBuddy -c "Set :LSEnvironment:CMUXD_UNIX_PATH \"${CMUXD_SOCKET}\"" "$INFO_PLIST" 2>/dev/null \
-        || /usr/libexec/PlistBuddy -c "Add :LSEnvironment:CMUXD_UNIX_PATH string \"${CMUXD_SOCKET}\"" "$INFO_PLIST"
-      /usr/libexec/PlistBuddy -c "Set :LSEnvironment:CMUX_SOCKET_PATH \"${CMUX_SOCKET}\"" "$INFO_PLIST" 2>/dev/null \
-        || /usr/libexec/PlistBuddy -c "Add :LSEnvironment:CMUX_SOCKET_PATH string \"${CMUX_SOCKET}\"" "$INFO_PLIST"
-      /usr/libexec/PlistBuddy -c "Set :LSEnvironment:CMUX_DEBUG_LOG \"${CMUX_DEBUG_LOG}\"" "$INFO_PLIST" 2>/dev/null \
-        || /usr/libexec/PlistBuddy -c "Add :LSEnvironment:CMUX_DEBUG_LOG string \"${CMUX_DEBUG_LOG}\"" "$INFO_PLIST"
-      if [[ -S "$CMUXD_SOCKET" ]]; then
-        for PID in $(lsof -t "$CMUXD_SOCKET" 2>/dev/null); do
+      /usr/libexec/PlistBuddy -c "Set :LSEnvironment:TERMMESH_DAEMON_UNIX_PATH \"${TERMMESH_DAEMON_SOCKET}\"" "$INFO_PLIST" 2>/dev/null \
+        || /usr/libexec/PlistBuddy -c "Add :LSEnvironment:TERMMESH_DAEMON_UNIX_PATH string \"${TERMMESH_DAEMON_SOCKET}\"" "$INFO_PLIST"
+      /usr/libexec/PlistBuddy -c "Set :LSEnvironment:TERMMESH_SOCKET_PATH \"${TERMMESH_SOCKET}\"" "$INFO_PLIST" 2>/dev/null \
+        || /usr/libexec/PlistBuddy -c "Add :LSEnvironment:TERMMESH_SOCKET_PATH string \"${TERMMESH_SOCKET}\"" "$INFO_PLIST"
+      /usr/libexec/PlistBuddy -c "Set :LSEnvironment:TERMMESH_DEBUG_LOG \"${TERMMESH_DEBUG_LOG}\"" "$INFO_PLIST" 2>/dev/null \
+        || /usr/libexec/PlistBuddy -c "Add :LSEnvironment:TERMMESH_DEBUG_LOG string \"${TERMMESH_DEBUG_LOG}\"" "$INFO_PLIST"
+      if [[ -S "$TERMMESH_DAEMON_SOCKET" ]]; then
+        for PID in $(lsof -t "$TERMMESH_DAEMON_SOCKET" 2>/dev/null); do
           kill "$PID" 2>/dev/null || true
         done
-        rm -f "$CMUXD_SOCKET"
+        rm -f "$TERMMESH_DAEMON_SOCKET"
       fi
-      if [[ -S "$CMUX_SOCKET" ]]; then
-        rm -f "$CMUX_SOCKET"
+      if [[ -S "$TERMMESH_SOCKET" ]]; then
+        rm -f "$TERMMESH_SOCKET"
       fi
     fi
     /usr/bin/codesign --force --sign - --timestamp=none --generate-entitlement-der "$TAG_APP_PATH" >/dev/null 2>&1 || true
@@ -282,21 +282,29 @@ else
   pkill -f "${APP_NAME}.app/Contents/MacOS/${BASE_APP_NAME}" || true
 fi
 sleep 0.3
-CMUXD_SRC="$PWD/cmuxd/zig-out/bin/cmuxd"
-if [[ -d "$PWD/cmuxd" ]]; then
-  (cd "$PWD/cmuxd" && zig build -Doptimize=ReleaseFast)
+TERMMESHD_SRC="$PWD/daemon/zig-out/bin/term-meshd"
+if [[ -d "$PWD/daemon" ]]; then
+  (cd "$PWD/daemon" && zig build -Doptimize=ReleaseFast)
 fi
-if [[ -x "$CMUXD_SRC" ]]; then
+if [[ -x "$TERMMESHD_SRC" ]]; then
   BIN_DIR="$APP_PATH/Contents/Resources/bin"
   mkdir -p "$BIN_DIR"
-  cp "$CMUXD_SRC" "$BIN_DIR/cmuxd"
-  chmod +x "$BIN_DIR/cmuxd"
+  cp "$TERMMESHD_SRC" "$BIN_DIR/term-meshd"
+  chmod +x "$BIN_DIR/term-meshd"
 fi
-# Avoid inheriting cmux/ghostty environment variables from the terminal that
-# runs this script (often inside another cmux instance), which can cause
+# Avoid inheriting term-mesh/ghostty environment variables from the terminal that
+# runs this script (often inside another term-mesh instance), which can cause
 # socket and resource-path conflicts.
 OPEN_CLEAN_ENV=(
   env
+  -u TERMMESH_SOCKET_PATH
+  -u TERMMESH_TAB_ID
+  -u TERMMESH_PANEL_ID
+  -u TERMMESH_DAEMON_UNIX_PATH
+  -u TERMMESH_TAG
+  -u TERMMESH_DEBUG_LOG
+  -u TERMMESH_BUNDLE_ID
+  -u TERMMESH_SHELL_INTEGRATION
   -u CMUX_SOCKET_PATH
   -u CMUX_TAB_ID
   -u CMUX_PANEL_ID
@@ -309,20 +317,20 @@ OPEN_CLEAN_ENV=(
   -u GHOSTTY_RESOURCES_DIR
   -u GHOSTTY_SHELL_FEATURES
   # Dev shells (including CI/Codex) often force-disable paging by exporting these.
-  # Don't leak that into cmux, otherwise `git diff` won't page even with PAGER=less.
+  # Don't leak that into term-mesh, otherwise `git diff` won't page even with PAGER=less.
   -u GIT_PAGER
   -u GH_PAGER
   -u TERMINFO
   -u XDG_DATA_DIRS
 )
 
-if [[ -n "${TAG_SLUG:-}" && -n "${CMUX_SOCKET:-}" ]]; then
-  # Ensure tag-specific socket paths win even if the caller has CMUX_* overrides.
-  "${OPEN_CLEAN_ENV[@]}" CMUX_TAG="$TAG_SLUG" CMUX_SOCKET_PATH="$CMUX_SOCKET" CMUXD_UNIX_PATH="$CMUXD_SOCKET" CMUX_DEBUG_LOG="$CMUX_DEBUG_LOG" open "$APP_PATH"
+if [[ -n "${TAG_SLUG:-}" && -n "${TERMMESH_SOCKET:-}" ]]; then
+  # Ensure tag-specific socket paths win even if the caller has TERMMESH_* overrides.
+  "${OPEN_CLEAN_ENV[@]}" TERMMESH_TAG="$TAG_SLUG" TERMMESH_SOCKET_PATH="$TERMMESH_SOCKET" TERMMESH_DAEMON_UNIX_PATH="$TERMMESH_DAEMON_SOCKET" TERMMESH_DEBUG_LOG="$TERMMESH_DEBUG_LOG" open "$APP_PATH"
 elif [[ -n "${TAG_SLUG:-}" ]]; then
-  "${OPEN_CLEAN_ENV[@]}" CMUX_TAG="$TAG_SLUG" CMUX_DEBUG_LOG="$CMUX_DEBUG_LOG" open "$APP_PATH"
+  "${OPEN_CLEAN_ENV[@]}" TERMMESH_TAG="$TAG_SLUG" TERMMESH_DEBUG_LOG="$TERMMESH_DEBUG_LOG" open "$APP_PATH"
 else
-  echo "/tmp/cmux-debug.log" > /tmp/cmux-last-debug-log-path || true
+  echo "/tmp/term-mesh-debug.log" > /tmp/term-mesh-last-debug-log-path || true
   "${OPEN_CLEAN_ENV[@]}" open "$APP_PATH"
 fi
 osascript -e "tell application id \"${BUNDLE_ID}\" to activate" || true

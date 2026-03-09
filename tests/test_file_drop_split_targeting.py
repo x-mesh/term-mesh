@@ -14,7 +14,7 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from cmux import cmux
+from termmesh import termmesh
 
 
 def surface_ids_from_layout(layout: dict):

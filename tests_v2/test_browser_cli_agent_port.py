@@ -16,7 +16,7 @@ from contextlib import contextmanager
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
-from cmux import cmuxError
+from termmesh import termmeshError
 
 
 SOCKET_PATH = os.environ.get("CMUX_SOCKET", "/tmp/cmux-debug.sock")
