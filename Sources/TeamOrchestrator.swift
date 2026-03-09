@@ -1693,6 +1693,10 @@ final class TeamOrchestrator {
         Date().timeIntervalSince(heartbeat.at) >= staleHeartbeatThreshold
     }
 
+    func agentState(teamName: String, agentName: String) -> String {
+        agentRuntimeState(teamName: teamName, agentName: agentName)
+    }
+
     private func agentRuntimeState(teamName: String, agentName: String) -> String {
         guard let task = activeTask(for: teamName, agentName: agentName) else { return "idle" }
         switch task.status {
