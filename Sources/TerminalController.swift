@@ -4222,9 +4222,10 @@ class TerminalController {
         let workingDirectory = params["working_directory"] as? String ?? FileManager.default.currentDirectoryPath
         let leaderSessionId = params["leader_session_id"] as? String ?? UUID().uuidString
 
-        let agents = agentsParam.map { dict -> (name: String, model: String, agentType: String, color: String, instructions: String) in
+        let agents = agentsParam.map { dict -> (name: String, cli: String, model: String, agentType: String, color: String, instructions: String) in
             (
                 name: dict["name"] as? String ?? "agent",
+                cli: dict["cli"] as? String ?? "claude",
                 model: dict["model"] as? String ?? "sonnet",
                 agentType: dict["agent_type"] as? String ?? "general",
                 color: dict["color"] as? String ?? "",

@@ -150,6 +150,15 @@ struct RolePresetEditorView: View {
                 }
 
                 HStack {
+                    LabeledContent("CLI") {
+                        Picker("", selection: binding.cli) {
+                            ForEach(AgentRolePreset.supportedCLIs, id: \.self) { cli in
+                                Text(cli).tag(cli)
+                            }
+                        }
+                        .frame(width: 90)
+                    }
+
                     LabeledContent("Model") {
                         Picker("", selection: binding.model) {
                             ForEach(models, id: \.self) { m in

@@ -58,6 +58,8 @@ test:
 deploy: build
 	@echo "==> Stopping existing app + daemon..."
 	@-pkill -f "term-mesh.app/Contents/MacOS" 2>/dev/null || true
+	@# Also kill any tagged debug apps to avoid confusion
+	@-pkill -f "term-mesh DEV" 2>/dev/null || true
 	@-pkill term-meshd 2>/dev/null || true
 	@sleep 1
 	@# Ensure no stale daemon remains

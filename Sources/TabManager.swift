@@ -34,10 +34,11 @@ enum SessionRestoreSettings {
         return SessionRestoreMode(rawValue: raw) ?? defaultMode
     }
 
+    /// Fixed path shared across Debug and Release builds so session state persists
+    /// regardless of bundle identifier (com.cmuxterm.app vs com.cmuxterm.app.debug).
     static var sessionFilePath: String {
         let appSupport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
-        let bundleId = Bundle.main.bundleIdentifier ?? "com.cmux"
-        let dir = appSupport.appendingPathComponent(bundleId)
+        let dir = appSupport.appendingPathComponent("com.cmuxterm.app")
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         return dir.appendingPathComponent("session.json").path
     }
@@ -890,6 +891,8 @@ class TabManager: ObservableObject {
             "selectedTabId": select ? newWorkspace.id.uuidString : (selectedTabId?.uuidString ?? "")
         ])
 #endif
+        scheduleSessionSave()
+        observeDirectoryChanges(for: newWorkspace)
         return newWorkspace
     }
 
@@ -900,7 +903,13 @@ class TabManager: ObservableObject {
     // MARK: - Session Save/Restore
 
     func saveSessionState() {
-        let workspaceStates = tabs.map { workspace in
+        // Exclude team workspaces — they are ephemeral (agents die on restart)
+        let teamWorkspaceIds = Set(
+            TeamOrchestrator.shared.teams.values.map { $0.workspaceId }
+        )
+        let nonTeamTabs = tabs.filter { !teamWorkspaceIds.contains($0.id) }
+
+        let workspaceStates = nonTeamTabs.map { workspace in
             SavedWorkspaceState(
                 title: workspace.title,
                 customTitle: workspace.customTitle,
@@ -910,7 +919,7 @@ class TabManager: ObservableObject {
             )
         }
         let selectedIndex = selectedTabId.flatMap { id in
-            tabs.firstIndex(where: { $0.id == id })
+            nonTeamTabs.firstIndex(where: { $0.id == id })
         }
         let session = SavedSessionState(
             version: 1,
@@ -924,6 +933,32 @@ class TabManager: ObservableObject {
         } catch {
             print("[session-restore] save failed: \(error)")
         }
+    }
+
+    /// Debounced session save — coalesces rapid tab open/close/directory changes
+    /// into a single disk write. Safe to call frequently.
+    private var sessionSaveWorkItem: DispatchWorkItem?
+
+    private func scheduleSessionSave() {
+        sessionSaveWorkItem?.cancel()
+        let work = DispatchWorkItem { [weak self] in
+            self?.saveSessionState()
+        }
+        sessionSaveWorkItem = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5, execute: work)
+    }
+
+    /// Observe currentDirectory changes on a workspace so session state is
+    /// persisted when the user cd's into a different directory.
+    private var directoryObservers: [UUID: AnyCancellable] = [:]
+
+    private func observeDirectoryChanges(for workspace: Workspace) {
+        directoryObservers[workspace.id] = workspace.$currentDirectory
+            .dropFirst()  // skip initial value
+            .removeDuplicates()
+            .sink { [weak self] _ in
+                self?.scheduleSessionSave()
+            }
     }
 
     static func loadSavedSession() -> SavedSessionState? {
@@ -1152,6 +1187,7 @@ class TabManager: ObservableObject {
 
         AppDelegate.shared?.notificationStore?.clearNotifications(forTabId: workspace.id)
         unwireClosedBrowserTracking(for: workspace)
+        directoryObservers.removeValue(forKey: workspace.id)
 
         if let index = tabs.firstIndex(where: { $0.id == workspace.id }) {
             tabs.remove(at: index)
@@ -1164,6 +1200,7 @@ class TabManager: ObservableObject {
                 selectedTabId = tabs[newIndex].id
             }
         }
+        scheduleSessionSave()
     }
 
     /// Detach a workspace from this window without closing its panels.
@@ -1174,6 +1211,7 @@ class TabManager: ObservableObject {
 
         let removed = tabs.remove(at: index)
         unwireClosedBrowserTracking(for: removed)
+        directoryObservers.removeValue(forKey: removed.id)
         lastFocusedPanelByTab.removeValue(forKey: removed.id)
 
         if tabs.isEmpty {

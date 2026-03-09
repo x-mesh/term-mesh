@@ -202,6 +202,17 @@ struct TeamCreationView: View {
                 }
                 .frame(width: 130)
 
+                // CLI picker
+                Picker("", selection: Binding(
+                    get: { agent.preset.cli },
+                    set: { agents[index].preset.cli = $0 }
+                )) {
+                    ForEach(AgentRolePreset.supportedCLIs, id: \.self) { cli in
+                        Text(cli).tag(cli)
+                    }
+                }
+                .frame(width: 75)
+
                 // Model picker
                 Picker("", selection: Binding(
                     get: { agent.preset.model },
@@ -351,6 +362,7 @@ struct TeamCreationView: View {
         let slots = agents.map { row in
             TeamTemplate.AgentSlot(
                 roleName: row.preset.name,
+                cli: row.preset.cli,
                 model: row.preset.model,
                 customInstructions: row.customInstructions
             )
@@ -367,6 +379,7 @@ struct TeamCreationView: View {
             let preset = available.first(where: { $0.name == slot.roleName })
                 ?? available.first
             guard var p = preset else { return nil as TeamAgentRow? }
+            p.cli = slot.cli
             p.model = slot.model
             return TeamAgentRow(preset: p, customInstructions: slot.customInstructions)
         }

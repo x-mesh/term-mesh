@@ -5,15 +5,20 @@ struct AgentRolePreset: Identifiable, Codable, Equatable {
     var id: UUID
     var name: String          // e.g. "explorer", "executor"
     var displayName: String   // e.g. "Explorer", "Code Executor"
+    var cli: String           // "claude" or "kiro" — which CLI agent to run
     var model: String         // "sonnet", "opus", "haiku"
     var color: String         // terminal color
     var instructions: String  // system prompt / instructions for this role
     var isBuiltIn: Bool       // built-in presets can't be deleted
 
+    /// Supported CLI types for agent execution.
+    static let supportedCLIs = ["claude", "kiro"]
+
     init(
         id: UUID = UUID(),
         name: String,
         displayName: String = "",
+        cli: String = "claude",
         model: String = "sonnet",
         color: String = "",
         instructions: String = "",
@@ -22,6 +27,7 @@ struct AgentRolePreset: Identifiable, Codable, Equatable {
         self.id = id
         self.name = name
         self.displayName = displayName.isEmpty ? name.capitalized : displayName
+        self.cli = cli
         self.model = model
         self.color = color
         self.instructions = instructions
@@ -368,6 +374,7 @@ struct TeamTemplate: Identifiable, Codable, Equatable {
 
     struct AgentSlot: Codable, Equatable {
         var roleName: String        // references AgentRolePreset.name
+        var cli: String             // "claude" or "kiro"
         var model: String
         var customInstructions: String
     }

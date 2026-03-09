@@ -11,6 +11,7 @@ final class TeamOrchestrator {
         let id: String           // agent-name@team-name
         let name: String         // e.g. "executor", "reviewer"
         let teamName: String
+        let cli: String          // "claude", "kiro" (which CLI to run)
         let model: String        // "opus", "sonnet", "haiku"
         let agentType: String    // "Explore", "executor", etc.
         let color: String        // terminal color
@@ -67,7 +68,17 @@ final class TeamOrchestrator {
     private(set) var messages: [String: [TeamMessage]] = [:]   // team_name → messages
     private(set) var taskBoards: [String: [TeamTask]] = [:]    // team_name → tasks
 
-    // MARK: - Claude Binary
+    // MARK: - Agent CLI Binaries
+
+    /// Resolve the binary path for a given CLI type ("claude", "kiro", etc.)
+    private func agentBinaryPath(cli: String) -> String? {
+        switch cli {
+        case "kiro":
+            return kiroBinaryPath()
+        default:
+            return claudeBinaryPath()
+        }
+    }
 
     private func claudeBinaryPath() -> String? {
         // Prefer the symlink at ~/.local/bin/claude
@@ -87,6 +98,16 @@ final class TeamOrchestrator {
         return nil
     }
 
+    private func kiroBinaryPath() -> String? {
+        let localBin = (NSHomeDirectory() as NSString).appendingPathComponent(".local/bin/kiro-cli")
+        if FileManager.default.fileExists(atPath: localBin) { return localBin }
+        // Fallback: common install locations
+        for path in ["/usr/local/bin/kiro-cli", "/opt/homebrew/bin/kiro-cli"] {
+            if FileManager.default.fileExists(atPath: path) { return path }
+        }
+        return nil
+    }
+
     // MARK: - Team Lifecycle
 
     /// Create a team of Claude agents in split panes within a single workspace.
@@ -94,7 +115,7 @@ final class TeamOrchestrator {
     /// Returns the team info on success.
     func createTeam(
         name: String,
-        agents: [(name: String, model: String, agentType: String, color: String, instructions: String)],
+        agents: [(name: String, cli: String, model: String, agentType: String, color: String, instructions: String)],
         workingDirectory: String,
         leaderSessionId: String,
         leaderMode: String = "repl",
@@ -113,9 +134,15 @@ final class TeamOrchestrator {
             }
         }
 
-        guard let claudePath = claudeBinaryPath() else {
-            print("[team] claude binary not found")
-            return nil
+        // Validate that all required CLI binaries are available
+        let cliTypes = Set(agents.map { $0.cli.isEmpty ? "claude" : $0.cli })
+        var cliPaths: [String: String] = [:]
+        for cli in cliTypes {
+            guard let path = agentBinaryPath(cli: cli) else {
+                print("[team] \(cli) binary not found")
+                return nil
+            }
+            cliPaths[cli] = path
         }
 
         let colors = ["green", "blue", "yellow", "magenta", "cyan", "red"]
@@ -146,21 +173,26 @@ final class TeamOrchestrator {
         let existingPaths = Set(appPath.split(separator: ":").map(String.init))
         let missingPaths = essentialPaths.filter { !existingPaths.contains($0) }
         let currentPath = (appPath.isEmpty ? essentialPaths : appPath.split(separator: ":").map(String.init) + missingPaths).joined(separator: ":")
+        let socketPath = SocketControlSettings.socketPath()
         let baseEnv: [String: String] = [
             "CMUX_TEAM_AGENT": "1",
             "CMUX_TEAM_NAME": name,
+            "CMUX_TEAM": name,
+            "CMUX_SOCKET": socketPath,
             "PATH": currentPath,
         ]
         // Agent panes get CLAUDECODE=1; leader pane in "claude" mode must NOT have it
         // (Claude Code refuses to start inside another CLAUDECODE session)
-        let agentEnv = baseEnv.merging([
+        let claudeAgentEnv = baseEnv.merging([
             "CLAUDECODE": "1",
             "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS": "1"
         ]) { _, new in new }
+        // Kiro agents: no CLAUDECODE (kiro-cli is a separate CLI and doesn't need it)
+        let kiroAgentEnv = baseEnv
 
         let leaderEnv = leaderMode == "claude"
             ? baseEnv  // no CLAUDECODE — leader runs its own Claude instance
-            : agentEnv
+            : claudeAgentEnv
 
         // First panel = leader console (left side)
         // Close the default panel and create a new one with the leader script as command
@@ -170,7 +202,6 @@ final class TeamOrchestrator {
         }
 
         // Build leader command
-        let socketPath = SocketControlSettings.socketPath()
         let scriptPath = leaderScriptPath(mode: leaderMode)
         #if DEBUG
         dlog("[team] leaderMode=\(leaderMode) scriptPath=\(scriptPath ?? "nil")")
@@ -232,20 +263,43 @@ final class TeamOrchestrator {
                 }
             }
 
-            let claudeArgs = buildClaudeCommand(
-                claudePath: claudePath,
-                agentId: agentId,
-                agentName: agent.name,
-                teamName: name,
-                agentColor: agentColor,
-                parentSessionId: leaderSessionId,
-                agentType: agent.agentType,
-                model: agent.model,
-                instructions: agent.instructions
-            )
-            // Wrap in shell -c so env vars from agentEnv are inherited and
-            // the terminal stays open (drops to shell) if Claude exits.
-            let shellCommand = "\(claudeArgs); exec $SHELL"
+            let agentCli = agent.cli.isEmpty ? "claude" : agent.cli
+            let cliPath = cliPaths[agentCli]!
+            let agentCommand: String
+            var kiroInitialPrompt: String? = nil
+            switch agentCli {
+            case "kiro":
+                agentCommand = buildKiroCommand(
+                    kiroPath: cliPath,
+                    agentName: agent.name,
+                    teamName: name,
+                    model: agent.model
+                )
+                // Build initial prompt to send after kiro-cli starts interactively
+                var prompt = "You are agent '\(agent.name)' on team '\(name)'. "
+                prompt += "Use the CMUX_SOCKET environment variable to communicate with the team leader via scripts/team.py. "
+                if !agent.instructions.isEmpty {
+                    prompt += agent.instructions
+                }
+                kiroInitialPrompt = prompt
+            default:
+                agentCommand = buildClaudeCommand(
+                    claudePath: cliPath,
+                    agentId: agentId,
+                    agentName: agent.name,
+                    teamName: name,
+                    agentColor: agentColor,
+                    parentSessionId: leaderSessionId,
+                    agentType: agent.agentType,
+                    model: agent.model,
+                    instructions: agent.instructions
+                )
+            }
+            // Wrap so the terminal stays open (drops to shell) if the CLI exits.
+            // Wrap so the terminal stays open (drops to shell) if the CLI exits.
+            let shellCommand = "\(agentCommand); exec $SHELL"
+            // Select the right environment: kiro agents don't need CLAUDECODE
+            let paneEnv = agentCli == "kiro" ? kiroAgentEnv : claudeAgentEnv
 
             let panelId: UUID
             if index == 0 {
@@ -256,7 +310,7 @@ final class TeamOrchestrator {
                     focus: false,
                     workingDirectory: agentWorkDir,
                     command: shellCommand,
-                    environment: agentEnv
+                    environment: paneEnv
                 ) else {
                     print("[team] failed to create first agent split pane")
                     return nil
@@ -271,7 +325,7 @@ final class TeamOrchestrator {
                     focus: false,
                     workingDirectory: agentWorkDir,
                     command: shellCommand,
-                    environment: agentEnv
+                    environment: paneEnv
                 ) else {
                     print("[team] failed to create split pane for agent '\(agent.name)'")
                     continue
@@ -290,6 +344,7 @@ final class TeamOrchestrator {
                 id: agentId,
                 name: agent.name,
                 teamName: name,
+                cli: agentCli,
                 model: agent.model,
                 agentType: agent.agentType,
                 color: agentColor,
@@ -302,6 +357,26 @@ final class TeamOrchestrator {
                 worktreeBranch: wtBranch
             )
             members.append(member)
+
+            // Kiro agents: send initial prompt after a delay to let the CLI start
+            if let prompt = kiroInitialPrompt {
+                let capturedPanelId = panelId
+                let capturedWsId = workspace.id
+                DispatchQueue.main.asyncAfter(deadline: .now() + 3.0) { [weak self] in
+                    guard let self else { return }
+                    // Find the panel and send the prompt as typed input
+                    if let ws = tabManager.tabs.first(where: { $0.id == capturedWsId }),
+                       let panel = ws.terminalPanel(for: capturedPanelId) {
+                        panel.sendInputText(prompt)
+                        panel.surface.forceRefresh()
+                        // Send Return after a short delay
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+                            panel.sendInputText("\n")
+                            panel.surface.forceRefresh()
+                        }
+                    }
+                }
+            }
         }
 
         let team = Team(
@@ -345,12 +420,18 @@ final class TeamOrchestrator {
         let trimmed = text.replacingOccurrences(of: "[\\r\\n]+$", with: "", options: .regularExpression)
         guard !trimmed.isEmpty else { return true }
 
-        // Send text + Return as key events (NOT bracketed paste).
-        // sendInputText sends each character via ghostty_surface_key and converts
-        // \n to a Return key press. This is the only approach that reliably submits
-        // in Claude Code TUI (bracketed paste + delayed Return does not work).
-        panel.sendInputText(trimmed + "\n")
+        // Send text first, then Return after a short delay.
+        // Sending text + Return synchronously in one call causes a race condition
+        // where Claude Code TUI may not have processed the text input before the
+        // Return key event arrives, causing the Return to be swallowed.
+        panel.sendInputText(trimmed)
         panel.surface.forceRefresh()
+
+        // Delay Return to give the TUI time to process the text input.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+            panel.sendInputText("\n")
+            panel.surface.forceRefresh()
+        }
 
         #if DEBUG
         dlog("[team.sendTextToPanel] sendInputText textLen=\(trimmed.count) text=\(trimmed.prefix(80).debugDescription)")
@@ -383,6 +464,7 @@ final class TeamOrchestrator {
                     [
                         "id": agent.id,
                         "name": agent.name,
+                        "cli": agent.cli,
                         "model": agent.model,
                         "agent_type": agent.agentType,
                         "color": agent.color,
@@ -407,6 +489,7 @@ final class TeamOrchestrator {
                 var info: [String: Any] = [
                     "id": agent.id,
                     "name": agent.name,
+                    "cli": agent.cli,
                     "model": agent.model,
                     "agent_type": agent.agentType,
                     "workspace_id": agent.workspaceId.uuidString,
@@ -512,6 +595,40 @@ final class TeamOrchestrator {
             parts.append("--append-system-prompt '\(escaped)'")
         }
 
+        return parts.joined(separator: " ")
+    }
+
+    /// Map short model names (used internally) to kiro-cli model identifiers.
+    private static func kiroModelName(_ shortName: String) -> String {
+        switch shortName.lowercased() {
+        case "opus":   return "claude-opus-4.6"
+        case "sonnet": return "claude-sonnet-4.6"
+        case "haiku":  return "claude-haiku-4.5"
+        default:       return shortName  // pass through if already full name
+        }
+    }
+
+    private func buildKiroCommand(
+        kiroPath: String,
+        agentName: String,
+        teamName: String,
+        model: String
+    ) -> String {
+        let path = kiroPath.contains(" ") ? "\"\(kiroPath)\"" : kiroPath
+        var parts = [
+            path,
+            "chat",
+            "--trust-all-tools"   // equivalent to claude's --dangerously-skip-permissions
+        ]
+
+        if !model.isEmpty {
+            let kiroModel = Self.kiroModelName(model)
+            parts.append("--model \(kiroModel)")
+        }
+
+        // Do NOT pass prompt as positional INPUT — kiro-cli treats it as
+        // one-shot mode and exits after answering. Instead, start interactively
+        // and send the initial prompt via sendInputText after startup.
         return parts.joined(separator: " ")
     }
 

@@ -203,6 +203,7 @@ struct cmuxApp: App {
                         let agentTuples = agents.map { row in
                             (
                                 name: row.preset.name,
+                                cli: row.preset.cli,
                                 model: row.preset.model,
                                 agentType: row.preset.name,
                                 color: row.preset.color,

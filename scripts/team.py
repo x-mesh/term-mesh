@@ -2,7 +2,7 @@
 """cmux Team Agent CLI
 
 Usage:
-    ./scripts/team.py create [N] [--claude-leader]
+    ./scripts/team.py create [N] [--claude-leader] [--kiro agent1,agent2]
     ./scripts/team.py send <agent> <text>
     ./scripts/team.py broadcast <text>
     ./scripts/team.py status
@@ -127,11 +127,21 @@ def cmd_create(sock: str, args: argparse.Namespace) -> None:
     count = args.count or 2
     leader_mode = "claude" if args.claude_leader else "repl"
 
+    # Parse --kiro flag: comma-separated agent names (or indices) that should use kiro-cli
+    kiro_agents: set[str] = set()
+    if args.kiro:
+        for item in args.kiro.split(","):
+            item = item.strip()
+            if item:
+                kiro_agents.add(item)
+
     agents = []
     for i in range(count):
         name = DEFAULT_AGENT_NAMES[i] if i < len(DEFAULT_AGENT_NAMES) else f"agent-{i}"
         color = DEFAULT_AGENT_COLORS[i % len(DEFAULT_AGENT_COLORS)]
-        agents.append({"name": name, "model": "sonnet", "agent_type": name, "color": color})
+        # Determine CLI: use kiro if agent name matches or "all" specified
+        cli = "kiro" if (name in kiro_agents or "all" in kiro_agents) else "claude"
+        agents.append({"name": name, "cli": cli, "model": "sonnet", "agent_type": name, "color": color})
 
     # Clean up existing team first
     rpc(sock, "team.destroy", {"team_name": TEAM}, req_id=0, timeout=2)
@@ -404,6 +414,8 @@ def build_parser() -> argparse.ArgumentParser:
     sp = sub.add_parser("create", help="Create team with N agents")
     sp.add_argument("count", nargs="?", type=int, default=2)
     sp.add_argument("--claude-leader", action="store_true")
+    sp.add_argument("--kiro", type=str, default="",
+                    help="Comma-separated agent names to run with kiro-cli (or 'all')")
 
     # send
     sp = sub.add_parser("send", help="Send text to a specific agent")
