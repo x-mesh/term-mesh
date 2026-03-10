@@ -319,15 +319,32 @@ final class TeamOrchestrator {
             let agentCommand: String
             switch agentCli {
             case "kiro":
+                // Build full init prompt embedded in the kiro agent profile.
+                // This is loaded at CLI startup — no delayed TUI injection needed.
+                let workerPrompt = """
+                You are a focused worker agent named '\(agent.name)' in team '\(name)'. \
+                Rules: 1) Be EXTREMELY concise — no preamble, no summaries unless asked. \
+                2) Output only code, commands, or direct answers. \
+                3) When done, state the result in 1-2 lines max. 4) Never repeat the task back.
+
+                Operational rules:
+                1. Work should be tracked with task ids.
+                2. When you begin a task, run `./scripts/team.py task start <task_id>`.
+                3. While actively working, periodically run `./scripts/team.py agent ping '<short progress summary>'`.
+                4. If blocked, run `./scripts/team.py task block <task_id> '<reason>'`.
+                5. If ready for validation, run `./scripts/team.py task review <task_id> '<summary>'`.
+                6. When accepted as done, run `./scripts/team.py task done <task_id> '<result>'`.
+                When you complete any task, you MUST use your bash/execute tool to run:
+                ./scripts/team.py report '<summary of your result>'
+                Do NOT just write the result as text — actually execute the shell command.
+                """
                 agentCommand = buildKiroCommand(
                     kiroPath: cliPath,
                     agentName: agent.name,
                     teamName: name,
-                    model: agent.model
+                    model: agent.model,
+                    systemPrompt: workerPrompt
                 )
-                // Do NOT auto-send initial prompt — kiro-cli takes 5+ seconds
-                // for MCP server initialization. The leader sends instructions
-                // via team.py send when the agent is ready.
             case "codex":
                 agentCommand = buildCodexCommand(
                     codexPath: cliPath,
@@ -446,8 +463,7 @@ final class TeamOrchestrator {
         syncTeamStateToDaemon()
         print("[team] created team '\(name)' with \(members.count) agent(s) + leader console")
 
-        // For non-Claude CLI leaders (kiro, codex, gemini), inject team instructions
-        // as the first interactive message after the CLI finishes initializing.
+        // For non-Claude CLI leaders (kiro, codex, gemini), inject team instructions.
         // Claude leaders get instructions via --system-prompt in team-leader-claude.sh.
         if leaderMode != "repl" && leaderMode != "claude" {
             let scriptDir = Self.findScriptsDir(workingDirectory: workingDirectory)
@@ -457,25 +473,34 @@ final class TeamOrchestrator {
                 socketPath: socketPath,
                 scriptDir: scriptDir
             )
-            // Write prompt to a temp file — multiline text can't be sent via sendInputText
-            // because each newline triggers Enter in the TUI, breaking the message.
+            // Write prompt to a temp file — used by kiro profile (self-directed read)
+            // and by codex/gemini (delayed TUI injection).
             let promptFile = "/tmp/term-mesh-leader-\(name).md"
             try? prompt.write(toFile: promptFile, atomically: true, encoding: .utf8)
 
-            // kiro-cli takes ~8s for MCP init, codex/gemini ~3-5s
-            let delay: Double = leaderMode == "kiro" ? 10.0 : 5.0
-            DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
-                guard let self else { return }
-                let msg = "Read the file \(promptFile) — it contains your team leader instructions with agent list and team.py commands. Follow those instructions for all team coordination."
-                let sent = self.sendTextToPanel(
-                    workspaceId: workspace.id,
-                    panelId: leaderPanelId,
-                    text: msg,
-                    tabManager: tabManager
-                )
+            if leaderMode == "kiro" {
+                // Kiro leader profile already includes "read /tmp/term-mesh-leader-<name>.md"
+                // in its system prompt. No delayed TUI injection needed — kiro reads the file
+                // on its own once MCP init completes.
                 #if DEBUG
-                dlog("[team] leader prompt injection \(sent ? "OK" : "FAILED") for \(leaderMode) leader in team '\(name)'")
+                dlog("[team] kiro leader prompt file written to \(promptFile) (profile-directed, no delay)")
                 #endif
+            } else {
+                // codex/gemini: still need delayed TUI injection
+                let delay: Double = 5.0
+                DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
+                    guard let self else { return }
+                    let msg = "Read the file \(promptFile) — it contains your team leader instructions with agent list and team.py commands. Follow those instructions for all team coordination."
+                    let sent = self.sendTextToPanel(
+                        workspaceId: workspace.id,
+                        panelId: leaderPanelId,
+                        text: msg,
+                        tabManager: tabManager
+                    )
+                    #if DEBUG
+                    dlog("[team] leader prompt injection \(sent ? "OK" : "FAILED") for \(leaderMode) leader in team '\(name)'")
+                    #endif
+                }
             }
         }
 
@@ -937,6 +962,9 @@ final class TeamOrchestrator {
         clearTasks(teamName: name)
         heartbeats.removeValue(forKey: name)
 
+        // Clean up dynamic kiro agent profiles
+        Self.cleanupKiroProfiles(teamName: name)
+
         teams.removeValue(forKey: name)
         syncTeamStateToDaemon()
         print("[team] destroyed team '\(name)'")
@@ -1003,39 +1031,47 @@ final class TeamOrchestrator {
         }
     }
 
-    /// Ensure kiro agent profiles exist at ~/.kiro/agents/ for team use.
-    /// Creates them on-demand so no external install step is needed.
-    private static func ensureKiroAgentProfiles() {
+    /// Write a kiro agent profile to ~/.kiro/agents/ with a specific system prompt.
+    /// Each team+agent combination gets its own profile so the prompt is loaded at CLI startup
+    /// — no delayed TUI injection needed.
+    @discardableResult
+    private static func writeKiroProfile(
+        profileName: String,
+        description: String,
+        prompt: String
+    ) -> String {
         let agentsDir = "\(NSHomeDirectory())/.kiro/agents"
         let fm = FileManager.default
         try? fm.createDirectory(atPath: agentsDir, withIntermediateDirectories: true)
 
-        let profiles: [(String, String, String)] = [
-            ("term-mesh-worker", "Minimal agent for term-mesh team worker panes.",
-             "You are a focused worker agent in a term-mesh team. Rules: 1) Be EXTREMELY concise — no preamble, no summaries unless asked. 2) Output only code, commands, or direct answers. 3) When done, state the result in 1-2 lines max. 4) Never repeat the task back."),
-            ("term-mesh-leader", "Team leader agent for term-mesh. Orchestrates workers via team.py.",
-             "You are a team leader in term-mesh. Coordinate worker agents via ./scripts/team.py. Rules: 1) Be concise. 2) Delegate work, don't do it yourself. 3) Always read agent results before responding. 4) Use short, clear instructions.")
+        let path = "\(agentsDir)/\(profileName).json"
+        let json: [String: Any] = [
+            "name": profileName,
+            "description": description,
+            "prompt": prompt,
+            "mcpServers": [String: Any](),
+            "tools": ["read", "write", "shell", "thinking", "todo"],
+            "toolAliases": [String: Any](),
+            "allowedTools": [String](),
+            "resources": ["file://AGENTS.md", "file://CLAUDE.md"],
+            "hooks": [String: Any](),
+            "toolsSettings": [String: Any](),
+            "useLegacyMcpJson": false
         ]
+        if let data = try? JSONSerialization.data(withJSONObject: json, options: [.prettyPrinted, .sortedKeys]) {
+            fm.createFile(atPath: path, contents: data)
+        }
+        return profileName
+    }
 
-        for (name, description, prompt) in profiles {
-            let path = "\(agentsDir)/\(name).json"
-            guard !fm.fileExists(atPath: path) else { continue }
-            let json: [String: Any] = [
-                "name": name,
-                "description": description,
-                "prompt": prompt,
-                "mcpServers": [String: Any](),
-                "tools": ["read", "write", "shell", "thinking", "todo"],
-                "toolAliases": [String: Any](),
-                "allowedTools": [String](),
-                "resources": ["file://AGENTS.md", "file://CLAUDE.md"],
-                "hooks": [String: Any](),
-                "toolsSettings": [String: Any](),
-                "useLegacyMcpJson": false
-            ]
-            if let data = try? JSONSerialization.data(withJSONObject: json, options: [.prettyPrinted, .sortedKeys]) {
-                fm.createFile(atPath: path, contents: data)
-            }
+    /// Remove dynamic kiro profiles created for a team.
+    private static func cleanupKiroProfiles(teamName: String) {
+        let agentsDir = "\(NSHomeDirectory())/.kiro/agents"
+        let fm = FileManager.default
+        guard let files = try? fm.contentsOfDirectory(atPath: agentsDir) else { return }
+        let prefix = "team-\(teamName)-"
+        for file in files where file.hasPrefix(prefix) && file.hasSuffix(".json") {
+            try? fm.removeItem(atPath: "\(agentsDir)/\(file)")
         }
     }
 
@@ -1044,9 +1080,39 @@ final class TeamOrchestrator {
         agentName: String,
         teamName: String,
         model: String,
-        isLeader: Bool = false
+        isLeader: Bool = false,
+        systemPrompt: String? = nil
     ) -> String {
-        Self.ensureKiroAgentProfiles()
+        let profileName = "team-\(teamName)-\(agentName)"
+
+        let defaultPrompt: String
+        if isLeader {
+            // Leader profile tells kiro to read the prompt file on startup.
+            // The file is written after agents are created (by createTeam).
+            defaultPrompt = """
+            You are a team leader in term-mesh. \
+            On startup, immediately read /tmp/term-mesh-leader-\(teamName).md — \
+            it contains your full team instructions with agent list and team.py commands. \
+            Follow those instructions for all team coordination. \
+            Rules: 1) Be concise. 2) Delegate work, don't do it yourself. \
+            3) Always read agent results before responding. 4) Use short, clear instructions.
+            """
+        } else {
+            defaultPrompt = """
+            You are a focused worker agent named '\(agentName)' in team '\(teamName)'. \
+            Rules: 1) Be EXTREMELY concise — no preamble, no summaries unless asked. \
+            2) Output only code, commands, or direct answers. \
+            3) When done, state the result in 1-2 lines max. 4) Never repeat the task back.
+            """
+        }
+
+        Self.writeKiroProfile(
+            profileName: profileName,
+            description: isLeader
+                ? "Team leader for \(teamName)"
+                : "Worker agent \(agentName) in team \(teamName)",
+            prompt: systemPrompt ?? defaultPrompt
+        )
 
         let path = kiroPath.contains(" ") ? "\"\(kiroPath)\"" : kiroPath
         var parts = [
@@ -1054,7 +1120,7 @@ final class TeamOrchestrator {
             "chat",
             "--trust-all-tools",   // equivalent to claude's --dangerously-skip-permissions
             "--wrap never",        // reduce formatting overhead in split panes
-            "--agent \(isLeader ? "term-mesh-leader" : "term-mesh-worker")"
+            "--agent \(profileName)"
         ]
 
         if !model.isEmpty {
@@ -1062,9 +1128,6 @@ final class TeamOrchestrator {
             parts.append("--model \(kiroModel)")
         }
 
-        // Do NOT pass prompt as positional INPUT — kiro-cli treats it as
-        // one-shot mode and exits after answering. Instead, start interactively
-        // and send the initial prompt via sendInputText after startup.
         return parts.joined(separator: " ")
     }
 

@@ -234,20 +234,25 @@ def cmd_create(sock: str, args: argparse.Namespace) -> None:
     print("  ./scripts/team.py status")
     print("  ./scripts/team.py destroy")
 
-    # Option 3: Send init prompt to each agent so they know to report results
+    # Send init prompt to non-kiro agents (kiro gets its prompt via agent profile at startup)
     if r.get("ok"):
-        print("\nSending init prompts to agents...")
-        time.sleep(3)  # Wait for agent CLI to initialize
-        for agent in agents:
-            name = agent["name"]
-            init_text = AGENT_INIT_PROMPT.format(agent=name)
-            rpc(sock, "team.send", {
-                "team_name": TEAM,
-                "agent_name": name,
-                "text": init_text + "\n",
-            }, timeout=3)
-            print(f"  ✓ {name}: init prompt sent")
-            time.sleep(1)  # Stagger sends to avoid race conditions
+        non_kiro = [a for a in agents if a.get("cli", "claude") != "kiro"]
+        if non_kiro:
+            print("\nSending init prompts to non-kiro agents...")
+            time.sleep(3)  # Wait for agent CLI to initialize
+            for agent in non_kiro:
+                name = agent["name"]
+                init_text = AGENT_INIT_PROMPT.format(agent=name)
+                rpc(sock, "team.send", {
+                    "team_name": TEAM,
+                    "agent_name": name,
+                    "text": init_text + "\n",
+                }, timeout=3)
+                print(f"  ✓ {name}: init prompt sent")
+                time.sleep(1)  # Stagger sends to avoid race conditions
+        kiro_count = len(agents) - len(non_kiro)
+        if kiro_count:
+            print(f"\n  ✓ {kiro_count} kiro agent(s): prompt loaded via agent profile (no delay)")
 
 
 def _append_report_suffix(text: str, agent: str, no_report: bool = False) -> str:

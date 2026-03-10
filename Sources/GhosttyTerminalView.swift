@@ -2756,32 +2756,69 @@ class GhosttyNSView: NSView, NSUserInterfaceValidations {
     }
 #endif
 
+    /// Send a Return key press+release to the given surface.
+    private func sendReturnKey(to surface: ghostty_surface_t) {
+        var keyEvent = ghostty_input_key_s()
+        keyEvent.action = GHOSTTY_ACTION_PRESS
+        keyEvent.keycode = 36
+        keyEvent.mods = GHOSTTY_MODS_NONE
+        keyEvent.consumed_mods = GHOSTTY_MODS_NONE
+        keyEvent.unshifted_codepoint = 0
+        keyEvent.composing = false
+        "\r".withCString { ptr in
+            keyEvent.text = ptr
+            _ = ghostty_surface_key(surface, keyEvent)
+        }
+        keyEvent.action = GHOSTTY_ACTION_RELEASE
+        keyEvent.text = nil
+        _ = ghostty_surface_key(surface, keyEvent)
+    }
+
     /// Send text from the IME Input Bar to the terminal surface as key input.
+    ///
+    /// Fixes over the original implementation:
+    /// 1. Sends RELEASE after each PRESS — TUI apps (Claude Code) may track
+    ///    key state and ignore subsequent PRESS events without a matching RELEASE.
+    /// 2. Splits multiline text at newlines and sends Return key events between
+    ///    lines, instead of sending embedded \n as raw bytes.
+    /// 3. Uses sendSurfaceKeyPress for Return (which already sends PRESS+RELEASE).
     func sendIMEText(_ text: String, withReturn: Bool = true) {
         guard let surface = surface else { return }
-        // Send the text
-        text.withCString { ptr in
-            var keyEvent = ghostty_input_key_s()
-            keyEvent.action = GHOSTTY_ACTION_PRESS
-            keyEvent.keycode = 0
-            keyEvent.mods = GHOSTTY_MODS_NONE
-            keyEvent.consumed_mods = GHOSTTY_MODS_NONE
-            keyEvent.text = ptr
-            keyEvent.composing = false
-            _ = ghostty_surface_key(surface, keyEvent)
+
+        let lines = text.components(separatedBy: "\n")
+        for (i, line) in lines.enumerated() {
+            if !line.isEmpty {
+                // Send text as key event
+                line.withCString { ptr in
+                    var keyEvent = ghostty_input_key_s()
+                    keyEvent.action = GHOSTTY_ACTION_PRESS
+                    keyEvent.keycode = 0
+                    keyEvent.mods = GHOSTTY_MODS_NONE
+                    keyEvent.consumed_mods = GHOSTTY_MODS_NONE
+                    keyEvent.unshifted_codepoint = 0
+                    keyEvent.text = ptr
+                    keyEvent.composing = false
+                    _ = ghostty_surface_key(surface, keyEvent)
+                }
+                // Send matching RELEASE — TUI apps may track key state
+                var releaseEvent = ghostty_input_key_s()
+                releaseEvent.action = GHOSTTY_ACTION_RELEASE
+                releaseEvent.keycode = 0
+                releaseEvent.mods = GHOSTTY_MODS_NONE
+                releaseEvent.consumed_mods = GHOSTTY_MODS_NONE
+                releaseEvent.unshifted_codepoint = 0
+                releaseEvent.text = nil
+                releaseEvent.composing = false
+                _ = ghostty_surface_key(surface, releaseEvent)
+            }
+            // Send newline between lines (for multiline input via Shift+Enter)
+            if i < lines.count - 1 {
+                sendReturnKey(to: surface)
+            }
         }
         // Send Enter to execute
         if withReturn {
-            "\r".withCString { ptr in
-                var keyEvent = ghostty_input_key_s()
-                keyEvent.action = GHOSTTY_ACTION_PRESS
-                keyEvent.keycode = 36  // Return key
-                keyEvent.mods = GHOSTTY_MODS_NONE
-                keyEvent.consumed_mods = GHOSTTY_MODS_NONE
-                keyEvent.text = ptr
-                keyEvent.composing = false
-                _ = ghostty_surface_key(surface, keyEvent)
-            }
+            sendReturnKey(to: surface)
         }
     }
 
@@ -3916,12 +3953,26 @@ final class GhosttySurfaceScrollView: NSView {
         CATransaction.setDisableActions(true)
         defer { CATransaction.commit() }
 
-        backgroundView.frame = bounds
-        scrollView.frame = bounds
+        // If IME bar is visible, dock it at the bottom and shrink the terminal area.
+        let imeBarHeight: CGFloat
+        if let imeView = imeInputBarHostingView {
+            imeBarHeight = 90
+            imeView.frame = NSRect(x: 0, y: 0, width: bounds.width, height: imeBarHeight)
+        } else {
+            imeBarHeight = 0
+        }
+        let terminalBounds = NSRect(
+            x: bounds.origin.x,
+            y: bounds.origin.y + imeBarHeight,
+            width: bounds.width,
+            height: bounds.height - imeBarHeight
+        )
+        backgroundView.frame = terminalBounds
+        scrollView.frame = terminalBounds
         let targetSize = scrollView.bounds.size
         surfaceView.frame.size = targetSize
         documentView.frame.size.width = scrollView.bounds.width
-        inactiveOverlayView.frame = bounds
+        inactiveOverlayView.frame = terminalBounds
         if let zone = activeDropZone {
             dropZoneOverlayView.frame = dropZoneOverlayFrame(for: zone, in: bounds.size)
         }
@@ -4102,24 +4153,22 @@ final class GhosttySurfaceScrollView: NSView {
             },
             onClose: { [weak self] in
                 self?.dismissIMEInputBar()
-            }
+            },
         )
 
         let overlay = NSHostingView(rootView: rootView)
-        overlay.translatesAutoresizingMaskIntoConstraints = false
         addSubview(overlay)
-        NSLayoutConstraint.activate([
-            overlay.topAnchor.constraint(equalTo: topAnchor),
-            overlay.bottomAnchor.constraint(equalTo: bottomAnchor),
-            overlay.leadingAnchor.constraint(equalTo: leadingAnchor),
-            overlay.trailingAnchor.constraint(equalTo: trailingAnchor),
-        ])
         imeInputBarHostingView = overlay
+
+        // Trigger layout to position the bar at the bottom and shrink the terminal
+        needsLayout = true
     }
 
     private func dismissIMEInputBar() {
         imeInputBarHostingView?.removeFromSuperview()
         imeInputBarHostingView = nil
+        // Re-layout to restore terminal to full size
+        needsLayout = true
         moveFocus()
     }
 
