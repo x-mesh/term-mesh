@@ -3540,6 +3540,7 @@ extension Notification.Name {
     static let commandPaletteMoveSelection = Notification.Name("term-mesh.commandPaletteMoveSelection")
     static let commandPaletteRenameInputInteractionRequested = Notification.Name("term-mesh.commandPaletteRenameInputInteractionRequested")
     static let commandPaletteRenameInputDeleteBackwardRequested = Notification.Name("term-mesh.commandPaletteRenameInputDeleteBackwardRequested")
+    static let ghosttyDidUpdateGitBranch = Notification.Name("ghosttyDidUpdateGitBranch")
     static let ghosttyDidSetTitle = Notification.Name("ghosttyDidSetTitle")
     static let ghosttyDidFocusTab = Notification.Name("ghosttyDidFocusTab")
     static let ghosttyDidFocusSurface = Notification.Name("ghosttyDidFocusSurface")

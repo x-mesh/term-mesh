@@ -883,6 +883,7 @@ final class Workspace: Identifiable, ObservableObject {
         if panelId == focusedPanelId {
             gitBranch = state
         }
+        NotificationCenter.default.post(name: .ghosttyDidUpdateGitBranch, object: nil)
     }
 
     func clearPanelGitBranch(panelId: UUID) {
@@ -890,6 +891,7 @@ final class Workspace: Identifiable, ObservableObject {
         if panelId == focusedPanelId {
             gitBranch = nil
         }
+        NotificationCenter.default.post(name: .ghosttyDidUpdateGitBranch, object: nil)
     }
 
     @discardableResult

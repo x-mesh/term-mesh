@@ -1097,6 +1097,10 @@ struct ContentView: View {
     @State private var mountedWorkspaceIds: [UUID] = []
     @State private var lastSidebarSelectionIndex: Int? = nil
     @State private var titlebarText: String = ""
+    @State private var titlebarGitBranch: String = ""
+    @State private var titlebarGitDirty: Bool = false
+    @State private var titlebarGitDirtyCount: Int = 0
+    @State private var titlebarDirBasename: String = ""
     @State private var isFullScreen: Bool = false
     @State private var observedWindow: NSWindow?
     @StateObject private var fullscreenControlsViewModel = TitlebarControlsViewModel()
@@ -1679,7 +1683,6 @@ struct ContentView: View {
         }
         .padding(.top, titlebarPadding)
         .overlay(alignment: .top) {
-            // Titlebar overlay is only over terminal content, not the sidebar.
             customTitlebar
         }
     }
@@ -1742,19 +1745,16 @@ struct ContentView: View {
             TitlebarLeadingInsetReader(inset: $titlebarLeadingInset)
                 .allowsHitTesting(false)
 
-            HStack(spacing: 8) {
+            HStack(spacing: 6) {
                 if isFullScreen && !sidebarState.isVisible {
                     fullscreenControls
+                        .padding(.trailing, 4)
                 }
 
-                Text(titlebarText)
-                    .font(.system(size: 13, weight: .bold))
-                    .foregroundColor(fakeTitlebarTextColor)
-                    .lineLimit(1)
-                    .allowsHitTesting(false)
+                // Git branch + directory basename
+                titlebarBranchAndDirectory
 
                 Spacer()
-
             }
             .frame(height: 28)
             .padding(.top, 2)
@@ -1772,18 +1772,107 @@ struct ContentView: View {
         }
     }
 
+    private var titlebarBranchAndDirectory: some View {
+        HStack(spacing: 5) {
+            if !titlebarGitBranch.isEmpty {
+                Image(systemName: "arrow.triangle.branch")
+                    .font(.system(size: 10, weight: .medium))
+                    .foregroundColor(.white.opacity(0.7))
+                Text(titlebarGitBranch)
+                    .font(.system(size: 11, weight: .medium, design: .monospaced))
+                    .foregroundColor(.white.opacity(0.85))
+                if titlebarGitDirty {
+                    Text(titlebarGitDirtyCount > 0 ? "±\(titlebarGitDirtyCount)" : "±")
+                        .font(.system(size: 10, weight: .medium, design: .monospaced))
+                        .foregroundColor(.orange.opacity(0.9))
+                }
+            }
+            if !titlebarDirBasename.isEmpty {
+                if !titlebarGitBranch.isEmpty {
+                    Text("·")
+                        .font(.system(size: 11))
+                        .foregroundColor(.white.opacity(0.4))
+                }
+                Text(titlebarDirBasename)
+                    .font(.system(size: 11, weight: .regular))
+                    .foregroundColor(.white.opacity(0.6))
+            }
+        }
+        .lineLimit(1)
+    }
+
     private func updateTitlebarText() {
         guard let selectedId = tabManager.selectedTabId,
               let tab = tabManager.tabs.first(where: { $0.id == selectedId }) else {
-            if !titlebarText.isEmpty {
-                titlebarText = ""
-            }
+            if !titlebarText.isEmpty { titlebarText = "" }
+            if !titlebarGitBranch.isEmpty { titlebarGitBranch = "" }
+            if !titlebarDirBasename.isEmpty { titlebarDirBasename = "" }
             return
         }
         let title = tab.title.trimmingCharacters(in: .whitespacesAndNewlines)
         if titlebarText != title {
             titlebarText = title
         }
+        // Git branch — try workspace-level, panel branches, or run git directly
+        let branchState = tab.gitBranch ?? tab.panelGitBranches.values.first
+        if let bs = branchState {
+            let branch = bs.branch
+            if titlebarGitBranch != branch { titlebarGitBranch = branch }
+            let dirty = bs.isDirty
+            if titlebarGitDirty != dirty { titlebarGitDirty = dirty }
+            let dirtyCount = bs.dirtyFileCount ?? 0
+            if titlebarGitDirtyCount != dirtyCount { titlebarGitDirtyCount = dirtyCount }
+        } else {
+            // Fallback: run git directly in the workspace's current directory
+            let dir = tab.currentDirectory
+            if !dir.isEmpty {
+                DispatchQueue.global(qos: .utility).async {
+                    let (branch, dirty, count) = Self.queryGitBranch(in: dir)
+                    DispatchQueue.main.async {
+                        if self.titlebarGitBranch != branch { self.titlebarGitBranch = branch }
+                        if self.titlebarGitDirty != dirty { self.titlebarGitDirty = dirty }
+                        if self.titlebarGitDirtyCount != count { self.titlebarGitDirtyCount = count }
+                    }
+                }
+            }
+        }
+        // Directory basename
+        let dirBase = (tab.currentDirectory as NSString).lastPathComponent
+        if titlebarDirBasename != dirBase { titlebarDirBasename = dirBase }
+    }
+
+    private static func queryGitBranch(in directory: String) -> (branch: String, dirty: Bool, dirtyCount: Int) {
+        let branchProcess = Process()
+        branchProcess.executableURL = URL(fileURLWithPath: "/usr/bin/git")
+        branchProcess.arguments = ["branch", "--show-current"]
+        branchProcess.currentDirectoryURL = URL(fileURLWithPath: directory)
+        let branchPipe = Pipe()
+        branchProcess.standardOutput = branchPipe
+        branchProcess.standardError = Pipe()
+        do {
+            try branchProcess.run()
+            branchProcess.waitUntilExit()
+        } catch { return ("", false, 0) }
+        guard branchProcess.terminationStatus == 0 else { return ("", false, 0) }
+        let branchData = branchPipe.fileHandleForReading.readDataToEndOfFile()
+        let branch = String(data: branchData, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        guard !branch.isEmpty else { return ("", false, 0) }
+
+        let statusProcess = Process()
+        statusProcess.executableURL = URL(fileURLWithPath: "/usr/bin/git")
+        statusProcess.arguments = ["status", "--porcelain", "--short"]
+        statusProcess.currentDirectoryURL = URL(fileURLWithPath: directory)
+        let statusPipe = Pipe()
+        statusProcess.standardOutput = statusPipe
+        statusProcess.standardError = Pipe()
+        do {
+            try statusProcess.run()
+            statusProcess.waitUntilExit()
+        } catch { return (branch, false, 0) }
+        let statusData = statusPipe.fileHandleForReading.readDataToEndOfFile()
+        let statusOutput = String(data: statusData, encoding: .utf8) ?? ""
+        let changedFiles = statusOutput.components(separatedBy: "\n").filter { !$0.isEmpty }
+        return (branch, !changedFiles.isEmpty, changedFiles.count)
     }
 
     private func scheduleTitlebarTextRefresh() {
@@ -1984,6 +2073,11 @@ struct ContentView: View {
                   tabId == tabManager.selectedTabId else { return }
             completeWorkspaceHandoffIfNeeded(focusedTabId: tabId, reason: "focus")
             scheduleTitlebarTextRefresh()
+        })
+
+        // Periodically refresh titlebar git branch + directory (3s interval)
+        view = AnyView(view.onReceive(Timer.publish(every: 3, on: .main, in: .common).autoconnect()) { _ in
+            updateTitlebarText()
         })
 
         view = AnyView(view.onChange(of: titlebarThemeGeneration) { oldValue, newValue in
@@ -2195,9 +2289,8 @@ struct ContentView: View {
             // Do not make the entire background draggable; it interferes with drag gestures
             // like sidebar tab reordering in multi-window mode.
             window.isMovableByWindowBackground = false
-            // Keep the window immovable by default so titlebar controls (like the folder icon)
-            // cannot accidentally initiate native window drags.
-            window.isMovable = false
+            // Let the system titlebar handle window dragging (Warp-style flush layout).
+            window.isMovable = true
             window.styleMask.insert(.fullSizeContentView)
 
             // Track this window for fullscreen notifications

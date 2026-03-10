@@ -1463,12 +1463,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         window.titleVisibility = .hidden
         window.titlebarAppearsTransparent = true
         window.isMovableByWindowBackground = false
-        window.isMovable = false
+        window.isMovable = true
         window.center()
         window.contentView = NSHostingView(rootView: root)
 
-        // Apply shared window styling.
-        attachUpdateAccessory(to: window)
+        // Apply shared window styling (skip titlebar accessory for flush layout).
         applyWindowDecorations(to: window)
 
         // Keep a strong reference so the window isn't deallocated.
