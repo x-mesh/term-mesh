@@ -1969,12 +1969,12 @@ private struct AboutPanelView: View {
                     Text("term-mesh")
                         .bold()
                         .font(.title)
+                        .foregroundColor(.black)
                     Text("A Ghostty-based terminal with vertical tabs\nand a notification panel for macOS.")
                         .multilineTextAlignment(.center)
                         .fixedSize(horizontal: false, vertical: true)
                         .font(.caption)
-                        .tint(.secondary)
-                        .opacity(0.8)
+                        .foregroundColor(.gray)
                 }
                 .textSelection(.enabled)
 
@@ -2029,7 +2029,7 @@ private struct AboutPanelView: View {
         .padding(.top, 8)
         .padding(32)
         .frame(minWidth: 280)
-        .background(AboutVisualEffectBackground(material: .underWindowBackground).ignoresSafeArea())
+        .background(Color.white.ignoresSafeArea())
     }
 }
 

@@ -15,14 +15,21 @@ struct WelcomeView: View {
 
     var body: some View {
         VStack(spacing: 24) {
+            // App icon
+            Image(nsImage: NSApplication.shared.applicationIconImage)
+                .resizable()
+                .renderingMode(.original)
+                .frame(width: 80, height: 80)
+                .shadow(color: .black.opacity(0.15), radius: 6, x: 0, y: 2)
+
             // Branding
             VStack(spacing: 6) {
                 Text("term-mesh")
-                    .font(.system(size: 36, weight: .semibold, design: .default))
-                    .foregroundStyle(.primary)
+                    .font(.system(size: 32, weight: .semibold, design: .default))
+                    .foregroundColor(.black)
                 Text("Terminal Multiplexer for macOS")
                     .font(.system(size: 14, weight: .regular))
-                    .foregroundStyle(.secondary)
+                    .foregroundColor(.gray)
             }
 
             Divider()
@@ -32,7 +39,7 @@ struct WelcomeView: View {
             VStack(alignment: .leading, spacing: 8) {
                 Text("Keyboard Shortcuts")
                     .font(.system(size: 11, weight: .semibold))
-                    .foregroundStyle(.secondary)
+                    .foregroundColor(.gray)
                     .textCase(.uppercase)
                     .tracking(0.5)
 
@@ -65,11 +72,12 @@ struct WelcomeView: View {
             Toggle(isOn: $hideWelcomeScreen) {
                 Text("Don't show again")
                     .font(.system(size: 12))
-                    .foregroundStyle(.secondary)
+                    .foregroundColor(.gray)
             }
             .toggleStyle(.checkbox)
         }
         .padding(40)
+        .background(Color.white)
     }
 }
 
@@ -81,16 +89,16 @@ private struct ShortcutRow: View {
         HStack(spacing: 8) {
             Text(key)
                 .font(.system(size: 11, weight: .medium, design: .monospaced))
-                .foregroundStyle(.primary)
+                .foregroundColor(.black)
                 .padding(.horizontal, 6)
                 .padding(.vertical, 3)
                 .background(
                     RoundedRectangle(cornerRadius: 4)
-                        .fill(.quaternary)
+                        .fill(Color.gray.opacity(0.15))
                 )
             Text(description)
                 .font(.system(size: 12))
-                .foregroundStyle(.secondary)
+                .foregroundColor(.gray)
             Spacer()
         }
     }
