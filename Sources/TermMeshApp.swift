@@ -1932,9 +1932,6 @@ private final class SidebarDebugWindowController: NSWindowController, NSWindowDe
 private struct AboutPanelView: View {
     @Environment(\.openURL) private var openURL
 
-    private let githubURL = URL(string: "https://github.com/manaflow-ai/term-mesh")
-    private let docsURL = URL(string: "https://term-mesh.dev/docs")
-
     private var version: String? { Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String }
     private var build: String? { Bundle.main.infoDictionary?["CFBundleVersion"] as? String }
     private var commit: String? {
@@ -1980,20 +1977,11 @@ private struct AboutPanelView: View {
                         URL(string: "https://github.com/manaflow-ai/term-mesh/commit/\(hash)")
                     }
                     AboutPropertyRow(label: "Commit", text: commitText, url: commitURL)
+                    AboutPropertyRow(label: "Author", text: "Jinwoo")
                 }
                 .frame(maxWidth: .infinity)
 
                 HStack(spacing: 8) {
-                    if let url = docsURL {
-                        Button("Docs") {
-                            openURL(url)
-                        }
-                    }
-                    if let url = githubURL {
-                        Button("GitHub") {
-                            openURL(url)
-                        }
-                    }
                     Button("Licenses") {
                         AcknowledgmentsWindowController.shared.show()
                     }
