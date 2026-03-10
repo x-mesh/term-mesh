@@ -105,15 +105,78 @@ final class TermMeshDaemon: ObservableObject {
     /// Stop the daemon process.
     func stopDaemon() {
         queue.sync {
-            guard let proc = daemonProcess, proc.isRunning else { return }
-            proc.terminate()
-            proc.waitUntilExit()
-            daemonProcess = nil
-            print("[term-mesh] daemon stopped")
+            // Case 1: We spawned the daemon — terminate directly
+            if let proc = daemonProcess, proc.isRunning {
+                proc.terminate()
+                proc.waitUntilExit()
+                daemonProcess = nil
+                print("[term-mesh] daemon stopped (tracked process)")
+            } else {
+                // Case 2: Daemon was started externally (nohup, make deploy, etc.)
+                // Try graceful shutdown via RPC first
+                daemonProcess = nil
+                let shutdownSent = sendShutdownRPC()
+                if shutdownSent {
+                    print("[term-mesh] daemon shutdown RPC sent")
+                    // Give it a moment to exit
+                    Thread.sleep(forTimeInterval: 0.5)
+                }
+
+                // Fallback: kill by process name if still alive
+                if ping() {
+                    let kill = Process()
+                    kill.executableURL = URL(fileURLWithPath: "/usr/bin/pkill")
+                    kill.arguments = ["-f", "term-meshd"]
+                    try? kill.run()
+                    kill.waitUntilExit()
+                    print("[term-mesh] daemon killed via pkill")
+                }
+            }
 
             // Clean up socket file
             try? FileManager.default.removeItem(atPath: socketPath)
         }
+    }
+
+    /// Send a shutdown RPC to the daemon (best-effort, no response expected).
+    private func sendShutdownRPC() -> Bool {
+        let id = nextId
+        nextId += 1
+        let request: [String: Any] = ["id": id, "method": "shutdown", "params": [:]]
+        guard let data = try? JSONSerialization.data(withJSONObject: request),
+              var jsonString = String(data: data, encoding: .utf8) else { return false }
+        jsonString += "\n"
+
+        let fd = socket(AF_UNIX, SOCK_STREAM, 0)
+        guard fd >= 0 else { return false }
+        defer { close(fd) }
+
+        var addr = sockaddr_un()
+        addr.sun_family = sa_family_t(AF_UNIX)
+        let pathBytes = socketPath.utf8CString
+        guard pathBytes.count <= MemoryLayout.size(ofValue: addr.sun_path) else { return false }
+        withUnsafeMutablePointer(to: &addr.sun_path) { ptr in
+            ptr.withMemoryRebound(to: CChar.self, capacity: pathBytes.count) { dest in
+                for (i, byte) in pathBytes.enumerated() {
+                    dest[i] = byte
+                }
+            }
+        }
+
+        let connectResult = withUnsafePointer(to: &addr) { ptr in
+            ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { sockPtr in
+                connect(fd, sockPtr, socklen_t(MemoryLayout<sockaddr_un>.size))
+            }
+        }
+        guard connectResult == 0 else { return false }
+
+        var timeout = timeval(tv_sec: 2, tv_usec: 0)
+        setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, socklen_t(MemoryLayout<timeval>.size))
+
+        let sent = jsonString.withCString { ptr in
+            write(fd, ptr, strlen(ptr))
+        }
+        return sent > 0
     }
 
     // MARK: - RPC Calls
