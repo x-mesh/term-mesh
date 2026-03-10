@@ -27,15 +27,14 @@ struct IMEInputBar: View {
     var body: some View {
         GeometryReader { geo in
             VStack {
-                Spacer()
-                    .frame(height: geo.size.height * 0.3)
+                Spacer(minLength: 20)
 
                 VStack(spacing: 0) {
                     HStack(alignment: .top, spacing: 6) {
                         Image(systemName: "keyboard")
                             .foregroundColor(.secondary)
-                            .font(.system(size: 13))
-                            .padding(.top, 4)
+                            .font(.system(size: 11))
+                            .padding(.top, 5)
 
                         IMETextEditor(
                             text: $text,
@@ -49,18 +48,18 @@ struct IMEInputBar: View {
                         .frame(minHeight: 22, maxHeight: CGFloat(min(lineCount, 8)) * 20 + 10)
                         .focused($isFieldFocused)
 
-                        VStack(spacing: 6) {
+                        HStack(spacing: 4) {
                             if !text.isEmpty {
                                 Button(action: {
                                     onSubmit(text)
                                     text = ""
                                 }) {
                                     Image(systemName: "paperplane.fill")
-                                        .font(.system(size: 13, weight: .semibold))
+                                        .font(.system(size: 11, weight: .semibold))
                                         .foregroundColor(.white)
-                                        .frame(width: 28, height: 28)
+                                        .frame(width: 22, height: 22)
                                         .background(Color.green)
-                                        .cornerRadius(6)
+                                        .cornerRadius(5)
                                 }
                                 .buttonStyle(.plain)
                                 .help("Send to current pane (Enter)")
@@ -71,11 +70,11 @@ struct IMEInputBar: View {
                                         text = ""
                                     }) {
                                         Image(systemName: "antenna.radiowaves.left.and.right")
-                                            .font(.system(size: 12, weight: .semibold))
+                                            .font(.system(size: 10, weight: .semibold))
                                             .foregroundColor(.white)
-                                            .frame(width: 28, height: 28)
+                                            .frame(width: 22, height: 22)
                                             .background(Color.orange)
-                                            .cornerRadius(6)
+                                            .cornerRadius(5)
                                     }
                                     .buttonStyle(.plain)
                                     .help("Broadcast to all panes")
@@ -84,16 +83,16 @@ struct IMEInputBar: View {
 
                             Button(action: { onClose() }) {
                                 Image(systemName: "xmark")
-                                    .font(.system(size: 11, weight: .bold))
+                                    .font(.system(size: 9, weight: .bold))
                                     .foregroundColor(.secondary)
-                                    .frame(width: 28, height: 28)
+                                    .frame(width: 22, height: 22)
                                     .background(Color.primary.opacity(0.08))
-                                    .cornerRadius(6)
+                                    .cornerRadius(5)
                             }
                             .buttonStyle(.plain)
                             .help("Close (Esc)")
                         }
-                        .padding(.top, 2)
+                        .padding(.top, 3)
                     }
                     .padding(.horizontal, 12)
                     .padding(.vertical, 8)
@@ -121,7 +120,7 @@ struct IMEInputBar: View {
                 .shadow(color: .black.opacity(0.2), radius: 8, y: 2)
                 .padding(.horizontal, geo.size.width * 0.12)
 
-                Spacer()
+                Spacer(minLength: 20)
             }
         }
         .onAppear {
