@@ -690,7 +690,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
 #endif
 
         SentrySDK.start { options in
-            options.dsn = "https://ecba1ec90ecaee02a102fba931b6d2b3@o4507547940749312.ingest.us.sentry.io/4510796264636416"
+            options.dsn = "https://e82b8ec104bf1557bb560b17cc3829d5@o406458.ingest.us.sentry.io/4511020180963328"
             #if DEBUG
             options.environment = "development"
             options.debug = true
