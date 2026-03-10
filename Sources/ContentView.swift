@@ -1677,13 +1677,6 @@ struct ContentView: View {
                 .opacity(sidebarSelectionState.selection == .notifications ? 1 : 0)
                 .allowsHitTesting(sidebarSelectionState.selection == .notifications)
         }
-        .overlay {
-            if (tabManager.tabs.isEmpty || (tabManager.selectedWorkspace?.panels.isEmpty ?? true))
-                && !hideWelcomeScreen {
-                WelcomeView(onGetStarted: { tabManager.addTab() })
-                    .transition(.opacity)
-            }
-        }
         .padding(.top, titlebarPadding)
         .overlay(alignment: .top) {
             // Titlebar overlay is only over terminal content, not the sidebar.
@@ -1917,6 +1910,15 @@ struct ContentView: View {
             }
             .frame(minWidth: 800, minHeight: 600)
                 .background(Color.clear)
+                .sheet(isPresented: Binding(
+                    get: { !hideWelcomeScreen },
+                    set: { if !$0 { hideWelcomeScreen = true } }
+                )) {
+                    WelcomeView(onGetStarted: {
+                        hideWelcomeScreen = true
+                    })
+                    .frame(width: 480, height: 400)
+                }
         )
 
         view = AnyView(view.onAppear {
