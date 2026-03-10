@@ -103,80 +103,26 @@ final class TermMeshDaemon: ObservableObject {
     }
 
     /// Stop the daemon process.
+    /// Called from applicationWillTerminate — must complete quickly.
     func stopDaemon() {
-        queue.sync {
-            // Case 1: We spawned the daemon — terminate directly
-            if let proc = daemonProcess, proc.isRunning {
-                proc.terminate()
-                proc.waitUntilExit()
-                daemonProcess = nil
-                print("[term-mesh] daemon stopped (tracked process)")
-            } else {
-                // Case 2: Daemon was started externally (nohup, make deploy, etc.)
-                // Try graceful shutdown via RPC first
-                daemonProcess = nil
-                let shutdownSent = sendShutdownRPC()
-                if shutdownSent {
-                    print("[term-mesh] daemon shutdown RPC sent")
-                    // Give it a moment to exit
-                    Thread.sleep(forTimeInterval: 0.5)
-                }
-
-                // Fallback: kill by process name if still alive
-                if ping() {
-                    let kill = Process()
-                    kill.executableURL = URL(fileURLWithPath: "/usr/bin/pkill")
-                    kill.arguments = ["-f", "term-meshd"]
-                    try? kill.run()
-                    kill.waitUntilExit()
-                    print("[term-mesh] daemon killed via pkill")
-                }
-            }
-
-            // Clean up socket file
-            try? FileManager.default.removeItem(atPath: socketPath)
-        }
-    }
-
-    /// Send a shutdown RPC to the daemon (best-effort, no response expected).
-    private func sendShutdownRPC() -> Bool {
-        let id = nextId
-        nextId += 1
-        let request: [String: Any] = ["id": id, "method": "shutdown", "params": [:]]
-        guard let data = try? JSONSerialization.data(withJSONObject: request),
-              var jsonString = String(data: data, encoding: .utf8) else { return false }
-        jsonString += "\n"
-
-        let fd = socket(AF_UNIX, SOCK_STREAM, 0)
-        guard fd >= 0 else { return false }
-        defer { close(fd) }
-
-        var addr = sockaddr_un()
-        addr.sun_family = sa_family_t(AF_UNIX)
-        let pathBytes = socketPath.utf8CString
-        guard pathBytes.count <= MemoryLayout.size(ofValue: addr.sun_path) else { return false }
-        withUnsafeMutablePointer(to: &addr.sun_path) { ptr in
-            ptr.withMemoryRebound(to: CChar.self, capacity: pathBytes.count) { dest in
-                for (i, byte) in pathBytes.enumerated() {
-                    dest[i] = byte
-                }
-            }
+        // Case 1: We spawned the daemon — terminate directly
+        if let proc = daemonProcess, proc.isRunning {
+            proc.terminate()
+            daemonProcess = nil
+            print("[term-mesh] daemon stopped (tracked process)")
         }
 
-        let connectResult = withUnsafePointer(to: &addr) { ptr in
-            ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { sockPtr in
-                connect(fd, sockPtr, socklen_t(MemoryLayout<sockaddr_un>.size))
-            }
-        }
-        guard connectResult == 0 else { return false }
+        // Case 2: Always pkill to catch externally-started daemons too.
+        // Fast and reliable — no socket I/O or timeouts.
+        let kill = Process()
+        kill.executableURL = URL(fileURLWithPath: "/usr/bin/pkill")
+        kill.arguments = ["term-meshd"]
+        try? kill.run()
+        kill.waitUntilExit()
+        print("[term-mesh] daemon pkill sent")
 
-        var timeout = timeval(tv_sec: 2, tv_usec: 0)
-        setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, socklen_t(MemoryLayout<timeval>.size))
-
-        let sent = jsonString.withCString { ptr in
-            write(fd, ptr, strlen(ptr))
-        }
-        return sent > 0
+        // Clean up socket file
+        try? FileManager.default.removeItem(atPath: socketPath)
     }
 
     // MARK: - RPC Calls
@@ -623,21 +569,31 @@ final class TermMeshDaemon: ObservableObject {
     }
 
     private func daemonBinaryPath() -> String? {
-        // Option 1: Built in the daemon/ directory (development)
-        let devPath = (termMeshEnv("PROJECT_DIR") ?? "")
-            + "/daemon/target/debug/term-meshd"
-        if FileManager.default.fileExists(atPath: devPath) { return devPath }
+        let fm = FileManager.default
+        let projectDir = termMeshEnv("PROJECT_DIR") ?? ""
+
+        // Option 1: Built in the daemon/ directory (development — debug then release)
+        for config in ["debug", "release"] {
+            let path = projectDir + "/daemon/target/\(config)/term-meshd"
+            if !path.hasPrefix("/daemon") && fm.fileExists(atPath: path) { return path }
+        }
 
         // Option 2: Next to the app bundle
         if let bundlePath = Bundle.main.executablePath {
             let dir = (bundlePath as NSString).deletingLastPathComponent
             let bundledPath = (dir as NSString).appendingPathComponent("term-meshd")
-            if FileManager.default.fileExists(atPath: bundledPath) { return bundledPath }
+            if fm.fileExists(atPath: bundledPath) { return bundledPath }
         }
 
-        // Option 3: Hardcoded project path (development fallback)
-        let fallback = "/Users/jinwoo/work/project/cmux/daemon/target/debug/term-meshd"
-        if FileManager.default.fileExists(atPath: fallback) { return fallback }
+        // Option 3: ~/bin/term-meshd (user install via make deploy)
+        let homeBin = (NSHomeDirectory() as NSString).appendingPathComponent("bin/term-meshd")
+        if fm.fileExists(atPath: homeBin) { return homeBin }
+
+        // Option 4: Hardcoded project path (development fallback)
+        for config in ["release", "debug"] {
+            let path = "/Users/jinwoo/work/project/cmux/daemon/target/\(config)/term-meshd"
+            if fm.fileExists(atPath: path) { return path }
+        }
 
         return nil
     }
