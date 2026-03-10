@@ -1939,7 +1939,20 @@ private struct AboutPanelView: View {
             return value
         }
         let env = termMeshEnv("COMMIT") ?? ""
-        return env.isEmpty ? nil : env
+        if !env.isEmpty { return env }
+        // Fallback: read git HEAD
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: "/usr/bin/git")
+        proc.arguments = ["rev-parse", "--short", "HEAD"]
+        proc.currentDirectoryURL = Bundle.main.bundleURL
+        let pipe = Pipe()
+        proc.standardOutput = pipe
+        proc.standardError = Pipe()
+        try? proc.run()
+        proc.waitUntilExit()
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        let hash = String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        return hash.isEmpty ? nil : hash
     }
     private var copyright: String? { Bundle.main.infoDictionary?["NSHumanReadableCopyright"] as? String }
 
@@ -1982,6 +1995,20 @@ private struct AboutPanelView: View {
                 .frame(maxWidth: .infinity)
 
                 HStack(spacing: 8) {
+                    Button {
+                        // No action — link removed
+                    } label: {
+                        Label("Docs", systemImage: "book")
+                    }
+                    .disabled(true)
+
+                    Button {
+                        // No action — link removed
+                    } label: {
+                        Label("GitHub", systemImage: "chevron.left.forwardslash.chevron.right")
+                    }
+                    .disabled(true)
+
                     Button("Licenses") {
                         AcknowledgmentsWindowController.shared.show()
                     }
