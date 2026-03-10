@@ -395,10 +395,13 @@ final class TeamOrchestrator {
             // Select the right environment: non-claude agents don't need CLAUDECODE
             let paneEnv = agentCli == "claude" ? claudeAgentEnv : kiroAgentEnv
 
-            // Grid layout: arrange agents in a 2-row grid so panes stay roughly equal.
-            // Column 0: agents 0,1  Column 1: agents 2,3  Column 2: agents 4,5 ...
-            // First agent per column splits horizontal; second splits vertical.
-            let maxRowsPerColumn = 2
+            // Balanced binary tree split: each agent splits from its tree-parent so
+            // panes stay roughly equal. Agent i splits from agent floor((i-1)/2).
+            // Example for 4 agents (each gets 25% of the right side):
+            //   A0: H from leader (50%)
+            //   A1: V from A0 → A0=25%, A1=25%
+            //   A2: V from A0 → A0=12.5%, A2=12.5%, A1=25%
+            //   A3: V from A1 → all 12.5% (equal)
             let orientation: SplitOrientation
             let splitFrom: UUID
 
@@ -406,16 +409,11 @@ final class TeamOrchestrator {
                 // First agent: split horizontally from leader
                 orientation = .horizontal
                 splitFrom = leaderPanelId
-            } else if index % maxRowsPerColumn == 0 {
-                // First agent of a new column: split horizontally from previous column head
-                let prevColumnHeadIndex = index - maxRowsPerColumn
-                orientation = .horizontal
-                splitFrom = members[prevColumnHeadIndex].panelId
             } else {
-                // Fill column vertically: split from this column's head
-                let columnHeadIndex = index - (index % maxRowsPerColumn)
+                // Balanced tree: split from parent node (the largest available pane)
+                let parentIndex = (index - 1) / 2
                 orientation = .vertical
-                splitFrom = members[columnHeadIndex].panelId
+                splitFrom = members[parentIndex].panelId
             }
 
             guard let panel = workspace.newTerminalSplit(
