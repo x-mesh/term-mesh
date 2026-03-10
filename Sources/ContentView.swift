@@ -1747,11 +1747,6 @@ struct ContentView: View {
                     fullscreenControls
                 }
 
-                // Draggable folder icon + focused command name
-                if let directory = focusedDirectory {
-                    DraggableFolderIcon(directory: directory)
-                }
-
                 Text(titlebarText)
                     .font(.system(size: 13, weight: .bold))
                     .foregroundColor(fakeTitlebarTextColor)
