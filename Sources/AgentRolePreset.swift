@@ -386,6 +386,24 @@ class AgentRolePresetManager: ObservableObject {
             isBuiltIn: true
         ),
 
+        // --- Systems & Infrastructure ---
+        AgentRolePreset(
+            name: "syseng",
+            displayName: "System Engineer",
+            model: "sonnet",
+            color: "red",
+            instructions: """
+            You are a systems engineer. Your job is to:
+            - Diagnose and resolve OS-level issues (processes, memory, disk, network)
+            - Write shell scripts for automation and system administration
+            - Configure services, daemons, and scheduled tasks (systemd, launchd, cron)
+            - Analyze system logs, traces, and metrics for root cause analysis
+            - Harden systems (firewall, permissions, resource limits, audit logging)
+            - Optimize system performance (kernel tuning, I/O scheduling, connection pooling)
+            """,
+            isBuiltIn: true
+        ),
+
         // --- Additional Specialized ---
         AgentRolePreset(
             name: "api",

@@ -352,7 +352,8 @@ struct TeamCreationView: View {
         TeamPreset(name: "Full Stack", icon: "rectangle.stack", roles: ["frontend", "backend", "tester", "reviewer"]),
         TeamPreset(name: "Ship It", icon: "shippingbox", roles: ["executor", "tester", "writer", "devops"]),
         TeamPreset(name: "Research", icon: "book", roles: ["researcher", "architect", "planner"]),
-        TeamPreset(name: "Performance", icon: "gauge.high", roles: ["perf", "debugger", "tester"]),
+        TeamPreset(name: "Performance", icon: "gauge.high", roles: ["perf", "syseng", "debugger"]),
+        TeamPreset(name: "Operations", icon: "server.rack", roles: ["syseng", "devops", "infra", "security"]),
         TeamPreset(name: "Security Audit", icon: "lock.shield", roles: ["security", "reviewer", "explorer"]),
         TeamPreset(name: "Full Team", icon: "person.3.sequence", roles: ["planner", "explorer", "executor", "reviewer", "tester"]),
         TeamPreset(name: "Super Team", icon: "star.circle", roles: [
