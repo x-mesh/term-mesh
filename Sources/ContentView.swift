@@ -1677,6 +1677,13 @@ struct ContentView: View {
                 .opacity(sidebarSelectionState.selection == .notifications ? 1 : 0)
                 .allowsHitTesting(sidebarSelectionState.selection == .notifications)
         }
+        .overlay {
+            if (tabManager.tabs.isEmpty || (tabManager.selectedWorkspace?.panels.isEmpty ?? true))
+                && !hideWelcomeScreen {
+                WelcomeView(onGetStarted: { tabManager.addTab() })
+                    .transition(.opacity)
+            }
+        }
         .padding(.top, titlebarPadding)
         .overlay(alignment: .top) {
             // Titlebar overlay is only over terminal content, not the sidebar.
@@ -1692,6 +1699,8 @@ struct ContentView: View {
     }
 
     @AppStorage("sidebarBlendMode") private var sidebarBlendMode = SidebarBlendModeOption.withinWindow.rawValue
+    @AppStorage("hideWelcomeScreen") private var hideWelcomeScreen: Bool = false
+    @AppStorage("showStatusBar") private var showStatusBar: Bool = true
 
     // Background glass settings
     @AppStorage("bgGlassTintHex") private var bgGlassTintHex = "#000000"
@@ -1892,16 +1901,21 @@ struct ContentView: View {
 
     var body: some View {
         var view = AnyView(
-            contentAndSidebarLayout
-                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
-                .overlay(alignment: .topLeading) {
-                    if isFullScreen && sidebarState.isVisible {
-                        fullscreenControls
-                            .padding(.leading, 10)
-                            .padding(.top, 4)
+            VStack(spacing: 0) {
+                contentAndSidebarLayout
+                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+                    .overlay(alignment: .topLeading) {
+                        if isFullScreen && sidebarState.isVisible {
+                            fullscreenControls
+                                .padding(.leading, 10)
+                                .padding(.top, 4)
+                        }
                     }
+                if showStatusBar {
+                    StatusBarView()
                 }
-                .frame(minWidth: 800, minHeight: 600)
+            }
+            .frame(minWidth: 800, minHeight: 600)
                 .background(Color.clear)
         )
 
