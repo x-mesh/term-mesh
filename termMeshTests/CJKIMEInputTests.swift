@@ -709,6 +709,101 @@ final class CJKIMEFirstRectTests: XCTestCase {
     }
 }
 
+// MARK: - IME position stabilization during composition
+
+/// Tests that the IME candidate window position stays frozen during active
+/// composition. TUI apps like ink (Claude Code) rapidly reposition the physical
+/// cursor during re-renders, which would cause the IME window to jump around.
+final class CJKIMEPositionStabilizationTests: XCTestCase {
+
+    func testFirstRectStabilizedDuringComposition() {
+        let frame = NSRect(x: 0, y: 0, width: 800, height: 600)
+        let view = GhosttyNSView(frame: frame)
+        view.cellSize = CGSize(width: 10, height: 20)
+
+        let window = NSWindow(
+            contentRect: NSRect(x: 100, y: 100, width: 800, height: 600),
+            styleMask: [.titled],
+            backing: .buffered,
+            defer: false
+        )
+        let content = NSView(frame: frame)
+        window.contentView = content
+        content.addSubview(view)
+        view.frame = frame
+
+        defer {
+            view.clearIMEPointForTesting()
+            window.orderOut(nil)
+        }
+
+        // 1. Set IME point at (100, 200) — this is where the user starts typing
+        view.setIMEPointForTesting(x: 100, y: 200, width: 10, height: 20)
+
+        // 2. Begin composition by calling setMarkedText (simulating Korean input ㅎ)
+        view.setMarkedText("ㅎ", selectedRange: NSRange(location: 0, length: 1), replacementRange: NSRange(location: NSNotFound, length: 0))
+        XCTAssertTrue(view.hasMarkedText())
+
+        let rectDuringComposition = view.firstRect(forCharacterRange: NSRange(location: 0, length: 1), actualRange: nil)
+
+        // 3. Simulate ink moving cursor to bottom of screen during re-render
+        view.setIMEPointForTesting(x: 0, y: 580, width: 10, height: 20)
+
+        // 4. firstRect should still return the stabilized position, not the new one
+        let rectAfterCursorMove = view.firstRect(forCharacterRange: NSRange(location: 0, length: 1), actualRange: nil)
+        XCTAssertEqual(rectDuringComposition.origin.x, rectAfterCursorMove.origin.x, accuracy: 0.001,
+            "IME rect X should be stabilized during composition")
+        XCTAssertEqual(rectDuringComposition.origin.y, rectAfterCursorMove.origin.y, accuracy: 0.001,
+            "IME rect Y should be stabilized during composition")
+
+        // 5. End composition — unmarkText should release the stabilized position
+        view.unmarkText()
+        XCTAssertFalse(view.hasMarkedText())
+
+        // 6. After composition ends, firstRect should use the new cursor position
+        let rectAfterComposition = view.firstRect(forCharacterRange: NSRange(location: 0, length: 1), actualRange: nil)
+        XCTAssertNotEqual(rectDuringComposition.origin.y, rectAfterComposition.origin.y,
+            "IME rect should update after composition ends")
+    }
+
+    func testFirstRectClampsToBounds() {
+        let frame = NSRect(x: 0, y: 0, width: 400, height: 300)
+        let view = GhosttyNSView(frame: frame)
+        view.cellSize = CGSize(width: 8, height: 16)
+
+        let window = NSWindow(
+            contentRect: NSRect(x: 50, y: 50, width: 400, height: 300),
+            styleMask: [.titled],
+            backing: .buffered,
+            defer: false
+        )
+        let content = NSView(frame: frame)
+        window.contentView = content
+        content.addSubview(view)
+        view.frame = frame
+
+        defer {
+            view.clearIMEPointForTesting()
+            window.orderOut(nil)
+        }
+
+        // Set IME point beyond view bounds
+        view.setIMEPointForTesting(x: 500, y: 400, width: 8, height: 16)
+
+        let rect = view.firstRect(forCharacterRange: NSRange(location: 0, length: 1), actualRange: nil)
+
+        // The clamped x: min(500, 400-8) = 392, y: min(400, 300-16) = 284
+        // Then converted: viewRect.y = 300 - 284 = 16
+        let expectedViewRect = NSRect(x: 392, y: 300 - 284, width: 8, height: 16)
+        let expectedScreenRect = window.convertToScreen(view.convert(expectedViewRect, to: nil))
+
+        XCTAssertEqual(rect.origin.x, expectedScreenRect.origin.x, accuracy: 0.001,
+            "IME rect X should be clamped to view bounds")
+        XCTAssertEqual(rect.origin.y, expectedScreenRect.origin.y, accuracy: 0.001,
+            "IME rect Y should be clamped to view bounds")
+    }
+}
+
 // MARK: - Key text accumulator during CJK IME composition
 
 /// Tests that the keyTextAccumulator correctly manages text during the keyDown

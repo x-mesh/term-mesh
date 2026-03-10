@@ -5618,43 +5618,43 @@ final class BrowserLinkOpenSettingsTests: XCTestCase {
     }
 
     func testTerminalLinksDefaultToCmuxBrowser() {
-        XCTAssertTrue(BrowserLinkOpenSettings.openTerminalLinksInCmuxBrowser(defaults: defaults))
+        XCTAssertTrue(BrowserLinkOpenSettings.openTerminalLinksInTermMeshBrowser(defaults: defaults))
     }
 
     func testTerminalLinksPreferenceUsesStoredValue() {
-        defaults.set(false, forKey: BrowserLinkOpenSettings.openTerminalLinksInCmuxBrowserKey)
-        XCTAssertFalse(BrowserLinkOpenSettings.openTerminalLinksInCmuxBrowser(defaults: defaults))
+        defaults.set(false, forKey: BrowserLinkOpenSettings.openTerminalLinksInTermMeshBrowserKey)
+        XCTAssertFalse(BrowserLinkOpenSettings.openTerminalLinksInTermMeshBrowser(defaults: defaults))
 
-        defaults.set(true, forKey: BrowserLinkOpenSettings.openTerminalLinksInCmuxBrowserKey)
-        XCTAssertTrue(BrowserLinkOpenSettings.openTerminalLinksInCmuxBrowser(defaults: defaults))
+        defaults.set(true, forKey: BrowserLinkOpenSettings.openTerminalLinksInTermMeshBrowserKey)
+        XCTAssertTrue(BrowserLinkOpenSettings.openTerminalLinksInTermMeshBrowser(defaults: defaults))
     }
 
     func testOpenCommandInterceptionDefaultsToCmuxBrowser() {
-        XCTAssertTrue(BrowserLinkOpenSettings.interceptTerminalOpenCommandInCmuxBrowser(defaults: defaults))
+        XCTAssertTrue(BrowserLinkOpenSettings.interceptTerminalOpenCommandInTermMeshBrowser(defaults: defaults))
     }
 
     func testOpenCommandInterceptionUsesStoredValue() {
-        defaults.set(false, forKey: BrowserLinkOpenSettings.interceptTerminalOpenCommandInCmuxBrowserKey)
-        XCTAssertFalse(BrowserLinkOpenSettings.interceptTerminalOpenCommandInCmuxBrowser(defaults: defaults))
+        defaults.set(false, forKey: BrowserLinkOpenSettings.interceptTerminalOpenCommandInTermMeshBrowserKey)
+        XCTAssertFalse(BrowserLinkOpenSettings.interceptTerminalOpenCommandInTermMeshBrowser(defaults: defaults))
 
-        defaults.set(true, forKey: BrowserLinkOpenSettings.interceptTerminalOpenCommandInCmuxBrowserKey)
-        XCTAssertTrue(BrowserLinkOpenSettings.interceptTerminalOpenCommandInCmuxBrowser(defaults: defaults))
+        defaults.set(true, forKey: BrowserLinkOpenSettings.interceptTerminalOpenCommandInTermMeshBrowserKey)
+        XCTAssertTrue(BrowserLinkOpenSettings.interceptTerminalOpenCommandInTermMeshBrowser(defaults: defaults))
     }
 
     func testOpenCommandInterceptionFallsBackToLegacyLinkToggleWhenUnset() {
-        defaults.set(false, forKey: BrowserLinkOpenSettings.openTerminalLinksInCmuxBrowserKey)
-        XCTAssertFalse(BrowserLinkOpenSettings.interceptTerminalOpenCommandInCmuxBrowser(defaults: defaults))
+        defaults.set(false, forKey: BrowserLinkOpenSettings.openTerminalLinksInTermMeshBrowserKey)
+        XCTAssertFalse(BrowserLinkOpenSettings.interceptTerminalOpenCommandInTermMeshBrowser(defaults: defaults))
 
-        defaults.set(true, forKey: BrowserLinkOpenSettings.openTerminalLinksInCmuxBrowserKey)
-        XCTAssertTrue(BrowserLinkOpenSettings.interceptTerminalOpenCommandInCmuxBrowser(defaults: defaults))
+        defaults.set(true, forKey: BrowserLinkOpenSettings.openTerminalLinksInTermMeshBrowserKey)
+        XCTAssertTrue(BrowserLinkOpenSettings.interceptTerminalOpenCommandInTermMeshBrowser(defaults: defaults))
     }
 
     func testSettingsInitialOpenCommandInterceptionValueFallsBackToLegacyLinkToggleWhenUnset() {
-        defaults.set(false, forKey: BrowserLinkOpenSettings.openTerminalLinksInCmuxBrowserKey)
-        XCTAssertFalse(BrowserLinkOpenSettings.initialInterceptTerminalOpenCommandInCmuxBrowserValue(defaults: defaults))
+        defaults.set(false, forKey: BrowserLinkOpenSettings.openTerminalLinksInTermMeshBrowserKey)
+        XCTAssertFalse(BrowserLinkOpenSettings.initialInterceptTerminalOpenCommandInTermMeshBrowserValue(defaults: defaults))
 
-        defaults.set(true, forKey: BrowserLinkOpenSettings.openTerminalLinksInCmuxBrowserKey)
-        XCTAssertTrue(BrowserLinkOpenSettings.initialInterceptTerminalOpenCommandInCmuxBrowserValue(defaults: defaults))
+        defaults.set(true, forKey: BrowserLinkOpenSettings.openTerminalLinksInTermMeshBrowserKey)
+        XCTAssertTrue(BrowserLinkOpenSettings.initialInterceptTerminalOpenCommandInTermMeshBrowserValue(defaults: defaults))
     }
 }
 
