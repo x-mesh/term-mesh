@@ -1,7 +1,10 @@
 # term-mesh Makefile
 # Usage:
 #   make build          — Xcode Debug build + Rust daemon release build
-#   make deploy         — build + copy to /Applications + launch
+#   make prod           — Xcode Release build + Rust daemon release build
+#   make deploy         — Debug build + copy to /Applications + launch
+#   make deploy-prod    — Release build + copy to /Applications + launch
+#   make dmg            — Release build + create distributable DMG
 #   make run            — launch from /Applications (no build)
 #   make stop           — stop running app + daemon
 #   make clean          — remove build artifacts
@@ -11,13 +14,16 @@
 TAG           ?= term-mesh
 DERIVED_DATA  := /tmp/term-mesh-$(TAG)
 BUILD_DIR     := $(DERIVED_DATA)/Build/Products/Debug
+PROD_DIR      := /tmp/term-mesh-prod/Build/Products/Release
 SRC_APP       := $(BUILD_DIR)/term-mesh DEV $(TAG).app
 BASE_APP      := $(BUILD_DIR)/term-mesh DEV.app
+PROD_APP      := $(PROD_DIR)/term-mesh.app
 INSTALL_APP   := /Applications/term-mesh.app
 BUNDLE_ID     := com.term-mesh.app.debug
+DMG_NAME      := term-mesh-macos.dmg
 PROJECT_DIR   := $(shell pwd)
 
-.PHONY: build deploy run stop clean daemon test
+.PHONY: build prod deploy deploy-prod dmg run stop clean daemon test
 
 build:
 	@echo "==> Building Xcode (Debug)..."
@@ -91,8 +97,84 @@ stop:
 	@-pkill -f term-meshd 2>/dev/null || true
 	@echo "==> Stopped"
 
+prod:
+	@echo "==> Building Xcode (Release)..."
+	@xcodebuild \
+		-project GhosttyTabs.xcodeproj \
+		-scheme term-mesh \
+		-configuration Release \
+		-destination 'platform=macOS' \
+		-derivedDataPath /tmp/term-mesh-prod \
+		build 2>&1 | tee /tmp/term-mesh-xcodebuild-prod.log | grep -E '(warning:|error:|BUILD|Compiling)'; \
+		RESULT=$${PIPESTATUS[0]}; \
+		if [ $$RESULT -ne 0 ]; then \
+			echo "==> Release build FAILED (exit $$RESULT). Full log: /tmp/term-mesh-xcodebuild-prod.log"; \
+			tail -20 /tmp/term-mesh-xcodebuild-prod.log; \
+			exit 1; \
+		fi
+	@echo "==> Building Rust daemon (release)..."
+	@cd daemon && cargo build --release 2>&1 | grep -v "Compiling " || true
+	@echo "==> Release build complete: $(PROD_APP)"
+
+deploy-prod: prod
+	@echo "==> Stopping existing app + daemon..."
+	@-pkill -f "term-mesh.app/Contents/MacOS" 2>/dev/null || true
+	@-pkill -f "term-mesh DEV" 2>/dev/null || true
+	@-pkill term-meshd 2>/dev/null || true
+	@sleep 1
+	@-pkill -9 term-meshd 2>/dev/null || true
+	@sleep 0.3
+	@echo "==> Deploying Release to $(INSTALL_APP)..."
+	@rm -rf "$(INSTALL_APP)"
+	@cp -R "$(PROD_APP)" "$(INSTALL_APP)"
+	@mkdir -p "$(INSTALL_APP)/Contents/Resources/bin"
+	@cp "$(PROJECT_DIR)/daemon/target/release/term-meshd" "$(INSTALL_APP)/Contents/Resources/bin/term-meshd"
+	@cp "$(PROJECT_DIR)/daemon/target/release/term-mesh-run" "$(INSTALL_APP)/Contents/Resources/bin/term-mesh-run"
+	@ln -sf "$(INSTALL_APP)/Contents/Resources/bin/term-mesh" "$(HOME)/bin/term-mesh"
+	@ln -sf "$(PROJECT_DIR)/daemon/target/release/term-meshd" "$(HOME)/bin/term-meshd"
+	@ln -sf "$(PROJECT_DIR)/daemon/target/release/term-mesh-run" "$(HOME)/bin/term-mesh-run"
+	@echo "==> Starting daemon..."
+	@nohup "$(HOME)/bin/term-meshd" > /tmp/term-meshd.log 2>&1 & sleep 0.5
+	@echo "==> Launching term-mesh..."
+	@open "$(INSTALL_APP)"
+	@echo "==> Deployed Release to $(INSTALL_APP)"
+
+dmg: prod
+	@echo "==> Creating DMG..."
+	@rm -f "$(DMG_NAME)"
+	@if command -v create-dmg >/dev/null 2>&1; then \
+		STAGING=$$(mktemp -d); \
+		cp -R "$(PROD_APP)" "$$STAGING/term-mesh.app"; \
+		mkdir -p "$$STAGING/term-mesh.app/Contents/Resources/bin"; \
+		cp "$(PROJECT_DIR)/daemon/target/release/term-meshd" "$$STAGING/term-mesh.app/Contents/Resources/bin/term-meshd"; \
+		cp "$(PROJECT_DIR)/daemon/target/release/term-mesh-run" "$$STAGING/term-mesh.app/Contents/Resources/bin/term-mesh-run"; \
+		create-dmg \
+			--volname "term-mesh" \
+			--window-pos 200 120 \
+			--window-size 600 400 \
+			--icon-size 100 \
+			--icon "term-mesh.app" 150 185 \
+			--app-drop-link 450 185 \
+			--no-internet-enable \
+			"$(DMG_NAME)" "$$STAGING"; \
+		rm -rf "$$STAGING"; \
+	else \
+		echo "==> create-dmg not found, using hdiutil fallback..."; \
+		STAGING=$$(mktemp -d); \
+		cp -R "$(PROD_APP)" "$$STAGING/term-mesh.app"; \
+		mkdir -p "$$STAGING/term-mesh.app/Contents/Resources/bin"; \
+		cp "$(PROJECT_DIR)/daemon/target/release/term-meshd" "$$STAGING/term-mesh.app/Contents/Resources/bin/term-meshd"; \
+		cp "$(PROJECT_DIR)/daemon/target/release/term-mesh-run" "$$STAGING/term-mesh.app/Contents/Resources/bin/term-mesh-run"; \
+		ln -s /Applications "$$STAGING/Applications"; \
+		hdiutil create -volname "term-mesh" -srcfolder "$$STAGING" -ov -format UDZO "$(DMG_NAME)"; \
+		rm -rf "$$STAGING"; \
+	fi
+	@echo "==> DMG created: $(DMG_NAME)"
+	@echo "    Install: open $(DMG_NAME), drag term-mesh to Applications"
+	@echo "    Unsigned: run 'xattr -cr /Applications/term-mesh.app' after install"
+
 clean:
 	@echo "==> Cleaning build artifacts..."
-	@rm -rf "$(DERIVED_DATA)"
+	@rm -rf "$(DERIVED_DATA)" /tmp/term-mesh-prod
 	@cd daemon && cargo clean
 	@echo "==> Clean complete"
