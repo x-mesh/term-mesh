@@ -1113,7 +1113,7 @@ final class BrowserPanel: Panel, ObservableObject {
     private static func resolvedGhosttyBackgroundColor(from notification: Notification? = nil) -> NSColor {
         let userInfo = notification?.userInfo
         let baseColor = (userInfo?[GhosttyNotificationKey.backgroundColor] as? NSColor)
-            ?? GhosttyApp.shared.defaultBackgroundColor
+            ?? GhosttyTheme.current.backgroundColor
 
         let opacity: Double
         if let value = userInfo?[GhosttyNotificationKey.backgroundOpacity] as? Double {
@@ -1121,7 +1121,7 @@ final class BrowserPanel: Panel, ObservableObject {
         } else if let value = userInfo?[GhosttyNotificationKey.backgroundOpacity] as? NSNumber {
             opacity = value.doubleValue
         } else {
-            opacity = GhosttyApp.shared.defaultBackgroundOpacity
+            opacity = GhosttyTheme.current.backgroundOpacity
         }
 
         return baseColor.withAlphaComponent(clampedGhosttyBackgroundOpacity(opacity))

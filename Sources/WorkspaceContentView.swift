@@ -161,7 +161,7 @@ struct WorkspaceContentView: View {
         reason: String = "unspecified",
         backgroundOverride: NSColor? = nil,
         loadConfig: () -> GhosttyConfig = GhosttyConfig.load,
-        defaultBackground: () -> NSColor = { GhosttyApp.shared.defaultBackgroundColor }
+        defaultBackground: () -> NSColor = { GhosttyTheme.current.backgroundColor }
     ) -> GhosttyConfig {
         var next = loadConfig()
         let loadedBackgroundHex = next.backgroundColor.hexString()
@@ -178,11 +178,9 @@ struct WorkspaceContentView: View {
         }
 
         next.backgroundColor = resolvedBackground
-        if GhosttyApp.shared.backgroundLogEnabled {
-            GhosttyApp.shared.logBackground(
-                "theme resolve reason=\(reason) loadedBg=\(loadedBackgroundHex) overrideBg=\(backgroundOverride?.hexString() ?? "nil") defaultBg=\(defaultBackgroundHex) finalBg=\(next.backgroundColor.hexString()) theme=\(next.theme ?? "nil")"
-            )
-        }
+        GhosttyApp.shared.logBackgroundIfEnabled(
+            "theme resolve reason=\(reason) loadedBg=\(loadedBackgroundHex) overrideBg=\(backgroundOverride?.hexString() ?? "nil") defaultBg=\(defaultBackgroundHex) finalBg=\(next.backgroundColor.hexString()) theme=\(next.theme ?? "nil")"
+        )
         return next
     }
 
@@ -244,8 +242,7 @@ struct WorkspaceContentView: View {
     }
 
     private func logTheme(_ message: String) {
-        guard GhosttyApp.shared.backgroundLogEnabled else { return }
-        GhosttyApp.shared.logBackground(message)
+        GhosttyApp.shared.logBackgroundIfEnabled(message)
     }
 }
 

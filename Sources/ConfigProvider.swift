@@ -13,3 +13,10 @@ protocol GhosttyConfigProvider: AnyObject {
 }
 
 extension GhosttyApp: GhosttyConfigProvider {}
+
+extension GhosttyConfigProvider {
+    func logBackgroundIfEnabled(_ message: @autoclosure () -> String) {
+        guard backgroundLogEnabled else { return }
+        logBackground(message())
+    }
+}

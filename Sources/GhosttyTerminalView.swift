@@ -1189,12 +1189,9 @@ static func focusLog(_ message: String) {
 
     override func viewDidChangeEffectiveAppearance() {
         super.viewDidChangeEffectiveAppearance()
-        if GhosttyApp.shared.backgroundLogEnabled {
-            let bestMatch = effectiveAppearance.bestMatch(from: [.darkAqua, .aqua])
-            GhosttyApp.shared.logBackground(
-                "surface appearance changed tab=\(tabId?.uuidString ?? "nil") surface=\(terminalSurface?.id.uuidString ?? "nil") bestMatch=\(bestMatch?.rawValue ?? "nil")"
-            )
-        }
+        GhosttyApp.shared.logBackgroundIfEnabled(
+            "surface appearance changed tab=\(tabId?.uuidString ?? "nil") surface=\(terminalSurface?.id.uuidString ?? "nil") bestMatch=\(effectiveAppearance.bestMatch(from: [.darkAqua, .aqua])?.rawValue ?? "nil")"
+        )
         applySurfaceColorScheme()
     }
 
@@ -1363,22 +1360,16 @@ func pushTargetSurfaceSize(_ size: CGSize) {
             ? GHOSTTY_COLOR_SCHEME_DARK
             : GHOSTTY_COLOR_SCHEME_LIGHT
         if !force, appliedColorScheme == scheme {
-            if GhosttyApp.shared.backgroundLogEnabled {
-                let schemeLabel = scheme == GHOSTTY_COLOR_SCHEME_DARK ? "dark" : "light"
-                GhosttyApp.shared.logBackground(
-                    "surface color scheme tab=\(tabId?.uuidString ?? "nil") surface=\(terminalSurface?.id.uuidString ?? "nil") bestMatch=\(bestMatch?.rawValue ?? "nil") scheme=\(schemeLabel) force=\(force) applied=false"
-                )
-            }
+            GhosttyApp.shared.logBackgroundIfEnabled(
+                "surface color scheme tab=\(tabId?.uuidString ?? "nil") surface=\(terminalSurface?.id.uuidString ?? "nil") bestMatch=\(bestMatch?.rawValue ?? "nil") scheme=\(scheme == GHOSTTY_COLOR_SCHEME_DARK ? "dark" : "light") force=\(force) applied=false"
+            )
             return
         }
         ghostty_surface_set_color_scheme(surface, scheme)
         appliedColorScheme = scheme
-        if GhosttyApp.shared.backgroundLogEnabled {
-            let schemeLabel = scheme == GHOSTTY_COLOR_SCHEME_DARK ? "dark" : "light"
-            GhosttyApp.shared.logBackground(
-                "surface color scheme tab=\(tabId?.uuidString ?? "nil") surface=\(terminalSurface?.id.uuidString ?? "nil") bestMatch=\(bestMatch?.rawValue ?? "nil") scheme=\(schemeLabel) force=\(force) applied=true"
-            )
-        }
+        GhosttyApp.shared.logBackgroundIfEnabled(
+            "surface color scheme tab=\(tabId?.uuidString ?? "nil") surface=\(terminalSurface?.id.uuidString ?? "nil") bestMatch=\(bestMatch?.rawValue ?? "nil") scheme=\(scheme == GHOSTTY_COLOR_SCHEME_DARK ? "dark" : "light") force=\(force) applied=true"
+        )
     }
 
     @discardableResult

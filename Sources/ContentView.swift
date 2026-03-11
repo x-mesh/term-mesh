@@ -925,14 +925,9 @@ struct ContentView: View {
     ) {
         let previousGeneration = titlebarThemeGeneration
         titlebarThemeGeneration &+= 1
-        if GhosttyApp.shared.backgroundLogEnabled {
-            let eventLabel = backgroundEventId.map(String.init) ?? "nil"
-            let sourceLabel = backgroundSource ?? "nil"
-            let payloadLabel = notificationPayloadHex ?? "nil"
-            GhosttyApp.shared.logBackground(
-                "titlebar theme refresh scheduled reason=\(reason) event=\(eventLabel) source=\(sourceLabel) payload=\(payloadLabel) previousGeneration=\(previousGeneration) generation=\(titlebarThemeGeneration) appBg=\(GhosttyApp.shared.defaultBackgroundColor.hexString()) appOpacity=\(String(format: "%.3f", GhosttyApp.shared.defaultBackgroundOpacity))"
-            )
-        }
+        GhosttyApp.shared.logBackgroundIfEnabled(
+            "titlebar theme refresh scheduled reason=\(reason) event=\(backgroundEventId.map(String.init) ?? "nil") source=\(backgroundSource ?? "nil") payload=\(notificationPayloadHex ?? "nil") previousGeneration=\(previousGeneration) generation=\(titlebarThemeGeneration) appBg=\(GhosttyApp.shared.defaultBackgroundColor.hexString()) appOpacity=\(String(format: "%.3f", GhosttyApp.shared.defaultBackgroundOpacity))"
+        )
     }
 
     private func scheduleTitlebarThemeRefreshFromWorkspace(
@@ -943,8 +938,7 @@ struct ContentView: View {
         notificationPayloadHex: String?
     ) {
         guard tabManager.selectedTabId == workspaceId else {
-            guard GhosttyApp.shared.backgroundLogEnabled else { return }
-            GhosttyApp.shared.logBackground(
+            GhosttyApp.shared.logBackgroundIfEnabled(
                 "titlebar theme refresh skipped workspace=\(workspaceId.uuidString) selected=\(tabManager.selectedTabId?.uuidString ?? "nil") reason=\(reason)"
             )
             return
@@ -1115,8 +1109,7 @@ struct ContentView: View {
         })
 
         view = AnyView(view.onChange(of: titlebarThemeGeneration) { oldValue, newValue in
-            guard GhosttyApp.shared.backgroundLogEnabled else { return }
-            GhosttyApp.shared.logBackground(
+            GhosttyApp.shared.logBackgroundIfEnabled(
                 "titlebar theme refresh applied oldGeneration=\(oldValue) generation=\(newValue) appBg=\(GhosttyApp.shared.defaultBackgroundColor.hexString()) appOpacity=\(String(format: "%.3f", GhosttyApp.shared.defaultBackgroundOpacity))"
             )
         })

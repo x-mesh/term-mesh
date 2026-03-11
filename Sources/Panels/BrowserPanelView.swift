@@ -203,6 +203,7 @@ struct BrowserPanelView: View {
     let portalPriority: Int
     let onRequestPanelFocus: () -> Void
     @Environment(\.colorScheme) private var colorScheme
+    @Environment(\.ghosttyTheme) private var ghosttyTheme
     @State private var omnibarState = OmnibarState()
     @State private var addressBarFocused: Bool = false
     @AppStorage(BrowserSearchSettings.searchEngineKey) private var searchEngineRaw = BrowserSearchSettings.defaultSearchEngine.rawValue
@@ -270,7 +271,7 @@ struct BrowserPanelView: View {
     private var browserChromeBackgroundColor: NSColor {
         resolvedBrowserChromeBackgroundColor(
             for: colorScheme,
-            themeBackgroundColor: GhosttyApp.shared.defaultBackgroundColor
+            themeBackgroundColor: ghosttyTheme.backgroundColor
         )
     }
 

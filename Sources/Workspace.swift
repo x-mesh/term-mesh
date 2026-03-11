@@ -158,23 +158,17 @@ final class Workspace: Identifiable, ObservableObject {
         let isNoOp = currentChromeColors.backgroundHex == nextChromeColors.backgroundHex &&
             currentChromeColors.borderHex == nextChromeColors.borderHex
 
-        if GhosttyApp.shared.backgroundLogEnabled {
-            let currentBackgroundHex = currentChromeColors.backgroundHex ?? "nil"
-            let nextBackgroundHex = nextChromeColors.backgroundHex ?? "nil"
-            GhosttyApp.shared.logBackground(
-                "theme apply workspace=\(id.uuidString) reason=\(reason) currentBg=\(currentBackgroundHex) nextBg=\(nextBackgroundHex) currentBorder=\(currentChromeColors.borderHex ?? "nil") nextBorder=\(nextChromeColors.borderHex ?? "nil") noop=\(isNoOp)"
-            )
-        }
+        GhosttyApp.shared.logBackgroundIfEnabled(
+            "theme apply workspace=\(id.uuidString) reason=\(reason) currentBg=\(currentChromeColors.backgroundHex ?? "nil") nextBg=\(nextChromeColors.backgroundHex ?? "nil") currentBorder=\(currentChromeColors.borderHex ?? "nil") nextBorder=\(nextChromeColors.borderHex ?? "nil") noop=\(isNoOp)"
+        )
 
         if isNoOp {
             return
         }
         bonsplitController.configuration.appearance.chromeColors = nextChromeColors
-        if GhosttyApp.shared.backgroundLogEnabled {
-            GhosttyApp.shared.logBackground(
-                "theme applied workspace=\(id.uuidString) reason=\(reason) resultingBg=\(bonsplitController.configuration.appearance.chromeColors.backgroundHex ?? "nil") resultingBorder=\(bonsplitController.configuration.appearance.chromeColors.borderHex ?? "nil")"
-            )
-        }
+        GhosttyApp.shared.logBackgroundIfEnabled(
+            "theme applied workspace=\(id.uuidString) reason=\(reason) resultingBg=\(bonsplitController.configuration.appearance.chromeColors.backgroundHex ?? "nil") resultingBorder=\(bonsplitController.configuration.appearance.chromeColors.borderHex ?? "nil")"
+        )
     }
 
     init(

@@ -291,10 +291,10 @@ final class GhosttySurfaceScrollView: NSView {
         layer?.masksToBounds = true
 
         backgroundView.wantsLayer = true
-        backgroundView.layer?.backgroundColor =
-            GhosttyApp.shared.defaultBackgroundColor
-                .withAlphaComponent(GhosttyApp.shared.defaultBackgroundOpacity)
-                .cgColor
+        backgroundView.layer?.backgroundColor = {
+            let theme = GhosttyTheme.current
+            return theme.backgroundColor.withAlphaComponent(theme.backgroundOpacity).cgColor
+        }()
         addSubview(backgroundView)
         addSubview(scrollView)
         inactiveOverlayView.wantsLayer = true
