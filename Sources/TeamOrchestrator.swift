@@ -229,11 +229,30 @@ final class TeamOrchestrator {
         let leaderCommand: String?
         switch leaderMode {
         case "repl":
-            let scriptPath = leaderScriptPath(mode: "repl")
+            let scriptPath = leaderScriptPath(mode: "repl", workingDirectory: workingDirectory)
             leaderCommand = scriptPath.map { "\($0) \(socketPath) \(name)" }
         case "claude":
-            let scriptPath = leaderScriptPath(mode: "claude")
-            leaderCommand = scriptPath.map { "\($0) \(socketPath) \(name)" }
+            if let claudePath = agentBinaryPath(cli: "claude") {
+                // Build system prompt from input agent specs (available before panes are created)
+                let scriptDir = Self.findScriptsDir(workingDirectory: workingDirectory)
+                let agentListStr = agents.enumerated().map { i, a in
+                    "  \(i + 1). \(a.name) (\(a.agentType))"
+                }.joined(separator: "\n")
+                let teamPy = "\(scriptDir)/team.py"
+                let systemPrompt = Self.buildLeaderClaudeSystemPrompt(
+                    teamName: name,
+                    agentList: agentListStr,
+                    teamPy: teamPy,
+                    socketPath: socketPath
+                )
+                // Write to temp file to avoid shell escaping issues with multiline prompt
+                let promptFile = "/tmp/term-mesh-leader-\(name)-prompt.txt"
+                try? systemPrompt.write(toFile: promptFile, atomically: true, encoding: .utf8)
+                let quotedPath = claudePath.contains(" ") ? "\"\(claudePath)\"" : claudePath
+                leaderCommand = "unset CLAUDECODE; \(quotedPath) --system-prompt \"$(cat '\(promptFile)')\" --dangerously-skip-permissions"
+            } else {
+                leaderCommand = nil
+            }
         case "kiro":
             if let path = agentBinaryPath(cli: "kiro") {
                 leaderCommand = buildKiroCommand(kiroPath: path, agentName: "leader", teamName: name, model: "sonnet", isLeader: true)
@@ -508,26 +527,127 @@ final class TeamOrchestrator {
     }
 
     /// Find the leader script for the given mode.
-    private func leaderScriptPath(mode: String) -> String? {
+    private func leaderScriptPath(mode: String, workingDirectory: String? = nil) -> String? {
         let filename = mode == "claude" ? "team-leader-claude.sh" : "team-leader.sh"
-        // Look relative to the working directory first (dev mode)
+        // Look relative to the working directory (project root)
+        if let wd = workingDirectory {
+            let wdPath = (wd as NSString).appendingPathComponent("scripts/\(filename)")
+            if FileManager.default.fileExists(atPath: wdPath) { return wdPath }
+        }
+        // Fallback: relative to app CWD (legacy dev mode)
         let devPath = "scripts/\(filename)"
         if FileManager.default.fileExists(atPath: devPath) { return devPath }
         // Try absolute from known project locations
         let home = NSHomeDirectory()
-        let projectPath = "\(home)/work/project/cmux/scripts/\(filename)"
-        if FileManager.default.fileExists(atPath: projectPath) { return projectPath }
+        for projectDir in ["cmux-term-mesh", "project/cmux", "project/term-mesh"] {
+            let projectPath = "\(home)/work/\(projectDir)/scripts/\(filename)"
+            if FileManager.default.fileExists(atPath: projectPath) { return projectPath }
+        }
         return nil
     }
 
     /// Find the scripts/ directory (for team.py path in leader prompts).
     private static func findScriptsDir(workingDirectory: String) -> String {
+        // Check relative to working directory first (the project root)
+        let wdPath = (workingDirectory as NSString).appendingPathComponent("scripts")
+        if FileManager.default.fileExists(atPath: wdPath) { return wdPath }
+        // Fallback: relative to app CWD (legacy dev mode)
         let devPath = "scripts"
         if FileManager.default.fileExists(atPath: devPath) { return devPath }
+        // Fallback: known project locations
         let home = NSHomeDirectory()
-        let projectPath = "\(home)/work/project/cmux/scripts"
-        if FileManager.default.fileExists(atPath: projectPath) { return projectPath }
-        return "scripts"  // fallback
+        for projectDir in ["cmux-term-mesh", "project/cmux", "project/term-mesh"] {
+            let projectPath = "\(home)/work/\(projectDir)/scripts"
+            if FileManager.default.fileExists(atPath: projectPath) { return projectPath }
+        }
+        return "\(workingDirectory)/scripts"  // fallback to working directory
+    }
+
+    /// Build system prompt for Claude leader (launched directly, no shell script wrapper).
+    private static func buildLeaderClaudeSystemPrompt(
+        teamName: String,
+        agentList: String,
+        teamPy: String,
+        socketPath: String
+    ) -> String {
+        return """
+        You are the TEAM LEADER for team '\(teamName)'. You direct a group of Claude agent workers running in terminal split panes.
+
+        ## Your Agents
+        \(agentList)
+
+        ## Operating Model
+
+        Task objects are the canonical unit of delegation.
+        Messages are conversational transport. Reports are result summaries.
+        Manage by task state and inbox, not by ad hoc chat alone.
+        Before sending meaningful work, create a task and assign it.
+
+        ## How to Command Agents
+
+        Create a task and delegate it to a specific agent:
+        ```
+        \(teamPy) delegate <agent_name> '<your instruction>'
+        ```
+
+        Send a raw direct message:
+        ```
+        \(teamPy) send <agent_name> '<your instruction>'
+        ```
+
+        Broadcast to all agents:
+        ```
+        \(teamPy) broadcast '<your instruction>'
+        ```
+
+        Check team status / inbox:
+        ```
+        \(teamPy) status
+        \(teamPy) inbox
+        ```
+
+        ## Reading Agent Results (MANDATORY)
+
+        After sending tasks, you MUST collect results before responding.
+        NEVER answer using only your own analysis when agents were delegated.
+
+        ```
+        \(teamPy) read <agent_name> --lines 100
+        \(teamPy) collect --lines 100
+        \(teamPy) wait --timeout 120
+        \(teamPy) wait --mode blocked --timeout 120
+        \(teamPy) wait --mode review_ready --timeout 120
+        ```
+
+        ## Message Channel
+        ```
+        \(teamPy) msg list
+        \(teamPy) msg list --from <agent_name>
+        ```
+
+        ## Task Board
+        ```
+        \(teamPy) task create '<title>' --assign <agent_name> --priority 2
+        \(teamPy) task list
+        \(teamPy) task get <id>
+        \(teamPy) task start <id> --assign <agent_name>
+        \(teamPy) task block <id> '<reason>'
+        \(teamPy) task review <id> '<summary>'
+        \(teamPy) task done <id> '<result>'
+        ```
+
+        ## Your Role
+        1. Break down user tasks and create explicit tasks before delegating
+        2. Use agent specialties to route work effectively
+        3. AFTER delegating, ALWAYS read agent results using read/collect/wait before responding
+        4. Check inbox before responding to the user
+        5. Treat blocked and review_ready as first-class control points
+        6. Coordinate between agents when tasks have dependencies
+        7. Synthesize agent results and report back to the user
+        8. Prefer parallel work: send independent tasks to multiple agents simultaneously
+
+        Environment: TERMMESH_SOCKET=\(socketPath)
+        """
     }
 
     /// Build team leader instructions for non-Claude CLI leaders (kiro, codex, gemini).
