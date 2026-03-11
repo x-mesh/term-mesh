@@ -2899,6 +2899,20 @@ class GhosttyNSView: NSView, NSUserInterfaceValidations {
 
     override func performKeyEquivalent(with event: NSEvent) -> Bool {
         guard event.type == .keyDown else { return false }
+
+        // When the IME input bar is active, allow Cmd+C to copy terminal selection
+        // even though IMETextView is the first responder. The mouse drag creates a
+        // ghostty selection, but the first-responder guard below would block copy.
+        if let imeTextView = enclosingSurfaceScrollView?.findIMETextView() {
+            let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+            if event.keyCode == 8 && flags == .command
+                && imeTextView.selectedRange().length == 0,
+               let surface = surface, ghostty_surface_has_selection(surface) {
+                copy(nil)
+                return true
+            }
+        }
+
         guard let fr = window?.firstResponder as? NSView,
               fr === self || fr.isDescendant(of: self) else { return false }
 

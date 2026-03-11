@@ -165,23 +165,27 @@ struct IMEInputBar: View {
             .padding(.top, 6)
             .padding(.bottom, 4)
 
-            // Hint bar
-            hintBar
+            // Hint bar + status indicators (same row)
+            HStack(spacing: 12) {
+                hintBar
 
-            // Status indicators
-            HStack(spacing: 8) {
-                if isComposing {
-                    Text("IME composing")
-                        .font(.system(size: 10, weight: .medium, design: .monospaced))
-                        .foregroundColor(.cyan.opacity(0.8))
-                }
-                if historyIndex >= 0 {
-                    Text("history [\(historyIndex + 1)/\(history.count)]")
-                        .font(.system(size: 10, weight: .medium, design: .monospaced))
-                        .foregroundColor(.orange.opacity(0.8))
+                Spacer()
+
+                // Status indicators (right-aligned)
+                HStack(spacing: 8) {
+                    if isComposing {
+                        Text("IME composing")
+                            .font(.system(size: 10, weight: .medium, design: .monospaced))
+                            .foregroundColor(.cyan.opacity(0.8))
+                    }
+                    if historyIndex >= 0 {
+                        Text("history [\(historyIndex + 1)/\(history.count)]")
+                            .font(.system(size: 10, weight: .medium, design: .monospaced))
+                            .foregroundColor(.orange.opacity(0.8))
+                    }
                 }
             }
-            .padding(.bottom, 2)
+            .padding(.horizontal, 12)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(isDark ? Color.black.opacity(0.75) : Color(nsColor: .controlBackgroundColor))
@@ -247,7 +251,6 @@ struct IMEInputBar: View {
             hintLabel("^R: search")
             hintLabel("Esc: close")
         }
-        .padding(.bottom, 6)
     }
 
     private func hintLabel(_ text: String) -> some View {
@@ -298,6 +301,14 @@ struct IMETextEditor: NSViewRepresentable {
         textView.isAutomaticQuoteSubstitutionEnabled = false
         textView.isAutomaticDashSubstitutionEnabled = false
         textView.isAutomaticTextReplacementEnabled = false
+
+        // Explicit marked text (IME composing) attributes for dark mode visibility
+        textView.markedTextAttributes = [
+            .foregroundColor: NSColor.textColor,
+            .underlineStyle: NSUnderlineStyle.single.rawValue,
+            .underlineColor: NSColor.cyan.withAlphaComponent(0.6),
+        ]
+
         textView.submitHandler = onSubmit
         textView.cancelHandler = onCancel
         textView.ctrlCHandler = onCtrlC
@@ -327,6 +338,11 @@ struct IMETextEditor: NSViewRepresentable {
         textView.textColor = NSColor.textColor
         textView.backgroundColor = NSColor.textBackgroundColor.withAlphaComponent(0.3)
         textView.insertionPointColor = NSColor.textColor
+        textView.markedTextAttributes = [
+            .foregroundColor: NSColor.textColor,
+            .underlineStyle: NSUnderlineStyle.single.rawValue,
+            .underlineColor: NSColor.cyan.withAlphaComponent(0.6),
+        ]
 
         textView.submitHandler = onSubmit
         textView.cancelHandler = onCancel
