@@ -106,14 +106,40 @@
 
 ---
 
-## Phase 5: 미래 로드맵
+## Phase 5: ServiceContainer & BrowserHistory (완료 ✅)
+
+### 5-A. BrowserHistoryStore.shared (15→6, −60% ✅)
+
+| 작업 | 상태 | 참조 감소 |
+|---|---|---|
+| `BrowserHistoryService` 프로토콜 확장 (clearHistory, removeHistoryEntry, flushPendingSaves) | ✅ 완료 | — |
+| `BrowserHistoryServiceKey` SwiftUI EnvironmentKey 도입 | ✅ 완료 | — |
+| `SettingsView` @Environment 적용 | ✅ 완료 | −3 refs |
+| `BrowserPanelView` @Environment 적용 | ✅ 완료 | −5 refs |
+| `BrowserPanel` browserHistory 프로퍼티 주입 | ✅ 완료 | −2 refs |
+| `ContentView` @Environment 적용 | ✅ 완료 | −1 ref |
+| `TermMeshApp` browserHistory 프로퍼티 적용 | ✅ 완료 | −1 ref |
+| `AppDelegate` browserHistory 프로퍼티 적용 | ✅ 완료 | −1 ref |
+
+**남은 6개 참조:** 프로퍼티 기본값(4), 주입점(0), Combine `$entries`(2)
+
+### 5-B. ServiceContainer 도입 (✅)
+
+| 작업 | 상태 |
+|---|---|
+| `ServiceContainer.swift` 생성 — 모든 서비스 통합 관리 | ✅ 완료 |
+| `View.withServices()` 확장 — 한 줄로 전체 서비스 주입 | ✅ 완료 |
+| `TermMeshApp` body에서 `.withServices()` 적용 | ✅ 완료 |
+| `AppDelegate.createMainWindow`에서 `.withServices()` 적용 | ✅ 완료 |
+
+---
+
+## Phase 6: 미래 로드맵
 
 | 우선순위 | 작업 | 사이즈 | 설명 |
 |---|---|---|---|
-| P1 | `ServiceContainer` 도입 | XL | 모든 서비스를 한 곳에서 생성·주입하는 DI 컨테이너 |
 | P1 | `TabManager` 생성자 주입 | M | daemon + notifications + config를 init 시 주입 |
 | P2 | `AppDelegate` 클로저 주입 | M | lifecycle 이벤트에서 싱글톤 대신 클로저 사용 |
-| P2 | `BrowserHistoryService` 주입 전환 | M | BrowserHistoryStore.shared 참조 제거 |
 | P3 | 단위 테스트 인프라 | L | 프로토콜 mock 생성, XCTest 타겟 구성 |
 
 ---
@@ -121,20 +147,22 @@
 ## 싱글톤 참조 추이
 
 ```
-             시작     Phase3   Phase4    잔여 분류
-GhosttyApp     53      37       17*      6 자기참조 + 2 theme + 3 C API + 4 기본값 + 1 static + 1 주입점
-TermMeshDaemon 54      54        8*      7 기본값 + 1 주입점
-Notification   18      18        6*      4 기본값 + 2 fallback
-BrowserHistory  ?       ?        ?       미착수
-────────────────────────────────────────────────────
-합계          125+    109+      31+
+               시작    Phase3   Phase4   Phase5    잔여 분류
+GhosttyApp       53      37       17       17*     6 자기참조 + 2 theme + 3 C API + 4 기본값 + 1 static + 1 주입점
+TermMeshDaemon   54      54        8        8*     7 기본값 + 1 주입점
+Notification     18      18        6        6*     4 기본값 + 2 fallback
+BrowserHistory   15      15       15        6*     4 기본값 + 2 Combine $entries
+──────────────────────────────────────────────────────
+합계            140+    124+      46+      37*
 
-* 남은 참조는 모두 프로퍼티 기본값/루트 주입점/자기참조/C API (실질적 커플링 제거 완료)
+* 남은 참조는 모두 프로퍼티 기본값/루트 주입점/자기참조/C API/Combine publisher
+  (실질적 커플링 제거 완료)
 ```
 
-## develop 브랜치 커밋 이력
+## 커밋 이력
 
 ```
+XXXXXXX refactor: Add ServiceContainer and replace BrowserHistoryStore.shared with protocol-based injection
 XXXXXXX refactor: Replace GhosttyApp.shared with ConfigProvider-based injection (37→17)
 XXXXXXX refactor: Replace TermMeshDaemon.shared and TerminalNotificationStore.shared with protocol-based injection
 d26b261 refactor: Replace singleton theme/logging access with GhosttyTheme and logBackgroundIfEnabled

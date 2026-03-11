@@ -204,6 +204,7 @@ struct BrowserPanelView: View {
     let onRequestPanelFocus: () -> Void
     @Environment(\.colorScheme) private var colorScheme
     @Environment(\.ghosttyTheme) private var ghosttyTheme
+    @Environment(\.browserHistoryService) private var browserHistory
     @State private var omnibarState = OmnibarState()
     @State private var addressBarFocused: Bool = false
     @AppStorage(BrowserSearchSettings.searchEngineKey) private var searchEngineRaw = BrowserSearchSettings.defaultSearchEngine.rawValue
@@ -358,7 +359,7 @@ struct BrowserPanelView: View {
             // If the browser surface is focused but has no URL loaded yet, auto-focus the omnibar.
             autoFocusOmnibarIfBlank()
             syncWebViewResponderPolicyWithViewState(reason: "onAppear")
-            BrowserHistoryStore.shared.loadIfNeeded()
+            browserHistory?.loadIfNeeded()
         }
         .onChange(of: panel.focusFlashToken) { _ in
             triggerFocusFlashAnimation()
@@ -928,7 +929,7 @@ struct BrowserPanelView: View {
 
         let target = omnibarState.suggestions[idx]
         guard case .history(let url, _) = target.kind else { return }
-        guard BrowserHistoryStore.shared.removeHistoryEntry(urlString: url) else { return }
+        guard browserHistory?.removeHistoryEntry(urlString: url) == true else { return }
         refreshSuggestions()
     }
 
@@ -956,9 +957,9 @@ struct BrowserPanelView: View {
         let query = omnibarState.buffer.trimmingCharacters(in: .whitespacesAndNewlines)
         let historyEntries: [BrowserHistoryStore.Entry] = {
             if query.isEmpty {
-                return BrowserHistoryStore.shared.recentSuggestions(limit: 12)
+                return browserHistory?.recentSuggestions(limit: 12) ?? []
             }
-            return BrowserHistoryStore.shared.suggestions(for: query, limit: 12)
+            return browserHistory?.suggestions(for: query, limit: 12) ?? []
         }()
         let openTabMatches = query.isEmpty ? [] : matchingOpenTabSuggestions(for: query, limit: 12)
         let isSingleCharacterQuery = omnibarSingleCharacterQuery(for: query) != nil
@@ -1022,7 +1023,7 @@ struct BrowserPanelView: View {
                 let merged = buildOmnibarSuggestions(
                     query: query,
                     engineName: searchEngine.displayName,
-                    historyEntries: BrowserHistoryStore.shared.suggestions(for: query, limit: 12),
+                    historyEntries: browserHistory?.suggestions(for: query, limit: 12) ?? [],
                     openTabMatches: matchingOpenTabSuggestions(for: query, limit: 12),
                     remoteQueries: remote,
                     resolvedURL: panel.resolveNavigableURL(from: query),

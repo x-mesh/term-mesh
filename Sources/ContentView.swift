@@ -18,6 +18,7 @@ struct ContentView: View {
     @Environment(\.ghosttyTheme) private var theme
     @Environment(\.daemonService) private var daemonService
     @Environment(\.configProvider) private var configProvider
+    @Environment(\.browserHistoryService) private var browserHistory
     @State private var sidebarWidth: CGFloat = 200
     @State private var hoveredResizerHandles: Set<SidebarResizerHandle> = []
     @State private var isResizerDragging = false
@@ -3182,7 +3183,7 @@ struct ContentView: View {
             }
         }
         registry.register(commandId: "palette.browserClearHistory") {
-            BrowserHistoryStore.shared.clearHistory()
+            browserHistory?.clearHistory()
         }
         registry.register(commandId: "palette.openDashboard") {
             let port = ProcessInfo.processInfo.environment["TERM_MESH_HTTP_ADDR"]

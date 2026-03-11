@@ -1137,6 +1137,9 @@ final class BrowserPanel: Panel, ObservableObject {
         return NSColor.windowBackgroundColor
     }
 
+    /// Injected browser history service (defaults to singleton for backward compatibility).
+    var browserHistory: any BrowserHistoryService = BrowserHistoryStore.shared
+
     let id: UUID
     let panelType: PanelType = .browser
 
@@ -1283,7 +1286,7 @@ final class BrowserPanel: Panel, ObservableObject {
         // Set up navigation delegate
         let navDelegate = BrowserNavigationDelegate()
         navDelegate.didFinish = { webView in
-            BrowserHistoryStore.shared.recordVisit(url: webView.url, title: webView.title)
+            browserHistory.recordVisit(url: webView.url, title: webView.title)
             Task { @MainActor [weak self] in
                 self?.refreshFavicon(from: webView)
                 self?.applyBrowserThemeModeIfNeeded()
@@ -1703,7 +1706,7 @@ final class BrowserPanel: Panel, ObservableObject {
         webView.customUserAgent = BrowserUserAgentSettings.safariUserAgent
         shouldRenderWebView = true
         if recordTypedNavigation {
-            BrowserHistoryStore.shared.recordTypedNavigation(url: url)
+            browserHistory.recordTypedNavigation(url: url)
         }
         navigationDelegate?.lastAttemptedURL = url
         webView.load(browserPreparedNavigationRequest(request))

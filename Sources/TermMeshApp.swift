@@ -10,6 +10,7 @@ struct TermMeshApp: App {
     @StateObject private var sidebarSelectionState = SidebarSelectionState()
     @ObservedObject private var termMeshDaemon = TermMeshDaemon.shared
     private let configProvider: any GhosttyConfigProvider = GhosttyApp.shared
+    private let browserHistory: any BrowserHistoryService = BrowserHistoryStore.shared
     private let primaryWindowId = UUID()
     @AppStorage(AppearanceSettings.appearanceModeKey) private var appearanceMode = AppearanceSettings.defaultMode.rawValue
     @AppStorage("titlebarControlsStyle") private var titlebarControlsStyle = TitlebarControlsStyle.classic.rawValue
@@ -176,9 +177,7 @@ struct TermMeshApp: App {
                 .environmentObject(sidebarState)
                 .environmentObject(sidebarSelectionState)
                 .environment(\.ghosttyTheme, ghosttyTheme)
-                .environment(\.configProvider, GhosttyApp.shared)
-                .environment(\.daemonService, TermMeshDaemon.shared)
-                .environment(\.notificationService, notificationStore)
+                .withServices()
                 .onReceive(NotificationCenter.default.publisher(for: .ghosttyDefaultBackgroundDidChange)) { _ in
                     ghosttyTheme = .current
                 }
@@ -595,7 +594,7 @@ struct TermMeshApp: App {
                 .keyboardShortcut("0", modifiers: .command)
 
                 Button("Clear Browser History") {
-                    BrowserHistoryStore.shared.clearHistory()
+                    browserHistory.clearHistory()
                 }
 
                 splitCommandButton(title: "Next Workspace", shortcut: nextWorkspaceMenuShortcut) {

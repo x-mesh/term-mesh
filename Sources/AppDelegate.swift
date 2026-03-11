@@ -61,6 +61,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
     var daemon: any DaemonService = TermMeshDaemon.shared
     /// Injected config provider (defaults to singleton for backward compatibility).
     var configProvider: any GhosttyConfigProvider = GhosttyApp.shared
+    /// Injected browser history service (defaults to singleton for backward compatibility).
+    var browserHistory: any BrowserHistoryService = BrowserHistoryStore.shared
     weak var notificationStore: TerminalNotificationStore?
     weak var sidebarState: SidebarState?
     weak var fullscreenControlsViewModel: TitlebarControlsViewModel?
@@ -373,7 +375,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
             }
         }
         daemon.stopDaemon()
-        BrowserHistoryStore.shared.flushPendingSaves()
+        browserHistory.flushPendingSaves()
         PostHogAnalytics.shared.flush()
         notificationStore?.clearAll()
     }
@@ -989,6 +991,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
             .environmentObject(notificationStore)
             .environmentObject(sidebarState)
             .environmentObject(sidebarSelectionState)
+            .withServices()
 
         let window = NSWindow(
             contentRect: NSRect(x: 0, y: 0, width: 460, height: 360),

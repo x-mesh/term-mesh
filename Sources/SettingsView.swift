@@ -44,6 +44,7 @@ struct SettingsView: View {
     @AppStorage(TermMeshDaemon.dashboardPasswordKey) private var dashboardPassword = ""
 
     @Environment(\.daemonService) private var daemonService
+    @Environment(\.browserHistoryService) private var browserHistory
 
     @State private var shortcutResetToken = UUID()
     @State private var topBlurOpacity: Double = 0
@@ -1069,9 +1070,9 @@ struct SettingsView: View {
         .background(Color(nsColor: .windowBackgroundColor).ignoresSafeArea())
         .toggleStyle(.switch)
         .onAppear {
-            BrowserHistoryStore.shared.loadIfNeeded()
+            browserHistory?.loadIfNeeded()
             browserThemeMode = BrowserThemeSettings.mode(defaults: .standard).rawValue
-            browserHistoryEntryCount = BrowserHistoryStore.shared.entries.count
+            browserHistoryEntryCount = browserHistory?.entries.count ?? 0
             browserInsecureHTTPAllowlistDraft = browserInsecureHTTPAllowlist
             reloadWorkspaceTabColorSettings()
         }
@@ -1093,7 +1094,7 @@ struct SettingsView: View {
             titleVisibility: .visible
         ) {
             Button("Clear History", role: .destructive) {
-                BrowserHistoryStore.shared.clearHistory()
+                browserHistory?.clearHistory()
             }
             Button("Cancel", role: .cancel) {}
         } message: {
