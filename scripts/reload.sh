@@ -2,6 +2,7 @@
 set -euo pipefail
 
 APP_NAME="term-mesh DEV"
+APP_DISPLAY_NAME="Term-Mesh DEV"
 BUNDLE_ID="com.termmesh.app.debug"
 BASE_APP_NAME="term-mesh DEV"
 DERIVED_DATA=""
@@ -154,6 +155,7 @@ if [[ -n "$TAG" ]]; then
   TAG_SLUG="$(sanitize_path "$TAG")"
   if [[ "$NAME_SET" -eq 0 ]]; then
     APP_NAME="term-mesh DEV ${TAG}"
+    APP_DISPLAY_NAME="Term-Mesh DEV ${TAG}"
   fi
   if [[ "$BUNDLE_SET" -eq 0 ]]; then
     BUNDLE_ID="com.termmesh.app.debug.${TAG_ID}"
@@ -174,8 +176,8 @@ if [[ -n "$DERIVED_DATA" ]]; then
 fi
 if [[ -z "$TAG" ]]; then
   XCODEBUILD_ARGS+=(
-    INFOPLIST_KEY_CFBundleName="$APP_NAME"
-    INFOPLIST_KEY_CFBundleDisplayName="$APP_NAME"
+    INFOPLIST_KEY_CFBundleName="$APP_DISPLAY_NAME"
+    INFOPLIST_KEY_CFBundleDisplayName="$APP_DISPLAY_NAME"
     PRODUCT_BUNDLE_IDENTIFIER="$BUNDLE_ID"
   )
 fi
@@ -236,10 +238,10 @@ if [[ -n "$TAG" && "$APP_NAME" != "$SEARCH_APP_NAME" ]]; then
   cp -R "$APP_PATH" "$TAG_APP_PATH"
   INFO_PLIST="$TAG_APP_PATH/Contents/Info.plist"
   if [[ -f "$INFO_PLIST" ]]; then
-    /usr/libexec/PlistBuddy -c "Set :CFBundleName $APP_NAME" "$INFO_PLIST" 2>/dev/null \
-      || /usr/libexec/PlistBuddy -c "Add :CFBundleName string $APP_NAME" "$INFO_PLIST"
-    /usr/libexec/PlistBuddy -c "Set :CFBundleDisplayName $APP_NAME" "$INFO_PLIST" 2>/dev/null \
-      || /usr/libexec/PlistBuddy -c "Add :CFBundleDisplayName string $APP_NAME" "$INFO_PLIST"
+    /usr/libexec/PlistBuddy -c "Set :CFBundleName $APP_DISPLAY_NAME" "$INFO_PLIST" 2>/dev/null \
+      || /usr/libexec/PlistBuddy -c "Add :CFBundleName string $APP_DISPLAY_NAME" "$INFO_PLIST"
+    /usr/libexec/PlistBuddy -c "Set :CFBundleDisplayName $APP_DISPLAY_NAME" "$INFO_PLIST" 2>/dev/null \
+      || /usr/libexec/PlistBuddy -c "Add :CFBundleDisplayName string $APP_DISPLAY_NAME" "$INFO_PLIST"
     /usr/libexec/PlistBuddy -c "Set :CFBundleIdentifier $BUNDLE_ID" "$INFO_PLIST" 2>/dev/null \
       || /usr/libexec/PlistBuddy -c "Add :CFBundleIdentifier string $BUNDLE_ID" "$INFO_PLIST"
     if [[ -n "${TAG_SLUG:-}" ]]; then

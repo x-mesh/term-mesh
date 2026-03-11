@@ -668,6 +668,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
     override init() {
         super.init()
         Self.shared = self
+
+        // Override process name to use branded "Term-Mesh" instead of the
+        // lowercase executable name ("term-mesh DEV" / "term-mesh").
+        // Must be set before SwiftUI creates the app menu.
+        if let displayName = Bundle.main.object(forInfoDictionaryKey: "CFBundleDisplayName") as? String
+            ?? Bundle.main.object(forInfoDictionaryKey: "CFBundleName") as? String {
+            ProcessInfo.processInfo.processName = displayName
+        }
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {

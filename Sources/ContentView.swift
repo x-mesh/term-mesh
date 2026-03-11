@@ -1952,7 +1952,7 @@ struct ContentView: View {
         )
         panel.title = "Worktrees (\(worktrees.count))"
         panel.isFloatingPanel = true
-        panel.becomesKeyOnlyIfNeeded = false
+        panel.becomesKeyOnlyIfNeeded = true
         panel.minSize = NSSize(width: 400, height: 250)
 
         if worktrees.isEmpty {
@@ -2018,7 +2018,7 @@ struct ContentView: View {
         // Store dataSource so it's retained
         dataSource.tableView = tableView
         dataSource.panel = panel
-        objc_setAssociatedObject(panel, "worktreeDataSource", dataSource, .OBJC_ASSOCIATION_RETAIN)
+        objc_setAssociatedObject(panel, &WorktreeAssocKeys.dataSource, dataSource, .OBJC_ASSOCIATION_RETAIN)
 
         panel.contentView = contentView
         panel.center()
@@ -4015,7 +4015,7 @@ struct ContentView: View {
             CommandPaletteCommandContribution(
                 commandId: "palette.openDashboard",
                 title: constant("Open Dashboard"),
-                subtitle: constant("term-mesh"),
+                subtitle: constant("Term-Mesh"),
                 shortcutHint: "⌘⇧D",
                 keywords: ["dashboard", "monitor", "heatmap", "resources", "term-mesh"]
             )
@@ -8621,6 +8621,10 @@ extension NSColor {
 
 // MARK: - Worktree Manager Table
 
+private enum WorktreeAssocKeys {
+    nonisolated(unsafe) static var dataSource: UInt8 = 0
+}
+
 @MainActor
 final class WorktreeTableDataSource: NSObject, NSTableViewDataSource, NSTableViewDelegate {
     private var worktrees: [WorktreeInfo]
@@ -8698,7 +8702,11 @@ final class WorktreeTableDataSource: NSObject, NSTableViewDataSource, NSTableVie
             DispatchQueue.main.async { [weak self] in
                 guard let self else { return }
                 if success {
-                    self.worktrees.remove(at: row)
+                    // Use name-based lookup instead of captured row index to avoid
+                    // stale index after concurrent deletions.
+                    if let idx = self.worktrees.firstIndex(where: { $0.name == name }) {
+                        self.worktrees.remove(at: idx)
+                    }
                     self.tableView?.reloadData()
                     self.panel?.title = "Worktrees (\(self.worktrees.count))"
                 } else {
@@ -8723,6 +8731,16 @@ final class WorktreeTableDataSource: NSObject, NSTableViewDataSource, NSTableVie
                 self.worktrees = remaining
                 self.tableView?.reloadData()
                 self.panel?.title = "Worktrees (\(remaining.count))"
+
+                // Switch to empty-state label when all worktrees have been removed
+                if remaining.isEmpty, let panel = self.panel {
+                    let label = NSTextField(labelWithString: "No active worktrees.")
+                    label.font = .systemFont(ofSize: 14)
+                    label.alignment = .center
+                    label.frame = panel.contentView?.bounds ?? NSRect(x: 0, y: 0, width: 520, height: 400)
+                    label.autoresizingMask = [.width, .height]
+                    panel.contentView = label
+                }
 
                 let resultAlert = NSAlert()
                 resultAlert.messageText = "Worktree Cleanup"

@@ -1765,13 +1765,13 @@ final class BrowserPanel: Panel, ObservableObject {
         alert.informativeText = """
         \(host) uses plain HTTP, so traffic can be read or modified on the network.
 
-        Open this URL in your default browser, or proceed in term-mesh.
+        Open this URL in your default browser, or proceed in Term-Mesh.
         """
         alert.addButton(withTitle: "Open in Default Browser")
-        alert.addButton(withTitle: "Proceed in term-mesh")
+        alert.addButton(withTitle: "Proceed in Term-Mesh")
         alert.addButton(withTitle: "Cancel")
         alert.showsSuppressionButton = true
-        alert.suppressionButton?.title = "Always allow this host in term-mesh"
+        alert.suppressionButton?.title = "Always allow this host in Term-Mesh"
 
         let response = alert.runModal()
         if browserShouldPersistInsecureHTTPAllowlistSelection(

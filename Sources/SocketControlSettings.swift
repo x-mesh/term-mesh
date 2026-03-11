@@ -18,7 +18,7 @@ enum SocketControlMode: String, CaseIterable, Identifiable {
         case .off:
             return "Off"
         case .termMeshOnly:
-            return "term-mesh processes only"
+            return "Term-Mesh processes only"
         case .automation:
             return "Automation mode"
         case .password:

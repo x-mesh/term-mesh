@@ -224,13 +224,13 @@ class UpdateViewModel: ObservableObject {
         if let networkError = networkError(from: nsError) {
             switch networkError.code {
             case NSURLErrorNotConnectedToInternet:
-                return "term-mesh can’t reach the update server. Check your internet connection and try again."
+                return "Term-Mesh can’t reach the update server. Check your internet connection and try again."
             case NSURLErrorTimedOut:
                 return "The update server took too long to respond. Try again in a moment."
             case NSURLErrorCannotFindHost:
                 return "The update server can’t be found. Check your connection or try again later."
             case NSURLErrorCannotConnectToHost:
-                return "term-mesh couldn’t connect to the update server. Check your connection or try again later."
+                return "Term-Mesh couldn’t connect to the update server. Check your connection or try again later."
             case NSURLErrorNetworkConnectionLost:
                 return "The network connection was lost while checking for updates. Try again."
             case NSURLErrorSecureConnectionFailed,
@@ -246,7 +246,7 @@ class UpdateViewModel: ObservableObject {
         if nsError.domain == SUSparkleErrorDomain {
             switch nsError.code {
             case 2001:
-                return "term-mesh couldn't download the update feed. Check your connection and try again."
+                return "Term-Mesh couldn't download the update feed. Check your connection and try again."
             case 1000, 1002:
                 return "The update feed could not be read. Please try again later."
             case 4:

@@ -25,7 +25,7 @@ struct WelcomeView: View {
 
             // Branding
             VStack(spacing: 6) {
-                Text("term-mesh")
+                Text("Term-Mesh")
                     .font(.system(size: 32, weight: .semibold, design: .default))
                     .foregroundColor(.black)
                 Text("Terminal Multiplexer for macOS")

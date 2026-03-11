@@ -812,6 +812,7 @@
 					"-framework",
 					Carbon,
 				);
+				APP_DISPLAY_NAME = "Term-Mesh DEV";
 				PRODUCT_BUNDLE_IDENTIFIER = com.termmesh.app.debug;
 				PRODUCT_NAME = "term-mesh DEV";
 				SPARKLE_PUBLIC_KEY = "avjcgKibf1FTvhIjLBxhd+0HSpsXU4D0IGlVk8cgqRc=";
@@ -852,6 +853,7 @@
 					Carbon,
 				);
 				ONLY_ACTIVE_ARCH = YES;
+				APP_DISPLAY_NAME = "Term-Mesh";
 				PRODUCT_BUNDLE_IDENTIFIER = com.termmesh.app;
 				PRODUCT_NAME = "term-mesh";
 				SPARKLE_PUBLIC_KEY = "avjcgKibf1FTvhIjLBxhd+0HSpsXU4D0IGlVk8cgqRc=";

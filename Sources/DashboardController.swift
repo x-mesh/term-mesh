@@ -83,7 +83,7 @@ final class DashboardController: NSObject, WKNavigationDelegate {
             backing: .buffered,
             defer: false
         )
-        win.title = "term-mesh Dashboard"
+        win.title = "Term-Mesh Dashboard"
         win.contentView = wv
         win.center()
         win.isReleasedWhenClosed = false
