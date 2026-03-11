@@ -2163,6 +2163,95 @@ class TabManager: ObservableObject {
         equalizeSplits(tree)
     }
 
+    /// Spawn N plain CLI terminal panes without worktrees.
+    /// Uses the same balanced grid layout as spawnAgentSessions.
+    func spawnCLISessions(count: Int, command: String? = nil) {
+        guard let selectedTabId,
+              let tab = tabs.first(where: { $0.id == selectedTabId }),
+              let focusedPanelId = tab.focusedPanelId else { return }
+
+        titlebarProgress = .indeterminate("Creating \(count) terminal\(count > 1 ? "s" : "")…", color: .blue)
+
+        let numCols: Int
+        if count <= 3 {
+            numCols = 1
+        } else if count <= 8 {
+            numCols = 2
+        } else {
+            numCols = 3
+        }
+
+        // Assign indices to grid cells: grid[col][row]
+        var grid: [[Int]] = Array(repeating: [], count: numCols)
+        for i in 0..<count {
+            grid[i % numCols].append(i)
+        }
+
+        // Get working directory from focused panel
+        let workDir = tab.panelDirectories[focusedPanelId] ?? tab.currentDirectory
+
+        var created = 0
+        let setTitle = { [weak self] (panelId: UUID, index: Int) in
+            tab.setPanelCustomTitle(panelId: panelId, title: "CLI \(index + 1)")
+            created += 1
+            self?.titlebarProgress = .determinate(
+                Double(created) / Double(count),
+                label: "Creating terminals (\(created)/\(count))…",
+                color: .blue
+            )
+        }
+
+        // Phase 1: Create first pane in each column (right splits from leader)
+        var columnTopPanelIds: [UUID] = []
+        var firstPanelId: UUID?
+        for col in 0..<numCols {
+            let idx = grid[col][0]
+            let splitFrom = firstPanelId ?? focusedPanelId
+            if let panelId = self.newSplit(
+                tabId: selectedTabId,
+                surfaceId: splitFrom,
+                direction: .right,
+                focus: false,
+                workingDirectory: workDir,
+                command: command
+            ) {
+                setTitle(panelId, idx)
+                columnTopPanelIds.append(panelId)
+                if firstPanelId == nil { firstPanelId = panelId }
+            }
+        }
+
+        // Phase 2: Split each column down to create rows
+        for col in 0..<numCols {
+            guard col < columnTopPanelIds.count else { break }
+            var lastRowPanelId = columnTopPanelIds[col]
+            for rowIdx in 1..<grid[col].count {
+                let idx = grid[col][rowIdx]
+                if let panelId = self.newSplit(
+                    tabId: selectedTabId,
+                    surfaceId: lastRowPanelId,
+                    direction: .down,
+                    focus: false,
+                    workingDirectory: workDir,
+                    command: command
+                ) {
+                    setTitle(panelId, idx)
+                    lastRowPanelId = panelId
+                }
+            }
+        }
+
+        // Phase 3: Equalize splits
+        equalizeAgentGrid(workspace: tab)
+
+        // Clear progress
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) { [weak self] in
+            withAnimation(.easeOut(duration: 0.3)) {
+                self?.titlebarProgress = nil
+            }
+        }
+    }
+
     /// Reconnect a detached agent session to a new split panel.
     /// Unlike spawnAgentSessions, this does NOT create a worktree or run a command —
     /// it opens a shell in the existing worktree directory and binds the panel to the session.

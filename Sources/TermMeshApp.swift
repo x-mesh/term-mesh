@@ -284,8 +284,8 @@ struct TermMeshApp: App {
                         }
                     }
                 }
-                Button("Spawn Agents…") {
-                    showSpawnAgentsDialog()
+                Button("Spawn CLI…") {
+                    showSpawnCLIDialog()
                 }
                 .keyboardShortcut("a", modifiers: [.command, .shift])
                 Button("Reconnect Agent…") {
@@ -840,61 +840,63 @@ struct TermMeshApp: App {
         _ = activeTabManager.createBrowserSplit(direction: .right, url: url)
     }
 
-    private func showSpawnAgentsDialog() {
+    private func showSpawnCLIDialog() {
         let alert = NSAlert()
-        alert.messageText = "Spawn Agents"
-        alert.informativeText = "Select a command and the number of agents to spawn:"
+        alert.messageText = "Spawn CLI"
+        alert.informativeText = "Create multiple terminal panes in a grid layout:"
         alert.alertStyle = .informational
-        alert.addButton(withTitle: "Spawn")
+        alert.addButton(withTitle: "Create")
         alert.addButton(withTitle: "Cancel")
 
-        // Command presets
-        let commands = [
-            "claude --dangerously-skip-permissions",
-            "claude",
-            "aider",
-            "codex",
-        ]
-
-        // -- Command popup --
-        let commandLabel = NSTextField(labelWithString: "Command:")
-        commandLabel.frame = NSRect(x: 0, y: 30, width: 70, height: 18)
-
-        let commandCombo = NSComboBox(frame: NSRect(x: 74, y: 26, width: 260, height: 26))
-        for cmd in commands { commandCombo.addItem(withObjectValue: cmd) }
-        commandCombo.stringValue = commands[0]
-        commandCombo.completes = true
-
         // -- Count stepper --
-        let countLabel = NSTextField(labelWithString: "Agents:")
-        countLabel.frame = NSRect(x: 0, y: 2, width: 70, height: 18)
+        let countLabel = NSTextField(labelWithString: "Terminals:")
+        countLabel.frame = NSRect(x: 0, y: 56, width: 80, height: 18)
 
-        let stepper = NSStepper(frame: NSRect(x: 74, y: 0, width: 26, height: 22))
+        let stepper = NSStepper(frame: NSRect(x: 84, y: 54, width: 26, height: 22))
         stepper.minValue = 1
-        stepper.maxValue = 8
-        stepper.integerValue = 2
+        stepper.maxValue = 12
+        stepper.integerValue = 3
         stepper.valueWraps = false
 
-        let countValueLabel = NSTextField(labelWithString: "2")
-        countValueLabel.frame = NSRect(x: 104, y: 2, width: 30, height: 18)
+        let countValueLabel = NSTextField(labelWithString: "3")
+        countValueLabel.frame = NSRect(x: 114, y: 56, width: 30, height: 18)
         countValueLabel.alignment = .center
 
         stepper.target = countValueLabel
         stepper.action = #selector(NSTextField.takeIntegerValueFrom(_:))
 
-        let container = NSView(frame: NSRect(x: 0, y: 0, width: 340, height: 54))
-        container.addSubview(commandLabel)
-        container.addSubview(commandCombo)
+        // -- Worktree checkbox --
+        let worktreeCheck = NSButton(checkboxWithTitle: "Use separate worktrees (git)", target: nil, action: nil)
+        worktreeCheck.frame = NSRect(x: 0, y: 30, width: 300, height: 20)
+        worktreeCheck.state = .off
+
+        // -- Command (optional) --
+        let commandLabel = NSTextField(labelWithString: "Command:")
+        commandLabel.frame = NSRect(x: 0, y: 2, width: 80, height: 18)
+
+        let commandField = NSTextField(frame: NSRect(x: 84, y: 0, width: 250, height: 22))
+        commandField.placeholderString = "optional (e.g. claude, aider)"
+        commandField.stringValue = ""
+
+        let container = NSView(frame: NSRect(x: 0, y: 0, width: 340, height: 78))
         container.addSubview(countLabel)
         container.addSubview(stepper)
         container.addSubview(countValueLabel)
+        container.addSubview(worktreeCheck)
+        container.addSubview(commandLabel)
+        container.addSubview(commandField)
         alert.accessoryView = container
 
         guard alert.runModal() == .alertFirstButtonReturn else { return }
         let count = stepper.integerValue
-        let command = commandCombo.stringValue.isEmpty ? commands[0] : commandCombo.stringValue
+        let useWorktree = worktreeCheck.state == .on
+        let command = commandField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
 
-        activeTabManager.spawnAgentSessions(count: count, command: command)
+        if useWorktree {
+            activeTabManager.spawnAgentSessions(count: count, command: command.isEmpty ? nil : command)
+        } else {
+            activeTabManager.spawnCLISessions(count: count, command: command.isEmpty ? nil : command)
+        }
     }
 
     private func showReconnectAgentDialog() {
