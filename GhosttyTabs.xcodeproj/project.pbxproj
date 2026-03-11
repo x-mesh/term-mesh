@@ -24,6 +24,8 @@
 			CVB00013 /* SettingsDebugViews.swift in Sources */ = {isa = PBXBuildFile; fileRef = CVS00013 /* SettingsDebugViews.swift */; };
 			CVB00014 /* AboutView.swift in Sources */ = {isa = PBXBuildFile; fileRef = CVS00014 /* AboutView.swift */; };
 			CVB00015 /* TabManagerSettings.swift in Sources */ = {isa = PBXBuildFile; fileRef = CVS00015 /* TabManagerSettings.swift */; };
+			CVB00019 /* WorkspaceModels.swift in Sources */ = {isa = PBXBuildFile; fileRef = CVS00019 /* WorkspaceModels.swift */; };
+			CVB00020 /* Workspace+BonsplitDelegate.swift in Sources */ = {isa = PBXBuildFile; fileRef = CVS00020 /* Workspace+BonsplitDelegate.swift */; };
 			E62155868BB29FEB5DAAAF25 /* SidebarSelectionState.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9AD52285508B1D6A9875E7B3 /* SidebarSelectionState.swift */; };
 			B9000018A1B2C3D4E5F60719 /* WindowDragHandleView.swift in Sources */ = {isa = PBXBuildFile; fileRef = B9000017A1B2C3D4E5F60719 /* WindowDragHandleView.swift */; };
 			A5001003 /* TabManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = A5001013 /* TabManager.swift */; };
@@ -50,6 +52,9 @@
 		TC0B0004 /* TerminalController+Pane.swift in Sources */ = {isa = PBXBuildFile; fileRef = TC0F0004 /* TerminalController+Pane.swift */; };
 		TC0B0005 /* TerminalController+Browser.swift in Sources */ = {isa = PBXBuildFile; fileRef = TC0F0005 /* TerminalController+Browser.swift */; };
 		TC0B0006 /* TerminalController+Debug.swift in Sources */ = {isa = PBXBuildFile; fileRef = TC0F0006 /* TerminalController+Debug.swift */; };
+		CVB00021 /* TerminalController+DebugOverlay.swift in Sources */ = {isa = PBXBuildFile; fileRef = CVS00021 /* TerminalController+DebugOverlay.swift */; };
+		CVB00022 /* TerminalController+DebugVisual.swift in Sources */ = {isa = PBXBuildFile; fileRef = CVS00022 /* TerminalController+DebugVisual.swift */; };
+		CVB00023 /* TerminalController+DebugInput.swift in Sources */ = {isa = PBXBuildFile; fileRef = CVS00023 /* TerminalController+DebugInput.swift */; };
 		TC0B0007 /* TerminalController+V1Commands.swift in Sources */ = {isa = PBXBuildFile; fileRef = TC0F0007 /* TerminalController+V1Commands.swift */; };
 		TC0B0008 /* TerminalController+Parsing.swift in Sources */ = {isa = PBXBuildFile; fileRef = TC0F0008 /* TerminalController+Parsing.swift */; };
 		A5001500 /* TermMeshWebView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A5001510 /* TermMeshWebView.swift */; };
@@ -188,6 +193,8 @@
 			CVS00013 /* SettingsDebugViews.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SettingsDebugViews.swift; sourceTree = "<group>"; };
 			CVS00014 /* AboutView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AboutView.swift; sourceTree = "<group>"; };
 			CVS00015 /* TabManagerSettings.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TabManagerSettings.swift; sourceTree = "<group>"; };
+			CVS00019 /* WorkspaceModels.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WorkspaceModels.swift; sourceTree = "<group>"; };
+			CVS00020 /* Workspace+BonsplitDelegate.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "Workspace+BonsplitDelegate.swift"; sourceTree = "<group>"; };
 			9AD52285508B1D6A9875E7B3 /* SidebarSelectionState.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SidebarSelectionState.swift; sourceTree = "<group>"; };
 			B9000017A1B2C3D4E5F60719 /* WindowDragHandleView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WindowDragHandleView.swift; sourceTree = "<group>"; };
 			A5001013 /* TabManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TabManager.swift; sourceTree = "<group>"; };
@@ -216,6 +223,9 @@
 		TC0F0004 /* TerminalController+Pane.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "TerminalController+Pane.swift"; sourceTree = "<group>"; };
 		TC0F0005 /* TerminalController+Browser.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "TerminalController+Browser.swift"; sourceTree = "<group>"; };
 		TC0F0006 /* TerminalController+Debug.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "TerminalController+Debug.swift"; sourceTree = "<group>"; };
+		CVS00021 /* TerminalController+DebugOverlay.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "TerminalController+DebugOverlay.swift"; sourceTree = "<group>"; };
+		CVS00022 /* TerminalController+DebugVisual.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "TerminalController+DebugVisual.swift"; sourceTree = "<group>"; };
+		CVS00023 /* TerminalController+DebugInput.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "TerminalController+DebugInput.swift"; sourceTree = "<group>"; };
 		TC0F0007 /* TerminalController+V1Commands.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "TerminalController+V1Commands.swift"; sourceTree = "<group>"; };
 		TC0F0008 /* TerminalController+Parsing.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "TerminalController+Parsing.swift"; sourceTree = "<group>"; };
 		A5001600 /* SentryHelper.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SentryHelper.swift; sourceTree = "<group>"; };
@@ -400,6 +410,8 @@
 					CVS00013 /* SettingsDebugViews.swift */,
 					CVS00014 /* AboutView.swift */,
 					CVS00015 /* TabManagerSettings.swift */,
+					CVS00019 /* WorkspaceModels.swift */,
+					CVS00020 /* Workspace+BonsplitDelegate.swift */,
 					9AD52285508B1D6A9875E7B3 /* SidebarSelectionState.swift */,
 					B9000017A1B2C3D4E5F60719 /* WindowDragHandleView.swift */,
 					A50012F0 /* Backport.swift */,
@@ -423,6 +435,9 @@
 				TC0F0004 /* TerminalController+Pane.swift */,
 				TC0F0005 /* TerminalController+Browser.swift */,
 				TC0F0006 /* TerminalController+Debug.swift */,
+				CVS00021 /* TerminalController+DebugOverlay.swift */,
+				CVS00022 /* TerminalController+DebugVisual.swift */,
+				CVS00023 /* TerminalController+DebugInput.swift */,
 				TC0F0007 /* TerminalController+V1Commands.swift */,
 				TC0F0008 /* TerminalController+Parsing.swift */,
 				A5001541 /* PortScanner.swift */,
@@ -668,6 +683,8 @@
 					CVB00013 /* SettingsDebugViews.swift in Sources */,
 					CVB00014 /* AboutView.swift in Sources */,
 					CVB00015 /* TabManagerSettings.swift in Sources */,
+					CVB00019 /* WorkspaceModels.swift in Sources */,
+					CVB00020 /* Workspace+BonsplitDelegate.swift in Sources */,
 					E62155868BB29FEB5DAAAF25 /* SidebarSelectionState.swift in Sources */,
 					B9000018A1B2C3D4E5F60719 /* WindowDragHandleView.swift in Sources */,
 					A50012F1 /* Backport.swift in Sources */,
@@ -691,6 +708,9 @@
 				TC0B0004 /* TerminalController+Pane.swift in Sources */,
 				TC0B0005 /* TerminalController+Browser.swift in Sources */,
 				TC0B0006 /* TerminalController+Debug.swift in Sources */,
+				CVB00021 /* TerminalController+DebugOverlay.swift in Sources */,
+				CVB00022 /* TerminalController+DebugVisual.swift in Sources */,
+				CVB00023 /* TerminalController+DebugInput.swift in Sources */,
 				TC0B0007 /* TerminalController+V1Commands.swift in Sources */,
 				TC0B0008 /* TerminalController+Parsing.swift in Sources */,
 				A5001540 /* PortScanner.swift in Sources */,

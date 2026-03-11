@@ -74,28 +74,6 @@ extension GhosttyNSView: NSTextInputClient {
         }
     }
 
-    /// Sync the preedit state based on the markedText value to libghostty.
-    /// This tells Ghostty about IME composition text so it can render the
-    /// preedit overlay (e.g. for Korean, Japanese, Chinese input).
-    func syncPreedit(clearIfNeeded: Bool = true) {
-        guard let surface = surface else { return }
-
-        if markedText.length > 0 {
-            let str = markedText.string
-            let len = str.utf8CString.count
-            if len > 0 {
-                str.withCString { ptr in
-                    // Subtract 1 for the null terminator
-                    ghostty_surface_preedit(surface, ptr, UInt(len - 1))
-                }
-            }
-        } else if clearIfNeeded {
-            // If we had marked text before but don't now, we're no longer
-            // in a preedit state so we can clear it.
-            ghostty_surface_preedit(surface, nil, 0)
-        }
-    }
-
     func validAttributesForMarkedText() -> [NSAttributedString.Key] {
         return []
     }
@@ -169,5 +147,29 @@ extension GhosttyNSView: NSTextInputClient {
 
         // Otherwise send directly to the terminal
         sendTextToSurface(chars)
+    }
+}
+
+extension GhosttyNSView {
+    /// Sync the preedit state based on the markedText value to libghostty.
+    /// This tells Ghostty about IME composition text so it can render the
+    /// preedit overlay (e.g. for Korean, Japanese, Chinese input).
+    func syncPreedit(clearIfNeeded: Bool = true) {
+        guard let surface = surface else { return }
+
+        if markedText.length > 0 {
+            let str = markedText.string
+            let len = str.utf8CString.count
+            if len > 0 {
+                str.withCString { ptr in
+                    // Subtract 1 for the null terminator
+                    ghostty_surface_preedit(surface, ptr, UInt(len - 1))
+                }
+            }
+        } else if clearIfNeeded {
+            // If we had marked text before but don't now, we're no longer
+            // in a preedit state so we can clear it.
+            ghostty_surface_preedit(surface, nil, 0)
+        }
     }
 }
