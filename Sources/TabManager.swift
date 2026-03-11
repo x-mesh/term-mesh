@@ -2165,83 +2165,157 @@ class TabManager: ObservableObject {
 
     /// Spawn N plain CLI terminal panes without worktrees.
     /// Uses the same balanced grid layout as spawnAgentSessions.
-    func spawnCLISessions(count: Int, command: String? = nil) {
-        guard let selectedTabId,
-              let tab = tabs.first(where: { $0.id == selectedTabId }),
-              let focusedPanelId = tab.focusedPanelId else { return }
+    func spawnCLISessions(count: Int, command: String? = nil, newWorkspace: Bool = false) {
+        let tab: Workspace
+        let rootPanelId: UUID
+
+        if newWorkspace {
+            // Create a new workspace tab with CLI panes filling the entire space
+            let ws = addTab(select: true)
+            tab = ws
+            guard let firstPanel = ws.focusedPanelId else { return }
+            rootPanelId = firstPanel
+            // Title the initial pane as CLI 1; if command given, run it
+            if let command {
+                // Send command to the initial panel's terminal
+                if let panel = ws.panels[firstPanel] as? TerminalPanel {
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+                        panel.sendText(command + "\n")
+                    }
+                }
+            }
+            ws.setPanelCustomTitle(panelId: firstPanel, title: "CLI 1")
+        } else {
+            guard let selectedTabId,
+                  let t = tabs.first(where: { $0.id == selectedTabId }),
+                  let focusedPanelId = t.focusedPanelId else { return }
+            tab = t
+            rootPanelId = focusedPanelId
+        }
+
+        let tabId = tab.id
 
         titlebarProgress = .indeterminate("Creating \(count) terminal\(count > 1 ? "s" : "")…", color: .blue)
 
+        // For new workspace, the first pane is already CLI 1 — create count-1 more splits
+        let splitsNeeded = newWorkspace ? count - 1 : count
+
         let numCols: Int
-        if count <= 3 {
-            numCols = 1
-        } else if count <= 8 {
-            numCols = 2
+        if newWorkspace {
+            // New workspace: all panes are equal, no leader — use full grid
+            if count <= 2 {
+                numCols = count
+            } else if count <= 6 {
+                numCols = Int(ceil(Double(count) / 2.0))
+            } else {
+                numCols = Int(ceil(Double(count) / 3.0))
+            }
         } else {
-            numCols = 3
+            if count <= 3 {
+                numCols = 1
+            } else if count <= 8 {
+                numCols = 2
+            } else {
+                numCols = 3
+            }
         }
 
-        // Assign indices to grid cells: grid[col][row]
-        var grid: [[Int]] = Array(repeating: [], count: numCols)
-        for i in 0..<count {
-            grid[i % numCols].append(i)
-        }
+        // Get working directory
+        let workDir = tab.panelDirectories[rootPanelId] ?? tab.currentDirectory
 
-        // Get working directory from focused panel
-        let workDir = tab.panelDirectories[focusedPanelId] ?? tab.currentDirectory
-
-        var created = 0
+        var created = newWorkspace ? 1 : 0
+        let totalCount = count
         let setTitle = { [weak self] (panelId: UUID, index: Int) in
             tab.setPanelCustomTitle(panelId: panelId, title: "CLI \(index + 1)")
             created += 1
             self?.titlebarProgress = .determinate(
-                Double(created) / Double(count),
-                label: "Creating terminals (\(created)/\(count))…",
+                Double(created) / Double(totalCount),
+                label: "Creating terminals (\(created)/\(totalCount))…",
                 color: .blue
             )
         }
 
-        // Phase 1: Create first pane in each column (right splits from leader)
-        var columnTopPanelIds: [UUID] = []
-        var firstPanelId: UUID?
-        for col in 0..<numCols {
-            let idx = grid[col][0]
-            let splitFrom = firstPanelId ?? focusedPanelId
-            if let panelId = self.newSplit(
-                tabId: selectedTabId,
-                surfaceId: splitFrom,
-                direction: .right,
-                focus: false,
-                workingDirectory: workDir,
-                command: command
-            ) {
-                setTitle(panelId, idx)
-                columnTopPanelIds.append(panelId)
-                if firstPanelId == nil { firstPanelId = panelId }
+        if newWorkspace && splitsNeeded > 0 {
+            // For new workspace: build grid from the root pane
+            // Assign all count panes (including root=0) to grid cells
+            var grid: [[Int]] = Array(repeating: [], count: numCols)
+            for i in 0..<count {
+                grid[i % numCols].append(i)
             }
-        }
 
-        // Phase 2: Split each column down to create rows
-        for col in 0..<numCols {
-            guard col < columnTopPanelIds.count else { break }
-            var lastRowPanelId = columnTopPanelIds[col]
-            for rowIdx in 1..<grid[col].count {
-                let idx = grid[col][rowIdx]
+            // The root pane is grid[0][0]. Split right for additional columns.
+            var columnTopPanelIds: [UUID] = [rootPanelId]  // col 0 = root pane
+            for col in 1..<numCols {
+                let idx = grid[col][0]
                 if let panelId = self.newSplit(
-                    tabId: selectedTabId,
-                    surfaceId: lastRowPanelId,
-                    direction: .down,
-                    focus: false,
-                    workingDirectory: workDir,
-                    command: command
+                    tabId: tabId, surfaceId: rootPanelId,
+                    direction: .right, focus: false,
+                    workingDirectory: workDir, command: command
                 ) {
                     setTitle(panelId, idx)
-                    lastRowPanelId = panelId
+                    columnTopPanelIds.append(panelId)
+                }
+            }
+
+            // Split each column down for rows
+            for col in 0..<numCols {
+                guard col < columnTopPanelIds.count else { break }
+                var lastRowPanelId = columnTopPanelIds[col]
+                let startRow = (col == 0) ? 1 : 1  // col 0 row 0 is root (already titled)
+                for rowIdx in startRow..<grid[col].count {
+                    let idx = grid[col][rowIdx]
+                    if let panelId = self.newSplit(
+                        tabId: tabId, surfaceId: lastRowPanelId,
+                        direction: .down, focus: false,
+                        workingDirectory: workDir, command: command
+                    ) {
+                        setTitle(panelId, idx)
+                        lastRowPanelId = panelId
+                    }
+                }
+            }
+        } else if !newWorkspace {
+            // Existing workspace: splits to the right of leader (original behavior)
+            let numColsActual = numCols
+            var grid: [[Int]] = Array(repeating: [], count: numColsActual)
+            for i in 0..<count {
+                grid[i % numColsActual].append(i)
+            }
+
+            var columnTopPanelIds: [UUID] = []
+            var firstPanelId: UUID?
+            for col in 0..<numColsActual {
+                let idx = grid[col][0]
+                let splitFrom = firstPanelId ?? rootPanelId
+                if let panelId = self.newSplit(
+                    tabId: tabId, surfaceId: splitFrom,
+                    direction: .right, focus: false,
+                    workingDirectory: workDir, command: command
+                ) {
+                    setTitle(panelId, idx)
+                    columnTopPanelIds.append(panelId)
+                    if firstPanelId == nil { firstPanelId = panelId }
+                }
+            }
+
+            for col in 0..<numColsActual {
+                guard col < columnTopPanelIds.count else { break }
+                var lastRowPanelId = columnTopPanelIds[col]
+                for rowIdx in 1..<grid[col].count {
+                    let idx = grid[col][rowIdx]
+                    if let panelId = self.newSplit(
+                        tabId: tabId, surfaceId: lastRowPanelId,
+                        direction: .down, focus: false,
+                        workingDirectory: workDir, command: command
+                    ) {
+                        setTitle(panelId, idx)
+                        lastRowPanelId = panelId
+                    }
                 }
             }
         }
 
-        // Phase 3: Equalize splits
+        // Equalize splits
         equalizeAgentGrid(workspace: tab)
 
         // Clear progress

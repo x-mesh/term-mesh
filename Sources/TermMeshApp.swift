@@ -840,6 +840,12 @@ struct TermMeshApp: App {
         _ = activeTabManager.createBrowserSplit(direction: .right, url: url)
     }
 
+    private static let spawnCLILastCommandKey = "spawnCLILastCommand"
+    private static let spawnCLILastOptionsKey = "spawnCLILastOptions"
+    private static let spawnCLILastCountKey = "spawnCLILastCount"
+    private static let spawnCLILastWorktreeKey = "spawnCLILastWorktree"
+    private static let spawnCLILastNewWorkspaceKey = "spawnCLILastNewWorkspace"
+
     private func showSpawnCLIDialog() {
         let alert = NSAlert()
         alert.messageText = "Spawn CLI"
@@ -848,54 +854,120 @@ struct TermMeshApp: App {
         alert.addButton(withTitle: "Create")
         alert.addButton(withTitle: "Cancel")
 
-        // -- Count stepper --
-        let countLabel = NSTextField(labelWithString: "Terminals:")
-        countLabel.frame = NSRect(x: 0, y: 56, width: 80, height: 18)
+        // Build available commands from CLI path settings
+        let cliNames = ["claude", "kiro", "codex", "gemini"]
+        var availableCommands: [String] = ["(shell only)"]
+        for cli in cliNames {
+            if CLIPathSettings.resolvedPath(for: cli) != nil {
+                availableCommands.append(cli)
+            }
+        }
 
-        let stepper = NSStepper(frame: NSRect(x: 84, y: 54, width: 26, height: 22))
+        // Restore last selections
+        let lastCommand = UserDefaults.standard.string(forKey: Self.spawnCLILastCommandKey) ?? "(shell only)"
+        let lastOptions = UserDefaults.standard.string(forKey: Self.spawnCLILastOptionsKey) ?? ""
+        let lastCount = UserDefaults.standard.integer(forKey: Self.spawnCLILastCountKey)
+        let lastWorktree = UserDefaults.standard.bool(forKey: Self.spawnCLILastWorktreeKey)
+        let lastNewWorkspace = UserDefaults.standard.bool(forKey: Self.spawnCLILastNewWorkspaceKey)
+
+        let rowH: CGFloat = 28
+        var y: CGFloat = rowH * 5 + 4  // 6 rows
+
+        // -- Command popup --
+        y -= rowH
+        let commandLabel = NSTextField(labelWithString: "Command:")
+        commandLabel.frame = NSRect(x: 0, y: y + 2, width: 80, height: 18)
+
+        let commandCombo = NSComboBox(frame: NSRect(x: 84, y: y - 2, width: 250, height: 26))
+        for cmd in availableCommands { commandCombo.addItem(withObjectValue: cmd) }
+        if let idx = availableCommands.firstIndex(of: lastCommand) {
+            commandCombo.selectItem(at: idx)
+        } else {
+            commandCombo.selectItem(at: 0)
+        }
+        commandCombo.completes = true
+
+        // -- Options field --
+        y -= rowH
+        let optionsLabel = NSTextField(labelWithString: "Options:")
+        optionsLabel.frame = NSRect(x: 0, y: y + 2, width: 80, height: 18)
+
+        let optionsField = NSTextField(frame: NSRect(x: 84, y: y, width: 250, height: 22))
+        optionsField.placeholderString = "e.g. --dangerously-skip-permissions"
+        optionsField.stringValue = lastOptions
+
+        // -- Count stepper --
+        y -= rowH
+        let countLabel = NSTextField(labelWithString: "Terminals:")
+        countLabel.frame = NSRect(x: 0, y: y + 2, width: 80, height: 18)
+
+        let stepper = NSStepper(frame: NSRect(x: 84, y: y, width: 26, height: 22))
         stepper.minValue = 1
         stepper.maxValue = 12
-        stepper.integerValue = 3
+        stepper.integerValue = lastCount > 0 ? lastCount : 3
         stepper.valueWraps = false
 
-        let countValueLabel = NSTextField(labelWithString: "3")
-        countValueLabel.frame = NSRect(x: 114, y: 56, width: 30, height: 18)
+        let countValueLabel = NSTextField(labelWithString: "\(stepper.integerValue)")
+        countValueLabel.frame = NSRect(x: 114, y: y + 2, width: 30, height: 18)
         countValueLabel.alignment = .center
 
         stepper.target = countValueLabel
         stepper.action = #selector(NSTextField.takeIntegerValueFrom(_:))
 
+        // -- New Workspace checkbox --
+        y -= rowH
+        let newWorkspaceCheck = NSButton(checkboxWithTitle: "Open in new workspace", target: nil, action: nil)
+        newWorkspaceCheck.frame = NSRect(x: 0, y: y, width: 300, height: 20)
+        newWorkspaceCheck.state = lastNewWorkspace ? .on : .off
+
         // -- Worktree checkbox --
+        y -= rowH
         let worktreeCheck = NSButton(checkboxWithTitle: "Use separate worktrees (git)", target: nil, action: nil)
-        worktreeCheck.frame = NSRect(x: 0, y: 30, width: 300, height: 20)
-        worktreeCheck.state = .off
+        worktreeCheck.frame = NSRect(x: 0, y: y, width: 300, height: 20)
+        worktreeCheck.state = lastWorktree ? .on : .off
 
-        // -- Command (optional) --
-        let commandLabel = NSTextField(labelWithString: "Command:")
-        commandLabel.frame = NSRect(x: 0, y: 2, width: 80, height: 18)
-
-        let commandField = NSTextField(frame: NSRect(x: 84, y: 0, width: 250, height: 22))
-        commandField.placeholderString = "optional (e.g. claude, aider)"
-        commandField.stringValue = ""
-
-        let container = NSView(frame: NSRect(x: 0, y: 0, width: 340, height: 78))
+        let totalHeight = rowH * 5 + 4
+        let container = NSView(frame: NSRect(x: 0, y: 0, width: 340, height: totalHeight))
+        container.addSubview(commandLabel)
+        container.addSubview(commandCombo)
+        container.addSubview(optionsLabel)
+        container.addSubview(optionsField)
         container.addSubview(countLabel)
         container.addSubview(stepper)
         container.addSubview(countValueLabel)
+        container.addSubview(newWorkspaceCheck)
         container.addSubview(worktreeCheck)
-        container.addSubview(commandLabel)
-        container.addSubview(commandField)
         alert.accessoryView = container
 
         guard alert.runModal() == .alertFirstButtonReturn else { return }
         let count = stepper.integerValue
         let useWorktree = worktreeCheck.state == .on
-        let command = commandField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        let useNewWorkspace = newWorkspaceCheck.state == .on
+        let selectedCommand = commandCombo.stringValue
+        let options = optionsField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+
+        // Save selections for next time
+        UserDefaults.standard.set(selectedCommand, forKey: Self.spawnCLILastCommandKey)
+        UserDefaults.standard.set(options, forKey: Self.spawnCLILastOptionsKey)
+        UserDefaults.standard.set(count, forKey: Self.spawnCLILastCountKey)
+        UserDefaults.standard.set(useWorktree, forKey: Self.spawnCLILastWorktreeKey)
+        UserDefaults.standard.set(useNewWorkspace, forKey: Self.spawnCLILastNewWorkspaceKey)
+
+        // Build full command string
+        let command: String? = {
+            if selectedCommand == "(shell only)" || selectedCommand.isEmpty {
+                return nil
+            }
+            if options.isEmpty {
+                return selectedCommand
+            }
+            return "\(selectedCommand) \(options)"
+        }()
 
         if useWorktree {
-            activeTabManager.spawnAgentSessions(count: count, command: command.isEmpty ? nil : command)
+            activeTabManager.spawnAgentSessions(count: count, command: command)
         } else {
-            activeTabManager.spawnCLISessions(count: count, command: command.isEmpty ? nil : command)
+            activeTabManager.spawnCLISessions(count: count, command: command, newWorkspace: useNewWorkspace)
         }
     }
 
