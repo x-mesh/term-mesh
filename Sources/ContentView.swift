@@ -1948,9 +1948,19 @@ struct ContentView: View {
                     .font(.system(size: 11, design: .monospaced))
                     .foregroundColor(titlebarColor(opacity: 0.5))
             }
+
+            titlebarInfoSeparator
+            Text(Self.appVersion)
+                .font(.system(size: 11, design: .monospaced))
+                .foregroundColor(titlebarColor(opacity: 0.4))
         }
         .lineLimit(1)
     }
+
+    private static let appVersion: String = {
+        let ver = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "?"
+        return "v\(ver)"
+    }()
 
     private static func isEffectivelyDark(_ rawMode: String) -> Bool {
         let mode = AppearanceMode(rawValue: rawMode) ?? .system
@@ -2298,7 +2308,7 @@ struct ContentView: View {
                                 .padding(.top, 4)
                         }
                     }
-                // Status bar removed — pane count display was not useful.
+                // Status bar removed — version now shown in titlebar right info.
             }
             .frame(minWidth: 800, minHeight: 600)
                 .background(Color.clear)

@@ -22,6 +22,11 @@ struct StatusBarView: View {
         return tabManager.tabs.firstIndex(where: { $0.id == ws.id }).map { $0 + 1 }
     }
 
+    private var appVersion: String {
+        let ver = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "?"
+        return "v\(ver)"
+    }
+
     private var shellName: String {
         guard let ws = selectedWorkspace,
               let panel = ws.focusedTerminalPanel else { return "" }
@@ -55,22 +60,28 @@ struct StatusBarView: View {
 
             Spacer()
 
-            // Right side: workspace name/index
-            if !workspaceTitle.isEmpty {
-                HStack(spacing: 4) {
-                    if let idx = workspaceIndex {
-                        Text("\(idx)")
-                            .font(.system(size: 11, weight: .medium, design: .monospaced))
-                            .foregroundStyle(.tertiary)
+            // Right side: workspace name/index + version
+            HStack(spacing: 6) {
+                if !workspaceTitle.isEmpty {
+                    HStack(spacing: 4) {
+                        if let idx = workspaceIndex {
+                            Text("\(idx)")
+                                .font(.system(size: 11, weight: .medium, design: .monospaced))
+                                .foregroundStyle(.tertiary)
+                        }
+                        Text(workspaceTitle)
+                            .font(.system(size: 11))
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                            .truncationMode(.middle)
                     }
-                    Text(workspaceTitle)
-                        .font(.system(size: 11))
-                        .foregroundStyle(.secondary)
-                        .lineLimit(1)
-                        .truncationMode(.middle)
+                    separatorDot
                 }
-                .padding(.trailing, 10)
+                Text(appVersion)
+                    .font(.system(size: 11, design: .monospaced))
+                    .foregroundStyle(.tertiary)
             }
+            .padding(.trailing, 10)
         }
         .frame(height: 22)
         .frame(maxWidth: .infinity)
