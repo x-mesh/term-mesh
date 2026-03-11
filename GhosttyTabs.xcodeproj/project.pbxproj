@@ -23,11 +23,15 @@
 			CVB00012 /* AppDelegateHelpers.swift in Sources */ = {isa = PBXBuildFile; fileRef = CVS00012 /* AppDelegateHelpers.swift */; };
 			CVB00013 /* SettingsDebugViews.swift in Sources */ = {isa = PBXBuildFile; fileRef = CVS00013 /* SettingsDebugViews.swift */; };
 			CVB00014 /* AboutView.swift in Sources */ = {isa = PBXBuildFile; fileRef = CVS00014 /* AboutView.swift */; };
+			CVB00015 /* TabManagerSettings.swift in Sources */ = {isa = PBXBuildFile; fileRef = CVS00015 /* TabManagerSettings.swift */; };
 			E62155868BB29FEB5DAAAF25 /* SidebarSelectionState.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9AD52285508B1D6A9875E7B3 /* SidebarSelectionState.swift */; };
 			B9000018A1B2C3D4E5F60719 /* WindowDragHandleView.swift in Sources */ = {isa = PBXBuildFile; fileRef = B9000017A1B2C3D4E5F60719 /* WindowDragHandleView.swift */; };
 			A5001003 /* TabManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = A5001013 /* TabManager.swift */; };
 			A5001004 /* GhosttyConfig.swift in Sources */ = {isa = PBXBuildFile; fileRef = A5001014 /* GhosttyConfig.swift */; };
 			A5001005 /* GhosttyTerminalView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A5001015 /* GhosttyTerminalView.swift */; };
+			CVB00016 /* GhosttyApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = CVS00016 /* GhosttyApp.swift */; };
+			CVB00017 /* GhosttySurfaceScrollView.swift in Sources */ = {isa = PBXBuildFile; fileRef = CVS00017 /* GhosttySurfaceScrollView.swift */; };
+			CVB00018 /* GhosttyNSView+TextInput.swift in Sources */ = {isa = PBXBuildFile; fileRef = CVS00018 /* GhosttyNSView+TextInput.swift */; };
 			A5001532 /* TerminalWindowPortal.swift in Sources */ = {isa = PBXBuildFile; fileRef = A5001531 /* TerminalWindowPortal.swift */; };
 			A5001534 /* BrowserWindowPortal.swift in Sources */ = {isa = PBXBuildFile; fileRef = A5001533 /* BrowserWindowPortal.swift */; };
 		A5001540 /* PortScanner.swift in Sources */ = {isa = PBXBuildFile; fileRef = A5001541 /* PortScanner.swift */; };
@@ -183,11 +187,15 @@
 			CVS00012 /* AppDelegateHelpers.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppDelegateHelpers.swift; sourceTree = "<group>"; };
 			CVS00013 /* SettingsDebugViews.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SettingsDebugViews.swift; sourceTree = "<group>"; };
 			CVS00014 /* AboutView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AboutView.swift; sourceTree = "<group>"; };
+			CVS00015 /* TabManagerSettings.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TabManagerSettings.swift; sourceTree = "<group>"; };
 			9AD52285508B1D6A9875E7B3 /* SidebarSelectionState.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SidebarSelectionState.swift; sourceTree = "<group>"; };
 			B9000017A1B2C3D4E5F60719 /* WindowDragHandleView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WindowDragHandleView.swift; sourceTree = "<group>"; };
 			A5001013 /* TabManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TabManager.swift; sourceTree = "<group>"; };
 			A5001014 /* GhosttyConfig.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GhosttyConfig.swift; sourceTree = "<group>"; };
 			A5001015 /* GhosttyTerminalView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GhosttyTerminalView.swift; sourceTree = "<group>"; };
+			CVS00016 /* GhosttyApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GhosttyApp.swift; sourceTree = "<group>"; };
+			CVS00017 /* GhosttySurfaceScrollView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GhosttySurfaceScrollView.swift; sourceTree = "<group>"; };
+			CVS00018 /* GhosttyNSView+TextInput.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "GhosttyNSView+TextInput.swift"; sourceTree = "<group>"; };
 			A5001531 /* TerminalWindowPortal.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TerminalWindowPortal.swift; sourceTree = "<group>"; };
 			A5001533 /* BrowserWindowPortal.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BrowserWindowPortal.swift; sourceTree = "<group>"; };
 		A5001541 /* PortScanner.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PortScanner.swift; sourceTree = "<group>"; };
@@ -391,6 +399,7 @@
 					CVS00012 /* AppDelegateHelpers.swift */,
 					CVS00013 /* SettingsDebugViews.swift */,
 					CVS00014 /* AboutView.swift */,
+					CVS00015 /* TabManagerSettings.swift */,
 					9AD52285508B1D6A9875E7B3 /* SidebarSelectionState.swift */,
 					B9000017A1B2C3D4E5F60719 /* WindowDragHandleView.swift */,
 					A50012F0 /* Backport.swift */,
@@ -402,6 +411,9 @@
 				A5001417 /* WorkspaceContentView.swift */,
 				A5001014 /* GhosttyConfig.swift */,
 				A5001015 /* GhosttyTerminalView.swift */,
+				CVS00016 /* GhosttyApp.swift */,
+				CVS00017 /* GhosttySurfaceScrollView.swift */,
+				CVS00018 /* GhosttyNSView+TextInput.swift */,
 				A5001531 /* TerminalWindowPortal.swift */,
 				A5001533 /* BrowserWindowPortal.swift */,
 				A5001019 /* TerminalController.swift */,
@@ -655,6 +667,7 @@
 					CVB00012 /* AppDelegateHelpers.swift in Sources */,
 					CVB00013 /* SettingsDebugViews.swift in Sources */,
 					CVB00014 /* AboutView.swift in Sources */,
+					CVB00015 /* TabManagerSettings.swift in Sources */,
 					E62155868BB29FEB5DAAAF25 /* SidebarSelectionState.swift in Sources */,
 					B9000018A1B2C3D4E5F60719 /* WindowDragHandleView.swift in Sources */,
 					A50012F1 /* Backport.swift in Sources */,
@@ -666,6 +679,9 @@
 				A5001407 /* WorkspaceContentView.swift in Sources */,
 				A5001004 /* GhosttyConfig.swift in Sources */,
 				A5001005 /* GhosttyTerminalView.swift in Sources */,
+				CVB00016 /* GhosttyApp.swift in Sources */,
+				CVB00017 /* GhosttySurfaceScrollView.swift in Sources */,
+				CVB00018 /* GhosttyNSView+TextInput.swift in Sources */,
 				A5001532 /* TerminalWindowPortal.swift in Sources */,
 				A5001534 /* BrowserWindowPortal.swift in Sources */,
 				A5001007 /* TerminalController.swift in Sources */,
