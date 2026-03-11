@@ -43,6 +43,29 @@ final class TermMeshDaemon: ObservableObject {
         set { UserDefaults.standard.set(newValue, forKey: Self.dashboardPortKey) }
     }
 
+    // MARK: - Worktree Settings (UserDefaults)
+
+    static let worktreeBaseDirKey = "termMeshWorktreeBaseDir"
+    static let worktreeAutoCleanupKey = "termMeshWorktreeAutoCleanup"
+
+    var worktreeBaseDir: String {
+        get {
+            let val = UserDefaults.standard.string(forKey: Self.worktreeBaseDirKey) ?? ""
+            return val.isEmpty ? Self.defaultWorktreeBaseDir : val
+        }
+        set { UserDefaults.standard.set(newValue, forKey: Self.worktreeBaseDirKey) }
+    }
+
+    var worktreeAutoCleanup: Bool {
+        get { UserDefaults.standard.bool(forKey: Self.worktreeAutoCleanupKey) }
+        set { UserDefaults.standard.set(newValue, forKey: Self.worktreeAutoCleanupKey) }
+    }
+
+    static var defaultWorktreeBaseDir: String {
+        let home = FileManager.default.homeDirectoryForCurrentUser.path
+        return "\(home)/.term-mesh/worktrees"
+    }
+
     // MARK: - Socket Path
 
     var socketPath: String {
@@ -130,7 +153,7 @@ final class TermMeshDaemon: ObservableObject {
     /// Create a worktree sandbox for the given repo path.
     /// Returns the worktree path on success, nil on failure.
     func createWorktree(repoPath: String, branch: String? = nil) -> WorktreeInfo? {
-        var params: [String: Any] = ["repo_path": repoPath]
+        var params: [String: Any] = ["repo_path": repoPath, "base_dir": worktreeBaseDir]
         if let branch { params["branch"] = branch }
         guard let response = rpcCall(method: "worktree.create", params: params) else { return nil }
         return parseWorktreeInfo(response)
@@ -148,7 +171,7 @@ final class TermMeshDaemon: ObservableObject {
             return .failure(.daemonNotConnected)
         }
 
-        var params: [String: Any] = ["repo_path": gitRoot]
+        var params: [String: Any] = ["repo_path": gitRoot, "base_dir": worktreeBaseDir]
         if let branch { params["branch"] = branch }
         guard let response = rpcCall(method: "worktree.create", params: params),
               let info = parseWorktreeInfo(response) else {
@@ -260,7 +283,7 @@ final class TermMeshDaemon: ObservableObject {
 
     /// Spawn N agent sessions with worktree sandboxes.
     func spawnAgents(repoPath: String, count: Int = 1, name: String? = nil, command: String? = nil) -> [AgentSessionInfo] {
-        var params: [String: Any] = ["repo_path": repoPath, "count": count]
+        var params: [String: Any] = ["repo_path": repoPath, "count": count, "worktree_base_dir": worktreeBaseDir]
         if let name { params["name"] = name }
         if let command { params["command"] = command }
         // Worktree creation takes ~2s per agent; allow generous timeout
@@ -606,6 +629,25 @@ final class TermMeshDaemon: ObservableObject {
               let path = dict["path"] as? String,
               let branch = dict["branch"] as? String else { return nil }
         return WorktreeInfo(name: name, path: path, branch: branch)
+    }
+
+    // MARK: - Worktree Cleanup
+
+    /// Remove all stale worktrees (those not bound to any active agent session)
+    func cleanupStaleWorktrees(repoPath: String) -> Int {
+        let worktrees = listWorktrees(repoPath: repoPath)
+        let activeAgents = listAgents(includeTerminated: false)
+        let activePaths = Set(activeAgents.map { $0.worktreePath })
+
+        var removed = 0
+        for wt in worktrees {
+            if !activePaths.contains(wt.path) {
+                if removeWorktree(repoPath: repoPath, name: wt.name) {
+                    removed += 1
+                }
+            }
+        }
+        return removed
     }
 }
 

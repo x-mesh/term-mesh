@@ -3395,6 +3395,45 @@ struct SettingsView: View {
                     SettingsCardNote("Leave empty to use auto-detected path. Custom paths take priority.")
                     }
 
+                    if settingsMatch("worktrees", "worktree", "base directory", "cleanup", "auto") {
+                    SettingsSectionHeader(title: "Worktrees")
+                    SettingsCard {
+                        SettingsCardRow("Base Directory", subtitle: "Where worktrees are created") {
+                            HStack(spacing: 8) {
+                                TextField("", text: Binding(
+                                    get: { TermMeshDaemon.shared.worktreeBaseDir },
+                                    set: { TermMeshDaemon.shared.worktreeBaseDir = $0 }
+                                ))
+                                .textFieldStyle(.roundedBorder)
+                                .frame(maxWidth: 300)
+
+                                Button("Reset") {
+                                    UserDefaults.standard.removeObject(forKey: TermMeshDaemon.worktreeBaseDirKey)
+                                }
+                                .buttonStyle(.plain)
+                                .foregroundColor(.secondary)
+
+                                Button("Open") {
+                                    let path = TermMeshDaemon.shared.worktreeBaseDir
+                                    NSWorkspace.shared.open(URL(fileURLWithPath: path))
+                                }
+                                .buttonStyle(.plain)
+                                .foregroundColor(.accentColor)
+                            }
+                        }
+
+                        SettingsCardDivider()
+
+                        SettingsCardRow("Auto-Cleanup on Quit", subtitle: "Remove stale worktrees when app closes") {
+                            Toggle("", isOn: Binding(
+                                get: { TermMeshDaemon.shared.worktreeAutoCleanup },
+                                set: { TermMeshDaemon.shared.worktreeAutoCleanup = $0 }
+                            ))
+                            .toggleStyle(.switch)
+                        }
+                    }
+                    }
+
                     if settingsMatch("dashboard", "http", "localhost", "port", "remote") {
                     SettingsSectionHeader(title: "Dashboard")
                     SettingsCard {

@@ -9,6 +9,10 @@ pub struct CreateParams {
     pub repo_path: String,
     /// Optional custom branch name (defaults to generated UUID-based name)
     pub branch: Option<String>,
+    /// Optional base directory for worktree placement.
+    /// Worktree is created at `{base_dir}/{repo_name}/term-mesh_wt_{uuid}`.
+    /// Defaults to `~/.term-mesh/worktrees/{repo_name}/`.
+    pub base_dir: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -20,8 +24,8 @@ pub struct WorktreeInfo {
 
 /// Create a new git worktree sandbox for an agent session.
 ///
-/// Worktrees are created at `../term-mesh_wt_<UUID>` relative to the repo,
-/// matching the PRD spec (F-01).
+/// Worktrees are created at `{base_dir}/{repo_name}/term-mesh_wt_<UUID>`.
+/// If `base_dir` is not provided, defaults to `~/.term-mesh/worktrees/{repo_name}/`.
 pub fn create(params: serde_json::Value) -> Result<WorktreeInfo, String> {
     let params: CreateParams =
         serde_json::from_value(params).map_err(|e| format!("invalid params: {e}"))?;
@@ -48,14 +52,30 @@ pub fn create(params: serde_json::Value) -> Result<WorktreeInfo, String> {
     repo.branch(&branch_name, &commit, false)
         .map_err(|e| format!("cannot create branch '{branch_name}': {e}"))?;
 
-    // Worktree path: sibling directory to the repo
+    // Worktree path: use base_dir if provided, otherwise default to ~/.term-mesh/worktrees/{repo_name}/
     let repo_root = repo
         .workdir()
         .ok_or("bare repos not supported")?;
-    let parent = repo_root
-        .parent()
-        .ok_or("repo has no parent directory")?;
-    let wt_path = parent.join(&wt_name);
+    let wt_path = if let Some(ref base) = params.base_dir {
+        let base_path = std::path::PathBuf::from(base);
+        let repo_name = repo_root.file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "unknown".to_string());
+        let target_dir = base_path.join(&repo_name);
+        std::fs::create_dir_all(&target_dir)
+            .map_err(|e| format!("cannot create worktree base dir: {e}"))?;
+        target_dir.join(&wt_name)
+    } else {
+        let home = dirs::home_dir().ok_or("cannot determine home directory")?;
+        let default_base = home.join(".term-mesh").join("worktrees");
+        let repo_name = repo_root.file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "unknown".to_string());
+        let target_dir = default_base.join(&repo_name);
+        std::fs::create_dir_all(&target_dir)
+            .map_err(|e| format!("cannot create worktree base dir: {e}"))?;
+        target_dir.join(&wt_name)
+    };
 
     // Create worktree
     repo.worktree(
@@ -93,10 +113,11 @@ pub fn remove(params: serde_json::Value) -> Result<(), String> {
     let repo = Repository::open(&params.repo_path)
         .map_err(|e| format!("cannot open repo: {e}"))?;
 
-    // Find and prune the worktree
+    // Find worktree and get its path before pruning
     let wt = repo
         .find_worktree(&params.name)
         .map_err(|e| format!("worktree '{}' not found: {e}", params.name))?;
+    let wt_path = wt.path().to_path_buf();
 
     wt.prune(Some(
         git2::WorktreePruneOptions::new()
@@ -105,10 +126,7 @@ pub fn remove(params: serde_json::Value) -> Result<(), String> {
     ))
     .map_err(|e| format!("cannot prune worktree: {e}"))?;
 
-    // Also remove the directory
-    let repo_root = repo.workdir().ok_or("bare repos not supported")?;
-    let parent = repo_root.parent().ok_or("repo has no parent directory")?;
-    let wt_path = parent.join(&params.name);
+    // Remove the directory using the path from git metadata
     if wt_path.exists() {
         std::fs::remove_dir_all(&wt_path)
             .map_err(|e| format!("cannot remove directory: {e}"))?;
@@ -161,16 +179,11 @@ pub fn is_term_mesh_worktree(name: &str) -> bool {
 }
 
 fn worktree_branch(repo: &Repository, wt_name: &str) -> String {
-    // Open the worktree's repo to read its HEAD
-    let repo_root = match repo.workdir() {
-        Some(r) => r,
-        None => return "unknown".into(),
+    // Get path from git worktree metadata
+    let wt_path = match repo.find_worktree(wt_name) {
+        Ok(wt) => wt.path().to_path_buf(),
+        Err(_) => return "unknown".into(),
     };
-    let parent = match repo_root.parent() {
-        Some(p) => p,
-        None => return "unknown".into(),
-    };
-    let wt_path = parent.join(wt_name);
     match Repository::open(&wt_path) {
         Ok(wt_repo) => match wt_repo.head() {
             Ok(head) => head
@@ -212,6 +225,27 @@ pub fn detect_orphan_worktrees() {
                 let name_str = name.to_string_lossy();
                 if name_str.starts_with("term-mesh_wt_") && entry.path().is_dir() {
                     orphans.push(entry.path());
+                }
+            }
+        }
+    }
+
+    // Also scan the default worktree base directory
+    let default_wt_base = home.join(".term-mesh").join("worktrees");
+    if default_wt_base.is_dir() {
+        if let Ok(entries) = std::fs::read_dir(&default_wt_base) {
+            for entry in entries.flatten() {
+                if entry.path().is_dir() {
+                    // Each subdirectory is a repo-name folder, scan inside
+                    if let Ok(inner) = std::fs::read_dir(entry.path()) {
+                        for inner_entry in inner.flatten() {
+                            let name = inner_entry.file_name();
+                            let name_str = name.to_string_lossy();
+                            if name_str.starts_with("term-mesh_wt_") && inner_entry.path().is_dir() {
+                                orphans.push(inner_entry.path());
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -340,5 +374,18 @@ mod tests {
         let result = create(params);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("cannot open repo"));
+    }
+
+    #[test]
+    fn create_with_base_dir() {
+        let (_dir, repo_path) = init_temp_repo();
+        let base = tempfile::tempdir().unwrap();
+        let params = serde_json::json!({
+            "repo_path": repo_path,
+            "base_dir": base.path().to_string_lossy(),
+        });
+        let info = create(params).unwrap();
+        assert!(info.path.starts_with(&base.path().to_string_lossy().to_string()));
+        assert!(std::path::Path::new(&info.path).exists());
     }
 }

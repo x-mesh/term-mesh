@@ -1105,6 +1105,7 @@ struct ContentView: View {
     @State private var titlebarSessionStart: Date? = nil
     @State private var titlebarTag: String? = nil
     @State private var titlebarDashboardPort: Int? = nil
+    @State private var titlebarWorktreeCount: Int = 0
     @State private var isFullScreen: Bool = false
     @State private var observedWindow: NSWindow?
     @StateObject private var fullscreenControlsViewModel = TitlebarControlsViewModel()
@@ -1874,6 +1875,17 @@ struct ContentView: View {
                 .help("Open Dashboard")
             }
 
+            if titlebarWorktreeCount > 0 {
+                titlebarInfoSeparator
+                HStack(spacing: 3) {
+                    Image(systemName: "arrow.triangle.branch")
+                        .font(.system(size: 9))
+                    Text(verbatim: "\(titlebarWorktreeCount)")
+                        .font(.system(size: 11, design: .monospaced))
+                }
+                .foregroundColor(.green.opacity(0.7))
+            }
+
             if let start = titlebarSessionStart {
                 titlebarInfoSeparator
                 Text(Self.formatDuration(since: start))
@@ -1977,6 +1989,17 @@ struct ContentView: View {
         // Dashboard port
         let dashPort: Int? = TermMeshDaemon.shared.isDashboardEnabled ? TermMeshDaemon.shared.dashboardPort : nil
         if titlebarDashboardPort != dashPort { titlebarDashboardPort = dashPort }
+
+        // Worktree count
+        DispatchQueue.global(qos: .utility).async {
+            let currentDir = tab.currentDirectory
+            if let repoPath = TermMeshDaemon.shared.findGitRoot(from: currentDir), !repoPath.isEmpty {
+                let count = TermMeshDaemon.shared.listWorktrees(repoPath: repoPath).count
+                DispatchQueue.main.async {
+                    if self.titlebarWorktreeCount != count { self.titlebarWorktreeCount = count }
+                }
+            }
+        }
     }
 
     private static func queryGitBranch(in directory: String) -> (branch: String, dirty: Bool, dirtyCount: Int) {
@@ -3655,6 +3678,33 @@ struct ContentView: View {
         )
         contributions.append(
             CommandPaletteCommandContribution(
+                commandId: "palette.listWorktrees",
+                title: constant("List Worktrees"),
+                subtitle: workspaceSubtitle,
+                keywords: ["worktree", "list", "git", "branch"],
+                when: { $0.bool(CommandPaletteContextKeys.hasWorkspace) }
+            )
+        )
+        contributions.append(
+            CommandPaletteCommandContribution(
+                commandId: "palette.cleanupWorktrees",
+                title: constant("Cleanup Stale Worktrees"),
+                subtitle: workspaceSubtitle,
+                keywords: ["worktree", "cleanup", "clean", "remove", "stale"],
+                when: { $0.bool(CommandPaletteContextKeys.hasWorkspace) }
+            )
+        )
+        contributions.append(
+            CommandPaletteCommandContribution(
+                commandId: "palette.openWorktreeDir",
+                title: constant("Open Worktree Directory"),
+                subtitle: constant("Open in Finder"),
+                keywords: ["worktree", "directory", "open", "finder"],
+                when: { _ in true }
+            )
+        )
+        contributions.append(
+            CommandPaletteCommandContribution(
                 commandId: "palette.clearWorkspaceName",
                 title: constant("Clear Workspace Name"),
                 subtitle: workspaceSubtitle,
@@ -4117,6 +4167,74 @@ struct ContentView: View {
                 return
             }
             workspace.tag = nil
+        }
+        registry.register(commandId: "palette.listWorktrees") {
+            guard let workspace = tabManager.selectedWorkspace else {
+                NSSound.beep()
+                return
+            }
+            let dir = workspace.currentDirectory
+            DispatchQueue.global(qos: .userInitiated).async {
+                guard let repoPath = TermMeshDaemon.shared.findGitRoot(from: dir), !repoPath.isEmpty else {
+                    DispatchQueue.main.async { NSSound.beep() }
+                    return
+                }
+                let worktrees = TermMeshDaemon.shared.listWorktrees(repoPath: repoPath)
+                DispatchQueue.main.async {
+                    let alert = NSAlert()
+                    alert.messageText = "Worktrees (\(worktrees.count))"
+                    if worktrees.isEmpty {
+                        alert.informativeText = "No active worktrees."
+                    } else {
+                        alert.informativeText = worktrees.map { "• \($0.name)\n  branch: \($0.branch)\n  path: \($0.path)" }.joined(separator: "\n\n")
+                    }
+                    alert.addButton(withTitle: "OK")
+                    if !worktrees.isEmpty {
+                        alert.addButton(withTitle: "Cleanup Stale")
+                    }
+                    let response = alert.runModal()
+                    if response == .alertSecondButtonReturn {
+                        DispatchQueue.global(qos: .userInitiated).async {
+                            let removed = TermMeshDaemon.shared.cleanupStaleWorktrees(repoPath: repoPath)
+                            DispatchQueue.main.async {
+                                let resultAlert = NSAlert()
+                                resultAlert.messageText = "Worktree Cleanup"
+                                resultAlert.informativeText = removed > 0 ? "Removed \(removed) stale worktree(s)." : "No stale worktrees found."
+                                resultAlert.addButton(withTitle: "OK")
+                                resultAlert.runModal()
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        registry.register(commandId: "palette.cleanupWorktrees") {
+            guard let workspace = tabManager.selectedWorkspace else {
+                NSSound.beep()
+                return
+            }
+            let dir = workspace.currentDirectory
+            DispatchQueue.global(qos: .userInitiated).async {
+                guard let repoPath = TermMeshDaemon.shared.findGitRoot(from: dir), !repoPath.isEmpty else {
+                    DispatchQueue.main.async { NSSound.beep() }
+                    return
+                }
+                let removed = TermMeshDaemon.shared.cleanupStaleWorktrees(repoPath: repoPath)
+                DispatchQueue.main.async {
+                    let alert = NSAlert()
+                    alert.messageText = "Worktree Cleanup"
+                    alert.informativeText = removed > 0 ? "Removed \(removed) stale worktree(s)." : "No stale worktrees to clean up."
+                    alert.addButton(withTitle: "OK")
+                    alert.runModal()
+                }
+            }
+        }
+        registry.register(commandId: "palette.openWorktreeDir") {
+            let path = TermMeshDaemon.shared.worktreeBaseDir
+            let url = URL(fileURLWithPath: path)
+            // Create directory if it doesn't exist
+            try? FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
+            NSWorkspace.shared.open(url)
         }
         registry.register(commandId: "palette.toggleWorkspacePin") {
             guard let workspace = tabManager.selectedWorkspace else {
