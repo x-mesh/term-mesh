@@ -1,5 +1,6 @@
 import Foundation
 import Combine
+import os
 
 /// Client for communicating with the term-meshd Rust daemon over Unix socket.
 /// Uses JSON-RPC 2.0 (line-delimited) protocol.
@@ -96,7 +97,7 @@ final class TermMeshDaemon: ObservableObject {
 
             // Already running (orphaned from previous app launch)? Reuse it.
             if self.ping() {
-                print("[term-mesh] daemon already running on socket, reusing")
+                Logger.daemon.info("daemon already running on socket, reusing")
                 return
             }
 
@@ -106,7 +107,7 @@ final class TermMeshDaemon: ObservableObject {
             // Find the daemon binary next to the app bundle, or in the daemon build dir
             let binaryPath = self.daemonBinaryPath()
             guard let binaryPath, FileManager.default.fileExists(atPath: binaryPath) else {
-                print("[term-mesh] daemon binary not found, skipping launch")
+                Logger.daemon.info("daemon binary not found, skipping launch")
                 return
             }
 
@@ -135,9 +136,9 @@ final class TermMeshDaemon: ObservableObject {
             do {
                 try process.run()
                 self.daemonProcess = process
-                print("[term-mesh] daemon started (pid: \(process.processIdentifier))")
+                Logger.daemon.info("daemon started (pid: \(process.processIdentifier, privacy: .public))")
             } catch {
-                print("[term-mesh] failed to start daemon: \(error)")
+                Logger.daemon.error("failed to start daemon: \(error, privacy: .public)")
             }
         }
     }
@@ -149,7 +150,7 @@ final class TermMeshDaemon: ObservableObject {
         if let proc = daemonProcess, proc.isRunning {
             proc.terminate()
             daemonProcess = nil
-            print("[term-mesh] daemon stopped (tracked process)")
+            Logger.daemon.info("daemon stopped (tracked process)")
         }
 
         // Case 2: Always pkill to catch externally-started daemons too.
@@ -159,7 +160,7 @@ final class TermMeshDaemon: ObservableObject {
         kill.arguments = ["term-meshd"]
         try? kill.run()
         kill.waitUntilExit()
-        print("[term-mesh] daemon pkill sent")
+        Logger.daemon.info("daemon pkill sent")
 
         // Clean up socket file
         try? FileManager.default.removeItem(atPath: socketPath)
@@ -603,7 +604,8 @@ final class TermMeshDaemon: ObservableObject {
         }
 
         if let error = json["error"] as? [String: Any] {
-            print("[term-mesh] RPC error: \(error["message"] ?? "unknown")")
+            let msg = (error["message"] as? String) ?? "unknown"
+            Logger.daemon.error("RPC error: \(msg, privacy: .public)")
             return nil
         }
 

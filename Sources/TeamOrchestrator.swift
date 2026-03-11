@@ -1,5 +1,6 @@
 import Bonsplit
 import Foundation
+import os
 
 /// Manages multi-agent Claude teams where a leader orchestrates N agent instances,
 /// each running in split panes within a single workspace.
@@ -143,10 +144,10 @@ final class TeamOrchestrator {
         // Auto-cleanup: if a team with this name exists but its workspace was closed, remove the stale entry
         if let existing = teams[name] {
             if tabManager.tabs.first(where: { $0.id == existing.workspaceId }) == nil {
-                print("[team] cleaning up stale team '\(name)' (workspace closed)")
+                Logger.team.info("cleaning up stale team '\(name, privacy: .public)' (workspace closed)")
                 teams.removeValue(forKey: name)
             } else {
-                print("[team] team '\(name)' already exists")
+                Logger.team.info("team '\(name, privacy: .public)' already exists")
                 return nil
             }
         }
@@ -156,7 +157,7 @@ final class TeamOrchestrator {
         var cliPaths: [String: String] = [:]
         for cli in cliTypes {
             guard let path = agentBinaryPath(cli: cli) else {
-                print("[team] \(cli) binary not found")
+                Logger.team.error("\(cli, privacy: .public) binary not found")
                 return nil
             }
             cliPaths[cli] = path
@@ -223,7 +224,7 @@ final class TeamOrchestrator {
         // First panel = leader console (left side)
         // Close the default panel and create a new one with the leader script as command
         guard let defaultPanelId = workspace.focusedPanelId else {
-            print("[team] no initial panel in workspace")
+            Logger.team.error("no initial panel in workspace")
             return nil
         }
 
@@ -283,7 +284,7 @@ final class TeamOrchestrator {
             command: leaderCommand.map { "\($0); exec $SHELL" },
             environment: leaderEnv
         ) else {
-            print("[team] failed to create leader panel")
+            Logger.team.error("failed to create leader panel")
             return nil
         }
         let leaderPanelId = leaderPanel.id
@@ -328,9 +329,9 @@ final class TeamOrchestrator {
                     wtName = info.name
                     wtPath = info.path
                     wtBranch = info.branch
-                    print("[team] worktree for \(agent.name): \(info.path) [\(info.branch)]")
+                    Logger.team.info("worktree for \(agent.name, privacy: .public): \(info.path, privacy: .public) [\(info.branch, privacy: .public)]")
                 case .failure(let error):
-                    print("[team] worktree failed for \(agent.name): \(error), using shared directory")
+                    Logger.team.error("worktree failed for \(agent.name, privacy: .public): \(error, privacy: .public), using shared directory")
                 }
             }
 
@@ -434,10 +435,10 @@ final class TeamOrchestrator {
                 environment: paneEnv
             ) else {
                 if index == 0 {
-                    print("[team] failed to create first agent split pane")
+                    Logger.team.error("failed to create first agent split pane")
                     return nil
                 }
-                print("[team] failed to create split pane for agent '\(agent.name)'")
+                Logger.team.error("failed to create split pane for agent '\(agent.name, privacy: .public)'")
                 continue
             }
             let panelId = panel.id
@@ -481,7 +482,7 @@ final class TeamOrchestrator {
         )
         teams[name] = team
         syncTeamStateToDaemon()
-        print("[team] created team '\(name)' with \(members.count) agent(s) + leader console")
+        Logger.team.info("created team '\(name, privacy: .public)' with \(members.count, privacy: .public) agent(s) + leader console")
 
         // For non-Claude CLI leaders (kiro, codex, gemini), inject team instructions.
         // Claude leaders get instructions via --system-prompt in team-leader-claude.sh.
@@ -1099,7 +1100,7 @@ final class TeamOrchestrator {
 
         teams.removeValue(forKey: name)
         syncTeamStateToDaemon()
-        print("[team] destroyed team '\(name)'")
+        Logger.team.info("destroyed team '\(name, privacy: .public)'")
         return true
     }
 
@@ -1109,9 +1110,9 @@ final class TeamOrchestrator {
         for agent in team.agents {
             guard let wtName = agent.worktreeName else { continue }
             if TermMeshDaemon.shared.removeWorktree(repoPath: repoRoot, name: wtName) {
-                print("[team] removed worktree '\(wtName)' for agent '\(agent.name)'")
+                Logger.team.info("removed worktree '\(wtName, privacy: .public)' for agent '\(agent.name, privacy: .public)'")
             } else {
-                print("[team] failed to remove worktree '\(wtName)' for agent '\(agent.name)'")
+                Logger.team.error("failed to remove worktree '\(wtName, privacy: .public)' for agent '\(agent.name, privacy: .public)'")
             }
         }
     }

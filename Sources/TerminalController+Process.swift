@@ -1,5 +1,6 @@
 import AppKit
 import Foundation
+import os
 
 extension TerminalController {
     // MARK: - Auth Rate Limiting
@@ -111,7 +112,7 @@ extension TerminalController {
         // Create socket
         serverSocket = socket(AF_UNIX, SOCK_STREAM, 0)
         guard serverSocket >= 0 else {
-            print("TerminalController: Failed to create socket")
+            Logger.socket.error("Failed to create socket")
             return
         }
 
@@ -132,7 +133,7 @@ extension TerminalController {
         }
 
         guard bindResult >= 0 else {
-            print("TerminalController: Failed to bind socket")
+            Logger.socket.error("Failed to bind socket")
             close(serverSocket)
             return
         }
@@ -141,13 +142,13 @@ extension TerminalController {
 
         // Listen
         guard listen(serverSocket, 5) >= 0 else {
-            print("TerminalController: Failed to listen on socket")
+            Logger.socket.error("Failed to listen on socket")
             close(serverSocket)
             return
         }
 
         isRunning = true
-        print("TerminalController: Listening on \(socketPath)")
+        Logger.socket.info("Listening on \(socketPath, privacy: .public)")
 
         // Wire batched port scanner results back to workspace state.
         PortScanner.shared.onPortsUpdated = { [weak self] workspaceId, panelId, ports in
@@ -186,7 +187,7 @@ extension TerminalController {
     func applySocketPermissions() {
         let permissions = mode_t(accessMode.socketFilePermissions)
         if chmod(socketPath, permissions) != 0 {
-            print("TerminalController: Failed to set socket permissions to \(String(permissions, radix: 8)) for \(socketPath)")
+            Logger.socket.error("Failed to set socket permissions to \(String(permissions, radix: 8), privacy: .public) for \(self.socketPath, privacy: .public)")
         }
     }
 
@@ -345,9 +346,9 @@ extension TerminalController {
             guard clientSocket >= 0 else {
                 if isRunning {
                     consecutiveFailures += 1
-                    print("TerminalController: Accept failed (\(consecutiveFailures) consecutive)")
+                    Logger.socket.error("Accept failed (\(consecutiveFailures, privacy: .public) consecutive)")
                     if consecutiveFailures >= 50 {
-                        print("TerminalController: Too many consecutive accept failures, exiting accept loop")
+                        Logger.socket.error("Too many consecutive accept failures, exiting accept loop")
                         break
                     }
                     usleep(10_000) // 10ms backoff

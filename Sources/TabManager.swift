@@ -4,6 +4,7 @@ import Foundation
 import Bonsplit
 import CoreVideo
 import Combine
+import os
 
 // MARK: - Tab Type Alias for Backwards Compatibility
 // The old Tab class is replaced by Workspace
@@ -851,7 +852,7 @@ class TabManager: ObservableObject {
             case .success(let info):
                 workingDirectory = info.path
                 worktreeInfo = info
-                print("[term-mesh] worktree created: \(info.name) at \(info.path)")
+                Logger.app.info("worktree created: \(info.name, privacy: .public) at \(info.path, privacy: .public)")
             case .failure(let error):
                 let message: String
                 switch error {
@@ -862,7 +863,7 @@ class TabManager: ObservableObject {
                 case .rpcError(let detail):
                     message = "Failed to create worktree: \(detail)\nNew tab will open without sandbox."
                 }
-                print("[term-mesh] worktree error: \(message)")
+                Logger.app.error("worktree error: \(message, privacy: .public)")
                 DispatchQueue.main.async {
                     let alert = NSAlert()
                     alert.messageText = "Worktree Sandbox"
@@ -958,9 +959,9 @@ class TabManager: ObservableObject {
         do {
             let data = try JSONEncoder().encode(session)
             try data.write(to: URL(fileURLWithPath: SessionRestoreSettings.sessionFilePath), options: .atomic)
-            print("[session-restore] saved \(workspaceStates.count) workspace(s)")
+            Logger.app.info("session-restore: saved \(workspaceStates.count, privacy: .public) workspace(s)")
         } catch {
-            print("[session-restore] save failed: \(error)")
+            Logger.app.error("session-restore: save failed: \(error, privacy: .public)")
         }
     }
 
@@ -999,7 +1000,7 @@ class TabManager: ObservableObject {
             guard session.version == 1, !session.workspaces.isEmpty else { return nil }
             return session
         } catch {
-            print("[session-restore] load failed: \(error)")
+            Logger.app.error("session-restore: load failed: \(error, privacy: .public)")
             return nil
         }
     }
@@ -1029,7 +1030,7 @@ class TabManager: ObservableObject {
         } else if let first = tabs.first {
             selectedTabId = first.id
         }
-        print("[session-restore] restored \(tabs.count) workspace(s)")
+        Logger.app.info("session-restore: restored \(self.tabs.count, privacy: .public) workspace(s)")
     }
 
     func terminalPanelForWorkspaceConfigInheritanceSource() -> TerminalPanel? {
@@ -1210,7 +1211,7 @@ class TabManager: ObservableObject {
         if let name = workspace.worktreeName, let repoPath = workspace.worktreeRepoPath {
             DispatchQueue.global(qos: .utility).async {
                 let success = TermMeshDaemon.shared.removeWorktree(repoPath: repoPath, name: name)
-                print("[term-mesh] worktree cleanup \(name): \(success ? "ok" : "failed")")
+                Logger.app.info("worktree cleanup \(name, privacy: .public): \(success ? "ok" : "failed", privacy: .public)")
             }
         }
 

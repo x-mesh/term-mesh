@@ -1,6 +1,7 @@
 import AppKit
 import UserNotifications
 import WebKit
+import os
 
 /// Manages the term-mesh monitoring dashboard in a separate window.
 ///
@@ -187,9 +188,9 @@ final class DashboardController: NSObject, WKNavigationDelegate {
         notificationPermissionRequested = true
         UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound]) { granted, error in
             if let error {
-                print("[term-mesh] notification permission error: \(error)")
+                Logger.app.error("notification permission error: \(error, privacy: .public)")
             } else {
-                print("[term-mesh] notification permission: \(granted ? "granted" : "denied")")
+                Logger.app.info("notification permission: \(granted ? "granted" : "denied", privacy: .public)")
             }
         }
     }
@@ -244,7 +245,7 @@ final class DashboardController: NSObject, WKNavigationDelegate {
                 trigger: nil
             )
             UNUserNotificationCenter.current().add(request)
-            print("[term-mesh] Budget Guard notification: \(name) (PID \(pid)) stopped for \(kind) threshold")
+            Logger.app.info("Budget Guard notification: \(name, privacy: .public) (PID \(pid, privacy: .public)) stopped for \(kind, privacy: .public) threshold")
         }
 
         // Clean up notified PIDs for processes no longer in alerts
@@ -477,12 +478,12 @@ final class DashboardController: NSObject, WKNavigationDelegate {
 
                 if let json = monitorData {
                     webView.evaluateJavaScript("updateMonitor(\(json));") { _, error in
-                        if let error { print("[dashboard] monitor error: \(error)") }
+                        if let error { Logger.app.error("dashboard monitor error: \(error, privacy: .public)") }
                     }
                 }
                 if let json = watcherData {
                     webView.evaluateJavaScript("updateHeatmap(\(json));") { _, error in
-                        if let error { print("[dashboard] heatmap error: \(error)") }
+                        if let error { Logger.app.error("dashboard heatmap error: \(error, privacy: .public)") }
                     }
                 }
                 if let json = sessionData {
