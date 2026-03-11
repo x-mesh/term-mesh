@@ -497,7 +497,7 @@ final class WorktreeTableDataSource: NSObject, NSTableViewDataSource, NSTableVie
         let repoPath = self.repoPath
         let name = wt.name
         DispatchQueue.global(qos: .userInitiated).async {
-            let success = daemon.removeWorktree(repoPath: repoPath, name: name)
+            let success = self.daemon.removeWorktree(repoPath: repoPath, name: name)
             DispatchQueue.main.async { [weak self] in
                 guard let self else { return }
                 if success {
@@ -523,8 +523,8 @@ final class WorktreeTableDataSource: NSObject, NSTableViewDataSource, NSTableVie
     @objc func cleanupStale(_ sender: Any?) {
         let repoPath = self.repoPath
         DispatchQueue.global(qos: .userInitiated).async {
-            let removed = daemon.cleanupStaleWorktrees(repoPath: repoPath)
-            let remaining = daemon.listWorktrees(repoPath: repoPath)
+            let removed = self.daemon.cleanupStaleWorktrees(repoPath: repoPath)
+            let remaining = self.daemon.listWorktrees(repoPath: repoPath)
             DispatchQueue.main.async { [weak self] in
                 guard let self else { return }
                 self.worktrees = remaining

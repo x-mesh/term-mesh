@@ -174,14 +174,14 @@ final class DashboardController: NSObject, WKNavigationDelegate {
         }
 
         DispatchQueue.global(qos: .utility).async {
-            daemon.syncSessions(sessions)
+            self.daemon.syncSessions(sessions)
         }
     }
 
     private func syncTeamsToDaemon() {
         let payload = currentTeamPayload()
         DispatchQueue.global(qos: .utility).async {
-            daemon.syncTeams(payload)
+            self.daemon.syncTeams(payload)
         }
     }
 
@@ -653,7 +653,7 @@ private class DashboardMessageHandler: NSObject, WKScriptMessageHandler {
 
     func userContentController(_ userContentController: WKUserContentController,
                                didReceive message: WKScriptMessage) {
-        let daemon = self.daemon
+        guard let daemon = controller?.daemon else { return }
         switch message.name {
         case "stopProcess":
             if let pid = message.body as? Int {

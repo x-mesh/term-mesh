@@ -37,6 +37,7 @@
 			CVB00035 /* BrowserHistoryService.swift in Sources */ = {isa = PBXBuildFile; fileRef = CVS00035 /* BrowserHistoryService.swift */; };
 			CVB00036 /* DaemonService.swift in Sources */ = {isa = PBXBuildFile; fileRef = CVS00036 /* DaemonService.swift */; };
 			CVB00037 /* ConfigProvider.swift in Sources */ = {isa = PBXBuildFile; fileRef = CVS00037 /* ConfigProvider.swift */; };
+			CVB00038 /* ServiceContainer.swift in Sources */ = {isa = PBXBuildFile; fileRef = CVS00038 /* ServiceContainer.swift */; };
 			E62155868BB29FEB5DAAAF25 /* SidebarSelectionState.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9AD52285508B1D6A9875E7B3 /* SidebarSelectionState.swift */; };
 			B9000018A1B2C3D4E5F60719 /* WindowDragHandleView.swift in Sources */ = {isa = PBXBuildFile; fileRef = B9000017A1B2C3D4E5F60719 /* WindowDragHandleView.swift */; };
 			A5001003 /* TabManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = A5001013 /* TabManager.swift */; };
@@ -220,6 +221,7 @@
 			CVS00035 /* BrowserHistoryService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BrowserHistoryService.swift; sourceTree = "<group>"; };
 			CVS00036 /* DaemonService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DaemonService.swift; sourceTree = "<group>"; };
 			CVS00037 /* ConfigProvider.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ConfigProvider.swift; sourceTree = "<group>"; };
+			CVS00038 /* ServiceContainer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ServiceContainer.swift; sourceTree = "<group>"; };
 			9AD52285508B1D6A9875E7B3 /* SidebarSelectionState.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SidebarSelectionState.swift; sourceTree = "<group>"; };
 			B9000017A1B2C3D4E5F60719 /* WindowDragHandleView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WindowDragHandleView.swift; sourceTree = "<group>"; };
 			A5001013 /* TabManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TabManager.swift; sourceTree = "<group>"; };
@@ -451,6 +453,7 @@
 					CVS00035 /* BrowserHistoryService.swift */,
 					CVS00036 /* DaemonService.swift */,
 					CVS00037 /* ConfigProvider.swift */,
+					CVS00038 /* ServiceContainer.swift */,
 					9AD52285508B1D6A9875E7B3 /* SidebarSelectionState.swift */,
 					B9000017A1B2C3D4E5F60719 /* WindowDragHandleView.swift */,
 					A50012F0 /* Backport.swift */,
@@ -738,6 +741,7 @@
 					CVB00035 /* BrowserHistoryService.swift in Sources */,
 					CVB00036 /* DaemonService.swift in Sources */,
 					CVB00037 /* ConfigProvider.swift in Sources */,
+					CVB00038 /* ServiceContainer.swift in Sources */,
 					E62155868BB29FEB5DAAAF25 /* SidebarSelectionState.swift in Sources */,
 					B9000018A1B2C3D4E5F60719 /* WindowDragHandleView.swift in Sources */,
 					A50012F1 /* Backport.swift in Sources */,

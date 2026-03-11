@@ -1012,7 +1012,7 @@ final class TeamOrchestrator {
     private func syncTeamStateToDaemon() {
         let payload = daemonPayload()
         DispatchQueue.global(qos: .utility).async {
-            daemon.syncTeams(payload)
+            self.daemon.syncTeams(payload)
         }
     }
 

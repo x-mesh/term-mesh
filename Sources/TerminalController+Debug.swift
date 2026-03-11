@@ -1622,7 +1622,7 @@ extension TerminalController {
 
     func clearNotifications() -> String {
         DispatchQueue.main.async {
-            notifications.clearAll()
+            self.notifications.clearAll()
         }
         return "OK"
     }

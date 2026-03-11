@@ -34,6 +34,7 @@ protocol DaemonService: AnyObject {
     func syncSessions(_ sessions: [[String: Any]])
     func syncTeams(_ payload: [String: Any])
     func watchPath(_ path: String)
+    func unwatchPath(_ path: String)
 
     // MARK: - Agent Management
     func spawnAgents(repoPath: String, count: Int, name: String?, command: String?) -> [AgentSessionInfo]
@@ -41,6 +42,9 @@ protocol DaemonService: AnyObject {
     func getAgent(id: String) -> AgentSessionInfo?
     func bindAgentPanel(sessionId: String, panelId: String) -> Bool
     func unbindAgentPanel(sessionId: String) -> Bool
+
+    // MARK: - Dashboard
+    func setAutoStop(enabled: Bool)
 
     // MARK: - Low-Level RPC
     func rpcCallRaw(method: String, params: [String: Any]) -> String?

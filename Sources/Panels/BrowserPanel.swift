@@ -1286,7 +1286,7 @@ final class BrowserPanel: Panel, ObservableObject {
         // Set up navigation delegate
         let navDelegate = BrowserNavigationDelegate()
         navDelegate.didFinish = { webView in
-            browserHistory.recordVisit(url: webView.url, title: webView.title)
+            self.browserHistory.recordVisit(url: webView.url, title: webView.title)
             Task { @MainActor [weak self] in
                 self?.refreshFavicon(from: webView)
                 self?.applyBrowserThemeModeIfNeeded()

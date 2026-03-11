@@ -475,8 +475,8 @@ class GhosttyApp {
         NotificationCenter.default.post(name: .ghosttyConfigDidReload, object: nil)
 
         #if os(macOS)
-        if let app {
-            ghostty_app_set_focus(app, NSApp.isActive)
+        if let app, let nsApp = NSApp {
+            ghostty_app_set_focus(app, nsApp.isActive)
         }
 
         appObservers.append(NotificationCenter.default.addObserver(

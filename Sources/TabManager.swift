@@ -258,7 +258,7 @@ class TabManager: ObservableObject {
         var gitRepoRoot: String?  // git root for worktree cleanup
         if daemon.worktreeEnabled, let cwd = workingDirectory {
             gitRepoRoot = daemon.findGitRoot(from: cwd)
-            let result = daemon.createWorktreeWithError(repoPath: cwd)
+            let result = daemon.createWorktreeWithError(repoPath: cwd, branch: nil)
             switch result {
             case .success(let info):
                 workingDirectory = info.path
@@ -306,7 +306,7 @@ class TabManager: ObservableObject {
         // term-mesh: Auto-watch the working directory for file heatmap
         if let cwd = workingDirectory, !cwd.isEmpty {
             DispatchQueue.global(qos: .utility).async {
-                daemon.watchPath(cwd)
+                self.daemon.watchPath(cwd)
             }
         }
 
@@ -621,7 +621,7 @@ class TabManager: ObservableObject {
         // term-mesh: Clean up worktree sandbox if this tab was using one
         if let name = workspace.worktreeName, let repoPath = workspace.worktreeRepoPath {
             DispatchQueue.global(qos: .utility).async {
-                let success = daemon.removeWorktree(repoPath: repoPath, name: name)
+                let success = self.daemon.removeWorktree(repoPath: repoPath, name: name)
                 Logger.app.info("worktree cleanup \(name, privacy: .public): \(success ? "ok" : "failed", privacy: .public)")
             }
         }
@@ -1431,8 +1431,9 @@ class TabManager: ObservableObject {
         titlebarProgress = .indeterminate("Spawning \(count) agent\(count > 1 ? "s" : "")…", color: .green)
 
         // Spawn agent sessions via daemon (background to avoid blocking UI)
+        let daemon = self.daemon
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-            let sessions = daemon.spawnAgents(repoPath: repoPath, count: count, command: command)
+            let sessions = daemon.spawnAgents(repoPath: repoPath, count: count, name: nil, command: command)
             guard !sessions.isEmpty else {
                 DispatchQueue.main.async {
                     self?.titlebarProgress = nil
@@ -1753,6 +1754,7 @@ class TabManager: ObservableObject {
               let tab = tabs.first(where: { $0.id == selectedTabId }),
               let focusedPanelId = tab.focusedPanelId else { return }
 
+        let daemon = self.daemon
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             guard let session = daemon.getAgent(id: sessionId) else {
                 DispatchQueue.main.async {
