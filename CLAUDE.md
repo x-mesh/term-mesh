@@ -112,50 +112,53 @@ tail -f "$(cat /tmp/term-mesh-last-debug-log-path 2>/dev/null || echo /tmp/term-
 - Only explicit focus-intent commands may mutate in-app focus/selection (`window.focus`, `workspace.select/next/previous/last`, `surface.focus`, `pane.focus/last`, browser focus commands, and v1 focus equivalents).
 - All non-focus commands should preserve current user focus context while still applying data/model changes.
 
-## Team agent system (OMC → term-mesh integration)
+## Team agent system (OMC override)
 
-When using multi-agent teams inside term-mesh (e.g., via OMC `/team` skill or manual team creation),
-**always use term-mesh's native team API** via `scripts/team.py` instead of Claude Code's built-in
-Team/Task tools (`TeamCreate`, `SendMessage`, `TaskCreate`, etc.).
+**CRITICAL OVERRIDE:** When running inside term-mesh (i.e., `TERMMESH_SOCKET` env var is set or
+a socket exists at `/tmp/term-mesh*.sock` or `/tmp/cmux.sock`), ALL team operations MUST use
+`scripts/team.py`. This applies regardless of how the team was triggered.
 
-term-mesh's team system provides GPU-accelerated terminal panes, pane buffer reading, and socket-based
-bidirectional communication — capabilities that Claude Code's native team API does not have.
+**Banned tools in term-mesh context:** `TeamCreate`, `SendMessage`, `TaskCreate`, `TaskList`,
+`TaskGet`, `TaskUpdate`, `TeamDelete`. These create a parallel, disconnected team state.
 
-### CLI reference
+**Use instead:** The project-local `/team` command (`.claude/commands/team.md`), which routes
+everything through `scripts/team.py`.
+
+### OMC keyword override
+
+If OMC's keyword detector fires `[MODE: TEAM]` or `[MAGIC KEYWORD: TEAM]`:
+1. **Do NOT invoke `/oh-my-claudecode:team`** — it uses Claude Code native teams
+2. **Instead invoke `/team`** (the project-local command) or use `scripts/team.py` directly
+
+### Quick CLI reference
 
 ```bash
 # Create team (agents get split panes in term-mesh)
 ./scripts/team.py create [N] [--claude-leader]
 
-# Send commands to agents
+# Delegate with task tracking
+./scripts/team.py delegate <agent> '<instruction>'
+
+# Send raw instruction
 ./scripts/team.py send <agent> '<instruction>'
 ./scripts/team.py broadcast '<instruction>'
 
-# Read agent output (bidirectional — the key advantage over Claude Code native teams)
+# Read agent output (bidirectional — the key advantage)
 ./scripts/team.py read <agent> --lines 100
 ./scripts/team.py collect --lines 100
 ./scripts/team.py wait --timeout 120 --mode any
 
-# Message queue (agent ↔ leader)
-./scripts/team.py msg send '<text>' --from <agent>
+# Message queue (agent <-> leader)
 ./scripts/team.py msg list [--from <agent>]
 
 # Task board
 ./scripts/team.py task create '<title>' --assign <agent>
-./scripts/team.py task update <id> <status> [result]
 ./scripts/team.py task list
+./scripts/team.py task done <id> '<result>'
+
+# Cleanup
+./scripts/team.py destroy
 ```
-
-### When OMC `/team` skill is triggered
-
-If the OMC keyword detector fires `[MAGIC KEYWORD: TEAM]`, the LLM should:
-1. Use `./scripts/team.py create` to spawn agents in term-mesh panes (NOT `TeamCreate`)
-2. Use `./scripts/team.py send` to assign work (NOT `SendMessage`)
-3. Use `./scripts/team.py read/collect/wait` to get results (NOT poll via `TaskGet`)
-4. Use `./scripts/team.py task` for task tracking (NOT `TaskCreate/TaskList`)
-5. Use `./scripts/team.py destroy` to clean up (NOT `TeamDelete`)
-
-This ensures a single team infrastructure with no state duplication.
 
 ## E2E mac UI tests
 
