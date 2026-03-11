@@ -2738,6 +2738,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
             return true
         }
 
+        // Sequential pane navigation: Cmd+] / Cmd+[
+        if matchShortcut(event: event, shortcut: KeyboardShortcutSettings.shortcut(for: .focusNextPane)) {
+            tabManager?.focusNextPane()
+            return true
+        }
+        if matchShortcut(event: event, shortcut: KeyboardShortcutSettings.shortcut(for: .focusPrevPane)) {
+            tabManager?.focusPrevPane()
+            return true
+        }
+
         // Surface navigation: Cmd+Shift+] / Cmd+Shift+[
         if matchShortcut(event: event, shortcut: KeyboardShortcutSettings.shortcut(for: .nextSurface)) {
             tabManager?.selectNextSurface()

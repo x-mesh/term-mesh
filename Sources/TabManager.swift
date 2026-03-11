@@ -837,7 +837,7 @@ class TabManager: ObservableObject {
     }
 
     @discardableResult
-    func addWorkspace(workingDirectory overrideWorkingDirectory: String? = nil, select: Bool = true) -> Workspace {
+    func addWorkspace(workingDirectory overrideWorkingDirectory: String? = nil, select: Bool = true, environment: [String: String] = [:]) -> Workspace {
         sentryBreadcrumb("workspace.create", data: ["tabCount": tabs.count + 1])
         var workingDirectory = normalizedWorkingDirectory(overrideWorkingDirectory) ?? preferredWorkingDirectoryForNewTab()
 
@@ -881,7 +881,8 @@ class TabManager: ObservableObject {
             title: worktreeInfo.map { "[\($0.branch)] Terminal \(tabs.count + 1)" } ?? "Terminal \(tabs.count + 1)",
             workingDirectory: workingDirectory,
             portOrdinal: ordinal,
-            configTemplate: inheritedConfig
+            configTemplate: inheritedConfig,
+            environment: environment
         )
         // term-mesh: Store worktree metadata for auto-cleanup on tab close
         if let info = worktreeInfo {
@@ -2126,12 +2127,15 @@ class TabManager: ObservableObject {
                 }
 
                 // Phase 3: Equalize splits via tree snapshot
-                self.equalizeAgentGrid(workspace: tab)
+                // Delay to let bonsplit complete its layout pass before setting divider positions.
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) { [weak self] in
+                    self?.equalizeAgentGrid(workspace: tab)
 
-                // Clear progress after a brief delay
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) { [weak self] in
-                    withAnimation(.easeOut(duration: 0.3)) {
-                        self?.titlebarProgress = nil
+                    // Clear progress after a brief delay
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) {
+                        withAnimation(.easeOut(duration: 0.3)) {
+                            self?.titlebarProgress = nil
+                        }
                     }
                 }
             }
@@ -2166,12 +2170,18 @@ class TabManager: ObservableObject {
     /// Spawn N plain CLI terminal panes without worktrees.
     /// Uses the same balanced grid layout as spawnAgentSessions.
     func spawnCLISessions(count: Int, command: String? = nil, newWorkspace: Bool = false) {
+        // Suppress shell banners (e.g. motd, figlet) so commands run reliably.
+        let spawnEnv: [String: String] = [
+            "TERMMESH_SPAWN_CLI": "1",
+            "CMUX_TEAM_AGENT": "1",
+        ]
+
         let tab: Workspace
         let rootPanelId: UUID
 
         if newWorkspace {
             // Create a new workspace tab with CLI panes filling the entire space
-            let ws = addTab(select: true)
+            let ws = addWorkspace(select: true, environment: spawnEnv)
             tab = ws
             guard let firstPanel = ws.focusedPanelId else { return }
             rootPanelId = firstPanel
@@ -2250,7 +2260,8 @@ class TabManager: ObservableObject {
                 if let panelId = self.newSplit(
                     tabId: tabId, surfaceId: rootPanelId,
                     direction: .right, focus: false,
-                    workingDirectory: workDir, command: command
+                    workingDirectory: workDir, command: command,
+                    environment: spawnEnv
                 ) {
                     setTitle(panelId, idx)
                     columnTopPanelIds.append(panelId)
@@ -2267,7 +2278,8 @@ class TabManager: ObservableObject {
                     if let panelId = self.newSplit(
                         tabId: tabId, surfaceId: lastRowPanelId,
                         direction: .down, focus: false,
-                        workingDirectory: workDir, command: command
+                        workingDirectory: workDir, command: command,
+                        environment: spawnEnv
                     ) {
                         setTitle(panelId, idx)
                         lastRowPanelId = panelId
@@ -2290,7 +2302,8 @@ class TabManager: ObservableObject {
                 if let panelId = self.newSplit(
                     tabId: tabId, surfaceId: splitFrom,
                     direction: .right, focus: false,
-                    workingDirectory: workDir, command: command
+                    workingDirectory: workDir, command: command,
+                    environment: spawnEnv
                 ) {
                     setTitle(panelId, idx)
                     columnTopPanelIds.append(panelId)
@@ -2306,7 +2319,8 @@ class TabManager: ObservableObject {
                     if let panelId = self.newSplit(
                         tabId: tabId, surfaceId: lastRowPanelId,
                         direction: .down, focus: false,
-                        workingDirectory: workDir, command: command
+                        workingDirectory: workDir, command: command,
+                        environment: spawnEnv
                     ) {
                         setTitle(panelId, idx)
                         lastRowPanelId = panelId
@@ -2315,13 +2329,15 @@ class TabManager: ObservableObject {
             }
         }
 
-        // Equalize splits
-        equalizeAgentGrid(workspace: tab)
+        // Equalize splits (delay to let bonsplit complete layout pass)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) { [weak self] in
+            self?.equalizeAgentGrid(workspace: tab)
 
-        // Clear progress
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) { [weak self] in
-            withAnimation(.easeOut(duration: 0.3)) {
-                self?.titlebarProgress = nil
+            // Clear progress
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) {
+                withAnimation(.easeOut(duration: 0.3)) {
+                    self?.titlebarProgress = nil
+                }
             }
         }
     }
@@ -2388,6 +2404,20 @@ class TabManager: ObservableObject {
         guard let selectedTabId,
               let tab = tabs.first(where: { $0.id == selectedTabId }) else { return }
         tab.moveFocus(direction: direction)
+    }
+
+    /// Focus the next pane in sequential order (wraps around)
+    func focusNextPane() {
+        guard let selectedTabId,
+              let tab = tabs.first(where: { $0.id == selectedTabId }) else { return }
+        tab.focusNextPane()
+    }
+
+    /// Focus the previous pane in sequential order (wraps around)
+    func focusPrevPane() {
+        guard let selectedTabId,
+              let tab = tabs.first(where: { $0.id == selectedTabId }) else { return }
+        tab.focusPrevPane()
     }
 
     // MARK: - Recent Tab History Navigation
@@ -2470,7 +2500,7 @@ class TabManager: ObservableObject {
 
     /// Create a new split in the specified direction
     /// Returns the new panel's ID (which is also the surface ID for terminals)
-    func newSplit(tabId: UUID, surfaceId: UUID, direction: SplitDirection, focus: Bool = true, workingDirectory: String? = nil, command: String? = nil) -> UUID? {
+    func newSplit(tabId: UUID, surfaceId: UUID, direction: SplitDirection, focus: Bool = true, workingDirectory: String? = nil, command: String? = nil, environment: [String: String] = [:]) -> UUID? {
         guard let tab = tabs.first(where: { $0.id == tabId }) else { return nil }
         return tab.newTerminalSplit(
             from: surfaceId,
@@ -2478,7 +2508,8 @@ class TabManager: ObservableObject {
             insertFirst: direction.insertFirst,
             focus: focus,
             workingDirectory: workingDirectory,
-            command: command
+            command: command,
+            environment: environment
         )?.id
     }
 

@@ -24,6 +24,8 @@ enum KeyboardShortcutSettings {
         case newSurface
 
         // Panes / splits
+        case focusNextPane
+        case focusPrevPane
         case focusLeft
         case focusRight
         case focusUp
@@ -57,6 +59,8 @@ enum KeyboardShortcutSettings {
             case .renameWorkspace: return "Rename Workspace"
             case .closeWorkspace: return "Close Workspace"
             case .newSurface: return "New Surface"
+            case .focusNextPane: return "Focus Next Pane"
+            case .focusPrevPane: return "Focus Previous Pane"
             case .focusLeft: return "Focus Pane Left"
             case .focusRight: return "Focus Pane Right"
             case .focusUp: return "Focus Pane Up"
@@ -85,6 +89,8 @@ enum KeyboardShortcutSettings {
             case .renameTab: return "shortcut.renameTab"
             case .renameWorkspace: return "shortcut.renameWorkspace"
             case .closeWorkspace: return "shortcut.closeWorkspace"
+            case .focusNextPane: return "shortcut.focusNextPane"
+            case .focusPrevPane: return "shortcut.focusPrevPane"
             case .focusLeft: return "shortcut.focusLeft"
             case .focusRight: return "shortcut.focusRight"
             case .focusUp: return "shortcut.focusUp"
@@ -128,6 +134,10 @@ enum KeyboardShortcutSettings {
                 return StoredShortcut(key: "r", command: true, shift: true, option: false, control: false)
             case .closeWorkspace:
                 return StoredShortcut(key: "w", command: true, shift: true, option: false, control: false)
+            case .focusNextPane:
+                return StoredShortcut(key: "]", command: true, shift: false, option: false, control: false)
+            case .focusPrevPane:
+                return StoredShortcut(key: "[", command: true, shift: false, option: false, control: false)
             case .focusLeft:
                 return StoredShortcut(key: "←", command: true, shift: false, option: true, control: false)
             case .focusRight:
@@ -212,6 +222,9 @@ enum KeyboardShortcutSettings {
     static func prevSidebarTabShortcut() -> StoredShortcut { shortcut(for: .prevSidebarTab) }
     static func renameWorkspaceShortcut() -> StoredShortcut { shortcut(for: .renameWorkspace) }
     static func closeWorkspaceShortcut() -> StoredShortcut { shortcut(for: .closeWorkspace) }
+
+    static func focusNextPaneShortcut() -> StoredShortcut { shortcut(for: .focusNextPane) }
+    static func focusPrevPaneShortcut() -> StoredShortcut { shortcut(for: .focusPrevPane) }
 
     static func focusLeftShortcut() -> StoredShortcut { shortcut(for: .focusLeft) }
     static func focusRightShortcut() -> StoredShortcut { shortcut(for: .focusRight) }

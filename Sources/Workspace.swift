@@ -452,7 +452,8 @@ final class Workspace: Identifiable, ObservableObject {
         title: String = "Terminal",
         workingDirectory: String? = nil,
         portOrdinal: Int = 0,
-        configTemplate: ghostty_surface_config_s? = nil
+        configTemplate: ghostty_surface_config_s? = nil,
+        environment: [String: String] = [:]
     ) {
         self.id = UUID()
         self.portOrdinal = portOrdinal
@@ -493,7 +494,8 @@ final class Workspace: Identifiable, ObservableObject {
             context: GHOSTTY_SURFACE_CONTEXT_TAB,
             configTemplate: configTemplate,
             workingDirectory: hasWorkingDirectory ? trimmedWorkingDirectory : nil,
-            portOrdinal: portOrdinal
+            portOrdinal: portOrdinal,
+            environment: environment
         )
         panels[terminalPanel.id] = terminalPanel
         panelTitles[terminalPanel.id] = terminalPanel.displayTitle
@@ -1933,6 +1935,62 @@ final class Workspace: Identifiable, ObservableObject {
         }
         if let targetPaneId {
             applyTabSelection(tabId: tabId, inPane: targetPaneId)
+        }
+    }
+
+    /// Collect pane IDs in visual reading order (left→right, top→bottom).
+    /// Sorts by Y position first (row), then X position (column) — like Warp's
+    /// sequential navigation: move right across a row, then wrap to the next row.
+    private func orderedPaneIds() -> [PaneID] {
+        var panes: [(id: String, x: Double, y: Double)] = []
+        func walk(_ node: ExternalTreeNode) {
+            switch node {
+            case .pane(let p):
+                panes.append((id: p.id, x: p.frame.x, y: p.frame.y))
+            case .split(let s):
+                walk(s.first)
+                walk(s.second)
+            }
+        }
+        walk(bonsplitController.treeSnapshot())
+        let allPanes = bonsplitController.allPaneIds
+        // Sort by row (Y) then column (X) for reading-order traversal
+        panes.sort { a, b in
+            if abs(a.y - b.y) > 1 { return a.y < b.y }
+            return a.x < b.x
+        }
+        return panes.compactMap { p in
+            allPanes.first(where: { $0.id.uuidString == p.id })
+        }
+    }
+
+    /// Focus the next pane in sequential (tree) order, wrapping around.
+    func focusNextPane() {
+        let ordered = orderedPaneIds()
+        guard ordered.count > 1, let current = bonsplitController.focusedPaneId else { return }
+        guard let idx = ordered.firstIndex(of: current) else { return }
+        let next = ordered[(idx + 1) % ordered.count]
+        if let prevPanelId = focusedPanelId, let prev = panels[prevPanelId] {
+            prev.unfocus()
+        }
+        bonsplitController.focusPane(next)
+        if let tabId = bonsplitController.selectedTab(inPane: next)?.id {
+            applyTabSelection(tabId: tabId, inPane: next)
+        }
+    }
+
+    /// Focus the previous pane in sequential (tree) order, wrapping around.
+    func focusPrevPane() {
+        let ordered = orderedPaneIds()
+        guard ordered.count > 1, let current = bonsplitController.focusedPaneId else { return }
+        guard let idx = ordered.firstIndex(of: current) else { return }
+        let prev = ordered[(idx - 1 + ordered.count) % ordered.count]
+        if let prevPanelId = focusedPanelId, let panel = panels[prevPanelId] {
+            panel.unfocus()
+        }
+        bonsplitController.focusPane(prev)
+        if let tabId = bonsplitController.selectedTab(inPane: prev)?.id {
+            applyTabSelection(tabId: tabId, inPane: prev)
         }
     }
 
