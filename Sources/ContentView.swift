@@ -1911,6 +1911,24 @@ struct ContentView: View {
                 .help("Manage Worktrees")
             }
 
+            // Zoom indicator
+            if tabManager.selectedWorkspace?.isPaneZoomed == true {
+                titlebarInfoSeparator
+                Button(action: {
+                    tabManager.toggleFocusedPaneZoom()
+                }) {
+                    HStack(spacing: 3) {
+                        Image(systemName: "arrow.down.right.and.arrow.up.left")
+                            .font(.system(size: 9, weight: .semibold))
+                        Text("ZOOM")
+                            .font(.system(size: 10, weight: .bold, design: .monospaced))
+                    }
+                    .foregroundColor(.orange.opacity(0.9))
+                }
+                .buttonStyle(.plain)
+                .help("Exit zoom (⇧⌘↩)")
+            }
+
             // Theme toggle (sun/moon)
             titlebarInfoSeparator
             Button(action: {
@@ -2280,9 +2298,7 @@ struct ContentView: View {
                                 .padding(.top, 4)
                         }
                     }
-                if showStatusBar {
-                    StatusBarView()
-                }
+                // Status bar removed — pane count display was not useful.
             }
             .frame(minWidth: 800, minHeight: 600)
                 .background(Color.clear)

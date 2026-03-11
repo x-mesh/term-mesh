@@ -336,6 +336,17 @@ final class Workspace: Identifiable, ObservableObject {
     /// Callback used by TabManager to capture recently closed browser panels for Cmd+Shift+T restore.
     var onClosedBrowserPanel: ((ClosedBrowserPanelRestoreSnapshot) -> Void)?
 
+    // MARK: - Pane Zoom
+
+    /// Whether any pane is currently zoomed (delegates to bonsplit's native zoom).
+    var isPaneZoomed: Bool { bonsplitController.isSplitZoomed }
+
+    /// Toggle zoom on the focused pane. If already zoomed, restores original layout.
+    func togglePaneZoom() {
+        bonsplitController.togglePaneZoom()
+        objectWillChange.send()
+    }
+
 
     // Closing tabs mutates split layout immediately; terminal views handle their own AppKit
     // layout/size synchronization.

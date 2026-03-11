@@ -2527,10 +2527,18 @@ class TabManager: ObservableObject {
         return false
     }
 
-    /// Toggle zoom on a panel - bonsplit doesn't have zoom support
+    /// Toggle zoom on the focused pane — expands it to fill the workspace.
     func toggleSplitZoom(tabId: UUID, surfaceId: UUID) -> Bool {
-        // Bonsplit doesn't have zoom support
-        return false
+        guard let tab = tabs.first(where: { $0.id == tabId }) else { return false }
+        tab.togglePaneZoom()
+        return true
+    }
+
+    /// Toggle zoom on the focused pane of the current workspace.
+    func toggleFocusedPaneZoom() {
+        guard let selectedTabId,
+              let tab = tabs.first(where: { $0.id == selectedTabId }) else { return }
+        tab.togglePaneZoom()
     }
 
     /// Close a surface/panel

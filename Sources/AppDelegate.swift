@@ -2927,6 +2927,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
             return true
         }
 
+        // Zoom pane: Cmd+Shift+Enter
+        if matchShortcut(event: event, shortcut: KeyboardShortcutSettings.shortcut(for: .zoomPane)) {
+#if DEBUG
+            dlog("shortcut.action name=zoomPane \(debugShortcutRouteSnapshot(event: event))")
+#endif
+            tabManager?.toggleFocusedPaneZoom()
+            return true
+        }
+
         // Surface navigation (legacy Ctrl+Tab support)
         if matchTabShortcut(event: event, shortcut: StoredShortcut(key: "\t", command: false, shift: false, option: false, control: true)) {
             tabManager?.selectNextSurface()
@@ -3528,6 +3537,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         case "m": return 46  // kVK_ANSI_M
         case ".": return 47  // kVK_ANSI_Period
         case "`": return 50  // kVK_ANSI_Grave
+        case "↩": return 36  // kVK_Return
         default:
             return nil
         }

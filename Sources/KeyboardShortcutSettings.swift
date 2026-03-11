@@ -35,6 +35,9 @@ enum KeyboardShortcutSettings {
         case splitBrowserRight
         case splitBrowserDown
 
+        // Zoom
+        case zoomPane
+
         // Panels
         case openBrowser
         case toggleBrowserDeveloperTools
@@ -69,6 +72,7 @@ enum KeyboardShortcutSettings {
             case .splitDown: return "Split Down"
             case .splitBrowserRight: return "Split Browser Right"
             case .splitBrowserDown: return "Split Browser Down"
+            case .zoomPane: return "Zoom Pane"
             case .openBrowser: return "Open Browser"
             case .toggleBrowserDeveloperTools: return "Toggle Browser Developer Tools"
             case .showBrowserJavaScriptConsole: return "Show Browser JavaScript Console"
@@ -102,6 +106,7 @@ enum KeyboardShortcutSettings {
             case .nextSurface: return "shortcut.nextSurface"
             case .prevSurface: return "shortcut.prevSurface"
             case .newSurface: return "shortcut.newSurface"
+            case .zoomPane: return "shortcut.zoomPane"
             case .openBrowser: return "shortcut.openBrowser"
             case .toggleBrowserDeveloperTools: return "shortcut.toggleBrowserDeveloperTools"
             case .showBrowserJavaScriptConsole: return "shortcut.showBrowserJavaScriptConsole"
@@ -160,6 +165,8 @@ enum KeyboardShortcutSettings {
                 return StoredShortcut(key: "[", command: true, shift: true, option: false, control: false)
             case .newSurface:
                 return StoredShortcut(key: "t", command: true, shift: false, option: false, control: false)
+            case .zoomPane:
+                return StoredShortcut(key: "↩", command: true, shift: true, option: false, control: false)
             case .openBrowser:
                 return StoredShortcut(key: "l", command: true, shift: true, option: false, control: false)
             case .toggleBrowserDeveloperTools:
@@ -263,6 +270,8 @@ struct StoredShortcut: Codable, Equatable {
         switch key {
         case "\t":
             keyText = "TAB"
+        case "↩":
+            keyText = "↩"
         default:
             keyText = key.uppercased()
         }
@@ -289,6 +298,8 @@ struct StoredShortcut: Codable, Equatable {
             return .upArrow
         case "↓":
             return .downArrow
+        case "↩":
+            return .return
         case "\t":
             return .tab
         default:
@@ -329,6 +340,8 @@ struct StoredShortcut: Codable, Equatable {
         case "↓":
             guard let scalar = UnicodeScalar(NSDownArrowFunctionKey) else { return nil }
             return String(Character(scalar))
+        case "↩":
+            return "\r"
         case "\t":
             return "\t"
         default:
@@ -367,6 +380,7 @@ struct StoredShortcut: Codable, Equatable {
         case 124: return "→" // right arrow
         case 125: return "↓" // down arrow
         case 126: return "↑" // up arrow
+        case 36: return "↩"  // kVK_Return (Enter)
         case 48: return "\t" // tab
         case 33: return "["  // kVK_ANSI_LeftBracket
         case 30: return "]"  // kVK_ANSI_RightBracket
