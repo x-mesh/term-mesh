@@ -8,8 +8,10 @@ import os
 
 @MainActor
 class TabManager: ObservableObject {
-    /// Injected daemon service (defaults to singleton for backward compatibility).
-    var daemon: any DaemonService = TermMeshDaemon.shared
+    /// Injected daemon service.
+    let daemon: any DaemonService
+    /// Injected notification service.
+    let notifications: any NotificationService
 
     @Published var tabs: [Workspace] = []
     @Published private(set) var isWorkspaceCycleHot: Bool = false
@@ -99,7 +101,13 @@ class TabManager: ObservableObject {
     var uiTestCancellables = Set<AnyCancellable>()
 #endif
 
-    init(initialWorkingDirectory: String? = nil) {
+    init(
+        initialWorkingDirectory: String? = nil,
+        daemon: (any DaemonService)? = nil,
+        notifications: (any NotificationService)? = nil
+    ) {
+        self.daemon = daemon ?? TermMeshDaemon.shared
+        self.notifications = notifications ?? TerminalNotificationStore.shared
         // Session restore: if enabled and no explicit directory was passed, restore previous workspaces
         if initialWorkingDirectory == nil,
            SessionRestoreSettings.mode() == .always,
@@ -618,7 +626,7 @@ class TabManager: ObservableObject {
             }
         }
 
-        AppDelegate.shared?.notificationStore?.clearNotifications(forTabId: workspace.id)
+        notifications.clearNotifications(forTabId: workspace.id)
         unwireClosedBrowserTracking(for: workspace)
         directoryObservers.removeValue(forKey: workspace.id)
 
@@ -778,7 +786,7 @@ class TabManager: ObservableObject {
                 ) else { return }
             }
 
-            AppDelegate.shared?.notificationStore?.clearNotifications(forTabId: tab.id)
+            notifications.clearNotifications(forTabId: tab.id)
             if willCloseWindow {
                 AppDelegate.shared?.closeMainWindowContainingTabId(tab.id)
             } else {
@@ -821,7 +829,7 @@ class TabManager: ObservableObject {
         }
 
         _ = tab.closePanel(surfaceId, force: true)
-        AppDelegate.shared?.notificationStore?.clearNotifications(forTabId: tab.id, surfaceId: surfaceId)
+        notifications.clearNotifications(forTabId: tab.id, surfaceId: surfaceId)
     }
 
     /// Runtime close requests from Ghostty without confirmation (e.g. child-exit).
@@ -848,7 +856,7 @@ class TabManager: ObservableObject {
             "surface=\(surfaceId.uuidString.prefix(5)) closed=\(closed ? 1 : 0) panelsAfter=\(tab.panels.count)"
         )
 #endif
-        AppDelegate.shared?.notificationStore?.clearNotifications(forTabId: tab.id, surfaceId: surfaceId)
+        notifications.clearNotifications(forTabId: tab.id, surfaceId: surfaceId)
     }
 
     /// Close a panel because its child process exited (e.g. the user hit Ctrl+D).
@@ -871,7 +879,7 @@ class TabManager: ObservableObject {
         if tab.panels.count <= 1 {
             if tabs.count <= 1 {
                 if let app = AppDelegate.shared {
-                    app.notificationStore?.clearNotifications(forTabId: tabId)
+                    notifications.clearNotifications(forTabId: tabId)
                     app.closeMainWindowContainingTabId(tabId)
                 } else {
                     // Headless/test fallback when no AppDelegate window context exists.
@@ -1089,12 +1097,11 @@ class TabManager: ObservableObject {
         guard selectedTabId == tabId else { return }
         guard !suppressFocusFlash else { return }
         guard AppFocusState.isAppActive() else { return }
-        guard let notificationStore = AppDelegate.shared?.notificationStore else { return }
-        guard notificationStore.hasUnreadNotification(forTabId: tabId, surfaceId: panelId) else { return }
+        guard notifications.hasUnreadNotification(forTabId: tabId, surfaceId: panelId) else { return }
         if let tab = tabs.first(where: { $0.id == tabId }) {
             tab.triggerNotificationFocusFlash(panelId: panelId, requiresSplit: false, shouldFocus: false)
         }
-        notificationStore.markRead(forTabId: tabId, surfaceId: panelId)
+        notifications.markRead(forTabId: tabId, surfaceId: panelId)
     }
 
     private func enqueuePanelTitleUpdate(tabId: UUID, panelId: UUID, title: String) {
@@ -1212,10 +1219,9 @@ class TabManager: ObservableObject {
             let targetPanelId = desiredPanelId ?? tab.focusedPanelId
             guard let targetPanelId,
                   tab.panels[targetPanelId] != nil else { return }
-            guard let notificationStore = AppDelegate.shared?.notificationStore else { return }
-            guard notificationStore.hasUnreadNotification(forTabId: tabId, surfaceId: targetPanelId) else { return }
+            guard self.notifications.hasUnreadNotification(forTabId: tabId, surfaceId: targetPanelId) else { return }
             tab.triggerNotificationFocusFlash(panelId: targetPanelId, requiresSplit: false, shouldFocus: true)
-            notificationStore.markRead(forTabId: tabId, surfaceId: targetPanelId)
+            self.notifications.markRead(forTabId: tabId, surfaceId: targetPanelId)
         }
     }
 
@@ -1953,7 +1959,7 @@ class TabManager: ObservableObject {
         guard tab.panels[surfaceId] != nil,
               tab.surfaceIdFromPanelId(surfaceId) != nil else { return false }
         tab.closePanel(surfaceId)
-        AppDelegate.shared?.notificationStore?.clearNotifications(forTabId: tabId, surfaceId: surfaceId)
+        notifications.clearNotifications(forTabId: tabId, surfaceId: surfaceId)
         return true
     }
 

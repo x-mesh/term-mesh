@@ -1,7 +1,7 @@
 # term-mesh Refactoring Status
 
 > Last updated: 2026-03-11
-> Branch: `develop` (4 commits ahead of `main`)
+> Branch: `develop` (5 commits ahead of `main`)
 
 ---
 
@@ -134,26 +134,43 @@
 
 ---
 
-## Phase 6: 미래 로드맵
+## Phase 6: TabManager 생성자 주입 (완료 ✅)
+
+### 6-A. TabManager 생성자 주입 (P1 완료 ✅)
+
+`TabManager`의 `daemon`과 `notifications`를 프로퍼티 기본값에서 생성자 주입 방식으로 전환.
+
+| 작업 | 상태 | 참조 감소 |
+|---|---|---|
+| `daemon` 프로퍼티를 `var` → `let` (생성자 주입) 전환 | ✅ 완료 | — |
+| `notifications` 프로퍼티 추가 (생성자 주입) | ✅ 완료 | — |
+| `init(daemon:notifications:)` 파라미터 추가 | ✅ 완료 | — |
+| `AppDelegate.shared?.notificationStore` → `self.notifications` (8 refs) | ✅ 완료 | −8 refs |
+| `TermMeshApp` init에서 명시적 서비스 전달 | ✅ 완료 | — |
+
+**남은 `AppDelegate.shared` 참조:** `closeMainWindowContainingTabId` (윈도우 관리, 서비스 아님)
+
+---
+
+## Phase 7: 미래 로드맵
 
 | 우선순위 | 작업 | 사이즈 | 설명 |
 |---|---|---|---|
-| P1 | `TabManager` 생성자 주입 | M | daemon + notifications + config를 init 시 주입 |
-| P2 | `AppDelegate` 클로저 주입 | M | lifecycle 이벤트에서 싱글톤 대신 클로저 사용 |
-| P3 | 단위 테스트 인프라 | L | 프로토콜 mock 생성, XCTest 타겟 구성 |
+| P1 | `AppDelegate` 클로저 주입 | M | lifecycle 이벤트에서 싱글톤 대신 클로저 사용 |
+| P2 | 단위 테스트 인프라 | L | 프로토콜 mock 생성, XCTest 타겟 구성 |
 
 ---
 
 ## 싱글톤 참조 추이
 
 ```
-               시작    Phase3   Phase4   Phase5    잔여 분류
-GhosttyApp       53      37       17       17*     6 자기참조 + 2 theme + 3 C API + 4 기본값 + 1 static + 1 주입점
-TermMeshDaemon   54      54        8        8*     7 기본값 + 1 주입점
-Notification     18      18        6        6*     4 기본값 + 2 fallback
-BrowserHistory   15      15       15        6*     4 기본값 + 2 Combine $entries
-──────────────────────────────────────────────────────
-합계            140+    124+      46+      37*
+               시작    Phase3   Phase4   Phase5   Phase6    잔여 분류
+GhosttyApp       53      37       17       17       17*     6 자기참조 + 2 theme + 3 C API + 4 기본값 + 1 static + 1 주입점
+TermMeshDaemon   54      54        8        8        7*     6 기본값 + 1 주입점 (TabManager → 생성자 주입)
+Notification     18      18        6        6        5*     3 기본값 + 1 fallback + 1 주입점 (TabManager −1 기본값 → 생성자 주입)
+BrowserHistory   15      15       15        6        6*     4 기본값 + 2 Combine $entries
+───────────────────────────────────────────────────────────
+합계            140+    124+      46+      37       35*
 
 * 남은 참조는 모두 프로퍼티 기본값/루트 주입점/자기참조/C API/Combine publisher
   (실질적 커플링 제거 완료)
@@ -162,6 +179,7 @@ BrowserHistory   15      15       15        6*     4 기본값 + 2 Combine $entr
 ## 커밋 이력
 
 ```
+XXXXXXX refactor: Convert TabManager to constructor injection for daemon and notifications services
 XXXXXXX refactor: Add ServiceContainer and replace BrowserHistoryStore.shared with protocol-based injection
 XXXXXXX refactor: Replace GhosttyApp.shared with ConfigProvider-based injection (37→17)
 XXXXXXX refactor: Replace TermMeshDaemon.shared and TerminalNotificationStore.shared with protocol-based injection
