@@ -180,21 +180,16 @@ extension TerminalController {
         let icon = parsed.options["icon"]
         let color = parsed.options["color"]
 
-        var result = "OK"
-        DispatchQueue.main.sync {
-            guard let tab = resolveTabForReport(args) else {
-                result = parsed.options["tab"] != nil ? "ERROR: Tab not found" : "ERROR: No tab selected"
-                return
-            }
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            guard let tab = resolveTabForReport(args) else { return }
             guard Self.shouldReplaceStatusEntry(
                 current: tab.statusEntries[key],
                 key: key,
                 value: value,
                 icon: icon,
                 color: color
-            ) else {
-                return
-            }
+            ) else { return }
             tab.statusEntries[key] = SidebarStatusEntry(
                 key: key,
                 value: value,
@@ -203,7 +198,7 @@ extension TerminalController {
                 timestamp: Date()
             )
         }
-        return result
+        return "OK"
     }
 
     func clearStatus(_ args: String) -> String {
@@ -212,17 +207,12 @@ extension TerminalController {
             return "ERROR: Missing status key — usage: clear_status <key> [--tab=X]"
         }
 
-        var result = "OK"
-        DispatchQueue.main.sync {
-            guard let tab = resolveTabForReport(args) else {
-                result = parsed.options["tab"] != nil ? "ERROR: Tab not found" : "ERROR: No tab selected"
-                return
-            }
-            if tab.statusEntries.removeValue(forKey: key) == nil {
-                result = "OK (key not found)"
-            }
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            guard let tab = resolveTabForReport(args) else { return }
+            tab.statusEntries.removeValue(forKey: key)
         }
-        return result
+        return "OK"
     }
 
     func listStatus(_ args: String) -> String {
@@ -259,12 +249,9 @@ extension TerminalController {
         }
         let source = parsed.options["source"]
 
-        var result = "OK"
-        DispatchQueue.main.sync {
-            guard let tab = resolveTabForReport(args) else {
-                result = parsed.options["tab"] != nil ? "ERROR: Tab not found" : "ERROR: No tab selected"
-                return
-            }
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            guard let tab = resolveTabForReport(args) else { return }
             tab.logEntries.append(SidebarLogEntry(message: message, level: level, source: source, timestamp: Date()))
             let configuredLimit = UserDefaults.standard.object(forKey: "sidebarMaxLogEntries") as? Int ?? 50
             let limit = max(1, min(500, configuredLimit))
@@ -272,19 +259,16 @@ extension TerminalController {
                 tab.logEntries.removeFirst(tab.logEntries.count - limit)
             }
         }
-        return result
+        return "OK"
     }
 
     func clearLog(_ args: String) -> String {
-        var result = "OK"
-        DispatchQueue.main.sync {
-            guard let tab = resolveTabForReport(args) else {
-                result = "ERROR: Tab not found"
-                return
-            }
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            guard let tab = resolveTabForReport(args) else { return }
             tab.logEntries.removeAll()
         }
-        return result
+        return "OK"
     }
 
     func listLog(_ args: String) -> String {
@@ -338,32 +322,24 @@ extension TerminalController {
         let clamped = min(1.0, max(0.0, value))
         let label = parsed.options["label"]
 
-        var result = "OK"
-        DispatchQueue.main.sync {
-            guard let tab = resolveTabForReport(args) else {
-                result = parsed.options["tab"] != nil ? "ERROR: Tab not found" : "ERROR: No tab selected"
-                return
-            }
-            guard Self.shouldReplaceProgress(current: tab.progress, value: clamped, label: label) else {
-                return
-            }
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            guard let tab = resolveTabForReport(args) else { return }
+            guard Self.shouldReplaceProgress(current: tab.progress, value: clamped, label: label) else { return }
             tab.progress = SidebarProgressState(value: clamped, label: label)
         }
-        return result
+        return "OK"
     }
 
     func clearProgress(_ args: String) -> String {
-        var result = "OK"
-        DispatchQueue.main.sync {
-            guard let tab = resolveTabForReport(args) else {
-                result = "ERROR: Tab not found"
-                return
-            }
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            guard let tab = resolveTabForReport(args) else { return }
             if tab.progress != nil {
                 tab.progress = nil
             }
         }
-        return result
+        return "OK"
     }
 
     func reportGitBranch(_ args: String) -> String {
@@ -373,85 +349,77 @@ extension TerminalController {
         }
         let isDirty = parsed.options["status"]?.lowercased() == "dirty"
         let dirtyFileCount = parsed.options["files"].flatMap { Int($0) }
+        let panelArgRaw = parsed.options["panel"] ?? parsed.options["surface"]
 
-        var result = "OK"
-        DispatchQueue.main.sync {
-            guard let tab = resolveTabForReport(args) else {
-                result = parsed.options["tab"] != nil ? "ERROR: Tab not found" : "ERROR: No tab selected"
-                return
+        // Validate panel UUID format off-main
+        let panelId: UUID?
+        if let raw = panelArgRaw {
+            if raw.isEmpty {
+                return "ERROR: Missing panel id — usage: report_git_branch <branch> [--status=dirty] [--files=N] [--tab=X] [--panel=Y]"
             }
+            guard let uuid = UUID(uuidString: raw) else {
+                return "ERROR: Invalid panel id '\(raw)'"
+            }
+            panelId = uuid
+        } else {
+            panelId = nil
+        }
+
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            guard let tab = resolveTabForReport(args) else { return }
             let validSurfaceIds = Set(tab.panels.keys)
             tab.pruneSurfaceMetadata(validSurfaceIds: validSurfaceIds)
 
-            let panelArg = parsed.options["panel"] ?? parsed.options["surface"]
             let surfaceId: UUID
-            if let panelArg {
-                if panelArg.isEmpty {
-                    result = "ERROR: Missing panel id — usage: report_git_branch <branch> [--status=dirty] [--files=N] [--tab=X] [--panel=Y]"
-                    return
-                }
-                guard let parsedId = UUID(uuidString: panelArg) else {
-                    result = "ERROR: Invalid panel id '\(panelArg)'"
-                    return
-                }
-                surfaceId = parsedId
+            if let panelId {
+                guard validSurfaceIds.contains(panelId) else { return }
+                surfaceId = panelId
             } else {
-                guard let focused = tab.focusedPanelId else {
-                    result = "ERROR: Missing panel id (no focused surface)"
-                    return
-                }
+                guard let focused = tab.focusedPanelId else { return }
                 surfaceId = focused
-            }
-
-            guard validSurfaceIds.contains(surfaceId) else {
-                result = "ERROR: Panel not found '\(surfaceId.uuidString)'"
-                return
             }
 
             tab.updatePanelGitBranch(panelId: surfaceId, branch: branch, isDirty: isDirty, dirtyFileCount: dirtyFileCount)
         }
-        return result
+        return "OK"
     }
 
     func clearGitBranch(_ args: String) -> String {
         let parsed = parseOptions(args)
-        var result = "OK"
-        DispatchQueue.main.sync {
-            guard let tab = resolveTabForReport(args) else {
-                result = parsed.options["tab"] != nil ? "ERROR: Tab not found" : "ERROR: No tab selected"
-                return
+        let panelArgRaw = parsed.options["panel"] ?? parsed.options["surface"]
+
+        let panelId: UUID?
+        if let raw = panelArgRaw {
+            if raw.isEmpty {
+                return "ERROR: Missing panel id — usage: clear_git_branch [--tab=X] [--panel=Y]"
             }
+            guard let uuid = UUID(uuidString: raw) else {
+                return "ERROR: Invalid panel id '\(raw)'"
+            }
+            panelId = uuid
+        } else {
+            panelId = nil
+        }
+
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            guard let tab = resolveTabForReport(args) else { return }
             let validSurfaceIds = Set(tab.panels.keys)
             tab.pruneSurfaceMetadata(validSurfaceIds: validSurfaceIds)
 
-            let panelArg = parsed.options["panel"] ?? parsed.options["surface"]
             let surfaceId: UUID
-            if let panelArg {
-                if panelArg.isEmpty {
-                    result = "ERROR: Missing panel id — usage: clear_git_branch [--tab=X] [--panel=Y]"
-                    return
-                }
-                guard let parsedId = UUID(uuidString: panelArg) else {
-                    result = "ERROR: Invalid panel id '\(panelArg)'"
-                    return
-                }
-                surfaceId = parsedId
+            if let panelId {
+                guard validSurfaceIds.contains(panelId) else { return }
+                surfaceId = panelId
             } else {
-                guard let focused = tab.focusedPanelId else {
-                    result = "ERROR: Missing panel id (no focused surface)"
-                    return
-                }
+                guard let focused = tab.focusedPanelId else { return }
                 surfaceId = focused
-            }
-
-            guard validSurfaceIds.contains(surfaceId) else {
-                result = "ERROR: Panel not found '\(surfaceId.uuidString)'"
-                return
             }
 
             tab.clearPanelGitBranch(panelId: surfaceId)
         }
-        return result
+        return "OK"
     }
 
     func reportPorts(_ args: String) -> String {
@@ -467,50 +435,41 @@ extension TerminalController {
             ports.append(port)
         }
         let normalizedPorts = Array(Set(ports)).sorted()
+        let panelArgRaw = parsed.options["panel"] ?? parsed.options["surface"]
 
-        var result = "OK"
-        DispatchQueue.main.sync {
-            guard let tab = resolveTabForReport(args) else {
-                result = parsed.options["tab"] != nil ? "ERROR: Tab not found" : "ERROR: No tab selected"
-                return
+        let panelId: UUID?
+        if let raw = panelArgRaw {
+            if raw.isEmpty {
+                return "ERROR: Missing panel id — usage: report_ports <port1> [port2...] [--tab=X] [--panel=Y]"
             }
+            guard let uuid = UUID(uuidString: raw) else {
+                return "ERROR: Invalid panel id '\(raw)'"
+            }
+            panelId = uuid
+        } else {
+            panelId = nil
+        }
 
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            guard let tab = resolveTabForReport(args) else { return }
             let validSurfaceIds = Set(tab.panels.keys)
             tab.pruneSurfaceMetadata(validSurfaceIds: validSurfaceIds)
 
-            let panelArg = parsed.options["panel"] ?? parsed.options["surface"]
             let surfaceId: UUID
-            if let panelArg {
-                if panelArg.isEmpty {
-                    result = "ERROR: Missing panel id — usage: report_ports <port1> [port2...] [--tab=X] [--panel=Y]"
-                    return
-                }
-                guard let parsedId = UUID(uuidString: panelArg) else {
-                    result = "ERROR: Invalid panel id '\(panelArg)'"
-                    return
-                }
-                surfaceId = parsedId
+            if let panelId {
+                guard validSurfaceIds.contains(panelId) else { return }
+                surfaceId = panelId
             } else {
-                guard let focused = tab.focusedPanelId else {
-                    result = "ERROR: Missing panel id (no focused surface)"
-                    return
-                }
+                guard let focused = tab.focusedPanelId else { return }
                 surfaceId = focused
             }
 
-            guard validSurfaceIds.contains(surfaceId) else {
-                result = "ERROR: Panel not found '\(surfaceId.uuidString)'"
-                return
-            }
-
-            guard Self.shouldReplacePorts(current: tab.surfaceListeningPorts[surfaceId], next: normalizedPorts) else {
-                return
-            }
-
+            guard Self.shouldReplacePorts(current: tab.surfaceListeningPorts[surfaceId], next: normalizedPorts) else { return }
             tab.surfaceListeningPorts[surfaceId] = normalizedPorts
             tab.recomputeListeningPorts()
         }
-        return result
+        return "OK"
     }
 
     func reportPwd(_ args: String) -> String {
@@ -538,75 +497,68 @@ extension TerminalController {
             return "OK"
         }
 
-        guard let tabManager else { return "ERROR: TabManager not available" }
+        guard tabManager != nil else { return "ERROR: TabManager not available" }
 
-        var result = "OK"
-        DispatchQueue.main.sync {
-            guard let tab = resolveTabForReport(args) else {
-                result = parsed.options["tab"] != nil ? "ERROR: Tab not found" : "ERROR: No tab selected"
-                return
+        let panelArgRaw = parsed.options["panel"] ?? parsed.options["surface"]
+        let panelId: UUID?
+        if let raw = panelArgRaw {
+            if raw.isEmpty {
+                return "ERROR: Missing panel id — usage: report_pwd <path> [--tab=X] [--panel=Y]"
             }
+            guard let uuid = UUID(uuidString: raw) else {
+                return "ERROR: Invalid panel id '\(raw)'"
+            }
+            panelId = uuid
+        } else {
+            panelId = nil
+        }
 
+        DispatchQueue.main.async { [weak self] in
+            guard let self, let tabManager = self.tabManager else { return }
+            guard let tab = resolveTabForReport(args) else { return }
             let validSurfaceIds = Set(tab.panels.keys)
             tab.pruneSurfaceMetadata(validSurfaceIds: validSurfaceIds)
 
-            let panelArg = parsed.options["panel"] ?? parsed.options["surface"]
             let surfaceId: UUID
-            if let panelArg {
-                if panelArg.isEmpty {
-                    result = "ERROR: Missing panel id — usage: report_pwd <path> [--tab=X] [--panel=Y]"
-                    return
-                }
-                guard let parsedId = UUID(uuidString: panelArg) else {
-                    result = "ERROR: Invalid panel id '\(panelArg)'"
-                    return
-                }
-                surfaceId = parsedId
+            if let panelId {
+                guard validSurfaceIds.contains(panelId) else { return }
+                surfaceId = panelId
             } else {
-                guard let focused = tab.focusedPanelId else {
-                    result = "ERROR: Missing panel id (no focused surface)"
-                    return
-                }
+                guard let focused = tab.focusedPanelId else { return }
                 surfaceId = focused
-            }
-
-            guard validSurfaceIds.contains(surfaceId) else {
-                result = "ERROR: Panel not found '\(surfaceId.uuidString)'"
-                return
             }
 
             tabManager.updateSurfaceDirectory(tabId: tab.id, surfaceId: surfaceId, directory: directory)
         }
-        return result
+        return "OK"
     }
 
     func clearPorts(_ args: String) -> String {
         let parsed = parseOptions(args)
-        var result = "OK"
-        DispatchQueue.main.sync {
-            guard let tab = resolveTabForReport(args) else {
-                result = parsed.options["tab"] != nil ? "ERROR: Tab not found" : "ERROR: No tab selected"
-                return
-            }
+        let panelArgRaw = parsed.options["panel"] ?? parsed.options["surface"]
 
+        let panelId: UUID?
+        if let raw = panelArgRaw {
+            if raw.isEmpty {
+                return "ERROR: Missing panel id — usage: clear_ports [--tab=X] [--panel=Y]"
+            }
+            guard let uuid = UUID(uuidString: raw) else {
+                return "ERROR: Invalid panel id '\(raw)'"
+            }
+            panelId = uuid
+        } else {
+            panelId = nil
+        }
+
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            guard let tab = resolveTabForReport(args) else { return }
             let validSurfaceIds = Set(tab.panels.keys)
             tab.pruneSurfaceMetadata(validSurfaceIds: validSurfaceIds)
 
-            let panelArg = parsed.options["panel"] ?? parsed.options["surface"]
-            if let panelArg {
-                if panelArg.isEmpty {
-                    result = "ERROR: Missing panel id — usage: clear_ports [--tab=X] [--panel=Y]"
-                    return
-                }
-                guard let surfaceId = UUID(uuidString: panelArg) else {
-                    result = "ERROR: Invalid panel id '\(panelArg)'"
-                    return
-                }
-                guard validSurfaceIds.contains(surfaceId) else {
-                    result = "ERROR: Panel not found '\(surfaceId.uuidString)'"
-                    return
-                }
-                if tab.surfaceListeningPorts.removeValue(forKey: surfaceId) != nil {
+            if let panelId {
+                guard validSurfaceIds.contains(panelId) else { return }
+                if tab.surfaceListeningPorts.removeValue(forKey: panelId) != nil {
                     tab.recomputeListeningPorts()
                 }
             } else {
@@ -616,7 +568,7 @@ extension TerminalController {
                 }
             }
         }
-        return result
+        return "OK"
     }
 
     func reportTTY(_ args: String) -> String {
@@ -636,44 +588,39 @@ extension TerminalController {
             return "OK"
         }
 
-        var result = "OK"
-        DispatchQueue.main.sync {
-            guard let tab = resolveTabForReport(args) else {
-                result = parsed.options["tab"] != nil ? "ERROR: Tab not found" : "ERROR: No tab selected"
-                return
+        let panelArgRaw = parsed.options["panel"] ?? parsed.options["surface"]
+        let panelId: UUID?
+        if let raw = panelArgRaw {
+            if raw.isEmpty {
+                return "ERROR: Missing panel id — usage: report_tty <tty_name> [--tab=X] [--panel=Y]"
             }
-
-            let panelArg = parsed.options["panel"] ?? parsed.options["surface"]
-            let surfaceId: UUID
-            if let panelArg {
-                if panelArg.isEmpty {
-                    result = "ERROR: Missing panel id — usage: report_tty <tty_name> [--tab=X] [--panel=Y]"
-                    return
-                }
-                guard let parsedId = UUID(uuidString: panelArg) else {
-                    result = "ERROR: Invalid panel id '\(panelArg)'"
-                    return
-                }
-                surfaceId = parsedId
-            } else {
-                guard let focused = tab.focusedPanelId else {
-                    result = "ERROR: Missing panel id (no focused surface)"
-                    return
-                }
-                surfaceId = focused
+            guard let uuid = UUID(uuidString: raw) else {
+                return "ERROR: Invalid panel id '\(raw)'"
             }
+            panelId = uuid
+        } else {
+            panelId = nil
+        }
 
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            guard let tab = resolveTabForReport(args) else { return }
             let validSurfaceIds = Set(tab.panels.keys)
-            guard validSurfaceIds.contains(surfaceId) else {
-                result = "ERROR: Panel not found '\(surfaceId.uuidString)'"
-                return
+
+            let surfaceId: UUID
+            if let panelId {
+                guard validSurfaceIds.contains(panelId) else { return }
+                surfaceId = panelId
+            } else {
+                guard let focused = tab.focusedPanelId else { return }
+                surfaceId = focused
             }
 
             guard tab.surfaceTTYNames[surfaceId] != ttyName else { return }
             tab.surfaceTTYNames[surfaceId] = ttyName
             PortScanner.shared.registerTTY(workspaceId: tab.id, panelId: surfaceId, ttyName: ttyName)
         }
-        return result
+        return "OK"
     }
 
     func portsKick(_ args: String) -> String {
@@ -686,36 +633,33 @@ extension TerminalController {
             return "OK"
         }
 
-        var result = "OK"
-        DispatchQueue.main.sync {
-            guard let tab = resolveTabForReport(args) else {
-                result = parsed.options["tab"] != nil ? "ERROR: Tab not found" : "ERROR: No tab selected"
-                return
+        let panelArgRaw = parsed.options["panel"] ?? parsed.options["surface"]
+        let panelId: UUID?
+        if let raw = panelArgRaw {
+            if raw.isEmpty {
+                return "ERROR: Missing panel id — usage: ports_kick [--tab=X] [--panel=Y]"
             }
+            guard let uuid = UUID(uuidString: raw) else {
+                return "ERROR: Invalid panel id '\(raw)'"
+            }
+            panelId = uuid
+        } else {
+            panelId = nil
+        }
 
-            let panelArg = parsed.options["panel"] ?? parsed.options["surface"]
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            guard let tab = resolveTabForReport(args) else { return }
             let surfaceId: UUID
-            if let panelArg {
-                if panelArg.isEmpty {
-                    result = "ERROR: Missing panel id — usage: ports_kick [--tab=X] [--panel=Y]"
-                    return
-                }
-                guard let parsedId = UUID(uuidString: panelArg) else {
-                    result = "ERROR: Invalid panel id '\(panelArg)'"
-                    return
-                }
-                surfaceId = parsedId
+            if let panelId {
+                surfaceId = panelId
             } else {
-                guard let focused = tab.focusedPanelId else {
-                    result = "ERROR: Missing panel id (no focused surface)"
-                    return
-                }
+                guard let focused = tab.focusedPanelId else { return }
                 surfaceId = focused
             }
-
             PortScanner.shared.kick(workspaceId: tab.id, panelId: surfaceId)
         }
-        return result
+        return "OK"
     }
 
     func sidebarState(_ args: String) -> String {
