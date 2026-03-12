@@ -19,6 +19,10 @@ use tower_http::cors::CorsLayer;
 /// even when the filesystem path cannot be resolved (e.g. deployed app bundle).
 const EMBEDDED_DASHBOARD_HTML: &str = include_str!("../../../Resources/dashboard/index.html");
 
+/// App icon embedded at compile time so `/api/brand-icon` always works
+/// regardless of where the binary is installed.
+const EMBEDDED_BRAND_ICON: &[u8] = include_bytes!("../../../Assets.xcassets/AppIcon.appiconset/128.png");
+
 use crate::agent::AgentSessionManager;
 use crate::monitor::{MonitorHandle, SystemSnapshot};
 use crate::socket::{SessionStore, TeamStateStore};
@@ -35,7 +39,6 @@ pub struct HttpState {
     pub usage_tracker: UsageTracker,
     pub agent_manager: Arc<AgentSessionManager>,
     pub dashboard_dir: Option<PathBuf>,
-    pub brand_icon_path: Option<PathBuf>,
     pub auth_password: Option<String>,
 }
 
@@ -52,7 +55,6 @@ pub async fn serve(
     mut shutdown_rx: watch::Receiver<bool>,
 ) -> anyhow::Result<()> {
     let dashboard_dir = find_dashboard_dir();
-    let brand_icon_path = find_brand_icon_path();
 
     if auth_password.is_some() {
         tracing::info!("HTTP dashboard authentication enabled");
@@ -67,7 +69,6 @@ pub async fn serve(
         usage_tracker,
         agent_manager,
         dashboard_dir,
-        brand_icon_path,
         auth_password,
     });
 
@@ -260,14 +261,8 @@ async fn version_handler() -> impl IntoResponse {
     }))
 }
 
-async fn brand_icon_handler(State(state): State<Arc<HttpState>>) -> impl IntoResponse {
-    let Some(path) = &state.brand_icon_path else {
-        return StatusCode::NOT_FOUND.into_response();
-    };
-    match tokio::fs::read(path).await {
-        Ok(bytes) => ([(header::CONTENT_TYPE, "image/png")], bytes).into_response(),
-        Err(_) => StatusCode::NOT_FOUND.into_response(),
-    }
+async fn brand_icon_handler() -> impl IntoResponse {
+    ([(header::CONTENT_TYPE, "image/png")], EMBEDDED_BRAND_ICON).into_response()
 }
 
 /// GET /api/sessions — list terminal sessions from the Swift app
@@ -1029,25 +1024,6 @@ fn find_dashboard_dir() -> Option<PathBuf> {
     None
 }
 
-fn find_brand_icon_path() -> Option<PathBuf> {
-    if let Ok(project_dir) = std::env::var("CMUX_PROJECT_DIR") {
-        let path = PathBuf::from(project_dir).join("Assets.xcassets/AppIcon.appiconset/128.png");
-        if path.exists() { return Some(path); }
-    }
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(parent) = exe.parent() {
-            let path = parent.join("AppIcon.png");
-            if path.exists() { return Some(path); }
-            // Deployed app bundle: binary at Contents/Resources/bin/,
-            // icon at Contents/Resources/AppIcon.png
-            if let Some(grandparent) = parent.parent() {
-                let path = grandparent.join("AppIcon.png");
-                if path.exists() { return Some(path); }
-            }
-        }
-    }
-    None
-}
 
 const HTTP_POLL_SCRIPT: &str = r#"<script>
 // ── HTTP Fetch Polling + Session Picker (injected by term-meshd) ──
