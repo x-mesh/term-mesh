@@ -2200,13 +2200,18 @@ func pushTargetSurfaceSize(_ size: CGSize) {
         dlog("terminal.mouseDown surface=\(terminalSurface?.id.uuidString.prefix(5) ?? "nil")")
         #endif
         if let imeTextView = enclosingSurfaceScrollView?.findIMETextView() {
-            // IME input bar is active — don't steal focus from it, but ensure
-            // the window is activated so the user can type after switching apps.
-            if let w = window, !w.isKeyWindow {
-                NSApp.activate(ignoringOtherApps: true)
-                w.makeKeyAndOrderFront(nil)
+            // IME input bar is active — keep focus on IMETextView, but ensure
+            // the window is activated and this pane is recognized as focused.
+            if let w = window {
+                if !w.isKeyWindow {
+                    NSApp.activate(ignoringOtherApps: true)
+                    w.makeKeyAndOrderFront(nil)
+                }
                 w.makeFirstResponder(imeTextView)
             }
+            // Trigger pane focus so bonsplit/tab highlights update even though
+            // surfaceView isn't becoming first responder.
+            onFocus?()
         } else {
             window?.makeFirstResponder(self)
         }

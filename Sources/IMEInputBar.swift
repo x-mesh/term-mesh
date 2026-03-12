@@ -573,6 +573,10 @@ final class IMETextView: NSTextView {
     var sendKeyHandler: ((_ keycode: UInt16, _ mods: UInt32) -> Void)?
     /// Submit current text and close the IME box in one action (Cmd+Enter).
     var submitAndCloseHandler: (() -> Void)?
+    /// Tracks the last ESC keypress time for double-ESC detection.
+    private var lastEscapeTime: TimeInterval = 0
+    /// Double-ESC threshold in seconds.
+    private let doubleEscapeThreshold: TimeInterval = 0.4
 
     // MARK: - Focus activation
 
@@ -661,9 +665,18 @@ final class IMETextView: NSTextView {
             cancelHandler?()
             return
         }
-        // Escape → forward to terminal (e.g. cancel current Claude Code operation)
+        // Escape handling: double-ESC → Ctrl+C to terminal, single ESC → forward ESC to terminal
         if event.keyCode == 53 {
-            sendKeyHandler?(event.keyCode, 0)
+            let now = CACurrentMediaTime()
+            if (now - lastEscapeTime) < doubleEscapeThreshold {
+                // Double-ESC: send Ctrl+C (keycode 8 = 'c', with ctrl mod) to cancel running command
+                sendKeyHandler?(8, UInt32(GHOSTTY_MODS_CTRL.rawValue))
+                lastEscapeTime = 0  // reset to avoid triple-trigger
+            } else {
+                // Single ESC: forward to terminal
+                sendKeyHandler?(event.keyCode, 0)
+                lastEscapeTime = now
+            }
             return
         }
         // ArrowUp → history (when cursor is on first line and not composing IME)
