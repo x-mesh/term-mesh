@@ -401,7 +401,8 @@ final class TeamOrchestrator {
             // Wrap so the terminal stays open (drops to shell) if the CLI exits.
             let shellCommand = "\(agentCommand); exec $SHELL"
             // Select the right environment: non-claude agents don't need CLAUDECODE
-            let paneEnv = agentCli == "claude" ? claudeAgentEnv : kiroAgentEnv
+            let paneEnv = (agentCli == "claude" ? claudeAgentEnv : kiroAgentEnv)
+                .merging(["TERMMESH_AGENT_NAME": agent.name]) { _, new in new }
 
             // Balanced binary tree with alternating H/V orientations for grid layout.
             // Agent i splits from agent floor((i-1)/2). Left children alternate
