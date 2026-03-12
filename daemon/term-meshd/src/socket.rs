@@ -246,6 +246,10 @@ async fn dispatch(req: &Request, ctx: &Context) -> Response {
             .map(|_| serde_json::json!("ok")),
         "worktree.list" => worktree::list(req.params.clone())
             .map(|v| serde_json::to_value(v).unwrap()),
+        "worktree.status" => worktree::status(req.params.clone())
+            .map(|v| serde_json::to_value(v).unwrap()),
+        "worktree.safe_remove" => worktree::safe_remove(req.params.clone())
+            .map(|_| serde_json::json!("ok")),
 
         // --- Resource Monitor (F-03/F-04) ---
         "monitor.snapshot" => {

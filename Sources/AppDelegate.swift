@@ -360,20 +360,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
     func applicationWillTerminate(_ notification: Notification) {
         tabManager?.saveSessionState()
         TerminalController.shared.stop()
-        // Auto-cleanup stale worktrees on quit
-        if daemon.worktreeAutoCleanup {
-            if let tabManager = tabManager {
-                for tab in tabManager.tabs {
-                    let dir = tab.currentDirectory
-                    if let repoPath = daemon.findGitRoot(from: dir), !repoPath.isEmpty {
-                        let removed = daemon.cleanupStaleWorktrees(repoPath: repoPath)
-                        if removed > 0 {
-                            NSLog("Auto-cleaned \(removed) stale worktree(s) for \(repoPath)")
-                        }
-                    }
-                }
-            }
-        }
+        // Worktree auto-cleanup disabled — worktrees are managed explicitly via Worktree Manager
         daemon.stopDaemon()
         browserHistory.flushPendingSaves()
         PostHogAnalytics.shared.flush()

@@ -1107,16 +1107,11 @@ final class TeamOrchestrator {
         return true
     }
 
-    /// Remove all worktrees associated with a team.
+    /// Log detached worktrees from a destroyed team (no longer auto-deleted).
     private func cleanupWorktrees(team: Team) {
-        guard let repoRoot = team.gitRepoRoot else { return }
         for agent in team.agents {
             guard let wtName = agent.worktreeName else { continue }
-            if daemon.removeWorktree(repoPath: repoRoot, name: wtName) {
-                Logger.team.info("removed worktree '\(wtName, privacy: .public)' for agent '\(agent.name, privacy: .public)'")
-            } else {
-                Logger.team.error("failed to remove worktree '\(wtName, privacy: .public)' for agent '\(agent.name, privacy: .public)'")
-            }
+            Logger.team.info("worktree '\(wtName, privacy: .public)' detached from agent '\(agent.name, privacy: .public)' (kept for manual cleanup)")
         }
     }
 

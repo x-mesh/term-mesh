@@ -602,14 +602,11 @@ impl AgentSessionManager {
         // Unwatch worktree
         watcher.unwatch_path(&session.worktree_path);
 
-        // Remove worktree
-        let remove_params = serde_json::json!({
-            "repo_path": session.repo_path,
-            "name": session.worktree_name,
-        });
-        if let Err(e) = worktree::remove(remove_params) {
-            tracing::warn!("failed to remove worktree {}: {e}", session.worktree_name);
-        }
+        // Worktree is intentionally kept — user manages via Worktree Manager
+        tracing::info!(
+            "worktree '{}' detached from terminated session {id} (kept for manual cleanup)",
+            session.worktree_name
+        );
 
         // Update DB and memory
         let ts = now_ms();

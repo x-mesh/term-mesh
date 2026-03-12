@@ -486,23 +486,32 @@ final class WorktreeTableDataSource: NSObject, NSTableViewDataSource, NSTableVie
         guard row < worktrees.count else { return }
         let wt = worktrees[row]
 
+        let repoPath = self.repoPath
+        let name = wt.name
+
+        // Pre-check: warn if worktree has uncommitted changes
+        let st = daemon.worktreeStatus(repoPath: repoPath, name: name)
+
         let confirm = NSAlert()
         confirm.messageText = "Delete Worktree?"
-        confirm.informativeText = "Remove \"\(wt.name)\" (branch: \(wt.branch))?\nPath: \(wt.path)"
-        confirm.alertStyle = .warning
-        confirm.addButton(withTitle: "Delete")
+        if st.dirty {
+            confirm.alertStyle = .critical
+            confirm.informativeText = "⚠ \"\(wt.name)\" has uncommitted changes!\nBranch: \(wt.branch)\nPath: \(wt.path)\n\nDeleting will permanently discard these changes."
+            confirm.addButton(withTitle: "Delete Anyway")
+        } else {
+            confirm.alertStyle = .warning
+            confirm.informativeText = "Remove \"\(wt.name)\" (branch: \(wt.branch))?\nPath: \(wt.path)"
+            confirm.addButton(withTitle: "Delete")
+        }
         confirm.addButton(withTitle: "Cancel")
         guard confirm.runModal() == .alertFirstButtonReturn else { return }
 
-        let repoPath = self.repoPath
-        let name = wt.name
         DispatchQueue.global(qos: .userInitiated).async {
+            // Use force remove since user explicitly confirmed
             let success = self.daemon.removeWorktree(repoPath: repoPath, name: name)
             DispatchQueue.main.async { [weak self] in
                 guard let self else { return }
                 if success {
-                    // Use name-based lookup instead of captured row index to avoid
-                    // stale index after concurrent deletions.
                     if let idx = self.worktrees.firstIndex(where: { $0.name == name }) {
                         self.worktrees.remove(at: idx)
                     }
@@ -523,7 +532,7 @@ final class WorktreeTableDataSource: NSObject, NSTableViewDataSource, NSTableVie
     @objc func cleanupStale(_ sender: Any?) {
         let repoPath = self.repoPath
         DispatchQueue.global(qos: .userInitiated).async {
-            let removed = self.daemon.cleanupStaleWorktrees(repoPath: repoPath)
+            let result = self.daemon.cleanupStaleWorktrees(repoPath: repoPath)
             let remaining = self.daemon.listWorktrees(repoPath: repoPath)
             DispatchQueue.main.async { [weak self] in
                 guard let self else { return }
@@ -543,9 +552,15 @@ final class WorktreeTableDataSource: NSObject, NSTableViewDataSource, NSTableVie
 
                 let resultAlert = NSAlert()
                 resultAlert.messageText = "Worktree Cleanup"
-                resultAlert.informativeText = removed > 0
-                    ? "Removed \(removed) stale worktree(s)."
-                    : "No stale worktrees found."
+                if result.removed > 0 && result.skippedDirty > 0 {
+                    resultAlert.informativeText = "Removed \(result.removed) stale worktree(s).\nSkipped \(result.skippedDirty) with uncommitted changes."
+                } else if result.removed > 0 {
+                    resultAlert.informativeText = "Removed \(result.removed) stale worktree(s)."
+                } else if result.skippedDirty > 0 {
+                    resultAlert.informativeText = "No clean stale worktrees to remove.\nSkipped \(result.skippedDirty) with uncommitted changes."
+                } else {
+                    resultAlert.informativeText = "No stale worktrees found."
+                }
                 resultAlert.addButton(withTitle: "OK")
                 resultAlert.runModal()
             }

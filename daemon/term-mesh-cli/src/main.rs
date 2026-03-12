@@ -179,16 +179,16 @@ fn cleanup_sandbox(repo_path: &str, wt_name: &str, wt_path: &str, child_pid: Opt
     // Unwatch the directory
     let _ = client.call("watcher.unwatch", serde_json::json!({ "path": wt_path }));
 
-    // Remove the worktree
+    // Try safe removal (skips if dirty); fall back to warning
     match client.call(
-        "worktree.remove",
+        "worktree.safe_remove",
         serde_json::json!({
             "repo_path": repo_path,
             "name": wt_name,
         }),
     ) {
         Ok(_) => eprintln!("term-mesh-run: sandbox removed"),
-        Err(e) => eprintln!("term-mesh-run: failed to remove worktree: {}", e),
+        Err(e) => eprintln!("term-mesh-run: sandbox kept ({}). Remove via Worktree Manager.", e),
     }
 }
 

@@ -618,12 +618,9 @@ class TabManager: ObservableObject {
         guard tabs.count > 1 else { return }
         sentryBreadcrumb("workspace.close", data: ["tabCount": tabs.count - 1])
 
-        // term-mesh: Clean up worktree sandbox if this tab was using one
-        if let name = workspace.worktreeName, let repoPath = workspace.worktreeRepoPath {
-            DispatchQueue.global(qos: .utility).async {
-                let success = self.daemon.removeWorktree(repoPath: repoPath, name: name)
-                Logger.app.info("worktree cleanup \(name, privacy: .public): \(success ? "ok" : "failed", privacy: .public)")
-            }
+        // term-mesh: Mark worktree as stale (no longer auto-deleted on tab close)
+        if let name = workspace.worktreeName {
+            Logger.app.info("worktree '\(name, privacy: .public)' detached from closed tab (kept for manual cleanup)")
         }
 
         notifications.clearNotifications(forTabId: workspace.id)

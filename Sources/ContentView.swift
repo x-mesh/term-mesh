@@ -3166,11 +3166,19 @@ struct ContentView: View {
                     DispatchQueue.main.async { NSSound.beep() }
                     return
                 }
-                let removed = daemon?.cleanupStaleWorktrees(repoPath: repoPath) ?? 0
+                let result = daemon?.cleanupStaleWorktrees(repoPath: repoPath) ?? (removed: 0, skippedDirty: 0)
                 DispatchQueue.main.async {
                     let alert = NSAlert()
                     alert.messageText = "Worktree Cleanup"
-                    alert.informativeText = removed > 0 ? "Removed \(removed) stale worktree(s)." : "No stale worktrees to clean up."
+                    if result.removed > 0 && result.skippedDirty > 0 {
+                        alert.informativeText = "Removed \(result.removed) stale worktree(s).\nSkipped \(result.skippedDirty) with uncommitted changes."
+                    } else if result.removed > 0 {
+                        alert.informativeText = "Removed \(result.removed) stale worktree(s)."
+                    } else if result.skippedDirty > 0 {
+                        alert.informativeText = "No clean stale worktrees to remove.\nSkipped \(result.skippedDirty) with uncommitted changes."
+                    } else {
+                        alert.informativeText = "No stale worktrees to clean up."
+                    }
                     alert.addButton(withTitle: "OK")
                     alert.runModal()
                 }

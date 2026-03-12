@@ -196,6 +196,116 @@ fn worktree_branch(repo: &Repository, wt_name: &str) -> String {
     }
 }
 
+/// Status of a worktree (dirty / unpushed checks).
+#[derive(Debug, Serialize)]
+pub struct WorktreeStatus {
+    /// true if the worktree has uncommitted changes (modified, staged, or untracked files)
+    pub dirty: bool,
+    /// true if the worktree has commits not pushed to its upstream
+    pub unpushed: bool,
+}
+
+/// Check whether a worktree has uncommitted changes or unpushed commits.
+pub fn status(params: serde_json::Value) -> Result<WorktreeStatus, String> {
+    #[derive(Deserialize)]
+    struct StatusParams {
+        repo_path: String,
+        name: String,
+    }
+
+    let params: StatusParams =
+        serde_json::from_value(params).map_err(|e| format!("invalid params: {e}"))?;
+
+    let repo = Repository::open(&params.repo_path)
+        .map_err(|e| format!("cannot open repo: {e}"))?;
+
+    let wt = repo
+        .find_worktree(&params.name)
+        .map_err(|e| format!("worktree '{}' not found: {e}", params.name))?;
+    let wt_path = wt.path().to_path_buf();
+
+    let wt_repo = Repository::open(&wt_path)
+        .map_err(|e| format!("cannot open worktree repo: {e}"))?;
+
+    // Check dirty: any modified, staged, or untracked files
+    let statuses = wt_repo
+        .statuses(Some(
+            git2::StatusOptions::new()
+                .include_untracked(true)
+                .recurse_untracked_dirs(true),
+        ))
+        .map_err(|e| format!("cannot get status: {e}"))?;
+    let dirty = !statuses.is_empty();
+
+    // Check unpushed: commits ahead of upstream
+    let unpushed = match wt_repo.head() {
+        Ok(head) => {
+            if let Some(local_oid) = head.target() {
+                // Try to find upstream
+                let branch_name = head.shorthand().unwrap_or("HEAD");
+                match wt_repo.find_branch(branch_name, git2::BranchType::Local) {
+                    Ok(branch) => match branch.upstream() {
+                        Ok(upstream) => {
+                            if let Some(upstream_oid) = upstream.get().target() {
+                                // Count commits local has that upstream doesn't
+                                let (ahead, _) = wt_repo
+                                    .graph_ahead_behind(local_oid, upstream_oid)
+                                    .unwrap_or((0, 0));
+                                ahead > 0
+                            } else {
+                                false
+                            }
+                        }
+                        Err(_) => {
+                            // No upstream configured — any commits on the branch count as unpushed
+                            true
+                        }
+                    },
+                    Err(_) => false,
+                }
+            } else {
+                false
+            }
+        }
+        Err(_) => false,
+    };
+
+    Ok(WorktreeStatus { dirty, unpushed })
+}
+
+/// Remove a worktree only if it has no uncommitted changes.
+/// Returns an error describing the unsafe state if the worktree is dirty.
+pub fn safe_remove(params: serde_json::Value) -> Result<(), String> {
+    #[derive(Deserialize)]
+    struct SafeRemoveParams {
+        repo_path: String,
+        name: String,
+    }
+
+    let raw = params.clone();
+    let params: SafeRemoveParams =
+        serde_json::from_value(raw).map_err(|e| format!("invalid params: {e}"))?;
+
+    // Check status first
+    let st = status(serde_json::json!({
+        "repo_path": params.repo_path,
+        "name": params.name,
+    }))?;
+
+    if st.dirty {
+        return Err(format!(
+            "worktree '{}' has uncommitted changes — remove manually or discard changes first",
+            params.name
+        ));
+    }
+
+    // Safe to remove
+    remove(serde_json::json!({
+        "repo_path": params.repo_path,
+        "name": params.name,
+    }))
+}
+
 /// Detect orphan worktrees left behind by crashed sessions.
 /// Scans common project directories for `term-mesh_wt_*` directories.
 /// Does NOT auto-delete — only logs warnings so the user or admin can investigate.

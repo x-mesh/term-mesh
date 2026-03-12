@@ -215,10 +215,43 @@ final class TermMeshDaemon: ObservableObject {
         return nil
     }
 
-    /// Remove a worktree by name.
+    /// Remove a worktree by name (force — skips dirty check).
     func removeWorktree(repoPath: String, name: String) -> Bool {
         let params: [String: Any] = ["repo_path": repoPath, "name": name]
         return rpcCall(method: "worktree.remove", params: params) != nil
+    }
+
+    /// Remove a worktree only if it has no uncommitted changes.
+    /// Returns a tuple: (success, errorMessage).
+    func safeRemoveWorktree(repoPath: String, name: String) -> (Bool, String?) {
+        let params: [String: Any] = ["repo_path": repoPath, "name": name]
+        if rpcCall(method: "worktree.safe_remove", params: params) != nil {
+            return (true, nil)
+        }
+        // On failure, check status to provide a meaningful message
+        let st = worktreeStatus(repoPath: repoPath, name: name)
+        if st.dirty {
+            return (false, "Worktree has uncommitted changes.")
+        }
+        return (false, "Failed to remove worktree.")
+    }
+
+    /// Check worktree status (dirty / unpushed).
+    struct WorktreeStatusResult {
+        let dirty: Bool
+        let unpushed: Bool
+    }
+
+    func worktreeStatus(repoPath: String, name: String) -> WorktreeStatusResult {
+        let params: [String: Any] = ["repo_path": repoPath, "name": name]
+        guard let response = rpcCall(method: "worktree.status", params: params),
+              let dict = response as? [String: Any] else {
+            return WorktreeStatusResult(dirty: false, unpushed: false)
+        }
+        return WorktreeStatusResult(
+            dirty: dict["dirty"] as? Bool ?? false,
+            unpushed: dict["unpushed"] as? Bool ?? false
+        )
     }
 
     /// List all term-mesh worktrees for a repo.
@@ -652,21 +685,28 @@ final class TermMeshDaemon: ObservableObject {
 
     // MARK: - Worktree Cleanup
 
-    /// Remove all stale worktrees (those not bound to any active agent session)
-    func cleanupStaleWorktrees(repoPath: String) -> Int {
+    /// Remove all stale worktrees (those not bound to any active agent session).
+    /// Skips dirty worktrees (uncommitted changes). Returns (removed, skippedDirty).
+    func cleanupStaleWorktrees(repoPath: String) -> (removed: Int, skippedDirty: Int) {
         let worktrees = listWorktrees(repoPath: repoPath)
         let activeAgents = listAgents(includeTerminated: false)
         let activePaths = Set(activeAgents.map { $0.worktreePath })
 
         var removed = 0
+        var skippedDirty = 0
         for wt in worktrees {
             if !activePaths.contains(wt.path) {
+                let st = worktreeStatus(repoPath: repoPath, name: wt.name)
+                if st.dirty {
+                    skippedDirty += 1
+                    continue
+                }
                 if removeWorktree(repoPath: repoPath, name: wt.name) {
                     removed += 1
                 }
             }
         }
-        return removed
+        return (removed, skippedDirty)
     }
 }
 
