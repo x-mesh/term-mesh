@@ -22,7 +22,8 @@ protocol DaemonService: AnyObject {
     func findGitRoot(from path: String) -> String?
     func removeWorktree(repoPath: String, name: String) -> Bool
     func listWorktrees(repoPath: String) -> [WorktreeInfo]
-    func cleanupStaleWorktrees(repoPath: String) -> Int
+    func worktreeStatus(repoPath: String, name: String) -> TermMeshDaemon.WorktreeStatusResult
+    func cleanupStaleWorktrees(repoPath: String) -> (removed: Int, skippedDirty: Int)
 
     // MARK: - Process Management
     func trackPID(_ pid: Int32)
