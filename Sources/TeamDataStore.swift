@@ -386,8 +386,13 @@ final class TeamDataStore: @unchecked Sendable {
 
     // MARK: - File-Based Results
 
+    /// Local copy of result directory path (avoids calling @MainActor TeamOrchestrator.resultDirectory)
+    private static func resultDirectory(teamName: String) -> String {
+        "/tmp/term-mesh-team-\(teamName)"
+    }
+
     func writeResult(teamName: String, agentName: String, content: String) -> Bool {
-        let dir = TeamOrchestrator.resultDirectory(teamName: teamName)
+        let dir = Self.resultDirectory(teamName: teamName)
         try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
         let path = (dir as NSString).appendingPathComponent("\(agentName).result.json")
         let payload: [String: Any] = [
@@ -402,7 +407,7 @@ final class TeamDataStore: @unchecked Sendable {
     }
 
     func readResult(teamName: String, agentName: String) -> [String: Any]? {
-        let dir = TeamOrchestrator.resultDirectory(teamName: teamName)
+        let dir = Self.resultDirectory(teamName: teamName)
         let path = (dir as NSString).appendingPathComponent("\(agentName).result.json")
         guard let data = FileManager.default.contents(atPath: path),
               let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
@@ -414,7 +419,7 @@ final class TeamDataStore: @unchecked Sendable {
     func resultStatus(teamName: String) -> [String: Any] {
         let agents = agentNames(for: teamName)
         guard !agents.isEmpty else { return [:] }
-        let dir = TeamOrchestrator.resultDirectory(teamName: teamName)
+        let dir = Self.resultDirectory(teamName: teamName)
         var agentStatus: [[String: Any]] = []
         for name in agents {
             let path = (dir as NSString).appendingPathComponent("\(name).result.json")
