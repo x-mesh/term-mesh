@@ -141,7 +141,7 @@ extension TerminalController {
         applySocketPermissions()
 
         // Listen
-        guard listen(serverSocket, 5) >= 0 else {
+        guard listen(serverSocket, 128) >= 0 else {
             Logger.socket.error("Failed to listen on socket")
             close(serverSocket)
             return
