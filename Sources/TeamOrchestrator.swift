@@ -829,14 +829,30 @@ final class TeamOrchestrator {
         tabManager: TabManager
     ) -> Bool {
         guard let task = getTask(teamName: teamName, taskId: taskId) else { return false }
+        return notifyTaskLifecycleEvent(teamName: teamName, task: task, event: event, note: note, tabManager: tabManager)
+    }
+
+    /// Overload that accepts a pre-fetched task (used by approach D async handlers
+    /// where the task comes from TeamDataStore, not from taskBoards).
+    func notifyTaskLifecycleEvent(
+        teamName: String,
+        task: TeamTask,
+        event: String,
+        note: String? = nil,
+        tabManager: TabManager
+    ) -> Bool {
         let leaderSummary = formatLeaderTaskNotification(task: task, event: event, note: note)
         return sendToLeader(teamName: teamName, text: leaderSummary, tabManager: tabManager)
     }
 
     func dispatchTaskToAssignee(teamName: String, taskId: String, tabManager: TabManager) -> Bool {
-        guard let task = getTask(teamName: teamName, taskId: taskId),
-              let assignee = task.assignee?.nilIfBlank
-        else { return false }
+        guard let task = getTask(teamName: teamName, taskId: taskId) else { return false }
+        return dispatchTaskToAssignee(teamName: teamName, task: task, tabManager: tabManager)
+    }
+
+    /// Overload that accepts a pre-fetched task (used by approach D async handlers).
+    func dispatchTaskToAssignee(teamName: String, task: TeamTask, tabManager: TabManager) -> Bool {
+        guard let assignee = task.assignee?.nilIfBlank else { return false }
         let instruction = formatTaskDispatchInstruction(task: task)
         let dispatched = sendToAgent(teamName: teamName, agentName: assignee, text: instruction, tabManager: tabManager)
         let leaderSummary = formatLeaderTaskNotification(task: task, event: dispatched ? "started" : "start_failed")

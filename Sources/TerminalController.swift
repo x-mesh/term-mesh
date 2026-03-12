@@ -679,11 +679,13 @@ class TerminalController {
             return v2Error(id: id, code: "invalid_request", message: "Missing method")
         }
 
-        // ── Approach C: Dual Queue ──────────────────────────────────────
-        // Route data-only team commands to teamDataQueue, bypassing v2MainSync.
-        // This prevents main-thread contention that causes IME hangs.
-        if let dataResponse = dispatchTeamDataCommand(method: method, params: params, id: id) {
-            return dataResponse
+        // ── Approach D: Async Team Dispatch ─────────────────────────────
+        // ALL team commands are handled via async path. Data-only commands
+        // use TeamDataStore directly (no main thread). UI commands use
+        // cooperative `await MainActor.run` instead of blocking `DispatchQueue.main.sync`.
+        // This eliminates deadlocks and minimizes main-thread hold time.
+        if method.hasPrefix("team.") {
+            return dispatchTeamCommandAsync(method: method, params: params, id: id)
         }
 
         v2MainSync { self.v2RefreshKnownRefs() }
@@ -1713,6 +1715,550 @@ class TerminalController {
                 "window_id": windowId.uuidString,
                 "window_ref": v2Ref(kind: .window, uuid: windowId)
             ])
+    }
+
+    // MARK: - V2 Team Async Dispatch (Approach D: Swift Concurrency)
+
+    /// Team commands that require MainActor (UI interaction: panels, key events, terminal reads).
+    private static let teamUICommands: Set<String> = [
+        "team.create",
+        "team.destroy",
+        "team.send",
+        "team.leader.send",
+        "team.broadcast",
+        "team.read",
+        "team.collect",
+        // Status/list/inbox need team struct with panel UUIDs
+        "team.list",
+        "team.status",
+        "team.inbox",
+        "team.agent.status",
+        // Task lifecycle commands that dispatch/notify via panel text
+        "team.task.start",
+        "team.task.block",
+        "team.task.review",
+        "team.task.done",
+        "team.task.reassign",
+        "team.task.unblock",
+        "team.task.split",
+    ]
+
+    /// Dispatch ALL team commands via async path.
+    /// - Data-only commands: handled on teamDataQueue (no main thread)
+    /// - UI commands: use cooperative `await MainActor.run` (no deadlock)
+    ///
+    /// Bridge: sync socket thread waits on semaphore while Task runs cooperatively.
+    /// Unlike DispatchQueue.main.sync, `await MainActor.run` is cooperative —
+    /// it doesn't block the main thread's run loop, preventing IME deadlocks.
+    private func dispatchTeamCommandAsync(method: String, params: [String: Any], id: Any?) -> String {
+        // Fast path: data-only commands don't need async bridge at all
+        if Self.teamDataCommands.contains(method) {
+            return teamDataQueue.sync {
+                dispatchTeamDataCommandDirect(method: method, params: params, id: id)
+            }
+        }
+
+        // UI commands: bridge sync → async via semaphore + Task
+        let semaphore = DispatchSemaphore(value: 0)
+        // nonisolated(unsafe) is fine here — only accessed sequentially
+        // (written inside Task, read after semaphore.wait)
+        nonisolated(unsafe) var response = ""
+
+        Task {
+            response = await self.processTeamUICommandAsync(method: method, params: params, id: id)
+            semaphore.signal()
+        }
+
+        semaphore.wait()
+        return response
+    }
+
+    /// Direct dispatch for data-only team commands (called within teamDataQueue).
+    private func dispatchTeamDataCommandDirect(method: String, params: [String: Any], id: Any?) -> String {
+        let store = TeamDataStore.shared
+        switch method {
+        case "team.message.post":
+            return teamDataMessagePost(params: params, id: id, store: store)
+        case "team.message.list":
+            return teamDataMessageList(params: params, id: id, store: store)
+        case "team.message.clear":
+            return teamDataMessageClear(params: params, id: id, store: store)
+        case "team.report":
+            return teamDataReport(params: params, id: id, store: store)
+        case "team.result.status":
+            return teamDataResultStatus(params: params, id: id, store: store)
+        case "team.result.collect":
+            return teamDataResultCollect(params: params, id: id, store: store)
+        case "team.agent.heartbeat":
+            return teamDataAgentHeartbeat(params: params, id: id, store: store)
+        case "team.task.get":
+            return teamDataTaskGet(params: params, id: id, store: store)
+        case "team.task.list":
+            return teamDataTaskList(params: params, id: id, store: store)
+        case "team.task.dependents":
+            return teamDataTaskDependents(params: params, id: id, store: store)
+        case "team.task.clear":
+            return teamDataTaskClear(params: params, id: id, store: store)
+        case "team.task.create":
+            return teamDataTaskCreate(params: params, id: id, store: store)
+        case "team.task.update":
+            return teamDataTaskUpdate(params: params, id: id, store: store)
+        default:
+            return v2Error(id: id, code: "unknown_method", message: "Unknown team data method: \(method)")
+        }
+    }
+
+    /// Async handler for team UI commands. Uses `await MainActor.run` for
+    /// cooperative main-thread access instead of blocking `DispatchQueue.main.sync`.
+    private func processTeamUICommandAsync(method: String, params: [String: Any], id: Any?) async -> String {
+        // Each UI command: parse params off-main, then `await MainActor.run` for minimal UI work
+        switch method {
+        case "team.create":
+            return await asyncTeamCreate(params: params, id: id)
+        case "team.destroy":
+            return await asyncTeamDestroy(params: params, id: id)
+        case "team.send":
+            return await asyncTeamSend(params: params, id: id)
+        case "team.leader.send":
+            return await asyncTeamLeaderSend(params: params, id: id)
+        case "team.broadcast":
+            return await asyncTeamBroadcast(params: params, id: id)
+        case "team.read":
+            return await asyncTeamRead(params: params, id: id)
+        case "team.collect":
+            return await asyncTeamCollect(params: params, id: id)
+        case "team.list":
+            return await asyncTeamList(params: params, id: id)
+        case "team.status":
+            return await asyncTeamStatus(params: params, id: id)
+        case "team.inbox":
+            return await asyncTeamInbox(params: params, id: id)
+        case "team.agent.status":
+            return await asyncTeamAgentStatus(params: params, id: id)
+        case "team.task.start":
+            return await asyncTeamTaskStart(params: params, id: id)
+        case "team.task.block":
+            return await asyncTeamTaskBlock(params: params, id: id)
+        case "team.task.review":
+            return await asyncTeamTaskReview(params: params, id: id)
+        case "team.task.done":
+            return await asyncTeamTaskDone(params: params, id: id)
+        case "team.task.reassign":
+            return await asyncTeamTaskReassign(params: params, id: id)
+        case "team.task.unblock":
+            return await asyncTeamTaskUnblock(params: params, id: id)
+        case "team.task.split":
+            return await asyncTeamTaskSplit(params: params, id: id)
+        default:
+            return v2Error(id: id, code: "unknown_method", message: "Unknown team command: \(method)")
+        }
+    }
+
+    // MARK: - Async Team UI Handlers
+
+    /// Pattern: parse params off-main → await MainActor.run { minimal UI work } → format response off-main
+    /// This minimizes main-thread hold time vs the old v2MainSync { entire method } pattern.
+
+    private func asyncTeamCreate(params: [String: Any], id: Any?) async -> String {
+        guard let teamName = params["team_name"] as? String, !teamName.isEmpty else {
+            return v2Error(id: id, code: "invalid_params", message: "Missing team_name")
+        }
+        guard let agentsParam = params["agents"] as? [[String: Any]], !agentsParam.isEmpty else {
+            return v2Error(id: id, code: "invalid_params", message: "Missing or empty agents array")
+        }
+        // Parse all params off-main
+        let workingDirectory = params["working_directory"] as? String ?? FileManager.default.currentDirectoryPath
+        let leaderSessionId = params["leader_session_id"] as? String ?? UUID().uuidString
+        let leaderMode = params["leader_mode"] as? String ?? "repl"
+        let agents = agentsParam.map { dict -> (name: String, cli: String, model: String, agentType: String, color: String, instructions: String) in
+            (
+                name: dict["name"] as? String ?? "agent",
+                cli: dict["cli"] as? String ?? "claude",
+                model: dict["model"] as? String ?? "sonnet",
+                agentType: dict["agent_type"] as? String ?? "",
+                color: dict["color"] as? String ?? "green",
+                instructions: dict["instructions"] as? String ?? ""
+            )
+        }
+        // Only the actual team creation needs MainActor
+        let result: V2CallResult = await MainActor.run {
+            guard let tabManager = self.tabManager else {
+                return V2CallResult.err(code: "unavailable", message: "TabManager not available", data: nil)
+            }
+            if let team = TeamOrchestrator.shared.createTeam(
+                name: teamName,
+                agents: agents,
+                workingDirectory: workingDirectory,
+                leaderSessionId: leaderSessionId,
+                leaderMode: leaderMode,
+                tabManager: tabManager
+            ) {
+                return V2CallResult.ok([
+                    "team_name": team.id,
+                    "agent_count": team.agents.count,
+                    "workspace_id": team.workspaceId.uuidString,
+                    "agents": team.agents.map { [
+                        "id": $0.id, "name": $0.name,
+                        "model": $0.model,
+                        "workspace_id": $0.workspaceId.uuidString,
+                        "panel_id": $0.panelId.uuidString,
+                    ] as [String: Any] },
+                ] as [String: Any])
+            }
+            return V2CallResult.err(code: "internal_error", message: "Failed to create team", data: nil)
+        }
+        return v2Result(id: id, result)
+    }
+
+    private func asyncTeamDestroy(params: [String: Any], id: Any?) async -> String {
+        guard let teamName = params["team_name"] as? String else {
+            return v2Error(id: id, code: "invalid_params", message: "Missing team_name")
+        }
+        let success = await MainActor.run {
+            guard let tabManager = self.tabManager else { return false }
+            return TeamOrchestrator.shared.destroyTeam(name: teamName, tabManager: tabManager)
+        }
+        return success
+            ? v2Ok(id: id, result: ["destroyed": true, "team_name": teamName])
+            : v2Error(id: id, code: "not_found", message: "Team not found")
+    }
+
+    private func asyncTeamSend(params: [String: Any], id: Any?) async -> String {
+        guard let teamName = params["team_name"] as? String else {
+            return v2Error(id: id, code: "invalid_params", message: "Missing team_name")
+        }
+        guard let agentName = params["agent_name"] as? String else {
+            return v2Error(id: id, code: "invalid_params", message: "Missing agent_name")
+        }
+        guard let text = params["text"] as? String else {
+            return v2Error(id: id, code: "invalid_params", message: "Missing text")
+        }
+        let success = await MainActor.run {
+            guard let tabManager = self.tabManager else { return false }
+            return TeamOrchestrator.shared.sendToAgent(
+                teamName: teamName, agentName: agentName, text: text, tabManager: tabManager
+            )
+        }
+        return success
+            ? v2Ok(id: id, result: ["sent": true, "team_name": teamName, "agent_name": agentName])
+            : v2Error(id: id, code: "not_found", message: "Agent or team not found")
+    }
+
+    private func asyncTeamLeaderSend(params: [String: Any], id: Any?) async -> String {
+        guard let teamName = params["team_name"] as? String else {
+            return v2Error(id: id, code: "invalid_params", message: "Missing team_name")
+        }
+        guard let text = params["text"] as? String else {
+            return v2Error(id: id, code: "invalid_params", message: "Missing text")
+        }
+        let success = await MainActor.run {
+            guard let tabManager = self.tabManager else { return false }
+            return TeamOrchestrator.shared.sendToLeader(teamName: teamName, text: text, tabManager: tabManager)
+        }
+        return success
+            ? v2Ok(id: id, result: ["sent": true, "team_name": teamName, "target": "leader"])
+            : v2Error(id: id, code: "not_found", message: "Leader or team not found")
+    }
+
+    private func asyncTeamBroadcast(params: [String: Any], id: Any?) async -> String {
+        guard let teamName = params["team_name"] as? String else {
+            return v2Error(id: id, code: "invalid_params", message: "Missing team_name")
+        }
+        guard let text = params["text"] as? String else {
+            return v2Error(id: id, code: "invalid_params", message: "Missing text")
+        }
+        let count = await MainActor.run {
+            guard let tabManager = self.tabManager else { return 0 }
+            return TeamOrchestrator.shared.broadcast(teamName: teamName, text: text, tabManager: tabManager)
+        }
+        return v2Ok(id: id, result: ["sent_count": count, "team_name": teamName])
+    }
+
+    private func asyncTeamRead(params: [String: Any], id: Any?) async -> String {
+        guard let teamName = params["team_name"] as? String else {
+            return v2Error(id: id, code: "invalid_params", message: "Missing team_name")
+        }
+        guard let agentName = params["agent_name"] as? String else {
+            return v2Error(id: id, code: "invalid_params", message: "Missing agent_name")
+        }
+        let lineLimit = params["lines"] as? Int
+        let result: V2CallResult = await MainActor.run {
+            guard let tabManager = self.tabManager else {
+                return .err(code: "unavailable", message: "TabManager not available", data: nil)
+            }
+            guard let panel = TeamOrchestrator.shared.agentPanel(
+                teamName: teamName, agentName: agentName, tabManager: tabManager
+            ) else {
+                return .err(code: "not_found", message: "Agent not found", data: nil)
+            }
+            let response = self.readTerminalTextBase64(
+                terminalPanel: panel, includeScrollback: true, lineLimit: lineLimit
+            )
+            guard response.hasPrefix("OK ") else {
+                return .err(code: "internal_error", message: response, data: nil)
+            }
+            let base64 = String(response.dropFirst(3)).trimmingCharacters(in: .whitespacesAndNewlines)
+            let text = Data(base64Encoded: base64).flatMap { String(data: $0, encoding: .utf8) } ?? ""
+            return .ok(["text": text, "agent_name": agentName, "team_name": teamName])
+        }
+        return v2Result(id: id, result)
+    }
+
+    private func asyncTeamCollect(params: [String: Any], id: Any?) async -> String {
+        guard let teamName = params["team_name"] as? String else {
+            return v2Error(id: id, code: "invalid_params", message: "Missing team_name")
+        }
+        let lineLimit = params["lines"] as? Int
+        let agentTexts: [[String: Any]] = await MainActor.run {
+            guard let tabManager = self.tabManager else { return [] }
+            let panels = TeamOrchestrator.shared.allAgentPanels(teamName: teamName, tabManager: tabManager)
+            return panels.map { (name, panel) in
+                let response = self.readTerminalTextBase64(
+                    terminalPanel: panel, includeScrollback: true, lineLimit: lineLimit
+                )
+                var text = ""
+                if response.hasPrefix("OK ") {
+                    let base64 = String(response.dropFirst(3)).trimmingCharacters(in: .whitespacesAndNewlines)
+                    text = Data(base64Encoded: base64).flatMap { String(data: $0, encoding: .utf8) } ?? ""
+                }
+                return ["agent_name": name, "text": text] as [String: Any]
+            }
+        }
+        return v2Ok(id: id, result: ["team_name": teamName, "agents": agentTexts])
+    }
+
+    private func asyncTeamList(params: [String: Any], id: Any?) async -> String {
+        let teams: [[String: Any]] = await MainActor.run {
+            TeamOrchestrator.shared.listTeams()
+        }
+        return v2Ok(id: id, result: teams)
+    }
+
+    private func asyncTeamStatus(params: [String: Any], id: Any?) async -> String {
+        guard let teamName = params["team_name"] as? String else {
+            return v2Error(id: id, code: "invalid_params", message: "Missing team_name")
+        }
+        let status: [String: Any]? = await MainActor.run {
+            TeamOrchestrator.shared.teamStatus(name: teamName)
+        }
+        if let status {
+            return v2Ok(id: id, result: status)
+        }
+        return v2Error(id: id, code: "not_found", message: "Team not found")
+    }
+
+    private func asyncTeamInbox(params: [String: Any], id: Any?) async -> String {
+        guard let teamName = params["team_name"] as? String else {
+            return v2Error(id: id, code: "invalid_params", message: "Missing team_name")
+        }
+        let topOnly = params["top_only"] as? Bool ?? false
+        let items: [[String: Any]] = await MainActor.run {
+            TeamOrchestrator.shared.inboxItems(teamName: teamName, topOnly: topOnly)
+        }
+        return v2Ok(id: id, result: ["team_name": teamName, "items": items, "count": items.count])
+    }
+
+    private func asyncTeamAgentStatus(params: [String: Any], id: Any?) async -> String {
+        guard let teamName = params["team_name"] as? String else {
+            return v2Error(id: id, code: "invalid_params", message: "Missing team_name")
+        }
+        guard let agentName = params["agent_name"] as? String else {
+            return v2Error(id: id, code: "invalid_params", message: "Missing agent_name")
+        }
+        let agent: [String: Any]? = await MainActor.run {
+            guard let status = TeamOrchestrator.shared.teamStatus(name: teamName),
+                  let agents = status["agents"] as? [[String: Any]],
+                  let agent = agents.first(where: { ($0["name"] as? String) == agentName }) else { return nil }
+            return agent
+        }
+        if let agent {
+            return v2Ok(id: id, result: agent)
+        }
+        return v2Error(id: id, code: "not_found", message: "Agent not found")
+    }
+
+    // MARK: - Async Task Lifecycle Handlers (data change + UI notification)
+
+    /// Pattern: data mutation via TeamDataStore (off-main) → UI notification via MainActor.run (cooperative)
+
+    private func asyncTeamTaskStart(params: [String: Any], id: Any?) async -> String {
+        guard let teamName = params["team_name"] as? String else {
+            return v2Error(id: id, code: "invalid_params", message: "Missing team_name")
+        }
+        guard let taskId = params["task_id"] as? String else {
+            return v2Error(id: id, code: "invalid_params", message: "Missing task_id")
+        }
+        let assignee = params["assignee"] as? String
+        let progressNote = params["progress_note"] as? String
+        let store = TeamDataStore.shared
+
+        // Data mutation off-main
+        guard let task = store.updateTask(
+            teamName: teamName, taskId: taskId,
+            status: "in_progress", assignee: assignee, progressNote: progressNote
+        ) else {
+            return v2Error(id: id, code: "not_found", message: "Task not found")
+        }
+
+        // Dispatch to assignee via MainActor (cooperative) — pass task directly
+        // to avoid reading from TeamOrchestrator.taskBoards (stale data source)
+        let dispatched = await MainActor.run {
+            guard let tabManager = self.tabManager else { return false }
+            return TeamOrchestrator.shared.dispatchTaskToAssignee(
+                teamName: teamName, task: task, tabManager: tabManager
+            )
+        }
+        return v2Ok(id: id, result: ["task": store.taskDictionary(task), "dispatched": dispatched])
+    }
+
+    private func asyncTeamTaskBlock(params: [String: Any], id: Any?) async -> String {
+        guard let teamName = params["team_name"] as? String else {
+            return v2Error(id: id, code: "invalid_params", message: "Missing team_name")
+        }
+        guard let taskId = params["task_id"] as? String else {
+            return v2Error(id: id, code: "invalid_params", message: "Missing task_id")
+        }
+        let reason = params["blocked_reason"] as? String
+        let store = TeamDataStore.shared
+
+        guard let task = store.updateTask(
+            teamName: teamName, taskId: taskId,
+            status: "blocked", blockedReason: reason
+        ) else {
+            return v2Error(id: id, code: "not_found", message: "Task not found")
+        }
+
+        let notified = await MainActor.run {
+            guard let tabManager = self.tabManager else { return false }
+            return TeamOrchestrator.shared.notifyTaskLifecycleEvent(
+                teamName: teamName, task: task, event: "blocked", note: reason, tabManager: tabManager
+            )
+        }
+        return v2Ok(id: id, result: ["task": store.taskDictionary(task), "notified": notified])
+    }
+
+    private func asyncTeamTaskReview(params: [String: Any], id: Any?) async -> String {
+        guard let teamName = params["team_name"] as? String else {
+            return v2Error(id: id, code: "invalid_params", message: "Missing team_name")
+        }
+        guard let taskId = params["task_id"] as? String else {
+            return v2Error(id: id, code: "invalid_params", message: "Missing task_id")
+        }
+        let summary = params["review_summary"] as? String
+        let store = TeamDataStore.shared
+
+        guard let task = store.updateTask(
+            teamName: teamName, taskId: taskId,
+            status: "review_ready", reviewSummary: summary
+        ) else {
+            return v2Error(id: id, code: "not_found", message: "Task not found")
+        }
+
+        let notified = await MainActor.run {
+            guard let tabManager = self.tabManager else { return false }
+            return TeamOrchestrator.shared.notifyTaskLifecycleEvent(
+                teamName: teamName, task: task, event: "review_ready", note: summary, tabManager: tabManager
+            )
+        }
+        return v2Ok(id: id, result: ["task": store.taskDictionary(task), "notified": notified])
+    }
+
+    private func asyncTeamTaskDone(params: [String: Any], id: Any?) async -> String {
+        guard let teamName = params["team_name"] as? String else {
+            return v2Error(id: id, code: "invalid_params", message: "Missing team_name")
+        }
+        guard let taskId = params["task_id"] as? String else {
+            return v2Error(id: id, code: "invalid_params", message: "Missing task_id")
+        }
+        let taskResult = params["result"] as? String
+        let store = TeamDataStore.shared
+
+        guard let task = store.updateTask(
+            teamName: teamName, taskId: taskId,
+            status: "completed", result: taskResult
+        ) else {
+            return v2Error(id: id, code: "not_found", message: "Task not found")
+        }
+
+        let notified = await MainActor.run {
+            guard let tabManager = self.tabManager else { return false }
+            return TeamOrchestrator.shared.notifyTaskLifecycleEvent(
+                teamName: teamName, task: task, event: "completed", note: taskResult, tabManager: tabManager
+            )
+        }
+        return v2Ok(id: id, result: ["task": store.taskDictionary(task), "notified": notified])
+    }
+
+    private func asyncTeamTaskReassign(params: [String: Any], id: Any?) async -> String {
+        guard let teamName = params["team_name"] as? String else {
+            return v2Error(id: id, code: "invalid_params", message: "Missing team_name")
+        }
+        guard let taskId = params["task_id"] as? String else {
+            return v2Error(id: id, code: "invalid_params", message: "Missing task_id")
+        }
+        let assignee = params["assignee"] as? String
+        let store = TeamDataStore.shared
+
+        guard let task = store.reassignTask(
+            teamName: teamName, taskId: taskId, assignee: assignee
+        ) else {
+            return v2Error(id: id, code: "not_found", message: "Task not found")
+        }
+
+        let dispatched = await MainActor.run {
+            guard let tabManager = self.tabManager else { return false }
+            return TeamOrchestrator.shared.dispatchTaskToAssignee(
+                teamName: teamName, task: task, tabManager: tabManager
+            )
+        }
+        return v2Ok(id: id, result: ["task": store.taskDictionary(task), "dispatched": dispatched])
+    }
+
+    private func asyncTeamTaskUnblock(params: [String: Any], id: Any?) async -> String {
+        guard let teamName = params["team_name"] as? String else {
+            return v2Error(id: id, code: "invalid_params", message: "Missing team_name")
+        }
+        guard let taskId = params["task_id"] as? String else {
+            return v2Error(id: id, code: "invalid_params", message: "Missing task_id")
+        }
+        let store = TeamDataStore.shared
+
+        guard let task = store.unblockTask(
+            teamName: teamName, taskId: taskId
+        ) else {
+            return v2Error(id: id, code: "not_found", message: "Task not found")
+        }
+
+        let dispatched = await MainActor.run {
+            guard let tabManager = self.tabManager else { return false }
+            return TeamOrchestrator.shared.dispatchTaskToAssignee(
+                teamName: teamName, task: task, tabManager: tabManager
+            )
+        }
+        return v2Ok(id: id, result: ["task": store.taskDictionary(task), "dispatched": dispatched])
+    }
+
+    private func asyncTeamTaskSplit(params: [String: Any], id: Any?) async -> String {
+        guard let teamName = params["team_name"] as? String else {
+            return v2Error(id: id, code: "invalid_params", message: "Missing team_name")
+        }
+        guard let taskId = params["task_id"] as? String else {
+            return v2Error(id: id, code: "invalid_params", message: "Missing task_id")
+        }
+        guard let title = params["title"] as? String else {
+            return v2Error(id: id, code: "invalid_params", message: "Missing title")
+        }
+        let assignee = params["assignee"] as? String
+        let createdBy = params["created_by"] as? String ?? "leader"
+        let store = TeamDataStore.shared
+
+        guard let task = store.splitTask(
+            teamName: teamName, parentTaskId: taskId,
+            title: title, assignee: assignee, createdBy: createdBy
+        ) else {
+            return v2Error(id: id, code: "not_found", message: "Task not found")
+        }
+        return v2Ok(id: id, result: store.taskDictionary(task))
     }
 
     // MARK: - V2 Team Data Dispatch (Approach C: Dual Queue)
