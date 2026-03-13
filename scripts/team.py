@@ -86,6 +86,12 @@ AGENT_INIT_PROMPT = (
     '5. If ready for validation, run `./scripts/team.py task review <task_id> \'<summary>\'`.\n'
     '6. When accepted as done, run `./scripts/team.py task done <task_id> \'<result>\'`.\n'
     '\n'
+    'Communication:\n'
+    '- Send message to leader: `./scripts/team.py msg send \'<text>\'`\n'
+    '- Send message to another agent: `./scripts/team.py msg send --to <agent_name> \'<text>\'`\n'
+    '- Check your inbox: `./scripts/team.py msg list --to {agent}`\n'
+    '- Check messages from a specific agent: `./scripts/team.py msg list --from <agent_name> --to {agent}`\n'
+    '\n'
     'Environment:\n'
     '- Working directory: {workdir}\n'
     '- Socket: {socket}\n'
@@ -427,6 +433,9 @@ def cmd_read(sock: str, args: argparse.Namespace) -> None:
     if args.lines:
         params["lines"] = args.lines
     r = rpc(sock, "team.read", params)
+    if getattr(args, "json_output", False):
+        print(pretty(r))
+        return
     result = r.get("result", {})
     if "text" in result:
         print(result["text"])
@@ -704,6 +713,8 @@ def cmd_msg_list(sock: str, args: argparse.Namespace) -> None:
     params: dict = {"team_name": TEAM}
     if args.sender:
         params["from"] = args.sender
+    if args.to:
+        params["to"] = args.to
     if args.limit:
         params["limit"] = args.limit
     r = rpc(sock, "team.message.list", params)
@@ -780,7 +791,14 @@ def cmd_task_start(sock: str, args: argparse.Namespace) -> None:
             "agent_name": assignee,
             "text": instruction + "\n",
         })
-    print(pretty({"update": r, "dispatch": dispatched}))
+    # Unified response format
+    update_result = r.get("result", {})
+    ok = r.get("ok", False)
+    if dispatched:
+        update_result["dispatched"] = dispatched.get("ok", False)
+    else:
+        update_result["dispatched"] = not should_dispatch  # True if dispatch wasn't needed
+    print(pretty({"ok": ok, "id": r.get("id"), "result": update_result}))
 
 
 def cmd_task_block(sock: str, args: argparse.Namespace) -> None:
@@ -918,6 +936,7 @@ def build_parser() -> argparse.ArgumentParser:
     sp = sub.add_parser("read", help="Read agent's terminal screen")
     sp.add_argument("agent")
     sp.add_argument("--lines", type=int)
+    sp.add_argument("--json", dest="json_output", action="store_true", help="Output as JSON")
 
     # collect
     sp = sub.add_parser("collect", help="Read all agents' terminal screens")
@@ -963,6 +982,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     sp = msg_sub.add_parser("list", help="List messages")
     sp.add_argument("--from", dest="sender")
+    sp.add_argument("--to", dest="to")
     sp.add_argument("--limit", type=int)
 
     msg_sub.add_parser("clear", help="Clear all messages")

@@ -2433,7 +2433,8 @@ class TerminalController {
             return v2Error(id: id, code: "invalid_params", message: "Missing content")
         }
         let type = params["type"] as? String ?? "report"
-        if let msg = store.postMessage(teamName: teamName, from: from, content: content, type: type) {
+        let to = params["to"] as? String
+        if let msg = store.postMessage(teamName: teamName, from: from, to: to, content: content, type: type) {
             return v2Ok(id: id, result: store.messageDictionary(msg))
         }
         return v2Error(id: id, code: "internal_error", message: "Failed to post message")
@@ -2444,9 +2445,10 @@ class TerminalController {
             return v2Error(id: id, code: "invalid_params", message: "Missing team_name")
         }
         let from = params["from"] as? String
+        let to = params["to"] as? String
         let type = params["type"] as? String
         let limit = params["limit"] as? Int
-        let msgs = store.getMessages(teamName: teamName, from: from, type: type, limit: limit)
+        let msgs = store.getMessages(teamName: teamName, from: from, to: to, type: type, limit: limit)
         let formatted = msgs.map { store.messageDictionary($0) }
         return v2Ok(id: id, result: ["team_name": teamName, "messages": formatted, "count": formatted.count])
     }
@@ -2935,17 +2937,20 @@ class TerminalController {
             return .err(code: "invalid_params", message: "Missing content", data: nil)
         }
         let type = params["type"] as? String ?? "report"
+        let to = params["to"] as? String
 
         var result: V2CallResult = .err(code: "internal_error", message: "Failed to post message", data: nil)
         v2MainSync {
-            if let msg = TeamOrchestrator.shared.postMessage(teamName: teamName, from: from, content: content, type: type) {
-                result = .ok([
+            if let msg = TeamOrchestrator.shared.postMessage(teamName: teamName, from: from, to: to, content: content, type: type) {
+                var dict: [String: Any] = [
                     "id": msg.id,
                     "from": msg.from,
                     "type": msg.type,
                     "team_name": teamName,
-                    "timestamp": ISO8601DateFormatter().string(from: msg.timestamp)
-                ])
+                    "timestamp": ISO8601DateFormatter().string(from: msg.timestamp),
+                ]
+                if let to = msg.to { dict["to"] = to }
+                result = .ok(dict)
             }
         }
         return result
@@ -2957,20 +2962,23 @@ class TerminalController {
             return .err(code: "invalid_params", message: "Missing team_name", data: nil)
         }
         let from = params["from"] as? String
+        let to = params["to"] as? String
         let type = params["type"] as? String
         let limit = params["limit"] as? Int
 
         var result: V2CallResult = .ok([] as [[String: Any]])
         v2MainSync {
-            let msgs = TeamOrchestrator.shared.getMessages(teamName: teamName, from: from, type: type, limit: limit)
+            let msgs = TeamOrchestrator.shared.getMessages(teamName: teamName, from: from, to: to, type: type, limit: limit)
             let formatted = msgs.map { msg -> [String: Any] in
-                [
+                var dict: [String: Any] = [
                     "id": msg.id,
                     "from": msg.from,
                     "type": msg.type,
                     "content": msg.content,
-                    "timestamp": ISO8601DateFormatter().string(from: msg.timestamp)
+                    "timestamp": ISO8601DateFormatter().string(from: msg.timestamp),
                 ]
+                if let to = msg.to { dict["to"] = to }
+                return dict
             }
             result = .ok(["team_name": teamName, "messages": formatted, "count": formatted.count])
         }

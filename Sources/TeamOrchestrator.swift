@@ -47,10 +47,11 @@ final class TeamOrchestrator {
         "/tmp/term-mesh-team-\(teamName)"
     }
 
-    /// C: In-memory message queue (agent → leader)
+    /// C: In-memory message queue (agent ↔ agent, agent → leader)
     struct TeamMessage {
         let id: String
         let from: String       // agent name or "leader"
+        let to: String?        // recipient agent name, "leader", or nil (broadcast to all)
         let teamName: String
         let content: String
         let timestamp: Date
@@ -1467,11 +1468,12 @@ final class TeamOrchestrator {
 
     /// Post a message from an agent (or leader) to the team message queue.
     @discardableResult
-    func postMessage(teamName: String, from: String, content: String, type: String = "report") -> TeamMessage? {
+    func postMessage(teamName: String, from: String, to: String? = nil, content: String, type: String = "report") -> TeamMessage? {
         guard teams[teamName] != nil else { return nil }
         let msg = TeamMessage(
             id: UUID().uuidString,
             from: from,
+            to: to,
             teamName: teamName,
             content: content,
             timestamp: Date(),
@@ -1483,10 +1485,11 @@ final class TeamOrchestrator {
     }
 
     /// Get messages for a team, optionally filtered.
-    func getMessages(teamName: String, from: String? = nil, type: String? = nil, since: Date? = nil, limit: Int? = nil) -> [TeamMessage] {
+    func getMessages(teamName: String, from: String? = nil, to: String? = nil, type: String? = nil, since: Date? = nil, limit: Int? = nil) -> [TeamMessage] {
         guard let msgs = messages[teamName] else { return [] }
         var filtered = msgs
         if let from { filtered = filtered.filter { $0.from == from } }
+        if let to { filtered = filtered.filter { $0.to == to } }
         if let type { filtered = filtered.filter { $0.type == type } }
         if let since { filtered = filtered.filter { $0.timestamp > since } }
         if let limit { filtered = Array(filtered.suffix(limit)) }
@@ -1868,13 +1871,17 @@ final class TeamOrchestrator {
     }
 
     func messageDictionary(_ message: TeamMessage) -> [String: Any] {
-        [
+        var dict: [String: Any] = [
             "id": message.id,
             "from": message.from,
             "type": message.type,
             "content": message.content,
-            "timestamp": ISO8601DateFormatter().string(from: message.timestamp)
+            "timestamp": ISO8601DateFormatter().string(from: message.timestamp),
         ]
+        if let to = message.to {
+            dict["to"] = to
+        }
+        return dict
     }
 
     private func normalizedMessageType(_ type: String) -> String {

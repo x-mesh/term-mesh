@@ -66,13 +66,14 @@ final class TeamDataStore: @unchecked Sendable {
     // MARK: - Messages
 
     @discardableResult
-    func postMessage(teamName: String, from: String, content: String, type: String = "report") -> TeamOrchestrator.TeamMessage? {
+    func postMessage(teamName: String, from: String, to: String? = nil, content: String, type: String = "report") -> TeamOrchestrator.TeamMessage? {
         lock.lock()
         defer { lock.unlock() }
         guard teamRegistry[teamName] != nil else { return nil }
         let msg = TeamOrchestrator.TeamMessage(
             id: UUID().uuidString,
             from: from,
+            to: to,
             teamName: teamName,
             content: content,
             timestamp: Date(),
@@ -84,12 +85,13 @@ final class TeamDataStore: @unchecked Sendable {
         return msg
     }
 
-    func getMessages(teamName: String, from: String? = nil, type: String? = nil, since: Date? = nil, limit: Int? = nil) -> [TeamOrchestrator.TeamMessage] {
+    func getMessages(teamName: String, from: String? = nil, to: String? = nil, type: String? = nil, since: Date? = nil, limit: Int? = nil) -> [TeamOrchestrator.TeamMessage] {
         lock.lock()
         defer { lock.unlock() }
         guard let msgs = messages[teamName] else { return [] }
         var filtered = msgs
         if let from { filtered = filtered.filter { $0.from == from } }
+        if let to { filtered = filtered.filter { $0.to == to } }
         if let type { filtered = filtered.filter { $0.type == type } }
         if let since { filtered = filtered.filter { $0.timestamp > since } }
         if let limit { filtered = Array(filtered.suffix(limit)) }
@@ -207,6 +209,7 @@ final class TeamDataStore: @unchecked Sendable {
             let msg = TeamOrchestrator.TeamMessage(
                 id: UUID().uuidString,
                 from: tasks[idx].assignee ?? "leader",
+                to: nil,
                 teamName: teamName,
                 content: progressNote,
                 timestamp: now,
@@ -550,13 +553,17 @@ final class TeamDataStore: @unchecked Sendable {
     }
 
     func messageDictionary(_ message: TeamOrchestrator.TeamMessage) -> [String: Any] {
-        [
+        var dict: [String: Any] = [
             "id": message.id,
             "from": message.from,
             "type": message.type,
             "content": message.content,
             "timestamp": ISO8601DateFormatter().string(from: message.timestamp),
         ]
+        if let to = message.to {
+            dict["to"] = to
+        }
+        return dict
     }
 
     // MARK: - Inbox (off-main alternative to TeamOrchestrator.inboxItems)
