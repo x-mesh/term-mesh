@@ -14,6 +14,29 @@ struct AgentRolePreset: Identifiable, Codable, Equatable {
     /// Supported CLI types for agent execution.
     static let supportedCLIs = ["claude", "kiro", "codex", "gemini"]
 
+    /// Available models per CLI type.
+    static func models(for cli: String) -> [String] {
+        switch cli {
+        case "claude", "kiro":
+            return ["sonnet", "opus", "haiku"]
+        case "codex":
+            return ["gpt-5.4", "gpt-5.3-codex", "gpt-5.2-codex", "gpt-5.2", "gpt-5.1-codex-max", "gpt-5.1-codex-mini"]
+        case "gemini":
+            return ["gemini-3.1-pro", "gemini-3-flash", "gemini-2.5-pro", "gemini-2.5-flash"]
+        default:
+            return ["sonnet", "opus", "haiku"]
+        }
+    }
+
+    /// Default model for a given CLI.
+    static func defaultModel(for cli: String) -> String {
+        switch cli {
+        case "codex":  return "gpt-5.4"
+        case "gemini": return "gemini-3.1-pro"
+        default:       return "sonnet"
+        }
+    }
+
     init(
         id: UUID = UUID(),
         name: String,

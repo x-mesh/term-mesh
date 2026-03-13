@@ -1313,11 +1313,13 @@ final class TeamOrchestrator {
     }
 
     /// Map short model names to Codex CLI model identifiers.
+    /// New-style names (gpt-5.4, gpt-5.3-codex, etc.) pass through directly.
+    /// Legacy short names kept for backward compatibility with saved presets.
     private static func codexModelName(_ shortName: String) -> String {
         switch shortName.lowercased() {
-        case "opus":   return "o3"       // highest reasoning
-        case "sonnet": return "o4-mini"  // balanced
-        case "haiku":  return "o4-mini"  // fast
+        case "opus":   return "gpt-5.4"
+        case "sonnet": return "gpt-5.4"
+        case "haiku":  return "gpt-5.1-codex-mini"
         default:       return shortName
         }
     }
@@ -1344,11 +1346,13 @@ final class TeamOrchestrator {
     }
 
     /// Map short model names to Gemini CLI model identifiers.
+    /// New-style names (gemini-3.1-pro, gemini-3-flash, etc.) pass through directly.
+    /// Legacy short names kept for backward compatibility with saved presets.
     private static func geminiModelName(_ shortName: String) -> String {
         switch shortName.lowercased() {
-        case "opus":   return "gemini-2.5-pro"
-        case "sonnet": return "gemini-2.5-flash"
-        case "haiku":  return "gemini-2.5-flash"
+        case "opus":   return "gemini-3.1-pro"
+        case "sonnet": return "gemini-3-flash"
+        case "haiku":  return "gemini-3-flash"
         default:       return shortName
         }
     }

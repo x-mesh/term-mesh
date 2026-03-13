@@ -10,7 +10,7 @@ struct RolePresetEditorView: View {
     @State private var showDeleteConfirm = false
     @State private var deleteTarget: AgentRolePreset?
 
-    private let models = ["sonnet", "opus", "haiku"]
+    // Models are now CLI-dependent — see AgentRolePreset.models(for:)
     private let colors = ["green", "blue", "yellow", "red", "cyan", "magenta"]
 
     var body: some View {
@@ -161,11 +161,11 @@ struct RolePresetEditorView: View {
 
                     LabeledContent("Model") {
                         Picker("", selection: binding.model) {
-                            ForEach(models, id: \.self) { m in
+                            ForEach(AgentRolePreset.models(for: binding.cli.wrappedValue), id: \.self) { m in
                                 Text(m).tag(m)
                             }
                         }
-                        .frame(width: 100)
+                        .frame(width: 140)
                     }
 
                     LabeledContent("Color") {

@@ -39,7 +39,11 @@ struct TeamCreationView: View {
         return AppDelegate.shared?.tabManagerFor(tabId: existing.workspaceId) != nil
     }
 
-    private let models = ["sonnet", "opus", "haiku"]
+    /// Models shown in the bulk picker — defaults to Claude models.
+    private var bulkModels: [String] {
+        AgentRolePreset.models(for: bulkCli)
+    }
+    @State private var bulkCli = "claude"
 
     var body: some View {
         VStack(spacing: 0) {
@@ -205,13 +209,25 @@ struct TeamCreationView: View {
                             .font(.caption)
                     }
                     .buttonStyle(.borderless)
-                    .help("Change all agents' model to \(bulkModel.capitalized)")
-                    Picker("", selection: $bulkModel) {
-                        ForEach(models, id: \.self) { m in
-                            Text(m).tag(m)
+                    .help("Change all \(bulkCli) agents' model to \(bulkModel)")
+                    Picker("", selection: Binding(
+                        get: { bulkCli },
+                        set: { newCli in
+                            bulkCli = newCli
+                            bulkModel = AgentRolePreset.defaultModel(for: newCli)
+                        }
+                    )) {
+                        ForEach(AgentRolePreset.supportedCLIs, id: \.self) { cli in
+                            Text(cli).tag(cli)
                         }
                     }
                     .frame(width: 85)
+                    Picker("", selection: $bulkModel) {
+                        ForEach(bulkModels, id: \.self) { m in
+                            Text(m).tag(m)
+                        }
+                    }
+                    .frame(width: 130)
                 }
 
                 Text("\(agents.count)")
@@ -280,7 +296,14 @@ struct TeamCreationView: View {
                 // CLI picker
                 Picker("", selection: Binding(
                     get: { agent.preset.cli },
-                    set: { agents[index].preset.cli = $0 }
+                    set: { newCli in
+                        let oldCli = agents[index].preset.cli
+                        agents[index].preset.cli = newCli
+                        // Reset model to CLI default when switching CLI families
+                        if AgentRolePreset.models(for: oldCli) != AgentRolePreset.models(for: newCli) {
+                            agents[index].preset.model = AgentRolePreset.defaultModel(for: newCli)
+                        }
+                    }
                 )) {
                     ForEach(AgentRolePreset.supportedCLIs, id: \.self) { cli in
                         Text(cli).tag(cli)
@@ -288,16 +311,16 @@ struct TeamCreationView: View {
                 }
                 .frame(width: 90)
 
-                // Model picker
+                // Model picker — shows CLI-appropriate models
                 Picker("", selection: Binding(
                     get: { agent.preset.model },
                     set: { agents[index].preset.model = $0 }
                 )) {
-                    ForEach(models, id: \.self) { m in
+                    ForEach(AgentRolePreset.models(for: agent.preset.cli), id: \.self) { m in
                         Text(m).tag(m)
                     }
                 }
-                .frame(width: 85)
+                .frame(width: 130)
 
                 Spacer()
 
@@ -586,8 +609,12 @@ struct TeamCreationView: View {
     }
 
     private func applyModelToAll() {
+        let targetModels = AgentRolePreset.models(for: bulkCli)
         for i in agents.indices {
-            agents[i].preset.model = bulkModel
+            // Apply to agents whose CLI shares the same model family
+            if AgentRolePreset.models(for: agents[i].preset.cli) == targetModels {
+                agents[i].preset.model = bulkModel
+            }
         }
     }
 
