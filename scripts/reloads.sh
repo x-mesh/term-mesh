@@ -225,6 +225,11 @@ if [[ -x "$TERMMESHD_SRC" ]]; then
   mkdir -p "$BIN_DIR"
   cp "$TERMMESHD_SRC" "$BIN_DIR/term-meshd"
   chmod +x "$BIN_DIR/term-meshd"
+  TMRPC_SRC="$PWD/daemon/target/release/tm-rpc"
+  if [[ -x "$TMRPC_SRC" ]]; then
+    cp "$TMRPC_SRC" "$BIN_DIR/tm-rpc"
+    chmod +x "$BIN_DIR/tm-rpc"
+  fi
 fi
 # Avoid inheriting term-mesh/ghostty environment variables from the terminal that
 # runs this script (often inside another term-mesh instance), which can cause

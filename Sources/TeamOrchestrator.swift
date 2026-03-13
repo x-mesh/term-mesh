@@ -180,7 +180,10 @@ final class TeamOrchestrator {
 
         // Env vars for agent panes
         // Include essential PATH entries since pane commands may not source shell profiles
+        // Include app's Resources/bin (contains tm-rpc, term-meshd)
+        let resourceBin = Bundle.main.resourcePath.map { "\($0)/bin" } ?? ""
         let essentialPaths = [
+            resourceBin,
             "\(NSHomeDirectory())/.local/bin",
             "/opt/homebrew/bin",
             "/opt/homebrew/sbin",
