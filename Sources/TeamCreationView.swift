@@ -10,7 +10,6 @@ struct TeamAgentRow: Identifiable {
 /// Sheet for creating a new multi-agent team.
 struct TeamCreationView: View {
     @Environment(\.dismiss) private var dismiss
-    @EnvironmentObject private var tabManager: TabManager
     @ObservedObject var presetManager = AgentRolePresetManager.shared
     @ObservedObject var templateManager = TeamTemplateManager.shared
 
@@ -34,7 +33,9 @@ struct TeamCreationView: View {
     private var isTeamNameDuplicate: Bool {
         guard !teamName.isEmpty,
               let existing = TeamOrchestrator.shared.teams[teamName] else { return false }
-        return tabManager.tabs.contains(where: { $0.id == existing.workspaceId })
+        // Check all windows' tab managers via AppDelegate (avoids @EnvironmentObject
+        // which can crash in .sheet contexts on macOS).
+        return AppDelegate.shared?.tabManagerFor(tabId: existing.workspaceId) != nil
     }
 
     private let models = ["sonnet", "opus", "haiku"]
