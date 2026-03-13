@@ -800,7 +800,7 @@ final class TeamOrchestrator {
     }
 
     /// Send text to a specific agent in a team.
-    func sendToAgent(teamName: String, agentName: String, text: String, tabManager: TabManager, enterDelay: TimeInterval = 0.05) -> Bool {
+    func sendToAgent(teamName: String, agentName: String, text: String, tabManager: TabManager, enterDelay: TimeInterval = 0.10) -> Bool {
         guard let team = teams[teamName] else { return false }
         guard let agent = team.agents.first(where: { $0.name == agentName }) else { return false }
         return sendTextToPanel(workspaceId: agent.workspaceId, panelId: agent.panelId, text: text, tabManager: tabManager, enterDelay: enterDelay)
@@ -932,34 +932,33 @@ final class TeamOrchestrator {
         return lines.joined(separator: "\n")
     }
 
-    private func sendTextToPanel(workspaceId: UUID, panelId: UUID, text: String, tabManager: TabManager, enterDelay: TimeInterval = 0.05) -> Bool {
+    private func sendTextToPanel(workspaceId: UUID, panelId: UUID, text: String, tabManager: TabManager, enterDelay: TimeInterval = 0.10) -> Bool {
         guard let workspace = tabManager.tabs.first(where: { $0.id == workspaceId }) else { return false }
         guard let panel = workspace.terminalPanel(for: panelId) else { return false }
         let trimmed = text.replacingOccurrences(of: "[\\r\\n]+$", with: "", options: .regularExpression)
         guard !trimmed.isEmpty else { return true }
 
-        // Send text first, then schedule Enter after a short delay.
-        // TUI apps (Claude Code) need a gap between text input and Return
-        // to process the text into their input buffer. Atomic (text+\n)
-        // delivery in a single call was tested and causes missed submissions.
+        // Send text and Enter via DispatchQueue.main (GCD) instead of
+        // RunLoop timers. GCD asyncAfter is more reliable under heavy
+        // main-thread load from multiple panels. Both text and Enter go
+        // through main thread to ensure AppKit thread safety and ordering.
         //
-        // RunLoop timer in .common mode fires reliably even under heavy
-        // main-thread load. Broadcast uses staggered enterDelay values
-        // so N agents don't fire Enter simultaneously.
-        panel.sendInputText(trimmed)
+        // TUI apps (Claude Code) need a gap between text input and Return
+        // to process the text into their input buffer.
+        DispatchQueue.main.async {
+            panel.sendInputText(trimmed)
+        }
 
         // Primary Enter
-        let enterTimer = Timer(timeInterval: enterDelay, repeats: false) { [weak panel] _ in
+        DispatchQueue.main.asyncAfter(deadline: .now() + enterDelay) { [weak panel] in
             panel?.sendInputText("\n")
         }
-        RunLoop.main.add(enterTimer, forMode: .common)
 
         // Safety retry: if primary Enter was missed (e.g. TUI was busy),
         // send another Enter later. Double-Enter on an idle prompt is harmless.
-        let retryTimer = Timer(timeInterval: enterDelay + 0.15, repeats: false) { [weak panel] _ in
+        DispatchQueue.main.asyncAfter(deadline: .now() + enterDelay + 0.25) { [weak panel] in
             panel?.sendInputText("\n")
         }
-        RunLoop.main.add(retryTimer, forMode: .common)
 
         #if DEBUG
         dlog("[team.sendTextToPanel] sendText textLen=\(trimmed.count) enterDelay=\(enterDelay) text=\(trimmed.prefix(80).debugDescription)")
@@ -974,7 +973,7 @@ final class TeamOrchestrator {
         guard let team = teams[teamName] else { return 0 }
         var count = 0
         for (index, agent) in team.agents.enumerated() {
-            let enterDelay = 0.05 + Double(index) * 0.05
+            let enterDelay = 0.10 + Double(index) * 0.05
             if sendToAgent(teamName: teamName, agentName: agent.name, text: text, tabManager: tabManager, enterDelay: enterDelay) {
                 count += 1
             }
