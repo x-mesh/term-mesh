@@ -193,6 +193,9 @@ enum Commands {
         count: Option<u32>,
         #[arg(long)]
         claude_leader: bool,
+        /// Set model for all agents (e.g. sonnet, opus, haiku)
+        #[arg(long, default_value = "sonnet")]
+        model: String,
         #[arg(long)]
         kiro: Option<String>,
         #[arg(long)]
@@ -619,8 +622,8 @@ fn main() {
         }
 
         // ── Orchestration commands ──────────────────────────────
-        Commands::Create { count, claude_leader, kiro, codex, gemini } => {
-            run_create(&sock, &team, count.unwrap_or(2), claude_leader, &kiro, &codex, &gemini);
+        Commands::Create { count, claude_leader, model, kiro, codex, gemini } => {
+            run_create(&sock, &team, count.unwrap_or(2), claude_leader, &model, &kiro, &codex, &gemini);
             return;
         }
         Commands::Send { agent: ref target, text, no_report } => {
@@ -679,7 +682,7 @@ fn print_result(result: Result<Value, String>) {
 
 fn run_create(
     sock: &PathBuf, team: &str, count: u32, claude_leader: bool,
-    kiro: &Option<String>, codex: &Option<String>, gemini: &Option<String>,
+    model: &str, kiro: &Option<String>, codex: &Option<String>, gemini: &Option<String>,
 ) {
     let leader_mode = if claude_leader { "claude" } else { "repl" };
     let kiro_agents = parse_cli_flag(kiro);
@@ -704,7 +707,7 @@ fn run_create(
             "claude"
         };
         agents.push(json!({
-            "name": name, "cli": cli, "model": "sonnet",
+            "name": name, "cli": cli, "model": model,
             "agent_type": name, "color": color,
         }));
     }
