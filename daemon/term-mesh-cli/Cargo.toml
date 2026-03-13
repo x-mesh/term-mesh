@@ -8,7 +8,12 @@ description = "term-mesh CLI — PTY wrapper for AI agents"
 name = "term-mesh-run"
 path = "src/main.rs"
 
+[[bin]]
+name = "tm-rpc"
+path = "src/tm_rpc.rs"
+
 [dependencies]
+glob = "0.3"
 libc = "0.2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
