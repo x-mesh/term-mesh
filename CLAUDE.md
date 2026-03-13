@@ -132,32 +132,31 @@ If OMC's keyword detector fires `[MODE: TEAM]` or `[MAGIC KEYWORD: TEAM]`:
 
 ### Quick CLI reference
 
+**Leader operations** (use `team.py` — runs once, latency OK):
 ```bash
-# Create team (agents get split panes in term-mesh)
 ./scripts/team.py create [N] [--claude-leader]
-
-# Delegate with task tracking
 ./scripts/team.py delegate <agent> '<instruction>'
-
-# Send raw instruction
 ./scripts/team.py send <agent> '<instruction>'
 ./scripts/team.py broadcast '<instruction>'
-
-# Read agent output (bidirectional — the key advantage)
 ./scripts/team.py read <agent> --lines 100
 ./scripts/team.py collect --lines 100
 ./scripts/team.py wait --timeout 120 --mode any
-
-# Message queue (agent <-> leader)
-./scripts/team.py msg list [--from <agent>]
-
-# Task board
-./scripts/team.py task create '<title>' --assign <agent>
-./scripts/team.py task list
-./scripts/team.py task done <id> '<result>'
-
-# Cleanup
 ./scripts/team.py destroy
+```
+
+**Agent operations** (use `tm-rpc` — Rust, ~2ms; fallback `./scripts/tm-rpc.sh` ~10ms):
+```bash
+# NEVER use team.py from agents — it is 100x slower (~250ms)
+tm-rpc task-start <task_id>
+tm-rpc task-done <task_id> '<result>'
+tm-rpc task-block <task_id> '<reason>'
+tm-rpc heartbeat '<progress summary>'
+tm-rpc report '<result summary>'
+tm-rpc msg '<text>'                    # to leader
+tm-rpc msg '<text>' --to <agent_name>  # to another agent
+tm-rpc inbox                           # check messages
+tm-rpc status                          # team status
+tm-rpc tasks                           # task board
 ```
 
 ## E2E mac UI tests
