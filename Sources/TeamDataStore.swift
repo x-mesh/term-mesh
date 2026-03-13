@@ -497,6 +497,82 @@ final class TeamDataStore: @unchecked Sendable {
         ]
     }
 
+    // MARK: - Inbox (off-main alternative to TeamOrchestrator.inboxItems)
+
+    func inboxItems(teamName: String, topOnly: Bool = false) -> [[String: Any]] {
+        lock.lock()
+        defer { lock.unlock() }
+        guard teamRegistry[teamName] != nil else { return [] }
+        let now = Date()
+        var items: [[String: Any]] = []
+
+        for task in taskBoards[teamName, default: []] {
+            let staleSeconds = Self.staleAgeSeconds(for: task, threshold: staleTaskThreshold)
+            let attention: (Int, String)?
+            switch task.status {
+            case "blocked":
+                attention = (1, task.blockedReason ?? "Blocked")
+            case "review_ready":
+                attention = (2, task.reviewSummary ?? "Ready for review")
+            case "failed":
+                attention = (3, task.result ?? "Task failed")
+            default:
+                if let staleSeconds {
+                    attention = (4, "Stale for \(staleSeconds)s")
+                } else if task.status == "completed" {
+                    attention = (5, task.result ?? "Completed")
+                } else {
+                    attention = nil
+                }
+            }
+            guard let attention else { continue }
+            items.append([
+                "kind": "task",
+                "priority": attention.0,
+                "team_name": teamName,
+                "task_id": task.id,
+                "agent_name": task.assignee as Any,
+                "reason": attention.1,
+                "age_seconds": Int(now.timeIntervalSince(task.updatedAt)),
+                "summary": task.title,
+                "task_title": task.title,
+                "result": task.result as Any,
+                "review_summary": task.reviewSummary as Any,
+                "status": task.status,
+                "is_stale": staleSeconds != nil,
+                "stale_seconds": staleSeconds as Any
+            ])
+        }
+
+        for message in messages[teamName, default: []] {
+            let priority: Int?
+            switch message.type {
+            case "blocked":
+                priority = 1
+            case "review_ready":
+                priority = 2
+            case "error":
+                priority = 3
+            default:
+                priority = nil
+            }
+            guard let priority else { continue }
+            items.append([
+                "kind": "message",
+                "priority": priority,
+                "team_name": teamName,
+                "from": message.from,
+                "reason": message.content,
+                "age_seconds": Int(now.timeIntervalSince(message.timestamp)),
+                "summary": String(message.content.prefix(120)),
+                "message_type": message.type
+            ])
+        }
+
+        items.sort { ($0["priority"] as? Int ?? 99) < ($1["priority"] as? Int ?? 99) }
+        return topOnly ? Array(items.prefix(1)) : items
+    }
+
     // MARK: - Static Helpers (no instance state needed)
 
     static func normalizedMessageType(_ type: String) -> String {

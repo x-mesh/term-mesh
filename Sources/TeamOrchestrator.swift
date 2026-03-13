@@ -939,10 +939,14 @@ final class TeamOrchestrator {
 
         // Use key-event input plus delayed Return so TUI apps submit the message
         // instead of leaving the text in the composer input.
+        // RunLoop timer in .common mode is more reliable than asyncAfter under
+        // heavy main-thread load (asyncAfter can be delayed/coalesced, causing
+        // missed Enter presses during broadcast or rapid sends).
         panel.sendInputText(trimmed)
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
-            panel.sendInputText("\n")
+        let enterTimer = Timer(timeInterval: 0.15, repeats: false) { [weak panel] _ in
+            panel?.sendInputText("\n")
         }
+        RunLoop.main.add(enterTimer, forMode: .common)
 
         #if DEBUG
         dlog("[team.sendTextToPanel] sendText textLen=\(trimmed.count) text=\(trimmed.prefix(80).debugDescription)")

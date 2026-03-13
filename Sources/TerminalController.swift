@@ -1765,8 +1765,8 @@ class TerminalController {
         nonisolated(unsafe) var response = ""
 
         Task {
+            defer { semaphore.signal() }
             response = await self.processTeamUICommandAsync(method: method, params: params, id: id)
-            semaphore.signal()
         }
 
         semaphore.wait()
@@ -1791,6 +1791,8 @@ class TerminalController {
             return teamDataResultCollect(params: params, id: id, store: store)
         case "team.agent.heartbeat":
             return teamDataAgentHeartbeat(params: params, id: id, store: store)
+        case "team.inbox":
+            return teamDataInbox(params: params, id: id, store: store)
         case "team.task.get":
             return teamDataTaskGet(params: params, id: id, store: store)
         case "team.task.list":
@@ -1982,26 +1984,32 @@ class TerminalController {
             return v2Error(id: id, code: "invalid_params", message: "Missing agent_name")
         }
         let lineLimit = params["lines"] as? Int
-        let result: V2CallResult = await MainActor.run {
+
+        // Minimal MainActor hold: only read terminal raw bytes, decode base64 off-main
+        let (response, errResult): (String?, V2CallResult?) = await MainActor.run {
             guard let tabManager = self.tabManager else {
-                return .err(code: "unavailable", message: "TabManager not available", data: nil)
+                return (nil, .err(code: "unavailable", message: "TabManager not available", data: nil))
             }
             guard let panel = TeamOrchestrator.shared.agentPanel(
                 teamName: teamName, agentName: agentName, tabManager: tabManager
             ) else {
-                return .err(code: "not_found", message: "Agent not found", data: nil)
+                return (nil, .err(code: "not_found", message: "Agent not found", data: nil))
             }
-            let response = self.readTerminalTextBase64(
+            return (self.readTerminalTextBase64(
                 terminalPanel: panel, includeScrollback: true, lineLimit: lineLimit
-            )
-            guard response.hasPrefix("OK ") else {
-                return .err(code: "internal_error", message: response, data: nil)
-            }
-            let base64 = String(response.dropFirst(3)).trimmingCharacters(in: .whitespacesAndNewlines)
-            let text = Data(base64Encoded: base64).flatMap { String(data: $0, encoding: .utf8) } ?? ""
-            return .ok(["text": text, "agent_name": agentName, "team_name": teamName])
+            ), nil)
         }
-        return v2Result(id: id, result)
+
+        // Base64 decode off-main
+        if let errResult {
+            return v2Result(id: id, errResult)
+        }
+        guard let response, response.hasPrefix("OK ") else {
+            return v2Result(id: id, .err(code: "internal_error", message: response ?? "No response", data: nil))
+        }
+        let base64 = String(response.dropFirst(3)).trimmingCharacters(in: .whitespacesAndNewlines)
+        let text = Data(base64Encoded: base64).flatMap { String(data: $0, encoding: .utf8) } ?? ""
+        return v2Ok(id: id, result: ["text": text, "agent_name": agentName, "team_name": teamName])
     }
 
     private func asyncTeamCollect(params: [String: Any], id: Any?) async -> String {
@@ -2009,20 +2017,28 @@ class TerminalController {
             return v2Error(id: id, code: "invalid_params", message: "Missing team_name")
         }
         let lineLimit = params["lines"] as? Int
-        let agentTexts: [[String: Any]] = await MainActor.run {
+
+        // Get panel references with minimal MainActor hold time
+        let panels: [(name: String, panel: TerminalPanel)] = await MainActor.run {
             guard let tabManager = self.tabManager else { return [] }
-            let panels = TeamOrchestrator.shared.allAgentPanels(teamName: teamName, tabManager: tabManager)
-            return panels.map { (name, panel) in
-                let response = self.readTerminalTextBase64(
+            return TeamOrchestrator.shared.allAgentPanels(teamName: teamName, tabManager: tabManager)
+        }
+
+        // Read each agent's terminal with per-agent MainActor.run to avoid O(N) main-thread hold
+        var agentTexts: [[String: Any]] = []
+        for (name, panel) in panels {
+            let base64Str: String = await MainActor.run {
+                self.readTerminalTextBase64(
                     terminalPanel: panel, includeScrollback: true, lineLimit: lineLimit
                 )
-                var text = ""
-                if response.hasPrefix("OK ") {
-                    let base64 = String(response.dropFirst(3)).trimmingCharacters(in: .whitespacesAndNewlines)
-                    text = Data(base64Encoded: base64).flatMap { String(data: $0, encoding: .utf8) } ?? ""
-                }
-                return ["agent_name": name, "text": text] as [String: Any]
             }
+            // Decode base64 off-main
+            var text = ""
+            if base64Str.hasPrefix("OK ") {
+                let raw = String(base64Str.dropFirst(3)).trimmingCharacters(in: .whitespacesAndNewlines)
+                text = Data(base64Encoded: raw).flatMap { String(data: $0, encoding: .utf8) } ?? ""
+            }
+            agentTexts.append(["agent_name": name, "text": text])
         }
         return v2Ok(id: id, result: ["team_name": teamName, "agents": agentTexts])
     }
@@ -2272,6 +2288,7 @@ class TerminalController {
         "team.result.status",
         "team.result.collect",
         "team.agent.heartbeat",
+        "team.inbox",
         "team.task.get",
         "team.task.list",
         "team.task.dependents",
@@ -2322,6 +2339,15 @@ class TerminalController {
     }
 
     // MARK: - Team Data Command Handlers (off-main-thread safe)
+
+    private func teamDataInbox(params: [String: Any], id: Any?, store: TeamDataStore) -> String {
+        guard let teamName = params["team_name"] as? String else {
+            return v2Error(id: id, code: "invalid_params", message: "Missing team_name")
+        }
+        let topOnly = params["top_only"] as? Bool ?? false
+        let items = store.inboxItems(teamName: teamName, topOnly: topOnly)
+        return v2Ok(id: id, result: ["team_name": teamName, "items": items, "count": items.count])
+    }
 
     private func teamDataMessagePost(params: [String: Any], id: Any?, store: TeamDataStore) -> String {
         guard let teamName = params["team_name"] as? String else {
