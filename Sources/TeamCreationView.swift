@@ -26,6 +26,7 @@ struct TeamCreationView: View {
     @State private var saveTemplateName = ""
     @State private var selectedWorkflowName: String?
     @State private var hoveredAgentId: UUID?
+    @State private var bulkModel = "sonnet"
 
     /// A team name is only truly duplicate if the entry exists AND its workspace
     /// tab is still open.  When the user closes a workspace tab manually the team
@@ -63,6 +64,7 @@ struct TeamCreationView: View {
         .background(Color(nsColor: .windowBackgroundColor))
         .onAppear {
             leaderMode = defaultLeaderMode
+            bulkModel = defaultModel
             if agents.isEmpty {
                 applyQuickPreset(count: 2)
             }
@@ -195,6 +197,23 @@ struct TeamCreationView: View {
                 Text("Agents")
                     .font(.subheadline.bold())
                 Spacer()
+
+                // Bulk model selector — only applies on explicit button click
+                if !agents.isEmpty {
+                    Button(action: applyModelToAll) {
+                        Label("Apply to All", systemImage: "arrow.triangle.2.circlepath")
+                            .font(.caption)
+                    }
+                    .buttonStyle(.borderless)
+                    .help("Change all agents' model to \(bulkModel.capitalized)")
+                    Picker("", selection: $bulkModel) {
+                        ForEach(models, id: \.self) { m in
+                            Text(m).tag(m)
+                        }
+                    }
+                    .frame(width: 85)
+                }
+
                 Text("\(agents.count)")
                     .font(.caption)
                     .foregroundStyle(.secondary)
@@ -563,6 +582,12 @@ struct TeamCreationView: View {
         guard leaderMode != "repl" else { return }
         for i in agents.indices {
             agents[i].preset.cli = leaderMode
+        }
+    }
+
+    private func applyModelToAll() {
+        for i in agents.indices {
+            agents[i].preset.model = bulkModel
         }
     }
 
