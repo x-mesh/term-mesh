@@ -10,6 +10,7 @@ struct TeamAgentRow: Identifiable {
 /// Sheet for creating a new multi-agent team.
 struct TeamCreationView: View {
     @Environment(\.dismiss) private var dismiss
+    @EnvironmentObject private var tabManager: TabManager
     @ObservedObject var presetManager = AgentRolePresetManager.shared
     @ObservedObject var templateManager = TeamTemplateManager.shared
 
@@ -27,8 +28,13 @@ struct TeamCreationView: View {
     @State private var selectedWorkflowName: String?
     @State private var hoveredAgentId: UUID?
 
+    /// A team name is only truly duplicate if the entry exists AND its workspace
+    /// tab is still open.  When the user closes a workspace tab manually the team
+    /// dict entry becomes stale — allow reuse (createTeam auto-cleans it up).
     private var isTeamNameDuplicate: Bool {
-        !teamName.isEmpty && TeamOrchestrator.shared.teams[teamName] != nil
+        guard !teamName.isEmpty,
+              let existing = TeamOrchestrator.shared.teams[teamName] else { return false }
+        return tabManager.tabs.contains(where: { $0.id == existing.workspaceId })
     }
 
     private let models = ["sonnet", "opus", "haiku"]
