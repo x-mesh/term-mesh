@@ -1333,7 +1333,8 @@ final class TeamOrchestrator {
         let path = codexPath.contains(" ") ? "\"\(codexPath)\"" : codexPath
         var parts = [
             path,
-            "--ask-for-approval never"  // equivalent to --dangerously-skip-permissions
+            "--ask-for-approval never",       // auto-approve all tool calls
+            "--sandbox danger-full-access"    // allow Unix socket access for tm-agent communication
         ]
 
         if !model.isEmpty {

@@ -609,12 +609,9 @@ struct TeamCreationView: View {
     }
 
     private func applyModelToAll() {
-        let targetModels = AgentRolePreset.models(for: bulkCli)
         for i in agents.indices {
-            // Apply to agents whose CLI shares the same model family
-            if AgentRolePreset.models(for: agents[i].preset.cli) == targetModels {
-                agents[i].preset.model = bulkModel
-            }
+            agents[i].preset.cli = bulkCli
+            agents[i].preset.model = bulkModel
         }
     }
 
