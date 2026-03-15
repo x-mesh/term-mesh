@@ -445,12 +445,38 @@ final class WorktreeTableDataSource: NSObject, NSTableViewDataSource, NSTableVie
         let wt = worktrees[row]
 
         if tableColumn?.identifier.rawValue == "action" {
-            let button = NSButton(title: "Delete", target: self, action: #selector(deleteRow(_:)))
-            button.bezelStyle = .rounded
-            button.tag = row
-            button.controlSize = .small
-            button.contentTintColor = .systemRed
-            return button
+            let container = NSStackView()
+            container.orientation = .horizontal
+            container.spacing = 4
+            container.alignment = .centerY
+            container.edgeInsets = NSEdgeInsets(top: 0, left: 4, bottom: 0, right: 4)
+
+            let copyButton = NSButton(image: NSImage(systemSymbolName: "doc.on.doc", accessibilityDescription: "Copy Path")!, target: self, action: #selector(copyPath(_:)))
+            copyButton.bezelStyle = .rounded
+            copyButton.tag = row
+            copyButton.controlSize = .small
+            copyButton.isBordered = false
+            copyButton.toolTip = "Copy Path"
+
+            let terminalButton = NSButton(image: NSImage(systemSymbolName: "terminal", accessibilityDescription: "Open Terminal")!, target: self, action: #selector(openTerminal(_:)))
+            terminalButton.bezelStyle = .rounded
+            terminalButton.tag = row
+            terminalButton.controlSize = .small
+            terminalButton.isBordered = false
+            terminalButton.toolTip = "Open Terminal Here"
+
+            let deleteButton = NSButton(image: NSImage(systemSymbolName: "trash", accessibilityDescription: "Delete")!, target: self, action: #selector(deleteRow(_:)))
+            deleteButton.bezelStyle = .rounded
+            deleteButton.tag = row
+            deleteButton.controlSize = .small
+            deleteButton.isBordered = false
+            deleteButton.contentTintColor = .systemRed
+            deleteButton.toolTip = "Delete Worktree"
+
+            container.addArrangedSubview(copyButton)
+            container.addArrangedSubview(terminalButton)
+            container.addArrangedSubview(deleteButton)
+            return container
         }
 
         // Name column: two-line cell (name + branch, path)
@@ -479,6 +505,26 @@ final class WorktreeTableDataSource: NSObject, NSTableViewDataSource, NSTableVie
         ])
 
         return cell
+    }
+
+    @objc func copyPath(_ sender: NSButton) {
+        let row = sender.tag
+        guard row < worktrees.count else { return }
+        let pasteboard = NSPasteboard.general
+        pasteboard.clearContents()
+        pasteboard.setString(worktrees[row].path, forType: .string)
+    }
+
+    @objc func openTerminal(_ sender: NSButton) {
+        let row = sender.tag
+        guard row < worktrees.count else { return }
+        let path = worktrees[row].path
+        guard let tabManager = AppDelegate.shared?.preferredMainWindowContextForServiceWorkspace()?.tabManager else {
+            NSSound.beep()
+            return
+        }
+        tabManager.addWorkspace(workingDirectory: path)
+        panel?.close()
     }
 
     @objc func deleteRow(_ sender: NSButton) {

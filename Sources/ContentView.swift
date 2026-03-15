@@ -772,18 +772,21 @@ struct ContentView: View {
         tableView.rowHeight = 52
         tableView.usesAlternatingRowBackgroundColors = true
         tableView.headerView = nil
+        tableView.columnAutoresizingStyle = .firstColumnOnlyAutoresizingStyle
 
+        let actionWidth: CGFloat = 100
         let nameCol = NSTableColumn(identifier: NSUserInterfaceItemIdentifier("name"))
         nameCol.title = "Worktree"
-        nameCol.width = 360
-        nameCol.resizingMask = .userResizingMask
+        nameCol.width = scrollView.frame.width - actionWidth
+        nameCol.resizingMask = .autoresizingMask
         tableView.addTableColumn(nameCol)
 
         let actionCol = NSTableColumn(identifier: NSUserInterfaceItemIdentifier("action"))
         actionCol.title = ""
-        actionCol.width = 80
-        actionCol.maxWidth = 80
-        actionCol.minWidth = 80
+        actionCol.width = actionWidth
+        actionCol.maxWidth = actionWidth
+        actionCol.minWidth = actionWidth
+        actionCol.resizingMask = []
         tableView.addTableColumn(actionCol)
 
         tableView.dataSource = dataSource

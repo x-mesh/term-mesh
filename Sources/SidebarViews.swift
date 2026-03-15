@@ -90,6 +90,9 @@ struct VerticalTabsSidebar: View {
                 .background(Color.clear)
                 .modifier(ClearScrollBackground())
             }
+            SidebarWorktreeSandboxToggle()
+                .frame(maxWidth: .infinity, alignment: .leading)
+
 #if DEBUG
             SidebarDevFooter(updateViewModel: updateViewModel)
                 .frame(maxWidth: .infinity, alignment: .leading)
@@ -160,6 +163,30 @@ struct VerticalTabsSidebar: View {
     private func debugShortSidebarTabId(_ id: UUID?) -> String {
         guard let id else { return "nil" }
         return String(id.uuidString.prefix(5))
+    }
+}
+
+// MARK: - Worktree Sandbox Toggle
+
+struct SidebarWorktreeSandboxToggle: View {
+    @ObservedObject private var daemon = TermMeshDaemon.shared
+
+    var body: some View {
+        Button(action: {
+            daemon.worktreeEnabled.toggle()
+        }) {
+            HStack(spacing: 5) {
+                Image(systemName: "arrow.triangle.branch")
+                    .font(.system(size: 10))
+                Text("Sandbox")
+                    .font(.system(size: 11))
+            }
+            .foregroundColor(daemon.worktreeEnabled ? .green : .secondary)
+        }
+        .buttonStyle(.plain)
+        .padding(.horizontal, 10)
+        .padding(.vertical, 4)
+        .help(daemon.worktreeEnabled ? "Worktree Sandbox: ON" : "Worktree Sandbox: OFF")
     }
 }
 
