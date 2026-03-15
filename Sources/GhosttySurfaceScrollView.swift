@@ -657,6 +657,20 @@ final class GhosttySurfaceScrollView: NSView {
             onCtrlC: { [weak self] in
                 // Send Ctrl+C (ETX) interrupt to the terminal
                 self?.surfaceView.sendIMEText("\u{03}")
+            },
+            onSendKey: { [weak self] keycode, mods in
+                guard let self, let surface = self.surfaceView.surface else { return }
+                var keyEvent = ghostty_input_key_s()
+                keyEvent.action = GHOSTTY_ACTION_PRESS
+                keyEvent.keycode = UInt32(keycode)
+                keyEvent.mods = ghostty_input_mods_e(rawValue: mods)
+                keyEvent.consumed_mods = GHOSTTY_MODS_NONE
+                keyEvent.unshifted_codepoint = 0
+                keyEvent.composing = false
+                keyEvent.text = nil
+                _ = ghostty_surface_key(surface, keyEvent)
+                keyEvent.action = GHOSTTY_ACTION_RELEASE
+                _ = ghostty_surface_key(surface, keyEvent)
             }
         )
 
