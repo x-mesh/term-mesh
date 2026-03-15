@@ -66,7 +66,9 @@ case "$CMD" in
         ;;
     reply)
         CONTENT=$(json_escape "$1")
-        send_rpc "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"team.report\",\"params\":{\"team_name\":\"$TEAM\",\"agent_name\":\"$AGENT\",\"content\":$CONTENT}}"
+        # Send message to leader (type=report) AND register as report — matches Rust binary behavior
+        send_rpc "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"team.message.post\",\"params\":{\"team_name\":\"$TEAM\",\"from\":\"$AGENT\",\"content\":$CONTENT,\"to\":\"leader\",\"type\":\"report\"}}"
+        send_rpc "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"team.report\",\"params\":{\"team_name\":\"$TEAM\",\"agent_name\":\"$AGENT\",\"content\":$CONTENT}}"
         ;;
     ping|heartbeat)
         SUMMARY=$(json_escape "${1:-alive}")
@@ -180,7 +182,7 @@ case "$CMD" in
         ;;
     *)
         echo "Unknown command: $CMD" >&2
-        echo "Commands: report, reply, ping, heartbeat, msg <send|list|clear>, task <start|done|block|review|list|...>, status, inbox, batch, raw" >&2
+        echo "Commands: report, reply, ping, heartbeat, msg <send|list|clear>, task <start|done|block|review|list|create|get|update|reassign|unblock|clear>, status, inbox, batch, raw" >&2
         exit 1
         ;;
 esac

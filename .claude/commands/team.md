@@ -35,6 +35,8 @@ tm-agent status
 |---------|---------|-------------|
 | `create [N]` | `/team create 3` | Create team with N agents (default 2) |
 | `create N --claude-leader` | `/team create 3 --claude-leader` | Create team with you as leader |
+| `create N --model opus` | `/team create 3 --model opus` | Set model for all agents (sonnet/opus/haiku) |
+| `create N --kiro N --codex N` | `/team create 4 --kiro 2 --codex 1` | Mix CLI types |
 | `destroy` | `/team destroy` | Destroy the current team |
 | `status` | `/team status` | Show team and task board status |
 | `list` | `/team list` | List all teams |
@@ -49,6 +51,7 @@ tm-agent status
 | `collect` | `/team collect --lines 100` | Read all agents' output |
 | `wait` | `/team wait --timeout 120 --mode any` | Wait for agent signals |
 | `brief <agent>` | `/team brief explorer` | Get concise agent status |
+| `inbox` | `/team inbox` | Priority-sorted attention queue (blocked/review_ready/stale) |
 
 ### Message queue
 | Command | Example | Description |
@@ -63,8 +66,9 @@ tm-agent status
 | `task create '<title>'` | `/team task create 'fix login' --assign explorer` | Create task |
 | `task list` | `/team task list` | List all tasks |
 | `task get <id>` | `/team task get T-1` | Get task details |
+| `task block <id> '<reason>'` | `/team task block T-1 'waiting on API'` | Block a task with reason |
 | `task done <id> '<result>'` | `/team task done T-1 'done'` | Mark task complete |
-| `task review <id>` | `/team task review T-1` | Submit for review |
+| `task review <id> '<summary>'` | `/team task review T-1 'ready for check'` | Submit for review with summary |
 | `task reassign <id> <agent>` | `/team task reassign T-1 executor` | Reassign task |
 | `task unblock <id>` | `/team task unblock T-1` | Unblock a task |
 | `task clear` | `/team task clear` | Clear all tasks |

@@ -60,7 +60,6 @@ Communication:\n\
 - Check your inbox: `tm-agent inbox`\n\
 - Check team status: `tm-agent status`\n\
 - Check tasks: `tm-agent task list`\n\
-- Report result: `tm-agent report '<summary>'`\n\
 \n\
 Environment:\n\
 - Working directory: {workdir}\n\
@@ -68,7 +67,9 @@ Environment:\n\
 - Project: term-mesh (Swift/macOS terminal multiplexer)\n\
 \n\
 When you complete any task assigned by the leader, you MUST use your bash/execute tool to run:\n\
-tm-agent report '<summary of your result>'\n\
+tm-agent reply '<one-paragraph summary of your result>'\n\
+This sends the result to the leader AND registers it as a report in one step.\n\
+Do NOT run separate msg send + report commands. Just use `reply` once.\n\
 Do NOT just write the result as text \u{2014} actually execute the shell command using your tool. \
 This allows the leader to detect task completion automatically. \
 Respond with \"Agent {agent} ready.\" to confirm.",
@@ -277,6 +278,7 @@ enum MsgCommands {
 // ── Socket / RPC infrastructure ──────────────────────────────────────
 
 fn detect_socket() -> Option<PathBuf> {
+    // Priority 1: Explicit environment variable (always wins)
     if let Ok(sock) = env::var("TERMMESH_SOCKET") {
         let p = PathBuf::from(&sock);
         if p.exists() {
@@ -284,6 +286,20 @@ fn detect_socket() -> Option<PathBuf> {
         }
     }
 
+    // Priority 2: Last-used socket path recorded by reload.sh / reloads.sh
+    // This avoids ambiguity when multiple tagged debug sockets exist.
+    let last_socket_path = PathBuf::from("/tmp/term-mesh-last-socket-path");
+    if last_socket_path.exists() {
+        if let Ok(contents) = std::fs::read_to_string(&last_socket_path) {
+            let p = PathBuf::from(contents.trim());
+            if p.exists() {
+                return Some(p);
+            }
+            // Stale path — fall through to glob detection
+        }
+    }
+
+    // Priority 3: Glob fallback (first match)
     let patterns = [
         "/tmp/term-mesh-debug-*.sock",
         "/tmp/term-mesh-debug.sock",
@@ -813,11 +829,13 @@ fn run_create(
             for a in &non_kiro {
                 let name = a["name"].as_str().unwrap_or("");
                 let init_text = agent_init_prompt(name, &workdir, &sock.to_string_lossy());
-                let _ = rpc_call_timeout(sock, "team.send", json!({
+                match rpc_call_timeout(sock, "team.send", json!({
                     "team_name": team, "agent_name": name,
                     "text": format!("{init_text}\n"),
-                }), 3);
-                eprintln!("  \u{2713} {name}: init prompt sent");
+                }), 3) {
+                    Ok(_) => eprintln!("  \u{2713} {name}: init prompt sent"),
+                    Err(e) => eprintln!("  \u{2717} {name}: init prompt FAILED: {e}"),
+                }
                 // Keep 1s delay between sends: this is NOT state synchronization but
                 // main-thread congestion relief. The Swift app processes sendTextToPanel
                 // on DispatchQueue.main — sending too fast causes Enter key events to be
@@ -875,6 +893,8 @@ fn run_delegate(
 }
 
 fn run_wait(sock: &PathBuf, team: &str, timeout: u32, interval: u32, mode: &str, task_id: Option<&str>) {
+    // Prevent infinite loop: clamp interval to at least 1 second
+    let interval = interval.max(1);
     eprintln!("Waiting for agents in team '{team}' (timeout: {timeout}s, mode: {mode})...");
 
     let mut agent_names: Vec<String> = Vec::new();
@@ -896,25 +916,31 @@ fn run_wait(sock: &PathBuf, team: &str, timeout: u32, interval: u32, mode: &str,
         let mut msg_progress = "0/0".to_string();
 
         if mode == "report" || mode == "any" {
-            if let Ok(r) = rpc_call(sock, "team.result.status", json!({ "team_name": team })) {
-                let res = &r["result"];
-                let done = res["completed"].as_u64().unwrap_or(0);
-                let total = res["total"].as_u64().unwrap_or(0);
-                report_done = res["all_done"].as_bool().unwrap_or(false);
-                report_progress = format!("{done}/{total}");
+            match rpc_call(sock, "team.result.status", json!({ "team_name": team })) {
+                Ok(r) => {
+                    let res = &r["result"];
+                    let done = res["completed"].as_u64().unwrap_or(0);
+                    let total = res["total"].as_u64().unwrap_or(0);
+                    report_done = res["all_done"].as_bool().unwrap_or(false);
+                    report_progress = format!("{done}/{total}");
+                }
+                Err(e) => eprintln!("  Warning: result.status RPC failed: {e}"),
             }
         }
 
         if mode == "msg" || mode == "any" {
-            if let Ok(r) = rpc_call(sock, "team.message.list", json!({ "team_name": team })) {
-                if let Some(messages) = r["result"]["messages"].as_array() {
-                    let senders: std::collections::HashSet<&str> = messages.iter()
-                        .filter_map(|m| m["from"].as_str()).collect();
-                    let reported = agent_names.iter().filter(|a| senders.contains(a.as_str())).count();
-                    let total = agent_names.len();
-                    msg_done = reported >= total && total > 0;
-                    msg_progress = format!("{reported}/{total}");
+            match rpc_call(sock, "team.message.list", json!({ "team_name": team })) {
+                Ok(r) => {
+                    if let Some(messages) = r["result"]["messages"].as_array() {
+                        let senders: std::collections::HashSet<&str> = messages.iter()
+                            .filter_map(|m| m["from"].as_str()).collect();
+                        let reported = agent_names.iter().filter(|a| senders.contains(a.as_str())).count();
+                        let total = agent_names.len();
+                        msg_done = reported >= total && total > 0;
+                        msg_progress = format!("{reported}/{total}");
+                    }
                 }
+                Err(e) => eprintln!("  Warning: message.list RPC failed: {e}"),
             }
         }
 
@@ -924,22 +950,28 @@ fn run_wait(sock: &PathBuf, team: &str, timeout: u32, interval: u32, mode: &str,
         let mut task_obj = json!(null);
 
         if mode == "blocked" || mode == "review_ready" || mode == "idle" || task_id.is_some() {
-            if let Ok(r) = rpc_call(sock, "team.inbox", json!({ "team_name": team })) {
-                if let Some(items) = r["result"]["items"].as_array() {
-                    inbox_blocked = items.iter()
-                        .filter(|i| i["kind"].as_str() == Some("task") && i["status"].as_str() == Some("blocked"))
-                        .cloned().collect();
-                    inbox_review = items.iter()
-                        .filter(|i| i["kind"].as_str() == Some("task") && i["status"].as_str() == Some("review_ready"))
-                        .cloned().collect();
+            match rpc_call(sock, "team.inbox", json!({ "team_name": team })) {
+                Ok(r) => {
+                    if let Some(items) = r["result"]["items"].as_array() {
+                        inbox_blocked = items.iter()
+                            .filter(|i| i["kind"].as_str() == Some("task") && i["status"].as_str() == Some("blocked"))
+                            .cloned().collect();
+                        inbox_review = items.iter()
+                            .filter(|i| i["kind"].as_str() == Some("task") && i["status"].as_str() == Some("review_ready"))
+                            .cloned().collect();
+                    }
                 }
+                Err(e) => eprintln!("  Warning: inbox RPC failed: {e}"),
             }
             if let Some(tid) = task_id {
-                if let Ok(r) = rpc_call(sock, "team.task.get", json!({ "team_name": team, "task_id": tid })) {
-                    if r["ok"].as_bool().unwrap_or(false) {
-                        task_obj = r["result"].clone();
-                        task_status = task_obj["status"].as_str().map(String::from);
+                match rpc_call(sock, "team.task.get", json!({ "team_name": team, "task_id": tid })) {
+                    Ok(r) => {
+                        if r["ok"].as_bool().unwrap_or(false) {
+                            task_obj = r["result"].clone();
+                            task_status = task_obj["status"].as_str().map(String::from);
+                        }
                     }
+                    Err(e) => eprintln!("  Warning: task.get RPC failed for {tid}: {e}"),
                 }
             }
         }

@@ -2,6 +2,22 @@
 
 All notable changes to term-mesh are documented here.
 
+## [0.64.2] - 2026-03-16
+
+### Fixed
+- **tm-agent socket detection**: `detect_socket()` now checks `/tmp/term-mesh-last-socket-path` before glob fallback, avoiding ambiguity with multiple tagged debug sockets
+- **tm-agent wait infinite loop**: `--interval 0` no longer causes an infinite loop (clamped to minimum 1 second)
+- **tm-agent prompt consistency**: `agent_init_prompt` now instructs agents to use `tm-agent reply` (unified with `REPORT_SUFFIX` and `BROADCAST_SUFFIX`)
+- **tm-agent RPC error surfacing**: `run_wait` and `run_create` now print warnings to stderr on RPC failures instead of silently ignoring them
+- **tm-agent.sh reply**: Shell fallback `reply` command now correctly sends both `message.post` (type=report, to=leader) and `team.report`, matching Rust binary behavior
+
+### Added
+- `tests/test_tm_agent.py` — 34-test automated suite covering task lifecycle, messaging, reply integration, wait modes, and edge cases (`python3 tests/test_tm_agent.py --rounds 3`)
+- `docs/tm-agent-architecture-review.md` — Architecture review with 6 identified issues and prioritized recommendations
+
+### Changed
+- `.claude/commands/team.md` — Added missing `task block`, `inbox`, `create` flags documentation; fixed `task review` signature
+
 ## [0.60.0] - 2026-02-21
 
 ### Added
