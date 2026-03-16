@@ -32,6 +32,8 @@ final class Workspace: Identifiable, ObservableObject {
     /// term-mesh: Worktree metadata for auto-cleanup on tab close.
     @Published var worktreeName: String?
     var worktreeRepoPath: String?
+    /// Detected at runtime: true if currentDirectory is inside a git worktree (`.git` is a file, not a directory).
+    @Published var isInsideWorktree: Bool = false
 
     /// The bonsplit controller managing the split panes for this workspace
     let bonsplitController: BonsplitController
@@ -190,9 +192,11 @@ final class Workspace: Identifiable, ObservableObject {
 
         let trimmedWorkingDirectory = workingDirectory?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         let hasWorkingDirectory = !trimmedWorkingDirectory.isEmpty
-        self.currentDirectory = hasWorkingDirectory
+        let effectiveDirectory = hasWorkingDirectory
             ? trimmedWorkingDirectory
             : FileManager.default.homeDirectoryForCurrentUser.path
+        self.currentDirectory = effectiveDirectory
+        self.isInsideWorktree = Self.detectWorktree(in: effectiveDirectory)
 
         // Configure bonsplit with keepAllAlive to preserve terminal state
         // and keep split entry instantaneous.
@@ -607,7 +611,32 @@ final class Workspace: Identifiable, ObservableObject {
         // Update current directory if this is the focused panel
         if panelId == focusedPanelId, currentDirectory != trimmed {
             currentDirectory = trimmed
+            // Re-detect worktree when directory changes
+            let wt = Self.detectWorktree(in: trimmed)
+            if isInsideWorktree != wt { isInsideWorktree = wt }
         }
+    }
+
+    /// Detect if a directory is inside a git worktree.
+    /// In a worktree, `.git` is a file (containing `gitdir: ...`) instead of a directory.
+    static func detectWorktree(in directory: String) -> Bool {
+        let gitPath = (directory as NSString).appendingPathComponent(".git")
+        var isDir: ObjCBool = false
+        if FileManager.default.fileExists(atPath: gitPath, isDirectory: &isDir) {
+            return !isDir.boolValue  // .git is a file → worktree
+        }
+        // Walk up to find .git
+        var current = directory
+        while current != "/" && !current.isEmpty {
+            let parent = (current as NSString).deletingLastPathComponent
+            if parent == current { break }
+            current = parent
+            let parentGit = (current as NSString).appendingPathComponent(".git")
+            if FileManager.default.fileExists(atPath: parentGit, isDirectory: &isDir) {
+                return !isDir.boolValue
+            }
+        }
+        return false
     }
 
     func updatePanelGitBranch(panelId: UUID, branch: String, isDirty: Bool, dirtyFileCount: Int? = nil) {

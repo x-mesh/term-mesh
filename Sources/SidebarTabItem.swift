@@ -206,9 +206,10 @@ struct TabItemView: View {
                 }
 
                 HStack(spacing: 4) {
-                    if tab.worktreeName != nil {
-                        Text("🔀")
-                            .font(.system(size: 11))
+                    if tab.worktreeName != nil || tab.isInsideWorktree {
+                        Image(systemName: "arrow.triangle.swap")
+                            .font(.system(size: 10, weight: .bold))
+                            .foregroundColor(.green)
                     }
                     Text(tab.title)
                         .font(.system(size: 12.5, weight: titleFontWeight))

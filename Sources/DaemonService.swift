@@ -17,11 +17,12 @@ protocol DaemonService: AnyObject {
     func ping() -> Bool
 
     // MARK: - Worktree
-    func createWorktree(repoPath: String, branch: String?) -> WorktreeInfo?
-    func createWorktreeWithError(repoPath: String, branch: String?) -> Result<WorktreeInfo, WorktreeCreateError>
+    func createWorktree(repoPath: String, branch: String?, baseBranch: String?) -> WorktreeInfo?
+    func createWorktreeWithError(repoPath: String, branch: String?, baseBranch: String?) -> Result<WorktreeInfo, WorktreeCreateError>
     func findGitRoot(from path: String) -> String?
     func removeWorktree(repoPath: String, name: String) -> Bool
     func listWorktrees(repoPath: String) -> [WorktreeInfo]
+    func listBranches(repoPath: String) -> [String]
     func worktreeStatus(repoPath: String, name: String) -> TermMeshDaemon.WorktreeStatusResult
     func cleanupStaleWorktrees(repoPath: String) -> (removed: Int, skippedDirty: Int)
 
@@ -49,6 +50,15 @@ protocol DaemonService: AnyObject {
 
     // MARK: - Low-Level RPC
     func rpcCallRaw(method: String, params: [String: Any]) -> String?
+}
+
+extension DaemonService {
+    func createWorktree(repoPath: String, branch: String?) -> WorktreeInfo? {
+        createWorktree(repoPath: repoPath, branch: branch, baseBranch: nil)
+    }
+    func createWorktreeWithError(repoPath: String, branch: String?) -> Result<WorktreeInfo, WorktreeCreateError> {
+        createWorktreeWithError(repoPath: repoPath, branch: branch, baseBranch: nil)
+    }
 }
 
 extension TermMeshDaemon: DaemonService {}

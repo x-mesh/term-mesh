@@ -13,6 +13,9 @@ pub struct CreateParams {
     /// Worktree is created at `{base_dir}/{repo_name}/term-mesh_wt_{uuid}`.
     /// Defaults to `~/.term-mesh/worktrees/{repo_name}/`.
     pub base_dir: Option<String>,
+    /// Optional base ref (branch/tag/commit) to branch from.
+    /// Defaults to HEAD if not specified.
+    pub base_ref: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -40,13 +43,20 @@ pub fn create(params: serde_json::Value) -> Result<WorktreeInfo, String> {
         .branch
         .unwrap_or_else(|| format!("term-mesh/{short_id}"));
 
-    // Resolve HEAD to create the branch
-    let head = repo
-        .head()
-        .map_err(|e| format!("cannot resolve HEAD: {e}"))?;
-    let commit = head
-        .peel_to_commit()
-        .map_err(|e| format!("HEAD is not a commit: {e}"))?;
+    // Resolve base ref (or HEAD) to create the branch from
+    let commit = if let Some(ref base) = params.base_ref {
+        let obj = repo
+            .revparse_single(base)
+            .map_err(|e| format!("cannot resolve base ref '{base}': {e}"))?;
+        obj.peel_to_commit()
+            .map_err(|e| format!("base ref '{base}' is not a commit: {e}"))?
+    } else {
+        let head = repo
+            .head()
+            .map_err(|e| format!("cannot resolve HEAD: {e}"))?;
+        head.peel_to_commit()
+            .map_err(|e| format!("HEAD is not a commit: {e}"))?
+    };
 
     // Create branch
     repo.branch(&branch_name, &commit, false)
@@ -97,6 +107,42 @@ pub fn create(params: serde_json::Value) -> Result<WorktreeInfo, String> {
         path: wt_path.to_string_lossy().into_owned(),
         branch: branch_name,
     })
+}
+
+/// List local branches for a repo.
+pub fn list_branches(params: serde_json::Value) -> Result<Vec<String>, String> {
+    #[derive(Deserialize)]
+    struct ListBranchesParams {
+        repo_path: String,
+    }
+
+    let params: ListBranchesParams =
+        serde_json::from_value(params).map_err(|e| format!("invalid params: {e}"))?;
+
+    let repo = Repository::open(&params.repo_path)
+        .map_err(|e| format!("cannot open repo at {}: {e}", params.repo_path))?;
+
+    let branches = repo
+        .branches(Some(git2::BranchType::Local))
+        .map_err(|e| format!("cannot list branches: {e}"))?;
+
+    let mut result: Vec<String> = branches
+        .filter_map(|b| b.ok())
+        .filter_map(|(b, _)| b.name().ok().flatten().map(|n| n.to_string()))
+        .collect();
+
+    // Sort with main/master first, then alphabetical
+    result.sort_by(|a, b| {
+        let a_primary = a == "main" || a == "master";
+        let b_primary = b == "main" || b == "master";
+        match (a_primary, b_primary) {
+            (true, false) => std::cmp::Ordering::Less,
+            (false, true) => std::cmp::Ordering::Greater,
+            _ => a.cmp(b),
+        }
+    });
+
+    Ok(result)
 }
 
 /// Remove a worktree by name.

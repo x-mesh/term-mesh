@@ -420,6 +420,71 @@ struct TitlebarLeadingInsetReader: NSViewRepresentable {
 
 enum WorktreeAssocKeys {
     nonisolated(unsafe) static var dataSource: UInt8 = 0
+    nonisolated(unsafe) static var creationHandler: UInt8 = 0
+}
+
+// MARK: - Worktree Creation Handler
+
+@MainActor
+final class WorktreeCreationHandler: NSObject {
+    weak var panel: NSPanel?
+    let branchPopup: NSPopUpButton
+    let nameField: NSTextField
+    let repoPath: String
+    let tabManager: TabManager
+
+    init(panel: NSPanel, branchPopup: NSPopUpButton, nameField: NSTextField, repoPath: String, tabManager: TabManager) {
+        self.panel = panel
+        self.branchPopup = branchPopup
+        self.nameField = nameField
+        self.repoPath = repoPath
+        self.tabManager = tabManager
+    }
+
+    @objc func cancel(_ sender: Any?) {
+        panel?.close()
+    }
+
+    @objc func create(_ sender: Any?) {
+        let baseBranch = branchPopup.titleOfSelectedItem ?? "main"
+        let worktreeName = nameField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        let repoPath = self.repoPath
+        let tabManager = self.tabManager
+
+        panel?.close()
+
+        let daemon = TermMeshDaemon.shared
+        DispatchQueue.global(qos: .userInitiated).async {
+            // If user gave a name, use it as the branch name (prefixed with term-mesh/)
+            let branch: String? = worktreeName.isEmpty ? nil : "term-mesh/\(worktreeName)"
+            switch daemon.createWorktreeWithError(repoPath: repoPath, branch: branch, baseBranch: baseBranch) {
+            case .success(let info):
+                DispatchQueue.main.async {
+                    let ws = tabManager.addWorkspace(workingDirectory: info.path)
+                    ws.worktreeName = info.name
+                    ws.worktreeRepoPath = repoPath
+                    let displayName = worktreeName.isEmpty ? info.branch : worktreeName
+                    tabManager.setCustomTitle(tabId: ws.id, title: "[\(displayName)] from \(baseBranch)")
+                }
+            case .failure(let error):
+                DispatchQueue.main.async {
+                    let alert = NSAlert()
+                    alert.messageText = "Worktree Creation Failed"
+                    switch error {
+                    case .daemonNotConnected:
+                        alert.informativeText = "term-meshd daemon is not running."
+                    case .notGitRepo:
+                        alert.informativeText = "Current directory is not a git repository."
+                    case .rpcError(let detail):
+                        alert.informativeText = "Failed to create worktree: \(detail)"
+                    }
+                    alert.alertStyle = .warning
+                    alert.addButton(withTitle: "OK")
+                    alert.runModal()
+                }
+            }
+        }
+    }
 }
 
 @MainActor
@@ -451,6 +516,13 @@ final class WorktreeTableDataSource: NSObject, NSTableViewDataSource, NSTableVie
             container.alignment = .centerY
             container.edgeInsets = NSEdgeInsets(top: 0, left: 4, bottom: 0, right: 4)
 
+            let renameButton = NSButton(image: NSImage(systemSymbolName: "pencil", accessibilityDescription: "Rename")!, target: self, action: #selector(renameRow(_:)))
+            renameButton.bezelStyle = .rounded
+            renameButton.tag = row
+            renameButton.controlSize = .small
+            renameButton.isBordered = false
+            renameButton.toolTip = "Rename Worktree"
+
             let copyButton = NSButton(image: NSImage(systemSymbolName: "doc.on.doc", accessibilityDescription: "Copy Path")!, target: self, action: #selector(copyPath(_:)))
             copyButton.bezelStyle = .rounded
             copyButton.tag = row
@@ -473,6 +545,7 @@ final class WorktreeTableDataSource: NSObject, NSTableViewDataSource, NSTableVie
             deleteButton.contentTintColor = .systemRed
             deleteButton.toolTip = "Delete Worktree"
 
+            container.addArrangedSubview(renameButton)
             container.addArrangedSubview(copyButton)
             container.addArrangedSubview(terminalButton)
             container.addArrangedSubview(deleteButton)
@@ -505,6 +578,38 @@ final class WorktreeTableDataSource: NSObject, NSTableViewDataSource, NSTableVie
         ])
 
         return cell
+    }
+
+    @objc func renameRow(_ sender: NSButton) {
+        let row = sender.tag
+        guard row < worktrees.count else { return }
+        let wt = worktrees[row]
+
+        let alert = NSAlert()
+        alert.messageText = "Rename Worktree"
+        alert.informativeText = "Enter a new display name for \"\(wt.name)\" (branch: \(wt.branch)):"
+        alert.addButton(withTitle: "Rename")
+        alert.addButton(withTitle: "Cancel")
+
+        let nameField = NSTextField(frame: NSRect(x: 0, y: 0, width: 300, height: 24))
+        nameField.stringValue = wt.name
+        nameField.placeholderString = "Worktree display name"
+        alert.accessoryView = nameField
+        alert.window.initialFirstResponder = nameField
+
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        let newName = nameField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !newName.isEmpty else { return }
+
+        // Update the display name in any open workspace tab that uses this worktree
+        if let tabManager = AppDelegate.shared?.preferredMainWindowContextForServiceWorkspace()?.tabManager {
+            for ws in tabManager.tabs where ws.worktreeName == wt.name {
+                tabManager.setCustomTitle(tabId: ws.id, title: newName)
+            }
+        }
+
+        // Refresh table (display name is stored in the workspace tab title, not in WorktreeInfo)
+        tableView?.reloadData()
     }
 
     @objc func copyPath(_ sender: NSButton) {

@@ -170,15 +170,16 @@ final class TermMeshDaemon: ObservableObject {
 
     /// Create a worktree sandbox for the given repo path.
     /// Returns the worktree path on success, nil on failure.
-    func createWorktree(repoPath: String, branch: String? = nil) -> WorktreeInfo? {
+    func createWorktree(repoPath: String, branch: String? = nil, baseBranch: String? = nil) -> WorktreeInfo? {
         var params: [String: Any] = ["repo_path": repoPath, "base_dir": worktreeBaseDir]
         if let branch { params["branch"] = branch }
+        if let baseBranch { params["base_ref"] = baseBranch }
         guard let response = rpcCall(method: "worktree.create", params: params) else { return nil }
         return parseWorktreeInfo(response)
     }
 
     /// Create a worktree with detailed error reporting.
-    func createWorktreeWithError(repoPath: String, branch: String? = nil) -> Result<WorktreeInfo, WorktreeCreateError> {
+    func createWorktreeWithError(repoPath: String, branch: String? = nil, baseBranch: String? = nil) -> Result<WorktreeInfo, WorktreeCreateError> {
         // Check if CWD is inside a git repo (walk up to find .git)
         guard let gitRoot = findGitRoot(from: repoPath) else {
             return .failure(.notGitRepo)
@@ -191,11 +192,20 @@ final class TermMeshDaemon: ObservableObject {
 
         var params: [String: Any] = ["repo_path": gitRoot, "base_dir": worktreeBaseDir]
         if let branch { params["branch"] = branch }
+        if let baseBranch { params["base_ref"] = baseBranch }
         guard let response = rpcCall(method: "worktree.create", params: params),
               let info = parseWorktreeInfo(response) else {
             return .failure(.rpcError("Worktree creation failed"))
         }
         return .success(info)
+    }
+
+    /// List local branches for a repo.
+    func listBranches(repoPath: String) -> [String] {
+        let params: [String: Any] = ["repo_path": repoPath]
+        guard let response = rpcCall(method: "worktree.list_branches", params: params),
+              let array = response as? [String] else { return [] }
+        return array
     }
 
     /// Walk up from `path` to find the nearest directory containing `.git`.

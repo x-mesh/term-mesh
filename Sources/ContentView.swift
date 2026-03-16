@@ -732,61 +732,117 @@ struct ContentView: View {
     }
 
     private func createWorktreeWorkspace() {
-        let daemon = self.daemonService
+        let daemon = TermMeshDaemon.shared
         guard let workspace = tabManager.selectedWorkspace else {
             NSSound.beep()
             return
         }
         let dir = workspace.currentDirectory
         DispatchQueue.global(qos: .userInitiated).async { [tabManager] in
-            guard let repoPath = daemon?.findGitRoot(from: dir), !repoPath.isEmpty else {
+            let repoPath = daemon.findGitRoot(from: dir) ?? ""
+            guard !repoPath.isEmpty else {
                 DispatchQueue.main.async {
                     let alert = NSAlert()
                     alert.messageText = "Not a Git Repository"
-                    alert.informativeText = "Current directory is not inside a git repository."
+                    alert.informativeText = "Current directory (\(dir)) is not inside a git repository."
                     alert.alertStyle = .warning
                     alert.addButton(withTitle: "OK")
                     alert.runModal()
                 }
                 return
             }
-            guard let result = daemon?.createWorktreeWithError(repoPath: repoPath, branch: nil) else {
-                DispatchQueue.main.async {
-                    let alert = NSAlert()
-                    alert.messageText = "Worktree Creation Failed"
-                    alert.informativeText = "Could not create worktree. Is the daemon running?"
-                    alert.alertStyle = .warning
-                    alert.addButton(withTitle: "OK")
-                    alert.runModal()
-                }
-                return
-            }
-            switch result {
-            case .success(let info):
-                DispatchQueue.main.async {
-                    let ws = tabManager.addWorkspace(workingDirectory: info.path)
-                    ws.worktreeName = info.name
-                    ws.worktreeRepoPath = repoPath
-                    tabManager.setCustomTitle(tabId: ws.id, title: "[\(info.branch)]")
-                }
-            case .failure(let error):
-                DispatchQueue.main.async {
-                    let alert = NSAlert()
-                    alert.messageText = "Worktree Creation Failed"
-                    switch error {
-                    case .daemonNotConnected:
-                        alert.informativeText = "term-meshd daemon is not running."
-                    case .notGitRepo:
-                        alert.informativeText = "Current directory is not a git repository."
-                    case .rpcError(let detail):
-                        alert.informativeText = "Failed to create worktree: \(detail)"
-                    }
-                    alert.alertStyle = .warning
-                    alert.addButton(withTitle: "OK")
-                    alert.runModal()
-                }
+            let branches = daemon.listBranches(repoPath: repoPath)
+            DispatchQueue.main.async {
+                Self.showWorktreeCreationSheet(
+                    repoPath: repoPath,
+                    branches: branches,
+                    tabManager: tabManager
+                )
             }
         }
+    }
+
+    @MainActor
+    private static func showWorktreeCreationSheet(
+        repoPath: String,
+        branches: [String],
+        tabManager: TabManager
+    ) {
+        let panel = NSPanel(
+            contentRect: NSRect(x: 0, y: 0, width: 420, height: 160),
+            styleMask: [.titled, .closable],
+            backing: .buffered,
+            defer: false
+        )
+        panel.title = "New Worktree Workspace"
+        panel.isFloatingPanel = true
+
+        let contentView = NSView(frame: NSRect(x: 0, y: 0, width: 420, height: 160))
+
+        // Base branch label + popup
+        let branchLabel = NSTextField(labelWithString: "Base branch:")
+        branchLabel.frame = NSRect(x: 20, y: 112, width: 100, height: 20)
+        branchLabel.font = .systemFont(ofSize: 13)
+        contentView.addSubview(branchLabel)
+
+        let branchPopup = NSPopUpButton(frame: NSRect(x: 130, y: 108, width: 270, height: 28))
+        let branchList = branches.isEmpty ? ["main"] : branches
+        branchPopup.addItems(withTitles: branchList)
+        if let mainIdx = branchList.firstIndex(of: "main") {
+            branchPopup.selectItem(at: mainIdx)
+        } else if let masterIdx = branchList.firstIndex(of: "master") {
+            branchPopup.selectItem(at: masterIdx)
+        }
+        contentView.addSubview(branchPopup)
+
+        // Worktree name label + field
+        let nameLabel = NSTextField(labelWithString: "Worktree name:")
+        nameLabel.frame = NSRect(x: 20, y: 72, width: 110, height: 20)
+        nameLabel.font = .systemFont(ofSize: 13)
+        contentView.addSubview(nameLabel)
+
+        let nameField = NSTextField(frame: NSRect(x: 130, y: 68, width: 270, height: 28))
+        nameField.placeholderString = "optional (e.g. fix-login-bug)"
+        contentView.addSubview(nameField)
+
+        // Buttons
+        let cancelButton = NSButton(title: "Cancel", target: nil, action: nil)
+        cancelButton.frame = NSRect(x: 220, y: 16, width: 80, height: 32)
+        cancelButton.bezelStyle = .rounded
+        cancelButton.keyEquivalent = "\u{1b}"
+        contentView.addSubview(cancelButton)
+
+        let createButton = NSButton(title: "Create", target: nil, action: nil)
+        createButton.frame = NSRect(x: 310, y: 16, width: 90, height: 32)
+        createButton.bezelStyle = .rounded
+        createButton.keyEquivalent = "\r"
+        contentView.addSubview(createButton)
+
+        // Repo info
+        let repoName = (repoPath as NSString).lastPathComponent
+        let repoLabel = NSTextField(labelWithString: "Repository: \(repoName)")
+        repoLabel.frame = NSRect(x: 20, y: 20, width: 190, height: 16)
+        repoLabel.font = .systemFont(ofSize: 11)
+        repoLabel.textColor = .secondaryLabelColor
+        contentView.addSubview(repoLabel)
+
+        panel.contentView = contentView
+        panel.center()
+        panel.makeKeyAndOrderFront(nil)
+
+        let handler = WorktreeCreationHandler(
+            panel: panel,
+            branchPopup: branchPopup,
+            nameField: nameField,
+            repoPath: repoPath,
+            tabManager: tabManager
+        )
+        objc_setAssociatedObject(panel, &WorktreeAssocKeys.creationHandler, handler, .OBJC_ASSOCIATION_RETAIN)
+
+        cancelButton.target = handler
+        cancelButton.action = #selector(WorktreeCreationHandler.cancel(_:))
+        createButton.target = handler
+        createButton.action = #selector(WorktreeCreationHandler.create(_:))
     }
 
     @MainActor
@@ -832,7 +888,7 @@ struct ContentView: View {
         tableView.headerView = nil
         tableView.columnAutoresizingStyle = .firstColumnOnlyAutoresizingStyle
 
-        let actionWidth: CGFloat = 100
+        let actionWidth: CGFloat = 130
         let nameCol = NSTableColumn(identifier: NSUserInterfaceItemIdentifier("name"))
         nameCol.title = "Worktree"
         nameCol.width = scrollView.frame.width - actionWidth
@@ -944,12 +1000,27 @@ struct ContentView: View {
                 }
             }
         }
-        // Worktree name
-        let wtName = tab.worktreeName ?? ""
+        // Worktree name — show user-friendly name from customTitle, not internal name
+        let hasWorktree = (tab.worktreeName != nil && !tab.worktreeName!.isEmpty)
+            || tab.isInsideWorktree
+        let wtName: String
+        if hasWorktree {
+            if let customTitle = tab.customTitle, !customTitle.isEmpty {
+                wtName = customTitle
+            } else if let rawWtName = tab.worktreeName, !rawWtName.isEmpty {
+                wtName = rawWtName
+            } else {
+                // Fallback: derive from directory
+                wtName = "worktree"
+            }
+        } else {
+            wtName = ""
+        }
         if titlebarWorktreeName != wtName { titlebarWorktreeName = wtName }
 
-        // Directory basename
-        let dirBase = (tab.currentDirectory as NSString).lastPathComponent
+        // Directory basename — skip when the workspace is a worktree (dirname is internal and redundant)
+        let rawDirBase = (tab.currentDirectory as NSString).lastPathComponent
+        let dirBase = hasWorktree ? "" : rawDirBase
         if titlebarDirBasename != dirBase { titlebarDirBasename = dirBase }
 
         // Listening ports
@@ -1372,7 +1443,14 @@ struct ContentView: View {
             openCommandPaletteSwitcher()
         })
 
-        view = AnyView(view.onReceive(NotificationCenter.default.publisher(for: .worktreeWorkspaceRequested)) { _ in
+        view = AnyView(view.onReceive(NotificationCenter.default.publisher(for: .worktreeWorkspaceRequested)) { notification in
+            let requestedWindow = notification.object as? NSWindow
+            guard Self.shouldHandleCommandPaletteRequest(
+                observedWindow: observedWindow,
+                requestedWindow: requestedWindow,
+                keyWindow: NSApp.keyWindow,
+                mainWindow: NSApp.mainWindow
+            ) else { return }
             createWorktreeWorkspace()
         })
 
@@ -2743,6 +2821,7 @@ struct ContentView: View {
                 commandId: "palette.newWorktreeWorkspace",
                 title: constant("New Worktree Workspace"),
                 subtitle: workspaceSubtitle,
+                shortcutHint: "⌘⌥⇧N",
                 keywords: ["worktree", "new", "workspace", "branch", "git", "sandbox", "isolate"],
                 when: { $0.bool(CommandPaletteContextKeys.hasWorkspace) }
             )
