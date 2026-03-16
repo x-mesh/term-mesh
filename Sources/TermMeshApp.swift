@@ -276,7 +276,6 @@ struct TermMeshApp: App {
                 Button("Term-Mesh Dashboard (Split)") {
                     openDashboardSplit()
                 }
-                .keyboardShortcut("d", modifiers: [.command, .shift])
                 Button(termMeshDaemon.worktreeEnabled
                     ? "✓ Worktree Sandbox"
                     : "  Worktree Sandbox"
@@ -620,19 +619,23 @@ struct TermMeshApp: App {
 
                 Divider()
 
-                splitCommandButton(title: "Split Right", shortcut: splitRightMenuShortcut) {
+                // Split shortcuts are handled by AppDelegate's local NSEvent monitor.
+                // Registering them as SwiftUI .keyboardShortcut() causes the menu
+                // system to process the shortcut independently, which can trigger
+                // WindowGroup to create a duplicate window.
+                splitCommandButton(title: "Split Right", shortcut: splitRightMenuShortcut, registerShortcut: false) {
                     performSplitFromMenu(direction: .right)
                 }
 
-                splitCommandButton(title: "Split Down", shortcut: splitDownMenuShortcut) {
+                splitCommandButton(title: "Split Down", shortcut: splitDownMenuShortcut, registerShortcut: false) {
                     performSplitFromMenu(direction: .down)
                 }
 
-                splitCommandButton(title: "Split Browser Right", shortcut: splitBrowserRightMenuShortcut) {
+                splitCommandButton(title: "Split Browser Right", shortcut: splitBrowserRightMenuShortcut, registerShortcut: false) {
                     performBrowserSplitFromMenu(direction: .right)
                 }
 
-                splitCommandButton(title: "Split Browser Down", shortcut: splitBrowserDownMenuShortcut) {
+                splitCommandButton(title: "Split Browser Down", shortcut: splitBrowserDownMenuShortcut, registerShortcut: false) {
                     performBrowserSplitFromMenu(direction: .down)
                 }
 
@@ -1040,7 +1043,17 @@ struct TermMeshApp: App {
 
     @ViewBuilder
     private func splitCommandButton(title: String, shortcut: StoredShortcut, action: @escaping () -> Void) -> some View {
-        if let key = shortcut.keyEquivalent {
+        splitCommandButton(title: title, shortcut: shortcut, registerShortcut: true, action: action)
+    }
+
+    /// When `registerShortcut` is false the menu item still shows the shortcut
+    /// hint text but does NOT register it as an NSMenuItem key equivalent.
+    /// Use this for shortcuts already handled by the local NSEvent monitor to
+    /// prevent SwiftUI from processing the shortcut independently (which can
+    /// cause WindowGroup to create a duplicate window).
+    @ViewBuilder
+    private func splitCommandButton(title: String, shortcut: StoredShortcut, registerShortcut: Bool, action: @escaping () -> Void) -> some View {
+        if registerShortcut, let key = shortcut.keyEquivalent {
             Button(title, action: action)
                 .keyboardShortcut(key, modifiers: shortcut.eventModifiers)
         } else {
