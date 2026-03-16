@@ -655,8 +655,19 @@ final class GhosttySurfaceScrollView: NSView {
                 self?.dismissIMEInputBar()
             },
             onCtrlC: { [weak self] in
-                // Send Ctrl+C (ETX) interrupt to the terminal
-                self?.surfaceView.sendIMEText("\u{03}")
+                guard let self, let surface = self.surfaceView.surface else { return }
+                // Send Ctrl+C as key event (enables Claude double Ctrl+C exit detection)
+                var keyEvent = ghostty_input_key_s()
+                keyEvent.action = GHOSTTY_ACTION_PRESS
+                keyEvent.keycode = 8  // 'c' key
+                keyEvent.mods = GHOSTTY_MODS_CTRL
+                keyEvent.consumed_mods = GHOSTTY_MODS_NONE
+                keyEvent.unshifted_codepoint = 0x63  // 'c'
+                keyEvent.composing = false
+                keyEvent.text = nil
+                _ = ghostty_surface_key(surface, keyEvent)
+                keyEvent.action = GHOSTTY_ACTION_RELEASE
+                _ = ghostty_surface_key(surface, keyEvent)
             },
             onSendKey: { [weak self] keycode, mods in
                 guard let self, let surface = self.surfaceView.surface else { return }

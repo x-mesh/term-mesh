@@ -627,7 +627,7 @@ final class IMETextView: NSTextView {
             insertNewline(nil)
             return
         }
-        // Ctrl+C → send interrupt (ETX) to terminal
+        // Ctrl+C → send ETX interrupt + key event (enables Claude double Ctrl+C exit)
         if event.keyCode == 8 && event.modifierFlags.contains(.control) {
             ctrlCHandler?()
             return
