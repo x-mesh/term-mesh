@@ -918,9 +918,32 @@
   #messages-card, #heatmap, #event-log { min-width: 0; }
   #messages-card { grid-column: span 6; }
   .section-anchor { scroll-margin-top: 24px; }
+  /* Hamburger toggle (hidden on desktop) */
+  .sidebar-toggle {
+    display: none;
+    position: fixed; top: 10px; left: 10px; z-index: 1100;
+    background: #1e293b; border: none; border-radius: 8px;
+    width: 40px; height: 40px; cursor: pointer; align-items: center; justify-content: center;
+    box-shadow: 0 2px 12px rgba(0,0,0,0.18);
+  }
+  .sidebar-toggle svg { width: 22px; height: 22px; stroke: #fff; stroke-width: 2.5; }
+  .sidebar-overlay {
+    display: none; position: fixed; inset: 0; z-index: 1049;
+    background: rgba(0,0,0,0.3); backdrop-filter: blur(2px);
+  }
   @media (max-width: 1100px) {
     .app-shell { grid-template-columns: 1fr; }
-    .sidebar { position: relative; height: auto; }
+    .sidebar-toggle { display: flex; }
+    .sidebar {
+      position: fixed; top: 0; left: 0; z-index: 1050;
+      height: 100vh; width: 260px;
+      transform: translateX(-100%);
+      transition: transform 0.2s ease;
+      box-shadow: 4px 0 20px rgba(0,0,0,0.1);
+    }
+    .sidebar.open { transform: translateX(0); }
+    .sidebar.open + .sidebar-overlay { display: block; }
+    .content-shell { padding-top: 52px; }
     .metrics-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   }
   @media (max-width: 760px) {
@@ -935,7 +958,10 @@
 </head>
 <body>
 <div class="app-shell">
-  <aside class="sidebar">
+  <button class="sidebar-toggle" id="sidebar-toggle" aria-label="Toggle menu">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><line x1="3" y1="6" x2="21" y2="6"/><line x1="3" y1="12" x2="21" y2="12"/><line x1="3" y1="18" x2="21" y2="18"/></svg>
+  </button>
+  <aside class="sidebar" id="sidebar">
     <div class="sidebar-brand">
       <div class="brand-mark">
         <img id="brand-logo" alt="Term-Mesh logo" />
@@ -974,6 +1000,7 @@
       <div class="meta" id="sidebar-socket">Waiting for instance sync</div>
     </div>
   </aside>
+  <div class="sidebar-overlay" id="sidebar-overlay"></div>
 
   <main class="content-shell">
     <div class="topbar section-anchor" id="overview">
@@ -2783,6 +2810,23 @@ initTimelineChart();
 renderTeamTaskToolbar();
 initMessagesUI();
 updateBrandLogo();
+
+// Sidebar toggle for small screens
+(function() {
+  const toggle = document.getElementById('sidebar-toggle');
+  const sidebar = document.getElementById('sidebar');
+  const overlay = document.getElementById('sidebar-overlay');
+  function open() { sidebar.classList.add('open'); }
+  function close() { sidebar.classList.remove('open'); }
+  toggle.addEventListener('click', function() {
+    sidebar.classList.contains('open') ? close() : open();
+  });
+  overlay.addEventListener('click', close);
+  // Close sidebar when a nav link is clicked
+  sidebar.querySelectorAll('.sidebar-nav a').forEach(function(a) {
+    a.addEventListener('click', close);
+  });
+})();
 </script>
 </body>
 </html>
