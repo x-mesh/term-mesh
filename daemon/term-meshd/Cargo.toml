@@ -13,7 +13,7 @@ path = "src/main.rs"
 tokio = { version = "1", features = ["full"] }
 
 # Git worktree orchestration (F-01)
-git2 = "0.19"
+git2 = { version = "0.19", features = ["vendored-openssl"] }
 
 # Serialization (JSON-RPC over Unix Socket)
 serde = { version = "1", features = ["derive"] }
