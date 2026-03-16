@@ -1134,7 +1134,11 @@ final class GhosttySurfaceScrollView: NSView {
 
         guard isActive else { return }
         guard surfaceView.terminalSurface?.searchState == nil else { return }
-        guard findIMETextView() == nil else { return }
+        // If IME bar is active, redirect focus there instead of the terminal surface.
+        if let imeTextView = findIMETextView() {
+            if let window { window.makeFirstResponder(imeTextView) }
+            return
+        }
         guard let window else { return }
         guard surfaceView.isVisibleInUI else {
             retry()
