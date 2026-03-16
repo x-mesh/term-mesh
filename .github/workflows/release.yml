@@ -248,7 +248,9 @@ jobs:
           fi
           APP_PATH="build/Build/Products/Release/term-mesh.app"
           ZIP_SUBMIT="term-mesh-notary.zip"
+          VERSION="${GITHUB_REF_NAME#v}"
           DMG_RELEASE="term-mesh-macos.dmg"
+          DMG_VERSIONED="term-mesh-${VERSION}-macos.dmg"
           ditto -c -k --sequesterRsrc --keepParent "$APP_PATH" "$ZIP_SUBMIT"
           APP_SUBMIT_JSON="$(xcrun notarytool submit "$ZIP_SUBMIT" --apple-id "$APPLE_ID" --team-id "$APPLE_TEAM_ID" --password "$APPLE_APP_SPECIFIC_PASSWORD" --wait --output-format json)"
           APP_SUBMIT_ID="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])' <<<"$APP_SUBMIT_JSON")"
@@ -278,6 +280,7 @@ jobs:
           fi
           xcrun stapler staple "$DMG_RELEASE"
           xcrun stapler validate "$DMG_RELEASE"
+          cp "$DMG_RELEASE" "$DMG_VERSIONED"
 
       - name: Upload dSYMs to Sentry
         if: steps.guard_release_assets.outputs.skip_all != 'true'
@@ -310,6 +313,7 @@ jobs:
         with:
           files: |
             term-mesh-macos.dmg
+            term-mesh-*-macos.dmg
             appcast.xml
           generate_release_notes: true
           overwrite_files: false

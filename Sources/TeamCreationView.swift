@@ -21,13 +21,15 @@ struct TeamCreationView: View {
     @ObservedObject var templateManager = TeamTemplateManager.shared
     @ObservedObject var providerDetector = ProviderDetector.shared
 
-    var onCreate: ((_ teamName: String, _ leaderMode: String, _ agents: [TeamAgentRow]) -> Void)?
+    var onCreate: ((_ teamName: String, _ leaderMode: String, _ leaderModel: String, _ agents: [TeamAgentRow]) -> Void)?
 
     @AppStorage("teamDefaultLeaderMode") private var defaultLeaderMode = "claude"
     @AppStorage("teamDefaultModel") private var defaultModel = "sonnet"
+    @AppStorage("teamDefaultLeaderModel") private var defaultLeaderModel = "sonnet"
 
     @State private var teamName = "my-team"
     @State private var leaderMode = "repl"  // "repl" or "claude"
+    @State private var leaderModel = "sonnet"
     @State private var agents: [TeamAgentRow] = []
     @State private var showPresetEditor = false
     @State private var showSaveTemplate = false
@@ -77,6 +79,7 @@ struct TeamCreationView: View {
         .background(Color(nsColor: .windowBackgroundColor))
         .onAppear {
             leaderMode = defaultLeaderMode
+            leaderModel = defaultLeaderModel
             bulkModel = defaultModel
             if agents.isEmpty {
                 applyQuickPreset(count: 2)
@@ -191,13 +194,32 @@ struct TeamCreationView: View {
                     .buttonStyle(.borderless)
                     .help("Change all agents' CLI to \(leaderMode.capitalized)")
                 }
-                Picker("", selection: $leaderMode) {
+                Picker("", selection: Binding(
+                    get: { leaderMode },
+                    set: { newMode in
+                        let oldMode = leaderMode
+                        leaderMode = newMode
+                        // Reset model to CLI default when switching CLI families
+                        if newMode != "repl" && AgentRolePreset.models(for: oldMode) != AgentRolePreset.models(for: newMode) {
+                            leaderModel = AgentRolePreset.defaultModel(for: newMode)
+                        }
+                    }
+                )) {
                     Text("REPL (Manual)").tag("repl")
                     ForEach(AgentRolePreset.supportedCLIs, id: \.self) { cli in
                         Text("\(cli.capitalized) (Auto)").tag(cli)
                     }
                 }
                 .frame(width: 180)
+
+                if leaderMode != "repl" {
+                    Picker("", selection: $leaderModel) {
+                        ForEach(AgentRolePreset.models(for: leaderMode), id: \.self) { m in
+                            Text(m).tag(m)
+                        }
+                    }
+                    .frame(width: 130)
+                }
             }
         }
     }
@@ -814,7 +836,8 @@ struct TeamCreationView: View {
     }
 
     private func createTeam() {
-        onCreate?(teamName, leaderMode, agents)
+        defaultLeaderModel = leaderModel
+        onCreate?(teamName, leaderMode, leaderModel, agents)
         dismiss()
     }
 

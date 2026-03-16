@@ -665,7 +665,13 @@ final class TermMeshDaemon: ObservableObject {
             if !path.hasPrefix("/daemon") && fm.fileExists(atPath: path) { return path }
         }
 
-        // Option 2: Next to the app bundle
+        // Option 2a: In app bundle Resources/bin/ (release DMG layout)
+        if let resourcePath = Bundle.main.resourcePath {
+            let resourceBinPath = (resourcePath as NSString).appendingPathComponent("bin/term-meshd")
+            if fm.fileExists(atPath: resourceBinPath) { return resourceBinPath }
+        }
+
+        // Option 2b: Next to the app executable (legacy layout)
         if let bundlePath = Bundle.main.executablePath {
             let dir = (bundlePath as NSString).deletingLastPathComponent
             let bundledPath = (dir as NSString).appendingPathComponent("term-meshd")

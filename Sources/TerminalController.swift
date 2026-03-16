@@ -1914,6 +1914,7 @@ class TerminalController {
         let workingDirectory = params["working_directory"] as? String ?? FileManager.default.currentDirectoryPath
         let leaderSessionId = params["leader_session_id"] as? String ?? UUID().uuidString
         let leaderMode = params["leader_mode"] as? String ?? "repl"
+        let leaderModel = params["leader_model"] as? String ?? "sonnet"
         let agents = agentsParam.map { dict -> (name: String, cli: String, model: String, agentType: String, color: String, instructions: String) in
             (
                 name: dict["name"] as? String ?? "agent",
@@ -1935,6 +1936,7 @@ class TerminalController {
                 workingDirectory: workingDirectory,
                 leaderSessionId: leaderSessionId,
                 leaderMode: leaderMode,
+                leaderModel: leaderModel,
                 tabManager: tabManager
             ) {
                 return V2CallResult.ok([
@@ -2707,6 +2709,7 @@ class TerminalController {
         }
 
         let leaderMode = params["leader_mode"] as? String ?? "repl"
+        let leaderModel = params["leader_model"] as? String ?? "sonnet"
 
         var result: V2CallResult = .err(code: "internal_error", message: "Failed to create team", data: nil)
         v2MainSync {
@@ -2716,6 +2719,7 @@ class TerminalController {
                 workingDirectory: workingDirectory,
                 leaderSessionId: leaderSessionId,
                 leaderMode: leaderMode,
+                leaderModel: leaderModel,
                 tabManager: tabManager
             ) {
                 result = .ok([

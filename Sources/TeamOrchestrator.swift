@@ -31,6 +31,7 @@ final class TeamOrchestrator {
         let id: String            // team name
         let leaderSessionId: String
         let leaderMode: String    // "repl", "claude", "kiro", "codex", "gemini"
+        let leaderModel: String   // e.g. "sonnet", "opus", "haiku"
         let leaderPanelId: UUID   // leader pane for sending instructions
         let workingDirectory: String
         let workspaceId: UUID     // single workspace for all agents
@@ -226,6 +227,7 @@ final class TeamOrchestrator {
         workingDirectory: String,
         leaderSessionId: String,
         leaderMode: String = "repl",
+        leaderModel: String = "sonnet",
         tabManager: TabManager
     ) -> Team? {
         guard !agents.isEmpty else { return nil }
@@ -343,21 +345,25 @@ final class TeamOrchestrator {
                 // Escape single quotes for shell, same approach as buildClaudeCommand
                 let escaped = systemPrompt.replacingOccurrences(of: "'", with: "'\\''")
                 let quotedPath = claudePath.contains(" ") ? "\"\(claudePath)\"" : claudePath
-                leaderCommand = "\(quotedPath) --system-prompt '\(escaped)' --dangerously-skip-permissions"
+                var claudeLeaderParts = ["\(quotedPath)", "--system-prompt '\(escaped)'", "--dangerously-skip-permissions"]
+                if !leaderModel.isEmpty && leaderModel != "sonnet" {
+                    claudeLeaderParts.append("--model \(leaderModel)")
+                }
+                leaderCommand = claudeLeaderParts.joined(separator: " ")
             } else {
                 leaderCommand = nil
             }
         case "kiro":
             if let path = agentBinaryPath(cli: "kiro") {
-                leaderCommand = buildKiroCommand(kiroPath: path, agentName: "leader", teamName: name, model: "sonnet", isLeader: true)
+                leaderCommand = buildKiroCommand(kiroPath: path, agentName: "leader", teamName: name, model: leaderModel, isLeader: true)
             } else { leaderCommand = nil }
         case "codex":
             if let path = agentBinaryPath(cli: "codex") {
-                leaderCommand = buildCodexCommand(codexPath: path, agentName: "leader", teamName: name, model: "sonnet")
+                leaderCommand = buildCodexCommand(codexPath: path, agentName: "leader", teamName: name, model: leaderModel)
             } else { leaderCommand = nil }
         case "gemini":
             if let path = agentBinaryPath(cli: "gemini") {
-                leaderCommand = buildGeminiCommand(geminiPath: path, agentName: "leader", teamName: name, model: "sonnet")
+                leaderCommand = buildGeminiCommand(geminiPath: path, agentName: "leader", teamName: name, model: leaderModel)
             } else { leaderCommand = nil }
         default:
             leaderCommand = nil
@@ -588,6 +594,7 @@ final class TeamOrchestrator {
             id: name,
             leaderSessionId: leaderSessionId,
             leaderMode: leaderMode,
+            leaderModel: leaderModel,
             leaderPanelId: leaderPanelId,
             workingDirectory: workingDirectory,
             workspaceId: workspace.id,
@@ -751,19 +758,19 @@ final class TeamOrchestrator {
 
         ## Message Channel
         ```
-        \(tmAgent) msg-list
-        \(tmAgent) msg-list --from <agent_name>
+        \(tmAgent) msg list
+        \(tmAgent) msg list --from <agent_name>
         ```
 
         ## Task Board
         ```
-        \(tmAgent) task-create '<title>' --assign <agent_name> --priority 2
-        \(tmAgent) tasks
-        \(tmAgent) task-get <id>
+        \(tmAgent) task create '<title>' --assign <agent_name> --priority 2
+        \(tmAgent) task list
+        \(tmAgent) task get <id>
         \(tmAgent) task-start <id> --assign <agent_name>
-        \(tmAgent) task-block <id> '<reason>'
-        \(tmAgent) task-review <id> '<summary>'
-        \(tmAgent) task-done <id> '<result>'
+        \(tmAgent) task block <id> '<reason>'
+        \(tmAgent) task review <id> '<summary>'
+        \(tmAgent) task done <id> '<result>'
         ```
 
         ## Your Role
@@ -880,19 +887,19 @@ final class TeamOrchestrator {
 
         ## Message Channel
         ```
-        \(tmAgent) msg-list
-        \(tmAgent) msg-list --from <agent_name>
+        \(tmAgent) msg list
+        \(tmAgent) msg list --from <agent_name>
         ```
 
         ## Task Board
         ```
-        \(tmAgent) task-create '<title>' --assign <agent_name> --priority 2
-        \(tmAgent) tasks
-        \(tmAgent) task-get <id>
+        \(tmAgent) task create '<title>' --assign <agent_name> --priority 2
+        \(tmAgent) task list
+        \(tmAgent) task get <id>
         \(tmAgent) task-start <id> --assign <agent_name>
-        \(tmAgent) task-block <id> '<reason>'
-        \(tmAgent) task-review <id> '<summary>'
-        \(tmAgent) task-done <id> '<result>'
+        \(tmAgent) task block <id> '<reason>'
+        \(tmAgent) task review <id> '<summary>'
+        \(tmAgent) task done <id> '<result>'
         ```
         \(worktreeSection)
 

@@ -147,6 +147,9 @@ enum Commands {
         /// Set model for all agents (e.g. sonnet, opus, haiku)
         #[arg(long, default_value = "sonnet")]
         model: String,
+        /// Set model for the leader (e.g. opus, sonnet, haiku)
+        #[arg(long)]
+        leader_model: Option<String>,
         #[arg(long)]
         kiro: Option<String>,
         #[arg(long)]
@@ -223,6 +226,56 @@ enum Commands {
         #[arg(long)]
         from: Option<String>,
     },
+
+    // ── Legacy hyphenated aliases (hidden) ───────────────────────────
+    /// Alias: task-get → task get
+    #[command(name = "task-get", hide = true)]
+    TaskGet { id: String },
+    /// Alias: task-start → task start
+    #[command(name = "task-start", hide = true)]
+    TaskStart { task_id: String },
+    /// Alias: task-done → task done
+    #[command(name = "task-done", hide = true)]
+    TaskDone { task_id: String, result: Option<String> },
+    /// Alias: task-block → task block
+    #[command(name = "task-block", hide = true)]
+    TaskBlock { task_id: String, reason: Option<String> },
+    /// Alias: task-list → task list
+    #[command(name = "task-list", hide = true)]
+    TaskList,
+    /// Alias: tasks → task list
+    #[command(name = "tasks", hide = true)]
+    Tasks,
+    /// Alias: task-create → task create
+    #[command(name = "task-create", hide = true)]
+    TaskCreate2 {
+        title: String,
+        #[arg(long)]
+        assign: Option<String>,
+        #[arg(long)]
+        desc: Option<String>,
+        #[arg(long)]
+        priority: Option<u32>,
+        #[arg(long, num_args = 1..)]
+        accept: Vec<String>,
+        #[arg(long, num_args = 1..)]
+        deps: Vec<String>,
+    },
+    /// Alias: task-update → task update
+    #[command(name = "task-update", hide = true)]
+    TaskUpdate2 { id: String, status: String, result: Option<String> },
+    /// Alias: task-review → task review
+    #[command(name = "task-review", hide = true)]
+    TaskReview2 { id: String, summary: Option<String> },
+    /// Alias: task-reassign → task reassign
+    #[command(name = "task-reassign", hide = true)]
+    TaskReassign2 { id: String, agent: String },
+    /// Alias: task-unblock → task unblock
+    #[command(name = "task-unblock", hide = true)]
+    TaskUnblock2 { id: String },
+    /// Alias: task-clear → task clear
+    #[command(name = "task-clear", hide = true)]
+    TaskClear2,
 }
 
 #[derive(Subcommand)]
@@ -610,6 +663,67 @@ fn main() {
                 }
             }
         }
+        // ── Legacy hyphenated aliases ────────────────────────────────
+        Commands::TaskGet { id } => {
+            rpc_call(&sock, "team.task.get", json!({
+                "team_name": team, "task_id": id,
+            }))
+        }
+        Commands::TaskStart { task_id } => {
+            rpc_call(&sock, "team.task.update", json!({
+                "team_name": team, "task_id": task_id, "status": "in_progress",
+            }))
+        }
+        Commands::TaskDone { task_id, result } => {
+            rpc_call(&sock, "team.task.done", json!({
+                "team_name": team, "task_id": task_id,
+                "result": result.as_deref().unwrap_or("done"),
+            }))
+        }
+        Commands::TaskBlock { task_id, reason } => {
+            rpc_call(&sock, "team.task.block", json!({
+                "team_name": team, "task_id": task_id,
+                "blocked_reason": reason.as_deref().unwrap_or("blocked"),
+            }))
+        }
+        Commands::TaskList | Commands::Tasks => {
+            rpc_call(&sock, "team.task.list", json!({ "team_name": team }))
+        }
+        Commands::TaskCreate2 { title, assign, desc, priority, accept, deps } => {
+            let mut params = json!({ "team_name": team, "title": title });
+            if let Some(a) = assign { params["assignee"] = json!(a); }
+            if let Some(d) = desc { params["description"] = json!(d); }
+            if let Some(p) = priority { params["priority"] = json!(p); }
+            if !accept.is_empty() { params["acceptance_criteria"] = json!(accept); }
+            if !deps.is_empty() { params["depends_on"] = json!(deps); }
+            rpc_call(&sock, "team.task.create", params)
+        }
+        Commands::TaskUpdate2 { id, status, result } => {
+            let mut params = json!({
+                "team_name": team, "task_id": id, "status": status,
+            });
+            if let Some(r) = result { params["result"] = json!(r); }
+            rpc_call(&sock, "team.task.update", params)
+        }
+        Commands::TaskReview2 { id, summary } => {
+            rpc_call(&sock, "team.task.review", json!({
+                "team_name": team, "task_id": id,
+                "summary": summary.as_deref().unwrap_or(""),
+            }))
+        }
+        Commands::TaskReassign2 { id, agent: ref target } => {
+            rpc_call(&sock, "team.task.reassign", json!({
+                "team_name": team, "task_id": id, "assignee": target,
+            }))
+        }
+        Commands::TaskUnblock2 { id } => {
+            rpc_call(&sock, "team.task.unblock", json!({
+                "team_name": team, "task_id": id,
+            }))
+        }
+        Commands::TaskClear2 => {
+            rpc_call(&sock, "team.task.clear", json!({ "team_name": team }))
+        }
         Commands::Status => {
             rpc_call(&sock, "team.status", json!({ "team_name": team }))
         }
@@ -681,8 +795,8 @@ fn main() {
             rpc_call(&sock, "team.result.collect", json!({ "team_name": team }))
         }
         // ── Orchestration commands ──────────────────────────────
-        Commands::Create { count, claude_leader, model, kiro, codex, gemini } => {
-            run_create(&sock, &team, count.unwrap_or(2), claude_leader, &model, &kiro, &codex, &gemini);
+        Commands::Create { count, claude_leader, model, leader_model, kiro, codex, gemini } => {
+            run_create(&sock, &team, count.unwrap_or(2), claude_leader, &model, leader_model.as_deref(), &kiro, &codex, &gemini);
             return;
         }
         Commands::Send { agent: ref target, text, no_report } => {
@@ -746,9 +860,10 @@ fn print_result(result: Result<Value, String>) {
 
 fn run_create(
     sock: &PathBuf, team: &str, count: u32, claude_leader: bool,
-    model: &str, kiro: &Option<String>, codex: &Option<String>, gemini: &Option<String>,
+    model: &str, leader_model: Option<&str>, kiro: &Option<String>, codex: &Option<String>, gemini: &Option<String>,
 ) {
     let leader_mode = if claude_leader { "claude" } else { "repl" };
+    let leader_model = leader_model.unwrap_or(model);
     let kiro_agents = parse_cli_flag(kiro);
     let codex_agents = parse_cli_flag(codex);
     let gemini_agents = parse_cli_flag(gemini);
@@ -807,6 +922,7 @@ fn run_create(
         "working_directory": workdir,
         "leader_session_id": format!("leader-{}", process::id()),
         "leader_mode": leader_mode,
+        "leader_model": leader_model,
         "agents": agents,
     }), 5) {
         Ok(v) => v,
