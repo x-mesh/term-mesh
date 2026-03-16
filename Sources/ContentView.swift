@@ -731,6 +731,64 @@ struct ContentView: View {
         }
     }
 
+    private func createWorktreeWorkspace() {
+        let daemon = self.daemonService
+        guard let workspace = tabManager.selectedWorkspace else {
+            NSSound.beep()
+            return
+        }
+        let dir = workspace.currentDirectory
+        DispatchQueue.global(qos: .userInitiated).async { [tabManager] in
+            guard let repoPath = daemon?.findGitRoot(from: dir), !repoPath.isEmpty else {
+                DispatchQueue.main.async {
+                    let alert = NSAlert()
+                    alert.messageText = "Not a Git Repository"
+                    alert.informativeText = "Current directory is not inside a git repository."
+                    alert.alertStyle = .warning
+                    alert.addButton(withTitle: "OK")
+                    alert.runModal()
+                }
+                return
+            }
+            guard let result = daemon?.createWorktreeWithError(repoPath: repoPath, branch: nil) else {
+                DispatchQueue.main.async {
+                    let alert = NSAlert()
+                    alert.messageText = "Worktree Creation Failed"
+                    alert.informativeText = "Could not create worktree. Is the daemon running?"
+                    alert.alertStyle = .warning
+                    alert.addButton(withTitle: "OK")
+                    alert.runModal()
+                }
+                return
+            }
+            switch result {
+            case .success(let info):
+                DispatchQueue.main.async {
+                    let ws = tabManager.addWorkspace(workingDirectory: info.path)
+                    ws.worktreeName = info.name
+                    ws.worktreeRepoPath = repoPath
+                    tabManager.setCustomTitle(tabId: ws.id, title: "[\(info.branch)]")
+                }
+            case .failure(let error):
+                DispatchQueue.main.async {
+                    let alert = NSAlert()
+                    alert.messageText = "Worktree Creation Failed"
+                    switch error {
+                    case .daemonNotConnected:
+                        alert.informativeText = "term-meshd daemon is not running."
+                    case .notGitRepo:
+                        alert.informativeText = "Current directory is not a git repository."
+                    case .rpcError(let detail):
+                        alert.informativeText = "Failed to create worktree: \(detail)"
+                    }
+                    alert.alertStyle = .warning
+                    alert.addButton(withTitle: "OK")
+                    alert.runModal()
+                }
+            }
+        }
+    }
+
     @MainActor
     static func showWorktreeManager(worktrees: [WorktreeInfo], repoPath: String) {
         let panel = NSPanel(
@@ -1312,6 +1370,10 @@ struct ContentView: View {
                 mainWindow: NSApp.mainWindow
             ) else { return }
             openCommandPaletteSwitcher()
+        })
+
+        view = AnyView(view.onReceive(NotificationCenter.default.publisher(for: .worktreeWorkspaceRequested)) { _ in
+            createWorktreeWorkspace()
         })
 
         view = AnyView(view.onReceive(NotificationCenter.default.publisher(for: .commandPaletteRenameTabRequested)) { notification in
@@ -2678,6 +2740,15 @@ struct ContentView: View {
         )
         contributions.append(
             CommandPaletteCommandContribution(
+                commandId: "palette.newWorktreeWorkspace",
+                title: constant("New Worktree Workspace"),
+                subtitle: workspaceSubtitle,
+                keywords: ["worktree", "new", "workspace", "branch", "git", "sandbox", "isolate"],
+                when: { $0.bool(CommandPaletteContextKeys.hasWorkspace) }
+            )
+        )
+        contributions.append(
+            CommandPaletteCommandContribution(
                 commandId: "palette.clearWorkspaceName",
                 title: constant("Clear Workspace Name"),
                 subtitle: workspaceSubtitle,
@@ -3193,6 +3264,9 @@ struct ContentView: View {
             // Create directory if it doesn't exist
             try? FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
             NSWorkspace.shared.open(url)
+        }
+        registry.register(commandId: "palette.newWorktreeWorkspace") {
+            createWorktreeWorkspace()
         }
         registry.register(commandId: "palette.toggleWorkspacePin") {
             guard let workspace = tabManager.selectedWorkspace else {

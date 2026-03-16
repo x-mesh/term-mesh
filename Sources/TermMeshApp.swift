@@ -447,6 +447,11 @@ struct TermMeshApp: App {
                     activeTabManager.addTab()
                 }
 
+                Button("New Worktree Workspace") {
+                    NotificationCenter.default.post(name: .worktreeWorkspaceRequested, object: nil)
+                }
+                .keyboardShortcut("n", modifiers: [.command, .option, .shift])
+
                 Divider()
 
                 Button("New Agent Team…") {

@@ -36,19 +36,50 @@ extension TerminalController {
             return .err(code: "unavailable", message: "TabManager not available", data: nil)
         }
 
+        let cwd = params["cwd"] as? String
+        let command = params["command"] as? String
+        let title = params["title"] as? String
+        let forceWorktree = params["worktree"] as? Bool ?? false
+
         var newId: UUID?
+        var preCreatedWorktree: WorktreeInfo?
         let shouldFocus = v2FocusAllowed()
         #if DEBUG
         let startedAt = ProcessInfo.processInfo.systemUptime
         #endif
+
+        // Only manually create a worktree when forceWorktree is requested AND the global
+        // worktree toggle is OFF — if it's already ON, addWorkspace handles creation itself.
+        if forceWorktree, let effectiveCwd = cwd, !TermMeshDaemon.shared.worktreeEnabled {
+            let result = TermMeshDaemon.shared.createWorktreeWithError(repoPath: effectiveCwd, branch: nil)
+            if case .success(let info) = result {
+                preCreatedWorktree = info
+            }
+        }
+
+        let effectiveCwd = preCreatedWorktree?.path ?? cwd
+
         v2MainSync {
-            let ws = tabManager.addWorkspace(select: shouldFocus)
+            let ws = tabManager.addWorkspace(
+                workingDirectory: effectiveCwd,
+                select: shouldFocus,
+                command: command
+            )
             newId = ws.id
+            if let wt = preCreatedWorktree {
+                ws.worktreeName = wt.name
+                ws.worktreeRepoPath = TermMeshDaemon.shared.findGitRoot(from: cwd ?? "")
+            }
+            if let title = title {
+                tabManager.setCustomTitle(tabId: ws.id, title: title)
+            } else if let wt = preCreatedWorktree {
+                tabManager.setCustomTitle(tabId: ws.id, title: "[\(wt.branch)]")
+            }
         }
         #if DEBUG
         let elapsedMs = (ProcessInfo.processInfo.systemUptime - startedAt) * 1000.0
         dlog(
-            "socket.workspace.create focus=\(shouldFocus ? 1 : 0) ms=\(String(format: "%.2f", elapsedMs)) main=\(Thread.isMainThread ? 1 : 0)"
+            "socket.workspace.create focus=\(shouldFocus ? 1 : 0) cwd=\(effectiveCwd ?? "nil") worktree=\(forceWorktree) ms=\(String(format: "%.2f", elapsedMs)) main=\(Thread.isMainThread ? 1 : 0)"
         )
         #endif
 
@@ -56,12 +87,18 @@ extension TerminalController {
             return .err(code: "internal_error", message: "Failed to create workspace", data: nil)
         }
         let windowId = v2ResolveWindowId(tabManager: tabManager)
-        return .ok([
+        var result: [String: Any] = [
             "window_id": v2OrNull(windowId?.uuidString),
             "window_ref": v2Ref(kind: .window, uuid: windowId),
             "workspace_id": newId.uuidString,
             "workspace_ref": v2Ref(kind: .workspace, uuid: newId)
-        ])
+        ]
+        if let wt = preCreatedWorktree {
+            result["worktree_name"] = wt.name
+            result["worktree_branch"] = wt.branch
+            result["worktree_path"] = wt.path
+        }
+        return .ok(result)
     }
     func v2WorkspaceSelect(params: [String: Any]) -> V2CallResult {
         guard let tabManager = v2ResolveTabManager(params: params) else {
