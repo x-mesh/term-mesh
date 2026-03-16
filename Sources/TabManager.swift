@@ -1454,18 +1454,20 @@ class TabManager: ObservableObject {
 
                 let count = sessions.count
 
-                // Grid layout: balanced grid on the right side of the leader pane.
-                // Prefer fewer columns (max 3) so agent panes stay wide enough.
-                // Layout: [Leader | Col1 | Col2 | ...]  each column split into rows.
-                let numCols: Int
-                if count <= 3 {
-                    numCols = 1
-                } else if count <= 8 {
-                    numCols = 2
+                // Grid layout: aspect-ratio-aware grid on the right side of the leader pane.
+                // Chooses (cols, rows) so each agent pane is closest to square.
+                let snapshot = tab.bonsplitController.layoutSnapshot()
+                let containerSize: CGSize
+                if snapshot.containerFrame.width > 0, snapshot.containerFrame.height > 0 {
+                    containerSize = CGSize(width: snapshot.containerFrame.width, height: snapshot.containerFrame.height)
+                } else if let screen = NSScreen.main?.visibleFrame {
+                    containerSize = CGSize(width: screen.width, height: screen.height)
                 } else {
-                    numCols = 3
+                    containerSize = .zero
                 }
-                let numRows = Int(ceil(Double(count) / Double(numCols)))
+                let (numCols, _) = self.optimalGridDimensions(
+                    count: count, containerSize: containerSize, hasLeader: true
+                )
 
                 // Helper to bind a session to a newly created panel
                 var created = 0
@@ -1551,10 +1553,65 @@ class TabManager: ObservableObject {
         }
     }
 
-    /// Equalize split dividers so all leaf panes get uniform size.
-    /// Uses leaf-count weighting: ratio = leftLeaves / (leftLeaves + rightLeaves).
-    /// This correctly handles cascading splits (e.g., 3 rows → 1/3 + 1/3 + 1/3).
+    /// Compute optimal (cols, rows) so each pane's aspect ratio is closest to 1:1 (square).
+    /// Falls back to fixed column logic when container size is unavailable.
+    private func optimalGridDimensions(
+        count: Int,
+        containerSize: CGSize,
+        hasLeader: Bool
+    ) -> (cols: Int, rows: Int) {
+        guard count > 1 else { return (1, 1) }
+
+        // When a leader pane exists, agent area is roughly count/(count+1) of total width
+        let agentWidth: CGFloat
+        let agentHeight: CGFloat = containerSize.height
+        if hasLeader {
+            agentWidth = containerSize.width * CGFloat(count) / CGFloat(count + 1)
+        } else {
+            agentWidth = containerSize.width
+        }
+
+        guard agentWidth > 0, agentHeight > 0 else {
+            // Fallback: fixed column logic
+            if count <= 3 { return (1, count) }
+            if count <= 8 { return (2, Int(ceil(Double(count) / 2.0))) }
+            return (3, Int(ceil(Double(count) / 3.0)))
+        }
+
+        var bestCols = 1
+        var bestRatio = CGFloat.greatestFiniteMagnitude
+
+        for cols in 1...count {
+            let rows = Int(ceil(Double(count) / Double(cols)))
+            let cellW = agentWidth / CGFloat(cols)
+            let cellH = agentHeight / CGFloat(rows)
+            let ratio = max(cellW / cellH, cellH / cellW)
+
+            if ratio < bestRatio {
+                bestRatio = ratio
+                bestCols = cols
+            }
+        }
+
+        let bestRows = Int(ceil(Double(count) / Double(bestCols)))
+        return (bestCols, bestRows)
+    }
+
+    /// Equalize split dividers for uniform grid cells.
+    /// H-splits use column-count (equal column widths regardless of row count).
+    /// V-splits use leaf-count (equal row heights within each column).
     private func equalizeAgentGrid(workspace: Workspace) {
+        func columnCount(_ node: ExternalTreeNode) -> Int {
+            switch node {
+            case .pane: return 1
+            case .split(let s):
+                if s.orientation == "horizontal" {
+                    return columnCount(s.first) + columnCount(s.second)
+                } else {
+                    return 1
+                }
+            }
+        }
         func leafCount(_ node: ExternalTreeNode) -> Int {
             switch node {
             case .pane: return 1
@@ -1563,9 +1620,16 @@ class TabManager: ObservableObject {
         }
         func equalizeSplits(_ node: ExternalTreeNode) {
             guard case .split(let splitNode) = node else { return }
-            let left = leafCount(splitNode.first)
-            let right = leafCount(splitNode.second)
-            let ratio = Double(left) / Double(left + right)
+            let ratio: Double
+            if splitNode.orientation == "horizontal" {
+                let leftCols = columnCount(splitNode.first)
+                let rightCols = columnCount(splitNode.second)
+                ratio = Double(leftCols) / Double(leftCols + rightCols)
+            } else {
+                let leftLeaves = leafCount(splitNode.first)
+                let rightLeaves = leafCount(splitNode.second)
+                ratio = Double(leftLeaves) / Double(leftLeaves + rightLeaves)
+            }
             if let splitId = UUID(uuidString: splitNode.id) {
                 workspace.bonsplitController.setDividerPosition(CGFloat(ratio), forSplit: splitId)
             }
@@ -1611,25 +1675,19 @@ class TabManager: ObservableObject {
         // For new workspace, the first pane is already CLI 1 — create count-1 more splits
         let splitsNeeded = newWorkspace ? count - 1 : count
 
-        let numCols: Int
-        if newWorkspace {
-            // New workspace: all panes are equal, no leader — use full grid
-            if count <= 2 {
-                numCols = count
-            } else if count <= 6 {
-                numCols = Int(ceil(Double(count) / 2.0))
-            } else {
-                numCols = Int(ceil(Double(count) / 3.0))
-            }
+        // Aspect-ratio-aware grid: choose (cols, rows) so each pane is closest to square.
+        let snapshot = tab.bonsplitController.layoutSnapshot()
+        let containerSize: CGSize
+        if snapshot.containerFrame.width > 0, snapshot.containerFrame.height > 0 {
+            containerSize = CGSize(width: snapshot.containerFrame.width, height: snapshot.containerFrame.height)
+        } else if let screen = NSScreen.main?.visibleFrame {
+            containerSize = CGSize(width: screen.width, height: screen.height)
         } else {
-            if count <= 3 {
-                numCols = 1
-            } else if count <= 8 {
-                numCols = 2
-            } else {
-                numCols = 3
-            }
+            containerSize = .zero
         }
+        let (numCols, _) = optimalGridDimensions(
+            count: count, containerSize: containerSize, hasLeader: !newWorkspace
+        )
 
         // Get working directory
         let workDir = tab.panelDirectories[rootPanelId] ?? tab.currentDirectory

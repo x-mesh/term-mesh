@@ -1,3 +1,4 @@
+import AppKit
 import Bonsplit
 import Foundation
 import os
@@ -94,18 +95,105 @@ final class TeamOrchestrator {
     private let staleTaskThreshold: TimeInterval = 10 * 60
     private let staleHeartbeatThreshold: TimeInterval = 5 * 60
 
-    // MARK: - Balanced Split Layout
+    // MARK: - Aspect-Ratio-Aware Grid Layout
 
-    /// Compute the split orientation for agent at the given index in the balanced binary tree.
-    /// Left children (odd index) alternate from parent; right children (even index) keep parent's.
-    private func agentSplitOrientation(at index: Int) -> SplitOrientation {
-        if index == 0 { return .horizontal }
-        let parentIndex = (index - 1) / 2
-        let parentOrientation = agentSplitOrientation(at: parentIndex)
-        let isLeftChild = (index % 2 == 1)
-        return isLeftChild
-            ? (parentOrientation == .horizontal ? .vertical : .horizontal)
-            : parentOrientation
+    /// Compute optimal (cols, rows) so each pane's aspect ratio is closest to 1:1 (square).
+    /// Falls back to fixed column logic when container size is unavailable.
+    private func optimalGridDimensions(
+        count: Int,
+        containerSize: CGSize,
+        hasLeader: Bool
+    ) -> (cols: Int, rows: Int) {
+        guard count > 1 else { return (1, 1) }
+
+        let agentWidth: CGFloat
+        let agentHeight: CGFloat = containerSize.height
+        if hasLeader {
+            agentWidth = containerSize.width * CGFloat(count) / CGFloat(count + 1)
+        } else {
+            agentWidth = containerSize.width
+        }
+
+        guard agentWidth > 0, agentHeight > 0 else {
+            if count <= 3 { return (1, count) }
+            if count <= 8 { return (2, Int(ceil(Double(count) / 2.0))) }
+            return (3, Int(ceil(Double(count) / 3.0)))
+        }
+
+        var bestCols = 1
+        var bestRatio = CGFloat.greatestFiniteMagnitude
+
+        for cols in 1...count {
+            let rows = Int(ceil(Double(count) / Double(cols)))
+            let cellW = agentWidth / CGFloat(cols)
+            let cellH = agentHeight / CGFloat(rows)
+            let ratio = max(cellW / cellH, cellH / cellW)
+
+            if ratio < bestRatio {
+                bestRatio = ratio
+                bestCols = cols
+            }
+        }
+
+        let bestRows = Int(ceil(Double(count) / Double(bestCols)))
+        return (bestCols, bestRows)
+    }
+
+    /// Equalize agent pane splits, skipping the root leader|agents split.
+    /// H-splits use column-count (equal column widths regardless of row count).
+    /// V-splits use leaf-count (equal row heights within each column).
+    private func equalizeAgentGrid(workspace: Workspace) {
+        /// Count columns in a subtree: H-splits add children's columns, V-splits count as 1.
+        func columnCount(_ node: ExternalTreeNode) -> Int {
+            switch node {
+            case .pane: return 1
+            case .split(let s):
+                if s.orientation == "horizontal" {
+                    return columnCount(s.first) + columnCount(s.second)
+                } else {
+                    return 1
+                }
+            }
+        }
+        /// Count leaves for V-split equalization (equal row heights).
+        func leafCount(_ node: ExternalTreeNode) -> Int {
+            switch node {
+            case .pane: return 1
+            case .split(let s): return leafCount(s.first) + leafCount(s.second)
+            }
+        }
+        func equalizeSplits(_ node: ExternalTreeNode) {
+            guard case .split(let splitNode) = node else { return }
+            let ratio: Double
+            if splitNode.orientation == "horizontal" {
+                // Column-count: equal width per column
+                let leftCols = columnCount(splitNode.first)
+                let rightCols = columnCount(splitNode.second)
+                ratio = Double(leftCols) / Double(leftCols + rightCols)
+            } else {
+                // Leaf-count: equal height per row
+                let leftLeaves = leafCount(splitNode.first)
+                let rightLeaves = leafCount(splitNode.second)
+                ratio = Double(leftLeaves) / Double(leftLeaves + rightLeaves)
+            }
+            if let splitId = UUID(uuidString: splitNode.id) {
+                workspace.bonsplitController.setDividerPosition(CGFloat(ratio), forSplit: splitId)
+            }
+            equalizeSplits(splitNode.first)
+            equalizeSplits(splitNode.second)
+        }
+        let tree = workspace.bonsplitController.treeSnapshot()
+        // Skip root split (leader | agent-area): only equalize the agent subtree
+        if case .split(let root) = tree {
+            #if DEBUG
+            dlog("[equalize] root orientation=\(root.orientation), agent subtree columns=\(columnCount(root.second)), leaves=\(leafCount(root.second))")
+            #endif
+            equalizeSplits(root.second)
+        } else {
+            #if DEBUG
+            dlog("[equalize] ERROR: tree root is not a split (single pane?)")
+            #endif
+        }
     }
 
     // MARK: - Agent CLI Binaries
@@ -315,8 +403,23 @@ final class TeamOrchestrator {
         let useWorktrees = daemon.worktreeEnabled
         let gitRepoRoot = useWorktrees ? daemon.findGitRoot(from: workingDirectory) : nil
 
+        // Compute optimal grid dimensions for agent panes
+        let snapshot = workspace.bonsplitController.layoutSnapshot()
+        let containerSize: CGSize
+        if snapshot.containerFrame.width > 0, snapshot.containerFrame.height > 0 {
+            containerSize = CGSize(width: snapshot.containerFrame.width, height: snapshot.containerFrame.height)
+        } else if let screen = NSScreen.main?.visibleFrame {
+            containerSize = CGSize(width: screen.width, height: screen.height)
+        } else {
+            containerSize = .zero
+        }
+        let (numCols, _) = optimalGridDimensions(
+            count: agents.count, containerSize: containerSize, hasLeader: true
+        )
+
         // Build agent panes with Claude running directly via command parameter
         // This bypasses shell init (.zshrc/.zprofile) entirely for reliable startup.
+        var firstAgentPanelId: UUID?
         for (index, agent) in agents.enumerated() {
             let agentColor = agent.color.isEmpty ? colors[index % colors.count] : agent.color
             let agentId = "\(agent.name)@\(name)"
@@ -408,30 +511,24 @@ final class TeamOrchestrator {
             let paneEnv = (agentCli == "claude" ? claudeAgentEnv : kiroAgentEnv)
                 .merging(["TERMMESH_AGENT_NAME": agent.name]) { _, new in new }
 
-            // Balanced binary tree with alternating H/V orientations for grid layout.
-            // Agent i splits from agent floor((i-1)/2). Left children alternate
-            // orientation from parent, right children keep parent's orientation.
-            // Example for 4 agents → clean 2×2 grid:
-            //   A0: H from leader, A1: V from A0, A2: H from A0, A3: H from A1
-            //   | Leader | A0 | A2 |
-            //   |        |----|----|
-            //   |        | A1 | A3 |
+            // Grid layout: agents are assigned to cells in column-major order.
+            // col = index % numCols, row = index / numCols
+            // Row 0 agents split RIGHT (from first agent pane or leader).
+            // Row > 0 agents split DOWN from the agent above in the same column.
+            let col = index % numCols
+            let row = index / numCols
+
             let splitFrom: UUID
             let orientation: SplitOrientation
 
-            if index == 0 {
+            if row == 0 {
+                // First row: split right to create columns
                 orientation = .horizontal
-                splitFrom = leaderPanelId
+                splitFrom = firstAgentPanelId ?? leaderPanelId
             } else {
-                let parentIndex = (index - 1) / 2
-                splitFrom = members[parentIndex].panelId
-                // Compute orientation: walk up the tree to determine parent's orientation,
-                // then alternate for left child (odd index), keep for right child (even index).
-                let parentOrientation = agentSplitOrientation(at: parentIndex)
-                let isLeftChild = (index % 2 == 1)
-                orientation = isLeftChild
-                    ? (parentOrientation == .horizontal ? .vertical : .horizontal)
-                    : parentOrientation
+                // Subsequent rows: split down within the column
+                orientation = .vertical
+                splitFrom = members[index - numCols].panelId
             }
 
             guard let panel = workspace.newTerminalSplit(
@@ -450,6 +547,7 @@ final class TeamOrchestrator {
                 continue
             }
             let panelId = panel.id
+            if firstAgentPanelId == nil { firstAgentPanelId = panelId }
 
             // Set agent name as pane title (include branch if worktree)
             let colorEmoji = Self.colorEmoji(agentColor)
@@ -475,6 +573,14 @@ final class TeamOrchestrator {
                 worktreeBranch: wtBranch
             )
             members.append(member)
+        }
+
+        // Equalize splits multiple times: bonsplit needs layout passes to settle.
+        // First pass immediate, then delayed passes for robustness.
+        for delay in [0.05, 0.3, 0.8] {
+            DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
+                self?.equalizeAgentGrid(workspace: workspace)
+            }
         }
 
         let team = Team(
