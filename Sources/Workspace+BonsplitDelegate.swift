@@ -16,9 +16,22 @@ extension Workspace: BonsplitDelegate {
 
         // Prefer a sheet if we can find a window, otherwise fall back to modal.
         if let window = NSApp.keyWindow ?? NSApp.mainWindow {
+            // Guard against the continuation hanging forever if the sheet is never dismissed
+            // (e.g. window deallocated without calling the completion handler). Both closures
+            // run on @MainActor so `resumed` is accessed without races.
+            var resumed = false
             return await withCheckedContinuation { continuation in
                 alert.beginSheetModal(for: window) { response in
+                    guard !resumed else { return }
+                    resumed = true
                     continuation.resume(returning: response == .alertFirstButtonReturn)
+                }
+                Task { @MainActor in
+                    try? await Task.sleep(nanoseconds: 10_000_000_000) // 10 s timeout
+                    guard !resumed else { return }
+                    resumed = true
+                    window.endSheet(alert.window)
+                    continuation.resume(returning: false)
                 }
             }
         }

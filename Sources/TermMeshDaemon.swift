@@ -197,7 +197,14 @@ final class TermMeshDaemon: ObservableObject {
         queue.async { [weak self] in
             guard let self else { return }
             // Stop synchronously (fast — pkill + socket cleanup)
-            DispatchQueue.main.sync { self.stopDaemon() }
+            // Use async + DispatchGroup to avoid deadlock when main is waiting on this queue
+            let stopGroup = DispatchGroup()
+            stopGroup.enter()
+            DispatchQueue.main.async { [weak self] in
+                self?.stopDaemon()
+                stopGroup.leave()
+            }
+            stopGroup.wait()
             // Brief pause so the socket file is fully released
             Thread.sleep(forTimeInterval: 0.3)
             self.startDaemon()

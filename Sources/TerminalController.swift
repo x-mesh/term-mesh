@@ -1811,7 +1811,9 @@ class TerminalController {
             response = await self.processTeamUICommandAsync(method: method, params: params, id: id)
         }
 
-        semaphore.wait()
+        if semaphore.wait(timeout: .now() + 5) == .timedOut {
+            return "{\"ok\":false,\"error\":{\"code\":\"timeout\",\"message\":\"team command timed out\"}}"
+        }
         return response
     }
 

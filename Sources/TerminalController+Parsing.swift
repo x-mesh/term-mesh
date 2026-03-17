@@ -217,8 +217,8 @@ extension TerminalController {
 
     func listStatus(_ args: String) -> String {
         var result = ""
-        DispatchQueue.main.sync {
-            guard let tab = resolveTabForReport(args) else {
+        let completed = v2MainExec {
+            guard let tab = self.resolveTabForReport(args) else {
                 result = "ERROR: Tab not found"
                 return
             }
@@ -234,6 +234,7 @@ extension TerminalController {
             }
             result = lines.joined(separator: "\n")
         }
+        if !completed { return "ERROR: Main thread busy" }
         return result
     }
 
@@ -285,8 +286,8 @@ extension TerminalController {
         }
 
         var result = ""
-        DispatchQueue.main.sync {
-            guard let tab = resolveTabForReport(args) else {
+        let completed = v2MainExec {
+            guard let tab = self.resolveTabForReport(args) else {
                 result = parsed.options["tab"] != nil ? "ERROR: Tab not found" : "ERROR: No tab selected"
                 return
             }
@@ -308,6 +309,7 @@ extension TerminalController {
                 return line
             }.joined(separator: "\n")
         }
+        if !completed { return "ERROR: Main thread busy" }
         return result
     }
 
@@ -664,8 +666,8 @@ extension TerminalController {
 
     func sidebarState(_ args: String) -> String {
         var result = ""
-        DispatchQueue.main.sync {
-            guard let tab = resolveTabForReport(args) else {
+        let completed = v2MainExec {
+            guard let tab = self.resolveTabForReport(args) else {
                 result = "ERROR: Tab not found"
                 return
             }
@@ -717,13 +719,14 @@ extension TerminalController {
 
             result = lines.joined(separator: "\n")
         }
+        if !completed { return "ERROR: Main thread busy" }
         return result
     }
 
     func resetSidebar(_ args: String) -> String {
         var result = "OK"
-        DispatchQueue.main.sync {
-            guard let tab = resolveTabForReport(args) else {
+        let completed = v2MainExec {
+            guard let tab = self.resolveTabForReport(args) else {
                 result = "ERROR: Tab not found"
                 return
             }
@@ -735,6 +738,7 @@ extension TerminalController {
             tab.surfaceListeningPorts.removeAll()
             tab.listeningPorts.removeAll()
         }
+        if !completed { return "ERROR: Main thread busy" }
         return result
     }
 
@@ -742,7 +746,7 @@ extension TerminalController {
         guard let tabManager = tabManager else { return "ERROR: TabManager not available" }
 
         var refreshedCount = 0
-        DispatchQueue.main.sync {
+        let completed = v2MainExec {
             guard let tabId = tabManager.selectedTabId,
                   let tab = tabManager.tabs.first(where: { $0.id == tabId }) else {
                 return
@@ -757,6 +761,7 @@ extension TerminalController {
                 }
             }
         }
+        if !completed { return "ERROR: Main thread busy" }
         return "OK Refreshed \(refreshedCount) surfaces"
     }
 
@@ -782,19 +787,19 @@ extension TerminalController {
     func surfaceHealth(_ tabArg: String) -> String {
         guard let tabManager = tabManager else { return "ERROR: TabManager not available" }
         var result = ""
-        DispatchQueue.main.sync {
-            guard let tab = resolveTab(from: tabArg, tabManager: tabManager) else {
+        let completed = v2MainExec {
+            guard let tab = self.resolveTab(from: tabArg, tabManager: tabManager) else {
                 result = "ERROR: Tab not found"
                 return
             }
-            let panels = orderedPanels(in: tab)
+            let panels = self.orderedPanels(in: tab)
             let lines = panels.enumerated().map { index, panel -> String in
                 let panelId = panel.id.uuidString
                 let type = panel.panelType.rawValue
                 if let tp = panel as? TerminalPanel {
                     let inWindow = tp.surface.isViewInWindow
-                    let portalHosted = isPortalHosted(tp.hostedView)
-                    let depth = viewDepth(of: tp.hostedView)
+                    let portalHosted = self.isPortalHosted(tp.hostedView)
+                    let depth = self.viewDepth(of: tp.hostedView)
                     return "\(index): \(panelId) type=\(type) in_window=\(inWindow) portal=\(portalHosted) view_depth=\(depth)"
                 } else if let bp = panel as? BrowserPanel {
                     let inWindow = bp.webView.window != nil
@@ -805,6 +810,7 @@ extension TerminalController {
             }
             result = lines.isEmpty ? "No surfaces" : lines.joined(separator: "\n")
         }
+        if !completed { return "ERROR: Main thread busy" }
         return result
     }
 
@@ -814,7 +820,7 @@ extension TerminalController {
         let trimmed = args.trimmingCharacters(in: .whitespacesAndNewlines)
 
         var result = "ERROR: Failed to close surface"
-        DispatchQueue.main.sync {
+        let completed = v2MainExec {
             guard let tabId = tabManager.selectedTabId,
                   let tab = tabManager.tabs.first(where: { $0.id == tabId }) else {
                 return
@@ -825,7 +831,7 @@ extension TerminalController {
             if trimmed.isEmpty {
                 surfaceId = tab.focusedPanelId
             } else {
-                surfaceId = resolveSurfaceId(from: trimmed, tab: tab)
+                surfaceId = self.resolveSurfaceId(from: trimmed, tab: tab)
             }
 
             guard let targetSurfaceId = surfaceId else {
@@ -843,6 +849,7 @@ extension TerminalController {
             tab.closePanel(targetSurfaceId, force: true)
             result = "OK"
         }
+        if !completed { return "ERROR: Main thread busy" }
         return result
     }
 
@@ -870,7 +877,7 @@ extension TerminalController {
         }
 
         var result = "ERROR: Failed to create tab"
-        DispatchQueue.main.sync {
+        let completed = v2MainExec {
             guard let tabId = tabManager.selectedTabId,
                   let tab = tabManager.tabs.first(where: { $0.id == tabId }) else {
                 return
@@ -882,7 +889,7 @@ extension TerminalController {
             if let paneArg {
                 if let uuid = UUID(uuidString: paneArg) {
                     paneId = paneIds.first(where: { $0.id == uuid })
-                } else if let uuid = v2ResolveHandleRef(paneArg) {
+                } else if let uuid = self.v2ResolveHandleRef(paneArg) {
                     paneId = paneIds.first(where: { $0.id == uuid })
                 } else {
                     paneId = nil
@@ -907,6 +914,7 @@ extension TerminalController {
                 result = "OK \(id.uuidString)"
             }
         }
+        if !completed { return "ERROR: Main thread busy" }
         return result
     }
 

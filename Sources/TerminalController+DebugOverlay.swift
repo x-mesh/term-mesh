@@ -25,12 +25,13 @@ extension TerminalController {
         }
 
         var result = "ERROR: Surface not found"
-        DispatchQueue.main.sync {
-            guard let panel = resolveTerminalPanel(from: target, tabManager: tabManager) else { return }
+        let completed = v2MainExec {
+            guard let panel = self.resolveTerminalPanel(from: target, tabManager: tabManager) else { return }
             result = panel.hostedView.debugSimulateFileDrop(paths: paths)
                 ? "OK"
                 : "ERROR: Failed to simulate drop"
         }
+        if !completed { return "ERROR: Main thread busy" }
         return result
     }
 
@@ -70,9 +71,10 @@ extension TerminalController {
             }
         }
 
-        DispatchQueue.main.sync {
+        let completed = v2MainExec {
             _ = NSPasteboard(name: .drag).declareTypes(types, owner: nil)
         }
+        if !completed { return "ERROR: Main thread busy" }
         return "OK"
     }
 
@@ -96,14 +98,14 @@ extension TerminalController {
         let eventType = parsedEvent.eventType
 
         var shouldCapture = false
-        DispatchQueue.main.sync {
+        let completed = v2MainExec {
             let pb = NSPasteboard(name: .drag)
             shouldCapture = DragOverlayRoutingPolicy.shouldCaptureFileDropOverlay(
                 pasteboardTypes: pb.types,
                 eventType: eventType
             )
         }
-
+        if !completed { return "ERROR: Main thread busy" }
         return shouldCapture ? "true" : "false"
     }
 
@@ -120,13 +122,14 @@ extension TerminalController {
         }
 
         var shouldCapture = false
-        DispatchQueue.main.sync {
+        let completed = v2MainExec {
             let pb = NSPasteboard(name: .drag)
             shouldCapture = DragOverlayRoutingPolicy.shouldCaptureFileDropDestination(
                 pasteboardTypes: pb.types,
                 hasLocalDraggingSource: hasLocalDraggingSource
             )
         }
+        if !completed { return "ERROR: Main thread busy" }
         return shouldCapture ? "true" : "false"
     }
 
@@ -142,13 +145,14 @@ extension TerminalController {
         let eventType = parsedEvent.eventType
 
         var shouldPassThrough = false
-        DispatchQueue.main.sync {
+        let completed = v2MainExec {
             let pb = NSPasteboard(name: .drag)
             shouldPassThrough = DragOverlayRoutingPolicy.shouldPassThroughPortalHitTesting(
                 pasteboardTypes: pb.types,
                 eventType: eventType
             )
         }
+        if !completed { return "ERROR: Main thread busy" }
         return shouldPassThrough ? "true" : "false"
     }
 
@@ -165,13 +169,14 @@ extension TerminalController {
         }
 
         var shouldCapture = false
-        DispatchQueue.main.sync {
+        let completed = v2MainExec {
             let pb = NSPasteboard(name: .drag)
             shouldCapture = DragOverlayRoutingPolicy.shouldCaptureSidebarExternalOverlay(
                 hasSidebarDragState: hasSidebarDragState,
                 pasteboardTypes: pb.types
             )
         }
+        if !completed { return "ERROR: Main thread busy" }
         return shouldCapture ? "true" : "false"
     }
 
@@ -190,14 +195,14 @@ extension TerminalController {
         }
 
         var result = "ERROR: No selected workspace"
-        DispatchQueue.main.sync {
+        let completed = v2MainExec {
             guard let selectedId = tabManager.selectedTabId,
                   let workspace = tabManager.tabs.first(where: { $0.id == selectedId }) else {
                 return
             }
 
             let terminalPanel = workspace.focusedTerminalPanel
-                ?? orderedPanels(in: workspace).compactMap { $0 as? TerminalPanel }.first
+                ?? self.orderedPanels(in: workspace).compactMap { $0 as? TerminalPanel }.first
             guard let terminalPanel else {
                 result = "ERROR: No terminal panel available"
                 return
@@ -218,6 +223,7 @@ extension TerminalController {
                 probe.bounds.height
             )
         }
+        if !completed { return "ERROR: Main thread busy" }
         return result
     }
 
@@ -298,7 +304,7 @@ extension TerminalController {
         }
 
         var result = "ERROR: No window"
-        DispatchQueue.main.sync {
+        let completed = v2MainExec {
             guard let window = NSApp.mainWindow
                 ?? NSApp.keyWindow
                 ?? NSApp.windows.first(where: { win in
@@ -324,6 +330,7 @@ extension TerminalController {
 
             result = "none"
         }
+        if !completed { return "ERROR: Main thread busy" }
         return result
     }
 }

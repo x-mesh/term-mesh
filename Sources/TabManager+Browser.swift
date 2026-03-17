@@ -734,6 +734,19 @@ extension TabManager {
 
 	            CVDisplayLinkSetOutputCallback(link, termMeshVsyncIOSurfaceTimelineCallback, ctx)
 	            CVDisplayLinkStart(link)
+
+	            // Safety: if CVDisplayLink never completes (display sleep, callback error, etc.)
+	            // resume after a generous timeout to avoid a permanent hang.
+	            // finish() is idempotent so calling it after the normal callback is harmless.
+	            // The ctx Unmanaged retain is not released here to avoid racing with a late
+	            // in-flight callback; the one-time leak on timeout is acceptable for a debug utility.
+	            let timeoutNs = UInt64(max(30, frameCount / 60 + 5)) * 1_000_000_000
+	            Task { @MainActor in
+	                try? await Task.sleep(nanoseconds: timeoutNs)
+	                guard !st.finished else { return }
+	                if let link = st.link { CVDisplayLinkStop(link) }
+	                st.finish()
+	            }
 	        }
 
 	        return (st.firstBlank, st.firstSizeMismatch, st.trace)

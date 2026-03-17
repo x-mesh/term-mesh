@@ -542,9 +542,11 @@ func termMeshVsyncIOSurfaceTimelineCallback(
     let st = Unmanaged<VsyncIOSurfaceTimelineState>.fromOpaque(ctx).takeUnretainedValue()
     if !st.tryBeginCapture() { return kCVReturnSuccess }
 
-    // Sample on the main thread synchronously so we don't "miss" a single compositor frame.
-    // (The previous Task/@MainActor hop could be delayed long enough to skip the blank frame.)
-    DispatchQueue.main.sync {
+    // Sample on the main thread. Using async (not sync) to avoid deadlock risk if the main
+    // thread is ever blocked waiting on CVDisplayLink. The tryBeginCapture/endCapture gate
+    // ensures at most one async block is in-flight at a time, so framesWritten stays consistent.
+    // Note: async may skip a frame if the main thread is busy — acceptable for this debug utility.
+    DispatchQueue.main.async {
         defer { st.endCapture() }
         guard st.framesWritten < st.frameCount else { return }
 
@@ -593,13 +595,13 @@ func termMeshVsyncIOSurfaceTimelineCallback(
         }
 
         st.framesWritten += 1
-    }
 
-    // Stop/resume outside the main-thread sync block to avoid reentrancy issues.
-    if st.framesWritten >= st.frameCount, let link = st.link {
-        CVDisplayLinkStop(link)
-        st.finish()
-        Unmanaged<VsyncIOSurfaceTimelineState>.fromOpaque(ctx).release()
+        // Stop/resume inside the async block so framesWritten is up to date.
+        if st.framesWritten >= st.frameCount, let link = st.link {
+            CVDisplayLinkStop(link)
+            st.finish()
+            Unmanaged<VsyncIOSurfaceTimelineState>.fromOpaque(ctx).release()
+        }
     }
 
     return kCVReturnSuccess

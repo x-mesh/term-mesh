@@ -13,6 +13,7 @@ use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 use tokio::sync::watch;
+use tokio::time::{timeout, Duration};
 use tower_http::cors::CorsLayer;
 
 /// Dashboard HTML embedded at compile time so it's always available in the binary,
@@ -399,9 +400,9 @@ async fn rpc_team_socket(
     let mut attempts = 0;
     let response_line = loop {
         let mut line = String::new();
-        let bytes = reader
-            .read_line(&mut line)
+        let bytes = timeout(Duration::from_secs(5), reader.read_line(&mut line))
             .await
+            .map_err(|_| "socket read timed out".to_string())?
             .map_err(|e| format!("socket read failed: {e}"))?;
         if bytes == 0 {
             return Err("socket closed without a response".to_string());
