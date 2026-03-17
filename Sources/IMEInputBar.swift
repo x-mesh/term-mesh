@@ -592,6 +592,43 @@ final class IMETextView: NSTextView {
         super.mouseDown(with: event)
     }
 
+    // MARK: - Key equivalents
+
+    override func performKeyEquivalent(with event: NSEvent) -> Bool {
+        guard event.type == .keyDown else { return super.performKeyEquivalent(with: event) }
+        let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+
+        // Cmd+C: if IME has no text selection but a terminal in the window does, copy the
+        // terminal selection. This lets users mouse-select terminal text while IME is active
+        // and copy it without losing IME focus.
+        if event.keyCode == 8 && flags == .command && selectedRange().length == 0 {
+            if let surfaceView = Self.findTerminalSurfaceWithSelection(in: window) {
+                surfaceView.copy(nil)
+                return true
+            }
+        }
+
+        return super.performKeyEquivalent(with: event)
+    }
+
+    /// Walk the window's view hierarchy to find a GhosttyNSView that has an active selection.
+    private static func findTerminalSurfaceWithSelection(in window: NSWindow?) -> GhosttyNSView? {
+        guard let contentView = window?.contentView else { return nil }
+        return findGhosttyViewWithSelection(in: contentView)
+    }
+
+    private static func findGhosttyViewWithSelection(in view: NSView) -> GhosttyNSView? {
+        if let gv = view as? GhosttyNSView,
+           let surface = gv.surface,
+           ghostty_surface_has_selection(surface) {
+            return gv
+        }
+        for sub in view.subviews {
+            if let found = findGhosttyViewWithSelection(in: sub) { return found }
+        }
+        return nil
+    }
+
     // MARK: - Key handling
 
     override func keyDown(with event: NSEvent) {

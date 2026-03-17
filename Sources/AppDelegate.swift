@@ -2657,6 +2657,21 @@ var termMeshFirstResponderGuardHitViewOverride: NSView?
 
 extension NSWindow {
     @objc func termMesh_makeFirstResponder(_ responder: NSResponder?) -> Bool {
+        // Block programmatic focus theft while IME is mid-composition (hasMarkedText).
+        // This prevents background events (agent terminal completion, socket commands)
+        // from stealing first responder during CJK/IME text input.
+        if let currentIME = self.firstResponder as? IMETextView,
+           currentIME.hasMarkedText(),
+           responder !== currentIME {
+#if DEBUG
+            dlog(
+                "focus.guard imeComposingBlocked responder=\(String(describing: responder.map { type(of: $0) })) " +
+                "window=\(ObjectIdentifier(self))"
+            )
+#endif
+            return false
+        }
+
         if AppDelegate.shared?.shouldBlockFirstResponderChangeWhileCommandPaletteVisible(
             window: self,
             responder: responder

@@ -129,7 +129,13 @@ extension Workspace: BonsplitDelegate {
 
         // Converge AppKit first responder with bonsplit's selected tab in the focused pane.
         // Without this, keyboard input can remain on a different terminal than the blue tab indicator.
-        if let terminalPanel = panel as? TerminalPanel {
+        // Skip when an IME is mid-composition in any pane — the makeFirstResponder swizzle
+        // would block the change anyway, but skipping here avoids unnecessary retry loops.
+        let imeComposingElsewhere: Bool = {
+            guard let window = (panel as? TerminalPanel)?.hostedView.window else { return false }
+            return (window.firstResponder as? IMETextView)?.hasMarkedText() == true
+        }()
+        if let terminalPanel = panel as? TerminalPanel, !imeComposingElsewhere {
             terminalPanel.hostedView.ensureFocus(for: id, surfaceId: panelId)
         }
 
