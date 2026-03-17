@@ -178,6 +178,23 @@ tm-agent task unblock <id>
 tm-agent task clear
 ```
 
+### Leader: reading full agent reports
+
+Agent replies are truncated to 1500 chars over the socket. Full reports are saved to files:
+
+```bash
+# Read full report for a specific task
+cat ~/.term-mesh/results/<team>/<task_id>.md
+
+# Read an agent's latest reply
+cat ~/.term-mesh/results/<team>/<agent>-reply.md
+
+# Example: read architect's full report in my-team
+cat ~/.term-mesh/results/my-team/architect-reply.md
+```
+
+When `tm-agent collect` or `msg list` returns truncated content (ends with `...`), read the corresponding file from `~/.term-mesh/results/` for the full text. Files are auto-cleaned after 24 hours.
+
 ## E2E mac UI tests
 
 Run UI tests on the UTM macOS VM (never on the host machine). Always run e2e UI tests via `ssh term-mesh-vm`:
