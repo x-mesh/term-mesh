@@ -1946,54 +1946,80 @@ class TerminalController {
         }
         // Only the actual team creation needs MainActor
         let result: V2CallResult = await MainActor.run {
-            // Resolve TabManager from params (window_id > surface_id > key window > fallback).
+            // File-based debug log for team.create routing (works in Release)
+            func teamLog(_ msg: String) {
+                let line = "[\(ISO8601DateFormatter().string(from: Date()))] \(msg)\n"
+                let path = "/tmp/term-mesh-team-routing.log"
+                if let fh = FileHandle(forWritingAtPath: path) {
+                    fh.seekToEndOfFile()
+                    fh.write(Data(line.utf8))
+                    fh.closeFile()
+                } else {
+                    FileManager.default.createFile(atPath: path, contents: Data(line.utf8))
+                }
+            }
+            let surfaceParam = params["surface_id"] as? String ?? "nil"
+            let windowParam = params["window_id"] as? String ?? "nil"
+            let wsParam = params["workspace_id"] as? String ?? "nil"
+            teamLog("params: window_id=\(windowParam) surface_id=\(surfaceParam) workspace_id=\(wsParam)")
+
+            // Resolve TabManager from params (window_id > surface_id > workspace_id > key window > fallback).
             // We're already on MainActor, so call AppDelegate directly without v2MainSync.
             let tabManager: TabManager? = {
                 let appDelegate = AppDelegate.shared
-                // 1. Explicit window_id
+                let ctxCount = appDelegate?.mainWindowContexts.count ?? 0
+                teamLog("mainWindowContexts count=\(ctxCount)")
+                // List all windows for debugging
+                if let appDelegate {
+                    for (i, ctx) in appDelegate.mainWindowContexts.values.enumerated() {
+                        let wid = ctx.windowId.uuidString
+                        let tabCount = ctx.tabManager.tabs.count
+                        let tabIds = ctx.tabManager.tabs.map { $0.id.uuidString.prefix(8) }.joined(separator: ",")
+                        teamLog("  window[\(i)]: id=\(wid) tabs=\(tabCount) tabIds=[\(tabIds)]")
+                    }
+                }
+                // 1. Explicit window_id (from TERMMESH_WINDOW_ID env var)
                 if let windowIdStr = params["window_id"] as? String,
                    let windowId = UUID(uuidString: windowIdStr),
                    let tm = appDelegate?.tabManagerFor(windowId: windowId) {
-                    #if DEBUG
-                    dlog("[team.create] resolved tabManager via window_id=\(windowIdStr)")
-                    #endif
+                    teamLog("RESOLVED via window_id=\(windowIdStr)")
                     return tm
                 }
                 // 2. surface_id from caller's pane (TERMMESH_PANEL_ID)
                 if let surfaceIdStr = params["surface_id"] as? String,
                    let surfaceId = UUID(uuidString: surfaceIdStr) {
                     if let tm = appDelegate?.locateSurface(surfaceId: surfaceId)?.tabManager {
-                        #if DEBUG
-                        dlog("[team.create] resolved tabManager via surface_id=\(surfaceIdStr)")
-                        #endif
+                        let resolvedWid = appDelegate?.windowId(for: tm)?.uuidString ?? "?"
+                        teamLog("RESOLVED via surface_id=\(surfaceIdStr) → window=\(resolvedWid)")
                         return tm
                     }
-                    #if DEBUG
-                    dlog("[team.create] surface_id=\(surfaceIdStr) NOT found in any window")
-                    #endif
+                    teamLog("surface_id=\(surfaceIdStr) NOT FOUND in any window")
+                }
+                // 2.5. workspace_id from caller's workspace (TERMMESH_WORKSPACE_ID)
+                if let wsIdStr = params["workspace_id"] as? String,
+                   let wsId = UUID(uuidString: wsIdStr),
+                   let tm = appDelegate?.tabManagerFor(tabId: wsId) {
+                    let resolvedWid = appDelegate?.windowId(for: tm)?.uuidString ?? "?"
+                    teamLog("RESOLVED via workspace_id=\(wsIdStr) → window=\(resolvedWid)")
+                    return tm
+                }
+                if let wsIdStr = params["workspace_id"] as? String {
+                    teamLog("workspace_id=\(wsIdStr) NOT FOUND in any window")
                 }
                 // 3. Current key window — most reliable for "which window is the user in"
                 if let appDelegate,
                    let keyWindow = NSApp.keyWindow,
                    let ctx = appDelegate.contextForMainWindow(keyWindow) {
-                    #if DEBUG
                     let windowId = appDelegate.windowId(for: ctx.tabManager)?.uuidString ?? "?"
-                    dlog("[team.create] resolved tabManager via keyWindow windowId=\(windowId)")
-                    #endif
+                    teamLog("RESOLVED via keyWindow windowId=\(windowId)")
                     return ctx.tabManager
                 }
                 // 4. Fallback to last active tabManager
-                #if DEBUG
                 let selfWindowId = self.v2ResolveWindowId(tabManager: self.tabManager)?.uuidString ?? "?"
-                dlog("[team.create] FALLBACK to self.tabManager windowId=\(selfWindowId)")
-                #endif
+                teamLog("FALLBACK to self.tabManager windowId=\(selfWindowId) (contexts=\(ctxCount))")
                 return self.tabManager
             }()
-            #if DEBUG
-            let surfaceParam = params["surface_id"] as? String ?? "nil"
-            let windowParam = params["window_id"] as? String ?? "nil"
-            dlog("[team.create] params: surface_id=\(surfaceParam) window_id=\(windowParam) resolved_tabManager=\(tabManager != nil)")
-            #endif
+            teamLog("final: resolved=\(tabManager != nil)")
             guard let tabManager else {
                 return V2CallResult.err(code: "unavailable", message: "TabManager not available", data: nil)
             }

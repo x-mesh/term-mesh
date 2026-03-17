@@ -1049,6 +1049,12 @@ fn run_create(
     if let Ok(panel_id) = env::var("TERMMESH_PANEL_ID") {
         create_params["surface_id"] = json!(panel_id);
     }
+    if let Ok(window_id) = env::var("TERMMESH_WINDOW_ID") {
+        create_params["window_id"] = json!(window_id);
+    }
+    if let Ok(workspace_id) = env::var("TERMMESH_WORKSPACE_ID") {
+        create_params["workspace_id"] = json!(workspace_id);
+    }
     let r = match rpc_call_timeout(sock, "team.create", create_params, 5) {
         Ok(v) => v,
         Err(e) => { eprintln!("Error: {e}"); process::exit(1); }

@@ -38,6 +38,8 @@ struct TermMeshApp: App {
     @AppStorage(TermMeshDaemon.worktreeAutoCleanupKey) private var worktreeAutoCleanup = false
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
     @State private var showTeamCreation = false
+    /// TabManager captured at menu-click time (before sheet steals key window).
+    @State private var teamCreationTabManager: TabManager?
     @State private var ghosttyTheme = GhosttyTheme.current
 
     init() {
@@ -211,6 +213,13 @@ struct TermMeshApp: App {
                     updateSocketController()
                 }
                 .onReceive(NotificationCenter.default.publisher(for: .teamCreationRequested)) { _ in
+                    if let kw = NSApp.keyWindow, let ctx = AppDelegate.shared?.contextForMainWindow(kw) {
+                        teamCreationTabManager = ctx.tabManager
+                    } else if let mw = NSApp.mainWindow, let ctx = AppDelegate.shared?.contextForMainWindow(mw) {
+                        teamCreationTabManager = ctx.tabManager
+                    } else {
+                        teamCreationTabManager = nil
+                    }
                     showTeamCreation = true
                 }
                 .onReceive(NotificationCenter.default.publisher(for: .spawnCLIRequested)) { _ in
@@ -230,7 +239,10 @@ struct TermMeshApp: App {
                                     : row.customInstructions
                             )
                         }
-                        let workDir = tabManager.selectedTab?.currentDirectory
+                        // Use the TabManager captured at menu-click time (before
+                        // the sheet stole key window focus).
+                        let activeTabManager = teamCreationTabManager ?? tabManager
+                        let workDir = activeTabManager.selectedTab?.currentDirectory
                             ?? FileManager.default.currentDirectoryPath
                         _ = TeamOrchestrator.shared.createTeam(
                             name: teamName,
@@ -240,7 +252,7 @@ struct TermMeshApp: App {
                             leaderMode: leaderMode,
                             leaderModel: leaderModel,
                             worktreeMode: worktreeMode,
-                            tabManager: tabManager
+                            tabManager: activeTabManager
                         )
                     }
                 }
@@ -251,6 +263,14 @@ struct TermMeshApp: App {
             CommandMenu("Agents") {
                 // -- Create --
                 Button("New Agent Team…") {
+                    // Capture the key window's TabManager NOW, before the sheet steals focus.
+                    if let kw = NSApp.keyWindow, let ctx = AppDelegate.shared?.contextForMainWindow(kw) {
+                        teamCreationTabManager = ctx.tabManager
+                    } else if let mw = NSApp.mainWindow, let ctx = AppDelegate.shared?.contextForMainWindow(mw) {
+                        teamCreationTabManager = ctx.tabManager
+                    } else {
+                        teamCreationTabManager = nil
+                    }
                     showTeamCreation = true
                 }
                 .keyboardShortcut("t", modifiers: [.command, .option])
