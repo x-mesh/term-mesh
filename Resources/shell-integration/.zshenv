@@ -30,8 +30,10 @@ fi
 {
     # zsh treats unset ZDOTDIR as if it were HOME. We do the same.
     builtin typeset _termmesh_file="${ZDOTDIR-$HOME}/.zshenv"
+    builtin print -- "[tm-zshenv] sourcing user .zshenv: $_termmesh_file interactive=$([[ -o interactive ]] && echo yes || echo no)" >> /tmp/term-mesh-zshenv-debug.log 2>/dev/null
     [[ ! -r "$_termmesh_file" ]] || builtin source -- "$_termmesh_file"
 } always {
+    builtin print -- "[tm-zshenv] always block: interactive=$([[ -o interactive ]] && echo yes || echo no) SHELL_INTEGRATION=${TERMMESH_SHELL_INTEGRATION:-unset} INTEGRATION_DIR=${TERMMESH_SHELL_INTEGRATION_DIR:-unset}" >> /tmp/term-mesh-zshenv-debug.log 2>/dev/null
     if [[ -o interactive ]]; then
         # We overwrote GhosttyKit's injected ZDOTDIR, so manually load Ghostty's
         # zsh integration if available.
@@ -43,8 +45,14 @@ fi
         # Load term-mesh integration (unless disabled)
         if [[ "${TERMMESH_SHELL_INTEGRATION:-${CMUX_SHELL_INTEGRATION:-1}}" != "0" && -n "${TERMMESH_SHELL_INTEGRATION_DIR:-${CMUX_SHELL_INTEGRATION_DIR:-}}" ]]; then
             builtin typeset _termmesh_integ="${TERMMESH_SHELL_INTEGRATION_DIR:-$CMUX_SHELL_INTEGRATION_DIR}/term-mesh-zsh-integration.zsh"
+            builtin print -- "[tm-zshenv] integ file: $_termmesh_integ readable=$([[ -r "$_termmesh_integ" ]] && echo yes || echo no)" >> /tmp/term-mesh-zshenv-debug.log 2>/dev/null
             [[ -r "$_termmesh_integ" ]] && builtin source -- "$_termmesh_integ"
+            builtin print -- "[tm-zshenv] sourced term-mesh integration OK" >> /tmp/term-mesh-zshenv-debug.log 2>/dev/null
+        else
+            builtin print -- "[tm-zshenv] SKIPPED: condition failed SHELL_INTEGRATION=${TERMMESH_SHELL_INTEGRATION:-${CMUX_SHELL_INTEGRATION:-1}} INTEGRATION_DIR=${TERMMESH_SHELL_INTEGRATION_DIR:-${CMUX_SHELL_INTEGRATION_DIR:-empty}}" >> /tmp/term-mesh-zshenv-debug.log 2>/dev/null
         fi
+    else
+        builtin print -- "[tm-zshenv] SKIPPED: not interactive" >> /tmp/term-mesh-zshenv-debug.log 2>/dev/null
     fi
 
     builtin unset _termmesh_file _termmesh_ghostty _termmesh_integ
