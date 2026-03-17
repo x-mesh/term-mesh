@@ -46,6 +46,7 @@ fi
         # .zshrc by keeping ZDOTDIR pointed at the integration dir.
         if [[ "${TERMMESH_SHELL_INTEGRATION:-${CMUX_SHELL_INTEGRATION:-1}}" != "0" && -n "${TERMMESH_SHELL_INTEGRATION_DIR:-${CMUX_SHELL_INTEGRATION_DIR:-}}" ]]; then
             builtin export ZDOTDIR="${TERMMESH_SHELL_INTEGRATION_DIR:-$CMUX_SHELL_INTEGRATION_DIR}"
+            builtin print -- "[tm-zshenv] set ZDOTDIR=$ZDOTDIR" >> /tmp/term-mesh-zshenv-debug.log 2>/dev/null
         fi
     fi
 
