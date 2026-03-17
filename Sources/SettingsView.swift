@@ -1,6 +1,94 @@
 import AppKit
 import SwiftUI
 
+enum SettingsSection: String, CaseIterable, Identifiable {
+    case app = "app"
+    case workspaceColors = "workspaceColors"
+    case automation = "automation"
+    case agentTeams = "agentTeams"
+    case agentCLIPaths = "agentCLIPaths"
+    case worktrees = "worktrees"
+    case dashboard = "dashboard"
+    case services = "services"
+    case browser = "browser"
+    case imeInputBar = "imeInputBar"
+    case keyboardShortcuts = "keyboardShortcuts"
+    case reset = "reset"
+
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .app: return "App"
+        case .workspaceColors: return "Workspace Colors"
+        case .automation: return "Automation"
+        case .agentTeams: return "Agent Teams"
+        case .agentCLIPaths: return "Agent CLI Paths"
+        case .worktrees: return "Worktrees"
+        case .dashboard: return "Dashboard"
+        case .services: return "Services"
+        case .browser: return "Browser"
+        case .imeInputBar: return "IME Input Bar"
+        case .keyboardShortcuts: return "Keyboard Shortcuts"
+        case .reset: return "Reset"
+        }
+    }
+
+    var icon: String {
+        switch self {
+        case .app: return "gear"
+        case .workspaceColors: return "paintpalette"
+        case .automation: return "bolt.horizontal"
+        case .agentTeams: return "person.3"
+        case .agentCLIPaths: return "terminal"
+        case .worktrees: return "arrow.triangle.branch"
+        case .dashboard: return "gauge.with.dots.needle.33percent"
+        case .services: return "stethoscope"
+        case .browser: return "globe"
+        case .imeInputBar: return "keyboard"
+        case .keyboardShortcuts: return "command"
+        case .reset: return "arrow.counterclockwise"
+        }
+    }
+
+    var category: SettingsSectionCategory {
+        switch self {
+        case .app, .workspaceColors: return .general
+        case .automation, .agentTeams, .agentCLIPaths, .worktrees: return .agents
+        case .dashboard, .services: return .network
+        case .browser: return .browser
+        case .imeInputBar, .keyboardShortcuts: return .input
+        case .reset: return .system
+        }
+    }
+
+    var searchKeywords: [String] {
+        switch self {
+        case .app: return ["app", "theme", "appearance", "dark", "light", "workspace", "placement", "session", "restore", "dock", "badge", "quit", "warn", "rename", "sidebar", "branch", "reorder", "notification"]
+        case .workspaceColors: return ["workspace", "color", "indicator", "palette", "custom"]
+        case .automation: return ["automation", "socket", "claude", "port", "integration", "password"]
+        case .agentTeams: return ["agent", "team", "leader", "model", "directory"]
+        case .agentCLIPaths: return ["cli", "path", "claude", "kiro", "codex", "gemini", "binary", "agent"]
+        case .worktrees: return ["worktrees", "worktree", "base directory", "cleanup", "auto"]
+        case .dashboard: return ["dashboard", "http", "localhost", "port", "remote"]
+        case .services: return ["services", "daemon", "doctor", "status", "restart", "subsystem", "log"]
+        case .browser: return ["browser", "search", "engine", "theme", "link", "history", "http", "insecure", "suggestion"]
+        case .imeInputBar: return ["ime", "input", "bar", "font", "height", "cjk"]
+        case .keyboardShortcuts: return ["keyboard", "shortcut", "keybinding", "hotkey"]
+        case .reset: return ["reset", "clear", "defaults"]
+        }
+    }
+}
+
+enum SettingsSectionCategory: String {
+    case general = "General"
+    case agents = "Agents"
+    case network = "Network"
+    case browser = "Browser"
+    case input = "Input"
+    case system = "System"
+}
+
 struct SettingsView: View {
     private let contentTopInset: CGFloat = 8
     private let pickerColumnWidth: CGFloat = 196
@@ -64,6 +152,7 @@ struct SettingsView: View {
     @State private var daemonStatusInfo: TermMeshDaemon.DaemonStatus?
     @State private var isDaemonRestarting = false
     @State private var daemonLogTail: AttributedString?
+    @State private var selectedSection: SettingsSection = .app
 
     private var selectedWorkspacePlacement: NewWorkspacePlacement {
         NewWorkspacePlacement(rawValue: newWorkspacePlacement) ?? WorkspacePlacementSettings.defaultPlacement
@@ -195,22 +284,311 @@ struct SettingsView: View {
         }
     }
 
+    // MARK: - Sidebar Filtering
+
+    /// Sections that match the current search query.
+    private var visibleSections: [SettingsSection] {
+        guard isSearching else { return SettingsSection.allCases }
+        return SettingsSection.allCases.filter { sectionMatchesSearch($0) }
+    }
+
+    private func sectionMatchesSearch(_ section: SettingsSection) -> Bool {
+        let q = normalizedSearchQuery
+        guard !q.isEmpty else { return true }
+        let keywords = section.searchKeywords
+        return keywords.contains { $0.lowercased().contains(q) }
+    }
+
+    // MARK: - Body
+
     var body: some View {
-        ZStack(alignment: .top) {
+        HStack(spacing: 0) {
+            // --- Sidebar ---
+            settingsSidebar
+                .frame(width: 180)
+
+            Divider()
+
+            // --- Content ---
+            ZStack(alignment: .top) {
+                settingsContentPanel
+                settingsTopBar
+            }
+        }
+        .background(Color(nsColor: .windowBackgroundColor).ignoresSafeArea())
+        .toggleStyle(.switch)
+        .onAppear {
+            browserHistory?.loadIfNeeded()
+            browserThemeMode = BrowserThemeSettings.mode(defaults: .standard).rawValue
+            browserHistoryEntryCount = browserHistory?.entries.count ?? 0
+            browserInsecureHTTPAllowlistDraft = browserInsecureHTTPAllowlist
+            reloadWorkspaceTabColorSettings()
+        }
+        .onChange(of: settingsSearchQuery) { _, _ in
+            // Auto-select first matching section when searching
+            if isSearching, let first = visibleSections.first, !visibleSections.contains(selectedSection) {
+                selectedSection = first
+            }
+        }
+        .onChange(of: browserInsecureHTTPAllowlist) { oldValue, newValue in
+            if browserInsecureHTTPAllowlistDraft == oldValue {
+                browserInsecureHTTPAllowlistDraft = newValue
+            }
+        }
+        .onReceive(BrowserHistoryStore.shared.$entries) { entries in
+            browserHistoryEntryCount = entries.count
+        }
+        .onReceive(NotificationCenter.default.publisher(for: UserDefaults.didChangeNotification)) { _ in
+            reloadWorkspaceTabColorSettings()
+        }
+        .confirmationDialog(
+            "Clear browser history?",
+            isPresented: $showClearBrowserHistoryConfirmation,
+            titleVisibility: .visible
+        ) {
+            Button("Clear History", role: .destructive) {
+                browserHistory?.clearHistory()
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("This removes visited-page suggestions from the browser omnibar.")
+        }
+        .confirmationDialog(
+            "Enable full open access?",
+            isPresented: $showOpenAccessConfirmation,
+            titleVisibility: .visible
+        ) {
+            Button("Enable Full Open Access", role: .destructive) {
+                socketControlMode = (pendingOpenAccessMode ?? .allowAll).rawValue
+                pendingOpenAccessMode = nil
+            }
+            Button("Cancel", role: .cancel) {
+                pendingOpenAccessMode = nil
+            }
+        } message: {
+            Text("This disables ancestry and password checks and opens the socket to all local users. Only enable when you understand the risk.")
+        }
+    }
+
+    // MARK: - Sidebar
+
+    private var settingsSidebar: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            // Search field in sidebar
+            HStack(spacing: 4) {
+                Image(systemName: "magnifyingglass")
+                    .font(.system(size: 11))
+                    .foregroundColor(.secondary)
+                TextField("Search", text: $settingsSearchQuery)
+                    .textFieldStyle(.plain)
+                    .font(.system(size: 12))
+                if !settingsSearchQuery.isEmpty {
+                    Button(action: { settingsSearchQuery = "" }) {
+                        Image(systemName: "xmark.circle.fill")
+                            .font(.system(size: 10))
+                            .foregroundColor(.secondary)
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
+            .padding(.horizontal, 10)
+            .padding(.vertical, 6)
+            .background(
+                RoundedRectangle(cornerRadius: 7, style: .continuous)
+                    .fill(Color(nsColor: .controlBackgroundColor).opacity(0.6))
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 7, style: .continuous)
+                            .stroke(Color(nsColor: .separatorColor).opacity(0.4), lineWidth: 1)
+                    )
+            )
+            .padding(.horizontal, 12)
+            .padding(.top, 52)
+            .padding(.bottom, 8)
+
             ScrollView {
-                VStack(alignment: .leading, spacing: 14) {
-                    if sectionVisible(["app"], rowKeywords: [
-                        ["theme", "appearance", "dark", "light"],
-                        ["workspace", "placement", "new tab", "position"],
-                        ["reorder", "notification"],
-                        ["session", "restore", "resume", "reopen", "directory", "folder", "startup", "launch"],
-                        ["dock", "badge", "unread"],
-                        ["quit", "warn", "confirmation"],
-                        ["rename", "select", "command palette"],
-                        ["sidebar", "branch", "layout", "git"]
-                    ]) {
-                    SettingsSectionHeader(title: "App")
-                    SettingsCard {
+                VStack(alignment: .leading, spacing: 2) {
+                    let sections = visibleSections
+                    var lastCategory: SettingsSectionCategory?
+
+                    ForEach(sections) { section in
+                        let showCategoryHeader = section.category != lastCategory
+                        let _ = { lastCategory = section.category }()
+
+                        if showCategoryHeader, section.category != .system {
+                            if section != sections.first {
+                                Spacer().frame(height: 8)
+                            }
+                            Text(section.category.rawValue)
+                                .font(.system(size: 10, weight: .semibold))
+                                .foregroundColor(.secondary.opacity(0.7))
+                                .textCase(.uppercase)
+                                .padding(.leading, 16)
+                                .padding(.top, 4)
+                                .padding(.bottom, 2)
+                        }
+
+                        Button {
+                            selectedSection = section
+                        } label: {
+                            HStack(spacing: 7) {
+                                Image(systemName: section.icon)
+                                    .font(.system(size: 11))
+                                    .frame(width: 16, alignment: .center)
+                                    .foregroundColor(selectedSection == section ? .white : .secondary)
+                                Text(section.title)
+                                    .font(.system(size: 12))
+                                    .foregroundColor(selectedSection == section ? .white : .primary)
+                                Spacer(minLength: 0)
+                            }
+                            .padding(.horizontal, 10)
+                            .padding(.vertical, 5)
+                            .contentShape(Rectangle())
+                            .background(
+                                RoundedRectangle(cornerRadius: 6, style: .continuous)
+                                    .fill(selectedSection == section ? Color.accentColor : Color.clear)
+                            )
+                        }
+                        .buttonStyle(.plain)
+                        .padding(.horizontal, 8)
+                    }
+                }
+                .padding(.bottom, 12)
+            }
+        }
+        .background(Color(nsColor: .windowBackgroundColor).opacity(0.5))
+    }
+
+    // MARK: - Top Bar
+
+    private var settingsTopBar: some View {
+        ZStack(alignment: .top) {
+            SettingsTitleLeadingInsetReader(inset: $settingsTitleLeadingInset)
+                .frame(width: 0, height: 0)
+
+            AboutVisualEffectBackground(material: .underWindowBackground, blendingMode: .withinWindow)
+                .mask(
+                    LinearGradient(
+                        colors: [
+                            Color.black.opacity(0.9),
+                            Color.black.opacity(0.64),
+                            Color.black.opacity(0.36),
+                            Color.clear
+                        ],
+                        startPoint: .top,
+                        endPoint: .bottom
+                    )
+                )
+                .opacity(0.52)
+
+            AboutVisualEffectBackground(material: .underWindowBackground, blendingMode: .withinWindow)
+                .mask(
+                    LinearGradient(
+                        colors: [
+                            Color.black.opacity(0.98),
+                            Color.black.opacity(0.78),
+                            Color.black.opacity(0.42),
+                            Color.clear
+                        ],
+                        startPoint: .top,
+                        endPoint: .bottom
+                    )
+                )
+                .opacity(0.14 + (topBlurOpacity * 0.86))
+
+            HStack(spacing: 12) {
+                Text(selectedSection.title)
+                    .font(.system(size: 16, weight: .semibold))
+                    .foregroundColor(.primary.opacity(0.92))
+                Spacer(minLength: 0)
+            }
+            .padding(.leading, 20)
+            .padding(.trailing, 20)
+            .padding(.top, 12)
+        }
+        .frame(height: 48)
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+        .ignoresSafeArea(.container, edges: .top)
+        .allowsHitTesting(false)
+    }
+
+    // MARK: - Content Panel
+
+    private var settingsContentPanel: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 14) {
+                sectionContent(for: selectedSection)
+
+                if isSearching && visibleSections.isEmpty {
+                    VStack(spacing: 8) {
+                        Image(systemName: "magnifyingglass")
+                            .font(.system(size: 28))
+                            .foregroundColor(.secondary.opacity(0.5))
+                        Text("No settings match \"\(settingsSearchQuery)\"")
+                            .font(.system(size: 13))
+                            .foregroundColor(.secondary)
+                    }
+                    .frame(maxWidth: .infinity)
+                    .padding(.top, 60)
+                }
+            }
+            .padding(.horizontal, 20)
+            .padding(.bottom, 20)
+            .padding(.top, 52)
+            .background(
+                GeometryReader { proxy in
+                    Color.clear.preference(
+                        key: SettingsTopOffsetPreferenceKey.self,
+                        value: proxy.frame(in: .named("SettingsContentArea")).minY
+                    )
+                }
+            )
+        }
+        .coordinateSpace(name: "SettingsContentArea")
+        .onPreferenceChange(SettingsTopOffsetPreferenceKey.self) { value in
+            if topBlurBaselineOffset == nil {
+                topBlurBaselineOffset = value
+            }
+            topBlurOpacity = blurOpacity(forContentOffset: value)
+        }
+    }
+
+    // MARK: - Section Content Router
+
+    @ViewBuilder
+    private func sectionContent(for section: SettingsSection) -> some View {
+        switch section {
+        case .app:
+            sectionApp
+        case .workspaceColors:
+            sectionWorkspaceColors
+        case .automation:
+            sectionAutomation
+        case .agentTeams:
+            sectionAgentTeams
+        case .agentCLIPaths:
+            sectionAgentCLIPaths
+        case .worktrees:
+            sectionWorktrees
+        case .dashboard:
+            sectionDashboard
+        case .services:
+            sectionServices
+        case .browser:
+            sectionBrowser
+        case .imeInputBar:
+            sectionIMEInputBar
+        case .keyboardShortcuts:
+            sectionKeyboardShortcuts
+        case .reset:
+            sectionReset
+        }
+    }
+
+    // MARK: - Section: App
+
+    @ViewBuilder
+    private var sectionApp: some View {
+        SettingsCard {
                         if settingsMatch("theme", "appearance", "dark", "light", "app") {
                         SettingsCardRow("Theme", controlWidth: pickerColumnWidth) {
                             Picker("", selection: $appearanceMode) {
@@ -334,12 +712,14 @@ struct SettingsView: View {
                         }
                         }
 
-                    }
-                    }
+        }
+    }
 
-                    if settingsMatch("workspace", "color", "indicator", "palette", "custom") {
-                    SettingsSectionHeader(title: "Workspace Colors")
-                    SettingsCard {
+    // MARK: - Section: Workspace Colors
+
+    @ViewBuilder
+    private var sectionWorkspaceColors: some View {
+        SettingsCard {
                         SettingsCardRow(
                             "Workspace Color Indicator",
                             controlWidth: pickerColumnWidth
@@ -427,12 +807,14 @@ struct SettingsView: View {
                             .buttonStyle(.bordered)
                             .controlSize(.small)
                         }
-                    }
-                    }
+        }
+    }
 
-                    if settingsMatch("automation", "socket", "claude", "port", "integration", "password") {
-                    SettingsSectionHeader(title: "Automation")
-                    SettingsCard {
+    // MARK: - Section: Automation
+
+    @ViewBuilder
+    private var sectionAutomation: some View {
+        SettingsCard {
                         SettingsCardRow(
                             "Socket Control Mode",
                             subtitle: selectedSocketControlMode.description,
@@ -533,16 +915,14 @@ struct SettingsView: View {
                         SettingsCardDivider()
 
                         SettingsCardNote("Each workspace gets TERMMESH_PORT and TERMMESH_PORT_END env vars with a dedicated port range. New terminals inherit these values.")
-                    }
-                    }
+        }
+    }
 
-                    if sectionVisible(["agent", "team"], rowKeywords: [
-                        ["leader", "mode", "repl", "claude"],
-                        ["model", "sonnet", "opus", "haiku"],
-                        ["directory", "working", "path"]
-                    ]) {
-                    SettingsSectionHeader(title: "Agent Teams")
-                    SettingsCard {
+    // MARK: - Section: Agent Teams
+
+    @ViewBuilder
+    private var sectionAgentTeams: some View {
+        SettingsCard {
                         if settingsMatch("leader", "mode", "repl", "claude", "agent", "team") {
                         SettingsCardRow(
                             "Default Leader Mode",
@@ -605,12 +985,14 @@ struct SettingsView: View {
                             }
                         }
                         }
-                    }
-                    }
+        }
+    }
 
-                    if settingsMatch("cli", "path", "claude", "kiro", "codex", "gemini", "binary", "agent") {
-                    SettingsSectionHeader(title: "Agent CLI Paths")
-                    SettingsCard {
+    // MARK: - Section: Agent CLI Paths
+
+    @ViewBuilder
+    private var sectionAgentCLIPaths: some View {
+        SettingsCard {
                         CLIPathRow(label: "Claude", cliKey: "claude", path: $cliPathClaude)
                         SettingsCardDivider()
                         CLIPathRow(label: "Kiro", cliKey: "kiro", path: $cliPathKiro)
@@ -619,12 +1001,14 @@ struct SettingsView: View {
                         SettingsCardDivider()
                         CLIPathRow(label: "Gemini", cliKey: "gemini", path: $cliPathGemini)
                     }
-                    SettingsCardNote("Leave empty to use auto-detected path. Custom paths take priority.")
-                    }
+        SettingsCardNote("Leave empty to use auto-detected path. Custom paths take priority.")
+    }
 
-                    if settingsMatch("worktrees", "worktree", "base directory", "cleanup", "auto") {
-                    SettingsSectionHeader(title: "Worktrees")
-                    SettingsCard {
+    // MARK: - Section: Worktrees
+
+    @ViewBuilder
+    private var sectionWorktrees: some View {
+        SettingsCard {
                         SettingsCardRow("Base Directory", subtitle: "Where worktrees are created") {
                             HStack(spacing: 8) {
                                 TextField("", text: Binding(
@@ -658,12 +1042,14 @@ struct SettingsView: View {
                             ))
                             .toggleStyle(.switch)
                         }
-                    }
-                    }
+        }
+    }
 
-                    if settingsMatch("dashboard", "http", "localhost", "port", "remote") {
-                    SettingsSectionHeader(title: "Dashboard")
-                    SettingsCard {
+    // MARK: - Section: Dashboard
+
+    @ViewBuilder
+    private var sectionDashboard: some View {
+        SettingsCard {
                         SettingsCardRow(
                             "HTTP Dashboard",
                             subtitle: dashboardEnabled
@@ -714,12 +1100,14 @@ struct SettingsView: View {
                         SettingsCardDivider()
 
                         SettingsCardNote("Changes take effect after restarting the daemon (quit and relaunch the app). The dashboard shows system metrics, team status, agents, and task boards.")
-                    }
-                    }
+        }
+    }
 
-                    if settingsMatch("services", "daemon", "doctor", "status", "restart", "subsystem", "log") {
-                    SettingsSectionHeader(title: "Services")
-                    SettingsCard {
+    // MARK: - Section: Services
+
+    @ViewBuilder
+    private var sectionServices: some View {
+        SettingsCard {
                         // -- App variant & identity --
                         if let status = daemonStatusInfo {
                             SettingsCardRow(
@@ -955,13 +1343,15 @@ struct SettingsView: View {
                         }
                         .padding(.horizontal, 14)
                         .padding(.vertical, 10)
-                    }
-                    .onAppear { refreshDaemonStatus() }
-                    }
+        }
+        .onAppear { refreshDaemonStatus() }
+    }
 
-                    if settingsMatch("browser", "search", "engine", "theme", "link", "history", "http", "insecure", "suggestion") {
-                    SettingsSectionHeader(title: "Browser")
-                    SettingsCard {
+    // MARK: - Section: Browser
+
+    @ViewBuilder
+    private var sectionBrowser: some View {
+        SettingsCard {
                         SettingsCardRow(
                             "Default Search Engine",
                             subtitle: "Used by the browser address bar when input is not a URL.",
@@ -1124,12 +1514,14 @@ struct SettingsView: View {
                             .controlSize(.small)
                             .disabled(browserHistoryEntryCount == 0)
                         }
-                    }
-                    }
+        }
+    }
 
-                    if settingsMatch("ime", "input", "bar", "font", "height", "cjk") {
-                    SettingsSectionHeader(title: "IME Input Bar")
-                    SettingsCard {
+    // MARK: - Section: IME Input Bar
+
+    @ViewBuilder
+    private var sectionIMEInputBar: some View {
+        SettingsCard {
                         SettingsCardRow("Font Size", subtitle: "Text size in the IME input bar (pt).", controlWidth: pickerColumnWidth) {
                             TextField("", value: $imeBarFontSize, format: .number)
                                 .textFieldStyle(.roundedBorder)
@@ -1147,12 +1539,14 @@ struct SettingsView: View {
                         SettingsCardDivider()
 
                         SettingsCardNote("The IME input bar (Cmd+Shift+I) provides a native text field for CJK composition. Adjust font size and bar height to your preference.")
-                    }
-                    }
+        }
+    }
 
-                    if settingsMatch("keyboard", "shortcut", "keybinding", "hotkey") {
-                    SettingsSectionHeader(title: "Keyboard Shortcuts")
-                    SettingsCard {
+    // MARK: - Section: Keyboard Shortcuts
+
+    @ViewBuilder
+    private var sectionKeyboardShortcuts: some View {
+        SettingsCard {
                         let actions = KeyboardShortcutSettings.Action.allCases
                         ForEach(Array(actions.enumerated()), id: \.element.id) { index, action in
                             ShortcutSettingRow(action: action)
@@ -1163,17 +1557,19 @@ struct SettingsView: View {
                             }
                         }
                     }
-                    .id(shortcutResetToken)
+        .id(shortcutResetToken)
 
-                    Text("Click a shortcut value to record a new shortcut.")
-                        .font(.caption)
-                        .foregroundColor(.secondary)
-                        .padding(.leading, 2)
-                    }
+        Text("Click a shortcut value to record a new shortcut.")
+            .font(.caption)
+            .foregroundColor(.secondary)
+            .padding(.leading, 2)
+    }
 
-                    if settingsMatch("reset", "clear", "defaults") {
-                    SettingsSectionHeader(title: "Reset")
-                    SettingsCard {
+    // MARK: - Section: Reset
+
+    @ViewBuilder
+    private var sectionReset: some View {
+        SettingsCard {
                         HStack {
                             Spacer(minLength: 0)
                             Button("Reset All Settings") {
@@ -1185,181 +1581,6 @@ struct SettingsView: View {
                         }
                         .padding(.horizontal, 14)
                         .padding(.vertical, 10)
-                    }
-                    }
-
-                    if isSearching {
-                        let anyVisible = sectionVisible(["app"], rowKeywords: [["theme"], ["workspace"], ["reorder"], ["session", "restore"], ["dock"], ["quit"], ["rename"], ["sidebar"]])
-                            || settingsMatch("workspace", "color", "indicator", "palette", "custom")
-                            || settingsMatch("automation", "socket", "claude", "port", "integration", "password")
-                            || sectionVisible(["agent", "team"], rowKeywords: [["leader"], ["model"], ["directory"]])
-                            || settingsMatch("services", "daemon", "doctor", "status", "restart", "subsystem", "log")
-                            || settingsMatch("browser", "search", "engine", "theme", "link", "history", "http", "insecure", "suggestion")
-                            || settingsMatch("keyboard", "shortcut", "keybinding", "hotkey")
-                            || settingsMatch("reset", "clear", "defaults")
-                        if !anyVisible {
-                            VStack(spacing: 8) {
-                                Image(systemName: "magnifyingglass")
-                                    .font(.system(size: 28))
-                                    .foregroundColor(.secondary.opacity(0.5))
-                                Text("No settings match \"\(settingsSearchQuery)\"")
-                                    .font(.system(size: 13))
-                                    .foregroundColor(.secondary)
-                            }
-                            .frame(maxWidth: .infinity)
-                            .padding(.top, 60)
-                        }
-                    }
-                }
-                .padding(.horizontal, 20)
-                .padding(.bottom, 20)
-                .padding(.top, contentTopInset)
-                .background(
-                    GeometryReader { proxy in
-                        Color.clear.preference(
-                            key: SettingsTopOffsetPreferenceKey.self,
-                            value: proxy.frame(in: .named("SettingsScrollArea")).minY
-                        )
-                    }
-                )
-            }
-            .coordinateSpace(name: "SettingsScrollArea")
-            .onPreferenceChange(SettingsTopOffsetPreferenceKey.self) { value in
-                if topBlurBaselineOffset == nil {
-                    topBlurBaselineOffset = value
-                }
-                topBlurOpacity = blurOpacity(forContentOffset: value)
-            }
-
-            ZStack(alignment: .top) {
-                SettingsTitleLeadingInsetReader(inset: $settingsTitleLeadingInset)
-                    .frame(width: 0, height: 0)
-
-                AboutVisualEffectBackground(material: .underWindowBackground, blendingMode: .withinWindow)
-                    .mask(
-                        LinearGradient(
-                            colors: [
-                                Color.black.opacity(0.9),
-                                Color.black.opacity(0.64),
-                                Color.black.opacity(0.36),
-                                Color.clear
-                            ],
-                            startPoint: .top,
-                            endPoint: .bottom
-                        )
-                    )
-                    .opacity(0.52)
-
-                AboutVisualEffectBackground(material: .underWindowBackground, blendingMode: .withinWindow)
-                    .mask(
-                        LinearGradient(
-                            colors: [
-                                Color.black.opacity(0.98),
-                                Color.black.opacity(0.78),
-                                Color.black.opacity(0.42),
-                                Color.clear
-                            ],
-                            startPoint: .top,
-                            endPoint: .bottom
-                        )
-                    )
-                    .opacity(0.14 + (topBlurOpacity * 0.86))
-
-                HStack(spacing: 12) {
-                    Text("Settings")
-                        .font(.system(size: 16, weight: .semibold))
-                        .foregroundColor(.primary.opacity(0.92))
-                    Spacer(minLength: 0)
-                    HStack(spacing: 4) {
-                        Image(systemName: "magnifyingglass")
-                            .font(.system(size: 12))
-                            .foregroundColor(.secondary)
-                        TextField("Search", text: $settingsSearchQuery)
-                            .textFieldStyle(.plain)
-                            .font(.system(size: 13))
-                            .frame(width: 140)
-                        if !settingsSearchQuery.isEmpty {
-                            Button(action: { settingsSearchQuery = "" }) {
-                                Image(systemName: "xmark.circle.fill")
-                                    .font(.system(size: 12))
-                                    .foregroundColor(.secondary)
-                            }
-                            .buttonStyle(.plain)
-                        }
-                    }
-                    .padding(.horizontal, 8)
-                    .padding(.vertical, 4)
-                    .background(
-                        RoundedRectangle(cornerRadius: 8, style: .continuous)
-                            .fill(Color(nsColor: .controlBackgroundColor).opacity(0.6))
-                            .overlay(
-                                RoundedRectangle(cornerRadius: 8, style: .continuous)
-                                    .stroke(Color(nsColor: .separatorColor).opacity(0.4), lineWidth: 1)
-                            )
-                    )
-                }
-                .padding(.leading, settingsTitleLeadingInset)
-                .padding(.trailing, 20)
-                .padding(.top, 12)
-            }
-                .frame(height: 62)
-                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
-                .ignoresSafeArea(.container, edges: .top)
-                .overlay(
-                    Rectangle()
-                        .fill(Color(nsColor: .separatorColor).opacity(0.07))
-                        .frame(height: 1),
-                    alignment: .bottom
-                )
-                .allowsHitTesting(true)
-        }
-        .background(Color(nsColor: .windowBackgroundColor).ignoresSafeArea())
-        .toggleStyle(.switch)
-        .onAppear {
-            browserHistory?.loadIfNeeded()
-            browserThemeMode = BrowserThemeSettings.mode(defaults: .standard).rawValue
-            browserHistoryEntryCount = browserHistory?.entries.count ?? 0
-            browserInsecureHTTPAllowlistDraft = browserInsecureHTTPAllowlist
-            reloadWorkspaceTabColorSettings()
-        }
-        .onChange(of: browserInsecureHTTPAllowlist) { oldValue, newValue in
-            // Keep draft in sync with external changes unless the user has local unsaved edits.
-            if browserInsecureHTTPAllowlistDraft == oldValue {
-                browserInsecureHTTPAllowlistDraft = newValue
-            }
-        }
-        .onReceive(BrowserHistoryStore.shared.$entries) { entries in
-            browserHistoryEntryCount = entries.count
-        }
-        .onReceive(NotificationCenter.default.publisher(for: UserDefaults.didChangeNotification)) { _ in
-            reloadWorkspaceTabColorSettings()
-        }
-        .confirmationDialog(
-            "Clear browser history?",
-            isPresented: $showClearBrowserHistoryConfirmation,
-            titleVisibility: .visible
-        ) {
-            Button("Clear History", role: .destructive) {
-                browserHistory?.clearHistory()
-            }
-            Button("Cancel", role: .cancel) {}
-        } message: {
-            Text("This removes visited-page suggestions from the browser omnibar.")
-        }
-        .confirmationDialog(
-            "Enable full open access?",
-            isPresented: $showOpenAccessConfirmation,
-            titleVisibility: .visible
-        ) {
-            Button("Enable Full Open Access", role: .destructive) {
-                socketControlMode = (pendingOpenAccessMode ?? .allowAll).rawValue
-                pendingOpenAccessMode = nil
-            }
-            Button("Cancel", role: .cancel) {
-                pendingOpenAccessMode = nil
-            }
-        } message: {
-            Text("This disables ancestry and password checks and opens the socket to all local users. Only enable when you understand the risk.")
         }
     }
 
