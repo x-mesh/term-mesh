@@ -46,8 +46,12 @@ fi
         if [[ "${TERMMESH_SHELL_INTEGRATION:-${CMUX_SHELL_INTEGRATION:-1}}" != "0" && -n "${TERMMESH_SHELL_INTEGRATION_DIR:-${CMUX_SHELL_INTEGRATION_DIR:-}}" ]]; then
             builtin typeset _termmesh_integ="${TERMMESH_SHELL_INTEGRATION_DIR:-$CMUX_SHELL_INTEGRATION_DIR}/term-mesh-zsh-integration.zsh"
             builtin print -- "[tm-zshenv] integ file: $_termmesh_integ readable=$([[ -r "$_termmesh_integ" ]] && echo yes || echo no)" >> /tmp/term-mesh-zshenv-debug.log 2>/dev/null
-            [[ -r "$_termmesh_integ" ]] && builtin source -- "$_termmesh_integ"
-            builtin print -- "[tm-zshenv] sourced term-mesh integration OK" >> /tmp/term-mesh-zshenv-debug.log 2>/dev/null
+            if [[ -r "$_termmesh_integ" ]]; then
+                builtin source -- "$_termmesh_integ"
+                builtin print -- "[tm-zshenv] source exit=$? _termmesh_send=$(builtin whence -w _termmesh_send 2>&1) precmd_functions=($precmd_functions)" >> /tmp/term-mesh-zshenv-debug.log 2>/dev/null
+            else
+                builtin print -- "[tm-zshenv] integ file NOT readable" >> /tmp/term-mesh-zshenv-debug.log 2>/dev/null
+            fi
         else
             builtin print -- "[tm-zshenv] SKIPPED: condition failed SHELL_INTEGRATION=${TERMMESH_SHELL_INTEGRATION:-${CMUX_SHELL_INTEGRATION:-1}} INTEGRATION_DIR=${TERMMESH_SHELL_INTEGRATION_DIR:-${CMUX_SHELL_INTEGRATION_DIR:-empty}}" >> /tmp/term-mesh-zshenv-debug.log 2>/dev/null
         fi
