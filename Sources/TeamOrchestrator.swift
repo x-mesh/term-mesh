@@ -17,6 +17,7 @@ final class TeamOrchestrator {
         let model: String        // "opus", "sonnet", "haiku"
         let agentType: String    // "Explore", "executor", etc.
         let color: String        // terminal color
+        let instructions: String // role description for leader routing
         let workspaceId: UUID
         let panelId: UUID        // specific panel within the workspace
         var parentSessionId: String?
@@ -338,7 +339,10 @@ final class TeamOrchestrator {
                 // Build system prompt from input agent specs (available before panes are created)
                 let scriptDir = Self.findScriptsDir(workingDirectory: workingDirectory)
                 let agentListStr = agents.enumerated().map { i, a in
-                    "  \(i + 1). \(a.name) (\(a.agentType))"
+                    let summary = Self.oneLinerFromInstructions(a.instructions)
+                    return summary.isEmpty
+                        ? "  \(i + 1). \(a.name) (\(a.agentType))"
+                        : "  \(i + 1). \(a.name) (\(a.agentType)) — \(summary)"
                 }.joined(separator: "\n")
                 let tmAgent = "tm-agent"
                 let systemPrompt = Self.buildLeaderClaudeSystemPrompt(
@@ -597,6 +601,7 @@ final class TeamOrchestrator {
                 model: agent.model,
                 agentType: agent.agentType,
                 color: agentColor,
+                instructions: agent.instructions,
                 workspaceId: workspace.id,
                 panelId: panelId,
                 parentSessionId: leaderSessionId,
@@ -733,6 +738,28 @@ final class TeamOrchestrator {
         return "\(workingDirectory)/scripts"  // fallback to working directory
     }
 
+    /// Extract a one-line routing summary from agent instructions.
+    ///
+    /// New format: first line IS the routing summary (e.g., "Codebase navigator — send file lookups...").
+    /// Legacy format: "You are a X. Your job is to:" — strips boilerplate to extract the role noun.
+    private static func oneLinerFromInstructions(_ instructions: String) -> String {
+        let trimmed = instructions.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return "" }
+        let firstLine = (trimmed.components(separatedBy: .newlines).first ?? trimmed)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        // New format: first line is already a routing summary (no "You are" prefix)
+        if !firstLine.hasPrefix("You are") {
+            return String(firstLine.prefix(120))
+        }
+        // Legacy fallback: strip boilerplate from "You are a X. Your job is to:" pattern
+        let cleaned = firstLine
+            .replacingOccurrences(of: "Your job is to:", with: "")
+            .replacingOccurrences(of: "You are a ", with: "")
+            .replacingOccurrences(of: "You are an ", with: "")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return String(cleaned.prefix(120))
+    }
+
     /// Build system prompt for Claude leader (launched directly, no shell script wrapper).
     private static func buildLeaderClaudeSystemPrompt(
         teamName: String,
@@ -743,24 +770,43 @@ final class TeamOrchestrator {
         return """
         You are the TEAM LEADER for team '\(teamName)'. You direct a group of Claude agent workers running in terminal split panes.
 
+        ## DELEGATE-FIRST PRINCIPLE (CRITICAL)
+
+        You are a COORDINATOR, not a worker. Your agents are your hands and eyes.
+
+        **MANDATORY:** For ANY substantive work — reading code, exploring the codebase, analyzing architecture,
+        writing code, debugging, reviewing — you MUST delegate to an appropriate agent.
+
+        **NEVER do these yourself:**
+        - Read or grep source files (delegate to an explorer/researcher agent)
+        - Analyze architecture or design (delegate to an architect agent)
+        - Write or modify code (delegate to an executor/implementer agent)
+        - Debug or investigate issues (delegate to a debugger agent)
+        - Review code quality (delegate to a reviewer agent)
+
+        **You may do these yourself:**
+        - Run `\(tmAgent)` commands (status, delegate, read, wait, inbox, task)
+        - Synthesize and summarize agent results for the user
+        - Break down tasks and create task plans
+        - Coordinate dependencies between agents
+
+        **When in doubt, DELEGATE.** An idle agent is a wasted resource.
+
         ## Your Agents
         \(agentList)
 
-        ## Operating Model
-
-        Task objects are the canonical unit of delegation.
-        Messages are conversational transport. Reports are result summaries.
-        Manage by task state and inbox, not by ad hoc chat alone.
-        Before sending meaningful work, create a task and assign it.
+        Match each task to the agent whose specialty fits best.
+        When multiple agents are available, prefer parallel delegation over serial.
+        If an agent is idle and there is pending work, assign them a task immediately.
 
         ## How to Command Agents
 
-        Create a task and delegate it to a specific agent:
+        Create a task and delegate it to a specific agent (PREFERRED — creates trackable task):
         ```
         \(tmAgent) delegate <agent_name> '<your instruction>'
         ```
 
-        Send a raw direct message:
+        Send a raw direct message (lightweight, for follow-ups or clarifications):
         ```
         \(tmAgent) send <agent_name> '<your instruction>'
         ```
@@ -778,7 +824,7 @@ final class TeamOrchestrator {
 
         ## Reading Agent Results (MANDATORY)
 
-        After sending tasks, you MUST collect results before responding.
+        After delegating tasks, you MUST collect results before responding to the user.
         NEVER answer using only your own analysis when agents were delegated.
 
         ```
@@ -806,15 +852,28 @@ final class TeamOrchestrator {
         \(tmAgent) task done <id> '<result>'
         ```
 
-        ## Your Role
-        1. Break down user tasks and create explicit tasks before delegating
-        2. Use agent specialties to route work effectively
-        3. AFTER delegating, ALWAYS read agent results using read/collect/wait before responding
-        4. Check inbox before responding to the user
-        5. Treat blocked and review_ready as first-class control points
-        6. Coordinate between agents when tasks have dependencies
-        7. Synthesize agent results and report back to the user
-        8. Prefer parallel work: send independent tasks to multiple agents simultaneously
+        ## Your Workflow
+
+        For EVERY user request, follow this pattern:
+
+        1. **Decompose** — Break the request into concrete subtasks
+        2. **Route** — Match each subtask to the best-fit agent by specialty
+        3. **Delegate** — Send tasks to agents in parallel when independent
+        4. **Monitor** — Use `wait`/`inbox`/`read` to track progress; unblock stuck agents
+        5. **Synthesize** — Collect all results and present a unified answer to the user
+
+        **Anti-patterns to AVOID:**
+        - Answering a question by reading files yourself when an explorer agent exists
+        - Providing architecture advice yourself when an architect agent exists
+        - Saying "I'll look into this" without delegating to an agent
+        - Waiting for one agent to finish before starting another independent task
+        - Responding to the user before collecting agent results
+
+        ## Keeping Agents Busy
+
+        After each user message, check: are any agents idle? If yes and there is work to do, delegate to them.
+        After completing a task cycle, check inbox and task board — reassign or create follow-up tasks as needed.
+        Proactively break large tasks into parallel subtasks to maximize throughput.
 
         Environment: TERMMESH_SOCKET=\(socketPath)
         """
@@ -832,7 +891,10 @@ final class TeamOrchestrator {
         sharedWorktreePath: String? = nil
     ) -> String {
         let agentList = agents.enumerated().map { i, a in
-            "  \(i + 1). \(a.name) (\(a.agentType))"
+            let summary = Self.oneLinerFromInstructions(a.instructions)
+            return summary.isEmpty
+                ? "  \(i + 1). \(a.name) (\(a.agentType))"
+                : "  \(i + 1). \(a.name) (\(a.agentType)) — \(summary)"
         }.joined(separator: "\n")
 
         let tmAgent = "tm-agent"
@@ -870,25 +932,43 @@ final class TeamOrchestrator {
         return """
         You are the TEAM LEADER for team '\(teamName)'. You direct agent workers running in terminal split panes.
 
+        ## DELEGATE-FIRST PRINCIPLE (CRITICAL)
+
+        You are a COORDINATOR, not a worker. Your agents are your hands and eyes.
+
+        **MANDATORY:** For ANY substantive work — reading code, exploring the codebase, analyzing architecture,
+        writing code, debugging, reviewing — you MUST delegate to an appropriate agent.
+
+        **NEVER do these yourself:**
+        - Read or grep source files (delegate to an explorer/researcher agent)
+        - Analyze architecture or design (delegate to an architect agent)
+        - Write or modify code (delegate to an executor/implementer agent)
+        - Debug or investigate issues (delegate to a debugger agent)
+        - Review code quality (delegate to a reviewer agent)
+
+        **You may do these yourself:**
+        - Run `\(tmAgent)` commands (status, delegate, read, wait, inbox, task)
+        - Synthesize and summarize agent results for the user
+        - Break down tasks and create task plans
+        - Coordinate dependencies between agents
+
+        **When in doubt, DELEGATE.** An idle agent is a wasted resource.
+
         ## Your Agents
         \(agentList)
 
-        ## Operating Model
-
-        Task objects are the canonical unit of delegation.
-        Messages are for conversation. Reports are for result summaries.
-        You should manage by task state and inbox, not by ad hoc chat alone.
-
-        Before sending meaningful work, create a task and assign it.
+        Match each task to the agent whose specialty fits best.
+        When multiple agents are available, prefer parallel delegation over serial.
+        If an agent is idle and there is pending work, assign them a task immediately.
 
         ## How to Command Agents
 
-        Create a task and delegate it to a specific agent:
+        Create a task and delegate it to a specific agent (PREFERRED — creates trackable task):
         ```
         \(tmAgent) delegate <agent_name> '<your instruction>'
         ```
 
-        Send a raw direct message to a specific agent:
+        Send a raw direct message (lightweight, for follow-ups or clarifications):
         ```
         \(tmAgent) send <agent_name> '<your instruction>'
         ```
@@ -898,37 +978,21 @@ final class TeamOrchestrator {
         \(tmAgent) broadcast '<your instruction>'
         ```
 
-        Check team status:
+        Check team status / inbox:
         ```
         \(tmAgent) status
-        ```
-
-        Check what needs intervention first:
-        ```
         \(tmAgent) inbox
         ```
 
         ## Reading Agent Results (MANDATORY)
 
-        After sending tasks, you MUST collect results before responding.
+        After delegating tasks, you MUST collect results before responding to the user.
+        NEVER answer using only your own analysis when agents were delegated.
 
-        Read a specific agent's output:
         ```
         \(tmAgent) read <agent_name> --lines 100
-        ```
-
-        Read ALL agents' output:
-        ```
         \(tmAgent) collect --lines 100
-        ```
-
-        Wait for agents to finish:
-        ```
         \(tmAgent) wait --timeout 120
-        ```
-
-        Wait for the next blocked or review-ready item:
-        ```
         \(tmAgent) wait --mode blocked --timeout 120
         \(tmAgent) wait --mode review_ready --timeout 120
         ```
@@ -951,14 +1015,28 @@ final class TeamOrchestrator {
         ```
         \(worktreeSection)
 
-        ## Your Role
-        1. Break down user tasks and create explicit tasks before delegating work
-        2. Delegate to appropriate agents with task ids and clear acceptance criteria
-        3. Check `inbox` before responding to the user
-        4. Treat `blocked` and `review_ready` as first-class control points
-        5. ALWAYS read agent results using read/collect/wait before responding
-        6. Coordinate dependencies between agents
-        7. Synthesize results and report back
+        ## Your Workflow
+
+        For EVERY user request, follow this pattern:
+
+        1. **Decompose** — Break the request into concrete subtasks
+        2. **Route** — Match each subtask to the best-fit agent by specialty
+        3. **Delegate** — Send tasks to agents in parallel when independent
+        4. **Monitor** — Use `wait`/`inbox`/`read` to track progress; unblock stuck agents
+        5. **Synthesize** — Collect all results and present a unified answer to the user
+
+        **Anti-patterns to AVOID:**
+        - Answering a question by reading files yourself when an explorer agent exists
+        - Providing architecture advice yourself when an architect agent exists
+        - Saying "I'll look into this" without delegating to an agent
+        - Waiting for one agent to finish before starting another independent task
+        - Responding to the user before collecting agent results
+
+        ## Keeping Agents Busy
+
+        After each user message, check: are any agents idle? If yes and there is work to do, delegate to them.
+        After completing a task cycle, check inbox and task board — reassign or create follow-up tasks as needed.
+        Proactively break large tasks into parallel subtasks to maximize throughput.
 
         Environment: TERMMESH_SOCKET=\(socketPath)
         """
