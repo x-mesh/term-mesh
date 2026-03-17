@@ -649,8 +649,17 @@ final class GhosttySurfaceScrollView: NSView {
                    let surface = self.surfaceView.terminalSurface {
                     surface.sendText(text)
                     surface.sendSurfaceKeyPress(keycode: 0x24, text: "\r")
-                } else {
+                } else if self.surfaceView.surface != nil {
                     self.surfaceView.sendIMEText(text)
+                } else {
+                    // Surface temporarily nil (pane re-creation) — retry once after 50ms
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) { [weak self] in
+                        guard let self, self.surfaceView.surface != nil else {
+                            NSSound.beep()
+                            return
+                        }
+                        self.surfaceView.sendIMEText(text)
+                    }
                 }
             },
             onBroadcast: { text in
@@ -724,6 +733,9 @@ final class GhosttySurfaceScrollView: NSView {
         imeInputBarHostingView = nil
         // Re-layout to restore terminal to full size
         needsLayout = true
+        // Only restore focus if the surface view is still in a valid window hierarchy.
+        // During window close or tab switch, moveFocus would target a detached view.
+        guard window != nil, surfaceView.window != nil else { return }
         moveFocus()
     }
 

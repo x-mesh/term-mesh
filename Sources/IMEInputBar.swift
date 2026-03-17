@@ -523,9 +523,8 @@ struct IMETextEditor: NSViewRepresentable {
             }
             textView.string = text
             textView.setSelectedRange(NSRange(location: textView.string.count, length: 0))
-            textView.applyRainbowKeywords()
         }
-        // Update colors when appearance changes
+        // Update colors when appearance changes (must run BEFORE applyRainbowKeywords)
         textView.textColor = NSColor.textColor
         textView.backgroundColor = .clear
         textView.insertionPointColor = NSColor.textColor
@@ -534,6 +533,8 @@ struct IMETextEditor: NSViewRepresentable {
             .underlineStyle: NSUnderlineStyle.single.rawValue,
             .underlineColor: NSColor.cyan.withAlphaComponent(0.6),
         ]
+        // Re-apply rainbow keywords AFTER all color resets so they aren't overwritten
+        textView.applyRainbowKeywords()
 
         textView.submitHandler = onSubmit
         textView.cancelHandler = onCancel
@@ -695,6 +696,11 @@ final class IMETextView: NSTextView {
             historySearchHandler?()
             return
         }
+        // Ctrl+Backspace → Ctrl+U (delete line) in terminal
+        if event.keyCode == 51 && event.modifierFlags.contains(.control) {
+            sendKeyHandler?(32, UInt32(GHOSTTY_MODS_CTRL.rawValue))
+            return
+        }
         // Shift+Tab → forward to terminal (Claude Code uses this for accepting suggestions)
         if event.keyCode == 48 && event.modifierFlags.contains(.shift) {
             sendKeyHandler?(event.keyCode, UInt32(GHOSTTY_MODS_SHIFT.rawValue))
@@ -755,6 +761,15 @@ final class IMETextView: NSTextView {
             return
         }
         super.keyDown(with: event)
+    }
+
+    override func deleteBackward(_ sender: Any?) {
+        if string.isEmpty {
+            // IME bar is empty → forward Backspace to terminal
+            sendKeyHandler?(51, 0)
+            return
+        }
+        super.deleteBackward(sender)
     }
 
     private func isCursorOnFirstLine() -> Bool {
