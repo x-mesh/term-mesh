@@ -2,6 +2,14 @@
 
 All notable changes to term-mesh are documented here.
 
+## [0.69.0] - 2026-03-17
+
+### Fixed
+- IME composition no longer strips trailing newline on Enter submit
+- Team creation now routes to the correct window instead of always targeting the last active window
+- Team name uniqueness is now enforced across all windows, not just the current one
+- Agents in shared/isolated worktree mode now correctly start in the worktree directory
+
 ## [0.64.2] - 2026-03-16
 
 ### Fixed
