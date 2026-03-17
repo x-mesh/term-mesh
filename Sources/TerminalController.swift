@@ -1946,7 +1946,55 @@ class TerminalController {
         }
         // Only the actual team creation needs MainActor
         let result: V2CallResult = await MainActor.run {
-            guard let tabManager = self.tabManager else {
+            // Resolve TabManager from params (window_id > surface_id > key window > fallback).
+            // We're already on MainActor, so call AppDelegate directly without v2MainSync.
+            let tabManager: TabManager? = {
+                let appDelegate = AppDelegate.shared
+                // 1. Explicit window_id
+                if let windowIdStr = params["window_id"] as? String,
+                   let windowId = UUID(uuidString: windowIdStr),
+                   let tm = appDelegate?.tabManagerFor(windowId: windowId) {
+                    #if DEBUG
+                    dlog("[team.create] resolved tabManager via window_id=\(windowIdStr)")
+                    #endif
+                    return tm
+                }
+                // 2. surface_id from caller's pane (TERMMESH_PANEL_ID)
+                if let surfaceIdStr = params["surface_id"] as? String,
+                   let surfaceId = UUID(uuidString: surfaceIdStr) {
+                    if let tm = appDelegate?.locateSurface(surfaceId: surfaceId)?.tabManager {
+                        #if DEBUG
+                        dlog("[team.create] resolved tabManager via surface_id=\(surfaceIdStr)")
+                        #endif
+                        return tm
+                    }
+                    #if DEBUG
+                    dlog("[team.create] surface_id=\(surfaceIdStr) NOT found in any window")
+                    #endif
+                }
+                // 3. Current key window — most reliable for "which window is the user in"
+                if let appDelegate,
+                   let keyWindow = NSApp.keyWindow,
+                   let ctx = appDelegate.contextForMainWindow(keyWindow) {
+                    #if DEBUG
+                    let windowId = appDelegate.windowId(for: ctx.tabManager)?.uuidString ?? "?"
+                    dlog("[team.create] resolved tabManager via keyWindow windowId=\(windowId)")
+                    #endif
+                    return ctx.tabManager
+                }
+                // 4. Fallback to last active tabManager
+                #if DEBUG
+                let selfWindowId = self.v2ResolveWindowId(tabManager: self.tabManager)?.uuidString ?? "?"
+                dlog("[team.create] FALLBACK to self.tabManager windowId=\(selfWindowId)")
+                #endif
+                return self.tabManager
+            }()
+            #if DEBUG
+            let surfaceParam = params["surface_id"] as? String ?? "nil"
+            let windowParam = params["window_id"] as? String ?? "nil"
+            dlog("[team.create] params: surface_id=\(surfaceParam) window_id=\(windowParam) resolved_tabManager=\(tabManager != nil)")
+            #endif
+            guard let tabManager else {
                 return V2CallResult.err(code: "unavailable", message: "TabManager not available", data: nil)
             }
             if let team = TeamOrchestrator.shared.createTeam(

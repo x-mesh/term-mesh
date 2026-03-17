@@ -1011,14 +1011,19 @@ fn run_create(
     eprintln!("Creating team '{team}' with {count} agent(s) [leader: {leader_mode}]...");
     eprintln!("Socket: {}", sock.display());
 
-    let r = match rpc_call_timeout(sock, "team.create", json!({
+    // Pass caller's panel ID so the app can route team creation to the correct window
+    let mut create_params = json!({
         "team_name": team,
         "working_directory": workdir,
         "leader_session_id": format!("leader-{}", process::id()),
         "leader_mode": leader_mode,
         "leader_model": leader_model,
         "agents": agents,
-    }), 5) {
+    });
+    if let Ok(panel_id) = env::var("TERMMESH_PANEL_ID") {
+        create_params["surface_id"] = json!(panel_id);
+    }
+    let r = match rpc_call_timeout(sock, "team.create", create_params, 5) {
         Ok(v) => v,
         Err(e) => { eprintln!("Error: {e}"); process::exit(1); }
     };

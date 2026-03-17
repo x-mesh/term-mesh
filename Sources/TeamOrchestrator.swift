@@ -244,15 +244,24 @@ final class TeamOrchestrator {
     ) -> Team? {
         guard !agents.isEmpty else { return nil }
 
-        // Auto-cleanup: if a team with this name exists but its workspace was closed, remove the stale entry
+        // Auto-cleanup: if a team with this name exists but its workspace was closed, remove the stale entry.
+        // Check across ALL windows (not just the current tabManager) to enforce global uniqueness.
         if let existing = teams[name] {
-            if tabManager.tabs.first(where: { $0.id == existing.workspaceId }) == nil {
-                Logger.team.info("cleaning up stale team '\(name, privacy: .public)' (workspace closed)")
-                teams.removeValue(forKey: name)
-            } else {
+            let workspaceAlive: Bool = {
+                // First check if any window still contains this workspace
+                if let appDelegate = AppDelegate.shared,
+                   appDelegate.contextContainingTabId(existing.workspaceId) != nil {
+                    return true
+                }
+                // Fallback: check the passed tabManager (in case AppDelegate lookup fails)
+                return tabManager.tabs.contains(where: { $0.id == existing.workspaceId })
+            }()
+            if workspaceAlive {
                 Logger.team.info("team '\(name, privacy: .public)' already exists")
                 return nil
             }
+            Logger.team.info("cleaning up stale team '\(name, privacy: .public)' (workspace closed)")
+            teams.removeValue(forKey: name)
         }
 
         // Validate that all required CLI binaries are available
