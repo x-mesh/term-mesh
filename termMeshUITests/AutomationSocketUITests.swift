@@ -3,21 +3,21 @@ import Foundation
 
 final class AutomationSocketUITests: XCTestCase {
     private var socketPath = ""
-    private let defaultsDomain = "com.cmuxterm.app.debug"
+    private let defaultsDomain = "com.term-meshterm.app.debug"
     private let modeKey = "socketControlMode"
     private let legacyKey = "socketControlEnabled"
 
     override func setUp() {
         super.setUp()
         continueAfterFailure = false
-        socketPath = "/tmp/cmux-debug-\(UUID().uuidString).sock"
+        socketPath = "/tmp/term-mesh-debug-\(UUID().uuidString).sock"
         resetSocketDefaults()
         removeSocketFile()
     }
 
     func testSocketToggleDisablesAndEnables() {
         let app = XCUIApplication()
-        app.launchArguments += ["-\(modeKey)", "cmuxOnly"]
+        app.launchArguments += ["-\(modeKey)", "term-meshOnly"]
         app.launchEnvironment["TERMMESH_SOCKET_PATH"] = socketPath
         app.launch()
         app.activate()
@@ -75,7 +75,7 @@ final class AutomationSocketUITests: XCTestCase {
         guard let entries = try? FileManager.default.contentsOfDirectory(atPath: tmpPath) else {
             return nil
         }
-        let matches = entries.filter { $0.hasPrefix("cmux") && $0.hasSuffix(".sock") }
+        let matches = entries.filter { $0.hasPrefix("term-mesh") && $0.hasSuffix(".sock") }
         if let debug = matches.first(where: { $0.contains("debug") }) {
             return (tmpPath as NSString).appendingPathComponent(debug)
         }

@@ -5,7 +5,7 @@ import path from "path";
 export const metadata: Metadata = {
   title: "Changelog",
   description:
-    "cmux release notes and version history. New features, bug fixes, and changes for the native macOS terminal.",
+    "term-mesh release notes and version history. New features, bug fixes, and changes for the native macOS terminal.",
 };
 
 interface ChangelogSection {
@@ -105,7 +105,7 @@ export default function ChangelogPage() {
   return (
     <>
       <h1>Changelog</h1>
-      <p>All notable changes to cmux are documented here.</p>
+      <p>All notable changes to term-mesh are documented here.</p>
 
       {versions.map((v) => (
         <div key={v.version} className="mb-8">

@@ -1,4 +1,4 @@
-# cmux 아키텍처 코드 리뷰 보고서
+# term-mesh 아키텍처 코드 리뷰 보고서
 **리뷰 대상:** Sources/ 디렉토리 & tests/
 **리뷰 날짜:** 2026-03-09
 **리뷰어:** reviewer (Code Review Agent)
@@ -7,7 +7,7 @@
 
 ## 요약
 
-cmux 프로젝트는 **macOS GPU-가속 멀티에이전트 제어 플레인**으로, 다음과 같은 핵심 특성을 가지고 있습니다:
+term-mesh 프로젝트는 **macOS GPU-가속 멀티에이전트 제어 플레인**으로, 다음과 같은 핵심 특성을 가지고 있습니다:
 
 - ✅ **멀티 CLI 통합:** Claude, Kiro, Codex, Gemini 4가지 AI 코딩 에이전트 지원
 - ✅ **워크트리 격리:** 각 에이전트가 독립적 git 브랜치에서 작업
@@ -314,7 +314,7 @@ final class TerminalController: NSObject {
 
 **테스트 현황:**
 - 56개 테스트 파일
-- cmux.py (45K) - Python 테스트 유틸
+- term-mesh.py (45K) - Python 테스트 유틸
 - 대부분 **E2E 테스트** (UI, 터미널 입출력)
 - **단위 테스트 거의 없음**
 
@@ -645,7 +645,7 @@ struct TeamBuilder {
 
 ## 결론
 
-**cmux는 야심찬 멀티에이전트 제어 플레인이지만, 현재 아키텍처에서 개선이 필요합니다:**
+**term-mesh는 야심찬 멀티에이전트 제어 플레인이지만, 현재 아키텍처에서 개선이 필요합니다:**
 
 1. **Protocol 추상화 도입** → Protocol-Oriented Programming으로 테스트 용이성 확보
 2. **거대 파일 분해** → 책임 명확화 및 이해도 향상

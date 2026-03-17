@@ -385,7 +385,7 @@ final class AppDelegateWindowContextRoutingTests: XCTestCase {
             backing: .buffered,
             defer: false
         )
-        window.identifier = NSUserInterfaceItemIdentifier("cmux.main.\(id.uuidString)")
+        window.identifier = NSUserInterfaceItemIdentifier("term-mesh.main.\(id.uuidString)")
         return window
     }
 
@@ -1582,7 +1582,7 @@ final class CommandPaletteKeyboardNavigationTests: XCTestCase {
 }
 
 final class CommandPaletteRenameSelectionSettingsTests: XCTestCase {
-    private let suiteName = "cmux.tests.commandPaletteRenameSelection.\(UUID().uuidString)"
+    private let suiteName = "term-mesh.tests.commandPaletteRenameSelection.\(UUID().uuidString)"
 
     private func makeDefaults() -> UserDefaults {
         let defaults = UserDefaults(suiteName: suiteName)!
@@ -3294,36 +3294,36 @@ final class SidebarDragAutoScrollPlannerTests: XCTestCase {
 final class FinderServicePathResolverTests: XCTestCase {
     func testOrderedUniqueDirectoriesUsesParentForFilesAndDedupes() {
         let input: [URL] = [
-            URL(fileURLWithPath: "/tmp/cmux-services/project", isDirectory: true),
-            URL(fileURLWithPath: "/tmp/cmux-services/project/README.md", isDirectory: false),
-            URL(fileURLWithPath: "/tmp/cmux-services/../cmux-services/project", isDirectory: true),
-            URL(fileURLWithPath: "/tmp/cmux-services/other", isDirectory: true),
+            URL(fileURLWithPath: "/tmp/term-mesh-services/project", isDirectory: true),
+            URL(fileURLWithPath: "/tmp/term-mesh-services/project/README.md", isDirectory: false),
+            URL(fileURLWithPath: "/tmp/term-mesh-services/../term-mesh-services/project", isDirectory: true),
+            URL(fileURLWithPath: "/tmp/term-mesh-services/other", isDirectory: true),
         ]
 
         let directories = FinderServicePathResolver.orderedUniqueDirectories(from: input)
         XCTAssertEqual(
             directories,
             [
-                "/tmp/cmux-services/project",
-                "/tmp/cmux-services/other",
+                "/tmp/term-mesh-services/project",
+                "/tmp/term-mesh-services/other",
             ]
         )
     }
 
     func testOrderedUniqueDirectoriesPreservesFirstSeenOrder() {
         let input: [URL] = [
-            URL(fileURLWithPath: "/tmp/cmux-services/b", isDirectory: true),
-            URL(fileURLWithPath: "/tmp/cmux-services/a/file.txt", isDirectory: false),
-            URL(fileURLWithPath: "/tmp/cmux-services/a", isDirectory: true),
-            URL(fileURLWithPath: "/tmp/cmux-services/b/file.txt", isDirectory: false),
+            URL(fileURLWithPath: "/tmp/term-mesh-services/b", isDirectory: true),
+            URL(fileURLWithPath: "/tmp/term-mesh-services/a/file.txt", isDirectory: false),
+            URL(fileURLWithPath: "/tmp/term-mesh-services/a", isDirectory: true),
+            URL(fileURLWithPath: "/tmp/term-mesh-services/b/file.txt", isDirectory: false),
         ]
 
         let directories = FinderServicePathResolver.orderedUniqueDirectories(from: input)
         XCTAssertEqual(
             directories,
             [
-                "/tmp/cmux-services/b",
-                "/tmp/cmux-services/a",
+                "/tmp/term-mesh-services/b",
+                "/tmp/term-mesh-services/a",
             ]
         )
     }
@@ -5684,22 +5684,22 @@ final class TerminalOpenURLTargetResolutionTests: XCTestCase {
     }
 
     func testResolvesFileSchemeAsExternal() throws {
-        let target = try XCTUnwrap(resolveTerminalOpenURLTarget("file:///tmp/cmux.txt"))
+        let target = try XCTUnwrap(resolveTerminalOpenURLTarget("file:///tmp/term-mesh.txt"))
         switch target {
         case let .external(url):
             XCTAssertTrue(url.isFileURL)
-            XCTAssertEqual(url.path, "/tmp/cmux.txt")
+            XCTAssertEqual(url.path, "/tmp/term-mesh.txt")
         default:
             XCTFail("Expected file URL to open externally")
         }
     }
 
     func testResolvesAbsolutePathAsExternalFileURL() throws {
-        let target = try XCTUnwrap(resolveTerminalOpenURLTarget("/tmp/cmux-path.txt"))
+        let target = try XCTUnwrap(resolveTerminalOpenURLTarget("/tmp/term-mesh-path.txt"))
         switch target {
         case let .external(url):
             XCTAssertTrue(url.isFileURL)
-            XCTAssertEqual(url.path, "/tmp/cmux-path.txt")
+            XCTAssertEqual(url.path, "/tmp/term-mesh-path.txt")
         default:
             XCTFail("Expected absolute file path to open externally")
         }
@@ -5716,12 +5716,12 @@ final class TerminalOpenURLTargetResolutionTests: XCTestCase {
     }
 
     func testResolvesHostlessHTTPSAsExternal() throws {
-        let target = try XCTUnwrap(resolveTerminalOpenURLTarget("https:///tmp/cmux.txt"))
+        let target = try XCTUnwrap(resolveTerminalOpenURLTarget("https:///tmp/term-mesh.txt"))
         switch target {
         case let .external(url):
             XCTAssertEqual(url.scheme, "https")
             XCTAssertNil(url.host)
-            XCTAssertEqual(url.path, "/tmp/cmux.txt")
+            XCTAssertEqual(url.path, "/tmp/term-mesh.txt")
         default:
             XCTFail("Expected hostless HTTPS URL to open externally")
         }
@@ -5960,15 +5960,15 @@ final class TerminalControllerSidebarDedupeTests: XCTestCase {
 
     func testNormalizeReportedDirectoryTrimsWhitespace() {
         XCTAssertEqual(
-            TerminalController.normalizeReportedDirectory("   /Users/cmux/project   "),
-            "/Users/cmux/project"
+            TerminalController.normalizeReportedDirectory("   /Users/term-mesh/project   "),
+            "/Users/term-mesh/project"
         )
     }
 
     func testNormalizeReportedDirectoryResolvesFileURL() {
         XCTAssertEqual(
-            TerminalController.normalizeReportedDirectory("file:///Users/cmux/project"),
-            "/Users/cmux/project"
+            TerminalController.normalizeReportedDirectory("file:///Users/term-mesh/project"),
+            "/Users/term-mesh/project"
         )
     }
 

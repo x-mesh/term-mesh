@@ -165,7 +165,7 @@ tm-agent task done <task_id> "PR merged"
 
 ### Socket Communication
 - All commands communicate via Unix domain socket
-- Default sockets: `/tmp/term-mesh-debug.sock`, `/tmp/term-mesh.sock`, `/tmp/cmux.sock`
+- Default sockets: `/tmp/term-mesh-debug.sock`, `/tmp/term-mesh.sock`, `/tmp/term-mesh.sock`
 - Socket detected automatically or via `TERMMESH_SOCKET` env var
 
 ### RPC Protocol

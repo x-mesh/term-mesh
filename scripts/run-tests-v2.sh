@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# This runner is intended for the UTM macOS VM (ssh cmux-vm).
+# This runner is intended for the UTM macOS VM (ssh term-mesh-vm).
 # It is intentionally guarded so we don't accidentally kill the host user's term-mesh instances.
-if [ "$(id -un)" != "cmux" ]; then
-  echo "ERROR: This script is intended to be run on the cmux-vm (user: cmux)." >&2
-  echo "Run via: ssh cmux-vm 'cd /Users/cmux/GhosttyTabs && ./scripts/run-tests-v2.sh'" >&2
+if [ "$(id -un)" != "term-mesh" ]; then
+  echo "ERROR: This script is intended to be run on the term-mesh-vm (user: term-mesh)." >&2
+  echo "Run via: ssh term-mesh-vm 'cd /Users/term-mesh/GhosttyTabs && ./scripts/run-tests-v2.sh'" >&2
   exit 2
 fi
 
@@ -35,7 +35,7 @@ fi
 cleanup() {
   pkill -x "term-mesh DEV" || true
   pkill -x "term-mesh" || true
-  rm -f /tmp/term-mesh*.sock /tmp/cmux*.sock || true
+  rm -f /tmp/term-mesh*.sock /tmp/term-mesh*.sock || true
 }
 
 launch_and_wait() {
@@ -55,7 +55,7 @@ launch_and_wait() {
 
   SOCK=""
   for _ in {1..120}; do
-    SOCK=$(ls -t /tmp/term-mesh-debug*.sock /tmp/term-mesh*.sock /tmp/cmux-debug*.sock /tmp/cmux*.sock 2>/dev/null | head -1 || true)
+    SOCK=$(ls -t /tmp/term-mesh-debug*.sock /tmp/term-mesh*.sock /tmp/term-mesh-debug*.sock /tmp/term-mesh*.sock 2>/dev/null | head -1 || true)
     if [ -n "$SOCK" ] && [ -S "$SOCK" ]; then
       break
     fi

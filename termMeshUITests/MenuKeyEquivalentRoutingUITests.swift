@@ -198,7 +198,7 @@ final class SplitCloseRightBlankRegressionUITests: XCTestCase {
         diagnosticsPath = "/tmp/term-mesh-ui-test-diagnostics-\(UUID().uuidString).json"
         // Prefer a globally accessible dir so we can pull screenshots from the VM for debugging.
         // If sandbox rules prevent this, fall back to the runner's container temp dir.
-        let leaf = "cmux-ui-test-split-close-right-shots-\(UUID().uuidString)"
+        let leaf = "term-mesh-ui-test-split-close-right-shots-\(UUID().uuidString)"
         let preferredURL = URL(fileURLWithPath: "/private/tmp").appendingPathComponent(leaf)
         let fallbackURL = FileManager.default.temporaryDirectory.appendingPathComponent(leaf)
         // Attempt to create the preferred dir; if it fails, use fallback.

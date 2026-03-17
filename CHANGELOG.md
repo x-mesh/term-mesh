@@ -327,7 +327,7 @@ _No user-facing changes._
 ## [0.23.0] - 2026-02-09
 
 ### Changed
-- Rename app to cmux — new app name, socket paths, Homebrew tap, and CLI binary name (bundle ID remains `com.termmesh.app` for Sparkle update continuity)
+- Rename app to term-mesh — new app name, socket paths, Homebrew tap, and CLI binary name (bundle ID remains `com.termmesh.app` for Sparkle update continuity)
 - Sidebar now shows tab status as text instead of colored dots, with instant git HEAD change detection
 
 ### Fixed
@@ -460,7 +460,7 @@ _No user-facing changes._
 ## [0.4.0] - 2025-01-28
 
 ### Added
-- cmux CLI with socket control modes
+- term-mesh CLI with socket control modes
 - NSPopover-based notifications
 
 ### Fixed

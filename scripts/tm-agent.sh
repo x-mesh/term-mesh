@@ -30,7 +30,7 @@ set -e
 if [ -n "$TERMMESH_SOCKET" ]; then
     SOCK="$TERMMESH_SOCKET"
 else
-    for f in /tmp/term-mesh-debug-*.sock /tmp/term-mesh-debug.sock /tmp/term-mesh.sock /tmp/cmux.sock; do
+    for f in /tmp/term-mesh-debug-*.sock /tmp/term-mesh-debug.sock /tmp/term-mesh.sock /tmp/term-mesh.sock; do
         [ -S "$f" ] && SOCK="$f" && break
     done
 fi

@@ -4,7 +4,7 @@ import { CodeBlock } from "../../components/code-block";
 export const metadata: Metadata = {
   title: "Concepts",
   description:
-    "How cmux organizes terminals: windows, workspaces, panes, and surfaces. The hierarchy behind the sidebar, splits, and socket API.",
+    "How term-mesh organizes terminals: windows, workspaces, panes, and surfaces. The hierarchy behind the sidebar, splits, and socket API.",
 };
 
 export default function ConceptsPage() {
@@ -12,7 +12,7 @@ export default function ConceptsPage() {
     <>
       <h1>Concepts</h1>
       <p>
-        cmux organizes your terminals in a four-level hierarchy. Understanding
+        term-mesh organizes your terminals in a four-level hierarchy. Understanding
         these levels helps when using the socket API, CLI, and keyboard
         shortcuts.
       </p>

@@ -837,7 +837,7 @@ final class TermMeshDaemon: ObservableObject {
 
         // Option 6: Hardcoded project path (development fallback)
         for config in ["release", "debug"] {
-            let path = "/Users/jinwoo/work/project/cmux/daemon/target/\(config)/term-meshd"
+            let path = "/Users/jinwoo/work/project/term-mesh/daemon/target/\(config)/term-meshd"
             if fm.fileExists(atPath: path) { return path }
         }
 

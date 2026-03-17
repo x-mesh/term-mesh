@@ -1,6 +1,6 @@
 # Release Local
 
-Full end-to-end release built locally. Bumps version, updates changelog, tags, then builds/signs/notarizes/uploads via `scripts/build-sign-upload.sh`.
+Bumps version, updates changelog, commits, tags, and pushes.
 
 ## Steps
 
@@ -18,11 +18,11 @@ Full end-to-end release built locally. Bumps version, updates changelog, tags, t
 - If there are no user-facing changes, ask the user if they still want to release
 - **Collect contributors:** For each PR referenced in the commits, get the author:
   ```bash
-  gh pr view <N> --repo manaflow-ai/cmux --json author --jq '.author.login'
+  gh pr view <N> --repo JINWOO-J/term-mesh --json author --jq '.author.login'
   ```
 - Also check for linked issue reporters (the person who filed the bug):
   ```bash
-  gh issue view <N> --repo manaflow-ai/cmux --json author --jq '.author.login'
+  gh issue view <N> --repo JINWOO-J/term-mesh --json author --jq '.author.login'
   ```
 - Build a deduplicated list of all contributor `@handle`s for the release
 
@@ -44,21 +44,6 @@ Full end-to-end release built locally. Bumps version, updates changelog, tags, t
 - Commit message: `Bump version to X.Y.Z`
 - Create tag: `git tag vX.Y.Z`
 - Push: `git push origin main && git push origin vX.Y.Z`
-
-### 6. Build, sign, notarize, and upload
-
-```bash
-./scripts/build-sign-upload.sh vX.Y.Z
-```
-
-This script handles: GhosttyKit build, xcodebuild, Sparkle key injection, codesigning, notarization (app + DMG), appcast generation, GitHub release upload, homebrew cask update, and cleanup.
-
-If the script fails, run `say "cmux release failed"`.
-
-### 7. Verify homebrew cask
-
-- Run `bash tests/test_homebrew_sha.sh` to confirm the cask SHA matches the release DMG
-- Update the homebrew-cmux submodule pointer: `git add homebrew-cmux && git commit -m "Update homebrew-cmux submodule to latest" && git push origin main`
 
 ## Changelog Guidelines
 

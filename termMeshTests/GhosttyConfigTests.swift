@@ -46,8 +46,8 @@ final class GhosttyConfigTests: XCTestCase {
     }
 
     func testThemeSearchPathsIncludeXDGDataDirsThemes() {
-        let pathA = "/tmp/cmux-theme-a"
-        let pathB = "/tmp/cmux-theme-b"
+        let pathA = "/tmp/term-mesh-theme-a"
+        let pathB = "/tmp/term-mesh-theme-b"
         let paths = GhosttyConfig.themeSearchPaths(
             forThemeName: "Solarized Light",
             environment: ["XDG_DATA_DIRS": "\(pathA):\(pathB)"],
@@ -60,7 +60,7 @@ final class GhosttyConfigTests: XCTestCase {
 
     func testLoadThemeResolvesPairedThemeValueByColorScheme() throws {
         let root = FileManager.default.temporaryDirectory
-            .appendingPathComponent("cmux-ghostty-theme-pair-\(UUID().uuidString)")
+            .appendingPathComponent("term-mesh-ghostty-theme-pair-\(UUID().uuidString)")
         let themesDir = root.appendingPathComponent("themes")
         try FileManager.default.createDirectory(at: themesDir, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: root) }
@@ -104,7 +104,7 @@ final class GhosttyConfigTests: XCTestCase {
 
     func testLoadThemeResolvesBuiltinAliasFromGhosttyResourcesDir() throws {
         let root = FileManager.default.temporaryDirectory
-            .appendingPathComponent("cmux-ghostty-themes-\(UUID().uuidString)")
+            .appendingPathComponent("term-mesh-ghostty-themes-\(UUID().uuidString)")
         let themesDir = root.appendingPathComponent("themes")
         try FileManager.default.createDirectory(at: themesDir, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: root) }
@@ -196,7 +196,7 @@ final class GhosttyConfigTests: XCTestCase {
     }
 
     func testClaudeCodeIntegrationDefaultsToEnabledWhenUnset() {
-        let suiteName = "cmux.tests.claude-hooks.\(UUID().uuidString)"
+        let suiteName = "term-mesh.tests.claude-hooks.\(UUID().uuidString)"
         guard let defaults = UserDefaults(suiteName: suiteName) else {
             XCTFail("Failed to create isolated user defaults suite")
             return
@@ -210,7 +210,7 @@ final class GhosttyConfigTests: XCTestCase {
     }
 
     func testClaudeCodeIntegrationRespectsStoredPreference() {
-        let suiteName = "cmux.tests.claude-hooks.\(UUID().uuidString)"
+        let suiteName = "term-mesh.tests.claude-hooks.\(UUID().uuidString)"
         guard let defaults = UserDefaults(suiteName: suiteName) else {
             XCTFail("Failed to create isolated user defaults suite")
             return
@@ -549,7 +549,7 @@ final class TabManagerNotificationOrderingSourceTests: XCTestCase {
 final class SocketControlSettingsTests: XCTestCase {
     func testMigrateModeSupportsExpandedSocketModes() {
         XCTAssertEqual(SocketControlSettings.migrateMode("off"), .off)
-        XCTAssertEqual(SocketControlSettings.migrateMode("cmuxOnly"), .termMeshOnly)
+        XCTAssertEqual(SocketControlSettings.migrateMode("term-meshOnly"), .termMeshOnly)
         XCTAssertEqual(SocketControlSettings.migrateMode("automation"), .automation)
         XCTAssertEqual(SocketControlSettings.migrateMode("password"), .password)
         XCTAssertEqual(SocketControlSettings.migrateMode("allow-all"), .allowAll)
@@ -585,80 +585,80 @@ final class SocketControlSettingsTests: XCTestCase {
     func testStableReleaseIgnoresAmbientSocketOverrideByDefault() {
         let path = SocketControlSettings.socketPath(
             environment: [
-                "CMUX_SOCKET_PATH": "/tmp/cmux-debug-issue-153-tmux-compat.sock",
+                "CMUX_SOCKET_PATH": "/tmp/term-mesh-debug-issue-153-tmux-compat.sock",
             ],
             bundleIdentifier: "com.termmesh.app",
             isDebugBuild: false
         )
 
-        XCTAssertEqual(path, "/tmp/cmux.sock")
+        XCTAssertEqual(path, "/tmp/term-mesh.sock")
     }
 
     func testNightlyReleaseUsesDedicatedDefaultAndIgnoresAmbientSocketOverride() {
         let path = SocketControlSettings.socketPath(
             environment: [
-                "CMUX_SOCKET_PATH": "/tmp/cmux-debug-issue-153-tmux-compat.sock",
+                "CMUX_SOCKET_PATH": "/tmp/term-mesh-debug-issue-153-tmux-compat.sock",
             ],
             bundleIdentifier: "com.termmesh.app.nightly",
             isDebugBuild: false
         )
 
-        XCTAssertEqual(path, "/tmp/cmux-nightly.sock")
+        XCTAssertEqual(path, "/tmp/term-mesh-nightly.sock")
     }
 
     func testDebugBundleHonorsSocketOverrideWithoutOptInFlag() {
         let path = SocketControlSettings.socketPath(
             environment: [
-                "CMUX_SOCKET_PATH": "/tmp/cmux-debug-my-tag.sock",
+                "CMUX_SOCKET_PATH": "/tmp/term-mesh-debug-my-tag.sock",
             ],
             bundleIdentifier: "com.termmesh.app.debug.my-tag",
             isDebugBuild: false
         )
 
-        XCTAssertEqual(path, "/tmp/cmux-debug-my-tag.sock")
+        XCTAssertEqual(path, "/tmp/term-mesh-debug-my-tag.sock")
     }
 
     func testStagingBundleHonorsSocketOverrideWithoutOptInFlag() {
         let path = SocketControlSettings.socketPath(
             environment: [
-                "CMUX_SOCKET_PATH": "/tmp/cmux-staging-my-tag.sock",
+                "CMUX_SOCKET_PATH": "/tmp/term-mesh-staging-my-tag.sock",
             ],
             bundleIdentifier: "com.termmesh.app.staging.my-tag",
             isDebugBuild: false
         )
 
-        XCTAssertEqual(path, "/tmp/cmux-staging-my-tag.sock")
+        XCTAssertEqual(path, "/tmp/term-mesh-staging-my-tag.sock")
     }
 
     func testStableReleaseCanOptInToSocketOverride() {
         let path = SocketControlSettings.socketPath(
             environment: [
-                "CMUX_SOCKET_PATH": "/tmp/cmux-debug-forced.sock",
+                "CMUX_SOCKET_PATH": "/tmp/term-mesh-debug-forced.sock",
                 "CMUX_ALLOW_SOCKET_OVERRIDE": "1",
             ],
             bundleIdentifier: "com.termmesh.app",
             isDebugBuild: false
         )
 
-        XCTAssertEqual(path, "/tmp/cmux-debug-forced.sock")
+        XCTAssertEqual(path, "/tmp/term-mesh-debug-forced.sock")
     }
 
     func testDefaultSocketPathByChannel() {
         XCTAssertEqual(
             SocketControlSettings.defaultSocketPath(bundleIdentifier: "com.termmesh.app", isDebugBuild: false),
-            "/tmp/cmux.sock"
+            "/tmp/term-mesh.sock"
         )
         XCTAssertEqual(
             SocketControlSettings.defaultSocketPath(bundleIdentifier: "com.termmesh.app.nightly", isDebugBuild: false),
-            "/tmp/cmux-nightly.sock"
+            "/tmp/term-mesh-nightly.sock"
         )
         XCTAssertEqual(
             SocketControlSettings.defaultSocketPath(bundleIdentifier: "com.termmesh.app.debug.tag", isDebugBuild: false),
-            "/tmp/cmux-debug.sock"
+            "/tmp/term-mesh-debug.sock"
         )
         XCTAssertEqual(
             SocketControlSettings.defaultSocketPath(bundleIdentifier: "com.termmesh.app.staging.tag", isDebugBuild: false),
-            "/tmp/cmux-staging.sock"
+            "/tmp/term-mesh-staging.sock"
         )
     }
 }
@@ -688,14 +688,14 @@ final class PostHogAnalyticsPropertiesTests: XCTestCase {
             ]
         )
 
-        XCTAssertEqual(properties["platform"] as? String, "cmuxterm")
+        XCTAssertEqual(properties["platform"] as? String, "term-meshterm")
         XCTAssertEqual(properties["app_version"] as? String, "0.31.0")
         XCTAssertEqual(properties["app_build"] as? String, "230")
     }
 
     func testPropertiesOmitVersionFieldsWhenUnavailable() {
         let superProperties = PostHogAnalytics.superProperties(infoDictionary: [:])
-        XCTAssertEqual(superProperties["platform"] as? String, "cmuxterm")
+        XCTAssertEqual(superProperties["platform"] as? String, "term-meshterm")
         XCTAssertNil(superProperties["app_version"])
         XCTAssertNil(superProperties["app_build"])
 

@@ -4,11 +4,11 @@ import { SiteHeader } from "../components/site-header";
 
 export const metadata: Metadata = {
   title: {
-    template: "%s — cmux docs",
-    default: "cmux docs",
+    template: "%s — term-mesh docs",
+    default: "term-mesh docs",
   },
   openGraph: {
-    siteName: "cmux",
+    siteName: "term-mesh",
     type: "article",
   },
   alternates: {

@@ -92,7 +92,7 @@ final class DashboardController: NSObject, WKNavigationDelegate {
             let htmlURL = URL(fileURLWithPath: htmlPath)
             wv.loadFileURL(htmlURL, allowingReadAccessTo: htmlURL.deletingLastPathComponent())
         } else {
-            let devPath = "/Users/jinwoo/work/project/cmux/Resources/dashboard/index.html"
+            let devPath = "/Users/jinwoo/work/project/term-mesh/Resources/dashboard/index.html"
             if FileManager.default.fileExists(atPath: devPath) {
                 let url = URL(fileURLWithPath: devPath)
                 wv.loadFileURL(url, allowingReadAccessTo: url.deletingLastPathComponent())

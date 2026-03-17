@@ -2,19 +2,19 @@
 import PackageDescription
 
 let package = Package(
-    name: "cmux",
+    name: "term-mesh",
     platforms: [
         .macOS(.v13)
     ],
     products: [
-        .executable(name: "cmux", targets: ["cmux"])
+        .executable(name: "term-mesh", targets: ["term-mesh"])
     ],
     dependencies: [
         .package(url: "https://github.com/migueldeicaza/SwiftTerm.git", from: "1.2.0")
     ],
     targets: [
         .executableTarget(
-            name: "cmux",
+            name: "term-mesh",
             dependencies: ["SwiftTerm"],
             path: "Sources"
         )

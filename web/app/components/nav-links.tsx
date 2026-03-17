@@ -31,10 +31,10 @@ export function NavLinks() {
         Community
       </Link>
       <a
-        href="https://github.com/manaflow-ai/cmux"
+        href="https://github.com/JINWOO-J/term-mesh"
         target="_blank"
         rel="noopener noreferrer"
-        onClick={() => posthog.capture("cmuxterm_github_clicked", { location: "navbar" })}
+        onClick={() => posthog.capture("term-meshterm_github_clicked", { location: "navbar" })}
         className="hover:text-foreground transition-colors"
       >
         GitHub

@@ -1,0 +1,4 @@
+interface:
+  display_name: "term-mesh Browser"
+  short_description: "Automate term-mesh webview surfaces with snapshot/ref workflows."
+  default_prompt: "Use this skill for browser automation via term-mesh CLI: identify target surface, snapshot interactive refs, perform actions, wait for state changes, and re-snapshot to avoid stale refs."

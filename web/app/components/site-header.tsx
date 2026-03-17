@@ -31,13 +31,13 @@ export function SiteHeader({
                 <Link href="/" className="flex items-center gap-2.5">
                   <img
                     src="/logo.png"
-                    alt="cmux"
+                    alt="term-mesh"
                     width={24}
                     height={24}
                     className="rounded-md"
                   />
                   <span className="text-sm font-semibold tracking-tight">
-                    cmux
+                    term-mesh
                   </span>
                 </Link>
                 {section && (
@@ -134,10 +134,10 @@ export function SiteHeader({
             Community
           </Link>
           <a
-            href="https://github.com/manaflow-ai/cmux"
+            href="https://github.com/JINWOO-J/term-mesh"
             target="_blank"
             rel="noopener noreferrer"
-            onClick={() => posthog.capture("cmuxterm_github_clicked", { location: "mobile_drawer" })}
+            onClick={() => posthog.capture("term-meshterm_github_clicked", { location: "mobile_drawer" })}
             className="hover:text-foreground transition-colors py-1"
           >
             GitHub

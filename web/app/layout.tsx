@@ -17,7 +17,7 @@ const geistMono = Geist_Mono({
 });
 
 export const metadata: Metadata = {
-  title: "cmux — The terminal built for multitasking",
+  title: "term-mesh — The terminal built for multitasking",
   description:
     "Native macOS terminal built on Ghostty. Works with Claude Code, Codex, OpenCode, Gemini CLI, Kiro, Aider, and any CLI tool. Vertical tabs, notification rings, split panes, and a socket API.",
   keywords: [
@@ -35,20 +35,20 @@ export const metadata: Metadata = {
     "terminal for AI agents",
   ],
   openGraph: {
-    title: "cmux — The terminal built for multitasking",
+    title: "term-mesh — The terminal built for multitasking",
     description:
       "Native macOS terminal for AI coding agents. Works with Claude Code, Codex, OpenCode, Gemini CLI, Kiro, Aider, and any CLI tool.",
-    url: "https://cmux.dev",
-    siteName: "cmux",
+    url: "https://term-mesh.dev",
+    siteName: "term-mesh",
     type: "website",
   },
   twitter: {
     card: "summary",
-    title: "cmux — The terminal built for multitasking",
+    title: "term-mesh — The terminal built for multitasking",
     description:
       "Native macOS terminal for AI coding agents. Works with Claude Code, Codex, OpenCode, Gemini CLI, Kiro, Aider, and any CLI tool.",
   },
-  metadataBase: new URL("https://cmux.dev"),
+  metadataBase: new URL("https://term-mesh.dev"),
 };
 
 export default function RootLayout({
@@ -59,12 +59,12 @@ export default function RootLayout({
   const jsonLd = {
     "@context": "https://schema.org",
     "@type": "SoftwareApplication",
-    name: "cmux",
+    name: "term-mesh",
     operatingSystem: "macOS",
     applicationCategory: "DeveloperApplication",
-    url: "https://cmux.dev",
+    url: "https://term-mesh.dev",
     downloadUrl:
-      "https://github.com/manaflow-ai/cmux/releases/latest/download/cmux-macos.dmg",
+      "https://github.com/JINWOO-J/term-mesh/releases/latest/download/term-mesh-macos.dmg",
     description:
       "Native macOS terminal built on Ghostty. Works with Claude Code, Codex, OpenCode, Gemini CLI, Kiro, Aider, and any CLI tool. Vertical tabs, notification rings, split panes, and a socket API.",
     keywords:

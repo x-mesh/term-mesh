@@ -5,7 +5,7 @@ import { Callout } from "../../components/callout";
 export const metadata: Metadata = {
   title: "API Reference",
   description:
-    "cmux CLI and Unix socket API reference. Workspace management, split panes, input control, notifications, sidebar metadata (status, progress, logs), environment variables, and detection methods.",
+    "term-mesh CLI and Unix socket API reference. Workspace management, split panes, input control, notifications, sidebar metadata (status, progress, logs), environment variables, and detection methods.",
 };
 
 function Cmd({
@@ -36,7 +36,7 @@ export default function ApiPage() {
     <>
       <h1>API Reference</h1>
       <p>
-        cmux provides both a CLI tool and a Unix socket for programmatic
+        term-mesh provides both a CLI tool and a Unix socket for programmatic
         control. Every command is available through both interfaces.
       </p>
 
@@ -52,19 +52,19 @@ export default function ApiPage() {
           <tr>
             <td>Release</td>
             <td>
-              <code>/tmp/cmux.sock</code>
+              <code>/tmp/term-mesh.sock</code>
             </td>
           </tr>
           <tr>
             <td>Debug</td>
             <td>
-              <code>/tmp/cmux-debug.sock</code>
+              <code>/tmp/term-mesh-debug.sock</code>
             </td>
           </tr>
           <tr>
             <td>Tagged debug build</td>
             <td>
-              <code>/tmp/cmux-debug-&lt;tag&gt;.sock</code>
+              <code>/tmp/term-mesh-debug-&lt;tag&gt;.sock</code>
             </td>
           </tr>
         </tbody>
@@ -101,10 +101,10 @@ export default function ApiPage() {
           </tr>
           <tr>
             <td>
-              <strong>cmux processes only</strong>
+              <strong>term-mesh processes only</strong>
             </td>
             <td>
-              Only processes spawned inside cmux terminals can connect.
+              Only processes spawned inside term-mesh terminals can connect.
             </td>
             <td>Default mode in Settings UI</td>
           </tr>
@@ -121,7 +121,7 @@ export default function ApiPage() {
       </table>
       <Callout type="warn">
         On shared machines, use <strong>Off</strong> or{" "}
-        <strong>cmux processes only</strong>.
+        <strong>term-mesh processes only</strong>.
       </Callout>
 
       <h2>CLI options</h2>
@@ -177,33 +177,33 @@ export default function ApiPage() {
       <Cmd
         name="list-workspaces"
         desc="List all open workspaces."
-        cli={`cmux list-workspaces
-cmux list-workspaces --json`}
+        cli={`term-mesh list-workspaces
+term-mesh list-workspaces --json`}
         socket={`{"id":"ws-list","method":"workspace.list","params":{}}`}
       />
       <Cmd
         name="new-workspace"
         desc="Create a new workspace."
-        cli={`cmux new-workspace`}
+        cli={`term-mesh new-workspace`}
         socket={`{"id":"ws-new","method":"workspace.create","params":{}}`}
       />
       <Cmd
         name="select-workspace"
         desc="Switch to a specific workspace."
-        cli={`cmux select-workspace --workspace <id>`}
+        cli={`term-mesh select-workspace --workspace <id>`}
         socket={`{"id":"ws-select","method":"workspace.select","params":{"workspace_id":"<id>"}}`}
       />
       <Cmd
         name="current-workspace"
         desc="Get the currently active workspace."
-        cli={`cmux current-workspace
-cmux current-workspace --json`}
+        cli={`term-mesh current-workspace
+term-mesh current-workspace --json`}
         socket={`{"id":"ws-current","method":"workspace.current","params":{}}`}
       />
       <Cmd
         name="close-workspace"
         desc="Close a workspace."
-        cli={`cmux close-workspace --workspace <id>`}
+        cli={`term-mesh close-workspace --workspace <id>`}
         socket={`{"id":"ws-close","method":"workspace.close","params":{"workspace_id":"<id>"}}`}
       />
 
@@ -212,21 +212,21 @@ cmux current-workspace --json`}
       <Cmd
         name="new-split"
         desc="Create a new split pane. Directions: left, right, up, down."
-        cli={`cmux new-split right
-cmux new-split down`}
+        cli={`term-mesh new-split right
+term-mesh new-split down`}
         socket={`{"id":"split-new","method":"surface.split","params":{"direction":"right"}}`}
       />
       <Cmd
         name="list-surfaces"
         desc="List all surfaces in the current workspace."
-        cli={`cmux list-surfaces
-cmux list-surfaces --json`}
+        cli={`term-mesh list-surfaces
+term-mesh list-surfaces --json`}
         socket={`{"id":"surface-list","method":"surface.list","params":{}}`}
       />
       <Cmd
         name="focus-surface"
         desc="Focus a specific surface."
-        cli={`cmux focus-surface --surface <id>`}
+        cli={`term-mesh focus-surface --surface <id>`}
         socket={`{"id":"surface-focus","method":"surface.focus","params":{"surface_id":"<id>"}}`}
       />
 
@@ -235,26 +235,26 @@ cmux list-surfaces --json`}
       <Cmd
         name="send"
         desc="Send text input to the focused terminal."
-        cli={`cmux send "echo hello"
-cmux send "ls -la\\n"`}
+        cli={`term-mesh send "echo hello"
+term-mesh send "ls -la\\n"`}
         socket={`{"id":"send-text","method":"surface.send_text","params":{"text":"echo hello\\n"}}`}
       />
       <Cmd
         name="send-key"
         desc="Send a key press. Keys: enter, tab, escape, backspace, delete, up, down, left, right."
-        cli={`cmux send-key enter`}
+        cli={`term-mesh send-key enter`}
         socket={`{"id":"send-key","method":"surface.send_key","params":{"key":"enter"}}`}
       />
       <Cmd
         name="send-surface"
         desc="Send text to a specific surface."
-        cli={`cmux send-surface --surface <id> "command"`}
+        cli={`term-mesh send-surface --surface <id> "command"`}
         socket={`{"id":"send-surface","method":"surface.send_text","params":{"surface_id":"<id>","text":"command"}}`}
       />
       <Cmd
         name="send-key-surface"
         desc="Send a key press to a specific surface."
-        cli={`cmux send-key-surface --surface <id> enter`}
+        cli={`term-mesh send-key-surface --surface <id> enter`}
         socket={`{"id":"send-key-surface","method":"surface.send_key","params":{"surface_id":"<id>","key":"enter"}}`}
       />
 
@@ -263,21 +263,21 @@ cmux send "ls -la\\n"`}
       <Cmd
         name="notify"
         desc="Send a notification."
-        cli={`cmux notify --title "Title" --body "Body"
-cmux notify --title "T" --subtitle "S" --body "B"`}
+        cli={`term-mesh notify --title "Title" --body "Body"
+term-mesh notify --title "T" --subtitle "S" --body "B"`}
         socket={`{"id":"notify","method":"notification.create","params":{"title":"Title","subtitle":"S","body":"Body"}}`}
       />
       <Cmd
         name="list-notifications"
         desc="List all notifications."
-        cli={`cmux list-notifications
-cmux list-notifications --json`}
+        cli={`term-mesh list-notifications
+term-mesh list-notifications --json`}
         socket={`{"id":"notif-list","method":"notification.list","params":{}}`}
       />
       <Cmd
         name="clear-notifications"
         desc="Clear all notifications."
-        cli={`cmux clear-notifications`}
+        cli={`term-mesh clear-notifications`}
         socket={`{"id":"notif-clear","method":"notification.clear","params":{}}`}
       />
 
@@ -291,61 +291,61 @@ cmux list-notifications --json`}
       <Cmd
         name="set-status"
         desc="Set a sidebar status pill. Use a unique key so different tools can manage their own entries."
-        cli={`cmux set-status build "compiling" --icon hammer --color "#ff9500"
-cmux set-status deploy "v1.2.3" --workspace workspace:2`}
+        cli={`term-mesh set-status build "compiling" --icon hammer --color "#ff9500"
+term-mesh set-status deploy "v1.2.3" --workspace workspace:2`}
         socket={`set_status build compiling --icon=hammer --color=#ff9500 --tab=<workspace-uuid>`}
       />
       <Cmd
         name="clear-status"
         desc="Remove a sidebar status entry by key."
-        cli={`cmux clear-status build`}
+        cli={`term-mesh clear-status build`}
         socket={`clear_status build --tab=<workspace-uuid>`}
       />
       <Cmd
         name="list-status"
         desc="List all sidebar status entries for a workspace."
-        cli={`cmux list-status`}
+        cli={`term-mesh list-status`}
         socket={`list_status --tab=<workspace-uuid>`}
       />
       <Cmd
         name="set-progress"
         desc="Set a progress bar in the sidebar (0.0 to 1.0)."
-        cli={`cmux set-progress 0.5 --label "Building..."
-cmux set-progress 1.0 --label "Done"`}
+        cli={`term-mesh set-progress 0.5 --label "Building..."
+term-mesh set-progress 1.0 --label "Done"`}
         socket={`set_progress 0.5 --label=Building... --tab=<workspace-uuid>`}
       />
       <Cmd
         name="clear-progress"
         desc="Clear the sidebar progress bar."
-        cli={`cmux clear-progress`}
+        cli={`term-mesh clear-progress`}
         socket={`clear_progress --tab=<workspace-uuid>`}
       />
       <Cmd
         name="log"
         desc="Append a log entry to the sidebar. Levels: info, progress, success, warning, error."
-        cli={`cmux log "Build started"
-cmux log --level error --source build "Compilation failed"
-cmux log --level success -- "All 42 tests passed"`}
+        cli={`term-mesh log "Build started"
+term-mesh log --level error --source build "Compilation failed"
+term-mesh log --level success -- "All 42 tests passed"`}
         socket={`log --level=error --source=build --tab=<workspace-uuid> -- Compilation failed`}
       />
       <Cmd
         name="clear-log"
         desc="Clear all sidebar log entries."
-        cli={`cmux clear-log`}
+        cli={`term-mesh clear-log`}
         socket={`clear_log --tab=<workspace-uuid>`}
       />
       <Cmd
         name="list-log"
         desc="List sidebar log entries."
-        cli={`cmux list-log
-cmux list-log --limit 5`}
+        cli={`term-mesh list-log
+term-mesh list-log --limit 5`}
         socket={`list_log --limit=5 --tab=<workspace-uuid>`}
       />
       <Cmd
         name="sidebar-state"
         desc="Dump all sidebar metadata (cwd, git branch, ports, status, progress, logs)."
-        cli={`cmux sidebar-state
-cmux sidebar-state --workspace workspace:2`}
+        cli={`term-mesh sidebar-state
+term-mesh sidebar-state --workspace workspace:2`}
         socket={`sidebar_state --tab=<workspace-uuid>`}
       />
 
@@ -353,23 +353,23 @@ cmux sidebar-state --workspace workspace:2`}
 
       <Cmd
         name="ping"
-        desc="Check if cmux is running and responsive."
-        cli={`cmux ping`}
+        desc="Check if term-mesh is running and responsive."
+        cli={`term-mesh ping`}
         socket={`{"id":"ping","method":"system.ping","params":{}}
 // Response: {"id":"ping","ok":true,"result":{"pong":true}}`}
       />
       <Cmd
         name="capabilities"
         desc="List available socket methods and current access mode."
-        cli={`cmux capabilities
-cmux capabilities --json`}
+        cli={`term-mesh capabilities
+term-mesh capabilities --json`}
         socket={`{"id":"caps","method":"system.capabilities","params":{}}`}
       />
       <Cmd
         name="identify"
         desc="Show focused window/workspace/pane/surface context."
-        cli={`cmux identify
-cmux identify --json`}
+        cli={`term-mesh identify
+term-mesh identify --json`}
         socket={`{"id":"identify","method":"system.identify","params":{}}`}
       />
 
@@ -403,9 +403,9 @@ cmux identify --json`}
               <code>CMUX_SOCKET_MODE</code>
             </td>
             <td>
-              Override access mode (<code>cmuxOnly</code>,{" "}
+              Override access mode (<code>term-meshOnly</code>,{" "}
               <code>allowAll</code>, <code>off</code>). Also accepts{" "}
-              <code>cmux-only</code>/<code>cmux_only</code> and{" "}
+              <code>term-mesh-only</code>/<code>term-mesh_only</code> and{" "}
               <code>allow-all</code>/<code>allow_all</code>
             </td>
           </tr>
@@ -444,19 +444,19 @@ cmux identify --json`}
         <code>notifications</code> are still accepted for compatibility.
       </Callout>
 
-      <h2>Detecting cmux</h2>
+      <h2>Detecting term-mesh</h2>
       <CodeBlock title="bash" lang="bash">{`# Prefer explicit socket path if set
-SOCK="\${CMUX_SOCKET_PATH:-/tmp/cmux.sock}"
+SOCK="\${CMUX_SOCKET_PATH:-/tmp/term-mesh.sock}"
 [ -S "$SOCK" ] && echo "Socket available"
 
 # Check for the CLI
-command -v cmux &>/dev/null && echo "cmux available"
+command -v term-mesh &>/dev/null && echo "term-mesh available"
 
-# In cmux-managed terminals these are auto-set
-[ -n "\${CMUX_WORKSPACE_ID:-}" ] && [ -n "\${CMUX_SURFACE_ID:-}" ] && echo "Inside cmux surface"
+# In term-mesh-managed terminals these are auto-set
+[ -n "\${CMUX_WORKSPACE_ID:-}" ] && [ -n "\${CMUX_SURFACE_ID:-}" ] && echo "Inside term-mesh surface"
 
 # Distinguish from regular Ghostty
-[ "$TERM_PROGRAM" = "ghostty" ] && [ -n "\${CMUX_WORKSPACE_ID:-}" ] && echo "In cmux"`}</CodeBlock>
+[ "$TERM_PROGRAM" = "ghostty" ] && [ -n "\${CMUX_WORKSPACE_ID:-}" ] && echo "In term-mesh"`}</CodeBlock>
 
       <h2>Examples</h2>
 
@@ -465,7 +465,7 @@ command -v cmux &>/dev/null && echo "cmux available"
 import os
 import socket
 
-SOCKET_PATH = os.environ.get("CMUX_SOCKET_PATH", "/tmp/cmux.sock")
+SOCKET_PATH = os.environ.get("CMUX_SOCKET_PATH", "/tmp/term-mesh.sock")
 
 def rpc(method, params=None, req_id=1):
     payload = {"id": req_id, "method": method, "params": params or {}}
@@ -486,22 +486,22 @@ print(rpc(
 
       <h3>Shell script</h3>
       <CodeBlock title="bash" lang="bash">{`#!/bin/bash
-SOCK="\${CMUX_SOCKET_PATH:-/tmp/cmux.sock}"
+SOCK="\${CMUX_SOCKET_PATH:-/tmp/term-mesh.sock}"
 
-cmux_cmd() {
+term-mesh_cmd() {
     printf "%s\\n" "$1" | nc -U "$SOCK"
 }
 
-cmux_cmd '{"id":"ws","method":"workspace.list","params":{}}'
-cmux_cmd '{"id":"notify","method":"notification.create","params":{"title":"Done","body":"Task complete"}}'`}</CodeBlock>
+term-mesh_cmd '{"id":"ws","method":"workspace.list","params":{}}'
+term-mesh_cmd '{"id":"notify","method":"notification.create","params":{"title":"Done","body":"Task complete"}}'`}</CodeBlock>
 
       <h3>Build script with notification</h3>
       <CodeBlock title="bash" lang="bash">{`#!/bin/bash
 npm run build
 if [ $? -eq 0 ]; then
-    cmux notify --title "✓ Build Success" --body "Ready to deploy"
+    term-mesh notify --title "✓ Build Success" --body "Ready to deploy"
 else
-    cmux notify --title "✗ Build Failed" --body "Check the logs"
+    term-mesh notify --title "✗ Build Failed" --body "Check the logs"
 fi`}</CodeBlock>
     </>
   );

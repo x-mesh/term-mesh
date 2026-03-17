@@ -70,13 +70,13 @@ Non-goals for P0/P1:
 ## Current Constraints
 
 Current relevant files:
-1. [daemon/term-mesh-cli/src/tm_agent.rs](/Users/jinwoo/work/project/cmux/daemon/term-mesh-cli/src/tm_agent.rs) (unified CLI — replaces scripts/team.py)
-2. [Sources/TeamOrchestrator.swift](/Users/jinwoo/work/project/cmux/Sources/TeamOrchestrator.swift)
-3. [Sources/TerminalController.swift](/Users/jinwoo/work/project/cmux/Sources/TerminalController.swift)
-4. [Resources/dashboard/index.html](/Users/jinwoo/work/project/cmux/Resources/dashboard/index.html)
-5. [Sources/DashboardController.swift](/Users/jinwoo/work/project/cmux/Sources/DashboardController.swift)
-6. [Sources/TeamCreationView.swift](/Users/jinwoo/work/project/cmux/Sources/TeamCreationView.swift)
-7. [Sources/AgentRolePreset.swift](/Users/jinwoo/work/project/cmux/Sources/AgentRolePreset.swift)
+1. [daemon/term-mesh-cli/src/tm_agent.rs](/Users/jinwoo/work/project/term-mesh/daemon/term-mesh-cli/src/tm_agent.rs) (unified CLI — replaces scripts/team.py)
+2. [Sources/TeamOrchestrator.swift](/Users/jinwoo/work/project/term-mesh/Sources/TeamOrchestrator.swift)
+3. [Sources/TerminalController.swift](/Users/jinwoo/work/project/term-mesh/Sources/TerminalController.swift)
+4. [Resources/dashboard/index.html](/Users/jinwoo/work/project/term-mesh/Resources/dashboard/index.html)
+5. [Sources/DashboardController.swift](/Users/jinwoo/work/project/term-mesh/Sources/DashboardController.swift)
+6. [Sources/TeamCreationView.swift](/Users/jinwoo/work/project/term-mesh/Sources/TeamCreationView.swift)
+7. [Sources/AgentRolePreset.swift](/Users/jinwoo/work/project/term-mesh/Sources/AgentRolePreset.swift)
 
 Current limitations:
 1. `TeamTask` only stores `title`, `assignee`, `status`, and `result`.
@@ -135,7 +135,7 @@ The system should derive `stale` rather than store it directly on tasks:
 
 ### P0 Data Model
 
-Extend `TeamTask` in [Sources/TeamOrchestrator.swift](/Users/jinwoo/work/project/cmux/Sources/TeamOrchestrator.swift):
+Extend `TeamTask` in [Sources/TeamOrchestrator.swift](/Users/jinwoo/work/project/term-mesh/Sources/TeamOrchestrator.swift):
 1. `description: String?`
 2. `acceptanceCriteria: [String]`
 3. `assignee: String?`
@@ -211,7 +211,7 @@ Proposed `team.task.update` params:
 
 ### P0 CLI Surface
 
-Update `tm-agent` CLI ([daemon/term-mesh-cli/src/tm_agent.rs](/Users/jinwoo/work/project/cmux/daemon/term-mesh-cli/src/tm_agent.rs)).
+Update `tm-agent` CLI ([daemon/term-mesh-cli/src/tm_agent.rs](/Users/jinwoo/work/project/term-mesh/daemon/term-mesh-cli/src/tm_agent.rs)).
 
 New commands:
 1. `tm-agent inbox`
@@ -229,7 +229,7 @@ CLI behavior changes:
 
 ### P0 Dashboard
 
-Update [Resources/dashboard/index.html](/Users/jinwoo/work/project/cmux/Resources/dashboard/index.html) and [Sources/DashboardController.swift](/Users/jinwoo/work/project/cmux/Sources/DashboardController.swift).
+Update [Resources/dashboard/index.html](/Users/jinwoo/work/project/term-mesh/Resources/dashboard/index.html) and [Sources/DashboardController.swift](/Users/jinwoo/work/project/term-mesh/Sources/DashboardController.swift).
 
 Add a top-level "Needs Attention" card:
 1. blocked tasks
@@ -255,7 +255,7 @@ Message panel changes:
 
 ### P0 Leader Prompting
 
-Update leader instructions in [Sources/TeamOrchestrator.swift](/Users/jinwoo/work/project/cmux/Sources/TeamOrchestrator.swift).
+Update leader instructions in [Sources/TeamOrchestrator.swift](/Users/jinwoo/work/project/term-mesh/Sources/TeamOrchestrator.swift).
 
 The leader prompt should explicitly instruct:
 1. create tasks before delegating meaningful work
@@ -343,7 +343,7 @@ Consider a compact leader console block:
 
 ### P1 Team Creation UX
 
-Update [Sources/TeamCreationView.swift](/Users/jinwoo/work/project/cmux/Sources/TeamCreationView.swift) and [Sources/AgentRolePreset.swift](/Users/jinwoo/work/project/cmux/Sources/AgentRolePreset.swift).
+Update [Sources/TeamCreationView.swift](/Users/jinwoo/work/project/term-mesh/Sources/TeamCreationView.swift) and [Sources/AgentRolePreset.swift](/Users/jinwoo/work/project/term-mesh/Sources/AgentRolePreset.swift).
 
 Add workflow presets alongside role presets:
 1. `Bug Triage`
@@ -369,12 +369,12 @@ Each workflow preset should define:
 
 ### P0 Order
 
-1. Expand `TeamTask` and task serialization in [Sources/TeamOrchestrator.swift](/Users/jinwoo/work/project/cmux/Sources/TeamOrchestrator.swift).
-2. Extend JSON-RPC handling in [Sources/TerminalController.swift](/Users/jinwoo/work/project/cmux/Sources/TerminalController.swift) for `team.inbox` and richer task updates.
+1. Expand `TeamTask` and task serialization in [Sources/TeamOrchestrator.swift](/Users/jinwoo/work/project/term-mesh/Sources/TeamOrchestrator.swift).
+2. Extend JSON-RPC handling in [Sources/TerminalController.swift](/Users/jinwoo/work/project/term-mesh/Sources/TerminalController.swift) for `team.inbox` and richer task updates.
 3. Update `tm-agent` CLI to expose the new task and inbox commands.
-4. Update dashboard fetch wiring in [Sources/DashboardController.swift](/Users/jinwoo/work/project/cmux/Sources/DashboardController.swift).
-5. Update dashboard rendering in [Resources/dashboard/index.html](/Users/jinwoo/work/project/cmux/Resources/dashboard/index.html).
-6. Update leader and worker prompts in [Sources/TeamOrchestrator.swift](/Users/jinwoo/work/project/cmux/Sources/TeamOrchestrator.swift).
+4. Update dashboard fetch wiring in [Sources/DashboardController.swift](/Users/jinwoo/work/project/term-mesh/Sources/DashboardController.swift).
+5. Update dashboard rendering in [Resources/dashboard/index.html](/Users/jinwoo/work/project/term-mesh/Resources/dashboard/index.html).
+6. Update leader and worker prompts in [Sources/TeamOrchestrator.swift](/Users/jinwoo/work/project/term-mesh/Sources/TeamOrchestrator.swift).
 
 ### P1 Order
 

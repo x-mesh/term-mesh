@@ -671,7 +671,7 @@ final class TeamOrchestrator {
         if FileManager.default.fileExists(atPath: devPath) { return devPath }
         // 4) Try absolute from known project locations
         let home = NSHomeDirectory()
-        for projectDir in ["cmux-term-mesh", "project/cmux", "project/term-mesh"] {
+        for projectDir in ["term-mesh-term-mesh", "project/term-mesh", "project/term-mesh"] {
             let projectPath = "\(home)/work/\(projectDir)/scripts/\(filename)"
             if FileManager.default.fileExists(atPath: projectPath) { return projectPath }
         }
@@ -693,7 +693,7 @@ final class TeamOrchestrator {
         if FileManager.default.fileExists(atPath: devPath) { return devPath }
         // 4) Fallback: known project locations
         let home = NSHomeDirectory()
-        for projectDir in ["cmux-term-mesh", "project/cmux", "project/term-mesh"] {
+        for projectDir in ["term-mesh-term-mesh", "project/term-mesh", "project/term-mesh"] {
             let projectPath = "\(home)/work/\(projectDir)/scripts"
             if FileManager.default.fileExists(atPath: projectPath) { return projectPath }
         }

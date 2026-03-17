@@ -6,7 +6,7 @@ import { DownloadButton } from "../../components/download-button";
 export const metadata: Metadata = {
   title: "Getting Started",
   description:
-    "Install cmux, the native macOS terminal for AI coding agents. Homebrew, DMG download, CLI setup, and auto-updates via Sparkle.",
+    "Install term-mesh, the native macOS terminal for AI coding agents. Homebrew, DMG download, CLI setup, and auto-updates via Sparkle.",
 };
 
 export default function GettingStartedPage() {
@@ -14,7 +14,7 @@ export default function GettingStartedPage() {
     <>
       <h1>Getting Started</h1>
       <p>
-        cmux is a lightweight, native macOS terminal built on Ghostty for
+        term-mesh is a lightweight, native macOS terminal built on Ghostty for
         managing multiple AI coding agents. It features vertical tabs, a
         notification panel, and a socket-based control API.
       </p>
@@ -26,15 +26,15 @@ export default function GettingStartedPage() {
         <DownloadButton />
       </div>
       <p>
-        Open the <code>.dmg</code> and drag cmux to your Applications folder.
-        cmux auto-updates via Sparkle, so you only need to download once.
+        Open the <code>.dmg</code> and drag term-mesh to your Applications folder.
+        term-mesh auto-updates via Sparkle, so you only need to download once.
       </p>
 
       <h3>Homebrew</h3>
-      <CodeBlock lang="bash">{`brew tap manaflow-ai/cmux
-brew install --cask cmux`}</CodeBlock>
+      <CodeBlock lang="bash">{`brew tap JINWOO-J/term-mesh
+brew install --cask term-mesh`}</CodeBlock>
       <p>To update later:</p>
-      <CodeBlock lang="bash">{`brew upgrade --cask cmux`}</CodeBlock>
+      <CodeBlock lang="bash">{`brew upgrade --cask term-mesh`}</CodeBlock>
 
       <Callout>
         On first launch, macOS may ask you to confirm opening an app from an
@@ -42,7 +42,7 @@ brew install --cask cmux`}</CodeBlock>
       </Callout>
 
       <h2>Verify installation</h2>
-      <p>Open cmux and you should see:</p>
+      <p>Open term-mesh and you should see:</p>
       <ul>
         <li>A terminal window with a vertical tab sidebar on the left</li>
         <li>One initial workspace already open</li>
@@ -51,20 +51,20 @@ brew install --cask cmux`}</CodeBlock>
 
       <h2>CLI setup</h2>
       <p>
-        cmux includes a command-line tool for automation. Inside cmux terminals
-        it works automatically. To use the CLI from outside cmux, create a
+        term-mesh includes a command-line tool for automation. Inside term-mesh terminals
+        it works automatically. To use the CLI from outside term-mesh, create a
         symlink:
       </p>
-      <CodeBlock lang="bash">{`sudo ln -sf "/Applications/cmux.app/Contents/Resources/bin/cmux" /usr/local/bin/cmux`}</CodeBlock>
+      <CodeBlock lang="bash">{`sudo ln -sf "/Applications/term-mesh.app/Contents/Resources/bin/term-mesh" /usr/local/bin/term-mesh`}</CodeBlock>
       <p>Then you can run commands like:</p>
-      <CodeBlock lang="bash">{`cmux list-workspaces
-cmux notify --title "Build Complete" --body "Your build finished"`}</CodeBlock>
+      <CodeBlock lang="bash">{`term-mesh list-workspaces
+term-mesh notify --title "Build Complete" --body "Your build finished"`}</CodeBlock>
 
       <h2>Auto-updates</h2>
       <p>
-        cmux checks for updates automatically via Sparkle. When an update is
+        term-mesh checks for updates automatically via Sparkle. When an update is
         available you&apos;ll see an update pill in the titlebar. You can also
-        check manually via <strong>cmux → Check for Updates</strong> in the menu
+        check manually via <strong>term-mesh → Check for Updates</strong> in the menu
         bar.
       </p>
 

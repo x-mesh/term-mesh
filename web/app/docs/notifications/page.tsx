@@ -5,7 +5,7 @@ import { Callout } from "../../components/callout";
 export const metadata: Metadata = {
   title: "Notifications",
   description:
-    "Send desktop notifications from AI agents and scripts in cmux. CLI, OSC 99/777 escape sequences, and Claude Code hooks integration.",
+    "Send desktop notifications from AI agents and scripts in term-mesh. CLI, OSC 99/777 escape sequences, and Claude Code hooks integration.",
 };
 
 export default function NotificationsPage() {
@@ -13,7 +13,7 @@ export default function NotificationsPage() {
     <>
       <h1>Notifications</h1>
       <p>
-        cmux supports desktop notifications, allowing AI agents and scripts to
+        term-mesh supports desktop notifications, allowing AI agents and scripts to
         alert you when they need attention.
       </p>
 
@@ -37,7 +37,7 @@ export default function NotificationsPage() {
       <h3>Suppression</h3>
       <p>Desktop alerts are suppressed when:</p>
       <ul>
-        <li>The cmux window is focused</li>
+        <li>The term-mesh window is focused</li>
         <li>The specific workspace sending the notification is active</li>
         <li>The notification panel is open</li>
       </ul>
@@ -52,8 +52,8 @@ export default function NotificationsPage() {
       <h2>Sending notifications</h2>
 
       <h3>CLI</h3>
-      <CodeBlock lang="bash">{`cmux notify --title "Task Complete" --body "Your build finished"
-cmux notify --title "Claude Code" --subtitle "Waiting" --body "Agent needs input"`}</CodeBlock>
+      <CodeBlock lang="bash">{`term-mesh notify --title "Task Complete" --body "Your build finished"
+term-mesh notify --title "Claude Code" --subtitle "Waiting" --body "Agent needs input"`}</CodeBlock>
 
       <h3>OSC 777 (simple)</h3>
       <p>
@@ -116,21 +116,21 @@ printf '\\e]99;i=1;e=1;d=1;p=body:All tests passed\\e\\\\'`}</CodeBlock>
 
       <Callout>
         Use OSC 777 for simple notifications. Use OSC 99 when you need subtitles
-        or notification IDs. Use the CLI (<code>cmux notify</code>) for the
+        or notification IDs. Use the CLI (<code>term-mesh notify</code>) for the
         easiest integration.
       </Callout>
 
       <h2>Claude Code hooks</h2>
       <p>
-        cmux integrates with{" "}
+        term-mesh integrates with{" "}
         <a href="https://docs.anthropic.com/en/docs/claude-code">Claude Code</a>{" "}
         via hooks to notify you when tasks complete.
       </p>
 
       <h3>1. Create the hook script</h3>
-      <CodeBlock title="~/.claude/hooks/cmux-notify.sh" lang="bash">{`#!/bin/bash
-# Skip if not in cmux
-[ -S /tmp/cmux.sock ] || exit 0
+      <CodeBlock title="~/.claude/hooks/term-mesh-notify.sh" lang="bash">{`#!/bin/bash
+# Skip if not in term-mesh
+[ -S /tmp/term-mesh.sock ] || exit 0
 
 EVENT=$(cat)
 EVENT_TYPE=$(echo "$EVENT" | jq -r '.event // "unknown"')
@@ -138,22 +138,22 @@ TOOL=$(echo "$EVENT" | jq -r '.tool_name // ""')
 
 case "$EVENT_TYPE" in
     "Stop")
-        cmux notify --title "Claude Code" --body "Session complete"
+        term-mesh notify --title "Claude Code" --body "Session complete"
         ;;
     "PostToolUse")
-        [ "$TOOL" = "Task" ] && cmux notify --title "Claude Code" --body "Agent finished"
+        [ "$TOOL" = "Task" ] && term-mesh notify --title "Claude Code" --body "Agent finished"
         ;;
 esac`}</CodeBlock>
-      <CodeBlock lang="bash">{`chmod +x ~/.claude/hooks/cmux-notify.sh`}</CodeBlock>
+      <CodeBlock lang="bash">{`chmod +x ~/.claude/hooks/term-mesh-notify.sh`}</CodeBlock>
 
       <h3>2. Configure Claude Code</h3>
       <CodeBlock title="~/.claude/settings.json" lang="json">{`{
   "hooks": {
-    "Stop": ["~/.claude/hooks/cmux-notify.sh"],
+    "Stop": ["~/.claude/hooks/term-mesh-notify.sh"],
     "PostToolUse": [
       {
         "matcher": "Task",
-        "hooks": ["~/.claude/hooks/cmux-notify.sh"]
+        "hooks": ["~/.claude/hooks/term-mesh-notify.sh"]
       }
     ]
   }
@@ -168,9 +168,9 @@ notify-after() {
   "$@"
   local exit_code=$?
   if [ $exit_code -eq 0 ]; then
-    cmux notify --title "✓ Command Complete" --body "$1"
+    term-mesh notify --title "✓ Command Complete" --body "$1"
   else
-    cmux notify --title "✗ Command Failed" --body "$1 (exit $exit_code)"
+    term-mesh notify --title "✗ Command Failed" --body "$1 (exit $exit_code)"
   fi
   return $exit_code
 }
@@ -195,7 +195,7 @@ notify("Script Complete", "Processing finished")`}</CodeBlock>
 notify('Build Done', 'webpack finished');`}</CodeBlock>
 
       <h3>tmux passthrough</h3>
-      <p>If using tmux inside cmux, enable passthrough:</p>
+      <p>If using tmux inside term-mesh, enable passthrough:</p>
       <CodeBlock title=".tmux.conf" lang="bash">{`set -g allow-passthrough on`}</CodeBlock>
       <CodeBlock lang="bash">{`printf '\\ePtmux;\\e\\e]777;notify;Title;Body\\a\\e\\\\'`}</CodeBlock>
     </>

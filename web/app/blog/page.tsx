@@ -3,20 +3,20 @@ import Link from "next/link";
 
 export const metadata: Metadata = {
   title: "Blog",
-  description: "News and updates from the cmux team",
+  description: "News and updates from the term-mesh team",
 };
 
 const posts = [
   {
     slug: "show-hn-launch",
-    title: "Launching cmux on Show HN",
+    title: "Launching term-mesh on Show HN",
     date: "2026-02-21",
     summary:
-      "cmux hit #2 on Hacker News, got shared by Mitchell Hashimoto, and went viral in Japan.",
+      "term-mesh hit #2 on Hacker News, got shared by Mitchell Hashimoto, and went viral in Japan.",
   },
   {
-    slug: "introducing-cmux",
-    title: "Introducing cmux",
+    slug: "introducing-term-mesh",
+    title: "Introducing term-mesh",
     date: "2026-02-12",
     summary:
       "A native macOS terminal built on Ghostty, designed for running multiple AI coding agents side by side.",

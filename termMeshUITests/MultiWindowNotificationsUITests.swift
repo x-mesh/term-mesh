@@ -151,7 +151,7 @@ final class MultiWindowNotificationsUITests: XCTestCase {
         app.typeKey("i", modifierFlags: [.command])
         XCTAssertTrue(app.staticTexts["No notifications yet"].waitForExistence(timeout: 6.0), "Expected empty notifications popover state")
 
-        let marker = "cmux_notif_block_\(UUID().uuidString.replacingOccurrences(of: "-", with: "").prefix(8))"
+        let marker = "term-mesh_notif_block_\(UUID().uuidString.replacingOccurrences(of: "-", with: "").prefix(8))"
         let before = readCurrentTerminalText() ?? ""
         XCTAssertFalse(before.contains(marker), "Unexpected marker precondition collision")
 

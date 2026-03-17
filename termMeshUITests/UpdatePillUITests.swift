@@ -48,7 +48,7 @@ final class UpdatePillUITests: XCTestCase {
         let systemSettings = XCUIApplication(bundleIdentifier: "com.apple.systempreferences")
         systemSettings.terminate()
         let timingPath = FileManager.default.temporaryDirectory
-            .appendingPathComponent("cmux-ui-test-timing-\(UUID().uuidString).json")
+            .appendingPathComponent("term-mesh-ui-test-timing-\(UUID().uuidString).json")
         let app = XCUIApplication()
         app.launchEnvironment["TERMMESH_UI_TEST_MODE"] = "1"
         app.launchEnvironment["TERMMESH_UI_TEST_UPDATE_STATE"] = "notFound"
@@ -92,7 +92,7 @@ final class UpdatePillUITests: XCTestCase {
         let systemSettings = XCUIApplication(bundleIdentifier: "com.apple.systempreferences")
         systemSettings.terminate()
         let timingPath = FileManager.default.temporaryDirectory
-            .appendingPathComponent("cmux-ui-test-timing-\(UUID().uuidString).json")
+            .appendingPathComponent("term-mesh-ui-test-timing-\(UUID().uuidString).json")
         let app = launchAppWithMockFeed(mode: "none", version: "9.9.9", timingPath: timingPath)
 
         let pill = pillButton(app: app, expectedLabel: "No Updates Available")
@@ -201,7 +201,7 @@ final class UpdatePillUITests: XCTestCase {
     ) -> XCUIApplication {
         let app = XCUIApplication()
         app.launchEnvironment["TERMMESH_UI_TEST_MODE"] = "1"
-        app.launchEnvironment["TERMMESH_UI_TEST_FEED_URL"] = "https://cmux.test/appcast.xml"
+        app.launchEnvironment["TERMMESH_UI_TEST_FEED_URL"] = "https://term-mesh.test/appcast.xml"
         app.launchEnvironment["TERMMESH_UI_TEST_FEED_MODE"] = mode
         app.launchEnvironment["TERMMESH_UI_TEST_UPDATE_VERSION"] = version
         app.launchEnvironment["TERMMESH_UI_TEST_AUTO_ALLOW_PERMISSION"] = "1"

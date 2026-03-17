@@ -1,0 +1,4 @@
+interface:
+  display_name: "term-mesh Debug Windows"
+  short_description: "Tune term-mesh debug windows and copy snapshots."
+  default_prompt: "Use this skill to manage term-mesh sidebar/background/menu-bar debug windows, keep Debug menu wiring clean, and capture copyable debug snapshots."

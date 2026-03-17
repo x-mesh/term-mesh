@@ -44,7 +44,7 @@
 Agents get physically isolated `git worktree` environments. Each agent session runs in its own `../term-mesh_wt_<UUID>` directory, preventing accidental modifications to the main repository. Worktrees are automatically cleaned up when tabs close.
 
 ### F-02: Multi-Agent Native Terminal
-Built on [cmux](https://github.com/manaflow-ai/cmux) with libghostty for Metal GPU-accelerated terminal rendering. Vertical sidebar tabs show git branch, working directory, and notification status for each agent session.
+Built on [term-mesh](https://github.com/JINWOO-J/term-mesh) with libghostty for Metal GPU-accelerated terminal rendering. Vertical sidebar tabs show git branch, working directory, and notification status for each agent session.
 
 ### F-03/F-04: Budget Guard & Resource Monitoring
 - **CPU/Memory monitoring** via `sysinfo` with automatic process discovery (BFS tree walk from daemon parent PID)
@@ -73,7 +73,7 @@ Real-time monitoring dashboard available as:
 
 ```bash
 # 1. Clone and setup
-git clone <repo-url> && cd cmux-term-mesh
+git clone <repo-url> && cd term-mesh-term-mesh
 git checkout term-mesh-mig
 
 # 2. Build libghostty + native app
@@ -200,4 +200,4 @@ Active development is on the `term-mesh-mig` branch.
 
 This project is licensed under the GNU Affero General Public License v3.0 or later (`AGPL-3.0-or-later`).
 
-Built as a fork of [cmux](https://github.com/manaflow-ai/cmux). See `LICENSE` for the full text.
+Built as a fork of [term-mesh](https://github.com/JINWOO-J/term-mesh). See `LICENSE` for the full text.

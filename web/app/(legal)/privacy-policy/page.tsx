@@ -1,8 +1,8 @@
 import type { Metadata } from "next";
 
 export const metadata: Metadata = {
-  title: "Privacy Policy — cmux",
-  description: "Privacy policy for cmux",
+  title: "Privacy Policy — term-mesh",
+  description: "Privacy policy for term-mesh",
 };
 
 export default function PrivacyPolicyPage() {
@@ -20,8 +20,8 @@ export default function PrivacyPolicyPage() {
       <p>
         For purposes of this policy, &ldquo;Site&rdquo; refers to the
         Company&rsquo;s website at{" "}
-        <a href="https://cmux.dev">cmux.dev</a>.
-        &ldquo;Application&rdquo; refers to the cmux desktop application for
+        <a href="https://term-mesh.dev">term-mesh.dev</a>.
+        &ldquo;Application&rdquo; refers to the term-mesh desktop application for
         macOS. &ldquo;Service&rdquo; refers to the Site and Application
         collectively. The terms &ldquo;we,&rdquo; &ldquo;us,&rdquo; and
         &ldquo;our&rdquo; refer to the Company. &ldquo;You&rdquo; refers to
