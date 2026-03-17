@@ -16,8 +16,17 @@ if ! command -v zig &> /dev/null; then
     exit 1
 fi
 
+echo "==> Checking for Metal Toolchain..."
+if ! xcrun metal --version &> /dev/null; then
+    echo "==> Metal Toolchain not found, downloading..."
+    xcodebuild -downloadComponent MetalToolchain
+fi
+
+echo "==> Cleaning problematic xcframework-* tags in ghostty submodule..."
+git -C ghostty tag -l 'xcframework-*' | while read -r t; do git -C ghostty tag -d "$t"; done 2>/dev/null || true
+
 GHOSTTY_SHA="$(git -C ghostty rev-parse HEAD)"
-CACHE_ROOT="${TERMMESH_GHOSTTYKIT_CACHE_DIR:-${CMUX_GHOSTTYKIT_CACHE_DIR:-$HOME/.cache/term-mesh/ghosttykit}}"
+CACHE_ROOT="${TERMMESH_GHOSTTYKIT_CACHE_DIR:-$HOME/.cache/term-mesh/ghosttykit}"
 CACHE_DIR="$CACHE_ROOT/$GHOSTTY_SHA"
 CACHE_XCFRAMEWORK="$CACHE_DIR/GhosttyKit.xcframework"
 LOCAL_XCFRAMEWORK="$PROJECT_DIR/ghostty/macos/GhosttyKit.xcframework"
@@ -84,4 +93,7 @@ ln -sfn "$CACHE_XCFRAMEWORK" GhosttyKit.xcframework
 echo "==> Setup complete!"
 echo ""
 echo "You can now build and run the app:"
+echo "  xcodebuild -project GhosttyTabs.xcodeproj -scheme term-mesh -configuration Debug -destination 'platform=macOS' build"
+echo ""
+echo "Or use the reload script:"
 echo "  ./scripts/reload.sh --tag first-run"

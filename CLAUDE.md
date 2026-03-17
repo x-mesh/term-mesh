@@ -2,11 +2,13 @@
 
 ## Initial setup
 
-Run the setup script to initialize submodules and build GhosttyKit:
+Run the setup script to initialize submodules, install Metal Toolchain, and build GhosttyKit:
 
 ```bash
 ./scripts/setup.sh
 ```
+
+This handles: submodule init, Metal Toolchain download, xcframework-* tag cleanup, GhosttyKit build (cached per ghostty SHA), and symlink creation.
 
 ## Local dev
 
@@ -22,10 +24,11 @@ After making code changes, always run the build:
 xcodebuild -project GhosttyTabs.xcodeproj -scheme term-mesh -configuration Debug -destination 'platform=macOS' build
 ```
 
-When rebuilding GhosttyKit.xcframework, always use Release optimizations:
+When rebuilding GhosttyKit.xcframework, always use Release optimizations.
+Clean any xcframework-* tags first to avoid zig build crashes:
 
 ```bash
-cd ghostty && zig build -Demit-xcframework=true -Doptimize=ReleaseFast
+cd ghostty && git tag -l 'xcframework-*' | while read -r t; do git tag -d "$t"; done 2>/dev/null; zig build -Demit-xcframework=true -Doptimize=ReleaseFast
 ```
 
 When rebuilding term-meshd (the Rust daemon):
@@ -241,20 +244,15 @@ Version bumping:
 ./scripts/bump-version.sh 1.0.0    # set specific version
 ```
 
-This updates both `MARKETING_VERSION` and `CURRENT_PROJECT_VERSION` (build number). The build number is auto-incremented and is required for Sparkle auto-update to work.
+This updates both `MARKETING_VERSION` and `CURRENT_PROJECT_VERSION` (build number).
 
 Manual release steps (if not using the command):
 
 ```bash
 git tag vX.Y.Z
 git push origin vX.Y.Z
-gh run watch --repo manaflow-ai/term-mesh
 ```
 
 Notes:
-- Requires GitHub secrets: `APPLE_CERTIFICATE_BASE64`, `APPLE_CERTIFICATE_PASSWORD`,
-  `APPLE_SIGNING_IDENTITY`, `APPLE_ID`, `APPLE_APP_SPECIFIC_PASSWORD`, `APPLE_TEAM_ID`.
-- The release asset is `term-mesh-macos.dmg` attached to the tag.
-- README download button points to `releases/latest/download/term-mesh-macos.dmg`.
 - Versioning: bump the minor version for updates unless explicitly asked otherwise.
 - Changelog: always update both `CHANGELOG.md` and the docs-site version.

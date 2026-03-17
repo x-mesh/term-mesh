@@ -3,7 +3,7 @@
 ## Prerequisites
 
 - macOS 14+
-- Xcode 15+
+- Xcode 16+ (with Metal Toolchain — the setup script installs it automatically if missing)
 - [Zig](https://ziglang.org/) (install via `brew install zig`)
 
 ## Getting Started
@@ -21,12 +21,13 @@
 
    This will:
    - Initialize git submodules (ghostty, vendor/bonsplit)
-   - Build the GhosttyKit.xcframework from source
+   - Install the Metal Toolchain if missing (required for GPU shader compilation)
+   - Build the GhosttyKit.xcframework from source (cached per ghostty commit SHA)
    - Create the necessary symlinks
 
 3. Build and run the debug app:
    ```bash
-   ./scripts/reload.sh
+   ./scripts/reload.sh --tag first-run
    ```
 
 ## Development Scripts
