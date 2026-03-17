@@ -35,6 +35,7 @@ struct TermMeshApp: App {
     @AppStorage(KeyboardShortcutSettings.Action.splitBrowserDown.defaultsKey) private var splitBrowserDownShortcutData = Data()
     @AppStorage(KeyboardShortcutSettings.Action.renameWorkspace.defaultsKey) private var renameWorkspaceShortcutData = Data()
     @AppStorage(KeyboardShortcutSettings.Action.closeWorkspace.defaultsKey) private var closeWorkspaceShortcutData = Data()
+    @AppStorage(TermMeshDaemon.worktreeAutoCleanupKey) private var worktreeAutoCleanup = false
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
     @State private var showTeamCreation = false
     @State private var ghosttyTheme = GhosttyTheme.current
@@ -242,6 +243,80 @@ struct TermMeshApp: App {
         }
         .windowStyle(.hiddenTitleBar)
         .commands {
+            // MARK: - Agents Menu (combined agents + worktrees)
+            CommandMenu("Agents") {
+                // -- Create --
+                Button("New Agent Team…") {
+                    showTeamCreation = true
+                }
+                .keyboardShortcut("t", modifiers: [.command, .option])
+
+                Button("Spawn CLI…") {
+                    showSpawnCLIDialog()
+                }
+                .keyboardShortcut("a", modifiers: [.command, .shift])
+
+                // -- Manage --
+                Divider()
+
+                Button("Reconnect Agent…") {
+                    showReconnectAgentDialog()
+                }
+                .keyboardShortcut("a", modifiers: [.command, .option])
+
+                Button("Destroy Team…") {
+                    showDestroyTeamDialog()
+                }
+
+                Button("Collect All Results") {
+                    showCollectResultsDialog()
+                }
+
+                // -- Worktrees --
+                Divider()
+
+                Button("New Worktree Workspace") {
+                    NotificationCenter.default.post(name: .worktreeWorkspaceRequested, object: nil)
+                }
+                .keyboardShortcut("n", modifiers: [.command, .option, .shift])
+
+                Button(termMeshDaemon.worktreeEnabled
+                    ? "✓ Worktree Sandbox"
+                    : "  Worktree Sandbox"
+                ) {
+                    let newValue = !termMeshDaemon.worktreeEnabled
+                    termMeshDaemon.worktreeEnabled = newValue
+                    if newValue {
+                        DispatchQueue.global(qos: .utility).async { [daemon = self.termMeshDaemon] in
+                            let connected = daemon.ping()
+                            if !connected {
+                                DispatchQueue.main.async {
+                                    let alert = NSAlert()
+                                    alert.messageText = "Worktree Sandbox"
+                                    alert.informativeText = "term-meshd daemon is not running.\nNew tabs will open without sandbox until the daemon is started."
+                                    alert.alertStyle = .warning
+                                    alert.addButton(withTitle: "OK")
+                                    alert.runModal()
+                                }
+                            }
+                        }
+                    }
+                }
+
+                Toggle("Worktree Auto-Cleanup", isOn: $worktreeAutoCleanup)
+
+                Divider()
+
+                Button("Clean Up Stale Worktrees") {
+                    cleanupStaleWorktrees()
+                }
+
+                Button("Open Worktree Directory…") {
+                    let path = termMeshDaemon.worktreeBaseDir
+                    NSWorkspace.shared.open(URL(fileURLWithPath: path, isDirectory: true))
+                }
+            }
+
             CommandGroup(replacing: .appSettings) {
                 Button("Settings…") {
                     showSettingsPanel()
@@ -276,36 +351,6 @@ struct TermMeshApp: App {
                 Button("Term-Mesh Dashboard (Split)") {
                     openDashboardSplit()
                 }
-                Button(termMeshDaemon.worktreeEnabled
-                    ? "✓ Worktree Sandbox"
-                    : "  Worktree Sandbox"
-                ) {
-                    let newValue = !termMeshDaemon.worktreeEnabled
-                    termMeshDaemon.worktreeEnabled = newValue
-                    if newValue {
-                        DispatchQueue.global(qos: .utility).async { [daemon = self.termMeshDaemon] in
-                            let connected = daemon.ping()
-                            if !connected {
-                                DispatchQueue.main.async {
-                                    let alert = NSAlert()
-                                    alert.messageText = "Worktree Sandbox"
-                                    alert.informativeText = "term-meshd daemon is not running.\nNew tabs will open without sandbox until the daemon is started."
-                                    alert.alertStyle = .warning
-                                    alert.addButton(withTitle: "OK")
-                                    alert.runModal()
-                                }
-                            }
-                        }
-                    }
-                }
-                Button("Spawn CLI…") {
-                    showSpawnCLIDialog()
-                }
-                .keyboardShortcut("a", modifiers: [.command, .shift])
-                Button("Reconnect Agent…") {
-                    showReconnectAgentDialog()
-                }
-                .keyboardShortcut("a", modifiers: [.command, .option])
             }
 
 #if DEBUG
@@ -437,7 +482,8 @@ struct TermMeshApp: App {
             }
 #endif
 
-            // New tab commands
+            // MARK: - File & Navigation Commands
+            Group {
             CommandGroup(replacing: .newItem) {
                 splitCommandButton(title: "New Window", shortcut: newWindowMenuShortcut) {
                     appDelegate.openNewMainWindow(nil)
@@ -446,18 +492,6 @@ struct TermMeshApp: App {
                 splitCommandButton(title: "New Workspace", shortcut: newWorkspaceMenuShortcut) {
                     activeTabManager.addTab()
                 }
-
-                Button("New Worktree Workspace") {
-                    NotificationCenter.default.post(name: .worktreeWorkspaceRequested, object: nil)
-                }
-                .keyboardShortcut("n", modifiers: [.command, .option, .shift])
-
-                Divider()
-
-                Button("New Agent Team…") {
-                    showTeamCreation = true
-                }
-                .keyboardShortcut("t", modifiers: [.command, .option])
             }
 
             // Close tab/workspace
@@ -662,6 +696,7 @@ struct TermMeshApp: App {
                     showNotificationsPopover()
                 }
             }
+            } // Group: File & Navigation Commands
         }
     }
 
@@ -861,6 +896,131 @@ struct TermMeshApp: App {
             .flatMap { $0.split(separator: ":").last.map(String.init) } ?? "9876"
         guard let url = URL(string: "http://localhost:\(port)") else { return }
         _ = activeTabManager.createBrowserSplit(direction: .right, url: url)
+    }
+
+    private func cleanupStaleWorktrees() {
+        let repoPath = activeTabManager.selectedWorkspace?.worktreeRepoPath
+            ?? termMeshDaemon.findGitRoot(from: FileManager.default.currentDirectoryPath)
+            ?? FileManager.default.currentDirectoryPath
+        DispatchQueue.global(qos: .utility).async { [daemon = self.termMeshDaemon] in
+            let result = daemon.cleanupStaleWorktrees(repoPath: repoPath)
+            DispatchQueue.main.async {
+                let alert = NSAlert()
+                alert.alertStyle = .informational
+                if result.removed == 0 && result.skippedDirty == 0 {
+                    alert.messageText = "No Stale Worktrees"
+                    alert.informativeText = "All worktrees are either active or already cleaned up."
+                } else {
+                    alert.messageText = "Worktree Cleanup Complete"
+                    var info = "Removed \(result.removed) stale worktree\(result.removed == 1 ? "" : "s")."
+                    if result.skippedDirty > 0 {
+                        info += "\nSkipped \(result.skippedDirty) dirty worktree\(result.skippedDirty == 1 ? "" : "s") (uncommitted changes)."
+                    }
+                    alert.informativeText = info
+                }
+                alert.addButton(withTitle: "OK")
+                alert.runModal()
+            }
+        }
+    }
+
+    private func showDestroyTeamDialog() {
+        let teamList = TeamOrchestrator.shared.listTeams()
+        guard !teamList.isEmpty else {
+            let alert = NSAlert()
+            alert.messageText = "Destroy Team"
+            alert.informativeText = "No active teams found."
+            alert.alertStyle = .informational
+            alert.addButton(withTitle: "OK")
+            alert.runModal()
+            return
+        }
+
+        let alert = NSAlert()
+        alert.messageText = "Destroy Team"
+        alert.informativeText = "Select a team to destroy. This will close all agent panes and clean up worktrees."
+        alert.alertStyle = .warning
+        alert.addButton(withTitle: "Destroy")
+        alert.addButton(withTitle: "Cancel")
+
+        let popup = NSPopUpButton(frame: NSRect(x: 0, y: 0, width: 340, height: 26), pullsDown: false)
+        for team in teamList {
+            let name = team["team_name"] as? String ?? "unknown"
+            let count = team["agent_count"] as? Int ?? 0
+            popup.addItem(withTitle: "\(name) (\(count) agents)")
+            popup.lastItem?.representedObject = name as NSString
+        }
+        alert.accessoryView = popup
+
+        guard alert.runModal() == .alertFirstButtonReturn,
+              let teamName = popup.selectedItem?.representedObject as? String else { return }
+
+        _ = TeamOrchestrator.shared.destroyTeam(name: teamName, tabManager: activeTabManager)
+    }
+
+    private func showCollectResultsDialog() {
+        let teamList = TeamOrchestrator.shared.listTeams()
+        guard !teamList.isEmpty else {
+            let alert = NSAlert()
+            alert.messageText = "Collect Results"
+            alert.informativeText = "No active teams found."
+            alert.alertStyle = .informational
+            alert.addButton(withTitle: "OK")
+            alert.runModal()
+            return
+        }
+
+        // If single team, use it directly; otherwise show picker
+        let teamName: String
+        if teamList.count == 1 {
+            teamName = teamList[0]["team_name"] as? String ?? ""
+        } else {
+            let alert = NSAlert()
+            alert.messageText = "Collect Results"
+            alert.informativeText = "Select a team:"
+            alert.alertStyle = .informational
+            alert.addButton(withTitle: "Collect")
+            alert.addButton(withTitle: "Cancel")
+
+            let popup = NSPopUpButton(frame: NSRect(x: 0, y: 0, width: 340, height: 26), pullsDown: false)
+            for team in teamList {
+                let name = team["team_name"] as? String ?? "unknown"
+                let count = team["agent_count"] as? Int ?? 0
+                popup.addItem(withTitle: "\(name) (\(count) agents)")
+                popup.lastItem?.representedObject = name as NSString
+            }
+            alert.accessoryView = popup
+
+            guard alert.runModal() == .alertFirstButtonReturn,
+                  let selected = popup.selectedItem?.representedObject as? String else { return }
+            teamName = selected
+        }
+
+        let status = TeamOrchestrator.shared.resultStatus(teamName: teamName)
+        let total = status["total"] as? Int ?? 0
+        let completed = status["completed"] as? Int ?? 0
+        let agents = status["agents"] as? [[String: Any]] ?? []
+
+        let resultAlert = NSAlert()
+        resultAlert.alertStyle = .informational
+        resultAlert.messageText = "Results — \(teamName)"
+
+        var lines: [String] = ["\(completed)/\(total) agents submitted results.\n"]
+        for agent in agents {
+            let name = agent["name"] as? String ?? "?"
+            let done = agent["has_result"] as? Bool ?? false
+            lines.append("  \(done ? "✅" : "⏳") \(name)")
+        }
+        let dir = TeamOrchestrator.resultDirectory(teamName: teamName)
+        lines.append("\nResults directory:\n\(dir)")
+        resultAlert.informativeText = lines.joined(separator: "\n")
+
+        resultAlert.addButton(withTitle: "Open in Finder")
+        resultAlert.addButton(withTitle: "OK")
+
+        if resultAlert.runModal() == .alertFirstButtonReturn {
+            NSWorkspace.shared.open(URL(fileURLWithPath: dir, isDirectory: true))
+        }
     }
 
     private static let spawnCLILastCommandKey = "spawnCLILastCommand"
