@@ -85,6 +85,7 @@ final class TeamOrchestrator {
         var reviewSummary: String?
         var createdBy: String
         var result: String?
+        var resultPath: String?
         let createdAt: Date
         var updatedAt: Date
         var startedAt: Date?
@@ -1815,6 +1816,7 @@ final class TeamOrchestrator {
             reviewSummary: nil,
             createdBy: normalizedCreatedBy,
             result: nil,
+            resultPath: nil,
             createdAt: now,
             updatedAt: now,
             startedAt: nil,
@@ -1840,6 +1842,7 @@ final class TeamOrchestrator {
         taskId: String,
         status: String? = nil,
         result: String? = nil,
+        resultPath: String? = nil,
         assignee: String? = nil,
         blockedReason: String? = nil,
         reviewSummary: String? = nil,
@@ -1861,6 +1864,7 @@ final class TeamOrchestrator {
             tasks[idx].reviewSummary = reviewSummary.nilIfBlank
         }
         if let result { tasks[idx].result = result }
+        if let resultPath { tasks[idx].resultPath = resultPath.nilIfBlank }
         if let progressNote = progressNote?.nilIfBlank {
             tasks[idx].lastProgressAt = now
             _ = postMessage(
@@ -2114,6 +2118,7 @@ final class TeamOrchestrator {
             "review_summary": task.reviewSummary as Any,
             "created_by": task.createdBy,
             "result": task.result as Any,
+            "result_path": task.resultPath as Any,
             "created_at": ISO8601DateFormatter().string(from: task.createdAt),
             "updated_at": ISO8601DateFormatter().string(from: task.updatedAt),
             "needs_attention": taskNeedsAttention(task),

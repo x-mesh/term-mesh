@@ -11,10 +11,18 @@ final class TeamDataStore: @unchecked Sendable {
     // Team registry: name → agent names (synced from TeamOrchestrator on create/destroy)
     private var teamRegistry: [String: [String]] = [:]
 
+    struct ContextEntry {
+        var key: String
+        var value: String
+        var setBy: String
+        var updatedAt: Date
+    }
+
     // Data collections (previously in TeamOrchestrator, now lock-protected)
     private var messages: [String: [TeamOrchestrator.TeamMessage]] = [:]
     private var taskBoards: [String: [TeamOrchestrator.TeamTask]] = [:]
     private var heartbeats: [String: [String: (at: Date, summary: String?)]] = [:]
+    private var contextStore: [String: [String: ContextEntry]] = [:]
 
     private let staleTaskThreshold: TimeInterval = 10 * 60
     private let staleHeartbeatThreshold: TimeInterval = 5 * 60
@@ -55,6 +63,7 @@ final class TeamDataStore: @unchecked Sendable {
         messages.removeValue(forKey: name)
         taskBoards.removeValue(forKey: name)
         heartbeats.removeValue(forKey: name)
+        contextStore.removeValue(forKey: name)
         lock.unlock()
         notifyChanged()
     }
@@ -200,6 +209,7 @@ final class TeamDataStore: @unchecked Sendable {
         taskId: String,
         status: String? = nil,
         result: String? = nil,
+        resultPath: String? = nil,
         assignee: String? = nil,
         blockedReason: String? = nil,
         reviewSummary: String? = nil,
@@ -223,6 +233,7 @@ final class TeamDataStore: @unchecked Sendable {
             tasks[idx].reviewSummary = reviewSummary.teamDataNilIfBlank
         }
         if let result { tasks[idx].result = result }
+        if let resultPath { tasks[idx].resultPath = resultPath.teamDataNilIfBlank }
         if let progressNote = progressNote?.teamDataNilIfBlank {
             tasks[idx].lastProgressAt = now
             // Post progress message (inline, already holding lock — use messages directly)
@@ -469,6 +480,54 @@ final class TeamDataStore: @unchecked Sendable {
         return taskBoards[teamName, default: []].count
     }
 
+    // MARK: - Context Store
+
+    @discardableResult
+    func contextSet(teamName: String, key: String, value: String, setBy: String) -> [String: Any] {
+        lock.lock()
+        guard teamRegistry[teamName] != nil else {
+            lock.unlock()
+            return ["ok": false, "error": "team '\(teamName)' is not registered"]
+        }
+        let entry = ContextEntry(
+            key: key,
+            value: value,
+            setBy: setBy,
+            updatedAt: Date()
+        )
+        contextStore[teamName, default: [:]][key] = entry
+        lock.unlock()
+        notifyChanged()
+        return ["ok": true, "key": key]
+    }
+
+    func contextGet(teamName: String, key: String) -> [String: Any]? {
+        lock.lock()
+        defer { lock.unlock() }
+        guard let entry = contextStore[teamName]?[key] else { return nil }
+        return [
+            "key": entry.key,
+            "value": entry.value,
+            "set_by": entry.setBy,
+            "updated_at": ISO8601DateFormatter().string(from: entry.updatedAt),
+        ]
+    }
+
+    func contextList(teamName: String) -> [[String: Any]] {
+        lock.lock()
+        defer { lock.unlock() }
+        return contextStore[teamName, default: [:]].values
+            .sorted { $0.key < $1.key }
+            .map { entry in
+                [
+                    "key": entry.key,
+                    "value": entry.value,
+                    "set_by": entry.setBy,
+                    "updated_at": ISO8601DateFormatter().string(from: entry.updatedAt),
+                ]
+            }
+    }
+
     // MARK: - File-Based Results
 
     /// Local copy of result directory path (avoids calling @MainActor TeamOrchestrator.resultDirectory)
@@ -550,6 +609,7 @@ final class TeamDataStore: @unchecked Sendable {
             "review_summary": task.reviewSummary as Any,
             "created_by": task.createdBy,
             "result": task.result as Any,
+            "result_path": task.resultPath as Any,
             "created_at": ISO8601DateFormatter().string(from: task.createdAt),
             "updated_at": ISO8601DateFormatter().string(from: task.updatedAt),
             "needs_attention": Self.taskNeedsAttention(task, threshold: staleTaskThreshold),

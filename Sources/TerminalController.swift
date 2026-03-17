@@ -876,6 +876,12 @@ class TerminalController {
             return v2Result(id: id, self.v2TeamTaskList(params: params))
         case "team.task.clear":
             return v2Result(id: id, self.v2TeamTaskClear(params: params))
+        case "team.context.set":
+            return v2Result(id: id, self.v2TeamContextSet(params: params))
+        case "team.context.get":
+            return v2Result(id: id, self.v2TeamContextGet(params: params))
+        case "team.context.list":
+            return v2Result(id: id, self.v2TeamContextList(params: params))
 
         // Notifications
         case "notification.create":
@@ -1854,6 +1860,12 @@ class TerminalController {
             return teamDataTaskCreate(params: params, id: id, store: store)
         case "team.task.update":
             return teamDataTaskUpdate(params: params, id: id, store: store)
+        case "team.context.set":
+            return teamDataContextSet(params: params, id: id, store: store)
+        case "team.context.get":
+            return teamDataContextGet(params: params, id: id, store: store)
+        case "team.context.list":
+            return teamDataContextList(params: params, id: id, store: store)
         default:
             return v2Error(id: id, code: "unknown_method", message: "Unknown team data method: \(method)")
         }
@@ -2311,11 +2323,12 @@ class TerminalController {
             return v2Error(id: id, code: "invalid_params", message: "Missing task_id")
         }
         let taskResult = params["result"] as? String
+        let resultPath = params["result_path"] as? String
         let store = TeamDataStore.shared
 
         guard let task = store.updateTask(
             teamName: teamName, taskId: taskId,
-            status: "completed", result: taskResult
+            status: "completed", result: taskResult, resultPath: resultPath
         ) else {
             return v2Error(id: id, code: "not_found", message: "Task not found")
         }
@@ -2419,6 +2432,9 @@ class TerminalController {
         "team.task.clear",
         "team.task.create",
         "team.task.update",
+        "team.context.set",
+        "team.context.get",
+        "team.context.list",
     ]
 
     /// Dispatch data-only team commands to teamDataQueue, bypassing v2MainSync.
@@ -2456,6 +2472,12 @@ class TerminalController {
                 return teamDataTaskCreate(params: params, id: id, store: store)
             case "team.task.update":
                 return teamDataTaskUpdate(params: params, id: id, store: store)
+            case "team.context.set":
+                return teamDataContextSet(params: params, id: id, store: store)
+            case "team.context.get":
+                return teamDataContextGet(params: params, id: id, store: store)
+            case "team.context.list":
+                return teamDataContextList(params: params, id: id, store: store)
             default:
                 return nil
             }
@@ -2686,6 +2708,38 @@ class TerminalController {
             return v2Ok(id: id, result: store.taskDictionary(task))
         }
         return v2Error(id: id, code: "not_found", message: "Task not found")
+    }
+
+    // MARK: - Team Context Handlers (off-main-thread safe)
+
+    private func teamDataContextSet(params: [String: Any], id: Any?, store: TeamDataStore) -> String {
+        guard let teamName = params["team_name"] as? String,
+              let key = params["key"] as? String,
+              let value = params["value"] as? String,
+              let setBy = params["set_by"] as? String else {
+            return v2Error(id: id, code: "invalid_params", message: "Missing required params: team_name, key, value, set_by")
+        }
+        let result = store.contextSet(teamName: teamName, key: key, value: value, setBy: setBy)
+        return v2Ok(id: id, result: result)
+    }
+
+    private func teamDataContextGet(params: [String: Any], id: Any?, store: TeamDataStore) -> String {
+        guard let teamName = params["team_name"] as? String,
+              let key = params["key"] as? String else {
+            return v2Error(id: id, code: "invalid_params", message: "Missing required params: team_name, key")
+        }
+        guard let result = store.contextGet(teamName: teamName, key: key) else {
+            return v2Error(id: id, code: "not_found", message: "Key not found: \(key)")
+        }
+        return v2Ok(id: id, result: result)
+    }
+
+    private func teamDataContextList(params: [String: Any], id: Any?, store: TeamDataStore) -> String {
+        guard let teamName = params["team_name"] as? String else {
+            return v2Error(id: id, code: "invalid_params", message: "Missing required param: team_name")
+        }
+        let entries = store.contextList(teamName: teamName)
+        return v2Ok(id: id, result: ["entries": entries, "count": entries.count])
     }
 
     // MARK: - V2 Agent Team Methods
@@ -3227,6 +3281,7 @@ class TerminalController {
             return .err(code: "invalid_params", message: "Missing task_id", data: nil)
         }
         let taskResult = params["result"] as? String
+        let resultPath = params["result_path"] as? String
 
         var result: V2CallResult = .err(code: "not_found", message: "Task not found", data: nil)
         v2MainSync {
@@ -3234,7 +3289,8 @@ class TerminalController {
                 teamName: teamName,
                 taskId: taskId,
                 status: "completed",
-                result: taskResult
+                result: taskResult,
+                resultPath: resultPath
             ) else { return }
             let notified = TeamOrchestrator.shared.notifyTaskLifecycleEvent(
                 teamName: teamName,
@@ -3486,6 +3542,38 @@ class TerminalController {
             TeamOrchestrator.shared.clearTasks(teamName: teamName)
         }
         return .ok(["cleared": true, "team_name": teamName])
+    }
+
+    // MARK: - V2 Context Methods (sync fallback)
+
+    private func v2TeamContextSet(params: [String: Any]) -> V2CallResult {
+        guard let teamName = params["team_name"] as? String,
+              let key = params["key"] as? String,
+              let value = params["value"] as? String,
+              let setBy = params["set_by"] as? String else {
+            return .err(code: "invalid_params", message: "Missing required params: team_name, key, value, set_by", data: nil)
+        }
+        let result = TeamDataStore.shared.contextSet(teamName: teamName, key: key, value: value, setBy: setBy)
+        return .ok(result)
+    }
+
+    private func v2TeamContextGet(params: [String: Any]) -> V2CallResult {
+        guard let teamName = params["team_name"] as? String,
+              let key = params["key"] as? String else {
+            return .err(code: "invalid_params", message: "Missing required params: team_name, key", data: nil)
+        }
+        guard let result = TeamDataStore.shared.contextGet(teamName: teamName, key: key) else {
+            return .err(code: "not_found", message: "Key not found: \(key)", data: nil)
+        }
+        return .ok(result)
+    }
+
+    private func v2TeamContextList(params: [String: Any]) -> V2CallResult {
+        guard let teamName = params["team_name"] as? String else {
+            return .err(code: "invalid_params", message: "Missing required param: team_name", data: nil)
+        }
+        let entries = TeamDataStore.shared.contextList(teamName: teamName)
+        return .ok(["entries": entries, "count": entries.count])
     }
 
     // MARK: - V2 Notification Methods

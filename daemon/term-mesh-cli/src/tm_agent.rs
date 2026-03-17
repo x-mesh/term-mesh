@@ -114,6 +114,9 @@ enum Commands {
     /// Message operations (send, list, clear)
     #[command(subcommand)]
     Msg(MsgCommands),
+    /// Shared context store
+    #[command(subcommand)]
+    Context(ContextCommands),
 
     // ── Simple RPC wrappers ────────────────────────────────────────
     /// Destroy the current team
@@ -348,6 +351,16 @@ enum MsgCommands {
     Clear,
 }
 
+#[derive(Subcommand)]
+enum ContextCommands {
+    /// Set a context key-value pair
+    Set { key: String, value: String },
+    /// Get a context value by key
+    Get { key: String },
+    /// List all context entries
+    List,
+}
+
 // ── Socket / RPC infrastructure ──────────────────────────────────────
 
 fn detect_socket() -> Option<PathBuf> {
@@ -478,7 +491,10 @@ fn task_title_from_text(text: &str) -> String {
     }
 }
 
-fn format_task_instruction(task: &Value, instruction: &str, no_report: bool) -> String {
+fn format_task_instruction(
+    sock: &PathBuf, team: &str,
+    task: &Value, instruction: &str, no_report: bool,
+) -> String {
     let mut lines = vec![
         format!("[TASK_ID] {}", task["id"].as_str().unwrap_or("")),
         format!("[TASK_TITLE] {}", task["title"].as_str().unwrap_or("")),
@@ -499,6 +515,27 @@ fn format_task_instruction(task: &Value, instruction: &str, no_report: bool) -> 
         if !deps.is_empty() {
             let dep_strs: Vec<&str> = deps.iter().filter_map(|d| d.as_str()).collect();
             lines.push(format!("[DEPS] {}", dep_strs.join(", ")));
+            // Inject dependency results for completed deps
+            for dep_id in &dep_strs {
+                if let Ok(dep_resp) = rpc_call(sock, "team.task.get", json!({
+                    "team_name": team, "task_id": dep_id,
+                })) {
+                    let dep_task = &dep_resp["result"];
+                    if dep_task["status"].as_str() == Some("completed") {
+                        let content = if let Some(path) = dep_task["result_path"].as_str() {
+                            std::fs::read_to_string(path).ok()
+                        } else {
+                            dep_task["result"].as_str().map(String::from)
+                        };
+                        if let Some(text) = content {
+                            let truncated = truncate_summary(&text, 2000);
+                            lines.push(format!("\n[DEP_RESULT: {dep_id}]"));
+                            lines.push(truncated);
+                            lines.push(format!("[/DEP_RESULT]"));
+                        }
+                    }
+                }
+            }
         }
     }
     if let Some(desc) = task["description"].as_str() {
@@ -532,6 +569,46 @@ fn parse_cli_flag(flag: &Option<String>) -> std::collections::HashSet<String> {
         }
     }
     result
+}
+
+// ── Hybrid result delivery helpers ────────────────────────────────────
+
+fn results_dir(team: &str) -> PathBuf {
+    let home = env::var("HOME").unwrap_or_else(|_| "/tmp".into());
+    PathBuf::from(home).join(".term-mesh/results").join(team)
+}
+
+fn write_result_file(team: &str, filename: &str, content: &str) -> Result<PathBuf, String> {
+    let dir = results_dir(team);
+    std::fs::create_dir_all(&dir).map_err(|e| format!("mkdir: {e}"))?;
+    let path = dir.join(filename);
+    let tmp = dir.join(format!(".{filename}.tmp"));
+    std::fs::write(&tmp, content).map_err(|e| format!("write: {e}"))?;
+    std::fs::rename(&tmp, &path).map_err(|e| format!("rename: {e}"))?;
+    Ok(path)
+}
+
+fn truncate_summary(content: &str, max_chars: usize) -> String {
+    if content.len() <= max_chars { return content.to_string(); }
+    let mut end = max_chars;
+    while end > 0 && !content.is_char_boundary(end) { end -= 1; }
+    format!("{}...", &content[..end])
+}
+
+fn cleanup_old_results(team: &str) {
+    let dir = results_dir(team);
+    if let Ok(entries) = std::fs::read_dir(&dir) {
+        let cutoff = std::time::SystemTime::now() - std::time::Duration::from_secs(24 * 3600);
+        for entry in entries.flatten() {
+            if let Ok(meta) = entry.metadata() {
+                if let Ok(modified) = meta.modified() {
+                    if modified < cutoff {
+                        let _ = std::fs::remove_file(entry.path());
+                    }
+                }
+            }
+        }
+    }
 }
 
 // ── Main ─────────────────────────────────────────────────────────────
@@ -592,6 +669,22 @@ fn main() {
                 }
             }
         }
+        Commands::Context(sub) => {
+            match sub {
+                ContextCommands::Set { key, value } => {
+                    let agent = agent.clone();
+                    rpc_call(&sock, "team.context.set", json!({
+                        "team_name": team, "key": key, "value": value, "set_by": agent,
+                    }))
+                }
+                ContextCommands::Get { key } => {
+                    rpc_call(&sock, "team.context.get", json!({ "team_name": team, "key": key }))
+                }
+                ContextCommands::List => {
+                    rpc_call(&sock, "team.context.list", json!({ "team_name": team }))
+                }
+            }
+        }
         Commands::Task(sub) => {
             match sub {
                 TaskCommands::Start { task_id } => {
@@ -600,10 +693,18 @@ fn main() {
                     }))
                 }
                 TaskCommands::Done { task_id, result } => {
-                    rpc_call(&sock, "team.task.done", json!({
+                    let result_text = result.as_deref().unwrap_or("done");
+                    // Write full result to file, send truncated summary via socket
+                    let result_path = write_result_file(&team, &format!("{task_id}.md"), result_text).ok();
+                    let summary = truncate_summary(result_text, 500);
+                    let mut params = json!({
                         "team_name": team, "task_id": task_id,
-                        "result": result.as_deref().unwrap_or("done"),
-                    }))
+                        "result": summary,
+                    });
+                    if let Some(ref path) = result_path {
+                        params["result_path"] = json!(path.to_string_lossy());
+                    }
+                    rpc_call(&sock, "team.task.done", params)
                 }
                 TaskCommands::Block { task_id, reason } => {
                     rpc_call(&sock, "team.task.block", json!({
@@ -770,6 +871,7 @@ fn main() {
         // ── Simple RPC wrappers ─────────────────────────────────
         Commands::Destroy => {
             eprintln!("Destroying team '{team}'...");
+            cleanup_old_results(&team);
             rpc_call(&sock, "team.destroy", json!({ "team_name": team }))
         }
         Commands::List => {
@@ -834,14 +936,25 @@ fn main() {
         Commands::Reply { text, from } => {
             let sender = from.unwrap_or_else(|| agent.clone());
             let content = text.join(" ");
-            print_result(rpc_call(&sock, "team.message.post", json!({
-                "team_name": team, "from": sender, "content": content,
+            // Write full result to file, send truncated summary via socket
+            let result_path = write_result_file(&team, &format!("{sender}-reply.md"), &content).ok();
+            let summary = truncate_summary(&content, 500);
+            let mut msg_params = json!({
+                "team_name": team, "from": sender, "content": summary,
                 "to": "leader", "type": "report",
-            })));
-            // Auto-submit report for wait detection
-            let _ = rpc_call(&sock, "team.report", json!({
-                "team_name": team, "agent_name": sender, "content": content,
-            }));
+            });
+            if let Some(ref path) = result_path {
+                msg_params["result_path"] = json!(path.to_string_lossy());
+            }
+            print_result(rpc_call(&sock, "team.message.post", msg_params));
+            // Auto-submit report for wait detection (with result_path)
+            let mut report_params = json!({
+                "team_name": team, "agent_name": sender, "content": summary,
+            });
+            if let Some(ref path) = result_path {
+                report_params["result_path"] = json!(path.to_string_lossy());
+            }
+            let _ = rpc_call(&sock, "team.report", report_params);
             return;
         }
     };
@@ -862,6 +975,7 @@ fn run_create(
     sock: &PathBuf, team: &str, count: u32, claude_leader: bool,
     model: &str, leader_model: Option<&str>, kiro: &Option<String>, codex: &Option<String>, gemini: &Option<String>,
 ) {
+    cleanup_old_results(team);
     let leader_mode = if claude_leader { "claude" } else { "repl" };
     let leader_model = leader_model.unwrap_or(model);
     let kiro_agents = parse_cli_flag(kiro);
@@ -1020,7 +1134,7 @@ fn run_delegate(
         return;
     }
 
-    let instruction = format_task_instruction(task, text, no_report);
+    let instruction = format_task_instruction(sock, team, task, text, no_report);
     let sent = match rpc_call(sock, "team.send", json!({
         "team_name": team, "agent_name": target,
         "text": format!("{instruction}\n"),
