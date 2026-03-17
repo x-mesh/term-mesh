@@ -62,11 +62,12 @@ final class Workspace: Identifiable, ObservableObject {
     // MARK: - Pane Zoom
 
     /// Whether any pane is currently zoomed (delegates to bonsplit's native zoom).
-    var isPaneZoomed: Bool { bonsplitController.isSplitZoomed }
+    /// TODO: Enable when bonsplit adds isSplitZoomed/togglePaneZoom
+    var isPaneZoomed: Bool { false }
 
     /// Toggle zoom on the focused pane. If already zoomed, restores original layout.
     func togglePaneZoom() {
-        bonsplitController.togglePaneZoom()
+        // TODO: bonsplitController.togglePaneZoom()
         objectWillChange.send()
     }
 
@@ -929,6 +930,7 @@ final class Workspace: Identifiable, ObservableObject {
         orientation: SplitOrientation,
         insertFirst: Bool = false,
         focus: Bool = true,
+        skipEqualization: Bool = false,
         workingDirectory: String? = nil,
         command: String? = nil,
         environment: [String: String] = [:]
@@ -999,7 +1001,9 @@ final class Workspace: Identifiable, ObservableObject {
 
         // Equalize divider positions so all panes in the same orientation chain
         // get equal space (e.g., 3 horizontal panes → 33:33:33 instead of 50:25:25).
-        equalizeSplitDividers()
+        if !skipEqualization {
+            equalizeSplitDividers()
+        }
 
         // Suppress the old view's becomeFirstResponder side-effects during SwiftUI reparenting.
         // Without this, reparenting triggers onFocus + ghostty_surface_set_focus on the old view,

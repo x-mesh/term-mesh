@@ -131,9 +131,11 @@ final class TeamOrchestrator {
             let cellW = hasLeader ? totalWidth / CGFloat(cols + 1) : totalWidth / CGFloat(cols)
             let cellH = totalHeight / CGFloat(rows)
             let ratio = max(cellW / cellH, cellH / cellW)
+            // Penalize portrait (tall) cells — prefer landscape (wide) layouts
+            let adjustedRatio = cellH > cellW ? ratio * 1.2 : ratio
 
-            if ratio < bestRatio {
-                bestRatio = ratio
+            if adjustedRatio < bestRatio {
+                bestRatio = adjustedRatio
                 bestCols = cols
             }
         }
@@ -186,8 +188,11 @@ final class TeamOrchestrator {
             equalizeSplits(splitNode.second)
         }
         let tree = workspace.bonsplitController.treeSnapshot()
-        // Skip root split (leader | agent-area): only equalize the agent subtree
+        // Set root split to 50% (leader gets half), then equalize the agent subtree
         if case .split(let root) = tree {
+            if let rootId = UUID(uuidString: root.id) {
+                workspace.bonsplitController.setDividerPosition(0.5, forSplit: rootId)
+            }
             #if DEBUG
             dlog("[equalize] root orientation=\(root.orientation), agent subtree columns=\(columnCount(root.second)), leaves=\(leafCount(root.second))")
             #endif
@@ -387,6 +392,7 @@ final class TeamOrchestrator {
             orientation: .horizontal,
             insertFirst: true,
             focus: true,
+            skipEqualization: true,
             workingDirectory: workingDirectory,
             command: leaderCommand.map { "\($0); exec $SHELL" },
             environment: leaderEnv
@@ -573,6 +579,7 @@ final class TeamOrchestrator {
                 from: splitFrom,
                 orientation: orientation,
                 focus: false,
+                skipEqualization: true,
                 workingDirectory: agentWorkDir,
                 command: shellCommand,
                 environment: paneEnv
