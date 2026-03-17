@@ -3,6 +3,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixListener;
+use tokio::time::{timeout, Duration};
 use tokio::sync::watch;
 
 use crate::agent::AgentSessionManager;
@@ -155,7 +156,10 @@ async fn handle_connection(
     let (reader, mut writer) = stream.into_split();
     let mut lines = BufReader::new(reader).lines();
 
-    while let Some(line) = lines.next_line().await? {
+    while let Some(line) = timeout(Duration::from_secs(60), lines.next_line())
+        .await
+        .map_err(|_| anyhow::anyhow!("read timeout"))??
+    {
         let req: Request = match serde_json::from_str(&line) {
             Ok(r) => r,
             Err(e) => {
@@ -169,7 +173,9 @@ async fn handle_connection(
                 };
                 let mut buf = serde_json::to_vec(&resp)?;
                 buf.push(b'\n');
-                writer.write_all(&buf).await?;
+                timeout(Duration::from_secs(5), writer.write_all(&buf))
+                    .await
+                    .map_err(|_| anyhow::anyhow!("write timeout"))??;
                 continue;
             }
         };
@@ -179,7 +185,9 @@ async fn handle_connection(
 
         let mut buf = serde_json::to_vec(&resp)?;
         buf.push(b'\n');
-        writer.write_all(&buf).await?;
+        timeout(Duration::from_secs(5), writer.write_all(&buf))
+            .await
+            .map_err(|_| anyhow::anyhow!("write timeout"))??;
     }
 
     Ok(())
