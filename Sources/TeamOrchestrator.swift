@@ -47,6 +47,29 @@ final class TeamOrchestrator {
 
     private(set) var teams: [String: Team] = [:]
 
+    /// When true, agent terminal surfaces are defocused to stop vsync rendering.
+    private(set) var agentRenderingPaused = false
+
+    /// Toggle rendering for all agent panes across all teams.
+    /// Paused agents stop CVDisplayLink (vsync), reducing GPU/CPU load significantly.
+    /// The pty and processes keep running — only Metal rendering is suspended.
+    func toggleAgentRendering() {
+        agentRenderingPaused.toggle()
+        setAgentSurfaceFocus(!agentRenderingPaused)
+    }
+
+    private func setAgentSurfaceFocus(_ focused: Bool) {
+        for team in teams.values {
+            for agent in team.agents {
+                guard let appDelegate = AppDelegate.shared,
+                      let located = appDelegate.locateSurface(surfaceId: agent.panelId),
+                      let workspace = located.tabManager.tabs.first(where: { $0.id == located.workspaceId }),
+                      let panel = workspace.panels[agent.panelId] as? TerminalPanel else { continue }
+                panel.surface.setFocus(focused)
+            }
+        }
+    }
+
     // MARK: - Bidirectional Communication
 
     /// B: File-based results — convention directory

@@ -148,6 +148,23 @@ final class TitlebarControlsViewModel: ObservableObject {
             menu.addItem(spawnItem)
         }
 
+        // Agent rendering toggle — only show when teams exist
+        MainActor.assumeIsolated {
+            let orchestrator = TeamOrchestrator.shared
+            if !orchestrator.teams.isEmpty {
+                menu.addItem(NSMenuItem.separator())
+                let paused = orchestrator.agentRenderingPaused
+                let renderItem = ClosureMenuItem(
+                    title: paused ? "Resume Agent Rendering" : "Pause Agent Rendering",
+                    keyEquivalent: ""
+                ) {
+                    orchestrator.toggleAgentRendering()
+                }
+                renderItem.state = paused ? .on : .off
+                menu.addItem(renderItem)
+            }
+        }
+
         guard let anchor = plusMenuAnchorView else {
             #if DEBUG
             dlog("titlebar.plusMenu anchor=nil — menu skipped")
