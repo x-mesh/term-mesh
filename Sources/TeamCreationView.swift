@@ -21,7 +21,7 @@ struct TeamCreationView: View {
     @ObservedObject var templateManager = TeamTemplateManager.shared
     @ObservedObject var providerDetector = ProviderDetector.shared
 
-    var onCreate: ((_ teamName: String, _ leaderMode: String, _ leaderModel: String, _ agents: [TeamAgentRow]) -> Void)?
+    var onCreate: ((_ teamName: String, _ leaderMode: String, _ leaderModel: String, _ agents: [TeamAgentRow], _ worktreeMode: String) -> Void)?
 
     @AppStorage("teamDefaultLeaderMode") private var defaultLeaderMode = "claude"
     @AppStorage("teamDefaultModel") private var defaultModel = "sonnet"
@@ -38,6 +38,8 @@ struct TeamCreationView: View {
     @State private var hoveredAgentId: UUID?
     @State private var bulkModel = "sonnet"
     @State private var selectedSmartPresetId: String?
+    @State private var worktreeMode = "off"  // "off", "shared", "isolated"
+    @State private var showDaemonWarning = false
 
     /// A team name is only truly duplicate if the entry exists AND its workspace
     /// tab is still open.  When the user closes a workspace tab manually the team
@@ -81,6 +83,7 @@ struct TeamCreationView: View {
             leaderMode = defaultLeaderMode
             leaderModel = defaultLeaderModel
             bulkModel = defaultModel
+            worktreeMode = TermMeshDaemon.shared.worktreeEnabled ? "isolated" : "off"
             if agents.isEmpty {
                 applyQuickPreset(count: 2)
             }
@@ -220,6 +223,52 @@ struct TeamCreationView: View {
                     }
                     .frame(width: 130)
                 }
+            }
+
+            HStack {
+                Text("Worktree")
+                    .font(.subheadline.bold())
+                Spacer()
+                Picker("", selection: $worktreeMode) {
+                    Text("Off").tag("off")
+                    Text("Shared").tag("shared")
+                    Text("Isolated").tag("isolated")
+                }
+                .pickerStyle(.segmented)
+                .frame(width: 240)
+            }
+            .onChange(of: worktreeMode) { _ in
+                showDaemonWarning = worktreeMode != "off" && !TermMeshDaemon.shared.daemonStatus().connected
+            }
+
+            if worktreeMode == "shared" {
+                HStack(spacing: 4) {
+                    Image(systemName: "arrow.triangle.branch")
+                        .foregroundStyle(.blue)
+                    Text("All agents share one worktree: team/\(teamName)")
+                        .foregroundStyle(.secondary)
+                }
+                .font(.caption)
+                .transition(.opacity)
+            } else if worktreeMode == "isolated" {
+                HStack(spacing: 4) {
+                    Image(systemName: "arrow.triangle.branch")
+                        .foregroundStyle(.green)
+                    Text("Each agent gets its own worktree branch")
+                        .foregroundStyle(.secondary)
+                }
+                .font(.caption)
+                .transition(.opacity)
+            }
+
+            if showDaemonWarning {
+                HStack(spacing: 4) {
+                    Image(systemName: "exclamationmark.triangle.fill")
+                        .foregroundStyle(.yellow)
+                    Text("term-meshd not running — worktrees require the daemon")
+                        .foregroundStyle(.secondary)
+                }
+                .font(.caption)
             }
         }
     }
@@ -707,6 +756,13 @@ struct TeamCreationView: View {
             .disabled(agents.isEmpty)
 
             Spacer()
+            if worktreeMode != "off" {
+                Label(worktreeMode == "shared" ? "Shared Worktree" : "Isolated Worktrees",
+                      systemImage: "arrow.triangle.branch")
+                    .font(.caption)
+                    .foregroundStyle(worktreeMode == "shared" ? .blue : .green)
+                    .padding(.trailing, 4)
+            }
             Button("Cancel") { dismiss() }
                 .keyboardShortcut(.cancelAction)
             Button("Create Team") { createTeam() }
@@ -837,7 +893,7 @@ struct TeamCreationView: View {
 
     private func createTeam() {
         defaultLeaderModel = leaderModel
-        onCreate?(teamName, leaderMode, leaderModel, agents)
+        onCreate?(teamName, leaderMode, leaderModel, agents, worktreeMode)
         dismiss()
     }
 

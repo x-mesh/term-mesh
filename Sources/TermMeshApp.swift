@@ -217,7 +217,7 @@ struct TermMeshApp: App {
                     showSpawnCLIDialog()
                 }
                 .sheet(isPresented: $showTeamCreation) {
-                    TeamCreationView { teamName, leaderMode, leaderModel, agents in
+                    TeamCreationView { teamName, leaderMode, leaderModel, agents, worktreeMode in
                         let agentTuples = agents.map { row in
                             (
                                 name: row.preset.name,
@@ -239,6 +239,7 @@ struct TermMeshApp: App {
                             leaderSessionId: UUID().uuidString,
                             leaderMode: leaderMode,
                             leaderModel: leaderModel,
+                            worktreeMode: worktreeMode,
                             tabManager: tabManager
                         )
                     }

@@ -38,6 +38,10 @@ final class TeamOrchestrator {
         var agents: [AgentMember]
         let createdAt: Date
         var gitRepoRoot: String?  // for worktree cleanup
+        var worktreeMode: String  // "off", "shared", "isolated"
+        var sharedWorktreeName: String?
+        var sharedWorktreePath: String?
+        var sharedWorktreeBranch: String?
     }
 
     private(set) var teams: [String: Team] = [:]
@@ -228,6 +232,7 @@ final class TeamOrchestrator {
         leaderSessionId: String,
         leaderMode: String = "repl",
         leaderModel: String = "sonnet",
+        worktreeMode: String = "off",
         tabManager: TabManager
     ) -> Team? {
         guard !agents.isEmpty else { return nil }
@@ -402,9 +407,30 @@ final class TeamOrchestrator {
         // Close the original empty panel
         workspace.closePanel(defaultPanelId)
 
-        // Worktree isolation: create per-agent worktrees if enabled
-        let useWorktrees = daemon.worktreeEnabled
+        // Worktree isolation based on team-level mode
+        let useWorktrees = worktreeMode != "off"
         let gitRepoRoot = useWorktrees ? daemon.findGitRoot(from: workingDirectory) : nil
+
+        // Shared mode: create ONE worktree for the whole team
+        var sharedWorkDir: String?
+        var sharedWtName: String?
+        var sharedWtPath: String?
+        var sharedWtBranch: String?
+
+        if worktreeMode == "shared", let repoRoot = gitRepoRoot {
+            let branchName = "team/\(name)"
+            let result = daemon.createWorktreeWithError(repoPath: repoRoot, branch: branchName)
+            switch result {
+            case .success(let info):
+                sharedWorkDir = info.path
+                sharedWtName = info.name
+                sharedWtPath = info.path
+                sharedWtBranch = info.branch
+                Logger.team.info("shared worktree for team '\(name, privacy: .public)': \(info.path, privacy: .public)")
+            case .failure(let error):
+                Logger.team.error("shared worktree failed: \(error, privacy: .public), using original directory")
+            }
+        }
 
         // Compute optimal grid dimensions for agent panes
         let snapshot = workspace.bonsplitController.layoutSnapshot()
@@ -426,13 +452,13 @@ final class TeamOrchestrator {
             let agentColor = agent.color.isEmpty ? colors[index % colors.count] : agent.color
             let agentId = "\(agent.name)@\(name)"
 
-            // Create isolated worktree for this agent if enabled
-            var agentWorkDir = workingDirectory
-            var wtName: String?
-            var wtPath: String?
-            var wtBranch: String?
+            // Worktree for this agent
+            var agentWorkDir = sharedWorkDir ?? workingDirectory
+            var wtName = sharedWtName
+            var wtPath = sharedWtPath
+            var wtBranch = sharedWtBranch
 
-            if useWorktrees, let repoRoot = gitRepoRoot {
+            if worktreeMode == "isolated", let repoRoot = gitRepoRoot {
                 let branchName = "team/\(name)/\(agent.name)"
                 let result = daemon.createWorktreeWithError(repoPath: repoRoot, branch: branchName)
                 switch result {
@@ -443,7 +469,7 @@ final class TeamOrchestrator {
                     wtBranch = info.branch
                     Logger.team.info("worktree for \(agent.name, privacy: .public): \(info.path, privacy: .public) [\(info.branch, privacy: .public)]")
                 case .failure(let error):
-                    Logger.team.error("worktree failed for \(agent.name, privacy: .public): \(error, privacy: .public), using shared directory")
+                    Logger.team.error("worktree failed for \(agent.name, privacy: .public): \(error, privacy: .public), using original directory")
                 }
             }
 
@@ -600,7 +626,11 @@ final class TeamOrchestrator {
             workspaceId: workspace.id,
             agents: members,
             createdAt: Date(),
-            gitRepoRoot: gitRepoRoot
+            gitRepoRoot: gitRepoRoot,
+            worktreeMode: worktreeMode,
+            sharedWorktreeName: sharedWtName,
+            sharedWorktreePath: sharedWtPath,
+            sharedWorktreeBranch: sharedWtBranch
         )
         teams[name] = team
         // Register in thread-safe data store for off-main access (approach C: dual queue)
@@ -616,7 +646,10 @@ final class TeamOrchestrator {
                 teamName: name,
                 agents: members,
                 socketPath: socketPath,
-                scriptDir: scriptDir
+                scriptDir: scriptDir,
+                worktreeMode: worktreeMode,
+                sharedWorktreeBranch: sharedWtBranch,
+                sharedWorktreePath: sharedWtPath
             )
             // Write prompt to a temp file — used by kiro profile (self-directed read)
             // and by codex/gemini (delayed TUI injection).
@@ -793,7 +826,10 @@ final class TeamOrchestrator {
         teamName: String,
         agents: [AgentMember],
         socketPath: String,
-        scriptDir: String
+        scriptDir: String,
+        worktreeMode: String = "off",
+        sharedWorktreeBranch: String? = nil,
+        sharedWorktreePath: String? = nil
     ) -> String {
         let agentList = agents.enumerated().map { i, a in
             "  \(i + 1). \(a.name) (\(a.agentType))"
@@ -802,19 +838,31 @@ final class TeamOrchestrator {
         let tmAgent = "tm-agent"
 
         // Worktree info
-        let worktreeAgents = agents.filter { $0.worktreeBranch != nil }
         let worktreeSection: String
-        if !worktreeAgents.isEmpty {
-            let wtList = worktreeAgents.map { a in
-                "  - \(a.name): branch='\(a.worktreeBranch ?? "?")' path='\(a.worktreePath ?? "?")'"
-            }.joined(separator: "\n")
+        if worktreeMode == "shared", let branch = sharedWorktreeBranch, let path = sharedWorktreePath {
             worktreeSection = """
 
-            ## Worktree Isolation (ACTIVE)
-            Each agent works in its own isolated git worktree.
-            \(wtList)
-            When agents complete work, instruct them to: git add -A && git commit && git push && gh pr create
+            ## Worktree Isolation (SHARED)
+            All agents share a single worktree branch: '\(branch)' at '\(path)'.
+            Agents should coordinate commits to avoid conflicts.
+            When work is complete: git add -A && git commit && git push && gh pr create
             """
+        } else if worktreeMode == "isolated" {
+            let worktreeAgents = agents.filter { $0.worktreeBranch != nil }
+            if !worktreeAgents.isEmpty {
+                let wtList = worktreeAgents.map { a in
+                    "  - \(a.name): branch='\(a.worktreeBranch ?? "?")' path='\(a.worktreePath ?? "?")'"
+                }.joined(separator: "\n")
+                worktreeSection = """
+
+                ## Worktree Isolation (ISOLATED)
+                Each agent works in its own isolated git worktree.
+                \(wtList)
+                When agents complete work, instruct them to: git add -A && git commit && git push && gh pr create
+                """
+            } else {
+                worktreeSection = ""
+            }
         } else {
             worktreeSection = ""
         }
