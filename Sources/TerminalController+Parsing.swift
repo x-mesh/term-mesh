@@ -481,6 +481,9 @@ extension TerminalController {
         }
 
         let directory = Self.normalizeReportedDirectory(parsed.positional.joined(separator: " "))
+        #if DEBUG
+        dlog("report_pwd.received dir=\(directory) args=\(args)")
+        #endif
 
         // Shell integration provides explicit UUID handles for cwd updates.
         // Keep this hot path off-main and drop no-op reports before scheduling UI work.
@@ -490,8 +493,14 @@ extension TerminalController {
                 panelId: scope.panelId,
                 directory: directory
             ) else {
+                #if DEBUG
+                dlog("report_pwd.deduped dir=\(directory) workspace=\(scope.workspaceId.uuidString.prefix(8)) panel=\(scope.panelId.uuidString.prefix(8))")
+                #endif
                 return "OK"
             }
+            #if DEBUG
+            dlog("report_pwd.publish dir=\(directory) workspace=\(scope.workspaceId.uuidString.prefix(8)) panel=\(scope.panelId.uuidString.prefix(8))")
+            #endif
             DispatchQueue.main.async {
                 guard let tabManager = AppDelegate.shared?.tabManagerFor(tabId: scope.workspaceId) else { return }
                 tabManager.updateSurfaceDirectory(tabId: scope.workspaceId, surfaceId: scope.panelId, directory: directory)

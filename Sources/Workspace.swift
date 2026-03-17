@@ -605,11 +605,19 @@ final class Workspace: Identifiable, ObservableObject {
     func updatePanelDirectory(panelId: UUID, directory: String) {
         let trimmed = directory.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
+        #if DEBUG
+        let oldPanelDir = panelDirectories[panelId] ?? "(nil)"
+        let isFocused = panelId == focusedPanelId
+        dlog("workspace.updatePanelDir panel=\(panelId.uuidString.prefix(8)) dir=\(trimmed) oldDir=\(oldPanelDir) isFocused=\(isFocused) currentDir=\(currentDirectory)")
+        #endif
         if panelDirectories[panelId] != trimmed {
             panelDirectories[panelId] = trimmed
         }
         // Update current directory if this is the focused panel
         if panelId == focusedPanelId, currentDirectory != trimmed {
+            #if DEBUG
+            dlog("workspace.currentDir.changed from=\(currentDirectory) to=\(trimmed)")
+            #endif
             currentDirectory = trimmed
             // Re-detect worktree when directory changes
             let wt = Self.detectWorktree(in: trimmed)
