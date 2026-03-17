@@ -17,15 +17,7 @@ const DEFAULT_AGENT_NAMES: &[&str] = &["explorer", "executor", "reviewer", "debu
 const DEFAULT_AGENT_COLORS: &[&str] = &["green", "blue", "yellow", "magenta", "cyan", "red"];
 
 const REPORT_SUFFIX: &str = concat!(
-    "\n\n[IMPORTANT] Use the team task lifecycle while you work:\n",
-    "1. If you are starting assigned work, run `tm-agent task start <task_id>`.\n",
-    "2. While you are actively working, periodically run `tm-agent heartbeat '<short progress summary>'`.\n",
-    "3. If you are blocked, run `tm-agent task block <task_id> '<reason>'`.\n",
-    "4. If you are ready for leader validation, run `tm-agent task review <task_id> '<summary>'`.\n",
-    "5. When the task is actually done, run `tm-agent task done <task_id> '<result>'`.\n",
-    "If the leader did not give you a task id, report that and ask for one.\n",
-    "\n",
-    "[IMPORTANT] When you finish this task, you MUST use your bash/execute tool to run this SINGLE command:\n",
+    "\n\n[IMPORTANT] When you finish this task, you MUST use your bash/execute tool to run this SINGLE command:\n",
     "```\n",
     "tm-agent reply '<one-paragraph summary of your result>'\n",
     "```\n",
@@ -34,14 +26,7 @@ const REPORT_SUFFIX: &str = concat!(
 );
 
 const BROADCAST_SUFFIX: &str = concat!(
-    "\n\n[IMPORTANT] When you finish this task, you MUST use your bash/execute tool to run this SINGLE command:\n",
-    "```\n",
-    "tm-agent reply '<one-paragraph summary of your result>'\n",
-    "```\n",
-    "This sends the result to the leader AND registers it as a report in one step.\n",
-    "Do NOT run separate msg send + report commands. Just use `reply` once.\n",
-    "Do NOT just write the result as text — actually execute the shell command using your tool.\n",
-    "This allows the leader to detect task completion automatically.",
+    "\n\n[IMPORTANT] When done, run: `tm-agent reply '<one-paragraph summary>'` to report your result.",
 );
 
 fn agent_init_prompt(agent: &str, workdir: &str, socket: &str) -> String {
@@ -70,12 +55,7 @@ Environment:\n\
 - Socket: {socket}\n\
 - Project: term-mesh (Swift/macOS terminal multiplexer)\n\
 \n\
-When you complete any task assigned by the leader, you MUST use your bash/execute tool to run:\n\
-tm-agent reply '<one-paragraph summary of your result>'\n\
-This sends the result to the leader AND registers it as a report in one step.\n\
-Do NOT run separate msg send + report commands. Just use `reply` once.\n\
-Do NOT just write the result as text \u{2014} actually execute the shell command using your tool. \
-This allows the leader to detect task completion automatically. \
+When you complete any task, run: `tm-agent reply '<one-paragraph summary>'` to report.\n\
 Respond with \"Agent {agent} ready.\" to confirm.",
     )
 }
