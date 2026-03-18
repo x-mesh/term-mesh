@@ -30,7 +30,6 @@ fi
 {
     # zsh treats unset ZDOTDIR as if it were HOME. We do the same.
     builtin typeset _termmesh_file="${ZDOTDIR-$HOME}/.zshenv"
-    builtin print -- "[tm-zshenv] sourcing user .zshenv: $_termmesh_file interactive=$([[ -o interactive ]] && echo yes || echo no)" >> /tmp/term-mesh-zshenv-debug.log 2>/dev/null
     [[ ! -r "$_termmesh_file" ]] || builtin source -- "$_termmesh_file"
 } always {
     if [[ -o interactive ]]; then
@@ -41,13 +40,10 @@ fi
             [[ -r "$_termmesh_ghostty" ]] && builtin source -- "$_termmesh_ghostty"
         fi
 
-        # Ghostty's .zshenv always block runs AFTER this file and clears all
-        # functions/hooks defined here.  Defer term-mesh integration loading to
-        # .zshrc by keeping ZDOTDIR pointed at the integration dir.
-        if [[ "${TERMMESH_SHELL_INTEGRATION:-${CMUX_SHELL_INTEGRATION:-1}}" != "0" && -n "${TERMMESH_SHELL_INTEGRATION_DIR:-${CMUX_SHELL_INTEGRATION_DIR:-}}" ]]; then
-            builtin export ZDOTDIR="${TERMMESH_SHELL_INTEGRATION_DIR:-$CMUX_SHELL_INTEGRATION_DIR}"
-            builtin print -- "[tm-zshenv] set ZDOTDIR=$ZDOTDIR" >> /tmp/term-mesh-zshenv-debug.log 2>/dev/null
-        fi
+        # NOTE: term-mesh integration is NOT loaded here.  Ghostty's .zshenv
+        # always block runs AFTER this file and clears all functions/hooks
+        # defined here.  The integration is loaded from the user's .zshrc
+        # instead (via the TERMMESH_SHELL_INTEGRATION_DIR env var).
     fi
 
     builtin unset _termmesh_file _termmesh_ghostty
