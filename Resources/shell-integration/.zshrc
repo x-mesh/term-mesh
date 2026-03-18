@@ -1,22 +1,31 @@
 # vim:ft=zsh
 #
-# Compatibility shim: with the current integration model, term-mesh restores
-# ZDOTDIR in .zshenv so this file should never be reached. If it is, restore
-# ZDOTDIR and behave like vanilla zsh by sourcing the user's .zshrc.
+# ZDOTDIR wrapper: source the user's .zshrc, then load term-mesh integration.
+# This runs in the FINAL process after GhosttyKit's exec chain, so functions
+# defined here will persist for the entire shell session.
 
-if [[ -n "${GHOSTTY_ZSH_ZDOTDIR+X}" ]]; then
-    builtin export ZDOTDIR="$GHOSTTY_ZSH_ZDOTDIR"
-    builtin unset GHOSTTY_ZSH_ZDOTDIR
-elif [[ -n "${TERMMESH_ZSH_ZDOTDIR+X}" ]]; then
-    builtin export ZDOTDIR="$TERMMESH_ZSH_ZDOTDIR"
-    builtin unset TERMMESH_ZSH_ZDOTDIR
-elif [[ -n "${CMUX_ZSH_ZDOTDIR+X}" ]]; then
-    builtin export ZDOTDIR="$CMUX_ZSH_ZDOTDIR"
-    builtin unset CMUX_ZSH_ZDOTDIR
-else
-    builtin unset ZDOTDIR
-fi
-
-builtin typeset _termmesh_file="${ZDOTDIR-$HOME}/.zshrc"
+# Source user's .zshrc from $HOME.
+builtin typeset _termmesh_file="${HOME}/.zshrc"
 [[ ! -r "$_termmesh_file" ]] || builtin source -- "$_termmesh_file"
 builtin unset _termmesh_file
+
+# Load Ghostty shell integration if available.
+if [[ -o interactive && -n "${GHOSTTY_RESOURCES_DIR:-}" ]]; then
+    builtin typeset _termmesh_ghostty="$GHOSTTY_RESOURCES_DIR/shell-integration/zsh/ghostty-integration"
+    if [[ -r "$_termmesh_ghostty" ]]; then
+        builtin source -- "$_termmesh_ghostty"
+    fi
+    builtin unset _termmesh_ghostty
+fi
+
+# Load term-mesh integration (unless disabled or already loaded).
+if [[ -o interactive && "${TERMMESH_SHELL_INTEGRATION:-${CMUX_SHELL_INTEGRATION:-1}}" != "0" && -n "${TERMMESH_SHELL_INTEGRATION_DIR:-${CMUX_SHELL_INTEGRATION_DIR:-}}" ]]; then
+    builtin typeset _termmesh_integ="${TERMMESH_SHELL_INTEGRATION_DIR:-$CMUX_SHELL_INTEGRATION_DIR}/term-mesh-zsh-integration.zsh"
+    if [[ -r "$_termmesh_integ" ]] && ! builtin whence -w _termmesh_send >/dev/null 2>&1; then
+        builtin source -- "$_termmesh_integ"
+    fi
+    builtin unset _termmesh_integ
+fi
+
+# Restore ZDOTDIR so user scripts see the expected value.
+builtin unset ZDOTDIR
