@@ -40,11 +40,14 @@ fi
             [[ -r "$_termmesh_ghostty" ]] && builtin source -- "$_termmesh_ghostty"
         fi
 
-        # NOTE: term-mesh integration is NOT loaded here.  Ghostty's .zshenv
-        # always block runs AFTER this file and clears all functions/hooks
-        # defined here.  The integration is loaded from the user's .zshrc
-        # instead (via the TERMMESH_SHELL_INTEGRATION_DIR env var).
+        # Load term-mesh integration (unless disabled).
+        # This works because shell-integration=none in ghostty-termmesh.conf
+        # prevents Ghostty's .zshenv always-block from clearing these functions.
+        if [[ "${TERMMESH_SHELL_INTEGRATION:-${CMUX_SHELL_INTEGRATION:-1}}" != "0" && -n "${TERMMESH_SHELL_INTEGRATION_DIR:-${CMUX_SHELL_INTEGRATION_DIR:-}}" ]]; then
+            builtin typeset _termmesh_integ="${TERMMESH_SHELL_INTEGRATION_DIR:-$CMUX_SHELL_INTEGRATION_DIR}/term-mesh-zsh-integration.zsh"
+            [[ -r "$_termmesh_integ" ]] && builtin source -- "$_termmesh_integ"
+        fi
     fi
 
-    builtin unset _termmesh_file _termmesh_ghostty
+    builtin unset _termmesh_file _termmesh_ghostty _termmesh_integ
 }

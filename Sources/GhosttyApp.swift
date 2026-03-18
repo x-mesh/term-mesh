@@ -504,7 +504,21 @@ class GhosttyApp {
         ghostty_config_load_default_files(config)
         loadLegacyGhosttyConfigIfNeeded(config)
         loadTermMeshThemeOverride(config)
+        loadTermMeshGhosttyOverrides(config)
         ghostty_config_finalize(config)
+    }
+
+    /// Load term-mesh-specific Ghostty overrides (e.g. shell-integration = none).
+    /// Must be loaded AFTER user config so it always takes precedence.
+    private func loadTermMeshGhosttyOverrides(_ config: ghostty_config_t) {
+        guard let url = Bundle.main.url(forResource: "ghostty-termmesh", withExtension: "conf"),
+              FileManager.default.fileExists(atPath: url.path) else { return }
+        url.path.withCString { path in
+            ghostty_config_load_file(config, path)
+        }
+        #if DEBUG
+        Self.initLog("loaded term-mesh ghostty overrides: \(url.path)")
+        #endif
     }
 
     /// Load the term-mesh terminal theme override file (if present).
