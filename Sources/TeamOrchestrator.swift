@@ -334,6 +334,13 @@ final class TeamOrchestrator: ObservableObject {
     ) -> Team? {
         guard !agents.isEmpty else { return nil }
 
+        // Always clear stale on-disk state for this team name before creating.
+        // Result/message/task files in /tmp persist across app restarts and workspace closures,
+        // causing wait --mode report to return immediately with outdated data.
+        clearResults(teamName: name)
+        clearMessages(teamName: name)
+        clearTasks(teamName: name)
+
         // Auto-cleanup: if a team with this name exists but its workspace was closed, remove the stale entry.
         // Check across ALL windows (not just the current tabManager) to enforce global uniqueness.
         if let existing = teams[name] {
@@ -351,7 +358,6 @@ final class TeamOrchestrator: ObservableObject {
                 return nil
             }
             Logger.team.info("cleaning up stale team '\(name, privacy: .public)' (workspace closed)")
-            clearResults(teamName: name)
             teams.removeValue(forKey: name)
         }
 
