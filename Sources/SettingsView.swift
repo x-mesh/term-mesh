@@ -900,7 +900,7 @@ struct SettingsView: View {
 
                     SettingsCard {
                         SettingsCardRow("Port Base", subtitle: "Starting port for TERMMESH_PORT env var.", controlWidth: pickerColumnWidth) {
-                            TextField("", value: $termMeshPortBase, format: .number)
+                            TextField("", value: $termMeshPortBase, format: .number.grouping(.never))
                                 .textFieldStyle(.roundedBorder)
                                 .multilineTextAlignment(.trailing)
                         }
@@ -908,7 +908,7 @@ struct SettingsView: View {
                         SettingsCardDivider()
 
                         SettingsCardRow("Port Range Size", subtitle: "Number of ports per workspace.", controlWidth: pickerColumnWidth) {
-                            TextField("", value: $termMeshPortRange, format: .number)
+                            TextField("", value: $termMeshPortRange, format: .number.grouping(.never))
                                 .textFieldStyle(.roundedBorder)
                                 .multilineTextAlignment(.trailing)
                         }
@@ -1086,7 +1086,7 @@ struct SettingsView: View {
                             SettingsCardDivider()
 
                             SettingsCardRow("Port", subtitle: "HTTP port for the dashboard.", controlWidth: pickerColumnWidth) {
-                                TextField("", value: $dashboardPort, format: .number)
+                                TextField("", value: $dashboardPort, format: .number.grouping(.never))
                                     .textFieldStyle(.roundedBorder)
                                     .multilineTextAlignment(.trailing)
                             }
@@ -1531,7 +1531,7 @@ struct SettingsView: View {
     private var sectionIMEInputBar: some View {
         SettingsCard {
                         SettingsCardRow("Font Size", subtitle: "Text size in the IME input bar (pt).", controlWidth: pickerColumnWidth) {
-                            TextField("", value: $imeBarFontSize, format: .number)
+                            TextField("", value: $imeBarFontSize, format: .number.grouping(.never))
                                 .textFieldStyle(.roundedBorder)
                                 .multilineTextAlignment(.trailing)
                         }
@@ -1539,7 +1539,7 @@ struct SettingsView: View {
                         SettingsCardDivider()
 
                         SettingsCardRow("Bar Height", subtitle: "Height of the IME input bar (px).", controlWidth: pickerColumnWidth) {
-                            TextField("", value: $imeBarHeight, format: .number)
+                            TextField("", value: $imeBarHeight, format: .number.grouping(.never))
                                 .textFieldStyle(.roundedBorder)
                                 .multilineTextAlignment(.trailing)
                         }
