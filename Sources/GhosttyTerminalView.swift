@@ -1629,49 +1629,50 @@ func pushTargetSurfaceSize(_ size: CGSize) {
 
     /// Send text from the IME Input Bar to the terminal surface as key input.
     ///
-    /// Fixes over the original implementation:
-    /// 1. Sends RELEASE after each PRESS — TUI apps (Claude Code) may track
-    ///    key state and ignore subsequent PRESS events without a matching RELEASE.
-    /// 2. Splits multiline text at newlines and sends Return key events between
-    ///    lines, instead of sending embedded \n as raw bytes.
-    /// 3. Uses sendSurfaceKeyPress for Return (which already sends PRESS+RELEASE).
+    /// Multiline: use bracketed paste so terminal treats newlines as content, not execution.
+    /// The shell interprets each Return key event as "execute", so multiline text must be
+    /// delivered via ghostty_surface_text (bracketed paste) rather than per-line key events.
+    /// Single-line: use key events so TUI apps (Claude Code) receive proper press/release pairs.
     func sendIMEText(_ text: String, withReturn: Bool = true) {
         guard let surface = surface else { return }
 
-        let lines = text.components(separatedBy: "\n")
-        for (i, line) in lines.enumerated() {
-            if !line.isEmpty {
-                // Chunk long lines at UTF-8 safe boundaries (max 4096 bytes per event)
-                // to prevent potential buffer issues in the Ghostty C/Zig layer.
-                let segments = Self.chunkUTF8Safe(line, maxBytes: 4096)
-                for segment in segments {
-                    // Send text as key event
-                    segment.withCString { ptr in
-                        var keyEvent = ghostty_input_key_s()
-                        keyEvent.action = GHOSTTY_ACTION_PRESS
-                        keyEvent.keycode = 0
-                        keyEvent.mods = GHOSTTY_MODS_NONE
-                        keyEvent.consumed_mods = GHOSTTY_MODS_NONE
-                        keyEvent.unshifted_codepoint = 0
-                        keyEvent.text = ptr
-                        keyEvent.composing = false
-                        _ = ghostty_surface_key(surface, keyEvent)
-                    }
-                    // Send matching RELEASE — TUI apps may track key state
-                    var releaseEvent = ghostty_input_key_s()
-                    releaseEvent.action = GHOSTTY_ACTION_RELEASE
-                    releaseEvent.keycode = 0
-                    releaseEvent.mods = GHOSTTY_MODS_NONE
-                    releaseEvent.consumed_mods = GHOSTTY_MODS_NONE
-                    releaseEvent.unshifted_codepoint = 0
-                    releaseEvent.text = nil
-                    releaseEvent.composing = false
-                    _ = ghostty_surface_key(surface, releaseEvent)
+        if text.contains("\n") {
+            // Multiline: use bracketed paste so terminal treats newlines as content, not execution.
+            // Sending Return key events between lines would cause the shell to execute each line
+            // immediately instead of composing a multiline input.
+            let payload = withReturn ? text + "\r" : text
+            terminalSurface?.sendText(payload)
+            return
+        }
+
+        // Single-line: use key events (PRESS+RELEASE) so TUI apps track key state correctly.
+        if !text.isEmpty {
+            // Chunk long text at UTF-8 safe boundaries (max 4096 bytes per event)
+            // to prevent potential buffer issues in the Ghostty C/Zig layer.
+            let segments = Self.chunkUTF8Safe(text, maxBytes: 4096)
+            for segment in segments {
+                // Send text as key event
+                segment.withCString { ptr in
+                    var keyEvent = ghostty_input_key_s()
+                    keyEvent.action = GHOSTTY_ACTION_PRESS
+                    keyEvent.keycode = 0
+                    keyEvent.mods = GHOSTTY_MODS_NONE
+                    keyEvent.consumed_mods = GHOSTTY_MODS_NONE
+                    keyEvent.unshifted_codepoint = 0
+                    keyEvent.text = ptr
+                    keyEvent.composing = false
+                    _ = ghostty_surface_key(surface, keyEvent)
                 }
-            }
-            // Send newline between lines (for multiline input via Shift+Enter)
-            if i < lines.count - 1 {
-                sendReturnKey(to: surface)
+                // Send matching RELEASE — TUI apps may track key state
+                var releaseEvent = ghostty_input_key_s()
+                releaseEvent.action = GHOSTTY_ACTION_RELEASE
+                releaseEvent.keycode = 0
+                releaseEvent.mods = GHOSTTY_MODS_NONE
+                releaseEvent.consumed_mods = GHOSTTY_MODS_NONE
+                releaseEvent.unshifted_codepoint = 0
+                releaseEvent.text = nil
+                releaseEvent.composing = false
+                _ = ghostty_surface_key(surface, releaseEvent)
             }
         }
         // Send Enter to execute
