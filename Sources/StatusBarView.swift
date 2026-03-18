@@ -2,6 +2,7 @@ import SwiftUI
 
 struct StatusBarView: View {
     @EnvironmentObject var tabManager: TabManager
+    @ObservedObject private var teamOrchestrator = TeamOrchestrator.shared
 
     private var selectedWorkspace: Workspace? {
         tabManager.selectedWorkspace
@@ -76,6 +77,17 @@ struct StatusBarView: View {
                             .truncationMode(.middle)
                     }
                     separatorDot
+                }
+                if !teamOrchestrator.teams.isEmpty {
+                    Button(action: {
+                        teamOrchestrator.toggleAgentRendering()
+                    }) {
+                        Image(systemName: teamOrchestrator.agentRenderingPaused ? "eye.slash" : "eye")
+                            .font(.system(size: 10))
+                            .foregroundStyle(.tertiary)
+                    }
+                    .buttonStyle(.plain)
+                    .help(teamOrchestrator.agentRenderingPaused ? "Resume agent rendering" : "Pause agent rendering")
                 }
                 Text(appVersion)
                     .font(.system(size: 11, design: .monospaced))

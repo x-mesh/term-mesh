@@ -67,7 +67,7 @@ enum SettingsSection: String, CaseIterable, Identifiable {
         case .app: return ["app", "theme", "appearance", "dark", "light", "workspace", "placement", "session", "restore", "dock", "badge", "quit", "warn", "rename", "sidebar", "branch", "reorder", "notification"]
         case .workspaceColors: return ["workspace", "color", "indicator", "palette", "custom"]
         case .automation: return ["automation", "socket", "claude", "port", "integration", "password"]
-        case .agentTeams: return ["agent", "team", "leader", "model", "directory"]
+        case .agentTeams: return ["agent", "team", "leader", "model", "directory", "rendering", "interval", "refresh"]
         case .agentCLIPaths: return ["cli", "path", "claude", "kiro", "codex", "gemini", "binary", "agent"]
         case .worktrees: return ["worktrees", "worktree", "base directory", "cleanup", "auto"]
         case .dashboard: return ["dashboard", "http", "localhost", "port", "remote"]
@@ -120,6 +120,7 @@ struct SettingsView: View {
     @AppStorage("teamDefaultLeaderMode") private var teamDefaultLeaderMode = "claude"
     @AppStorage("teamDefaultModel") private var teamDefaultModel = "sonnet"
     @AppStorage("teamDefaultWorkingDirectory") private var teamDefaultWorkingDirectory = ""
+    @AppStorage("agentRenderingInterval") private var agentRenderingInterval = 3
     @AppStorage("cliPath.claude") private var cliPathClaude = ""
     @AppStorage("cliPath.kiro") private var cliPathKiro = ""
     @AppStorage("cliPath.codex") private var cliPathCodex = ""
@@ -983,6 +984,30 @@ struct SettingsView: View {
                                 }
                                 .buttonStyle(.bordered)
                                 .controlSize(.small)
+                            }
+                        }
+                        }
+
+                        if settingsMatch("rendering", "interval", "agent", "refresh", "pane") {
+                        SettingsCardDivider()
+
+                        SettingsCardRow(
+                            "Agent Rendering Interval",
+                            subtitle: "How often to refresh agent panes when rendering is paused.",
+                            controlWidth: pickerColumnWidth
+                        ) {
+                            Picker("", selection: $agentRenderingInterval) {
+                                Text("1s").tag(1)
+                                Text("3s").tag(3)
+                                Text("5s").tag(5)
+                                Text("10s").tag(10)
+                                Text("15s").tag(15)
+                                Text("30s").tag(30)
+                            }
+                            .labelsHidden()
+                            .pickerStyle(.menu)
+                            .onChange(of: agentRenderingInterval) { _ in
+                                TeamOrchestrator.shared.updatePeriodicRenderInterval()
                             }
                         }
                         }

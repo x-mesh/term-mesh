@@ -11,6 +11,7 @@ import WebKit
 struct ContentView: View {
     @ObservedObject var updateViewModel: UpdateViewModel
     @ObservedObject private var rainbowBanner = RainbowBannerStore.shared
+    @ObservedObject private var teamOrchestrator = TeamOrchestrator.shared
     let windowId: UUID
     @EnvironmentObject var tabManager: TabManager
     @EnvironmentObject var notificationStore: TerminalNotificationStore
@@ -695,6 +696,16 @@ struct ContentView: View {
                     .foregroundColor(titlebarColor(opacity: 0.5))
             }
 
+            if !teamOrchestrator.teams.isEmpty {
+                titlebarInfoSeparator
+                Button(action: { teamOrchestrator.toggleAgentRendering() }) {
+                    Image(systemName: teamOrchestrator.agentRenderingPaused ? "eye.slash" : "eye")
+                        .font(.system(size: 10))
+                        .foregroundColor(teamOrchestrator.agentRenderingPaused ? .orange.opacity(0.8) : .green.opacity(0.7))
+                }
+                .buttonStyle(.plain)
+                .help(teamOrchestrator.agentRenderingPaused ? "Resume agent rendering" : "Pause agent rendering")
+            }
             titlebarInfoSeparator
             Text(Self.appVersion)
                 .font(.system(size: 11, design: .monospaced))

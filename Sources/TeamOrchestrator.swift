@@ -6,7 +6,7 @@ import os
 /// Manages multi-agent Claude teams where a leader orchestrates N agent instances,
 /// each running in split panes within a single workspace.
 @MainActor
-final class TeamOrchestrator {
+final class TeamOrchestrator: ObservableObject {
     static let shared = TeamOrchestrator()
 
     struct AgentMember: Identifiable {
@@ -46,27 +46,91 @@ final class TeamOrchestrator {
         var sharedWorktreeBranch: String?
     }
 
-    private(set) var teams: [String: Team] = [:]
+    @Published private(set) var teams: [String: Team] = [:]
 
-    /// When true, agent terminal surfaces are defocused to stop vsync rendering.
-    private(set) var agentRenderingPaused = false
+    /// When true, agent terminal surfaces are occluded; a periodic timer triggers a single
+    /// ghostty_surface_draw every 3 s so new output is visible when the user glances at agents.
+    @Published private(set) var agentRenderingPaused = false
 
-    /// Toggle rendering for all agent panes across all teams.
-    /// Paused agents stop CVDisplayLink (vsync), reducing GPU/CPU load significantly.
-    /// The pty and processes keep running — only Metal rendering is suspended.
-    func toggleAgentRendering() {
-        agentRenderingPaused.toggle()
-        setAgentSurfaceFocus(!agentRenderingPaused)
+    private var periodicRenderTimer: DispatchSourceTimer?
+
+    /// Reads the user-configured interval (seconds) from UserDefaults; defaults to 3.
+    private var periodicRenderInterval: TimeInterval {
+        let stored = UserDefaults.standard.integer(forKey: "agentRenderingInterval")
+        return stored > 0 ? TimeInterval(stored) : 3.0
     }
 
-    private func setAgentSurfaceFocus(_ focused: Bool) {
+    /// Called when the user changes the rendering interval in Settings.
+    /// Restarts the timer with the new interval if rendering is currently paused.
+    func updatePeriodicRenderInterval() {
+        guard agentRenderingPaused else { return }
+        stopPeriodicRenderTimer()
+        startPeriodicRenderTimer()
+    }
+
+    /// Toggle rendering for all agent panes across all teams.
+    /// Paused: occludes surfaces (stops CVDisplayLink + wakeup rendering) and starts a 3-second
+    /// periodic draw so new output is still captured. Resumed: restores normal rendering.
+    func toggleAgentRendering() {
+        agentRenderingPaused.toggle()
+        if agentRenderingPaused {
+            setAgentSurfaceOcclusion(visible: false)
+            startPeriodicRenderTimer()
+        } else {
+            stopPeriodicRenderTimer()
+            setAgentSurfaceOcclusion(visible: true)
+        }
+    }
+
+    private func setAgentSurfaceOcclusion(visible: Bool) {
         for team in teams.values {
             for agent in team.agents {
                 guard let appDelegate = AppDelegate.shared,
                       let located = appDelegate.locateSurface(surfaceId: agent.panelId),
                       let workspace = located.tabManager.tabs.first(where: { $0.id == located.workspaceId }),
                       let panel = workspace.panels[agent.panelId] as? TerminalPanel else { continue }
-                panel.surface.setFocus(focused)
+                // Set renderingPaused before any focus/occlusion calls so guards work correctly.
+                panel.surface.renderingPaused = !visible
+                // setOcclusion(false) blocks all rendering paths (CVDisplayLink + wakeup-driven).
+                // setFocus is also called for belt-and-suspenders CVDisplayLink control.
+                if visible {
+                    panel.surface.setOcclusion(true)
+                    panel.surface.setFocus(true)
+                } else {
+                    panel.surface.setFocus(false)
+                    panel.surface.setOcclusion(false)
+                }
+            }
+        }
+    }
+
+    private func startPeriodicRenderTimer() {
+        let timer = DispatchSource.makeTimerSource(queue: .main)
+        timer.schedule(deadline: .now() + periodicRenderInterval, repeating: periodicRenderInterval)
+        timer.setEventHandler { [weak self] in
+            self?.periodicRenderAgents()
+        }
+        timer.resume()
+        periodicRenderTimer = timer
+    }
+
+    private func stopPeriodicRenderTimer() {
+        periodicRenderTimer?.cancel()
+        periodicRenderTimer = nil
+    }
+
+    /// Called by the periodic timer while rendering is paused.
+    /// Issues a single ghostty_surface_draw per agent so new terminal output is captured.
+    private func periodicRenderAgents() {
+        guard agentRenderingPaused else { return }
+        for team in teams.values {
+            for agent in team.agents {
+                guard let appDelegate = AppDelegate.shared,
+                      let located = appDelegate.locateSurface(surfaceId: agent.panelId),
+                      let workspace = located.tabManager.tabs.first(where: { $0.id == located.workspaceId }),
+                      let panel = workspace.panels[agent.panelId] as? TerminalPanel,
+                      let surface = panel.surface.surface else { continue }
+                ghostty_surface_draw(surface)
             }
         }
     }
@@ -1515,6 +1579,12 @@ final class TeamOrchestrator {
             tabManager.closeTab(wsRef)
             // Clean up worktrees after workspace is closed
             self.cleanupWorktrees(team: teamCopy)
+        }
+
+        // Stop periodic render timer if no teams remain after this removal
+        if teams.count <= 1 {
+            stopPeriodicRenderTimer()
+            agentRenderingPaused = false
         }
 
         // Clean up bidirectional communication state

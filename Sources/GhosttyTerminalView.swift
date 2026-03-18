@@ -216,6 +216,9 @@ final class TerminalSurface: Identifiable, ObservableObject {
 
     private(set) var surface: ghostty_surface_t?
     private weak var attachedView: GhosttyNSView?
+    /// When true, setFocus(true) calls are ignored to keep CVDisplayLink suspended.
+    /// Set by TeamOrchestrator.setAgentSurfaceFocus() when pausing/resuming agent rendering.
+    var renderingPaused = false
     /// Whether the terminal surface view is currently attached to a window.
     ///
     /// Use the hosted view rather than the inner surface view, since the surface can be
@@ -822,6 +825,10 @@ final class TerminalSurface: Identifiable, ObservableObject {
     }
 
     func setFocus(_ focused: Bool) {
+        // If rendering is paused (agent pane suppressed), block re-focus attempts.
+        // This prevents CVDisplayLink from restarting when panel.focus() or
+        // becomeFirstResponder triggers setFocus(true) after pause.
+        if renderingPaused && focused { return }
         guard let surface = surface else { return }
         ghostty_surface_set_focus(surface, focused)
 
@@ -1545,6 +1552,10 @@ func pushTargetSurfaceSize(_ size: CGSize) {
                     ]
                 )
             }
+            // Skip focus restoration if rendering is paused (agent pane suppressed).
+            // Without this guard, becomeFirstResponder re-enables the CVDisplayLink
+            // even after TeamOrchestrator has called setOcclusion(false)/setFocus(false).
+            guard terminalSurface?.renderingPaused != true else { return result }
             ghostty_surface_set_focus(surface, true)
 
             // Ghostty only restarts its vsync display link on display-id changes while focused.
@@ -1897,7 +1908,10 @@ func pushTargetSurfaceSize(_ size: CGSize) {
         // This avoids intermittent drops after rapid split close/reparent transitions.
         let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
         if flags.contains(.control) && !flags.contains(.command) && !flags.contains(.option) {
-            ghostty_surface_set_focus(surface, true)
+            // Skip re-focus for paused agent surfaces to avoid restarting their CVDisplayLink.
+            if terminalSurface?.renderingPaused != true {
+                ghostty_surface_set_focus(surface, true)
+            }
             var keyEvent = ghostty_input_key_s()
             keyEvent.action = event.isARepeat ? GHOSTTY_ACTION_REPEAT : GHOSTTY_ACTION_PRESS
             keyEvent.keycode = UInt32(event.keyCode)
