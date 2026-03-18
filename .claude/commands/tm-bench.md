@@ -14,7 +14,9 @@ Parse `$ARGUMENTS` to determine the subcommand:
 
 | Input | Command |
 |-------|---------|
-| `agent` | `python3 scripts/bench-agent.py` |
+| `agent` | `python3 scripts/bench-agent.py` (both pane + headless) |
+| `agent --pane` | `python3 scripts/bench-agent.py --mode pane` |
+| `agent --headless` | `python3 scripts/bench-agent.py --mode headless` |
 | `agent --rpc` | `python3 scripts/bench-agent.py --rpc-only` |
 | `agent --e2e` | `python3 scripts/bench-agent.py --e2e-only` |
 | `agent --note "..."` | `python3 scripts/bench-agent.py --note "..."` |
@@ -23,7 +25,7 @@ Parse `$ARGUMENTS` to determine the subcommand:
 
 Map the first word of `$ARGUMENTS`:
 
-- **`agent`** → Run benchmarks. Pass any remaining flags (`--rpc`, `--e2e`, `--note "..."`) through to the script.
+- **`agent`** → Run benchmarks. Map `--pane` to `--mode pane`, `--headless` to `--mode headless`. Pass remaining flags (`--rpc`, `--e2e`, `--note "..."`) through to the script.
 - **`history`** → Show history: `python3 scripts/bench-agent.py --history`
 - **`compare`** → Compare runs: `python3 scripts/bench-agent.py --compare` followed by the remaining args.
 
