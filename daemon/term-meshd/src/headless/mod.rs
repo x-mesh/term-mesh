@@ -139,6 +139,7 @@ impl HeadlessManager {
                 &params.model,
                 &daemon_socket,
                 params.cli_path.as_deref(),
+                params.app_socket_path.as_deref(),
             ),
             "codex" => cli_builder::build_codex_command(
                 &params.name,
@@ -146,6 +147,7 @@ impl HeadlessManager {
                 &params.model,
                 &daemon_socket,
                 params.cli_path.as_deref(),
+                params.app_socket_path.as_deref(),
             ),
             "gemini" => cli_builder::build_gemini_command(
                 &params.name,
@@ -153,6 +155,7 @@ impl HeadlessManager {
                 &params.model,
                 &daemon_socket,
                 params.cli_path.as_deref(),
+                params.app_socket_path.as_deref(),
             ),
             _ => cli_builder::build_claude_command(
                 &params.name,
@@ -161,6 +164,7 @@ impl HeadlessManager {
                 &params.working_directory,
                 &daemon_socket,
                 params.cli_path.as_deref(),
+                params.app_socket_path.as_deref(),
             ),
         };
 

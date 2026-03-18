@@ -10,10 +10,19 @@ pub struct CliCommand {
 }
 
 /// Common term-mesh environment variables for all agent CLIs.
-fn base_env(name: &str, team_name: &str, daemon_socket: &str) -> Vec<(String, String)> {
+fn base_env(
+    name: &str,
+    team_name: &str,
+    daemon_socket: &str,
+    app_socket_path: Option<&str>,
+) -> Vec<(String, String)> {
     let agent_id = format!("{name}@{team_name}");
+    // TERMMESH_SOCKET → Swift app socket (for team.* commands via tm-agent).
+    // Falls back to daemon socket when no app socket is provided (CLI-only mode).
+    let primary_socket = app_socket_path.unwrap_or(daemon_socket);
     vec![
-        ("TERMMESH_SOCKET".into(), daemon_socket.to_string()),
+        ("TERMMESH_SOCKET".into(), primary_socket.to_string()),
+        ("TERMMESH_DAEMON_SOCKET".into(), daemon_socket.to_string()),
         ("TERMMESH_TEAM".into(), team_name.to_string()),
         ("TERMMESH_AGENT_NAME".into(), name.to_string()),
         ("TERMMESH_AGENT_ID".into(), agent_id),
@@ -37,6 +46,7 @@ pub fn build_claude_command(
     _working_directory: &str,
     daemon_socket: &str,
     cli_path: Option<&str>,
+    app_socket_path: Option<&str>,
 ) -> CliCommand {
     let program = resolve_cli_path(cli_path, "CLAUDE_PATH", "claude");
 
@@ -48,7 +58,7 @@ pub fn build_claude_command(
         "--model".into(), model.to_string(),
     ];
 
-    let env = base_env(name, team_name, daemon_socket);
+    let env = base_env(name, team_name, daemon_socket, app_socket_path);
 
     // Remove env vars that cause nested-session detection in Claude Code
     let env_remove = vec![
@@ -76,6 +86,7 @@ pub fn build_kiro_command(
     model: &str,
     daemon_socket: &str,
     cli_path: Option<&str>,
+    app_socket_path: Option<&str>,
 ) -> CliCommand {
     let program = resolve_cli_path(cli_path, "KIRO_PATH", "kiro-cli");
 
@@ -103,7 +114,7 @@ pub fn build_kiro_command(
         "--model".into(), kiro_model.to_string(),
     ];
 
-    let env = base_env(name, team_name, daemon_socket);
+    let env = base_env(name, team_name, daemon_socket, app_socket_path);
     CliCommand { program, args, env, env_remove: vec![] }
 }
 
@@ -145,6 +156,7 @@ pub fn build_codex_command(
     model: &str,
     daemon_socket: &str,
     cli_path: Option<&str>,
+    app_socket_path: Option<&str>,
 ) -> CliCommand {
     let program = resolve_cli_path(cli_path, "CODEX_PATH", "codex");
 
@@ -157,7 +169,7 @@ pub fn build_codex_command(
         "-".into(),  // read prompt from stdin
     ];
 
-    let env = base_env(name, team_name, daemon_socket);
+    let env = base_env(name, team_name, daemon_socket, app_socket_path);
     CliCommand { program, args, env, env_remove: vec![] }
 }
 
@@ -178,6 +190,7 @@ pub fn build_gemini_command(
     model: &str,
     daemon_socket: &str,
     cli_path: Option<&str>,
+    app_socket_path: Option<&str>,
 ) -> CliCommand {
     let program = resolve_cli_path(cli_path, "GEMINI_PATH", "gemini");
 
@@ -187,7 +200,7 @@ pub fn build_gemini_command(
         "--model".into(), gemini_model.to_string(),
     ];
 
-    let env = base_env(name, team_name, daemon_socket);
+    let env = base_env(name, team_name, daemon_socket, app_socket_path);
     CliCommand { program, args, env, env_remove: vec![] }
 }
 

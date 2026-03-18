@@ -1284,7 +1284,16 @@ fn run_create(
 }
 
 fn detect_daemon_socket() -> Option<PathBuf> {
-    // Daemon socket is always at a fixed path (separate from the Swift app socket)
+    // Priority 1: TERMMESH_DAEMON_SOCKET (injected by daemon into headless agent env)
+    if let Ok(p) = env::var("TERMMESH_DAEMON_SOCKET") {
+        if !p.is_empty() {
+            let path = PathBuf::from(&p);
+            if is_socket_alive(&path) {
+                return Some(path);
+            }
+        }
+    }
+    // Priority 2: TERMMESH_DAEMON_UNIX_PATH (tagged build override)
     if let Ok(p) = env::var("TERMMESH_DAEMON_UNIX_PATH") {
         if !p.is_empty() {
             let path = PathBuf::from(&p);
@@ -1318,7 +1327,7 @@ fn is_headless_agent(daemon_sock: &PathBuf, team: &str, agent_name: &str) -> Opt
 }
 
 fn run_create_headless(
-    _app_sock: &PathBuf, team: &str, count: u32, model: &str, roles: Option<&str>,
+    app_sock: &PathBuf, team: &str, count: u32, model: &str, roles: Option<&str>,
 ) {
     let daemon_sock = match detect_daemon_socket() {
         Some(s) => s,
@@ -1365,6 +1374,7 @@ fn run_create_headless(
         "working_directory": workdir,
         "leader_session_id": format!("leader-{}", process::id()),
         "agents": agent_specs,
+        "app_socket_path": app_sock.to_string_lossy(),
     });
 
     match rpc_call_timeout(&daemon_sock, "headless.create_team", create_params, 30) {
