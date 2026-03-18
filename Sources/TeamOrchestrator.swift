@@ -1979,11 +1979,11 @@ final class TeamOrchestrator: ObservableObject {
     }
 
     /// Map short model names to Gemini CLI model identifiers.
-    /// New-style names (gemini-3.1-pro, gemini-3-flash, etc.) pass through directly.
+    /// New-style names (gemini-3-pro, gemini-3-flash, etc.) pass through directly.
     /// Legacy short names kept for backward compatibility with saved presets.
     private static func geminiModelName(_ shortName: String) -> String {
         switch shortName.lowercased() {
-        case "opus":   return "gemini-3.1-pro"
+        case "opus":   return "gemini-3-pro"
         case "sonnet": return "gemini-3-flash"
         case "haiku":  return "gemini-3-flash"
         default:       return shortName

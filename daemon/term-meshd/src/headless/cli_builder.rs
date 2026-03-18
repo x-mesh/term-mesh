@@ -176,7 +176,7 @@ pub fn build_codex_command(
 /// Map short model names to Gemini CLI model identifiers.
 fn gemini_model_name(short: &str) -> &str {
     match short.to_lowercase().as_str() {
-        "opus" => "gemini-3.1-pro",
+        "opus" => "gemini-3-pro",
         "sonnet" => "gemini-3-flash",
         "haiku" => "gemini-3-flash",
         _ => short,
