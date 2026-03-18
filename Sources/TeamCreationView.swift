@@ -819,6 +819,7 @@ struct TeamCreationView: View {
         if teamName == "my-team" || teamName.isEmpty {
             teamName = preset.id
         }
+        syncBulkFromAgents()
     }
 
     private func applyTeamPreset(_ preset: TeamPreset) {
@@ -826,11 +827,11 @@ struct TeamCreationView: View {
         selectedWorkflowName = nil
         selectedSmartPresetId = nil
         agents = preset.roles.compactMap { roleName in
-            if let match = available.first(where: { $0.name == roleName }) {
-                return TeamAgentRow(preset: match, customInstructions: "")
-            }
-            // Fallback: use first available preset if role not found
-            return available.first.map { TeamAgentRow(preset: $0, customInstructions: "") }
+            guard var p = available.first(where: { $0.name == roleName })
+                    ?? available.first else { return nil as TeamAgentRow? }
+            p.cli = bulkCli
+            p.model = bulkModel
+            return TeamAgentRow(preset: p, customInstructions: "")
         }
     }
 
@@ -840,13 +841,16 @@ struct TeamCreationView: View {
         selectedSmartPresetId = nil
         leaderMode = preset.leaderMode
         agents = preset.roles.compactMap { roleName in
-            let presetRole = available.first(where: { $0.name == roleName }) ?? available.first
-            guard let presetRole else { return nil as TeamAgentRow? }
-            return TeamAgentRow(preset: presetRole, customInstructions: "")
+            guard var p = available.first(where: { $0.name == roleName })
+                    ?? available.first else { return nil as TeamAgentRow? }
+            p.cli = bulkCli
+            p.model = bulkModel
+            return TeamAgentRow(preset: p, customInstructions: "")
         }
         if teamName == "my-team" || teamName.isEmpty {
             teamName = preset.name.lowercased().replacingOccurrences(of: " ", with: "-")
         }
+        syncBulkFromAgents()
     }
 
     private func saveCurrentAsTemplate() {
@@ -875,6 +879,7 @@ struct TeamCreationView: View {
             p.model = slot.model
             return TeamAgentRow(preset: p, customInstructions: slot.customInstructions)
         }
+        syncBulkFromAgents()
     }
 
     private func applyLeaderCLIToAll() {
@@ -886,9 +891,17 @@ struct TeamCreationView: View {
 
     private func applyModelToAll() {
         for i in agents.indices {
-            agents[i].preset.cli = bulkCli
             agents[i].preset.model = bulkModel
+            agents[i].providerBadge = .none
         }
+    }
+
+    private func syncBulkFromAgents() {
+        guard !agents.isEmpty else { return }
+        let cliCounts = Dictionary(grouping: agents, by: { $0.preset.cli }).mapValues(\.count)
+        let modelCounts = Dictionary(grouping: agents, by: { $0.preset.model }).mapValues(\.count)
+        bulkCli = cliCounts.max(by: { $0.value < $1.value })?.key ?? bulkCli
+        bulkModel = modelCounts.max(by: { $0.value < $1.value })?.key ?? bulkModel
     }
 
     private func createTeam() {
