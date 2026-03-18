@@ -127,14 +127,37 @@ impl HeadlessManager {
             .to_string_lossy()
             .to_string();
 
-        let cmd = cli_builder::build_claude_command(
-            &params.name,
-            &params.team_name,
-            &params.model,
-            &params.working_directory,
-            &daemon_socket,
-            params.cli_path.as_deref(),
-        );
+        let cmd = match params.cli.as_str() {
+            "kiro" => cli_builder::build_kiro_command(
+                &params.name,
+                &params.team_name,
+                &params.model,
+                &daemon_socket,
+                params.cli_path.as_deref(),
+            ),
+            "codex" => cli_builder::build_codex_command(
+                &params.name,
+                &params.team_name,
+                &params.model,
+                &daemon_socket,
+                params.cli_path.as_deref(),
+            ),
+            "gemini" => cli_builder::build_gemini_command(
+                &params.name,
+                &params.team_name,
+                &params.model,
+                &daemon_socket,
+                params.cli_path.as_deref(),
+            ),
+            _ => cli_builder::build_claude_command(
+                &params.name,
+                &params.team_name,
+                &params.model,
+                &params.working_directory,
+                &daemon_socket,
+                params.cli_path.as_deref(),
+            ),
+        };
 
         tracing::info!(
             "spawning headless agent: {} (cli={}, model={}, dir={})",
