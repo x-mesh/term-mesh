@@ -30,6 +30,7 @@ fi
 {
     # zsh treats unset ZDOTDIR as if it were HOME. We do the same.
     builtin typeset _termmesh_file="${ZDOTDIR-$HOME}/.zshenv"
+    builtin print -- "[tm-zshenv] enter file=$_termmesh_file" >> /tmp/term-mesh-zshenv-debug.log 2>/dev/null
     [[ ! -r "$_termmesh_file" ]] || builtin source -- "$_termmesh_file"
 } always {
     if [[ -o interactive ]]; then
@@ -45,7 +46,10 @@ fi
         # prevents Ghostty's .zshenv always-block from clearing these functions.
         if [[ "${TERMMESH_SHELL_INTEGRATION:-${CMUX_SHELL_INTEGRATION:-1}}" != "0" && -n "${TERMMESH_SHELL_INTEGRATION_DIR:-${CMUX_SHELL_INTEGRATION_DIR:-}}" ]]; then
             builtin typeset _termmesh_integ="${TERMMESH_SHELL_INTEGRATION_DIR:-$CMUX_SHELL_INTEGRATION_DIR}/term-mesh-zsh-integration.zsh"
-            [[ -r "$_termmesh_integ" ]] && builtin source -- "$_termmesh_integ"
+            if [[ -r "$_termmesh_integ" ]]; then
+                builtin source -- "$_termmesh_integ"
+                builtin print -- "[tm-zshenv] sourced OK send=$(builtin whence -w _termmesh_send 2>&1)" >> /tmp/term-mesh-zshenv-debug.log 2>/dev/null
+            fi
         fi
     fi
 
