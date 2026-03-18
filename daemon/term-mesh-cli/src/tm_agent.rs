@@ -365,7 +365,7 @@ fn detect_socket() -> Option<PathBuf> {
     // Priority 1: Explicit environment variable (always wins)
     if let Ok(sock) = env::var("TERMMESH_SOCKET") {
         let p = PathBuf::from(&sock);
-        if p.exists() {
+        if is_socket_alive(&p) {
             return Some(p);
         }
     }
@@ -376,14 +376,14 @@ fn detect_socket() -> Option<PathBuf> {
     if last_socket_path.exists() {
         if let Ok(contents) = std::fs::read_to_string(&last_socket_path) {
             let p = PathBuf::from(contents.trim());
-            if p.exists() {
+            if is_socket_alive(&p) {
                 return Some(p);
             }
-            // Stale path — fall through to glob detection
+            // Stale/dead socket — fall through to glob detection
         }
     }
 
-    // Priority 3: Glob fallback (first match)
+    // Priority 3: Glob fallback — try each, skip dead sockets
     let patterns = [
         "/tmp/term-mesh-debug-*.sock",
         "/tmp/term-mesh-debug.sock",
@@ -393,13 +393,30 @@ fn detect_socket() -> Option<PathBuf> {
     for pattern in &patterns {
         if let Ok(paths) = glob::glob(pattern) {
             for entry in paths.flatten() {
-                if entry.exists() {
+                if is_socket_alive(&entry) {
                     return Some(entry);
                 }
             }
         }
     }
     None
+}
+
+/// Test if a Unix socket is actually listening (not just a stale file).
+fn is_socket_alive(path: &PathBuf) -> bool {
+    if !path.exists() {
+        return false;
+    }
+    use std::os::unix::net::UnixStream;
+    use std::time::Duration;
+    match UnixStream::connect(path) {
+        Ok(stream) => {
+            let _ = stream.set_read_timeout(Some(Duration::from_millis(100)));
+            let _ = stream.shutdown(std::net::Shutdown::Both);
+            true
+        }
+        Err(_) => false,
+    }
 }
 
 fn rpc_call(sock: &PathBuf, method: &str, params: Value) -> Result<Value, String> {
