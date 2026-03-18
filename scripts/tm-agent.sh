@@ -26,6 +26,15 @@
 
 set -e
 
+# Prefer Rust binary if available (has auto-complete and full features)
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+for _bin in "$PROJECT_ROOT/tm-agent" "$PROJECT_ROOT/daemon/target/release/tm-agent"; do
+    if [ -x "$_bin" ]; then
+        exec "$_bin" "$@"
+    fi
+done
+
 # Auto-detect socket
 if [ -n "$TERMMESH_SOCKET" ]; then
     SOCK="$TERMMESH_SOCKET"
@@ -63,6 +72,12 @@ case "$CMD" in
     report)
         CONTENT=$(json_escape "$1")
         send_rpc "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"team.report\",\"params\":{\"team_name\":\"$TEAM\",\"agent_name\":\"$AGENT\",\"content\":$CONTENT}}"
+        # Auto-complete active task (matches Rust binary behavior)
+        TASK_ID=$(send_rpc "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"team.status\",\"params\":{\"team_name\":\"$TEAM\"}}" 2>/dev/null \
+            | python3 -c "import sys,json;d=json.load(sys.stdin);agents=d.get('result',{}).get('agents',[]);print(next((a['active_task_id'] for a in agents if a.get('name')=='$AGENT' and a.get('active_task_id') and a.get('active_task_status') not in ('completed','failed','abandoned')),''))" 2>/dev/null || true)
+        if [ -n "$TASK_ID" ]; then
+            send_rpc "{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"team.task.update\",\"params\":{\"team_name\":\"$TEAM\",\"task_id\":\"$TASK_ID\",\"status\":\"completed\",\"result\":$CONTENT}}" >/dev/null 2>&1 || true
+        fi
         ;;
     reply)
         CONTENT=$(json_escape "$1")

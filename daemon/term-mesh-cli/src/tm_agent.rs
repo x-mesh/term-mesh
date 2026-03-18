@@ -652,11 +652,34 @@ fn main() {
     let result = match cli.command {
         // ── Agent-side commands ──────────────────────────────────
         Commands::Report { content } => {
-            rpc_call(&sock, "team.report", json!({
+            let report_content = content.as_deref().unwrap_or("done");
+            let report_result = rpc_call(&sock, "team.report", json!({
                 "team_name": team,
                 "agent_name": agent,
-                "content": content.as_deref().unwrap_or("done"),
-            }))
+                "content": report_content,
+            }));
+            // Auto-complete the active task (same logic as `reply`)
+            if report_result.is_ok() {
+                if let Ok(status_resp) = rpc_call(&sock, "team.status", json!({"team_name": &team})) {
+                    if let Some(agents) = status_resp["result"]["agents"].as_array() {
+                        for a in agents {
+                            if a["name"].as_str() == Some(agent.as_str()) {
+                                if let Some(tid) = a["active_task_id"].as_str() {
+                                    if !matches!(a["active_task_status"].as_str(), Some("completed") | Some("failed") | Some("abandoned")) {
+                                        let summary = truncate_summary(report_content, 1500);
+                                        let _ = rpc_call(&sock, "team.task.update", json!({
+                                            "team_name": &team, "task_id": tid,
+                                            "status": "completed", "result": summary,
+                                        }));
+                                    }
+                                }
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+            report_result
         }
         Commands::Ping { summary } | Commands::Heartbeat { summary } => {
             rpc_call(&sock, "team.agent.heartbeat", json!({
@@ -1593,31 +1616,42 @@ fn run_wait(sock: &PathBuf, team: &str, timeout: u32, interval: u32, mode: &str,
         let mut msg_progress = "0/0".to_string();
 
         if mode == "report" || mode == "any" {
-            match rpc_call(sock, "team.result.status", json!({ "team_name": team })) {
+            // Primary: check task completion status (immune to stale reports)
+            match rpc_call(sock, "team.status", json!({ "team_name": team })) {
                 Ok(r) => {
-                    let res = &r["result"];
-                    if agent_filter.is_empty() {
-                        let done = res["completed"].as_u64().unwrap_or(0);
-                        let total = res["total"].as_u64().unwrap_or(0);
-                        report_done = res["all_done"].as_bool().unwrap_or(false);
-                        report_progress = format!("{done}/{total}");
-                    } else if let Some(agents) = res["agents"].as_array() {
+                    if let Some(agents) = r["result"]["agents"].as_array() {
                         let filtered: Vec<&Value> = agents.iter()
                             .filter(|a| {
-                                a["agent_name"].as_str()
-                                    .map(|n| agent_filter.contains(n))
-                                    .unwrap_or(false)
+                                let name = a["name"].as_str().unwrap_or("");
+                                agent_filter.is_empty() || agent_filter.contains(name)
                             })
                             .collect();
-                        let total = filtered.len() as u64;
-                        let done = filtered.iter()
-                            .filter(|a| a["has_result"].as_bool().unwrap_or(false))
-                            .count() as u64;
-                        report_done = total > 0 && done >= total;
-                        report_progress = format!("{done}/{total}");
+                        // Only count agents that have an active task (assigned by leader)
+                        let with_tasks: Vec<&&Value> = filtered.iter()
+                            .filter(|a| a["active_task_id"].as_str().is_some())
+                            .collect();
+                        if with_tasks.is_empty() {
+                            // Fallback: no tasks assigned, use legacy result.status
+                            if let Ok(rs) = rpc_call(sock, "team.result.status", json!({ "team_name": team })) {
+                                let done = rs["result"]["completed"].as_u64().unwrap_or(0);
+                                let total = rs["result"]["total"].as_u64().unwrap_or(0);
+                                report_done = rs["result"]["all_done"].as_bool().unwrap_or(false);
+                                report_progress = format!("{done}/{total}");
+                            }
+                        } else {
+                            let total = with_tasks.len() as u64;
+                            let done = with_tasks.iter()
+                                .filter(|a| matches!(
+                                    a["active_task_status"].as_str(),
+                                    Some("completed") | Some("review_ready")
+                                ))
+                                .count() as u64;
+                            report_done = total > 0 && done >= total;
+                            report_progress = format!("{done}/{total}");
+                        }
                     }
                 }
-                Err(e) => eprintln!("  Warning: result.status RPC failed: {e}"),
+                Err(e) => eprintln!("  Warning: team.status RPC failed: {e}"),
             }
         }
 
