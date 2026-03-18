@@ -190,14 +190,16 @@ def bench_rpc_task_create(sock_path: str, team_name: str, iterations: int = 20) 
 
 
 def bench_rpc_task_lifecycle(sock_path: str, team_name: str, iterations: int = 10) -> Dict:
-    """Benchmark full task lifecycle: create → get → update → review → done."""
+    """Benchmark full task lifecycle: create → get → update → review → done.
+    Cycles through all 10 agents (w1..w10)."""
     latencies: List[float] = []
     for i in range(iterations):
+        agent = f"w{(i % 10) + 1}"
         cycle_start = time.perf_counter()
 
         # Create
         resp = _rpc_call(sock_path, "team.task.create", {
-            "team_name": team_name, "title": f"lifecycle-{i}", "assignee": "w1",
+            "team_name": team_name, "title": f"lifecycle-{i}", "assignee": agent,
         }, rid=300 + i * 5)
         if not resp.get("ok"):
             continue
@@ -239,13 +241,15 @@ def bench_rpc_task_lifecycle(sock_path: str, team_name: str, iterations: int = 1
 
 
 def bench_rpc_message_throughput(sock_path: str, team_name: str, count: int = 50) -> Dict:
-    """Benchmark message post + list throughput."""
+    """Benchmark message post + list throughput.
+    Distributes messages across all 10 agents."""
     t0 = time.perf_counter()
     success = 0
     for i in range(count):
+        agent = f"w{(i % 10) + 1}"
         resp = _rpc_call(sock_path, "team.message.post", {
             "team_name": team_name,
-            "from": "w1",
+            "from": agent,
             "content": f"bench msg {i}",
             "type": "note",
         }, rid=400 + i)
@@ -276,13 +280,15 @@ def bench_rpc_message_throughput(sock_path: str, team_name: str, count: int = 50
 
 
 def bench_rpc_heartbeat(sock_path: str, team_name: str, iterations: int = 20) -> Dict:
-    """Benchmark agent heartbeat latency."""
+    """Benchmark agent heartbeat latency.
+    Cycles through all 10 agents."""
     latencies: List[float] = []
     for i in range(iterations):
+        agent = f"w{(i % 10) + 1}"
         t0 = time.perf_counter()
         resp = _rpc_call(sock_path, "team.agent.heartbeat", {
             "team_name": team_name,
-            "agent_name": "w1",
+            "agent_name": agent,
             "summary": f"bench heartbeat {i}",
         }, rid=500 + i)
         t1 = time.perf_counter()
@@ -350,9 +356,13 @@ def run_rpc_benchmarks(sock_path: str) -> Dict:
         pass
 
     try:
+        bench_agents = [
+            {"name": f"w{i}", "model": "sonnet", "agent_type": "general"}
+            for i in range(1, 11)
+        ]
         resp = _rpc_call(sock_path, "team.create", {
             "team_name": BENCH_TEAM,
-            "agents": [{"name": "w1", "model": "sonnet", "agent_type": "general"}],
+            "agents": bench_agents,
             "working_directory": os.getcwd(),
             "leader_session_id": "bench-leader",
         }, rid=1)
@@ -407,6 +417,17 @@ def _tm_agent(*args: str, timeout: float = 120) -> subprocess.CompletedProcess:
         return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
 
 
+def _parse_rpc_result(output: str) -> Optional[Any]:
+    """Parse JSON-RPC envelope and return the 'result' payload."""
+    try:
+        raw = json.loads(output.strip())
+        if isinstance(raw, dict) and raw.get("ok"):
+            return raw.get("result")
+        return raw
+    except (json.JSONDecodeError, TypeError):
+        return None
+
+
 def _detect_team() -> Optional[Dict]:
     """Detect existing team and agents from tm-agent status."""
     result = _tm_agent("status")
@@ -417,32 +438,26 @@ def _detect_team() -> Optional[Dict]:
     if not output:
         return None
 
-    # Try JSON first — tm-agent status returns a JSON-RPC envelope:
+    # tm-agent status returns a JSON-RPC envelope:
     #   {"id": N, "ok": true, "result": {"team_name": "...", "agents": [...]}}
-    try:
-        raw = json.loads(output)
-        if isinstance(raw, dict):
-            # Unwrap JSON-RPC envelope if present
-            data = raw.get("result", raw) if raw.get("ok") else raw
-            if isinstance(data, dict):
-                team_name = (data.get("team_name")
-                             or data.get("team")
-                             or data.get("name")
-                             or "unknown")
-                agents_raw = data.get("agents", [])
-                if isinstance(agents_raw, list) and agents_raw:
-                    if isinstance(agents_raw[0], dict):
-                        agents = [a.get("name", "") for a in agents_raw if a.get("name")]
-                    else:
-                        agents = [str(a) for a in agents_raw]
-                else:
-                    agents = []
-                if team_name or agents:
-                    return {"team_name": team_name, "agents": agents}
-    except (json.JSONDecodeError, TypeError):
-        pass
+    data = _parse_rpc_result(output)
+    if isinstance(data, dict):
+        team_name = (data.get("team_name")
+                     or data.get("team")
+                     or data.get("name")
+                     or "unknown")
+        agents_raw = data.get("agents", [])
+        if isinstance(agents_raw, list) and agents_raw:
+            if isinstance(agents_raw[0], dict):
+                agents = [a.get("name", "") for a in agents_raw if a.get("name")]
+            else:
+                agents = [str(a) for a in agents_raw]
+        else:
+            agents = []
+        if team_name or agents:
+            return {"team_name": team_name, "agents": agents}
 
-    # Parse text output
+    # Fallback: text output parsing
     team_name = None
     agents: List[str] = []
     skip_words = {"team", "status", "agents", "name", "state", "task", "tasks", "messages"}
@@ -450,7 +465,6 @@ def _detect_team() -> Optional[Dict]:
     for line in output.split("\n"):
         stripped = line.strip()
         lower = stripped.lower()
-
         if lower.startswith("team:") or lower.startswith("team name:"):
             team_name = stripped.split(":", 1)[1].strip()
         elif stripped.startswith("- ") or (line.startswith("  ") and stripped):
@@ -463,168 +477,227 @@ def _detect_team() -> Optional[Dict]:
     return None
 
 
-def bench_e2e_ping(agents: List[str]) -> Dict:
-    """Ping all agents and measure response times."""
+# ── E2E core: delegate-all-and-wait ──
+
+def _delegate_all_and_wait(
+    agents: List[str],
+    instruction_fn,
+    timeout: float = 120,
+    poll_interval: float = 2.0,
+    label: str = "",
+) -> Dict:
+    """Delegate to every agent and poll task list until ALL complete.
+
+    Args:
+        agents: list of agent names
+        instruction_fn: callable(agent_name) -> instruction string
+        timeout: max seconds to wait for all completions
+        poll_interval: seconds between task-list polls
+
+    Returns:
+        {"completed": {agent: elapsed_ms}, "total_ms": int,
+         "task_ids": {agent: task_id}}
+    """
     t0 = time.perf_counter()
+    task_to_agent: Dict[str, str] = {}   # task_id → agent_name
 
+    # Phase 1 — delegate to every agent
     for agent in agents:
-        _tm_agent("send", agent, "Reply with exactly: pong")
+        instruction = instruction_fn(agent)
+        result = _tm_agent("delegate", agent, instruction)
+        parsed = _parse_rpc_result(result.stdout)
+        if isinstance(parsed, dict):
+            tid = parsed.get("task_id") or parsed.get("id") or ""
+            if tid:
+                task_to_agent[tid] = agent
 
-    result = _tm_agent("wait", "--timeout", "60", "--mode", "any")
-    t1 = time.perf_counter()
+    # If we couldn't parse task IDs (older daemon), build a map from task list
+    if not task_to_agent:
+        tl = _parse_rpc_result(_tm_agent("task", "list").stdout)
+        if isinstance(tl, dict):
+            for task in tl.get("tasks", []):
+                assignee = task.get("assignee", "")
+                tid = task.get("id", "")
+                status = task.get("status", "")
+                if assignee in agents and status not in ("completed", "done"):
+                    task_to_agent[tid] = assignee
 
-    total_ms = round((t1 - t0) * 1000)
-    responded = 0
-    per_agent: Dict[str, float] = {}
+    # Phase 2 — poll task list until all complete or timeout
+    completed: Dict[str, float] = {}   # agent_name → elapsed_ms
 
-    if result.returncode == 0:
-        try:
-            data = json.loads(result.stdout.strip())
-            if isinstance(data, dict):
-                for name, info in data.items():
-                    if isinstance(info, dict) and "elapsed_ms" in info:
-                        per_agent[name] = info["elapsed_ms"]
-                        responded += 1
-        except (json.JSONDecodeError, TypeError):
-            pass
-        if not per_agent:
-            responded = len(agents)
+    while len(completed) < len(agents):
+        elapsed = time.perf_counter() - t0
+        if elapsed >= timeout:
+            break
 
+        # Short blocking wait so we don't busy-spin
+        remaining = max(1, int(timeout - elapsed))
+        _tm_agent("wait", "--timeout", str(min(int(poll_interval), remaining)),
+                  "--mode", "any")
+
+        # Scan task list for completions
+        tl = _parse_rpc_result(_tm_agent("task", "list").stdout)
+        if isinstance(tl, dict):
+            for task in tl.get("tasks", []):
+                tid = task.get("id", "")
+                status = task.get("status", "")
+                agent_name = task_to_agent.get(tid)
+                if not agent_name:
+                    # Try assignee match for tasks we missed
+                    assignee = task.get("assignee", "")
+                    if assignee in agents:
+                        agent_name = assignee
+                if agent_name and agent_name not in completed:
+                    if status in ("completed", "done", "review_ready"):
+                        completed[agent_name] = round(
+                            (time.perf_counter() - t0) * 1000)
+
+        # Progress indicator
+        if label:
+            n = len(completed)
+            total = len(agents)
+            if n > 0 and n < total:
+                print(f"\r  {dim(f'{label}: {n}/{total} agents done...')}", end="",
+                      flush=True)
+
+    if label and len(completed) > 0:
+        print(f"\r  {dim(f'{label}: {len(completed)}/{len(agents)} agents done   ')}")
+
+    total_ms = round((time.perf_counter() - t0) * 1000)
+    return {
+        "completed": completed,
+        "total_ms": total_ms,
+        "task_ids": task_to_agent,
+    }
+
+
+# ── E2E scenarios (all use _delegate_all_and_wait for real tracking) ──
+
+def bench_e2e_ping(agents: List[str]) -> Dict:
+    """Ping all N agents via delegate and wait for every response."""
+    result = _delegate_all_and_wait(
+        agents,
+        instruction_fn=lambda a: f"Reply with exactly one word: pong",
+        timeout=120,
+        label="Ping",
+    )
+    completed = result["completed"]
     return {
         "agent_count": len(agents),
-        "responded": responded,
-        "per_agent_ms": per_agent,
-        "total_ms": total_ms,
-        "all_responded": responded >= len(agents),
-        "passed": responded >= len(agents),
+        "responded": len(completed),
+        "per_agent_ms": completed,
+        "total_ms": result["total_ms"],
+        "all_responded": len(completed) >= len(agents),
+        "passed": len(completed) >= len(agents),
     }
 
 
 def bench_e2e_delegation(agents: List[str]) -> Dict:
-    """Delegate tasks to all agents and measure completion."""
-    t0 = time.perf_counter()
-
-    for agent in agents:
-        _tm_agent("delegate", agent, f"Reply with: delegation-ack from {agent}")
-
-    result = _tm_agent("wait", "--timeout", "120", "--mode", "any")
-    t1 = time.perf_counter()
-
-    total_ms = round((t1 - t0) * 1000)
-    completed = 0
-    per_agent: Dict[str, float] = {}
-
-    if result.returncode == 0:
-        try:
-            data = json.loads(result.stdout.strip())
-            if isinstance(data, dict):
-                for name, info in data.items():
-                    if isinstance(info, dict) and "elapsed_ms" in info:
-                        per_agent[name] = info["elapsed_ms"]
-                        completed += 1
-        except (json.JSONDecodeError, TypeError):
-            pass
-        if not per_agent:
-            completed = len(agents)
-
+    """Delegate a task to all N agents and wait for every completion."""
+    result = _delegate_all_and_wait(
+        agents,
+        instruction_fn=lambda a: f"Reply with: delegation-ack from {a}",
+        timeout=120,
+        label="Delegation",
+    )
+    completed = result["completed"]
     return {
         "agent_count": len(agents),
-        "completed": completed,
-        "per_agent_ms": per_agent,
-        "total_ms": total_ms,
-        "all_completed": completed >= len(agents),
-        "passed": completed >= len(agents),
+        "completed": len(completed),
+        "per_agent_ms": completed,
+        "total_ms": result["total_ms"],
+        "all_completed": len(completed) >= len(agents),
+        "passed": len(completed) >= len(agents),
     }
 
 
 def bench_e2e_cross_messaging(agents: List[str]) -> Dict:
-    """Test cross-agent messaging by delegating messaging tasks."""
+    """Test cross-agent messaging — uses all agents in pairs."""
     if len(agents) < 2:
         return {
-            "passed": False,
-            "error": "Need at least 2 agents",
-            "delivered": 0,
-            "total": 0,
-            "pairs": 0,
-            "total_ms": 0,
-            "all_delivered": False,
+            "passed": False, "error": "Need at least 2 agents",
+            "delivered": 0, "total": 0, "pairs": 0,
+            "total_ms": 0, "all_delivered": False,
         }
 
-    pairs = min(4, len(agents) // 2)
-    t0 = time.perf_counter()
+    pairs = len(agents) // 2  # Use ALL agents: 10 agents → 5 pairs
+    senders = agents[:pairs]
 
-    for i in range(pairs):
-        sender = agents[i * 2]
-        receiver = agents[i * 2 + 1]
-        _tm_agent(
-            "delegate", sender,
-            f"Send a message to {receiver} saying 'cross-test-{i}' "
-            f"using: tm-agent msg send 'cross-test-{i}' --to {receiver}")
+    def instruction(agent: str) -> str:
+        idx = senders.index(agent)
+        receiver = agents[pairs + idx]
+        return (f"Send a message to {receiver} saying 'cross-test-{idx}' "
+                f"using: tm-agent msg send 'cross-test-{idx}' --to {receiver}")
 
-    result = _tm_agent("wait", "--timeout", "60", "--mode", "any")
-    t1 = time.perf_counter()
-
-    delivered = pairs if result.returncode == 0 else 0
-
+    result = _delegate_all_and_wait(
+        senders,
+        instruction_fn=instruction,
+        timeout=60,
+        label="Cross-msg",
+    )
+    completed = result["completed"]
     return {
         "pairs": pairs,
-        "delivered": delivered,
+        "agents_used": pairs * 2,
+        "delivered": len(completed),
         "total": pairs,
-        "total_ms": round((t1 - t0) * 1000),
-        "all_delivered": delivered >= pairs,
-        "passed": delivered >= pairs,
+        "per_agent_ms": completed,
+        "total_ms": result["total_ms"],
+        "all_delivered": len(completed) >= pairs,
+        "passed": len(completed) >= pairs,
     }
 
 
 def bench_e2e_task_lifecycle(agents: List[str]) -> Dict:
-    """Delegate task lifecycle steps to an agent."""
+    """Delegate task lifecycle to ALL agents — each runs start→heartbeat→review→done."""
     if not agents:
         return {"passed": False, "error": "No agents available",
-                "stages_completed": 0, "total_stages": 5, "total_ms": 0, "agent": ""}
+                "agents_completed": 0, "agent_count": 0,
+                "total_stages": 0, "total_ms": 0}
 
-    agent = agents[0]
-    t0 = time.perf_counter()
-
-    _tm_agent(
-        "delegate", agent,
-        "Execute the following task lifecycle steps in order: "
-        "1) Run: tm-agent task start <your-task-id>  "
-        "2) Run: tm-agent heartbeat 'working on it'  "
-        "3) Run: tm-agent task review <your-task-id> 'lifecycle bench complete'  "
-        "4) Run: tm-agent task done <your-task-id> 'lifecycle complete'  "
-        "5) Reply with: lifecycle-done")
-
-    result = _tm_agent("wait", "--timeout", "120", "--mode", "any")
-    t1 = time.perf_counter()
-
-    stages = 5 if result.returncode == 0 else 0
-
+    result = _delegate_all_and_wait(
+        agents,
+        instruction_fn=lambda a: (
+            "Execute the following task lifecycle steps in order: "
+            "1) Run: tm-agent task start <your-task-id>  "
+            "2) Run: tm-agent heartbeat 'working on it'  "
+            "3) Run: tm-agent task review <your-task-id> 'lifecycle bench complete'  "
+            "4) Run: tm-agent task done <your-task-id> 'lifecycle complete'  "
+            "5) Reply with: lifecycle-done"
+        ),
+        timeout=120,
+        label="Lifecycle",
+    )
+    completed = result["completed"]
     return {
-        "agent": agent,
-        "stages_completed": stages,
-        "total_stages": 5,
-        "total_ms": round((t1 - t0) * 1000),
-        "passed": stages >= 5,
+        "agent_count": len(agents),
+        "agents_completed": len(completed),
+        "per_agent_ms": completed,
+        "total_stages": len(completed) * 5,
+        "total_ms": result["total_ms"],
+        "passed": len(completed) >= len(agents),
     }
 
 
 def bench_e2e_broadcast(agents: List[str]) -> Dict:
-    """Broadcast to all agents and measure convergence."""
-    t0 = time.perf_counter()
+    """Broadcast then delegate to all N agents and wait for every ack."""
+    # First broadcast, then delegate to track responses
+    _tm_agent("broadcast", "You will be asked to ack shortly.")
 
-    _tm_agent("broadcast", "Reply with exactly: broadcast-ack")
-    result = _tm_agent("wait", "--timeout", "60", "--mode", "any")
-
-    t1 = time.perf_counter()
-    total_ms = round((t1 - t0) * 1000)
-    responded = len(agents) if result.returncode == 0 else 0
-
+    result = _delegate_all_and_wait(
+        agents,
+        instruction_fn=lambda a: "Reply with exactly: broadcast-ack",
+        timeout=60,
+        label="Broadcast",
+    )
+    completed = result["completed"]
     return {
         "agent_count": len(agents),
-        "responded": responded,
-        "total_ms": total_ms,
-        "all_responded": responded >= len(agents),
-        "passed": responded >= len(agents),
+        "responded": len(completed),
+        "per_agent_ms": completed,
+        "total_ms": result["total_ms"],
+        "all_responded": len(completed) >= len(agents),
+        "passed": len(completed) >= len(agents),
     }
 
 
@@ -815,6 +888,15 @@ def print_rpc_results(results: Dict):
     print()
 
 
+def _print_per_agent(per_agent_ms: Dict[str, float]):
+    """Print per-agent timing breakdown."""
+    if not per_agent_ms:
+        return
+    for name in sorted(per_agent_ms.keys()):
+        ms = per_agent_ms[name]
+        print(f"    {dim(f'{name}:')} {ms / 1000:.1f}s")
+
+
 def print_e2e_results(results: Dict):
     print(f"  {bold('── Agent E2E ──')}")
 
@@ -825,26 +907,36 @@ def print_e2e_results(results: Dict):
         ms = r.get("total_ms", 0)
         _result_line(f"Ping All ({n} agents)", "100% respond",
                      f"{resp}/{n} ({ms / 1000:.1f}s)", r["passed"])
+        _print_per_agent(r.get("per_agent_ms", {}))
 
     if "parallel_delegation" in results:
         r = results["parallel_delegation"]
         n = r.get("agent_count", 0)
         comp = r.get("completed", 0)
         ms = r.get("total_ms", 0)
-        _result_line("Parallel Delegation", "100% complete",
+        _result_line(f"Parallel Delegation ({n})", "100% complete",
                      f"{comp}/{n} ({ms / 1000:.1f}s)", r["passed"])
+        _print_per_agent(r.get("per_agent_ms", {}))
 
     if "cross_messaging" in results:
         r = results["cross_messaging"]
         d = r.get("delivered", 0)
         t = r.get("total", 0)
-        _result_line("Cross Messaging", "100% delivered", f"{d}/{t}", r["passed"])
+        used = r.get("agents_used", t * 2)
+        ms = r.get("total_ms", 0)
+        _result_line(f"Cross Messaging ({used} agents)", "100% delivered",
+                     f"{d}/{t} ({ms / 1000:.1f}s)", r["passed"])
+        _print_per_agent(r.get("per_agent_ms", {}))
 
     if "task_lifecycle" in results:
         r = results["task_lifecycle"]
-        s = r.get("stages_completed", 0)
-        t = r.get("total_stages", 5)
-        _result_line("Task Lifecycle", "all stages", f"{s}/{t} stages", r["passed"])
+        n = r.get("agent_count", 0)
+        done = r.get("agents_completed", 0)
+        ms = r.get("total_ms", 0)
+        stages = r.get("total_stages", 0)
+        _result_line(f"Task Lifecycle ({n} agents)", "all complete",
+                     f"{done}/{n} ({ms / 1000:.1f}s)", r["passed"])
+        _print_per_agent(r.get("per_agent_ms", {}))
 
     if "broadcast_convergence" in results:
         r = results["broadcast_convergence"]
