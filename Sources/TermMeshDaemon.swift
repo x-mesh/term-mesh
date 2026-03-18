@@ -103,6 +103,11 @@ final class TermMeshDaemon: ObservableObject {
             // Already running (orphaned from previous app launch)? Reuse it.
             if self.ping() {
                 Logger.daemon.info("daemon already running on socket, reusing")
+                if let daemonPid = self.getDaemonPeerPid() {
+                    DispatchQueue.main.async {
+                        TerminalController.shared.trustedDaemonPid = daemonPid
+                    }
+                }
                 return
             }
 
@@ -148,7 +153,11 @@ final class TermMeshDaemon: ObservableObject {
             do {
                 try process.run()
                 self.daemonProcess = process
-                Logger.daemon.info("daemon started (pid: \(process.processIdentifier, privacy: .public), binary: \(binaryPath, privacy: .public))")
+                let daemonPid = process.processIdentifier
+                Logger.daemon.info("daemon started (pid: \(daemonPid, privacy: .public), binary: \(binaryPath, privacy: .public))")
+                DispatchQueue.main.async {
+                    TerminalController.shared.trustedDaemonPid = daemonPid
+                }
             } catch {
                 Logger.daemon.error("failed to start daemon: \(error, privacy: .public)")
             }
@@ -726,6 +735,32 @@ final class TermMeshDaemon: ObservableObject {
     func ping() -> Bool {
         guard let response = rpcCall(method: "ping", params: [:]) else { return false }
         return (response as? String) == "pong"
+    }
+
+    /// Connect to the daemon socket and retrieve its PID via LOCAL_PEERPID.
+    /// Used to register an orphaned (reused) daemon as a trusted ancestor.
+    private func getDaemonPeerPid() -> pid_t? {
+        let fd = Darwin.socket(AF_UNIX, SOCK_STREAM, 0)
+        guard fd >= 0 else { return nil }
+        defer { Darwin.close(fd) }
+        var addr = sockaddr_un()
+        addr.sun_family = sa_family_t(AF_UNIX)
+        let path = socketPath
+        withUnsafeMutablePointer(to: &addr.sun_path) { ptr in
+            path.withCString { cstr in
+                _ = strcpy(UnsafeMutableRawPointer(ptr).assumingMemoryBound(to: CChar.self), cstr)
+            }
+        }
+        let result = withUnsafePointer(to: &addr) { ptr in
+            ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { sockPtr in
+                Darwin.connect(fd, sockPtr, socklen_t(MemoryLayout<sockaddr_un>.size))
+            }
+        }
+        guard result == 0 else { return nil }
+        var pid: pid_t = 0
+        var size = socklen_t(MemoryLayout<pid_t>.size)
+        getsockopt(fd, SOL_LOCAL, LOCAL_PEERPID, &pid, &size)
+        return pid > 0 ? pid : nil
     }
 
     /// Raw RPC call that returns the result as a JSON string (for injecting into WKWebView).

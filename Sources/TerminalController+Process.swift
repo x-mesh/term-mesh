@@ -61,20 +61,17 @@ extension TerminalController {
     }
 
     /// Check if `pid` is a descendant of this process by walking the process tree.
+    /// Also trusts daemon-spawned processes (headless agents) via trustedDaemonPid.
     func isDescendant(_ pid: pid_t) -> Bool {
         var current = pid
         // Walk up to 128 levels to avoid infinite loops from kernel bugs
         for _ in 0..<128 {
-            if current == myPid {
-                return true
-            }
-            if current <= 1 {
-                return false
-            }
+            if current == myPid { return true }
+            // Trust daemon-spawned processes (headless agents)
+            if trustedDaemonPid > 0 && current == trustedDaemonPid { return true }
+            if current <= 1 { return false }
             let parent = parentPid(of: current)
-            if parent == current || parent < 0 {
-                return false
-            }
+            if parent == current || parent < 0 { return false }
             current = parent
         }
         return false

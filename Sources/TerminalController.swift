@@ -10,6 +10,10 @@ import WebKit
 class TerminalController {
     static let shared = TerminalController()
 
+    /// PID of the daemon process, trusted as an ancestor for headless agents.
+    /// Set after daemon spawn or orphan reuse so isDescendant() grants access.
+    nonisolated(unsafe) var trustedDaemonPid: pid_t = 0
+
     nonisolated(unsafe) var socketPath = "/tmp/term-mesh.sock"
     nonisolated(unsafe) var serverSocket: Int32 = -1
     nonisolated(unsafe) var isRunning = false
