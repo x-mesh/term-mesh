@@ -138,6 +138,7 @@ fn codex_model_name(short: &str) -> &str {
 }
 
 /// Build the CLI command for a Codex agent.
+/// Uses `codex exec` (non-interactive) with `--json` for JSONL output and stdin prompt.
 pub fn build_codex_command(
     name: &str,
     team_name: &str,
@@ -149,9 +150,11 @@ pub fn build_codex_command(
 
     let codex_model = codex_model_name(model);
     let args = vec![
-        "--ask-for-approval".into(), "never".into(),
+        "exec".into(),
         "--sandbox".into(), "danger-full-access".into(),
         "--model".into(), codex_model.to_string(),
+        "--json".into(),
+        "-".into(),  // read prompt from stdin
     ];
 
     let env = base_env(name, team_name, daemon_socket);
