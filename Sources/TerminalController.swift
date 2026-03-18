@@ -2077,7 +2077,8 @@ class TerminalController {
             return v2Error(id: id, code: "invalid_params", message: "Missing team_name")
         }
         let success = await MainActor.run {
-            guard let tabManager = self.tabManager else { return false }
+            let tabManager = TeamOrchestrator.shared.resolveTabManager(teamName: teamName) ?? self.tabManager
+            guard let tabManager else { return false }
             return TeamOrchestrator.shared.destroyTeam(name: teamName, tabManager: tabManager)
         }
         return success
@@ -2095,17 +2096,30 @@ class TerminalController {
         guard let text = params["text"] as? String else {
             return v2Error(id: id, code: "invalid_params", message: "Missing text")
         }
+        // Resolve the correct tabManager from the team's workspace, not self.tabManager
         var success = await MainActor.run {
-            guard let tabManager = self.tabManager else { return false }
+            let tabManager = TeamOrchestrator.shared.resolveTabManager(teamName: teamName) ?? self.tabManager
+            guard let tabManager else { return false }
             return TeamOrchestrator.shared.sendToAgent(
                 teamName: teamName, agentName: agentName, text: text, tabManager: tabManager
             )
         }
-        // Retry once if panel routing failed
+        // Progressive retry: 150ms then 400ms
         if !success {
-            try? await Task.sleep(nanoseconds: 500_000_000)
+            try? await Task.sleep(nanoseconds: 150_000_000)
             success = await MainActor.run {
-                guard let tabManager = self.tabManager else { return false }
+                let tabManager = TeamOrchestrator.shared.resolveTabManager(teamName: teamName) ?? self.tabManager
+                guard let tabManager else { return false }
+                return TeamOrchestrator.shared.sendToAgent(
+                    teamName: teamName, agentName: agentName, text: text, tabManager: tabManager
+                )
+            }
+        }
+        if !success {
+            try? await Task.sleep(nanoseconds: 400_000_000)
+            success = await MainActor.run {
+                let tabManager = TeamOrchestrator.shared.resolveTabManager(teamName: teamName) ?? self.tabManager
+                guard let tabManager else { return false }
                 return TeamOrchestrator.shared.sendToAgent(
                     teamName: teamName, agentName: agentName, text: text, tabManager: tabManager
                 )
@@ -2124,7 +2138,8 @@ class TerminalController {
             return v2Error(id: id, code: "invalid_params", message: "Missing text")
         }
         let success = await MainActor.run {
-            guard let tabManager = self.tabManager else { return false }
+            let tabManager = TeamOrchestrator.shared.resolveTabManager(teamName: teamName) ?? self.tabManager
+            guard let tabManager else { return false }
             return TeamOrchestrator.shared.sendToLeader(teamName: teamName, text: text, tabManager: tabManager)
         }
         return success
@@ -2140,7 +2155,8 @@ class TerminalController {
             return v2Error(id: id, code: "invalid_params", message: "Missing text")
         }
         let count = await MainActor.run {
-            guard let tabManager = self.tabManager else { return 0 }
+            let tabManager = TeamOrchestrator.shared.resolveTabManager(teamName: teamName) ?? self.tabManager
+            guard let tabManager else { return 0 }
             return TeamOrchestrator.shared.broadcast(teamName: teamName, text: text, tabManager: tabManager)
         }
         return v2Ok(id: id, result: ["sent_count": count, "team_name": teamName])
@@ -2157,7 +2173,8 @@ class TerminalController {
 
         // Minimal MainActor hold: only read terminal raw bytes, decode base64 off-main
         let (response, errResult): (String?, V2CallResult?) = await MainActor.run {
-            guard let tabManager = self.tabManager else {
+            let tabManager = TeamOrchestrator.shared.resolveTabManager(teamName: teamName) ?? self.tabManager
+            guard let tabManager else {
                 return (nil, .err(code: "unavailable", message: "TabManager not available", data: nil))
             }
             guard let panel = TeamOrchestrator.shared.agentPanel(
@@ -2190,7 +2207,8 @@ class TerminalController {
 
         // Get panel references with minimal MainActor hold time
         let panels: [(name: String, panel: TerminalPanel)] = await MainActor.run {
-            guard let tabManager = self.tabManager else { return [] }
+            let tabManager = TeamOrchestrator.shared.resolveTabManager(teamName: teamName) ?? self.tabManager
+            guard let tabManager else { return [] }
             return TeamOrchestrator.shared.allAgentPanels(teamName: teamName, tabManager: tabManager)
         }
 
@@ -2362,7 +2380,8 @@ class TerminalController {
         // Dispatch to assignee via MainActor (cooperative) — pass task directly
         // to avoid reading from TeamOrchestrator.taskBoards (stale data source)
         let dispatched = await MainActor.run {
-            guard let tabManager = self.tabManager else { return false }
+            let tabManager = TeamOrchestrator.shared.resolveTabManager(teamName: teamName) ?? self.tabManager
+            guard let tabManager else { return false }
             return TeamOrchestrator.shared.dispatchTaskToAssignee(
                 teamName: teamName, task: task, tabManager: tabManager
             )
@@ -2388,7 +2407,8 @@ class TerminalController {
         }
 
         let notified = await MainActor.run {
-            guard let tabManager = self.tabManager else { return false }
+            let tabManager = TeamOrchestrator.shared.resolveTabManager(teamName: teamName) ?? self.tabManager
+            guard let tabManager else { return false }
             return TeamOrchestrator.shared.notifyTaskLifecycleEvent(
                 teamName: teamName, task: task, event: "blocked", note: reason, tabManager: tabManager
             )
@@ -2414,7 +2434,8 @@ class TerminalController {
         }
 
         let notified = await MainActor.run {
-            guard let tabManager = self.tabManager else { return false }
+            let tabManager = TeamOrchestrator.shared.resolveTabManager(teamName: teamName) ?? self.tabManager
+            guard let tabManager else { return false }
             return TeamOrchestrator.shared.notifyTaskLifecycleEvent(
                 teamName: teamName, task: task, event: "review_ready", note: summary, tabManager: tabManager
             )
@@ -2441,7 +2462,8 @@ class TerminalController {
         }
 
         let notified = await MainActor.run {
-            guard let tabManager = self.tabManager else { return false }
+            let tabManager = TeamOrchestrator.shared.resolveTabManager(teamName: teamName) ?? self.tabManager
+            guard let tabManager else { return false }
             return TeamOrchestrator.shared.notifyTaskLifecycleEvent(
                 teamName: teamName, task: task, event: "completed", note: taskResult, tabManager: tabManager
             )
@@ -2466,7 +2488,8 @@ class TerminalController {
         }
 
         let dispatched = await MainActor.run {
-            guard let tabManager = self.tabManager else { return false }
+            let tabManager = TeamOrchestrator.shared.resolveTabManager(teamName: teamName) ?? self.tabManager
+            guard let tabManager else { return false }
             return TeamOrchestrator.shared.dispatchTaskToAssignee(
                 teamName: teamName, task: task, tabManager: tabManager
             )
@@ -2490,7 +2513,8 @@ class TerminalController {
         }
 
         let dispatched = await MainActor.run {
-            guard let tabManager = self.tabManager else { return false }
+            let tabManager = TeamOrchestrator.shared.resolveTabManager(teamName: teamName) ?? self.tabManager
+            guard let tabManager else { return false }
             return TeamOrchestrator.shared.dispatchTaskToAssignee(
                 teamName: teamName, task: task, tabManager: tabManager
             )
@@ -2555,9 +2579,12 @@ class TerminalController {
         let priority = params["priority"] as? Int
         let store = TeamDataStore.shared
 
-        // Create task + send instruction on MainActor (sendToAgent requires main thread)
+        // Create task + send instruction on MainActor (sendToAgent requires main thread).
+        // Resolve the correct tabManager from the team's actual workspace first — self.tabManager
+        // may point to a different window (e.g., after window switch or adopted leader mode).
         let delegateResult: TeamOrchestrator.DelegateResult? = await MainActor.run {
-            guard let tabManager = self.tabManager else { return nil }
+            let tabManager = TeamOrchestrator.shared.resolveTabManager(teamName: teamName) ?? self.tabManager
+            guard let tabManager else { return nil }
             return TeamOrchestrator.shared.delegateToAgent(
                 teamName: teamName,
                 agentName: agentName,
@@ -2572,22 +2599,38 @@ class TerminalController {
             return v2Error(id: id, code: "internal_error", message: "Task creation failed for agent '\(agentName)'")
         }
 
-        // Retry text delivery if initial send failed (panel routing race)
+        // Retry text delivery if initial send failed (panel routing race).
+        // Use progressive backoff: 150ms first (catches fast panel init races), 400ms second.
         var textDelivered = delegateResult.textDelivered
         if !textDelivered {
             #if DEBUG
-            dlog("[asyncTeamDelegate] initial send failed for \(agentName), retrying in 500ms")
+            dlog("[asyncTeamDelegate] initial send failed for \(agentName), retrying in 150ms")
             #endif
-            try? await Task.sleep(nanoseconds: 500_000_000)
+            try? await Task.sleep(nanoseconds: 150_000_000)
             textDelivered = await MainActor.run {
-                guard let tabManager = self.tabManager else { return false }
+                let tabManager = TeamOrchestrator.shared.resolveTabManager(teamName: teamName) ?? self.tabManager
+                guard let tabManager else { return false }
+                return TeamOrchestrator.shared.sendToAgent(
+                    teamName: teamName, agentName: agentName,
+                    text: delegateResult.instruction + "\n", tabManager: tabManager
+                )
+            }
+        }
+        if !textDelivered {
+            #if DEBUG
+            dlog("[asyncTeamDelegate] 1st retry failed for \(agentName), retrying in 400ms")
+            #endif
+            try? await Task.sleep(nanoseconds: 400_000_000)
+            textDelivered = await MainActor.run {
+                let tabManager = TeamOrchestrator.shared.resolveTabManager(teamName: teamName) ?? self.tabManager
+                guard let tabManager else { return false }
                 return TeamOrchestrator.shared.sendToAgent(
                     teamName: teamName, agentName: agentName,
                     text: delegateResult.instruction + "\n", tabManager: tabManager
                 )
             }
             #if DEBUG
-            dlog("[asyncTeamDelegate] retry result for \(agentName): \(textDelivered)")
+            dlog("[asyncTeamDelegate] 2nd retry result for \(agentName): \(textDelivered)")
             #endif
         }
 
