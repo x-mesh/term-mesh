@@ -944,7 +944,12 @@ fn main() {
             return;
         }
         Commands::Delegate { agent: ref target, text, title, priority, accept, deps, desc, no_report } => {
-            run_delegate(&sock, &team, target, &text, title, priority, &accept, &deps, desc, no_report);
+            // Auto-detect comma-separated agents and route to parallel fan-out
+            if target.contains(',') {
+                run_fan_out(&sock, &team, &text, title, priority, no_report, &Some(target.to_string()));
+            } else {
+                run_delegate(&sock, &team, target, &text, title, priority, &accept, &deps, desc, no_report);
+            }
             return;
         }
         Commands::FanOut { text, title, priority, no_report, agents } => {

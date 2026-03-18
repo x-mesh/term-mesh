@@ -2521,6 +2521,22 @@ class TerminalController {
         guard let text = params["text"] as? String else {
             return v2Error(id: id, code: "invalid_params", message: "Missing text")
         }
+
+        // Reject comma-separated agent names — fan-out should be handled client-side
+        if agentName.contains(",") {
+            return v2Error(id: id, code: "invalid_params",
+                           message: "agent name must not contain commas; use fan-out for multiple agents")
+        }
+
+        // Validate agent exists in the team before creating task
+        let agentExists: Bool = await MainActor.run {
+            guard let team = TeamOrchestrator.shared.teams[teamName] else { return false }
+            return team.agents.contains(where: { $0.name == agentName })
+        }
+        guard agentExists else {
+            return v2Error(id: id, code: "not_found", message: "Agent '\(agentName)' not found in team '\(teamName)'")
+        }
+
         let taskTitle = params["task_title"] as? String
         let priority = params["priority"] as? Int
         let store = TeamDataStore.shared
@@ -2539,7 +2555,7 @@ class TerminalController {
         }
 
         guard let task else {
-            return v2Error(id: id, code: "not_found", message: "Team or agent not found, or task creation failed")
+            return v2Error(id: id, code: "internal_error", message: "Task creation failed for agent '\(agentName)'")
         }
         return v2Ok(id: id, result: ["task": store.taskDictionary(task), "sent": true])
     }
