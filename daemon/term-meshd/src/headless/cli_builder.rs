@@ -72,9 +72,9 @@ pub fn build_claude_command(
 /// Map short model names to Kiro CLI model identifiers.
 fn kiro_model_name(short: &str) -> &str {
     match short.to_lowercase().as_str() {
-        "opus" => "claude-sonnet-4-5-20250514",
-        "sonnet" => "claude-sonnet-4-5-20250514",
-        "haiku" => "claude-haiku-3-5-20241022",
+        "opus" => "claude-opus-4-6-20250618",
+        "sonnet" => "claude-sonnet-4-6-20250514",
+        "haiku" => "claude-haiku-4-5-20251001",
         _ => short,
     }
 }
