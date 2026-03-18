@@ -148,6 +148,9 @@ enum Commands {
         /// Comma-separated roles to create (e.g. "explorer,executor,reviewer")
         #[arg(long)]
         roles: Option<String>,
+        /// Spawn headless agents (no GUI panes, daemon-managed subprocesses)
+        #[arg(long)]
+        headless: bool,
     },
     /// Preset operations (list)
     #[command(subcommand)]
@@ -891,12 +894,26 @@ fn main() {
         Commands::Destroy => {
             eprintln!("Destroying team '{team}'...");
             cleanup_old_results(&team);
+            // Also destroy headless team if it exists
+            if let Some(daemon_sock) = detect_daemon_socket() {
+                let _ = rpc_call_timeout(&daemon_sock, "headless.destroy_team", json!({ "team_name": team }), 5);
+            }
             rpc_call(&sock, "team.destroy", json!({ "team_name": team }))
         }
         Commands::List => {
             rpc_call(&sock, "team.list", json!({}))
         }
         Commands::Read { agent: ref agent_name, lines } => {
+            // Check if agent is headless — route to daemon socket
+            if let Some(daemon_sock) = detect_daemon_socket() {
+                if let Some(agent_id) = is_headless_agent(&daemon_sock, &team, agent_name) {
+                    print_result(rpc_call(&daemon_sock, "headless.read", json!({
+                        "agent_id": agent_id,
+                        "lines": lines,
+                    })));
+                    return;
+                }
+            }
             rpc_call(&sock, "team.read", json!({
                 "team_name": team, "agent_name": agent_name, "lines": lines,
             }))
@@ -916,8 +933,12 @@ fn main() {
             rpc_call(&sock, "team.result.collect", json!({ "team_name": team }))
         }
         // ── Orchestration commands ──────────────────────────────
-        Commands::Create { count, claude_leader, model, leader_model, kiro, codex, gemini, adopt, preset, roles } => {
-            run_create(&sock, &team, count.unwrap_or(2), claude_leader, &model, leader_model.as_deref(), &kiro, &codex, &gemini, adopt, preset.as_deref(), roles.as_deref());
+        Commands::Create { count, claude_leader, model, leader_model, kiro, codex, gemini, adopt, preset, roles, headless } => {
+            if headless {
+                run_create_headless(&sock, &team, count.unwrap_or(2), &model, roles.as_deref());
+            } else {
+                run_create(&sock, &team, count.unwrap_or(2), claude_leader, &model, leader_model.as_deref(), &kiro, &codex, &gemini, adopt, preset.as_deref(), roles.as_deref());
+            }
             return;
         }
         Commands::Preset(sub) => {
@@ -947,6 +968,16 @@ fn main() {
         }
         Commands::Send { agent: ref target, text, no_report } => {
             let text = append_report_suffix(&text, no_report);
+            // Check if agent is headless — route to daemon socket
+            if let Some(daemon_sock) = detect_daemon_socket() {
+                if let Some(agent_id) = is_headless_agent(&daemon_sock, &team, target) {
+                    print_result(rpc_call(&daemon_sock, "headless.send", json!({
+                        "agent_id": agent_id,
+                        "text": format!("{text}\n"),
+                    })));
+                    return;
+                }
+            }
             print_result(rpc_call(&sock, "team.send", json!({
                 "team_name": team, "agent_name": target,
                 "text": format!("{text}\n"),
@@ -1250,6 +1281,128 @@ fn run_create(
             eprintln!("\n  \u{2713} {kiro_count} kiro agent(s): prompt loaded via agent profile (no delay)");
         }
     }
+}
+
+fn detect_daemon_socket() -> Option<PathBuf> {
+    // Daemon socket is always at a fixed path (separate from the Swift app socket)
+    if let Ok(p) = env::var("TERMMESH_DAEMON_UNIX_PATH") {
+        if !p.is_empty() {
+            let path = PathBuf::from(&p);
+            if is_socket_alive(&path) {
+                return Some(path);
+            }
+        }
+    }
+    // Default daemon socket path
+    let dir = env::var("TMPDIR").ok().map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/tmp"));
+    let path = dir.join("term-meshd.sock");
+    if is_socket_alive(&path) {
+        Some(path)
+    } else {
+        None
+    }
+}
+
+/// Check if an agent is headless by querying the daemon's headless.resolve RPC.
+fn is_headless_agent(daemon_sock: &PathBuf, team: &str, agent_name: &str) -> Option<String> {
+    if let Ok(resp) = rpc_call(daemon_sock, "headless.resolve", json!({
+        "team_name": team,
+        "agent_name": agent_name,
+    })) {
+        if resp["result"]["headless"].as_bool().unwrap_or(false) {
+            return resp["result"]["agent_id"].as_str().map(String::from);
+        }
+    }
+    None
+}
+
+fn run_create_headless(
+    _app_sock: &PathBuf, team: &str, count: u32, model: &str, roles: Option<&str>,
+) {
+    let daemon_sock = match detect_daemon_socket() {
+        Some(s) => s,
+        None => {
+            eprintln!("Error: daemon socket not found (is term-meshd running?)");
+            process::exit(1);
+        }
+    };
+
+    // Build agent list from roles or defaults
+    let agent_specs: Vec<Value> = if let Some(roles_str) = roles {
+        roles_str.split(',')
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .enumerate()
+            .map(|(_i, name)| json!({ "name": name, "cli": "claude", "model": model }))
+            .collect()
+    } else {
+        (0..count as usize)
+            .map(|i| {
+                let name = if i < DEFAULT_AGENT_NAMES.len() {
+                    DEFAULT_AGENT_NAMES[i].to_string()
+                } else {
+                    format!("agent-{i}")
+                };
+                json!({ "name": name, "cli": "claude", "model": model })
+            })
+            .collect()
+    };
+
+    let workdir = env::current_dir()
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_else(|_| ".".to_string());
+
+    // Destroy existing headless team first
+    let _ = rpc_call_timeout(&daemon_sock, "headless.destroy_team", json!({ "team_name": team }), 3);
+
+    let agent_count = agent_specs.len();
+    eprintln!("Creating headless team '{team}' with {agent_count} agent(s) on daemon...");
+    eprintln!("Daemon socket: {}", daemon_sock.display());
+
+    let create_params = json!({
+        "team_name": team,
+        "working_directory": workdir,
+        "leader_session_id": format!("leader-{}", process::id()),
+        "agents": agent_specs,
+    });
+
+    match rpc_call_timeout(&daemon_sock, "headless.create_team", create_params, 30) {
+        Ok(resp) => {
+            if let Some(err) = resp.get("error") {
+                eprintln!("Error: {}", err["message"].as_str().unwrap_or("unknown"));
+                process::exit(1);
+            }
+            println!("{}", pretty(&resp));
+
+            // Send init prompts to all agents
+            eprintln!("\nSending init prompts to headless agents...");
+            let sock_str = daemon_sock.to_string_lossy();
+            for spec in &agent_specs {
+                let name = spec["name"].as_str().unwrap_or("");
+                let agent_id = format!("{name}@{team}");
+                let init_text = agent_init_prompt(name, &workdir, &sock_str);
+                match rpc_call_timeout(&daemon_sock, "headless.send", json!({
+                    "agent_id": agent_id,
+                    "text": init_text,
+                }), 5) {
+                    Ok(_) => eprintln!("  \u{2713} {name}: init prompt sent"),
+                    Err(e) => eprintln!("  \u{2717} {name}: init prompt FAILED: {e}"),
+                }
+            }
+        }
+        Err(e) => {
+            eprintln!("Error: {e}");
+            process::exit(1);
+        }
+    }
+
+    println!();
+    println!("Commands:");
+    println!("  tm-agent send <agent> 'your message'");
+    println!("  tm-agent read <agent> --lines 50");
+    println!("  tm-agent status");
+    println!("  tm-agent destroy");
 }
 
 fn run_delegate_result(

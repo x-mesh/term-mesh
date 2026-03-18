@@ -6,7 +6,8 @@
       "Bash(log show:*)",
       "mcp__mem-mesh__search",
       "WebSearch",
-      "mcp__mem-mesh__pin_add"
+      "mcp__mem-mesh__pin_add",
+      "Bash(cd /Users/jinwoo/work/project/term-mesh/daemon && cargo build --release 2>&1)"
     ]
   },
   "enabledPlugins": {

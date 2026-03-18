@@ -7,6 +7,7 @@ use tokio::time::{timeout, Duration};
 use tokio::sync::watch;
 
 use crate::agent::AgentSessionManager;
+use crate::headless::HeadlessManager;
 use crate::monitor::{MonitorHandle, SystemSnapshot};
 use crate::tokens::UsageTracker;
 use crate::watcher::WatcherHandle;
@@ -70,6 +71,7 @@ pub struct Context {
     pub team_state: TeamStateStore,
     pub usage_tracker: UsageTracker,
     pub agent_manager: Arc<AgentSessionManager>,
+    pub headless: Arc<tokio::sync::Mutex<HeadlessManager>>,
 }
 
 pub fn default_socket_path() -> PathBuf {
@@ -94,6 +96,7 @@ pub async fn serve(
     team_state: TeamStateStore,
     usage_tracker: UsageTracker,
     agent_manager: Arc<AgentSessionManager>,
+    headless: Arc<tokio::sync::Mutex<HeadlessManager>>,
     mut shutdown_rx: watch::Receiver<bool>,
 ) -> anyhow::Result<()> {
     if path.exists() {
@@ -111,6 +114,7 @@ pub async fn serve(
         team_state,
         usage_tracker,
         agent_manager,
+        headless,
     });
 
     loop {
@@ -617,6 +621,121 @@ async fn dispatch(req: &Request, ctx: &Context) -> Response {
         "input.poll" => {
             let inputs = ctx.agent_manager.poll_inputs();
             Ok(serde_json::to_value(inputs).unwrap())
+        }
+
+        // --- Headless Agents ---
+        "headless.spawn" => {
+            match serde_json::from_value::<crate::headless::SpawnParams>(req.params.clone()) {
+                Ok(p) => {
+                    let mut mgr = ctx.headless.lock().await;
+                    match mgr.spawn_agent(p).await {
+                        Ok(info) => Ok(serde_json::to_value(info).unwrap()),
+                        Err(e) => Err(e),
+                    }
+                }
+                Err(e) => Err(format!("invalid params: {e}")),
+            }
+        }
+        "headless.send" => {
+            #[derive(Deserialize)]
+            struct P { agent_id: String, text: String }
+            match serde_json::from_value::<P>(req.params.clone()) {
+                Ok(p) => {
+                    let mut mgr = ctx.headless.lock().await;
+                    mgr.send_message(&p.agent_id, &p.text).await
+                        .map(|_| serde_json::json!("ok"))
+                }
+                Err(e) => Err(format!("invalid params: {e}")),
+            }
+        }
+        "headless.read" => {
+            #[derive(Deserialize)]
+            struct P { agent_id: String, #[serde(default = "default_lines")] lines: usize }
+            fn default_lines() -> usize { 50 }
+            match serde_json::from_value::<P>(req.params.clone()) {
+                Ok(p) => {
+                    let mgr = ctx.headless.lock().await;
+                    mgr.read_output(&p.agent_id, p.lines).await
+                        .map(|lines| serde_json::json!({ "lines": lines, "count": lines.len() }))
+                }
+                Err(e) => Err(format!("invalid params: {e}")),
+            }
+        }
+        "headless.terminate" => {
+            #[derive(Deserialize)]
+            struct P { agent_id: String }
+            match serde_json::from_value::<P>(req.params.clone()) {
+                Ok(p) => {
+                    let mut mgr = ctx.headless.lock().await;
+                    mgr.terminate(&p.agent_id).await
+                        .map(|_| serde_json::json!("ok"))
+                }
+                Err(e) => Err(format!("invalid params: {e}")),
+            }
+        }
+        "headless.status" => {
+            #[derive(Deserialize)]
+            struct P { agent_id: String }
+            match serde_json::from_value::<P>(req.params.clone()) {
+                Ok(p) => {
+                    let mgr = ctx.headless.lock().await;
+                    mgr.status(&p.agent_id).await
+                        .map(|info| serde_json::to_value(info).unwrap())
+                }
+                Err(e) => Err(format!("invalid params: {e}")),
+            }
+        }
+        "headless.list" => {
+            #[derive(Deserialize)]
+            struct P { #[serde(default)] team_name: Option<String> }
+            let params: P = serde_json::from_value(req.params.clone())
+                .unwrap_or(P { team_name: None });
+            let mgr = ctx.headless.lock().await;
+            let agents = mgr.list(params.team_name.as_deref()).await;
+            Ok(serde_json::to_value(agents).unwrap())
+        }
+        "headless.create_team" => {
+            match serde_json::from_value::<crate::headless::TeamCreateParams>(req.params.clone()) {
+                Ok(p) => {
+                    let mut mgr = ctx.headless.lock().await;
+                    match mgr.create_team(p).await {
+                        Ok(team) => Ok(serde_json::to_value(team).unwrap()),
+                        Err(e) => Err(e),
+                    }
+                }
+                Err(e) => Err(format!("invalid params: {e}")),
+            }
+        }
+        "headless.destroy_team" => {
+            #[derive(Deserialize)]
+            struct P { team_name: String }
+            match serde_json::from_value::<P>(req.params.clone()) {
+                Ok(p) => {
+                    let mut mgr = ctx.headless.lock().await;
+                    mgr.destroy_team(&p.team_name).await
+                        .map(|_| serde_json::json!("ok"))
+                }
+                Err(e) => Err(format!("invalid params: {e}")),
+            }
+        }
+        "headless.list_teams" => {
+            let mgr = ctx.headless.lock().await;
+            let teams = mgr.list_teams();
+            Ok(serde_json::to_value(teams).unwrap())
+        }
+        "headless.resolve" => {
+            #[derive(Deserialize)]
+            struct P { team_name: String, agent_name: String }
+            match serde_json::from_value::<P>(req.params.clone()) {
+                Ok(p) => {
+                    let mgr = ctx.headless.lock().await;
+                    match mgr.resolve_agent_id(&p.team_name, &p.agent_name) {
+                        Some(id) => Ok(serde_json::json!({ "agent_id": id, "headless": true })),
+                        None => Ok(serde_json::json!({ "agent_id": null, "headless": false })),
+                    }
+                }
+                Err(e) => Err(format!("invalid params: {e}")),
+            }
         }
 
         _ => Err(format!("unknown method: {}", req.method)),

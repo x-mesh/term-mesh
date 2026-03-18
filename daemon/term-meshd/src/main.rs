@@ -1,4 +1,5 @@
 mod agent;
+mod headless;
 mod http;
 mod monitor;
 mod socket;
@@ -45,6 +46,10 @@ async fn main() -> anyhow::Result<()> {
             .expect("failed to initialize agent session DB"),
     );
     tracing::info!("agent session manager initialized");
+
+    // Headless agent manager
+    let headless_manager = Arc::new(tokio::sync::Mutex::new(headless::HeadlessManager::new()));
+    tracing::info!("headless manager initialized");
 
     // Shared session store (populated by Swift app via session.sync RPC)
     let sessions: socket::SessionStore = Arc::new(Mutex::new(Vec::new()));
@@ -101,6 +106,7 @@ async fn main() -> anyhow::Result<()> {
         team_state,
         usage_tracker,
         agent_manager.clone(),
+        headless_manager.clone(),
         shutdown_rx,
     ));
 
@@ -115,7 +121,11 @@ async fn main() -> anyhow::Result<()> {
     // a. Signal servers to stop
     let _ = shutdown_tx.send(true);
 
-    // b. Terminate all agent sessions (cleanup worktrees + PIDs)
+    // b. Terminate all headless agents
+    headless_manager.lock().await.terminate_all().await;
+    tracing::info!("headless agents terminated");
+
+    // c. Terminate all agent sessions (cleanup worktrees + PIDs)
     agent_manager.terminate_all(&watcher_handle);
     tracing::info!("agent sessions terminated");
 
