@@ -226,7 +226,7 @@ struct TermMeshApp: App {
                     showSpawnCLIDialog()
                 }
                 .sheet(isPresented: $showTeamCreation) {
-                    TeamCreationView { teamName, leaderMode, leaderModel, agents, worktreeMode in
+                    TeamCreationView { teamName, leaderMode, leaderModel, agents, worktreeMode, executionMode in
                         let agentTuples = agents.map { row in
                             (
                                 name: row.preset.name,
@@ -244,16 +244,27 @@ struct TermMeshApp: App {
                         let activeTabManager = teamCreationTabManager ?? tabManager
                         let workDir = activeTabManager.selectedTab?.currentDirectory
                             ?? FileManager.default.currentDirectoryPath
-                        _ = TeamOrchestrator.shared.createTeam(
-                            name: teamName,
-                            agents: agentTuples,
-                            workingDirectory: workDir,
-                            leaderSessionId: UUID().uuidString,
-                            leaderMode: leaderMode,
-                            leaderModel: leaderModel,
-                            worktreeMode: worktreeMode,
-                            tabManager: activeTabManager
-                        )
+
+                        if executionMode == "headless" {
+                            // Headless: spawn agents via daemon subprocess (no GUI panes)
+                            Self.createHeadlessTeam(
+                                name: teamName,
+                                agents: agentTuples,
+                                workingDirectory: workDir
+                            )
+                        } else {
+                            // Pane: create agents with GUI terminal panes (existing behavior)
+                            _ = TeamOrchestrator.shared.createTeam(
+                                name: teamName,
+                                agents: agentTuples,
+                                workingDirectory: workDir,
+                                leaderSessionId: UUID().uuidString,
+                                leaderMode: leaderMode,
+                                leaderModel: leaderModel,
+                                worktreeMode: worktreeMode,
+                                tabManager: activeTabManager
+                            )
+                        }
                     }
                 }
         }
@@ -920,6 +931,53 @@ struct TermMeshApp: App {
             .flatMap { $0.split(separator: ":").last.map(String.init) } ?? "9876"
         guard let url = URL(string: "http://localhost:\(port)") else { return }
         _ = activeTabManager.createBrowserSplit(direction: .right, url: url)
+    }
+
+    /// Create a headless team via daemon RPC (no GUI panes).
+    private static func createHeadlessTeam(
+        name: String,
+        agents: [(name: String, cli: String, model: String, agentType: String, color: String, instructions: String)],
+        workingDirectory: String
+    ) {
+        let daemon = TermMeshDaemon.shared
+        guard daemon.daemonStatus().connected else {
+            DispatchQueue.main.async {
+                let alert = NSAlert()
+                alert.alertStyle = .warning
+                alert.messageText = "Daemon Not Running"
+                alert.informativeText = "Headless mode requires term-meshd. Start it with:\n\nterm-meshd &"
+                alert.addButton(withTitle: "OK")
+                alert.runModal()
+            }
+            return
+        }
+
+        let agentSpecs = agents.map { a -> [String: Any] in
+            ["name": a.name, "cli": a.cli, "model": a.model]
+        }
+
+        let params: [String: Any] = [
+            "team_name": name,
+            "working_directory": workingDirectory,
+            "leader_session_id": "leader-\(ProcessInfo.processInfo.processIdentifier)",
+            "agents": agentSpecs,
+        ]
+
+        DispatchQueue.global(qos: .userInitiated).async {
+            let result = daemon.rpcCallRaw(method: "headless.create_team", params: params)
+            DispatchQueue.main.async {
+                if let json = result {
+                    NSLog("[headless] create_team result: \(json)")
+                } else {
+                    let alert = NSAlert()
+                    alert.alertStyle = .warning
+                    alert.messageText = "Headless Team Failed"
+                    alert.informativeText = "Failed to create headless team '\(name)'. Check daemon logs."
+                    alert.addButton(withTitle: "OK")
+                    alert.runModal()
+                }
+            }
+        }
     }
 
     private func cleanupStaleWorktrees() {

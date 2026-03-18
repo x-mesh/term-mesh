@@ -21,7 +21,7 @@ struct TeamCreationView: View {
     @ObservedObject var templateManager = TeamTemplateManager.shared
     @ObservedObject var providerDetector = ProviderDetector.shared
 
-    var onCreate: ((_ teamName: String, _ leaderMode: String, _ leaderModel: String, _ agents: [TeamAgentRow], _ worktreeMode: String) -> Void)?
+    var onCreate: ((_ teamName: String, _ leaderMode: String, _ leaderModel: String, _ agents: [TeamAgentRow], _ worktreeMode: String, _ executionMode: String) -> Void)?
 
     @AppStorage("teamDefaultLeaderMode") private var defaultLeaderMode = "claude"
     @AppStorage("teamDefaultModel") private var defaultModel = "sonnet"
@@ -39,6 +39,7 @@ struct TeamCreationView: View {
     @State private var bulkModel = "sonnet"
     @State private var selectedSmartPresetId: String?
     @State private var worktreeMode = "off"  // "off", "shared", "isolated"
+    @State private var executionMode = "pane"  // "pane" or "headless"
     @State private var showDaemonWarning = false
 
     /// A team name is only truly duplicate if the entry exists AND its workspace
@@ -226,6 +227,36 @@ struct TeamCreationView: View {
             }
 
             HStack {
+                Text("Execution")
+                    .font(.subheadline.bold())
+                Spacer()
+                Picker("", selection: $executionMode) {
+                    Text("Pane").tag("pane")
+                    Text("Headless").tag("headless")
+                }
+                .pickerStyle(.segmented)
+                .frame(width: 160)
+            }
+            .onChange(of: executionMode) { _ in
+                if executionMode == "headless" {
+                    showDaemonWarning = !TermMeshDaemon.shared.daemonStatus().connected
+                } else {
+                    showDaemonWarning = worktreeMode != "off" && !TermMeshDaemon.shared.daemonStatus().connected
+                }
+            }
+
+            if executionMode == "headless" {
+                HStack(spacing: 4) {
+                    Image(systemName: "terminal")
+                        .foregroundStyle(.orange)
+                    Text("Agents run as background subprocesses — no terminal panes")
+                        .foregroundStyle(.secondary)
+                }
+                .font(.caption)
+                .transition(.opacity)
+            }
+
+            HStack {
                 Text("Worktree")
                     .font(.subheadline.bold())
                 Spacer()
@@ -265,7 +296,9 @@ struct TeamCreationView: View {
                 HStack(spacing: 4) {
                     Image(systemName: "exclamationmark.triangle.fill")
                         .foregroundStyle(.yellow)
-                    Text("term-meshd not running — worktrees require the daemon")
+                    Text(executionMode == "headless"
+                         ? "term-meshd not running — headless mode requires the daemon"
+                         : "term-meshd not running — worktrees require the daemon")
                         .foregroundStyle(.secondary)
                 }
                 .font(.caption)
@@ -756,6 +789,12 @@ struct TeamCreationView: View {
             .disabled(agents.isEmpty)
 
             Spacer()
+            if executionMode == "headless" {
+                Label("Headless", systemImage: "terminal")
+                    .font(.caption)
+                    .foregroundStyle(.orange)
+                    .padding(.trailing, 4)
+            }
             if worktreeMode != "off" {
                 Label(worktreeMode == "shared" ? "Shared Worktree" : "Isolated Worktrees",
                       systemImage: "arrow.triangle.branch")
@@ -765,7 +804,7 @@ struct TeamCreationView: View {
             }
             Button("Cancel") { dismiss() }
                 .keyboardShortcut(.cancelAction)
-            Button("Create Team") { createTeam() }
+            Button(executionMode == "headless" ? "Create Headless Team" : "Create Team") { createTeam() }
                 .keyboardShortcut(.defaultAction)
                 .disabled(teamName.isEmpty || agents.isEmpty || isTeamNameDuplicate)
         }
@@ -906,7 +945,7 @@ struct TeamCreationView: View {
 
     private func createTeam() {
         defaultLeaderModel = leaderModel
-        onCreate?(teamName, leaderMode, leaderModel, agents, worktreeMode)
+        onCreate?(teamName, leaderMode, leaderModel, agents, worktreeMode, executionMode)
         dismiss()
     }
 
