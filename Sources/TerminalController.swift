@@ -1869,6 +1869,10 @@ class TerminalController {
             return teamDataContextGet(params: params, id: id, store: store)
         case "team.context.list":
             return teamDataContextList(params: params, id: id, store: store)
+        case "team.preset.list":
+            return teamDataPresetList(params: params, id: id)
+        case "team.preset.resolve":
+            return teamDataPresetResolve(params: params, id: id)
         default:
             return v2Error(id: id, code: "unknown_method", message: "Unknown team data method: \(method)")
         }
@@ -1937,6 +1941,13 @@ class TerminalController {
         let leaderSessionId = params["leader_session_id"] as? String ?? UUID().uuidString
         let leaderMode = params["leader_mode"] as? String ?? "repl"
         let leaderModel = params["leader_model"] as? String ?? "sonnet"
+        // Adopted mode: caller's terminal IS the leader; surface_id identifies it.
+        let adoptedLeaderSurfaceId: UUID? = leaderMode == "adopted"
+            ? (params["surface_id"] as? String).flatMap(UUID.init(uuidString:))
+            : nil
+        if leaderMode == "adopted" && adoptedLeaderSurfaceId == nil {
+            return v2Error(id: id, code: "invalid_params", message: "adopted mode requires a valid surface_id")
+        }
         let agents = agentsParam.map { dict -> (name: String, cli: String, model: String, agentType: String, color: String, instructions: String) in
             (
                 name: dict["name"] as? String ?? "agent",
@@ -2033,6 +2044,7 @@ class TerminalController {
                 leaderSessionId: leaderSessionId,
                 leaderMode: leaderMode,
                 leaderModel: leaderModel,
+                adoptedLeaderSurfaceId: adoptedLeaderSurfaceId,
                 tabManager: tabManager
             ) {
                 return V2CallResult.ok([
@@ -2512,6 +2524,8 @@ class TerminalController {
         "team.context.set",
         "team.context.get",
         "team.context.list",
+        "team.preset.list",
+        "team.preset.resolve",
     ]
 
     /// Dispatch data-only team commands to teamDataQueue, bypassing v2MainSync.
@@ -2555,6 +2569,10 @@ class TerminalController {
                 return teamDataContextGet(params: params, id: id, store: store)
             case "team.context.list":
                 return teamDataContextList(params: params, id: id, store: store)
+            case "team.preset.list":
+                return teamDataPresetList(params: params, id: id)
+            case "team.preset.resolve":
+                return teamDataPresetResolve(params: params, id: id)
             default:
                 return nil
             }
@@ -2819,6 +2837,102 @@ class TerminalController {
         return v2Ok(id: id, result: ["entries": entries, "count": entries.count])
     }
 
+    // MARK: - Team Preset Handlers (off-main-thread safe)
+
+    /// List all built-in smart team presets with their agent definitions.
+    private func teamDataPresetList(params: [String: Any], id: Any?) -> String {
+        let detector = ProviderDetector.shared
+        let presets: [[String: Any]] = SmartTeamPreset.builtIn.map { preset in
+            let resolved = preset.resolve(with: detector)
+            return [
+                "id": preset.id,
+                "name": preset.name,
+                "icon": preset.icon,
+                "description": preset.description,
+                "leader_mode": preset.leaderMode,
+                "agent_count": resolved.count,
+                "agents": resolved.map { agent -> [String: Any] in
+                    [
+                        "role": agent.role,
+                        "cli": agent.cli,
+                        "model": agent.model,
+                        "status": {
+                            switch agent.status {
+                            case .normal: return "normal"
+                            case .best: return "best"
+                            case .fallback: return "fallback"
+                            }
+                        }() as String,
+                        "reason": agent.reason,
+                    ]
+                },
+            ]
+        }
+        return v2Ok(id: id, result: ["presets": presets, "count": presets.count])
+    }
+
+    /// Resolve a preset or a list of roles into a concrete agents array ready for team.create.
+    private func teamDataPresetResolve(params: [String: Any], id: Any?) -> String {
+        let detector = ProviderDetector.shared
+        let presetManager = AgentRolePresetManager.shared
+        let defaultColors = ["green", "blue", "yellow", "magenta", "cyan", "red"]
+
+        // Mode 1: Resolve by preset_id
+        if let presetId = params["preset_id"] as? String {
+            guard let preset = SmartTeamPreset.builtIn.first(where: { $0.id == presetId }) else {
+                return v2Error(id: id, code: "not_found", message: "Unknown preset_id: \(presetId)")
+            }
+            let resolved = preset.resolve(with: detector)
+            let agents: [[String: Any]] = resolved.enumerated().map { i, agent in
+                let rolePreset = presetManager.presets.first(where: { $0.name == agent.role })
+                return [
+                    "name": agent.role,
+                    "cli": agent.cli,
+                    "model": agent.model,
+                    "agent_type": agent.role,
+                    "color": rolePreset?.color ?? defaultColors[i % defaultColors.count],
+                    "instructions": rolePreset?.instructions ?? "",
+                ]
+            }
+            return v2Ok(id: id, result: [
+                "preset_id": presetId,
+                "leader_mode": preset.leaderMode,
+                "agents": agents,
+                "count": agents.count,
+            ])
+        }
+
+        // Mode 2: Resolve by roles array
+        if let roles = params["roles"] as? [String] {
+            guard !roles.isEmpty else {
+                return v2Error(id: id, code: "invalid_params", message: "Empty roles array")
+            }
+            var unknownRoles: [String] = []
+            let agents: [[String: Any]] = roles.enumerated().compactMap { i, roleName in
+                guard let rolePreset = presetManager.presets.first(where: { $0.name == roleName }) else {
+                    unknownRoles.append(roleName)
+                    return nil
+                }
+                let cli = detector.isAvailable(rolePreset.cli) ? rolePreset.cli : "claude"
+                let model = rolePreset.model.isEmpty ? AgentRolePreset.defaultModel(for: cli) : rolePreset.model
+                return [
+                    "name": rolePreset.name,
+                    "cli": cli,
+                    "model": model,
+                    "agent_type": rolePreset.name,
+                    "color": rolePreset.color.isEmpty ? defaultColors[i % defaultColors.count] : rolePreset.color,
+                    "instructions": rolePreset.instructions,
+                ]
+            }
+            if !unknownRoles.isEmpty {
+                return v2Error(id: id, code: "unknown_roles", message: "Unknown role(s): \(unknownRoles.joined(separator: ", ")). Use team.preset.list to see available roles.")
+            }
+            return v2Ok(id: id, result: ["agents": agents, "count": agents.count])
+        }
+
+        return v2Error(id: id, code: "invalid_params", message: "Missing preset_id or roles param")
+    }
+
     // MARK: - V2 Agent Team Methods
 
     private func v2TeamCreate(params: [String: Any]) -> V2CallResult {
@@ -2848,6 +2962,12 @@ class TerminalController {
 
         let leaderMode = params["leader_mode"] as? String ?? "repl"
         let leaderModel = params["leader_model"] as? String ?? "sonnet"
+        let adoptedLeaderSurfaceId: UUID? = leaderMode == "adopted"
+            ? (params["surface_id"] as? String).flatMap(UUID.init(uuidString:))
+            : nil
+        if leaderMode == "adopted" && adoptedLeaderSurfaceId == nil {
+            return .err(code: "invalid_params", message: "adopted mode requires a valid surface_id", data: nil)
+        }
 
         var result: V2CallResult = .err(code: "internal_error", message: "Failed to create team", data: nil)
         v2MainSync {
@@ -2858,6 +2978,7 @@ class TerminalController {
                 leaderSessionId: leaderSessionId,
                 leaderMode: leaderMode,
                 leaderModel: leaderModel,
+                adoptedLeaderSurfaceId: adoptedLeaderSurfaceId,
                 tabManager: tabManager
             ) {
                 result = .ok([

@@ -31,11 +31,12 @@ final class TeamOrchestrator {
     struct Team: Identifiable {
         let id: String            // team name
         let leaderSessionId: String
-        let leaderMode: String    // "repl", "claude", "kiro", "codex", "gemini"
+        let leaderMode: String    // "repl", "claude", "kiro", "codex", "gemini", "adopted"
         let leaderModel: String   // e.g. "sonnet", "opus", "haiku"
         let leaderPanelId: UUID   // leader pane for sending instructions
+        let leaderWorkspaceId: UUID?  // only set in "adopted" mode (leader lives in a separate workspace)
         let workingDirectory: String
-        let workspaceId: UUID     // single workspace for all agents
+        let workspaceId: UUID     // agent workspace (may differ from leader workspace in "adopted" mode)
         var agents: [AgentMember]
         let createdAt: Date
         var gitRepoRoot: String?  // for worktree cleanup
@@ -263,6 +264,7 @@ final class TeamOrchestrator {
         leaderMode: String = "repl",
         leaderModel: String = "sonnet",
         worktreeMode: String = "off",
+        adoptedLeaderSurfaceId: UUID? = nil,
         tabManager: TabManager
     ) -> Team? {
         guard !agents.isEmpty else { return nil }
@@ -403,101 +405,131 @@ final class TeamOrchestrator {
             return nil
         }
 
-        // Build leader command
-        let leaderCommand: String?
-        switch leaderMode {
-        case "repl":
-            let scriptPath = leaderScriptPath(mode: "repl", workingDirectory: workingDirectory)
-            leaderCommand = scriptPath.map { "\($0) \(socketPath) \(name)" }
-        case "claude":
-            if let claudePath = agentBinaryPath(cli: "claude") {
-                // Build system prompt from input agent specs (available before panes are created)
-                let scriptDir = Self.findScriptsDir(workingDirectory: workingDirectory)
-                let agentListStr = agents.enumerated().map { i, a in
-                    let summary = Self.oneLinerFromInstructions(a.instructions)
-                    return summary.isEmpty
-                        ? "  \(i + 1). \(a.name) (\(a.agentType))"
-                        : "  \(i + 1). \(a.name) (\(a.agentType)) — \(summary)"
-                }.joined(separator: "\n")
-                let tmAgent = "tm-agent"
-                let systemPrompt = Self.buildLeaderClaudeSystemPrompt(
-                    teamName: name,
-                    agentList: agentListStr,
-                    tmAgent: tmAgent,
-                    socketPath: socketPath
-                )
-                // Escape single quotes for shell, same approach as buildClaudeCommand
-                let escaped = systemPrompt.replacingOccurrences(of: "'", with: "'\\''")
-                let quotedPath = claudePath.contains(" ") ? "\"\(claudePath)\"" : claudePath
-                var claudeLeaderParts = ["\(quotedPath)", "--system-prompt '\(escaped)'", "--dangerously-skip-permissions"]
-                if !leaderModel.isEmpty && leaderModel != "sonnet" {
-                    claudeLeaderParts.append("--model \(leaderModel)")
+        // ── Leader setup: adopted vs normal ─────────────────────────────────
+        // "adopted" mode: caller's terminal IS the leader. Skip leader pane creation;
+        // register the caller's surface as leaderPanelId and track its workspace separately.
+        let leaderPanelId: UUID
+        let leaderWorkspaceId: UUID?
+
+        if leaderMode == "adopted" {
+            guard let adoptedSurfaceId = adoptedLeaderSurfaceId else {
+                Logger.team.error("[team] adopted mode requires adoptedLeaderSurfaceId")
+                return nil
+            }
+            // Look up the adopted leader's workspace so cross-workspace sends work correctly.
+            leaderWorkspaceId = AppDelegate.shared?.locateSurface(surfaceId: adoptedSurfaceId)?.workspaceId
+            if leaderWorkspaceId == nil {
+                Logger.team.warning("[team] adopted mode: locateSurface(surfaceId:) returned nil — leader workspace unknown, cross-workspace send may fail")
+            }
+            leaderPanelId = adoptedSurfaceId
+            #if DEBUG
+            dlog("[team] adopted mode: leaderPanelId=\(adoptedSurfaceId.uuidString.prefix(8)) leaderWorkspaceId=\(leaderWorkspaceId?.uuidString.prefix(8) ?? "nil")")
+            #endif
+            // The workspace's defaultPanel will serve as anchor for agent splits.
+            // It will be closed after all agent panes are created.
+        } else {
+            leaderWorkspaceId = nil
+
+            // Build leader command
+            let leaderCommand: String?
+            switch leaderMode {
+            case "repl":
+                let scriptPath = leaderScriptPath(mode: "repl", workingDirectory: workingDirectory)
+                leaderCommand = scriptPath.map { "\($0) \(socketPath) \(name)" }
+            case "claude":
+                if let claudePath = agentBinaryPath(cli: "claude") {
+                    // Build system prompt from input agent specs (available before panes are created)
+                    let scriptDir = Self.findScriptsDir(workingDirectory: workingDirectory)
+                    let agentListStr = agents.enumerated().map { i, a in
+                        let summary = Self.oneLinerFromInstructions(a.instructions)
+                        return summary.isEmpty
+                            ? "  \(i + 1). \(a.name) (\(a.agentType))"
+                            : "  \(i + 1). \(a.name) (\(a.agentType)) — \(summary)"
+                    }.joined(separator: "\n")
+                    let tmAgent = "tm-agent"
+                    let systemPrompt = Self.buildLeaderClaudeSystemPrompt(
+                        teamName: name,
+                        agentList: agentListStr,
+                        tmAgent: tmAgent,
+                        socketPath: socketPath
+                    )
+                    // Escape single quotes for shell, same approach as buildClaudeCommand
+                    let escaped = systemPrompt.replacingOccurrences(of: "'", with: "'\\''")
+                    let quotedPath = claudePath.contains(" ") ? "\"\(claudePath)\"" : claudePath
+                    var claudeLeaderParts = ["\(quotedPath)", "--system-prompt '\(escaped)'", "--dangerously-skip-permissions"]
+                    if !leaderModel.isEmpty && leaderModel != "sonnet" {
+                        claudeLeaderParts.append("--model \(leaderModel)")
+                    }
+                    leaderCommand = claudeLeaderParts.joined(separator: " ")
+                } else {
+                    leaderCommand = nil
                 }
-                leaderCommand = claudeLeaderParts.joined(separator: " ")
-            } else {
+            case "kiro":
+                if let path = agentBinaryPath(cli: "kiro") {
+                    leaderCommand = buildKiroCommand(kiroPath: path, agentName: "leader", teamName: name, model: leaderModel, isLeader: true)
+                } else { leaderCommand = nil }
+            case "codex":
+                if let path = agentBinaryPath(cli: "codex") {
+                    leaderCommand = buildCodexCommand(codexPath: path, agentName: "leader", teamName: name, model: leaderModel)
+                } else { leaderCommand = nil }
+            case "gemini":
+                if let path = agentBinaryPath(cli: "gemini") {
+                    leaderCommand = buildGeminiCommand(geminiPath: path, agentName: "leader", teamName: name, model: leaderModel)
+                } else { leaderCommand = nil }
+            default:
                 leaderCommand = nil
             }
-        case "kiro":
-            if let path = agentBinaryPath(cli: "kiro") {
-                leaderCommand = buildKiroCommand(kiroPath: path, agentName: "leader", teamName: name, model: leaderModel, isLeader: true)
-            } else { leaderCommand = nil }
-        case "codex":
-            if let path = agentBinaryPath(cli: "codex") {
-                leaderCommand = buildCodexCommand(codexPath: path, agentName: "leader", teamName: name, model: leaderModel)
-            } else { leaderCommand = nil }
-        case "gemini":
-            if let path = agentBinaryPath(cli: "gemini") {
-                leaderCommand = buildGeminiCommand(geminiPath: path, agentName: "leader", teamName: name, model: leaderModel)
-            } else { leaderCommand = nil }
-        default:
-            leaderCommand = nil
-        }
-        #if DEBUG
-        dlog("[team] leaderMode=\(leaderMode) leaderCommand=\(leaderCommand ?? "nil")")
-        #endif
+            #if DEBUG
+            dlog("[team] leaderMode=\(leaderMode) leaderCommand=\(leaderCommand ?? "nil")")
+            #endif
 
-        // Build leader shell command with explicit cd when worktree is active
-        let leaderShellCommand: String? = leaderCommand.map { cmd in
-            if leaderWorkDir != workingDirectory {
-                let shell = ProcessInfo.processInfo.environment["SHELL"] ?? "/bin/zsh"
-                let inner = "cd \"\(leaderWorkDir)\" && exec \(cmd); exec $SHELL"
-                let escaped = inner.replacingOccurrences(of: "'", with: "'\\''")
-                return "\(shell) -l -c '\(escaped)'"
-            } else {
-                return "\(cmd); exec $SHELL"
+            // Build leader shell command with explicit cd when worktree is active
+            let leaderShellCommand: String? = leaderCommand.map { cmd in
+                if leaderWorkDir != workingDirectory {
+                    let shell = ProcessInfo.processInfo.environment["SHELL"] ?? "/bin/zsh"
+                    let inner = "cd \"\(leaderWorkDir)\" && exec \(cmd); exec $SHELL"
+                    let escaped = inner.replacingOccurrences(of: "'", with: "'\\''")
+                    return "\(shell) -l -c '\(escaped)'"
+                } else {
+                    return "\(cmd); exec $SHELL"
+                }
             }
+
+            // Replace default panel: split from it with leader command, then close the original
+            guard let leaderPanel = workspace.newTerminalSplit(
+                from: defaultPanelId,
+                orientation: .horizontal,
+                insertFirst: true,
+                focus: true,
+                skipEqualization: true,
+                workingDirectory: leaderWorkDir,
+                command: leaderShellCommand,
+                environment: leaderEnv
+            ) else {
+                Logger.team.error("failed to create leader panel")
+                return nil
+            }
+            leaderPanelId = leaderPanel.id
+
+            // Set leader pane title
+            let leaderLabel: String
+            switch leaderMode {
+            case "repl":   leaderLabel = "👑 Leader (REPL)"
+            case "claude": leaderLabel = "👑 Leader (Claude)"
+            case "kiro":   leaderLabel = "👑 Leader (Kiro)"
+            case "codex":  leaderLabel = "👑 Leader (Codex)"
+            case "gemini": leaderLabel = "👑 Leader (Gemini)"
+            default:       leaderLabel = "👑 Leader (\(leaderMode))"
+            }
+            workspace.setPanelCustomTitle(panelId: leaderPanelId, title: leaderLabel)
+
+            // Close the original empty panel
+            workspace.closePanel(defaultPanelId)
         }
 
-        // Replace default panel: split from it with leader command, then close the original
-        guard let leaderPanel = workspace.newTerminalSplit(
-            from: defaultPanelId,
-            orientation: .horizontal,
-            insertFirst: true,
-            focus: true,
-            skipEqualization: true,
-            workingDirectory: leaderWorkDir,
-            command: leaderShellCommand,
-            environment: leaderEnv
-        ) else {
-            Logger.team.error("failed to create leader panel")
-            return nil
-        }
-        let leaderPanelId = leaderPanel.id
-
-        // Set leader pane title
-        let leaderLabel: String
-        switch leaderMode {
-        case "repl":   leaderLabel = "👑 Leader (REPL)"
-        case "claude": leaderLabel = "👑 Leader (Claude)"
-        case "kiro":   leaderLabel = "👑 Leader (Kiro)"
-        case "codex":  leaderLabel = "👑 Leader (Codex)"
-        case "gemini": leaderLabel = "👑 Leader (Gemini)"
-        default:       leaderLabel = "👑 Leader (\(leaderMode))"
-        }
-        workspace.setPanelCustomTitle(panelId: leaderPanelId, title: leaderLabel)
-
-        // Close the original empty panel
-        workspace.closePanel(defaultPanelId)
+        // Agent grid anchor: in normal mode agents split from leaderPanel;
+        // in adopted mode they split from the workspace's default panel (no leader pane exists).
+        let agentAnchorPanelId = leaderMode == "adopted" ? defaultPanelId : leaderPanelId
 
         // Compute optimal grid dimensions for agent panes
         let snapshot = workspace.bonsplitController.layoutSnapshot()
@@ -637,11 +669,11 @@ final class TeamOrchestrator {
             let orientation: SplitOrientation
 
             if row == 0 {
-                // First row: split right from previous column (or leader for first)
+                // First row: split right from previous column (or anchor for first)
                 // Chaining from previous column creates visual L→R order.
                 orientation = .horizontal
                 if col == 0 {
-                    splitFrom = leaderPanelId
+                    splitFrom = agentAnchorPanelId
                 } else {
                     // Previous column's top panel: agent at index (col-1) in row 0
                     splitFrom = members[col - 1].panelId
@@ -697,6 +729,11 @@ final class TeamOrchestrator {
             members.append(member)
         }
 
+        // In adopted mode, the default panel served as anchor but is no longer needed.
+        if leaderMode == "adopted" {
+            workspace.closePanel(defaultPanelId)
+        }
+
         // Equalize splits multiple times: bonsplit needs layout passes to settle.
         // First pass immediate, then delayed passes for robustness.
         for delay in [0.05, 0.3, 0.8] {
@@ -711,6 +748,7 @@ final class TeamOrchestrator {
             leaderMode: leaderMode,
             leaderModel: leaderModel,
             leaderPanelId: leaderPanelId,
+            leaderWorkspaceId: leaderWorkspaceId,
             workingDirectory: workingDirectory,
             workspaceId: workspace.id,
             agents: members,
@@ -1135,6 +1173,12 @@ final class TeamOrchestrator {
 
     func sendToLeader(teamName: String, text: String, tabManager: TabManager) -> Bool {
         guard let team = teams[teamName] else { return false }
+        // Adopted mode: leader lives in a different workspace than the agent workspace.
+        // Use AppDelegate to locate the leader panel across all windows.
+        if let leaderWsId = team.leaderWorkspaceId {
+            guard let located = AppDelegate.shared?.locateSurface(surfaceId: team.leaderPanelId) else { return false }
+            return sendTextToPanel(workspaceId: leaderWsId, panelId: team.leaderPanelId, text: text, tabManager: located.tabManager)
+        }
         return sendTextToPanel(workspaceId: team.workspaceId, panelId: team.leaderPanelId, text: text, tabManager: tabManager)
     }
 

@@ -139,7 +139,19 @@ enum Commands {
         codex: Option<String>,
         #[arg(long)]
         gemini: Option<String>,
+        /// Adopt current terminal as leader pane (skip leader pane creation)
+        #[arg(long)]
+        adopt: bool,
+        /// Use a named preset (e.g. "standard", "architect")
+        #[arg(long)]
+        preset: Option<String>,
+        /// Comma-separated roles to create (e.g. "explorer,executor,reviewer")
+        #[arg(long)]
+        roles: Option<String>,
     },
+    /// Preset operations (list)
+    #[command(subcommand)]
+    Preset(PresetCommands),
     /// Send instruction to an agent (with report suffix)
     Send {
         agent: String,
@@ -338,6 +350,12 @@ enum ContextCommands {
     /// Get a context value by key
     Get { key: String },
     /// List all context entries
+    List,
+}
+
+#[derive(Subcommand)]
+enum PresetCommands {
+    /// List all available presets
     List,
 }
 
@@ -881,9 +899,34 @@ fn main() {
             rpc_call(&sock, "team.result.collect", json!({ "team_name": team }))
         }
         // ── Orchestration commands ──────────────────────────────
-        Commands::Create { count, claude_leader, model, leader_model, kiro, codex, gemini } => {
-            run_create(&sock, &team, count.unwrap_or(2), claude_leader, &model, leader_model.as_deref(), &kiro, &codex, &gemini);
+        Commands::Create { count, claude_leader, model, leader_model, kiro, codex, gemini, adopt, preset, roles } => {
+            run_create(&sock, &team, count.unwrap_or(2), claude_leader, &model, leader_model.as_deref(), &kiro, &codex, &gemini, adopt, preset.as_deref(), roles.as_deref());
             return;
+        }
+        Commands::Preset(sub) => {
+            match sub {
+                PresetCommands::List => {
+                    match rpc_call(&sock, "team.preset.list", json!({})) {
+                        Ok(resp) => {
+                            if let Some(presets) = resp["result"]["presets"].as_array() {
+                                println!("{:<20} {:<30} {:<8} {}", "ID", "Name", "Agents", "Description");
+                                println!("{}", "-".repeat(80));
+                                for p in presets {
+                                    let id = p["id"].as_str().unwrap_or("");
+                                    let name = p["name"].as_str().unwrap_or("");
+                                    let desc = p["description"].as_str().unwrap_or("");
+                                    let agent_count = p["agents"].as_array().map(|a| a.len()).unwrap_or(0);
+                                    println!("{:<20} {:<30} {:<8} {}", id, name, agent_count, desc);
+                                }
+                            } else {
+                                println!("{}", pretty(&resp));
+                            }
+                        }
+                        Err(e) => { eprintln!("Error: {e}"); process::exit(1); }
+                    }
+                    return;
+                }
+            }
         }
         Commands::Send { agent: ref target, text, no_report } => {
             let text = append_report_suffix(&text, no_report);
@@ -980,36 +1023,99 @@ fn print_result(result: Result<Value, String>) {
 fn run_create(
     sock: &PathBuf, team: &str, count: u32, claude_leader: bool,
     model: &str, leader_model: Option<&str>, kiro: &Option<String>, codex: &Option<String>, gemini: &Option<String>,
+    adopt: bool, preset: Option<&str>, roles: Option<&str>,
 ) {
+    // Guard: --adopt and --claude-leader are mutually exclusive
+    if adopt && claude_leader {
+        eprintln!("Error: --adopt and --claude-leader cannot be used together. In --adopt mode the current terminal is already the leader.");
+        process::exit(1);
+    }
+    // Guard: --roles and count together — roles wins, count is ignored
+    if roles.is_some() && count != 2 {
+        eprintln!("Warning: --roles is specified; --count ({count}) will be ignored.");
+    }
     cleanup_old_results(team);
-    let leader_mode = if claude_leader { "claude" } else { "repl" };
+    let leader_mode = if adopt {
+        "adopted"
+    } else if claude_leader {
+        "claude"
+    } else {
+        "repl"
+    };
     let leader_model = leader_model.unwrap_or(model);
     let kiro_agents = parse_cli_flag(kiro);
     let codex_agents = parse_cli_flag(codex);
     let gemini_agents = parse_cli_flag(gemini);
 
-    let mut agents = Vec::new();
-    for i in 0..count as usize {
-        let name = if i < DEFAULT_AGENT_NAMES.len() {
-            DEFAULT_AGENT_NAMES[i].to_string()
-        } else {
-            format!("agent-{i}")
-        };
-        let color = DEFAULT_AGENT_COLORS[i % DEFAULT_AGENT_COLORS.len()];
-        let cli = if codex_agents.contains(&name) || codex_agents.contains("all") {
-            "codex"
-        } else if gemini_agents.contains(&name) || gemini_agents.contains("all") {
-            "gemini"
-        } else if kiro_agents.contains(&name) || kiro_agents.contains("all") {
-            "kiro"
-        } else {
-            "claude"
-        };
-        agents.push(json!({
-            "name": name, "cli": cli, "model": model,
-            "agent_type": name, "color": color,
-        }));
-    }
+    // Resolve agents from preset or roles via RPC, or build from defaults
+    let agents: Vec<serde_json::Value> = if let Some(preset_id) = preset {
+        eprintln!("Resolving preset '{preset_id}'...");
+        match rpc_call_timeout(sock, "team.preset.resolve", json!({
+            "preset_id": preset_id,
+            "model": model,
+        }), 3) {
+            Ok(resp) if resp["ok"].as_bool().unwrap_or(false) => {
+                resp["result"]["agents"].as_array()
+                    .cloned()
+                    .unwrap_or_default()
+            }
+            Ok(resp) => {
+                eprintln!("Error: preset resolve failed: {}", resp["error"]["message"].as_str().unwrap_or("unknown"));
+                process::exit(1);
+            }
+            Err(e) => {
+                eprintln!("Error: team.preset.resolve RPC failed (app may not support presets yet): {e}");
+                process::exit(1);
+            }
+        }
+    } else if let Some(roles_str) = roles {
+        eprintln!("Resolving roles '{roles_str}'...");
+        // Split comma-separated roles into a JSON array (Swift expects [String], not String)
+        let roles_vec: Vec<&str> = roles_str.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()).collect();
+        match rpc_call_timeout(sock, "team.preset.resolve", json!({
+            "roles": roles_vec,
+            "model": model,
+        }), 3) {
+            Ok(resp) if resp["ok"].as_bool().unwrap_or(false) => {
+                resp["result"]["agents"].as_array()
+                    .cloned()
+                    .unwrap_or_default()
+            }
+            Ok(resp) => {
+                eprintln!("Error: roles resolve failed: {}", resp["error"]["message"].as_str().unwrap_or("unknown"));
+                process::exit(1);
+            }
+            Err(e) => {
+                eprintln!("Error: team.preset.resolve RPC failed (app may not support roles yet): {e}");
+                process::exit(1);
+            }
+        }
+    } else {
+        // Default: build from DEFAULT_AGENT_NAMES up to count
+        let mut default_agents = Vec::new();
+        for i in 0..count as usize {
+            let name = if i < DEFAULT_AGENT_NAMES.len() {
+                DEFAULT_AGENT_NAMES[i].to_string()
+            } else {
+                format!("agent-{i}")
+            };
+            let color = DEFAULT_AGENT_COLORS[i % DEFAULT_AGENT_COLORS.len()];
+            let cli = if codex_agents.contains(&name) || codex_agents.contains("all") {
+                "codex"
+            } else if gemini_agents.contains(&name) || gemini_agents.contains("all") {
+                "gemini"
+            } else if kiro_agents.contains(&name) || kiro_agents.contains("all") {
+                "kiro"
+            } else {
+                "claude"
+            };
+            default_agents.push(json!({
+                "name": name, "cli": cli, "model": model,
+                "agent_type": name, "color": color,
+            }));
+        }
+        default_agents
+    };
 
     // Destroy existing team first, then poll until gone (max 10 × 50ms = 500ms)
     let _ = rpc_call_timeout(sock, "team.destroy", json!({ "team_name": team }), 2);
@@ -1034,7 +1140,8 @@ fn run_create(
         .map(|p| p.to_string_lossy().to_string())
         .unwrap_or_else(|_| ".".to_string());
 
-    eprintln!("Creating team '{team}' with {count} agent(s) [leader: {leader_mode}]...");
+    let agent_count = agents.len();
+    eprintln!("Creating team '{team}' with {agent_count} agent(s) [leader: {leader_mode}]...");
     eprintln!("Socket: {}", sock.display());
 
     // Pass caller's panel ID so the app can route team creation to the correct window
