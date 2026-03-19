@@ -1644,16 +1644,30 @@ func pushTargetSurfaceSize(_ size: CGSize) {
     /// The shell interprets each Return key event as "execute", so multiline text must be
     /// delivered via ghostty_surface_text (bracketed paste) rather than per-line key events.
     /// Single-line: use key events so TUI apps (Claude Code) receive proper press/release pairs.
-    func sendIMEText(_ text: String, withReturn: Bool = true) {
-        guard let surface = surface else { return }
+    ///
+    /// Returns true if text was delivered successfully, false if the surface was unavailable.
+    @discardableResult
+    func sendIMEText(_ text: String, withReturn: Bool = true) -> Bool {
+        guard let surface = surface else {
+#if DEBUG
+            dlog("ime.send.fail reason=surface_nil surface=\(terminalSurface?.id.uuidString.prefix(5) ?? "nil")")
+#endif
+            return false
+        }
 
         if text.contains("\n") {
             // Multiline: use bracketed paste so terminal treats newlines as content, not execution.
             // Sending Return key events between lines would cause the shell to execute each line
             // immediately instead of composing a multiline input.
+            guard let ts = terminalSurface else {
+#if DEBUG
+                dlog("ime.send.fail reason=terminalSurface_nil path=multiline")
+#endif
+                return false
+            }
             let payload = withReturn ? text + "\r" : text
-            terminalSurface?.sendText(payload)
-            return
+            ts.sendText(payload)
+            return true
         }
 
         // Single-line: use key events (PRESS+RELEASE) so TUI apps track key state correctly.
@@ -1663,6 +1677,7 @@ func pushTargetSurfaceSize(_ size: CGSize) {
             let segments = Self.chunkUTF8Safe(text, maxBytes: 4096)
             for segment in segments {
                 // Send text as key event
+                var handled = false
                 segment.withCString { ptr in
                     var keyEvent = ghostty_input_key_s()
                     keyEvent.action = GHOSTTY_ACTION_PRESS
@@ -1672,8 +1687,13 @@ func pushTargetSurfaceSize(_ size: CGSize) {
                     keyEvent.unshifted_codepoint = 0
                     keyEvent.text = ptr
                     keyEvent.composing = false
-                    _ = ghostty_surface_key(surface, keyEvent)
+                    handled = ghostty_surface_key(surface, keyEvent)
                 }
+#if DEBUG
+                if !handled {
+                    dlog("ime.send.fail reason=key_not_handled segment=\(segment.prefix(20)) surface=\(terminalSurface?.id.uuidString.prefix(5) ?? "nil")")
+                }
+#endif
                 // Send matching RELEASE — TUI apps may track key state
                 var releaseEvent = ghostty_input_key_s()
                 releaseEvent.action = GHOSTTY_ACTION_RELEASE
@@ -1690,6 +1710,7 @@ func pushTargetSurfaceSize(_ size: CGSize) {
         if withReturn {
             sendReturnKey(to: surface)
         }
+        return true
     }
 
     /// Split a string into chunks where each chunk fits within `maxBytes` of UTF-8,

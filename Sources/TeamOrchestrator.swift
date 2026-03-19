@@ -826,8 +826,15 @@ final class TeamOrchestrator: ObservableObject {
                 shellCommand = "\(agentCommand); exec $SHELL"
             }
             // Select the right environment: non-claude agents don't need CLAUDECODE
+            // Add window and workspace routing so agent team.create calls route correctly
+            let windowId = AppDelegate.shared?.windowId(for: tabManager)?.uuidString ?? ""
+            var agentSpecificEnv: [String: String] = ["TERMMESH_AGENT_NAME": agent.name]
+            if !windowId.isEmpty {
+                agentSpecificEnv["TERMMESH_WINDOW_ID"] = windowId
+            }
+            agentSpecificEnv["TERMMESH_WORKSPACE_ID"] = workspace.id.uuidString
             let paneEnv = (agentCli == "claude" ? claudeAgentEnv : kiroAgentEnv)
-                .merging(["TERMMESH_AGENT_NAME": agent.name]) { _, new in new }
+                .merging(agentSpecificEnv) { _, new in new }
 
             // Grid layout: agents are assigned to cells in column-major order.
             // col = index % numCols, row = index / numCols
@@ -1530,7 +1537,7 @@ final class TeamOrchestrator: ObservableObject {
         return lines.joined(separator: "\n")
     }
 
-    private func sendTextToPanel(workspaceId: UUID, panelId: UUID, text: String, tabManager: TabManager, enterDelay: TimeInterval = 0.10) -> Bool {
+    private func sendTextToPanel(workspaceId: UUID, panelId: UUID, text: String, tabManager: TabManager, enterDelay: TimeInterval = 0.10, retryCount: Int = 0) -> Bool {
         // Try the provided tabManager first, then fall back to global surface lookup
         // for cross-window scenarios (e.g. broadcast when agents are in a different window).
         let panel: TerminalPanel
@@ -1547,9 +1554,20 @@ final class TeamOrchestrator: ObservableObject {
             let wsFound = tabManager.tabs.first(where: { $0.id == workspaceId })
             let panelFound = wsFound?.panels[panelId]
             let locateResult = AppDelegate.shared?.locateSurface(surfaceId: panelId)
-            dlog("[team.sendTextToPanel.FAIL] panelId=\(panelId.uuidString.prefix(8)) wsId=\(workspaceId.uuidString.prefix(8)) wsFound=\(wsFound != nil) panelInWs=\(panelFound != nil) globalLocate=\(locateResult != nil) tabCount=\(tabManager.tabs.count) ctxCount=\(AppDelegate.shared?.mainWindowContexts.count ?? 0)")
+            dlog("[team.sendTextToPanel.FAIL] panelId=\(panelId.uuidString.prefix(8)) wsId=\(workspaceId.uuidString.prefix(8)) wsFound=\(wsFound != nil) panelInWs=\(panelFound != nil) globalLocate=\(locateResult != nil) tabCount=\(tabManager.tabs.count) ctxCount=\(AppDelegate.shared?.mainWindowContexts.count ?? 0) retryCount=\(retryCount)")
             #endif
-            Logger.team.warning("[sendTextToPanel] panel \(panelId.uuidString.prefix(8), privacy: .public) not found: wsMatch=\(tabManager.tabs.contains(where: { $0.id == workspaceId }), privacy: .public) globalLocate=\(AppDelegate.shared?.locateSurface(surfaceId: panelId) != nil, privacy: .public)")
+            Logger.team.warning("[sendTextToPanel] panel \(panelId.uuidString.prefix(8), privacy: .public) not found (attempt \(retryCount + 1))")
+
+            // Retry after 0.5s if this is the first failure
+            // Panel may exist but not yet visible in workspace list after fast splits
+            if retryCount < 1 {
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
+                    _ = self?.sendTextToPanel(
+                        workspaceId: workspaceId, panelId: panelId, text: text,
+                        tabManager: tabManager, enterDelay: enterDelay, retryCount: retryCount + 1
+                    )
+                }
+            }
             return false
         }
         let trimmed = text.replacingOccurrences(of: "[\\r\\n]+$", with: "", options: .regularExpression)

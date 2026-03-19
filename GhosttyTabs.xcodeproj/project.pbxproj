@@ -92,7 +92,10 @@
 			A5001250 /* Sentry in Frameworks */ = {isa = PBXBuildFile; productRef = A5001251 /* Sentry */; };
 			A5001270 /* PostHog in Frameworks */ = {isa = PBXBuildFile; productRef = A5001271 /* PostHog */; };
 			A5001303 /* SurfaceSearchOverlay.swift in Sources */ = {isa = PBXBuildFile; fileRef = A5001301 /* SurfaceSearchOverlay.swift */; };
-			A5009001 /* IMEInputBar.swift in Sources */ = {isa = PBXBuildFile; fileRef = A5009000 /* IMEInputBar.swift */; };
+			IME0002 /* IMEHistory.swift in Sources */ = {isa = PBXBuildFile; fileRef = IME0001 /* IMEHistory.swift */; };
+			IME0004 /* IMEInputBar.swift in Sources */ = {isa = PBXBuildFile; fileRef = IME0003 /* IMEInputBar.swift */; };
+			IME0006 /* IMETextEditor.swift in Sources */ = {isa = PBXBuildFile; fileRef = IME0005 /* IMETextEditor.swift */; };
+			IME0008 /* IMETextView.swift in Sources */ = {isa = PBXBuildFile; fileRef = IME0007 /* IMETextView.swift */; };
 			A500B001 /* RainbowBannerStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = A500B000 /* RainbowBannerStore.swift */; };
 			A500B003 /* RainbowBannerView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A500B002 /* RainbowBannerView.swift */; };
 			A5009101 /* TitlebarProgressBar.swift in Sources */ = {isa = PBXBuildFile; fileRef = A5009100 /* TitlebarProgressBar.swift */; };
@@ -280,7 +283,10 @@
 		A5001091 /* NotificationsPage.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NotificationsPage.swift; sourceTree = "<group>"; };
 		A5001092 /* TerminalNotificationStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TerminalNotificationStore.swift; sourceTree = "<group>"; };
 		A5001301 /* SurfaceSearchOverlay.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Find/SurfaceSearchOverlay.swift; sourceTree = "<group>"; };
-		A5009000 /* IMEInputBar.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = IMEInputBar.swift; sourceTree = "<group>"; };
+		IME0001 /* IMEHistory.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = IMEHistory.swift; sourceTree = "<group>"; };
+		IME0003 /* IMEInputBar.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = IMEInputBar.swift; sourceTree = "<group>"; };
+		IME0005 /* IMETextEditor.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = IMETextEditor.swift; sourceTree = "<group>"; };
+		IME0007 /* IMETextView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = IMETextView.swift; sourceTree = "<group>"; };
 		A500B000 /* RainbowBannerStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RainbowBannerStore.swift; sourceTree = "<group>"; };
 		A500B002 /* RainbowBannerView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RainbowBannerView.swift; sourceTree = "<group>"; };
 		A5009100 /* TitlebarProgressBar.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TitlebarProgressBar.swift; sourceTree = "<group>"; };
@@ -505,7 +511,7 @@
 				A5001091 /* NotificationsPage.swift */,
 				A5001092 /* TerminalNotificationStore.swift */,
 				A5001301 /* SurfaceSearchOverlay.swift */,
-				A5009000 /* IMEInputBar.swift */,
+				IME0GRP /* IME */,
 				A500B000 /* RainbowBannerStore.swift */,
 				A500B002 /* RainbowBannerView.swift */,
 				A5009100 /* TitlebarProgressBar.swift */,
@@ -594,6 +600,17 @@
 				F4000001A1B2C3D4E5F60718 /* GhosttyConfigTests.swift */,
 			);
 			path = termMeshTests;
+			sourceTree = "<group>";
+		};
+		IME0GRP /* IME */ = {
+			isa = PBXGroup;
+			children = (
+				IME0001 /* IMEHistory.swift */,
+				IME0003 /* IMEInputBar.swift */,
+				IME0005 /* IMETextEditor.swift */,
+				IME0007 /* IMETextView.swift */,
+			);
+			path = IME;
 			sourceTree = "<group>";
 		};
 /* End PBXGroup section */
@@ -796,7 +813,10 @@
 				A5001094 /* NotificationsPage.swift in Sources */,
 				A5001095 /* TerminalNotificationStore.swift in Sources */,
 				A5001303 /* SurfaceSearchOverlay.swift in Sources */,
-				A5009001 /* IMEInputBar.swift in Sources */,
+				IME0002 /* IMEHistory.swift in Sources */,
+				IME0004 /* IMEInputBar.swift in Sources */,
+				IME0006 /* IMETextEditor.swift in Sources */,
+				IME0008 /* IMETextView.swift in Sources */,
 				A500B001 /* RainbowBannerStore.swift in Sources */,
 				A500B003 /* RainbowBannerView.swift in Sources */,
 				A5009101 /* TitlebarProgressBar.swift in Sources */,
