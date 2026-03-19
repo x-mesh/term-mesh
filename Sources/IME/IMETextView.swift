@@ -286,7 +286,7 @@ final class IMETextView: NSTextView {
     /// when the cursor is on the first line and IME is not composing.
     private func handleUpArrow(event: NSEvent, mods: NSEvent.ModifierFlags) {
         if mods.contains(.option) && !hasMarkedText() {
-            sendKeyHandler?(VK.upArrow, 0)
+            sendKeyHandler?(VK.upArrow, UInt32(GHOSTTY_MODS_ALT.rawValue))
         } else if !hasMarkedText() && isCursorOnFirstLine() {
             historyUpHandler?()
         } else {
@@ -298,7 +298,7 @@ final class IMETextView: NSTextView {
     /// history when the cursor is on the last line and IME is not composing.
     private func handleDownArrow(event: NSEvent, mods: NSEvent.ModifierFlags) {
         if mods.contains(.option) && !hasMarkedText() {
-            sendKeyHandler?(VK.downArrow, 0)
+            sendKeyHandler?(VK.downArrow, UInt32(GHOSTTY_MODS_ALT.rawValue))
         } else if !hasMarkedText() && isCursorOnLastLine() {
             historyDownHandler?()
         } else {
@@ -414,6 +414,54 @@ final class IMETextView: NSTextView {
         .systemRed, .systemOrange, .systemYellow, .systemGreen, .cyan, .systemBlue, .systemPurple,
     ]
 
+    // MARK: - Shell syntax highlighting
+
+    /// Regex patterns for shell token categories, in priority order (first match wins).
+    /// All NSRegularExpression instances are compiled once and cached.
+    private static let syntaxPatterns: [(NSRegularExpression, NSColor)] = {
+        var patterns: [(NSRegularExpression, NSColor)] = []
+        let defs: [(String, NSColor)] = [
+            // Double-quoted strings (handles \" escapes)
+            (#""(?:[^"\\]|\\.)*""#,             .systemYellow),
+            // Single-quoted strings
+            (#"'[^']*'"#,                        .systemYellow),
+            // Backtick command substitution
+            (#"`[^`]*`"#,                        .systemYellow),
+            // Comments (# to end of line)
+            (#"#[^\n]*"#,                        NSColor.secondaryLabelColor),
+            // Variables: ${VAR} and $VAR
+            (#"\$\{[^}]+\}"#,                   .cyan),
+            (#"\$[A-Za-z_][A-Za-z0-9_]*"#,     .cyan),
+            // Redirects: 2>&1, >>, >& before single > or <
+            (#"2>&1|>>|>&|[><]"#,               .systemOrange),
+            // Pipe: single | (not ||)
+            (#"\|(?!\|)"#,                       .systemOrange),
+            // Logical operators and double-semicolon
+            (#"&&|\|\||;;"#,                     .systemOrange),
+            // Semicolon separator (not ;; — already matched above)
+            (#"(?<![;]);(?![;])"#,               .systemOrange),
+            // Flags: --long-flag or -s (must start at word boundary)
+            (#"(?:^|(?<=\s))--?[A-Za-z][A-Za-z0-9-]*"#, .systemGreen),
+            // Standalone integers and decimals
+            (#"(?:^|(?<=\s))\d+(?:\.\d+)?(?=\s|$|;|\||&)"#, .systemPurple),
+        ]
+        for (pattern, color) in defs {
+            if let re = try? NSRegularExpression(pattern: pattern, options: [.anchorsMatchLines]) {
+                patterns.append((re, color))
+            }
+        }
+        return patterns
+    }()
+
+    /// Regex to find the command word at the start of each logical command segment.
+    /// Matches an optional separator (;, |, &&, ||) followed by optional whitespace,
+    /// then captures the first word (the command name).
+    private static let commandRegex: NSRegularExpression? =
+        try? NSRegularExpression(
+            pattern: #"(?:^|[;]|&&|\|\||\|)\s*([A-Za-z/_][A-Za-z0-9_\-./]*)"#,
+            options: [.anchorsMatchLines]
+        )
+
     private var isApplyingRainbow = false
 
     override func didChangeText() {
@@ -453,7 +501,12 @@ final class IMETextView: NSTextView {
             }
         }
 
-        // Apply rainbow colors per character for each keyword match
+        // Apply shell syntax highlighting (before rainbow so rainbow overrides)
+        var colored = IndexSet()
+        applySyntaxHighlighting(storage: storage, fullString: fullString, len: len,
+                                markedRange: markedRange, colored: &colored)
+
+        // Apply rainbow colors per character for each keyword match (overrides syntax colors)
         for keyword in IMETextView.rainbowKeywords {
             var searchRange = NSRange(location: 0, length: len)
             while searchRange.length > 0 {
@@ -475,6 +528,77 @@ final class IMETextView: NSTextView {
         }
 
         storage.endEditing()
+    }
+
+    /// Applies shell syntax coloring to `storage` within a single beginEditing/endEditing batch.
+    /// Uses a first-match-wins `IndexSet` so that higher-priority tokens (strings, comments)
+    /// prevent lower-priority tokens from recoloring the same characters.
+    private func applySyntaxHighlighting(
+        storage: NSTextStorage,
+        fullString: NSString,
+        len: Int,
+        markedRange: NSRange,
+        colored: inout IndexSet
+    ) {
+        let nsStr = fullString as String
+        let fullRange = NSRange(location: 0, length: len)
+
+        // 1. Regex-based token patterns (string/comment/variable/operator/flag/number)
+        for (regex, color) in IMETextView.syntaxPatterns {
+            regex.enumerateMatches(in: nsStr, options: [], range: fullRange) { match, _, _ in
+                guard let matchRange = match?.range, matchRange.length > 0 else { return }
+
+                // Skip if overlaps with active IME composing range
+                if markedRange.location != NSNotFound, markedRange.length > 0,
+                   NSIntersectionRange(matchRange, markedRange).length > 0 { return }
+
+                // First-match wins: skip if any index in this range is already colored
+                let indices = matchRange.location ..< (matchRange.location + matchRange.length)
+                if colored.intersects(integersIn: indices) { return }
+
+                // Skip ranges that contain image attachments
+                var hasAttachment = false
+                storage.enumerateAttribute(
+                    .attachment, in: matchRange,
+                    options: .longestEffectiveRangeNotRequired
+                ) { val, _, stop in
+                    if val != nil { hasAttachment = true; stop.pointee = true }
+                }
+                if hasAttachment { return }
+
+                storage.addAttribute(.foregroundColor, value: color, range: matchRange)
+                colored.insert(integersIn: indices)
+            }
+        }
+
+        // 2. Command highlighting: first word after line start or ;/|/&&/||
+        guard let cmdRe = IMETextView.commandRegex else { return }
+        cmdRe.enumerateMatches(in: nsStr, options: [], range: fullRange) { match, _, _ in
+            guard let m = match, m.numberOfRanges > 1 else { return }
+            let wordRange = m.range(at: 1)
+            guard wordRange.location != NSNotFound, wordRange.length > 0 else { return }
+
+            // Skip if overlaps with IME composing range
+            if markedRange.location != NSNotFound, markedRange.length > 0,
+               NSIntersectionRange(wordRange, markedRange).length > 0 { return }
+
+            // Skip if already colored by a higher-priority token
+            let indices = wordRange.location ..< (wordRange.location + wordRange.length)
+            if colored.intersects(integersIn: indices) { return }
+
+            // Skip attachment ranges
+            var hasAttachment = false
+            storage.enumerateAttribute(
+                .attachment, in: wordRange,
+                options: .longestEffectiveRangeNotRequired
+            ) { val, _, stop in
+                if val != nil { hasAttachment = true; stop.pointee = true }
+            }
+            if hasAttachment { return }
+
+            storage.addAttribute(.foregroundColor, value: NSColor.systemBlue, range: wordRange)
+            colored.insert(integersIn: indices)
+        }
     }
 
     // MARK: - Ghost suggestion logic
