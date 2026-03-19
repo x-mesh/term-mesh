@@ -618,6 +618,13 @@ class TabManager: ObservableObject {
         guard tabs.count > 1 else { return }
         sentryBreadcrumb("workspace.close", data: ["tabCount": tabs.count - 1])
 
+        // Terminate any bound agent sessions before removing the workspace.
+        // Bonsplit's didCloseTab delegate won't fire when the entire workspace is removed,
+        // so we must explicitly close panels here.
+        for (_, panel) in workspace.panels {
+            panel.close()
+        }
+
         // term-mesh: Mark worktree as stale (no longer auto-deleted on tab close)
         if let name = workspace.worktreeName {
             Logger.app.info("worktree '\(name, privacy: .public)' detached from closed tab (kept for manual cleanup)")
