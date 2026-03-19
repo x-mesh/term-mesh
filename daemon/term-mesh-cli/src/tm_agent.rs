@@ -224,6 +224,14 @@ enum Commands {
         #[arg(long)]
         from: Option<String>,
     },
+    /// Warm up agents (send pong task, wait for response, print latency)
+    Warmup {
+        /// Specific agent to warm up (default: all agents)
+        agent: Option<String>,
+        /// Timeout in seconds (default: 30)
+        #[arg(long, default_value_t = 30)]
+        timeout: u32,
+    },
 
     // ── Legacy hyphenated aliases (hidden) ───────────────────────────
     /// Alias: task-get → task get
@@ -1030,6 +1038,10 @@ fn main() {
         Commands::Wait { timeout, interval, mode, task, agents } => {
             let filter = parse_cli_flag(&agents);
             run_wait(&sock, &team, timeout, interval, &mode, task.as_deref(), &filter);
+            return;
+        }
+        Commands::Warmup { agent: ref target, timeout } => {
+            run_warmup(&sock, &team, target.as_deref(), timeout);
             return;
         }
         Commands::Brief { agent: ref target, lines } => {
@@ -1888,6 +1900,107 @@ fn run_wait(sock: &PathBuf, team: &str, timeout: u32, interval: u32, mode: &str,
         println!("{}", pretty(&r));
     }
     process::exit(1);
+}
+
+fn run_warmup(sock: &PathBuf, team: &str, target: Option<&str>, timeout: u32) {
+    use std::time::Instant;
+
+    // Get agent list
+    let status = match rpc_call(sock, "team.status", json!({ "team_name": team })) {
+        Ok(v) => v,
+        Err(e) => { eprintln!("Error: {e}"); process::exit(1); }
+    };
+    let agents = status["result"]["agents"].as_array().unwrap_or(&vec![]).clone();
+    if agents.is_empty() {
+        eprintln!("No agents in team '{team}'");
+        process::exit(1);
+    }
+
+    // Filter to specific agent if requested
+    let targets: Vec<&Value> = if let Some(name) = target {
+        let filtered: Vec<&Value> = agents.iter().filter(|a| a["name"].as_str() == Some(name)).collect();
+        if filtered.is_empty() {
+            eprintln!("Agent '{name}' not found in team '{team}'");
+            process::exit(1);
+        }
+        filtered
+    } else {
+        agents.iter().collect()
+    };
+
+    let count = targets.len();
+    eprintln!("Warming up {count} agent(s) in team '{team}'...");
+
+    // Delegate pong task to each agent
+    let mut task_ids: Vec<(String, String, Instant)> = Vec::new(); // (agent_name, task_id, start_time)
+    for agent_val in &targets {
+        let name = agent_val["name"].as_str().unwrap_or("?");
+        let start = Instant::now();
+        let result = run_delegate_result(
+            sock, team, name, "Reply with exactly one word: pong",
+            Some("warmup-ping".to_string()), Some(3), &[], &[], None, true,
+        );
+        match result {
+            Ok(v) => {
+                if let Some(tid) = v["result"]["task"]["id"].as_str() {
+                    task_ids.push((name.to_string(), tid.to_string(), start));
+                } else {
+                    eprintln!("  {name}: failed to create task");
+                }
+            }
+            Err(e) => eprintln!("  {name}: delegate error: {e}"),
+        }
+    }
+
+    if task_ids.is_empty() {
+        eprintln!("No warmup tasks created");
+        process::exit(1);
+    }
+
+    // Poll for completion
+    let deadline = Instant::now() + Duration::from_secs(timeout as u64);
+    let mut completed: Vec<(String, u128, String)> = Vec::new(); // (agent, ms, result)
+    let mut pending = task_ids.clone();
+
+    while !pending.is_empty() && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(500));
+        let mut still_pending = Vec::new();
+        for (agent_name, tid, start) in &pending {
+            if let Ok(v) = rpc_call(sock, "team.task.get", json!({
+                "team_name": team, "task_id": tid,
+            })) {
+                let status = v["result"]["status"].as_str().unwrap_or("");
+                if status == "completed" || status == "review_ready" {
+                    let ms = start.elapsed().as_millis();
+                    let result = v["result"]["result"].as_str().unwrap_or("").to_string();
+                    completed.push((agent_name.clone(), ms, result));
+                    continue;
+                }
+            }
+            still_pending.push((agent_name.clone(), tid.clone(), *start));
+        }
+        pending = still_pending;
+    }
+
+    // Print results
+    let pass = completed.len();
+    let fail = task_ids.len() - pass;
+    println!();
+    for (name, ms, result) in &completed {
+        let icon = if result.to_lowercase().contains("pong") { "✓" } else { "?" };
+        println!("  {icon} {name}: {ms}ms");
+    }
+    for (name, _, start) in &pending {
+        let ms = start.elapsed().as_millis();
+        println!("  ✗ {name}: timeout ({ms}ms)");
+    }
+    println!();
+    if fail == 0 {
+        println!("All {pass} agent(s) warm ✓");
+    } else {
+        println!("{pass} warm, {fail} timed out");
+        process::exit(1);
+    }
 }
 
 fn run_brief(sock: &PathBuf, team: &str, target: &str, lines: u32) {
