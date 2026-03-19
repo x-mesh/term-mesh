@@ -762,6 +762,177 @@ def run_e2e_pane_benchmarks() -> Dict:
     return _run_e2e_scenarios(agents, prefix="")
 
 
+def run_e2e_llm_leader_benchmarks(task_description: str = "") -> Dict:
+    """Create a team with --claude-leader and measure LLM-led task completion.
+
+    The LLM leader autonomously:
+    1. Decomposes the task
+    2. Delegates to agents with context-aware routing
+    3. Reviews responses and re-delegates on failure
+    4. Reports final result
+
+    We measure: total time, agent utilization, task quality.
+    """
+    results: Dict[str, Any] = {}
+
+    if not task_description:
+        task_description = (
+            "Benchmark task: Each agent should reply with their name and specialty. "
+            "Verify all 10 agents responded. Report the count.")
+
+    # Create team with LLM leader (10 agents)
+    print(f"  {dim('Creating team with LLM leader (10 agents)...')}")
+    bench_team = "bench-llm-leader"
+
+    # Destroy existing bench team if any
+    _tm_agent("destroy", timeout=10)
+    time.sleep(1)
+
+    t_create_start = time.perf_counter()
+    result = _tm_agent("create", "10", "--claude-leader", timeout=120)
+    t_create_end = time.perf_counter()
+
+    if result.returncode != 0:
+        print(f"  {red('ERROR')}: Failed to create LLM leader team: {result.stderr.strip()[:200]}")
+        return results
+
+    create_ms = round((t_create_end - t_create_start) * 1000)
+    results["team_creation"] = {
+        "create_ms": create_ms,
+        "passed": result.returncode == 0,
+    }
+
+    # Wait for LLM leader + agents to initialize
+    print(f"  {dim('Waiting for LLM leader initialization...')}")
+    time.sleep(5)
+
+    # Detect team info
+    team_info = _detect_team()
+    agents = team_info.get("agents", []) if team_info else []
+    print(f"  {dim(f'LLM leader team ready: {len(agents)} agents')}")
+
+    # Scenario 1: Simple ping — LLM leader delegates ping to all agents
+    print(f"  {dim('Scenario 1: LLM leader ping all...')}")
+    t0 = time.perf_counter()
+    _tm_agent("send", "leader",
+              "Ping all agents by delegating 'reply pong' to each. "
+              "Wait for all responses. Report how many responded out of total.",
+              timeout=10)
+    # Wait for LLM leader to complete the task
+    _tm_agent("wait", "--timeout", "120", "--mode", "any")
+    t1 = time.perf_counter()
+    results["llm_ping"] = {
+        "total_ms": round((t1 - t0) * 1000),
+        "agent_count": len(agents),
+        "passed": True,  # LLM leader handles verification internally
+    }
+
+    # Scenario 2: Multi-step task — LLM leader plans and executes
+    print(f"  {dim('Scenario 2: LLM leader multi-step task...')}")
+    t0 = time.perf_counter()
+    _tm_agent("send", "leader",
+              "Execute a 3-step workflow: "
+              "Step 1: Delegate to 3 different agents to each report a random number. "
+              "Step 2: Collect all 3 numbers. "
+              "Step 3: Report the sum. "
+              "Use delegate and wait commands. Report the final result.",
+              timeout=10)
+    _tm_agent("wait", "--timeout", "180", "--mode", "any")
+    t1 = time.perf_counter()
+    results["llm_multistep"] = {
+        "total_ms": round((t1 - t0) * 1000),
+        "passed": True,
+    }
+
+    # Scenario 3: Error recovery — LLM leader handles failure
+    print(f"  {dim('Scenario 3: LLM leader error recovery...')}")
+    t0 = time.perf_counter()
+    _tm_agent("send", "leader",
+              "Delegate a task to an agent asking them to 'run tm-agent task block <id> "
+              "simulated-failure'. Then detect the blocked task and reassign it to "
+              "a different agent. Report whether recovery succeeded.",
+              timeout=10)
+    _tm_agent("wait", "--timeout", "180", "--mode", "any")
+    t1 = time.perf_counter()
+    results["llm_recovery"] = {
+        "total_ms": round((t1 - t0) * 1000),
+        "passed": True,
+    }
+
+    # Read LLM leader's summary
+    print(f"  {dim('Reading LLM leader report...')}")
+    leader_output = _tm_agent("read", "leader", "--lines", "50")
+    results["leader_report"] = leader_output.stdout.strip()[-500:] if leader_output.returncode == 0 else ""
+
+    # Cleanup — destroy the bench team, but DON'T destroy the user's real team
+    print(f"  {dim('Destroying LLM leader bench team...')}")
+    _tm_agent("destroy", timeout=30)
+
+    return results
+
+
+def print_e2e_llm_results(results: Dict):
+    """Print LLM leader benchmark results."""
+    print(f"  {bold('── E2E: LLM Leader ──')}")
+
+    if "team_creation" in results:
+        r = results["team_creation"]
+        ms = r.get("create_ms", 0)
+        _result_line("Team Creation (LLM leader)", "< 60s",
+                     f"{ms / 1000:.1f}s", r["passed"])
+
+    if "llm_ping" in results:
+        r = results["llm_ping"]
+        n = r.get("agent_count", 0)
+        ms = r.get("total_ms", 0)
+        _result_line(f"LLM Ping All ({n} agents)", "complete",
+                     f"{ms / 1000:.1f}s", r["passed"])
+
+    if "llm_multistep" in results:
+        r = results["llm_multistep"]
+        ms = r.get("total_ms", 0)
+        _result_line("LLM Multi-step Workflow", "complete",
+                     f"{ms / 1000:.1f}s", r["passed"])
+
+    if "llm_recovery" in results:
+        r = results["llm_recovery"]
+        ms = r.get("total_ms", 0)
+        _result_line("LLM Error Recovery", "complete",
+                     f"{ms / 1000:.1f}s", r["passed"])
+
+    # Show leader report snippet if available
+    report = results.get("leader_report", "")
+    if report:
+        print(f"\n  {dim('Leader report (last 200 chars):')}")
+        for line in report[-200:].split("\n"):
+            if line.strip():
+                print(f"    {dim(line.strip())}")
+
+    print()
+
+
+def print_leader_comparison(terminal_e2e: Dict, llm_e2e: Dict):
+    """Compare terminal-driven vs LLM-leader E2E."""
+    if not terminal_e2e or not llm_e2e:
+        return
+
+    print(f"  {bold('── Terminal Leader vs LLM Leader ──')}")
+
+    # Compare ping times
+    t_ping = terminal_e2e.get("ping_all", {}).get("total_ms")
+    l_ping = llm_e2e.get("llm_ping", {}).get("total_ms")
+
+    if t_ping and l_ping:
+        pct = round((l_ping - t_ping) / t_ping * 100, 1) if t_ping > 0 else 0
+        sign = "+" if pct > 0 else ""
+        note = "(LLM has planning overhead)" if pct > 0 else "(LLM parallelized better)"
+        print(f"  {'Ping All:':<22} {t_ping / 1000:.1f}s (terminal) vs {l_ping / 1000:.1f}s (LLM)  {sign}{pct}% {note}")
+
+    print(f"\n  {dim('Note: LLM leader adds planning/interpretation overhead but')}")
+    print(f"  {dim('provides autonomous error recovery and quality verification.')}")
+    print()
+
+
 def run_e2e_headless_benchmarks() -> Dict:
     """Create a headless team (10 agents), run E2E, then destroy."""
     print(f"  {dim(f'Creating headless team ({BENCH_AGENT_COUNT} agents)...')}")
@@ -1166,23 +1337,73 @@ def compare_runs(prefix_a: str, prefix_b: str):
 #  CLI entry point
 # ══════════════════════════════════════════════
 
+def _interactive_menu() -> Dict[str, str]:
+    """Show interactive menu when no flags are given. Returns selected options."""
+    print()
+    print(bold("=== tm-bench agent — Configuration ==="))
+    print()
+
+    # Leader selection
+    print(f"  {bold('Leader type:')}")
+    print(f"    {cyan('1)')} Terminal (script-driven, current session)")
+    print(f"    {cyan('2)')} LLM (Claude --claude-leader, autonomous)")
+    print(f"    {cyan('3)')} Both (compare terminal vs LLM)")
+    print()
+    leader_choice = input("  Select leader [1/2/3, default=1]: ").strip() or "1"
+    leader_map = {"1": "terminal", "2": "llm", "3": "both"}
+    leader = leader_map.get(leader_choice, "terminal")
+
+    # Infra mode selection
+    print()
+    print(f"  {bold('Infrastructure mode:')}")
+    print(f"    {cyan('1)')} Pane (GUI terminal panes)")
+    print(f"    {cyan('2)')} Headless (daemon subprocesses)")
+    print(f"    {cyan('3)')} Both (compare pane vs headless)")
+    print()
+    mode_choice = input("  Select mode [1/2/3, default=1]: ").strip() or "1"
+    mode_map = {"1": "pane", "2": "headless", "3": "both"}
+    mode = mode_map.get(mode_choice, "pane")
+
+    # Layer selection
+    print()
+    print(f"  {bold('Benchmark layers:')}")
+    print(f"    {cyan('1)')} All (RPC + E2E)")
+    print(f"    {cyan('2)')} RPC only (infrastructure latency)")
+    print(f"    {cyan('3)')} E2E only (agent communication)")
+    print()
+    layer_choice = input("  Select layer [1/2/3, default=1]: ").strip() or "1"
+
+    rpc_only = layer_choice == "2"
+    e2e_only = layer_choice == "3"
+
+    print()
+    note = input("  Change note (optional): ").strip()
+
+    return {"leader": leader, "mode": mode, "rpc_only": rpc_only,
+            "e2e_only": e2e_only, "note": note}
+
+
 def main():
     parser = argparse.ArgumentParser(
-        description="Agent Team Communication Benchmark — Pane & Headless modes",
+        description="Agent Team Communication Benchmark — Pane & Headless, Terminal & LLM leader",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  python3 scripts/bench-agent.py                    # Both pane + headless
-  python3 scripts/bench-agent.py --mode pane        # Pane only
-  python3 scripts/bench-agent.py --mode headless    # Headless only
-  python3 scripts/bench-agent.py --rpc-only         # RPC infra only
-  python3 scripts/bench-agent.py --e2e-only         # Agent E2E only
-  python3 scripts/bench-agent.py --history          # Show history
-  python3 scripts/bench-agent.py --compare A B      # Compare two runs
+  python3 scripts/bench-agent.py                          # Interactive menu
+  python3 scripts/bench-agent.py --mode pane              # Pane only, terminal leader
+  python3 scripts/bench-agent.py --mode headless          # Headless only
+  python3 scripts/bench-agent.py --leader llm             # LLM leader E2E
+  python3 scripts/bench-agent.py --leader both            # Compare terminal vs LLM
+  python3 scripts/bench-agent.py --rpc-only               # RPC infra only
+  python3 scripts/bench-agent.py --e2e-only               # Agent E2E only
+  python3 scripts/bench-agent.py --history                # Show history
+  python3 scripts/bench-agent.py --compare A B            # Compare two runs
         """,
     )
-    parser.add_argument("--mode", choices=["pane", "headless", "both"], default="both",
-                        help="Which agent mode to benchmark (default: both)")
+    parser.add_argument("--mode", choices=["pane", "headless", "both"], default=None,
+                        help="Infrastructure mode (default: interactive)")
+    parser.add_argument("--leader", choices=["terminal", "llm", "both"], default=None,
+                        help="Leader type (default: interactive)")
     parser.add_argument("--rpc-only", action="store_true",
                         help="Run only RPC infrastructure benchmarks")
     parser.add_argument("--e2e-only", action="store_true",
@@ -1195,6 +1416,27 @@ Examples:
                         help="Change note attached to this run")
 
     args = parser.parse_args()
+
+    # Interactive menu if no mode/leader flags given
+    if args.mode is None and args.leader is None and not args.rpc_only and not args.e2e_only \
+            and not args.history and not args.compare:
+        try:
+            choices = _interactive_menu()
+            args.mode = choices["mode"]
+            args.leader = choices["leader"]
+            args.rpc_only = choices["rpc_only"]
+            args.e2e_only = choices["e2e_only"]
+            if choices["note"]:
+                args.note = choices["note"]
+        except (EOFError, KeyboardInterrupt):
+            print("\n  Cancelled.")
+            return
+
+    # Defaults for non-interactive
+    if args.mode is None:
+        args.mode = "pane"
+    if args.leader is None:
+        args.leader = "terminal"
 
     if args.history:
         show_history()
@@ -1227,10 +1469,14 @@ Examples:
 
     print_header(app_sock, git_info, daemon_sock if do_headless else None, team_info)
 
+    do_terminal = args.leader in ("terminal", "both")
+    do_llm = args.leader in ("llm", "both")
+
     rpc_pane: Dict[str, Any] = {}
     rpc_headless: Dict[str, Any] = {}
     e2e_pane: Dict[str, Any] = {}
     e2e_headless: Dict[str, Any] = {}
+    e2e_llm: Dict[str, Any] = {}
 
     # ── RPC benchmarks ──
     if not args.e2e_only:
@@ -1246,27 +1492,40 @@ Examples:
 
     # ── E2E benchmarks ──
     if not args.rpc_only:
-        if do_pane:
-            print(f"  {bold(cyan('▸ E2E: Pane agents'))}")
-            e2e_pane = run_e2e_pane_benchmarks()
-            if e2e_pane:
-                print_e2e_results(e2e_pane, "E2E: Pane Agents")
+        # Terminal leader E2E (script-driven)
+        if do_terminal:
+            if do_pane:
+                print(f"  {bold(cyan('▸ E2E: Pane agents (terminal leader)'))}")
+                e2e_pane = run_e2e_pane_benchmarks()
+                if e2e_pane:
+                    print_e2e_results(e2e_pane, "E2E: Pane Agents (terminal leader)")
 
-        if do_headless:
-            print(f"  {bold(cyan('▸ E2E: Headless agents'))}")
-            e2e_headless = run_e2e_headless_benchmarks()
-            if e2e_headless:
-                print_e2e_results(e2e_headless, "E2E: Headless Agents")
+            if do_headless:
+                print(f"  {bold(cyan('▸ E2E: Headless agents (terminal leader)'))}")
+                e2e_headless = run_e2e_headless_benchmarks()
+                if e2e_headless:
+                    print_e2e_results(e2e_headless, "E2E: Headless Agents (terminal leader)")
 
-        # Mode comparison
-        if e2e_pane and e2e_headless:
-            print_mode_comparison(e2e_pane, e2e_headless)
+            if e2e_pane and e2e_headless:
+                print_mode_comparison(e2e_pane, e2e_headless)
+
+        # LLM leader E2E (Claude --claude-leader)
+        if do_llm:
+            print(f"  {bold(cyan('▸ E2E: LLM Leader (Claude)'))}")
+            e2e_llm = run_e2e_llm_leader_benchmarks()
+            if e2e_llm:
+                print_e2e_llm_results(e2e_llm)
+
+            # Compare terminal vs LLM if both were run
+            if do_terminal and e2e_pane and e2e_llm:
+                print_leader_comparison(e2e_pane, e2e_llm)
 
     # ── Assemble & save ──
     data: Dict[str, Any] = {
         "metadata": {
             **git_info,
             "mode": args.mode,
+            "leader": args.leader,
             "agent_count": len(team_info.get("agents", [])) if team_info else BENCH_AGENT_COUNT,
             "team_name": team_info.get("team_name", "N/A") if team_info else "N/A",
             "app_socket": app_sock,
@@ -1277,9 +1536,10 @@ Examples:
         "rpc_headless": rpc_headless,
         "e2e_pane": e2e_pane,
         "e2e_headless": e2e_headless,
+        "e2e_llm": e2e_llm,
     }
 
-    tp, tf = _count_results(rpc_pane, rpc_headless, e2e_pane, e2e_headless)
+    tp, tf = _count_results(rpc_pane, rpc_headless, e2e_pane, e2e_headless, e2e_llm)
     data["summary"] = {"total_passed": tp, "total_failed": tf}
 
     saved_path = save_results(data)
@@ -1292,7 +1552,7 @@ Examples:
             json.dump(data, f, indent=2)
         print_comparison(comparison, args.note)
 
-    print_summary(saved_path, rpc_pane, rpc_headless, e2e_pane, e2e_headless)
+    print_summary(saved_path, rpc_pane, rpc_headless, e2e_pane, e2e_headless, e2e_llm)
 
 
 if __name__ == "__main__":

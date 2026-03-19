@@ -63,7 +63,7 @@ Respond with \"Agent {agent} ready.\" to confirm.",
 // ── CLI definition ───────────────────────────────────────────────────
 
 #[derive(Parser)]
-#[command(name = "tm-agent", about = "term-mesh team CLI — unified agent & leader tool")]
+#[command(name = "tm-agent", about = "term-mesh team CLI — unified agent & leader tool", version)]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
