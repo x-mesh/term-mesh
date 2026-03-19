@@ -987,10 +987,10 @@ final class TeamOrchestrator: ObservableObject {
             }
         }
 
-        // Auto-warmup: trigger each agent's first API call to warm Anthropic prompt cache.
-        // Cold API RTT ~700-900ms → hot ~200-300ms after first call. 15s delay allows
-        // Claude Code CLI to fully initialize before sending the warmup task.
-        scheduleAutoWarmup(team: team, tabManager: tabManager)
+        // Auto-warmup disabled: causes Enter swallowed + high CPU load with 10+ agents.
+        // The 2s-staggered approach still floods the main queue with concurrent GCD dispatches.
+        // Real tasks serve as implicit warmup — first-task latency is acceptable (~2-3s).
+        // scheduleAutoWarmup(team: team, tabManager: tabManager)
 
         return team
     }
