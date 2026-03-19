@@ -1530,7 +1530,7 @@ final class TeamOrchestrator: ObservableObject {
         return lines.joined(separator: "\n")
     }
 
-    private func sendTextToPanel(workspaceId: UUID, panelId: UUID, text: String, tabManager: TabManager, enterDelay: TimeInterval = 0.10) -> Bool {
+    private func sendTextToPanel(workspaceId: UUID, panelId: UUID, text: String, tabManager: TabManager, enterDelay: TimeInterval = 0.02) -> Bool {
         // Try the provided tabManager first, then fall back to global surface lookup
         // for cross-window scenarios (e.g. broadcast when agents are in a different window).
         let panel: TerminalPanel
@@ -1555,23 +1555,28 @@ final class TeamOrchestrator: ObservableObject {
         let trimmed = text.replacingOccurrences(of: "[\\r\\n]+$", with: "", options: .regularExpression)
         guard !trimmed.isEmpty else { return true }
 
-        // Hybrid approach: sendIMEText for atomic text+Enter (PRESS+RELEASE pairs),
-        // plus a safety Enter retry in case the first one is missed.
-        // sendIMEText eliminates the 100ms enterDelay by sending text and Return
-        // synchronously with proper key state tracking.
-        DispatchQueue.main.async { [panel] in
-            panel.sendIMEText(trimmed, withReturn: true)
+        // Send text and Enter via DispatchQueue.main (GCD).
+        // TUI apps (Claude Code) need a gap between text input and Return
+        // to process the text into their input buffer.
+        DispatchQueue.main.async {
+            panel.sendInputText(trimmed)
+        }
+
+        // Primary Enter — use STRONG reference [panel] to prevent deallocation
+        // during GCD scheduling under high concurrent load (10+ agents).
+        DispatchQueue.main.asyncAfter(deadline: .now() + enterDelay) { [panel] in
+            panel.sendInputText("\n")
             #if DEBUG
-            dlog("[team.sendTextToPanel.ime] panelId=\(panelId.uuidString.prefix(8)) textLen=\(trimmed.count)")
+            dlog("[team.sendTextToPanel.enter1] panelId=\(panelId.uuidString.prefix(8)) delay=\(enterDelay)")
             #endif
         }
 
         // Safety retry: if primary Enter was missed (e.g. TUI was busy),
         // send another Enter later. Double-Enter on an idle prompt is harmless.
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) { [panel] in
+        DispatchQueue.main.asyncAfter(deadline: .now() + enterDelay + 0.15) { [panel] in
             panel.sendInputText("\n")
             #if DEBUG
-            dlog("[team.sendTextToPanel.retryEnter] panelId=\(panelId.uuidString.prefix(8))")
+            dlog("[team.sendTextToPanel.enter2] panelId=\(panelId.uuidString.prefix(8)) retry")
             #endif
         }
 
