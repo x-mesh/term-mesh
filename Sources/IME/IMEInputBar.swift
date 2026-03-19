@@ -199,6 +199,12 @@ struct IMEInputBar: View {
 
     var body: some View {
         VStack(spacing: 0) {
+            // Slash command picker (above input row, expands upward into available space)
+            if showSlashPicker && !filteredSlashCommands.isEmpty {
+                slashCommandPickerView
+                    .transition(.opacity.combined(with: .move(edge: .top)))
+            }
+
             // Input row
             HStack(alignment: .top, spacing: 6) {
                 Image(systemName: "keyboard")
@@ -263,12 +269,6 @@ struct IMEInputBar: View {
             .padding(.horizontal, 12)
             .padding(.top, 6)
             .padding(.bottom, 4)
-
-            // Slash command picker (inline, inside IME bar between editor and hint bar)
-            if showSlashPicker && !filteredSlashCommands.isEmpty {
-                slashCommandPickerView
-                    .transition(.opacity.combined(with: .move(edge: .bottom)))
-            }
 
             // Hint bar + status indicators (same row)
             HStack(spacing: 12) {
