@@ -997,33 +997,41 @@ final class TeamOrchestrator: ObservableObject {
 
     /// Send a lightweight "pong" task to each agent after a delay, warming the Anthropic prompt cache.
     /// This reduces first-real-task latency from ~10s (cold) to ~1.2s (hot cache).
+    /// Staggers agent warmups by 2s each to avoid flooding the GCD main queue with concurrent
+    /// Enter keystrokes, which can cause TUI input drops (Enter swallowed) and failed deliveries.
     private func scheduleAutoWarmup(team: Team, tabManager: TabManager) {
         let warmupDelay: TimeInterval = 15.0
+        let perAgentStagger: TimeInterval = 2.0  // 2s between each agent warmup
         let teamName = team.id
+        let agentCount = team.agents.count
 
-        DispatchQueue.main.asyncAfter(deadline: .now() + warmupDelay) { [weak self] in
-            guard let self = self, self.teams[teamName] != nil else { return }
+        for (index, agent) in team.agents.enumerated() {
+            let agentDelay = warmupDelay + Double(index) * perAgentStagger
+            let agentName = agent.name
 
-            // Resolve tabManager at execution time (original ref may be stale after 15s)
-            let currentTabManager = self.resolveTabManager(teamName: teamName) ?? tabManager
+            DispatchQueue.main.asyncAfter(deadline: .now() + agentDelay) { [weak self] in
+                guard let self = self, self.teams[teamName] != nil else { return }
 
-            var sent = 0
-            for agent in team.agents {
+                let currentTabManager = self.resolveTabManager(teamName: teamName) ?? tabManager
+
                 let result = self.delegateToAgent(
                     teamName: teamName,
-                    agentName: agent.name,
+                    agentName: agentName,
                     text: "Reply with exactly one word: pong",
                     taskTitle: "warmup-ping",
                     priority: 3,
                     tabManager: currentTabManager
                 )
-                if result?.textDelivered == true { sent += 1 }
+                let delivered = result?.textDelivered == true
                 #if DEBUG
-                dlog("[team] auto-warmup \(result?.textDelivered == true ? "sent" : "FAILED") to \(agent.name) in team '\(teamName)'")
+                dlog("[team] auto-warmup \(delivered ? "sent" : "FAILED") to \(agentName) in team '\(teamName)' (delay=\(agentDelay)s)")
                 #endif
-            }
 
-            Logger.team.info("auto-warmup: \(sent)/\(team.agents.count) agent(s) warmed in team '\(teamName, privacy: .public)'")
+                // Log summary after last agent
+                if index == agentCount - 1 {
+                    Logger.team.info("auto-warmup: dispatched \(agentCount) agent(s) in team '\(teamName, privacy: .public)' (staggered \(perAgentStagger)s each)")
+                }
+            }
         }
     }
 

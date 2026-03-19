@@ -176,7 +176,12 @@ struct TermMeshApp: App {
     }
 
     var body: some Scene {
-        WindowGroup {
+        // Restrict WindowGroup to only create the initial primary window.
+        // Use a unique ID that the system won't match for state-restoration
+        // or external events, preventing duplicate scene creation.
+        // All additional windows are created via AppDelegate.createMainWindow()
+        // with their own TabManager, avoiding the shared-@StateObject problem.
+        WindowGroup(id: "term-mesh-primary") {
             ContentView(updateViewModel: appDelegate.updateViewModel, windowId: primaryWindowId)
                 .environmentObject(tabManager)
                 .environmentObject(notificationStore)
@@ -191,6 +196,11 @@ struct TermMeshApp: App {
 #if DEBUG
                     if termMeshEnv("UI_TEST_MODE") == "1" {
                         UpdateLogStore.shared.append("ui test: TermMeshApp onAppear")
+                    }
+                    let existingWindows = appDelegate.mainWindowContexts.count
+                    NSLog("[TermMeshApp] WindowGroup.onAppear: primaryWindowId=\(primaryWindowId.uuidString.prefix(8)) existingWindows=\(existingWindows)")
+                    if existingWindows > 0 {
+                        NSLog("[TermMeshApp] ⚠️ WindowGroup.onAppear DUPLICATE SCENE detected! existingWindows=\(existingWindows)")
                     }
 #endif
                     // Start the Unix socket controller for programmatic access
@@ -258,6 +268,11 @@ struct TermMeshApp: App {
                     }
                 }
         }
+        // Prevent macOS from creating duplicate WindowGroup scenes via
+        // state restoration, dock clicks, or external events. Only the
+        // initial scene should use this WindowGroup; additional windows
+        // are NSWindow-backed via AppDelegate.createMainWindow().
+        .handlesExternalEvents(matching: Set(["term-mesh-primary"]))
         .windowStyle(.hiddenTitleBar)
         .commands {
             // MARK: - Agents Menu (combined agents + worktrees)

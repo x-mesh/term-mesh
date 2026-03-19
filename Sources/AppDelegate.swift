@@ -245,6 +245,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
             }
         }
         NSWindow.allowsAutomaticWindowTabbing = false
+        // Disable macOS window state restoration. We manage our own session
+        // restore via TabManager/SessionRestoreSettings. Without this, macOS
+        // can recreate previously-open NSWindows on launch, producing ghost
+        // duplicates that share the SwiftUI WindowGroup's tabManager.
+        UserDefaults.standard.set(false, forKey: "NSQuitAlwaysKeepsWindows")
         disableNativeTabbingShortcut()
         ensureApplicationIcon()
         if !isRunningUnderXCTest {
@@ -335,6 +340,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         return object
     }
 #endif
+
+    // Prevent dock-click from creating a new SwiftUI WindowGroup window.
+    // Instead, activate the existing main window. This prevents duplicate
+    // windows that share the same @StateObject tabManager.
+    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
+        if flag {
+            // Already have visible windows — just activate them
+            return false
+        }
+        // No visible windows: show the most recent main window instead of
+        // letting SwiftUI WindowGroup create a duplicate scene.
+        if let window = mainWindowContexts.values.compactMap(\.window).first {
+            window.makeKeyAndOrderFront(nil)
+            return false
+        }
+        // No existing window at all — allow the system to create one
+        return true
+    }
 
     func applicationDidBecomeActive(_ notification: Notification) {
         sentryBreadcrumb("app.didBecomeActive", category: "lifecycle", data: [
@@ -968,6 +991,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
     @discardableResult
     func createMainWindow(initialWorkingDirectory: String? = nil) -> UUID {
         let windowId = UUID()
+        let existingCount = mainWindowContexts.count
+        #if DEBUG
+        dlog("mainWindow.CREATE windowId=\(windowId.uuidString.prefix(8)) existingWindows=\(existingCount) cwd=\(initialWorkingDirectory ?? "nil") caller=\(Thread.callStackSymbols.prefix(5).joined(separator: " → "))")
+        #endif
         let tabManager = TabManager(initialWorkingDirectory: initialWorkingDirectory)
         let sidebarState = SidebarState()
         let sidebarSelectionState = SidebarSelectionState()
@@ -991,6 +1018,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         window.titlebarAppearsTransparent = true
         window.isMovableByWindowBackground = false
         window.isMovable = true
+        // Disable macOS state restoration for this window. Without this,
+        // macOS may auto-recreate closed windows on next launch, producing
+        // duplicates that share the SwiftUI WindowGroup's @StateObject tabManager.
+        window.isRestorable = false
         window.center()
         window.contentView = NSHostingView(rootView: root)
 
