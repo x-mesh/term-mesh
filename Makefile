@@ -50,7 +50,13 @@ build:
 		exit 1; \
 	fi
 	@echo "==> Building Rust daemon (release)..."
-	@cd daemon && cargo build --release 2>&1 | grep -v "Compiling " || true
+	@cd daemon && cargo build --release 2>&1 | tee /tmp/term-mesh-cargo.log | grep -v "Compiling "; \
+		RESULT=$${PIPESTATUS[0]}; \
+		if [ $$RESULT -ne 0 ]; then \
+			echo "==> Rust daemon build FAILED (exit $$RESULT). Full log: /tmp/term-mesh-cargo.log"; \
+			tail -20 /tmp/term-mesh-cargo.log; \
+			exit 1; \
+		fi
 	@echo "==> Build complete"
 
 daemon:
@@ -79,6 +85,7 @@ deploy: build
 	@mkdir -p "$(INSTALL_APP)/Contents/Resources/bin"
 	@cp "$(PROJECT_DIR)/daemon/target/release/term-meshd" "$(INSTALL_APP)/Contents/Resources/bin/term-meshd"
 	@cp "$(PROJECT_DIR)/daemon/target/release/term-mesh-run" "$(INSTALL_APP)/Contents/Resources/bin/term-mesh-run"
+	@-cp "$(PROJECT_DIR)/daemon/target/release/tm-agent" "$(INSTALL_APP)/Contents/Resources/bin/tm-agent" 2>/dev/null || true
 	@echo "==> Re-signing app bundle (binaries added after initial sign)..."
 	@codesign --force --deep --sign - "$(INSTALL_APP)"
 	@# Update symlinks (term-mesh = Swift CLI from app bundle, term-mesh-run = Rust PTY wrapper)
@@ -115,7 +122,13 @@ prod:
 			exit 1; \
 		fi
 	@echo "==> Building Rust daemon (release)..."
-	@cd daemon && cargo build --release 2>&1 | grep -v "Compiling " || true
+	@cd daemon && cargo build --release 2>&1 | tee /tmp/term-mesh-cargo.log | grep -v "Compiling "; \
+		RESULT=$${PIPESTATUS[0]}; \
+		if [ $$RESULT -ne 0 ]; then \
+			echo "==> Rust daemon build FAILED (exit $$RESULT). Full log: /tmp/term-mesh-cargo.log"; \
+			tail -20 /tmp/term-mesh-cargo.log; \
+			exit 1; \
+		fi
 	@echo ""
 	@echo "================================================"
 	@echo "  Release build complete!"
@@ -159,17 +172,24 @@ deploy-prod: prod
 	@echo "==> Deployed Release to $(INSTALL_APP)"
 
 dmg: prod
+	@echo "==> Verifying daemon binaries..."
+	@test -f "$(PROJECT_DIR)/daemon/target/release/term-meshd" || \
+		(echo "ERROR: term-meshd not found. Run 'cd daemon && cargo build --release' first." && exit 1)
+	@test -f "$(PROJECT_DIR)/daemon/target/release/term-mesh-run" || \
+		(echo "ERROR: term-mesh-run not found. Run 'cd daemon && cargo build --release' first." && exit 1)
 	@echo "==> Creating DMG..."
 	@rm -f "$(DMG_NAME)"
 	@if command -v create-dmg >/dev/null 2>&1; then \
-		STAGING=$$(mktemp -d); \
-		cp -R "$(PROD_APP)" "$$STAGING/term-mesh.app"; \
-		mkdir -p "$$STAGING/term-mesh.app/Contents/Resources/bin"; \
-		cp "$(PROJECT_DIR)/daemon/target/release/term-meshd" "$$STAGING/term-mesh.app/Contents/Resources/bin/term-meshd"; \
-		cp "$(PROJECT_DIR)/daemon/target/release/term-mesh-run" "$$STAGING/term-mesh.app/Contents/Resources/bin/term-mesh-run"; \
-		cp "$(PROJECT_DIR)/daemon/target/release/tm-agent" "$$STAGING/term-mesh.app/Contents/Resources/bin/tm-agent" 2>/dev/null || true; \
-		echo "==> Re-signing app bundle for DMG..."; \
-		codesign --force --deep --sign - "$$STAGING/term-mesh.app"; \
+		STAGING=$$(mktemp -d) && \
+		cp -R "$(PROD_APP)" "$$STAGING/term-mesh.app" && \
+		mkdir -p "$$STAGING/term-mesh.app/Contents/Resources/bin" && \
+		cp "$(PROJECT_DIR)/daemon/target/release/term-meshd" "$$STAGING/term-mesh.app/Contents/Resources/bin/term-meshd" && \
+		cp "$(PROJECT_DIR)/daemon/target/release/term-mesh-run" "$$STAGING/term-mesh.app/Contents/Resources/bin/term-mesh-run" && \
+		(cp "$(PROJECT_DIR)/daemon/target/release/tm-agent" "$$STAGING/term-mesh.app/Contents/Resources/bin/tm-agent" 2>/dev/null || true) && \
+		echo "==> Re-signing app bundle for DMG..." && \
+		codesign --force --deep --sign - "$$STAGING/term-mesh.app" && \
+		echo "==> Bundled binaries:" && \
+		ls -la "$$STAGING/term-mesh.app/Contents/Resources/bin/" && \
 		create-dmg \
 			--volname "term-mesh" \
 			--window-pos 200 120 \
@@ -182,15 +202,17 @@ dmg: prod
 		rm -rf "$$STAGING"; \
 	else \
 		echo "==> create-dmg not found, using hdiutil fallback..."; \
-		STAGING=$$(mktemp -d); \
-		cp -R "$(PROD_APP)" "$$STAGING/term-mesh.app"; \
-		mkdir -p "$$STAGING/term-mesh.app/Contents/Resources/bin"; \
-		cp "$(PROJECT_DIR)/daemon/target/release/term-meshd" "$$STAGING/term-mesh.app/Contents/Resources/bin/term-meshd"; \
-		cp "$(PROJECT_DIR)/daemon/target/release/term-mesh-run" "$$STAGING/term-mesh.app/Contents/Resources/bin/term-mesh-run"; \
-		cp "$(PROJECT_DIR)/daemon/target/release/tm-agent" "$$STAGING/term-mesh.app/Contents/Resources/bin/tm-agent" 2>/dev/null || true; \
-		echo "==> Re-signing app bundle for DMG..."; \
-		codesign --force --deep --sign - "$$STAGING/term-mesh.app"; \
-		ln -s /Applications "$$STAGING/Applications"; \
+		STAGING=$$(mktemp -d) && \
+		cp -R "$(PROD_APP)" "$$STAGING/term-mesh.app" && \
+		mkdir -p "$$STAGING/term-mesh.app/Contents/Resources/bin" && \
+		cp "$(PROJECT_DIR)/daemon/target/release/term-meshd" "$$STAGING/term-mesh.app/Contents/Resources/bin/term-meshd" && \
+		cp "$(PROJECT_DIR)/daemon/target/release/term-mesh-run" "$$STAGING/term-mesh.app/Contents/Resources/bin/term-mesh-run" && \
+		(cp "$(PROJECT_DIR)/daemon/target/release/tm-agent" "$$STAGING/term-mesh.app/Contents/Resources/bin/tm-agent" 2>/dev/null || true) && \
+		echo "==> Re-signing app bundle for DMG..." && \
+		codesign --force --deep --sign - "$$STAGING/term-mesh.app" && \
+		echo "==> Bundled binaries:" && \
+		ls -la "$$STAGING/term-mesh.app/Contents/Resources/bin/" && \
+		ln -s /Applications "$$STAGING/Applications" && \
 		hdiutil create -volname "term-mesh" -srcfolder "$$STAGING" -ov -format UDZO "$(DMG_NAME)"; \
 		rm -rf "$$STAGING"; \
 	fi
