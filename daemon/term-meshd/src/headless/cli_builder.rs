@@ -20,6 +20,22 @@ fn base_env(
     // TERMMESH_SOCKET → Swift app socket (for team.* commands via tm-agent).
     // Falls back to daemon socket when no app socket is provided (CLI-only mode).
     let primary_socket = app_socket_path.unwrap_or(daemon_socket);
+
+    // Ensure the daemon's own binary directory (Resources/bin) is in PATH.
+    // When the app is launched from Finder/Spotlight, macOS provides a minimal PATH
+    // that doesn't include Resources/bin. Pane mode handles this in TeamOrchestrator.swift,
+    // but headless mode inherits the daemon's PATH which may be missing it.
+    let daemon_bin_dir = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.to_string_lossy().to_string()))
+        .unwrap_or_default();
+    let current_path = std::env::var("PATH").unwrap_or_default();
+    let path = if !daemon_bin_dir.is_empty() && !current_path.contains(&daemon_bin_dir) {
+        format!("{daemon_bin_dir}:{current_path}")
+    } else {
+        current_path
+    };
+
     vec![
         ("TERMMESH_SOCKET".into(), primary_socket.to_string()),
         ("TERMMESH_DAEMON_SOCKET".into(), daemon_socket.to_string()),
@@ -27,6 +43,7 @@ fn base_env(
         ("TERMMESH_AGENT_NAME".into(), name.to_string()),
         ("TERMMESH_AGENT_ID".into(), agent_id),
         ("TERMMESH_HEADLESS".into(), "1".to_string()),
+        ("PATH".into(), path),
     ]
 }
 

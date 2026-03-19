@@ -125,6 +125,19 @@ final class TermMeshDaemon: ObservableObject {
             process.executableURL = URL(fileURLWithPath: binaryPath)
             var env = ProcessInfo.processInfo.environment
 
+            // Ensure Resources/bin is in PATH for daemon and all its child processes.
+            // When launched from Finder/Spotlight, macOS provides a minimal PATH that
+            // doesn't include the app's Resources/bin (where tm-agent, term-meshd live).
+            // Pane mode handles this in TeamOrchestrator.swift, but the daemon needs it
+            // for headless agent spawning.
+            if let resourcePath = Bundle.main.resourcePath {
+                let resourceBin = "\(resourcePath)/bin"
+                let currentPath = env["PATH"] ?? ""
+                if !currentPath.contains(resourceBin) {
+                    env["PATH"] = "\(resourceBin):\(currentPath)"
+                }
+            }
+
             // Dashboard settings
             if !self.isDashboardEnabled {
                 env["TERM_MESH_HTTP_DISABLED"] = "1"

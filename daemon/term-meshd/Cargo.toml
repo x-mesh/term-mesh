@@ -1,6 +1,6 @@
 [package]
 name = "term-meshd"
-version = "0.1.0"
+version = "0.72.0"
 edition = "2021"
 description = "term-mesh background daemon — worktree orchestration, resource monitoring, file heatmap"
 
