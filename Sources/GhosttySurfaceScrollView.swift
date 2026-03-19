@@ -640,8 +640,8 @@ final class GhosttySurfaceScrollView: NSView {
         }
 
         let rootView = IMEInputBar(
-            onSubmit: { [weak self] text in
-                guard let self = self else { return }
+            onSubmit: { [weak self] text -> Bool in
+                guard let self = self else { return false }
                 // Image paths (from IME paste) must go through bracketed paste
                 // (ghostty_surface_text) so Claude Code recognizes them as images
                 // ([Image #1]) instead of treating the path as typed text.
@@ -649,8 +649,9 @@ final class GhosttySurfaceScrollView: NSView {
                    let surface = self.surfaceView.terminalSurface {
                     surface.sendText(text)
                     surface.sendSurfaceKeyPress(keycode: 0x24, text: "\r")
+                    return true
                 } else if self.surfaceView.surface != nil {
-                    self.surfaceView.sendIMEText(text)
+                    return self.surfaceView.sendIMEText(text)
                 } else {
                     // Surface temporarily nil (pane re-creation) — retry once after 50ms
                     DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) { [weak self] in
@@ -658,8 +659,12 @@ final class GhosttySurfaceScrollView: NSView {
                             NSSound.beep()
                             return
                         }
-                        self.surfaceView.sendIMEText(text)
+                        if !self.surfaceView.sendIMEText(text) {
+                            NSSound.beep()
+                        }
                     }
+                    // Return false since the actual send is deferred; caller should not clear text
+                    return false
                 }
             },
             onBroadcast: { text in

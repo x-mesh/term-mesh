@@ -145,7 +145,7 @@ private enum ShellHistory {
 /// Activated via Cmd+Shift+I (or menu: Edit → IME Input Bar).
 /// Docked at the bottom of the terminal pane; the terminal shrinks to make room.
 struct IMEInputBar: View {
-    let onSubmit: (String) -> Void
+    let onSubmit: (String) -> Bool
     let onBroadcast: ((String) -> Void)?
     let onClose: () -> Void
     var onCtrlC: (() -> Void)? = nil
@@ -168,21 +168,27 @@ struct IMEInputBar: View {
     private func doSubmit() {
         if text.isEmpty {
             // Pass through Enter to the terminal so the user isn't "trapped"
-            onSubmit("")
+            _ = onSubmit("")
             return
         }
         let submitted = text
         addToHistory(submitted)
-        onSubmit(submitted)
-        text = ""
+        let success = onSubmit(submitted)
+        if success {
+            text = ""
+        }
+        // On failure, keep text in the box so the user can retry or edit.
+        // The caller (sendIMEText / surface retry) will beep to signal the error.
     }
 
     private func doSubmitAndClose() {
         if !text.isEmpty {
             let submitted = text
             addToHistory(submitted)
-            onSubmit(submitted)
-            text = ""
+            let success = onSubmit(submitted)
+            if success {
+                text = ""
+            }
         }
         onClose()
     }
