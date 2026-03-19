@@ -1238,6 +1238,121 @@ def print_comparison(comparison: Dict, change_note: str = ""):
     print()
 
 
+def _extract_total_ms(iteration: Dict, section: str, test: str) -> Optional[float]:
+    """Extract total_ms for a given test from an iteration result."""
+    data = iteration.get(section, {})
+    if isinstance(data, dict) and test in data:
+        return data[test].get("total_ms") if isinstance(data[test], dict) else None
+    return None
+
+
+def _compute_aggregate(iterations: List[Dict]) -> Dict[str, Any]:
+    """Compute median/mean/min/max across iterations for each test."""
+    import statistics
+
+    # Collect all (section, test) pairs from first iteration
+    sections = ["rpc_pane", "rpc_headless", "e2e_pane", "e2e_headless", "e2e_llm"]
+    test_keys: Dict[str, List[str]] = {}
+    for sec in sections:
+        data = iterations[0].get(sec, {})
+        if isinstance(data, dict):
+            test_keys[sec] = [k for k, v in data.items()
+                              if isinstance(v, dict) and "total_ms" in v]
+
+    agg: Dict[str, Any] = {}
+    for sec, tests in test_keys.items():
+        agg[sec] = {}
+        for t in tests:
+            values = []
+            for it in iterations:
+                v = _extract_total_ms(it, sec, t)
+                if v is not None:
+                    values.append(v)
+            if not values:
+                continue
+            s = sorted(values)
+            n = len(s)
+            agg[sec][t] = {
+                "samples": n,
+                "median_ms": round(statistics.median(s), 1),
+                "mean_ms": round(statistics.mean(s), 1),
+                "min_ms": round(s[0], 1),
+                "max_ms": round(s[-1], 1),
+                "stdev_ms": round(statistics.stdev(s), 1) if n >= 2 else 0,
+                "values_ms": [round(v, 1) for v in values],
+            }
+    return agg
+
+
+E2E_TEST_LABELS = {
+    "ping_all": "Ping All",
+    "parallel_delegation": "Delegation",
+    "cross_messaging": "Cross Msg",
+    "task_lifecycle": "Lifecycle",
+    "broadcast_convergence": "Broadcast",
+}
+
+
+def _print_iteration_summary(iterations: List[Dict]):
+    """Print a compact per-iteration table + aggregated stats."""
+    import statistics
+
+    sections = ["e2e_pane", "e2e_headless", "rpc_pane", "rpc_headless"]
+    # Find which sections have data
+    active_sections = []
+    for sec in sections:
+        if any(iterations[i].get(sec) for i in range(len(iterations))):
+            active_sections.append(sec)
+
+    for sec in active_sections:
+        # Collect test names from first non-empty iteration
+        test_names = []
+        for it in iterations:
+            data = it.get(sec, {})
+            if isinstance(data, dict):
+                test_names = [k for k, v in data.items()
+                              if isinstance(v, dict) and "total_ms" in v]
+                if test_names:
+                    break
+
+        if not test_names:
+            continue
+
+        sec_label = sec.replace("_", " ").title()
+        print(f"\n  {bold(f'── Aggregate: {sec_label} ({len(iterations)} iterations) ──')}")
+
+        # Per-iteration table
+        header = f"  {'Test':<16}"
+        for i in range(len(iterations)):
+            header += f" {'#' + str(i+1):>8}"
+        header += f" {'median':>8} {'mean':>8} {'stdev':>8}"
+        print(header)
+
+        for t in test_names:
+            label = E2E_TEST_LABELS.get(t, t[:16])
+            values = []
+            row = f"  {label:<16}"
+            for it in iterations:
+                v = _extract_total_ms(it, sec, t)
+                if v is not None:
+                    values.append(v)
+                    row += f" {v:>7.0f}ms" if v >= 1 else f" {v:>6.1f}ms"
+                else:
+                    row += f" {'—':>8}"
+
+            if len(values) >= 2:
+                med = statistics.median(values)
+                avg = statistics.mean(values)
+                sd = statistics.stdev(values)
+                row += f" {med:>6.0f}ms {avg:>6.0f}ms {sd:>6.0f}ms"
+            elif values:
+                row += f" {values[0]:>6.0f}ms {values[0]:>6.0f}ms {'—':>8}"
+
+            print(row)
+
+    print()
+
+
 def _count_results(*result_dicts: Dict):
     tp = tf = 0
     for rd in result_dicts:
@@ -1498,6 +1613,7 @@ Examples:
   python3 scripts/bench-agent.py --leader both            # Compare terminal vs LLM
   python3 scripts/bench-agent.py --rpc-only               # RPC infra only
   python3 scripts/bench-agent.py --e2e-only               # Agent E2E only
+  python3 scripts/bench-agent.py --repeat 5 --note "..."  # 5 iterations with stats
   python3 scripts/bench-agent.py --history                # Show history
   python3 scripts/bench-agent.py --compare A B            # Compare two runs
         """,
@@ -1510,6 +1626,8 @@ Examples:
                         help="Run only RPC infrastructure benchmarks")
     parser.add_argument("--e2e-only", action="store_true",
                         help="Run only E2E agent benchmarks")
+    parser.add_argument("--repeat", type=int, default=1,
+                        help="Number of iterations to run (default: 1)")
     parser.add_argument("--history", action="store_true",
                         help="Show recent benchmark history")
     parser.add_argument("--compare", nargs=2, metavar=("A", "B"),
@@ -1574,53 +1692,81 @@ Examples:
     do_terminal = args.leader in ("terminal", "both")
     do_llm = args.leader in ("llm", "both")
 
-    rpc_pane: Dict[str, Any] = {}
-    rpc_headless: Dict[str, Any] = {}
-    e2e_pane: Dict[str, Any] = {}
-    e2e_headless: Dict[str, Any] = {}
-    e2e_llm: Dict[str, Any] = {}
+    repeat = max(1, args.repeat)
+    all_iterations: List[Dict[str, Any]] = []
 
-    # ── RPC benchmarks ──
-    if not args.e2e_only:
-        if do_pane:
-            print(f"  {bold(cyan('▸ RPC: Pane mode'))}")
-            rpc_pane = run_rpc_pane_benchmarks(app_sock)
-            print_rpc_pane_results(rpc_pane)
+    for iteration in range(1, repeat + 1):
+        if repeat > 1:
+            print(f"\n  {bold(cyan(f'━━ Iteration {iteration}/{repeat} ━━'))}")
 
-        if do_headless:
-            print(f"  {bold(cyan('▸ RPC: Headless mode'))}")
-            rpc_headless = run_rpc_headless_benchmarks(daemon_sock, app_sock)
-            print_rpc_headless_results(rpc_headless)
+        rpc_pane: Dict[str, Any] = {}
+        rpc_headless: Dict[str, Any] = {}
+        e2e_pane: Dict[str, Any] = {}
+        e2e_headless: Dict[str, Any] = {}
+        e2e_llm: Dict[str, Any] = {}
 
-    # ── E2E benchmarks ──
-    if not args.rpc_only:
-        # Terminal leader E2E (script-driven)
-        if do_terminal:
+        # ── RPC benchmarks ──
+        if not args.e2e_only:
             if do_pane:
-                print(f"  {bold(cyan('▸ E2E: Pane agents (terminal leader)'))}")
-                e2e_pane = run_e2e_pane_benchmarks()
-                if e2e_pane:
-                    print_e2e_results(e2e_pane, "E2E: Pane Agents (terminal leader)")
+                print(f"  {bold(cyan('▸ RPC: Pane mode'))}")
+                rpc_pane = run_rpc_pane_benchmarks(app_sock)
+                print_rpc_pane_results(rpc_pane)
 
             if do_headless:
-                print(f"  {bold(cyan('▸ E2E: Headless agents (terminal leader)'))}")
-                e2e_headless = run_e2e_headless_benchmarks()
-                if e2e_headless:
-                    print_e2e_results(e2e_headless, "E2E: Headless Agents (terminal leader)")
+                print(f"  {bold(cyan('▸ RPC: Headless mode'))}")
+                rpc_headless = run_rpc_headless_benchmarks(daemon_sock, app_sock)
+                print_rpc_headless_results(rpc_headless)
 
-            if e2e_pane and e2e_headless:
-                print_mode_comparison(e2e_pane, e2e_headless)
+        # ── E2E benchmarks ──
+        if not args.rpc_only:
+            # Terminal leader E2E (script-driven)
+            if do_terminal:
+                if do_pane:
+                    print(f"  {bold(cyan('▸ E2E: Pane agents (terminal leader)'))}")
+                    e2e_pane = run_e2e_pane_benchmarks()
+                    if e2e_pane:
+                        print_e2e_results(e2e_pane, "E2E: Pane Agents (terminal leader)")
 
-        # LLM leader E2E (Claude --claude-leader)
-        if do_llm:
-            print(f"  {bold(cyan('▸ E2E: LLM Leader (Claude)'))}")
-            e2e_llm = run_e2e_llm_leader_benchmarks()
-            if e2e_llm:
-                print_e2e_llm_results(e2e_llm)
+                if do_headless:
+                    print(f"  {bold(cyan('▸ E2E: Headless agents (terminal leader)'))}")
+                    e2e_headless = run_e2e_headless_benchmarks()
+                    if e2e_headless:
+                        print_e2e_results(e2e_headless, "E2E: Headless Agents (terminal leader)")
 
-            # Compare terminal vs LLM if both were run
-            if do_terminal and e2e_pane and e2e_llm:
-                print_leader_comparison(e2e_pane, e2e_llm)
+                if e2e_pane and e2e_headless:
+                    print_mode_comparison(e2e_pane, e2e_headless)
+
+            # LLM leader E2E (Claude --claude-leader)
+            if do_llm:
+                print(f"  {bold(cyan('▸ E2E: LLM Leader (Claude)'))}")
+                e2e_llm = run_e2e_llm_leader_benchmarks()
+                if e2e_llm:
+                    print_e2e_llm_results(e2e_llm)
+
+                # Compare terminal vs LLM if both were run
+                if do_terminal and e2e_pane and e2e_llm:
+                    print_leader_comparison(e2e_pane, e2e_llm)
+
+        all_iterations.append({
+            "iteration": iteration,
+            "rpc_pane": rpc_pane,
+            "rpc_headless": rpc_headless,
+            "e2e_pane": e2e_pane,
+            "e2e_headless": e2e_headless,
+            "e2e_llm": e2e_llm,
+        })
+
+    # ── Aggregate stats for multi-iteration runs ──
+    if repeat > 1:
+        _print_iteration_summary(all_iterations)
+
+    # Use last iteration as the primary result (or aggregated median for multi-run)
+    last = all_iterations[-1]
+    rpc_pane = last["rpc_pane"]
+    rpc_headless = last["rpc_headless"]
+    e2e_pane = last["e2e_pane"]
+    e2e_headless = last["e2e_headless"]
+    e2e_llm = last["e2e_llm"]
 
     # ── Assemble & save ──
     data: Dict[str, Any] = {
@@ -1633,6 +1779,7 @@ Examples:
             "app_socket": app_sock,
             "daemon_socket": daemon_sock or "N/A",
             "change_note": args.note,
+            "repeat": repeat,
         },
         "rpc_pane": rpc_pane,
         "rpc_headless": rpc_headless,
@@ -1640,6 +1787,10 @@ Examples:
         "e2e_headless": e2e_headless,
         "e2e_llm": e2e_llm,
     }
+
+    if repeat > 1:
+        data["iterations"] = all_iterations
+        data["aggregate"] = _compute_aggregate(all_iterations)
 
     tp, tf = _count_results(rpc_pane, rpc_headless, e2e_pane, e2e_headless, e2e_llm)
     data["summary"] = {"total_passed": tp, "total_failed": tf}
