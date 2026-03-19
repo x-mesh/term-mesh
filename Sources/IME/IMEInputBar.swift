@@ -257,16 +257,18 @@ struct IMEInputBar: View {
                     }
                 )
                 .focused($isFieldFocused)
-                // Slash command picker popover (anchored to text editor, appears below cursor)
-                .popover(isPresented: $showSlashPicker, arrowEdge: .top) {
-                    slashCommandPickerView
-                }
 
                 actionButtons
             }
             .padding(.horizontal, 12)
             .padding(.top, 6)
             .padding(.bottom, 4)
+
+            // Slash command picker (inline, inside IME bar between editor and hint bar)
+            if showSlashPicker && !filteredSlashCommands.isEmpty {
+                slashCommandPickerView
+                    .transition(.opacity.combined(with: .move(edge: .bottom)))
+            }
 
             // Hint bar + status indicators (same row)
             HStack(spacing: 12) {
@@ -313,7 +315,7 @@ struct IMEInputBar: View {
         .popover(isPresented: $showHistoryPicker, arrowEdge: .bottom) {
             historyPickerView
         }
-        // (slash picker popover is attached to IMETextEditor above)
+        // (slash picker is inline in VStack above)
         .onAppear {
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
                 isFieldFocused = true
@@ -490,6 +492,8 @@ struct IMEInputBar: View {
 
     private var slashCommandPickerView: some View {
         VStack(spacing: 0) {
+            Divider()
+
             HStack {
                 Text("Slash Commands")
                     .font(.system(size: 10, weight: .semibold))
@@ -499,18 +503,11 @@ struct IMEInputBar: View {
                     .font(.system(size: 9))
                     .foregroundColor(.secondary.opacity(0.6))
             }
-            .padding(.horizontal, 10)
-            .padding(.vertical, 6)
+            .padding(.horizontal, 12)
+            .padding(.vertical, 3)
 
-            Divider()
-
-            if filteredSlashCommands.isEmpty {
-                Text("No matching commands")
-                    .font(.system(size: 11))
-                    .foregroundColor(.secondary)
-                    .padding(12)
-            } else {
-                ScrollView {
+            ScrollViewReader { proxy in
+                ScrollView(.vertical, showsIndicators: false) {
                     VStack(spacing: 0) {
                         ForEach(Array(filteredSlashCommands.enumerated()), id: \.offset) { i, cmd in
                             Button(action: {
@@ -522,30 +519,32 @@ struct IMEInputBar: View {
                                     Text(cmd)
                                         .font(.system(size: 11, design: .monospaced))
                                         .lineLimit(1)
-                                        .truncationMode(.tail)
-                                        .foregroundColor(.primary)
+                                        .foregroundColor(i == slashPickerSelection ? .white : .primary)
                                     Spacer()
                                 }
-                                .padding(.horizontal, 10)
-                                .padding(.vertical, 5)
+                                .padding(.horizontal, 12)
+                                .padding(.vertical, 4)
                                 .background(
                                     i == slashPickerSelection
-                                        ? Color.accentColor.opacity(0.2)
+                                        ? Color.teal.opacity(0.6)
                                         : Color.clear
                                 )
+                                .cornerRadius(4)
                             }
                             .buttonStyle(.plain)
-
-                            if i < filteredSlashCommands.count - 1 {
-                                Divider().padding(.leading, 10)
-                            }
+                            .id(i)
                         }
                     }
+                    .padding(.horizontal, 4)
+                    .padding(.vertical, 2)
                 }
-                .frame(maxHeight: 200)
+                .frame(maxHeight: 150)
+                .onChange(of: slashPickerSelection) { newVal in
+                    withAnimation(.easeOut(duration: 0.1)) { proxy.scrollTo(newVal, anchor: .center) }
+                }
             }
         }
-        .frame(width: 300)
+        .frame(maxWidth: .infinity)
     }
 
     private var keyboardHelpView: some View {
