@@ -1341,12 +1341,87 @@ def _interactive_menu() -> Dict[str, str]:
     """Show interactive menu when no flags are given. Returns selected options."""
     print()
     print(bold("=== tm-bench agent — Configuration ==="))
+
+    # Detect existing team for context
+    team_info = _detect_team()
+    daemon_sock = _detect_daemon_socket()
+
+    if team_info:
+        tn = team_info.get("team_name", "?")
+        agents = team_info.get("agents", [])
+        print(f"  {green('●')} Active team: {bold(tn)} ({len(agents)} agents)")
+    else:
+        print(f"  {dim('○ No active team detected')}")
+    if daemon_sock:
+        print(f"  {green('●')} Daemon: {dim(daemon_sock)}")
+    else:
+        print(f"  {dim('○ No daemon socket')}")
+
+    # Quick presets
+    print()
+    print(f"  {bold('Quick presets:')}")
+    if team_info:
+        tn = team_info.get("team_name", "?")
+        n = len(team_info.get("agents", []))
+        print(f"    {cyan('1)')} {bold('Existing team E2E')}    — {tn} ({n} agents), no new team  {green('fastest')}")
+        print(f"    {cyan('2)')} {bold('Full pane benchmark')} — temp team for RPC + existing for E2E")
+    else:
+        print(f"    {dim('1)')} {dim('Existing team E2E')}    — {yellow('no team detected')}")
+        print(f"    {cyan('2)')} {bold('Full pane benchmark')} — creates temp team for RPC + E2E")
+    print(f"    {cyan('3)')} {bold('LLM leader E2E')}     — creates new team with --claude-leader")
+    if daemon_sock:
+        print(f"    {cyan('4)')} {bold('Headless benchmark')} — daemon subprocess mode")
+    else:
+        print(f"    {dim('4)')} {dim('Headless benchmark')} — {yellow('no daemon')}")
+    print(f"    {cyan('5)')} {bold('RPC only')}           — infrastructure latency (temp team)")
+    print(f"    {cyan('6)')} {bold('Custom...')}          — pick leader / mode / layers")
     print()
 
-    # Leader selection
+    preset = input(f"  Select [{cyan('1')}-{cyan('6')}, default=1]: ").strip() or "1"
+
+    # ── Preset mappings ──
+    if preset == "1":
+        if not team_info:
+            print(f"\n  {yellow('WARN')}: No active team. Falling back to full pane benchmark.")
+            return {"leader": "terminal", "mode": "pane", "rpc_only": False,
+                    "e2e_only": False, "note": ""}
+        print(f"\n  {dim('→ Terminal leader, pane mode, E2E only (existing team)')}")
+        note = input("  Change note (optional): ").strip()
+        return {"leader": "terminal", "mode": "pane", "rpc_only": False,
+                "e2e_only": True, "note": note}
+
+    elif preset == "2":
+        print(f"\n  {dim('→ Terminal leader, pane mode, RPC + E2E')}")
+        note = input("  Change note (optional): ").strip()
+        return {"leader": "terminal", "mode": "pane", "rpc_only": False,
+                "e2e_only": False, "note": note}
+
+    elif preset == "3":
+        print(f"\n  {dim('→ LLM leader, pane mode, E2E only (creates new team)')}")
+        note = input("  Change note (optional): ").strip()
+        return {"leader": "llm", "mode": "pane", "rpc_only": False,
+                "e2e_only": True, "note": note}
+
+    elif preset == "4":
+        if not daemon_sock:
+            print(f"\n  {red('ERROR')}: No daemon socket found. Start term-meshd first.")
+            raise EOFError
+        print(f"\n  {dim('→ Terminal leader, headless mode, RPC + E2E')}")
+        note = input("  Change note (optional): ").strip()
+        return {"leader": "terminal", "mode": "headless", "rpc_only": False,
+                "e2e_only": False, "note": note}
+
+    elif preset == "5":
+        print(f"\n  {dim('→ Terminal leader, pane mode, RPC only (temp team)')}")
+        note = input("  Change note (optional): ").strip()
+        return {"leader": "terminal", "mode": "pane", "rpc_only": True,
+                "e2e_only": False, "note": note}
+
+    # ── Custom: full selection (preset == "6" or anything else) ──
+    print()
     print(f"  {bold('Leader type:')}")
-    print(f"    {cyan('1)')} Terminal (script-driven, current session)")
-    print(f"    {cyan('2)')} LLM (Claude --claude-leader, autonomous)")
+    print(f"    {cyan('1)')} Terminal (script-driven, uses existing team for E2E)")
+    print(f"    {cyan('2)')} LLM (Claude --claude-leader, creates new team)")
     print(f"    {cyan('3)')} Both (compare terminal vs LLM)")
     print()
     leader_choice = input("  Select leader [1/2/3, default=1]: ").strip() or "1"
@@ -1357,10 +1432,17 @@ def _interactive_menu() -> Dict[str, str]:
     print()
     print(f"  {bold('Infrastructure mode:')}")
     print(f"    {cyan('1)')} Pane (GUI terminal panes)")
-    print(f"    {cyan('2)')} Headless (daemon subprocesses)")
-    print(f"    {cyan('3)')} Both (compare pane vs headless)")
+    if daemon_sock:
+        print(f"    {cyan('2)')} Headless (daemon subprocesses)")
+        print(f"    {cyan('3)')} Both (compare pane vs headless)")
+    else:
+        print(f"    {dim('2)')} {dim('Headless')} — {yellow('no daemon')}")
+        print(f"    {dim('3)')} {dim('Both')}     — {yellow('no daemon')}")
     print()
     mode_choice = input("  Select mode [1/2/3, default=1]: ").strip() or "1"
+    if mode_choice in ("2", "3") and not daemon_sock:
+        print(f"  {yellow('WARN')}: No daemon socket. Falling back to pane mode.")
+        mode_choice = "1"
     mode_map = {"1": "pane", "2": "headless", "3": "both"}
     mode = mode_map.get(mode_choice, "pane")
 
@@ -1368,13 +1450,33 @@ def _interactive_menu() -> Dict[str, str]:
     print()
     print(f"  {bold('Benchmark layers:')}")
     print(f"    {cyan('1)')} All (RPC + E2E)")
-    print(f"    {cyan('2)')} RPC only (infrastructure latency)")
-    print(f"    {cyan('3)')} E2E only (agent communication)")
+    print(f"    {cyan('2)')} RPC only  — infrastructure latency {dim('(creates temp team)')}")
+    if team_info:
+        print(f"    {cyan('3)')} E2E only  — agent communication {dim('(uses existing team)')}")
+    else:
+        print(f"    {cyan('3)')} E2E only  — agent communication {dim('(needs active team)')}")
     print()
     layer_choice = input("  Select layer [1/2/3, default=1]: ").strip() or "1"
 
     rpc_only = layer_choice == "2"
     e2e_only = layer_choice == "3"
+
+    # Summary
+    parts = []
+    if leader == "terminal":
+        parts.append("terminal leader")
+    elif leader == "llm":
+        parts.append("LLM leader")
+    else:
+        parts.append("terminal + LLM")
+    parts.append(f"{mode} mode")
+    if rpc_only:
+        parts.append("RPC only")
+    elif e2e_only:
+        parts.append("E2E only")
+    else:
+        parts.append("RPC + E2E")
+    print(f"\n  {dim('→ ' + ', '.join(parts))}")
 
     print()
     note = input("  Change note (optional): ").strip()
