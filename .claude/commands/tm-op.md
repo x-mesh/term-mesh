@@ -773,12 +773,28 @@ tm-agent collect --lines 100
 
 ## Interactive Mode
 
-`$ARGUMENTS`가 빈 경우, AskUserQuestion 도구를 사용하여 전략을 선택받는다:
+`$ARGUMENTS`가 빈 경우, AskUserQuestion 도구를 사용하여 전략을 선택받는다.
 
-- Question: "어떤 전략을 사용할까요? 태스크도 함께 입력해주세요."
-- Options: "refine", "tournament", "chain", "review", "debate", "red-team", "brainstorm"
+**AskUserQuestion은 옵션 최대 4개 제한이 있으므로**, 두 단계로 질문한다:
 
-사용자가 전략을 선택하면, 태스크 입력을 추가로 요청한 후 해당 전략 섹션을 실행한다.
+**1단계 — 카테고리 선택:**
+- Question: "어떤 유형의 전략을 사용할까요?"
+- Options:
+  1. "협력 (refine / brainstorm)" — 전원이 협력하여 정제하거나 아이디어 발산
+  2. "경쟁 (tournament / debate)" — 전원 경쟁 투표 또는 찬반 토론
+  3. "파이프라인 (chain)" — A→B→C 순차 실행
+  4. "분석 (review / red-team)" — 다각도 리뷰 또는 공격/방어
+
+**2단계 — 구체 전략 선택:**
+선택된 카테고리에 전략이 2개 이상이면 AskUserQuestion으로 구체 전략을 선택받는다.
+카테고리에 전략이 1개뿐이면 바로 해당 전략을 실행한다.
+
+**3단계 — 태스크 입력:**
+전략 선택 후 AskUserQuestion으로 태스크를 입력받는다:
+- Question: "{전략} 전략을 실행합니다. 태스크를 입력해주세요."
+- Options에 예시를 포함 (전략별 대표 사용 예시)
+
+사용자가 전략과 태스크를 모두 입력하면 해당 전략 섹션을 실행한다.
 
 ## Safety Rules
 
