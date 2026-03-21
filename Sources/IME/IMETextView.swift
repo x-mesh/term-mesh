@@ -559,6 +559,18 @@ final class IMETextView: NSTextView {
     override func didChangeText() {
         super.didChangeText()
         guard !isApplyingRainbow, !hasMarkedText() else { return }
+        // Defer textStorage edits to the next run-loop iteration.
+        // Editing textStorage synchronously here triggers layout invalidation
+        // inside NSLayoutManager, which can race with the current draw cycle
+        // and crash in _fillGlyphHoleForCharacterRange (EXC_BREAKPOINT).
+        NSObject.cancelPreviousPerformRequests(
+            withTarget: self, selector: #selector(applyHighlightingDeferred), object: nil
+        )
+        perform(#selector(applyHighlightingDeferred), with: nil, afterDelay: 0)
+    }
+
+    @objc private func applyHighlightingDeferred() {
+        guard !isApplyingRainbow, !hasMarkedText() else { return }
         isApplyingRainbow = true
         applyRainbowKeywords()
         isApplyingRainbow = false
@@ -738,6 +750,13 @@ final class IMETextView: NSTextView {
     // MARK: - Ghost drawing
 
     override func draw(_ dirtyRect: NSRect) {
+        // Ensure layout is fully resolved before drawing.
+        // If textStorage was recently edited (e.g. rainbow highlighting),
+        // the layout manager may have glyph holes that cause
+        // _fillGlyphHoleForCharacterRange to throw an NSException.
+        if let lm = layoutManager, let tc = textContainer {
+            lm.ensureLayout(for: tc)
+        }
         super.draw(dirtyRect)
         drawGhostText()
     }
@@ -745,13 +764,21 @@ final class IMETextView: NSTextView {
     private func drawGhostText() {
         guard !ghostSuggestion.isEmpty, !hasMarkedText() else { return }
         guard let lm = layoutManager, let tc = textContainer else { return }
+        guard let storage = textStorage, storage.length > 0 else { return }
 
         lm.ensureLayout(for: tc)
         let numGlyphs = lm.numberOfGlyphs
         guard numGlyphs > 0 else { return }
 
-        // bounding rect of the last glyph in textContainer coordinates
+        // Validate that the last glyph index falls within the valid glyph range
+        // for this text container. After textStorage edits, numberOfGlyphs can
+        // momentarily exceed the actual laid-out range.
         let lastGlyphIdx = numGlyphs - 1
+        let validRange = lm.glyphRange(for: tc)
+        guard validRange.length > 0,
+              NSLocationInRange(lastGlyphIdx, validRange) else { return }
+
+        // bounding rect of the last glyph in textContainer coordinates
         let glyphBound = lm.boundingRect(
             forGlyphRange: NSRange(location: lastGlyphIdx, length: 1),
             in: tc
