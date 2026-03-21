@@ -215,6 +215,15 @@ final class IMETextView: NSTextView {
         case VK.k where mods.contains(.control):
             deleteToEndOfParagraph(nil)
 
+        // Ctrl+U → readline kill-whole-line (clear all text, or forward to terminal if empty)
+        case VK.u where mods.contains(.control):
+            if string.isEmpty {
+                sendKeyHandler?(VK.u, UInt32(GHOSTTY_MODS_CTRL.rawValue))
+            } else {
+                selectAll(nil)
+                deleteBackward(nil)
+            }
+
         // Ctrl+W → readline delete-word-backward
         case VK.w where mods.contains(.control):
             deleteWordBackward(nil)

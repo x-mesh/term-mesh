@@ -426,6 +426,7 @@ struct IMEInputBar: View {
             hintLabel("Tab →term")
             hintLabel("⇧Tab accept")
             hintLabel("Esc →term")
+            hintLabel("⌃U clear")
             hintLabel("⌃C interrupt")
             if onStopAllAgents != nil {
                 hintLabel("⌃⇧C stop all")
@@ -584,6 +585,7 @@ struct IMEInputBar: View {
                     helpRow("⏎", "Send")
                     helpRow("⌘⏎", "Send & close")
                     helpRow("⇧⏎", "New line")
+                    helpRow("⌃U", "Clear line")
                     helpRow("⌃C", "Interrupt (Ctrl+C)")
                     helpRow("⌃⇧C", "Stop all agents")
                 }

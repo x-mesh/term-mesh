@@ -2070,6 +2070,17 @@ func pushTargetSurfaceSize(_ size: CGSize) {
         // AppKit text interpretation and send a single deterministic Ghostty key event.
         // This avoids intermittent drops after rapid split close/reparent transitions.
         let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+
+        // Ctrl+Shift+C → Stop all agents (works with or without IME bar).
+        // Must be checked before the Ctrl fast path which would send it to the
+        // current terminal only.
+        if flags.contains(.control) && flags.contains(.shift)
+            && event.keyCode == 0x08 /* kVK_ANSI_C */
+            && !flags.contains(.command) {
+            NotificationCenter.default.post(name: .termMeshStopAllAgents, object: nil)
+            return
+        }
+
         if flags.contains(.control) && !flags.contains(.command) && !flags.contains(.option) {
             // Skip re-focus for paused agent surfaces to avoid restarting their CVDisplayLink.
             if terminalSurface?.renderingPaused != true {
