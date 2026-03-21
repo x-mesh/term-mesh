@@ -108,7 +108,9 @@ public final class BonsplitController {
             isLoading: isLoading,
             isPinned: isPinned
         )
-        let targetPane = pane ?? focusedPaneId ?? PaneID(id: internalController.rootNode.allPaneIds.first!.id)
+        guard let targetPane = pane ?? focusedPaneId ?? internalController.rootNode.allPaneIds.first.map({ PaneID(id: $0.id) }) else {
+            return nil
+        }
 
         // Check with delegate
         if delegate?.splitTabBar(self, shouldCreateTab: tab, inPane: targetPane) == false {

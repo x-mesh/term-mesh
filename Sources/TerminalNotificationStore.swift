@@ -35,7 +35,14 @@ enum TaggedRunBadgeSettings {
 }
 
 enum AppFocusState {
-    static var overrideIsFocused: Bool?
+    /// Thread-safe storage for focus override.
+    /// Written from socket background threads and read from main thread.
+    private static let _lock = NSLock()
+    private static var _overrideIsFocused: Bool?
+    static var overrideIsFocused: Bool? {
+        get { _lock.withLock { _overrideIsFocused } }
+        set { _lock.withLock { _overrideIsFocused = newValue } }
+    }
 
     static func isAppActive() -> Bool {
         if let overrideIsFocused {

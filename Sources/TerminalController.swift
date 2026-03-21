@@ -4070,7 +4070,7 @@ class TerminalController {
 
     private func v2NotificationList() -> [String: Any] {
         var items: [[String: Any]] = []
-        DispatchQueue.main.sync {
+        v2MainSync {
             items = notifications.notifications.map { n in
                 return [
                     "id": n.id.uuidString,
@@ -4087,7 +4087,7 @@ class TerminalController {
     }
 
     private func v2NotificationClear() -> V2CallResult {
-        DispatchQueue.main.sync {
+        v2MainSync {
             notifications.clearAll()
         }
         return .ok([:])

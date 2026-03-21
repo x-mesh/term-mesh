@@ -615,25 +615,26 @@ extension TabManager {
             }()
 
             let targets: [(label: String, view: GhosttySurfaceScrollView)] = {
+                guard let topLeftPanel = tab.terminalPanel(for: topLeftId) else { return [] }
                 switch pattern {
                 case "close_right_single":
                     return [
-                        ("TL", tab.terminalPanel(for: topLeftId)!.surface.hostedView),
+                        ("TL", topLeftPanel.surface.hostedView),
                     ]
                 case "close_bottom":
                     return [
-                        ("TL", tab.terminalPanel(for: topLeftId)!.surface.hostedView),
+                        ("TL", topLeftPanel.surface.hostedView),
                         ("TR", topRight.surface.hostedView),
                     ]
                 case "close_right_lrtd_bottom_first", "close_right_bottom_first":
                     return [
                         ("TR", topRight.surface.hostedView),
-                        ("TL", tab.terminalPanel(for: topLeftId)!.surface.hostedView),
+                        ("TL", topLeftPanel.surface.hostedView),
                     ]
                 default:
                     guard let bottomLeft else { return [] }
                     return [
-                        ("TL", tab.terminalPanel(for: topLeftId)!.surface.hostedView),
+                        ("TL", topLeftPanel.surface.hostedView),
                         ("BL", bottomLeft.surface.hostedView),
                     ]
                 }
