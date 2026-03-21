@@ -584,52 +584,15 @@ enum MenuBarIconRenderer {
         return image
     }
 
-    // Change this value to preview different icon styles (0–3).
-    // 0: full-mesh pentagon, 1: hub-and-spoke, 2: prompt+mesh, 3: tri-mesh layered
-    private static let glyphStyle = 1
-
     private static func drawGlyph(in rect: NSRect) {
-        switch glyphStyle {
-        case 1: drawHubAndSpoke(in: rect)
-        case 2: drawPromptMesh(in: rect)
-        case 3: drawTriMesh(in: rect)
-        default: drawFullMesh(in: rect)
-        }
-    }
-
-    // ── Style 0: Full-mesh pentagon (current) ──
-    // 5 nodes fully interconnected — dense network feel
-    private static func drawFullMesh(in rect: NSRect) {
-        let cx = rect.midX
-        let cy = rect.midY
-        let r: CGFloat = min(rect.width, rect.height) * 0.42
-
-        let nodes: [(CGFloat, CGFloat)] = [
-            (cx,            cy + r * 0.95),
-            (cx + r * 0.9,  cy + r * 0.25),
-            (cx + r * 0.55, cy - r * 0.85),
-            (cx - r * 0.55, cy - r * 0.85),
-            (cx - r * 0.9,  cy + r * 0.25),
-        ]
-
-        let edges: [(Int, Int)] = [
-            (0, 1), (1, 2), (2, 3), (3, 4), (4, 0),
-            (0, 2), (0, 3), (1, 3), (1, 4), (2, 4),
-        ]
-
-        drawMeshNetwork(nodes: nodes, edges: edges, in: rect, lineWidth: 0.8, nodeRadius: 1.6)
-    }
-
-    // ── Style 1: Hub-and-spoke ──
-    // Central node connected to 6 outer nodes — star topology, clean
-    private static func drawHubAndSpoke(in rect: NSRect) {
+        // Hub-and-spoke mesh: central hub + 6 outer nodes connected by spokes and ring.
         let cx = rect.midX
         let cy = rect.midY
         let r: CGFloat = min(rect.width, rect.height) * 0.48
 
         var nodes: [(CGFloat, CGFloat)] = [(cx, cy)]  // center hub
         for i in 0..<6 {
-            let angle = CGFloat(i) * .pi / 3.0 + .pi / 6.0  // 30° offset
+            let angle = CGFloat(i) * .pi / 3.0 + .pi / 6.0
             nodes.append((cx + r * cos(angle), cy + r * sin(angle)))
         }
 
@@ -638,96 +601,9 @@ enum MenuBarIconRenderer {
         for i in 1...6 { edges.append((0, i)) }
         for i in 1...6 { edges.append((i, i == 6 ? 1 : i + 1)) }
 
-        drawMeshNetwork(nodes: nodes, edges: edges, in: rect, lineWidth: 0.9, nodeRadius: 1.6, hubIndex: 0, hubRadius: 2.2)
-    }
-
-    // ── Style 2: Prompt + mesh dots ──
-    // Terminal `>` prompt on left, 3 mesh-connected dots on right
-    private static func drawPromptMesh(in rect: NSRect) {
         let color = NSColor.white
-
-        // Draw `>` prompt
-        let promptPath = NSBezierPath()
-        let px = rect.minX + 0.5
-        let py = rect.midY
-        let pw: CGFloat = 4.5
-        let ph: CGFloat = rect.height * 0.32
-        promptPath.move(to: NSPoint(x: px, y: py + ph))
-        promptPath.line(to: NSPoint(x: px + pw, y: py))
-        promptPath.line(to: NSPoint(x: px, y: py - ph))
-        promptPath.lineWidth = 1.4
-        promptPath.lineCapStyle = .round
-        promptPath.lineJoinStyle = .round
-        color.setStroke()
-        promptPath.stroke()
-
-        // Draw `_` cursor
-        let cursorPath = NSBezierPath()
-        cursorPath.move(to: NSPoint(x: px + 0.8, y: py - ph - 1.0))
-        cursorPath.line(to: NSPoint(x: px + pw - 0.2, y: py - ph - 1.0))
-        cursorPath.lineWidth = 1.2
-        cursorPath.lineCapStyle = .round
-        color.setStroke()
-        cursorPath.stroke()
-
-        // 3 mesh nodes on the right half
-        let meshX = rect.midX + 2.5
-        let meshY = rect.midY
-        let mr: CGFloat = 3.2
-        let meshNodes: [(CGFloat, CGFloat)] = [
-            (meshX,          meshY + mr * 1.1),  // top
-            (meshX + mr * 1.0, meshY - mr * 0.6),  // bottom right
-            (meshX - mr * 0.6, meshY - mr * 0.8),  // bottom left
-        ]
-
-        // All connected
-        let meshEdges: [(Int, Int)] = [(0, 1), (1, 2), (2, 0)]
-        drawMeshNetwork(nodes: meshNodes, edges: meshEdges, in: rect, lineWidth: 0.7, nodeRadius: 1.3, skipRect: true)
-    }
-
-    // ── Style 3: Tri-mesh layered ──
-    // Two overlapping triangles (6 nodes) with selective cross-links — gem/crystal feel
-    private static func drawTriMesh(in rect: NSRect) {
-        let cx = rect.midX
-        let cy = rect.midY
-        let outer: CGFloat = min(rect.width, rect.height) * 0.44
-        let inner: CGFloat = outer * 0.48
-
-        // Outer triangle (pointing up)
-        let nodes: [(CGFloat, CGFloat)] = [
-            (cx,                     cy + outer * 0.92),   // 0: top
-            (cx + outer * 0.85,      cy - outer * 0.5),    // 1: bottom right
-            (cx - outer * 0.85,      cy - outer * 0.5),    // 2: bottom left
-            // Inner triangle (pointing down, smaller)
-            (cx,                     cy - inner * 0.7),     // 3: bottom center
-            (cx + inner * 0.72,      cy + inner * 0.55),    // 4: top right
-            (cx - inner * 0.72,      cy + inner * 0.55),    // 5: top left
-        ]
-
-        let edges: [(Int, Int)] = [
-            // Outer triangle
-            (0, 1), (1, 2), (2, 0),
-            // Inner triangle
-            (3, 4), (4, 5), (5, 3),
-            // Cross links (inner to outer)
-            (0, 4), (0, 5), (1, 3), (1, 4), (2, 3), (2, 5),
-        ]
-
-        drawMeshNetwork(nodes: nodes, edges: edges, in: rect, lineWidth: 0.65, nodeRadius: 1.3)
-    }
-
-    // ── Shared drawing helper ──
-    private static func drawMeshNetwork(
-        nodes: [(CGFloat, CGFloat)],
-        edges: [(Int, Int)],
-        in rect: NSRect,
-        lineWidth: CGFloat,
-        nodeRadius: CGFloat,
-        hubIndex: Int? = nil,
-        hubRadius: CGFloat = 0,
-        skipRect: Bool = false
-    ) {
-        let color = NSColor.white
+        let hubRadius: CGFloat = 2.2
+        let nodeRadius: CGFloat = 1.6
 
         // Draw edges
         color.setStroke()
@@ -735,14 +611,14 @@ enum MenuBarIconRenderer {
             let path = NSBezierPath()
             path.move(to: NSPoint(x: nodes[a].0, y: nodes[a].1))
             path.line(to: NSPoint(x: nodes[b].0, y: nodes[b].1))
-            path.lineWidth = lineWidth
+            path.lineWidth = 0.9
             path.stroke()
         }
 
         // Draw nodes
         color.setFill()
         for (i, (nx, ny)) in nodes.enumerated() {
-            let r = (i == hubIndex) ? hubRadius : nodeRadius
+            let nr = (i == 0) ? hubRadius : nodeRadius
             let dot = NSBezierPath(ovalIn: NSRect(
                 x: nx - r, y: ny - r, width: r * 2, height: r * 2
             ))
