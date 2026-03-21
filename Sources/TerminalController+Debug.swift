@@ -35,7 +35,7 @@ extension TerminalController {
         }
 
         var result: V2CallResult = .err(code: "internal_error", message: "No window", data: nil)
-        DispatchQueue.main.sync {
+        _ = v2MainExec(timeout: 5) {
             guard let window = NSApp.keyWindow
                 ?? NSApp.mainWindow
                 ?? NSApp.windows.first(where: { $0.isVisible })
@@ -68,14 +68,14 @@ extension TerminalController {
     func v2DebugToggleCommandPalette(params: [String: Any]) -> V2CallResult {
         let requestedWindowId = v2UUID(params, "window_id")
         var result: V2CallResult = .ok([:])
-        DispatchQueue.main.sync {
+        _ = v2MainExec(timeout: 5) {
             let targetWindow: NSWindow?
             if let requestedWindowId {
                 guard let window = AppDelegate.shared?.mainWindow(for: requestedWindowId) else {
                     result = .err(
                         code: "not_found",
                         message: "Window not found",
-                        data: ["window_id": requestedWindowId.uuidString, "window_ref": v2Ref(kind: .window, uuid: requestedWindowId)]
+                        data: ["window_id": requestedWindowId.uuidString, "window_ref": self.v2Ref(kind: .window, uuid: requestedWindowId)]
                     )
                     return
                 }
@@ -91,7 +91,7 @@ extension TerminalController {
     func v2DebugOpenCommandPaletteRenameTabInput(params: [String: Any]) -> V2CallResult {
         let requestedWindowId = v2UUID(params, "window_id")
         var result: V2CallResult = .ok([:])
-        DispatchQueue.main.sync {
+        _ = v2MainExec(timeout: 5) {
             let targetWindow: NSWindow?
             if let requestedWindowId {
                 guard let window = AppDelegate.shared?.mainWindow(for: requestedWindowId) else {
@@ -100,7 +100,7 @@ extension TerminalController {
                         message: "Window not found",
                         data: [
                             "window_id": requestedWindowId.uuidString,
-                            "window_ref": v2Ref(kind: .window, uuid: requestedWindowId)
+                            "window_ref": self.v2Ref(kind: .window, uuid: requestedWindowId)
                         ]
                     )
                     return
@@ -119,12 +119,12 @@ extension TerminalController {
             return .err(code: "invalid_params", message: "Missing or invalid window_id", data: nil)
         }
         var visible = false
-        DispatchQueue.main.sync {
+        _ = v2MainExec(timeout: 5) {
             visible = AppDelegate.shared?.isCommandPaletteVisible(windowId: windowId) ?? false
         }
         return .ok([
             "window_id": windowId.uuidString,
-            "window_ref": v2Ref(kind: .window, uuid: windowId),
+            "window_ref": self.v2Ref(kind: .window, uuid: windowId),
             "visible": visible
         ])
     }
@@ -135,13 +135,13 @@ extension TerminalController {
         }
         var visible = false
         var selectedIndex = 0
-        DispatchQueue.main.sync {
+        _ = v2MainExec(timeout: 5) {
             visible = AppDelegate.shared?.isCommandPaletteVisible(windowId: windowId) ?? false
             selectedIndex = AppDelegate.shared?.commandPaletteSelectionIndex(windowId: windowId) ?? 0
         }
         return .ok([
             "window_id": windowId.uuidString,
-            "window_ref": v2Ref(kind: .window, uuid: windowId),
+            "window_ref": self.v2Ref(kind: .window, uuid: windowId),
             "visible": visible,
             "selected_index": max(0, selectedIndex)
         ])
@@ -158,7 +158,7 @@ extension TerminalController {
         var selectedIndex = 0
         var snapshot = CommandPaletteDebugSnapshot.empty
 
-        DispatchQueue.main.sync {
+        _ = v2MainExec(timeout: 5) {
             visible = AppDelegate.shared?.isCommandPaletteVisible(windowId: windowId) ?? false
             selectedIndex = AppDelegate.shared?.commandPaletteSelectionIndex(windowId: windowId) ?? 0
             snapshot = AppDelegate.shared?.commandPaletteSnapshot(windowId: windowId) ?? .empty
@@ -176,7 +176,7 @@ extension TerminalController {
 
         return .ok([
             "window_id": windowId.uuidString,
-            "window_ref": v2Ref(kind: .window, uuid: windowId),
+            "window_ref": self.v2Ref(kind: .window, uuid: windowId),
             "visible": visible,
             "selected_index": max(0, selectedIndex),
             "query": snapshot.query,
@@ -188,7 +188,7 @@ extension TerminalController {
     func v2DebugCommandPaletteRenameInputInteraction(params: [String: Any]) -> V2CallResult {
         let requestedWindowId = v2UUID(params, "window_id")
         var result: V2CallResult = .ok([:])
-        DispatchQueue.main.sync {
+        _ = v2MainExec(timeout: 5) {
             let targetWindow: NSWindow?
             if let requestedWindowId {
                 guard let window = AppDelegate.shared?.mainWindow(for: requestedWindowId) else {
@@ -197,7 +197,7 @@ extension TerminalController {
                         message: "Window not found",
                         data: [
                             "window_id": requestedWindowId.uuidString,
-                            "window_ref": v2Ref(kind: .window, uuid: requestedWindowId)
+                            "window_ref": self.v2Ref(kind: .window, uuid: requestedWindowId)
                         ]
                     )
                     return
@@ -214,7 +214,7 @@ extension TerminalController {
     func v2DebugCommandPaletteRenameInputDeleteBackward(params: [String: Any]) -> V2CallResult {
         let requestedWindowId = v2UUID(params, "window_id")
         var result: V2CallResult = .ok([:])
-        DispatchQueue.main.sync {
+        _ = v2MainExec(timeout: 5) {
             let targetWindow: NSWindow?
             if let requestedWindowId {
                 guard let window = AppDelegate.shared?.mainWindow(for: requestedWindowId) else {
@@ -223,7 +223,7 @@ extension TerminalController {
                         message: "Window not found",
                         data: [
                             "window_id": requestedWindowId.uuidString,
-                            "window_ref": v2Ref(kind: .window, uuid: requestedWindowId)
+                            "window_ref": self.v2Ref(kind: .window, uuid: requestedWindowId)
                         ]
                     )
                     return
@@ -244,19 +244,19 @@ extension TerminalController {
 
         var result: V2CallResult = .ok([
             "window_id": windowId.uuidString,
-            "window_ref": v2Ref(kind: .window, uuid: windowId),
+            "window_ref": self.v2Ref(kind: .window, uuid: windowId),
             "focused": false,
             "selection_location": 0,
             "selection_length": 0,
             "text_length": 0
         ])
 
-        DispatchQueue.main.sync {
+        _ = v2MainExec(timeout: 5) {
             guard let window = AppDelegate.shared?.mainWindow(for: windowId) else {
                 result = .err(
                     code: "not_found",
                     message: "Window not found",
-                    data: ["window_id": windowId.uuidString, "window_ref": v2Ref(kind: .window, uuid: windowId)]
+                    data: ["window_id": windowId.uuidString, "window_ref": self.v2Ref(kind: .window, uuid: windowId)]
                 )
                 return
             }
@@ -267,7 +267,7 @@ extension TerminalController {
             let textLength = (editor.string as NSString).length
             result = .ok([
                 "window_id": windowId.uuidString,
-                "window_ref": v2Ref(kind: .window, uuid: windowId),
+                "window_ref": self.v2Ref(kind: .window, uuid: windowId),
                 "focused": true,
                 "selection_location": max(0, selectedRange.location),
                 "selection_length": max(0, selectedRange.length),
@@ -287,7 +287,7 @@ extension TerminalController {
                     data: ["enabled": rawEnabled]
                 )
             }
-            DispatchQueue.main.sync {
+            _ = v2MainExec(timeout: 5) {
                 UserDefaults.standard.set(
                     enabled,
                     forKey: CommandPaletteRenameSelectionSettings.selectAllOnFocusKey
@@ -296,7 +296,7 @@ extension TerminalController {
         }
 
         var enabled = CommandPaletteRenameSelectionSettings.defaultSelectAllOnFocus
-        DispatchQueue.main.sync {
+        _ = v2MainExec(timeout: 5) {
             enabled = CommandPaletteRenameSelectionSettings.selectAllOnFocusEnabled()
         }
 
@@ -310,19 +310,19 @@ extension TerminalController {
             return .err(code: "invalid_params", message: "Missing or invalid window_id", data: nil)
         }
         var visibility: Bool?
-        DispatchQueue.main.sync {
+        _ = v2MainExec(timeout: 5) {
             visibility = AppDelegate.shared?.sidebarVisibility(windowId: windowId)
         }
         guard let visible = visibility else {
             return .err(
                 code: "not_found",
                 message: "Window not found",
-                data: ["window_id": windowId.uuidString, "window_ref": v2Ref(kind: .window, uuid: windowId)]
+                data: ["window_id": windowId.uuidString, "window_ref": self.v2Ref(kind: .window, uuid: windowId)]
             )
         }
         return .ok([
             "window_id": windowId.uuidString,
-            "window_ref": v2Ref(kind: .window, uuid: windowId),
+            "window_ref": self.v2Ref(kind: .window, uuid: windowId),
             "visible": visible
         ])
     }
@@ -534,7 +534,7 @@ extension TerminalController {
 
         let trimmedSurfaceArg = surfaceArg.trimmingCharacters(in: .whitespacesAndNewlines)
         var result = "ERROR: No tab selected"
-        DispatchQueue.main.sync {
+        _ = v2MainExec(timeout: 5) {
             guard let tabId = tabManager.selectedTabId,
                   let tab = tabManager.tabs.first(where: { $0.id == tabId }) else {
                 return
@@ -544,7 +544,7 @@ extension TerminalController {
             if trimmedSurfaceArg.isEmpty {
                 panelId = tab.focusedPanelId
             } else {
-                panelId = resolveSurfaceId(from: trimmedSurfaceArg, tab: tab)
+                panelId = self.resolveSurfaceId(from: trimmedSurfaceArg, tab: tab)
             }
 
             guard let panelId,
@@ -553,7 +553,7 @@ extension TerminalController {
                 return
             }
 
-            result = readTerminalTextBase64(
+            result = self.readTerminalTextBase64(
                 terminalPanel: terminalPanel,
                 includeScrollback: includeScrollback,
                 lineLimit: lineLimit
@@ -571,7 +571,7 @@ extension TerminalController {
             return error.message
         }
 
-        let response = readTerminalTextBase64(
+        let response = self.readTerminalTextBase64(
             surfaceArg: options.surfaceArg,
             includeScrollback: options.includeScrollback,
             lineLimit: options.lineLimit
@@ -783,7 +783,7 @@ extension TerminalController {
 	        let requestTimestamp = ProcessInfo.processInfo.systemUptime
 	
 	        var result = "ERROR: Failed to create event"
-	        DispatchQueue.main.sync {
+	        _ = v2MainExec(timeout: 5) {
 	            // Prefer the current active-tab-manager window so shortcut simulation stays
 	            // scoped to the intended window even when NSApp.keyWindow is stale.
 	            let targetWindow: NSWindow? = {
@@ -882,7 +882,7 @@ extension TerminalController {
         let text = unescapeSocketText(raw)
 
 	        var result = "ERROR: No window"
-	        DispatchQueue.main.sync {
+	        _ = v2MainExec(timeout: 5) {
 	            // Like simulate_shortcut, prefer a visible window so debug automation doesn't
 	            // fail during key window transitions.
 	            guard let window = NSApp.keyWindow
@@ -922,7 +922,7 @@ extension TerminalController {
         }
 
         var result = "ERROR: No window"
-        DispatchQueue.main.sync {
+        _ = v2MainExec(timeout: 5) {
             guard let window = NSApp.mainWindow
                 ?? NSApp.keyWindow
                 ?? NSApp.windows.first(where: { win in
@@ -950,7 +950,7 @@ extension TerminalController {
             var current: NSView? = hit
             var depth = 0
             while let view = current, depth < 8 {
-                chain.append(debugDragHitViewDescriptor(view))
+                chain.append(self.debugDragHitViewDescriptor(view))
                 current = view.superview
                 depth += 1
             }
@@ -1024,14 +1024,14 @@ extension TerminalController {
         guard !panelArg.isEmpty else { return "ERROR: Usage: is_terminal_focused <panel_id|idx>" }
 
         var result = "false"
-        DispatchQueue.main.sync {
+        _ = v2MainExec(timeout: 5) {
             guard let tabId = tabManager.selectedTabId,
                   let tab = tabManager.tabs.first(where: { $0.id == tabId }) else {
                 result = "false"
                 return
             }
 
-            guard let panelId = resolveSurfaceId(from: panelArg, tab: tab),
+            guard let panelId = self.resolveSurfaceId(from: panelArg, tab: tab),
                   let terminalPanel = tab.terminalPanel(for: panelId) else {
                 result = "false"
                 return
@@ -1042,7 +1042,7 @@ extension TerminalController {
     }
 
     func readTerminalText(_ args: String) -> String {
-        readTerminalTextBase64(surfaceArg: args)
+        self.readTerminalTextBase64(surfaceArg: args)
     }
 
     struct RenderStatsResponse: Codable {
@@ -1070,7 +1070,7 @@ extension TerminalController {
         let panelArg = args.trimmingCharacters(in: .whitespacesAndNewlines)
 
         var result = "ERROR: No tab selected"
-        DispatchQueue.main.sync {
+        _ = v2MainExec(timeout: 5) {
             guard let tabId = tabManager.selectedTabId,
                   let tab = tabManager.tabs.first(where: { $0.id == tabId }) else {
                 return
@@ -1080,7 +1080,7 @@ extension TerminalController {
             if panelArg.isEmpty {
                 panelId = tab.focusedPanelId
             } else {
-                panelId = resolveSurfaceId(from: panelArg, tab: tab)
+                panelId = self.resolveSurfaceId(from: panelArg, tab: tab)
             }
 
             guard let panelId,
@@ -1341,7 +1341,7 @@ extension TerminalController {
         guard let windowId = v2MainSync({ AppDelegate.shared?.createMainWindow() }) else {
             return "ERROR: Failed to create window"
         }
-        if socketCommandAllowsInAppFocusMutations(),
+        if self.socketCommandAllowsInAppFocusMutations(),
            let tm = v2MainSync({ AppDelegate.shared?.tabManagerFor(windowId: windowId) }) {
             setActiveTabManager(tm)
         }
@@ -1362,7 +1362,7 @@ extension TerminalController {
         guard let windowId = UUID(uuidString: parts[1]) else { return "ERROR: Invalid window id" }
 
         var ok = false
-        let focus = socketCommandAllowsInAppFocusMutations()
+        let focus = self.socketCommandAllowsInAppFocusMutations()
         v2MainSync {
             guard let srcTM = AppDelegate.shared?.tabManagerFor(tabId: wsId),
                   let dstTM = AppDelegate.shared?.tabManagerFor(windowId: windowId),
@@ -1385,10 +1385,10 @@ extension TerminalController {
         guard let tabManager = tabManager else { return "ERROR: TabManager not available" }
 
         var result: String = ""
-        DispatchQueue.main.sync {
+        _ = v2MainExec(timeout: 5) {
             let tabs = tabManager.tabs.map { tab in
                 let selected = tab.id == tabManager.selectedTabId ? "*" : " "
-                let ref = v2EnsureHandleRef(kind: .workspace, uuid: tab.id)
+                let ref = self.v2EnsureHandleRef(kind: .workspace, uuid: tab.id)
                 return "\(selected) \(ref): \(tab.id.uuidString) \(tab.title)"
             }
             result = tabs.joined(separator: "\n")
@@ -1400,11 +1400,11 @@ extension TerminalController {
         guard let tabManager = tabManager else { return "ERROR: TabManager not available" }
 
         var newTabId: UUID?
-        let focus = socketCommandAllowsInAppFocusMutations()
+        let focus = self.socketCommandAllowsInAppFocusMutations()
         #if DEBUG
         let startedAt = ProcessInfo.processInfo.systemUptime
         #endif
-        DispatchQueue.main.sync {
+        _ = v2MainExec(timeout: 5) {
             let workspace = tabManager.addTab(select: focus)
             newTabId = workspace.id
         }
@@ -1434,7 +1434,7 @@ extension TerminalController {
         }
 
         var result = "ERROR: Failed to create split"
-        DispatchQueue.main.sync {
+        _ = v2MainExec(timeout: 5) {
             guard let tabId = tabManager.selectedTabId,
                   let tab = tabManager.tabs.first(where: { $0.id == tabId }) else {
                 return
@@ -1443,7 +1443,7 @@ extension TerminalController {
             // If panel arg provided, resolve it; otherwise use focused panel
             let surfaceId: UUID?
             if !panelArg.isEmpty {
-                surfaceId = resolveSurfaceId(from: panelArg, tab: tab)
+                surfaceId = self.resolveSurfaceId(from: panelArg, tab: tab)
                 if surfaceId == nil {
                     result = "ERROR: Panel not found"
                     return
@@ -1461,7 +1461,7 @@ extension TerminalController {
                 tabId: tabId,
                 surfaceId: targetSurface,
                 direction: direction,
-                focus: socketCommandAllowsInAppFocusMutations()
+                focus: self.socketCommandAllowsInAppFocusMutations()
             ) {
                 result = "OK \(newPanelId.uuidString)"
             }
@@ -1472,16 +1472,16 @@ extension TerminalController {
     func listSurfaces(_ tabArg: String) -> String {
         guard let tabManager = tabManager else { return "ERROR: TabManager not available" }
         var result = ""
-        DispatchQueue.main.sync {
-            guard let tab = resolveTab(from: tabArg, tabManager: tabManager) else {
+        _ = v2MainExec(timeout: 5) {
+            guard let tab = self.resolveTab(from: tabArg, tabManager: tabManager) else {
                 result = "ERROR: Tab not found"
                 return
             }
-            let panels = orderedPanels(in: tab)
+            let panels = self.orderedPanels(in: tab)
             let focusedId = tab.focusedPanelId
             let lines = panels.map { panel in
                 let selected = panel.id == focusedId ? "*" : " "
-                let ref = v2EnsureHandleRef(kind: .surface, uuid: panel.id)
+                let ref = self.v2EnsureHandleRef(kind: .surface, uuid: panel.id)
                 return "\(selected) \(ref): \(panel.id.uuidString)"
             }
             result = lines.isEmpty ? "No surfaces" : lines.joined(separator: "\n")
@@ -1495,7 +1495,7 @@ extension TerminalController {
         guard !trimmed.isEmpty else { return "ERROR: Missing panel id or index" }
 
         var success = false
-        DispatchQueue.main.sync {
+        _ = v2MainExec(timeout: 5) {
             guard let tabId = tabManager.selectedTabId,
                   let tab = tabManager.tabs.first(where: { $0.id == tabId }) else {
                 return
@@ -1509,7 +1509,7 @@ extension TerminalController {
                 return
             }
 
-            if let uuid = v2ResolveHandleRef(trimmed),
+            if let uuid = self.v2ResolveHandleRef(trimmed),
                tab.panels[uuid] != nil {
                 guard tab.surfaceIdFromPanelId(uuid) != nil else { return }
                 tabManager.focusSurface(tabId: tab.id, surfaceId: uuid)
@@ -1524,14 +1524,14 @@ extension TerminalController {
         guard let tabManager = tabManager else { return "ERROR: TabManager not available" }
 
         var result = "OK"
-        DispatchQueue.main.sync {
+        _ = v2MainExec(timeout: 5) {
             guard let tabId = tabManager.selectedTabId else {
                 result = "ERROR: No tab selected"
                 return
             }
             let surfaceId = tabManager.focusedSurfaceId(for: tabId)
-            let (title, subtitle, body) = parseNotificationPayload(args)
-            notifications.addNotification(
+            let (title, subtitle, body) = self.parseNotificationPayload(args)
+            self.notifications.addNotification(
                 tabId: tabId,
                 surfaceId: surfaceId,
                 title: title,
@@ -1552,18 +1552,18 @@ extension TerminalController {
         let payload = parts.count > 1 ? parts[1] : ""
 
         var result = "OK"
-        DispatchQueue.main.sync {
+        _ = v2MainExec(timeout: 5) {
             guard let tabId = tabManager.selectedTabId,
                   let tab = tabManager.tabs.first(where: { $0.id == tabId }) else {
                 result = "ERROR: No tab selected"
                 return
             }
-            guard let surfaceId = resolveSurfaceId(from: surfaceArg, tab: tab) else {
+            guard let surfaceId = self.resolveSurfaceId(from: surfaceArg, tab: tab) else {
                 result = "ERROR: Surface not found"
                 return
             }
-            let (title, subtitle, body) = parseNotificationPayload(payload)
-            notifications.addNotification(
+            let (title, subtitle, body) = self.parseNotificationPayload(payload)
+            self.notifications.addNotification(
                 tabId: tabId,
                 surfaceId: surfaceId,
                 title: title,
@@ -1587,8 +1587,8 @@ extension TerminalController {
         let payload = parts.count > 2 ? parts[2] : ""
 
         var result = "OK"
-        DispatchQueue.main.sync {
-            guard let tab = resolveTab(from: tabArg, tabManager: tabManager) else {
+        _ = v2MainExec(timeout: 5) {
+            guard let tab = self.resolveTab(from: tabArg, tabManager: tabManager) else {
                 result = "ERROR: Tab not found"
                 return
             }
@@ -1597,8 +1597,8 @@ extension TerminalController {
                 result = "ERROR: Panel not found"
                 return
             }
-            let (title, subtitle, body) = parseNotificationPayload(payload)
-            notifications.addNotification(
+            let (title, subtitle, body) = self.parseNotificationPayload(payload)
+            self.notifications.addNotification(
                 tabId: tab.id,
                 surfaceId: panelId,
                 title: title,
@@ -1623,8 +1623,8 @@ extension TerminalController {
 
     func listNotifications() -> String {
         var result = ""
-        DispatchQueue.main.sync {
-            let lines = notifications.notifications.enumerated().map { index, notification in
+        _ = v2MainExec(timeout: 5) {
+            let lines = self.notifications.notifications.enumerated().map { index, notification in
                 let surfaceText = notification.surfaceId?.uuidString ?? "none"
                 let readText = notification.isRead ? "read" : "unread"
                 return "\(index):\(notification.id.uuidString)|\(notification.tabId.uuidString)|\(surfaceText)|\(readText)|\(notification.title)|\(notification.subtitle)|\(notification.body)"
@@ -1676,12 +1676,12 @@ extension TerminalController {
         let surfaceArg = parts.count > 1 ? parts[1] : ""
 
         var result = "OK"
-        DispatchQueue.main.sync {
-            guard let tab = resolveTab(from: tabArg, tabManager: tabManager) else {
+        _ = v2MainExec(timeout: 5) {
+            guard let tab = self.resolveTab(from: tabArg, tabManager: tabManager) else {
                 result = "ERROR: Tab not found"
                 return
             }
-            let surfaceId = surfaceArg.isEmpty ? nil : resolveSurfaceId(from: surfaceArg, tab: tab)
+            let surfaceId = surfaceArg.isEmpty ? nil : self.resolveSurfaceId(from: surfaceArg, tab: tab)
             if !surfaceArg.isEmpty && surfaceId == nil {
                 result = "ERROR: Surface not found"
                 return
@@ -1697,13 +1697,13 @@ extension TerminalController {
         guard !trimmed.isEmpty else { return "ERROR: Missing surface id or index" }
 
         var result = "ERROR: Surface not found"
-        DispatchQueue.main.sync {
+        _ = v2MainExec(timeout: 5) {
             guard let tabId = tabManager.selectedTabId,
                   let tab = tabManager.tabs.first(where: { $0.id == tabId }) else {
                 result = "ERROR: No tab selected"
                 return
             }
-            guard let surfaceId = resolveSurfaceId(from: trimmed, tab: tab) else {
+            guard let surfaceId = self.resolveSurfaceId(from: trimmed, tab: tab) else {
                 result = "ERROR: Surface not found"
                 return
             }
@@ -1748,7 +1748,7 @@ extension TerminalController {
             return tabManager.tabs.first(where: { $0.id == uuid })
         }
 
-        if let uuid = v2ResolveHandleRef(trimmed) {
+        if let uuid = self.v2ResolveHandleRef(trimmed) {
             return tabManager.tabs.first(where: { $0.id == uuid })
         }
 
@@ -1789,7 +1789,7 @@ extension TerminalController {
             return tab.terminalPanel(for: uuid)
         }
 
-        if let uuid = v2ResolveHandleRef(arg) {
+        if let uuid = self.v2ResolveHandleRef(arg) {
             return tab.terminalPanel(for: uuid)
         }
 
@@ -1827,7 +1827,7 @@ extension TerminalController {
             return uuid
         }
 
-        if let uuid = v2ResolveHandleRef(arg), tab.panels[uuid] != nil {
+        if let uuid = self.v2ResolveHandleRef(arg), tab.panels[uuid] != nil {
             return uuid
         }
 
@@ -1851,14 +1851,14 @@ extension TerminalController {
         let uuid: UUID
         if let directUUID = UUID(uuidString: tabId) {
             uuid = directUUID
-        } else if let refUUID = v2ResolveHandleRef(tabId) {
+        } else if let refUUID = self.v2ResolveHandleRef(tabId) {
             uuid = refUUID
         } else {
             return "ERROR: Invalid tab ID or ref"
         }
 
         var success = false
-        DispatchQueue.main.sync {
+        _ = v2MainExec(timeout: 5) {
             if let tab = tabManager.tabs.first(where: { $0.id == uuid }) {
                 tabManager.closeTab(tab)
                 success = true
@@ -1871,7 +1871,7 @@ extension TerminalController {
         guard let tabManager = tabManager else { return "ERROR: TabManager not available" }
 
         var success = false
-        DispatchQueue.main.sync {
+        _ = v2MainExec(timeout: 5) {
             // Try as UUID first
             if let uuid = UUID(uuidString: arg) {
                 if let tab = tabManager.tabs.first(where: { $0.id == uuid }) {
@@ -1880,7 +1880,7 @@ extension TerminalController {
                 }
             }
             // Try as short ref (e.g. workspace:1)
-            else if let uuid = v2ResolveHandleRef(arg),
+            else if let uuid = self.v2ResolveHandleRef(arg),
                     let tab = tabManager.tabs.first(where: { $0.id == uuid }) {
                 tabManager.selectTab(tab)
                 success = true
@@ -1893,7 +1893,7 @@ extension TerminalController {
         guard let tabManager = tabManager else { return "ERROR: TabManager not available" }
 
         var result: String = ""
-        DispatchQueue.main.sync {
+        _ = v2MainExec(timeout: 5) {
             if let id = tabManager.selectedTabId {
                 result = id.uuidString
             }

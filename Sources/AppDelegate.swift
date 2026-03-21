@@ -32,6 +32,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         let sidebarState: SidebarState
         let sidebarSelectionState: SidebarSelectionState
         weak var window: NSWindow?
+        /// Observer token for NSWindow.willCloseNotification — must be removed on unregister.
+        var closeObserver: NSObjectProtocol?
 
         init(
             windowId: UUID,
@@ -479,14 +481,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         if let existing = mainWindowContexts[key] {
             existing.window = window
         } else {
-            mainWindowContexts[key] = MainWindowContext(
+            let context = MainWindowContext(
                 windowId: windowId,
                 tabManager: tabManager,
                 sidebarState: sidebarState,
                 sidebarSelectionState: sidebarSelectionState,
                 window: window
             )
-            NotificationCenter.default.addObserver(
+            context.closeObserver = NotificationCenter.default.addObserver(
                 forName: NSWindow.willCloseNotification,
                 object: window,
                 queue: .main
@@ -494,6 +496,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
                 guard let self, let closing = note.object as? NSWindow else { return }
                 self.unregisterMainWindow(closing)
             }
+            mainWindowContexts[key] = context
         }
         commandPaletteVisibilityByWindowId[windowId] = false
         commandPaletteSelectionByWindowId[windowId] = 0

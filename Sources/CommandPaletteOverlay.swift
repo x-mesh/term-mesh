@@ -28,6 +28,11 @@ final class WindowCommandPaletteOverlayController: NSObject {
     private var focusLockTimer: DispatchSourceTimer?
     private var scheduledFocusWorkItem: DispatchWorkItem?
 
+    deinit {
+        focusLockTimer?.cancel()
+        scheduledFocusWorkItem?.cancel()
+    }
+
     init(window: NSWindow) {
         self.window = window
         super.init()

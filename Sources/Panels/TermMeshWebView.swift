@@ -455,7 +455,8 @@ final class TermMeshWebView: WKWebView {
         }
 
         let cookieStore = configuration.websiteDataStore.httpCookieStore
-        cookieStore.getAllCookies { cookies in
+        cookieStore.getAllCookies { [weak self] cookies in
+            guard let self = self else { return }
             var request = URLRequest(url: url)
             request.httpMethod = "GET"
             let cookieHeaders = HTTPCookie.requestHeaderFields(with: cookies)
@@ -469,8 +470,9 @@ final class TermMeshWebView: WKWebView {
                 request.setValue(ua, forHTTPHeaderField: "User-Agent")
             }
 
-            URLSession.shared.dataTask(with: request) { data, response, error in
-                DispatchQueue.main.async {
+            URLSession.shared.dataTask(with: request) { [weak self] data, response, error in
+                DispatchQueue.main.async { [weak self] in
+                    guard let self = self else { return }
                     guard let data, error == nil else {
                         self.notifyContextMenuDownloadState(false)
                         self.runContextMenuFallback(action: fallbackAction, target: fallbackTarget, sender: sender)
@@ -487,7 +489,8 @@ final class TermMeshWebView: WKWebView {
                     savePanel.directoryURL = FileManager.default.urls(for: .downloadsDirectory, in: .userDomainMask).first
                     // Download is already complete; we're now waiting for user save choice.
                     self.notifyContextMenuDownloadState(false)
-                    savePanel.begin { result in
+                    savePanel.begin { [weak self] result in
+                        guard let self = self else { return }
                         guard result == .OK, let destURL = savePanel.url else { return }
                         do {
                             try data.write(to: destURL, options: .atomic)

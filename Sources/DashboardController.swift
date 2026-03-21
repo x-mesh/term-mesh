@@ -120,6 +120,7 @@ final class DashboardController: NSObject, WKNavigationDelegate {
         stopUIPolling()
         window?.close()
         window = nil
+        webView?.configuration.userContentController.removeAllScriptMessageHandlers()
         webView = nil
         messageHandler = nil
     }
@@ -720,6 +721,7 @@ extension DashboardController: NSWindowDelegate {
     nonisolated func windowWillClose(_ notification: Notification) {
         Task { @MainActor in
             stopUIPolling()
+            webView?.configuration.userContentController.removeAllScriptMessageHandlers()
             webView = nil
             window = nil
         }

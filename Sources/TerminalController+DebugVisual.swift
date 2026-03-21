@@ -25,12 +25,12 @@ extension TerminalController {
         guard !panelArg.isEmpty else { return "ERROR: Usage: panel_snapshot_reset <panel_id|idx>" }
 
         var result = "ERROR: No tab selected"
-        DispatchQueue.main.sync {
+        _ = v2MainExec(timeout: 5) {
             guard let tabId = tabManager.selectedTabId,
                   let tab = tabManager.tabs.first(where: { $0.id == tabId }) else {
                 return
             }
-            guard let panelId = resolveSurfaceId(from: panelArg, tab: tab) else {
+            guard let panelId = self.resolveSurfaceId(from: panelArg, tab: tab) else {
                 result = "ERROR: Surface not found"
                 return
             }
@@ -132,13 +132,13 @@ extension TerminalController {
         let outputPath = outputDir.appendingPathComponent(filename)
 
         var result = "ERROR: No tab selected"
-        DispatchQueue.main.sync {
+        _ = v2MainExec(timeout: 5) {
             guard let tabId = tabManager.selectedTabId,
                   let tab = tabManager.tabs.first(where: { $0.id == tabId }) else {
                 return
             }
 
-            guard let panelId = resolveSurfaceId(from: panelArg, tab: tab),
+            guard let panelId = self.resolveSurfaceId(from: panelArg, tab: tab),
                   let terminalPanel = tab.terminalPanel(for: panelId) else {
                 result = "ERROR: Terminal surface not found"
                 return
@@ -223,7 +223,7 @@ extension TerminalController {
         guard let tabManager else { return "ERROR: TabManager not available" }
 
         var result = "ERROR: No tab selected"
-        DispatchQueue.main.sync {
+        _ = v2MainExec(timeout: 5) {
             guard let tabId = tabManager.selectedTabId,
                   let tab = tabManager.tabs.first(where: { $0.id == tabId }) else {
                 return
@@ -395,7 +395,7 @@ extension TerminalController {
 
     func emptyPanelCount() -> String {
         var result = "OK 0"
-        DispatchQueue.main.sync {
+        _ = v2MainExec(timeout: 5) {
             result = "OK \(DebugUIEventCounters.emptyPanelAppearCount)"
         }
         return result
@@ -410,7 +410,7 @@ extension TerminalController {
 
     func bonsplitUnderflowCount() -> String {
         var result = "OK 0"
-        DispatchQueue.main.sync {
+        _ = v2MainExec(timeout: 5) {
 #if DEBUG
             result = "OK \(BonsplitDebugCounters.arrangedSubviewUnderflowCount)"
 #else
@@ -450,7 +450,7 @@ extension TerminalController {
 
         // Capture the main window on main thread
         var captureError: String?
-        DispatchQueue.main.sync {
+        _ = v2MainExec(timeout: 5) {
             guard let window = NSApp.mainWindow ?? NSApp.windows.first else {
                 captureError = "No window available"
                 return

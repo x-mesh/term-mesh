@@ -196,7 +196,7 @@ extension TerminalController {
 
         var success = false
         var error: String?
-        DispatchQueue.main.sync {
+        _ = v2MainExec(timeout: 5) {
             guard let selectedId = tabManager.selectedTabId,
                   let tab = tabManager.tabs.first(where: { $0.id == selectedId }),
                   let terminalPanel = tab.focusedTerminalPanel else {
@@ -212,7 +212,7 @@ extension TerminalController {
                 .replacingOccurrences(of: "\\t", with: "\t")
 
             if let surface = terminalPanel.surface.surface {
-                sendSocketText(unescaped, surface: surface)
+                self.sendSocketText(unescaped, surface: surface)
             } else {
                 terminalPanel.sendText(unescaped)
                 terminalPanel.surface.requestBackgroundSurfaceStartIfNeeded()
@@ -232,8 +232,8 @@ extension TerminalController {
         let text = parts[1]
 
         var success = false
-        DispatchQueue.main.sync {
-            guard let terminalPanel = resolveTerminalPanel(from: target, tabManager: tabManager) else { return }
+        _ = v2MainExec(timeout: 5) {
+            guard let terminalPanel = self.resolveTerminalPanel(from: target, tabManager: tabManager) else { return }
 
             let unescaped = text
                 .replacingOccurrences(of: "\\n", with: "\r")
@@ -241,7 +241,7 @@ extension TerminalController {
                 .replacingOccurrences(of: "\\t", with: "\t")
 
             if let surface = terminalPanel.surface.surface {
-                sendSocketText(unescaped, surface: surface)
+                self.sendSocketText(unescaped, surface: surface)
             } else {
                 terminalPanel.sendText(unescaped)
                 terminalPanel.surface.requestBackgroundSurfaceStartIfNeeded()
@@ -257,7 +257,7 @@ extension TerminalController {
 
         var success = false
         var error: String?
-        DispatchQueue.main.sync {
+        _ = v2MainExec(timeout: 5) {
             guard let selectedId = tabManager.selectedTabId,
                   let tab = tabManager.tabs.first(where: { $0.id == selectedId }),
                   let terminalPanel = tab.focusedTerminalPanel else {
@@ -270,7 +270,7 @@ extension TerminalController {
                 return
             }
 
-            success = sendNamedKey(surface, keyName: keyName)
+            success = self.sendNamedKey(surface, keyName: keyName)
         }
         if let error { return error }
         return success ? "OK" : "ERROR: Unknown key '\(keyName)'"
@@ -286,8 +286,8 @@ extension TerminalController {
 
         var success = false
         var error: String?
-        DispatchQueue.main.sync {
-            guard let terminalPanel = resolveTerminalPanel(from: target, tabManager: tabManager) else {
+        _ = v2MainExec(timeout: 5) {
+            guard let terminalPanel = self.resolveTerminalPanel(from: target, tabManager: tabManager) else {
                 error = "ERROR: Surface not found"
                 return
             }
@@ -295,7 +295,7 @@ extension TerminalController {
                 error = "ERROR: Surface not ready"
                 return
             }
-            success = sendNamedKey(surface, keyName: keyName)
+            success = self.sendNamedKey(surface, keyName: keyName)
         }
 
         if let error { return error }

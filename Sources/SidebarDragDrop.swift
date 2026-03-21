@@ -122,6 +122,10 @@ final class SidebarDragFailsafeMonitor: ObservableObject {
     private var keyDownMonitor: Any?
     private var onRequestClear: ((String) -> Void)?
 
+    deinit {
+        MainActor.assumeIsolated { stop() }
+    }
+
     func start(onRequestClear: @escaping (String) -> Void) {
         self.onRequestClear = onRequestClear
         if timer == nil {
@@ -288,6 +292,10 @@ final class SidebarCommandKeyMonitor: ObservableObject {
     private var keyDownMonitor: Any?
     private var appResignObserver: NSObjectProtocol?
     private var pendingShowWorkItem: DispatchWorkItem?
+
+    deinit {
+        MainActor.assumeIsolated { stop() }
+    }
 
     func setHostWindow(_ window: NSWindow?) {
         guard hostWindow !== window else { return }

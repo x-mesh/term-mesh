@@ -229,6 +229,9 @@ extension AppDelegate {
         #endif
         let key = ObjectIdentifier(window)
         guard let removed = mainWindowContexts.removeValue(forKey: key) else { return }
+        if let observer = removed.closeObserver {
+            NotificationCenter.default.removeObserver(observer)
+        }
         commandPaletteVisibilityByWindowId.removeValue(forKey: removed.windowId)
         commandPaletteSelectionByWindowId.removeValue(forKey: removed.windowId)
         commandPaletteSnapshotByWindowId.removeValue(forKey: removed.windowId)
