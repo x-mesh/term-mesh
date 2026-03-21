@@ -585,32 +585,52 @@ enum MenuBarIconRenderer {
     }
 
     private static func drawGlyph(in rect: NSRect) {
-        // Match the canonical term-mesh center-mark path from Icon Center Image Artwork.svg.
-        let srcMinX: CGFloat = 384.0
-        let srcMinY: CGFloat = 255.0
-        let srcWidth: CGFloat = 369.0
-        let srcHeight: CGFloat = 513.0
+        // Simplified mesh network icon: nodes connected by edges.
+        // 5 nodes arranged in a loose pentagon with interconnecting lines.
+        let cx = rect.midX
+        let cy = rect.midY
+        let r: CGFloat = min(rect.width, rect.height) * 0.42
 
-        func map(_ x: CGFloat, _ y: CGFloat) -> NSPoint {
-            let nx = (x - srcMinX) / srcWidth
-            let ny = (y - srcMinY) / srcHeight
-            return NSPoint(
-                x: rect.minX + nx * rect.width,
-                y: rect.minY + (1.0 - ny) * rect.height
-            )
+        // Node positions (relative to center, slight asymmetry for organic feel)
+        let nodes: [(CGFloat, CGFloat)] = [
+            (cx,            cy + r * 0.95),  // top center
+            (cx + r * 0.9,  cy + r * 0.25),  // right upper
+            (cx + r * 0.55, cy - r * 0.85),  // right lower
+            (cx - r * 0.55, cy - r * 0.85),  // left lower
+            (cx - r * 0.9,  cy + r * 0.25),  // left upper
+        ]
+
+        // Edges: mesh connections (outer ring + cross links)
+        let edges: [(Int, Int)] = [
+            (0, 1), (1, 2), (2, 3), (3, 4), (4, 0),  // outer ring
+            (0, 2), (0, 3), (1, 3), (1, 4), (2, 4),   // cross links (full mesh)
+        ]
+
+        let lineColor = NSColor.white
+        let nodeColor = NSColor.white
+
+        // Draw edges
+        lineColor.setStroke()
+        for (a, b) in edges {
+            let path = NSBezierPath()
+            path.move(to: NSPoint(x: nodes[a].0, y: nodes[a].1))
+            path.line(to: NSPoint(x: nodes[b].0, y: nodes[b].1))
+            path.lineWidth = 0.8
+            path.stroke()
         }
 
-        let path = NSBezierPath()
-        path.move(to: map(384.0, 255.0))
-        path.line(to: map(753.0, 511.5))
-        path.line(to: map(384.0, 768.0))
-        path.line(to: map(384.0, 654.0))
-        path.line(to: map(582.692, 511.5))
-        path.line(to: map(384.0, 369.0))
-        path.close()
-
-        NSColor.white.setFill()
-        path.fill()
+        // Draw nodes (filled circles)
+        nodeColor.setFill()
+        let nodeRadius: CGFloat = 1.6
+        for (nx, ny) in nodes {
+            let dot = NSBezierPath(ovalIn: NSRect(
+                x: nx - nodeRadius,
+                y: ny - nodeRadius,
+                width: nodeRadius * 2,
+                height: nodeRadius * 2
+            ))
+            dot.fill()
+        }
     }
 
     private static func drawBadge(text: String, in rect: NSRect, config: MenuBarBadgeRenderConfig) {
