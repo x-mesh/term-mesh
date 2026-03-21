@@ -1,6 +1,6 @@
 # tm-op — 전략 오케스트레이션 커맨드
 
-에이전트 팀에게 구조화된 전략(발산·수렴·경쟁·파이프라인·리뷰)을 지시한다.
+에이전트 팀에게 구조화된 전략(발산·수렴·경쟁·파이프라인·리뷰·토론·공격방어·브레인스토밍)을 지시한다.
 리더 Claude(너)가 오케스트레이터 겸 LLM 합성 역할을 수행하며, tm-agent 프리미티브로 에이전트를 제어한다.
 
 ## Arguments
@@ -14,6 +14,9 @@ Parse `$ARGUMENTS`의 첫 단어로 전략을 결정한다:
 - `tournament` → [Strategy: tournament] 섹션 실행
 - `chain` → [Strategy: chain] 섹션 실행
 - `review` → [Strategy: review] 섹션 실행
+- `debate` → [Strategy: debate] 섹션 실행
+- `red-team` → [Strategy: red-team] 섹션 실행
+- `brainstorm` → [Strategy: brainstorm] 섹션 실행
 - 빈 입력 → 사용자에게 전략 선택 질문
 
 ## Options
@@ -26,6 +29,11 @@ Parse `$ARGUMENTS`의 첫 단어로 전략을 결정한다:
 - `--pr <number>` — review 대상 PR
 - `--judge <agent>` — tournament 심판 에이전트
 - `--timeout N` — 라운드별 타임아웃 초 (기본 120)
+- `--pro "agent,agent"` — debate 찬성팀 수동 지정
+- `--con "agent,agent"` — debate 반대팀 수동 지정
+- `--attackers "agent,agent"` — red-team 공격팀 수동 지정
+- `--defenders "agent,agent"` — red-team 방어팀 수동 지정
+- `--vote` — brainstorm에서 도트 투표 활성화
 
 ## Shared Setup
 
@@ -39,8 +47,9 @@ tm-agent status
 2. idle 에이전트 목록을 파악한다. working/blocked 에이전트는 제외한다.
 
 3. 전략별 최소 에이전트 수를 확인한다:
-   - chain, review: 최소 1명
-   - refine, tournament: 최소 2명
+   - chain, review, brainstorm: 최소 1명
+   - refine, tournament, red-team: 최소 2명
+   - debate: 최소 3명 (PRO 1+, CON 1+, JUDGE 1+)
    미달이면 경고를 출력하고 사용자에게 계속 진행할지 확인한다.
    tournament에서 에이전트가 1명뿐이면 "경쟁 불가 — chain 전략을 권장합니다" 안내.
 
@@ -403,12 +412,371 @@ tm-agent collect --lines 200
 
 ---
 
+## Strategy: debate
+
+정반합 토론. 찬성팀(PRO)과 반대팀(CON)이 구조화된 논쟁을 벌인 뒤 판정단이 평가.
+
+### Phase 1: POSITION (팀 분배)
+
+> ⚖️ [debate] Phase 1: Position — 팀 분배
+
+`--pro`/`--con` 옵션이 있으면 해당 에이전트를 배정한다.
+없으면 자동 분배:
+- idle 에이전트 리스트를 3등분: PRO(전반), CON(후반), JUDGES(나머지)
+- 최소 PRO 1명, CON 1명, JUDGE 1명 필요
+- JUDGE가 없으면 리더(Claude)가 판정
+
+사용자에게 팀 구성을 알린다:
+> PRO: {agent1, agent2} | CON: {agent3, agent4} | JUDGE: {agent5}
+
+### Phase 2: OPENING (입론)
+
+> ⚖️ [debate] Phase 2: Opening — 양측 입론
+
+PRO팀과 CON팀에게 동시에 입론을 요청한다:
+
+PRO팀 각 에이전트에게:
+```bash
+tm-agent delegate {pro_agent} '## Debate: PRO 입론
+논제: {TASK}
+당신은 찬성(PRO) 측이다. 이 제안/접근법을 지지하는 논거를 제시하라.
+- 핵심 장점 3가지
+- 구체적 근거와 예시
+- 300단어 이내
+[IMPORTANT] When done, run: tm-agent reply "<your argument>" to report.'
+```
+
+CON팀 각 에이전트에게 (동시에):
+```bash
+tm-agent delegate {con_agent} '## Debate: CON 입론
+논제: {TASK}
+당신은 반대(CON) 측이다. 이 제안/접근법의 문제점과 대안을 제시하라.
+- 핵심 위험/단점 3가지
+- 구체적 근거와 대안
+- 300단어 이내
+[IMPORTANT] When done, run: tm-agent reply "<your argument>" to report.'
+```
+
+```bash
+tm-agent wait --timeout {timeout} --mode report
+```
+
+양측 입론을 수집한다. 같은 팀의 복수 에이전트 입론은 리더가 팀별로 종합한다.
+
+### Phase 3: REBUTTAL (반박)
+
+> ⚖️ [debate] Phase 3: Rebuttal — 교차 반박 (Round {n})
+
+`--rounds N`으로 반박 라운드 수를 조절한다 (기본 1).
+
+PRO팀에게 CON 입론을 전달하고 반박 요청:
+```bash
+tm-agent delegate {pro_agent} '## Debate: PRO 반박 (Round {n})
+상대(CON)의 주장:
+{con_arguments}
+
+위 주장에 반박하라. 200단어 이내.
+[IMPORTANT] When done, run: tm-agent reply "<your rebuttal>" to report.'
+```
+
+CON팀에게 PRO 입론을 전달하고 반박 요청 (동시에):
+```bash
+tm-agent delegate {con_agent} '## Debate: CON 반박 (Round {n})
+상대(PRO)의 주장:
+{pro_arguments}
+
+위 주장에 반박하라. 200단어 이내.
+[IMPORTANT] When done, run: tm-agent reply "<your rebuttal>" to report.'
+```
+
+```bash
+tm-agent wait --timeout {timeout} --mode report
+```
+
+라운드 2 이상이면 이전 반박 결과를 포함하여 반복한다.
+
+### Phase 4: VERDICT (판정)
+
+> ⚖️ [debate] Phase 4: Verdict — 판정
+
+판정단 에이전트에게 전체 논쟁 기록을 전달:
+```bash
+tm-agent delegate {judge} '## Debate: 판정
+논제: {TASK}
+
+PRO 입론: {pro_opening}
+CON 입론: {con_opening}
+PRO 반박: {pro_rebuttal}
+CON 반박: {con_rebuttal}
+
+양측 논거를 평가하고 판정하라:
+1. 어느 쪽이 더 설득력 있는가? (PRO/CON)
+2. 각 측의 가장 강한 논거 1개
+3. 최종 권고 (200단어 이내)
+[IMPORTANT] When done, run: tm-agent reply "<your verdict>" to report.'
+```
+
+```bash
+tm-agent wait --timeout {timeout} --mode report
+```
+
+리더(Claude)가 판정단 결과를 종합하여 최종 결론을 내린다.
+판정단이 없는 경우(에이전트 3명 미만) 리더가 직접 판정한다.
+
+### Debate 최종 출력
+
+```
+⚖️ [debate] Complete — {topic}
+
+| Team | Agents | Key Argument |
+|------|--------|-------------|
+| PRO  | {agents} | {strongest point} |
+| CON  | {agents} | {strongest point} |
+
+## Verdict: {PRO|CON} — {한 줄 요약}
+{최종 판정 근거}
+
+## 논쟁 요약
+| Phase | PRO | CON |
+|-------|-----|-----|
+| Opening | {핵심 주장} | {핵심 주장} |
+| Rebuttal | {핵심 반박} | {핵심 반박} |
+```
+
+---
+
+## Strategy: red-team
+
+적대적 공격/방어. 공격팀이 취약점·결함을 발견하고 방어팀이 수정안을 제시.
+
+### Phase 1: TARGET (대상 수집)
+
+> 🔴 [red-team] Phase 1: Target — 공격 대상 수집
+
+리뷰 대상을 수집한다 (review 전략과 동일):
+- `--target <file>` → 해당 파일 읽기
+- `--pr <number>` → `gh pr diff {number}` 실행
+- 둘 다 없으면 → `git diff HEAD` (staged + unstaged)
+
+**보안 필터**: .env, credentials, secret, key 패턴이 포함된 파일은 제외하고 경고.
+
+### Phase 2: ASSIGN TEAMS (팀 분배)
+
+> 🔴 [red-team] Phase 2: Assign — 공격/방어팀 분배
+
+`--attackers`/`--defenders` 옵션이 있으면 해당 에이전트를 배정한다.
+없으면 역할 기반 자동 분배:
+- **공격팀 (ATTACKERS)**: security, tester, explorer, reviewer (취약점 발견에 적합)
+- **방어팀 (DEFENDERS)**: executor, backend, frontend, architect (수정/설계에 적합)
+- planner, writer → idle면 방어팀에 배정
+
+### Phase 3: ATTACK (공격)
+
+> 🔴 [red-team] Phase 3: Attack — 취약점/결함 탐색
+
+공격팀 에이전트에게 병렬로 공격 요청:
+```bash
+tm-agent delegate {attacker} '## Red Team: ATTACK
+대상 코드/설계:
+{target_content}
+
+적대적 관점에서 최대한 많은 취약점/결함/에지케이스를 찾아라.
+각 발견 항목을 아래 형식으로:
+- [Critical|High|Medium] 위치 — 공격 벡터 — 증명 시나리오
+공격적으로 사고하라. 방어 가능성은 고려하지 마라.
+[IMPORTANT] When done, run: tm-agent reply "<your attacks>" to report.'
+```
+
+```bash
+tm-agent wait --timeout {timeout} --mode report
+```
+
+리더가 공격 결과를 수집하고 중복을 제거한다.
+
+### Phase 4: DEFEND (방어)
+
+> 🔴 [red-team] Phase 4: Defend — 수정안 제시
+
+방어팀 에이전트에게 중복 제거된 공격 목록을 전달:
+```bash
+tm-agent delegate {defender} '## Red Team: DEFEND
+다음 공격이 보고되었다:
+{deduplicated_attacks}
+
+각 공격에 대해:
+1. 유효한 공격이면: 구체적 수정안 코드/설계 제시
+2. 무효한 공격이면: 반박 근거 제시 (왜 실제로는 문제가 아닌지)
+[IMPORTANT] When done, run: tm-agent reply "<your defenses>" to report.'
+```
+
+```bash
+tm-agent wait --timeout {timeout} --mode report
+```
+
+### Phase 5: REATTACK (재공격, 선택)
+
+`--rounds 2` 이상일 때만 실행.
+
+> 🔴 [red-team] Phase 5: Reattack — 수정안 재공격 (Round {n})
+
+방어팀의 수정안을 공격팀에게 전달하여 재공격:
+```bash
+tm-agent delegate {attacker} '## Red Team: REATTACK (Round {n})
+이전 공격에 대한 방어팀 수정안:
+{defense_results}
+
+수정안이 충분한지 검증하라. 여전히 취약한 부분이 있으면 새 공격 벡터를 제시.
+[IMPORTANT] When done, run: tm-agent reply "<your reattack>" to report.'
+```
+
+```bash
+tm-agent wait --timeout {timeout} --mode report
+```
+
+재공격 결과가 있으면 Phase 4(방어)를 반복한다. `--rounds` 횟수까지 반복.
+
+### Phase 6: REPORT (종합)
+
+리더(Claude)가 모든 공격/방어 결과를 종합한다:
+1. 각 공격 항목의 최종 상태 결정: Fixed(🟢), Partial(🟡), Open(🔴)
+2. 심각도별 정렬: Critical > High > Medium
+3. 수정안이 유효한지 리더가 최종 판단
+
+### Red-team 최종 출력
+
+```
+🔴 [red-team] Complete — {rounds} rounds, {total} vulnerabilities
+
+| # | Severity | Attack | Status | Defender |
+|---|----------|--------|--------|----------|
+| 1 | Critical | {attack description} | 🟢 Fixed | {agent} |
+| 2 | High     | {attack description} | 🟡 Partial | {agent} |
+| 3 | Medium   | {attack description} | 🔴 Open | — |
+
+## Fixed Issues (🟢)
+{수정안 상세}
+
+## Partial Fixes (🟡)
+{부분 수정 + 남은 위험}
+
+## Open Issues (🔴)
+{미해결 취약점 + 권장 조치}
+```
+
+---
+
+## Strategy: brainstorm
+
+자유 발산. 수렴 압력 없이 아이디어를 최대한 모은 뒤 분류·우선순위 매기기.
+
+### Phase 1: SEED (주제 제시)
+
+> 💡 [brainstorm] Phase 1: Seed — 주제 설정
+
+사용자에게 진행 상황을 알린다:
+> 💡 [brainstorm] "{TASK}" — {N}명 에이전트 참여, 발산 시작
+
+### Phase 2: GENERATE (아이디어 생성)
+
+> 💡 [brainstorm] Phase 2: Generate — 전원 아이디어 발산
+
+```bash
+tm-agent fan-out '## Brainstorm: {TASK}
+이 주제에 대해 아이디어를 최대한 많이 제시하라.
+규칙:
+- 비판 금지 — 실현 가능성은 나중에 판단
+- 기존 아이디어에 편승(build-on) OK
+- 각 아이디어는 제목 + 1-2줄 설명
+- 최소 5개 이상
+[IMPORTANT] When done, run: tm-agent reply "<your ideas>" to report.'
+```
+
+```bash
+tm-agent wait --timeout {timeout} --mode report
+tm-agent collect --lines 200
+```
+
+잘린 결과가 있으면 개별 reply 파일을 읽는다.
+
+### Phase 3: CLUSTER (분류)
+
+> 💡 [brainstorm] Phase 3: Cluster — 테마별 분류
+
+리더(Claude)가 전원 아이디어를 수집하고:
+1. 중복 제거 (같은 아이디어를 여러 에이전트가 제안한 경우 병합, 제안자 모두 표시)
+2. 테마별 그룹핑 (예: "성능", "UX", "아키텍처", "파격적 아이디어")
+3. 총 아이디어 수와 테마 수 카운트
+4. 각 아이디어에 번호 부여
+
+### Phase 4: VOTE (도트 투표, 선택)
+
+`--vote` 옵션이 있을 때만 실행.
+
+> 💡 [brainstorm] Phase 4: Vote — 도트 투표
+
+```bash
+tm-agent broadcast '## Brainstorm: 도트 투표
+아래 아이디어 목록에서 가장 가치 있다고 생각하는 3개를 선택하라.
+
+{clustered_ideas_with_numbers}
+
+형식: 1. [아이디어 번호], 2. [번호], 3. [번호] — 이유: [한 줄]
+[IMPORTANT] When done, run: tm-agent reply "<your votes>" to report.'
+```
+
+```bash
+tm-agent wait --timeout {timeout} --mode report
+tm-agent collect --lines 100
+```
+
+리더(Claude)가 투표를 집계한다:
+- 각 아이디어별 득표 수 계산
+- 득표 순으로 정렬
+- Top 5 선정
+
+### Brainstorm 최종 출력
+
+`--vote` 없을 때:
+```
+💡 [brainstorm] Complete — {N} ideas from {M} agents, {T} themes
+
+## 테마: {theme_1} ({count}개)
+- {idea_1} — {agent}
+- {idea_2} — {agent1, agent2}
+
+## 테마: {theme_2} ({count}개)
+- {idea_3} — {agent}
+...
+```
+
+`--vote` 있을 때:
+```
+💡 [brainstorm] Complete — {N} ideas from {M} agents, {T} themes
+
+## Top 5
+| Rank | Idea | Votes | By |
+|------|------|-------|----|
+| 1 | {idea} | {N}표 | {agents} |
+| 2 | {idea} | {N}표 | {agents} |
+...
+
+## 전체 아이디어 (테마별)
+### {theme_1} ({count}개)
+| # | Idea | By | Votes |
+|---|------|----|-------|
+| 1 | ... | architect | ⭐⭐⭐ |
+| 2 | ... | frontend | ⭐⭐ |
+...
+```
+
+---
+
 ## Interactive Mode
 
 `$ARGUMENTS`가 빈 경우, AskUserQuestion 도구를 사용하여 전략을 선택받는다:
 
 - Question: "어떤 전략을 사용할까요? 태스크도 함께 입력해주세요."
-- Options: "refine", "tournament", "chain", "review"
+- Options: "refine", "tournament", "chain", "review", "debate", "red-team", "brainstorm"
 
 사용자가 전략을 선택하면, 태스크 입력을 추가로 요청한 후 해당 전략 섹션을 실행한다.
 
