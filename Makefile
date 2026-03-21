@@ -24,7 +24,7 @@ APP_VERSION   := $(shell grep 'MARKETING_VERSION' GhosttyTabs.xcodeproj/project.
 DMG_NAME      := term-mesh-macos-$(APP_VERSION).dmg
 PROJECT_DIR   := $(shell pwd)
 
-.PHONY: build prod deploy deploy-prod dmg run stop clean daemon test
+.PHONY: build prod deploy deploy-prod dmg run stop clean daemon test install-commands
 
 build:
 	@echo "==> Building Xcode (Debug)..."
@@ -171,6 +171,7 @@ deploy-prod: prod
 	@echo "==> Launching term-mesh..."
 	@open "$(INSTALL_APP)"
 	@echo "==> Deployed Release to $(INSTALL_APP)"
+	@$(MAKE) install-commands
 
 dmg: prod
 	@echo "==> Verifying daemon binaries..."
@@ -228,6 +229,18 @@ dmg: prod
 	@echo "  Install: open $(DMG_NAME), drag term-mesh to Applications"
 	@echo "  Unsigned: run 'xattr -cr /Applications/term-mesh.app' after install"
 	@echo "================================================"
+	@$(MAKE) install-commands
+
+install-commands:
+	@echo "==> Installing Claude commands to ~/.claude/commands/..."
+	@mkdir -p "$(HOME)/.claude/commands"
+	@for cmd in tm-op team team-up tm-bench; do \
+		SRC="$(PROJECT_DIR)/.claude/commands/$$cmd.md"; \
+		if [ -f "$$SRC" ]; then \
+			cp "$$SRC" "$(HOME)/.claude/commands/$$cmd.md"; \
+		fi; \
+	done
+	@echo "==> Claude commands installed (tm-op, team, team-up, tm-bench)"
 
 clean:
 	@echo "==> Cleaning build artifacts..."
