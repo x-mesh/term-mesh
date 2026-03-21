@@ -10,6 +10,7 @@ User provided: $ARGUMENTS
 ## Routing
 
 Parse `$ARGUMENTS`의 첫 단어로 전략을 결정한다:
+- `list` → [Subcommand: list] 섹션 실행
 - `refine` → [Strategy: refine] 섹션 실행
 - `tournament` → [Strategy: tournament] 섹션 실행
 - `chain` → [Strategy: chain] 섹션 실행
@@ -81,6 +82,53 @@ cat ~/.term-mesh/results/my-team/<task_id>.md
 cat ~/.term-mesh/results/my-team/<agent>-reply.md
 ```
 3. **tm-agent collect** (요약 수집 — 잘릴 수 있음, 위 파일로 보완)
+
+---
+
+## Subcommand: list
+
+사용 가능한 전략과 서브커맨드 목록을 출력한다. 아래 표를 **그대로** 사용자에게 출력하라:
+
+```
+tm-op — 전략 오케스트레이션 커맨드
+
+서브커맨드:
+  list                    사용 가능한 전략/서브커맨드 목록 출력
+
+전략 (Strategies):
+  refine <topic>          발산→수렴→검증 라운드 기반 정제. 전원 독립 답변 후 종합·투표·검증 반복
+  tournament <topic>      전원 동시 경쟁 후 익명 투표로 최고 결과 채택
+  chain <topic>           A→B→C 순차 파이프라인. 이전 단계 결과가 다음 입력
+  review <--target file>  버그·보안·성능 관점 자동 배정 후 이슈 종합·심각도 정렬 리포트
+  debate <topic>          찬반 토론 후 판정. 설계 트레이드오프 분석에 적합
+  red-team <--target f>   공격팀이 결함 발견→방어팀이 수정. 보안·견고성 강화
+  brainstorm <topic>      수렴 없이 아이디어 발산→분류→투표
+
+옵션 (Options):
+  --rounds N              refine 라운드 수 (기본 4)
+  --preset <p>            quick | thorough | deep
+  --steps "a:t,b:t"       chain 단계 수동 지정
+  --target <file|dir>     review/red-team 대상
+  --pr <number>           review 대상 PR
+  --judge <agent>         tournament 심판 에이전트
+  --timeout N             라운드별 타임아웃 초 (기본 120)
+  --pro "a,b"             debate 찬성팀
+  --con "a,b"             debate 반대팀
+  --attackers "a,b"       red-team 공격팀
+  --defenders "a,b"       red-team 방어팀
+  --vote                  brainstorm 도트 투표 활성화
+
+예시:
+  /tm-op refine "결제 API 설계" --rounds 4
+  /tm-op tournament "로그인 구현"
+  /tm-op chain "보안 점검" --steps "explorer:분석,security:식별,reviewer:종합"
+  /tm-op review --target src/pay.ts
+  /tm-op debate "모놀리스 vs 마이크로서비스"
+  /tm-op red-team --target src/auth.ts
+  /tm-op brainstorm "v2 기능 아이디어" --vote
+```
+
+출력 후 즉시 종료. 전략을 실행하지 않는다.
 
 ---
 
