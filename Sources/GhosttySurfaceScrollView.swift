@@ -702,12 +702,34 @@ final class GhosttySurfaceScrollView: NSView {
             },
             onSendKey: { [weak self] keycode, mods in
                 guard let self, let surface = self.surfaceView.surface else { return }
+                // Map virtual keycode → unshifted Unicode codepoint.
+                // Ctrl+key combos (Ctrl+U, Ctrl+L, etc.) need the codepoint
+                // for Ghostty to derive the correct control character (codepoint & 0x1F).
+                let codepoint: UInt32 = {
+                    switch keycode {
+                    case 0x00: return 0x61  // a
+                    case 0x08: return 0x63  // c
+                    case 0x09: return 0x76  // v
+                    case 0x0D: return 0x77  // w
+                    case 0x0E: return 0x65  // e
+                    case 0x0F: return 0x72  // r
+                    case 0x20: return 0x75  // u
+                    case 0x25: return 0x6C  // l
+                    case 0x26: return 0x6A  // j
+                    case 0x28: return 0x6B  // k
+                    case 0x30: return 0x09  // tab
+                    case 0x33: return 0x08  // backspace
+                    case 0x35: return 0x1B  // escape
+                    case 0x75: return 0x7F  // forward delete
+                    default:   return 0     // arrows, etc.
+                    }
+                }()
                 var keyEvent = ghostty_input_key_s()
                 keyEvent.action = GHOSTTY_ACTION_PRESS
                 keyEvent.keycode = UInt32(keycode)
                 keyEvent.mods = ghostty_input_mods_e(rawValue: mods)
                 keyEvent.consumed_mods = GHOSTTY_MODS_NONE
-                keyEvent.unshifted_codepoint = 0
+                keyEvent.unshifted_codepoint = codepoint
                 keyEvent.composing = false
                 keyEvent.text = nil
                 _ = ghostty_surface_key(surface, keyEvent)
