@@ -346,6 +346,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
     // Instead, activate the existing main window. This prevents duplicate
     // windows that share the same @StateObject tabManager.
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
+        #if DEBUG
+        dlog("window.handleReopen flag=\(flag) contexts=\(mainWindowContexts.count) visibleWindows=\(NSApp.windows.filter { $0.isVisible }.count)")
+        #endif
         if flag {
             // Already have visible windows — just activate them
             return false
@@ -356,8 +359,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
             window.makeKeyAndOrderFront(nil)
             return false
         }
-        // No existing window at all — allow the system to create one
-        return true
+        // No existing window at all. Previously we returned true here, which let macOS
+        // delegate window creation to SwiftUI's WindowGroup — causing it to produce a
+        // duplicate scene that shares TermMeshApp's @StateObject tabManager. Instead,
+        // create a window via AppDelegate so it gets its own independent TabManager.
+        createMainWindow()
+        return false
     }
 
     func applicationDidBecomeActive(_ notification: Notification) {

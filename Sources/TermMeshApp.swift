@@ -1,6 +1,7 @@
 import AppKit
 import SwiftUI
 import Darwin
+import Bonsplit
 
 @main
 struct TermMeshApp: App {
@@ -209,12 +210,30 @@ struct TermMeshApp: App {
                     if termMeshEnv("UI_TEST_MODE") == "1" {
                         UpdateLogStore.shared.append("ui test: TermMeshApp onAppear")
                     }
-                    let existingWindows = appDelegate.mainWindowContexts.count
-                    NSLog("[TermMeshApp] WindowGroup.onAppear: primaryWindowId=\(primaryWindowId.uuidString.prefix(8)) existingWindows=\(existingWindows)")
-                    if existingWindows > 0 {
-                        NSLog("[TermMeshApp] ⚠️ WindowGroup.onAppear DUPLICATE SCENE detected! existingWindows=\(existingWindows)")
-                    }
 #endif
+                    // Duplicate WindowGroup scene guard: if a primary window is already
+                    // registered, this onAppear is firing for a duplicate scene. Skip
+                    // configure/socket setup to prevent AppDelegate.tabManager from being
+                    // overwritten, and close the duplicate window.
+                    let existingWindows = appDelegate.mainWindowContexts.count
+#if DEBUG
+                    dlog("window.WindowGroup.onAppear primaryWindowId=\(primaryWindowId.uuidString.prefix(8)) existingWindows=\(existingWindows)")
+#endif
+                    // The primary window registers via WindowAccessor before onAppear fires,
+                    // so count == 1 is normal. A duplicate scene produces count >= 2.
+                    if existingWindows > 1 {
+#if DEBUG
+                        dlog("window.WindowGroup.onAppear DUPLICATE_SCENE existingWindows=\(existingWindows) — blocking configure, closing duplicate")
+#endif
+                        DispatchQueue.main.async {
+                            if let duplicateWindow = NSApp.windows.last,
+                               duplicateWindow.contentView != nil,
+                               appDelegate.mainWindowContexts.count > 1 {
+                                duplicateWindow.close()
+                            }
+                        }
+                        return
+                    }
                     // Start the Unix socket controller for programmatic access
                     updateSocketController()
                     appDelegate.configure(tabManager: tabManager, notificationStore: notificationStore, sidebarState: sidebarState)
@@ -547,7 +566,10 @@ struct TermMeshApp: App {
             // MARK: - File & Navigation Commands
             Group {
             CommandGroup(replacing: .newItem) {
-                splitCommandButton(title: "New Window", shortcut: newWindowMenuShortcut) {
+                // New Window shortcut is handled by AppDelegate's local NSEvent monitor.
+                // Registering it as SwiftUI .keyboardShortcut() causes the menu system to
+                // process the shortcut independently, which can trigger a duplicate window.
+                splitCommandButton(title: "New Window", shortcut: newWindowMenuShortcut, registerShortcut: false) {
                     appDelegate.openNewMainWindow(nil)
                 }
 

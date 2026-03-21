@@ -27,20 +27,20 @@ public final class DebugEventLog: @unchecked Sendable {
     private static func resolveLogPath() -> String {
         let env = ProcessInfo.processInfo.environment
 
-        if let explicit = env["CMUX_DEBUG_LOG"]?.trimmingCharacters(in: .whitespacesAndNewlines),
+        if let explicit = (env["TERMMESH_DEBUG_LOG"] ?? env["CMUX_DEBUG_LOG"])?.trimmingCharacters(in: .whitespacesAndNewlines),
            !explicit.isEmpty {
             return explicit
         }
 
-        if let tag = env["CMUX_TAG"]?.trimmingCharacters(in: .whitespacesAndNewlines),
+        if let tag = (env["TERMMESH_TAG"] ?? env["CMUX_TAG"])?.trimmingCharacters(in: .whitespacesAndNewlines),
            !tag.isEmpty {
             return "/tmp/cmux-debug-\(sanitizePathToken(tag)).log"
         }
 
-        if let socketPath = env["CMUX_SOCKET_PATH"]?.trimmingCharacters(in: .whitespacesAndNewlines),
+        if let socketPath = (env["TERMMESH_SOCKET_PATH"] ?? env["CMUX_SOCKET_PATH"])?.trimmingCharacters(in: .whitespacesAndNewlines),
            !socketPath.isEmpty {
             let socketBase = URL(fileURLWithPath: socketPath).deletingPathExtension().lastPathComponent
-            if socketBase.hasPrefix("cmux-debug-") {
+            if socketBase.hasPrefix("cmux-debug-") || socketBase.hasPrefix("term-mesh-debug-") {
                 return "/tmp/\(socketBase).log"
             }
         }

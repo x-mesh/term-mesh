@@ -849,10 +849,11 @@ extension TerminalController {
         DispatchQueue.main.async {
             NSApp.activate(ignoringOtherApps: true)
             NSApp.unhide(nil)
-            let hasMainTerminalWindow = NSApp.windows.contains { window in
-                guard let raw = window.identifier?.rawValue else { return false }
-                return raw == "term-mesh.main" || raw.hasPrefix("term-mesh.main.")
-            }
+            let hasMainTerminalWindow = !(AppDelegate.shared?.mainWindowContexts.isEmpty ?? true)
+                || NSApp.windows.contains { window in
+                    guard let raw = window.identifier?.rawValue else { return false }
+                    return raw == "term-mesh.main" || raw.hasPrefix("term-mesh.main.")
+                }
 
             if !hasMainTerminalWindow {
                 AppDelegate.shared?.openNewMainWindow(nil)

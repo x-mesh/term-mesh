@@ -223,6 +223,10 @@ extension AppDelegate {
     }
 
     func unregisterMainWindow(_ window: NSWindow) {
+        #if DEBUG
+        let remainingAfter = mainWindowContexts.count - 1
+        dlog("mainWindow.UNREGISTER window={\(debugWindowToken(window))} remainingContexts=\(remainingAfter)")
+        #endif
         let key = ObjectIdentifier(window)
         guard let removed = mainWindowContexts.removeValue(forKey: key) else { return }
         commandPaletteVisibilityByWindowId.removeValue(forKey: removed.windowId)
