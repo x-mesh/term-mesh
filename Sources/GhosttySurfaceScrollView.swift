@@ -42,6 +42,7 @@ extension Notification.Name {
     static let ghosttyDefaultBackgroundDidChange = Notification.Name("ghosttyDefaultBackgroundDidChange")
     static let termMeshToggleIMEInputBar = Notification.Name("termMeshToggleIMEInputBar")
     static let termMeshBroadcastIMEText = Notification.Name("termMeshBroadcastIMEText")
+    static let termMeshStopAllAgents = Notification.Name("termMeshStopAllAgents")
 }
 
 // MARK: - IME Bar Drag Handle
@@ -399,7 +400,8 @@ final class GhosttySurfaceScrollView: NSView {
             guard let self = self,
                   let surface = notification.object as? TerminalSurface,
                   surface === self.surfaceView.terminalSurface else { return }
-            self.toggleIMEInputBar()
+            let cwd = notification.userInfo?["workingDirectory"] as? String
+            self.toggleIMEInputBar(workingDirectory: cwd)
         })
     }
 
@@ -633,7 +635,7 @@ final class GhosttySurfaceScrollView: NSView {
 
     // MARK: - IME Input Bar
 
-    func toggleIMEInputBar() {
+    func toggleIMEInputBar(workingDirectory: String? = nil) {
         if imeInputBarHostingView != nil {
             dismissIMEInputBar()
             return
@@ -692,6 +694,12 @@ final class GhosttySurfaceScrollView: NSView {
                 keyEvent.action = GHOSTTY_ACTION_RELEASE
                 _ = ghostty_surface_key(surface, keyEvent)
             },
+            onStopAllAgents: {
+                NotificationCenter.default.post(
+                    name: .termMeshStopAllAgents,
+                    object: nil
+                )
+            },
             onSendKey: { [weak self] keycode, mods in
                 guard let self, let surface = self.surfaceView.surface else { return }
                 var keyEvent = ghostty_input_key_s()
@@ -705,7 +713,8 @@ final class GhosttySurfaceScrollView: NSView {
                 _ = ghostty_surface_key(surface, keyEvent)
                 keyEvent.action = GHOSTTY_ACTION_RELEASE
                 _ = ghostty_surface_key(surface, keyEvent)
-            }
+            },
+            workingDirectory: workingDirectory
         )
 
         let overlay = NSHostingView(rootView: rootView)

@@ -17,12 +17,7 @@ const DEFAULT_AGENT_NAMES: &[&str] = &["explorer", "executor", "reviewer", "debu
 const DEFAULT_AGENT_COLORS: &[&str] = &["green", "blue", "yellow", "magenta", "cyan", "red"];
 
 const REPORT_SUFFIX: &str = concat!(
-    "\n\n[IMPORTANT] When you finish this task, you MUST use your bash/execute tool to run this SINGLE command:\n",
-    "```\n",
-    "tm-agent reply '<one-paragraph summary of your result>'\n",
-    "```\n",
-    "This sends the result to the leader AND registers it as a report in one step.\n",
-    "Do NOT run separate msg send + report commands. Just use `reply` once.",
+    "\n\n[IMPORTANT] When done, run: tm-agent reply '<one-paragraph summary of your result>' to report your result.",
 );
 
 const BROADCAST_SUFFIX: &str = concat!(
@@ -184,6 +179,14 @@ enum Commands {
         desc: Option<String>,
         #[arg(long)]
         no_report: bool,
+    },
+    /// Stop (interrupt) agents by sending Ctrl+C to their terminals
+    Stop {
+        /// Agent name to interrupt, or omit for all agents
+        agent: Option<String>,
+        /// Interrupt all agents in the team
+        #[arg(long)]
+        all: bool,
     },
     /// Wait for agent signals (report, msg, blocked, review_ready, idle, any)
     Wait {
@@ -996,6 +999,20 @@ fn main() {
                     return;
                 }
             }
+        }
+        Commands::Stop { agent, all } => {
+            if all || agent.is_none() {
+                // Interrupt all agents in the team
+                print_result(rpc_call(&sock, "team.interrupt_all", json!({
+                    "team_name": team,
+                })));
+            } else if let Some(ref target) = agent {
+                // Interrupt a specific agent
+                print_result(rpc_call(&sock, "team.interrupt", json!({
+                    "team_name": team, "agent_name": target,
+                })));
+            }
+            return;
         }
         Commands::Send { agent: ref target, text, no_report } => {
             let text = append_report_suffix(&text, no_report);

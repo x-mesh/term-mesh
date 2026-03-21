@@ -183,6 +183,13 @@ final class TerminalPanel: Panel, ObservableObject {
         return surface.sendIMEText(text, withReturn: withReturn)
     }
 
+    /// Send text using the proven socket-style delivery (per-character key events).
+    /// Most reliable path for team agent text delivery.
+    @discardableResult
+    func sendSocketStyleText(_ text: String, withReturn: Bool = true) -> Bool {
+        return surface.sendSocketStyleText(text, withReturn: withReturn)
+    }
+
     /// Send a key press directly through the Ghostty surface API.
     /// Works even when the panel is not in the active tab (no window required).
     func sendSurfaceKeyPress(keycode: UInt16) {

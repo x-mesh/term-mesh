@@ -51,6 +51,17 @@
 - [ ] Notification marked unread doesn't get pushed to the top of the list
 - [ ] Browser cmd+shift+H ring flashes only once (should flash twice like other shortcuts)
 
+## Test Coverage Gaps
+- [ ] **설정 관리** — AppearanceSettings, TerminalSettings, SettingsView 등 설정 변경/저장/로드 테스트
+- [ ] **사이드바** — 탭 선택, 드래그 순서 변경, 컨텍스트 메뉴, 접기/펼치기 (현재 리사이즈만 테스트)
+- [ ] **워크스페이스** — 생성/삭제/전환/이름변경 전체 라이프사이클 테스트
+- [ ] **포커스 라우팅** — 스플릿 간 포커스 이동, 브라우저↔터미널 전환 시 포커스 보존
+- [ ] **에러 핸들링** — 소켓 끊김, 잘못된 명령, 타임아웃 등 엣지 케이스
+- [ ] **성능 벤치마크** — 렌더링 FPS, 소켓 응답 레이턴시, 메모리 사용량 기준선
+- [ ] **에이전트 오케스트레이션** — 팀 생성/소멸, 에이전트 간 메시지 전달, 태스크 보드 상태 전이
+- [ ] **다크/라이트 테마 전환** — 테마 전환 시 모든 UI 컴포넌트 올바른 색상 적용 검증
+- [ ] **멀티 윈도우** — 윈도우 간 탭 이동, 독립 소켓 상태, 윈도우 닫기 시 정리
+
 ## Refactoring
 - [x] **P0** Remove all index-based APIs in favor of short ID refs (surface:N, pane:N, workspace:N, window:N)
 - [x] **P0** CLI commands should be workspace-relative using CMUX_WORKSPACE_ID env var (not focused workspace) so agents in background workspaces don't affect the user's active workspace. Affected: send, send-key, send-panel, send-key-panel, new-split, new-pane, new-surface, close-surface, list-panes, list-pane-surfaces, list-panels, focus-pane, focus-panel, surface-health

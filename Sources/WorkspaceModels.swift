@@ -104,6 +104,7 @@ enum IntegrationStatus: String {
     case stale
     case partial
     case notLoaded
+    case agentMode
 
     var label: String {
         switch self {
@@ -112,6 +113,7 @@ enum IntegrationStatus: String {
         case .stale: return "Stale"
         case .partial: return "Partial"
         case .notLoaded: return "Not Loaded"
+        case .agentMode: return "Agent Mode"
         }
     }
 }

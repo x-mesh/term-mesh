@@ -21,6 +21,9 @@ private enum VK {
     static let downArrow: UInt16   = 0x7D  // 125 — ↓
     static let leftArrow: UInt16   = 0x7B  // 123 — ←
     static let rightArrow: UInt16  = 0x7C  // 124 — →
+    static let equal: UInt16       = 0x18  // 24  — '=' (Cmd+= for zoom in)
+    static let minus: UInt16       = 0x1B  // 27  — '-' (Cmd+- for zoom out)
+    static let zero: UInt16        = 0x1D  // 29  — '0' (Cmd+0 for reset zoom)
 }
 
 /// Custom NSTextView that intercepts Enter (submit), Shift+Enter (newline),
@@ -29,6 +32,8 @@ final class IMETextView: NSTextView {
     var submitHandler: (() -> Void)?
     var cancelHandler: (() -> Void)?
     var ctrlCHandler: (() -> Void)?
+    /// Stop all team agents (Ctrl+Shift+C) — sends Ctrl+C to every agent panel.
+    var stopAllAgentsHandler: (() -> Void)?
     var historyUpHandler: (() -> Void)?
     var historyDownHandler: (() -> Void)?
     var historySearchHandler: (() -> Void)?
@@ -42,6 +47,15 @@ final class IMETextView: NSTextView {
     private var lastEscapeTime: TimeInterval = 0
     /// Double-ESC threshold in seconds.
     private let doubleEscapeThreshold: TimeInterval = 0.4
+
+    /// Clear the undo stack when this view leaves its window to prevent
+    /// dangling undo actions from crashing on Cmd+Z after the view is deallocated.
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        if window == nil {
+            undoManager?.removeAllActions()
+        }
+    }
 
     // MARK: - Q2: Ghost suggestion
 
@@ -107,7 +121,38 @@ final class IMETextView: NSTextView {
             }
         }
 
+        // Cmd+= / Cmd+Plus → zoom in (increase IME font size)
+        if event.keyCode == VK.equal && flags == .command {
+            adjustFontSize(delta: 1)
+            return true
+        }
+
+        // Cmd+- → zoom out (decrease IME font size)
+        if event.keyCode == VK.minus && flags == .command {
+            adjustFontSize(delta: -1)
+            return true
+        }
+
+        // Cmd+0 → reset IME font size to default
+        if event.keyCode == VK.zero && flags == .command {
+            setFontSize(IMEInputBarSettings.defaultFontSize)
+            return true
+        }
+
         return super.performKeyEquivalent(with: event)
+    }
+
+    // MARK: - Font size adjustment
+
+    private func adjustFontSize(delta: CGFloat) {
+        let current = IMEInputBarSettings.fontSize
+        let newSize = max(8, min(36, current + delta))
+        setFontSize(Double(newSize))
+    }
+
+    private func setFontSize(_ size: Double) {
+        UserDefaults.standard.set(size, forKey: "imeBarFontSize")
+        font = NSFont.monospacedSystemFont(ofSize: CGFloat(size), weight: .regular)
     }
 
     /// Walk the window's view hierarchy to find a GhosttyNSView that has an active selection.
@@ -149,6 +194,10 @@ final class IMETextView: NSTextView {
             } else {
                 handleReturn(event: event, mods: mods)
             }
+
+        // Ctrl+Shift+C → Stop all team agents (interrupt every agent panel)
+        case VK.c where mods.contains(.control) && mods.contains(.shift):
+            stopAllAgentsHandler?()
 
         // Ctrl+C → ETX interrupt (enables Claude double Ctrl+C exit)
         case VK.c where mods.contains(.control):
@@ -308,11 +357,14 @@ final class IMETextView: NSTextView {
         }
     }
 
-    /// Up arrow: Option+Up forwards plain Up to terminal; plain Up navigates history
-    /// when the cursor is on the first line and IME is not composing.
+    /// Up arrow: Option+Up → plain Up to terminal (Claude Code selection escape hatch);
+    /// when IME is empty → plain Up to terminal; otherwise → history navigation.
     private func handleUpArrow(event: NSEvent, mods: NSEvent.ModifierFlags) {
         if mods.contains(.option) && !hasMarkedText() {
-            sendKeyHandler?(VK.upArrow, UInt32(GHOSTTY_MODS_ALT.rawValue))
+            sendKeyHandler?(VK.upArrow, 0)
+        } else if !hasMarkedText() && string.isEmpty {
+            // IME empty: forward plain Up to terminal for Claude Code picker navigation
+            sendKeyHandler?(VK.upArrow, 0)
         } else if !hasMarkedText() && isCursorOnFirstLine() {
             historyUpHandler?()
         } else {
@@ -320,11 +372,14 @@ final class IMETextView: NSTextView {
         }
     }
 
-    /// Down arrow: Option+Down forwards plain Down to terminal; plain Down navigates
-    /// history when the cursor is on the last line and IME is not composing.
+    /// Down arrow: Option+Down → plain Down to terminal (Claude Code selection escape hatch);
+    /// when IME is empty → plain Down to terminal; otherwise → history navigation.
     private func handleDownArrow(event: NSEvent, mods: NSEvent.ModifierFlags) {
         if mods.contains(.option) && !hasMarkedText() {
-            sendKeyHandler?(VK.downArrow, UInt32(GHOSTTY_MODS_ALT.rawValue))
+            sendKeyHandler?(VK.downArrow, 0)
+        } else if !hasMarkedText() && string.isEmpty {
+            // IME empty: forward plain Down to terminal for Claude Code picker navigation
+            sendKeyHandler?(VK.downArrow, 0)
         } else if !hasMarkedText() && isCursorOnLastLine() {
             historyDownHandler?()
         } else {

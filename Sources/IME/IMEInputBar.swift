@@ -19,12 +19,16 @@ struct IMEInputBar: View {
     let onBroadcast: ((String) -> Void)?
     let onClose: () -> Void
     var onCtrlC: (() -> Void)? = nil
+    /// Stop all team agents — sends Ctrl+C to every agent panel.
+    var onStopAllAgents: (() -> Void)? = nil
     /// Send a raw key event (keycode + modifier flags) to the terminal surface.
     var onSendKey: ((_ keycode: UInt16, _ mods: UInt32) -> Void)? = nil
+    /// Terminal working directory — used to discover project-local slash commands.
+    var workingDirectory: String? = nil
 
     @State private var text: String = ""
     @State private var history: [String] = IMEHistory.load()   // Q4: fast sync init; merged async in .task
-    @State private var slashCommands: [SlashCommand] = SlashCommands.loadAll()
+    @State private var slashCommands: [SlashCommand] = []
     @State private var historyIndex: Int = -1   // -1 = editing draft
     @State private var historyDraft: String = ""
     @State private var isComposing: Bool = false
@@ -217,6 +221,7 @@ struct IMEInputBar: View {
                     onSubmit: doSubmit,
                     onCancel: onClose,
                     onCtrlC: onCtrlC,
+                    onStopAllAgents: onStopAllAgents,
                     onSendKey: onSendKey,
                     onSubmitAndClose: doSubmitAndClose,
                     onHistoryUp: historyUp,
@@ -317,6 +322,7 @@ struct IMEInputBar: View {
         }
         // (slash picker is inline in VStack above)
         .onAppear {
+            slashCommands = SlashCommands.loadAll(workingDirectory: workingDirectory)
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
                 isFieldFocused = true
             }
@@ -373,6 +379,19 @@ struct IMEInputBar: View {
                     .help("Broadcast to all panes")
                 }
 
+                if onStopAllAgents != nil {
+                    Button(action: { onStopAllAgents?() }) {
+                        Image(systemName: "stop.fill")
+                            .font(.system(size: 10, weight: .semibold))
+                            .foregroundColor(.white)
+                            .frame(width: 22, height: 22)
+                            .background(Color.red)
+                            .cornerRadius(5)
+                    }
+                    .buttonStyle(.plain)
+                    .help("Stop all agents (⌃⇧C)")
+                }
+
                 // Q5: clear button — only visible when there is text
                 if !text.isEmpty {
                     Button(action: { text = "" }) {
@@ -408,6 +427,9 @@ struct IMEInputBar: View {
             hintLabel("⇧Tab accept")
             hintLabel("Esc →term")
             hintLabel("⌃C interrupt")
+            if onStopAllAgents != nil {
+                hintLabel("⌃⇧C stop all")
+            }
 
             Button(action: { showKeyboardHelp.toggle() }) {
                 Text("?")
@@ -563,6 +585,7 @@ struct IMEInputBar: View {
                     helpRow("⌘⏎", "Send & close")
                     helpRow("⇧⏎", "New line")
                     helpRow("⌃C", "Interrupt (Ctrl+C)")
+                    helpRow("⌃⇧C", "Stop all agents")
                 }
                 helpSection("Navigation") {
                     helpRow("↑ ↓", "History (\(history.count))")
@@ -573,7 +596,8 @@ struct IMEInputBar: View {
                     helpRow("Esc", "Send Escape to terminal")
                     helpRow("Tab", "Accept ghost / tab to terminal")
                     helpRow("⇧Tab", "Send Shift+Tab (accept)")
-                    helpRow("⌥↑↓←→", "Arrow to terminal")
+                    helpRow("⌥↑↓", "↑↓ to terminal (selection)")
+                    helpRow("⌥←→", "Word move (Alt+←→)")
                     helpRow("⌥Tab", "Tab to terminal")
                     helpRow("Del", "Forward delete (empty)")
                 }

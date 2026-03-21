@@ -2,6 +2,23 @@
 
 All notable changes to term-mesh are documented here.
 
+## [0.75.0] - 2026-03-21
+
+### Added
+- Default light theme for terminal — fresh installs now have proper light colors out of the box
+- Auto-detect macOS system appearance and apply matching terminal theme in "System" mode
+- Light/Dark theme pickers now show only matching themes (light themes for Light, dark themes for Dark)
+- IME slash command picker discovers project-local commands from `.claude/commands/` (e.g. `/squash`)
+- IME font zoom with Cmd+Plus/Minus shortcuts
+- Plain arrow key pass-through when IME input is empty
+- Stop/interrupt command for team agents
+
+### Fixed
+- Terminal always showing dark theme regardless of appearance setting
+- IME Cmd+Z crash caused by stale undo stack after view teardown
+- Option+Arrow keys in IME now send plain arrows instead of Alt-modified sequences
+- Agent panels no longer counted in shell health assessment
+
 ## [0.74.0] - 2026-03-20
 
 ### Added

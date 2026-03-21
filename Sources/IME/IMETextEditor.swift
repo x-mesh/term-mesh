@@ -7,6 +7,8 @@ struct IMETextEditor: NSViewRepresentable {
     let onSubmit: () -> Void
     let onCancel: () -> Void
     var onCtrlC: (() -> Void)? = nil
+    /// Stop all team agents (Ctrl+Shift+C) — sends Ctrl+C to every agent panel.
+    var onStopAllAgents: (() -> Void)? = nil
     var onSendKey: ((_ keycode: UInt16, _ mods: UInt32) -> Void)? = nil
     var onSubmitAndClose: (() -> Void)? = nil
     let onHistoryUp: () -> Void
@@ -70,6 +72,7 @@ struct IMETextEditor: NSViewRepresentable {
         textView.submitHandler = onSubmit
         textView.cancelHandler = onCancel
         textView.ctrlCHandler = onCtrlC
+        textView.stopAllAgentsHandler = onStopAllAgents
         textView.sendKeyHandler = onSendKey
         textView.submitAndCloseHandler = onSubmitAndClose
         textView.historyUpHandler = onHistoryUp
@@ -103,6 +106,12 @@ struct IMETextEditor: NSViewRepresentable {
         return scrollView
     }
 
+    static func dismantleNSView(_ scrollView: NSScrollView, coordinator: Coordinator) {
+        if let textView = scrollView.documentView as? IMETextView {
+            textView.undoManager?.removeAllActions()
+        }
+    }
+
     func updateNSView(_ scrollView: NSScrollView, context: Context) {
         guard let textView = scrollView.documentView as? IMETextView else { return }
         if textView.submittableText() != text && !textView.hasMarkedText() {
@@ -128,6 +137,7 @@ struct IMETextEditor: NSViewRepresentable {
         textView.submitHandler = onSubmit
         textView.cancelHandler = onCancel
         textView.ctrlCHandler = onCtrlC
+        textView.stopAllAgentsHandler = onStopAllAgents
         textView.sendKeyHandler = onSendKey
         textView.submitAndCloseHandler = onSubmitAndClose
         textView.historyUpHandler = onHistoryUp

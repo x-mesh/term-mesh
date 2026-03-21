@@ -17,6 +17,7 @@ Parse `$ARGUMENTS` to determine the subcommand:
 |-------|---------|
 | `agent` | **Interactive selector** (use `AskUserQuestion`, see below) |
 | (empty) | **Interactive selector** (same as `agent`) |
+| `agent N` | **Interactive selector** with `--repeat N` (e.g. `agent 5` → run 5 iterations) |
 | `agent --pane` | `python3 scripts/bench-agent.py --mode pane` |
 | `agent --headless` | `python3 scripts/bench-agent.py --mode headless` |
 | `agent --llm` | `python3 scripts/bench-agent.py --leader llm` |
@@ -30,7 +31,8 @@ Parse `$ARGUMENTS` to determine the subcommand:
 Map the first word of `$ARGUMENTS`:
 
 - **`agent` (no flags)** or **empty** → Interactive selector (see Interactive Flow below)
-- **`agent` (with flags)** → Map `--pane` to `--mode pane`, `--headless` to `--mode headless`, `--llm` to `--leader llm`, `--terminal` to `--leader terminal`. Pass remaining flags through.
+- **`agent N`** (bare number, e.g. `agent 5`) → Interactive selector with `--repeat N` appended to the final command. Parse the number and pass through the Interactive Flow, then append `--repeat N` when executing.
+- **`agent` (with flags)** → Map `--pane` to `--mode pane`, `--headless` to `--mode headless`, `--llm` to `--leader llm`, `--terminal` to `--leader terminal`. If a bare number is present among flags, extract it as `--repeat N`. Pass remaining flags through.
 - **`history`** → Show history: `python3 scripts/bench-agent.py --history`
 - **`compare`** → Compare runs: `python3 scripts/bench-agent.py --compare` followed by the remaining args.
 
@@ -87,6 +89,7 @@ When `$ARGUMENTS` is empty or just `agent` with no flags:
 | Command | Description |
 |---------|-------------|
 | `agent` | Interactive menu: select leader type + infra mode + layers |
+| `agent N` | Interactive menu + run N iterations (e.g. `agent 5`) |
 | `agent --pane` | Pane infrastructure only |
 | `agent --headless` | Headless infrastructure only |
 | `agent --llm` | LLM leader E2E (creates team with --claude-leader) |

@@ -1927,6 +1927,10 @@ class TerminalController {
             return await asyncTeamTaskSplit(params: params, id: id)
         case "team.delegate":
             return await asyncTeamDelegate(params: params, id: id)
+        case "team.interrupt":
+            return await asyncTeamInterrupt(params: params, id: id)
+        case "team.interrupt_all":
+            return await asyncTeamInterruptAll(params: params, id: id)
         default:
             return v2Error(id: id, code: "unknown_method", message: "Unknown team command: \(method)")
         }
@@ -2154,10 +2158,25 @@ class TerminalController {
         guard let text = params["text"] as? String else {
             return v2Error(id: id, code: "invalid_params", message: "Missing text")
         }
-        let count = await MainActor.run {
-            let tabManager = TeamOrchestrator.shared.resolveTabManager(teamName: teamName) ?? self.tabManager
-            guard let tabManager else { return 0 }
-            return TeamOrchestrator.shared.broadcast(teamName: teamName, text: text, tabManager: tabManager)
+        // Stagger sends: 100ms between each agent to avoid main-thread congestion
+        // that causes text/Enter key drops. 10 agents × 100ms = 1s total (acceptable).
+        let agentNames: [String] = await MainActor.run {
+            guard let team = TeamOrchestrator.shared.teams[teamName] else { return [] }
+            return team.agents.map(\.name)
+        }
+        var count = 0
+        for (index, agentName) in agentNames.enumerated() {
+            if index > 0 {
+                try? await Task.sleep(nanoseconds: 100_000_000) // 100ms
+            }
+            let success = await MainActor.run {
+                let tabManager = TeamOrchestrator.shared.resolveTabManager(teamName: teamName) ?? self.tabManager
+                guard let tabManager else { return false }
+                return TeamOrchestrator.shared.sendToAgent(
+                    teamName: teamName, agentName: agentName, text: text, tabManager: tabManager
+                )
+            }
+            if success { count += 1 }
         }
         return v2Ok(id: id, result: ["sent_count": count, "team_name": teamName])
     }
@@ -2543,6 +2562,42 @@ class TerminalController {
             return v2Error(id: id, code: "not_found", message: "Task not found")
         }
         return v2Ok(id: id, result: store.taskDictionary(task))
+    }
+
+    // MARK: - Team Interrupt Handlers
+
+    /// Send Ctrl+C (ETX) to a single agent, interrupting its current operation.
+    private func asyncTeamInterrupt(params: [String: Any], id: Any?) async -> String {
+        guard let teamName = params["team_name"] as? String else {
+            return v2Error(id: id, code: "invalid_params", message: "Missing team_name")
+        }
+        guard let agentName = params["agent_name"] as? String else {
+            return v2Error(id: id, code: "invalid_params", message: "Missing agent_name")
+        }
+        let success = await MainActor.run {
+            let tabManager = TeamOrchestrator.shared.resolveTabManager(teamName: teamName) ?? self.tabManager
+            guard let tabManager else { return false }
+            return TeamOrchestrator.shared.interruptAgent(
+                teamName: teamName, agentName: agentName, tabManager: tabManager
+            )
+        }
+        return success
+            ? v2Ok(id: id, result: ["interrupted": true, "team_name": teamName, "agent_name": agentName])
+            : v2Error(id: id, code: "not_found", message: "Agent or team not found")
+    }
+
+    /// Send Ctrl+C (ETX) to ALL agents in a team (or all teams if team_name is "__all__").
+    private func asyncTeamInterruptAll(params: [String: Any], id: Any?) async -> String {
+        let teamName = params["team_name"] as? String ?? "__all__"
+        let count = await MainActor.run {
+            let tabManager = TeamOrchestrator.shared.resolveTabManager(teamName: teamName) ?? self.tabManager
+            guard let tabManager else { return 0 }
+            if teamName == "__all__" {
+                return TeamOrchestrator.shared.interruptAllTeams(tabManager: tabManager)
+            }
+            return TeamOrchestrator.shared.interruptAll(teamName: teamName, tabManager: tabManager)
+        }
+        return v2Ok(id: id, result: ["interrupted_count": count, "team_name": teamName])
     }
 
     /// Unified delegate handler: atomically creates a task and dispatches the formatted

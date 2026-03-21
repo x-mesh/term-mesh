@@ -139,6 +139,17 @@ class TabManager: ObservableObject {
             self.broadcastIMEText(text)
         })
         observers.append(NotificationCenter.default.addObserver(
+            forName: .termMeshStopAllAgents,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            guard let self else { return }
+            let count = TeamOrchestrator.shared.interruptAllTeams(tabManager: self)
+            #if DEBUG
+            dlog("[stopAllAgents] interrupted \(count) agents via IME bar")
+            #endif
+        })
+        observers.append(NotificationCenter.default.addObserver(
             forName: .ghosttyDidFocusSurface,
             object: nil,
             queue: .main
@@ -235,7 +246,11 @@ class TabManager: ObservableObject {
 
     func toggleIMEInputBar() {
         guard let panel = selectedTerminalPanel else { return }
-        NotificationCenter.default.post(name: .termMeshToggleIMEInputBar, object: panel.surface)
+        var userInfo: [String: Any]?
+        if let cwd = selectedWorkspace?.currentDirectory, !cwd.isEmpty {
+            userInfo = ["workingDirectory": cwd]
+        }
+        NotificationCenter.default.post(name: .termMeshToggleIMEInputBar, object: panel.surface, userInfo: userInfo)
     }
 
     func broadcastIMEText(_ text: String) {

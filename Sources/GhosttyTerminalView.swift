@@ -864,6 +864,51 @@ final class TerminalSurface: Identifiable, ObservableObject {
         writeTextData(data, to: surface)
     }
 
+    /// Send text + Enter using the same approach as the socket `send_surface` command.
+    /// This is the most reliable text delivery path — proven to work for team agent delivery.
+    /// Control characters (\r, \n, \t, ESC, DEL) are sent as proper key events.
+    /// All other characters are sent as text key events.
+    @discardableResult
+    func sendSocketStyleText(_ text: String, withReturn: Bool = true) -> Bool {
+        guard let surface = surface else { return false }
+        let payload = withReturn ? text + "\r" : text
+        for scalar in payload.unicodeScalars {
+            switch scalar.value {
+            case 0x0A, 0x0D:
+                sendSurfaceKeyPress(keycode: 0x24, text: "\r") // kVK_Return
+            case 0x09:
+                sendSurfaceKeyPress(keycode: 0x30, text: "\t") // kVK_Tab
+            case 0x1B:
+                sendSurfaceKeyPress(keycode: 0x35, text: "\u{1b}") // kVK_Escape
+            case 0x7F:
+                sendSurfaceKeyPress(keycode: 0x33, text: "\u{7f}") // kVK_Delete
+            default:
+                let ch = String(scalar)
+                ch.withCString { ptr in
+                    var keyEvent = ghostty_input_key_s()
+                    keyEvent.action = GHOSTTY_ACTION_PRESS
+                    keyEvent.keycode = 0
+                    keyEvent.mods = GHOSTTY_MODS_NONE
+                    keyEvent.consumed_mods = GHOSTTY_MODS_NONE
+                    keyEvent.unshifted_codepoint = 0
+                    keyEvent.text = ptr
+                    keyEvent.composing = false
+                    _ = ghostty_surface_key(surface, keyEvent)
+                }
+                var releaseEvent = ghostty_input_key_s()
+                releaseEvent.action = GHOSTTY_ACTION_RELEASE
+                releaseEvent.keycode = 0
+                releaseEvent.mods = GHOSTTY_MODS_NONE
+                releaseEvent.consumed_mods = GHOSTTY_MODS_NONE
+                releaseEvent.unshifted_codepoint = 0
+                releaseEvent.text = nil
+                releaseEvent.composing = false
+                _ = ghostty_surface_key(surface, releaseEvent)
+            }
+        }
+        return true
+    }
+
     /// Send a key press directly through the Ghostty surface API.
     /// Unlike sendSyntheticKeyPress (which creates an NSEvent and requires the view to be
     /// in a window), this works even when the surface view is not attached to a window —
@@ -942,6 +987,9 @@ final class TerminalSurface: Identifiable, ObservableObject {
     /// Unlike sendInputText which sends PRESS-only for text chars (causing key state
     /// ambiguity), this sends proper PRESS+RELEASE pairs per chunk, then an atomic
     /// Return key event — all synchronously within one call.
+    ///
+    /// Multiline text (containing `\n`) is sent via `sendText` (bracketed paste) so the
+    /// terminal treats newlines as content rather than per-line execution.
     @discardableResult
     func sendIMEText(_ text: String, withReturn: Bool = true) -> Bool {
         guard let surface = surface else {
@@ -951,16 +999,30 @@ final class TerminalSurface: Identifiable, ObservableObject {
             return false
         }
 
-        if !text.isEmpty {
+        // Multiline: collapse newlines to spaces so the text is sent as a single
+        // line via key events. Bracketed paste + Return key event doesn't reliably
+        // submit in TUI apps (Claude Code). Newlines in agent instructions are
+        // formatting only — the LLM understands the instruction without them.
+        let normalized: String
+        if text.contains("\n") {
+            normalized = text
+                .replacingOccurrences(of: "\r\n", with: " ")
+                .replacingOccurrences(of: "\n", with: " ")
+                .replacingOccurrences(of: "\r", with: " ")
+        } else {
+            normalized = text
+        }
+
+        if !normalized.isEmpty {
             // Chunk long text at UTF-8 safe boundaries
             let maxBytes = 4096
             var chunks: [String] = []
-            if text.utf8.count <= maxBytes {
-                chunks = [text]
+            if normalized.utf8.count <= maxBytes {
+                chunks = [normalized]
             } else {
                 var current = ""
                 var currentBytes = 0
-                for char in text {
+                for char in normalized {
                     let charBytes = char.utf8.count
                     if currentBytes + charBytes > maxBytes {
                         chunks.append(current)

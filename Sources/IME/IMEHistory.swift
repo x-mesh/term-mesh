@@ -221,11 +221,16 @@ enum SlashCommands {
     ]
 
     /// Loads built-in commands merged with custom commands from .claude/commands/ directories.
-    static func loadAll() -> [SlashCommand] {
+    /// - Parameter workingDirectory: Terminal's current working directory; used to find the project root.
+    static func loadAll(workingDirectory: String? = nil) -> [SlashCommand] {
         var commands = builtinCommands
-        // Project-local commands
-        let projectDir = FileManager.default.currentDirectoryPath + "/.claude/commands"
-        commands += scanCommandDir(projectDir)
+        // Project-local commands: walk up from the terminal CWD to find .claude/commands/
+        let projectDir = findProjectCommandsDir(from: workingDirectory)
+            ?? findProjectCommandsDir(from: GhosttyConfig.load().workingDirectory)
+            ?? findProjectCommandsDir(from: FileManager.default.currentDirectoryPath)
+        if let projectDir {
+            commands += scanCommandDir(projectDir)
+        }
         // User global commands
         let userDir = FileManager.default.homeDirectoryForCurrentUser
             .appendingPathComponent(".claude/commands").path
@@ -240,6 +245,23 @@ enum SlashCommands {
             }
         }
         return unique.sorted { $0.name < $1.name }
+    }
+
+    /// Walk up from `startDir` looking for `.claude/commands/`.
+    private static func findProjectCommandsDir(from startDir: String?) -> String? {
+        guard let start = startDir, !start.isEmpty else { return nil }
+        var dir = start
+        let fm = FileManager.default
+        for _ in 0..<10 {
+            let candidate = (dir as NSString).appendingPathComponent(".claude/commands")
+            if fm.fileExists(atPath: candidate) {
+                return candidate
+            }
+            let parent = (dir as NSString).deletingLastPathComponent
+            if parent == dir { break }
+            dir = parent
+        }
+        return nil
     }
 
     private static func scanCommandDir(_ path: String) -> [SlashCommand] {

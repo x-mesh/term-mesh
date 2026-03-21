@@ -574,6 +574,27 @@ def _detect_team() -> Optional[Dict]:
 
 # ── E2E core: delegate-all-and-wait ──
 
+def _wait_for_agents_ready(agents: List[str], timeout: float = 30.0):
+    """Wait until all agents have sent at least one heartbeat (= CLI is loaded)."""
+    t0 = time.perf_counter()
+    while time.perf_counter() - t0 < timeout:
+        result = _tm_agent("status")
+        parsed = _parse_rpc_result(result.stdout)
+        if not isinstance(parsed, dict):
+            time.sleep(1)
+            continue
+        agent_list = parsed.get("agents", [])
+        not_ready = []
+        for a in agent_list:
+            if isinstance(a, dict) and a.get("name") in agents:
+                if a.get("heartbeat_age_seconds") is None:
+                    not_ready.append(a.get("name"))
+        if not not_ready:
+            return True
+        time.sleep(1)
+    return False
+
+
 def _delegate_all_and_wait(
     agents: List[str],
     instruction_fn,
@@ -585,11 +606,16 @@ def _delegate_all_and_wait(
     t0 = time.perf_counter()
     task_to_agent: Dict[str, str] = {}
 
-    for agent in agents:
+    _wait_for_agents_ready(agents)
+
+    for i, agent in enumerate(agents):
+        if i > 0:
+            time.sleep(0.3)  # 300ms delay between delegates to avoid main thread congestion
         result = _tm_agent("delegate", agent, instruction_fn(agent))
         parsed = _parse_rpc_result(result.stdout)
         if isinstance(parsed, dict):
-            tid = parsed.get("task_id") or parsed.get("id") or ""
+            task_obj = parsed.get("task") if isinstance(parsed.get("task"), dict) else {}
+            tid = parsed.get("task_id") or parsed.get("id") or task_obj.get("id", "")
             if tid:
                 task_to_agent[tid] = agent
 
@@ -821,10 +847,12 @@ def run_e2e_llm_leader_benchmarks(task_description: str = "") -> Dict:
     # Wait for LLM leader to complete the task
     _tm_agent("wait", "--timeout", "120", "--mode", "any")
     t1 = time.perf_counter()
+    leader_read = _tm_agent("read", "leader", "--lines", "20")
+    has_response = leader_read.returncode == 0 and len(leader_read.stdout.strip()) > 0
     results["llm_ping"] = {
         "total_ms": round((t1 - t0) * 1000),
         "agent_count": len(agents),
-        "passed": True,  # LLM leader handles verification internally
+        "passed": has_response,
     }
 
     # Scenario 2: Multi-step task — LLM leader plans and executes
@@ -839,9 +867,11 @@ def run_e2e_llm_leader_benchmarks(task_description: str = "") -> Dict:
               timeout=10)
     _tm_agent("wait", "--timeout", "180", "--mode", "any")
     t1 = time.perf_counter()
+    leader_read = _tm_agent("read", "leader", "--lines", "20")
+    has_response = leader_read.returncode == 0 and len(leader_read.stdout.strip()) > 0
     results["llm_multistep"] = {
         "total_ms": round((t1 - t0) * 1000),
-        "passed": True,
+        "passed": has_response,
     }
 
     # Scenario 3: Error recovery — LLM leader handles failure
@@ -854,9 +884,11 @@ def run_e2e_llm_leader_benchmarks(task_description: str = "") -> Dict:
               timeout=10)
     _tm_agent("wait", "--timeout", "180", "--mode", "any")
     t1 = time.perf_counter()
+    leader_read = _tm_agent("read", "leader", "--lines", "20")
+    has_response = leader_read.returncode == 0 and len(leader_read.stdout.strip()) > 0
     results["llm_recovery"] = {
         "total_ms": round((t1 - t0) * 1000),
-        "passed": True,
+        "passed": has_response,
     }
 
     # Read LLM leader's summary

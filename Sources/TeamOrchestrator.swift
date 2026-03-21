@@ -1637,16 +1637,26 @@ final class TeamOrchestrator: ObservableObject {
             return false
         }
 
-        // Send synchronously — we are already on the main thread (called via
-        // MainActor.run → delegateToAgent → sendToAgent → here). The previous
-        // DispatchQueue.main.async dispatch was unnecessary and created a race
-        // window where the surface could become nil between dispatch and execution,
-        // while also preventing the return value from propagating to the retry logic.
-        let delivered = panel.sendIMEText(trimmed, withReturn: true)
+        // Deliver text via ghostty_surface_text (bracketed paste) for efficiency,
+        // then send Return key event after a short delay to ensure the paste is
+        // fully processed by the TUI app before Enter fires.
+        // Normalize newlines to spaces — TUI apps interpret \n as Enter.
+        let normalized = trimmed
+            .replacingOccurrences(of: "\r\n", with: " ")
+            .replacingOccurrences(of: "\n", with: " ")
+            .replacingOccurrences(of: "\r", with: " ")
+        panel.surface.sendText(normalized)
+        // Delay the Return key to let bracketed paste complete processing.
+        // Without this delay, the Enter arrives before the paste text is committed
+        // to the TUI input buffer, causing the Enter to be silently dropped.
+        let surfaceRef = panel.surface
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
+            surfaceRef.sendSurfaceKeyPress(keycode: 0x24, text: "\r")
+        }
         #if DEBUG
-        dlog("[team.sendTextToPanel] IME sendText+Enter panelId=\(panelId.uuidString.prefix(8)) textLen=\(trimmed.count) delivered=\(delivered) text=\(trimmed.prefix(80).debugDescription)")
+        dlog("[team.sendTextToPanel] paste+delayedEnter panelId=\(panelId.uuidString.prefix(8)) textLen=\(normalized.count) text=\(normalized.prefix(80).debugDescription)")
         #endif
-        return delivered
+        return true
     }
 
     /// Broadcast text to all agents in a team.
@@ -1661,6 +1671,45 @@ final class TeamOrchestrator: ObservableObject {
             }
         }
         return count
+    }
+
+    /// Send Ctrl+C (ETX) to a specific agent's terminal, interrupting the current operation.
+    /// Unlike sendToAgent which types text into the prompt, this sends a raw interrupt signal
+    /// that works even when the agent is busy (thinking/running tools).
+    func interruptAgent(teamName: String, agentName: String, tabManager: TabManager) -> Bool {
+        guard let team = teams[teamName],
+              let agent = team.agents.first(where: { $0.name == agentName }) else { return false }
+        guard let panel = agentPanel(teamName: teamName, agentName: agentName, tabManager: tabManager) else { return false }
+        // Send ETX byte (0x03 = Ctrl+C) directly to PTY — bypasses TUI input handling
+        panel.sendText("\u{03}")
+        #if DEBUG
+        dlog("[team.interrupt] sent ETX to agent '\(agentName)' in team '\(teamName)'")
+        #endif
+        return true
+    }
+
+    /// Send Ctrl+C (ETX) to ALL agents in a team, interrupting all running operations.
+    func interruptAll(teamName: String, tabManager: TabManager) -> Int {
+        guard let team = teams[teamName] else { return 0 }
+        var count = 0
+        for agent in team.agents {
+            if interruptAgent(teamName: teamName, agentName: agent.name, tabManager: tabManager) {
+                count += 1
+            }
+        }
+        #if DEBUG
+        dlog("[team.interrupt_all] interrupted \(count)/\(team.agents.count) agents in team '\(teamName)'")
+        #endif
+        return count
+    }
+
+    /// Send Ctrl+C (ETX) to ALL agents across ALL teams.
+    func interruptAllTeams(tabManager: TabManager) -> Int {
+        var total = 0
+        for teamName in teams.keys {
+            total += interruptAll(teamName: teamName, tabManager: tabManager)
+        }
+        return total
     }
 
     /// List all teams.

@@ -57,6 +57,8 @@ struct TermMeshApp: App {
 
         let startupAppearance = AppearanceSettings.resolvedMode()
         Self.applyAppearance(startupAppearance)
+        // Ensure terminal theme override exists at startup (covers fresh install)
+        TerminalThemeOverride.write(for: startupAppearance.rawValue)
         _tabManager = StateObject(wrappedValue: TabManager(
             daemon: TermMeshDaemon.shared,
             notifications: TerminalNotificationStore.shared

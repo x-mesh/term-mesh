@@ -811,7 +811,7 @@ struct SettingsView: View {
                     Picker("", selection: $terminalThemeLight) {
                         Text("Default (from config)").tag("")
                         Divider()
-                        ForEach(TerminalThemeList.bundledThemeNames(), id: \.self) { theme in
+                        ForEach(TerminalThemeList.bundledThemeNames(for: .light), id: \.self) { theme in
                             Text(theme).tag(theme)
                         }
                     }
@@ -831,7 +831,7 @@ struct SettingsView: View {
                     Picker("", selection: $terminalThemeDark) {
                         Text("Default (from config)").tag("")
                         Divider()
-                        ForEach(TerminalThemeList.bundledThemeNames(), id: \.self) { theme in
+                        ForEach(TerminalThemeList.bundledThemeNames(for: .dark), id: \.self) { theme in
                             Text(theme).tag(theme)
                         }
                     }
@@ -2007,15 +2007,16 @@ struct SettingsView: View {
                 ForEach(shellHealthEntries) { entry in
                     SettingsCardDivider()
 
+                    let displayStatus = entry.isAgentPanel ? IntegrationStatus.agentMode : entry.health.status
                     SettingsCardRow(
                         "\(entry.workspaceTitle) / \(entry.panelTitle)",
-                        subtitle: shellHealthDetail(entry)
+                        subtitle: entry.isAgentPanel ? "TUI agent — shell integration N/A" : shellHealthDetail(entry)
                     ) {
                         HStack(spacing: 6) {
                             Circle()
-                                .fill(entry.health.status.settingsColor)
+                                .fill(displayStatus.settingsColor)
                                 .frame(width: 7, height: 7)
-                            Text(entry.health.status.label)
+                            Text(displayStatus.label)
                                 .font(.system(size: 11, design: .monospaced))
                                 .foregroundColor(.secondary)
                         }
@@ -2047,22 +2048,43 @@ struct SettingsView: View {
 
     private var shellHealthOverallColor: Color {
         if shellHealthEntries.isEmpty { return .gray }
-        let statuses = shellHealthEntries.map { $0.health.status }
-        if statuses.contains(.notLoaded) { return .red }
-        if statuses.contains(.partial) || statuses.contains(.stale) { return .orange }
-        if statuses.allSatisfy({ $0 == .starting }) { return .gray }
+        // Agent panels are expected to lack shell integration; exclude from health assessment.
+        let nonAgentStatuses = shellHealthEntries
+            .filter { !$0.isAgentPanel }
+            .map { $0.health.status }
+        if nonAgentStatuses.isEmpty {
+            // All panels are agent panels — show blue if any exist, gray otherwise.
+            return shellHealthEntries.isEmpty ? .gray : .blue
+        }
+        if nonAgentStatuses.contains(.notLoaded) { return .red }
+        if nonAgentStatuses.contains(.partial) || nonAgentStatuses.contains(.stale) { return .orange }
+        if nonAgentStatuses.allSatisfy({ $0 == .starting }) { return .gray }
         return .green
     }
 
     private var shellHealthOverallLabel: String {
         if shellHealthEntries.isEmpty { return "No panels" }
-        let statuses = shellHealthEntries.map { $0.health.status }
-        let notLoadedCount = statuses.filter { $0 == .notLoaded }.count
-        if notLoadedCount > 0 { return "\(notLoadedCount) not loaded" }
-        let problemCount = statuses.filter { $0 == .partial || $0 == .stale }.count
-        if problemCount > 0 { return "\(problemCount) degraded" }
-        if statuses.allSatisfy({ $0 == .starting }) { return "Starting..." }
-        return "All healthy"
+        let agentCount = shellHealthEntries.filter { $0.isAgentPanel }.count
+        // Evaluate health only for non-agent panels.
+        let nonAgentStatuses = shellHealthEntries
+            .filter { !$0.isAgentPanel }
+            .map { $0.health.status }
+        if nonAgentStatuses.isEmpty {
+            return "\(agentCount) agent\(agentCount == 1 ? "" : "s")"
+        }
+        let notLoadedCount = nonAgentStatuses.filter { $0 == .notLoaded }.count
+        if notLoadedCount > 0 {
+            let suffix = agentCount > 0 ? " · \(agentCount) agent\(agentCount == 1 ? "" : "s")" : ""
+            return "\(notLoadedCount) not loaded\(suffix)"
+        }
+        let problemCount = nonAgentStatuses.filter { $0 == .partial || $0 == .stale }.count
+        if problemCount > 0 {
+            let suffix = agentCount > 0 ? " · \(agentCount) agent\(agentCount == 1 ? "" : "s")" : ""
+            return "\(problemCount) degraded\(suffix)"
+        }
+        if nonAgentStatuses.allSatisfy({ $0 == .starting }) { return "Starting..." }
+        let suffix = agentCount > 0 ? " · \(agentCount) agent\(agentCount == 1 ? "" : "s")" : ""
+        return "All healthy\(suffix)"
     }
 
     private func shellHealthDetail(_ entry: ShellHealthEntry) -> String {
@@ -2082,6 +2104,16 @@ struct SettingsView: View {
             shellHealthEntries = []
             return
         }
+        // Collect all agent panel IDs across all teams for quick lookup
+        let agentPanelIds: Set<UUID> = {
+            var ids = Set<UUID>()
+            for team in TeamOrchestrator.shared.teams.values {
+                for agent in team.agents {
+                    ids.insert(agent.panelId)
+                }
+            }
+            return ids
+        }()
         var entries: [ShellHealthEntry] = []
         for context in appDelegate.mainWindowContexts.values {
             let tabManager = context.tabManager
@@ -2097,7 +2129,8 @@ struct SettingsView: View {
                         id: panelId,
                         workspaceTitle: title,
                         panelTitle: panelTitle,
-                        health: health
+                        health: health,
+                        isAgentPanel: agentPanelIds.contains(panelId)
                     ))
                 }
             }
@@ -2473,6 +2506,7 @@ extension IntegrationStatus {
         case .healthy: return .green
         case .stale, .partial: return .orange
         case .notLoaded: return .red
+        case .agentMode: return .blue
         }
     }
 }
@@ -2482,6 +2516,8 @@ private struct ShellHealthEntry: Identifiable {
     let workspaceTitle: String
     let panelTitle: String
     let health: ShellIntegrationHealth
+    /// True if this panel belongs to a team agent (TUI mode, shell integration N/A).
+    let isAgentPanel: Bool
 }
 
 private struct SettingsCardNote: View {

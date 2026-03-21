@@ -73,6 +73,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
     var shortcutDefaultsObserver: NSObjectProtocol?
     var splitButtonTooltipRefreshScheduled = false
     var ghosttyConfigObserver: NSObjectProtocol?
+    private var systemAppearanceObserver: NSObjectProtocol?
     var ghosttyGotoSplitLeftShortcut: StoredShortcut?
     var ghosttyGotoSplitRightShortcut: StoredShortcut?
     var ghosttyGotoSplitUpShortcut: StoredShortcut?
@@ -380,7 +381,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         notificationStore.markRead(forTabId: tabId, surfaceId: surfaceId)
     }
 
+    // MARK: - System Appearance Observer
+
+    private func observeSystemAppearanceChanges() {
+        guard systemAppearanceObserver == nil else { return }
+        systemAppearanceObserver = DistributedNotificationCenter.default.addObserver(
+            forName: .init("AppleInterfaceThemeChangedNotification"),
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            guard let self else { return }
+            let mode = AppearanceSettings.resolvedMode()
+            guard mode == .system else { return }
+            TerminalThemeOverride.write(for: mode.rawValue)
+            self.configProvider.reloadConfiguration(source: "system.appearance.change")
+        }
+    }
+
     func applicationWillTerminate(_ notification: Notification) {
+        if let observer = systemAppearanceObserver {
+            DistributedNotificationCenter.default.removeObserver(observer)
+        }
         tabManager?.saveSessionState()
         TerminalController.shared.stop()
         // Worktree auto-cleanup disabled — worktrees are managed explicitly via Worktree Manager
@@ -395,6 +416,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         self.notificationStore = notificationStore
         self.sidebarState = sidebarState
         DashboardController.shared.tabManager = tabManager
+        observeSystemAppearanceChanges()
 #if DEBUG
         setupJumpUnreadUITestIfNeeded()
         setupGotoSplitUITestIfNeeded()

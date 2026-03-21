@@ -100,8 +100,15 @@ enum TerminalSettingsOverride {
 
 // MARK: - Bundled Theme List
 
+enum ThemeBrightness {
+    case light
+    case dark
+}
+
 enum TerminalThemeList {
     private static var cachedNames: [String]?
+    private static var cachedLight: [String]?
+    private static var cachedDark: [String]?
 
     /// Returns sorted list of bundled ghostty theme names.
     static func bundledThemeNames() -> [String] {
@@ -112,37 +119,107 @@ enum TerminalThemeList {
         return names
     }
 
-    private static func loadThemeNames() -> [String] {
+    /// Returns bundled theme names filtered by brightness.
+    static func bundledThemeNames(for brightness: ThemeBrightness) -> [String] {
+        switch brightness {
+        case .light:
+            if let cached = cachedLight { return cached }
+        case .dark:
+            if let cached = cachedDark { return cached }
+        }
+
+        classifyThemes()
+
+        switch brightness {
+        case .light: return cachedLight ?? []
+        case .dark: return cachedDark ?? []
+        }
+    }
+
+    private static func classifyThemes() {
+        guard let dir = findThemesDirectory() else {
+            cachedLight = []
+            cachedDark = []
+            return
+        }
+
+        var light: [String] = []
+        var dark: [String] = []
+
+        for name in bundledThemeNames() {
+            let fileURL = dir.appendingPathComponent(name)
+            let isLight = isLightTheme(at: fileURL)
+            if isLight {
+                light.append(name)
+            } else {
+                dark.append(name)
+            }
+        }
+
+        cachedLight = light
+        cachedDark = dark
+    }
+
+    /// Parses the theme file's background color and returns true if luminance > 0.5.
+    private static func isLightTheme(at url: URL) -> Bool {
+        guard let contents = try? String(contentsOf: url, encoding: .utf8) else { return false }
+
+        for line in contents.components(separatedBy: .newlines) {
+            let trimmed = line.trimmingCharacters(in: .whitespaces)
+            guard trimmed.hasPrefix("background") else { continue }
+            let parts = trimmed.split(separator: "=", maxSplits: 1)
+            guard parts.count == 2 else { continue }
+            let key = parts[0].trimmingCharacters(in: .whitespaces)
+            guard key == "background" else { continue }
+            let hex = parts[1].trimmingCharacters(in: .whitespaces)
+            return hexLuminance(hex) > 0.5
+        }
+
+        return false // no background line → assume dark
+    }
+
+    /// Computes perceived luminance (0–1) from a hex color string like "#0d1117".
+    private static func hexLuminance(_ hex: String) -> Double {
+        var h = hex
+        if h.hasPrefix("#") { h = String(h.dropFirst()) }
+        guard h.count == 6, let rgb = UInt32(h, radix: 16) else { return 0 }
+        let r = Double((rgb >> 16) & 0xFF) / 255.0
+        let g = Double((rgb >> 8) & 0xFF) / 255.0
+        let b = Double(rgb & 0xFF) / 255.0
+        return 0.299 * r + 0.587 * g + 0.114 * b
+    }
+
+    private static func findThemesDirectory() -> URL? {
         let bundle = Bundle.main
         let fm = FileManager.default
-        var themesDir: URL?
 
         // 1. App bundle: Contents/Resources/ghostty/themes (both Debug and Release)
         if let resourceURL = bundle.resourceURL {
             let bundledThemes = resourceURL.appendingPathComponent("ghostty/themes")
             if fm.fileExists(atPath: bundledThemes.path) {
-                themesDir = bundledThemes
+                return bundledThemes
             }
         }
 
         // 2. XDG / system ghostty theme directories
-        if themesDir == nil {
-            let homeDir = fm.homeDirectoryForCurrentUser
-            let candidates = [
-                homeDir.appendingPathComponent(".local/share/ghostty/themes"),
-                homeDir.appendingPathComponent(".config/ghostty/themes"),
-                URL(fileURLWithPath: "/usr/local/share/ghostty/themes"),
-                URL(fileURLWithPath: "/usr/share/ghostty/themes"),
-            ]
-            for candidate in candidates {
-                if fm.fileExists(atPath: candidate.path) {
-                    themesDir = candidate
-                    break
-                }
+        let homeDir = fm.homeDirectoryForCurrentUser
+        let candidates = [
+            homeDir.appendingPathComponent(".local/share/ghostty/themes"),
+            homeDir.appendingPathComponent(".config/ghostty/themes"),
+            URL(fileURLWithPath: "/usr/local/share/ghostty/themes"),
+            URL(fileURLWithPath: "/usr/share/ghostty/themes"),
+        ]
+        for candidate in candidates {
+            if fm.fileExists(atPath: candidate.path) {
+                return candidate
             }
         }
 
-        guard let dir = themesDir else { return [] }
+        return nil
+    }
+
+    private static func loadThemeNames() -> [String] {
+        guard let dir = findThemesDirectory() else { return [] }
 
         do {
             let contents = try FileManager.default.contentsOfDirectory(

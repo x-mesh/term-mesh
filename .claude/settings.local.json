@@ -12,7 +12,8 @@
       "Bash(./scripts/reloadp.sh)",
       "mcp__mem-mesh__add",
       "Bash(./scripts/reload.sh --tag fix-layout-loop)",
-      "Bash(pkill -f 'term-mesh DEV fix-layout-loop')"
+      "Bash(pkill -f 'term-mesh DEV fix-layout-loop')",
+      "Bash(xcodebuild -project GhosttyTabs.xcodeproj -scheme term-mesh -configuration Debug -destination 'platform=macOS' build)"
     ]
   },
   "enabledPlugins": {

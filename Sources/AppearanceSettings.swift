@@ -55,8 +55,8 @@ enum AppearanceSettings {
 // MARK: - Terminal Theme Override
 
 /// Manages a ghostty config override file that sets terminal colors
-/// when the user explicitly toggles light/dark mode via the titlebar button.
-/// When appearance is "system", the override is removed and ghostty's own config applies.
+/// based on the current appearance mode. For "system" mode, the effective
+/// OS appearance is detected so the terminal always has appropriate colors.
 enum TerminalThemeOverride {
     static let overrideFileName = "terminal-theme.config"
 
@@ -80,16 +80,24 @@ enum TerminalThemeOverride {
             return
         }
 
+        let config: String
         switch mode {
         case .light:
-            try? fm.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
-            try? lightConfig.write(to: url, atomically: true, encoding: .utf8)
+            config = lightConfig
         case .dark:
-            try? fm.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
-            try? darkConfig.write(to: url, atomically: true, encoding: .utf8)
+            config = darkConfig
         case .system, .auto:
-            try? fm.removeItem(at: url)
+            config = effectiveSystemAppearanceIsDark() ? darkConfig : lightConfig
         }
+
+        try? fm.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try? config.write(to: url, atomically: true, encoding: .utf8)
+    }
+
+    /// Returns true if the effective macOS system appearance is dark.
+    private static func effectiveSystemAppearanceIsDark() -> Bool {
+        guard let appearance = NSApp?.effectiveAppearance else { return true }
+        return appearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
     }
 
     // GitHub Dark — deep, high-contrast dark theme
