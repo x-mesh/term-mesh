@@ -35,6 +35,8 @@ Parse `$ARGUMENTS`의 첫 단어로 전략을 결정한다:
 - `--attackers "agent,agent"` — red-team 공격팀 수동 지정
 - `--defenders "agent,agent"` — red-team 방어팀 수동 지정
 - `--vote` — brainstorm에서 도트 투표 활성화
+- `--context` — 대화 맥락을 강제로 에이전트에게 주입 (자동 판단 무시)
+- `--no-context` — 대화 맥락 주입을 강제로 비활성화 (자동 판단 무시)
 
 ## Shared Setup
 
@@ -55,6 +57,45 @@ tm-agent status
    tournament에서 에이전트가 1명뿐이면 "경쟁 불가 — chain 전략을 권장합니다" 안내.
 
 4. 참여할 에이전트 이름 목록을 기억한다 (이후 모든 라운드에서 사용).
+
+## Context Injection
+
+모든 전략 실행 전, 에이전트에게 사전 맥락을 주입할지 결정한다.
+
+### 결정 우선순위
+1. `--no-context` 옵션 → **주입하지 않는다** (자동 판단 무시)
+2. `--context` 옵션 → **반드시 주입한다** (자동 판단 무시)
+3. 옵션 없음 → 아래 자동 판단 기준에 따라 결정
+
+### 자동 판단 기준 (하나라도 해당하면 주입)
+- 사용자가 이전 시도의 실패를 언급했다
+- 대화에 에러 메시지, 빌드 실패, 스택 트레이스가 있었다
+- 이전 tm-op 전략의 결과가 있다
+
+### 자동 판단 결과 안내
+옵션이 명시되지 않았을 때, 자동 판단 결과를 사용자에게 알린다:
+- 주입 시: `📋 Context detected — 이전 대화 맥락을 에이전트에게 전달합니다. (--no-context로 비활성화 가능)`
+- 미주입 시: `💡 No prior context detected. (--context로 강제 주입 가능)`
+
+### 컨텍스트 작성 규칙
+1. 3000자 이내
+2. 구조: `## What was tried` → `## What failed` → `## Error details` → `## Constraints`
+3. 에러 메시지는 핵심 부분만 발췌 (전체 스택 트레이스 금지)
+4. 관련 없는 대화 내용은 제외
+
+### 주입 방법
+`tm-agent delegate`/`tm-agent fan-out` 호출 시 `--context` 플래그를 추가한다:
+
+```bash
+tm-agent fan-out '<instruction>' --context '## What was tried
+- Approach A: XYZ — failed due to ABC
+## Error details
+Error: specific error message
+## Constraints
+- Must maintain backward compat'
+```
+
+주입하지 않을 때는 `--context` 플래그를 생략한다 (기존 동작 유지).
 
 ## Error Handling
 
@@ -117,6 +158,8 @@ tm-op — 전략 오케스트레이션 커맨드
   --attackers "a,b"       red-team 공격팀
   --defenders "a,b"       red-team 방어팀
   --vote                  brainstorm 도트 투표 활성화
+  --context               대화 맥락을 강제로 에이전트에게 주입
+  --no-context            대화 맥락 주입을 강제로 비활성화
 
 예시:
   /tm-op refine "결제 API 설계" --rounds 4
@@ -841,6 +884,14 @@ tm-agent collect --lines 100
 전략 선택 후 AskUserQuestion으로 태스크를 입력받는다:
 - Question: "{전략} 전략을 실행합니다. 태스크를 입력해주세요."
 - Options에 예시를 포함 (전략별 대표 사용 예시)
+
+**4단계 — 컨텍스트 주입 확인:**
+`--context`/`--no-context` 옵션이 없고, 자동 판단으로 맥락이 감지된 경우:
+- Question: "이전 대화 맥락을 에이전트에게 전달할까요?"
+- Options:
+  1. "전달 (권장)" — 이전 시도/실패 맥락을 요약하여 에이전트에게 주입
+  2. "전달하지 않음" — 맥락 없이 새로 시작
+자동 판단으로 맥락이 감지되지 않으면 이 단계를 건너뛴다.
 
 사용자가 전략과 태스크를 모두 입력하면 해당 전략 섹션을 실행한다.
 

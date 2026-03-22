@@ -842,10 +842,10 @@ class GhosttyApp {
                     .flatMap { String(cString: $0) } ?? ""
                 let actionBody = action.action.desktop_notification.body
                     .flatMap { String(cString: $0) } ?? ""
-                return performOnMain {
+                DispatchQueue.main.async { [self] in
                     guard let tabManager = AppDelegate.shared?.tabManager,
                           let tabId = tabManager.selectedTabId else {
-                        return false
+                        return
                     }
                     let tabTitle = tabManager.titleForTab(tabId) ?? "Terminal"
                     let command = actionTitle.isEmpty ? tabTitle : actionTitle
@@ -858,14 +858,14 @@ class GhosttyApp {
                         subtitle: "",
                         body: body
                     )
-                    return true
                 }
+                return true
             }
 
             if action.tag == GHOSTTY_ACTION_RELOAD_CONFIG {
                 let soft = action.action.reload_config.soft
                 logThemeAction("reload request target=app soft=\(soft)")
-                performOnMain {
+                DispatchQueue.main.async {
                     GhosttyApp.shared.reloadConfiguration(soft: soft, source: "action.reload_config.app")
                 }
                 return true
@@ -965,20 +965,22 @@ class GhosttyApp {
                   let direction = splitDirection(from: action.action.new_split) else {
                 return false
             }
-            return performOnMain {
-                guard let tabManager = AppDelegate.shared?.tabManager else { return false }
-                return tabManager.newSplit(tabId: tabId, surfaceId: surfaceId, direction: direction) != nil
+            DispatchQueue.main.async {
+                guard let tabManager = AppDelegate.shared?.tabManager else { return }
+                _ = tabManager.newSplit(tabId: tabId, surfaceId: surfaceId, direction: direction)
             }
+            return true
         case GHOSTTY_ACTION_GOTO_SPLIT:
             guard let tabId = surfaceView.tabId,
                   let surfaceId = surfaceView.terminalSurface?.id,
                   let direction = focusDirection(from: action.action.goto_split) else {
                 return false
             }
-            return performOnMain {
-                guard let tabManager = AppDelegate.shared?.tabManager else { return false }
-                return tabManager.moveSplitFocus(tabId: tabId, surfaceId: surfaceId, direction: direction)
+            DispatchQueue.main.async {
+                guard let tabManager = AppDelegate.shared?.tabManager else { return }
+                _ = tabManager.moveSplitFocus(tabId: tabId, surfaceId: surfaceId, direction: direction)
             }
+            return true
         case GHOSTTY_ACTION_RESIZE_SPLIT:
             guard let tabId = surfaceView.tabId,
                   let surfaceId = surfaceView.terminalSurface?.id,
@@ -986,32 +988,35 @@ class GhosttyApp {
                 return false
             }
             let amount = action.action.resize_split.amount
-            return performOnMain {
-                guard let tabManager = AppDelegate.shared?.tabManager else { return false }
-                return tabManager.resizeSplit(
+            DispatchQueue.main.async {
+                guard let tabManager = AppDelegate.shared?.tabManager else { return }
+                _ = tabManager.resizeSplit(
                     tabId: tabId,
                     surfaceId: surfaceId,
                     direction: direction,
                     amount: amount
                 )
             }
+            return true
         case GHOSTTY_ACTION_EQUALIZE_SPLITS:
             guard let tabId = surfaceView.tabId else {
                 return false
             }
-            return performOnMain {
-                guard let tabManager = AppDelegate.shared?.tabManager else { return false }
-                return tabManager.equalizeSplits(tabId: tabId)
+            DispatchQueue.main.async {
+                guard let tabManager = AppDelegate.shared?.tabManager else { return }
+                _ = tabManager.equalizeSplits(tabId: tabId)
             }
+            return true
         case GHOSTTY_ACTION_TOGGLE_SPLIT_ZOOM:
             guard let tabId = surfaceView.tabId,
                   let surfaceId = surfaceView.terminalSurface?.id else {
                 return false
             }
-            return performOnMain {
-                guard let tabManager = AppDelegate.shared?.tabManager else { return false }
-                return tabManager.toggleSplitZoom(tabId: tabId, surfaceId: surfaceId)
+            DispatchQueue.main.async {
+                guard let tabManager = AppDelegate.shared?.tabManager else { return }
+                _ = tabManager.toggleSplitZoom(tabId: tabId, surfaceId: surfaceId)
             }
+            return true
         case GHOSTTY_ACTION_SCROLLBAR:
             let scrollbar = GhosttyScrollbar(c: action.action.scrollbar)
             surfaceView.scrollbar = scrollbar
@@ -1106,7 +1111,7 @@ class GhosttyApp {
                 .flatMap { String(cString: $0) } ?? ""
             let actionBody = action.action.desktop_notification.body
                 .flatMap { String(cString: $0) } ?? ""
-            performOnMain {
+            DispatchQueue.main.async { [self] in
                 let tabTitle = AppDelegate.shared?.tabManager?.titleForTab(tabId) ?? "Terminal"
                 let command = actionTitle.isEmpty ? tabTitle : actionTitle
                 let body = actionBody
@@ -1154,51 +1159,48 @@ class GhosttyApp {
             logThemeAction(
                 "reload request target=surface tab=\(surfaceView.tabId?.uuidString ?? "nil") surface=\(surfaceView.terminalSurface?.id.uuidString ?? "nil") soft=\(soft)"
             )
-            return performOnMain {
+            DispatchQueue.main.async {
                 // Keep all runtime theme/default-background state in the same path.
                 GhosttyApp.shared.reloadConfiguration(
                     soft: soft,
                     source: "action.reload_config.surface tab=\(surfaceView.tabId?.uuidString ?? "nil") surface=\(surfaceView.terminalSurface?.id.uuidString ?? "nil")"
                 )
-                return true
             }
+            return true
         case GHOSTTY_ACTION_KEY_SEQUENCE:
-            return performOnMain {
+            DispatchQueue.main.async {
                 surfaceView.updateKeySequence(action.action.key_sequence)
-                return true
             }
+            return true
         case GHOSTTY_ACTION_KEY_TABLE:
-            return performOnMain {
+            DispatchQueue.main.async {
                 surfaceView.updateKeyTable(action.action.key_table)
-                return true
             }
+            return true
         case GHOSTTY_ACTION_OPEN_URL:
             let openUrl = action.action.open_url
             guard let cstr = openUrl.url else { return false }
             let urlString = String(cString: cstr)
             guard let target = resolveTerminalOpenURLTarget(urlString) else { return false }
             if !BrowserLinkOpenSettings.openTerminalLinksInTermMeshBrowser() {
-                return performOnMain {
-                    NSWorkspace.shared.open(target.url)
-                }
+                let urlToOpen = target.url
+                DispatchQueue.main.async { NSWorkspace.shared.open(urlToOpen) }
+                return true
             }
             switch target {
             case let .external(url):
-                return performOnMain {
-                    NSWorkspace.shared.open(url)
-                }
+                DispatchQueue.main.async { NSWorkspace.shared.open(url) }
+                return true
             case let .embeddedBrowser(url):
                 guard let host = BrowserInsecureHTTPSettings.normalizeHost(url.host ?? "") else {
-                    return performOnMain {
-                        NSWorkspace.shared.open(url)
-                    }
+                    DispatchQueue.main.async { NSWorkspace.shared.open(url) }
+                    return true
                 }
 
                 // If a host whitelist is configured and this host isn't in it, open externally.
                 if !BrowserLinkOpenSettings.hostMatchesWhitelist(host) {
-                    return performOnMain {
-                        NSWorkspace.shared.open(url)
-                    }
+                    DispatchQueue.main.async { NSWorkspace.shared.open(url) }
+                    return true
                 }
                 guard let tabId = surfaceView.tabId,
                       let surfaceId = surfaceView.terminalSurface?.id else { return false }

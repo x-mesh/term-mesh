@@ -193,6 +193,9 @@ enum Commands {
         desc: Option<String>,
         #[arg(long)]
         no_report: bool,
+        /// Prior context (e.g. previous attempts, errors) to inject into agent instruction
+        #[arg(long)]
+        context: Option<String>,
     },
     /// Stop (interrupt) agents by sending Ctrl+C to their terminals
     Stop {
@@ -228,6 +231,9 @@ enum Commands {
         /// Comma-separated list of agents to target (default: all)
         #[arg(long)]
         agents: Option<String>,
+        /// Prior context (e.g. previous attempts, errors) to inject into agent instruction
+        #[arg(long)]
+        context: Option<String>,
     },
     /// Get concise agent status (status + task + messages + terminal)
     Brief {
@@ -537,6 +543,7 @@ fn task_title_from_text(text: &str) -> String {
 fn format_task_instruction(
     sock: &PathBuf, team: &str,
     task: &Value, instruction: &str, no_report: bool,
+    context: Option<&str>,
 ) -> String {
     let mut lines = vec![
         format!("[TASK_ID] {}", task["id"].as_str().unwrap_or("")),
@@ -586,6 +593,14 @@ fn format_task_instruction(
             lines.push(format!("[TASK_DESCRIPTION] {desc}"));
         }
     }
+    if let Some(ctx) = context {
+        let truncated = truncate_summary(ctx, 3000);
+        lines.push(String::new());
+        lines.push("[PRIOR_CONTEXT]".to_string());
+        lines.push(truncated);
+        lines.push("[/PRIOR_CONTEXT]".to_string());
+    }
+
     let task_id = task["id"].as_str().unwrap_or("");
     lines.push(String::new());
     lines.push("[FORMAT COMPLIANCE] Follow the leader's instructions EXACTLY as given. \
@@ -1076,17 +1091,17 @@ fn main() {
             })));
             return;
         }
-        Commands::Delegate { agent: ref target, text, title, priority, accept, deps, desc, no_report } => {
+        Commands::Delegate { agent: ref target, text, title, priority, accept, deps, desc, no_report, context } => {
             // Auto-detect comma-separated agents and route to parallel fan-out
             if target.contains(',') {
-                run_fan_out(&sock, &team, &text, title, priority, no_report, &Some(target.to_string()));
+                run_fan_out(&sock, &team, &text, title, priority, no_report, &Some(target.to_string()), context.as_deref());
             } else {
-                run_delegate(&sock, &team, target, &text, title, priority, &accept, &deps, desc, no_report);
+                run_delegate(&sock, &team, target, &text, title, priority, &accept, &deps, desc, no_report, context.as_deref());
             }
             return;
         }
-        Commands::FanOut { text, title, priority, no_report, agents } => {
-            run_fan_out(&sock, &team, &text, title, priority, no_report, &agents);
+        Commands::FanOut { text, title, priority, no_report, agents, context } => {
+            run_fan_out(&sock, &team, &text, title, priority, no_report, &agents, context.as_deref());
             return;
         }
         Commands::Wait { timeout, interval, mode, task, agents } => {
@@ -1573,25 +1588,29 @@ fn run_delegate_result(
     sock: &PathBuf, team: &str, target: &str, text: &str,
     title: Option<String>, priority: Option<u32>,
     accept: &[String], deps: &[String], desc: Option<String>, no_report: bool,
+    context: Option<&str>,
 ) -> Result<Value, String> {
     let resolved_title = title.unwrap_or_else(|| task_title_from_text(text));
     let resolved_priority = priority.unwrap_or(2);
 
     // Try unified team.delegate RPC first (single round-trip)
-    let delegate_params = json!({
+    let mut delegate_params = json!({
         "team": team,
         "agent": target,
         "text": text,
         "task_title": resolved_title,
         "priority": resolved_priority,
     });
+    if let Some(ctx) = context {
+        delegate_params["context"] = json!(ctx);
+    }
     if let Ok(v) = rpc_call(sock, "team.delegate", delegate_params) {
         if v["ok"].as_bool().unwrap_or(false) {
             // Check if text was actually delivered to the agent's terminal
             let text_delivered = v["result"]["text_delivered"].as_bool().unwrap_or(true);
             if !text_delivered {
                 let task_ref = &v["result"]["task"];
-                let instruction = format_task_instruction(sock, team, task_ref, text, no_report);
+                let instruction = format_task_instruction(sock, team, task_ref, text, no_report, context);
 
                 // Headless agent path: route via daemon socket if available
                 if let Some(daemon_sock) = detect_daemon_socket() {
@@ -1655,7 +1674,7 @@ fn run_delegate_result(
         return Err(format!("task.create failed: {}", pretty(&created)));
     }
 
-    let instruction = format_task_instruction(sock, team, task, text, no_report);
+    let instruction = format_task_instruction(sock, team, task, text, no_report, context);
     let send_text = format!("{instruction}\n");
 
     // Headless agent path: route via daemon socket for 2-RPC fallback too
@@ -1706,8 +1725,9 @@ fn run_delegate(
     sock: &PathBuf, team: &str, target: &str, text: &str,
     title: Option<String>, priority: Option<u32>,
     accept: &[String], deps: &[String], desc: Option<String>, no_report: bool,
+    context: Option<&str>,
 ) {
-    match run_delegate_result(sock, team, target, text, title, priority, accept, deps, desc, no_report) {
+    match run_delegate_result(sock, team, target, text, title, priority, accept, deps, desc, no_report, context) {
         Ok(v) => println!("{}", pretty(&v)),
         Err(e) => { eprintln!("Error: {e}"); process::exit(1); }
     }
@@ -1716,7 +1736,7 @@ fn run_delegate(
 fn run_fan_out(
     sock: &PathBuf, team: &str, text: &str,
     title: Option<String>, priority: Option<u32>, no_report: bool,
-    agents_flag: &Option<String>,
+    agents_flag: &Option<String>, context: Option<&str>,
 ) {
     // Get all agent names from team status
     let all_agents: Vec<String> = match rpc_call(sock, "team.status", json!({ "team_name": team })) {
@@ -1753,7 +1773,7 @@ fn run_fan_out(
             let t = base_title.clone();
             s.spawn(move || {
                 let result = run_delegate_result(
-                    sock, team, target, text, Some(t), priority, &[], &[], None, no_report,
+                    sock, team, target, text, Some(t), priority, &[], &[], None, no_report, context,
                 );
                 (*target, result)
             })
@@ -2057,7 +2077,7 @@ fn run_warmup(sock: &PathBuf, team: &str, target: Option<&str>, timeout: u32) {
         let start = Instant::now();
         let result = run_delegate_result(
             sock, team, name, "Reply with exactly one word: pong",
-            Some("warmup-ping".to_string()), Some(3), &[], &[], None, true,
+            Some("warmup-ping".to_string()), Some(3), &[], &[], None, true, None,
         );
         match result {
             Ok(v) => {

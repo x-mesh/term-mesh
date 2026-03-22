@@ -267,62 +267,62 @@ class TabManager: ObservableObject {
     @discardableResult
     func addWorkspace(workingDirectory overrideWorkingDirectory: String? = nil, select: Bool = true, command: String? = nil, environment: [String: String] = [:]) -> Workspace {
         sentryBreadcrumb("workspace.create", data: ["tabCount": tabs.count + 1])
-        var workingDirectory = normalizedWorkingDirectory(overrideWorkingDirectory) ?? preferredWorkingDirectoryForNewTab()
+        let workingDirectory = normalizedWorkingDirectory(overrideWorkingDirectory) ?? preferredWorkingDirectoryForNewTab()
 
-        // term-mesh: Create worktree sandbox if enabled and CWD is a git repo
-        var worktreeInfo: WorktreeInfo?
-        var gitRepoRoot: String?  // git root for worktree cleanup
-        if daemon.worktreeEnabled, let cwd = workingDirectory {
-            gitRepoRoot = daemon.findGitRoot(from: cwd)
-            let result = daemon.createWorktreeWithError(repoPath: cwd, branch: nil)
-            switch result {
-            case .success(let info):
-                workingDirectory = info.path
-                worktreeInfo = info
-                Logger.app.info("worktree created: \(info.name, privacy: .public) at \(info.path, privacy: .public)")
-            case .failure(let error):
-                let message: String
-                switch error {
-                case .daemonNotConnected:
-                    message = "term-meshd daemon is not running.\nNew tab will open without sandbox."
-                case .notGitRepo:
-                    message = "Current directory is not a git repository.\nNew tab will open without sandbox."
-                case .rpcError(let detail):
-                    message = "Failed to create worktree: \(detail)\nNew tab will open without sandbox."
-                }
-                Logger.app.error("worktree error: \(message, privacy: .public)")
-                DispatchQueue.main.async {
-                    let alert = NSAlert()
-                    alert.messageText = "Worktree Sandbox"
-                    alert.informativeText = message
-                    alert.alertStyle = .warning
-                    alert.addButton(withTitle: "OK")
-                    alert.runModal()
-                }
-            }
-        }
+        // term-mesh: Worktree sandbox setup runs asynchronously to avoid blocking
+        // the main thread with daemon RPC calls (up to 5s timeout each).
+        // findGitRoot is local FS only (fast), but createWorktreeWithError does RPC.
+        let worktreeEnabled = daemon.worktreeEnabled
+        let worktreeCwd = workingDirectory
 
         let inheritedConfig = inheritedTerminalConfigForNewWorkspace()
         let ordinal = Self.nextPortOrdinal
         Self.nextPortOrdinal += 1
+        let tabNumber = tabs.count + 1
         let newWorkspace = Workspace(
-            title: worktreeInfo.map { "[\($0.branch)] Terminal \(tabs.count + 1)" } ?? "Terminal \(tabs.count + 1)",
+            title: "Terminal \(tabNumber)",
             workingDirectory: workingDirectory,
             portOrdinal: ordinal,
             configTemplate: inheritedConfig,
             command: command,
             environment: environment
         )
-        // term-mesh: Store worktree metadata for auto-cleanup on tab close
-        if let info = worktreeInfo {
-            newWorkspace.worktreeName = info.name
-            newWorkspace.worktreeRepoPath = gitRepoRoot
-        }
 
         // term-mesh: Auto-watch the working directory for file heatmap
         if let cwd = workingDirectory, !cwd.isEmpty {
             DispatchQueue.global(qos: .utility).async {
                 self.daemon.watchPath(cwd)
+            }
+        }
+
+        // term-mesh: Async worktree setup — creates worktree sandbox without blocking UI
+        if worktreeEnabled, let cwd = worktreeCwd {
+            let daemon = self.daemon
+            DispatchQueue.global(qos: .userInitiated).async {
+                let gitRepoRoot = daemon.findGitRoot(from: cwd)
+                let result = daemon.createWorktreeWithError(repoPath: cwd, branch: nil)
+                DispatchQueue.main.async { [weak newWorkspace] in
+                    guard let newWorkspace else { return }
+                    switch result {
+                    case .success(let info):
+                        Logger.app.info("worktree created: \(info.name, privacy: .public) at \(info.path, privacy: .public)")
+                        newWorkspace.worktreeName = info.name
+                        newWorkspace.worktreeRepoPath = gitRepoRoot
+                        newWorkspace.title = "[\(info.branch)] Terminal \(tabNumber)"
+                        newWorkspace.currentDirectory = info.path
+                    case .failure(let error):
+                        let message: String
+                        switch error {
+                        case .daemonNotConnected:
+                            message = "term-meshd daemon is not running.\nNew tab will open without sandbox."
+                        case .notGitRepo:
+                            message = "Current directory is not a git repository.\nNew tab will open without sandbox."
+                        case .rpcError(let detail):
+                            message = "Failed to create worktree: \(detail)\nNew tab will open without sandbox."
+                        }
+                        Logger.app.error("worktree error: \(message, privacy: .public)")
+                    }
+                }
             }
         }
 

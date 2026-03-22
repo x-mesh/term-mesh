@@ -1526,6 +1526,7 @@ final class TeamOrchestrator: ObservableObject {
         text: String,
         taskTitle: String? = nil,
         priority: Int? = nil,
+        context: String? = nil,
         tabManager: TabManager
     ) -> DelegateResult? {
         let title = taskTitle?.nilIfBlank ?? String(text.prefix(80))
@@ -1535,18 +1536,27 @@ final class TeamOrchestrator: ObservableObject {
             assignee: agentName,
             priority: priority ?? 2
         ) else { return nil }
-        let instruction = formatDelegateInstruction(task: task, text: text)
+        let instruction = formatDelegateInstruction(task: task, text: text, context: context)
         let delivered = sendToAgent(teamName: teamName, agentName: agentName, text: instruction + "\n", tabManager: tabManager)
         return DelegateResult(task: task, textDelivered: delivered, instruction: instruction)
     }
 
-    private func formatDelegateInstruction(task: TeamTask, text: String) -> String {
+    private func formatDelegateInstruction(task: TeamTask, text: String, context: String? = nil) -> String {
         let taskId = task.id
         var lines: [String] = [
             "[TASK_ID] \(taskId)",
             "[TASK_TITLE] \(task.title)",
             "[TASK_STATUS] \(task.status)",
             "[TASK_PRIORITY] \(task.priority)",
+        ]
+        if let ctx = context, !ctx.isEmpty {
+            let truncated = String(ctx.prefix(3000))
+            lines.append("")
+            lines.append("[PRIOR_CONTEXT]")
+            lines.append(truncated)
+            lines.append("[/PRIOR_CONTEXT]")
+        }
+        lines.append(contentsOf: [
             "",
             "[FORMAT COMPLIANCE] Follow the leader's instructions EXACTLY as given. If a specific output format is requested, reproduce it precisely — do not paraphrase, summarize, or restructure the format.",
             "",
@@ -1558,7 +1568,7 @@ final class TeamOrchestrator: ObservableObject {
             "- tm-agent task block \(taskId) '<reason>'",
             "- tm-agent task review \(taskId) '<summary>'",
             "- tm-agent task done \(taskId) '<result>'",
-        ]
+        ])
         let body = lines.joined(separator: "\n")
         return body + "\n\n[IMPORTANT] When you finish this task, you MUST use your bash/execute tool to run this SINGLE command:\n```\ntm-agent reply '<one-paragraph summary of your result>'\n```\nThis sends the result to the leader AND registers it as a report in one step.\nDo NOT run separate msg send + report commands. Just use `reply` once."
     }
@@ -1783,13 +1793,13 @@ final class TeamOrchestrator: ObservableObject {
                         "model": agent.model,
                         "agent_type": agent.agentType,
                         "color": agent.color,
-                        "active_task_id": activeTask?.id as Any,
-                        "active_task_title": activeTask?.title as Any,
-                        "active_task_status": activeTask?.status as Any,
+                        "active_task_id": activeTask?.id as Any? ?? NSNull(),
+                        "active_task_title": activeTask?.title as Any? ?? NSNull(),
+                        "active_task_status": activeTask?.status as Any? ?? NSNull(),
                         "active_task_is_stale": activeTask.map(isTaskStale) ?? false,
                         "agent_state": agentRuntimeState(teamName: team.id, agentName: agent.name),
-                        "heartbeat_age_seconds": heartbeatAgeSeconds(teamName: team.id, agentName: agent.name) as Any,
-                        "last_heartbeat_summary": heartbeat?.summary as Any,
+                        "heartbeat_age_seconds": heartbeatAgeSeconds(teamName: team.id, agentName: agent.name) as Any? ?? NSNull(),
+                        "last_heartbeat_summary": heartbeat?.summary as Any? ?? NSNull(),
                         "heartbeat_is_stale": heartbeat.map(isHeartbeatStale) ?? false,
                         "workspace_id": agent.workspaceId.uuidString,
                         "panel_id": agent.panelId.uuidString
@@ -1859,13 +1869,13 @@ final class TeamOrchestrator: ObservableObject {
                     "cli": agent.cli,
                     "model": agent.model,
                     "agent_type": agent.agentType,
-                    "active_task_id": activeTask?.id as Any,
-                    "active_task_title": activeTask?.title as Any,
-                    "active_task_status": activeTask?.status as Any,
+                    "active_task_id": activeTask?.id as Any? ?? NSNull(),
+                    "active_task_title": activeTask?.title as Any? ?? NSNull(),
+                    "active_task_status": activeTask?.status as Any? ?? NSNull(),
                     "active_task_is_stale": activeTask.map(isTaskStale) ?? false,
                     "agent_state": agentRuntimeState(teamName: team.id, agentName: agent.name),
-                    "heartbeat_age_seconds": heartbeatAgeSeconds(teamName: team.id, agentName: agent.name) as Any,
-                    "last_heartbeat_summary": heartbeat?.summary as Any,
+                    "heartbeat_age_seconds": heartbeatAgeSeconds(teamName: team.id, agentName: agent.name) as Any? ?? NSNull(),
+                    "last_heartbeat_summary": heartbeat?.summary as Any? ?? NSNull(),
                     "heartbeat_is_stale": heartbeat.map(isHeartbeatStale) ?? false,
                     "workspace_id": agent.workspaceId.uuidString,
                     "panel_id": agent.panelId.uuidString
@@ -2571,16 +2581,16 @@ final class TeamOrchestrator: ObservableObject {
                 "priority": attention.0,
                 "team_name": teamName,
                 "task_id": task.id,
-                "agent_name": task.assignee as Any,
+                "agent_name": task.assignee as Any? ?? NSNull(),
                 "reason": attention.1,
                 "age_seconds": Int(now.timeIntervalSince(task.updatedAt)),
                 "summary": task.title,
                 "task_title": task.title,
-                "result": task.result as Any,
-                "review_summary": task.reviewSummary as Any,
+                "result": task.result as Any? ?? NSNull(),
+                "review_summary": task.reviewSummary as Any? ?? NSNull(),
                 "status": task.status,
                 "is_stale": staleSeconds != nil,
-                "stale_seconds": staleSeconds as Any
+                "stale_seconds": staleSeconds as Any? ?? NSNull()
             ])
         }
 
@@ -2632,23 +2642,23 @@ final class TeamOrchestrator: ObservableObject {
         var dict: [String: Any] = [
             "id": task.id,
             "title": task.title,
-            "description": task.details as Any,
+            "description": task.details as Any? ?? NSNull(),
             "acceptance_criteria": task.acceptanceCriteria,
             "labels": task.labels,
-            "estimated_size": task.estimatedSize as Any,
+            "estimated_size": task.estimatedSize as Any? ?? NSNull(),
             "status": task.status,
             "priority": task.priority,
             "depends_on": task.dependsOn,
-            "parent_task_id": task.parentTaskId as Any,
+            "parent_task_id": task.parentTaskId as Any? ?? NSNull(),
             "child_task_ids": task.childTaskIds,
             "reassignment_count": task.reassignmentCount,
-            "superseded_by": task.supersededBy as Any,
-            "assignee": task.assignee as Any,
-            "blocked_reason": task.blockedReason as Any,
-            "review_summary": task.reviewSummary as Any,
+            "superseded_by": task.supersededBy as Any? ?? NSNull(),
+            "assignee": task.assignee as Any? ?? NSNull(),
+            "blocked_reason": task.blockedReason as Any? ?? NSNull(),
+            "review_summary": task.reviewSummary as Any? ?? NSNull(),
             "created_by": task.createdBy,
-            "result": task.result as Any,
-            "result_path": task.resultPath as Any,
+            "result": task.result as Any? ?? NSNull(),
+            "result_path": task.resultPath as Any? ?? NSNull(),
             "created_at": ISO8601DateFormatter().string(from: task.createdAt),
             "updated_at": ISO8601DateFormatter().string(from: task.updatedAt),
             "needs_attention": taskNeedsAttention(task),

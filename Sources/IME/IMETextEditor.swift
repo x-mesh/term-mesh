@@ -131,8 +131,21 @@ struct IMETextEditor: NSViewRepresentable {
             .underlineStyle: NSUnderlineStyle.single.rawValue,
             .underlineColor: NSColor.cyan.withAlphaComponent(0.6),
         ]
-        // Re-apply rainbow keywords AFTER all color resets so they aren't overwritten
-        textView.applyRainbowKeywords()
+        // Re-apply rainbow keywords AFTER all color resets so they aren't overwritten.
+        // Use the deferred path (next run-loop iteration) to avoid layout invalidation
+        // collisions with the current SwiftUI update cycle (TERM-MESH-9 fix).
+        if !textView.hasMarkedText() {
+            NSObject.cancelPreviousPerformRequests(
+                withTarget: textView,
+                selector: #selector(IMETextView.applyHighlightingDeferred),
+                object: nil
+            )
+            textView.perform(
+                #selector(IMETextView.applyHighlightingDeferred),
+                with: nil,
+                afterDelay: 0
+            )
+        }
 
         textView.submitHandler = onSubmit
         textView.cancelHandler = onCancel

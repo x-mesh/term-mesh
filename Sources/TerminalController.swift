@@ -698,7 +698,11 @@ class TerminalController {
             return dispatchTeamCommandAsync(method: method, params: params, id: id)
         }
 
-        v2MainSync { self.v2RefreshKnownRefs() }
+        // Refresh handle refs asynchronously to avoid blocking the socket thread.
+        // Refs are also created lazily by v2EnsureHandleRef in each command's response,
+        // so a stale cache only affects handle-based lookups (e.g., "window:1") — raw
+        // UUID parameters always resolve immediately.
+        DispatchQueue.main.async { self.v2RefreshKnownRefs() }
 
 
         #if DEBUG
@@ -2632,6 +2636,7 @@ class TerminalController {
 
         let taskTitle = params["task_title"] as? String
         let priority = params["priority"] as? Int
+        let context = params["context"] as? String
         let store = TeamDataStore.shared
 
         // Create task + send instruction on MainActor (sendToAgent requires main thread).
@@ -2646,6 +2651,7 @@ class TerminalController {
                 text: text,
                 taskTitle: taskTitle,
                 priority: priority,
+                context: context,
                 tabManager: tabManager
             )
         }

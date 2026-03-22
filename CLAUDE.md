@@ -143,7 +143,8 @@ tail -f "$(cat /tmp/term-mesh-last-debug-log-path 2>/dev/null || echo /tmp/term-
 
 옵션: `--rounds N`, `--preset quick|thorough|deep`, `--steps "a:t,b:t"`, `--target <file>`,
 `--pr <number>`, `--judge <agent>`, `--timeout N`, `--resume`,
-`--pro`/`--con` (debate), `--attackers`/`--defenders` (red-team), `--vote` (brainstorm)
+`--pro`/`--con` (debate), `--attackers`/`--defenders` (red-team), `--vote` (brainstorm),
+`--context` (강제 맥락 주입), `--no-context` (맥락 주입 비활성화)
 
 ## Team agent system (OMC override)
 
@@ -175,7 +176,7 @@ tm-agent list
 
 # Leader → agent communication
 tm-agent send <agent> '<instruction>'
-tm-agent delegate <agent> '<instruction>'
+tm-agent delegate <agent> '<instruction>' [--context '<prior context>']
 tm-agent broadcast '<instruction>'
 tm-agent read <agent> --lines 100
 tm-agent collect --lines 100

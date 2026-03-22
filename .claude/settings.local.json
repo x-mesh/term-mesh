@@ -14,7 +14,8 @@
       "Bash(./scripts/reload.sh --tag fix-layout-loop)",
       "Bash(pkill -f 'term-mesh DEV fix-layout-loop')",
       "Bash(xcodebuild -project GhosttyTabs.xcodeproj -scheme term-mesh -configuration Debug -destination 'platform=macOS' build)",
-      "Bash(tm-agent wait:*)"
+      "Bash(tm-agent wait:*)",
+      "Bash(cargo build:*)"
     ]
   },
   "enabledPlugins": {

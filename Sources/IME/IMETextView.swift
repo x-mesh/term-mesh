@@ -569,7 +569,7 @@ final class IMETextView: NSTextView {
         perform(#selector(applyHighlightingDeferred), with: nil, afterDelay: 0)
     }
 
-    @objc private func applyHighlightingDeferred() {
+    @objc func applyHighlightingDeferred() {
         guard !isApplyingRainbow, !hasMarkedText() else { return }
         isApplyingRainbow = true
         applyRainbowKeywords()
@@ -581,6 +581,7 @@ final class IMETextView: NSTextView {
     /// Safe to call externally (e.g. after programmatic `string =` assignment).
     /// Skips any active IME composing (marked) range.
     func applyRainbowKeywords() {
+        guard !isApplyingRainbow else { return }
         guard let storage = textStorage else { return }
         let len = storage.length
         guard len > 0 else { return }
