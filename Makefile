@@ -115,6 +115,7 @@ prod:
 		-configuration Release \
 		-destination 'platform=macOS' \
 		-derivedDataPath /tmp/term-mesh-prod \
+		ONLY_ACTIVE_ARCH=YES \
 		build 2>&1 | tee /tmp/term-mesh-xcodebuild-prod.log | grep -E '(warning:|error:|BUILD|Compiling)'; \
 		RESULT=$${PIPESTATUS[0]}; \
 		if [ $$RESULT -ne 0 ]; then \
