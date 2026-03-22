@@ -147,6 +147,20 @@ enum Commands {
         #[arg(long)]
         headless: bool,
     },
+    /// Add an agent to an existing team
+    Add {
+        /// Agent type/name (e.g. "security", "executor", "reviewer")
+        agent_type: String,
+        /// Custom agent name (defaults to agent_type)
+        #[arg(long)]
+        name: Option<String>,
+        /// Model to use (e.g. sonnet, opus, haiku)
+        #[arg(long, default_value = "sonnet")]
+        model: String,
+        /// CLI to use (claude, codex, kiro, gemini)
+        #[arg(long, default_value = "claude")]
+        cli: String,
+    },
     /// Preset operations (list)
     #[command(subcommand)]
     Preset(PresetCommands),
@@ -975,6 +989,29 @@ fn main() {
             }
             return;
         }
+        Commands::Add { agent_type, name, model, cli } => {
+            let agent_name = name.unwrap_or_else(|| agent_type.clone());
+
+            // Try headless path first
+            if let Some(daemon_sock) = detect_daemon_socket() {
+                // Check if the team exists as a headless team
+                if let Ok(resp) = rpc_call(&daemon_sock, "headless.list_teams", json!({})) {
+                    let is_headless = resp["result"].as_array()
+                        .map(|teams| teams.iter().any(|t| t["name"].as_str() == Some(&team)))
+                        .unwrap_or(false);
+                    if is_headless {
+                        run_add_headless(&sock, &daemon_sock, &team, &agent_name, &agent_type, &model, &cli);
+                        return;
+                    }
+                }
+            }
+
+            // GUI team: not yet supported
+            eprintln!("Error: 'tm-agent add' for GUI teams is not yet supported.");
+            eprintln!("Hint: Use 'tm-agent destroy' then 'tm-agent create' to recreate with different agents.");
+            eprintln!("      Headless team support: 'tm-agent create --headless ...' then 'tm-agent add ...'");
+            process::exit(1);
+        }
         Commands::Preset(sub) => {
             match sub {
                 PresetCommands::List => {
@@ -1465,6 +1502,71 @@ fn run_create_headless(
     println!("  tm-agent read <agent> --lines 50");
     println!("  tm-agent status");
     println!("  tm-agent destroy");
+}
+
+fn run_add_headless(
+    app_sock: &PathBuf, daemon_sock: &PathBuf, team: &str, agent_name: &str,
+    agent_type: &str, model: &str, cli: &str,
+) {
+    eprintln!("Adding agent '{agent_name}' (type={agent_type}, cli={cli}, model={model}) to headless team '{team}'...");
+
+    let app_sock_str = app_sock.to_string_lossy().to_string();
+
+    let add_params = json!({
+        "team_name": team,
+        "name": agent_name,
+        "cli": cli,
+        "model": model,
+        "app_socket_path": app_sock_str,
+    });
+
+    match rpc_call_timeout(daemon_sock, "headless.add_agent", add_params, 15) {
+        Ok(resp) => {
+            if let Some(err) = resp.get("error") {
+                eprintln!("Error: {}", err["message"].as_str().unwrap_or("unknown"));
+                process::exit(1);
+            }
+
+            println!("{}", pretty(&resp));
+
+            // Send init prompt to the new agent
+            let workdir = env::current_dir()
+                .map(|p| p.to_string_lossy().to_string())
+                .unwrap_or_else(|_| ".".to_string());
+            let agent_id = format!("{agent_name}@{team}");
+            let init_text = agent_init_prompt(agent_name, &workdir, &app_sock_str);
+
+            match rpc_call_timeout(daemon_sock, "headless.send", json!({
+                "agent_id": agent_id,
+                "text": init_text,
+            }), 5) {
+                Ok(_) => eprintln!("  \u{2713} {agent_name}: init prompt sent"),
+                Err(e) => eprintln!("  \u{2717} {agent_name}: init prompt FAILED: {e}"),
+            }
+
+            // Register the agent with the Swift app's team data store
+            // Use agent_type (role) separately from agent_name (display name)
+            match rpc_call(app_sock, "team.register_agent", json!({
+                "team_name": team,
+                "agent_name": agent_name,
+                "agent_type": agent_type,
+                "model": model,
+                "cli": cli,
+            })) {
+                Ok(_) => {},
+                Err(e) => {
+                    eprintln!("  Warning: failed to register agent with app: {e}");
+                    eprintln!("  (agent process is running on daemon but may not appear in app UI)");
+                }
+            }
+
+            eprintln!("\nAgent '{agent_name}' added to team '{team}'.");
+        }
+        Err(e) => {
+            eprintln!("Error: {e}");
+            process::exit(1);
+        }
+    }
 }
 
 fn run_delegate_result(

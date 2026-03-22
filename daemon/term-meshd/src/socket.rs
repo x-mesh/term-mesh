@@ -723,6 +723,42 @@ async fn dispatch(req: &Request, ctx: &Context) -> Response {
             let teams = mgr.list_teams();
             Ok(serde_json::to_value(teams).unwrap())
         }
+        "headless.add_agent" => {
+            #[derive(Deserialize)]
+            struct P {
+                team_name: String,
+                name: String,
+                #[serde(default = "default_cli")]
+                cli: String,
+                #[serde(default = "default_model")]
+                model: String,
+                #[serde(default)]
+                cli_path: Option<String>,
+                #[serde(default)]
+                app_socket_path: Option<String>,
+                #[serde(default)]
+                instructions: Option<String>,
+            }
+            fn default_cli() -> String { "claude".into() }
+            fn default_model() -> String { "sonnet".into() }
+            match serde_json::from_value::<P>(req.params.clone()) {
+                Ok(p) => {
+                    let spec = crate::headless::AgentSpec {
+                        name: p.name,
+                        cli: p.cli,
+                        model: p.model,
+                        cli_path: p.cli_path,
+                        instructions: p.instructions,
+                    };
+                    let mut mgr = ctx.headless.lock().await;
+                    match mgr.add_agent(&p.team_name, spec, p.app_socket_path.as_deref()).await {
+                        Ok(info) => Ok(serde_json::to_value(info).unwrap()),
+                        Err(e) => Err(e),
+                    }
+                }
+                Err(e) => Err(format!("invalid params: {e}")),
+            }
+        }
         "headless.resolve" => {
             #[derive(Deserialize)]
             struct P { team_name: String, agent_name: String }

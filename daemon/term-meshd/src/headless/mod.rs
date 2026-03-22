@@ -484,6 +484,48 @@ impl HeadlessManager {
         self.agents.clear();
     }
 
+    /// Add a single agent to an existing headless team.
+    pub async fn add_agent(&mut self, team_name: &str, spec: AgentSpec, app_socket_path: Option<&str>) -> Result<AgentInfo, String> {
+        let team = self.teams.get(team_name)
+            .ok_or_else(|| format!("team not found: {team_name}"))?;
+
+        let agent_id = format!("{}@{}", spec.name, team_name);
+        if self.agents.contains_key(&agent_id) {
+            return Err(format!("agent '{}' already exists in team '{}'", spec.name, team_name));
+        }
+
+        let working_directory = team.working_directory.clone();
+
+        let spawn_params = SpawnParams {
+            name: spec.name.clone(),
+            team_name: team_name.to_string(),
+            cli: spec.cli,
+            model: spec.model,
+            working_directory,
+            cli_path: spec.cli_path,
+            app_socket_path: app_socket_path.map(String::from),
+            instructions: spec.instructions,
+        };
+
+        let info = self.spawn_agent(spawn_params).await?;
+
+        // Update team's agent list (team must still exist since we hold &mut self)
+        match self.teams.get_mut(team_name) {
+            Some(team) => {
+                team.agents.push(info.id.clone());
+            }
+            None => {
+                // Rollback: terminate the orphaned agent
+                tracing::error!("team '{}' disappeared after spawn, rolling back agent '{}'", team_name, info.id);
+                let _ = self.terminate(&info.id).await;
+                self.agents.remove(&info.id);
+                return Err(format!("team '{}' was removed during agent spawn", team_name));
+            }
+        }
+
+        Ok(info)
+    }
+
     /// Check if an agent exists and is headless.
     pub fn is_headless(&self, agent_id: &str) -> bool {
         self.agents.contains_key(agent_id)

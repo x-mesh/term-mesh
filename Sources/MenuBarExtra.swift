@@ -581,6 +581,7 @@ enum MenuBarIconRenderer {
             drawBadge(text: text, in: config.badgeRect, config: config)
         }
 
+        image.isTemplate = true
         return image
     }
 
@@ -620,7 +621,7 @@ enum MenuBarIconRenderer {
         for (i, (nx, ny)) in nodes.enumerated() {
             let nr = (i == 0) ? hubRadius : nodeRadius
             let dot = NSBezierPath(ovalIn: NSRect(
-                x: nx - r, y: ny - r, width: r * 2, height: r * 2
+                x: nx - nr, y: ny - nr, width: nr * 2, height: nr * 2
             ))
             dot.fill()
         }
