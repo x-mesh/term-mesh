@@ -18,6 +18,8 @@ Parse `$ARGUMENTS`의 첫 단어로 전략을 결정한다:
 - `debate` → [Strategy: debate] 섹션 실행
 - `red-team` → [Strategy: red-team] 섹션 실행
 - `brainstorm` → [Strategy: brainstorm] 섹션 실행
+- `distribute` → [Strategy: distribute] 섹션 실행
+- `council` → [Strategy: council] 섹션 실행
 - 빈 입력 → 사용자에게 전략 선택 질문
 
 ## Options
@@ -35,6 +37,10 @@ Parse `$ARGUMENTS`의 첫 단어로 전략을 결정한다:
 - `--attackers "agent,agent"` — red-team 공격팀 수동 지정
 - `--defenders "agent,agent"` — red-team 방어팀 수동 지정
 - `--vote` — brainstorm에서 도트 투표 활성화
+- `--splits "agent:task,agent:task"` — distribute 분할 수동 지정
+- `--no-merge` — distribute 결과 병합 비활성화
+- `--conflict-check` — distribute 파일 충돌 검사 (기본 활성)
+- `--agenda "item1,item2,item3"` — council 다중 안건 지정
 - `--context` — 대화 맥락을 강제로 에이전트에게 주입 (자동 판단 무시)
 - `--no-context` — 대화 맥락 주입을 강제로 비활성화 (자동 판단 무시)
 
@@ -51,7 +57,7 @@ tm-agent status
 
 3. 전략별 최소 에이전트 수를 확인한다:
    - chain, review, brainstorm: 최소 1명
-   - refine, tournament, red-team: 최소 2명
+   - refine, tournament, red-team, distribute, council: 최소 2명 (council은 3명 이상 권장)
    - debate: 최소 3명 (PRO 1+, CON 1+, JUDGE 1+)
    미달이면 경고를 출력하고 사용자에게 계속 진행할지 확인한다.
    tournament에서 에이전트가 1명뿐이면 "경쟁 불가 — chain 전략을 권장합니다" 안내.
@@ -144,11 +150,14 @@ tm-op — 전략 오케스트레이션 커맨드
   debate <topic>          찬반 토론 후 판정. 설계 트레이드오프 분석에 적합
   red-team <--target f>   공격팀이 결함 발견→방어팀이 수정. 보안·견고성 강화
   brainstorm <topic>      수렴 없이 아이디어 발산→분류→투표
+  distribute <topic>      대규모 태스크를 독립 서브태스크로 분할하여 병렬 실행·병합
+  council <topic>         N명 자유 토의 → 교차 질의 → 심화 → 합의 도출. 다자간 숙의 회의
 
 옵션 (Options):
   --rounds N              refine 라운드 수 (기본 4)
   --preset <p>            quick | thorough | deep
   --steps "a:t,b:t"       chain 단계 수동 지정
+  --splits "a:t,b:t"      distribute 분할 수동 지정
   --target <file|dir>     review/red-team 대상
   --pr <number>           review 대상 PR
   --judge <agent>         tournament 심판 에이전트
@@ -158,6 +167,9 @@ tm-op — 전략 오케스트레이션 커맨드
   --attackers "a,b"       red-team 공격팀
   --defenders "a,b"       red-team 방어팀
   --vote                  brainstorm 도트 투표 활성화
+  --no-merge              distribute 결과 병합 비활성화
+  --conflict-check        distribute 파일 충돌 검사 (기본 활성)
+  --agenda "a,b,c"        council 다중 안건
   --context               대화 맥락을 강제로 에이전트에게 주입
   --no-context            대화 맥락 주입을 강제로 비활성화
 
@@ -169,6 +181,9 @@ tm-op — 전략 오케스트레이션 커맨드
   /tm-op debate "모놀리스 vs 마이크로서비스"
   /tm-op red-team --target src/auth.ts
   /tm-op brainstorm "v2 기능 아이디어" --vote
+  /tm-op distribute "6개 Sentry 이슈 분석" --splits "explorer:MESH-1,security:MESH-2,executor:MESH-3"
+  /tm-op council "ECS vs K8s 마이그레이션" --rounds 4
+  /tm-op council "스프린트 계획" --agenda "API 설계,인증 방식,배포 전략"
 ```
 
 출력 후 즉시 종료. 전략을 실행하지 않는다.
@@ -636,6 +651,255 @@ tm-agent wait --timeout {timeout} --mode report
 
 ---
 
+## Strategy: council
+
+다자간 숙의 회의. N명의 에이전트가 자유롭게 의견을 개진하고, 서로의 주장에 교차 질의하며, 핵심 쟁점을 심화 토의한 뒤 합의 또는 쟁점 정리 문서를 도출한다.
+
+debate와의 차이: debate는 2개 고정 진영(PRO/CON)이 승패를 겨루지만, council은 N개 유동 포지션이 합의를 추구한다.
+
+### Prerequisites
+
+- 최소 에이전트 수: **2명** (3명 이상 권장)
+- 2명일 경우 경고: "council은 3명 이상에서 최적화됩니다. 2명이면 debate를 권장합니다. 계속할까요?"
+- `--rounds N` — 총 라운드 수 (기본 4, 최소 2). Round 1(개진) + Round 2(교차 질의) + Round 3~N-1(심화) + Final(수렴).
+- `--agenda "item1,item2,item3"` — 다중 안건. 각 안건마다 전체 council 사이클을 반복한다.
+
+### Agenda Handling
+
+`--agenda` 제공 시:
+1. 안건 목록을 파싱: `"API 설계,인증 방식,배포 전략"` → `["API 설계", "인증 방식", "배포 전략"]`
+2. 사용자에게 안건 목록을 보여준다:
+```
+🏛️ [council] 안건 목록:
+  1. API 설계
+  2. 인증 방식
+  3. 배포 전략
+총 {N}개 안건, 에이전트 {M}명 참여
+```
+3. 각 안건마다 Round 1~Final을 순차 실행한다.
+4. 안건별 결과를 누적하여 최종 출력에 통합한다.
+
+`--agenda` 없으면 사용자가 제공한 토픽 하나를 단일 안건으로 처리한다.
+
+### Round 1: OPENING (개진)
+
+> 🏛️ [council] Round 1/{max_rounds}: Opening — 각자 입장 개진
+
+각 에이전트가 독립적으로 주제에 대한 자신의 입장을 밝힌다.
+
+```bash
+tm-agent fan-out '## Council: 입장 개진
+논제: {TASK}
+
+이 주제에 대해 당신의 입장과 근거를 밝혀라.
+- 핵심 주장 (명확한 포지션)
+- 근거 2-3가지 (구체적 사례/데이터)
+- 예상되는 반론과 그에 대한 사전 답변 1가지
+- 300단어 이내
+
+당신은 어떤 포지션이든 자유롭게 취할 수 있다. 다른 에이전트와 같은 입장이어도 무방하다.
+[IMPORTANT] When done, run: tm-agent reply "<your position>" to report.'
+```
+
+```bash
+tm-agent wait --timeout {timeout} --mode report
+tm-agent collect --lines 200
+```
+
+잘린 결과가 있으면 개별 reply 파일을 읽는다.
+
+리더(Claude)가 전원 입장을 수집하고 내부적으로 **포지션 맵**을 구축한다:
+- 각 에이전트의 핵심 주장 요약 (1줄)
+- 유사 포지션끼리 그룹핑
+- 초기 합의 지점과 분기점 파악
+
+사용자에게 중간 상황을 보고한다:
+```
+🏛️ [council] Round 1 완료 — {N}명 입장 개진
+포지션 분포: {group_summary}
+핵심 분기점: {divergence_points}
+```
+
+### Round 2: CROSS-EXAMINE (교차 질의)
+
+> 🏛️ [council] Round 2/{max_rounds}: Cross-Examine — 교차 질의
+
+이 라운드가 council의 핵심 차별점이다. 각 에이전트가 다른 에이전트들의 **구체적 주장**을 읽고 직접 질문하거나 반론한다.
+
+각 에이전트에게 **본인 제외** 다른 모든 에이전트의 입장을 전달하고 교차 질의를 요청한다:
+
+```bash
+tm-agent delegate {agent} '## Council: 교차 질의
+논제: {TASK}
+
+다른 참여자들의 입장:
+{other_agents_positions — 본인 제외}
+
+위 입장을 읽고 아래를 수행하라:
+1. 가장 동의하는 주장 1개를 골라 그 이유를 밝혀라
+2. 가장 의문이 드는 주장 1-2개를 골라 구체적 질문 또는 반론을 제기하라
+   - "{agent_name}의 주장 중 ~~ 부분에 대해..." 형식으로 특정 에이전트를 지명하라
+3. 다른 에이전트의 주장을 통해 자신의 입장이 변화했다면 어떻게 변했는지 밝혀라
+- 300단어 이내
+[IMPORTANT] When done, run: tm-agent reply "<your cross-examination>" to report.'
+```
+
+(위 delegate를 모든 에이전트에 대해 **병렬로** 실행한다. broadcast가 아닌 개별 delegate — 에이전트마다 {other_agents_positions} 내용이 다르기 때문이다.)
+
+```bash
+tm-agent wait --timeout {timeout} --mode report
+```
+
+결과를 수집하고 리더(Claude)가 분석한다:
+1. **합의 수렴 감지**: 복수 에이전트가 특정 포지션에 동의를 표명했는지 확인
+2. **핵심 쟁점 추출**: 교차 질의에서 반복적으로 제기된 의문/반론을 쟁점(dispute)으로 정리
+3. **입장 변화 추적**: 에이전트가 입장을 수정한 경우 기록
+
+사용자에게 중간 상황을 보고한다:
+```
+🏛️ [council] Round 2 완료 — 교차 질의 결과
+합의 수렴: {converging_points}
+핵심 쟁점: {dispute_list}
+입장 변화: {agent_name}: {old_position} → {new_position}
+```
+
+**조기 종료 체크**: 전원이 동일 포지션에 합의를 표명했다면 → Round 3~N-1을 건너뛰고 Final Round로 직행.
+
+### Round 3 ~ N-1: DEEP DIVE (심화)
+
+> 🏛️ [council] Round {n}/{max_rounds}: Deep Dive — 핵심 쟁점 심화 토의
+
+리더(Claude)가 교차 질의에서 추출한 핵심 쟁점(최대 3개)을 선정하고, 전 에이전트에게 해당 쟁점에 집중한 심화 토의를 요청한다.
+
+```bash
+tm-agent broadcast '## Council: 심화 토의 (Round {n})
+논제: {TASK}
+
+지금까지의 논의에서 다음 핵심 쟁점이 도출되었다:
+
+### 쟁점 1: {dispute_1_title}
+{dispute_1_description}
+관련 입장: {agent_a} — {position_a} vs {agent_b} — {position_b}
+
+### 쟁점 2: {dispute_2_title}
+{dispute_2_description}
+
+### 현재 합의 사항
+- {agreed_point_1}
+- {agreed_point_2}
+
+위 쟁점 중 자신의 전문 분야와 가장 관련 깊은 것에 집중하여:
+1. 추가 근거나 데이터를 제시하라
+2. 다른 에이전트의 교차 질의에 직접 답변하라 ("{agent}의 질문에 대해...")
+3. 타협안(compromise)이 있다면 제안하라
+4. 자신의 입장이 변했다면 명시적으로 밝혀라: "입장 변경: {이전} → {이후}"
+- 300단어 이내
+[IMPORTANT] When done, run: tm-agent reply "<your deep dive>" to report.'
+```
+
+```bash
+tm-agent wait --timeout {timeout} --mode report
+tm-agent collect --lines 200
+```
+
+리더(Claude)가 결과를 분석한다:
+1. 각 쟁점별로 합의가 이루어졌는지 판단
+2. 새로운 쟁점이 등장했는지 확인
+3. 에이전트별 입장 변화를 누적 추적
+
+**조기 종료 체크**: 모든 핵심 쟁점에서 합의가 이루어졌다면 → 다음 심화 라운드를 건너뛰고 Final Round로 직행.
+
+심화 라운드를 max_rounds가 허용하는 한 반복한다. 각 라운드에서:
+- 해결된 쟁점은 "합의 사항"으로 이동
+- 미해결 쟁점은 다음 라운드에서 재논의
+- 새 쟁점이 등장하면 추가
+
+### Final Round: CONVERGE (수렴)
+
+> 🏛️ [council] Round {max_rounds}/{max_rounds}: Converge — 합의 시도
+
+리더(Claude)가 전체 논의를 종합하여 **합의안 초안(draft consensus)**을 작성한다. 리더가 작성하되, 에이전트들의 실제 논의 내용만을 반영한다 (리더 자신의 의견을 넣지 않는다).
+
+```bash
+tm-agent broadcast '## Council: 합의 수렴
+논제: {TASK}
+
+전체 논의를 종합한 합의안 초안:
+
+### 합의 사항
+{consensus_items}
+
+### 미해결 쟁점
+{remaining_disputes_with_both_positions}
+
+위 초안에 대해 다음 중 하나로 응답하라:
+1. **AGREE** — 합의안에 동의한다. (부분 수정 제안이 있으면 함께 기술)
+2. **OBJECT** — 합의안에 동의하지 않는다. 반대 이유와 수정 요구를 구체적으로 밝혀라.
+
+또한 최종 입장을 한 줄로 요약하라: "최종 입장: {summary}"
+[IMPORTANT] When done, run: tm-agent reply "<AGREE or OBJECT + reasoning>" to report.'
+```
+
+```bash
+tm-agent wait --timeout {timeout} --mode report
+tm-agent collect --lines 200
+```
+
+리더(Claude)가 결과를 분석한다:
+- **전원 AGREE** → consensus_status = "FULL CONSENSUS"
+- **과반 AGREE** (OBJECT 에이전트의 수정 제안이 minor) → 수정 반영 후 consensus_status = "CONSENSUS WITH RESERVATIONS"
+- **과반 미달** 또는 **핵심 OBJECT** → consensus_status = "NO CONSENSUS — DISPUTE SUMMARY"
+
+### Council 최종 출력
+
+```
+🏛️ [council] Complete — {actual_rounds}/{max_rounds} rounds, {N} agents
+Status: {FULL CONSENSUS | CONSENSUS WITH RESERVATIONS | NO CONSENSUS}
+
+## Consensus Statement (합의문)
+{consensus_statement — 전원 합의 시 확정안, 부분 합의 시 조건부 합의안}
+
+## Key Disputes (핵심 쟁점)
+| # | Dispute | Position A | Position B | Status |
+|---|---------|-----------|-----------|--------|
+| 1 | {쟁점} | {입장A} ({agents}) | {입장B} ({agents}) | ✅ Resolved / ❌ Open |
+
+## Stance Evolution (입장 변천)
+| Agent | Round 1 | Final | Changed? |
+|-------|---------|-------|----------|
+| {agent1} | {initial_position} | {final_position} | ✅ / — |
+| {agent2} | {initial_position} | {final_position} | ✅ / — |
+
+## Unresolved Items (미해결 항목)
+| # | Item | Blocking Positions | What Would Resolve It |
+|---|------|--------------------|----------------------|
+| 1 | {item} | {agent}: {reason} | {데이터/실험/추가 분석 필요} |
+
+## Round Summary
+| Round | Phase | Key Outcome |
+|-------|-------|-------------|
+| 1 | Opening | {N}명 입장 개진, {G}개 포지션 그룹 |
+| 2 | Cross-Examine | {쟁점 수}개 핵심 쟁점 도출, {변화 수}명 입장 변화 |
+| 3 | Deep Dive | 쟁점 {해결수}/{총수} 해결 |
+| 4 | Converge | {consensus_status} |
+```
+
+`--agenda` 사용 시:
+```
+🏛️ [council] Complete — {agenda_count} agendas, {total_rounds} total rounds
+
+## Agenda 1: {topic_1}
+{위와 동일한 출력 구조}
+
+## Agenda 2: {topic_2}
+{위와 동일한 출력 구조}
+
+## Cross-Agenda Summary
+{안건 간 연관성이나 상충점이 있으면 리더가 정리}
+```
+
+---
+
 ## Strategy: red-team
 
 적대적 공격/방어. 공격팀이 취약점·결함을 발견하고 방어팀이 수정안을 제시.
@@ -862,6 +1126,195 @@ tm-agent collect --lines 100
 
 ---
 
+## Strategy: distribute
+
+대규모 태스크를 독립 서브태스크로 분할하여 각 에이전트에게 할당, 병렬 실행 후 병합.
+`refine`(같은 태스크를 다르게)이나 `fan-out`(동일 지시)과 달리, 각 에이전트가 **서로 다른 서브태스크**를 수행한다.
+
+### Phase 1: SPLIT (분할)
+
+> 📦 [distribute] Phase 1: Split — 태스크를 독립 서브태스크로 분할
+
+**Case A: `--splits` 제공 시** — 파싱:
+```
+--splits "explorer:src/auth 분석,security:src/api 분석,executor:tests/ 작성"
+→ [(explorer, "src/auth 분석"), (security, "src/api 분석"), (executor, "tests/ 작성")]
+```
+
+지정된 에이전트가 존재하고 idle인지 확인한다. working/blocked이면 경고 후 사용자에게 계속할지 확인.
+
+**Case B: 자동 분할 (기본)** — 리더(Claude)가 태스크를 분석하여 idle 에이전트 수만큼 서브태스크로 분할:
+
+1. 태스크 설명을 읽고 자연스러운 분할 경계를 파악 (파일별, 모듈별, 이슈별, 테스트별 등)
+2. 서브태스크 간 **독립성** 보장 — 어떤 서브태스크도 다른 서브태스크의 결과에 의존하지 않아야 한다
+3. 에이전트 역할에 맞게 배정 (security → 보안 관련, frontend → UI 관련 등)
+
+리더가 분할 계획을 사용자에게 보여주고 확인받는다:
+```
+📦 분할 계획:
+| # | Agent     | Subtask              | Target Files    |
+|---|-----------|----------------------|-----------------|
+| 1 | explorer  | src/auth/ 분석       | src/auth/*.ts   |
+| 2 | security  | src/api/ 보안 점검    | src/api/*.ts    |
+| 3 | executor  | tests/ 작성          | tests/*.ts      |
+
+진행할까요? (Y/n)
+```
+
+사용자가 거부하면 AskUserQuestion으로 수정 사항을 받는다.
+
+서브태스크 수 > 에이전트 수인 경우:
+- 한 에이전트에 복수 서브태스크를 순차 할당하거나
+- 사용자에게 범위 축소를 제안한다
+
+### Phase 2: CONFLICT CHECK (충돌 검사)
+
+> 📦 [distribute] Phase 2: Conflict Check — 파일 충돌 사전 검증
+
+`--conflict-check` 활성 시 (기본 활성) 그리고 태스크가 파일 수정을 포함할 때:
+
+1. 각 서브태스크의 대상 파일/디렉토리를 파악
+2. 두 에이전트 이상의 범위에 같은 파일이 포함되면 경고:
+```
+⚠️ 충돌 감지: src/utils/helper.ts 가 explorer와 executor의 작업 범위에 포함됩니다.
+```
+3. 해결 옵션: 해당 파일을 한 에이전트에게만 재할당, 또는 경고를 인지하고 진행
+4. 분석 전용 태스크(읽기만)이면 이 단계를 스킵한다
+
+### Phase 3: DISPATCH (병렬 배포)
+
+> 📦 [distribute] Phase 3: Dispatch — {N}개 서브태스크 병렬 실행
+
+각 에이전트에게 고유한 서브태스크를 `tm-agent delegate`로 전송:
+
+```bash
+tm-agent delegate {agent} '## Distributed Task: Subtask {n}/{total}
+
+전체 태스크: {original_task}
+당신의 담당: {subtask_description}
+작업 범위: {target_files_or_scope}
+
+다른 에이전트가 나머지 부분을 병렬로 작업 중이다. 아래 파일/범위만 수정/분석하라:
+{scope_boundary}
+
+⚠️ 범위 밖 파일을 수정하지 마라 — 다른 에이전트와 충돌할 수 있다.
+
+[IMPORTANT] When done, run: tm-agent reply "<your result>" to report.'
+```
+
+컨텍스트 주입이 활성이면 각 delegate 호출에 `--context` 플래그를 추가한다.
+
+모든 에이전트를 동시에 dispatch한 후:
+
+```bash
+tm-agent wait --timeout {timeout} --mode report
+```
+
+### Phase 4: COLLECT (수집)
+
+> 📦 [distribute] Phase 4: Collect — 결과 수집
+
+표준 Result Collection 우선순위로 수집:
+1. Task ID 파일: `cat ~/.term-mesh/results/{team}/{task_id}.md`
+2. Agent reply 파일: `cat ~/.term-mesh/results/{team}/{agent}-reply.md`
+3. `tm-agent collect --lines 200` (요약, 잘릴 수 있음)
+
+에이전트별 완료 상태를 추적:
+
+| Agent | Status | Duration |
+|-------|--------|----------|
+| explorer | completed | 45s |
+| security | completed | 62s |
+| executor | timeout | 120s |
+
+에이전트가 타임아웃이면:
+- 해당 에이전트를 "timeout"으로 표시
+- 나머지 에이전트 결과로 계속 진행
+- 최종 출력에 경고 포함
+
+전원 타임아웃이면 전략을 중단하고 수집된 부분 결과를 출력.
+
+### Phase 5: MERGE (병합)
+
+> 📦 [distribute] Phase 5: Merge — 결과 병합
+
+`--no-merge` 시 이 단계를 스킵하고 Phase 6으로 이동.
+
+리더(Claude)가 전원 결과를 병합한다:
+1. **코드 수정 태스크**: 충돌하는 편집이 없는지 검증. 충돌 감지 시 양쪽 버전을 보여주고 사용자 선택 요청.
+2. **분석 태스크**: 발견 사항을 테마/심각도별로 종합, 중복 제거.
+3. **혼합 태스크**: 유형별(코드 변경, 분석, 문서)로 그룹화하여 통합 제시.
+
+### Phase 6: VERIFY (교차 검증, 선택)
+
+`--rounds 2` 이상일 때만 실행.
+
+> 📦 [distribute] Phase 6: Verify — 교차 검증 (Round {n})
+
+```bash
+tm-agent broadcast '## Distribute: 교차 검증
+다른 에이전트들의 작업 결과를 검토하라:
+
+{merged_results_summary}
+
+자신의 담당 범위와 인접한 부분에서 일관성 문제나 누락을 확인하라.
+- 문제 있으면: 구체적으로 지적
+- 문제 없으면: "OK"
+
+[IMPORTANT] When done, run: tm-agent reply "<your verification>" to report.'
+```
+
+```bash
+tm-agent wait --timeout {timeout} --mode report
+tm-agent collect --lines 100
+```
+
+결과를 분석:
+- **전원 OK** → 완료
+- **지적 있음** → 리더가 반영하여 결과 수정, 또는 해당 에이전트에게 수정 재요청
+
+### Distribute 최종 출력
+
+`--merge` 활성 시 (기본):
+```
+📦 [distribute] Complete — {N} subtasks, {completed}/{N} succeeded
+
+| # | Agent     | Subtask           | Status    | Duration |
+|---|-----------|-------------------|-----------|----------|
+| 1 | explorer  | src/auth/ 분석     | ✅ Done   | 45s      |
+| 2 | security  | src/api/ 보안 점검  | ✅ Done   | 62s      |
+| 3 | executor  | tests/ 작성        | ⏰ Timeout | 120s     |
+
+## 병합된 결과
+{merged_result}
+
+## 서브태스크별 상세
+### Subtask 1: {subtask_description} (explorer)
+{individual_result}
+
+### Subtask 2: {subtask_description} (security)
+{individual_result}
+
+### Subtask 3: {subtask_description} (executor)
+⏰ Timeout — 결과 없음
+```
+
+`--no-merge` 시:
+```
+📦 [distribute] Complete — {N} subtasks, {completed}/{N} succeeded
+
+| # | Agent     | Subtask           | Status    | Duration |
+|---|-----------|-------------------|-----------|----------|
+
+## Subtask 1: {subtask_description} (explorer)
+{individual_result}
+
+## Subtask 2: {subtask_description} (security)
+{individual_result}
+```
+
+---
+
 ## Interactive Mode
 
 `$ARGUMENTS`가 빈 경우, AskUserQuestion 도구를 사용하여 전략을 선택받는다.
@@ -872,8 +1325,8 @@ tm-agent collect --lines 100
 - Question: "어떤 유형의 전략을 사용할까요?"
 - Options:
   1. "협력 (refine / brainstorm)" — 전원이 협력하여 정제하거나 아이디어 발산
-  2. "경쟁 (tournament / debate)" — 전원 경쟁 투표 또는 찬반 토론
-  3. "파이프라인 (chain)" — A→B→C 순차 실행
+  2. "경쟁/숙의 (tournament / debate / council)" — 경쟁 투표, 찬반 토론, 또는 다자간 숙의
+  3. "파이프라인 (chain / distribute)" — 순차 파이프라인 또는 병렬 분배
   4. "분석 (review / red-team)" — 다각도 리뷰 또는 공격/방어
 
 **2단계 — 구체 전략 선택:**

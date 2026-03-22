@@ -117,7 +117,7 @@ tail -f "$(cat /tmp/term-mesh-last-debug-log-path 2>/dev/null || echo /tmp/term-
 
 ## tm-op 전략 커맨드
 
-활성 에이전트 팀에게 구조화된 전략(발산·수렴·경쟁·파이프라인·토론·공격방어·브레인스토밍)을 지시한다.
+활성 에이전트 팀에게 구조화된 전략(발산·수렴·경쟁·파이프라인·분배·숙의·토론·공격방어·브레인스토밍)을 지시한다.
 `tm-agent create`로 팀이 먼저 구성되어 있어야 한다.
 
 ```bash
@@ -129,6 +129,8 @@ tail -f "$(cat /tmp/term-mesh-last-debug-log-path 2>/dev/null || echo /tmp/term-
 /tm-op debate "모놀리스 vs 마이크로서비스" # 정반합 토론
 /tm-op red-team --target src/auth.ts      # 적대적 공격/방어
 /tm-op brainstorm "v2 기능 아이디어" --vote # 자유 발산 + 투표
+/tm-op distribute "6개 Sentry 이슈 분석"  # 병렬 분배 실행
+/tm-op council "ECS vs K8s" --rounds 4    # 다자간 숙의 회의
 ```
 
 | 전략 | 설명 |
@@ -140,11 +142,14 @@ tail -f "$(cat /tmp/term-mesh-last-debug-log-path 2>/dev/null || echo /tmp/term-
 | **debate** | 찬반 토론 후 판정. 설계 트레이드오프 분석에 적합. `--pro`/`--con` 팀 지정 가능 |
 | **red-team** | 공격팀이 결함 발견→방어팀이 수정. 보안·견고성 강화. `--attackers`/`--defenders` 지정 |
 | **brainstorm** | 수렴 없이 아이디어 발산→분류→투표. `--vote`로 도트 투표 활성화 |
+| **distribute** | 대규모 태스크를 독립 서브태스크로 분할·병렬 실행·병합. `--splits`로 수동 분할, `--no-merge`로 병합 비활성화 |
+| **council** | N명 자유 토의 → 교차 질의 → 심화 → 합의 도출. `--agenda`로 다중 안건, `--rounds N`으로 라운드 수 조절 |
 
 옵션: `--rounds N`, `--preset quick|thorough|deep`, `--steps "a:t,b:t"`, `--target <file>`,
 `--pr <number>`, `--judge <agent>`, `--timeout N`, `--resume`,
 `--pro`/`--con` (debate), `--attackers`/`--defenders` (red-team), `--vote` (brainstorm),
-`--context` (강제 맥락 주입), `--no-context` (맥락 주입 비활성화)
+`--splits "a:t,b:t"` (distribute 수동 분할), `--no-merge` (distribute 병합 비활성화),
+`--agenda "a,b,c"` (council 다중 안건), `--context` (강제 맥락 주입), `--no-context` (맥락 주입 비활성화)
 
 ## Team agent system (OMC override)
 
