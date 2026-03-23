@@ -2346,9 +2346,10 @@ class TerminalController {
         guard let teamName = params["team_name"] as? String else {
             return v2Error(id: id, code: "invalid_params", message: "Missing team_name")
         }
+        let agentName = params["agent_name"] as? String
         let topOnly = params["top_only"] as? Bool ?? false
         let items: [[String: Any]] = await MainActor.run {
-            TeamOrchestrator.shared.inboxItems(teamName: teamName, topOnly: topOnly)
+            TeamOrchestrator.shared.inboxItems(teamName: teamName, agentName: agentName, topOnly: topOnly)
         }
         return v2Ok(id: id, result: ["team_name": teamName, "items": items, "count": items.count])
     }
@@ -2792,8 +2793,9 @@ class TerminalController {
         guard let teamName = params["team_name"] as? String else {
             return v2Error(id: id, code: "invalid_params", message: "Missing team_name")
         }
+        let agentName = params["agent_name"] as? String
         let topOnly = params["top_only"] as? Bool ?? false
-        let items = store.inboxItems(teamName: teamName, topOnly: topOnly)
+        let items = store.inboxItems(teamName: teamName, agentName: agentName, topOnly: topOnly)
         return v2Ok(id: id, result: ["team_name": teamName, "items": items, "count": items.count])
     }
 
@@ -3525,10 +3527,11 @@ class TerminalController {
         guard let teamName = params["team_name"] as? String else {
             return .err(code: "invalid_params", message: "Missing team_name", data: nil)
         }
+        let agentName = params["agent_name"] as? String
         let topOnly = params["top_only"] as? Bool ?? false
         var result: V2CallResult = .ok([] as [[String: Any]])
         v2MainSync {
-            let items = TeamOrchestrator.shared.inboxItems(teamName: teamName, topOnly: topOnly)
+            let items = TeamOrchestrator.shared.inboxItems(teamName: teamName, agentName: agentName, topOnly: topOnly)
             result = .ok(["team_name": teamName, "items": items, "count": items.count])
         }
         return result

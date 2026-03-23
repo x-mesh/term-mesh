@@ -2566,7 +2566,7 @@ final class TeamOrchestrator: ObservableObject {
         syncTeamStateToDaemon()
     }
 
-    func inboxItems(teamName: String, topOnly: Bool = false) -> [[String: Any]] {
+    func inboxItems(teamName: String, agentName: String? = nil, topOnly: Bool = false) -> [[String: Any]] {
         guard teams[teamName] != nil else { return [] }
         let now = Date()
         var items: [[String: Any]] = []
@@ -2619,10 +2619,15 @@ final class TeamOrchestrator: ObservableObject {
             case "error":
                 priority = 3
             default:
-                priority = nil
+                // When agentName is provided, include all messages addressed to this agent
+                if let agent = agentName, message.to == agent {
+                    priority = 6
+                } else {
+                    priority = nil
+                }
             }
             guard let priority else { continue }
-            items.append([
+            var item: [String: Any] = [
                 "kind": "message",
                 "priority": priority,
                 "team_name": teamName,
@@ -2631,8 +2636,10 @@ final class TeamOrchestrator: ObservableObject {
                 "reason": message.type,
                 "age_seconds": Int(now.timeIntervalSince(message.timestamp)),
                 "summary": message.content,
-                "message_id": message.id
-            ])
+                "message_id": message.id,
+            ]
+            if let to = message.to { item["to"] = to }
+            items.append(item)
         }
 
         let sorted = items.sorted {

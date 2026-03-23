@@ -704,7 +704,7 @@ final class TeamDataStore: @unchecked Sendable {
 
     // MARK: - Inbox (off-main alternative to TeamOrchestrator.inboxItems)
 
-    func inboxItems(teamName: String, topOnly: Bool = false) -> [[String: Any]] {
+    func inboxItems(teamName: String, agentName: String? = nil, topOnly: Bool = false) -> [[String: Any]] {
         lock.lock()
         defer { lock.unlock() }
         guard teamRegistry[teamName] != nil else { return [] }
@@ -759,10 +759,16 @@ final class TeamDataStore: @unchecked Sendable {
             case "error":
                 priority = 3
             default:
-                priority = nil
+                // When agentName is provided, include all messages addressed to this agent
+                // (e.g. agent-to-agent "note" type messages)
+                if let agent = agentName, message.to == agent {
+                    priority = 6
+                } else {
+                    priority = nil
+                }
             }
             guard let priority else { continue }
-            items.append([
+            var item: [String: Any] = [
                 "kind": "message",
                 "priority": priority,
                 "team_name": teamName,
@@ -770,8 +776,11 @@ final class TeamDataStore: @unchecked Sendable {
                 "reason": message.content,
                 "age_seconds": Int(now.timeIntervalSince(message.timestamp)),
                 "summary": String(message.content.prefix(120)),
-                "message_type": message.type
-            ])
+                "message_type": message.type,
+                "message_id": message.id,
+            ]
+            if let to = message.to { item["to"] = to }
+            items.append(item)
         }
 
         if topOnly {
