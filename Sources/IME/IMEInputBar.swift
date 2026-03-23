@@ -33,6 +33,7 @@ struct IMEInputBar: View {
     @State private var historyDraft: String = ""
     @State private var isComposing: Bool = false
     @State private var showKeyboardHelp: Bool = false
+    @State private var compactHintBar: Bool = false
     @State private var feedbackState: FeedbackState = .none  // Q1
     // M1: Fuzzy history picker state
     @State private var showHistoryPicker: Bool = false
@@ -278,6 +279,13 @@ struct IMEInputBar: View {
             // Hint bar + status indicators (same row)
             HStack(spacing: 12) {
                 hintBar
+                    .background(
+                        GeometryReader { geo in
+                            Color.clear
+                                .onAppear { compactHintBar = geo.size.width < 300 }
+                                .onChange(of: geo.size.width) { w in compactHintBar = w < 300 }
+                        }
+                    )
 
                 Spacer()
 
@@ -424,16 +432,19 @@ struct IMEInputBar: View {
 
     private var hintBar: some View {
         HStack(spacing: 10) {
-            hintLabel("⏎ send")
-            hintLabel("⌘⏎ send+close")
-            hintLabel("⇧⏎ newline")
-            hintLabel("Tab →term")
-            hintLabel("⇧Tab accept")
-            hintLabel("Esc →term")
-            hintLabel("⌃U clear")
-            hintLabel("⌃C interrupt")
-            if onStopAllAgents != nil {
-                hintLabel("⌃⇧C stop all")
+            // Only show hint labels when there is enough width
+            if !compactHintBar {
+                hintLabel("⏎ send")
+                hintLabel("⌘⏎ send+close")
+                hintLabel("⇧⏎ newline")
+                hintLabel("Tab →term")
+                hintLabel("⇧Tab accept")
+                hintLabel("Esc →term")
+                hintLabel("⌃U clear")
+                hintLabel("⌃C interrupt")
+                if onStopAllAgents != nil {
+                    hintLabel("⌃⇧C stop all")
+                }
             }
 
             Button(action: { showKeyboardHelp.toggle() }) {

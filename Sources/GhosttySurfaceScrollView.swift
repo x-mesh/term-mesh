@@ -143,6 +143,8 @@ final class GhosttySurfaceScrollView: NSView {
     private var searchOverlayHostingView: NSHostingView<SurfaceSearchOverlay>?
     private var imeInputBarHostingView: NSHostingView<IMEInputBar>?
     private var imeBarDragHandle: IMEBarDragHandle?
+    private static let imeMinBarHeight: CGFloat = 60
+    private static let imeMinTerminalHeight: CGFloat = 40
     private var imeBarCurrentHeight: CGFloat = IMEInputBarSettings.height
     private var observers: [NSObjectProtocol] = []
 	    private var windowObservers: [NSObjectProtocol] = []
@@ -453,7 +455,23 @@ final class GhosttySurfaceScrollView: NSView {
         // If IME bar is visible, dock it at the bottom and shrink the terminal area.
         let imeBarHeight: CGFloat
         if let imeView = imeInputBarHostingView {
-            imeBarHeight = imeBarCurrentHeight
+            // Clamp IME bar height so the terminal always retains a minimum visible area.
+            // When the window is too small to fit both the IME minimum and terminal minimum,
+            // split the available space 50/50 rather than crushing one side to zero.
+            let minBar = Self.imeMinBarHeight
+            let minTerm = Self.imeMinTerminalHeight
+            let clampedHeight: CGFloat
+            if bounds.height <= 0 {
+                clampedHeight = 0
+            } else if bounds.height < minBar + minTerm {
+                clampedHeight = bounds.height * 0.5
+            } else {
+                clampedHeight = min(imeBarCurrentHeight, bounds.height - minTerm)
+            }
+            if clampedHeight < imeBarCurrentHeight {
+                imeBarCurrentHeight = clampedHeight
+            }
+            imeBarHeight = max(0, imeBarCurrentHeight)
             imeView.frame = NSRect(x: 0, y: 0, width: bounds.width, height: imeBarHeight)
             // Position drag handle straddling the boundary between terminal and IME bar
             if let handle = imeBarDragHandle {
@@ -467,7 +485,7 @@ final class GhosttySurfaceScrollView: NSView {
             x: bounds.origin.x,
             y: bounds.origin.y + imeBarHeight,
             width: bounds.width,
-            height: bounds.height - imeBarHeight
+            height: max(0, bounds.height - imeBarHeight)
         )
         backgroundView.frame = terminalBounds
         scrollView.frame = terminalBounds
@@ -743,8 +761,13 @@ final class GhosttySurfaceScrollView: NSView {
         addSubview(overlay)
         imeInputBarHostingView = overlay
 
-        // Reset height to persisted value
-        imeBarCurrentHeight = IMEInputBarSettings.height
+        // Reset height to persisted value, clamped to leave the terminal visible.
+        let minBar = Self.imeMinBarHeight
+        let minTerm = Self.imeMinTerminalHeight
+        let maxInitialBarHeight = bounds.height < minBar + minTerm
+            ? bounds.height * 0.5
+            : bounds.height - minTerm
+        imeBarCurrentHeight = min(IMEInputBarSettings.height, max(0, maxInitialBarHeight))
 
         // Add drag handle for resizing
         let handle = IMEBarDragHandle()
