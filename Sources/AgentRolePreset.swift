@@ -14,27 +14,74 @@ struct AgentRolePreset: Identifiable, Codable, Equatable {
     /// Supported CLI types for agent execution.
     static let supportedCLIs = ["claude", "kiro", "codex", "gemini"]
 
-    /// Available models per CLI type.
-    static func models(for cli: String) -> [String] {
+    /// Built-in default models per CLI type.
+    static func builtInModels(for cli: String) -> [String] {
         switch cli {
         case "claude", "kiro":
             return ["sonnet", "opus", "haiku"]
         case "codex":
             return ["gpt-5.4", "gpt-5.3-codex", "gpt-5.2-codex", "gpt-5.2", "gpt-5.1-codex-max", "gpt-5.1-codex-mini"]
         case "gemini":
-            return ["gemini-3.1-pro-preview", "gemini-3-flash", "gemini-2.5-pro", "gemini-2.5-flash"]
+            return ["gemini-2.5-pro", "gemini-2.5-flash"]
         default:
             return ["sonnet", "opus", "haiku"]
         }
+    }
+
+    /// Available models per CLI type (built-in + user-custom).
+    static func models(for cli: String) -> [String] {
+        let builtIn = builtInModels(for: cli)
+        let custom = customModels(for: cli)
+        // Custom models appear first so they're easy to find.
+        return custom + builtIn
     }
 
     /// Default model for a given CLI.
     static func defaultModel(for cli: String) -> String {
         switch cli {
         case "codex":  return "gpt-5.4"
-        case "gemini": return "gemini-3.1-pro-preview"
+        case "gemini": return "gemini-2.5-pro"
         default:       return "sonnet"
         }
+    }
+
+    // MARK: - Custom Models (UserDefaults)
+
+    /// UserDefaults key for storing custom model names per CLI.
+    private static func customModelsKey(for cli: String) -> String {
+        "customModels.\(cli)"
+    }
+
+    /// Read user-added custom models for a CLI.
+    static func customModels(for cli: String, defaults: UserDefaults = .standard) -> [String] {
+        defaults.stringArray(forKey: customModelsKey(for: cli)) ?? []
+    }
+
+    /// Save user-added custom models for a CLI.
+    static func setCustomModels(_ models: [String], for cli: String, defaults: UserDefaults = .standard) {
+        let filtered = models.map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }
+        if filtered.isEmpty {
+            defaults.removeObject(forKey: customModelsKey(for: cli))
+        } else {
+            defaults.set(filtered, forKey: customModelsKey(for: cli))
+        }
+    }
+
+    /// Add a single custom model for a CLI (no-op if already exists).
+    static func addCustomModel(_ model: String, for cli: String, defaults: UserDefaults = .standard) {
+        let trimmed = model.trimmingCharacters(in: .whitespaces)
+        guard !trimmed.isEmpty else { return }
+        var current = customModels(for: cli, defaults: defaults)
+        guard !current.contains(trimmed) && !builtInModels(for: cli).contains(trimmed) else { return }
+        current.append(trimmed)
+        setCustomModels(current, for: cli, defaults: defaults)
+    }
+
+    /// Remove a single custom model for a CLI.
+    static func removeCustomModel(_ model: String, for cli: String, defaults: UserDefaults = .standard) {
+        var current = customModels(for: cli, defaults: defaults)
+        current.removeAll { $0 == model }
+        setCustomModels(current, for: cli, defaults: defaults)
     }
 
     init(

@@ -8,6 +8,7 @@ enum SettingsSection: String, CaseIterable, Identifiable {
     case automation = "automation"
     case agentTeams = "agentTeams"
     case agentCLIPaths = "agentCLIPaths"
+    case agentModels = "agentModels"
     case worktrees = "worktrees"
     case dashboard = "dashboard"
     case services = "services"
@@ -26,6 +27,7 @@ enum SettingsSection: String, CaseIterable, Identifiable {
         case .automation: return "Automation"
         case .agentTeams: return "Agent Teams"
         case .agentCLIPaths: return "Agent CLI Paths"
+        case .agentModels: return "Agent Models"
         case .worktrees: return "Worktrees"
         case .dashboard: return "Dashboard"
         case .services: return "Services"
@@ -44,6 +46,7 @@ enum SettingsSection: String, CaseIterable, Identifiable {
         case .automation: return "bolt.horizontal"
         case .agentTeams: return "person.3"
         case .agentCLIPaths: return "terminal"
+        case .agentModels: return "cpu"
         case .worktrees: return "arrow.triangle.branch"
         case .dashboard: return "gauge.with.dots.needle.33percent"
         case .services: return "stethoscope"
@@ -57,7 +60,7 @@ enum SettingsSection: String, CaseIterable, Identifiable {
     var category: SettingsSectionCategory {
         switch self {
         case .app, .terminal, .workspaceColors: return .general
-        case .automation, .agentTeams, .agentCLIPaths, .worktrees: return .agents
+        case .automation, .agentTeams, .agentCLIPaths, .agentModels, .worktrees: return .agents
         case .dashboard, .services: return .network
         case .browser: return .browser
         case .imeInputBar, .keyboardShortcuts: return .input
@@ -73,6 +76,7 @@ enum SettingsSection: String, CaseIterable, Identifiable {
         case .automation: return ["automation", "socket", "claude", "port", "integration", "password"]
         case .agentTeams: return ["agent", "team", "leader", "model", "directory", "rendering", "interval", "refresh"]
         case .agentCLIPaths: return ["cli", "path", "claude", "kiro", "codex", "gemini", "binary", "agent"]
+        case .agentModels: return ["model", "custom", "version", "gemini", "codex", "kiro", "claude", "preview"]
         case .worktrees: return ["worktrees", "worktree", "base directory", "cleanup", "auto"]
         case .dashboard: return ["dashboard", "http", "localhost", "port", "remote"]
         case .services: return ["services", "daemon", "doctor", "status", "restart", "subsystem", "log", "shell", "integration", "health"]
@@ -585,6 +589,8 @@ struct SettingsView: View {
             sectionAgentTeams
         case .agentCLIPaths:
             sectionAgentCLIPaths
+        case .agentModels:
+            sectionAgentModels
         case .worktrees:
             sectionWorktrees
         case .dashboard:
@@ -1257,6 +1263,16 @@ struct SettingsView: View {
                         CLIPathRow(label: "Gemini", cliKey: "gemini", path: $cliPathGemini)
                     }
         SettingsCardNote("Leave empty to use auto-detected path. Custom paths take priority.")
+    }
+
+    // MARK: - Section: Agent Models
+
+    @ViewBuilder
+    private var sectionAgentModels: some View {
+        ForEach(AgentRolePreset.supportedCLIs, id: \.self) { cli in
+            CLICustomModelsSection(cli: cli)
+        }
+        SettingsCardNote("Add custom model names per CLI. These appear alongside built-in models in the team creation picker.")
     }
 
     // MARK: - Section: Worktrees
@@ -2451,6 +2467,73 @@ private struct CLIPathRow: View {
             }
         }
         .onAppear { autoDetected = CLIPathSettings.autoDetect(cli: cliKey) }
+    }
+}
+
+private struct CLICustomModelsSection: View {
+    let cli: String
+    @State private var customModels: [String] = []
+    @State private var newModelName = ""
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            HStack {
+                Text(cli.capitalized)
+                    .font(.system(size: 11, weight: .semibold))
+                    .foregroundColor(.secondary)
+                    .textCase(.uppercase)
+                Spacer()
+                Text("\(AgentRolePreset.builtInModels(for: cli).count) built-in, \(customModels.count) custom")
+                    .font(.caption2)
+                    .foregroundColor(.secondary)
+            }
+            .padding(.horizontal, 2)
+
+            SettingsCard {
+                // Built-in models (read-only)
+                ForEach(AgentRolePreset.builtInModels(for: cli), id: \.self) { model in
+                    SettingsCardRow(model, subtitle: "built-in") {
+                        EmptyView()
+                    }
+                    SettingsCardDivider()
+                }
+
+                // Custom models (editable)
+                ForEach(customModels, id: \.self) { model in
+                    SettingsCardRow(model, subtitle: "custom") {
+                        Button(role: .destructive) {
+                            AgentRolePreset.removeCustomModel(model, for: cli)
+                            customModels = AgentRolePreset.customModels(for: cli)
+                        } label: {
+                            Image(systemName: "minus.circle.fill")
+                                .foregroundColor(.red)
+                        }
+                        .buttonStyle(.plain)
+                    }
+                    SettingsCardDivider()
+                }
+
+                // Add new model row
+                HStack(spacing: 8) {
+                    TextField("e.g. gemini-2.5-pro-preview-06-05", text: $newModelName)
+                        .textFieldStyle(.roundedBorder)
+                    Button("Add") {
+                        guard !newModelName.trimmingCharacters(in: .whitespaces).isEmpty else { return }
+                        AgentRolePreset.addCustomModel(newModelName, for: cli)
+                        customModels = AgentRolePreset.customModels(for: cli)
+                        newModelName = ""
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+                    .disabled(newModelName.trimmingCharacters(in: .whitespaces).isEmpty)
+                }
+                .padding(.horizontal, 14)
+                .padding(.vertical, 9)
+            }
+        }
+        .onAppear {
+            customModels = AgentRolePreset.customModels(for: cli)
+        }
     }
 }
 
