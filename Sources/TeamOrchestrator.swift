@@ -1453,6 +1453,17 @@ final class TeamOrchestrator: ObservableObject {
         return sendTextToPanel(workspaceId: agent.workspaceId, panelId: agent.panelId, text: text, tabManager: tabManager)
     }
 
+    /// Send text to an agent without requiring a tabManager.
+    /// Uses AppDelegate.locateSurface to find the agent's panel across all windows.
+    /// Must be called on the main thread.
+    @discardableResult
+    func sendToAgentAutoLocate(teamName: String, agentName: String, text: String) -> Bool {
+        guard let team = teams[teamName],
+              let agent = team.agents.first(where: { $0.name == agentName }),
+              let located = AppDelegate.shared?.locateSurface(surfaceId: agent.panelId) else { return false }
+        return sendTextToPanel(workspaceId: agent.workspaceId, panelId: agent.panelId, text: text, tabManager: located.tabManager)
+    }
+
     func sendToLeader(teamName: String, text: String, tabManager: TabManager) -> Bool {
         guard let team = teams[teamName] else { return false }
         // Adopted mode: leader lives in a different workspace than the agent workspace.

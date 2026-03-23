@@ -2812,6 +2812,17 @@ class TerminalController {
         let type = params["type"] as? String ?? "report"
         let to = params["to"] as? String
         if let msg = store.postMessage(teamName: teamName, from: from, to: to, content: content, type: type) {
+            // Auto-push notification to the recipient agent's terminal.
+            // This eliminates the need for agents to poll inbox — messages arrive instantly.
+            // Fire-and-forget on main thread (DispatchQueue.main.async, NOT sync).
+            if let recipient = to, recipient != "leader" {
+                let notificationText = "[MSG from \(from)]: \(content)"
+                DispatchQueue.main.async {
+                    TeamOrchestrator.shared.sendToAgentAutoLocate(
+                        teamName: teamName, agentName: recipient, text: notificationText
+                    )
+                }
+            }
             return v2Ok(id: id, result: store.messageDictionary(msg))
         }
         return v2Error(id: id, code: "internal_error", message: "Failed to post message")
