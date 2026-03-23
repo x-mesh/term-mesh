@@ -462,11 +462,9 @@ final class TeamOrchestrator: ObservableObject {
         var sharedWtPath: String?
         var sharedWtBranch: String?
 
-        #if DEBUG
         if useWorktrees {
-            dlog("worktree.create mode=\(worktreeMode) gitRoot=\(gitRepoRoot ?? "nil")")
+            WorktreeLog.log("team.create mode=\(worktreeMode) team=\(name) gitRoot=\(gitRepoRoot ?? "nil")")
         }
-        #endif
 
         if worktreeMode == "shared", let repoRoot = gitRepoRoot {
             let branchName = "team/\(name)"
@@ -478,14 +476,10 @@ final class TeamOrchestrator: ObservableObject {
                 sharedWtPath = info.path
                 sharedWtBranch = info.branch
                 Logger.team.info("shared worktree for team '\(name, privacy: .public)': \(info.path, privacy: .public)")
-                #if DEBUG
-                dlog("worktree.shared.ok team=\(name) path=\(info.path) branch=\(info.branch)")
-                #endif
+                WorktreeLog.log("team.shared.ok team=\(name) path=\(info.path) branch=\(info.branch)")
             case .failure(let error):
                 Logger.team.error("shared worktree failed: \(error, privacy: .public), using original directory")
-                #if DEBUG
-                dlog("worktree.shared.FAIL team=\(name) error=\(error)")
-                #endif
+                WorktreeLog.log("team.shared.FAIL team=\(name) error=\(error)")
                 DispatchQueue.main.async {
                     let alert = NSAlert()
                     alert.messageText = "Worktree Creation Failed"
@@ -753,14 +747,10 @@ final class TeamOrchestrator: ObservableObject {
                     wtPath = info.path
                     wtBranch = info.branch
                     Logger.team.info("worktree for \(agent.name, privacy: .public): \(info.path, privacy: .public) [\(info.branch, privacy: .public)]")
-                    #if DEBUG
-                    dlog("worktree.isolated.ok agent=\(agent.name) path=\(info.path) branch=\(info.branch)")
-                    #endif
+                    WorktreeLog.log("team.isolated.ok team=\(name) agent=\(agent.name) path=\(info.path) branch=\(info.branch)")
                 case .failure(let error):
                     Logger.team.error("worktree failed for \(agent.name, privacy: .public): \(error, privacy: .public), using original directory")
-                    #if DEBUG
-                    dlog("worktree.isolated.FAIL agent=\(agent.name) error=\(error)")
-                    #endif
+                    WorktreeLog.log("team.isolated.FAIL team=\(name) agent=\(agent.name) error=\(error)")
                     DispatchQueue.main.async {
                         let alert = NSAlert()
                         alert.messageText = "Worktree Creation Failed"

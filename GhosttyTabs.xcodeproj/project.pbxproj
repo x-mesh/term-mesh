@@ -52,6 +52,7 @@
 		A5001540 /* PortScanner.swift in Sources */ = {isa = PBXBuildFile; fileRef = A5001541 /* PortScanner.swift */; };
 		A5001700 /* TermMeshDaemon.swift in Sources */ = {isa = PBXBuildFile; fileRef = A5001701 /* TermMeshDaemon.swift */; };
 		F46F7DFF875543329CD15B08 /* AgentRolePreset.swift in Sources */ = {isa = PBXBuildFile; fileRef = DE801F330BAD4EB88D9D875E /* AgentRolePreset.swift */; };
+		WL00000001000000010000001 /* WorktreeLog.swift in Sources */ = {isa = PBXBuildFile; fileRef = WL00000002000000020000002 /* WorktreeLog.swift */; };
 		562D55FA859F4E8B94EB49CB /* TeamCreationView.swift in Sources */ = {isa = PBXBuildFile; fileRef = B848F672710C48B1944F70BF /* TeamCreationView.swift */; };
 		4C9D95957760492496CD2E3E /* RolePresetEditorView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 813264D854BA4B5F9AA4F9FC /* RolePresetEditorView.swift */; };
 		A5001710 /* TeamOrchestrator.swift in Sources */ = {isa = PBXBuildFile; fileRef = A5001711 /* TeamOrchestrator.swift */; };
@@ -248,6 +249,7 @@
 		A5001541 /* PortScanner.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PortScanner.swift; sourceTree = "<group>"; };
 		A5001701 /* TermMeshDaemon.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TermMeshDaemon.swift; sourceTree = "<group>"; };
 		DE801F330BAD4EB88D9D875E /* AgentRolePreset.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AgentRolePreset.swift; sourceTree = "<group>"; };
+		WL00000002000000020000002 /* WorktreeLog.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WorktreeLog.swift; sourceTree = "<group>"; };
 		B848F672710C48B1944F70BF /* TeamCreationView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TeamCreationView.swift; sourceTree = "<group>"; };
 		813264D854BA4B5F9AA4F9FC /* RolePresetEditorView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RolePresetEditorView.swift; sourceTree = "<group>"; };
 		A5001711 /* TeamOrchestrator.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TeamOrchestrator.swift; sourceTree = "<group>"; };
@@ -517,6 +519,7 @@
 				813264D854BA4B5F9AA4F9FC /* RolePresetEditorView.swift */,
 				B848F672710C48B1944F70BF /* TeamCreationView.swift */,
 				DE801F330BAD4EB88D9D875E /* AgentRolePreset.swift */,
+				WL00000002000000020000002 /* WorktreeLog.swift */,
 				A5001703 /* DashboardController.swift */,
 				A5001225 /* SocketControlSettings.swift */,
 				A5001600 /* SentryHelper.swift */,
@@ -825,6 +828,7 @@
 				4C9D95957760492496CD2E3E /* RolePresetEditorView.swift in Sources */,
 				562D55FA859F4E8B94EB49CB /* TeamCreationView.swift in Sources */,
 				F46F7DFF875543329CD15B08 /* AgentRolePreset.swift in Sources */,
+				WL00000001000000010000001 /* WorktreeLog.swift in Sources */,
 				A5001702 /* DashboardController.swift in Sources */,
 				A5001226 /* SocketControlSettings.swift in Sources */,
 				A5001601 /* SentryHelper.swift in Sources */,

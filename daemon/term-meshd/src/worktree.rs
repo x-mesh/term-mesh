@@ -1,7 +1,33 @@
 use git2::Repository;
 use serde::{Deserialize, Serialize};
+use std::io::Write;
 
 use uuid::Uuid;
+
+/// Append a timestamped line to ~/.term-mesh/logs/worktree.log.
+/// Best-effort — never panics or propagates errors.
+fn wt_log(msg: &str) {
+    let Some(home) = dirs::home_dir() else { return };
+    let log_dir = home.join(".term-mesh").join("logs");
+    let _ = std::fs::create_dir_all(&log_dir);
+    let log_path = log_dir.join("worktree.log");
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)
+    {
+        let d = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default();
+        let total_s = d.as_secs();
+        let ms = d.subsec_millis();
+        // UTC breakdown without external crate
+        let s = (total_s % 60) as u32;
+        let m = ((total_s / 60) % 60) as u32;
+        let h = ((total_s / 3600) % 24) as u32;
+        let _ = writeln!(f, "[{h:02}:{m:02}:{s:02}.{ms:03}Z] {msg}");
+    }
+}
 
 #[derive(Debug, Deserialize)]
 pub struct CreateParams {
@@ -30,8 +56,24 @@ pub struct WorktreeInfo {
 /// Worktrees are created at `{base_dir}/{repo_name}/term-mesh_wt_<UUID>`.
 /// If `base_dir` is not provided, defaults to `~/.term-mesh/worktrees/{repo_name}/`.
 pub fn create(params: serde_json::Value) -> Result<WorktreeInfo, String> {
+    let result = create_inner(params);
+    if let Err(ref e) = result {
+        wt_log(&format!("CREATE FAIL {e}"));
+    }
+    result
+}
+
+fn create_inner(params: serde_json::Value) -> Result<WorktreeInfo, String> {
     let params: CreateParams =
         serde_json::from_value(params).map_err(|e| format!("invalid params: {e}"))?;
+
+    wt_log(&format!(
+        "CREATE repo={} branch={} base_ref={} base_dir={}",
+        params.repo_path,
+        params.branch.as_deref().unwrap_or("(auto)"),
+        params.base_ref.as_deref().unwrap_or("HEAD"),
+        params.base_dir.as_deref().unwrap_or("(default)"),
+    ));
 
     // Open the repo — if repo_path is itself a worktree, resolve to the main
     // repo. Git does not support nested worktrees, so creating a worktree from
@@ -167,11 +209,13 @@ pub fn create(params: serde_json::Value) -> Result<WorktreeInfo, String> {
     )
     .map_err(|e| format!("cannot create worktree: {e}"))?;
 
+    let path_str = wt_path.to_string_lossy().into_owned();
     tracing::info!("created worktree {wt_name} at {}", wt_path.display());
+    wt_log(&format!("CREATE OK name={wt_name} branch={branch_name} path={path_str}"));
 
     Ok(WorktreeInfo {
         name: wt_name,
-        path: wt_path.to_string_lossy().into_owned(),
+        path: path_str,
         branch: branch_name,
     })
 }
@@ -226,6 +270,8 @@ pub fn remove(params: serde_json::Value) -> Result<(), String> {
     let params: RemoveParams =
         serde_json::from_value(params).map_err(|e| format!("invalid params: {e}"))?;
 
+    wt_log(&format!("REMOVE name={} force={} repo={}", params.name, params.force, params.repo_path));
+
     let repo = Repository::open(&params.repo_path)
         .map_err(|e| format!("cannot open repo: {e}"))?;
 
@@ -267,6 +313,7 @@ pub fn remove(params: serde_json::Value) -> Result<(), String> {
     }
 
     tracing::info!("removed worktree {} (force={})", params.name, params.force);
+    wt_log(&format!("REMOVE OK name={}", params.name));
     Ok(())
 }
 

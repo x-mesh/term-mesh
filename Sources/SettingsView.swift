@@ -1316,6 +1316,8 @@ struct SettingsView: View {
         }
 
         WorktreeManagerSection(baseDir: daemonService?.worktreeBaseDir ?? TermMeshDaemon.defaultWorktreeBaseDir)
+
+        WorktreeLogSection()
     }
 
     // MARK: - Section: Dashboard
@@ -2467,6 +2469,114 @@ private struct CLIPathRow: View {
             }
         }
         .onAppear { autoDetected = CLIPathSettings.autoDetect(cli: cliKey) }
+    }
+}
+
+private struct WorktreeLogSection: View {
+    @State private var fileSize = WorktreeLog.fileSizeFormatted
+    @State private var lineCount = WorktreeLog.lineCount
+    @State private var lastModified: String = ""
+    @State private var tailPreview = ""
+    @State private var showPreview = false
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            HStack {
+                Text("Worktree Log")
+                    .font(.system(size: 11, weight: .semibold))
+                    .foregroundColor(.secondary)
+                    .textCase(.uppercase)
+                Spacer()
+            }
+            .padding(.horizontal, 2)
+
+            SettingsCard {
+                SettingsCardRow("Log File", subtitle: WorktreeLog.logFile.path) {
+                    HStack(spacing: 8) {
+                        Text(fileSize)
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                        if lineCount > 0 {
+                            Text("(\(lineCount) lines)")
+                                .font(.caption)
+                                .foregroundColor(.secondary)
+                        }
+                    }
+                }
+
+                SettingsCardDivider()
+
+                SettingsCardRow("Last Modified", subtitle: lastModified.isEmpty ? "No log yet" : lastModified) {
+                    EmptyView()
+                }
+
+                SettingsCardDivider()
+
+                HStack(spacing: 8) {
+                    Button("Reveal in Finder") {
+                        let url = WorktreeLog.logFile
+                        if FileManager.default.fileExists(atPath: url.path) {
+                            NSWorkspace.shared.activateFileViewerSelecting([url])
+                        } else {
+                            NSWorkspace.shared.open(WorktreeLog.logDir)
+                        }
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+
+                    Button(showPreview ? "Hide Preview" : "Preview") {
+                        if !showPreview {
+                            tailPreview = WorktreeLog.tail(30)
+                        }
+                        showPreview.toggle()
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+
+                    Spacer()
+
+                    Button("Clear Log") {
+                        WorktreeLog.clear()
+                        refresh()
+                        tailPreview = ""
+                        showPreview = false
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+                    .disabled(lineCount == 0)
+                }
+                .padding(.horizontal, 14)
+                .padding(.vertical, 9)
+
+                if showPreview && !tailPreview.isEmpty {
+                    SettingsCardDivider()
+                    ScrollView(.vertical) {
+                        Text(tailPreview)
+                            .font(.system(size: 10, design: .monospaced))
+                            .foregroundColor(.secondary)
+                            .textSelection(.enabled)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                    }
+                    .frame(maxHeight: 200)
+                    .padding(.horizontal, 14)
+                    .padding(.vertical, 8)
+                }
+            }
+        }
+        .onAppear { refresh() }
+    }
+
+    private func refresh() {
+        fileSize = WorktreeLog.fileSizeFormatted
+        lineCount = WorktreeLog.lineCount
+        if let date = WorktreeLog.lastModified {
+            let df = DateFormatter()
+            df.dateStyle = .medium
+            df.timeStyle = .medium
+            lastModified = df.string(from: date)
+        } else {
+            lastModified = ""
+        }
     }
 }
 
