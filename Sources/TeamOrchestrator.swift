@@ -1478,12 +1478,14 @@ final class TeamOrchestrator: ObservableObject {
     @discardableResult
     func notifyTaskCreated(teamName: String, taskId: String, tabManager: TabManager) -> Bool {
         guard let task = getTask(teamName: teamName, taskId: taskId) else { return false }
-        let leaderSummary = formatLeaderTaskNotification(task: task, event: "created")
-        let leaderSent = sendToLeader(teamName: teamName, text: leaderSummary, tabManager: tabManager)
-        guard let assignee = task.assignee?.nilIfBlank else { return leaderSent }
+        // Skip leader stdin injection — leader gets notifications via tm-agent wait/inbox
+        Logger.team.info("[notifyTaskCreated] task=\(taskId.prefix(8), privacy: .public)")
+        #if DEBUG
+        dlog("[team.notifyTaskCreated] task=\(taskId.prefix(8)) — suppressed leader stdin injection")
+        #endif
+        guard let assignee = task.assignee?.nilIfBlank else { return true }
         let assigneeNotice = formatTaskAssignmentInstruction(task: task)
-        let agentSent = sendToAgent(teamName: teamName, agentName: assignee, text: assigneeNotice, tabManager: tabManager)
-        return leaderSent || agentSent
+        return sendToAgent(teamName: teamName, agentName: assignee, text: assigneeNotice, tabManager: tabManager)
     }
 
     @discardableResult
@@ -1507,8 +1509,13 @@ final class TeamOrchestrator: ObservableObject {
         note: String? = nil,
         tabManager: TabManager
     ) -> Bool {
-        let leaderSummary = formatLeaderTaskNotification(task: task, event: event, note: note)
-        return sendToLeader(teamName: teamName, text: leaderSummary, tabManager: tabManager)
+        // Do NOT inject notification into leader stdin — it pollutes the prompt.
+        // Leader receives notifications via tm-agent wait/inbox (daemon push).
+        Logger.team.info("[notifyTask] \(event, privacy: .public) task=\(task.id.prefix(8), privacy: .public) assignee=\(task.assignee ?? "none", privacy: .public)")
+        #if DEBUG
+        dlog("[team.notifyTask] \(event) task=\(task.id.prefix(8)) — suppressed leader stdin injection")
+        #endif
+        return true
     }
 
     func dispatchTaskToAssignee(teamName: String, taskId: String, tabManager: TabManager) -> Bool {
@@ -1521,8 +1528,12 @@ final class TeamOrchestrator: ObservableObject {
         guard let assignee = task.assignee?.nilIfBlank else { return false }
         let instruction = formatTaskDispatchInstruction(task: task)
         let dispatched = sendToAgent(teamName: teamName, agentName: assignee, text: instruction, tabManager: tabManager)
-        let leaderSummary = formatLeaderTaskNotification(task: task, event: dispatched ? "started" : "start_failed")
-        _ = sendToLeader(teamName: teamName, text: leaderSummary, tabManager: tabManager)
+        // Skip leader stdin injection — leader gets notifications via tm-agent wait/inbox
+        let event = dispatched ? "started" : "start_failed"
+        Logger.team.info("[dispatchTask] \(event, privacy: .public) task=\(task.id.prefix(8), privacy: .public) assignee=\(assignee, privacy: .public)")
+        #if DEBUG
+        dlog("[team.dispatchTask] \(event) task=\(task.id.prefix(8)) assignee=\(assignee) — suppressed leader stdin injection")
+        #endif
         return dispatched
     }
 
