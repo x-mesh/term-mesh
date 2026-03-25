@@ -426,12 +426,18 @@ final class TerminalSurface: Identifiable, ObservableObject {
                 return
             }
 #if DEBUG
-            dlog("surface.attach.create surface=\(id.uuidString.prefix(5))")
+            dlog("surface.attach.create.queue surface=\(id.uuidString.prefix(5))")
 #endif
-            createSurface(for: view)
+            DispatchQueue.main.async { [weak self] in
+                guard let self, let view = self.attachedView else { return }
 #if DEBUG
-            dlog("surface.attach.create.done surface=\(id.uuidString.prefix(5)) hasSurface=\(surface != nil ? 1 : 0)")
+                dlog("surface.attach.create surface=\(self.id.uuidString.prefix(5))")
 #endif
+                self.createSurface(for: view)
+#if DEBUG
+                dlog("surface.attach.create.done surface=\(self.id.uuidString.prefix(5)) hasSurface=\(self.surface != nil ? 1 : 0)")
+#endif
+            }
         } else if let screen = view.window?.screen ?? NSScreen.main,
                   let displayID = screen.displayID,
                   displayID != 0,
