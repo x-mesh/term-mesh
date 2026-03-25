@@ -480,7 +480,11 @@ final class WorktreeCreationHandler: NSObject {
                     }
                     alert.alertStyle = .warning
                     alert.addButton(withTitle: "OK")
-                    alert.runModal()
+                    if let window = NSApp.keyWindow ?? NSApp.mainWindow {
+                        alert.beginSheetModal(for: window) { _ in }
+                    } else {
+                        alert.runModal()
+                    }
                 }
             }
         }
@@ -674,7 +678,11 @@ final class WorktreeTableDataSource: NSObject, NSTableViewDataSource, NSTableVie
                     errAlert.informativeText = "Could not remove \"\(name)\". It may be in use."
                     errAlert.alertStyle = .warning
                     errAlert.addButton(withTitle: "OK")
-                    errAlert.runModal()
+                    if let window = NSApp.keyWindow ?? NSApp.mainWindow {
+                        errAlert.beginSheetModal(for: window) { _ in }
+                    } else {
+                        errAlert.runModal()
+                    }
                 }
             }
         }
@@ -713,7 +721,11 @@ final class WorktreeTableDataSource: NSObject, NSTableViewDataSource, NSTableVie
                     resultAlert.informativeText = "No stale worktrees found."
                 }
                 resultAlert.addButton(withTitle: "OK")
-                resultAlert.runModal()
+                if let window = NSApp.keyWindow ?? NSApp.mainWindow {
+                    resultAlert.beginSheetModal(for: window) { _ in }
+                } else {
+                    resultAlert.runModal()
+                }
             }
         }
     }

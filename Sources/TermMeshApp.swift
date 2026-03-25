@@ -389,7 +389,11 @@ struct TermMeshApp: App {
                                     alert.informativeText = "term-meshd daemon is not running.\nNew tabs will open without sandbox until the daemon is started."
                                     alert.alertStyle = .warning
                                     alert.addButton(withTitle: "OK")
-                                    alert.runModal()
+                                    if let window = NSApp.keyWindow ?? NSApp.mainWindow {
+                                        alert.beginSheetModal(for: window)
+                                    } else {
+                                        alert.runModal()
+                                    }
                                 }
                             }
                         }
@@ -1021,7 +1025,11 @@ struct TermMeshApp: App {
                     alert.informativeText = info
                 }
                 alert.addButton(withTitle: "OK")
-                alert.runModal()
+                if let window = NSApp.keyWindow ?? NSApp.mainWindow {
+                    alert.beginSheetModal(for: window)
+                } else {
+                    alert.runModal()
+                }
             }
         }
     }

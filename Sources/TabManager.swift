@@ -1469,7 +1469,11 @@ class TabManager: ObservableObject {
             alert.informativeText = "Current directory is not inside a git repository."
             alert.alertStyle = .warning
             alert.addButton(withTitle: "OK")
-            alert.runModal()
+            if let window = NSApp.keyWindow ?? NSApp.mainWindow {
+                alert.beginSheetModal(for: window)
+            } else {
+                alert.runModal()
+            }
             return
         }
 
@@ -1488,7 +1492,11 @@ class TabManager: ObservableObject {
                     alert.informativeText = "Failed to spawn agent sessions. Is term-meshd running?"
                     alert.alertStyle = .warning
                     alert.addButton(withTitle: "OK")
-                    alert.runModal()
+                    if let window = NSApp.keyWindow ?? NSApp.mainWindow {
+                        alert.beginSheetModal(for: window)
+                    } else {
+                        alert.runModal()
+                    }
                 }
                 return
             }
@@ -1863,7 +1871,11 @@ class TabManager: ObservableObject {
                     alert.informativeText = "Agent session not found."
                     alert.alertStyle = .warning
                     alert.addButton(withTitle: "OK")
-                    alert.runModal()
+                    if let window = NSApp.keyWindow ?? NSApp.mainWindow {
+                        alert.beginSheetModal(for: window)
+                    } else {
+                        alert.runModal()
+                    }
                 }
                 return
             }

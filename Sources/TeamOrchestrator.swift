@@ -487,7 +487,11 @@ final class TeamOrchestrator: ObservableObject {
                     alert.informativeText = "Shared worktree for team '\(name)' could not be created: \(error). Agents will use the original directory."
                     alert.alertStyle = .warning
                     alert.addButton(withTitle: "OK")
-                    alert.runModal()
+                    if let window = NSApp.keyWindow ?? NSApp.mainWindow {
+                        alert.beginSheetModal(for: window)
+                    } else {
+                        alert.runModal()
+                    }
                 }
             }
         }
@@ -761,7 +765,11 @@ final class TeamOrchestrator: ObservableObject {
                         alert.informativeText = "Worktree for agent '\(agent.name)' could not be created: \(error). Agent will use the original directory."
                         alert.alertStyle = .warning
                         alert.addButton(withTitle: "OK")
-                        alert.runModal()
+                        if let window = NSApp.keyWindow ?? NSApp.mainWindow {
+                            alert.beginSheetModal(for: window)
+                        } else {
+                            alert.runModal()
+                        }
                     }
                 }
             }

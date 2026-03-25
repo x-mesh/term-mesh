@@ -1066,7 +1066,11 @@ struct TabItemView: View {
             alert.informativeText = "\"\(trimmed)\" is not a valid hex color. Use #RRGGBB."
         }
         alert.addButton(withTitle: "OK")
-        _ = alert.runModal()
+        if let window = NSApp.keyWindow ?? NSApp.mainWindow {
+            alert.beginSheetModal(for: window)
+        } else {
+            alert.runModal()
+        }
     }
 
     private func promptRename() {
