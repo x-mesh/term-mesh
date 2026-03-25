@@ -36,6 +36,7 @@ struct ContentView: View {
     @Environment(\.configProvider) private var configProvider
     @Environment(\.browserHistoryService) private var browserHistory
     @State private var sidebarWidth: CGFloat = 200
+    @State private var lastClampedWidth: CGFloat = 0
     @State private var hoveredResizerHandles: Set<SidebarResizerHandle> = []
     @State private var isResizerDragging = false
     @State private var sidebarDragStartWidth: CGFloat?
@@ -123,6 +124,8 @@ struct ContentView: View {
             min(maxSidebarWidth(availableWidth: availableWidth), sidebarWidth)
         )
         guard abs(nextWidth - sidebarWidth) > 0.5 else { return }
+        guard abs(nextWidth - lastClampedWidth) > 0.5 else { return }
+        lastClampedWidth = nextWidth
         withTransaction(Transaction(animation: nil)) {
             sidebarWidth = nextWidth
         }
@@ -359,12 +362,7 @@ struct ContentView: View {
                     .allowsHitTesting(false)
             }
             .frame(width: totalWidth, height: proxy.size.height, alignment: .leading)
-            .onAppear {
-                clampSidebarWidthIfNeeded(availableWidth: totalWidth)
-            }
-            .onChange(of: totalWidth) {
-                clampSidebarWidthIfNeeded(availableWidth: totalWidth)
-            }
+            .preference(key: SidebarOverlayWidthPreferenceKey.self, value: totalWidth)
         }
     }
 
@@ -1280,6 +1278,10 @@ struct ContentView: View {
                         sidebarResizerOverlay
                             .zIndex(1000)
                     }
+                }
+                .onPreferenceChange(SidebarOverlayWidthPreferenceKey.self) { width in
+                    guard width > 0 else { return }
+                    clampSidebarWidthIfNeeded(availableWidth: width)
                 }
         )
     }
@@ -4137,4 +4139,9 @@ struct ContentView: View {
         String(format: "%.2fms", ms)
     }
 #endif
+}
+
+private struct SidebarOverlayWidthPreferenceKey: PreferenceKey {
+    static var defaultValue: CGFloat = 0
+    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) { value = nextValue() }
 }
