@@ -1754,7 +1754,15 @@ func pushTargetSurfaceSize(_ size: CGSize) {
     }
 
     override func resignFirstResponder() -> Bool {
+        let hadMarkedText = markedText.length > 0
         let result = super.resignFirstResponder()
+        if result && hadMarkedText {
+            // Clear IME composition after confirmed resign to prevent stale
+            // markedText ranges causing NSRangeException (TERM-MESH-9 prevention).
+            // Order: notify IME first, then clear internal state.
+            inputContext?.discardMarkedText()
+            unmarkText()
+        }
         if result {
             desiredFocus = false
         }

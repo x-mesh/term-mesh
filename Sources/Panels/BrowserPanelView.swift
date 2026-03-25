@@ -2856,6 +2856,10 @@ struct WebViewRepresentable: NSViewRepresentable {
     private final class HostContainerView: NSView {
         var onDidMoveToWindow: (() -> Void)?
         var onGeometryChanged: (() -> Void)?
+        // TERM-MESH-H: guard against Swift exclusivity violation (EXC_BAD_ACCESS) that
+        // occurs when onGeometryChanged fires synchronously inside NSPerformVisuallyAtomicChange.
+        // Mirror GhosttyTerminalView.HostContainerView.scheduleGeometryCallback() pattern.
+        private var hasScheduledGeometryCallback = false
 
         // Clip WKWebView compositing layers that extend beyond bounds after pageZoom
         // changes. Without this, zoomed web content can overflow into adjacent panels
@@ -2869,27 +2873,40 @@ struct WebViewRepresentable: NSViewRepresentable {
         override func viewDidMoveToWindow() {
             super.viewDidMoveToWindow()
             onDidMoveToWindow?()
-            onGeometryChanged?()
+            scheduleGeometryCallback()
         }
 
         override func viewDidMoveToSuperview() {
             super.viewDidMoveToSuperview()
-            onGeometryChanged?()
+            scheduleGeometryCallback()
         }
 
         override func layout() {
             super.layout()
-            onGeometryChanged?()
+            scheduleGeometryCallback()
         }
 
         override func setFrameOrigin(_ newOrigin: NSPoint) {
             super.setFrameOrigin(newOrigin)
-            onGeometryChanged?()
+            scheduleGeometryCallback()
         }
 
         override func setFrameSize(_ newSize: NSSize) {
             super.setFrameSize(newSize)
-            onGeometryChanged?()
+            scheduleGeometryCallback()
+        }
+
+        /// Coalesce geometry callbacks to prevent re-entrant layout loops.
+        /// Multiple layout/frame changes during a single AppKit layout pass
+        /// are batched into one deferred synchronizeForAnchor call.
+        private func scheduleGeometryCallback() {
+            guard !hasScheduledGeometryCallback else { return }
+            hasScheduledGeometryCallback = true
+            DispatchQueue.main.async { [weak self] in
+                guard let self else { return }
+                self.hasScheduledGeometryCallback = false
+                self.onGeometryChanged?()
+            }
         }
 
         override func hitTest(_ point: NSPoint) -> NSView? {

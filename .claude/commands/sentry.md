@@ -69,9 +69,41 @@ sentry-cli issues mute <ISSUE_ID>
 ```
 
 - If no extra args: list unresolved issues
-- If arg is a number: show that issue's details
+- If arg is a number or short ID (e.g. `TERM-MESH-9`): fetch issue details via curl (see below)
 - If arg starts with `resolve` or `mute`: run the corresponding action
 - Present results in a readable table format
+
+#### Issue detail via Sentry Web API
+
+`sentry-cli api` was removed in sentry-cli 3.x. Use curl instead.
+
+Read the auth token from `~/.sentryclirc` and org/project from `<project>/.sentryclirc`:
+
+```bash
+# Extract auth token (NEVER print this value)
+SENTRY_TOKEN=$(grep -A1 '\[auth\]' ~/.sentryclirc | grep token | cut -d= -f2 | tr -d ' ')
+SENTRY_ORG=$(grep -A2 '\[defaults\]' .sentryclirc | grep org | cut -d= -f2 | tr -d ' ')
+SENTRY_PROJECT=$(grep -A2 '\[defaults\]' .sentryclirc | grep project | cut -d= -f2 | tr -d ' ')
+
+# Get issue details (by numeric ID or short ID like TERM-MESH-9)
+# For short IDs, use the search endpoint:
+curl -s -H "Authorization: Bearer $SENTRY_TOKEN" \
+  "https://sentry.io/api/0/projects/$SENTRY_ORG/$SENTRY_PROJECT/issues/?query=$SHORT_ID" | python3 -m json.tool
+
+# For numeric issue IDs, use the direct endpoint:
+curl -s -H "Authorization: Bearer $SENTRY_TOKEN" \
+  "https://sentry.io/api/0/issues/$ISSUE_ID/" | python3 -m json.tool
+
+# Get latest event for an issue (includes stacktrace):
+curl -s -H "Authorization: Bearer $SENTRY_TOKEN" \
+  "https://sentry.io/api/0/issues/$ISSUE_ID/events/latest/" | python3 -m json.tool
+```
+
+When displaying issue details, extract and present:
+- **Title**, **Level**, **Status**, **First/Last seen**, **Event count**
+- **Stacktrace** (from latest event `entries` where `type == "exception"`)
+- **Tags** (OS, device, app version)
+- **Breadcrumbs** (last 10, from latest event `entries` where `type == "breadcrumbs"`)
 
 ### 2b. Subcommand: `releases`
 
