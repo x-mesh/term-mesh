@@ -439,7 +439,11 @@ final class IMETextView: NSTextView {
 
     override func paste(_ sender: Any?) {
         let pb = NSPasteboard.general
-        if pb.string(forType: .string) != nil || pb.string(forType: NSPasteboard.PasteboardType("public.utf8-plain-text")) != nil {
+        // Check type availability without reading data — avoids blocking pboardd IPC
+        // that occurs when clipboard owner provides promised/lazy data.
+        // pb.string(forType:) forces full data materialization; availableType just queries metadata.
+        let textTypes: [NSPasteboard.PasteboardType] = [.string, NSPasteboard.PasteboardType("public.utf8-plain-text")]
+        if pb.availableType(from: textTypes) != nil {
             pasteAsPlainText(sender)
             return
         }
