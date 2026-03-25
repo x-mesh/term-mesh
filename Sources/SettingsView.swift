@@ -1213,8 +1213,10 @@ struct SettingsView: View {
                                     panel.canChooseDirectories = true
                                     panel.canChooseFiles = false
                                     panel.allowsMultipleSelection = false
-                                    if panel.runModal() == .OK, let url = panel.url {
-                                        teamDefaultWorkingDirectory = url.path
+                                    panel.presentAsSheet { response in
+                                        if response == .OK, let url = panel.url {
+                                            teamDefaultWorkingDirectory = url.path
+                                        }
                                     }
                                 }
                                 .buttonStyle(.bordered)
@@ -2460,8 +2462,10 @@ private struct CLIPathRow: View {
                     panel.canChooseFiles = true
                     panel.allowsMultipleSelection = false
                     panel.treatsFilePackagesAsDirectories = true
-                    if panel.runModal() == .OK, let url = panel.url {
-                        path = url.path
+                    panel.presentAsSheet { response in
+                        if response == .OK, let url = panel.url {
+                            path = url.path
+                        }
                     }
                 }
                 .buttonStyle(.bordered)

@@ -2092,13 +2092,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         alert.showsSuppressionButton = true
         alert.suppressionButton?.title = "Don't warn again for Cmd+Q"
 
-        let response = alert.runModal()
-        if alert.suppressionButton?.state == .on {
-            QuitWarningSettings.setEnabled(false)
-        }
-
-        if response == .alertFirstButtonReturn {
-            NSApp.terminate(nil)
+        alert.presentAsSheet { response in
+            if alert.suppressionButton?.state == .on {
+                QuitWarningSettings.setEnabled(false)
+            }
+            if response == .alertFirstButtonReturn {
+                NSApp.terminate(nil)
+            }
         }
         return true
     }
@@ -2127,9 +2127,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
             input.selectText(nil)
         }
 
-        let response = alert.runModal()
-        guard response == .alertFirstButtonReturn else { return true }
-        tabManager.setCustomTitle(tabId: tab.id, title: input.stringValue)
+        alert.presentAsSheet { [weak self] response in
+            guard response == .alertFirstButtonReturn else { return }
+            self?.tabManager?.setCustomTitle(tabId: tab.id, title: input.stringValue)
+        }
         return true
     }
 
