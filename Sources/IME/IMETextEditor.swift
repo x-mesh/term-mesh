@@ -56,6 +56,10 @@ struct IMETextEditor: NSViewRepresentable {
         let fg = explicitTextColor
         let imeFont = NSFont.monospacedSystemFont(ofSize: IMEInputBarSettings.fontSize, weight: .regular)
         let textView = IMETextView()
+        // Force TextKit 1 mode — accessing layoutManager opts out of TextKit 2,
+        // which on macOS 14.x can silently fail to render text when textStorage
+        // attributes are modified directly (e.g. applyRainbowKeywords).
+        _ = textView.layoutManager
         textView.delegate = context.coordinator
         textView.font = imeFont
         textView.resolvedTextColor = fg
