@@ -104,27 +104,36 @@ struct AboutPanelView: View {
 
     private var version: String? { Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String }
     private var build: String? { Bundle.main.infoDictionary?["CFBundleVersion"] as? String }
-    private var commit: String? {
+    @State private var commitHash: String?
+    private var copyright: String? { Bundle.main.infoDictionary?["NSHumanReadableCopyright"] as? String }
+
+    private func loadCommitHash() {
+        // Fast path: bundle info or env (synchronous, no I/O)
         if let value = Bundle.main.infoDictionary?["TermMeshCommit"] as? String, !value.isEmpty {
-            return value
+            commitHash = value
+            return
         }
         let env = termMeshEnv("COMMIT") ?? ""
-        if !env.isEmpty { return env }
-        // Fallback: read git HEAD
-        let proc = Process()
-        proc.executableURL = URL(fileURLWithPath: "/usr/bin/git")
-        proc.arguments = ["rev-parse", "--short", "HEAD"]
-        proc.currentDirectoryURL = Bundle.main.bundleURL
-        let pipe = Pipe()
-        proc.standardOutput = pipe
-        proc.standardError = Pipe()
-        try? proc.run()
-        proc.waitUntilExit()
-        let data = pipe.fileHandleForReading.readDataToEndOfFile()
-        let hash = String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        return hash.isEmpty ? nil : hash
+        if !env.isEmpty {
+            commitHash = env
+            return
+        }
+        // Fallback: git subprocess — run off main thread
+        Task.detached(priority: .utility) {
+            let proc = Process()
+            proc.executableURL = URL(fileURLWithPath: "/usr/bin/git")
+            proc.arguments = ["rev-parse", "--short", "HEAD"]
+            proc.currentDirectoryURL = Bundle.main.bundleURL
+            let pipe = Pipe()
+            proc.standardOutput = pipe
+            proc.standardError = Pipe()
+            try? proc.run()
+            proc.waitUntilExit()
+            let data = pipe.fileHandleForReading.readDataToEndOfFile()
+            let hash = String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            await MainActor.run { commitHash = hash.isEmpty ? nil : hash }
+        }
     }
-    private var copyright: String? { Bundle.main.infoDictionary?["NSHumanReadableCopyright"] as? String }
 
     var body: some View {
         VStack(alignment: .center) {
@@ -154,8 +163,8 @@ struct AboutPanelView: View {
                     if let build {
                         AboutPropertyRow(label: "Build", text: build)
                     }
-                    let commitText = commit ?? "—"
-                    let commitURL = commit.flatMap { hash in
+                    let commitText = commitHash ?? "—"
+                    let commitURL = commitHash.flatMap { hash in
                         URL(string: "https://github.com/manaflow-ai/term-mesh/commit/\(hash)")
                     }
                     AboutPropertyRow(label: "Commit", text: commitText, url: commitURL)
@@ -199,6 +208,9 @@ struct AboutPanelView: View {
         .padding(32)
         .frame(minWidth: 280)
         .background(Color(nsColor: .windowBackgroundColor).ignoresSafeArea())
+        .onAppear {
+            if commitHash == nil { loadCommitHash() }
+        }
     }
 }
 

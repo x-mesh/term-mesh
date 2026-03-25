@@ -1463,45 +1463,40 @@ class TabManager: ObservableObject {
         // Determine repo path from the focused terminal panel's directory
         let focusedDir = tab.panelDirectories[focusedPanelId] ?? ""
         let currentDir = focusedDir.isEmpty ? tab.currentDirectory : focusedDir
-        guard let repoPath = daemon.findGitRoot(from: currentDir), !repoPath.isEmpty else {
-            let alert = NSAlert()
-            alert.messageText = "Spawn Agents"
-            alert.informativeText = "Current directory is not inside a git repository."
-            alert.alertStyle = .warning
-            alert.addButton(withTitle: "OK")
-            if let window = NSApp.keyWindow ?? NSApp.mainWindow {
-                alert.beginSheetModal(for: window)
-            } else {
-                alert.runModal()
-            }
-            return
-        }
-
-        // Show indeterminate progress while spawning
-        titlebarProgress = .indeterminate("Spawning \(count) agent\(count > 1 ? "s" : "")…", color: .green)
-
-        // Spawn agent sessions via daemon (background to avoid blocking UI)
         let daemon = self.daemon
-        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+
+        // Move findGitRoot and spawnAgents off the main thread to avoid blocking UI (TERM-MESH-B)
+        Task.detached(priority: .userInitiated) { [weak self] in
+            guard let repoPath = daemon.findGitRoot(from: currentDir), !repoPath.isEmpty else {
+                await MainActor.run {
+                    let alert = NSAlert()
+                    alert.messageText = "Spawn Agents"
+                    alert.informativeText = "Current directory is not inside a git repository."
+                    alert.alertStyle = .warning
+                    alert.addButton(withTitle: "OK")
+                    alert.presentAsSheet()
+                }
+                return
+            }
+
+            // Show indeterminate progress while spawning
+            await MainActor.run { self?.titlebarProgress = .indeterminate("Spawning \(count) agent\(count > 1 ? "s" : "")…", color: .green) }
+
             let sessions = daemon.spawnAgents(repoPath: repoPath, count: count, name: nil, command: command)
             guard !sessions.isEmpty else {
-                DispatchQueue.main.async {
+                await MainActor.run {
                     self?.titlebarProgress = nil
                     let alert = NSAlert()
                     alert.messageText = "Spawn Agents"
                     alert.informativeText = "Failed to spawn agent sessions. Is term-meshd running?"
                     alert.alertStyle = .warning
                     alert.addButton(withTitle: "OK")
-                    if let window = NSApp.keyWindow ?? NSApp.mainWindow {
-                        alert.beginSheetModal(for: window)
-                    } else {
-                        alert.runModal()
-                    }
+                    alert.presentAsSheet()
                 }
                 return
             }
 
-            DispatchQueue.main.async { [weak self] in
+            await MainActor.run { [weak self] in
                 guard let self,
                       let tab = self.tabs.first(where: { $0.id == selectedTabId }),
                       let focusedPanelId = tab.focusedPanelId else {

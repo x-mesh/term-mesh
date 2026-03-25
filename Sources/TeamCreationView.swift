@@ -387,7 +387,10 @@ struct TeamCreationView: View {
                 .onChange(of: resumeSession) { enabled in
                     if enabled && recentSessions.isEmpty {
                         let dir = resolveWorkingDirectory()
-                        recentSessions = ClaudeSession.listRecent(workingDirectory: dir)
+                        Task.detached(priority: .userInitiated) {
+                            let sessions = ClaudeSession.listRecent(workingDirectory: dir)
+                            await MainActor.run { recentSessions = sessions }
+                        }
                     }
                     if !enabled {
                         selectedSessionId = nil

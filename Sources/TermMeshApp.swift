@@ -1005,12 +1005,16 @@ struct TermMeshApp: App {
     }
 
     private func cleanupStaleWorktrees() {
-        let repoPath = activeTabManager.selectedWorkspace?.worktreeRepoPath
-            ?? termMeshDaemon.findGitRoot(from: FileManager.default.currentDirectoryPath)
-            ?? FileManager.default.currentDirectoryPath
-        DispatchQueue.global(qos: .utility).async { [daemon = self.termMeshDaemon] in
+        // Cache the repo path on the main thread before going off-main,
+        // so findGitRoot (blocking RPC) never runs on the main thread.
+        let cachedRepoPath = activeTabManager.selectedWorkspace?.worktreeRepoPath
+        let daemon = self.termMeshDaemon
+        Task.detached(priority: .utility) {
+            let repoPath = cachedRepoPath
+                ?? daemon.findGitRoot(from: FileManager.default.currentDirectoryPath)
+                ?? FileManager.default.currentDirectoryPath
             let result = daemon.cleanupStaleWorktrees(repoPath: repoPath)
-            DispatchQueue.main.async {
+            await MainActor.run {
                 let alert = NSAlert()
                 alert.alertStyle = .informational
                 if result.removed == 0 && result.skippedDirty == 0 {
@@ -1025,11 +1029,7 @@ struct TermMeshApp: App {
                     alert.informativeText = info
                 }
                 alert.addButton(withTitle: "OK")
-                if let window = NSApp.keyWindow ?? NSApp.mainWindow {
-                    alert.beginSheetModal(for: window)
-                } else {
-                    alert.runModal()
-                }
+                alert.presentAsSheet()
             }
         }
     }
@@ -1304,7 +1304,10 @@ struct TermMeshApp: App {
 
     @MainActor
     private func showReconnectAgentDialog() async {
-        let agents = termMeshDaemon.listAgents(includeTerminated: false)
+        // listAgents() does a blocking socket RPC; run it off the main thread.
+        let agents = await Task.detached(priority: .userInitiated) {
+            self.termMeshDaemon.listAgents(includeTerminated: false)
+        }.value
         let detached = agents.filter { $0.status != "terminated" && $0.panelId == nil }
 
         guard !detached.isEmpty else {
