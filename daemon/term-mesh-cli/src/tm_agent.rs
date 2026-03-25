@@ -1631,24 +1631,28 @@ fn main() {
                 report_params["result_path"] = json!(path.to_string_lossy());
             }
             let _ = rpc_call(&sock, "team.report", report_params);
-            // Auto-complete the active task for this agent
-            if let Ok(status_resp) = rpc_call(&sock, "team.status", json!({"team_name": &team})) {
-                if let Some(agents) = status_resp["result"]["agents"].as_array() {
-                    for a in agents {
-                        if a["name"].as_str() == Some(sender.as_str()) {
-                            if let Some(tid) = a["active_task_id"].as_str() {
-                                if a["active_task_status"].as_str() != Some("completed") {
-                                    let mut update = json!({
-                                        "team_name": &team, "task_id": tid,
-                                        "status": "completed", "result": &summary,
-                                    });
-                                    if let Some(ref path) = result_path {
-                                        update["result_path"] = json!(path.to_string_lossy());
-                                    }
-                                    let _ = rpc_call(&sock, "team.task.update", update);
+            // Auto-complete the active task for this agent.
+            // Use team.task.list (data command, no MainActor) instead of team.status
+            // (UI command, MainActor) to avoid timeout when main thread is busy —
+            // a timeout here silently skips task completion, causing the leader's
+            // `wait` to hang indefinitely.
+            if let Ok(task_resp) = rpc_call(&sock, "team.task.list", json!({
+                "team_name": &team, "assignee": &sender
+            })) {
+                if let Some(tasks) = task_resp["result"]["tasks"].as_array() {
+                    for t in tasks {
+                        let status = t["status"].as_str().unwrap_or("");
+                        if status != "completed" && status != "failed" && status != "abandoned" {
+                            if let Some(tid) = t["id"].as_str() {
+                                let mut update = json!({
+                                    "team_name": &team, "task_id": tid,
+                                    "status": "completed", "result": &summary,
+                                });
+                                if let Some(ref path) = result_path {
+                                    update["result_path"] = json!(path.to_string_lossy());
                                 }
+                                let _ = rpc_call(&sock, "team.task.update", update);
                             }
-                            break;
                         }
                     }
                 }
@@ -2671,7 +2675,16 @@ fn run_wait(sock: &PathBuf, team: &str, timeout: u32, interval: u32, mode: &str,
                         }
                     }
                 }
-                Err(e) => eprintln!("  Warning: team.status RPC failed: {e}"),
+                Err(e) => {
+                    eprintln!("  Warning: team.status RPC failed: {e}");
+                    // Fallback to result.status when team.status (UI command) times out
+                    if let Ok(rs) = result_status_r {
+                        let done = rs["result"]["completed"].as_u64().unwrap_or(0);
+                        let total = rs["result"]["total"].as_u64().unwrap_or(0);
+                        report_done = rs["result"]["all_done"].as_bool().unwrap_or(false);
+                        report_progress = format!("{done}/{total}");
+                    }
+                }
             }
         }
 
