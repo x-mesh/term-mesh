@@ -1,4 +1,5 @@
 import AppKit
+import Bonsplit
 
 /// Virtual keycode constants (Carbon HIToolbox/Events.h).
 private enum VK {
@@ -774,33 +775,30 @@ final class IMETextView: NSTextView {
     // MARK: - Ghost drawing
 
     override func draw(_ dirtyRect: NSRect) {
-        // Ensure layout is fully resolved before drawing.
-        // If textStorage was recently edited (e.g. rainbow highlighting),
-        // the layout manager may have glyph holes that cause
-        // _fillGlyphHoleForCharacterRange to throw an NSException.
-        if let lm = layoutManager, let tc = textContainer {
-            lm.ensureLayout(for: tc)
-        }
+        // Do NOT call ensureLayout before super.draw — on some machines,
+        // ensureLayout can hit a corrupt glyph range after applyRainbowKeywords
+        // edits textStorage. The resulting NSException is silently caught by
+        // Core Animation's CALayer display path, which permanently breaks text
+        // rendering for this view (invisible text, no crash). The default
+        // NSTextView.draw handles layout internally and is resilient to this.
         super.draw(dirtyRect)
         drawGhostText()
     }
 
     private func drawGhostText() {
         guard !ghostSuggestion.isEmpty, !hasMarkedText() else { return }
+        guard !isApplyingRainbow else { return }  // skip during textStorage edits
         guard let lm = layoutManager, let tc = textContainer else { return }
         guard let storage = textStorage, storage.length > 0 else { return }
 
-        lm.ensureLayout(for: tc)
-        let numGlyphs = lm.numberOfGlyphs
+        // Use glyphRange(for:) which is safe even with partial layout,
+        // instead of ensureLayout which can throw on corrupt glyph state.
+        let validRange = lm.glyphRange(for: tc)
+        let numGlyphs = validRange.length
         guard numGlyphs > 0 else { return }
 
-        // Validate that the last glyph index falls within the valid glyph range
-        // for this text container. After textStorage edits, numberOfGlyphs can
-        // momentarily exceed the actual laid-out range.
-        let lastGlyphIdx = numGlyphs - 1
-        let validRange = lm.glyphRange(for: tc)
-        guard validRange.length > 0,
-              NSLocationInRange(lastGlyphIdx, validRange) else { return }
+        let lastGlyphIdx = validRange.location + numGlyphs - 1
+        guard NSLocationInRange(lastGlyphIdx, validRange) else { return }
 
         // bounding rect of the last glyph in textContainer coordinates
         let glyphBound = lm.boundingRect(

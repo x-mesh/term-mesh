@@ -1,3 +1,4 @@
+import Bonsplit
 import SwiftUI
 
 // MARK: - Custom NSTextView wrapper for Enter/Shift+Enter/History handling
@@ -53,14 +54,18 @@ struct IMETextEditor: NSViewRepresentable {
         scrollView.drawsBackground = false
 
         let fg = explicitTextColor
+        let imeFont = NSFont.monospacedSystemFont(ofSize: IMEInputBarSettings.fontSize, weight: .regular)
         let textView = IMETextView()
         textView.delegate = context.coordinator
-        textView.font = NSFont.monospacedSystemFont(ofSize: IMEInputBarSettings.fontSize, weight: .regular)
+        textView.font = imeFont
         textView.resolvedTextColor = fg
         textView.textColor = fg
         textView.backgroundColor = .clear
-        textView.drawsBackground = true
+        textView.drawsBackground = false
         textView.insertionPointColor = fg
+        // Explicitly set typing attributes so new keystrokes always get the right color/font,
+        // regardless of NSTextView's rich-text attribute inheritance chain.
+        textView.typingAttributes = [.foregroundColor: fg, .font: imeFont]
         textView.isRichText = true
         textView.allowsUndo = true
         textView.isVerticallyResizable = true
@@ -138,15 +143,22 @@ struct IMETextEditor: NSViewRepresentable {
         // Use explicit color derived from SwiftUI colorScheme to avoid NSColor.textColor
         // resolving against the wrong effectiveAppearance in NSViewRepresentable contexts.
         let fg = explicitTextColor
+        let imeFont = textView.font ?? NSFont.monospacedSystemFont(ofSize: IMEInputBarSettings.fontSize, weight: .regular)
         textView.resolvedTextColor = fg
         textView.textColor = fg
         textView.backgroundColor = .clear
+        textView.drawsBackground = false
         textView.insertionPointColor = fg
+        textView.typingAttributes = [.foregroundColor: fg, .font: imeFont]
         textView.markedTextAttributes = [
             .foregroundColor: fg,
             .underlineStyle: NSUnderlineStyle.single.rawValue,
             .underlineColor: NSColor.cyan.withAlphaComponent(0.6),
         ]
+        #if DEBUG
+        let tvFrame = textView.frame
+        dlog("ime.update fg=\(fg) font=\(imeFont.pointSize)pt frame=\(Int(tvFrame.width))x\(Int(tvFrame.height)) scheme=\(colorScheme == .dark ? "dark" : "light") textLen=\(textView.string.count)")
+        #endif
         // Re-apply rainbow keywords AFTER all color resets so they aren't overwritten.
         // Use the deferred path (next run-loop iteration) to avoid layout invalidation
         // collisions with the current SwiftUI update cycle (TERM-MESH-9 fix).

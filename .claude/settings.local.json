@@ -15,7 +15,9 @@
       "Bash(pkill -f 'term-mesh DEV fix-layout-loop')",
       "Bash(xcodebuild -project GhosttyTabs.xcodeproj -scheme term-mesh -configuration Debug -destination 'platform=macOS' build)",
       "Bash(tm-agent wait:*)",
-      "Bash(cargo build:*)"
+      "Bash(cargo build:*)",
+      "Bash(node /Users/jinwoo/.claude/plugins/cache/xm-kit/xm-build/1.1.0/lib/xm-build-cli.mjs mode show 2>/dev/null | head -1)",
+      "Bash(node /Users/jinwoo/.claude/plugins/cache/xm-kit/xm-build/1.1.0/lib/xm-build-cli.mjs mode show 2>&1)"
     ]
   },
   "enabledPlugins": {
