@@ -158,6 +158,25 @@ final class DraggableFolderNSView: NSView, NSDraggingSource {
     private var hasActiveDragSession = false
     private var didArmWindowDragSuppression = false
 
+    private static let iconCache = NSCache<NSString, NSImage>()
+    private static let iconQueue = DispatchQueue(label: "com.termmesh.icon-loader", qos: .userInitiated)
+
+    private static func loadIcon(forPath path: String, size: NSSize, completion: @escaping (NSImage) -> Void) {
+        let key = "\(path)@\(Int(size.width))" as NSString
+        if let cached = iconCache.object(forKey: key) {
+            completion(cached)
+            return
+        }
+        iconQueue.async {
+            let icon = NSWorkspace.shared.icon(forFile: path)
+            icon.size = size
+            iconCache.setObject(icon, forKey: key)
+            DispatchQueue.main.async {
+                completion(icon)
+            }
+        }
+    }
+
     private func formatPoint(_ point: NSPoint) -> String {
         String(format: "(%.1f,%.1f)", point.x, point.y)
     }
@@ -195,9 +214,12 @@ final class DraggableFolderNSView: NSView, NSDraggingSource {
     }
 
     func updateIcon() {
-        let icon = NSWorkspace.shared.icon(forFile: directory)
-        icon.size = NSSize(width: 16, height: 16)
-        imageView.image = icon
+        let size = NSSize(width: 16, height: 16)
+        // Show a generic folder placeholder immediately; replace with the real icon asynchronously.
+        imageView.image = NSImage(named: NSImage.folderName)
+        Self.loadIcon(forPath: directory, size: size) { [weak self] icon in
+            self?.imageView.image = icon
+        }
     }
 
     func draggingSession(_ session: NSDraggingSession, sourceOperationMaskFor context: NSDraggingContext) -> NSDragOperation {
@@ -242,9 +264,20 @@ final class DraggableFolderNSView: NSView, NSDraggingSource {
         let fileURL = URL(fileURLWithPath: directory)
         let draggingItem = NSDraggingItem(pasteboardWriter: fileURL as NSURL)
 
-        let iconImage = NSWorkspace.shared.icon(forFile: directory)
-        iconImage.size = NSSize(width: 32, height: 32)
-        draggingItem.setDraggingFrame(bounds, contents: iconImage)
+        // Use cached icon for drag; fall back to the already-displayed imageView image.
+        let iconSize = NSSize(width: 32, height: 32)
+        let dragIcon: NSImage
+        if let cached = Self.iconCache.object(forKey: "\(directory)@32" as NSString) {
+            dragIcon = cached
+        } else if let existing = imageView.image, let copy = existing.copy() as? NSImage {
+            copy.size = iconSize
+            dragIcon = copy
+        } else {
+            let fallback = NSImage(named: NSImage.folderName) ?? NSImage()
+            fallback.size = iconSize
+            dragIcon = fallback
+        }
+        draggingItem.setDraggingFrame(bounds, contents: dragIcon)
 
         let session = beginDraggingSession(with: [draggingItem], event: event, source: self)
         hasActiveDragSession = true
@@ -283,9 +316,6 @@ final class DraggableFolderNSView: NSView, NSDraggingSource {
 
         // Add path components (current dir at top, root at bottom - matches native macOS)
         for pathURL in pathComponents {
-            let icon = NSWorkspace.shared.icon(forFile: pathURL.path)
-            icon.size = NSSize(width: 16, height: 16)
-
             let displayName: String
             if pathURL.path == "/" {
                 // Use the volume name for root
@@ -300,9 +330,15 @@ final class DraggableFolderNSView: NSView, NSDraggingSource {
 
             let item = NSMenuItem(title: displayName, action: #selector(openPathComponent(_:)), keyEquivalent: "")
             item.target = self
-            item.image = icon
+            item.image = NSImage(named: NSImage.folderName)
             item.representedObject = pathURL
             menu.addItem(item)
+
+            // Load the real icon asynchronously and update the menu item.
+            let iconSize = NSSize(width: 16, height: 16)
+            Self.loadIcon(forPath: pathURL.path, size: iconSize) { icon in
+                item.image = icon
+            }
         }
 
         // Add computer name at the bottom (like native proxy icon)
