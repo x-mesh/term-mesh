@@ -2279,7 +2279,12 @@ func pushTargetSurfaceSize(_ size: CGSize) {
         // be encoded. Example: Japanese begin composing, then press backspace.
         // This should only cancel the composing state but not actually delete
         // the prior input characters (prior to the composing).
-        keyEvent.composing = markedText.length > 0 || markedTextBefore
+        //
+        // ESC (keyCode 53) is never a composing event — it *cancels* composition.
+        // Marking it composing causes Ghostty to suppress the 0x1B byte, which
+        // breaks vim normal-mode switching over SSH even when no IME box is open.
+        let isEscape = event.keyCode == 53 // kVK_Escape
+        keyEvent.composing = !isEscape && (markedText.length > 0 || markedTextBefore)
 
         // Use accumulated text from insertText (for IME), or compute text for key
         if let accumulated = keyTextAccumulator, !accumulated.isEmpty {
