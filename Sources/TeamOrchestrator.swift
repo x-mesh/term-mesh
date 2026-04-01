@@ -1741,10 +1741,11 @@ final class TeamOrchestrator: ObservableObject {
             return
         }
 
-        // Heuristic: check terminal title for "thinking" or "Generating" indicators.
-        // Claude Code updates the terminal title during processing.
-        let title = panel.title
-        let isThinking = title.contains("thinking") || title.contains("Generating")
+        // Minimum wait: don't drain within the first 15 seconds of a send.
+        // Claude Code typically takes 5-30s to process a command. Draining too early
+        // causes the next text to be pasted while Claude is still "thinking", which
+        // leads to text concatenation.
+        let isThinking = attempts <= 15 // First 15 attempts × 1s = 15s minimum wait
         // Also check if Claude has a "❯" prompt visible (screen scraping fallback)
         // For now, rely on title heuristic + time-based fallback.
 
@@ -1872,24 +1873,43 @@ final class TeamOrchestrator: ObservableObject {
             return true // Report as delivered — will be sent when panel is ready
         }
 
-        // Normalize and send text+Return via sendIMEText.
+        // Normalize text: collapse newlines to spaces.
         let normalized = trimmed
             .replacingOccurrences(of: "\r\n", with: " ")
             .replacingOccurrences(of: "\n", with: " ")
             .replacingOccurrences(of: "\r", with: " ")
-        let sent = panel.surface.sendIMEText(normalized, withReturn: withReturn)
+
+        // Send text WITHOUT Return first. Return is sent in a SEPARATE MainActor
+        // turn (via asyncAfter) to ensure the PTY has flushed the paste before
+        // the key event arrives. Sending both in the same call/turn causes TUI
+        // apps (Claude Code) to silently drop the Return.
+        let textSent = panel.surface.sendIMEText(normalized, withReturn: false)
         #if DEBUG
-        dlog("[team.sendTextToPanel] sendIMEText panelId=\(panelId.uuidString.prefix(8)) textLen=\(normalized.count) withReturn=\(withReturn) sent=\(sent) text=\(normalized.prefix(80).debugDescription)")
+        dlog("[team.sendTextToPanel] text-only panelId=\(panelId.uuidString.prefix(8)) textLen=\(normalized.count) sent=\(textSent) text=\(normalized.prefix(80).debugDescription)")
         #endif
 
-        // Mark this panel as having an in-flight send. The drain timer will
-        // clear it once the TUI returns to idle (prompt visible on screen).
-        if withReturn && sent {
+        if withReturn && textSent {
+            // Mark in-flight to queue subsequent sends
             panelSendInFlight.insert(panelId)
+
+            // Schedule Return in a separate MainActor turn after 50ms.
+            // CRITICAL: use TerminalController.sendKeyEvent (same path as surface.send_key RPC)
+            // rather than TerminalSurface.sendReturnKey. The RPC path reliably delivers
+            // Return to TUI apps; the direct ghostty_surface_key call from TerminalSurface
+            // context can be silently dropped.
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
+                guard let surface = panel.surface.surface else { return }
+                TerminalController.shared.sendKeyEvent(surface: surface, keycode: 36, text: "\r") // kVK_Return = 36
+                panel.surface.forceRefresh()
+                #if DEBUG
+                dlog("[team.sendTextToPanel] deferred Return via TC.sendKeyEvent panelId=\(panelId.uuidString.prefix(8))")
+                #endif
+            }
+            // Start drain timer to detect idle and send queued items
             schedulePanelDrain(panelId: panelId, panel: panel, workspaceId: workspaceId, tabManager: tabManager)
         }
 
-        return sent
+        return textSent
     }
 
     /// Broadcast text to all agents in a team.

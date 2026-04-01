@@ -1093,13 +1093,18 @@ final class TerminalSurface: Identifiable, ObservableObject {
     /// Send a single Return key (PRESS+RELEASE) to the given surface.
     /// Returns true if ghostty reported the key press as handled.
     /// Internal visibility for TeamOrchestrator's per-surface drain queue.
+    ///
+    /// Note: `unshifted_codepoint` must be 0 (not 13/CR). Setting it to 13
+    /// causes ghostty's key encoder to treat Return as a "text" key rather than
+    /// a "functional" key, which can be silently dropped by TUI apps in certain
+    /// states (e.g., Claude Code's "thinking" mode returning to idle).
     func sendReturnKey(to surface: ghostty_surface_t) -> Bool {
         var keyEvent = ghostty_input_key_s()
         keyEvent.action = GHOSTTY_ACTION_PRESS
         keyEvent.keycode = 36 // kVK_Return
         keyEvent.mods = GHOSTTY_MODS_NONE
         keyEvent.consumed_mods = GHOSTTY_MODS_NONE
-        keyEvent.unshifted_codepoint = 13
+        keyEvent.unshifted_codepoint = 0 // Must be 0, not 13 — see comment above
         keyEvent.composing = false
         var pressHandled = false
         "\r".withCString { ptr in
@@ -1109,6 +1114,7 @@ final class TerminalSurface: Identifiable, ObservableObject {
         keyEvent.action = GHOSTTY_ACTION_RELEASE
         keyEvent.text = nil
         _ = ghostty_surface_key(surface, keyEvent)
+        forceRefresh()
         return pressHandled
     }
 
