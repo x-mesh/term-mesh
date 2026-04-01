@@ -80,6 +80,9 @@ pub struct SpawnParams {
     /// Agent-specific instructions (preset system prompt).
     #[serde(default)]
     pub instructions: Option<String>,
+    /// Override TERMMESH_AGENT_NAME env var (for autonomous tasks that report as a different agent).
+    #[serde(default)]
+    pub agent_name_override: Option<String>,
 }
 
 fn default_cli() -> String { "claude".into() }
@@ -190,6 +193,12 @@ impl HeadlessManager {
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .kill_on_drop(true);
+
+        // Override TERMMESH_AGENT_NAME if requested (autonomous mode: report as original agent)
+        if let Some(ref name_override) = params.agent_name_override {
+            command.env("TERMMESH_AGENT_NAME", name_override);
+            command.env("TERMMESH_AGENT_ID", format!("{name_override}@{}", params.team_name));
+        }
 
         // Remove env vars that would interfere with the subprocess
         for key in &cmd.env_remove {
@@ -410,6 +419,7 @@ impl HeadlessManager {
                 cli_path: spec.cli_path.clone(),
                 app_socket_path: params.app_socket_path.clone(),
                 instructions: spec.instructions.clone(),
+                agent_name_override: None,
             };
 
             match self.spawn_agent(spawn_params).await {
@@ -505,6 +515,7 @@ impl HeadlessManager {
             cli_path: spec.cli_path,
             app_socket_path: app_socket_path.map(String::from),
             instructions: spec.instructions,
+            agent_name_override: None,
         };
 
         let info = self.spawn_agent(spawn_params).await?;

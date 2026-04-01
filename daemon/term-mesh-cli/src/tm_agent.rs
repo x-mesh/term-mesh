@@ -227,6 +227,9 @@ enum Commands {
         /// Auto-fix budget: max number of fix attempts before auto-blocking
         #[arg(long)]
         auto_fix_budget: Option<u8>,
+        /// Run task in autonomous mode (headless subprocess, no leader approval needed for edits)
+        #[arg(long)]
+        autonomous: bool,
     },
     /// Stop (interrupt) agents by sending Ctrl+C to their terminals
     Stop {
@@ -1626,10 +1629,12 @@ fn main() {
             })));
             return;
         }
-        Commands::Delegate { agent: ref target, text, title, priority, accept, deps, desc, no_report, context, auto_fix_budget } => {
+        Commands::Delegate { agent: ref target, text, title, priority, accept, deps, desc, no_report, context, auto_fix_budget, autonomous } => {
             // Auto-detect comma-separated agents and route to parallel fan-out
             if target.contains(',') {
                 run_fan_out(&sock, &team, &text, title, priority, no_report, &Some(target.to_string()), context.as_deref(), auto_fix_budget);
+            } else if autonomous {
+                run_delegate_autonomous(&sock, &team, target, &text, title, priority, no_report, context.as_deref(), auto_fix_budget);
             } else {
                 run_delegate(&sock, &team, target, &text, title, priority, &accept, &deps, desc, no_report, context.as_deref(), auto_fix_budget);
             }
@@ -2569,6 +2574,107 @@ fn run_delegate(
         Ok(v) => println!("{}", pretty(&v)),
         Err(e) => { eprintln!("Error: {e}"); process::exit(1); }
     }
+}
+
+/// Delegate a task in autonomous mode: spawn a temporary headless subprocess
+/// that runs without team flags (no leader approval), executes the task, and exits.
+fn run_delegate_autonomous(
+    sock: &PathBuf, team: &str, target: &str, text: &str,
+    title: Option<String>, priority: Option<u32>, no_report: bool,
+    context: Option<&str>, fix_budget: Option<u8>,
+) {
+    let resolved_title = title.unwrap_or_else(|| task_title_from_text(text));
+    let resolved_priority = priority.unwrap_or(2);
+
+    // Step 1: Create the task (same as normal delegate)
+    let task_params = json!({
+        "team_name": team,
+        "title": resolved_title,
+        "assignee": target,
+        "priority": resolved_priority,
+    });
+    let task = match rpc_call(sock, "team.task.create", task_params) {
+        Ok(v) if v["ok"].as_bool().unwrap_or(false) => v["result"].clone(),
+        Ok(v) => { eprintln!("Error creating task: {}", pretty(&v)); process::exit(1); }
+        Err(e) => { eprintln!("Error creating task: {e}"); process::exit(1); }
+    };
+    let task_id = task["id"].as_str().unwrap_or("").to_string();
+
+    // Step 2: Format instruction with task context
+    let instruction = format_task_instruction(sock, team, &task, text, no_report, context, fix_budget);
+
+    // Step 3: Get agent model from team status
+    let model = match rpc_call(sock, "team.status", json!({ "team_name": team })) {
+        Ok(v) => {
+            v["result"]["agents"].as_array()
+                .and_then(|arr| arr.iter().find(|a| a["name"].as_str() == Some(target)))
+                .and_then(|a| a["model"].as_str())
+                .unwrap_or("sonnet")
+                .to_string()
+        }
+        Err(_) => "sonnet".to_string(),
+    };
+
+    // Step 4: Spawn headless subprocess via daemon
+    let daemon_sock = match detect_daemon_socket() {
+        Some(s) => s,
+        None => {
+            eprintln!("Error: --autonomous requires the term-mesh daemon. No daemon socket found.");
+            process::exit(1);
+        }
+    };
+
+    // Get the app socket path for TERMMESH_SOCKET (so the subprocess can use tm-agent reply)
+    let app_socket = env::var("TERMMESH_SOCKET").ok();
+
+    // Use a unique name for the headless subprocess to avoid collision with the GUI panel agent.
+    // agent_name_override ensures TERMMESH_AGENT_NAME=target so tm-agent reply routes correctly.
+    let headless_name = format!("{}_auto_{}", target, &task_id[..8.min(task_id.len())]);
+    let spawn_params = json!({
+        "name": headless_name,
+        "team_name": team,
+        "model": model,
+        "working_directory": env::current_dir().unwrap_or_default().to_string_lossy().to_string(),
+        "app_socket_path": app_socket,
+        "agent_name_override": target,
+        "instructions": format!(
+            "You are agent '{}' running in autonomous mode (no approval needed for file edits).\n\
+             Complete the task below and report your results using: tm-agent reply '<summary>'",
+            target
+        ),
+    });
+
+    let spawn_result = rpc_call(&daemon_sock, "headless.spawn", spawn_params);
+    let agent_id = match &spawn_result {
+        Ok(v) if !v["result"]["id"].is_null() => v["result"]["id"].as_str().unwrap_or("").to_string(),
+        Ok(v) => { eprintln!("Error spawning autonomous agent: {}", pretty(v)); process::exit(1); }
+        Err(e) => { eprintln!("Error spawning autonomous agent: {e}"); process::exit(1); }
+    };
+
+    eprintln!("  Autonomous mode: spawned headless subprocess {agent_id}");
+
+    // Step 5: Send instruction to the headless subprocess
+    // Small delay for the subprocess to initialize
+    std::thread::sleep(Duration::from_millis(500));
+    let send_result = rpc_call(&daemon_sock, "headless.send", json!({
+        "agent_id": agent_id,
+        "text": format!("{instruction}\n"),
+    }));
+    if let Err(e) = &send_result {
+        eprintln!("  Warning: failed to send instruction to autonomous agent: {e}");
+    }
+
+    // Output result (task info + autonomous flag)
+    println!("{}", pretty(&json!({
+        "ok": true,
+        "result": {
+            "task": task,
+            "sent": true,
+            "text_delivered": send_result.is_ok(),
+            "autonomous": true,
+            "headless_agent_id": agent_id,
+        }
+    })));
 }
 
 fn run_fan_out(
