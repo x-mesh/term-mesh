@@ -201,6 +201,11 @@ final class GhosttyMetalLayer: CAMetalLayer {
 
 // MARK: - Terminal Surface (owns the ghostty_surface_t lifecycle)
 
+/// Token shared across async Return retry closures.
+/// Once a retry succeeds (`delivered = true`), subsequent closures skip sending.
+/// Safe because all closures run on MainActor (DispatchQueue.main.asyncAfter).
+private class ReturnDeliveryToken { var delivered = false }
+
 final class TerminalSurface: Identifiable, ObservableObject {
     final class SearchState: ObservableObject {
         @Published var needle: String
@@ -1060,19 +1065,25 @@ final class TerminalSurface: Identifiable, ObservableObject {
                     #if DEBUG
                     dlog("[sendIMEText.Return] sync retry failed, scheduling async retries surface=\(id.uuidString.prefix(8))")
                     #endif
-                    // Schedule async retries — don't block MainThread
-                    let asyncDelays: [Double] = [0.2, 0.5, 1.0] // 200ms, 500ms, 1s
+                    // Schedule async retries — don't block MainThread.
+                    // TUI apps (Claude Code) can be "thinking" for 15-30s during which
+                    // Return is rejected. Retry at exponential intervals up to ~30s total.
+                    // Use a shared token to stop retrying once Return is accepted.
+                    let token = ReturnDeliveryToken()
+                    let asyncDelays: [Double] = [0.2, 0.5, 1.0, 2.0, 4.0, 8.0, 15.0, 25.0]
                     for (i, delay) in asyncDelays.enumerated() {
-                        DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
-                            guard let self, let surf = self.surface else { return }
+                        DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self, token] in
+                            guard let self, let surf = self.surface, !token.delivered else { return }
                             let ok = self.sendReturnKey(to: surf)
+                            if ok { token.delivered = true }
                             #if DEBUG
-                            dlog("[sendIMEText.Return] async retry \(i + 1)/\(asyncDelays.count) delay=\(delay)s handled=\(ok) surface=\(self.id.uuidString.prefix(8))")
+                            dlog("[sendIMEText.Return] async retry \(i + 1)/\(asyncDelays.count) delay=\(delay)s handled=\(ok) token.delivered=\(token.delivered) surface=\(self.id.uuidString.prefix(8))")
                             #endif
                         }
                     }
-                    // Return true — async retries will handle delivery
-                    return true
+                    // Return false — Return was NOT delivered synchronously.
+                    // Async retries are scheduled but callers should treat this as pending.
+                    return false
                 }
             }
         }
@@ -1081,7 +1092,8 @@ final class TerminalSurface: Identifiable, ObservableObject {
 
     /// Send a single Return key (PRESS+RELEASE) to the given surface.
     /// Returns true if ghostty reported the key press as handled.
-    private func sendReturnKey(to surface: ghostty_surface_t) -> Bool {
+    /// Internal visibility for TeamOrchestrator's per-surface drain queue.
+    func sendReturnKey(to surface: ghostty_surface_t) -> Bool {
         var keyEvent = ghostty_input_key_s()
         keyEvent.action = GHOSTTY_ACTION_PRESS
         keyEvent.keycode = 36 // kVK_Return

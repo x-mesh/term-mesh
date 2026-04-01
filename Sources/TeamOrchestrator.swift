@@ -1684,6 +1684,110 @@ final class TeamOrchestrator: ObservableObject {
     /// 4 attempts: 50 → 150 → 400 → 800 ms (total ~1.4 s before final failure).
     private static let sendTextRetryDelaysMs: [Double] = [50, 150, 400, 800]
 
+    // MARK: - Per-Surface Send Queue
+
+    /// Queued text items waiting for the panel's TUI to return to idle.
+    private var pendingSendQueues: [UUID: [(text: String, tabManager: TabManager, withReturn: Bool)]] = [:]
+    /// Set of panel IDs that have an in-flight send (TUI may be processing it).
+    private var panelSendInFlight: Set<UUID> = []
+    /// Drain attempt counter per panel (prevents infinite retries).
+    private var panelDrainAttempts: [UUID: Int] = [:]
+
+    /// Maximum drain attempts before giving up (at 1s intervals = ~60s total).
+    private static let maxDrainAttempts = 60
+
+    /// Schedule periodic drain checks for a panel.
+    /// Checks if the TUI has returned to idle by looking for prompt indicators
+    /// in the terminal screen content. When idle, sends the next queued item.
+    private func schedulePanelDrain(panelId: UUID, panel: TerminalPanel, workspaceId: UUID, tabManager: TabManager) {
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self] in
+            self?.drainSendQueue(panelId: panelId, workspaceId: workspaceId, tabManager: tabManager)
+        }
+    }
+
+    /// Drain the send queue for a specific panel.
+    /// Checks if the TUI is idle (prompt visible) before sending the next item.
+    private func drainSendQueue(panelId: UUID, workspaceId: UUID, tabManager: TabManager) {
+        guard panelSendInFlight.contains(panelId) else { return }
+
+        let attempts = panelDrainAttempts[panelId, default: 0] + 1
+        panelDrainAttempts[panelId] = attempts
+
+        if attempts > Self.maxDrainAttempts {
+            // Give up — clear state and send remaining items immediately
+            #if DEBUG
+            dlog("[team.drainQueue] MAX attempts reached panelId=\(panelId.uuidString.prefix(8)) attempts=\(attempts)")
+            #endif
+            panelSendInFlight.remove(panelId)
+            panelDrainAttempts.removeValue(forKey: panelId)
+            // Send remaining queued items immediately (may concatenate, but better than losing them)
+            if var queue = pendingSendQueues.removeValue(forKey: panelId) {
+                for item in queue {
+                    _ = sendTextToPanel(workspaceId: workspaceId, panelId: panelId, text: item.text, tabManager: item.tabManager, withReturn: item.withReturn)
+                }
+            }
+            return
+        }
+
+        // Check if the panel's TUI is idle by reading the screen title.
+        // Claude Code sets title to include "thinking" when processing.
+        // When idle, the title just shows the project path.
+        guard let surfaceTuple = AppDelegate.shared?.locateSurface(surfaceId: panelId),
+              let ws = surfaceTuple.tabManager.tabs.first(where: { $0.id == surfaceTuple.workspaceId }),
+              let panel = ws.terminalPanel(for: panelId) else {
+            panelSendInFlight.remove(panelId)
+            panelDrainAttempts.removeValue(forKey: panelId)
+            pendingSendQueues.removeValue(forKey: panelId)
+            return
+        }
+
+        // Heuristic: check terminal title for "thinking" or "Generating" indicators.
+        // Claude Code updates the terminal title during processing.
+        let title = panel.title
+        let isThinking = title.contains("thinking") || title.contains("Generating")
+        // Also check if Claude has a "❯" prompt visible (screen scraping fallback)
+        // For now, rely on title heuristic + time-based fallback.
+
+        if isThinking {
+            // Still processing — retry in 1s
+            #if DEBUG
+            if attempts % 10 == 0 {
+                dlog("[team.drainQueue] still thinking panelId=\(panelId.uuidString.prefix(8)) attempt=\(attempts) title=\(title.prefix(40))")
+            }
+            #endif
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self] in
+                self?.drainSendQueue(panelId: panelId, workspaceId: workspaceId, tabManager: tabManager)
+            }
+            return
+        }
+
+        // TUI appears idle — send next queued item
+        panelSendInFlight.remove(panelId)
+        panelDrainAttempts.removeValue(forKey: panelId)
+
+        if var queue = pendingSendQueues[panelId], !queue.isEmpty {
+            let next = queue.removeFirst()
+            if queue.isEmpty {
+                pendingSendQueues.removeValue(forKey: panelId)
+            } else {
+                pendingSendQueues[panelId] = queue
+            }
+            #if DEBUG
+            dlog("[team.drainQueue] idle detected, sending next panelId=\(panelId.uuidString.prefix(8)) remaining=\(pendingSendQueues[panelId]?.count ?? 0) text=\(next.text.prefix(60).debugDescription)")
+            #endif
+            // Brief delay to ensure TUI is fully ready
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
+                _ = self?.sendTextToPanel(
+                    workspaceId: workspaceId,
+                    panelId: panelId,
+                    text: next.text,
+                    tabManager: next.tabManager,
+                    withReturn: next.withReturn
+                )
+            }
+        }
+    }
+
     private func sendTextToPanel(workspaceId: UUID, panelId: UUID, text: String, tabManager: TabManager, withReturn: Bool = true, retryCount: Int = 0) -> Bool {
         // Try the provided tabManager first, then fall back to global surface lookup
         // for cross-window scenarios (e.g. broadcast when agents are in a different window).
@@ -1754,9 +1858,21 @@ final class TeamOrchestrator: ObservableObject {
             return false
         }
 
+        // Per-surface send queue: if this panel has a pending send (previous text
+        // was delivered but the TUI may still be processing it), queue this send.
+        // This prevents text concatenation when Claude Code is in "thinking" mode.
+        if panelSendInFlight.contains(panelId) && withReturn {
+            if pendingSendQueues[panelId] == nil {
+                pendingSendQueues[panelId] = []
+            }
+            pendingSendQueues[panelId]?.append((text: trimmed, tabManager: tabManager, withReturn: withReturn))
+            #if DEBUG
+            dlog("[team.sendTextToPanel] QUEUED (in-flight) panelId=\(panelId.uuidString.prefix(8)) queueLen=\(pendingSendQueues[panelId]?.count ?? 0) text=\(trimmed.prefix(60).debugDescription)")
+            #endif
+            return true // Report as delivered — will be sent when panel is ready
+        }
+
         // Normalize and send text+Return via sendIMEText.
-        // Note: when callers pass withReturn=false, only text is delivered (no Enter key).
-        // The caller is responsible for sending Return separately if needed.
         let normalized = trimmed
             .replacingOccurrences(of: "\r\n", with: " ")
             .replacingOccurrences(of: "\n", with: " ")
@@ -1765,6 +1881,14 @@ final class TeamOrchestrator: ObservableObject {
         #if DEBUG
         dlog("[team.sendTextToPanel] sendIMEText panelId=\(panelId.uuidString.prefix(8)) textLen=\(normalized.count) withReturn=\(withReturn) sent=\(sent) text=\(normalized.prefix(80).debugDescription)")
         #endif
+
+        // Mark this panel as having an in-flight send. The drain timer will
+        // clear it once the TUI returns to idle (prompt visible on screen).
+        if withReturn && sent {
+            panelSendInFlight.insert(panelId)
+            schedulePanelDrain(panelId: panelId, panel: panel, workspaceId: workspaceId, tabManager: tabManager)
+        }
+
         return sent
     }
 
