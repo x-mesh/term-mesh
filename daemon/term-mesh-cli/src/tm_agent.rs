@@ -1637,10 +1637,27 @@ fn main() {
                     return;
                 }
             }
-            print_result(rpc_call(&sock, "team.send", json!({
+            let send_result = rpc_call(&sock, "team.send", json!({
                 "team_name": team, "agent_name": target,
                 "text": format!("{text}\n"),
-            })));
+            }));
+            // Send Return key via team.send_key (reliable sendNamedKey path)
+            if let Ok(ref r) = send_result {
+                if r["result"]["text_delivered"].as_bool().unwrap_or(false) {
+                    std::thread::sleep(Duration::from_millis(150));
+                    for attempt in 0..5u32 {
+                        match rpc_call(&sock, "team.send_key", json!({
+                            "team_name": team, "agent_name": target, "key": "return",
+                        })) {
+                            Ok(r) if r["ok"].as_bool().unwrap_or(false) => break,
+                            _ => if attempt < 4 {
+                                std::thread::sleep(Duration::from_millis(200 * (attempt as u64 + 1)));
+                            },
+                        }
+                    }
+                }
+            }
+            print_result(send_result);
             return;
         }
         Commands::Broadcast { text, no_report } => {

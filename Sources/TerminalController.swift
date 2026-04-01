@@ -2147,7 +2147,8 @@ class TerminalController {
             let tabManager = TeamOrchestrator.shared.resolveTabManager(teamName: teamName) ?? self.tabManager
             guard let tabManager else { return false }
             return TeamOrchestrator.shared.sendToAgent(
-                teamName: teamName, agentName: agentName, text: text, tabManager: tabManager
+                teamName: teamName, agentName: agentName, text: text, tabManager: tabManager,
+                withReturn: false // Return is sent separately by Rust CLI via team.send_key
             )
         }
         return success
