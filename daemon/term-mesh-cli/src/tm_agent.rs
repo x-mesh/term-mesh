@@ -2576,8 +2576,10 @@ fn run_delegate(
     }
 }
 
-/// Delegate a task in autonomous mode: spawn a temporary headless subprocess
-/// that runs without team flags (no leader approval), executes the task, and exits.
+/// Delegate a task in autonomous mode: spawn a temporary Claude subprocess
+/// directly from the CLI (no daemon required). The subprocess runs without
+/// team flags (--agent-id etc.), so no leader approval is needed for edits.
+/// It uses `claude -p` (print mode) for single-shot execution.
 fn run_delegate_autonomous(
     sock: &PathBuf, team: &str, target: &str, text: &str,
     title: Option<String>, priority: Option<u32>, no_report: bool,
@@ -2615,66 +2617,114 @@ fn run_delegate_autonomous(
         Err(_) => "sonnet".to_string(),
     };
 
-    // Step 4: Spawn headless subprocess via daemon
-    let daemon_sock = match detect_daemon_socket() {
-        Some(s) => s,
-        None => {
-            eprintln!("Error: --autonomous requires the term-mesh daemon. No daemon socket found.");
+    // Step 4: Resolve claude binary path
+    let claude_path = env::var("CLAUDE_PATH").ok()
+        .or_else(|| {
+            // Check versioned installs
+            let versions_dir = format!("{}/.local/share/claude/versions",
+                env::var("HOME").unwrap_or_default());
+            if let Ok(entries) = std::fs::read_dir(&versions_dir) {
+                let mut paths: Vec<_> = entries.filter_map(|e| e.ok())
+                    .filter(|e| e.path().join("claude").exists())
+                    .collect();
+                paths.sort_by_key(|e| e.path());
+                paths.last().map(|e| e.path().join("claude").to_string_lossy().to_string())
+            } else {
+                None
+            }
+        })
+        .unwrap_or_else(|| "claude".to_string());
+
+    // Step 5: Spawn claude subprocess directly (no team flags → no leader approval)
+    let app_socket = env::var("TERMMESH_SOCKET").unwrap_or_default();
+    let working_dir = env::current_dir().unwrap_or_default();
+
+    eprintln!("  Autonomous mode: spawning claude subprocess for task {}", &task_id[..8.min(task_id.len())]);
+
+    let child = std::process::Command::new(&claude_path)
+        .arg("-p")  // print mode: single-shot execution
+        .arg("--dangerously-skip-permissions")
+        .arg("--model")
+        .arg(&model)
+        .arg(&instruction)
+        .env("TERMMESH_SOCKET", &app_socket)
+        .env("TERMMESH_TEAM", team)
+        .env("TERMMESH_AGENT_NAME", target)
+        .env("TERMMESH_AGENT_ID", format!("{target}@{team}"))
+        .env_remove("CLAUDECODE")
+        .env_remove("CLAUDE_CODE_ENTRYPOINT")
+        .current_dir(&working_dir)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn();
+
+    let mut child = match child {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("Error: failed to spawn claude: {e}");
+            eprintln!("  Tried path: {claude_path}");
             process::exit(1);
         }
     };
 
-    // Get the app socket path for TERMMESH_SOCKET (so the subprocess can use tm-agent reply)
-    let app_socket = env::var("TERMMESH_SOCKET").ok();
-
-    // Use a unique name for the headless subprocess to avoid collision with the GUI panel agent.
-    // agent_name_override ensures TERMMESH_AGENT_NAME=target so tm-agent reply routes correctly.
-    let headless_name = format!("{}_auto_{}", target, &task_id[..8.min(task_id.len())]);
-    let spawn_params = json!({
-        "name": headless_name,
-        "team_name": team,
-        "model": model,
-        "working_directory": env::current_dir().unwrap_or_default().to_string_lossy().to_string(),
-        "app_socket_path": app_socket,
-        "agent_name_override": target,
-        "instructions": format!(
-            "You are agent '{}' running in autonomous mode (no approval needed for file edits).\n\
-             Complete the task below and report your results using: tm-agent reply '<summary>'",
-            target
-        ),
-    });
-
-    let spawn_result = rpc_call(&daemon_sock, "headless.spawn", spawn_params);
-    let agent_id = match &spawn_result {
-        Ok(v) if !v["result"]["id"].is_null() => v["result"]["id"].as_str().unwrap_or("").to_string(),
-        Ok(v) => { eprintln!("Error spawning autonomous agent: {}", pretty(v)); process::exit(1); }
-        Err(e) => { eprintln!("Error spawning autonomous agent: {e}"); process::exit(1); }
-    };
-
-    eprintln!("  Autonomous mode: spawned headless subprocess {agent_id}");
-
-    // Step 5: Send instruction to the headless subprocess
-    // Small delay for the subprocess to initialize
-    std::thread::sleep(Duration::from_millis(500));
-    let send_result = rpc_call(&daemon_sock, "headless.send", json!({
-        "agent_id": agent_id,
-        "text": format!("{instruction}\n"),
-    }));
-    if let Err(e) = &send_result {
-        eprintln!("  Warning: failed to send instruction to autonomous agent: {e}");
-    }
-
-    // Output result (task info + autonomous flag)
+    // Output task info immediately (don't wait for subprocess to finish)
     println!("{}", pretty(&json!({
         "ok": true,
         "result": {
             "task": task,
             "sent": true,
-            "text_delivered": send_result.is_ok(),
+            "text_delivered": true,
             "autonomous": true,
-            "headless_agent_id": agent_id,
         }
     })));
+
+    // Step 6: Wait for subprocess in background, then auto-complete the task
+    let sock_path = sock.clone();
+    let team_str = team.to_string();
+    let target_str = target.to_string();
+    let task_id_clone = task_id.clone();
+
+    std::thread::spawn(move || {
+        let output = child.wait_with_output();
+        match output {
+            Ok(out) => {
+                let stdout = String::from_utf8_lossy(&out.stdout);
+                let stderr = String::from_utf8_lossy(&out.stderr);
+                let result_text = if stdout.trim().is_empty() {
+                    format!("(autonomous task completed, exit={}) stderr: {}",
+                        out.status.code().unwrap_or(-1), &stderr[..stderr.len().min(500)])
+                } else {
+                    stdout[..stdout.len().min(2000)].to_string()
+                };
+
+                // Write result file
+                write_result_file(&team_str, &task_id_clone, &result_text);
+                write_result_file(&team_str, &format!("{}-reply", target_str), &result_text);
+
+                // Auto-complete the task via RPC
+                let _ = rpc_call(&sock_path, "team.report", json!({
+                    "team_name": team_str,
+                    "agent_name": target_str,
+                    "content": &result_text[..result_text.len().min(1500)],
+                }));
+                let _ = rpc_call(&sock_path, "team.task.update", json!({
+                    "team_name": team_str,
+                    "task_id": task_id_clone,
+                    "status": "completed",
+                    "result": &result_text[..result_text.len().min(1500)],
+                }));
+
+                if out.status.success() {
+                    eprintln!("  Autonomous task {} completed successfully", &task_id_clone[..8.min(task_id_clone.len())]);
+                } else {
+                    eprintln!("  Autonomous task {} failed (exit={})", &task_id_clone[..8.min(task_id_clone.len())], out.status.code().unwrap_or(-1));
+                }
+            }
+            Err(e) => {
+                eprintln!("  Autonomous task {} error: {e}", &task_id_clone[..8.min(task_id_clone.len())]);
+            }
+        }
+    });
 }
 
 fn run_fan_out(
