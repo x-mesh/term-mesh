@@ -76,7 +76,13 @@ tm-agent status
 
    예: `--preset quick` (base_timeout=60) → red-team attack wait = 90초, broadcast wait = 90초.
 
-6. **자율 실행 모드 (Autonomous Mode)** — 에이전트가 파일을 직접 수정해야 하는 전략에서는 `tm-agent delegate --autonomous`를 사용한다. 이 모드는 임시 headless 프로세스를 spawn하여 리더 승인 없이 파일 편집이 가능하다.
+6. **자율 실행 모드 (Autonomous Mode)** — 에이전트가 파일을 직접 수정해야 하는 전략에서는 `tm-agent delegate --autonomous`를 사용한다. 이 모드는 임시 `claude -p` 서브프로세스를 spawn하여 리더 승인 없이 파일 편집이 가능하다.
+
+   **호출 규칙**:
+   - autonomous delegate는 반드시 **background로 실행**한다: `tm-agent delegate <agent> '...' --autonomous &`
+   - `tm-agent`는 claude 서브프로세스 완료까지 대기하며 task를 자동 완료한다 (thread join).
+   - 결과 파일: `~/.term-mesh/results/<team>/<task_id>.md` 및 `<agent>-reply.md`에 자동 기록된다.
+   - 병렬 실행 시 여러 `&` 명령을 동시에 실행하고, `tm-agent task list`로 completion을 폴링한다.
 
    **자율 실행이 필요한 경우** (파일 수정):
    - `distribute`: 모든 에이전트 → `--autonomous`
@@ -87,8 +93,6 @@ tm-agent status
    - `refine`, `tournament`, `brainstorm`, `council`: 모든 에이전트 → 기본 모드
    - `review`, `red-team` attackers: 모든 에이전트 → 기본 모드
    - `chain`: explorer, reviewer, architect 역할 → 기본 모드
-
-   autonomous 에이전트도 `tm-agent reply`로 결과를 보고하며, 태스크 추적은 동일하게 동작한다.
 
 ## Context Injection
 

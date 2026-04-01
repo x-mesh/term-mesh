@@ -952,6 +952,27 @@ fn task_title_from_text(text: &str) -> String {
     }
 }
 
+/// Format instruction for autonomous mode: task context + instruction only.
+/// No lifecycle commands (task start/done/reply) since the detached monitor handles completion.
+fn format_autonomous_instruction(
+    task: &Value, instruction: &str, context: Option<&str>,
+) -> String {
+    let mut lines = vec![
+        format!("[TASK_ID] {}", task["id"].as_str().unwrap_or("")),
+        format!("[TASK_TITLE] {}", task["title"].as_str().unwrap_or("")),
+    ];
+    if let Some(ctx) = context {
+        let truncated = truncate_summary(ctx, 3000);
+        lines.push(String::new());
+        lines.push("[PRIOR_CONTEXT]".to_string());
+        lines.push(truncated);
+        lines.push("[/PRIOR_CONTEXT]".to_string());
+    }
+    lines.push(String::new());
+    lines.push(instruction.trim().to_string());
+    lines.join("\n")
+}
+
 fn format_task_instruction(
     sock: &PathBuf, team: &str,
     task: &Value, instruction: &str, no_report: bool,
@@ -2602,8 +2623,9 @@ fn run_delegate_autonomous(
     };
     let task_id = task["id"].as_str().unwrap_or("").to_string();
 
-    // Step 2: Format instruction with task context
-    let instruction = format_task_instruction(sock, team, &task, text, no_report, context, fix_budget);
+    // Step 2: Format instruction for autonomous mode (no lifecycle commands, no report suffix).
+    // The monitor process handles task completion and result reporting.
+    let instruction = format_autonomous_instruction(&task, text, context);
 
     // Step 3: Get agent model from team status
     let model = match rpc_call(sock, "team.status", json!({ "team_name": team })) {
@@ -2636,10 +2658,20 @@ fn run_delegate_autonomous(
         .unwrap_or_else(|| "claude".to_string());
 
     // Step 5: Spawn claude subprocess directly (no team flags → no leader approval)
+    // stdout goes to a temp file so a detached monitor process can read it after tm-agent exits.
     let app_socket = env::var("TERMMESH_SOCKET").unwrap_or_default();
     let working_dir = env::current_dir().unwrap_or_default();
 
     eprintln!("  Autonomous mode: spawning claude subprocess for task {}", &task_id[..8.min(task_id.len())]);
+
+    // Create temp file for capturing stdout
+    let results_dir = format!("{}/.term-mesh/results/{}", env::var("HOME").unwrap_or_default(), team);
+    let _ = std::fs::create_dir_all(&results_dir);
+    let stdout_file_path = format!("{}/autonomous-{}.stdout", results_dir, &task_id[..8.min(task_id.len())]);
+    let stdout_file = match std::fs::File::create(&stdout_file_path) {
+        Ok(f) => f,
+        Err(e) => { eprintln!("Error creating stdout file: {e}"); process::exit(1); }
+    };
 
     let child = std::process::Command::new(&claude_path)
         .arg("-p")  // print mode: single-shot execution
@@ -2654,18 +2686,21 @@ fn run_delegate_autonomous(
         .env_remove("CLAUDECODE")
         .env_remove("CLAUDE_CODE_ENTRYPOINT")
         .current_dir(&working_dir)
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
+        .stdout(stdout_file)
+        .stderr(std::process::Stdio::null())
         .spawn();
 
-    let mut child = match child {
+    let child = match child {
         Ok(c) => c,
         Err(e) => {
             eprintln!("Error: failed to spawn claude: {e}");
             eprintln!("  Tried path: {claude_path}");
+            let _ = std::fs::remove_file(&stdout_file_path);
             process::exit(1);
         }
     };
+
+    let child_pid = child.id();
 
     // Output task info immediately (don't wait for subprocess to finish)
     println!("{}", pretty(&json!({
@@ -2675,56 +2710,58 @@ fn run_delegate_autonomous(
             "sent": true,
             "text_delivered": true,
             "autonomous": true,
+            "pid": child_pid,
         }
     })));
 
-    // Step 6: Wait for subprocess in background, then auto-complete the task
+    // Step 6: Wait for claude subprocess in a background thread, then auto-complete the task.
+    // The thread runs inside this tm-agent process (which is a descendant of term-mesh),
+    // so RPC calls pass the socket's isDescendant() access check.
+    // The caller should invoke `tm-agent delegate --autonomous &` to avoid blocking.
     let sock_path = sock.clone();
     let team_str = team.to_string();
     let target_str = target.to_string();
     let task_id_clone = task_id.clone();
+    let stdout_path_clone = stdout_file_path.clone();
+    let results_dir_clone = results_dir.clone();
 
-    std::thread::spawn(move || {
-        let output = child.wait_with_output();
-        match output {
-            Ok(out) => {
-                let stdout = String::from_utf8_lossy(&out.stdout);
-                let stderr = String::from_utf8_lossy(&out.stderr);
-                let result_text = if stdout.trim().is_empty() {
-                    format!("(autonomous task completed, exit={}) stderr: {}",
-                        out.status.code().unwrap_or(-1), &stderr[..stderr.len().min(500)])
-                } else {
-                    stdout[..stdout.len().min(2000)].to_string()
-                };
+    let handle = std::thread::spawn(move || {
+        // Wait for the claude subprocess to finish
+        let mut child_inner = child;
+        let status = child_inner.wait();
+        let exit_code = status.as_ref().map(|s| s.code().unwrap_or(-1)).unwrap_or(-1);
 
-                // Write result file
-                write_result_file(&team_str, &task_id_clone, &result_text);
-                write_result_file(&team_str, &format!("{}-reply", target_str), &result_text);
-
-                // Auto-complete the task via RPC
-                let _ = rpc_call(&sock_path, "team.report", json!({
-                    "team_name": team_str,
-                    "agent_name": target_str,
-                    "content": &result_text[..result_text.len().min(1500)],
-                }));
-                let _ = rpc_call(&sock_path, "team.task.update", json!({
-                    "team_name": team_str,
-                    "task_id": task_id_clone,
-                    "status": "completed",
-                    "result": &result_text[..result_text.len().min(1500)],
-                }));
-
-                if out.status.success() {
-                    eprintln!("  Autonomous task {} completed successfully", &task_id_clone[..8.min(task_id_clone.len())]);
-                } else {
-                    eprintln!("  Autonomous task {} failed (exit={})", &task_id_clone[..8.min(task_id_clone.len())], out.status.code().unwrap_or(-1));
-                }
-            }
-            Err(e) => {
-                eprintln!("  Autonomous task {} error: {e}", &task_id_clone[..8.min(task_id_clone.len())]);
-            }
+        // Copy stdout file to result files
+        let stdout_content = std::fs::read_to_string(&stdout_path_clone).unwrap_or_default();
+        if !stdout_content.trim().is_empty() {
+            let task_result_path = format!("{}/{}.md", results_dir_clone, task_id_clone);
+            let agent_reply_path = format!("{}/{}-reply.md", results_dir_clone, target_str);
+            let _ = std::fs::write(&task_result_path, &stdout_content);
+            let _ = std::fs::write(&agent_reply_path, &stdout_content);
         }
+        let _ = std::fs::remove_file(&stdout_path_clone);
+
+        // Auto-complete the task via RPC
+        let completion_msg = format!("autonomous task {} completed (exit={})", task_id_clone, exit_code);
+        let _ = rpc_call(&sock_path, "team.report", json!({
+            "team_name": team_str,
+            "agent_name": target_str,
+            "content": &completion_msg,
+        }));
+        let _ = rpc_call(&sock_path, "team.task.update", json!({
+            "team_name": team_str,
+            "task_id": task_id_clone,
+            "status": "completed",
+            "result": &completion_msg,
+        }));
+
+        eprintln!("  Autonomous task {} completed (exit={})", &task_id_clone[..8.min(task_id_clone.len())], exit_code);
     });
+
+    // Wait for the background thread to finish.
+    // This means tm-agent stays alive until claude -p exits.
+    // The caller should use `tm-agent delegate --autonomous &` to avoid blocking.
+    let _ = handle.join();
 }
 
 fn run_fan_out(
