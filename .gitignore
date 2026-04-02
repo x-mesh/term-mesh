@@ -51,6 +51,7 @@ tmp-*/
 daemon/target/
 
 # OMC (oh-my-claudecode) state
-.omc/Sources/BuildInfo.swift
+.omc/
+daemon/.omc/
 .xm/
 daemon/.xm/

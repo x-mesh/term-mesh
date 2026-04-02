@@ -1,7 +1,0 @@
-{
-  "tool_name": "Bash",
-  "tool_input_preview": "{\"command\":\"sleep 120 && tm-agent task get f0d07b6d --json 2>/dev/null | python3 -c \\\"import sys,json; d=json.load(sys.stdin); print(f'executor: {d[\\\\\\\"result\\\\\\\"][\\\\\\\"status\\\\\\\"]}')\\\" && tm-agent tas...",
-  "error": "Exit code 1\nTraceback (most recent call last):\n  File \"<string>\", line 1, in <module>\n    import sys,json; d=json.load(sys.stdin); print(f'executor: {d[\"result\"][\"status\"]}')\n                       ~~~~~~~~~^^^^^^^^^^^\n  File \"/opt/homebrew/Cellar/python@3.14/3.14.3_1/Frameworks/Python.framework/Versions/3.14/lib/python3.14/json/__init__.py\", line 298, in load\n    return loads(fp.read(),\n        cls=cls, object_hook=object_hook,\n        parse_float=parse_float, parse_int=parse_int,\n        parse...",
-  "timestamp": "2026-03-18T01:52:16.463Z",
-  "retry_count": 1
-}

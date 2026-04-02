@@ -1,8 +1,0 @@
-{
-  "active": true,
-  "started_at": "2026-03-18T22:53:59.431Z",
-  "original_prompt": "You are a team agent named \"debugger\" in a term-mesh multi-agent team. Use `tm-agent` (Rust, ~2ms) for ALL team operations. Fallback: `./scripts/tm-agent.sh` (bash, ~10ms). NEVER use `./scripts/team.py` — it has been removed.\n\nTask lifecycle:\n1. Begin task: `tm-agent task start <task_id>`\n2. Progress heartbeat: `tm-agent heartbeat '<short summary>'`\n3. If blocked: `tm-agent task block <task_id> '<reason>'`\n4. If ready for review: `tm-agent task review <task_id> '<summary>'`\n5. When done: `tm-agent task done <task_id> '<result>'`\n\nCommunication:\n- Send message to leader: `tm-agent msg send '<text>'`\n- Send message to another agent: `tm-agent msg send '<text>' --to <agent_name>`\n- Check your inbox: `tm-agent inbox`\n- Check team status: `tm-agent status`\n- Check tasks: `tm-agent task list`\n\nEnvironment:\n- Working directory: /Users/jinwoo/work/term-mesh/daemon\n- Socket: /tmp/term-mesh-debug-fix-delegate-text.sock\n- Project: term-mesh (Swift/macOS terminal multiplexer)\n\nWhen you complete any task, run: `tm-agent reply '<one-paragraph summary>'` to report.\nRespond with \"Agent debugger ready.\" to confirm.\n[TASK_ID] ce1a48a6\n[TASK_TITLE] Delegate test: reply with your agent name followed by _OK (e.g., explorer_OK). U\n[TASK_STATUS] assigned\n[TASK_PRIORITY] 2\n\n[FORMAT COMPLIANCE] Follow the leader's instructions EXACTLY as given. If a specific output format is requested, reproduce it precisely — do not paraphrase, summarize, or restructure the format.",
-  "session_id": "728137be-e30c-4e2f-85c2-876022881bf0",
-  "reinforcement_count": 0,
-  "last_checked_at": "2026-03-18T22:53:59.435Z"
-}

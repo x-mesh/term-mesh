@@ -1,7 +1,0 @@
-{
-  "tool_name": "Read",
-  "tool_input_preview": "{\"file_path\":\"/tmp/nonexistent/file.txt\"}",
-  "error": "File does not exist. Note: your current working directory is /Users/jinwoo/work/term-mesh/daemon.",
-  "timestamp": "2026-04-01T01:35:58.365Z",
-  "retry_count": 1
-}
