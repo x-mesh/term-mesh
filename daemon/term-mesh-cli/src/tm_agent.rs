@@ -1476,7 +1476,11 @@ fn main() {
             // Compact version check: "app_sha:cli_sha" + match flag
             let version_info = if let Ok(info) = rpc_call(&sock, "system.info", json!({})) {
                 let app_sha = info["result"]["git_sha"].as_str().unwrap_or("?");
-                let matched = app_sha == GIT_SHA || app_sha == "?" || app_sha.is_empty();
+                let matched = if app_sha == "?" || app_sha.is_empty() {
+                    Value::Null // app version unknown — can't determine match
+                } else {
+                    Value::Bool(app_sha == GIT_SHA)
+                };
                 json!({ "app": app_sha, "cli": GIT_SHA, "ok": matched })
             } else {
                 json!({ "cli": GIT_SHA, "ok": null })
