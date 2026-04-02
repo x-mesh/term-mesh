@@ -288,6 +288,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
             daemon.startDaemon()
         }
 
+        // Fix initial terminal size: the first surface may be created before SwiftUI
+        // finishes layout (sidebar, titlebar). After a brief delay, force all visible
+        // surfaces to recalculate their size so SIGWINCH corrects the column count.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
+            guard let self else { return }
+            for (_, context) in self.mainWindowContexts {
+                for tab in context.tabManager.tabs {
+                    for (_, panel) in tab.panels {
+                        if let terminalPanel = panel as? TerminalPanel {
+                            terminalPanel.surface.forceRefresh()
+                        }
+                    }
+                }
+            }
+        }
+
         // Install Claude slash commands from bundle to ~/.claude/commands/
         if !isRunningUnderXCTest {
             DispatchQueue.global(qos: .utility).async {
