@@ -1471,14 +1471,19 @@ fn main() {
         Commands::Status => {
             // Fetch app version info and check for CLI/app mismatch
             if let Ok(info) = rpc_call(&sock, "system.info", json!({})) {
-                if let Some(app_sha) = info["result"]["git_sha"].as_str() {
-                    if !app_sha.is_empty() && app_sha != "?" && app_sha != GIT_SHA {
-                        eprintln!("⚠ Version mismatch: CLI={} ({}) App={} ({})",
-                            env!("CARGO_PKG_VERSION"), GIT_SHA,
-                            info["result"]["app_version"].as_str().unwrap_or("?"), app_sha);
-                        eprintln!("  Run: make deploy-prod  (or ./scripts/reloadp.sh)");
-                    }
+                let app_ver = info["result"]["app_version"].as_str().unwrap_or("?");
+                let app_sha = info["result"]["git_sha"].as_str().unwrap_or("?");
+                let app_build = info["result"]["build_number"].as_str().unwrap_or("?");
+                if !app_sha.is_empty() && app_sha != "?" && app_sha != GIT_SHA {
+                    eprintln!("⚠ Version mismatch!");
+                    eprintln!("  CLI: {} ({})", env!("CARGO_PKG_VERSION"), GIT_SHA);
+                    eprintln!("  App: {} build {} ({})", app_ver, app_build, app_sha);
+                    eprintln!("  Fix: make deploy-prod");
+                } else {
+                    eprintln!("✓ App {} ({}) CLI {} ({})", app_ver, app_sha, env!("CARGO_PKG_VERSION"), GIT_SHA);
                 }
+            } else {
+                eprintln!("⚠ Cannot reach app (system.info failed) — CLI {} ({})", env!("CARGO_PKG_VERSION"), GIT_SHA);
             }
             rpc_call(&sock, "team.status", json!({ "team_name": team }))
         }
