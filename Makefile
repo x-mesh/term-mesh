@@ -27,6 +27,8 @@ PROJECT_DIR   := $(shell pwd)
 .PHONY: build prod deploy deploy-prod dmg run stop clean daemon test install-commands
 
 build:
+	@echo "==> Generating BuildInfo.swift..."
+	@./scripts/generate-build-info.sh
 	@echo "==> Building Xcode (Debug)..."
 	@xcodebuild \
 		-project GhosttyTabs.xcodeproj \
@@ -108,6 +110,8 @@ stop:
 	@echo "==> Stopped"
 
 prod:
+	@echo "==> Generating BuildInfo.swift..."
+	@./scripts/generate-build-info.sh
 	@echo "==> Building Xcode (Release)..."
 	@xcodebuild \
 		-project GhosttyTabs.xcodeproj \
