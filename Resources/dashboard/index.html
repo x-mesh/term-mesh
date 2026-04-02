@@ -1126,8 +1126,30 @@
   </div>
 
   <!-- Team Overview -->
-  <div class="card full" id="team-overview-card" style="display:none">
-    <h2>Team Overview</h2>
+  <div class="card full" id="team-overview-card">
+    <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:10px">
+      <h2>Team Overview</h2>
+      <div style="display:flex;gap:6px">
+        <button onclick="showCreateTeamForm()" style="font-size:11px;padding:4px 12px;border-radius:5px;border:1px solid var(--accent);background:rgba(34,211,238,0.08);color:var(--accent);cursor:pointer;font-weight:600">+ Create Team</button>
+        <button onclick="destroyTeam()" id="destroy-team-btn" style="display:none;font-size:11px;padding:4px 12px;border-radius:5px;border:1px solid var(--danger);background:rgba(248,113,113,0.08);color:var(--danger);cursor:pointer;font-weight:600">Destroy</button>
+      </div>
+    </div>
+    <div id="create-team-form" style="display:none;margin-bottom:12px;padding:12px;border:1px solid var(--border);border-radius:8px;background:var(--surface)">
+      <div style="display:flex;gap:8px;align-items:end;flex-wrap:wrap">
+        <label style="font-size:11px;color:var(--text-dim)">Agents
+          <input id="ct-count" type="number" min="1" max="10" value="2" style="display:block;width:60px;padding:4px 8px;border:1px solid var(--border);border-radius:5px;background:var(--bg);color:var(--text);font-size:12px;margin-top:2px">
+        </label>
+        <label style="font-size:11px;color:var(--text-dim)">Model
+          <select id="ct-model" style="display:block;padding:4px 8px;border:1px solid var(--border);border-radius:5px;background:var(--bg);color:var(--text);font-size:12px;margin-top:2px">
+            <option value="sonnet">sonnet</option>
+            <option value="haiku">haiku</option>
+            <option value="opus">opus</option>
+          </select>
+        </label>
+        <button onclick="createTeam()" style="padding:5px 16px;border-radius:5px;border:none;background:var(--accent);color:#000;font-size:12px;font-weight:600;cursor:pointer">Create</button>
+        <button onclick="document.getElementById('create-team-form').style.display='none'" style="padding:5px 12px;border-radius:5px;border:1px solid var(--border);background:transparent;color:var(--text-dim);font-size:12px;cursor:pointer">Cancel</button>
+      </div>
+    </div>
     <div id="team-overview" class="team-overview-grid"><div class="empty">No active teams</div></div>
   </div>
 
@@ -2226,11 +2248,12 @@ function renderTeamOverview() {
   const teams = _cachedTeams || [];
   const card = document.getElementById('team-overview-card');
   const el = document.getElementById('team-overview');
+  const destroyBtn = document.getElementById('destroy-team-btn');
+  if (destroyBtn) destroyBtn.style.display = teams.length ? '' : 'none';
   if (!teams.length) {
-    card.style.display = 'none';
+    el.innerHTML = '<div class="empty">No active teams — click "Create Team" to start</div>';
     return;
   }
-  card.style.display = '';
   el.innerHTML = teams.map(team => {
     const agents = (team.agents || []).map(agent => {
       const status = deriveTeamAgentStatus(agent);
@@ -2957,6 +2980,38 @@ async function ackMessage(msgId) {
     });
     if (_selectedMsgAgent) selectMsgAgent(_selectedMsgAgent);
   } catch (e) { console.error('[messages] ack error:', e); }
+}
+
+// ── Team Management GUI ──
+function showCreateTeamForm() {
+  document.getElementById('create-team-form').style.display = '';
+}
+async function createTeam() {
+  const count = parseInt(document.getElementById('ct-count').value) || 2;
+  const model = document.getElementById('ct-model').value;
+  const baseUrl = window.location.origin;
+  try {
+    const res = await fetch(baseUrl + '/api/team/teams', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({ count, model }),
+    });
+    const data = await res.json();
+    if (data.ok || res.ok) {
+      document.getElementById('create-team-form').style.display = 'none';
+    } else {
+      alert('Failed: ' + (data.error?.message || 'unknown'));
+    }
+  } catch(e) { alert('Error: ' + e.message); }
+}
+async function destroyTeam() {
+  if (!confirm('Destroy the active team?')) return;
+  const baseUrl = window.location.origin;
+  try {
+    const teams = _cachedTeams || [];
+    if (!teams.length) return;
+    await fetch(baseUrl + '/api/team/teams/' + encodeURIComponent(teams[0].team_name), { method: 'DELETE' });
+  } catch(e) { console.error('destroy error:', e); }
 }
 
 // ── Init ──
