@@ -642,7 +642,13 @@ class TabManager: ObservableObject {
         // Terminate any bound agent sessions before removing the workspace.
         // Bonsplit's didCloseTab delegate won't fire when the entire workspace is removed,
         // so we must explicitly close panels here.
-        for (_, panel) in workspace.panels {
+        for (panelId, panel) in workspace.panels {
+            // Clean up TerminalController singleton state for each surface.
+            // didCloseTab won't fire, so we must do it here.
+            if let tabId = workspace.surfaceIdFromPanelId(panelId) {
+                TerminalController.shared.v2CleanupSurface(tabId.uuid)
+            }
+            TerminalController.shared.v2CleanupSurface(panelId)
             panel.close()
         }
 

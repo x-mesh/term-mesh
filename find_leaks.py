@@ -1,71 +1,73 @@
 import os
-import sys
+import re
 
-def check_file(filepath):
-    with open(filepath, 'r', encoding='utf-8') as f:
-        content = f.read()
+sources_dir = 'Sources'
+results = []
 
-    results = []
+delegate_regex = re.compile(r'^\s*(?:@objc\s+)?(?:public\s+|private\s+|internal\s+|fileprivate\s+)?(?:lazy\s+)?var\s+\w*(?:[dD]elegate|[dD]ataSource)\s*:\s*[A-Z\[]', re.MULTILINE)
+
+timer_regex = re.compile(r'(?:Timer\.scheduledTimer|DispatchSource\.[a-zA-Z0-9_]+)[^{]*\{([^}]*)\}')
+notification_regex = re.compile(r'NotificationCenter\.default\.addObserver[^{]*\{([^}]*)\}')
+dispatch_regex = re.compile(r'DispatchQueue\.[^{]*\{([^}]*)\}')
+
+def analyze_file(filepath):
+    try:
+        with open(filepath, 'r', encoding='utf-8') as f:
+            content = f.read()
+    except Exception:
+        return
     
-    # 2. delegate 프로퍼티가 strong
-    import re
-    delegate_pattern = re.compile(r'^\s*(?:private\s+|public\s+|internal\s+)?(?:var|let)\s+[a-zA-Z0-9_]*delegate\b', re.MULTILINE | re.IGNORECASE)
-    for match in delegate_pattern.finditer(content):
-        line_num = content[:match.start()].count('\n') + 1
-        line = match.group(0).strip()
-        if 'weak' not in line:
-            results.append((line_num, line, 'delegate strong', 'low', 'weak로 선언'))
-
-    # 1. 클로저에서 [self] 강한 캡처 
-    # Search for common async/closure keywords and find the `{` block
-    keywords = [r'DispatchQueue\.[a-zA-Z0-9_().]+async(?:After)?(?:\([^)]*\))?', 
-                r'NotificationCenter\.default\.addObserver(?:\([^)]*\))?',
-                r'Timer\.scheduledTimer(?:\([^)]*\))?',
-                r'URLSession\.shared\.dataTask(?:\([^)]*\))?',
-                r'(?:\w+Completion|\w*handler|\w*Handler)\s*(?::|=|\()']
+    lines = content.split('\n')
     
-    for kw in keywords:
-        pattern = re.compile(kw + r'\s*\{', re.MULTILINE)
-        for match in pattern.finditer(content):
-            start_idx = match.end() - 1
-            # extract block
-            depth = 0
-            end_idx = start_idx
-            for i in range(start_idx, len(content)):
-                if content[i] == '{':
-                    depth += 1
-                elif content[i] == '}':
-                    depth -= 1
-                    if depth == 0:
-                        end_idx = i
-                        break
-            if depth != 0: continue
+    # 1. Delegate (missing weak)
+    for i, line in enumerate(lines):
+        if delegate_regex.search(line):
+            if 'weak ' not in line and 'unowned ' not in line:
+                results.append((filepath, i+1, "Delegate without weak", "High", line.strip()[:100]))
+    
+    def check_blocks(regex, name, severity):
+        for match in regex.finditer(content):
+            block_start = match.start(1)
+            # Find the closing brace of this block
+            brace_count = 1
+            block_end = block_start
+            while block_end < len(content) and brace_count > 0:
+                if content[block_end] == '{':
+                    brace_count += 1
+                elif content[block_end] == '}':
+                    brace_count -= 1
+                block_end += 1
             
-            block = content[start_idx:end_idx+1]
-            if 'self.' in block:
-                # check if there's [weak self] or [unowned self]
-                if '[weak self]' not in block and '[unowned self]' not in block:
-                    # check if the class/struct is actually a struct (can't easily do, but we report)
-                    # let's report it
-                    line_num = content[:start_idx].count('\n') + 1
-                    snippet = match.group(0).strip()
-                    results.append((line_num, snippet, f'클로저 strong self 캡처 ({kw.split(".")[0][:10]})', '중/높', '[weak self] 추가'))
+            block = content[block_start:block_end]
+            
+            if re.search(r'\bself\b', block):
+                # Check for [weak self] or [unowned self]
+                header_match = re.match(r'\s*\[([^\]]+)\]', block)
+                has_weak_self = False
+                if header_match:
+                    cap_list = header_match.group(1)
+                    if 'weak self' in cap_list or 'unowned self' in cap_list:
+                        has_weak_self = True
+                
+                if not has_weak_self:
+                    start_index = match.start()
+                    line_num = content.count('\n', 0, start_index) + 1
+                    snippet = lines[line_num-1].strip()[:100]
+                    # We might want to see if it's a known non-escaping closure, 
+                    # DispatchQueue async is escaping, Timer is escaping.
+                    results.append((filepath, line_num, name, severity, snippet))
 
-    # 4. escaping 클로저에서 self 캡처
-    # find functions with @escaping
-    escaping_pattern = re.compile(r'@escaping\s*\(?[^)]*\)?\s*->\s*[^,{]*')
-    # This is a bit complex. Let's just focus on the above which covers most closures.
+    check_blocks(timer_regex, "Timer Strong Capture", "High")
+    check_blocks(notification_regex, "NotificationCenter Strong Capture", "High")
+    check_blocks(dispatch_regex, "DispatchQueue Strong Capture", "Medium")
 
-    if results:
-        print(f"File: {filepath}")
-        for r in results:
-            print(f"  Line {r[0]}: {r[2]} - {r[1]} - {r[4]}")
+for root, _, files in os.walk(sources_dir):
+    for file in files:
+        if file.endswith('.swift'):
+            analyze_file(os.path.join(root, file))
 
-def main():
-    for root, dirs, files in os.walk('Sources'):
-        for file in files:
-            if file.endswith('.swift'):
-                check_file(os.path.join(root, file))
-
-if __name__ == '__main__':
-    main()
+results.sort(key=lambda x: (x[0], x[1]))
+print("| 파일명 | 라인번호 | 패턴 종류 | 위험도 | 코드 스니펫 |")
+print("|---|---|---|---|---|")
+for r in results:
+    print(f"| {r[0]} | {r[1]} | {r[2]} | {r[3]} | `{r[4]}` |")

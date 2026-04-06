@@ -329,6 +329,11 @@ extension Workspace: BonsplitDelegate {
             panel?.close()
         }
 
+        // Clean up TerminalController singleton state for this surface to prevent memory leaks.
+        // The tabId is the bonsplit tab ID which maps to the surface UUID used by v2 browser APIs.
+        TerminalController.shared.v2CleanupSurface(tabId.uuid)
+        TerminalController.shared.v2CleanupSurface(panelId)
+
         panels.removeValue(forKey: panelId)
         surfaceIdToPanelId.removeValue(forKey: tabId)
         panelDirectories.removeValue(forKey: panelId)

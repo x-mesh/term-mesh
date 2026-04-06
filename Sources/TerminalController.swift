@@ -111,6 +111,33 @@ class TerminalController {
 
     private init() {}
 
+    // MARK: - Surface Cleanup
+
+    /// Remove all v2 browser state associated with a closed surface.
+    /// Called from Workspace.didCloseTab to prevent unbounded dictionary growth.
+    func v2CleanupSurface(_ surfaceId: UUID) {
+        // SP1: Remove surfaceId-keyed browser dictionaries
+        v2BrowserFrameSelectorBySurface.removeValue(forKey: surfaceId)
+        v2BrowserInitScriptsBySurface.removeValue(forKey: surfaceId)
+        v2BrowserInitStylesBySurface.removeValue(forKey: surfaceId)
+        v2BrowserDialogQueueBySurface.removeValue(forKey: surfaceId)
+        v2BrowserDownloadEventsBySurface.removeValue(forKey: surfaceId)
+        v2BrowserUnsupportedNetworkRequestsBySurface.removeValue(forKey: surfaceId)
+
+        // SP3: Remove element refs belonging to this surface
+        let refsToRemove = v2BrowserElementRefs.filter { $0.value.surfaceId == surfaceId }.map(\.key)
+        for ref in refsToRemove {
+            v2BrowserElementRefs.removeValue(forKey: ref)
+        }
+
+        // SP2: Remove handle mappings for this surface UUID
+        for kind in V2HandleKind.allCases {
+            if let ref = v2RefByUUID[kind]?.removeValue(forKey: surfaceId) {
+                v2UUIDByRef[kind]?.removeValue(forKey: ref)
+            }
+        }
+    }
+
     nonisolated static func shouldSuppressSocketCommandActivation() -> Bool {
         socketCommandPolicyLock.lock()
         defer { socketCommandPolicyLock.unlock() }
