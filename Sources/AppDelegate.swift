@@ -480,6 +480,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
             guard let self else { return }
             self.isDisplayReconfigSuppressed = false
             NSApp.windows.forEach { $0.contentView?.isHidden = false }
+
+            // After unhiding, Ghostty's CVDisplayLink may still be dormant because
+            // the hide/unhide cycle doesn't trigger focus events.  Force-refresh all
+            // terminal surfaces so the Metal layer redraws immediately.
+            // Deferred one runloop turn so AppKit has finished layout after isHidden = false.
+            DispatchQueue.main.async { [weak self] in
+                guard let tabManager = self?.tabManager else { return }
+                for workspace in tabManager.tabs {
+                    for panel in workspace.panels.values {
+                        guard let terminalPanel = panel as? TerminalPanel else { continue }
+                        guard !terminalPanel.surface.renderingPaused else { continue }
+                        terminalPanel.surface.forceRefresh()
+                    }
+                }
+            }
         }
         displayReconfigSuppressionWorkItem = item
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.5, execute: item)
