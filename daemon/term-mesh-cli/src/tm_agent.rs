@@ -329,6 +329,75 @@ enum Commands {
         /// Focus hint for the research
         #[arg(long)]
         focus: Option<String>,
+        /// Skip post-research discussion phase
+        #[arg(long)]
+        no_discuss: bool,
+    },
+
+    /// Solve a problem collaboratively via board stigmergy
+    Solve {
+        /// Problem description
+        problem: String,
+        /// Number of agents to assign (0 = all idle)
+        #[arg(long, default_value_t = 0)]
+        agents: u32,
+        /// Number of solve rounds per agent
+        #[arg(long, default_value_t = 5)]
+        budget: u32,
+        /// Timeout in seconds
+        #[arg(long, default_value_t = 600)]
+        timeout: u64,
+        /// Verification command to check solution
+        #[arg(long)]
+        verify: Option<String>,
+        /// Target file/directory to focus on
+        #[arg(long)]
+        target: Option<String>,
+        /// Skip post-solve discussion phase
+        #[arg(long)]
+        no_discuss: bool,
+    },
+
+    /// Reach consensus on a question via board deliberation
+    Consensus {
+        /// Question to deliberate
+        question: String,
+        /// Number of agents to assign (0 = all idle)
+        #[arg(long, default_value_t = 0)]
+        agents: u32,
+        /// Number of deliberation rounds per agent
+        #[arg(long, default_value_t = 4)]
+        budget: u32,
+        /// Timeout in seconds
+        #[arg(long, default_value_t = 600)]
+        timeout: u64,
+        /// Comma-separated perspectives for agents
+        #[arg(long)]
+        perspectives: Option<String>,
+        /// Skip post-consensus discussion phase
+        #[arg(long)]
+        no_discuss: bool,
+    },
+
+    /// Execute emergent work via swarm task board
+    Swarm {
+        /// Goal to achieve
+        goal: String,
+        /// Number of agents to assign (0 = all idle)
+        #[arg(long, default_value_t = 0)]
+        agents: u32,
+        /// Number of rounds per agent
+        #[arg(long, default_value_t = 10)]
+        budget: u32,
+        /// Timeout in seconds
+        #[arg(long, default_value_t = 900)]
+        timeout: u64,
+        /// Comma-separated seed tasks
+        #[arg(long)]
+        seed: Option<String>,
+        /// Skip post-swarm discussion phase
+        #[arg(long)]
+        no_discuss: bool,
     },
 
     // ── Legacy hyphenated aliases (hidden) ───────────────────────────
@@ -1025,7 +1094,7 @@ fn select_agents(idle: Vec<AgentInfo>, requested: u32) -> (Vec<AgentInfo>, Optio
     if idle.is_empty() {
         return (
             Vec::new(),
-            Some("No idle claude agents. Create a team first: tm-agent create 3".to_string()),
+            Some("No idle agents. Create a team first: tm-agent create 3".to_string()),
         );
     }
 
@@ -1942,10 +2011,35 @@ fn main() {
             run_warmup(&sock, &team, target.as_deref(), timeout);
             return;
         }
-        Commands::Research { topic, agents, budget, timeout, depth, web, focus } => {
-            run_research(
-                &sock, &team, &topic, agents, budget, timeout,
-                &depth, web, focus.as_deref(),
+        Commands::Research { topic, agents, budget, timeout, depth, web, focus, no_discuss } => {
+            run_autonomous(
+                &sock, &team, "research", &topic, agents, budget, timeout,
+                &depth, web, focus.as_deref(), no_discuss,
+                None, None, None,
+            );
+            return;
+        }
+        Commands::Solve { problem, agents, budget, timeout, verify, target, no_discuss } => {
+            run_autonomous(
+                &sock, &team, "solve", &problem, agents, budget, timeout,
+                "deep", false, None, no_discuss,
+                verify.as_deref(), target.as_deref(), None,
+            );
+            return;
+        }
+        Commands::Consensus { question, agents, budget, timeout, perspectives, no_discuss } => {
+            run_autonomous(
+                &sock, &team, "consensus", &question, agents, budget, timeout,
+                "deep", false, None, no_discuss,
+                None, None, perspectives.as_deref(),
+            );
+            return;
+        }
+        Commands::Swarm { goal, agents, budget, timeout, seed, no_discuss } => {
+            run_autonomous(
+                &sock, &team, "swarm", &goal, agents, budget, timeout,
+                "deep", false, None, no_discuss,
+                None, None, seed.as_deref(),
             );
             return;
         }
@@ -3711,6 +3805,103 @@ fn run_brief(sock: &PathBuf, team: &str, target: &str, lines: u32) {
 /// Each line in board.jsonl is expected to be a JSON object with fields:
 ///   agent, round, finding, source, implication
 /// Missing fields are tolerated — raw JSON is used as fallback.
+/// Poll task IDs until all are completed/failed/abandoned, or timeout.
+/// Returns the set of task IDs that completed successfully.
+fn wait_for_tasks(sock: &PathBuf, team: &str, task_ids: &[String], timeout_secs: u64, label: &str) -> Vec<String> {
+    if task_ids.is_empty() { return Vec::new(); }
+    eprintln!("Waiting for {} task(s) to complete ({}, timeout: {}s)...", task_ids.len(), label, timeout_secs);
+    let poll_interval = Duration::from_secs(3);
+    let start = std::time::Instant::now();
+    let deadline = start + Duration::from_secs(timeout_secs);
+    let mut completed_ids: Vec<String> = Vec::new();
+    loop {
+        if std::time::Instant::now() >= deadline {
+            eprintln!("Timeout: {}/{} tasks completed within {}s", completed_ids.len(), task_ids.len(), timeout_secs);
+            break;
+        }
+        thread::sleep(poll_interval);
+        let mut all_done = true;
+        let mut done_count = 0usize;
+        if let Ok(r) = rpc_call(sock, "team.task.list", json!({ "team_name": team })) {
+            if let Some(tasks) = r["result"]["tasks"].as_array() {
+                completed_ids.clear();
+                for tid in task_ids {
+                    let task_status = tasks.iter()
+                        .find(|t| t["id"].as_str() == Some(tid.as_str()))
+                        .and_then(|t| t["status"].as_str());
+                    match task_status {
+                        Some("completed") => { done_count += 1; completed_ids.push(tid.clone()); }
+                        Some("failed") | Some("abandoned") => { done_count += 1; }
+                        _ => { all_done = false; }
+                    }
+                }
+            }
+        }
+        let elapsed = start.elapsed().as_secs();
+        eprintln!("  [{}/{}s] {}/{} done ({})", elapsed, timeout_secs, done_count, task_ids.len(), label);
+        if all_done { break; }
+    }
+    completed_ids
+}
+
+/// Dispatch delegates with stagger and wait for completion.
+/// Returns (agent_name, task_id) for dispatched tasks.
+fn dispatch_and_wait(
+    sock: &PathBuf, team: &str, timeout_secs: u64,
+    agents_and_prompts: Vec<(String, String, String)>, // (agent_name, prompt, title)
+    label: &str,
+) -> Vec<(String, String)> { // (agent_name, task_id) for dispatched tasks
+    let mut handles = Vec::new();
+    for (i, (name, prompt, title)) in agents_and_prompts.into_iter().enumerate() {
+        if i > 0 {
+            thread::sleep(Duration::from_secs(2)); // stagger to avoid pane contention
+        }
+        let sock_clone = sock.clone();
+        let team_owned = team.to_string();
+        let h = thread::spawn(move || {
+            let result = run_delegate_result(
+                &sock_clone, &team_owned, &name, &prompt,
+                Some(title), None, &[], &[], None, false, None, None,
+            );
+            (name, result)
+        });
+        handles.push(h);
+    }
+
+    let results: Vec<(String, Result<Value, String>)> =
+        handles.into_iter().map(|h| h.join().expect("thread panicked")).collect();
+
+    let mut agent_task_pairs: Vec<(String, String)> = Vec::new();
+    let mut task_ids: Vec<String> = Vec::new();
+    for (name, result) in &results {
+        match result {
+            Ok(v) => {
+                if let Some(tid) = v["result"]["task"]["id"].as_str() {
+                    task_ids.push(tid.to_string());
+                    agent_task_pairs.push((name.clone(), tid.to_string()));
+                }
+            }
+            Err(e) => { eprintln!("  {name}: delegate failed: {e}"); }
+        }
+    }
+
+    // Wait for all tasks to complete
+    wait_for_tasks(sock, team, &task_ids, timeout_secs, label);
+    agent_task_pairs
+}
+
+/// Read a task's result from the result file (task_id.md or agent-reply.md fallback).
+fn read_task_result(team: &str, task_id: &str, agent_name: &str) -> String {
+    let home = std::env::var("HOME").unwrap_or_default();
+    let result_file = format!("{}/.term-mesh/results/{}/{}.md", home, team, task_id);
+    std::fs::read_to_string(&result_file)
+        .or_else(|_| {
+            let reply_file = format!("{}/.term-mesh/results/{}/{}-reply.md", home, team, agent_name);
+            std::fs::read_to_string(&reply_file)
+        })
+        .unwrap_or_else(|_| "(no response)".to_string())
+}
+
 fn synthesize_board(board_path: &PathBuf, board_path_str: &str) {
     use std::collections::HashMap;
     use std::fs::File;
@@ -3827,21 +4018,25 @@ fn synthesize_board(board_path: &PathBuf, board_path_str: &str) {
     eprintln!("\nBoard path: {board_path_str}");
 }
 
-fn run_research(
+fn run_autonomous(
     sock: &PathBuf, team: &str,
-    topic: &str, agents_requested: u32, budget: u32,
-    timeout: u64, depth: &str, web: bool, focus: Option<&str>,
+    mode: &str,          // "research", "solve", "consensus", "swarm"
+    topic: &str,         // topic/problem/question/goal
+    agents_requested: u32, budget: u32,
+    timeout: u64, depth: &str, web: bool,
+    focus: Option<&str>, no_discuss: bool,
+    // Mode-specific options:
+    verify_cmd: Option<&str>,    // solve only
+    target: Option<&str>,        // solve only
+    extra: Option<&str>,         // consensus: perspectives, swarm: seed tasks
 ) {
-    // Detect idle claude agents
-    let idle = detect_idle_agents(sock, team, Some("claude"));
+    let idle = detect_idle_agents(sock, team, None);
     let (selected, warn_or_err) = select_agents(idle, agents_requested);
 
     if selected.is_empty() {
-        // warn_or_err is guaranteed Some when selected is empty
         eprintln!("Error: {}", warn_or_err.unwrap_or_default());
         process::exit(1);
     }
-
     if let Some(ref w) = warn_or_err {
         eprintln!("{w}");
     }
@@ -3849,87 +4044,172 @@ fn run_research(
     let agent_names: Vec<&str> = selected.iter().map(|a| a.name.as_str()).collect();
     let total_agents = agent_names.len() as u32;
     eprintln!(
-        "Research: topic='{}' agents={} budget={} timeout={}s depth={} web={}",
-        topic, agent_names.join(","), budget, timeout, depth, web
+        "{}: topic='{}' agents={} budget={} timeout={}s",
+        mode.to_uppercase(), topic, agent_names.join(","), budget, timeout
     );
 
-    // Create shared board for stigmergic coordination
-    let (board_path, run_id) = match create_board("research") {
+    let (board_path, run_id) = match create_board(mode) {
         Ok(v) => v,
         Err(e) => {
-            eprintln!("Error creating research board: {e}");
+            eprintln!("Error creating {mode} board: {e}");
             process::exit(1);
         }
     };
     let board_path_str = board_path_for_prompt(&board_path);
     eprintln!("Board: {board_path_str} (run: {run_id})");
 
-    // Build per-agent instructions using the full research prompt
+    // For swarm mode: seed initial tasks to board
+    if mode == "swarm" {
+        let seed_tasks: Vec<&str> = extra
+            .map(|s| s.split(',').map(|t| t.trim()).collect::<Vec<_>>())
+            .unwrap_or_default();
+        if seed_tasks.is_empty() {
+            // Auto-generate 3 generic seed tasks
+            let seeds = vec![
+                format!(r#"{{"type":"task","id":1,"desc":"Analyze scope and requirements for: {}","status":"open","added_by":"leader"}}"#, topic),
+                format!(r#"{{"type":"task","id":2,"desc":"Identify key components and dependencies","status":"open","added_by":"leader"}}"#),
+                format!(r#"{{"type":"task","id":3,"desc":"Create implementation plan with priorities","status":"open","added_by":"leader"}}"#),
+            ];
+            let mut content = String::new();
+            for s in &seeds {
+                content.push_str(s);
+                content.push('\n');
+            }
+            let _ = std::fs::write(&board_path, &content);
+        } else {
+            let mut content = String::new();
+            for (i, task) in seed_tasks.iter().enumerate() {
+                content.push_str(&format!(
+                    r#"{{"type":"task","id":{},"desc":"{}","status":"open","added_by":"leader"}}"#,
+                    i + 1, task
+                ));
+                content.push('\n');
+            }
+            let _ = std::fs::write(&board_path, &content);
+        }
+    }
+
+    // Build per-agent instructions
     let instructions: Vec<String> = agent_names.iter().enumerate().map(|(i, _name)| {
-        prompts::research_prompt(
-            topic,
-            &board_path_str,
-            (i + 1) as u32,   // 1-indexed agent number
-            total_agents,
-            depth,
-            budget,
-            web,
-            focus,
-        )
+        let n = (i + 1) as u32;
+        match mode {
+            "research" => prompts::research_prompt(topic, &board_path_str, n, total_agents, depth, budget, web, focus),
+            "solve" => prompts::solve_prompt(topic, &board_path_str, n, total_agents, budget, verify_cmd, target),
+            "consensus" => {
+                // Parse perspectives if provided, assign round-robin
+                let perspectives: Vec<&str> = extra
+                    .map(|s| s.split(',').map(|t| t.trim()).collect::<Vec<_>>())
+                    .unwrap_or_default();
+                let perspective = if perspectives.is_empty() { None } else { Some(perspectives[i % perspectives.len()]) };
+                prompts::consensus_prompt(topic, &board_path_str, n, total_agents, budget, perspective)
+            }
+            "swarm" => prompts::swarm_prompt(topic, &board_path_str, n, total_agents, budget, extra),
+            _ => unreachable!(),
+        }
     }).collect();
 
-    // Delegate to each agent with a 3-second stagger to reduce board.jsonl write contention
+    // Stagger timing per mode
+    let stagger_secs: u64 = match mode {
+        "consensus" => 8,
+        _ => 3,
+    };
+
+    // Dispatch to each agent
+    let task_title = format!("{}: {}", mode, &topic[..topic.len().min(60)]);
     let mut handles = Vec::new();
     for (i, (name, instr)) in agent_names.iter().zip(instructions.iter()).enumerate() {
         if i > 0 {
-            thread::sleep(Duration::from_secs(3));
+            thread::sleep(Duration::from_secs(stagger_secs));
         }
         let instr = instr.clone();
-        let task_title = format!("research: {}", &topic[..topic.len().min(60)]);
-        // We can't use thread::scope with staggered spawning (scope blocks until all exit),
-        // so we use scoped-like approach: collect JoinHandles manually.
-        // SAFETY: sock, team, name all outlive this function's stack; we join before returning.
+        let title = task_title.clone();
         let sock_clone = sock.clone();
         let team_owned = team.to_string();
         let name_owned = name.to_string();
         let h = thread::spawn(move || {
             let result = run_delegate_result(
                 &sock_clone, &team_owned, &name_owned, &instr,
-                Some(task_title),
-                None, &[], &[], None, false, None, None,
+                Some(title), None, &[], &[], None, false, None, None,
             );
             (name_owned, result)
         });
         handles.push(h);
     }
 
-    // Collect results
     let results: Vec<(String, Result<Value, String>)> =
         handles.into_iter().map(|h| h.join().expect("thread panicked")).collect();
 
     let mut succeeded: Vec<String> = Vec::new();
     let mut failed: Vec<String> = Vec::new();
+    let mut task_ids: Vec<String> = Vec::new();
     for (name, result) in &results {
         match result {
             Ok(v) => {
                 println!("{}", pretty(v));
+                if let Some(tid) = v["result"]["task"]["id"].as_str() {
+                    task_ids.push(tid.to_string());
+                }
                 succeeded.push(name.clone());
             }
             Err(e) => {
-                eprintln!("Error delegating research to {name}: {e}");
+                eprintln!("Error delegating {mode} to {name}: {e}");
                 failed.push(name.clone());
             }
         }
     }
 
-    // Read and synthesize board.jsonl entries
+    wait_for_tasks(sock, team, &task_ids, timeout, mode);
     synthesize_board(&board_path, &board_path_str);
+
+    // === Discussion Phase (same for all modes) ===
+    if !no_discuss && succeeded.len() >= 2 {
+        let board_text = std::fs::read_to_string(&board_path).unwrap_or_default();
+        if !board_text.trim().is_empty() {
+            thread::sleep(Duration::from_secs(5));
+            eprintln!("\n══ Discussion Phase ══");
+            let discuss_timeout = 180u64;
+
+            eprintln!("Phase 1: Cross-Review — agents examining each other's findings...");
+            let cross_tasks: Vec<(String, String, String)> = succeeded.iter().map(|name| {
+                let prompt = prompts::cross_review_prompt(topic, &board_text, name, &succeeded);
+                (name.clone(), prompt, format!("{mode}-discuss: cross-review"))
+            }).collect();
+            let cross_pairs = dispatch_and_wait(sock, team, discuss_timeout, cross_tasks, "cross-review");
+
+            let cross_texts: Vec<(String, String)> = cross_pairs.iter().map(|(name, tid)| {
+                (name.clone(), read_task_result(team, tid, name))
+            }).collect();
+
+            for (name, text) in &cross_texts {
+                eprintln!("[{name}] cross-review:\n{}\n", &text[..text.len().min(500)]);
+            }
+
+            if cross_texts.len() >= 2 {
+                eprintln!("Phase 2: Synthesis — converging on consensus...");
+                let cross_summary: String = cross_texts.iter()
+                    .map(|(name, text)| format!("### {name}의 교차 검토\n{text}"))
+                    .collect::<Vec<_>>().join("\n\n");
+
+                let synth_tasks: Vec<(String, String, String)> = succeeded.iter().map(|name| {
+                    let prompt = prompts::synthesis_prompt(topic, &cross_summary);
+                    (name.clone(), prompt, format!("{mode}-discuss: synthesis"))
+                }).collect();
+                let synth_pairs = dispatch_and_wait(sock, team, discuss_timeout, synth_tasks, "synthesis");
+
+                eprintln!("\n══ Discussion Results ══");
+                for (name, tid) in &synth_pairs {
+                    let text = read_task_result(team, tid, name);
+                    eprintln!("[{name}] synthesis:\n{text}\n");
+                }
+            }
+        }
+    }
 
     println!("{}", pretty(&json!({
         "ok": !succeeded.is_empty(),
         "result": {
+            "mode": mode,
             "topic": topic,
-            "depth": depth,
             "budget": budget,
             "timeout_secs": timeout,
             "assigned": succeeded,
