@@ -2001,6 +2001,9 @@ final class TeamOrchestrator: ObservableObject {
         // Clean up dynamic kiro agent profiles
         Self.cleanupKiroProfiles(teamName: name)
 
+        // Clean up leader prompt temp file
+        try? FileManager.default.removeItem(atPath: "/tmp/term-mesh-leader-\(name).md")
+
         teams.removeValue(forKey: name)
         syncTeamStateToDaemon()
         Logger.team.info("destroyed team '\(name, privacy: .public)'")

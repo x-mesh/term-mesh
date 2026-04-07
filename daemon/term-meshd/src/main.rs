@@ -54,6 +54,21 @@ async fn main() -> anyhow::Result<()> {
     );
     tracing::info!("agent session manager initialized");
 
+    // Prune old DB data on startup and every 6 hours (24h TTL)
+    {
+        let mgr = Arc::clone(&agent_manager);
+        const PRUNE_TTL_MS: u64 = 24 * 60 * 60 * 1000; // 24 hours
+        mgr.prune_old_data(PRUNE_TTL_MS);
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(6 * 3600));
+            interval.tick().await; // skip immediate tick (already pruned above)
+            loop {
+                interval.tick().await;
+                mgr.prune_old_data(PRUNE_TTL_MS);
+            }
+        });
+    }
+
     // Headless agent manager
     let headless_manager = Arc::new(tokio::sync::Mutex::new(headless::HeadlessManager::new()));
     tracing::info!("headless manager initialized");

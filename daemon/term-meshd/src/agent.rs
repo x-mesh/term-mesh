@@ -668,6 +668,7 @@ impl AgentSessionManager {
                 params![ts, id],
             );
             inner.sessions.remove(id);
+            inner.pending_inputs.remove(id);
         }
 
         tracing::info!("terminated agent session {id} ({})", session.name);
@@ -1415,6 +1416,40 @@ impl AgentSessionManager {
                 tracing::warn!("failed to terminate session {id}: {e}");
             }
         }
+    }
+
+    /// Prune old data: terminated sessions, task logs, and messages older than `max_age_ms`.
+    pub fn prune_old_data(&self, max_age_ms: u64) {
+        let cutoff = now_ms().saturating_sub(max_age_ms);
+        let inner = self.inner.lock().unwrap();
+
+        // Delete old task_log entries
+        let _ = inner.db.execute(
+            "DELETE FROM task_log WHERE created_at_ms < ?1",
+            params![cutoff],
+        );
+
+        // Delete old read messages
+        let _ = inner.db.execute(
+            "DELETE FROM agent_messages WHERE read = 1 AND created_at_ms < ?1",
+            params![cutoff],
+        );
+
+        // Delete terminated sessions older than cutoff (cascade deps first)
+        let _ = inner.db.execute(
+            "DELETE FROM session_pids WHERE session_id IN \
+             (SELECT id FROM agent_sessions WHERE status = 'terminated' AND terminated_at_ms < ?1)",
+            params![cutoff],
+        );
+        let _ = inner.db.execute(
+            "DELETE FROM agent_sessions WHERE status = 'terminated' AND terminated_at_ms < ?1",
+            params![cutoff],
+        );
+
+        // Checkpoint WAL to prevent unbounded WAL growth
+        let _ = inner.db.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);");
+
+        tracing::debug!("pruned data older than {max_age_ms}ms");
     }
 }
 

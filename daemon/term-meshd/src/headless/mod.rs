@@ -311,42 +311,49 @@ impl HeadlessManager {
 
     /// Terminate a headless agent subprocess.
     pub async fn terminate(&mut self, agent_id: &str) -> Result<(), String> {
-        let agent = self.agents.get_mut(agent_id)
-            .ok_or_else(|| format!("agent not found: {agent_id}"))?;
+        // Check status before removal
+        let pid = {
+            let agent = self.agents.get(agent_id)
+                .ok_or_else(|| format!("agent not found: {agent_id}"))?;
+            if agent.status == AgentStatus::Terminated {
+                // Already terminated — just ensure removal
+                self.agents.remove(agent_id);
+                return Ok(());
+            }
+            agent.pid
+        };
 
-        if agent.status == AgentStatus::Terminated {
-            return Ok(());
-        }
-
-        tracing::info!("terminating headless agent: {agent_id} (pid={})", agent.pid);
+        tracing::info!("terminating headless agent: {agent_id} (pid={pid})");
 
         // Try graceful SIGTERM first
-        let pid = agent.pid;
         unsafe {
             libc::kill(pid as i32, libc::SIGTERM);
         }
 
         // Wait up to 5 seconds for the process to exit
-        let wait_result = tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            agent.child.wait(),
-        ).await;
+        if let Some(agent) = self.agents.get_mut(agent_id) {
+            let wait_result = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                agent.child.wait(),
+            ).await;
 
-        match wait_result {
-            Ok(Ok(_)) => {
-                tracing::debug!("agent {agent_id} exited gracefully");
-            }
-            _ => {
-                // Force kill
-                tracing::warn!("agent {agent_id} did not exit within 5s, sending SIGKILL");
-                unsafe {
-                    libc::kill(pid as i32, libc::SIGKILL);
+            match wait_result {
+                Ok(Ok(_)) => {
+                    tracing::debug!("agent {agent_id} exited gracefully");
                 }
-                let _ = agent.child.wait().await;
+                _ => {
+                    tracing::warn!("agent {agent_id} did not exit within 5s, sending SIGKILL");
+                    unsafe {
+                        libc::kill(pid as i32, libc::SIGKILL);
+                    }
+                    let _ = agent.child.wait().await;
+                }
             }
         }
 
-        agent.status = AgentStatus::Terminated;
+        // Remove from HashMap to free OutputBuffer (10K ring) and child handles
+        self.agents.remove(agent_id);
+
         Ok(())
     }
 

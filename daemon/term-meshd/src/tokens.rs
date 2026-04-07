@@ -179,6 +179,12 @@ impl UsageTracker {
             return Ok(());
         }
 
+        // Prune file_positions for deleted files
+        {
+            let mut state = self.state.lock().unwrap();
+            state.file_positions.retain(|p, _| p.exists());
+        }
+
         for entry in std::fs::read_dir(&claude_dir)? {
             let entry = entry?;
             if !entry.file_type()?.is_dir() {

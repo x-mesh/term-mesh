@@ -238,6 +238,8 @@ final class TermMeshDaemon: ObservableObject {
 
             do {
                 try process.run()
+                // Close our copy of the log fd — Process dup'd it internally
+                try? logHandle?.close()
                 self.daemonProcess = process
                 let daemonPid = process.processIdentifier
                 Logger.daemon.info("daemon started (pid: \(daemonPid, privacy: .public), binary: \(binaryPath, privacy: .public))")

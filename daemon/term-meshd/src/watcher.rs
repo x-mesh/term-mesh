@@ -295,6 +295,12 @@ pub fn start_watcher() -> WatcherHandle {
             let cutoff = now.saturating_sub(30 * 60_000);
             let cutoff_minute = (cutoff / 60_000) * 60_000;
             state.timeline_buckets.retain(|&k, _| k >= cutoff_minute);
+
+            // Prune stale heatmap entries (keep only paths seen in last 30 minutes)
+            state.last_event_times.retain(|_, &mut ts| ts >= cutoff);
+            let live_keys: std::collections::HashSet<String> =
+                state.last_event_times.keys().cloned().collect();
+            state.event_counts.retain(|k, _| live_keys.contains(k));
         }
     });
 
