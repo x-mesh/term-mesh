@@ -2,6 +2,11 @@
 
 All notable changes to term-mesh are documented here.
 
+## [0.86.5] - 2026-04-07
+
+### Fixed
+- Terminal screen turning white after waking from sleep or monitor connect/disconnect — clicking was required to restore display
+
 ## [0.75.0] - 2026-03-21
 
 ### Added
