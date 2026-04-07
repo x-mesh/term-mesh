@@ -4116,7 +4116,11 @@ fn run_autonomous(
     };
 
     // Dispatch to each agent
-    let task_title = format!("{}: {}", mode, &topic[..topic.len().min(60)]);
+    let truncated_topic = match topic.char_indices().nth(60) {
+        Some((idx, _)) => &topic[..idx],
+        None => topic,
+    };
+    let task_title = format!("{}: {}", mode, truncated_topic);
     let mut handles = Vec::new();
     for (i, (name, instr)) in agent_names.iter().zip(instructions.iter()).enumerate() {
         if i > 0 {
@@ -4182,7 +4186,11 @@ fn run_autonomous(
             }).collect();
 
             for (name, text) in &cross_texts {
-                eprintln!("[{name}] cross-review:\n{}\n", &text[..text.len().min(500)]);
+                let truncated = match text.char_indices().nth(500) {
+                    Some((idx, _)) => &text[..idx],
+                    None => text,
+                };
+                eprintln!("[{name}] cross-review:\n{truncated}\n");
             }
 
             if cross_texts.len() >= 2 {
