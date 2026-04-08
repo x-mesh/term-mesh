@@ -2,6 +2,35 @@
 
 All notable changes to term-mesh are documented here.
 
+## [0.91.0] - 2026-04-08
+
+### Added
+- **Dashboard preset switcher** — Overview / Team Ops / DevOps / Cost views with section visibility
+- **Process Monitor tree view** — parent-child hierarchy with collapsible UI and Expand All/Collapse All
+- **System Extended card** — Load Average bars, Swap usage, collapsible Network I/O (total + per-interface detail)
+- **Per-Core CPU Heatmap** — color-coded grid showing per-core utilization
+- **Anomaly detection** — high CPU sustained, repeated failure, no-heartbeat detection in daemon
+- **Dashboard keyboard shortcut** — Cmd+Shift+D toggles the dashboard window
+- **CLI: `new-split --type browser --url`** — one-step browser split creation
+- **CLI: `close-surface --close-pane`** — collapse pane after closing all surfaces
+- **CLI: `browser eval` scalar output** — string/number/bool printed directly without `--json`
+- **Side-by-side card layout** — Watched Projects + Agent Status, Agent Sessions + Needs Attention, Daemon Tasks + Team Tasks
+
+### Changed
+- Settings dashboard toggle/bind/port/password now auto-restart the daemon (with debounce for port/password)
+- WKWebView polling skip narrowed to dedicated dashboard window (split browser panels now poll correctly)
+- Tagged builds (`./scripts/reload.sh --tag`) disable HTTP server to avoid port conflict with main app
+- ProcessSnapshot now includes `ppid` for tree rendering
+
+### Fixed
+- **Initial cursor-in-middle-of-prompt bug** — terminal surfaces now force-refresh at 0.3s/0.8s/1.5s after launch to correct column count after SwiftUI layout settles (re-applies the c580530 fix that was reverted in c32830e)
+- **Browser dashboard "disconnected"** — restored missing JS helpers (togglePid, toggleAllProcesses, updateProcessTree) that were accidentally deleted during section reorder
+- **Mobile layout horizontal scroll** — reset `grid-column` on `#agents-card`/`#tasks-card`/`#team-tasks-card`/`#team-attention-card` in mobile media query, force inner grids to single/dual column
+- **Card layout collapse to single column on Overview** — added agent/team cards to overview preset so paired cards stay side-by-side
+- **Chart.js double-init error** — `cpuChart`/`timelineChart` initialized only in `window.onload` with destroy guards
+- **Display type override** — `switchPreset` now uses `style.display = ''` instead of `'block'` so CSS grid/flex layouts are preserved
+- **Sidebar Environment card visibility** — replaced hardcoded white background with theme-aware CSS variables
+
 ## [0.89.1] - 2026-04-07
 
 ### Changed
