@@ -156,6 +156,9 @@ extension TerminalController {
               let direction = parseSplitDirection(directionStr) else {
             return .err(code: "invalid_params", message: "Missing or invalid direction (left|right|up|down)", data: nil)
         }
+        let panelType = v2PanelType(params, "type") ?? .terminal
+        let urlStr = v2String(params, "url")
+        let url = urlStr.flatMap { URL(string: $0) }
 
         var result: V2CallResult = .err(code: "internal_error", message: "Failed to create split", data: nil)
         let completed = v2MainExec(timeout: 2) {
@@ -176,12 +179,25 @@ extension TerminalController {
                 return
             }
 
-            if let newId = tabManager.newSplit(
-                tabId: ws.id,
-                surfaceId: targetSurfaceId,
-                direction: direction,
-                focus: self.v2FocusAllowed()
-            ) {
+            // Branch on panel type: browser splits use newBrowserSplit, terminal uses tabManager.newSplit.
+            let newIdOpt: UUID?
+            if panelType == .browser {
+                newIdOpt = ws.newBrowserSplit(
+                    from: targetSurfaceId,
+                    orientation: direction.orientation,
+                    insertFirst: direction.insertFirst,
+                    url: url,
+                    focus: self.v2FocusAllowed()
+                )?.id
+            } else {
+                newIdOpt = tabManager.newSplit(
+                    tabId: ws.id,
+                    surfaceId: targetSurfaceId,
+                    direction: direction,
+                    focus: self.v2FocusAllowed()
+                )
+            }
+            if let newId = newIdOpt {
                 let paneUUID = ws.paneId(forPanelId: newId)?.id
                 let windowId = self.v2ResolveWindowId(tabManager: tabManager)
                 result = .ok([
@@ -266,6 +282,7 @@ extension TerminalController {
         guard let tabManager = v2ResolveTabManager(params: params) else {
             return .err(code: "unavailable", message: "TabManager not available", data: nil)
         }
+        let closePane = (params["close_pane"] as? Bool) ?? false
 
         var result: V2CallResult = .err(code: "internal_error", message: "Failed to close surface", data: nil)
         let completed = v2MainExec(timeout: 2) {
@@ -291,7 +308,17 @@ extension TerminalController {
             }
 
             // Socket API must be non-interactive: bypass close-confirmation gating.
-            ws.closePanel(surfaceId, force: true)
+            if closePane, let paneId = ws.paneId(forPanelId: surfaceId) {
+                // Close all surfaces in this pane so the pane itself collapses.
+                let tabsInPane = ws.bonsplitController.tabs(inPane: paneId)
+                for tab in tabsInPane {
+                    if let pid = ws.panelIdFromSurfaceId(tab.id) {
+                        ws.closePanel(pid, force: true)
+                    }
+                }
+            } else {
+                ws.closePanel(surfaceId, force: true)
+            }
             result = .ok(["workspace_id": ws.id.uuidString, "workspace_ref": self.v2Ref(kind: .workspace, uuid: ws.id), "surface_id": surfaceId.uuidString, "surface_ref": self.v2Ref(kind: .surface, uuid: surfaceId), "window_id": self.v2OrNull(self.v2ResolveWindowId(tabManager: tabManager)?.uuidString), "window_ref": self.v2Ref(kind: .window, uuid: self.v2ResolveWindowId(tabManager: tabManager))])
         }
         if !completed { return .err(code: "timeout", message: "Main thread busy", data: nil) }

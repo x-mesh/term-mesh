@@ -703,9 +703,11 @@ struct TermMeshCLI {
             let (wsArg, rem0) = parseOption(commandArgs, name: "--workspace")
             let (panelArg, rem1) = parseOption(rem0, name: "--panel")
             let (sfArg, rem2) = parseOption(rem1, name: "--surface")
+            let (typeArg, rem3) = parseOption(rem2, name: "--type")
+            let (urlArg, rem4) = parseOption(rem3, name: "--url")
             let workspaceArg = wsArg ?? (windowId == nil ? (ProcessInfo.processInfo.environment["TERMMESH_WORKSPACE_ID"] ?? ProcessInfo.processInfo.environment["CMUX_WORKSPACE_ID"]) : nil)
             let surfaceRaw = sfArg ?? panelArg ?? (wsArg == nil && windowId == nil ? (ProcessInfo.processInfo.environment["TERMMESH_SURFACE_ID"] ?? ProcessInfo.processInfo.environment["CMUX_SURFACE_ID"]) : nil)
-            guard let direction = rem2.first else {
+            guard let direction = rem4.first else {
                 throw CLIError(message: "new-split requires a direction")
             }
             var params: [String: Any] = ["direction": direction]
@@ -713,6 +715,8 @@ struct TermMeshCLI {
             if let wsId { params["workspace_id"] = wsId }
             let sfId = try normalizeSurfaceHandle(surfaceRaw, client: client, workspaceHandle: wsId)
             if let sfId { params["surface_id"] = sfId }
+            if let typeArg { params["type"] = typeArg }
+            if let urlArg { params["url"] = urlArg }
             let payload = try client.sendV2(method: "surface.split", params: params)
             printV2Payload(payload, jsonOutput: jsonOutput, idFormat: idFormat, fallbackText: v2OKSummary(payload, idFormat: idFormat))
 
@@ -812,11 +816,13 @@ struct TermMeshCLI {
             let csWsFlag = optionValue(commandArgs, name: "--workspace")
             let workspaceArg = csWsFlag ?? (windowId == nil ? (ProcessInfo.processInfo.environment["TERMMESH_WORKSPACE_ID"] ?? ProcessInfo.processInfo.environment["CMUX_WORKSPACE_ID"]) : nil)
             let surfaceRaw = optionValue(commandArgs, name: "--surface") ?? optionValue(commandArgs, name: "--panel") ?? (csWsFlag == nil && windowId == nil ? (ProcessInfo.processInfo.environment["TERMMESH_SURFACE_ID"] ?? ProcessInfo.processInfo.environment["CMUX_SURFACE_ID"]) : nil)
+            let closePane = commandArgs.contains("--close-pane")
             var params: [String: Any] = [:]
             let wsId = try normalizeWorkspaceHandle(workspaceArg, client: client)
             if let wsId { params["workspace_id"] = wsId }
             let sfId = try normalizeSurfaceHandle(surfaceRaw, client: client, workspaceHandle: wsId)
             if let sfId { params["surface_id"] = sfId }
+            if closePane { params["close_pane"] = true }
             let payload = try client.sendV2(method: "surface.close", params: params)
             printV2Payload(payload, jsonOutput: jsonOutput, idFormat: idFormat, fallbackText: v2OKSummary(payload, idFormat: idFormat))
 
@@ -2174,7 +2180,28 @@ struct TermMeshCLI {
                 throw CLIError(message: "browser eval requires a script")
             }
             let payload = try client.sendV2(method: "browser.eval", params: ["surface_id": sid, "script": trimmed])
-            output(payload, fallback: "OK")
+            if jsonOutput {
+                print(jsonString(formatIDs(payload, mode: idFormat)))
+            } else if let value = payload["value"] {
+                if let s = value as? String {
+                    print(s)
+                } else if let n = value as? NSNumber {
+                    // NSNumber covers Bool, Int, Double from JSON deserialization
+                    if CFGetTypeID(n) == CFBooleanGetTypeID() {
+                        print(n.boolValue ? "true" : "false")
+                    } else {
+                        print(n.stringValue)
+                    }
+                } else if value is NSNull {
+                    // print nothing for null
+                } else if JSONSerialization.isValidJSONObject(value) {
+                    print(jsonString(value))
+                } else {
+                    print(String(describing: value))
+                }
+            } else {
+                print("OK")
+            }
             return
         }
 
