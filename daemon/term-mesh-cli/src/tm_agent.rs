@@ -194,6 +194,36 @@ enum Commands {
         #[arg(long, default_value = "claude")]
         cli: String,
     },
+    /// Attach an agent pane to the current workspace's team.
+    ///
+    /// Unlike `create`, this does not spawn a new workspace — it adds the
+    /// agent pane as a split inside the caller's existing workspace. The
+    /// caller's pane is auto-adopted as the team's leader on first attach.
+    /// The team is auto-named `ws-<first8hex>` based on the workspace UUID.
+    /// Must be run inside a term-mesh pane (TERMMESH_WORKSPACE_ID env required).
+    Attach {
+        /// Agent type/name (e.g. "executor", "reviewer", "security")
+        agent_type: String,
+        /// Custom agent name (defaults to agent_type). Must match `^[a-zA-Z0-9_-]{1,32}$`.
+        #[arg(long)]
+        name: Option<String>,
+        /// Model to use (e.g. sonnet, opus, haiku)
+        #[arg(long, default_value = "sonnet")]
+        model: String,
+        /// CLI to use (claude, codex, kiro, gemini)
+        #[arg(long, default_value = "claude")]
+        cli: String,
+    },
+    /// Detach an agent from the current workspace's team.
+    ///
+    /// Closes the agent's pane and removes it from the team. The leader
+    /// pane (the caller's original pane) is never touched. If the detached
+    /// agent was the last one, the team is automatically destroyed while
+    /// the leader pane is preserved.
+    Detach {
+        /// Agent name to detach
+        agent_name: String,
+    },
     /// Preset operations (list)
     #[command(subcommand)]
     Preset(PresetCommands),
@@ -1895,6 +1925,23 @@ fn main() {
             eprintln!("      Headless team support: 'tm-agent create --headless ...' then 'tm-agent add ...'");
             process::exit(1);
         }
+        Commands::Attach { agent_type, name, model, cli } => {
+            let agent_name = name.unwrap_or_else(|| agent_type.clone());
+            if let Err(e) = validate_agent_name(&agent_name) {
+                eprintln!("Error: {}", e);
+                process::exit(1);
+            }
+            run_attach(&sock, &agent_type, &agent_name, &model, &cli);
+            return;
+        }
+        Commands::Detach { agent_name } => {
+            if let Err(e) = validate_agent_name(&agent_name) {
+                eprintln!("Error: {}", e);
+                process::exit(1);
+            }
+            run_detach(&sock, &agent_name);
+            return;
+        }
         Commands::Preset(sub) => {
             match sub {
                 PresetCommands::List => {
@@ -2573,6 +2620,224 @@ fn run_create(
         if kiro_count > 0 {
             eprintln!("\n  \u{2713} {kiro_count} kiro agent(s): prompt loaded via agent profile (no delay)");
         }
+    }
+}
+
+/// Validate agent name against the whitelist regex `^[a-zA-Z0-9_-]{1,32}$`.
+///
+/// Used by `attach` and `detach` subcommands to prevent env var injection and
+/// filename escape via agent_name. Returns `Err(message)` if invalid.
+/// Implemented as a manual char scan (no `regex` crate dep).
+fn validate_agent_name(name: &str) -> Result<(), String> {
+    if name.is_empty() {
+        return Err("agent name must not be empty".to_string());
+    }
+    if name.len() > 32 {
+        return Err(format!(
+            "agent name '{}' is too long ({}>32 chars)",
+            name,
+            name.len()
+        ));
+    }
+    for ch in name.chars() {
+        let ok = ch.is_ascii_alphanumeric() || ch == '_' || ch == '-';
+        if !ok {
+            return Err(format!(
+                "agent name '{}' contains invalid character '{}'; only [a-zA-Z0-9_-] allowed",
+                name, ch
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Resolve the team name for workspace-local attach/detach operations.
+///
+/// Priority:
+/// 1. `TERMMESH_TEAM` env var (explicit override)
+/// 2. `ws-<first8hex>` derived from `TERMMESH_WORKSPACE_ID`
+///
+/// Returns `Err` if neither is available.
+#[allow(dead_code)] // used by run_attach/run_detach (t8/t9)
+fn resolve_workspace_team_name() -> Result<String, String> {
+    if let Ok(explicit) = env::var("TERMMESH_TEAM") {
+        if !explicit.is_empty() {
+            return Ok(explicit);
+        }
+    }
+    let ws = env::var("TERMMESH_WORKSPACE_ID")
+        .map_err(|_| "TERMMESH_WORKSPACE_ID env var not set. Not running inside a term-mesh workspace?".to_string())?;
+    if ws.is_empty() {
+        return Err("TERMMESH_WORKSPACE_ID is empty".to_string());
+    }
+    // Strip dashes, take first 8 hex chars, lowercase
+    let hex: String = ws
+        .chars()
+        .filter(|c| c.is_ascii_hexdigit())
+        .take(8)
+        .collect::<String>()
+        .to_lowercase();
+    if hex.len() < 8 {
+        return Err(format!(
+            "TERMMESH_WORKSPACE_ID '{}' does not contain 8 hex chars",
+            ws
+        ));
+    }
+    Ok(format!("ws-{}", hex))
+}
+
+/// Validate that the caller is running inside a term-mesh pane.
+/// Returns the tuple of env vars needed for workspace-local attach/detach.
+fn require_termmesh_context() -> Result<(String, String, Option<String>), String> {
+    let workspace_id = env::var("TERMMESH_WORKSPACE_ID").map_err(|_| {
+        "Not running inside a term-mesh workspace. Use tm-agent create instead.".to_string()
+    })?;
+    if workspace_id.is_empty() {
+        return Err(
+            "Not running inside a term-mesh workspace. Use tm-agent create instead.".to_string(),
+        );
+    }
+    let panel_id = env::var("TERMMESH_PANEL_ID").map_err(|_| {
+        "TERMMESH_PANEL_ID not set. Caller pane cannot be identified for attach.".to_string()
+    })?;
+    if panel_id.is_empty() {
+        return Err(
+            "TERMMESH_PANEL_ID is empty. Caller pane cannot be identified for attach.".to_string(),
+        );
+    }
+    let window_id = env::var("TERMMESH_WINDOW_ID").ok().filter(|s| !s.is_empty());
+    Ok((workspace_id, panel_id, window_id))
+}
+
+/// Attach a single agent pane to the caller's current workspace via `team.attach` RPC.
+fn run_attach(sock: &PathBuf, agent_type: &str, agent_name: &str, model: &str, cli: &str) {
+    let (workspace_id, panel_id, window_id) = match require_termmesh_context() {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("Error: {}", e);
+            process::exit(1);
+        }
+    };
+    let team_name = match resolve_workspace_team_name() {
+        Ok(name) => name,
+        Err(e) => {
+            eprintln!("Error: {}", e);
+            process::exit(1);
+        }
+    };
+
+    eprintln!(
+        "Attaching agent '{}' (type={}, cli={}, model={}) to team '{}' in current workspace...",
+        agent_name, agent_type, cli, model, team_name
+    );
+
+    let mut params = json!({
+        "agent_type": agent_type,
+        "agent_name": agent_name,
+        "agent_cli": cli,
+        "agent_model": model,
+        "workspace_id": workspace_id,
+        "surface_id": panel_id,
+    });
+    if let Some(wid) = window_id {
+        params["window_id"] = json!(wid);
+    }
+
+    let resp = match rpc_call_timeout(sock, "team.attach", params, 10) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("Error: {}", e);
+            process::exit(1);
+        }
+    };
+
+    if resp["ok"].as_bool().unwrap_or(false) {
+        println!("{}", pretty(&resp));
+        if let Some(result) = resp["result"].as_object() {
+            eprintln!();
+            eprintln!(
+                "  \u{2713} agent '{}' attached ({} total in team '{}')",
+                result.get("agent_name").and_then(|v| v.as_str()).unwrap_or(agent_name),
+                result.get("agent_count").and_then(|v| v.as_u64()).unwrap_or(0),
+                result.get("team_name").and_then(|v| v.as_str()).unwrap_or(&team_name),
+            );
+        }
+    } else {
+        let code = resp["error"]["code"].as_str().unwrap_or("unknown");
+        let msg = resp["error"]["message"].as_str().unwrap_or("attach failed");
+        eprintln!("Error [{}]: {}", code, msg);
+        process::exit(1);
+    }
+}
+
+/// Detach a single agent from the caller's workspace-local team via `team.detach` RPC.
+fn run_detach(sock: &PathBuf, agent_name: &str) {
+    let (workspace_id, _panel_id, window_id) = match require_termmesh_context() {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("Error: {}", e);
+            process::exit(1);
+        }
+    };
+    let team_name = match resolve_workspace_team_name() {
+        Ok(name) => name,
+        Err(e) => {
+            eprintln!("Error: {}", e);
+            process::exit(1);
+        }
+    };
+
+    eprintln!(
+        "Detaching agent '{}' from team '{}'...",
+        agent_name, team_name
+    );
+
+    let mut params = json!({
+        "agent_name": agent_name,
+        "team_name": team_name,
+        "workspace_id": workspace_id,
+    });
+    if let Some(wid) = window_id {
+        params["window_id"] = json!(wid);
+    }
+
+    let resp = match rpc_call_timeout(sock, "team.detach", params, 10) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("Error: {}", e);
+            process::exit(1);
+        }
+    };
+
+    if resp["ok"].as_bool().unwrap_or(false) {
+        println!("{}", pretty(&resp));
+        if let Some(result) = resp["result"].as_object() {
+            let remaining = result
+                .get("remaining_agents")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+            let team_destroyed = result
+                .get("team_destroyed")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            eprintln!();
+            if team_destroyed {
+                eprintln!(
+                    "  \u{2713} agent '{}' detached. Team '{}' destroyed (leader pane preserved).",
+                    agent_name, team_name
+                );
+            } else {
+                eprintln!(
+                    "  \u{2713} agent '{}' detached ({} remaining)",
+                    agent_name, remaining
+                );
+            }
+        }
+    } else {
+        let code = resp["error"]["code"].as_str().unwrap_or("unknown");
+        let msg = resp["error"]["message"].as_str().unwrap_or("detach failed");
+        eprintln!("Error [{}]: {}", code, msg);
+        process::exit(1);
     }
 }
 

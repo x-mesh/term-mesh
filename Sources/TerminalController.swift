@@ -1851,6 +1851,9 @@ class TerminalController {
         "team.delegate",
         // Send named key (return, ctrl-c, etc.) to an agent's terminal
         "team.send_key",
+        // Workspace-local attach/detach (no new workspace spawned)
+        "team.attach",
+        "team.detach",
     ]
 
     /// Dispatch ALL team commands via async path.
@@ -1998,6 +2001,10 @@ class TerminalController {
             return await asyncTeamInterrupt(params: params, id: id)
         case "team.interrupt_all":
             return await asyncTeamInterruptAll(params: params, id: id)
+        case "team.attach":
+            return await asyncTeamAttach(params: params, id: id)
+        case "team.detach":
+            return await asyncTeamDetach(params: params, id: id)
         default:
             return v2Error(id: id, code: "unknown_method", message: "Unknown team command: \(method)")
         }
@@ -2157,6 +2164,174 @@ class TerminalController {
         return success
             ? v2Ok(id: id, result: ["destroyed": true, "team_name": teamName])
             : v2Error(id: id, code: "not_found", message: "Team not found")
+    }
+
+    /// Attach a single agent pane to the caller's existing workspace.
+    ///
+    /// Params:
+    ///   - agent_type (required)  : e.g. "executor", "reviewer"
+    ///   - agent_name (required)  : unique within the workspace-local team
+    ///   - agent_cli              : "claude" (default), "codex", "kiro", "gemini"
+    ///   - agent_model            : "sonnet" (default), "opus", "haiku"
+    ///   - instructions           : optional system-prompt/role description
+    ///   - window_id / surface_id / workspace_id : same routing params as team.create
+    ///
+    /// Reuses `asyncTeamCreate`'s TabManager resolution path (R11 — 2026-03-17 regression guard).
+    private func asyncTeamAttach(params: [String: Any], id: Any?) async -> String {
+        // Parse off-main
+        guard let agentType = params["agent_type"] as? String, !agentType.isEmpty else {
+            return v2Error(id: id, code: "invalid_params", message: "Missing agent_type")
+        }
+        guard let agentName = params["agent_name"] as? String, !agentName.isEmpty else {
+            return v2Error(id: id, code: "invalid_params", message: "Missing agent_name")
+        }
+        let agentCli = (params["agent_cli"] as? String) ?? "claude"
+        let agentModel = (params["agent_model"] as? String) ?? "sonnet"
+        let instructions = (params["instructions"] as? String) ?? ""
+
+        // MainActor-bound resolution + attach
+        let result: V2CallResult = await MainActor.run {
+            // Resolve TabManager using the same precedence as asyncTeamCreate (R11).
+            let appDelegate = AppDelegate.shared
+            let resolved: (tabManager: TabManager, workspaceId: UUID, callerPanelId: UUID)? = {
+                // 1. Explicit window_id — locate tabManager, then derive workspace from workspace_id or surface_id.
+                if let windowIdStr = params["window_id"] as? String,
+                   let windowId = UUID(uuidString: windowIdStr),
+                   let tm = appDelegate?.tabManagerFor(windowId: windowId) {
+                    if let surfaceIdStr = params["surface_id"] as? String,
+                       let surfaceId = UUID(uuidString: surfaceIdStr),
+                       let located = appDelegate?.locateSurface(surfaceId: surfaceId) {
+                        return (tm, located.workspaceId, surfaceId)
+                    }
+                    if let wsIdStr = params["workspace_id"] as? String,
+                       let wsId = UUID(uuidString: wsIdStr),
+                       let panelIdStr = params["surface_id"] as? String,
+                       let panelId = UUID(uuidString: panelIdStr) {
+                        return (tm, wsId, panelId)
+                    }
+                }
+                // 2. surface_id alone — derives both tabManager and workspace.
+                if let surfaceIdStr = params["surface_id"] as? String,
+                   let surfaceId = UUID(uuidString: surfaceIdStr),
+                   let located = appDelegate?.locateSurface(surfaceId: surfaceId) {
+                    return (located.tabManager, located.workspaceId, surfaceId)
+                }
+                // 3. workspace_id alone — tabManager via workspace lookup; caller pane unknown → reject
+                //    (attach requires a caller pane to adopt as leader).
+                return nil
+            }()
+
+            guard let resolved else {
+                return V2CallResult.err(
+                    code: "not_in_workspace",
+                    message: "team.attach requires surface_id (caller pane) to adopt as leader. Run tm-agent attach from inside a term-mesh pane.",
+                    data: nil
+                )
+            }
+
+            let outcome = TeamOrchestrator.shared.attachToWorkspace(
+                workspaceId: resolved.workspaceId,
+                callerPanelId: resolved.callerPanelId,
+                agentName: agentName,
+                agentCli: agentCli,
+                agentModel: agentModel,
+                agentType: agentType,
+                instructions: instructions,
+                tabManager: resolved.tabManager
+            )
+
+            switch outcome {
+            case .success(let (team, newAgent)):
+                return V2CallResult.ok([
+                    "team_name": team.id,
+                    "agent_name": newAgent.name,
+                    "agent_id": newAgent.id,
+                    "panel_id": newAgent.panelId.uuidString,
+                    "workspace_id": team.workspaceId.uuidString,
+                    "agent_count": team.agents.count,
+                    "model": newAgent.model,
+                    "cli": newAgent.cli,
+                ] as [String: Any])
+            case .failure(let err):
+                return V2CallResult.err(code: err.code, message: err.description, data: nil)
+            }
+        }
+        return v2Result(id: id, result)
+    }
+
+    /// Detach a single agent from the caller's workspace-local team.
+    ///
+    /// Params:
+    ///   - agent_name (required) : agent to remove
+    ///   - team_name              : optional explicit override (defaults to ws-<hex> for caller's workspace)
+    ///   - window_id / surface_id / workspace_id : same routing params as team.create
+    private func asyncTeamDetach(params: [String: Any], id: Any?) async -> String {
+        guard let agentName = params["agent_name"] as? String, !agentName.isEmpty else {
+            return v2Error(id: id, code: "invalid_params", message: "Missing agent_name")
+        }
+        let explicitTeamName = params["team_name"] as? String
+
+        let result: V2CallResult = await MainActor.run {
+            let appDelegate = AppDelegate.shared
+            // Resolve TabManager + workspaceId — reuse attach's logic minus the callerPanelId requirement.
+            let resolved: (tabManager: TabManager, workspaceId: UUID)? = {
+                if let windowIdStr = params["window_id"] as? String,
+                   let windowId = UUID(uuidString: windowIdStr),
+                   let tm = appDelegate?.tabManagerFor(windowId: windowId) {
+                    if let wsIdStr = params["workspace_id"] as? String,
+                       let wsId = UUID(uuidString: wsIdStr) {
+                        return (tm, wsId)
+                    }
+                    if let surfaceIdStr = params["surface_id"] as? String,
+                       let surfaceId = UUID(uuidString: surfaceIdStr),
+                       let located = appDelegate?.locateSurface(surfaceId: surfaceId) {
+                        return (tm, located.workspaceId)
+                    }
+                }
+                if let surfaceIdStr = params["surface_id"] as? String,
+                   let surfaceId = UUID(uuidString: surfaceIdStr),
+                   let located = appDelegate?.locateSurface(surfaceId: surfaceId) {
+                    return (located.tabManager, located.workspaceId)
+                }
+                if let wsIdStr = params["workspace_id"] as? String,
+                   let wsId = UUID(uuidString: wsIdStr),
+                   let tm = appDelegate?.tabManagerFor(tabId: wsId) {
+                    return (tm, wsId)
+                }
+                return nil
+            }()
+
+            guard let resolved else {
+                return V2CallResult.err(
+                    code: "not_in_workspace",
+                    message: "team.detach requires workspace_id or surface_id from a term-mesh pane.",
+                    data: nil
+                )
+            }
+
+            let teamName = explicitTeamName
+                ?? TeamOrchestrator.workspaceTeamName(for: resolved.workspaceId)
+
+            let outcome = TeamOrchestrator.shared.detachAgent(
+                teamName: teamName,
+                agentName: agentName,
+                tabManager: resolved.tabManager
+            )
+
+            switch outcome {
+            case .success(let detachResult):
+                return V2CallResult.ok([
+                    "detached": true,
+                    "team_name": detachResult.teamName,
+                    "agent_name": detachResult.agentName,
+                    "remaining_agents": detachResult.remainingAgents,
+                    "team_destroyed": detachResult.teamDestroyed,
+                ] as [String: Any])
+            case .failure(let err):
+                return V2CallResult.err(code: err.code, message: err.description, data: nil)
+            }
+        }
+        return v2Result(id: id, result)
     }
 
     private func asyncTeamSend(params: [String: Any], id: Any?) async -> String {

@@ -330,6 +330,239 @@ final class TeamOrchestrator: ObservableObject {
         return nil
     }
 
+    // MARK: - Agent Pane Env (shared helper)
+
+    /// Build the complete environment dict for an agent pane.
+    /// Single source of truth for agent pane env — used by both `createTeam` and
+    /// `attachToWorkspace` to prevent the 2026-03-19 regression where
+    /// `TERMMESH_WINDOW_ID` / `TERMMESH_WORKSPACE_ID` were missing on agent panes.
+    ///
+    /// Includes:
+    /// - PATH with essential homebrew/local bins merged
+    /// - Socket path (TERMMESH_SOCKET / CMUX_SOCKET)
+    /// - Team identity (TERMMESH_TEAM*, CMUX_TEAM*)
+    /// - CLAUDECODE flag (only for `agentCli == "claude"`; codex/gemini/kiro must not have it)
+    /// - Per-agent routing (TERMMESH_AGENT_NAME, TERMMESH_WINDOW_ID, TERMMESH_WORKSPACE_ID)
+    static func buildAgentPaneEnv(
+        teamName: String,
+        agentName: String,
+        agentCli: String,
+        windowId: String?,
+        workspaceId: UUID
+    ) -> [String: String] {
+        // Essential PATH entries — pane commands don't source shell profiles,
+        // so we must inject homebrew/local bins explicitly.
+        let resourceBin = Bundle.main.resourcePath.map { "\($0)/bin" } ?? ""
+        let essentialPaths = [
+            resourceBin,
+            "\(NSHomeDirectory())/.local/bin",
+            "/opt/homebrew/bin",
+            "/opt/homebrew/sbin",
+            "/usr/local/bin",
+            "/usr/bin",
+            "/bin",
+            "/usr/sbin",
+            "/sbin"
+        ]
+        let appPath = ProcessInfo.processInfo.environment["PATH"] ?? ""
+        let existingPaths = Set(appPath.split(separator: ":").map(String.init))
+        let missingPaths = essentialPaths.filter { !existingPaths.contains($0) }
+        let currentPath = (appPath.isEmpty ? essentialPaths : appPath.split(separator: ":").map(String.init) + missingPaths).joined(separator: ":")
+        let socketPath = SocketControlSettings.socketPath()
+
+        var env: [String: String] = [
+            "TERMMESH_TEAM_AGENT": "1",
+            "CMUX_TEAM_AGENT": "1",
+            "TERMMESH_TEAM_NAME": teamName,
+            "CMUX_TEAM_NAME": teamName,
+            "TERMMESH_TEAM": teamName,
+            "CMUX_TEAM": teamName,
+            "TERMMESH_SOCKET": socketPath,
+            "CMUX_SOCKET": socketPath,
+            "PATH": currentPath,
+        ]
+
+        // Only claude agents get CLAUDECODE=1 (Anthropic-specific; codex/gemini/kiro must not).
+        if agentCli == "claude" {
+            env["CLAUDECODE"] = "1"
+            env["CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS"] = "1"
+        }
+
+        // Per-agent routing — 2026-03-19 regression guard.
+        env["TERMMESH_AGENT_NAME"] = agentName
+        if let windowId = windowId, !windowId.isEmpty {
+            env["TERMMESH_WINDOW_ID"] = windowId
+        }
+        env["TERMMESH_WORKSPACE_ID"] = workspaceId.uuidString
+
+        return env
+    }
+
+    // MARK: - Agent Pane Construction (shared helper)
+
+    /// Build the kiro worker prompt embedded in the kiro agent profile at CLI startup.
+    private static func buildKiroWorkerPrompt(agentName: String, teamName: String) -> String {
+        return """
+        You are a focused worker agent named '\(agentName)' in team '\(teamName)'. \
+        Rules: 1) Be EXTREMELY concise — no preamble, no summaries unless asked. \
+        2) Output only code, commands, or direct answers. \
+        3) When done, state the result in 1-2 lines max. 4) Never repeat the task back.
+
+        Operational rules:
+        1. Work should be tracked with task ids.
+        2. When you begin a task, run `tm-agent task start <task_id>`.
+        3. While actively working, periodically run `tm-agent heartbeat '<short progress summary>'`.
+        4. If blocked, run `tm-agent task block <task_id> '<reason>'`.
+        5. If ready for validation, run `tm-agent task review <task_id> '<summary>'`.
+        6. When accepted as done, run `tm-agent task done <task_id> '<result>'`.
+        When you complete any task, you MUST use your bash/execute tool to run:
+        tm-agent report '<summary of your result>'
+        Do NOT just write the result as text — actually execute the shell command.
+        """
+    }
+
+    /// Add a single agent pane to an existing workspace.
+    ///
+    /// This is the single source of truth for agent pane construction. It builds
+    /// the CLI-specific invocation, wraps it in a shell with working-directory cd
+    /// when a worktree is active, constructs the pane env via `buildAgentPaneEnv`,
+    /// spawns the split pane, applies the pane title, and returns an `AgentMember`.
+    ///
+    /// Used by:
+    /// - `createTeam` — inside the multi-agent grid loop
+    /// - `attachToWorkspace` — for single-agent attach (t3)
+    ///
+    /// The caller is responsible for:
+    /// - Pre-normalizing `agentCli` (empty → "claude")
+    /// - Resolving `cliPath` via `agentBinaryPath`
+    /// - Choosing `splitFrom` and `orientation` (grid vs single-agent logic differs)
+    /// - Deciding `agentWorkDir` (worktree path or team working directory)
+    ///
+    /// Returns `nil` on split failure. The caller logs context-specific errors.
+    private func addAgentPaneToWorkspace(
+        workspace: Workspace,
+        agentName: String,
+        agentCli: String,
+        agentModel: String,
+        agentType: String,
+        agentColor: String,
+        agentInstructions: String,
+        cliPath: String,
+        teamName: String,
+        leaderSessionId: String,
+        workingDirectory: String,
+        agentWorkDir: String,
+        worktreeName: String?,
+        worktreePath: String?,
+        worktreeBranch: String?,
+        splitFrom: UUID,
+        orientation: SplitOrientation,
+        tabManager: TabManager
+    ) -> AgentMember? {
+        let agentId = "\(agentName)@\(teamName)"
+
+        // Build CLI-specific invocation
+        let agentCommand: String
+        switch agentCli {
+        case "kiro":
+            let workerPrompt = Self.buildKiroWorkerPrompt(agentName: agentName, teamName: teamName)
+            agentCommand = buildKiroCommand(
+                kiroPath: cliPath,
+                agentName: agentName,
+                teamName: teamName,
+                model: agentModel,
+                systemPrompt: workerPrompt
+            )
+        case "codex":
+            agentCommand = buildCodexCommand(
+                codexPath: cliPath,
+                agentName: agentName,
+                teamName: teamName,
+                model: agentModel
+            )
+        case "gemini":
+            agentCommand = buildGeminiCommand(
+                geminiPath: cliPath,
+                agentName: agentName,
+                teamName: teamName,
+                model: agentModel
+            )
+        default:
+            agentCommand = buildClaudeCommand(
+                claudePath: cliPath,
+                agentId: agentId,
+                agentName: agentName,
+                teamName: teamName,
+                agentColor: agentColor,
+                parentSessionId: leaderSessionId,
+                agentType: agentType,
+                model: agentModel,
+                instructions: agentInstructions
+            )
+        }
+
+        // Wrap so the terminal stays open (drops to shell) if the CLI exits.
+        // When a worktree is active, build a login-shell invocation with explicit
+        // `cd` to guarantee the agent CLI starts in the worktree directory.
+        let shellCommand: String
+        if agentWorkDir != workingDirectory {
+            let shell = ProcessInfo.processInfo.environment["SHELL"] ?? "/bin/zsh"
+            let inner = "cd \"\(agentWorkDir)\" && exec \(agentCommand); exec $SHELL"
+            let escaped = inner.replacingOccurrences(of: "'", with: "'\\''")
+            shellCommand = "\(shell) -l -c '\(escaped)'"
+        } else {
+            shellCommand = "\(agentCommand); exec $SHELL"
+        }
+
+        // Build env via shared helper (2026-03-19 regression guard — single source of truth)
+        let windowId = AppDelegate.shared?.windowId(for: tabManager)?.uuidString
+        let paneEnv = Self.buildAgentPaneEnv(
+            teamName: teamName,
+            agentName: agentName,
+            agentCli: agentCli,
+            windowId: windowId,
+            workspaceId: workspace.id
+        )
+
+        // Spawn the split pane
+        guard let panel = workspace.newTerminalSplit(
+            from: splitFrom,
+            orientation: orientation,
+            focus: false,
+            skipEqualization: true,
+            workingDirectory: agentWorkDir,
+            command: shellCommand,
+            environment: paneEnv
+        ) else {
+            return nil
+        }
+
+        // Apply pane title (include branch if worktree active)
+        let colorEmoji = Self.colorEmoji(agentColor)
+        let paneTitle = worktreeBranch != nil
+            ? "\(colorEmoji) \(agentName) [\(worktreeBranch!)]"
+            : "\(colorEmoji) \(agentName)"
+        workspace.setPanelCustomTitle(panelId: panel.id, title: paneTitle)
+
+        return AgentMember(
+            id: agentId,
+            name: agentName,
+            teamName: teamName,
+            cli: agentCli,
+            model: agentModel,
+            agentType: agentType,
+            color: agentColor,
+            instructions: agentInstructions,
+            workspaceId: workspace.id,
+            panelId: panel.id,
+            parentSessionId: leaderSessionId,
+            createdAt: Date(),
+            worktreeName: worktreeName,
+            worktreePath: worktreePath,
+            worktreeBranch: worktreeBranch
+        )
+    }
+
     // MARK: - Team Lifecycle
 
     /// Create a team of Claude agents in split panes within a single workspace.
@@ -442,9 +675,6 @@ final class TeamOrchestrator: ObservableObject {
             "CLAUDECODE": "1",
             "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS": "1"
         ]) { _, new in new }
-        // Kiro agents: no CLAUDECODE (kiro-cli is a separate CLI and doesn't need it)
-        let kiroAgentEnv = baseEnv
-
         // Leader env: Claude leader needs no CLAUDECODE (runs its own instance).
         // Explicitly clear CLAUDECODE to prevent inheritance from parent process
         // (Claude Code refuses to start inside another CLAUDECODE session).
@@ -735,7 +965,6 @@ final class TeamOrchestrator: ObservableObject {
         // This bypasses shell init (.zshrc/.zprofile) entirely for reliable startup.
         for (index, agent) in agents.enumerated() {
             let agentColor = agent.color.isEmpty ? colors[index % colors.count] : agent.color
-            let agentId = "\(agent.name)@\(name)"
 
             // Worktree for this agent
             var agentWorkDir = sharedWorkDir ?? workingDirectory
@@ -770,88 +999,6 @@ final class TeamOrchestrator: ObservableObject {
 
             let agentCli = agent.cli.isEmpty ? "claude" : agent.cli
             let cliPath = cliPaths[agentCli]!
-            let agentCommand: String
-            switch agentCli {
-            case "kiro":
-                // Build full init prompt embedded in the kiro agent profile.
-                // This is loaded at CLI startup — no delayed TUI injection needed.
-                let workerPrompt = """
-                You are a focused worker agent named '\(agent.name)' in team '\(name)'. \
-                Rules: 1) Be EXTREMELY concise — no preamble, no summaries unless asked. \
-                2) Output only code, commands, or direct answers. \
-                3) When done, state the result in 1-2 lines max. 4) Never repeat the task back.
-
-                Operational rules:
-                1. Work should be tracked with task ids.
-                2. When you begin a task, run `tm-agent task start <task_id>`.
-                3. While actively working, periodically run `tm-agent heartbeat '<short progress summary>'`.
-                4. If blocked, run `tm-agent task block <task_id> '<reason>'`.
-                5. If ready for validation, run `tm-agent task review <task_id> '<summary>'`.
-                6. When accepted as done, run `tm-agent task done <task_id> '<result>'`.
-                When you complete any task, you MUST use your bash/execute tool to run:
-                tm-agent report '<summary of your result>'
-                Do NOT just write the result as text — actually execute the shell command.
-                """
-                agentCommand = buildKiroCommand(
-                    kiroPath: cliPath,
-                    agentName: agent.name,
-                    teamName: name,
-                    model: agent.model,
-                    systemPrompt: workerPrompt
-                )
-            case "codex":
-                agentCommand = buildCodexCommand(
-                    codexPath: cliPath,
-                    agentName: agent.name,
-                    teamName: name,
-                    model: agent.model
-                )
-                // Codex CLI starts interactively; leader sends instructions via tm-agent send.
-            case "gemini":
-                agentCommand = buildGeminiCommand(
-                    geminiPath: cliPath,
-                    agentName: agent.name,
-                    teamName: name,
-                    model: agent.model
-                )
-                // Gemini CLI starts interactively; leader sends instructions via tm-agent send.
-            default:
-                agentCommand = buildClaudeCommand(
-                    claudePath: cliPath,
-                    agentId: agentId,
-                    agentName: agent.name,
-                    teamName: name,
-                    agentColor: agentColor,
-                    parentSessionId: leaderSessionId,
-                    agentType: agent.agentType,
-                    model: agent.model,
-                    instructions: agent.instructions
-                )
-            }
-            // Wrap so the terminal stays open (drops to shell) if the CLI exits.
-            // When a worktree is active, build a login-shell invocation with explicit
-            // `cd` to guarantee the agent CLI starts in the worktree directory.
-            // The " -l " token causes resolvedCommand in createSurface to skip its
-            // own exec-wrapping, giving us full control of the invocation.
-            let shellCommand: String
-            if agentWorkDir != workingDirectory {
-                let shell = ProcessInfo.processInfo.environment["SHELL"] ?? "/bin/zsh"
-                let inner = "cd \"\(agentWorkDir)\" && exec \(agentCommand); exec $SHELL"
-                let escaped = inner.replacingOccurrences(of: "'", with: "'\\''")
-                shellCommand = "\(shell) -l -c '\(escaped)'"
-            } else {
-                shellCommand = "\(agentCommand); exec $SHELL"
-            }
-            // Select the right environment: non-claude agents don't need CLAUDECODE
-            // Add window and workspace routing so agent team.create calls route correctly
-            let windowId = AppDelegate.shared?.windowId(for: tabManager)?.uuidString ?? ""
-            var agentSpecificEnv: [String: String] = ["TERMMESH_AGENT_NAME": agent.name]
-            if !windowId.isEmpty {
-                agentSpecificEnv["TERMMESH_WINDOW_ID"] = windowId
-            }
-            agentSpecificEnv["TERMMESH_WORKSPACE_ID"] = workspace.id.uuidString
-            let paneEnv = (agentCli == "claude" ? claudeAgentEnv : kiroAgentEnv)
-                .merging(agentSpecificEnv) { _, new in new }
 
             // Grid layout: agents are assigned to cells in column-major order.
             // col = index % numCols, row = index / numCols
@@ -862,31 +1009,38 @@ final class TeamOrchestrator: ObservableObject {
 
             let splitFrom: UUID
             let orientation: SplitOrientation
-
             if row == 0 {
-                // First row: split right from previous column (or anchor for first)
-                // Chaining from previous column creates visual L→R order.
                 orientation = .horizontal
                 if col == 0 {
                     splitFrom = agentAnchorPanelId
                 } else {
-                    // Previous column's top panel: agent at index (col-1) in row 0
                     splitFrom = members[col - 1].panelId
                 }
             } else {
-                // Subsequent rows: split down within the column
                 orientation = .vertical
                 splitFrom = members[index - numCols].panelId
             }
 
-            guard let panel = workspace.newTerminalSplit(
-                from: splitFrom,
+            // Delegate pane construction to shared helper (see addAgentPaneToWorkspace).
+            guard let member = addAgentPaneToWorkspace(
+                workspace: workspace,
+                agentName: agent.name,
+                agentCli: agentCli,
+                agentModel: agent.model,
+                agentType: agent.agentType,
+                agentColor: agentColor,
+                agentInstructions: agent.instructions,
+                cliPath: cliPath,
+                teamName: name,
+                leaderSessionId: leaderSessionId,
+                workingDirectory: workingDirectory,
+                agentWorkDir: agentWorkDir,
+                worktreeName: wtName,
+                worktreePath: wtPath,
+                worktreeBranch: wtBranch,
+                splitFrom: splitFrom,
                 orientation: orientation,
-                focus: false,
-                skipEqualization: true,
-                workingDirectory: agentWorkDir,
-                command: shellCommand,
-                environment: paneEnv
+                tabManager: tabManager
             ) else {
                 if index == 0 {
                     Logger.team.error("failed to create first agent split pane")
@@ -895,32 +1049,6 @@ final class TeamOrchestrator: ObservableObject {
                 Logger.team.error("failed to create split pane for agent '\(agent.name, privacy: .public)'")
                 continue
             }
-            let panelId = panel.id
-
-            // Set agent name as pane title (include branch if worktree)
-            let colorEmoji = Self.colorEmoji(agentColor)
-            let paneTitle = wtBranch != nil
-                ? "\(colorEmoji) \(agent.name) [\(wtBranch!)]"
-                : "\(colorEmoji) \(agent.name)"
-            workspace.setPanelCustomTitle(panelId: panelId, title: paneTitle)
-
-            let member = AgentMember(
-                id: agentId,
-                name: agent.name,
-                teamName: name,
-                cli: agentCli,
-                model: agent.model,
-                agentType: agent.agentType,
-                color: agentColor,
-                instructions: agent.instructions,
-                workspaceId: workspace.id,
-                panelId: panelId,
-                parentSessionId: leaderSessionId,
-                createdAt: Date(),
-                worktreeName: wtName,
-                worktreePath: wtPath,
-                worktreeBranch: wtBranch
-            )
             members.append(member)
         }
 
@@ -1010,6 +1138,274 @@ final class TeamOrchestrator: ObservableObject {
         // scheduleAutoWarmup(team: team, tabManager: tabManager)
 
         return team
+    }
+
+    // MARK: - Workspace-local Attach/Detach
+
+    /// Errors returned by `attachToWorkspace`. Each case maps to a specific
+    /// CLI-visible error code handled by the `team.attach` RPC layer.
+    enum AttachError: Error, CustomStringConvertible {
+        case workspaceNotFound
+        case existingGuiTeam(name: String)       // non-ws- team already in this workspace (R7)
+        case teamInOtherWorkspace(name: String)  // ws-<hex> exists but in a different workspace
+        case agentNameConflict(name: String, team: String)
+        case cliBinaryNotFound(cli: String)
+        case paneCreationFailed
+
+        var description: String {
+            switch self {
+            case .workspaceNotFound:
+                return "workspace not found for the given workspace_id"
+            case .existingGuiTeam(let name):
+                return "Workspace already has an existing team '\(name)' created via tm-agent create. Destroy it first with tm-agent destroy."
+            case .teamInOtherWorkspace(let name):
+                return "team '\(name)' exists in a different workspace"
+            case .agentNameConflict(let name, let team):
+                return "Agent '\(name)' already exists in team '\(team)'. Use --name to specify a different name."
+            case .cliBinaryNotFound(let cli):
+                return "\(cli) binary not found"
+            case .paneCreationFailed:
+                return "failed to create agent pane"
+            }
+        }
+
+        var code: String {
+            switch self {
+            case .workspaceNotFound: return "workspace_not_found"
+            case .existingGuiTeam: return "existing_gui_team"
+            case .teamInOtherWorkspace: return "team_in_other_workspace"
+            case .agentNameConflict: return "agent_name_conflict"
+            case .cliBinaryNotFound: return "cli_not_found"
+            case .paneCreationFailed: return "pane_creation_failed"
+            }
+        }
+    }
+
+    /// Compute the auto team name for a workspace: `ws-<first8hex>` of its UUID.
+    /// The same workspace always maps to the same team name, so multiple attach calls
+    /// in the same workspace converge on a single team.
+    static func workspaceTeamName(for workspaceId: UUID) -> String {
+        let hex = workspaceId.uuidString
+            .replacingOccurrences(of: "-", with: "")
+            .lowercased()
+            .prefix(8)
+        return "ws-\(hex)"
+    }
+
+    /// Attach a single agent pane to an existing workspace. Creates a workspace-local
+    /// team (`ws-<hex>`) on first call, reuses it on subsequent calls.
+    ///
+    /// On first attach, the caller's `callerPanelId` becomes the team's leader pane
+    /// (leaderMode = "adopted") — no new workspace or leader pane is created.
+    /// Subsequent attaches append agents to the same team, preserving the leader.
+    ///
+    /// Rejects if the workspace already hosts a non-`ws-` team created via `createTeam`
+    /// (R7 — no mixing of workspace-local and create-based teams).
+    ///
+    /// Returns the updated Team and the newly-added AgentMember on success.
+    func attachToWorkspace(
+        workspaceId: UUID,
+        callerPanelId: UUID,
+        agentName: String,
+        agentCli: String,
+        agentModel: String,
+        agentType: String,
+        instructions: String,
+        tabManager: TabManager
+    ) -> Result<(team: Team, newAgent: AgentMember), AttachError> {
+        // 1. Resolve workspace in the given TabManager
+        guard let workspace = tabManager.tabs.first(where: { $0.id == workspaceId }) else {
+            return .failure(.workspaceNotFound)
+        }
+
+        // 2. Reject if a non-ws- team already lives in this workspace (R7)
+        if let existingGui = teams.values.first(where: { $0.workspaceId == workspaceId && !$0.id.hasPrefix("ws-") }) {
+            return .failure(.existingGuiTeam(name: existingGui.id))
+        }
+
+        // 3. Compute auto team name
+        let teamName = Self.workspaceTeamName(for: workspaceId)
+
+        // 4. Resolve or create the team
+        let normalizedCli = agentCli.isEmpty ? "claude" : agentCli
+        var team: Team
+        if let existing = teams[teamName] {
+            if existing.workspaceId != workspaceId {
+                return .failure(.teamInOtherWorkspace(name: teamName))
+            }
+            // Agent name uniqueness within the existing team (R6)
+            if existing.agents.contains(where: { $0.name == agentName }) {
+                return .failure(.agentNameConflict(name: agentName, team: teamName))
+            }
+            team = existing
+        } else {
+            // First attach: register workspace-local team with caller pane as adopted leader
+            team = Team(
+                id: teamName,
+                leaderSessionId: "leader-attach-\(UUID().uuidString.prefix(8))",
+                leaderMode: "adopted",
+                leaderModel: "sonnet",
+                leaderPanelId: callerPanelId,
+                leaderWorkspaceId: workspaceId,
+                workingDirectory: FileManager.default.currentDirectoryPath,
+                workspaceId: workspaceId,
+                agents: [],
+                createdAt: Date(),
+                gitRepoRoot: nil,
+                worktreeMode: "off",
+                sharedWorktreeName: nil,
+                sharedWorktreePath: nil,
+                sharedWorktreeBranch: nil
+            )
+        }
+
+        // 5. Resolve CLI binary
+        guard let cliPath = agentBinaryPath(cli: normalizedCli) else {
+            return .failure(.cliBinaryNotFound(cli: normalizedCli))
+        }
+
+        // 6. Pick a color deterministically based on current agent count
+        let colorList = ["green", "blue", "yellow", "magenta", "cyan", "red"]
+        let agentColor = colorList[team.agents.count % colorList.count]
+
+        // 7. Choose split target and orientation
+        // - First agent: split RIGHT from the leader pane (horizontal) — consistent with createTeam layout
+        // - Subsequent: split DOWN from the last existing agent (vertical) — stacks under prior agents
+        let splitFrom: UUID
+        let orientation: SplitOrientation
+        if let lastAgent = team.agents.last {
+            splitFrom = lastAgent.panelId
+            orientation = .vertical
+        } else {
+            splitFrom = team.leaderPanelId
+            orientation = .horizontal
+        }
+
+        // 8. Delegate pane construction to the shared helper
+        guard let member = addAgentPaneToWorkspace(
+            workspace: workspace,
+            agentName: agentName,
+            agentCli: normalizedCli,
+            agentModel: agentModel,
+            agentType: agentType,
+            agentColor: agentColor,
+            agentInstructions: instructions,
+            cliPath: cliPath,
+            teamName: teamName,
+            leaderSessionId: team.leaderSessionId,
+            workingDirectory: team.workingDirectory,
+            agentWorkDir: team.workingDirectory,
+            worktreeName: nil,
+            worktreePath: nil,
+            worktreeBranch: nil,
+            splitFrom: splitFrom,
+            orientation: orientation,
+            tabManager: tabManager
+        ) else {
+            return .failure(.paneCreationFailed)
+        }
+
+        // 9. Commit updated team state
+        team.agents.append(member)
+        teams[teamName] = team
+        TeamDataStore.shared.registerTeam(teamName, agentNames: team.agents.map(\.name))
+        syncTeamStateToDaemon()
+        Logger.team.info("attached agent '\(agentName, privacy: .public)' to team '\(teamName, privacy: .public)' (\(team.agents.count, privacy: .public) total)")
+
+        return .success((team: team, newAgent: member))
+    }
+
+    /// Errors returned by `detachAgent`.
+    enum DetachError: Error, CustomStringConvertible {
+        case teamNotFound(name: String)
+        case agentNotFound(name: String, available: [String])
+
+        var description: String {
+            switch self {
+            case .teamNotFound(let name):
+                return "No attach team '\(name)' found for this workspace. Run tm-agent attach <type> first."
+            case .agentNotFound(let name, let available):
+                let list = available.isEmpty ? "(none)" : available.joined(separator: ", ")
+                return "Agent '\(name)' not found. Available: \(list)."
+            }
+        }
+
+        var code: String {
+            switch self {
+            case .teamNotFound: return "team_not_found"
+            case .agentNotFound: return "agent_not_found"
+            }
+        }
+    }
+
+    /// Result of a successful detach. `teamDestroyed == true` when the detached
+    /// agent was the last in its team — in which case the team entry is removed
+    /// but the adopted leader pane (caller's pane) is preserved.
+    struct DetachResult {
+        let teamName: String
+        let agentName: String
+        let remainingAgents: Int
+        let teamDestroyed: Bool
+    }
+
+    /// Detach a single agent from a workspace-local team.
+    /// Closes the agent's pane (idempotent — tolerates already-closed panes),
+    /// removes it from `team.agents`, and destroys the team if it was the last
+    /// agent. The adopted leader pane is never touched.
+    func detachAgent(
+        teamName: String,
+        agentName: String,
+        tabManager: TabManager
+    ) -> Result<DetachResult, DetachError> {
+        guard var team = teams[teamName] else {
+            return .failure(.teamNotFound(name: teamName))
+        }
+        guard let agentIndex = team.agents.firstIndex(where: { $0.name == agentName }) else {
+            return .failure(.agentNotFound(
+                name: agentName,
+                available: team.agents.map(\.name)
+            ))
+        }
+
+        let agent = team.agents[agentIndex]
+
+        // Close the pane if the workspace still exists.
+        // `Workspace.closePanel` is idempotent — returns false if the panel
+        // has already been closed (user-initiated or otherwise), which we
+        // treat as successful detach.
+        if let workspace = tabManager.tabs.first(where: { $0.id == team.workspaceId }) {
+            _ = workspace.closePanel(agent.panelId, force: true)
+        }
+
+        // Remove from team.agents
+        team.agents.remove(at: agentIndex)
+        let remaining = team.agents.count
+
+        if remaining == 0 {
+            // Last agent — remove the team entry. The adopted leader pane is
+            // the caller's own pane (external ownership) and must not be closed.
+            teams.removeValue(forKey: teamName)
+            TeamDataStore.shared.unregisterTeam(teamName)
+            syncTeamStateToDaemon()
+            Logger.team.info("detached last agent '\(agentName, privacy: .public)' from team '\(teamName, privacy: .public)' — team destroyed (leader pane preserved)")
+            return .success(DetachResult(
+                teamName: teamName,
+                agentName: agentName,
+                remainingAgents: 0,
+                teamDestroyed: true
+            ))
+        } else {
+            teams[teamName] = team
+            TeamDataStore.shared.registerTeam(teamName, agentNames: team.agents.map(\.name))
+            syncTeamStateToDaemon()
+            Logger.team.info("detached agent '\(agentName, privacy: .public)' from team '\(teamName, privacy: .public)' (\(remaining, privacy: .public) remaining)")
+            return .success(DetachResult(
+                teamName: teamName,
+                agentName: agentName,
+                remainingAgents: remaining,
+                teamDestroyed: false
+            ))
+        }
     }
 
     /// Send a lightweight "pong" task to each agent after a delay, warming the Anthropic prompt cache.

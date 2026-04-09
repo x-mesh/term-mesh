@@ -177,10 +177,22 @@ If OMC's keyword detector fires `[MODE: TEAM]` or `[MAGIC KEYWORD: TEAM]`:
 **All operations** use `tm-agent` (Rust, ~2ms; fallback `./scripts/tm-agent.sh` ~10ms):
 ```bash
 # Team lifecycle
-tm-agent create [N] [--claude-leader]
+tm-agent create [N] [--claude-leader]          # creates a new workspace with agents
 tm-agent destroy
 tm-agent status
 tm-agent list
+
+# Workspace-local attach/detach (NO new workspace — uses the caller's current one)
+tm-agent attach <agent_type> [--name N] [--model M] [--cli claude|codex|kiro|gemini]
+tm-agent detach <agent_name>
+# Examples:
+#   tm-agent attach reviewer                    # split reviewer pane into current workspace
+#   tm-agent attach executor --model opus       # opus-backed executor
+#   tm-agent attach security --name sec1        # custom agent name
+#   tm-agent detach reviewer                    # close reviewer pane, keep leader pane
+# First attach auto-creates team `ws-<first8hex>` from the current workspace UUID.
+# The calling pane becomes the leader (adopted). Last detach destroys the team but
+# preserves the leader pane. Rejected if the workspace already hosts a `create`-based team.
 
 # Leader → agent communication
 tm-agent send <agent> '<instruction>'
