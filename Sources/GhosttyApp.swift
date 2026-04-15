@@ -503,11 +503,47 @@ class GhosttyApp {
     }
 
     private func loadDefaultConfigFilesWithLegacyFallback(_ config: ghostty_config_t) {
+        loadTermMeshBaselineDefaults(config)
         ghostty_config_load_default_files(config)
         loadLegacyGhosttyConfigIfNeeded(config)
         loadTermMeshThemeOverride(config)
         loadTermMeshSettingsOverride(config)
         ghostty_config_finalize(config)
+    }
+
+    /// Baseline defaults loaded BEFORE user config so user's ~/.config/ghostty/config
+    /// can still override. Keeps out-of-the-box behavior sane for common pain points
+    /// (e.g. SSHing into servers without xterm-ghostty terminfo).
+    private func loadTermMeshBaselineDefaults(_ config: ghostty_config_t) {
+        let contents = """
+        # term-mesh baseline defaults. User config overrides these.
+        shell-integration-features = ssh-env,ssh-terminfo
+        """
+        guard let url = Self.baselineDefaultsURL() else { return }
+        do {
+            try FileManager.default.createDirectory(
+                at: url.deletingLastPathComponent(),
+                withIntermediateDirectories: true
+            )
+            try contents.write(to: url, atomically: true, encoding: .utf8)
+        } catch {
+            #if DEBUG
+            Self.initLog("failed to write baseline defaults: \(error)")
+            #endif
+            return
+        }
+        url.path.withCString { path in
+            ghostty_config_load_file(config, path)
+        }
+    }
+
+    private static func baselineDefaultsURL() -> URL? {
+        guard let dir = FileManager.default.urls(
+            for: .applicationSupportDirectory, in: .userDomainMask
+        ).first else { return nil }
+        return dir
+            .appendingPathComponent("com.term-mesh.app", isDirectory: true)
+            .appendingPathComponent("baseline-defaults.ghostty")
     }
 
 

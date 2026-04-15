@@ -24,7 +24,7 @@ APP_VERSION   := $(shell grep 'MARKETING_VERSION' GhosttyTabs.xcodeproj/project.
 DMG_NAME      := term-mesh-macos-$(APP_VERSION).dmg
 PROJECT_DIR   := $(shell pwd)
 
-.PHONY: build prod deploy deploy-prod dmg run stop clean daemon test install-commands
+.PHONY: build prod deploy deploy-prod dmg run stop clean daemon test install-commands sentry-upload-dsym
 
 build:
 	@echo "==> Generating BuildInfo.swift..."
@@ -92,11 +92,12 @@ deploy: build
 	@echo "==> Re-signing app bundle (binaries added after initial sign)..."
 	@codesign --force --deep --sign - "$(INSTALL_APP)"
 	@# Update symlinks (term-mesh = Swift CLI from app bundle, term-mesh-run = Rust PTY wrapper)
-	@ln -sf "$(INSTALL_APP)/Contents/Resources/bin/term-mesh" "$(HOME)/bin/term-mesh"
-	@ln -sf "$(PROJECT_DIR)/daemon/target/release/term-meshd" "$(HOME)/bin/term-meshd"
-	@ln -sf "$(PROJECT_DIR)/daemon/target/release/term-mesh-run" "$(HOME)/bin/term-mesh-run"
+	@mkdir -p "$(HOME)/.local/bin"
+	@ln -sf "$(INSTALL_APP)/Contents/Resources/bin/term-mesh" "$(HOME)/.local/bin/term-mesh"
+	@ln -sf "$(PROJECT_DIR)/daemon/target/release/term-meshd" "$(HOME)/.local/bin/term-meshd"
+	@ln -sf "$(PROJECT_DIR)/daemon/target/release/term-mesh-run" "$(HOME)/.local/bin/term-mesh-run"
 	@echo "==> Starting daemon..."
-	@nohup "$(HOME)/bin/term-meshd" > /tmp/term-meshd.log 2>&1 & sleep 0.5
+	@nohup "$(HOME)/.local/bin/term-meshd" > /tmp/term-meshd.log 2>&1 & sleep 0.5
 	@echo "==> Launching term-mesh..."
 	@open "$(INSTALL_APP)"
 	@echo "==> Deployed to $(INSTALL_APP)"
@@ -135,6 +136,7 @@ prod:
 			tail -20 /tmp/term-mesh-cargo.log; \
 			exit 1; \
 		fi
+	@$(MAKE) sentry-upload-dsym DSYM_DIR="$(PROD_DIR)"
 	@echo ""
 	@echo "================================================"
 	@echo "  Release build complete!"
@@ -167,16 +169,43 @@ deploy-prod: daemon prod
 	@-cp "$(PROJECT_DIR)/daemon/target/release/tm-agent" "$(INSTALL_APP)/Contents/Resources/bin/tm-agent" 2>/dev/null || true
 	@echo "==> Re-signing app bundle (binaries added after initial sign)..."
 	@codesign --force --deep --sign - "$(INSTALL_APP)"
-	@ln -sf "$(INSTALL_APP)/Contents/Resources/bin/term-mesh" "$(HOME)/bin/term-mesh"
-	@ln -sf "$(PROJECT_DIR)/daemon/target/release/term-meshd" "$(HOME)/bin/term-meshd"
-	@ln -sf "$(PROJECT_DIR)/daemon/target/release/term-mesh-run" "$(HOME)/bin/term-mesh-run"
-	@ln -sf "$(PROJECT_DIR)/daemon/target/release/tm-agent" "$(HOME)/bin/tm-agent" 2>/dev/null || true
+	@mkdir -p "$(HOME)/.local/bin"
+	@ln -sf "$(INSTALL_APP)/Contents/Resources/bin/term-mesh" "$(HOME)/.local/bin/term-mesh"
+	@ln -sf "$(PROJECT_DIR)/daemon/target/release/term-meshd" "$(HOME)/.local/bin/term-meshd"
+	@ln -sf "$(PROJECT_DIR)/daemon/target/release/term-mesh-run" "$(HOME)/.local/bin/term-mesh-run"
+	@ln -sf "$(PROJECT_DIR)/daemon/target/release/tm-agent" "$(HOME)/.local/bin/tm-agent" 2>/dev/null || true
 	@echo "==> Starting daemon..."
-	@nohup "$(HOME)/bin/term-meshd" > /tmp/term-meshd.log 2>&1 & sleep 0.5
+	@nohup "$(HOME)/.local/bin/term-meshd" > /tmp/term-meshd.log 2>&1 & sleep 0.5
 	@echo "==> Launching term-mesh..."
 	@open "$(INSTALL_APP)"
 	@echo "==> Deployed Release to $(INSTALL_APP)"
 	@$(MAKE) install-commands
+
+# Upload dSYMs for Sentry symbolication. Non-fatal: skipped gracefully if
+# sentry-cli is missing, auth is absent, or DSYM_DIR contains no .dSYM bundles.
+# DSYM_DIR defaults to the Release build dir; override when uploading elsewhere.
+DSYM_DIR ?= $(PROD_DIR)
+sentry-upload-dsym:
+	@if ! command -v sentry-cli >/dev/null 2>&1; then \
+		echo "==> sentry-cli not installed; skipping dSYM upload"; \
+		exit 0; \
+	fi
+	@if ! sentry-cli info >/dev/null 2>&1; then \
+		echo "==> sentry-cli not authenticated; skipping dSYM upload"; \
+		exit 0; \
+	fi
+	@APP_DSYM="$(DSYM_DIR)/term-mesh.app.dSYM"; \
+	CLI_DSYM="$(DSYM_DIR)/term-mesh.dSYM"; \
+	ARGS=""; \
+	[ -d "$$APP_DSYM" ] && ARGS="$$ARGS $$APP_DSYM"; \
+	[ -d "$$CLI_DSYM" ] && ARGS="$$ARGS $$CLI_DSYM"; \
+	if [ -z "$$ARGS" ]; then \
+		echo "==> No term-mesh dSYMs found in $(DSYM_DIR); skipping upload"; \
+		exit 0; \
+	fi; \
+	echo "==> Uploading dSYMs to Sentry..."; \
+	sentry-cli debug-files upload --include-sources $$ARGS || \
+		echo "==> dSYM upload failed (non-fatal)"
 
 dmg: prod
 	@echo "==> Verifying daemon binaries..."

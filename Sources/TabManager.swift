@@ -381,8 +381,14 @@ class TabManager: ObservableObject {
 
     // MARK: - Session Save/Restore
 
+    /// Background queue for session save I/O. Serial so writes never interleave.
+    private static let sessionSaveQueue = DispatchQueue(
+        label: "com.term-mesh.session-save",
+        qos: .utility
+    )
+
     func saveSessionState() {
-        // Exclude team workspaces — they are ephemeral (agents die on restart)
+        // Main-thread snapshot (Workspace is @MainActor-isolated).
         let teamWorkspaceIds = Set(
             TeamOrchestrator.shared.teams.values.map { $0.workspaceId }
         )
@@ -390,23 +396,17 @@ class TabManager: ObservableObject {
 
         let encoder = JSONEncoder()
         let workspaceStates = nonTeamTabs.map { workspace -> SavedWorkspaceState in
-            // v2: Serialize bonsplit split tree
             let treeData: Data? = {
                 let snapshot = workspace.bonsplitController.treeSnapshot()
                 return try? encoder.encode(snapshot)
             }()
-
-            // v2: Per-pane directories — for now, all panes share the workspace directory.
-            // Future: track per-pane pwd via OSC 7 callbacks.
-            let paneDirectories: [String: String]? = nil
-
             return SavedWorkspaceState(
                 title: workspace.title,
                 customTitle: workspace.customTitle,
                 directory: workspace.currentDirectory,
                 isPinned: workspace.isPinned,
                 customColor: workspace.customColor,
-                paneDirectories: paneDirectories,
+                paneDirectories: nil,
                 splitTree: treeData,
                 focusedPaneId: workspace.bonsplitController.focusedPaneId?.id.uuidString
             )
@@ -420,12 +420,22 @@ class TabManager: ObservableObject {
             selectedIndex: selectedIndex,
             windowFrame: nil
         )
-        do {
-            let data = try encoder.encode(session)
-            try data.write(to: URL(fileURLWithPath: SessionRestoreSettings.sessionFilePath), options: .atomicWrite)
-            Logger.app.info("session-restore: saved \(workspaceStates.count, privacy: .public) workspace(s) (v2, split trees included)")
-        } catch {
-            Logger.app.error("session-restore: save failed: \(error, privacy: .public)")
+        let sessionFilePath = SessionRestoreSettings.sessionFilePath
+
+        // Off-main JSON encode + atomicWrite. atomicWrite does a rename that
+        // triggers FSEvents/Darwin notify; keeping it on main caused 2s+ hangs
+        // in the 30s periodic save (Sentry TERM-MESH-2).
+        Self.sessionSaveQueue.async {
+            do {
+                let data = try JSONEncoder().encode(session)
+                try data.write(
+                    to: URL(fileURLWithPath: sessionFilePath),
+                    options: .atomicWrite
+                )
+                Logger.app.info("session-restore: saved \(workspaceStates.count, privacy: .public) workspace(s) (v2, split trees included)")
+            } catch {
+                Logger.app.error("session-restore: save failed: \(error, privacy: .public)")
+            }
         }
     }
 

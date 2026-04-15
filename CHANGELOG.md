@@ -2,6 +2,16 @@
 
 All notable changes to term-mesh are documented here.
 
+## [0.93.1] - 2026-04-15
+
+### Fixed
+- **App hang during periodic session save** — `TabManager.saveSessionState()` is called every 30 s and on tab/split churn; previously it ran JSON encoding and an `atomicWrite` on the main thread. The `rename()` behind `atomicWrite` triggers FSEvents/Darwin notify, and under file-watcher pressure this could block main for 2 s+ (Sentry TERM-MESH-2). Session snapshot is still captured on main (required by `@MainActor` isolation), but encoding and the disk write now run on a dedicated serial background queue.
+- **Garbled terminal output when SSHing to servers without `xterm-ghostty` terminfo** — Ghostty defaults `TERM=xterm-ghostty`, which most remote hosts don't have. Shell redraw sequences were mis-interpreted, making every keystroke look like it echoed the previous autosuggestion. term-mesh now writes a baseline Ghostty config that enables `shell-integration-features = ssh-env,ssh-terminfo` out of the box; this installs the terminfo on the remote the first time you connect (falls back to `xterm-256color` if `tic` is unavailable). The baseline is loaded before the user config, so `~/.config/ghostty/config` can still override it.
+
+### Changed
+- **CLI symlinks moved from `~/bin` to `~/.local/bin`** — `make deploy` / `make deploy-prod` used to fail on machines without `~/bin` (the directory isn't created by default on macOS, and isn't on PATH in most default shell setups). Symlinks now go to `~/.local/bin`, which matches the XDG convention and is already on PATH for common setups. The Makefile creates the directory if it's missing.
+- **Sentry dSYM upload is automatic on Release builds** — `make prod` / `make deploy-prod` / `make dmg` now run `sentry-cli debug-files upload --include-sources` at the end of the build. No-ops gracefully if `sentry-cli` is missing, unauthenticated, or no dSYMs are present, so unsigned-in contributors aren't blocked. Crash/hang reports from here on will be symbolicated with Swift file:line + source snippets.
+
 ## [0.93.0] - 2026-04-09
 
 ### Added
