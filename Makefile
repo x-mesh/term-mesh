@@ -216,7 +216,9 @@ dmg: prod
 	@test -f "$(PROJECT_DIR)/daemon/target/release/tm-agent" || \
 		(echo "ERROR: tm-agent not found. Run 'cd daemon && cargo build --release' first." && exit 1)
 	@echo "==> Creating DMG (version $(APP_VERSION))..."
-	@rm -f "$(DMG_NAME)"
+	@# Ensure no stale mount from a previous run blocks create-dmg's detach step
+	@-hdiutil detach "/Volumes/term-mesh" -force >/dev/null 2>&1 || true
+	@rm -f "$(DMG_NAME)" rw.*.$(DMG_NAME)
 	@if command -v create-dmg >/dev/null 2>&1; then \
 		STAGING=$$(mktemp -d) && \
 		cp -R "$(PROD_APP)" "$$STAGING/term-mesh.app" && \
@@ -254,6 +256,10 @@ dmg: prod
 		hdiutil create -volname "term-mesh" -srcfolder "$$STAGING" -ov -format UDZO "$(DMG_NAME)"; \
 		rm -rf "$$STAGING"; \
 	fi
+	@# create-dmg occasionally leaves the read-write intermediate behind when
+	@# Finder detach is slow; clean it up so only the final UDZO remains.
+	@rm -f rw.*.$(DMG_NAME)
+	@-hdiutil detach "/Volumes/term-mesh" -force >/dev/null 2>&1 || true
 	@echo ""
 	@echo "================================================"
 	@echo "  DMG created: $(DMG_NAME)"

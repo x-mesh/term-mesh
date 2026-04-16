@@ -2,6 +2,12 @@
 
 All notable changes to term-mesh are documented here.
 
+## [0.93.2] - 2026-04-16
+
+### Fixed
+- **`claude` wrapper `stop` / `notification` hooks no longer surface "Tab not found" errors to Claude Code's Stop hook log** — `term-mesh claude stop` / `claude notification` are best-effort telemetry auto-injected by the wrapper; stale session mappings (tab closed/renamed between launches, or `claude -p` subprocesses with stale workspace IDs) previously bubbled up as hook failures and spammed Claude Code's hook log. Workspace resolve failures and `notify_target` errors in the `stop`, `idle`, and `notification` subcommands are now caught and the hook returns `OK` instead of throwing. (`CLI/term-mesh.swift`)
+- **`make dmg` no longer fails on stale `/Volumes/term-mesh` mounts or leftover `rw.*.dmg` intermediates** — repeated DMG builds in the same session could hit "resource busy" when a previous `/Volumes/term-mesh` mount hadn't been detached, and `create-dmg` occasionally leaves the read-write intermediate behind when Finder's detach is slow. `make dmg` now force-detaches any lingering `/Volumes/term-mesh` before and after `create-dmg` and removes `rw.*.term-mesh.dmg` intermediates so only the final UDZO image remains. (`Makefile`)
+
 ## [0.93.1] - 2026-04-15
 
 ### Fixed

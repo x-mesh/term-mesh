@@ -4312,7 +4312,24 @@ struct TermMeshCLI {
         let rawInput = String(data: FileHandle.standardInput.readDataToEndOfFile(), encoding: .utf8) ?? ""
         let parsedInput = parseClaudeHookInput(rawInput: rawInput)
         let sessionStore = ClaudeHookSessionStore()
-        let fallbackWorkspaceId = try resolveWorkspaceIdForClaudeHook(workspaceArg, client: client)
+
+        // stop/notification are auto-injected telemetry from the `claude` wrapper
+        // and must never surface errors to Claude Code's Stop hook log. Common
+        // failure modes are stale session mappings (tab closed/renamed) that bubble
+        // up as "Tab not found" — silently return "OK" and exit 0 instead.
+        let isBestEffort = subcommand == "stop" || subcommand == "idle"
+            || subcommand == "notification" || subcommand == "notify"
+
+        let fallbackWorkspaceId: String
+        do {
+            fallbackWorkspaceId = try resolveWorkspaceIdForClaudeHook(workspaceArg, client: client)
+        } catch {
+            if isBestEffort {
+                print("OK")
+                return
+            }
+            throw error
+        }
         let fallbackSurfaceId = try? resolveSurfaceId(surfaceArg, workspaceId: fallbackWorkspaceId, client: client)
 
         switch subcommand {
@@ -4351,10 +4368,16 @@ struct TermMeshCLI {
             // workspace ID may be stale (e.g. subprocess claude -p invocations).
             try? clearClaudeStatus(client: client, workspaceId: workspaceId)
 
-            if let completion = summarizeClaudeHookStop(
+            guard let completion = summarizeClaudeHookStop(
                 parsedInput: parsedInput,
                 sessionRecord: consumedSession
-            ) {
+            ) else {
+                print("OK")
+                return
+            }
+            // Stale surface mapping → notify_target returns "ERROR: Tab not found".
+            // Swallow so Claude Code's Stop hook doesn't log a failure.
+            do {
                 let surfaceId = try resolveSurfaceIdForClaudeHook(
                     consumedSession?.surfaceId ?? surfaceArg,
                     workspaceId: workspaceId,
@@ -4366,7 +4389,7 @@ struct TermMeshCLI {
                 let payload = "\(title)|\(subtitle)|\(body)"
                 let response = try sendV1Command("notify_target \(workspaceId) \(surfaceId) \(payload)", client: client)
                 print(response)
-            } else {
+            } catch {
                 print("OK")
             }
 
@@ -4382,37 +4405,43 @@ struct TermMeshCLI {
                 preferredSurface = mapped.surfaceId
             }
 
-            let surfaceId = try resolveSurfaceIdForClaudeHook(
-                preferredSurface,
-                workspaceId: workspaceId,
-                client: client
-            )
-
-            let title = "Claude Code"
-            let subtitle = sanitizeNotificationField(summary.subtitle)
-            let body = sanitizeNotificationField(summary.body)
-            let payload = "\(title)|\(subtitle)|\(body)"
-
-            if let sessionId = parsedInput.sessionId {
-                try? sessionStore.upsert(
-                    sessionId: sessionId,
+            // Stale surface mapping → notify_target returns "ERROR: Tab not found".
+            // Swallow so Claude Code's Notification hook doesn't log a failure.
+            do {
+                let surfaceId = try resolveSurfaceIdForClaudeHook(
+                    preferredSurface,
                     workspaceId: workspaceId,
-                    surfaceId: surfaceId,
-                    cwd: parsedInput.cwd,
-                    lastSubtitle: summary.subtitle,
-                    lastBody: summary.body
+                    client: client
                 )
-            }
 
-            let response = try sendV1Command("notify_target \(workspaceId) \(surfaceId) \(payload)", client: client)
-            _ = try? setClaudeStatus(
-                client: client,
-                workspaceId: workspaceId,
-                value: "Needs input",
-                icon: "bell.fill",
-                color: "#4C8DFF"
-            )
-            print(response)
+                let title = "Claude Code"
+                let subtitle = sanitizeNotificationField(summary.subtitle)
+                let body = sanitizeNotificationField(summary.body)
+                let payload = "\(title)|\(subtitle)|\(body)"
+
+                if let sessionId = parsedInput.sessionId {
+                    try? sessionStore.upsert(
+                        sessionId: sessionId,
+                        workspaceId: workspaceId,
+                        surfaceId: surfaceId,
+                        cwd: parsedInput.cwd,
+                        lastSubtitle: summary.subtitle,
+                        lastBody: summary.body
+                    )
+                }
+
+                let response = try sendV1Command("notify_target \(workspaceId) \(surfaceId) \(payload)", client: client)
+                _ = try? setClaudeStatus(
+                    client: client,
+                    workspaceId: workspaceId,
+                    value: "Needs input",
+                    icon: "bell.fill",
+                    color: "#4C8DFF"
+                )
+                print(response)
+            } catch {
+                print("OK")
+            }
 
         case "help", "--help", "-h":
             print(
