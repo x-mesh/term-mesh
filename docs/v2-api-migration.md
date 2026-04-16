@@ -138,8 +138,8 @@ v2 suite lives in `tests_v2/` and should:
 - avoid depending on v1 text output formats
 
 VM runners:
-- v1: `ssh term-mesh-vm 'cd /Users/term-mesh/GhosttyTabs && ./scripts/run-tests-v1.sh'`
-- v2: `ssh term-mesh-vm 'cd /Users/term-mesh/GhosttyTabs && ./scripts/run-tests-v2.sh'`
+- v1: `ssh term-mesh-vm 'cd /Users/jinwoo/term-mesh/GhosttyTabs && ./scripts/run-tests-v1.sh'`
+- v2: `ssh term-mesh-vm 'cd /Users/jinwoo/term-mesh/GhosttyTabs && ./scripts/run-tests-v2.sh'`
 
 ## Open Questions
 

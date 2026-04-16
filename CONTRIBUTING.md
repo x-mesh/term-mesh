@@ -54,13 +54,13 @@ zig build -Demit-xcframework=true -Doptimize=ReleaseFast
 ### Basic tests (run on VM)
 
 ```bash
-ssh term-mesh-vm 'cd /Users/term-mesh/GhosttyTabs && xcodebuild -project GhosttyTabs.xcodeproj -scheme term-mesh -configuration Debug -destination "platform=macOS" build && pkill -x "term-mesh DEV" || true && APP=$(find /Users/term-mesh/Library/Developer/Xcode/DerivedData -path "*/Build/Products/Debug/term-mesh DEV.app" -print -quit) && open "$APP" && for i in {1..20}; do [ -S /tmp/term-mesh.sock ] && break; sleep 0.5; done && python3 tests/test_update_timing.py && python3 tests/test_signals_auto.py && python3 tests/test_ctrl_socket.py && python3 tests/test_notifications.py'
+ssh term-mesh-vm 'cd /Users/jinwoo/term-mesh/GhosttyTabs && xcodebuild -project GhosttyTabs.xcodeproj -scheme term-mesh -configuration Debug -destination "platform=macOS" build && pkill -x "term-mesh DEV" || true && APP=$(find /Users/jinwoo/term-mesh/Library/Developer/Xcode/DerivedData -path "*/Build/Products/Debug/term-mesh DEV.app" -print -quit) && open "$APP" && for i in {1..20}; do [ -S /tmp/term-mesh.sock ] && break; sleep 0.5; done && python3 tests/test_update_timing.py && python3 tests/test_signals_auto.py && python3 tests/test_ctrl_socket.py && python3 tests/test_notifications.py'
 ```
 
 ### UI tests (run on VM)
 
 ```bash
-ssh term-mesh-vm 'cd /Users/term-mesh/GhosttyTabs && xcodebuild -project GhosttyTabs.xcodeproj -scheme term-mesh -configuration Debug -destination "platform=macOS" -only-testing:term-meshUITests test'
+ssh term-mesh-vm 'cd /Users/jinwoo/term-mesh/GhosttyTabs && xcodebuild -project GhosttyTabs.xcodeproj -scheme term-mesh -configuration Debug -destination "platform=macOS" -only-testing:term-meshUITests test'
 ```
 
 ## Ghostty Submodule

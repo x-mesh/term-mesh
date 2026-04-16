@@ -5,7 +5,7 @@ set -euo pipefail
 # It is intentionally guarded so we don't accidentally kill the host user's term-mesh instances.
 if [ "$(id -un)" != "term-mesh" ]; then
   echo "ERROR: This script is intended to be run on the term-mesh-vm (user: term-mesh)." >&2
-  echo "Run via: ssh term-mesh-vm 'cd /Users/term-mesh/GhosttyTabs && ./scripts/run-tests-v2.sh'" >&2
+  echo "Run via: ssh term-mesh-vm 'cd /Users/jinwoo/term-mesh/GhosttyTabs && ./scripts/run-tests-v2.sh'" >&2
   exit 2
 fi
 

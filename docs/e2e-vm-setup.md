@@ -70,7 +70,7 @@ ssh term-mesh-vm 'whoami'   # → term-mesh
 ssh term-mesh-vm
 
 # 프로젝트 클론
-cd /Users/term-mesh
+cd /Users/jinwoo/term-mesh
 git clone <repo-url> GhosttyTabs
 cd GhosttyTabs
 
@@ -81,7 +81,7 @@ cd GhosttyTabs
 ## 5. 첫 빌드 확인
 
 ```bash
-ssh term-mesh-vm 'cd /Users/term-mesh/GhosttyTabs && xcodebuild \
+ssh term-mesh-vm 'cd /Users/jinwoo/term-mesh/GhosttyTabs && xcodebuild \
   -project GhosttyTabs.xcodeproj \
   -scheme term-mesh \
   -configuration Debug \
@@ -104,19 +104,19 @@ ssh term-mesh-vm 'pip3 install --user <패키지>'
 ### Python 통합 테스트 (v1)
 
 ```bash
-ssh term-mesh-vm 'cd /Users/term-mesh/GhosttyTabs && ./scripts/run-tests-v1.sh'
+ssh term-mesh-vm 'cd /Users/jinwoo/term-mesh/GhosttyTabs && ./scripts/run-tests-v1.sh'
 ```
 
 ### Python 통합 테스트 (v2)
 
 ```bash
-ssh term-mesh-vm 'cd /Users/term-mesh/GhosttyTabs && ./scripts/run-tests-v2.sh'
+ssh term-mesh-vm 'cd /Users/jinwoo/term-mesh/GhosttyTabs && ./scripts/run-tests-v2.sh'
 ```
 
 ### Xcode UI 테스트 (특정 클래스)
 
 ```bash
-ssh term-mesh-vm 'cd /Users/term-mesh/GhosttyTabs && xcodebuild \
+ssh term-mesh-vm 'cd /Users/jinwoo/term-mesh/GhosttyTabs && xcodebuild \
   -project GhosttyTabs.xcodeproj \
   -scheme term-mesh \
   -configuration Debug \
@@ -128,13 +128,13 @@ ssh term-mesh-vm 'cd /Users/term-mesh/GhosttyTabs && xcodebuild \
 ### Xcode 유닛 테스트
 
 ```bash
-ssh term-mesh-vm 'cd /Users/term-mesh/GhosttyTabs && ./scripts/test-unit.sh'
+ssh term-mesh-vm 'cd /Users/jinwoo/term-mesh/GhosttyTabs && ./scripts/test-unit.sh'
 ```
 
 ### 개별 Python 테스트
 
 ```bash
-ssh term-mesh-vm 'cd /Users/term-mesh/GhosttyTabs && python3 tests/test_ctrl_socket.py'
+ssh term-mesh-vm 'cd /Users/jinwoo/term-mesh/GhosttyTabs && python3 tests/test_ctrl_socket.py'
 ```
 
 ## 8. 테스트 스크립트 동작 방식

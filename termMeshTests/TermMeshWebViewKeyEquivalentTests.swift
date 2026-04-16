@@ -5960,15 +5960,15 @@ final class TerminalControllerSidebarDedupeTests: XCTestCase {
 
     func testNormalizeReportedDirectoryTrimsWhitespace() {
         XCTAssertEqual(
-            TerminalController.normalizeReportedDirectory("   /Users/term-mesh/project   "),
-            "/Users/term-mesh/project"
+            TerminalController.normalizeReportedDirectory("   /Users/jinwoo/term-mesh/project   "),
+            "/Users/jinwoo/term-mesh/project"
         )
     }
 
     func testNormalizeReportedDirectoryResolvesFileURL() {
         XCTAssertEqual(
-            TerminalController.normalizeReportedDirectory("file:///Users/term-mesh/project"),
-            "/Users/term-mesh/project"
+            TerminalController.normalizeReportedDirectory("file:///Users/jinwoo/term-mesh/project"),
+            "/Users/jinwoo/term-mesh/project"
         )
     }
 

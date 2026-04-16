@@ -4,7 +4,7 @@
 수정 버그 5가지에 대한 검증 시나리오
 
 Usage (VM에서 실행):
-    ssh term-mesh-vm 'cd /Users/term-mesh/GhosttyTabs && python3 tests/test_duplicate_window.py'
+    ssh term-mesh-vm 'cd /Users/jinwoo/term-mesh/GhosttyTabs && python3 tests/test_duplicate_window.py'
 
 Prerequisites:
     - term-mesh Debug 앱이 실행 중이어야 함
