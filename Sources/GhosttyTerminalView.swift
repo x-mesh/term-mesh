@@ -449,6 +449,28 @@ final class TerminalSurface: Identifiable, ObservableObject {
         }
     }
 
+    /// Quick, timeout-bounded reachability probe for a filesystem path.
+    ///
+    /// Runs `access(path, F_OK)` on a background queue so the stall of a
+    /// broken mount (or similar stuck VFS path) cannot block the main
+    /// thread for more than `timeout` seconds. Used by `createSurface` to
+    /// avoid feeding a stale working directory to ghostty, whose internal
+    /// `openat` on that path would otherwise block main and trigger the
+    /// App Hanging watchdog (Sentry TERM-MESH-17).
+    ///
+    /// Returns `true` only when the probe completes within the timeout
+    /// AND reports the path as accessible. Timeout and errors both map to
+    /// `false`, causing the caller to fall back to a default directory.
+    private static func probeDirectoryReachable(_ path: String, timeout: TimeInterval) -> Bool {
+        let sem = DispatchSemaphore(value: 0)
+        var accessible = false
+        DispatchQueue.global(qos: .userInitiated).async {
+            accessible = (access(path, F_OK) == 0)
+            sem.signal()
+        }
+        return sem.wait(timeout: .now() + timeout) == .success && accessible
+    }
+
     private func createSurface(for view: GhosttyNSView) {
         #if DEBUG
         let resourcesDir = getenv("GHOSTTY_RESOURCES_DIR").flatMap { String(cString: $0) } ?? "(unset)"
@@ -644,9 +666,24 @@ final class TerminalSurface: Identifiable, ObservableObject {
             return "\(shell) -l -c 'exec \(escaped)'"
         }()
 
-        if let workingDirectory, !workingDirectory.isEmpty {
+        // Drop the working directory if it doesn't respond to a quick reachability
+        // probe. A stale path (unmounted network share, spun-down external drive,
+        // broken SSHFS, …) will otherwise cause ghostty's internal openat on this
+        // path to block the main thread, tripping the App Hanging watchdog
+        // (Sentry TERM-MESH-17). Passing nil lets ghostty fall back to HOME.
+        let usableWorkingDirectory: String? = {
+            guard let dir = workingDirectory, !dir.isEmpty else { return nil }
+            return Self.probeDirectoryReachable(dir, timeout: 0.3) ? dir : nil
+        }()
+        #if DEBUG
+        if let dir = workingDirectory, !dir.isEmpty, usableWorkingDirectory == nil {
+            Self.surfaceLog("createSurface workingDirectory unreachable, falling back to HOME surface=\(id.uuidString) dir=\(dir)")
+        }
+        #endif
+
+        if let usableWorkingDirectory {
             if let resolvedCommand {
-                workingDirectory.withCString { cWorkingDir in
+                usableWorkingDirectory.withCString { cWorkingDir in
                     resolvedCommand.withCString { cCmd in
                         surfaceConfig.working_directory = cWorkingDir
                         surfaceConfig.command = cCmd
@@ -654,7 +691,7 @@ final class TerminalSurface: Identifiable, ObservableObject {
                     }
                 }
             } else {
-                workingDirectory.withCString { cWorkingDir in
+                usableWorkingDirectory.withCString { cWorkingDir in
                     surfaceConfig.working_directory = cWorkingDir
                     createSurface()
                 }
