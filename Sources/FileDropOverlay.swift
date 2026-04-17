@@ -86,7 +86,11 @@ enum DragOverlayRoutingPolicy {
         return hasBonsplitTabTransfer(pasteboardTypes) || hasSidebarTabReorder(pasteboardTypes)
     }
 
-    private static func isDragMouseEvent(_ eventType: NSEvent.EventType?) -> Bool {
+    /// `true` when the current NSApp event is a drag-motion event. Callers use this
+    /// to gate NSPasteboard(name: .drag) access so idle-layout hit tests don't
+    /// probe stuck NSFilePromiseReceiver entries from a prior external drag
+    /// (Sentry TERM-MESH-19).
+    static func isDragMouseEvent(_ eventType: NSEvent.EventType?) -> Bool {
         eventType == .leftMouseDragged
             || eventType == .rightMouseDragged
             || eventType == .otherMouseDragged
@@ -175,8 +179,18 @@ final class FileDropOverlayView: NSView {
     // file-drop, bonsplit tab drags, and sidebar tab reorder drags cannot conflict.
 
     override func hitTest(_ point: NSPoint) -> NSView? {
-        let pb = NSPasteboard(name: .drag)
         let eventType = NSApp.currentEvent?.type
+
+        // Short-circuit non-drag events BEFORE touching NSPasteboard(name: .drag).
+        // Reading `.types` can wake stuck NSFilePromiseReceiver entries left by a
+        // prior external (Finder) drag and block main during idle layout — the
+        // suspected path for Sentry TERM-MESH-19 (system-only hang whose stack
+        // bottoms out in loadFileSystemItemAsynchronously). The routing policy
+        // already rejects non-drag events; we just move the check above the
+        // pasteboard read so the pasteboard is never consulted in the idle path.
+        guard DragOverlayRoutingPolicy.isDragMouseEvent(eventType) else { return nil }
+
+        let pb = NSPasteboard(name: .drag)
         let shouldCapture = DragOverlayRoutingPolicy.shouldCaptureFileDropOverlay(
             pasteboardTypes: pb.types,
             eventType: eventType
