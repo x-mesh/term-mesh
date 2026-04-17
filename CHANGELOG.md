@@ -2,6 +2,15 @@
 
 All notable changes to term-mesh are documented here.
 
+## [0.94.0] - 2026-04-17
+
+### Fixed
+- **Observer/NSAlert leak when two deferred alerts race for the same key-window transition** — the v0.93.3 fix for the notification-permission App Hanging warning (Sentry TERM-MESH-18) installed a one-shot `NSWindow.didBecomeKeyNotification` observer to wait for a key window before presenting the sheet. If two alerts queued before any window was focused (e.g. permission prompt + quit warning while the app was activated from the menu bar) and a window then became key, the first observer would attach its sheet and the second observer fell through its guard without deregistering — leaking the observer, the `NSAlert`, and its completion closure for the remainder of the session. A Settings/About window with an attached sheet could also silently swallow an alert intended for a terminal window. The observer now re-registers cleanly when the key window already has a sheet attached, so the alert still surfaces on the next key-window transition without leaking.
+
+### Thanks to 1 contributor!
+
+- [@JINWOO-J](https://github.com/JINWOO-J)
+
 ## [0.93.3] - 2026-04-17
 
 ### Fixed
