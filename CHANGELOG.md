@@ -2,6 +2,18 @@
 
 All notable changes to term-mesh are documented here.
 
+## [0.93.3] - 2026-04-17
+
+### Fixed
+- **App hang when opening a terminal whose last working directory is on a stalled filesystem** — if the previous working directory (OSC 7 / session snapshot) pointed at an unmounted network share, a spun-down external drive, or a broken SSHFS, Ghostty's internal `openat(workingDir)` during surface creation blocked the main thread for 2 s+ and tripped macOS's App Hanging watchdog (Sentry TERM-MESH-17). The working directory is now probed on a background queue with a 300 ms timeout before handing it to Ghostty; an unreachable path falls back to `$HOME` so a new terminal always opens immediately.
+- **App hang when the notification-permission prompt appeared without a focused window** — `TerminalNotificationStore.promptToEnableNotifications` falls through `NSAlert.presentAsSheet` to a fallback path when no key/main window is available. That fallback used `runModal()`, which spins a nested modal event loop on the main thread and trips the App Hanging watchdog if the app is activated from the menu bar / background with no visible window (Sentry TERM-MESH-18). The fallback now defers presentation via a one-shot `NSWindow.didBecomeKeyNotification` observer — the sheet shows as soon as any window becomes key, without ever blocking main.
+- **Possible app hang during SwiftUI layout involving drag-and-drop** — `FileDropOverlayView.hitTest` used to read `NSPasteboard(name: .drag).types` on every AppKit hit test, including idle-layout probes that run outside any active drag. If a prior external (Finder) drag left an `NSFilePromiseReceiver` on the drag pasteboard, macOS could wake the receiver during that probe and stall the main thread (Sentry TERM-MESH-19). The pasteboard read is now gated on an active drag-motion event; idle layout no longer touches the drag pasteboard at all. No behavior change for real drags.
+- **New windows no longer stack on top of the previously-focused window** — `LastWindowPosition.restore()` used to apply the saved window position to every new window, so each new window jumped to the position of the most recently focused window and the cascade logic only offset it slightly. It now restores only the first window per app launch; subsequent new windows cascade from fresh positions. (ghostty submodule)
+
+### Thanks to 1 contributor!
+
+- [@JINWOO-J](https://github.com/JINWOO-J)
+
 ## [0.93.2] - 2026-04-16
 
 ### Fixed
