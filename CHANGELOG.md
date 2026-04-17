@@ -2,6 +2,15 @@
 
 All notable changes to term-mesh are documented here.
 
+## [0.95.0] - 2026-04-17
+
+### Fixed
+- **Ctrl+C no longer leaks `9;5u` text after a TUI app crashes or is killed** — TUI apps (Claude Code CLI, nvim, helix, etc.) enable the kitty keyboard protocol's "disambiguate escape codes" mode via `CSI > 1 u` on startup and are expected to disable it via `CSI < u` on exit. If the app crashed, was force-quit, or exited abnormally (for example after an API error during `/compact`), the flags remained on the terminal's protocol stack, causing the next Ctrl+C at the shell prompt to be encoded as `\e[99;5u` — which the shell would then echo to the screen as `9;5u9;5u9;5u…` instead of delivering SIGINT. term-mesh's zsh and bash shell integration now automatically pops any leftover kitty keyboard flags on every prompt render, so Ctrl+C recovers cleanly on the very next prompt without any user configuration or terminal restart. Running TUIs are unaffected because they re-push their flags on each prompt cycle.
+
+### Thanks to 1 contributor!
+
+- [@JINWOO-J](https://github.com/JINWOO-J)
+
 ## [0.94.0] - 2026-04-17
 
 ### Fixed
