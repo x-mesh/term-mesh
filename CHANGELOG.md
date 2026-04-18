@@ -2,6 +2,15 @@
 
 All notable changes to term-mesh are documented here.
 
+## [0.96.0] - 2026-04-19
+
+### Fixed
+- **New windows no longer duplicate the primary window's restored session** — `TabManager.init` used to re-run session restore for every new window whose `initialWorkingDirectory` was `nil`, so opening a second term-mesh window brought up the same workspaces as the first one (the saved session, restored twice). Session restore is now an explicit opt-in: only the primary window created at launch by `TermMeshApp` passes `restoreSavedSession: true`. Secondary windows opened via the app menu, Cmd+N, or the dock start with a single fresh workspace, so they no longer shadow the primary window's tabs.
+
+### Thanks to 1 contributor!
+
+- [@JINWOO-J](https://github.com/JINWOO-J)
+
 ## [0.95.0] - 2026-04-17
 
 ### Fixed
