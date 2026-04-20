@@ -63,6 +63,13 @@ _termmesh_ports_kick() {
 }
 
 _termmesh_prompt_command() {
+    # Pop any leftover kitty keyboard protocol flags. TUI apps (Claude Code CLI,
+    # nvim, etc.) push flags via CSI > u on startup and should pop via CSI < u
+    # on exit; if they crash or are killed mid-run, the flags stay on the stack
+    # and the next Ctrl+C is encoded as \e[99;5u — visible as "9;5u" text when
+    # the shell doesn't speak kitty keyboard protocol. No-op when empty.
+    printf '\e[<u'
+
     [[ -S "${TERMMESH_SOCKET_PATH:-$CMUX_SOCKET_PATH}" ]] || return 0
     [[ -n "${TERMMESH_TAB_ID:-$CMUX_TAB_ID}" ]] || return 0
     [[ -n "${TERMMESH_PANEL_ID:-$CMUX_PANEL_ID}" ]] || return 0

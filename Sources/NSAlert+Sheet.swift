@@ -21,24 +21,29 @@ extension NSAlert {
         }
 
         // No window available — wait for one to become key, then present the sheet.
-        // Strong `self` capture keeps this NSAlert alive until the observer fires;
-        // the observer removes itself on first delivery to break the retain.
-        //
-        // The token is stored in a reference-typed box so the sendable closure can
-        // read it without the "mutated after capture" warning on the var itself.
+        // Remove the observer unconditionally on every delivery and re-register when
+        // the key window already has an attached sheet, so concurrent deferred alerts
+        // don't leak observer B after observer A occupies the sheet slot.
         final class ObserverBox { var token: NSObjectProtocol? }
         let box = ObserverBox()
-        box.token = NotificationCenter.default.addObserver(
-            forName: NSWindow.didBecomeKeyNotification,
-            object: nil,
-            queue: .main
-        ) { [self] note in
-            guard let win = note.object as? NSWindow, win.attachedSheet == nil else { return }
-            if let token = box.token { NotificationCenter.default.removeObserver(token) }
-            self.beginSheetModal(for: win) { response in
-                completion?(response)
+        func register() {
+            box.token = NotificationCenter.default.addObserver(
+                forName: NSWindow.didBecomeKeyNotification,
+                object: nil,
+                queue: .main
+            ) { [self] note in
+                if let token = box.token { NotificationCenter.default.removeObserver(token) }
+                box.token = nil
+                guard let win = note.object as? NSWindow, win.attachedSheet == nil else {
+                    register()
+                    return
+                }
+                self.beginSheetModal(for: win) { response in
+                    completion?(response)
+                }
             }
         }
+        register()
     }
 }
 

@@ -34,10 +34,9 @@ if (( ${#PATHS[@]} == 0 )); then
 else
   info "Checking out declared submodules at parent's pinned SHAs…"
   git submodule update --init --recursive "${PATHS[@]}"
+  info "Summary:"
+  git submodule status "${PATHS[@]}" | sed 's/^/  /'
 fi
-
-info "Summary:"
-git submodule status "${PATHS[@]}" | sed 's/^/  /'
 
 # Optional convenience: offer to enable auto-recursion globally on this
 # machine so future `git pull` / `git checkout` update submodules

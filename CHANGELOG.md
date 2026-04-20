@@ -2,6 +2,33 @@
 
 All notable changes to term-mesh are documented here.
 
+## [0.96.0] - 2026-04-19
+
+### Fixed
+- **New windows no longer duplicate the primary window's restored session** — `TabManager.init` used to re-run session restore for every new window whose `initialWorkingDirectory` was `nil`, so opening a second term-mesh window brought up the same workspaces as the first one (the saved session, restored twice). Session restore is now an explicit opt-in: only the primary window created at launch by `TermMeshApp` passes `restoreSavedSession: true`. Secondary windows opened via the app menu, Cmd+N, or the dock start with a single fresh workspace, so they no longer shadow the primary window's tabs.
+
+### Thanks to 1 contributor!
+
+- [@JINWOO-J](https://github.com/JINWOO-J)
+
+## [0.95.0] - 2026-04-17
+
+### Fixed
+- **Ctrl+C no longer leaks `9;5u` text after a TUI app crashes or is killed** — TUI apps (Claude Code CLI, nvim, helix, etc.) enable the kitty keyboard protocol's "disambiguate escape codes" mode via `CSI > 1 u` on startup and are expected to disable it via `CSI < u` on exit. If the app crashed, was force-quit, or exited abnormally (for example after an API error during `/compact`), the flags remained on the terminal's protocol stack, causing the next Ctrl+C at the shell prompt to be encoded as `\e[99;5u` — which the shell would then echo to the screen as `9;5u9;5u9;5u…` instead of delivering SIGINT. term-mesh's zsh and bash shell integration now automatically pops any leftover kitty keyboard flags on every prompt render, so Ctrl+C recovers cleanly on the very next prompt without any user configuration or terminal restart. Running TUIs are unaffected because they re-push their flags on each prompt cycle.
+
+### Thanks to 1 contributor!
+
+- [@JINWOO-J](https://github.com/JINWOO-J)
+
+## [0.94.0] - 2026-04-17
+
+### Fixed
+- **Observer/NSAlert leak when two deferred alerts race for the same key-window transition** — the v0.93.3 fix for the notification-permission App Hanging warning (Sentry TERM-MESH-18) installed a one-shot `NSWindow.didBecomeKeyNotification` observer to wait for a key window before presenting the sheet. If two alerts queued before any window was focused (e.g. permission prompt + quit warning while the app was activated from the menu bar) and a window then became key, the first observer would attach its sheet and the second observer fell through its guard without deregistering — leaking the observer, the `NSAlert`, and its completion closure for the remainder of the session. A Settings/About window with an attached sheet could also silently swallow an alert intended for a terminal window. The observer now re-registers cleanly when the key window already has a sheet attached, so the alert still surfaces on the next key-window transition without leaking.
+
+### Thanks to 1 contributor!
+
+- [@JINWOO-J](https://github.com/JINWOO-J)
+
 ## [0.93.3] - 2026-04-17
 
 ### Fixed

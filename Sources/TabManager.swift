@@ -107,13 +107,18 @@ class TabManager: ObservableObject {
 
     init(
         initialWorkingDirectory: String? = nil,
+        restoreSavedSession: Bool = false,
         daemon: (any DaemonService)? = nil,
         notifications: (any NotificationService)? = nil
     ) {
         self.daemon = daemon ?? TermMeshDaemon.shared
         self.notifications = notifications ?? TerminalNotificationStore.shared
-        // Session restore: if enabled and no explicit directory was passed, restore previous workspaces
+        // Session restore: only the primary window (created by TermMeshApp at launch)
+        // opts into restoring the saved session. Secondary windows opened via
+        // AppDelegate.createMainWindow intentionally start with a fresh workspace so
+        // they don't duplicate the primary window's workspaces.
         if initialWorkingDirectory == nil,
+           restoreSavedSession,
            SessionRestoreSettings.mode() == .always,
            let saved = Self.loadSavedSession() {
             restoreSession(saved)
