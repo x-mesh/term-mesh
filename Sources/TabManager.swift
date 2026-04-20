@@ -405,13 +405,14 @@ class TabManager: ObservableObject {
                 let snapshot = workspace.bonsplitController.treeSnapshot()
                 return try? encoder.encode(snapshot)
             }()
+            let paneDirs = Self.collectPaneDirectories(in: workspace)
             return SavedWorkspaceState(
                 title: workspace.title,
                 customTitle: workspace.customTitle,
                 directory: workspace.currentDirectory,
                 isPinned: workspace.isPinned,
                 customColor: workspace.customColor,
-                paneDirectories: nil,
+                paneDirectories: paneDirs.isEmpty ? nil : paneDirs,
                 splitTree: treeData,
                 focusedPaneId: workspace.bonsplitController.focusedPaneId?.id.uuidString
             )
@@ -495,10 +496,28 @@ class TabManager: ObservableObject {
 
         let fm = FileManager.default
         for saved in session.workspaces {
-            let directory = fm.fileExists(atPath: saved.directory)
+            let fallbackDir = fm.fileExists(atPath: saved.directory)
                 ? saved.directory
                 : fm.homeDirectoryForCurrentUser.path
-            let workspace = addWorkspace(workingDirectory: directory, select: false)
+
+            // v2: Pre-decode split tree so we can pick per-pane directories and seed the
+            // root pane with the correct saved cwd (the workspace's root pane is the
+            // leftmost leaf in the saved tree, which may differ from saved.directory —
+            // that one tracks the last-focused pane).
+            let savedTree: ExternalTreeNode? = {
+                guard session.version >= 2, let data = saved.splitTree else { return nil }
+                return try? JSONDecoder().decode(ExternalTreeNode.self, from: data)
+            }()
+            let paneDirs = saved.paneDirectories ?? [:]
+            let rootDir: String = {
+                guard let tree = savedTree,
+                      let firstLeafId = Self.firstLeafTabId(in: tree),
+                      let dir = paneDirs[firstLeafId],
+                      fm.fileExists(atPath: dir) else { return fallbackDir }
+                return dir
+            }()
+
+            let workspace = addWorkspace(workingDirectory: rootDir, select: false)
             if let customTitle = saved.customTitle {
                 workspace.customTitle = customTitle
                 workspace.title = customTitle
@@ -506,9 +525,13 @@ class TabManager: ObservableObject {
             workspace.isPinned = saved.isPinned
             workspace.customColor = saved.customColor
 
-            // v2: Restore split layout from saved tree
-            if session.version >= 2, let treeData = saved.splitTree {
-                restoreSplitTree(treeData, in: workspace, directory: directory)
+            if let tree = savedTree {
+                restoreSplitTree(
+                    tree,
+                    in: workspace,
+                    fallbackDirectory: fallbackDir,
+                    paneDirectories: paneDirs
+                )
             }
         }
 
@@ -522,17 +545,17 @@ class TabManager: ObservableObject {
         Logger.app.info("session-restore: restored \(self.tabs.count, privacy: .public) workspace(s) (v\(version, privacy: .public))")
     }
 
-    /// Rebuild bonsplit split tree from a serialized ExternalTreeNode.
+    /// Rebuild bonsplit split tree from a deserialized ExternalTreeNode.
     /// The workspace already has one pane (created by addWorkspace). We walk the saved tree
     /// recursively: at each split node, split the current pane to produce two children,
     /// then recurse into each subtree. Divider positions are set on the LIVE split UUID
     /// (not the saved one) by querying the tree immediately after each split.
-    private func restoreSplitTree(_ treeData: Data, in workspace: Workspace, directory: String) {
-        guard let savedTree = try? JSONDecoder().decode(ExternalTreeNode.self, from: treeData) else {
-            Logger.app.warning("session-restore: failed to decode split tree")
-            return
-        }
-
+    private func restoreSplitTree(
+        _ savedTree: ExternalTreeNode,
+        in workspace: Workspace,
+        fallbackDirectory: String,
+        paneDirectories: [String: String]
+    ) {
         let paneCount = countPanes(in: savedTree, depth: 0)
         guard paneCount > 1, paneCount <= 128 else {
             if paneCount > 128 {
@@ -544,7 +567,13 @@ class TabManager: ObservableObject {
         }
 
         guard let rootPaneId = workspace.bonsplitController.allPaneIds.first else { return }
-        rebuildSubtree(savedTree, currentPaneId: rootPaneId, workspace: workspace, directory: directory)
+        rebuildSubtree(
+            savedTree,
+            currentPaneId: rootPaneId,
+            workspace: workspace,
+            fallbackDirectory: fallbackDirectory,
+            paneDirectories: paneDirectories
+        )
 
         Logger.app.info("session-restore: rebuilt \(paneCount, privacy: .public) panes from split tree")
     }
@@ -556,7 +585,8 @@ class TabManager: ObservableObject {
         _ node: ExternalTreeNode,
         currentPaneId: PaneID,
         workspace: Workspace,
-        directory: String
+        fallbackDirectory: String,
+        paneDirectories: [String: String]
     ) {
         switch node {
         case .pane:
@@ -566,12 +596,20 @@ class TabManager: ObservableObject {
         case .split(let split):
             let orientation: SplitOrientation = split.orientation == "horizontal" ? .horizontal : .vertical
 
+            // The new pane corresponds to the leftmost leaf of split.second.
+            // Pick its saved cwd so each restored pane launches in its own directory.
+            let newPaneDir = Self.resolvePaneDirectory(
+                for: split.second,
+                paneDirectories: paneDirectories,
+                fallback: fallbackDirectory
+            )
+
             // Split the current pane. The new pane appears as "second" (insertFirst: false).
             // After this: currentPaneId = first child, newPaneId = second child.
             guard let newPaneId = workspace.restoreSplitTerminal(
                 at: currentPaneId,
                 orientation: orientation,
-                directory: directory
+                directory: newPaneDir
             ) else {
                 Logger.app.warning("session-restore: split failed, aborting subtree")
                 return
@@ -591,8 +629,77 @@ class TabManager: ObservableObject {
             }
 
             // Recurse: first child keeps currentPaneId, second child uses newPaneId
-            rebuildSubtree(split.first, currentPaneId: currentPaneId, workspace: workspace, directory: directory)
-            rebuildSubtree(split.second, currentPaneId: newPaneId, workspace: workspace, directory: directory)
+            rebuildSubtree(
+                split.first,
+                currentPaneId: currentPaneId,
+                workspace: workspace,
+                fallbackDirectory: fallbackDirectory,
+                paneDirectories: paneDirectories
+            )
+            rebuildSubtree(
+                split.second,
+                currentPaneId: newPaneId,
+                workspace: workspace,
+                fallbackDirectory: fallbackDirectory,
+                paneDirectories: paneDirectories
+            )
+        }
+    }
+
+    /// Resolve a pane's restore directory: use the leftmost leaf's saved cwd when the path
+    /// still exists, otherwise fall back. Returning the fallback keeps the shell launchable
+    /// even if the saved project was deleted between sessions.
+    private static func resolvePaneDirectory(
+        for node: ExternalTreeNode,
+        paneDirectories: [String: String],
+        fallback: String
+    ) -> String {
+        let fm = FileManager.default
+        guard let tabId = firstLeafTabId(in: node),
+              let dir = paneDirectories[tabId],
+              fm.fileExists(atPath: dir) else { return fallback }
+        return dir
+    }
+
+    /// Walk to the leftmost leaf and return the tab ID its cwd is keyed by in
+    /// `paneDirectories` (prefers the saved selected tab so multi-tab panes restore
+    /// into the tab the user was looking at).
+    private static func firstLeafTabId(in node: ExternalTreeNode) -> String? {
+        switch node {
+        case .pane(let pane):
+            return pane.selectedTabId ?? pane.tabs.first?.id
+        case .split(let split):
+            return firstLeafTabId(in: split.first)
+        }
+    }
+
+    /// Snapshot per-pane working directories keyed by Bonsplit tab UUID string, so restore
+    /// can launch each pane's shell in its original cwd instead of collapsing to the
+    /// workspace-level directory (which only tracks the last-focused pane).
+    private static func collectPaneDirectories(in workspace: Workspace) -> [String: String] {
+        var result: [String: String] = [:]
+        let tree = workspace.bonsplitController.treeSnapshot()
+        walk(tree, workspace: workspace, into: &result)
+        return result
+    }
+
+    private static func walk(
+        _ node: ExternalTreeNode,
+        workspace: Workspace,
+        into dirs: inout [String: String]
+    ) {
+        switch node {
+        case .pane(let pane):
+            for tab in pane.tabs {
+                guard let tabUUID = UUID(uuidString: tab.id),
+                      let panelId = workspace.surfaceIdToPanelId[TabID(uuid: tabUUID)],
+                      let dir = workspace.panelDirectories[panelId],
+                      !dir.isEmpty else { continue }
+                dirs[tab.id] = dir
+            }
+        case .split(let split):
+            walk(split.first, workspace: workspace, into: &dirs)
+            walk(split.second, workspace: workspace, into: &dirs)
         }
     }
 

@@ -2,6 +2,16 @@
 
 All notable changes to term-mesh are documented here.
 
+## [0.97.0] - 2026-04-20
+
+### Fixed
+- **Restored sessions no longer collapse every pane to the same working directory** — when multiple split panes were open in different directories, quitting and relaunching term-mesh used to reopen every pane in a single shared cwd (the last-focused pane's directory). Per-pane working directories are now snapshotted at save time and each restored pane's shell launches in its original directory. Paths that no longer exist fall back to the workspace directory (or `$HOME`) so the shell still opens cleanly.
+- **Secondary windows' titlebar no longer freezes in dark mode under light system appearance** — windows opened via Cmd+N or the app menu did not inject the current ghostty background theme into their SwiftUI environment, so their chrome used `GhosttyTheme.default` (hardcoded black) and ignored later light/dark transitions. Secondary windows now own a live `@State ghosttyTheme` and subscribe to `ghosttyDefaultBackgroundDidChange`, matching the primary window's behavior.
+
+### Thanks to 1 contributor!
+
+- [@JINWOO-J](https://github.com/JINWOO-J)
+
 ## [0.96.0] - 2026-04-19
 
 ### Fixed

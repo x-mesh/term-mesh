@@ -8,6 +8,23 @@ import WebKit
 import Combine
 import ObjectiveC.runtime
 
+/// Mirrors TermMeshApp's primary window setup: owns ghosttyTheme as @State and
+/// refreshes it on the ghostty background-color change notification so secondary
+/// windows' chrome follows light/dark transitions instead of freezing at the
+/// default (black) environment value.
+private struct TermMeshWindowRoot<Content: View>: View {
+    @ViewBuilder let content: () -> Content
+    @State private var ghosttyTheme = GhosttyTheme.current
+
+    var body: some View {
+        content()
+            .environment(\.ghosttyTheme, ghosttyTheme)
+            .onReceive(NotificationCenter.default.publisher(for: .ghosttyDefaultBackgroundDidChange)) { _ in
+                ghosttyTheme = .current
+            }
+    }
+}
+
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDelegate, NSMenuItemValidation {
     static var shared: AppDelegate?
@@ -1122,12 +1139,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         let sidebarSelectionState = SidebarSelectionState()
         let notificationStore = self.notificationStore ?? TerminalNotificationStore.shared
 
-        let root = ContentView(updateViewModel: updateViewModel, windowId: windowId)
-            .environmentObject(tabManager)
-            .environmentObject(notificationStore)
-            .environmentObject(sidebarState)
-            .environmentObject(sidebarSelectionState)
-            .withServices()
+        let root = TermMeshWindowRoot {
+            ContentView(updateViewModel: self.updateViewModel, windowId: windowId)
+                .environmentObject(tabManager)
+                .environmentObject(notificationStore)
+                .environmentObject(sidebarState)
+                .environmentObject(sidebarSelectionState)
+                .withServices()
+        }
 
         let window = NSWindow(
             contentRect: NSRect(x: 0, y: 0, width: 460, height: 360),

@@ -1085,6 +1085,11 @@ final class Workspace: Identifiable, ObservableObject {
         )
         panels[newPanel.id] = newPanel
         panelTitles[newPanel.id] = newPanel.displayTitle
+        // Seed panel directory so titlebar/branch render the restored cwd before
+        // shell integration reports via OSC 7.
+        if !directory.isEmpty {
+            panelDirectories[newPanel.id] = directory
+        }
 
         let newTab = Bonsplit.Tab(
             title: newPanel.displayTitle,
@@ -1101,6 +1106,7 @@ final class Workspace: Identifiable, ObservableObject {
             panels.removeValue(forKey: newPanel.id)
             panelTitles.removeValue(forKey: newPanel.id)
             surfaceIdToPanelId.removeValue(forKey: newTab.id)
+            panelDirectories.removeValue(forKey: newPanel.id)
             return nil
         }
         return newPaneId
