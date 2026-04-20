@@ -2,6 +2,14 @@
 
 All notable changes to term-mesh are documented here.
 
+## [0.98.0] - 2026-04-20
+
+No user-visible changes. Internal release-tooling update only: `/release` now tags the squash-merge SHA on `main` and checks out that tag before building the dSYM, so Sentry debug symbols always match the released binary (previously a divergent local `main` could let an older build upload its dSYMs under the new tag's name).
+
+### Thanks to 1 contributor!
+
+- [@JINWOO-J](https://github.com/JINWOO-J)
+
 ## [0.97.0] - 2026-04-20
 
 ### Fixed

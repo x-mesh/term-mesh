@@ -31,15 +31,15 @@ Prepare a new release for term-mesh. This command updates the changelog, bumps t
    - **Only include changes that affect the end-user experience** - things users will see, feel, or interact with
    - Write clear, user-facing descriptions (not raw commit messages)
    - **Credit contributors inline** (see Contributor Credits below)
-   - Also update `docs-site/content/docs/changelog.mdx` with the same content
+   - The `web/app/docs/changelog` page parses `CHANGELOG.md` at build time — no separate docs file to update
    - If there are no user-facing changes, ask the user if they still want to release
 
 5. **Bump the version in Xcode project**
-   - Update all occurrences of `MARKETING_VERSION` in `GhosttyTabs.xcodeproj/project.pbxproj`
-   - There are typically 4 occurrences (Debug/Release for main app and CLI)
+   - Run `./scripts/bump-version.sh X.Y.Z` — updates all `MARKETING_VERSION` occurrences (typically 6) and bumps `CURRENT_PROJECT_VERSION`
+   - Verify: `grep -c "MARKETING_VERSION = X.Y.Z" GhosttyTabs.xcodeproj/project.pbxproj` should return ≥ 4
 
 6. **Commit and push the release branch**
-   - Stage: `CHANGELOG.md`, `docs-site/content/docs/changelog.mdx`, `GhosttyTabs.xcodeproj/project.pbxproj`
+   - Stage: `CHANGELOG.md`, `GhosttyTabs.xcodeproj/project.pbxproj`
    - Commit message: `Bump version to X.Y.Z`
    - Push: `git push -u origin release/vX.Y.Z`
 
@@ -52,21 +52,31 @@ Prepare a new release for term-mesh. This command updates the changelog, bumps t
    - If CI fails, fix the issues and push again
    - Wait for all checks to pass before proceeding
 
-9. **Merge the PR**
-   - Merge: `gh pr merge --squash --delete-branch`
-   - Switch back to main: `git checkout main && git pull`
+9. **Merge the PR into main**
+   - Target branch is `main` (see CLAUDE.md — main is the released-version branch).
+   - Merge: `gh pr merge <N> --repo JINWOO-J/term-mesh --squash --delete-branch`
+   - Capture the squash-merge commit SHA: `gh pr view <N> --repo JINWOO-J/term-mesh --json mergeCommit --jq '.mergeCommit.oid'` — the tag must point at this SHA.
 
-10. **Create and push the tag**
-    - Create tag: `git tag vX.Y.Z`
-    - Push tag: `git push origin vX.Y.Z`
+10. **Create and push the tag at the squash-merge commit**
+    - `git fetch origin main` (do NOT fast-forward local main — it may carry local-only commits that diverge from the squash-merge result; the tag only needs the remote SHA).
+    - `git tag vX.Y.Z <squash-merge-sha>` — tag the exact commit that got merged to main, not whatever local HEAD happens to be.
+    - `git push origin vX.Y.Z`
 
-11. **Upload dSYM debug symbols to Sentry**
-    - Build Release and upload in one step: `./scripts/upload-dsym.sh --build`
-    - Or upload an existing Release dSYM from DerivedData: `./scripts/upload-dsym.sh`
+11. **Checkout the tag before building dSYM** *(critical — skipping this uploads the previous version's debug symbols)*
+    - `git checkout vX.Y.Z` (detached HEAD on the exact released code)
+    - Verify pbxproj matches: `grep -c "MARKETING_VERSION = X.Y.Z" GhosttyTabs.xcodeproj/project.pbxproj` should return ≥ 4. If not, the tag is wrong — stop and diagnose before building.
+
+12. **Upload dSYM debug symbols to Sentry**
+    - Build Release and upload: `./scripts/upload-dsym.sh --build` (runs from the tag's working tree, so the dSYM UUID matches the released binary)
+    - **Version check:** the script prints `dSYM version: X.Y.Z (N)` — confirm it matches the tag. If it shows an older version, abort and investigate (usually means step 11 was skipped or the tag points at a pre-bump commit).
     - Required for crash symbolication on issues like `EXC_BAD_ACCESS` in Sentry.
-    - If this fails (non-zero exit), the release is still valid — just re-run the script once sentry-cli auth is fixed.
+    - If upload fails (non-zero exit), the release is still valid — just re-run `./scripts/upload-dsym.sh` (no rebuild) once sentry-cli auth is fixed.
 
-12. **Notify**
+13. **Return to the working branch**
+    - `git checkout main` (or `develop`) so subsequent commands don't run on detached HEAD.
+    - If local `main` diverged from `origin/main` during the release, flag it to the user — don't silently `reset --hard`.
+
+14. **Notify**
     - On success: `say "term-mesh release complete"`
     - On failure: `say "term-mesh release failed"`
 
