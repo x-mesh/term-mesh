@@ -72,11 +72,23 @@ Prepare a new release for term-mesh. This command updates the changelog, bumps t
     - Required for crash symbolication on issues like `EXC_BAD_ACCESS` in Sentry.
     - If upload fails (non-zero exit), the release is still valid — just re-run `./scripts/upload-dsym.sh` (no rebuild) once sentry-cli auth is fixed.
 
-13. **Return to the working branch**
+13. **Build the distributable DMG and publish the GitHub Release**
+    - While still on the tag's detached HEAD (from step 11), run `make dmg` — produces `term-mesh-macos-X.Y.Z.dmg` with the ad-hoc signed bundle and bundled Rust binaries.
+    - Publish to GitHub: `./scripts/publish-github-release.sh X.Y.Z`
+      - Creates/updates the `vX.Y.Z` release on `x-mesh/term-mesh`, uploads the DMG as an asset, and pulls release notes from `CHANGELOG.md`.
+      - Safe to re-run; `--clobber` replaces an existing DMG.
+
+14. **Update the Homebrew cask**
+    - Run `./scripts/update-homebrew-cask.sh X.Y.Z ./term-mesh-macos-X.Y.Z.dmg`
+      - Computes sha256, rewrites `Casks/term-mesh.rb` in `x-mesh/homebrew-tap`, commits as `term-mesh X.Y.Z`, and pushes to `main`.
+      - Set `DRY_RUN=1` to stage the change locally without pushing.
+    - Verify: `brew update && brew info --cask x-mesh/tap/term-mesh` should report the new version.
+
+15. **Return to the working branch**
     - `git checkout main` (or `develop`) so subsequent commands don't run on detached HEAD.
     - If local `main` diverged from `origin/main` during the release, flag it to the user — don't silently `reset --hard`.
 
-14. **Notify**
+16. **Notify**
     - On success: `say "term-mesh release complete"`
     - On failure: `say "term-mesh release failed"`
 
