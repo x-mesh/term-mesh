@@ -6,7 +6,7 @@
 <p align="center">AI 코딩 에이전트를 위한 세로 탭과 알림 기능을 갖춘 Ghostty 기반 macOS 터미널</p>
 
 <p align="center">
-  <a href="https://github.com/manaflow-ai/term-mesh/releases/latest/download/term-mesh-macos.dmg">
+  <a href="https://github.com/x-mesh/term-mesh/releases/latest/download/term-mesh-macos.dmg">
     <img src="./docs/assets/macos-badge.png" alt="term-mesh" width="180" />
   </a>
 </p>
@@ -29,28 +29,56 @@
 
 ## 설치
 
-### DMG (권장)
-
-<a href="https://github.com/manaflow-ai/term-mesh/releases/latest/download/term-mesh-macos.dmg">
-  <img src="./docs/assets/macos-badge.png" alt="term-mesh" width="180" />
-</a>
-
-`.dmg` 파일을 열고 term-mesh를 응용 프로그램 폴더로 드래그하세요. term-mesh는 Sparkle을 통해 자동 업데이트되므로, 한 번만 다운로드하면 됩니다.
-
-### Homebrew
+### Homebrew (권장)
 
 ```bash
-brew tap manaflow-ai/term-mesh
-brew install --cask term-mesh
+brew install --cask x-mesh/tap/term-mesh
 ```
 
-나중에 업데이트하려면:
+Cask가 [GitHub Releases](https://github.com/x-mesh/term-mesh/releases)에서 최신 DMG를 받아 `term-mesh.app`을 `/Applications`에 설치하고, Gatekeeper 격리 속성(`com.apple.quarantine`)을 자동으로 제거합니다. 공증되지 않은 빌드지만 별도의 `xattr` 작업 없이 바로 실행됩니다.
+
+번들에 포함된 CLI 도구(`tm-agent`, `term-mesh-run`)는 `$(brew --prefix)/bin`에 심볼릭 링크됩니다.
+
+업데이트 / 제거:
 
 ```bash
 brew upgrade --cask term-mesh
+brew uninstall --cask term-mesh           # 앱 제거
+brew uninstall --cask --zap term-mesh     # ~/Library 데이터와 ~/.term-mesh까지 제거
 ```
 
-처음 실행 시, macOS가 확인된 개발자의 앱을 여는 것을 확인하도록 요청할 수 있습니다. **열기**를 클릭하여 계속 진행하세요.
+#### "App already exists" 오류 대처
+
+DMG로 수동 설치한 term-mesh가 이미 `/Applications`에 있으면 Homebrew가 기존 번들을 덮어쓰지 않고 다음 오류로 중단합니다:
+
+```
+Error: It seems there is already an App at '/Applications/term-mesh.app'.
+```
+
+`--force`로 Homebrew가 기존 앱을 인계받게 하거나,
+
+```bash
+brew install --cask --force x-mesh/tap/term-mesh
+```
+
+기존 앱을 먼저 옮긴 뒤 재설치하세요:
+
+```bash
+mv /Applications/term-mesh.app ~/Downloads/term-mesh.app.manual-backup
+brew install --cask x-mesh/tap/term-mesh
+```
+
+두 경우 모두 실행 중인 term-mesh는 먼저 종료해야 합니다.
+
+### DMG (수동)
+
+[최신 릴리스](https://github.com/x-mesh/term-mesh/releases/latest)에서 `term-mesh-macos-<version>.dmg`를 내려받아 열고, `term-mesh.app`을 `/Applications`에 드래그합니다. 공증되지 않은 빌드이므로 복사 후 한 번 실행하세요:
+
+```bash
+xattr -dr com.apple.quarantine /Applications/term-mesh.app
+```
+
+이후 업데이트는 Sparkle이 자동으로 처리합니다.
 
 ## Why term-mesh를 만들었나요?
 
