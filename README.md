@@ -14,13 +14,13 @@
 
 <p align="center">
   <a href="https://term-mesh.dev">Website</a> &middot;
-  <a href="https://github.com/JINWOO-J/term-mesh/releases/latest">Download</a> &middot;
+  <a href="https://github.com/x-mesh/term-mesh/releases/latest">Download</a> &middot;
   <a href="#features">Features</a> &middot;
   <a href="#quick-start">Quick Start</a>
 </p>
 
 <p align="center">
-  <a href="https://github.com/JINWOO-J/term-mesh/releases/latest"><img src="docs/assets/macos-badge.png" height="40" alt="Download for macOS"></a>
+  <a href="https://github.com/x-mesh/term-mesh/releases/latest"><img src="docs/assets/macos-badge.png" height="40" alt="Download for macOS"></a>
 </p>
 
 ---
@@ -103,6 +103,59 @@ Full control via Unix socket and HTTP REST API — automate tab creation, pane m
 └──────────────────────────────────────────────────────────┘
 ```
 
+## Install
+
+### Homebrew (recommended)
+
+```bash
+brew install --cask x-mesh/tap/term-mesh
+```
+
+The cask downloads the latest DMG from [GitHub Releases](https://github.com/x-mesh/term-mesh/releases), copies `term-mesh.app` into `/Applications`, and strips the Gatekeeper quarantine attribute automatically — so the unsigned build launches without a manual `xattr` step.
+
+Bundled CLI helpers (`tm-agent`, `term-mesh-run`) are symlinked to `$(brew --prefix)/bin`.
+
+Upgrade / uninstall:
+
+```bash
+brew upgrade --cask term-mesh
+brew uninstall --cask term-mesh           # remove the app
+brew uninstall --cask --zap term-mesh     # also remove ~/Library data and ~/.term-mesh
+```
+
+#### "App already exists" on first install
+
+If you previously installed term-mesh manually (e.g. by dragging the DMG) and then run `brew install --cask`, Homebrew refuses to overwrite the existing bundle:
+
+```
+Error: It seems there is already an App at '/Applications/term-mesh.app'.
+```
+
+Either pass `--force` to let Homebrew take over the existing app:
+
+```bash
+brew install --cask --force x-mesh/tap/term-mesh
+```
+
+…or move the existing app out of the way first:
+
+```bash
+mv /Applications/term-mesh.app ~/Downloads/term-mesh.app.manual-backup
+brew install --cask x-mesh/tap/term-mesh
+```
+
+Quit any running term-mesh instance before either command.
+
+### DMG (manual)
+
+Grab `term-mesh-macos-<version>.dmg` from the [latest release](https://github.com/x-mesh/term-mesh/releases/latest), open it, and drag `term-mesh.app` into `/Applications`. Because the build is not notarized, run once after copying:
+
+```bash
+xattr -dr com.apple.quarantine /Applications/term-mesh.app
+```
+
+Auto-updates (Sparkle) handle subsequent versions.
+
 ## Prerequisites
 
 | Component | Version | Notes |
@@ -116,7 +169,7 @@ Full control via Unix socket and HTTP REST API — automate tab creation, pane m
 
 ```bash
 # 1. Clone and setup
-git clone https://github.com/JINWOO-J/term-mesh.git && cd term-mesh
+git clone https://github.com/x-mesh/term-mesh.git && cd term-mesh
 
 # 2. Build libghostty + native app
 ./scripts/setup.sh
