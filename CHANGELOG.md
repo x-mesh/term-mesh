@@ -2,6 +2,14 @@
 
 All notable changes to term-mesh are documented here.
 
+## [0.98.2] - 2026-04-22
+
+No user-visible changes. Release-flow validation build — exercises the end-to-end `/release` pipeline introduced in v0.98.1 (DMG build → GitHub Release asset upload → Homebrew cask auto-update in `x-mesh/homebrew-tap`) and verifies `brew upgrade --cask term-mesh` picks up the new version without manual intervention.
+
+### Thanks to 1 contributor!
+
+- [@JINWOO-J](https://github.com/JINWOO-J)
+
 ## [0.98.1] - 2026-04-22
 
 ### Added
