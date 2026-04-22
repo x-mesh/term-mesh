@@ -112,13 +112,15 @@ cask "term-mesh" do
 end
 EOF
 
-# Commit only if the cask actually changed
-if git -C "$TAP_DIR" diff --quiet --exit-code -- "Casks/term-mesh.rb"; then
+# Stage first so new files (e.g. initial Casks/term-mesh.rb) are visible
+# to the change check — `git diff` alone ignores untracked paths.
+git -C "$TAP_DIR" add "Casks/term-mesh.rb"
+
+if git -C "$TAP_DIR" diff --cached --quiet --exit-code -- "Casks/term-mesh.rb"; then
   echo "==> No cask changes — nothing to commit"
   exit 0
 fi
 
-git -C "$TAP_DIR" add "Casks/term-mesh.rb"
 git -C "$TAP_DIR" -c user.name="term-mesh release bot" \
                    -c user.email="noreply@x-mesh.dev" \
   commit -m "term-mesh ${VERSION}"
