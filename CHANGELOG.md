@@ -2,6 +2,15 @@
 
 All notable changes to term-mesh are documented here.
 
+## [0.98.1] - 2026-04-22
+
+### Added
+- **Homebrew cask install path** — term-mesh is now available via the `x-mesh/tap` Homebrew tap. Install with `brew install --cask x-mesh/tap/term-mesh`; upgrade with `brew upgrade --cask term-mesh`. The cask strips the Gatekeeper quarantine attribute automatically on install and upgrade, so the unsigned DMG launches without a manual `xattr` step.
+
+### Thanks to 1 contributor!
+
+- [@JINWOO-J](https://github.com/JINWOO-J)
+
 ## [0.98.0] - 2026-04-20
 
 No user-visible changes. Internal release-tooling update only: `/release` now tags the squash-merge SHA on `main` and checks out that tag before building the dSYM, so Sentry debug symbols always match the released binary (previously a divergent local `main` could let an older build upload its dSYMs under the new tag's name).
