@@ -1,10 +1,7 @@
-//  Phase C-3c.3.3a: DEBUG-only hook that starts a Swift PeerServer inside
-//  term-mesh.app. The provider is hard-coded to a single Echo surface —
-//  just enough to let the Rust tm-agent CLI connect to the app via
-//  `tm-agent peer list` / `peer attach --name echo`.
-//
-//  Phase C-3c.3.3b will swap the Echo provider for a real "enumerate the
-//  app's panes" provider so remote clients can attach to live PTYs.
+//  Phase C-3c.3.3b: DEBUG-only hook that starts a Swift PeerServer inside
+//  term-mesh.app. The provider enumerates the app's live Ghostty terminal
+//  panes (GhosttyPaneSurfaceProvider) so remote clients can list and attach
+//  to real PTYs via `tm-agent peer list / peer attach`.
 
 #if DEBUG
 import AppKit
@@ -97,17 +94,7 @@ final class PeerDebugServerCoordinator: NSObject {
     }
 
     private func bringUp(at path: String, silent: Bool = false) async {
-        // Minimal provider: one Echo surface. A client can attach, type,
-        // and see bytes come back. Real-pane wiring lands in C-3c.3.3b.
-        var info = Termmesh_Peer_V1_SurfaceInfo()
-        info.surfaceID = Data(repeating: 0xE1, count: 16)
-        info.title = "echo"
-        info.cols = 80
-        info.rows = 24
-        info.surfaceType = "terminal"
-        info.attachable = true
-
-        let provider = EchoSurfaceProvider(surfaces: [info])
+        let provider = GhosttyPaneSurfaceProvider()
 
         var config = PeerServerConfig()
         config.hostDisplayName = ProcessInfo.processInfo.hostName
