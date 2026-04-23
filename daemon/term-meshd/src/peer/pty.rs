@@ -14,10 +14,17 @@ pub struct PtyChild {
     pub pid: libc::pid_t,
 }
 
-/// Fork a child that runs `command` with `args` attached to a fresh PTY.
-/// The caller owns `master_fd` and must close it when done; the child
-/// is reaped by the caller via [`reap`] or by dropping [`PtySurface`].
-pub fn spawn(command: &str, args: &[&str], cols: u16, rows: u16) -> io::Result<PtyChild> {
+/// Fork a child that runs `command` with `args` attached to a fresh PTY,
+/// optionally chdir'd to `cwd` before exec. The caller owns `master_fd`
+/// and must close it when done; the child is reaped by the caller via
+/// [`teardown`] or by dropping [`PtySurface`].
+pub fn spawn(
+    command: &str,
+    args: &[&str],
+    cols: u16,
+    rows: u16,
+    cwd: Option<&str>,
+) -> io::Result<PtyChild> {
     // Allocate all CStrings before forking; in the child we can only
     // call async-signal-safe functions.
     let c_cmd = CString::new(command)
@@ -27,6 +34,13 @@ pub fn spawn(command: &str, args: &[&str], cols: u16, rows: u16) -> io::Result<P
         .map(|a| CString::new(*a))
         .collect::<Result<_, _>>()
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "arg contains NUL"))?;
+    let c_cwd = match cwd {
+        Some(path) => Some(
+            CString::new(path)
+                .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "cwd contains NUL"))?,
+        ),
+        None => None,
+    };
 
     let mut argv: Vec<*const libc::c_char> = std::iter::once(c_cmd.as_ptr())
         .chain(c_args.iter().map(|s| s.as_ptr()))
@@ -57,8 +71,13 @@ pub fn spawn(command: &str, args: &[&str], cols: u16, rows: u16) -> io::Result<P
 
     if pid == 0 {
         // Child process: only async-signal-safe work from here on.
-        // execvp replaces the image; if it returns, it failed.
         unsafe {
+            if let Some(cwd_ptr) = c_cwd.as_ref().map(|c| c.as_ptr()) {
+                // chdir is async-signal-safe. If it fails we still exec so
+                // the caller sees a running-but-wrong-cwd child rather than
+                // silent death; logging isn't available here.
+                libc::chdir(cwd_ptr);
+            }
             libc::execvp(c_cmd.as_ptr(), argv.as_ptr());
             libc::_exit(127);
         }

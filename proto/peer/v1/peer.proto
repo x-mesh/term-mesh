@@ -119,6 +119,12 @@ message SurfaceInfo {
   string surface_type = 6;
   // Host policy may forbid per-surface attach.
   bool attachable = 7;
+  // Captured at spawn time, i.e. the directory the child was chdir'd into
+  // before exec. Does NOT track runtime cd; for that, subscribe to
+  // WorkspaceUpdate.meta events (future).
+  string cwd = 8;
+  // Git branch of `cwd` resolved at spawn time, or empty if not a git repo.
+  string branch = 9;
 }
 
 enum AttachMode {

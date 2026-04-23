@@ -14,8 +14,8 @@ use std::sync::Arc;
 
 use peer_proto::v1::envelope::Payload;
 use peer_proto::v1::{
-    AttachMode, AttachResult, AuthChallenge, AuthResult, Envelope, Error, Hello, Pong, PtyData,
-    SurfaceList,
+    workspace_update, AttachMode, AttachResult, AuthChallenge, AuthResult, Envelope, Error, Hello,
+    Pong, PtyData, SurfaceList, WorkspaceMeta, WorkspaceUpdate,
 };
 use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::UnixStream;
@@ -233,6 +233,24 @@ async fn reader_loop(
                     })),
                 };
                 send(&outgoing_tx, reply).await?;
+
+                // Push an initial WorkspaceMeta snapshot so the client can
+                // show the remote surface's cwd / branch immediately. Future
+                // dynamic updates (branch changed, ports opened) would ride
+                // the same channel.
+                let meta_env = Envelope {
+                    seq: next_seq(&seq_counter),
+                    correlation_id: 0,
+                    payload: Some(Payload::WorkspaceUpdate(WorkspaceUpdate {
+                        kind: Some(workspace_update::Kind::Meta(WorkspaceMeta {
+                            branch: surface.branch.clone(),
+                            cwd: surface.cwd.clone(),
+                            ports: vec![],
+                            latest_notification: String::new(),
+                        })),
+                    })),
+                };
+                send(&outgoing_tx, meta_env).await?;
 
                 let entry = spawn_attach_relay(
                     surface.clone(),

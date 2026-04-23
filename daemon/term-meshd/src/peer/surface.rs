@@ -43,6 +43,10 @@ pub struct PtySurface {
     pub workspace_name: String,
     pub cols: AtomicU32,
     pub rows: AtomicU32,
+    /// Directory the child was spawned in (absolute path when resolvable).
+    pub cwd: String,
+    /// Git branch of `cwd` at spawn time; empty when cwd is not in a repo.
+    pub branch: String,
     /// The authoritative broadcast sender. Subscribers are created via
     /// `.subscribe()`; the reader task owns a cloned sender for fan-out.
     pub broadcast_tx: broadcast::Sender<Vec<u8>>,
@@ -64,10 +68,20 @@ impl PtySurface {
         args: &[&str],
         cols: u16,
         rows: u16,
+        cwd: Option<&str>,
     ) -> std::io::Result<Arc<Self>> {
-        let child = pty::spawn(command, args, cols, rows)?;
+        let child = pty::spawn(command, args, cols, rows, cwd)?;
         pty::set_nonblocking(child.master_fd)?;
         let (tx, _rx) = broadcast::channel::<Vec<u8>>(BROADCAST_CAPACITY);
+
+        let resolved_cwd = cwd
+            .map(|c| c.to_string())
+            .unwrap_or_else(|| {
+                std::env::current_dir()
+                    .map(|p| p.to_string_lossy().into_owned())
+                    .unwrap_or_default()
+            });
+        let branch = resolve_git_branch(&resolved_cwd);
 
         let surface = Arc::new(PtySurface {
             surface_id: surface_id.clone(),
@@ -75,6 +89,8 @@ impl PtySurface {
             workspace_name: "peer-host".into(),
             cols: AtomicU32::new(cols as u32),
             rows: AtomicU32::new(rows as u32),
+            cwd: resolved_cwd,
+            branch,
             broadcast_tx: tx.clone(),
             dead: AtomicBool::new(false),
             dead_notify: Notify::new(),
@@ -203,8 +219,23 @@ impl PtySurface {
             rows: self.rows.load(Ordering::Relaxed),
             surface_type: "terminal".into(),
             attachable: !self.dead.load(Ordering::Acquire),
+            cwd: self.cwd.clone(),
+            branch: self.branch.clone(),
         }
     }
+}
+
+/// Best-effort current-branch lookup via `git2`. Returns empty string when
+/// `cwd` is not inside a git repo, the repo is in detached-HEAD state, or
+/// any other error occurs — never panics or propagates.
+fn resolve_git_branch(cwd: &str) -> String {
+    let Ok(repo) = git2::Repository::discover(cwd) else {
+        return String::new();
+    };
+    let Ok(head) = repo.head() else {
+        return String::new();
+    };
+    head.shorthand().map(String::from).unwrap_or_default()
 }
 
 impl Drop for PtySurface {
@@ -220,6 +251,9 @@ pub struct SpawnSpec {
     pub args: Vec<String>,
     pub cols: u16,
     pub rows: u16,
+    /// Child's working directory before exec. `None` inherits the daemon's
+    /// current dir at spawn time.
+    pub cwd: Option<String>,
 }
 
 pub struct PtyManager {
@@ -315,6 +349,7 @@ impl PtyManager {
                 args: vec!["-c".into(), cmd],
                 cols: 80,
                 rows: 24,
+                cwd: None,
             };
             self.register_and_spawn(surface_id, spec);
         }
@@ -405,6 +440,7 @@ fn spawn_from_spec(surface_id: &[u8], spec: &SpawnSpec) -> std::io::Result<Arc<P
         &arg_refs,
         spec.cols,
         spec.rows,
+        spec.cwd.as_deref(),
     )
 }
 

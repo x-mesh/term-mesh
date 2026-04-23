@@ -94,6 +94,7 @@ mod integration_tests {
             &[],
             80,
             24,
+            None,
         )
         .expect("spawn /bin/cat");
         manager.insert_surface(surface);
@@ -510,6 +511,7 @@ mod integration_tests {
                 ],
                 cols: 80,
                 rows: 24,
+                cwd: None,
             },
         );
 
@@ -591,6 +593,7 @@ mod integration_tests {
                     ],
                     cols: 80,
                     rows: 24,
+                    cwd: None,
                 },
             );
         }
@@ -698,6 +701,93 @@ mod integration_tests {
         )
         .await;
         assert!(seen, "never observed bravo-specific marker");
+
+        drop(reader);
+        drop(writer);
+        shutdown_tx.send(true).unwrap();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(3), server_task).await;
+    }
+
+    /// After a successful attach, the server pushes a `WorkspaceUpdate.meta`
+    /// frame with the surface's captured cwd. `branch` is whatever git
+    /// reports for that cwd (empty when not a repo). Exercises both the
+    /// proto field additions on SurfaceInfo and the on-attach push path.
+    #[tokio::test]
+    async fn attach_pushes_workspace_meta() {
+        use crate::peer::surface::SpawnSpec;
+        use peer_proto::v1::{workspace_update, WorkspaceUpdate};
+
+        let tmp = TempDir::new().unwrap();
+        let sock_path = tmp.path().join("peer.sock");
+        // Use the tempdir as the spawn cwd; it's definitely NOT a git repo
+        // so branch should come back empty — a stable assertion regardless
+        // of where the test runs.
+        let spawn_cwd = tmp.path().to_string_lossy().into_owned();
+
+        let manager = Arc::new(PtyManager::new());
+        let sid = surface_id_from_name("meta-test");
+        manager.register_and_spawn(
+            sid.clone(),
+            SpawnSpec {
+                title: "meta-test".into(),
+                command: "/bin/sh".into(),
+                args: vec![
+                    "-c".into(),
+                    "for _ in 1 2 3 4 5 6 7 8 9 10; do printf '.'; sleep 0.1; done".into(),
+                ],
+                cols: 80,
+                rows: 24,
+                cwd: Some(spawn_cwd.clone()),
+            },
+        );
+
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let sp_task = sock_path.clone();
+        let server_task = tokio::spawn(async move {
+            serve_with_manager(sp_task, shutdown_rx, manager).await.unwrap();
+        });
+        for _ in 0..50 {
+            if sock_path.exists() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+
+        let (mut reader, mut writer, surface_id) = attach_one(&sock_path, "meta-client").await;
+        assert_eq!(surface_id, sid);
+
+        // The next envelope after AttachResult should be the pushed
+        // WorkspaceUpdate.meta. It may be followed by PtyData frames,
+        // so we scan for up to 3 envelopes or a short timeout.
+        let mut meta_seen: Option<(String, String)> = None;
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
+        for _ in 0..6 {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            let env = match tokio::time::timeout(remaining, read_envelope(&mut reader)).await {
+                Ok(Ok(e)) => e,
+                _ => break,
+            };
+            if let Some(Payload::WorkspaceUpdate(WorkspaceUpdate {
+                kind: Some(workspace_update::Kind::Meta(m)),
+            })) = env.payload
+            {
+                meta_seen = Some((m.cwd, m.branch));
+                break;
+            }
+        }
+        let (cwd, branch) =
+            meta_seen.expect("WorkspaceUpdate.meta never arrived after AttachResult");
+        assert_eq!(
+            cwd, spawn_cwd,
+            "meta cwd did not match the registered SpawnSpec cwd"
+        );
+        assert_eq!(
+            branch, "",
+            "expected empty branch for non-repo cwd, got {branch:?}"
+        );
 
         drop(reader);
         drop(writer);

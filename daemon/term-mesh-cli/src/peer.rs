@@ -135,11 +135,18 @@ pub fn list_cmd(socket_path: &Path) -> anyhow::Result<()> {
     }
     for s in surfaces {
         let status = if s.attachable { "live" } else { "dead" };
+        let branch = if s.branch.is_empty() {
+            "-".into()
+        } else {
+            format!("@{}", s.branch)
+        };
         println!(
-            "{title:<24} {cols:>3}x{rows:<3}  {status:<4}  {id}",
+            "{title:<20} {cols:>3}x{rows:<3}  {status:<4}  {branch:<16}  {cwd}  [{id}]",
             title = s.title,
             cols = s.cols,
             rows = s.rows,
+            branch = branch,
+            cwd = if s.cwd.is_empty() { "-" } else { s.cwd.as_str() },
             id = hex_short(&s.surface_id),
         );
     }
@@ -238,6 +245,17 @@ pub fn attach_cmd(socket_path: &Path, name: Option<&str>) -> anyhow::Result<()> 
                     let mut out = stdout.lock();
                     out.write_all(&p.payload)?;
                     out.flush()?;
+                }
+                Some(Payload::WorkspaceUpdate(wu)) => {
+                    if let Some(peer_proto::v1::workspace_update::Kind::Meta(m)) = wu.kind {
+                        let branch = if m.branch.is_empty() {
+                            String::new()
+                        } else {
+                            format!(" @{}", m.branch)
+                        };
+                        let cwd = if m.cwd.is_empty() { "-" } else { m.cwd.as_str() };
+                        eprintln!("\r\n[peer] workspace: cwd={cwd}{branch}");
+                    }
                 }
                 Some(Payload::Error(e)) => {
                     eprintln!("\r\n[peer error {}] {}", e.code, e.message);
