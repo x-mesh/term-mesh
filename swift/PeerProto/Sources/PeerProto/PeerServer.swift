@@ -20,17 +20,78 @@ import SwiftProtobuf
 
 // MARK: - PeerSurfaceProvider
 
-/// Supplies the server with the set of surfaces to advertise. Phase
-/// C-3c.3.2 will extend this with attach-side methods
-/// (`subscribe(surfaceID:cols:rows:)` returning a byte stream + input
-/// sink); for now ListSurfaces is the only thing clients can do past
-/// the handshake.
-public protocol PeerSurfaceProvider: AnyObject, Sendable {
-    func listSurfaces() async -> [Termmesh_Peer_V1_SurfaceInfo]
+/// Returned by `PeerSurfaceProvider.attach`. Carries the per-attach state
+/// the server needs to pump bytes to the client and route client inputs
+/// back to the surface's underlying byte producer (e.g. a PTY).
+public struct PeerSurfaceAttachment: Sendable {
+    /// Host → client byte stream. Each element is a chunk that becomes
+    /// one `PtyData` frame. The session continues until this stream
+    /// finishes, then ends the attach from the server side.
+    public let byteStream: AsyncStream<Data>
+    /// Client → host: raw keystroke bytes from an Input frame.
+    public let input: @Sendable (Data) async -> Void
+    /// Client → host: resize from a Resize frame (cols, rows).
+    public let resize: @Sendable (UInt32, UInt32) async -> Void
+    /// Optional initial `WorkspaceUpdate.meta` to push to the client
+    /// right after the AttachResult. Mirrors Phase 2.4b on the Rust side.
+    public let workspaceMeta: PeerWorkspaceMeta?
+    /// Called by the session when the client detaches, the connection
+    /// closes, or the session is shut down. Providers should stop
+    /// yielding to `byteStream` and release per-attach resources.
+    public let detach: @Sendable () async -> Void
+
+    public init(
+        byteStream: AsyncStream<Data>,
+        input: @escaping @Sendable (Data) async -> Void,
+        resize: @escaping @Sendable (UInt32, UInt32) async -> Void = { _, _ in },
+        workspaceMeta: PeerWorkspaceMeta? = nil,
+        detach: @escaping @Sendable () async -> Void = {}
+    ) {
+        self.byteStream = byteStream
+        self.input = input
+        self.resize = resize
+        self.workspaceMeta = workspaceMeta
+        self.detach = detach
+    }
 }
 
-/// Convenience provider for tests and early GUI integration: just
-/// reports a fixed surface list.
+public struct PeerWorkspaceMeta: Sendable, Equatable {
+    public let cwd: String
+    public let branch: String
+    public let ports: [UInt32]
+    public let latestNotification: String
+
+    public init(
+        cwd: String = "",
+        branch: String = "",
+        ports: [UInt32] = [],
+        latestNotification: String = ""
+    ) {
+        self.cwd = cwd
+        self.branch = branch
+        self.ports = ports
+        self.latestNotification = latestNotification
+    }
+}
+
+/// Supplies the server with the set of surfaces to advertise AND the
+/// per-attach plumbing. term-mesh.app's real pane registry will
+/// implement this in Phase C-3c.3.3; tests use `StaticSurfaceProvider`
+/// for list-only scenarios and `EchoSurfaceProvider` for round-trip.
+public protocol PeerSurfaceProvider: AnyObject, Sendable {
+    func listSurfaces() async -> [Termmesh_Peer_V1_SurfaceInfo]
+    /// Return an attachment for `surfaceID`, or `nil` if unknown. The
+    /// server sends an `AttachResult(accepted: false)` back to the
+    /// client on `nil`.
+    func attach(
+        surfaceID: Data,
+        clientCols: UInt32,
+        clientRows: UInt32
+    ) async -> PeerSurfaceAttachment?
+}
+
+/// Provider for the list-only case: static surfaces, no attach support.
+/// Attaching raises an `attachRejected` to the caller.
 public actor StaticSurfaceProvider: PeerSurfaceProvider {
     private var surfaces: [Termmesh_Peer_V1_SurfaceInfo]
 
@@ -44,6 +105,63 @@ public actor StaticSurfaceProvider: PeerSurfaceProvider {
 
     public func setSurfaces(_ newValue: [Termmesh_Peer_V1_SurfaceInfo]) async {
         surfaces = newValue
+    }
+
+    public func attach(
+        surfaceID: Data,
+        clientCols: UInt32,
+        clientRows: UInt32
+    ) async -> PeerSurfaceAttachment? {
+        nil
+    }
+}
+
+/// Echoes client Input back as PtyData on the same surface. Used by
+/// in-process tests to exercise the full attach → input → data path
+/// without a real PTY on the provider side.
+public actor EchoSurfaceProvider: PeerSurfaceProvider {
+    private let surfaces: [Termmesh_Peer_V1_SurfaceInfo]
+    private var continuations: [Data: AsyncStream<Data>.Continuation] = [:]
+
+    public init(surfaces: [Termmesh_Peer_V1_SurfaceInfo]) {
+        self.surfaces = surfaces
+    }
+
+    public func listSurfaces() async -> [Termmesh_Peer_V1_SurfaceInfo] {
+        surfaces
+    }
+
+    public func attach(
+        surfaceID: Data,
+        clientCols: UInt32,
+        clientRows: UInt32
+    ) async -> PeerSurfaceAttachment? {
+        guard surfaces.contains(where: { $0.surfaceID == surfaceID }) else { return nil }
+        let (stream, continuation) = AsyncStream.makeStream(of: Data.self)
+        continuations[surfaceID] = continuation
+
+        let input: @Sendable (Data) async -> Void = { [weak self] bytes in
+            await self?.yield(surfaceID: surfaceID, bytes: bytes)
+        }
+        let detach: @Sendable () async -> Void = { [weak self] in
+            await self?.finish(surfaceID: surfaceID)
+        }
+        return PeerSurfaceAttachment(
+            byteStream: stream,
+            input: input,
+            resize: { _, _ in },
+            workspaceMeta: nil,
+            detach: detach
+        )
+    }
+
+    private func yield(surfaceID: Data, bytes: Data) {
+        continuations[surfaceID]?.yield(bytes)
+    }
+
+    private func finish(surfaceID: Data) {
+        continuations[surfaceID]?.finish()
+        continuations.removeValue(forKey: surfaceID)
     }
 }
 
@@ -364,6 +482,8 @@ actor PeerServerSession {
     private var state: State = .initial
     private var seq: UInt64 = 0
     private var pendingInbound = Data()
+    private var attachments: [Data: PeerSurfaceAttachment] = [:]
+    private var relayTasks: [Data: Task<Void, Never>] = [:]
 
     init(
         connection: AcceptedUnixConnection,
@@ -380,18 +500,32 @@ actor PeerServerSession {
             while !Task.isCancelled {
                 let env = try await readFrame()
                 try await dispatch(env)
-                if case .goodbye = env.payload { return }
+                if case .goodbye = env.payload { break }
             }
         } catch is CancellationError {
             // graceful
         } catch {
             // Stream ended or protocol error — session terminates.
         }
+        await teardownAttachments()
         await connection.close()
     }
 
     func close() async {
+        await teardownAttachments()
         await connection.close()
+    }
+
+    private func teardownAttachments() async {
+        for (_, task) in relayTasks {
+            task.cancel()
+        }
+        let snapshot = attachments
+        attachments.removeAll()
+        relayTasks.removeAll()
+        for (_, attachment) in snapshot {
+            await attachment.detach()
+        }
     }
 
     private func dispatch(_ env: Termmesh_Peer_V1_Envelope) async throws {
@@ -453,6 +587,30 @@ actor PeerServerSession {
                 inner.surfaceList = list
             }
 
+        case (.ready, .attachSurface(let req)):
+            try await handleAttach(req, correlationID: env.seq)
+
+        case (.ready, .detachSurface(let det)):
+            await detachSurface(id: det.surfaceID)
+
+        case (.ready, .input(let input)):
+            guard let attachment = attachments[input.surfaceID] else { return }
+            switch input.kind {
+            case .keys(let keys):
+                await attachment.input(keys)
+            case .paste(let paste):
+                await attachment.input(paste.text)
+            case .mouse, .none:
+                // Mouse encoding is deferred; drop silently for now.
+                break
+            }
+
+        case (.ready, .resize(let r)):
+            guard let attachment = attachments[r.surfaceID] else { return }
+            if r.cols > 0 && r.rows > 0 {
+                await attachment.resize(r.cols, r.rows)
+            }
+
         case (.ready, .ping(let p)):
             try await sendEnvelopeWithCorrelation(env.seq) { inner in
                 var pong = Termmesh_Peer_V1_Pong()
@@ -464,13 +622,112 @@ actor PeerServerSession {
             return
 
         case (.ready, _):
-            // Attach / Input / Resize / Detach land in Phase C-3c.3.2.
-            // Advertise the unsupported payload as an error so clients
-            // don't silently hang on a reply that never comes.
-            try await sendError(
-                code: 103,
-                message: "payload not supported in Phase C-3c.3.1: \(String(describing: env.payload))"
+            // Remaining payloads (DataAck, Error inbound, etc.) are either
+            // advisory from the client side or shouldn't arrive here.
+            // Silent drop matches the Rust server's behavior.
+            break
+        }
+    }
+
+    // MARK: - attach plumbing
+
+    private func handleAttach(
+        _ req: Termmesh_Peer_V1_AttachSurface,
+        correlationID: UInt64
+    ) async throws {
+        if attachments[req.surfaceID] != nil {
+            try await sendEnvelopeWithCorrelation(correlationID) { inner in
+                var r = Termmesh_Peer_V1_AttachResult()
+                r.accepted = false
+                r.reason = "already attached"
+                r.surfaceID = req.surfaceID
+                inner.attachResult = r
+            }
+            return
+        }
+
+        guard
+            let attachment = await provider.attach(
+                surfaceID: req.surfaceID,
+                clientCols: req.clientCols,
+                clientRows: req.clientRows
             )
+        else {
+            try await sendEnvelopeWithCorrelation(correlationID) { inner in
+                var r = Termmesh_Peer_V1_AttachResult()
+                r.accepted = false
+                r.reason = "surface not found"
+                r.surfaceID = req.surfaceID
+                inner.attachResult = r
+            }
+            return
+        }
+
+        let grantedMode: Termmesh_Peer_V1_AttachMode = {
+            switch req.mode {
+            case .coWrite, .takeOver: return .coWrite
+            default: return .readOnly
+            }
+        }()
+
+        try await sendEnvelopeWithCorrelation(correlationID) { inner in
+            var r = Termmesh_Peer_V1_AttachResult()
+            r.accepted = true
+            r.surfaceID = req.surfaceID
+            r.initialSeq = 0
+            r.grantedMode = grantedMode
+            inner.attachResult = r
+        }
+
+        if let meta = attachment.workspaceMeta {
+            try await sendEnvelope { inner in
+                var m = Termmesh_Peer_V1_WorkspaceMeta()
+                m.cwd = meta.cwd
+                m.branch = meta.branch
+                m.ports = meta.ports
+                m.latestNotification = meta.latestNotification
+                var wu = Termmesh_Peer_V1_WorkspaceUpdate()
+                wu.meta = m
+                inner.workspaceUpdate = wu
+            }
+        }
+
+        attachments[req.surfaceID] = attachment
+        let surfaceID = req.surfaceID
+        let relayTask: Task<Void, Never> = Task { [weak self] in
+            guard let self else { return }
+            await self.pumpByteStream(surfaceID: surfaceID, attachment: attachment)
+        }
+        relayTasks[surfaceID] = relayTask
+    }
+
+    private func pumpByteStream(
+        surfaceID: Data,
+        attachment: PeerSurfaceAttachment
+    ) async {
+        var byteSeq: UInt64 = 0
+        for await bytes in attachment.byteStream {
+            if Task.isCancelled { return }
+            if bytes.isEmpty { continue }
+            do {
+                try await sendEnvelope { env in
+                    var p = Termmesh_Peer_V1_PtyData()
+                    p.surfaceID = surfaceID
+                    p.byteSeq = byteSeq
+                    p.payload = bytes
+                    env.ptyData = p
+                }
+            } catch {
+                return
+            }
+            byteSeq &+= UInt64(bytes.count)
+        }
+    }
+
+    private func detachSurface(id: Data) async {
+        relayTasks.removeValue(forKey: id)?.cancel()
+        if let attachment = attachments.removeValue(forKey: id) {
+            await attachment.detach()
         }
     }
 

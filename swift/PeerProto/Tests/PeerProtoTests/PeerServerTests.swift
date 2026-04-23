@@ -72,19 +72,23 @@ final class PeerServerTests: XCTestCase {
         await server.stop()
     }
 
-    /// Client sending a post-handshake payload we haven't wired yet
-    /// (Attach) receives an explicit error frame rather than a hang.
-    /// Guards against future regressions when we do wire Attach.
-    func testUnsupportedPayloadReturnsError() async throws {
+    /// Static provider returns no attachment → server replies
+    /// `AttachResult(accepted: false)` → PeerSession throws
+    /// `attachRejected`.
+    func testStaticProviderRejectsAttach() async throws {
         let sockPath = "/tmp/tm-peer-swift-srv-err-\(UUID().uuidString.prefix(8)).sock"
         defer { try? FileManager.default.removeItem(atPath: sockPath) }
 
-        let provider = StaticSurfaceProvider(surfaces: [])
+        var info = Termmesh_Peer_V1_SurfaceInfo()
+        info.surfaceID = Data(repeating: 0x77, count: 16)
+        info.title = "listed-but-not-attachable"
+        info.cols = 80
+        info.rows = 24
+
+        let provider = StaticSurfaceProvider(surfaces: [info])
         let server = PeerServer(socketPath: sockPath, provider: provider)
         try await server.start()
-        defer {
-            Task { await server.stop() }
-        }
+        defer { Task { await server.stop() } }
 
         let deadline = Date().addingTimeInterval(2)
         while !FileManager.default.fileExists(atPath: sockPath) {
@@ -99,23 +103,96 @@ final class PeerServerTests: XCTestCase {
         )
         _ = try await session.handshake()
 
-        // AttachSurface is intentionally not handled yet.
         do {
             _ = try await session.attachSurface(
-                id: Data(count: 16),
+                id: info.surfaceID,
                 mode: .coWrite,
                 cols: 80,
                 rows: 24
             )
-            XCTFail("expected attach to fail — Phase C-3c.3.1 server doesn't implement Attach")
-        } catch PeerSessionError.unexpectedMessage(let msg) {
-            // Server emits an Error envelope; PeerSession sees it where it
-            // expected AttachResult and throws unexpectedMessage.
-            XCTAssertTrue(msg.contains("error") || msg.contains("Error"), "got: \(msg)")
+            XCTFail("expected attachRejected for static provider")
+        } catch PeerSessionError.attachRejected(let reason) {
+            XCTAssertEqual(reason, "surface not found")
         } catch {
             XCTFail("wrong error: \(error)")
         }
 
+        await transport.close()
+        await server.stop()
+    }
+
+    /// End-to-end attach round trip through an `EchoSurfaceProvider`:
+    /// client attaches, writes Input, receives the same bytes back as
+    /// PtyData on the same surface. Exercises `PeerServerSession`'s
+    /// attach handler, relay task, and Input routing.
+    func testEchoAttachRoundTrip() async throws {
+        let sockPath = "/tmp/tm-peer-swift-echo-\(UUID().uuidString.prefix(8)).sock"
+        defer { try? FileManager.default.removeItem(atPath: sockPath) }
+
+        var info = Termmesh_Peer_V1_SurfaceInfo()
+        info.surfaceID = Data(repeating: 0xE1, count: 16)
+        info.title = "echo"
+        info.cols = 80
+        info.rows = 24
+        info.attachable = true
+
+        let provider = EchoSurfaceProvider(surfaces: [info])
+        let server = PeerServer(socketPath: sockPath, provider: provider)
+        try await server.start()
+        defer { Task { await server.stop() } }
+
+        let deadline = Date().addingTimeInterval(2)
+        while !FileManager.default.fileExists(atPath: sockPath) {
+            if Date() > deadline { return XCTFail("no socket") }
+            try await Task.sleep(nanoseconds: 50_000_000)
+        }
+
+        let transport = try await UnixSocketTransport.connect(socketPath: sockPath)
+        let session = PeerSession(
+            read: { try await transport.read() },
+            write: { try await transport.write($0) }
+        )
+        _ = try await session.handshake()
+
+        let outcome = try await session.attachSurface(
+            id: info.surfaceID,
+            mode: .coWrite,
+            cols: 80,
+            rows: 24
+        )
+        XCTAssertEqual(outcome.surfaceID, info.surfaceID)
+
+        let marker = "ECHO-VIA-SWIFT-SERVER"
+        try await session.sendInput(
+            surfaceID: info.surfaceID,
+            keys: Data(marker.utf8)
+        )
+
+        var aggregated = Data()
+        let sawMarker = try await Task {
+            let hardDeadline = Date().addingTimeInterval(3)
+            while Date() < hardDeadline {
+                let msg = try await session.receiveNextMessage()
+                switch msg {
+                case .ptyData(_, _, let payload):
+                    aggregated.append(payload)
+                    if aggregated.range(of: Data(marker.utf8)) != nil {
+                        return true
+                    }
+                case .goodbye, .error:
+                    return false
+                default:
+                    continue
+                }
+            }
+            return false
+        }.value
+        XCTAssertTrue(
+            sawMarker,
+            "never observed echo of MARKER; aggregated=\(String(data: aggregated, encoding: .utf8) ?? "")"
+        )
+
+        try await session.sendGoodbye(reason: "c3c3.2 done")
         await transport.close()
         await server.stop()
     }
