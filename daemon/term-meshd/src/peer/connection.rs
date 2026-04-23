@@ -1,32 +1,35 @@
 //! Per-connection state machine for peer-federation host side.
 //!
-//! Handshake: Init → HelloReceived → AuthSent → Ready.
+//! Handshake: Init → AuthSent → Ready.
 //! In Ready, handles ListSurfaces / AttachSurface / DetachSurface /
 //! Input / Resize / Ping / Goodbye.
 //!
-//! For Phase 2.2 the only surface is a single synthetic `TickSurface`
-//! with a fixed surface_id; see `surface.rs`.
+//! Phase 2.3B: surfaces are real PTYs owned by a shared `PtyManager`.
+//! Each attach spawns a subscriber relay task that pumps broadcast bytes
+//! into the connection's outgoing channel wrapped as `PtyData` frames.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
-use peer_proto::v1::{
-    AttachMode, AttachResult, AuthChallenge, AuthResult, Envelope, Error, Hello, Pong, SurfaceList,
-};
 use peer_proto::v1::envelope::Payload;
+use peer_proto::v1::{
+    AttachMode, AttachResult, AuthChallenge, AuthResult, Envelope, Error, Hello, Pong, PtyData,
+    SurfaceList,
+};
 use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::UnixStream;
-use tokio::sync::mpsc;
+use tokio::sync::{broadcast, mpsc, Notify};
+use tokio::task::JoinHandle;
 
 use super::framing::{read_envelope, write_envelope};
-use super::surface::{spawn_tick_surface, tick_surface_info, AttachHandle};
+use super::surface::{PtyManager, PtySurface};
 
 pub const PROTOCOL_VERSION: &str = "1.0.0";
 pub const HOST_DISPLAY_NAME_ENV: &str = "TERMMESH_PEER_DISPLAY_NAME";
 
-/// Fixed surface_id for the Phase 2.2 tick surface. Deterministic so tests
-/// don't need to call ListSurfaces before attaching.
+/// Stable surface_id for the Phase 2.3B default PTY. Keeps the constant
+/// name from 2.2 so existing tests / tools don't break.
 pub const TICK_SURFACE_ID: [u8; 16] = [
     0x74, 0x69, 0x63, 0x6b, 0x2d, 0x73, 0x75, 0x72, 0x66, 0x61, 0x63, 0x65, 0x2d, 0x30, 0x30, 0x31,
 ];
@@ -38,17 +41,19 @@ enum HandshakeState {
     Ready,
 }
 
-/// Public entry for an accepted connection. Drives the handshake and
-/// dispatch loop until the peer disconnects or sends Goodbye.
-pub async fn run(stream: UnixStream) -> anyhow::Result<()> {
+struct AttachEntry {
+    surface: Arc<PtySurface>,
+    task: JoinHandle<()>,
+    cancel: Arc<Notify>,
+}
+
+pub async fn run(stream: UnixStream, manager: Arc<PtyManager>) -> anyhow::Result<()> {
     let (reader, writer) = stream.into_split();
     let (outgoing_tx, outgoing_rx) = mpsc::channel::<Envelope>(128);
     let seq_counter = Arc::new(AtomicU64::new(0));
 
     let writer_task = tokio::spawn(writer_loop(writer, outgoing_rx));
-    let reader_task = reader_loop(reader, outgoing_tx.clone(), seq_counter.clone());
-
-    let result = reader_task.await;
+    let result = reader_loop(reader, outgoing_tx.clone(), seq_counter, manager).await;
     drop(outgoing_tx);
     let _ = writer_task.await;
     result
@@ -67,9 +72,10 @@ async fn reader_loop(
     mut reader: OwnedReadHalf,
     outgoing_tx: mpsc::Sender<Envelope>,
     seq_counter: Arc<AtomicU64>,
+    manager: Arc<PtyManager>,
 ) -> anyhow::Result<()> {
     let mut state = HandshakeState::Init;
-    let mut attached: HashMap<Vec<u8>, AttachHandle> = HashMap::new();
+    let mut attached: HashMap<Vec<u8>, AttachEntry> = HashMap::new();
 
     loop {
         let env = match read_envelope(&mut reader).await {
@@ -109,9 +115,7 @@ async fn reader_loop(
                     hello.app_version
                 );
 
-                let host_hello = host_hello(&seq_counter);
-                send(&outgoing_tx, host_hello).await?;
-
+                send(&outgoing_tx, host_hello(&seq_counter)).await?;
                 let challenge = Envelope {
                     seq: next_seq(&seq_counter),
                     correlation_id: 0,
@@ -163,24 +167,39 @@ async fn reader_loop(
             }
 
             (HandshakeState::Ready, Payload::ListSurfaces(_)) => {
+                let surfaces = manager.list().iter().map(|s| s.info()).collect();
                 let reply = Envelope {
                     seq: next_seq(&seq_counter),
                     correlation_id: env.seq,
-                    payload: Some(Payload::SurfaceList(SurfaceList {
-                        surfaces: vec![tick_surface_info(&TICK_SURFACE_ID)],
-                    })),
+                    payload: Some(Payload::SurfaceList(SurfaceList { surfaces })),
                 };
                 send(&outgoing_tx, reply).await?;
             }
 
             (HandshakeState::Ready, Payload::AttachSurface(req)) => {
-                if req.surface_id != TICK_SURFACE_ID {
+                let Some(surface) = manager.get(&req.surface_id) else {
                     let reply = Envelope {
                         seq: next_seq(&seq_counter),
                         correlation_id: env.seq,
                         payload: Some(Payload::AttachResult(AttachResult {
                             accepted: false,
                             reason: "surface not found".into(),
+                            surface_id: req.surface_id.clone(),
+                            initial_seq: 0,
+                            granted_mode: AttachMode::Unspecified as i32,
+                        })),
+                    };
+                    send(&outgoing_tx, reply).await?;
+                    continue;
+                };
+
+                if surface.dead.load(Ordering::Acquire) {
+                    let reply = Envelope {
+                        seq: next_seq(&seq_counter),
+                        correlation_id: env.seq,
+                        payload: Some(Payload::AttachResult(AttachResult {
+                            accepted: false,
+                            reason: "surface has exited".into(),
                             surface_id: req.surface_id.clone(),
                             initial_seq: 0,
                             granted_mode: AttachMode::Unspecified as i32,
@@ -206,11 +225,19 @@ async fn reader_loop(
                     continue;
                 }
 
-                let initial_seq = 0u64;
-                let granted = match AttachMode::try_from(req.mode).unwrap_or(AttachMode::Unspecified) {
-                    AttachMode::CoWrite | AttachMode::TakeOver => AttachMode::CoWrite,
-                    _ => AttachMode::ReadOnly,
-                };
+                // Apply client-requested size. Multi-client policy beyond
+                // last-writer-wins is deferred to Phase 2.3B-c.
+                if req.client_cols > 0 && req.client_rows > 0 {
+                    if let Err(e) = surface.resize(req.client_cols as u16, req.client_rows as u16) {
+                        tracing::warn!("resize on attach failed: {e}");
+                    }
+                }
+
+                let granted =
+                    match AttachMode::try_from(req.mode).unwrap_or(AttachMode::Unspecified) {
+                        AttachMode::CoWrite | AttachMode::TakeOver => AttachMode::CoWrite,
+                        _ => AttachMode::ReadOnly,
+                    };
 
                 let reply = Envelope {
                     seq: next_seq(&seq_counter),
@@ -219,58 +246,63 @@ async fn reader_loop(
                         accepted: true,
                         reason: String::new(),
                         surface_id: req.surface_id.clone(),
-                        initial_seq,
+                        initial_seq: 0,
                         granted_mode: granted as i32,
                     })),
                 };
                 send(&outgoing_tx, reply).await?;
 
-                let handle = spawn_tick_surface(
-                    req.surface_id.clone(),
-                    initial_seq,
+                let entry = spawn_attach_relay(
+                    surface.clone(),
                     outgoing_tx.clone(),
                     seq_counter.clone(),
                 );
-                attached.insert(req.surface_id, handle);
+                attached.insert(req.surface_id, entry);
             }
 
             (HandshakeState::Ready, Payload::DetachSurface(det)) => {
-                if let Some(h) = attached.remove(&det.surface_id) {
-                    h.cancel.notify_one();
-                    let _ = h.task.await;
+                if let Some(entry) = attached.remove(&det.surface_id) {
+                    entry.cancel.notify_one();
+                    let _ = entry.task.await;
                 }
             }
 
             (HandshakeState::Ready, Payload::Input(input)) => {
-                match &input.kind {
+                let Some(entry) = attached.get(&input.surface_id) else {
+                    tracing::debug!(
+                        "input for unattached surface {:?}",
+                        input.surface_id
+                    );
+                    continue;
+                };
+                match input.kind {
                     Some(peer_proto::v1::input::Kind::Keys(keys)) => {
-                        tracing::debug!(
-                            "peer input on surface {:?}: {} bytes",
-                            input.surface_id,
-                            keys.len()
-                        );
-                    }
-                    Some(peer_proto::v1::input::Kind::Mouse(_)) => {
-                        tracing::debug!("peer mouse event on surface {:?}", input.surface_id);
+                        if let Err(e) = entry.surface.write(&keys) {
+                            tracing::warn!("PTY write failed: {e}");
+                        }
                     }
                     Some(peer_proto::v1::input::Kind::Paste(p)) => {
-                        tracing::debug!(
-                            "peer paste on surface {:?}: {} bytes",
-                            input.surface_id,
-                            p.text.len()
-                        );
+                        if let Err(e) = entry.surface.write(&p.text) {
+                            tracing::warn!("PTY paste-write failed: {e}");
+                        }
+                    }
+                    Some(peer_proto::v1::input::Kind::Mouse(_)) => {
+                        // Mouse events need xterm-style encoding; defer to 2.3B-c.
+                        tracing::debug!("mouse event ignored (not yet implemented)");
                     }
                     None => {}
                 }
             }
 
             (HandshakeState::Ready, Payload::Resize(r)) => {
-                tracing::debug!(
-                    "peer resize surface {:?} -> {}x{}",
-                    r.surface_id,
-                    r.cols,
-                    r.rows
-                );
+                let Some(entry) = attached.get(&r.surface_id) else {
+                    continue;
+                };
+                if r.cols > 0 && r.rows > 0 {
+                    if let Err(e) = entry.surface.resize(r.cols as u16, r.rows as u16) {
+                        tracing::warn!("resize failed: {e}");
+                    }
+                }
             }
 
             (HandshakeState::Ready, Payload::Ping(p)) => {
@@ -290,15 +322,74 @@ async fn reader_loop(
             (HandshakeState::Ready, other) => {
                 tracing::debug!("unhandled Ready-state payload: {other:?}");
             }
-
         }
     }
 
-    for (_, h) in attached.drain() {
-        h.cancel.notify_one();
-        let _ = h.task.await;
+    for (_, entry) in attached.drain() {
+        entry.cancel.notify_one();
+        let _ = entry.task.await;
     }
     Ok(())
+}
+
+fn spawn_attach_relay(
+    surface: Arc<PtySurface>,
+    outgoing_tx: mpsc::Sender<Envelope>,
+    seq_counter: Arc<AtomicU64>,
+) -> AttachEntry {
+    let cancel = Arc::new(Notify::new());
+    let cancel_for_task = cancel.clone();
+    let surface_for_task = surface.clone();
+    let mut subscriber = surface.subscribe();
+
+    let task = tokio::spawn(async move {
+        let mut attach_seq = 0u64;
+        loop {
+            tokio::select! {
+                biased;
+                _ = cancel_for_task.notified() => break,
+                _ = surface_for_task.dead_notify.notified() => {
+                    tracing::info!("surface died, detaching relay");
+                    break;
+                }
+                res = subscriber.recv() => {
+                    match res {
+                        Ok(bytes) => {
+                            let len = bytes.len() as u64;
+                            let env = Envelope {
+                                seq: seq_counter.fetch_add(1, Ordering::Relaxed) + 1,
+                                correlation_id: 0,
+                                payload: Some(Payload::PtyData(PtyData {
+                                    surface_id: surface_for_task.surface_id.clone(),
+                                    byte_seq: attach_seq,
+                                    payload: bytes,
+                                })),
+                            };
+                            attach_seq += len;
+                            if outgoing_tx.send(env).await.is_err() {
+                                break;
+                            }
+                        }
+                        Err(broadcast::error::RecvError::Lagged(n)) => {
+                            tracing::warn!("attach relay lagged, missed {n} chunks");
+                            // Protocol-level re-sync (GridSnapshot) lands in a later phase.
+                            continue;
+                        }
+                        Err(broadcast::error::RecvError::Closed) => {
+                            tracing::info!("broadcast closed, detaching relay");
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    });
+
+    AttachEntry {
+        surface,
+        task,
+        cancel,
+    }
 }
 
 fn host_hello(seq_counter: &AtomicU64) -> Envelope {
@@ -327,10 +418,7 @@ fn major_compatible(a: &str, b: &str) -> bool {
     a.split('.').next() == b.split('.').next()
 }
 
-async fn send(
-    tx: &mpsc::Sender<Envelope>,
-    env: Envelope,
-) -> anyhow::Result<()> {
+async fn send(tx: &mpsc::Sender<Envelope>, env: Envelope) -> anyhow::Result<()> {
     tx.send(env)
         .await
         .map_err(|e| anyhow::anyhow!("peer outgoing channel closed: {e}"))
@@ -348,4 +436,3 @@ async fn send_error(tx: &mpsc::Sender<Envelope>, code: u32, message: &str) {
     };
     let _ = tx.send(env).await;
 }
-

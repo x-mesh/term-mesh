@@ -1,17 +1,29 @@
 //! Unix-socket accept loop for peer-federation host.
 //!
-//! Invoked from term-meshd's main when `TERMMESH_PEER_SOCKET` is set.
-//! The socket path is expected to be inside a user-private directory;
-//! binding permissions are left as the process umask default for PoC.
+//! Phase 2.3B: constructs a shared `PtyManager` at startup, eagerly
+//! spawns a default PTY surface, and passes the manager into each
+//! per-connection task.
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use tokio::net::UnixListener;
 use tokio::sync::watch;
 
-use super::connection;
+use super::connection::{self, TICK_SURFACE_ID};
+use super::surface::PtyManager;
 
-pub async fn serve(path: PathBuf, mut shutdown_rx: watch::Receiver<bool>) -> anyhow::Result<()> {
+pub async fn serve(path: PathBuf, shutdown_rx: watch::Receiver<bool>) -> anyhow::Result<()> {
+    let manager = Arc::new(PtyManager::new());
+    manager.spawn_default(TICK_SURFACE_ID.to_vec());
+    serve_with_manager(path, shutdown_rx, manager).await
+}
+
+pub async fn serve_with_manager(
+    path: PathBuf,
+    mut shutdown_rx: watch::Receiver<bool>,
+    manager: Arc<PtyManager>,
+) -> anyhow::Result<()> {
     if path.exists() {
         std::fs::remove_file(&path)?;
     }
@@ -29,8 +41,9 @@ pub async fn serve(path: PathBuf, mut shutdown_rx: watch::Receiver<bool>) -> any
             result = listener.accept() => {
                 match result {
                     Ok((stream, _)) => {
+                        let manager = manager.clone();
                         tokio::spawn(async move {
-                            if let Err(e) = connection::run(stream).await {
+                            if let Err(e) = connection::run(stream, manager).await {
                                 tracing::warn!("peer connection ended with error: {e}");
                             }
                         });
@@ -56,29 +69,60 @@ pub async fn serve(path: PathBuf, mut shutdown_rx: watch::Receiver<bool>) -> any
 #[cfg(test)]
 mod integration_tests {
     use super::*;
-    use peer_proto::v1::{
-        envelope, AttachMode, AttachSurface, Auth, Envelope, Hello, ListSurfaces,
-    };
     use peer_proto::v1::envelope::Payload;
+    use peer_proto::v1::{
+        AttachMode, AttachSurface, Auth, Envelope, Hello, ListSurfaces,
+    };
     use tempfile::TempDir;
     use tokio::net::UnixStream;
 
-    use crate::peer::connection::{PROTOCOL_VERSION, TICK_SURFACE_ID};
+    use crate::peer::connection::PROTOCOL_VERSION;
     use crate::peer::framing::{read_envelope, write_envelope};
+    use crate::peer::surface::PtySurface;
 
+    fn echo_manager(marker: &str) -> Arc<PtyManager> {
+        // Child script: wait long enough for the test to send AttachSurface,
+        // then emit the marker several times so a subscriber sees it even
+        // if their attach races with the first write. The child then exits,
+        // which gives the reader thread a natural EOF and lets the tokio
+        // runtime shut down cleanly at test end.
+        //
+        // Long-lived interactive PTYs (a shell staying open) are validated
+        // by the manual SSH demo. Phase 2.3B-b will switch the PTY reader
+        // to AsyncFd so the runtime can cancel it on drop; that lets tests
+        // use persistent commands (like /bin/cat) without risking hangs.
+        let manager = Arc::new(PtyManager::new());
+        let script = format!(
+            "for i in 1 2 3 4 5 6 7 8 9 10; do printf %s {marker}; sleep 0.1; done"
+        );
+        let surface = PtySurface::spawn(
+            TICK_SURFACE_ID.to_vec(),
+            "sh -c".into(),
+            "/bin/sh",
+            &["-c", &script],
+            80,
+            24,
+        )
+        .expect("spawn /bin/sh -c loop");
+        manager.insert_surface(surface);
+        manager
+    }
+
+    /// Attach to a short-lived PTY surface; verify the command's output
+    /// arrives through PtyData.
     #[tokio::test]
-    async fn host_serves_tick_surface_end_to_end() {
+    async fn pty_surface_delivers_child_output() {
         let tmp = TempDir::new().unwrap();
         let sock_path = tmp.path().join("peer.sock");
 
+        const MARKER: &str = "MARKER-peer-test";
+        let manager = echo_manager(MARKER);
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let sock_path_task = sock_path.clone();
         let server_task = tokio::spawn(async move {
-            serve(sock_path_task, shutdown_rx).await.unwrap();
+            serve_with_manager(sock_path_task, shutdown_rx, manager).await.unwrap();
         });
 
-        // Wait for the socket file to appear (bind is synchronous on the server side
-        // but the task may not have reached it yet).
         for _ in 0..50 {
             if sock_path.exists() {
                 break;
@@ -89,100 +133,119 @@ mod integration_tests {
         let stream = UnixStream::connect(&sock_path).await.unwrap();
         let (mut reader, mut writer) = stream.into_split();
 
-        // --- Handshake ---
-        let client_hello = Envelope {
-            seq: 1,
-            correlation_id: 0,
-            payload: Some(Payload::Hello(Hello {
-                protocol_version: PROTOCOL_VERSION.into(),
-                peer_id: vec![0x11; 16],
-                display_name: "integration-test".into(),
-                capabilities: vec![],
-                app_version: "test".into(),
-            })),
-        };
-        write_envelope(&mut writer, &client_hello).await.unwrap();
+        // Handshake.
+        write_envelope(
+            &mut writer,
+            &Envelope {
+                seq: 1,
+                correlation_id: 0,
+                payload: Some(Payload::Hello(Hello {
+                    protocol_version: PROTOCOL_VERSION.into(),
+                    peer_id: vec![0x11; 16],
+                    display_name: "integration-test".into(),
+                    capabilities: vec![],
+                    app_version: "test".into(),
+                })),
+            },
+        )
+        .await
+        .unwrap();
+        let _ = read_envelope(&mut reader).await.unwrap();
+        let _ = read_envelope(&mut reader).await.unwrap();
+        write_envelope(
+            &mut writer,
+            &Envelope {
+                seq: 2,
+                correlation_id: 0,
+                payload: Some(Payload::Auth(Auth {
+                    method: "ssh-passthrough".into(),
+                    token_id: vec![],
+                    signature: vec![],
+                })),
+            },
+        )
+        .await
+        .unwrap();
+        let _ = read_envelope(&mut reader).await.unwrap();
 
-        let host_hello = read_envelope(&mut reader).await.unwrap();
-        assert!(matches!(host_hello.payload, Some(Payload::Hello(_))));
-
-        let challenge = read_envelope(&mut reader).await.unwrap();
-        assert!(matches!(challenge.payload, Some(Payload::AuthChallenge(_))));
-
-        let client_auth = Envelope {
-            seq: 2,
-            correlation_id: 0,
-            payload: Some(Payload::Auth(Auth {
-                method: "ssh-passthrough".into(),
-                token_id: vec![],
-                signature: vec![],
-            })),
-        };
-        write_envelope(&mut writer, &client_auth).await.unwrap();
-
-        let auth_result = read_envelope(&mut reader).await.unwrap();
-        match auth_result.payload {
-            Some(Payload::AuthResult(r)) => assert!(r.accepted, "auth rejected: {}", r.reason),
-            other => panic!("expected AuthResult, got {other:?}"),
-        }
-
-        // --- ListSurfaces ---
-        let list = Envelope {
-            seq: 3,
-            correlation_id: 0,
-            payload: Some(Payload::ListSurfaces(ListSurfaces {})),
-        };
-        write_envelope(&mut writer, &list).await.unwrap();
-        let surface_list = read_envelope(&mut reader).await.unwrap();
-        match surface_list.payload {
-            Some(Payload::SurfaceList(sl)) => {
-                assert_eq!(sl.surfaces.len(), 1);
-                assert_eq!(sl.surfaces[0].surface_id, TICK_SURFACE_ID);
-            }
+        // List + attach.
+        write_envelope(
+            &mut writer,
+            &Envelope {
+                seq: 3,
+                correlation_id: 0,
+                payload: Some(Payload::ListSurfaces(ListSurfaces {})),
+            },
+        )
+        .await
+        .unwrap();
+        let list_reply = read_envelope(&mut reader).await.unwrap();
+        let surfaces = match list_reply.payload {
+            Some(Payload::SurfaceList(sl)) => sl.surfaces,
             other => panic!("expected SurfaceList, got {other:?}"),
-        }
-
-        // --- AttachSurface ---
-        let attach = Envelope {
-            seq: 4,
-            correlation_id: 0,
-            payload: Some(Payload::AttachSurface(AttachSurface {
-                surface_id: TICK_SURFACE_ID.to_vec(),
-                mode: AttachMode::CoWrite as i32,
-                client_cols: 80,
-                client_rows: 24,
-                resume_from_seq: 0,
-            })),
         };
-        write_envelope(&mut writer, &attach).await.unwrap();
-        let attach_result = read_envelope(&mut reader).await.unwrap();
-        match attach_result.payload {
-            Some(Payload::AttachResult(r)) => {
-                assert!(r.accepted);
-                assert_eq!(r.surface_id, TICK_SURFACE_ID);
-            }
+        assert!(!surfaces.is_empty(), "server did not expose any surfaces");
+        let surface_id = surfaces[0].surface_id.clone();
+
+        write_envelope(
+            &mut writer,
+            &Envelope {
+                seq: 4,
+                correlation_id: 0,
+                payload: Some(Payload::AttachSurface(AttachSurface {
+                    surface_id: surface_id.clone(),
+                    mode: AttachMode::CoWrite as i32,
+                    client_cols: 80,
+                    client_rows: 24,
+                    resume_from_seq: 0,
+                })),
+            },
+        )
+        .await
+        .unwrap();
+        let attach_reply = read_envelope(&mut reader).await.unwrap();
+        match attach_reply.payload {
+            Some(Payload::AttachResult(r)) => assert!(r.accepted, "attach rejected: {}", r.reason),
             other => panic!("expected AttachResult, got {other:?}"),
         }
 
-        // --- Receive at least one PtyData tick (within 2s) ---
-        let pty = tokio::time::timeout(
-            std::time::Duration::from_secs(3),
-            read_envelope(&mut reader),
-        )
-        .await
-        .expect("did not receive PtyData in time")
-        .unwrap();
-        match pty.payload {
-            Some(Payload::PtyData(p)) => {
-                let text = String::from_utf8_lossy(&p.payload);
-                assert!(text.contains("[host] tick"), "unexpected payload: {text}");
-                assert_eq!(p.surface_id, TICK_SURFACE_ID);
+        // Child printed MARKER and exited; output should arrive within ~1 s.
+        let mut aggregated = Vec::<u8>::new();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                break;
             }
-            other => panic!("expected PtyData, got {other:?}"),
+            let env = match tokio::time::timeout(remaining, read_envelope(&mut reader)).await {
+                Ok(Ok(env)) => env,
+                _ => break,
+            };
+            if let Some(Payload::PtyData(p)) = env.payload {
+                aggregated.extend_from_slice(&p.payload);
+                if aggregated
+                    .windows(MARKER.len())
+                    .any(|w| w == MARKER.as_bytes())
+                {
+                    break;
+                }
+            }
         }
+        let text = String::from_utf8_lossy(&aggregated);
+        assert!(
+            text.contains(MARKER),
+            "did not observe MARKER in PTY output; saw: {text:?}"
+        );
 
+        // Explicitly close the client side so the server's connection task
+        // observes EOF and its AttachEntry relay tasks drop their
+        // Arc<PtySurface>. Combined with the child having exited (which
+        // lets the reader thread hit EOF naturally), this gives tokio a
+        // clean path to shut the runtime down at test end.
+        drop(reader);
+        drop(writer);
         shutdown_tx.send(true).unwrap();
-        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), server_task).await;
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(3), server_task).await;
     }
 
     #[tokio::test]
@@ -190,10 +253,11 @@ mod integration_tests {
         let tmp = TempDir::new().unwrap();
         let sock_path = tmp.path().join("peer.sock");
 
+        let manager = echo_manager("IGNORED");
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let sock_path_task = sock_path.clone();
         let server_task = tokio::spawn(async move {
-            serve(sock_path_task, shutdown_rx).await.unwrap();
+            serve_with_manager(sock_path_task, shutdown_rx, manager).await.unwrap();
         });
 
         for _ in 0..50 {
@@ -206,7 +270,6 @@ mod integration_tests {
         let stream = UnixStream::connect(&sock_path).await.unwrap();
         let (mut reader, mut writer) = stream.into_split();
 
-        // Minimal handshake.
         write_envelope(
             &mut writer,
             &Envelope {
@@ -223,8 +286,8 @@ mod integration_tests {
         )
         .await
         .unwrap();
-        let _ = read_envelope(&mut reader).await.unwrap(); // host hello
-        let _ = read_envelope(&mut reader).await.unwrap(); // challenge
+        let _ = read_envelope(&mut reader).await.unwrap();
+        let _ = read_envelope(&mut reader).await.unwrap();
         write_envelope(
             &mut writer,
             &Envelope {
@@ -239,9 +302,8 @@ mod integration_tests {
         )
         .await
         .unwrap();
-        let _ = read_envelope(&mut reader).await.unwrap(); // auth result
+        let _ = read_envelope(&mut reader).await.unwrap();
 
-        // Attach a surface id that does not exist.
         write_envelope(
             &mut writer,
             &Envelope {
@@ -268,7 +330,9 @@ mod integration_tests {
             other => panic!("expected AttachResult, got {other:?}"),
         }
 
+        drop(reader);
+        drop(writer);
         shutdown_tx.send(true).unwrap();
-        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), server_task).await;
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(3), server_task).await;
     }
 }

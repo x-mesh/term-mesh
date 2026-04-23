@@ -7,6 +7,7 @@
 
 pub mod connection;
 pub mod framing;
+pub mod pty;
 pub mod server;
 pub mod surface;
 

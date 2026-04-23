@@ -1,91 +1,199 @@
-//! Host-side surface abstractions for peer-federation.
+//! Host-side surfaces backed by real PTYs (Phase 2.3B).
 //!
-//! Phase 2.2 provides a single synthetic surface (`TickSurface`) that emits
-//! deterministic PtyData on a 1-second interval. This exists to validate the
-//! wire protocol end-to-end before real PTY integration arrives in Phase 2.3.
+//! A `PtySurface` wraps a forked child attached to a PTY master fd.
+//! PTY output is fan-out to all attached clients via `tokio::broadcast`;
+//! client input goes to the master via blocking `write(2)`.
+//!
+//! `PtyManager` owns the registry of live surfaces. For Phase 2.3B-a
+//! we eagerly spawn a single default surface running `$SHELL -l`, with
+//! a stable surface_id so clients can list + attach deterministically.
 
-use std::sync::Arc;
-use std::time::Duration;
+use std::collections::HashMap;
+use std::os::unix::io::RawFd;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::{Arc, RwLock};
 
-use peer_proto::v1::{envelope, Envelope, PtyData, SurfaceInfo};
-use tokio::sync::{mpsc, Notify};
-use tokio::task::JoinHandle;
+use peer_proto::v1::SurfaceInfo;
+use tokio::sync::{broadcast, Notify};
 
-/// Canonical descriptor returned to clients via `ListSurfaces`.
-pub fn tick_surface_info(surface_id: &[u8]) -> SurfaceInfo {
-    SurfaceInfo {
-        surface_id: surface_id.to_vec(),
-        workspace_name: "peer-poc".into(),
-        title: "synthetic tick stream".into(),
-        cols: 80,
-        rows: 24,
-        surface_type: "terminal".into(),
-        attachable: true,
-    }
-}
+use super::pty;
 
-pub struct AttachHandle {
-    // Retained for Phase 2.3 where detach/resume logic needs them.
-    #[allow(dead_code)]
+const READ_BUF_SIZE: usize = 4096;
+/// Fan-out channel capacity. If a slow subscriber falls behind by this many
+/// chunks, it starts getting `RecvError::Lagged` on `recv()`; the connection
+/// layer handles that as a gap (eventual reconnect will re-snapshot).
+const BROADCAST_CAPACITY: usize = 1024;
+
+pub struct PtySurface {
     pub surface_id: Vec<u8>,
-    #[allow(dead_code)]
-    pub initial_byte_seq: u64,
-    pub cancel: Arc<Notify>,
-    pub task: JoinHandle<()>,
+    pub title: String,
+    pub workspace_name: String,
+    pub cols: AtomicU32,
+    pub rows: AtomicU32,
+    /// The authoritative broadcast sender. Subscribers are created via
+    /// `.subscribe()`; the reader task owns a cloned sender for fan-out.
+    pub broadcast_tx: broadcast::Sender<Vec<u8>>,
+    /// Set true when the PTY reader has observed EOF or the child died.
+    /// Subscribers should detach when this flips.
+    pub dead: AtomicBool,
+    /// Notified when `dead` flips; lets relay tasks exit promptly without
+    /// polling the flag.
+    pub dead_notify: Notify,
+    master_fd: RawFd,
+    pid: libc::pid_t,
 }
 
-/// Spawn a TickSurface attach that emits PtyData into `outgoing_tx` until
-/// `cancel` is notified or the channel is closed.
-///
-/// The first frame starts at `byte_seq = initial_byte_seq` and each subsequent
-/// frame advances by the emitted payload length, matching the protocol's
-/// "cumulative byte offset since attach" semantics.
-pub fn spawn_tick_surface(
-    surface_id: Vec<u8>,
-    initial_byte_seq: u64,
-    outgoing_tx: mpsc::Sender<Envelope>,
-    seq_counter: Arc<std::sync::atomic::AtomicU64>,
-) -> AttachHandle {
-    let cancel = Arc::new(Notify::new());
-    let cancel_for_task = cancel.clone();
-    let surface_id_for_task = surface_id.clone();
+impl PtySurface {
+    pub fn spawn(
+        surface_id: Vec<u8>,
+        title: String,
+        command: &str,
+        args: &[&str],
+        cols: u16,
+        rows: u16,
+    ) -> std::io::Result<Arc<Self>> {
+        let child = pty::spawn(command, args, cols, rows)?;
+        let (tx, _rx) = broadcast::channel::<Vec<u8>>(BROADCAST_CAPACITY);
 
-    let task = tokio::spawn(async move {
-        let mut tick = 0u64;
-        let mut byte_seq = initial_byte_seq;
-        let mut interval = tokio::time::interval(Duration::from_secs(1));
-        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let surface = Arc::new(PtySurface {
+            surface_id: surface_id.clone(),
+            title,
+            workspace_name: "peer-host".into(),
+            cols: AtomicU32::new(cols as u32),
+            rows: AtomicU32::new(rows as u32),
+            broadcast_tx: tx.clone(),
+            dead: AtomicBool::new(false),
+            dead_notify: Notify::new(),
+            master_fd: child.master_fd,
+            pid: child.pid,
+        });
 
-        loop {
-            tokio::select! {
-                biased;
-                _ = cancel_for_task.notified() => break,
-                _ = interval.tick() => {
-                    tick += 1;
-                    let payload = format!("[host] tick {tick}\r\n").into_bytes();
-                    let payload_len = payload.len() as u64;
-                    let env = Envelope {
-                        seq: seq_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1,
-                        correlation_id: 0,
-                        payload: Some(envelope::Payload::PtyData(PtyData {
-                            surface_id: surface_id_for_task.clone(),
-                            byte_seq,
-                            payload,
-                        })),
-                    };
-                    byte_seq += payload_len;
-                    if outgoing_tx.send(env).await.is_err() {
+        // Reader thread: blocking read(2) loop on the master fd, broadcasting
+        // each chunk to subscribers. Exits on EOF or read error; flips the
+        // surface's `dead` flag so relay tasks can leave cleanly.
+        let reader_surface = surface.clone();
+        let master_fd = child.master_fd;
+        tokio::task::spawn_blocking(move || {
+            let mut buf = [0u8; READ_BUF_SIZE];
+            loop {
+                match pty::read(master_fd, &mut buf) {
+                    Ok(0) => {
+                        tracing::info!(
+                            "PTY reader EOF on surface {:?}",
+                            hex_short(&reader_surface.surface_id)
+                        );
+                        break;
+                    }
+                    Ok(n) => {
+                        // .send returns Err only when there are no subscribers;
+                        // that's expected (nobody attached yet) and not fatal.
+                        let _ = tx.send(buf[..n].to_vec());
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            "PTY read error on surface {:?}: {e}",
+                            hex_short(&reader_surface.surface_id)
+                        );
                         break;
                     }
                 }
             }
-        }
-    });
+            reader_surface.dead.store(true, Ordering::Release);
+            reader_surface.dead_notify.notify_waiters();
+        });
 
-    AttachHandle {
-        surface_id,
-        initial_byte_seq,
-        cancel,
-        task,
+        Ok(surface)
     }
+
+    pub fn subscribe(&self) -> broadcast::Receiver<Vec<u8>> {
+        self.broadcast_tx.subscribe()
+    }
+
+    pub fn write(&self, bytes: &[u8]) -> std::io::Result<usize> {
+        pty::write(self.master_fd, bytes)
+    }
+
+    pub fn resize(&self, cols: u16, rows: u16) -> std::io::Result<()> {
+        pty::resize(self.master_fd, cols, rows)?;
+        self.cols.store(cols as u32, Ordering::Relaxed);
+        self.rows.store(rows as u32, Ordering::Relaxed);
+        Ok(())
+    }
+
+    pub fn info(&self) -> SurfaceInfo {
+        SurfaceInfo {
+            surface_id: self.surface_id.clone(),
+            workspace_name: self.workspace_name.clone(),
+            title: self.title.clone(),
+            cols: self.cols.load(Ordering::Relaxed),
+            rows: self.rows.load(Ordering::Relaxed),
+            surface_type: "terminal".into(),
+            attachable: !self.dead.load(Ordering::Acquire),
+        }
+    }
+}
+
+impl Drop for PtySurface {
+    fn drop(&mut self) {
+        pty::teardown(self.master_fd, self.pid);
+    }
+}
+
+pub struct PtyManager {
+    surfaces: RwLock<HashMap<Vec<u8>, Arc<PtySurface>>>,
+}
+
+impl PtyManager {
+    pub fn new() -> Self {
+        Self {
+            surfaces: RwLock::new(HashMap::new()),
+        }
+    }
+
+    /// Ensure the Phase 2.3B-a default surface exists. Called once at
+    /// server startup. If spawn fails (e.g. `$SHELL` not executable),
+    /// logs and returns without a surface — the server still runs and
+    /// clients see an empty surface list.
+    pub fn spawn_default(self: &Arc<Self>, surface_id: Vec<u8>) {
+        if self.surfaces.read().unwrap().contains_key(&surface_id) {
+            return;
+        }
+        let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".into());
+        let title = format!("{} -l", shell);
+        match PtySurface::spawn(surface_id.clone(), title, &shell, &["-l"], 80, 24) {
+            Ok(surface) => {
+                self.surfaces
+                    .write()
+                    .unwrap()
+                    .insert(surface_id, surface);
+                tracing::info!("spawned default PTY surface");
+            }
+            Err(e) => {
+                tracing::error!("failed to spawn default PTY surface: {e}");
+            }
+        }
+    }
+
+    pub fn list(&self) -> Vec<Arc<PtySurface>> {
+        self.surfaces.read().unwrap().values().cloned().collect()
+    }
+
+    pub fn get(&self, surface_id: &[u8]) -> Option<Arc<PtySurface>> {
+        self.surfaces.read().unwrap().get(surface_id).cloned()
+    }
+
+    /// Register a pre-built surface. Used by tests to install deterministic
+    /// commands (`/bin/cat` instead of a login shell) without racing env vars.
+    #[allow(dead_code)]
+    pub fn insert_surface(&self, surface: Arc<PtySurface>) {
+        self.surfaces
+            .write()
+            .unwrap()
+            .insert(surface.surface_id.clone(), surface);
+    }
+}
+
+fn hex_short(bytes: &[u8]) -> String {
+    let n = bytes.len().min(4);
+    bytes[..n].iter().map(|b| format!("{b:02x}")).collect()
 }
