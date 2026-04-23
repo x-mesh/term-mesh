@@ -2,6 +2,7 @@ mod agent;
 mod headless;
 mod http;
 mod monitor;
+mod peer;
 mod socket;
 mod tokens;
 mod watcher;
@@ -117,6 +118,17 @@ async fn main() -> anyhow::Result<()> {
         ))
     };
 
+    // 5a. Peer federation server (opt-in via TERMMESH_PEER_SOCKET).
+    let peer_task: Option<tokio::task::JoinHandle<anyhow::Result<()>>> =
+        std::env::var("TERMMESH_PEER_SOCKET")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .map(std::path::PathBuf::from)
+            .map(|path| tokio::spawn(peer::serve(path, shutdown_rx.clone())));
+    if peer_task.is_some() {
+        tracing::info!("peer-federation server enabled");
+    }
+
     // 5. Unix socket server
     let socket_path = socket::default_socket_path();
     let socket_task = tokio::spawn(socket::serve(
@@ -162,6 +174,9 @@ async fn main() -> anyhow::Result<()> {
     match tokio::time::timeout(timeout, async {
         let _ = socket_task.await;
         let _ = http_task.await;
+        if let Some(t) = peer_task {
+            let _ = t.await;
+        }
     })
     .await
     {

@@ -1670,6 +1670,8 @@ dependencies = [
  "libc",
  "libz-sys",
  "notify",
+ "peer-proto",
+ "prost",
  "rusqlite",
  "serde",
  "serde_json",

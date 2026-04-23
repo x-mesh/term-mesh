@@ -46,6 +46,10 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # UUID for worktree naming
 uuid = { version = "1", features = ["v4"] }
 
+# Peer federation protocol bindings
+peer-proto = { path = "../peer-proto" }
+prost = "0.13"
+
 # Platform directories
 dirs = "6"
 
