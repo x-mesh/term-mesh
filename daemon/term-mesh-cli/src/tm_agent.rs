@@ -493,13 +493,25 @@ struct PeerCommands {
 
 #[derive(Subcommand)]
 enum PeerCommand {
-    /// Attach to the first surface exposed by a peer-federation host socket.
+    /// List the surfaces a peer-federation host exposes.
     ///
-    /// Stream PtyData from the host to stdout; relay stdin line-buffered as Input.
-    /// Ctrl-D (EOF on stdin) cleanly detaches.
-    Attach {
-        /// Path to the host's peer-federation unix socket (must already exist).
+    /// Prints one surface per line: `<title>  <cols>x<rows>  <status>  <id>`
+    /// where status is "live" or "dead". Exits after printing.
+    List {
+        /// Path to the host's peer-federation unix socket.
         socket: PathBuf,
+    },
+    /// Attach to a surface exposed by a peer-federation host.
+    ///
+    /// Without `--name`, attaches to the first surface listed by the host.
+    /// Stream PtyData from the host to stdout; relay stdin as Input.
+    /// Ctrl-] detaches in interactive mode; stdin EOF detaches otherwise.
+    Attach {
+        /// Path to the host's peer-federation unix socket.
+        socket: PathBuf,
+        /// Title of the surface to attach to; defaults to the first listed.
+        #[arg(long)]
+        name: Option<String>,
     },
 }
 
@@ -1805,8 +1817,15 @@ fn main() {
         }
         Commands::Peer(peer_cmd) => {
             match peer_cmd.command {
-                PeerCommand::Attach { socket } => {
-                    if let Err(e) = peer::attach_cmd(&socket) {
+                PeerCommand::List { socket } => {
+                    if let Err(e) = peer::list_cmd(&socket) {
+                        eprintln!("peer list failed: {e:#}");
+                        process::exit(1);
+                    }
+                    return;
+                }
+                PeerCommand::Attach { socket, name } => {
+                    if let Err(e) = peer::attach_cmd(&socket, name.as_deref()) {
                         eprintln!("peer attach failed: {e:#}");
                         process::exit(1);
                     }

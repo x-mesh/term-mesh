@@ -115,6 +115,7 @@ impl PtySurface {
                     }
                 };
 
+                let child_pid = reader_surface.pid;
                 let result = guard.try_io(|inner| {
                     // Safety: libc::read on a registered, nonblocking fd.
                     let n = unsafe {
@@ -129,9 +130,19 @@ impl PtySurface {
                         match err.raw_os_error() {
                             // AsyncFd will re-register and wait for readability.
                             Some(libc::EAGAIN) => Err(err),
-                            // macOS returns EIO on the master side when the
-                            // child has exited; surface it as EOF.
-                            Some(libc::EIO) => Ok(0),
+                            Some(libc::EIO) => {
+                                // macOS reports EIO both for "child has
+                                // exited" AND transiently during the brief
+                                // gap between fork and exec. Distinguish
+                                // via WNOHANG waitpid: if the child is still
+                                // running, treat EIO as EAGAIN (ask AsyncFd
+                                // to re-register). If it has exited, real EOF.
+                                if pty::child_has_exited(child_pid) {
+                                    Ok(0)
+                                } else {
+                                    Err(std::io::Error::from_raw_os_error(libc::EAGAIN))
+                                }
+                            }
                             _ => Err(err),
                         }
                     } else {
@@ -219,6 +230,65 @@ pub struct PtyManager {
     specs: RwLock<HashMap<Vec<u8>, SpawnSpec>>,
 }
 
+/// Namespace UUID used to derive stable 16-byte `surface_id`s from
+/// user-friendly names. Deterministic across runs so a client can
+/// reconnect to the same logical surface after a daemon restart.
+const SURFACE_NAMESPACE: uuid::Uuid = uuid::Uuid::from_bytes([
+    0xf5, 0x75, 0x6e, 0x86, 0xa7, 0xde, 0x49, 0x3b, 0x9d, 0x43, 0x12, 0x95, 0xed, 0xc8, 0x2a, 0xd0,
+]);
+
+/// Stable 16-byte id derived from a human name via UUIDv5.
+/// Collision-resistant regardless of name length.
+pub fn surface_id_from_name(name: &str) -> Vec<u8> {
+    uuid::Uuid::new_v5(&SURFACE_NAMESPACE, name.as_bytes())
+        .as_bytes()
+        .to_vec()
+}
+
+/// Parse `TERMMESH_PEER_SURFACES` into (name, shell-command) pairs.
+///
+/// Format: one `name=cmd` entry per line. Newline as the separator lets
+/// commands use `;` freely (for `while :; do …; done` style loops). Each
+/// command string is executed via `/bin/sh -c <cmd>` so quoting and
+/// expansion work naturally. Empty / malformed lines are silently skipped.
+/// Returns `None` when the env var is unset or parses to nothing.
+///
+/// Example (bash / zsh):
+///
+/// ```text
+/// export TERMMESH_PEER_SURFACES='shell=/bin/zsh -l
+/// clock=while :; do date; sleep 1; done
+/// uptime=while :; do uptime; sleep 2; done'
+/// ```
+pub fn parse_surfaces_env() -> Option<Vec<(String, String)>> {
+    let raw = std::env::var("TERMMESH_PEER_SURFACES").ok()?;
+    let mut out = Vec::new();
+    for entry in raw.split('\n') {
+        let entry = entry.trim();
+        if entry.is_empty() {
+            continue;
+        }
+        let Some((name, cmd)) = entry.split_once('=') else {
+            continue;
+        };
+        let (name, cmd) = (name.trim(), cmd.trim());
+        if name.is_empty() || cmd.is_empty() {
+            continue;
+        }
+        out.push((name.to_string(), cmd.to_string()));
+    }
+    if out.is_empty() {
+        None
+    } else {
+        Some(out)
+    }
+}
+
+fn default_shell_cmd() -> String {
+    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".into());
+    format!("{shell} -l")
+}
+
 impl PtyManager {
     pub fn new() -> Self {
         Self {
@@ -227,22 +297,27 @@ impl PtyManager {
         }
     }
 
-    /// Ensure the default surface exists. Called once at server startup.
-    /// The spawn spec is registered so the surface can be respawned under
-    /// the same id if the user exits the shell.
-    pub fn spawn_default(self: &Arc<Self>, surface_id: Vec<u8>) {
-        if self.surfaces.read().unwrap().contains_key(&surface_id) {
-            return;
+    /// Spawn every surface declared by `TERMMESH_PEER_SURFACES`, falling
+    /// back to a single "shell" surface running `$SHELL -l`. Called once
+    /// at server startup. Each registered spec is eligible for auto-respawn
+    /// via `get_or_respawn`.
+    pub fn spawn_from_config(self: &Arc<Self>) {
+        let entries = parse_surfaces_env()
+            .unwrap_or_else(|| vec![("shell".to_string(), default_shell_cmd())]);
+        for (name, cmd) in entries {
+            let surface_id = surface_id_from_name(&name);
+            if self.surfaces.read().unwrap().contains_key(&surface_id) {
+                continue;
+            }
+            let spec = SpawnSpec {
+                title: name,
+                command: "/bin/sh".into(),
+                args: vec!["-c".into(), cmd],
+                cols: 80,
+                rows: 24,
+            };
+            self.register_and_spawn(surface_id, spec);
         }
-        let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".into());
-        let spec = SpawnSpec {
-            title: format!("{shell} -l"),
-            command: shell,
-            args: vec!["-l".into()],
-            cols: 80,
-            rows: 24,
-        };
-        self.register_and_spawn(surface_id, spec);
     }
 
     /// Register a respawn spec under `surface_id` and spawn its first
@@ -264,7 +339,10 @@ impl PtyManager {
     }
 
     pub fn list(&self) -> Vec<Arc<PtySurface>> {
-        self.surfaces.read().unwrap().values().cloned().collect()
+        let mut v: Vec<Arc<PtySurface>> = self.surfaces.read().unwrap().values().cloned().collect();
+        // Stable ordering for UI/CLI display.
+        v.sort_by(|a, b| a.title.cmp(&b.title));
+        v
     }
 
     /// Return a live surface for `surface_id`, respawning if the

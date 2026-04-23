@@ -110,6 +110,24 @@ pub fn resize(master_fd: RawFd, cols: u16, rows: u16) -> io::Result<()> {
     Ok(())
 }
 
+/// Non-blocking check: has the child exited?
+///
+/// Returns `true` iff `waitpid(pid, _, WNOHANG)` reports the child has
+/// terminated (rc > 0 means it was just reaped; rc < 0 means it was
+/// already reaped elsewhere or there's no such pid — both count as
+/// "not alive" from our perspective).
+///
+/// Used to distinguish a genuine PTY EOF/EIO from a transient startup
+/// glitch: on macOS the master fd can momentarily report EIO during the
+/// brief window between `fork(2)` and `execve(2)` in the child.
+pub fn child_has_exited(pid: libc::pid_t) -> bool {
+    let mut status = 0i32;
+    // Safety: waitpid with WNOHANG is safe on any pid we own; we don't
+    // care about the status value, only the return code.
+    let rc = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
+    rc != 0
+}
+
 /// Best-effort graceful shutdown: SIGHUP the child, close the master fd,
 /// and non-blocking reap. Any errors are swallowed; this is cleanup-path
 /// code run from Drop.

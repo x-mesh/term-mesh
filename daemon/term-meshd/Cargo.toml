@@ -43,8 +43,8 @@ anyhow = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
-# UUID for worktree naming
-uuid = { version = "1", features = ["v4"] }
+# UUID for worktree naming + stable surface-id derivation (v5)
+uuid = { version = "1", features = ["v4", "v5"] }
 
 # Peer federation protocol bindings
 peer-proto = { path = "../peer-proto" }

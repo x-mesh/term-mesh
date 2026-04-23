@@ -28,15 +28,20 @@ const DEFAULT_ROWS: u32 = 24;
 /// Ctrl-] — same convention as telnet. One keystroke, no two-step escape.
 const DETACH_KEY: u8 = 0x1d;
 
-pub fn attach_cmd(socket_path: &Path) -> anyhow::Result<()> {
+/// Establish a connection, run the Hello/Auth handshake, and return the
+/// stream halves + the running seq counter. Used by both `list_cmd` and
+/// `attach_cmd` so their handshake stays in sync.
+fn connect_and_authenticate(
+    socket_path: &Path,
+    emit_banners: bool,
+) -> anyhow::Result<(UnixStream, UnixStream, Arc<AtomicU64>)> {
     let stream = UnixStream::connect(socket_path)
         .map_err(|e| anyhow::anyhow!("connect {}: {e}", socket_path.display()))?;
-    let mut read_stream = stream.try_clone()?;
+    let read_stream = stream.try_clone()?;
     let mut write_stream = stream;
+    let mut read_ref = write_stream.try_clone()?;
 
     let seq = Arc::new(AtomicU64::new(0));
-
-    // ---- handshake (synchronous, main thread owns both halves) ----
     let peer_id = random_16_bytes();
     write_envelope(
         &mut write_stream,
@@ -54,16 +59,18 @@ pub fn attach_cmd(socket_path: &Path) -> anyhow::Result<()> {
         },
     )?;
 
-    let host_hello = read_envelope(&mut read_stream)?;
+    let host_hello = read_envelope(&mut read_ref)?;
     let Some(Payload::Hello(h)) = host_hello.payload else {
         anyhow::bail!("host did not send Hello first");
     };
-    eprintln!(
-        "[peer] connected to {} ({}), protocol {}",
-        h.display_name, h.app_version, h.protocol_version
-    );
+    if emit_banners {
+        eprintln!(
+            "[peer] connected to {} ({}), protocol {}",
+            h.display_name, h.app_version, h.protocol_version
+        );
+    }
 
-    let challenge = read_envelope(&mut read_stream)?;
+    let challenge = read_envelope(&mut read_ref)?;
     match challenge.payload {
         Some(Payload::AuthChallenge(_)) => {}
         other => anyhow::bail!("expected AuthChallenge, got {other:?}"),
@@ -82,33 +89,87 @@ pub fn attach_cmd(socket_path: &Path) -> anyhow::Result<()> {
         },
     )?;
 
-    let auth_result = read_envelope(&mut read_stream)?;
+    let auth_result = read_envelope(&mut read_ref)?;
     match auth_result.payload {
         Some(Payload::AuthResult(r)) if r.accepted => {
-            eprintln!("[peer] authenticated");
+            if emit_banners {
+                eprintln!("[peer] authenticated");
+            }
         }
         Some(Payload::AuthResult(r)) => anyhow::bail!("auth rejected: {}", r.reason),
         other => anyhow::bail!("expected AuthResult, got {other:?}"),
     }
 
-    // ---- list + pick first surface ----
+    // Both read halves on the same underlying socket; return one pair to the caller.
+    drop(read_ref);
+    Ok((read_stream, write_stream, seq))
+}
+
+fn list_surfaces(
+    read_stream: &mut UnixStream,
+    write_stream: &mut UnixStream,
+    seq: &AtomicU64,
+) -> anyhow::Result<Vec<peer_proto::v1::SurfaceInfo>> {
     write_envelope(
-        &mut write_stream,
+        write_stream,
         &Envelope {
-            seq: next_seq(&seq),
+            seq: next_seq(seq),
             correlation_id: 0,
             payload: Some(Payload::ListSurfaces(ListSurfaces {})),
         },
     )?;
-    let list_reply = read_envelope(&mut read_stream)?;
-    let surfaces = match list_reply.payload {
-        Some(Payload::SurfaceList(sl)) => sl.surfaces,
+    let list_reply = read_envelope(read_stream)?;
+    match list_reply.payload {
+        Some(Payload::SurfaceList(sl)) => Ok(sl.surfaces),
         other => anyhow::bail!("expected SurfaceList, got {other:?}"),
+    }
+}
+
+pub fn list_cmd(socket_path: &Path) -> anyhow::Result<()> {
+    let (mut read_stream, mut write_stream, seq) =
+        connect_and_authenticate(socket_path, /* emit_banners */ false)?;
+    let surfaces = list_surfaces(&mut read_stream, &mut write_stream, &seq)?;
+    if surfaces.is_empty() {
+        println!("(no surfaces)");
+        return Ok(());
+    }
+    for s in surfaces {
+        let status = if s.attachable { "live" } else { "dead" };
+        println!(
+            "{title:<24} {cols:>3}x{rows:<3}  {status:<4}  {id}",
+            title = s.title,
+            cols = s.cols,
+            rows = s.rows,
+            id = hex_short(&s.surface_id),
+        );
+    }
+    Ok(())
+}
+
+pub fn attach_cmd(socket_path: &Path, name: Option<&str>) -> anyhow::Result<()> {
+    let (mut read_stream_init, mut write_stream, seq) =
+        connect_and_authenticate(socket_path, /* emit_banners */ true)?;
+
+    let surfaces = list_surfaces(&mut read_stream_init, &mut write_stream, &seq)?;
+
+    let chosen = match name {
+        Some(n) => surfaces
+            .iter()
+            .find(|s| s.title == n)
+            .cloned()
+            .ok_or_else(|| {
+                let available: Vec<String> = surfaces.iter().map(|s| s.title.clone()).collect();
+                anyhow::anyhow!(
+                    "surface \"{n}\" not found on host; available: {}",
+                    available.join(", ")
+                )
+            })?,
+        None => surfaces
+            .first()
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("host reports no attachable surfaces"))?,
     };
-    let chosen = surfaces
-        .first()
-        .ok_or_else(|| anyhow::anyhow!("host reports no attachable surfaces"))?
-        .clone();
+
     eprintln!(
         "[peer] attaching surface \"{}\" ({}) {}x{}",
         hex_short(&chosen.surface_id),
@@ -116,6 +177,8 @@ pub fn attach_cmd(socket_path: &Path) -> anyhow::Result<()> {
         chosen.cols,
         chosen.rows
     );
+
+    let mut read_stream = read_stream_init;
     let surface_id = chosen.surface_id.clone();
 
     // ---- attach ----

@@ -10,12 +10,12 @@ use std::sync::Arc;
 use tokio::net::UnixListener;
 use tokio::sync::watch;
 
-use super::connection::{self, TICK_SURFACE_ID};
+use super::connection;
 use super::surface::PtyManager;
 
 pub async fn serve(path: PathBuf, shutdown_rx: watch::Receiver<bool>) -> anyhow::Result<()> {
     let manager = Arc::new(PtyManager::new());
-    manager.spawn_default(TICK_SURFACE_ID.to_vec());
+    manager.spawn_from_config();
     serve_with_manager(path, shutdown_rx, manager).await
 }
 
@@ -78,7 +78,7 @@ mod integration_tests {
 
     use crate::peer::connection::PROTOCOL_VERSION;
     use crate::peer::framing::{read_envelope, write_envelope};
-    use crate::peer::surface::PtySurface;
+    use crate::peer::surface::{surface_id_from_name, PtySurface};
 
     fn cat_manager() -> Arc<PtyManager> {
         // `/bin/cat` is long-lived: it only exits when its stdin (the PTY
@@ -88,7 +88,7 @@ mod integration_tests {
         // spawn_blocking design this would hang the test forever.
         let manager = Arc::new(PtyManager::new());
         let surface = PtySurface::spawn(
-            TICK_SURFACE_ID.to_vec(),
+            surface_id_from_name("shell"),
             "cat".into(),
             "/bin/cat",
             &[],
@@ -496,10 +496,11 @@ mod integration_tests {
         let sock_path = tmp.path().join("peer.sock");
 
         let manager = Arc::new(PtyManager::new());
+        let sid = surface_id_from_name("short-lived");
         // Child prints MARKER and exits immediately. Every respawn produces
         // a fresh MARKER-bearing child.
         manager.register_and_spawn(
-            TICK_SURFACE_ID.to_vec(),
+            sid.clone(),
             SpawnSpec {
                 title: "short-lived".into(),
                 command: "/bin/sh".into(),
@@ -516,7 +517,7 @@ mod integration_tests {
         // flips before we attempt our attach.
         for _ in 0..50 {
             let still_alive = manager
-                .get_or_respawn(&TICK_SURFACE_ID)
+                .get_or_respawn(&sid)
                 .map(|s| !s.dead.load(std::sync::atomic::Ordering::Acquire))
                 .unwrap_or(false);
             // Break the moment we observe a live post-respawn surface OR
@@ -561,6 +562,145 @@ mod integration_tests {
 
         drop(reader);
         drop(_writer);
+        shutdown_tx.send(true).unwrap();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(3), server_task).await;
+    }
+
+    /// Register three independent surfaces, list them, verify each is
+    /// present and attach to a specific one by name.
+    #[tokio::test]
+    async fn lists_and_attaches_multiple_surfaces_by_name() {
+        use crate::peer::surface::SpawnSpec;
+
+        let tmp = TempDir::new().unwrap();
+        let sock_path = tmp.path().join("peer.sock");
+
+        let manager = Arc::new(PtyManager::new());
+        for name in ["alpha", "bravo", "charlie"] {
+            manager.register_and_spawn(
+                surface_id_from_name(name),
+                SpawnSpec {
+                    title: name.into(),
+                    command: "/bin/sh".into(),
+                    // Each child writes a name-specific marker then sleeps.
+                    args: vec![
+                        "-c".into(),
+                        format!(
+                            "for _ in 1 2 3 4 5 6 7 8 9 10; do printf 'HELLO-{name}'; sleep 0.1; done"
+                        ),
+                    ],
+                    cols: 80,
+                    rows: 24,
+                },
+            );
+        }
+
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let sp_task = sock_path.clone();
+        let server_task = tokio::spawn(async move {
+            serve_with_manager(sp_task, shutdown_rx, manager)
+                .await
+                .unwrap();
+        });
+        for _ in 0..50 {
+            if sock_path.exists() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+
+        // Handshake + ListSurfaces: expect all three titles in the reply.
+        let stream = UnixStream::connect(&sock_path).await.unwrap();
+        let (mut reader, mut writer) = stream.into_split();
+        write_envelope(
+            &mut writer,
+            &Envelope {
+                seq: 1,
+                correlation_id: 0,
+                payload: Some(Payload::Hello(Hello {
+                    protocol_version: PROTOCOL_VERSION.into(),
+                    peer_id: vec![0; 16],
+                    display_name: "list-test".into(),
+                    capabilities: vec![],
+                    app_version: "test".into(),
+                })),
+            },
+        )
+        .await
+        .unwrap();
+        let _ = read_envelope(&mut reader).await.unwrap();
+        let _ = read_envelope(&mut reader).await.unwrap();
+        write_envelope(
+            &mut writer,
+            &Envelope {
+                seq: 2,
+                correlation_id: 0,
+                payload: Some(Payload::Auth(Auth {
+                    method: "ssh-passthrough".into(),
+                    token_id: vec![],
+                    signature: vec![],
+                })),
+            },
+        )
+        .await
+        .unwrap();
+        let _ = read_envelope(&mut reader).await.unwrap();
+        write_envelope(
+            &mut writer,
+            &Envelope {
+                seq: 3,
+                correlation_id: 0,
+                payload: Some(Payload::ListSurfaces(ListSurfaces {})),
+            },
+        )
+        .await
+        .unwrap();
+        let list_reply = read_envelope(&mut reader).await.unwrap();
+        let titles: Vec<String> = match list_reply.payload {
+            Some(Payload::SurfaceList(sl)) => sl.surfaces.into_iter().map(|s| s.title).collect(),
+            other => panic!("expected SurfaceList, got {other:?}"),
+        };
+        assert_eq!(
+            titles,
+            vec!["alpha".to_string(), "bravo".into(), "charlie".into()],
+            "surfaces not sorted by title or missing entries"
+        );
+
+        // Attach specifically to `bravo` by its derived id; verify the
+        // bravo-specific marker appears on the stream.
+        let bravo_id = surface_id_from_name("bravo");
+        write_envelope(
+            &mut writer,
+            &Envelope {
+                seq: 4,
+                correlation_id: 0,
+                payload: Some(Payload::AttachSurface(AttachSurface {
+                    surface_id: bravo_id.clone(),
+                    mode: AttachMode::CoWrite as i32,
+                    client_cols: 80,
+                    client_rows: 24,
+                    resume_from_seq: 0,
+                })),
+            },
+        )
+        .await
+        .unwrap();
+        let attach_reply = read_envelope(&mut reader).await.unwrap();
+        match attach_reply.payload {
+            Some(Payload::AttachResult(r)) => assert!(r.accepted, "attach rejected: {}", r.reason),
+            other => panic!("expected AttachResult, got {other:?}"),
+        }
+
+        let seen = wait_for_marker(
+            &mut reader,
+            b"HELLO-bravo",
+            std::time::Duration::from_secs(3),
+        )
+        .await;
+        assert!(seen, "never observed bravo-specific marker");
+
+        drop(reader);
+        drop(writer);
         shutdown_tx.send(true).unwrap();
         let _ = tokio::time::timeout(std::time::Duration::from_secs(3), server_task).await;
     }

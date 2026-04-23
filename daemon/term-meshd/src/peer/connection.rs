@@ -28,12 +28,6 @@ use super::surface::{PtyManager, PtySurface};
 pub const PROTOCOL_VERSION: &str = "1.0.0";
 pub const HOST_DISPLAY_NAME_ENV: &str = "TERMMESH_PEER_DISPLAY_NAME";
 
-/// Stable surface_id for the Phase 2.3B default PTY. Keeps the constant
-/// name from 2.2 so existing tests / tools don't break.
-pub const TICK_SURFACE_ID: [u8; 16] = [
-    0x74, 0x69, 0x63, 0x6b, 0x2d, 0x73, 0x75, 0x72, 0x66, 0x61, 0x63, 0x65, 0x2d, 0x30, 0x30, 0x31,
-];
-
 #[derive(Debug, PartialEq, Eq)]
 enum HandshakeState {
     Init,
