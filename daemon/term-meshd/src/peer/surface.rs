@@ -202,33 +202,59 @@ impl Drop for PtySurface {
     }
 }
 
+#[derive(Clone, Debug)]
+pub struct SpawnSpec {
+    pub title: String,
+    pub command: String,
+    pub args: Vec<String>,
+    pub cols: u16,
+    pub rows: u16,
+}
+
 pub struct PtyManager {
     surfaces: RwLock<HashMap<Vec<u8>, Arc<PtySurface>>>,
+    /// Registered "how to respawn this surface" specs keyed by surface_id.
+    /// `insert_surface` (test-only path) does not populate this; production
+    /// surfaces registered via `spawn_default` do.
+    specs: RwLock<HashMap<Vec<u8>, SpawnSpec>>,
 }
 
 impl PtyManager {
     pub fn new() -> Self {
         Self {
             surfaces: RwLock::new(HashMap::new()),
+            specs: RwLock::new(HashMap::new()),
         }
     }
 
-    /// Ensure the Phase 2.3B-a default surface exists. Called once at
-    /// server startup. If spawn fails (e.g. `$SHELL` not executable),
-    /// logs and returns without a surface — the server still runs and
-    /// clients see an empty surface list.
+    /// Ensure the default surface exists. Called once at server startup.
+    /// The spawn spec is registered so the surface can be respawned under
+    /// the same id if the user exits the shell.
     pub fn spawn_default(self: &Arc<Self>, surface_id: Vec<u8>) {
         if self.surfaces.read().unwrap().contains_key(&surface_id) {
             return;
         }
         let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".into());
-        let title = format!("{} -l", shell);
-        match PtySurface::spawn(surface_id.clone(), title, &shell, &["-l"], 80, 24) {
+        let spec = SpawnSpec {
+            title: format!("{shell} -l"),
+            command: shell,
+            args: vec!["-l".into()],
+            cols: 80,
+            rows: 24,
+        };
+        self.register_and_spawn(surface_id, spec);
+    }
+
+    /// Register a respawn spec under `surface_id` and spawn its first
+    /// instance. Errors are logged; the server runs on regardless.
+    pub fn register_and_spawn(&self, surface_id: Vec<u8>, spec: SpawnSpec) {
+        match spawn_from_spec(&surface_id, &spec) {
             Ok(surface) => {
                 self.surfaces
                     .write()
                     .unwrap()
-                    .insert(surface_id, surface);
+                    .insert(surface_id.clone(), surface);
+                self.specs.write().unwrap().insert(surface_id, spec);
                 tracing::info!("spawned default PTY surface");
             }
             Err(e) => {
@@ -241,12 +267,48 @@ impl PtyManager {
         self.surfaces.read().unwrap().values().cloned().collect()
     }
 
-    pub fn get(&self, surface_id: &[u8]) -> Option<Arc<PtySurface>> {
-        self.surfaces.read().unwrap().get(surface_id).cloned()
+    /// Return a live surface for `surface_id`, respawning if the
+    /// previously-registered instance has exited. Returns `None` when the
+    /// id is unknown (no surface ever registered) or when respawn fails.
+    pub fn get_or_respawn(&self, surface_id: &[u8]) -> Option<Arc<PtySurface>> {
+        if let Some(s) = self.surfaces.read().unwrap().get(surface_id) {
+            if !s.dead.load(Ordering::Acquire) {
+                return Some(s.clone());
+            }
+        }
+
+        let spec = self.specs.read().unwrap().get(surface_id).cloned()?;
+
+        let mut surfaces = self.surfaces.write().unwrap();
+        // Re-check under the write lock: another caller may have just
+        // respawned between our read-lock check and now.
+        if let Some(s) = surfaces.get(surface_id) {
+            if !s.dead.load(Ordering::Acquire) {
+                return Some(s.clone());
+            }
+        }
+        surfaces.remove(surface_id);
+
+        match spawn_from_spec(surface_id, &spec) {
+            Ok(surface) => {
+                surfaces.insert(surface_id.to_vec(), surface.clone());
+                tracing::info!(
+                    "respawned surface after exit: {}",
+                    hex_short(surface_id)
+                );
+                Some(surface)
+            }
+            Err(e) => {
+                tracing::error!("respawn failed for {}: {e}", hex_short(surface_id));
+                None
+            }
+        }
     }
 
     /// Register a pre-built surface. Used by tests to install deterministic
     /// commands (`/bin/cat` instead of a login shell) without racing env vars.
+    /// Does NOT register a respawn spec; tests that need respawn must use
+    /// `register_and_spawn`.
     #[allow(dead_code)]
     pub fn insert_surface(&self, surface: Arc<PtySurface>) {
         self.surfaces
@@ -254,6 +316,18 @@ impl PtyManager {
             .unwrap()
             .insert(surface.surface_id.clone(), surface);
     }
+}
+
+fn spawn_from_spec(surface_id: &[u8], spec: &SpawnSpec) -> std::io::Result<Arc<PtySurface>> {
+    let arg_refs: Vec<&str> = spec.args.iter().map(String::as_str).collect();
+    PtySurface::spawn(
+        surface_id.to_vec(),
+        spec.title.clone(),
+        &spec.command,
+        &arg_refs,
+        spec.cols,
+        spec.rows,
+    )
 }
 
 fn hex_short(bytes: &[u8]) -> String {

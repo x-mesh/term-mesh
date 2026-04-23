@@ -177,7 +177,11 @@ async fn reader_loop(
             }
 
             (HandshakeState::Ready, Payload::AttachSurface(req)) => {
-                let Some(surface) = manager.get(&req.surface_id) else {
+                // get_or_respawn revives a registered surface whose child
+                // has exited (e.g., the user typed `exit` in a previous
+                // attach). Unknown ids or respawn failures fall through
+                // to the "surface not found" reply below.
+                let Some(surface) = manager.get_or_respawn(&req.surface_id) else {
                     let reply = Envelope {
                         seq: next_seq(&seq_counter),
                         correlation_id: env.seq,
@@ -192,22 +196,6 @@ async fn reader_loop(
                     send(&outgoing_tx, reply).await?;
                     continue;
                 };
-
-                if surface.dead.load(Ordering::Acquire) {
-                    let reply = Envelope {
-                        seq: next_seq(&seq_counter),
-                        correlation_id: env.seq,
-                        payload: Some(Payload::AttachResult(AttachResult {
-                            accepted: false,
-                            reason: "surface has exited".into(),
-                            surface_id: req.surface_id.clone(),
-                            initial_seq: 0,
-                            granted_mode: AttachMode::Unspecified as i32,
-                        })),
-                    };
-                    send(&outgoing_tx, reply).await?;
-                    continue;
-                }
 
                 if attached.contains_key(&req.surface_id) {
                     let reply = Envelope {

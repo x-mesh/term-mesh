@@ -484,6 +484,87 @@ mod integration_tests {
         let _ = tokio::time::timeout(std::time::Duration::from_secs(3), server_task).await;
     }
 
+    /// Register a respawn spec for a child that exits immediately; verify
+    /// that a subsequent attach respawns the surface and PtyData flows
+    /// again. This is the regression guard for the UX bug where typing
+    /// `exit` in a session left the default surface permanently dead.
+    #[tokio::test]
+    async fn surface_respawns_after_child_exit() {
+        use crate::peer::surface::SpawnSpec;
+
+        let tmp = TempDir::new().unwrap();
+        let sock_path = tmp.path().join("peer.sock");
+
+        let manager = Arc::new(PtyManager::new());
+        // Child prints MARKER and exits immediately. Every respawn produces
+        // a fresh MARKER-bearing child.
+        manager.register_and_spawn(
+            TICK_SURFACE_ID.to_vec(),
+            SpawnSpec {
+                title: "short-lived".into(),
+                command: "/bin/sh".into(),
+                args: vec![
+                    "-c".into(),
+                    "printf RESPAWN-MARKER".into(),
+                ],
+                cols: 80,
+                rows: 24,
+            },
+        );
+
+        // Wait for the first child to exit so the surface's `dead` flag
+        // flips before we attempt our attach.
+        for _ in 0..50 {
+            let still_alive = manager
+                .get_or_respawn(&TICK_SURFACE_ID)
+                .map(|s| !s.dead.load(std::sync::atomic::Ordering::Acquire))
+                .unwrap_or(false);
+            // Break the moment we observe a live post-respawn surface OR
+            // the initial one is dead and respawn hasn't happened yet.
+            // (get_or_respawn itself revives it, so this tight loop can't
+            // sit on a dead one for long.)
+            if still_alive {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let sp_task = sock_path.clone();
+        let manager_for_task = manager.clone();
+        let server_task = tokio::spawn(async move {
+            serve_with_manager(sp_task, shutdown_rx, manager_for_task)
+                .await
+                .unwrap();
+        });
+
+        for _ in 0..50 {
+            if sock_path.exists() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+
+        let (mut reader, _writer, _surface_id) = attach_one(&sock_path, "respawn-test").await;
+
+        // After attach, the fresh (respawned) child prints RESPAWN-MARKER.
+        let seen = wait_for_marker(
+            &mut reader,
+            b"RESPAWN-MARKER",
+            std::time::Duration::from_secs(3),
+        )
+        .await;
+        assert!(
+            seen,
+            "RESPAWN-MARKER did not arrive after a dead-surface attach"
+        );
+
+        drop(reader);
+        drop(_writer);
+        shutdown_tx.send(true).unwrap();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(3), server_task).await;
+    }
+
     #[tokio::test]
     async fn rejects_unknown_surface() {
         let tmp = TempDir::new().unwrap();
