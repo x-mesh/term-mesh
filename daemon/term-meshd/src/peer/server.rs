@@ -259,6 +259,231 @@ mod integration_tests {
         let _ = tokio::time::timeout(std::time::Duration::from_secs(3), server_task).await;
     }
 
+    /// Drive the full handshake + attach path for one client against
+    /// `sock_path`, returning the split stream halves and the chosen
+    /// surface_id. Used by the multi-client test below.
+    async fn attach_one(
+        sock_path: &std::path::Path,
+        display: &str,
+    ) -> (
+        tokio::net::unix::OwnedReadHalf,
+        tokio::net::unix::OwnedWriteHalf,
+        Vec<u8>,
+    ) {
+        let stream = UnixStream::connect(sock_path).await.unwrap();
+        let (mut reader, mut writer) = stream.into_split();
+
+        let mut peer_id = display.as_bytes().to_vec();
+        peer_id.resize(16, 0);
+        write_envelope(
+            &mut writer,
+            &Envelope {
+                seq: 1,
+                correlation_id: 0,
+                payload: Some(Payload::Hello(Hello {
+                    protocol_version: PROTOCOL_VERSION.into(),
+                    peer_id,
+                    display_name: display.into(),
+                    capabilities: vec![],
+                    app_version: "test".into(),
+                })),
+            },
+        )
+        .await
+        .unwrap();
+        let _ = read_envelope(&mut reader).await.unwrap(); // host hello
+        let _ = read_envelope(&mut reader).await.unwrap(); // challenge
+
+        write_envelope(
+            &mut writer,
+            &Envelope {
+                seq: 2,
+                correlation_id: 0,
+                payload: Some(Payload::Auth(Auth {
+                    method: "ssh-passthrough".into(),
+                    token_id: vec![],
+                    signature: vec![],
+                })),
+            },
+        )
+        .await
+        .unwrap();
+        let _ = read_envelope(&mut reader).await.unwrap(); // auth result
+
+        write_envelope(
+            &mut writer,
+            &Envelope {
+                seq: 3,
+                correlation_id: 0,
+                payload: Some(Payload::ListSurfaces(ListSurfaces {})),
+            },
+        )
+        .await
+        .unwrap();
+        let list_reply = read_envelope(&mut reader).await.unwrap();
+        let surfaces = match list_reply.payload {
+            Some(Payload::SurfaceList(sl)) => sl.surfaces,
+            other => panic!("{display}: expected SurfaceList, got {other:?}"),
+        };
+        let surface_id = surfaces[0].surface_id.clone();
+
+        write_envelope(
+            &mut writer,
+            &Envelope {
+                seq: 4,
+                correlation_id: 0,
+                payload: Some(Payload::AttachSurface(AttachSurface {
+                    surface_id: surface_id.clone(),
+                    mode: AttachMode::CoWrite as i32,
+                    client_cols: 80,
+                    client_rows: 24,
+                    resume_from_seq: 0,
+                })),
+            },
+        )
+        .await
+        .unwrap();
+        let attach_reply = read_envelope(&mut reader).await.unwrap();
+        match attach_reply.payload {
+            Some(Payload::AttachResult(r)) => {
+                assert!(r.accepted, "{display}: attach rejected: {}", r.reason)
+            }
+            other => panic!("{display}: expected AttachResult, got {other:?}"),
+        }
+
+        (reader, writer, surface_id)
+    }
+
+    /// Read PtyData frames from `reader` into a buffer until `marker`
+    /// appears (returns true) or the timeout elapses (returns false).
+    async fn wait_for_marker(
+        reader: &mut tokio::net::unix::OwnedReadHalf,
+        marker: &[u8],
+        timeout: std::time::Duration,
+    ) -> bool {
+        let deadline = tokio::time::Instant::now() + timeout;
+        let mut aggregated = Vec::<u8>::new();
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                return false;
+            }
+            let env = match tokio::time::timeout(remaining, read_envelope(reader)).await {
+                Ok(Ok(e)) => e,
+                _ => return false,
+            };
+            if let Some(Payload::PtyData(p)) = env.payload {
+                aggregated.extend_from_slice(&p.payload);
+                if aggregated.windows(marker.len()).any(|w| w == marker) {
+                    return true;
+                }
+            }
+        }
+    }
+
+    /// Two clients attach to the same surface with CO_WRITE; input from
+    /// either client must fan out to both, and a detach by one client
+    /// must leave the other fully operational.
+    #[tokio::test]
+    async fn two_clients_co_write_same_surface() {
+        let tmp = TempDir::new().unwrap();
+        let sock_path = tmp.path().join("peer.sock");
+
+        let manager = cat_manager();
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let sp_task = sock_path.clone();
+        let server_task = tokio::spawn(async move {
+            serve_with_manager(sp_task, shutdown_rx, manager)
+                .await
+                .unwrap();
+        });
+
+        for _ in 0..50 {
+            if sock_path.exists() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+
+        let (mut r1, mut w1, surface_id) = attach_one(&sock_path, "client-one").await;
+        let (mut r2, mut w2, _) = attach_one(&sock_path, "client-two").await;
+
+        // Input from client 1 must reach both readers.
+        write_envelope(
+            &mut w1,
+            &Envelope {
+                seq: 5,
+                correlation_id: 0,
+                payload: Some(Payload::Input(Input {
+                    surface_id: surface_id.clone(),
+                    kind: Some(peer_proto::v1::input::Kind::Keys(b"MARKER-ONE\n".to_vec())),
+                })),
+            },
+        )
+        .await
+        .unwrap();
+
+        let timeout = std::time::Duration::from_secs(3);
+        let seen_on_1 = wait_for_marker(&mut r1, b"MARKER-ONE", timeout).await;
+        let seen_on_2 = wait_for_marker(&mut r2, b"MARKER-ONE", timeout).await;
+        assert!(seen_on_1, "client 1 did not receive its own MARKER-ONE echo");
+        assert!(seen_on_2, "client 2 did not receive MARKER-ONE from client 1");
+
+        // Input from client 2 must reach both readers.
+        write_envelope(
+            &mut w2,
+            &Envelope {
+                seq: 5,
+                correlation_id: 0,
+                payload: Some(Payload::Input(Input {
+                    surface_id: surface_id.clone(),
+                    kind: Some(peer_proto::v1::input::Kind::Keys(b"MARKER-TWO\n".to_vec())),
+                })),
+            },
+        )
+        .await
+        .unwrap();
+
+        let seen_on_1 = wait_for_marker(&mut r1, b"MARKER-TWO", timeout).await;
+        let seen_on_2 = wait_for_marker(&mut r2, b"MARKER-TWO", timeout).await;
+        assert!(seen_on_1, "client 1 did not receive MARKER-TWO from client 2");
+        assert!(seen_on_2, "client 2 did not receive its own MARKER-TWO echo");
+
+        // Detach client 1 by dropping its stream halves. Client 2 must
+        // still be able to round-trip input.
+        drop(r1);
+        drop(w1);
+        // Give the server a moment to observe EOF on client 1's connection.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        write_envelope(
+            &mut w2,
+            &Envelope {
+                seq: 6,
+                correlation_id: 0,
+                payload: Some(Payload::Input(Input {
+                    surface_id: surface_id.clone(),
+                    kind: Some(peer_proto::v1::input::Kind::Keys(
+                        b"MARKER-AFTER-DETACH\n".to_vec(),
+                    )),
+                })),
+            },
+        )
+        .await
+        .unwrap();
+
+        let seen_after = wait_for_marker(&mut r2, b"MARKER-AFTER-DETACH", timeout).await;
+        assert!(
+            seen_after,
+            "client 2 lost the surface after client 1 detached"
+        );
+
+        drop(r2);
+        drop(w2);
+        shutdown_tx.send(true).unwrap();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(3), server_task).await;
+    }
+
     #[tokio::test]
     async fn rejects_unknown_surface() {
         let tmp = TempDir::new().unwrap();
