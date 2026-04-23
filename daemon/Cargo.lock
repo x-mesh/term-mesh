@@ -1652,9 +1652,12 @@ dependencies = [
 name = "term-mesh-cli"
 version = "0.72.0"
 dependencies = [
+ "anyhow",
  "clap",
  "glob",
  "libc",
+ "peer-proto",
+ "prost",
  "serde",
  "serde_json",
 ]

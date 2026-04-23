@@ -3,6 +3,7 @@
 //! Replaces both tm-rpc (agent-side) and team.py (leader-side).
 //! ~1-3ms per call for all commands.
 
+mod peer;
 mod prompts;
 
 use clap::{Parser, Subcommand};
@@ -479,6 +480,27 @@ enum Commands {
     /// Alias: task-clear → task clear
     #[command(name = "task-clear", hide = true)]
     TaskClear2,
+
+    /// Peer-federation operations (attach to a remote term-mesh host).
+    Peer(PeerCommands),
+}
+
+#[derive(clap::Args)]
+struct PeerCommands {
+    #[command(subcommand)]
+    command: PeerCommand,
+}
+
+#[derive(Subcommand)]
+enum PeerCommand {
+    /// Attach to the first surface exposed by a peer-federation host socket.
+    ///
+    /// Stream PtyData from the host to stdout; relay stdin line-buffered as Input.
+    /// Ctrl-D (EOF on stdin) cleanly detaches.
+    Attach {
+        /// Path to the host's peer-federation unix socket (must already exist).
+        socket: PathBuf,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1780,6 +1802,17 @@ fn main() {
         }
         Commands::TaskClear2 => {
             rpc_call(&sock, "team.task.clear", json!({ "team_name": team }))
+        }
+        Commands::Peer(peer_cmd) => {
+            match peer_cmd.command {
+                PeerCommand::Attach { socket } => {
+                    if let Err(e) = peer::attach_cmd(&socket) {
+                        eprintln!("peer attach failed: {e:#}");
+                        process::exit(1);
+                    }
+                    return;
+                }
+            }
         }
         Commands::Status => {
             // Inject version info into the team.status response JSON
