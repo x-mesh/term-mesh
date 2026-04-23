@@ -1,18 +1,19 @@
-//  Phase C-3b-β: DEBUG-only hook that lets a developer exercise the
-//  Swift peer-federation client from inside term-mesh.app without
+//  Phase C-3b-β + C-3c.2α: DEBUG-only hook that lets a developer exercise
+//  the Swift peer-federation client from inside term-mesh.app without
 //  touching any terminal UI yet.
 //
-//  Entry point: the NSMenuItem returned by `PeerDebugMenu.item()`,
-//  inserted into the status-bar menu (see MenuBarExtra.swift). Clicking
-//  it pops an NSAlert with a socket path field; on OK, the coordinator
-//  connects via `UnixSocketTransport`, runs `PeerSession.handshake()` +
-//  `listSurfaces()`, and displays the results in a second NSAlert.
-//
-//  This is intentionally stub-grade: it doesn't attach to a surface or
-//  render any output. Its purpose is to prove that the Swift side can
-//  reach a running term-meshd from a real app-bundle context (entitlements,
-//  sandbox behavior, MainActor isolation) before Phase C-3c wires remote
-//  surfaces into actual panes.
+//  Flow:
+//   1. Menu item → NSAlert prompt for socket path.
+//   2. Connect + handshake + list (from C-3b-β).
+//   3. Attach to the first surface (C-3c.2α).
+//   4. Open a `PeerDebugConsoleWindow`:
+//        - NSTextView (read-only) streams raw PtyData bytes as UTF-8. No
+//          ANSI escape processing — the user sees the raw tty stream,
+//          which is the point: it proves bytes are flowing into the GUI
+//          process and rendering on-screen.
+//        - NSTextField below lets the developer type a line and hit
+//          Enter; it gets sent as an Input frame, field clears.
+//        - Closing the window sends Goodbye and tears down the transport.
 
 #if DEBUG
 import AppKit
@@ -35,6 +36,10 @@ enum PeerDebugMenu {
 final class PeerDebugCoordinator: NSObject {
     static let shared = PeerDebugCoordinator()
 
+    /// Holding onto the window controllers here keeps their reader Tasks
+    /// alive; dropping the reference would cancel the stream.
+    private var openConsoles: [PeerDebugConsoleWindowController] = []
+
     @objc func promptAndRun(_ sender: Any?) {
         let alert = NSAlert()
         alert.messageText = "Connect to peer socket"
@@ -51,41 +56,50 @@ final class PeerDebugCoordinator: NSObject {
         let path = input.stringValue.trimmingCharacters(in: .whitespaces)
         guard !path.isEmpty else { return }
 
-        Task { await self.connect(to: path) }
+        Task { await self.run(socketPath: path) }
     }
 
-    private func connect(to path: String) async {
+    private func run(socketPath: String) async {
         do {
-            let transport = try await UnixSocketTransport.connect(socketPath: path)
+            let transport = try await UnixSocketTransport.connect(socketPath: socketPath)
             let session = PeerSession(
                 read: { try await transport.read() },
                 write: { try await transport.write($0) }
             )
             let info = try await session.handshake()
             let surfaces = try await session.listSurfaces()
-            try? await session.sendGoodbye(reason: "debug menu test")
-            await transport.close()
-
-            let summary: String
-            if surfaces.isEmpty {
-                summary = "(host reports no surfaces)"
-            } else {
-                summary = surfaces.map { surface in
-                    let branch = surface.branch.isEmpty ? "-" : "@\(surface.branch)"
-                    let live = surface.attachable ? "live" : "dead"
-                    return "• \(surface.title)  \(surface.cols)x\(surface.rows)  \(live)  \(branch)"
-                }.joined(separator: "\n")
+            guard let chosen = surfaces.first(where: { $0.attachable }) ?? surfaces.first else {
+                await transport.close()
+                showAlert(title: "No surfaces on host", body: "\(info.hostDisplayName) reports no exposable surfaces.")
+                return
             }
-            showResult(
-                title: "Connected to \(info.hostDisplayName)",
-                body: "protocol \(info.hostProtocolVersion)\napp \(info.hostAppVersion)\n\n\(summary)"
+
+            let outcome = try await session.attachSurface(
+                id: chosen.surfaceID,
+                mode: .coWrite,
+                cols: 80,
+                rows: 24
             )
+
+            let controller = PeerDebugConsoleWindowController(
+                hostName: info.hostDisplayName,
+                surfaceTitle: chosen.title,
+                surfaceID: outcome.surfaceID,
+                session: session,
+                transport: transport
+            )
+            openConsoles.append(controller)
+            controller.onClose = { [weak self] in
+                guard let self else { return }
+                self.openConsoles.removeAll { $0 === controller }
+            }
+            controller.show()
         } catch {
-            showResult(title: "Peer connection failed", body: String(describing: error))
+            showAlert(title: "Peer connection failed", body: String(describing: error))
         }
     }
 
-    private func showResult(title: String, body: String) {
+    private func showAlert(title: String, body: String) {
         let alert = NSAlert()
         alert.messageText = title
         alert.informativeText = body
@@ -95,13 +109,201 @@ final class PeerDebugCoordinator: NSObject {
     }
 
     private func defaultSocketPath() -> String {
-        // If the developer has TERMMESH_PEER_SOCKET set, preseed with it.
         if let env = ProcessInfo.processInfo.environment["TERMMESH_PEER_SOCKET"],
            !env.isEmpty
         {
             return env
         }
         return "/tmp/termmesh-peer.sock"
+    }
+}
+
+@MainActor
+final class PeerDebugConsoleWindowController: NSWindowController, NSWindowDelegate {
+    private let surfaceID: Data
+    private let session: PeerSession
+    private let transport: UnixSocketTransport
+    private let outputView: NSTextView
+    private let inputField: NSTextField
+    private var readerTask: Task<Void, Never>?
+    private var isClosing = false
+
+    var onClose: (@MainActor () -> Void)?
+
+    init(
+        hostName: String,
+        surfaceTitle: String,
+        surfaceID: Data,
+        session: PeerSession,
+        transport: UnixSocketTransport
+    ) {
+        self.surfaceID = surfaceID
+        self.session = session
+        self.transport = transport
+
+        let outputView = Self.makeOutputView()
+        let inputField = Self.makeInputField()
+        self.outputView = outputView
+        self.inputField = inputField
+
+        let scroll = NSScrollView()
+        scroll.hasVerticalScroller = true
+        scroll.hasHorizontalScroller = false
+        scroll.documentView = outputView
+        scroll.translatesAutoresizingMaskIntoConstraints = false
+
+        let root = NSView()
+        root.translatesAutoresizingMaskIntoConstraints = false
+        root.addSubview(scroll)
+        root.addSubview(inputField)
+        NSLayoutConstraint.activate([
+            scroll.topAnchor.constraint(equalTo: root.topAnchor),
+            scroll.leadingAnchor.constraint(equalTo: root.leadingAnchor),
+            scroll.trailingAnchor.constraint(equalTo: root.trailingAnchor),
+            scroll.bottomAnchor.constraint(equalTo: inputField.topAnchor, constant: -8),
+            inputField.leadingAnchor.constraint(equalTo: root.leadingAnchor, constant: 8),
+            inputField.trailingAnchor.constraint(equalTo: root.trailingAnchor, constant: -8),
+            inputField.bottomAnchor.constraint(equalTo: root.bottomAnchor, constant: -8),
+        ])
+
+        let window = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 720, height: 480),
+            styleMask: [.titled, .closable, .resizable, .miniaturizable],
+            backing: .buffered,
+            defer: false
+        )
+        window.title = "\(hostName) · \(surfaceTitle)  [peer-debug]"
+        window.contentView = root
+        window.center()
+
+        super.init(window: window)
+        window.delegate = self
+
+        inputField.target = self
+        inputField.action = #selector(sendInputLine(_:))
+    }
+
+    required init?(coder: NSCoder) { fatalError("init(coder:) not used") }
+
+    func show() {
+        window?.makeKeyAndOrderFront(nil)
+        inputField.window?.makeFirstResponder(inputField)
+        startReader()
+        appendText("[connected]\n")
+    }
+
+    private func startReader() {
+        readerTask = Task { [weak self] in
+            guard let self else { return }
+            while !Task.isCancelled {
+                let msg: PeerIncomingMessage
+                do {
+                    msg = try await self.session.receiveNextMessage()
+                } catch {
+                    await self.handleStreamError(error)
+                    return
+                }
+                await self.handle(msg)
+                if case .goodbye = msg { return }
+            }
+        }
+    }
+
+    private func handle(_ msg: PeerIncomingMessage) {
+        switch msg {
+        case .ptyData(_, _, let payload):
+            append(payload)
+        case .workspaceMeta(let cwd, let branch, _, _):
+            appendText("[workspace: cwd=\(cwd)\(branch.isEmpty ? "" : " @\(branch)")]\n")
+        case .error(let code, let message):
+            appendText("\n[peer error \(code)] \(message)\n")
+        case .goodbye(let reason):
+            appendText("\n[host goodbye: \(reason)]\n")
+            closeWindow()
+        default:
+            break
+        }
+    }
+
+    private func handleStreamError(_ error: Error) {
+        appendText("\n[stream error] \(error)\n")
+        closeWindow()
+    }
+
+    private func append(_ data: Data) {
+        let text = String(data: data, encoding: .utf8) ?? "<binary \(data.count)B>\n"
+        appendText(text)
+    }
+
+    private func appendText(_ text: String) {
+        guard let ts = outputView.textStorage else { return }
+        let attr = NSAttributedString(
+            string: text,
+            attributes: [.foregroundColor: NSColor.textColor, .font: Self.monospaceFont]
+        )
+        ts.append(attr)
+        outputView.scrollRangeToVisible(NSRange(location: ts.length, length: 0))
+    }
+
+    @objc private func sendInputLine(_ sender: NSTextField) {
+        let line = sender.stringValue + "\n"
+        sender.stringValue = ""
+        let payload = Data(line.utf8)
+        let surfaceID = self.surfaceID
+        let session = self.session
+        Task {
+            try? await session.sendInput(surfaceID: surfaceID, keys: payload)
+        }
+    }
+
+    private func closeWindow() {
+        guard !isClosing else { return }
+        isClosing = true
+        window?.performClose(nil)
+    }
+
+    // MARK: - NSWindowDelegate
+
+    func windowWillClose(_ notification: Notification) {
+        readerTask?.cancel()
+        readerTask = nil
+        let session = self.session
+        let transport = self.transport
+        let surfaceID = self.surfaceID
+        _ = surfaceID  // silence
+        Task {
+            try? await session.sendGoodbye(reason: "debug console closed")
+            await transport.close()
+        }
+        onClose?()
+    }
+
+    // MARK: - Helpers
+
+    private static func makeOutputView() -> NSTextView {
+        let tv = NSTextView()
+        tv.isEditable = false
+        tv.isSelectable = true
+        tv.isRichText = false
+        tv.allowsUndo = false
+        tv.backgroundColor = NSColor.textBackgroundColor
+        tv.font = monospaceFont
+        tv.textContainer?.widthTracksTextView = true
+        tv.autoresizingMask = [.width]
+        return tv
+    }
+
+    private static func makeInputField() -> NSTextField {
+        let f = NSTextField()
+        f.translatesAutoresizingMaskIntoConstraints = false
+        f.placeholderString = "type here, Enter to send"
+        f.font = monospaceFont
+        f.focusRingType = .default
+        return f
+    }
+
+    private static var monospaceFont: NSFont {
+        NSFont.monospacedSystemFont(ofSize: 12, weight: .regular)
     }
 }
 #endif
