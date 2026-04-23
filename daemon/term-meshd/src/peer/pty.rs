@@ -70,19 +70,20 @@ pub fn spawn(command: &str, args: &[&str], cols: u16, rows: u16) -> io::Result<P
 /// Blocking read from the master side. Returns `Ok(0)` on EOF
 /// (which happens when the child closes its slave or exits and
 /// the kernel drains). Returns `Err` on ioctl / read failures.
-pub fn read(master_fd: RawFd, buf: &mut [u8]) -> io::Result<usize> {
-    // Safety: libc::read on a valid fd with a valid buffer.
-    let n = unsafe { libc::read(master_fd, buf.as_mut_ptr() as *mut _, buf.len()) };
-    if n < 0 {
-        let err = io::Error::last_os_error();
-        // On macOS when the child exits, read on the master returns EIO.
-        // Surface that as EOF to callers.
-        if err.raw_os_error() == Some(libc::EIO) {
-            return Ok(0);
-        }
-        return Err(err);
+/// Set `O_NONBLOCK` on `fd`. Required when the fd is wrapped in
+/// `tokio::io::unix::AsyncFd` — blocking syscalls on a registered fd defeat
+/// the reactor.
+pub fn set_nonblocking(fd: RawFd) -> io::Result<()> {
+    // Safety: fcntl is always safe to call with a valid fd and these cmds.
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL, 0) };
+    if flags < 0 {
+        return Err(io::Error::last_os_error());
     }
-    Ok(n as usize)
+    let rc = unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) };
+    if rc < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
 }
 
 pub fn write(master_fd: RawFd, bytes: &[u8]) -> io::Result<usize> {

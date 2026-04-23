@@ -71,7 +71,7 @@ mod integration_tests {
     use super::*;
     use peer_proto::v1::envelope::Payload;
     use peer_proto::v1::{
-        AttachMode, AttachSurface, Auth, Envelope, Hello, ListSurfaces,
+        AttachMode, AttachSurface, Auth, Envelope, Hello, Input, ListSurfaces,
     };
     use tempfile::TempDir;
     use tokio::net::UnixStream;
@@ -80,43 +80,36 @@ mod integration_tests {
     use crate::peer::framing::{read_envelope, write_envelope};
     use crate::peer::surface::PtySurface;
 
-    fn echo_manager(marker: &str) -> Arc<PtyManager> {
-        // Child script: wait long enough for the test to send AttachSurface,
-        // then emit the marker several times so a subscriber sees it even
-        // if their attach races with the first write. The child then exits,
-        // which gives the reader thread a natural EOF and lets the tokio
-        // runtime shut down cleanly at test end.
-        //
-        // Long-lived interactive PTYs (a shell staying open) are validated
-        // by the manual SSH demo. Phase 2.3B-b will switch the PTY reader
-        // to AsyncFd so the runtime can cancel it on drop; that lets tests
-        // use persistent commands (like /bin/cat) without risking hangs.
+    fn cat_manager() -> Arc<PtyManager> {
+        // `/bin/cat` is long-lived: it only exits when its stdin (the PTY
+        // slave) is closed. We deliberately use it as the test child to
+        // prove the AsyncFd-based reader task can be cancelled cleanly
+        // when the tokio runtime drops at test end. Under the earlier
+        // spawn_blocking design this would hang the test forever.
         let manager = Arc::new(PtyManager::new());
-        let script = format!(
-            "for i in 1 2 3 4 5 6 7 8 9 10; do printf %s {marker}; sleep 0.1; done"
-        );
         let surface = PtySurface::spawn(
             TICK_SURFACE_ID.to_vec(),
-            "sh -c".into(),
-            "/bin/sh",
-            &["-c", &script],
+            "cat".into(),
+            "/bin/cat",
+            &[],
             80,
             24,
         )
-        .expect("spawn /bin/sh -c loop");
+        .expect("spawn /bin/cat");
         manager.insert_surface(surface);
         manager
     }
 
-    /// Attach to a short-lived PTY surface; verify the command's output
-    /// arrives through PtyData.
+    /// Attach to a long-lived `/bin/cat` PTY; send keystrokes as Input and
+    /// verify they come back through PtyData. This exercises the full
+    /// bidirectional path plus AsyncFd's cancellation behavior at test end.
     #[tokio::test]
-    async fn pty_surface_delivers_child_output() {
+    async fn pty_surface_round_trips_input() {
         let tmp = TempDir::new().unwrap();
         let sock_path = tmp.path().join("peer.sock");
 
         const MARKER: &str = "MARKER-peer-test";
-        let manager = echo_manager(MARKER);
+        let manager = cat_manager();
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let sock_path_task = sock_path.clone();
         let server_task = tokio::spawn(async move {
@@ -209,7 +202,25 @@ mod integration_tests {
             other => panic!("expected AttachResult, got {other:?}"),
         }
 
-        // Child printed MARKER and exited; output should arrive within ~1 s.
+        // Send MARKER through as Input. /bin/cat in a PTY echoes it back via
+        // both the PTY's default ECHO termios and cat's own stdin→stdout.
+        // Either path puts MARKER into the PtyData stream.
+        let mut payload = MARKER.as_bytes().to_vec();
+        payload.push(b'\n');
+        write_envelope(
+            &mut writer,
+            &Envelope {
+                seq: 5,
+                correlation_id: 0,
+                payload: Some(Payload::Input(Input {
+                    surface_id: surface_id.clone(),
+                    kind: Some(peer_proto::v1::input::Kind::Keys(payload)),
+                })),
+            },
+        )
+        .await
+        .unwrap();
+
         let mut aggregated = Vec::<u8>::new();
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
         loop {
@@ -253,7 +264,7 @@ mod integration_tests {
         let tmp = TempDir::new().unwrap();
         let sock_path = tmp.path().join("peer.sock");
 
-        let manager = echo_manager("IGNORED");
+        let manager = cat_manager();
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let sock_path_task = sock_path.clone();
         let server_task = tokio::spawn(async move {

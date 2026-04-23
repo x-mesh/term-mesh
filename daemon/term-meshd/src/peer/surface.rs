@@ -9,14 +9,27 @@
 //! a stable surface_id so clients can list + attach deterministically.
 
 use std::collections::HashMap;
-use std::os::unix::io::RawFd;
+use std::os::unix::io::{AsRawFd, RawFd};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, RwLock};
 
 use peer_proto::v1::SurfaceInfo;
+use tokio::io::unix::AsyncFd;
+use tokio::io::Interest;
 use tokio::sync::{broadcast, Notify};
 
 use super::pty;
+
+/// Wrapper so a PTY master fd can be handed to `AsyncFd::new` without
+/// implying ownership — closing the fd is the surface's Drop's job.
+#[derive(Debug)]
+struct BorrowedMasterFd(RawFd);
+
+impl AsRawFd for BorrowedMasterFd {
+    fn as_raw_fd(&self) -> RawFd {
+        self.0
+    }
+}
 
 const READ_BUF_SIZE: usize = 4096;
 /// Fan-out channel capacity. If a slow subscriber falls behind by this many
@@ -53,6 +66,7 @@ impl PtySurface {
         rows: u16,
     ) -> std::io::Result<Arc<Self>> {
         let child = pty::spawn(command, args, cols, rows)?;
+        pty::set_nonblocking(child.master_fd)?;
         let (tx, _rx) = broadcast::channel::<Vec<u8>>(BROADCAST_CAPACITY);
 
         let surface = Arc::new(PtySurface {
@@ -68,34 +82,83 @@ impl PtySurface {
             pid: child.pid,
         });
 
-        // Reader thread: blocking read(2) loop on the master fd, broadcasting
-        // each chunk to subscribers. Exits on EOF or read error; flips the
-        // surface's `dead` flag so relay tasks can leave cleanly.
+        // Reader task: tokio::spawn (not spawn_blocking) with AsyncFd so the
+        // reactor can cancel it on runtime shutdown. The blocking variant used
+        // in 2.3B-a hung runtime drop whenever the child was long-lived,
+        // because an in-flight `read(2)` can't be interrupted from outside.
         let reader_surface = surface.clone();
         let master_fd = child.master_fd;
-        tokio::task::spawn_blocking(move || {
-            let mut buf = [0u8; READ_BUF_SIZE];
+        tokio::spawn(async move {
+            let async_fd = match AsyncFd::with_interest(
+                BorrowedMasterFd(master_fd),
+                Interest::READABLE,
+            ) {
+                Ok(fd) => fd,
+                Err(e) => {
+                    tracing::error!("AsyncFd registration failed: {e}");
+                    reader_surface.dead.store(true, Ordering::Release);
+                    reader_surface.dead_notify.notify_waiters();
+                    return;
+                }
+            };
+
+            let mut buf = vec![0u8; READ_BUF_SIZE];
             loop {
-                match pty::read(master_fd, &mut buf) {
-                    Ok(0) => {
+                let mut guard = match async_fd.readable().await {
+                    Ok(g) => g,
+                    Err(e) => {
+                        tracing::warn!(
+                            "AsyncFd readable error on surface {:?}: {e}",
+                            hex_short(&reader_surface.surface_id)
+                        );
+                        break;
+                    }
+                };
+
+                let result = guard.try_io(|inner| {
+                    // Safety: libc::read on a registered, nonblocking fd.
+                    let n = unsafe {
+                        libc::read(
+                            inner.as_raw_fd(),
+                            buf.as_mut_ptr() as *mut _,
+                            buf.len(),
+                        )
+                    };
+                    if n < 0 {
+                        let err = std::io::Error::last_os_error();
+                        match err.raw_os_error() {
+                            // AsyncFd will re-register and wait for readability.
+                            Some(libc::EAGAIN) => Err(err),
+                            // macOS returns EIO on the master side when the
+                            // child has exited; surface it as EOF.
+                            Some(libc::EIO) => Ok(0),
+                            _ => Err(err),
+                        }
+                    } else {
+                        Ok(n as usize)
+                    }
+                });
+
+                match result {
+                    Ok(Ok(0)) => {
                         tracing::info!(
                             "PTY reader EOF on surface {:?}",
                             hex_short(&reader_surface.surface_id)
                         );
                         break;
                     }
-                    Ok(n) => {
-                        // .send returns Err only when there are no subscribers;
-                        // that's expected (nobody attached yet) and not fatal.
+                    Ok(Ok(n)) => {
+                        // Err only means "no subscribers", which is fine.
                         let _ = tx.send(buf[..n].to_vec());
                     }
-                    Err(e) => {
+                    Ok(Err(e)) => {
                         tracing::warn!(
                             "PTY read error on surface {:?}: {e}",
                             hex_short(&reader_surface.surface_id)
                         );
                         break;
                     }
+                    Err(_would_block) => continue,
                 }
             }
             reader_surface.dead.store(true, Ordering::Release);
