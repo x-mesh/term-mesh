@@ -1,29 +1,32 @@
-//! Peer-federation client for tm-agent (Phase 2.2b).
+//! Peer-federation client for tm-agent.
 //!
-//! Headless verification tool: connects to a host term-mesh peer socket,
-//! walks the handshake, attaches to the first available surface, streams
-//! PtyData to stdout, and relays stdin (line-buffered) as Input.
-//!
-//! Scope note: intentionally sync (std::os::unix::net::UnixStream + threads)
-//! to avoid dragging tokio into term-mesh-cli. Terminal raw-mode, SIGWINCH
-//! tracking, and rich keybindings land in Phase 2.3+.
+//! Phase 2.2b shipped a line-buffered PoC. Phase 2.3B-b.2 adds:
+//!   - termios raw mode so each keystroke reaches the remote immediately
+//!     (vim, less, etc. behave correctly)
+//!   - SIGWINCH → Resize frame so the remote PTY reflows on window resize
+//!   - Ctrl-] detach key (line-based Ctrl-D EOF no longer reaches us under
+//!     raw mode)
+//!   - All outgoing frames serialized through a single writer thread so
+//!     SIGWINCH, stdin, and handshake-follow-up writes don't race.
 
 use std::io::{self, Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
+use std::sync::{mpsc, Arc};
 
-use peer_proto::v1::{
-    AttachMode, AttachSurface, Auth, Envelope, Goodbye, Hello, Input, ListSurfaces,
-};
 use peer_proto::v1::envelope::Payload;
+use peer_proto::v1::{
+    AttachMode, AttachSurface, Auth, Envelope, Goodbye, Hello, Input, ListSurfaces, Resize,
+};
 use peer_proto::MAX_FRAME_BYTES;
 use prost::Message;
 
 const PROTOCOL_VERSION: &str = "1.0.0";
 const DEFAULT_COLS: u32 = 80;
 const DEFAULT_ROWS: u32 = 24;
+/// Ctrl-] — same convention as telnet. One keystroke, no two-step escape.
+const DETACH_KEY: u8 = 0x1d;
 
 pub fn attach_cmd(socket_path: &Path) -> anyhow::Result<()> {
     let stream = UnixStream::connect(socket_path)
@@ -33,21 +36,23 @@ pub fn attach_cmd(socket_path: &Path) -> anyhow::Result<()> {
 
     let seq = Arc::new(AtomicU64::new(0));
 
-    // ---- handshake ----
+    // ---- handshake (synchronous, main thread owns both halves) ----
     let peer_id = random_16_bytes();
-    let client_hello = Envelope {
-        seq: next_seq(&seq),
-        correlation_id: 0,
-        payload: Some(Payload::Hello(Hello {
-            protocol_version: PROTOCOL_VERSION.into(),
-            peer_id,
-            display_name: std::env::var("TERMMESH_PEER_CLIENT_NAME")
-                .unwrap_or_else(|_| "tm-agent-peer".into()),
-            capabilities: vec![],
-            app_version: env!("CARGO_PKG_VERSION").into(),
-        })),
-    };
-    write_envelope(&mut write_stream, &client_hello)?;
+    write_envelope(
+        &mut write_stream,
+        &Envelope {
+            seq: next_seq(&seq),
+            correlation_id: 0,
+            payload: Some(Payload::Hello(Hello {
+                protocol_version: PROTOCOL_VERSION.into(),
+                peer_id,
+                display_name: std::env::var("TERMMESH_PEER_CLIENT_NAME")
+                    .unwrap_or_else(|_| "tm-agent-peer".into()),
+                capabilities: vec![],
+                app_version: env!("CARGO_PKG_VERSION").into(),
+            })),
+        },
+    )?;
 
     let host_hello = read_envelope(&mut read_stream)?;
     let Some(Payload::Hello(h)) = host_hello.payload else {
@@ -64,16 +69,18 @@ pub fn attach_cmd(socket_path: &Path) -> anyhow::Result<()> {
         other => anyhow::bail!("expected AuthChallenge, got {other:?}"),
     }
 
-    let auth = Envelope {
-        seq: next_seq(&seq),
-        correlation_id: 0,
-        payload: Some(Payload::Auth(Auth {
-            method: "ssh-passthrough".into(),
-            token_id: vec![],
-            signature: vec![],
-        })),
-    };
-    write_envelope(&mut write_stream, &auth)?;
+    write_envelope(
+        &mut write_stream,
+        &Envelope {
+            seq: next_seq(&seq),
+            correlation_id: 0,
+            payload: Some(Payload::Auth(Auth {
+                method: "ssh-passthrough".into(),
+                token_id: vec![],
+                signature: vec![],
+            })),
+        },
+    )?;
 
     let auth_result = read_envelope(&mut read_stream)?;
     match auth_result.payload {
@@ -85,12 +92,14 @@ pub fn attach_cmd(socket_path: &Path) -> anyhow::Result<()> {
     }
 
     // ---- list + pick first surface ----
-    let list = Envelope {
-        seq: next_seq(&seq),
-        correlation_id: 0,
-        payload: Some(Payload::ListSurfaces(ListSurfaces {})),
-    };
-    write_envelope(&mut write_stream, &list)?;
+    write_envelope(
+        &mut write_stream,
+        &Envelope {
+            seq: next_seq(&seq),
+            correlation_id: 0,
+            payload: Some(Payload::ListSurfaces(ListSurfaces {})),
+        },
+    )?;
     let list_reply = read_envelope(&mut read_stream)?;
     let surfaces = match list_reply.payload {
         Some(Payload::SurfaceList(sl)) => sl.surfaces,
@@ -101,7 +110,7 @@ pub fn attach_cmd(socket_path: &Path) -> anyhow::Result<()> {
         .ok_or_else(|| anyhow::anyhow!("host reports no attachable surfaces"))?
         .clone();
     eprintln!(
-        "[peer] attaching surface {:?} ({}) {}x{}",
+        "[peer] attaching surface \"{}\" ({}) {}x{}",
         hex_short(&chosen.surface_id),
         chosen.title,
         chosen.cols,
@@ -111,28 +120,48 @@ pub fn attach_cmd(socket_path: &Path) -> anyhow::Result<()> {
 
     // ---- attach ----
     let (cols, rows) = term_size().unwrap_or((DEFAULT_COLS, DEFAULT_ROWS));
-    let attach = Envelope {
-        seq: next_seq(&seq),
-        correlation_id: 0,
-        payload: Some(Payload::AttachSurface(AttachSurface {
-            surface_id: surface_id.clone(),
-            mode: AttachMode::CoWrite as i32,
-            client_cols: cols,
-            client_rows: rows,
-            resume_from_seq: 0,
-        })),
-    };
-    write_envelope(&mut write_stream, &attach)?;
+    write_envelope(
+        &mut write_stream,
+        &Envelope {
+            seq: next_seq(&seq),
+            correlation_id: 0,
+            payload: Some(Payload::AttachSurface(AttachSurface {
+                surface_id: surface_id.clone(),
+                mode: AttachMode::CoWrite as i32,
+                client_cols: cols,
+                client_rows: rows,
+                resume_from_seq: 0,
+            })),
+        },
+    )?;
     let attach_reply = read_envelope(&mut read_stream)?;
     match attach_reply.payload {
         Some(Payload::AttachResult(r)) if r.accepted => {
-            eprintln!("[peer] attached; streaming. Ctrl+D to detach.");
+            eprintln!("[peer] attached; streaming. Ctrl-] to detach.");
         }
         Some(Payload::AttachResult(r)) => anyhow::bail!("attach rejected: {}", r.reason),
         other => anyhow::bail!("expected AttachResult, got {other:?}"),
     }
 
-    // ---- reader thread ----
+    // ---- transition to interactive mode ----
+
+    // Raw mode on stdin (no-op if stdin isn't a TTY, e.g. in tests).
+    let _raw_guard = RawModeGuard::enable();
+
+    // Single writer thread so stdin / SIGWINCH / cleanup can all emit frames
+    // without locking the stream.
+    let (out_tx, out_rx) = mpsc::channel::<Envelope>();
+    let writer_handle = std::thread::spawn(move || -> io::Result<()> {
+        while let Ok(env) = out_rx.recv() {
+            if write_envelope(&mut write_stream, &env).is_err() {
+                break;
+            }
+        }
+        let _ = write_stream.shutdown(std::net::Shutdown::Write);
+        Ok(())
+    });
+
+    // Socket → stdout reader thread.
     let reader_handle = std::thread::spawn(move || -> io::Result<()> {
         let stdout = io::stdout();
         loop {
@@ -148,32 +177,78 @@ pub fn attach_cmd(socket_path: &Path) -> anyhow::Result<()> {
                     out.flush()?;
                 }
                 Some(Payload::Error(e)) => {
-                    eprintln!("[peer error {}] {}", e.code, e.message);
+                    eprintln!("\r\n[peer error {}] {}", e.code, e.message);
                     if e.code >= 500 {
                         return Ok(());
                     }
                 }
                 Some(Payload::Goodbye(g)) => {
-                    eprintln!("[peer] host goodbye: {}", g.reason);
+                    eprintln!("\r\n[peer] host goodbye: {}", g.reason);
                     return Ok(());
                 }
-                Some(Payload::Pong(_)) => {}
                 _ => {}
             }
         }
     });
 
-    // ---- stdin relay ----
+    // SIGWINCH pipe + processor thread.
+    let sigwinch_read_fd = install_sigwinch_pipe()
+        .map_err(|e| {
+            eprintln!("[peer] SIGWINCH setup failed: {e} — resize events won't propagate");
+            e
+        })
+        .ok();
+
+    let sigwinch_handle = sigwinch_read_fd.map(|fd| {
+        let tx = out_tx.clone();
+        let id = surface_id.clone();
+        let seq = seq.clone();
+        std::thread::spawn(move || {
+            let mut scratch = [0u8; 16];
+            loop {
+                // Drain the pipe (one byte per SIGWINCH; merge bursts).
+                let n = unsafe {
+                    libc::read(fd, scratch.as_mut_ptr() as *mut _, scratch.len())
+                };
+                if n <= 0 {
+                    break;
+                }
+                if let Some((cols, rows)) = term_size() {
+                    let env = Envelope {
+                        seq: next_seq(&seq),
+                        correlation_id: 0,
+                        payload: Some(Payload::Resize(Resize {
+                            surface_id: id.clone(),
+                            cols,
+                            rows,
+                            pixel_width: 0,
+                            pixel_height: 0,
+                        })),
+                    };
+                    if tx.send(env).is_err() {
+                        break;
+                    }
+                }
+            }
+        })
+    });
+
+    // ---- stdin relay + detach watch ----
     let stdin = io::stdin();
     let mut buf = [0u8; 1024];
+    let mut detached = false;
     loop {
         let n = match stdin.lock().read(&mut buf) {
             Ok(0) => break,
             Ok(n) => n,
             Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
-            Err(e) => return Err(e.into()),
+            Err(_) => break,
         };
-        let input = Envelope {
+        if buf[..n].contains(&DETACH_KEY) {
+            detached = true;
+            break;
+        }
+        let env = Envelope {
             seq: next_seq(&seq),
             correlation_id: 0,
             payload: Some(Payload::Input(Input {
@@ -181,24 +256,42 @@ pub fn attach_cmd(socket_path: &Path) -> anyhow::Result<()> {
                 kind: Some(peer_proto::v1::input::Kind::Keys(buf[..n].to_vec())),
             })),
         };
-        if write_envelope(&mut write_stream, &input).is_err() {
+        if out_tx.send(env).is_err() {
             break;
         }
     }
 
     // ---- graceful goodbye ----
-    let _ = write_envelope(
-        &mut write_stream,
-        &Envelope {
-            seq: next_seq(&seq),
-            correlation_id: 0,
-            payload: Some(Payload::Goodbye(Goodbye {
-                reason: "client detach".into(),
-            })),
-        },
-    );
-    let _ = write_stream.shutdown(std::net::Shutdown::Write);
+    let reason = if detached { "client detach (Ctrl-])" } else { "client stdin EOF" };
+    let _ = out_tx.send(Envelope {
+        seq: next_seq(&seq),
+        correlation_id: 0,
+        payload: Some(Payload::Goodbye(Goodbye {
+            reason: reason.into(),
+        })),
+    });
+
+    // Close the SIGWINCH pipe's write end BEFORE dropping out_tx so the
+    // sigwinch thread (which holds an out_tx clone and is blocked in
+    // libc::read on the pipe's read end) wakes up, drops its clone, and
+    // lets the writer thread observe "no more senders".
+    let prev_fd = SIGWINCH_PIPE_WRITE.swap(-1, Ordering::Relaxed);
+    if prev_fd >= 0 {
+        unsafe {
+            libc::close(prev_fd);
+        }
+    }
+
+    drop(out_tx);
+    let _ = writer_handle.join();
     let _ = reader_handle.join();
+    if let Some(h) = sigwinch_handle {
+        let _ = h.join();
+    }
+
+    if detached {
+        eprintln!("[peer] detached.");
+    }
     Ok(())
 }
 
@@ -235,6 +328,106 @@ fn write_envelope<W: Write>(writer: &mut W, envelope: &Envelope) -> io::Result<(
     Ok(())
 }
 
+// ── termios raw-mode guard ────────────────────────────────────────
+
+struct RawModeGuard {
+    original: libc::termios,
+    applied: bool,
+}
+
+impl RawModeGuard {
+    fn enable() -> Self {
+        let mut original: libc::termios = unsafe { std::mem::zeroed() };
+        if unsafe { libc::isatty(libc::STDIN_FILENO) } != 1 {
+            return RawModeGuard {
+                original,
+                applied: false,
+            };
+        }
+        if unsafe { libc::tcgetattr(libc::STDIN_FILENO, &mut original) } != 0 {
+            return RawModeGuard {
+                original,
+                applied: false,
+            };
+        }
+        let mut raw = original;
+        unsafe {
+            libc::cfmakeraw(&mut raw);
+        }
+        if unsafe { libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &raw) } == 0 {
+            RawModeGuard {
+                original,
+                applied: true,
+            }
+        } else {
+            RawModeGuard {
+                original,
+                applied: false,
+            }
+        }
+    }
+}
+
+impl Drop for RawModeGuard {
+    fn drop(&mut self) {
+        if self.applied {
+            unsafe {
+                libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &self.original);
+            }
+        }
+    }
+}
+
+// ── SIGWINCH self-pipe ────────────────────────────────────────────
+
+/// Write end of the SIGWINCH pipe. Read by the signal handler with atomic
+/// load; any value >= 0 is a live fd. AtomicI32 loads are async-signal-safe.
+static SIGWINCH_PIPE_WRITE: AtomicI32 = AtomicI32::new(-1);
+
+extern "C" fn sigwinch_handler(_sig: libc::c_int) {
+    let fd = SIGWINCH_PIPE_WRITE.load(Ordering::Relaxed);
+    if fd < 0 {
+        return;
+    }
+    let buf = [1u8];
+    // write(2) is async-signal-safe; ignore errors — the processor thread
+    // will just miss one wakeup.
+    unsafe {
+        libc::write(fd, buf.as_ptr() as *const _, 1);
+    }
+}
+
+fn install_sigwinch_pipe() -> io::Result<libc::c_int> {
+    let mut fds = [0i32; 2];
+    if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    for &fd in &fds {
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFD, 0) };
+        if flags >= 0 {
+            unsafe {
+                libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC);
+            }
+        }
+    }
+    let read_fd = fds[0];
+    let write_fd = fds[1];
+    SIGWINCH_PIPE_WRITE.store(write_fd, Ordering::Relaxed);
+
+    let mut sa: libc::sigaction = unsafe { std::mem::zeroed() };
+    sa.sa_sigaction = sigwinch_handler as *const () as libc::sighandler_t;
+    unsafe {
+        libc::sigemptyset(&mut sa.sa_mask);
+    }
+    sa.sa_flags = libc::SA_RESTART;
+
+    let rc = unsafe { libc::sigaction(libc::SIGWINCH, &sa, std::ptr::null_mut()) };
+    if rc != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(read_fd)
+}
+
 // ── helpers ───────────────────────────────────────────────────────
 
 fn next_seq(seq: &AtomicU64) -> u64 {
@@ -242,8 +435,6 @@ fn next_seq(seq: &AtomicU64) -> u64 {
 }
 
 fn random_16_bytes() -> Vec<u8> {
-    // Not cryptographic — just a unique client identifier for the session.
-    // peer_id is used by hosts to key per-device authorization; PoC doesn't care.
     let mut out = [0u8; 16];
     let pid = std::process::id() as u128;
     let now = std::time::SystemTime::now()
@@ -257,17 +448,13 @@ fn random_16_bytes() -> Vec<u8> {
 
 fn hex_short(bytes: &[u8]) -> String {
     let n = bytes.len().min(4);
-    bytes[..n]
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect::<String>()
+    bytes[..n].iter().map(|b| format!("{b:02x}")).collect()
 }
 
 #[cfg(unix)]
 fn term_size() -> Option<(u32, u32)> {
     use std::mem::MaybeUninit;
     let mut ws: MaybeUninit<libc::winsize> = MaybeUninit::uninit();
-    // Safety: ioctl(TIOCGWINSZ) reads the size of stdin's controlling terminal.
     let rc = unsafe { libc::ioctl(libc::STDIN_FILENO, libc::TIOCGWINSZ, ws.as_mut_ptr()) };
     if rc == 0 {
         let ws = unsafe { ws.assume_init() };
@@ -310,5 +497,14 @@ mod tests {
         let mut cur = Cursor::new(buf);
         let err = read_envelope(&mut cur).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn raw_mode_guard_noop_when_stdin_not_tty() {
+        // In cargo test, stdin is a pipe, not a TTY. Enable must be a no-op
+        // and Drop must not panic.
+        let guard = RawModeGuard::enable();
+        assert!(!guard.applied);
+        drop(guard);
     }
 }
