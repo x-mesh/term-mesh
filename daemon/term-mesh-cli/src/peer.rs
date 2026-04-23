@@ -160,17 +160,24 @@ pub fn attach_cmd(socket_path: &Path, name: Option<&str>) -> anyhow::Result<()> 
     let surfaces = list_surfaces(&mut read_stream_init, &mut write_stream, &seq)?;
 
     let chosen = match name {
-        Some(n) => surfaces
-            .iter()
-            .find(|s| s.title == n)
-            .cloned()
-            .ok_or_else(|| {
-                let available: Vec<String> = surfaces.iter().map(|s| s.title.clone()).collect();
-                anyhow::anyhow!(
-                    "surface \"{n}\" not found on host; available: {}",
-                    available.join(", ")
-                )
-            })?,
+        Some(n) => {
+            // Match by exact title OR by ID hex-prefix (e.g. "33e5ce65").
+            let n_lower = n.to_ascii_lowercase();
+            surfaces
+                .iter()
+                .find(|s| s.title == n || hex_short(&s.surface_id).starts_with(&n_lower))
+                .cloned()
+                .ok_or_else(|| {
+                    let available: Vec<String> = surfaces
+                        .iter()
+                        .map(|s| format!("{} [{}]", s.title, hex_short(&s.surface_id)))
+                        .collect();
+                    anyhow::anyhow!(
+                        "surface \"{n}\" not found on host; available: {}",
+                        available.join(", ")
+                    )
+                })?
+        }
         None => surfaces
             .first()
             .cloned()

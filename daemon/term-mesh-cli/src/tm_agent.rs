@@ -1477,6 +1477,28 @@ fn is_leap(y: u32) -> bool {
 fn main() {
     let cli = Cli::parse();
 
+    // Peer commands carry their own socket path — handle them before
+    // the daemon-socket detection that would otherwise fail when there
+    // is no running term-mesh daemon in the environment.
+    if let Commands::Peer(ref peer_cmd) = cli.command {
+        match &peer_cmd.command {
+            PeerCommand::List { socket } => {
+                if let Err(e) = peer::list_cmd(socket) {
+                    eprintln!("peer list failed: {e:#}");
+                    process::exit(1);
+                }
+                return;
+            }
+            PeerCommand::Attach { socket, name } => {
+                if let Err(e) = peer::attach_cmd(socket, name.as_deref()) {
+                    eprintln!("peer attach failed: {e:#}");
+                    process::exit(1);
+                }
+                return;
+            }
+        }
+    }
+
     let sock = match detect_socket() {
         Some(s) => s,
         None => {
@@ -1815,24 +1837,7 @@ fn main() {
         Commands::TaskClear2 => {
             rpc_call(&sock, "team.task.clear", json!({ "team_name": team }))
         }
-        Commands::Peer(peer_cmd) => {
-            match peer_cmd.command {
-                PeerCommand::List { socket } => {
-                    if let Err(e) = peer::list_cmd(&socket) {
-                        eprintln!("peer list failed: {e:#}");
-                        process::exit(1);
-                    }
-                    return;
-                }
-                PeerCommand::Attach { socket, name } => {
-                    if let Err(e) = peer::attach_cmd(&socket, name.as_deref()) {
-                        eprintln!("peer attach failed: {e:#}");
-                        process::exit(1);
-                    }
-                    return;
-                }
-            }
-        }
+        Commands::Peer(_) => unreachable!("peer commands exit before detect_socket()"),
         Commands::Status => {
             // Inject version info into the team.status response JSON
             let mut status = rpc_call(&sock, "team.status", json!({ "team_name": team }))
