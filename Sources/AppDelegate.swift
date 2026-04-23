@@ -226,6 +226,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         if isRunningUnderXCTest {
             KeyboardShortcutSettings.resetAll()
         }
+
+        // Optional auto-start of the peer-federation server for
+        // integration testing from a terminal (`TERMMESH_DEBUG_PEER_SERVER_PATH`).
+        PeerDebugServerCoordinator.autoStartIfConfigured()
 #endif
 
 #if DEBUG
