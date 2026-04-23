@@ -112,6 +112,11 @@ final class MenuBarExtraController: NSObject, NSMenuDelegate {
 
         menu.addItem(.separator())
 
+        #if DEBUG
+        menu.addItem(PeerDebugMenu.item())
+        menu.addItem(.separator())
+        #endif
+
         quitItem.target = self
         quitItem.action = #selector(quitAction)
         menu.addItem(quitItem)

@@ -28,6 +28,7 @@
 			CVB00019 /* WorkspaceModels.swift in Sources */ = {isa = PBXBuildFile; fileRef = CVS00019 /* WorkspaceModels.swift */; };
 			CVB00020 /* Workspace+BonsplitDelegate.swift in Sources */ = {isa = PBXBuildFile; fileRef = CVS00020 /* Workspace+BonsplitDelegate.swift */; };
 			CVB00080 /* PeerProtoBridge.swift in Sources */ = {isa = PBXBuildFile; fileRef = CVS00080 /* PeerProtoBridge.swift */; };
+			CVB00081 /* PeerDebugMenu.swift in Sources */ = {isa = PBXBuildFile; fileRef = CVS00081 /* PeerDebugMenu.swift */; };
 			CVB00027 /* AppDelegate+Shortcuts.swift in Sources */ = {isa = PBXBuildFile; fileRef = CVS00027 /* AppDelegate+Shortcuts.swift */; };
 			CVB00028 /* AppDelegate+Notifications.swift in Sources */ = {isa = PBXBuildFile; fileRef = CVS00028 /* AppDelegate+Notifications.swift */; };
 			CVB00029 /* ContentViewModels.swift in Sources */ = {isa = PBXBuildFile; fileRef = CVS00029 /* ContentViewModels.swift */; };
@@ -228,6 +229,7 @@
 			CVS00019 /* WorkspaceModels.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WorkspaceModels.swift; sourceTree = "<group>"; };
 			CVS00020 /* Workspace+BonsplitDelegate.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "Workspace+BonsplitDelegate.swift"; sourceTree = "<group>"; };
 			CVS00080 /* PeerProtoBridge.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PeerProtoBridge.swift; sourceTree = "<group>"; };
+			CVS00081 /* PeerDebugMenu.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PeerDebugMenu.swift; sourceTree = "<group>"; };
 			CVS00027 /* AppDelegate+Shortcuts.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "AppDelegate+Shortcuts.swift"; sourceTree = "<group>"; };
 			CVS00028 /* AppDelegate+Notifications.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "AppDelegate+Notifications.swift"; sourceTree = "<group>"; };
 			CVS00029 /* ContentViewModels.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ContentViewModels.swift; sourceTree = "<group>"; };
@@ -476,6 +478,7 @@
 					CVS00019 /* WorkspaceModels.swift */,
 					CVS00020 /* Workspace+BonsplitDelegate.swift */,
 					CVS00080 /* PeerProtoBridge.swift */,
+					CVS00081 /* PeerDebugMenu.swift */,
 					CVS00027 /* AppDelegate+Shortcuts.swift */,
 					CVS00028 /* AppDelegate+Notifications.swift */,
 					CVS00029 /* ContentViewModels.swift */,
@@ -790,6 +793,7 @@
 					CVB00019 /* WorkspaceModels.swift in Sources */,
 					CVB00020 /* Workspace+BonsplitDelegate.swift in Sources */,
 					CVB00080 /* PeerProtoBridge.swift in Sources */,
+					CVB00081 /* PeerDebugMenu.swift in Sources */,
 					CVB00027 /* AppDelegate+Shortcuts.swift in Sources */,
 					CVB00028 /* AppDelegate+Notifications.swift in Sources */,
 					CVB00029 /* ContentViewModels.swift in Sources */,
