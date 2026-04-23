@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["term-meshd", "term-mesh-cli"]
+members = ["term-meshd", "term-mesh-cli", "peer-proto"]
 
 # Force static linking of zlib so term-meshd doesn't depend on Homebrew's libz.
 # Without this, libgit2-sys links dynamically to /opt/homebrew/opt/zlib/lib/libz.1.dylib
