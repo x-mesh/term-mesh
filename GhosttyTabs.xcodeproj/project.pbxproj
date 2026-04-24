@@ -31,6 +31,8 @@
 			CVB00081 /* PeerDebugMenu.swift in Sources */ = {isa = PBXBuildFile; fileRef = CVS00081 /* PeerDebugMenu.swift */; };
 			CVB00082 /* PeerDebugServer.swift in Sources */ = {isa = PBXBuildFile; fileRef = CVS00082 /* PeerDebugServer.swift */; };
 			CVB00083 /* GhosttyPaneSurfaceProvider.swift in Sources */ = {isa = PBXBuildFile; fileRef = CVS00083 /* GhosttyPaneSurfaceProvider.swift */; };
+			CVB00084 /* PeerRelaySession.swift in Sources */ = {isa = PBXBuildFile; fileRef = CVS00084 /* PeerRelaySession.swift */; };
+			CVB00085 /* PeerRelayWindowController.swift in Sources */ = {isa = PBXBuildFile; fileRef = CVS00085 /* PeerRelayWindowController.swift */; };
 			CVB00027 /* AppDelegate+Shortcuts.swift in Sources */ = {isa = PBXBuildFile; fileRef = CVS00027 /* AppDelegate+Shortcuts.swift */; };
 			CVB00028 /* AppDelegate+Notifications.swift in Sources */ = {isa = PBXBuildFile; fileRef = CVS00028 /* AppDelegate+Notifications.swift */; };
 			CVB00029 /* ContentViewModels.swift in Sources */ = {isa = PBXBuildFile; fileRef = CVS00029 /* ContentViewModels.swift */; };
@@ -234,6 +236,8 @@
 			CVS00081 /* PeerDebugMenu.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PeerDebugMenu.swift; sourceTree = "<group>"; };
 			CVS00082 /* PeerDebugServer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PeerDebugServer.swift; sourceTree = "<group>"; };
 			CVS00083 /* GhosttyPaneSurfaceProvider.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GhosttyPaneSurfaceProvider.swift; sourceTree = "<group>"; };
+			CVS00084 /* PeerRelaySession.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PeerRelaySession.swift; sourceTree = "<group>"; };
+			CVS00085 /* PeerRelayWindowController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PeerRelayWindowController.swift; sourceTree = "<group>"; };
 			CVS00027 /* AppDelegate+Shortcuts.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "AppDelegate+Shortcuts.swift"; sourceTree = "<group>"; };
 			CVS00028 /* AppDelegate+Notifications.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "AppDelegate+Notifications.swift"; sourceTree = "<group>"; };
 			CVS00029 /* ContentViewModels.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ContentViewModels.swift; sourceTree = "<group>"; };
@@ -485,6 +489,8 @@
 					CVS00081 /* PeerDebugMenu.swift */,
 					CVS00082 /* PeerDebugServer.swift */,
 				CVS00083 /* GhosttyPaneSurfaceProvider.swift */,
+				CVS00084 /* PeerRelaySession.swift */,
+				CVS00085 /* PeerRelayWindowController.swift */,
 					CVS00027 /* AppDelegate+Shortcuts.swift */,
 					CVS00028 /* AppDelegate+Notifications.swift */,
 					CVS00029 /* ContentViewModels.swift */,
@@ -802,6 +808,8 @@
 					CVB00081 /* PeerDebugMenu.swift in Sources */,
 					CVB00082 /* PeerDebugServer.swift in Sources */,
 				CVB00083 /* GhosttyPaneSurfaceProvider.swift in Sources */,
+				CVB00084 /* PeerRelaySession.swift in Sources */,
+				CVB00085 /* PeerRelayWindowController.swift in Sources */,
 					CVB00027 /* AppDelegate+Shortcuts.swift in Sources */,
 					CVB00028 /* AppDelegate+Notifications.swift in Sources */,
 					CVB00029 /* ContentViewModels.swift in Sources */,
