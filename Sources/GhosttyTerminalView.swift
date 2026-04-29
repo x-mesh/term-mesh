@@ -849,6 +849,9 @@ final class TerminalSurface: Identifiable, ObservableObject {
     }
 
     func setFocus(_ focused: Bool) {
+#if DEBUG
+        dlog("surface.setFocus paused=\(renderingPaused) focused=\(focused)")
+#endif
         // If rendering is paused (agent pane suppressed), block re-focus attempts.
         // This prevents CVDisplayLink from restarting when panel.focus() or
         // becomeFirstResponder triggers setFocus(true) after pause.
@@ -2720,6 +2723,10 @@ func pushTargetSurfaceSize(_ size: CGSize) {
     }
 
     private func windowDidChangeScreen(_ notification: Notification) {
+#if DEBUG
+        let dispID = (notification.object as? NSWindow)?.screen?.displayID ?? 0
+        dlog("surface.didChangeScreen displayID=\(dispID)")
+#endif
         guard let window else { return }
         guard let object = notification.object as? NSWindow, window == object else { return }
         guard let screen = window.screen else { return }

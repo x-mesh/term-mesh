@@ -407,6 +407,49 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
                 options: .mappedIfSafe
             )
         }
+
+#if DEBUG
+        // Sleep/wake instrumentation for diagnosing kiro-cli agent pane black regression.
+        // Pure observation only — no behavior change.
+        NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.willSleepNotification,
+            object: nil,
+            queue: .main
+        ) { _ in
+            MainActor.assumeIsolated {
+                let teamCount = TeamOrchestrator.shared.teams.count
+                let agentCount = TeamOrchestrator.shared.teams.values.reduce(0) { $0 + $1.agents.count }
+                let paused = TeamOrchestrator.shared.agentRenderingPaused
+                dlog("workspace.willSleep teams=\(teamCount) agents=\(agentCount) agentPaused=\(paused)")
+            }
+        }
+        NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.didWakeNotification,
+            object: nil,
+            queue: .main
+        ) { _ in
+            MainActor.assumeIsolated {
+                let teamCount = TeamOrchestrator.shared.teams.count
+                let agentCount = TeamOrchestrator.shared.teams.values.reduce(0) { $0 + $1.agents.count }
+                let paused = TeamOrchestrator.shared.agentRenderingPaused
+                dlog("workspace.didWake teams=\(teamCount) agents=\(agentCount) agentPaused=\(paused)")
+            }
+        }
+        NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.screensDidSleepNotification,
+            object: nil,
+            queue: .main
+        ) { _ in
+            dlog("workspace.screensDidSleep")
+        }
+        NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.screensDidWakeNotification,
+            object: nil,
+            queue: .main
+        ) { _ in
+            dlog("workspace.screensDidWake")
+        }
+#endif
     }
 
 #if DEBUG
