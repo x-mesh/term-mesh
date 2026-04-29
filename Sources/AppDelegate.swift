@@ -100,6 +100,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
     var splitButtonTooltipRefreshScheduled = false
     var ghosttyConfigObserver: NSObjectProtocol?
     private var systemAppearanceObserver: NSObjectProtocol?
+    private var wakeRecoveryObserver: NSObjectProtocol?
     var ghosttyGotoSplitLeftShortcut: StoredShortcut?
     var ghosttyGotoSplitRightShortcut: StoredShortcut?
     var ghosttyGotoSplitUpShortcut: StoredShortcut?
@@ -408,9 +409,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
             )
         }
 
+        wakeRecoveryObserver = NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.didWakeNotification,
+            object: nil,
+            queue: .main
+        ) { _ in
+            MainActor.assumeIsolated {
+#if DEBUG
+                let teamCount = TeamOrchestrator.shared.teams.count
+                let agentCount = TeamOrchestrator.shared.teams.values.reduce(0) { $0 + $1.agents.count }
+                let paused = TeamOrchestrator.shared.agentRenderingPaused
+                dlog("workspace.didWake teams=\(teamCount) agents=\(agentCount) agentPaused=\(paused)")
+#endif
+                TeamOrchestrator.shared.drawAgentSurfacesAfterWake()
+            }
+        }
+
 #if DEBUG
         // Sleep/wake instrumentation for diagnosing kiro-cli agent pane black regression.
-        // Pure observation only — no behavior change.
         NSWorkspace.shared.notificationCenter.addObserver(
             forName: NSWorkspace.willSleepNotification,
             object: nil,
@@ -421,18 +437,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
                 let agentCount = TeamOrchestrator.shared.teams.values.reduce(0) { $0 + $1.agents.count }
                 let paused = TeamOrchestrator.shared.agentRenderingPaused
                 dlog("workspace.willSleep teams=\(teamCount) agents=\(agentCount) agentPaused=\(paused)")
-            }
-        }
-        NSWorkspace.shared.notificationCenter.addObserver(
-            forName: NSWorkspace.didWakeNotification,
-            object: nil,
-            queue: .main
-        ) { _ in
-            MainActor.assumeIsolated {
-                let teamCount = TeamOrchestrator.shared.teams.count
-                let agentCount = TeamOrchestrator.shared.teams.values.reduce(0) { $0 + $1.agents.count }
-                let paused = TeamOrchestrator.shared.agentRenderingPaused
-                dlog("workspace.didWake teams=\(teamCount) agents=\(agentCount) agentPaused=\(paused)")
             }
         }
         NSWorkspace.shared.notificationCenter.addObserver(
@@ -560,6 +564,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
     func applicationWillTerminate(_ notification: Notification) {
         if let observer = systemAppearanceObserver {
             DistributedNotificationCenter.default.removeObserver(observer)
+        }
+        if let observer = wakeRecoveryObserver {
+            NSWorkspace.shared.notificationCenter.removeObserver(observer)
         }
         tabManager?.saveSessionState()
         TerminalController.shared.stop()
