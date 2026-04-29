@@ -144,6 +144,12 @@ final class TeamOrchestrator: ObservableObject {
         periodicRenderTimer = nil
     }
 
+    /// Re-present agent terminal surfaces once after macOS wakes the display.
+    /// This is intentionally scoped to agents so regular terminal panes keep their existing wake path.
+    func drawAgentSurfacesAfterWake() {
+        drawAgentSurfaces(reason: "wake")
+    }
+
     /// Called by the periodic timer while rendering is paused.
     /// Issues a single ghostty_surface_draw per agent so new terminal output is captured.
     private func periodicRenderAgents() {
@@ -155,6 +161,11 @@ final class TeamOrchestrator: ObservableObject {
         }
 #endif
         guard agentRenderingPaused else { return }
+        drawAgentSurfaces(reason: "periodic")
+    }
+
+    private func drawAgentSurfaces(reason: String) {
+        var drawnCount = 0
         for team in teams.values {
             for agent in team.agents {
                 guard let appDelegate = AppDelegate.shared,
@@ -163,8 +174,12 @@ final class TeamOrchestrator: ObservableObject {
                       let panel = workspace.panels[agent.panelId] as? TerminalPanel,
                       let surface = panel.surface.surface else { continue }
                 ghostty_surface_draw(surface)
+                drawnCount += 1
             }
         }
+#if DEBUG
+        dlog("team.drawAgentSurfaces reason=\(reason) drawn=\(drawnCount) paused=\(agentRenderingPaused)")
+#endif
     }
 
     // MARK: - Bidirectional Communication
