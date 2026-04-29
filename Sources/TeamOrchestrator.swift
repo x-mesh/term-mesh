@@ -144,10 +144,18 @@ final class TeamOrchestrator: ObservableObject {
         periodicRenderTimer = nil
     }
 
-    /// Re-present agent terminal surfaces once after macOS wakes the display.
-    /// This is intentionally scoped to agents so regular terminal panes keep their existing wake path.
+    /// Re-present agent terminal surfaces after macOS wakes the display.
+    /// Unlike the periodic path which only fires when rendering is paused,
+    /// this runs unconditionally because wake can black-out any surface
+    /// regardless of its paused state.
+    /// Issues an immediate draw plus a 50ms-delayed follow-up to absorb cases where IOSurface /
+    /// CALayer rebinding completes a few frames after didWakeNotification fires (especially on
+    /// external displays returning from sleep).
     func drawAgentSurfacesAfterWake() {
         drawAgentSurfaces(reason: "wake")
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) { [weak self] in
+            self?.drawAgentSurfaces(reason: "wake-followup")
+        }
     }
 
     /// Called by the periodic timer while rendering is paused.
