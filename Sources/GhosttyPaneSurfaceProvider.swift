@@ -85,11 +85,7 @@ final class GhosttyPaneSurfaceProvider: PeerSurfaceProvider {
         let input: @Sendable (Data) async -> Void = { [weakTS] bytes in
             await MainActor.run {
                 guard let ptr = weakTS.value?.surface else { return }
-                bytes.withUnsafeBytes { buf in
-                    guard let base = buf.baseAddress?.assumingMemoryBound(to: CChar.self)
-                    else { return }
-                    ghostty_surface_text(ptr, base, UInt(buf.count))
-                }
+                sendPeerInputBytes(ptr, bytes: bytes)
             }
         }
 
@@ -171,6 +167,57 @@ final class GhosttyPaneSurfaceProvider: PeerSurfaceProvider {
 }
 
 // MARK: - Helpers
+
+/// Route peer Input bytes into Ghostty. Plain bytes go through
+/// ghostty_surface_text() (which wraps in bracketed paste when enabled);
+/// `\r` (0x0d) and `\n` (0x0a) are dispatched as real Return key events so
+/// shells/TUI execute the command instead of inserting a literal CR/LF. The
+/// LF case matters because the peer relay binary's stdin is a PTY slave
+/// with default ICRNL — Ghostty writes CR but the relay reads LF.
+/// Other control bytes are still passed through as text and need similar
+/// treatment in follow-up work.
+@MainActor
+private func sendPeerInputBytes(_ surface: ghostty_surface_t, bytes: Data) {
+    var pending = Data()
+    for byte in bytes {
+        if byte == 0x0d || byte == 0x0a { // CR / LF — Return
+            flushPeerText(surface, &pending)
+            sendPeerReturnKey(to: surface)
+        } else {
+            pending.append(byte)
+        }
+    }
+    flushPeerText(surface, &pending)
+}
+
+@MainActor
+private func flushPeerText(_ surface: ghostty_surface_t, _ pending: inout Data) {
+    guard !pending.isEmpty else { return }
+    pending.withUnsafeBytes { buf in
+        if let base = buf.baseAddress?.assumingMemoryBound(to: CChar.self) {
+            ghostty_surface_text(surface, base, UInt(buf.count))
+        }
+    }
+    pending.removeAll(keepingCapacity: true)
+}
+
+@MainActor
+private func sendPeerReturnKey(to surface: ghostty_surface_t) {
+    var keyEvent = ghostty_input_key_s()
+    keyEvent.action = GHOSTTY_ACTION_PRESS
+    keyEvent.keycode = 36 // kVK_Return
+    keyEvent.mods = GHOSTTY_MODS_NONE
+    keyEvent.consumed_mods = GHOSTTY_MODS_NONE
+    keyEvent.unshifted_codepoint = 0
+    keyEvent.composing = false
+    "\r".withCString { ptr in
+        keyEvent.text = ptr
+        _ = ghostty_surface_key(surface, keyEvent)
+    }
+    keyEvent.action = GHOSTTY_ACTION_RELEASE
+    keyEvent.text = nil
+    _ = ghostty_surface_key(surface, keyEvent)
+}
 
 private func surfaceIDBytes(_ id: UUID) -> Data {
     withUnsafeBytes(of: id.uuid) { Data($0) }
