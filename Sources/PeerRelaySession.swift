@@ -354,7 +354,8 @@ final class PeerRelaySession {
                         pLog("relayToHost: readFrame error: \(error)")
                         break
                     }
-                    pLog("relayToHost: got frame type=0x\(String(frame.type, radix: 16)) size=\(frame.payload.count)")
+                    let hex = frame.payload.prefix(16).map { String(format: "%02x", $0) }.joined(separator: " ")
+                    pLog("relayToHost: got frame type=0x\(String(frame.type, radix: 16)) size=\(frame.payload.count) hex=[\(hex)]")
                     switch frame.type {
                     case kTypeKeyInput:
                         try? await session.sendInput(surfaceID: surfaceID, keys: frame.payload)

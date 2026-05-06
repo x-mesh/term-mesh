@@ -168,54 +168,175 @@ final class GhosttyPaneSurfaceProvider: PeerSurfaceProvider {
 
 // MARK: - Helpers
 
-/// Route peer Input bytes into Ghostty. Plain bytes go through
-/// ghostty_surface_text() (which wraps in bracketed paste when enabled);
-/// `\r` (0x0d) and `\n` (0x0a) are dispatched as real Return key events so
-/// shells/TUI execute the command instead of inserting a literal CR/LF. The
-/// LF case matters because the peer relay binary's stdin is a PTY slave
-/// with default ICRNL — Ghostty writes CR but the relay reads LF.
-/// Other control bytes are still passed through as text and need similar
-/// treatment in follow-up work.
+/// Route peer Input bytes into Ghostty as key events.
+///
+/// All bytes flow through `ghostty_surface_key()`; we deliberately avoid
+/// `ghostty_surface_text()` because that path wraps content in bracketed
+/// paste markers which (a) breaks Enter / Tab / Ctrl-C semantics in
+/// readline-style shells and (b) eats some control bytes before they
+/// reach the PTY. Mirroring `GhosttyTerminalView.sendSocketStyleText`:
+///
+/// - Enter (CR/LF), Tab, Backspace, Escape       → key event with keycode
+/// - 3-byte CSI arrow sequences (`\x1b[A/B/C/D`) → arrow key event
+/// - Ctrl-letter control bytes (0x01-0x1A)       → key event + Ctrl mod
+/// - Anything else                                → key event (keycode=0)
+///   with the Unicode scalar as text. Multi-byte UTF-8 sequences are
+///   grouped into a single scalar before dispatch.
+///
+/// LF→Return mapping is needed because the relay binary's stdin is a PTY
+/// slave with default ICRNL, so Ghostty writes CR but the relay reads
+/// LF before forwarding over the peer socket.
 @MainActor
 private func sendPeerInputBytes(_ surface: ghostty_surface_t, bytes: Data) {
-    var pending = Data()
-    for byte in bytes {
-        if byte == 0x0d || byte == 0x0a { // CR / LF — Return
-            flushPeerText(surface, &pending)
-            sendPeerReturnKey(to: surface)
+    let arr = Array(bytes)
+    var i = 0
+    while i < arr.count {
+        let byte = arr[i]
+
+        // 3-byte CSI arrow sequence comes in one frame for most TUIs.
+        if byte == 0x1b, i + 2 < arr.count, arr[i + 1] == 0x5b /* '[' */,
+           let arrowKeycode = peerArrowKeycode(arr[i + 2]) {
+            sendPeerKeyEvent(surface, keycode: arrowKeycode, text: nil)
+            i += 3
+            continue
+        }
+
+        if let mapping = peerSingleByteKeyMapping(byte) {
+            sendPeerKeyEvent(surface, keycode: mapping.keycode, text: mapping.text)
+            i += 1
+            continue
+        }
+
+        if let kc = peerCtrlLetterKeycode(byte) {
+            sendPeerCtrlLetterKey(surface, keycode: kc, byte: byte)
+            i += 1
+            continue
+        }
+
+        // Printable / UTF-8 path: group continuation bytes for one scalar.
+        let scalarEnd = min(i + peerUtf8Len(byte), arr.count)
+        let chunkBytes = Array(arr[i..<scalarEnd])
+        if let str = String(bytes: chunkBytes, encoding: .utf8) {
+            for scalar in str.unicodeScalars {
+                sendPeerKeyEvent(surface, keycode: 0, text: String(scalar))
+            }
+            i = scalarEnd
         } else {
-            pending.append(byte)
+            // Lone byte fallback when UTF-8 decoding fails (rare for
+            // typed input).
+            sendPeerKeyEvent(surface, keycode: 0, text: String(UnicodeScalar(byte)))
+            i += 1
         }
     }
-    flushPeerText(surface, &pending)
+}
+
+/// Special single bytes that map to a named macOS keycode.
+private func peerSingleByteKeyMapping(_ byte: UInt8) -> (keycode: UInt32, text: String)? {
+    switch byte {
+    case 0x0d, 0x0a: return (36, "\r")          // kVK_Return
+    case 0x09:        return (0x30, "\t")        // kVK_Tab
+    case 0x7f, 0x08:  return (0x33, "\u{7f}")    // kVK_Delete (Backspace)
+    case 0x1b:        return (0x35, "\u{1b}")    // kVK_Escape
+    default:          return nil
+    }
+}
+
+/// Map a Ctrl+letter control byte (0x01-0x1A, excluding bytes already
+/// claimed by `peerSingleByteKeyMapping`) to its `kVK_ANSI_*` keycode.
+private func peerCtrlLetterKeycode(_ byte: UInt8) -> UInt32? {
+    switch byte {
+    case 0x01: return 0x00 // Ctrl-A → kVK_ANSI_A
+    case 0x02: return 0x0B // Ctrl-B → kVK_ANSI_B
+    case 0x03: return 0x08 // Ctrl-C → kVK_ANSI_C
+    case 0x04: return 0x02 // Ctrl-D → kVK_ANSI_D
+    case 0x05: return 0x0E // Ctrl-E → kVK_ANSI_E
+    case 0x06: return 0x03 // Ctrl-F → kVK_ANSI_F
+    case 0x07: return 0x05 // Ctrl-G → kVK_ANSI_G
+    // 0x08 BS, 0x09 Tab, 0x0a LF — handled above
+    case 0x0B: return 0x28 // Ctrl-K → kVK_ANSI_K
+    case 0x0C: return 0x25 // Ctrl-L → kVK_ANSI_L
+    // 0x0d CR — handled above
+    case 0x0E: return 0x2D // Ctrl-N → kVK_ANSI_N
+    case 0x0F: return 0x1F // Ctrl-O → kVK_ANSI_O
+    case 0x10: return 0x23 // Ctrl-P → kVK_ANSI_P
+    case 0x11: return 0x0C // Ctrl-Q → kVK_ANSI_Q
+    case 0x12: return 0x0F // Ctrl-R → kVK_ANSI_R
+    case 0x13: return 0x01 // Ctrl-S → kVK_ANSI_S
+    case 0x14: return 0x11 // Ctrl-T → kVK_ANSI_T
+    case 0x15: return 0x20 // Ctrl-U → kVK_ANSI_U
+    case 0x16: return 0x09 // Ctrl-V → kVK_ANSI_V
+    case 0x17: return 0x0D // Ctrl-W → kVK_ANSI_W
+    case 0x18: return 0x07 // Ctrl-X → kVK_ANSI_X
+    case 0x19: return 0x10 // Ctrl-Y → kVK_ANSI_Y
+    case 0x1A: return 0x06 // Ctrl-Z → kVK_ANSI_Z
+    // 0x1b Esc — handled above
+    default:   return nil
+    }
+}
+
+/// Map the third byte of a `\x1b[?` CSI sequence to its arrow keycode.
+private func peerArrowKeycode(_ byte: UInt8) -> UInt32? {
+    switch byte {
+    case 0x41: return 0x7e // 'A' → kVK_UpArrow
+    case 0x42: return 0x7d // 'B' → kVK_DownArrow
+    case 0x43: return 0x7c // 'C' → kVK_RightArrow
+    case 0x44: return 0x7b // 'D' → kVK_LeftArrow
+    default:   return nil
+    }
+}
+
+/// Number of bytes in the UTF-8 sequence whose lead byte is `byte`.
+/// Returns 1 for ASCII and for stray continuation bytes.
+private func peerUtf8Len(_ byte: UInt8) -> Int {
+    if byte < 0x80 { return 1 }
+    if byte < 0xC0 { return 1 }
+    if byte < 0xE0 { return 2 }
+    if byte < 0xF0 { return 3 }
+    return 4
 }
 
 @MainActor
-private func flushPeerText(_ surface: ghostty_surface_t, _ pending: inout Data) {
-    guard !pending.isEmpty else { return }
-    pending.withUnsafeBytes { buf in
-        if let base = buf.baseAddress?.assumingMemoryBound(to: CChar.self) {
-            ghostty_surface_text(surface, base, UInt(buf.count))
-        }
-    }
-    pending.removeAll(keepingCapacity: true)
-}
-
-@MainActor
-private func sendPeerReturnKey(to surface: ghostty_surface_t) {
+private func sendPeerKeyEvent(_ surface: ghostty_surface_t, keycode: UInt32, text: String?) {
     var keyEvent = ghostty_input_key_s()
     keyEvent.action = GHOSTTY_ACTION_PRESS
-    keyEvent.keycode = 36 // kVK_Return
+    keyEvent.keycode = keycode
     keyEvent.mods = GHOSTTY_MODS_NONE
     keyEvent.consumed_mods = GHOSTTY_MODS_NONE
     keyEvent.unshifted_codepoint = 0
     keyEvent.composing = false
-    "\r".withCString { ptr in
-        keyEvent.text = ptr
+    if let text {
+        text.withCString { ptr in
+            keyEvent.text = ptr
+            _ = ghostty_surface_key(surface, keyEvent)
+        }
+    } else {
+        keyEvent.text = nil
         _ = ghostty_surface_key(surface, keyEvent)
     }
     keyEvent.action = GHOSTTY_ACTION_RELEASE
     keyEvent.text = nil
+    _ = ghostty_surface_key(surface, keyEvent)
+}
+
+@MainActor
+private func sendPeerCtrlLetterKey(_ surface: ghostty_surface_t, keycode: UInt32, byte: UInt8) {
+    // Don't send text for Ctrl+key combos — keycode + mods +
+    // unshifted_codepoint are enough for Ghostty's KeyEncoder. Adding
+    // the raw control byte as text triggers Kitty-protocol double
+    // encoding that leaks CSI-u sequences (e.g. "9;5u") as visible
+    // text. Mirrors the de5df7d fix in GhosttyTerminalView's Ctrl
+    // fast path.
+    var keyEvent = ghostty_input_key_s()
+    keyEvent.action = GHOSTTY_ACTION_PRESS
+    keyEvent.keycode = keycode
+    keyEvent.mods = GHOSTTY_MODS_CTRL
+    keyEvent.consumed_mods = GHOSTTY_MODS_NONE
+    keyEvent.unshifted_codepoint = UInt32(byte) + 0x60 // 0x03 → 'c'
+    keyEvent.composing = false
+    keyEvent.text = nil
+    _ = ghostty_surface_key(surface, keyEvent)
+
+    keyEvent.action = GHOSTTY_ACTION_RELEASE
     _ = ghostty_surface_key(surface, keyEvent)
 }
 

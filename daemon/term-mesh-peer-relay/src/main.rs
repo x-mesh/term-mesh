@@ -68,6 +68,46 @@ fn current_winsize() -> Option<(u16, u16)> {
     }
 }
 
+// ── Raw stdin ──────────────────────────────────────────────────────
+//
+// Without raw mode, stdin is line-buffered: Tab / Ctrl-C / arrow keys
+// stay queued in the kernel line buffer until Enter is pressed, so the
+// host never sees them. cfmakeraw + tcsetattr makes every keystroke
+// visible to read(2) immediately. The original termios is captured at
+// startup and restored on exit.
+
+struct RawStdinGuard {
+    original: Option<libc::termios>,
+}
+
+impl RawStdinGuard {
+    fn enable() -> Self {
+        let mut original: libc::termios = unsafe { std::mem::zeroed() };
+        let got = unsafe { libc::tcgetattr(libc::STDIN_FILENO, &mut original) };
+        if got != 0 {
+            return Self { original: None };
+        }
+        let mut raw = original;
+        unsafe { libc::cfmakeraw(&mut raw) };
+        // VMIN=1, VTIME=0 → read returns as soon as one byte is available.
+        raw.c_cc[libc::VMIN] = 1;
+        raw.c_cc[libc::VTIME] = 0;
+        let set = unsafe { libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &raw) };
+        if set != 0 {
+            return Self { original: None };
+        }
+        Self { original: Some(original) }
+    }
+}
+
+impl Drop for RawStdinGuard {
+    fn drop(&mut self) {
+        if let Some(ref tio) = self.original {
+            unsafe { libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, tio) };
+        }
+    }
+}
+
 // ── Framing ────────────────────────────────────────────────────────
 
 fn write_frame(sock: &mut UnixStream, typ: u8, payload: &[u8]) -> io::Result<()> {
@@ -104,6 +144,11 @@ fn main() {
         eprintln!("[relay] connect {socket_path}: {e}");
         std::process::exit(1);
     });
+
+    // Put stdin in raw mode so each keystroke (Tab, Ctrl-C, arrow keys)
+    // is forwarded immediately instead of waiting for a newline flush.
+    // Restored automatically on drop at the end of main().
+    let _raw_guard = RawStdinGuard::enable();
 
     // Send initial Resize so the host knows our terminal size.
     if let Some((cols, rows)) = current_winsize() {
