@@ -140,6 +140,12 @@ final class GhosttySurfaceScrollView: NSView {
     private let notificationRingLayer: CAShapeLayer
     private let peerRingOverlayView: GhosttyFlashOverlayView
     private let peerRingLayer: CAShapeLayer
+    /// Filled teal pill in the top-right corner of the peer ring,
+    /// shown only when 2+ peer-federation clients are attached.
+    private let peerCountBadgeBg: CAShapeLayer = CAShapeLayer()
+    /// Number ("2", "9+") drawn inside `peerCountBadgeBg`. Both layers
+    /// hide together via `setPeerRing(visible:count:)`.
+    private let peerCountBadgeText: CATextLayer = CATextLayer()
     private let flashOverlayView: GhosttyFlashOverlayView
     private let flashLayer: CAShapeLayer
     private var searchOverlayHostingView: NSHostingView<SurfaceSearchOverlay>?
@@ -351,6 +357,22 @@ final class GhosttySurfaceScrollView: NSView {
         peerRingLayer.shadowOffset = .zero
         peerRingLayer.opacity = 0
         peerRingOverlayView.layer?.addSublayer(peerRingLayer)
+
+        // Badge: filled teal pill (CAShapeLayer) + centered count
+        // (CATextLayer). Hidden until count >= 2.
+        peerCountBadgeBg.fillColor = NSColor.systemTeal.cgColor
+        peerCountBadgeBg.strokeColor = NSColor.white.withAlphaComponent(0.6).cgColor
+        peerCountBadgeBg.lineWidth = 1
+        peerCountBadgeBg.opacity = 0
+        peerCountBadgeText.foregroundColor = NSColor.white.cgColor
+        peerCountBadgeText.alignmentMode = .center
+        peerCountBadgeText.font = NSFont.systemFont(ofSize: 11, weight: .bold)
+        peerCountBadgeText.fontSize = 11
+        peerCountBadgeText.contentsScale = NSScreen.main?.backingScaleFactor ?? 2.0
+        peerCountBadgeText.opacity = 0
+        peerRingOverlayView.layer?.addSublayer(peerCountBadgeBg)
+        peerRingOverlayView.layer?.addSublayer(peerCountBadgeText)
+
         peerRingOverlayView.isHidden = true
         addSubview(peerRingOverlayView)
 
@@ -622,9 +644,17 @@ final class GhosttySurfaceScrollView: NSView {
     /// the surface; orthogonal to the (blue) notification ring so
     /// both can be lit at once.
     func setPeerRing(visible: Bool) {
+        setPeerRing(visible: visible, count: visible ? 1 : 0)
+    }
+
+    /// Show / hide the teal peer-attached ring. When `count >= 2`, a
+    /// small numbered badge ("2", "9+") is drawn in the top-right of
+    /// the surface so the host can see at a glance how many clients
+    /// are mirroring this pane.
+    func setPeerRing(visible: Bool, count: Int) {
         if !Thread.isMainThread {
             DispatchQueue.main.async { [weak self] in
-                self?.setPeerRing(visible: visible)
+                self?.setPeerRing(visible: visible, count: count)
             }
             return
         }
@@ -633,7 +663,46 @@ final class GhosttySurfaceScrollView: NSView {
         CATransaction.setDisableActions(true)
         peerRingOverlayView.isHidden = !visible
         peerRingLayer.opacity = visible ? 1 : 0
+        let showBadge = visible && count >= 2
+        peerCountBadgeBg.opacity = showBadge ? 1 : 0
+        peerCountBadgeText.opacity = showBadge ? 1 : 0
+        if showBadge {
+            peerCountBadgeText.string = count > 9 ? "9+" : "\(count)"
+            updatePeerCountBadgeFrame()
+        }
         CATransaction.commit()
+    }
+
+    private func updatePeerCountBadgeFrame() {
+        let bounds = peerRingOverlayView.bounds
+        let isWide = (peerCountBadgeText.string as? String).map { $0.count > 1 } ?? false
+        let badgeWidth: CGFloat = isWide ? 22 : 18
+        let badgeHeight: CGFloat = 18
+        // Inset matches peerRingPath inset (5pt) so the badge sits
+        // neatly on top of the ring's top-right corner.
+        let x = bounds.maxX - 5 - badgeWidth + (badgeWidth / 2)
+        let y = bounds.maxY - 5 - (badgeHeight / 2)
+        let frame = CGRect(
+            x: x - badgeWidth / 2,
+            y: y - badgeHeight / 2,
+            width: badgeWidth,
+            height: badgeHeight
+        )
+        peerCountBadgeBg.frame = frame
+        peerCountBadgeBg.path = CGPath(
+            roundedRect: CGRect(origin: .zero, size: frame.size),
+            cornerWidth: badgeHeight / 2,
+            cornerHeight: badgeHeight / 2,
+            transform: nil
+        )
+        // CATextLayer is positioned in superlayer coords; offset so the
+        // text baseline sits roughly centered vertically.
+        peerCountBadgeText.frame = CGRect(
+            x: frame.minX,
+            y: frame.minY + 1,
+            width: frame.width,
+            height: frame.height - 2
+        )
     }
 
     func setSearchOverlay(searchState: TerminalSurface.SearchState?) {
@@ -1700,6 +1769,9 @@ final class GhosttySurfaceScrollView: NSView {
             inset: 5,
             radius: 5
         )
+        if peerCountBadgeBg.opacity > 0 {
+            updatePeerCountBadgeFrame()
+        }
     }
 
     private func updateFlashPath() {

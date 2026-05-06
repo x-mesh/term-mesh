@@ -284,10 +284,9 @@ final class GhosttyPaneSurfaceProvider: PeerSurfaceProvider {
 
     static func incrementPeerAttach(for ts: TerminalSurface) {
         let prev = peerAttachCounts[ts.id] ?? 0
-        peerAttachCounts[ts.id] = prev + 1
-        if prev == 0 {
-            ts.hostedView.setPeerRing(visible: true)
-        }
+        let next = prev + 1
+        peerAttachCounts[ts.id] = next
+        ts.hostedView.setPeerRing(visible: true, count: next)
     }
 
     static func decrementPeerAttach(for ts: TerminalSurface) {
@@ -295,9 +294,10 @@ final class GhosttyPaneSurfaceProvider: PeerSurfaceProvider {
         let next = max(0, prev - 1)
         if next == 0 {
             peerAttachCounts.removeValue(forKey: ts.id)
-            ts.hostedView.setPeerRing(visible: false)
+            ts.hostedView.setPeerRing(visible: false, count: 0)
         } else {
             peerAttachCounts[ts.id] = next
+            ts.hostedView.setPeerRing(visible: true, count: next)
         }
     }
 
