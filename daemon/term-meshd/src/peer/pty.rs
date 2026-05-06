@@ -8,6 +8,7 @@
 use std::ffi::CString;
 use std::io;
 use std::os::unix::io::RawFd;
+use std::time::Duration;
 
 pub struct PtyChild {
     pub master_fd: RawFd,
@@ -105,13 +106,35 @@ pub fn set_nonblocking(fd: RawFd) -> io::Result<()> {
     Ok(())
 }
 
-pub fn write(master_fd: RawFd, bytes: &[u8]) -> io::Result<usize> {
-    // Safety: libc::write on a valid fd with a valid buffer.
-    let n = unsafe { libc::write(master_fd, bytes.as_ptr() as *const _, bytes.len()) };
-    if n < 0 {
-        return Err(io::Error::last_os_error());
+pub fn write_all(master_fd: RawFd, bytes: &[u8]) -> io::Result<()> {
+    let mut offset = 0;
+    while offset < bytes.len() {
+        // Safety: libc::write on a valid fd with a valid buffer.
+        let n = unsafe {
+            libc::write(
+                master_fd,
+                bytes[offset..].as_ptr() as *const _,
+                bytes.len() - offset,
+            )
+        };
+        if n > 0 {
+            offset += n as usize;
+            continue;
+        }
+        if n == 0 {
+            return Err(io::Error::new(io::ErrorKind::WriteZero, "PTY write returned 0"));
+        }
+        let err = io::Error::last_os_error();
+        match err.raw_os_error() {
+            Some(libc::EINTR) => continue,
+            Some(code) if code == libc::EAGAIN || code == libc::EWOULDBLOCK => {
+                std::thread::sleep(Duration::from_millis(1));
+                continue;
+            }
+            _ => return Err(err),
+        }
     }
-    Ok(n as usize)
+    Ok(())
 }
 
 pub fn resize(master_fd: RawFd, cols: u16, rows: u16) -> io::Result<()> {

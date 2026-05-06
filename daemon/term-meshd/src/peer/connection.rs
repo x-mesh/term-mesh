@@ -209,8 +209,8 @@ async fn reader_loop(
 
                 // Apply client-requested size. Multi-client policy beyond
                 // last-writer-wins is deferred to Phase 2.3B-c.
-                if req.client_cols > 0 && req.client_rows > 0 {
-                    if let Err(e) = surface.resize(req.client_cols as u16, req.client_rows as u16) {
+                if let Some((cols, rows)) = clamp_pty_size(req.client_cols, req.client_rows) {
+                    if let Err(e) = surface.resize(cols, rows) {
                         tracing::warn!("resize on attach failed: {e}");
                     }
                 }
@@ -277,12 +277,12 @@ async fn reader_loop(
                 };
                 match input.kind {
                     Some(peer_proto::v1::input::Kind::Keys(keys)) => {
-                        if let Err(e) = entry.surface.write(&keys) {
+                        if let Err(e) = entry.surface.write_all(&keys) {
                             tracing::warn!("PTY write failed: {e}");
                         }
                     }
                     Some(peer_proto::v1::input::Kind::Paste(p)) => {
-                        if let Err(e) = entry.surface.write(&p.text) {
+                        if let Err(e) = entry.surface.write_all(&p.text) {
                             tracing::warn!("PTY paste-write failed: {e}");
                         }
                     }
@@ -298,8 +298,8 @@ async fn reader_loop(
                 let Some(entry) = attached.get(&r.surface_id) else {
                     continue;
                 };
-                if r.cols > 0 && r.rows > 0 {
-                    if let Err(e) = entry.surface.resize(r.cols as u16, r.rows as u16) {
+                if let Some((cols, rows)) = clamp_pty_size(r.cols, r.rows) {
+                    if let Err(e) = entry.surface.resize(cols, rows) {
                         tracing::warn!("resize failed: {e}");
                     }
                 }
@@ -412,6 +412,15 @@ fn host_hello(seq_counter: &AtomicU64) -> Envelope {
 
 fn next_seq(seq_counter: &AtomicU64) -> u64 {
     seq_counter.fetch_add(1, Ordering::Relaxed) + 1
+}
+
+fn clamp_pty_size(cols: u32, rows: u32) -> Option<(u16, u16)> {
+    if cols == 0 || rows == 0 {
+        return None;
+    }
+    let cols = cols.min(1000) as u16;
+    let rows = rows.min(1000) as u16;
+    Some((cols, rows))
 }
 
 fn major_compatible(a: &str, b: &str) -> bool {

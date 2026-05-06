@@ -230,6 +230,7 @@ public actor PeerServer {
 
     public func start() throws {
         guard listenerFd < 0 else { throw PeerServerError.alreadyRunning }
+        try Self.prepareSocketParentDirectory(for: socketPath)
         // Remove any stale socket file first; an old entry would make bind fail.
         unlink(socketPath)
 
@@ -268,6 +269,7 @@ public actor PeerServer {
             close(fd)
             throw PeerServerError.bindFailed(errno: err, message: "bind() failed")
         }
+        chmod(socketPath, 0o600)
 
         if listen(fd, 8) != 0 {
             let err = errno
@@ -358,6 +360,10 @@ public actor PeerServer {
                 if errno == EAGAIN || errno == EWOULDBLOCK { continue }
                 break
             }
+            guard Self.clientHasSameUser(fd: clientFd) else {
+                close(clientFd)
+                continue
+            }
             let connection = AcceptedUnixConnection(fd: clientFd)
             let session = PeerServerSession(
                 connection: connection,
@@ -372,6 +378,32 @@ public actor PeerServer {
                 }
             }
         }
+    }
+
+    private static func prepareSocketParentDirectory(for socketPath: String) throws {
+        let parent = URL(fileURLWithPath: socketPath).deletingLastPathComponent()
+        guard !parent.path.isEmpty, parent.path != "/" else { return }
+        var isDirectory: ObjCBool = false
+        let exists = FileManager.default.fileExists(atPath: parent.path, isDirectory: &isDirectory)
+        if exists {
+            guard isDirectory.boolValue else {
+                throw PeerServerError.bindFailed(errno: ENOTDIR, message: "socket parent is not a directory")
+            }
+            return
+        }
+        try FileManager.default.createDirectory(at: parent, withIntermediateDirectories: true)
+        chmod(parent.path, 0o700)
+    }
+
+    private static func clientHasSameUser(fd: Int32) -> Bool {
+        #if canImport(Darwin)
+        var cred = xucred()
+        var credLen = socklen_t(MemoryLayout<xucred>.size)
+        let result = getsockopt(fd, SOL_LOCAL, LOCAL_PEERCRED, &cred, &credLen)
+        return result == 0 && cred.cr_uid == getuid()
+        #else
+        return true
+        #endif
     }
 }
 

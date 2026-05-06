@@ -8,10 +8,12 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use tokio::net::UnixListener;
-use tokio::sync::watch;
+use tokio::sync::{watch, Semaphore};
 
 use super::connection;
 use super::surface::PtyManager;
+
+const MAX_PEER_CONNECTIONS: usize = 16;
 
 pub async fn serve(path: PathBuf, shutdown_rx: watch::Receiver<bool>) -> anyhow::Result<()> {
     let manager = Arc::new(PtyManager::new());
@@ -34,15 +36,23 @@ pub async fn serve_with_manager(
     }
 
     let listener = UnixListener::bind(&path)?;
+    harden_socket_permissions(&path);
     tracing::info!("peer-federation listening on {}", path.display());
+    let connection_permits = Arc::new(Semaphore::new(MAX_PEER_CONNECTIONS));
 
     loop {
         tokio::select! {
             result = listener.accept() => {
                 match result {
                     Ok((stream, _)) => {
+                        let Ok(permit) = connection_permits.clone().try_acquire_owned() else {
+                            tracing::warn!("peer connection limit reached; closing new client");
+                            drop(stream);
+                            continue;
+                        };
                         let manager = manager.clone();
                         tokio::spawn(async move {
+                            let _permit = permit;
                             if let Err(e) = connection::run(stream, manager).await {
                                 tracing::warn!("peer connection ended with error: {e}");
                             }
@@ -65,6 +75,20 @@ pub async fn serve_with_manager(
     }
     Ok(())
 }
+
+#[cfg(unix)]
+fn harden_socket_permissions(path: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+
+    if let Ok(metadata) = std::fs::metadata(path) {
+        let mut perms = metadata.permissions();
+        perms.set_mode(0o600);
+        let _ = std::fs::set_permissions(path, perms);
+    }
+}
+
+#[cfg(not(unix))]
+fn harden_socket_permissions(_path: &Path) {}
 
 #[cfg(test)]
 mod integration_tests {

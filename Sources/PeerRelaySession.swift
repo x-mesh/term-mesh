@@ -198,18 +198,28 @@ final class PeerRelaySession {
     // dials the socket — the picker UX and stage 2 are unaffected.
 
     static func connectAndList(hostSockPath: String) async throws -> PeerRelayConnection {
+        let connection = try await connect(hostSockPath: hostSockPath)
+        let surfaces = try await connection.session.listSurfaces()
+        return PeerRelayConnection(
+            hostSockPath: hostSockPath,
+            session: connection.session,
+            transport: connection.transport,
+            surfaces: surfaces
+        )
+    }
+
+    static func connect(hostSockPath: String) async throws -> PeerRelayConnection {
         let transport = try await UnixSocketTransport.connect(socketPath: hostSockPath)
         let session = PeerSession(
             read: { try await transport.read() },
             write: { try await transport.write($0) }
         )
         _ = try await session.handshake()
-        let surfaces = try await session.listSurfaces()
         return PeerRelayConnection(
             hostSockPath: hostSockPath,
             session: session,
             transport: transport,
-            surfaces: surfaces
+            surfaces: []
         )
     }
 

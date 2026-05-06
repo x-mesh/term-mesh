@@ -199,8 +199,8 @@ impl PtySurface {
         self.broadcast_tx.subscribe()
     }
 
-    pub fn write(&self, bytes: &[u8]) -> std::io::Result<usize> {
-        pty::write(self.master_fd, bytes)
+    pub fn write_all(&self, bytes: &[u8]) -> std::io::Result<()> {
+        pty::write_all(self.master_fd, bytes)
     }
 
     pub fn resize(&self, cols: u16, rows: u16) -> std::io::Result<()> {

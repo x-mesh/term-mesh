@@ -264,9 +264,10 @@ final class PeerRelayWorkspaceWindowController: NSWindowController, NSWindowDele
             NSEvent.removeMonitor(monitor)
             keyMonitor = nil
         }
-        // Note: we keep the click monitor + slot views around so the
-        // window doesn't visually flicker during a brief reconnect.
-        // applyLayout on re-up will rebuild slots in place.
+        if let monitor = clickMonitor {
+            NSEvent.removeMonitor(monitor)
+            clickMonitor = nil
+        }
         let transport = subscriptionTransport
         subscriptionTransport = nil
         let toStop = Array(panesBySurfaceID.values)
@@ -282,7 +283,7 @@ final class PeerRelayWorkspaceWindowController: NSWindowController, NSWindowDele
         // Force the body stack (and thus the banner) to exist before
         // the first layout pass, so initial-attach errors can land in
         // the banner instead of an immediate window close.
-        if let window { _ = ensureBodyStack(in: window) }
+        if let window { ensureBodyStack(in: window) }
 
         startTask = Task { [weak self] in
             guard let self else { return }
@@ -397,6 +398,15 @@ final class PeerRelayWorkspaceWindowController: NSWindowController, NSWindowDele
     // app's main window.
 
     private func installKeyMonitor() {
+        if let monitor = keyMonitor {
+            NSEvent.removeMonitor(monitor)
+            keyMonitor = nil
+        }
+        if let monitor = clickMonitor {
+            NSEvent.removeMonitor(monitor)
+            clickMonitor = nil
+        }
+
         keyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
             guard let self,
                   let window = self.window,
@@ -517,10 +527,12 @@ final class PeerRelayWorkspaceWindowController: NSWindowController, NSWindowDele
 
     private func applyLayout(_ layout: Termmesh_Peer_V1_WorkspaceLayout) async throws {
         let newSurfaceIDs = collectSurfaceIDs(layout)
+        let missingSurfaceIDs = newSurfaceIDs.filter { panesBySurfaceID[$0] == nil }
+        let surfaceInfoByID = try await fetchSurfaceInfoByIDIfNeeded(for: Array(missingSurfaceIDs))
         // Spawn missing slots first (async, may take time per pane).
-        for surfaceID in newSurfaceIDs where panesBySurfaceID[surfaceID] == nil {
+        for surfaceID in missingSurfaceIDs {
             let pane = findPane(for: surfaceID, in: layout) ?? makeEmptyPaneStub(surfaceID: surfaceID)
-            let slot = try await spawnPaneSlot(pane)
+            let slot = try await spawnPaneSlot(pane, surfaceInfo: surfaceInfoByID[surfaceID])
             panesBySurfaceID[surfaceID] = slot
         }
 
@@ -670,10 +682,24 @@ final class PeerRelayWorkspaceWindowController: NSWindowController, NSWindowDele
 
     // MARK: - Slot factory
 
-    private func spawnPaneSlot(_ pane: Termmesh_Peer_V1_WorkspacePane) async throws -> PaneSlot {
+    private func fetchSurfaceInfoByIDIfNeeded(
+        for surfaceIDs: [Data]
+    ) async throws -> [Data: Termmesh_Peer_V1_SurfaceInfo] {
+        guard !surfaceIDs.isEmpty else { return [:] }
         let conn = try await PeerRelaySession.connectAndList(hostSockPath: hostSockPath)
-        let chosen = conn.surfaces.first(where: { $0.surfaceID == pane.surfaceID })
-                        ?? makeFallbackSurfaceInfo(from: pane)
+        defer { Task { await conn.cancel() } }
+        let wanted = Set(surfaceIDs)
+        return Dictionary(uniqueKeysWithValues: conn.surfaces
+            .filter { wanted.contains($0.surfaceID) }
+            .map { ($0.surfaceID, $0) })
+    }
+
+    private func spawnPaneSlot(
+        _ pane: Termmesh_Peer_V1_WorkspacePane,
+        surfaceInfo: Termmesh_Peer_V1_SurfaceInfo?
+    ) async throws -> PaneSlot {
+        let conn = try await PeerRelaySession.connect(hostSockPath: hostSockPath)
+        let chosen = surfaceInfo ?? makeFallbackSurfaceInfo(from: pane)
         let session = try await PeerRelaySession.attach(conn, surface: chosen)
         try session.prepareListener()
 

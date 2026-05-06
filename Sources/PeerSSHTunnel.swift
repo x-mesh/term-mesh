@@ -118,6 +118,7 @@ final class PeerSSHTunnel: @unchecked Sendable {
             "-o", "ExitOnForwardFailure=yes",
             "-o", "ServerAliveInterval=15",
             "-o", "ServerAliveCountMax=3",
+            "-o", "StreamLocalBindMask=0177",
             "-L", "\(localSockPath):\(remoteSockPath)",
             sshTarget,
         ]

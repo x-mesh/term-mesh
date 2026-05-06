@@ -7,6 +7,7 @@
 // immediately without restarting the app.
 
 import Foundation
+import Darwin
 
 enum PeerFederationSettings {
     static let autoStartKey      = "peerFederationAutoStart"
@@ -15,7 +16,12 @@ enum PeerFederationSettings {
     static let recentHostsKey    = "peerFederationRecentHosts"
     static let forceRedrawKey    = "peerFederationForceRedrawOnAttach"
 
-    static let defaultSocketPath = "/tmp/termmesh-app-peer.sock"
+    static var defaultSocketPath: String {
+        let uid = getuid()
+        return NSTemporaryDirectory()
+            .appending("term-mesh-\(uid)")
+            .appending("/peer.sock")
+    }
     static var defaultDisplayName: String {
         ProcessInfo.processInfo.hostName
     }

@@ -29,23 +29,68 @@ private func ptyTapCallback(
     len: UInt
 ) {
     guard let userdata, let data, len > 0 else { return }
-    let ctx = Unmanaged<PtyTapContext>.fromOpaque(userdata).takeUnretainedValue()
-    ctx.continuation.yield(Data(bytes: data, count: Int(len)))
+    let hub = Unmanaged<PtyTapHub>.fromOpaque(userdata).takeUnretainedValue()
+    hub.broadcast(Data(bytes: data, count: Int(len)))
 }
 
-// MARK: - PtyTapContext
+// MARK: - PtyTapHub
 
-/// Bridges the Ghostty C callback to an AsyncStream.
-/// Holds a strong reference to the TerminalSurface so the surface cannot
-/// be freed while a peer client is actively attached.
-final class PtyTapContext: @unchecked Sendable {
-    let continuation: AsyncStream<Data>.Continuation
+/// One Ghostty PTY callback per surface, fan-out to bounded per-peer streams.
+final class PtyTapHub: @unchecked Sendable {
+    private let lock = NSLock()
+    private var continuations: [UUID: AsyncStream<Data>.Continuation] = [:]
+
+    let surfaceID: UUID
+    let surfacePtr: ghostty_surface_t
     // Strong reference prevents TerminalSurface.deinit from running while attached.
     let surfaceRef: TerminalSurface
 
-    init(continuation: AsyncStream<Data>.Continuation, surfaceRef: TerminalSurface) {
-        self.continuation = continuation
+    init(surfaceID: UUID, surfacePtr: ghostty_surface_t, surfaceRef: TerminalSurface) {
+        self.surfaceID = surfaceID
+        self.surfacePtr = surfacePtr
         self.surfaceRef = surfaceRef
+    }
+
+    func makeStream(initialBytes: Data?) -> (UUID, AsyncStream<Data>) {
+        let attachID = UUID()
+        let stream = AsyncStream<Data>(bufferingPolicy: .bufferingNewest(256)) { continuation in
+            lock.lock()
+            continuations[attachID] = continuation
+            lock.unlock()
+            if let initialBytes {
+                continuation.yield(initialBytes)
+            }
+        }
+        return (attachID, stream)
+    }
+
+    func broadcast(_ bytes: Data) {
+        lock.lock()
+        let targets = Array(continuations.values)
+        lock.unlock()
+        for continuation in targets {
+            continuation.yield(bytes)
+        }
+    }
+
+    @discardableResult
+    func finish(attachID: UUID) -> Bool {
+        lock.lock()
+        let continuation = continuations.removeValue(forKey: attachID)
+        let isEmpty = continuations.isEmpty
+        lock.unlock()
+        continuation?.finish()
+        return isEmpty
+    }
+
+    func finishAll() {
+        lock.lock()
+        let targets = Array(continuations.values)
+        continuations.removeAll()
+        lock.unlock()
+        for continuation in targets {
+            continuation.finish()
+        }
     }
 }
 
@@ -56,6 +101,7 @@ final class PtyTapContext: @unchecked Sendable {
 /// because @MainActor isolation makes the class's state consistent.
 @MainActor
 final class GhosttyPaneSurfaceProvider: PeerSurfaceProvider {
+    private var tapHubs: [UUID: PtyTapHub] = [:]
 
     // MARK: PeerSurfaceProvider
 
@@ -91,12 +137,8 @@ final class GhosttyPaneSurfaceProvider: PeerSurfaceProvider {
         clientCols: UInt32,
         clientRows: UInt32
     ) async -> PeerSurfaceAttachment? {
-        guard let (sfcPtr, ts) = await MainActor.run(body: { findSurface(id: surfaceID) })
+        guard let (sfcPtr, ts) = findSurface(id: surfaceID)
         else { return nil }
-
-        let (stream, continuation) = AsyncStream<Data>.makeStream()
-        let ctx = PtyTapContext(continuation: continuation, surfaceRef: ts)
-        let ctxPtr = Unmanaged.passRetained(ctx).toOpaque()
 
         // Send a snapshot of the current viewport so the relay window
         // shows existing content immediately instead of starting blank.
@@ -104,12 +146,19 @@ final class GhosttyPaneSurfaceProvider: PeerSurfaceProvider {
         // to land before any new PTY bytes. ANSI styling is lost (text
         // only); fullscreen TUIs (vim, less, htop) won't redraw without
         // SIGWINCH and require manual refresh.
-        if let snapshot = readPaneSnapshot(sfcPtr) {
-            continuation.yield(snapshot)
-        }
+        let snapshot = readPaneSnapshot(sfcPtr)
 
-        // Register the C tap under renderer_state.mutex in Ghostty.
-        ghostty_surface_set_pty_data_callback(sfcPtr, ptyTapCallback, ctxPtr)
+        let hub: PtyTapHub
+        if let existing = tapHubs[ts.id] {
+            hub = existing
+        } else {
+            hub = PtyTapHub(surfaceID: ts.id, surfacePtr: sfcPtr, surfaceRef: ts)
+            tapHubs[ts.id] = hub
+            // Register the C tap under renderer_state.mutex in Ghostty.
+            let hubPtr = Unmanaged.passUnretained(hub).toOpaque()
+            ghostty_surface_set_pty_data_callback(sfcPtr, ptyTapCallback, hubPtr)
+        }
+        let (attachID, stream) = hub.makeStream(initialBytes: snapshot)
 
         // Light up the peer-attached ring on the host pane and bump
         // the per-surface ref count so concurrent attaches all share
@@ -143,21 +192,21 @@ final class GhosttyPaneSurfaceProvider: PeerSurfaceProvider {
             }
         }
 
-        let detach: @Sendable () async -> Void = { [weakTS] in
+        let detach: @Sendable () async -> Void = { [provider = WeakRef(self), weakTS, hub] in
             await MainActor.run {
-                if let ptr = weakTS.value?.surface {
-                    ghostty_surface_clear_pty_data_callback(ptr)
-                }
+                let hubEmpty = hub.finish(attachID: attachID)
                 if let ts = weakTS.value {
                     GhosttyPaneSurfaceProvider.decrementPeerAttach(for: ts)
+                    if hubEmpty {
+                        if let ptr = ts.surface {
+                            ghostty_surface_clear_pty_data_callback(ptr)
+                        }
+                        provider.value?.tapHubs.removeValue(forKey: ts.id)
+                    }
                 }
             }
-            continuation.finish()
-            // Release the retain from passRetained above.
-            Unmanaged<PtyTapContext>.fromOpaque(ctxPtr).release()
         }
 
-        let sz = ghostty_surface_size(sfcPtr)
         let meta: PeerWorkspaceMeta? = nil
 
         return PeerSurfaceAttachment(
@@ -170,8 +219,11 @@ final class GhosttyPaneSurfaceProvider: PeerSurfaceProvider {
                     // Use current cell size to convert cols×rows → pixels.
                     let curSz = ghostty_surface_size(ptr)
                     if curSz.cell_width_px > 0 && curSz.cell_height_px > 0 {
-                        let w = cols * UInt32(curSz.cell_width_px)
-                        let h = rows * UInt32(curSz.cell_height_px)
+                        let safeCols = min(cols, 1000)
+                        let safeRows = min(rows, 1000)
+                        let (w, wOverflow) = safeCols.multipliedReportingOverflow(by: UInt32(curSz.cell_width_px))
+                        let (h, hOverflow) = safeRows.multipliedReportingOverflow(by: UInt32(curSz.cell_height_px))
+                        guard !wOverflow, !hOverflow else { return }
                         ghostty_surface_set_size(ptr, w, h)
                     }
                 }
@@ -210,7 +262,14 @@ final class GhosttyPaneSurfaceProvider: PeerSurfaceProvider {
         guard let currentSurfaceUUID = uuidFromSurfaceID(paneIDBytes),
               let workspace = workspaceContaining(panelUUID: currentSurfaceUUID),
               let targetSurfaceUUID = uuidFromSurfaceID(surfaceIDBytes),
+              let currentTabID = workspace.surfaceIdFromPanelId(currentSurfaceUUID),
               let targetTabID = workspace.surfaceIdFromPanelId(targetSurfaceUUID)
+        else { return }
+        let targetPaneId = workspace.bonsplitController.allPaneIds.first { paneId in
+            workspace.bonsplitController.tabs(inPane: paneId).contains { $0.id == currentTabID }
+        }
+        guard let targetPaneId,
+              workspace.bonsplitController.tabs(inPane: targetPaneId).contains(where: { $0.id == targetTabID })
         else { return }
         workspace.bonsplitController.selectTab(targetTabID)
     }
