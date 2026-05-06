@@ -38,9 +38,12 @@ Phase W  — Layout-preserving workspace relay
 Phase W' — Live workspace layout sync                                       ✅ DONE
 Phase D  — Production integration
   D-1    — Drop #if DEBUG guards, opt-in env var                            ✅ DONE
+  D-2A   — Rename PeerDebug* identifiers/files                              ✅ DONE
   D-2    — Main UI integration (preferences pane, sidebar)                  ⬜ TODO
-  D-3    — Bonjour mDNS discovery                                           ⬜ TODO
-  D-4    — SSH transport                                                    ⬜ TODO
+  D-3a   — Bonjour LAN discovery (advertise host, autofill SSH dialog)     ✅ DONE
+  D-3b   — Native TCP transport (skip SSH for LAN)                          ⬜ TODO
+  D-4    — SSH transport (`ssh -L` tunnel + relay window)                   ✅ DONE
+  D-5    — CI prebuilt GhosttyKit.xcframework + setup.sh auto-fetch         ✅ DONE
 ```
 
 ---

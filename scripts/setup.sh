@@ -61,9 +61,44 @@ else
         LOCAL_SHA="$(cat "$LOCAL_SHA_STAMP")"
     fi
 
+    SEEDED_FROM=""
     if [ -d "$LOCAL_XCFRAMEWORK" ] && [ "$LOCAL_SHA" = "$GHOSTTY_SHA" ]; then
         echo "==> Seeding cache from existing local GhosttyKit.xcframework (SHA matches)"
-    else
+        SEEDED_FROM="local"
+    fi
+
+    # Try the prebuilt GitHub Release artifact next. Skips a slow (and
+    # zig-toolchain-dependent) local build when CI has already built
+    # this exact ghostty SHA. Disable with TERMMESH_GHOSTTY_NO_PREBUILT=1.
+    if [ -z "$SEEDED_FROM" ] && [ "${TERMMESH_GHOSTTY_NO_PREBUILT:-0}" != "1" ]; then
+        PREBUILT_REPO="${TERMMESH_GHOSTTY_PREBUILT_REPO:-x-mesh/term-mesh}"
+        PREBUILT_TAG="ghostty-prebuilt-$GHOSTTY_SHA"
+        PREBUILT_ASSET="GhosttyKit-$GHOSTTY_SHA.tar.gz"
+        PREBUILT_URL="https://github.com/$PREBUILT_REPO/releases/download/$PREBUILT_TAG/$PREBUILT_ASSET"
+        TMP_DL_DIR="$(mktemp -d "$CACHE_ROOT/.ghosttykit-dl.XXXXXX")"
+        echo "==> Trying prebuilt artifact: $PREBUILT_URL"
+        if curl -fL --silent --show-error "$PREBUILT_URL" -o "$TMP_DL_DIR/$PREBUILT_ASSET" 2>"$TMP_DL_DIR/curl.err"; then
+            if tar -xzf "$TMP_DL_DIR/$PREBUILT_ASSET" -C "$TMP_DL_DIR" 2>"$TMP_DL_DIR/tar.err"; then
+                if [ -d "$TMP_DL_DIR/GhosttyKit.xcframework" ]; then
+                    rm -rf "$LOCAL_XCFRAMEWORK"
+                    mkdir -p "$(dirname "$LOCAL_XCFRAMEWORK")"
+                    mv "$TMP_DL_DIR/GhosttyKit.xcframework" "$LOCAL_XCFRAMEWORK"
+                    echo "$GHOSTTY_SHA" > "$LOCAL_SHA_STAMP"
+                    SEEDED_FROM="release"
+                    echo "==> Fetched prebuilt GhosttyKit.xcframework from $PREBUILT_TAG"
+                else
+                    echo "==> Prebuilt tarball did not contain GhosttyKit.xcframework; falling back to local build"
+                fi
+            else
+                echo "==> Prebuilt tarball failed to extract ($(cat "$TMP_DL_DIR/tar.err" 2>/dev/null)); falling back to local build"
+            fi
+        else
+            echo "==> No prebuilt available for $GHOSTTY_SHA; falling back to local build"
+        fi
+        rm -rf "$TMP_DL_DIR"
+    fi
+
+    if [ -z "$SEEDED_FROM" ]; then
         echo "==> Building GhosttyKit.xcframework (this may take a few minutes)..."
         (
             cd ghostty
@@ -71,6 +106,7 @@ else
         )
         # Stamp the build output with the SHA it was built from
         echo "$GHOSTTY_SHA" > "$LOCAL_SHA_STAMP"
+        SEEDED_FROM="zig"
     fi
 
     if [ ! -d "$LOCAL_XCFRAMEWORK" ]; then
@@ -84,7 +120,7 @@ else
     rm -rf "$CACHE_XCFRAMEWORK"
     mv "$TMP_DIR/GhosttyKit.xcframework" "$CACHE_XCFRAMEWORK"
     rmdir "$TMP_DIR"
-    echo "==> Cached GhosttyKit.xcframework at $CACHE_XCFRAMEWORK"
+    echo "==> Cached GhosttyKit.xcframework at $CACHE_XCFRAMEWORK (source: $SEEDED_FROM)"
 fi
 
 echo "==> Creating symlink for GhosttyKit.xcframework..."

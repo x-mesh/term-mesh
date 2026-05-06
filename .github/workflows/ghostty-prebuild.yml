@@ -1,0 +1,106 @@
+name: ghostty-prebuild
+
+# Builds GhosttyKit.xcframework on a clean macOS runner whenever the
+# ghostty submodule pin changes, then publishes the resulting tarball
+# as a GitHub Release asset keyed by the ghostty SHA. `scripts/setup.sh`
+# fetches that asset on cache miss so contributors don't need a working
+# zig toolchain on machines where zig 0.15.2 is incompatible with the
+# host SDK (e.g. macOS 26).
+#
+# Trigger logic:
+#   - push to feat/ branches and main → opportunistic build (skips if
+#     a release for the current SHA already exists)
+#   - manual workflow_dispatch → force rebuild for arbitrary refs
+#
+# Release tag format: `ghostty-prebuilt-<full-sha>` (prerelease so it
+# doesn't drown out real version releases on the Releases page).
+
+on:
+  push:
+    branches:
+      - main
+      - 'feat/**'
+    paths:
+      - 'ghostty'
+      - '.gitmodules'
+      - '.github/workflows/ghostty-prebuild.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write   # required to create releases / upload assets
+
+concurrency:
+  # Multiple branches can hit the same ghostty SHA — serialize per SHA
+  # so they don't race the same release-create call.
+  group: ghostty-prebuild
+  cancel-in-progress: false
+
+jobs:
+  prebuild:
+    runs-on: macos-14   # Sonoma; zig 0.15.2 builds cleanly here
+    steps:
+      - name: Checkout (with submodules)
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Resolve ghostty SHA
+        id: sha
+        run: |
+          GHOSTTY_SHA="$(git -C ghostty rev-parse HEAD)"
+          echo "sha=$GHOSTTY_SHA" >> "$GITHUB_OUTPUT"
+          echo "Pinned ghostty SHA: $GHOSTTY_SHA"
+
+      - name: Skip if release already exists
+        id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="ghostty-prebuilt-${{ steps.sha.outputs.sha }}"
+          if gh release view "$TAG" --repo "${{ github.repository }}" >/dev/null 2>&1; then
+            echo "Release $TAG already exists; skipping rebuild."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Install zig 0.15.2
+        if: steps.check.outputs.skip != 'true'
+        run: |
+          curl -fsSL https://ziglang.org/download/0.15.2/zig-aarch64-macos-0.15.2.tar.xz \
+            | tar -xJ -C "$RUNNER_TEMP"
+          echo "$RUNNER_TEMP/zig-aarch64-macos-0.15.2" >> "$GITHUB_PATH"
+
+      - name: Verify zig
+        if: steps.check.outputs.skip != 'true'
+        run: zig version
+
+      - name: Build GhosttyKit.xcframework
+        if: steps.check.outputs.skip != 'true'
+        working-directory: ghostty
+        run: |
+          # Clear xcframework-* tags so repeated zig builds don't crash
+          # (matches the workaround in CLAUDE.md).
+          git tag -l 'xcframework-*' | while read -r t; do git tag -d "$t"; done 2>/dev/null || true
+          zig build -Demit-xcframework=true -Doptimize=ReleaseFast
+
+      - name: Tar artifact
+        if: steps.check.outputs.skip != 'true'
+        run: |
+          test -d ghostty/macos/GhosttyKit.xcframework
+          tar -czf "GhosttyKit-${{ steps.sha.outputs.sha }}.tar.gz" \
+            -C ghostty/macos GhosttyKit.xcframework
+          ls -lh "GhosttyKit-${{ steps.sha.outputs.sha }}.tar.gz"
+
+      - name: Publish release
+        if: steps.check.outputs.skip != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="ghostty-prebuilt-${{ steps.sha.outputs.sha }}"
+          gh release create "$TAG" \
+            "GhosttyKit-${{ steps.sha.outputs.sha }}.tar.gz" \
+            --repo "${{ github.repository }}" \
+            --prerelease \
+            --title "GhosttyKit prebuild · ghostty ${{ steps.sha.outputs.sha }}" \
+            --notes "Automated prebuild of \`GhosttyKit.xcframework\` for ghostty SHA \`${{ steps.sha.outputs.sha }}\`. Consumed by \`scripts/setup.sh\` so contributors don't need a working zig toolchain. Safe to delete; the next push that lands on this SHA will recreate it."
