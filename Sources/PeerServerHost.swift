@@ -39,17 +39,50 @@ final class PeerServerCoordinator: NSObject {
     private var layoutObserver: NSObjectProtocol?
     private var bonjour: PeerBonjourPublisher?
 
-    /// Launch-time hook. If `TERMMESH_PEER_SERVER_PATH` (or legacy
-    /// `TERMMESH_DEBUG_PEER_SERVER_PATH`) is set, start a peer server
-    /// at that path. Without the env var the server stays off until
-    /// the user clicks "Start Peer Server…" from the status bar menu.
+    /// Launch-time hook. Start the peer server when either the
+    /// `TERMMESH_PEER_SERVER_PATH` (or legacy
+    /// `TERMMESH_DEBUG_PEER_SERVER_PATH`) env var is set or the
+    /// "Auto-start" preference is on. Env wins on path conflict.
     static func autoStartIfConfigured() {
         let env = ProcessInfo.processInfo.environment
-        let path = env["TERMMESH_PEER_SERVER_PATH"]
+        let envPath = env["TERMMESH_PEER_SERVER_PATH"]
             ?? env["TERMMESH_DEBUG_PEER_SERVER_PATH"]
-        guard let path, !path.isEmpty else { return }
+        let path: String?
+        if let envPath, !envPath.isEmpty {
+            path = envPath
+        } else if PeerFederationSettings.autoStart {
+            path = PeerFederationSettings.socketPath
+        } else {
+            path = nil
+        }
+        guard let path else { return }
         Task { await PeerServerCoordinator.shared.bringUp(at: path, silent: true) }
     }
+
+    /// Toggle the server on/off without showing any UI. Used by the
+    /// Settings pane and by `autoStartIfConfigured`.
+    @discardableResult
+    func setRunning(_ shouldRun: Bool) async -> Bool {
+        if shouldRun {
+            guard server == nil else { return true } // already up
+            await bringUp(at: PeerFederationSettings.socketPath, silent: true)
+            return server != nil
+        } else {
+            guard let server else { return true }
+            self.server = nil
+            self.provider = nil
+            socketPath = nil
+            uninstallLayoutChangeBridge()
+            bonjour?.stop()
+            bonjour = nil
+            await server.stop()
+            return true
+        }
+    }
+
+    /// `true` while the server is listening. Lets Settings reflect
+    /// state without polling.
+    var isRunning: Bool { server != nil }
 
     @objc func startServer(_ sender: Any?) {
         if let existing = socketPath {
@@ -103,7 +136,7 @@ final class PeerServerCoordinator: NSObject {
         let provider = GhosttyPaneSurfaceProvider()
 
         var config = PeerServerConfig()
-        config.hostDisplayName = ProcessInfo.processInfo.hostName
+        config.hostDisplayName = PeerFederationSettings.displayName
         config.hostAppVersion = "debug-server"
 
         let server = PeerServer(socketPath: path, provider: provider, config: config)
@@ -119,7 +152,7 @@ final class PeerServerCoordinator: NSObject {
             // carries the socket path; the actual data path remains
             // SSH (clients connect with `ssh -L`).
             let publisher = PeerBonjourPublisher(
-                serviceName: ProcessInfo.processInfo.hostName,
+                serviceName: PeerFederationSettings.displayName,
                 socketPath: path
             )
             publisher.start()

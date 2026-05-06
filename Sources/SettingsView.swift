@@ -15,6 +15,7 @@ enum SettingsSection: String, CaseIterable, Identifiable {
     case browser = "browser"
     case imeInputBar = "imeInputBar"
     case keyboardShortcuts = "keyboardShortcuts"
+    case peerFederation = "peerFederation"
     case reset = "reset"
 
     var id: String { rawValue }
@@ -34,6 +35,7 @@ enum SettingsSection: String, CaseIterable, Identifiable {
         case .browser: return "Browser"
         case .imeInputBar: return "IME Input Bar"
         case .keyboardShortcuts: return "Keyboard Shortcuts"
+        case .peerFederation: return "Peer Federation"
         case .reset: return "Reset"
         }
     }
@@ -53,6 +55,7 @@ enum SettingsSection: String, CaseIterable, Identifiable {
         case .browser: return "globe"
         case .imeInputBar: return "keyboard"
         case .keyboardShortcuts: return "command"
+        case .peerFederation: return "antenna.radiowaves.left.and.right"
         case .reset: return "arrow.counterclockwise"
         }
     }
@@ -61,7 +64,7 @@ enum SettingsSection: String, CaseIterable, Identifiable {
         switch self {
         case .app, .terminal, .workspaceColors: return .general
         case .automation, .agentTeams, .agentCLIPaths, .agentModels, .worktrees: return .agents
-        case .dashboard, .services: return .network
+        case .dashboard, .services, .peerFederation: return .network
         case .browser: return .browser
         case .imeInputBar, .keyboardShortcuts: return .input
         case .reset: return .system
@@ -83,6 +86,7 @@ enum SettingsSection: String, CaseIterable, Identifiable {
         case .browser: return ["browser", "search", "engine", "theme", "link", "history", "http", "insecure", "suggestion"]
         case .imeInputBar: return ["ime", "input", "bar", "font", "height", "cjk"]
         case .keyboardShortcuts: return ["keyboard", "shortcut", "keybinding", "hotkey"]
+        case .peerFederation: return ["peer", "federation", "remote", "ssh", "relay", "share", "bonjour", "lan"]
         case .reset: return ["reset", "clear", "defaults"]
         }
     }
@@ -149,6 +153,14 @@ struct SettingsView: View {
     @AppStorage(TerminalSettingsOverride.scrollbackLimitKey) private var terminalScrollback: Int = 0
     @AppStorage(TerminalSettingsOverride.unfocusedSplitOpacityKey) private var terminalUnfocusedOpacity: Double = -1
     @AppStorage(TerminalSettingsOverride.splitDividerColorKey) private var terminalDividerColor = ""
+
+    @AppStorage(PeerFederationSettings.autoStartKey) private var peerFederationAutoStart = false
+    @AppStorage(PeerFederationSettings.socketPathKey) private var peerFederationSocketPath = PeerFederationSettings.defaultSocketPath
+    @AppStorage(PeerFederationSettings.displayNameKey) private var peerFederationDisplayName = ""
+    /// Mirrors `PeerServerCoordinator.shared.isRunning`. Refreshed on
+    /// section appear and after every toggle change since the
+    /// coordinator state is held outside SwiftUI.
+    @State private var peerFederationServerRunning = false
 
     @Environment(\.daemonService) private var daemonService
     @Environment(\.browserHistoryService) private var browserHistory
@@ -605,6 +617,8 @@ struct SettingsView: View {
             sectionIMEInputBar
         case .keyboardShortcuts:
             sectionKeyboardShortcuts
+        case .peerFederation:
+            sectionPeerFederation
         case .reset:
             sectionReset
         }
@@ -1859,6 +1873,74 @@ struct SettingsView: View {
             .font(.caption)
             .foregroundColor(.secondary)
             .padding(.leading, 2)
+    }
+
+    // MARK: - Section: Peer Federation
+
+    @ViewBuilder
+    private var sectionPeerFederation: some View {
+        SettingsCard {
+            SettingsCardRow(
+                "Enable peer server",
+                subtitle: peerFederationServerRunning
+                    ? "Listening at \(peerFederationSocketPath). Remote clients can attach now."
+                    : "Server is off. Toggle on to accept incoming relay attaches."
+            ) {
+                Toggle("", isOn: $peerFederationServerRunning)
+                    .labelsHidden()
+                    .controlSize(.small)
+                    .onChange(of: peerFederationServerRunning) { newValue in
+                        Task { @MainActor in
+                            await PeerServerCoordinator.shared.setRunning(newValue)
+                            peerFederationServerRunning = PeerServerCoordinator.shared.isRunning
+                        }
+                    }
+            }
+
+            SettingsCardDivider()
+
+            SettingsCardRow(
+                "Auto-start at app launch",
+                subtitle: peerFederationAutoStart
+                    ? "Server will start automatically when the app launches."
+                    : "Server stays off until you toggle it on or click \"Start Peer Server…\" in the menu bar."
+            ) {
+                Toggle("", isOn: $peerFederationAutoStart)
+                    .labelsHidden()
+                    .controlSize(.small)
+            }
+
+            SettingsCardDivider()
+
+            SettingsCardRow(
+                "Socket path",
+                subtitle: "Local Unix socket the peer server binds. SSH clients tunnel into this path on the remote machine.",
+                controlWidth: 280
+            ) {
+                TextField(PeerFederationSettings.defaultSocketPath, text: $peerFederationSocketPath)
+                    .textFieldStyle(.roundedBorder)
+                    .multilineTextAlignment(.trailing)
+            }
+
+            SettingsCardDivider()
+
+            SettingsCardRow(
+                "Display name",
+                subtitle: "Shown in remote clients' connect dialogs and Bonjour LAN browse list. Defaults to this Mac's hostname.",
+                controlWidth: 280
+            ) {
+                TextField(PeerFederationSettings.defaultDisplayName, text: $peerFederationDisplayName)
+                    .textFieldStyle(.roundedBorder)
+                    .multilineTextAlignment(.trailing)
+            }
+
+            SettingsCardDivider()
+
+            SettingsCardNote("Peer federation lets another term-mesh.app instance attach this Mac's terminal panes via SSH (workspace mirror with live layout sync). \"Enable peer server\" controls the running state right now; \"Auto-start at app launch\" persists across restarts.")
+        }
+        .onAppear {
+            peerFederationServerRunning = PeerServerCoordinator.shared.isRunning
+        }
     }
 
     // MARK: - Section: Reset
