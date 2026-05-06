@@ -116,6 +116,22 @@ final class GhosttyPaneSurfaceProvider: PeerSurfaceProvider {
         // a single visible ring.
         Self.incrementPeerAttach(for: ts)
 
+        // Phase E-6: optional Ctrl-L injection so TUIs repaint with
+        // full styling on attach. The plain-text snapshot path above
+        // restores content but loses ANSI; sending Ctrl-L makes vim /
+        // htop / less redraw correctly. Disabled by default because
+        // the redraw is visible to the host's local viewer too.
+        if PeerFederationSettings.forceRedrawOnAttach {
+            // Defer briefly so the snapshot lands first; the redraw
+            // bytes that come back through the PTY tap will then
+            // cleanly overwrite it.
+            Task { @MainActor [weak ts] in
+                try? await Task.sleep(nanoseconds: 100_000_000)
+                guard let ptr = ts?.surface else { return }
+                sendPeerInputBytes(ptr, bytes: Data([0x0c]))
+            }
+        }
+
         // Capture weak reference to TerminalSurface for input/resize closures;
         // the strong ref lives in PtyTapContext for the lifetime of the attach.
         let weakTS = WeakRef(ts)

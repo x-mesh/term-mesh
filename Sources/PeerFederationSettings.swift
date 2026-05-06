@@ -13,6 +13,7 @@ enum PeerFederationSettings {
     static let socketPathKey     = "peerFederationSocketPath"
     static let displayNameKey    = "peerFederationDisplayName"
     static let recentHostsKey    = "peerFederationRecentHosts"
+    static let forceRedrawKey    = "peerFederationForceRedrawOnAttach"
 
     static let defaultSocketPath = "/tmp/termmesh-app-peer.sock"
     static var defaultDisplayName: String {
@@ -31,6 +32,14 @@ enum PeerFederationSettings {
     static var displayName: String {
         let v = UserDefaults.standard.string(forKey: displayNameKey) ?? ""
         return v.isEmpty ? defaultDisplayName : v
+    }
+
+    /// Phase E-6: when on, the host injects Ctrl-L into the PTY at
+    /// each peer attach so full-screen TUIs (vim, htop, less) repaint
+    /// with full styling. Off by default — flicker is visible to the
+    /// host's local viewer too.
+    static var forceRedrawOnAttach: Bool {
+        UserDefaults.standard.bool(forKey: forceRedrawKey)
     }
 
     // MARK: - Recent SSH hosts

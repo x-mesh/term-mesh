@@ -157,6 +157,7 @@ struct SettingsView: View {
     @AppStorage(PeerFederationSettings.autoStartKey) private var peerFederationAutoStart = false
     @AppStorage(PeerFederationSettings.socketPathKey) private var peerFederationSocketPath = PeerFederationSettings.defaultSocketPath
     @AppStorage(PeerFederationSettings.displayNameKey) private var peerFederationDisplayName = ""
+    @AppStorage(PeerFederationSettings.forceRedrawKey) private var peerFederationForceRedraw = false
     /// Mirrors `PeerServerCoordinator.shared.isRunning`. Refreshed on
     /// section appear and after every toggle change since the
     /// coordinator state is held outside SwiftUI.
@@ -1932,6 +1933,19 @@ struct SettingsView: View {
                 TextField(PeerFederationSettings.defaultDisplayName, text: $peerFederationDisplayName)
                     .textFieldStyle(.roundedBorder)
                     .multilineTextAlignment(.trailing)
+            }
+
+            SettingsCardDivider()
+
+            SettingsCardRow(
+                "Force TUI redraw on attach",
+                subtitle: peerFederationForceRedraw
+                    ? "Sends Ctrl-L to the host PTY whenever a peer attaches so vim, htop, less repaint with full color. The redraw is also visible to the host's local viewer."
+                    : "Initial-attach snapshot is plain text; full-screen TUIs keep their text but lose styling until they redraw on their own."
+            ) {
+                Toggle("", isOn: $peerFederationForceRedraw)
+                    .labelsHidden()
+                    .controlSize(.small)
             }
 
             SettingsCardDivider()

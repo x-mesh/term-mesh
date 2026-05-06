@@ -172,8 +172,10 @@ Override knobs:
 - **Snapshot styling** — the initial-attach snapshot only carries
   plain text, no colors or cursor position; full-screen TUIs (vim,
   less, htop) show the right text but lose styling until they
-  redraw. SIGWINCH / Ctrl-L injection would fix that but disturbs
-  the host's local viewer.
+  redraw. Settings → Peer Federation → "Force TUI redraw on
+  attach" injects Ctrl-L on every attach to fix this at the cost
+  of a visible redraw on the host's local viewer too. Off by
+  default.
 - **Scrollback on attach** — only the live viewport is replayed;
   scrollback is lost.
 - **Authentication** — anything that can reach the host's Unix
