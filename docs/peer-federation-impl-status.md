@@ -40,7 +40,7 @@ Phase D  — Production integration
   D-1    — Drop #if DEBUG guards, opt-in env var                            ✅ DONE
   D-2A   — Rename PeerDebug* identifiers/files                              ✅ DONE
   D-2B   — Settings pane (Peer Federation section)                          ✅ DONE
-  D-2C   — Sidebar entry (connected peers, recent hosts)                    ⬜ TODO
+  D-2C   — Recent SSH hosts in connect dialog                               ✅ DONE
   D-2D   — Status-bar peer-server activity indicator                        ✅ DONE
   D-3a   — Bonjour LAN discovery (advertise host, autofill SSH dialog)     ✅ DONE
   D-3b   — Native TCP transport (skip SSH for LAN)                          ⬜ TODO
@@ -173,10 +173,11 @@ on the host.
       libghostty doesn't expose cell metadata via `ghostty_surface_*`
       yet. SIGWINCH wiggle / Ctrl-L injection both work but disturb the
       host's local viewer because they go through the shared PTY.
-- [ ] **Sidebar entry / recent hosts** (D-2C). Currently every relay
-      session prompts the SSH dialog from scratch; remembering the last
-      few hosts and surfacing connection state in the main app sidebar
-      would cut down on repeat typing.
+- [ ] **Sidebar entry / connection state** — D-2C added a recent-hosts
+      picker inside the SSH connect dialog, but a real "Connections"
+      sidebar (currently active relay windows, click-to-bring-to-front,
+      click-to-disconnect) would make the feature feel native rather
+      than menu-only.
 - [ ] **Native TCP transport** (D-3b). SSH already covers the cross-mac
       case; this would let LAN clients skip SSH entirely (paired with
       auth, of course). Low priority now that D-3a discovery + D-4 SSH
@@ -195,6 +196,7 @@ on the host.
 - [x] Drop `#if DEBUG` guards from all peer-federation sources (D-1).
 - [x] Rename `PeerDebug*` → `Peer*` after going production (D-2A).
 - [x] Settings pane (Peer Federation section) (D-2B).
+- [x] Recent SSH hosts in connect dialog (D-2C).
 - [x] Status-bar peer-server activity indicator (D-2D).
 - [x] Auto-start peer server at app launch (D-1 / D-2B preference).
 - [x] Bonjour LAN discovery (D-3a).
