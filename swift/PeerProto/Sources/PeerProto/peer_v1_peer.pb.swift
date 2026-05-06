@@ -639,6 +639,7 @@ public struct Termmesh_Peer_V1_WorkspacePane: Sendable {
   // `Message` and `Message+*Additions` files in the SwiftProtobuf library for
   // methods supported on all messages.
 
+  /// surface_id of the currently *active* tab in this bonsplit pane.
   public var surfaceID: Data = Data()
 
   public var title: String = String()
@@ -648,6 +649,26 @@ public struct Termmesh_Peer_V1_WorkspacePane: Sendable {
   public var rows: UInt32 = 0
 
   public var cwd: String = String()
+
+  /// Every tab the host has stacked in this bonsplit pane (Phase E-4).
+  /// The active one's surface_id matches `surface_id` above; clients
+  /// can render the rest as a tab bar and ask the host to activate one
+  /// via WorkspaceControl.activate_tab.
+  public var tabs: [Termmesh_Peer_V1_PaneTab] = []
+
+  public var unknownFields = SwiftProtobuf.UnknownStorage()
+
+  public init() {}
+}
+
+public struct Termmesh_Peer_V1_PaneTab: Sendable {
+  // SwiftProtobuf.Message conformance is added in an extension below. See the
+  // `Message` and `Message+*Additions` files in the SwiftProtobuf library for
+  // methods supported on all messages.
+
+  public var surfaceID: Data = Data()
+
+  public var title: String = String()
 
   public var unknownFields = SwiftProtobuf.UnknownStorage()
 
@@ -701,6 +722,14 @@ public struct Termmesh_Peer_V1_WorkspaceControl: Sendable {
     set {kind = .newTab(newValue)}
   }
 
+  public var activateTab: Termmesh_Peer_V1_ActivateTabRequest {
+    get {
+      if case .activateTab(let v)? = kind {return v}
+      return Termmesh_Peer_V1_ActivateTabRequest()
+    }
+    set {kind = .activateTab(newValue)}
+  }
+
   public var unknownFields = SwiftProtobuf.UnknownStorage()
 
   public enum OneOf_Kind: Equatable, Sendable {
@@ -709,6 +738,7 @@ public struct Termmesh_Peer_V1_WorkspaceControl: Sendable {
     case focusPane(Termmesh_Peer_V1_FocusPaneRequest)
     case setDivider(Termmesh_Peer_V1_SetDividerPositionRequest)
     case newTab(Termmesh_Peer_V1_NewTabRequest)
+    case activateTab(Termmesh_Peer_V1_ActivateTabRequest)
 
   }
 
@@ -780,6 +810,23 @@ public struct Termmesh_Peer_V1_NewTabRequest: Sendable {
   /// new terminal tab should appear. The host resolves it back to the
   /// pane id and creates a new tab there.
   public var paneID: Data = Data()
+
+  public var unknownFields = SwiftProtobuf.UnknownStorage()
+
+  public init() {}
+}
+
+public struct Termmesh_Peer_V1_ActivateTabRequest: Sendable {
+  // SwiftProtobuf.Message conformance is added in an extension below. See the
+  // `Message` and `Message+*Additions` files in the SwiftProtobuf library for
+  // methods supported on all messages.
+
+  /// surfaceID of any pane that lives in the bonsplit pane whose tab
+  /// strip we're operating on (typically the currently-active pane).
+  public var paneID: Data = Data()
+
+  /// surfaceID of the tab to make active.
+  public var surfaceID: Data = Data()
 
   public var unknownFields = SwiftProtobuf.UnknownStorage()
 
@@ -2384,7 +2431,7 @@ extension Termmesh_Peer_V1_WorkspaceSplit: SwiftProtobuf.Message, SwiftProtobuf.
 
 extension Termmesh_Peer_V1_WorkspacePane: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
   public static let protoMessageName: String = _protobuf_package + ".WorkspacePane"
-  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{3}surface_id\0\u{1}title\0\u{1}cols\0\u{1}rows\0\u{1}cwd\0")
+  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{3}surface_id\0\u{1}title\0\u{1}cols\0\u{1}rows\0\u{1}cwd\0\u{1}tabs\0")
 
   public mutating func decodeMessage<D: SwiftProtobuf.Decoder>(decoder: inout D) throws {
     while let fieldNumber = try decoder.nextFieldNumber() {
@@ -2397,6 +2444,7 @@ extension Termmesh_Peer_V1_WorkspacePane: SwiftProtobuf.Message, SwiftProtobuf._
       case 3: try { try decoder.decodeSingularUInt32Field(value: &self.cols) }()
       case 4: try { try decoder.decodeSingularUInt32Field(value: &self.rows) }()
       case 5: try { try decoder.decodeSingularStringField(value: &self.cwd) }()
+      case 6: try { try decoder.decodeRepeatedMessageField(value: &self.tabs) }()
       default: break
       }
     }
@@ -2418,6 +2466,9 @@ extension Termmesh_Peer_V1_WorkspacePane: SwiftProtobuf.Message, SwiftProtobuf._
     if !self.cwd.isEmpty {
       try visitor.visitSingularStringField(value: self.cwd, fieldNumber: 5)
     }
+    if !self.tabs.isEmpty {
+      try visitor.visitRepeatedMessageField(value: self.tabs, fieldNumber: 6)
+    }
     try unknownFields.traverse(visitor: &visitor)
   }
 
@@ -2427,6 +2478,42 @@ extension Termmesh_Peer_V1_WorkspacePane: SwiftProtobuf.Message, SwiftProtobuf._
     if lhs.cols != rhs.cols {return false}
     if lhs.rows != rhs.rows {return false}
     if lhs.cwd != rhs.cwd {return false}
+    if lhs.tabs != rhs.tabs {return false}
+    if lhs.unknownFields != rhs.unknownFields {return false}
+    return true
+  }
+}
+
+extension Termmesh_Peer_V1_PaneTab: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
+  public static let protoMessageName: String = _protobuf_package + ".PaneTab"
+  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{3}surface_id\0\u{1}title\0")
+
+  public mutating func decodeMessage<D: SwiftProtobuf.Decoder>(decoder: inout D) throws {
+    while let fieldNumber = try decoder.nextFieldNumber() {
+      // The use of inline closures is to circumvent an issue where the compiler
+      // allocates stack space for every case branch when no optimizations are
+      // enabled. https://github.com/apple/swift-protobuf/issues/1034
+      switch fieldNumber {
+      case 1: try { try decoder.decodeSingularBytesField(value: &self.surfaceID) }()
+      case 2: try { try decoder.decodeSingularStringField(value: &self.title) }()
+      default: break
+      }
+    }
+  }
+
+  public func traverse<V: SwiftProtobuf.Visitor>(visitor: inout V) throws {
+    if !self.surfaceID.isEmpty {
+      try visitor.visitSingularBytesField(value: self.surfaceID, fieldNumber: 1)
+    }
+    if !self.title.isEmpty {
+      try visitor.visitSingularStringField(value: self.title, fieldNumber: 2)
+    }
+    try unknownFields.traverse(visitor: &visitor)
+  }
+
+  public static func ==(lhs: Termmesh_Peer_V1_PaneTab, rhs: Termmesh_Peer_V1_PaneTab) -> Bool {
+    if lhs.surfaceID != rhs.surfaceID {return false}
+    if lhs.title != rhs.title {return false}
     if lhs.unknownFields != rhs.unknownFields {return false}
     return true
   }
@@ -2434,7 +2521,7 @@ extension Termmesh_Peer_V1_WorkspacePane: SwiftProtobuf.Message, SwiftProtobuf._
 
 extension Termmesh_Peer_V1_WorkspaceControl: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
   public static let protoMessageName: String = _protobuf_package + ".WorkspaceControl"
-  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{3}split_pane\0\u{3}close_pane\0\u{3}focus_pane\0\u{3}set_divider\0\u{3}new_tab\0")
+  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{3}split_pane\0\u{3}close_pane\0\u{3}focus_pane\0\u{3}set_divider\0\u{3}new_tab\0\u{3}activate_tab\0")
 
   public mutating func decodeMessage<D: SwiftProtobuf.Decoder>(decoder: inout D) throws {
     while let fieldNumber = try decoder.nextFieldNumber() {
@@ -2507,6 +2594,19 @@ extension Termmesh_Peer_V1_WorkspaceControl: SwiftProtobuf.Message, SwiftProtobu
           self.kind = .newTab(v)
         }
       }()
+      case 6: try {
+        var v: Termmesh_Peer_V1_ActivateTabRequest?
+        var hadOneofValue = false
+        if let current = self.kind {
+          hadOneofValue = true
+          if case .activateTab(let m) = current {v = m}
+        }
+        try decoder.decodeSingularMessageField(value: &v)
+        if let v = v {
+          if hadOneofValue {try decoder.handleConflictingOneOf()}
+          self.kind = .activateTab(v)
+        }
+      }()
       default: break
       }
     }
@@ -2537,6 +2637,10 @@ extension Termmesh_Peer_V1_WorkspaceControl: SwiftProtobuf.Message, SwiftProtobu
     case .newTab?: try {
       guard case .newTab(let v)? = self.kind else { preconditionFailure() }
       try visitor.visitSingularMessageField(value: v, fieldNumber: 5)
+    }()
+    case .activateTab?: try {
+      guard case .activateTab(let v)? = self.kind else { preconditionFailure() }
+      try visitor.visitSingularMessageField(value: v, fieldNumber: 6)
     }()
     case nil: break
     }
@@ -2705,6 +2809,41 @@ extension Termmesh_Peer_V1_NewTabRequest: SwiftProtobuf.Message, SwiftProtobuf._
 
   public static func ==(lhs: Termmesh_Peer_V1_NewTabRequest, rhs: Termmesh_Peer_V1_NewTabRequest) -> Bool {
     if lhs.paneID != rhs.paneID {return false}
+    if lhs.unknownFields != rhs.unknownFields {return false}
+    return true
+  }
+}
+
+extension Termmesh_Peer_V1_ActivateTabRequest: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
+  public static let protoMessageName: String = _protobuf_package + ".ActivateTabRequest"
+  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{3}pane_id\0\u{3}surface_id\0")
+
+  public mutating func decodeMessage<D: SwiftProtobuf.Decoder>(decoder: inout D) throws {
+    while let fieldNumber = try decoder.nextFieldNumber() {
+      // The use of inline closures is to circumvent an issue where the compiler
+      // allocates stack space for every case branch when no optimizations are
+      // enabled. https://github.com/apple/swift-protobuf/issues/1034
+      switch fieldNumber {
+      case 1: try { try decoder.decodeSingularBytesField(value: &self.paneID) }()
+      case 2: try { try decoder.decodeSingularBytesField(value: &self.surfaceID) }()
+      default: break
+      }
+    }
+  }
+
+  public func traverse<V: SwiftProtobuf.Visitor>(visitor: inout V) throws {
+    if !self.paneID.isEmpty {
+      try visitor.visitSingularBytesField(value: self.paneID, fieldNumber: 1)
+    }
+    if !self.surfaceID.isEmpty {
+      try visitor.visitSingularBytesField(value: self.surfaceID, fieldNumber: 2)
+    }
+    try unknownFields.traverse(visitor: &visitor)
+  }
+
+  public static func ==(lhs: Termmesh_Peer_V1_ActivateTabRequest, rhs: Termmesh_Peer_V1_ActivateTabRequest) -> Bool {
+    if lhs.paneID != rhs.paneID {return false}
+    if lhs.surfaceID != rhs.surfaceID {return false}
     if lhs.unknownFields != rhs.unknownFields {return false}
     return true
   }

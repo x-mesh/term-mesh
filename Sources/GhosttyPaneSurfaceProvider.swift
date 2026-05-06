@@ -179,9 +179,24 @@ final class GhosttyPaneSurfaceProvider: PeerSurfaceProvider {
             performSetDivider(splitIDBytes: req.splitID, ratio: req.ratio)
         case .newTab(let req):
             performNewTab(paneIDBytes: req.paneID)
+        case .activateTab(let req):
+            performActivateTab(paneIDBytes: req.paneID, surfaceIDBytes: req.surfaceID)
         case .none:
             break
         }
+    }
+
+    /// Phase E-4: switch the active tab inside the bonsplit pane that
+    /// hosts `paneIDBytes` to the tab whose surface is
+    /// `surfaceIDBytes`. Both arguments are surface_ids; the pane id
+    /// is the *current* active surface used as a locator.
+    private func performActivateTab(paneIDBytes: Data, surfaceIDBytes: Data) {
+        guard let currentSurfaceUUID = uuidFromSurfaceID(paneIDBytes),
+              let workspace = workspaceContaining(panelUUID: currentSurfaceUUID),
+              let targetSurfaceUUID = uuidFromSurfaceID(surfaceIDBytes),
+              let targetTabID = workspace.surfaceIdFromPanelId(targetSurfaceUUID)
+        else { return }
+        workspace.bonsplitController.selectTab(targetTabID)
     }
 
     private func performNewTab(paneIDBytes: Data) {
@@ -376,6 +391,20 @@ final class GhosttyPaneSurfaceProvider: PeerSurfaceProvider {
             paneMsg.rows = UInt32(sz.rows)
             if let cwd = workspace.panelDirectories[terminal.id] {
                 paneMsg.cwd = cwd
+            }
+            // Phase E-4: include every tab in this bonsplit pane so
+            // the relay window can render a tab strip and let the user
+            // switch the active tab via WorkspaceControl.activate_tab.
+            paneMsg.tabs = pane.tabs.compactMap { tab -> Termmesh_Peer_V1_PaneTab? in
+                guard let tUUID = UUID(uuidString: tab.id),
+                      let pUUID = workspace.surfaceIdToPanelId[TabID(uuid: tUUID)],
+                      let term = workspace.panels[pUUID] as? TerminalPanel,
+                      term.surface.surface != nil
+                else { return nil }
+                var t = Termmesh_Peer_V1_PaneTab()
+                t.surfaceID = surfaceIDBytes(term.surface.id)
+                t.title = workspace.panelTitles[term.id] ?? "Terminal"
+                return t
             }
             var layout = Termmesh_Peer_V1_WorkspaceLayout()
             layout.pane = paneMsg

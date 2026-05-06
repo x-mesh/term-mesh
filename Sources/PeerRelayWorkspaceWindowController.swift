@@ -35,6 +35,36 @@ private final class WorkspaceSplitWatcher: NSObject, NSSplitViewDelegate {
 }
 
 @MainActor
+/// Small NSButton subclass used by the relay window's per-pane tab
+/// strip. Carries the host paneID + tab's surfaceID so a click can
+/// dispatch ActivateTab without hunting for context.
+final class TabStripButton: NSButton {
+    var paneID: Data = Data()
+    var tabSurfaceID: Data = Data()
+    var isActive: Bool = false {
+        didSet { applyActiveStyle() }
+    }
+
+    convenience init(title: String) {
+        self.init(frame: .zero)
+        self.title = title
+        self.bezelStyle = .recessed
+        self.controlSize = .small
+        self.font = NSFont.systemFont(ofSize: 11)
+        self.translatesAutoresizingMaskIntoConstraints = false
+        self.setButtonType(.toggle)
+        self.lineBreakMode = .byTruncatingTail
+        applyActiveStyle()
+    }
+
+    private func applyActiveStyle() {
+        // Map "is the host's active tab" onto NSButton state so the
+        // built-in recessed style draws the highlighted appearance for
+        // the active tab and the muted appearance for others.
+        self.state = isActive ? .on : .off
+    }
+}
+
 final class PeerRelayWorkspaceWindowController: NSWindowController, NSWindowDelegate {
     // MARK: - Pane bookkeeping
 
@@ -648,18 +678,37 @@ final class PeerRelayWorkspaceWindowController: NSWindowController, NSWindowDele
             )
         }
 
+        let paneCopy = pane
         let wrapper = await MainActor.run { () -> NSView in
             let host = surface.hostedView
             host.translatesAutoresizingMaskIntoConstraints = false
             let wrap = NSView()
             wrap.translatesAutoresizingMaskIntoConstraints = false
             wrap.addSubview(host)
-            NSLayoutConstraint.activate([
-                host.topAnchor.constraint(equalTo: wrap.topAnchor),
-                host.bottomAnchor.constraint(equalTo: wrap.bottomAnchor),
-                host.leadingAnchor.constraint(equalTo: wrap.leadingAnchor),
-                host.trailingAnchor.constraint(equalTo: wrap.trailingAnchor),
-            ])
+
+            // Phase E-4: tab strip across the top when the host pane
+            // has 2+ tabs. Click → requestActivateTab → host swaps the
+            // active tab → relay receives a layout-changed push and
+            // respawns the slot for the new active surface.
+            if let tabBar = self.buildTabBar(for: paneCopy) {
+                wrap.addSubview(tabBar)
+                NSLayoutConstraint.activate([
+                    tabBar.topAnchor.constraint(equalTo: wrap.topAnchor),
+                    tabBar.leadingAnchor.constraint(equalTo: wrap.leadingAnchor),
+                    tabBar.trailingAnchor.constraint(equalTo: wrap.trailingAnchor),
+                    host.topAnchor.constraint(equalTo: tabBar.bottomAnchor),
+                    host.bottomAnchor.constraint(equalTo: wrap.bottomAnchor),
+                    host.leadingAnchor.constraint(equalTo: wrap.leadingAnchor),
+                    host.trailingAnchor.constraint(equalTo: wrap.trailingAnchor),
+                ])
+            } else {
+                NSLayoutConstraint.activate([
+                    host.topAnchor.constraint(equalTo: wrap.topAnchor),
+                    host.bottomAnchor.constraint(equalTo: wrap.bottomAnchor),
+                    host.leadingAnchor.constraint(equalTo: wrap.leadingAnchor),
+                    host.trailingAnchor.constraint(equalTo: wrap.trailingAnchor),
+                ])
+            }
             return wrap
         }
 
@@ -669,6 +718,57 @@ final class PeerRelayWorkspaceWindowController: NSWindowController, NSWindowDele
         }
 
         return PaneSlot(surfaceID: pane.surfaceID, session: session, surface: surface, view: wrapper)
+    }
+
+    // MARK: - Tab strip (Phase E-4)
+
+    /// Build a tab strip for a pane, or nil if there's nothing useful
+    /// to show (0 or 1 tab). Each tab becomes an NSButton wired to
+    /// `tabButtonClicked(_:)` so a click sends ActivateTab to the host.
+    @MainActor
+    fileprivate func buildTabBar(for pane: Termmesh_Peer_V1_WorkspacePane) -> NSView? {
+        guard pane.tabs.count >= 2 else { return nil }
+        let strip = NSStackView()
+        strip.orientation = .horizontal
+        strip.alignment = .centerY
+        strip.spacing = 2
+        strip.edgeInsets = NSEdgeInsets(top: 2, left: 4, bottom: 2, right: 4)
+        strip.translatesAutoresizingMaskIntoConstraints = false
+        strip.wantsLayer = true
+        strip.layer?.backgroundColor = NSColor.windowBackgroundColor.withAlphaComponent(0.6).cgColor
+
+        for tab in pane.tabs {
+            let isActive = tab.surfaceID == pane.surfaceID
+            let title = tab.title.isEmpty ? "Terminal" : tab.title
+            let btn = TabStripButton(title: title)
+            btn.isActive = isActive
+            btn.paneID = pane.surfaceID
+            btn.tabSurfaceID = tab.surfaceID
+            btn.target = self
+            btn.action = #selector(tabButtonClicked(_:))
+            strip.addArrangedSubview(btn)
+        }
+        // Trailing flexible spacer so tabs left-align even when the
+        // pane is wide.
+        let spacer = NSView()
+        spacer.translatesAutoresizingMaskIntoConstraints = false
+        spacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        strip.addArrangedSubview(spacer)
+
+        NSLayoutConstraint.activate([
+            strip.heightAnchor.constraint(equalToConstant: 24),
+        ])
+        return strip
+    }
+
+    @MainActor
+    @objc private func tabButtonClicked(_ sender: TabStripButton) {
+        guard let session = subscriptionSession else { return }
+        let paneID = sender.paneID
+        let tabID = sender.tabSurfaceID
+        Task {
+            try? await session.requestActivateTab(paneID: paneID, surfaceID: tabID)
+        }
     }
 
     // MARK: - Helpers

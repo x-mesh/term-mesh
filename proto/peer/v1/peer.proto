@@ -209,11 +209,22 @@ message WorkspaceSplit {
 }
 
 message WorkspacePane {
+  // surface_id of the currently *active* tab in this bonsplit pane.
   bytes surface_id = 1;
   string title = 2;
   uint32 cols = 3;
   uint32 rows = 4;
   string cwd = 5;
+  // Every tab the host has stacked in this bonsplit pane (Phase E-4).
+  // The active one's surface_id matches `surface_id` above; clients
+  // can render the rest as a tab bar and ask the host to activate one
+  // via WorkspaceControl.activate_tab.
+  repeated PaneTab tabs = 6;
+}
+
+message PaneTab {
+  bytes surface_id = 1;
+  string title = 2;
 }
 
 // ============================================================
@@ -233,6 +244,7 @@ message WorkspaceControl {
     FocusPaneRequest focus_pane = 3;
     SetDividerPositionRequest set_divider = 4;
     NewTabRequest new_tab = 5;
+    ActivateTabRequest activate_tab = 6;
   }
 }
 
@@ -263,6 +275,14 @@ message NewTabRequest {
   // new terminal tab should appear. The host resolves it back to the
   // pane id and creates a new tab there.
   bytes pane_id = 1;
+}
+
+message ActivateTabRequest {
+  // surfaceID of any pane that lives in the bonsplit pane whose tab
+  // strip we're operating on (typically the currently-active pane).
+  bytes pane_id = 1;
+  // surfaceID of the tab to make active.
+  bytes surface_id = 2;
 }
 
 // ============================================================

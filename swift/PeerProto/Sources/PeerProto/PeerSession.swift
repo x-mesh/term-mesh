@@ -200,6 +200,21 @@ public actor PeerSession {
         }
     }
 
+    /// Ask the host to switch the active tab in the bonsplit pane
+    /// hosting `paneID` to the tab whose surface is `surfaceID`.
+    /// Fire-and-forget; the host pushes the resulting layout via
+    /// `WorkspaceLayoutChanged`.
+    public func requestActivateTab(paneID: Data, surfaceID: Data) async throws {
+        try await sendEnvelope { env in
+            var req = Termmesh_Peer_V1_ActivateTabRequest()
+            req.paneID = paneID
+            req.surfaceID = surfaceID
+            var ctl = Termmesh_Peer_V1_WorkspaceControl()
+            ctl.activateTab = req
+            env.workspaceControl = ctl
+        }
+    }
+
     // MARK: - AttachSurface
 
     public func attachSurface(
