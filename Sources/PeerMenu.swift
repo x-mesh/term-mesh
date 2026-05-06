@@ -49,6 +49,16 @@ enum PeerMenu {
         item.target = PeerCoordinator.shared
         return item
     }
+
+    static func relayWorkspaceSSHItem() -> NSMenuItem {
+        let item = NSMenuItem(
+            title: "Connect to Remote Peer Workspace (SSH)…",
+            action: #selector(PeerCoordinator.promptAndRunRelayWorkspaceSSH(_:)),
+            keyEquivalent: ""
+        )
+        item.target = PeerCoordinator.shared
+        return item
+    }
 }
 
 @MainActor
@@ -60,6 +70,137 @@ final class PeerCoordinator: NSObject {
     private var openConsoles: [PeerConsoleWindowController] = []
     private var openRelays: [PeerRelayWindowController] = []
     private var openWorkspaceRelays: [PeerRelayWorkspaceWindowController] = []
+    /// Active SSH tunnels keyed by the controller they back. The
+    /// tunnel must outlive the relay window; dropped tunnels yank the
+    /// forwarded socket out from under the relay sessions.
+    private var sshTunnels: [ObjectIdentifier: PeerSSHTunnel] = [:]
+
+    @objc func promptAndRunRelayWorkspaceSSH(_ sender: Any?) {
+        let alert = NSAlert()
+        alert.messageText = "Connect to Remote Peer Workspace via SSH"
+        alert.informativeText = "Tunnels the host's peer socket through `ssh -L`. Provide an SSH target (user@host or ssh-config alias) and the path of the remote peer server's Unix socket."
+
+        let stack = NSStackView(frame: NSRect(x: 0, y: 0, width: 380, height: 60))
+        stack.orientation = .vertical
+        stack.alignment = .leading
+        stack.spacing = 4
+
+        let targetLabel = NSTextField(labelWithString: "SSH target (user@host):")
+        let targetField = NSTextField(frame: NSRect(x: 0, y: 0, width: 380, height: 24))
+        targetField.placeholderString = "user@mac-mini.local"
+        let remoteLabel = NSTextField(labelWithString: "Remote peer socket:")
+        let remoteField = NSTextField(frame: NSRect(x: 0, y: 0, width: 380, height: 24))
+        remoteField.stringValue = "/tmp/termmesh-app-peer.sock"
+
+        for v in [targetLabel, targetField, remoteLabel, remoteField] {
+            stack.addArrangedSubview(v)
+        }
+        stack.frame = NSRect(x: 0, y: 0, width: 380, height: 110)
+        alert.accessoryView = stack
+        alert.addButton(withTitle: "Connect")
+        alert.addButton(withTitle: "Cancel")
+
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        let target = targetField.stringValue.trimmingCharacters(in: .whitespaces)
+        let remote = remoteField.stringValue.trimmingCharacters(in: .whitespaces)
+        guard !target.isEmpty, !remote.isEmpty else { return }
+
+        Task {
+            let tunnel = PeerSSHTunnel(sshTarget: target, remoteSockPath: remote)
+            do {
+                try await tunnel.start()
+            } catch {
+                await MainActor.run {
+                    self.showAlert(title: "SSH Tunnel Failed",
+                                   body: String(describing: error))
+                }
+                return
+            }
+            await self.openWorkspaceRelay(
+                hostSockPath: tunnel.localSockPath,
+                titleSuffix: " · \(target)",
+                tunnel: tunnel
+            )
+        }
+    }
+
+    /// Shared workflow: enumerate workspaces over a `PeerRelayConnection`
+    /// rooted at `hostSockPath`, prompt for one when there are multiple,
+    /// open a `PeerRelayWorkspaceWindowController` and own its lifetime.
+    /// `tunnel` (when non-nil) is held alive until the controller closes
+    /// and torn down on close.
+    private func openWorkspaceRelay(hostSockPath: String,
+                                    titleSuffix: String = "",
+                                    tunnel: PeerSSHTunnel? = nil) async {
+        let probe: PeerRelayConnection
+        do {
+            probe = try await PeerRelaySession.connectAndList(hostSockPath: hostSockPath)
+        } catch {
+            tunnel?.stop()
+            await MainActor.run {
+                self.showAlert(title: "Peer Workspace Failed",
+                               body: String(describing: error))
+            }
+            return
+        }
+        let workspaces: [Termmesh_Peer_V1_Workspace]
+        do {
+            workspaces = try await probe.session.listWorkspaces()
+        } catch {
+            await probe.cancel()
+            tunnel?.stop()
+            await MainActor.run {
+                self.showAlert(title: "Peer Workspace Failed",
+                               body: "listWorkspaces failed: \(error)")
+            }
+            return
+        }
+        await probe.cancel()
+
+        guard !workspaces.isEmpty else {
+            tunnel?.stop()
+            await MainActor.run {
+                self.showAlert(title: "Peer Workspace Failed",
+                               body: "Host did not return any workspaces.")
+            }
+            return
+        }
+
+        let chosen: Termmesh_Peer_V1_Workspace?
+        if workspaces.count == 1 {
+            chosen = workspaces[0]
+        } else {
+            chosen = await MainActor.run {
+                self.promptForWorkspaceSelection(from: workspaces)
+            }
+        }
+        guard let chosen else {
+            tunnel?.stop()
+            return
+        }
+
+        await MainActor.run {
+            let controller = PeerRelayWorkspaceWindowController(
+                hostSockPath: hostSockPath,
+                workspace: chosen
+            )
+            self.openWorkspaceRelays.append(controller)
+            if let tunnel {
+                self.sshTunnels[ObjectIdentifier(controller)] = tunnel
+                if !titleSuffix.isEmpty {
+                    controller.window?.title += titleSuffix
+                }
+            }
+            controller.onClose = { [weak self, weak controller] in
+                guard let self, let controller else { return }
+                self.openWorkspaceRelays.removeAll { $0 === controller }
+                if let stale = self.sshTunnels.removeValue(forKey: ObjectIdentifier(controller)) {
+                    stale.stop()
+                }
+            }
+            controller.show()
+        }
+    }
 
     @objc func promptAndRunRelayWorkspace(_ sender: Any?) {
         let alert = NSAlert()
