@@ -297,65 +297,42 @@ final class PeerRelaySession {
         let surfaceID = self.surfaceID
 
         pumpTask = Task {
-            func pLog(_ msg: String) {
-                let line = "\(Date()): [pump] \(msg)\n"
-                if let data = line.data(using: .utf8) {
-                    let url = URL(fileURLWithPath: "/tmp/peer-relay-trace.log")
-                    if let fh = try? FileHandle(forWritingTo: url) {
-                        fh.seekToEndOfFile(); fh.write(data); try? fh.close()
-                    }
-                }
-            }
-
             // Host → relay: receive PtyData frames, write to relay socket.
             let hostToRelay = Task {
-                pLog("hostToRelay started")
-                var count = 0
                 while !Task.isCancelled {
                     let msg: PeerIncomingMessage
                     do {
                         msg = try await session.receiveNextMessage()
                     } catch {
-                        pLog("hostToRelay: receiveNextMessage error: \(error)")
                         try? relay.writeFrame(type: kTypeGoodbye, payload: Data("host-error".utf8))
                         break
                     }
-                    count += 1
                     switch msg {
                     case .ptyData(_, _, let data):
-                        pLog("hostToRelay: ptyData #\(count) \(data.count)B")
                         do {
                             try relay.writeFrame(type: kTypePtyData, payload: data)
                         } catch {
-                            pLog("hostToRelay: writeFrame error: \(error)")
                             break
                         }
-                    case .goodbye(let reason):
-                        pLog("hostToRelay: host sent goodbye: \(reason)")
+                    case .goodbye:
                         try? relay.writeFrame(type: kTypeGoodbye, payload: Data("host-goodbye".utf8))
                         return
                     default:
-                        pLog("hostToRelay: ignoring msg #\(count): \(msg)")
                         break
                     }
                 }
-                pLog("hostToRelay: exiting, calling disconnect")
                 await self.disconnect()
             }
 
             // Relay → host: read frames from relay socket, forward to PeerSession.
             let relayToHost = Task {
-                pLog("relayToHost started")
                 while !Task.isCancelled {
                     let frame: (type: UInt8, payload: Data)
                     do {
                         frame = try await Task.detached { try relay.readFrame() }.value
                     } catch {
-                        pLog("relayToHost: readFrame error: \(error)")
                         break
                     }
-                    let hex = frame.payload.prefix(16).map { String(format: "%02x", $0) }.joined(separator: " ")
-                    pLog("relayToHost: got frame type=0x\(String(frame.type, radix: 16)) size=\(frame.payload.count) hex=[\(hex)]")
                     switch frame.type {
                     case kTypeKeyInput:
                         try? await session.sendInput(surfaceID: surfaceID, keys: frame.payload)
@@ -366,18 +343,14 @@ final class PeerRelaySession {
                         let rows = UInt32(UInt16(littleEndian: frame.payload.withUnsafeBytes {
                             $0.loadUnaligned(fromByteOffset: 2, as: UInt16.self)
                         }))
-                        pLog("relayToHost: resize \(cols)x\(rows)")
                         try? await session.sendResize(surfaceID: surfaceID, cols: cols, rows: rows)
                     case kTypeGoodbye:
-                        pLog("relayToHost: relay sent goodbye")
                         try? await session.sendGoodbye(reason: "relay disconnected")
                         return
                     default:
-                        pLog("relayToHost: unknown frame type 0x\(String(frame.type, radix: 16))")
                         break
                     }
                 }
-                pLog("relayToHost: exiting, calling disconnect")
                 await self.disconnect()
             }
 

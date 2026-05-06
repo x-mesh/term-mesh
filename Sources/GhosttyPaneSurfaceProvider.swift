@@ -75,6 +75,16 @@ final class GhosttyPaneSurfaceProvider: PeerSurfaceProvider {
         let ctx = PtyTapContext(continuation: continuation, surfaceRef: ts)
         let ctxPtr = Unmanaged.passRetained(ctx).toOpaque()
 
+        // Send a snapshot of the current viewport so the relay window
+        // shows existing content immediately instead of starting blank.
+        // Yielded before the callback is registered so it's guaranteed
+        // to land before any new PTY bytes. ANSI styling is lost (text
+        // only); fullscreen TUIs (vim, less, htop) won't redraw without
+        // SIGWINCH and require manual refresh.
+        if let snapshot = readPaneSnapshot(sfcPtr) {
+            continuation.yield(snapshot)
+        }
+
         // Register the C tap under renderer_state.mutex in Ghostty.
         ghostty_surface_set_pty_data_callback(sfcPtr, ptyTapCallback, ctxPtr)
 
@@ -338,6 +348,52 @@ private func sendPeerCtrlLetterKey(_ surface: ghostty_surface_t, keycode: UInt32
 
     keyEvent.action = GHOSTTY_ACTION_RELEASE
     _ = ghostty_surface_key(surface, keyEvent)
+}
+
+/// Read the current viewport text via ghostty_surface_read_text and
+/// wrap it in an ANSI clear+home prefix so the attaching client sees
+/// the host's current screen instead of a blank canvas.
+@MainActor
+private func readPaneSnapshot(_ surface: ghostty_surface_t) -> Data? {
+    let topLeft = ghostty_point_s(
+        tag: GHOSTTY_POINT_VIEWPORT,
+        coord: GHOSTTY_POINT_COORD_TOP_LEFT,
+        x: 0, y: 0
+    )
+    let bottomRight = ghostty_point_s(
+        tag: GHOSTTY_POINT_VIEWPORT,
+        coord: GHOSTTY_POINT_COORD_BOTTOM_RIGHT,
+        x: 0, y: 0
+    )
+    let selection = ghostty_selection_s(
+        top_left: topLeft,
+        bottom_right: bottomRight,
+        rectangle: true
+    )
+    var out = ghostty_text_s()
+    guard ghostty_surface_read_text(surface, selection, &out) else { return nil }
+    defer { ghostty_surface_free_text(surface, &out) }
+    guard let ptr = out.text, out.text_len > 0 else { return nil }
+
+    let raw = Data(bytes: ptr, count: Int(out.text_len))
+    // Convert bare LFs to CR+LF so each line lands on column 0 in the
+    // remote terminal emulator. Already-CRLF input is left untouched.
+    var body = Data()
+    body.reserveCapacity(raw.count + 16)
+    var prev: UInt8 = 0
+    for b in raw {
+        if b == 0x0a && prev != 0x0d {
+            body.append(0x0d)
+        }
+        body.append(b)
+        prev = b
+    }
+
+    var snapshot = Data()
+    snapshot.append(contentsOf: [0x1b, 0x5b, 0x32, 0x4a]) // ESC [ 2 J — clear screen
+    snapshot.append(contentsOf: [0x1b, 0x5b, 0x48])       // ESC [ H   — cursor home
+    snapshot.append(body)
+    return snapshot
 }
 
 private func surfaceIDBytes(_ id: UUID) -> Data {

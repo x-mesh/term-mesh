@@ -223,40 +223,19 @@ fn main() {
     });
 
     // Socket reader (main thread): receives PtyData and writes to stdout.
-    let log_path = "/tmp/peer-relay-binary.log";
-    let mut rlog = std::fs::OpenOptions::new()
-        .create(true).append(true).open(log_path).ok();
-    macro_rules! rlog {
-        ($($arg:tt)*) => {
-            if let Some(ref mut f) = rlog {
-                let _ = writeln!(f, "[relay-bin] {}", format!($($arg)*));
-            }
-        };
-    }
-    rlog!("main loop starting");
     let stdout = io::stdout();
     loop {
         match read_frame(&mut sock) {
-            Err(e) => { rlog!("read_frame error: {e}"); break; }
+            Err(_) => break,
             Ok((TYPE_PTY_DATA, payload)) => {
                 let mut out = stdout.lock();
-                if let Err(e) = out.write_all(&payload) {
-                    rlog!("stdout write_all error: {e} (payload {}B)", payload.len());
-                    break;
-                }
-                if let Err(e) = out.flush() {
-                    rlog!("stdout flush error: {e}");
-                    break;
-                }
+                if out.write_all(&payload).is_err() { break; }
+                if out.flush().is_err() { break; }
             }
-            Ok((TYPE_GOODBYE, reason)) => {
-                rlog!("got GOODBYE: {}", String::from_utf8_lossy(&reason));
-                break;
-            }
-            Ok((t, _)) => { rlog!("unknown frame type 0x{t:02x}"); }
+            Ok((TYPE_GOODBYE, _)) => break,
+            Ok((_, _)) => {}
         }
     }
-    rlog!("main loop exited");
 
     STOPPING.store(true, Ordering::Relaxed);
 

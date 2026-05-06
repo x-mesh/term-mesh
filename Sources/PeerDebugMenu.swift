@@ -67,33 +67,17 @@ final class PeerDebugCoordinator: NSObject {
         guard !path.isEmpty else { return }
 
         Task {
-            func traceLog(_ msg: String) {
-                let line = "\(Date()): [peer-relay] \(msg)\n"
-                if let data = line.data(using: .utf8) {
-                    let url = URL(fileURLWithPath: "/tmp/peer-relay-trace.log")
-                    if let fh = try? FileHandle(forWritingTo: url) {
-                        fh.seekToEndOfFile(); fh.write(data); try? fh.close()
-                    } else {
-                        try? data.write(to: url)
-                    }
-                }
-            }
-            traceLog("task started, connecting to \(path)")
             do {
                 let session = try await PeerRelaySession.create(hostSockPath: path)
-                traceLog("session created, preparing listener")
                 try session.prepareListener()
-                traceLog("listener ready at \(session.relaySockPath)")
                 let controller = PeerRelayWindowController(session: session)
                 self.openRelays.append(controller)
                 controller.onClose = { [weak self, weak controller] in
                     guard let self, let controller else { return }
                     self.openRelays.removeAll { $0 === controller }
                 }
-                traceLog("showing window")
                 controller.show()
             } catch {
-                traceLog("ERROR: \(error)")
                 self.showAlert(title: "Peer Relay Failed", body: String(describing: error))
             }
         }

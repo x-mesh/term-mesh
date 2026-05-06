@@ -1,6 +1,6 @@
 # Peer Federation — Implementation Status
 
-Last updated: 2026-04-24
+Last updated: 2026-05-06
 Branch: `feat/peer-federation`
 
 This document tracks the implementation progress of peer federation phases.
@@ -24,7 +24,7 @@ Phase C  — In-app Swift peer client + Ghostty relay window
     C-3c.3.1 Swift peer server skeleton: listen + handshake + list          ✅ DONE
     C-3c.3.2 Swift peer server: attach, streaming, Input routing            ✅ DONE
     C-3c.3.3 term-mesh.app runs peer server (GhosttyPaneSurfaceProvider)   ✅ DONE
-  C-4    — Ghostty relay window (real Ghostty surface shows remote PTY)     🚧 IN PROGRESS
+  C-4    — Ghostty relay window (real Ghostty surface shows remote PTY)     ✅ DONE
 Phase D  — Production integration (non-DEBUG), discovery UI, pairing        ⬜ TODO
 ```
 
@@ -74,65 +74,57 @@ Phase D  — Production integration (non-DEBUG), discovery UI, pairing        �
      _ = Darwin.fcntl(fd, F_SETFL, Darwin.fcntl(fd, F_GETFL) & ~O_NONBLOCK)
      ```
 
-### Current status (2026-04-24)
+5. **Bracketed-paste swallowing keystrokes** — `GhosttyPaneSurfaceProvider` initially routed all peer Input bytes through `ghostty_surface_text()`, which wraps content in `\e[200~…\e[201~`. Shells then treated CR / Tab / Ctrl-C as pasted whitespace instead of keystrokes, so commands typed in the relay window moved to the next line without executing and signals were silently dropped.
+   - Fix: route every peer byte through `ghostty_surface_key()` instead. Recognize 3-byte CSI arrow sequences, named keys (Return / Tab / Backspace / Escape) and Ctrl+letter (`0x01`–`0x1A` → `kVK_ANSI_<letter>` + `GHOSTTY_MODS_CTRL` with `text=nil` and `unshifted_codepoint = byte+0x60`). Mirrors the de5df7d Kitty-protocol fix.
+
+6. **Line-buffered relay stdin swallowed Tab / Ctrl-C / arrow keys** — without raw mode, the relay binary's stdin held single keystrokes in the kernel line buffer until Enter was pressed, so the host never saw them. Only complete `…\n` lines made it through.
+   - Fix: enable `cfmakeraw` + `VMIN=1, VTIME=0` on `STDIN_FILENO` at startup; restore the original termios via an RAII guard on exit.
+
+7. **Snapshot-on-attach** — early relay sessions started with a blank surface even though the host had a full screen of content; only new output appeared.
+   - Fix: read the current viewport via `ghostty_surface_read_text` and yield an `ESC[2J ESC[H` + text snapshot into the byte stream before registering the C tap callback.
+
+### Current status (2026-05-06)
 
 - Relay window opens ✅
-- Relay binary connects to relay socket ✅
-- Bidirectional pump starts ✅ (confirmed by trace log)
-- Resize frame (type=0x03) received and forwarded to host ✅
-- KeyInput (type=0x02) forwarded to host ✅
-- PtyData (type=0x01) forwarded from host to relay binary ✅
-- **Ghostty renders the relay binary's stdout** — ❓ unconfirmed (blank window observed)
+- Bidirectional pump (PtyData / KeyInput / Resize / Goodbye) ✅
+- Ghostty renders host PTY output in relay surface ✅
+- Enter / Tab / Backspace / Escape / arrow keys all execute on host ✅
+- Ctrl-C and other Ctrl+letter combinations interrupt on host ✅
+- Initial viewport snapshot on attach (no longer starts blank) ✅
+- Stable streaming over multi-minute sessions (no spurious disconnect) ✅
 
-### Test setup required
+### Test setup
 
-The peer server is `#if DEBUG` only (in `PeerDebugServer.swift`). Correct test flow:
+The peer server is `#if DEBUG` only (in `PeerDebugServer.swift`). Either flow works:
 
-1. Open a terminal window in the **c4 debug app**.
-2. In c4 debug app → menu → **"Start Peer Server… (debug)"** → path `/tmp/termmesh-app-peer.sock`.
-3. In c4 debug app → menu → **"Connect to Peer via Ghostty Relay… (debug)"** → same path.
-4. Relay window appears. Type in the relay window or in the host terminal.
+1. Launch the app with `TERMMESH_DEBUG_PEER_SERVER_PATH=/tmp/termmesh-app-peer.sock`
+   to auto-start the server, **or** click menu →
+   **"Start Peer Server… (debug)"**.
+2. Click menu → **"Connect to Peer via Ghostty Relay… (debug)"** with the
+   same socket path.
+3. Relay window appears with a snapshot of the host pane. Typing flows in
+   both directions; the host pane and the relay window stay in sync.
 
 ---
 
-## Open TODOs (Phase C-4)
-
-### P0 — must fix before C-4 is done
-
-- [ ] **Verify Ghostty renders relay stdout** — relay binary may be writing PTY data correctly but Ghostty may not be rendering it. Needs manual test with correct setup (peer server started first).
-- [ ] **Relay binary exit diagnosis** — relay binary exits ~10–28s after connect. Binary log (`/tmp/peer-relay-binary.log`) added; need to capture actual exit reason (`read_frame error` vs `stdout write error`).
-- [ ] **Screen replay on attach** — host sends no initial screen snapshot, so relay window starts blank. Need to trigger a redraw on the host side after attach (e.g., send `\x0c` clear+redraw, or add a snapshot mechanism to PeerSurfaceAttachment).
-- [ ] **Commit: squash WIP commits** — 6 WIP commits since `dd43802` need to be squashed into a clean C-4 commit.
+## Open TODOs (post-Phase C-4)
 
 ### P1 — nice to have before Phase D
 
-- [ ] **Remove trace logging** — `/tmp/peer-relay-trace.log` writes and `pLog()` in `PeerRelaySession.swift` are for diagnostics only; remove before production.
-- [ ] **Remove binary debug logging** — `rlog!` macro and `/tmp/peer-relay-binary.log` in relay binary; remove before release build.
-- [ ] **Relay socket cleanup on crash** — if the app crashes, stale relay socket files accumulate in `/tmp/`. Add cleanup at startup.
-- [ ] **Multiple relay windows** — `PeerRelaySession.create()` always picks `surfaces.first`; add surface picker UI.
-- [ ] **Error UX** — "host has no attachable surfaces" and other relay errors currently show an NSAlert. Should be surfaced more gracefully.
+- [ ] **Snapshot styling** — `readPaneSnapshot` currently sends plain text
+      (no colors / cursor position). Look into a richer per-cell read or a
+      SIGWINCH wiggle so fullscreen TUIs (vim, less, htop) redraw on attach.
+- [ ] **Relay socket cleanup on crash** — if the app crashes, stale relay
+      socket files accumulate in `/tmp/`. Clean up at startup.
+- [ ] **Multiple relay windows / surface picker** — `PeerRelaySession.create()`
+      always picks `surfaces.first(where: { $0.attachable })`; add UI to pick.
+- [ ] **Error UX** — relay errors currently show an NSAlert; should integrate
+      into the main UI more gracefully.
 
 ### P2 — Phase D prep
 
-- [ ] Remove `#if DEBUG` guards from PeerRelaySession, PeerRelayWindowController, GhosttyPaneSurfaceProvider.
+- [ ] Remove `#if DEBUG` guards from PeerRelaySession, PeerRelayWindowController,
+      GhosttyPaneSurfaceProvider.
 - [ ] Auto-start peer server at app launch (no manual menu step required).
 - [ ] Surface relay window in main UI (not just debug menu).
 - [ ] Bonjour discovery for host socket path.
-
----
-
-## Diagnostics
-
-```bash
-# Swift-side pump trace
-tail -f /tmp/peer-relay-trace.log
-
-# Relay binary exit reason
-tail -f /tmp/peer-relay-binary.log
-
-# Check relay binary is running
-pgrep -l term-mesh-peer-relay
-
-# Check relay socket connections
-lsof -U | grep tm-peer-relay
-```
