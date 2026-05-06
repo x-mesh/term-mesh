@@ -705,6 +705,16 @@ extension Workspace: BonsplitDelegate {
         _ = snapshot
         scheduleTerminalGeometryReconcile()
         scheduleFocusReconcile()
+        #if DEBUG
+        // Notify any peer-federation observers (PeerServer broadcast)
+        // so attached clients can patch their NSSplitView trees in
+        // place instead of going stale or needing a reconnect.
+        NotificationCenter.default.post(
+            name: .peerWorkspaceLayoutDidChange,
+            object: nil,
+            userInfo: ["workspaceID": self.id]
+        )
+        #endif
     }
 
     // No post-close polling refresh loop: we rely on view invariants and Ghostty's wakeups.

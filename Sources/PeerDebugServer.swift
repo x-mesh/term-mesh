@@ -36,6 +36,8 @@ final class PeerDebugServerCoordinator: NSObject {
 
     private var server: PeerServer?
     private var socketPath: String?
+    private var provider: GhosttyPaneSurfaceProvider?
+    private var layoutObserver: NSObjectProtocol?
 
     /// Launch-time hook. If `TERMMESH_DEBUG_PEER_SERVER_PATH` is set,
     /// start a peer server at that path with the Echo provider. Lets a
@@ -80,8 +82,10 @@ final class PeerDebugServerCoordinator: NSObject {
             return
         }
         self.server = nil
+        self.provider = nil
         let oldPath = socketPath
         socketPath = nil
+        uninstallLayoutChangeBridge()
         Task {
             await server.stop()
             await MainActor.run {
@@ -105,6 +109,8 @@ final class PeerDebugServerCoordinator: NSObject {
             try await server.start()
             self.server = server
             self.socketPath = path
+            self.provider = provider
+            installLayoutChangeBridge(server: server, provider: provider)
             NSLog("[peer-debug] server listening on %@", path)
             if !silent {
                 showInfo(
@@ -129,6 +135,41 @@ final class PeerDebugServerCoordinator: NSObject {
         }
     }
 
+    /// Bridge from `Workspace+BonsplitDelegate.didChangeGeometry`'s
+    /// NotificationCenter post to the peer server's broadcast API.
+    /// Each notification carries a `workspaceID`; we fetch the latest
+    /// `WorkspaceLayout` from the provider and push it to all
+    /// connected sessions.
+    private func installLayoutChangeBridge(server: PeerServer,
+                                           provider: GhosttyPaneSurfaceProvider) {
+        layoutObserver = NotificationCenter.default.addObserver(
+            forName: .peerWorkspaceLayoutDidChange,
+            object: nil,
+            queue: .main
+        ) { [weak server, weak provider] note in
+            guard let server, let provider,
+                  let workspaceID = note.userInfo?["workspaceID"] as? UUID
+            else { return }
+            let idBytes = withUnsafeBytes(of: workspaceID.uuid) { Data($0) }
+            Task {
+                let workspaces = await provider.listWorkspaces()
+                guard let updated = workspaces.first(where: { $0.workspaceID == idBytes })
+                else { return }
+                await server.broadcastWorkspaceLayoutChanged(
+                    workspaceID: idBytes,
+                    layout: updated.layout
+                )
+            }
+        }
+    }
+
+    private func uninstallLayoutChangeBridge() {
+        if let observer = layoutObserver {
+            NotificationCenter.default.removeObserver(observer)
+            layoutObserver = nil
+        }
+    }
+
     private func showInfo(title: String, body: String) {
         let alert = NSAlert()
         alert.messageText = title
@@ -137,5 +178,14 @@ final class PeerDebugServerCoordinator: NSObject {
         alert.addButton(withTitle: "OK")
         alert.runModal()
     }
+}
+
+extension Notification.Name {
+    /// Posted by `Workspace` when bonsplit reports a layout change
+    /// (split add/remove, divider drag). userInfo carries
+    /// `["workspaceID": UUID]`. Observed by
+    /// `PeerDebugServerCoordinator` which pushes the refreshed layout
+    /// to attached peer clients.
+    static let peerWorkspaceLayoutDidChange = Notification.Name("PeerWorkspaceLayoutDidChange")
 }
 #endif

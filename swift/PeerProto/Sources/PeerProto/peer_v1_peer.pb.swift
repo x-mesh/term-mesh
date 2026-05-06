@@ -908,6 +908,18 @@ public struct Termmesh_Peer_V1_WorkspaceUpdate: Sendable {
     set {kind = .split(newValue)}
   }
 
+  /// Pushed by the host whenever a workspace's split tree changes
+  /// (divider drag, new split, pane close, ...). Carries the full
+  /// refreshed `WorkspaceLayout` so attached clients can diff
+  /// against their current state and patch the layout in place.
+  public var workspaceLayout: Termmesh_Peer_V1_WorkspaceLayoutChanged {
+    get {
+      if case .workspaceLayout(let v)? = kind {return v}
+      return Termmesh_Peer_V1_WorkspaceLayoutChanged()
+    }
+    set {kind = .workspaceLayout(newValue)}
+  }
+
   public var unknownFields = SwiftProtobuf.UnknownStorage()
 
   public enum OneOf_Kind: Equatable, Sendable {
@@ -916,6 +928,11 @@ public struct Termmesh_Peer_V1_WorkspaceUpdate: Sendable {
     case retitled(Termmesh_Peer_V1_SurfaceRetitled)
     case meta(Termmesh_Peer_V1_WorkspaceMeta)
     case split(Termmesh_Peer_V1_SplitChanged)
+    /// Pushed by the host whenever a workspace's split tree changes
+    /// (divider drag, new split, pane close, ...). Carries the full
+    /// refreshed `WorkspaceLayout` so attached clients can diff
+    /// against their current state and patch the layout in place.
+    case workspaceLayout(Termmesh_Peer_V1_WorkspaceLayoutChanged)
 
   }
 
@@ -1003,6 +1020,29 @@ public struct Termmesh_Peer_V1_SplitChanged: Sendable {
   public var unknownFields = SwiftProtobuf.UnknownStorage()
 
   public init() {}
+}
+
+public struct Termmesh_Peer_V1_WorkspaceLayoutChanged: Sendable {
+  // SwiftProtobuf.Message conformance is added in an extension below. See the
+  // `Message` and `Message+*Additions` files in the SwiftProtobuf library for
+  // methods supported on all messages.
+
+  public var workspaceID: Data = Data()
+
+  public var layout: Termmesh_Peer_V1_WorkspaceLayout {
+    get {_layout ?? Termmesh_Peer_V1_WorkspaceLayout()}
+    set {_layout = newValue}
+  }
+  /// Returns true if `layout` has been explicitly set.
+  public var hasLayout: Bool {self._layout != nil}
+  /// Clears the value of `layout`. Subsequent reads from it will return its default value.
+  public mutating func clearLayout() {self._layout = nil}
+
+  public var unknownFields = SwiftProtobuf.UnknownStorage()
+
+  public init() {}
+
+  fileprivate var _layout: Termmesh_Peer_V1_WorkspaceLayout? = nil
 }
 
 public struct Termmesh_Peer_V1_Ping: Sendable {
@@ -2699,7 +2739,7 @@ extension Termmesh_Peer_V1_DataAck: SwiftProtobuf.Message, SwiftProtobuf._Messag
 
 extension Termmesh_Peer_V1_WorkspaceUpdate: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
   public static let protoMessageName: String = _protobuf_package + ".WorkspaceUpdate"
-  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{1}added\0\u{1}removed\0\u{1}retitled\0\u{1}meta\0\u{1}split\0")
+  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{1}added\0\u{1}removed\0\u{1}retitled\0\u{1}meta\0\u{1}split\0\u{3}workspace_layout\0")
 
   public mutating func decodeMessage<D: SwiftProtobuf.Decoder>(decoder: inout D) throws {
     while let fieldNumber = try decoder.nextFieldNumber() {
@@ -2772,6 +2812,19 @@ extension Termmesh_Peer_V1_WorkspaceUpdate: SwiftProtobuf.Message, SwiftProtobuf
           self.kind = .split(v)
         }
       }()
+      case 6: try {
+        var v: Termmesh_Peer_V1_WorkspaceLayoutChanged?
+        var hadOneofValue = false
+        if let current = self.kind {
+          hadOneofValue = true
+          if case .workspaceLayout(let m) = current {v = m}
+        }
+        try decoder.decodeSingularMessageField(value: &v)
+        if let v = v {
+          if hadOneofValue {try decoder.handleConflictingOneOf()}
+          self.kind = .workspaceLayout(v)
+        }
+      }()
       default: break
       }
     }
@@ -2802,6 +2855,10 @@ extension Termmesh_Peer_V1_WorkspaceUpdate: SwiftProtobuf.Message, SwiftProtobuf
     case .split?: try {
       guard case .split(let v)? = self.kind else { preconditionFailure() }
       try visitor.visitSingularMessageField(value: v, fieldNumber: 5)
+    }()
+    case .workspaceLayout?: try {
+      guard case .workspaceLayout(let v)? = self.kind else { preconditionFailure() }
+      try visitor.visitSingularMessageField(value: v, fieldNumber: 6)
     }()
     case nil: break
     }
@@ -2994,6 +3051,45 @@ extension Termmesh_Peer_V1_SplitChanged: SwiftProtobuf.Message, SwiftProtobuf._M
   public static func ==(lhs: Termmesh_Peer_V1_SplitChanged, rhs: Termmesh_Peer_V1_SplitChanged) -> Bool {
     if lhs.paneID != rhs.paneID {return false}
     if lhs.snapshot != rhs.snapshot {return false}
+    if lhs.unknownFields != rhs.unknownFields {return false}
+    return true
+  }
+}
+
+extension Termmesh_Peer_V1_WorkspaceLayoutChanged: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
+  public static let protoMessageName: String = _protobuf_package + ".WorkspaceLayoutChanged"
+  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{3}workspace_id\0\u{1}layout\0")
+
+  public mutating func decodeMessage<D: SwiftProtobuf.Decoder>(decoder: inout D) throws {
+    while let fieldNumber = try decoder.nextFieldNumber() {
+      // The use of inline closures is to circumvent an issue where the compiler
+      // allocates stack space for every case branch when no optimizations are
+      // enabled. https://github.com/apple/swift-protobuf/issues/1034
+      switch fieldNumber {
+      case 1: try { try decoder.decodeSingularBytesField(value: &self.workspaceID) }()
+      case 2: try { try decoder.decodeSingularMessageField(value: &self._layout) }()
+      default: break
+      }
+    }
+  }
+
+  public func traverse<V: SwiftProtobuf.Visitor>(visitor: inout V) throws {
+    // The use of inline closures is to circumvent an issue where the compiler
+    // allocates stack space for every if/case branch local when no optimizations
+    // are enabled. https://github.com/apple/swift-protobuf/issues/1034 and
+    // https://github.com/apple/swift-protobuf/issues/1182
+    if !self.workspaceID.isEmpty {
+      try visitor.visitSingularBytesField(value: self.workspaceID, fieldNumber: 1)
+    }
+    try { if let v = self._layout {
+      try visitor.visitSingularMessageField(value: v, fieldNumber: 2)
+    } }()
+    try unknownFields.traverse(visitor: &visitor)
+  }
+
+  public static func ==(lhs: Termmesh_Peer_V1_WorkspaceLayoutChanged, rhs: Termmesh_Peer_V1_WorkspaceLayoutChanged) -> Bool {
+    if lhs.workspaceID != rhs.workspaceID {return false}
+    if lhs._layout != rhs._layout {return false}
     if lhs.unknownFields != rhs.unknownFields {return false}
     return true
   }

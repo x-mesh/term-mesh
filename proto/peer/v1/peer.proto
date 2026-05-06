@@ -308,6 +308,11 @@ message WorkspaceUpdate {
     SurfaceRetitled retitled = 3;
     WorkspaceMeta meta = 4;
     SplitChanged split = 5;
+    // Pushed by the host whenever a workspace's split tree changes
+    // (divider drag, new split, pane close, ...). Carries the full
+    // refreshed `WorkspaceLayout` so attached clients can diff
+    // against their current state and patch the layout in place.
+    WorkspaceLayoutChanged workspace_layout = 6;
   }
 }
 
@@ -337,6 +342,11 @@ message SplitChanged {
   // Opaque tree snapshot; sidebar decoder will be versioned separately.
   // Placeholder until the split-tree schema is frozen.
   bytes snapshot = 2;
+}
+
+message WorkspaceLayoutChanged {
+  bytes workspace_id = 1;
+  WorkspaceLayout layout = 2;
 }
 
 // ============================================================

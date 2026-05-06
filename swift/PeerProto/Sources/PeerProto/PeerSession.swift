@@ -40,6 +40,7 @@ public enum PeerIncomingMessage: Sendable {
     case workspaceSurfaceAdded(Termmesh_Peer_V1_SurfaceInfo)
     case workspaceSurfaceRemoved(surfaceID: Data)
     case workspaceSurfaceRetitled(surfaceID: Data, title: String)
+    case workspaceLayoutChanged(workspaceID: Data, layout: Termmesh_Peer_V1_WorkspaceLayout)
     case error(code: UInt32, message: String)
     case goodbye(reason: String)
     case other
@@ -200,6 +201,8 @@ public actor PeerSession {
                 return .workspaceSurfaceRemoved(surfaceID: r.surfaceID)
             case .retitled(let rt):
                 return .workspaceSurfaceRetitled(surfaceID: rt.surfaceID, title: rt.title)
+            case .workspaceLayout(let wl):
+                return .workspaceLayoutChanged(workspaceID: wl.workspaceID, layout: wl.layout)
             default:
                 return .other
             }

@@ -303,6 +303,19 @@ public actor PeerServer {
         activeSessions.removeAll { $0 === session }
     }
 
+    /// Push a `WorkspaceLayoutChanged` update to every connected
+    /// session. Callers (term-mesh.app's PeerDebugServerCoordinator)
+    /// invoke this when bonsplit reports a layout change so attached
+    /// clients can patch their local NSSplitView trees.
+    public func broadcastWorkspaceLayoutChanged(
+        workspaceID: Data,
+        layout: Termmesh_Peer_V1_WorkspaceLayout
+    ) async {
+        for session in activeSessions {
+            try? await session.pushWorkspaceLayoutChanged(workspaceID: workspaceID, layout: layout)
+        }
+    }
+
     fileprivate func register(_ session: PeerServerSession) {
         activeSessions.append(session)
     }
@@ -525,6 +538,24 @@ actor PeerServerSession {
     func close() async {
         await teardownAttachments()
         await connection.close()
+    }
+
+    /// Server-initiated push of a workspace layout change. Sent only
+    /// after the session reaches the `.ready` state — callers should
+    /// avoid pushing during handshake.
+    func pushWorkspaceLayoutChanged(
+        workspaceID: Data,
+        layout: Termmesh_Peer_V1_WorkspaceLayout
+    ) async throws {
+        guard state == .ready else { return }
+        try await sendEnvelope { env in
+            var changed = Termmesh_Peer_V1_WorkspaceLayoutChanged()
+            changed.workspaceID = workspaceID
+            changed.layout = layout
+            var wu = Termmesh_Peer_V1_WorkspaceUpdate()
+            wu.workspaceLayout = changed
+            env.workspaceUpdate = wu
+        }
     }
 
     private func teardownAttachments() async {

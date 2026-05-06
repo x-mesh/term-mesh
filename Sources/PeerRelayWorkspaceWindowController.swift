@@ -2,17 +2,12 @@
 // inside a single NSWindow, arranged in NSSplitViews that mirror the
 // host workspace's bonsplit tree.
 //
-// Each pane in the workspace gets:
-//   * its own PeerRelayConnection (independent transport, so closing
-//     one pane does not tear down the others),
-//   * a PeerRelaySession driving a relay binary process,
-//   * a TerminalSurface whose "shell" is the relay binary, embedded
-//     in the appropriate NSSplitView leaf slot.
-//
-// The split tree from the host (`Termmesh_Peer_V1_WorkspaceLayout`) is
-// translated 1:1 to NSSplitView nesting. Divider positions are
-// re-applied after the window has its final size so percentages map
-// to actual pixels.
+// Phase W' adds live layout sync: a dedicated subscription PeerSession
+// listens for `WorkspaceLayoutChanged` push messages from the host and
+// applies them to the local NSSplitView tree. Pane reuse is keyed by
+// surfaceID — existing panes keep their PTY stream when the host
+// reshuffles the layout, and new/removed panes spawn / tear down their
+// PeerRelaySession on the fly.
 
 #if DEBUG
 import AppKit
@@ -20,23 +15,44 @@ import PeerProto
 
 @MainActor
 final class PeerRelayWorkspaceWindowController: NSWindowController, NSWindowDelegate {
+    // MARK: - Pane bookkeeping
+
+    /// Per-leaf state. We keep these alive across layout updates so a
+    /// host-side resize / split reshuffle doesn't flicker the relay
+    /// window's PTY streams.
+    private final class PaneSlot {
+        let surfaceID: Data
+        let session: PeerRelaySession
+        let surface: TerminalSurface
+        let view: NSView
+        init(surfaceID: Data, session: PeerRelaySession, surface: TerminalSurface, view: NSView) {
+            self.surfaceID = surfaceID
+            self.session = session
+            self.surface = surface
+            self.view = view
+        }
+    }
+
     private let hostSockPath: String
-    private let workspace: Termmesh_Peer_V1_Workspace
-    private var sessions: [PeerRelaySession] = []
-    // TerminalSurface owns the live ghostty_surface_t; without a
-    // strong reference here it deinits when buildPaneView returns,
-    // which frees the ghostty surface before Ghostty has a chance to
-    // spawn the relay binary as the surface's child shell.
-    private var terminalSurfaces: [TerminalSurface] = []
+    private var workspaceID: Data
+    private var currentLayout: Termmesh_Peer_V1_WorkspaceLayout
+    private var panesBySurfaceID: [Data: PaneSlot] = [:]
+    /// Splits the renderer needs to apply divider positions to after
+    /// the next layout pass. Cleared after each `applyPendingDividerPositions`.
     private var pendingDividerSetters: [(NSSplitView, CGFloat)] = []
+    private var subscriptionTask: Task<Void, Never>?
+    private var subscriptionTransport: UnixSocketTransport?
     private var startTask: Task<Void, Never>?
     private var isClosing = false
 
     var onClose: (@MainActor () -> Void)?
 
+    // MARK: - Init
+
     init(hostSockPath: String, workspace: Termmesh_Peer_V1_Workspace) {
         self.hostSockPath = hostSockPath
-        self.workspace = workspace
+        self.workspaceID = workspace.workspaceID
+        self.currentLayout = workspace.layout
 
         let initialSize = NSRect(x: 0, y: 0, width: 1024, height: 640)
         let window = NSWindow(
@@ -59,31 +75,14 @@ final class PeerRelayWorkspaceWindowController: NSWindowController, NSWindowDele
     func show() {
         window?.makeKeyAndOrderFront(nil)
 
-        // Build all relay sessions, then build the NSSplitView tree
-        // and mount the resulting view as the window content.
         startTask = Task { [weak self] in
             guard let self else { return }
             do {
-                let view = try await self.buildLayoutTree(self.workspace.layout)
-                await MainActor.run {
-                    guard let window = self.window else { return }
-                    let container = NSView(frame: window.contentLayoutRect)
-                    view.translatesAutoresizingMaskIntoConstraints = false
-                    container.addSubview(view)
-                    NSLayoutConstraint.activate([
-                        view.topAnchor.constraint(equalTo: container.topAnchor),
-                        view.bottomAnchor.constraint(equalTo: container.bottomAnchor),
-                        view.leadingAnchor.constraint(equalTo: container.leadingAnchor),
-                        view.trailingAnchor.constraint(equalTo: container.trailingAnchor),
-                    ])
-                    window.contentView = container
-                    self.applyPendingDividerPositions()
-                }
+                try await self.applyLayout(self.currentLayout)
+                await self.startSubscription()
             } catch {
-                NSLog("[peer-relay] workspace start failed: %@", String(describing: error))
-                await MainActor.run {
-                    self.window?.performClose(nil)
-                }
+                NSLog("[peer-ws] initial layout failed: %@", String(describing: error))
+                await MainActor.run { self.window?.performClose(nil) }
             }
         }
     }
@@ -95,89 +94,219 @@ final class PeerRelayWorkspaceWindowController: NSWindowController, NSWindowDele
         isClosing = true
         startTask?.cancel()
         startTask = nil
-        let toStop = sessions
-        sessions.removeAll()
+        subscriptionTask?.cancel()
+        subscriptionTask = nil
+        let transport = subscriptionTransport
+        subscriptionTransport = nil
+        let toStop = Array(panesBySurfaceID.values)
+        panesBySurfaceID.removeAll()
         Task {
-            for s in toStop {
-                await s.stop()
-            }
+            for slot in toStop { await slot.session.stop() }
+            await transport?.close()
         }
         onClose?()
     }
 
-    // MARK: - Tree → view
+    // MARK: - Subscription channel
+    //
+    // The probe connection used by PeerDebugMenu has been cancelled by
+    // the time the controller starts, and per-pane connections silently
+    // ignore non-PtyData messages. To receive `WorkspaceLayoutChanged`
+    // pushes we open one extra session that does nothing else.
 
-    /// Recursively walks the proto layout tree, building either an
-    /// NSSplitView (interior) or an embedded TerminalSurface
-    /// (leaf). Each leaf brings up its own PeerRelaySession, which we
-    /// retain on `sessions` so the streams keep running.
-    private func buildLayoutTree(_ layout: Termmesh_Peer_V1_WorkspaceLayout) async throws -> NSView {
-        switch layout.node {
-        case .pane(let pane):
-            return try await buildPaneView(pane)
-        case .split(let split):
-            let firstView = try await buildLayoutTree(split.first)
-            let secondView = try await buildLayoutTree(split.second)
-            return makeSplitView(orientation: split.orientation,
-                                 dividerPosition: CGFloat(split.dividerPosition),
-                                 first: firstView,
-                                 second: secondView)
-        case .none:
-            throw NSError(domain: "PeerRelayWorkspace", code: 1,
-                          userInfo: [NSLocalizedDescriptionKey: "empty layout node"])
+    private func startSubscription() async {
+        do {
+            let transport = try await UnixSocketTransport.connect(socketPath: hostSockPath)
+            let session = PeerSession(
+                read: { try await transport.read() },
+                write: { try await transport.write($0) }
+            )
+            _ = try await session.handshake()
+            subscriptionTransport = transport
+
+            subscriptionTask = Task { [weak self] in
+                while let self, !Task.isCancelled {
+                    let msg: PeerIncomingMessage
+                    do {
+                        msg = try await session.receiveNextMessage()
+                    } catch {
+                        return
+                    }
+                    if case .workspaceLayoutChanged(let wid, let layout) = msg {
+                        guard wid == self.workspaceID else { continue }
+                        do {
+                            try await self.applyLayout(layout)
+                            await MainActor.run { self.currentLayout = layout }
+                        } catch {
+                            NSLog("[peer-ws] applyLayout error: %@", String(describing: error))
+                        }
+                    }
+                    if case .goodbye = msg { return }
+                }
+            }
+        } catch {
+            NSLog("[peer-ws] subscription connect failed: %@", String(describing: error))
         }
     }
 
-    private func buildPaneView(_ pane: Termmesh_Peer_V1_WorkspacePane) async throws -> NSView {
-        // Each pane uses an independent connection so per-pane close
-        // doesn't cascade. PeerRelaySession.attach reuses the
-        // connection's session/transport, so we burn one handshake
-        // per pane — fine for local sockets and acceptable for SSH
-        // tunnels (the SSH multiplexer collapses them anyway).
-        let conn = try await PeerRelaySession.connectAndList(hostSockPath: hostSockPath)
+    // MARK: - Layout application
+    //
+    // applyLayout(_:) is the single entry point used by both the
+    // initial show() and every subsequent layout update push. It:
+    //   1. Walks the new layout, ensuring `panesBySurfaceID` has a
+    //      slot per leaf — new ones spawn a PeerRelaySession.
+    //   2. Builds a fresh NSView hierarchy that reuses existing slot
+    //      views, so PTY streams stay alive across reshuffles.
+    //   3. Replaces the window content view's child with the new tree.
+    //   4. Tears down slots whose surfaces are no longer in the tree.
 
-        // Find the matching surface in the freshly-listed set so we
-        // pick up any cols/rows updates since the workspace listing.
+    private func applyLayout(_ layout: Termmesh_Peer_V1_WorkspaceLayout) async throws {
+        let newSurfaceIDs = collectSurfaceIDs(layout)
+        // Spawn missing slots first (async, may take time per pane).
+        for surfaceID in newSurfaceIDs where panesBySurfaceID[surfaceID] == nil {
+            let pane = findPane(for: surfaceID, in: layout) ?? makeEmptyPaneStub(surfaceID: surfaceID)
+            let slot = try await spawnPaneSlot(pane)
+            panesBySurfaceID[surfaceID] = slot
+        }
+
+        // Build the new view tree on the main actor.
+        let (newRoot, dividers) = await MainActor.run { () -> (NSView, [(NSSplitView, CGFloat)]) in
+            self.pendingDividerSetters.removeAll()
+            let view = self.materializeLayout(layout)
+            return (view, self.pendingDividerSetters)
+        }
+        await MainActor.run { self.swapRootView(newRoot, dividers: dividers) }
+
+        // Tear down slots that fell out of the tree.
+        let toRemove = Set(panesBySurfaceID.keys).subtracting(newSurfaceIDs)
+        for sid in toRemove {
+            if let slot = panesBySurfaceID.removeValue(forKey: sid) {
+                Task { await slot.session.stop() }
+            }
+        }
+    }
+
+    private func swapRootView(_ newRoot: NSView, dividers: [(NSSplitView, CGFloat)]) {
+        guard let window = self.window else { return }
+        let container = window.contentView ?? NSView(frame: window.contentLayoutRect)
+        for sub in container.subviews { sub.removeFromSuperview() }
+        newRoot.translatesAutoresizingMaskIntoConstraints = false
+        container.addSubview(newRoot)
+        NSLayoutConstraint.activate([
+            newRoot.topAnchor.constraint(equalTo: container.topAnchor),
+            newRoot.bottomAnchor.constraint(equalTo: container.bottomAnchor),
+            newRoot.leadingAnchor.constraint(equalTo: container.leadingAnchor),
+            newRoot.trailingAnchor.constraint(equalTo: container.trailingAnchor),
+        ])
+        if window.contentView == nil {
+            window.contentView = container
+        }
+        container.layoutSubtreeIfNeeded()
+        for (split, fraction) in dividers {
+            let extent: CGFloat = split.isVertical ? split.bounds.width : split.bounds.height
+            guard extent > 0 else { continue }
+            let position = max(20, min(extent - 20, extent * fraction))
+            split.setPosition(position, ofDividerAt: 0)
+        }
+    }
+
+    /// Recursively builds an NSView hierarchy from a layout proto,
+    /// reusing existing PaneSlot views by surfaceID.
+    private func materializeLayout(_ layout: Termmesh_Peer_V1_WorkspaceLayout) -> NSView {
+        switch layout.node {
+        case .pane(let pane):
+            if let slot = panesBySurfaceID[pane.surfaceID] {
+                slot.view.removeFromSuperview()
+                return slot.view
+            }
+            // Should never happen since spawnPaneSlot ran for every
+            // missing leaf before this method is called.
+            return NSView()
+        case .split(let split):
+            let first = materializeLayout(split.first)
+            let second = materializeLayout(split.second)
+            let nsSplit = NSSplitView()
+            nsSplit.isVertical = (split.orientation == "horizontal")
+            nsSplit.dividerStyle = .thin
+            nsSplit.translatesAutoresizingMaskIntoConstraints = false
+            nsSplit.addSubview(first)
+            nsSplit.addSubview(second)
+            pendingDividerSetters.append((nsSplit, CGFloat(split.dividerPosition)))
+            return nsSplit
+        case .none:
+            return NSView()
+        }
+    }
+
+    // MARK: - Slot factory
+
+    private func spawnPaneSlot(_ pane: Termmesh_Peer_V1_WorkspacePane) async throws -> PaneSlot {
+        let conn = try await PeerRelaySession.connectAndList(hostSockPath: hostSockPath)
         let chosen = conn.surfaces.first(where: { $0.surfaceID == pane.surfaceID })
                         ?? makeFallbackSurfaceInfo(from: pane)
         let session = try await PeerRelaySession.attach(conn, surface: chosen)
         try session.prepareListener()
 
-        let surface = TerminalSurface(
-            tabId: UUID(),
-            context: GHOSTTY_SURFACE_CONTEXT_WINDOW,
-            configTemplate: nil,
-            command: session.relayBinaryPath,
-            environment: ["TERMMESH_PEER_RELAY_SOCKET": session.relaySockPath]
-        )
-        sessions.append(session)
-        terminalSurfaces.append(surface)
-        session.onDisconnect = { [weak self] in
-            _ = self
+        let surface = await MainActor.run {
+            TerminalSurface(
+                tabId: UUID(),
+                context: GHOSTTY_SURFACE_CONTEXT_WINDOW,
+                configTemplate: nil,
+                command: session.relayBinaryPath,
+                environment: ["TERMMESH_PEER_RELAY_SOCKET": session.relaySockPath]
+            )
         }
 
-        // Start the relay pump after the surface view is on screen
-        // (Ghostty needs a window to spawn its child process).
+        let wrapper = await MainActor.run { () -> NSView in
+            let host = surface.hostedView
+            host.translatesAutoresizingMaskIntoConstraints = false
+            let wrap = NSView()
+            wrap.translatesAutoresizingMaskIntoConstraints = false
+            wrap.addSubview(host)
+            NSLayoutConstraint.activate([
+                host.topAnchor.constraint(equalTo: wrap.topAnchor),
+                host.bottomAnchor.constraint(equalTo: wrap.bottomAnchor),
+                host.leadingAnchor.constraint(equalTo: wrap.leadingAnchor),
+                host.trailingAnchor.constraint(equalTo: wrap.trailingAnchor),
+            ])
+            return wrap
+        }
+
         Task {
-            do {
-                try await session.start()
-            } catch {
-                NSLog("[peer-relay] workspace pane start failed: %@", String(describing: error))
-            }
+            do { try await session.start() }
+            catch { NSLog("[peer-relay] workspace pane start failed: %@", String(describing: error)) }
         }
 
-        let host = surface.hostedView
-        host.translatesAutoresizingMaskIntoConstraints = false
-        let wrapper = NSView()
-        wrapper.translatesAutoresizingMaskIntoConstraints = false
-        wrapper.addSubview(host)
-        NSLayoutConstraint.activate([
-            host.topAnchor.constraint(equalTo: wrapper.topAnchor),
-            host.bottomAnchor.constraint(equalTo: wrapper.bottomAnchor),
-            host.leadingAnchor.constraint(equalTo: wrapper.leadingAnchor),
-            host.trailingAnchor.constraint(equalTo: wrapper.trailingAnchor),
-        ])
-        return wrapper
+        return PaneSlot(surfaceID: pane.surfaceID, session: session, surface: surface, view: wrapper)
+    }
+
+    // MARK: - Helpers
+
+    private func collectSurfaceIDs(_ layout: Termmesh_Peer_V1_WorkspaceLayout) -> Set<Data> {
+        switch layout.node {
+        case .pane(let p): return [p.surfaceID]
+        case .split(let s):
+            return collectSurfaceIDs(s.first).union(collectSurfaceIDs(s.second))
+        case .none: return []
+        }
+    }
+
+    private func findPane(for surfaceID: Data, in layout: Termmesh_Peer_V1_WorkspaceLayout) -> Termmesh_Peer_V1_WorkspacePane? {
+        switch layout.node {
+        case .pane(let p):
+            return p.surfaceID == surfaceID ? p : nil
+        case .split(let s):
+            return findPane(for: surfaceID, in: s.first) ?? findPane(for: surfaceID, in: s.second)
+        case .none: return nil
+        }
+    }
+
+    private func makeEmptyPaneStub(surfaceID: Data) -> Termmesh_Peer_V1_WorkspacePane {
+        var p = Termmesh_Peer_V1_WorkspacePane()
+        p.surfaceID = surfaceID
+        p.cols = 80
+        p.rows = 24
+        return p
     }
 
     private func makeFallbackSurfaceInfo(from pane: Termmesh_Peer_V1_WorkspacePane) -> Termmesh_Peer_V1_SurfaceInfo {
@@ -190,37 +319,6 @@ final class PeerRelayWorkspaceWindowController: NSWindowController, NSWindowDele
         info.surfaceType = "terminal"
         info.attachable = true
         return info
-    }
-
-    /// bonsplit "horizontal" = side-by-side, "vertical" = stacked.
-    /// NSSplitView is the inverse: `isVertical=true` puts subviews
-    /// side-by-side. Translate accordingly.
-    private func makeSplitView(orientation: String, dividerPosition: CGFloat, first: NSView, second: NSView) -> NSSplitView {
-        let split = NSSplitView()
-        split.isVertical = (orientation == "horizontal")
-        split.dividerStyle = .thin
-        split.translatesAutoresizingMaskIntoConstraints = false
-        split.addSubview(first)
-        split.addSubview(second)
-        // Defer divider-position application until the view has size,
-        // otherwise NSSplitView rounds to 0 / max.
-        pendingDividerSetters.append((split, dividerPosition))
-        return split
-    }
-
-    private func applyPendingDividerPositions() {
-        guard let window = self.window else { return }
-        // Two-pass: layout once so split views know their sizes, then
-        // apply percentages.
-        window.contentView?.layoutSubtreeIfNeeded()
-        for (split, fraction) in pendingDividerSetters {
-            let extent: CGFloat = split.isVertical ? split.bounds.width : split.bounds.height
-            guard extent > 0 else { continue }
-            let position = max(20, min(extent - 20, extent * fraction))
-            split.setPosition(position, ofDividerAt: 0)
-        }
-        // Don't clear `pendingDividerSetters` — re-apply on resize via
-        // splitViewDidResizeSubviews if NSSplitView clamps positions.
     }
 }
 #endif
