@@ -12,7 +12,6 @@
 //        relay stdin (user keystrokes) → relay socket → PeerSession Input → host.
 //        relay SIGWINCH → relay socket → PeerSession Resize → host.
 
-#if DEBUG
 import AppKit
 import SwiftUI
 
@@ -111,4 +110,3 @@ final class PeerRelayWindowController: NSWindowController, NSWindowDelegate {
         onClose?()
     }
 }
-#endif

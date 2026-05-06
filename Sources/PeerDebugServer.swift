@@ -3,7 +3,6 @@
 //  panes (GhosttyPaneSurfaceProvider) so remote clients can list and attach
 //  to real PTYs via `tm-agent peer list / peer attach`.
 
-#if DEBUG
 import AppKit
 import PeerProto
 
@@ -11,7 +10,7 @@ import PeerProto
 enum PeerDebugServerMenu {
     static func startItem() -> NSMenuItem {
         let item = NSMenuItem(
-            title: "Start Peer Server… (debug)",
+            title: "Start Peer Server…",
             action: #selector(PeerDebugServerCoordinator.startServer(_:)),
             keyEquivalent: ""
         )
@@ -21,7 +20,7 @@ enum PeerDebugServerMenu {
 
     static func stopItem() -> NSMenuItem {
         let item = NSMenuItem(
-            title: "Stop Peer Server (debug)",
+            title: "Stop Peer Server",
             action: #selector(PeerDebugServerCoordinator.stopServer(_:)),
             keyEquivalent: ""
         )
@@ -39,15 +38,15 @@ final class PeerDebugServerCoordinator: NSObject {
     private var provider: GhosttyPaneSurfaceProvider?
     private var layoutObserver: NSObjectProtocol?
 
-    /// Launch-time hook. If `TERMMESH_DEBUG_PEER_SERVER_PATH` is set,
-    /// start a peer server at that path with the Echo provider. Lets a
-    /// terminal-driven integration test reach the app's Swift server
-    /// without clicking through the menu.
+    /// Launch-time hook. If `TERMMESH_PEER_SERVER_PATH` (or legacy
+    /// `TERMMESH_DEBUG_PEER_SERVER_PATH`) is set, start a peer server
+    /// at that path. Without the env var the server stays off until
+    /// the user clicks "Start Peer Server…" from the status bar menu.
     static func autoStartIfConfigured() {
-        guard
-            let path = ProcessInfo.processInfo.environment["TERMMESH_DEBUG_PEER_SERVER_PATH"],
-            !path.isEmpty
-        else { return }
+        let env = ProcessInfo.processInfo.environment
+        let path = env["TERMMESH_PEER_SERVER_PATH"]
+            ?? env["TERMMESH_DEBUG_PEER_SERVER_PATH"]
+        guard let path, !path.isEmpty else { return }
         Task { await PeerDebugServerCoordinator.shared.bringUp(at: path, silent: true) }
     }
 
@@ -188,4 +187,3 @@ extension Notification.Name {
     /// to attached peer clients.
     static let peerWorkspaceLayoutDidChange = Notification.Name("PeerWorkspaceLayoutDidChange")
 }
-#endif

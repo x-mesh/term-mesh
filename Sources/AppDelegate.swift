@@ -226,16 +226,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         if isRunningUnderXCTest {
             KeyboardShortcutSettings.resetAll()
         }
+#endif
 
-        // Optional auto-start of the peer-federation server for
-        // integration testing from a terminal (`TERMMESH_DEBUG_PEER_SERVER_PATH`).
+        // Peer federation: opt-in auto-start via `TERMMESH_PEER_SERVER_PATH`
+        // (or its legacy `TERMMESH_DEBUG_PEER_SERVER_PATH` alias). Without
+        // the env var the user must manually start the server from the
+        // status-bar menu — there is no implicit listener.
         PeerDebugServerCoordinator.autoStartIfConfigured()
 
         // Reap leftover relay sockets from any previous crashed run
         // before a user opens a fresh relay window — otherwise stale
         // /tmp/tm-peer-relay-*.sock files accumulate indefinitely.
         PeerRelaySession.sweepStaleRelaySockets()
-#endif
 
 #if DEBUG
         writeUITestDiagnosticsIfNeeded(stage: "didFinishLaunching")

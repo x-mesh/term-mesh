@@ -15,7 +15,6 @@
 //          Enter; it gets sent as an Input frame, field clears.
 //        - Closing the window sends Goodbye and tears down the transport.
 
-#if DEBUG
 import AppKit
 import PeerProto
 
@@ -23,7 +22,7 @@ import PeerProto
 enum PeerDebugMenu {
     static func item() -> NSMenuItem {
         let item = NSMenuItem(
-            title: "Connect to Peer… (debug)",
+            title: "Connect to Peer…",
             action: #selector(PeerDebugCoordinator.promptAndRun(_:)),
             keyEquivalent: ""
         )
@@ -33,7 +32,7 @@ enum PeerDebugMenu {
 
     static func relayItem() -> NSMenuItem {
         let item = NSMenuItem(
-            title: "Connect to Peer via Ghostty Relay… (debug)",
+            title: "Connect to Peer via Ghostty Relay…",
             action: #selector(PeerDebugCoordinator.promptAndRunRelay(_:)),
             keyEquivalent: ""
         )
@@ -43,7 +42,7 @@ enum PeerDebugMenu {
 
     static func relayWorkspaceItem() -> NSMenuItem {
         let item = NSMenuItem(
-            title: "Connect to Peer Workspace via Ghostty Relay… (debug)",
+            title: "Connect to Peer Workspace via Ghostty Relay…",
             action: #selector(PeerDebugCoordinator.promptAndRunRelayWorkspace(_:)),
             keyEquivalent: ""
         )
@@ -551,4 +550,3 @@ final class PeerDebugConsoleWindowController: NSWindowController, NSWindowDelega
         NSFont.monospacedSystemFont(ofSize: 12, weight: .regular)
     }
 }
-#endif

@@ -11,7 +11,6 @@
 //        ↑ user keystrokes (relay stdin) → type=0x02 → app → PeerSession Input
 //        ↑ SIGWINCH (relay) → type=0x03 → app → PeerSession Resize
 
-#if DEBUG
 import Foundation
 import Darwin
 import PeerProto
@@ -470,4 +469,3 @@ final class PeerRelaySession {
         disconnect()
     }
 }
-#endif

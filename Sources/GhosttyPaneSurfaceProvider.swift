@@ -17,7 +17,6 @@
 //     C callback and then ghostty_surface_free proceeds safely; the context is
 //     released by the detach closure when the PeerServer eventually calls it.
 
-#if DEBUG
 import AppKit
 import Bonsplit
 import PeerProto
@@ -560,4 +559,3 @@ private final class WeakRef<T: AnyObject>: @unchecked Sendable {
     weak var value: T?
     init(_ value: T) { self.value = value }
 }
-#endif

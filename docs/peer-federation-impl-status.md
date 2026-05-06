@@ -10,7 +10,10 @@ Design doc: `peer-federation.md` / `peer-federation-protocol.md`.
 
 ## Phase Map (Swift + Rust, in-app proof-of-concept)
 
-All phases are DEBUG-only (`#if DEBUG`) for now. Production integration starts after Phase C-4 is stable.
+Phase D-1 lifts the DEBUG guards: peer-federation source files compile
+into Release builds and the menu items are always visible. The peer
+server still does not run by default — it is opt-in via either the
+status-bar menu or the `TERMMESH_PEER_SERVER_PATH` env var.
 
 ```
 Phase A  — Protocol + transport library (PeerProto Swift package)           ✅ DONE
@@ -32,7 +35,12 @@ Phase W  — Layout-preserving workspace relay
   W-2    — Host: serialize bonsplit treeSnapshot → WorkspaceLayout          ✅ DONE
   W-3    — Picker: choose workspace                                         ✅ DONE
   W-4    — PeerRelayWorkspaceWindowController (NSSplitView reconstruction)  ✅ DONE
-Phase D  — Production integration (non-DEBUG), discovery UI, pairing        ⬜ TODO
+Phase W' — Live workspace layout sync                                       ✅ DONE
+Phase D  — Production integration
+  D-1    — Drop #if DEBUG guards, opt-in env var                            ✅ DONE
+  D-2    — Main UI integration (preferences pane, sidebar)                  ⬜ TODO
+  D-3    — Bonjour mDNS discovery                                           ⬜ TODO
+  D-4    — SSH transport                                                    ⬜ TODO
 ```
 
 ---

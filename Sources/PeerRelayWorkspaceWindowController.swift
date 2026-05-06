@@ -9,7 +9,6 @@
 // reshuffles the layout, and new/removed panes spawn / tear down their
 // PeerRelaySession on the fly.
 
-#if DEBUG
 import AppKit
 import PeerProto
 
@@ -321,4 +320,3 @@ final class PeerRelayWorkspaceWindowController: NSWindowController, NSWindowDele
         return info
     }
 }
-#endif
