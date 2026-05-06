@@ -84,11 +84,19 @@ final class PeerRelayWorkspaceWindowController: NSWindowController, NSWindowDele
         }
     }
 
-    private let hostSockPath: String
+    let hostSockPath: String
     /// Held strongly while the controller is alive so the tunnel
     /// auto-restart loop keeps running. nil for non-SSH (direct
     /// unix-socket) sessions.
     private var sshTunnel: PeerSSHTunnel?
+    var sshTarget: String? { sshTunnel?.sshTarget }
+    /// Wall-clock time the relay window first opened. Used by the
+    /// Connections panel to show "Attached <duration>".
+    let connectedAt: Date = Date()
+    /// Workspace title shown to the host. Mirrors `baseTitle` minus
+    /// the "Peer Workspace · " prefix so it can be displayed in lists
+    /// without redundancy.
+    let workspaceTitle: String
     private var workspaceID: Data
     private let baseTitle: String
     private var currentLayout: Termmesh_Peer_V1_WorkspaceLayout
@@ -147,6 +155,7 @@ final class PeerRelayWorkspaceWindowController: NSWindowController, NSWindowDele
         self.workspaceID = workspace.workspaceID
         self.currentLayout = workspace.layout
         let title = workspace.title.isEmpty ? "<workspace>" : workspace.title
+        self.workspaceTitle = title
         self.baseTitle = "Peer Workspace · \(title)"
 
         let initialSize = NSRect(x: 0, y: 0, width: 1024, height: 640)

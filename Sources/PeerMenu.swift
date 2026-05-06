@@ -59,11 +59,25 @@ enum PeerMenu {
         item.target = PeerCoordinator.shared
         return item
     }
+
+    static func connectionsItem() -> NSMenuItem {
+        let item = NSMenuItem(
+            title: "Show Peer Connections…",
+            action: #selector(PeerCoordinator.showConnections(_:)),
+            keyEquivalent: ""
+        )
+        item.target = PeerCoordinator.shared
+        return item
+    }
 }
 
 @MainActor
 final class PeerCoordinator: NSObject {
     static let shared = PeerCoordinator()
+
+    /// Posted whenever the active-relays roster changes (open / close).
+    /// `PeerConnectionsWindowController` listens to refresh its table.
+    static let relaysDidChangeNotification = Notification.Name("PeerCoordinatorRelaysDidChange")
 
     /// Holding onto the window controllers here keeps their reader Tasks
     /// alive; dropping the reference would cancel the stream.
@@ -74,6 +88,20 @@ final class PeerCoordinator: NSObject {
     /// tunnel must outlive the relay window; dropped tunnels yank the
     /// forwarded socket out from under the relay sessions.
     private var sshTunnels: [ObjectIdentifier: PeerSSHTunnel] = [:]
+
+    /// Snapshot of every active workspace relay for the Connections
+    /// panel. Returned in open-order.
+    func activeWorkspaceRelays() -> [PeerRelayWorkspaceWindowController] {
+        return openWorkspaceRelays
+    }
+
+    fileprivate func postRelaysChanged() {
+        NotificationCenter.default.post(name: Self.relaysDidChangeNotification, object: self)
+    }
+
+    @objc func showConnections(_ sender: Any?) {
+        PeerConnectionsWindowController.shared.showAndFocus()
+    }
 
     @objc func promptAndRunRelayWorkspaceSSH(_ sender: Any?) {
         let alert = NSAlert()
@@ -282,8 +310,10 @@ final class PeerCoordinator: NSObject {
                 if let stale = self.sshTunnels.removeValue(forKey: ObjectIdentifier(controller)) {
                     stale.stop()
                 }
+                self.postRelaysChanged()
             }
             controller.show()
+            self.postRelaysChanged()
         }
     }
 
@@ -356,8 +386,10 @@ final class PeerCoordinator: NSObject {
                 controller.onClose = { [weak self, weak controller] in
                     guard let self, let controller else { return }
                     self.openWorkspaceRelays.removeAll { $0 === controller }
+                    self.postRelaysChanged()
                 }
                 controller.show()
+                self.postRelaysChanged()
             }
         }
     }
