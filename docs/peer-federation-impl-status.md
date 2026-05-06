@@ -39,12 +39,17 @@ Phase W' — Live workspace layout sync                                       �
 Phase D  — Production integration
   D-1    — Drop #if DEBUG guards, opt-in env var                            ✅ DONE
   D-2A   — Rename PeerDebug* identifiers/files                              ✅ DONE
-  D-2    — Main UI integration (preferences pane, sidebar)                  ⬜ TODO
+  D-2B   — Settings pane (Peer Federation section)                          ✅ DONE
+  D-2C   — Sidebar entry (connected peers, recent hosts)                    ⬜ TODO
+  D-2D   — Status-bar peer-server activity indicator                        ✅ DONE
   D-3a   — Bonjour LAN discovery (advertise host, autofill SSH dialog)     ✅ DONE
   D-3b   — Native TCP transport (skip SSH for LAN)                          ⬜ TODO
   D-4    — SSH transport (`ssh -L` tunnel + relay window)                   ✅ DONE
   D-5    — CI prebuilt GhosttyKit.xcframework + setup.sh auto-fetch         ✅ DONE
   D-6    — Workspace control plane (Cmd+D / Cmd+Shift+D / Cmd+W from relay) ✅ DONE
+  D-7a   — Divider drag sync (relay → host)                                 ✅ DONE
+  D-7b   — Focus sync (relay click → host pane focus)                       ✅ DONE
+  D-7c   — Cmd+T new tab forwarding                                         ✅ DONE
 ```
 
 ---
@@ -161,30 +166,42 @@ on the host.
 
 ## Open TODOs
 
-### P1 — nice to have before Phase D
+### Polish (post-D)
 
-- [x] **Relay socket cleanup on crash** — `PeerRelaySession.sweepStaleRelaySockets()`
-      runs in `AppDelegate.applicationDidFinishLaunching` and removes
-      `/tmp/tm-peer-relay-*.sock` files whose listener is gone
-      (`connect()` returns `ECONNREFUSED`). Live sockets owned by other
-      debug instances are left alone.
-- [ ] **Workspace layout updates** — propagate split-resize / pane
-      add+remove from host to attached workspace clients (Phase W').
 - [ ] **Snapshot styling** (deferred) — current `readPaneSnapshot` sends
       plain text. The clean fix is a per-cell read with styling, but
       libghostty doesn't expose cell metadata via `ghostty_surface_*`
       yet. SIGWINCH wiggle / Ctrl-L injection both work but disturb the
       host's local viewer because they go through the shared PTY.
-- [ ] **Error UX** — relay errors currently show an NSAlert; merge with
-      Phase D's main UI integration.
+- [ ] **Sidebar entry / recent hosts** (D-2C). Currently every relay
+      session prompts the SSH dialog from scratch; remembering the last
+      few hosts and surfacing connection state in the main app sidebar
+      would cut down on repeat typing.
+- [ ] **Native TCP transport** (D-3b). SSH already covers the cross-mac
+      case; this would let LAN clients skip SSH entirely (paired with
+      auth, of course). Low priority now that D-3a discovery + D-4 SSH
+      land users on the right host with one click.
+- [ ] **Authentication / pairing**. Today any process that can reach
+      the unix socket (or SSH into the host) can attach. Production
+      should add a first-time pairing step + per-peer authorization.
+- [ ] **Error UX** — relay errors still show an NSAlert; surface them
+      in the main UI more gracefully.
+- [ ] **Per-cell scrollback replay** — initial snapshot only carries
+      the live viewport; scrollback is lost on attach. Could be a
+      second proto message or a side channel.
 
-### P2 — Phase D prep
+### Done in Phase D
 
-- [ ] Remove `#if DEBUG` guards from PeerRelaySession,
-      PeerRelayWindowController, PeerRelayWorkspaceWindowController,
-      GhosttyPaneSurfaceProvider.
-- [ ] Auto-start peer server at app launch (no manual menu step required).
-- [ ] Surface relay window in main UI (not just debug menu).
-- [ ] Bonjour discovery for host socket path.
-- [ ] SSH transport behind the same `connectAndList` API (only the
-      stage-1 dial changes).
+- [x] Drop `#if DEBUG` guards from all peer-federation sources (D-1).
+- [x] Rename `PeerDebug*` → `Peer*` after going production (D-2A).
+- [x] Settings pane (Peer Federation section) (D-2B).
+- [x] Status-bar peer-server activity indicator (D-2D).
+- [x] Auto-start peer server at app launch (D-1 / D-2B preference).
+- [x] Bonjour LAN discovery (D-3a).
+- [x] SSH transport via `ssh -L` tunnel (D-4).
+- [x] CI prebuilt GhosttyKit.xcframework + setup.sh fallback (D-5).
+- [x] Workspace control plane: split / close from relay (D-6).
+- [x] Live divider drag sync (D-7a) and pane focus sync (D-7b).
+- [x] Cmd+T new tab forwarding (D-7c).
+- [x] Workspace layout updates pushed live (Phase W').
+- [x] Relay socket cleanup on crash startup sweep.
