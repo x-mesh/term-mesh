@@ -7,31 +7,31 @@ import AppKit
 import PeerProto
 
 @MainActor
-enum PeerDebugServerMenu {
+enum PeerServerMenu {
     static func startItem() -> NSMenuItem {
         let item = NSMenuItem(
             title: "Start Peer Server…",
-            action: #selector(PeerDebugServerCoordinator.startServer(_:)),
+            action: #selector(PeerServerCoordinator.startServer(_:)),
             keyEquivalent: ""
         )
-        item.target = PeerDebugServerCoordinator.shared
+        item.target = PeerServerCoordinator.shared
         return item
     }
 
     static func stopItem() -> NSMenuItem {
         let item = NSMenuItem(
             title: "Stop Peer Server",
-            action: #selector(PeerDebugServerCoordinator.stopServer(_:)),
+            action: #selector(PeerServerCoordinator.stopServer(_:)),
             keyEquivalent: ""
         )
-        item.target = PeerDebugServerCoordinator.shared
+        item.target = PeerServerCoordinator.shared
         return item
     }
 }
 
 @MainActor
-final class PeerDebugServerCoordinator: NSObject {
-    static let shared = PeerDebugServerCoordinator()
+final class PeerServerCoordinator: NSObject {
+    static let shared = PeerServerCoordinator()
 
     private var server: PeerServer?
     private var socketPath: String?
@@ -47,7 +47,7 @@ final class PeerDebugServerCoordinator: NSObject {
         let path = env["TERMMESH_PEER_SERVER_PATH"]
             ?? env["TERMMESH_DEBUG_PEER_SERVER_PATH"]
         guard let path, !path.isEmpty else { return }
-        Task { await PeerDebugServerCoordinator.shared.bringUp(at: path, silent: true) }
+        Task { await PeerServerCoordinator.shared.bringUp(at: path, silent: true) }
     }
 
     @objc func startServer(_ sender: Any?) {
@@ -183,7 +183,7 @@ extension Notification.Name {
     /// Posted by `Workspace` when bonsplit reports a layout change
     /// (split add/remove, divider drag). userInfo carries
     /// `["workspaceID": UUID]`. Observed by
-    /// `PeerDebugServerCoordinator` which pushes the refreshed layout
+    /// `PeerServerCoordinator` which pushes the refreshed layout
     /// to attached peer clients.
     static let peerWorkspaceLayoutDidChange = Notification.Name("PeerWorkspaceLayoutDidChange")
 }

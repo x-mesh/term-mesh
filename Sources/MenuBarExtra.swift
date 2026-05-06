@@ -112,11 +112,11 @@ final class MenuBarExtraController: NSObject, NSMenuDelegate {
 
         menu.addItem(.separator())
 
-        menu.addItem(PeerDebugMenu.item())
-        menu.addItem(PeerDebugMenu.relayItem())
-        menu.addItem(PeerDebugMenu.relayWorkspaceItem())
-        menu.addItem(PeerDebugServerMenu.startItem())
-        menu.addItem(PeerDebugServerMenu.stopItem())
+        menu.addItem(PeerMenu.item())
+        menu.addItem(PeerMenu.relayItem())
+        menu.addItem(PeerMenu.relayWorkspaceItem())
+        menu.addItem(PeerServerMenu.startItem())
+        menu.addItem(PeerServerMenu.stopItem())
         menu.addItem(.separator())
 
         quitItem.target = self

@@ -67,15 +67,15 @@ Phase D  — Production integration
 |------|------|
 | `Sources/PeerRelaySession.swift` | Socket listener, accept, bidirectional pump |
 | `Sources/PeerRelayWindowController.swift` | NSWindow hosting TerminalSurface (relay binary as shell) |
-| `Sources/PeerDebugMenu.swift` | Menu items + PeerDebugCoordinator (holds open window refs) |
-| `Sources/PeerDebugServer.swift` | DEBUG peer server (Start/Stop via menu) |
+| `Sources/PeerMenu.swift` | Menu items + PeerCoordinator (holds open window refs) |
+| `Sources/PeerServerHost.swift` | DEBUG peer server (Start/Stop via menu) |
 | `Sources/GhosttyPaneSurfaceProvider.swift` | Maps live Ghostty panes to PeerSurfaceProvider |
 | `daemon/term-mesh-peer-relay/src/main.rs` | Relay binary: stdout/stdin/SIGWINCH framing |
 
 ### Bugs fixed during C-4 development
 
 1. **ARC deallocation** — `PeerRelayWindowController` was a local `let` inside a Task closure → immediately deallocated → `PeerRelaySession.deinit` removed the relay socket → relay binary couldn't connect.
-   - Fix: store controller in `PeerDebugCoordinator.openRelays: [PeerRelayWindowController]`.
+   - Fix: store controller in `PeerCoordinator.openRelays: [PeerRelayWindowController]`.
 
 2. **Swift DEBUG alignment trap (UInt32)** — `UnsafeRawBufferPointer.load(fromByteOffset: 1, as: UInt32.self)` asserts 4-byte alignment in DEBUG builds. Relay frame header has length at byte offset 1 (not aligned).
    - Fix: `loadUnaligned(fromByteOffset: 1, as: UInt32.self)` in `RelaySocket.readFrame()`.
@@ -110,20 +110,20 @@ Phase D  — Production integration
 
 ### Test setup
 
-The peer server is `#if DEBUG` only (in `PeerDebugServer.swift`). Either flow works:
+The peer server is opt-in. Either flow works:
 
-1. Launch the app with `TERMMESH_DEBUG_PEER_SERVER_PATH=/tmp/termmesh-app-peer.sock`
-   to auto-start the server, **or** click menu →
-   **"Start Peer Server… (debug)"**.
+1. Launch the app with `TERMMESH_PEER_SERVER_PATH=/tmp/termmesh-app-peer.sock`
+   to auto-start the server (legacy `TERMMESH_DEBUG_PEER_SERVER_PATH`
+   is still accepted), **or** click menu → **"Start Peer Server…"**.
 2. Pick one of the three relay menu items:
-   - **"Connect to Peer… (debug)"** — raw NSTextView console for the
-     PtyData stream (oldest debug surface).
-   - **"Connect to Peer via Ghostty Relay… (debug)"** — single Ghostty
-     surface mirroring one host pane. Surface picker pops up when the
-     host has multiple panes.
-   - **"Connect to Peer Workspace via Ghostty Relay… (debug)"** —
-     single window with the host workspace's full split layout
-     reproduced via NSSplitView; one PeerRelaySession per leaf pane.
+   - **"Connect to Peer…"** — raw NSTextView console for the PtyData
+     stream (oldest debug surface).
+   - **"Connect to Peer via Ghostty Relay…"** — single Ghostty surface
+     mirroring one host pane. Surface picker pops up when the host has
+     multiple panes.
+   - **"Connect to Peer Workspace via Ghostty Relay…"** — single window
+     with the host workspace's full split layout reproduced via
+     NSSplitView; one PeerRelaySession per leaf pane.
 3. Active peer attachments light up a **teal ring** around the host
    pane(s); the ring is reference-counted so multiple clients on the
    same pane keep it lit until the last one detaches.
@@ -143,7 +143,7 @@ on the host.
 |-------|--------------|
 | Proto | New `ListWorkspaces` / `WorkspaceList` RPC plus `Workspace` / `WorkspaceLayout` (recursive `oneof split | pane`) / `WorkspaceSplit` / `WorkspacePane` messages. |
 | Host  | `GhosttyPaneSurfaceProvider.listWorkspaces()` walks `tabManager.tabs`, calls `bonsplitController.treeSnapshot()`, and translates each `ExternalTreeNode` into a `WorkspaceLayout` proto. Empty/non-attachable subtrees are folded out. |
-| Client | `PeerSession.listWorkspaces()`, picker dialog (workspace list) in `PeerDebugMenu`, and `PeerRelayWorkspaceWindowController` which recursively walks the layout and builds an NSSplitView tree with one `PeerRelaySession` + Ghostty surface per leaf. Each leaf opens its own connection so per-pane disconnect doesn't cascade. |
+| Client | `PeerSession.listWorkspaces()`, picker dialog (workspace list) in `PeerMenu`, and `PeerRelayWorkspaceWindowController` which recursively walks the layout and builds an NSSplitView tree with one `PeerRelaySession` + Ghostty surface per leaf. Each leaf opens its own connection so per-pane disconnect doesn't cascade. |
 
 **Known limitations (Phase W' candidates):**
 - Layout drift: divider position / pane add+remove on the host after

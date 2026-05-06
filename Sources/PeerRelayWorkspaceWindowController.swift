@@ -108,7 +108,7 @@ final class PeerRelayWorkspaceWindowController: NSWindowController, NSWindowDele
 
     // MARK: - Subscription channel
     //
-    // The probe connection used by PeerDebugMenu has been cancelled by
+    // The probe connection used by PeerMenu has been cancelled by
     // the time the controller starts, and per-pane connections silently
     // ignore non-PtyData messages. To receive `WorkspaceLayoutChanged`
     // pushes we open one extra session that does nothing else.

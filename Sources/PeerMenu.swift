@@ -6,7 +6,7 @@
 //   1. Menu item → NSAlert prompt for socket path.
 //   2. Connect + handshake + list (from C-3b-β).
 //   3. Attach to the first surface (C-3c.2α).
-//   4. Open a `PeerDebugConsoleWindow`:
+//   4. Open a `PeerConsoleWindow`:
 //        - NSTextView (read-only) streams raw PtyData bytes as UTF-8. No
 //          ANSI escape processing — the user sees the raw tty stream,
 //          which is the point: it proves bytes are flowing into the GUI
@@ -19,45 +19,45 @@ import AppKit
 import PeerProto
 
 @MainActor
-enum PeerDebugMenu {
+enum PeerMenu {
     static func item() -> NSMenuItem {
         let item = NSMenuItem(
             title: "Connect to Peer…",
-            action: #selector(PeerDebugCoordinator.promptAndRun(_:)),
+            action: #selector(PeerCoordinator.promptAndRun(_:)),
             keyEquivalent: ""
         )
-        item.target = PeerDebugCoordinator.shared
+        item.target = PeerCoordinator.shared
         return item
     }
 
     static func relayItem() -> NSMenuItem {
         let item = NSMenuItem(
             title: "Connect to Peer via Ghostty Relay…",
-            action: #selector(PeerDebugCoordinator.promptAndRunRelay(_:)),
+            action: #selector(PeerCoordinator.promptAndRunRelay(_:)),
             keyEquivalent: ""
         )
-        item.target = PeerDebugCoordinator.shared
+        item.target = PeerCoordinator.shared
         return item
     }
 
     static func relayWorkspaceItem() -> NSMenuItem {
         let item = NSMenuItem(
             title: "Connect to Peer Workspace via Ghostty Relay…",
-            action: #selector(PeerDebugCoordinator.promptAndRunRelayWorkspace(_:)),
+            action: #selector(PeerCoordinator.promptAndRunRelayWorkspace(_:)),
             keyEquivalent: ""
         )
-        item.target = PeerDebugCoordinator.shared
+        item.target = PeerCoordinator.shared
         return item
     }
 }
 
 @MainActor
-final class PeerDebugCoordinator: NSObject {
-    static let shared = PeerDebugCoordinator()
+final class PeerCoordinator: NSObject {
+    static let shared = PeerCoordinator()
 
     /// Holding onto the window controllers here keeps their reader Tasks
     /// alive; dropping the reference would cancel the stream.
-    private var openConsoles: [PeerDebugConsoleWindowController] = []
+    private var openConsoles: [PeerConsoleWindowController] = []
     private var openRelays: [PeerRelayWindowController] = []
     private var openWorkspaceRelays: [PeerRelayWorkspaceWindowController] = []
 
@@ -325,7 +325,7 @@ final class PeerDebugCoordinator: NSObject {
                 rows: 24
             )
 
-            let controller = PeerDebugConsoleWindowController(
+            let controller = PeerConsoleWindowController(
                 hostName: info.hostDisplayName,
                 surfaceTitle: chosen.title,
                 surfaceID: outcome.surfaceID,
@@ -363,7 +363,7 @@ final class PeerDebugCoordinator: NSObject {
 }
 
 @MainActor
-final class PeerDebugConsoleWindowController: NSWindowController, NSWindowDelegate {
+final class PeerConsoleWindowController: NSWindowController, NSWindowDelegate {
     private let surfaceID: Data
     private let session: PeerSession
     private let transport: UnixSocketTransport
