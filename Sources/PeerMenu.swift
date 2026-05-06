@@ -85,6 +85,23 @@ final class PeerCoordinator: NSObject {
         stack.alignment = .leading
         stack.spacing = 4
 
+        // Recent hosts (most recently successful connect bubbles to
+        // the top). Pick fills target + remote fields.
+        let recentLabel = NSTextField(labelWithString: "Recent:")
+        let recentPopup = NSPopUpButton(
+            frame: NSRect(x: 0, y: 0, width: 380, height: 26),
+            pullsDown: false
+        )
+        let recents = PeerFederationSettings.loadRecentHosts()
+        let recentMenu = NSMenu()
+        recentMenu.addItem(withTitle: recents.isEmpty ? "(no recent hosts)" : "(pick a recent host…)",
+                           action: nil, keyEquivalent: "")
+        for r in recents {
+            recentMenu.addItem(withTitle: "\(r.sshTarget)  ·  \(r.remoteSocket)",
+                               action: nil, keyEquivalent: "")
+        }
+        recentPopup.menu = recentMenu
+
         // Bonjour-discovered hosts populate this popup live; selecting
         // one autofills the SSH target / remote socket fields.
         let discoveredLabel = NSTextField(labelWithString: "Discovered on LAN:")
@@ -101,10 +118,23 @@ final class PeerCoordinator: NSObject {
         let remoteField = NSTextField(frame: NSRect(x: 0, y: 0, width: 380, height: 24))
         remoteField.stringValue = "/tmp/termmesh-app-peer.sock"
 
-        for v in [discoveredLabel, discoveredPopup, targetLabel, targetField, remoteLabel, remoteField] {
+        // Pre-fill from the most recent host so a re-connect is
+        // one-keystroke (Cmd+T → Cmd+Return).
+        if let mostRecent = recents.first {
+            targetField.stringValue = mostRecent.sshTarget
+            remoteField.stringValue = mostRecent.remoteSocket
+        }
+
+        let arranged: [NSView] = [
+            recentLabel, recentPopup,
+            discoveredLabel, discoveredPopup,
+            targetLabel, targetField,
+            remoteLabel, remoteField,
+        ]
+        for v in arranged {
             stack.addArrangedSubview(v)
         }
-        stack.frame = NSRect(x: 0, y: 0, width: 380, height: 170)
+        stack.frame = NSRect(x: 0, y: 0, width: 380, height: 230)
         alert.accessoryView = stack
         alert.addButton(withTitle: "Connect")
         alert.addButton(withTitle: "Cancel")
@@ -138,7 +168,16 @@ final class PeerCoordinator: NSObject {
         discoveredPopup.target = proxy
         discoveredPopup.action = #selector(SSHDialogPopupProxy.didPick(_:))
 
-        defer { browser.stop(); _ = proxy } // tear down after modal dismissal
+        let recentProxy = RecentHostPopupProxy(
+            popup: recentPopup,
+            target: targetField,
+            remote: remoteField,
+            recents: recents
+        )
+        recentPopup.target = recentProxy
+        recentPopup.action = #selector(RecentHostPopupProxy.didPick(_:))
+
+        defer { browser.stop(); _ = proxy; _ = recentProxy } // tear down after modal dismissal
 
         guard alert.runModal() == .alertFirstButtonReturn else { return }
         let target = targetField.stringValue.trimmingCharacters(in: .whitespaces)
@@ -156,6 +195,11 @@ final class PeerCoordinator: NSObject {
                 }
                 return
             }
+            // Tunnel is up — remember the host so the next connect
+            // dialog has it ready in the recent picker.
+            PeerFederationSettings.rememberRecentHost(
+                .init(sshTarget: target, remoteSocket: remote)
+            )
             await self.openWorkspaceRelay(
                 hostSockPath: tunnel.localSockPath,
                 titleSuffix: " · \(target)",
@@ -765,5 +809,36 @@ final class SSHDialogPopupProxy: NSObject {
         if let sock = peer.socketPath, !sock.isEmpty {
             remoteField?.stringValue = sock
         }
+    }
+}
+
+/// Glue between the SSH-dialog "Recent" popup and the surrounding
+/// fields. `recents` is captured at construction time — we don't
+/// re-read defaults mid-modal so the menu items stay in sync with
+/// the popup's index.
+@MainActor
+final class RecentHostPopupProxy: NSObject {
+    private weak var popup: NSPopUpButton?
+    private weak var targetField: NSTextField?
+    private weak var remoteField: NSTextField?
+    private let recents: [PeerFederationSettings.RecentHost]
+
+    init(popup: NSPopUpButton,
+         target: NSTextField,
+         remote: NSTextField,
+         recents: [PeerFederationSettings.RecentHost]) {
+        self.popup = popup
+        self.targetField = target
+        self.remoteField = remote
+        self.recents = recents
+        super.init()
+    }
+
+    @objc func didPick(_ sender: NSPopUpButton) {
+        let idx = sender.indexOfSelectedItem - 1
+        guard idx >= 0, idx < recents.count else { return }
+        let entry = recents[idx]
+        targetField?.stringValue = entry.sshTarget
+        remoteField?.stringValue = entry.remoteSocket
     }
 }
