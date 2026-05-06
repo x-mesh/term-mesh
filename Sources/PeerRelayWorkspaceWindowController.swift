@@ -55,7 +55,12 @@ final class PeerRelayWorkspaceWindowController: NSWindowController, NSWindowDele
     }
 
     private let hostSockPath: String
+    /// Held strongly while the controller is alive so the tunnel
+    /// auto-restart loop keeps running. nil for non-SSH (direct
+    /// unix-socket) sessions.
+    private var sshTunnel: PeerSSHTunnel?
     private var workspaceID: Data
+    private let baseTitle: String
     private var currentLayout: Termmesh_Peer_V1_WorkspaceLayout
     private var panesBySurfaceID: [Data: PaneSlot] = [:]
     /// Splits the renderer needs to apply divider positions to after
@@ -102,6 +107,8 @@ final class PeerRelayWorkspaceWindowController: NSWindowController, NSWindowDele
         self.hostSockPath = hostSockPath
         self.workspaceID = workspace.workspaceID
         self.currentLayout = workspace.layout
+        let title = workspace.title.isEmpty ? "<workspace>" : workspace.title
+        self.baseTitle = "Peer Workspace · \(title)"
 
         let initialSize = NSRect(x: 0, y: 0, width: 1024, height: 640)
         let window = PeerRelayWorkspaceWindow(
@@ -110,8 +117,7 @@ final class PeerRelayWorkspaceWindowController: NSWindowController, NSWindowDele
             backing: .buffered,
             defer: false
         )
-        let title = workspace.title.isEmpty ? "<workspace>" : workspace.title
-        window.title = "Peer Workspace · \(title)"
+        window.title = self.baseTitle
         window.isReleasedWhenClosed = false
         // Disable AppKit's automatic Cmd+T window tabbing so Cmd+T
         // flows through to our keyMonitor and forwards to the remote
@@ -124,6 +130,65 @@ final class PeerRelayWorkspaceWindowController: NSWindowController, NSWindowDele
     }
 
     required init?(coder: NSCoder) { fatalError("not used") }
+
+    /// Attach an `PeerSSHTunnel` so the window observes its state and
+    /// re-establishes the relay when the tunnel auto-restarts. Must be
+    /// called before `show()` if the host is reached over SSH.
+    func attachTunnel(_ tunnel: PeerSSHTunnel) {
+        self.sshTunnel = tunnel
+        tunnel.onStateChange = { [weak self] state in
+            self?.handleTunnelStateChange(state)
+        }
+    }
+
+    @MainActor
+    private func handleTunnelStateChange(_ state: PeerSSHTunnelState) {
+        switch state {
+        case .down(let reason):
+            window?.title = "\(baseTitle) · disconnected (\(reason))"
+            tearDownPeerSessions(keepWindow: true)
+        case .reconnecting(let attempt):
+            window?.title = "\(baseTitle) · reconnecting (try \(attempt))…"
+        case .up:
+            window?.title = "\(baseTitle) · reconnecting…"
+            // Tunnel just came back. Re-run the initial-attach flow
+            // from the same hostSockPath.
+            startTask?.cancel()
+            startTask = Task { [weak self] in
+                guard let self else { return }
+                do {
+                    try await self.applyLayout(self.currentLayout)
+                    await self.startSubscription()
+                    await MainActor.run { self.window?.title = self.baseTitle }
+                } catch {
+                    NSLog("[peer-ws] reconnect applyLayout failed: %@", String(describing: error))
+                }
+            }
+        case .stopped, .starting:
+            break
+        }
+    }
+
+    private func tearDownPeerSessions(keepWindow: Bool) {
+        subscriptionTask?.cancel()
+        subscriptionTask = nil
+        subscriptionSession = nil
+        if let monitor = keyMonitor {
+            NSEvent.removeMonitor(monitor)
+            keyMonitor = nil
+        }
+        // Note: we keep the click monitor + slot views around so the
+        // window doesn't visually flicker during a brief reconnect.
+        // applyLayout on re-up will rebuild slots in place.
+        let transport = subscriptionTransport
+        subscriptionTransport = nil
+        let toStop = Array(panesBySurfaceID.values)
+        panesBySurfaceID.removeAll()
+        Task {
+            for slot in toStop { await slot.session.stop() }
+            await transport?.close()
+        }
+    }
 
     func show() {
         window?.makeKeyAndOrderFront(nil)

@@ -271,6 +271,7 @@ final class PeerCoordinator: NSObject {
             self.openWorkspaceRelays.append(controller)
             if let tunnel {
                 self.sshTunnels[ObjectIdentifier(controller)] = tunnel
+                controller.attachTunnel(tunnel)
                 if !titleSuffix.isEmpty {
                     controller.window?.title += titleSuffix
                 }
