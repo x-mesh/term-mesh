@@ -387,10 +387,15 @@ extension Workspace: BonsplitDelegate {
         }
         scheduleTerminalGeometryReconcile()
         scheduleFocusReconcile()
+        postPeerLayoutChange()
     }
 
     func splitTabBar(_ controller: BonsplitController, didSelectTab tab: Bonsplit.Tab, inPane pane: PaneID) {
         applyTabSelection(tabId: tab.id, inPane: pane)
+        // The proto's WorkspacePane only carries the selected tab's
+        // surface_id, so a tab selection change effectively rewrites
+        // the pane's surface in the relay client's view.
+        postPeerLayoutChange()
     }
 
     func splitTabBar(_ controller: BonsplitController, didMoveTab tab: Bonsplit.Tab, fromPane source: PaneID, toPane destination: PaneID) {
@@ -705,16 +710,21 @@ extension Workspace: BonsplitDelegate {
         _ = snapshot
         scheduleTerminalGeometryReconcile()
         scheduleFocusReconcile()
-        #if DEBUG
-        // Notify any peer-federation observers (PeerServer broadcast)
-        // so attached clients can patch their NSSplitView trees in
-        // place instead of going stale or needing a reconnect.
+        postPeerLayoutChange()
+    }
+
+    /// Notify any peer-federation observers (PeerServer broadcast) so
+    /// attached clients can patch their NSSplitView trees in place
+    /// instead of going stale or needing a reconnect. Called from
+    /// every bonsplit delegate event that can change what a relay
+    /// client should render: split tree changes, tab selection, tab
+    /// close.
+    fileprivate func postPeerLayoutChange() {
         NotificationCenter.default.post(
             name: .peerWorkspaceLayoutDidChange,
             object: nil,
             userInfo: ["workspaceID": self.id]
         )
-        #endif
     }
 
     // No post-close polling refresh loop: we rely on view invariants and Ghostty's wakeups.

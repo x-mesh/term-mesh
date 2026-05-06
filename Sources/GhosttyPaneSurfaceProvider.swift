@@ -177,9 +177,23 @@ final class GhosttyPaneSurfaceProvider: PeerSurfaceProvider {
             performFocus(paneIDBytes: req.paneID)
         case .setDivider(let req):
             performSetDivider(splitIDBytes: req.splitID, ratio: req.ratio)
+        case .newTab(let req):
+            performNewTab(paneIDBytes: req.paneID)
         case .none:
             break
         }
+    }
+
+    private func performNewTab(paneIDBytes: Data) {
+        guard let panelUUID = uuidFromSurfaceID(paneIDBytes),
+              let workspace = workspaceContaining(panelUUID: panelUUID),
+              let tabID = workspace.surfaceIdFromPanelId(panelUUID)
+        else { return }
+        let targetPaneId = workspace.bonsplitController.allPaneIds.first { paneId in
+            workspace.bonsplitController.tabs(inPane: paneId).contains { $0.id == tabID }
+        }
+        guard let targetPaneId else { return }
+        _ = workspace.newTerminalSurface(inPane: targetPaneId, focus: true)
     }
 
     private func performSetDivider(splitIDBytes: Data, ratio: Double) {

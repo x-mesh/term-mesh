@@ -693,6 +693,14 @@ public struct Termmesh_Peer_V1_WorkspaceControl: Sendable {
     set {kind = .setDivider(newValue)}
   }
 
+  public var newTab: Termmesh_Peer_V1_NewTabRequest {
+    get {
+      if case .newTab(let v)? = kind {return v}
+      return Termmesh_Peer_V1_NewTabRequest()
+    }
+    set {kind = .newTab(newValue)}
+  }
+
   public var unknownFields = SwiftProtobuf.UnknownStorage()
 
   public enum OneOf_Kind: Equatable, Sendable {
@@ -700,6 +708,7 @@ public struct Termmesh_Peer_V1_WorkspaceControl: Sendable {
     case closePane(Termmesh_Peer_V1_ClosePaneRequest)
     case focusPane(Termmesh_Peer_V1_FocusPaneRequest)
     case setDivider(Termmesh_Peer_V1_SetDividerPositionRequest)
+    case newTab(Termmesh_Peer_V1_NewTabRequest)
 
   }
 
@@ -756,6 +765,21 @@ public struct Termmesh_Peer_V1_SetDividerPositionRequest: Sendable {
 
   /// Fraction in [0.0, 1.0] of the first child.
   public var ratio: Double = 0
+
+  public var unknownFields = SwiftProtobuf.UnknownStorage()
+
+  public init() {}
+}
+
+public struct Termmesh_Peer_V1_NewTabRequest: Sendable {
+  // SwiftProtobuf.Message conformance is added in an extension below. See the
+  // `Message` and `Message+*Additions` files in the SwiftProtobuf library for
+  // methods supported on all messages.
+
+  /// surfaceID of any pane that lives in the bonsplit pane where the
+  /// new terminal tab should appear. The host resolves it back to the
+  /// pane id and creates a new tab there.
+  public var paneID: Data = Data()
 
   public var unknownFields = SwiftProtobuf.UnknownStorage()
 
@@ -2410,7 +2434,7 @@ extension Termmesh_Peer_V1_WorkspacePane: SwiftProtobuf.Message, SwiftProtobuf._
 
 extension Termmesh_Peer_V1_WorkspaceControl: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
   public static let protoMessageName: String = _protobuf_package + ".WorkspaceControl"
-  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{3}split_pane\0\u{3}close_pane\0\u{3}focus_pane\0\u{3}set_divider\0")
+  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{3}split_pane\0\u{3}close_pane\0\u{3}focus_pane\0\u{3}set_divider\0\u{3}new_tab\0")
 
   public mutating func decodeMessage<D: SwiftProtobuf.Decoder>(decoder: inout D) throws {
     while let fieldNumber = try decoder.nextFieldNumber() {
@@ -2470,6 +2494,19 @@ extension Termmesh_Peer_V1_WorkspaceControl: SwiftProtobuf.Message, SwiftProtobu
           self.kind = .setDivider(v)
         }
       }()
+      case 5: try {
+        var v: Termmesh_Peer_V1_NewTabRequest?
+        var hadOneofValue = false
+        if let current = self.kind {
+          hadOneofValue = true
+          if case .newTab(let m) = current {v = m}
+        }
+        try decoder.decodeSingularMessageField(value: &v)
+        if let v = v {
+          if hadOneofValue {try decoder.handleConflictingOneOf()}
+          self.kind = .newTab(v)
+        }
+      }()
       default: break
       }
     }
@@ -2496,6 +2533,10 @@ extension Termmesh_Peer_V1_WorkspaceControl: SwiftProtobuf.Message, SwiftProtobu
     case .setDivider?: try {
       guard case .setDivider(let v)? = self.kind else { preconditionFailure() }
       try visitor.visitSingularMessageField(value: v, fieldNumber: 4)
+    }()
+    case .newTab?: try {
+      guard case .newTab(let v)? = self.kind else { preconditionFailure() }
+      try visitor.visitSingularMessageField(value: v, fieldNumber: 5)
     }()
     case nil: break
     }
@@ -2634,6 +2675,36 @@ extension Termmesh_Peer_V1_SetDividerPositionRequest: SwiftProtobuf.Message, Swi
   public static func ==(lhs: Termmesh_Peer_V1_SetDividerPositionRequest, rhs: Termmesh_Peer_V1_SetDividerPositionRequest) -> Bool {
     if lhs.splitID != rhs.splitID {return false}
     if lhs.ratio != rhs.ratio {return false}
+    if lhs.unknownFields != rhs.unknownFields {return false}
+    return true
+  }
+}
+
+extension Termmesh_Peer_V1_NewTabRequest: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
+  public static let protoMessageName: String = _protobuf_package + ".NewTabRequest"
+  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{3}pane_id\0")
+
+  public mutating func decodeMessage<D: SwiftProtobuf.Decoder>(decoder: inout D) throws {
+    while let fieldNumber = try decoder.nextFieldNumber() {
+      // The use of inline closures is to circumvent an issue where the compiler
+      // allocates stack space for every case branch when no optimizations are
+      // enabled. https://github.com/apple/swift-protobuf/issues/1034
+      switch fieldNumber {
+      case 1: try { try decoder.decodeSingularBytesField(value: &self.paneID) }()
+      default: break
+      }
+    }
+  }
+
+  public func traverse<V: SwiftProtobuf.Visitor>(visitor: inout V) throws {
+    if !self.paneID.isEmpty {
+      try visitor.visitSingularBytesField(value: self.paneID, fieldNumber: 1)
+    }
+    try unknownFields.traverse(visitor: &visitor)
+  }
+
+  public static func ==(lhs: Termmesh_Peer_V1_NewTabRequest, rhs: Termmesh_Peer_V1_NewTabRequest) -> Bool {
+    if lhs.paneID != rhs.paneID {return false}
     if lhs.unknownFields != rhs.unknownFields {return false}
     return true
   }

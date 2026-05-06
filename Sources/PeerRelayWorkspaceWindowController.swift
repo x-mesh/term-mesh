@@ -113,6 +113,10 @@ final class PeerRelayWorkspaceWindowController: NSWindowController, NSWindowDele
         let title = workspace.title.isEmpty ? "<workspace>" : workspace.title
         window.title = "Peer Workspace · \(title)"
         window.isReleasedWhenClosed = false
+        // Disable AppKit's automatic Cmd+T window tabbing so Cmd+T
+        // flows through to our keyMonitor and forwards to the remote
+        // host instead of merging this window into a tab group.
+        window.tabbingMode = .disallowed
         window.center()
 
         super.init(window: window)
@@ -241,6 +245,9 @@ final class PeerRelayWorkspaceWindowController: NSWindowController, NSWindowDele
             case "w":
                 self.dispatchClose()
                 return nil
+            case "t":
+                self.dispatchNewTab()
+                return nil
             default:
                 return event
             }
@@ -294,6 +301,15 @@ final class PeerRelayWorkspaceWindowController: NSWindowController, NSWindowDele
         else { return }
         Task {
             try? await session.requestClosePane(paneID: surfaceID)
+        }
+    }
+
+    private func dispatchNewTab() {
+        guard let surfaceID = focusedPaneSurfaceID(),
+              let session = subscriptionSession
+        else { return }
+        Task {
+            try? await session.requestNewTab(paneID: surfaceID)
         }
     }
 

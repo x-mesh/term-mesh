@@ -232,6 +232,7 @@ message WorkspaceControl {
     ClosePaneRequest close_pane = 2;
     FocusPaneRequest focus_pane = 3;
     SetDividerPositionRequest set_divider = 4;
+    NewTabRequest new_tab = 5;
   }
 }
 
@@ -255,6 +256,13 @@ message SetDividerPositionRequest {
   bytes split_id = 1;
   // Fraction in [0.0, 1.0] of the first child.
   double ratio = 2;
+}
+
+message NewTabRequest {
+  // surfaceID of any pane that lives in the bonsplit pane where the
+  // new terminal tab should appear. The host resolves it back to the
+  // pane id and creates a new tab there.
+  bytes pane_id = 1;
 }
 
 // ============================================================

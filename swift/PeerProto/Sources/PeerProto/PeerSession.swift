@@ -188,6 +188,18 @@ public actor PeerSession {
         }
     }
 
+    /// Ask the host to create a new terminal tab inside the bonsplit
+    /// pane that owns this surface. Fire-and-forget.
+    public func requestNewTab(paneID: Data) async throws {
+        try await sendEnvelope { env in
+            var req = Termmesh_Peer_V1_NewTabRequest()
+            req.paneID = paneID
+            var ctl = Termmesh_Peer_V1_WorkspaceControl()
+            ctl.newTab = req
+            env.workspaceControl = ctl
+        }
+    }
+
     // MARK: - AttachSurface
 
     public func attachSurface(
