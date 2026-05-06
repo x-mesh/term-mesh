@@ -175,8 +175,27 @@ final class GhosttyPaneSurfaceProvider: PeerSurfaceProvider {
             performClose(paneIDBytes: req.paneID)
         case .focusPane(let req):
             performFocus(paneIDBytes: req.paneID)
+        case .setDivider(let req):
+            performSetDivider(splitIDBytes: req.splitID, ratio: req.ratio)
         case .none:
             break
+        }
+    }
+
+    private func performSetDivider(splitIDBytes: Data, ratio: Double) {
+        guard let splitUUID = uuidFromSurfaceID(splitIDBytes),
+              let tabManager = AppDelegate.shared?.tabManager
+        else { return }
+        let clamped = CGFloat(max(0.05, min(0.95, ratio)))
+        for workspace in tabManager.tabs {
+            if workspace.bonsplitController.findSplit(splitUUID) {
+                workspace.bonsplitController.setDividerPosition(
+                    clamped,
+                    forSplit: splitUUID,
+                    fromExternal: false
+                )
+                return
+            }
         }
     }
 
@@ -366,6 +385,9 @@ final class GhosttyPaneSurfaceProvider: PeerSurfaceProvider {
                 splitMsg.dividerPosition = split.dividerPosition
                 splitMsg.first = f
                 splitMsg.second = s
+                if let splitUUID = UUID(uuidString: split.id) {
+                    splitMsg.splitID = withUnsafeBytes(of: splitUUID.uuid) { Data($0) }
+                }
                 var layout = Termmesh_Peer_V1_WorkspaceLayout()
                 layout.split = splitMsg
                 return layout

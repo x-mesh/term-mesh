@@ -175,6 +175,19 @@ public actor PeerSession {
         }
     }
 
+    /// Ask the host to update a split's divider ratio. Fire-and-forget;
+    /// the resulting layout flows back via WorkspaceLayoutChanged.
+    public func requestSetDivider(splitID: Data, ratio: Double) async throws {
+        try await sendEnvelope { env in
+            var req = Termmesh_Peer_V1_SetDividerPositionRequest()
+            req.splitID = splitID
+            req.ratio = ratio
+            var ctl = Termmesh_Peer_V1_WorkspaceControl()
+            ctl.setDivider = req
+            env.workspaceControl = ctl
+        }
+    }
+
     // MARK: - AttachSurface
 
     public func attachSurface(

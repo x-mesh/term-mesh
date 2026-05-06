@@ -202,6 +202,10 @@ message WorkspaceSplit {
   double divider_position = 2;
   WorkspaceLayout first = 3;
   WorkspaceLayout second = 4;
+  // Stable identifier of the bonsplit split node, so clients can ask
+  // the host to update the divider via SetDividerPositionRequest. May
+  // be empty for hosts that don't expose stable split ids.
+  bytes split_id = 5;
 }
 
 message WorkspacePane {
@@ -227,6 +231,7 @@ message WorkspaceControl {
     SplitPaneRequest split_pane = 1;
     ClosePaneRequest close_pane = 2;
     FocusPaneRequest focus_pane = 3;
+    SetDividerPositionRequest set_divider = 4;
   }
 }
 
@@ -244,6 +249,12 @@ message ClosePaneRequest {
 
 message FocusPaneRequest {
   bytes pane_id = 1;
+}
+
+message SetDividerPositionRequest {
+  bytes split_id = 1;
+  // Fraction in [0.0, 1.0] of the first child.
+  double ratio = 2;
 }
 
 // ============================================================

@@ -19,6 +19,21 @@ import PeerProto
 /// forwarded to the remote host instead of triggering a local split.
 final class PeerRelayWorkspaceWindow: NSWindow {}
 
+/// Adapter that forwards NSSplitView delegate callbacks back to the
+/// owning controller. Lives separately because NSSplitView holds its
+/// `delegate` weakly.
+@MainActor
+private final class WorkspaceSplitWatcher: NSObject, NSSplitViewDelegate {
+    weak var controller: PeerRelayWorkspaceWindowController?
+    init(controller: PeerRelayWorkspaceWindowController) {
+        self.controller = controller
+    }
+    func splitViewDidResizeSubviews(_ notification: Notification) {
+        guard let splitView = notification.object as? NSSplitView else { return }
+        controller?.dividerDidResize(splitView)
+    }
+}
+
 @MainActor
 final class PeerRelayWorkspaceWindowController: NSWindowController, NSWindowDelegate {
     // MARK: - Pane bookkeeping
@@ -60,6 +75,22 @@ final class PeerRelayWorkspaceWindowController: NSWindowController, NSWindowDele
     /// when Ghostty surfaces sit inside an NSSplitView we built ourselves,
     /// so we track focus explicitly instead.
     private var lastClickedSurfaceID: Data?
+    /// Bonsplit split-id (16-byte UUID) keyed to the NSSplitView that
+    /// renders it. Used by the divider-drag delegate to identify which
+    /// host-side split to update.
+    private var splitsByID: [Data: NSSplitView] = [:]
+    private var splitIDByObject: [ObjectIdentifier: Data] = [:]
+    /// Per-split debounce — drag fires `splitViewDidResizeSubviews` on
+    /// every pixel; coalesce to one push per ~150 ms idle window.
+    private var dividerDebounce: [Data: Task<Void, Never>] = [:]
+    /// Set non-zero while we apply layout updates programmatically so
+    /// the resulting `splitViewDidResizeSubviews` callbacks don't echo
+    /// the value back to the host (would cause infinite ping-pong).
+    private var applyingLayoutDepth: Int = 0
+    /// Watcher that converts NSSplitView delegate callbacks back into
+    /// controller-side notifications. Stored separately so the split
+    /// view's weak `delegate` reference doesn't drop it.
+    private var splitWatcher: WorkspaceSplitWatcher?
     private var startTask: Task<Void, Never>?
     private var isClosing = false
 
@@ -123,6 +154,11 @@ final class PeerRelayWorkspaceWindowController: NSWindowController, NSWindowDele
             NSEvent.removeMonitor(monitor)
             clickMonitor = nil
         }
+        for (_, task) in dividerDebounce { task.cancel() }
+        dividerDebounce.removeAll()
+        splitsByID.removeAll()
+        splitIDByObject.removeAll()
+        splitWatcher = nil
         let transport = subscriptionTransport
         subscriptionTransport = nil
         let toStop = Array(panesBySurfaceID.values)
@@ -308,6 +344,8 @@ final class PeerRelayWorkspaceWindowController: NSWindowController, NSWindowDele
         // Build the new view tree on the main actor.
         let (newRoot, dividers) = await MainActor.run { () -> (NSView, [(NSSplitView, CGFloat)]) in
             self.pendingDividerSetters.removeAll()
+            self.splitsByID.removeAll()
+            self.splitIDByObject.removeAll()
             let view = self.materializeLayout(layout)
             return (view, self.pendingDividerSetters)
         }
@@ -337,6 +375,10 @@ final class PeerRelayWorkspaceWindowController: NSWindowController, NSWindowDele
         if window.contentView == nil {
             window.contentView = container
         }
+        // Programmatic divider apply — silence the divider-watcher
+        // callbacks so we don't bounce the position straight back to
+        // the host.
+        applyingLayoutDepth += 1
         container.layoutSubtreeIfNeeded()
         for (split, fraction) in dividers {
             let extent: CGFloat = split.isVertical ? split.bounds.width : split.bounds.height
@@ -344,6 +386,36 @@ final class PeerRelayWorkspaceWindowController: NSWindowController, NSWindowDele
             let position = max(20, min(extent - 20, extent * fraction))
             split.setPosition(position, ofDividerAt: 0)
         }
+        DispatchQueue.main.async { [weak self] in
+            self?.applyingLayoutDepth = max(0, (self?.applyingLayoutDepth ?? 1) - 1)
+        }
+    }
+
+    /// Called by `WorkspaceSplitWatcher` whenever an NSSplitView posts
+    /// a resize event. Skips events triggered by our own
+    /// `swapRootView` apply, debounces the rest by ~150 ms so a drag
+    /// becomes a single push, then forwards the new ratio to the host.
+    fileprivate func dividerDidResize(_ splitView: NSSplitView) {
+        guard applyingLayoutDepth == 0 else { return }
+        guard let splitID = splitIDByObject[ObjectIdentifier(splitView)] else { return }
+        let extent = splitView.isVertical ? splitView.bounds.width : splitView.bounds.height
+        guard extent > 0, splitView.subviews.count >= 2 else { return }
+        let firstExtent = splitView.isVertical
+            ? splitView.subviews[0].frame.width
+            : splitView.subviews[0].frame.height
+        let ratio = Double(max(0.0, min(1.0, firstExtent / extent)))
+
+        dividerDebounce[splitID]?.cancel()
+        dividerDebounce[splitID] = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: 150_000_000)
+            if Task.isCancelled { return }
+            await self?.sendDividerUpdate(splitID: splitID, ratio: ratio)
+        }
+    }
+
+    private func sendDividerUpdate(splitID: Data, ratio: Double) async {
+        guard let session = subscriptionSession else { return }
+        try? await session.requestSetDivider(splitID: splitID, ratio: ratio)
     }
 
     /// Recursively builds an NSView hierarchy from a layout proto,
@@ -368,6 +440,16 @@ final class PeerRelayWorkspaceWindowController: NSWindowController, NSWindowDele
             nsSplit.addSubview(first)
             nsSplit.addSubview(second)
             pendingDividerSetters.append((nsSplit, CGFloat(split.dividerPosition)))
+            // Register split for divider-drag forwarding when the host
+            // gave us a stable id.
+            if !split.splitID.isEmpty {
+                splitsByID[split.splitID] = nsSplit
+                splitIDByObject[ObjectIdentifier(nsSplit)] = split.splitID
+                if splitWatcher == nil {
+                    splitWatcher = WorkspaceSplitWatcher(controller: self)
+                }
+                nsSplit.delegate = splitWatcher
+            }
             return nsSplit
         case .none:
             return NSView()

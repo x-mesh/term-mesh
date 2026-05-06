@@ -619,6 +619,14 @@ public struct Termmesh_Peer_V1_WorkspaceSplit: @unchecked Sendable {
   /// Clears the value of `second`. Subsequent reads from it will return its default value.
   public mutating func clearSecond() {_uniqueStorage()._second = nil}
 
+  /// Stable identifier of the bonsplit split node, so clients can ask
+  /// the host to update the divider via SetDividerPositionRequest. May
+  /// be empty for hosts that don't expose stable split ids.
+  public var splitID: Data {
+    get {_storage._splitID}
+    set {_uniqueStorage()._splitID = newValue}
+  }
+
   public var unknownFields = SwiftProtobuf.UnknownStorage()
 
   public init() {}
@@ -677,12 +685,21 @@ public struct Termmesh_Peer_V1_WorkspaceControl: Sendable {
     set {kind = .focusPane(newValue)}
   }
 
+  public var setDivider: Termmesh_Peer_V1_SetDividerPositionRequest {
+    get {
+      if case .setDivider(let v)? = kind {return v}
+      return Termmesh_Peer_V1_SetDividerPositionRequest()
+    }
+    set {kind = .setDivider(newValue)}
+  }
+
   public var unknownFields = SwiftProtobuf.UnknownStorage()
 
   public enum OneOf_Kind: Equatable, Sendable {
     case splitPane(Termmesh_Peer_V1_SplitPaneRequest)
     case closePane(Termmesh_Peer_V1_ClosePaneRequest)
     case focusPane(Termmesh_Peer_V1_FocusPaneRequest)
+    case setDivider(Termmesh_Peer_V1_SetDividerPositionRequest)
 
   }
 
@@ -724,6 +741,21 @@ public struct Termmesh_Peer_V1_FocusPaneRequest: Sendable {
   // methods supported on all messages.
 
   public var paneID: Data = Data()
+
+  public var unknownFields = SwiftProtobuf.UnknownStorage()
+
+  public init() {}
+}
+
+public struct Termmesh_Peer_V1_SetDividerPositionRequest: Sendable {
+  // SwiftProtobuf.Message conformance is added in an extension below. See the
+  // `Message` and `Message+*Additions` files in the SwiftProtobuf library for
+  // methods supported on all messages.
+
+  public var splitID: Data = Data()
+
+  /// Fraction in [0.0, 1.0] of the first child.
+  public var ratio: Double = 0
 
   public var unknownFields = SwiftProtobuf.UnknownStorage()
 
@@ -2230,13 +2262,14 @@ extension Termmesh_Peer_V1_WorkspaceLayout: SwiftProtobuf.Message, SwiftProtobuf
 
 extension Termmesh_Peer_V1_WorkspaceSplit: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
   public static let protoMessageName: String = _protobuf_package + ".WorkspaceSplit"
-  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{1}orientation\0\u{3}divider_position\0\u{1}first\0\u{1}second\0")
+  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{1}orientation\0\u{3}divider_position\0\u{1}first\0\u{1}second\0\u{3}split_id\0")
 
   fileprivate class _StorageClass {
     var _orientation: String = String()
     var _dividerPosition: Double = 0
     var _first: Termmesh_Peer_V1_WorkspaceLayout? = nil
     var _second: Termmesh_Peer_V1_WorkspaceLayout? = nil
+    var _splitID: Data = Data()
 
       // This property is used as the initial default value for new instances of the type.
       // The type itself is protecting the reference to its storage via CoW semantics.
@@ -2251,6 +2284,7 @@ extension Termmesh_Peer_V1_WorkspaceSplit: SwiftProtobuf.Message, SwiftProtobuf.
       _dividerPosition = source._dividerPosition
       _first = source._first
       _second = source._second
+      _splitID = source._splitID
     }
   }
 
@@ -2273,6 +2307,7 @@ extension Termmesh_Peer_V1_WorkspaceSplit: SwiftProtobuf.Message, SwiftProtobuf.
         case 2: try { try decoder.decodeSingularDoubleField(value: &_storage._dividerPosition) }()
         case 3: try { try decoder.decodeSingularMessageField(value: &_storage._first) }()
         case 4: try { try decoder.decodeSingularMessageField(value: &_storage._second) }()
+        case 5: try { try decoder.decodeSingularBytesField(value: &_storage._splitID) }()
         default: break
         }
       }
@@ -2297,6 +2332,9 @@ extension Termmesh_Peer_V1_WorkspaceSplit: SwiftProtobuf.Message, SwiftProtobuf.
       try { if let v = _storage._second {
         try visitor.visitSingularMessageField(value: v, fieldNumber: 4)
       } }()
+      if !_storage._splitID.isEmpty {
+        try visitor.visitSingularBytesField(value: _storage._splitID, fieldNumber: 5)
+      }
     }
     try unknownFields.traverse(visitor: &visitor)
   }
@@ -2310,6 +2348,7 @@ extension Termmesh_Peer_V1_WorkspaceSplit: SwiftProtobuf.Message, SwiftProtobuf.
         if _storage._dividerPosition != rhs_storage._dividerPosition {return false}
         if _storage._first != rhs_storage._first {return false}
         if _storage._second != rhs_storage._second {return false}
+        if _storage._splitID != rhs_storage._splitID {return false}
         return true
       }
       if !storagesAreEqual {return false}
@@ -2371,7 +2410,7 @@ extension Termmesh_Peer_V1_WorkspacePane: SwiftProtobuf.Message, SwiftProtobuf._
 
 extension Termmesh_Peer_V1_WorkspaceControl: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
   public static let protoMessageName: String = _protobuf_package + ".WorkspaceControl"
-  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{3}split_pane\0\u{3}close_pane\0\u{3}focus_pane\0")
+  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{3}split_pane\0\u{3}close_pane\0\u{3}focus_pane\0\u{3}set_divider\0")
 
   public mutating func decodeMessage<D: SwiftProtobuf.Decoder>(decoder: inout D) throws {
     while let fieldNumber = try decoder.nextFieldNumber() {
@@ -2418,6 +2457,19 @@ extension Termmesh_Peer_V1_WorkspaceControl: SwiftProtobuf.Message, SwiftProtobu
           self.kind = .focusPane(v)
         }
       }()
+      case 4: try {
+        var v: Termmesh_Peer_V1_SetDividerPositionRequest?
+        var hadOneofValue = false
+        if let current = self.kind {
+          hadOneofValue = true
+          if case .setDivider(let m) = current {v = m}
+        }
+        try decoder.decodeSingularMessageField(value: &v)
+        if let v = v {
+          if hadOneofValue {try decoder.handleConflictingOneOf()}
+          self.kind = .setDivider(v)
+        }
+      }()
       default: break
       }
     }
@@ -2440,6 +2492,10 @@ extension Termmesh_Peer_V1_WorkspaceControl: SwiftProtobuf.Message, SwiftProtobu
     case .focusPane?: try {
       guard case .focusPane(let v)? = self.kind else { preconditionFailure() }
       try visitor.visitSingularMessageField(value: v, fieldNumber: 3)
+    }()
+    case .setDivider?: try {
+      guard case .setDivider(let v)? = self.kind else { preconditionFailure() }
+      try visitor.visitSingularMessageField(value: v, fieldNumber: 4)
     }()
     case nil: break
     }
@@ -2543,6 +2599,41 @@ extension Termmesh_Peer_V1_FocusPaneRequest: SwiftProtobuf.Message, SwiftProtobu
 
   public static func ==(lhs: Termmesh_Peer_V1_FocusPaneRequest, rhs: Termmesh_Peer_V1_FocusPaneRequest) -> Bool {
     if lhs.paneID != rhs.paneID {return false}
+    if lhs.unknownFields != rhs.unknownFields {return false}
+    return true
+  }
+}
+
+extension Termmesh_Peer_V1_SetDividerPositionRequest: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
+  public static let protoMessageName: String = _protobuf_package + ".SetDividerPositionRequest"
+  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{3}split_id\0\u{1}ratio\0")
+
+  public mutating func decodeMessage<D: SwiftProtobuf.Decoder>(decoder: inout D) throws {
+    while let fieldNumber = try decoder.nextFieldNumber() {
+      // The use of inline closures is to circumvent an issue where the compiler
+      // allocates stack space for every case branch when no optimizations are
+      // enabled. https://github.com/apple/swift-protobuf/issues/1034
+      switch fieldNumber {
+      case 1: try { try decoder.decodeSingularBytesField(value: &self.splitID) }()
+      case 2: try { try decoder.decodeSingularDoubleField(value: &self.ratio) }()
+      default: break
+      }
+    }
+  }
+
+  public func traverse<V: SwiftProtobuf.Visitor>(visitor: inout V) throws {
+    if !self.splitID.isEmpty {
+      try visitor.visitSingularBytesField(value: self.splitID, fieldNumber: 1)
+    }
+    if self.ratio.bitPattern != 0 {
+      try visitor.visitSingularDoubleField(value: self.ratio, fieldNumber: 2)
+    }
+    try unknownFields.traverse(visitor: &visitor)
+  }
+
+  public static func ==(lhs: Termmesh_Peer_V1_SetDividerPositionRequest, rhs: Termmesh_Peer_V1_SetDividerPositionRequest) -> Bool {
+    if lhs.splitID != rhs.splitID {return false}
+    if lhs.ratio != rhs.ratio {return false}
     if lhs.unknownFields != rhs.unknownFields {return false}
     return true
   }
