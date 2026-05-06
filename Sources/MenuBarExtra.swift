@@ -13,6 +13,7 @@ final class MenuBarExtraController: NSObject, NSMenuDelegate {
     private let onOpenPreferences: () -> Void
     private let onQuitApp: () -> Void
     private var notificationsCancellable: AnyCancellable?
+    private var peerServerObserver: NSObjectProtocol?
     private let buildHintTitle: String?
 
     private let stateHintItem = NSMenuItem(title: "No unread notifications", action: nil, keyEquivalent: "")
@@ -64,6 +65,14 @@ final class MenuBarExtraController: NSObject, NSMenuDelegate {
             .sink { [weak self] _ in
                 self?.refreshUI()
             }
+
+        peerServerObserver = NotificationCenter.default.addObserver(
+            forName: .peerServerStateDidChange,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            self?.refreshUI()
+        }
 
         refreshUI()
     }
@@ -159,10 +168,18 @@ final class MenuBarExtraController: NSObject, NSMenuDelegate {
         rebuildInlineNotificationItems(recentNotifications: snapshot.recentNotifications)
 
         if let button = statusItem.button {
-            button.image = MenuBarIconRenderer.makeImage(unreadCount: displayedUnreadCount)
-            button.toolTip = displayedUnreadCount == 0
+            let peerActive = PeerServerCoordinator.shared.isRunning
+            button.image = MenuBarIconRenderer.makeImage(
+                unreadCount: displayedUnreadCount,
+                peerActive: peerActive
+            )
+            var toolTip = displayedUnreadCount == 0
                 ? "Term-Mesh"
                 : "Term-Mesh: \(displayedUnreadCount) unread notification\(displayedUnreadCount == 1 ? "" : "s")"
+            if peerActive {
+                toolTip += " · Peer server: on"
+            }
+            button.toolTip = toolTip
         }
     }
 
@@ -574,7 +591,7 @@ enum MenuBarIconDebugSettings {
 
 enum MenuBarIconRenderer {
 
-    static func makeImage(unreadCount: Int) -> NSImage {
+    static func makeImage(unreadCount: Int, peerActive: Bool = false) -> NSImage {
         let badgeText = MenuBarBadgeLabelFormatter.badgeText(for: unreadCount)
         let config = MenuBarIconDebugSettings.badgeRenderConfig()
         let size = NSSize(width: 18, height: 18)
@@ -582,18 +599,33 @@ enum MenuBarIconRenderer {
         image.lockFocus()
         defer { image.unlockFocus() }
 
+        // When `peerActive` is true we need a colored accent on the
+        // dot. NSImage can't mix template + non-template in one
+        // bitmap, so fall back to a non-template image and paint the
+        // glyph in `labelColor`, which auto-adjusts to the menu-bar
+        // appearance closely enough that the result still reads as a
+        // standard status item.
+        let glyphColor: NSColor = peerActive ? .labelColor : .white
         let glyphRect = NSRect(x: 0.5, y: 0.5, width: 15.0, height: 17.0)
-        drawGlyph(in: glyphRect)
+        drawGlyph(in: glyphRect, color: glyphColor)
 
         if let text = badgeText {
             drawBadge(text: text, in: config.badgeRect, config: config)
         }
 
-        image.isTemplate = true
+        if peerActive {
+            // Larger blue dot at the bottom-right indicates the
+            // local peer-federation server is listening.
+            let dot = NSBezierPath(ovalIn: NSRect(x: 11.5, y: 0.5, width: 6, height: 6))
+            NSColor.systemBlue.setFill()
+            dot.fill()
+        }
+
+        image.isTemplate = !peerActive
         return image
     }
 
-    private static func drawGlyph(in rect: NSRect) {
+    private static func drawGlyph(in rect: NSRect, color: NSColor = .white) {
         // Hub-and-spoke mesh: central hub + 6 outer nodes connected by spokes and ring.
         let cx = rect.midX
         let cy = rect.midY
@@ -610,7 +642,6 @@ enum MenuBarIconRenderer {
         for i in 1...6 { edges.append((0, i)) }
         for i in 1...6 { edges.append((i, i == 6 ? 1 : i + 1)) }
 
-        let color = NSColor.white
         let hubRadius: CGFloat = 2.2
         let nodeRadius: CGFloat = 1.6
 

@@ -66,6 +66,7 @@ final class PeerServerCoordinator: NSObject {
         if shouldRun {
             guard server == nil else { return true } // already up
             await bringUp(at: PeerFederationSettings.socketPath, silent: true)
+            postStateChange()
             return server != nil
         } else {
             guard let server else { return true }
@@ -76,8 +77,13 @@ final class PeerServerCoordinator: NSObject {
             bonjour?.stop()
             bonjour = nil
             await server.stop()
+            postStateChange()
             return true
         }
+    }
+
+    private func postStateChange() {
+        NotificationCenter.default.post(name: .peerServerStateDidChange, object: nil)
     }
 
     /// `true` while the server is listening. Lets Settings reflect
@@ -124,6 +130,7 @@ final class PeerServerCoordinator: NSObject {
         Task {
             await server.stop()
             await MainActor.run {
+                self.postStateChange()
                 self.showInfo(
                     title: "Peer server stopped",
                     body: oldPath.map { "Socket \($0) is gone." } ?? "Socket removed."
@@ -158,6 +165,7 @@ final class PeerServerCoordinator: NSObject {
             publisher.start()
             self.bonjour = publisher
             NSLog("[peer-debug] server listening on %@", path)
+            postStateChange()
             if !silent {
                 showInfo(
                     title: "Peer server listening",
@@ -233,4 +241,9 @@ extension Notification.Name {
     /// `PeerServerCoordinator` which pushes the refreshed layout
     /// to attached peer clients.
     static let peerWorkspaceLayoutDidChange = Notification.Name("PeerWorkspaceLayoutDidChange")
+
+    /// Posted by `PeerServerCoordinator` whenever the local peer
+    /// server starts or stops. Observed by the status-bar icon to
+    /// toggle the activity dot.
+    static let peerServerStateDidChange = Notification.Name("PeerServerStateDidChange")
 }
