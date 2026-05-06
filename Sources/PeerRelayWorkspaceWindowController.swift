@@ -12,6 +12,13 @@
 import AppKit
 import PeerProto
 
+/// Marker NSWindow subclass for peer-relay workspace windows. Lets the
+/// app-level NSEvent shortcut monitor (`AppDelegate.handleCustomShortcut`)
+/// short-circuit before consuming Cmd+D / Cmd+Shift+D / Cmd+W, so those
+/// keystrokes flow through to this controller's local monitor and are
+/// forwarded to the remote host instead of triggering a local split.
+final class PeerRelayWorkspaceWindow: NSWindow {}
+
 @MainActor
 final class PeerRelayWorkspaceWindowController: NSWindowController, NSWindowDelegate {
     // MARK: - Pane bookkeeping
@@ -41,6 +48,18 @@ final class PeerRelayWorkspaceWindowController: NSWindowController, NSWindowDele
     private var pendingDividerSetters: [(NSSplitView, CGFloat)] = []
     private var subscriptionTask: Task<Void, Never>?
     private var subscriptionTransport: UnixSocketTransport?
+    /// Open peer session held alive for the lifetime of the controller.
+    /// Used both to receive `WorkspaceLayoutChanged` pushes and to
+    /// send fire-and-forget `WorkspaceControl` requests (Cmd+D split,
+    /// Cmd+W close, …) back to the host.
+    private var subscriptionSession: PeerSession?
+    private var keyMonitor: Any?
+    private var clickMonitor: Any?
+    /// surfaceID of the most recently mouse-down'd pane in this
+    /// window. NSWindow.firstResponder doesn't always swing reliably
+    /// when Ghostty surfaces sit inside an NSSplitView we built ourselves,
+    /// so we track focus explicitly instead.
+    private var lastClickedSurfaceID: Data?
     private var startTask: Task<Void, Never>?
     private var isClosing = false
 
@@ -54,7 +73,7 @@ final class PeerRelayWorkspaceWindowController: NSWindowController, NSWindowDele
         self.currentLayout = workspace.layout
 
         let initialSize = NSRect(x: 0, y: 0, width: 1024, height: 640)
-        let window = NSWindow(
+        let window = PeerRelayWorkspaceWindow(
             contentRect: initialSize,
             styleMask: [.titled, .closable, .resizable, .miniaturizable],
             backing: .buffered,
@@ -95,6 +114,15 @@ final class PeerRelayWorkspaceWindowController: NSWindowController, NSWindowDele
         startTask = nil
         subscriptionTask?.cancel()
         subscriptionTask = nil
+        subscriptionSession = nil
+        if let monitor = keyMonitor {
+            NSEvent.removeMonitor(monitor)
+            keyMonitor = nil
+        }
+        if let monitor = clickMonitor {
+            NSEvent.removeMonitor(monitor)
+            clickMonitor = nil
+        }
         let transport = subscriptionTransport
         subscriptionTransport = nil
         let toStop = Array(panesBySurfaceID.values)
@@ -122,6 +150,8 @@ final class PeerRelayWorkspaceWindowController: NSWindowController, NSWindowDele
             )
             _ = try await session.handshake()
             subscriptionTransport = transport
+            subscriptionSession = session
+            await MainActor.run { self.installKeyMonitor() }
 
             subscriptionTask = Task { [weak self] in
                 while let self, !Task.isCancelled {
@@ -146,6 +176,101 @@ final class PeerRelayWorkspaceWindowController: NSWindowController, NSWindowDele
         } catch {
             NSLog("[peer-ws] subscription connect failed: %@", String(describing: error))
         }
+    }
+
+    // MARK: - Workspace control (Cmd+D / Cmd+Shift+D / Cmd+W)
+    //
+    // Local NSEvent monitor scoped to this window. When the user
+    // presses a known split / close shortcut while this relay window
+    // is key, intercept it and forward to the host via the
+    // subscription session. The host applies the change with bonsplit
+    // and the resulting WorkspaceLayoutChanged push patches our local
+    // NSSplitView tree (Phase W'). Without interception the shortcut
+    // would either no-op (no local bonsplit) or worse, target the
+    // app's main window.
+
+    private func installKeyMonitor() {
+        keyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
+            guard let self,
+                  let window = self.window,
+                  window.isKeyWindow,
+                  event.modifierFlags.contains(.command)
+            else { return event }
+            let chars = event.charactersIgnoringModifiers ?? ""
+            let shift = event.modifierFlags.contains(.shift)
+            switch chars.lowercased() {
+            case "d":
+                self.dispatchSplit(orientation: shift ? "vertical" : "horizontal")
+                return nil
+            case "w":
+                self.dispatchClose()
+                return nil
+            default:
+                return event
+            }
+        }
+
+        // Track which pane the user last clicked. Ghostty surfaces
+        // embedded in our NSSplitView don't always promote themselves
+        // to firstResponder reliably, so we record focus on mouse
+        // down and consult that first when dispatching shortcuts.
+        clickMonitor = NSEvent.addLocalMonitorForEvents(matching: .leftMouseDown) { [weak self] event in
+            guard let self,
+                  let window = self.window,
+                  event.window === window
+            else { return event }
+            let point = event.locationInWindow
+            for (sid, slot) in self.panesBySurfaceID {
+                let frameInWindow = slot.view.convert(slot.view.bounds, to: nil)
+                if frameInWindow.contains(point) {
+                    self.lastClickedSurfaceID = sid
+                    break
+                }
+            }
+            return event
+        }
+    }
+
+    private func dispatchSplit(orientation: String) {
+        guard let surfaceID = focusedPaneSurfaceID(),
+              let session = subscriptionSession
+        else { return }
+        Task {
+            try? await session.requestSplitPane(paneID: surfaceID, orientation: orientation)
+        }
+    }
+
+    private func dispatchClose() {
+        guard let surfaceID = focusedPaneSurfaceID(),
+              let session = subscriptionSession
+        else { return }
+        Task {
+            try? await session.requestClosePane(paneID: surfaceID)
+        }
+    }
+
+    /// Resolve the active pane in priority order:
+    ///   1. The most recently mouse-down'd pane (tracked by
+    ///      `clickMonitor`) — most reliable in our embedded NSSplitView
+    ///      where Ghostty doesn't always claim firstResponder.
+    ///   2. NSWindow.firstResponder walked up to its enclosing slot.
+    ///   3. Fallback to the first slot in the dictionary so the
+    ///      shortcut at least targets *something* the host can split.
+    private func focusedPaneSurfaceID() -> Data? {
+        if let sid = lastClickedSurfaceID, panesBySurfaceID[sid] != nil {
+            return sid
+        }
+        if let window = self.window,
+           var view = window.firstResponder as? NSView {
+            while true {
+                for (sid, slot) in panesBySurfaceID where view === slot.view || view.isDescendant(of: slot.view) {
+                    return sid
+                }
+                guard let parent = view.superview else { break }
+                view = parent
+            }
+        }
+        return panesBySurfaceID.keys.first
     }
 
     // MARK: - Layout application

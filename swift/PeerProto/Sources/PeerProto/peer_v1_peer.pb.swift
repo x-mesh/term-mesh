@@ -184,6 +184,14 @@ public struct Termmesh_Peer_V1_Envelope: Sendable {
     set {payload = .workspaceList(newValue)}
   }
 
+  public var workspaceControl: Termmesh_Peer_V1_WorkspaceControl {
+    get {
+      if case .workspaceControl(let v)? = payload {return v}
+      return Termmesh_Peer_V1_WorkspaceControl()
+    }
+    set {payload = .workspaceControl(newValue)}
+  }
+
   public var ptyData: Termmesh_Peer_V1_PtyData {
     get {
       if case .ptyData(let v)? = payload {return v}
@@ -278,6 +286,7 @@ public struct Termmesh_Peer_V1_Envelope: Sendable {
     case detachSurface(Termmesh_Peer_V1_DetachSurface)
     case listWorkspaces(Termmesh_Peer_V1_ListWorkspaces)
     case workspaceList(Termmesh_Peer_V1_WorkspaceList)
+    case workspaceControl(Termmesh_Peer_V1_WorkspaceControl)
     case ptyData(Termmesh_Peer_V1_PtyData)
     case input(Termmesh_Peer_V1_Input)
     case resize(Termmesh_Peer_V1_Resize)
@@ -631,6 +640,69 @@ public struct Termmesh_Peer_V1_WorkspacePane: Sendable {
   public var rows: UInt32 = 0
 
   public var cwd: String = String()
+
+  public var unknownFields = SwiftProtobuf.UnknownStorage()
+
+  public init() {}
+}
+
+public struct Termmesh_Peer_V1_WorkspaceControl: Sendable {
+  // SwiftProtobuf.Message conformance is added in an extension below. See the
+  // `Message` and `Message+*Additions` files in the SwiftProtobuf library for
+  // methods supported on all messages.
+
+  public var kind: Termmesh_Peer_V1_WorkspaceControl.OneOf_Kind? = nil
+
+  public var splitPane: Termmesh_Peer_V1_SplitPaneRequest {
+    get {
+      if case .splitPane(let v)? = kind {return v}
+      return Termmesh_Peer_V1_SplitPaneRequest()
+    }
+    set {kind = .splitPane(newValue)}
+  }
+
+  public var closePane: Termmesh_Peer_V1_ClosePaneRequest {
+    get {
+      if case .closePane(let v)? = kind {return v}
+      return Termmesh_Peer_V1_ClosePaneRequest()
+    }
+    set {kind = .closePane(newValue)}
+  }
+
+  public var unknownFields = SwiftProtobuf.UnknownStorage()
+
+  public enum OneOf_Kind: Equatable, Sendable {
+    case splitPane(Termmesh_Peer_V1_SplitPaneRequest)
+    case closePane(Termmesh_Peer_V1_ClosePaneRequest)
+
+  }
+
+  public init() {}
+}
+
+public struct Termmesh_Peer_V1_SplitPaneRequest: Sendable {
+  // SwiftProtobuf.Message conformance is added in an extension below. See the
+  // `Message` and `Message+*Additions` files in the SwiftProtobuf library for
+  // methods supported on all messages.
+
+  /// surfaceID of the pane to split (the focused leaf in the relay
+  /// window). The host resolves it back to its bonsplit pane.
+  public var paneID: Data = Data()
+
+  /// "horizontal" (side-by-side) or "vertical" (stacked).
+  public var orientation: String = String()
+
+  public var unknownFields = SwiftProtobuf.UnknownStorage()
+
+  public init() {}
+}
+
+public struct Termmesh_Peer_V1_ClosePaneRequest: Sendable {
+  // SwiftProtobuf.Message conformance is added in an extension below. See the
+  // `Message` and `Message+*Additions` files in the SwiftProtobuf library for
+  // methods supported on all messages.
+
+  public var paneID: Data = Data()
 
   public var unknownFields = SwiftProtobuf.UnknownStorage()
 
@@ -1110,7 +1182,7 @@ extension Termmesh_Peer_V1_AttachMode: SwiftProtobuf._ProtoNameProviding {
 
 extension Termmesh_Peer_V1_Envelope: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
   public static let protoMessageName: String = _protobuf_package + ".Envelope"
-  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{1}seq\0\u{3}correlation_id\0\u{2}\u{8}hello\0\u{3}auth_challenge\0\u{1}auth\0\u{3}auth_result\0\u{4}\u{7}list_surfaces\0\u{3}surface_list\0\u{3}attach_surface\0\u{3}attach_result\0\u{3}detach_surface\0\u{3}list_workspaces\0\u{3}workspace_list\0\u{4}\u{4}pty_data\0\u{1}input\0\u{1}resize\0\u{3}grid_snapshot\0\u{3}data_ack\0\u{4}\u{6}workspace_update\0\u{2}\u{a}ping\0\u{1}pong\0\u{2}\u{9}goodbye\0\u{2}'error\0")
+  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{1}seq\0\u{3}correlation_id\0\u{2}\u{8}hello\0\u{3}auth_challenge\0\u{1}auth\0\u{3}auth_result\0\u{4}\u{7}list_surfaces\0\u{3}surface_list\0\u{3}attach_surface\0\u{3}attach_result\0\u{3}detach_surface\0\u{3}list_workspaces\0\u{3}workspace_list\0\u{3}workspace_control\0\u{4}\u{3}pty_data\0\u{1}input\0\u{1}resize\0\u{3}grid_snapshot\0\u{3}data_ack\0\u{4}\u{6}workspace_update\0\u{2}\u{a}ping\0\u{1}pong\0\u{2}\u{9}goodbye\0\u{2}'error\0")
 
   public mutating func decodeMessage<D: SwiftProtobuf.Decoder>(decoder: inout D) throws {
     while let fieldNumber = try decoder.nextFieldNumber() {
@@ -1261,6 +1333,19 @@ extension Termmesh_Peer_V1_Envelope: SwiftProtobuf.Message, SwiftProtobuf._Messa
         if let v = v {
           if hadOneofValue {try decoder.handleConflictingOneOf()}
           self.payload = .workspaceList(v)
+        }
+      }()
+      case 27: try {
+        var v: Termmesh_Peer_V1_WorkspaceControl?
+        var hadOneofValue = false
+        if let current = self.payload {
+          hadOneofValue = true
+          if case .workspaceControl(let m) = current {v = m}
+        }
+        try decoder.decodeSingularMessageField(value: &v)
+        if let v = v {
+          if hadOneofValue {try decoder.handleConflictingOneOf()}
+          self.payload = .workspaceControl(v)
         }
       }()
       case 30: try {
@@ -1453,6 +1538,10 @@ extension Termmesh_Peer_V1_Envelope: SwiftProtobuf.Message, SwiftProtobuf._Messa
     case .workspaceList?: try {
       guard case .workspaceList(let v)? = self.payload else { preconditionFailure() }
       try visitor.visitSingularMessageField(value: v, fieldNumber: 26)
+    }()
+    case .workspaceControl?: try {
+      guard case .workspaceControl(let v)? = self.payload else { preconditionFailure() }
+      try visitor.visitSingularMessageField(value: v, fieldNumber: 27)
     }()
     case .ptyData?: try {
       guard case .ptyData(let v)? = self.payload else { preconditionFailure() }
@@ -2254,6 +2343,138 @@ extension Termmesh_Peer_V1_WorkspacePane: SwiftProtobuf.Message, SwiftProtobuf._
     if lhs.cols != rhs.cols {return false}
     if lhs.rows != rhs.rows {return false}
     if lhs.cwd != rhs.cwd {return false}
+    if lhs.unknownFields != rhs.unknownFields {return false}
+    return true
+  }
+}
+
+extension Termmesh_Peer_V1_WorkspaceControl: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
+  public static let protoMessageName: String = _protobuf_package + ".WorkspaceControl"
+  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{3}split_pane\0\u{3}close_pane\0")
+
+  public mutating func decodeMessage<D: SwiftProtobuf.Decoder>(decoder: inout D) throws {
+    while let fieldNumber = try decoder.nextFieldNumber() {
+      // The use of inline closures is to circumvent an issue where the compiler
+      // allocates stack space for every case branch when no optimizations are
+      // enabled. https://github.com/apple/swift-protobuf/issues/1034
+      switch fieldNumber {
+      case 1: try {
+        var v: Termmesh_Peer_V1_SplitPaneRequest?
+        var hadOneofValue = false
+        if let current = self.kind {
+          hadOneofValue = true
+          if case .splitPane(let m) = current {v = m}
+        }
+        try decoder.decodeSingularMessageField(value: &v)
+        if let v = v {
+          if hadOneofValue {try decoder.handleConflictingOneOf()}
+          self.kind = .splitPane(v)
+        }
+      }()
+      case 2: try {
+        var v: Termmesh_Peer_V1_ClosePaneRequest?
+        var hadOneofValue = false
+        if let current = self.kind {
+          hadOneofValue = true
+          if case .closePane(let m) = current {v = m}
+        }
+        try decoder.decodeSingularMessageField(value: &v)
+        if let v = v {
+          if hadOneofValue {try decoder.handleConflictingOneOf()}
+          self.kind = .closePane(v)
+        }
+      }()
+      default: break
+      }
+    }
+  }
+
+  public func traverse<V: SwiftProtobuf.Visitor>(visitor: inout V) throws {
+    // The use of inline closures is to circumvent an issue where the compiler
+    // allocates stack space for every if/case branch local when no optimizations
+    // are enabled. https://github.com/apple/swift-protobuf/issues/1034 and
+    // https://github.com/apple/swift-protobuf/issues/1182
+    switch self.kind {
+    case .splitPane?: try {
+      guard case .splitPane(let v)? = self.kind else { preconditionFailure() }
+      try visitor.visitSingularMessageField(value: v, fieldNumber: 1)
+    }()
+    case .closePane?: try {
+      guard case .closePane(let v)? = self.kind else { preconditionFailure() }
+      try visitor.visitSingularMessageField(value: v, fieldNumber: 2)
+    }()
+    case nil: break
+    }
+    try unknownFields.traverse(visitor: &visitor)
+  }
+
+  public static func ==(lhs: Termmesh_Peer_V1_WorkspaceControl, rhs: Termmesh_Peer_V1_WorkspaceControl) -> Bool {
+    if lhs.kind != rhs.kind {return false}
+    if lhs.unknownFields != rhs.unknownFields {return false}
+    return true
+  }
+}
+
+extension Termmesh_Peer_V1_SplitPaneRequest: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
+  public static let protoMessageName: String = _protobuf_package + ".SplitPaneRequest"
+  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{3}pane_id\0\u{1}orientation\0")
+
+  public mutating func decodeMessage<D: SwiftProtobuf.Decoder>(decoder: inout D) throws {
+    while let fieldNumber = try decoder.nextFieldNumber() {
+      // The use of inline closures is to circumvent an issue where the compiler
+      // allocates stack space for every case branch when no optimizations are
+      // enabled. https://github.com/apple/swift-protobuf/issues/1034
+      switch fieldNumber {
+      case 1: try { try decoder.decodeSingularBytesField(value: &self.paneID) }()
+      case 2: try { try decoder.decodeSingularStringField(value: &self.orientation) }()
+      default: break
+      }
+    }
+  }
+
+  public func traverse<V: SwiftProtobuf.Visitor>(visitor: inout V) throws {
+    if !self.paneID.isEmpty {
+      try visitor.visitSingularBytesField(value: self.paneID, fieldNumber: 1)
+    }
+    if !self.orientation.isEmpty {
+      try visitor.visitSingularStringField(value: self.orientation, fieldNumber: 2)
+    }
+    try unknownFields.traverse(visitor: &visitor)
+  }
+
+  public static func ==(lhs: Termmesh_Peer_V1_SplitPaneRequest, rhs: Termmesh_Peer_V1_SplitPaneRequest) -> Bool {
+    if lhs.paneID != rhs.paneID {return false}
+    if lhs.orientation != rhs.orientation {return false}
+    if lhs.unknownFields != rhs.unknownFields {return false}
+    return true
+  }
+}
+
+extension Termmesh_Peer_V1_ClosePaneRequest: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
+  public static let protoMessageName: String = _protobuf_package + ".ClosePaneRequest"
+  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{3}pane_id\0")
+
+  public mutating func decodeMessage<D: SwiftProtobuf.Decoder>(decoder: inout D) throws {
+    while let fieldNumber = try decoder.nextFieldNumber() {
+      // The use of inline closures is to circumvent an issue where the compiler
+      // allocates stack space for every case branch when no optimizations are
+      // enabled. https://github.com/apple/swift-protobuf/issues/1034
+      switch fieldNumber {
+      case 1: try { try decoder.decodeSingularBytesField(value: &self.paneID) }()
+      default: break
+      }
+    }
+  }
+
+  public func traverse<V: SwiftProtobuf.Visitor>(visitor: inout V) throws {
+    if !self.paneID.isEmpty {
+      try visitor.visitSingularBytesField(value: self.paneID, fieldNumber: 1)
+    }
+    try unknownFields.traverse(visitor: &visitor)
+  }
+
+  public static func ==(lhs: Termmesh_Peer_V1_ClosePaneRequest, rhs: Termmesh_Peer_V1_ClosePaneRequest) -> Bool {
+    if lhs.paneID != rhs.paneID {return false}
     if lhs.unknownFields != rhs.unknownFields {return false}
     return true
   }

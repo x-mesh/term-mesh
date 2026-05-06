@@ -82,6 +82,10 @@ final class GhosttyPaneSurfaceProvider: PeerSurfaceProvider {
         return await MainActor.run { collectWorkspaces() }
     }
 
+    func handleWorkspaceControl(_ control: Termmesh_Peer_V1_WorkspaceControl) async {
+        await MainActor.run { applyWorkspaceControl(control) }
+    }
+
     func attach(
         surfaceID: Data,
         clientCols: UInt32,
@@ -159,6 +163,64 @@ final class GhosttyPaneSurfaceProvider: PeerSurfaceProvider {
             workspaceMeta: meta,
             detach: detach
         )
+    }
+
+    // MARK: - Workspace control dispatch
+
+    private func applyWorkspaceControl(_ control: Termmesh_Peer_V1_WorkspaceControl) {
+        switch control.kind {
+        case .splitPane(let req):
+            performSplit(paneIDBytes: req.paneID, orientationString: req.orientation)
+        case .closePane(let req):
+            performClose(paneIDBytes: req.paneID)
+        case .none:
+            break
+        }
+    }
+
+    private func performSplit(paneIDBytes: Data, orientationString: String) {
+        guard let panelUUID = uuidFromSurfaceID(paneIDBytes),
+              let workspace = workspaceContaining(panelUUID: panelUUID)
+        else { return }
+        let orientation: SplitOrientation = (orientationString == "vertical") ? .vertical : .horizontal
+        _ = workspace.newTerminalSplit(from: panelUUID, orientation: orientation)
+    }
+
+    private func performClose(paneIDBytes: Data) {
+        guard let panelUUID = uuidFromSurfaceID(paneIDBytes),
+              let workspace = workspaceContaining(panelUUID: panelUUID),
+              let panel = workspace.panels[panelUUID]
+        else { return }
+        // Use bonsplit's pane-id derivation: find the pane that holds
+        // the tab whose ID matches this terminal surface, then close it.
+        if let tabID = workspace.surfaceIdFromPanelId(panelUUID) {
+            for paneId in workspace.bonsplitController.allPaneIds {
+                let tabs = workspace.bonsplitController.tabs(inPane: paneId)
+                if tabs.contains(where: { $0.id == tabID }) {
+                    _ = workspace.bonsplitController.closeTab(tabID, inPane: paneId)
+                    return
+                }
+            }
+        }
+        _ = panel  // silence unused
+    }
+
+    private func uuidFromSurfaceID(_ data: Data) -> UUID? {
+        guard data.count == 16 else { return nil }
+        let tuple = data.withUnsafeBytes { raw -> uuid_t in
+            raw.load(as: uuid_t.self)
+        }
+        return UUID(uuid: tuple)
+    }
+
+    private func workspaceContaining(panelUUID: UUID) -> Workspace? {
+        guard let tabManager = AppDelegate.shared?.tabManager else { return nil }
+        for workspace in tabManager.tabs {
+            if workspace.panels[panelUUID] != nil {
+                return workspace
+            }
+        }
+        return nil
     }
 
     // MARK: - Peer attach indicator

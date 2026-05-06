@@ -95,10 +95,18 @@ public protocol PeerSurfaceProvider: AnyObject, Sendable {
     /// `listSurfaces` to attach every leaf in a workspace and place
     /// them in the same arrangement locally.
     func listWorkspaces() async -> [Termmesh_Peer_V1_Workspace]
+
+    /// Fire-and-forget workspace mutation requests (split, close).
+    /// Default no-op; providers that own a real workspace tree
+    /// (`GhosttyPaneSurfaceProvider`) override to drive bonsplit. The
+    /// resulting layout change is observable via the same
+    /// `WorkspaceLayoutChanged` push path.
+    func handleWorkspaceControl(_ control: Termmesh_Peer_V1_WorkspaceControl) async
 }
 
 public extension PeerSurfaceProvider {
     func listWorkspaces() async -> [Termmesh_Peer_V1_Workspace] { [] }
+    func handleWorkspaceControl(_ control: Termmesh_Peer_V1_WorkspaceControl) async {}
 }
 
 /// Provider for the list-only case: static surfaces, no attach support.
@@ -636,6 +644,11 @@ actor PeerServerSession {
                 list.workspaces = workspaces
                 inner.workspaceList = list
             }
+
+        case (.ready, .workspaceControl(let ctl)):
+            // Fire-and-forget; the resulting layout update flows back
+            // via the existing WorkspaceLayoutChanged push.
+            await provider.handleWorkspaceControl(ctl)
 
         case (.ready, .attachSurface(let req)):
             try await handleAttach(req, correlationID: env.seq)

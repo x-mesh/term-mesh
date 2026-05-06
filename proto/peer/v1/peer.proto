@@ -41,6 +41,7 @@ message Envelope {
     DetachSurface detach_surface = 24;
     ListWorkspaces list_workspaces = 25;
     WorkspaceList workspace_list = 26;
+    WorkspaceControl workspace_control = 27;
 
     PtyData pty_data = 30;
     Input input = 31;
@@ -209,6 +210,35 @@ message WorkspacePane {
   uint32 cols = 3;
   uint32 rows = 4;
   string cwd = 5;
+}
+
+// ============================================================
+// Workspace control (client → host)
+// ============================================================
+//
+// Fire-and-forget commands that ask the host to mutate the workspace
+// layout. The host applies the change via its bonsplit controller and
+// publishes the resulting layout via the existing
+// `WorkspaceLayoutChanged` push, so the client doesn't need a paired
+// reply — it just observes the layout update arriving moments later.
+
+message WorkspaceControl {
+  oneof kind {
+    SplitPaneRequest split_pane = 1;
+    ClosePaneRequest close_pane = 2;
+  }
+}
+
+message SplitPaneRequest {
+  // surfaceID of the pane to split (the focused leaf in the relay
+  // window). The host resolves it back to its bonsplit pane.
+  bytes pane_id = 1;
+  // "horizontal" (side-by-side) or "vertical" (stacked).
+  string orientation = 2;
+}
+
+message ClosePaneRequest {
+  bytes pane_id = 1;
 }
 
 // ============================================================

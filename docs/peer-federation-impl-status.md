@@ -44,6 +44,7 @@ Phase D  — Production integration
   D-3b   — Native TCP transport (skip SSH for LAN)                          ⬜ TODO
   D-4    — SSH transport (`ssh -L` tunnel + relay window)                   ✅ DONE
   D-5    — CI prebuilt GhosttyKit.xcframework + setup.sh auto-fetch         ✅ DONE
+  D-6    — Workspace control plane (Cmd+D / Cmd+Shift+D / Cmd+W from relay) ✅ DONE
 ```
 
 ---

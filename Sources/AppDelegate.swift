@@ -2221,6 +2221,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
     }
 
     func handleCustomShortcut(event: NSEvent) -> Bool {
+        // Peer-federation relay windows host their own NSEvent monitor
+        // for Cmd+D / Cmd+Shift+D / Cmd+W and forward those keystrokes
+        // to the remote host. We must NOT route them through the local
+        // app's split shortcut, which would split a host pane in the
+        // local main window instead of the relay-clicked pane. Bail
+        // out for any keyDown landing in a workspace-relay window.
+        if let keyWindow = NSApp.keyWindow,
+           keyWindow is PeerRelayWorkspaceWindow {
+            return false
+        }
+
         // `charactersIgnoringModifiers` can be nil for some synthetic NSEvents and certain special keys.
         // Most shortcuts below use keyCode fallbacks, so treat nil as "" rather than bailing out.
         let chars = (event.charactersIgnoringModifiers ?? "").lowercased()

@@ -140,6 +140,30 @@ public actor PeerSession {
         return list.workspaces
     }
 
+    /// Ask the host to split a pane. Fire-and-forget; the new layout
+    /// arrives via the next `WorkspaceLayoutChanged` push.
+    public func requestSplitPane(paneID: Data, orientation: String) async throws {
+        try await sendEnvelope { env in
+            var req = Termmesh_Peer_V1_SplitPaneRequest()
+            req.paneID = paneID
+            req.orientation = orientation
+            var ctl = Termmesh_Peer_V1_WorkspaceControl()
+            ctl.splitPane = req
+            env.workspaceControl = ctl
+        }
+    }
+
+    /// Ask the host to close a pane. Fire-and-forget.
+    public func requestClosePane(paneID: Data) async throws {
+        try await sendEnvelope { env in
+            var req = Termmesh_Peer_V1_ClosePaneRequest()
+            req.paneID = paneID
+            var ctl = Termmesh_Peer_V1_WorkspaceControl()
+            ctl.closePane = req
+            env.workspaceControl = ctl
+        }
+    }
+
     // MARK: - AttachSurface
 
     public func attachSurface(
