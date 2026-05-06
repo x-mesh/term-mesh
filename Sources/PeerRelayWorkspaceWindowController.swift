@@ -99,6 +99,16 @@ final class PeerRelayWorkspaceWindowController: NSWindowController, NSWindowDele
     private var startTask: Task<Void, Never>?
     private var isClosing = false
 
+    /// In-window status / error banner. Lives at the top of the content
+    /// view; the split tree sits below it. Created lazily on the first
+    /// `show*` call so non-SSH sessions never allocate it.
+    private var banner: PeerRelayBanner?
+    /// Container holding [banner, splitRoot]. Stored so swapRootView
+    /// can replace only the split-tree subview without touching the
+    /// banner.
+    private var bodyStack: NSStackView?
+    private var splitRootContainer: NSView?
+
     var onClose: (@MainActor () -> Void)?
 
     // MARK: - Init
@@ -145,12 +155,27 @@ final class PeerRelayWorkspaceWindowController: NSWindowController, NSWindowDele
     private func handleTunnelStateChange(_ state: PeerSSHTunnelState) {
         switch state {
         case .down(let reason):
-            window?.title = "\(baseTitle) · disconnected (\(reason))"
+            banner?.show(
+                kind: .error,
+                message: "Disconnected: \(reason)",
+                actionTitle: nil,
+                dismissable: false
+            )
             tearDownPeerSessions(keepWindow: true)
         case .reconnecting(let attempt):
-            window?.title = "\(baseTitle) · reconnecting (try \(attempt))…"
+            banner?.show(
+                kind: .warning,
+                message: "Reconnecting to host (try \(attempt))…",
+                actionTitle: nil,
+                dismissable: false
+            )
         case .up:
-            window?.title = "\(baseTitle) · reconnecting…"
+            banner?.show(
+                kind: .info,
+                message: "Re-attaching panes…",
+                actionTitle: nil,
+                dismissable: false
+            )
             // Tunnel just came back. Re-run the initial-attach flow
             // from the same hostSockPath.
             startTask?.cancel()
@@ -159,9 +184,33 @@ final class PeerRelayWorkspaceWindowController: NSWindowController, NSWindowDele
                 do {
                     try await self.applyLayout(self.currentLayout)
                     await self.startSubscription()
-                    await MainActor.run { self.window?.title = self.baseTitle }
+                    await MainActor.run { [weak self] in
+                        guard let self else { return }
+                        self.banner?.show(
+                            kind: .success,
+                            message: "Reconnected",
+                            actionTitle: nil,
+                            dismissable: true
+                        )
+                        // Auto-dismiss the success banner after 3 s.
+                        Task { [weak self] in
+                            try? await Task.sleep(nanoseconds: 3_000_000_000)
+                            await MainActor.run { self?.banner?.hide() }
+                        }
+                    }
                 } catch {
-                    NSLog("[peer-ws] reconnect applyLayout failed: %@", String(describing: error))
+                    let detail = String(describing: error)
+                    await MainActor.run { [weak self] in
+                        self?.banner?.show(
+                            kind: .error,
+                            message: "Reconnect failed: \(detail)",
+                            actionTitle: "Retry",
+                            dismissable: false,
+                            action: { [weak self] in
+                                self?.handleTunnelStateChange(.up)
+                            }
+                        )
+                    }
                 }
             }
         case .stopped, .starting:
@@ -192,6 +241,10 @@ final class PeerRelayWorkspaceWindowController: NSWindowController, NSWindowDele
 
     func show() {
         window?.makeKeyAndOrderFront(nil)
+        // Force the body stack (and thus the banner) to exist before
+        // the first layout pass, so initial-attach errors can land in
+        // the banner instead of an immediate window close.
+        if let window { _ = ensureBodyStack(in: window) }
 
         startTask = Task { [weak self] in
             guard let self else { return }
@@ -199,8 +252,19 @@ final class PeerRelayWorkspaceWindowController: NSWindowController, NSWindowDele
                 try await self.applyLayout(self.currentLayout)
                 await self.startSubscription()
             } catch {
-                NSLog("[peer-ws] initial layout failed: %@", String(describing: error))
-                await MainActor.run { self.window?.performClose(nil) }
+                let detail = String(describing: error)
+                NSLog("[peer-ws] initial layout failed: %@", detail)
+                await MainActor.run { [weak self] in
+                    self?.banner?.show(
+                        kind: .error,
+                        message: "Failed to attach: \(detail)",
+                        actionTitle: "Close",
+                        dismissable: false,
+                        action: { [weak self] in
+                            self?.window?.performClose(nil)
+                        }
+                    )
+                }
             }
         }
     }
@@ -443,24 +507,23 @@ final class PeerRelayWorkspaceWindowController: NSWindowController, NSWindowDele
 
     private func swapRootView(_ newRoot: NSView, dividers: [(NSSplitView, CGFloat)]) {
         guard let window = self.window else { return }
-        let container = window.contentView ?? NSView(frame: window.contentLayoutRect)
-        for sub in container.subviews { sub.removeFromSuperview() }
+        let body = ensureBodyStack(in: window)
+        let splitContainer = ensureSplitRootContainer(in: body)
+
+        for sub in splitContainer.subviews { sub.removeFromSuperview() }
         newRoot.translatesAutoresizingMaskIntoConstraints = false
-        container.addSubview(newRoot)
+        splitContainer.addSubview(newRoot)
         NSLayoutConstraint.activate([
-            newRoot.topAnchor.constraint(equalTo: container.topAnchor),
-            newRoot.bottomAnchor.constraint(equalTo: container.bottomAnchor),
-            newRoot.leadingAnchor.constraint(equalTo: container.leadingAnchor),
-            newRoot.trailingAnchor.constraint(equalTo: container.trailingAnchor),
+            newRoot.topAnchor.constraint(equalTo: splitContainer.topAnchor),
+            newRoot.bottomAnchor.constraint(equalTo: splitContainer.bottomAnchor),
+            newRoot.leadingAnchor.constraint(equalTo: splitContainer.leadingAnchor),
+            newRoot.trailingAnchor.constraint(equalTo: splitContainer.trailingAnchor),
         ])
-        if window.contentView == nil {
-            window.contentView = container
-        }
         // Programmatic divider apply — silence the divider-watcher
         // callbacks so we don't bounce the position straight back to
         // the host.
         applyingLayoutDepth += 1
-        container.layoutSubtreeIfNeeded()
+        body.layoutSubtreeIfNeeded()
         for (split, fraction) in dividers {
             let extent: CGFloat = split.isVertical ? split.bounds.width : split.bounds.height
             guard extent > 0 else { continue }
@@ -470,6 +533,45 @@ final class PeerRelayWorkspaceWindowController: NSWindowController, NSWindowDele
         DispatchQueue.main.async { [weak self] in
             self?.applyingLayoutDepth = max(0, (self?.applyingLayoutDepth ?? 1) - 1)
         }
+    }
+
+    /// Create the [banner, splitContainer] vertical stack on first
+    /// use and pin it to the window's contentView.
+    @discardableResult
+    private func ensureBodyStack(in window: NSWindow) -> NSStackView {
+        if let body = bodyStack { return body }
+        let banner = PeerRelayBanner(frame: .zero)
+        self.banner = banner
+
+        let body = NSStackView()
+        body.orientation = .vertical
+        body.alignment = .width
+        body.spacing = 0
+        body.distribution = .fill
+        body.translatesAutoresizingMaskIntoConstraints = false
+        body.addArrangedSubview(banner)
+
+        let container = window.contentView ?? NSView(frame: window.contentLayoutRect)
+        if window.contentView == nil { window.contentView = container }
+        for sub in container.subviews { sub.removeFromSuperview() }
+        container.addSubview(body)
+        NSLayoutConstraint.activate([
+            body.topAnchor.constraint(equalTo: container.topAnchor),
+            body.bottomAnchor.constraint(equalTo: container.bottomAnchor),
+            body.leadingAnchor.constraint(equalTo: container.leadingAnchor),
+            body.trailingAnchor.constraint(equalTo: container.trailingAnchor),
+        ])
+        bodyStack = body
+        return body
+    }
+
+    private func ensureSplitRootContainer(in body: NSStackView) -> NSView {
+        if let c = splitRootContainer { return c }
+        let c = NSView()
+        c.translatesAutoresizingMaskIntoConstraints = false
+        body.addArrangedSubview(c)
+        splitRootContainer = c
+        return c
     }
 
     /// Called by `WorkspaceSplitWatcher` whenever an NSSplitView posts
