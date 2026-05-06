@@ -37,6 +37,7 @@ final class PeerServerCoordinator: NSObject {
     private var socketPath: String?
     private var provider: GhosttyPaneSurfaceProvider?
     private var layoutObserver: NSObjectProtocol?
+    private var bonjour: PeerBonjourPublisher?
 
     /// Launch-time hook. If `TERMMESH_PEER_SERVER_PATH` (or legacy
     /// `TERMMESH_DEBUG_PEER_SERVER_PATH`) is set, start a peer server
@@ -85,6 +86,8 @@ final class PeerServerCoordinator: NSObject {
         let oldPath = socketPath
         socketPath = nil
         uninstallLayoutChangeBridge()
+        bonjour?.stop()
+        bonjour = nil
         Task {
             await server.stop()
             await MainActor.run {
@@ -110,6 +113,17 @@ final class PeerServerCoordinator: NSObject {
             self.socketPath = path
             self.provider = provider
             installLayoutChangeBridge(server: server, provider: provider)
+            // LAN discovery: advertise via Bonjour so other macs on
+            // the same network can pick this host out of a list
+            // instead of typing an SSH alias by hand. The TXT record
+            // carries the socket path; the actual data path remains
+            // SSH (clients connect with `ssh -L`).
+            let publisher = PeerBonjourPublisher(
+                serviceName: ProcessInfo.processInfo.hostName,
+                socketPath: path
+            )
+            publisher.start()
+            self.bonjour = publisher
             NSLog("[peer-debug] server listening on %@", path)
             if !silent {
                 showInfo(

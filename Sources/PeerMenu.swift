@@ -78,12 +78,21 @@ final class PeerCoordinator: NSObject {
     @objc func promptAndRunRelayWorkspaceSSH(_ sender: Any?) {
         let alert = NSAlert()
         alert.messageText = "Connect to Remote Peer Workspace via SSH"
-        alert.informativeText = "Tunnels the host's peer socket through `ssh -L`. Provide an SSH target (user@host or ssh-config alias) and the path of the remote peer server's Unix socket."
+        alert.informativeText = "Tunnels the host's peer socket through `ssh -L`. Pick a host advertised on this LAN, or type an SSH target (user@host or ssh-config alias) and the path of the remote peer server's Unix socket."
 
         let stack = NSStackView(frame: NSRect(x: 0, y: 0, width: 380, height: 60))
         stack.orientation = .vertical
         stack.alignment = .leading
         stack.spacing = 4
+
+        // Bonjour-discovered hosts populate this popup live; selecting
+        // one autofills the SSH target / remote socket fields.
+        let discoveredLabel = NSTextField(labelWithString: "Discovered on LAN:")
+        let discoveredPopup = NSPopUpButton(
+            frame: NSRect(x: 0, y: 0, width: 380, height: 26),
+            pullsDown: false
+        )
+        discoveredPopup.menu?.addItem(withTitle: "(searching…)", action: nil, keyEquivalent: "")
 
         let targetLabel = NSTextField(labelWithString: "SSH target (user@host):")
         let targetField = NSTextField(frame: NSRect(x: 0, y: 0, width: 380, height: 24))
@@ -92,13 +101,44 @@ final class PeerCoordinator: NSObject {
         let remoteField = NSTextField(frame: NSRect(x: 0, y: 0, width: 380, height: 24))
         remoteField.stringValue = "/tmp/termmesh-app-peer.sock"
 
-        for v in [targetLabel, targetField, remoteLabel, remoteField] {
+        for v in [discoveredLabel, discoveredPopup, targetLabel, targetField, remoteLabel, remoteField] {
             stack.addArrangedSubview(v)
         }
-        stack.frame = NSRect(x: 0, y: 0, width: 380, height: 110)
+        stack.frame = NSRect(x: 0, y: 0, width: 380, height: 170)
         alert.accessoryView = stack
         alert.addButton(withTitle: "Connect")
         alert.addButton(withTitle: "Cancel")
+
+        // Live Bonjour browse: rebuild the popup as services arrive
+        // and resolve. Strong ref kept until the dialog closes.
+        var discoveredPeers: [DiscoveredPeer] = []
+        let browser = PeerBonjourBrowser()
+        browser.start { peers in
+            discoveredPeers = peers
+            let menu = discoveredPopup.menu ?? NSMenu()
+            menu.removeAllItems()
+            if peers.isEmpty {
+                menu.addItem(withTitle: "(no LAN hosts found)", action: nil, keyEquivalent: "")
+            } else {
+                menu.addItem(withTitle: "(pick a host…)", action: nil, keyEquivalent: "")
+                for p in peers {
+                    let label = "\(p.serviceName)  ·  \(p.hostname)\(p.socketPath.map { "  ·  \($0)" } ?? "")"
+                    menu.addItem(withTitle: label, action: nil, keyEquivalent: "")
+                }
+            }
+            discoveredPopup.menu = menu
+        }
+        // Adapter target so the popup's action stays @objc-compatible.
+        let proxy = SSHDialogPopupProxy(
+            popup: discoveredPopup,
+            target: targetField,
+            remote: remoteField,
+            peersProvider: { discoveredPeers }
+        )
+        discoveredPopup.target = proxy
+        discoveredPopup.action = #selector(SSHDialogPopupProxy.didPick(_:))
+
+        defer { browser.stop(); _ = proxy } // tear down after modal dismissal
 
         guard alert.runModal() == .alertFirstButtonReturn else { return }
         let target = targetField.stringValue.trimmingCharacters(in: .whitespaces)
@@ -689,5 +729,41 @@ final class PeerConsoleWindowController: NSWindowController, NSWindowDelegate {
 
     private static var monospaceFont: NSFont {
         NSFont.monospacedSystemFont(ofSize: 12, weight: .regular)
+    }
+}
+
+/// Glue between the SSH-dialog Bonjour popup (NSPopUpButton, plain
+/// NSObject target) and the surrounding text fields. Lives alongside
+/// the dialog stack and rewrites the SSH target / remote-socket
+/// fields whenever the user picks a discovered peer.
+@MainActor
+final class SSHDialogPopupProxy: NSObject {
+    private weak var popup: NSPopUpButton?
+    private weak var targetField: NSTextField?
+    private weak var remoteField: NSTextField?
+    private let peersProvider: () -> [DiscoveredPeer]
+
+    init(popup: NSPopUpButton,
+         target: NSTextField,
+         remote: NSTextField,
+         peersProvider: @escaping () -> [DiscoveredPeer]) {
+        self.popup = popup
+        self.targetField = target
+        self.remoteField = remote
+        self.peersProvider = peersProvider
+        super.init()
+    }
+
+    @objc func didPick(_ sender: NSPopUpButton) {
+        let peers = peersProvider()
+        // Index 0 is the placeholder ("pick a host…" / "no hosts");
+        // discovered entries start at 1.
+        let idx = sender.indexOfSelectedItem - 1
+        guard idx >= 0, idx < peers.count else { return }
+        let peer = peers[idx]
+        targetField?.stringValue = peer.hostname
+        if let sock = peer.socketPath, !sock.isEmpty {
+            remoteField?.stringValue = sock
+        }
     }
 }
