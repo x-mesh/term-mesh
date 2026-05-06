@@ -47,6 +47,10 @@ final class PeerRelayBanner: NSView {
     private let actionButton = NSButton(title: "", target: nil, action: nil)
     private let dismissButton = NSButton(title: "✕", target: nil, action: nil)
     private var actionHandler: (() -> Void)?
+    /// Drives the banner's height directly: 0 when hidden so the
+    /// neighbouring split-tree container takes the full window height,
+    /// 28 when shown.
+    private var heightConstraint: NSLayoutConstraint!
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
@@ -96,10 +100,10 @@ final class PeerRelayBanner: NSView {
 
             dismissButton.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -8),
             dismissButton.centerYAnchor.constraint(equalTo: centerYAnchor),
-
-            heightAnchor.constraint(equalToConstant: 28),
         ])
 
+        heightConstraint = heightAnchor.constraint(equalToConstant: 0)
+        heightConstraint.isActive = true
         isHidden = true
     }
 
@@ -130,10 +134,12 @@ final class PeerRelayBanner: NSView {
         }
         dismissButton.isHidden = !dismissable
         isHidden = false
+        heightConstraint.constant = 28
     }
 
     func hide() {
         isHidden = true
+        heightConstraint.constant = 0
         actionHandler = nil
     }
 

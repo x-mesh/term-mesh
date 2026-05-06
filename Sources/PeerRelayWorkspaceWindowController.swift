@@ -103,10 +103,9 @@ final class PeerRelayWorkspaceWindowController: NSWindowController, NSWindowDele
     /// view; the split tree sits below it. Created lazily on the first
     /// `show*` call so non-SSH sessions never allocate it.
     private var banner: PeerRelayBanner?
-    /// Container holding [banner, splitRoot]. Stored so swapRootView
-    /// can replace only the split-tree subview without touching the
-    /// banner.
-    private var bodyStack: NSStackView?
+    /// True once `ensureBodyStack` has installed the banner and
+    /// splitRoot container into the window's contentView.
+    private var bodyInstalled = false
     private var splitRootContainer: NSView?
 
     var onClose: (@MainActor () -> Void)?
@@ -507,8 +506,8 @@ final class PeerRelayWorkspaceWindowController: NSWindowController, NSWindowDele
 
     private func swapRootView(_ newRoot: NSView, dividers: [(NSSplitView, CGFloat)]) {
         guard let window = self.window else { return }
-        let body = ensureBodyStack(in: window)
-        let splitContainer = ensureSplitRootContainer(in: body)
+        ensureBodyStack(in: window)
+        guard let splitContainer = splitRootContainer else { return }
 
         for sub in splitContainer.subviews { sub.removeFromSuperview() }
         newRoot.translatesAutoresizingMaskIntoConstraints = false
@@ -523,7 +522,7 @@ final class PeerRelayWorkspaceWindowController: NSWindowController, NSWindowDele
         // callbacks so we don't bounce the position straight back to
         // the host.
         applyingLayoutDepth += 1
-        body.layoutSubtreeIfNeeded()
+        splitContainer.layoutSubtreeIfNeeded()
         for (split, fraction) in dividers {
             let extent: CGFloat = split.isVertical ? split.bounds.width : split.bounds.height
             guard extent > 0 else { continue }
@@ -535,43 +534,34 @@ final class PeerRelayWorkspaceWindowController: NSWindowController, NSWindowDele
         }
     }
 
-    /// Create the [banner, splitContainer] vertical stack on first
-    /// use and pin it to the window's contentView.
-    @discardableResult
-    private func ensureBodyStack(in window: NSWindow) -> NSStackView {
-        if let body = bodyStack { return body }
-        let banner = PeerRelayBanner(frame: .zero)
-        self.banner = banner
-
-        let body = NSStackView()
-        body.orientation = .vertical
-        body.alignment = .width
-        body.spacing = 0
-        body.distribution = .fill
-        body.translatesAutoresizingMaskIntoConstraints = false
-        body.addArrangedSubview(banner)
-
+    /// Install banner (top, height 0 when hidden) and splitRoot
+    /// container (under banner, fills remainder) into the window's
+    /// contentView. Idempotent.
+    private func ensureBodyStack(in window: NSWindow) {
+        if bodyInstalled { return }
         let container = window.contentView ?? NSView(frame: window.contentLayoutRect)
         if window.contentView == nil { window.contentView = container }
         for sub in container.subviews { sub.removeFromSuperview() }
-        container.addSubview(body)
-        NSLayoutConstraint.activate([
-            body.topAnchor.constraint(equalTo: container.topAnchor),
-            body.bottomAnchor.constraint(equalTo: container.bottomAnchor),
-            body.leadingAnchor.constraint(equalTo: container.leadingAnchor),
-            body.trailingAnchor.constraint(equalTo: container.trailingAnchor),
-        ])
-        bodyStack = body
-        return body
-    }
 
-    private func ensureSplitRootContainer(in body: NSStackView) -> NSView {
-        if let c = splitRootContainer { return c }
-        let c = NSView()
-        c.translatesAutoresizingMaskIntoConstraints = false
-        body.addArrangedSubview(c)
-        splitRootContainer = c
-        return c
+        let bannerView = PeerRelayBanner(frame: .zero)
+        self.banner = bannerView
+        let split = NSView()
+        split.translatesAutoresizingMaskIntoConstraints = false
+        self.splitRootContainer = split
+
+        container.addSubview(bannerView)
+        container.addSubview(split)
+        NSLayoutConstraint.activate([
+            bannerView.topAnchor.constraint(equalTo: container.topAnchor),
+            bannerView.leadingAnchor.constraint(equalTo: container.leadingAnchor),
+            bannerView.trailingAnchor.constraint(equalTo: container.trailingAnchor),
+
+            split.topAnchor.constraint(equalTo: bannerView.bottomAnchor),
+            split.bottomAnchor.constraint(equalTo: container.bottomAnchor),
+            split.leadingAnchor.constraint(equalTo: container.leadingAnchor),
+            split.trailingAnchor.constraint(equalTo: container.trailingAnchor),
+        ])
+        bodyInstalled = true
     }
 
     /// Called by `WorkspaceSplitWatcher` whenever an NSSplitView posts
