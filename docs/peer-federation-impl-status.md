@@ -151,15 +151,20 @@ on the host.
 
 ### P1 — nice to have before Phase D
 
-- [ ] **Snapshot styling** — `readPaneSnapshot` currently sends plain text
-      (no colors / cursor position). Look into a richer per-cell read or a
-      SIGWINCH wiggle so fullscreen TUIs (vim, less, htop) redraw on attach.
-- [ ] **Relay socket cleanup on crash** — if the app crashes, stale relay
-      socket files accumulate in `/tmp/`. Clean up at startup.
+- [x] **Relay socket cleanup on crash** — `PeerRelaySession.sweepStaleRelaySockets()`
+      runs in `AppDelegate.applicationDidFinishLaunching` and removes
+      `/tmp/tm-peer-relay-*.sock` files whose listener is gone
+      (`connect()` returns `ECONNREFUSED`). Live sockets owned by other
+      debug instances are left alone.
 - [ ] **Workspace layout updates** — propagate split-resize / pane
       add+remove from host to attached workspace clients (Phase W').
-- [ ] **Error UX** — relay errors currently show an NSAlert; should integrate
-      into the main UI more gracefully.
+- [ ] **Snapshot styling** (deferred) — current `readPaneSnapshot` sends
+      plain text. The clean fix is a per-cell read with styling, but
+      libghostty doesn't expose cell metadata via `ghostty_surface_*`
+      yet. SIGWINCH wiggle / Ctrl-L injection both work but disturb the
+      host's local viewer because they go through the shared PTY.
+- [ ] **Error UX** — relay errors currently show an NSAlert; merge with
+      Phase D's main UI integration.
 
 ### P2 — Phase D prep
 

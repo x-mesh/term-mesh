@@ -230,6 +230,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         // Optional auto-start of the peer-federation server for
         // integration testing from a terminal (`TERMMESH_DEBUG_PEER_SERVER_PATH`).
         PeerDebugServerCoordinator.autoStartIfConfigured()
+
+        // Reap leftover relay sockets from any previous crashed run
+        // before a user opens a fresh relay window — otherwise stale
+        // /tmp/tm-peer-relay-*.sock files accumulate indefinitely.
+        PeerRelaySession.sweepStaleRelaySockets()
 #endif
 
 #if DEBUG

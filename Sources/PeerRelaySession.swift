@@ -139,6 +139,53 @@ final class PeerRelaySession {
     var onError: (@MainActor (Error) -> Void)?
     var onDisconnect: (@MainActor () -> Void)?
 
+    // ── Stale-socket sweep ──────────────────────────────────────────
+    //
+    // Per-session sockets land in /tmp as `tm-peer-relay-<uuid>.sock`.
+    // Normal teardown removes them in deinit, but a crash leaves the
+    // file behind. Call this at app startup to remove any whose
+    // listener is no longer accepting (i.e. a `connect()` returns
+    // ECONNREFUSED). Sockets with a live listener — for example one
+    // owned by another running debug app instance — are left alone.
+
+    static func sweepStaleRelaySockets() {
+        let dir = "/tmp"
+        guard let entries = try? FileManager.default.contentsOfDirectory(atPath: dir) else { return }
+        for name in entries
+            where name.hasPrefix("tm-peer-relay-") && name.hasSuffix(".sock")
+        {
+            let path = "\(dir)/\(name)"
+            if !relaySocketHasLiveListener(at: path) {
+                try? FileManager.default.removeItem(atPath: path)
+            }
+        }
+    }
+
+    private static func relaySocketHasLiveListener(at path: String) -> Bool {
+        let fd = Darwin.socket(AF_UNIX, SOCK_STREAM, 0)
+        guard fd >= 0 else { return true } // can't tell — keep
+        defer { Darwin.close(fd) }
+        var addr = sockaddr_un()
+        addr.sun_family = sa_family_t(AF_UNIX)
+        let pathBytes = Array(path.utf8) + [0]
+        guard pathBytes.count <= MemoryLayout.size(ofValue: addr.sun_path) else { return true }
+        withUnsafeMutableBytes(of: &addr.sun_path) { dst in
+            pathBytes.withUnsafeBufferPointer { src in
+                dst.copyBytes(from: UnsafeRawBufferPointer(start: src.baseAddress, count: pathBytes.count))
+            }
+        }
+        let len = socklen_t(MemoryLayout<sockaddr_un>.size)
+        let rc = withUnsafePointer(to: &addr) { ap -> Int32 in
+            ap.withMemoryRebound(to: sockaddr.self, capacity: 1) { sa in
+                Darwin.connect(fd, sa, len)
+            }
+        }
+        if rc == 0 { return true }
+        // ECONNREFUSED means the file exists but nobody is listening —
+        // the leftover from a previous crashed run.
+        return errno != ECONNREFUSED
+    }
+
     // ── Factory (two-stage) ────────────────────────────────────────
     //
     // Stage 1 — `connectAndList`: open the transport, handshake, list
