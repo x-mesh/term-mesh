@@ -138,6 +138,8 @@ final class GhosttySurfaceScrollView: NSView {
     private let dropZoneOverlayView: GhosttyFlashOverlayView
     private let notificationRingOverlayView: GhosttyFlashOverlayView
     private let notificationRingLayer: CAShapeLayer
+    private let peerRingOverlayView: GhosttyFlashOverlayView
+    private let peerRingLayer: CAShapeLayer
     private let flashOverlayView: GhosttyFlashOverlayView
     private let flashLayer: CAShapeLayer
     private var searchOverlayHostingView: NSHostingView<SurfaceSearchOverlay>?
@@ -271,6 +273,8 @@ final class GhosttySurfaceScrollView: NSView {
         dropZoneOverlayView = GhosttyFlashOverlayView(frame: .zero)
         notificationRingOverlayView = GhosttyFlashOverlayView(frame: .zero)
         notificationRingLayer = CAShapeLayer()
+        peerRingOverlayView = GhosttyFlashOverlayView(frame: .zero)
+        peerRingLayer = CAShapeLayer()
         flashOverlayView = GhosttyFlashOverlayView(frame: .zero)
         flashLayer = CAShapeLayer()
         scrollView.hasVerticalScroller = true
@@ -328,6 +332,28 @@ final class GhosttySurfaceScrollView: NSView {
         notificationRingOverlayView.layer?.addSublayer(notificationRingLayer)
         notificationRingOverlayView.isHidden = true
         addSubview(notificationRingOverlayView)
+
+        // Peer-attached ring: teal, drawn just inside the notification
+        // ring so both can be visible simultaneously (notifications +
+        // active remote viewer).
+        peerRingOverlayView.wantsLayer = true
+        peerRingOverlayView.layer?.backgroundColor = NSColor.clear.cgColor
+        peerRingOverlayView.layer?.masksToBounds = false
+        peerRingOverlayView.autoresizingMask = [.width, .height]
+        peerRingLayer.fillColor = NSColor.clear.cgColor
+        peerRingLayer.strokeColor = NSColor.systemTeal.cgColor
+        peerRingLayer.lineWidth = 2.5
+        peerRingLayer.lineJoin = .round
+        peerRingLayer.lineCap = .round
+        peerRingLayer.shadowColor = NSColor.systemTeal.cgColor
+        peerRingLayer.shadowOpacity = 0.4
+        peerRingLayer.shadowRadius = 4
+        peerRingLayer.shadowOffset = .zero
+        peerRingLayer.opacity = 0
+        peerRingOverlayView.layer?.addSublayer(peerRingLayer)
+        peerRingOverlayView.isHidden = true
+        addSubview(peerRingOverlayView)
+
         flashOverlayView.wantsLayer = true
         flashOverlayView.layer?.backgroundColor = NSColor.clear.cgColor
         flashOverlayView.layer?.masksToBounds = false
@@ -509,8 +535,10 @@ final class GhosttySurfaceScrollView: NSView {
             setDropZoneOverlay(zone: pending)
         }
         notificationRingOverlayView.frame = bounds
+        peerRingOverlayView.frame = bounds
         flashOverlayView.frame = bounds
         updateNotificationRingPath()
+        updatePeerRingPath()
         updateFlashPath()
         synchronizeScrollView()
         synchronizeSurfaceView()
@@ -586,6 +614,25 @@ final class GhosttySurfaceScrollView: NSView {
         CATransaction.setDisableActions(true)
         notificationRingOverlayView.isHidden = !visible
         notificationRingLayer.opacity = visible ? 1 : 0
+        CATransaction.commit()
+    }
+
+    /// Indicates whether one or more peer-federation clients are
+    /// currently attached to this pane. Drawn as a teal ring around
+    /// the surface; orthogonal to the (blue) notification ring so
+    /// both can be lit at once.
+    func setPeerRing(visible: Bool) {
+        if !Thread.isMainThread {
+            DispatchQueue.main.async { [weak self] in
+                self?.setPeerRing(visible: visible)
+            }
+            return
+        }
+
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        peerRingOverlayView.isHidden = !visible
+        peerRingLayer.opacity = visible ? 1 : 0
         CATransaction.commit()
     }
 
@@ -1641,6 +1688,17 @@ final class GhosttySurfaceScrollView: NSView {
             bounds: notificationRingOverlayView.bounds,
             inset: 2,
             radius: 6
+        )
+    }
+
+    private func updatePeerRingPath() {
+        // Inset slightly more than the notification ring so the two
+        // can be displayed concentrically without visual overlap.
+        updateOverlayRingPath(
+            layer: peerRingLayer,
+            bounds: peerRingOverlayView.bounds,
+            inset: 5,
+            radius: 5
         )
     }
 

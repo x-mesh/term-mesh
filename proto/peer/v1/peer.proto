@@ -39,6 +39,8 @@ message Envelope {
     AttachSurface attach_surface = 22;
     AttachResult attach_result = 23;
     DetachSurface detach_surface = 24;
+    ListWorkspaces list_workspaces = 25;
+    WorkspaceList workspace_list = 26;
 
     PtyData pty_data = 30;
     Input input = 31;
@@ -157,6 +159,56 @@ message AttachResult {
 
 message DetachSurface {
   bytes surface_id = 1;
+}
+
+// ============================================================
+// Workspace listing (layout-preserving attach)
+// ============================================================
+//
+// A workspace is a host-side tab containing a recursive split tree
+// of panes. Clients use ListWorkspaces to discover the host's tab
+// inventory plus enough split-layout information to reconstruct the
+// arrangement locally (e.g. with NSSplitView). Each pane references
+// a SurfaceInfo.surface_id; clients then call AttachSurface for
+// every pane they want to render.
+
+message ListWorkspaces {}
+
+message WorkspaceList {
+  repeated Workspace workspaces = 1;
+}
+
+message Workspace {
+  bytes workspace_id = 1;
+  string title = 2;
+  // Root of the recursive split tree.
+  WorkspaceLayout layout = 3;
+}
+
+// Recursive node: either a split (interior) or a pane (leaf).
+message WorkspaceLayout {
+  oneof node {
+    WorkspaceSplit split = 1;
+    WorkspacePane pane = 2;
+  }
+}
+
+message WorkspaceSplit {
+  // "horizontal" (side-by-side) or "vertical" (stacked).
+  // Mirrors bonsplit's orientation strings on the host.
+  string orientation = 1;
+  // Fraction in [0.0, 1.0] of the parent's first child.
+  double divider_position = 2;
+  WorkspaceLayout first = 3;
+  WorkspaceLayout second = 4;
+}
+
+message WorkspacePane {
+  bytes surface_id = 1;
+  string title = 2;
+  uint32 cols = 3;
+  uint32 rows = 4;
+  string cwd = 5;
 }
 
 // ============================================================

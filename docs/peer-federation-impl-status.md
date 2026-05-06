@@ -25,6 +25,13 @@ Phase C  — In-app Swift peer client + Ghostty relay window
     C-3c.3.2 Swift peer server: attach, streaming, Input routing            ✅ DONE
     C-3c.3.3 term-mesh.app runs peer server (GhosttyPaneSurfaceProvider)   ✅ DONE
   C-4    — Ghostty relay window (real Ghostty surface shows remote PTY)     ✅ DONE
+  C-4.1  — Surface picker dialog (multi-pane hosts)                         ✅ DONE
+  C-4.2  — Peer-attached ring on host pane (teal overlay, ref-counted)      ✅ DONE
+Phase W  — Layout-preserving workspace relay
+  W-1    — Proto: WorkspaceLayout / Workspace / ListWorkspaces              ✅ DONE
+  W-2    — Host: serialize bonsplit treeSnapshot → WorkspaceLayout          ✅ DONE
+  W-3    — Picker: choose workspace                                         ✅ DONE
+  W-4    — PeerRelayWorkspaceWindowController (NSSplitView reconstruction)  ✅ DONE
 Phase D  — Production integration (non-DEBUG), discovery UI, pairing        ⬜ TODO
 ```
 
@@ -100,14 +107,47 @@ The peer server is `#if DEBUG` only (in `PeerDebugServer.swift`). Either flow wo
 1. Launch the app with `TERMMESH_DEBUG_PEER_SERVER_PATH=/tmp/termmesh-app-peer.sock`
    to auto-start the server, **or** click menu →
    **"Start Peer Server… (debug)"**.
-2. Click menu → **"Connect to Peer via Ghostty Relay… (debug)"** with the
-   same socket path.
-3. Relay window appears with a snapshot of the host pane. Typing flows in
-   both directions; the host pane and the relay window stay in sync.
+2. Pick one of the three relay menu items:
+   - **"Connect to Peer… (debug)"** — raw NSTextView console for the
+     PtyData stream (oldest debug surface).
+   - **"Connect to Peer via Ghostty Relay… (debug)"** — single Ghostty
+     surface mirroring one host pane. Surface picker pops up when the
+     host has multiple panes.
+   - **"Connect to Peer Workspace via Ghostty Relay… (debug)"** —
+     single window with the host workspace's full split layout
+     reproduced via NSSplitView; one PeerRelaySession per leaf pane.
+3. Active peer attachments light up a **teal ring** around the host
+   pane(s); the ring is reference-counted so multiple clients on the
+   same pane keep it lit until the last one detaches.
 
 ---
 
-## Open TODOs (post-Phase C-4)
+## Phase W — Layout-Preserving Workspace Relay
+
+**Goal:** when a client attaches to a workspace (host tab), the local
+relay window mirrors not only every pane's PTY stream but also the
+host's split arrangement, so the user sees the same layout they had
+on the host.
+
+**Pieces:**
+
+| Layer | What changed |
+|-------|--------------|
+| Proto | New `ListWorkspaces` / `WorkspaceList` RPC plus `Workspace` / `WorkspaceLayout` (recursive `oneof split | pane`) / `WorkspaceSplit` / `WorkspacePane` messages. |
+| Host  | `GhosttyPaneSurfaceProvider.listWorkspaces()` walks `tabManager.tabs`, calls `bonsplitController.treeSnapshot()`, and translates each `ExternalTreeNode` into a `WorkspaceLayout` proto. Empty/non-attachable subtrees are folded out. |
+| Client | `PeerSession.listWorkspaces()`, picker dialog (workspace list) in `PeerDebugMenu`, and `PeerRelayWorkspaceWindowController` which recursively walks the layout and builds an NSSplitView tree with one `PeerRelaySession` + Ghostty surface per leaf. Each leaf opens its own connection so per-pane disconnect doesn't cascade. |
+
+**Known limitations (Phase W' candidates):**
+- Layout drift: divider position / pane add+remove on the host after
+  attach is not reflected on the client (snapshot-once).
+- bonsplit's per-pane tabs (multiple TabItems per pane) are collapsed
+  to the selected tab only.
+- Each leaf burns a full handshake on its own connection. Fine for
+  unix-socket / SSH-multiplexed transports; may want pooling later.
+
+---
+
+## Open TODOs
 
 ### P1 — nice to have before Phase D
 
@@ -116,15 +156,18 @@ The peer server is `#if DEBUG` only (in `PeerDebugServer.swift`). Either flow wo
       SIGWINCH wiggle so fullscreen TUIs (vim, less, htop) redraw on attach.
 - [ ] **Relay socket cleanup on crash** — if the app crashes, stale relay
       socket files accumulate in `/tmp/`. Clean up at startup.
-- [ ] **Multiple relay windows / surface picker** — `PeerRelaySession.create()`
-      always picks `surfaces.first(where: { $0.attachable })`; add UI to pick.
+- [ ] **Workspace layout updates** — propagate split-resize / pane
+      add+remove from host to attached workspace clients (Phase W').
 - [ ] **Error UX** — relay errors currently show an NSAlert; should integrate
       into the main UI more gracefully.
 
 ### P2 — Phase D prep
 
-- [ ] Remove `#if DEBUG` guards from PeerRelaySession, PeerRelayWindowController,
+- [ ] Remove `#if DEBUG` guards from PeerRelaySession,
+      PeerRelayWindowController, PeerRelayWorkspaceWindowController,
       GhosttyPaneSurfaceProvider.
 - [ ] Auto-start peer server at app launch (no manual menu step required).
 - [ ] Surface relay window in main UI (not just debug menu).
 - [ ] Bonjour discovery for host socket path.
+- [ ] SSH transport behind the same `connectAndList` API (only the
+      stage-1 dial changes).

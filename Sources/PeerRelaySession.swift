@@ -23,6 +23,24 @@ private let kTypeKeyInput: UInt8 = 0x02
 private let kTypeResize: UInt8   = 0x03
 private let kTypeGoodbye: UInt8  = 0xFF
 
+// ── Two-stage handshake result ─────────────────────────────────────
+
+/// Carries an open PeerSession and the surface list from a host. Yielded
+/// by `PeerRelaySession.connectAndList` so the caller can show a picker
+/// and then either call `PeerRelaySession.attach(_, surface:)` or
+/// `cancel()` to release the connection cleanly.
+struct PeerRelayConnection: Sendable {
+    let hostSockPath: String
+    let session: PeerSession
+    let transport: UnixSocketTransport
+    let surfaces: [Termmesh_Peer_V1_SurfaceInfo]
+
+    func cancel() async {
+        try? await session.sendGoodbye(reason: "peer-relay picker cancelled")
+        await transport.close()
+    }
+}
+
 // ── Relay socket wrapper ─────────────────────────────────────────────
 
 /// Wraps a connected relay fd; provides framed reads and writes.
@@ -121,11 +139,19 @@ final class PeerRelaySession {
     var onError: (@MainActor (Error) -> Void)?
     var onDisconnect: (@MainActor () -> Void)?
 
-    // ── Factory ─────────────────────────────────────────────────────
+    // ── Factory (two-stage) ────────────────────────────────────────
+    //
+    // Stage 1 — `connectAndList`: open the transport, handshake, list
+    //   surfaces. The caller inspects the list (e.g. shows a picker)
+    //   and either decides on a surface or aborts.
+    // Stage 2 — `attach`: take an open connection plus the chosen
+    //   surface and return a ready-to-start PeerRelaySession.
+    //
+    // The split keeps surface selection transport-agnostic so a future
+    // SSH transport (or Bonjour discovery) only changes how stage 1
+    // dials the socket — the picker UX and stage 2 are unaffected.
 
-    /// Connects to hostSockPath, picks first attachable surface, returns
-    /// a ready-to-start PeerRelaySession.
-    static func create(hostSockPath: String) async throws -> PeerRelaySession {
+    static func connectAndList(hostSockPath: String) async throws -> PeerRelayConnection {
         let transport = try await UnixSocketTransport.connect(socketPath: hostSockPath)
         let session = PeerSession(
             read: { try await transport.read() },
@@ -133,29 +159,49 @@ final class PeerRelaySession {
         )
         _ = try await session.handshake()
         let surfaces = try await session.listSurfaces()
-        guard let chosen = surfaces.first(where: { $0.attachable }) ?? surfaces.first else {
-            await transport.close()
-            throw RelayError.ioError("host has no attachable surfaces")
-        }
-        let outcome = try await session.attachSurface(
-            id: chosen.surfaceID,
+        return PeerRelayConnection(
+            hostSockPath: hostSockPath,
+            session: session,
+            transport: transport,
+            surfaces: surfaces
+        )
+    }
+
+    static func attach(
+        _ connection: PeerRelayConnection,
+        surface: Termmesh_Peer_V1_SurfaceInfo
+    ) async throws -> PeerRelaySession {
+        let outcome = try await connection.session.attachSurface(
+            id: surface.surfaceID,
             mode: .coWrite,
-            cols: UInt32(chosen.cols),
-            rows: UInt32(chosen.rows)
+            cols: UInt32(surface.cols),
+            rows: UInt32(surface.rows)
         )
 
         let uuid = UUID().uuidString.lowercased().prefix(8)
         let relaySockPath = "/tmp/tm-peer-relay-\(uuid).sock"
 
         return PeerRelaySession(
-            hostSockPath: hostSockPath,
+            hostSockPath: connection.hostSockPath,
             relaySockPath: relaySockPath,
             surfaceID: outcome.surfaceID,
-            remoteCols: UInt32(chosen.cols),
-            remoteRows: UInt32(chosen.rows),
-            session: session,
-            transport: transport
+            remoteCols: UInt32(surface.cols),
+            remoteRows: UInt32(surface.rows),
+            session: connection.session,
+            transport: connection.transport
         )
+    }
+
+    /// Convenience for callers that don't care which surface — auto-picks
+    /// the first attachable. Kept so existing in-process tests / scripts
+    /// keep working.
+    static func create(hostSockPath: String) async throws -> PeerRelaySession {
+        let conn = try await connectAndList(hostSockPath: hostSockPath)
+        guard let chosen = conn.surfaces.first(where: { $0.attachable }) ?? conn.surfaces.first else {
+            await conn.cancel()
+            throw RelayError.ioError("host has no attachable surfaces")
+        }
+        return try await attach(conn, surface: chosen)
     }
 
     private init(

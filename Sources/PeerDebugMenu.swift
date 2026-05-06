@@ -40,6 +40,16 @@ enum PeerDebugMenu {
         item.target = PeerDebugCoordinator.shared
         return item
     }
+
+    static func relayWorkspaceItem() -> NSMenuItem {
+        let item = NSMenuItem(
+            title: "Connect to Peer Workspace via Ghostty Relay… (debug)",
+            action: #selector(PeerDebugCoordinator.promptAndRunRelayWorkspace(_:)),
+            keyEquivalent: ""
+        )
+        item.target = PeerDebugCoordinator.shared
+        return item
+    }
 }
 
 @MainActor
@@ -50,6 +60,119 @@ final class PeerDebugCoordinator: NSObject {
     /// alive; dropping the reference would cancel the stream.
     private var openConsoles: [PeerDebugConsoleWindowController] = []
     private var openRelays: [PeerRelayWindowController] = []
+    private var openWorkspaceRelays: [PeerRelayWorkspaceWindowController] = []
+
+    @objc func promptAndRunRelayWorkspace(_ sender: Any?) {
+        let alert = NSAlert()
+        alert.messageText = "Connect to Peer Workspace via Ghostty Relay"
+        alert.informativeText = "Path to a Swift peer server socket. Picks one of the host's workspaces and mirrors its split layout in a single window."
+
+        let input = NSTextField(frame: NSRect(x: 0, y: 0, width: 360, height: 24))
+        input.stringValue = ProcessInfo.processInfo.environment["TERMMESH_DEBUG_PEER_SERVER_PATH"] ?? "/tmp/termmesh-app-peer.sock"
+        alert.accessoryView = input
+        alert.addButton(withTitle: "Connect")
+        alert.addButton(withTitle: "Cancel")
+
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        let path = input.stringValue.trimmingCharacters(in: .whitespaces)
+        guard !path.isEmpty else { return }
+
+        Task {
+            // Open a probe connection to enumerate workspaces, then
+            // discard it — each pane in the chosen workspace will
+            // open its own connection.
+            let probe: PeerRelayConnection
+            do {
+                probe = try await PeerRelaySession.connectAndList(hostSockPath: path)
+            } catch {
+                await MainActor.run {
+                    self.showAlert(title: "Peer Workspace Failed",
+                                   body: String(describing: error))
+                }
+                return
+            }
+            let workspaces: [Termmesh_Peer_V1_Workspace]
+            do {
+                workspaces = try await probe.session.listWorkspaces()
+            } catch {
+                await probe.cancel()
+                await MainActor.run {
+                    self.showAlert(title: "Peer Workspace Failed",
+                                   body: "listWorkspaces failed: \(error)")
+                }
+                return
+            }
+            await probe.cancel()
+
+            guard !workspaces.isEmpty else {
+                await MainActor.run {
+                    self.showAlert(title: "Peer Workspace Failed",
+                                   body: "Host did not return any workspaces.")
+                }
+                return
+            }
+
+            let chosen: Termmesh_Peer_V1_Workspace?
+            if workspaces.count == 1 {
+                chosen = workspaces[0]
+            } else {
+                chosen = await MainActor.run {
+                    self.promptForWorkspaceSelection(from: workspaces)
+                }
+            }
+            guard let chosen else { return }
+
+            await MainActor.run {
+                let controller = PeerRelayWorkspaceWindowController(
+                    hostSockPath: path,
+                    workspace: chosen
+                )
+                self.openWorkspaceRelays.append(controller)
+                controller.onClose = { [weak self, weak controller] in
+                    guard let self, let controller else { return }
+                    self.openWorkspaceRelays.removeAll { $0 === controller }
+                }
+                controller.show()
+            }
+        }
+    }
+
+    private func promptForWorkspaceSelection(
+        from workspaces: [Termmesh_Peer_V1_Workspace]
+    ) -> Termmesh_Peer_V1_Workspace? {
+        let alert = NSAlert()
+        alert.messageText = "Choose a workspace"
+        alert.informativeText = "Host has \(workspaces.count) workspaces. The chosen one will open in a single window with its host split layout."
+
+        let popup = NSPopUpButton(
+            frame: NSRect(x: 0, y: 0, width: 360, height: 26),
+            pullsDown: false
+        )
+        for w in workspaces {
+            let title = w.title.isEmpty ? "<untitled>" : w.title
+            let count = countLeaves(w.layout)
+            let idHex = w.workspaceID.prefix(4).map { String(format: "%02x", $0) }.joined()
+            let item = NSMenuItem(title: "\(title)  ·  \(count) panes  [\(idHex)]",
+                                  action: nil, keyEquivalent: "")
+            popup.menu?.addItem(item)
+        }
+        alert.accessoryView = popup
+        alert.addButton(withTitle: "Open")
+        alert.addButton(withTitle: "Cancel")
+
+        guard alert.runModal() == .alertFirstButtonReturn else { return nil }
+        let idx = popup.indexOfSelectedItem
+        guard idx >= 0, idx < workspaces.count else { return nil }
+        return workspaces[idx]
+    }
+
+    private func countLeaves(_ layout: Termmesh_Peer_V1_WorkspaceLayout) -> Int {
+        switch layout.node {
+        case .pane: return 1
+        case .split(let s): return countLeaves(s.first) + countLeaves(s.second)
+        case .none: return 0
+        }
+    }
 
     @objc func promptAndRunRelay(_ sender: Any?) {
         let alert = NSAlert()
@@ -67,20 +190,99 @@ final class PeerDebugCoordinator: NSObject {
         guard !path.isEmpty else { return }
 
         Task {
+            let connection: PeerRelayConnection
             do {
-                let session = try await PeerRelaySession.create(hostSockPath: path)
-                try session.prepareListener()
-                let controller = PeerRelayWindowController(session: session)
-                self.openRelays.append(controller)
-                controller.onClose = { [weak self, weak controller] in
-                    guard let self, let controller else { return }
-                    self.openRelays.removeAll { $0 === controller }
-                }
-                controller.show()
+                connection = try await PeerRelaySession.connectAndList(hostSockPath: path)
             } catch {
-                self.showAlert(title: "Peer Relay Failed", body: String(describing: error))
+                await MainActor.run {
+                    self.showAlert(title: "Peer Relay Failed", body: String(describing: error))
+                }
+                return
+            }
+
+            // Pick a surface — auto-skip the dialog when there's nothing
+            // to choose between.
+            let attachable = connection.surfaces.filter { $0.attachable }
+            let pickFrom = attachable.isEmpty ? connection.surfaces : attachable
+            guard !pickFrom.isEmpty else {
+                await connection.cancel()
+                await MainActor.run {
+                    self.showAlert(title: "Peer Relay Failed",
+                                   body: "Host has no surfaces to attach to.")
+                }
+                return
+            }
+
+            let chosen: Termmesh_Peer_V1_SurfaceInfo?
+            if pickFrom.count == 1 {
+                chosen = pickFrom[0]
+            } else {
+                chosen = await MainActor.run {
+                    self.promptForSurfaceSelection(from: pickFrom)
+                }
+            }
+            guard let chosen else {
+                await connection.cancel()
+                return
+            }
+
+            do {
+                let session = try await PeerRelaySession.attach(connection, surface: chosen)
+                try session.prepareListener()
+                await MainActor.run {
+                    let controller = PeerRelayWindowController(session: session)
+                    self.openRelays.append(controller)
+                    controller.onClose = { [weak self, weak controller] in
+                        guard let self, let controller else { return }
+                        self.openRelays.removeAll { $0 === controller }
+                    }
+                    controller.show()
+                }
+            } catch {
+                await connection.cancel()
+                await MainActor.run {
+                    self.showAlert(title: "Peer Relay Failed", body: String(describing: error))
+                }
             }
         }
+    }
+
+    /// Show an NSAlert with an NSPopUpButton listing the available
+    /// surfaces. Returns the user's pick, or nil if Cancel was clicked.
+    private func promptForSurfaceSelection(
+        from surfaces: [Termmesh_Peer_V1_SurfaceInfo]
+    ) -> Termmesh_Peer_V1_SurfaceInfo? {
+        let alert = NSAlert()
+        alert.messageText = "Choose a remote surface"
+        alert.informativeText = "Host exposes \(surfaces.count) surfaces. Pick which one this relay window should mirror."
+
+        let popup = NSPopUpButton(
+            frame: NSRect(x: 0, y: 0, width: 360, height: 26),
+            pullsDown: false
+        )
+        // NSPopUpButton dedupes items by visible title — when the host
+        // has multiple panes with the same title/cwd (e.g. four splits
+        // in the same workspace), they collapse into one entry. Stamp a
+        // short surfaceID prefix on every label and add NSMenuItem
+        // directly (rather than addItem(withTitle:)) so each row stays
+        // distinct.
+        for s in surfaces {
+            let title = s.title.isEmpty ? "<untitled>" : s.title
+            let detail = s.cwd.isEmpty ? "" : "  ·  \(s.cwd)"
+            let dims = "  (\(s.cols)×\(s.rows))"
+            let idHex = s.surfaceID.prefix(4).map { String(format: "%02x", $0) }.joined()
+            let display = "\(title)\(detail)\(dims)  [\(idHex)]"
+            let item = NSMenuItem(title: display, action: nil, keyEquivalent: "")
+            popup.menu?.addItem(item)
+        }
+        alert.accessoryView = popup
+        alert.addButton(withTitle: "Open")
+        alert.addButton(withTitle: "Cancel")
+
+        guard alert.runModal() == .alertFirstButtonReturn else { return nil }
+        let idx = popup.indexOfSelectedItem
+        guard idx >= 0, idx < surfaces.count else { return nil }
+        return surfaces[idx]
     }
 
     @objc func promptAndRun(_ sender: Any?) {

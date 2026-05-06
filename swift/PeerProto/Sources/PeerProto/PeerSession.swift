@@ -124,6 +124,21 @@ public actor PeerSession {
         return list.surfaces
     }
 
+    /// Layout-preserving discovery — host returns its workspaces (tabs)
+    /// each carrying a recursive split tree. Hosts that don't expose
+    /// layouts return an empty list, in which case the caller should
+    /// fall back to per-surface attach.
+    public func listWorkspaces() async throws -> [Termmesh_Peer_V1_Workspace] {
+        try await sendEnvelope { env in
+            env.listWorkspaces = Termmesh_Peer_V1_ListWorkspaces()
+        }
+        let reply = try await readFrame()
+        guard case .workspaceList(let list) = reply.payload else {
+            throw PeerSessionError.unexpectedMessage(String(describing: reply.payload))
+        }
+        return list.workspaces
+    }
+
     // MARK: - AttachSurface
 
     public func attachSurface(

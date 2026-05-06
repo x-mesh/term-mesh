@@ -19,6 +19,7 @@
 
 #if DEBUG
 import AppKit
+import Bonsplit
 import PeerProto
 
 // MARK: - C callback (top-level; @convention(c) cannot capture)
@@ -60,7 +61,26 @@ final class GhosttyPaneSurfaceProvider: PeerSurfaceProvider {
     // MARK: PeerSurfaceProvider
 
     func listSurfaces() async -> [Termmesh_Peer_V1_SurfaceInfo] {
-        await MainActor.run { collectSurfaces() }
+        // Background panes have a lazy `ghostty_surface_t` — newly opened
+        // splits / non-active tabs may not have one yet. Kick lazy init
+        // for any unready pane and wait briefly so the next collect
+        // picks them up. Without this the latest split is silently
+        // dropped from the picker.
+        await MainActor.run { kickLazySurfaceStarts() }
+        for _ in 0..<10 {
+            if await MainActor.run(body: { allSurfacesReady() }) { break }
+            try? await Task.sleep(nanoseconds: 30_000_000) // 30 ms × 10 = ≤300 ms
+        }
+        return await MainActor.run { collectSurfaces() }
+    }
+
+    func listWorkspaces() async -> [Termmesh_Peer_V1_Workspace] {
+        await MainActor.run { kickLazySurfaceStarts() }
+        for _ in 0..<10 {
+            if await MainActor.run(body: { allSurfacesReady() }) { break }
+            try? await Task.sleep(nanoseconds: 30_000_000)
+        }
+        return await MainActor.run { collectWorkspaces() }
     }
 
     func attach(
@@ -88,6 +108,11 @@ final class GhosttyPaneSurfaceProvider: PeerSurfaceProvider {
         // Register the C tap under renderer_state.mutex in Ghostty.
         ghostty_surface_set_pty_data_callback(sfcPtr, ptyTapCallback, ctxPtr)
 
+        // Light up the peer-attached ring on the host pane and bump
+        // the per-surface ref count so concurrent attaches all share
+        // a single visible ring.
+        Self.incrementPeerAttach(for: ts)
+
         // Capture weak reference to TerminalSurface for input/resize closures;
         // the strong ref lives in PtyTapContext for the lifetime of the attach.
         let weakTS = WeakRef(ts)
@@ -103,6 +128,9 @@ final class GhosttyPaneSurfaceProvider: PeerSurfaceProvider {
             await MainActor.run {
                 if let ptr = weakTS.value?.surface {
                     ghostty_surface_clear_pty_data_callback(ptr)
+                }
+                if let ts = weakTS.value {
+                    GhosttyPaneSurfaceProvider.decrementPeerAttach(for: ts)
                 }
             }
             continuation.finish()
@@ -134,7 +162,135 @@ final class GhosttyPaneSurfaceProvider: PeerSurfaceProvider {
         )
     }
 
+    // MARK: - Peer attach indicator
+
+    /// Per-surface attach counter. Lives on the @MainActor-isolated
+    /// type so reads/writes serialize with the rest of provider state.
+    private static var peerAttachCounts: [UUID: Int] = [:]
+
+    static func incrementPeerAttach(for ts: TerminalSurface) {
+        let prev = peerAttachCounts[ts.id] ?? 0
+        peerAttachCounts[ts.id] = prev + 1
+        if prev == 0 {
+            ts.hostedView.setPeerRing(visible: true)
+        }
+    }
+
+    static func decrementPeerAttach(for ts: TerminalSurface) {
+        let prev = peerAttachCounts[ts.id] ?? 0
+        let next = max(0, prev - 1)
+        if next == 0 {
+            peerAttachCounts.removeValue(forKey: ts.id)
+            ts.hostedView.setPeerRing(visible: false)
+        } else {
+            peerAttachCounts[ts.id] = next
+        }
+    }
+
     // MARK: - Private helpers
+
+    /// Wake up any pane whose `ghostty_surface_t` hasn't been created
+    /// yet (newly opened splits, background tabs). Non-blocking — caller
+    /// polls `allSurfacesReady` to know when init has settled.
+    private func kickLazySurfaceStarts() {
+        guard let tabManager = AppDelegate.shared?.tabManager else { return }
+        for workspace in tabManager.tabs {
+            for (_, panel) in workspace.panels {
+                guard let terminal = panel as? TerminalPanel else { continue }
+                let ts = terminal.surface
+                if ts.surface == nil {
+                    ts.requestBackgroundSurfaceStartIfNeeded()
+                }
+            }
+        }
+    }
+
+    /// True when every terminal pane has a non-nil `ghostty_surface_t`.
+    private func allSurfacesReady() -> Bool {
+        guard let tabManager = AppDelegate.shared?.tabManager else { return true }
+        for workspace in tabManager.tabs {
+            for (_, panel) in workspace.panels {
+                guard let terminal = panel as? TerminalPanel else { continue }
+                if terminal.surface.surface == nil { return false }
+            }
+        }
+        return true
+    }
+
+    private func collectWorkspaces() -> [Termmesh_Peer_V1_Workspace] {
+        guard let tabManager = AppDelegate.shared?.tabManager else { return [] }
+        var result: [Termmesh_Peer_V1_Workspace] = []
+        for workspace in tabManager.tabs {
+            let tree = workspace.bonsplitController.treeSnapshot()
+            guard let layout = translateBonsplitNode(tree, workspace: workspace) else {
+                continue
+            }
+            var ws = Termmesh_Peer_V1_Workspace()
+            ws.workspaceID = withUnsafeBytes(of: workspace.id.uuid) { Data($0) }
+            ws.title = workspace.customTitle ?? workspace.title
+            ws.layout = layout
+            result.append(ws)
+        }
+        return result
+    }
+
+    /// Walk a bonsplit `ExternalTreeNode` and produce the corresponding
+    /// `WorkspaceLayout` proto. Pane leaves are dereferenced via
+    /// `workspace.surfaceIdToPanelId` to find the underlying
+    /// TerminalSurface ID — that's the value clients use for
+    /// AttachSurface. Non-terminal panes (browsers, panes whose
+    /// surface hasn't materialised yet) are dropped; if both children
+    /// of a split drop, the split itself is folded out.
+    private func translateBonsplitNode(
+        _ node: ExternalTreeNode,
+        workspace: Workspace
+    ) -> Termmesh_Peer_V1_WorkspaceLayout? {
+        switch node {
+        case .pane(let pane):
+            guard let selectedTabIDStr = pane.selectedTabId ?? pane.tabs.first?.id,
+                  let tabUUID = UUID(uuidString: selectedTabIDStr),
+                  let panelUUID = workspace.surfaceIdToPanelId[TabID(uuid: tabUUID)],
+                  let terminal = workspace.panels[panelUUID] as? TerminalPanel,
+                  let sfcPtr = terminal.surface.surface
+            else { return nil }
+            let ts = terminal.surface
+            var paneMsg = Termmesh_Peer_V1_WorkspacePane()
+            paneMsg.surfaceID = surfaceIDBytes(ts.id)
+            paneMsg.title = workspace.panelTitles[terminal.id] ?? "Terminal"
+            let sz = ghostty_surface_size(sfcPtr)
+            paneMsg.cols = UInt32(sz.columns)
+            paneMsg.rows = UInt32(sz.rows)
+            if let cwd = workspace.panelDirectories[terminal.id] {
+                paneMsg.cwd = cwd
+            }
+            var layout = Termmesh_Peer_V1_WorkspaceLayout()
+            layout.pane = paneMsg
+            return layout
+
+        case .split(let split):
+            let firstChild = translateBonsplitNode(split.first, workspace: workspace)
+            let secondChild = translateBonsplitNode(split.second, workspace: workspace)
+            // If one side has nothing attachable, fold the split out
+            // and surface only the populated child.
+            switch (firstChild, secondChild) {
+            case (nil, nil):
+                return nil
+            case (let f?, nil):
+                return f
+            case (nil, let s?):
+                return s
+            case (let f?, let s?):
+                var splitMsg = Termmesh_Peer_V1_WorkspaceSplit()
+                splitMsg.orientation = split.orientation
+                splitMsg.dividerPosition = split.dividerPosition
+                splitMsg.first = f
+                splitMsg.second = s
+                var layout = Termmesh_Peer_V1_WorkspaceLayout()
+                layout.split = splitMsg
+                return layout
+            }
+        }
+    }
 
     private func collectSurfaces() -> [Termmesh_Peer_V1_SurfaceInfo] {
         guard let tabManager = AppDelegate.shared?.tabManager else { return [] }

@@ -88,6 +88,17 @@ public protocol PeerSurfaceProvider: AnyObject, Sendable {
         clientCols: UInt32,
         clientRows: UInt32
     ) async -> PeerSurfaceAttachment?
+    /// Layout-preserving discovery: enumerate the host's workspaces
+    /// (tabs) plus their split tree. Default implementation returns an
+    /// empty list, so providers that don't expose split layouts (Static,
+    /// Echo) can ignore the call. Clients combine this with
+    /// `listSurfaces` to attach every leaf in a workspace and place
+    /// them in the same arrangement locally.
+    func listWorkspaces() async -> [Termmesh_Peer_V1_Workspace]
+}
+
+public extension PeerSurfaceProvider {
+    func listWorkspaces() async -> [Termmesh_Peer_V1_Workspace] { [] }
 }
 
 /// Provider for the list-only case: static surfaces, no attach support.
@@ -585,6 +596,14 @@ actor PeerServerSession {
                 var list = Termmesh_Peer_V1_SurfaceList()
                 list.surfaces = surfaces
                 inner.surfaceList = list
+            }
+
+        case (.ready, .listWorkspaces):
+            let workspaces = await provider.listWorkspaces()
+            try await sendEnvelopeWithCorrelation(env.seq) { inner in
+                var list = Termmesh_Peer_V1_WorkspaceList()
+                list.workspaces = workspaces
+                inner.workspaceList = list
             }
 
         case (.ready, .attachSurface(let req)):
