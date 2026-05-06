@@ -173,9 +173,29 @@ final class GhosttyPaneSurfaceProvider: PeerSurfaceProvider {
             performSplit(paneIDBytes: req.paneID, orientationString: req.orientation)
         case .closePane(let req):
             performClose(paneIDBytes: req.paneID)
+        case .focusPane(let req):
+            performFocus(paneIDBytes: req.paneID)
         case .none:
             break
         }
+    }
+
+    private func performFocus(paneIDBytes: Data) {
+        guard let panelUUID = uuidFromSurfaceID(paneIDBytes),
+              let workspace = workspaceContaining(panelUUID: panelUUID),
+              let tabID = workspace.surfaceIdFromPanelId(panelUUID)
+        else { return }
+        // Drive bonsplit directly. The full `Workspace.focusPanel`
+        // path also calls `moveFocus` which ends up running
+        // `window.makeKeyAndOrderFront` on the host's main term-mesh
+        // window — that yanks the user's keyboard focus out of the
+        // peer relay window every time they click a pane in it.
+        let targetPaneId = workspace.bonsplitController.allPaneIds.first { paneId in
+            workspace.bonsplitController.tabs(inPane: paneId).contains { $0.id == tabID }
+        }
+        guard let targetPaneId else { return }
+        workspace.bonsplitController.focusPane(targetPaneId)
+        workspace.bonsplitController.selectTab(tabID)
     }
 
     private func performSplit(paneIDBytes: Data, orientationString: String) {

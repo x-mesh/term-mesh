@@ -164,6 +164,17 @@ public actor PeerSession {
         }
     }
 
+    /// Ask the host to move keyboard focus to a pane. Fire-and-forget.
+    public func requestFocusPane(paneID: Data) async throws {
+        try await sendEnvelope { env in
+            var req = Termmesh_Peer_V1_FocusPaneRequest()
+            req.paneID = paneID
+            var ctl = Termmesh_Peer_V1_WorkspaceControl()
+            ctl.focusPane = req
+            env.workspaceControl = ctl
+        }
+    }
+
     // MARK: - AttachSurface
 
     public func attachSurface(

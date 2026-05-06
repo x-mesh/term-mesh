@@ -213,7 +213,9 @@ final class PeerRelayWorkspaceWindowController: NSWindowController, NSWindowDele
         // Track which pane the user last clicked. Ghostty surfaces
         // embedded in our NSSplitView don't always promote themselves
         // to firstResponder reliably, so we record focus on mouse
-        // down and consult that first when dispatching shortcuts.
+        // down and consult that first when dispatching shortcuts. We
+        // also forward the focus to the host so its bonsplit follows
+        // the click — keeps the two windows in sync visually.
         clickMonitor = NSEvent.addLocalMonitorForEvents(matching: .leftMouseDown) { [weak self] event in
             guard let self,
                   let window = self.window,
@@ -223,11 +225,21 @@ final class PeerRelayWorkspaceWindowController: NSWindowController, NSWindowDele
             for (sid, slot) in self.panesBySurfaceID {
                 let frameInWindow = slot.view.convert(slot.view.bounds, to: nil)
                 if frameInWindow.contains(point) {
-                    self.lastClickedSurfaceID = sid
+                    if self.lastClickedSurfaceID != sid {
+                        self.lastClickedSurfaceID = sid
+                        self.dispatchFocus(surfaceID: sid)
+                    }
                     break
                 }
             }
             return event
+        }
+    }
+
+    private func dispatchFocus(surfaceID: Data) {
+        guard let session = subscriptionSession else { return }
+        Task {
+            try? await session.requestFocusPane(paneID: surfaceID)
         }
     }
 

@@ -669,11 +669,20 @@ public struct Termmesh_Peer_V1_WorkspaceControl: Sendable {
     set {kind = .closePane(newValue)}
   }
 
+  public var focusPane: Termmesh_Peer_V1_FocusPaneRequest {
+    get {
+      if case .focusPane(let v)? = kind {return v}
+      return Termmesh_Peer_V1_FocusPaneRequest()
+    }
+    set {kind = .focusPane(newValue)}
+  }
+
   public var unknownFields = SwiftProtobuf.UnknownStorage()
 
   public enum OneOf_Kind: Equatable, Sendable {
     case splitPane(Termmesh_Peer_V1_SplitPaneRequest)
     case closePane(Termmesh_Peer_V1_ClosePaneRequest)
+    case focusPane(Termmesh_Peer_V1_FocusPaneRequest)
 
   }
 
@@ -698,6 +707,18 @@ public struct Termmesh_Peer_V1_SplitPaneRequest: Sendable {
 }
 
 public struct Termmesh_Peer_V1_ClosePaneRequest: Sendable {
+  // SwiftProtobuf.Message conformance is added in an extension below. See the
+  // `Message` and `Message+*Additions` files in the SwiftProtobuf library for
+  // methods supported on all messages.
+
+  public var paneID: Data = Data()
+
+  public var unknownFields = SwiftProtobuf.UnknownStorage()
+
+  public init() {}
+}
+
+public struct Termmesh_Peer_V1_FocusPaneRequest: Sendable {
   // SwiftProtobuf.Message conformance is added in an extension below. See the
   // `Message` and `Message+*Additions` files in the SwiftProtobuf library for
   // methods supported on all messages.
@@ -2350,7 +2371,7 @@ extension Termmesh_Peer_V1_WorkspacePane: SwiftProtobuf.Message, SwiftProtobuf._
 
 extension Termmesh_Peer_V1_WorkspaceControl: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
   public static let protoMessageName: String = _protobuf_package + ".WorkspaceControl"
-  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{3}split_pane\0\u{3}close_pane\0")
+  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{3}split_pane\0\u{3}close_pane\0\u{3}focus_pane\0")
 
   public mutating func decodeMessage<D: SwiftProtobuf.Decoder>(decoder: inout D) throws {
     while let fieldNumber = try decoder.nextFieldNumber() {
@@ -2384,6 +2405,19 @@ extension Termmesh_Peer_V1_WorkspaceControl: SwiftProtobuf.Message, SwiftProtobu
           self.kind = .closePane(v)
         }
       }()
+      case 3: try {
+        var v: Termmesh_Peer_V1_FocusPaneRequest?
+        var hadOneofValue = false
+        if let current = self.kind {
+          hadOneofValue = true
+          if case .focusPane(let m) = current {v = m}
+        }
+        try decoder.decodeSingularMessageField(value: &v)
+        if let v = v {
+          if hadOneofValue {try decoder.handleConflictingOneOf()}
+          self.kind = .focusPane(v)
+        }
+      }()
       default: break
       }
     }
@@ -2402,6 +2436,10 @@ extension Termmesh_Peer_V1_WorkspaceControl: SwiftProtobuf.Message, SwiftProtobu
     case .closePane?: try {
       guard case .closePane(let v)? = self.kind else { preconditionFailure() }
       try visitor.visitSingularMessageField(value: v, fieldNumber: 2)
+    }()
+    case .focusPane?: try {
+      guard case .focusPane(let v)? = self.kind else { preconditionFailure() }
+      try visitor.visitSingularMessageField(value: v, fieldNumber: 3)
     }()
     case nil: break
     }
@@ -2474,6 +2512,36 @@ extension Termmesh_Peer_V1_ClosePaneRequest: SwiftProtobuf.Message, SwiftProtobu
   }
 
   public static func ==(lhs: Termmesh_Peer_V1_ClosePaneRequest, rhs: Termmesh_Peer_V1_ClosePaneRequest) -> Bool {
+    if lhs.paneID != rhs.paneID {return false}
+    if lhs.unknownFields != rhs.unknownFields {return false}
+    return true
+  }
+}
+
+extension Termmesh_Peer_V1_FocusPaneRequest: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
+  public static let protoMessageName: String = _protobuf_package + ".FocusPaneRequest"
+  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{3}pane_id\0")
+
+  public mutating func decodeMessage<D: SwiftProtobuf.Decoder>(decoder: inout D) throws {
+    while let fieldNumber = try decoder.nextFieldNumber() {
+      // The use of inline closures is to circumvent an issue where the compiler
+      // allocates stack space for every case branch when no optimizations are
+      // enabled. https://github.com/apple/swift-protobuf/issues/1034
+      switch fieldNumber {
+      case 1: try { try decoder.decodeSingularBytesField(value: &self.paneID) }()
+      default: break
+      }
+    }
+  }
+
+  public func traverse<V: SwiftProtobuf.Visitor>(visitor: inout V) throws {
+    if !self.paneID.isEmpty {
+      try visitor.visitSingularBytesField(value: self.paneID, fieldNumber: 1)
+    }
+    try unknownFields.traverse(visitor: &visitor)
+  }
+
+  public static func ==(lhs: Termmesh_Peer_V1_FocusPaneRequest, rhs: Termmesh_Peer_V1_FocusPaneRequest) -> Bool {
     if lhs.paneID != rhs.paneID {return false}
     if lhs.unknownFields != rhs.unknownFields {return false}
     return true

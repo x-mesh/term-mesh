@@ -226,6 +226,7 @@ message WorkspaceControl {
   oneof kind {
     SplitPaneRequest split_pane = 1;
     ClosePaneRequest close_pane = 2;
+    FocusPaneRequest focus_pane = 3;
   }
 }
 
@@ -238,6 +239,10 @@ message SplitPaneRequest {
 }
 
 message ClosePaneRequest {
+  bytes pane_id = 1;
+}
+
+message FocusPaneRequest {
   bytes pane_id = 1;
 }
 
