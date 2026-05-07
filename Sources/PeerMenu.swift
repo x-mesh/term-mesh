@@ -155,7 +155,12 @@ final class PeerCoordinator: NSObject {
         targetField.placeholderString = "user@mac-mini.local"
         let remoteLabel = NSTextField(labelWithString: "Remote peer socket:")
         let remoteField = NSTextField(frame: NSRect(x: 0, y: 0, width: 380, height: 24))
-        remoteField.stringValue = PeerFederationSettings.defaultSocketPath
+        // Pre-fill with this machine's *effective* socketPath (the
+        // value stored in UserDefaults when the user has overridden
+        // it; otherwise the per-uid default). When the remote side is
+        // the same user on a similarly-configured Mac, this will be
+        // the correct remote path; the user can still edit it.
+        remoteField.stringValue = PeerFederationSettings.socketPath
 
         // Pre-fill from the most recent host so a re-connect is
         // one-keystroke (Cmd+T → Cmd+Return).
@@ -335,7 +340,7 @@ final class PeerCoordinator: NSObject {
 
         let input = NSTextField(frame: NSRect(x: 0, y: 0, width: 360, height: 24))
         input.stringValue = ProcessInfo.processInfo.environment["TERMMESH_DEBUG_PEER_SERVER_PATH"]
-            ?? PeerFederationSettings.defaultSocketPath
+            ?? PeerFederationSettings.socketPath
         alert.accessoryView = input
         alert.addButton(withTitle: "Connect")
         alert.addButton(withTitle: "Cancel")
@@ -450,7 +455,7 @@ final class PeerCoordinator: NSObject {
 
         let input = NSTextField(frame: NSRect(x: 0, y: 0, width: 360, height: 24))
         input.stringValue = ProcessInfo.processInfo.environment["TERMMESH_DEBUG_PEER_SERVER_PATH"]
-            ?? PeerFederationSettings.defaultSocketPath
+            ?? PeerFederationSettings.socketPath
         alert.accessoryView = input
         alert.addButton(withTitle: "Connect")
         alert.addButton(withTitle: "Cancel")
