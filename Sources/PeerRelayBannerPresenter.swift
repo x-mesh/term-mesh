@@ -24,8 +24,8 @@ final class PeerRelayBannerPresenter {
     func showDisconnected(reason: String) {
         cancelDismiss()
         banner?.show(
-            kind: .error,
-            message: "Disconnected: \(reason)",
+            kind: .disconnected,
+            message: "Disconnected — \(reason)",
             actionTitle: nil,
             dismissable: false
         )

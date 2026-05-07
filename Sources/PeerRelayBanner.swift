@@ -12,31 +12,38 @@ enum PeerRelayBannerKind {
     case warning
     case error
     case success
+    /// "Connection is gone" state — slightly darker red than `.error`
+    /// and uses a 🔌 (broken-plug) emoji prefix so the loss reads as
+    /// distinct from a transient operation error.
+    case disconnected
 
     var background: NSColor {
         switch self {
-        case .info:    return NSColor.systemBlue.withAlphaComponent(0.18)
-        case .warning: return NSColor.systemYellow.withAlphaComponent(0.22)
-        case .error:   return NSColor.systemRed.withAlphaComponent(0.22)
-        case .success: return NSColor.systemGreen.withAlphaComponent(0.22)
+        case .info:         return NSColor.systemBlue.withAlphaComponent(0.18)
+        case .warning:      return NSColor.systemYellow.withAlphaComponent(0.22)
+        case .error:        return NSColor.systemRed.withAlphaComponent(0.22)
+        case .success:      return NSColor.systemGreen.withAlphaComponent(0.22)
+        case .disconnected: return NSColor.systemRed.withAlphaComponent(0.32)
         }
     }
 
     var symbol: String {
         switch self {
-        case .info:    return "ⓘ"
-        case .warning: return "⚠"
-        case .error:   return "✕"
-        case .success: return "✓"
+        case .info:         return "ⓘ"
+        case .warning:      return "⚠"
+        case .error:        return "✕"
+        case .success:      return "✓"
+        case .disconnected: return "🔌"
         }
     }
 
     var symbolColor: NSColor {
         switch self {
-        case .info:    return .systemBlue
-        case .warning: return .systemYellow
-        case .error:   return .systemRed
-        case .success: return .systemGreen
+        case .info:         return .systemBlue
+        case .warning:      return .systemYellow
+        case .error:        return .systemRed
+        case .success:      return .systemGreen
+        case .disconnected: return .systemRed
         }
     }
 }

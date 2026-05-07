@@ -210,11 +210,14 @@ final class PeerRelayWorkspaceWindowController: NSWindowController, NSWindowDele
     private func handleTunnelStateChange(_ state: PeerSSHTunnelState) {
         switch state {
         case .down(let reason):
+            markWindowDisconnected(reason: reason)
             bannerPresenter?.showDisconnected(reason: reason)
             tearDownPeerSessions(keepWindow: true)
         case .reconnecting(let attempt):
+            markWindowReconnecting(attempt: attempt)
             bannerPresenter?.showReconnecting(attempt: attempt)
         case .up:
+            markWindowConnected()
             bannerPresenter?.showReattaching()
             // Tunnel just came back. Re-run the initial-attach flow
             // from the same hostSockPath.
@@ -240,6 +243,7 @@ final class PeerRelayWorkspaceWindowController: NSWindowController, NSWindowDele
         case .failed(let reason):
             // Auto-retry gave up. Surface a Retry button so the user
             // can re-arm the loop without closing the window.
+            markWindowDisconnected(reason: "gave up retrying")
             bannerPresenter?.showFailedTerminal(reason: reason) { [weak self] in
                 self?.sshTunnel?.retry()
             }
@@ -247,6 +251,29 @@ final class PeerRelayWorkspaceWindowController: NSWindowController, NSWindowDele
         case .stopped, .starting:
             break
         }
+    }
+
+    // MARK: - Disconnect indicator (window title prefix)
+
+    /// Update the window title with a clear visual disconnect marker.
+    /// Idempotent — safe to call repeatedly. Shown for both SSH-tunnel
+    /// `.down` / `.failed` and the direct-socket EOF case so all
+    /// disconnects produce the same UI affordance.
+    @MainActor
+    private func markWindowDisconnected(reason: String) {
+        let suffix = " — 🔌 Disconnected"
+        let detail = reason.isEmpty ? "" : " (\(reason))"
+        window?.title = baseTitle + suffix + detail
+    }
+
+    @MainActor
+    private func markWindowReconnecting(attempt: Int) {
+        window?.title = baseTitle + " — Reconnecting (try \(attempt))…"
+    }
+
+    @MainActor
+    private func markWindowConnected() {
+        window?.title = baseTitle
     }
 
     private func tearDownPeerSessions(keepWindow: Bool) {
@@ -360,12 +387,19 @@ final class PeerRelayWorkspaceWindowController: NSWindowController, NSWindowDele
             await MainActor.run { self.installKeyMonitor() }
 
             subscriptionTask = Task { [weak self] in
+                var disconnectReason: String? = nil
                 while let self, !Task.isCancelled {
                     let msg: PeerIncomingMessage
                     do {
                         msg = try await session.receiveNextMessage()
                     } catch {
-                        return
+                        // Transport read failed — the host went away.
+                        // For SSH-backed sessions the tunnel's own
+                        // .down state usually arrives first; for
+                        // direct unix-socket sessions this is the
+                        // only signal.
+                        disconnectReason = String(describing: error)
+                        break
                     }
                     if case .workspaceLayoutChanged(let wid, let layout) = msg {
                         guard wid == self.workspaceID else { continue }
@@ -376,11 +410,37 @@ final class PeerRelayWorkspaceWindowController: NSWindowController, NSWindowDele
                             NSLog("[peer-ws] applyLayout error: %@", String(describing: error))
                         }
                     }
-                    if case .goodbye = msg { return }
+                    if case .goodbye = msg {
+                        disconnectReason = "host closed connection"
+                        break
+                    }
+                }
+                // Announce the loss if we exited unexpectedly. Skip
+                // when the controller is mid-shutdown (`isClosing`)
+                // or when a tunnel is already driving the disconnect
+                // banner — `bannerPresenter.showDisconnected` is
+                // idempotent so a duplicate is harmless, but
+                // surfacing it from both sides clutters logs.
+                if let reason = disconnectReason {
+                    await MainActor.run { [weak self] in
+                        guard let self, !self.isClosing else { return }
+                        // SSH-backed: the tunnel's `.down` already
+                        // marked us disconnected; don't double up.
+                        if self.sshTunnel == nil {
+                            self.markWindowDisconnected(reason: reason)
+                            self.bannerPresenter?.showDisconnected(reason: reason)
+                        }
+                    }
                 }
             }
         } catch {
             NSLog("[peer-ws] subscription connect failed: %@", String(describing: error))
+            await MainActor.run { [weak self] in
+                guard let self, !self.isClosing else { return }
+                let detail = String(describing: error)
+                self.markWindowDisconnected(reason: detail)
+                self.bannerPresenter?.showDisconnected(reason: detail)
+            }
         }
     }
 
