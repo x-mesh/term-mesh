@@ -379,11 +379,12 @@ final class TerminalSurface: Identifiable, ObservableObject {
         abs(lhs - rhs) <= epsilon
     }
 
-    func attachToView(_ view: GhosttyNSView) {
+    func attachToView(_ view: GhosttyNSView, deferCreation: Bool = true) {
 #if DEBUG
         dlog(
             "surface.attach surface=\(id.uuidString.prefix(5)) view=\(Unmanaged.passUnretained(view).toOpaque()) " +
-            "attached=\(attachedView != nil ? 1 : 0) hasSurface=\(surface != nil ? 1 : 0) inWindow=\(view.window != nil ? 1 : 0)"
+            "attached=\(attachedView != nil ? 1 : 0) hasSurface=\(surface != nil ? 1 : 0) " +
+            "inWindow=\(view.window != nil ? 1 : 0) defer=\(deferCreation ? 1 : 0)"
         )
 #endif
 
@@ -428,11 +429,30 @@ final class TerminalSurface: Identifiable, ObservableObject {
                     "bounds=\(String(format: "%.1fx%.1f", view.bounds.width, view.bounds.height))"
                 )
 #endif
+                sentryBreadcrumb("surface.attach.defer", category: "terminal", data: [
+                    "surface": id.uuidString,
+                    "workspace": tabId.uuidString,
+                    "reason": "noWindow",
+                    "width": Double(view.bounds.width),
+                    "height": Double(view.bounds.height)
+                ])
                 return
             }
 #if DEBUG
             dlog("surface.attach.create surface=\(id.uuidString.prefix(5))")
 #endif
+            sentryBreadcrumb("surface.attach.create", category: "terminal", data: [
+                "surface": id.uuidString,
+                "workspace": tabId.uuidString,
+                "width": Double(view.bounds.width),
+                "height": Double(view.bounds.height),
+                "windowCount": NSApp.windows.count,
+                "deferred": deferCreation
+            ])
+            if deferCreation {
+                requestBackgroundSurfaceStartIfNeeded(reason: "attachToWindow")
+                return
+            }
             createSurface(for: view)
 #if DEBUG
             dlog("surface.attach.create.done surface=\(id.uuidString.prefix(5)) hasSurface=\(surface != nil ? 1 : 0)")
@@ -472,6 +492,7 @@ final class TerminalSurface: Identifiable, ObservableObject {
     }
 
     private func createSurface(for view: GhosttyNSView) {
+        let createSurfaceStartedAt = CACurrentMediaTime()
         #if DEBUG
         let resourcesDir = getenv("GHOSTTY_RESOURCES_DIR").flatMap { String(cString: $0) } ?? "(unset)"
         let terminfo = getenv("TERMINFO").flatMap { String(cString: $0) } ?? "(unset)"
@@ -479,12 +500,25 @@ final class TerminalSurface: Identifiable, ObservableObject {
         let manpath = getenv("MANPATH").flatMap { String(cString: $0) } ?? "(unset)"
         Self.surfaceLog("createSurface start surface=\(id.uuidString) tab=\(tabId.uuidString) bounds=\(view.bounds) inWindow=\(view.window != nil) resources=\(resourcesDir) terminfo=\(terminfo) xdg=\(xdg) manpath=\(manpath)")
         #endif
+        sentryBreadcrumb("surface.create.start", category: "terminal", data: [
+            "surface": id.uuidString,
+            "workspace": tabId.uuidString,
+            "context": termMeshSurfaceContextName(surfaceContext),
+            "width": Double(view.bounds.width),
+            "height": Double(view.bounds.height),
+            "inWindow": view.window != nil
+        ])
 
         guard let app = GhosttyApp.shared.app else {
             Logger.ui.error("Ghostty app not initialized")
             #if DEBUG
             Self.surfaceLog("createSurface FAILED surface=\(id.uuidString): ghostty app not initialized")
             #endif
+            sentryBreadcrumb("surface.create.fail", category: "terminal", data: [
+                "surface": id.uuidString,
+                "workspace": tabId.uuidString,
+                "reason": "ghosttyAppNil"
+            ])
             return
         }
 
@@ -633,7 +667,12 @@ final class TerminalSurface: Identifiable, ObservableObject {
             }
         }
 
+        var ghosttySurfaceNewMs: Double?
         let createSurface = { [self] in
+            let ghosttySurfaceNewStartedAt = CACurrentMediaTime()
+            defer {
+                ghosttySurfaceNewMs = (CACurrentMediaTime() - ghosttySurfaceNewStartedAt) * 1000.0
+            }
             if !envVars.isEmpty {
                 let envVarsCount = envVars.count
                 envVars.withUnsafeMutableBufferPointer { buffer in
@@ -723,6 +762,16 @@ final class TerminalSurface: Identifiable, ObservableObject {
                 Self.surfaceLog("createSurface diagnostics: config=nil")
             }
             #endif
+            sentryBreadcrumb("surface.create.fail", category: "terminal", data: [
+                "surface": id.uuidString,
+                "workspace": tabId.uuidString,
+                "reason": "surfaceNil",
+                "totalMs": (CACurrentMediaTime() - createSurfaceStartedAt) * 1000.0,
+                "ghosttySurfaceNewMs": ghosttySurfaceNewMs ?? -1.0,
+                "hasWorkingDirectory": usableWorkingDirectory != nil,
+                "hasCommand": resolvedCommand != nil,
+                "envCount": env.count
+            ])
             return
         }
         guard let createdSurface = surface else { return }
@@ -780,6 +829,18 @@ final class TerminalSurface: Identifiable, ObservableObject {
             "runtimeFont=\(runtimeFontText)"
         )
 #endif
+        sentryBreadcrumb("surface.create.done", category: "terminal", data: [
+            "surface": id.uuidString,
+            "workspace": tabId.uuidString,
+            "context": termMeshSurfaceContextName(surfaceContext),
+            "totalMs": (CACurrentMediaTime() - createSurfaceStartedAt) * 1000.0,
+            "ghosttySurfaceNewMs": ghosttySurfaceNewMs ?? -1.0,
+            "hasWorkingDirectory": usableWorkingDirectory != nil,
+            "hasCommand": resolvedCommand != nil,
+            "envCount": env.count,
+            "widthPx": Int(lastPixelWidth),
+            "heightPx": Int(lastPixelHeight)
+        ])
     }
 
     func updateSize(
@@ -1134,10 +1195,10 @@ final class TerminalSurface: Identifiable, ObservableObject {
         return pressHandled
     }
 
-    func requestBackgroundSurfaceStartIfNeeded() {
+    func requestBackgroundSurfaceStartIfNeeded(reason: String = "background") {
         if !Thread.isMainThread {
             DispatchQueue.main.async { [weak self] in
-                self?.requestBackgroundSurfaceStartIfNeeded()
+                self?.requestBackgroundSurfaceStartIfNeeded(reason: reason)
             }
             return
         }
@@ -1150,6 +1211,14 @@ final class TerminalSurface: Identifiable, ObservableObject {
             guard let self else { return }
             self.backgroundSurfaceStartQueued = false
             guard self.surface == nil, let view = self.attachedView else { return }
+            sentryBreadcrumb("surface.create.deferredStart", category: "terminal", data: [
+                "surface": self.id.uuidString,
+                "workspace": self.tabId.uuidString,
+                "reason": reason,
+                "inWindow": view.window != nil,
+                "width": Double(view.bounds.width),
+                "height": Double(view.bounds.height)
+            ])
             #if DEBUG
             let startedAt = ProcessInfo.processInfo.systemUptime
             #endif
@@ -1677,7 +1746,7 @@ func pushTargetSurfaceSize(_ size: CGSize) {
             return surface
         }
         guard window != nil else { return nil }
-        terminalSurface?.attachToView(self)
+        terminalSurface?.attachToView(self, deferCreation: false)
         updateSurfaceSize(size: bounds.size)
         applySurfaceColorScheme(force: true)
         return surface

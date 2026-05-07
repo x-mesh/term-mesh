@@ -487,7 +487,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
 
     func applicationDidBecomeActive(_ notification: Notification) {
         sentryBreadcrumb("app.didBecomeActive", category: "lifecycle", data: [
-            "tabCount": tabManager?.tabs.count ?? 0
+            "tabCount": tabManager?.tabs.count ?? 0,
+            "windowCount": NSApp.windows.count,
+            "visibleWindowCount": NSApp.windows.filter { $0.isVisible }.count,
+            "hasKeyWindow": NSApp.keyWindow != nil,
+            "hasMainWindow": NSApp.mainWindow != nil
         ])
         let env = ProcessInfo.processInfo.environment
         if !isRunningUnderXCTest(env) {
