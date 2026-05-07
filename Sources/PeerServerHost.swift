@@ -38,6 +38,12 @@ final class PeerServerCoordinator: NSObject {
     private var provider: GhosttyPaneSurfaceProvider?
     private var layoutObserver: NSObjectProtocol?
     private var bonjour: PeerBonjourPublisher?
+    /// Per-workspace debounce of `WorkspaceLayoutChanged` broadcasts.
+    /// `bonsplit.didChangeGeometry` fires on every intermediate
+    /// position during a divider drag (~60Hz); coalescing here keeps
+    /// the network/CPU cost proportional to "drag ended" rather than
+    /// "frame settled."
+    private var layoutBroadcastDebounce: [UUID: Task<Void, Never>] = [:]
 
     /// Launch-time hook. Start the peer server when either the
     /// `TERMMESH_PEER_SERVER_PATH` (or legacy
@@ -200,21 +206,47 @@ final class PeerServerCoordinator: NSObject {
             forName: .peerWorkspaceLayoutDidChange,
             object: nil,
             queue: .main
-        ) { [weak server, weak provider] note in
-            guard let server, let provider,
+        ) { [weak self, weak server, weak provider] note in
+            guard let self, let server, let provider,
                   let workspaceID = note.userInfo?["workspaceID"] as? UUID
             else { return }
-            let idBytes = withUnsafeBytes(of: workspaceID.uuid) { Data($0) }
-            Task {
-                let workspaces = await provider.listWorkspaces()
-                guard let updated = workspaces.first(where: { $0.workspaceID == idBytes })
-                else { return }
-                await server.broadcastWorkspaceLayoutChanged(
-                    workspaceID: idBytes,
-                    layout: updated.layout
-                )
+            // Coalesce a flurry of layout-change notifications (e.g. a
+            // divider drag posts one per pixel of motion) into a single
+            // broadcast so attached relays don't thrash.
+            self.scheduleLayoutBroadcast(
+                workspaceID: workspaceID,
+                server: server,
+                provider: provider
+            )
+        }
+    }
+
+    /// Debounce window for divider-drag-style flurries. 120 ms balances
+    /// "feels live" against "don't broadcast every intermediate frame."
+    private static let layoutBroadcastDebounceInterval: UInt64 = 120_000_000
+
+    private func scheduleLayoutBroadcast(workspaceID: UUID,
+                                         server: PeerServer,
+                                         provider: GhosttyPaneSurfaceProvider) {
+        layoutBroadcastDebounce[workspaceID]?.cancel()
+        let idBytes = withUnsafeBytes(of: workspaceID.uuid) { Data($0) }
+        let debounceNs = Self.layoutBroadcastDebounceInterval
+        let task = Task { [weak self, weak server, weak provider] in
+            try? await Task.sleep(nanoseconds: debounceNs)
+            if Task.isCancelled { return }
+            guard let server, let provider else { return }
+            let workspaces = await provider.listWorkspaces()
+            guard let updated = workspaces.first(where: { $0.workspaceID == idBytes })
+            else { return }
+            await server.broadcastWorkspaceLayoutChanged(
+                workspaceID: idBytes,
+                layout: updated.layout
+            )
+            await MainActor.run { [weak self] in
+                self?.layoutBroadcastDebounce.removeValue(forKey: workspaceID)
             }
         }
+        layoutBroadcastDebounce[workspaceID] = task
     }
 
     private func uninstallLayoutChangeBridge() {
@@ -222,6 +254,8 @@ final class PeerServerCoordinator: NSObject {
             NotificationCenter.default.removeObserver(observer)
             layoutObserver = nil
         }
+        for (_, task) in layoutBroadcastDebounce { task.cancel() }
+        layoutBroadcastDebounce.removeAll()
     }
 
     private func showInfo(title: String, body: String) {

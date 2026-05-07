@@ -573,6 +573,16 @@ final class PeerRelayWorkspaceWindowController: NSWindowController, NSWindowDele
     //   4. Tears down slots whose surfaces are no longer in the tree.
 
     private func applyLayout(_ layout: Termmesh_Peer_V1_WorkspaceLayout) async throws {
+        // Fast path: if the only thing that changed since the last
+        // applied layout is divider positions, just push positions
+        // into the existing NSSplitView tree. Saves a full
+        // teardown / rebuild + Auto Layout pass per host divider
+        // drag tick — the dominant cost during a drag.
+        if Self.isDividerOnlyDelta(from: currentLayout, to: layout) {
+            await MainActor.run { self.applyDividerPositions(from: layout) }
+            return
+        }
+
         let newSurfaceIDs = collectSurfaceIDs(layout)
         let missingSurfaceIDs = newSurfaceIDs.filter { panesBySurfaceID[$0] == nil }
         let surfaceInfoByID = try await fetchSurfaceInfoByIDIfNeeded(for: Array(missingSurfaceIDs))
@@ -600,6 +610,59 @@ final class PeerRelayWorkspaceWindowController: NSWindowController, NSWindowDele
                 Task { await slot.session.stop() }
             }
         }
+    }
+
+    /// Walk old + new layouts in lockstep. Same topology means: same
+    /// tree shape, same surface IDs at every leaf with identical tab
+    /// metadata, and same split IDs / orientations at every internal
+    /// node. Only `divider_position` is allowed to differ. Anything
+    /// else falls back to the full-rebuild path.
+    private static func isDividerOnlyDelta(
+        from old: Termmesh_Peer_V1_WorkspaceLayout,
+        to new: Termmesh_Peer_V1_WorkspaceLayout
+    ) -> Bool {
+        switch (old.node, new.node) {
+        case (.pane(let pa), .pane(let pb)):
+            return pa.surfaceID == pb.surfaceID
+                && pa.tabs == pb.tabs
+                && pa.title == pb.title
+        case (.split(let sa), .split(let sb)):
+            guard sa.orientation == sb.orientation,
+                  sa.splitID == sb.splitID,
+                  !sa.splitID.isEmpty
+            else { return false }
+            return isDividerOnlyDelta(from: sa.first, to: sb.first)
+                && isDividerOnlyDelta(from: sa.second, to: sb.second)
+        default:
+            return false
+        }
+    }
+
+    /// Walk the layout and call `setPosition` on every NSSplitView
+    /// that has a stable splitID. `applyingLayoutDepth` gates the
+    /// divider-watcher so these programmatic moves don't echo back to
+    /// the host as another `requestSetDivider`.
+    @MainActor
+    private func applyDividerPositions(from layout: Termmesh_Peer_V1_WorkspaceLayout) {
+        applyingLayoutDepth += 1
+        applyDividerPositionsRecursive(layout)
+        DispatchQueue.main.async { [weak self] in
+            self?.applyingLayoutDepth = max(0, (self?.applyingLayoutDepth ?? 1) - 1)
+        }
+    }
+
+    @MainActor
+    private func applyDividerPositionsRecursive(_ layout: Termmesh_Peer_V1_WorkspaceLayout) {
+        guard case .split(let split) = layout.node else { return }
+        if let nsSplit = splitsByID[split.splitID] {
+            let extent: CGFloat = nsSplit.isVertical ? nsSplit.bounds.width : nsSplit.bounds.height
+            if extent > 0 {
+                let position = max(20, min(extent - 20, extent * CGFloat(split.dividerPosition)))
+                nsSplit.setPosition(position, ofDividerAt: 0)
+            }
+        }
+        applyDividerPositionsRecursive(split.first)
+        applyDividerPositionsRecursive(split.second)
     }
 
     private func swapRootView(_ newRoot: NSView, dividers: [(NSSplitView, CGFloat)]) {
