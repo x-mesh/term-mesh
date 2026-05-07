@@ -141,6 +141,12 @@ final class PeerRelayWorkspaceWindowController: NSWindowController, NSWindowDele
     /// view's weak `delegate` reference doesn't drop it.
     private var splitWatcher: WorkspaceSplitWatcher?
     private var startTask: Task<Void, Never>?
+    /// Serialises `applyLayout` calls so a layout-changed push can't
+    /// interleave with an in-flight initial-attach (each can suspend
+    /// on `spawnPaneSlot`, leaving `panesBySurfaceID` mutated by both
+    /// at unpredictable points). Each call awaits the previous one's
+    /// completion before mutating the slot dictionary.
+    private var applyLayoutTask: Task<Void, Error>?
     private var isClosing = false
 
     /// In-window status / error banner. Lives at the top of the content
@@ -556,7 +562,45 @@ final class PeerRelayWorkspaceWindowController: NSWindowController, NSWindowDele
     //   3. Replaces the window content view's child with the new tree.
     //   4. Tears down slots whose surfaces are no longer in the tree.
 
+    /// Serialised entry point. Awaits any in-flight `applyLayout` to
+    /// finish before starting the next one, so concurrent calls
+    /// (initial attach + layout-changed push, two layout-changed
+    /// pushes back-to-back) can't interleave their `panesBySurfaceID`
+    /// mutations across `await spawnPaneSlot` suspensions. Cancellation
+    /// of the previous task is honoured — a stale apply that's still
+    /// in `spawnPaneSlot` when a newer one arrives gets cancelled and
+    /// the new one proceeds without waiting.
+    @MainActor
     private func applyLayout(_ layout: Termmesh_Peer_V1_WorkspaceLayout) async throws {
+        let previous = applyLayoutTask
+        let myTask = Task<Void, Error> { [weak self] in
+            // Wait for whatever was running before us, ignoring its
+            // result (errors there were already handled by their
+            // caller's catch).
+            _ = try? await previous?.value
+            try Task.checkCancellation()
+            try await self?.applyLayoutBody(layout)
+        }
+        applyLayoutTask = myTask
+        do {
+            try await myTask.value
+        } catch {
+            // Surface the original error to our caller; the wrapper
+            // ref is cleared either way (a newer task may already
+            // have replaced it, in which case we leave that alone).
+            if applyLayoutTask == myTask { applyLayoutTask = nil }
+            throw error
+        }
+        if applyLayoutTask == myTask { applyLayoutTask = nil }
+    }
+
+    /// Actual layout-application logic. Annotated `@MainActor` so all
+    /// `panesBySurfaceID` mutations across the various `await` points
+    /// happen on a single actor — `windowWillClose` /
+    /// `tearDownPeerSessions` (also MainActor-bound) won't observe
+    /// torn intermediate state.
+    @MainActor
+    private func applyLayoutBody(_ layout: Termmesh_Peer_V1_WorkspaceLayout) async throws {
         // Fast path: if the only thing that changed since the last
         // applied layout is divider positions, just push positions
         // into the existing NSSplitView tree. Saves a full

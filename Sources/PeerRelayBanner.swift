@@ -51,6 +51,12 @@ final class PeerRelayBanner: NSView {
     /// neighbouring split-tree container takes the full window height,
     /// 28 when shown.
     private var heightConstraint: NSLayoutConstraint!
+    /// When true, `actionTapped` hides the banner before invoking the
+    /// callback. Defaults to true so the common "transient action,
+    /// then dismiss" case is implicit; pass `dismissOnAction: false`
+    /// from `show(...)` for actions that intend to re-show a different
+    /// banner kind themselves (e.g. Retry → "Reconnecting…").
+    private var dismissOnAction: Bool = true
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
@@ -111,11 +117,16 @@ final class PeerRelayBanner: NSView {
 
     /// Show or update the banner. Pass `actionTitle: nil` for no
     /// inline button. `dismissable` keeps the trailing × button.
+    /// `dismissOnAction` controls whether tapping the inline action
+    /// button auto-hides the banner before running the callback;
+    /// keep the default (`true`) unless the action explicitly intends
+    /// to swap the banner to a different state itself.
     func show(
         kind: PeerRelayBannerKind,
         message: String,
         actionTitle: String? = nil,
         dismissable: Bool = true,
+        dismissOnAction: Bool = true,
         action: (() -> Void)? = nil
     ) {
         layer?.backgroundColor = kind.background.cgColor
@@ -132,6 +143,7 @@ final class PeerRelayBanner: NSView {
             actionButton.isHidden = true
             actionHandler = nil
         }
+        self.dismissOnAction = dismissOnAction
         dismissButton.isHidden = !dismissable
         isHidden = false
         heightConstraint.constant = 28
@@ -145,6 +157,13 @@ final class PeerRelayBanner: NSView {
 
     @objc private func actionTapped() {
         let h = actionHandler
+        // Hide before invoking the callback so a callback that
+        // immediately calls `show(...)` can land on a clean state
+        // (and queued repeat-clicks while the action is in flight
+        // can't stack the same banner copy multiple times).
+        if dismissOnAction {
+            hide()
+        }
         h?()
     }
 
