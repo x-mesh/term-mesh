@@ -476,7 +476,7 @@ struct TermMeshApp: App {
             }
 #endif
 
-            CommandMenu("Update Logs") {
+            CommandGroup(after: .help) {
                 Button("Copy Update Logs") {
                     appDelegate.copyUpdateLogs(nil)
                 }
