@@ -90,9 +90,20 @@ final class PeerCoordinator: NSObject {
     private var sshTunnels: [ObjectIdentifier: PeerSSHTunnel] = [:]
 
     /// Snapshot of every active workspace relay for the Connections
-    /// panel. Returned in open-order.
-    func activeWorkspaceRelays() -> [PeerRelayWorkspaceWindowController] {
-        return openWorkspaceRelays
+    /// panel. Returned in open-order. Now exposes a value type rather
+    /// than the controller itself so external observers don't grow a
+    /// dependency on AppKit window-controller internals.
+    func activeWorkspaceConnections() -> [PeerRelayConnectionInfo] {
+        return openWorkspaceRelays.map { $0.connectionInfo }
+    }
+
+    /// Disconnect (close) the relay window matching `id`. No-op when
+    /// the controller has already been released or removed from the
+    /// roster — safer than indexing by row position.
+    func disconnect(id: ObjectIdentifier) {
+        guard let ctrl = openWorkspaceRelays.first(where: { ObjectIdentifier($0) == id })
+        else { return }
+        ctrl.window?.performClose(nil)
     }
 
     fileprivate func postRelaysChanged() {

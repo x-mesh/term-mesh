@@ -35,6 +35,28 @@ private final class WorkspaceSplitWatcher: NSObject, NSSplitViewDelegate {
 }
 
 @MainActor
+/// Read-only snapshot of one peer-relay workspace window's
+/// connection metadata. Surfaced through
+/// `PeerRelayWorkspaceWindowController.connectionInfo` so views like
+/// the Connections panel can render rows without holding a reference
+/// to (and reaching into) the controller itself.
+struct PeerRelayConnectionInfo: Sendable {
+    /// Stable identity for the underlying controller. Use with
+    /// `PeerCoordinator.disconnect(id:)` to act on this connection
+    /// safely even after the roster has been re-rendered.
+    let id: ObjectIdentifier
+    let hostSockPath: String
+    /// SSH target if the relay was opened over an `ssh -L` tunnel,
+    /// otherwise nil (direct Unix-socket connection).
+    let sshTarget: String?
+    let workspaceTitle: String
+    let connectedAt: Date
+
+    /// Best display string for the host: SSH target if available,
+    /// otherwise the local socket path.
+    var hostDisplay: String { sshTarget ?? hostSockPath }
+}
+
 /// Small NSButton subclass used by the relay window's per-pane tab
 /// strip. Carries the host paneID + tab's surfaceID so a click can
 /// dispatch ActivateTab without hunting for context.
@@ -84,20 +106,34 @@ final class PeerRelayWorkspaceWindowController: NSWindowController, NSWindowDele
         }
     }
 
-    let hostSockPath: String
+    private let hostSockPath: String
     /// Held strongly while the controller is alive so the tunnel
     /// auto-restart loop keeps running. nil for non-SSH (direct
     /// unix-socket) sessions.
     private var sshTunnel: PeerSSHTunnel?
-    var sshTarget: String? { sshTunnel?.sshTarget }
-    /// Wall-clock time the relay window first opened. Used by the
-    /// Connections panel to show "Attached <duration>".
-    let connectedAt: Date = Date()
+    /// Wall-clock time the relay window first opened. Captured at
+    /// init so the connections panel can compute "Attached Ns ago".
+    private let connectedAt: Date = Date()
     /// Workspace title shown to the host. Mirrors `baseTitle` minus
-    /// the "Peer Workspace · " prefix so it can be displayed in lists
+    /// the "Peer Workspace · " prefix so display lists can show it
     /// without redundancy.
-    let workspaceTitle: String
+    private let workspaceTitle: String
     private var workspaceID: Data
+
+    /// Snapshot of the controller's connection-level metadata for
+    /// external observers (the Connections panel, future CLI/headless
+    /// listings). Returns the values actually shown in the UI rather
+    /// than the underlying `let` storage so callers don't grow a
+    /// dependency on the controller's internals.
+    var connectionInfo: PeerRelayConnectionInfo {
+        PeerRelayConnectionInfo(
+            id: ObjectIdentifier(self),
+            hostSockPath: hostSockPath,
+            sshTarget: sshTunnel?.sshTarget,
+            workspaceTitle: workspaceTitle,
+            connectedAt: connectedAt
+        )
+    }
     private let baseTitle: String
     private var currentLayout: Termmesh_Peer_V1_WorkspaceLayout
     private var panesBySurfaceID: [Data: PaneSlot] = [:]

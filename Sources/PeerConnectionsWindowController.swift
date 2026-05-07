@@ -8,17 +8,19 @@
 
 import AppKit
 
-/// NSButton with a weak reference to the relay controller it
-/// disconnects. Decouples click resolution from the table view's row
-/// index, so a roster change between render and click can't make the
-/// button act on the wrong controller.
+/// NSButton carrying the stable `ObjectIdentifier` of the relay
+/// controller it disconnects. The handler resolves the id back to a
+/// live controller through `PeerCoordinator.disconnect(id:)`, so a
+/// roster change between render and click can't make the button act
+/// on the wrong controller — and the panel doesn't need to hold a
+/// reference to the controller at all.
 @MainActor
 final class DisconnectButton: NSButton {
-    weak var targetController: PeerRelayWorkspaceWindowController?
+    var targetID: ObjectIdentifier?
 
-    convenience init(target: PeerRelayWorkspaceWindowController) {
+    convenience init(targetID: ObjectIdentifier) {
         self.init(title: "Disconnect", target: nil, action: nil)
-        self.targetController = target
+        self.targetID = targetID
         self.controlSize = .small
         self.bezelStyle = .rounded
         self.font = .systemFont(ofSize: 11)
@@ -29,7 +31,7 @@ final class DisconnectButton: NSButton {
 final class PeerConnectionsWindowController: NSWindowController, NSWindowDelegate {
     static let shared = PeerConnectionsWindowController()
 
-    private var rows: [PeerRelayWorkspaceWindowController] = []
+    private var rows: [PeerRelayConnectionInfo] = []
     private var tableView: NSTableView!
     private var refreshTimer: Timer?
     private var observerToken: NSObjectProtocol?
@@ -132,7 +134,7 @@ final class PeerConnectionsWindowController: NSWindowController, NSWindowDelegat
     // MARK: - Data
 
     private func reload() {
-        rows = PeerCoordinator.shared.activeWorkspaceRelays()
+        rows = PeerCoordinator.shared.activeWorkspaceConnections()
         tableView?.reloadData()
     }
 }
@@ -146,16 +148,16 @@ extension PeerConnectionsWindowController: NSTableViewDelegate {
                    viewFor tableColumn: NSTableColumn?,
                    row: Int) -> NSView? {
         guard let column = tableColumn, row < rows.count else { return nil }
-        let ctrl = rows[row]
+        let info = rows[row]
         switch column.identifier.rawValue {
         case "host":
-            return makeLabel(ctrl.sshTarget ?? ctrl.hostSockPath)
+            return makeLabel(info.hostDisplay)
         case "workspace":
-            return makeLabel(ctrl.workspaceTitle)
+            return makeLabel(info.workspaceTitle)
         case "attached":
-            return makeLabel(formatRelative(ctrl.connectedAt))
+            return makeLabel(formatRelative(info.connectedAt))
         case "action":
-            return makeDisconnectButton(for: ctrl)
+            return makeDisconnectButton(for: info)
         default:
             return nil
         }
@@ -169,22 +171,19 @@ extension PeerConnectionsWindowController: NSTableViewDelegate {
         return f
     }
 
-    private func makeDisconnectButton(for ctrl: PeerRelayWorkspaceWindowController) -> NSView {
-        // Subclassed NSButton holds a weak reference to the actual
-        // controller. Identifying by row index (sender.tag) was racy:
-        // a roster change between render and click could shift the
-        // index so the click force-closed a *different* controller.
-        let btn = DisconnectButton(target: ctrl)
+    private func makeDisconnectButton(for info: PeerRelayConnectionInfo) -> NSView {
+        let btn = DisconnectButton(targetID: info.id)
         btn.target = self
         btn.action = #selector(disconnectClicked(_:))
         return btn
     }
 
     @objc private func disconnectClicked(_ sender: DisconnectButton) {
-        // weak ref means a closed-since-render controller produces a
-        // safe no-op rather than an out-of-bounds rows[] crash or a
-        // close on the wrong window.
-        sender.targetController?.window?.performClose(nil)
+        // Resolve the stable id through the coordinator. A
+        // closed-since-render controller produces a safe no-op
+        // rather than mis-acting on the row at the same position.
+        guard let id = sender.targetID else { return }
+        PeerCoordinator.shared.disconnect(id: id)
         // The roster-changed notification will re-fire reload.
     }
 
