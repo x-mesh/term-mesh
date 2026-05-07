@@ -107,11 +107,21 @@ fn harden_socket_permissions(path: &Path) {
 #[cfg(not(unix))]
 fn harden_socket_permissions(_path: &Path) {}
 
-/// Ensure the socket's parent directory exists, is owned by the
-/// current uid, and is mode 0700. If it already exists with looser
-/// permissions, tighten it (covers the case where an attacker
-/// pre-created `/tmp/term-mesh-peer-<uid>/` under their own uid). If
-/// it exists but isn't owned by us, refuse to proceed at all.
+/// Ensure the socket's parent directory exists and is safe to bind
+/// inside. There are three accepted cases:
+/// 1. Parent doesn't exist → create + 0700 (our own).
+/// 2. Parent exists and is owned by us → tighten to 0700, idempotent.
+/// 3. Parent exists, isn't owned by us, but has the sticky bit set
+///    (e.g. `/tmp` itself, mode 01777) → trust the kernel's
+///    sticky-bit semantics; the socket file's 0600 mode is what
+///    actually gates other users.
+/// Anything else (a pre-existing dir at our expected path that we
+/// don't own and isn't sticky-bit-protected) is treated as a hostile
+/// drop-in and refused.
+///
+/// `metadata()` follows symlinks, which is what we want — system
+/// `/tmp` is itself a symlink to `/private/tmp` on macOS and we
+/// can't refuse that.
 #[cfg(unix)]
 fn harden_parent_directory(parent: &Path) -> anyhow::Result<()> {
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
@@ -120,19 +130,31 @@ fn harden_parent_directory(parent: &Path) -> anyhow::Result<()> {
         std::fs::create_dir_all(parent)?;
     }
     let meta = std::fs::metadata(parent)?;
+    if !meta.is_dir() {
+        anyhow::bail!(
+            "peer-federation socket parent {} is not a directory",
+            parent.display()
+        );
+    }
     let owner_uid = current_uid();
-    if meta.uid() != owner_uid {
+    let mode = meta.mode();
+    let is_ours = meta.uid() == owner_uid;
+    let is_sticky_world = mode & 0o1000 != 0; // S_ISVTX
+    if is_ours {
+        if mode & 0o777 != 0o700 {
+            let mut perms = meta.permissions();
+            perms.set_mode(0o700);
+            std::fs::set_permissions(parent, perms)?;
+        }
+    } else if is_sticky_world {
+        // System tmp dir; trust the kernel.
+    } else {
         anyhow::bail!(
             "peer-federation socket parent directory {} is not owned by uid {} (got uid {}); refusing to bind",
             parent.display(),
             owner_uid,
             meta.uid()
         );
-    }
-    let mut perms = meta.permissions();
-    if perms.mode() & 0o777 != 0o700 {
-        perms.set_mode(0o700);
-        std::fs::set_permissions(parent, perms)?;
     }
     Ok(())
 }

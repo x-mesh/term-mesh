@@ -409,35 +409,51 @@ public actor PeerServer {
         } else if !isDirectory.boolValue {
             throw PeerServerError.bindFailed(errno: ENOTDIR, message: "socket parent is not a directory")
         }
-        // Whether we just created the directory or it already existed
-        // (possibly pre-created by a hostile uid before we launched —
-        // /tmp is world-writable with the sticky bit), enforce both
-        // ownership and 0700 mode every time. An attacker-owned
-        // directory at the expected path is refused outright.
+        // Resolve the directory we'll actually be binding under, then
+        // decide what level of hardening to apply. Use `stat()` (which
+        // follows symlinks) instead of `lstat` because system paths
+        // like macOS's `/tmp` are themselves symlinks (`/tmp` →
+        // `/private/tmp`) — `lstat` would incorrectly flag those as
+        // "not a directory."
         var st = stat()
-        guard lstat(parent.path, &st) == 0 else {
+        guard stat(parent.path, &st) == 0 else {
             throw PeerServerError.bindFailed(
                 errno: errno,
-                message: "lstat failed on socket parent \(parent.path)"
+                message: "stat failed on socket parent \(parent.path)"
             )
         }
         guard (st.st_mode & S_IFMT) == S_IFDIR else {
             throw PeerServerError.bindFailed(
                 errno: ENOTDIR,
-                message: "socket parent \(parent.path) is not a directory (lstat)"
+                message: "socket parent \(parent.path) is not a directory"
             )
         }
-        if st.st_uid != getuid() {
+        let myUid = getuid()
+        let isOurOwn = st.st_uid == myUid
+        // Sticky-bit world-writable directories (e.g. /tmp itself,
+        // mode 01777) get their security from the kernel's sticky-bit
+        // semantics — only the file's owner or root can unlink/rename
+        // entries — so we don't need to own the directory ourselves
+        // when binding inside one. The socket file's own 0600 mode is
+        // what gates other users.
+        let isStickyTmp = (st.st_mode & UInt16(S_ISVTX)) != 0
+        if isOurOwn {
+            // Tighten mode unconditionally — a directory we just
+            // created with umask 0077 lands at 0700 already, but a
+            // pre-existing one we own may be looser. Idempotent.
+            if (st.st_mode & 0o777) != 0o700 {
+                chmod(parent.path, 0o700)
+            }
+        } else if isStickyTmp {
+            // System tmp dir (sticky-bit). Trust the kernel; bind on.
+        } else {
+            // Pre-existing directory at our expected path that's
+            // neither ours nor a sticky-bit world dir — most likely
+            // an attacker-controlled drop-in.
             throw PeerServerError.bindFailed(
                 errno: EPERM,
-                message: "socket parent \(parent.path) not owned by uid \(getuid()) (got \(st.st_uid)); refusing to use it"
+                message: "socket parent \(parent.path) not owned by uid \(myUid) (got \(st.st_uid)); refusing to use it"
             )
-        }
-        // Tighten mode unconditionally — a directory we created with
-        // umask 0022 (or similar) lands at 0755, and a pre-existing
-        // one might be 0777. Forcing 0700 here is idempotent.
-        if (st.st_mode & 0o777) != 0o700 {
-            chmod(parent.path, 0o700)
         }
     }
 
