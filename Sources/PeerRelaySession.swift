@@ -447,11 +447,28 @@ final class PeerRelaySession {
 
     private nonisolated static func verifyRelaySecret(_ relay: RelaySocket, expected: String) throws {
         let frame = try relay.readFrame()
+        let expectedBytes = Array(expected.utf8)
+        let receivedBytes = Array(frame.payload)
         guard frame.type == kTypeAuth,
-              String(data: frame.payload, encoding: .utf8) == expected
+              constantTimeEquals(receivedBytes, expectedBytes)
         else {
             throw RelayError.ioError("relay auth failed")
         }
+    }
+
+    /// Length-aware, constant-time byte comparison. Iterates the
+    /// longer of the two inputs so total work is independent of where
+    /// the first divergence sits, defeating the wall-clock side
+    /// channel that ordinary `==` exposes.
+    private nonisolated static func constantTimeEquals(_ a: [UInt8], _ b: [UInt8]) -> Bool {
+        let n = max(a.count, b.count)
+        var diff: UInt8 = a.count == b.count ? 0 : 1
+        for i in 0..<n {
+            let x = i < a.count ? a[i] : 0
+            let y = i < b.count ? b[i] : 0
+            diff |= x ^ y
+        }
+        return diff == 0
     }
 
     private nonisolated static func clientHasSameUser(fd: Int32) -> Bool {

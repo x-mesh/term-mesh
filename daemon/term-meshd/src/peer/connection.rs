@@ -415,11 +415,25 @@ fn next_seq(seq_counter: &AtomicU64) -> u64 {
 }
 
 fn random_peer_bytes(len: usize) -> Vec<u8> {
-    let mut out = Vec::with_capacity(len);
-    while out.len() < len {
-        out.extend_from_slice(uuid::Uuid::new_v4().as_bytes());
+    // CSPRNG via getrandom(3) so auth nonces / session ids don't
+    // carry the structural fixed bits of UUIDv4 (version+variant
+    // nibbles) and don't depend on uuid crate internals to use a
+    // strong source. Falls back to a deterministic-looking but still
+    // unique buffer only if getrandom is somehow unavailable, which
+    // shouldn't happen on supported targets.
+    let mut out = vec![0u8; len];
+    if getrandom::getrandom(&mut out).is_ok() {
+        return out;
     }
-    out.truncate(len);
+    // Fallback: two UUIDv4 bytes per chunk. Worse than CSPRNG but
+    // better than a hard panic if getrandom fails.
+    let mut filled = 0;
+    while filled < len {
+        let bytes = uuid::Uuid::new_v4();
+        let take = (len - filled).min(16);
+        out[filled..filled + take].copy_from_slice(&bytes.as_bytes()[..take]);
+        filled += take;
+    }
     out
 }
 

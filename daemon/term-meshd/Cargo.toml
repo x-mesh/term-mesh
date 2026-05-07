@@ -45,6 +45,8 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 # UUID for worktree naming + stable surface-id derivation (v5)
 uuid = { version = "1", features = ["v4", "v5"] }
+# CSPRNG-backed random for peer-federation auth nonces / session ids.
+getrandom = "0.2"
 
 # Peer federation protocol bindings
 peer-proto = { path = "../peer-proto" }

@@ -1682,6 +1682,7 @@ dependencies = [
  "anyhow",
  "axum",
  "dirs",
+ "getrandom 0.2.17",
  "git2",
  "libc",
  "libz-sys",

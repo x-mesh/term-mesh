@@ -13,6 +13,7 @@
 
 #if canImport(Darwin)
 import Darwin
+import Security
 #endif
 import Foundation
 import Dispatch
@@ -939,6 +940,23 @@ private func majorPart(of semver: String) -> Substring {
 }
 
 private func randomPeerBytes(count: Int) -> Data {
+    #if canImport(Darwin)
+    // SecRandomCopyBytes is the documented CSPRNG entry point on
+    // Darwin. Avoids the structural fixed bits of UUIDv4 (version /
+    // variant nibbles) that the previous implementation embedded in
+    // every 16-byte chunk of the nonce.
+    var bytes = [UInt8](repeating: 0, count: count)
+    let rc = bytes.withUnsafeMutableBufferPointer { buf -> Int32 in
+        guard let base = buf.baseAddress else { return errSecParam }
+        return SecRandomCopyBytes(kSecRandomDefault, count, base)
+    }
+    if rc == errSecSuccess {
+        return Data(bytes)
+    }
+    #endif
+    // Fallback: the original UUID-concat path. Worse than the
+    // CSPRNG but better than panicking if SecRandom ever returns an
+    // error (which shouldn't happen in practice).
     var data = Data()
     data.reserveCapacity(count)
     while data.count < count {
