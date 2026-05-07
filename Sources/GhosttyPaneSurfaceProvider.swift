@@ -621,18 +621,39 @@ private func sendPeerInputBytes(_ surface: ghostty_surface_t, bytes: Data) {
             continue
         }
 
-        // Printable / UTF-8 path: group continuation bytes for one scalar.
-        let scalarEnd = min(i + peerUtf8Len(byte), arr.count)
-        let chunkBytes = Array(arr[i..<scalarEnd])
-        if let str = String(bytes: chunkBytes, encoding: .utf8) {
-            for scalar in str.unicodeScalars {
-                sendPeerKeyEvent(surface, keycode: 0, text: String(scalar))
+        // Printable / UTF-8 path. Batch runs of consecutive printable
+        // bytes (no escape, no mapped single byte, no Ctrl+letter)
+        // into one ghostty_surface_key call rather than firing one
+        // event per scalar. Pasting a 10KB chunk of plain text used
+        // to walk the renderer state machine ~10000 times; with the
+        // batch path it's ~one call per `tokTypeKeyInput` frame
+        // sent by the relay.
+        let runStart = i
+        while i < arr.count {
+            let bb = arr[i]
+            if bb == 0x1b { break }
+            if peerSingleByteKeyMapping(bb) != nil { break }
+            if peerCtrlLetterKeycode(bb) != nil { break }
+            i += 1
+        }
+        if i > runStart {
+            let chunkBytes = Array(arr[runStart..<i])
+            if let str = String(bytes: chunkBytes, encoding: .utf8), !str.isEmpty {
+                sendPeerKeyEvent(surface, keycode: 0, text: str)
+            } else {
+                // UTF-8 decode failed mid-paste (rare for typed input
+                // but possible if a continuation byte was split
+                // across two protocol frames). Fall back to per-scalar
+                // best-effort recovery so partial bytes don't get
+                // silently dropped.
+                for j in runStart..<i {
+                    sendPeerKeyEvent(surface, keycode: 0, text: String(UnicodeScalar(arr[j])))
+                }
             }
-            i = scalarEnd
         } else {
-            // Lone byte fallback when UTF-8 decoding fails (rare for
-            // typed input).
-            sendPeerKeyEvent(surface, keycode: 0, text: String(UnicodeScalar(byte)))
+            // Defensive: shouldn't happen because at least one of the
+            // earlier branches would have matched. Avoid an infinite
+            // loop on a degenerate byte by advancing one position.
             i += 1
         }
     }
