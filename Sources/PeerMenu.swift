@@ -115,6 +115,13 @@ final class PeerClientCoordinator: NSObject {
     }
 
     @objc func promptAndRunRelayWorkspaceSSH(_ sender: Any?) {
+        Task { @MainActor in
+            await self.promptAndRunRelayWorkspaceSSHAsync()
+        }
+    }
+
+    @MainActor
+    private func promptAndRunRelayWorkspaceSSHAsync() async {
         let alert = NSAlert()
         alert.messageText = "Connect to Remote Peer Workspace via SSH"
         alert.informativeText = "Tunnels the host's peer socket through `ssh -L`. Pick a host advertised on this LAN, or type an SSH target (user@host or ssh-config alias) and the path of the remote peer server's Unix socket."
@@ -223,33 +230,30 @@ final class PeerClientCoordinator: NSObject {
 
         defer { browser.stop(); _ = proxy; _ = recentProxy } // tear down after modal dismissal
 
-        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        let resp = await Self.runModalAsSheet(alert)
+        guard resp == .alertFirstButtonReturn else { return }
         let target = targetField.stringValue.trimmingCharacters(in: .whitespaces)
         let remote = remoteField.stringValue.trimmingCharacters(in: .whitespaces)
         guard !target.isEmpty, !remote.isEmpty else { return }
 
-        Task {
-            let tunnel = PeerSSHTunnel(sshTarget: target, remoteSockPath: remote)
-            do {
-                try await tunnel.start()
-            } catch {
-                await MainActor.run {
-                    self.showAlert(title: "SSH Tunnel Failed",
-                                   body: String(describing: error))
-                }
-                return
-            }
-            // Tunnel is up — remember the host so the next connect
-            // dialog has it ready in the recent picker.
-            PeerFederationSettings.rememberRecentHost(
-                .init(sshTarget: target, remoteSocket: remote)
-            )
-            await self.openWorkspaceRelay(
-                hostSockPath: tunnel.localSockPath,
-                titleSuffix: " · \(target)",
-                tunnel: tunnel
-            )
+        let tunnel = PeerSSHTunnel(sshTarget: target, remoteSockPath: remote)
+        do {
+            try await tunnel.start()
+        } catch {
+            self.showAlert(title: "SSH Tunnel Failed",
+                           body: String(describing: error))
+            return
         }
+        // Tunnel is up — remember the host so the next connect
+        // dialog has it ready in the recent picker.
+        PeerFederationSettings.rememberRecentHost(
+            .init(sshTarget: target, remoteSocket: remote)
+        )
+        await self.openWorkspaceRelay(
+            hostSockPath: tunnel.localSockPath,
+            titleSuffix: " · \(target)",
+            tunnel: tunnel
+        )
     }
 
     /// Shared workflow: enumerate workspaces over a `PeerRelayConnection`
@@ -298,9 +302,7 @@ final class PeerClientCoordinator: NSObject {
         if workspaces.count == 1 {
             chosen = workspaces[0]
         } else {
-            chosen = await MainActor.run {
-                self.promptForWorkspaceSelection(from: workspaces)
-            }
+            chosen = await self.promptForWorkspaceSelection(from: workspaces)
         }
         guard let chosen else {
             tunnel?.stop()
@@ -345,10 +347,19 @@ final class PeerClientCoordinator: NSObject {
         alert.addButton(withTitle: "Connect")
         alert.addButton(withTitle: "Cancel")
 
-        guard alert.runModal() == .alertFirstButtonReturn else { return }
-        let path = input.stringValue.trimmingCharacters(in: .whitespaces)
-        guard !path.isEmpty else { return }
+        Task { @MainActor in
+            let resp = await Self.runModalAsSheet(alert)
+            guard resp == .alertFirstButtonReturn else { return }
+            let path = input.stringValue.trimmingCharacters(in: .whitespaces)
+            guard !path.isEmpty else { return }
+            await self.runWorkspaceFlow(path: path)
+        }
+    }
 
+    /// Body of the workspace-relay flow, extracted from
+    /// promptAndRunRelayWorkspace so the sheet-based completion can
+    /// call it cleanly.
+    private func runWorkspaceFlow(path: String) async {
         Task {
             // Open a probe connection to enumerate workspaces, then
             // discard it — each pane in the chosen workspace will
@@ -388,9 +399,7 @@ final class PeerClientCoordinator: NSObject {
             if workspaces.count == 1 {
                 chosen = workspaces[0]
             } else {
-                chosen = await MainActor.run {
-                    self.promptForWorkspaceSelection(from: workspaces)
-                }
+                chosen = await self.promptForWorkspaceSelection(from: workspaces)
             }
             guard let chosen else { return }
 
@@ -413,7 +422,7 @@ final class PeerClientCoordinator: NSObject {
 
     private func promptForWorkspaceSelection(
         from workspaces: [Termmesh_Peer_V1_Workspace]
-    ) -> Termmesh_Peer_V1_Workspace? {
+    ) async -> Termmesh_Peer_V1_Workspace? {
         let alert = NSAlert()
         alert.messageText = "Choose a workspace"
         alert.informativeText = "Host has \(workspaces.count) workspaces. The chosen one will open in a single window with its host split layout."
@@ -434,7 +443,8 @@ final class PeerClientCoordinator: NSObject {
         alert.addButton(withTitle: "Open")
         alert.addButton(withTitle: "Cancel")
 
-        guard alert.runModal() == .alertFirstButtonReturn else { return nil }
+        let resp = await Self.runModalAsSheet(alert)
+        guard resp == .alertFirstButtonReturn else { return nil }
         let idx = popup.indexOfSelectedItem
         guard idx >= 0, idx < workspaces.count else { return nil }
         return workspaces[idx]
@@ -460,10 +470,21 @@ final class PeerClientCoordinator: NSObject {
         alert.addButton(withTitle: "Connect")
         alert.addButton(withTitle: "Cancel")
 
-        guard alert.runModal() == .alertFirstButtonReturn else { return }
-        let path = input.stringValue.trimmingCharacters(in: .whitespaces)
-        guard !path.isEmpty else { return }
+        Task { @MainActor in
+            let resp = await Self.runModalAsSheet(alert)
+            guard resp == .alertFirstButtonReturn else { return }
+            let path = input.stringValue.trimmingCharacters(in: .whitespaces)
+            guard !path.isEmpty else { return }
+            await self.runRelayFlow(path: path)
+        }
+    }
 
+    /// Body of the legacy single-pane relay flow, extracted so the
+    /// promptAndRunRelay sheet completion can call it cleanly.
+    /// The body remains its own detached Task so the sheet
+    /// completion isn't blocked while we connect, list surfaces,
+    /// and pop a follow-up picker.
+    private func runRelayFlow(path: String) async {
         Task {
             let connection: PeerRelayConnection
             do {
@@ -492,9 +513,7 @@ final class PeerClientCoordinator: NSObject {
             if pickFrom.count == 1 {
                 chosen = pickFrom[0]
             } else {
-                chosen = await MainActor.run {
-                    self.promptForSurfaceSelection(from: pickFrom)
-                }
+                chosen = await self.promptForSurfaceSelection(from: pickFrom)
             }
             guard let chosen else {
                 await connection.cancel()
@@ -526,7 +545,7 @@ final class PeerClientCoordinator: NSObject {
     /// surfaces. Returns the user's pick, or nil if Cancel was clicked.
     private func promptForSurfaceSelection(
         from surfaces: [Termmesh_Peer_V1_SurfaceInfo]
-    ) -> Termmesh_Peer_V1_SurfaceInfo? {
+    ) async -> Termmesh_Peer_V1_SurfaceInfo? {
         let alert = NSAlert()
         alert.messageText = "Choose a remote surface"
         alert.informativeText = "Host exposes \(surfaces.count) surfaces. Pick which one this relay window should mirror."
@@ -554,7 +573,8 @@ final class PeerClientCoordinator: NSObject {
         alert.addButton(withTitle: "Open")
         alert.addButton(withTitle: "Cancel")
 
-        guard alert.runModal() == .alertFirstButtonReturn else { return nil }
+        let resp = await Self.runModalAsSheet(alert)
+        guard resp == .alertFirstButtonReturn else { return nil }
         let idx = popup.indexOfSelectedItem
         guard idx >= 0, idx < surfaces.count else { return nil }
         return surfaces[idx]
@@ -572,11 +592,13 @@ final class PeerClientCoordinator: NSObject {
         alert.addButton(withTitle: "Connect")
         alert.addButton(withTitle: "Cancel")
 
-        guard alert.runModal() == .alertFirstButtonReturn else { return }
-        let path = input.stringValue.trimmingCharacters(in: .whitespaces)
-        guard !path.isEmpty else { return }
-
-        Task { await self.run(socketPath: path) }
+        Task { @MainActor in
+            let resp = await Self.runModalAsSheet(alert)
+            guard resp == .alertFirstButtonReturn else { return }
+            let path = input.stringValue.trimmingCharacters(in: .whitespaces)
+            guard !path.isEmpty else { return }
+            await self.run(socketPath: path)
+        }
     }
 
     private func run(socketPath: String) async {
@@ -625,7 +647,49 @@ final class PeerClientCoordinator: NSObject {
         alert.informativeText = body
         alert.alertStyle = .informational
         alert.addButton(withTitle: "OK")
-        _ = alert.runModal()
+        Self.presentAsSheetIfPossible(alert) { _ in }
+    }
+
+    /// Present `alert` as a window-attached sheet when possible so the
+    /// main run loop isn't blocked on `mach_msg2_trap` for the
+    /// duration the dialog is up — this is what `App Hanging` tickets
+    /// trace back to. Falls back to the original modal flow only when
+    /// no host window is reachable (status-bar-only invocation with
+    /// no visible app window).
+    @MainActor
+    static func presentAsSheetIfPossible(
+        _ alert: NSAlert,
+        completion: @escaping @MainActor (NSApplication.ModalResponse) -> Void
+    ) {
+        NSApp.activate(ignoringOtherApps: true)
+        let host: NSWindow? = NSApp.mainWindow
+            ?? NSApp.keyWindow
+            ?? NSApp.windows.first(where: { $0.isVisible && !($0 is NSPanel) })
+        guard let host else {
+            // No host window — runModal is the only option but at
+            // least this branch only fires when the app is fully
+            // hidden (rare from a menu-driven flow).
+            completion(alert.runModal())
+            return
+        }
+        alert.beginSheetModal(for: host) { response in
+            // beginSheetModal's completion runs on the main thread but
+            // isn't @MainActor-annotated by the SDK; hop explicitly.
+            Task { @MainActor in completion(response) }
+        }
+    }
+
+    /// Async wrapper for `presentAsSheetIfPossible` — lets dialog
+    /// flows keep their straight-line shape (`let resp = await
+    /// runModalAsSheet(alert)`) instead of pyramiding completion
+    /// blocks.
+    @MainActor
+    static func runModalAsSheet(_ alert: NSAlert) async -> NSApplication.ModalResponse {
+        await withCheckedContinuation { cont in
+            presentAsSheetIfPossible(alert) { resp in
+                cont.resume(returning: resp)
+            }
+        }
     }
 
     private func defaultSocketPath() -> String {
