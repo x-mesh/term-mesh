@@ -8,11 +8,13 @@ import Network
 /// No UI yet — exposes an ObservableObject so Phase 2 can bind to it.
 
 enum BrewSelfUpdateState: Equatable {
-    case unsupported          // brew binary not found, or term-mesh not installed via cask
+    case unsupported                                    // brew binary not found, or term-mesh not installed via cask
     case idle
     case checking
     case upToDate
     case outdated(installed: String, latest: String)
+    case downloading(installed: String, latest: String, message: String)
+    case readyToInstall(installed: String, latest: String)
     case error(message: String)
 }
 
@@ -34,16 +36,34 @@ final class BrewSelfUpdateViewModel: ObservableObject {
     @Published private(set) var brewBinaryPath: String?
     @Published private(set) var caskToken: String = "term-mesh"
 
+    /// True for any state that reflects "an update has been detected" (outdated, downloading, ready).
+    var hasPendingUpdate: Bool {
+        switch state {
+        case .outdated, .downloading, .readyToInstall: return true
+        default: return false
+        }
+    }
+
     var isOutdated: Bool {
         if case .outdated = state { return true }
         return false
     }
 
+    var isReadyToInstall: Bool {
+        if case .readyToInstall = state { return true }
+        return false
+    }
+
     var outdatedInfo: BrewOutdatedInfo? {
-        if case let .outdated(installed, latest) = state {
+        switch state {
+        case let .outdated(installed, latest),
+             let .readyToInstall(installed, latest):
             return BrewOutdatedInfo(installed: installed, latest: latest)
+        case let .downloading(installed, latest, _):
+            return BrewOutdatedInfo(installed: installed, latest: latest)
+        default:
+            return nil
         }
-        return nil
     }
 
     fileprivate func update(state: BrewSelfUpdateState) { self.state = state }
