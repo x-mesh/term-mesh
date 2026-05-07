@@ -8,6 +8,23 @@
 
 import AppKit
 
+/// NSButton with a weak reference to the relay controller it
+/// disconnects. Decouples click resolution from the table view's row
+/// index, so a roster change between render and click can't make the
+/// button act on the wrong controller.
+@MainActor
+final class DisconnectButton: NSButton {
+    weak var targetController: PeerRelayWorkspaceWindowController?
+
+    convenience init(target: PeerRelayWorkspaceWindowController) {
+        self.init(title: "Disconnect", target: nil, action: nil)
+        self.targetController = target
+        self.controlSize = .small
+        self.bezelStyle = .rounded
+        self.font = .systemFont(ofSize: 11)
+    }
+}
+
 @MainActor
 final class PeerConnectionsWindowController: NSWindowController, NSWindowDelegate {
     static let shared = PeerConnectionsWindowController()
@@ -153,20 +170,21 @@ extension PeerConnectionsWindowController: NSTableViewDelegate {
     }
 
     private func makeDisconnectButton(for ctrl: PeerRelayWorkspaceWindowController) -> NSView {
-        let btn = NSButton(title: "Disconnect", target: self, action: #selector(disconnectClicked(_:)))
-        btn.controlSize = .small
-        btn.bezelStyle = .rounded
-        btn.font = .systemFont(ofSize: 11)
-        // ObjectIdentifier doesn't survive into selectors; tag the
-        // button with the row index instead.
-        btn.tag = rows.firstIndex(where: { $0 === ctrl }) ?? -1
+        // Subclassed NSButton holds a weak reference to the actual
+        // controller. Identifying by row index (sender.tag) was racy:
+        // a roster change between render and click could shift the
+        // index so the click force-closed a *different* controller.
+        let btn = DisconnectButton(target: ctrl)
+        btn.target = self
+        btn.action = #selector(disconnectClicked(_:))
         return btn
     }
 
-    @objc private func disconnectClicked(_ sender: NSButton) {
-        let idx = sender.tag
-        guard idx >= 0, idx < rows.count else { return }
-        rows[idx].window?.performClose(nil)
+    @objc private func disconnectClicked(_ sender: DisconnectButton) {
+        // weak ref means a closed-since-render controller produces a
+        // safe no-op rather than an out-of-bounds rows[] crash or a
+        // close on the wrong window.
+        sender.targetController?.window?.performClose(nil)
         // The roster-changed notification will re-fire reload.
     }
 
