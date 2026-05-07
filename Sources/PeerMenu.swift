@@ -334,7 +334,8 @@ final class PeerCoordinator: NSObject {
         alert.informativeText = "Path to a Swift peer server socket. Picks one of the host's workspaces and mirrors its split layout in a single window."
 
         let input = NSTextField(frame: NSRect(x: 0, y: 0, width: 360, height: 24))
-        input.stringValue = ProcessInfo.processInfo.environment["TERMMESH_DEBUG_PEER_SERVER_PATH"] ?? "/tmp/termmesh-app-peer.sock"
+        input.stringValue = ProcessInfo.processInfo.environment["TERMMESH_DEBUG_PEER_SERVER_PATH"]
+            ?? PeerFederationSettings.defaultSocketPath
         alert.accessoryView = input
         alert.addButton(withTitle: "Connect")
         alert.addButton(withTitle: "Cancel")
@@ -448,7 +449,8 @@ final class PeerCoordinator: NSObject {
         alert.informativeText = "Path to a Swift peer server socket (e.g. TERMMESH_DEBUG_PEER_SERVER_PATH).\nOpens remote pane in a real Ghostty surface."
 
         let input = NSTextField(frame: NSRect(x: 0, y: 0, width: 360, height: 24))
-        input.stringValue = ProcessInfo.processInfo.environment["TERMMESH_DEBUG_PEER_SERVER_PATH"] ?? "/tmp/termmesh-app-peer.sock"
+        input.stringValue = ProcessInfo.processInfo.environment["TERMMESH_DEBUG_PEER_SERVER_PATH"]
+            ?? PeerFederationSettings.defaultSocketPath
         alert.accessoryView = input
         alert.addButton(withTitle: "Connect")
         alert.addButton(withTitle: "Cancel")
