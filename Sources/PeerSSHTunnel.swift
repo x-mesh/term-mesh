@@ -212,7 +212,16 @@ final class PeerSSHTunnel: @unchecked Sendable {
     /// Backoff loop: 1s, 2s, 4s, 8s, 16s, 30s, 30s … capped. Stops
     /// when `wantsRunning` flips false (caller stopped explicitly) or
     /// when a respawn succeeds.
-    private func scheduleReconnect() {
+    ///
+    /// Emits `.down` exactly once when the loop arms, then only
+    /// `.reconnecting(attempt:)` per iteration. The previous version
+    /// re-emitted `.down` on every retry, which made the controller
+    /// re-run `tearDownPeerSessions` for an already-torn-down state
+    /// and raced with any work that had started in response to a
+    /// transient `.up`. Initial reason carries through to the listener
+    /// for richer diagnostics; per-attempt errors are folded into the
+    /// `.reconnecting` count rather than re-flapped through `.down`.
+    private func scheduleReconnect(reason initialReason: String = "ssh exited") {
         lock.lock()
         if !wantsRunning || restartTask != nil {
             lock.unlock()
@@ -220,9 +229,11 @@ final class PeerSSHTunnel: @unchecked Sendable {
         }
         let task = Task { [weak self] in
             guard let self else { return }
+            // One-shot down emission so the controller tears down its
+            // per-pane sessions exactly once before we start retrying.
+            self.emit(.down(reason: initialReason))
             var attempt = 1
             while !Task.isCancelled {
-                self.emit(.down(reason: "ssh exited"))
                 self.emit(.reconnecting(attempt: attempt))
                 let delaySec = min(30, 1 << min(attempt - 1, 5))
                 try? await Task.sleep(nanoseconds: UInt64(delaySec) * 1_000_000_000)

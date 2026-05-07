@@ -313,6 +313,17 @@ final class PeerRelayWorkspaceWindowController: NSWindowController, NSWindowDele
     func windowWillClose(_ notification: Notification) {
         guard !isClosing else { return }
         isClosing = true
+        // Detach from the tunnel before kicking off async drains so a
+        // concurrent ssh exit doesn't fire `.down` into a half-torn
+        // controller. Stop the tunnel synchronously here too — the
+        // coordinator's onClose also stops it as a fallback, but
+        // doing it directly closes the race where the tunnel emits
+        // a state change between this method and onClose running.
+        if let tunnel = sshTunnel {
+            tunnel.onStateChange = nil
+            tunnel.stop()
+            sshTunnel = nil
+        }
         startTask?.cancel()
         startTask = nil
         subscriptionTask?.cancel()
