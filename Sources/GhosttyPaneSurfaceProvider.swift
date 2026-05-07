@@ -163,14 +163,20 @@ final class GhosttyPaneSurfaceProvider: PeerSurfaceProvider {
         // Light up the peer-attached ring on the host pane and bump
         // the per-surface ref count so concurrent attaches all share
         // a single visible ring.
-        Self.incrementPeerAttach(for: ts)
+        let isFirstAttach = Self.incrementPeerAttach(for: ts)
 
         // Phase E-6: optional Ctrl-L injection so TUIs repaint with
         // full styling on attach. The plain-text snapshot path above
         // restores content but loses ANSI; sending Ctrl-L makes vim /
         // htop / less redraw correctly. Disabled by default because
         // the redraw is visible to the host's local viewer too.
-        if PeerFederationSettings.forceRedrawOnAttach {
+        //
+        // Gate on the 0→1 transition: clients 2..N attaching to the
+        // same surface get the redraw bytes via the existing PTY tap
+        // (broadcast from the first attach's redraw), so emitting
+        // Ctrl-L on every attach would just stack form-feeds and
+        // multiply the host's local flicker.
+        if isFirstAttach && PeerFederationSettings.forceRedrawOnAttach {
             // Defer briefly so the snapshot lands first; the redraw
             // bytes that come back through the PTY tap will then
             // cleanly overwrite it.
@@ -375,11 +381,17 @@ final class GhosttyPaneSurfaceProvider: PeerSurfaceProvider {
     /// type so reads/writes serialize with the rest of provider state.
     private static var peerAttachCounts: [UUID: Int] = [:]
 
-    static func incrementPeerAttach(for ts: TerminalSurface) {
+    /// Bump the attach counter and update the teal ring + count
+    /// badge. Returns `true` when this attach transitioned the surface
+    /// from 0 → 1 — i.e. it's the first peer attaching, used by the
+    /// caller to decide whether to inject Ctrl-L for TUI redraw.
+    @discardableResult
+    static func incrementPeerAttach(for ts: TerminalSurface) -> Bool {
         let prev = peerAttachCounts[ts.id] ?? 0
         let next = prev + 1
         peerAttachCounts[ts.id] = next
         ts.hostedView.setPeerRing(visible: true, count: next)
+        return prev == 0
     }
 
     static func decrementPeerAttach(for ts: TerminalSurface) {
