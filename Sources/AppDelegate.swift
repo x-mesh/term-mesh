@@ -112,6 +112,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
     var browserAddressBarFocusObserver: NSObjectProtocol?
     var browserAddressBarBlurObserver: NSObjectProtocol?
     let updateController = UpdateController()
+    let brewSelfUpdater = BrewSelfUpdater()
     private lazy var titlebarAccessoryController = UpdateTitlebarAccessoryController(viewModel: updateViewModel)
     let windowDecorationsController = WindowDecorationsController()
     var menuBarExtraController: MenuBarExtraController?
@@ -276,6 +277,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
 
         if !isRunningUnderXCTest {
             PostHogAnalytics.shared.startIfNeeded()
+            brewSelfUpdater.start()
         }
 
         // UI tests frequently time out waiting for the main window if we do heavyweight
