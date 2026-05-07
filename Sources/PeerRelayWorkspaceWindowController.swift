@@ -578,7 +578,15 @@ final class PeerRelayWorkspaceWindowController: NSWindowController, NSWindowDele
         // into the existing NSSplitView tree. Saves a full
         // teardown / rebuild + Auto Layout pass per host divider
         // drag tick — the dominant cost during a drag.
-        if Self.isDividerOnlyDelta(from: currentLayout, to: layout) {
+        //
+        // Gated on `!panesBySurfaceID.isEmpty` because the controller
+        // initialises `currentLayout = workspace.layout` in `init`,
+        // so on the very first call to applyLayout the proto values
+        // already match — without this guard we'd skip the initial
+        // spawn / mount and the relay window would render blank.
+        if !panesBySurfaceID.isEmpty,
+           Self.isDividerOnlyDelta(from: currentLayout, to: layout)
+        {
             await MainActor.run { self.applyDividerPositions(from: layout) }
             return
         }
