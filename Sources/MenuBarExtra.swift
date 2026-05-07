@@ -169,7 +169,7 @@ final class MenuBarExtraController: NSObject, NSMenuDelegate {
         rebuildInlineNotificationItems(recentNotifications: snapshot.recentNotifications)
 
         if let button = statusItem.button {
-            let peerActive = PeerServerCoordinator.shared.isRunning
+            let peerActive = PeerHostCoordinator.shared.isRunning
             button.image = MenuBarIconRenderer.makeImage(
                 unreadCount: displayedUnreadCount,
                 peerActive: peerActive

@@ -158,7 +158,7 @@ struct SettingsView: View {
     @AppStorage(PeerFederationSettings.socketPathKey) private var peerFederationSocketPath = PeerFederationSettings.defaultSocketPath
     @AppStorage(PeerFederationSettings.displayNameKey) private var peerFederationDisplayName = ""
     @AppStorage(PeerFederationSettings.forceRedrawKey) private var peerFederationForceRedraw = false
-    /// Mirrors `PeerServerCoordinator.shared.isRunning`. Refreshed on
+    /// Mirrors `PeerHostCoordinator.shared.isRunning`. Refreshed on
     /// section appear and after every toggle change since the
     /// coordinator state is held outside SwiftUI.
     @State private var peerFederationServerRunning = false
@@ -1898,8 +1898,8 @@ struct SettingsView: View {
                     .controlSize(.small)
                     .onChange(of: peerFederationServerRunning) { newValue in
                         Task { @MainActor in
-                            await PeerServerCoordinator.shared.setRunning(newValue)
-                            peerFederationServerRunning = PeerServerCoordinator.shared.isRunning
+                            await PeerHostCoordinator.shared.setRunning(newValue)
+                            peerFederationServerRunning = PeerHostCoordinator.shared.isRunning
                         }
                     }
             }
@@ -1959,7 +1959,7 @@ struct SettingsView: View {
             SettingsCardNote("Peer federation lets another term-mesh.app instance attach this Mac's terminal panes via SSH (workspace mirror with live layout sync). \"Enable peer server\" controls the running state right now; \"Auto-start at app launch\" persists across restarts.")
         }
         .onAppear {
-            peerFederationServerRunning = PeerServerCoordinator.shared.isRunning
+            peerFederationServerRunning = PeerHostCoordinator.shared.isRunning
         }
     }
 

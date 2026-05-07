@@ -23,61 +23,61 @@ enum PeerMenu {
     static func item() -> NSMenuItem {
         let item = NSMenuItem(
             title: "Connect to Peer…",
-            action: #selector(PeerCoordinator.promptAndRun(_:)),
+            action: #selector(PeerClientCoordinator.promptAndRun(_:)),
             keyEquivalent: ""
         )
-        item.target = PeerCoordinator.shared
+        item.target = PeerClientCoordinator.shared
         return item
     }
 
     static func relayItem() -> NSMenuItem {
         let item = NSMenuItem(
             title: "Connect to Peer via Ghostty Relay…",
-            action: #selector(PeerCoordinator.promptAndRunRelay(_:)),
+            action: #selector(PeerClientCoordinator.promptAndRunRelay(_:)),
             keyEquivalent: ""
         )
-        item.target = PeerCoordinator.shared
+        item.target = PeerClientCoordinator.shared
         return item
     }
 
     static func relayWorkspaceItem() -> NSMenuItem {
         let item = NSMenuItem(
             title: "Connect to Peer Workspace via Ghostty Relay…",
-            action: #selector(PeerCoordinator.promptAndRunRelayWorkspace(_:)),
+            action: #selector(PeerClientCoordinator.promptAndRunRelayWorkspace(_:)),
             keyEquivalent: ""
         )
-        item.target = PeerCoordinator.shared
+        item.target = PeerClientCoordinator.shared
         return item
     }
 
     static func relayWorkspaceSSHItem() -> NSMenuItem {
         let item = NSMenuItem(
             title: "Connect to Remote Peer Workspace (SSH)…",
-            action: #selector(PeerCoordinator.promptAndRunRelayWorkspaceSSH(_:)),
+            action: #selector(PeerClientCoordinator.promptAndRunRelayWorkspaceSSH(_:)),
             keyEquivalent: ""
         )
-        item.target = PeerCoordinator.shared
+        item.target = PeerClientCoordinator.shared
         return item
     }
 
     static func connectionsItem() -> NSMenuItem {
         let item = NSMenuItem(
             title: "Show Peer Connections…",
-            action: #selector(PeerCoordinator.showConnections(_:)),
+            action: #selector(PeerClientCoordinator.showConnections(_:)),
             keyEquivalent: ""
         )
-        item.target = PeerCoordinator.shared
+        item.target = PeerClientCoordinator.shared
         return item
     }
 }
 
 @MainActor
-final class PeerCoordinator: NSObject {
-    static let shared = PeerCoordinator()
+final class PeerClientCoordinator: NSObject {
+    static let shared = PeerClientCoordinator()
 
     /// Posted whenever the active-relays roster changes (open / close).
     /// `PeerConnectionsWindowController` listens to refresh its table.
-    static let relaysDidChangeNotification = Notification.Name("PeerCoordinatorRelaysDidChange")
+    static let relaysDidChangeNotification = Notification.Name("PeerClientCoordinatorRelaysDidChange")
 
     /// Holding onto the window controllers here keeps their reader Tasks
     /// alive; dropping the reference would cancel the stream.

@@ -526,33 +526,33 @@ struct TermMeshApp: App {
             CommandMenu("Peer") {
                 Menu("Host This Mac") {
                     Button("Start Peer Server…") {
-                        PeerServerCoordinator.shared.startServer(nil)
+                        PeerHostCoordinator.shared.startServer(nil)
                     }
                     Button("Stop Peer Server") {
-                        PeerServerCoordinator.shared.stopServer(nil)
+                        PeerHostCoordinator.shared.stopServer(nil)
                     }
                 }
 
                 Divider()
 
                 Button("Connect to Peer…") {
-                    PeerCoordinator.shared.promptAndRun(nil)
+                    PeerClientCoordinator.shared.promptAndRun(nil)
                 }
 
                 Menu("Via Relay") {
                     Button("Connect via Relay…") {
-                        PeerCoordinator.shared.promptAndRunRelay(nil)
+                        PeerClientCoordinator.shared.promptAndRunRelay(nil)
                     }
                     Button("Connect to Workspace via Relay…") {
-                        PeerCoordinator.shared.promptAndRunRelayWorkspace(nil)
+                        PeerClientCoordinator.shared.promptAndRunRelayWorkspace(nil)
                     }
                     Button("Remote Workspace (SSH)…") {
-                        PeerCoordinator.shared.promptAndRunRelayWorkspaceSSH(nil)
+                        PeerClientCoordinator.shared.promptAndRunRelayWorkspaceSSH(nil)
                     }
                 }
 
                 Button("Show Peer Connections…") {
-                    PeerCoordinator.shared.showConnections(nil)
+                    PeerClientCoordinator.shared.showConnections(nil)
                 }
 
                 Divider()

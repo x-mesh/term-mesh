@@ -232,7 +232,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         // (or its legacy `TERMMESH_DEBUG_PEER_SERVER_PATH` alias). Without
         // the env var the user must manually start the server from the
         // status-bar menu — there is no implicit listener.
-        PeerServerCoordinator.autoStartIfConfigured()
+        PeerHostCoordinator.autoStartIfConfigured()
 
         // Reap leftover relay sockets from any previous crashed run
         // before a user opens a fresh relay window — otherwise stale

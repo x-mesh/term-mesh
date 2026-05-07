@@ -42,7 +42,7 @@ private final class WorkspaceSplitWatcher: NSObject, NSSplitViewDelegate {
 /// to (and reaching into) the controller itself.
 struct PeerRelayConnectionInfo: Sendable {
     /// Stable identity for the underlying controller. Use with
-    /// `PeerCoordinator.disconnect(id:)` to act on this connection
+    /// `PeerClientCoordinator.disconnect(id:)` to act on this connection
     /// safely even after the roster has been re-rendered.
     let id: ObjectIdentifier
     let hostSockPath: String

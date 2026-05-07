@@ -11,27 +11,27 @@ enum PeerServerMenu {
     static func startItem() -> NSMenuItem {
         let item = NSMenuItem(
             title: "Start Peer Server…",
-            action: #selector(PeerServerCoordinator.startServer(_:)),
+            action: #selector(PeerHostCoordinator.startServer(_:)),
             keyEquivalent: ""
         )
-        item.target = PeerServerCoordinator.shared
+        item.target = PeerHostCoordinator.shared
         return item
     }
 
     static func stopItem() -> NSMenuItem {
         let item = NSMenuItem(
             title: "Stop Peer Server",
-            action: #selector(PeerServerCoordinator.stopServer(_:)),
+            action: #selector(PeerHostCoordinator.stopServer(_:)),
             keyEquivalent: ""
         )
-        item.target = PeerServerCoordinator.shared
+        item.target = PeerHostCoordinator.shared
         return item
     }
 }
 
 @MainActor
-final class PeerServerCoordinator: NSObject {
-    static let shared = PeerServerCoordinator()
+final class PeerHostCoordinator: NSObject {
+    static let shared = PeerHostCoordinator()
 
     private var server: PeerServer?
     private var socketPath: String?
@@ -62,7 +62,7 @@ final class PeerServerCoordinator: NSObject {
             path = nil
         }
         guard let path else { return }
-        Task { await PeerServerCoordinator.shared.bringUp(at: path, silent: true) }
+        Task { await PeerHostCoordinator.shared.bringUp(at: path, silent: true) }
     }
 
     /// Toggle the server on/off without showing any UI. Used by the
@@ -272,11 +272,11 @@ extension Notification.Name {
     /// Posted by `Workspace` when bonsplit reports a layout change
     /// (split add/remove, divider drag). userInfo carries
     /// `["workspaceID": UUID]`. Observed by
-    /// `PeerServerCoordinator` which pushes the refreshed layout
+    /// `PeerHostCoordinator` which pushes the refreshed layout
     /// to attached peer clients.
     static let peerWorkspaceLayoutDidChange = Notification.Name("PeerWorkspaceLayoutDidChange")
 
-    /// Posted by `PeerServerCoordinator` whenever the local peer
+    /// Posted by `PeerHostCoordinator` whenever the local peer
     /// server starts or stops. Observed by the status-bar icon to
     /// toggle the activity dot.
     static let peerServerStateDidChange = Notification.Name("PeerServerStateDidChange")

@@ -3,14 +3,14 @@
 // host (SSH target if available, otherwise the local socket path), the
 // workspace title, the time the relay opened, and a Disconnect button.
 //
-// `PeerCoordinator.relaysDidChangeNotification` fires on every open /
+// `PeerClientCoordinator.relaysDidChangeNotification` fires on every open /
 // close so the table refreshes itself without polling.
 
 import AppKit
 
 /// NSButton carrying the stable `ObjectIdentifier` of the relay
 /// controller it disconnects. The handler resolves the id back to a
-/// live controller through `PeerCoordinator.disconnect(id:)`, so a
+/// live controller through `PeerClientCoordinator.disconnect(id:)`, so a
 /// roster change between render and click can't make the button act
 /// on the wrong controller — and the panel doesn't need to hold a
 /// reference to the controller at all.
@@ -51,7 +51,7 @@ final class PeerConnectionsWindowController: NSWindowController, NSWindowDelegat
         win.delegate = self
         installContent()
         observerToken = NotificationCenter.default.addObserver(
-            forName: PeerCoordinator.relaysDidChangeNotification,
+            forName: PeerClientCoordinator.relaysDidChangeNotification,
             object: nil,
             queue: .main
         ) { [weak self] _ in
@@ -134,7 +134,7 @@ final class PeerConnectionsWindowController: NSWindowController, NSWindowDelegat
     // MARK: - Data
 
     private func reload() {
-        rows = PeerCoordinator.shared.activeWorkspaceConnections()
+        rows = PeerClientCoordinator.shared.activeWorkspaceConnections()
         tableView?.reloadData()
     }
 }
@@ -183,7 +183,7 @@ extension PeerConnectionsWindowController: NSTableViewDelegate {
         // closed-since-render controller produces a safe no-op
         // rather than mis-acting on the row at the same position.
         guard let id = sender.targetID else { return }
-        PeerCoordinator.shared.disconnect(id: id)
+        PeerClientCoordinator.shared.disconnect(id: id)
         // The roster-changed notification will re-fire reload.
     }
 
