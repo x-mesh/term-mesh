@@ -981,6 +981,14 @@ struct ContentView: View {
     }
 
     private func updateTitlebarText() {
+        // Snapshot every @Published / KeyPath we read up front so the
+        // hot path does ONE pass over the workspace's published state
+        // instead of dispatching through `swift_getAtKeyPath` /
+        // `Published.subscript.getter` for each access — that pattern
+        // was the sampler-visible culprit in the App Hang reports
+        // (TERM-MESH-1K, 1N) where titlebar updates landed during
+        // foreground/background churn.
+        let updateStart = CFAbsoluteTimeGetCurrent()
         guard let selectedId = tabManager.selectedTabId,
               let tab = tabManager.tabs.first(where: { $0.id == selectedId }) else {
             if !titlebarText.isEmpty { titlebarText = "" }
@@ -993,18 +1001,35 @@ struct ContentView: View {
             if titlebarTag != nil { titlebarTag = nil }
             return
         }
-        let title = tab.title.trimmingCharacters(in: .whitespacesAndNewlines)
+        // One-pass snapshot of the published fields that drive the
+        // titlebar. Holding values in locals avoids re-entering each
+        // KeyPath getter under `swift_beginAccess` for diff
+        // comparisons later in this function.
+        let snapTitle = tab.title
+        let focusedPanelId = tab.focusedPanelId
+        let branchState = tab.gitBranch
+        let snapPanelDirs = tab.panelDirectories
+        let snapTTYNames = tab.surfaceTTYNames
+        let snapCurrentDir = tab.currentDirectory
+        let snapWorktreeName = tab.worktreeName
+        let snapIsInsideWorktree = tab.isInsideWorktree
+        let snapCustomTitle = tab.customTitle
+        let snapListeningPorts = tab.listeningPorts
+        let snapCreatedAt = tab.createdAt
+        #if DEBUG
+        let snapPanelBranches = tab.panelGitBranches
+        #endif
+
+        let title = snapTitle.trimmingCharacters(in: .whitespacesAndNewlines)
         if titlebarText != title {
             titlebarText = title
         }
         // Git branch — prefer focused panel's reported branch; fall back to git query
-        let focusedPanelId = tab.focusedPanelId
-        let branchState = tab.gitBranch
-        let focusedDir = focusedPanelId.flatMap { tab.panelDirectories[$0] } ?? tab.currentDirectory
-        let focusedTTY: String? = focusedPanelId.flatMap { tab.surfaceTTYNames[$0] }
-        let hasPanelDir = focusedPanelId != nil && tab.panelDirectories[focusedPanelId!] != nil
+        let focusedDir = focusedPanelId.flatMap { snapPanelDirs[$0] } ?? snapCurrentDir
+        let focusedTTY: String? = focusedPanelId.flatMap { snapTTYNames[$0] }
+        let hasPanelDir = focusedPanelId != nil && snapPanelDirs[focusedPanelId!] != nil
         #if DEBUG
-        dlog("titlebar.update focusedPanel=\(focusedPanelId?.uuidString.prefix(8) ?? "nil") gitBranch=\(branchState?.branch ?? "nil") panelBranches=\(tab.panelGitBranches.mapValues { $0.branch }) currentDir=\(tab.currentDirectory) focusedDir=\(focusedDir) tty=\(focusedTTY ?? "nil") hasPanelDir=\(hasPanelDir) worktreeName=\(tab.worktreeName ?? "nil")")
+        dlog("titlebar.update focusedPanel=\(focusedPanelId?.uuidString.prefix(8) ?? "nil") gitBranch=\(branchState?.branch ?? "nil") panelBranches=\(snapPanelBranches.mapValues { $0.branch }) currentDir=\(snapCurrentDir) focusedDir=\(focusedDir) tty=\(focusedTTY ?? "nil") hasPanelDir=\(hasPanelDir) worktreeName=\(snapWorktreeName ?? "nil")")
         #endif
         if let bs = branchState {
             let branch = bs.branch
@@ -1041,13 +1066,13 @@ struct ContentView: View {
             }
         }
         // Worktree name — show user-friendly name from customTitle, not internal name
-        let hasWorktree = (tab.worktreeName != nil && !tab.worktreeName!.isEmpty)
-            || tab.isInsideWorktree
+        let hasWorktree = (snapWorktreeName != nil && !snapWorktreeName!.isEmpty)
+            || snapIsInsideWorktree
         let wtName: String
         if hasWorktree {
-            if let customTitle = tab.customTitle, !customTitle.isEmpty {
+            if let customTitle = snapCustomTitle, !customTitle.isEmpty {
                 wtName = customTitle
-            } else if let rawWtName = tab.worktreeName, !rawWtName.isEmpty {
+            } else if let rawWtName = snapWorktreeName, !rawWtName.isEmpty {
                 wtName = rawWtName
             } else {
                 // Fallback: derive from directory
@@ -1059,34 +1084,54 @@ struct ContentView: View {
         if titlebarWorktreeName != wtName { titlebarWorktreeName = wtName }
 
         // Directory basename — skip when the workspace is a worktree (dirname is internal and redundant)
-        let rawDirBase = (tab.currentDirectory as NSString).lastPathComponent
+        let rawDirBase = (snapCurrentDir as NSString).lastPathComponent
         let dirBase = hasWorktree ? "" : rawDirBase
         if titlebarDirBasename != dirBase { titlebarDirBasename = dirBase }
 
         // Listening ports
-        let ports = tab.listeningPorts
+        let ports = snapListeningPorts
         if titlebarPorts != ports { titlebarPorts = ports }
 
         // Session time
-        if titlebarSessionStart != tab.createdAt { titlebarSessionStart = tab.createdAt }
+        if titlebarSessionStart != snapCreatedAt { titlebarSessionStart = snapCreatedAt }
 
         // Tag
-        if titlebarTag != tab.tag { titlebarTag = tab.tag }
+        let snapTag = tab.tag
+        if titlebarTag != snapTag { titlebarTag = snapTag }
 
         // Dashboard port
         let dashPort: Int? = daemonService?.isDashboardEnabled == true ? daemonService?.dashboardPort : nil
         if titlebarDashboardPort != dashPort { titlebarDashboardPort = dashPort }
 
-        // Worktree count
+        // Worktree count — re-use the snapshot directory; don't go
+        // back through the @Published getter on a background queue.
         let daemon = self.daemonService
+        let cwdForWorktree = snapCurrentDir
         DispatchQueue.global(qos: .utility).async {
-            let currentDir = tab.currentDirectory
-            if let repoPath = daemon?.findGitRoot(from: currentDir), !repoPath.isEmpty {
+            if let repoPath = daemon?.findGitRoot(from: cwdForWorktree), !repoPath.isEmpty {
                 let count = daemon?.listWorktrees(repoPath: repoPath).count ?? 0
                 DispatchQueue.main.async {
                     if self.titlebarWorktreeCount != count { self.titlebarWorktreeCount = count }
                 }
             }
+        }
+
+        // Breadcrumb only when the synchronous body went slow enough
+        // to be sampler-visible (>50ms). Routine fast updates emit no
+        // breadcrumb so the 100-entry ring buffer stays useful for
+        // user-action context rather than getting flooded by the 3s
+        // periodic refresh.
+        let elapsedMs = (CFAbsoluteTimeGetCurrent() - updateStart) * 1000
+        if elapsedMs > 50 {
+            sentryBreadcrumb(
+                "titlebar.update.slow",
+                category: "ui",
+                data: [
+                    "elapsed_ms": Int(elapsedMs),
+                    "has_worktree": hasWorktree,
+                    "branch_present": branchState != nil
+                ]
+            )
         }
     }
 
@@ -1383,9 +1428,27 @@ struct ContentView: View {
             scheduleTitlebarTextRefresh()
         })
 
-        // Periodically refresh titlebar git branch + directory (3s interval)
+        // Periodically refresh titlebar git branch + directory (3s interval).
+        //
+        // Skip when the app isn't active — the titlebar isn't visible
+        // and TimerPublisher firing into a background app while
+        // foreground/background transitions churn SwiftUI was the root
+        // cause of the App Hang sentry events (TERM-MESH-1K, 1N): the
+        // 3s tick walked the selected workspace's @Published keypaths
+        // (gitBranch, worktreeName, …) on the main thread while the
+        // OS was already serializing access via swift_beginAccess /
+        // AccessSet, pushing the sampler past the 2000ms hang
+        // threshold. Routing through `scheduleTitlebarTextRefresh()`
+        // also coalesces with focus / selectTab / ghosttyDidSetTitle
+        // pushes so the periodic tick is a no-op when nothing changed.
         view = AnyView(view.onReceive(Timer.publish(every: 3, on: .main, in: .common).autoconnect()) { _ in
-            updateTitlebarText()
+            guard NSApp?.isActive == true else {
+                sentryBreadcrumb("titlebar.update.skip",
+                                 category: "ui",
+                                 data: ["reason": "app-inactive"])
+                return
+            }
+            scheduleTitlebarTextRefresh()
         })
 
         view = AnyView(view.onChange(of: titlebarThemeGeneration) { [configProvider] oldValue, newValue in
