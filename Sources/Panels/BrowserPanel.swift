@@ -2813,7 +2813,7 @@ private class BrowserUIDelegate: NSObject, WKUIDelegate {
             alert.beginSheetModal(for: window, completionHandler: completion)
             return
         }
-        completion(alert.runModal())
+        alert.presentAsSheet(completion: completion)
     }
 
     /// Returning nil tells WebKit not to open a new window.

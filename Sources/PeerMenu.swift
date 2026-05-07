@@ -666,10 +666,7 @@ final class PeerClientCoordinator: NSObject {
             ?? NSApp.keyWindow
             ?? NSApp.windows.first(where: { $0.isVisible && !($0 is NSPanel) })
         guard let host else {
-            // No host window — runModal is the only option but at
-            // least this branch only fires when the app is fully
-            // hidden (rare from a menu-driven flow).
-            completion(alert.runModal())
+            alert.presentAsSheet(completion: completion)
             return
         }
         alert.beginSheetModal(for: host) { response in

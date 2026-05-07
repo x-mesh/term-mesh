@@ -259,8 +259,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
 
             // Performance tracing (10% of transactions)
             options.tracesSampleRate = 0.1
-            // App hang timeout (default is 2s, be explicit)
-            options.appHangTimeoutInterval = 2.0
+            // macOS can legitimately spend a few seconds in AppKit/SkyLight while
+            // foregrounding, creating windows, or committing layer transactions.
+            // Keep hang capture enabled, but avoid treating short system waits as
+            // actionable AppHang issues.
+            #if DEBUG
+            options.appHangTimeoutInterval = 10.0
+            #else
+            options.appHangTimeoutInterval = 5.0
+            #endif
             // Attach stack traces to all events
             options.attachStacktrace = true
             // Capture failed HTTP requests

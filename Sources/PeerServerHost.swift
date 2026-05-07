@@ -101,7 +101,7 @@ final class PeerHostCoordinator: NSObject {
             let alert = NSAlert()
             alert.messageText = "Peer server is already running."
             alert.informativeText = "Listening at \(existing). Stop it first if you want a new path."
-            alert.runModal()
+            alert.presentAsSheet()
             return
         }
 
@@ -114,11 +114,12 @@ final class PeerHostCoordinator: NSObject {
         alert.accessoryView = input
         alert.addButton(withTitle: "Start")
         alert.addButton(withTitle: "Cancel")
-        guard alert.runModal() == .alertFirstButtonReturn else { return }
-        let path = input.stringValue.trimmingCharacters(in: .whitespaces)
-        guard !path.isEmpty else { return }
-
-        Task { await self.bringUp(at: path) }
+        alert.presentAsSheet { [weak self] response in
+            guard response == .alertFirstButtonReturn else { return }
+            let path = input.stringValue.trimmingCharacters(in: .whitespaces)
+            guard !path.isEmpty else { return }
+            Task { await self?.bringUp(at: path) }
+        }
     }
 
     @objc func stopServer(_ sender: Any?) {
@@ -264,7 +265,7 @@ final class PeerHostCoordinator: NSObject {
         alert.informativeText = body
         alert.alertStyle = .informational
         alert.addButton(withTitle: "OK")
-        alert.runModal()
+        alert.presentAsSheet()
     }
 }
 

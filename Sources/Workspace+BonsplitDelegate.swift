@@ -14,7 +14,7 @@ extension Workspace: BonsplitDelegate {
         alert.addButton(withTitle: "Close")
         alert.addButton(withTitle: "Cancel")
 
-        // Prefer a sheet if we can find a window, otherwise fall back to modal.
+        // Prefer a sheet if we can find a window, otherwise defer until one appears.
         if let window = NSApp.keyWindow ?? NSApp.mainWindow {
             // Guard against the continuation hanging forever if the sheet is never dismissed
             // (e.g. window deallocated without calling the completion handler). Both closures
@@ -36,7 +36,20 @@ extension Workspace: BonsplitDelegate {
             }
         }
 
-        return alert.runModal() == .alertFirstButtonReturn
+        var resumed = false
+        return await withCheckedContinuation { continuation in
+            alert.presentAsSheet { response in
+                guard !resumed else { return }
+                resumed = true
+                continuation.resume(returning: response == .alertFirstButtonReturn)
+            }
+            Task { @MainActor in
+                try? await Task.sleep(nanoseconds: 10_000_000_000)
+                guard !resumed else { return }
+                resumed = true
+                continuation.resume(returning: false)
+            }
+        }
     }
 
     /// Apply the side-effects of selecting a tab (unfocus others, focus this panel, update state).

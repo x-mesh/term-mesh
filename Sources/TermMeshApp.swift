@@ -395,11 +395,7 @@ struct TermMeshApp: App {
                                     alert.informativeText = "term-meshd daemon is not running.\nNew tabs will open without sandbox until the daemon is started."
                                     alert.alertStyle = .warning
                                     alert.addButton(withTitle: "OK")
-                                    if let window = NSApp.keyWindow ?? NSApp.mainWindow {
-                                        alert.beginSheetModal(for: window)
-                                    } else {
-                                        alert.runModal()
-                                    }
+                                    alert.presentAsSheet()
                                 }
                             }
                         }
@@ -1107,7 +1103,20 @@ struct TermMeshApp: App {
             }
         }
 
-        return alert.runModal()
+        var resumed = false
+        return await withCheckedContinuation { continuation in
+            alert.presentAsSheet { response in
+                guard !resumed else { return }
+                resumed = true
+                continuation.resume(returning: response)
+            }
+            Task { @MainActor in
+                try? await Task.sleep(nanoseconds: 10_000_000_000)
+                guard !resumed else { return }
+                resumed = true
+                continuation.resume(returning: .cancel)
+            }
+        }
     }
 
     @MainActor

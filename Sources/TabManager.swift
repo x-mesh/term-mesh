@@ -1068,7 +1068,20 @@ class TabManager: ObservableObject {
             }
         }
 
-        return alert.runModal() == .alertFirstButtonReturn
+        var resumed = false
+        return await withCheckedContinuation { continuation in
+            alert.presentAsSheet { response in
+                guard !resumed else { return }
+                resumed = true
+                continuation.resume(returning: response == .alertFirstButtonReturn)
+            }
+            Task { @MainActor in
+                try? await Task.sleep(nanoseconds: 10_000_000_000)
+                guard !resumed else { return }
+                resumed = true
+                continuation.resume(returning: false)
+            }
+        }
     }
 
     private func closeWorkspaceIfRunningProcess(_ workspace: Workspace) async {
