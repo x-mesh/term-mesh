@@ -37,6 +37,11 @@ enum PeerSSHTunnelState: Sendable, Equatable {
     case up
     case down(reason: String)
     case reconnecting(attempt: Int)
+    /// Auto-reconnect gave up after the configured cap. The tunnel
+    /// is no longer trying. Caller must explicitly invoke
+    /// `retry()` (e.g. via the in-window banner's "Retry" button)
+    /// to resume attempts.
+    case failed(reason: String)
 }
 
 final class PeerSSHTunnel: @unchecked Sendable {
@@ -83,6 +88,23 @@ final class PeerSSHTunnel: @unchecked Sendable {
         emit(.starting)
         try await spawnOnce()
         emit(.up)
+    }
+
+    /// Re-arm the auto-restart loop after a `.failed` transition. The
+    /// controller's banner "Retry" action wires through here so the
+    /// user can ask for another round of attempts after the cap was
+    /// hit (e.g. once they've fixed the SSH config / brought the
+    /// remote server back up). No-op if the tunnel is currently
+    /// stopped or already running.
+    func retry() {
+        lock.lock()
+        if process != nil || restartTask != nil {
+            lock.unlock()
+            return
+        }
+        wantsRunning = true
+        lock.unlock()
+        scheduleReconnect(reason: "user retry")
     }
 
     /// Tears the ssh subprocess down and disarms auto-restart. Safe to
@@ -209,9 +231,17 @@ final class PeerSSHTunnel: @unchecked Sendable {
         }
     }
 
+    /// Maximum number of consecutive reconnect attempts before the
+    /// tunnel transitions to `.failed` and stops trying. The user
+    /// surfaces a "Retry" banner action from the controller to
+    /// re-arm reconnection — important for permanent-failure cases
+    /// (server uninstalled, target user deleted, DNS gone) where the
+    /// previous unbounded loop kept spawning ssh forever.
+    private static let maxReconnectAttempts = 12
+
     /// Backoff loop: 1s, 2s, 4s, 8s, 16s, 30s, 30s … capped. Stops
-    /// when `wantsRunning` flips false (caller stopped explicitly) or
-    /// when a respawn succeeds.
+    /// when `wantsRunning` flips false (caller stopped explicitly),
+    /// when a respawn succeeds, or when the cap is reached.
     ///
     /// Emits `.down` exactly once when the loop arms, then only
     /// `.reconnecting(attempt:)` per iteration. The previous version
@@ -233,7 +263,8 @@ final class PeerSSHTunnel: @unchecked Sendable {
             // per-pane sessions exactly once before we start retrying.
             self.emit(.down(reason: initialReason))
             var attempt = 1
-            while !Task.isCancelled {
+            var lastError: String = initialReason
+            while !Task.isCancelled, attempt <= Self.maxReconnectAttempts {
                 self.emit(.reconnecting(attempt: attempt))
                 let delaySec = min(30, 1 << min(attempt - 1, 5))
                 try? await Task.sleep(nanoseconds: UInt64(delaySec) * 1_000_000_000)
@@ -250,12 +281,22 @@ final class PeerSSHTunnel: @unchecked Sendable {
                     self.lock.unlock()
                     return
                 } catch {
+                    lastError = String(describing: error)
                     attempt += 1
                 }
             }
+            // Retries exhausted (or cancelled). Move to a terminal
+            // state so the UI can offer an explicit Retry rather than
+            // showing "Reconnecting (try N)…" forever.
             self.lock.lock()
             self.restartTask = nil
+            let stillWants = self.wantsRunning
             self.lock.unlock()
+            if stillWants && !Task.isCancelled {
+                self.emit(.failed(
+                    reason: "gave up after \(Self.maxReconnectAttempts) attempts: \(lastError)"
+                ))
+            }
         }
         restartTask = task
         lock.unlock()

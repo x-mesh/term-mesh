@@ -287,6 +287,20 @@ final class PeerRelayWorkspaceWindowController: NSWindowController, NSWindowDele
                     }
                 }
             }
+        case .failed(let reason):
+            // Auto-retry gave up. Surface a Retry button on the
+            // banner so the user can re-arm the loop without closing
+            // and reopening the window.
+            banner?.show(
+                kind: .error,
+                message: "Reconnect failed: \(reason)",
+                actionTitle: "Retry",
+                dismissable: false,
+                action: { [weak self] in
+                    self?.sshTunnel?.retry()
+                }
+            )
+            tearDownPeerSessions(keepWindow: true)
         case .stopped, .starting:
             break
         }
