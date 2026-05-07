@@ -1,0 +1,895 @@
+//  Phase C-3b-β + C-3c.2α: DEBUG-only hook that lets a developer exercise
+//  the Swift peer-federation client from inside term-mesh.app without
+//  touching any terminal UI yet.
+//
+//  Flow:
+//   1. Menu item → NSAlert prompt for socket path.
+//   2. Connect + handshake + list (from C-3b-β).
+//   3. Attach to the first surface (C-3c.2α).
+//   4. Open a `PeerConsoleWindow`:
+//        - NSTextView (read-only) streams raw PtyData bytes as UTF-8. No
+//          ANSI escape processing — the user sees the raw tty stream,
+//          which is the point: it proves bytes are flowing into the GUI
+//          process and rendering on-screen.
+//        - NSTextField below lets the developer type a line and hit
+//          Enter; it gets sent as an Input frame, field clears.
+//        - Closing the window sends Goodbye and tears down the transport.
+
+import AppKit
+import PeerProto
+
+@MainActor
+enum PeerMenu {
+    static func item() -> NSMenuItem {
+        let item = NSMenuItem(
+            title: "Connect to Peer…",
+            action: #selector(PeerClientCoordinator.promptAndRun(_:)),
+            keyEquivalent: ""
+        )
+        item.target = PeerClientCoordinator.shared
+        return item
+    }
+
+    static func relayItem() -> NSMenuItem {
+        let item = NSMenuItem(
+            title: "Connect to Peer via Ghostty Relay…",
+            action: #selector(PeerClientCoordinator.promptAndRunRelay(_:)),
+            keyEquivalent: ""
+        )
+        item.target = PeerClientCoordinator.shared
+        return item
+    }
+
+    static func relayWorkspaceItem() -> NSMenuItem {
+        let item = NSMenuItem(
+            title: "Connect to Peer Workspace via Ghostty Relay…",
+            action: #selector(PeerClientCoordinator.promptAndRunRelayWorkspace(_:)),
+            keyEquivalent: ""
+        )
+        item.target = PeerClientCoordinator.shared
+        return item
+    }
+
+    static func relayWorkspaceSSHItem() -> NSMenuItem {
+        let item = NSMenuItem(
+            title: "Connect to Remote Peer Workspace (SSH)…",
+            action: #selector(PeerClientCoordinator.promptAndRunRelayWorkspaceSSH(_:)),
+            keyEquivalent: ""
+        )
+        item.target = PeerClientCoordinator.shared
+        return item
+    }
+
+    static func connectionsItem() -> NSMenuItem {
+        let item = NSMenuItem(
+            title: "Show Peer Connections…",
+            action: #selector(PeerClientCoordinator.showConnections(_:)),
+            keyEquivalent: ""
+        )
+        item.target = PeerClientCoordinator.shared
+        return item
+    }
+}
+
+@MainActor
+final class PeerClientCoordinator: NSObject {
+    static let shared = PeerClientCoordinator()
+
+    /// Posted whenever the active-relays roster changes (open / close).
+    /// `PeerConnectionsWindowController` listens to refresh its table.
+    static let relaysDidChangeNotification = Notification.Name("PeerClientCoordinatorRelaysDidChange")
+
+    /// Holding onto the window controllers here keeps their reader Tasks
+    /// alive; dropping the reference would cancel the stream.
+    private var openConsoles: [PeerConsoleWindowController] = []
+    private var openRelays: [PeerRelayWindowController] = []
+    private var openWorkspaceRelays: [PeerRelayWorkspaceWindowController] = []
+    /// Active SSH tunnels keyed by the controller they back. The
+    /// tunnel must outlive the relay window; dropped tunnels yank the
+    /// forwarded socket out from under the relay sessions.
+    private var sshTunnels: [ObjectIdentifier: PeerSSHTunnel] = [:]
+
+    /// Snapshot of every active workspace relay for the Connections
+    /// panel. Returned in open-order. Now exposes a value type rather
+    /// than the controller itself so external observers don't grow a
+    /// dependency on AppKit window-controller internals.
+    func activeWorkspaceConnections() -> [PeerRelayConnectionInfo] {
+        return openWorkspaceRelays.map { $0.connectionInfo }
+    }
+
+    /// Disconnect (close) the relay window matching `id`. No-op when
+    /// the controller has already been released or removed from the
+    /// roster — safer than indexing by row position.
+    func disconnect(id: ObjectIdentifier) {
+        guard let ctrl = openWorkspaceRelays.first(where: { ObjectIdentifier($0) == id })
+        else { return }
+        ctrl.window?.performClose(nil)
+    }
+
+    fileprivate func postRelaysChanged() {
+        NotificationCenter.default.post(name: Self.relaysDidChangeNotification, object: self)
+    }
+
+    @objc func showConnections(_ sender: Any?) {
+        PeerConnectionsWindowController.shared.showAndFocus()
+    }
+
+    @objc func promptAndRunRelayWorkspaceSSH(_ sender: Any?) {
+        let alert = NSAlert()
+        alert.messageText = "Connect to Remote Peer Workspace via SSH"
+        alert.informativeText = "Tunnels the host's peer socket through `ssh -L`. Pick a host advertised on this LAN, or type an SSH target (user@host or ssh-config alias) and the path of the remote peer server's Unix socket."
+
+        let stack = NSStackView(frame: NSRect(x: 0, y: 0, width: 380, height: 60))
+        stack.orientation = .vertical
+        stack.alignment = .leading
+        stack.spacing = 4
+
+        // Recent hosts (most recently successful connect bubbles to
+        // the top). Pick fills target + remote fields.
+        let recentLabel = NSTextField(labelWithString: "Recent:")
+        let recentPopup = NSPopUpButton(
+            frame: NSRect(x: 0, y: 0, width: 380, height: 26),
+            pullsDown: false
+        )
+        let recents = PeerFederationSettings.loadRecentHosts()
+        let recentMenu = NSMenu()
+        recentMenu.addItem(withTitle: recents.isEmpty ? "(no recent hosts)" : "(pick a recent host…)",
+                           action: nil, keyEquivalent: "")
+        for r in recents {
+            recentMenu.addItem(withTitle: "\(r.sshTarget)  ·  \(r.remoteSocket)",
+                               action: nil, keyEquivalent: "")
+        }
+        recentPopup.menu = recentMenu
+
+        // Bonjour-discovered hosts populate this popup live; selecting
+        // one autofills the SSH target / remote socket fields.
+        let discoveredLabel = NSTextField(labelWithString: "Discovered on LAN:")
+        let discoveredPopup = NSPopUpButton(
+            frame: NSRect(x: 0, y: 0, width: 380, height: 26),
+            pullsDown: false
+        )
+        discoveredPopup.menu?.addItem(withTitle: "(searching…)", action: nil, keyEquivalent: "")
+
+        let targetLabel = NSTextField(labelWithString: "SSH target (user@host):")
+        let targetField = NSTextField(frame: NSRect(x: 0, y: 0, width: 380, height: 24))
+        targetField.placeholderString = "user@mac-mini.local"
+        let remoteLabel = NSTextField(labelWithString: "Remote peer socket:")
+        let remoteField = NSTextField(frame: NSRect(x: 0, y: 0, width: 380, height: 24))
+        // Pre-fill with this machine's *effective* socketPath (the
+        // value stored in UserDefaults when the user has overridden
+        // it; otherwise the per-uid default). When the remote side is
+        // the same user on a similarly-configured Mac, this will be
+        // the correct remote path; the user can still edit it.
+        remoteField.stringValue = PeerFederationSettings.socketPath
+
+        // Pre-fill from the most recent host so a re-connect is
+        // one-keystroke (Cmd+T → Cmd+Return).
+        if let mostRecent = recents.first {
+            targetField.stringValue = mostRecent.sshTarget
+            remoteField.stringValue = mostRecent.remoteSocket
+        }
+
+        let arranged: [NSView] = [
+            recentLabel, recentPopup,
+            discoveredLabel, discoveredPopup,
+            targetLabel, targetField,
+            remoteLabel, remoteField,
+        ]
+        for v in arranged {
+            stack.addArrangedSubview(v)
+        }
+        stack.frame = NSRect(x: 0, y: 0, width: 380, height: 230)
+        alert.accessoryView = stack
+        alert.addButton(withTitle: "Connect")
+        alert.addButton(withTitle: "Cancel")
+
+        // Live Bonjour browse: rebuild the popup as services arrive
+        // and resolve. Strong ref kept until the dialog closes.
+        var discoveredPeers: [DiscoveredPeer] = []
+        let browser = PeerBonjourBrowser()
+        browser.start { peers in
+            discoveredPeers = peers
+            let menu = discoveredPopup.menu ?? NSMenu()
+            menu.removeAllItems()
+            if peers.isEmpty {
+                menu.addItem(withTitle: "(no LAN hosts found)", action: nil, keyEquivalent: "")
+            } else {
+                menu.addItem(withTitle: "(pick a host…)", action: nil, keyEquivalent: "")
+                for p in peers {
+                    let label = "\(p.serviceName)  ·  \(p.hostname)\(p.socketPath.map { "  ·  \($0)" } ?? "")"
+                    menu.addItem(withTitle: label, action: nil, keyEquivalent: "")
+                }
+            }
+            discoveredPopup.menu = menu
+        }
+        // Adapter target so the popup's action stays @objc-compatible.
+        let proxy = SSHDialogPopupProxy(
+            popup: discoveredPopup,
+            target: targetField,
+            remote: remoteField,
+            peersProvider: { discoveredPeers }
+        )
+        discoveredPopup.target = proxy
+        discoveredPopup.action = #selector(SSHDialogPopupProxy.didPick(_:))
+
+        let recentProxy = RecentHostPopupProxy(
+            popup: recentPopup,
+            target: targetField,
+            remote: remoteField,
+            recents: recents
+        )
+        recentPopup.target = recentProxy
+        recentPopup.action = #selector(RecentHostPopupProxy.didPick(_:))
+
+        defer { browser.stop(); _ = proxy; _ = recentProxy } // tear down after modal dismissal
+
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        let target = targetField.stringValue.trimmingCharacters(in: .whitespaces)
+        let remote = remoteField.stringValue.trimmingCharacters(in: .whitespaces)
+        guard !target.isEmpty, !remote.isEmpty else { return }
+
+        Task {
+            let tunnel = PeerSSHTunnel(sshTarget: target, remoteSockPath: remote)
+            do {
+                try await tunnel.start()
+            } catch {
+                await MainActor.run {
+                    self.showAlert(title: "SSH Tunnel Failed",
+                                   body: String(describing: error))
+                }
+                return
+            }
+            // Tunnel is up — remember the host so the next connect
+            // dialog has it ready in the recent picker.
+            PeerFederationSettings.rememberRecentHost(
+                .init(sshTarget: target, remoteSocket: remote)
+            )
+            await self.openWorkspaceRelay(
+                hostSockPath: tunnel.localSockPath,
+                titleSuffix: " · \(target)",
+                tunnel: tunnel
+            )
+        }
+    }
+
+    /// Shared workflow: enumerate workspaces over a `PeerRelayConnection`
+    /// rooted at `hostSockPath`, prompt for one when there are multiple,
+    /// open a `PeerRelayWorkspaceWindowController` and own its lifetime.
+    /// `tunnel` (when non-nil) is held alive until the controller closes
+    /// and torn down on close.
+    private func openWorkspaceRelay(hostSockPath: String,
+                                    titleSuffix: String = "",
+                                    tunnel: PeerSSHTunnel? = nil) async {
+        let probe: PeerRelayConnection
+        do {
+            probe = try await PeerRelaySession.connectAndList(hostSockPath: hostSockPath)
+        } catch {
+            tunnel?.stop()
+            await MainActor.run {
+                self.showAlert(title: "Peer Workspace Failed",
+                               body: String(describing: error))
+            }
+            return
+        }
+        let workspaces: [Termmesh_Peer_V1_Workspace]
+        do {
+            workspaces = try await probe.session.listWorkspaces()
+        } catch {
+            await probe.cancel()
+            tunnel?.stop()
+            await MainActor.run {
+                self.showAlert(title: "Peer Workspace Failed",
+                               body: "listWorkspaces failed: \(error)")
+            }
+            return
+        }
+        await probe.cancel()
+
+        guard !workspaces.isEmpty else {
+            tunnel?.stop()
+            await MainActor.run {
+                self.showAlert(title: "Peer Workspace Failed",
+                               body: "Host did not return any workspaces.")
+            }
+            return
+        }
+
+        let chosen: Termmesh_Peer_V1_Workspace?
+        if workspaces.count == 1 {
+            chosen = workspaces[0]
+        } else {
+            chosen = await MainActor.run {
+                self.promptForWorkspaceSelection(from: workspaces)
+            }
+        }
+        guard let chosen else {
+            tunnel?.stop()
+            return
+        }
+
+        await MainActor.run {
+            let controller = PeerRelayWorkspaceWindowController(
+                hostSockPath: hostSockPath,
+                workspace: chosen
+            )
+            self.openWorkspaceRelays.append(controller)
+            if let tunnel {
+                self.sshTunnels[ObjectIdentifier(controller)] = tunnel
+                controller.attachTunnel(tunnel)
+                if !titleSuffix.isEmpty {
+                    controller.window?.title += titleSuffix
+                }
+            }
+            controller.onClose = { [weak self, weak controller] in
+                guard let self, let controller else { return }
+                self.openWorkspaceRelays.removeAll { $0 === controller }
+                if let stale = self.sshTunnels.removeValue(forKey: ObjectIdentifier(controller)) {
+                    stale.stop()
+                }
+                self.postRelaysChanged()
+            }
+            controller.show()
+            self.postRelaysChanged()
+        }
+    }
+
+    @objc func promptAndRunRelayWorkspace(_ sender: Any?) {
+        let alert = NSAlert()
+        alert.messageText = "Connect to Peer Workspace via Ghostty Relay"
+        alert.informativeText = "Path to a Swift peer server socket. Picks one of the host's workspaces and mirrors its split layout in a single window."
+
+        let input = NSTextField(frame: NSRect(x: 0, y: 0, width: 360, height: 24))
+        input.stringValue = ProcessInfo.processInfo.environment["TERMMESH_DEBUG_PEER_SERVER_PATH"]
+            ?? PeerFederationSettings.socketPath
+        alert.accessoryView = input
+        alert.addButton(withTitle: "Connect")
+        alert.addButton(withTitle: "Cancel")
+
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        let path = input.stringValue.trimmingCharacters(in: .whitespaces)
+        guard !path.isEmpty else { return }
+
+        Task {
+            // Open a probe connection to enumerate workspaces, then
+            // discard it — each pane in the chosen workspace will
+            // open its own connection.
+            let probe: PeerRelayConnection
+            do {
+                probe = try await PeerRelaySession.connectAndList(hostSockPath: path)
+            } catch {
+                await MainActor.run {
+                    self.showAlert(title: "Peer Workspace Failed",
+                                   body: String(describing: error))
+                }
+                return
+            }
+            let workspaces: [Termmesh_Peer_V1_Workspace]
+            do {
+                workspaces = try await probe.session.listWorkspaces()
+            } catch {
+                await probe.cancel()
+                await MainActor.run {
+                    self.showAlert(title: "Peer Workspace Failed",
+                                   body: "listWorkspaces failed: \(error)")
+                }
+                return
+            }
+            await probe.cancel()
+
+            guard !workspaces.isEmpty else {
+                await MainActor.run {
+                    self.showAlert(title: "Peer Workspace Failed",
+                                   body: "Host did not return any workspaces.")
+                }
+                return
+            }
+
+            let chosen: Termmesh_Peer_V1_Workspace?
+            if workspaces.count == 1 {
+                chosen = workspaces[0]
+            } else {
+                chosen = await MainActor.run {
+                    self.promptForWorkspaceSelection(from: workspaces)
+                }
+            }
+            guard let chosen else { return }
+
+            await MainActor.run {
+                let controller = PeerRelayWorkspaceWindowController(
+                    hostSockPath: path,
+                    workspace: chosen
+                )
+                self.openWorkspaceRelays.append(controller)
+                controller.onClose = { [weak self, weak controller] in
+                    guard let self, let controller else { return }
+                    self.openWorkspaceRelays.removeAll { $0 === controller }
+                    self.postRelaysChanged()
+                }
+                controller.show()
+                self.postRelaysChanged()
+            }
+        }
+    }
+
+    private func promptForWorkspaceSelection(
+        from workspaces: [Termmesh_Peer_V1_Workspace]
+    ) -> Termmesh_Peer_V1_Workspace? {
+        let alert = NSAlert()
+        alert.messageText = "Choose a workspace"
+        alert.informativeText = "Host has \(workspaces.count) workspaces. The chosen one will open in a single window with its host split layout."
+
+        let popup = NSPopUpButton(
+            frame: NSRect(x: 0, y: 0, width: 360, height: 26),
+            pullsDown: false
+        )
+        for w in workspaces {
+            let title = w.title.isEmpty ? "<untitled>" : w.title
+            let count = countLeaves(w.layout)
+            let idHex = w.workspaceID.prefix(4).map { String(format: "%02x", $0) }.joined()
+            let item = NSMenuItem(title: "\(title)  ·  \(count) panes  [\(idHex)]",
+                                  action: nil, keyEquivalent: "")
+            popup.menu?.addItem(item)
+        }
+        alert.accessoryView = popup
+        alert.addButton(withTitle: "Open")
+        alert.addButton(withTitle: "Cancel")
+
+        guard alert.runModal() == .alertFirstButtonReturn else { return nil }
+        let idx = popup.indexOfSelectedItem
+        guard idx >= 0, idx < workspaces.count else { return nil }
+        return workspaces[idx]
+    }
+
+    private func countLeaves(_ layout: Termmesh_Peer_V1_WorkspaceLayout) -> Int {
+        switch layout.node {
+        case .pane: return 1
+        case .split(let s): return countLeaves(s.first) + countLeaves(s.second)
+        case .none: return 0
+        }
+    }
+
+    @objc func promptAndRunRelay(_ sender: Any?) {
+        let alert = NSAlert()
+        alert.messageText = "Connect to Peer via Ghostty Relay"
+        alert.informativeText = "Path to a Swift peer server socket (e.g. TERMMESH_DEBUG_PEER_SERVER_PATH).\nOpens remote pane in a real Ghostty surface."
+
+        let input = NSTextField(frame: NSRect(x: 0, y: 0, width: 360, height: 24))
+        input.stringValue = ProcessInfo.processInfo.environment["TERMMESH_DEBUG_PEER_SERVER_PATH"]
+            ?? PeerFederationSettings.socketPath
+        alert.accessoryView = input
+        alert.addButton(withTitle: "Connect")
+        alert.addButton(withTitle: "Cancel")
+
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        let path = input.stringValue.trimmingCharacters(in: .whitespaces)
+        guard !path.isEmpty else { return }
+
+        Task {
+            let connection: PeerRelayConnection
+            do {
+                connection = try await PeerRelaySession.connectAndList(hostSockPath: path)
+            } catch {
+                await MainActor.run {
+                    self.showAlert(title: "Peer Relay Failed", body: String(describing: error))
+                }
+                return
+            }
+
+            // Pick a surface — auto-skip the dialog when there's nothing
+            // to choose between.
+            let attachable = connection.surfaces.filter { $0.attachable }
+            let pickFrom = attachable.isEmpty ? connection.surfaces : attachable
+            guard !pickFrom.isEmpty else {
+                await connection.cancel()
+                await MainActor.run {
+                    self.showAlert(title: "Peer Relay Failed",
+                                   body: "Host has no surfaces to attach to.")
+                }
+                return
+            }
+
+            let chosen: Termmesh_Peer_V1_SurfaceInfo?
+            if pickFrom.count == 1 {
+                chosen = pickFrom[0]
+            } else {
+                chosen = await MainActor.run {
+                    self.promptForSurfaceSelection(from: pickFrom)
+                }
+            }
+            guard let chosen else {
+                await connection.cancel()
+                return
+            }
+
+            do {
+                let session = try await PeerRelaySession.attach(connection, surface: chosen)
+                try session.prepareListener()
+                await MainActor.run {
+                    let controller = PeerRelayWindowController(session: session)
+                    self.openRelays.append(controller)
+                    controller.onClose = { [weak self, weak controller] in
+                        guard let self, let controller else { return }
+                        self.openRelays.removeAll { $0 === controller }
+                    }
+                    controller.show()
+                }
+            } catch {
+                await connection.cancel()
+                await MainActor.run {
+                    self.showAlert(title: "Peer Relay Failed", body: String(describing: error))
+                }
+            }
+        }
+    }
+
+    /// Show an NSAlert with an NSPopUpButton listing the available
+    /// surfaces. Returns the user's pick, or nil if Cancel was clicked.
+    private func promptForSurfaceSelection(
+        from surfaces: [Termmesh_Peer_V1_SurfaceInfo]
+    ) -> Termmesh_Peer_V1_SurfaceInfo? {
+        let alert = NSAlert()
+        alert.messageText = "Choose a remote surface"
+        alert.informativeText = "Host exposes \(surfaces.count) surfaces. Pick which one this relay window should mirror."
+
+        let popup = NSPopUpButton(
+            frame: NSRect(x: 0, y: 0, width: 360, height: 26),
+            pullsDown: false
+        )
+        // NSPopUpButton dedupes items by visible title — when the host
+        // has multiple panes with the same title/cwd (e.g. four splits
+        // in the same workspace), they collapse into one entry. Stamp a
+        // short surfaceID prefix on every label and add NSMenuItem
+        // directly (rather than addItem(withTitle:)) so each row stays
+        // distinct.
+        for s in surfaces {
+            let title = s.title.isEmpty ? "<untitled>" : s.title
+            let detail = s.cwd.isEmpty ? "" : "  ·  \(s.cwd)"
+            let dims = "  (\(s.cols)×\(s.rows))"
+            let idHex = s.surfaceID.prefix(4).map { String(format: "%02x", $0) }.joined()
+            let display = "\(title)\(detail)\(dims)  [\(idHex)]"
+            let item = NSMenuItem(title: display, action: nil, keyEquivalent: "")
+            popup.menu?.addItem(item)
+        }
+        alert.accessoryView = popup
+        alert.addButton(withTitle: "Open")
+        alert.addButton(withTitle: "Cancel")
+
+        guard alert.runModal() == .alertFirstButtonReturn else { return nil }
+        let idx = popup.indexOfSelectedItem
+        guard idx >= 0, idx < surfaces.count else { return nil }
+        return surfaces[idx]
+    }
+
+    @objc func promptAndRun(_ sender: Any?) {
+        let alert = NSAlert()
+        alert.messageText = "Connect to peer socket"
+        alert.informativeText = "Path to a term-meshd peer socket (see TERMMESH_PEER_SOCKET)."
+
+        let input = NSTextField(frame: NSRect(x: 0, y: 0, width: 360, height: 24))
+        input.stringValue = defaultSocketPath()
+        input.placeholderString = "/tmp/termmesh-peer.sock"
+        alert.accessoryView = input
+        alert.addButton(withTitle: "Connect")
+        alert.addButton(withTitle: "Cancel")
+
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        let path = input.stringValue.trimmingCharacters(in: .whitespaces)
+        guard !path.isEmpty else { return }
+
+        Task { await self.run(socketPath: path) }
+    }
+
+    private func run(socketPath: String) async {
+        do {
+            let transport = try await UnixSocketTransport.connect(socketPath: socketPath)
+            let session = PeerSession(
+                read: { try await transport.read() },
+                write: { try await transport.write($0) }
+            )
+            let info = try await session.handshake()
+            let surfaces = try await session.listSurfaces()
+            guard let chosen = surfaces.first(where: { $0.attachable }) ?? surfaces.first else {
+                await transport.close()
+                showAlert(title: "No surfaces on host", body: "\(info.hostDisplayName) reports no exposable surfaces.")
+                return
+            }
+
+            let outcome = try await session.attachSurface(
+                id: chosen.surfaceID,
+                mode: .coWrite,
+                cols: 80,
+                rows: 24
+            )
+
+            let controller = PeerConsoleWindowController(
+                hostName: info.hostDisplayName,
+                surfaceTitle: chosen.title,
+                surfaceID: outcome.surfaceID,
+                session: session,
+                transport: transport
+            )
+            openConsoles.append(controller)
+            controller.onClose = { [weak self] in
+                guard let self else { return }
+                self.openConsoles.removeAll { $0 === controller }
+            }
+            controller.show()
+        } catch {
+            showAlert(title: "Peer connection failed", body: String(describing: error))
+        }
+    }
+
+    private func showAlert(title: String, body: String) {
+        let alert = NSAlert()
+        alert.messageText = title
+        alert.informativeText = body
+        alert.alertStyle = .informational
+        alert.addButton(withTitle: "OK")
+        _ = alert.runModal()
+    }
+
+    private func defaultSocketPath() -> String {
+        if let env = ProcessInfo.processInfo.environment["TERMMESH_PEER_SOCKET"],
+           !env.isEmpty
+        {
+            return env
+        }
+        return "/tmp/termmesh-peer.sock"
+    }
+}
+
+@MainActor
+final class PeerConsoleWindowController: NSWindowController, NSWindowDelegate {
+    private let surfaceID: Data
+    private let session: PeerSession
+    private let transport: UnixSocketTransport
+    private let outputView: NSTextView
+    private let inputField: NSTextField
+    private var readerTask: Task<Void, Never>?
+    private var isClosing = false
+
+    var onClose: (@MainActor () -> Void)?
+
+    init(
+        hostName: String,
+        surfaceTitle: String,
+        surfaceID: Data,
+        session: PeerSession,
+        transport: UnixSocketTransport
+    ) {
+        self.surfaceID = surfaceID
+        self.session = session
+        self.transport = transport
+
+        let outputView = Self.makeOutputView()
+        let inputField = Self.makeInputField()
+        self.outputView = outputView
+        self.inputField = inputField
+
+        let scroll = NSScrollView()
+        scroll.hasVerticalScroller = true
+        scroll.hasHorizontalScroller = false
+        scroll.documentView = outputView
+        scroll.translatesAutoresizingMaskIntoConstraints = false
+
+        let root = NSView()
+        root.translatesAutoresizingMaskIntoConstraints = false
+        root.addSubview(scroll)
+        root.addSubview(inputField)
+        NSLayoutConstraint.activate([
+            scroll.topAnchor.constraint(equalTo: root.topAnchor),
+            scroll.leadingAnchor.constraint(equalTo: root.leadingAnchor),
+            scroll.trailingAnchor.constraint(equalTo: root.trailingAnchor),
+            scroll.bottomAnchor.constraint(equalTo: inputField.topAnchor, constant: -8),
+            inputField.leadingAnchor.constraint(equalTo: root.leadingAnchor, constant: 8),
+            inputField.trailingAnchor.constraint(equalTo: root.trailingAnchor, constant: -8),
+            inputField.bottomAnchor.constraint(equalTo: root.bottomAnchor, constant: -8),
+        ])
+
+        let window = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 720, height: 480),
+            styleMask: [.titled, .closable, .resizable, .miniaturizable],
+            backing: .buffered,
+            defer: false
+        )
+        window.title = "\(hostName) · \(surfaceTitle)  [peer-debug]"
+        window.contentView = root
+        window.center()
+
+        super.init(window: window)
+        window.delegate = self
+
+        inputField.target = self
+        inputField.action = #selector(sendInputLine(_:))
+    }
+
+    required init?(coder: NSCoder) { fatalError("init(coder:) not used") }
+
+    func show() {
+        window?.makeKeyAndOrderFront(nil)
+        inputField.window?.makeFirstResponder(inputField)
+        startReader()
+        appendText("[connected]\n")
+    }
+
+    private func startReader() {
+        readerTask = Task { [weak self] in
+            guard let self else { return }
+            while !Task.isCancelled {
+                let msg: PeerIncomingMessage
+                do {
+                    msg = try await self.session.receiveNextMessage()
+                } catch {
+                    await self.handleStreamError(error)
+                    return
+                }
+                await self.handle(msg)
+                if case .goodbye = msg { return }
+            }
+        }
+    }
+
+    private func handle(_ msg: PeerIncomingMessage) {
+        switch msg {
+        case .ptyData(_, _, let payload):
+            append(payload)
+        case .workspaceMeta(let cwd, let branch, _, _):
+            appendText("[workspace: cwd=\(cwd)\(branch.isEmpty ? "" : " @\(branch)")]\n")
+        case .error(let code, let message):
+            appendText("\n[peer error \(code)] \(message)\n")
+        case .goodbye(let reason):
+            appendText("\n[host goodbye: \(reason)]\n")
+            closeWindow()
+        default:
+            break
+        }
+    }
+
+    private func handleStreamError(_ error: Error) {
+        appendText("\n[stream error] \(error)\n")
+        closeWindow()
+    }
+
+    private func append(_ data: Data) {
+        let text = String(data: data, encoding: .utf8) ?? "<binary \(data.count)B>\n"
+        appendText(text)
+    }
+
+    private func appendText(_ text: String) {
+        guard let ts = outputView.textStorage else { return }
+        let attr = NSAttributedString(
+            string: text,
+            attributes: [.foregroundColor: NSColor.textColor, .font: Self.monospaceFont]
+        )
+        ts.append(attr)
+        outputView.scrollRangeToVisible(NSRange(location: ts.length, length: 0))
+    }
+
+    @objc private func sendInputLine(_ sender: NSTextField) {
+        let line = sender.stringValue + "\n"
+        sender.stringValue = ""
+        let payload = Data(line.utf8)
+        let surfaceID = self.surfaceID
+        let session = self.session
+        Task {
+            try? await session.sendInput(surfaceID: surfaceID, keys: payload)
+        }
+    }
+
+    private func closeWindow() {
+        guard !isClosing else { return }
+        isClosing = true
+        window?.performClose(nil)
+    }
+
+    // MARK: - NSWindowDelegate
+
+    func windowWillClose(_ notification: Notification) {
+        readerTask?.cancel()
+        readerTask = nil
+        let session = self.session
+        let transport = self.transport
+        let surfaceID = self.surfaceID
+        _ = surfaceID  // silence
+        Task {
+            try? await session.sendGoodbye(reason: "debug console closed")
+            await transport.close()
+        }
+        onClose?()
+    }
+
+    // MARK: - Helpers
+
+    private static func makeOutputView() -> NSTextView {
+        let tv = NSTextView()
+        tv.isEditable = false
+        tv.isSelectable = true
+        tv.isRichText = false
+        tv.allowsUndo = false
+        tv.backgroundColor = NSColor.textBackgroundColor
+        tv.font = monospaceFont
+        tv.textContainer?.widthTracksTextView = true
+        tv.autoresizingMask = [.width]
+        return tv
+    }
+
+    private static func makeInputField() -> NSTextField {
+        let f = NSTextField()
+        f.translatesAutoresizingMaskIntoConstraints = false
+        f.placeholderString = "type here, Enter to send"
+        f.font = monospaceFont
+        f.focusRingType = .default
+        return f
+    }
+
+    private static var monospaceFont: NSFont {
+        NSFont.monospacedSystemFont(ofSize: 12, weight: .regular)
+    }
+}
+
+/// Glue between the SSH-dialog Bonjour popup (NSPopUpButton, plain
+/// NSObject target) and the surrounding text fields. Lives alongside
+/// the dialog stack and rewrites the SSH target / remote-socket
+/// fields whenever the user picks a discovered peer.
+@MainActor
+final class SSHDialogPopupProxy: NSObject {
+    private weak var popup: NSPopUpButton?
+    private weak var targetField: NSTextField?
+    private weak var remoteField: NSTextField?
+    private let peersProvider: () -> [DiscoveredPeer]
+
+    init(popup: NSPopUpButton,
+         target: NSTextField,
+         remote: NSTextField,
+         peersProvider: @escaping () -> [DiscoveredPeer]) {
+        self.popup = popup
+        self.targetField = target
+        self.remoteField = remote
+        self.peersProvider = peersProvider
+        super.init()
+    }
+
+    @objc func didPick(_ sender: NSPopUpButton) {
+        let peers = peersProvider()
+        // Index 0 is the placeholder ("pick a host…" / "no hosts");
+        // discovered entries start at 1.
+        let idx = sender.indexOfSelectedItem - 1
+        guard idx >= 0, idx < peers.count else { return }
+        let peer = peers[idx]
+        targetField?.stringValue = peer.hostname
+        if let sock = peer.socketPath, !sock.isEmpty {
+            remoteField?.stringValue = sock
+        }
+    }
+}
+
+/// Glue between the SSH-dialog "Recent" popup and the surrounding
+/// fields. `recents` is captured at construction time — we don't
+/// re-read defaults mid-modal so the menu items stay in sync with
+/// the popup's index.
+@MainActor
+final class RecentHostPopupProxy: NSObject {
+    private weak var popup: NSPopUpButton?
+    private weak var targetField: NSTextField?
+    private weak var remoteField: NSTextField?
+    private let recents: [PeerFederationSettings.RecentHost]
+
+    init(popup: NSPopUpButton,
+         target: NSTextField,
+         remote: NSTextField,
+         recents: [PeerFederationSettings.RecentHost]) {
+        self.popup = popup
+        self.targetField = target
+        self.remoteField = remote
+        self.recents = recents
+        super.init()
+    }
+
+    @objc func didPick(_ sender: NSPopUpButton) {
+        let idx = sender.indexOfSelectedItem - 1
+        guard idx >= 0, idx < recents.count else { return }
+        let entry = recents[idx]
+        targetField?.stringValue = entry.sshTarget
+        remoteField?.stringValue = entry.remoteSocket
+    }
+}

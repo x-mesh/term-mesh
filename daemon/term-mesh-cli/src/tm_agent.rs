@@ -3,6 +3,7 @@
 //! Replaces both tm-rpc (agent-side) and team.py (leader-side).
 //! ~1-3ms per call for all commands.
 
+mod peer;
 mod prompts;
 
 use clap::{Parser, Subcommand};
@@ -479,6 +480,39 @@ enum Commands {
     /// Alias: task-clear → task clear
     #[command(name = "task-clear", hide = true)]
     TaskClear2,
+
+    /// Peer-federation operations (attach to a remote term-mesh host).
+    Peer(PeerCommands),
+}
+
+#[derive(clap::Args)]
+struct PeerCommands {
+    #[command(subcommand)]
+    command: PeerCommand,
+}
+
+#[derive(Subcommand)]
+enum PeerCommand {
+    /// List the surfaces a peer-federation host exposes.
+    ///
+    /// Prints one surface per line: `<title>  <cols>x<rows>  <status>  <id>`
+    /// where status is "live" or "dead". Exits after printing.
+    List {
+        /// Path to the host's peer-federation unix socket.
+        socket: PathBuf,
+    },
+    /// Attach to a surface exposed by a peer-federation host.
+    ///
+    /// Without `--name`, attaches to the first surface listed by the host.
+    /// Stream PtyData from the host to stdout; relay stdin as Input.
+    /// Ctrl-] detaches in interactive mode; stdin EOF detaches otherwise.
+    Attach {
+        /// Path to the host's peer-federation unix socket.
+        socket: PathBuf,
+        /// Title of the surface to attach to; defaults to the first listed.
+        #[arg(long)]
+        name: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1443,6 +1477,28 @@ fn is_leap(y: u32) -> bool {
 fn main() {
     let cli = Cli::parse();
 
+    // Peer commands carry their own socket path — handle them before
+    // the daemon-socket detection that would otherwise fail when there
+    // is no running term-mesh daemon in the environment.
+    if let Commands::Peer(ref peer_cmd) = cli.command {
+        match &peer_cmd.command {
+            PeerCommand::List { socket } => {
+                if let Err(e) = peer::list_cmd(socket) {
+                    eprintln!("peer list failed: {e:#}");
+                    process::exit(1);
+                }
+                return;
+            }
+            PeerCommand::Attach { socket, name } => {
+                if let Err(e) = peer::attach_cmd(socket, name.as_deref()) {
+                    eprintln!("peer attach failed: {e:#}");
+                    process::exit(1);
+                }
+                return;
+            }
+        }
+    }
+
     let sock = match detect_socket() {
         Some(s) => s,
         None => {
@@ -1781,6 +1837,7 @@ fn main() {
         Commands::TaskClear2 => {
             rpc_call(&sock, "team.task.clear", json!({ "team_name": team }))
         }
+        Commands::Peer(_) => unreachable!("peer commands exit before detect_socket()"),
         Commands::Status => {
             // Inject version info into the team.status response JSON
             let mut status = rpc_call(&sock, "team.status", json!({ "team_name": team }))

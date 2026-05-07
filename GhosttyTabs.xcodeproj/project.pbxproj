@@ -27,6 +27,19 @@
 			CVB00015 /* TabManagerSettings.swift in Sources */ = {isa = PBXBuildFile; fileRef = CVS00015 /* TabManagerSettings.swift */; };
 			CVB00019 /* WorkspaceModels.swift in Sources */ = {isa = PBXBuildFile; fileRef = CVS00019 /* WorkspaceModels.swift */; };
 			CVB00020 /* Workspace+BonsplitDelegate.swift in Sources */ = {isa = PBXBuildFile; fileRef = CVS00020 /* Workspace+BonsplitDelegate.swift */; };
+			CVB00080 /* PeerProtoBridge.swift in Sources */ = {isa = PBXBuildFile; fileRef = CVS00080 /* PeerProtoBridge.swift */; };
+			CVB00081 /* PeerMenu.swift in Sources */ = {isa = PBXBuildFile; fileRef = CVS00081 /* PeerMenu.swift */; };
+			CVB00082 /* PeerServerHost.swift in Sources */ = {isa = PBXBuildFile; fileRef = CVS00082 /* PeerServerHost.swift */; };
+			CVB00083 /* GhosttyPaneSurfaceProvider.swift in Sources */ = {isa = PBXBuildFile; fileRef = CVS00083 /* GhosttyPaneSurfaceProvider.swift */; };
+			CVB00084 /* PeerRelaySession.swift in Sources */ = {isa = PBXBuildFile; fileRef = CVS00084 /* PeerRelaySession.swift */; };
+			CVB00085 /* PeerRelayWindowController.swift in Sources */ = {isa = PBXBuildFile; fileRef = CVS00085 /* PeerRelayWindowController.swift */; };
+			CVB00086 /* PeerRelayWorkspaceWindowController.swift in Sources */ = {isa = PBXBuildFile; fileRef = CVS00086 /* PeerRelayWorkspaceWindowController.swift */; };
+			CVB00087 /* PeerSSHTunnel.swift in Sources */ = {isa = PBXBuildFile; fileRef = CVS00087 /* PeerSSHTunnel.swift */; };
+			CVB00088 /* PeerBonjour.swift in Sources */ = {isa = PBXBuildFile; fileRef = CVS00088 /* PeerBonjour.swift */; };
+			CVB00089 /* PeerFederationSettings.swift in Sources */ = {isa = PBXBuildFile; fileRef = CVS00089 /* PeerFederationSettings.swift */; };
+			CVB00090 /* PeerRelayBanner.swift in Sources */ = {isa = PBXBuildFile; fileRef = CVS00090 /* PeerRelayBanner.swift */; };
+			CVB00091 /* PeerConnectionsWindowController.swift in Sources */ = {isa = PBXBuildFile; fileRef = CVS00091 /* PeerConnectionsWindowController.swift */; };
+			CVB00092 /* PeerRelayBannerPresenter.swift in Sources */ = {isa = PBXBuildFile; fileRef = CVS00092 /* PeerRelayBannerPresenter.swift */; };
 			CVB00027 /* AppDelegate+Shortcuts.swift in Sources */ = {isa = PBXBuildFile; fileRef = CVS00027 /* AppDelegate+Shortcuts.swift */; };
 			CVB00028 /* AppDelegate+Notifications.swift in Sources */ = {isa = PBXBuildFile; fileRef = CVS00028 /* AppDelegate+Notifications.swift */; };
 			CVB00029 /* ContentViewModels.swift in Sources */ = {isa = PBXBuildFile; fileRef = CVS00029 /* ContentViewModels.swift */; };
@@ -226,6 +239,19 @@
 			CVS00015 /* TabManagerSettings.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TabManagerSettings.swift; sourceTree = "<group>"; };
 			CVS00019 /* WorkspaceModels.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WorkspaceModels.swift; sourceTree = "<group>"; };
 			CVS00020 /* Workspace+BonsplitDelegate.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "Workspace+BonsplitDelegate.swift"; sourceTree = "<group>"; };
+			CVS00080 /* PeerProtoBridge.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PeerProtoBridge.swift; sourceTree = "<group>"; };
+			CVS00081 /* PeerMenu.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PeerMenu.swift; sourceTree = "<group>"; };
+			CVS00082 /* PeerServerHost.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PeerServerHost.swift; sourceTree = "<group>"; };
+			CVS00083 /* GhosttyPaneSurfaceProvider.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GhosttyPaneSurfaceProvider.swift; sourceTree = "<group>"; };
+			CVS00084 /* PeerRelaySession.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PeerRelaySession.swift; sourceTree = "<group>"; };
+			CVS00085 /* PeerRelayWindowController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PeerRelayWindowController.swift; sourceTree = "<group>"; };
+			CVS00086 /* PeerRelayWorkspaceWindowController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PeerRelayWorkspaceWindowController.swift; sourceTree = "<group>"; };
+			CVS00087 /* PeerSSHTunnel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PeerSSHTunnel.swift; sourceTree = "<group>"; };
+			CVS00088 /* PeerBonjour.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PeerBonjour.swift; sourceTree = "<group>"; };
+			CVS00089 /* PeerFederationSettings.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PeerFederationSettings.swift; sourceTree = "<group>"; };
+			CVS00090 /* PeerRelayBanner.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PeerRelayBanner.swift; sourceTree = "<group>"; };
+			CVS00091 /* PeerConnectionsWindowController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PeerConnectionsWindowController.swift; sourceTree = "<group>"; };
+			CVS00092 /* PeerRelayBannerPresenter.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PeerRelayBannerPresenter.swift; sourceTree = "<group>"; };
 			CVS00027 /* AppDelegate+Shortcuts.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "AppDelegate+Shortcuts.swift"; sourceTree = "<group>"; };
 			CVS00028 /* AppDelegate+Notifications.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "AppDelegate+Notifications.swift"; sourceTree = "<group>"; };
 			CVS00029 /* ContentViewModels.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ContentViewModels.swift; sourceTree = "<group>"; };
@@ -473,6 +499,19 @@
 					CVS00015 /* TabManagerSettings.swift */,
 					CVS00019 /* WorkspaceModels.swift */,
 					CVS00020 /* Workspace+BonsplitDelegate.swift */,
+					CVS00080 /* PeerProtoBridge.swift */,
+					CVS00081 /* PeerMenu.swift */,
+					CVS00082 /* PeerServerHost.swift */,
+				CVS00083 /* GhosttyPaneSurfaceProvider.swift */,
+				CVS00084 /* PeerRelaySession.swift */,
+				CVS00085 /* PeerRelayWindowController.swift */,
+				CVS00086 /* PeerRelayWorkspaceWindowController.swift */,
+				CVS00087 /* PeerSSHTunnel.swift */,
+				CVS00088 /* PeerBonjour.swift */,
+				CVS00089 /* PeerFederationSettings.swift */,
+				CVS00090 /* PeerRelayBanner.swift */,
+				CVS00091 /* PeerConnectionsWindowController.swift */,
+				CVS00092 /* PeerRelayBannerPresenter.swift */,
 					CVS00027 /* AppDelegate+Shortcuts.swift */,
 					CVS00028 /* AppDelegate+Notifications.swift */,
 					CVS00029 /* ContentViewModels.swift */,
@@ -664,6 +703,7 @@
 					A5001251 /* Sentry */,
 					A5001271 /* PostHog */,
 					A5001261 /* Bonsplit */,
+					A5001281 /* PeerProto */,
 				);
 			name = GhosttyTabs;
 			productName = GhosttyTabs;
@@ -746,6 +786,7 @@
 					A5001252 /* XCRemoteSwiftPackageReference "sentry-cocoa" */,
 					A5001272 /* XCRemoteSwiftPackageReference "posthog-ios" */,
 					A5001260 /* XCLocalSwiftPackageReference "bonsplit" */,
+					A5001280 /* XCLocalSwiftPackageReference "PeerProto" */,
 				);
 			productRefGroup = A5001042 /* Products */;
 			projectDirPath = "";
@@ -784,6 +825,19 @@
 					CVB00015 /* TabManagerSettings.swift in Sources */,
 					CVB00019 /* WorkspaceModels.swift in Sources */,
 					CVB00020 /* Workspace+BonsplitDelegate.swift in Sources */,
+					CVB00080 /* PeerProtoBridge.swift in Sources */,
+					CVB00081 /* PeerMenu.swift in Sources */,
+					CVB00082 /* PeerServerHost.swift in Sources */,
+				CVB00083 /* GhosttyPaneSurfaceProvider.swift in Sources */,
+				CVB00084 /* PeerRelaySession.swift in Sources */,
+				CVB00085 /* PeerRelayWindowController.swift in Sources */,
+				CVB00086 /* PeerRelayWorkspaceWindowController.swift in Sources */,
+				CVB00087 /* PeerSSHTunnel.swift in Sources */,
+				CVB00088 /* PeerBonjour.swift in Sources */,
+				CVB00089 /* PeerFederationSettings.swift in Sources */,
+				CVB00090 /* PeerRelayBanner.swift in Sources */,
+				CVB00091 /* PeerConnectionsWindowController.swift in Sources */,
+				CVB00092 /* PeerRelayBannerPresenter.swift in Sources */,
 					CVB00027 /* AppDelegate+Shortcuts.swift in Sources */,
 					CVB00028 /* AppDelegate+Notifications.swift in Sources */,
 					CVB00029 /* ContentViewModels.swift in Sources */,
@@ -1210,6 +1264,10 @@
 				isa = XCLocalSwiftPackageReference;
 				relativePath = vendor/bonsplit;
 			};
+			A5001280 /* XCLocalSwiftPackageReference "PeerProto" */ = {
+				isa = XCLocalSwiftPackageReference;
+				relativePath = swift/PeerProto;
+			};
 /* End XCRemoteSwiftPackageReference section */
 
 /* Begin XCSwiftPackageProductDependency section */
@@ -1232,6 +1290,11 @@
 				isa = XCSwiftPackageProductDependency;
 				package = A5001260 /* XCLocalSwiftPackageReference "bonsplit" */;
 				productName = Bonsplit;
+			};
+			A5001281 /* PeerProto */ = {
+				isa = XCSwiftPackageProductDependency;
+				package = A5001280 /* XCLocalSwiftPackageReference "PeerProto" */;
+				productName = PeerProto;
 			};
 /* End XCSwiftPackageProductDependency section */
 

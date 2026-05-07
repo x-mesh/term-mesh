@@ -1146,6 +1146,18 @@ void ghostty_inspector_metal_render(ghostty_inspector_t, void*, void*);
 bool ghostty_inspector_metal_shutdown(ghostty_inspector_t);
 #endif
 
+// PTY data tap — peer federation (term-mesh fork).
+// Registers a callback that receives every raw PTY output chunk before it
+// is parsed by the terminal emulator. The callback is invoked on the IO
+// reader thread under renderer_state.mutex and MUST be non-blocking.
+typedef void (*ghostty_surface_pty_data_cb)(void* userdata, const uint8_t* data, uintptr_t len);
+void ghostty_surface_set_pty_data_callback(
+    ghostty_surface_t,
+    ghostty_surface_pty_data_cb cb,
+    void* userdata
+);
+void ghostty_surface_clear_pty_data_callback(ghostty_surface_t);
+
 // APIs I'd like to get rid of eventually but are still needed for now.
 // Don't use these unless you know what you're doing.
 void ghostty_set_window_background_blur(ghostty_app_t, void*);

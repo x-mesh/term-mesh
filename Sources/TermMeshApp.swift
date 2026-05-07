@@ -476,7 +476,7 @@ struct TermMeshApp: App {
             }
 #endif
 
-            CommandMenu("Update Logs") {
+            CommandGroup(after: .help) {
                 Button("Copy Update Logs") {
                     appDelegate.copyUpdateLogs(nil)
                 }
@@ -521,6 +521,45 @@ struct TermMeshApp: App {
                     notificationStore.clearAll()
                 }
                 .disabled(!snapshot.hasNotifications)
+            }
+
+            CommandMenu("Peer") {
+                Menu("Host This Mac") {
+                    Button("Start Peer Server…") {
+                        PeerHostCoordinator.shared.startServer(nil)
+                    }
+                    Button("Stop Peer Server") {
+                        PeerHostCoordinator.shared.stopServer(nil)
+                    }
+                }
+
+                Divider()
+
+                Button("Connect to Peer…") {
+                    PeerClientCoordinator.shared.promptAndRun(nil)
+                }
+
+                Menu("Via Relay") {
+                    Button("Connect via Relay…") {
+                        PeerClientCoordinator.shared.promptAndRunRelay(nil)
+                    }
+                    Button("Connect to Workspace via Relay…") {
+                        PeerClientCoordinator.shared.promptAndRunRelayWorkspace(nil)
+                    }
+                    Button("Remote Workspace (SSH)…") {
+                        PeerClientCoordinator.shared.promptAndRunRelayWorkspaceSSH(nil)
+                    }
+                }
+
+                Button("Show Peer Connections…") {
+                    PeerClientCoordinator.shared.showConnections(nil)
+                }
+
+                Divider()
+
+                Button("Peer Federation Settings…") {
+                    showSettingsPanel(navigateTo: .peerFederation)
+                }
             }
 
 #if DEBUG
@@ -811,9 +850,17 @@ struct TermMeshApp: App {
         NSApp.activate(ignoringOtherApps: true)
     }
 
-    private func showSettingsPanel() {
+    private func showSettingsPanel(navigateTo section: SettingsSection? = nil) {
         SettingsWindowController.shared.show()
         NSApp.activate(ignoringOtherApps: true)
+        guard let section else { return }
+        DispatchQueue.main.async {
+            NotificationCenter.default.post(
+                name: .settingsNavigateToSection,
+                object: nil,
+                userInfo: [SettingsNavigationUserInfoKey.section: section.rawValue]
+            )
+        }
     }
 
     private func applyAppearance() {

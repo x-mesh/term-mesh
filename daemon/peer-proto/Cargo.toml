@@ -1,0 +1,16 @@
+[package]
+name = "peer-proto"
+version = "0.1.0"
+edition = "2021"
+description = "term-mesh peer federation protocol bindings (generated from proto/peer/v1/peer.proto)"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+prost = "0.13"
+bytes = "1"
+
+[build-dependencies]
+prost-build = "0.13"
+protox = "0.7"

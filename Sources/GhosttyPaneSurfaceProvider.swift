@@ -1,0 +1,825 @@
+// Phase C-3c.3.3b: bridges the app's live Ghostty terminal panes into the
+// PeerServer's PeerSurfaceProvider abstraction.
+//
+// Surface enumeration: TabManager → Workspace.panels → TerminalPanel.surface
+// (TerminalSurface) → ghostty_surface_t.
+//
+// Input forwarding: ghostty_surface_text() on MainActor.
+// Output tapping:   ghostty_surface_set_pty_data_callback() registers a C
+//                   callback that yields raw PTY bytes into an AsyncStream.
+//                   The callback is invoked on Ghostty's IO reader thread
+//                   under renderer_state.mutex, so it must be non-blocking.
+//
+// Memory contract:
+//   • attach() retains a PtyTapContext (strong ref keeps TerminalSurface alive)
+//   • detach() clears the C callback then releases the context
+//   • If the surface is freed before detach: TerminalSurface.deinit clears the
+//     C callback and then ghostty_surface_free proceeds safely; the context is
+//     released by the detach closure when the PeerServer eventually calls it.
+
+import AppKit
+import Bonsplit
+import PeerProto
+
+// MARK: - C callback (top-level; @convention(c) cannot capture)
+
+private func ptyTapCallback(
+    userdata: UnsafeMutableRawPointer?,
+    data: UnsafePointer<UInt8>?,
+    len: UInt
+) {
+    guard let userdata, let data, len > 0 else { return }
+    let hub = Unmanaged<PtyTapHub>.fromOpaque(userdata).takeUnretainedValue()
+    hub.broadcast(Data(bytes: data, count: Int(len)))
+}
+
+// MARK: - PtyTapHub
+
+/// One Ghostty PTY callback per surface, fan-out to bounded per-peer streams.
+final class PtyTapHub: @unchecked Sendable {
+    private let lock = NSLock()
+    private var continuations: [UUID: AsyncStream<Data>.Continuation] = [:]
+
+    let surfaceID: UUID
+    let surfacePtr: ghostty_surface_t
+    // Strong reference prevents TerminalSurface.deinit from running while attached.
+    let surfaceRef: TerminalSurface
+
+    init(surfaceID: UUID, surfacePtr: ghostty_surface_t, surfaceRef: TerminalSurface) {
+        self.surfaceID = surfaceID
+        self.surfacePtr = surfacePtr
+        self.surfaceRef = surfaceRef
+    }
+
+    func makeStream(initialBytes: Data?) -> (UUID, AsyncStream<Data>) {
+        let attachID = UUID()
+        let stream = AsyncStream<Data>(bufferingPolicy: .bufferingNewest(256)) { continuation in
+            lock.lock()
+            continuations[attachID] = continuation
+            lock.unlock()
+            if let initialBytes {
+                continuation.yield(initialBytes)
+            }
+        }
+        return (attachID, stream)
+    }
+
+    func broadcast(_ bytes: Data) {
+        // Yield directly under the lock — `AsyncStream.Continuation.yield`
+        // with `bufferingNewest(256)` is a non-blocking enqueue into a
+        // bounded ring buffer, so holding the lock for the duration is
+        // bounded by N × O(1) rather than waiting on consumers. Avoids
+        // the per-chunk `Array(continuations.values)` allocation that
+        // showed up on tail-following workloads (cat /dev/urandom etc.)
+        // where the PTY callback fires thousands of times per second.
+        lock.lock()
+        for continuation in continuations.values {
+            continuation.yield(bytes)
+        }
+        lock.unlock()
+    }
+
+    @discardableResult
+    func finish(attachID: UUID) -> Bool {
+        lock.lock()
+        let continuation = continuations.removeValue(forKey: attachID)
+        let isEmpty = continuations.isEmpty
+        lock.unlock()
+        continuation?.finish()
+        return isEmpty
+    }
+
+    func finishAll() {
+        lock.lock()
+        let targets = Array(continuations.values)
+        continuations.removeAll()
+        lock.unlock()
+        for continuation in targets {
+            continuation.finish()
+        }
+    }
+}
+
+// MARK: - GhosttyPaneSurfaceProvider
+
+/// PeerSurfaceProvider backed by the app's live terminal panes.
+/// Conformance to PeerSurfaceProvider (which requires Sendable) is valid
+/// because @MainActor isolation makes the class's state consistent.
+@MainActor
+final class GhosttyPaneSurfaceProvider: PeerSurfaceProvider {
+    private var tapHubs: [UUID: PtyTapHub] = [:]
+
+    // MARK: PeerSurfaceProvider
+
+    func listSurfaces() async -> [Termmesh_Peer_V1_SurfaceInfo] {
+        // Background panes have a lazy `ghostty_surface_t` — newly opened
+        // splits / non-active tabs may not have one yet. Kick lazy init
+        // for any unready pane and wait briefly so the next collect
+        // picks them up. Without this the latest split is silently
+        // dropped from the picker.
+        await MainActor.run { kickLazySurfaceStarts() }
+        for _ in 0..<10 {
+            if await MainActor.run(body: { allSurfacesReady() }) { break }
+            try? await Task.sleep(nanoseconds: 30_000_000) // 30 ms × 10 = ≤300 ms
+        }
+        return await MainActor.run { collectSurfaces() }
+    }
+
+    func listWorkspaces() async -> [Termmesh_Peer_V1_Workspace] {
+        await MainActor.run { kickLazySurfaceStarts() }
+        for _ in 0..<10 {
+            if await MainActor.run(body: { allSurfacesReady() }) { break }
+            try? await Task.sleep(nanoseconds: 30_000_000)
+        }
+        return await MainActor.run { collectWorkspaces() }
+    }
+
+    func handleWorkspaceControl(_ control: Termmesh_Peer_V1_WorkspaceControl) async {
+        await MainActor.run { applyWorkspaceControl(control) }
+    }
+
+    func attach(
+        surfaceID: Data,
+        clientCols: UInt32,
+        clientRows: UInt32
+    ) async -> PeerSurfaceAttachment? {
+        guard let (sfcPtr, ts) = findSurface(id: surfaceID)
+        else { return nil }
+
+        // Send a snapshot of the current viewport so the relay window
+        // shows existing content immediately instead of starting blank.
+        // Yielded before the callback is registered so it's guaranteed
+        // to land before any new PTY bytes. ANSI styling is lost (text
+        // only); fullscreen TUIs (vim, less, htop) won't redraw without
+        // SIGWINCH and require manual refresh.
+        let snapshot = readPaneSnapshot(sfcPtr)
+
+        let hub: PtyTapHub
+        if let existing = tapHubs[ts.id] {
+            hub = existing
+        } else {
+            hub = PtyTapHub(surfaceID: ts.id, surfacePtr: sfcPtr, surfaceRef: ts)
+            tapHubs[ts.id] = hub
+            // Register the C tap under renderer_state.mutex in Ghostty.
+            let hubPtr = Unmanaged.passUnretained(hub).toOpaque()
+            ghostty_surface_set_pty_data_callback(sfcPtr, ptyTapCallback, hubPtr)
+        }
+        let (attachID, stream) = hub.makeStream(initialBytes: snapshot)
+
+        // Light up the peer-attached ring on the host pane and bump
+        // the per-surface ref count so concurrent attaches all share
+        // a single visible ring.
+        let isFirstAttach = Self.incrementPeerAttach(for: ts)
+
+        // Phase E-6: optional Ctrl-L injection so TUIs repaint with
+        // full styling on attach. The plain-text snapshot path above
+        // restores content but loses ANSI; sending Ctrl-L makes vim /
+        // htop / less redraw correctly. Disabled by default because
+        // the redraw is visible to the host's local viewer too.
+        //
+        // Gate on the 0→1 transition: clients 2..N attaching to the
+        // same surface get the redraw bytes via the existing PTY tap
+        // (broadcast from the first attach's redraw), so emitting
+        // Ctrl-L on every attach would just stack form-feeds and
+        // multiply the host's local flicker.
+        if isFirstAttach && PeerFederationSettings.forceRedrawOnAttach {
+            // Defer briefly so the snapshot lands first; the redraw
+            // bytes that come back through the PTY tap will then
+            // cleanly overwrite it.
+            Task { @MainActor [weak ts] in
+                try? await Task.sleep(nanoseconds: 100_000_000)
+                guard let ptr = ts?.surface else { return }
+                sendPeerInputBytes(ptr, bytes: Data([0x0c]))
+            }
+        }
+
+        // Capture weak reference to TerminalSurface for input/resize closures;
+        // the strong ref lives in PtyTapContext for the lifetime of the attach.
+        let weakTS = WeakRef(ts)
+
+        let input: @Sendable (Data) async -> Void = { [weakTS] bytes in
+            await MainActor.run {
+                guard let ptr = weakTS.value?.surface else { return }
+                sendPeerInputBytes(ptr, bytes: bytes)
+            }
+        }
+
+        let detach: @Sendable () async -> Void = { [provider = WeakRef(self), weakTS, hub] in
+            await MainActor.run {
+                let hubEmpty = hub.finish(attachID: attachID)
+                if let ts = weakTS.value {
+                    GhosttyPaneSurfaceProvider.decrementPeerAttach(for: ts)
+                    if hubEmpty {
+                        if let ptr = ts.surface {
+                            ghostty_surface_clear_pty_data_callback(ptr)
+                        }
+                        provider.value?.tapHubs.removeValue(forKey: ts.id)
+                    }
+                }
+            }
+        }
+
+        let meta: PeerWorkspaceMeta? = nil
+
+        return PeerSurfaceAttachment(
+            byteStream: stream,
+            input: input,
+            resize: { [weakTS] cols, rows in
+                await MainActor.run {
+                    guard let ptr = weakTS.value?.surface else { return }
+                    // ghostty_surface_set_size takes pixel dimensions.
+                    // Use current cell size to convert cols×rows → pixels.
+                    let curSz = ghostty_surface_size(ptr)
+                    if curSz.cell_width_px > 0 && curSz.cell_height_px > 0 {
+                        let safeCols = min(cols, 1000)
+                        let safeRows = min(rows, 1000)
+                        let (w, wOverflow) = safeCols.multipliedReportingOverflow(by: UInt32(curSz.cell_width_px))
+                        let (h, hOverflow) = safeRows.multipliedReportingOverflow(by: UInt32(curSz.cell_height_px))
+                        guard !wOverflow, !hOverflow else { return }
+                        ghostty_surface_set_size(ptr, w, h)
+                    }
+                }
+            },
+            workspaceMeta: meta,
+            detach: detach
+        )
+    }
+
+    // MARK: - Workspace control dispatch
+
+    private func applyWorkspaceControl(_ control: Termmesh_Peer_V1_WorkspaceControl) {
+        switch control.kind {
+        case .splitPane(let req):
+            performSplit(paneIDBytes: req.paneID, orientationString: req.orientation)
+        case .closePane(let req):
+            performClose(paneIDBytes: req.paneID)
+        case .focusPane(let req):
+            performFocus(paneIDBytes: req.paneID)
+        case .setDivider(let req):
+            performSetDivider(splitIDBytes: req.splitID, ratio: req.ratio)
+        case .newTab(let req):
+            performNewTab(paneIDBytes: req.paneID)
+        case .activateTab(let req):
+            performActivateTab(paneIDBytes: req.paneID, surfaceIDBytes: req.surfaceID)
+        case .none:
+            break
+        }
+    }
+
+    /// Phase E-4: switch the active tab inside the bonsplit pane that
+    /// hosts `paneIDBytes` to the tab whose surface is
+    /// `surfaceIDBytes`. Both arguments are surface_ids; the pane id
+    /// is the *current* active surface used as a locator.
+    private func performActivateTab(paneIDBytes: Data, surfaceIDBytes: Data) {
+        guard let currentSurfaceUUID = uuidFromSurfaceID(paneIDBytes),
+              let workspace = workspaceContaining(panelUUID: currentSurfaceUUID),
+              let targetSurfaceUUID = uuidFromSurfaceID(surfaceIDBytes),
+              let currentTabID = workspace.surfaceIdFromPanelId(currentSurfaceUUID),
+              let targetTabID = workspace.surfaceIdFromPanelId(targetSurfaceUUID)
+        else { return }
+        let targetPaneId = workspace.bonsplitController.allPaneIds.first { paneId in
+            workspace.bonsplitController.tabs(inPane: paneId).contains { $0.id == currentTabID }
+        }
+        guard let targetPaneId,
+              workspace.bonsplitController.tabs(inPane: targetPaneId).contains(where: { $0.id == targetTabID })
+        else { return }
+        workspace.bonsplitController.selectTab(targetTabID)
+    }
+
+    private func performNewTab(paneIDBytes: Data) {
+        guard let panelUUID = uuidFromSurfaceID(paneIDBytes),
+              let workspace = workspaceContaining(panelUUID: panelUUID),
+              let tabID = workspace.surfaceIdFromPanelId(panelUUID)
+        else { return }
+        let targetPaneId = workspace.bonsplitController.allPaneIds.first { paneId in
+            workspace.bonsplitController.tabs(inPane: paneId).contains { $0.id == tabID }
+        }
+        guard let targetPaneId else { return }
+        _ = workspace.newTerminalSurface(inPane: targetPaneId, focus: true)
+    }
+
+    private func performSetDivider(splitIDBytes: Data, ratio: Double) {
+        guard let splitUUID = uuidFromSurfaceID(splitIDBytes),
+              let tabManager = AppDelegate.shared?.tabManager
+        else { return }
+        let clamped = CGFloat(max(0.05, min(0.95, ratio)))
+        for workspace in tabManager.tabs {
+            if workspace.bonsplitController.findSplit(splitUUID) {
+                workspace.bonsplitController.setDividerPosition(
+                    clamped,
+                    forSplit: splitUUID,
+                    fromExternal: false
+                )
+                return
+            }
+        }
+    }
+
+    private func performFocus(paneIDBytes: Data) {
+        guard let panelUUID = uuidFromSurfaceID(paneIDBytes),
+              let workspace = workspaceContaining(panelUUID: panelUUID),
+              let tabID = workspace.surfaceIdFromPanelId(panelUUID)
+        else { return }
+        // Drive bonsplit directly. The full `Workspace.focusPanel`
+        // path also calls `moveFocus` which ends up running
+        // `window.makeKeyAndOrderFront` on the host's main term-mesh
+        // window — that yanks the user's keyboard focus out of the
+        // peer relay window every time they click a pane in it.
+        let targetPaneId = workspace.bonsplitController.allPaneIds.first { paneId in
+            workspace.bonsplitController.tabs(inPane: paneId).contains { $0.id == tabID }
+        }
+        guard let targetPaneId else { return }
+        workspace.bonsplitController.focusPane(targetPaneId)
+        workspace.bonsplitController.selectTab(tabID)
+    }
+
+    private func performSplit(paneIDBytes: Data, orientationString: String) {
+        guard let panelUUID = uuidFromSurfaceID(paneIDBytes),
+              let workspace = workspaceContaining(panelUUID: panelUUID)
+        else { return }
+        let orientation: SplitOrientation = (orientationString == "vertical") ? .vertical : .horizontal
+        _ = workspace.newTerminalSplit(from: panelUUID, orientation: orientation)
+    }
+
+    private func performClose(paneIDBytes: Data) {
+        guard let panelUUID = uuidFromSurfaceID(paneIDBytes),
+              let workspace = workspaceContaining(panelUUID: panelUUID),
+              let panel = workspace.panels[panelUUID]
+        else { return }
+        // Use bonsplit's pane-id derivation: find the pane that holds
+        // the tab whose ID matches this terminal surface, then close it.
+        if let tabID = workspace.surfaceIdFromPanelId(panelUUID) {
+            for paneId in workspace.bonsplitController.allPaneIds {
+                let tabs = workspace.bonsplitController.tabs(inPane: paneId)
+                if tabs.contains(where: { $0.id == tabID }) {
+                    _ = workspace.bonsplitController.closeTab(tabID, inPane: paneId)
+                    return
+                }
+            }
+        }
+        _ = panel  // silence unused
+    }
+
+    private func uuidFromSurfaceID(_ data: Data) -> UUID? {
+        guard data.count == 16 else { return nil }
+        let bytes = [UInt8](data)
+        return UUID(uuid: (
+            bytes[0], bytes[1], bytes[2], bytes[3],
+            bytes[4], bytes[5], bytes[6], bytes[7],
+            bytes[8], bytes[9], bytes[10], bytes[11],
+            bytes[12], bytes[13], bytes[14], bytes[15]
+        ))
+    }
+
+    private func workspaceContaining(panelUUID: UUID) -> Workspace? {
+        guard let tabManager = AppDelegate.shared?.tabManager else { return nil }
+        for workspace in tabManager.tabs {
+            if workspace.panels[panelUUID] != nil {
+                return workspace
+            }
+        }
+        return nil
+    }
+
+    // MARK: - Peer attach indicator
+
+    /// Per-surface attach counter. Lives on the @MainActor-isolated
+    /// type so reads/writes serialize with the rest of provider state.
+    private static var peerAttachCounts: [UUID: Int] = [:]
+
+    /// Bump the attach counter and update the teal ring + count
+    /// badge. Returns `true` when this attach transitioned the surface
+    /// from 0 → 1 — i.e. it's the first peer attaching, used by the
+    /// caller to decide whether to inject Ctrl-L for TUI redraw.
+    @discardableResult
+    static func incrementPeerAttach(for ts: TerminalSurface) -> Bool {
+        let prev = peerAttachCounts[ts.id] ?? 0
+        let next = prev + 1
+        peerAttachCounts[ts.id] = next
+        ts.hostedView.setPeerRing(visible: true, count: next)
+        return prev == 0
+    }
+
+    static func decrementPeerAttach(for ts: TerminalSurface) {
+        let prev = peerAttachCounts[ts.id] ?? 0
+        let next = max(0, prev - 1)
+        if next == 0 {
+            peerAttachCounts.removeValue(forKey: ts.id)
+            ts.hostedView.setPeerRing(visible: false, count: 0)
+        } else {
+            peerAttachCounts[ts.id] = next
+            ts.hostedView.setPeerRing(visible: true, count: next)
+        }
+    }
+
+    // MARK: - Private helpers
+
+    /// Wake up any pane whose `ghostty_surface_t` hasn't been created
+    /// yet (newly opened splits, background tabs). Non-blocking — caller
+    /// polls `allSurfacesReady` to know when init has settled.
+    private func kickLazySurfaceStarts() {
+        guard let tabManager = AppDelegate.shared?.tabManager else { return }
+        for workspace in tabManager.tabs {
+            for (_, panel) in workspace.panels {
+                guard let terminal = panel as? TerminalPanel else { continue }
+                let ts = terminal.surface
+                if ts.surface == nil {
+                    ts.requestBackgroundSurfaceStartIfNeeded()
+                }
+            }
+        }
+    }
+
+    /// True when every terminal pane has a non-nil `ghostty_surface_t`.
+    private func allSurfacesReady() -> Bool {
+        guard let tabManager = AppDelegate.shared?.tabManager else { return true }
+        for workspace in tabManager.tabs {
+            for (_, panel) in workspace.panels {
+                guard let terminal = panel as? TerminalPanel else { continue }
+                if terminal.surface.surface == nil { return false }
+            }
+        }
+        return true
+    }
+
+    private func collectWorkspaces() -> [Termmesh_Peer_V1_Workspace] {
+        guard let tabManager = AppDelegate.shared?.tabManager else { return [] }
+        var result: [Termmesh_Peer_V1_Workspace] = []
+        for workspace in tabManager.tabs {
+            let tree = workspace.bonsplitController.treeSnapshot()
+            guard let layout = translateBonsplitNode(tree, workspace: workspace) else {
+                continue
+            }
+            var ws = Termmesh_Peer_V1_Workspace()
+            ws.workspaceID = withUnsafeBytes(of: workspace.id.uuid) { Data($0) }
+            ws.title = workspace.customTitle ?? workspace.title
+            ws.layout = layout
+            result.append(ws)
+        }
+        return result
+    }
+
+    /// Walk a bonsplit `ExternalTreeNode` and produce the corresponding
+    /// `WorkspaceLayout` proto. Pane leaves are dereferenced via
+    /// `workspace.surfaceIdToPanelId` to find the underlying
+    /// TerminalSurface ID — that's the value clients use for
+    /// AttachSurface. Non-terminal panes (browsers, panes whose
+    /// surface hasn't materialised yet) are dropped; if both children
+    /// of a split drop, the split itself is folded out.
+    private func translateBonsplitNode(
+        _ node: ExternalTreeNode,
+        workspace: Workspace
+    ) -> Termmesh_Peer_V1_WorkspaceLayout? {
+        switch node {
+        case .pane(let pane):
+            guard let selectedTabIDStr = pane.selectedTabId ?? pane.tabs.first?.id,
+                  let tabUUID = UUID(uuidString: selectedTabIDStr),
+                  let panelUUID = workspace.surfaceIdToPanelId[TabID(uuid: tabUUID)],
+                  let terminal = workspace.panels[panelUUID] as? TerminalPanel,
+                  let sfcPtr = terminal.surface.surface
+            else { return nil }
+            let ts = terminal.surface
+            var paneMsg = Termmesh_Peer_V1_WorkspacePane()
+            paneMsg.surfaceID = surfaceIDBytes(ts.id)
+            paneMsg.title = workspace.panelTitles[terminal.id] ?? "Terminal"
+            let sz = ghostty_surface_size(sfcPtr)
+            paneMsg.cols = UInt32(sz.columns)
+            paneMsg.rows = UInt32(sz.rows)
+            if let cwd = workspace.panelDirectories[terminal.id] {
+                paneMsg.cwd = cwd
+            }
+            // Phase E-4: include every tab in this bonsplit pane so
+            // the relay window can render a tab strip and let the user
+            // switch the active tab via WorkspaceControl.activate_tab.
+            paneMsg.tabs = pane.tabs.compactMap { tab -> Termmesh_Peer_V1_PaneTab? in
+                guard let tUUID = UUID(uuidString: tab.id),
+                      let pUUID = workspace.surfaceIdToPanelId[TabID(uuid: tUUID)],
+                      let term = workspace.panels[pUUID] as? TerminalPanel,
+                      term.surface.surface != nil
+                else { return nil }
+                var t = Termmesh_Peer_V1_PaneTab()
+                t.surfaceID = surfaceIDBytes(term.surface.id)
+                t.title = workspace.panelTitles[term.id] ?? "Terminal"
+                return t
+            }
+            var layout = Termmesh_Peer_V1_WorkspaceLayout()
+            layout.pane = paneMsg
+            return layout
+
+        case .split(let split):
+            let firstChild = translateBonsplitNode(split.first, workspace: workspace)
+            let secondChild = translateBonsplitNode(split.second, workspace: workspace)
+            // If one side has nothing attachable, fold the split out
+            // and surface only the populated child.
+            switch (firstChild, secondChild) {
+            case (nil, nil):
+                return nil
+            case (let f?, nil):
+                return f
+            case (nil, let s?):
+                return s
+            case (let f?, let s?):
+                var splitMsg = Termmesh_Peer_V1_WorkspaceSplit()
+                splitMsg.orientation = split.orientation
+                splitMsg.dividerPosition = split.dividerPosition
+                splitMsg.first = f
+                splitMsg.second = s
+                if let splitUUID = UUID(uuidString: split.id) {
+                    splitMsg.splitID = withUnsafeBytes(of: splitUUID.uuid) { Data($0) }
+                }
+                var layout = Termmesh_Peer_V1_WorkspaceLayout()
+                layout.split = splitMsg
+                return layout
+            }
+        }
+    }
+
+    private func collectSurfaces() -> [Termmesh_Peer_V1_SurfaceInfo] {
+        guard let tabManager = AppDelegate.shared?.tabManager else { return [] }
+        var result: [Termmesh_Peer_V1_SurfaceInfo] = []
+        for workspace in tabManager.tabs {
+            for (_, panel) in workspace.panels {
+                guard let terminal = panel as? TerminalPanel else { continue }
+                let ts = terminal.surface
+                guard let sfcPtr = ts.surface else { continue }
+                var info = Termmesh_Peer_V1_SurfaceInfo()
+                info.surfaceID = surfaceIDBytes(ts.id)
+                info.title = workspace.panelTitles[terminal.id] ?? "Terminal"
+                info.surfaceType = "terminal"
+                info.attachable = true
+                let sz = ghostty_surface_size(sfcPtr)
+                info.cols = UInt32(sz.columns)
+                info.rows = UInt32(sz.rows)
+                if let cwd = workspace.panelDirectories[terminal.id] {
+                    info.cwd = cwd
+                }
+                result.append(info)
+            }
+        }
+        return result
+    }
+
+    private func findSurface(id: Data) -> (ghostty_surface_t, TerminalSurface)? {
+        guard let tabManager = AppDelegate.shared?.tabManager else { return nil }
+        for workspace in tabManager.tabs {
+            for (_, panel) in workspace.panels {
+                guard let terminal = panel as? TerminalPanel else { continue }
+                let ts = terminal.surface
+                guard surfaceIDBytes(ts.id) == id else { continue }
+                guard let ptr = ts.surface else { continue }
+                return (ptr, ts)
+            }
+        }
+        return nil
+    }
+}
+
+// MARK: - Helpers
+
+/// Route peer Input bytes into Ghostty as key events.
+///
+/// All bytes flow through `ghostty_surface_key()`; we deliberately avoid
+/// `ghostty_surface_text()` because that path wraps content in bracketed
+/// paste markers which (a) breaks Enter / Tab / Ctrl-C semantics in
+/// readline-style shells and (b) eats some control bytes before they
+/// reach the PTY. Mirroring `GhosttyTerminalView.sendSocketStyleText`:
+///
+/// - Enter (CR/LF), Tab, Backspace, Escape       → key event with keycode
+/// - 3-byte CSI arrow sequences (`\x1b[A/B/C/D`) → arrow key event
+/// - Ctrl-letter control bytes (0x01-0x1A)       → key event + Ctrl mod
+/// - Anything else                                → key event (keycode=0)
+///   with the Unicode scalar as text. Multi-byte UTF-8 sequences are
+///   grouped into a single scalar before dispatch.
+///
+/// LF→Return mapping is needed because the relay binary's stdin is a PTY
+/// slave with default ICRNL, so Ghostty writes CR but the relay reads
+/// LF before forwarding over the peer socket.
+@MainActor
+private func sendPeerInputBytes(_ surface: ghostty_surface_t, bytes: Data) {
+    let arr = Array(bytes)
+    var i = 0
+    while i < arr.count {
+        let byte = arr[i]
+
+        // 3-byte CSI arrow sequence comes in one frame for most TUIs.
+        if byte == 0x1b, i + 2 < arr.count, arr[i + 1] == 0x5b /* '[' */,
+           let arrowKeycode = peerArrowKeycode(arr[i + 2]) {
+            sendPeerKeyEvent(surface, keycode: arrowKeycode, text: nil)
+            i += 3
+            continue
+        }
+
+        if let mapping = peerSingleByteKeyMapping(byte) {
+            sendPeerKeyEvent(surface, keycode: mapping.keycode, text: mapping.text)
+            i += 1
+            continue
+        }
+
+        if let kc = peerCtrlLetterKeycode(byte) {
+            sendPeerCtrlLetterKey(surface, keycode: kc, byte: byte)
+            i += 1
+            continue
+        }
+
+        // Printable / UTF-8 path. Batch runs of consecutive printable
+        // bytes (no escape, no mapped single byte, no Ctrl+letter)
+        // into one ghostty_surface_key call rather than firing one
+        // event per scalar. Pasting a 10KB chunk of plain text used
+        // to walk the renderer state machine ~10000 times; with the
+        // batch path it's ~one call per `tokTypeKeyInput` frame
+        // sent by the relay.
+        let runStart = i
+        while i < arr.count {
+            let bb = arr[i]
+            if bb == 0x1b { break }
+            if peerSingleByteKeyMapping(bb) != nil { break }
+            if peerCtrlLetterKeycode(bb) != nil { break }
+            i += 1
+        }
+        if i > runStart {
+            let chunkBytes = Array(arr[runStart..<i])
+            if let str = String(bytes: chunkBytes, encoding: .utf8), !str.isEmpty {
+                sendPeerKeyEvent(surface, keycode: 0, text: str)
+            } else {
+                // UTF-8 decode failed mid-paste (rare for typed input
+                // but possible if a continuation byte was split
+                // across two protocol frames). Fall back to per-scalar
+                // best-effort recovery so partial bytes don't get
+                // silently dropped.
+                for j in runStart..<i {
+                    sendPeerKeyEvent(surface, keycode: 0, text: String(UnicodeScalar(arr[j])))
+                }
+            }
+        } else {
+            // Defensive: shouldn't happen because at least one of the
+            // earlier branches would have matched. Avoid an infinite
+            // loop on a degenerate byte by advancing one position.
+            i += 1
+        }
+    }
+}
+
+/// Special single bytes that map to a named macOS keycode.
+private func peerSingleByteKeyMapping(_ byte: UInt8) -> (keycode: UInt32, text: String)? {
+    switch byte {
+    case 0x0d, 0x0a: return (36, "\r")          // kVK_Return
+    case 0x09:        return (0x30, "\t")        // kVK_Tab
+    case 0x7f, 0x08:  return (0x33, "\u{7f}")    // kVK_Delete (Backspace)
+    case 0x1b:        return (0x35, "\u{1b}")    // kVK_Escape
+    default:          return nil
+    }
+}
+
+/// Map a Ctrl+letter control byte (0x01-0x1A, excluding bytes already
+/// claimed by `peerSingleByteKeyMapping`) to its `kVK_ANSI_*` keycode.
+private func peerCtrlLetterKeycode(_ byte: UInt8) -> UInt32? {
+    switch byte {
+    case 0x01: return 0x00 // Ctrl-A → kVK_ANSI_A
+    case 0x02: return 0x0B // Ctrl-B → kVK_ANSI_B
+    case 0x03: return 0x08 // Ctrl-C → kVK_ANSI_C
+    case 0x04: return 0x02 // Ctrl-D → kVK_ANSI_D
+    case 0x05: return 0x0E // Ctrl-E → kVK_ANSI_E
+    case 0x06: return 0x03 // Ctrl-F → kVK_ANSI_F
+    case 0x07: return 0x05 // Ctrl-G → kVK_ANSI_G
+    // 0x08 BS, 0x09 Tab, 0x0a LF — handled above
+    case 0x0B: return 0x28 // Ctrl-K → kVK_ANSI_K
+    case 0x0C: return 0x25 // Ctrl-L → kVK_ANSI_L
+    // 0x0d CR — handled above
+    case 0x0E: return 0x2D // Ctrl-N → kVK_ANSI_N
+    case 0x0F: return 0x1F // Ctrl-O → kVK_ANSI_O
+    case 0x10: return 0x23 // Ctrl-P → kVK_ANSI_P
+    case 0x11: return 0x0C // Ctrl-Q → kVK_ANSI_Q
+    case 0x12: return 0x0F // Ctrl-R → kVK_ANSI_R
+    case 0x13: return 0x01 // Ctrl-S → kVK_ANSI_S
+    case 0x14: return 0x11 // Ctrl-T → kVK_ANSI_T
+    case 0x15: return 0x20 // Ctrl-U → kVK_ANSI_U
+    case 0x16: return 0x09 // Ctrl-V → kVK_ANSI_V
+    case 0x17: return 0x0D // Ctrl-W → kVK_ANSI_W
+    case 0x18: return 0x07 // Ctrl-X → kVK_ANSI_X
+    case 0x19: return 0x10 // Ctrl-Y → kVK_ANSI_Y
+    case 0x1A: return 0x06 // Ctrl-Z → kVK_ANSI_Z
+    // 0x1b Esc — handled above
+    default:   return nil
+    }
+}
+
+/// Map the third byte of a `\x1b[?` CSI sequence to its arrow keycode.
+private func peerArrowKeycode(_ byte: UInt8) -> UInt32? {
+    switch byte {
+    case 0x41: return 0x7e // 'A' → kVK_UpArrow
+    case 0x42: return 0x7d // 'B' → kVK_DownArrow
+    case 0x43: return 0x7c // 'C' → kVK_RightArrow
+    case 0x44: return 0x7b // 'D' → kVK_LeftArrow
+    default:   return nil
+    }
+}
+
+/// Number of bytes in the UTF-8 sequence whose lead byte is `byte`.
+/// Returns 1 for ASCII and for stray continuation bytes.
+private func peerUtf8Len(_ byte: UInt8) -> Int {
+    if byte < 0x80 { return 1 }
+    if byte < 0xC0 { return 1 }
+    if byte < 0xE0 { return 2 }
+    if byte < 0xF0 { return 3 }
+    return 4
+}
+
+@MainActor
+private func sendPeerKeyEvent(_ surface: ghostty_surface_t, keycode: UInt32, text: String?) {
+    var keyEvent = ghostty_input_key_s()
+    keyEvent.action = GHOSTTY_ACTION_PRESS
+    keyEvent.keycode = keycode
+    keyEvent.mods = GHOSTTY_MODS_NONE
+    keyEvent.consumed_mods = GHOSTTY_MODS_NONE
+    keyEvent.unshifted_codepoint = 0
+    keyEvent.composing = false
+    if let text {
+        text.withCString { ptr in
+            keyEvent.text = ptr
+            _ = ghostty_surface_key(surface, keyEvent)
+        }
+    } else {
+        keyEvent.text = nil
+        _ = ghostty_surface_key(surface, keyEvent)
+    }
+    keyEvent.action = GHOSTTY_ACTION_RELEASE
+    keyEvent.text = nil
+    _ = ghostty_surface_key(surface, keyEvent)
+}
+
+@MainActor
+private func sendPeerCtrlLetterKey(_ surface: ghostty_surface_t, keycode: UInt32, byte: UInt8) {
+    // Don't send text for Ctrl+key combos — keycode + mods +
+    // unshifted_codepoint are enough for Ghostty's KeyEncoder. Adding
+    // the raw control byte as text triggers Kitty-protocol double
+    // encoding that leaks CSI-u sequences (e.g. "9;5u") as visible
+    // text. Mirrors the de5df7d fix in GhosttyTerminalView's Ctrl
+    // fast path.
+    var keyEvent = ghostty_input_key_s()
+    keyEvent.action = GHOSTTY_ACTION_PRESS
+    keyEvent.keycode = keycode
+    keyEvent.mods = GHOSTTY_MODS_CTRL
+    keyEvent.consumed_mods = GHOSTTY_MODS_NONE
+    keyEvent.unshifted_codepoint = UInt32(byte) + 0x60 // 0x03 → 'c'
+    keyEvent.composing = false
+    keyEvent.text = nil
+    _ = ghostty_surface_key(surface, keyEvent)
+
+    keyEvent.action = GHOSTTY_ACTION_RELEASE
+    _ = ghostty_surface_key(surface, keyEvent)
+}
+
+/// Read the current viewport text via ghostty_surface_read_text and
+/// wrap it in an ANSI clear+home prefix so the attaching client sees
+/// the host's current screen instead of a blank canvas.
+@MainActor
+private func readPaneSnapshot(_ surface: ghostty_surface_t) -> Data? {
+    let topLeft = ghostty_point_s(
+        tag: GHOSTTY_POINT_VIEWPORT,
+        coord: GHOSTTY_POINT_COORD_TOP_LEFT,
+        x: 0, y: 0
+    )
+    let bottomRight = ghostty_point_s(
+        tag: GHOSTTY_POINT_VIEWPORT,
+        coord: GHOSTTY_POINT_COORD_BOTTOM_RIGHT,
+        x: 0, y: 0
+    )
+    let selection = ghostty_selection_s(
+        top_left: topLeft,
+        bottom_right: bottomRight,
+        rectangle: true
+    )
+    var out = ghostty_text_s()
+    guard ghostty_surface_read_text(surface, selection, &out) else { return nil }
+    defer { ghostty_surface_free_text(surface, &out) }
+    guard let ptr = out.text, out.text_len > 0 else { return nil }
+
+    let raw = Data(bytes: ptr, count: Int(out.text_len))
+    // Convert bare LFs to CR+LF so each line lands on column 0 in the
+    // remote terminal emulator. Already-CRLF input is left untouched.
+    var body = Data()
+    body.reserveCapacity(raw.count + 16)
+    var prev: UInt8 = 0
+    for b in raw {
+        if b == 0x0a && prev != 0x0d {
+            body.append(0x0d)
+        }
+        body.append(b)
+        prev = b
+    }
+
+    var snapshot = Data()
+    snapshot.append(contentsOf: [0x1b, 0x5b, 0x32, 0x4a]) // ESC [ 2 J — clear screen
+    snapshot.append(contentsOf: [0x1b, 0x5b, 0x48])       // ESC [ H   — cursor home
+    snapshot.append(body)
+    return snapshot
+}
+
+private func surfaceIDBytes(_ id: UUID) -> Data {
+    withUnsafeBytes(of: id.uuid) { Data($0) }
+}
+
+private final class WeakRef<T: AnyObject>: @unchecked Sendable {
+    weak var value: T?
+    init(_ value: T) { self.value = value }
+}
