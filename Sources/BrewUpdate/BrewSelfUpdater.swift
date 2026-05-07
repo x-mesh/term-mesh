@@ -93,6 +93,7 @@ final class BrewSelfUpdater {
     private var startWorkItem: DispatchWorkItem?
     private var isRunningCheck = false
     private var isRunningRefresh = false
+    private var isRunningFetch = false
     private let pathMonitor = NWPathMonitor()
     private var isOnline = true
     /// Cached brew binary path captured once at init; reused on background tasks
@@ -211,15 +212,64 @@ final class BrewSelfUpdater {
         switch result {
         case .success(let info):
             if let info {
+                // Skip re-fetch if the version we already prepared matches.
+                if case let .readyToInstall(_, latest) = viewModel.state, latest == info.latest {
+                    UpdateLogStore.shared.append("brew self-update: still ready to install \(info.latest)")
+                    return
+                }
+                if case let .downloading(_, latest, _) = viewModel.state, latest == info.latest {
+                    return
+                }
                 viewModel.update(state: .outdated(installed: info.installed, latest: info.latest))
                 UpdateLogStore.shared.append("brew self-update: outdated installed=\(info.installed) latest=\(info.latest)")
+                triggerFetchIfNeeded(info: info)
             } else {
                 viewModel.update(state: .upToDate)
                 UpdateLogStore.shared.append("brew self-update: up-to-date")
             }
         case .failure(let err):
+            // Don't clobber readyToInstall on a transient outdated-check failure.
+            if case .readyToInstall = viewModel.state {
+                UpdateLogStore.shared.append("brew self-update: outdated check failed but keeping readyToInstall — \(err.message)")
+                return
+            }
             viewModel.update(state: .error(message: err.message))
             UpdateLogStore.shared.append("brew self-update: outdated check failed — \(err.message)")
+        }
+    }
+
+    // MARK: - Fetch
+
+    private func triggerFetchIfNeeded(info: BrewOutdatedInfo) {
+        guard !isRunningFetch else { return }
+        guard isOnline else {
+            UpdateLogStore.shared.append("brew self-update: skipping fetch — offline")
+            return
+        }
+        guard let brew = cachedBrewPath else { return }
+        isRunningFetch = true
+        viewModel.update(state: .downloading(installed: info.installed, latest: info.latest, message: "Downloading update…"))
+        UpdateLogStore.shared.append("brew self-update: fetching cask \(caskToken) for \(info.latest)")
+        let cask = caskToken
+        let started = Date()
+        Task.detached(priority: .utility) { [weak self] in
+            let result = Self.runBrewFetch(brew: brew, cask: cask)
+            await self?.applyFetchResult(result, info: info, startedAt: started)
+        }
+    }
+
+    private func applyFetchResult(_ result: Result<Void, BrewRunError>,
+                                  info: BrewOutdatedInfo,
+                                  startedAt: Date) {
+        isRunningFetch = false
+        let duration = String(format: "%.1f", -startedAt.timeIntervalSinceNow)
+        switch result {
+        case .success:
+            viewModel.update(state: .readyToInstall(installed: info.installed, latest: info.latest))
+            UpdateLogStore.shared.append("brew self-update: fetch ok \(info.latest) in \(duration)s — ready to install")
+        case .failure(let err):
+            viewModel.update(state: .error(message: err.message))
+            UpdateLogStore.shared.append("brew self-update: fetch failed in \(duration)s — \(err.message)")
         }
     }
 
@@ -314,6 +364,15 @@ final class BrewSelfUpdater {
         switch runProcess(executable: brew, arguments: ["update"], timeout: 180) {
         case .success: return "exit=0"
         case .failure(let err): return err.message
+        }
+    }
+
+    /// Runs `brew fetch --cask <token>` to populate the cache without installing.
+    /// Safe to call while the app is running.
+    fileprivate nonisolated static func runBrewFetch(brew: String, cask: String) -> Result<Void, BrewRunError> {
+        switch runProcess(executable: brew, arguments: ["fetch", "--cask", cask], timeout: 600) {
+        case .success: return .success(())
+        case .failure(let err): return .failure(err)
         }
     }
 
