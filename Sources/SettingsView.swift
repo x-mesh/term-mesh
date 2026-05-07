@@ -376,6 +376,12 @@ struct SettingsView: View {
         .onReceive(NotificationCenter.default.publisher(for: UserDefaults.didChangeNotification)) { _ in
             reloadWorkspaceTabColorSettings()
         }
+        .onReceive(NotificationCenter.default.publisher(for: .settingsNavigateToSection)) { output in
+            guard let raw = output.userInfo?[SettingsNavigationUserInfoKey.section] as? String,
+                  let section = SettingsSection(rawValue: raw) else { return }
+            settingsSearchQuery = ""
+            selectedSection = section
+        }
         .confirmationDialog(
             "Clear browser history?",
             isPresented: $showClearBrowserHistoryConfirmation,
@@ -3220,6 +3226,14 @@ private func parseBranchFromHead(_ content: String) -> String {
     }
     // Detached HEAD — show abbreviated hash
     return trimmed.isEmpty ? "unknown" : "detached:\(trimmed.prefix(8))"
+}
+
+enum SettingsNavigationUserInfoKey {
+    static let section = "settingsSection"
+}
+
+extension Notification.Name {
+    static let settingsNavigateToSection = Notification.Name("TermMeshSettingsNavigateToSection")
 }
 
 struct SettingsRootView: View {

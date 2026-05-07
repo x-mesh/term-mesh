@@ -523,6 +523,45 @@ struct TermMeshApp: App {
                 .disabled(!snapshot.hasNotifications)
             }
 
+            CommandMenu("Peer") {
+                Menu("Host This Mac") {
+                    Button("Start Peer Server…") {
+                        PeerServerCoordinator.shared.startServer(nil)
+                    }
+                    Button("Stop Peer Server") {
+                        PeerServerCoordinator.shared.stopServer(nil)
+                    }
+                }
+
+                Divider()
+
+                Button("Connect to Peer…") {
+                    PeerCoordinator.shared.promptAndRun(nil)
+                }
+
+                Menu("Via Relay") {
+                    Button("Connect via Relay…") {
+                        PeerCoordinator.shared.promptAndRunRelay(nil)
+                    }
+                    Button("Connect to Workspace via Relay…") {
+                        PeerCoordinator.shared.promptAndRunRelayWorkspace(nil)
+                    }
+                    Button("Remote Workspace (SSH)…") {
+                        PeerCoordinator.shared.promptAndRunRelayWorkspaceSSH(nil)
+                    }
+                }
+
+                Button("Show Peer Connections…") {
+                    PeerCoordinator.shared.showConnections(nil)
+                }
+
+                Divider()
+
+                Button("Peer Federation Settings…") {
+                    showSettingsPanel(navigateTo: .peerFederation)
+                }
+            }
+
 #if DEBUG
             CommandMenu("Debug") {
                 Button("New Tab With Lorem Search Text") {
@@ -811,9 +850,17 @@ struct TermMeshApp: App {
         NSApp.activate(ignoringOtherApps: true)
     }
 
-    private func showSettingsPanel() {
+    private func showSettingsPanel(navigateTo section: SettingsSection? = nil) {
         SettingsWindowController.shared.show()
         NSApp.activate(ignoringOtherApps: true)
+        guard let section else { return }
+        DispatchQueue.main.async {
+            NotificationCenter.default.post(
+                name: .settingsNavigateToSection,
+                object: nil,
+                userInfo: [SettingsNavigationUserInfoKey.section: section.rawValue]
+            )
+        }
     }
 
     private func applyAppearance() {
