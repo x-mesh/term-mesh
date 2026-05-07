@@ -603,8 +603,13 @@ final class PeerRelayWorkspaceWindowController: NSWindowController, NSWindowDele
         }
         await MainActor.run { self.swapRootView(newRoot, dividers: dividers) }
 
-        // Tear down slots that fell out of the tree.
-        let toRemove = Set(panesBySurfaceID.keys).subtracting(newSurfaceIDs)
+        // Tear down slots only when the surface is gone from EVERY
+        // pane's tab list — keeping cached slots for inactive tabs of
+        // the same bonsplit pane lets a tab-switch reuse the existing
+        // PeerRelaySession + ghostty surface instead of paying the
+        // handshake / fork / snapshot cost on every click.
+        let liveSurfaceIDs = collectAllLiveSurfaceIDs(layout)
+        let toRemove = Set(panesBySurfaceID.keys).subtracting(liveSurfaceIDs)
         for sid in toRemove {
             if let slot = panesBySurfaceID.removeValue(forKey: sid) {
                 Task { await slot.session.stop() }
@@ -921,11 +926,33 @@ final class PeerRelayWorkspaceWindowController: NSWindowController, NSWindowDele
 
     // MARK: - Helpers
 
+    /// Surface IDs of every leaf currently *mounted* in the layout
+    /// (one per bonsplit pane, the active tab). Used by the spawn /
+    /// mount path.
     private func collectSurfaceIDs(_ layout: Termmesh_Peer_V1_WorkspaceLayout) -> Set<Data> {
         switch layout.node {
         case .pane(let p): return [p.surfaceID]
         case .split(let s):
             return collectSurfaceIDs(s.first).union(collectSurfaceIDs(s.second))
+        case .none: return []
+        }
+    }
+
+    /// Active surface IDs PLUS every inactive tab's surface ID — the
+    /// full set of surfaces the user might switch back to without a
+    /// fresh attach. The teardown gate compares against this so a
+    /// PaneSlot for a pane the user just clicked away from stays
+    /// alive while the host still lists that tab.
+    private func collectAllLiveSurfaceIDs(_ layout: Termmesh_Peer_V1_WorkspaceLayout) -> Set<Data> {
+        switch layout.node {
+        case .pane(let p):
+            var ids: Set<Data> = [p.surfaceID]
+            for tab in p.tabs {
+                ids.insert(tab.surfaceID)
+            }
+            return ids
+        case .split(let s):
+            return collectAllLiveSurfaceIDs(s.first).union(collectAllLiveSurfaceIDs(s.second))
         case .none: return []
         }
     }
