@@ -36,7 +36,10 @@ final class PeerRelayWindowController: NSWindowController, NSWindowDelegate {
             context: GHOSTTY_SURFACE_CONTEXT_WINDOW,
             configTemplate: nil,
             command: session.relayBinaryPath,
-            environment: ["TERMMESH_PEER_RELAY_SOCKET": session.relaySockPath]
+            environment: [
+                "TERMMESH_PEER_RELAY_SOCKET": session.relaySockPath,
+                "TERMMESH_PEER_RELAY_SECRET": session.relaySecret,
+            ]
         )
 
         // Build the window around the Ghostty surface view.

@@ -350,10 +350,13 @@ final class GhosttyPaneSurfaceProvider: PeerSurfaceProvider {
 
     private func uuidFromSurfaceID(_ data: Data) -> UUID? {
         guard data.count == 16 else { return nil }
-        let tuple = data.withUnsafeBytes { raw -> uuid_t in
-            raw.load(as: uuid_t.self)
-        }
-        return UUID(uuid: tuple)
+        let bytes = [UInt8](data)
+        return UUID(uuid: (
+            bytes[0], bytes[1], bytes[2], bytes[3],
+            bytes[4], bytes[5], bytes[6], bytes[7],
+            bytes[8], bytes[9], bytes[10], bytes[11],
+            bytes[12], bytes[13], bytes[14], bytes[15]
+        ))
     }
 
     private func workspaceContaining(panelUUID: UUID) -> Workspace? {

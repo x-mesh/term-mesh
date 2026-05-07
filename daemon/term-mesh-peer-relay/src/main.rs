@@ -20,12 +20,15 @@ use std::env;
 use std::io::{self, Read, Write};
 use std::os::unix::net::UnixStream;
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
-use std::sync::mpsc;
+use std::sync::mpsc::{self, RecvTimeoutError};
+use std::time::Duration;
 
 const TYPE_PTY_DATA: u8 = 0x01;
 const TYPE_KEY_INPUT: u8 = 0x02;
 const TYPE_RESIZE: u8 = 0x03;
 const TYPE_GOODBYE: u8 = 0xFF;
+const TYPE_AUTH: u8 = 0xFE;
+const MAX_FRAME_BYTES: usize = 1024 * 1024;
 
 // ── SIGWINCH self-pipe ─────────────────────────────────────────────
 
@@ -111,6 +114,12 @@ impl Drop for RawStdinGuard {
 // ── Framing ────────────────────────────────────────────────────────
 
 fn write_frame(sock: &mut UnixStream, typ: u8, payload: &[u8]) -> io::Result<()> {
+    if payload.len() > MAX_FRAME_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("relay frame length {} exceeds {}", payload.len(), MAX_FRAME_BYTES),
+        ));
+    }
     let mut header = [0u8; 5];
     header[0] = typ;
     let len = payload.len() as u32;
@@ -125,6 +134,12 @@ fn read_frame(sock: &mut UnixStream) -> io::Result<(u8, Vec<u8>)> {
     sock.read_exact(&mut header)?;
     let typ = header[0];
     let len = u32::from_le_bytes(header[1..5].try_into().unwrap()) as usize;
+    if len > MAX_FRAME_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("relay frame length {len} exceeds {MAX_FRAME_BYTES}"),
+        ));
+    }
     let mut payload = vec![0u8; len];
     if len > 0 {
         sock.read_exact(&mut payload)?;
@@ -144,6 +159,14 @@ fn main() {
         eprintln!("[relay] connect {socket_path}: {e}");
         std::process::exit(1);
     });
+    let relay_secret = env::var("TERMMESH_PEER_RELAY_SECRET").unwrap_or_else(|_| {
+        eprintln!("[relay] TERMMESH_PEER_RELAY_SECRET not set");
+        std::process::exit(1);
+    });
+    if let Err(e) = write_frame(&mut sock, TYPE_AUTH, relay_secret.as_bytes()) {
+        eprintln!("[relay] auth handshake failed: {e}");
+        std::process::exit(1);
+    }
 
     // Put stdin in raw mode so each keystroke (Tab, Ctrl-C, arrow keys)
     // is forwarded immediately instead of waiting for a newline flush.
@@ -167,11 +190,18 @@ fn main() {
     // Writer thread: receives frames from channel, writes to socket.
     let mut sock_write = sock.try_clone().unwrap();
     let writer_handle = std::thread::spawn(move || {
-        while let Ok(frame) = rx.recv() {
-            if sock_write.write_all(&frame).is_err() {
-                break;
+        loop {
+            match rx.recv_timeout(Duration::from_millis(100)) {
+                Ok(frame) => {
+                    if sock_write.write_all(&frame).is_err() {
+                        break;
+                    }
+                    let _ = sock_write.flush();
+                }
+                Err(RecvTimeoutError::Timeout) if STOPPING.load(Ordering::Relaxed) => break,
+                Err(RecvTimeoutError::Timeout) => continue,
+                Err(RecvTimeoutError::Disconnected) => break,
             }
-            let _ = sock_write.flush();
         }
         let _ = write_frame(&mut sock_write, TYPE_GOODBYE, b"relay-eof");
     });
@@ -245,12 +275,12 @@ fn main() {
         unsafe { libc::close(wfd); }
     }
 
-    // Signal stdin thread to stop (it may be blocked in read; closing
-    // stdin fd would help but is too destructive — just let it die on EOF).
-    drop(tx_stop); // drop our tx clone so writer unblocks when stdin also drops
+    // The stdin reader may be blocked inside the PTY read. Let process exit
+    // tear it down instead of joining forever during relay shutdown.
+    drop(tx_stop);
     drop(tx);
 
-    let _ = stdin_handle.join();
+    drop(stdin_handle);
     let _ = writer_handle.join();
     if let Some(h) = sigwinch_handle {
         let _ = h.join();

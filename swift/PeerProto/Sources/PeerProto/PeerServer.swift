@@ -18,6 +18,8 @@ import Foundation
 import Dispatch
 import SwiftProtobuf
 
+private let maxPeerServerSessions = 16
+
 // MARK: - PeerSurfaceProvider
 
 /// Returned by `PeerSurfaceProvider.attach`. Carries the per-attach state
@@ -313,6 +315,10 @@ public actor PeerServer {
         activeSessions.removeAll { $0 === session }
     }
 
+    fileprivate func canAcceptSession() -> Bool {
+        activeSessions.count < maxPeerServerSessions
+    }
+
     /// Push a `WorkspaceLayoutChanged` update to every connected
     /// session. Callers (term-mesh.app's PeerDebugServerCoordinator)
     /// invoke this when bonsplit reports a layout change so attached
@@ -360,6 +366,10 @@ public actor PeerServer {
                 if errno == EAGAIN || errno == EWOULDBLOCK { continue }
                 break
             }
+            guard let server, await server.canAcceptSession() else {
+                close(clientFd)
+                continue
+            }
             guard Self.clientHasSameUser(fd: clientFd) else {
                 close(clientFd)
                 continue
@@ -370,12 +380,10 @@ public actor PeerServer {
                 config: config,
                 provider: provider
             )
-            await server?.register(session)
+            await server.register(session)
             Task {
                 await session.run()
-                if let server = server {
-                    await server.sessionFinished(session)
-                }
+                await server.sessionFinished(session)
             }
         }
     }
@@ -626,13 +634,13 @@ actor PeerServerSession {
                 h.protocolVersion = self.config.protocolVersion
                 h.displayName = self.config.hostDisplayName
                 h.appVersion = self.config.hostAppVersion
-                h.peerID = Data(count: 16)
+                h.peerID = randomPeerBytes(count: 16)
                 env.hello = h
             }
             try await sendEnvelope { env in
                 var c = Termmesh_Peer_V1_AuthChallenge()
-                c.nonce = Data(count: 32)
-                c.supportedMethods = ["ssh-passthrough", "token-ed25519"]
+                c.nonce = randomPeerBytes(count: 32)
+                c.supportedMethods = ["ssh-passthrough"]
                 env.authChallenge = c
             }
             state = .authSent
@@ -653,7 +661,7 @@ actor PeerServerSession {
             try await sendEnvelopeWithCorrelation(env.seq) { inner in
                 var r = Termmesh_Peer_V1_AuthResult()
                 r.accepted = true
-                r.sessionID = Data(count: 16)
+                r.sessionID = randomPeerBytes(count: 16)
                 inner.authResult = r
             }
             state = .ready
@@ -874,4 +882,14 @@ actor PeerServerSession {
 
 private func majorPart(of semver: String) -> Substring {
     semver.split(separator: ".").first ?? Substring(semver)
+}
+
+private func randomPeerBytes(count: Int) -> Data {
+    var data = Data()
+    data.reserveCapacity(count)
+    while data.count < count {
+        var uuid = UUID().uuid
+        withUnsafeBytes(of: &uuid) { data.append(contentsOf: $0) }
+    }
+    return data.prefix(count)
 }

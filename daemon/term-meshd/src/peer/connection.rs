@@ -114,8 +114,8 @@ async fn reader_loop(
                     seq: next_seq(&seq_counter),
                     correlation_id: 0,
                     payload: Some(Payload::AuthChallenge(AuthChallenge {
-                        nonce: vec![0u8; 32],
-                        supported_methods: vec!["ssh-passthrough".into(), "token-ed25519".into()],
+                        nonce: random_peer_bytes(32),
+                        supported_methods: vec!["ssh-passthrough".into()],
                     })),
                 };
                 send(&outgoing_tx, challenge).await?;
@@ -147,7 +147,7 @@ async fn reader_loop(
                     payload: Some(Payload::AuthResult(AuthResult {
                         accepted: true,
                         reason: String::new(),
-                        session_id: uuid::Uuid::new_v4().as_bytes().to_vec(),
+                        session_id: random_peer_bytes(16),
                     })),
                 };
                 send(&outgoing_tx, accept).await?;
@@ -277,12 +277,12 @@ async fn reader_loop(
                 };
                 match input.kind {
                     Some(peer_proto::v1::input::Kind::Keys(keys)) => {
-                        if let Err(e) = entry.surface.write_all(&keys) {
+                        if let Err(e) = write_surface_input(entry.surface.clone(), keys).await {
                             tracing::warn!("PTY write failed: {e}");
                         }
                     }
                     Some(peer_proto::v1::input::Kind::Paste(p)) => {
-                        if let Err(e) = entry.surface.write_all(&p.text) {
+                        if let Err(e) = write_surface_input(entry.surface.clone(), p.text).await {
                             tracing::warn!("PTY paste-write failed: {e}");
                         }
                     }
@@ -412,6 +412,21 @@ fn host_hello(seq_counter: &AtomicU64) -> Envelope {
 
 fn next_seq(seq_counter: &AtomicU64) -> u64 {
     seq_counter.fetch_add(1, Ordering::Relaxed) + 1
+}
+
+fn random_peer_bytes(len: usize) -> Vec<u8> {
+    let mut out = Vec::with_capacity(len);
+    while out.len() < len {
+        out.extend_from_slice(uuid::Uuid::new_v4().as_bytes());
+    }
+    out.truncate(len);
+    out
+}
+
+async fn write_surface_input(surface: Arc<PtySurface>, bytes: Vec<u8>) -> std::io::Result<()> {
+    tokio::task::spawn_blocking(move || surface.write_all(&bytes))
+        .await
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Interrupted, e.to_string()))?
 }
 
 fn clamp_pty_size(cols: u32, rows: u32) -> Option<(u16, u16)> {

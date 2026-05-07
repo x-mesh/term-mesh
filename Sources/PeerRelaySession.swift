@@ -21,6 +21,8 @@ private let kTypePtyData: UInt8  = 0x01
 private let kTypeKeyInput: UInt8 = 0x02
 private let kTypeResize: UInt8   = 0x03
 private let kTypeGoodbye: UInt8  = 0xFF
+private let kTypeAuth: UInt8     = 0xFE
+private let kRelayMaxFrameBytes = 1024 * 1024
 
 // ── Two-stage handshake result ─────────────────────────────────────
 
@@ -46,17 +48,21 @@ struct PeerRelayConnection: Sendable {
 final class RelaySocket: @unchecked Sendable {
     let fd: Int32
     private let writeLock = NSLock()
+    private var isClosed = false
 
     init(fd: Int32) {
         self.fd = fd
     }
 
     deinit {
-        Darwin.close(fd)
+        close()
     }
 
     // Blocking send of a single frame (called from background tasks).
     func writeFrame(type: UInt8, payload: Data) throws {
+        guard payload.count <= kRelayMaxFrameBytes else {
+            throw RelayError.ioError("relay frame too large: \(payload.count)")
+        }
         var header = Data(count: 5)
         header[0] = type
         let len = UInt32(payload.count)
@@ -73,11 +79,23 @@ final class RelaySocket: @unchecked Sendable {
         try readFull(fd: fd, into: &header)
         let type = header[0]
         let len = Int(UInt32(littleEndian: header.withUnsafeBytes { $0.loadUnaligned(fromByteOffset: 1, as: UInt32.self) }))
+        guard len <= kRelayMaxFrameBytes else {
+            throw RelayError.ioError("relay frame too large: \(len)")
+        }
         var payload = Data(count: len)
         if len > 0 {
             try readFull(fd: fd, into: &payload)
         }
         return (type, payload)
+    }
+
+    func close() {
+        writeLock.lock()
+        defer { writeLock.unlock() }
+        guard !isClosed else { return }
+        isClosed = true
+        Darwin.shutdown(fd, SHUT_RDWR)
+        Darwin.close(fd)
     }
 }
 
@@ -121,6 +139,8 @@ enum RelayError: Error {
 final class PeerRelaySession {
     // Path the relay binary should connect to.
     let relaySockPath: String
+    // Per-session secret the relay binary must echo before we forward input.
+    let relaySecret: String
     // Relay binary location (must exist before calling start()).
     let relayBinaryPath: String
 
@@ -140,7 +160,7 @@ final class PeerRelaySession {
 
     // ── Stale-socket sweep ──────────────────────────────────────────
     //
-    // Per-session sockets land in /tmp as `tm-peer-relay-<uuid>.sock`.
+    // Per-session sockets land in a private per-user directory.
     // Normal teardown removes them in deinit, but a crash leaves the
     // file behind. Call this at app startup to remove any whose
     // listener is no longer accepting (i.e. a `connect()` returns
@@ -148,10 +168,10 @@ final class PeerRelaySession {
     // owned by another running debug app instance — are left alone.
 
     static func sweepStaleRelaySockets() {
-        let dir = "/tmp"
+        let dir = "/tmp/term-mesh-relays-\(getuid())"
         guard let entries = try? FileManager.default.contentsOfDirectory(atPath: dir) else { return }
         for name in entries
-            where name.hasPrefix("tm-peer-relay-") && name.hasSuffix(".sock")
+            where name.hasSuffix(".sock")
         {
             let path = "\(dir)/\(name)"
             if !relaySocketHasLiveListener(at: path) {
@@ -234,12 +254,12 @@ final class PeerRelaySession {
             rows: UInt32(surface.rows)
         )
 
-        let uuid = UUID().uuidString.lowercased().prefix(8)
-        let relaySockPath = "/tmp/tm-peer-relay-\(uuid).sock"
+        let relaySockPath = try Self.makeRelaySocketPath()
 
         return PeerRelaySession(
             hostSockPath: connection.hostSockPath,
             relaySockPath: relaySockPath,
+            relaySecret: Self.makeRelaySecret(),
             surfaceID: outcome.surfaceID,
             remoteCols: UInt32(surface.cols),
             remoteRows: UInt32(surface.rows),
@@ -263,6 +283,7 @@ final class PeerRelaySession {
     private init(
         hostSockPath: String,
         relaySockPath: String,
+        relaySecret: String,
         surfaceID: Data,
         remoteCols: UInt32,
         remoteRows: UInt32,
@@ -271,6 +292,7 @@ final class PeerRelaySession {
     ) {
         self.hostSockPath = hostSockPath
         self.relaySockPath = relaySockPath
+        self.relaySecret = relaySecret
         self.surfaceID = surfaceID
         self.remoteCols = remoteCols
         self.remoteRows = remoteRows
@@ -282,6 +304,23 @@ final class PeerRelaySession {
     deinit {
         if listenerFd >= 0 { Darwin.close(listenerFd) }
         try? FileManager.default.removeItem(atPath: relaySockPath)
+    }
+
+    private static func makeRelaySocketPath() throws -> String {
+        let dir = "/tmp/term-mesh-relays-\(getuid())"
+        var isDirectory: ObjCBool = false
+        if !FileManager.default.fileExists(atPath: dir, isDirectory: &isDirectory) {
+            try FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+        } else if !isDirectory.boolValue {
+            throw RelayError.listenerSetupFailed("relay socket parent is not a directory")
+        }
+        Darwin.chmod(dir, 0o700)
+        return "\(dir)/\(UUID().uuidString.lowercased()).sock"
+    }
+
+    private static func makeRelaySecret() -> String {
+        UUID().uuidString.replacingOccurrences(of: "-", with: "")
+            + UUID().uuidString.replacingOccurrences(of: "-", with: "")
     }
 
     // ── Relay binary location ────────────────────────────────────────
@@ -349,6 +388,7 @@ final class PeerRelaySession {
             Darwin.close(fd)
             throw RelayError.listenerSetupFailed("bind() errno \(errno)")
         }
+        Darwin.chmod(relaySockPath, 0o600)
         guard Darwin.listen(fd, 1) == 0 else {
             Darwin.close(fd)
             throw RelayError.listenerSetupFailed("listen() errno \(errno)")
@@ -369,6 +409,7 @@ final class PeerRelaySession {
 
     private func acceptRelay() async throws -> RelaySocket {
         let lfd = listenerFd
+        let expectedSecret = relaySecret
         // Set non-blocking so we can poll in a background Task.
         _ = Darwin.fcntl(lfd, F_SETFL, O_NONBLOCK)
         return try await withCheckedThrowingContinuation { cont in
@@ -379,7 +420,19 @@ final class PeerRelaySession {
                     if fd >= 0 {
                         // Accepted fd inherits O_NONBLOCK from listener; reset to blocking.
                         _ = Darwin.fcntl(fd, F_SETFL, Darwin.fcntl(fd, F_GETFL) & ~O_NONBLOCK)
-                        cont.resume(returning: RelaySocket(fd: fd))
+                        guard Self.clientHasSameUser(fd: fd) else {
+                            Darwin.close(fd)
+                            cont.resume(throwing: RelayError.ioError("relay peer uid mismatch"))
+                            return
+                        }
+                        let relay = RelaySocket(fd: fd)
+                        do {
+                            try Self.verifyRelaySecret(relay, expected: expectedSecret)
+                            cont.resume(returning: relay)
+                        } catch {
+                            relay.close()
+                            cont.resume(throwing: error)
+                        }
                         return
                     }
                     if errno != EAGAIN && errno != EWOULDBLOCK {
@@ -390,6 +443,22 @@ final class PeerRelaySession {
                 cont.resume(throwing: RelayError.acceptTimedOut)
             }
         }
+    }
+
+    private nonisolated static func verifyRelaySecret(_ relay: RelaySocket, expected: String) throws {
+        let frame = try relay.readFrame()
+        guard frame.type == kTypeAuth,
+              String(data: frame.payload, encoding: .utf8) == expected
+        else {
+            throw RelayError.ioError("relay auth failed")
+        }
+    }
+
+    private nonisolated static func clientHasSameUser(fd: Int32) -> Bool {
+        var cred = xucred()
+        var credLen = socklen_t(MemoryLayout<xucred>.size)
+        let result = getsockopt(fd, SOL_LOCAL, LOCAL_PEERCRED, &cred, &credLen)
+        return result == 0 && cred.cr_uid == getuid()
     }
 
     // ── Bidirectional pumping ────────────────────────────────────────
@@ -464,6 +533,8 @@ final class PeerRelaySession {
     private func disconnect() {
         pumpTask?.cancel()
         pumpTask = nil
+        relaySocket?.close()
+        relaySocket = nil
         let transport = self.transport
         let session = self.session
         self.session = nil
