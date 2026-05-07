@@ -210,15 +210,19 @@ message WorkspaceSplit {
 
 message WorkspacePane {
   // surface_id of the currently *active* tab in this bonsplit pane.
+  // Always equals one of `tabs[i].surface_id` — the active tab is
+  // intentionally also included in `tabs[]` so clients can render
+  // the strip from a single source. Compare against `surface_id`
+  // here to highlight which strip entry is selected.
   bytes surface_id = 1;
   string title = 2;
   uint32 cols = 3;
   uint32 rows = 4;
   string cwd = 5;
-  // Every tab the host has stacked in this bonsplit pane (Phase E-4).
-  // The active one's surface_id matches `surface_id` above; clients
-  // can render the rest as a tab bar and ask the host to activate one
-  // via WorkspaceControl.activate_tab.
+  // Every tab the host has stacked in this bonsplit pane (Phase E-4),
+  // active one included. Clients render the strip from this list and
+  // ask the host to switch the active tab via
+  // WorkspaceControl.activate_tab.
   repeated PaneTab tabs = 6;
 }
 

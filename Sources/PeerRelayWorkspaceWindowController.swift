@@ -57,36 +57,6 @@ struct PeerRelayConnectionInfo: Sendable {
     var hostDisplay: String { sshTarget ?? hostSockPath }
 }
 
-/// Small NSButton subclass used by the relay window's per-pane tab
-/// strip. Carries the host paneID + tab's surfaceID so a click can
-/// dispatch ActivateTab without hunting for context.
-final class TabStripButton: NSButton {
-    var paneID: Data = Data()
-    var tabSurfaceID: Data = Data()
-    var isActive: Bool = false {
-        didSet { applyActiveStyle() }
-    }
-
-    convenience init(title: String) {
-        self.init(frame: .zero)
-        self.title = title
-        self.bezelStyle = .recessed
-        self.controlSize = .small
-        self.font = NSFont.systemFont(ofSize: 11)
-        self.translatesAutoresizingMaskIntoConstraints = false
-        self.setButtonType(.toggle)
-        self.lineBreakMode = .byTruncatingTail
-        applyActiveStyle()
-    }
-
-    private func applyActiveStyle() {
-        // Map "is the host's active tab" onto NSButton state so the
-        // built-in recessed style draws the highlighted appearance for
-        // the active tab and the muted appearance for others.
-        self.state = isActive ? .on : .off
-    }
-}
-
 final class PeerRelayWorkspaceWindowController: NSWindowController, NSWindowDelegate {
     // MARK: - Pane bookkeeping
 
@@ -897,6 +867,38 @@ final class PeerRelayWorkspaceWindowController: NSWindowController, NSWindowDele
 
     // MARK: - Tab strip (Phase E-4)
 
+    /// Per-pane tab strip button. Carries the host pane's active
+    /// surfaceID + the tab's own surfaceID so a click can dispatch
+    /// `ActivateTab` without hunting for context. Nested inside the
+    /// controller so nothing in `Sources/` accidentally instantiates
+    /// it from the global namespace.
+    @MainActor
+    final class TabStripButton: NSButton {
+        let paneID: Data
+        let tabSurfaceID: Data
+        let isActive: Bool
+
+        init(title: String, paneID: Data, tabSurfaceID: Data, isActive: Bool) {
+            self.paneID = paneID
+            self.tabSurfaceID = tabSurfaceID
+            self.isActive = isActive
+            super.init(frame: .zero)
+            self.title = title
+            self.bezelStyle = .recessed
+            self.controlSize = .small
+            self.font = NSFont.systemFont(ofSize: 11)
+            self.translatesAutoresizingMaskIntoConstraints = false
+            self.setButtonType(.toggle)
+            self.lineBreakMode = .byTruncatingTail
+            // Map "is the host's active tab" onto NSButton state so
+            // the built-in recessed style draws the highlighted look
+            // for the active tab and the muted look for others.
+            self.state = isActive ? .on : .off
+        }
+
+        required init?(coder: NSCoder) { fatalError("not used") }
+    }
+
     /// Build a tab strip for a pane, or nil if there's nothing useful
     /// to show (0 or 1 tab). Each tab becomes an NSButton wired to
     /// `tabButtonClicked(_:)` so a click sends ActivateTab to the host.
@@ -913,12 +915,13 @@ final class PeerRelayWorkspaceWindowController: NSWindowController, NSWindowDele
         strip.layer?.backgroundColor = NSColor.windowBackgroundColor.withAlphaComponent(0.6).cgColor
 
         for tab in pane.tabs {
-            let isActive = tab.surfaceID == pane.surfaceID
             let title = tab.title.isEmpty ? "Terminal" : tab.title
-            let btn = TabStripButton(title: title)
-            btn.isActive = isActive
-            btn.paneID = pane.surfaceID
-            btn.tabSurfaceID = tab.surfaceID
+            let btn = TabStripButton(
+                title: title,
+                paneID: pane.surfaceID,
+                tabSurfaceID: tab.surfaceID,
+                isActive: tab.surfaceID == pane.surfaceID
+            )
             btn.target = self
             btn.action = #selector(tabButtonClicked(_:))
             strip.addArrangedSubview(btn)
