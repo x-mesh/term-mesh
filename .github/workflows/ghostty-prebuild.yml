@@ -37,7 +37,15 @@ concurrency:
 
 jobs:
   prebuild:
-    runs-on: macos-14   # Sonoma; zig 0.15.2 builds cleanly here
+    # macos-26: matches the SDK ghostty's pinned source compiles
+    # against. The previous macos-14 (Sonoma / Xcode 15.4) image
+    # bundled the macOS 14.5 SDK, which is missing CoreVideo
+    # constants ghostty references — notably
+    # `kCVPixelFormatType_30RGB_r210`, introduced in macOS 26 — and
+    # would fail at the cimport stage of `pkg/macos/video/pixel_format.zig`.
+    # Pin explicitly rather than `macos-latest` so future GHA image
+    # rolls don't move the SDK out from under us.
+    runs-on: macos-26
     steps:
       - name: Checkout (with submodules)
         uses: actions/checkout@v4
