@@ -2,6 +2,17 @@
 
 All notable changes to term-mesh are documented here.
 
+## [0.99.1] - 2026-05-07
+
+### Fixed
+- **App Hang false positives gone** — the 3-second titlebar refresh timer no longer trips Sentry's hang detector during foreground/background transitions. The timer now skips entirely when the app isn't active, coalesces with other titlebar-relevant events, and snapshots the workspace's published state in a single pass instead of repeatedly entering each `@Published` keypath under the runtime exclusivity check.
+- **Modal alerts no longer block the main run loop** — peer-federation, browser, workspace, and tab dialogs that still used `NSAlert.runModal()` now present as window-attached sheets via `presentAsSheet`. The main thread keeps ticking while a dialog is up, so legitimate user interaction doesn't show up in Sentry as a fake App Hang.
+- **Hang detector tolerates legitimate AppKit waits** — Sentry's `appHangTimeoutInterval` raised to 10s in DEBUG / 5s in Release so brief filesystem / Bonjour / SwiftUI rebuild stalls don't get reported as hangs.
+
+### Thanks to 1 contributor!
+
+- [@JINWOO-J](https://github.com/JINWOO-J)
+
 ## [0.99.0] - 2026-05-07
 
 ### Added
