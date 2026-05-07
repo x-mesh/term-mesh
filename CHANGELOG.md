@@ -2,6 +2,25 @@
 
 All notable changes to term-mesh are documented here.
 
+## [0.99.0] - 2026-05-07
+
+### Added
+- **Peer Federation** — attach another Mac's term-mesh from the status-bar menu (SSH or local Unix socket), mirror its workspace's split layout in a Ghostty relay window, and drive everything from your client: Cmd+D / Cmd+Shift+D split, Cmd+W close, Cmd+T new tab, divider drag, click-to-focus, in-relay tab strip for switching between tabs of the same pane. Supports multiple concurrent clients per host pane (count badge on the teal ring shows how many are attached). New "Show Peer Connections…" panel lists active relay windows with per-row Disconnect.
+- **SSH transport with auto-reconnect** — `ssh -L`-tunneled relay survives sleep/wake, server reboots, and transient network blips with exponential backoff (1s → 30s, 12-attempt cap before a Retry-banner stop). The relay window's title and an in-window banner show live state: 🔌 Disconnected / Reconnecting (try N…) / Reconnected.
+- **Bonjour LAN discovery** — hosts with the peer server enabled advertise themselves; the connect dialog has a live "Discovered on LAN" picker plus a recent-hosts dropdown so reconnecting is one keystroke.
+- **Settings → Peer Federation** — toggle the local peer server, enable auto-start at app launch, override the socket path / display name, and opt in to "Force TUI redraw on attach" (sends Ctrl-L when a peer attaches so vim / htop / less repaint with full color).
+- **Status-bar peer indicator** — small blue dot on the menu-bar icon when the local peer server is running.
+
+### Security
+- Local peer socket gated by `LOCAL_PEERCRED` (Darwin) / `SO_PEERCRED` (Linux) UID match on accept; bind runs under `umask 0o077` so the socket is created at 0600 with no TOCTOU window. Parent directory is forced to 0700 and ownership-checked, with sticky-bit world-writable parents (`/tmp`) explicitly accepted as a special case. SSH target / remote-socket validation rejects option-injection inputs (leading `-`, embedded `:`) before they reach `Process`. Relay handshake secret compared in constant time, auth nonces from a CSPRNG (`SecRandomCopyBytes` / `getrandom`) instead of UUIDv4 concatenation.
+
+### Fixed
+- **Connect dialogs no longer trip the App-Hang detector** — the SSH connect, workspace picker, surface picker, and error dialogs now present as window-attached sheets via `beginSheetModal(for:)` instead of `NSAlert.runModal()`. The main run loop is no longer parked in `mach_msg2_trap` while a dialog is up, eliminating the false-positive "App Hanging" Sentry events that the modal pattern produced.
+
+### Thanks to 1 contributor!
+
+- [@JINWOO-J](https://github.com/JINWOO-J)
+
 ## [0.98.2] - 2026-04-22
 
 No user-visible changes. Release-flow validation build — exercises the end-to-end `/release` pipeline introduced in v0.98.1 (DMG build → GitHub Release asset upload → Homebrew cask auto-update in `x-mesh/homebrew-tap`) and verifies `brew upgrade --cask term-mesh` picks up the new version without manual intervention.

@@ -70,6 +70,9 @@ Monitoring dashboard available as a **split panel** in-app (Cmd+Shift+D) or **st
 ### Socket API
 Full control via Unix socket and HTTP REST API — automate tab creation, pane management, notifications, and more from scripts or other tools.
 
+### Peer Federation (Mac → Mac handoff)
+Attach another machine's term-mesh from your menu bar — the host's split layout opens in a relay window on your laptop, with live PTY streams in every pane. Drive remote panes with the usual keybindings (Cmd+D split, Cmd+T new tab, Cmd+W close, divider drag, click-to-focus, tab strip switching), and let `ssh -L` tunnel the wire so any host you can SSH into works as a peer. Bonjour LAN discovery and a recent-hosts dropdown make reconnecting a one-keystroke job; auto-reconnect handles sleep/wake and network blips. See [docs/peer-federation-user-guide.md](docs/peer-federation-user-guide.md) for the practical primer.
+
 ## Architecture
 
 ```
