@@ -65,12 +65,18 @@ final class PtyTapHub: @unchecked Sendable {
     }
 
     func broadcast(_ bytes: Data) {
+        // Yield directly under the lock — `AsyncStream.Continuation.yield`
+        // with `bufferingNewest(256)` is a non-blocking enqueue into a
+        // bounded ring buffer, so holding the lock for the duration is
+        // bounded by N × O(1) rather than waiting on consumers. Avoids
+        // the per-chunk `Array(continuations.values)` allocation that
+        // showed up on tail-following workloads (cat /dev/urandom etc.)
+        // where the PTY callback fires thousands of times per second.
         lock.lock()
-        let targets = Array(continuations.values)
-        lock.unlock()
-        for continuation in targets {
+        for continuation in continuations.values {
             continuation.yield(bytes)
         }
+        lock.unlock()
     }
 
     @discardableResult
