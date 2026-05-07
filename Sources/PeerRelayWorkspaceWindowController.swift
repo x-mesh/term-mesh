@@ -153,6 +153,11 @@ final class PeerRelayWorkspaceWindowController: NSWindowController, NSWindowDele
     /// view; the split tree sits below it. Created lazily on the first
     /// `show*` call so non-SSH sessions never allocate it.
     private var banner: PeerRelayBanner?
+    /// Owns banner copy / kind / auto-dismiss timing. Created lazily
+    /// alongside the banner inside `ensureBodyStack`. Controller code
+    /// forwards tunnel-state transitions to this presenter and never
+    /// touches `banner.show(...)` directly.
+    private var bannerPresenter: PeerRelayBannerPresenter?
     /// True once `ensureBodyStack` has installed the banner and
     /// splitRoot container into the window's contentView.
     private var bodyInstalled = false
@@ -205,27 +210,12 @@ final class PeerRelayWorkspaceWindowController: NSWindowController, NSWindowDele
     private func handleTunnelStateChange(_ state: PeerSSHTunnelState) {
         switch state {
         case .down(let reason):
-            banner?.show(
-                kind: .error,
-                message: "Disconnected: \(reason)",
-                actionTitle: nil,
-                dismissable: false
-            )
+            bannerPresenter?.showDisconnected(reason: reason)
             tearDownPeerSessions(keepWindow: true)
         case .reconnecting(let attempt):
-            banner?.show(
-                kind: .warning,
-                message: "Reconnecting to host (try \(attempt))…",
-                actionTitle: nil,
-                dismissable: false
-            )
+            bannerPresenter?.showReconnecting(attempt: attempt)
         case .up:
-            banner?.show(
-                kind: .info,
-                message: "Re-attaching panes…",
-                actionTitle: nil,
-                dismissable: false
-            )
+            bannerPresenter?.showReattaching()
             // Tunnel just came back. Re-run the initial-attach flow
             // from the same hostSockPath.
             startTask?.cancel()
@@ -235,47 +225,24 @@ final class PeerRelayWorkspaceWindowController: NSWindowController, NSWindowDele
                     try await self.applyLayout(self.currentLayout)
                     await self.startSubscription()
                     await MainActor.run { [weak self] in
-                        guard let self else { return }
-                        self.banner?.show(
-                            kind: .success,
-                            message: "Reconnected",
-                            actionTitle: nil,
-                            dismissable: true
-                        )
-                        // Auto-dismiss the success banner after 3 s.
-                        Task { [weak self] in
-                            try? await Task.sleep(nanoseconds: 3_000_000_000)
-                            await MainActor.run { self?.banner?.hide() }
-                        }
+                        self?.bannerPresenter?.showReconnected()
                     }
                 } catch {
                     let detail = String(describing: error)
                     await MainActor.run { [weak self] in
-                        self?.banner?.show(
-                            kind: .error,
-                            message: "Reconnect failed: \(detail)",
-                            actionTitle: "Retry",
-                            dismissable: false,
-                            action: { [weak self] in
-                                self?.handleTunnelStateChange(.up)
-                            }
-                        )
+                        self?.bannerPresenter?.showReconnectFailed(detail: detail) {
+                            // Re-enter `.up` to redrive applyLayout.
+                            self?.handleTunnelStateChange(.up)
+                        }
                     }
                 }
             }
         case .failed(let reason):
-            // Auto-retry gave up. Surface a Retry button on the
-            // banner so the user can re-arm the loop without closing
-            // and reopening the window.
-            banner?.show(
-                kind: .error,
-                message: "Reconnect failed: \(reason)",
-                actionTitle: "Retry",
-                dismissable: false,
-                action: { [weak self] in
-                    self?.sshTunnel?.retry()
-                }
-            )
+            // Auto-retry gave up. Surface a Retry button so the user
+            // can re-arm the loop without closing the window.
+            bannerPresenter?.showFailedTerminal(reason: reason) { [weak self] in
+                self?.sshTunnel?.retry()
+            }
             tearDownPeerSessions(keepWindow: true)
         case .stopped, .starting:
             break
@@ -320,15 +287,9 @@ final class PeerRelayWorkspaceWindowController: NSWindowController, NSWindowDele
                 let detail = String(describing: error)
                 NSLog("[peer-ws] initial layout failed: %@", detail)
                 await MainActor.run { [weak self] in
-                    self?.banner?.show(
-                        kind: .error,
-                        message: "Failed to attach: \(detail)",
-                        actionTitle: "Close",
-                        dismissable: false,
-                        action: { [weak self] in
-                            self?.window?.performClose(nil)
-                        }
-                    )
+                    self?.bannerPresenter?.showAttachFailed(detail: detail) {
+                        self?.window?.performClose(nil)
+                    }
                 }
             }
         }
@@ -747,6 +708,7 @@ final class PeerRelayWorkspaceWindowController: NSWindowController, NSWindowDele
 
         let bannerView = PeerRelayBanner(frame: .zero)
         self.banner = bannerView
+        self.bannerPresenter = PeerRelayBannerPresenter(banner: bannerView)
         let split = NSView()
         split.translatesAutoresizingMaskIntoConstraints = false
         self.splitRootContainer = split

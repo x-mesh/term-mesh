@@ -39,6 +39,7 @@
 			CVB00089 /* PeerFederationSettings.swift in Sources */ = {isa = PBXBuildFile; fileRef = CVS00089 /* PeerFederationSettings.swift */; };
 			CVB00090 /* PeerRelayBanner.swift in Sources */ = {isa = PBXBuildFile; fileRef = CVS00090 /* PeerRelayBanner.swift */; };
 			CVB00091 /* PeerConnectionsWindowController.swift in Sources */ = {isa = PBXBuildFile; fileRef = CVS00091 /* PeerConnectionsWindowController.swift */; };
+			CVB00092 /* PeerRelayBannerPresenter.swift in Sources */ = {isa = PBXBuildFile; fileRef = CVS00092 /* PeerRelayBannerPresenter.swift */; };
 			CVB00027 /* AppDelegate+Shortcuts.swift in Sources */ = {isa = PBXBuildFile; fileRef = CVS00027 /* AppDelegate+Shortcuts.swift */; };
 			CVB00028 /* AppDelegate+Notifications.swift in Sources */ = {isa = PBXBuildFile; fileRef = CVS00028 /* AppDelegate+Notifications.swift */; };
 			CVB00029 /* ContentViewModels.swift in Sources */ = {isa = PBXBuildFile; fileRef = CVS00029 /* ContentViewModels.swift */; };
@@ -250,6 +251,7 @@
 			CVS00089 /* PeerFederationSettings.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PeerFederationSettings.swift; sourceTree = "<group>"; };
 			CVS00090 /* PeerRelayBanner.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PeerRelayBanner.swift; sourceTree = "<group>"; };
 			CVS00091 /* PeerConnectionsWindowController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PeerConnectionsWindowController.swift; sourceTree = "<group>"; };
+			CVS00092 /* PeerRelayBannerPresenter.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PeerRelayBannerPresenter.swift; sourceTree = "<group>"; };
 			CVS00027 /* AppDelegate+Shortcuts.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "AppDelegate+Shortcuts.swift"; sourceTree = "<group>"; };
 			CVS00028 /* AppDelegate+Notifications.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "AppDelegate+Notifications.swift"; sourceTree = "<group>"; };
 			CVS00029 /* ContentViewModels.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ContentViewModels.swift; sourceTree = "<group>"; };
@@ -509,6 +511,7 @@
 				CVS00089 /* PeerFederationSettings.swift */,
 				CVS00090 /* PeerRelayBanner.swift */,
 				CVS00091 /* PeerConnectionsWindowController.swift */,
+				CVS00092 /* PeerRelayBannerPresenter.swift */,
 					CVS00027 /* AppDelegate+Shortcuts.swift */,
 					CVS00028 /* AppDelegate+Notifications.swift */,
 					CVS00029 /* ContentViewModels.swift */,
@@ -834,6 +837,7 @@
 				CVB00089 /* PeerFederationSettings.swift in Sources */,
 				CVB00090 /* PeerRelayBanner.swift in Sources */,
 				CVB00091 /* PeerConnectionsWindowController.swift in Sources */,
+				CVB00092 /* PeerRelayBannerPresenter.swift in Sources */,
 					CVB00027 /* AppDelegate+Shortcuts.swift in Sources */,
 					CVB00028 /* AppDelegate+Notifications.swift in Sources */,
 					CVB00029 /* ContentViewModels.swift in Sources */,
