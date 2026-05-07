@@ -261,16 +261,27 @@ public actor PeerServer {
             }
         }
 
+        // Tight umask so the socket file is created at 0600 from the
+        // start, eliminating the bind→chmod TOCTOU window where a
+        // racing local connect() could reach the listener before the
+        // explicit chmod below lands. Restored immediately on the
+        // success and error paths so other threads doing concurrent
+        // bind() / open() aren't affected longer than this syscall.
+        let prevUmask = umask(0o077)
         let bindResult = withUnsafePointer(to: &addr) { ptr -> Int32 in
             ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { sockPtr in
                 bind(fd, sockPtr, socklen_t(MemoryLayout<sockaddr_un>.size))
             }
         }
+        umask(prevUmask)
         if bindResult != 0 {
             let err = errno
             close(fd)
             throw PeerServerError.bindFailed(errno: err, message: "bind() failed")
         }
+        // Belt-and-braces: even with the tight umask, normalize the
+        // socket file's mode to 0600 in case a future code path or
+        // umask quirk lets it land permissive.
         chmod(socketPath, 0o600)
 
         if listen(fd, 8) != 0 {
@@ -393,14 +404,41 @@ public actor PeerServer {
         guard !parent.path.isEmpty, parent.path != "/" else { return }
         var isDirectory: ObjCBool = false
         let exists = FileManager.default.fileExists(atPath: parent.path, isDirectory: &isDirectory)
-        if exists {
-            guard isDirectory.boolValue else {
-                throw PeerServerError.bindFailed(errno: ENOTDIR, message: "socket parent is not a directory")
-            }
-            return
+        if !exists {
+            try FileManager.default.createDirectory(at: parent, withIntermediateDirectories: true)
+        } else if !isDirectory.boolValue {
+            throw PeerServerError.bindFailed(errno: ENOTDIR, message: "socket parent is not a directory")
         }
-        try FileManager.default.createDirectory(at: parent, withIntermediateDirectories: true)
-        chmod(parent.path, 0o700)
+        // Whether we just created the directory or it already existed
+        // (possibly pre-created by a hostile uid before we launched —
+        // /tmp is world-writable with the sticky bit), enforce both
+        // ownership and 0700 mode every time. An attacker-owned
+        // directory at the expected path is refused outright.
+        var st = stat()
+        guard lstat(parent.path, &st) == 0 else {
+            throw PeerServerError.bindFailed(
+                errno: errno,
+                message: "lstat failed on socket parent \(parent.path)"
+            )
+        }
+        guard (st.st_mode & S_IFMT) == S_IFDIR else {
+            throw PeerServerError.bindFailed(
+                errno: ENOTDIR,
+                message: "socket parent \(parent.path) is not a directory (lstat)"
+            )
+        }
+        if st.st_uid != getuid() {
+            throw PeerServerError.bindFailed(
+                errno: EPERM,
+                message: "socket parent \(parent.path) not owned by uid \(getuid()) (got \(st.st_uid)); refusing to use it"
+            )
+        }
+        // Tighten mode unconditionally — a directory we created with
+        // umask 0022 (or similar) lands at 0755, and a pre-existing
+        // one might be 0777. Forcing 0700 here is idempotent.
+        if (st.st_mode & 0o777) != 0o700 {
+            chmod(parent.path, 0o700)
+        }
     }
 
     private static func clientHasSameUser(fd: Int32) -> Bool {

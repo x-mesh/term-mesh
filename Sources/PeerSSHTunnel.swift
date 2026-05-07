@@ -25,6 +25,10 @@ enum PeerSSHTunnelError: Error {
     case spawnFailed(String)
     case socketNeverAppeared(String)
     case alreadyRunning
+    /// Caller-supplied SSH target / remote socket failed validation.
+    /// Surfaced before spawning ssh so option-injection inputs never
+    /// reach `Process`.
+    case invalidArgument(String)
 }
 
 enum PeerSSHTunnelState: Sendable, Equatable {
@@ -110,6 +114,16 @@ final class PeerSSHTunnel: @unchecked Sendable {
     private func spawnOnce() async throws {
         try? FileManager.default.removeItem(atPath: localSockPath)
 
+        // Reject inputs that could be reinterpreted as ssh options.
+        // `sshTarget` is appended unquoted at the end of argv, so a
+        // value starting with `-` (e.g. `-oProxyCommand=…`) would let
+        // a malicious dialog entry execute arbitrary local commands.
+        // `remoteSockPath` lives inside the `-L` value where colons
+        // are field separators; an embedded colon silently rewrites
+        // the forward target.
+        try Self.validateSshTarget(sshTarget)
+        try Self.validateRemoteSockPath(remoteSockPath)
+
         let proc = Process()
         proc.executableURL = URL(fileURLWithPath: "/usr/bin/ssh")
         proc.arguments = [
@@ -120,6 +134,10 @@ final class PeerSSHTunnel: @unchecked Sendable {
             "-o", "ServerAliveCountMax=3",
             "-o", "StreamLocalBindMask=0177",
             "-L", "\(localSockPath):\(remoteSockPath)",
+            // `--` ends ssh option parsing so the trailing target is
+            // always treated positionally, even if it sneaks past the
+            // validator above.
+            "--",
             sshTarget,
         ]
         let errPipe = Pipe()
@@ -240,6 +258,56 @@ final class PeerSSHTunnel: @unchecked Sendable {
         guard let cb else { return }
         Task { @MainActor in
             cb(newState)
+        }
+    }
+
+    // MARK: - Argument validation
+
+    /// Reject SSH targets that would slip past the `--` separator into
+    /// option position. Keeps the input in the union of {ssh-config
+    /// alias, `user@host`, `host`, `host:port`-style hostnames}.
+    static func validateSshTarget(_ value: String) throws {
+        guard !value.isEmpty else {
+            throw PeerSSHTunnelError.invalidArgument("SSH target is empty")
+        }
+        if value.hasPrefix("-") {
+            throw PeerSSHTunnelError.invalidArgument(
+                "SSH target may not start with '-' (would be parsed as an ssh option)"
+            )
+        }
+        // Newlines / NUL would let a future logging or argv path
+        // misinterpret the value. Whitespace inside is suspicious in
+        // any standard ssh target.
+        let banned: Set<Character> = ["\n", "\r", "\0", " ", "\t"]
+        if value.contains(where: { banned.contains($0) }) {
+            throw PeerSSHTunnelError.invalidArgument(
+                "SSH target contains whitespace or control characters"
+            )
+        }
+    }
+
+    /// Reject remote socket paths that contain the colon delimiter
+    /// used inside `-L local:remote` (or that try to escape via a
+    /// leading `-`). A path with a colon would silently rewrite the
+    /// forward semantics and route bytes to a different destination.
+    static func validateRemoteSockPath(_ value: String) throws {
+        guard !value.isEmpty else {
+            throw PeerSSHTunnelError.invalidArgument("Remote socket path is empty")
+        }
+        if value.contains(":") {
+            throw PeerSSHTunnelError.invalidArgument(
+                "Remote socket path may not contain ':' (collides with -L delimiter)"
+            )
+        }
+        if value.hasPrefix("-") {
+            throw PeerSSHTunnelError.invalidArgument(
+                "Remote socket path may not start with '-'"
+            )
+        }
+        if value.contains(where: { $0 == "\n" || $0 == "\r" || $0 == "\0" }) {
+            throw PeerSSHTunnelError.invalidArgument(
+                "Remote socket path contains control characters"
+            )
         }
     }
 }

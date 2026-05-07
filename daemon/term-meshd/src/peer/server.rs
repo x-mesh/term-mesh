@@ -31,20 +31,37 @@ pub async fn serve_with_manager(
     }
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() {
-            std::fs::create_dir_all(parent)?;
+            harden_parent_directory(parent)?;
         }
     }
 
-    let listener = UnixListener::bind(&path)?;
+    // Bind under a tight umask so the socket file is created at 0600
+    // from the start; the post-bind chmod is kept as belt-and-braces
+    // for the (already narrow) window between bind() and the umask
+    // restore. Closes the bind-time TOCTOU on multi-user systems.
+    let listener = bind_with_tight_umask(&path)?;
     harden_socket_permissions(&path);
     tracing::info!("peer-federation listening on {}", path.display());
     let connection_permits = Arc::new(Semaphore::new(MAX_PEER_CONNECTIONS));
+    let owner_uid = current_uid();
 
     loop {
         tokio::select! {
             result = listener.accept() => {
                 match result {
                     Ok((stream, _)) => {
+                        // UID gate: only same-user processes may attach
+                        // to this socket, even if a permissive parent
+                        // directory or chmod race exposed the file to
+                        // other users on the host.
+                        if !peer_uid_matches(&stream, owner_uid) {
+                            tracing::warn!(
+                                "rejecting peer connection from foreign uid \
+                                 (only uid {owner_uid} may attach)"
+                            );
+                            drop(stream);
+                            continue;
+                        }
                         let Ok(permit) = connection_permits.clone().try_acquire_owned() else {
                             tracing::warn!("peer connection limit reached; closing new client");
                             drop(stream);
@@ -89,6 +106,143 @@ fn harden_socket_permissions(path: &Path) {
 
 #[cfg(not(unix))]
 fn harden_socket_permissions(_path: &Path) {}
+
+/// Ensure the socket's parent directory exists, is owned by the
+/// current uid, and is mode 0700. If it already exists with looser
+/// permissions, tighten it (covers the case where an attacker
+/// pre-created `/tmp/term-mesh-peer-<uid>/` under their own uid). If
+/// it exists but isn't owned by us, refuse to proceed at all.
+#[cfg(unix)]
+fn harden_parent_directory(parent: &Path) -> anyhow::Result<()> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    if !parent.exists() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let meta = std::fs::metadata(parent)?;
+    let owner_uid = current_uid();
+    if meta.uid() != owner_uid {
+        anyhow::bail!(
+            "peer-federation socket parent directory {} is not owned by uid {} (got uid {}); refusing to bind",
+            parent.display(),
+            owner_uid,
+            meta.uid()
+        );
+    }
+    let mut perms = meta.permissions();
+    if perms.mode() & 0o777 != 0o700 {
+        perms.set_mode(0o700);
+        std::fs::set_permissions(parent, perms)?;
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn harden_parent_directory(parent: &Path) -> anyhow::Result<()> {
+    if !parent.exists() {
+        std::fs::create_dir_all(parent)?;
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn current_uid() -> u32 {
+    // Safe: getuid() never fails and has no side effects.
+    unsafe { libc::getuid() }
+}
+
+#[cfg(not(unix))]
+fn current_uid() -> u32 {
+    0
+}
+
+/// Bind the listener with a tight umask so the socket file is mode
+/// 0600 immediately, eliminating the bind→chmod TOCTOU window that
+/// exists when the kernel uses the process umask to derive the
+/// initial permissions.
+#[cfg(unix)]
+fn bind_with_tight_umask(path: &Path) -> std::io::Result<UnixListener> {
+    // libc::umask is process-global. We restore on success and on the
+    // unwind path so other threads that bind files concurrently aren't
+    // affected for longer than the bind() syscall itself.
+    let prev = unsafe { libc::umask(0o077) };
+    let result = UnixListener::bind(path);
+    unsafe { libc::umask(prev) };
+    result
+}
+
+#[cfg(not(unix))]
+fn bind_with_tight_umask(path: &Path) -> std::io::Result<UnixListener> {
+    UnixListener::bind(path)
+}
+
+/// Compare the connected peer's effective uid against `expected_uid`.
+/// Returns `true` only when we positively confirm the match; on any
+/// platform/syscall failure we fail closed (return `false`).
+#[cfg(target_os = "macos")]
+fn peer_uid_matches(stream: &tokio::net::UnixStream, expected_uid: u32) -> bool {
+    use std::os::fd::AsRawFd;
+
+    // Darwin's LOCAL_PEERCRED returns `xucred`. The first useful
+    // field (`cr_uid`) is the connected peer's effective uid.
+    #[repr(C)]
+    struct Xucred {
+        cr_version: libc::c_uint,
+        cr_uid: libc::uid_t,
+        cr_ngroups: libc::c_short,
+        cr_groups: [libc::gid_t; 16],
+    }
+    const LOCAL_PEERCRED: libc::c_int = 0x001;
+    const SOL_LOCAL: libc::c_int = 0;
+
+    let fd = stream.as_raw_fd();
+    let mut cred = std::mem::MaybeUninit::<Xucred>::zeroed();
+    let mut len = std::mem::size_of::<Xucred>() as libc::socklen_t;
+    let rc = unsafe {
+        libc::getsockopt(
+            fd,
+            SOL_LOCAL,
+            LOCAL_PEERCRED,
+            cred.as_mut_ptr() as *mut libc::c_void,
+            &mut len,
+        )
+    };
+    if rc != 0 {
+        return false;
+    }
+    let cred = unsafe { cred.assume_init() };
+    cred.cr_uid == expected_uid
+}
+
+#[cfg(target_os = "linux")]
+fn peer_uid_matches(stream: &tokio::net::UnixStream, expected_uid: u32) -> bool {
+    use std::os::fd::AsRawFd;
+
+    let fd = stream.as_raw_fd();
+    let mut cred = std::mem::MaybeUninit::<libc::ucred>::zeroed();
+    let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+    let rc = unsafe {
+        libc::getsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_PEERCRED,
+            cred.as_mut_ptr() as *mut libc::c_void,
+            &mut len,
+        )
+    };
+    if rc != 0 {
+        return false;
+    }
+    let cred = unsafe { cred.assume_init() };
+    cred.uid == expected_uid
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn peer_uid_matches(_stream: &tokio::net::UnixStream, _expected_uid: u32) -> bool {
+    // Conservative default: refuse all connections on platforms where
+    // we can't verify the peer's uid.
+    false
+}
 
 #[cfg(test)]
 mod integration_tests {
