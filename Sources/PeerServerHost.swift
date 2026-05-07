@@ -65,7 +65,7 @@ final class PeerServerCoordinator: NSObject {
     func setRunning(_ shouldRun: Bool) async -> Bool {
         if shouldRun {
             guard server == nil else { return true } // already up
-            await bringUp(at: PeerFederationSettings.socketPath, silent: true)
+            await bringUp(at: PeerFederationSettings.socketPath, silent: false)
             postStateChange()
             return server != nil
         } else {
@@ -104,7 +104,7 @@ final class PeerServerCoordinator: NSObject {
         alert.informativeText = "term-mesh.app will listen on this Unix socket. Existing file at the path will be overwritten."
 
         let input = NSTextField(frame: NSRect(x: 0, y: 0, width: 360, height: 24))
-        input.stringValue = "/tmp/termmesh-app-peer.sock"
+        input.stringValue = PeerFederationSettings.socketPath
         alert.accessoryView = input
         alert.addButton(withTitle: "Start")
         alert.addButton(withTitle: "Cancel")

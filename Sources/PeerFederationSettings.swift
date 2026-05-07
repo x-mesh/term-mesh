@@ -18,9 +18,7 @@ enum PeerFederationSettings {
 
     static var defaultSocketPath: String {
         let uid = getuid()
-        return NSTemporaryDirectory()
-            .appending("term-mesh-\(uid)")
-            .appending("/peer.sock")
+        return "/tmp/term-mesh-peer-\(uid)/peer.sock"
     }
     static var defaultDisplayName: String {
         ProcessInfo.processInfo.hostName

@@ -144,7 +144,7 @@ final class PeerCoordinator: NSObject {
         targetField.placeholderString = "user@mac-mini.local"
         let remoteLabel = NSTextField(labelWithString: "Remote peer socket:")
         let remoteField = NSTextField(frame: NSRect(x: 0, y: 0, width: 380, height: 24))
-        remoteField.stringValue = "/tmp/termmesh-app-peer.sock"
+        remoteField.stringValue = PeerFederationSettings.defaultSocketPath
 
         // Pre-fill from the most recent host so a re-connect is
         // one-keystroke (Cmd+T → Cmd+Return).
