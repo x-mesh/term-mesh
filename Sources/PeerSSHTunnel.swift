@@ -155,6 +155,8 @@ final class PeerSSHTunnel: @unchecked Sendable {
             "-o", "ServerAliveInterval=15",
             "-o", "ServerAliveCountMax=3",
             "-o", "StreamLocalBindMask=0177",
+            "-o", "StrictHostKeyChecking=accept-new",
+            "-o", "BatchMode=no",
             "-L", "\(localSockPath):\(remoteSockPath)",
             // `--` ends ssh option parsing so the trailing target is
             // always treated positionally, even if it sneaks past the

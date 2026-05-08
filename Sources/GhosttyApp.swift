@@ -998,6 +998,17 @@ class GhosttyApp {
 
         switch action.tag {
         case GHOSTTY_ACTION_NEW_SPLIT:
+            // Relay pane surfaces live in PeerRelayWorkspaceWindow, not a
+            // tabManager workspace. Their tabId is a placeholder UUID that
+            // tabManager doesn't know about, so newSplit would silently fail.
+            // The relay window's keyMonitor intercepts Cmd+D before it reaches
+            // Ghostty (Fix 3). This guard is a safety net for any remaining path.
+            if surfaceView.window is PeerRelayWorkspaceWindow {
+                #if DEBUG
+                dlog("relay.split.ghostty-path blocked — should have been caught by keyMonitor")
+                #endif
+                return true
+            }
             guard let tabId = surfaceView.tabId,
                   let surfaceId = surfaceView.terminalSurface?.id,
                   let direction = splitDirection(from: action.action.new_split) else {
