@@ -159,6 +159,90 @@ final class BrewSelfUpdater {
         }
     }
 
+    /// True only when the running app bundle lives under `/Applications/` —
+    /// prevents wrecking a DerivedData / DEV install with a `brew upgrade`.
+    var isApplicationsInstall: Bool { Self.isApplicationsInstall }
+
+    nonisolated static var isApplicationsInstall: Bool {
+        let path = Bundle.main.bundlePath
+        return path.hasPrefix("/Applications/")
+    }
+
+    /// True if all preconditions for a one-click upgrade are satisfied:
+    /// running from /Applications, brew + cask installed, and a fetched
+    /// update is waiting in the cache.
+    var canTriggerRestartAndUpgrade: Bool {
+        guard isApplicationsInstall else { return false }
+        guard cachedBrewPath != nil else { return false }
+        if case .readyToInstall = viewModel.state { return true }
+        return false
+    }
+
+    /// Confirm with the user, spawn the helper detached, and quit the app.
+    /// The helper waits for the process to exit, runs `brew upgrade --cask --force`,
+    /// and relaunches the new bundle.
+    @discardableResult
+    func triggerInstallAndRestart() -> Bool {
+        guard canTriggerRestartAndUpgrade else {
+            UpdateLogStore.shared.append("brew self-update: triggerInstall blocked — preconditions unmet")
+            return false
+        }
+        guard case let .readyToInstall(installed, latest) = viewModel.state else { return false }
+        guard let helper = Self.bundledHelperPath() else {
+            UpdateLogStore.shared.append("brew self-update: helper script missing from bundle")
+            viewModel.update(state: .error(message: "Update helper not found in app bundle."))
+            return false
+        }
+        guard let brew = cachedBrewPath else { return false }
+
+        let alert = NSAlert()
+        alert.messageText = "Update term-mesh from \(installed) to \(latest)?"
+        alert.informativeText = "term-mesh will quit, install the update via Homebrew, and relaunch automatically."
+        alert.alertStyle = .informational
+        alert.addButton(withTitle: "Restart and Update")
+        alert.addButton(withTitle: "Later")
+        let response = alert.runModal()
+        guard response == .alertFirstButtonReturn else {
+            UpdateLogStore.shared.append("brew self-update: user cancelled restart-and-update")
+            return false
+        }
+
+        let appPath = Bundle.main.bundlePath
+        UpdateLogStore.shared.append("brew self-update: spawning helper to upgrade \(installed) → \(latest)")
+
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/bin/bash")
+        process.arguments = [helper, brew, caskToken, appPath]
+        // Detach by giving the child a fresh stdio + no pipes back to us.
+        process.standardInput = FileHandle.nullDevice
+        process.standardOutput = FileHandle.nullDevice
+        process.standardError = FileHandle.nullDevice
+        do {
+            try process.run()
+        } catch {
+            UpdateLogStore.shared.append("brew self-update: helper spawn failed — \(error.localizedDescription)")
+            viewModel.update(state: .error(message: "Failed to launch update helper: \(error.localizedDescription)"))
+            return false
+        }
+
+        // Give the helper a moment to start its `pgrep` wait loop before we exit.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
+            NSApp.terminate(nil)
+        }
+        return true
+    }
+
+    /// Locate the bundled helper script, falling back to a DEBUG-time
+    /// repo-relative path so debug builds without the script bundled
+    /// still work for development.
+    nonisolated static func bundledHelperPath() -> String? {
+        if let url = Bundle.main.url(forResource: "brew-upgrade-helper", withExtension: "sh"),
+           FileManager.default.isExecutableFile(atPath: url.path) {
+            return url.path
+        }
+        return nil
+    }
+
     // MARK: - Scheduling
 
     private func scheduleInitialCheck() {
