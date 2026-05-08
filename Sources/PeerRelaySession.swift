@@ -420,6 +420,9 @@ final class PeerRelaySession {
                     if fd >= 0 {
                         // Accepted fd inherits O_NONBLOCK from listener; reset to blocking.
                         _ = Darwin.fcntl(fd, F_SETFL, Darwin.fcntl(fd, F_GETFL) & ~O_NONBLOCK)
+                        // Prevent a slow/stalled relay from blocking auth indefinitely.
+                        var timeout = timeval(tv_sec: 5, tv_usec: 0)
+                        _ = setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, socklen_t(MemoryLayout<timeval>.size))
                         guard Self.clientHasSameUser(fd: fd) else {
                             Darwin.close(fd)
                             cont.resume(throwing: RelayError.ioError("relay peer uid mismatch"))
@@ -445,8 +448,13 @@ final class PeerRelaySession {
         }
     }
 
+    private static let kRelayAuthMaxPayload: Int = 256
+
     private nonisolated static func verifyRelaySecret(_ relay: RelaySocket, expected: String) throws {
         let frame = try relay.readFrame()
+        guard frame.payload.count <= kRelayAuthMaxPayload else {
+            throw RelayError.ioError("relay auth frame too large: \(frame.payload.count)")
+        }
         let expectedBytes = Array(expected.utf8)
         let receivedBytes = Array(frame.payload)
         guard frame.type == kTypeAuth,

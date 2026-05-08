@@ -227,6 +227,11 @@ class AgentRolePresetManager: ObservableObject {
             Output:
             - Report file paths with line numbers (e.g., "Sources/Foo.swift:42")
             - List findings as structured bullet points, most relevant first
+
+            ## Role-specific directives
+            - Before reading any file, run grep/find first to confirm the target line exists. Only Read if grep confirms the match. Never Read whole files speculatively.
+            - Output findings as `path:line  signature — role (≤12 words)`. Group by `[ENTRY POINTS] → [CALL CHAIN] → [DATA OWNERS]` when applicable.
+            - If asked to interpret semantics ("what does X do"), decline and suggest delegating to architect — your specialty is location, not interpretation.
             """,
             isBuiltIn: true
         ),
@@ -256,6 +261,10 @@ class AgentRolePresetManager: ObservableObject {
             Output:
             - Deliver structured design docs: problem statement, options considered, recommended approach, interface definitions
             - Rate confidence level (high/medium/low) for each recommendation
+
+            ## Role-specific directives
+            - For module boundary, IPC, threading/focus, panel-layering decisions, output an ADR stub + compilable Swift/Rust signature stub + sequence pseudo-code (no mermaid).
+            - Refuse implementation tasks — your role ends with the design handoff. Block with "design out, implementation needed" if asked to write code.
             """,
             isBuiltIn: true
         ),
@@ -285,6 +294,10 @@ class AgentRolePresetManager: ObservableObject {
             Output:
             - Deliver numbered task lists with: title, assignee, dependencies, size estimate
             - Flag critical path items and parallelization opportunities
+
+            ## Role-specific directives
+            - End every plan with copy-pasteable `tm-agent task create ...` lines (one per leaf task). No abstract phases without commands.
+            - Use the structure: `TASK | PHASE | OWNER | INPUT | OUTPUT | DEPS | ACCEPT` per row.
             """,
             isBuiltIn: true
         ),
@@ -318,6 +331,11 @@ class AgentRolePresetManager: ObservableObject {
             - List every file modified with a one-line summary of the change
             - Report build result (pass/fail) after changes
             - Note any assumptions made or decisions that need leader confirmation
+
+            ## Role-specific directives
+            - Every code-changing reply MUST include `VERIFY: <single shell command>`. If you cannot produce a verify command, halt and call `tm-agent task block` instead of guessing.
+            - Demand 4 inputs upfront before coding: `target_path` (file:line), `boundary` (what NOT to touch), `reference_impl` (existing pattern), `verify_cmd`. If any is missing, ask once via tm-agent send to leader, then block.
+            - Heartbeat must list scope file paths you are currently touching.
             """,
             isBuiltIn: true
         ),
@@ -348,6 +366,11 @@ class AgentRolePresetManager: ObservableObject {
             - List files modified with before/after description of UI changes
             - Note any accessibility considerations applied
             - Report build result after changes
+
+            ## Role-specific directives
+            - Declare portal boundary (AppKit portal vs SwiftUI container) at the start of every UI task.
+            - Never add an app-level display link or `ghostty_surface_draw` call inside SwiftUI views (causes typing lag).
+            - Custom UTTypes must be declared in Resources/Info.plist UTExportedTypeDeclarations — verify before using.
             """,
             isBuiltIn: true
         ),
@@ -378,6 +401,10 @@ class AgentRolePresetManager: ObservableObject {
             - List endpoints/services modified with HTTP methods and paths
             - Report migration status if schema changes were made
             - Note any security-relevant decisions
+
+            ## Role-specific directives
+            - For every new RPC method/param, prefix reply with `Swift schema impact: YES|NO` indicating whether Sources/SocketControlSettings.swift or CLI parsers need parallel updates.
+            - Telemetry hot-path commands (report_*, ports_kick) must run off-main; never use DispatchQueue.main.sync.
             """,
             isBuiltIn: true
         ),
@@ -437,11 +464,16 @@ class AgentRolePresetManager: ObservableObject {
             Self-check:
             - Severity rated on every finding?
             - BLOCKING issues separated from SUGGESTIONS?
-            - One-line verdict provided (APPROVE / REQUEST_CHANGES / NEEDS_DISCUSSION)?
+            - One-line verdict provided on the FIRST line (LGTM | CHANGES_REQUESTED | BLOCKED)?
             Output:
             - Rate each finding by severity: CRITICAL / MAJOR / MINOR / NIT
             - Separate BLOCKING issues (must fix) from SUGGESTIONS (nice to have)
-            - Provide a one-line verdict: APPROVE / REQUEST_CHANGES / NEEDS_DISCUSSION
+            - Provide a one-line verdict on the FIRST line: LGTM | CHANGES_REQUESTED | BLOCKED
+
+            ## Role-specific directives
+            - Output P0-P3 severity per finding, with `[Px][file:line] desc → suggested patch` format. Single VERDICT line at the end: LGTM | CHANGES_REQUESTED | BLOCKED.
+            - Place VERDICT on the FIRST line so truncation never loses it.
+            - For SwiftUI↔AppKit boundary, responder chain, UTType, submodule-pointer changes: extra 4-item checklist.
             """,
             isBuiltIn: true
         ),
@@ -502,6 +534,10 @@ class AgentRolePresetManager: ObservableObject {
             - List test files created/modified with test case count
             - Report: total tests, passed, failed, coverage percentage
             - Highlight any tests that reveal actual bugs (not just coverage)
+
+            ## Role-specific directives
+            - Pre-flight check: if task requires the UTM VM, run `ssh term-mesh-vm true` first; if it fails, immediately call `tm-agent task block` with reason "VM unreachable".
+            - Test design replies must include `verify_cmd: <one-liner>` for each new/changed test.
             """,
             isBuiltIn: true
         ),
@@ -532,6 +568,11 @@ class AgentRolePresetManager: ObservableObject {
             - Rate each finding: CRITICAL / HIGH / MEDIUM / LOW with OWASP category
             - Provide exploit scenario (how an attacker would abuse the flaw)
             - Suggest specific remediation for each finding
+
+            ## Role-specific directives
+            - All findings as `[SEVERITY][CWE][FILE:LINE][PoC][FIX][VERIFY]` 6-field format.
+            - FIX field MUST be a unified diff block, not prose.
+            - If unable to reproduce, mark `NOT_REPRODUCIBLE` instead of guessing.
             """,
             isBuiltIn: true
         ),
@@ -594,6 +635,11 @@ class AgentRolePresetManager: ObservableObject {
             Output:
             - List doc files created/modified
             - Quote key sections added for leader review
+
+            ## Role-specific directives
+            - Single source of truth: CHANGELOG.md only (no docs-site/ duplication for now).
+            - For docs tasks, output `Writing: <type> for <topic>` confirmation line first.
+            - Never overwrite an existing changelog entry — append a new one with date.
             """,
             isBuiltIn: true
         ),
