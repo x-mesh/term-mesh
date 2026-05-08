@@ -770,7 +770,10 @@ final class GhosttySurfaceScrollView: NSView {
                     surface.sendSurfaceKeyPress(keycode: 0x24, text: "\r")
                     return true
                 } else if self.surfaceView.surface != nil {
-                    return self.surfaceView.sendIMEText(text)
+                    self.surfaceView.sendIMETextResult(text) { result in
+                        if case .failure = result { NSSound.beep() }
+                    }
+                    return true
                 } else {
                     // Surface temporarily nil (pane re-creation) — retry once after 50ms
                     DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) { [weak self] in
@@ -778,8 +781,8 @@ final class GhosttySurfaceScrollView: NSView {
                             NSSound.beep()
                             return
                         }
-                        if !self.surfaceView.sendIMEText(text) {
-                            NSSound.beep()
+                        self.surfaceView.sendIMETextResult(text) { result in
+                            if case .failure = result { NSSound.beep() }
                         }
                     }
                     // Return false since the actual send is deferred; caller should not clear text
