@@ -2,6 +2,21 @@
 
 All notable changes to term-mesh are documented here.
 
+## [0.101.0] - 2026-05-08
+
+### Fixed
+- **Peer relay SSH first-connect no longer hangs** — Connecting a relay to a Mac whose host key isn't in `~/.ssh/known_hosts` previously stopped at the SSH "Are you sure you want to continue connecting (yes/no/[fingerprint])?" prompt with no way to answer from inside term-mesh. The tunnel now passes `-o StrictHostKeyChecking=accept-new` so brand-new hosts are auto-registered (TOFU) while changed keys are still rejected, and `-o BatchMode=no` keeps password fallback available when public-key auth isn't.
+- **Peer relay window split (Cmd+D) actually splits now** — Three silent-fail paths were eating the keypress: `dispatchSplit` returned with no log when the subscription session was still nil, `GHOSTTY_ACTION_NEW_SPLIT` routed relay surfaces through `tabManager.newSplit(tabId: UUID())` (random UUID, no matching tab), and the relay window's keyMonitor only installed after the subscription handshake. Cmd+D during the handshake now stays inside the relay controller, the GhosttyApp action short-circuits for relay windows so the split goes through `dispatchSplit`, and a DEBUG `relay.split.skip` dlog surfaces a refusal when a split is genuinely unavailable.
+- **Multi-pane broadcasts no longer strand peers at `[Pasted text #1]`** — When `tm-agent broadcast` (or any 3+ simultaneous deliveries) arrived faster than the previous Return retry could finish, four out of five surfaces could end up with the pasted text but no Enter — a `sendIMEText` reentrancy where the second paste hit `false` and the daemon's Return RPC was skipped. Replaced with a per-surface FIFO paste queue (depth 16, oldest-drop with a Sentry breadcrumb) that drains on the main actor, a `pasteGeneration` cancellation token that prevents async retry double-completion, and a finalize watchdog so a wedged surface never holds the queue forever. Return retry shortened from `[0.2, 0.5, 1.0, 5.0, 25.0]s` to `[0.2, 0.5, 1.0, 2.0, 3.0]s` so one bad delivery no longer parks the queue for 25 seconds.
+
+### Security
+- **Daemon control socket is now owner-only** — `daemon/term-meshd` previously bound the local control socket without a tight umask, so the file could end up at 0o660 (group-readable/writable). The bind now runs under `umask 0o077`, the socket is force-set to 0o600 after creation, and the accept loop adds a `LOCAL_PEERCRED` (macOS) / `SO_PEERCRED` (Linux) UID match — connections from a different UID are dropped with a warn log instead of being served. Mirrors the hardening already applied to the peer relay socket in 0.99.0.
+- **Peer relay handshake gets bounded reads** — `acceptRelay()` now sets `SO_RCVTIMEO = 5s` after the non-blocking accept polls finish, so a peer that opens the socket and never sends bytes can't park a relay handshake task indefinitely. The auth-frame size is capped at 256 bytes (down from the 1 MiB read-frame ceiling) before `verifyRelaySecret`, blocking pre-auth allocation amplification.
+
+### Thanks to 1 contributor!
+
+- [@JINWOO-J](https://github.com/JINWOO-J)
+
 ## [0.100.0] - 2026-05-08
 
 ### Added
