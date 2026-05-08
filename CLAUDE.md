@@ -288,6 +288,124 @@ When a task has a fix budget (set via `--auto-fix-budget N` on delegate):
 - Auto-blocked tasks require leader intervention to unblock.
 - If no fix budget is set, fix-attempt is optional (count is still tracked).
 
+### Agent Trigger Routing
+
+특정 작업이 발생했을 때 leader가 직접 처리하지 않고 해당 에이전트에 위임한다.
+아래 매트릭스는 brainstorm(2026-05-08) Tier 1·2 합의 결과와 persona run 운영 규칙 R1을 영구화한 것이다.
+
+| 시그널 | → 에이전트 | 근거 |
+|--------|-----------|------|
+| "X is defined where", "all callers of Y", "find pattern across", "what does M depend on" | **explorer** | 심볼 탐색·파일 위치 확인은 grep-first 전문 역할 |
+| Sources/Panels/*, Sources/Splits/*, UTType, performKeyEquivalent, 애니메이션, SwiftUI 레이아웃 | **frontend** | AppKit/SwiftUI 컴포넌트 경계 변경 |
+| daemon/, term-meshd, JSON-RPC schema 변경, peer-federation Phase 진행 | **backend** | Rust 데몬·IPC 프로토콜 전담 |
+| 신규 IPC 커맨드 설계, 모듈 경계 결정, threading/focus 정책, panel layering 계약 | **architect** | 구조적 결정 — 코드 작성 전에 ADR 필요 |
+| Process(), 신규 socket 커맨드, 외부 입력 파싱, allowAll 조건 변경, quoting 코드 | **security** | 취약점 패턴 즉시 탐지 의무 |
+| executor diff 완료 직후, submodule 포인터 변경, /release·/ship 직전 | **reviewer** | 코드 품질·포인터 정합성 게이트 |
+| 기능 브랜치 머지 후, CLI·DX 변경, Settings UI 신규 옵션 추가, /release Step 4 | **writer** | CHANGELOG·README·CLAUDE.md 단일 소스 관리 |
+| 파일 3개 이상 동시 변경, Phase·Stage 의존성 존재, 에이전트 2명+ 관여하는 작업 | **planner** | task 분해·의존성 그래프·Phase gate 설계 |
+| socket 커맨드 추가, focus policy 변경, split 레이아웃 변경, PR 직전 smoke test | **tester** | VM 기반 통합 테스트 실행 |
+| ghostty 서브모듈 변경, GhosttyKit.xcframework 재빌드, zig 빌드 crash | **backend** + **executor** | xcframework 빌드 = ghostty submodule + zig 의존성 |
+| dSYM 업로드, Sentry 이슈 분류, 심볼화 실패 디버깅 | **executor** | scripts/upload-dsym.sh 워크플로우 |
+| /xm:op·/team 슬래시 커맨드 자체 수정, tm-agent 옵션 추가, 페르소나 프롬프트 갱신 | **architect** + **writer** | 메타 도구 변경 — 설계+문서 동시 |
+| executor 완료 후 build·tests 실패, fix 시도 3회+ 반복 블로킹 상황 | **executor** (재위임) + **reviewer** 동시 | 실패 원인 분류 후 fix-attempt budget 소진 전 에스컬레이션 |
+
+> **Anti-pattern — leader가 절대 직접 처리하지 말 것:**
+>
+> ```bash
+> # BAD — leader가 직접 탐색 후 결과를 직접 사용
+> grep -r "PeerRelaySession" Sources/ | head -20
+> # → 탐색 결과를 leader 컨텍스트에 적재, 탐색 비용 leader가 부담
+>
+> # GOOD — 탐색을 explorer에 위임, leader는 결과만 소비
+> tm-agent delegate explorer 'Find all call sites of PeerRelaySession.connect() — return path:line format'
+> tm-agent wait --timeout 30 --mode any
+> tm-agent read explorer --lines 50
+> ```
+
+### Reply Truncation Protocol
+
+`tm-agent reply`와 `tm-agent collect`는 소켓 전송을 **1500자로 truncate**한다.
+풀 내용은 `~/.term-mesh/results/<team>/<task_id>.md`에 자동 저장되며, 24시간 후 자동 정리된다.
+
+#### 에이전트 의무
+
+- **응답이 1000자를 초과할 경우** reply 첫 줄에 다음을 의무적으로 포함한다:
+
+```
+Full report: ~/.term-mesh/results/<team>/<task_id>.md
+```
+
+- `<team>`: `tm-agent status`의 team_name 필드
+- `<task_id>`: 현재 처리 중인 task ID (8자리 hex)
+
+#### Leader가 풀 내용을 읽는 명령
+
+```bash
+# 특정 task 전체 결과
+cat ~/.term-mesh/results/my-team/<task_id>.md
+
+# 에이전트의 최신 reply
+cat ~/.term-mesh/results/my-team/<agent>-reply.md
+
+# 예시: explorer의 탐색 결과 전문
+cat ~/.term-mesh/results/my-team/explorer-reply.md
+```
+
+> **BAD/GOOD 예시:**
+>
+> ```bash
+> # BAD — collect 결과가 "..." 로 끊겨 핵심 VERIFY 명령이 누락됨
+> tm-agent collect --lines 100
+> # → "...확인 필요. VERIFY: xcodebuild -scheme term-mesh ..." (잘림)
+>
+> # GOOD — truncation 감지 후 파일 직접 읽기
+> tm-agent collect --lines 100
+> # 결과 끝이 "..." 이거나 "Full report:" 가 보이면:
+> cat ~/.term-mesh/results/my-team/executor-reply.md
+> ```
+
+### Standard Reply Header
+
+모든 에이전트 reply는 다음 **4필드 헤더**로 시작한다.
+이 헤더는 brainstorm(2026-05-08) Tier 1 Cluster D 합의 결과를 영구화한 것이다.
+
+```
+STATUS: DONE|BLOCKED|NEEDS_REVIEW
+FILES: <변경된 파일 경로, 복수 시 공백 구분, 없으면 "none">
+VERIFY: <결과를 확인하는 단일 shell 명령, 해당 없으면 "n/a">
+NEXT: <leader가 다음에 실행할 액션 한 줄, 없으면 "NONE">
+```
+
+- **모든 task**: 4필드 의무. 해당 없으면 `n/a`/`none`/`NONE` 사용.
+- 헤더 다음에 페르소나별 본문 포맷이 이어진다 (아래 참조)
+
+#### 페르소나별 포맷과의 관계
+
+Standard Header가 **첫 블록**, 페르소나 고유 포맷이 **본문**이다. 중복 필드(예: security의 VERIFY 필드)는 헤더 VERIFY와 동일 값을 사용한다.
+
+| 에이전트 | 본문 포맷 |
+|---------|----------|
+| explorer | `path:line — 역할 한 줄` |
+| reviewer | `[P0-P3][file:line] 설명 → patch snippet + VERDICT: LGTM\|CHANGES` |
+| security | `[SEVERITY][CWE][FILE:LINE][PoC][FIX][VERIFY]` 6필드 |
+| planner | `TASK\|PHASE\|OWNER\|INPUT\|OUTPUT\|DEPS\|ACCEPT + tm-agent task create 라인` |
+| architect | ADR 섹션 + Swift/Rust 스텁 + sequence pseudo |
+| executor | `STATUS\|FILES\|VERIFY\|NEXT 헤더 + diff/build 결과` |
+| frontend | `STATUS\|FILES\|VERIFY + portal 경계 명시 + dlog 이벤트 목록` |
+| backend | `STATUS\|FILES\|VERIFY + RPC 변경 시 첫 줄 Swift 영향 YES/NO + CHANGED_FILES` |
+| tester | `STATUS\|FILES\|VERIFY + 테스트 케이스 수 N/M + VM 필요 여부` |
+| writer | `STATUS\|FILES\|NEXT + 삽입 위치 + Self-check 한 줄` |
+
+#### Leader가 STATUS·NEXT를 일괄 추출하는 명령
+
+```bash
+# 전체 에이전트 collect 후 STATUS·NEXT만 추출
+tm-agent collect --lines 100 | grep -E "^(STATUS|NEXT):"
+
+# 특정 에이전트의 헤더만 확인
+cat ~/.term-mesh/results/my-team/<agent>-reply.md | head -5
+```
+
 ## E2E mac UI tests
 
 Run UI tests on the UTM macOS VM (never on the host machine). Always run e2e UI tests via `ssh term-mesh-vm`:
