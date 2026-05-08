@@ -65,7 +65,15 @@ final class PeerSSHTunnel: @unchecked Sendable {
         self.sshTarget = sshTarget
         self.remoteSockPath = remoteSockPath
         let uuid = UUID().uuidString.lowercased().prefix(8)
-        self.localSockPath = "/tmp/tm-peer-ssh-\(uuid).sock"
+        // Embed the owning app's PID in the filename so the startup
+        // sweep can distinguish "left over from a dead app instance"
+        // from "currently held by a sibling app instance" (DEV vs
+        // STAGING vs Release running side-by-side, or a tagged debug
+        // build alongside the main app — see CLAUDE.md). Without the
+        // PID, sweep would PPID-only-classify a sibling's healthy
+        // tunnel as an orphan and SIGTERM it.
+        let owner = ProcessInfo.processInfo.processIdentifier
+        self.localSockPath = "/tmp/tm-peer-ssh-\(owner)-\(uuid).sock"
     }
 
     var currentState: PeerSSHTunnelState {
@@ -118,13 +126,52 @@ final class PeerSSHTunnel: @unchecked Sendable {
         restartTask = nil
         lock.unlock()
         task?.cancel()
+        // Only unlink the local socket once we've actually reaped ssh.
+        // If `p` is nil here, the terminationHandler already fired —
+        // ssh has exited and unlinking the path is safe. If `p` is
+        // alive but `terminate()` doesn't kill it within the grace
+        // window, we escalate to SIGKILL rather than blocking forever
+        // and we leave the socket file alone so a still-running ssh
+        // doesn't end up as a "ghost socket" (kernel-bound but path
+        // gone), which is exactly the corruption a mid-stop crash
+        // used to leave behind.
+        var sshActuallyExited = (p == nil)
         if let p, p.isRunning {
             p.terminate()
-            // Reap; ssh -N exits within a few hundred ms of SIGTERM.
-            p.waitUntilExit()
+            sshActuallyExited = waitForExit(p, timeout: 2.0)
+            if !sshActuallyExited {
+                kill(p.processIdentifier, SIGKILL)
+                sshActuallyExited = waitForExit(p, timeout: 1.0)
+            }
+        } else {
+            sshActuallyExited = true
         }
-        try? FileManager.default.removeItem(atPath: localSockPath)
-        emit(.stopped)
+        if sshActuallyExited {
+            try? FileManager.default.removeItem(atPath: localSockPath)
+            emit(.stopped)
+        } else {
+            // SIGKILL didn't reap ssh (rare — typically a kernel-level
+            // hang or PID reuse). The socket file is intentionally not
+            // unlinked above so we don't ghost-socket a still-running
+            // process. Emit `.failed` instead of `.stopped` so UI
+            // listeners can surface the leak (banner, telemetry) and
+            // the next-launch sweep can clean up via owner-PID gating.
+            emit(.failed(reason: "ssh did not exit after SIGTERM+SIGKILL; tunnel state leaked"))
+        }
+    }
+
+    /// Polls `Process.isRunning` up to `timeout` seconds. Returns
+    /// `true` if the process exited within the budget, `false`
+    /// otherwise. Avoids `waitUntilExit()` which blocks indefinitely
+    /// when ssh ignores SIGTERM (rare but observed during sleep/wake
+    /// or with mis-configured ProxyCommand chains).
+    private func waitForExit(_ proc: Process, timeout: TimeInterval) -> Bool {
+        let deadline = Date().addingTimeInterval(timeout)
+        while proc.isRunning {
+            if Date() > deadline { return false }
+            Thread.sleep(forTimeInterval: 0.05)
+        }
+        return true
     }
 
     deinit {
@@ -313,6 +360,170 @@ final class PeerSSHTunnel: @unchecked Sendable {
         Task { @MainActor in
             cb(newState)
         }
+    }
+
+    // MARK: - Stale-tunnel sweep
+
+    /// Reap leftover SSH tunnels from a previous crashed app run.
+    /// Two failure modes show up after an abnormal exit:
+    ///
+    /// 1. The local listen socket file is left at `/tmp/tm-peer-ssh-<pid>-<uuid>.sock`
+    ///    but its owning ssh subprocess is gone — connect() would fail
+    ///    with ECONNREFUSED forever.
+    /// 2. The ssh subprocess survives (reparented to launchd) but its
+    ///    bind path was already unlinked by a partial `stop()`. lsof
+    ///    sees the unix socket, but `connect(path)` returns ENOENT
+    ///    because the directory entry is gone — the "ghost socket"
+    ///    failure that motivated this sweep.
+    ///
+    /// Mode 1 we fix by unlinking the orphaned file. Mode 2 we fix by
+    /// killing the orphaned ssh PID; the kernel then drops the socket
+    /// inode automatically.
+    ///
+    /// Multi-instance safety: the sweep must NOT touch a sibling
+    /// term-mesh app's live tunnels (DEV/STAGING/Release running
+    /// side-by-side, tagged debug builds, etc.). The classifier is
+    /// "owner PID embedded in the socket filename / argv is no longer
+    /// alive" — not just PPID. A sibling's ssh has PPID = sibling's
+    /// app PID (alive), so it's preserved. A leftover ssh has PPID =
+    /// 1 (launchd) AND its embedded owner PID is dead, so it's
+    /// reaped. The owner-PID gate also covers the case where a
+    /// sibling's app PID happens to match `getppid()` for our ssh
+    /// (impossible in practice — Process.run is a direct fork — but
+    /// the owner-PID check is independent of ancestry).
+    static func sweepStaleTunnels() {
+        // (a) Files on disk: unlink only if its embedded owner PID is
+        //     no longer alive AND no ssh currently holds the path.
+        //     Files whose owner is alive (our run, or a sibling
+        //     instance's run) are preserved even if we can't read
+        //     the lsof state.
+        if let entries = try? FileManager.default.contentsOfDirectory(atPath: "/tmp") {
+            for name in entries
+                where name.hasPrefix("tm-peer-ssh-") && name.hasSuffix(".sock")
+            {
+                let path = "/tmp/\(name)"
+                if let owner = ownerPidFromSockName(name), isPidAlive(owner) {
+                    continue
+                }
+                if pidsHoldingPath(path).isEmpty {
+                    try? FileManager.default.removeItem(atPath: path)
+                }
+            }
+        }
+
+        // (b) Orphaned ssh subprocesses: any ssh whose -L argv references
+        //     /tmp/tm-peer-ssh-<owner>-<uuid>.sock where <owner> is a
+        //     dead PID. PPID is intentionally NOT in the predicate — it
+        //     would false-positive a sibling app's child after that
+        //     sibling exits (PPID becomes 1) AND mis-classify our own
+        //     children if they're enumerated mid-fork.
+        let pids = orphanedTunnelPids()
+        for pid in pids {
+            kill(pid, SIGTERM)
+        }
+        // SIGKILL escalation: ssh that ignores SIGTERM (sleep/wake,
+        // mis-configured ProxyCommand, etc.) would otherwise persist
+        // across launches because the next-launch sweep just sends
+        // another ineffectual SIGTERM. We mirror `stop()`'s 2s grace
+        // budget here. Sweep runs on a background queue (see
+        // AppDelegate), so Thread.sleep is safe.
+        if !pids.isEmpty {
+            Thread.sleep(forTimeInterval: 1.5)
+            for pid in pids where isPidAlive(pid) {
+                kill(pid, SIGKILL)
+            }
+        }
+    }
+
+    /// Extracts `<owner>` from a basename like
+    /// `tm-peer-ssh-<owner>-<uuid>.sock`. Returns nil for legacy
+    /// names (`tm-peer-ssh-<uuid>.sock` from older builds) — those
+    /// have no owner gate and fall through to the lsof check.
+    private static func ownerPidFromSockName(_ name: String) -> pid_t? {
+        // "tm-peer-ssh-".count == 12
+        let body = name.dropFirst("tm-peer-ssh-".count).dropLast(".sock".count)
+        guard let dash = body.firstIndex(of: "-") else { return nil }
+        return pid_t(body[body.startIndex..<dash])
+    }
+
+    /// Extracts `<owner>` from a `-L` argv field of the form
+    /// `/tmp/tm-peer-ssh-<owner>-<uuid>.sock:<remote>`. Returns nil
+    /// if the path doesn't match the expected layout.
+    private static func ownerPidFromArgv(_ cmd: String) -> pid_t? {
+        guard let range = cmd.range(of: "/tmp/tm-peer-ssh-") else { return nil }
+        let after = cmd[range.upperBound...]
+        guard let dash = after.firstIndex(of: "-") else { return nil }
+        return pid_t(after[after.startIndex..<dash])
+    }
+
+    /// True iff a process with `pid` exists. Uses signal 0 which
+    /// performs the permission/existence check without delivering a
+    /// signal. EPERM means the process exists but belongs to another
+    /// uid (we still treat it as alive — leave it alone).
+    private static func isPidAlive(_ pid: pid_t) -> Bool {
+        if pid <= 1 { return false }   // 0/1 are sentinel; never an owner
+        if kill(pid, 0) == 0 { return true }
+        return errno == EPERM
+    }
+
+    /// Returns PIDs that have the given path open (any fd type),
+    /// using `lsof -t -- <path>`. Empty array on lookup failure or
+    /// when nothing holds the path.
+    private static func pidsHoldingPath(_ path: String) -> [pid_t] {
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: "/usr/sbin/lsof")
+        proc.arguments = ["-t", "--", path]
+        let out = Pipe()
+        proc.standardOutput = out
+        proc.standardError = Pipe()
+        do { try proc.run() } catch { return [] }
+        proc.waitUntilExit()
+        guard let data = try? out.fileHandleForReading.readToEnd(),
+              let s = String(data: data, encoding: .utf8) else { return [] }
+        return s.split(whereSeparator: { $0.isNewline })
+            .compactMap { pid_t($0) }
+    }
+
+    /// Scan all running ssh processes; return PIDs whose -L argv
+    /// references a `/tmp/tm-peer-ssh-<owner>-<uuid>.sock` path where
+    /// `<owner>` is a dead PID. Live owners (our run or a sibling
+    /// term-mesh app instance) are preserved. ssh procs whose argv
+    /// uses the legacy unowned filename (no embedded PID) are also
+    /// preserved — there's no safe way to attribute them, and they
+    /// will eventually be cleaned by `pidsHoldingPath` once they die
+    /// on their own.
+    private static func orphanedTunnelPids() -> [pid_t] {
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: "/bin/ps")
+        proc.arguments = ["-Ao", "pid=,command="]
+        let out = Pipe()
+        proc.standardOutput = out
+        proc.standardError = Pipe()
+        do { try proc.run() } catch { return [] }
+        proc.waitUntilExit()
+        guard let data = try? out.fileHandleForReading.readToEnd(),
+              let s = String(data: data, encoding: .utf8) else { return [] }
+
+        var result: [pid_t] = []
+        for line in s.split(whereSeparator: { $0.isNewline }) {
+            let trimmed = line.trimmingCharacters(in: .whitespaces)
+            let parts = trimmed.split(separator: " ", maxSplits: 1,
+                                      omittingEmptySubsequences: true)
+            guard parts.count == 2,
+                  let pid = pid_t(parts[0])
+            else { continue }
+            let cmd = String(parts[1])
+            // Require both the ssh executable path AND a tm-peer-ssh-
+            // socket path that we know is ours (owner-prefixed). The
+            // owner-prefixed match keeps us from ever SIGTERMing a
+            // benign ssh whose argv merely contains the substring.
+            guard cmd.contains("/usr/bin/ssh"),
+                  let owner = ownerPidFromArgv(cmd)
+            else { continue }
+            if isPidAlive(owner) { continue }   // sibling or self
+            result.append(pid)
+        }
+        return result
     }
 
     // MARK: - Argument validation

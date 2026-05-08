@@ -2,6 +2,15 @@
 
 All notable changes to term-mesh are documented here.
 
+## [0.102.1] - 2026-05-08
+
+### Fixed
+- **Peer relay/socket connect no longer silently fails after a previous app crash** — If the app exited abnormally while a peer SSH tunnel was up, the local listen socket file at `/tmp/tm-peer-ssh-*.sock` could end up unlinked while the ssh subprocess (now reparented to launchd) kept the unix socket bound in the kernel. New connect attempts saw `ENOENT` even though `lsof` still listed the socket — relay and direct socket connects both failed with no error surfaced. Term-mesh now (a) waits for ssh to actually exit before unlinking the socket file in `stop()`, with a 2 s SIGTERM grace and 1 s SIGKILL escalation, (b) sweeps `/tmp/tm-peer-ssh-*.sock` and orphan ssh subprocesses on launch using owner-PID gating so sibling app instances (DEV / STAGING / Release running side-by-side) never reap each other's live tunnels, and (c) embeds the owning app's PID in the listen socket filename to make that gate possible.
+
+### Thanks to 1 contributor!
+
+- [@JINWOO-J](https://github.com/JINWOO-J)
+
 ## [0.102.0] - 2026-05-08
 
 ### Removed

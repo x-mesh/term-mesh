@@ -236,6 +236,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         // /tmp/tm-peer-relay-*.sock files accumulate indefinitely.
         PeerRelaySession.sweepStaleRelaySockets()
 
+        // Same idea for SSH tunnel listen sockets: a previous app
+        // instance can leave /tmp/tm-peer-ssh-*.sock files (and even
+        // orphaned ssh subprocesses re-parented to launchd) behind.
+        // Without this sweep, the orphaned ssh holds the unix socket
+        // bound in the kernel while the path is gone from the
+        // filesystem, so new clients see ENOENT and relay/socket
+        // connects both silently fail.
+        //
+        // Off the main thread: the sweep shells out to `lsof` and `ps`
+        // via NSConcreteTask, whose `waitUntilExit()` pumps the main
+        // runloop. Calling it from didFinishLaunching causes a
+        // deadlock-style stall — main-queue work re-enters under the
+        // wait and the launch hangs. A background queue keeps the UI
+        // responsive while still completing well before any peer
+        // dialog the user can open.
+        DispatchQueue.global(qos: .utility).async {
+            PeerSSHTunnel.sweepStaleTunnels()
+        }
+
 #if DEBUG
         writeUITestDiagnosticsIfNeeded(stage: "didFinishLaunching")
         DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self] in
