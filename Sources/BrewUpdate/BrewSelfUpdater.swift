@@ -87,10 +87,9 @@ final class BrewSelfUpdater {
 
     let viewModel: BrewSelfUpdateViewModel
     private let caskToken: String
-    /// Optional bridge into the Sparkle update pill — when set, brew's
-    /// readyToInstall state is mirrored as `UpdateState.brewReadyToInstall`
-    /// so the existing pill UI surfaces it.
-    private weak var bridgedSparklePillModel: UpdateViewModel?
+    /// Optional bridge into the UpdateViewModel pill — when set, all brew states
+    /// are mirrored into UpdateState so the pill UI surfaces them.
+    private weak var bridgedPillModel: UpdateViewModel?
     private var stateBridgeCancellable: AnyCancellable?
     private let timerQueue = DispatchQueue(label: "term-mesh.brew-self-update.timer", qos: .utility)
     private var outdatedTimer: DispatchSourceTimer?
@@ -131,43 +130,59 @@ final class BrewSelfUpdater {
         pathMonitor.cancel()
     }
 
-    /// Mirror brew state into the existing Sparkle UpdateViewModel via overrideState.
-    /// While brew has a readyToInstall update, the standard UpdatePill shows
-    /// "Update Available: <latest>" and clicking it routes through the brew install path.
+    /// Mirror all brew states into UpdateViewModel so the pill UI surfaces them.
     /// Idempotent — calling again just updates the bridged target.
-    func bridgeToSparklePill(_ updateModel: UpdateViewModel) {
-        bridgedSparklePillModel = updateModel
+    func bridgeToPill(_ updateModel: UpdateViewModel) {
+        bridgedPillModel = updateModel
         stateBridgeCancellable?.cancel()
         stateBridgeCancellable = viewModel.$state
             .receive(on: DispatchQueue.main)
             .sink { [weak self] state in
-                self?.applyToSparklePill(state)
+                self?.applyToPill(state)
             }
-        applyToSparklePill(viewModel.state)
+        applyToPill(viewModel.state)
     }
 
-    private func applyToSparklePill(_ state: BrewSelfUpdateState) {
-        guard let updateModel = bridgedSparklePillModel else { return }
+    private func applyToPill(_ state: BrewSelfUpdateState) {
+        guard let updateModel = bridgedPillModel else { return }
         switch state {
-        case let .readyToInstall(installed, latest):
-            let info = UpdateState.BrewReady(
+        case .checking:
+            updateModel.state = .checking
+        case .upToDate:
+            updateModel.state = .upToDate(dismiss: { [weak updateModel] in
+                updateModel?.state = .idle
+            })
+            let duration = UpdateTiming.noUpdateDisplayDuration
+            DispatchQueue.main.asyncAfter(deadline: .now() + duration) { [weak updateModel] in
+                guard case .upToDate = updateModel?.state else { return }
+                updateModel?.state = .idle
+            }
+        case let .outdated(installed, latest):
+            updateModel.state = .updateAvailable(
                 installed: installed,
                 latest: latest,
-                install: { [weak self] in
-                    _ = self?.triggerInstallAndRestart()
-                },
-                dismiss: { [weak updateModel] in
-                    if case .brewReadyToInstall = updateModel?.overrideState {
-                        updateModel?.overrideState = nil
-                    }
-                }
+                install: { [weak self] in _ = self?.triggerInstallAndRestart() },
+                dismiss: { [weak updateModel] in updateModel?.state = .idle }
             )
-            updateModel.overrideState = .brewReadyToInstall(info)
-        default:
-            // Only clear an override that we set ourselves.
-            if case .brewReadyToInstall = updateModel.overrideState {
-                updateModel.overrideState = nil
-            }
+        case let .downloading(installed, latest, message):
+            updateModel.state = .downloading(installed: installed, latest: latest, message: message)
+        case let .readyToInstall(installed, latest):
+            updateModel.state = .readyToInstall(
+                installed: installed,
+                latest: latest,
+                install: { [weak self] in _ = self?.triggerInstallAndRestart() },
+                dismiss: { [weak updateModel] in updateModel?.state = .idle }
+            )
+        case .error(let message):
+            updateModel.state = .error(
+                message: message,
+                retry: { [weak self] in self?.refreshNow() },
+                dismiss: { [weak updateModel] in updateModel?.state = .idle }
+            )
+        case .unsupported, .idle:
+            if case .idle = updateModel.state { return }
+            if case .checking = updateModel.state { return }
+            updateModel.state = .idle
         }
     }
 
@@ -230,7 +245,9 @@ final class BrewSelfUpdater {
     func checkNow() { runOutdatedCheck() }
 
     /// Force a tap refresh (`brew update`) followed by an outdated check.
+    /// Immediately publishes .checking so the pill shows a spinner without delay.
     func refreshNow() {
+        viewModel.update(state: .checking)
         Task.detached(priority: .utility) { [weak self] in
             guard let self else { return }
             await self.runTapRefresh()
@@ -287,12 +304,9 @@ final class BrewSelfUpdater {
         alert.addButton(withTitle: "Later")
 
         if let notes = BrewReleaseNotesService.shared.cachedNotes(for: latest), !notes.isEmpty {
-            let releaseURL = UpdateState.BrewReady(
-                installed: installed,
-                latest: latest,
-                install: {},
-                dismiss: {}
-            ).releaseNotesURL
+            let trimmed = latest.trimmingCharacters(in: .whitespaces)
+            let tag = trimmed.hasPrefix("v") ? trimmed : "v\(trimmed)"
+            let releaseURL = URL(string: "https://github.com/x-mesh/term-mesh/releases/tag/\(tag)")
             alert.accessoryView = BrewReleaseNotesAccessoryView.nsHostingView(
                 markdown: notes,
                 version: latest,
@@ -392,8 +406,14 @@ final class BrewSelfUpdater {
         let cask = caskToken
         isRunningCheck = true
         viewModel.update(state: .checking)
+        let checkStart = Date()
         Task.detached(priority: .utility) { [weak self] in
             let result = Self.runBrewOutdated(brew: brew, cask: cask)
+            let elapsed = -checkStart.timeIntervalSinceNow
+            let minDuration = UpdateTiming.minimumCheckDisplayDuration
+            if elapsed < minDuration {
+                Thread.sleep(forTimeInterval: minDuration - elapsed)
+            }
             await self?.applyOutdatedResult(result)
         }
     }

@@ -12,16 +12,8 @@ struct UpdateBadge: View {
     @ViewBuilder
     private var badgeContent: some View {
         switch model.effectiveState {
-        case .downloading(let download):
-            if let expectedLength = download.expectedLength, expectedLength > 0 {
-                let progress = min(1, max(0, Double(download.progress) / Double(expectedLength)))
-                ProgressRingView(progress: progress)
-            } else {
-                Image(systemName: "arrow.down.circle")
-            }
-
-        case .extracting(let extracting):
-            ProgressRingView(progress: min(1, max(0, extracting.progress)))
+        case .downloading:
+            BrowserStyleLoadingSpinner(size: 14, color: model.foregroundColor)
 
         case .checking:
             BrowserStyleLoadingSpinner(size: 14, color: model.foregroundColor)

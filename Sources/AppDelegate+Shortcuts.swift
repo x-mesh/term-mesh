@@ -439,7 +439,7 @@ extension AppDelegate {
     }
 
     func validateMenuItem(_ item: NSMenuItem) -> Bool {
-        updateController.validateMenuItem(item)
+        return true
     }
 
 }

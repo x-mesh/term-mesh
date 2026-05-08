@@ -1,6 +1,5 @@
 #if DEBUG
 import Foundation
-import Sparkle
 
 enum UpdateTestSupport {
     static func applyIfNeeded(to viewModel: UpdateViewModel) {
@@ -9,15 +8,17 @@ enum UpdateTestSupport {
         guard let state = (env["TERMMESH_UI_TEST_UPDATE_STATE"] ?? env["CMUX_UI_TEST_UPDATE_STATE"]) else { return }
 
         DispatchQueue.main.async {
+            let version = (env["TERMMESH_UI_TEST_UPDATE_VERSION"] ?? env["CMUX_UI_TEST_UPDATE_VERSION"]) ?? "9.9.9"
             switch state {
             case "available":
-                let version = (env["TERMMESH_UI_TEST_UPDATE_VERSION"] ?? env["CMUX_UI_TEST_UPDATE_VERSION"]) ?? "9.9.9"
-                transition(to: .updateAvailable(.init(
-                    appcastItem: makeAppcastItem(displayVersion: version) ?? SUAppcastItem.empty(),
-                    reply: { _ in }
-                )), on: viewModel)
+                transition(to: .updateAvailable(
+                    installed: "0.0.1",
+                    latest: version,
+                    install: {},
+                    dismiss: { viewModel.state = .idle }
+                ), on: viewModel)
             case "notFound":
-                transition(to: .notFound(.init(acknowledgement: {})), on: viewModel)
+                transition(to: .upToDate(dismiss: { viewModel.state = .idle }), on: viewModel)
             default:
                 break
             }
@@ -33,19 +34,23 @@ enum UpdateTestSupport {
         UpdateLogStore.shared.append("ui test mock feed check: \(feedURLString)")
         UpdateTestURLProtocol.registerIfNeeded()
         DispatchQueue.main.async {
-            viewModel.state = .checking(.init(cancel: {}))
+            viewModel.state = .checking
         }
 
+        let version = (env["TERMMESH_UI_TEST_UPDATE_VERSION"] ?? env["CMUX_UI_TEST_UPDATE_VERSION"]) ?? "9.9.9"
         let task = URLSession.shared.dataTask(with: feedURL) { data, _, _ in
             let xml = data.flatMap { String(data: $0, encoding: .utf8) } ?? ""
-            let version = (env["TERMMESH_UI_TEST_UPDATE_VERSION"] ?? env["CMUX_UI_TEST_UPDATE_VERSION"]) ?? "9.9.9"
             let hasItem = xml.contains("<item>")
             let applyState = {
                 if hasItem {
-                    let appcastItem = makeAppcastItem(displayVersion: version) ?? SUAppcastItem.empty()
-                    viewModel.state = .updateAvailable(.init(appcastItem: appcastItem, reply: { _ in }))
+                    viewModel.state = .updateAvailable(
+                        installed: "0.0.1",
+                        latest: version,
+                        install: {},
+                        dismiss: { viewModel.state = .idle }
+                    )
                 } else {
-                    viewModel.state = .notFound(.init(acknowledgement: {}))
+                    setUpToDate(on: viewModel)
                 }
             }
             DispatchQueue.main.async {
@@ -64,24 +69,45 @@ enum UpdateTestSupport {
     }
 
     private static func transition(to state: UpdateState, on viewModel: UpdateViewModel) {
-        viewModel.state = .checking(.init(cancel: {}))
+        viewModel.state = .checking
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
-            viewModel.state = state
+            if case .upToDate = state {
+                setUpToDate(on: viewModel)
+            } else {
+                viewModel.state = state
+            }
         }
     }
 
-    private static func makeAppcastItem(displayVersion: String) -> SUAppcastItem? {
-        let enclosure: [String: Any] = [
-            "url": "https://example.com/term-mesh.zip",
-            "length": "1024",
-            "sparkle:version": displayVersion,
-            "sparkle:shortVersionString": displayVersion,
-        ]
-        let dict: [String: Any] = [
-            "title": "term-mesh \(displayVersion)",
-            "enclosure": enclosure,
-        ]
-        return SUAppcastItem(dictionary: dict)
+    /// Sets `.upToDate`, records the shown timestamp, and schedules the auto-fade
+    /// with hidden timestamp recording after `noUpdateDisplayDuration`.
+    private static func setUpToDate(on viewModel: UpdateViewModel) {
+        recordUITestTimestamp(key: "noUpdateShownAt")
+        viewModel.state = .upToDate(dismiss: { viewModel.state = .idle })
+        let duration = UpdateTiming.noUpdateDisplayDuration
+        DispatchQueue.main.asyncAfter(deadline: .now() + duration) { [weak viewModel] in
+            guard let viewModel, case .upToDate = viewModel.state else { return }
+            recordUITestTimestamp(key: "noUpdateHiddenAt")
+            viewModel.state = .idle
+        }
+    }
+
+    /// Writes a timestamp to the JSON file at TERMMESH_UI_TEST_TIMING_PATH.
+    static func recordUITestTimestamp(key: String) {
+        let env = ProcessInfo.processInfo.environment
+        guard (env["TERMMESH_UI_TEST_MODE"] ?? env["CMUX_UI_TEST_MODE"]) == "1" else { return }
+        guard let path = (env["TERMMESH_UI_TEST_TIMING_PATH"] ?? env["CMUX_UI_TEST_TIMING_PATH"]) else { return }
+
+        let url = URL(fileURLWithPath: path)
+        var payload: [String: Double] = [:]
+        if let data = try? Data(contentsOf: url),
+           let object = try? JSONSerialization.jsonObject(with: data) as? [String: Double] {
+            payload = object
+        }
+        payload[key] = Date().timeIntervalSince1970
+        if let data = try? JSONSerialization.data(withJSONObject: payload) {
+            try? data.write(to: url)
+        }
     }
 }
 #endif

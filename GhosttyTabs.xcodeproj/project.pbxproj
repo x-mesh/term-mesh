@@ -122,9 +122,6 @@
 			A50012F1 /* Backport.swift in Sources */ = {isa = PBXBuildFile; fileRef = A50012F0 /* Backport.swift */; };
 			A50012F3 /* KeyboardShortcutSettings.swift in Sources */ = {isa = PBXBuildFile; fileRef = A50012F2 /* KeyboardShortcutSettings.swift */; };
 			A5001521 /* PostHogAnalytics.swift in Sources */ = {isa = PBXBuildFile; fileRef = A5001520 /* PostHogAnalytics.swift */; };
-			A5001201 /* UpdateController.swift in Sources */ = {isa = PBXBuildFile; fileRef = A5001211 /* UpdateController.swift */; };
-		A5001202 /* UpdateDelegate.swift in Sources */ = {isa = PBXBuildFile; fileRef = A5001212 /* UpdateDelegate.swift */; };
-		A5001203 /* UpdateDriver.swift in Sources */ = {isa = PBXBuildFile; fileRef = A5001213 /* UpdateDriver.swift */; };
 		A5001204 /* UpdateViewModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = A5001214 /* UpdateViewModel.swift */; };
 		A5001205 /* UpdatePill.swift in Sources */ = {isa = PBXBuildFile; fileRef = A5001215 /* UpdatePill.swift */; };
 		A5001206 /* UpdateBadge.swift in Sources */ = {isa = PBXBuildFile; fileRef = A5001216 /* UpdateBadge.swift */; };
@@ -140,7 +137,6 @@
 		A5001290 /* BrewSelfUpdater.swift in Sources */ = {isa = PBXBuildFile; fileRef = A5001291 /* BrewSelfUpdater.swift */; };
 		A5001294 /* BrewReleaseNotes.swift in Sources */ = {isa = PBXBuildFile; fileRef = A5001295 /* BrewReleaseNotes.swift */; };
 		A5001100 /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = A5001101 /* Assets.xcassets */; };
-		A5001230 /* Sparkle in Frameworks */ = {isa = PBXBuildFile; productRef = A5001231 /* Sparkle */; };
 		B9000002A1B2C3D4E5F60719 /* term-mesh.swift in Sources */ = {isa = PBXBuildFile; fileRef = B9000001A1B2C3D4E5F60719 /* term-mesh.swift */; };
 		B900000BA1B2C3D4E5F60719 /* term-mesh in Copy CLI */ = {isa = PBXBuildFile; fileRef = B9000004A1B2C3D4E5F60719 /* term-mesh */; };
 		C1ADE00002A1B2C3D4E5F719 /* claude in Copy CLI */ = {isa = PBXBuildFile; fileRef = C1ADE00001A1B2C3D4E5F719 /* claude */; };
@@ -337,9 +333,6 @@
 		A5009004 /* StatusBarView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = StatusBarView.swift; sourceTree = "<group>"; };
 		A50012F0 /* Backport.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Backport.swift; sourceTree = "<group>"; };
 		A50012F2 /* KeyboardShortcutSettings.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KeyboardShortcutSettings.swift; sourceTree = "<group>"; };
-		A5001211 /* UpdateController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Update/UpdateController.swift; sourceTree = "<group>"; };
-		A5001212 /* UpdateDelegate.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Update/UpdateDelegate.swift; sourceTree = "<group>"; };
-		A5001213 /* UpdateDriver.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Update/UpdateDriver.swift; sourceTree = "<group>"; };
 		A5001214 /* UpdateViewModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Update/UpdateViewModel.swift; sourceTree = "<group>"; };
 		A5001215 /* UpdatePill.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Update/UpdatePill.swift; sourceTree = "<group>"; };
 		A5001216 /* UpdateBadge.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Update/UpdateBadge.swift; sourceTree = "<group>"; };
@@ -388,7 +381,6 @@
 				buildActionMask = 2147483647;
 				files = (
 					A5001006 /* GhosttyKit.xcframework in Frameworks */,
-					A5001230 /* Sparkle in Frameworks */,
 					A5001250 /* Sentry in Frameworks */,
 					A5001270 /* PostHog in Frameworks */,
 				);
@@ -594,9 +586,6 @@
 				A5001510 /* TermMeshWebView.swift */,
 				A5009910 /* EnvCompat.swift */,
 				A5001415 /* PanelContentView.swift */,
-				A5001211 /* UpdateController.swift */,
-				A5001212 /* UpdateDelegate.swift */,
-				A5001213 /* UpdateDriver.swift */,
 				A5001214 /* UpdateViewModel.swift */,
 				A5001215 /* UpdatePill.swift */,
 				A5001216 /* UpdateBadge.swift */,
@@ -709,7 +698,6 @@
 				B900000EA1B2C3D4E5F60719 /* PBXTargetDependency */,
 			);
 				packageProductDependencies = (
-					A5001231 /* Sparkle */,
 					A5001251 /* Sentry */,
 					A5001271 /* PostHog */,
 					A5001261 /* Bonsplit */,
@@ -792,7 +780,6 @@
 			);
 			mainGroup = A5001040;
 				packageReferences = (
-					A5001232 /* XCRemoteSwiftPackageReference "Sparkle" */,
 					A5001252 /* XCRemoteSwiftPackageReference "sentry-cocoa" */,
 					A5001272 /* XCRemoteSwiftPackageReference "posthog-ios" */,
 					A5001260 /* XCLocalSwiftPackageReference "bonsplit" */,
@@ -926,9 +913,6 @@
 				A5001500 /* TermMeshWebView.swift in Sources */,
 				A5009900 /* EnvCompat.swift in Sources */,
 				A5001405 /* PanelContentView.swift in Sources */,
-				A5001201 /* UpdateController.swift in Sources */,
-				A5001202 /* UpdateDelegate.swift in Sources */,
-				A5001203 /* UpdateDriver.swift in Sources */,
 				A5001204 /* UpdateViewModel.swift in Sources */,
 				A5001205 /* UpdatePill.swift in Sources */,
 				A5001206 /* UpdateBadge.swift in Sources */,
@@ -1101,7 +1085,6 @@
 				APP_DISPLAY_NAME = "Term-Mesh DEV";
 				PRODUCT_BUNDLE_IDENTIFIER = com.termmesh.app.debug;
 				PRODUCT_NAME = "term-mesh DEV";
-				SPARKLE_PUBLIC_KEY = "avjcgKibf1FTvhIjLBxhd+0HSpsXU4D0IGlVk8cgqRc=";
 				SWIFT_EMIT_LOC_STRINGS = YES;
 				SWIFT_OBJC_BRIDGING_HEADER = "term-mesh-Bridging-Header.h";
 				SWIFT_VERSION = 5.0;
@@ -1142,7 +1125,6 @@
 				APP_DISPLAY_NAME = "Term-Mesh";
 				PRODUCT_BUNDLE_IDENTIFIER = com.termmesh.app;
 				PRODUCT_NAME = "term-mesh";
-				SPARKLE_PUBLIC_KEY = "avjcgKibf1FTvhIjLBxhd+0HSpsXU4D0IGlVk8cgqRc=";
 				SWIFT_EMIT_LOC_STRINGS = YES;
 				SWIFT_OBJC_BRIDGING_HEADER = "term-mesh-Bridging-Header.h";
 				SWIFT_VERSION = 5.0;
@@ -1248,14 +1230,6 @@
 /* End XCBuildConfiguration section */
 
 /* Begin XCRemoteSwiftPackageReference section */
-		A5001232 /* XCRemoteSwiftPackageReference "Sparkle" */ = {
-			isa = XCRemoteSwiftPackageReference;
-			repositoryURL = "https://github.com/sparkle-project/Sparkle";
-			requirement = {
-				kind = upToNextMajorVersion;
-				minimumVersion = 2.5.1;
-			};
-		};
 			A5001252 /* XCRemoteSwiftPackageReference "sentry-cocoa" */ = {
 				isa = XCRemoteSwiftPackageReference;
 				repositoryURL = "https://github.com/getsentry/sentry-cocoa.git";
@@ -1283,11 +1257,6 @@
 /* End XCRemoteSwiftPackageReference section */
 
 /* Begin XCSwiftPackageProductDependency section */
-		A5001231 /* Sparkle */ = {
-			isa = XCSwiftPackageProductDependency;
-			package = A5001232 /* XCRemoteSwiftPackageReference "Sparkle" */;
-			productName = Sparkle;
-		};
 			A5001251 /* Sentry */ = {
 				isa = XCSwiftPackageProductDependency;
 				package = A5001252 /* XCRemoteSwiftPackageReference "sentry-cocoa" */;

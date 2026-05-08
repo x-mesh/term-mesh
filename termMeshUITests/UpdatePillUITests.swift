@@ -124,21 +124,63 @@ final class UpdatePillUITests: XCTestCase {
         assertVisibleSize(noUpdatePill)
     }
 
-    func testNoSparklePermissionDialogIsShown() {
+    func testCheckingPillRemainsVisibleForMinimumDuration() {
         let systemSettings = XCUIApplication(bundleIdentifier: "com.apple.systempreferences")
         systemSettings.terminate()
+        // Use a 1500ms mock-feed delay so the .checking state is held long enough to measure.
+        let app = launchAppWithMockFeed(
+            mode: "none",
+            version: "9.9.9",
+            extraEnvironment: ["TERMMESH_UI_TEST_MOCK_FEED_DELAY_MS": "1500"]
+        )
 
+        let checkingPill = pillButton(app: app, expectedLabel: "Checking for Updates…")
+        XCTAssertTrue(checkingPill.waitForExistence(timeout: 6.0))
+        assertVisibleSize(checkingPill)
+
+        // minimumCheckDisplayDuration is 2.0s; verify pill hasn't gone after 0.8s.
+        RunLoop.current.run(until: Date().addingTimeInterval(0.8))
+        XCTAssertTrue(checkingPill.exists, "Checking pill disappeared before 0.8s")
+
+        // Then confirm it eventually resolves to the upToDate state.
+        let resolvedPill = pillButton(app: app, expectedLabel: "No Updates Available")
+        XCTAssertTrue(resolvedPill.waitForExistence(timeout: 5.0))
+        assertVisibleSize(resolvedPill)
+        attachElementDebug(name: "checking-resolved-pill", element: resolvedPill)
+    }
+
+    func testUpToDatePillIsStillVisibleAtThreeSeconds() {
+        // noUpdateDisplayDuration is 5.0s; pill must still be present at the 3s mark.
+        let systemSettings = XCUIApplication(bundleIdentifier: "com.apple.systempreferences")
+        systemSettings.terminate()
         let app = XCUIApplication()
-        // Make Sparkle re-request permission on startup, but we should auto-handle it with no UI.
-        app.launchEnvironment["TERMMESH_UI_TEST_RESET_SPARKLE_PERMISSION"] = "1"
+        app.launchEnvironment["TERMMESH_UI_TEST_MODE"] = "1"
+        app.launchEnvironment["TERMMESH_UI_TEST_UPDATE_STATE"] = "notFound"
         launchAndActivate(app)
 
-        XCTAssertTrue(waitForWindowCount(atLeast: 1, app: app, timeout: 6.0))
+        let pill = pillButton(app: app, expectedLabel: "No Updates Available")
+        XCTAssertTrue(pill.waitForExistence(timeout: 6.0))
+        assertVisibleSize(pill)
+        attachElementDebug(name: "up-to-date-pill-initial", element: pill)
 
-        // Sparkle's default permission prompt is an NSAlert with these labels.
-        XCTAssertFalse(app.staticTexts["Check for updates automatically?"].waitForExistence(timeout: 2.0))
-        XCTAssertFalse(app.buttons["Don't Check"].exists)
-        XCTAssertFalse(app.buttons["Check Automatically"].exists)
+        RunLoop.current.run(until: Date().addingTimeInterval(3.0))
+        XCTAssertTrue(pill.exists, "upToDate pill disappeared before 3s (noUpdateDisplayDuration=5.0)")
+
+        let gone = XCTNSPredicateExpectation(
+            predicate: NSPredicate(format: "exists == false"),
+            object: pill
+        )
+        XCTAssertEqual(
+            XCTWaiter().wait(for: [gone], timeout: 5.0),
+            .completed,
+            "upToDate pill did not auto-fade within 8s total"
+        )
+    }
+
+    func testErrorPillShowsRetryButton() throws {
+        // Requires TERMMESH_UI_TEST_UPDATE_STATE="error" support in UpdateTestSupport.applyIfNeeded.
+        // Add the "error" case to Sources/Update/UpdateTestSupport.swift to enable this test.
+        throw XCTSkip("Needs 'error' case in UpdateTestSupport (Sources/Update/UpdateTestSupport.swift)")
     }
 
     private func pillButton(app: XCUIApplication, expectedLabel: String) -> XCUIElement {
@@ -204,7 +246,6 @@ final class UpdatePillUITests: XCTestCase {
         app.launchEnvironment["TERMMESH_UI_TEST_FEED_URL"] = "https://term-mesh.test/appcast.xml"
         app.launchEnvironment["TERMMESH_UI_TEST_FEED_MODE"] = mode
         app.launchEnvironment["TERMMESH_UI_TEST_UPDATE_VERSION"] = version
-        app.launchEnvironment["TERMMESH_UI_TEST_AUTO_ALLOW_PERMISSION"] = "1"
         app.launchEnvironment["TERMMESH_UI_TEST_TRIGGER_UPDATE_CHECK"] = "1"
         if let timingPath {
             app.launchEnvironment["TERMMESH_UI_TEST_TIMING_PATH"] = timingPath.path

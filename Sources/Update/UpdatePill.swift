@@ -30,9 +30,8 @@ struct UpdatePill: View {
     @ViewBuilder
     private var pillButton: some View {
         Button(action: {
-            if case .notFound(let notFound) = model.state {
-                model.state = .idle
-                notFound.acknowledgement()
+            if case .upToDate(let dismissFn) = model.state {
+                dismissFn()
             } else {
                 showPopover.toggle()
             }

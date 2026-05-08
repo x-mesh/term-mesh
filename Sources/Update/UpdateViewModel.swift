@@ -1,88 +1,53 @@
 import Foundation
 import AppKit
 import SwiftUI
-import Sparkle
 
 class UpdateViewModel: ObservableObject {
     @Published var state: UpdateState = .idle
-    @Published var overrideState: UpdateState?
     #if DEBUG
     @Published var debugOverrideText: String?
     #endif
 
-    var effectiveState: UpdateState {
-        overrideState ?? state
-    }
+    var effectiveState: UpdateState { state }
 
     var text: String {
         #if DEBUG
         if let debugOverrideText { return debugOverrideText }
         #endif
-        switch effectiveState {
+        switch state {
         case .idle:
             return ""
-        case .permissionRequest:
-            return "Enable Automatic Updates?"
         case .checking:
             return "Checking for Updates…"
-        case .updateAvailable(let update):
-            let version = update.appcastItem.displayVersionString
-            if !version.isEmpty {
-                return "Update Available: \(version)"
-            }
-            return "Update Available"
-        case .downloading(let download):
-            if let expectedLength = download.expectedLength, expectedLength > 0 {
-                let progress = Double(download.progress) / Double(expectedLength)
-                return String(format: "Downloading: %.0f%%", progress * 100)
-            }
-            return "Downloading…"
-        case .extracting(let extracting):
-            return String(format: "Preparing: %.0f%%", extracting.progress * 100)
-        case .installing(let install):
-            return install.isAutoUpdate ? "Restart to Complete Update" : "Installing…"
-        case .notFound:
+        case .upToDate:
             return "No Updates Available"
-        case .error(let err):
-            return Self.userFacingErrorTitle(for: err.error)
-        case .brewReadyToInstall(let brew):
-            return "Update Available: \(brew.latest)"
+        case .updateAvailable(_, let latest, _, _):
+            return "Update Available: \(latest)"
+        case .downloading(_, _, let message):
+            return message
+        case .readyToInstall(_, let latest, _, _):
+            return "Update Available: \(latest)"
+        case .error(let message, _, _):
+            return message
         }
     }
 
-    var maxWidthText: String {
-        switch effectiveState {
-        case .downloading:
-            return "Downloading: 100%"
-        case .extracting:
-            return "Preparing: 100%"
-        default:
-            return text
-        }
-    }
+    var maxWidthText: String { text }
 
     var iconName: String? {
         switch effectiveState {
         case .idle:
             return nil
-        case .permissionRequest:
-            return "questionmark.circle"
         case .checking:
             return "arrow.triangle.2.circlepath"
-        case .updateAvailable:
+        case .upToDate:
+            return "info.circle"
+        case .updateAvailable, .readyToInstall:
             return "shippingbox.fill"
         case .downloading:
             return "arrow.down.circle"
-        case .extracting:
-            return "shippingbox"
-        case .installing:
-            return "power.circle"
-        case .notFound:
-            return "info.circle"
         case .error:
             return "exclamationmark.triangle.fill"
-        case .brewReadyToInstall:
-            return "shippingbox.fill"
         }
     }
 
@@ -90,42 +55,27 @@ class UpdateViewModel: ObservableObject {
         switch effectiveState {
         case .idle:
             return ""
-        case .permissionRequest:
-            return "Configure automatic update preferences"
         case .checking:
             return "Please wait while we check for available updates"
-        case .updateAvailable(let update):
-            return update.releaseNotes?.label ?? "Download and install the latest version"
-        case .downloading:
-            return "Downloading the update package"
-        case .extracting:
-            return "Extracting and preparing the update"
-        case let .installing(install):
-            return install.isAutoUpdate ? "Restart to Complete Update" : "Installing update and preparing to restart"
-        case .notFound:
+        case .upToDate:
             return "You are running the latest version"
-        case .error(let err):
-            return Self.userFacingErrorMessage(for: err.error)
-        case .brewReadyToInstall(let brew):
-            return "term-mesh \(brew.installed) → \(brew.latest) via Homebrew"
+        case .updateAvailable(let installed, let latest, _, _):
+            return "term-mesh \(installed) → \(latest) via Homebrew"
+        case .downloading(_, _, let message):
+            return message
+        case .readyToInstall(let installed, let latest, _, _):
+            return "term-mesh \(installed) → \(latest) via Homebrew"
+        case .error(let message, _, _):
+            return message
         }
     }
 
     var badge: String? {
         switch effectiveState {
-        case .updateAvailable(let update):
-            let version = update.appcastItem.displayVersionString
-            return version.isEmpty ? nil : version
-        case .downloading(let download):
-            if let expectedLength = download.expectedLength, expectedLength > 0 {
-                let percentage = Double(download.progress) / Double(expectedLength) * 100
-                return String(format: "%.0f%%", percentage)
-            }
-            return nil
-        case .extracting(let extracting):
-            return String(format: "%.0f%%", extracting.progress * 100)
-        case .brewReadyToInstall(let brew):
-            return brew.latest
+        case .updateAvailable(_, let latest, _, _):
+            return latest
+        case .readyToInstall(_, let latest, _, _):
+            return latest
         default:
             return nil
         }
@@ -133,32 +83,20 @@ class UpdateViewModel: ObservableObject {
 
     var iconColor: Color {
         switch effectiveState {
-        case .idle:
-            return .secondary
-        case .permissionRequest:
-            return .white
-        case .checking:
-            return .secondary
-        case .updateAvailable:
+        case .updateAvailable, .readyToInstall:
             return .accentColor
-        case .downloading, .extracting, .installing:
-            return .secondary
-        case .notFound:
-            return .secondary
         case .error:
             return .orange
-        case .brewReadyToInstall:
-            return .accentColor
+        default:
+            return .secondary
         }
     }
 
     var backgroundColor: Color {
         switch effectiveState {
-        case .permissionRequest:
-            return Color(nsColor: NSColor.systemBlue.blended(withFraction: 0.3, of: .black) ?? .systemBlue)
-        case .updateAvailable, .brewReadyToInstall:
+        case .updateAvailable, .readyToInstall:
             return .accentColor
-        case .notFound:
+        case .upToDate:
             return Color(nsColor: NSColor.systemBlue.blended(withFraction: 0.5, of: .black) ?? .systemBlue)
         case .error:
             return .orange.opacity(0.2)
@@ -169,11 +107,7 @@ class UpdateViewModel: ObservableObject {
 
     var foregroundColor: Color {
         switch effectiveState {
-        case .permissionRequest:
-            return .white
-        case .updateAvailable, .brewReadyToInstall:
-            return .white
-        case .notFound:
+        case .updateAvailable, .readyToInstall, .upToDate:
             return .white
         case .error:
             return .orange
@@ -181,183 +115,16 @@ class UpdateViewModel: ObservableObject {
             return .primary
         }
     }
-
-    static func userFacingErrorTitle(for error: Swift.Error) -> String {
-        let nsError = error as NSError
-        if let networkError = networkError(from: nsError) {
-            switch networkError.code {
-            case NSURLErrorNotConnectedToInternet:
-                return "No Internet Connection"
-            case NSURLErrorTimedOut:
-                return "Update Timed Out"
-            case NSURLErrorCannotFindHost:
-                return "Server Not Found"
-            case NSURLErrorCannotConnectToHost:
-                return "Server Unreachable"
-            case NSURLErrorNetworkConnectionLost:
-                return "Connection Lost"
-            case NSURLErrorSecureConnectionFailed,
-                 NSURLErrorServerCertificateUntrusted,
-                 NSURLErrorServerCertificateHasBadDate,
-                 NSURLErrorServerCertificateHasUnknownRoot,
-                 NSURLErrorServerCertificateNotYetValid:
-                return "Secure Connection Failed"
-            default:
-                break
-            }
-        }
-        if nsError.domain == SUSparkleErrorDomain {
-            switch nsError.code {
-            case 4005:
-                return "Updater Permission Error"
-            case 2001:
-                return "Couldn't Download Update"
-            case 1000, 1002:
-                return "Update Feed Error"
-            case 4:
-                return "Invalid Update Feed"
-            case 3:
-                return "Insecure Update Feed"
-            case 1, 2, 3001, 3002:
-                return "Update Signature Error"
-            case 1003, 1005:
-                return "App Location Issue"
-            default:
-                break
-            }
-        }
-        return "Update Failed"
-    }
-
-    static func userFacingErrorMessage(for error: Swift.Error) -> String {
-        let nsError = error as NSError
-        if let networkError = networkError(from: nsError) {
-            switch networkError.code {
-            case NSURLErrorNotConnectedToInternet:
-                return "Term-Mesh can’t reach the update server. Check your internet connection and try again."
-            case NSURLErrorTimedOut:
-                return "The update server took too long to respond. Try again in a moment."
-            case NSURLErrorCannotFindHost:
-                return "The update server can’t be found. Check your connection or try again later."
-            case NSURLErrorCannotConnectToHost:
-                return "Term-Mesh couldn’t connect to the update server. Check your connection or try again later."
-            case NSURLErrorNetworkConnectionLost:
-                return "The network connection was lost while checking for updates. Try again."
-            case NSURLErrorSecureConnectionFailed,
-                 NSURLErrorServerCertificateUntrusted,
-                 NSURLErrorServerCertificateHasBadDate,
-                 NSURLErrorServerCertificateHasUnknownRoot,
-                 NSURLErrorServerCertificateNotYetValid:
-                return "A secure connection to the update server couldn’t be established. Try again later."
-            default:
-                break
-            }
-        }
-        if nsError.domain == SUSparkleErrorDomain {
-            switch nsError.code {
-            case 2001:
-                return "Term-Mesh couldn't download the update feed. Check your connection and try again."
-            case 1000, 1002:
-                return "The update feed could not be read. Please try again later."
-            case 4:
-                return "The update feed URL is invalid. Please contact support."
-            case 3:
-                return "The update feed is insecure. Please contact support."
-            case 1, 2, 3001, 3002:
-                return "The update's signature could not be verified. Please try again later."
-            case 1003, 1005, 4005:
-                return "Move term-mesh into Applications and relaunch to enable updates."
-            default:
-                break
-            }
-        }
-        return nsError.localizedDescription
-    }
-
-    static func errorDetails(for error: Swift.Error, technicalDetails: String?, feedURLString: String?) -> String {
-        let nsError = error as NSError
-        var lines: [String] = []
-        lines.append("Message: \(nsError.localizedDescription)")
-        lines.append("Domain: \(nsError.domain)")
-        if nsError.domain == SUSparkleErrorDomain,
-           let sparkleName = sparkleErrorCodeName(for: nsError.code) {
-            lines.append("Code: \(sparkleName) (\(nsError.code))")
-        } else {
-            lines.append("Code: \(nsError.code)")
-        }
-
-        if let url = nsError.userInfo[NSURLErrorFailingURLErrorKey] as? URL {
-            lines.append("URL: \(url.absoluteString)")
-        } else if let urlString = nsError.userInfo[NSURLErrorFailingURLStringErrorKey] as? String {
-            lines.append("URL: \(urlString)")
-        }
-
-        if let failure = nsError.userInfo[NSLocalizedFailureReasonErrorKey] as? String,
-           !failure.isEmpty {
-            lines.append("Failure: \(failure)")
-        }
-        if let recovery = nsError.userInfo[NSLocalizedRecoverySuggestionErrorKey] as? String,
-           !recovery.isEmpty {
-            lines.append("Recovery: \(recovery)")
-        }
-
-        if let feedURLString, !feedURLString.isEmpty {
-            lines.append("Feed: \(feedURLString)")
-        }
-
-        if let technicalDetails, !technicalDetails.isEmpty {
-            lines.append("Debug: \(technicalDetails)")
-        }
-
-        lines.append("Log: \(UpdateLogStore.shared.logPath())")
-        return lines.joined(separator: "\n")
-    }
-
-    private static func networkError(from error: NSError) -> NSError? {
-        if error.domain == NSURLErrorDomain {
-            return error
-        }
-        if let underlying = error.userInfo[NSUnderlyingErrorKey] as? NSError,
-           underlying.domain == NSURLErrorDomain {
-            return underlying
-        }
-        return nil
-    }
-
-    private static func sparkleErrorCodeName(for code: Int) -> String? {
-        switch code {
-        case 1: return "SUNoPublicDSAFoundError"
-        case 2: return "SUInsufficientSigningError"
-        case 3: return "SUInsecureFeedURLError"
-        case 4: return "SUInvalidFeedURLError"
-        case 1000: return "SUAppcastParseError"
-        case 1001: return "SUNoUpdateError"
-        case 1002: return "SUAppcastError"
-        case 1003: return "SURunningFromDiskImageError"
-        case 1005: return "SURunningTranslocated"
-        case 2001: return "SUDownloadError"
-        case 3001: return "SUSignatureError"
-        case 3002: return "SUValidationError"
-        default:
-            return nil
-        }
-    }
 }
 
 enum UpdateState: Equatable {
     case idle
-    case permissionRequest(PermissionRequest)
-    case checking(Checking)
-    case updateAvailable(UpdateAvailable)
-    case notFound(NotFound)
-    case error(Error)
-    case downloading(Downloading)
-    case extracting(Extracting)
-    case installing(Installing)
-    /// Set externally (via overrideState) by BrewSelfUpdater when a Homebrew cask
-    /// upgrade is fetched and ready to install. Lets the existing UpdatePill UI
-    /// surface brew updates without a parallel pill.
-    case brewReadyToInstall(BrewReady)
+    case checking
+    case upToDate(dismiss: () -> Void)
+    case updateAvailable(installed: String, latest: String, install: () -> Void, dismiss: () -> Void)
+    case downloading(installed: String, latest: String, message: String)
+    case readyToInstall(installed: String, latest: String, install: () -> Void, dismiss: () -> Void)
+    case error(message: String, retry: () -> Void, dismiss: () -> Void)
 
     var isIdle: Bool {
         if case .idle = self { return true }
@@ -366,12 +133,7 @@ enum UpdateState: Equatable {
 
     var isInstallable: Bool {
         switch self {
-        case .checking,
-                .updateAvailable,
-                .downloading,
-                .extracting,
-                .installing,
-                .brewReadyToInstall:
+        case .readyToInstall, .updateAvailable, .downloading:
             return true
         default:
             return false
@@ -380,18 +142,14 @@ enum UpdateState: Equatable {
 
     func cancel() {
         switch self {
-        case .checking(let checking):
-            checking.cancel()
-        case .updateAvailable(let available):
-            available.reply(.dismiss)
-        case .downloading(let downloading):
-            downloading.cancel()
-        case .notFound(let notFound):
-            notFound.acknowledgement()
-        case .error(let err):
-            err.dismiss()
-        case .brewReadyToInstall(let brew):
-            brew.dismiss()
+        case .upToDate(let dismiss):
+            dismiss()
+        case .updateAvailable(_, _, _, let dismiss):
+            dismiss()
+        case .readyToInstall(_, _, _, let dismiss):
+            dismiss()
+        case .error(_, _, let dismiss):
+            dismiss()
         default:
             break
         }
@@ -399,10 +157,10 @@ enum UpdateState: Equatable {
 
     func confirm() {
         switch self {
-        case .updateAvailable(let available):
-            available.reply(.install)
-        case .brewReadyToInstall(let brew):
-            brew.install()
+        case .updateAvailable(_, _, let install, _):
+            install()
+        case .readyToInstall(_, _, let install, _):
+            install()
         default:
             break
         }
@@ -412,158 +170,20 @@ enum UpdateState: Equatable {
         switch (lhs, rhs) {
         case (.idle, .idle):
             return true
-        case (.permissionRequest, .permissionRequest):
-            return true
         case (.checking, .checking):
             return true
-        case (.updateAvailable(let lUpdate), .updateAvailable(let rUpdate)):
-            return lUpdate.appcastItem.displayVersionString == rUpdate.appcastItem.displayVersionString
-        case (.notFound, .notFound):
+        case (.upToDate, .upToDate):
             return true
-        case (.error(let lErr), .error(let rErr)):
-            return lErr.error.localizedDescription == rErr.error.localizedDescription
-        case (.downloading(let lDown), .downloading(let rDown)):
-            return lDown.progress == rDown.progress && lDown.expectedLength == rDown.expectedLength
-        case (.extracting(let lExt), .extracting(let rExt)):
-            return lExt.progress == rExt.progress
-        case (.installing(let lInstall), .installing(let rInstall)):
-            return lInstall.isAutoUpdate == rInstall.isAutoUpdate
-        case (.brewReadyToInstall(let lBrew), .brewReadyToInstall(let rBrew)):
-            return lBrew.installed == rBrew.installed && lBrew.latest == rBrew.latest
+        case (.updateAvailable(let li, let ll, _, _), .updateAvailable(let ri, let rl, _, _)):
+            return li == ri && ll == rl
+        case (.downloading(let li, let ll, let lm), .downloading(let ri, let rl, let rm)):
+            return li == ri && ll == rl && lm == rm
+        case (.readyToInstall(let li, let ll, _, _), .readyToInstall(let ri, let rl, _, _)):
+            return li == ri && ll == rl
+        case (.error(let lm, _, _), .error(let rm, _, _)):
+            return lm == rm
         default:
             return false
         }
-    }
-
-    struct BrewReady {
-        let installed: String
-        let latest: String
-        let install: () -> Void
-        let dismiss: () -> Void
-
-        /// GitHub release page for the cask's source repo. The brew cask pulls
-        /// DMGs from `x-mesh/term-mesh`, so release notes live there (this differs
-        /// from the Sparkle-side `manaflow-ai/term-mesh` link, which is intentional).
-        var releaseNotesURL: URL? {
-            let trimmed = latest.trimmingCharacters(in: .whitespaces)
-            guard !trimmed.isEmpty else { return nil }
-            let tag = trimmed.hasPrefix("v") ? trimmed : "v\(trimmed)"
-            return URL(string: "https://github.com/x-mesh/term-mesh/releases/tag/\(tag)")
-        }
-    }
-
-    struct NotFound {
-        let acknowledgement: () -> Void
-    }
-
-    struct PermissionRequest {
-        let request: SPUUpdatePermissionRequest
-        let reply: @Sendable (SUUpdatePermissionResponse) -> Void
-    }
-
-    struct Checking {
-        let cancel: () -> Void
-    }
-
-    struct UpdateAvailable {
-        let appcastItem: SUAppcastItem
-        let reply: @Sendable (SPUUserUpdateChoice) -> Void
-
-        var releaseNotes: ReleaseNotes? {
-            ReleaseNotes(displayVersionString: appcastItem.displayVersionString)
-        }
-    }
-
-    enum ReleaseNotes {
-        case commit(URL)
-        case tagged(URL)
-
-        init?(displayVersionString: String) {
-            let version = displayVersionString
-
-            if let semver = Self.extractSemanticVersion(from: version) {
-                let tag = semver.hasPrefix("v") ? semver : "v\(semver)"
-                if let url = URL(string: "https://github.com/manaflow-ai/term-mesh/releases/tag/\(tag)") {
-                    self = .tagged(url)
-                    return
-                }
-            }
-
-            guard let newHash = Self.extractGitHash(from: version) else {
-                return nil
-            }
-
-            if let url = URL(string: "https://github.com/manaflow-ai/term-mesh/commit/\(newHash)") {
-                self = .commit(url)
-            } else {
-                return nil
-            }
-        }
-
-        private static func extractSemanticVersion(from version: String) -> String? {
-            let pattern = #"v?\d+\.\d+\.\d+"#
-            if let range = version.range(of: pattern, options: .regularExpression) {
-                return String(version[range])
-            }
-            return nil
-        }
-
-        private static func extractGitHash(from version: String) -> String? {
-            let pattern = #"[0-9a-f]{7,40}"#
-            if let range = version.range(of: pattern, options: .regularExpression) {
-                return String(version[range])
-            }
-            return nil
-        }
-
-        var url: URL {
-            switch self {
-            case .commit(let url): return url
-            case .tagged(let url): return url
-            }
-        }
-
-        var label: String {
-            switch self {
-            case .commit: return "View GitHub Commit"
-            case .tagged: return "View Release Notes"
-            }
-        }
-    }
-
-    struct Error {
-        let error: any Swift.Error
-        let retry: () -> Void
-        let dismiss: () -> Void
-        let technicalDetails: String?
-        let feedURLString: String?
-
-        init(error: any Swift.Error,
-             retry: @escaping () -> Void,
-             dismiss: @escaping () -> Void,
-             technicalDetails: String? = nil,
-             feedURLString: String? = nil) {
-            self.error = error
-            self.retry = retry
-            self.dismiss = dismiss
-            self.technicalDetails = technicalDetails
-            self.feedURLString = feedURLString
-        }
-    }
-
-    struct Downloading {
-        let cancel: () -> Void
-        let expectedLength: UInt64?
-        let progress: UInt64
-    }
-
-    struct Extracting {
-        let progress: Double
-    }
-
-    struct Installing {
-        var isAutoUpdate = false
-        let retryTerminatingApplication: () -> Void
-        let dismiss: () -> Void
     }
 }
