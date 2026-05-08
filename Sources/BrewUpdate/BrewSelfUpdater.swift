@@ -550,9 +550,19 @@ final class BrewSelfUpdater {
     /// Runs `brew outdated --cask --json=v2 <token>` and parses the result.
     /// Returns nil if the cask is up to date, an info struct if outdated.
     fileprivate nonisolated static func runBrewOutdated(brew: String, cask: String) -> Result<BrewOutdatedInfo?, BrewRunError> {
+        // `brew outdated --json=v2 --cask <token>` exits 1 (yes, one)
+        // when the cask is outdated and 0 when up-to-date. The stdout
+        // is valid JSON in both cases. `runProcess` treats any
+        // non-zero exit as failure, which made every user with a
+        // pending update see "Update Failed" with the JSON snippet
+        // bleeding through as the error message — exactly the
+        // condition we're trying to detect, mistaken for a runtime
+        // error. Use the exit-code-tolerant variant and rely on the
+        // JSON shape for the actual success/failure decision.
         let result = runProcess(executable: brew,
                                 arguments: ["outdated", "--cask", "--json=v2", cask],
-                                timeout: 30)
+                                timeout: 30,
+                                allowedExitCodes: [0, 1])
         switch result {
         case .failure(let err):
             return .failure(err)
@@ -598,10 +608,15 @@ final class BrewSelfUpdater {
         }
     }
 
-    /// Wraps Process with stdout capture and a hard timeout.
+    /// Wraps Process with stdout capture and a hard timeout. By default
+    /// only exit code 0 is treated as success; pass `allowedExitCodes`
+    /// to whitelist additional codes (e.g. `brew outdated` exits 1
+    /// when there are outdated items, which is a normal "yes" signal,
+    /// not an error).
     private nonisolated static func runProcess(executable: String,
                                                arguments: [String],
-                                               timeout: TimeInterval) -> Result<String, BrewRunError> {
+                                               timeout: TimeInterval,
+                                               allowedExitCodes: Set<Int32> = [0]) -> Result<String, BrewRunError> {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: executable)
         process.arguments = arguments
@@ -639,7 +654,7 @@ final class BrewSelfUpdater {
         let stdout = String(data: stdoutData, encoding: String.Encoding.utf8) ?? ""
         let stderr = String(data: stderrData, encoding: String.Encoding.utf8) ?? ""
 
-        if process.terminationStatus != 0 {
+        if !allowedExitCodes.contains(process.terminationStatus) {
             let snippet = stderr.isEmpty ? stdout : stderr
             let trimmed = snippet.split(separator: "\n").prefix(3).joined(separator: " ")
             return .failure(BrewRunError(message: "exit=\(process.terminationStatus) \(trimmed)"))
