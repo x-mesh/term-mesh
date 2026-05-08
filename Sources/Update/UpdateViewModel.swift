@@ -440,6 +440,16 @@ enum UpdateState: Equatable {
         let latest: String
         let install: () -> Void
         let dismiss: () -> Void
+
+        /// GitHub release page for the cask's source repo. The brew cask pulls
+        /// DMGs from `x-mesh/term-mesh`, so release notes live there (this differs
+        /// from the Sparkle-side `manaflow-ai/term-mesh` link, which is intentional).
+        var releaseNotesURL: URL? {
+            let trimmed = latest.trimmingCharacters(in: .whitespaces)
+            guard !trimmed.isEmpty else { return nil }
+            let tag = trimmed.hasPrefix("v") ? trimmed : "v\(trimmed)"
+            return URL(string: "https://github.com/x-mesh/term-mesh/releases/tag/\(tag)")
+        }
     }
 
     struct NotFound {

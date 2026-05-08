@@ -52,54 +52,78 @@ fileprivate struct BrewReadyView: View {
     private let labelWidth: CGFloat = 70
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            VStack(alignment: .leading, spacing: 8) {
-                Text("Update Ready")
-                    .font(.system(size: 13, weight: .semibold))
+        VStack(alignment: .leading, spacing: 0) {
+            VStack(alignment: .leading, spacing: 12) {
+                VStack(alignment: .leading, spacing: 8) {
+                    Text("Update Ready")
+                        .font(.system(size: 13, weight: .semibold))
 
-                Text("term-mesh will quit, install via Homebrew, and relaunch automatically.")
+                    Text("term-mesh will quit, install via Homebrew, and relaunch automatically.")
+                        .font(.system(size: 11))
+                        .foregroundColor(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+
+                    VStack(alignment: .leading, spacing: 4) {
+                        HStack(spacing: 6) {
+                            Text("Current:")
+                                .foregroundColor(.secondary)
+                                .frame(width: labelWidth, alignment: .trailing)
+                            Text(brew.installed).monospaced()
+                        }
+                        HStack(spacing: 6) {
+                            Text("Available:")
+                                .foregroundColor(.secondary)
+                                .frame(width: labelWidth, alignment: .trailing)
+                            Text(brew.latest).monospaced()
+                        }
+                    }
                     .font(.system(size: 11))
-                    .foregroundColor(.secondary)
-                    .fixedSize(horizontal: false, vertical: true)
-
-                VStack(alignment: .leading, spacing: 4) {
-                    HStack(spacing: 6) {
-                        Text("Current:")
-                            .foregroundColor(.secondary)
-                            .frame(width: labelWidth, alignment: .trailing)
-                        Text(brew.installed).monospaced()
-                    }
-                    HStack(spacing: 6) {
-                        Text("Available:")
-                            .foregroundColor(.secondary)
-                            .frame(width: labelWidth, alignment: .trailing)
-                        Text(brew.latest).monospaced()
-                    }
+                    .textSelection(.enabled)
                 }
-                .font(.system(size: 11))
-                .textSelection(.enabled)
+
+                HStack(spacing: 8) {
+                    Button("Later") {
+                        brew.dismiss()
+                        dismiss()
+                    }
+                    .keyboardShortcut(.cancelAction)
+                    .controlSize(.small)
+
+                    Spacer()
+
+                    Button("Install and Restart") {
+                        brew.install()
+                        dismiss()
+                    }
+                    .keyboardShortcut(.defaultAction)
+                    .buttonStyle(.borderedProminent)
+                    .controlSize(.small)
+                }
             }
+            .padding(16)
 
-            HStack(spacing: 8) {
-                Button("Later") {
-                    brew.dismiss()
-                    dismiss()
+            if let notesURL = brew.releaseNotesURL {
+                Divider()
+
+                Link(destination: notesURL) {
+                    HStack {
+                        Image(systemName: "doc.text")
+                            .font(.system(size: 11))
+                        Text("View Release Notes")
+                            .font(.system(size: 11, weight: .medium))
+                        Spacer()
+                        Image(systemName: "arrow.up.right")
+                            .font(.system(size: 10))
+                    }
+                    .foregroundColor(.primary)
+                    .padding(12)
+                    .frame(maxWidth: .infinity)
+                    .background(Color(nsColor: .controlBackgroundColor))
+                    .contentShape(Rectangle())
                 }
-                .keyboardShortcut(.cancelAction)
-                .controlSize(.small)
-
-                Spacer()
-
-                Button("Install and Restart") {
-                    brew.install()
-                    dismiss()
-                }
-                .keyboardShortcut(.defaultAction)
-                .buttonStyle(.borderedProminent)
-                .controlSize(.small)
+                .buttonStyle(.plain)
             }
         }
-        .padding(16)
     }
 }
 
