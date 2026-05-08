@@ -127,6 +127,12 @@ final class BrewSelfUpdater {
 
     /// Start periodic polling. Safe to call multiple times.
     func start() {
+#if DEBUG
+        if applyDebugForceReadyIfNeeded() {
+            // DEBUG override active — skip the real polling chain.
+            return
+        }
+#endif
         guard UserDefaults.standard.bool(forKey: Defaults.enabled) else {
             UpdateLogStore.shared.append("brew self-update disabled by user defaults")
             viewModel.update(state: .unsupported)
@@ -147,6 +153,24 @@ final class BrewSelfUpdater {
         scheduleRefreshTimer()
     }
 
+#if DEBUG
+    /// Honors `TERMMESH_BREW_FORCE_READY=<installed>:<latest>` to jump
+    /// straight into the readyToInstall state, skipping detection and fetch.
+    /// Returns true if an override was applied.
+    private func applyDebugForceReadyIfNeeded() -> Bool {
+        let env = ProcessInfo.processInfo.environment
+        guard let raw = env["TERMMESH_BREW_FORCE_READY"], !raw.isEmpty else { return false }
+        let parts = raw.split(separator: ":", maxSplits: 1).map(String.init)
+        guard parts.count == 2, !parts[0].isEmpty, !parts[1].isEmpty else {
+            UpdateLogStore.shared.append("brew self-update: DEBUG TERMMESH_BREW_FORCE_READY malformed (\(raw)) — expected installed:latest")
+            return false
+        }
+        viewModel.update(state: .readyToInstall(installed: parts[0], latest: parts[1]))
+        UpdateLogStore.shared.append("brew self-update: DEBUG forced .readyToInstall \(parts[0]) → \(parts[1])")
+        return true
+    }
+#endif
+
     /// Force an outdated check immediately. Used by Phase 2's "Check now" button.
     func checkNow() { runOutdatedCheck() }
 
@@ -164,6 +188,11 @@ final class BrewSelfUpdater {
     var isApplicationsInstall: Bool { Self.isApplicationsInstall }
 
     nonisolated static var isApplicationsInstall: Bool {
+#if DEBUG
+        if ProcessInfo.processInfo.environment["TERMMESH_BREW_FORCE_APPLICATIONS_OK"] == "1" {
+            return true
+        }
+#endif
         let path = Bundle.main.bundlePath
         return path.hasPrefix("/Applications/")
     }
