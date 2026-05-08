@@ -2,6 +2,18 @@
 
 All notable changes to term-mesh are documented here.
 
+## [0.102.0] - 2026-05-08
+
+### Removed
+- **Sparkle is gone** — the appcast feed has been 404 for some time and was producing `SUDownloadError (2001)` dialogs every time the user clicked `Check for Updates…`. The Sparkle SDK is no longer linked, the Sparkle public key and feed URL are out of `Info.plist`, and the three SPUUpdater shim files (`UpdateController.swift`, `UpdateDelegate.swift`, `UpdateDriver.swift`, ~720 lines combined) are gone. brew has been the actual update channel since 0.100.0; this just makes that explicit. No user action needed.
+
+### Changed
+- **`Check for Updates…` now gives you an actual answer** — the manual click was running silently in the background; you'd only see a pill if there was already an update sitting around. The titlebar pill now shows `Checking…` the moment you click, holds for at least 0.8 seconds so you can register that something happened, then transitions to either `Up to date` (which fades after 5 seconds) or `Update Available: X.Y.Z`. The 30-minute background poll is unchanged.
+
+### Thanks to 1 contributor!
+
+- [@JINWOO-J](https://github.com/JINWOO-J)
+
 ## [0.101.2] - 2026-05-08
 
 ### Fixed

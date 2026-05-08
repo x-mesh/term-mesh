@@ -111,7 +111,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
     var browserOmnibarRepeatDelta: Int = 0
     var browserAddressBarFocusObserver: NSObjectProtocol?
     var browserAddressBarBlurObserver: NSObjectProtocol?
-    let updateController = UpdateController()
+    let updateViewModel = UpdateViewModel()
     let brewSelfUpdater = BrewSelfUpdater()
     private lazy var titlebarAccessoryController = UpdateTitlebarAccessoryController(viewModel: updateViewModel)
     let windowDecorationsController = WindowDecorationsController()
@@ -200,10 +200,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
     var commandPaletteSelectionByWindowId: [UUID: Int] = [:]
     var commandPaletteSnapshotByWindowId: [UUID: CommandPaletteDebugSnapshot] = [:]
 
-    var updateViewModel: UpdateViewModel {
-        updateController.viewModel
-    }
-
     override init() {
         super.init()
         Self.shared = self
@@ -277,7 +273,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
 
         if !isRunningUnderXCTest {
             PostHogAnalytics.shared.startIfNeeded()
-            brewSelfUpdater.bridgeToSparklePill(updateViewModel)
+            brewSelfUpdater.bridgeToPill(updateViewModel)
             brewSelfUpdater.start()
         }
 
@@ -303,8 +299,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         if !isRunningUnderXCTest {
             configureUserNotifications()
             setupMenuBarExtra()
-            // Sparkle updater is started lazily on first manual check. This avoids any
-            // first-launch permission prompts and keeps term-mesh aligned with the update pill UI.
         }
         titlebarAccessoryController.start()
         windowDecorationsController.start()
@@ -376,7 +370,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         // event loop). Removing the mechanism fixes the wake-from-sleep regression
         // and does not reintroduce any measurable hang on current Ghostty.
 #if DEBUG
-        UpdateTestSupport.applyIfNeeded(to: updateController.viewModel)
+        UpdateTestSupport.applyIfNeeded(to: updateViewModel)
         if (env["TERMMESH_UI_TEST_MODE"] ?? env["CMUX_UI_TEST_MODE"]) == "1" {
             let trigger = (env["TERMMESH_UI_TEST_TRIGGER_UPDATE_CHECK"] ?? env["CMUX_UI_TEST_TRIGGER_UPDATE_CHECK"]) ?? "<nil>"
             let feed = (env["TERMMESH_UI_TEST_FEED_URL"] ?? env["CMUX_UI_TEST_FEED_URL"]) ?? "<nil>"
@@ -388,7 +382,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
                 guard let self else { return }
                 let windowIds = NSApp.windows.map { $0.identifier?.rawValue ?? "<nil>" }
                 UpdateLogStore.shared.append("ui test windows: count=\(NSApp.windows.count) ids=\(windowIds.joined(separator: ","))")
-                if UpdateTestSupport.performMockFeedCheckIfNeeded(on: self.updateController.viewModel) {
+                if UpdateTestSupport.performMockFeedCheckIfNeeded(on: self.updateViewModel) {
                     return
                 }
                 self.checkForUpdates(nil)
@@ -1230,23 +1224,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
     }
 
     @objc func checkForUpdates(_ sender: Any?) {
-        updateViewModel.overrideState = nil
-        // Sparkle's manual check is intentionally skipped here:
-        // the appcast feed (manaflow-ai/term-mesh) returns 404, so the
-        // SPUUpdater would surface a SUDownloadError dialog to the user.
-        // brew is the active update channel; Sparkle install path
-        // (applyUpdateIfAvailable) stays available for the rare case it works.
         brewSelfUpdater.refreshNow()
     }
 
     @objc func applyUpdateIfAvailable(_ sender: Any?) {
-        updateViewModel.overrideState = nil
-        updateController.installUpdate()
+        _ = brewSelfUpdater.triggerInstallAndRestart()
     }
 
     @objc func attemptUpdate(_ sender: Any?) {
-        updateViewModel.overrideState = nil
-        updateController.attemptUpdate()
+        brewSelfUpdater.refreshNow()
     }
 
     func setupMenuBarExtra() {
@@ -1319,27 +1305,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
     #if DEBUG
     @objc func showUpdatePill(_ sender: Any?) {
         updateViewModel.debugOverrideText = nil
-        updateViewModel.overrideState = .installing(.init(isAutoUpdate: true, retryTerminatingApplication: {}, dismiss: {}))
+        updateViewModel.state = .readyToInstall(installed: "0.100.0", latest: "0.101.0", install: {}, dismiss: { [weak self] in self?.updateViewModel.state = .idle })
     }
 
     @objc func showUpdatePillLongNightly(_ sender: Any?) {
         updateViewModel.debugOverrideText = "Update Available: 0.32.0-nightly+20260216.abc1234"
-        updateViewModel.overrideState = .notFound(.init(acknowledgement: {}))
+        updateViewModel.state = .upToDate(dismiss: { [weak self] in self?.updateViewModel.state = .idle })
     }
 
     @objc func showUpdatePillLoading(_ sender: Any?) {
         updateViewModel.debugOverrideText = nil
-        updateViewModel.overrideState = .checking(.init(cancel: {}))
+        updateViewModel.state = .checking
     }
 
     @objc func hideUpdatePill(_ sender: Any?) {
         updateViewModel.debugOverrideText = nil
-        updateViewModel.overrideState = .idle
+        updateViewModel.state = .idle
     }
 
     @objc func clearUpdatePillOverride(_ sender: Any?) {
         updateViewModel.debugOverrideText = nil
-        updateViewModel.overrideState = nil
+        updateViewModel.state = .idle
     }
 #endif
 
