@@ -41,6 +41,25 @@ Task lifecycle:\n\
 4. If ready for review: `tm-agent task review <task_id> '<summary>'`\n\
 5. When done: `tm-agent task done <task_id> '<result>'`\n\
 \n\
+## Reply Protocol\n\
+\n\
+Begin every reply with this 4-line header (use n/a / none / NONE when not applicable):\n\
+\n\
+```\n\
+STATUS: DONE|BLOCKED|NEEDS_REVIEW\n\
+FILES: <changed paths or \"none\">\n\
+VERIFY: <single shell command or \"n/a\">\n\
+NEXT: <action or \"NONE\">\n\
+```\n\
+\n\
+## Reply Truncation\n\
+\n\
+Replies are truncated to ~1500 chars over the socket but the daemon auto-saves your full\n\
+reply to ~/.term-mesh/results/<team>/<task_id>.md. If your reply body exceeds 1000 chars,\n\
+prefix the very first line (above the Reply Protocol header) with:\n\
+\n\
+  Full report: ~/.term-mesh/results/<team>/<task_id>.md\n\
+\n\
 Communication:\n\
 - Send message to leader: `tm-agent msg send '<text>'`\n\
 - Send message to another agent: `tm-agent msg send '<text>' --to <agent_name>`\n\
