@@ -127,6 +127,7 @@ final class BrewSelfUpdater {
     deinit {
         outdatedTimer?.cancel()
         refreshTimer?.cancel()
+        startWorkItem?.cancel()
         pathMonitor.cancel()
     }
 
@@ -190,6 +191,14 @@ final class BrewSelfUpdater {
         }
         guard isInstalledViaCask() else {
             UpdateLogStore.shared.append("brew self-update: term-mesh cask not installed")
+            viewModel.update(state: .unsupported)
+            return
+        }
+        // No point polling when the running bundle isn't where brew installs it
+        // (e.g. DEV builds in DerivedData) — we'd never be able to trigger the
+        // upgrade anyway. DEBUG force-overrides above bypass this entirely.
+        guard Self.isApplicationsInstall else {
+            UpdateLogStore.shared.append("brew self-update: app not running from /Applications — polling skipped")
             viewModel.update(state: .unsupported)
             return
         }

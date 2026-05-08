@@ -38,6 +38,13 @@ CALLER_PID="$4"
 log "=================================================="
 log "brew-upgrade-helper start: cask=$CASK app=$APP brew=$BREW pid=$$ caller=$CALLER_PID"
 
+# Defensive validation: caller_pid must be numeric so `kill -0 "$CALLER_PID"`
+# can't be tricked by a crafted argument.
+if [[ ! "$CALLER_PID" =~ ^[0-9]+$ ]]; then
+    log "ERROR: invalid caller pid (not numeric): $CALLER_PID"
+    exit 64
+fi
+
 if [[ ! -x "$BREW" ]]; then
     log "ERROR: brew binary not executable: $BREW"
     exit 1
@@ -74,9 +81,14 @@ if [[ -d "$APP" ]]; then
     /usr/bin/open "$APP" >>"$LOG" 2>&1 || log "WARN: open exited non-zero"
     # Belt-and-suspenders: explicitly activate so the relaunched window
     # comes to foreground even if another app currently has focus.
+    # Pass the bundle name as an osascript argv item so embedded quotes/special
+    # characters in the path can't break out of the AppleScript string.
     APP_BASENAME=$(basename "$APP" .app)
-    /usr/bin/osascript -e "tell application \"$APP_BASENAME\" to activate" \
-        >>"$LOG" 2>&1 || log "WARN: osascript activate failed"
+    /usr/bin/osascript \
+        -e 'on run argv' \
+        -e 'tell application (item 1 of argv) to activate' \
+        -e 'end run' \
+        -- "$APP_BASENAME" >>"$LOG" 2>&1 || log "WARN: osascript activate failed"
 else
     log "WARN: app path not found: $APP — skipping relaunch"
 fi
