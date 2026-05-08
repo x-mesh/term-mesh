@@ -2,6 +2,15 @@
 
 All notable changes to term-mesh are documented here.
 
+## [0.102.4] - 2026-05-08
+
+### Changed
+- Release pipeline verification build — exercises the full in-app update path end-to-end (brew outdated detection, helper-driven `brew upgrade --cask`, relaunch) on top of the v0.102.3 ghostty rollback. No code changes other than the version bump.
+
+### Thanks to 1 contributor!
+
+- [@JINWOO-J](https://github.com/JINWOO-J)
+
 ## [0.102.3] - 2026-05-08
 
 ### Fixed
