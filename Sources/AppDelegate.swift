@@ -1231,7 +1231,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
 
     @objc func checkForUpdates(_ sender: Any?) {
         updateViewModel.overrideState = nil
-        updateController.checkForUpdates()
+        // Sparkle's manual check is intentionally skipped here:
+        // the appcast feed (manaflow-ai/term-mesh) returns 404, so the
+        // SPUUpdater would surface a SUDownloadError dialog to the user.
+        // brew is the active update channel; Sparkle install path
+        // (applyUpdateIfAvailable) stays available for the rare case it works.
         brewSelfUpdater.refreshNow()
     }
 
