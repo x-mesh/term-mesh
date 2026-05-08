@@ -237,11 +237,20 @@ final class BrewSelfUpdater {
         }
 
         let appPath = Bundle.main.bundlePath
-        UpdateLogStore.shared.append("brew self-update: spawning helper to upgrade \(installed) → \(latest)")
+        let callerPid = String(ProcessInfo.processInfo.processIdentifier)
+
+#if DEBUG
+        if ProcessInfo.processInfo.environment["TERMMESH_BREW_DRY_RUN"] == "1" {
+            UpdateLogStore.shared.append("brew self-update: DRY_RUN — would spawn /bin/bash \(helper) \(brew) \(caskToken) \(appPath) \(callerPid); skipping spawn and terminate")
+            return true
+        }
+#endif
+
+        UpdateLogStore.shared.append("brew self-update: spawning helper to upgrade \(installed) → \(latest) (caller pid=\(callerPid))")
 
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/bin/bash")
-        process.arguments = [helper, brew, caskToken, appPath]
+        process.arguments = [helper, brew, caskToken, appPath, callerPid]
         // Detach by giving the child a fresh stdio + no pipes back to us.
         process.standardInput = FileHandle.nullDevice
         process.standardOutput = FileHandle.nullDevice
@@ -254,7 +263,7 @@ final class BrewSelfUpdater {
             return false
         }
 
-        // Give the helper a moment to start its `pgrep` wait loop before we exit.
+        // Give the helper a moment to start its wait loop before we exit.
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
             NSApp.terminate(nil)
         }
