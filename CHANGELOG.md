@@ -2,6 +2,15 @@
 
 All notable changes to term-mesh are documented here.
 
+## [0.102.2] - 2026-05-08
+
+### Fixed
+- **In-app "Check for Updates" no longer fails with "Update Failed" when an update is actually available** — `brew outdated --cask --json=v2 <token>` exits with code 1 (with valid JSON on stdout) when the cask is outdated and 0 when up-to-date. The previous Process wrapper treated any non-zero exit as failure, so users on 0.102.0 saw "Update Failed" with the JSON payload bleeding through as the error message — exactly the condition the check was trying to detect, mistaken for a runtime error. The wrapper now accepts `{0, 1}` for the outdated check and relies on the JSON shape for the actual decision.
+
+### Thanks to 1 contributor!
+
+- [@JINWOO-J](https://github.com/JINWOO-J)
+
 ## [0.102.1] - 2026-05-08
 
 ### Fixed
