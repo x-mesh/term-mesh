@@ -45,6 +45,8 @@ class UpdateViewModel: ObservableObject {
             return "No Updates Available"
         case .error(let err):
             return Self.userFacingErrorTitle(for: err.error)
+        case .brewReadyToInstall(let brew):
+            return "Update Available: \(brew.latest)"
         }
     }
 
@@ -79,6 +81,8 @@ class UpdateViewModel: ObservableObject {
             return "info.circle"
         case .error:
             return "exclamationmark.triangle.fill"
+        case .brewReadyToInstall:
+            return "shippingbox.fill"
         }
     }
 
@@ -102,6 +106,8 @@ class UpdateViewModel: ObservableObject {
             return "You are running the latest version"
         case .error(let err):
             return Self.userFacingErrorMessage(for: err.error)
+        case .brewReadyToInstall(let brew):
+            return "term-mesh \(brew.installed) → \(brew.latest) via Homebrew"
         }
     }
 
@@ -118,6 +124,8 @@ class UpdateViewModel: ObservableObject {
             return nil
         case .extracting(let extracting):
             return String(format: "%.0f%%", extracting.progress * 100)
+        case .brewReadyToInstall(let brew):
+            return brew.latest
         default:
             return nil
         }
@@ -139,6 +147,8 @@ class UpdateViewModel: ObservableObject {
             return .secondary
         case .error:
             return .orange
+        case .brewReadyToInstall:
+            return .accentColor
         }
     }
 
@@ -146,7 +156,7 @@ class UpdateViewModel: ObservableObject {
         switch effectiveState {
         case .permissionRequest:
             return Color(nsColor: NSColor.systemBlue.blended(withFraction: 0.3, of: .black) ?? .systemBlue)
-        case .updateAvailable:
+        case .updateAvailable, .brewReadyToInstall:
             return .accentColor
         case .notFound:
             return Color(nsColor: NSColor.systemBlue.blended(withFraction: 0.5, of: .black) ?? .systemBlue)
@@ -161,7 +171,7 @@ class UpdateViewModel: ObservableObject {
         switch effectiveState {
         case .permissionRequest:
             return .white
-        case .updateAvailable:
+        case .updateAvailable, .brewReadyToInstall:
             return .white
         case .notFound:
             return .white
@@ -344,6 +354,10 @@ enum UpdateState: Equatable {
     case downloading(Downloading)
     case extracting(Extracting)
     case installing(Installing)
+    /// Set externally (via overrideState) by BrewSelfUpdater when a Homebrew cask
+    /// upgrade is fetched and ready to install. Lets the existing UpdatePill UI
+    /// surface brew updates without a parallel pill.
+    case brewReadyToInstall(BrewReady)
 
     var isIdle: Bool {
         if case .idle = self { return true }
@@ -356,7 +370,8 @@ enum UpdateState: Equatable {
                 .updateAvailable,
                 .downloading,
                 .extracting,
-                .installing:
+                .installing,
+                .brewReadyToInstall:
             return true
         default:
             return false
@@ -375,6 +390,8 @@ enum UpdateState: Equatable {
             notFound.acknowledgement()
         case .error(let err):
             err.dismiss()
+        case .brewReadyToInstall(let brew):
+            brew.dismiss()
         default:
             break
         }
@@ -384,6 +401,8 @@ enum UpdateState: Equatable {
         switch self {
         case .updateAvailable(let available):
             available.reply(.install)
+        case .brewReadyToInstall(let brew):
+            brew.install()
         default:
             break
         }
@@ -409,9 +428,18 @@ enum UpdateState: Equatable {
             return lExt.progress == rExt.progress
         case (.installing(let lInstall), .installing(let rInstall)):
             return lInstall.isAutoUpdate == rInstall.isAutoUpdate
+        case (.brewReadyToInstall(let lBrew), .brewReadyToInstall(let rBrew)):
+            return lBrew.installed == rBrew.installed && lBrew.latest == rBrew.latest
         default:
             return false
         }
+    }
+
+    struct BrewReady {
+        let installed: String
+        let latest: String
+        let install: () -> Void
+        let dismiss: () -> Void
     }
 
     struct NotFound {

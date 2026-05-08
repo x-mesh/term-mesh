@@ -36,9 +36,70 @@ struct UpdatePopoverView: View {
 
             case .error(let error):
                 UpdateErrorView(error: error, dismiss: dismiss)
+
+            case .brewReadyToInstall(let brew):
+                BrewReadyView(brew: brew, dismiss: dismiss)
             }
         }
         .frame(width: 300)
+    }
+}
+
+fileprivate struct BrewReadyView: View {
+    let brew: UpdateState.BrewReady
+    let dismiss: DismissAction
+
+    private let labelWidth: CGFloat = 70
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            VStack(alignment: .leading, spacing: 8) {
+                Text("Update Ready")
+                    .font(.system(size: 13, weight: .semibold))
+
+                Text("term-mesh will quit, install via Homebrew, and relaunch automatically.")
+                    .font(.system(size: 11))
+                    .foregroundColor(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+
+                VStack(alignment: .leading, spacing: 4) {
+                    HStack(spacing: 6) {
+                        Text("Current:")
+                            .foregroundColor(.secondary)
+                            .frame(width: labelWidth, alignment: .trailing)
+                        Text(brew.installed).monospaced()
+                    }
+                    HStack(spacing: 6) {
+                        Text("Available:")
+                            .foregroundColor(.secondary)
+                            .frame(width: labelWidth, alignment: .trailing)
+                        Text(brew.latest).monospaced()
+                    }
+                }
+                .font(.system(size: 11))
+                .textSelection(.enabled)
+            }
+
+            HStack(spacing: 8) {
+                Button("Later") {
+                    brew.dismiss()
+                    dismiss()
+                }
+                .keyboardShortcut(.cancelAction)
+                .controlSize(.small)
+
+                Spacer()
+
+                Button("Install and Restart") {
+                    brew.install()
+                    dismiss()
+                }
+                .keyboardShortcut(.defaultAction)
+                .buttonStyle(.borderedProminent)
+                .controlSize(.small)
+            }
+        }
+        .padding(16)
     }
 }
 

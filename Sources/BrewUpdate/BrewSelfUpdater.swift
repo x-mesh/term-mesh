@@ -87,6 +87,11 @@ final class BrewSelfUpdater {
 
     let viewModel: BrewSelfUpdateViewModel
     private let caskToken: String
+    /// Optional bridge into the Sparkle update pill — when set, brew's
+    /// readyToInstall state is mirrored as `UpdateState.brewReadyToInstall`
+    /// so the existing pill UI surfaces it.
+    private weak var bridgedSparklePillModel: UpdateViewModel?
+    private var stateBridgeCancellable: AnyCancellable?
     private let timerQueue = DispatchQueue(label: "term-mesh.brew-self-update.timer", qos: .utility)
     private var outdatedTimer: DispatchSourceTimer?
     private var refreshTimer: DispatchSourceTimer?
@@ -123,6 +128,46 @@ final class BrewSelfUpdater {
         outdatedTimer?.cancel()
         refreshTimer?.cancel()
         pathMonitor.cancel()
+    }
+
+    /// Mirror brew state into the existing Sparkle UpdateViewModel via overrideState.
+    /// While brew has a readyToInstall update, the standard UpdatePill shows
+    /// "Update Available: <latest>" and clicking it routes through the brew install path.
+    /// Idempotent — calling again just updates the bridged target.
+    func bridgeToSparklePill(_ updateModel: UpdateViewModel) {
+        bridgedSparklePillModel = updateModel
+        stateBridgeCancellable?.cancel()
+        stateBridgeCancellable = viewModel.$state
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] state in
+                self?.applyToSparklePill(state)
+            }
+        applyToSparklePill(viewModel.state)
+    }
+
+    private func applyToSparklePill(_ state: BrewSelfUpdateState) {
+        guard let updateModel = bridgedSparklePillModel else { return }
+        switch state {
+        case let .readyToInstall(installed, latest):
+            let info = UpdateState.BrewReady(
+                installed: installed,
+                latest: latest,
+                install: { [weak self] in
+                    _ = self?.triggerInstallAndRestart()
+                },
+                dismiss: { [weak updateModel] in
+                    if case .brewReadyToInstall = updateModel?.overrideState {
+                        updateModel?.overrideState = nil
+                    }
+                }
+            )
+            updateModel.overrideState = .brewReadyToInstall(info)
+        default:
+            // Only clear an override that we set ourselves.
+            if case .brewReadyToInstall = updateModel.overrideState {
+                updateModel.overrideState = nil
+            }
+        }
     }
 
     /// Start periodic polling. Safe to call multiple times.

@@ -277,6 +277,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
 
         if !isRunningUnderXCTest {
             PostHogAnalytics.shared.startIfNeeded()
+            brewSelfUpdater.bridgeToSparklePill(updateViewModel)
             brewSelfUpdater.start()
         }
 
