@@ -212,6 +212,7 @@ final class BrewSelfUpdater {
         }
         viewModel.update(state: .readyToInstall(installed: parts[0], latest: parts[1]))
         UpdateLogStore.shared.append("brew self-update: DEBUG forced .readyToInstall \(parts[0]) → \(parts[1])")
+        prefetchReleaseNotes(for: parts[1])
         return true
     }
 #endif
@@ -275,6 +276,21 @@ final class BrewSelfUpdater {
         alert.alertStyle = .informational
         alert.addButton(withTitle: "Restart and Update")
         alert.addButton(withTitle: "Later")
+
+        if let notes = BrewReleaseNotesService.shared.cachedNotes(for: latest), !notes.isEmpty {
+            let releaseURL = UpdateState.BrewReady(
+                installed: installed,
+                latest: latest,
+                install: {},
+                dismiss: {}
+            ).releaseNotesURL
+            alert.accessoryView = BrewReleaseNotesAccessoryView.nsHostingView(
+                markdown: notes,
+                version: latest,
+                releaseURL: releaseURL
+            )
+        }
+
         let response = alert.runModal()
         guard response == .alertFirstButtonReturn else {
             UpdateLogStore.shared.append("brew self-update: user cancelled restart-and-update")
@@ -434,9 +450,19 @@ final class BrewSelfUpdater {
         case .success:
             viewModel.update(state: .readyToInstall(installed: info.installed, latest: info.latest))
             UpdateLogStore.shared.append("brew self-update: fetch ok \(info.latest) in \(duration)s — ready to install")
+            prefetchReleaseNotes(for: info.latest)
         case .failure(let err):
             viewModel.update(state: .error(message: err.message))
             UpdateLogStore.shared.append("brew self-update: fetch failed in \(duration)s — \(err.message)")
+        }
+    }
+
+    /// Kick off a background fetch of GitHub release notes so the NSAlert
+    /// can render them inline when the user clicks "Restart and Update".
+    /// Failures are silent — the alert just falls back to a notes-less layout.
+    private func prefetchReleaseNotes(for version: String) {
+        Task { @MainActor in
+            _ = await BrewReleaseNotesService.shared.notes(for: version)
         }
     }
 
