@@ -1068,103 +1068,193 @@ final class TerminalSurface: Identifiable, ObservableObject {
         flush()
     }
 
-    /// Send text via IME-style PRESS+RELEASE pairs for reliable key state tracking.
-    /// Unlike sendInputText which sends PRESS-only for text chars (causing key state
-    /// ambiguity), this sends proper PRESS+RELEASE pairs per chunk, then an atomic
-    /// Return key event — all synchronously within one call.
-    ///
-    /// Multiline text (containing `\n`) is sent via `sendText` (bracketed paste) so the
-    /// terminal treats newlines as content rather than per-line execution.
+    // MARK: - Paste Queue
+
+    enum PasteSendError: Error {
+        case queueOverflow
+        case surfaceUnavailable
+        case returnRetryExhausted
+    }
+
+    private struct PendingPaste {
+        let text: String
+        let needsReturn: Bool
+        let enqueuedAt: TimeInterval
+        let completion: ((Result<Void, PasteSendError>) -> Void)?
+    }
+    private var pasteQueue: [PendingPaste] = []
+    private var pasteInFlight: Bool = false
+    private var pasteWatchdog: DispatchSourceTimer?
+    private var pasteGeneration: Int = 0
+    private static let maxPasteQueueDepth = 16
+
+    /// Enqueues text+Return for serialized delivery via the paste queue,
+    /// eliminating the paste→Return race. Returns true immediately (enqueue succeeds).
     @discardableResult
     func sendIMEText(_ text: String, withReturn: Bool = true) -> Bool {
-        guard let surface = surface else {
+        if !Thread.isMainThread {
+            DispatchQueue.main.async { [weak self] in _ = self?.sendIMEText(text, withReturn: withReturn) }
+            return true
+        }
+        let normalized = text.contains("\n") ? text
+            .replacingOccurrences(of: "\r\n", with: " ")
+            .replacingOccurrences(of: "\n", with: " ")
+            .replacingOccurrences(of: "\r", with: " ")
+            : text
+        enqueuePaste(PendingPaste(text: normalized, needsReturn: withReturn,
+                                  enqueuedAt: ProcessInfo.processInfo.systemUptime, completion: nil))
+        drainPasteQueue()
+        return true
+    }
+
+    /// Result-based variant for callers that want structured error feedback.
+    /// Existing Bool-returning callers are unaffected; migrate to this in a follow-up PR.
+    func sendIMETextResult(_ text: String, withReturn: Bool = true,
+                           completion: @escaping (Result<Void, PasteSendError>) -> Void) {
+        if !Thread.isMainThread {
+            DispatchQueue.main.async { [weak self] in
+                self?.sendIMETextResult(text, withReturn: withReturn, completion: completion)
+            }
+            return
+        }
+        let normalized = text.contains("\n") ? text
+            .replacingOccurrences(of: "\r\n", with: " ")
+            .replacingOccurrences(of: "\n", with: " ")
+            .replacingOccurrences(of: "\r", with: " ")
+            : text
+        enqueuePaste(PendingPaste(text: normalized, needsReturn: withReturn,
+                                  enqueuedAt: ProcessInfo.processInfo.systemUptime, completion: completion))
+        drainPasteQueue()
+    }
+
+    private func enqueuePaste(_ p: PendingPaste) {
+        if !Thread.isMainThread {
+            DispatchQueue.main.async { [weak self] in self?.enqueuePaste(p) }
+            return
+        }
+        if pasteQueue.count >= TerminalSurface.maxPasteQueueDepth {
+            let dropped = pasteQueue.removeFirst()
+            dropped.completion?(.failure(.queueOverflow))
+            sentryBreadcrumb("paste.queue.overflow", category: "terminal", data: [
+                "surface": id.uuidString,
+                "dropped_text_prefix": String(dropped.text.prefix(40))
+            ])
             #if DEBUG
-            dlog("ime.send.fail reason=surface_nil")
+            dlog("paste.queue.overflow surface=\(id.uuidString.prefix(8)) dropped=\(dropped.text.prefix(40))")
             #endif
-            return false
         }
+        pasteQueue.append(p)
+    }
 
-        // Multiline: collapse newlines to spaces so the text is sent as a single
-        // line via key events. Bracketed paste + Return key event doesn't reliably
-        // submit in TUI apps (Claude Code). Newlines in agent instructions are
-        // formatting only — the LLM understands the instruction without them.
-        let normalized: String
-        if text.contains("\n") {
-            normalized = text
-                .replacingOccurrences(of: "\r\n", with: " ")
-                .replacingOccurrences(of: "\n", with: " ")
-                .replacingOccurrences(of: "\r", with: " ")
-        } else {
-            normalized = text
+    private func drainPasteQueue() {
+        guard !pasteInFlight, !pasteQueue.isEmpty else { return }
+        let next = pasteQueue.removeFirst()
+        processPaste(next)
+    }
+
+    private func finalizePaste(result: Result<Void, PasteSendError>,
+                               completion: ((Result<Void, PasteSendError>) -> Void)?) {
+        cancelPasteWatchdog()
+        pasteInFlight = false
+        completion?(result)
+        drainPasteQueue()
+    }
+
+    private func startPasteWatchdog(generation: Int,
+                                    completion: ((Result<Void, PasteSendError>) -> Void)?) {
+        pasteWatchdog?.cancel()
+        let src = DispatchSource.makeTimerSource(queue: .main)
+        src.schedule(deadline: .now() + 8.0)
+        src.setEventHandler { [weak self] in
+            guard let self, self.pasteGeneration == generation else { return }
+            self.pasteWatchdog = nil
+            self.pasteGeneration &+= 1  // invalidate stale async retry callbacks
+            self.pasteInFlight = false
+            completion?(.failure(.returnRetryExhausted))
+            self.drainPasteQueue()
+            #if DEBUG
+            dlog("[paste.watchdog] 8s timeout forced surface=\(self.id.uuidString.prefix(8))")
+            #endif
         }
+        src.resume()
+        pasteWatchdog = src
+    }
 
-        if !normalized.isEmpty {
-            // Use ghostty_surface_text for text delivery — it properly wraps
-            // content in bracketed paste markers (\e[200~...\e[201~) when the
-            // terminal has bracketed paste mode enabled. This ensures TUI apps
-            // like Claude Code handle the text as an official paste event rather
-            // than inferring paste from rapid keystroke arrival (which can cause
-            // the subsequent Return key to be silently dropped).
-            let data = normalized.utf8
+    private func cancelPasteWatchdog() {
+        pasteWatchdog?.cancel()
+        pasteWatchdog = nil
+    }
+
+    private func processPaste(_ p: PendingPaste) {
+        guard let surface = surface else {
+            pasteQueue.insert(p, at: 0)
+            return
+        }
+        pasteInFlight = true
+        pasteGeneration &+= 1
+        let gen = pasteGeneration
+        startPasteWatchdog(generation: gen, completion: p.completion)
+
+        if !p.text.isEmpty {
+            let data = p.text.utf8
             let len = UInt(data.count)
             data.withContiguousStorageIfAvailable { buf in
                 ghostty_surface_text(surface, buf.baseAddress, len)
-            } ?? normalized.withCString { cstr in
+            } ?? p.text.withCString { cstr in
                 ghostty_surface_text(surface, cstr, len)
+            }
+            if p.needsReturn {
+                usleep(5_000) // 5ms — let IO thread flush paste to PTY before Return
             }
         }
 
-        // When text was delivered and Return is requested, brief pause to let
-        // the IO thread flush the paste to the PTY. Note: for team text delivery,
-        // sendTextToPanel splits text and Return into separate MainActor turns,
-        // so this delay is mainly for direct sendIMEText callers.
-        if withReturn && !normalized.isEmpty {
-            usleep(5_000) // 5ms — enough for IO thread to flush paste to PTY
+        guard p.needsReturn else {
+            finalizePaste(result: .success(()), completion: p.completion)
+            return
         }
 
-        // Send Return key (PRESS+RELEASE) with sync + async retry.
-        // When a TUI app (Claude Code) is "thinking", ghostty_surface_key(Return)
-        // returns pressHandled=false. Synchronous retries (blocking MainThread) can't
-        // wait long enough. Strategy:
-        //   1. Try once synchronously (immediate)
-        //   2. If fails, one sync retry after 10ms
-        //   3. If still fails, schedule async retries via DispatchQueue.main.asyncAfter
-        //      at 200ms, 500ms, 1000ms — these fire when the TUI returns to idle
-        if withReturn {
-            let delivered = sendReturnKey(to: surface)
-            if !delivered {
-                #if DEBUG
-                dlog("[sendIMEText.Return] PRESS not handled, sync retry in 10ms surface=\(id.uuidString.prefix(8))")
-                #endif
-                usleep(10_000)
-                let retryDelivered = sendReturnKey(to: surface)
-                if !retryDelivered {
-                    #if DEBUG
-                    dlog("[sendIMEText.Return] sync retry failed, scheduling async retries surface=\(id.uuidString.prefix(8))")
-                    #endif
-                    // Schedule async retries — don't block MainThread.
-                    // TUI apps (Claude Code) can be "thinking" for 15-30s during which
-                    // Return is rejected. Retry at exponential intervals up to ~30s total.
-                    // Use a shared token to stop retrying once Return is accepted.
-                    let token = ReturnDeliveryToken()
-                    let asyncDelays: [Double] = [0.2, 0.5, 1.0, 2.0, 4.0, 8.0, 15.0, 25.0]
-                    for (i, delay) in asyncDelays.enumerated() {
-                        DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self, token] in
-                            guard let self, let surf = self.surface, !token.delivered else { return }
-                            let ok = self.sendReturnKey(to: surf)
-                            if ok { token.delivered = true }
-                            #if DEBUG
-                            dlog("[sendIMEText.Return] async retry \(i + 1)/\(asyncDelays.count) delay=\(delay)s handled=\(ok) token.delivered=\(token.delivered) surface=\(self.id.uuidString.prefix(8))")
-                            #endif
-                        }
+        let delivered = sendReturnKey(to: surface)
+        if delivered {
+            finalizePaste(result: .success(()), completion: p.completion)
+            return
+        }
+        #if DEBUG
+        dlog("[processPaste.Return] PRESS not handled, sync retry in 10ms surface=\(id.uuidString.prefix(8))")
+        #endif
+        usleep(10_000)
+        let retryDelivered = sendReturnKey(to: surface)
+        if retryDelivered {
+            finalizePaste(result: .success(()), completion: p.completion)
+            return
+        }
+        #if DEBUG
+        dlog("[processPaste.Return] sync retry failed, scheduling async retries surface=\(id.uuidString.prefix(8))")
+        #endif
+
+        let token = ReturnDeliveryToken()
+        let asyncDelays: [Double] = [0.2, 0.5, 1.0, 2.0, 3.0]
+        for (i, delay) in asyncDelays.enumerated() {
+            let isLast = i == asyncDelays.count - 1
+            DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self, token] in
+                guard let self, !token.delivered, self.pasteGeneration == gen else { return }
+                guard let surf = self.surface else {
+                    if isLast {
+                        self.finalizePaste(result: .failure(.surfaceUnavailable), completion: p.completion)
                     }
-                    // Return false — Return was NOT delivered synchronously.
-                    // Async retries are scheduled but callers should treat this as pending.
-                    return false
+                    return
+                }
+                let ok = self.sendReturnKey(to: surf)
+                if ok { token.delivered = true }
+                #if DEBUG
+                dlog("[processPaste.Return] async retry \(i + 1)/\(asyncDelays.count) delay=\(delay)s handled=\(ok) token.delivered=\(token.delivered) surface=\(self.id.uuidString.prefix(8))")
+                #endif
+                if ok {
+                    self.finalizePaste(result: .success(()), completion: p.completion)
+                } else if isLast {
+                    self.finalizePaste(result: .failure(.returnRetryExhausted), completion: p.completion)
                 }
             }
         }
-        return true
     }
 
     /// Send a single Return key (PRESS+RELEASE) to the given surface.
@@ -1926,165 +2016,15 @@ func pushTargetSurfaceSize(_ size: CGSize) {
     }
 #endif
 
-    /// Send a Return key press+release to the given surface.
     @discardableResult
-    private func sendReturnKey(to surface: ghostty_surface_t) -> Bool {
-        #if DEBUG
-        dlog("[sendReturnKey] sending Return to surface \(terminalSurface?.id.uuidString.prefix(8) ?? "nil")")
-        #endif
-        var keyEvent = ghostty_input_key_s()
-        keyEvent.action = GHOSTTY_ACTION_PRESS
-        keyEvent.keycode = 36
-        keyEvent.mods = GHOSTTY_MODS_NONE
-        keyEvent.consumed_mods = GHOSTTY_MODS_NONE
-        keyEvent.unshifted_codepoint = 0
-        keyEvent.composing = false
-        var pressHandled = false
-        "\r".withCString { ptr in
-            keyEvent.text = ptr
-            pressHandled = ghostty_surface_key(surface, keyEvent)
-        }
-        #if DEBUG
-        if !pressHandled {
-            dlog("[sendReturnKey] WARN: Return key PRESS not handled by ghostty surface=\(terminalSurface?.id.uuidString.prefix(8) ?? "nil")")
-        }
-        #endif
-        keyEvent.action = GHOSTTY_ACTION_RELEASE
-        keyEvent.text = nil
-        _ = ghostty_surface_key(surface, keyEvent)
-        return pressHandled
+    func sendIMEText(_ text: String, withReturn: Bool = true) -> Bool {
+        terminalSurface?.sendIMEText(text, withReturn: withReturn) ?? false
     }
 
-    /// Exponential backoff delays (ms) for surface-nil retry in sendIMEText.
-    /// 4 attempts: 50 → 150 → 400 → 800 ms (total ~1.4 s before final failure).
-    private static let sendIMETextRetryDelaysMs: [Double] = [50, 150, 400, 800]
-
-    /// Send text from the IME Input Bar to the terminal surface as key input.
-    ///
-    /// Multiline: use bracketed paste so terminal treats newlines as content, not execution.
-    /// The shell interprets each Return key event as "execute", so multiline text must be
-    /// delivered via ghostty_surface_text (bracketed paste) rather than per-line key events.
-    /// Single-line: use key events so TUI apps (Claude Code) receive proper press/release pairs.
-    ///
-    /// Returns true if text was delivered successfully, false if the surface was unavailable.
-    /// If the surface is transiently nil (pane re-creation), retries up to 4 times with
-    /// exponential backoff (50 → 150 → 400 → 800 ms) before giving up.
-    @discardableResult
-    func sendIMEText(_ text: String, withReturn: Bool = true, attempt: Int = 0) -> Bool {
-        guard let surface = surface else {
-            let delays = Self.sendIMETextRetryDelaysMs
-            guard attempt < delays.count else {
-#if DEBUG
-                dlog("[sendIMEText] FAIL: surface nil after 4 retries, text+Enter dropped: \(text.prefix(50))")
-#endif
-                return false
-            }
-            let delayMs = delays[attempt]
-#if DEBUG
-            dlog("[sendIMEText] surface nil, retry \(attempt + 1)/\(delays.count) after \(Int(delayMs))ms surface=\(terminalSurface?.id.uuidString.prefix(5) ?? "nil")")
-#endif
-            DispatchQueue.main.asyncAfter(deadline: .now() + delayMs / 1000.0) { [weak self] in
-                _ = self?.sendIMEText(text, withReturn: withReturn, attempt: attempt + 1)
-            }
-            return false
-        }
-
-        if text.contains("\n") {
-            // Multiline: use bracketed paste so terminal treats newlines as content, not execution.
-            // Sending Return key events between lines would cause the shell to execute each line
-            // immediately instead of composing a multiline input.
-            guard let ts = terminalSurface else {
-#if DEBUG
-                dlog("ime.send.fail reason=terminalSurface_nil path=multiline")
-#endif
-                return false
-            }
-            let payload = withReturn ? text + "\r" : text
-            ts.sendText(payload)
-            return true
-        }
-
-        // Single-line: use key events (PRESS+RELEASE) so TUI apps track key state correctly.
-        if !text.isEmpty {
-            // Chunk long text at UTF-8 safe boundaries (max 4096 bytes per event)
-            // to prevent potential buffer issues in the Ghostty C/Zig layer.
-            let segments = Self.chunkUTF8Safe(text, maxBytes: 4096)
-            for segment in segments {
-                // Send text as key event
-                var handled = false
-                segment.withCString { ptr in
-                    var keyEvent = ghostty_input_key_s()
-                    keyEvent.action = GHOSTTY_ACTION_PRESS
-                    keyEvent.keycode = 0
-                    keyEvent.mods = GHOSTTY_MODS_NONE
-                    keyEvent.consumed_mods = GHOSTTY_MODS_NONE
-                    keyEvent.unshifted_codepoint = 0
-                    keyEvent.text = ptr
-                    keyEvent.composing = false
-                    handled = ghostty_surface_key(surface, keyEvent)
-                }
-#if DEBUG
-                if !handled {
-                    dlog("ime.send.fail reason=key_not_handled segment=\(segment.prefix(20)) surface=\(terminalSurface?.id.uuidString.prefix(5) ?? "nil")")
-                }
-#endif
-                // Send matching RELEASE — TUI apps may track key state
-                var releaseEvent = ghostty_input_key_s()
-                releaseEvent.action = GHOSTTY_ACTION_RELEASE
-                releaseEvent.keycode = 0
-                releaseEvent.mods = GHOSTTY_MODS_NONE
-                releaseEvent.consumed_mods = GHOSTTY_MODS_NONE
-                releaseEvent.unshifted_codepoint = 0
-                releaseEvent.text = nil
-                releaseEvent.composing = false
-                _ = ghostty_surface_key(surface, releaseEvent)
-            }
-        }
-        // Send Enter to execute
-        if withReturn {
-            var returnDelivered = sendReturnKey(to: surface)
-            if !returnDelivered {
-                // Retry Return key delivery with small delays
-                let retryDelaysUs: [useconds_t] = [10_000, 30_000, 150_000]
-                for (i, delayUs) in retryDelaysUs.enumerated() {
-                    usleep(delayUs)
-                    returnDelivered = sendReturnKey(to: surface)
-                    #if DEBUG
-                    dlog("[sendIMEText] Return retry \(i + 1)/\(retryDelaysUs.count) handled=\(returnDelivered) surface=\(terminalSurface?.id.uuidString.prefix(8) ?? "nil")")
-                    #endif
-                    if returnDelivered { break }
-                }
-                if !returnDelivered {
-                    #if DEBUG
-                    dlog("[sendIMEText] FAIL: Return not delivered after all retries surface=\(terminalSurface?.id.uuidString.prefix(8) ?? "nil")")
-                    #endif
-                    return false
-                }
-            }
-        }
-        return true
-    }
-
-    /// Split a string into chunks where each chunk fits within `maxBytes` of UTF-8,
-    /// never splitting in the middle of a character.
-    private static func chunkUTF8Safe(_ text: String, maxBytes: Int) -> [String] {
-        guard text.utf8.count > maxBytes else { return [text] }
-        var chunks: [String] = []
-        var current = ""
-        var currentBytes = 0
-        for char in text {
-            let charBytes = char.utf8.count
-            if currentBytes + charBytes > maxBytes {
-                chunks.append(current)
-                current = String(char)
-                currentBytes = charBytes
-            } else {
-                current.append(char)
-                currentBytes += charBytes
-            }
-        }
-        if !current.isEmpty { chunks.append(current) }
-        return chunks
+    func sendIMETextResult(_ text: String, withReturn: Bool = true,
+                           completion: @escaping (Result<Void, TerminalSurface.PasteSendError>) -> Void) {
+        guard let ts = terminalSurface else { completion(.failure(.surfaceUnavailable)); return }
+        ts.sendIMETextResult(text, withReturn: withReturn, completion: completion)
     }
 
     // Prevents NSBeep for unimplemented actions from interpretKeyEvents
