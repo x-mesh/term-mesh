@@ -2,6 +2,15 @@
 
 All notable changes to term-mesh are documented here.
 
+## [0.102.3] - 2026-05-08
+
+### Fixed
+- **App no longer crashes on launch with `KERN_INVALID_ADDRESS` in `ghostty_config_get`** — v0.102.2 bumped the ghostty submodule to a SHA cherry-picked onto a much newer fork/main (1298 commits ahead of the prior base). The resulting GhosttyKit ABI was incompatible with our Swift bindings and any first window that became first responder crashed in `ghostty_config_get` during `ensureSurfaceReadyForInput`, blocking app launch entirely. Roll the submodule back to the SHA shipped with v0.102.1 (`c6e5476a`) where the PTY tap callback works without ABI drift; the PeerSSHTunnel ghost-socket fix and BrewSelfUpdater outdated-exit fix from v0.102.1 / v0.102.2 are preserved on top of this base.
+
+### Thanks to 1 contributor!
+
+- [@JINWOO-J](https://github.com/JINWOO-J)
+
 ## [0.102.2] - 2026-05-08
 
 ### Fixed
