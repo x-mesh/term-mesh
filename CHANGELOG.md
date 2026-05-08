@@ -2,6 +2,15 @@
 
 All notable changes to term-mesh are documented here.
 
+## [0.101.2] - 2026-05-08
+
+### Fixed
+- **`Check for Updates…` no longer surfaces a Sparkle download error** — the manual menu click was firing both Sparkle and the brew self-updater. Sparkle's appcast feed has been unreachable for a while (the configured host returns 404), so each click produced a `SUDownloadError (2001)` dialog even though brew was happily picking up the new version in the background. The manual click now only runs the brew check; Sparkle's install path (`applyUpdateIfAvailable`) is left in place for the rare case its feed comes back online.
+
+### Thanks to 1 contributor!
+
+- [@JINWOO-J](https://github.com/JINWOO-J)
+
 ## [0.101.1] - 2026-05-08
 
 ### Fixed
