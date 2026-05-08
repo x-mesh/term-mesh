@@ -1118,6 +1118,73 @@ private struct NotificationPopoverRow: View {
     }
 }
 
+/// Right-side titlebar accessory that hosts UpdatePill. Stays sized at 0×0 when
+/// the pill is idle (UpdatePill renders nothing for idle state) and grows
+/// automatically when an update appears.
+final class UpdatePillAccessoryViewController: NSTitlebarAccessoryViewController {
+    private let hostingView: NonDraggableHostingView<UpdatePillAccessoryHost>
+    private let containerView = NSView()
+    private var pendingSizeUpdate = false
+
+    init(viewModel: UpdateViewModel) {
+        hostingView = NonDraggableHostingView(rootView: UpdatePillAccessoryHost(model: viewModel))
+        super.init(nibName: nil, bundle: nil)
+        view = containerView
+        containerView.translatesAutoresizingMaskIntoConstraints = true
+        hostingView.translatesAutoresizingMaskIntoConstraints = true
+        hostingView.autoresizingMask = [.width, .height]
+        containerView.addSubview(hostingView)
+        scheduleSizeUpdate()
+    }
+
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
+
+    override func viewDidAppear() {
+        super.viewDidAppear()
+        scheduleSizeUpdate()
+    }
+
+    override func viewDidLayout() {
+        super.viewDidLayout()
+        scheduleSizeUpdate()
+    }
+
+    private func scheduleSizeUpdate() {
+        guard !pendingSizeUpdate else { return }
+        pendingSizeUpdate = true
+        DispatchQueue.main.async { [weak self] in
+            self?.pendingSizeUpdate = false
+            self?.updateSize()
+        }
+    }
+
+    private func updateSize() {
+        hostingView.invalidateIntrinsicContentSize()
+        hostingView.layoutSubtreeIfNeeded()
+        let contentSize = hostingView.fittingSize
+        let titlebarHeight = view.window.map { window in
+            window.frame.height - window.contentLayoutRect.height
+        } ?? contentSize.height
+        let containerHeight = max(contentSize.height, titlebarHeight)
+        let yOffset = max(0, (containerHeight - contentSize.height) / 2.0)
+        preferredContentSize = NSSize(width: contentSize.width, height: containerHeight)
+        containerView.frame = NSRect(x: 0, y: 0, width: contentSize.width, height: containerHeight)
+        hostingView.frame = NSRect(x: 0, y: yOffset, width: contentSize.width, height: contentSize.height)
+    }
+}
+
+/// SwiftUI host that re-evaluates accessory sizing whenever the pill text changes.
+private struct UpdatePillAccessoryHost: View {
+    @ObservedObject var model: UpdateViewModel
+
+    var body: some View {
+        UpdatePill(model: model)
+            .padding(.horizontal, 6)
+    }
+}
+
 final class UpdateTitlebarAccessoryController {
     /// Injected notification store for titlebar controls (defaults to singleton for backward compatibility).
     var notificationStore: TerminalNotificationStore = .shared
@@ -1128,6 +1195,7 @@ final class UpdateTitlebarAccessoryController {
     private var pendingAttachRetries: [ObjectIdentifier: Int] = [:]
     private var startupScanWorkItems: [DispatchWorkItem] = []
     private let controlsIdentifier = NSUserInterfaceItemIdentifier("term-mesh.titlebarControls")
+    private let pillIdentifier = NSUserInterfaceItemIdentifier("term-mesh.titlebarUpdatePill")
     private let controlsControllers = NSHashTable<TitlebarControlsAccessoryViewController>.weakObjects()
 
     init(viewModel: UpdateViewModel) {
@@ -1236,6 +1304,14 @@ final class UpdateTitlebarAccessoryController {
             controls.view.identifier = controlsIdentifier
             window.addTitlebarAccessoryViewController(controls)
             controlsControllers.add(controls)
+        }
+
+        if let updateViewModel,
+           !window.titlebarAccessoryViewControllers.contains(where: { $0.view.identifier == pillIdentifier }) {
+            let pill = UpdatePillAccessoryViewController(viewModel: updateViewModel)
+            pill.layoutAttribute = .right
+            pill.view.identifier = pillIdentifier
+            window.addTitlebarAccessoryViewController(pill)
         }
 
         attachedWindows.add(window)

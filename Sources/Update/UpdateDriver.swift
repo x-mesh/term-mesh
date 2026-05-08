@@ -299,6 +299,8 @@ class UpdateDriver: NSObject, SPUUserDriver {
             return String(format: "extracting(%.0f%%)", extracting.progress * 100)
         case .installing(let installing):
             return "installing(auto=\(installing.isAutoUpdate))"
+        case .brewReadyToInstall(let brew):
+            return "brewReadyToInstall(\(brew.installed) → \(brew.latest))"
         }
     }
 

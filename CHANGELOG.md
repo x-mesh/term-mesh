@@ -2,6 +2,15 @@
 
 All notable changes to term-mesh are documented here.
 
+## [0.100.0] - 2026-05-08
+
+### Added
+- **Homebrew cask self-updater** — installs done via `brew install --cask x-mesh/tap/term-mesh` now check for new cask versions every 30 minutes, pre-fetch the next release in the background via `brew fetch`, and surface an "Update Available" pill in the right side of the titlebar. A matching "Restart and Update term-mesh" entry appears in the menu bar once the download is ready. Confirming the update opens an alert that renders the GitHub release notes inline (headings, bullets, links); accepting it quits the app, runs `brew upgrade --cask --force term-mesh` via a detached helper script, and relaunches automatically with focus restored. The standard `Check for Updates…` menu item now triggers a brew check alongside Sparkle in the same click.
+
+### Thanks to 1 contributor!
+
+- [@JINWOO-J](https://github.com/JINWOO-J)
+
 ## [0.99.1] - 2026-05-07
 
 ### Fixed

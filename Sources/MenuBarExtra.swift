@@ -10,9 +10,12 @@ final class MenuBarExtraController: NSObject, NSMenuDelegate {
     private let onOpenNotification: (TerminalNotification) -> Void
     private let onJumpToLatestUnread: () -> Void
     private let onCheckForUpdates: () -> Void
+    private let onRestartAndUpdateBrew: () -> Void
+    private let brewUpdateViewModel: BrewSelfUpdateViewModel?
     private let onOpenPreferences: () -> Void
     private let onQuitApp: () -> Void
     private var notificationsCancellable: AnyCancellable?
+    private var brewUpdateCancellable: AnyCancellable?
     private var peerServerObserver: NSObjectProtocol?
     private let buildHintTitle: String?
 
@@ -25,6 +28,7 @@ final class MenuBarExtraController: NSObject, NSMenuDelegate {
     private let markAllReadItem = NSMenuItem(title: "Mark All Read", action: nil, keyEquivalent: "")
     private let clearAllItem = NSMenuItem(title: "Clear All", action: nil, keyEquivalent: "")
     private let checkForUpdatesItem = NSMenuItem(title: "Check for Updates…", action: nil, keyEquivalent: "")
+    private let brewUpdateItem = NSMenuItem(title: "Restart and Update term-mesh", action: nil, keyEquivalent: "")
     private let preferencesItem = NSMenuItem(title: "Preferences…", action: nil, keyEquivalent: "")
     private let quitItem = NSMenuItem(title: "Quit Term-Mesh", action: nil, keyEquivalent: "")
 
@@ -33,18 +37,22 @@ final class MenuBarExtraController: NSObject, NSMenuDelegate {
 
     init(
         notificationStore: TerminalNotificationStore,
+        brewUpdateViewModel: BrewSelfUpdateViewModel? = nil,
         onShowNotifications: @escaping () -> Void,
         onOpenNotification: @escaping (TerminalNotification) -> Void,
         onJumpToLatestUnread: @escaping () -> Void,
         onCheckForUpdates: @escaping () -> Void,
+        onRestartAndUpdateBrew: @escaping () -> Void = {},
         onOpenPreferences: @escaping () -> Void,
         onQuitApp: @escaping () -> Void
     ) {
         self.notificationStore = notificationStore
+        self.brewUpdateViewModel = brewUpdateViewModel
         self.onShowNotifications = onShowNotifications
         self.onOpenNotification = onOpenNotification
         self.onJumpToLatestUnread = onJumpToLatestUnread
         self.onCheckForUpdates = onCheckForUpdates
+        self.onRestartAndUpdateBrew = onRestartAndUpdateBrew
         self.onOpenPreferences = onOpenPreferences
         self.onQuitApp = onQuitApp
         self.buildHintTitle = MenuBarBuildHintFormatter.menuTitle()
@@ -65,6 +73,14 @@ final class MenuBarExtraController: NSObject, NSMenuDelegate {
             .sink { [weak self] _ in
                 self?.refreshUI()
             }
+
+        if let brewUpdateViewModel {
+            brewUpdateCancellable = brewUpdateViewModel.$state
+                .receive(on: DispatchQueue.main)
+                .sink { [weak self] _ in
+                    self?.refreshUI()
+                }
+        }
 
         peerServerObserver = NotificationCenter.default.addObserver(
             forName: .peerServerStateDidChange,
@@ -110,6 +126,11 @@ final class MenuBarExtraController: NSObject, NSMenuDelegate {
         menu.addItem(clearAllItem)
 
         menu.addItem(.separator())
+
+        brewUpdateItem.target = self
+        brewUpdateItem.action = #selector(restartAndUpdateBrewAction)
+        brewUpdateItem.isHidden = true
+        menu.addItem(brewUpdateItem)
 
         checkForUpdatesItem.target = self
         checkForUpdatesItem.action = #selector(checkForUpdatesAction)
@@ -167,6 +188,7 @@ final class MenuBarExtraController: NSObject, NSMenuDelegate {
         clearAllItem.isEnabled = snapshot.hasNotifications
 
         rebuildInlineNotificationItems(recentNotifications: snapshot.recentNotifications)
+        refreshBrewUpdateItem()
 
         if let button = statusItem.button {
             let peerActive = PeerHostCoordinator.shared.isRunning
@@ -243,6 +265,24 @@ final class MenuBarExtraController: NSObject, NSMenuDelegate {
 
     @objc private func clearAllAction() {
         notificationStore.clearAll()
+    }
+
+    private func refreshBrewUpdateItem() {
+        guard let vm = brewUpdateViewModel else {
+            brewUpdateItem.isHidden = true
+            return
+        }
+        guard BrewSelfUpdater.isApplicationsInstall,
+              case let .readyToInstall(installed, latest) = vm.state else {
+            brewUpdateItem.isHidden = true
+            return
+        }
+        brewUpdateItem.isHidden = false
+        brewUpdateItem.title = "Restart and Update term-mesh (\(installed) → \(latest))"
+    }
+
+    @objc private func restartAndUpdateBrewAction() {
+        onRestartAndUpdateBrew()
     }
 
     @objc private func checkForUpdatesAction() {

@@ -112,6 +112,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
     var browserAddressBarFocusObserver: NSObjectProtocol?
     var browserAddressBarBlurObserver: NSObjectProtocol?
     let updateController = UpdateController()
+    let brewSelfUpdater = BrewSelfUpdater()
     private lazy var titlebarAccessoryController = UpdateTitlebarAccessoryController(viewModel: updateViewModel)
     let windowDecorationsController = WindowDecorationsController()
     var menuBarExtraController: MenuBarExtraController?
@@ -276,6 +277,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
 
         if !isRunningUnderXCTest {
             PostHogAnalytics.shared.startIfNeeded()
+            brewSelfUpdater.bridgeToSparklePill(updateViewModel)
+            brewSelfUpdater.start()
         }
 
         // UI tests frequently time out waiting for the main window if we do heavyweight
@@ -1229,6 +1232,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
     @objc func checkForUpdates(_ sender: Any?) {
         updateViewModel.overrideState = nil
         updateController.checkForUpdates()
+        brewSelfUpdater.checkNow()
     }
 
     @objc func applyUpdateIfAvailable(_ sender: Any?) {
@@ -1245,6 +1249,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         let store = self.notificationStore ?? TerminalNotificationStore.shared
         menuBarExtraController = MenuBarExtraController(
             notificationStore: store,
+            brewUpdateViewModel: brewSelfUpdater.viewModel,
             onShowNotifications: { [weak self] in
                 self?.showNotificationsPopoverFromMenuBar()
             },
@@ -1260,6 +1265,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
             },
             onCheckForUpdates: { [weak self] in
                 self?.checkForUpdates(nil)
+            },
+            onRestartAndUpdateBrew: { [weak self] in
+                _ = self?.brewSelfUpdater.triggerInstallAndRestart()
             },
             onOpenPreferences: { [weak self] in
                 self?.openPreferencesWindow()
