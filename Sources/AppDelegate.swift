@@ -1247,6 +1247,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         let store = self.notificationStore ?? TerminalNotificationStore.shared
         menuBarExtraController = MenuBarExtraController(
             notificationStore: store,
+            brewUpdateViewModel: brewSelfUpdater.viewModel,
             onShowNotifications: { [weak self] in
                 self?.showNotificationsPopoverFromMenuBar()
             },
@@ -1262,6 +1263,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
             },
             onCheckForUpdates: { [weak self] in
                 self?.checkForUpdates(nil)
+            },
+            onRestartAndUpdateBrew: { [weak self] in
+                _ = self?.brewSelfUpdater.triggerInstallAndRestart()
             },
             onOpenPreferences: { [weak self] in
                 self?.openPreferencesWindow()
