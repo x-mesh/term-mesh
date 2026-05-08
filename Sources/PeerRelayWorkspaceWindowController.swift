@@ -10,6 +10,7 @@
 // PeerRelaySession on the fly.
 
 import AppKit
+import Bonsplit
 import PeerProto
 
 /// Marker NSWindow subclass for peer-relay workspace windows. Lets the
@@ -304,6 +305,12 @@ final class PeerRelayWorkspaceWindowController: NSWindowController, NSWindowDele
         // the first layout pass, so initial-attach errors can land in
         // the banner instead of an immediate window close.
         if let window { ensureBodyStack(in: window) }
+        // Install the key monitor immediately so Cmd+D/W/T are
+        // intercepted from the moment the window appears, not just
+        // after startSubscription completes. dispatchSplit et al.
+        // already guard on subscriptionSession being non-nil and will
+        // log+no-op if the session isn't ready yet (Fix 1).
+        installKeyMonitor()
 
         startTask = Task { [weak self] in
             guard let self else { return }
@@ -524,7 +531,12 @@ final class PeerRelayWorkspaceWindowController: NSWindowController, NSWindowDele
     private func dispatchSplit(orientation: String) {
         guard let surfaceID = focusedPaneSurfaceID(),
               let session = subscriptionSession
-        else { return }
+        else {
+            #if DEBUG
+            dlog("relay.split.skip reason=no-subscription window=\(String(format: "%08x", UInt(bitPattern: ObjectIdentifier(self))))")
+            #endif
+            return
+        }
         Task {
             try? await session.requestSplitPane(paneID: surfaceID, orientation: orientation)
         }
