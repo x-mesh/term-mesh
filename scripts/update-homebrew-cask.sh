@@ -79,6 +79,19 @@ cask "term-mesh" do
 
   depends_on macos: ">= :ventura"
 
+  # Quit a running term-mesh before brew tries to replace the bundle.
+  # macOS technically allows replacing a running .app via rename, but
+  # brew-cask sometimes silently no-ops the move when the app holds an
+  # active LaunchServices registration — leaving the user on the old
+  # version with a "successfully installed" message. Quitting first
+  # eliminates the race for both fresh installs and upgrades.
+  preflight do
+    system_command "/usr/bin/osascript",
+                   args: ["-e", 'tell application "term-mesh" to quit'],
+                   must_succeed: false
+    sleep 2
+  end
+
   app "term-mesh.app"
 
   binary "#{appdir}/term-mesh.app/Contents/Resources/bin/tm-agent"
@@ -141,3 +154,26 @@ echo "  Version: ${VERSION}"
 echo "  sha256:  ${SHA256}"
 echo "  Install: brew install --cask x-mesh/tap/term-mesh"
 echo "================================================"
+
+# Post-publish smoke test: do an actual `brew install` and confirm the
+# resulting /Applications/term-mesh.app reports the version we just shipped.
+# This catches the failure mode where publish + cask push both succeed but
+# brew install silently leaves the user on the old version (see preflight
+# block above for the race we hit on 0.100.0). Skip with SMOKE_TEST=0.
+if [[ "${SMOKE_TEST:-1}" != "0" ]]; then
+  echo ""
+  echo "==> Smoke test: fresh brew install + version check"
+  brew update >/dev/null 2>&1 || true
+  brew uninstall --cask --force term-mesh >/dev/null 2>&1 || true
+  if ! brew install --cask "${TAP_REPO%%/*}/tap/term-mesh"; then
+    echo "ERROR: smoke test brew install failed" >&2
+    exit 2
+  fi
+  ACTUAL=$(/usr/bin/defaults read /Applications/term-mesh.app/Contents/Info CFBundleShortVersionString 2>/dev/null || echo "<missing>")
+  if [[ "$ACTUAL" != "$VERSION" ]]; then
+    echo "ERROR: smoke test failed — installed=$ACTUAL expected=$VERSION" >&2
+    echo "       The cask was published but `brew install` did not produce the expected version." >&2
+    exit 2
+  fi
+  echo "==> Smoke test OK: /Applications/term-mesh.app reports $ACTUAL"
+fi
