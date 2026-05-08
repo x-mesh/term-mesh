@@ -1231,6 +1231,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
     @objc func checkForUpdates(_ sender: Any?) {
         updateViewModel.overrideState = nil
         updateController.checkForUpdates()
+        brewSelfUpdater.checkNow()
     }
 
     @objc func applyUpdateIfAvailable(_ sender: Any?) {
