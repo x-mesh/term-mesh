@@ -16,6 +16,7 @@ Usage:
 
 import os
 import socket
+import stat
 import subprocess
 import sys
 import tempfile
@@ -439,6 +440,63 @@ fi
 # allowAll mode test (Phase 3)
 # ---------------------------------------------------------------------------
 
+def test_allowall_socket_permissions(socket_path: str, app_path: str) -> TestResult:
+    """allowAll 모드에서 소켓 권한이 0o600(owner-only) 임을 확인.
+
+    Security patch regression: allowAll 모드도 0o600(owner-only) 이어야 함.
+    """
+    result = TestResult("allowAll mode socket permissions == 0o600")
+    try:
+        _kill_cmux(app_path)
+        _launch_cmux(app_path, socket_path, mode="allowAll")
+
+        if not os.path.exists(socket_path):
+            result.failure(f"Socket not found after launch: {socket_path}")
+            return result
+
+        st = os.stat(socket_path)
+        mode = stat.S_IMODE(st.st_mode)
+
+        if mode != 0o600:
+            result.failure(
+                f"Expected 0o600 (owner-only) in allowAll, got {oct(mode)} — group/other bits leak"
+            )
+            return result
+
+        result.success(f"allowAll socket permissions: {oct(mode)}")
+    except Exception as e:
+        result.failure(f"{type(e).__name__}: {e}")
+    return result
+
+
+def test_restricted_mode_socket_is_0o600(socket_path: str, app_path: str) -> TestResult:
+    """cmuxOnly/termMeshOnly 모드에서 소켓 권한이 정확히 0o600 확인.
+
+    Security patch regression: 제한 모드에서 group/other 접근 bit 없음.
+    """
+    result = TestResult("Restricted mode socket is 0o600")
+    try:
+        _kill_cmux(app_path)
+        _launch_cmux(app_path, socket_path, mode="cmuxOnly")
+
+        if not os.path.exists(socket_path):
+            result.failure(f"Socket not found: {socket_path}")
+            return result
+
+        st = os.stat(socket_path)
+        mode = stat.S_IMODE(st.st_mode)
+
+        # group 또는 other 접근 불가
+        if mode & 0o077:
+            result.failure(f"Group/other bits set in cmuxOnly: {oct(mode)}")
+            return result
+
+        result.success(f"cmuxOnly socket permissions: {oct(mode)}")
+    except Exception as e:
+        result.failure(f"{type(e).__name__}: {e}")
+    return result
+
+
 def test_allowall_mode_works(socket_path: str, app_path: str) -> TestResult:
     """Verify CMUX_SOCKET_MODE=allowAll bypasses ancestry check."""
     result = TestResult("allowAll mode allows external")
@@ -687,11 +745,19 @@ def run_tests():
     run_test(test_internal_process_allowed, socket_path, app_path)
     print()
 
-    # ── Phase 3: allowAll env override ──
-    print("Phase 3: allowAll mode — env override bypasses check")
+    # ── Phase 3: allowAll env override + socket permissions ──
+    print("Phase 3: allowAll mode — env override bypasses check + permissions")
     print("-" * 50)
 
+    run_test(test_allowall_socket_permissions, socket_path, app_path)
     run_test(test_allowall_mode_works, socket_path, app_path)
+    print()
+
+    # ── Phase 3b: restricted mode socket permissions ──
+    print("Phase 3b: cmuxOnly mode — socket file permissions 0o600")
+    print("-" * 50)
+
+    run_test(test_restricted_mode_socket_is_0o600, socket_path, app_path)
     print()
 
     # ── Phase 4: password mode auth gate ──

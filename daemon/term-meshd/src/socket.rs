@@ -103,9 +103,11 @@ pub async fn serve(
         std::fs::remove_file(&path)?;
     }
 
-    let listener = UnixListener::bind(&path)?;
+    let listener = bind_with_tight_umask(&path)?;
+    harden_socket_permissions(&path);
     tracing::info!("listening on {}", path.display());
 
+    let owner_uid = current_uid();
     let ctx = Arc::new(Context {
         monitor_rx,
         monitor_handle,
@@ -122,6 +124,11 @@ pub async fn serve(
             result = listener.accept() => {
                 match result {
                     Ok((stream, _)) => {
+                        if !peer_uid_matches(&stream, owner_uid) {
+                            tracing::warn!("rejecting connection from foreign uid (only uid {owner_uid} may attach)");
+                            drop(stream);
+                            continue;
+                        }
                         let ctx = ctx.clone();
                         tokio::spawn(async move {
                             if let Err(e) = handle_connection(stream, &ctx).await {
@@ -812,6 +819,111 @@ async fn dispatch(req: &Request, ctx: &Context) -> Response {
         },
     }
 }
+
+// ── Socket hardening helpers ──────────────────────────────────────────────────
+
+#[cfg(unix)]
+fn current_uid() -> u32 {
+    unsafe { libc::getuid() }
+}
+
+#[cfg(not(unix))]
+fn current_uid() -> u32 {
+    0
+}
+
+/// Bind with umask(0o077) so the socket file is created at 0600 immediately,
+/// eliminating the bind→chmod TOCTOU window.
+#[cfg(unix)]
+fn bind_with_tight_umask(path: &std::path::Path) -> std::io::Result<UnixListener> {
+    let prev = unsafe { libc::umask(0o077) };
+    let result = UnixListener::bind(path);
+    unsafe { libc::umask(prev) };
+    result
+}
+
+#[cfg(not(unix))]
+fn bind_with_tight_umask(path: &std::path::Path) -> std::io::Result<UnixListener> {
+    UnixListener::bind(path)
+}
+
+#[cfg(unix)]
+fn harden_socket_permissions(path: &std::path::Path) {
+    use std::os::unix::fs::PermissionsExt;
+    if let Ok(metadata) = std::fs::metadata(path) {
+        let mut perms = metadata.permissions();
+        perms.set_mode(0o600);
+        let _ = std::fs::set_permissions(path, perms);
+    }
+}
+
+#[cfg(not(unix))]
+fn harden_socket_permissions(_path: &std::path::Path) {}
+
+/// Compare connected peer's effective uid against `expected_uid`.
+/// Returns `true` only when positively confirmed; fails closed on any error.
+#[cfg(target_os = "macos")]
+fn peer_uid_matches(stream: &tokio::net::UnixStream, expected_uid: u32) -> bool {
+    use std::os::fd::AsRawFd;
+
+    #[repr(C)]
+    struct Xucred {
+        cr_version: libc::c_uint,
+        cr_uid: libc::uid_t,
+        cr_ngroups: libc::c_short,
+        cr_groups: [libc::gid_t; 16],
+    }
+    const LOCAL_PEERCRED: libc::c_int = 0x001;
+    const SOL_LOCAL: libc::c_int = 0;
+
+    let fd = stream.as_raw_fd();
+    let mut cred = std::mem::MaybeUninit::<Xucred>::zeroed();
+    let mut len = std::mem::size_of::<Xucred>() as libc::socklen_t;
+    let rc = unsafe {
+        libc::getsockopt(
+            fd,
+            SOL_LOCAL,
+            LOCAL_PEERCRED,
+            cred.as_mut_ptr() as *mut libc::c_void,
+            &mut len,
+        )
+    };
+    if rc != 0 {
+        return false;
+    }
+    let cred = unsafe { cred.assume_init() };
+    cred.cr_uid == expected_uid
+}
+
+#[cfg(target_os = "linux")]
+fn peer_uid_matches(stream: &tokio::net::UnixStream, expected_uid: u32) -> bool {
+    use std::os::fd::AsRawFd;
+
+    let fd = stream.as_raw_fd();
+    let mut cred = std::mem::MaybeUninit::<libc::ucred>::zeroed();
+    let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+    let rc = unsafe {
+        libc::getsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_PEERCRED,
+            cred.as_mut_ptr() as *mut libc::c_void,
+            &mut len,
+        )
+    };
+    if rc != 0 {
+        return false;
+    }
+    let cred = unsafe { cred.assume_init() };
+    cred.uid == expected_uid
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn peer_uid_matches(_stream: &tokio::net::UnixStream, _expected_uid: u32) -> bool {
+    false
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 
 /// Compute no_heartbeat and repeated_failure anomalies from daemon task state.
 ///

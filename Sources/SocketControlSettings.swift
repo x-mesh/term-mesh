@@ -47,11 +47,9 @@ enum SocketControlMode: String, CaseIterable, Identifiable {
     var socketFilePermissions: UInt16 {
         switch self {
         case .allowAll:
-            // 0o660: owner+group only — removes world-readable/writable access.
-            // Other local users on the machine can no longer connect to the socket
-            // even in allowAll mode. The owning group (typically the user's primary
-            // group) retains access, which is sufficient for local automation tools.
-            return 0o660
+            // 0o600: owner-only — group-write removed to prevent same-group,
+            // different-UID processes from injecting PTY commands via the socket.
+            return 0o600
         case .off, .termMeshOnly, .automation, .password:
             return 0o600
         }
