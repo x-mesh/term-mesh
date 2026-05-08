@@ -2,6 +2,15 @@
 
 All notable changes to term-mesh are documented here.
 
+## [0.101.1] - 2026-05-08
+
+### Fixed
+- **`Check for Updates…` menu now actually finds new versions** — the manual click was calling the brew updater's `checkNow()` path, which runs `brew outdated` against the locally cached tap state and skips `brew update`. If the tap was stale (the common case right after a release that the user wants to install), no new version was visible and the click silently did nothing. Manual click now goes through `refreshNow()` so the tap is refreshed before the version comparison. The 30-minute background poll is unchanged — it still uses `checkNow()` to avoid `brew update` thrashing.
+
+### Thanks to 1 contributor!
+
+- [@JINWOO-J](https://github.com/JINWOO-J)
+
 ## [0.101.0] - 2026-05-08
 
 ### Fixed
