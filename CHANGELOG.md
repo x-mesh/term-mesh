@@ -2,6 +2,16 @@
 
 All notable changes to term-mesh are documented here.
 
+## [0.102.8] - 2026-05-09
+
+### Fixed
+- **Peer relay over SSH no longer pollutes the remote shell with `command not found: 11` and similar nonsense after running TUIs like `gk`, `vim`, or `less`** — TUIs probe the terminal at startup with control sequences such as `CSI 6n` (cursor position) and `OSC 11 ?` (background colour). Until now the bytes flowed straight through to the local Ghostty, which answered per spec; the answer then made the round trip back over SSH and arrived at the remote PTY *after* the querying program had already exited, so it landed in zsh's prompt and zsh tried to execute it ("`zsh: command not found: 11`", "`no such file or directory: rgb:0d0d/1111/17177`"). The daemon now intercepts the queries (DA1/DA2/DA3, DSR-status, DSR-CPR, OSC 10/11) at the PTY boundary, writes a synthesised reply straight back to the PTY master so the originating program reads it on stdin without a relay round trip, and strips the query from the broadcast so the local terminal never sees it ([#20](https://github.com/x-mesh/term-mesh/pull/20)).
+- **Peer relay panes no longer go silent after the remote daemon restarts, the remote machine sleeps/wakes, or the SSH session closes** — when the peer session ended while the SSH tunnel itself was still up (the common "Mac slept and woke", "remote daemon restarted", "vpn flapped" cases), the workspace window quietly displayed nothing with no indication that the connection was gone. A status overlay now appears for `down` / `reconnecting` / `failed` transitions with a Reconnect action; in the session-ended-while-tunnel-alive case the workspace also tears the SSH tunnel down and re-establishes it via the normal reconnect loop, so a sleeping laptop reattaching is handled automatically.
+
+### Thanks to 1 contributor!
+
+- [@JINWOO-J](https://github.com/JINWOO-J)
+
 ## [0.102.7] - 2026-05-09
 
 ### Fixed
