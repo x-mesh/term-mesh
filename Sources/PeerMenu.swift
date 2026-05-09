@@ -16,6 +16,7 @@
 //        - Closing the window sends Goodbye and tears down the transport.
 
 import AppKit
+import Bonsplit
 import PeerProto
 
 @MainActor
@@ -94,10 +95,17 @@ final class PeerClientCoordinator: NSObject {
     /// controllers so external observers don't grow a dependency on
     /// AppKit window-controller internals.
     func activeConnections() -> [PeerRelayConnectionInfo] {
-        return (openConsoles.map { $0.connectionInfo }
+        let infos = (openConsoles.map { $0.connectionInfo }
             + openRelays.map { $0.connectionInfo }
             + openWorkspaceRelays.map { $0.connectionInfo })
             .sorted { $0.connectedAt < $1.connectedAt }
+#if DEBUG
+        dlog("peer.connections.active count=\(infos.count) consoles=\(openConsoles.count) relays=\(openRelays.count) workspaces=\(openWorkspaceRelays.count)")
+        for info in infos {
+            dlog("peer.connections.active row kind=\(info.kind.rawValue) host=\(info.hostDisplay) ssh=\(info.sshTarget ?? "nil") target=\(info.targetTitle)")
+        }
+#endif
+        return infos
     }
 
     /// Disconnect (close) the relay window matching `id`. No-op when
@@ -118,6 +126,9 @@ final class PeerClientCoordinator: NSObject {
     }
 
     fileprivate func postRelaysChanged() {
+#if DEBUG
+        dlog("peer.connections.post consoles=\(openConsoles.count) relays=\(openRelays.count) workspaces=\(openWorkspaceRelays.count)")
+#endif
         NotificationCenter.default.post(name: Self.relaysDidChangeNotification, object: self)
     }
 
@@ -328,9 +339,15 @@ final class PeerClientCoordinator: NSObject {
                 hostDisplayName: probe.hostDisplayName
             )
             self.openWorkspaceRelays.append(controller)
+#if DEBUG
+            dlog("peer.connections.openWorkspaceRelay appended hasTunnel=\(tunnel != nil) host=\(hostSockPath) hostDisplay=\(probe.hostDisplayName ?? "nil") workspace=\(controller.connectionInfo.targetTitle)")
+#endif
             if let tunnel {
                 self.sshTunnels[ObjectIdentifier(controller)] = tunnel
                 controller.attachTunnel(tunnel)
+#if DEBUG
+                dlog("peer.connections.openWorkspaceRelay attached tunnel sshTarget=\(tunnel.sshTarget)")
+#endif
                 if !titleSuffix.isEmpty {
                     controller.window?.title += titleSuffix
                 }

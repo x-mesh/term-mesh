@@ -8,6 +8,7 @@
 // close so the table refreshes itself without polling.
 
 import AppKit
+import Bonsplit
 
 /// NSButton carrying the stable `ObjectIdentifier` of the relay
 /// controller it disconnects. The handler resolves the id back to a
@@ -56,8 +57,14 @@ final class PeerConnectionsWindowController: NSWindowController, NSWindowDelegat
             object: nil,
             queue: .main
         ) { [weak self] _ in
+#if DEBUG
+            dlog("peer.connections.notify received")
+#endif
             Task { @MainActor in self?.reload() }
         }
+#if DEBUG
+        dlog("peer.connections.panel init token=\(String(describing: observerToken))")
+#endif
     }
 
     required init?(coder: NSCoder) { fatalError("not used") }
@@ -137,6 +144,9 @@ final class PeerConnectionsWindowController: NSWindowController, NSWindowDelegat
 
     private func reload() {
         rows = PeerClientCoordinator.shared.activeConnections()
+#if DEBUG
+        dlog("peer.connections.panel reload rows=\(rows.count)")
+#endif
         tableView?.reloadData()
     }
 }
