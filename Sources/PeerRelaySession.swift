@@ -33,6 +33,7 @@ private let kRelayAuthMaxPayload = 256
 /// `cancel()` to release the connection cleanly.
 struct PeerRelayConnection: Sendable {
     let hostSockPath: String
+    let hostDisplayName: String
     let session: PeerSession
     let transport: UnixSocketTransport
     let surfaces: [Termmesh_Peer_V1_SurfaceInfo]
@@ -149,7 +150,8 @@ final class PeerRelaySession {
     // Ghostty treats `command` as a shell command rather than argv.
     var relayLaunchCommand: String { Self.shellQuote(relayBinaryPath) }
 
-    private let hostSockPath: String
+    let hostSockPath: String
+    let hostDisplayName: String
     private let surfaceID: Data
     private let remoteCols: UInt32
     private let remoteRows: UInt32
@@ -227,6 +229,7 @@ final class PeerRelaySession {
         let surfaces = try await connection.session.listSurfaces()
         return PeerRelayConnection(
             hostSockPath: hostSockPath,
+            hostDisplayName: connection.hostDisplayName,
             session: connection.session,
             transport: connection.transport,
             surfaces: surfaces
@@ -239,9 +242,10 @@ final class PeerRelaySession {
             read: { try await transport.read() },
             write: { try await transport.write($0) }
         )
-        _ = try await session.handshake()
+        let info = try await session.handshake()
         return PeerRelayConnection(
             hostSockPath: hostSockPath,
+            hostDisplayName: info.hostDisplayName,
             session: session,
             transport: transport,
             surfaces: []
@@ -263,6 +267,7 @@ final class PeerRelaySession {
 
         return PeerRelaySession(
             hostSockPath: connection.hostSockPath,
+            hostDisplayName: connection.hostDisplayName,
             relaySockPath: relaySockPath,
             relaySecret: Self.makeRelaySecret(),
             surfaceID: outcome.surfaceID,
@@ -287,6 +292,7 @@ final class PeerRelaySession {
 
     private init(
         hostSockPath: String,
+        hostDisplayName: String,
         relaySockPath: String,
         relaySecret: String,
         surfaceID: Data,
@@ -296,6 +302,7 @@ final class PeerRelaySession {
         transport: UnixSocketTransport
     ) {
         self.hostSockPath = hostSockPath
+        self.hostDisplayName = hostDisplayName
         self.relaySockPath = relaySockPath
         self.relaySecret = relaySecret
         self.surfaceID = surfaceID

@@ -319,18 +319,41 @@ fn is_terminal_csi_response(seq: &[u8]) -> bool {
                 false
             }
         }
+        // Kitty keyboard protocol state report: ESC [ ? flags u.
+        // Codex enables the protocol in modern terminals; if the local
+        // relay terminal answers a mirrored query, forwarding the reply
+        // back to the host injects visible "[?7u" into Codex's input.
+        b'u' => {
+            body.starts_with(b"?")
+                && !body[1..].is_empty()
+                && body[1..].iter().all(|b| b.is_ascii_digit() || *b == b';')
+        }
         _ => false,
     }
 }
 
 fn translate_terminal_csi_input(seq: &[u8]) -> Option<Vec<u8>> {
-    if seq.len() < 4 || seq[0] != 0x1B || seq[1] != b'[' || *seq.last()? != b'u' {
+    if seq.len() < 4 || seq[0] != 0x1B || seq[1] != b'[' {
         return None;
     }
+    let final_byte = *seq.last()?;
+    if final_byte != b'u' {
+        return translate_kitty_special_csi_input(seq);
+    }
+
     let body = &seq[2..seq.len() - 1];
     let mut parts = body.split(|b| *b == b';');
-    let codepoint = parse_ascii_u32(parts.next()?)?;
-    let modifiers = parts.next().map(parse_ascii_u32).unwrap_or(Some(1))?;
+    let codepoint = parse_ascii_u32(first_colon_part(parts.next()?))?;
+    let (modifiers, event_type) = parse_csi_u_modifiers_and_event(parts.next())?;
+    if matches!(event_type, Some(3)) {
+        // The local relay terminal can enter kitty report-events mode
+        // after mirrored host output. Key release events are not text and
+        // become visible "[27;1:3u" / "[97;1:3u" tails in non-kitty hosts.
+        return Some(Vec::new());
+    }
+    if event_type.is_some_and(|event| event != 1 && event != 2) {
+        return None;
+    }
     if modifiers == 1 {
         if let Some(byte) = csi_u_control_key_byte(codepoint) {
             return Some(vec![byte]);
@@ -343,6 +366,50 @@ fn translate_terminal_csi_input(seq: &[u8]) -> Option<Vec<u8>> {
     }
     let letter = ctrl_letter_from_codepoint(codepoint)?;
     Some(vec![ctrl_byte_for_ascii_letter(letter)])
+}
+
+fn translate_kitty_special_csi_input(seq: &[u8]) -> Option<Vec<u8>> {
+    let final_byte = *seq.last()?;
+    let body = &seq[2..seq.len() - 1];
+    let mut parts = body.split(|b| *b == b';');
+    let key = parse_ascii_u32(first_colon_part(parts.next()?))?;
+    let (_, event_type) = parse_csi_u_modifiers_and_event(parts.next())?;
+    if !is_kitty_special_key(final_byte, key) {
+        return None;
+    }
+    if matches!(event_type, Some(3)) {
+        // Special keys such as arrows use final A/B/C/D instead of final u.
+        // Release events are not text; forwarding them makes Codex selection
+        // UIs move once for press and again for release.
+        return Some(Vec::new());
+    }
+    None
+}
+
+fn is_kitty_special_key(final_byte: u8, key: u32) -> bool {
+    match final_byte {
+        b'A' | b'B' | b'C' | b'D' | b'F' | b'H' | b'P' | b'Q' | b'S' => key == 1,
+        b'~' => matches!(key, 2 | 3 | 5 | 6 | 13 | 15 | 17 | 18 | 19 | 20 | 21 | 23 | 24),
+        _ => false,
+    }
+}
+
+fn first_colon_part(bytes: &[u8]) -> &[u8] {
+    match bytes.iter().position(|b| *b == b':') {
+        Some(idx) => &bytes[..idx],
+        None => bytes,
+    }
+}
+
+fn parse_csi_u_modifiers_and_event(bytes: Option<&[u8]>) -> Option<(u32, Option<u32>)> {
+    let Some(bytes) = bytes else {
+        return Some((1, None));
+    };
+    let (modifier_bytes, event_type) = match bytes.iter().position(|b| *b == b':') {
+        Some(idx) => (&bytes[..idx], Some(parse_ascii_u32(&bytes[idx + 1..])?)),
+        None => (bytes, None),
+    };
+    Some((parse_ascii_u32(modifier_bytes)?, event_type))
 }
 
 fn csi_u_control_key_byte(codepoint: u32) -> Option<u8> {
@@ -688,6 +755,26 @@ mod tests {
     }
 
     #[test]
+    fn passes_kitty_arrow_press_and_repeat_events() {
+        assert_eq!(filter(b"\x1B[1;1:1B"), b"\x1B[1;1:1B");
+        assert_eq!(filter(b"\x1B[1;1:2A"), b"\x1B[1;1:2A");
+    }
+
+    #[test]
+    fn drops_kitty_arrow_release_events() {
+        assert!(filter(b"\x1B[1;1:3A").is_empty());
+        assert!(filter(b"\x1B[1;1:3B").is_empty());
+        assert!(filter(b"\x1B[1;2:3A").is_empty());
+        assert!(filter(b"\x1B[1;5:3P").is_empty());
+    }
+
+    #[test]
+    fn drops_kitty_tilde_special_release_events() {
+        assert!(filter(b"\x1B[5;1:3~").is_empty());
+        assert!(filter(b"\x1B[13;2:3~").is_empty());
+    }
+
+    #[test]
     fn translates_ascii_csi_u_ctrl_c_to_etx() {
         assert_eq!(filter(b"\x1B[99;5u"), b"\x03");
     }
@@ -696,6 +783,26 @@ mod tests {
     fn translates_csi_u_escape_to_escape() {
         assert_eq!(filter(b"\x1B[27u"), b"\x1B");
         assert_eq!(filter(b"\x1B[27;1u"), b"\x1B");
+        assert_eq!(filter(b"\x1B[27;1:1u"), b"\x1B");
+        assert_eq!(filter(b"\x1B[27;1:2u"), b"\x1B");
+    }
+
+    #[test]
+    fn drops_csi_u_escape_release_event() {
+        assert!(filter(b"\x1B[27;1:3u").is_empty());
+    }
+
+    #[test]
+    fn drops_csi_u_printable_release_event() {
+        assert!(filter(b"\x1B[97;1:3u").is_empty());
+        assert!(filter(b"\x1B[106:74;2:3u").is_empty());
+        assert!(filter(b"\x1B[127;1:3;65u").is_empty());
+        assert!(filter(b"\x1B[337::91;5:3u").is_empty());
+    }
+
+    #[test]
+    fn drops_csi_u_modifier_release_event() {
+        assert!(filter(b"\x1B[57442;5:3u").is_empty());
     }
 
     #[test]
@@ -775,6 +882,12 @@ mod tests {
     }
 
     #[test]
+    fn drops_kitty_keyboard_state_response() {
+        assert!(filter(b"\x1B[?7u").is_empty());
+        assert!(filter(b"\x1B[?31u").is_empty());
+    }
+
+    #[test]
     fn drops_mixed_response_burst_without_touching_user_text() {
         let mut f = TerminalResponseFilter::default();
         let out = f.process(b"ok\x1B]11;rgb:f8f8/efef/e7e7\x1B\\\x1B[2;1R\r");
@@ -806,6 +919,27 @@ mod tests {
         let mut f = TerminalResponseFilter::default();
         assert!(f.process(b"\x1B").is_empty());
         assert!(f.process(b"[2;1R").is_empty());
+    }
+
+    #[test]
+    fn drops_kitty_keyboard_state_response_split_after_escape() {
+        let mut f = TerminalResponseFilter::default();
+        assert!(f.process(b"\x1B").is_empty());
+        assert!(f.process(b"[?7u").is_empty());
+    }
+
+    #[test]
+    fn drops_csi_u_escape_release_split_after_escape() {
+        let mut f = TerminalResponseFilter::default();
+        assert!(f.process(b"\x1B").is_empty());
+        assert!(f.process(b"[27;1:3u").is_empty());
+    }
+
+    #[test]
+    fn drops_kitty_arrow_release_split_after_escape() {
+        let mut f = TerminalResponseFilter::default();
+        assert!(f.process(b"\x1B").is_empty());
+        assert!(f.process(b"[1;1:3B").is_empty());
     }
 
     #[test]

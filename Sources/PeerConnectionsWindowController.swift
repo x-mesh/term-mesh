@@ -1,7 +1,8 @@
 // Phase E-5: a small floating window listing every active peer
 // federation relay window the app currently hosts. Each row shows the
-// host (SSH target if available, otherwise the local socket path), the
-// workspace title, the time the relay opened, and a Disconnect button.
+// host (SSH target if available, otherwise the peer name or local socket
+// path), the connection type, the remote target title, the time the
+// relay opened, and a Disconnect button.
 //
 // `PeerClientCoordinator.relaysDidChangeNotification` fires on every open /
 // close so the table refreshes itself without polling.
@@ -38,7 +39,7 @@ final class PeerConnectionsWindowController: NSWindowController, NSWindowDelegat
 
     init() {
         let win = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 520, height: 240),
+            contentRect: NSRect(x: 0, y: 0, width: 660, height: 240),
             styleMask: [.titled, .closable, .resizable, .miniaturizable],
             backing: .buffered,
             defer: false
@@ -103,8 +104,9 @@ final class PeerConnectionsWindowController: NSWindowController, NSWindowDelegat
         table.headerView = NSTableHeaderView()
 
         for (id, title, width) in [
-            ("host", "Host", CGFloat(180)),
-            ("workspace", "Workspace", CGFloat(160)),
+            ("host", "Host", CGFloat(220)),
+            ("kind", "Type", CGFloat(76)),
+            ("target", "Target", CGFloat(160)),
             ("attached", "Attached", CGFloat(80)),
             ("action", "", CGFloat(80)),
         ] {
@@ -134,7 +136,7 @@ final class PeerConnectionsWindowController: NSWindowController, NSWindowDelegat
     // MARK: - Data
 
     private func reload() {
-        rows = PeerClientCoordinator.shared.activeWorkspaceConnections()
+        rows = PeerClientCoordinator.shared.activeConnections()
         tableView?.reloadData()
     }
 }
@@ -152,8 +154,10 @@ extension PeerConnectionsWindowController: NSTableViewDelegate {
         switch column.identifier.rawValue {
         case "host":
             return makeLabel(info.hostDisplay)
-        case "workspace":
-            return makeLabel(info.workspaceTitle)
+        case "kind":
+            return makeLabel(info.kind.rawValue)
+        case "target":
+            return makeLabel(info.targetTitle)
         case "attached":
             return makeLabel(formatRelative(info.connectedAt))
         case "action":

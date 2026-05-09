@@ -18,16 +18,31 @@ import SwiftUI
 @MainActor
 final class PeerRelayWindowController: NSWindowController, NSWindowDelegate {
     private let relaySession: PeerRelaySession
+    private let surfaceTitle: String
+    private let connectedAt = Date()
     private let terminalSurface: TerminalSurface
     private var startTask: Task<Void, Never>?
     private var isClosing = false
 
     var onClose: (@MainActor () -> Void)?
 
+    var connectionInfo: PeerRelayConnectionInfo {
+        PeerRelayConnectionInfo(
+            id: ObjectIdentifier(self),
+            kind: .pane,
+            hostSockPath: relaySession.hostSockPath,
+            hostDisplayName: relaySession.hostDisplayName,
+            sshTarget: nil,
+            targetTitle: surfaceTitle.isEmpty ? "<surface>" : surfaceTitle,
+            connectedAt: connectedAt
+        )
+    }
+
     // ── Init ─────────────────────────────────────────────────────────
 
-    init(session: PeerRelaySession) {
+    init(session: PeerRelaySession, surfaceTitle: String) {
         self.relaySession = session
+        self.surfaceTitle = surfaceTitle
 
         // Create a TerminalSurface configured to run the relay binary.
         // Ghostty will spawn it as the "shell" for this pane.
@@ -52,6 +67,7 @@ final class PeerRelayWindowController: NSWindowController, NSWindowDelegate {
         )
         window.title = "Peer (Ghostty) · \(hostView)"
         window.isReleasedWhenClosed = false
+        window.installPeerTitlebarGradientAccent()
         window.center()
 
         // Embed the Ghostty surface's hosted NSView as the content view.
@@ -86,6 +102,7 @@ final class PeerRelayWindowController: NSWindowController, NSWindowDelegate {
     // ── Show ─────────────────────────────────────────────────────────
 
     func show() {
+        window?.installPeerTitlebarGradientAccent()
         window?.makeKeyAndOrderFront(nil)
         // Accept the relay connection and begin pumping after the
         // Ghostty surface has been created (hostedView is now on screen).

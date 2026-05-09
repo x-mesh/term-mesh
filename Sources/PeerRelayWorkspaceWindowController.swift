@@ -20,6 +20,46 @@ import PeerProto
 /// forwarded to the remote host instead of triggering a local split.
 final class PeerRelayWorkspaceWindow: NSWindow {}
 
+@MainActor
+private final class PeerTitlebarGradientView: NSView {
+    private static let colors: [NSColor] = [
+        NSColor(srgbRed: 0.95, green: 0.45, blue: 0.55, alpha: 0.92),
+        NSColor(srgbRed: 0.55, green: 0.45, blue: 0.95, alpha: 0.92),
+        NSColor(srgbRed: 0.45, green: 0.55, blue: 0.95, alpha: 0.92),
+    ]
+
+    override var isOpaque: Bool { false }
+
+    override func draw(_ dirtyRect: NSRect) {
+        NSGradient(colors: Self.colors)?.draw(in: bounds, angle: 0)
+        NSColor.black.withAlphaComponent(0.14).setFill()
+        NSBezierPath(rect: NSRect(x: 0, y: 0, width: bounds.width, height: 1)).fill()
+    }
+
+    override func hitTest(_ point: NSPoint) -> NSView? { nil }
+}
+
+@MainActor
+extension NSWindow {
+    func installPeerTitlebarGradientAccent() {
+        titlebarAppearsTransparent = true
+
+        guard let titlebarView = standardWindowButton(.closeButton)?.superview else { return }
+
+        let identifier = NSUserInterfaceItemIdentifier("term-mesh.peer.titlebarGradientAccent")
+        if let existing = titlebarView.subviews.first(where: { $0.identifier == identifier }) {
+            existing.frame = titlebarView.bounds
+            existing.needsDisplay = true
+            return
+        }
+
+        let accent = PeerTitlebarGradientView(frame: titlebarView.bounds)
+        accent.identifier = identifier
+        accent.autoresizingMask = [.width, .height]
+        titlebarView.addSubview(accent, positioned: .below, relativeTo: nil)
+    }
+}
+
 /// Adapter that forwards NSSplitView delegate callbacks back to the
 /// owning controller. Lives separately because NSSplitView holds its
 /// `delegate` weakly.
@@ -121,26 +161,37 @@ private final class PeerRelayStatusOverlay: NSView {
 }
 
 @MainActor
-/// Read-only snapshot of one peer-relay workspace window's
+/// Read-only snapshot of one active peer-relay connection's
 /// connection metadata. Surfaced through
-/// `PeerRelayWorkspaceWindowController.connectionInfo` so views like
-/// the Connections panel can render rows without holding a reference
-/// to (and reaching into) the controller itself.
+/// `connectionInfo` properties so views like the Connections panel can
+/// render rows without holding references to AppKit controllers.
 struct PeerRelayConnectionInfo: Sendable {
+    enum Kind: String, Sendable {
+        case console = "Console"
+        case pane = "Pane"
+        case workspace = "Workspace"
+    }
+
     /// Stable identity for the underlying controller. Use with
     /// `PeerClientCoordinator.disconnect(id:)` to act on this connection
     /// safely even after the roster has been re-rendered.
     let id: ObjectIdentifier
+    let kind: Kind
     let hostSockPath: String
+    let hostDisplayName: String?
     /// SSH target if the relay was opened over an `ssh -L` tunnel,
     /// otherwise nil (direct Unix-socket connection).
     let sshTarget: String?
-    let workspaceTitle: String
+    let targetTitle: String
     let connectedAt: Date
 
     /// Best display string for the host: SSH target if available,
-    /// otherwise the local socket path.
-    var hostDisplay: String { sshTarget ?? hostSockPath }
+    /// otherwise the host's peer name, otherwise the local socket path.
+    var hostDisplay: String {
+        if let sshTarget, !sshTarget.isEmpty { return "SSH · \(sshTarget)" }
+        if let hostDisplayName, !hostDisplayName.isEmpty { return hostDisplayName }
+        return hostSockPath
+    }
 }
 
 final class PeerRelayWorkspaceWindowController: NSWindowController, NSWindowDelegate {
@@ -163,6 +214,7 @@ final class PeerRelayWorkspaceWindowController: NSWindowController, NSWindowDele
     }
 
     private let hostSockPath: String
+    private let hostDisplayName: String?
     /// Held strongly while the controller is alive so the tunnel
     /// auto-restart loop keeps running. nil for non-SSH (direct
     /// unix-socket) sessions.
@@ -184,9 +236,11 @@ final class PeerRelayWorkspaceWindowController: NSWindowController, NSWindowDele
     var connectionInfo: PeerRelayConnectionInfo {
         PeerRelayConnectionInfo(
             id: ObjectIdentifier(self),
+            kind: .workspace,
             hostSockPath: hostSockPath,
+            hostDisplayName: hostDisplayName,
             sshTarget: sshTunnel?.sshTarget,
-            workspaceTitle: workspaceTitle,
+            targetTitle: workspaceTitle,
             connectedAt: connectedAt
         )
     }
@@ -255,8 +309,11 @@ final class PeerRelayWorkspaceWindowController: NSWindowController, NSWindowDele
 
     // MARK: - Init
 
-    init(hostSockPath: String, workspace: Termmesh_Peer_V1_Workspace) {
+    init(hostSockPath: String,
+         workspace: Termmesh_Peer_V1_Workspace,
+         hostDisplayName: String? = nil) {
         self.hostSockPath = hostSockPath
+        self.hostDisplayName = hostDisplayName
         self.workspaceID = workspace.workspaceID
         self.currentLayout = workspace.layout
         let title = workspace.title.isEmpty ? "<workspace>" : workspace.title
@@ -272,6 +329,7 @@ final class PeerRelayWorkspaceWindowController: NSWindowController, NSWindowDele
         )
         window.title = self.baseTitle
         window.isReleasedWhenClosed = false
+        window.installPeerTitlebarGradientAccent()
         // Disable AppKit's automatic Cmd+T window tabbing so Cmd+T
         // flows through to our keyMonitor and forwards to the remote
         // host instead of merging this window into a tab group.
@@ -450,6 +508,7 @@ final class PeerRelayWorkspaceWindowController: NSWindowController, NSWindowDele
     }
 
     func show() {
+        window?.installPeerTitlebarGradientAccent()
         window?.makeKeyAndOrderFront(nil)
         // Force the body stack (and thus the banner) to exist before
         // the first layout pass, so initial-attach errors can land in
