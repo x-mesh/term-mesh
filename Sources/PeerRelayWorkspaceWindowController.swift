@@ -794,20 +794,24 @@ final class PeerRelayWorkspaceWindowController: NSWindowController, NSWindowDele
     /// `applyLayout` push restores the split tree (clearing the zoom).
     @MainActor
     private func toggleRelayPaneZoom() {
-        if zoomedSurfaceID != nil {
-            // Exit zoom: rebuild the split tree from the cached layout.
+        if let prev = zoomedSurfaceID {
+            // Exit zoom: rebuild the split tree from `currentLayout`. We
+            // can't re-enter `applyLayout` here because its fast path
+            // skips the rebuild when `currentLayout == currentLayout`
+            // (the divider-only delta check returns true), leaving the
+            // zoomed single-pane view in place. Materialize the tree
+            // synchronously and swap it in instead.
             zoomedSurfaceID = nil
             #if DEBUG
-            dlog("relay.zoom exit")
+            dlog("relay.zoom exit prev=\(Self.shortSurfaceID(prev))")
             #endif
-            let layout = currentLayout
-            Task { [weak self] in
-                do {
-                    try await self?.applyLayout(layout)
-                } catch {
-                    NSLog("[peer-ws] zoom-exit applyLayout error: %@", String(describing: error))
-                }
-            }
+            pendingDividerSetters.removeAll()
+            splitsByID.removeAll()
+            splitIDByObject.removeAll()
+            let newRoot = materializeLayout(currentLayout)
+            let dividers = pendingDividerSetters
+            swapRootView(newRoot, dividers: dividers)
+            restoreRelayFocus(after: currentLayout, forwardToHost: false)
             return
         }
         // Enter zoom: pick the focused pane (or the first available one
