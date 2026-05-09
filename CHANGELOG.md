@@ -2,6 +2,15 @@
 
 All notable changes to term-mesh are documented here.
 
+## [0.102.5] - 2026-05-09
+
+### Fixed
+- **Peer relay no longer fails with "relay binary not found" on any machine other than the developer's** — `term-mesh-peer-relay` (the Ghostty PTY shim spawned for every remote peer pane) was never actually copied into the shipped `.app` bundle: every `make deploy` / `make dmg` target only copied `term-meshd`, `term-mesh-run`, and `tm-agent`. Worse, `PeerRelaySession.findRelayBinary()` carried a hardcoded `/Users/jinwoo/...` dev fallback, so the developer's machine masked the bug while every brew user hit it the moment they tried to open a peer pane (locally or over SSH). Fix: bundle the relay binary alongside the other Rust binaries under `Contents/Resources/bin/`, switch the Swift lookup to that location (with a DerivedData-derived dev fallback that works for any contributor), drop the hardcoded user path, and add `verify-daemon-binaries` + `scripts/check-bundle-binaries.sh` guards to the build so the next workspace member that gets added can't be silently dropped from the bundle the same way.
+
+### Thanks to 1 contributor!
+
+- [@JINWOO-J](https://github.com/JINWOO-J)
+
 ## [0.102.4] - 2026-05-08
 
 ### Changed
