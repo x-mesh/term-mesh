@@ -410,6 +410,22 @@ final class PeerRelaySession {
     func start() async throws {
         let relay = try await acceptRelay()
         self.relaySocket = relay
+        // App-level heartbeat: detect a remote daemon that has stopped
+        // responding while its TCP socket is still considered alive
+        // (laptop sleep on the remote, deadlocked daemon, etc.). When
+        // the heartbeat declares the session dead we close the transport
+        // so the pump's `receiveNextMessage()` unblocks with an error
+        // and `disconnect()` runs through the normal teardown path
+        // instead of leaving the user staring at a hung terminal.
+        if let session, let transport {
+            let weakTransport = transport
+            await session.startHeartbeat(
+                intervalSeconds: 10,
+                deadAfterSeconds: 30
+            ) {
+                Task { await weakTransport.close() }
+            }
+        }
         startPumping(relay: relay)
     }
 
@@ -573,6 +589,7 @@ final class PeerRelaySession {
         self.session = nil
         self.transport = nil
         Task {
+            await session?.stopHeartbeat()
             try? await session?.sendGoodbye(reason: "relay-session teardown")
             await transport?.close()
         }

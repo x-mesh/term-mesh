@@ -521,10 +521,12 @@ final class PeerRelayWorkspaceWindowController: NSWindowController, NSWindowDele
         splitIDByObject.removeAll()
         splitWatcher = nil
         let transport = subscriptionTransport
+        let session = subscriptionSession
         subscriptionTransport = nil
         let toStop = Array(panesBySurfaceID.values)
         panesBySurfaceID.removeAll()
         Task {
+            await session?.stopHeartbeat()
             for slot in toStop { await slot.session.stop() }
             await transport?.close()
         }
@@ -548,6 +550,22 @@ final class PeerRelayWorkspaceWindowController: NSWindowController, NSWindowDele
             _ = try await session.handshake()
             subscriptionTransport = transport
             subscriptionSession = session
+            // App-level heartbeat. SSH ServerAliveInterval (15s × 3)
+            // catches a dead tunnel within ~45s, but it can't catch a
+            // remote daemon that's paused while its kernel still
+            // answers TCP keepalives (the laptop-sleep / hibernation
+            // failure mode the user reported). 10s ping cadence with
+            // a 30s "no Pong" deadline closes the hung-tunnel detection
+            // gap; on dead, we close the subscription transport so the
+            // pump's `receiveNextMessage()` unblocks with an error and
+            // the existing disconnect/reconnect path runs.
+            let weakTransport = transport
+            await session.startHeartbeat(
+                intervalSeconds: 10,
+                deadAfterSeconds: 30
+            ) {
+                Task { await weakTransport.close() }
+            }
             await MainActor.run { self.installKeyMonitor() }
 
             subscriptionTask = Task { [weak self] in

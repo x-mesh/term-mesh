@@ -1,6 +1,25 @@
 import XCTest
 @testable import PeerProto
 
+/// One-shot flag that a `Sendable` callback can fire and an async test
+/// body can wait on. Polls a few times per the timeout — simple and
+/// avoids `CheckedContinuation` cancellation footguns when the timeout
+/// branch wins inside a `TaskGroup`.
+actor AsyncFlag {
+    private var fired = false
+
+    func signal() { fired = true }
+
+    func wait(timeoutSeconds: TimeInterval) async -> Bool {
+        let deadline = Date().addingTimeInterval(timeoutSeconds)
+        while Date() < deadline {
+            if fired { return true }
+            try? await Task.sleep(nanoseconds: 30_000_000) // 30ms
+        }
+        return fired
+    }
+}
+
 /// In-memory paired channel: one side's writes appear on the other side's
 /// reads. Used to run a "server" coroutine alongside the `PeerSession`
 /// client in a single test process, no Unix socket required.
@@ -184,6 +203,82 @@ final class PeerSessionTests: XCTestCase {
         XCTAssertFalse(surfaces[1].attachable)
 
         try await hostTask.value
+    }
+
+    /// Heartbeat must fire `onDead` when the remote stops sending Pong.
+    /// Reproduces the laptop-sleep / hung-daemon failure mode where the
+    /// transport read blocks forever without an OS-level disconnect.
+    func testHeartbeatDeclaresDeadOnSilentRemote() async throws {
+        let transport = MockTransport()
+        let session = PeerSession(
+            read: { await transport.clientRead() },
+            write: { await transport.clientWrite($0) }
+        )
+
+        let deadFlag = AsyncFlag()
+        await session.startHeartbeat(intervalSeconds: 0.05, deadAfterSeconds: 0.3) {
+            Task { await deadFlag.signal() }
+        }
+
+        let fired = await deadFlag.wait(timeoutSeconds: 2.0)
+        XCTAssertTrue(fired, "heartbeat should have called onDead within 2s")
+
+        await session.stopHeartbeat()
+    }
+
+    /// Heartbeat must NOT fire `onDead` while the remote is replying
+    /// with Pong frames. Guards against false-positive disconnects.
+    func testHeartbeatStaysAliveWhilePongsArrive() async throws {
+        let transport = MockTransport()
+        let session = PeerSession(
+            read: { await transport.clientRead() },
+            write: { await transport.clientWrite($0) }
+        )
+
+        let pongTask = Task<Void, Never> {
+            var pending = Data()
+            var serverSeq: UInt64 = 0
+            while !Task.isCancelled {
+                let chunk = await transport.serverRead()
+                if chunk.isEmpty { break }
+                pending.append(chunk)
+                while let env = try? decodeFrame(from: &pending) {
+                    if case .ping(let p) = env.payload {
+                        var reply = Termmesh_Peer_V1_Envelope()
+                        serverSeq += 1
+                        reply.seq = serverSeq
+                        var pong = Termmesh_Peer_V1_Pong()
+                        pong.nonce = p.nonce
+                        reply.pong = pong
+                        if let frame = try? encodeFrame(reply) {
+                            await transport.serverWrite(frame)
+                        }
+                    }
+                }
+            }
+        }
+
+        // Drain Pongs on the client side so receiveNextMessage updates
+        // lastPongAt — without a drain the actor's internal timestamp
+        // never refreshes and the deadline trips even with replies in
+        // flight.
+        let drainTask = Task<Void, Never> {
+            while !Task.isCancelled {
+                _ = try? await session.receiveNextMessage()
+            }
+        }
+
+        let deadFlag = AsyncFlag()
+        await session.startHeartbeat(intervalSeconds: 0.05, deadAfterSeconds: 0.3) {
+            Task { await deadFlag.signal() }
+        }
+
+        let fired = await deadFlag.wait(timeoutSeconds: 0.7)
+        XCTAssertFalse(fired, "heartbeat must not declare dead while Pongs are arriving")
+
+        await session.stopHeartbeat()
+        drainTask.cancel()
+        pongTask.cancel()
     }
 
     func testHandshakeRejectsMismatchedProtocol() async throws {
