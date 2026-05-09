@@ -19,6 +19,7 @@ use tokio::io::Interest;
 use tokio::sync::{broadcast, Notify};
 
 use super::pty;
+use super::query_filter::QueryFilter;
 
 /// Wrapper so a PTY master fd can be handed to `AsyncFd::new` without
 /// implying ownership — closing the fd is the surface's Drop's job.
@@ -161,6 +162,7 @@ impl PtySurface {
             };
 
             let mut buf = vec![0u8; READ_BUF_SIZE];
+            let mut filter = QueryFilter::default();
             loop {
                 let mut guard = match async_fd.readable().await {
                     Ok(g) => g,
@@ -217,10 +219,25 @@ impl PtySurface {
                         break;
                     }
                     Ok(Ok(n)) => {
-                        let bytes = buf[..n].to_vec();
+                        let (bytes, responses) = filter.process(&buf[..n]);
+                        if !responses.is_empty() {
+                            // Synthesised reply to a terminal query
+                            // (DA1/DA2/DSR/OSC 10·11). Write back to the
+                            // PTY master so the originating program sees
+                            // it on stdin without a relay round trip.
+                            if let Err(e) = pty::write_all(master_fd, &responses) {
+                                tracing::warn!(
+                                    "query reply write failed on surface {:?}: {e}",
+                                    hex_short(&reader_surface.surface_id)
+                                );
+                            }
+                        }
+                        if bytes.is_empty() {
+                            continue;
+                        }
                         let seq = reader_surface
                             .byte_seq
-                            .fetch_add(n as u64, Ordering::Relaxed);
+                            .fetch_add(bytes.len() as u64, Ordering::Relaxed);
                         let chunk = PtyChunk { seq, bytes };
                         if let Ok(mut replay) = reader_surface.replay.lock() {
                             replay.push(chunk.clone());

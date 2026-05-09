@@ -584,6 +584,97 @@ mod integration_tests {
         let _ = tokio::time::timeout(std::time::Duration::from_secs(3), server_task).await;
     }
 
+    /// Issue 1 fix: when a TUI in the remote PTY emits a terminal query
+    /// like CSI 6n (cursor position report), the daemon must answer it
+    /// itself by writing a synthesized reply back to the PTY master,
+    /// AND must strip the query from the bytes broadcast to clients.
+    /// Otherwise the local Ghostty would answer over the SSH round trip
+    /// and the answer would land in the remote shell as bogus input
+    /// ("zsh: command not found: 11", etc.).
+    #[tokio::test]
+    async fn cpr_query_is_answered_locally_and_not_broadcast() {
+        let tmp = TempDir::new().unwrap();
+        let sock_path = tmp.path().join("peer.sock");
+
+        let manager = Arc::new(PtyManager::new());
+        // The shell emits the CPR query, then `dd` reads exactly the 6
+        // bytes of the synthesized reply (`\x1b[1;1R`) from stdin, then
+        // prints them inside `GOT[...]`. The PTY is put into raw mode
+        // first so `dd` can return on byte boundaries instead of waiting
+        // for a newline (canonical mode blocks until '\n', and the
+        // response has none). If the daemon didn't write the reply,
+        // `dd` would block forever and the marker never appears.
+        let surface = PtySurface::spawn(
+            surface_id_from_name("query"),
+            "query".into(),
+            "/bin/sh",
+            &[
+                "-c",
+                "stty -icanon -echo min 1 time 0 2>/dev/null; printf '\\033[6n'; reply=$(dd bs=1 count=6 2>/dev/null); printf 'GOT[%s]\\n' \"$reply\"; sleep 2",
+            ],
+            80,
+            24,
+            None,
+        )
+        .expect("spawn query surface");
+        manager.insert_surface(surface);
+
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let sp_task = sock_path.clone();
+        let server_task = tokio::spawn(async move {
+            serve_with_manager(sp_task, shutdown_rx, manager)
+                .await
+                .unwrap();
+        });
+
+        for _ in 0..50 {
+            if sock_path.exists() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+
+        let (mut reader, writer, _surface_id) = attach_one(&sock_path, "query-test").await;
+
+        // Drain frames for up to 5s, accumulating payload bytes. We
+        // need both: the GOT[...] marker (proves the daemon answered)
+        // AND the absence of the raw `\x1b[6n` bytes (proves the query
+        // was stripped from broadcast).
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut aggregated = Vec::<u8>::new();
+        let marker = b"GOT[\x1b[1;1R]";
+        let query = b"\x1b[6n";
+        while tokio::time::Instant::now() < deadline {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            let env = match tokio::time::timeout(remaining, read_envelope(&mut reader)).await {
+                Ok(Ok(e)) => e,
+                _ => break,
+            };
+            if let Some(Payload::PtyData(p)) = env.payload {
+                aggregated.extend_from_slice(&p.payload);
+                if aggregated.windows(marker.len()).any(|w| w == marker) {
+                    break;
+                }
+            }
+        }
+
+        assert!(
+            aggregated.windows(marker.len()).any(|w| w == marker),
+            "shell did not receive the synthesized CPR reply on stdin (got bytes: {:?})",
+            aggregated
+        );
+        assert!(
+            !aggregated.windows(query.len()).any(|w| w == query),
+            "raw CPR query leaked into the client broadcast (got bytes: {:?})",
+            aggregated
+        );
+
+        drop(reader);
+        drop(writer);
+        shutdown_tx.send(true).unwrap();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(3), server_task).await;
+    }
+
     /// Drive the full handshake + attach path for one client against
     /// `sock_path`, returning the split stream halves and the chosen
     /// surface_id. Used by the multi-client test below.
