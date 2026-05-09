@@ -115,6 +115,38 @@ final class PeerSSHTunnel: @unchecked Sendable {
         scheduleReconnect(reason: "user retry")
     }
 
+    /// Force the current ssh subprocess through the normal reconnect
+    /// loop. Used when the Unix-socket peer session closes while ssh
+    /// itself is still alive, which can happen across sleep/wake or
+    /// remote peer-server restarts. In that state `Process`
+    /// termination will not fire, but every pane session is already
+    /// dead from the relay's perspective.
+    func forceReconnect(reason: String) {
+        lock.lock()
+        if restartTask != nil {
+            lock.unlock()
+            return
+        }
+        wantsRunning = true
+        let p = process
+        process = nil
+        lock.unlock()
+
+        var sshActuallyExited = (p == nil)
+        if let p, p.isRunning {
+            p.terminate()
+            sshActuallyExited = waitForExit(p, timeout: 2.0)
+            if !sshActuallyExited {
+                kill(p.processIdentifier, SIGKILL)
+                sshActuallyExited = waitForExit(p, timeout: 1.0)
+            }
+        }
+        if sshActuallyExited {
+            try? FileManager.default.removeItem(atPath: localSockPath)
+        }
+        scheduleReconnect(reason: reason)
+    }
+
     /// Tears the ssh subprocess down and disarms auto-restart. Safe to
     /// call repeatedly.
     func stop() {

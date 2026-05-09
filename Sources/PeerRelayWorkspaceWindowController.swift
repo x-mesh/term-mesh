@@ -36,6 +36,91 @@ private final class WorkspaceSplitWatcher: NSObject, NSSplitViewDelegate {
 }
 
 @MainActor
+private final class PeerRelayStatusOverlay: NSView {
+    private let stack = NSStackView()
+    private let titleLabel = NSTextField(labelWithString: "")
+    private let detailLabel = NSTextField(labelWithString: "")
+    private let actionButton = NSButton(title: "", target: nil, action: nil)
+    private var actionHandler: (() -> Void)?
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        wantsLayer = true
+        layer?.backgroundColor = NSColor.windowBackgroundColor.withAlphaComponent(0.84).cgColor
+        translatesAutoresizingMaskIntoConstraints = false
+        isHidden = true
+
+        stack.orientation = .vertical
+        stack.alignment = .centerX
+        stack.spacing = 8
+        stack.translatesAutoresizingMaskIntoConstraints = false
+
+        titleLabel.font = .systemFont(ofSize: 15, weight: .semibold)
+        titleLabel.textColor = .labelColor
+        titleLabel.alignment = .center
+        titleLabel.maximumNumberOfLines = 1
+
+        detailLabel.font = .systemFont(ofSize: 12)
+        detailLabel.textColor = .secondaryLabelColor
+        detailLabel.alignment = .center
+        detailLabel.maximumNumberOfLines = 2
+        detailLabel.lineBreakMode = .byTruncatingTail
+        detailLabel.preferredMaxLayoutWidth = 520
+
+        actionButton.bezelStyle = .rounded
+        actionButton.controlSize = .small
+        actionButton.target = self
+        actionButton.action = #selector(actionTapped)
+        actionButton.isHidden = true
+
+        stack.addArrangedSubview(titleLabel)
+        stack.addArrangedSubview(detailLabel)
+        stack.addArrangedSubview(actionButton)
+        addSubview(stack)
+
+        NSLayoutConstraint.activate([
+            stack.centerXAnchor.constraint(equalTo: centerXAnchor),
+            stack.centerYAnchor.constraint(equalTo: centerYAnchor),
+            stack.leadingAnchor.constraint(greaterThanOrEqualTo: leadingAnchor, constant: 28),
+            stack.trailingAnchor.constraint(lessThanOrEqualTo: trailingAnchor, constant: -28),
+        ])
+    }
+
+    required init?(coder: NSCoder) { fatalError("not used") }
+
+    override func hitTest(_ point: NSPoint) -> NSView? {
+        isHidden ? nil : super.hitTest(point)
+    }
+
+    func show(title: String,
+              detail: String,
+              actionTitle: String? = nil,
+              action: (() -> Void)? = nil) {
+        titleLabel.stringValue = title
+        detailLabel.stringValue = detail
+        detailLabel.toolTip = detail
+        if let actionTitle, !actionTitle.isEmpty {
+            actionButton.title = actionTitle
+            actionButton.isHidden = false
+            actionHandler = action
+        } else {
+            actionButton.isHidden = true
+            actionHandler = nil
+        }
+        isHidden = false
+    }
+
+    func hide() {
+        isHidden = true
+        actionHandler = nil
+    }
+
+    @objc private func actionTapped() {
+        actionHandler?()
+    }
+}
+
+@MainActor
 /// Read-only snapshot of one peer-relay workspace window's
 /// connection metadata. Surfaced through
 /// `PeerRelayWorkspaceWindowController.connectionInfo` so views like
@@ -163,6 +248,8 @@ final class PeerRelayWorkspaceWindowController: NSWindowController, NSWindowDele
     /// splitRoot container into the window's contentView.
     private var bodyInstalled = false
     private var splitRootContainer: NSView?
+    private var splitContentContainer: NSView?
+    private var statusOverlay: PeerRelayStatusOverlay?
 
     var onClose: (@MainActor () -> Void)?
 
@@ -213,27 +300,52 @@ final class PeerRelayWorkspaceWindowController: NSWindowController, NSWindowDele
         case .down(let reason):
             markWindowDisconnected(reason: reason)
             bannerPresenter?.showDisconnected(reason: reason)
+            showRelayOverlay(
+                title: "Connection lost",
+                detail: "Waiting for SSH to reconnect. Pane controls are paused."
+            )
             tearDownPeerSessions(keepWindow: true)
         case .reconnecting(let attempt):
             markWindowReconnecting(attempt: attempt)
             bannerPresenter?.showReconnecting(attempt: attempt)
+            showRelayOverlay(
+                title: "Reconnecting",
+                detail: "Attempt \(attempt). Pane controls will resume when the host is reachable."
+            )
         case .up:
             markWindowConnected()
             bannerPresenter?.showReattaching()
+            showRelayOverlay(
+                title: "Re-attaching panes",
+                detail: "Refreshing the host layout and rebuilding the relay view."
+            )
             // Tunnel just came back. Re-run the initial-attach flow
             // from the same hostSockPath.
             startTask?.cancel()
             startTask = Task { [weak self] in
                 guard let self else { return }
                 do {
-                    try await self.applyLayout(self.currentLayout)
+                    let latest = try await self.fetchLatestWorkspace()
+                    await MainActor.run {
+                        self.workspaceID = latest.workspaceID
+                        self.currentLayout = latest.layout
+                    }
+                    try await self.applyLayout(latest.layout)
                     await self.startSubscription()
                     await MainActor.run { [weak self] in
+                        self?.hideRelayOverlay()
                         self?.bannerPresenter?.showReconnected()
                     }
                 } catch {
                     let detail = String(describing: error)
                     await MainActor.run { [weak self] in
+                        self?.showRelayOverlay(
+                            title: "Reconnect failed",
+                            detail: detail,
+                            actionTitle: "Retry"
+                        ) {
+                            self?.handleTunnelStateChange(.up)
+                        }
                         self?.bannerPresenter?.showReconnectFailed(detail: detail) {
                             // Re-enter `.up` to redrive applyLayout.
                             self?.handleTunnelStateChange(.up)
@@ -246,6 +358,13 @@ final class PeerRelayWorkspaceWindowController: NSWindowController, NSWindowDele
             // can re-arm the loop without closing the window.
             markWindowDisconnected(reason: "gave up retrying")
             bannerPresenter?.showFailedTerminal(reason: reason) { [weak self] in
+                self?.sshTunnel?.retry()
+            }
+            showRelayOverlay(
+                title: "Reconnect failed",
+                detail: reason,
+                actionTitle: "Retry"
+            ) { [weak self] in
                 self?.sshTunnel?.retry()
             }
             tearDownPeerSessions(keepWindow: true)
@@ -277,7 +396,31 @@ final class PeerRelayWorkspaceWindowController: NSWindowController, NSWindowDele
         window?.title = baseTitle
     }
 
+    @MainActor
+    private func showRelayOverlay(title: String,
+                                  detail: String,
+                                  actionTitle: String? = nil,
+                                  action: (() -> Void)? = nil) {
+        guard let window else { return }
+        ensureBodyStack(in: window)
+        statusOverlay?.show(
+            title: title,
+            detail: detail,
+            actionTitle: actionTitle,
+            action: action
+        )
+    }
+
+    @MainActor
+    private func hideRelayOverlay() {
+        statusOverlay?.hide()
+    }
+
     private func tearDownPeerSessions(keepWindow: Bool) {
+        startTask?.cancel()
+        startTask = nil
+        applyLayoutTask?.cancel()
+        applyLayoutTask = nil
         subscriptionTask?.cancel()
         subscriptionTask = nil
         subscriptionSession = nil
@@ -289,6 +432,13 @@ final class PeerRelayWorkspaceWindowController: NSWindowController, NSWindowDele
             NSEvent.removeMonitor(monitor)
             clickMonitor = nil
         }
+        for (_, task) in dividerDebounce { task.cancel() }
+        dividerDebounce.removeAll()
+        splitsByID.removeAll()
+        splitIDByObject.removeAll()
+        lastClickedSurfaceID = nil
+        splitWatcher = nil
+        splitContentContainer?.subviews.forEach { $0.removeFromSuperview() }
         let transport = subscriptionTransport
         subscriptionTransport = nil
         let toStop = Array(panesBySurfaceID.values)
@@ -321,6 +471,13 @@ final class PeerRelayWorkspaceWindowController: NSWindowController, NSWindowDele
                 let detail = String(describing: error)
                 NSLog("[peer-ws] initial layout failed: %@", detail)
                 await MainActor.run { [weak self] in
+                    self?.showRelayOverlay(
+                        title: "Attach failed",
+                        detail: detail,
+                        actionTitle: "Close"
+                    ) {
+                        self?.window?.performClose(nil)
+                    }
                     self?.bannerPresenter?.showAttachFailed(detail: detail) {
                         self?.window?.performClose(nil)
                     }
@@ -431,11 +588,17 @@ final class PeerRelayWorkspaceWindowController: NSWindowController, NSWindowDele
                 if let reason = disconnectReason {
                     await MainActor.run { [weak self] in
                         guard let self, !self.isClosing else { return }
-                        // SSH-backed: the tunnel's `.down` already
-                        // marked us disconnected; don't double up.
-                        if self.sshTunnel == nil {
-                            self.markWindowDisconnected(reason: reason)
-                            self.bannerPresenter?.showDisconnected(reason: reason)
+                        self.markWindowDisconnected(reason: reason)
+                        self.bannerPresenter?.showDisconnected(reason: reason)
+                        self.showRelayOverlay(
+                            title: "Connection lost",
+                            detail: "The peer session closed. Reconnecting the SSH tunnel."
+                        )
+                        self.tearDownPeerSessions(keepWindow: true)
+                        if let tunnel = self.sshTunnel {
+                            Task.detached {
+                                tunnel.forceReconnect(reason: "peer session closed: \(reason)")
+                            }
                         }
                     }
                 }
@@ -742,7 +905,7 @@ final class PeerRelayWorkspaceWindowController: NSWindowController, NSWindowDele
     private func swapRootView(_ newRoot: NSView, dividers: [(NSSplitView, CGFloat)]) {
         guard let window = self.window else { return }
         ensureBodyStack(in: window)
-        guard let splitContainer = splitRootContainer else { return }
+        guard let splitContainer = splitContentContainer else { return }
 
         for sub in splitContainer.subviews { sub.removeFromSuperview() }
         newRoot.translatesAutoresizingMaskIntoConstraints = false
@@ -785,6 +948,14 @@ final class PeerRelayWorkspaceWindowController: NSWindowController, NSWindowDele
         split.translatesAutoresizingMaskIntoConstraints = false
         self.splitRootContainer = split
 
+        let splitContent = NSView()
+        splitContent.translatesAutoresizingMaskIntoConstraints = false
+        self.splitContentContainer = splitContent
+        let overlay = PeerRelayStatusOverlay(frame: .zero)
+        self.statusOverlay = overlay
+        split.addSubview(splitContent)
+        split.addSubview(overlay)
+
         container.addSubview(bannerView)
         container.addSubview(split)
         NSLayoutConstraint.activate([
@@ -796,6 +967,16 @@ final class PeerRelayWorkspaceWindowController: NSWindowController, NSWindowDele
             split.bottomAnchor.constraint(equalTo: container.bottomAnchor),
             split.leadingAnchor.constraint(equalTo: container.leadingAnchor),
             split.trailingAnchor.constraint(equalTo: container.trailingAnchor),
+
+            splitContent.topAnchor.constraint(equalTo: split.topAnchor),
+            splitContent.bottomAnchor.constraint(equalTo: split.bottomAnchor),
+            splitContent.leadingAnchor.constraint(equalTo: split.leadingAnchor),
+            splitContent.trailingAnchor.constraint(equalTo: split.trailingAnchor),
+
+            overlay.topAnchor.constraint(equalTo: split.topAnchor),
+            overlay.bottomAnchor.constraint(equalTo: split.bottomAnchor),
+            overlay.leadingAnchor.constraint(equalTo: split.leadingAnchor),
+            overlay.trailingAnchor.constraint(equalTo: split.trailingAnchor),
         ])
         bodyInstalled = true
     }
@@ -866,6 +1047,19 @@ final class PeerRelayWorkspaceWindowController: NSWindowController, NSWindowDele
     }
 
     // MARK: - Slot factory
+
+    private func fetchLatestWorkspace() async throws -> Termmesh_Peer_V1_Workspace {
+        let conn = try await PeerRelaySession.connect(hostSockPath: hostSockPath)
+        defer { Task { await conn.cancel() } }
+        let workspaces = try await conn.session.listWorkspaces()
+        if let same = workspaces.first(where: { $0.workspaceID == workspaceID }) {
+            return same
+        }
+        if workspaces.count == 1, let only = workspaces.first {
+            return only
+        }
+        throw RelayError.ioError("workspace disappeared from host")
+    }
 
     private func fetchSurfaceInfoByIDIfNeeded(
         for surfaceIDs: [Data]
