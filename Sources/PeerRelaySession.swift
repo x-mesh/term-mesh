@@ -326,27 +326,35 @@ final class PeerRelaySession {
     // ── Relay binary location ────────────────────────────────────────
 
     static func findRelayBinary() -> String {
-        // Bundled alongside the app binary.
-        let appDir = Bundle.main.bundlePath + "/Contents/MacOS"
-        let bundled = appDir + "/term-mesh-peer-relay"
-        if FileManager.default.fileExists(atPath: bundled) { return bundled }
+        let fm = FileManager.default
+        let bundlePath = Bundle.main.bundlePath
 
-        // Development build: look relative to the project root via
-        // the __FILE__ path at compile time (approximation).
-        let devBuildPaths = [
-            // Xcode sets SOURCE_ROOT as the project root; not available at runtime,
-            // but we can derive it from the app's DerivedData path.
-            Bundle.main.bundlePath
-                .components(separatedBy: "/Build/")
-                .first
-                .map { $0 + "/../daemon/target/release/term-mesh-peer-relay" }
-                .map { ($0 as NSString).standardizingPath },
-            "/Users/jinwoo/work/project/term-mesh/daemon/target/release/term-mesh-peer-relay",
-        ]
-        for path in devBuildPaths.compactMap({ $0 }) {
-            if FileManager.default.fileExists(atPath: path) { return path }
+        // Production: bundled under Contents/Resources/bin/, where every
+        // other Rust binary lives (term-meshd, term-mesh-run, tm-agent).
+        // Makefile deploy/deploy-prod/dmg targets copy them here.
+        let bundledResource = bundlePath + "/Contents/Resources/bin/term-mesh-peer-relay"
+        if fm.fileExists(atPath: bundledResource) { return bundledResource }
+
+        // Legacy fallback: older builds may have placed it in MacOS/.
+        let bundledMacOS = bundlePath + "/Contents/MacOS/term-mesh-peer-relay"
+        if fm.fileExists(atPath: bundledMacOS) { return bundledMacOS }
+
+        // Development: derive daemon/target/release from the DerivedData
+        // path. Works for any developer when the app runs straight from
+        // Xcode (./scripts/reload.sh, xcodebuild …) without committing a
+        // hardcoded user-specific source root.
+        if let derivedRoot = bundlePath.components(separatedBy: "/Build/").first {
+            let derivedRelative = (derivedRoot + "/../daemon/target/release/term-mesh-peer-relay") as NSString
+            let devPath = derivedRelative.standardizingPath
+            if fm.fileExists(atPath: devPath) { return devPath }
         }
-        return bundled  // will fail at runtime; caller handles error
+
+        // Last resort: cwd-relative for `swift run` / unit tests launched
+        // from the repo root.
+        let cwdPath = fm.currentDirectoryPath + "/daemon/target/release/term-mesh-peer-relay"
+        if fm.fileExists(atPath: cwdPath) { return cwdPath }
+
+        return bundledResource  // will fail at runtime; caller handles error
     }
 
     // ── Start ────────────────────────────────────────────────────────
