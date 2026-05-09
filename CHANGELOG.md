@@ -2,6 +2,15 @@
 
 All notable changes to term-mesh are documented here.
 
+## [0.102.9] - 2026-05-09
+
+### Fixed
+- **Peer relay panes no longer hang silently when the remote machine sleeps, the daemon pauses, or the network drops** — v0.102.8's reconnect overlay only fired when the SSH tunnel itself died. That left a much bigger gap: a remote laptop sleeping with its lid closed (the most common case), a paused/deadlocked daemon, or a Wi-Fi/VPN switch where the kernel hadn't yet seen a TCP RST all left the kernel believing the connection was alive — `read()` would block forever and macOS's default 2-hour TCP keepalive was the only thing that would eventually notice. Term-mesh now sends an application-level Ping every 10 s on every active peer session, expects a Pong back within 30 s, and on miss closes the transport so the existing reconnect overlay fires within seconds instead of leaving the user staring at an unresponsive terminal.
+
+### Thanks to 1 contributor!
+
+- [@JINWOO-J](https://github.com/JINWOO-J)
+
 ## [0.102.8] - 2026-05-09
 
 ### Fixed

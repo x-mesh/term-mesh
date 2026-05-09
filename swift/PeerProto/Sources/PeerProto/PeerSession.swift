@@ -84,9 +84,76 @@ public actor PeerSession {
     private var seq: UInt64 = 0
     private var pendingInbound = Data()
 
+    /// Heartbeat state. SSH `ServerAliveInterval` only catches dead
+    /// TCP; it does not catch a remote daemon that has paused (laptop
+    /// sleep, debugger, deadlock) while its kernel still answers
+    /// keepalives. The application-level Ping/Pong here closes that
+    /// gap so a hung relay surfaces as a clean disconnect within
+    /// seconds instead of leaving the terminal blocked on `read()`
+    /// until the kernel TCP keepalive fires (default 2 hours on
+    /// macOS).
+    private var heartbeatTask: Task<Void, Never>?
+    private var lastPongAt: Date = Date()
+    private var pingCounter: UInt64 = 0
+
     public init(read: @escaping PeerReadFn, write: @escaping PeerWriteFn) {
         self.read = read
         self.write = write
+    }
+
+    /// Begin sending Ping frames every `interval` seconds. If no Pong
+    /// arrives within `deadAfter` seconds (or a Ping write itself
+    /// fails), `onDead` is invoked exactly once and the heartbeat
+    /// task exits. Callers should arrange for `onDead` to close the
+    /// transport so the in-flight `receiveNextMessage()` read unblocks
+    /// with an error and the existing disconnect path runs. Calling
+    /// `startHeartbeat` while a heartbeat is already running cancels
+    /// the previous one before starting the new one.
+    public func startHeartbeat(
+        intervalSeconds: TimeInterval = 10,
+        deadAfterSeconds: TimeInterval = 30,
+        onDead: @escaping @Sendable () -> Void
+    ) {
+        heartbeatTask?.cancel()
+        lastPongAt = Date()
+        let intervalNs = UInt64(max(intervalSeconds, 0.1) * 1_000_000_000)
+        heartbeatTask = Task { [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: intervalNs)
+                if Task.isCancelled { return }
+                guard let self else { return }
+                let alive = await self.tickHeartbeat(deadAfterSeconds: deadAfterSeconds)
+                if !alive {
+                    onDead()
+                    return
+                }
+            }
+        }
+    }
+
+    /// Cancel any in-flight heartbeat task. Safe to call multiple
+    /// times and from teardown paths.
+    public func stopHeartbeat() {
+        heartbeatTask?.cancel()
+        heartbeatTask = nil
+    }
+
+    private func tickHeartbeat(deadAfterSeconds: TimeInterval) async -> Bool {
+        if Date().timeIntervalSince(lastPongAt) > deadAfterSeconds {
+            return false
+        }
+        pingCounter &+= 1
+        let nonce = pingCounter
+        do {
+            try await sendEnvelope { env in
+                var p = Termmesh_Peer_V1_Ping()
+                p.nonce = nonce
+                env.ping = p
+            }
+            return true
+        } catch {
+            return false
+        }
     }
 
     // MARK: - Handshake
@@ -259,6 +326,12 @@ public actor PeerSession {
     public func receiveNextMessage() async throws -> PeerIncomingMessage {
         let env = try await readFrame()
         switch env.payload {
+        case .pong:
+            // Liveness reply to a heartbeat Ping — refresh the timestamp
+            // the heartbeat task checks. Surfaced to callers as `.other`
+            // since they don't need to act on it.
+            lastPongAt = Date()
+            return .other
         case .ptyData(let p):
             return .ptyData(surfaceID: p.surfaceID, byteSeq: p.byteSeq, payload: p.payload)
         case .workspaceUpdate(let wu):
