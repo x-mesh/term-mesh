@@ -2,6 +2,15 @@
 
 All notable changes to term-mesh are documented here.
 
+## [0.103.1] - 2026-05-09
+
+### Fixed
+- **Tab, Enter, Escape, and Backspace work in peer relay panes when Ghostty's keyboard protocol is active** — Ghostty encodes some unmodified control keys as `CSI <codepoint> u` (e.g. `\x1B[9u` for Tab, `\x1B[27u` for Escape) instead of the bare control byte. The relay was passing these through verbatim, so the remote shell saw `\x1b[9u` as literal text instead of a tab character; navigation in `vim`, `less`, and any TUI that reads raw stdin was broken. The relay now translates `CSI 9u` / `CSI 13u` / `CSI 27u` / `CSI 127u` to `\t` / `\r` / `\x1b` / `\x7f` before forwarding.
+
+### Thanks to 1 contributor!
+
+- [@JINWOO-J](https://github.com/JINWOO-J)
+
 ## [0.103.0] - 2026-05-09
 
 ### Fixed
