@@ -23,6 +23,7 @@ private let kTypeResize: UInt8   = 0x03
 private let kTypeGoodbye: UInt8  = 0xFF
 private let kTypeAuth: UInt8     = 0xFE
 private let kRelayMaxFrameBytes = 1024 * 1024
+private let kRelayAuthMaxPayload = 256
 
 // ── Two-stage handshake result ─────────────────────────────────────
 
@@ -143,6 +144,10 @@ final class PeerRelaySession {
     let relaySecret: String
     // Relay binary location (must exist before calling start()).
     let relayBinaryPath: String
+    // Shell-safe command string for Ghostty's command parser. Debug app
+    // bundle paths contain spaces ("term-mesh DEV <tag>.app"), and
+    // Ghostty treats `command` as a shell command rather than argv.
+    var relayLaunchCommand: String { Self.shellQuote(relayBinaryPath) }
 
     private let hostSockPath: String
     private let surfaceID: Data
@@ -323,6 +328,10 @@ final class PeerRelaySession {
             + UUID().uuidString.replacingOccurrences(of: "-", with: "")
     }
 
+    private static func shellQuote(_ value: String) -> String {
+        "'" + value.replacingOccurrences(of: "'", with: "'\\''") + "'"
+    }
+
     // ── Relay binary location ────────────────────────────────────────
 
     static func findRelayBinary() -> String {
@@ -455,6 +464,7 @@ final class PeerRelaySession {
                         let relay = RelaySocket(fd: fd)
                         do {
                             try Self.verifyRelaySecret(relay, expected: expectedSecret)
+                            Self.clearSocketReceiveTimeout(fd)
                             cont.resume(returning: relay)
                         } catch {
                             relay.close()
@@ -472,8 +482,6 @@ final class PeerRelaySession {
         }
     }
 
-    private static let kRelayAuthMaxPayload: Int = 256
-
     private nonisolated static func verifyRelaySecret(_ relay: RelaySocket, expected: String) throws {
         let frame = try relay.readFrame()
         guard frame.payload.count <= kRelayAuthMaxPayload else {
@@ -486,6 +494,11 @@ final class PeerRelaySession {
         else {
             throw RelayError.ioError("relay auth failed")
         }
+    }
+
+    private nonisolated static func clearSocketReceiveTimeout(_ fd: Int32) {
+        var timeout = timeval(tv_sec: 0, tv_usec: 0)
+        _ = setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, socklen_t(MemoryLayout<timeval>.size))
     }
 
     /// Length-aware, constant-time byte comparison. Iterates the
@@ -541,7 +554,7 @@ final class PeerRelaySession {
                         break
                     }
                 }
-                await self.disconnect()
+                self.disconnect()
             }
 
             // Relay → host: read frames from relay socket, forward to PeerSession.
@@ -571,7 +584,7 @@ final class PeerRelaySession {
                         break
                     }
                 }
-                await self.disconnect()
+                self.disconnect()
             }
 
             _ = await hostToRelay.result

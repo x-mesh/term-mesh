@@ -167,7 +167,8 @@ final class PeerClientCoordinator: NSObject {
         // it; otherwise the per-uid default). When the remote side is
         // the same user on a similarly-configured Mac, this will be
         // the correct remote path; the user can still edit it.
-        remoteField.stringValue = PeerFederationSettings.socketPath
+        remoteField.stringValue = PeerHostCoordinator.shared.currentSocketPath
+            ?? PeerFederationSettings.socketPath
 
         // Pre-fill from the most recent host so a re-connect is
         // one-keystroke (Cmd+T → Cmd+Return).
@@ -342,6 +343,7 @@ final class PeerClientCoordinator: NSObject {
 
         let input = NSTextField(frame: NSRect(x: 0, y: 0, width: 360, height: 24))
         input.stringValue = ProcessInfo.processInfo.environment["TERMMESH_DEBUG_PEER_SERVER_PATH"]
+            ?? PeerHostCoordinator.shared.currentSocketPath
             ?? PeerFederationSettings.socketPath
         alert.accessoryView = input
         alert.addButton(withTitle: "Connect")
@@ -465,6 +467,7 @@ final class PeerClientCoordinator: NSObject {
 
         let input = NSTextField(frame: NSRect(x: 0, y: 0, width: 360, height: 24))
         input.stringValue = ProcessInfo.processInfo.environment["TERMMESH_DEBUG_PEER_SERVER_PATH"]
+            ?? PeerHostCoordinator.shared.currentSocketPath
             ?? PeerFederationSettings.socketPath
         alert.accessoryView = input
         alert.addButton(withTitle: "Connect")

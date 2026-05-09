@@ -290,22 +290,18 @@ else
   pkill -f "${APP_NAME}.app/Contents/MacOS/${BASE_APP_NAME}" || true
 fi
 sleep 0.3
-TERMMESHD_SRC="$PWD/daemon/target/release/term-meshd"
 if [[ -d "$PWD/daemon" && -f "$PWD/daemon/Cargo.toml" ]]; then
   (cd "$PWD/daemon" && cargo build --release 2>/dev/null) || true
 fi
-if [[ -x "$TERMMESHD_SRC" ]]; then
-  BIN_DIR="$APP_PATH/Contents/Resources/bin"
-  mkdir -p "$BIN_DIR"
-  cp "$TERMMESHD_SRC" "$BIN_DIR/term-meshd"
-  chmod +x "$BIN_DIR/term-meshd"
-  # Also copy tm-agent (unified team CLI) if built
-  TMAGENT_SRC="$PWD/daemon/target/release/tm-agent"
-  if [[ -x "$TMAGENT_SRC" ]]; then
-    cp "$TMAGENT_SRC" "$BIN_DIR/tm-agent"
-    chmod +x "$BIN_DIR/tm-agent"
+BIN_DIR="$APP_PATH/Contents/Resources/bin"
+mkdir -p "$BIN_DIR"
+for bin in term-meshd term-mesh-run tm-agent term-mesh-peer-relay; do
+  src="$PWD/daemon/target/release/$bin"
+  if [[ -x "$src" ]]; then
+    cp "$src" "$BIN_DIR/$bin"
+    chmod +x "$BIN_DIR/$bin"
   fi
-fi
+done
 # Avoid inheriting term-mesh/ghostty environment variables from the terminal that
 # runs this script (often inside another term-mesh instance), which can cause
 # socket and resource-path conflicts.

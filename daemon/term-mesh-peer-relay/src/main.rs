@@ -29,6 +29,7 @@ const TYPE_RESIZE: u8 = 0x03;
 const TYPE_GOODBYE: u8 = 0xFF;
 const TYPE_AUTH: u8 = 0xFE;
 const MAX_FRAME_BYTES: usize = 1024 * 1024;
+const MAX_RESPONSE_PENDING: usize = 256;
 
 // ── SIGWINCH self-pipe ─────────────────────────────────────────────
 
@@ -147,6 +148,307 @@ fn read_frame(sock: &mut UnixStream) -> io::Result<(u8, Vec<u8>)> {
     Ok((typ, payload))
 }
 
+// ── Terminal-response filter ───────────────────────────────────────
+//
+// Ghostty writes terminal query replies (for example OSC 11 color
+// reports and CSI cursor-position reports) to the child process stdin.
+// In a normal local terminal that child is the program that asked the
+// query. In peer relay mode, this binary is the child; forwarding those
+// replies as "user input" makes them arrive late at the remote shell,
+// where zsh tries to execute fragments such as `11;rgb:...` and `2;1R`.
+//
+// The host daemon already strips and answers known queries before they
+// reach local Ghostty. This is a second, narrow safety net for older
+// hosts, replayed output, and any missed query path. It drops only known
+// terminal-generated responses; ordinary key input and navigation CSI
+// sequences still pass through unchanged.
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ResponseFilterState {
+    Ground,
+    Escape,
+    Csi,
+    Osc,
+    OscEsc,
+}
+
+#[derive(Debug)]
+struct TerminalResponseFilter {
+    state: ResponseFilterState,
+    pending: Vec<u8>,
+}
+
+impl Default for TerminalResponseFilter {
+    fn default() -> Self {
+        Self {
+            state: ResponseFilterState::Ground,
+            pending: Vec::with_capacity(64),
+        }
+    }
+}
+
+impl TerminalResponseFilter {
+    fn process(&mut self, input: &[u8]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(input.len());
+
+        for &b in input {
+            match self.state {
+                ResponseFilterState::Ground => {
+                    if b == 0x1B {
+                        self.pending.clear();
+                        self.pending.push(b);
+                        self.state = ResponseFilterState::Escape;
+                    } else {
+                        out.push(b);
+                    }
+                }
+                ResponseFilterState::Escape => {
+                    self.pending.push(b);
+                    match b {
+                        b'[' => self.state = ResponseFilterState::Csi,
+                        b']' => self.state = ResponseFilterState::Osc,
+                        _ => {
+                            out.extend_from_slice(&self.pending);
+                            self.pending.clear();
+                            self.state = ResponseFilterState::Ground;
+                        }
+                    }
+                }
+                ResponseFilterState::Csi => {
+                    self.pending.push(b);
+                    if (0x40..=0x7E).contains(&b) {
+                        if let Some(replacement) = translate_terminal_csi_input(&self.pending) {
+                            out.extend_from_slice(&replacement);
+                        } else if !is_terminal_csi_response(&self.pending) {
+                            out.extend_from_slice(&self.pending);
+                        }
+                        self.pending.clear();
+                        self.state = ResponseFilterState::Ground;
+                    } else if !(0x20..=0x3F).contains(&b) || self.pending.len() > MAX_RESPONSE_PENDING {
+                        out.extend_from_slice(&self.pending);
+                        self.pending.clear();
+                        self.state = ResponseFilterState::Ground;
+                    }
+                }
+                ResponseFilterState::Osc => {
+                    if b == 0x07 {
+                        if !is_terminal_osc_response(&self.pending) {
+                            out.extend_from_slice(&self.pending);
+                            out.push(0x07);
+                        }
+                        self.pending.clear();
+                        self.state = ResponseFilterState::Ground;
+                    } else if b == 0x1B {
+                        self.state = ResponseFilterState::OscEsc;
+                    } else {
+                        self.pending.push(b);
+                        if self.pending.len() > MAX_RESPONSE_PENDING {
+                            out.extend_from_slice(&self.pending);
+                            self.pending.clear();
+                            self.state = ResponseFilterState::Ground;
+                        }
+                    }
+                }
+                ResponseFilterState::OscEsc => {
+                    if b == b'\\' {
+                        if !is_terminal_osc_response(&self.pending) {
+                            out.extend_from_slice(&self.pending);
+                            out.extend_from_slice(b"\x1B\\");
+                        }
+                        self.pending.clear();
+                        self.state = ResponseFilterState::Ground;
+                    } else {
+                        out.extend_from_slice(&self.pending);
+                        out.push(0x1B);
+                        out.push(b);
+                        self.pending.clear();
+                        self.state = ResponseFilterState::Ground;
+                    }
+                }
+            }
+        }
+
+        out
+    }
+
+    /// True when the filter is holding a lone ESC waiting for a
+    /// follow-up byte. Read loops use this to schedule a short poll
+    /// timeout so a user-typed Escape that has no follow-up is
+    /// flushed promptly without forwarding it eagerly when the very
+    /// next read might complete an OSC/CSI sequence.
+    fn has_pending_escape(&self) -> bool {
+        self.state == ResponseFilterState::Escape && self.pending == b"\x1B"
+    }
+
+    /// Drain a lone pending ESC as user input. The caller is expected
+    /// to invoke this when a poll timeout indicates no follow-up byte
+    /// is arriving. No-op when the filter is in any other state.
+    fn flush_pending_escape(&mut self) -> Vec<u8> {
+        if self.has_pending_escape() {
+            self.pending.clear();
+            self.state = ResponseFilterState::Ground;
+            return vec![0x1B];
+        }
+        Vec::new()
+    }
+}
+
+fn is_terminal_csi_response(seq: &[u8]) -> bool {
+    if seq.len() < 3 || seq[0] != 0x1B || seq[1] != b'[' {
+        return false;
+    }
+    let body = &seq[2..seq.len() - 1];
+    let final_byte = seq[seq.len() - 1];
+
+    match final_byte {
+        // FocusIn / FocusOut. These are generated by the local relay
+        // terminal when a remote full-screen app enables focus tracking.
+        // Forwarding them through the peer input path makes "[I"/"[O"
+        // appear as literal text in shells and CLIs that do not expect
+        // them on the host-side terminal.
+        b'I' | b'O' => body.is_empty(),
+        // Cursor Position Report: ESC [ row ; col R
+        b'R' => !body.is_empty() && body.iter().all(|b| b.is_ascii_digit() || *b == b';'),
+        // Device Status Report: ESC [ 0 n, ESC [ 3 n, etc.
+        b'n' => !body.is_empty() && body.iter().all(|b| b.is_ascii_digit() || *b == b';' || *b == b'?'),
+        // Primary/secondary Device Attributes replies.
+        b'c' => {
+            if body.starts_with(b"?") || body.starts_with(b">") {
+                body[1..].iter().all(|b| b.is_ascii_digit() || *b == b';')
+            } else {
+                false
+            }
+        }
+        _ => false,
+    }
+}
+
+fn translate_terminal_csi_input(seq: &[u8]) -> Option<Vec<u8>> {
+    if seq.len() < 4 || seq[0] != 0x1B || seq[1] != b'[' || *seq.last()? != b'u' {
+        return None;
+    }
+    let body = &seq[2..seq.len() - 1];
+    let mut parts = body.split(|b| *b == b';');
+    let codepoint = parse_ascii_u32(parts.next()?)?;
+    let modifiers = parse_ascii_u32(parts.next()?)?;
+    // Kitty keyboard protocol uses 1-based modifier flags. Ctrl is bit 2
+    // after subtracting 1, so Ctrl-only is ";5".
+    if modifiers == 0 || ((modifiers - 1) & 0b100) == 0 {
+        return None;
+    }
+    let letter = ctrl_letter_from_codepoint(codepoint)?;
+    Some(vec![ctrl_byte_for_ascii_letter(letter)])
+}
+
+fn parse_ascii_u32(bytes: &[u8]) -> Option<u32> {
+    if bytes.is_empty() || !bytes.iter().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let mut value = 0u32;
+    for &b in bytes {
+        value = value.checked_mul(10)?.checked_add(u32::from(b - b'0'))?;
+    }
+    Some(value)
+}
+
+fn ctrl_byte_for_ascii_letter(letter: u8) -> u8 {
+    letter.to_ascii_lowercase() - b'a' + 1
+}
+
+fn ctrl_letter_from_codepoint(codepoint: u32) -> Option<u8> {
+    const ASCII_LOWER_A: u32 = b'a' as u32;
+    const ASCII_LOWER_Z: u32 = b'z' as u32;
+    const ASCII_UPPER_A: u32 = b'A' as u32;
+    const ASCII_UPPER_Z: u32 = b'Z' as u32;
+
+    match codepoint {
+        ASCII_LOWER_A..=ASCII_LOWER_Z => Some(codepoint as u8),
+        ASCII_UPPER_A..=ASCII_UPPER_Z => Some((codepoint as u8).to_ascii_lowercase()),
+        // Korean 2-set IME can make Ghostty encode the physical Ctrl+key
+        // as the Hangul jamo produced by that key. Map those jamo back to
+        // their QWERTY physical letters so Ctrl+C still becomes ETX.
+        0x3142 | 0x3143 => Some(b'q'), // ㅂ / ㅃ
+        0x3148 | 0x3149 => Some(b'w'), // ㅈ / ㅉ
+        0x3137 | 0x3138 => Some(b'e'), // ㄷ / ㄸ
+        0x3131 | 0x3132 => Some(b'r'), // ㄱ / ㄲ
+        0x3145 | 0x3146 => Some(b't'), // ㅅ / ㅆ
+        0x315B => Some(b'y'),          // ㅛ
+        0x3155 => Some(b'u'),          // ㅕ
+        0x3151 => Some(b'i'),          // ㅑ
+        0x3150 | 0x3152 => Some(b'o'), // ㅐ / ㅒ
+        0x3154 | 0x3156 => Some(b'p'), // ㅔ / ㅖ
+        0x3141 => Some(b'a'),          // ㅁ
+        0x3134 => Some(b's'),          // ㄴ
+        0x3147 => Some(b'd'),          // ㅇ
+        0x3139 => Some(b'f'),          // ㄹ
+        0x314E => Some(b'g'),          // ㅎ
+        0x3157 => Some(b'h'),          // ㅗ
+        0x3153 => Some(b'j'),          // ㅓ
+        0x314F => Some(b'k'),          // ㅏ
+        0x3163 => Some(b'l'),          // ㅣ
+        0x314B => Some(b'z'),          // ㅋ
+        0x314C => Some(b'x'),          // ㅌ
+        0x314A => Some(b'c'),          // ㅊ
+        0x314D => Some(b'v'),          // ㅍ
+        0x3160 => Some(b'b'),          // ㅠ
+        0x315C => Some(b'n'),          // ㅜ
+        0x3161 => Some(b'm'),          // ㅡ
+        _ => None,
+    }
+}
+
+fn is_terminal_osc_response(seq_without_terminator: &[u8]) -> bool {
+    if seq_without_terminator.len() < 4
+        || seq_without_terminator[0] != 0x1B
+        || seq_without_terminator[1] != b']'
+    {
+        return false;
+    }
+    let payload = &seq_without_terminator[2..];
+    let Some(semi) = payload.iter().position(|&b| b == b';') else {
+        return false;
+    };
+    let ps = &payload[..semi];
+    let value = &payload[semi + 1..];
+
+    match ps {
+        // Color reports for fg / bg / cursor / mouse / etc. (OSC 10..19).
+        // Ghostty replies `OSC Ps ; rgb:RRRR/GGGG/BBBB` to `OSC Ps ; ?`
+        // queries. Restrict the drop to payloads that actually look like
+        // a colour value so a user legitimately typing
+        // `printf '\e]11;custom\e\\'` is not silently swallowed.
+        b"10" | b"11" | b"12" | b"13" | b"14" | b"15" | b"16" | b"17" | b"18" | b"19" => {
+            value.starts_with(b"rgb:") || value.starts_with(b"rgba:")
+        }
+        // Palette colour query reply: `OSC 4 ; n ; rgb:...`. The
+        // colour value lives after the *second* semicolon, not the
+        // first, so we have to look one level deeper than the
+        // 10..19 case.
+        b"4" => {
+            if let Some(second_semi) = value.iter().position(|&b| b == b';') {
+                let v = &value[second_semi + 1..];
+                v.starts_with(b"rgb:") || v.starts_with(b"rgba:")
+            } else {
+                false
+            }
+        }
+        // Clipboard read reply. Ghostty answers a host-issued
+        // `OSC 52 ; <Pc> ; ?` query with `OSC 52 ; <Pc> ; <BASE64>`,
+        // and the bytes flow back here on the relay's stdin. Without
+        // this drop the relay would forward the BASE64 payload as
+        // ordinary user input — a clipboard exfiltration channel for
+        // any peer host that asks. The reply and the user-typed set
+        // form (`OSC 52 ; c ; data`) are byte-identical, so we drop
+        // every OSC 52 the relay sees rather than risk leaking. Users
+        // who need clipboard manipulation in the remote pane should
+        // route it through an explicit channel, not raw OSC.
+        b"52" => true,
+        // Kitty's clipboard / file extension. Same shape, same risk.
+        b"5522" => true,
+        _ => false,
+    }
+}
+
 // ── Main ────────────────────────────────────────────────────────────
 
 fn main() {
@@ -232,21 +534,85 @@ fn main() {
         })
     });
 
-    // stdin reader thread: sends keystrokes to socket.
+    // stdin reader thread: sends keystrokes to socket. Uses poll(2)
+    // so a lone ESC held by `TerminalResponseFilter` (waiting to see
+    // if it's the start of a CSI/OSC sequence) can be flushed after
+    // a short timeout — the standard "Escape timing" trick TUIs use
+    // to disambiguate Esc-by-itself from `Esc[A` arrow keys without
+    // racing read boundaries. Without poll, we'd either flush every
+    // ESC eagerly (the original code, which lets a CSI/OSC reply
+    // split as `[ESC][[2;1R]` slip through as raw input) or hold ESC
+    // forever (which makes vim's `<Esc>` to leave insert mode hang).
     let tx_stdin = tx.clone();
     let stdin_handle = std::thread::spawn(move || {
-        let stdin = io::stdin();
+        // Bounded delay between seeing a lone ESC and forwarding it
+        // as user input. 100 ms is well above any same-burst
+        // PTY read-fragmentation jitter and well below human Escape
+        // perception latency.
+        const ESC_FLUSH_TIMEOUT_MS: i32 = 100;
+
+        let stdin_fd = libc::STDIN_FILENO;
         let mut buf = [0u8; 1024];
-        loop {
-            let n = match stdin.lock().read(&mut buf) {
-                Ok(0) | Err(_) => break,
-                Ok(n) => n,
-            };
-            let mut frame = Vec::with_capacity(5 + n);
+        let mut response_filter = TerminalResponseFilter::default();
+
+        let send_frame = |tx: &mpsc::Sender<Vec<u8>>, payload: &[u8]| -> bool {
+            if payload.is_empty() {
+                return true;
+            }
+            let mut frame = Vec::with_capacity(5 + payload.len());
             frame.push(TYPE_KEY_INPUT);
-            frame.extend_from_slice(&(n as u32).to_le_bytes());
-            frame.extend_from_slice(&buf[..n]);
-            if tx_stdin.send(frame).is_err() {
+            frame.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+            frame.extend_from_slice(payload);
+            tx.send(frame).is_ok()
+        };
+
+        loop {
+            let timeout_ms = if response_filter.has_pending_escape() {
+                ESC_FLUSH_TIMEOUT_MS
+            } else {
+                -1
+            };
+            let mut pfd = libc::pollfd {
+                fd: stdin_fd,
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            let ret = unsafe { libc::poll(&mut pfd, 1, timeout_ms) };
+            if ret < 0 {
+                let err = io::Error::last_os_error();
+                if err.raw_os_error() == Some(libc::EINTR) {
+                    continue;
+                }
+                break;
+            }
+            if ret == 0 {
+                let flushed = response_filter.flush_pending_escape();
+                if !send_frame(&tx_stdin, &flushed) {
+                    break;
+                }
+                continue;
+            }
+            if pfd.revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) != 0 {
+                break;
+            }
+            if pfd.revents & libc::POLLIN == 0 {
+                continue;
+            }
+            let n = unsafe {
+                libc::read(stdin_fd, buf.as_mut_ptr() as *mut _, buf.len())
+            };
+            if n == 0 {
+                break;
+            }
+            if n < 0 {
+                let err = io::Error::last_os_error();
+                match err.raw_os_error() {
+                    Some(libc::EINTR) | Some(libc::EAGAIN) => continue,
+                    _ => break,
+                }
+            }
+            let filtered = response_filter.process(&buf[..n as usize]);
+            if !send_frame(&tx_stdin, &filtered) {
                 break;
             }
         }
@@ -284,5 +650,180 @@ fn main() {
     let _ = writer_handle.join();
     if let Some(h) = sigwinch_handle {
         let _ = h.join();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn filter(input: &[u8]) -> Vec<u8> {
+        let mut f = TerminalResponseFilter::default();
+        f.process(input)
+    }
+
+    #[test]
+    fn passes_plain_user_input() {
+        assert_eq!(filter(b"gk pull\r"), b"gk pull\r");
+    }
+
+    #[test]
+    fn passes_arrow_key_input() {
+        assert_eq!(filter(b"\x1B[A"), b"\x1B[A");
+    }
+
+    #[test]
+    fn translates_ascii_csi_u_ctrl_c_to_etx() {
+        assert_eq!(filter(b"\x1B[99;5u"), b"\x03");
+    }
+
+    #[test]
+    fn translates_korean_ime_csi_u_ctrl_c_to_etx() {
+        // 0x314A / 12618 is "ㅊ", the Korean 2-set jamo on the
+        // physical C key. Ghostty may emit it when Ctrl+C is pressed
+        // while the Korean IME layout is active.
+        assert_eq!(filter(b"\x1B[12618;5u"), b"\x03");
+    }
+
+    #[test]
+    fn translates_reported_korean_ime_csi_u_ctrl_a() {
+        // 0x3141 / 12609 is "ㅁ", the Korean 2-set jamo on physical A.
+        assert_eq!(filter(b"\x1B[12609;5u"), b"\x01");
+    }
+
+    #[test]
+    fn holds_lone_escape_pending_for_followup() {
+        let mut f = TerminalResponseFilter::default();
+        // A lone ESC must NOT be flushed inside `process` — that would
+        // turn a CSI/OSC reply split across read boundaries (ESC, then
+        // `[2;1R` on the next read) into ordinary input. The read loop
+        // arms a poll timeout to flush these via `flush_pending_escape`.
+        assert!(f.process(b"\x1B").is_empty());
+        assert!(f.has_pending_escape());
+        assert_eq!(f.flush_pending_escape(), b"\x1B");
+        assert!(!f.has_pending_escape());
+    }
+
+    #[test]
+    fn flush_pending_escape_is_noop_when_idle() {
+        let mut f = TerminalResponseFilter::default();
+        assert!(f.flush_pending_escape().is_empty());
+        // Mid-CSI must not be flushed by the timeout helper either.
+        let _ = f.process(b"\x1B[");
+        assert!(f.flush_pending_escape().is_empty());
+    }
+
+    #[test]
+    fn drops_osc_11_rgb_response_with_st() {
+        assert!(filter(b"\x1B]11;rgb:f8f8/efef/e7e7\x1B\\").is_empty());
+    }
+
+    #[test]
+    fn drops_osc_10_rgb_response_with_bel() {
+        assert!(filter(b"\x1B]10;rgb:ffff/ffff/ffff\x07").is_empty());
+    }
+
+    #[test]
+    fn keeps_non_color_osc_input() {
+        assert_eq!(filter(b"\x1B]0;title\x07"), b"\x1B]0;title\x07");
+    }
+
+    #[test]
+    fn drops_cursor_position_report() {
+        assert!(filter(b"\x1B[2;1R").is_empty());
+    }
+
+    #[test]
+    fn drops_status_and_device_attribute_responses() {
+        assert!(filter(b"\x1B[0n").is_empty());
+        assert!(filter(b"\x1B[?1;2c").is_empty());
+        assert!(filter(b"\x1B[>1;95;0c").is_empty());
+    }
+
+    #[test]
+    fn drops_focus_in_out_events() {
+        assert!(filter(b"\x1B[I").is_empty());
+        assert!(filter(b"\x1B[O").is_empty());
+    }
+
+    #[test]
+    fn drops_mixed_response_burst_without_touching_user_text() {
+        let mut f = TerminalResponseFilter::default();
+        let out = f.process(b"ok\x1B]11;rgb:f8f8/efef/e7e7\x1B\\\x1B[2;1R\r");
+        assert_eq!(out, b"ok\r");
+    }
+
+    #[test]
+    fn handles_split_osc_response() {
+        let mut f = TerminalResponseFilter::default();
+        assert!(f.process(b"\x1B]11;rgb:f8").is_empty());
+        assert!(f.process(b"f8/efef/e7e7\x1B\\").is_empty());
+    }
+
+    #[test]
+    fn handles_split_cpr_response() {
+        let mut f = TerminalResponseFilter::default();
+        assert!(f.process(b"\x1B[2;").is_empty());
+        assert!(f.process(b"1R").is_empty());
+    }
+
+    /// Regression for the Codex finding: an OSC/CSI reply split as
+    /// `ESC` then `[2;1R` (or `]11;...`) used to slip through because
+    /// `process` flushed the lone ESC at the end of each read,
+    /// resetting state to Ground. The fix holds ESC pending across
+    /// reads so the second chunk completes the sequence and is
+    /// dropped intact.
+    #[test]
+    fn drops_csi_response_split_after_escape() {
+        let mut f = TerminalResponseFilter::default();
+        assert!(f.process(b"\x1B").is_empty());
+        assert!(f.process(b"[2;1R").is_empty());
+    }
+
+    #[test]
+    fn drops_osc_response_split_after_escape() {
+        let mut f = TerminalResponseFilter::default();
+        assert!(f.process(b"\x1B").is_empty());
+        assert!(f
+            .process(b"]11;rgb:f8f8/efef/e7e7\x1B\\")
+            .is_empty());
+    }
+
+    /// Regression for the Codex high finding: OSC 52 clipboard read
+    /// replies (`\x1b]52;c;BASE64\x07`) used to be forwarded as user
+    /// input because the filter only matched OSC 10..19 colours.
+    /// Forwarding leaks the local clipboard to the remote host.
+    #[test]
+    fn drops_osc_52_clipboard_read_reply_with_bel() {
+        assert!(filter(b"\x1B]52;c;SGVsbG8gd29ybGQ=\x07").is_empty());
+    }
+
+    #[test]
+    fn drops_osc_52_clipboard_read_reply_with_st() {
+        assert!(filter(b"\x1B]52;c;SGVsbG8gd29ybGQ=\x1B\\").is_empty());
+    }
+
+    #[test]
+    fn drops_osc_52_split_after_escape() {
+        let mut f = TerminalResponseFilter::default();
+        assert!(f.process(b"\x1B").is_empty());
+        assert!(f.process(b"]52;c;SGVsbG8=\x07").is_empty());
+    }
+
+    #[test]
+    fn drops_osc_4_palette_response() {
+        assert!(filter(b"\x1B]4;5;rgb:8080/8080/8080\x07").is_empty());
+    }
+
+    #[test]
+    fn drops_osc_5522_kitty_extension_response() {
+        assert!(filter(b"\x1B]5522;c;ZGF0YQ==\x07").is_empty());
+    }
+
+    #[test]
+    fn keeps_osc_0_title_set() {
+        // Title set is not a Ghostty-generated reply — user / shell
+        // may legitimately send it. Must continue to pass through.
+        assert_eq!(filter(b"\x1B]0;hello\x07"), b"\x1B]0;hello\x07");
     }
 }

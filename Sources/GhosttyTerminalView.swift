@@ -693,6 +693,9 @@ final class TerminalSurface: Identifiable, ObservableObject {
         // in `$SHELL -l -c '...'` so .profile/.zshrc are always sourced.
         let resolvedCommand: String? = {
             guard let command, !command.isEmpty else { return nil }
+            if additionalEnvironment["TERMMESH_PEER_RELAY_SOCKET"] != nil {
+                return command
+            }
             let loginShellMode = UserDefaults.standard.string(forKey: "shellLoginMode") ?? "login"
             guard loginShellMode == "login" else { return command }
             // Already a login-shell invocation — don't double-wrap.
