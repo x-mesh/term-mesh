@@ -2,6 +2,17 @@
 
 All notable changes to term-mesh are documented here.
 
+## [0.102.6] - 2026-05-09
+
+### Fixed
+- **Ctrl-C now interrupts foreground commands inside a peer relay pane** — pressing Ctrl-C in a remote peer pane (the kind opened from another machine over SSH) was sometimes leaving the foreground process running. The Ghostty key encoder, in some host states, was turning the ETX byte (`0x03`) into keyboard-protocol text that the remote PTY's line discipline never recognised as SIGINT, so `sleep`, `tail -f`, REPLs, etc. kept running until you closed the pane. The relay path now forwards `0x03` raw to the PTY, bypassing the encoder, so Ctrl-C reaches the foreground process the way the local terminal does ([#17](https://github.com/x-mesh/term-mesh/pull/17)).
+- **Peer relay over SSH no longer reports "connection lost" while the connection is actually fine** — when an OpenSSH `ControlMaster` was already running for the same host, the forwarded Unix-socket request would be answered by the master and the spawned `ssh` process would exit immediately. The local socket appeared, so the upper layer thought the tunnel was up, but a few seconds later it would tear down and retry, surfacing as a flapping "reconnecting…" banner. Managed peer tunnels now pass `-S none -o ControlMaster=no -o ControlPersist=no` to opt out of multiplexing, and the tunnel is only marked healthy after the spawned `ssh` process is confirmed alive *after* the local socket appears, so a stale-socket scenario surfaces as a clean spawn failure instead of a phantom reconnect ([#17](https://github.com/x-mesh/term-mesh/pull/17)).
+- **Attaching to an existing peer pane no longer shows a blank terminal until you press a key** — when a second client attached to a surface that had already produced output (a shell prompt, a long-running `tail`, a previous command's result), the new client would see nothing until fresh bytes arrived, because the daemon only broadcast newly-written PTY bytes. The daemon now keeps a 64 KB ring buffer of recent PTY output per surface and replays the snapshot on attach (deduped against live broadcast via byte-sequence numbers), so the new pane shows the current screen state immediately ([#17](https://github.com/x-mesh/term-mesh/pull/17)).
+
+### Thanks to 1 contributor!
+
+- [@JINWOO-J](https://github.com/JINWOO-J)
+
 ## [0.102.5] - 2026-05-09
 
 ### Fixed
