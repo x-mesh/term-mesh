@@ -33,11 +33,21 @@ enum PeerServerMenu {
 final class PeerHostCoordinator: NSObject {
     static let shared = PeerHostCoordinator()
 
+    private enum Lifecycle {
+        case stopped
+        case starting(String)
+        case running(String)
+        case stopping(String?)
+    }
+
     private var server: PeerServer?
     private var socketPath: String?
     private var provider: GhosttyPaneSurfaceProvider?
     private var layoutObserver: NSObjectProtocol?
     private var bonjour: PeerBonjourPublisher?
+    private var lifecycle: Lifecycle = .stopped
+    private var startDialogOpen = false
+    private var infoAlertOpen = false
     /// Per-workspace debounce of `WorkspaceLayoutChanged` broadcasts.
     /// `bonsplit.didChangeGeometry` fires on every intermediate
     /// position during a divider drag (~60Hz); coalescing here keeps
@@ -70,21 +80,12 @@ final class PeerHostCoordinator: NSObject {
     @discardableResult
     func setRunning(_ shouldRun: Bool) async -> Bool {
         if shouldRun {
-            guard server == nil else { return true } // already up
+            guard case .stopped = lifecycle else { return server != nil }
             await bringUp(at: PeerFederationSettings.socketPath, silent: false)
             postStateChange()
             return server != nil
         } else {
-            guard let server else { return true }
-            self.server = nil
-            self.provider = nil
-            socketPath = nil
-            uninstallLayoutChangeBridge()
-            bonjour?.stop()
-            bonjour = nil
-            await server.stop()
-            postStateChange()
-            return true
+            return await tearDown(showStoppedAlert: false)
         }
     }
 
@@ -97,13 +98,29 @@ final class PeerHostCoordinator: NSObject {
     var isRunning: Bool { server != nil }
 
     @objc func startServer(_ sender: Any?) {
-        if let existing = socketPath {
-            let alert = NSAlert()
-            alert.messageText = "Peer server is already running."
-            alert.informativeText = "Listening at \(existing). Stop it first if you want a new path."
-            alert.presentAsSheet()
+        switch lifecycle {
+        case .running(let existing):
+            showInfo(
+                title: "Peer server is already running.",
+                body: "Listening at \(existing). Stop it first if you want a new path."
+            )
             return
+        case .starting(let path):
+            showInfo(
+                title: "Peer server is starting",
+                body: "Already starting at \(path)."
+            )
+            return
+        case .stopping:
+            showInfo(
+                title: "Peer server is stopping",
+                body: "Wait for the current stop operation to finish before starting it again."
+            )
+            return
+        case .stopped:
+            break
         }
+        guard !startDialogOpen else { return }
 
         let alert = NSAlert()
         alert.messageText = "Start peer server"
@@ -114,7 +131,9 @@ final class PeerHostCoordinator: NSObject {
         alert.accessoryView = input
         alert.addButton(withTitle: "Start")
         alert.addButton(withTitle: "Cancel")
-        alert.presentAsSheet { [weak self] response in
+        startDialogOpen = true
+        presentAlert(alert) { [weak self] response in
+            self?.startDialogOpen = false
             guard response == .alertFirstButtonReturn else { return }
             let path = input.stringValue.trimmingCharacters(in: .whitespaces)
             guard !path.isEmpty else { return }
@@ -123,10 +142,34 @@ final class PeerHostCoordinator: NSObject {
     }
 
     @objc func stopServer(_ sender: Any?) {
-        guard let server = self.server else {
+        switch lifecycle {
+        case .starting(let path):
+            showInfo(
+                title: "Peer server is starting",
+                body: "Already starting at \(path). Wait for startup to finish before stopping it."
+            )
+            return
+        case .stopping:
+            return
+        case .stopped:
             showInfo(title: "No server running", body: "Start one first via Start Peer Server…")
             return
+        case .running:
+            break
         }
+        Task { await self.tearDown(showStoppedAlert: true) }
+    }
+
+    @discardableResult
+    private func tearDown(showStoppedAlert: Bool) async -> Bool {
+        guard let server = self.server else {
+            if case .starting = lifecycle {
+                return false
+            }
+            lifecycle = .stopped
+            return true
+        }
+        lifecycle = .stopping(socketPath)
         self.server = nil
         self.provider = nil
         let oldPath = socketPath
@@ -134,19 +177,72 @@ final class PeerHostCoordinator: NSObject {
         uninstallLayoutChangeBridge()
         bonjour?.stop()
         bonjour = nil
-        Task {
-            await server.stop()
-            await MainActor.run {
-                self.postStateChange()
-                self.showInfo(
-                    title: "Peer server stopped",
-                    body: oldPath.map { "Socket \($0) is gone." } ?? "Socket removed."
+        await server.stop()
+        lifecycle = .stopped
+        postStateChange()
+        if showStoppedAlert {
+            showInfo(
+                title: "Peer server stopped",
+                body: oldPath.map { "Socket \($0) is gone." } ?? "Socket removed."
+            )
+        }
+        return true
+    }
+
+    private func canStartServer(at path: String, silent: Bool) -> Bool {
+        switch lifecycle {
+        case .stopped:
+            lifecycle = .starting(path)
+            postStateChange()
+            return true
+        case .running(let existing):
+            if !silent {
+                showInfo(
+                    title: "Peer server is already running.",
+                    body: "Listening at \(existing). Stop it first if you want a new path."
                 )
             }
+            return false
+        case .starting, .stopping:
+            return false
         }
     }
 
+    private func markStartFailed() {
+        server = nil
+        provider = nil
+        socketPath = nil
+        uninstallLayoutChangeBridge()
+        bonjour?.stop()
+        bonjour = nil
+        lifecycle = .stopped
+        postStateChange()
+    }
+
+    private func markStartSucceeded(server: PeerServer,
+                                    path: String,
+                                    provider: GhosttyPaneSurfaceProvider) {
+        self.server = server
+        self.socketPath = path
+        self.provider = provider
+        lifecycle = .running(path)
+        installLayoutChangeBridge(server: server, provider: provider)
+        // LAN discovery: advertise via Bonjour so other macs on
+        // the same network can pick this host out of a list
+        // instead of typing an SSH alias by hand. The TXT record
+        // carries the socket path; the actual data path remains
+        // SSH (clients connect with `ssh -L`).
+        let publisher = PeerBonjourPublisher(
+            serviceName: PeerFederationSettings.displayName,
+            socketPath: path
+        )
+        publisher.start()
+        self.bonjour = publisher
+        postStateChange()
+    }
+
     private func bringUp(at path: String, silent: Bool = false) async {
+        guard canStartServer(at: path, silent: silent) else { return }
         let provider = GhosttyPaneSurfaceProvider()
 
         var config = PeerServerConfig()
@@ -156,23 +252,8 @@ final class PeerHostCoordinator: NSObject {
         let server = PeerServer(socketPath: path, provider: provider, config: config)
         do {
             try await server.start()
-            self.server = server
-            self.socketPath = path
-            self.provider = provider
-            installLayoutChangeBridge(server: server, provider: provider)
-            // LAN discovery: advertise via Bonjour so other macs on
-            // the same network can pick this host out of a list
-            // instead of typing an SSH alias by hand. The TXT record
-            // carries the socket path; the actual data path remains
-            // SSH (clients connect with `ssh -L`).
-            let publisher = PeerBonjourPublisher(
-                serviceName: PeerFederationSettings.displayName,
-                socketPath: path
-            )
-            publisher.start()
-            self.bonjour = publisher
+            markStartSucceeded(server: server, path: path, provider: provider)
             NSLog("[peer-debug] server listening on %@", path)
-            postStateChange()
             if !silent {
                 showInfo(
                     title: "Peer server listening",
@@ -186,6 +267,7 @@ final class PeerHostCoordinator: NSObject {
                 )
             }
         } catch {
+            markStartFailed()
             NSLog("[peer-debug] server failed to start at %@: %@", path, String(describing: error))
             if !silent {
                 showInfo(
@@ -259,13 +341,27 @@ final class PeerHostCoordinator: NSObject {
         layoutBroadcastDebounce.removeAll()
     }
 
+    private func presentAlert(_ alert: NSAlert,
+                              completion: ((NSApplication.ModalResponse) -> Void)? = nil) {
+        let targetWindow = NSApp.keyWindow ?? NSApp.mainWindow
+        guard targetWindow?.attachedSheet == nil else {
+            completion?(.abort)
+            return
+        }
+        alert.presentAsSheet(for: targetWindow, completion: completion)
+    }
+
     private func showInfo(title: String, body: String) {
         let alert = NSAlert()
         alert.messageText = title
         alert.informativeText = body
         alert.alertStyle = .informational
         alert.addButton(withTitle: "OK")
-        alert.presentAsSheet()
+        guard !infoAlertOpen else { return }
+        infoAlertOpen = true
+        presentAlert(alert) { [weak self] _ in
+            self?.infoAlertOpen = false
+        }
     }
 }
 

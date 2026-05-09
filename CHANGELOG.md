@@ -2,6 +2,16 @@
 
 All notable changes to term-mesh are documented here.
 
+## [0.102.7] - 2026-05-09
+
+### Fixed
+- **Peer host menu no longer stacks duplicate "Start Peer Server…" sheets when clicked twice** — clicking Start (or hitting the hotkey) while the start sheet was already up could either present a second sheet underneath the first or silently drop the action. The menu actions now track whether a sheet is up and bail out cleanly instead of stacking, and any "info" alert (already running / starting / stopping / no server) is also de-duplicated.
+- **Stopping the peer server while it was still finishing startup no longer leaves the coordinator in a wedged state** — race between menu Stop and the in-flight `bringUp` could leave `server` as `nil` while the bonjour publisher and layout bridge stayed installed. The coordinator is now driven by an explicit `.stopped/.starting/.running/.stopping` lifecycle so every transition cleans up the same way and a stop in the middle of starting just no-ops with a sheet asking the user to wait.
+
+### Thanks to 1 contributor!
+
+- [@JINWOO-J](https://github.com/JINWOO-J)
+
 ## [0.102.6] - 2026-05-09
 
 ### Fixed
