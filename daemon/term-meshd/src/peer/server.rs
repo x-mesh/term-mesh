@@ -460,6 +460,130 @@ mod integration_tests {
         let _ = tokio::time::timeout(std::time::Duration::from_secs(3), server_task).await;
     }
 
+    #[tokio::test]
+    async fn attach_replays_pre_attach_output() {
+        let tmp = TempDir::new().unwrap();
+        let sock_path = tmp.path().join("peer.sock");
+
+        const MARKER: &[u8] = b"PREATTACH-PROMPT";
+        let manager = Arc::new(PtyManager::new());
+        let surface = PtySurface::spawn(
+            surface_id_from_name("preattach"),
+            "preattach".into(),
+            "/bin/sh",
+            &["-c", "printf PREATTACH-PROMPT; sleep 5"],
+            80,
+            24,
+            None,
+        )
+        .expect("spawn preattach surface");
+
+        for _ in 0..50 {
+            let replay = surface.replay_snapshot();
+            if replay
+                .iter()
+                .flat_map(|chunk| chunk.bytes.iter().copied())
+                .collect::<Vec<_>>()
+                .windows(MARKER.len())
+                .any(|w| w == MARKER)
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        manager.insert_surface(surface);
+
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let sp_task = sock_path.clone();
+        let server_task = tokio::spawn(async move {
+            serve_with_manager(sp_task, shutdown_rx, manager)
+                .await
+                .unwrap();
+        });
+
+        for _ in 0..50 {
+            if sock_path.exists() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+
+        let (mut reader, writer, _surface_id) = attach_one(&sock_path, "replay-test").await;
+        let seen = wait_for_marker(&mut reader, MARKER, std::time::Duration::from_secs(3)).await;
+        assert!(seen, "pre-attach PTY output was not replayed to the relay");
+
+        drop(reader);
+        drop(writer);
+        shutdown_tx.send(true).unwrap();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(3), server_task).await;
+    }
+
+    #[tokio::test]
+    async fn ctrl_c_input_reaches_attached_pty() {
+        let tmp = TempDir::new().unwrap();
+        let sock_path = tmp.path().join("peer.sock");
+
+        let manager = Arc::new(PtyManager::new());
+        let surface = PtySurface::spawn(
+            surface_id_from_name("sigint"),
+            "sigint".into(),
+            "/bin/sh",
+            &[
+                "-c",
+                "trap 'printf GOT-SIGINT; exit 0' INT; while :; do sleep 10; done",
+            ],
+            80,
+            24,
+            None,
+        )
+        .expect("spawn sigint surface");
+        manager.insert_surface(surface);
+
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let sp_task = sock_path.clone();
+        let server_task = tokio::spawn(async move {
+            serve_with_manager(sp_task, shutdown_rx, manager)
+                .await
+                .unwrap();
+        });
+
+        for _ in 0..50 {
+            if sock_path.exists() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+
+        let (mut reader, mut writer, surface_id) = attach_one(&sock_path, "sigint-test").await;
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        write_envelope(
+            &mut writer,
+            &Envelope {
+                seq: 5,
+                correlation_id: 0,
+                payload: Some(Payload::Input(Input {
+                    surface_id,
+                    kind: Some(peer_proto::v1::input::Kind::Keys(vec![0x03])),
+                })),
+            },
+        )
+        .await
+        .unwrap();
+
+        let seen = wait_for_marker(
+            &mut reader,
+            b"GOT-SIGINT",
+            std::time::Duration::from_secs(3),
+        )
+        .await;
+        assert!(seen, "Ctrl-C byte did not interrupt the attached PTY");
+
+        drop(reader);
+        drop(writer);
+        shutdown_tx.send(true).unwrap();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(3), server_task).await;
+    }
+
     /// Drive the full handshake + attach path for one client against
     /// `sock_path`, returning the split stream halves and the chosen
     /// surface_id. Used by the multi-client test below.
@@ -953,7 +1077,7 @@ mod integration_tests {
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
 
-        let (mut reader, mut writer, surface_id) = attach_one(&sock_path, "meta-client").await;
+        let (mut reader, writer, surface_id) = attach_one(&sock_path, "meta-client").await;
         assert_eq!(surface_id, sid);
 
         // The next envelope after AttachResult should be the pushed

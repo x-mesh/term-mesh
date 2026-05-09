@@ -344,6 +344,29 @@ fn spawn_attach_relay(
 
     let task = tokio::spawn(async move {
         let mut attach_seq = 0u64;
+        let replay = surface_for_task.replay_snapshot();
+        let live_min_seq = replay
+            .last()
+            .map(|chunk| chunk.seq + chunk.bytes.len() as u64)
+            .unwrap_or(0);
+
+        for chunk in replay {
+            let len = chunk.bytes.len() as u64;
+            let env = Envelope {
+                seq: seq_counter.fetch_add(1, Ordering::Relaxed) + 1,
+                correlation_id: 0,
+                payload: Some(Payload::PtyData(PtyData {
+                    surface_id: surface_for_task.surface_id.clone(),
+                    byte_seq: attach_seq,
+                    payload: chunk.bytes,
+                })),
+            };
+            attach_seq += len;
+            if outgoing_tx.send(env).await.is_err() {
+                return;
+            }
+        }
+
         loop {
             tokio::select! {
                 biased;
@@ -354,15 +377,18 @@ fn spawn_attach_relay(
                 }
                 res = subscriber.recv() => {
                     match res {
-                        Ok(bytes) => {
-                            let len = bytes.len() as u64;
+                        Ok(chunk) => {
+                            if chunk.seq < live_min_seq {
+                                continue;
+                            }
+                            let len = chunk.bytes.len() as u64;
                             let env = Envelope {
                                 seq: seq_counter.fetch_add(1, Ordering::Relaxed) + 1,
                                 correlation_id: 0,
                                 payload: Some(Payload::PtyData(PtyData {
                                     surface_id: surface_for_task.surface_id.clone(),
                                     byte_seq: attach_seq,
-                                    payload: bytes,
+                                    payload: chunk.bytes,
                                 })),
                             };
                             attach_seq += len;

@@ -197,6 +197,16 @@ final class PeerSSHTunnel: @unchecked Sendable {
         proc.executableURL = URL(fileURLWithPath: "/usr/bin/ssh")
         proc.arguments = [
             "-N", "-T",
+            // Managed relay tunnels must be owned by this subprocess.
+            // If the user's ssh_config has ControlMaster/ControlPath
+            // enabled, ssh can hand the forward to an existing master
+            // connection and exit immediately; the forward may work,
+            // but our Process lifetime then looks "down" and the UI
+            // shows a false reconnect banner. `-S none` disables
+            // multiplexing for this invocation.
+            "-S", "none",
+            "-o", "ControlMaster=no",
+            "-o", "ControlPersist=no",
             "-o", "LogLevel=ERROR",
             "-o", "ExitOnForwardFailure=yes",
             "-o", "ServerAliveInterval=15",
@@ -266,6 +276,14 @@ final class PeerSSHTunnel: @unchecked Sendable {
                 )
             }
             try await Task.sleep(nanoseconds: 150_000_000)
+        }
+
+        if !proc.isRunning {
+            let stderrData = errPipe.fileHandleForReading.availableData
+            let detail = String(data: stderrData, encoding: .utf8) ?? "(no stderr)"
+            throw PeerSSHTunnelError.spawnFailed(
+                "ssh exited after creating \(localSockPath); stderr: \(detail.trimmingCharacters(in: .whitespacesAndNewlines))"
+            )
         }
     }
 
