@@ -24,7 +24,14 @@ APP_VERSION   := $(shell grep 'MARKETING_VERSION' GhosttyTabs.xcodeproj/project.
 DMG_NAME      := term-mesh-macos-$(APP_VERSION).dmg
 PROJECT_DIR   := $(shell pwd)
 
-.PHONY: build prod deploy deploy-prod dmg run stop clean daemon test install-commands sentry-upload-dsym
+# Single source of truth for daemon binaries shipped inside the app
+# bundle's Contents/Resources/bin. Adding a new Rust workspace member
+# that needs to ship with the app? Append it here — every install/dmg
+# target picks it up automatically. `verify-daemon-binaries` enforces
+# that each one was actually built before any packaging step runs.
+DAEMON_BINS   := term-meshd term-mesh-run tm-agent term-mesh-peer-relay
+
+.PHONY: build prod deploy deploy-prod dmg run stop clean daemon test install-commands sentry-upload-dsym verify-daemon-binaries
 
 build:
 	@echo "==> Generating BuildInfo.swift..."
@@ -83,12 +90,17 @@ deploy: build
 	@echo "==> Deploying to $(INSTALL_APP)..."
 	@rm -rf "$(INSTALL_APP)"
 	@cp -R "$(SRC_APP)" "$(INSTALL_APP)"
-	@# Copy Rust binaries into app bundle (term-mesh-run = PTY wrapper, term-meshd = daemon)
-	@# Note: term-mesh (Swift CLI, socket controller) is already in the bundle from Xcode "Copy CLI" phase
+	@# Copy Rust binaries into app bundle. Set defined by DAEMON_BINS:
+	@#   term-meshd          = peer/local daemon
+	@#   term-mesh-run       = PTY wrapper
+	@#   tm-agent            = team agent CLI
+	@#   term-mesh-peer-relay= Ghostty PTY shim used by PeerRelaySession
+	@# `term-mesh` (Swift CLI) is already bundled from the Xcode "Copy CLI" phase.
+	@$(MAKE) verify-daemon-binaries
 	@mkdir -p "$(INSTALL_APP)/Contents/Resources/bin"
-	@cp "$(PROJECT_DIR)/daemon/target/release/term-meshd" "$(INSTALL_APP)/Contents/Resources/bin/term-meshd"
-	@cp "$(PROJECT_DIR)/daemon/target/release/term-mesh-run" "$(INSTALL_APP)/Contents/Resources/bin/term-mesh-run"
-	@-cp "$(PROJECT_DIR)/daemon/target/release/tm-agent" "$(INSTALL_APP)/Contents/Resources/bin/tm-agent" 2>/dev/null || true
+	@for b in $(DAEMON_BINS); do \
+		cp "$(PROJECT_DIR)/daemon/target/release/$$b" "$(INSTALL_APP)/Contents/Resources/bin/$$b" || exit 1; \
+	done
 	@echo "==> Re-signing app bundle (binaries added after initial sign)..."
 	@codesign --force --deep --sign - "$(INSTALL_APP)"
 	@# Update symlinks (term-mesh = Swift CLI from app bundle, term-mesh-run = Rust PTY wrapper)
@@ -163,10 +175,11 @@ deploy-prod: daemon prod
 	@echo "==> Deploying Release to $(INSTALL_APP)..."
 	@rm -rf "$(INSTALL_APP)"
 	@cp -R "$(PROD_APP)" "$(INSTALL_APP)"
+	@$(MAKE) verify-daemon-binaries
 	@mkdir -p "$(INSTALL_APP)/Contents/Resources/bin"
-	@cp "$(PROJECT_DIR)/daemon/target/release/term-meshd" "$(INSTALL_APP)/Contents/Resources/bin/term-meshd"
-	@cp "$(PROJECT_DIR)/daemon/target/release/term-mesh-run" "$(INSTALL_APP)/Contents/Resources/bin/term-mesh-run"
-	@-cp "$(PROJECT_DIR)/daemon/target/release/tm-agent" "$(INSTALL_APP)/Contents/Resources/bin/tm-agent" 2>/dev/null || true
+	@for b in $(DAEMON_BINS); do \
+		cp "$(PROJECT_DIR)/daemon/target/release/$$b" "$(INSTALL_APP)/Contents/Resources/bin/$$b" || exit 1; \
+	done
 	@echo "==> Re-signing app bundle (binaries added after initial sign)..."
 	@codesign --force --deep --sign - "$(INSTALL_APP)"
 	@mkdir -p "$(HOME)/.local/bin"
@@ -207,14 +220,17 @@ sentry-upload-dsym:
 	sentry-cli debug-files upload --include-sources $$ARGS || \
 		echo "==> dSYM upload failed (non-fatal)"
 
+verify-daemon-binaries:
+	@for b in $(DAEMON_BINS); do \
+		if [ ! -f "$(PROJECT_DIR)/daemon/target/release/$$b" ]; then \
+			echo "ERROR: $$b not found at daemon/target/release/$$b"; \
+			echo "       Run 'cd daemon && cargo build --release' first."; \
+			exit 1; \
+		fi; \
+	done
+
 dmg: prod
-	@echo "==> Verifying daemon binaries..."
-	@test -f "$(PROJECT_DIR)/daemon/target/release/term-meshd" || \
-		(echo "ERROR: term-meshd not found. Run 'cd daemon && cargo build --release' first." && exit 1)
-	@test -f "$(PROJECT_DIR)/daemon/target/release/term-mesh-run" || \
-		(echo "ERROR: term-mesh-run not found. Run 'cd daemon && cargo build --release' first." && exit 1)
-	@test -f "$(PROJECT_DIR)/daemon/target/release/tm-agent" || \
-		(echo "ERROR: tm-agent not found. Run 'cd daemon && cargo build --release' first." && exit 1)
+	@$(MAKE) verify-daemon-binaries
 	@echo "==> Creating DMG (version $(APP_VERSION))..."
 	@# Ensure no stale mount from a previous run blocks create-dmg's detach step
 	@-hdiutil detach "/Volumes/term-mesh" -force >/dev/null 2>&1 || true
@@ -223,13 +239,14 @@ dmg: prod
 		STAGING=$$(mktemp -d) && \
 		cp -R "$(PROD_APP)" "$$STAGING/term-mesh.app" && \
 		mkdir -p "$$STAGING/term-mesh.app/Contents/Resources/bin" && \
-		cp "$(PROJECT_DIR)/daemon/target/release/term-meshd" "$$STAGING/term-mesh.app/Contents/Resources/bin/term-meshd" && \
-		cp "$(PROJECT_DIR)/daemon/target/release/term-mesh-run" "$$STAGING/term-mesh.app/Contents/Resources/bin/term-mesh-run" && \
-		cp "$(PROJECT_DIR)/daemon/target/release/tm-agent" "$$STAGING/term-mesh.app/Contents/Resources/bin/tm-agent" && \
+		for b in $(DAEMON_BINS); do \
+			cp "$(PROJECT_DIR)/daemon/target/release/$$b" "$$STAGING/term-mesh.app/Contents/Resources/bin/$$b" || exit 1; \
+		done && \
 		echo "==> Re-signing app bundle for DMG..." && \
 		codesign --force --deep --sign - "$$STAGING/term-mesh.app" && \
 		echo "==> Bundled binaries:" && \
 		ls -la "$$STAGING/term-mesh.app/Contents/Resources/bin/" && \
+		"$(PROJECT_DIR)/scripts/check-bundle-binaries.sh" "$$STAGING/term-mesh.app" && \
 		create-dmg \
 			--volname "term-mesh" \
 			--window-pos 200 120 \
@@ -245,13 +262,14 @@ dmg: prod
 		STAGING=$$(mktemp -d) && \
 		cp -R "$(PROD_APP)" "$$STAGING/term-mesh.app" && \
 		mkdir -p "$$STAGING/term-mesh.app/Contents/Resources/bin" && \
-		cp "$(PROJECT_DIR)/daemon/target/release/term-meshd" "$$STAGING/term-mesh.app/Contents/Resources/bin/term-meshd" && \
-		cp "$(PROJECT_DIR)/daemon/target/release/term-mesh-run" "$$STAGING/term-mesh.app/Contents/Resources/bin/term-mesh-run" && \
-		cp "$(PROJECT_DIR)/daemon/target/release/tm-agent" "$$STAGING/term-mesh.app/Contents/Resources/bin/tm-agent" && \
+		for b in $(DAEMON_BINS); do \
+			cp "$(PROJECT_DIR)/daemon/target/release/$$b" "$$STAGING/term-mesh.app/Contents/Resources/bin/$$b" || exit 1; \
+		done && \
 		echo "==> Re-signing app bundle for DMG..." && \
 		codesign --force --deep --sign - "$$STAGING/term-mesh.app" && \
 		echo "==> Bundled binaries:" && \
 		ls -la "$$STAGING/term-mesh.app/Contents/Resources/bin/" && \
+		"$(PROJECT_DIR)/scripts/check-bundle-binaries.sh" "$$STAGING/term-mesh.app" && \
 		ln -s /Applications "$$STAGING/Applications" && \
 		hdiutil create -volname "term-mesh" -srcfolder "$$STAGING" -ov -format UDZO "$(DMG_NAME)"; \
 		rm -rf "$$STAGING"; \
