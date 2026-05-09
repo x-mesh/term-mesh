@@ -89,21 +89,32 @@ final class PeerClientCoordinator: NSObject {
     /// forwarded socket out from under the relay sessions.
     private var sshTunnels: [ObjectIdentifier: PeerSSHTunnel] = [:]
 
-    /// Snapshot of every active workspace relay for the Connections
-    /// panel. Returned in open-order. Now exposes a value type rather
-    /// than the controller itself so external observers don't grow a
-    /// dependency on AppKit window-controller internals.
-    func activeWorkspaceConnections() -> [PeerRelayConnectionInfo] {
-        return openWorkspaceRelays.map { $0.connectionInfo }
+    /// Snapshot of every active peer connection for the Connections
+    /// panel. Returned in open-order. Exposes value types rather than
+    /// controllers so external observers don't grow a dependency on
+    /// AppKit window-controller internals.
+    func activeConnections() -> [PeerRelayConnectionInfo] {
+        return (openConsoles.map { $0.connectionInfo }
+            + openRelays.map { $0.connectionInfo }
+            + openWorkspaceRelays.map { $0.connectionInfo })
+            .sorted { $0.connectedAt < $1.connectedAt }
     }
 
     /// Disconnect (close) the relay window matching `id`. No-op when
     /// the controller has already been released or removed from the
     /// roster — safer than indexing by row position.
     func disconnect(id: ObjectIdentifier) {
-        guard let ctrl = openWorkspaceRelays.first(where: { ObjectIdentifier($0) == id })
-        else { return }
-        ctrl.window?.performClose(nil)
+        if let ctrl = openWorkspaceRelays.first(where: { ObjectIdentifier($0) == id }) {
+            ctrl.window?.performClose(nil)
+            return
+        }
+        if let ctrl = openRelays.first(where: { ObjectIdentifier($0) == id }) {
+            ctrl.window?.performClose(nil)
+            return
+        }
+        if let ctrl = openConsoles.first(where: { ObjectIdentifier($0) == id }) {
+            ctrl.window?.performClose(nil)
+        }
     }
 
     fileprivate func postRelaysChanged() {
@@ -313,7 +324,8 @@ final class PeerClientCoordinator: NSObject {
         await MainActor.run {
             let controller = PeerRelayWorkspaceWindowController(
                 hostSockPath: hostSockPath,
-                workspace: chosen
+                workspace: chosen,
+                hostDisplayName: probe.hostDisplayName
             )
             self.openWorkspaceRelays.append(controller)
             if let tunnel {
@@ -408,7 +420,8 @@ final class PeerClientCoordinator: NSObject {
             await MainActor.run {
                 let controller = PeerRelayWorkspaceWindowController(
                     hostSockPath: path,
-                    workspace: chosen
+                    workspace: chosen,
+                    hostDisplayName: probe.hostDisplayName
                 )
                 self.openWorkspaceRelays.append(controller)
                 controller.onClose = { [weak self, weak controller] in
@@ -527,13 +540,18 @@ final class PeerClientCoordinator: NSObject {
                 let session = try await PeerRelaySession.attach(connection, surface: chosen)
                 try session.prepareListener()
                 await MainActor.run {
-                    let controller = PeerRelayWindowController(session: session)
+                    let controller = PeerRelayWindowController(
+                        session: session,
+                        surfaceTitle: chosen.title
+                    )
                     self.openRelays.append(controller)
                     controller.onClose = { [weak self, weak controller] in
                         guard let self, let controller else { return }
                         self.openRelays.removeAll { $0 === controller }
+                        self.postRelaysChanged()
                     }
                     controller.show()
+                    self.postRelaysChanged()
                 }
             } catch {
                 await connection.cancel()
@@ -627,6 +645,7 @@ final class PeerClientCoordinator: NSObject {
             )
 
             let controller = PeerConsoleWindowController(
+                hostSockPath: socketPath,
                 hostName: info.hostDisplayName,
                 surfaceTitle: chosen.title,
                 surfaceID: outcome.surfaceID,
@@ -634,11 +653,13 @@ final class PeerClientCoordinator: NSObject {
                 transport: transport
             )
             openConsoles.append(controller)
-            controller.onClose = { [weak self] in
-                guard let self else { return }
+            controller.onClose = { [weak self, weak controller] in
+                guard let self, let controller else { return }
                 self.openConsoles.removeAll { $0 === controller }
+                self.postRelaysChanged()
             }
             controller.show()
+            self.postRelaysChanged()
         } catch {
             showAlert(title: "Peer connection failed", body: String(describing: error))
         }
@@ -704,23 +725,43 @@ final class PeerClientCoordinator: NSObject {
 
 @MainActor
 final class PeerConsoleWindowController: NSWindowController, NSWindowDelegate {
+    private let hostSockPath: String
+    private let hostName: String
+    private let surfaceTitle: String
     private let surfaceID: Data
     private let session: PeerSession
     private let transport: UnixSocketTransport
     private let outputView: NSTextView
     private let inputField: NSTextField
+    private let connectedAt = Date()
     private var readerTask: Task<Void, Never>?
     private var isClosing = false
 
     var onClose: (@MainActor () -> Void)?
 
+    var connectionInfo: PeerRelayConnectionInfo {
+        PeerRelayConnectionInfo(
+            id: ObjectIdentifier(self),
+            kind: .console,
+            hostSockPath: hostSockPath,
+            hostDisplayName: hostName,
+            sshTarget: nil,
+            targetTitle: surfaceTitle.isEmpty ? "<surface>" : surfaceTitle,
+            connectedAt: connectedAt
+        )
+    }
+
     init(
+        hostSockPath: String,
         hostName: String,
         surfaceTitle: String,
         surfaceID: Data,
         session: PeerSession,
         transport: UnixSocketTransport
     ) {
+        self.hostSockPath = hostSockPath
+        self.hostName = hostName
+        self.surfaceTitle = surfaceTitle
         self.surfaceID = surfaceID
         self.session = session
         self.transport = transport
@@ -758,6 +799,7 @@ final class PeerConsoleWindowController: NSWindowController, NSWindowDelegate {
         )
         window.title = "\(hostName) · \(surfaceTitle)  [peer-debug]"
         window.contentView = root
+        window.installPeerTitlebarGradientAccent()
         window.center()
 
         super.init(window: window)
@@ -770,6 +812,7 @@ final class PeerConsoleWindowController: NSWindowController, NSWindowDelegate {
     required init?(coder: NSCoder) { fatalError("init(coder:) not used") }
 
     func show() {
+        window?.installPeerTitlebarGradientAccent()
         window?.makeKeyAndOrderFront(nil)
         inputField.window?.makeFirstResponder(inputField)
         startReader()

@@ -2,6 +2,21 @@
 
 All notable changes to term-mesh are documented here.
 
+## [0.103.2] - 2026-05-10
+
+### Fixed
+- **Codex (and other Kitty-keyboard TUIs) no longer receive ghost double-fire keystrokes through the peer relay** — when the local relay terminal had Kitty's keyboard protocol enabled in "report all events" mode, every key press was followed by a release event encoded as `CSI <key>;<mods>:3 <final>` (e.g. `\x1B[97;1:3u` for `a` release, `\x1B[1;1:3B` for ↓ release). The relay's filter only understood event-type-1 (press) and was forwarding the release events as a second keystroke, so menu selections in `codex` jumped two rows per keypress, Esc closed dialogs twice, and Ctrl-C arrived as `^C` plus a literal `[27;1:3u`. The relay now parses the `:event_type` field on both `CSI ... u` and Kitty special-key sequences (arrows, Page/Home/End, function keys) and drops release events while still translating presses and auto-repeats correctly.
+- **Kitty keyboard protocol state reports stop polluting the host shell** — when a remote TUI queried the local relay terminal's keyboard mode with `CSI ? u`, Ghostty answered with `\x1B[?7u` (or similar) and the relay forwarded the answer back to the remote shell as typed input, so users saw stray `[?7u` literals appear in their `codex` prompt or the host's zsh after closing a TUI. The filter now classifies the `CSI ? <flags> u` response as terminal-generated and drops it, including when the response is split across two reads (`\x1B` then `[?7u`).
+- **Connections panel now lists every active peer connection, not just workspace windows** — opening a peer console (debug socket) or a single-pane peer attach left the Connections panel empty even though the connection was live, so there was no UI affordance to disconnect it without closing the window manually. The panel now shows Console, Pane, and Workspace connections in one open-order list and the "Disconnect" button works for all three.
+
+### Changed
+- **Peer windows have a coloured titlebar accent** — peer relay panes, workspace windows, and the debug console now render a pink-to-blue gradient strip across the titlebar so they're visually distinct from local Ghostty windows at a glance. The accent reinstalls itself on `show()` so it survives window-merge / fullscreen transitions.
+- **Connections panel grew a "Type" column and a wider Host column** — host display now prefixes SSH targets with `SSH ·` and falls back to the peer's advertised display name before the raw socket path, so it's easier to tell apart multiple peers at a glance. Window default width is 660 pt to fit the new layout.
+
+### Thanks to 1 contributor!
+
+- [@JINWOO-J](https://github.com/JINWOO-J)
+
 ## [0.103.1] - 2026-05-09
 
 ### Fixed
