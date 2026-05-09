@@ -330,7 +330,12 @@ fn translate_terminal_csi_input(seq: &[u8]) -> Option<Vec<u8>> {
     let body = &seq[2..seq.len() - 1];
     let mut parts = body.split(|b| *b == b';');
     let codepoint = parse_ascii_u32(parts.next()?)?;
-    let modifiers = parse_ascii_u32(parts.next()?)?;
+    let modifiers = parts.next().map(parse_ascii_u32).unwrap_or(Some(1))?;
+    if modifiers == 1 {
+        if let Some(byte) = csi_u_control_key_byte(codepoint) {
+            return Some(vec![byte]);
+        }
+    }
     // Kitty keyboard protocol uses 1-based modifier flags. Ctrl is bit 2
     // after subtracting 1, so Ctrl-only is ";5".
     if modifiers == 0 || ((modifiers - 1) & 0b100) == 0 {
@@ -338,6 +343,16 @@ fn translate_terminal_csi_input(seq: &[u8]) -> Option<Vec<u8>> {
     }
     let letter = ctrl_letter_from_codepoint(codepoint)?;
     Some(vec![ctrl_byte_for_ascii_letter(letter)])
+}
+
+fn csi_u_control_key_byte(codepoint: u32) -> Option<u8> {
+    match codepoint {
+        9 => Some(b'\t'),  // Tab
+        13 => Some(b'\r'), // Enter
+        27 => Some(0x1B),  // Escape
+        127 => Some(0x7F), // Backspace / Delete
+        _ => None,
+    }
 }
 
 fn parse_ascii_u32(bytes: &[u8]) -> Option<u32> {
@@ -675,6 +690,19 @@ mod tests {
     #[test]
     fn translates_ascii_csi_u_ctrl_c_to_etx() {
         assert_eq!(filter(b"\x1B[99;5u"), b"\x03");
+    }
+
+    #[test]
+    fn translates_csi_u_escape_to_escape() {
+        assert_eq!(filter(b"\x1B[27u"), b"\x1B");
+        assert_eq!(filter(b"\x1B[27;1u"), b"\x1B");
+    }
+
+    #[test]
+    fn translates_csi_u_basic_control_keys() {
+        assert_eq!(filter(b"\x1B[9u"), b"\t");
+        assert_eq!(filter(b"\x1B[13u"), b"\r");
+        assert_eq!(filter(b"\x1B[127u"), b"\x7f");
     }
 
     #[test]

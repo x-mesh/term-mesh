@@ -604,18 +604,6 @@ private func sendPeerInputBytes(_ surface: ghostty_surface_t, bytes: Data) {
             continue
         }
 
-        if byte == 0x03 {
-            // ETX is the terminal line discipline's SIGINT byte. In a
-            // relay, the local terminal has already encoded the user's
-            // Ctrl+C into this byte, so send it raw instead of re-running
-            // it through Ghostty's key encoder. Re-encoding can turn it
-            // into keyboard-protocol text in some host states, which leaves
-            // the foreground process running.
-            sendPeerRawByte(surface, byte)
-            i += 1
-            continue
-        }
-
         if let kc = peerCtrlLetterKeycode(byte) {
             sendPeerCtrlLetterKey(surface, keycode: kc, byte: byte)
             i += 1
@@ -656,16 +644,6 @@ private func sendPeerInputBytes(_ surface: ghostty_surface_t, bytes: Data) {
             // earlier branches would have matched. Avoid an infinite
             // loop on a degenerate byte by advancing one position.
             i += 1
-        }
-    }
-}
-
-@MainActor
-private func sendPeerRawByte(_ surface: ghostty_surface_t, _ byte: UInt8) {
-    var raw = byte
-    withUnsafePointer(to: &raw) { ptr in
-        ptr.withMemoryRebound(to: CChar.self, capacity: 1) { cptr in
-            ghostty_surface_text(surface, cptr, 1)
         }
     }
 }
