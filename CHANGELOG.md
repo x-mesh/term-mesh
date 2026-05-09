@@ -2,6 +2,24 @@
 
 All notable changes to term-mesh are documented here.
 
+## [0.103.0] - 2026-05-09
+
+### Fixed
+- **TUIs in peer relay panes no longer leak terminal-control responses to the remote shell** — `gk`, `vim`, `less`, etc. probe the terminal at startup with OSC/CSI queries (background colour, cursor position, device attributes). The local Ghostty answered those queries per spec, but the relay was forwarding the answers as user keystrokes — they arrived at the remote shell *after* the originating program had already exited and zsh treated them as commands (`zsh: command not found: 11`, `no such file or directory: rgb:0d0d/1111/17177`). The relay now runs a stateful filter on its stdin that drops OSC 4/10–19 (colour reports), OSC 52/5522 (clipboard reads), CSI cursor-position / status / device-attribute / focus replies, and translates Kitty CSI-u Ctrl-letter sequences (including Korean IME jamo) to the proper control byte before forwarding to the host.
+- **OSC 52 clipboard contents no longer leak to peer hosts** — a malicious or compromised peer host could emit `OSC 52 ; c ; ?` to query the local terminal's clipboard; Ghostty would answer with the BASE64 contents, which the previous filter happily forwarded as typed input. The relay now drops every OSC 52 reply unconditionally.
+- **Terminal replies split across read boundaries no longer slip through the relay filter** — when stdin returned `\x1B` and `[2;1R` in two separate reads (normal under PTY chunking), the filter used to flush the lone ESC and forward the rest as ordinary input. The state machine now holds pending escapes across reads, with a 100 ms `poll(2)` timeout so a user-typed Escape with no follow-up still reaches the host promptly.
+- **Focus-tracking events stop polluting the host shell** — when a remote full-screen app turned on focus tracking, the local terminal's `\x1B[I` / `\x1B[O` events were forwarded as `[I` / `[O` literals into the remote prompt. The relay now classifies these as terminal-generated and drops them.
+- **Korean Ctrl-key presses reach the remote shell as the right control byte** — when the Korean 2-set IME was active, Ctrl-C / Ctrl-A / etc. arrived at the relay as Kitty CSI-u sequences with Hangul jamo codepoints (`\x1B[12618;5u` for ㅊ on the C key) and were passed through unchanged; the remote shell saw the raw escape instead of `^C`. The relay now translates these to the QWERTY-equivalent control byte before forwarding.
+- **Peer relay panes keep host-window keyboard focus** — peer focus pushes from the host used to steal the user's keyboard focus into the relay window even when they were typing in another app. The provider now updates the visual focus indicator without calling `makeFirstResponder`.
+- **Pane focus follows the click in workspace relay windows** — clicking a pane in a multi-pane relay used to keep focus on whichever pane was last attached. The workspace controller now hit-tests the click against the actual pane geometry and restores focus after layout swaps.
+
+### Changed
+- **Peer host menu prefills the connect dialog with the current socket path** — if you've changed the daemon socket path away from the default, the connect / configure dialogs now start from the value already in use instead of always showing the default. Custom socket paths persist across app launches.
+
+### Thanks to 1 contributor!
+
+- [@JINWOO-J](https://github.com/JINWOO-J)
+
 ## [0.102.9] - 2026-05-09
 
 ### Fixed
