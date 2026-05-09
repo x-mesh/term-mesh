@@ -8,10 +8,10 @@
 //! we eagerly spawn a single default surface running `$SHELL -l`, with
 //! a stable surface_id so clients can list + attach deterministically.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::os::unix::io::{AsRawFd, RawFd};
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, RwLock};
 
 use peer_proto::v1::SurfaceInfo;
 use tokio::io::unix::AsyncFd;
@@ -36,6 +36,42 @@ const READ_BUF_SIZE: usize = 4096;
 /// chunks, it starts getting `RecvError::Lagged` on `recv()`; the connection
 /// layer handles that as a gap (eventual reconnect will re-snapshot).
 const BROADCAST_CAPACITY: usize = 1024;
+/// Bytes of recent PTY output replayed to a newly attached relay. This covers
+/// the common "shell prompt printed before the SSH relay attached" case without
+/// turning the daemon into an unbounded terminal scrollback store.
+const REPLAY_CAPACITY_BYTES: usize = 64 * 1024;
+
+#[derive(Clone, Debug)]
+pub struct PtyChunk {
+    pub seq: u64,
+    pub bytes: Vec<u8>,
+}
+
+#[derive(Debug, Default)]
+struct ReplayBuffer {
+    chunks: VecDeque<PtyChunk>,
+    bytes: usize,
+}
+
+impl ReplayBuffer {
+    fn push(&mut self, chunk: PtyChunk) {
+        if chunk.bytes.is_empty() {
+            return;
+        }
+        self.bytes += chunk.bytes.len();
+        self.chunks.push_back(chunk);
+        while self.bytes > REPLAY_CAPACITY_BYTES {
+            let Some(front) = self.chunks.pop_front() else {
+                break;
+            };
+            self.bytes = self.bytes.saturating_sub(front.bytes.len());
+        }
+    }
+
+    fn snapshot(&self) -> Vec<PtyChunk> {
+        self.chunks.iter().cloned().collect()
+    }
+}
 
 pub struct PtySurface {
     pub surface_id: Vec<u8>,
@@ -49,13 +85,17 @@ pub struct PtySurface {
     pub branch: String,
     /// The authoritative broadcast sender. Subscribers are created via
     /// `.subscribe()`; the reader task owns a cloned sender for fan-out.
-    pub broadcast_tx: broadcast::Sender<Vec<u8>>,
+    pub broadcast_tx: broadcast::Sender<PtyChunk>,
     /// Set true when the PTY reader has observed EOF or the child died.
     /// Subscribers should detach when this flips.
     pub dead: AtomicBool,
     /// Notified when `dead` flips; lets relay tasks exit promptly without
     /// polling the flag.
     pub dead_notify: Notify,
+    /// Monotonic byte offset for PTY chunks. Used only to de-duplicate replay
+    /// bytes against live broadcast bytes at attach time.
+    byte_seq: AtomicU64,
+    replay: Mutex<ReplayBuffer>,
     master_fd: RawFd,
     pid: libc::pid_t,
 }
@@ -72,7 +112,7 @@ impl PtySurface {
     ) -> std::io::Result<Arc<Self>> {
         let child = pty::spawn(command, args, cols, rows, cwd)?;
         pty::set_nonblocking(child.master_fd)?;
-        let (tx, _rx) = broadcast::channel::<Vec<u8>>(BROADCAST_CAPACITY);
+        let (tx, _rx) = broadcast::channel::<PtyChunk>(BROADCAST_CAPACITY);
 
         let resolved_cwd = cwd
             .map(|c| c.to_string())
@@ -94,6 +134,8 @@ impl PtySurface {
             broadcast_tx: tx.clone(),
             dead: AtomicBool::new(false),
             dead_notify: Notify::new(),
+            byte_seq: AtomicU64::new(0),
+            replay: Mutex::new(ReplayBuffer::default()),
             master_fd: child.master_fd,
             pid: child.pid,
         });
@@ -175,8 +217,16 @@ impl PtySurface {
                         break;
                     }
                     Ok(Ok(n)) => {
+                        let bytes = buf[..n].to_vec();
+                        let seq = reader_surface
+                            .byte_seq
+                            .fetch_add(n as u64, Ordering::Relaxed);
+                        let chunk = PtyChunk { seq, bytes };
+                        if let Ok(mut replay) = reader_surface.replay.lock() {
+                            replay.push(chunk.clone());
+                        }
                         // Err only means "no subscribers", which is fine.
-                        let _ = tx.send(buf[..n].to_vec());
+                        let _ = tx.send(chunk);
                     }
                     Ok(Err(e)) => {
                         tracing::warn!(
@@ -195,8 +245,15 @@ impl PtySurface {
         Ok(surface)
     }
 
-    pub fn subscribe(&self) -> broadcast::Receiver<Vec<u8>> {
+    pub fn subscribe(&self) -> broadcast::Receiver<PtyChunk> {
         self.broadcast_tx.subscribe()
+    }
+
+    pub fn replay_snapshot(&self) -> Vec<PtyChunk> {
+        self.replay
+            .lock()
+            .map(|replay| replay.snapshot())
+            .unwrap_or_default()
     }
 
     pub fn write_all(&self, bytes: &[u8]) -> std::io::Result<()> {
