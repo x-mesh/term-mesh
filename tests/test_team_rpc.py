@@ -122,6 +122,67 @@ def test_team_create(sock_path: str) -> TestResult:
     return result
 
 
+def test_preset_list_includes_workflows(sock_path: str) -> TestResult:
+    """Test that team.preset.list exposes workflow presets."""
+    result = TestResult("team.preset.list (workflows)")
+    try:
+        resp = _rpc_call(sock_path, "team.preset.list", {}, rid=50)
+        if not resp.get("ok"):
+            result.failure(f"preset.list failed: {resp.get('error', resp)}")
+            return result
+
+        presets = resp.get("result", {}).get("presets", [])
+        bug = next((p for p in presets if p.get("id") == "bug-triage"), None)
+        if not bug:
+            result.failure(f"bug-triage workflow missing: {json.dumps(presets)[:300]}")
+            return result
+
+        if (
+            bug.get("type") == "workflow"
+            and bug.get("leader_mode") == "repl"
+            and len(bug.get("agents", [])) == 3
+            and bug.get("task_templates")
+            and bug.get("review_checkpoints")
+        ):
+            result.success("workflow preset listed with agents and templates")
+        else:
+            result.failure(f"Unexpected workflow preset: {json.dumps(bug)[:300]}")
+    except Exception as e:
+        result.failure(f"RPC error: {e}")
+    return result
+
+
+def test_preset_resolve_workflow(sock_path: str) -> TestResult:
+    """Test resolving a workflow preset into agents and task templates."""
+    result = TestResult("team.preset.resolve (workflow)")
+    try:
+        resp = _rpc_call(sock_path, "team.preset.resolve", {
+            "preset_id": "bug-triage",
+        }, rid=51)
+        if not resp.get("ok"):
+            result.failure(f"preset.resolve failed: {resp.get('error', resp)}")
+            return result
+
+        payload = resp.get("result", {})
+        agents = payload.get("agents", [])
+        templates = payload.get("task_templates", [])
+        checkpoints = payload.get("review_checkpoints", [])
+        roles = [a.get("name") for a in agents]
+        if (
+            payload.get("preset_type") == "workflow"
+            and payload.get("leader_mode") == "repl"
+            and roles == ["debugger", "explorer", "tester"]
+            and "reproduce issue" in templates
+            and "blocked on repro" in checkpoints
+        ):
+            result.success("workflow preset resolved")
+        else:
+            result.failure(f"Unexpected workflow resolve payload: {json.dumps(payload)[:400]}")
+    except Exception as e:
+        result.failure(f"RPC error: {e}")
+    return result
+
+
 def test_team_list(sock_path: str) -> TestResult:
     """Test that created team appears in team.list."""
     result = TestResult("team.list")
@@ -362,6 +423,43 @@ def test_task_review(sock_path: str) -> TestResult:
     return result
 
 
+def test_inbox_review_ready_task(sock_path: str) -> TestResult:
+    """Test that review_ready tasks are surfaced as first-class inbox items."""
+    result = TestResult("team.inbox (review_ready task)")
+    task_id = _task_state.get("task_id")
+    if not task_id:
+        result.failure("No task_id available")
+        return result
+    try:
+        resp = _rpc_call(sock_path, "team.inbox", {
+            "team_name": TEAM_NAME,
+            "top_only": True,
+        }, rid=33)
+        if not resp.get("ok"):
+            result.failure(f"team.inbox failed: {resp.get('error', resp)}")
+            return result
+
+        items = resp.get("result", {}).get("items", [])
+        if len(items) != 1:
+            result.failure(f"Expected one top inbox item, got {len(items)}")
+            return result
+
+        item = items[0]
+        if (
+            item.get("kind") == "task"
+            and item.get("status") == "review_ready"
+            and item.get("task_id") == task_id
+            and item.get("agent_name") == "w1"
+            and item.get("priority") == 2
+        ):
+            result.success("review_ready task surfaced in inbox")
+        else:
+            result.failure(f"Unexpected inbox item: {json.dumps(item)[:300]}")
+    except Exception as e:
+        result.failure(f"RPC error: {e}")
+    return result
+
+
 def test_task_done(sock_path: str) -> TestResult:
     """Test marking a task as done."""
     result = TestResult("team.task.done")
@@ -437,6 +535,51 @@ def test_message_list(sock_path: str) -> TestResult:
     return result
 
 
+def test_message_attention_inbox(sock_path: str) -> TestResult:
+    """Test that attention message types keep a dashboard-friendly inbox shape."""
+    result = TestResult("team.inbox (attention message)")
+    try:
+        post = _rpc_call(sock_path, "team.message.post", {
+            "team_name": TEAM_NAME,
+            "from": "w1",
+            "content": "blocked by rpc test",
+            "type": "blocked",
+        }, rid=23)
+        if not post.get("ok"):
+            result.failure(f"message.post failed: {post.get('error', post)}")
+            return result
+
+        resp = _rpc_call(sock_path, "team.inbox", {
+            "team_name": TEAM_NAME,
+        }, rid=24)
+        if not resp.get("ok"):
+            result.failure(f"team.inbox failed: {resp.get('error', resp)}")
+            return result
+
+        items = resp.get("result", {}).get("items", [])
+        item = next((
+            i for i in items
+            if i.get("kind") == "message" and i.get("message_type") == "blocked"
+        ), None)
+        if not item:
+            result.failure(f"Blocked message missing from inbox: {json.dumps(items)[:300]}")
+            return result
+
+        if (
+            item.get("status") == "blocked"
+            and item.get("agent_name") == "w1"
+            and item.get("reason") == "blocked by rpc test"
+            and item.get("priority") == 1
+            and "task_id" in item
+        ):
+            result.success("blocked message surfaced with normalized inbox fields")
+        else:
+            result.failure(f"Unexpected message inbox item: {json.dumps(item)[:300]}")
+    except Exception as e:
+        result.failure(f"RPC error: {e}")
+    return result
+
+
 def test_message_clear(sock_path: str) -> TestResult:
     """Test clearing all messages for the team."""
     result = TestResult("team.message.clear")
@@ -490,6 +633,8 @@ def main():
     # Define test sequence (order matters for lifecycle tests)
     tests = [
         lambda: test_ping(sock_path),
+        lambda: test_preset_list_includes_workflows(sock_path),
+        lambda: test_preset_resolve_workflow(sock_path),
         lambda: test_team_create(sock_path),
     ]
 
@@ -516,12 +661,14 @@ def main():
             lambda: test_task_get(sock_path),
             lambda: test_task_update(sock_path),
             lambda: test_task_review(sock_path),
+            lambda: test_inbox_review_ready_task(sock_path),
             lambda: test_task_done(sock_path),
             # --- edge case: invalid task_id while team exists ---
             lambda: test_task_get_invalid_id(sock_path),
             # --- messaging ---
             lambda: test_message_post(sock_path),
             lambda: test_message_list(sock_path),
+            lambda: test_message_attention_inbox(sock_path),
             lambda: test_message_clear(sock_path),
             # --- existing: destroy ---
             lambda: test_team_destroy(sock_path),

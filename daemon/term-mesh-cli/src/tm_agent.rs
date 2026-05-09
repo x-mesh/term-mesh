@@ -8,9 +8,10 @@ mod prompts;
 
 use clap::{Parser, Subcommand};
 use serde_json::{json, Value};
+use std::fs;
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 use std::{env, process, thread};
 
@@ -28,6 +29,10 @@ const BROADCAST_SUFFIX: &str = concat!(
 );
 
 fn agent_init_prompt(agent: &str, workdir: &str, socket: &str) -> String {
+    let runbook_section = load_runbook_content_for_agent(Path::new(workdir), agent)
+        .map(|content| format!("\n## Role Runbook\n\n{content}\n"))
+        .unwrap_or_default();
+
     format!(
         "You are a team agent named \"{agent}\" in a term-mesh multi-agent team. \
 Use `tm-agent` (Rust, ~2ms) for ALL team operations. \
@@ -71,7 +76,7 @@ Environment:\n\
 - Working directory: {workdir}\n\
 - Socket: {socket}\n\
 - Project: term-mesh (Swift/macOS terminal multiplexer)\n\
-\n\
+{runbook_section}\n\
 When you complete any task, run: `tm-agent reply '<one-paragraph summary>'` to report.\n\
 Respond with \"Agent {agent} ready.\" to confirm.",
     )
@@ -140,6 +145,9 @@ enum Commands {
     /// Task template operations (list, show)
     #[command(subcommand)]
     Template(TemplateCommands),
+    /// Install per-agent runbooks into local agent tool configs
+    #[command(subcommand)]
+    Runbook(RunbookCommands),
 
     // ── Simple RPC wrappers ────────────────────────────────────────
     /// Destroy the current team
@@ -185,7 +193,7 @@ enum Commands {
         /// Adopt current terminal as leader pane (skip leader pane creation)
         #[arg(long)]
         adopt: bool,
-        /// Use a named preset (e.g. "standard", "architect")
+        /// Use a named smart or workflow preset (e.g. "standard", "bug-triage")
         #[arg(long)]
         preset: Option<String>,
         /// Comma-separated roles to create (e.g. "explorer,executor,reviewer")
@@ -638,6 +646,36 @@ enum TemplateCommands {
     Show { name: String },
 }
 
+#[derive(Subcommand)]
+enum RunbookCommands {
+    /// Show runbook install status for this repo
+    Status,
+    /// Create .agent-runbooks/ source files only
+    Init {
+        /// Print planned changes without writing files
+        #[arg(long)]
+        dry_run: bool,
+        /// Overwrite existing managed files
+        #[arg(long)]
+        force: bool,
+    },
+    /// Install runbooks for one tool or all supported tools
+    Install {
+        /// claude, codex, opencode, or all
+        #[arg(long, default_value = "all")]
+        tool: String,
+        /// Install only one role runbook
+        #[arg(long)]
+        agent: Option<String>,
+        /// Print planned changes without writing files
+        #[arg(long)]
+        dry_run: bool,
+        /// Overwrite existing non-managed files
+        #[arg(long)]
+        force: bool,
+    },
+}
+
 // ── Task template system ─────────────────────────────────────────────
 
 /// Parse `key=value` CLI arg for `--var`.
@@ -804,6 +842,518 @@ fn list_all_templates() -> Vec<(String, String)> {
         }
     }
     result
+}
+
+// ── Agent runbook installer ─────────────────────────────────────────
+
+const RUNBOOK_MARKER: &str = "<!-- term-mesh-managed: runbook-installer v1 -->";
+const RUNBOOK_SOURCE_DIR: &str = ".agent-runbooks";
+
+#[derive(Clone, Copy)]
+enum RunbookTool {
+    Claude,
+    Codex,
+    OpenCode,
+}
+
+impl RunbookTool {
+    fn as_str(self) -> &'static str {
+        match self {
+            RunbookTool::Claude => "claude",
+            RunbookTool::Codex => "codex",
+            RunbookTool::OpenCode => "opencode",
+        }
+    }
+}
+
+struct RunbookRole {
+    name: &'static str,
+    title: &'static str,
+    description: &'static str,
+    rules: &'static [&'static str],
+}
+
+fn builtin_runbook_roles() -> Vec<RunbookRole> {
+    vec![
+        RunbookRole {
+            name: "explorer",
+            title: "Explorer Runbook",
+            description: "Read-only codebase exploration and symbol tracing.",
+            rules: &[
+                "Use rg or rg --files first for searches.",
+                "Return findings as path:line plus one concise role sentence.",
+                "Do not edit files unless the leader explicitly changes your role.",
+                "Prefer exact call sites, ownership boundaries, and dependency edges over broad summaries.",
+            ],
+        },
+        RunbookRole {
+            name: "executor",
+            title: "Executor Runbook",
+            description: "Scoped implementation work with direct file edits and verification.",
+            rules: &[
+                "Own the files assigned in the task and avoid unrelated refactors.",
+                "Do not revert edits made by other agents or the user.",
+                "Run the narrowest useful verification command before reporting.",
+                "Report changed files, verification, and remaining risk in the standard header.",
+            ],
+        },
+        RunbookRole {
+            name: "reviewer",
+            title: "Reviewer Runbook",
+            description: "Code review focused on regressions, bugs, and missing tests.",
+            rules: &[
+                "Lead with findings ordered by severity.",
+                "Ground every finding in file:line references.",
+                "Prefer actionable patch snippets over style-only comments.",
+                "Return VERDICT: LGTM or VERDICT: CHANGES after findings.",
+            ],
+        },
+        RunbookRole {
+            name: "security",
+            title: "Security Runbook",
+            description: "Security review for process execution, sockets, quoting, and trust boundaries.",
+            rules: &[
+                "Inspect Process(), shell invocation, socket authorization, allowAll paths, and external input parsing.",
+                "Include severity, CWE when obvious, PoC, fix, and verify command.",
+                "Flag focus stealing or privilege boundary changes when socket commands are involved.",
+                "Do not suggest broad rewrites when a local validation or escaping fix is enough.",
+            ],
+        },
+        RunbookRole {
+            name: "frontend",
+            title: "Frontend Runbook",
+            description: "SwiftUI/AppKit interface work for term-mesh panels and dashboard UI.",
+            rules: &[
+                "Preserve portal layering contracts for terminal and browser surfaces.",
+                "Use existing design tokens and avoid nested card layouts.",
+                "Add DEBUG dlog events only behind DEBUG guards when useful.",
+                "Verify responsive layout and avoid overlapping text or controls.",
+            ],
+        },
+        RunbookRole {
+            name: "backend",
+            title: "Backend Runbook",
+            description: "Rust daemon, JSON-RPC, IPC, and telemetry implementation.",
+            rules: &[
+                "Default new socket commands to off-main handling unless UI state requires main actor access.",
+                "Parse and validate external input before scheduling UI mutation.",
+                "Keep JSON response shapes backward compatible where existing clients depend on them.",
+                "Run cargo test for daemon changes when feasible.",
+            ],
+        },
+        RunbookRole {
+            name: "architect",
+            title: "Architect Runbook",
+            description: "Design decisions for module boundaries, threading, and protocol changes.",
+            rules: &[
+                "Write the decision, rejected alternatives, and compatibility impact.",
+                "Include Swift/Rust stubs or sequence pseudocode when it clarifies the boundary.",
+                "Call out focus policy, socket threading, and panel layering impacts explicitly.",
+                "Avoid abstractions that do not remove real duplication or risk.",
+            ],
+        },
+        RunbookRole {
+            name: "tester",
+            title: "Tester Runbook",
+            description: "Verification planning and regression execution.",
+            rules: &[
+                "Map tests to user-visible risk and changed contracts.",
+                "Use VM-only UI test commands for macOS UI automation.",
+                "Report test case count, failures, and whether VM coverage is still needed.",
+                "Prefer reproducible shell commands over prose-only validation.",
+            ],
+        },
+        RunbookRole {
+            name: "writer",
+            title: "Writer Runbook",
+            description: "Documentation, changelog, and release-note updates.",
+            rules: &[
+                "Update the single source of truth first, then linked docs.",
+                "Keep docs aligned with current CLI names and socket methods.",
+                "Mention exact insertion locations and self-check consistency.",
+                "Avoid documenting speculative behavior as shipped behavior.",
+            ],
+        },
+        RunbookRole {
+            name: "planner",
+            title: "Planner Runbook",
+            description: "Task decomposition, dependency mapping, and phase gates.",
+            rules: &[
+                "Split work into independently assignable tasks with clear owners.",
+                "List inputs, outputs, dependencies, and acceptance criteria.",
+                "Prefer phase gates where shared contracts or multiple agents are involved.",
+                "Emit tm-agent task create lines when actionable.",
+            ],
+        },
+    ]
+}
+
+fn find_runbook_project_root() -> Result<PathBuf, String> {
+    let start = env::current_dir().map_err(|e| format!("current_dir: {e}"))?;
+    let mut cur = start.as_path();
+    loop {
+        if cur.join(".git").exists() || cur.join("AGENTS.md").exists() || cur.join("TODO.md").exists() {
+            return Ok(cur.to_path_buf());
+        }
+        match cur.parent() {
+            Some(parent) => cur = parent,
+            None => return Ok(start),
+        }
+    }
+}
+
+fn parse_runbook_tools(tool: &str) -> Result<Vec<RunbookTool>, String> {
+    let mut out = Vec::new();
+    for raw in tool.split(',') {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "" => {}
+            "all" => return Ok(vec![RunbookTool::Claude, RunbookTool::Codex, RunbookTool::OpenCode]),
+            "claude" | "claude-code" | "claudecode" => out.push(RunbookTool::Claude),
+            "codex" => out.push(RunbookTool::Codex),
+            "opencode" | "open-code" => out.push(RunbookTool::OpenCode),
+            other => return Err(format!("unknown runbook tool: {other}")),
+        }
+    }
+    if out.is_empty() {
+        return Err("no runbook tool selected".to_string());
+    }
+    Ok(out)
+}
+
+fn selected_runbook_roles(agent: Option<&str>) -> Result<Vec<RunbookRole>, String> {
+    let roles = builtin_runbook_roles();
+    if let Some(name) = agent {
+        let Some(role) = roles.into_iter().find(|r| r.name == name) else {
+            return Err(format!("unknown runbook agent: {name}"));
+        };
+        return Ok(vec![role]);
+    }
+    Ok(roles)
+}
+
+fn runbook_source_path(root: &Path, role: &RunbookRole) -> PathBuf {
+    root.join(RUNBOOK_SOURCE_DIR).join(format!("{}.md", role.name))
+}
+
+fn load_runbook_content_for_agent(root: &Path, agent: &str) -> Option<String> {
+    if !agent
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+    {
+        return None;
+    }
+    let path = root.join(RUNBOOK_SOURCE_DIR).join(format!("{agent}.md"));
+    fs::read_to_string(path).ok().filter(|content| !content.trim().is_empty())
+}
+
+fn runbook_readme_path(root: &Path) -> PathBuf {
+    root.join(RUNBOOK_SOURCE_DIR).join("README.md")
+}
+
+fn runbook_projection_path(root: &Path, tool: RunbookTool, role: &RunbookRole) -> PathBuf {
+    match tool {
+        RunbookTool::Claude => root
+            .join(".claude/skills")
+            .join(format!("term-mesh-{}", role.name))
+            .join("SKILL.md"),
+        RunbookTool::Codex => root
+            .join(".codex/skills")
+            .join(format!("term-mesh-{}", role.name))
+            .join("SKILL.md"),
+        RunbookTool::OpenCode => root
+            .join(".opencode/runbooks")
+            .join(format!("{}.md", role.name)),
+    }
+}
+
+fn yaml_escape(s: &str) -> String {
+    s.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
+fn source_runbook_content(role: &RunbookRole) -> String {
+    let mut out = format!(
+        "{RUNBOOK_MARKER}\n# {}\n\n{}\n\n## Role\n\n`{}` is a term-mesh team role. Use this runbook whenever an agent is assigned this role.\n\n## Operating Rules\n",
+        role.title, role.description, role.name
+    );
+    for rule in role.rules {
+        out.push_str(&format!("- {rule}\n"));
+    }
+    out.push_str(
+        "\n## Standard Reply Header\n\n```text\nSTATUS: DONE|BLOCKED|NEEDS_REVIEW\nFILES: <changed paths or none>\nVERIFY: <single shell command or n/a>\nNEXT: <leader action or NONE>\n```\n",
+    );
+    out
+}
+
+fn tool_runbook_content(tool: RunbookTool, role: &RunbookRole) -> String {
+    let body = source_runbook_content(role);
+    match tool {
+        RunbookTool::Claude | RunbookTool::Codex => format!(
+            "---\nname: term-mesh-{}\ndescription: \"{}\"\n---\n{}",
+            role.name,
+            yaml_escape(&format!("Use when acting as the {} agent in a term-mesh team.", role.name)),
+            body
+        ),
+        RunbookTool::OpenCode => body,
+    }
+}
+
+fn runbook_readme_content(roles: &[RunbookRole]) -> String {
+    let mut out = format!(
+        "{RUNBOOK_MARKER}\n# Agent Runbooks\n\nThese files are the source of truth for term-mesh per-agent behavior. Regenerate tool-specific projections with:\n\n```bash\ntm-agent runbook install --tool all\n```\n\n## Roles\n"
+    );
+    for role in roles {
+        out.push_str(&format!("- `{}`: {}\n", role.name, role.description));
+    }
+    out
+}
+
+fn is_runbook_managed(content: &str) -> bool {
+    content.lines().take(30).any(|line| line == RUNBOOK_MARKER)
+}
+
+fn file_runbook_state(path: &Path) -> &'static str {
+    match fs::read_to_string(path) {
+        Ok(content) if is_runbook_managed(&content) => "managed",
+        Ok(_) => "custom",
+        Err(_) => "missing",
+    }
+}
+
+fn write_managed_runbook(path: &Path, content: &str, dry_run: bool, force: bool) -> Result<Value, String> {
+    let existing = fs::read_to_string(path).ok();
+    let action = match existing.as_deref() {
+        Some(old) if old == content => "unchanged",
+        Some(old) if !is_runbook_managed(old) && !force => "skipped_custom",
+        Some(_) if dry_run => "would_update",
+        None if dry_run => "would_create",
+        Some(_) => "updated",
+        None => "created",
+    };
+
+    if !dry_run && matches!(action, "created" | "updated") {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).map_err(|e| format!("create_dir {}: {e}", parent.display()))?;
+        }
+        let file_name = path
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("runbook");
+        let tmp = path.with_file_name(format!(".tmp-{file_name}"));
+        fs::write(&tmp, content).map_err(|e| format!("write {}: {e}", tmp.display()))?;
+        fs::rename(&tmp, path).map_err(|e| format!("rename {} -> {}: {e}", tmp.display(), path.display()))?;
+    }
+
+    Ok(json!({
+        "path": path.to_string_lossy(),
+        "action": action,
+    }))
+}
+
+fn runbook_init(dry_run: bool, force: bool) -> Result<Value, String> {
+    let root = find_runbook_project_root()?;
+    let roles = builtin_runbook_roles();
+    let mut files = Vec::new();
+    files.push(write_managed_runbook(
+        &runbook_readme_path(&root),
+        &runbook_readme_content(&roles),
+        dry_run,
+        force,
+    )?);
+    for role in &roles {
+        files.push(write_managed_runbook(
+            &runbook_source_path(&root, role),
+            &source_runbook_content(role),
+            dry_run,
+            force,
+        )?);
+    }
+    Ok(json!({
+        "ok": true,
+        "result": {
+            "project_root": root.to_string_lossy(),
+            "dry_run": dry_run,
+            "files": files,
+        }
+    }))
+}
+
+fn runbook_install(tool: &str, agent: Option<&str>, dry_run: bool, force: bool) -> Result<Value, String> {
+    let root = find_runbook_project_root()?;
+    let tools = parse_runbook_tools(tool)?;
+    let roles = selected_runbook_roles(agent)?;
+    let all_roles = builtin_runbook_roles();
+    let mut files = Vec::new();
+
+    files.push(write_managed_runbook(
+        &runbook_readme_path(&root),
+        &runbook_readme_content(&all_roles),
+        dry_run,
+        force,
+    )?);
+    for role in &roles {
+        files.push(write_managed_runbook(
+            &runbook_source_path(&root, role),
+            &source_runbook_content(role),
+            dry_run,
+            force,
+        )?);
+    }
+    for tool in tools {
+        for role in &roles {
+            files.push(write_managed_runbook(
+                &runbook_projection_path(&root, tool, role),
+                &tool_runbook_content(tool, role),
+                dry_run,
+                force,
+            )?);
+        }
+    }
+
+    Ok(json!({
+        "ok": true,
+        "result": {
+            "project_root": root.to_string_lossy(),
+            "dry_run": dry_run,
+            "agent": agent.unwrap_or("all"),
+            "files": files,
+        }
+    }))
+}
+
+fn runbook_status() -> Result<Value, String> {
+    let root = find_runbook_project_root()?;
+    let roles = builtin_runbook_roles();
+    let source: Vec<Value> = roles
+        .iter()
+        .map(|role| {
+            let path = runbook_source_path(&root, role);
+            json!({
+                "role": role.name,
+                "path": path.to_string_lossy(),
+                "state": file_runbook_state(&path),
+            })
+        })
+        .collect();
+
+    let tools: Vec<Value> = [RunbookTool::Claude, RunbookTool::Codex, RunbookTool::OpenCode]
+        .iter()
+        .map(|tool| {
+            let mut files = Vec::new();
+            let mut managed = 0;
+            let mut custom = 0;
+            let mut missing = 0;
+            for role in &roles {
+                let path = runbook_projection_path(&root, *tool, role);
+                let state = file_runbook_state(&path);
+                match state {
+                    "managed" => managed += 1,
+                    "custom" => custom += 1,
+                    _ => missing += 1,
+                }
+                files.push(json!({
+                    "role": role.name,
+                    "path": path.to_string_lossy(),
+                    "state": state,
+                }));
+            }
+            json!({
+                "tool": tool.as_str(),
+                "managed": managed,
+                "custom": custom,
+                "missing": missing,
+                "files": files,
+            })
+        })
+        .collect();
+
+    Ok(json!({
+        "ok": true,
+        "result": {
+            "project_root": root.to_string_lossy(),
+            "source_dir": root.join(RUNBOOK_SOURCE_DIR).to_string_lossy(),
+            "roles": roles.iter().map(|r| r.name).collect::<Vec<_>>(),
+            "source": source,
+            "tools": tools,
+        }
+    }))
+}
+
+fn run_runbook_command(command: &RunbookCommands) -> Result<Value, String> {
+    match command {
+        RunbookCommands::Status => runbook_status(),
+        RunbookCommands::Init { dry_run, force } => runbook_init(*dry_run, *force),
+        RunbookCommands::Install { tool, agent, dry_run, force } => {
+            runbook_install(tool, agent.as_deref(), *dry_run, *force)
+        }
+    }
+}
+
+#[cfg(test)]
+mod runbook_tests {
+    use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn runbook_parse_tools_accepts_all_and_aliases() {
+        let all = parse_runbook_tools("all").unwrap();
+        assert_eq!(all.len(), 3);
+
+        let tools = parse_runbook_tools("claude-code,codex,open-code").unwrap();
+        let names: Vec<&str> = tools.iter().map(|t| t.as_str()).collect();
+        assert_eq!(names, vec!["claude", "codex", "opencode"]);
+    }
+
+    #[test]
+    fn runbook_content_has_marker_and_skill_frontmatter() {
+        let role = selected_runbook_roles(Some("reviewer")).unwrap().remove(0);
+        let source = source_runbook_content(&role);
+        assert!(source.starts_with(RUNBOOK_MARKER));
+        assert!(source.contains("Reviewer Runbook"));
+
+        let skill = tool_runbook_content(RunbookTool::Codex, &role);
+        assert!(skill.starts_with("---\nname: term-mesh-reviewer"));
+        assert!(skill.contains(RUNBOOK_MARKER));
+    }
+
+    #[test]
+    fn runbook_write_skips_custom_files_without_force() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = env::temp_dir().join(format!("tm-agent-runbook-test-{unique}"));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("custom.md");
+        fs::write(&path, "user file\n").unwrap();
+
+        let result = write_managed_runbook(&path, RUNBOOK_MARKER, false, false).unwrap();
+        assert_eq!(result["action"].as_str(), Some("skipped_custom"));
+        assert_eq!(fs::read_to_string(&path).unwrap(), "user file\n");
+
+        let forced = write_managed_runbook(&path, RUNBOOK_MARKER, false, true).unwrap();
+        assert_eq!(forced["action"].as_str(), Some("updated"));
+        assert_eq!(file_runbook_state(&path), "managed");
+
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn runbook_init_prompt_loads_matching_agent_file() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = env::temp_dir().join(format!("tm-agent-runbook-prompt-{unique}"));
+        let runbook_dir = dir.join(RUNBOOK_SOURCE_DIR);
+        fs::create_dir_all(&runbook_dir).unwrap();
+        fs::write(runbook_dir.join("explorer.md"), "EXPLORER ONLY\n").unwrap();
+
+        let prompt = agent_init_prompt("explorer", &dir.to_string_lossy(), "/tmp/socket");
+        assert!(prompt.contains("## Role Runbook"));
+        assert!(prompt.contains("EXPLORER ONLY"));
+
+        fs::remove_dir_all(dir).ok();
+    }
 }
 
 // ── Socket / RPC infrastructure ──────────────────────────────────────
@@ -1518,6 +2068,13 @@ fn main() {
         }
     }
 
+    // Runbook commands operate on the current repository, not the app socket.
+    // They must work before term-mesh is running so onboarding can bootstrap itself.
+    if let Commands::Runbook(ref runbook_cmd) = cli.command {
+        print_result(run_runbook_command(runbook_cmd));
+        return;
+    }
+
     let sock = match detect_socket() {
         Some(s) => s,
         None => {
@@ -1857,6 +2414,7 @@ fn main() {
             rpc_call(&sock, "team.task.clear", json!({ "team_name": team }))
         }
         Commands::Peer(_) => unreachable!("peer commands exit before detect_socket()"),
+        Commands::Runbook(_) => unreachable!("runbook commands exit before detect_socket()"),
         Commands::Status => {
             // Inject version info into the team.status response JSON
             let mut status = rpc_call(&sock, "team.status", json!({ "team_name": team }))
@@ -2024,14 +2582,21 @@ fn main() {
                     match rpc_call(&sock, "team.preset.list", json!({})) {
                         Ok(resp) => {
                             if let Some(presets) = resp["result"]["presets"].as_array() {
-                                println!("{:<20} {:<30} {:<8} {}", "ID", "Name", "Agents", "Description");
-                                println!("{}", "-".repeat(80));
+                                println!(
+                                    "{:<18} {:<10} {:<24} {:<8} {}",
+                                    "ID", "Kind", "Name", "Agents", "Description"
+                                );
+                                println!("{}", "-".repeat(92));
                                 for p in presets {
                                     let id = p["id"].as_str().unwrap_or("");
+                                    let kind = p["type"].as_str().unwrap_or("smart");
                                     let name = p["name"].as_str().unwrap_or("");
                                     let desc = p["description"].as_str().unwrap_or("");
                                     let agent_count = p["agents"].as_array().map(|a| a.len()).unwrap_or(0);
-                                    println!("{:<20} {:<30} {:<8} {}", id, name, agent_count, desc);
+                                    println!(
+                                        "{:<18} {:<10} {:<24} {:<8} {}",
+                                        id, kind, name, agent_count, desc
+                                    );
                                 }
                             } else {
                                 println!("{}", pretty(&resp));
@@ -2497,17 +3062,20 @@ fn run_create(
 
     cleanup_old_results(team);
     // --resume-session implies claude leader mode (need Claude CLI to pass --resume)
-    let leader_mode = if adopt {
-        "adopted"
+    let mut leader_mode = if adopt {
+        "adopted".to_string()
     } else if claude_leader || resume_session_id.is_some() {
-        "claude"
+        "claude".to_string()
     } else {
-        "repl"
+        "repl".to_string()
     };
     let leader_model = leader_model.unwrap_or(model);
     let kiro_agents = parse_cli_flag(kiro);
     let codex_agents = parse_cli_flag(codex);
     let gemini_agents = parse_cli_flag(gemini);
+    let mut preset_name: Option<String> = None;
+    let mut workflow_task_templates: Vec<String> = Vec::new();
+    let mut workflow_review_checkpoints: Vec<String> = Vec::new();
 
     // Resolve agents from preset or roles via RPC, or build from defaults
     let agents: Vec<serde_json::Value> = if let Some(preset_id) = preset {
@@ -2517,7 +3085,30 @@ fn run_create(
             "model": model,
         }), 3) {
             Ok(resp) if resp["ok"].as_bool().unwrap_or(false) => {
-                resp["result"]["agents"].as_array()
+                let result = &resp["result"];
+                preset_name = result["preset_name"].as_str().map(str::to_string);
+                if !adopt && !claude_leader && resume_session_id.is_none() {
+                    if let Some(resolved_leader) = result["leader_mode"].as_str() {
+                        leader_mode = resolved_leader.to_string();
+                    }
+                }
+                workflow_task_templates = result["task_templates"].as_array()
+                    .map(|items| {
+                        items
+                            .iter()
+                            .filter_map(|v| v.as_str().map(str::to_string))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                workflow_review_checkpoints = result["review_checkpoints"].as_array()
+                    .map(|items| {
+                        items
+                            .iter()
+                            .filter_map(|v| v.as_str().map(str::to_string))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                result["agents"].as_array()
                     .cloned()
                     .unwrap_or_default()
             }
@@ -2645,6 +3236,61 @@ fn run_create(
     println!("  tm-agent destroy");
 
     if r["ok"].as_bool().unwrap_or(false) {
+        if !workflow_task_templates.is_empty() {
+            let workflow_label = preset_name
+                .as_deref()
+                .or(preset)
+                .unwrap_or("workflow");
+            let checkpoint_note = if workflow_review_checkpoints.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    "\nReview checkpoints: {}",
+                    workflow_review_checkpoints.join(", ")
+                )
+            };
+            eprintln!("\nCreating workflow task templates for '{workflow_label}'...");
+            for (i, title) in workflow_task_templates.iter().enumerate() {
+                let assignee = agents
+                    .get(i % agents.len())
+                    .and_then(|a| a["name"].as_str())
+                    .unwrap_or("");
+                let mut params = json!({
+                    "team_name": team,
+                    "title": title,
+                    "description": format!(
+                        "Created from workflow preset: {}{}",
+                        workflow_label,
+                        checkpoint_note
+                    ),
+                    "priority": 2,
+                    "created_by": format!("workflow:{workflow_label}"),
+                });
+                if !assignee.is_empty() {
+                    params["assignee"] = json!(assignee);
+                }
+                match rpc_call_timeout(sock, "team.task.create", params, 2) {
+                    Ok(resp) if resp["ok"].as_bool().unwrap_or(false) => {
+                        let suffix = if assignee.is_empty() {
+                            String::new()
+                        } else {
+                            format!(" -> {assignee}")
+                        };
+                        eprintln!("  \u{2713} {title}{suffix}");
+                    }
+                    Ok(resp) => {
+                        eprintln!(
+                            "  \u{2717} {title}: {}",
+                            resp["error"]["message"].as_str().unwrap_or("task create failed")
+                        );
+                    }
+                    Err(e) => {
+                        eprintln!("  \u{2717} {title}: {e}");
+                    }
+                }
+            }
+        }
+
         let non_kiro: Vec<&Value> = agents.iter()
             .filter(|a| a["cli"].as_str().unwrap_or("claude") != "kiro")
             .collect();

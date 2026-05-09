@@ -1135,7 +1135,7 @@ struct TeamCreationView: View {
             return TeamAgentRow(preset: p, customInstructions: "")
         }
         if teamName == "my-team" || teamName.isEmpty {
-            teamName = preset.name.lowercased().replacingOccurrences(of: " ", with: "-")
+            teamName = preset.id
         }
         syncBulkFromAgents()
     }
