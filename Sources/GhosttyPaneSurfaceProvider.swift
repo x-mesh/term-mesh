@@ -316,21 +316,11 @@ final class GhosttyPaneSurfaceProvider: PeerSurfaceProvider {
     }
 
     private func performFocus(paneIDBytes: Data) {
-        guard let panelUUID = uuidFromSurfaceID(paneIDBytes),
-              let workspace = workspaceContaining(panelUUID: panelUUID),
-              let tabID = workspace.surfaceIdFromPanelId(panelUUID)
-        else { return }
-        // Drive bonsplit directly. The full `Workspace.focusPanel`
-        // path also calls `moveFocus` which ends up running
-        // `window.makeKeyAndOrderFront` on the host's main term-mesh
-        // window — that yanks the user's keyboard focus out of the
-        // peer relay window every time they click a pane in it.
-        let targetPaneId = workspace.bonsplitController.allPaneIds.first { paneId in
-            workspace.bonsplitController.tabs(inPane: paneId).contains { $0.id == tabID }
-        }
-        guard let targetPaneId else { return }
-        workspace.bonsplitController.focusPane(targetPaneId)
-        workspace.bonsplitController.selectTab(tabID)
+        // A peer client's local focus must not steal keyboard focus on
+        // the host app. Split/close/new-tab requests carry their target
+        // surface id explicitly, so host-side focus is not needed for
+        // correctness.
+        _ = paneIDBytes
     }
 
     private func performSplit(paneIDBytes: Data, orientationString: String) {
@@ -584,10 +574,10 @@ final class GhosttyPaneSurfaceProvider: PeerSurfaceProvider {
 /// readline-style shells and (b) eats some control bytes before they
 /// reach the PTY. Mirroring `GhosttyTerminalView.sendSocketStyleText`:
 ///
-/// - Enter (CR/LF), Tab, Backspace, Escape       → key event with keycode
-/// - 3-byte CSI arrow sequences (`\x1b[A/B/C/D`) → arrow key event
-/// - Ctrl-letter control bytes (0x01-0x1A)       → key event + Ctrl mod
-/// - Anything else                                → key event (keycode=0)
+/// - Enter (CR/LF), Tab, Backspace, Escape        → key event with keycode
+/// - CSI/SS3 navigation keys and function keys    → key event with keycode
+/// - Ctrl-letter control bytes (0x01-0x1A)        → key event + Ctrl mod
+/// - Anything else                                 → key event (keycode=0)
 ///   with the Unicode scalar as text. Multi-byte UTF-8 sequences are
 ///   grouped into a single scalar before dispatch.
 ///
@@ -601,11 +591,10 @@ private func sendPeerInputBytes(_ surface: ghostty_surface_t, bytes: Data) {
     while i < arr.count {
         let byte = arr[i]
 
-        // 3-byte CSI arrow sequence comes in one frame for most TUIs.
-        if byte == 0x1b, i + 2 < arr.count, arr[i + 1] == 0x5b /* '[' */,
-           let arrowKeycode = peerArrowKeycode(arr[i + 2]) {
-            sendPeerKeyEvent(surface, keycode: arrowKeycode, text: nil)
-            i += 3
+        if byte == 0x1b,
+           let sequence = peerEscapeKeySequence(arr, start: i) {
+            sendPeerKeyEvent(surface, keycode: sequence.keycode, mods: sequence.mods, text: nil)
+            i += sequence.consumed
             continue
         }
 
@@ -725,13 +714,127 @@ private func peerCtrlLetterKeycode(_ byte: UInt8) -> UInt32? {
     }
 }
 
-/// Map the third byte of a `\x1b[?` CSI sequence to its arrow keycode.
-private func peerArrowKeycode(_ byte: UInt8) -> UInt32? {
-    switch byte {
-    case 0x41: return 0x7e // 'A' → kVK_UpArrow
-    case 0x42: return 0x7d // 'B' → kVK_DownArrow
-    case 0x43: return 0x7c // 'C' → kVK_RightArrow
-    case 0x44: return 0x7b // 'D' → kVK_LeftArrow
+private func peerEscapeKeySequence(
+    _ bytes: [UInt8],
+    start: Int
+) -> (keycode: UInt32, mods: ghostty_input_mods_e, consumed: Int)? {
+    guard start + 2 < bytes.count, bytes[start] == 0x1b else { return nil }
+    switch bytes[start + 1] {
+    case 0x5b: // '[' — CSI
+        return peerCsiKeySequence(bytes, start: start)
+    case 0x4f: // 'O' — SS3, commonly F1-F4 and Home/End.
+        guard let keycode = peerSs3Keycode(bytes[start + 2]) else { return nil }
+        return (keycode, GHOSTTY_MODS_NONE, 3)
+    default:
+        return nil
+    }
+}
+
+private func peerCsiKeySequence(
+    _ bytes: [UInt8],
+    start: Int
+) -> (keycode: UInt32, mods: ghostty_input_mods_e, consumed: Int)? {
+    let bodyStart = start + 2
+    var finalIndex = bodyStart
+    while finalIndex < bytes.count {
+        let byte = bytes[finalIndex]
+        if (0x40...0x7e).contains(byte) { break }
+        finalIndex += 1
+    }
+    guard finalIndex < bytes.count else { return nil }
+
+    let final = bytes[finalIndex]
+    let params = peerCsiParams(Array(bytes[bodyStart..<finalIndex]))
+    let keycode: UInt32?
+    let modifierParam: Int?
+
+    switch final {
+    case 0x41, 0x42, 0x43, 0x44, 0x48, 0x46: // A/B/C/D/H/F
+        keycode = peerCsiFinalKeycode(final)
+        modifierParam = params.dropFirst().first
+    case 0x7e: // '~'
+        guard let first = params.first else { return nil }
+        keycode = peerCsiTildeKeycode(first)
+        modifierParam = params.dropFirst().first
+    default:
+        return nil
+    }
+
+    guard let keycode else { return nil }
+    return (keycode, peerCsiModifier(modifierParam), finalIndex - start + 1)
+}
+
+private func peerCsiParams(_ body: [UInt8]) -> [Int] {
+    guard !body.isEmpty else { return [] }
+    return body.split(separator: 0x3b, omittingEmptySubsequences: false).compactMap { part in
+        guard !part.isEmpty else { return nil }
+        var value = 0
+        for byte in part {
+            guard byte >= 0x30, byte <= 0x39 else { return nil }
+            value = value * 10 + Int(byte - 0x30)
+        }
+        return value
+    }
+}
+
+private func peerCsiModifier(_ encoded: Int?) -> ghostty_input_mods_e {
+    guard let encoded, encoded > 1 else { return GHOSTTY_MODS_NONE }
+    let flags = encoded - 1
+    var raw = GHOSTTY_MODS_NONE.rawValue
+    if (flags & 0b001) != 0 { raw |= GHOSTTY_MODS_SHIFT.rawValue }
+    if (flags & 0b010) != 0 { raw |= GHOSTTY_MODS_ALT.rawValue }
+    if (flags & 0b100) != 0 { raw |= GHOSTTY_MODS_CTRL.rawValue }
+    return ghostty_input_mods_e(rawValue: raw)
+}
+
+private func peerCsiFinalKeycode(_ final: UInt8) -> UInt32? {
+    switch final {
+    case 0x41: return 0x7e // Up
+    case 0x42: return 0x7d // Down
+    case 0x43: return 0x7c // Right
+    case 0x44: return 0x7b // Left
+    case 0x48: return 0x73 // Home
+    case 0x46: return 0x77 // End
+    default:   return nil
+    }
+}
+
+private func peerSs3Keycode(_ final: UInt8) -> UInt32? {
+    switch final {
+    case 0x41: return 0x7e // Up
+    case 0x42: return 0x7d // Down
+    case 0x43: return 0x7c // Right
+    case 0x44: return 0x7b // Left
+    case 0x48: return 0x73 // Home
+    case 0x46: return 0x77 // End
+    case 0x50: return 0x7a // F1
+    case 0x51: return 0x78 // F2
+    case 0x52: return 0x63 // F3
+    case 0x53: return 0x76 // F4
+    default:   return nil
+    }
+}
+
+private func peerCsiTildeKeycode(_ value: Int) -> UInt32? {
+    switch value {
+    case 1, 7: return 0x73 // Home
+    case 2:    return 0x72 // Insert / Help
+    case 3:    return 0x75 // Forward Delete
+    case 4, 8: return 0x77 // End
+    case 5:    return 0x74 // Page Up
+    case 6:    return 0x79 // Page Down
+    case 11:   return 0x7a // F1
+    case 12:   return 0x78 // F2
+    case 13:   return 0x63 // F3
+    case 14:   return 0x76 // F4
+    case 15:   return 0x60 // F5
+    case 17:   return 0x61 // F6
+    case 18:   return 0x62 // F7
+    case 19:   return 0x64 // F8
+    case 20:   return 0x65 // F9
+    case 21:   return 0x6d // F10
+    case 23:   return 0x67 // F11
+    case 24:   return 0x6f // F12
     default:   return nil
     }
 }
@@ -747,11 +850,16 @@ private func peerUtf8Len(_ byte: UInt8) -> Int {
 }
 
 @MainActor
-private func sendPeerKeyEvent(_ surface: ghostty_surface_t, keycode: UInt32, text: String?) {
+private func sendPeerKeyEvent(
+    _ surface: ghostty_surface_t,
+    keycode: UInt32,
+    mods: ghostty_input_mods_e = GHOSTTY_MODS_NONE,
+    text: String?
+) {
     var keyEvent = ghostty_input_key_s()
     keyEvent.action = GHOSTTY_ACTION_PRESS
     keyEvent.keycode = keycode
-    keyEvent.mods = GHOSTTY_MODS_NONE
+    keyEvent.mods = mods
     keyEvent.consumed_mods = GHOSTTY_MODS_NONE
     keyEvent.unshifted_codepoint = 0
     keyEvent.composing = false

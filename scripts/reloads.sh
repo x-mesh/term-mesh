@@ -225,11 +225,13 @@ if [[ -x "$TERMMESHD_SRC" ]]; then
   mkdir -p "$BIN_DIR"
   cp "$TERMMESHD_SRC" "$BIN_DIR/term-meshd"
   chmod +x "$BIN_DIR/term-meshd"
-  TMAGENT_SRC="$PWD/daemon/target/release/tm-agent"
-  if [[ -x "$TMAGENT_SRC" ]]; then
-    cp "$TMAGENT_SRC" "$BIN_DIR/tm-agent"
-    chmod +x "$BIN_DIR/tm-agent"
-  fi
+  for bin in term-mesh-run tm-agent term-mesh-peer-relay; do
+    src="$PWD/daemon/target/release/$bin"
+    if [[ -x "$src" ]]; then
+      cp "$src" "$BIN_DIR/$bin"
+      chmod +x "$BIN_DIR/$bin"
+    fi
+  done
 fi
 # Avoid inheriting term-mesh/ghostty environment variables from the terminal that
 # runs this script (often inside another term-mesh instance), which can cause

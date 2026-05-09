@@ -566,7 +566,10 @@ final class PeerRelayWorkspaceWindowController: NSWindowController, NSWindowDele
             ) {
                 Task { await weakTransport.close() }
             }
-            await MainActor.run { self.installKeyMonitor() }
+            await MainActor.run {
+                self.installKeyMonitor()
+                self.restoreRelayFocus(after: self.currentLayout, forwardToHost: false)
+            }
 
             subscriptionTask = Task { [weak self] in
                 var disconnectReason: String? = nil
@@ -687,18 +690,60 @@ final class PeerRelayWorkspaceWindowController: NSWindowController, NSWindowDele
                   let window = self.window,
                   event.window === window
             else { return event }
-            let point = event.locationInWindow
-            for (sid, slot) in self.panesBySurfaceID {
-                let frameInWindow = slot.view.convert(slot.view.bounds, to: nil)
-                if frameInWindow.contains(point) {
-                    if self.lastClickedSurfaceID != sid {
-                        self.lastClickedSurfaceID = sid
-                        self.dispatchFocus(surfaceID: sid)
-                    }
-                    break
-                }
+            guard let contentView = window.contentView else { return event }
+            let point = contentView.convert(event.locationInWindow, from: nil)
+            guard let hitView = contentView.hitTest(point) else { return event }
+            for (sid, slot) in self.panesBySurfaceID
+                where hitView === slot.view || hitView.isDescendant(of: slot.view)
+            {
+                self.focusRelayPane(surfaceID: sid, forwardToHost: false)
+                break
             }
             return event
+        }
+    }
+
+    @MainActor
+    private func focusRelayPane(surfaceID: Data, forwardToHost: Bool) {
+        guard let slot = panesBySurfaceID[surfaceID] else { return }
+        lastClickedSurfaceID = surfaceID
+        updatePaneFocusDecorations()
+        slot.surface.hostedView.moveFocus()
+        #if DEBUG
+        dlog("relay.focus surface=\(Self.shortSurfaceID(surfaceID)) forward=\(forwardToHost ? 1 : 0)")
+        #endif
+        if forwardToHost {
+            dispatchFocus(surfaceID: surfaceID)
+        }
+    }
+
+    @MainActor
+    private func restoreRelayFocus(after layout: Termmesh_Peer_V1_WorkspaceLayout,
+                                   forwardToHost: Bool) {
+        let mounted = collectSurfaceIDs(layout)
+        let target = lastClickedSurfaceID.flatMap { mounted.contains($0) ? $0 : nil }
+            ?? firstSurfaceID(in: layout)
+        guard let target else {
+            lastClickedSurfaceID = nil
+            updatePaneFocusDecorations()
+            return
+        }
+        DispatchQueue.main.async { [weak self] in
+            self?.focusRelayPane(surfaceID: target, forwardToHost: forwardToHost)
+        }
+    }
+
+    @MainActor
+    private func updatePaneFocusDecorations() {
+        for (sid, slot) in panesBySurfaceID {
+            slot.view.wantsLayer = true
+            if sid == lastClickedSurfaceID {
+                slot.view.layer?.borderWidth = 2
+                slot.view.layer?.borderColor = NSColor.controlAccentColor.cgColor
+            } else {
+                slot.view.layer?.borderWidth = 0
+                slot.view.layer?.borderColor = NSColor.clear.cgColor
+            }
         }
     }
 
@@ -762,7 +807,7 @@ final class PeerRelayWorkspaceWindowController: NSWindowController, NSWindowDele
                 view = parent
             }
         }
-        return panesBySurfaceID.keys.first
+        return firstSurfaceID(in: currentLayout)
     }
 
     // MARK: - Layout application
@@ -852,6 +897,7 @@ final class PeerRelayWorkspaceWindowController: NSWindowController, NSWindowDele
             return (view, self.pendingDividerSetters)
         }
         await MainActor.run { self.swapRootView(newRoot, dividers: dividers) }
+        await MainActor.run { self.restoreRelayFocus(after: layout, forwardToHost: false) }
 
         // Tear down slots only when the surface is gone from EVERY
         // pane's tab list — keeping cached slots for inactive tabs of
@@ -1105,7 +1151,7 @@ final class PeerRelayWorkspaceWindowController: NSWindowController, NSWindowDele
                 tabId: UUID(),
                 context: GHOSTTY_SURFACE_CONTEXT_WINDOW,
                 configTemplate: nil,
-                command: session.relayBinaryPath,
+                command: session.relayLaunchCommand,
                 environment: [
                     "TERMMESH_PEER_RELAY_SOCKET": session.relaySockPath,
                     "TERMMESH_PEER_RELAY_SECRET": session.relaySecret,
@@ -1251,6 +1297,19 @@ final class PeerRelayWorkspaceWindowController: NSWindowController, NSWindowDele
             return collectSurfaceIDs(s.first).union(collectSurfaceIDs(s.second))
         case .none: return []
         }
+    }
+
+    private func firstSurfaceID(in layout: Termmesh_Peer_V1_WorkspaceLayout) -> Data? {
+        switch layout.node {
+        case .pane(let p): return p.surfaceID
+        case .split(let s):
+            return firstSurfaceID(in: s.first) ?? firstSurfaceID(in: s.second)
+        case .none: return nil
+        }
+    }
+
+    private static func shortSurfaceID(_ id: Data) -> String {
+        id.prefix(5).map { String(format: "%02x", $0) }.joined()
     }
 
     /// Active surface IDs PLUS every inactive tab's surface ID — the

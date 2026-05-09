@@ -20,7 +20,7 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 BIN_DIR="$APP_PATH/Contents/Resources/bin"
 mkdir -p "$BIN_DIR"
-for bin in term-meshd tm-agent; do
+for bin in term-meshd term-mesh-run tm-agent term-mesh-peer-relay; do
   src="$PROJECT_DIR/daemon/target/release/$bin"
   if [[ -x "$src" ]]; then
     cp "$src" "$BIN_DIR/$bin"

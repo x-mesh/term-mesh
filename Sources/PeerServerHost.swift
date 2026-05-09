@@ -96,6 +96,7 @@ final class PeerHostCoordinator: NSObject {
     /// `true` while the server is listening. Lets Settings reflect
     /// state without polling.
     var isRunning: Bool { server != nil }
+    var currentSocketPath: String? { socketPath }
 
     @objc func startServer(_ sender: Any?) {
         switch lifecycle {
@@ -137,7 +138,7 @@ final class PeerHostCoordinator: NSObject {
             guard response == .alertFirstButtonReturn else { return }
             let path = input.stringValue.trimmingCharacters(in: .whitespaces)
             guard !path.isEmpty else { return }
-            Task { await self?.bringUp(at: path) }
+            Task { await self?.bringUp(at: path, persistPath: true) }
         }
     }
 
@@ -221,10 +222,14 @@ final class PeerHostCoordinator: NSObject {
 
     private func markStartSucceeded(server: PeerServer,
                                     path: String,
-                                    provider: GhosttyPaneSurfaceProvider) {
+                                    provider: GhosttyPaneSurfaceProvider,
+                                    persistPath: Bool) {
         self.server = server
         self.socketPath = path
         self.provider = provider
+        if persistPath {
+            UserDefaults.standard.set(path, forKey: PeerFederationSettings.socketPathKey)
+        }
         lifecycle = .running(path)
         installLayoutChangeBridge(server: server, provider: provider)
         // LAN discovery: advertise via Bonjour so other macs on
@@ -241,7 +246,7 @@ final class PeerHostCoordinator: NSObject {
         postStateChange()
     }
 
-    private func bringUp(at path: String, silent: Bool = false) async {
+    private func bringUp(at path: String, silent: Bool = false, persistPath: Bool = false) async {
         guard canStartServer(at: path, silent: silent) else { return }
         let provider = GhosttyPaneSurfaceProvider()
 
@@ -252,7 +257,7 @@ final class PeerHostCoordinator: NSObject {
         let server = PeerServer(socketPath: path, provider: provider, config: config)
         do {
             try await server.start()
-            markStartSucceeded(server: server, path: path, provider: provider)
+            markStartSucceeded(server: server, path: path, provider: provider, persistPath: persistPath)
             NSLog("[peer-debug] server listening on %@", path)
             if !silent {
                 showInfo(
