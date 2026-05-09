@@ -264,6 +264,11 @@ final class PeerRelayWorkspaceWindowController: NSWindowController, NSWindowDele
     /// when Ghostty surfaces sit inside an NSSplitView we built ourselves,
     /// so we track focus explicitly instead.
     private var lastClickedSurfaceID: Data?
+    /// Non-nil when the user has zoomed one pane to fill the window
+    /// (Cmd+Shift+Enter). Mirrors Bonsplit's local zoom: the split tree
+    /// stays unchanged in `currentLayout`; only the relay's render swaps
+    /// to a single-pane view. Cleared by any `applyLayout` rebuild.
+    private var zoomedSurfaceID: Data?
     /// Bonsplit split-id (16-byte UUID) keyed to the NSSplitView that
     /// renders it. Used by the divider-drag delegate to identify which
     /// host-side split to update.
@@ -723,6 +728,14 @@ final class PeerRelayWorkspaceWindowController: NSWindowController, NSWindowDele
             else { return event }
             let chars = event.charactersIgnoringModifiers ?? ""
             let shift = event.modifierFlags.contains(.shift)
+            // Cmd+Shift+Return: zoom focused pane to fill the relay window.
+            // Matches the local Cmd+Shift+Enter "Zoom Pane" shortcut, but
+            // applies only to the relay's render — the host workspace is
+            // not informed.
+            if shift, event.keyCode == 36 /* kVK_Return */ {
+                self.toggleRelayPaneZoom()
+                return nil
+            }
             switch chars.lowercased() {
             case "d":
                 self.dispatchSplit(orientation: shift ? "vertical" : "horizontal")
@@ -774,6 +787,62 @@ final class PeerRelayWorkspaceWindowController: NSWindowController, NSWindowDele
         if forwardToHost {
             dispatchFocus(surfaceID: surfaceID)
         }
+    }
+
+    /// Toggle a Bonsplit-style "zoom one pane to fill the window" mode.
+    /// Local-only — the host workspace stays untouched. Any subsequent
+    /// `applyLayout` push restores the split tree (clearing the zoom).
+    @MainActor
+    private func toggleRelayPaneZoom() {
+        if let prev = zoomedSurfaceID {
+            // Exit zoom: rebuild the split tree from `currentLayout`. We
+            // can't re-enter `applyLayout` here because its fast path
+            // skips the rebuild when `currentLayout == currentLayout`
+            // (the divider-only delta check returns true), leaving the
+            // zoomed single-pane view in place. Materialize the tree
+            // synchronously and swap it in instead.
+            zoomedSurfaceID = nil
+            #if DEBUG
+            dlog("relay.zoom exit prev=\(Self.shortSurfaceID(prev))")
+            #endif
+            pendingDividerSetters.removeAll()
+            splitsByID.removeAll()
+            splitIDByObject.removeAll()
+            let newRoot = materializeLayout(currentLayout)
+            let dividers = pendingDividerSetters
+            swapRootView(newRoot, dividers: dividers)
+            restoreRelayFocus(after: currentLayout, forwardToHost: false)
+            return
+        }
+        // Enter zoom: pick the focused pane (or the first available one
+        // when nothing has been clicked yet) and reparent its view into
+        // the split content container as the sole child.
+        let target = lastClickedSurfaceID.flatMap { panesBySurfaceID[$0] != nil ? $0 : nil }
+            ?? firstSurfaceID(in: currentLayout)
+        guard let surfaceID = target,
+              let slot = panesBySurfaceID[surfaceID],
+              let container = splitContentContainer
+        else {
+            #if DEBUG
+            dlog("relay.zoom enter no-target")
+            #endif
+            return
+        }
+        zoomedSurfaceID = surfaceID
+        #if DEBUG
+        dlog("relay.zoom enter surface=\(Self.shortSurfaceID(surfaceID))")
+        #endif
+        for sub in container.subviews { sub.removeFromSuperview() }
+        let paneView = slot.view
+        paneView.translatesAutoresizingMaskIntoConstraints = false
+        container.addSubview(paneView)
+        NSLayoutConstraint.activate([
+            paneView.topAnchor.constraint(equalTo: container.topAnchor),
+            paneView.bottomAnchor.constraint(equalTo: container.bottomAnchor),
+            paneView.leadingAnchor.constraint(equalTo: container.leadingAnchor),
+            paneView.trailingAnchor.constraint(equalTo: container.trailingAnchor),
+        ])
+        focusRelayPane(surfaceID: surfaceID, forwardToHost: false)
     }
 
     @MainActor
@@ -1030,6 +1099,10 @@ final class PeerRelayWorkspaceWindowController: NSWindowController, NSWindowDele
         ensureBodyStack(in: window)
         guard let splitContainer = splitContentContainer else { return }
 
+        // Any layout swap implicitly restores the split tree. Drop any
+        // stale zoom marker so a subsequent Cmd+Shift+Enter zooms-in
+        // again from a clean state instead of trying to "exit zoom".
+        zoomedSurfaceID = nil
         for sub in splitContainer.subviews { sub.removeFromSuperview() }
         newRoot.translatesAutoresizingMaskIntoConstraints = false
         splitContainer.addSubview(newRoot)

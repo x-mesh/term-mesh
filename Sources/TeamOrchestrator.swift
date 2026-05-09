@@ -3081,9 +3081,11 @@ final class TeamOrchestrator: ObservableObject {
                 "team_name": teamName,
                 "task_id": NSNull(),
                 "agent_name": message.from,
-                "reason": message.type,
+                "status": message.type,
+                "reason": message.content,
                 "age_seconds": Int(now.timeIntervalSince(message.timestamp)),
                 "summary": message.content,
+                "message_type": message.type,
                 "message_id": message.id,
             ]
             if let to = message.to { item["to"] = to }

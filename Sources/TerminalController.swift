@@ -3352,17 +3352,22 @@ class TerminalController {
 
     // MARK: - Team Preset Handlers (off-main-thread safe)
 
-    /// List all built-in smart team presets with their agent definitions.
+    /// List all built-in smart and workflow team presets with their agent definitions.
     private func teamDataPresetList(params: [String: Any], id: Any?) -> String {
         let detector = ProviderDetector.shared
-        let presets: [[String: Any]] = SmartTeamPreset.builtIn.map { preset in
+        let presetManager = AgentRolePresetManager.shared
+        let smartPresets: [[String: Any]] = SmartTeamPreset.builtIn.map { preset in
             let resolved = preset.resolve(with: detector)
             return [
+                "type": "smart",
                 "id": preset.id,
                 "name": preset.name,
                 "icon": preset.icon,
                 "description": preset.description,
                 "leader_mode": preset.leaderMode,
+                "roles": preset.agents.map(\.role),
+                "task_templates": [],
+                "review_checkpoints": [],
                 "agent_count": resolved.count,
                 "agents": resolved.map { agent -> [String: Any] in
                     [
@@ -3381,6 +3386,27 @@ class TerminalController {
                 },
             ]
         }
+        let workflowPresets: [[String: Any]] = WorkflowPresetDefinition.builtIn.map { preset in
+            let resolved = resolvedWorkflowAgents(
+                for: preset,
+                detector: detector,
+                presetManager: presetManager
+            )
+            return [
+                "type": "workflow",
+                "id": preset.id,
+                "name": preset.name,
+                "icon": preset.icon,
+                "description": "Workflow preset with \(preset.roles.count) roles and \(preset.taskTemplates.count) task templates",
+                "leader_mode": preset.leaderMode,
+                "roles": preset.roles,
+                "task_templates": preset.taskTemplates,
+                "review_checkpoints": preset.reviewCheckpoints,
+                "agent_count": resolved.count,
+                "agents": resolved,
+            ]
+        }
+        let presets = smartPresets + workflowPresets
         return v2Ok(id: id, result: ["presets": presets, "count": presets.count])
     }
 
@@ -3390,32 +3416,81 @@ class TerminalController {
         let presetManager = AgentRolePresetManager.shared
         let defaultColors = ["green", "blue", "yellow", "magenta", "cyan", "red"]
 
-        // Mode 1: Resolve by preset_id
+        // Mode 1: Resolve by preset_id (smart preset or workflow preset)
         if let presetId = params["preset_id"] as? String {
-            guard let preset = SmartTeamPreset.builtIn.first(where: { $0.id == presetId }) else {
-                return v2Error(id: id, code: "not_found", message: "Unknown preset_id: \(presetId)")
+            if let preset = SmartTeamPreset.builtIn.first(where: { $0.id == presetId }) {
+                let resolved = preset.resolve(with: detector)
+                let agents: [[String: Any]] = resolved.enumerated().map { i, agent in
+                    let rolePreset = presetManager.presets.first(where: { $0.name == agent.role })
+                    return [
+                        "name": agent.role,
+                        "cli": agent.cli,
+                        "model": agent.model,
+                        "agent_type": agent.role,
+                        "color": rolePreset?.color ?? defaultColors[i % defaultColors.count],
+                        "instructions": rolePreset?.instructions ?? "",
+                    ]
+                }
+                return v2Ok(id: id, result: [
+                    "preset_id": presetId,
+                    "preset_type": "smart",
+                    "preset_name": preset.name,
+                    "leader_mode": preset.leaderMode,
+                    "agents": agents,
+                    "task_templates": [],
+                    "review_checkpoints": [],
+                    "count": agents.count,
+                ])
             }
-            let resolved = preset.resolve(with: detector)
-            let agents: [[String: Any]] = resolved.enumerated().map { i, agent in
-                let rolePreset = presetManager.presets.first(where: { $0.name == agent.role })
-                return [
-                    "name": agent.role,
-                    "cli": agent.cli,
-                    "model": agent.model,
-                    "agent_type": agent.role,
-                    "color": rolePreset?.color ?? defaultColors[i % defaultColors.count],
-                    "instructions": rolePreset?.instructions ?? "",
-                ]
+
+            if let workflow = WorkflowPresetDefinition.builtIn.first(where: { $0.id == presetId }) {
+                let agents = resolvedWorkflowAgents(
+                    for: workflow,
+                    detector: detector,
+                    presetManager: presetManager
+                )
+                let unknownRoles = Set(workflow.roles).subtracting(Set(agents.compactMap { $0["name"] as? String }))
+                if !unknownRoles.isEmpty {
+                    return v2Error(id: id, code: "unknown_roles", message: "Unknown workflow role(s): \(unknownRoles.sorted().joined(separator: ", "))")
+                }
+                return v2Ok(id: id, result: [
+                    "preset_id": presetId,
+                    "preset_type": "workflow",
+                    "preset_name": workflow.name,
+                    "leader_mode": workflow.leaderMode,
+                    "agents": agents,
+                    "task_templates": workflow.taskTemplates,
+                    "review_checkpoints": workflow.reviewCheckpoints,
+                    "count": agents.count,
+                ])
             }
+
+            return v2Error(id: id, code: "not_found", message: "Unknown preset_id: \(presetId)")
+        }
+
+        // Mode 2: Resolve by workflow_id alias.
+        if let workflowId = params["workflow_id"] as? String {
+            guard let workflow = WorkflowPresetDefinition.builtIn.first(where: { $0.id == workflowId }) else {
+                return v2Error(id: id, code: "not_found", message: "Unknown workflow_id: \(workflowId)")
+            }
+            let agents = resolvedWorkflowAgents(
+                for: workflow,
+                detector: detector,
+                presetManager: presetManager
+            )
             return v2Ok(id: id, result: [
-                "preset_id": presetId,
-                "leader_mode": preset.leaderMode,
+                "preset_id": workflowId,
+                "preset_type": "workflow",
+                "preset_name": workflow.name,
+                "leader_mode": workflow.leaderMode,
                 "agents": agents,
+                "task_templates": workflow.taskTemplates,
+                "review_checkpoints": workflow.reviewCheckpoints,
                 "count": agents.count,
             ])
         }
 
-        // Mode 2: Resolve by roles array
+        // Mode 3: Resolve by roles array
         if let roles = params["roles"] as? [String] {
             guard !roles.isEmpty else {
                 return v2Error(id: id, code: "invalid_params", message: "Empty roles array")
@@ -3440,10 +3515,42 @@ class TerminalController {
             if !unknownRoles.isEmpty {
                 return v2Error(id: id, code: "unknown_roles", message: "Unknown role(s): \(unknownRoles.joined(separator: ", ")). Use team.preset.list to see available roles.")
             }
-            return v2Ok(id: id, result: ["agents": agents, "count": agents.count])
+            return v2Ok(id: id, result: [
+                "preset_type": "roles",
+                "agents": agents,
+                "task_templates": [],
+                "review_checkpoints": [],
+                "count": agents.count,
+            ])
         }
 
-        return v2Error(id: id, code: "invalid_params", message: "Missing preset_id or roles param")
+        return v2Error(id: id, code: "invalid_params", message: "Missing preset_id, workflow_id, or roles param")
+    }
+
+    private func resolvedWorkflowAgents(
+        for workflow: WorkflowPresetDefinition,
+        detector: ProviderDetector,
+        presetManager: AgentRolePresetManager
+    ) -> [[String: Any]] {
+        let defaultColors = ["green", "blue", "yellow", "magenta", "cyan", "red"]
+        return workflow.roles.enumerated().compactMap { i, roleName in
+            guard let rolePreset = presetManager.presets.first(where: { $0.name == roleName }) else {
+                return nil
+            }
+            let cli = detector.isAvailable(rolePreset.cli) ? rolePreset.cli : "claude"
+            let model = rolePreset.model.isEmpty ? AgentRolePreset.defaultModel(for: cli) : rolePreset.model
+            return [
+                "role": rolePreset.name,
+                "name": rolePreset.name,
+                "cli": cli,
+                "model": model,
+                "agent_type": rolePreset.name,
+                "color": rolePreset.color.isEmpty ? defaultColors[i % defaultColors.count] : rolePreset.color,
+                "instructions": rolePreset.instructions,
+                "status": detector.isAvailable(rolePreset.cli) ? "normal" : "fallback",
+                "reason": "Workflow role",
+            ]
+        }
     }
 
     // MARK: - V2 Agent Team Methods

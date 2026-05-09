@@ -359,6 +359,14 @@ fn translate_terminal_csi_input(seq: &[u8]) -> Option<Vec<u8>> {
             return Some(vec![byte]);
         }
     }
+    // Shift+Enter is the universal "insert literal newline" keybinding for
+    // multi-line input fields (codex, claude code, jupyter, …). When the
+    // local terminal is in kitty mode it emits `CSI 13 ; 2 u`; the host
+    // shell / TUI rarely shares that mode and prints the escape verbatim.
+    // Forward an LF instead so the receiving text field sees a newline.
+    if modifiers == 2 && codepoint == 13 {
+        return Some(vec![b'\n']);
+    }
     // Kitty keyboard protocol uses 1-based modifier flags. Ctrl is bit 2
     // after subtracting 1, so Ctrl-only is ";5".
     if modifiers == 0 || ((modifiers - 1) & 0b100) == 0 {
@@ -785,6 +793,18 @@ mod tests {
         assert_eq!(filter(b"\x1B[27;1u"), b"\x1B");
         assert_eq!(filter(b"\x1B[27;1:1u"), b"\x1B");
         assert_eq!(filter(b"\x1B[27;1:2u"), b"\x1B");
+    }
+
+    #[test]
+    fn translates_shift_enter_to_newline() {
+        assert_eq!(filter(b"\x1B[13;2u"), b"\n");
+        assert_eq!(filter(b"\x1B[13;2:1u"), b"\n");
+        assert_eq!(filter(b"\x1B[13;2:2u"), b"\n");
+    }
+
+    #[test]
+    fn drops_shift_enter_release_event() {
+        assert!(filter(b"\x1B[13;2:3u").is_empty());
     }
 
     #[test]

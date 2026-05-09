@@ -772,7 +772,10 @@ final class TeamDataStore: @unchecked Sendable {
                 "kind": "message",
                 "priority": priority,
                 "team_name": teamName,
+                "task_id": NSNull(),
+                "agent_name": message.from,
                 "from": message.from,
+                "status": message.type,
                 "reason": message.content,
                 "age_seconds": Int(now.timeIntervalSince(message.timestamp)),
                 "summary": String(message.content.prefix(120)),
@@ -783,14 +786,15 @@ final class TeamDataStore: @unchecked Sendable {
             items.append(item)
         }
 
-        if topOnly {
-            // O(n) min scan instead of O(n log n) sort for single item
-            if let best = items.min(by: { ($0["priority"] as? Int ?? 99) < ($1["priority"] as? Int ?? 99) }) {
-                return [best]
-            }
-            return []
+        items.sort {
+            let lhsPriority = $0["priority"] as? Int ?? Int.max
+            let rhsPriority = $1["priority"] as? Int ?? Int.max
+            if lhsPriority != rhsPriority { return lhsPriority < rhsPriority }
+            let lhsAge = $0["age_seconds"] as? Int ?? .min
+            let rhsAge = $1["age_seconds"] as? Int ?? .min
+            return lhsAge > rhsAge
         }
-        items.sort { ($0["priority"] as? Int ?? 99) < ($1["priority"] as? Int ?? 99) }
+        if topOnly, let first = items.first { return [first] }
         return items
     }
 

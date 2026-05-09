@@ -106,7 +106,7 @@ struct AgentRolePreset: Identifiable, Codable, Equatable {
 }
 
 struct WorkflowPresetDefinition: Identifiable, Codable, Equatable {
-    var id: UUID
+    var id: String
     var name: String
     var icon: String
     var roles: [String]
@@ -115,7 +115,7 @@ struct WorkflowPresetDefinition: Identifiable, Codable, Equatable {
     var reviewCheckpoints: [String]
 
     init(
-        id: UUID = UUID(),
+        id: String,
         name: String,
         icon: String,
         roles: [String],
@@ -134,6 +134,7 @@ struct WorkflowPresetDefinition: Identifiable, Codable, Equatable {
 
     static let builtIn: [WorkflowPresetDefinition] = [
         WorkflowPresetDefinition(
+            id: "bug-triage",
             name: "Bug Triage",
             icon: "ladybug",
             roles: ["debugger", "explorer", "tester"],
@@ -142,6 +143,7 @@ struct WorkflowPresetDefinition: Identifiable, Codable, Equatable {
             reviewCheckpoints: ["blocked on repro", "review fix scope"]
         ),
         WorkflowPresetDefinition(
+            id: "feature-build",
             name: "Feature Build",
             icon: "hammer",
             roles: ["planner", "executor", "tester", "reviewer"],
@@ -150,6 +152,7 @@ struct WorkflowPresetDefinition: Identifiable, Codable, Equatable {
             reviewCheckpoints: ["implementation review", "final acceptance"]
         ),
         WorkflowPresetDefinition(
+            id: "refactor-verify",
             name: "Refactor + Verify",
             icon: "arrow.triangle.2.circlepath",
             roles: ["refactorer", "reviewer", "tester"],
@@ -158,6 +161,7 @@ struct WorkflowPresetDefinition: Identifiable, Codable, Equatable {
             reviewCheckpoints: ["behavior-preserving review", "test pass review"]
         ),
         WorkflowPresetDefinition(
+            id: "release-prep",
             name: "Release Prep",
             icon: "shippingbox",
             roles: ["planner", "reviewer", "tester", "writer", "devops"],
