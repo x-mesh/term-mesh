@@ -2,6 +2,18 @@
 
 All notable changes to term-mesh are documented here.
 
+## [0.103.3] - 2026-05-10
+
+### Added
+- **Cmd+Shift+Return zooms a single pane to fill the relay window** — peer-relay workspace windows now honour the same "Zoom Pane" shortcut as local windows. The focused pane expands to occupy the full relay window, hiding all the other panes; pressing Cmd+Shift+Return again restores the original split tree. The zoom is purely local — the host workspace and any other relay clients are untouched. Useful when a remote split has too many panes to read comfortably and you want to focus on one without resizing the window or asking the host to rearrange.
+
+### Fixed
+- **Shift+Return inserts a real newline in remote multi-line input fields (codex, Claude Code, jupyter, …)** — when the local Ghostty has the Kitty keyboard protocol enabled it encodes Shift+Return as `CSI 13 ; 2 u`. The remote shell / TUI rarely shares that mode and was printing `[13;2u` verbatim into whatever multi-line input field was open. The peer-relay filter now translates Shift+Return to a literal LF (`\n`) before forwarding, which every text-input field treats as "insert newline".
+
+### Thanks to 1 contributor!
+
+- [@JINWOO-J](https://github.com/JINWOO-J)
+
 ## [0.103.2] - 2026-05-10
 
 ### Fixed
