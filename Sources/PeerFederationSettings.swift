@@ -8,6 +8,7 @@
 
 import Foundation
 import Darwin
+import PeerProto
 
 enum PeerFederationSettings {
     static let autoStartKey      = "peerFederationAutoStart"
@@ -44,6 +45,10 @@ enum PeerFederationSettings {
     /// host's local viewer too.
     static var forceRedrawOnAttach: Bool {
         UserDefaults.standard.bool(forKey: forceRedrawKey)
+    }
+
+    static var peerIDHex: String {
+        (try? PeerIdentity.loadOrCreate()).map(PeerIdentity.hexString) ?? "unavailable"
     }
 
     // MARK: - Recent SSH hosts

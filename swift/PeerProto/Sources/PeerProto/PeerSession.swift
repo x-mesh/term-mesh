@@ -55,7 +55,7 @@ public struct PeerSessionOptions: Sendable {
 
     public init(
         displayName: String = "term-mesh-swift",
-        peerID: Data = Data(count: 16),
+        peerID: Data = PeerIdentity.defaultPeerID(),
         appVersion: String = "0.0.1",
         authMethod: String = "ssh-passthrough",
         clientProtocolVersion: String = "1.0.0"

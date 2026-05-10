@@ -1,5 +1,6 @@
 import AppKit
 import SwiftUI
+import PeerProto
 
 enum SettingsSection: String, CaseIterable, Identifiable {
     case app = "app"
@@ -177,6 +178,7 @@ struct SettingsView: View {
     @State private var settingsSearchQuery = ""
     @State private var showClearBrowserHistoryConfirmation = false
     @State private var showOpenAccessConfirmation = false
+    @State private var showPeerIDRegenerateConfirmation = false
     @State private var pendingOpenAccessMode: SocketControlMode?
     @State private var browserHistoryEntryCount: Int = 0
     @State private var browserInsecureHTTPAllowlistDraft = BrowserInsecureHTTPSettings.defaultAllowlistText
@@ -191,6 +193,9 @@ struct SettingsView: View {
     @State private var daemonLogTail: AttributedString?
     @State private var shellHealthEntries: [ShellHealthEntry] = []
     @State private var shellFixCopied = false
+    @State private var peerFederationPeerIDHex = "Loading..."
+    @State private var peerFederationPeerIDStatusMessage: String?
+    @State private var peerFederationPeerIDStatusIsError = false
     @State private var selectedSection: SettingsSection = .app
 
     private var selectedWorkspacePlacement: NewWorkspacePlacement {
@@ -412,6 +417,18 @@ struct SettingsView: View {
             }
         } message: {
             Text("This disables ancestry and password checks and opens the socket to all local users. Only enable when you understand the risk.")
+        }
+        .confirmationDialog(
+            "Regenerate peer ID?",
+            isPresented: $showPeerIDRegenerateConfirmation,
+            titleVisibility: .visible
+        ) {
+            Button("Regenerate Peer ID", role: .destructive) {
+                regeneratePeerIdentity()
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("Existing peer pairings may stop working. Restart active peer sessions after regenerating this ID.")
         }
     }
 
@@ -1950,6 +1967,37 @@ struct SettingsView: View {
             SettingsCardDivider()
 
             SettingsCardRow(
+                "Peer ID",
+                subtitle: "Stable 16-byte identity stored in this Mac's keychain. Regenerating can invalidate existing pairings.",
+                controlWidth: 360
+            ) {
+                VStack(alignment: .trailing, spacing: 4) {
+                    HStack(spacing: 8) {
+                        Text(peerFederationPeerIDHex)
+                            .font(.system(size: 11, design: .monospaced))
+                            .foregroundColor(.secondary)
+                            .lineLimit(1)
+                            .truncationMode(.middle)
+                            .help(peerFederationPeerIDHex)
+                        Button("Regenerate") {
+                            showPeerIDRegenerateConfirmation = true
+                        }
+                        .buttonStyle(.bordered)
+                        .controlSize(.small)
+                    }
+                    if let message = peerFederationPeerIDStatusMessage {
+                        Text(message)
+                            .font(.caption2)
+                            .foregroundColor(peerFederationPeerIDStatusIsError ? .red : .secondary)
+                            .lineLimit(2)
+                            .multilineTextAlignment(.trailing)
+                    }
+                }
+            }
+
+            SettingsCardDivider()
+
+            SettingsCardRow(
                 "Force TUI redraw on attach",
                 subtitle: peerFederationForceRedraw
                     ? "Sends Ctrl-L to the host PTY whenever a peer attaches so vim, htop, less repaint with full color. The redraw is also visible to the host's local viewer."
@@ -1966,6 +2014,42 @@ struct SettingsView: View {
         }
         .onAppear {
             peerFederationServerRunning = PeerHostCoordinator.shared.isRunning
+            refreshPeerIdentityDisplay()
+        }
+    }
+
+    private func refreshPeerIdentityDisplay() {
+        Task.detached {
+            let result = Result { try PeerIdentity.loadOrCreate() }
+            await MainActor.run {
+                switch result {
+                case .success(let id):
+                    peerFederationPeerIDHex = PeerIdentity.hexString(id)
+                    peerFederationPeerIDStatusMessage = nil
+                    peerFederationPeerIDStatusIsError = false
+                case .failure(let error):
+                    peerFederationPeerIDHex = "Unavailable"
+                    peerFederationPeerIDStatusMessage = String(describing: error)
+                    peerFederationPeerIDStatusIsError = true
+                }
+            }
+        }
+    }
+
+    private func regeneratePeerIdentity() {
+        Task.detached {
+            let result = Result { try PeerIdentity.regenerate() }
+            await MainActor.run {
+                switch result {
+                case .success(let id):
+                    peerFederationPeerIDHex = PeerIdentity.hexString(id)
+                    peerFederationPeerIDStatusMessage = "Regenerated. Restart active peer sessions."
+                    peerFederationPeerIDStatusIsError = false
+                case .failure(let error):
+                    peerFederationPeerIDStatusMessage = String(describing: error)
+                    peerFederationPeerIDStatusIsError = true
+                }
+            }
         }
     }
 

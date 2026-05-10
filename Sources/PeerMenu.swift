@@ -136,6 +136,29 @@ final class PeerClientCoordinator: NSObject {
         PeerConnectionsWindowController.shared.showAndFocus()
     }
 
+    /// Open a workspace relay window initiated from the sidebar.
+    /// Registers the controller in the shared roster so the Connections
+    /// panel and `RemoteHostStore` both see it.
+    func openWorkspaceRelayForSidebar(
+        hostSockPath: String,
+        workspace: Termmesh_Peer_V1_Workspace,
+        hostDisplayName: String?
+    ) {
+        let controller = PeerRelayWorkspaceWindowController(
+            hostSockPath: hostSockPath,
+            workspace: workspace,
+            hostDisplayName: hostDisplayName
+        )
+        openWorkspaceRelays.append(controller)
+        controller.onClose = { [weak self, weak controller] in
+            guard let self, let controller else { return }
+            self.openWorkspaceRelays.removeAll { $0 === controller }
+            self.postRelaysChanged()
+        }
+        controller.show()
+        postRelaysChanged()
+    }
+
     @objc func promptAndRunRelayWorkspaceSSH(_ sender: Any?) {
         Task { @MainActor in
             await self.promptAndRunRelayWorkspaceSSHAsync()
