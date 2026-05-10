@@ -2696,9 +2696,9 @@ final class TeamOrchestrator: ObservableObject {
     /// New-style names pass through directly.
     private static func geminiModelName(_ shortName: String) -> String {
         switch shortName.lowercased() {
-        case "opus":   return "gemini-2.5-pro"
-        case "sonnet": return "gemini-2.5-flash"
-        case "haiku":  return "gemini-2.5-flash-lite"
+        case "opus":   return "gemini-3.1-pro-preview"
+        case "sonnet": return "gemini-3-flash-preview"
+        case "haiku":  return "gemini-3.1-flash-lite-preview"
         default:       return shortName
         }
     }
