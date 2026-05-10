@@ -1936,10 +1936,10 @@ final class TeamOrchestrator: ObservableObject {
     }
 
     /// Send text to a specific agent in a team.
-    func sendToAgent(teamName: String, agentName: String, text: String, tabManager: TabManager, withReturn: Bool = true) -> Bool {
+    func sendToAgent(teamName: String, agentName: String, text: String, tabManager: TabManager, withReturn: Bool = true, completion: ((Bool) -> Void)? = nil) -> Bool {
         guard let team = teams[teamName] else { return false }
         guard let agent = team.agents.first(where: { $0.name == agentName }) else { return false }
-        return sendTextToPanel(workspaceId: agent.workspaceId, panelId: agent.panelId, text: text, tabManager: tabManager, withReturn: withReturn)
+        return sendTextToPanel(workspaceId: agent.workspaceId, panelId: agent.panelId, text: text, tabManager: tabManager, withReturn: withReturn, completion: completion)
     }
 
     /// Send text to an agent without requiring a tabManager.
@@ -2046,7 +2046,8 @@ final class TeamOrchestrator: ObservableObject {
         taskTitle: String? = nil,
         priority: Int? = nil,
         context: String? = nil,
-        tabManager: TabManager
+        tabManager: TabManager,
+        completion: ((Bool) -> Void)? = nil
     ) -> DelegateResult? {
         let title = taskTitle?.nilIfBlank ?? String(text.prefix(80))
         guard let task = TeamDataStore.shared.createTask(
@@ -2057,9 +2058,8 @@ final class TeamOrchestrator: ObservableObject {
         ) else { return nil }
         let instruction = formatDelegateInstruction(task: task, text: text, context: context)
         // Send text WITHOUT Return — the Rust CLI sends Return separately via
-        // team.send_key RPC after a brief delay. This ensures Return goes through
-        // the reliable sendNamedKey path (same as surface.send_key).
-        let delivered = sendToAgent(teamName: teamName, agentName: agentName, text: instruction, tabManager: tabManager, withReturn: false)
+        // team.send_key RPC after receiving the paste-completion ack (completion callback).
+        let delivered = sendToAgent(teamName: teamName, agentName: agentName, text: instruction, tabManager: tabManager, withReturn: false, completion: completion)
         return DelegateResult(task: task, textDelivered: delivered, instruction: instruction)
     }
 
@@ -2165,7 +2165,7 @@ final class TeamOrchestrator: ObservableObject {
     /// 4 attempts: 50 → 150 → 400 → 800 ms (total ~1.4 s before final failure).
     private static let sendTextRetryDelaysMs: [Double] = [50, 150, 400, 800]
 
-    private func sendTextToPanel(workspaceId: UUID, panelId: UUID, text: String, tabManager: TabManager, withReturn: Bool = true, retryCount: Int = 0) -> Bool {
+    private func sendTextToPanel(workspaceId: UUID, panelId: UUID, text: String, tabManager: TabManager, withReturn: Bool = true, retryCount: Int = 0, completion: ((Bool) -> Void)? = nil) -> Bool {
         // Try the provided tabManager first, then fall back to global surface lookup
         // for cross-window scenarios (e.g. broadcast when agents are in a different window).
         let panel: TerminalPanel
@@ -2192,9 +2192,12 @@ final class TeamOrchestrator: ObservableObject {
                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
                     _ = self?.sendTextToPanel(
                         workspaceId: workspaceId, panelId: panelId, text: text,
-                        tabManager: tabManager, withReturn: withReturn, retryCount: retryCount + 1
+                        tabManager: tabManager, withReturn: withReturn, retryCount: retryCount + 1,
+                        completion: completion
                     )
                 }
+            } else {
+                completion?(false)
             }
             return false
         }
@@ -2228,9 +2231,12 @@ final class TeamOrchestrator: ObservableObject {
                 DispatchQueue.main.asyncAfter(deadline: .now() + delayMs / 1000.0) { [weak self] in
                     _ = self?.sendTextToPanel(
                         workspaceId: workspaceId, panelId: panelId, text: text,
-                        tabManager: tabManager, withReturn: withReturn, retryCount: retryCount + 1
+                        tabManager: tabManager, withReturn: withReturn, retryCount: retryCount + 1,
+                        completion: completion
                     )
                 }
+            } else {
+                completion?(false)
             }
             return false
         }
@@ -2244,6 +2250,20 @@ final class TeamOrchestrator: ObservableObject {
             .replacingOccurrences(of: "\r\n", with: " ")
             .replacingOccurrences(of: "\n", with: " ")
             .replacingOccurrences(of: "\r", with: " ")
+        if let completion {
+            // Ack-based path: sendIMETextResult fires completion when paste drains.
+            // Dispatch async so completion always fires after delegateToAgent returns,
+            // ensuring capturedDelegateResult is set before the caller reads it.
+            panel.surface.sendIMETextResult(normalized, withReturn: withReturn) { result in
+                let ok: Bool
+                switch result { case .success: ok = true; default: ok = false }
+                DispatchQueue.main.async { completion(ok) }
+            }
+            #if DEBUG
+            dlog("[team.sendTextToPanel] sendIMETextResult (ack) panelId=\(panelId.uuidString.prefix(8)) textLen=\(normalized.count) withReturn=\(withReturn) text=\(normalized.prefix(80).debugDescription)")
+            #endif
+            return true
+        }
         let sent = panel.surface.sendIMEText(normalized, withReturn: withReturn)
         #if DEBUG
         dlog("[team.sendTextToPanel] sendIMEText panelId=\(panelId.uuidString.prefix(8)) textLen=\(normalized.count) withReturn=\(withReturn) sent=\(sent) text=\(normalized.prefix(80).debugDescription)")

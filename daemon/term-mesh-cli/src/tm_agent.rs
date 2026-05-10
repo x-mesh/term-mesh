@@ -5401,9 +5401,10 @@ fn run_delegate_result(
             // Send Return key separately via team.send_key RPC.
             // delegateToAgent sends text WITHOUT Return (paste only). Return is sent
             // through the reliable sendNamedKey path (same as surface.send_key RPC).
+            // Swift ack-based completion is the primary ordering guarantee;
+            // this sleep is a minimal safety margin only.
             if text_delivered {
-                // Brief delay for PTY to flush the bracketed paste
-                std::thread::sleep(Duration::from_millis(150));
+                std::thread::sleep(Duration::from_millis(20));
 
                 // Retry Return delivery up to 5 times with backoff
                 for attempt in 0..5u32 {
