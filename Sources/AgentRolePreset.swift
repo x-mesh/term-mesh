@@ -33,6 +33,21 @@ struct AgentRolePreset: Identifiable, Codable, Equatable {
         }
     }
 
+    /// User-facing label for a model in a given CLI context.
+    /// Internal storage may use tier names ("opus"/"sonnet"/"haiku") for cross-CLI uniformity,
+    /// but UI shows CLI-native text.
+    static func modelDisplayLabel(_ model: String, for cli: String) -> String {
+        switch (cli.lowercased(), model.lowercased()) {
+        case ("codex", "opus"):   return "gpt-5.5 (high)"
+        case ("codex", "sonnet"): return "gpt-5.5 (medium)"
+        case ("codex", "haiku"):  return "gpt-5.5 (low)"
+        case ("gemini", "opus"):   return "gemini-3.1-pro-preview"
+        case ("gemini", "sonnet"): return "gemini-3-flash-preview"
+        case ("gemini", "haiku"):  return "gemini-3.1-flash-lite-preview"
+        default: return model
+        }
+    }
+
     /// Available models per CLI type (built-in + user-custom).
     static func models(for cli: String) -> [String] {
         let builtIn = builtInModels(for: cli)

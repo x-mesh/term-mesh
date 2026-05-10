@@ -369,7 +369,7 @@ struct TeamCreationView: View {
                 if leaderMode != "repl" {
                     Picker("", selection: $leaderModel) {
                         ForEach(AgentRolePreset.models(for: leaderMode), id: \.self) { m in
-                            Text(m).tag(m)
+                            Text(AgentRolePreset.modelDisplayLabel(m, for: leaderMode)).tag(m)
                         }
                     }
                     .fixedSize()
@@ -609,7 +609,7 @@ struct TeamCreationView: View {
                     .frame(width: 85)
                     Picker("", selection: $bulkModel) {
                         ForEach(bulkModels, id: \.self) { m in
-                            Text(m).tag(m)
+                            Text(AgentRolePreset.modelDisplayLabel(m, for: bulkCli)).tag(m)
                         }
                     }
                     .frame(width: 130)
@@ -703,7 +703,7 @@ struct TeamCreationView: View {
                     set: { agents[index].preset.model = $0 }
                 )) {
                     ForEach(AgentRolePreset.models(for: agent.preset.cli), id: \.self) { m in
-                        Text(m).tag(m)
+                        Text(AgentRolePreset.modelDisplayLabel(m, for: agent.preset.cli)).tag(m)
                     }
                 }
                 .frame(width: 130)
