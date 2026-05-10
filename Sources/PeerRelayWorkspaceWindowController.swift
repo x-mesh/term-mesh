@@ -10,6 +10,7 @@
 // PeerRelaySession on the fly.
 
 import AppKit
+import SwiftUI
 import Bonsplit
 import PeerProto
 
@@ -225,7 +226,7 @@ final class PeerRelayWorkspaceWindowController: NSWindowController, NSWindowDele
     /// Workspace title shown to the host. Mirrors `baseTitle` minus
     /// the "Peer Workspace · " prefix so display lists can show it
     /// without redundancy.
-    private let workspaceTitle: String
+    private var workspaceTitle: String
     private var workspaceID: Data
 
     /// Snapshot of the controller's connection-level metadata for
@@ -244,7 +245,7 @@ final class PeerRelayWorkspaceWindowController: NSWindowController, NSWindowDele
             connectedAt: connectedAt
         )
     }
-    private let baseTitle: String
+    private var baseTitle: String
     private var currentLayout: Termmesh_Peer_V1_WorkspaceLayout
     private var panesBySurfaceID: [Data: PaneSlot] = [:]
     /// Splits the renderer needs to apply divider positions to after
@@ -309,6 +310,9 @@ final class PeerRelayWorkspaceWindowController: NSWindowController, NSWindowDele
     private var splitRootContainer: NSView?
     private var splitContentContainer: NSView?
     private var statusOverlay: PeerRelayStatusOverlay?
+    private var sidebarModel: PeerRelayWorkspaceSidebarModel?
+    private var sidebarHostingView: NSHostingView<PeerRelayWorkspaceSidebarView>?
+    private var workspaceFetchTask: Task<Void, Never>?
 
     var onClose: (@MainActor () -> Void)?
 
@@ -343,6 +347,12 @@ final class PeerRelayWorkspaceWindowController: NSWindowController, NSWindowDele
 
         super.init(window: window)
         window.delegate = self
+
+        let model = PeerRelayWorkspaceSidebarModel()
+        model.workspaces = [PeerRelayWorkspaceSummary(id: self.workspaceID, title: self.workspaceTitle)]
+        model.selectedID = self.workspaceID
+        model.onSelect = { [weak self] ws in self?.switchToWorkspace(ws) }
+        self.sidebarModel = model
     }
 
     required init?(coder: NSCoder) { fatalError("not used") }
@@ -519,6 +529,7 @@ final class PeerRelayWorkspaceWindowController: NSWindowController, NSWindowDele
         // the first layout pass, so initial-attach errors can land in
         // the banner instead of an immediate window close.
         if let window { ensureBodyStack(in: window) }
+        fetchWorkspaces()
         // Install the key monitor immediately so Cmd+D/W/T are
         // intercepted from the moment the window appears, not just
         // after startSubscription completes. dispatchSplit et al.
@@ -568,6 +579,8 @@ final class PeerRelayWorkspaceWindowController: NSWindowController, NSWindowDele
         }
         startTask?.cancel()
         startTask = nil
+        workspaceFetchTask?.cancel()
+        workspaceFetchTask = nil
         subscriptionTask?.cancel()
         subscriptionTask = nil
         subscriptionSession = nil
@@ -1149,6 +1162,22 @@ final class PeerRelayWorkspaceWindowController: NSWindowController, NSWindowDele
         self.splitContentContainer = splitContent
         let overlay = PeerRelayStatusOverlay(frame: .zero)
         self.statusOverlay = overlay
+
+        // Sidebar — 160 pt left column, 1 pt separator, then split tree.
+        let model = sidebarModel ?? PeerRelayWorkspaceSidebarModel()
+        if sidebarModel == nil { sidebarModel = model }
+        let sidebarView = PeerRelayWorkspaceSidebarView(model: model)
+        let hosting = NSHostingView(rootView: sidebarView)
+        hosting.translatesAutoresizingMaskIntoConstraints = false
+        self.sidebarHostingView = hosting
+
+        let separator = NSView()
+        separator.translatesAutoresizingMaskIntoConstraints = false
+        separator.wantsLayer = true
+        separator.layer?.backgroundColor = NSColor.separatorColor.cgColor
+
+        split.addSubview(hosting)
+        split.addSubview(separator)
         split.addSubview(splitContent)
         split.addSubview(overlay)
 
@@ -1164,11 +1193,25 @@ final class PeerRelayWorkspaceWindowController: NSWindowController, NSWindowDele
             split.leadingAnchor.constraint(equalTo: container.leadingAnchor),
             split.trailingAnchor.constraint(equalTo: container.trailingAnchor),
 
+            // Sidebar column.
+            hosting.topAnchor.constraint(equalTo: split.topAnchor),
+            hosting.bottomAnchor.constraint(equalTo: split.bottomAnchor),
+            hosting.leadingAnchor.constraint(equalTo: split.leadingAnchor),
+            hosting.widthAnchor.constraint(equalToConstant: 160),
+
+            // 1 pt separator.
+            separator.topAnchor.constraint(equalTo: split.topAnchor),
+            separator.bottomAnchor.constraint(equalTo: split.bottomAnchor),
+            separator.leadingAnchor.constraint(equalTo: hosting.trailingAnchor),
+            separator.widthAnchor.constraint(equalToConstant: 1),
+
+            // Terminal area.
             splitContent.topAnchor.constraint(equalTo: split.topAnchor),
             splitContent.bottomAnchor.constraint(equalTo: split.bottomAnchor),
-            splitContent.leadingAnchor.constraint(equalTo: split.leadingAnchor),
+            splitContent.leadingAnchor.constraint(equalTo: separator.trailingAnchor),
             splitContent.trailingAnchor.constraint(equalTo: split.trailingAnchor),
 
+            // Overlay covers the whole split area (including sidebar).
             overlay.topAnchor.constraint(equalTo: split.topAnchor),
             overlay.bottomAnchor.constraint(equalTo: split.bottomAnchor),
             overlay.leadingAnchor.constraint(equalTo: split.leadingAnchor),
@@ -1255,6 +1298,72 @@ final class PeerRelayWorkspaceWindowController: NSWindowController, NSWindowDele
             return only
         }
         throw RelayError.ioError("workspace disappeared from host")
+    }
+
+    // MARK: - Sidebar workspace list
+
+    private func fetchWorkspaces() {
+        workspaceFetchTask?.cancel()
+        workspaceFetchTask = Task { [weak self] in
+            guard let self else { return }
+            do {
+                let conn = try await PeerRelaySession.connect(hostSockPath: self.hostSockPath)
+                let workspaces: [Termmesh_Peer_V1_Workspace]
+                do {
+                    workspaces = try await conn.session.listWorkspaces()
+                } catch {
+                    await conn.cancel()
+                    return
+                }
+                await conn.cancel()
+                let summaries = workspaces.map {
+                    PeerRelayWorkspaceSummary(
+                        id: $0.workspaceID,
+                        title: $0.title.isEmpty ? "<workspace>" : $0.title
+                    )
+                }
+                await MainActor.run { [weak self] in
+                    guard let self else { return }
+                    self.sidebarModel?.workspaces = summaries
+                    self.sidebarModel?.selectedID = self.workspaceID
+                }
+            } catch {
+                // Host not reachable — sidebar stays with initial entry.
+            }
+        }
+    }
+
+    private func switchToWorkspace(_ ws: PeerRelayWorkspaceSummary) {
+        guard ws.id != workspaceID else { return }
+        sidebarModel?.selectedID = ws.id
+        workspaceTitle = ws.title
+        baseTitle = "Peer Workspace · \(ws.title)"
+        window?.title = baseTitle
+        workspaceID = ws.id
+        tearDownPeerSessions(keepWindow: true)
+        showRelayOverlay(title: "Switching workspace", detail: ws.title)
+        startTask = Task { [weak self] in
+            guard let self else { return }
+            do {
+                let latest = try await self.fetchLatestWorkspace()
+                await MainActor.run {
+                    self.workspaceID = latest.workspaceID
+                    self.currentLayout = latest.layout
+                }
+                try await self.applyLayout(latest.layout)
+                await self.startSubscription()
+                await MainActor.run { self.hideRelayOverlay() }
+            } catch {
+                let detail = String(describing: error)
+                await MainActor.run { [weak self] in
+                    self?.showRelayOverlay(
+                        title: "Switch failed",
+                        detail: detail,
+                        actionTitle: "Close"
+                    ) { self?.window?.performClose(nil) }
+                }
+            }
+        }
     }
 
     private func fetchSurfaceInfoByIDIfNeeded(
