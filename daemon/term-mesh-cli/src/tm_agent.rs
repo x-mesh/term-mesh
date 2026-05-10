@@ -429,6 +429,15 @@ enum Commands {
         #[arg(long, value_name = "SESSION_ID")]
         leader_session: Option<String>,
     },
+    /// Bridge reply events with XMB_TASK headers into xm-build tasks.json updates
+    XmbBridge {
+        /// Stop after N seconds (default: 0 = run until Ctrl+C)
+        #[arg(long, default_value_t = 0)]
+        timeout: u32,
+        /// Filter to events belonging to a specific leader session
+        #[arg(long, value_name = "SESSION_ID")]
+        leader_session: Option<String>,
+    },
     /// Claim the next available pending task (work-stealing)
     Claim,
     /// Suggest the best agent for a task description based on capability mapping
@@ -3015,6 +3024,21 @@ fn main() {
         return;
     }
 
+    if let Commands::XmbBridge {
+        timeout,
+        leader_session,
+    } = &cli.command
+    {
+        let sock = detect_daemon_socket()
+            .or_else(detect_socket)
+            .unwrap_or_else(|| {
+                eprintln!("Error: no daemon socket found");
+                process::exit(1);
+            });
+        run_xmb_bridge(&sock, *timeout, leader_session.as_deref());
+        return;
+    }
+
     let sock = match detect_socket() {
         Some(s) => s,
         None => {
@@ -3981,6 +4005,14 @@ fn main() {
                 on_event.as_deref(),
                 leader_session.as_deref(),
             );
+            return;
+        }
+        Commands::XmbBridge {
+            timeout,
+            leader_session,
+        } => {
+            let bridge_sock = detect_daemon_socket().unwrap_or_else(|| sock.clone());
+            run_xmb_bridge(&bridge_sock, timeout, leader_session.as_deref());
             return;
         }
         Commands::Claim => {
@@ -5984,6 +6016,380 @@ fn run_watch(
                 }
             }
         }
+    }
+}
+
+fn run_xmb_bridge(sock: &PathBuf, timeout_secs: u32, leader_session: Option<&str>) {
+    eprintln!("[xmb-bridge] starting (timeout: {timeout_secs}s)");
+    let mut handled = 0_u64;
+    stream_events(sock, timeout_secs, &["reply"], leader_session, |event| {
+        if let Err(e) = handle_xmb_reply_event(event, &mut handled) {
+            eprintln!("[xmb-bridge] warning: {e}");
+        }
+    });
+    eprintln!("[xmb-bridge] stopped (updates: {handled})");
+}
+
+fn handle_xmb_reply_event(event: Value, handled: &mut u64) -> Result<(), String> {
+    if event.get("kind").and_then(Value::as_str) != Some("reply") {
+        return Ok(());
+    }
+    let Some(header) = event.get("header").and_then(Value::as_str) else {
+        return Ok(());
+    };
+    let Some(parsed) = parse_xmb_header(header) else {
+        return Ok(());
+    };
+    let Some(xmb_status) = xmb_status_for_protocol_status(&parsed.status) else {
+        eprintln!(
+            "[xmb-bridge] skip {} / {}: unsupported STATUS {}",
+            parsed.project, parsed.task_id, parsed.status
+        );
+        return Ok(());
+    };
+
+    let tasks_path = resolve_xmb_tasks_path(&parsed.project)?;
+    let outcome = update_xmb_task_status(&tasks_path, &parsed.task_id, xmb_status)?;
+    match outcome {
+        XmbUpdateOutcome::Updated { old_status } => {
+            *handled += 1;
+            eprintln!(
+                "[xmb-bridge] {} / {}: {} -> {}",
+                parsed.project, parsed.task_id, old_status, xmb_status
+            );
+        }
+        XmbUpdateOutcome::SkippedSameStatus => {
+            eprintln!(
+                "[xmb-bridge] {} / {}: already {}",
+                parsed.project, parsed.task_id, xmb_status
+            );
+        }
+    }
+    Ok(())
+}
+
+fn stream_events<F>(
+    sock: &PathBuf,
+    timeout_secs: u32,
+    kinds: &[&str],
+    leader_session: Option<&str>,
+    mut on_event: F,
+) where
+    F: FnMut(Value),
+{
+    let request = json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "events.subscribe",
+        "params": {
+            "kinds": kinds,
+            "timeout": if timeout_secs > 0 { Some(timeout_secs as u64) } else { None::<u64> },
+            "leader_session_id": leader_session,
+        },
+    });
+
+    let stream = match UnixStream::connect(sock) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("error: cannot connect to daemon socket: {e}");
+            process::exit(1);
+        }
+    };
+
+    let read_timeout_secs: u64 = if timeout_secs > 0 {
+        (timeout_secs as u64).saturating_add(10)
+    } else {
+        90
+    };
+    stream
+        .set_read_timeout(Some(Duration::from_secs(read_timeout_secs)))
+        .ok();
+    stream.set_write_timeout(Some(Duration::from_secs(10))).ok();
+
+    let mut writer = match stream.try_clone() {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("error: socket clone failed: {e}");
+            process::exit(1);
+        }
+    };
+
+    let mut payload = serde_json::to_string(&request).expect("request serialization cannot fail");
+    payload.push('\n');
+    if let Err(e) = writer.write_all(payload.as_bytes()) {
+        eprintln!("error: failed to send subscribe request: {e}");
+        process::exit(1);
+    }
+    writer.flush().ok();
+
+    let mut reader = BufReader::new(&stream);
+    let mut line = String::new();
+    loop {
+        line.clear();
+        match reader.read_line(&mut line) {
+            Ok(0) => break,
+            Ok(_) => {
+                let trimmed = line.trim_end_matches('\n').trim_end_matches('\r');
+                if trimmed.is_empty() {
+                    continue;
+                }
+                match serde_json::from_str::<Value>(trimmed) {
+                    Ok(value) if value.get("kind").is_some() => on_event(value),
+                    Ok(_) => {}
+                    Err(e) => eprintln!("[events] invalid JSONL event: {e}"),
+                }
+            }
+            Err(e) => {
+                use std::io::ErrorKind;
+                match e.kind() {
+                    ErrorKind::WouldBlock | ErrorKind::TimedOut => {
+                        if timeout_secs > 0 {
+                            eprintln!("[events] read timeout; exiting");
+                            break;
+                        }
+                        continue;
+                    }
+                    _ => {
+                        eprintln!("[events] stream error: {e}");
+                        break;
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct XmbHeader {
+    status: String,
+    project: String,
+    task_id: String,
+}
+
+fn parse_xmb_header(header: &str) -> Option<XmbHeader> {
+    let mut status = None;
+    let mut task = None;
+    for line in header.lines() {
+        let trimmed = line.trim();
+        if let Some(value) = trimmed.strip_prefix("STATUS:") {
+            status = Some(value.trim().to_ascii_uppercase());
+        } else if let Some(value) = trimmed.strip_prefix("XMB_TASK:") {
+            task = parse_xmb_task_ref(value.trim());
+        }
+    }
+    let (project, task_id) = task?;
+    Some(XmbHeader {
+        status: status?,
+        project,
+        task_id,
+    })
+}
+
+fn parse_xmb_task_ref(value: &str) -> Option<(String, String)> {
+    let (project, task_id) = value.split_once('/')?;
+    if !is_valid_xmb_project(project) || !is_valid_xmb_task_id(task_id) {
+        return None;
+    }
+    Some((project.to_string(), task_id.to_string()))
+}
+
+fn is_valid_xmb_project(project: &str) -> bool {
+    !project.is_empty()
+        && project
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+}
+
+fn is_valid_xmb_task_id(task_id: &str) -> bool {
+    let Some(rest) = task_id.strip_prefix('t') else {
+        return false;
+    };
+    !rest.is_empty() && rest.chars().all(|c| c.is_ascii_digit())
+}
+
+fn xmb_status_for_protocol_status(status: &str) -> Option<&'static str> {
+    match status {
+        "DONE" => Some("completed"),
+        "BLOCKED" => Some("blocked"),
+        "NEEDS_REVIEW" => Some("review_ready"),
+        "FAILED" => Some("failed"),
+        _ => None,
+    }
+}
+
+fn resolve_xmb_tasks_path(project: &str) -> Result<PathBuf, String> {
+    let cwd = env::current_dir().map_err(|e| format!("current_dir: {e}"))?;
+    let rel = Path::new(".xm")
+        .join("build")
+        .join("projects")
+        .join(project)
+        .join("phases")
+        .join("02-plan")
+        .join("tasks.json");
+    let local = cwd.join(&rel);
+    if local.exists() {
+        return Ok(local);
+    }
+    if let Some(root) = git_root(&cwd) {
+        let rooted = root.join(&rel);
+        if rooted.exists() {
+            return Ok(rooted);
+        }
+    }
+    Err(format!(
+        "tasks.json not found for project {project} from {}",
+        cwd.display()
+    ))
+}
+
+fn git_root(cwd: &Path) -> Option<PathBuf> {
+    let output = std::process::Command::new("git")
+        .args(["rev-parse", "--show-toplevel"])
+        .current_dir(cwd)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let root = String::from_utf8(output.stdout).ok()?;
+    let root = root.trim();
+    if root.is_empty() {
+        None
+    } else {
+        Some(PathBuf::from(root))
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum XmbUpdateOutcome {
+    Updated { old_status: String },
+    SkippedSameStatus,
+}
+
+fn update_xmb_task_status(
+    tasks_path: &Path,
+    task_id: &str,
+    status: &str,
+) -> Result<XmbUpdateOutcome, String> {
+    let text = fs::read_to_string(tasks_path)
+        .map_err(|e| format!("read {}: {e}", tasks_path.display()))?;
+    let mut doc: Value =
+        serde_json::from_str(&text).map_err(|e| format!("parse {}: {e}", tasks_path.display()))?;
+    let tasks = doc
+        .get_mut("tasks")
+        .and_then(Value::as_array_mut)
+        .ok_or_else(|| format!("{}: missing tasks array", tasks_path.display()))?;
+    let task = tasks
+        .iter_mut()
+        .find(|task| task.get("id").and_then(Value::as_str) == Some(task_id))
+        .ok_or_else(|| format!("task {task_id} not found in {}", tasks_path.display()))?;
+
+    let old_status = task
+        .get("status")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    if old_status == status {
+        return Ok(XmbUpdateOutcome::SkippedSameStatus);
+    }
+
+    task["status"] = json!(status);
+    let now = iso8601_utc_now();
+    match status {
+        "completed" => task["completed_at"] = json!(now),
+        "blocked" | "review_ready" | "failed" => task["updated_at"] = json!(now),
+        _ => {}
+    }
+
+    let rendered = serde_json::to_string_pretty(&doc)
+        .map_err(|e| format!("serialize {}: {e}", tasks_path.display()))?;
+    write_atomic(tasks_path, &(rendered + "\n"))?;
+    Ok(XmbUpdateOutcome::Updated { old_status })
+}
+
+fn write_atomic(path: &Path, content: &str) -> Result<(), String> {
+    let dir = path
+        .parent()
+        .ok_or_else(|| format!("{} has no parent directory", path.display()))?;
+    let filename = path
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("tasks.json");
+    let tmp = dir.join(format!(".{filename}.tmp"));
+    fs::write(&tmp, content).map_err(|e| format!("write {}: {e}", tmp.display()))?;
+    fs::rename(&tmp, path)
+        .map_err(|e| format!("rename {} -> {}: {e}", tmp.display(), path.display()))
+}
+
+fn iso8601_utc_now() -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let (year, month, day, hour, min, sec) = unix_ts_to_ymd_hms(now);
+    format!("{year:04}-{month:02}-{day:02}T{hour:02}:{min:02}:{sec:02}Z")
+}
+
+#[cfg(test)]
+mod xmb_bridge_tests {
+    use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn parse_xmb_header_extracts_status_project_and_task() {
+        let parsed = parse_xmb_header(
+            "STATUS: NEEDS_REVIEW\nFILES: none\nVERIFY: n/a\nNEXT: NONE\nFULL_REPORT: n/a\nXMB_TASK: agent-feedback-loop/t3\n",
+        )
+        .unwrap();
+
+        assert_eq!(
+            parsed,
+            XmbHeader {
+                status: "NEEDS_REVIEW".into(),
+                project: "agent-feedback-loop".into(),
+                task_id: "t3".into(),
+            }
+        );
+        assert_eq!(
+            xmb_status_for_protocol_status(&parsed.status),
+            Some("review_ready")
+        );
+    }
+
+    #[test]
+    fn parse_xmb_header_rejects_invalid_task_ref() {
+        assert!(parse_xmb_header("STATUS: DONE\nXMB_TASK: ../bad/t3\n").is_none());
+        assert!(parse_xmb_header("STATUS: DONE\nXMB_TASK: project/task3\n").is_none());
+    }
+
+    #[test]
+    fn update_xmb_task_status_is_idempotent() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = env::temp_dir().join(format!("tm-agent-xmb-bridge-test-{unique}"));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("tasks.json");
+        fs::write(
+            &path,
+            r#"{"tasks":[{"id":"t3","name":"demo","status":"running"}]}"#,
+        )
+        .unwrap();
+
+        let first = update_xmb_task_status(&path, "t3", "completed").unwrap();
+        assert!(
+            matches!(first, XmbUpdateOutcome::Updated { old_status } if old_status == "running")
+        );
+
+        let second = update_xmb_task_status(&path, "t3", "completed").unwrap();
+        assert_eq!(second, XmbUpdateOutcome::SkippedSameStatus);
+
+        let doc: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(doc["tasks"][0]["status"].as_str(), Some("completed"));
+        assert!(doc["tasks"][0]["completed_at"].as_str().is_some());
+
+        fs::remove_dir_all(dir).ok();
     }
 }
 
