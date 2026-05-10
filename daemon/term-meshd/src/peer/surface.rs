@@ -115,13 +115,11 @@ impl PtySurface {
         pty::set_nonblocking(child.master_fd)?;
         let (tx, _rx) = broadcast::channel::<PtyChunk>(BROADCAST_CAPACITY);
 
-        let resolved_cwd = cwd
-            .map(|c| c.to_string())
-            .unwrap_or_else(|| {
-                std::env::current_dir()
-                    .map(|p| p.to_string_lossy().into_owned())
-                    .unwrap_or_default()
-            });
+        let resolved_cwd = cwd.map(|c| c.to_string()).unwrap_or_else(|| {
+            std::env::current_dir()
+                .map(|p| p.to_string_lossy().into_owned())
+                .unwrap_or_default()
+        });
         let branch = resolve_git_branch(&resolved_cwd);
 
         let surface = Arc::new(PtySurface {
@@ -148,18 +146,16 @@ impl PtySurface {
         let reader_surface = surface.clone();
         let master_fd = child.master_fd;
         tokio::spawn(async move {
-            let async_fd = match AsyncFd::with_interest(
-                BorrowedMasterFd(master_fd),
-                Interest::READABLE,
-            ) {
-                Ok(fd) => fd,
-                Err(e) => {
-                    tracing::error!("AsyncFd registration failed: {e}");
-                    reader_surface.dead.store(true, Ordering::Release);
-                    reader_surface.dead_notify.notify_waiters();
-                    return;
-                }
-            };
+            let async_fd =
+                match AsyncFd::with_interest(BorrowedMasterFd(master_fd), Interest::READABLE) {
+                    Ok(fd) => fd,
+                    Err(e) => {
+                        tracing::error!("AsyncFd registration failed: {e}");
+                        reader_surface.dead.store(true, Ordering::Release);
+                        reader_surface.dead_notify.notify_waiters();
+                        return;
+                    }
+                };
 
             let mut buf = vec![0u8; READ_BUF_SIZE];
             let mut filter = QueryFilter::default();
@@ -179,11 +175,7 @@ impl PtySurface {
                 let result = guard.try_io(|inner| {
                     // Safety: libc::read on a registered, nonblocking fd.
                     let n = unsafe {
-                        libc::read(
-                            inner.as_raw_fd(),
-                            buf.as_mut_ptr() as *mut _,
-                            buf.len(),
-                        )
+                        libc::read(inner.as_raw_fd(), buf.as_mut_ptr() as *mut _, buf.len())
                     };
                     if n < 0 {
                         let err = std::io::Error::last_os_error();
@@ -479,10 +471,7 @@ impl PtyManager {
         match spawn_from_spec(surface_id, &spec) {
             Ok(surface) => {
                 surfaces.insert(surface_id.to_vec(), surface.clone());
-                tracing::info!(
-                    "respawned surface after exit: {}",
-                    hex_short(surface_id)
-                );
+                tracing::info!("respawned surface after exit: {}", hex_short(surface_id));
                 Some(surface)
             }
             Err(e) => {

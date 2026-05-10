@@ -3,8 +3,8 @@ use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixListener;
-use tokio::time::{timeout, Duration};
 use tokio::sync::watch;
+use tokio::time::{timeout, Duration};
 
 use crate::agent::AgentSessionManager;
 use crate::headless::HeadlessManager;
@@ -160,10 +160,7 @@ pub async fn serve(
     Ok(())
 }
 
-async fn handle_connection(
-    stream: tokio::net::UnixStream,
-    ctx: &Context,
-) -> anyhow::Result<()> {
+async fn handle_connection(stream: tokio::net::UnixStream, ctx: &Context) -> anyhow::Result<()> {
     let (reader, mut writer) = stream.into_split();
     let mut lines = BufReader::new(reader).lines();
 
@@ -254,7 +251,9 @@ async fn dispatch(req: &Request, ctx: &Context) -> Response {
         // --- Sessions (pushed by Swift app) ---
         "session.sync" => {
             #[derive(Deserialize)]
-            struct SyncParams { sessions: Vec<SessionInfo> }
+            struct SyncParams {
+                sessions: Vec<SessionInfo>,
+            }
             match serde_json::from_value::<SyncParams>(req.params.clone()) {
                 Ok(p) => {
                     let count = p.sessions.len();
@@ -381,7 +380,11 @@ async fn dispatch(req: &Request, ctx: &Context) -> Response {
                     if !extra_anomalies.is_empty() {
                         let existing = value["anomalies"].as_array().cloned().unwrap_or_default();
                         let mut all = existing;
-                        all.extend(extra_anomalies.into_iter().map(|a| serde_json::to_value(a).unwrap()));
+                        all.extend(
+                            extra_anomalies
+                                .into_iter()
+                                .map(|a| serde_json::to_value(a).unwrap()),
+                        );
                         value["anomalies"] = serde_json::json!(all);
                     }
                     Ok(value)
@@ -391,17 +394,27 @@ async fn dispatch(req: &Request, ctx: &Context) -> Response {
         }
         "monitor.track" => {
             #[derive(Deserialize)]
-            struct TrackParams { pid: u32 }
+            struct TrackParams {
+                pid: u32,
+            }
             match serde_json::from_value::<TrackParams>(req.params.clone()) {
-                Ok(p) => { ctx.monitor_handle.track_pid(p.pid); Ok(serde_json::json!({"status": "ok"})) }
+                Ok(p) => {
+                    ctx.monitor_handle.track_pid(p.pid);
+                    Ok(serde_json::json!({"status": "ok"}))
+                }
                 Err(e) => Err(format!("invalid params: {e}")),
             }
         }
         "monitor.untrack" => {
             #[derive(Deserialize)]
-            struct UntrackParams { pid: u32 }
+            struct UntrackParams {
+                pid: u32,
+            }
             match serde_json::from_value::<UntrackParams>(req.params.clone()) {
-                Ok(p) => { ctx.monitor_handle.untrack_pid(p.pid); Ok(serde_json::json!({"status": "ok"})) }
+                Ok(p) => {
+                    ctx.monitor_handle.untrack_pid(p.pid);
+                    Ok(serde_json::json!({"status": "ok"}))
+                }
                 Err(e) => Err(format!("invalid params: {e}")),
             }
         }
@@ -411,7 +424,9 @@ async fn dispatch(req: &Request, ctx: &Context) -> Response {
         }
         "process.stop" => {
             #[derive(Deserialize)]
-            struct StopParams { pid: u32 }
+            struct StopParams {
+                pid: u32,
+            }
             match serde_json::from_value::<StopParams>(req.params.clone()) {
                 Ok(p) => {
                     let ok = ctx.monitor_handle.stop_process(p.pid);
@@ -422,7 +437,9 @@ async fn dispatch(req: &Request, ctx: &Context) -> Response {
         }
         "process.resume" => {
             #[derive(Deserialize)]
-            struct ResumeParams { pid: u32 }
+            struct ResumeParams {
+                pid: u32,
+            }
             match serde_json::from_value::<ResumeParams>(req.params.clone()) {
                 Ok(p) => {
                     let ok = ctx.monitor_handle.resume_process(p.pid);
@@ -433,7 +450,9 @@ async fn dispatch(req: &Request, ctx: &Context) -> Response {
         }
         "budget.auto_stop" => {
             #[derive(Deserialize)]
-            struct AutoStopParams { enabled: bool }
+            struct AutoStopParams {
+                enabled: bool,
+            }
             match serde_json::from_value::<AutoStopParams>(req.params.clone()) {
                 Ok(p) => {
                     ctx.monitor_handle.set_auto_stop(p.enabled);
@@ -446,17 +465,27 @@ async fn dispatch(req: &Request, ctx: &Context) -> Response {
         // --- File Watcher (F-05) ---
         "watcher.watch" => {
             #[derive(Deserialize)]
-            struct WatchParams { path: String }
+            struct WatchParams {
+                path: String,
+            }
             match serde_json::from_value::<WatchParams>(req.params.clone()) {
-                Ok(p) => { ctx.watcher_handle.watch_path(&p.path); Ok(serde_json::json!({"status": "ok"})) }
+                Ok(p) => {
+                    ctx.watcher_handle.watch_path(&p.path);
+                    Ok(serde_json::json!({"status": "ok"}))
+                }
                 Err(e) => Err(format!("invalid params: {e}")),
             }
         }
         "watcher.unwatch" => {
             #[derive(Deserialize)]
-            struct UnwatchParams { path: String }
+            struct UnwatchParams {
+                path: String,
+            }
             match serde_json::from_value::<UnwatchParams>(req.params.clone()) {
-                Ok(p) => { ctx.watcher_handle.unwatch_path(&p.path); Ok(serde_json::json!({"status": "ok"})) }
+                Ok(p) => {
+                    ctx.watcher_handle.unwatch_path(&p.path);
+                    Ok(serde_json::json!({"status": "ok"}))
+                }
                 Err(e) => Err(format!("invalid params: {e}")),
             }
         }
@@ -470,12 +499,10 @@ async fn dispatch(req: &Request, ctx: &Context) -> Response {
             let snapshot = ctx.usage_tracker.snapshot();
             Ok(serde_json::to_value(snapshot).unwrap())
         }
-        "usage.scan" => {
-            match ctx.usage_tracker.scan_all() {
-                Ok(_) => Ok(serde_json::json!({"status": "ok"})),
-                Err(e) => Err(format!("scan error: {e}")),
-            }
-        }
+        "usage.scan" => match ctx.usage_tracker.scan_all() {
+            Ok(_) => Ok(serde_json::json!({"status": "ok"})),
+            Err(e) => Err(format!("scan error: {e}")),
+        },
 
         // --- Agent Sessions (F-06) ---
         "agent.spawn" => {
@@ -493,13 +520,18 @@ async fn dispatch(req: &Request, ctx: &Context) -> Response {
                 #[serde(default)]
                 include_terminated: bool,
             }
-            let params: ListParams = serde_json::from_value(req.params.clone()).unwrap_or(ListParams { include_terminated: false });
+            let params: ListParams =
+                serde_json::from_value(req.params.clone()).unwrap_or(ListParams {
+                    include_terminated: false,
+                });
             let sessions = ctx.agent_manager.list(params.include_terminated);
             Ok(serde_json::to_value(sessions).unwrap())
         }
         "agent.get" => {
             #[derive(Deserialize)]
-            struct GetParams { id: String }
+            struct GetParams {
+                id: String,
+            }
             match serde_json::from_value::<GetParams>(req.params.clone()) {
                 Ok(p) => match ctx.agent_manager.get(&p.id) {
                     Some(s) => Ok(serde_json::to_value(s).unwrap()),
@@ -516,34 +548,50 @@ async fn dispatch(req: &Request, ctx: &Context) -> Response {
                 force: bool,
             }
             match serde_json::from_value::<TerminateParams>(req.params.clone()) {
-                Ok(p) => ctx.agent_manager.terminate(&p.id, p.force, &ctx.watcher_handle)
+                Ok(p) => ctx
+                    .agent_manager
+                    .terminate(&p.id, p.force, &ctx.watcher_handle)
                     .map(|_| serde_json::json!({"status": "ok"})),
                 Err(e) => Err(format!("invalid params: {e}")),
             }
         }
         "agent.bind_panel" => {
             #[derive(Deserialize)]
-            struct BindParams { session_id: String, panel_id: String }
+            struct BindParams {
+                session_id: String,
+                panel_id: String,
+            }
             match serde_json::from_value::<BindParams>(req.params.clone()) {
-                Ok(p) => ctx.agent_manager.bind_panel(&p.session_id, &p.panel_id)
+                Ok(p) => ctx
+                    .agent_manager
+                    .bind_panel(&p.session_id, &p.panel_id)
                     .map(|_| serde_json::json!({"status": "ok"})),
                 Err(e) => Err(format!("invalid params: {e}")),
             }
         }
         "agent.unbind_panel" => {
             #[derive(Deserialize)]
-            struct UnbindParams { session_id: String }
+            struct UnbindParams {
+                session_id: String,
+            }
             match serde_json::from_value::<UnbindParams>(req.params.clone()) {
-                Ok(p) => ctx.agent_manager.unbind_panel(&p.session_id)
+                Ok(p) => ctx
+                    .agent_manager
+                    .unbind_panel(&p.session_id)
                     .map(|_| serde_json::json!({"status": "ok"})),
                 Err(e) => Err(format!("invalid params: {e}")),
             }
         }
         "agent.add_pid" => {
             #[derive(Deserialize)]
-            struct AddPidParams { session_id: String, pid: u32 }
+            struct AddPidParams {
+                session_id: String,
+                pid: u32,
+            }
             match serde_json::from_value::<AddPidParams>(req.params.clone()) {
-                Ok(p) => ctx.agent_manager.add_pid(&p.session_id, p.pid)
+                Ok(p) => ctx
+                    .agent_manager
+                    .add_pid(&p.session_id, p.pid)
                     .map(|_| serde_json::json!({"status": "ok"})),
                 Err(e) => Err(format!("invalid params: {e}")),
             }
@@ -552,43 +600,60 @@ async fn dispatch(req: &Request, ctx: &Context) -> Response {
         // --- Tasks (F-06 Phase 2) ---
         "task.create" => {
             match serde_json::from_value::<crate::agent::TaskCreateParams>(req.params.clone()) {
-                Ok(p) => ctx.agent_manager.task_create(p)
+                Ok(p) => ctx
+                    .agent_manager
+                    .task_create(p)
                     .map(|t| serde_json::to_value(t).unwrap()),
                 Err(e) => Err(format!("invalid params: {e}")),
             }
         }
         "task.get" => {
             #[derive(Deserialize)]
-            struct P { id: String }
+            struct P {
+                id: String,
+            }
             match serde_json::from_value::<P>(req.params.clone()) {
-                Ok(p) => ctx.agent_manager.task_get(&p.id)
+                Ok(p) => ctx
+                    .agent_manager
+                    .task_get(&p.id)
                     .map(|t| serde_json::to_value(t).unwrap()),
                 Err(e) => Err(format!("invalid params: {e}")),
             }
         }
         "task.list" => {
             let params: crate::agent::TaskListParams = serde_json::from_value(req.params.clone())
-                .unwrap_or(crate::agent::TaskListParams { status: None, assignee: None });
+                .unwrap_or(crate::agent::TaskListParams {
+                    status: None,
+                    assignee: None,
+                });
             let tasks = ctx.agent_manager.task_list(params);
             Ok(serde_json::to_value(tasks).unwrap())
         }
         "task.update" => {
             match serde_json::from_value::<crate::agent::TaskUpdateParams>(req.params.clone()) {
-                Ok(p) => ctx.agent_manager.task_update(p)
+                Ok(p) => ctx
+                    .agent_manager
+                    .task_update(p)
                     .map(|t| serde_json::to_value(t).unwrap()),
                 Err(e) => Err(format!("invalid params: {e}")),
             }
         }
         "task.assign" => {
             match serde_json::from_value::<crate::agent::TaskAssignParams>(req.params.clone()) {
-                Ok(p) => ctx.agent_manager.task_assign(p)
+                Ok(p) => ctx
+                    .agent_manager
+                    .task_assign(p)
                     .map(|t| serde_json::to_value(t).unwrap()),
                 Err(e) => Err(format!("invalid params: {e}")),
             }
         }
         "task.log" => {
             #[derive(Deserialize)]
-            struct P { task_id: String, #[serde(default)] limit: Option<i64> }
+            struct P {
+                task_id: String,
+                #[serde(default)]
+                limit: Option<i64>,
+            }
             match serde_json::from_value::<P>(req.params.clone()) {
                 Ok(p) => {
                     let entries = ctx.agent_manager.task_log(&p.task_id, p.limit);
@@ -601,9 +666,14 @@ async fn dispatch(req: &Request, ctx: &Context) -> Response {
         // --- Auto-Fix Budget ---
         "task.fix_attempt" => {
             #[derive(Deserialize)]
-            struct P { task_id: String, agent_name: String }
+            struct P {
+                task_id: String,
+                agent_name: String,
+            }
             match serde_json::from_value::<P>(req.params.clone()) {
-                Ok(p) => ctx.agent_manager.task_fix_attempt(&p.task_id, &p.agent_name)
+                Ok(p) => ctx
+                    .agent_manager
+                    .task_fix_attempt(&p.task_id, &p.agent_name)
                     .map(|r| serde_json::to_value(r).unwrap()),
                 Err(e) => Err(format!("invalid params: {e}")),
             }
@@ -612,7 +682,9 @@ async fn dispatch(req: &Request, ctx: &Context) -> Response {
         // --- Messages (F-06 Phase 2) ---
         "message.send" => {
             match serde_json::from_value::<crate::agent::MessageSendParams>(req.params.clone()) {
-                Ok(p) => ctx.agent_manager.message_send(p)
+                Ok(p) => ctx
+                    .agent_manager
+                    .message_send(p)
                     .map(|m| serde_json::to_value(m).unwrap()),
                 Err(e) => Err(format!("invalid params: {e}")),
             }
@@ -628,7 +700,9 @@ async fn dispatch(req: &Request, ctx: &Context) -> Response {
         }
         "message.ack" => {
             match serde_json::from_value::<crate::agent::MessageAckParams>(req.params.clone()) {
-                Ok(p) => ctx.agent_manager.message_ack(&p.message_ids)
+                Ok(p) => ctx
+                    .agent_manager
+                    .message_ack(&p.message_ids)
                     .map(|n| serde_json::json!({"acknowledged": n})),
                 Err(e) => Err(format!("invalid params: {e}")),
             }
@@ -637,9 +711,14 @@ async fn dispatch(req: &Request, ctx: &Context) -> Response {
         // --- Pending Input (PTY injection via Swift polling) ---
         "input.enqueue" => {
             #[derive(Deserialize)]
-            struct P { session_id: String, text: String }
+            struct P {
+                session_id: String,
+                text: String,
+            }
             match serde_json::from_value::<P>(req.params.clone()) {
-                Ok(p) => ctx.agent_manager.enqueue_input(&p.session_id, &p.text)
+                Ok(p) => ctx
+                    .agent_manager
+                    .enqueue_input(&p.session_id, &p.text)
                     .map(|_| serde_json::json!({"status": "ok"})),
                 Err(e) => Err(format!("invalid params: {e}")),
             }
@@ -664,11 +743,15 @@ async fn dispatch(req: &Request, ctx: &Context) -> Response {
         }
         "headless.send" => {
             #[derive(Deserialize)]
-            struct P { agent_id: String, text: String }
+            struct P {
+                agent_id: String,
+                text: String,
+            }
             match serde_json::from_value::<P>(req.params.clone()) {
                 Ok(p) => {
                     let mut mgr = ctx.headless.lock().await;
-                    mgr.send_message(&p.agent_id, &p.text).await
+                    mgr.send_message(&p.agent_id, &p.text)
+                        .await
                         .map(|_| serde_json::json!({"status": "ok"}))
                 }
                 Err(e) => Err(format!("invalid params: {e}")),
@@ -676,12 +759,19 @@ async fn dispatch(req: &Request, ctx: &Context) -> Response {
         }
         "headless.read" => {
             #[derive(Deserialize)]
-            struct P { agent_id: String, #[serde(default = "default_lines")] lines: usize }
-            fn default_lines() -> usize { 50 }
+            struct P {
+                agent_id: String,
+                #[serde(default = "default_lines")]
+                lines: usize,
+            }
+            fn default_lines() -> usize {
+                50
+            }
             match serde_json::from_value::<P>(req.params.clone()) {
                 Ok(p) => {
                     let mgr = ctx.headless.lock().await;
-                    mgr.read_output(&p.agent_id, p.lines).await
+                    mgr.read_output(&p.agent_id, p.lines)
+                        .await
                         .map(|lines| serde_json::json!({ "lines": lines, "count": lines.len() }))
                 }
                 Err(e) => Err(format!("invalid params: {e}")),
@@ -689,11 +779,14 @@ async fn dispatch(req: &Request, ctx: &Context) -> Response {
         }
         "headless.terminate" => {
             #[derive(Deserialize)]
-            struct P { agent_id: String }
+            struct P {
+                agent_id: String,
+            }
             match serde_json::from_value::<P>(req.params.clone()) {
                 Ok(p) => {
                     let mut mgr = ctx.headless.lock().await;
-                    mgr.terminate(&p.agent_id).await
+                    mgr.terminate(&p.agent_id)
+                        .await
                         .map(|_| serde_json::json!({"status": "ok"}))
                 }
                 Err(e) => Err(format!("invalid params: {e}")),
@@ -701,11 +794,14 @@ async fn dispatch(req: &Request, ctx: &Context) -> Response {
         }
         "headless.status" => {
             #[derive(Deserialize)]
-            struct P { agent_id: String }
+            struct P {
+                agent_id: String,
+            }
             match serde_json::from_value::<P>(req.params.clone()) {
                 Ok(p) => {
                     let mgr = ctx.headless.lock().await;
-                    mgr.status(&p.agent_id).await
+                    mgr.status(&p.agent_id)
+                        .await
                         .map(|info| serde_json::to_value(info).unwrap())
                 }
                 Err(e) => Err(format!("invalid params: {e}")),
@@ -713,9 +809,12 @@ async fn dispatch(req: &Request, ctx: &Context) -> Response {
         }
         "headless.list" => {
             #[derive(Deserialize)]
-            struct P { #[serde(default)] team_name: Option<String> }
-            let params: P = serde_json::from_value(req.params.clone())
-                .unwrap_or(P { team_name: None });
+            struct P {
+                #[serde(default)]
+                team_name: Option<String>,
+            }
+            let params: P =
+                serde_json::from_value(req.params.clone()).unwrap_or(P { team_name: None });
             let mgr = ctx.headless.lock().await;
             let agents = mgr.list(params.team_name.as_deref()).await;
             Ok(serde_json::to_value(agents).unwrap())
@@ -734,11 +833,14 @@ async fn dispatch(req: &Request, ctx: &Context) -> Response {
         }
         "headless.destroy_team" => {
             #[derive(Deserialize)]
-            struct P { team_name: String }
+            struct P {
+                team_name: String,
+            }
             match serde_json::from_value::<P>(req.params.clone()) {
                 Ok(p) => {
                     let mut mgr = ctx.headless.lock().await;
-                    mgr.destroy_team(&p.team_name).await
+                    mgr.destroy_team(&p.team_name)
+                        .await
                         .map(|_| serde_json::json!({"status": "ok"}))
                 }
                 Err(e) => Err(format!("invalid params: {e}")),
@@ -765,8 +867,12 @@ async fn dispatch(req: &Request, ctx: &Context) -> Response {
                 #[serde(default)]
                 instructions: Option<String>,
             }
-            fn default_cli() -> String { "claude".into() }
-            fn default_model() -> String { "sonnet".into() }
+            fn default_cli() -> String {
+                "claude".into()
+            }
+            fn default_model() -> String {
+                "sonnet".into()
+            }
             match serde_json::from_value::<P>(req.params.clone()) {
                 Ok(p) => {
                     let spec = crate::headless::AgentSpec {
@@ -777,7 +883,10 @@ async fn dispatch(req: &Request, ctx: &Context) -> Response {
                         instructions: p.instructions,
                     };
                     let mut mgr = ctx.headless.lock().await;
-                    match mgr.add_agent(&p.team_name, spec, p.app_socket_path.as_deref()).await {
+                    match mgr
+                        .add_agent(&p.team_name, spec, p.app_socket_path.as_deref())
+                        .await
+                    {
                         Ok(info) => Ok(serde_json::to_value(info).unwrap()),
                         Err(e) => Err(e),
                     }
@@ -787,7 +896,10 @@ async fn dispatch(req: &Request, ctx: &Context) -> Response {
         }
         "headless.resolve" => {
             #[derive(Deserialize)]
-            struct P { team_name: String, agent_name: String }
+            struct P {
+                team_name: String,
+                agent_name: String,
+            }
             match serde_json::from_value::<P>(req.params.clone()) {
                 Ok(p) => {
                     let mgr = ctx.headless.lock().await;
@@ -930,7 +1042,10 @@ fn peer_uid_matches(_stream: &tokio::net::UnixStream, _expected_uid: u32) -> boo
 /// - no_heartbeat: in_progress tasks whose `updated_at_ms` is older than 5 minutes.
 /// - repeated_failure: tasks where fix_count >= 3.
 fn compute_agent_anomalies(agent_manager: &AgentSessionManager) -> Vec<Anomaly> {
-    let params = crate::agent::TaskListParams { status: None, assignee: None };
+    let params = crate::agent::TaskListParams {
+        status: None,
+        assignee: None,
+    };
     let tasks = agent_manager.task_list(params);
     let now_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -955,7 +1070,10 @@ fn compute_agent_anomalies(agent_manager: &AgentSessionManager) -> Vec<Anomaly> 
         let day = r2 - 2447 * month / 80;
         let month2 = month + 2 - 12 * (month / 11);
         let year = 100 * (q - 49) + s2 + month / 11;
-        format!("{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z", year, month2, day, h, m, s)
+        format!(
+            "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
+            year, month2, day, h, m, s
+        )
     };
 
     for task in &tasks {
@@ -972,7 +1090,11 @@ fn compute_agent_anomalies(agent_manager: &AgentSessionManager) -> Vec<Anomaly> 
                     "Task '{}' (id={}) has been in_progress with no update for {}m",
                     task.title, task.id, idle_mins
                 ),
-                severity: if idle_mins >= 10 { "critical".into() } else { "warning".into() },
+                severity: if idle_mins >= 10 {
+                    "critical".into()
+                } else {
+                    "warning".into()
+                },
                 detected_at: detected_at.clone(),
             });
         }
@@ -987,7 +1109,11 @@ fn compute_agent_anomalies(agent_manager: &AgentSessionManager) -> Vec<Anomaly> 
                     "Task '{}' (id={}) has had {} fix attempts",
                     task.title, task.id, task.fix_count
                 ),
-                severity: if task.fix_count >= 5 { "critical".into() } else { "warning".into() },
+                severity: if task.fix_count >= 5 {
+                    "critical".into()
+                } else {
+                    "warning".into()
+                },
                 detected_at: detected_at.clone(),
             });
         }

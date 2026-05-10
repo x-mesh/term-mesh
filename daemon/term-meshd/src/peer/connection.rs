@@ -252,11 +252,8 @@ async fn reader_loop(
                 };
                 send(&outgoing_tx, meta_env).await?;
 
-                let entry = spawn_attach_relay(
-                    surface.clone(),
-                    outgoing_tx.clone(),
-                    seq_counter.clone(),
-                );
+                let entry =
+                    spawn_attach_relay(surface.clone(), outgoing_tx.clone(), seq_counter.clone());
                 attached.insert(req.surface_id, entry);
             }
 
@@ -269,10 +266,7 @@ async fn reader_loop(
 
             (HandshakeState::Ready, Payload::Input(input)) => {
                 let Some(entry) = attached.get(&input.surface_id) else {
-                    tracing::debug!(
-                        "input for unattached surface {:?}",
-                        input.surface_id
-                    );
+                    tracing::debug!("input for unattached surface {:?}", input.surface_id);
                     continue;
                 };
                 match input.kind {

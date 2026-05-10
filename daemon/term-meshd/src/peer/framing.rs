@@ -75,7 +75,9 @@ mod tests {
         let (mut a, mut b) = duplex(64);
         // Write a bogus length larger than MAX_FRAME_BYTES.
         let bad = (MAX_FRAME_BYTES + 1).to_le_bytes();
-        tokio::io::AsyncWriteExt::write_all(&mut a, &bad).await.unwrap();
+        tokio::io::AsyncWriteExt::write_all(&mut a, &bad)
+            .await
+            .unwrap();
         let err = read_envelope(&mut b).await.unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
     }

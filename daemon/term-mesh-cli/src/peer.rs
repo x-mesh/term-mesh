@@ -146,7 +146,11 @@ pub fn list_cmd(socket_path: &Path) -> anyhow::Result<()> {
             cols = s.cols,
             rows = s.rows,
             branch = branch,
-            cwd = if s.cwd.is_empty() { "-" } else { s.cwd.as_str() },
+            cwd = if s.cwd.is_empty() {
+                "-"
+            } else {
+                s.cwd.as_str()
+            },
             id = hex_short(&s.surface_id),
         );
     }
@@ -260,7 +264,11 @@ pub fn attach_cmd(socket_path: &Path, name: Option<&str>) -> anyhow::Result<()> 
                         } else {
                             format!(" @{}", m.branch)
                         };
-                        let cwd = if m.cwd.is_empty() { "-" } else { m.cwd.as_str() };
+                        let cwd = if m.cwd.is_empty() {
+                            "-"
+                        } else {
+                            m.cwd.as_str()
+                        };
                         eprintln!("\r\n[peer] workspace: cwd={cwd}{branch}");
                     }
                 }
@@ -295,9 +303,7 @@ pub fn attach_cmd(socket_path: &Path, name: Option<&str>) -> anyhow::Result<()> 
             let mut scratch = [0u8; 16];
             loop {
                 // Drain the pipe (one byte per SIGWINCH; merge bursts).
-                let n = unsafe {
-                    libc::read(fd, scratch.as_mut_ptr() as *mut _, scratch.len())
-                };
+                let n = unsafe { libc::read(fd, scratch.as_mut_ptr() as *mut _, scratch.len()) };
                 if n <= 0 {
                     break;
                 }
@@ -350,7 +356,11 @@ pub fn attach_cmd(socket_path: &Path, name: Option<&str>) -> anyhow::Result<()> 
     }
 
     // ---- graceful goodbye ----
-    let reason = if detached { "client detach (Ctrl-])" } else { "client stdin EOF" };
+    let reason = if detached {
+        "client detach (Ctrl-])"
+    } else {
+        "client stdin EOF"
+    };
     let _ = out_tx.send(Envelope {
         seq: next_seq(&seq),
         correlation_id: 0,

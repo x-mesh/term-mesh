@@ -26,7 +26,7 @@ pub struct HeatmapEntry {
 /// Per-minute event count for the timeline chart.
 #[derive(Debug, Clone, Serialize)]
 pub struct TimelineBucket {
-    pub minute_ms: u64,   // start of the minute (floored)
+    pub minute_ms: u64, // start of the minute (floored)
     pub create: u64,
     pub modify: u64,
     pub remove: u64,
@@ -96,7 +96,9 @@ impl WatcherHandle {
             }
         }
         // Send command to the watcher thread to actually start watching
-        let _ = self.command_tx.try_send(WatcherCommand::Watch(path.to_string()));
+        let _ = self
+            .command_tx
+            .try_send(WatcherCommand::Watch(path.to_string()));
     }
 
     pub fn unwatch_path(&self, path: &str) {
@@ -106,7 +108,9 @@ impl WatcherHandle {
             // Remove gitignore rules for this base dir
             state.gitignore_patterns.retain(|r| r.base_dir != path);
         }
-        let _ = self.command_tx.try_send(WatcherCommand::Unwatch(path.to_string()));
+        let _ = self
+            .command_tx
+            .try_send(WatcherCommand::Unwatch(path.to_string()));
     }
 
     /// Enable/disable .gitignore-based filtering for file events.
@@ -125,7 +129,9 @@ impl WatcherHandle {
                 }
             }
         }
-        let _ = self.command_tx.try_send(WatcherCommand::SetUseGitignore(enabled));
+        let _ = self
+            .command_tx
+            .try_send(WatcherCommand::SetUseGitignore(enabled));
     }
 
     /// Check if .gitignore filtering is enabled.
@@ -152,13 +158,7 @@ impl WatcherHandle {
         entries.truncate(20);
 
         // Last 50 events
-        let recent = state
-            .recent_events
-            .iter()
-            .rev()
-            .take(50)
-            .cloned()
-            .collect();
+        let recent = state.recent_events.iter().rev().take(50).cloned().collect();
 
         // Timeline: last 30 minutes, sorted by time
         let timeline_cutoff = now.saturating_sub(30 * 60_000);
@@ -451,11 +451,11 @@ const IGNORE_DIRS: &[&str] = &[
     "/.git/",
     "/node_modules/",
     "/.next/",
-    "/target/",          // Rust/Cargo
+    "/target/", // Rust/Cargo
     "/build/",
     "/dist/",
-    "/.xm/",             // x-kit state
-    "/.omc/",            // OMC state
+    "/.xm/",  // x-kit state
+    "/.omc/", // OMC state
     "/__pycache__/",
     "/.cache/",
     "/DerivedData/",
@@ -541,7 +541,8 @@ mod tests {
             // Insert 25 files with different event counts
             for i in 0..25 {
                 s.event_counts.insert(format!("/file_{i}"), (i + 1) as u64);
-                s.last_event_times.insert(format!("/file_{i}"), 1000 + i as u64);
+                s.last_event_times
+                    .insert(format!("/file_{i}"), 1000 + i as u64);
             }
         }
         let handle = make_handle(state);
@@ -588,7 +589,8 @@ mod tests {
             // Recent bucket (should be included)
             s.timeline_buckets.insert(current_minute, (5, 10, 2));
             // Very old bucket (should be excluded — more than 30 min ago)
-            s.timeline_buckets.insert(current_minute - 40 * minute, (1, 1, 1));
+            s.timeline_buckets
+                .insert(current_minute - 40 * minute, (1, 1, 1));
         }
         let handle = make_handle(state);
         let snap = handle.snapshot();
@@ -629,15 +631,33 @@ mod tests {
 
         // dir/** matches everything under dir
         assert!(gitignore_pattern_matches("logs/**", "logs/a.log"));
-        assert!(gitignore_pattern_matches("logs/**", "logs/deep/nested/file"));
+        assert!(gitignore_pattern_matches(
+            "logs/**",
+            "logs/deep/nested/file"
+        ));
     }
 
     #[test]
     fn matches_gitignore_with_rules() {
         let rules = vec![
-            GitignoreRule { base_dir: "/project".into(), pattern: "*.log".into(), negated: false, dir_only: false },
-            GitignoreRule { base_dir: "/project".into(), pattern: "dist".into(), negated: false, dir_only: false },
-            GitignoreRule { base_dir: "/project".into(), pattern: "important.log".into(), negated: true, dir_only: false },
+            GitignoreRule {
+                base_dir: "/project".into(),
+                pattern: "*.log".into(),
+                negated: false,
+                dir_only: false,
+            },
+            GitignoreRule {
+                base_dir: "/project".into(),
+                pattern: "dist".into(),
+                negated: false,
+                dir_only: false,
+            },
+            GitignoreRule {
+                base_dir: "/project".into(),
+                pattern: "important.log".into(),
+                negated: true,
+                dir_only: false,
+            },
         ];
         // *.log matches
         assert!(matches_gitignore(&rules, "/project/debug.log"));
@@ -653,11 +673,17 @@ mod tests {
 
     #[test]
     fn should_ignore_git_and_node_modules() {
-        assert!(should_ignore_path("/Users/me/project/.git/objects/pack/abc"));
-        assert!(should_ignore_path("/Users/me/project/node_modules/react/index.js"));
+        assert!(should_ignore_path(
+            "/Users/me/project/.git/objects/pack/abc"
+        ));
+        assert!(should_ignore_path(
+            "/Users/me/project/node_modules/react/index.js"
+        ));
         assert!(should_ignore_path("/Users/me/project/.DS_Store"));
         assert!(should_ignore_path("/Users/me/project/src/main.rs.swp"));
-        assert!(should_ignore_path("/Users/me/project/target/release/binary"));
+        assert!(should_ignore_path(
+            "/Users/me/project/target/release/binary"
+        ));
         assert!(!should_ignore_path("/Users/me/project/src/main.rs"));
         assert!(!should_ignore_path("/Users/me/project/README.md"));
         assert!(!should_ignore_path("/Users/me/project/.gitignore"));

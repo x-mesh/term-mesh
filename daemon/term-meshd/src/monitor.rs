@@ -160,7 +160,10 @@ fn iso8601_now() -> String {
     let day = r2 - 2447 * month / 80;
     let month2 = month + 2 - 12 * (month / 11);
     let year = 100 * (q - 49) + s2 + month / 11;
-    format!("{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z", year, month2, day, h, m, s)
+    format!(
+        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
+        year, month2, day, h, m, s
+    )
 }
 
 /// Start background resource monitor with auto-process-discovery.
@@ -206,7 +209,8 @@ pub fn start_monitor(
 
             // Only refresh tracked PIDs (registered by Swift app via monitor.track RPC)
             let tracked_snapshot: Vec<u32> = pids.lock().unwrap().clone();
-            let pids_to_refresh: Vec<Pid> = tracked_snapshot.iter().map(|&p| Pid::from_u32(p)).collect();
+            let pids_to_refresh: Vec<Pid> =
+                tracked_snapshot.iter().map(|&p| Pid::from_u32(p)).collect();
             if !pids_to_refresh.is_empty() {
                 sys.refresh_processes(ProcessesToUpdate::Some(&pids_to_refresh), true);
             }
@@ -243,7 +247,8 @@ pub fn start_monitor(
 
                     // cmdline: join argv, truncate to 200 chars
                     let cmdline: Option<String> = {
-                        let args: Vec<String> = proc.cmd()
+                        let args: Vec<String> = proc
+                            .cmd()
                             .iter()
                             .map(|a| a.to_string_lossy().into_owned())
                             .collect();
@@ -251,7 +256,11 @@ pub fn start_monitor(
                             None
                         } else {
                             let joined = args.join(" ");
-                            Some(if joined.len() > 200 { joined[..200].to_string() } else { joined })
+                            Some(if joined.len() > 200 {
+                                joined[..200].to_string()
+                            } else {
+                                joined
+                            })
                         }
                     };
 
@@ -273,13 +282,18 @@ pub fn start_monitor(
                     });
 
                     // Skip threshold checks for already-stopped processes
-                    if is_stopped { continue; }
+                    if is_stopped {
+                        continue;
+                    }
 
                     if cpu > config.cpu_threshold_percent {
                         let action = if should_auto_stop {
                             if send_signal(pid, libc::SIGSTOP) {
                                 stopped.lock().unwrap().insert(pid);
-                                tracing::warn!("SIGSTOP sent to PID {pid} ({name}): CPU {cpu:.1}% > {:.1}%", config.cpu_threshold_percent);
+                                tracing::warn!(
+                                    "SIGSTOP sent to PID {pid} ({name}): CPU {cpu:.1}% > {:.1}%",
+                                    config.cpu_threshold_percent
+                                );
                                 "stopped"
                             } else {
                                 "warning"
@@ -319,7 +333,10 @@ pub fn start_monitor(
                         let action = if should_auto_stop {
                             if send_signal(pid, libc::SIGSTOP) {
                                 stopped.lock().unwrap().insert(pid);
-                                tracing::warn!("SIGSTOP sent to PID {pid} ({name}): mem {mem} > {}", config.memory_threshold_bytes);
+                                tracing::warn!(
+                                    "SIGSTOP sent to PID {pid} ({name}): mem {mem} > {}",
+                                    config.memory_threshold_bytes
+                                );
                                 "stopped"
                             } else {
                                 "warning"
@@ -350,24 +367,29 @@ pub fn start_monitor(
                 (t + d.total_space(), a + d.available_space())
             });
 
-            let disk_space: Vec<DiskInfo> = disks.list().iter().map(|d| {
-                let total = d.total_space();
-                let avail = d.available_space();
-                let used = total.saturating_sub(avail);
-                DiskInfo {
-                    mount_point: d.mount_point().to_string_lossy().into_owned(),
-                    total,
-                    used,
-                    available: avail,
-                }
-            }).collect();
+            let disk_space: Vec<DiskInfo> = disks
+                .list()
+                .iter()
+                .map(|d| {
+                    let total = d.total_space();
+                    let avail = d.available_space();
+                    let used = total.saturating_sub(avail);
+                    DiskInfo {
+                        mount_point: d.mount_point().to_string_lossy().into_owned(),
+                        total,
+                        used,
+                        available: avail,
+                    }
+                })
+                .collect();
 
             // System-wide disk I/O: aggregate across ALL processes
             // disk_usage().read_bytes is bytes since last refresh (already a delta)
-            let (io_read, io_write) = sys.processes().values().fold((0u64, 0u64), |(r, w), proc| {
-                let du = proc.disk_usage();
-                (r + du.read_bytes, w + du.written_bytes)
-            });
+            let (io_read, io_write) =
+                sys.processes().values().fold((0u64, 0u64), |(r, w), proc| {
+                    let du = proc.disk_usage();
+                    (r + du.read_bytes, w + du.written_bytes)
+                });
             let read_per_sec = io_read / 2; // 2s interval
             let write_per_sec = io_write / 2;
 
@@ -376,7 +398,8 @@ pub fn start_monitor(
             for (iface_name, data) in networks.iter() {
                 let rx_total = data.total_received();
                 let tx_total = data.total_transmitted();
-                let (rx_rate, tx_rate) = if let Some(&(prev_rx, prev_tx)) = prev_net.get(iface_name) {
+                let (rx_rate, tx_rate) = if let Some(&(prev_rx, prev_tx)) = prev_net.get(iface_name)
+                {
                     let rx_delta = rx_total.saturating_sub(prev_rx);
                     let tx_delta = tx_total.saturating_sub(prev_tx);
                     (rx_delta as f64 / 2.0, tx_delta as f64 / 2.0) // 2s interval
@@ -403,7 +426,11 @@ pub fn start_monitor(
 
             let total_mem = sys.total_memory();
             let used_mem = sys.used_memory();
-            let mem_pct = if total_mem > 0 { (used_mem as f64 / total_mem as f64 * 100.0) as f32 } else { 0.0 };
+            let mem_pct = if total_mem > 0 {
+                (used_mem as f64 / total_mem as f64 * 100.0) as f32
+            } else {
+                0.0
+            };
 
             let snapshot = SystemSnapshot {
                 timestamp_ms: std::time::SystemTime::now()
@@ -492,7 +519,8 @@ impl MonitorHandle {
 
     /// Set auto-stop mode.
     pub fn set_auto_stop(&self, enabled: bool) {
-        self.auto_stop.store(enabled, std::sync::atomic::Ordering::Relaxed);
+        self.auto_stop
+            .store(enabled, std::sync::atomic::Ordering::Relaxed);
         tracing::info!("auto-stop set to {enabled}");
     }
 

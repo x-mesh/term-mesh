@@ -134,10 +134,7 @@ fn run_sandboxed(cmd: &str, args: &[&str]) -> ExitCode {
         return ExitCode::from(1);
     }
 
-    eprintln!(
-        "term-mesh-run: sandbox created at {}",
-        wt_path
-    );
+    eprintln!("term-mesh-run: sandbox created at {}", wt_path);
 
     // Watch the worktree directory
     let _ = client.call("watcher.watch", serde_json::json!({ "path": &wt_path }));
@@ -189,7 +186,10 @@ fn cleanup_sandbox(repo_path: &str, wt_name: &str, wt_path: &str, child_pid: Opt
         }),
     ) {
         Ok(_) => eprintln!("term-mesh-run: sandbox removed"),
-        Err(e) => eprintln!("term-mesh-run: sandbox kept ({}). Remove via Worktree Manager.", e),
+        Err(e) => eprintln!(
+            "term-mesh-run: sandbox kept ({}). Remove via Worktree Manager.",
+            e
+        ),
     }
 }
 

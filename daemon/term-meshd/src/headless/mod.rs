@@ -86,8 +86,12 @@ pub struct SpawnParams {
     pub agent_name_override: Option<String>,
 }
 
-fn default_cli() -> String { "claude".into() }
-fn default_model() -> String { "sonnet".into() }
+fn default_cli() -> String {
+    "claude".into()
+}
+fn default_model() -> String {
+    "sonnet".into()
+}
 
 /// Parameters for creating a headless team.
 #[derive(Debug, serde::Deserialize)]
@@ -182,7 +186,10 @@ impl HeadlessManager {
 
         tracing::info!(
             "spawning headless agent: {} (cli={}, model={}, dir={})",
-            id, params.cli, params.model, params.working_directory
+            id,
+            params.cli,
+            params.model,
+            params.working_directory
         );
 
         let mut command = Command::new(&cmd.program);
@@ -198,7 +205,10 @@ impl HeadlessManager {
         // Override TERMMESH_AGENT_NAME if requested (autonomous mode: report as original agent)
         if let Some(ref name_override) = params.agent_name_override {
             command.env("TERMMESH_AGENT_NAME", name_override);
-            command.env("TERMMESH_AGENT_ID", format!("{name_override}@{}", params.team_name));
+            command.env(
+                "TERMMESH_AGENT_ID",
+                format!("{name_override}@{}", params.team_name),
+            );
         }
 
         // Remove env vars that would interfere with the subprocess
@@ -262,28 +272,33 @@ impl HeadlessManager {
             output_lines: 0,
         };
 
-        self.agents.insert(id.clone(), HeadlessAgent {
-            id,
-            name: params.name,
-            cli: params.cli,
-            model: params.model,
-            team_name: params.team_name,
-            working_directory: params.working_directory,
-            child,
-            stdin,
-            stdout_buffer,
-            protocol: proto,
-            status: AgentStatus::Running,
-            pid,
-            created_at: now,
-        });
+        self.agents.insert(
+            id.clone(),
+            HeadlessAgent {
+                id,
+                name: params.name,
+                cli: params.cli,
+                model: params.model,
+                team_name: params.team_name,
+                working_directory: params.working_directory,
+                child,
+                stdin,
+                stdout_buffer,
+                protocol: proto,
+                status: AgentStatus::Running,
+                pid,
+                created_at: now,
+            },
+        );
 
         Ok(info)
     }
 
     /// Send a message to a headless agent's stdin via its protocol adapter.
     pub async fn send_message(&mut self, agent_id: &str, text: &str) -> Result<(), String> {
-        let agent = self.agents.get_mut(agent_id)
+        let agent = self
+            .agents
+            .get_mut(agent_id)
             .ok_or_else(|| format!("agent not found: {agent_id}"))?;
 
         if agent.status == AgentStatus::Terminated {
@@ -291,9 +306,15 @@ impl HeadlessManager {
         }
 
         let bytes = agent.protocol.encode_message(text);
-        agent.stdin.write_all(&bytes).await
+        agent
+            .stdin
+            .write_all(&bytes)
+            .await
             .map_err(|e| format!("write to stdin failed: {e}"))?;
-        agent.stdin.flush().await
+        agent
+            .stdin
+            .flush()
+            .await
             .map_err(|e| format!("flush stdin failed: {e}"))?;
 
         tracing::debug!("sent {} bytes to {agent_id}", bytes.len());
@@ -302,7 +323,9 @@ impl HeadlessManager {
 
     /// Read the last N lines from an agent's output buffer.
     pub async fn read_output(&self, agent_id: &str, lines: usize) -> Result<Vec<String>, String> {
-        let agent = self.agents.get(agent_id)
+        let agent = self
+            .agents
+            .get(agent_id)
             .ok_or_else(|| format!("agent not found: {agent_id}"))?;
 
         let buf = agent.stdout_buffer.lock().await;
@@ -313,7 +336,9 @@ impl HeadlessManager {
     pub async fn terminate(&mut self, agent_id: &str) -> Result<(), String> {
         // Check status before removal
         let pid = {
-            let agent = self.agents.get(agent_id)
+            let agent = self
+                .agents
+                .get(agent_id)
                 .ok_or_else(|| format!("agent not found: {agent_id}"))?;
             if agent.status == AgentStatus::Terminated {
                 // Already terminated — just ensure removal
@@ -332,10 +357,8 @@ impl HeadlessManager {
 
         // Wait up to 5 seconds for the process to exit
         if let Some(agent) = self.agents.get_mut(agent_id) {
-            let wait_result = tokio::time::timeout(
-                std::time::Duration::from_secs(5),
-                agent.child.wait(),
-            ).await;
+            let wait_result =
+                tokio::time::timeout(std::time::Duration::from_secs(5), agent.child.wait()).await;
 
             match wait_result {
                 Ok(Ok(_)) => {
@@ -359,7 +382,9 @@ impl HeadlessManager {
 
     /// Get info for a single agent.
     pub async fn status(&self, agent_id: &str) -> Result<AgentInfo, String> {
-        let agent = self.agents.get(agent_id)
+        let agent = self
+            .agents
+            .get(agent_id)
             .ok_or_else(|| format!("agent not found: {agent_id}"))?;
 
         let output_lines = agent.stdout_buffer.lock().await.len();
@@ -459,7 +484,9 @@ impl HeadlessManager {
 
     /// Destroy a headless team: terminate all agents and remove team metadata.
     pub async fn destroy_team(&mut self, team_name: &str) -> Result<(), String> {
-        let team = self.teams.remove(team_name)
+        let team = self
+            .teams
+            .remove(team_name)
             .ok_or_else(|| format!("team not found: {team_name}"))?;
 
         for agent_id in &team.agents {
@@ -504,13 +531,23 @@ impl HeadlessManager {
     }
 
     /// Add a single agent to an existing headless team.
-    pub async fn add_agent(&mut self, team_name: &str, spec: AgentSpec, app_socket_path: Option<&str>) -> Result<AgentInfo, String> {
-        let team = self.teams.get(team_name)
+    pub async fn add_agent(
+        &mut self,
+        team_name: &str,
+        spec: AgentSpec,
+        app_socket_path: Option<&str>,
+    ) -> Result<AgentInfo, String> {
+        let team = self
+            .teams
+            .get(team_name)
             .ok_or_else(|| format!("team not found: {team_name}"))?;
 
         let agent_id = format!("{}@{}", spec.name, team_name);
         if self.agents.contains_key(&agent_id) {
-            return Err(format!("agent '{}' already exists in team '{}'", spec.name, team_name));
+            return Err(format!(
+                "agent '{}' already exists in team '{}'",
+                spec.name, team_name
+            ));
         }
 
         let working_directory = team.working_directory.clone();
@@ -536,10 +573,17 @@ impl HeadlessManager {
             }
             None => {
                 // Rollback: terminate the orphaned agent
-                tracing::error!("team '{}' disappeared after spawn, rolling back agent '{}'", team_name, info.id);
+                tracing::error!(
+                    "team '{}' disappeared after spawn, rolling back agent '{}'",
+                    team_name,
+                    info.id
+                );
                 let _ = self.terminate(&info.id).await;
                 self.agents.remove(&info.id);
-                return Err(format!("team '{}' was removed during agent spawn", team_name));
+                return Err(format!(
+                    "team '{}' was removed during agent spawn",
+                    team_name
+                ));
             }
         }
 

@@ -100,7 +100,9 @@ impl RawStdinGuard {
         if set != 0 {
             return Self { original: None };
         }
-        Self { original: Some(original) }
+        Self {
+            original: Some(original),
+        }
     }
 }
 
@@ -118,7 +120,11 @@ fn write_frame(sock: &mut UnixStream, typ: u8, payload: &[u8]) -> io::Result<()>
     if payload.len() > MAX_FRAME_BYTES {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            format!("relay frame length {} exceeds {}", payload.len(), MAX_FRAME_BYTES),
+            format!(
+                "relay frame length {} exceeds {}",
+                payload.len(),
+                MAX_FRAME_BYTES
+            ),
         ));
     }
     let mut header = [0u8; 5];
@@ -224,7 +230,9 @@ impl TerminalResponseFilter {
                         }
                         self.pending.clear();
                         self.state = ResponseFilterState::Ground;
-                    } else if !(0x20..=0x3F).contains(&b) || self.pending.len() > MAX_RESPONSE_PENDING {
+                    } else if !(0x20..=0x3F).contains(&b)
+                        || self.pending.len() > MAX_RESPONSE_PENDING
+                    {
                         out.extend_from_slice(&self.pending);
                         self.pending.clear();
                         self.state = ResponseFilterState::Ground;
@@ -310,7 +318,12 @@ fn is_terminal_csi_response(seq: &[u8]) -> bool {
         // Cursor Position Report: ESC [ row ; col R
         b'R' => !body.is_empty() && body.iter().all(|b| b.is_ascii_digit() || *b == b';'),
         // Device Status Report: ESC [ 0 n, ESC [ 3 n, etc.
-        b'n' => !body.is_empty() && body.iter().all(|b| b.is_ascii_digit() || *b == b';' || *b == b'?'),
+        b'n' => {
+            !body.is_empty()
+                && body
+                    .iter()
+                    .all(|b| b.is_ascii_digit() || *b == b';' || *b == b'?')
+        }
         // Primary/secondary Device Attributes replies.
         b'c' => {
             if body.starts_with(b"?") || body.starts_with(b">") {
@@ -397,7 +410,10 @@ fn translate_kitty_special_csi_input(seq: &[u8]) -> Option<Vec<u8>> {
 fn is_kitty_special_key(final_byte: u8, key: u32) -> bool {
     match final_byte {
         b'A' | b'B' | b'C' | b'D' | b'F' | b'H' | b'P' | b'Q' | b'S' => key == 1,
-        b'~' => matches!(key, 2 | 3 | 5 | 6 | 13 | 15 | 17 | 18 | 19 | 20 | 21 | 23 | 24),
+        b'~' => matches!(
+            key,
+            2 | 3 | 5 | 6 | 13 | 15 | 17 | 18 | 19 | 20 | 21 | 23 | 24
+        ),
         _ => false,
     }
 }
@@ -688,9 +704,7 @@ fn main() {
             if pfd.revents & libc::POLLIN == 0 {
                 continue;
             }
-            let n = unsafe {
-                libc::read(stdin_fd, buf.as_mut_ptr() as *mut _, buf.len())
-            };
+            let n = unsafe { libc::read(stdin_fd, buf.as_mut_ptr() as *mut _, buf.len()) };
             if n == 0 {
                 break;
             }
@@ -715,8 +729,12 @@ fn main() {
             Err(_) => break,
             Ok((TYPE_PTY_DATA, payload)) => {
                 let mut out = stdout.lock();
-                if out.write_all(&payload).is_err() { break; }
-                if out.flush().is_err() { break; }
+                if out.write_all(&payload).is_err() {
+                    break;
+                }
+                if out.flush().is_err() {
+                    break;
+                }
             }
             Ok((TYPE_GOODBYE, _)) => break,
             Ok((_, _)) => {}
@@ -728,7 +746,9 @@ fn main() {
     // Close SIGWINCH pipe write end so the sigwinch thread unblocks.
     let wfd = SIGWINCH_PIPE_WRITE.swap(-1, Ordering::Relaxed);
     if wfd >= 0 {
-        unsafe { libc::close(wfd); }
+        unsafe {
+            libc::close(wfd);
+        }
     }
 
     // The stdin reader may be blocked inside the PTY read. Let process exit
@@ -966,9 +986,7 @@ mod tests {
     fn drops_osc_response_split_after_escape() {
         let mut f = TerminalResponseFilter::default();
         assert!(f.process(b"\x1B").is_empty());
-        assert!(f
-            .process(b"]11;rgb:f8f8/efef/e7e7\x1B\\")
-            .is_empty());
+        assert!(f.process(b"]11;rgb:f8f8/efef/e7e7\x1B\\").is_empty());
     }
 
     /// Regression for the Codex high finding: OSC 52 clipboard read

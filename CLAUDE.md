@@ -203,6 +203,11 @@ tm-agent destroy
 tm-agent status
 tm-agent list
 
+# Agent runbooks (repo-local role behavior)
+tm-agent runbook status
+tm-agent runbook init [--dry-run] [--force]
+tm-agent runbook install --tool claude|codex|opencode|all [--agent <role>] [--dry-run] [--force]
+
 # Workspace-local attach/detach (NO new workspace — uses the caller's current one)
 tm-agent attach <agent_type> [--name N] [--model M] [--cli claude|codex|kiro|gemini]
 tm-agent detach <agent_name>
@@ -226,13 +231,11 @@ tm-agent brief <agent>
 
 # Agent task lifecycle
 tm-agent task start <task_id>
-tm-agent task done <task_id> '<result>'
 tm-agent task block <task_id> '<reason>'
 tm-agent task review <task_id> '<summary>'
 tm-agent task fix-attempt <task_id>   # Record a fix attempt (auto-blocks when budget exhausted)
 tm-agent heartbeat '<progress summary>'
-tm-agent report '<result summary>'
-tm-agent reply '<one-paragraph summary>'
+tm-agent reply '<STATUS/FILES/VERIFY/NEXT/FULL_REPORT header plus result>'  # auto-reports and completes active task
 
 # Messaging
 tm-agent msg send '<text>'                    # to leader
@@ -325,18 +328,18 @@ When a task has a fix budget (set via `--auto-fix-budget N` on delegate):
 ### Reply Truncation Protocol
 
 `tm-agent reply`와 `tm-agent collect`는 소켓 전송을 **1500자로 truncate**한다.
-풀 내용은 `~/.term-mesh/results/<team>/<task_id>.md`에 자동 저장되며, 24시간 후 자동 정리된다.
+풀 내용은 `~/.term-mesh/results/<team>/<agent>-reply.md`에 자동 저장되며, 24시간 후 자동 정리된다.
 
 #### 에이전트 의무
 
-- **응답이 1000자를 초과할 경우** reply 첫 줄에 다음을 의무적으로 포함한다:
+- **응답이 1000자를 초과할 경우** Standard Header의 `FULL_REPORT`에 결과 파일 경로를 넣는다:
 
 ```
-Full report: ~/.term-mesh/results/<team>/<task_id>.md
+FULL_REPORT: ~/.term-mesh/results/<team>/<agent>-reply.md
 ```
 
 - `<team>`: `tm-agent status`의 team_name 필드
-- `<task_id>`: 현재 처리 중인 task ID (8자리 hex)
+- `<agent>`: 현재 agent name
 
 #### Leader가 풀 내용을 읽는 명령
 
@@ -360,13 +363,13 @@ cat ~/.term-mesh/results/my-team/explorer-reply.md
 >
 > # GOOD — truncation 감지 후 파일 직접 읽기
 > tm-agent collect --lines 100
-> # 결과 끝이 "..." 이거나 "Full report:" 가 보이면:
+> # 결과 끝이 "..." 이거나 FULL_REPORT가 n/a가 아니면:
 > cat ~/.term-mesh/results/my-team/executor-reply.md
 > ```
 
 ### Standard Reply Header
 
-모든 에이전트 reply는 다음 **4필드 헤더**로 시작한다.
+모든 에이전트 reply는 다음 **5필드 헤더**로 시작한다.
 이 헤더는 brainstorm(2026-05-08) Tier 1 Cluster D 합의 결과를 영구화한 것이다.
 
 ```
@@ -374,9 +377,10 @@ STATUS: DONE|BLOCKED|NEEDS_REVIEW
 FILES: <변경된 파일 경로, 복수 시 공백 구분, 없으면 "none">
 VERIFY: <결과를 확인하는 단일 shell 명령, 해당 없으면 "n/a">
 NEXT: <leader가 다음에 실행할 액션 한 줄, 없으면 "NONE">
+FULL_REPORT: <전체 결과 파일 경로, 해당 없으면 "n/a">
 ```
 
-- **모든 task**: 4필드 의무. 해당 없으면 `n/a`/`none`/`NONE` 사용.
+- **모든 task**: 5필드 의무. 해당 없으면 `n/a`/`none`/`NONE` 사용.
 - 헤더 다음에 페르소나별 본문 포맷이 이어진다 (아래 참조)
 
 #### 페르소나별 포맷과의 관계
@@ -390,11 +394,11 @@ Standard Header가 **첫 블록**, 페르소나 고유 포맷이 **본문**이�
 | security | `[SEVERITY][CWE][FILE:LINE][PoC][FIX][VERIFY]` 6필드 |
 | planner | `TASK\|PHASE\|OWNER\|INPUT\|OUTPUT\|DEPS\|ACCEPT + tm-agent task create 라인` |
 | architect | ADR 섹션 + Swift/Rust 스텁 + sequence pseudo |
-| executor | `STATUS\|FILES\|VERIFY\|NEXT 헤더 + diff/build 결과` |
-| frontend | `STATUS\|FILES\|VERIFY + portal 경계 명시 + dlog 이벤트 목록` |
-| backend | `STATUS\|FILES\|VERIFY + RPC 변경 시 첫 줄 Swift 영향 YES/NO + CHANGED_FILES` |
+| executor | `STATUS\|FILES\|VERIFY\|NEXT\|FULL_REPORT 헤더 + diff/build 결과` |
+| frontend | `STATUS\|FILES\|VERIFY\|NEXT\|FULL_REPORT 헤더 + portal 경계 명시 + dlog 이벤트 목록` |
+| backend | `STATUS\|FILES\|VERIFY\|NEXT\|FULL_REPORT 헤더 + RPC 변경 시 첫 줄 Swift 영향 YES/NO + CHANGED_FILES` |
 | tester | `STATUS\|FILES\|VERIFY + 테스트 케이스 수 N/M + VM 필요 여부` |
-| writer | `STATUS\|FILES\|NEXT + 삽입 위치 + Self-check 한 줄` |
+| writer | `STATUS\|FILES\|VERIFY\|NEXT\|FULL_REPORT 헤더 + 삽입 위치 + Self-check 한 줄` |
 
 #### Leader가 STATUS·NEXT를 일괄 추출하는 명령
 

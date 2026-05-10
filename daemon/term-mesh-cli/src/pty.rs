@@ -43,7 +43,11 @@ pub fn run_with_pty(cmd: &str, args: &[&str], cwd: Option<&str>) -> Result<(i32,
         if let Some(dir) = cwd {
             let c_dir = CString::new(dir).unwrap();
             if unsafe { libc::chdir(c_dir.as_ptr()) } != 0 {
-                eprintln!("term-mesh: failed to chdir to '{}': {}", dir, io::Error::last_os_error());
+                eprintln!(
+                    "term-mesh: failed to chdir to '{}': {}",
+                    dir,
+                    io::Error::last_os_error()
+                );
                 unsafe { libc::_exit(126) };
             }
         }
@@ -64,7 +68,11 @@ pub fn run_with_pty(cmd: &str, args: &[&str], cwd: Option<&str>) -> Result<(i32,
         unsafe { libc::execvp(c_cmd.as_ptr(), c_argv.as_ptr()) };
 
         // If exec fails
-        eprintln!("term-mesh: failed to exec '{}': {}", cmd, io::Error::last_os_error());
+        eprintln!(
+            "term-mesh: failed to exec '{}': {}",
+            cmd,
+            io::Error::last_os_error()
+        );
         unsafe { libc::_exit(127) };
     }
 
@@ -95,7 +103,8 @@ pub fn run_with_pty(cmd: &str, args: &[&str], cwd: Option<&str>) -> Result<(i32,
             if n <= 0 {
                 break;
             }
-            let written = unsafe { libc::write(master_raw_for_stdin, buf.as_ptr() as _, n as usize) };
+            let written =
+                unsafe { libc::write(master_raw_for_stdin, buf.as_ptr() as _, n as usize) };
             if written <= 0 {
                 break;
             }

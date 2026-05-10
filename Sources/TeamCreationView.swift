@@ -189,6 +189,7 @@ struct TeamCreationView: View {
     @State private var recentSessions: [ClaudeSession] = []
     @State private var selectedSessionId: String?
     @State private var manualSessionId = ""
+    @State private var runbookStatus = AgentRunbookService.shared.status()
 
     /// A team name is only truly duplicate if the entry exists AND its workspace
     /// tab is still open.  When the user closes a workspace tab manually the team
@@ -236,6 +237,7 @@ struct TeamCreationView: View {
             if agents.isEmpty {
                 applyQuickPreset(count: 2)
             }
+            refreshRunbookStatus()
         }
         .sheet(isPresented: $showPresetEditor) {
             RolePresetEditorView()
@@ -714,6 +716,8 @@ struct TeamCreationView: View {
                     EmptyView()
                 }
 
+                runbookBadge(for: agent)
+
                 Spacer()
 
                 // Remove button
@@ -774,6 +778,8 @@ struct TeamCreationView: View {
             }
             .font(.caption)
             .foregroundStyle(.secondary)
+
+            resolvedPromptDisclosure(for: agent)
         }
         .padding(10)
         .background(
@@ -1066,7 +1072,8 @@ struct TeamCreationView: View {
         let available = presetManager.presets
         var preset = available[agents.count % available.count]
         preset.model = defaultModel
-        agents.append(TeamAgentRow(preset: preset, customInstructions: ""))
+        let row = TeamAgentRow(preset: preset, customInstructions: "")
+        agents.append(row)
     }
 
     private func applyQuickPreset(count: Int) {
@@ -1190,6 +1197,104 @@ struct TeamCreationView: View {
         let modelCounts = Dictionary(grouping: agents, by: { $0.preset.model }).mapValues(\.count)
         bulkCli = cliCounts.max(by: { $0.value < $1.value })?.key ?? bulkCli
         bulkModel = modelCounts.max(by: { $0.value < $1.value })?.key ?? bulkModel
+    }
+
+    private func refreshRunbookStatus() {
+        runbookStatus = AgentRunbookService.shared.status(workingDirectory: resolveWorkingDirectory())
+    }
+
+    private func runbookBadge(for agent: TeamAgentRow) -> some View {
+        let hasCustom = !agent.customInstructions.isEmpty && agent.customInstructions != agent.preset.instructions
+        let state = runbookStatus.role(agent.preset.name)?.sourceState ?? .missing
+        let label = hasCustom ? "custom" : (state == .missing ? "preset" : "runbook")
+        let color: Color = hasCustom ? .orange : (state == .missing ? .secondary : .green)
+        return Text(label)
+            .font(.system(size: 9, weight: .medium))
+            .foregroundStyle(color)
+            .padding(.horizontal, 5)
+            .padding(.vertical, 1)
+            .background(RoundedRectangle(cornerRadius: 4).fill(color.opacity(0.1)))
+            .help(hasCustom ? "Team-specific custom instructions" : (state == .missing ? "Using role preset instructions" : "Repo-local runbook will be included"))
+    }
+
+    private func resolvedPromptDisclosure(for agent: TeamAgentRow) -> some View {
+        DisclosureGroup {
+            VStack(alignment: .leading, spacing: 6) {
+                HStack(spacing: 6) {
+                    runbookBadge(for: agent)
+                    Text(runbookPreviewSummary(for: agent))
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                    Spacer()
+                    Button {
+                        refreshRunbookStatus()
+                    } label: {
+                        Image(systemName: "arrow.clockwise")
+                    }
+                    .buttonStyle(.borderless)
+                    .help("Refresh runbook status")
+                }
+
+                ScrollView {
+                    Text(effectiveRunbookPrompt(for: agent))
+                        .font(.system(.caption2, design: .monospaced))
+                        .foregroundStyle(.secondary)
+                        .textSelection(.enabled)
+                        .frame(maxWidth: .infinity, alignment: .topLeading)
+                        .padding(8)
+                }
+                .frame(height: 112)
+                .background(
+                    RoundedRectangle(cornerRadius: 6)
+                        .fill(Color(nsColor: .textBackgroundColor).opacity(0.35))
+                )
+                .overlay(
+                    RoundedRectangle(cornerRadius: 6)
+                        .stroke(Color.secondary.opacity(0.14), lineWidth: 1)
+                )
+            }
+            .padding(.top, 4)
+        } label: {
+            HStack(spacing: 6) {
+                Label("Resolved Prompt", systemImage: "doc.text.magnifyingglass")
+                Text("Read-only")
+                    .font(.system(size: 9, weight: .medium))
+                    .foregroundStyle(.secondary)
+                    .padding(.horizontal, 5)
+                    .padding(.vertical, 1)
+                    .background(RoundedRectangle(cornerRadius: 4).fill(Color.secondary.opacity(0.1)))
+            }
+        }
+        .font(.caption)
+        .foregroundStyle(.secondary)
+    }
+
+    private func effectiveRunbookPrompt(for agent: TeamAgentRow) -> String {
+        let customInstructions = agent.customInstructions == agent.preset.instructions
+            ? ""
+            : agent.customInstructions
+        return AgentRunbookService.shared.composeInstructions(
+            roleName: agent.preset.name,
+            presetInstructions: agent.preset.instructions,
+            customInstructions: customInstructions,
+            workingDirectory: resolveWorkingDirectory()
+        )
+    }
+
+    private func runbookPreviewSummary(for agent: TeamAgentRow) -> String {
+        let hasCustom = !agent.customInstructions.isEmpty && agent.customInstructions != agent.preset.instructions
+        let state = runbookStatus.role(agent.preset.name)?.sourceState ?? .missing
+        if hasCustom && state != .missing {
+            return "Role preset, repo runbook, and team custom instructions will be merged."
+        }
+        if hasCustom {
+            return "Role preset and team custom instructions will be merged."
+        }
+        if state != .missing {
+            return "Role preset and repo runbook will be merged."
+        }
+        return "Role preset only. No repo-local runbook exists for this role."
     }
 
     /// Resolve the current project's working directory from the key window's active tab.

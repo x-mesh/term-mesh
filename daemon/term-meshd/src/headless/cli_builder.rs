@@ -69,11 +69,14 @@ pub fn build_claude_command(
     let program = resolve_cli_path(cli_path, "CLAUDE_PATH", "claude");
 
     let mut args = vec![
-        "--input-format".into(), "stream-json".into(),
-        "--output-format".into(), "stream-json".into(),
+        "--input-format".into(),
+        "stream-json".into(),
+        "--output-format".into(),
+        "stream-json".into(),
         "--verbose".into(),
         "--dangerously-skip-permissions".into(),
-        "--model".into(), model.to_string(),
+        "--model".into(),
+        model.to_string(),
     ];
 
     // Pass agent-specific instructions as --append-system-prompt
@@ -88,12 +91,14 @@ pub fn build_claude_command(
     let env = base_env(name, team_name, daemon_socket, app_socket_path);
 
     // Remove env vars that cause nested-session detection in Claude Code
-    let env_remove = vec![
-        "CLAUDECODE".into(),
-        "CLAUDE_CODE_ENTRYPOINT".into(),
-    ];
+    let env_remove = vec!["CLAUDECODE".into(), "CLAUDE_CODE_ENTRYPOINT".into()];
 
-    CliCommand { program, args, env, env_remove }
+    CliCommand {
+        program,
+        args,
+        env,
+        env_remove,
+    }
 }
 
 /// Map short model names to Kiro CLI model identifiers.
@@ -136,13 +141,21 @@ pub fn build_kiro_command(
     let args = vec![
         "chat".into(),
         "--trust-all-tools".into(),
-        "--wrap".into(), "never".into(),
-        "--agent".into(), profile_name,
-        "--model".into(), kiro_model.to_string(),
+        "--wrap".into(),
+        "never".into(),
+        "--agent".into(),
+        profile_name,
+        "--model".into(),
+        kiro_model.to_string(),
     ];
 
     let env = base_env(name, team_name, daemon_socket, app_socket_path);
-    CliCommand { program, args, env, env_remove: vec![] }
+    CliCommand {
+        program,
+        args,
+        env,
+        env_remove: vec![],
+    }
 }
 
 /// Write a Kiro agent profile TOML to ~/.kiro/agents/<name>.toml
@@ -190,14 +203,21 @@ pub fn build_codex_command(
     let codex_model = codex_model_name(model);
     let args = vec![
         "exec".into(),
-        "--sandbox".into(), "danger-full-access".into(),
-        "--model".into(), codex_model.to_string(),
+        "--sandbox".into(),
+        "danger-full-access".into(),
+        "--model".into(),
+        codex_model.to_string(),
         "--json".into(),
-        "-".into(),  // read prompt from stdin
+        "-".into(), // read prompt from stdin
     ];
 
     let env = base_env(name, team_name, daemon_socket, app_socket_path);
-    CliCommand { program, args, env, env_remove: vec![] }
+    CliCommand {
+        program,
+        args,
+        env,
+        env_remove: vec![],
+    }
 }
 
 /// Map short model names to Gemini CLI model identifiers.
@@ -222,13 +242,15 @@ pub fn build_gemini_command(
     let program = resolve_cli_path(cli_path, "GEMINI_PATH", "gemini");
 
     let gemini_model = gemini_model_name(model);
-    let args = vec![
-        "--yolo".into(),
-        "--model".into(), gemini_model.to_string(),
-    ];
+    let args = vec!["--yolo".into(), "--model".into(), gemini_model.to_string()];
 
     let env = base_env(name, team_name, daemon_socket, app_socket_path);
-    CliCommand { program, args, env, env_remove: vec![] }
+    CliCommand {
+        program,
+        args,
+        env,
+        env_remove: vec![],
+    }
 }
 
 /// Resolve the daemon socket path (same logic as socket::default_socket_path).

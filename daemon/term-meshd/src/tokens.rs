@@ -171,9 +171,7 @@ impl UsageTracker {
 
     /// Scan all JSONL files for new data.
     pub fn scan_all(&self) -> anyhow::Result<()> {
-        let claude_dir = {
-            self.state.lock().unwrap().claude_projects_dir.clone()
-        };
+        let claude_dir = { self.state.lock().unwrap().claude_projects_dir.clone() };
 
         if !claude_dir.exists() {
             return Ok(());
@@ -304,14 +302,12 @@ fn process_line(state: &mut TrackerState, entry: &JsonlLine, file_path: &Path) {
         None => return,
     };
 
-    let model = message
-        .model
-        .clone()
-        .unwrap_or_else(|| "unknown".into());
+    let model = message.model.clone().unwrap_or_else(|| "unknown".into());
 
-    let project_path = entry.cwd.clone().unwrap_or_else(|| {
-        decode_project_dir(file_path)
-    });
+    let project_path = entry
+        .cwd
+        .clone()
+        .unwrap_or_else(|| decode_project_dir(file_path));
 
     let cost = calculate_line_cost(&usage, &model);
 
@@ -381,10 +377,7 @@ fn decode_project_dir(file_path: &Path) -> String {
                 .unwrap_or(false)
             {
                 // path is the project directory
-                let dir_name = path
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .unwrap_or("");
+                let dir_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
                 return dir_name.replacen('-', "/", 1).replace('-', "/");
             }
             path = parent;
@@ -535,7 +528,8 @@ mod tests {
         // Note: decode_project_dir replaces all '-' with '/' — hyphens in
         // directory names (e.g. tty-mesh) are not preserved. This is a known
         // limitation; the cwd field from JSONL is preferred when available.
-        let path = PathBuf::from("/home/user/.claude/projects/-Users-jinwoo-work-project/abc.jsonl");
+        let path =
+            PathBuf::from("/home/user/.claude/projects/-Users-jinwoo-work-project/abc.jsonl");
         let decoded = decode_project_dir(&path);
         assert_eq!(decoded, "/Users/jinwoo/work/project");
     }

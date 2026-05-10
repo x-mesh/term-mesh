@@ -30,7 +30,8 @@ impl AgentProtocol for ClaudeStreamJson {
                 "content": text,
             }
         });
-        let mut bytes = serde_json::to_vec(&msg).expect("JSON serialization cannot fail for valid input");
+        let mut bytes =
+            serde_json::to_vec(&msg).expect("JSON serialization cannot fail for valid input");
         bytes.push(b'\n');
         bytes
     }
@@ -47,7 +48,9 @@ pub fn protocol_for(cli: &str) -> Box<dyn AgentProtocol> {
         // Phase 3: "codex" => Box::new(CodexJsonRpc),
         // Phase 3: "kiro" | "gemini" => Box::new(AcpProtocol),
         other => {
-            tracing::warn!("no protocol adapter for CLI '{other}', falling back to claude-stream-json");
+            tracing::warn!(
+                "no protocol adapter for CLI '{other}', falling back to claude-stream-json"
+            );
             Box::new(ClaudeStreamJson)
         }
     }

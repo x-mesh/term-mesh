@@ -122,7 +122,10 @@ pub fn write_all(master_fd: RawFd, bytes: &[u8]) -> io::Result<()> {
             continue;
         }
         if n == 0 {
-            return Err(io::Error::new(io::ErrorKind::WriteZero, "PTY write returned 0"));
+            return Err(io::Error::new(
+                io::ErrorKind::WriteZero,
+                "PTY write returned 0",
+            ));
         }
         let err = io::Error::last_os_error();
         match err.raw_os_error() {

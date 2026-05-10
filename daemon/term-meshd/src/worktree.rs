@@ -86,11 +86,17 @@ fn create_inner(params: serde_json::Value) -> Result<WorktreeInfo, String> {
             .map_err(|e| format!("cannot open repo at {}: {e}", params.repo_path))?;
         if candidate.is_worktree() {
             let git_path = candidate.path(); // e.g. <main>/.git/worktrees/<name>/
-            // Walk up: worktrees/<name> -> worktrees -> .git -> main repo root
-            let main_git_dir = git_path.parent() // worktrees/<name>
-                .and_then(|p| p.parent())        // worktrees
-                .and_then(|p| p.parent())        // .git
-                .ok_or_else(|| format!("cannot resolve main repo from worktree path: {}", git_path.display()))?;
+                                             // Walk up: worktrees/<name> -> worktrees -> .git -> main repo root
+            let main_git_dir = git_path
+                .parent() // worktrees/<name>
+                .and_then(|p| p.parent()) // worktrees
+                .and_then(|p| p.parent()) // .git
+                .ok_or_else(|| {
+                    format!(
+                        "cannot resolve main repo from worktree path: {}",
+                        git_path.display()
+                    )
+                })?;
             tracing::debug!("resolved worktree to main repo: {}", main_git_dir.display());
             Repository::open(main_git_dir)
                 .map_err(|e| format!("cannot open main repo at {}: {e}", main_git_dir.display()))?
@@ -122,7 +128,10 @@ fn create_inner(params: serde_json::Value) -> Result<WorktreeInfo, String> {
     };
 
     // Create branch (delete stale branch+worktree first if it already exists)
-    if repo.find_branch(&branch_name, git2::BranchType::Local).is_ok() {
+    if repo
+        .find_branch(&branch_name, git2::BranchType::Local)
+        .is_ok()
+    {
         // Check if there's an existing worktree using this branch and prune it
         if let Ok(wt_names) = repo.worktrees() {
             for existing_wt in wt_names.iter().flatten() {
@@ -162,9 +171,11 @@ fn create_inner(params: serde_json::Value) -> Result<WorktreeInfo, String> {
             }
         }
         // Delete the stale branch so we can recreate it from current HEAD
-        let mut branch = repo.find_branch(&branch_name, git2::BranchType::Local)
+        let mut branch = repo
+            .find_branch(&branch_name, git2::BranchType::Local)
             .map_err(|e| format!("cannot find branch '{branch_name}': {e}"))?;
-        branch.delete()
+        branch
+            .delete()
             .map_err(|e| format!("cannot delete stale branch '{branch_name}': {e}"))?;
         tracing::info!("deleted stale branch '{branch_name}' for re-creation");
     }
@@ -172,12 +183,11 @@ fn create_inner(params: serde_json::Value) -> Result<WorktreeInfo, String> {
         .map_err(|e| format!("cannot create branch '{branch_name}': {e}"))?;
 
     // Worktree path: use base_dir if provided, otherwise default to ~/.term-mesh/worktrees/{repo_name}/
-    let repo_root = repo
-        .workdir()
-        .ok_or("bare repos not supported")?;
+    let repo_root = repo.workdir().ok_or("bare repos not supported")?;
     let wt_path = if let Some(ref base) = params.base_dir {
         let base_path = std::path::PathBuf::from(base);
-        let repo_name = repo_root.file_name()
+        let repo_name = repo_root
+            .file_name()
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_else(|| "unknown".to_string());
         let target_dir = base_path.join(&repo_name);
@@ -187,7 +197,8 @@ fn create_inner(params: serde_json::Value) -> Result<WorktreeInfo, String> {
     } else {
         let home = dirs::home_dir().ok_or("cannot determine home directory")?;
         let default_base = home.join(".term-mesh").join("worktrees");
-        let repo_name = repo_root.file_name()
+        let repo_name = repo_root
+            .file_name()
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_else(|| "unknown".to_string());
         let target_dir = default_base.join(&repo_name);
@@ -201,17 +212,21 @@ fn create_inner(params: serde_json::Value) -> Result<WorktreeInfo, String> {
         &wt_name,
         &wt_path,
         Some(
-            git2::WorktreeAddOptions::new()
-                .reference(Some(&repo.find_branch(&branch_name, git2::BranchType::Local)
+            git2::WorktreeAddOptions::new().reference(Some(
+                &repo
+                    .find_branch(&branch_name, git2::BranchType::Local)
                     .map_err(|e| format!("branch lookup failed: {e}"))?
-                    .into_reference())),
+                    .into_reference(),
+            )),
         ),
     )
     .map_err(|e| format!("cannot create worktree: {e}"))?;
 
     let path_str = wt_path.to_string_lossy().into_owned();
     tracing::info!("created worktree {wt_name} at {}", wt_path.display());
-    wt_log(&format!("CREATE OK name={wt_name} branch={branch_name} path={path_str}"));
+    wt_log(&format!(
+        "CREATE OK name={wt_name} branch={branch_name} path={path_str}"
+    ));
 
     Ok(WorktreeInfo {
         name: wt_name,
@@ -270,10 +285,12 @@ pub fn remove(params: serde_json::Value) -> Result<(), String> {
     let params: RemoveParams =
         serde_json::from_value(params).map_err(|e| format!("invalid params: {e}"))?;
 
-    wt_log(&format!("REMOVE name={} force={} repo={}", params.name, params.force, params.repo_path));
+    wt_log(&format!(
+        "REMOVE name={} force={} repo={}",
+        params.name, params.force, params.repo_path
+    ));
 
-    let repo = Repository::open(&params.repo_path)
-        .map_err(|e| format!("cannot open repo: {e}"))?;
+    let repo = Repository::open(&params.repo_path).map_err(|e| format!("cannot open repo: {e}"))?;
 
     // Find worktree and get its path before pruning
     let wt = repo
@@ -308,8 +325,7 @@ pub fn remove(params: serde_json::Value) -> Result<(), String> {
 
     // Remove the directory using the path from git metadata
     if wt_path.exists() {
-        std::fs::remove_dir_all(&wt_path)
-            .map_err(|e| format!("cannot remove directory: {e}"))?;
+        std::fs::remove_dir_all(&wt_path).map_err(|e| format!("cannot remove directory: {e}"))?;
     }
 
     tracing::info!("removed worktree {} (force={})", params.name, params.force);
@@ -327,8 +343,7 @@ pub fn list(params: serde_json::Value) -> Result<Vec<WorktreeInfo>, String> {
     let params: ListParams =
         serde_json::from_value(params).map_err(|e| format!("invalid params: {e}"))?;
 
-    let repo = Repository::open(&params.repo_path)
-        .map_err(|e| format!("cannot open repo: {e}"))?;
+    let repo = Repository::open(&params.repo_path).map_err(|e| format!("cannot open repo: {e}"))?;
 
     let names = repo
         .worktrees()
@@ -354,7 +369,6 @@ pub fn list(params: serde_json::Value) -> Result<Vec<WorktreeInfo>, String> {
     Ok(result)
 }
 
-
 fn worktree_branch(repo: &Repository, wt_name: &str) -> String {
     // Get path from git worktree metadata
     let wt_path = match repo.find_worktree(wt_name) {
@@ -363,10 +377,7 @@ fn worktree_branch(repo: &Repository, wt_name: &str) -> String {
     };
     match Repository::open(&wt_path) {
         Ok(wt_repo) => match wt_repo.head() {
-            Ok(head) => head
-                .shorthand()
-                .unwrap_or("detached")
-                .to_string(),
+            Ok(head) => head.shorthand().unwrap_or("detached").to_string(),
             Err(_) => "unknown".into(),
         },
         Err(_) => "unknown".into(),
@@ -393,16 +404,15 @@ pub fn status(params: serde_json::Value) -> Result<WorktreeStatus, String> {
     let params: StatusParams =
         serde_json::from_value(params).map_err(|e| format!("invalid params: {e}"))?;
 
-    let repo = Repository::open(&params.repo_path)
-        .map_err(|e| format!("cannot open repo: {e}"))?;
+    let repo = Repository::open(&params.repo_path).map_err(|e| format!("cannot open repo: {e}"))?;
 
     let wt = repo
         .find_worktree(&params.name)
         .map_err(|e| format!("worktree '{}' not found: {e}", params.name))?;
     let wt_path = wt.path().to_path_buf();
 
-    let wt_repo = Repository::open(&wt_path)
-        .map_err(|e| format!("cannot open worktree repo: {e}"))?;
+    let wt_repo =
+        Repository::open(&wt_path).map_err(|e| format!("cannot open worktree repo: {e}"))?;
 
     // Check dirty: any modified, staged, or untracked files
     let statuses = wt_repo
@@ -502,7 +512,8 @@ pub fn detect_orphan_worktrees() {
                         for inner_entry in inner.flatten() {
                             let name = inner_entry.file_name();
                             let name_str = name.to_string_lossy();
-                            if name_str.starts_with("term-mesh_wt_") && inner_entry.path().is_dir() {
+                            if name_str.starts_with("term-mesh_wt_") && inner_entry.path().is_dir()
+                            {
                                 orphans.push(inner_entry.path());
                             }
                         }
@@ -569,7 +580,6 @@ mod tests {
         let path_str = repo_path.to_string_lossy().into_owned();
         (dir, path_str)
     }
-
 
     #[test]
     fn create_and_list_worktree() {
@@ -666,7 +676,9 @@ mod tests {
             "base_dir": base.path().to_string_lossy(),
         });
         let info = create(params).unwrap();
-        assert!(info.path.starts_with(&base.path().to_string_lossy().to_string()));
+        assert!(info
+            .path
+            .starts_with(&base.path().to_string_lossy().to_string()));
         assert!(std::path::Path::new(&info.path).exists());
     }
 }

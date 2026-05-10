@@ -7,6 +7,7 @@ enum SettingsSection: String, CaseIterable, Identifiable {
     case workspaceColors = "workspaceColors"
     case automation = "automation"
     case agentTeams = "agentTeams"
+    case agentRunbooks = "agentRunbooks"
     case agentCLIPaths = "agentCLIPaths"
     case agentModels = "agentModels"
     case worktrees = "worktrees"
@@ -27,6 +28,7 @@ enum SettingsSection: String, CaseIterable, Identifiable {
         case .workspaceColors: return "Workspace Colors"
         case .automation: return "Automation"
         case .agentTeams: return "Agent Teams"
+        case .agentRunbooks: return "Agent Runbooks"
         case .agentCLIPaths: return "Agent CLI Paths"
         case .agentModels: return "Agent Models"
         case .worktrees: return "Worktrees"
@@ -47,6 +49,7 @@ enum SettingsSection: String, CaseIterable, Identifiable {
         case .workspaceColors: return "paintpalette"
         case .automation: return "bolt.horizontal"
         case .agentTeams: return "person.3"
+        case .agentRunbooks: return "book.closed"
         case .agentCLIPaths: return "terminal"
         case .agentModels: return "cpu"
         case .worktrees: return "arrow.triangle.branch"
@@ -63,7 +66,7 @@ enum SettingsSection: String, CaseIterable, Identifiable {
     var category: SettingsSectionCategory {
         switch self {
         case .app, .terminal, .workspaceColors: return .general
-        case .automation, .agentTeams, .agentCLIPaths, .agentModels, .worktrees: return .agents
+        case .automation, .agentTeams, .agentRunbooks, .agentCLIPaths, .agentModels, .worktrees: return .agents
         case .dashboard, .services, .peerFederation: return .network
         case .browser: return .browser
         case .imeInputBar, .keyboardShortcuts: return .input
@@ -78,6 +81,7 @@ enum SettingsSection: String, CaseIterable, Identifiable {
         case .workspaceColors: return ["workspace", "color", "indicator", "palette", "custom"]
         case .automation: return ["automation", "socket", "claude", "port", "integration", "password"]
         case .agentTeams: return ["agent", "team", "leader", "model", "directory", "rendering", "interval", "refresh"]
+        case .agentRunbooks: return ["agent", "runbook", "skill", "claude", "codex", "opencode", "install", "role"]
         case .agentCLIPaths: return ["cli", "path", "claude", "kiro", "codex", "gemini", "binary", "agent"]
         case .agentModels: return ["model", "custom", "version", "gemini", "codex", "kiro", "claude", "preview"]
         case .worktrees: return ["worktrees", "worktree", "base directory", "cleanup", "auto"]
@@ -608,6 +612,8 @@ struct SettingsView: View {
             sectionAutomation
         case .agentTeams:
             sectionAgentTeams
+        case .agentRunbooks:
+            AgentRunbookSettingsView()
         case .agentCLIPaths:
             sectionAgentCLIPaths
         case .agentModels:
@@ -2577,7 +2583,7 @@ private struct SettingsSectionHeader: View {
     }
 }
 
-private struct SettingsCard<Content: View>: View {
+struct SettingsCard<Content: View>: View {
     @ViewBuilder let content: Content
 
     init(@ViewBuilder content: () -> Content) {
@@ -2599,7 +2605,7 @@ private struct SettingsCard<Content: View>: View {
     }
 }
 
-private struct SettingsCardRow<Trailing: View>: View {
+struct SettingsCardRow<Trailing: View>: View {
     let title: String
     let subtitle: String?
     let controlWidth: CGFloat?
@@ -2647,7 +2653,7 @@ private struct SettingsCardRow<Trailing: View>: View {
     }
 }
 
-private struct SettingsCardDivider: View {
+struct SettingsCardDivider: View {
     var body: some View {
         Rectangle()
             .fill(Color(nsColor: NSColor.separatorColor).opacity(0.5))
@@ -2940,7 +2946,7 @@ private struct ShellHealthEntry: Identifiable {
     let isAgentPanel: Bool
 }
 
-private struct SettingsCardNote: View {
+struct SettingsCardNote: View {
     let text: String
 
     init(_ text: String) {

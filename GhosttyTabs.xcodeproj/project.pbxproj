@@ -73,6 +73,8 @@
 		A5001720 /* TeamDataStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = A5001721 /* TeamDataStore.swift */; };
 		A5001702 /* DashboardController.swift in Sources */ = {isa = PBXBuildFile; fileRef = A5001703 /* DashboardController.swift */; };
 		A5001704 /* dashboard in Resources */ = {isa = PBXBuildFile; fileRef = A5001705 /* dashboard */; };
+		ARB00002 /* AgentRunbookService.swift in Sources */ = {isa = PBXBuildFile; fileRef = ARB00001 /* AgentRunbookService.swift */; };
+		ARB00004 /* AgentRunbookSettingsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = ARB00003 /* AgentRunbookSettingsView.swift */; };
 			A5001006 /* GhosttyKit.xcframework in Frameworks */ = {isa = PBXBuildFile; fileRef = A5001016 /* GhosttyKit.xcframework */; };
 		A5001007 /* TerminalController.swift in Sources */ = {isa = PBXBuildFile; fileRef = A5001019 /* TerminalController.swift */; };
 		TC0B0001 /* TerminalController+Process.swift in Sources */ = {isa = PBXBuildFile; fileRef = TC0F0001 /* TerminalController+Process.swift */; };
@@ -284,6 +286,8 @@
 		A5001721 /* TeamDataStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TeamDataStore.swift; sourceTree = "<group>"; };
 		A5001703 /* DashboardController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DashboardController.swift; sourceTree = "<group>"; };
 		A5001705 /* dashboard */ = {isa = PBXFileReference; lastKnownFileType = folder; path = dashboard; sourceTree = "<group>"; };
+		ARB00001 /* AgentRunbookService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AgentRunbookService.swift; sourceTree = "<group>"; };
+		ARB00003 /* AgentRunbookSettingsView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AgentRunbookSettingsView.swift; sourceTree = "<group>"; };
 			A5001016 /* GhosttyKit.xcframework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.xcframework; path = GhosttyKit.xcframework; sourceTree = "<group>"; };
 		A5001017 /* ghostty.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = ghostty.h; sourceTree = "<group>"; };
 		A5001018 /* term-mesh-Bridging-Header.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = "term-mesh-Bridging-Header.h"; sourceTree = "<group>"; };
@@ -559,6 +563,8 @@
 				A5001701 /* TermMeshDaemon.swift */,
 				A5001711 /* TeamOrchestrator.swift */,
 				A5001721 /* TeamDataStore.swift */,
+				ARB00001 /* AgentRunbookService.swift */,
+				ARB00003 /* AgentRunbookSettingsView.swift */,
 				813264D854BA4B5F9AA4F9FC /* RolePresetEditorView.swift */,
 				B848F672710C48B1944F70BF /* TeamCreationView.swift */,
 				DE801F330BAD4EB88D9D875E /* AgentRolePreset.swift */,
@@ -883,6 +889,8 @@
 				A5001700 /* TermMeshDaemon.swift in Sources */,
 				A5001710 /* TeamOrchestrator.swift in Sources */,
 				A5001720 /* TeamDataStore.swift in Sources */,
+				ARB00002 /* AgentRunbookService.swift in Sources */,
+				ARB00004 /* AgentRunbookSettingsView.swift in Sources */,
 				4C9D95957760492496CD2E3E /* RolePresetEditorView.swift in Sources */,
 				562D55FA859F4E8B94EB49CB /* TeamCreationView.swift in Sources */,
 				F46F7DFF875543329CD15B08 /* AgentRolePreset.swift in Sources */,
@@ -1059,7 +1067,7 @@
 				CODE_SIGN_ENTITLEMENTS = "";
 				CODE_SIGN_STYLE = Automatic;
 				COMBINE_HIDPI_IMAGES = YES;
-				CURRENT_PROJECT_VERSION = 161;
+				CURRENT_PROJECT_VERSION = 162;
 				DEVELOPMENT_TEAM = "";
 				ENABLE_HARDENED_RUNTIME = NO;
 				GENERATE_INFOPLIST_FILE = NO;
@@ -1068,7 +1076,7 @@
 					"$(inherited)",
 					"@executable_path/../Frameworks",
 				);
-				MARKETING_VERSION = 0.103.3;
+				MARKETING_VERSION = 0.104.0;
 				OTHER_LDFLAGS = (
 					"-lc++",
 					"-framework",
@@ -1098,7 +1106,7 @@
 				CODE_SIGN_ENTITLEMENTS = "";
 				CODE_SIGN_STYLE = Automatic;
 				COMBINE_HIDPI_IMAGES = YES;
-				CURRENT_PROJECT_VERSION = 161;
+				CURRENT_PROJECT_VERSION = 162;
 				DEVELOPMENT_TEAM = "";
 				ENABLE_HARDENED_RUNTIME = NO;
 				GENERATE_INFOPLIST_FILE = NO;
@@ -1107,7 +1115,7 @@
 					"$(inherited)",
 					"@executable_path/../Frameworks",
 				);
-				MARKETING_VERSION = 0.103.3;
+				MARKETING_VERSION = 0.104.0;
 				OTHER_LDFLAGS = (
 					"-lc++",
 					"-framework",
@@ -1161,10 +1169,10 @@
 			isa = XCBuildConfiguration;
 			buildSettings = {
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 161;
+				CURRENT_PROJECT_VERSION = 162;
 				GENERATE_INFOPLIST_FILE = YES;
 				MACOSX_DEPLOYMENT_TARGET = 14.0;
-				MARKETING_VERSION = 0.103.3;
+				MARKETING_VERSION = 0.104.0;
 				ONLY_ACTIVE_ARCH = YES;
 				PRODUCT_BUNDLE_IDENTIFIER = com.termmesh.appuitests;
 				PRODUCT_NAME = "$(TARGET_NAME)";
@@ -1178,10 +1186,10 @@
 			isa = XCBuildConfiguration;
 			buildSettings = {
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 161;
+				CURRENT_PROJECT_VERSION = 162;
 				GENERATE_INFOPLIST_FILE = YES;
 				MACOSX_DEPLOYMENT_TARGET = 14.0;
-				MARKETING_VERSION = 0.103.3;
+				MARKETING_VERSION = 0.104.0;
 				ONLY_ACTIVE_ARCH = YES;
 				PRODUCT_BUNDLE_IDENTIFIER = com.termmesh.appuitests;
 				PRODUCT_NAME = "$(TARGET_NAME)";
@@ -1195,10 +1203,10 @@
 			buildSettings = {
 				BUNDLE_LOADER = "$(TEST_HOST)";
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 161;
+				CURRENT_PROJECT_VERSION = 162;
 				GENERATE_INFOPLIST_FILE = YES;
 				MACOSX_DEPLOYMENT_TARGET = 14.0;
-				MARKETING_VERSION = 0.103.3;
+				MARKETING_VERSION = 0.104.0;
 				ONLY_ACTIVE_ARCH = YES;
 				PRODUCT_BUNDLE_IDENTIFIER = com.termmesh.apptests;
 				PRODUCT_NAME = "$(TARGET_NAME)";
@@ -1214,10 +1222,10 @@
 			buildSettings = {
 				BUNDLE_LOADER = "$(TEST_HOST)";
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 161;
+				CURRENT_PROJECT_VERSION = 162;
 				GENERATE_INFOPLIST_FILE = YES;
 				MACOSX_DEPLOYMENT_TARGET = 14.0;
-				MARKETING_VERSION = 0.103.3;
+				MARKETING_VERSION = 0.104.0;
 				ONLY_ACTIVE_ARCH = YES;
 				PRODUCT_BUNDLE_IDENTIFIER = com.termmesh.apptests;
 				PRODUCT_NAME = "$(TARGET_NAME)";

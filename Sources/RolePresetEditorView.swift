@@ -1,3 +1,4 @@
+import AppKit
 import SwiftUI
 
 /// Editor for managing agent role presets — create, edit, delete.
@@ -9,6 +10,8 @@ struct RolePresetEditorView: View {
     @State private var editingPreset: AgentRolePreset?
     @State private var showDeleteConfirm = false
     @State private var deleteTarget: AgentRolePreset?
+    @State private var runbookStatus = AgentRunbookService.shared.status()
+    @State private var runbookMessage: String?
 
     // Models are now CLI-dependent — see AgentRolePreset.models(for:)
     private let colors = ["green", "blue", "yellow", "red", "cyan", "magenta"]
@@ -20,10 +23,11 @@ struct RolePresetEditorView: View {
             detail
                 .frame(minWidth: 320)
         }
-        .frame(width: 560, height: 440)
+        .frame(width: 620, height: 520)
         .background(Color(nsColor: .windowBackgroundColor))
         .onAppear {
             selectedId = presetManager.presets.first?.id
+            refreshRunbookStatus()
         }
         .alert("Delete Preset?", isPresented: $showDeleteConfirm, presenting: deleteTarget) { preset in
             Button("Delete", role: .destructive) {
@@ -184,6 +188,8 @@ struct RolePresetEditorView: View {
                     }
                 }
 
+                runbookPanel(for: binding.wrappedValue)
+
                 VStack(alignment: .leading, spacing: 4) {
                     Text("Instructions")
                         .font(.subheadline.bold())
@@ -221,6 +227,86 @@ struct RolePresetEditorView: View {
     }
 
     // MARK: - Actions
+
+    private func runbookPanel(for preset: AgentRolePreset) -> some View {
+        let roleStatus = runbookStatus.role(preset.name)
+        let state = roleStatus?.sourceState ?? .missing
+        return VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 8) {
+                Text("Runbook")
+                    .font(.subheadline.bold())
+                runbookBadge(state)
+                Spacer()
+                Button {
+                    createRunbook(from: preset)
+                } label: {
+                    Label("Create", systemImage: "plus")
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+                .disabled(state != .missing)
+
+                Button {
+                    openRunbook(for: preset)
+                } label: {
+                    Image(systemName: "folder")
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+                .help("Open runbook folder")
+            }
+
+            Text(roleStatus?.sourcePath ?? "No project root found")
+                .font(.caption2.monospaced())
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+                .truncationMode(.middle)
+
+            if let runbookMessage {
+                Text(runbookMessage)
+                    .font(.caption)
+                    .foregroundStyle(runbookMessage.contains("skipped") ? Color.orange : Color.secondary)
+            }
+        }
+        .padding(10)
+        .background(RoundedRectangle(cornerRadius: 8).fill(.quaternary.opacity(0.35)))
+    }
+
+    private func runbookBadge(_ state: AgentRunbookFileState) -> some View {
+        Text(state.displayName)
+            .font(.system(size: 11, weight: .medium))
+            .foregroundStyle(runbookColor(state))
+            .padding(.horizontal, 7)
+            .padding(.vertical, 2)
+            .background(RoundedRectangle(cornerRadius: 5).fill(runbookColor(state).opacity(0.12)))
+    }
+
+    private func runbookColor(_ state: AgentRunbookFileState) -> Color {
+        switch state {
+        case .managed: return .green
+        case .outdated: return .blue
+        case .custom: return .orange
+        case .missing: return .secondary
+        }
+    }
+
+    private func refreshRunbookStatus() {
+        runbookStatus = AgentRunbookService.shared.status()
+    }
+
+    private func createRunbook(from preset: AgentRolePreset) {
+        let result = AgentRunbookService.shared.writeRunbookFromPreset(preset)
+        runbookMessage = result.state == "written" ? "Runbook created." : result.message
+        refreshRunbookStatus()
+    }
+
+    private func openRunbook(for preset: AgentRolePreset) {
+        AgentRunbookService.shared.openRunbookFolder()
+        if let path = runbookStatus.role(preset.name)?.sourcePath,
+           FileManager.default.fileExists(atPath: path) {
+            NSWorkspace.shared.selectFile(path, inFileViewerRootedAtPath: "")
+        }
+    }
 
     private func addNewPreset() {
         let preset = AgentRolePreset(

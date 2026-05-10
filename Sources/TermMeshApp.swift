@@ -65,6 +65,14 @@ struct TermMeshApp: App {
             daemon: TermMeshDaemon.shared,
             notifications: TerminalNotificationStore.shared
         ))
+        // TabManager init triggers `GhosttyApp.shared` to load. Push the
+        // saved appearance to the GhosttyApp-level color scheme right
+        // after so the very first surfaces pick the correct variant from
+        // a `theme = light:X,dark:Y` config. Without this, every launch
+        // (after a brew upgrade or fresh start) renders the LIGHT theme
+        // because GhosttyApp defaults to LIGHT until `.onChange(of: appearanceMode)`
+        // fires — which it never does at startup.
+        Self.syncGhosttyAppColorScheme(for: startupAppearance)
         // Migrate legacy and old-format socket mode values to the new enum.
         let defaults = UserDefaults.standard
         if let stored = defaults.string(forKey: SocketControlSettings.appStorageKey) {
@@ -239,6 +247,16 @@ struct TermMeshApp: App {
                     updateSocketController()
                     appDelegate.configure(tabManager: tabManager, notificationStore: notificationStore, sidebarState: sidebarState)
                     applyAppearance()
+                    // Sync Ghostty app-level color scheme on startup so the
+                    // GUI theme picker (`theme = light:X,dark:Y`) selects the
+                    // right variant. Without this the user sees the light
+                    // theme on every launch when their saved appearanceMode
+                    // is `dark` — `.onChange(of: appearanceMode)` doesn't
+                    // fire on initial load (no change to react to), so the
+                    // GhosttyApp keeps the default LIGHT scheme it was
+                    // initialized with and the next config reload picks the
+                    // light theme.
+                    syncGhosttyAppColorScheme()
                     if termMeshEnv("UI_TEST_SHOW_SETTINGS") == "1" {
                         DispatchQueue.main.async {
                             showSettingsPanel()
@@ -251,10 +269,7 @@ struct TermMeshApp: App {
                     TerminalThemeOverride.write(for: appearanceMode)
                     configProvider.reloadConfiguration(source: "appearance.toggle")
                     // Sync Ghostty app-level color scheme so new surfaces inherit the correct theme
-                    if let app = GhosttyApp.shared.app {
-                        let isDark = NSApp.effectiveAppearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
-                        ghostty_app_set_color_scheme(app, isDark ? GHOSTTY_COLOR_SCHEME_DARK : GHOSTTY_COLOR_SCHEME_LIGHT)
-                    }
+                    syncGhosttyAppColorScheme()
                 }
                 .onChange(of: terminalFontFamily) { _ in applyTerminalSettings() }
                 .onChange(of: terminalFontSize) { _ in applyTerminalSettings() }
@@ -286,28 +301,37 @@ struct TermMeshApp: App {
                 }
                 .sheet(isPresented: $showTeamCreation) {
                     TeamCreationView { teamName, leaderMode, leaderModel, agents, worktreeMode, executionMode, resumeSessionId in
-                        let agentTuples = agents.map { row in
-                            (
-                                name: row.preset.name,
-                                cli: row.preset.cli,
-                                model: row.preset.model,
-                                agentType: row.preset.name,
-                                color: row.preset.color,
-                                instructions: row.customInstructions.isEmpty
-                                    ? row.preset.instructions
-                                    : row.customInstructions
-                            )
-                        }
                         // Use the TabManager captured at menu-click time (before
                         // the sheet stole key window focus).
                         let activeTabManager = teamCreationTabManager ?? tabManager
                         let workDir = activeTabManager.selectedTab?.currentDirectory
                             ?? FileManager.default.currentDirectoryPath
-                        _ = TeamOrchestrator.shared.createTeam(
+                        let agentTuples: [(name: String, cli: String, model: String, agentType: String, color: String, instructions: String)] = agents.map { row in
+                            let customInstructions = row.customInstructions == row.preset.instructions
+                                ? ""
+                                : row.customInstructions
+                            let effectiveInstructions = AgentRunbookService.shared.composeInstructions(
+                                roleName: row.preset.name,
+                                presetInstructions: row.preset.instructions,
+                                customInstructions: customInstructions,
+                                workingDirectory: workDir
+                            )
+                            return (
+                                name: row.preset.name,
+                                cli: row.preset.cli,
+                                model: row.preset.model,
+                                agentType: row.preset.name,
+                                color: row.preset.color,
+                                instructions: effectiveInstructions
+                            )
+                        }
+                        let leaderSessionId = UUID().uuidString
+                        let orchestrator = TeamOrchestrator.shared
+                        _ = orchestrator.createTeam(
                             name: teamName,
                             agents: agentTuples,
                             workingDirectory: workDir,
-                            leaderSessionId: UUID().uuidString,
+                            leaderSessionId: leaderSessionId,
                             leaderMode: leaderMode,
                             leaderModel: leaderModel,
                             resumeSessionId: resumeSessionId,
@@ -865,6 +889,62 @@ struct TermMeshApp: App {
             appearanceMode = mode.rawValue
         }
         Self.applyAppearance(mode)
+    }
+
+    /// Push the current effective appearance to the GhosttyApp-level color
+    /// scheme. Surfaces and config reloads consult the app-level scheme to
+    /// pick between `theme = light:X,dark:Y` variants, so this must be in
+    /// sync with `NSApp.effectiveAppearance` from startup onward.
+    ///
+    /// `GhosttyApp.shared.app` may be nil for a brief moment during early
+    /// `.onAppear` (it initializes lazily on first reference). The retry
+    /// loop covers fast paths; for slow startups (notably the brew-upgrade
+    /// relaunch that this method was added to fix) the budget can run out.
+    /// `GhosttyApp.shared.app` is also re-checked on every `applyAppearance`
+    /// pass and on every `.onChange(of: appearanceMode)` — so a late init
+    /// will still receive the saved preference once any of those fire.
+    private func syncGhosttyAppColorScheme() {
+        Self.syncGhosttyAppColorScheme(for: AppearanceSettings.mode(for: appearanceMode))
+    }
+
+    /// Static counterpart so `init()` can call this before any SwiftUI
+    /// view appears. Resolves `dark`/`light` from the explicit user
+    /// preference; for `.system` falls back to `NSApp.effectiveAppearance`.
+    ///
+    /// F6 fix: when the retry budget is exhausted without `GhosttyApp.shared.app`
+    /// becoming non-nil, schedule one final, longer-delay attempt (3s) before
+    /// giving up. On a sluggish brew-upgrade relaunch that's enough time for
+    /// the lazy init to finish; if it still hasn't, the next user-driven
+    /// appearance change (or any later `applyAppearance` call) will pick up.
+    private static func syncGhosttyAppColorScheme(for mode: AppearanceMode, attempt: Int = 0) {
+        guard let app = GhosttyApp.shared.app else {
+            if attempt < 5 {
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+                    Self.syncGhosttyAppColorScheme(for: mode, attempt: attempt + 1)
+                }
+            } else if attempt == 5 {
+                // Final long-delay safety net for slow startups (e.g.
+                // brew-upgrade relaunch). Without this, exhausting the
+                // 500ms budget would leave the GhosttyApp at its default
+                // LIGHT scheme and a `theme = light:X,dark:Y` config would
+                // pick the wrong variant — exactly the regression that
+                // motivated this method.
+                DispatchQueue.main.asyncAfter(deadline: .now() + 3.0) {
+                    Self.syncGhosttyAppColorScheme(for: mode, attempt: attempt + 1)
+                }
+            }
+            return
+        }
+        let isDark: Bool
+        switch mode {
+        case .dark:
+            isDark = true
+        case .light:
+            isDark = false
+        case .system, .auto:
+            isDark = NSApp.effectiveAppearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
+        }
+        ghostty_app_set_color_scheme(app, isDark ? GHOSTTY_COLOR_SCHEME_DARK : GHOSTTY_COLOR_SCHEME_LIGHT)
     }
 
     private func applyTerminalSettings() {

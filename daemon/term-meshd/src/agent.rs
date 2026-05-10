@@ -362,7 +362,7 @@ impl AgentSessionManager {
                 content       TEXT NOT NULL,
                 read          INTEGER NOT NULL DEFAULT 0,
                 created_at_ms INTEGER NOT NULL
-            );"
+            );",
         )?;
 
         // Migration: add priority column if missing (existing DBs from Phase 1)
@@ -372,9 +372,8 @@ impl AgentSessionManager {
             .map(|c| c > 0)
             .unwrap_or(false);
         if !has_priority {
-            let _ = db.execute_batch(
-                "ALTER TABLE tasks ADD COLUMN priority INTEGER NOT NULL DEFAULT 0"
-            );
+            let _ = db
+                .execute_batch("ALTER TABLE tasks ADD COLUMN priority INTEGER NOT NULL DEFAULT 0");
         }
 
         // Migration: add fix_budget and fix_count columns if missing
@@ -386,7 +385,7 @@ impl AgentSessionManager {
         if !has_fix_budget {
             let _ = db.execute_batch(
                 "ALTER TABLE tasks ADD COLUMN fix_budget INTEGER DEFAULT NULL;
-                 ALTER TABLE tasks ADD COLUMN fix_count INTEGER NOT NULL DEFAULT 0"
+                 ALTER TABLE tasks ADD COLUMN fix_count INTEGER NOT NULL DEFAULT 0",
             );
         }
 
@@ -398,7 +397,7 @@ impl AgentSessionManager {
                         s.worktree_branch, s.command, s.status, s.pid, s.panel_id,
                         s.created_at_ms, s.terminated_at_ms
                  FROM agent_sessions s
-                 WHERE s.status != 'terminated'"
+                 WHERE s.status != 'terminated'",
             )?;
 
             let rows = stmt.query_map([], |row| {
@@ -426,9 +425,7 @@ impl AgentSessionManager {
             }
 
             // Load tracked PIDs
-            let mut pid_stmt = db.prepare(
-                "SELECT session_id, pid FROM session_pids"
-            )?;
+            let mut pid_stmt = db.prepare("SELECT session_id, pid FROM session_pids")?;
             let pid_rows = pid_stmt.query_map([], |row| {
                 Ok((row.get::<_, String>(0)?, row.get::<_, u32>(1)?))
             })?;
@@ -446,7 +443,11 @@ impl AgentSessionManager {
         }
 
         Ok(Self {
-            inner: Mutex::new(Inner { db, sessions, pending_inputs: HashMap::new() }),
+            inner: Mutex::new(Inner {
+                db,
+                sessions,
+                pending_inputs: HashMap::new(),
+            }),
         })
     }
 
@@ -497,26 +498,29 @@ impl AgentSessionManager {
             // Persist to DB + memory
             {
                 let inner = self.inner.lock().unwrap();
-                inner.db.execute(
-                    "INSERT INTO agent_sessions
+                inner
+                    .db
+                    .execute(
+                        "INSERT INTO agent_sessions
                         (id, name, repo_path, worktree_name, worktree_path, worktree_branch,
                          command, status, pid, panel_id, created_at_ms, terminated_at_ms)
                      VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
-                    params![
-                        session.id,
-                        session.name,
-                        session.repo_path,
-                        session.worktree_name,
-                        session.worktree_path,
-                        session.worktree_branch,
-                        session.command,
-                        session.status.as_str(),
-                        session.pid,
-                        session.panel_id,
-                        session.created_at_ms,
-                        session.terminated_at_ms,
-                    ],
-                ).map_err(|e| format!("DB insert failed: {e}"))?;
+                        params![
+                            session.id,
+                            session.name,
+                            session.repo_path,
+                            session.worktree_name,
+                            session.worktree_path,
+                            session.worktree_branch,
+                            session.command,
+                            session.status.as_str(),
+                            session.pid,
+                            session.panel_id,
+                            session.created_at_ms,
+                            session.terminated_at_ms,
+                        ],
+                    )
+                    .map_err(|e| format!("DB insert failed: {e}"))?;
             }
 
             // Insert into memory map (separate lock scope)
@@ -527,7 +531,9 @@ impl AgentSessionManager {
 
             tracing::info!(
                 "spawned agent session {} ({}) at {}",
-                session.id, session.name, session.worktree_path
+                session.id,
+                session.name,
+                session.worktree_path
             );
 
             results.push(session);
@@ -546,7 +552,7 @@ impl AgentSessionManager {
             if let Ok(mut stmt) = inner.db.prepare(
                 "SELECT id, name, repo_path, worktree_name, worktree_path, worktree_branch,
                         command, status, pid, panel_id, created_at_ms, terminated_at_ms
-                 FROM agent_sessions WHERE status = 'terminated'"
+                 FROM agent_sessions WHERE status = 'terminated'",
             ) {
                 if let Ok(rows) = stmt.query_map([], |row| {
                     Ok(AgentSession {
@@ -588,38 +594,36 @@ impl AgentSessionManager {
         }
 
         // Check DB for terminated sessions
-        inner.db.query_row(
-            "SELECT id, name, repo_path, worktree_name, worktree_path, worktree_branch,
+        inner
+            .db
+            .query_row(
+                "SELECT id, name, repo_path, worktree_name, worktree_path, worktree_branch,
                     command, status, pid, panel_id, created_at_ms, terminated_at_ms
              FROM agent_sessions WHERE id = ?1",
-            params![id],
-            |row| {
-                Ok(AgentSession {
-                    id: row.get(0)?,
-                    name: row.get(1)?,
-                    repo_path: row.get(2)?,
-                    worktree_name: row.get(3)?,
-                    worktree_path: row.get(4)?,
-                    worktree_branch: row.get(5)?,
-                    command: row.get(6)?,
-                    status: SessionStatus::from_str(&row.get::<_, String>(7)?),
-                    pid: row.get::<_, Option<u32>>(8)?,
-                    tracked_pids: Vec::new(),
-                    panel_id: row.get(9)?,
-                    created_at_ms: row.get(10)?,
-                    terminated_at_ms: row.get(11)?,
-                })
-            },
-        ).ok()
+                params![id],
+                |row| {
+                    Ok(AgentSession {
+                        id: row.get(0)?,
+                        name: row.get(1)?,
+                        repo_path: row.get(2)?,
+                        worktree_name: row.get(3)?,
+                        worktree_path: row.get(4)?,
+                        worktree_branch: row.get(5)?,
+                        command: row.get(6)?,
+                        status: SessionStatus::from_str(&row.get::<_, String>(7)?),
+                        pid: row.get::<_, Option<u32>>(8)?,
+                        tracked_pids: Vec::new(),
+                        panel_id: row.get(9)?,
+                        created_at_ms: row.get(10)?,
+                        terminated_at_ms: row.get(11)?,
+                    })
+                },
+            )
+            .ok()
     }
 
     /// Terminate an agent session: kill processes, unwatch, remove worktree, update DB.
-    pub fn terminate(
-        &self,
-        id: &str,
-        force: bool,
-        watcher: &WatcherHandle,
-    ) -> Result<(), String> {
+    pub fn terminate(&self, id: &str, force: bool, watcher: &WatcherHandle) -> Result<(), String> {
         let session = {
             let inner = self.inner.lock().unwrap();
             inner.sessions.get(id).cloned()
@@ -634,10 +638,14 @@ impl AgentSessionManager {
         // Kill tracked PIDs
         let signal = if force { libc::SIGKILL } else { libc::SIGTERM };
         for &pid in &session.tracked_pids {
-            unsafe { libc::kill(pid as i32, signal); }
+            unsafe {
+                libc::kill(pid as i32, signal);
+            }
         }
         if let Some(pid) = session.pid {
-            unsafe { libc::kill(pid as i32, signal); }
+            unsafe {
+                libc::kill(pid as i32, signal);
+            }
         }
 
         // Unwatch worktree
@@ -678,7 +686,9 @@ impl AgentSessionManager {
     /// Bind a UI panel to a session.
     pub fn bind_panel(&self, session_id: &str, panel_id: &str) -> Result<(), String> {
         let mut inner = self.inner.lock().unwrap();
-        let session = inner.sessions.get_mut(session_id)
+        let session = inner
+            .sessions
+            .get_mut(session_id)
             .ok_or_else(|| format!("session not found: {session_id}"))?;
         session.panel_id = Some(panel_id.to_string());
         let _ = inner.db.execute(
@@ -692,7 +702,9 @@ impl AgentSessionManager {
     /// Unbind a UI panel from a session (session stays alive).
     pub fn unbind_panel(&self, session_id: &str) -> Result<(), String> {
         let mut inner = self.inner.lock().unwrap();
-        let session = inner.sessions.get_mut(session_id)
+        let session = inner
+            .sessions
+            .get_mut(session_id)
             .ok_or_else(|| format!("session not found: {session_id}"))?;
         session.panel_id = None;
         let _ = inner.db.execute(
@@ -751,35 +763,46 @@ impl AgentSessionManager {
         // BUG-2: Dedup deps to prevent PK constraint crash on duplicate entries.
         let raw_deps = params.deps.unwrap_or_default();
         let mut seen = std::collections::HashSet::new();
-        let mut deps: Vec<String> = raw_deps.into_iter().filter(|d| seen.insert(d.clone())).collect();
+        let mut deps: Vec<String> = raw_deps
+            .into_iter()
+            .filter(|d| seen.insert(d.clone()))
+            .collect();
 
         // BUG-1 + ISSUE-3: Validate dep existence BEFORE task INSERT to prevent orphan rows.
         // Unknown deps are stripped with a warning (matches Swift behavior) rather than erroring.
         if !deps.is_empty() {
-            let placeholders: Vec<String> = deps.iter().enumerate()
+            let placeholders: Vec<String> = deps
+                .iter()
+                .enumerate()
                 .map(|(i, _)| format!("?{}", i + 1))
                 .collect();
             let check_sql = format!(
                 "SELECT id FROM tasks WHERE id IN ({})",
                 placeholders.join(", ")
             );
-            let mut stmt = inner.db.prepare(&check_sql)
+            let mut stmt = inner
+                .db
+                .prepare(&check_sql)
                 .map_err(|e| format!("dep check failed: {e}"))?;
-            let dep_refs: Vec<&dyn rusqlite::types::ToSql> =
-                deps.iter().map(|d| d as &dyn rusqlite::types::ToSql).collect();
+            let dep_refs: Vec<&dyn rusqlite::types::ToSql> = deps
+                .iter()
+                .map(|d| d as &dyn rusqlite::types::ToSql)
+                .collect();
             let found_ids: std::collections::HashSet<String> = stmt
                 .query_map(dep_refs.as_slice(), |row| row.get::<_, String>(0))
                 .map_err(|e| format!("dep check failed: {e}"))?
                 .flatten()
                 .collect();
-            let missing: Vec<&str> = deps.iter()
+            let missing: Vec<&str> = deps
+                .iter()
                 .filter(|d| !found_ids.contains(*d))
                 .map(String::as_str)
                 .collect();
             if !missing.is_empty() {
                 tracing::warn!(
                     "task_create: stripping {} unknown dep(s): {:?}",
-                    missing.len(), missing
+                    missing.len(),
+                    missing
                 );
                 deps.retain(|d| found_ids.contains(d));
             }
@@ -793,10 +816,13 @@ impl AgentSessionManager {
         ).map_err(|e| format!("DB insert failed: {e}"))?;
 
         for dep in &deps {
-            inner.db.execute(
-                "INSERT INTO task_deps (task_id, depends_on) VALUES (?1, ?2)",
-                params![id, dep],
-            ).map_err(|e| format!("dep insert failed: {e}"))?;
+            inner
+                .db
+                .execute(
+                    "INSERT INTO task_deps (task_id, depends_on) VALUES (?1, ?2)",
+                    params![id, dep],
+                )
+                .map_err(|e| format!("dep insert failed: {e}"))?;
         }
 
         // Log creation
@@ -824,9 +850,11 @@ impl AgentSessionManager {
     /// Get a task by ID (with deps loaded via single JOIN query).
     pub fn task_get(&self, id: &str) -> Result<Task, String> {
         let inner = self.inner.lock().unwrap();
-        inner.db.query_row(
-            // Safe: task IDs are hex UUIDs, never contain '|'
-            "SELECT t.id, t.title, t.description, t.status, t.priority, t.assignee,
+        inner
+            .db
+            .query_row(
+                // Safe: task IDs are hex UUIDs, never contain '|'
+                "SELECT t.id, t.title, t.description, t.status, t.priority, t.assignee,
                     t.created_by, t.created_at_ms, t.updated_at_ms,
                     GROUP_CONCAT(td.depends_on, '|') as dep_ids,
                     t.fix_budget, t.fix_count
@@ -834,28 +862,30 @@ impl AgentSessionManager {
              LEFT JOIN task_deps td ON td.task_id = t.id
              WHERE t.id = ?1
              GROUP BY t.id",
-            params![id],
-            |row| {
-                let dep_str: Option<String> = row.get(9)?;
-                let deps = dep_str
-                    .map(|s| s.split('|').map(String::from).collect())
-                    .unwrap_or_default();
-                Ok(Task {
-                    id: row.get(0)?,
-                    title: row.get(1)?,
-                    description: row.get(2)?,
-                    status: TaskStatus::from_str(&row.get::<_, String>(3)?).unwrap_or(TaskStatus::Pending),
-                    priority: row.get(4)?,
-                    assignee: row.get(5)?,
-                    created_by: row.get(6)?,
-                    deps,
-                    fix_budget: row.get(10)?,
-                    fix_count: row.get::<_, i32>(11).unwrap_or(0),
-                    created_at_ms: row.get(7)?,
-                    updated_at_ms: row.get(8)?,
-                })
-            },
-        ).map_err(|_| format!("task not found: {id}"))
+                params![id],
+                |row| {
+                    let dep_str: Option<String> = row.get(9)?;
+                    let deps = dep_str
+                        .map(|s| s.split('|').map(String::from).collect())
+                        .unwrap_or_default();
+                    Ok(Task {
+                        id: row.get(0)?,
+                        title: row.get(1)?,
+                        description: row.get(2)?,
+                        status: TaskStatus::from_str(&row.get::<_, String>(3)?)
+                            .unwrap_or(TaskStatus::Pending),
+                        priority: row.get(4)?,
+                        assignee: row.get(5)?,
+                        created_by: row.get(6)?,
+                        deps,
+                        fix_budget: row.get(10)?,
+                        fix_count: row.get::<_, i32>(11).unwrap_or(0),
+                        created_at_ms: row.get(7)?,
+                        updated_at_ms: row.get(8)?,
+                    })
+                },
+            )
+            .map_err(|_| format!("task not found: {id}"))
     }
 
     /// List tasks with optional filters, ordered by priority DESC.
@@ -870,7 +900,7 @@ impl AgentSessionManager {
                     t.fix_budget, t.fix_count
              FROM tasks t
              LEFT JOIN task_deps td ON td.task_id = t.id
-             WHERE 1=1"
+             WHERE 1=1",
         );
         let mut bind_values: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
 
@@ -889,7 +919,8 @@ impl AgentSessionManager {
             Err(_) => return Vec::new(),
         };
 
-        let refs: Vec<&dyn rusqlite::types::ToSql> = bind_values.iter().map(|b| b.as_ref()).collect();
+        let refs: Vec<&dyn rusqlite::types::ToSql> =
+            bind_values.iter().map(|b| b.as_ref()).collect();
         let rows = match stmt.query_map(refs.as_slice(), |row| {
             let dep_str: Option<String> = row.get(9)?;
             let deps = dep_str
@@ -899,7 +930,8 @@ impl AgentSessionManager {
                 id: row.get(0)?,
                 title: row.get(1)?,
                 description: row.get(2)?,
-                status: TaskStatus::from_str(&row.get::<_, String>(3)?).unwrap_or(TaskStatus::Pending),
+                status: TaskStatus::from_str(&row.get::<_, String>(3)?)
+                    .unwrap_or(TaskStatus::Pending),
                 priority: row.get(4)?,
                 assignee: row.get(5)?,
                 created_by: row.get(6)?,
@@ -922,11 +954,14 @@ impl AgentSessionManager {
         let inner = self.inner.lock().unwrap();
 
         // Load current task
-        let current = inner.db.query_row(
-            "SELECT status, assignee FROM tasks WHERE id = ?1",
-            params![params.id],
-            |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
-        ).map_err(|_| format!("task not found: {}", params.id))?;
+        let current = inner
+            .db
+            .query_row(
+                "SELECT status, assignee FROM tasks WHERE id = ?1",
+                params![params.id],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
+            )
+            .map_err(|_| format!("task not found: {}", params.id))?;
 
         let current_status = TaskStatus::from_str(&current.0)
             .ok_or_else(|| format!("invalid current status: {}", current.0))?;
@@ -972,19 +1007,36 @@ impl AgentSessionManager {
 
         bind_values.push(Box::new(params.id.clone()));
         let id_idx = bind_values.len();
-        let sql = format!("UPDATE tasks SET {} WHERE id = ?{}", sets.join(", "), id_idx);
+        let sql = format!(
+            "UPDATE tasks SET {} WHERE id = ?{}",
+            sets.join(", "),
+            id_idx
+        );
 
-        let refs: Vec<&dyn rusqlite::types::ToSql> = bind_values.iter().map(|b| b.as_ref()).collect();
-        inner.db.execute(&sql, refs.as_slice())
+        let refs: Vec<&dyn rusqlite::types::ToSql> =
+            bind_values.iter().map(|b| b.as_ref()).collect();
+        inner
+            .db
+            .execute(&sql, refs.as_slice())
             .map_err(|e| format!("update failed: {e}"))?;
 
         // Log the change
         let mut log_parts = Vec::new();
-        if params.title.is_some() { log_parts.push("title"); }
-        if params.description.is_some() { log_parts.push("description"); }
-        if let Some(ref s) = params.status { log_parts.push(s); }
-        if params.priority.is_some() { log_parts.push("priority"); }
-        if params.assignee.is_some() { log_parts.push("assignee"); }
+        if params.title.is_some() {
+            log_parts.push("title");
+        }
+        if params.description.is_some() {
+            log_parts.push("description");
+        }
+        if let Some(ref s) = params.status {
+            log_parts.push(s);
+        }
+        if params.priority.is_some() {
+            log_parts.push("priority");
+        }
+        if params.assignee.is_some() {
+            log_parts.push("assignee");
+        }
         let log_msg = format!("updated: {}", log_parts.join(", "));
         let _ = inner.db.execute(
             "INSERT INTO task_log (task_id, agent_id, message, created_at_ms) VALUES (?1, NULL, ?2, ?3)",
@@ -1006,15 +1058,21 @@ impl AgentSessionManager {
 
         // Verify agent exists and is active
         if !inner.sessions.contains_key(&params.agent_id) {
-            return Err(format!("agent not found or terminated: {}", params.agent_id));
+            return Err(format!(
+                "agent not found or terminated: {}",
+                params.agent_id
+            ));
         }
 
         // Load current task status
-        let current_status_str: String = inner.db.query_row(
-            "SELECT status FROM tasks WHERE id = ?1",
-            params![params.task_id],
-            |row| row.get(0),
-        ).map_err(|_| format!("task not found: {}", params.task_id))?;
+        let current_status_str: String = inner
+            .db
+            .query_row(
+                "SELECT status FROM tasks WHERE id = ?1",
+                params![params.task_id],
+                |row| row.get(0),
+            )
+            .map_err(|_| format!("task not found: {}", params.task_id))?;
 
         let current_status = TaskStatus::from_str(&current_status_str)
             .ok_or_else(|| format!("invalid status: {current_status_str}"))?;
@@ -1030,14 +1088,25 @@ impl AgentSessionManager {
         // Check all deps are completed
         let deps = Self::load_deps(&inner.db, &params.task_id);
         if !deps.is_empty() {
-            let placeholders: Vec<String> = deps.iter().enumerate().map(|(i, _)| format!("?{}", i + 1)).collect();
+            let placeholders: Vec<String> = deps
+                .iter()
+                .enumerate()
+                .map(|(i, _)| format!("?{}", i + 1))
+                .collect();
             let sql = format!(
                 "SELECT COUNT(*) FROM tasks WHERE id IN ({}) AND status != 'completed'",
                 placeholders.join(", ")
             );
-            let mut stmt = inner.db.prepare(&sql).map_err(|e| format!("query failed: {e}"))?;
-            let dep_refs: Vec<&dyn rusqlite::types::ToSql> = deps.iter().map(|d| d as &dyn rusqlite::types::ToSql).collect();
-            let incomplete: i64 = stmt.query_row(dep_refs.as_slice(), |row| row.get(0))
+            let mut stmt = inner
+                .db
+                .prepare(&sql)
+                .map_err(|e| format!("query failed: {e}"))?;
+            let dep_refs: Vec<&dyn rusqlite::types::ToSql> = deps
+                .iter()
+                .map(|d| d as &dyn rusqlite::types::ToSql)
+                .collect();
+            let incomplete: i64 = stmt
+                .query_row(dep_refs.as_slice(), |row| row.get(0))
                 .map_err(|e| format!("dep check failed: {e}"))?;
             if incomplete > 0 {
                 return Err(format!("{incomplete} dependency(ies) not yet completed"));
@@ -1065,7 +1134,7 @@ impl AgentSessionManager {
         let limit = limit.unwrap_or(100);
         let mut stmt = match inner.db.prepare(
             "SELECT id, task_id, agent_id, message, created_at_ms FROM task_log
-             WHERE task_id = ?1 ORDER BY id DESC LIMIT ?2"
+             WHERE task_id = ?1 ORDER BY id DESC LIMIT ?2",
         ) {
             Ok(s) => s,
             Err(_) => return Vec::new(),
@@ -1098,15 +1167,22 @@ impl AgentSessionManager {
     /// - fix_count is server-side only; agents cannot reset it
     /// - block→unblock does NOT reset fix_count (enforced in task_update)
     /// - reassign does NOT reset fix_count (task-scoped, not agent-scoped)
-    pub fn task_fix_attempt(&self, task_id: &str, agent_name: &str) -> Result<TaskFixAttemptResult, String> {
+    pub fn task_fix_attempt(
+        &self,
+        task_id: &str,
+        agent_name: &str,
+    ) -> Result<TaskFixAttemptResult, String> {
         let inner = self.inner.lock().unwrap();
 
         // Load current task state
-        let (status_str, fix_budget, fix_count): (String, Option<i32>, i32) = inner.db.query_row(
-            "SELECT status, fix_budget, fix_count FROM tasks WHERE id = ?1",
-            params![task_id],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get::<_, i32>(2).unwrap_or(0))),
-        ).map_err(|_| format!("task not found: {task_id}"))?;
+        let (status_str, fix_budget, fix_count): (String, Option<i32>, i32) = inner
+            .db
+            .query_row(
+                "SELECT status, fix_budget, fix_count FROM tasks WHERE id = ?1",
+                params![task_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get::<_, i32>(2).unwrap_or(0))),
+            )
+            .map_err(|_| format!("task not found: {task_id}"))?;
 
         let status = TaskStatus::from_str(&status_str)
             .ok_or_else(|| format!("invalid status: {status_str}"))?;
@@ -1127,33 +1203,45 @@ impl AgentSessionManager {
 
         if budget_exhausted {
             // Auto-block: increment count AND set status to blocked in one transaction
-            inner.db.execute(
-                "UPDATE tasks SET fix_count = ?1, status = 'blocked',
+            inner
+                .db
+                .execute(
+                    "UPDATE tasks SET fix_count = ?1, status = 'blocked',
                         updated_at_ms = ?2
                  WHERE id = ?3",
-                params![new_count, ts, task_id],
-            ).map_err(|e| format!("update failed: {e}"))?;
+                    params![new_count, ts, task_id],
+                )
+                .map_err(|e| format!("update failed: {e}"))?;
 
             // Log the auto-block
             let msg = format!(
                 "auto-blocked: fix budget exhausted ({}/{}) by {}",
-                new_count, fix_budget.unwrap_or(0), agent_name
+                new_count,
+                fix_budget.unwrap_or(0),
+                agent_name
             );
             let _ = inner.db.execute(
                 "INSERT INTO task_log (task_id, agent_id, message, created_at_ms) VALUES (?1, ?2, ?3, ?4)",
                 params![task_id, agent_name, msg, ts],
             );
 
-            tracing::warn!("task {task_id} auto-blocked: fix budget exhausted ({new_count}/{})", fix_budget.unwrap_or(0));
+            tracing::warn!(
+                "task {task_id} auto-blocked: fix budget exhausted ({new_count}/{})",
+                fix_budget.unwrap_or(0)
+            );
         } else {
             // Just increment the count
-            inner.db.execute(
-                "UPDATE tasks SET fix_count = ?1, updated_at_ms = ?2 WHERE id = ?3",
-                params![new_count, ts, task_id],
-            ).map_err(|e| format!("update failed: {e}"))?;
+            inner
+                .db
+                .execute(
+                    "UPDATE tasks SET fix_count = ?1, updated_at_ms = ?2 WHERE id = ?3",
+                    params![new_count, ts, task_id],
+                )
+                .map_err(|e| format!("update failed: {e}"))?;
 
             // Log the attempt
-            let budget_str = fix_budget.map_or("unlimited".to_string(), |b| format!("{new_count}/{b}"));
+            let budget_str =
+                fix_budget.map_or("unlimited".to_string(), |b| format!("{new_count}/{b}"));
             let msg = format!("fix attempt #{new_count} ({budget_str}) by {agent_name}");
             let _ = inner.db.execute(
                 "INSERT INTO task_log (task_id, agent_id, message, created_at_ms) VALUES (?1, ?2, ?3, ?4)",
@@ -1179,20 +1267,27 @@ impl AgentSessionManager {
 
         // Verify recipient exists and is active
         if !inner.sessions.contains_key(&params.to_agent) {
-            return Err(format!("recipient agent not found or terminated: {}", params.to_agent));
+            return Err(format!(
+                "recipient agent not found or terminated: {}",
+                params.to_agent
+            ));
         }
 
         let ts = now_ms();
-        inner.db.execute(
-            "INSERT INTO agent_messages (from_agent, to_agent, content, read, created_at_ms)
+        inner
+            .db
+            .execute(
+                "INSERT INTO agent_messages (from_agent, to_agent, content, read, created_at_ms)
              VALUES (?1, ?2, ?3, 0, ?4)",
-            params![params.from_agent, params.to_agent, params.content, ts],
-        ).map_err(|e| format!("message insert failed: {e}"))?;
+                params![params.from_agent, params.to_agent, params.content, ts],
+            )
+            .map_err(|e| format!("message insert failed: {e}"))?;
 
         // Auto-enqueue input for PTY delivery
         let from_label = params.from_agent.as_deref().unwrap_or("dashboard");
         let formatted = format!("[MSG from {}]: {}", from_label, params.content);
-        inner.pending_inputs
+        inner
+            .pending_inputs
             .entry(params.to_agent.clone())
             .or_default()
             .push(PendingInput {
@@ -1254,14 +1349,26 @@ impl AgentSessionManager {
             return Ok(0);
         }
         let inner = self.inner.lock().unwrap();
-        let placeholders: Vec<String> = message_ids.iter().enumerate().map(|(i, _)| format!("?{}", i + 1)).collect();
+        let placeholders: Vec<String> = message_ids
+            .iter()
+            .enumerate()
+            .map(|(i, _)| format!("?{}", i + 1))
+            .collect();
         let sql = format!(
             "UPDATE agent_messages SET read = 1 WHERE id IN ({})",
             placeholders.join(", ")
         );
-        let mut stmt = inner.db.prepare(&sql).map_err(|e| format!("prepare failed: {e}"))?;
-        let refs: Vec<&dyn rusqlite::types::ToSql> = message_ids.iter().map(|id| id as &dyn rusqlite::types::ToSql).collect();
-        let count = stmt.execute(refs.as_slice()).map_err(|e| format!("ack failed: {e}"))?;
+        let mut stmt = inner
+            .db
+            .prepare(&sql)
+            .map_err(|e| format!("prepare failed: {e}"))?;
+        let refs: Vec<&dyn rusqlite::types::ToSql> = message_ids
+            .iter()
+            .map(|id| id as &dyn rusqlite::types::ToSql)
+            .collect();
+        let count = stmt
+            .execute(refs.as_slice())
+            .map_err(|e| format!("ack failed: {e}"))?;
         Ok(count)
     }
 
@@ -1277,7 +1384,8 @@ impl AgentSessionManager {
             Some(_) => return Err(format!("session is terminated: {session_id}")),
             None => return Err(format!("session not found: {session_id}")),
         }
-        inner.pending_inputs
+        inner
+            .pending_inputs
             .entry(session_id.to_string())
             .or_default()
             .push(PendingInput {
@@ -1306,16 +1414,18 @@ impl AgentSessionManager {
     /// Only dispatches tasks that are in 'pending' status with an assignee already set.
     fn dispatch_ready_dependents(inner: &Inner, completed_task_id: &str) {
         // Find tasks that depend on the just-completed task
-        let mut stmt = match inner.db.prepare(
-            "SELECT DISTINCT task_id FROM task_deps WHERE depends_on = ?1"
-        ) {
+        let mut stmt = match inner
+            .db
+            .prepare("SELECT DISTINCT task_id FROM task_deps WHERE depends_on = ?1")
+        {
             Ok(s) => s,
             Err(_) => return,
         };
-        let dependent_ids: Vec<String> = match stmt.query_map(params![completed_task_id], |row| row.get::<_, String>(0)) {
-            Ok(rows) => rows.flatten().collect(),
-            Err(_) => return,
-        };
+        let dependent_ids: Vec<String> =
+            match stmt.query_map(params![completed_task_id], |row| row.get::<_, String>(0)) {
+                Ok(rows) => rows.flatten().collect(),
+                Err(_) => return,
+            };
 
         let ts = now_ms();
         for task_id in &dependent_ids {
@@ -1338,8 +1448,11 @@ impl AgentSessionManager {
             if deps.is_empty() {
                 continue;
             }
-            let placeholders: Vec<String> = deps.iter().enumerate()
-                .map(|(i, _)| format!("?{}", i + 1)).collect();
+            let placeholders: Vec<String> = deps
+                .iter()
+                .enumerate()
+                .map(|(i, _)| format!("?{}", i + 1))
+                .collect();
             let sql = format!(
                 "SELECT COUNT(*) FROM tasks WHERE id IN ({}) AND status != 'completed'",
                 placeholders.join(", ")
@@ -1348,8 +1461,10 @@ impl AgentSessionManager {
                 Ok(s) => s,
                 Err(_) => continue,
             };
-            let dep_refs: Vec<&dyn rusqlite::types::ToSql> = deps.iter()
-                .map(|d| d as &dyn rusqlite::types::ToSql).collect();
+            let dep_refs: Vec<&dyn rusqlite::types::ToSql> = deps
+                .iter()
+                .map(|d| d as &dyn rusqlite::types::ToSql)
+                .collect();
             let incomplete: i64 = match dep_stmt.query_row(dep_refs.as_slice(), |row| row.get(0)) {
                 Ok(n) => n,
                 Err(_) => continue,
@@ -1484,12 +1599,15 @@ mod tests {
         let (_dir, mgr) = test_manager();
         let inner = mgr.inner.lock().unwrap();
         // Verify tables exist
-        let count: i64 = inner.db.query_row(
-            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name IN
+        let count: i64 = inner
+            .db
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name IN
              ('agent_sessions', 'session_pids', 'tasks', 'task_deps', 'task_log')",
-            [],
-            |row| row.get(0),
-        ).unwrap();
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
         assert_eq!(count, 5);
     }
 
@@ -1513,32 +1631,38 @@ mod tests {
         // Insert a fake session directly
         {
             let inner = mgr.inner.lock().unwrap();
-            inner.db.execute(
-                "INSERT INTO agent_sessions
+            inner
+                .db
+                .execute(
+                    "INSERT INTO agent_sessions
                     (id, name, repo_path, worktree_name, worktree_path, worktree_branch,
                      status, created_at_ms)
                  VALUES ('s1', 'test', '/repo', 'wt', '/wt', 'branch', 'running', 1000)",
-                [],
-            ).unwrap();
+                    [],
+                )
+                .unwrap();
         }
         // Also add to memory
         {
             let mut inner = mgr.inner.lock().unwrap();
-            inner.sessions.insert("s1".to_string(), AgentSession {
-                id: "s1".into(),
-                name: "test".into(),
-                repo_path: "/repo".into(),
-                worktree_name: "wt".into(),
-                worktree_path: "/wt".into(),
-                worktree_branch: "branch".into(),
-                command: None,
-                status: SessionStatus::Running,
-                pid: None,
-                tracked_pids: vec![],
-                panel_id: None,
-                created_at_ms: 1000,
-                terminated_at_ms: None,
-            });
+            inner.sessions.insert(
+                "s1".to_string(),
+                AgentSession {
+                    id: "s1".into(),
+                    name: "test".into(),
+                    repo_path: "/repo".into(),
+                    worktree_name: "wt".into(),
+                    worktree_path: "/wt".into(),
+                    worktree_branch: "branch".into(),
+                    command: None,
+                    status: SessionStatus::Running,
+                    pid: None,
+                    tracked_pids: vec![],
+                    panel_id: None,
+                    created_at_ms: 1000,
+                    terminated_at_ms: None,
+                },
+            );
         }
 
         mgr.bind_panel("s1", "panel-123").unwrap();
@@ -1555,28 +1679,34 @@ mod tests {
         let (_dir, mgr) = test_manager();
         {
             let mut inner = mgr.inner.lock().unwrap();
-            inner.db.execute(
-                "INSERT INTO agent_sessions
+            inner
+                .db
+                .execute(
+                    "INSERT INTO agent_sessions
                     (id, name, repo_path, worktree_name, worktree_path, worktree_branch,
                      status, created_at_ms)
                  VALUES ('s2', 'test2', '/repo', 'wt2', '/wt2', 'b2', 'spawning', 2000)",
-                [],
-            ).unwrap();
-            inner.sessions.insert("s2".to_string(), AgentSession {
-                id: "s2".into(),
-                name: "test2".into(),
-                repo_path: "/repo".into(),
-                worktree_name: "wt2".into(),
-                worktree_path: "/wt2".into(),
-                worktree_branch: "b2".into(),
-                command: None,
-                status: SessionStatus::Spawning,
-                pid: None,
-                tracked_pids: vec![],
-                panel_id: None,
-                created_at_ms: 2000,
-                terminated_at_ms: None,
-            });
+                    [],
+                )
+                .unwrap();
+            inner.sessions.insert(
+                "s2".to_string(),
+                AgentSession {
+                    id: "s2".into(),
+                    name: "test2".into(),
+                    repo_path: "/repo".into(),
+                    worktree_name: "wt2".into(),
+                    worktree_path: "/wt2".into(),
+                    worktree_branch: "b2".into(),
+                    command: None,
+                    status: SessionStatus::Spawning,
+                    pid: None,
+                    tracked_pids: vec![],
+                    panel_id: None,
+                    created_at_ms: 2000,
+                    terminated_at_ms: None,
+                },
+            );
         }
 
         mgr.add_pid("s2", 12345).unwrap();
@@ -1590,41 +1720,49 @@ mod tests {
 
     fn insert_fake_agent(mgr: &AgentSessionManager, id: &str) {
         let mut inner = mgr.inner.lock().unwrap();
-        inner.db.execute(
-            "INSERT INTO agent_sessions
+        inner
+            .db
+            .execute(
+                "INSERT INTO agent_sessions
                 (id, name, repo_path, worktree_name, worktree_path, worktree_branch,
                  status, created_at_ms)
              VALUES (?1, ?1, '/repo', 'wt', '/wt', 'b', 'running', 1000)",
-            params![id],
-        ).unwrap();
-        inner.sessions.insert(id.to_string(), AgentSession {
-            id: id.into(),
-            name: id.into(),
-            repo_path: "/repo".into(),
-            worktree_name: "wt".into(),
-            worktree_path: "/wt".into(),
-            worktree_branch: "b".into(),
-            command: None,
-            status: SessionStatus::Running,
-            pid: None,
-            tracked_pids: vec![],
-            panel_id: None,
-            created_at_ms: 1000,
-            terminated_at_ms: None,
-        });
+                params![id],
+            )
+            .unwrap();
+        inner.sessions.insert(
+            id.to_string(),
+            AgentSession {
+                id: id.into(),
+                name: id.into(),
+                repo_path: "/repo".into(),
+                worktree_name: "wt".into(),
+                worktree_path: "/wt".into(),
+                worktree_branch: "b".into(),
+                command: None,
+                status: SessionStatus::Running,
+                pid: None,
+                tracked_pids: vec![],
+                panel_id: None,
+                created_at_ms: 1000,
+                terminated_at_ms: None,
+            },
+        );
     }
 
     #[test]
     fn task_create_and_get() {
         let (_dir, mgr) = test_manager();
-        let task = mgr.task_create(TaskCreateParams {
-            title: "Test task".into(),
-            description: Some("A description".into()),
-            priority: Some(5),
-            created_by: None,
-            deps: None,
-            fix_budget: None,
-        }).unwrap();
+        let task = mgr
+            .task_create(TaskCreateParams {
+                title: "Test task".into(),
+                description: Some("A description".into()),
+                priority: Some(5),
+                created_by: None,
+                deps: None,
+                fix_budget: None,
+            })
+            .unwrap();
 
         assert_eq!(task.title, "Test task");
         assert_eq!(task.status, TaskStatus::Pending);
@@ -1640,25 +1778,32 @@ mod tests {
         let (_dir, mgr) = test_manager();
         insert_fake_agent(&mgr, "a1");
 
-        let t1 = mgr.task_create(TaskCreateParams {
-            title: "High priority".into(),
-            description: None,
-            priority: Some(10),
-            created_by: None,
-            deps: None,
-            fix_budget: None,
-        }).unwrap();
-        let _t2 = mgr.task_create(TaskCreateParams {
-            title: "Low priority".into(),
-            description: None,
-            priority: Some(1),
-            created_by: None,
-            deps: None,
-            fix_budget: None,
-        }).unwrap();
+        let t1 = mgr
+            .task_create(TaskCreateParams {
+                title: "High priority".into(),
+                description: None,
+                priority: Some(10),
+                created_by: None,
+                deps: None,
+                fix_budget: None,
+            })
+            .unwrap();
+        let _t2 = mgr
+            .task_create(TaskCreateParams {
+                title: "Low priority".into(),
+                description: None,
+                priority: Some(1),
+                created_by: None,
+                deps: None,
+                fix_budget: None,
+            })
+            .unwrap();
 
         // List all — should be ordered by priority DESC
-        let all = mgr.task_list(TaskListParams { status: None, assignee: None });
+        let all = mgr.task_list(TaskListParams {
+            status: None,
+            assignee: None,
+        });
         assert_eq!(all.len(), 2);
         assert_eq!(all[0].title, "High priority");
 
@@ -1666,7 +1811,8 @@ mod tests {
         mgr.task_assign(TaskAssignParams {
             task_id: t1.id.clone(),
             agent_id: "a1".into(),
-        }).unwrap();
+        })
+        .unwrap();
 
         let assigned = mgr.task_list(TaskListParams {
             status: Some("assigned".into()),
@@ -1687,14 +1833,16 @@ mod tests {
         let (_dir, mgr) = test_manager();
         insert_fake_agent(&mgr, "a1");
 
-        let task = mgr.task_create(TaskCreateParams {
-            title: "SM test".into(),
-            description: None,
-            priority: None,
-            created_by: None,
-            deps: None,
-            fix_budget: None,
-        }).unwrap();
+        let task = mgr
+            .task_create(TaskCreateParams {
+                title: "SM test".into(),
+                description: None,
+                priority: None,
+                created_by: None,
+                deps: None,
+                fix_budget: None,
+            })
+            .unwrap();
 
         // Invalid: pending -> in_progress (must go through assigned)
         let err = mgr.task_update(TaskUpdateParams {
@@ -1708,52 +1856,61 @@ mod tests {
         assert!(err.is_err());
 
         // Valid: pending -> cancelled
-        let updated = mgr.task_update(TaskUpdateParams {
-            id: task.id.clone(),
-            title: None,
-            description: None,
-            status: Some("cancelled".into()),
-            priority: None,
-            assignee: None,
-        }).unwrap();
+        let updated = mgr
+            .task_update(TaskUpdateParams {
+                id: task.id.clone(),
+                title: None,
+                description: None,
+                status: Some("cancelled".into()),
+                priority: None,
+                assignee: None,
+            })
+            .unwrap();
         assert_eq!(updated.status, TaskStatus::Cancelled);
 
         // Create another to test full lifecycle
-        let t2 = mgr.task_create(TaskCreateParams {
-            title: "Lifecycle".into(),
-            description: None,
-            priority: None,
-            created_by: None,
-            deps: None,
-            fix_budget: None,
-        }).unwrap();
+        let t2 = mgr
+            .task_create(TaskCreateParams {
+                title: "Lifecycle".into(),
+                description: None,
+                priority: None,
+                created_by: None,
+                deps: None,
+                fix_budget: None,
+            })
+            .unwrap();
 
         // pending -> assigned (via task_assign)
         mgr.task_assign(TaskAssignParams {
             task_id: t2.id.clone(),
             agent_id: "a1".into(),
-        }).unwrap();
+        })
+        .unwrap();
 
         // assigned -> in_progress
-        let t2 = mgr.task_update(TaskUpdateParams {
-            id: t2.id.clone(),
-            title: None,
-            description: None,
-            status: Some("in_progress".into()),
-            priority: None,
-            assignee: None,
-        }).unwrap();
+        let t2 = mgr
+            .task_update(TaskUpdateParams {
+                id: t2.id.clone(),
+                title: None,
+                description: None,
+                status: Some("in_progress".into()),
+                priority: None,
+                assignee: None,
+            })
+            .unwrap();
         assert_eq!(t2.status, TaskStatus::InProgress);
 
         // in_progress -> completed
-        let t2 = mgr.task_update(TaskUpdateParams {
-            id: t2.id.clone(),
-            title: None,
-            description: None,
-            status: Some("completed".into()),
-            priority: None,
-            assignee: None,
-        }).unwrap();
+        let t2 = mgr
+            .task_update(TaskUpdateParams {
+                id: t2.id.clone(),
+                title: None,
+                description: None,
+                status: Some("completed".into()),
+                priority: None,
+                assignee: None,
+            })
+            .unwrap();
         assert_eq!(t2.status, TaskStatus::Completed);
     }
 
@@ -1763,24 +1920,28 @@ mod tests {
         insert_fake_agent(&mgr, "a1");
 
         // Create dep task (not completed)
-        let dep = mgr.task_create(TaskCreateParams {
-            title: "Dep task".into(),
-            description: None,
-            priority: None,
-            created_by: None,
-            deps: None,
-            fix_budget: None,
-        }).unwrap();
+        let dep = mgr
+            .task_create(TaskCreateParams {
+                title: "Dep task".into(),
+                description: None,
+                priority: None,
+                created_by: None,
+                deps: None,
+                fix_budget: None,
+            })
+            .unwrap();
 
         // Create task with dep
-        let task = mgr.task_create(TaskCreateParams {
-            title: "Blocked task".into(),
-            description: None,
-            priority: None,
-            created_by: None,
-            deps: Some(vec![dep.id.clone()]),
-            fix_budget: None,
-        }).unwrap();
+        let task = mgr
+            .task_create(TaskCreateParams {
+                title: "Blocked task".into(),
+                description: None,
+                priority: None,
+                created_by: None,
+                deps: Some(vec![dep.id.clone()]),
+                fix_budget: None,
+            })
+            .unwrap();
 
         // Should fail — dep not completed
         let err = mgr.task_assign(TaskAssignParams {
@@ -1794,7 +1955,8 @@ mod tests {
         mgr.task_assign(TaskAssignParams {
             task_id: dep.id.clone(),
             agent_id: "a1".into(),
-        }).unwrap();
+        })
+        .unwrap();
         mgr.task_update(TaskUpdateParams {
             id: dep.id.clone(),
             title: None,
@@ -1802,7 +1964,8 @@ mod tests {
             status: Some("in_progress".into()),
             priority: None,
             assignee: None,
-        }).unwrap();
+        })
+        .unwrap();
         mgr.task_update(TaskUpdateParams {
             id: dep.id.clone(),
             title: None,
@@ -1810,13 +1973,16 @@ mod tests {
             status: Some("completed".into()),
             priority: None,
             assignee: None,
-        }).unwrap();
+        })
+        .unwrap();
 
         // Now assign should succeed
-        let assigned = mgr.task_assign(TaskAssignParams {
-            task_id: task.id.clone(),
-            agent_id: "a1".into(),
-        }).unwrap();
+        let assigned = mgr
+            .task_assign(TaskAssignParams {
+                task_id: task.id.clone(),
+                agent_id: "a1".into(),
+            })
+            .unwrap();
         assert_eq!(assigned.status, TaskStatus::Assigned);
     }
 
@@ -1824,14 +1990,16 @@ mod tests {
     fn task_log_records_changes() {
         let (_dir, mgr) = test_manager();
 
-        let task = mgr.task_create(TaskCreateParams {
-            title: "Log test".into(),
-            description: None,
-            priority: None,
-            created_by: None,
-            deps: None,
-            fix_budget: None,
-        }).unwrap();
+        let task = mgr
+            .task_create(TaskCreateParams {
+                title: "Log test".into(),
+                description: None,
+                priority: None,
+                created_by: None,
+                deps: None,
+                fix_budget: None,
+            })
+            .unwrap();
 
         mgr.task_update(TaskUpdateParams {
             id: task.id.clone(),
@@ -1840,11 +2008,12 @@ mod tests {
             status: None,
             priority: None,
             assignee: None,
-        }).unwrap();
+        })
+        .unwrap();
 
         let log = mgr.task_log(&task.id, None);
         assert!(log.len() >= 2); // create + update
-        // Most recent first
+                                 // Most recent first
         assert!(log[0].message.contains("updated"));
         assert!(log[1].message.contains("created"));
     }
@@ -1855,11 +2024,13 @@ mod tests {
         insert_fake_agent(&mgr, "a1");
         insert_fake_agent(&mgr, "a2");
 
-        let msg = mgr.message_send(MessageSendParams {
-            from_agent: Some("a1".into()),
-            to_agent: "a2".into(),
-            content: "hello".into(),
-        }).unwrap();
+        let msg = mgr
+            .message_send(MessageSendParams {
+                from_agent: Some("a1".into()),
+                to_agent: "a2".into(),
+                content: "hello".into(),
+            })
+            .unwrap();
 
         assert_eq!(msg.to_agent, "a2");
         assert!(!msg.read);
@@ -1887,16 +2058,20 @@ mod tests {
         insert_fake_agent(&mgr, "a1");
         insert_fake_agent(&mgr, "a2");
 
-        let m1 = mgr.message_send(MessageSendParams {
-            from_agent: Some("a1".into()),
-            to_agent: "a2".into(),
-            content: "msg1".into(),
-        }).unwrap();
-        let m2 = mgr.message_send(MessageSendParams {
-            from_agent: Some("a1".into()),
-            to_agent: "a2".into(),
-            content: "msg2".into(),
-        }).unwrap();
+        let m1 = mgr
+            .message_send(MessageSendParams {
+                from_agent: Some("a1".into()),
+                to_agent: "a2".into(),
+                content: "msg1".into(),
+            })
+            .unwrap();
+        let m2 = mgr
+            .message_send(MessageSendParams {
+                from_agent: Some("a1".into()),
+                to_agent: "a2".into(),
+                content: "msg2".into(),
+            })
+            .unwrap();
 
         let count = mgr.message_ack(&[m1.id, m2.id]).unwrap();
         assert_eq!(count, 2);
