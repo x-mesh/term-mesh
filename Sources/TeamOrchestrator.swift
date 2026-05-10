@@ -887,7 +887,8 @@ final class TeamOrchestrator: ObservableObject {
                 let effectiveInstructions = AgentRunbookService.shared.composeInstructions(
                     roleName: a.agentType,
                     presetInstructions: a.instructions,
-                    workingDirectory: workingDirectory
+                    workingDirectory: workingDirectory,
+                    mode: .digest
                 )
                 var spec: [String: Any] = ["name": a.name, "agent_type": a.agentType, "cli": cli, "model": a.model]
                 if let path = cliPaths[cli] {
@@ -927,7 +928,8 @@ final class TeamOrchestrator: ObservableObject {
                 let effectiveInstructions = AgentRunbookService.shared.composeInstructions(
                     roleName: agent.agentType,
                     presetInstructions: agent.instructions,
-                    workingDirectory: workingDirectory
+                    workingDirectory: workingDirectory,
+                    mode: .digest
                 )
                 let member = AgentMember(
                     id: "\(agent.name)@\(name)",
@@ -1032,7 +1034,8 @@ final class TeamOrchestrator: ObservableObject {
                 effectiveInstructions = AgentRunbookService.shared.composeInstructions(
                     roleName: agent.agentType,
                     presetInstructions: agent.instructions,
-                    workingDirectory: agentWorkDir
+                    workingDirectory: agentWorkDir,
+                    mode: .digest
                 )
             }
 
@@ -1300,7 +1303,8 @@ final class TeamOrchestrator: ObservableObject {
         let effectiveInstructions = AgentRunbookService.shared.composeInstructions(
             roleName: agentType,
             presetInstructions: instructions,
-            workingDirectory: team.workingDirectory
+            workingDirectory: team.workingDirectory,
+            mode: .digest
         )
 
         // 5. Resolve CLI binary
@@ -2062,33 +2066,29 @@ final class TeamOrchestrator: ObservableObject {
     private func formatDelegateInstruction(task: TeamTask, text: String, context: String? = nil) -> String {
         let taskId = task.id
         var lines: [String] = [
-            "[TASK_ID] \(taskId)",
-            "[TASK_TITLE] \(task.title)",
-            "[TASK_STATUS] \(task.status)",
-            "[TASK_PRIORITY] \(task.priority)",
+            "## Task Capsule",
+            "TASK_ID: \(taskId)",
+            "TASK_TITLE: \(task.title)",
+            "TASK_STATUS: \(task.status)",
+            "TASK_PRIORITY: \(task.priority)",
+            "PROTOCOL: TM-PROTOCOL-v1",
+            "OUTPUT: STATUS/FILES/VERIFY/NEXT/FULL_REPORT header plus concise summary",
         ]
         if let ctx = context, !ctx.isEmpty {
-            let truncated = String(ctx.prefix(3000))
+            let truncated = String(ctx.prefix(500))
             lines.append("")
-            lines.append("[PRIOR_CONTEXT]")
+            lines.append("[CONTEXT_SUMMARY]")
             lines.append(truncated)
-            lines.append("[/PRIOR_CONTEXT]")
+            lines.append("[/CONTEXT_SUMMARY]")
         }
         lines.append(contentsOf: [
             "",
-            "[FORMAT COMPLIANCE] Follow the leader's instructions EXACTLY as given. If a specific output format is requested, reproduce it precisely — do not paraphrase, summarize, or restructure the format.",
-            "",
+            "[GOAL]",
             text.trimmingCharacters(in: .whitespacesAndNewlines),
-            "",
-            "You MUST follow this task lifecycle:",
-            "- tm-agent task start \(taskId)",
-            "- tm-agent heartbeat '<short progress summary>'",
-            "- tm-agent task block \(taskId) '<reason>'",
-            "- tm-agent task review \(taskId) '<summary>'",
-            "- tm-agent reply '<5-line header plus result>'  # final completion; auto-reports and completes the active task",
+            "[/GOAL]",
         ])
         let body = lines.joined(separator: "\n")
-        return body + "\n\n[IMPORTANT] When you finish this task, you MUST use your bash/execute tool to run this SINGLE command:\n```\ntm-agent reply '<STATUS/FILES/VERIFY/NEXT/FULL_REPORT header plus concise result>'\n```\nThis sends the result to the leader, registers it as a report, and completes your active task. Do NOT run separate msg send, report, or task done commands. Just use `reply` once."
+        return body + "\n\n[IMPORTANT] Finish via TM-PROTOCOL-v1: tm-agent reply '<5-line header plus concise summary>'."
     }
 
     private func formatTaskDispatchInstruction(task: TeamTask) -> String {
@@ -2538,7 +2538,7 @@ final class TeamOrchestrator: ObservableObject {
     /// Map short model names (used internally) to kiro-cli model identifiers.
     private static func kiroModelName(_ shortName: String) -> String {
         switch shortName.lowercased() {
-        case "opus":   return "claude-opus-4.6"
+        case "opus":   return "claude-opus-4.7"
         case "sonnet": return "claude-sonnet-4.6"
         case "haiku":  return "claude-haiku-4.5"
         default:       return shortName  // pass through if already full name
@@ -2646,14 +2646,23 @@ final class TeamOrchestrator: ObservableObject {
     }
 
     /// Map short model names to Codex CLI model identifiers.
-    /// New-style names (gpt-5.4, gpt-5.3-codex, etc.) pass through directly.
-    /// Legacy short names kept for backward compatibility with saved presets.
+    /// All short tiers map to gpt-5.5; differentiation happens via reasoning effort
+    /// (see codexReasoningEffort). New-style names pass through directly.
     private static func codexModelName(_ shortName: String) -> String {
         switch shortName.lowercased() {
-        case "opus":   return "gpt-5.4"
-        case "sonnet": return "gpt-5.4"
-        case "haiku":  return "gpt-5.1-codex-mini"
-        default:       return shortName
+        case "opus", "sonnet", "haiku": return "gpt-5.5"
+        default: return shortName
+        }
+    }
+
+    /// Map short model tier to Codex reasoning effort (high/medium/low).
+    /// Returns nil for non-tier model names so we don't override user-specified models.
+    private static func codexReasoningEffort(_ shortName: String) -> String? {
+        switch shortName.lowercased() {
+        case "opus": return "high"
+        case "sonnet": return "medium"
+        case "haiku": return "low"
+        default: return nil
         }
     }
 
@@ -2675,18 +2684,21 @@ final class TeamOrchestrator: ObservableObject {
             parts.append("--model \(codexModel)")
         }
 
+        if !model.isEmpty, let effort = Self.codexReasoningEffort(model) {
+            parts.append("-c model_reasoning_effort=\(effort)")
+        }
+
         // Start interactively — leader sends instructions via tm-agent send.
         return parts.joined(separator: " ")
     }
 
     /// Map short model names to Gemini CLI model identifiers.
-    /// New-style names (gemini-2.5-pro, gemini-2.5-flash, etc.) pass through directly.
-    /// Legacy short names kept for backward compatibility with saved presets.
+    /// New-style names pass through directly.
     private static func geminiModelName(_ shortName: String) -> String {
         switch shortName.lowercased() {
         case "opus":   return "gemini-3.1-pro-preview"
         case "sonnet": return "gemini-3-flash-preview"
-        case "haiku":  return "gemini-2.5-flash"
+        case "haiku":  return "gemini-3.1-flash-lite-preview"
         default:       return shortName
         }
     }

@@ -20,11 +20,31 @@ struct AgentRolePreset: Identifiable, Codable, Equatable {
         case "claude", "kiro":
             return ["sonnet", "opus", "haiku"]
         case "codex":
-            return ["gpt-5.4", "gpt-5.3-codex", "gpt-5.2-codex", "gpt-5.2", "gpt-5.1-codex-max", "gpt-5.1-codex-mini"]
+            return ["sonnet", "opus", "haiku",
+                    "gpt-5.5", "gpt-5.3-codex", "gpt-5.2-codex", "gpt-5.2",
+                    "gpt-5.1-codex-max", "gpt-5.1-codex-mini"]
         case "gemini":
-            return ["gemini-3.1-pro", "gemini-3.1-pro-preview", "gemini-3-flash-preview", "gemini-2.5-pro", "gemini-2.5-flash", "gemini-2.5-flash-lite"]
+            return ["sonnet", "opus", "haiku",
+                    "gemini-3.1-pro-preview", "gemini-3-flash-preview",
+                    "gemini-3.1-flash-lite-preview",
+                    "gemini-2.5-pro", "gemini-2.5-flash", "gemini-2.5-flash-lite"]
         default:
             return ["sonnet", "opus", "haiku"]
+        }
+    }
+
+    /// User-facing label for a model in a given CLI context.
+    /// Internal storage may use tier names ("opus"/"sonnet"/"haiku") for cross-CLI uniformity,
+    /// but UI shows CLI-native text.
+    static func modelDisplayLabel(_ model: String, for cli: String) -> String {
+        switch (cli.lowercased(), model.lowercased()) {
+        case ("codex", "opus"):   return "gpt-5.5 (high)"
+        case ("codex", "sonnet"): return "gpt-5.5 (medium)"
+        case ("codex", "haiku"):  return "gpt-5.5 (low)"
+        case ("gemini", "opus"):   return "gemini-3.1-pro-preview"
+        case ("gemini", "sonnet"): return "gemini-3-flash-preview"
+        case ("gemini", "haiku"):  return "gemini-3.1-flash-lite-preview"
+        default: return model
         }
     }
 
@@ -39,7 +59,7 @@ struct AgentRolePreset: Identifiable, Codable, Equatable {
     /// Default model for a given CLI.
     static func defaultModel(for cli: String) -> String {
         switch cli {
-        case "codex":  return "gpt-5.4"
+        case "codex":  return "gpt-5.5"
         case "gemini": return "gemini-3.1-pro-preview"
         default:       return "sonnet"
         }
@@ -1178,7 +1198,7 @@ struct SmartTeamPreset: Identifiable {
                                    fallbackCli: "claude", fallbackModel: "sonnet", reason: "Fast lookups"),
                 ProviderPreference(role: "executor", primaryCli: "claude", primaryModel: "sonnet",
                                    fallbackCli: "claude", fallbackModel: "sonnet", reason: "Best general coding"),
-                ProviderPreference(role: "reviewer", primaryCli: "codex", primaryModel: nil,
+                ProviderPreference(role: "reviewer", primaryCli: "codex", primaryModel: "opus",
                                    fallbackCli: "claude", fallbackModel: "sonnet", reason: "Fast code review"),
             ]
         ),
@@ -1189,11 +1209,11 @@ struct SmartTeamPreset: Identifiable {
             description: "Spec-driven design + implementation",
             leaderMode: "claude",
             agents: [
-                ProviderPreference(role: "architect", primaryCli: "kiro", primaryModel: nil,
+                ProviderPreference(role: "architect", primaryCli: "claude", primaryModel: "opus",
                                    fallbackCli: "claude", fallbackModel: "opus", reason: "Spec-driven design"),
                 ProviderPreference(role: "executor", primaryCli: "claude", primaryModel: "sonnet",
                                    fallbackCli: "claude", fallbackModel: "sonnet", reason: "Implementation"),
-                ProviderPreference(role: "reviewer", primaryCli: "codex", primaryModel: nil,
+                ProviderPreference(role: "reviewer", primaryCli: "codex", primaryModel: "opus",
                                    fallbackCli: "claude", fallbackModel: "sonnet", reason: "Fast review"),
                 ProviderPreference(role: "tester", primaryCli: "codex", primaryModel: nil,
                                    fallbackCli: "claude", fallbackModel: "sonnet", reason: "Test writing speed"),
@@ -1212,7 +1232,7 @@ struct SmartTeamPreset: Identifiable {
                                    fallbackCli: "claude", fallbackModel: "sonnet", reason: "WebDev Arena #1"),
                 ProviderPreference(role: "backend", primaryCli: "claude", primaryModel: "sonnet",
                                    fallbackCli: "claude", fallbackModel: "sonnet", reason: "API / logic"),
-                ProviderPreference(role: "reviewer", primaryCli: "codex", primaryModel: nil,
+                ProviderPreference(role: "reviewer", primaryCli: "codex", primaryModel: "opus",
                                    fallbackCli: "claude", fallbackModel: "sonnet", reason: "Fast review"),
                 ProviderPreference(role: "tester", primaryCli: "claude", primaryModel: "sonnet",
                                    fallbackCli: "claude", fallbackModel: "sonnet", reason: "Test coverage"),
@@ -1229,7 +1249,7 @@ struct SmartTeamPreset: Identifiable {
                                    fallbackCli: "claude", fallbackModel: "sonnet", reason: "1M context analysis"),
                 ProviderPreference(role: "refactorer", primaryCli: "claude", primaryModel: "sonnet",
                                    fallbackCli: "claude", fallbackModel: "sonnet", reason: "Multi-file changes"),
-                ProviderPreference(role: "reviewer", primaryCli: "codex", primaryModel: nil,
+                ProviderPreference(role: "reviewer", primaryCli: "codex", primaryModel: "opus",
                                    fallbackCli: "claude", fallbackModel: "sonnet", reason: "Change verification"),
                 ProviderPreference(role: "tester", primaryCli: "claude", primaryModel: "sonnet",
                                    fallbackCli: "claude", fallbackModel: "sonnet", reason: "Regression tests"),
@@ -1242,11 +1262,11 @@ struct SmartTeamPreset: Identifiable {
             description: "Quality-focused with spec and security review",
             leaderMode: "claude",
             agents: [
-                ProviderPreference(role: "architect", primaryCli: "kiro", primaryModel: nil,
+                ProviderPreference(role: "architect", primaryCli: "claude", primaryModel: "sonnet",
                                    fallbackCli: "claude", fallbackModel: "sonnet", reason: "Spec → test gen"),
                 ProviderPreference(role: "tester", primaryCli: "codex", primaryModel: nil,
                                    fallbackCli: "claude", fallbackModel: "sonnet", reason: "Fast test writing"),
-                ProviderPreference(role: "reviewer", primaryCli: "codex", primaryModel: nil,
+                ProviderPreference(role: "reviewer", primaryCli: "codex", primaryModel: "opus",
                                    fallbackCli: "claude", fallbackModel: "sonnet", reason: "Review + safety"),
                 ProviderPreference(role: "security", primaryCli: "claude", primaryModel: "opus",
                                    fallbackCli: "claude", fallbackModel: "sonnet", reason: "Deep security audit"),
@@ -1259,9 +1279,9 @@ struct SmartTeamPreset: Identifiable {
             description: "AWS infrastructure with Kiro native integration",
             leaderMode: "claude",
             agents: [
-                ProviderPreference(role: "architect", primaryCli: "kiro", primaryModel: nil,
+                ProviderPreference(role: "architect", primaryCli: "claude", primaryModel: "opus",
                                    fallbackCli: "claude", fallbackModel: "sonnet", reason: "AWS native"),
-                ProviderPreference(role: "infra", primaryCli: "kiro", primaryModel: nil,
+                ProviderPreference(role: "infra", primaryCli: "claude", primaryModel: "sonnet",
                                    fallbackCli: "claude", fallbackModel: "sonnet", reason: "IAM Autopilot"),
                 ProviderPreference(role: "executor", primaryCli: "claude", primaryModel: "sonnet",
                                    fallbackCli: "claude", fallbackModel: "sonnet", reason: "CDK / CF coding"),
@@ -1279,7 +1299,7 @@ struct SmartTeamPreset: Identifiable {
             agents: [
                 ProviderPreference(role: "researcher", primaryCli: "claude", primaryModel: "opus",
                                    fallbackCli: "claude", fallbackModel: "opus", reason: "Market/tech research"),
-                ProviderPreference(role: "architect", primaryCli: "kiro", primaryModel: nil,
+                ProviderPreference(role: "architect", primaryCli: "claude", primaryModel: "opus",
                                    fallbackCli: "claude", fallbackModel: "opus", reason: "System architecture draft"),
                 ProviderPreference(role: "ux", primaryCli: "gemini", primaryModel: nil,
                                    fallbackCli: "claude", fallbackModel: "sonnet", reason: "User flow & wireframes"),
@@ -1344,9 +1364,9 @@ struct SmartTeamPreset: Identifiable {
                                    fallbackCli: "claude", fallbackModel: "opus", reason: "OWASP Top 10 audit"),
                 ProviderPreference(role: "explorer", primaryCli: "gemini", primaryModel: nil,
                                    fallbackCli: "claude", fallbackModel: "sonnet", reason: "Full codebase scan"),
-                ProviderPreference(role: "reviewer", primaryCli: "codex", primaryModel: nil,
+                ProviderPreference(role: "reviewer", primaryCli: "codex", primaryModel: "opus",
                                    fallbackCli: "claude", fallbackModel: "opus", reason: "Logic flaw detection"),
-                ProviderPreference(role: "infra", primaryCli: "kiro", primaryModel: nil,
+                ProviderPreference(role: "infra", primaryCli: "claude", primaryModel: "sonnet",
                                    fallbackCli: "claude", fallbackModel: "sonnet", reason: "Cloud/IAM security"),
                 ProviderPreference(role: "syseng", primaryCli: "claude", primaryModel: "sonnet",
                                    fallbackCli: "claude", fallbackModel: "sonnet", reason: "OS/network hardening"),
@@ -1384,7 +1404,7 @@ struct SmartTeamPreset: Identifiable {
             agents: [
                 ProviderPreference(role: "api", primaryCli: "claude", primaryModel: "sonnet",
                                    fallbackCli: "claude", fallbackModel: "sonnet", reason: "OpenAPI spec design"),
-                ProviderPreference(role: "architect", primaryCli: "kiro", primaryModel: nil,
+                ProviderPreference(role: "architect", primaryCli: "claude", primaryModel: "opus",
                                    fallbackCli: "claude", fallbackModel: "opus", reason: "Schema & versioning"),
                 ProviderPreference(role: "backend", primaryCli: "claude", primaryModel: "sonnet",
                                    fallbackCli: "claude", fallbackModel: "sonnet", reason: "Endpoint implementation"),
@@ -1413,7 +1433,7 @@ struct SmartTeamPreset: Identifiable {
                                    fallbackCli: "claude", fallbackModel: "sonnet", reason: "Bulk transforms"),
                 ProviderPreference(role: "tester", primaryCli: "claude", primaryModel: "sonnet",
                                    fallbackCli: "claude", fallbackModel: "sonnet", reason: "Regression & diff verify"),
-                ProviderPreference(role: "reviewer", primaryCli: "codex", primaryModel: nil,
+                ProviderPreference(role: "reviewer", primaryCli: "codex", primaryModel: "opus",
                                    fallbackCli: "claude", fallbackModel: "opus", reason: "Conversion accuracy"),
             ]
         ),

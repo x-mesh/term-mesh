@@ -166,7 +166,7 @@ struct RolePresetEditorView: View {
                     LabeledContent("Model") {
                         Picker("", selection: binding.model) {
                             ForEach(AgentRolePreset.models(for: binding.cli.wrappedValue), id: \.self) { m in
-                                Text(m).tag(m)
+                                Text(AgentRolePreset.modelDisplayLabel(m, for: binding.cli.wrappedValue)).tag(m)
                             }
                         }
                         .frame(width: 140)

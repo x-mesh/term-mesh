@@ -314,7 +314,8 @@ struct TermMeshApp: App {
                                 roleName: row.preset.name,
                                 presetInstructions: row.preset.instructions,
                                 customInstructions: customInstructions,
-                                workingDirectory: workDir
+                                workingDirectory: workDir,
+                                mode: .digest
                             )
                             return (
                                 name: row.preset.name,

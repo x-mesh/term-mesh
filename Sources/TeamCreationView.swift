@@ -369,7 +369,7 @@ struct TeamCreationView: View {
                 if leaderMode != "repl" {
                     Picker("", selection: $leaderModel) {
                         ForEach(AgentRolePreset.models(for: leaderMode), id: \.self) { m in
-                            Text(m).tag(m)
+                            Text(AgentRolePreset.modelDisplayLabel(m, for: leaderMode)).tag(m)
                         }
                     }
                     .fixedSize()
@@ -565,6 +565,28 @@ struct TeamCreationView: View {
                     .font(.subheadline.bold())
                 Spacer()
 
+                // 3-mode cost toggle
+                if !agents.isEmpty {
+                    HStack(spacing: 4) {
+                        Button(action: applyMaxCost) {
+                            Label("최대 성능", systemImage: "diamond.fill")
+                                .font(.caption)
+                        }
+                        .help("All agents → opus tier (highest cost, best quality)")
+                        Button(action: applyBalanced) {
+                            Label("균형", systemImage: "scale.3d")
+                                .font(.caption)
+                        }
+                        .help("Restore per-role tiers from current Smart Preset (or sonnet for all if none active)")
+                        Button(action: applyMinCost) {
+                            Label("최소 비용", systemImage: "leaf.fill")
+                                .font(.caption)
+                        }
+                        .help("All agents → haiku tier (lowest cost)")
+                    }
+                    .disabled(agents.isEmpty)
+                }
+
                 // Bulk model selector — only applies on explicit button click
                 if !agents.isEmpty {
                     Button(action: applyModelToAll) {
@@ -587,7 +609,7 @@ struct TeamCreationView: View {
                     .frame(width: 85)
                     Picker("", selection: $bulkModel) {
                         ForEach(bulkModels, id: \.self) { m in
-                            Text(m).tag(m)
+                            Text(AgentRolePreset.modelDisplayLabel(m, for: bulkCli)).tag(m)
                         }
                     }
                     .frame(width: 130)
@@ -681,7 +703,7 @@ struct TeamCreationView: View {
                     set: { agents[index].preset.model = $0 }
                 )) {
                     ForEach(AgentRolePreset.models(for: agent.preset.cli), id: \.self) { m in
-                        Text(m).tag(m)
+                        Text(AgentRolePreset.modelDisplayLabel(m, for: agent.preset.cli)).tag(m)
                     }
                 }
                 .frame(width: 130)
@@ -1188,6 +1210,32 @@ struct TeamCreationView: View {
             agents[i].preset.cli = bulkCli
             agents[i].preset.model = bulkModel
             agents[i].providerBadge = .none
+        }
+    }
+
+    private func applyMaxCost() {
+        for i in agents.indices {
+            agents[i].preset.model = "opus"
+            agents[i].providerBadge = .none
+        }
+    }
+
+    private func applyMinCost() {
+        for i in agents.indices {
+            agents[i].preset.model = "haiku"
+            agents[i].providerBadge = .none
+        }
+    }
+
+    private func applyBalanced() {
+        if let smartPresetId = selectedSmartPresetId,
+           let smart = SmartTeamPreset.builtIn.first(where: { $0.id == smartPresetId }) {
+            applySmartPreset(smart)
+        } else {
+            for i in agents.indices {
+                agents[i].preset.model = "sonnet"
+                agents[i].providerBadge = .none
+            }
         }
     }
 

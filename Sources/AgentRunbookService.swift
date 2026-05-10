@@ -96,6 +96,11 @@ enum AgentRunbookTool: String, CaseIterable, Identifiable, Sendable {
     }
 }
 
+enum AgentRunbookInstructionMode: Sendable {
+    case full
+    case digest
+}
+
 struct AgentRunbookCommandResult: Equatable, Sendable {
     let exitCode: Int32
     let stdout: String
@@ -245,7 +250,8 @@ final class AgentRunbookService: @unchecked Sendable {
         roleName: String,
         presetInstructions: String,
         customInstructions: String? = nil,
-        workingDirectory: String
+        workingDirectory: String,
+        mode: AgentRunbookInstructionMode = .full
     ) -> String {
         let preset = presetInstructions.trimmingCharacters(in: .whitespacesAndNewlines)
         if preset.contains(Self.effectivePromptMarker) {
@@ -254,20 +260,74 @@ final class AgentRunbookService: @unchecked Sendable {
 
         var parts: [String] = []
         if !preset.isEmpty {
-            parts.append(preset)
+            parts.append(mode == .digest ? presetRoutingDigest(preset) : preset)
         }
 
         if let runbook = loadRunbookContent(role: roleName, workingDirectory: workingDirectory),
            !runbook.isEmpty {
-            parts.append("""
-            \(Self.effectivePromptMarker)
-            ## Repo Role Runbook
+            switch mode {
+            case .full:
+                parts.append("""
+                \(Self.effectivePromptMarker)
+                ## Repo Role Runbook
 
-            \(runbook)
-            """)
+                \(runbook)
+                """)
+            case .digest:
+                parts.append(runbookDigest(role: roleName, content: runbook, workingDirectory: workingDirectory))
+            }
         }
 
         return appendCustomInstructionsIfNeeded(base: parts.joined(separator: "\n\n"), customInstructions: customInstructions)
+    }
+
+    func runbookDigest(role: String, content: String, workingDirectory: String) -> String {
+        let normalized = Self.normalizeRoleName(role)
+        let root = projectRoot(from: workingDirectory)
+        let fullPath = sourcePath(projectRoot: root, role: normalized)
+        let when = sectionBullets(content, section: "## When To Use", limit: 2).joined(separator: " | ")
+        let must = sectionBullets(content, section: "## Operating Rules", limit: 3).joined(separator: " | ")
+        let verify = sectionBullets(content, section: "## Verify", limit: 2).joined(separator: " | ")
+        return """
+        \(Self.effectivePromptMarker)
+        <!-- term-mesh-runbook-digest v1 -->
+        ## Repo Role Runbook Digest
+        ROLE: \(normalized)
+        WHEN: \(when.isEmpty ? "Use for assigned \(normalized) role work." : when)
+        MUST: \(must.isEmpty ? "Follow the leader's task instructions and repo constraints." : must)
+        VERIFY: \(verify.isEmpty ? "Report a concrete verify command or n/a." : verify)
+        OUTPUT: STATUS/FILES/VERIFY/NEXT/FULL_REPORT
+        FULL: \(fullPath)
+        """
+    }
+
+    private func presetRoutingDigest(_ preset: String) -> String {
+        let firstLine = preset
+            .components(separatedBy: .newlines)
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .first { !$0.isEmpty } ?? ""
+        guard !firstLine.isEmpty else { return "" }
+        return """
+        ## Role Routing Digest
+        SUMMARY: \(String(firstLine.prefix(180)))
+        """
+    }
+
+    private func sectionBullets(_ content: String, section: String, limit: Int) -> [String] {
+        var inSection = false
+        var out: [String] = []
+        for rawLine in content.components(separatedBy: .newlines) {
+            let line = rawLine.trimmingCharacters(in: .whitespacesAndNewlines)
+            if line.hasPrefix("## ") {
+                inSection = line == section
+                continue
+            }
+            if inSection, line.hasPrefix("- ") {
+                out.append(String(line.dropFirst(2)).trimmingCharacters(in: .whitespacesAndNewlines))
+                if out.count >= limit { break }
+            }
+        }
+        return out
     }
 
     @MainActor

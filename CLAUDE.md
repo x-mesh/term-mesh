@@ -206,6 +206,7 @@ tm-agent list
 # Agent runbooks (repo-local role behavior)
 tm-agent runbook status
 tm-agent runbook init [--dry-run] [--force]
+tm-agent runbook digest [--agent <role>]       # compact prompt-efficient role brief
 tm-agent runbook install --tool claude|codex|opencode|all [--agent <role>] [--dry-run] [--force]
 
 # Workspace-local attach/detach (NO new workspace — uses the caller's current one)
@@ -226,6 +227,8 @@ tm-agent delegate <agent> '<instruction>' [--context '<prior context>']
 tm-agent broadcast '<instruction>'
 tm-agent read <agent> --lines 100
 tm-agent collect --lines 100
+tm-agent collect --headers                    # header-only result collection for token-efficient synthesis
+tm-agent reports --summary                    # headers + concise summaries, full files lazy-read via FULL_REPORT
 tm-agent wait --timeout 120 --mode any
 tm-agent brief <agent>
 
@@ -236,6 +239,14 @@ tm-agent task review <task_id> '<summary>'
 tm-agent task fix-attempt <task_id>   # Record a fix attempt (auto-blocks when budget exhausted)
 tm-agent heartbeat '<progress summary>'
 tm-agent reply '<STATUS/FILES/VERIFY/NEXT/FULL_REPORT header plus result>'  # auto-reports and completes active task
+
+# Token-efficient protocol
+# Agent init uses compact runbook digests by default. Set TERMMESH_RUNBOOK_MODE=full
+# only when debugging role behavior or when a task truly needs the full source runbook.
+# Delegated tasks should use compact task capsules and `TM-PROTOCOL-v1` instead of
+# repeating lifecycle instructions. Leaders should read `collect --headers` or
+# `reports --summary` first, then open FULL_REPORT only for BLOCKED/NEEDS_REVIEW
+# or failed VERIFY cases.
 
 # Messaging
 tm-agent msg send '<text>'                    # to leader

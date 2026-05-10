@@ -104,9 +104,9 @@ pub fn build_claude_command(
 /// Map short model names to Kiro CLI model identifiers.
 fn kiro_model_name(short: &str) -> &str {
     match short.to_lowercase().as_str() {
-        "opus" => "claude-opus-4-6-20250618",
-        "sonnet" => "claude-sonnet-4-6-20250514",
-        "haiku" => "claude-haiku-4-5-20251001",
+        "opus" => "claude-opus-4.7",
+        "sonnet" => "claude-sonnet-4.6",
+        "haiku" => "claude-haiku-4.5",
         _ => short,
     }
 }
@@ -179,12 +179,23 @@ fn write_kiro_profile(profile_name: &str, description: &str, prompt: &str) {
 }
 
 /// Map short model names to Codex CLI model identifiers.
+/// All tiers use gpt-5.5; differentiation happens via reasoning effort
+/// (see codex_reasoning_effort).
 fn codex_model_name(short: &str) -> &str {
     match short.to_lowercase().as_str() {
-        "opus" => "gpt-5.4",
-        "sonnet" => "gpt-5.4",
-        "haiku" => "gpt-5.1-codex-mini",
+        "opus" | "sonnet" | "haiku" => "gpt-5.5",
         _ => short,
+    }
+}
+
+/// Map short model tier to Codex reasoning effort.
+/// Returns None for non-tier names so unknown/passthrough models don't get the flag injected.
+fn codex_reasoning_effort(short: &str) -> Option<&str> {
+    match short.to_lowercase().as_str() {
+        "opus" => Some("high"),
+        "sonnet" => Some("medium"),
+        "haiku" => Some("low"),
+        _ => None,
     }
 }
 
@@ -201,15 +212,19 @@ pub fn build_codex_command(
     let program = resolve_cli_path(cli_path, "CODEX_PATH", "codex");
 
     let codex_model = codex_model_name(model);
-    let args = vec![
+    let mut args: Vec<String> = vec![
         "exec".into(),
         "--sandbox".into(),
         "danger-full-access".into(),
         "--model".into(),
         codex_model.to_string(),
-        "--json".into(),
-        "-".into(), // read prompt from stdin
     ];
+    if let Some(effort) = codex_reasoning_effort(model) {
+        args.push("-c".into());
+        args.push(format!("model_reasoning_effort={effort}"));
+    }
+    args.push("--json".into());
+    args.push("-".into()); // read prompt from stdin
 
     let env = base_env(name, team_name, daemon_socket, app_socket_path);
     CliCommand {
@@ -223,9 +238,9 @@ pub fn build_codex_command(
 /// Map short model names to Gemini CLI model identifiers.
 fn gemini_model_name(short: &str) -> &str {
     match short.to_lowercase().as_str() {
-        "opus" => "gemini-3.1-pro",
-        "sonnet" => "gemini-3-flash",
-        "haiku" => "gemini-3-flash",
+        "opus" => "gemini-3.1-pro-preview",
+        "sonnet" => "gemini-3-flash-preview",
+        "haiku" => "gemini-3.1-flash-lite-preview",
         _ => short,
     }
 }
