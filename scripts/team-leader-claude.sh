@@ -120,6 +120,7 @@ ${WORKTREE_INFO}
 
 When agents complete their work, instruct them to:
 1. Stage and commit their changes: git add -A && git commit -m 'description'
+   (Commit messages must not contain fenced code-block markers — .githooks/commit-msg strips them. Follow the Commit Policy in .agent-runbooks/executor.md.)
 2. Push their branch: git push -u origin <branch-name>
 3. Create a PR: gh pr create --title 'description' --body 'details'
 
