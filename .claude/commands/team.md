@@ -46,9 +46,11 @@ tm-agent status
 |---------|---------|-------------|
 | `runbook status` | `/team runbook status` | Show `.agent-runbooks` source and Claude/Codex/OpenCode projection status |
 | `runbook init` | `/team runbook init` | Create repo-local source runbooks |
+| `runbook digest --agent executor` | `/team runbook digest --agent executor` | Show compact prompt-efficient role digest |
 | `runbook install --tool all` | `/team runbook install --tool all` | Install managed projections for supported agent tools |
 
 Runbook precedence: base term-mesh protocol → role preset → `.agent-runbooks/<role>.md` → per-team custom instructions. Tool-specific files under `.claude/skills`, `.codex/skills`, and `.opencode/runbooks` are projections, not the source of truth.
+Agent init uses compact runbook digests by default; set `TERMMESH_RUNBOOK_MODE=full` only for debugging or deep role-behavior audits.
 
 ### Communication (leader → agent)
 | Command | Example | Description |
@@ -93,6 +95,8 @@ tm-agent heartbeat '<summary>'
 tm-agent task review <task_id> '<summary>'
 tm-agent msg send '<text>'
 tm-agent reply '<STATUS/FILES/VERIFY/NEXT/FULL_REPORT header plus result>'
+tm-agent collect --headers
+tm-agent reports --summary
 tm-agent inbox
 tm-agent status
 ```

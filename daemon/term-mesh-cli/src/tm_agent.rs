@@ -23,17 +23,30 @@ const DEFAULT_AGENT_NAMES: &[&str] = &[
 const DEFAULT_AGENT_COLORS: &[&str] = &["green", "blue", "yellow", "magenta", "cyan", "red"];
 
 const REPORT_SUFFIX: &str = concat!(
-    "\n\n[IMPORTANT] When done, run: tm-agent reply '<STATUS/FILES/VERIFY/NEXT/FULL_REPORT header plus summary>' to report your result. Do not run task done separately; reply auto-reports and completes your active task.",
+    "\n\n[IMPORTANT] Finish via TM-PROTOCOL-v1: tm-agent reply '<5-line header plus concise summary>'.",
 );
 
 const BROADCAST_SUFFIX: &str = concat!(
-    "\n\n[IMPORTANT] When done, run: `tm-agent reply '<STATUS/FILES/VERIFY/NEXT/FULL_REPORT header plus summary>'` to report your result. Do not run task done separately; reply auto-reports and completes your active task.",
+    "\n\n[IMPORTANT] Finish via TM-PROTOCOL-v1: `tm-agent reply '<5-line header plus concise summary>'`.",
 );
 
 fn agent_init_prompt(agent_name: &str, agent_role: &str, workdir: &str, socket: &str) -> String {
-    let runbook_section = load_runbook_content_for_role(Path::new(workdir), agent_role)
-        .map(|content| format!("\n## Role Runbook\n\n{content}\n"))
-        .unwrap_or_default();
+    let root = Path::new(workdir);
+    let runbook_mode = env::var("TERMMESH_RUNBOOK_MODE").unwrap_or_else(|_| "digest".to_string());
+    let role = selected_runbook_roles(Some(agent_role))
+        .ok()
+        .and_then(|mut roles| roles.pop());
+    let runbook_section = if runbook_mode == "full" {
+        load_runbook_content_for_role(root, agent_role)
+            .map(|content| format!("\n## Role Runbook\n\n{content}\n"))
+            .unwrap_or_default()
+    } else if let Some(role) = role {
+        format!("\n{}\n", runbook_digest_content(root, &role))
+    } else {
+        load_runbook_content_for_role(root, agent_role)
+            .map(|content| format!("\n## Runbook Digest\nROLE: {agent_role}\nOUTPUT: STATUS/FILES/VERIFY/NEXT/FULL_REPORT\nFULL: .agent-runbooks/{agent_role}.md\n\n{content}\n"))
+            .unwrap_or_default()
+    };
     let identity_line = if agent_name == agent_role {
         format!("You are a team agent named \"{agent_name}\" with role \"{agent_role}\" in a term-mesh multi-agent team.")
     } else {
@@ -54,6 +67,13 @@ Task lifecycle:\n\
 5. When done: `tm-agent reply '<full result>'` \u{2014} this auto-reports and completes your active task. Do not run `tm-agent task done` separately.\n\
 \n\
 ## Reply Protocol\n\
+\n\
+This session defines `TM-PROTOCOL-v1`:\n\
+- Start assigned work with `tm-agent task start <task_id>`.\n\
+- Send brief progress with `tm-agent heartbeat '<short summary>'`.\n\
+- Use `tm-agent task block <task_id> '<reason>'` when blocked.\n\
+- Use `tm-agent task review <task_id> '<summary>'` when ready for validation.\n\
+- Finish with one `tm-agent reply '<5-line header plus concise result>'`; it auto-reports and completes your active task.\n\
 \n\
 Begin every `tm-agent reply` body with this 5-line header (use n/a / none / NONE when not applicable):\n\
 \n\
@@ -174,13 +194,33 @@ enum Commands {
     Collect {
         #[arg(long, default_value_t = 50)]
         lines: u32,
+        /// Print result headers only instead of terminal text
+        #[arg(long)]
+        headers: bool,
+        /// Print result headers plus short summaries instead of terminal text
+        #[arg(long)]
+        summary: bool,
     },
     /// Get agent reports
-    Reports,
+    Reports {
+        /// Print only STATUS/FILES/VERIFY/NEXT/FULL_REPORT headers
+        #[arg(long)]
+        headers: bool,
+        /// Print headers plus short summaries
+        #[arg(long)]
+        summary: bool,
+    },
     /// Check result completion status
     ResultStatus,
     /// Collect all results
-    ResultCollect,
+    ResultCollect {
+        /// Print only STATUS/FILES/VERIFY/NEXT/FULL_REPORT headers
+        #[arg(long)]
+        headers: bool,
+        /// Print headers plus short summaries
+        #[arg(long)]
+        summary: bool,
+    },
 
     // ── Orchestration ──────────────────────────────────────────────
     /// Create a new agent team
@@ -699,6 +739,12 @@ enum RunbookCommands {
         /// Overwrite existing non-managed files
         #[arg(long)]
         force: bool,
+    },
+    /// Print compact runbook digest(s) for prompt-efficient agent init
+    Digest {
+        /// Show only one role digest
+        #[arg(long)]
+        agent: Option<String>,
     },
 }
 
@@ -1401,6 +1447,84 @@ fn load_runbook_content_for_role(root: &Path, role: &str) -> Option<String> {
         .filter(|content| !content.trim().is_empty())
 }
 
+fn runbook_section_bullets(content: &str, section: &str, limit: usize) -> Vec<String> {
+    let mut in_section = false;
+    let mut out = Vec::new();
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("## ") {
+            in_section = trimmed == section;
+            continue;
+        }
+        if in_section {
+            if let Some(item) = trimmed.strip_prefix("- ") {
+                out.push(item.trim().to_string());
+                if out.len() >= limit {
+                    break;
+                }
+            }
+        }
+    }
+    out
+}
+
+fn runbook_digest_content(root: &Path, role: &RunbookRole) -> String {
+    let source_path = runbook_source_path(root, role);
+    let source_content = effective_source_runbook_content(root, role);
+    let when = runbook_section_bullets(&source_content, "## When To Use", 2);
+    let rules = runbook_section_bullets(&source_content, "## Operating Rules", 3);
+    let verify = runbook_section_bullets(&source_content, "## Verify", 2);
+
+    let when = if when.is_empty() {
+        role.when_to_use
+            .iter()
+            .take(2)
+            .copied()
+            .collect::<Vec<_>>()
+            .join(" | ")
+    } else {
+        when.join(" | ")
+    };
+    let must = if rules.is_empty() {
+        role.rules
+            .iter()
+            .take(3)
+            .copied()
+            .collect::<Vec<_>>()
+            .join(" | ")
+    } else {
+        rules.join(" | ")
+    };
+    let verify = if verify.is_empty() {
+        role.verify
+            .iter()
+            .take(2)
+            .copied()
+            .collect::<Vec<_>>()
+            .join(" | ")
+    } else {
+        verify.join(" | ")
+    };
+
+    format!(
+        "\
+<!-- term-mesh-runbook-digest v1 -->
+## Runbook Digest
+ROLE: {role}
+WHEN: {when}
+MUST: {must}
+VERIFY: {verify}
+OUTPUT: STATUS/FILES/VERIFY/NEXT/FULL_REPORT
+FULL: {full}
+",
+        role = role.name,
+        when = when,
+        must = must,
+        verify = verify,
+        full = source_path.to_string_lossy(),
+    )
+}
+
 fn runbook_readme_path(root: &Path) -> PathBuf {
     root.join(RUNBOOK_SOURCE_DIR).join("README.md")
 }
@@ -1696,6 +1820,30 @@ fn runbook_status() -> Result<Value, String> {
     }))
 }
 
+fn runbook_digest(agent: Option<&str>) -> Result<Value, String> {
+    let root = find_runbook_project_root()?;
+    let roles = selected_runbook_roles(agent)?;
+    let digests: Vec<Value> = roles
+        .iter()
+        .map(|role| {
+            json!({
+                "role": role.name,
+                "path": runbook_source_path(&root, role).to_string_lossy(),
+                "digest": runbook_digest_content(&root, role),
+            })
+        })
+        .collect();
+    Ok(json!({
+        "ok": true,
+        "result": {
+            "project_root": root.to_string_lossy(),
+            "mode": "digest",
+            "agent": agent.unwrap_or("all"),
+            "digests": digests,
+        }
+    }))
+}
+
 fn run_runbook_command(command: &RunbookCommands) -> Result<Value, String> {
     match command {
         RunbookCommands::Status => runbook_status(),
@@ -1706,6 +1854,7 @@ fn run_runbook_command(command: &RunbookCommands) -> Result<Value, String> {
             dry_run,
             force,
         } => runbook_install(tool, agent.as_deref(), *dry_run, *force),
+        RunbookCommands::Digest { agent } => runbook_digest(agent.as_deref()),
     }
 }
 
@@ -1772,8 +1921,8 @@ mod runbook_tests {
         fs::write(runbook_dir.join("explorer.md"), "EXPLORER ONLY\n").unwrap();
 
         let prompt = agent_init_prompt("exp1", "explorer", &dir.to_string_lossy(), "/tmp/socket");
-        assert!(prompt.contains("## Role Runbook"));
-        assert!(prompt.contains("EXPLORER ONLY"));
+        assert!(prompt.contains("## Runbook Digest"));
+        assert!(prompt.contains("OUTPUT: STATUS/FILES/VERIFY/NEXT/FULL_REPORT"));
         assert!(prompt.contains("named \"exp1\" with role \"explorer\""));
         assert!(prompt.contains(".agent-runbooks/explorer.md"));
 
@@ -1817,6 +1966,63 @@ mod runbook_tests {
         );
 
         fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn runbook_digest_uses_source_sections() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = env::temp_dir().join(format!("tm-agent-runbook-digest-{unique}"));
+        let role = selected_runbook_roles(Some("executor")).unwrap().remove(0);
+        let source_path = runbook_source_path(&dir, &role);
+        fs::create_dir_all(source_path.parent().unwrap()).unwrap();
+        fs::write(
+            &source_path,
+            "\
+## When To Use
+- Custom when
+
+## Operating Rules
+- Custom rule A
+- Custom rule B
+
+## Verify
+- Custom verify
+",
+        )
+        .unwrap();
+
+        let digest = runbook_digest_content(&dir, &role);
+        assert!(digest.contains("ROLE: executor"));
+        assert!(digest.contains("Custom rule A"));
+        assert!(digest.contains("Custom verify"));
+        assert!(digest.contains("FULL:"));
+
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn result_collect_compaction_removes_full_content() {
+        let resp = json!({
+            "ok": true,
+            "result": {
+                "results": [{
+                    "agent": "executor",
+                    "content": "STATUS: DONE\nFILES: a.rs\nVERIFY: cargo test\nNEXT: NONE\nFULL_REPORT: /tmp/full.md\n\nSUMMARY:\nChanged code"
+                }]
+            }
+        });
+        let compact = compact_result_collect_response(resp, true);
+        let item = &compact["result"]["results"][0];
+        assert!(item.get("content").is_none());
+        assert_eq!(item["headers"]["status"].as_str(), Some("DONE"));
+        assert_eq!(
+            item["headers"]["full_report"].as_str(),
+            Some("/tmp/full.md")
+        );
+        assert!(item["summary"].as_str().unwrap().contains("Changed code"));
     }
 }
 
@@ -2313,15 +2519,18 @@ fn format_task_instruction(
     fix_budget: Option<u8>,
 ) -> String {
     let mut lines = vec![
-        format!("[TASK_ID] {}", task["id"].as_str().unwrap_or("")),
-        format!("[TASK_TITLE] {}", task["title"].as_str().unwrap_or("")),
+        "## Task Capsule".to_string(),
+        format!("TASK_ID: {}", task["id"].as_str().unwrap_or("")),
+        format!("TASK_TITLE: {}", task["title"].as_str().unwrap_or("")),
         format!(
-            "[TASK_STATUS] {}",
+            "TASK_STATUS: {}",
             task["status"].as_str().unwrap_or("assigned")
         ),
+        "PROTOCOL: TM-PROTOCOL-v1".to_string(),
+        "OUTPUT: STATUS/FILES/VERIFY/NEXT/FULL_REPORT header plus concise summary".to_string(),
     ];
     if let Some(p) = task["priority"].as_u64() {
-        lines.push(format!("[TASK_PRIORITY] {p}"));
+        lines.push(format!("TASK_PRIORITY: {p}"));
     }
     if let Some(ac) = task["acceptance_criteria"].as_array() {
         if !ac.is_empty() {
@@ -2352,7 +2561,7 @@ fn format_task_instruction(
                             dep_task["result"].as_str().map(String::from)
                         };
                         if let Some(text) = content {
-                            let truncated = truncate_summary(&text, 2000);
+                            let truncated = truncate_summary(&text, 600);
                             lines.push(format!("\n[DEP_RESULT: {dep_id}]"));
                             lines.push(truncated);
                             lines.push(format!("[/DEP_RESULT]"));
@@ -2367,31 +2576,25 @@ fn format_task_instruction(
             lines.push(format!("[TASK_DESCRIPTION] {desc}"));
         }
     }
+    let task_id = task["id"].as_str().unwrap_or("");
     if let Some(ctx) = context {
-        let truncated = truncate_summary(ctx, 3000);
+        let context_ref = write_result_file(team, &format!("{task_id}-context.md"), ctx)
+            .ok()
+            .map(|p| p.to_string_lossy().to_string());
+        let truncated = truncate_summary(ctx, 500);
         lines.push(String::new());
-        lines.push("[PRIOR_CONTEXT]".to_string());
+        if let Some(path) = context_ref {
+            lines.push(format!("CONTEXT_REF: {path}"));
+        }
+        lines.push("[CONTEXT_SUMMARY]".to_string());
         lines.push(truncated);
-        lines.push("[/PRIOR_CONTEXT]".to_string());
+        lines.push("[/CONTEXT_SUMMARY]".to_string());
     }
 
-    let task_id = task["id"].as_str().unwrap_or("");
     lines.push(String::new());
-    lines.push(
-        "[FORMAT COMPLIANCE] Follow the leader's instructions EXACTLY as given. \
-If a specific output format is requested, reproduce it precisely — \
-do not paraphrase, summarize, or restructure the format."
-            .to_string(),
-    );
-    lines.push(String::new());
+    lines.push("[GOAL]".to_string());
     lines.push(instruction.trim().to_string());
-    lines.push(String::new());
-    lines.push("You MUST follow this task lifecycle:".to_string());
-    lines.push(format!("- tm-agent task start {task_id}"));
-    lines.push("- tm-agent heartbeat '<short progress summary>'".to_string());
-    lines.push(format!("- tm-agent task block {task_id} '<reason>'"));
-    lines.push(format!("- tm-agent task review {task_id} '<summary>'"));
-    lines.push("- tm-agent reply '<5-line header plus result>'  # final completion; auto-reports and completes the active task".to_string());
+    lines.push("[/GOAL]".to_string());
 
     // Inject Auto-Fix Budget rules when budget is set
     if let Some(budget) = fix_budget {
@@ -2459,6 +2662,66 @@ fn truncate_summary(content: &str, max_chars: usize) -> String {
         end -= 1;
     }
     format!("{}...", &content[..end])
+}
+
+fn reply_header_and_summary(content: &str, summary_chars: usize) -> (Value, String) {
+    let header_keys = ["STATUS", "FILES", "VERIFY", "NEXT", "FULL_REPORT"];
+    let mut headers = serde_json::Map::new();
+    let mut body_lines = Vec::new();
+    for line in content.lines() {
+        let trimmed = line.trim();
+        let mut matched = false;
+        for key in header_keys {
+            if let Some(value) = trimmed.strip_prefix(&format!("{key}:")) {
+                headers.insert(key.to_ascii_lowercase(), json!(value.trim()));
+                matched = true;
+                break;
+            }
+        }
+        if !matched {
+            body_lines.push(line);
+        }
+    }
+    for key in header_keys {
+        headers
+            .entry(key.to_ascii_lowercase())
+            .or_insert_with(|| json!("n/a"));
+    }
+    let body = body_lines
+        .join("\n")
+        .trim()
+        .trim_start_matches("SUMMARY:")
+        .trim()
+        .to_string();
+    (
+        Value::Object(headers),
+        truncate_summary(&body, summary_chars),
+    )
+}
+
+fn compact_result_collect_response(mut resp: Value, include_summary: bool) -> Value {
+    if let Some(results) = resp
+        .get_mut("result")
+        .and_then(|r| r.get_mut("results"))
+        .and_then(|r| r.as_array_mut())
+    {
+        for result in results {
+            if let Some(obj) = result.as_object_mut() {
+                let content = obj
+                    .get("content")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let (headers, summary) = reply_header_and_summary(&content, 700);
+                obj.insert("headers".to_string(), headers);
+                if include_summary {
+                    obj.insert("summary".to_string(), json!(summary));
+                }
+                obj.remove("content");
+            }
+        }
+    }
+    resp
 }
 
 fn cleanup_old_results(team: &str) {
@@ -3203,19 +3466,44 @@ fn main() {
                 }),
             )
         }
-        Commands::Collect { lines } => rpc_call(
-            &sock,
-            "team.collect",
-            json!({
-                "team_name": team, "lines": lines,
-            }),
-        ),
-        Commands::Reports => rpc_call(&sock, "team.result.collect", json!({ "team_name": team })),
+        Commands::Collect {
+            lines,
+            headers,
+            summary,
+        } => {
+            if headers || summary {
+                rpc_call(&sock, "team.result.collect", json!({ "team_name": team }))
+                    .map(|resp| compact_result_collect_response(resp, summary))
+            } else {
+                rpc_call(
+                    &sock,
+                    "team.collect",
+                    json!({
+                        "team_name": team, "lines": lines,
+                    }),
+                )
+            }
+        }
+        Commands::Reports { headers, summary } => {
+            rpc_call(&sock, "team.result.collect", json!({ "team_name": team })).map(|resp| {
+                if headers || summary {
+                    compact_result_collect_response(resp, summary)
+                } else {
+                    resp
+                }
+            })
+        }
         Commands::ResultStatus => {
             rpc_call(&sock, "team.result.status", json!({ "team_name": team }))
         }
-        Commands::ResultCollect => {
-            rpc_call(&sock, "team.result.collect", json!({ "team_name": team }))
+        Commands::ResultCollect { headers, summary } => {
+            rpc_call(&sock, "team.result.collect", json!({ "team_name": team })).map(|resp| {
+                if headers || summary {
+                    compact_result_collect_response(resp, summary)
+                } else {
+                    resp
+                }
+            })
         }
         // ── Orchestration commands ──────────────────────────────
         Commands::Create {
