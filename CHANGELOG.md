@@ -2,6 +2,29 @@
 
 All notable changes to term-mesh are documented here.
 
+## [0.105.0] - 2026-05-10
+
+### Added
+- **Cost-aware bulk action buttons in team creation** — three new buttons (💎 최대 성능 / ⚖️ 균형 / 💰 최소 비용) above the Agents list set every agent's tier in one click. "최대 성능" pushes everyone to `opus`, "최소 비용" drops everyone to `haiku`, and "균형" re-applies the currently selected Smart Preset's per-role tier distribution (or falls back to `sonnet` when no Smart Preset is active). Useful for dialing the session's compute budget without editing each agent row by hand.
+- **Compact agent runbook digest** — `tm-agent runbook digest` returns a token-efficient role brief instead of the full runbook source, and the default agent init prompt now uses the digest. Set `TERMMESH_RUNBOOK_MODE=full` to opt back into the full source for debugging role behaviour.
+
+### Changed
+- **Codex agents now default to GPT-5.5 with tier-based reasoning effort** — the previous `gpt-5.4` and `gpt-5.1-codex-mini` identifiers are no longer accepted by current ChatGPT accounts. All three short tiers (`opus` / `sonnet` / `haiku`) now map to `gpt-5.5` and dispatch the reasoning level separately as `high` / `medium` / `low` via `-c model_reasoning_effort=…`, so tier ordering is meaningful even though the underlying model is the same.
+- **Gemini agents use Gemini 3 series previews** — `gemini-3.1-pro-preview` (opus), `gemini-3-flash-preview` (sonnet), `gemini-3.1-flash-lite-preview` (haiku) replace the previously hard-coded `gemini-3.1-pro` / `gemini-3-flash` identifiers that 404'd against current accounts. The Gemini 2.5 family stays selectable as a fallback in the model picker.
+- **Kiro agents use the dotted model identifier format** — `claude-opus-4.7` / `claude-sonnet-4.6` / `claude-haiku-4.5` replace the previous `claude-opus-4-6-20250618` style strings that `kiro-cli` no longer accepts.
+- **Smart Presets prefer Claude over Kiro for `architect` and `infra` roles** — when both CLIs are available, Claude is the safer default; Kiro stays available as a manual choice in the picker. Affected presets: `architect`, `quality`, `aws`, `idea`, `security-audit`, `api-factory`.
+- **Smart Presets' `reviewer` role is now codex/opus (high reasoning)** — code review is where the extra reasoning budget pays off the most. Affected presets: `standard`, `architect`, `fullstack`, `refactor`, `quality`, `security-audit`, `migration`.
+- **Codex and Gemini model pickers show CLI-native labels** — picking the `opus` tier under codex now displays as `gpt-5.5 (high)`, under gemini as `gemini-3.1-pro-preview`. Internal storage still uses the tier name so Smart Presets and saved roles round-trip without breakage.
+- **Compact task capsule protocol for `tm-agent delegate`** — delegated tasks now ship a `TM-PROTOCOL-v1` capsule instead of re-stating the full lifecycle instructions per task, freeing context budget for the actual work.
+
+### Fixed
+- **Codex reasoning effort flag is no longer injected for non-tier model identifiers** — selecting `gpt-5.3-codex` (or any other passthrough name) used to add an unwanted `-c model_reasoning_effort=medium` argument on the headless daemon spawn path. The flag is now only added for tier names that actually map to a reasoning level, matching the Swift app's existing behaviour.
+- **Reviewer agent's codex model picker no longer renders empty** — Smart Presets now write `primaryModel="opus"` for the codex reviewer, the picker recognises that selection, and the row shows `gpt-5.5 (high)` instead of an empty box.
+
+### Thanks to 1 contributor!
+
+- [@JINWOO-J](https://github.com/JINWOO-J)
+
 ## [0.104.1] - 2026-05-10
 
 ### Fixed
