@@ -1,0 +1,22 @@
+#!/bin/sh
+# Strips fenced code-block marker lines (``` or ```lang) from commit messages.
+# Inline backticks (`code`) are preserved.
+
+MSG_FILE="$1"
+
+if [ -z "$MSG_FILE" ] || [ ! -f "$MSG_FILE" ]; then
+  echo "commit-msg: cannot read message file" >&2
+  exit 1
+fi
+
+TMP_FILE=$(mktemp "${TMPDIR:-/tmp}/commit-msg.XXXXXX") || exit 1
+trap 'rm -f "$TMP_FILE"' EXIT INT TERM
+
+awk '
+  /^[[:space:]]*```/ { next }
+  { print }
+' "$MSG_FILE" > "$TMP_FILE" || exit 1
+
+mv "$TMP_FILE" "$MSG_FILE" || exit 1
+
+exit 0

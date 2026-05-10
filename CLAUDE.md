@@ -10,6 +10,12 @@ Run the setup script to initialize submodules, install Metal Toolchain, and buil
 
 This handles: submodule init, Metal Toolchain download, xcframework-* tag cleanup, GhosttyKit build (cached per ghostty SHA), and symlink creation.
 
+Activate project git hooks once per clone (strips code-block markers from commit messages):
+
+```bash
+git config core.hooksPath .githooks
+```
+
 ## Syncing submodules on a fresh pull (multi-machine)
 
 **IMPORTANT:** The `ghostty` submodule is pinned to `JINWOO-J/ghostty` (personal fork).
