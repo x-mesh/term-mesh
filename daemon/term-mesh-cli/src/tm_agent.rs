@@ -33,19 +33,25 @@ const BROADCAST_SUFFIX: &str = concat!(
 fn agent_init_prompt(agent_name: &str, agent_role: &str, workdir: &str, socket: &str) -> String {
     let root = Path::new(workdir);
     let runbook_mode = env::var("TERMMESH_RUNBOOK_MODE").unwrap_or_else(|_| "digest".to_string());
+    let runbook_mode = runbook_mode.trim();
     let role = selected_runbook_roles(Some(agent_role))
         .ok()
         .and_then(|mut roles| roles.pop());
-    let runbook_section = if runbook_mode == "full" {
+    let runbook_section = if runbook_mode.eq_ignore_ascii_case("full") {
         load_runbook_content_for_role(root, agent_role)
             .map(|content| format!("\n## Role Runbook\n\n{content}\n"))
             .unwrap_or_default()
     } else if let Some(role) = role {
         format!("\n{}\n", runbook_digest_content(root, &role))
     } else {
-        load_runbook_content_for_role(root, agent_role)
-            .map(|content| format!("\n## Runbook Digest\nROLE: {agent_role}\nOUTPUT: STATUS/FILES/VERIFY/NEXT/FULL_REPORT\nFULL: .agent-runbooks/{agent_role}.md\n\n{content}\n"))
-            .unwrap_or_default()
+        format!(
+            "\n{}\n",
+            runbook_digest_content_for_role_name(
+                root,
+                agent_role,
+                load_runbook_content_for_role(root, agent_role).as_deref()
+            )
+        )
     };
     let identity_line = if agent_name == agent_role {
         format!("You are a team agent named \"{agent_name}\" with role \"{agent_role}\" in a term-mesh multi-agent team.")
@@ -1525,6 +1531,58 @@ FULL: {full}
     )
 }
 
+fn runbook_digest_content_for_role_name(
+    root: &Path,
+    role_name: &str,
+    source: Option<&str>,
+) -> String {
+    let safe_role_name: String = role_name
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
+        .collect();
+    let safe_role_name = if safe_role_name.is_empty() {
+        "agent".to_string()
+    } else {
+        safe_role_name
+    };
+    let full = root
+        .join(RUNBOOK_SOURCE_DIR)
+        .join(format!("{safe_role_name}.md"))
+        .to_string_lossy()
+        .to_string();
+    let content = source.unwrap_or("");
+    let when = runbook_section_bullets(content, "## When To Use", 2).join(" | ");
+    let must = runbook_section_bullets(content, "## Operating Rules", 3).join(" | ");
+    let verify = runbook_section_bullets(content, "## Verify", 2).join(" | ");
+    format!(
+        "\
+<!-- term-mesh-runbook-digest v1 -->
+## Runbook Digest
+ROLE: {safe_role_name}
+WHEN: {when}
+MUST: {must}
+VERIFY: {verify}
+OUTPUT: STATUS/FILES/VERIFY/NEXT/FULL_REPORT
+FULL: {full}
+",
+        when = if when.is_empty() {
+            format!("Use for assigned {safe_role_name} role work.")
+        } else {
+            when
+        },
+        must = if must.is_empty() {
+            "Follow the leader's task instructions and repo constraints.".to_string()
+        } else {
+            must
+        },
+        verify = if verify.is_empty() {
+            "Report a concrete verify command or n/a.".to_string()
+        } else {
+            verify
+        },
+    )
+}
+
 fn runbook_readme_path(root: &Path) -> PathBuf {
     root.join(RUNBOOK_SOURCE_DIR).join("README.md")
 }
@@ -2001,6 +2059,49 @@ mod runbook_tests {
         assert!(digest.contains("FULL:"));
 
         fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn unknown_role_digest_does_not_inline_full_runbook() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = env::temp_dir().join(format!("tm-agent-runbook-custom-digest-{unique}"));
+        let runbook_dir = dir.join(RUNBOOK_SOURCE_DIR);
+        fs::create_dir_all(&runbook_dir).unwrap();
+        fs::write(
+            runbook_dir.join("custom.md"),
+            "## When To Use\n- Custom when\n\n## Operating Rules\n- Custom must\n\nLONG BODY SHOULD NOT INLINE\n",
+        )
+        .unwrap();
+
+        let digest = runbook_digest_content_for_role_name(
+            &dir,
+            "custom",
+            load_runbook_content_for_role(&dir, "custom").as_deref(),
+        );
+        assert!(digest.contains("ROLE: custom"));
+        assert!(digest.contains("Custom must"));
+        assert!(!digest.contains("LONG BODY SHOULD NOT INLINE"));
+
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn truncate_summary_counts_unicode_chars() {
+        assert_eq!(truncate_summary("가나다라마", 3), "가나다...");
+        assert_eq!(truncate_summary("abc", 3), "abc");
+    }
+
+    #[test]
+    fn reply_summary_strips_one_summary_prefix_and_keeps_first_header() {
+        let (headers, summary) = reply_header_and_summary(
+            "STATUS: DONE\nSTATUS: BLOCKED\nFILES: none\nVERIFY: n/a\nNEXT: NONE\nFULL_REPORT: n/a\n\nSUMMARY:SUMMARY: keep",
+            200,
+        );
+        assert_eq!(headers["status"].as_str(), Some("DONE"));
+        assert_eq!(summary, "SUMMARY: keep");
     }
 
     #[test]
@@ -2518,9 +2619,10 @@ fn format_task_instruction(
     context: Option<&str>,
     fix_budget: Option<u8>,
 ) -> String {
+    let task_id = task["id"].as_str().unwrap_or("");
     let mut lines = vec![
         "## Task Capsule".to_string(),
-        format!("TASK_ID: {}", task["id"].as_str().unwrap_or("")),
+        format!("TASK_ID: {task_id}"),
         format!("TASK_TITLE: {}", task["title"].as_str().unwrap_or("")),
         format!(
             "TASK_STATUS: {}",
@@ -2561,7 +2663,20 @@ fn format_task_instruction(
                             dep_task["result"].as_str().map(String::from)
                         };
                         if let Some(text) = content {
+                            let dep_ref = write_result_file(
+                                team,
+                                &format!("{task_id}-dep-{dep_id}.md"),
+                                &text,
+                            )
+                            .map(|p| p.to_string_lossy().to_string());
                             let truncated = truncate_summary(&text, 600);
+                            if let Ok(path) = dep_ref.as_ref() {
+                                lines.push(format!("DEP_REF: {dep_id} {path}"));
+                            } else if let Err(err) = dep_ref.as_ref() {
+                                eprintln!(
+                                    "warning: failed to write dependency result ref for {dep_id}: {err}"
+                                );
+                            }
                             lines.push(format!("\n[DEP_RESULT: {dep_id}]"));
                             lines.push(truncated);
                             lines.push(format!("[/DEP_RESULT]"));
@@ -2576,15 +2691,17 @@ fn format_task_instruction(
             lines.push(format!("[TASK_DESCRIPTION] {desc}"));
         }
     }
-    let task_id = task["id"].as_str().unwrap_or("");
     if let Some(ctx) = context {
         let context_ref = write_result_file(team, &format!("{task_id}-context.md"), ctx)
-            .ok()
             .map(|p| p.to_string_lossy().to_string());
-        let truncated = truncate_summary(ctx, 500);
+        let truncated = truncate_summary(ctx, if context_ref.is_ok() { 500 } else { 3000 });
         lines.push(String::new());
-        if let Some(path) = context_ref {
-            lines.push(format!("CONTEXT_REF: {path}"));
+        match context_ref {
+            Ok(path) => lines.push(format!("CONTEXT_REF: {path}")),
+            Err(err) => {
+                eprintln!("warning: failed to write context ref for task {task_id}: {err}");
+                lines.push(format!("CONTEXT_REF_ERROR: {err}"));
+            }
         }
         lines.push("[CONTEXT_SUMMARY]".to_string());
         lines.push(truncated);
@@ -2654,14 +2771,10 @@ fn write_result_file(team: &str, filename: &str, content: &str) -> Result<PathBu
 }
 
 fn truncate_summary(content: &str, max_chars: usize) -> String {
-    if content.len() <= max_chars {
+    if content.chars().count() <= max_chars {
         return content.to_string();
     }
-    let mut end = max_chars;
-    while end > 0 && !content.is_char_boundary(end) {
-        end -= 1;
-    }
-    format!("{}...", &content[..end])
+    format!("{}...", content.chars().take(max_chars).collect::<String>())
 }
 
 fn reply_header_and_summary(content: &str, summary_chars: usize) -> (Value, String) {
@@ -2673,7 +2786,9 @@ fn reply_header_and_summary(content: &str, summary_chars: usize) -> (Value, Stri
         let mut matched = false;
         for key in header_keys {
             if let Some(value) = trimmed.strip_prefix(&format!("{key}:")) {
-                headers.insert(key.to_ascii_lowercase(), json!(value.trim()));
+                headers
+                    .entry(key.to_ascii_lowercase())
+                    .or_insert_with(|| json!(value.trim()));
                 matched = true;
                 break;
             }
@@ -2687,10 +2802,11 @@ fn reply_header_and_summary(content: &str, summary_chars: usize) -> (Value, Stri
             .entry(key.to_ascii_lowercase())
             .or_insert_with(|| json!("n/a"));
     }
-    let body = body_lines
-        .join("\n")
-        .trim()
-        .trim_start_matches("SUMMARY:")
+    let joined = body_lines.join("\n");
+    let body = joined.trim();
+    let body = body
+        .strip_prefix("SUMMARY:")
+        .unwrap_or(body)
         .trim()
         .to_string();
     (

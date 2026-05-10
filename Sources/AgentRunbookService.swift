@@ -303,10 +303,9 @@ final class AgentRunbookService: @unchecked Sendable {
 
     private func presetRoutingDigest(_ preset: String) -> String {
         let firstLine = preset
-            .split(separator: "\n", omittingEmptySubsequences: true)
-            .first
-            .map(String.init)?
-            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            .components(separatedBy: .newlines)
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .first { !$0.isEmpty } ?? ""
         guard !firstLine.isEmpty else { return "" }
         return """
         ## Role Routing Digest
