@@ -2897,9 +2897,12 @@ class TerminalController {
 
         // Create task + send instruction on MainActor, then await paste-completion ack.
         // Continuation resumes when finalizePaste fires (via sendIMETextResult callback)
-        // or after a 6s safety timeout (shorter than the 8s paste watchdog).
+        // or after a 12s last-resort timeout. Timeout must exceed paste watchdog (8s)
+        // plus max retry backoff (~2s) to avoid racing a still-live paste in the queue.
+        // Primary completion path is the watchdog's finalizePaste; 12s is a dead-man switch
+        // for cases where completion is never called due to a deeper bug.
         // The Rust CLI sends Return via team.send_key only after receiving this ack,
-        // eliminating the race between paste flush and the 150ms fixed sleep.
+        // eliminating the race between paste flush and the previous 150ms fixed sleep.
         var capturedDelegateResult: TeamOrchestrator.DelegateResult? = nil
         let textDelivered: Bool = await withCheckedContinuation { cont in
             var resumed = false
@@ -2908,7 +2911,7 @@ class TerminalController {
                 resumed = true
                 cont.resume(returning: ok)
             }
-            DispatchQueue.main.asyncAfter(deadline: .now() + 6.0) { resume(false) }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 12.0) { resume(false) }
             Task { @MainActor in
                 let tabManager = TeamOrchestrator.shared.resolveTabManager(teamName: teamName) ?? self.tabManager
                 guard let tabManager else { resume(false); return }

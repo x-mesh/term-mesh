@@ -1937,8 +1937,8 @@ final class TeamOrchestrator: ObservableObject {
 
     /// Send text to a specific agent in a team.
     func sendToAgent(teamName: String, agentName: String, text: String, tabManager: TabManager, withReturn: Bool = true, completion: ((Bool) -> Void)? = nil) -> Bool {
-        guard let team = teams[teamName] else { return false }
-        guard let agent = team.agents.first(where: { $0.name == agentName }) else { return false }
+        guard let team = teams[teamName] else { completion?(false); return false }
+        guard let agent = team.agents.first(where: { $0.name == agentName }) else { completion?(false); return false }
         return sendTextToPanel(workspaceId: agent.workspaceId, panelId: agent.panelId, text: text, tabManager: tabManager, withReturn: withReturn, completion: completion)
     }
 
@@ -2208,7 +2208,9 @@ final class TeamOrchestrator: ObservableObject {
 #if DEBUG
             dlog("[team.sendTextToPanel] text empty after trim, sending Return key only panelId=\(panelId.uuidString.prefix(8))")
 #endif
-            return panel.surface.sendIMEText("", withReturn: true)
+            let sent = panel.surface.sendIMEText("", withReturn: true)
+            completion?(sent)
+            return sent
         }
 
         // Surface readiness check — if the underlying ghostty surface is nil,
