@@ -20,9 +20,9 @@ struct AgentRolePreset: Identifiable, Codable, Equatable {
         case "claude", "kiro":
             return ["sonnet", "opus", "haiku"]
         case "codex":
-            return ["gpt-5.4", "gpt-5.3-codex", "gpt-5.2-codex", "gpt-5.2", "gpt-5.1-codex-max", "gpt-5.1-codex-mini"]
+            return ["gpt-5.5", "gpt-5.3-codex", "gpt-5.2-codex", "gpt-5.2", "gpt-5.1-codex-max", "gpt-5.1-codex-mini"]
         case "gemini":
-            return ["gemini-3.1-pro", "gemini-3.1-pro-preview", "gemini-3-flash-preview", "gemini-2.5-pro", "gemini-2.5-flash", "gemini-2.5-flash-lite"]
+            return ["gemini-2.5-pro", "gemini-2.5-flash", "gemini-2.5-flash-lite"]
         default:
             return ["sonnet", "opus", "haiku"]
         }
@@ -39,8 +39,8 @@ struct AgentRolePreset: Identifiable, Codable, Equatable {
     /// Default model for a given CLI.
     static func defaultModel(for cli: String) -> String {
         switch cli {
-        case "codex":  return "gpt-5.4"
-        case "gemini": return "gemini-3.1-pro-preview"
+        case "codex":  return "gpt-5.5"
+        case "gemini": return "gemini-2.5-pro"
         default:       return "sonnet"
         }
     }

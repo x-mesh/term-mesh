@@ -104,9 +104,9 @@ pub fn build_claude_command(
 /// Map short model names to Kiro CLI model identifiers.
 fn kiro_model_name(short: &str) -> &str {
     match short.to_lowercase().as_str() {
-        "opus" => "claude-opus-4-6-20250618",
-        "sonnet" => "claude-sonnet-4-6-20250514",
-        "haiku" => "claude-haiku-4-5-20251001",
+        "opus" => "claude-opus-4.7",
+        "sonnet" => "claude-sonnet-4.6",
+        "haiku" => "claude-haiku-4.5",
         _ => short,
     }
 }
@@ -179,12 +179,22 @@ fn write_kiro_profile(profile_name: &str, description: &str, prompt: &str) {
 }
 
 /// Map short model names to Codex CLI model identifiers.
+/// All tiers use gpt-5.5; differentiation happens via reasoning effort
+/// (see codex_reasoning_effort).
 fn codex_model_name(short: &str) -> &str {
     match short.to_lowercase().as_str() {
-        "opus" => "gpt-5.4",
-        "sonnet" => "gpt-5.4",
-        "haiku" => "gpt-5.1-codex-mini",
+        "opus" | "sonnet" | "haiku" => "gpt-5.5",
         _ => short,
+    }
+}
+
+/// Map short model tier to Codex reasoning effort.
+fn codex_reasoning_effort(short: &str) -> &str {
+    match short.to_lowercase().as_str() {
+        "opus" => "high",
+        "sonnet" => "medium",
+        "haiku" => "low",
+        _ => "medium",
     }
 }
 
@@ -207,6 +217,8 @@ pub fn build_codex_command(
         "danger-full-access".into(),
         "--model".into(),
         codex_model.to_string(),
+        "-c".into(),
+        format!("model_reasoning_effort={}", codex_reasoning_effort(model)).into(),
         "--json".into(),
         "-".into(), // read prompt from stdin
     ];
@@ -223,9 +235,9 @@ pub fn build_codex_command(
 /// Map short model names to Gemini CLI model identifiers.
 fn gemini_model_name(short: &str) -> &str {
     match short.to_lowercase().as_str() {
-        "opus" => "gemini-3.1-pro",
-        "sonnet" => "gemini-3-flash",
-        "haiku" => "gemini-3-flash",
+        "opus" => "gemini-2.5-pro",
+        "sonnet" => "gemini-2.5-flash",
+        "haiku" => "gemini-2.5-flash-lite",
         _ => short,
     }
 }
