@@ -60,3 +60,6 @@ daemon/.omc/
 # x-kit / x-mesh local state
 .xm/
 daemon/.xm/
+
+# Machine-local Claude Code scheduler state
+.claude/scheduled_tasks.lock
