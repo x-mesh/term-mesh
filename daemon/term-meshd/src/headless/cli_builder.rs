@@ -189,12 +189,13 @@ fn codex_model_name(short: &str) -> &str {
 }
 
 /// Map short model tier to Codex reasoning effort.
-fn codex_reasoning_effort(short: &str) -> &str {
+/// Returns None for non-tier names so unknown/passthrough models don't get the flag injected.
+fn codex_reasoning_effort(short: &str) -> Option<&str> {
     match short.to_lowercase().as_str() {
-        "opus" => "high",
-        "sonnet" => "medium",
-        "haiku" => "low",
-        _ => "medium",
+        "opus" => Some("high"),
+        "sonnet" => Some("medium"),
+        "haiku" => Some("low"),
+        _ => None,
     }
 }
 
@@ -211,17 +212,19 @@ pub fn build_codex_command(
     let program = resolve_cli_path(cli_path, "CODEX_PATH", "codex");
 
     let codex_model = codex_model_name(model);
-    let args = vec![
+    let mut args: Vec<String> = vec![
         "exec".into(),
         "--sandbox".into(),
         "danger-full-access".into(),
         "--model".into(),
         codex_model.to_string(),
-        "-c".into(),
-        format!("model_reasoning_effort={}", codex_reasoning_effort(model)).into(),
-        "--json".into(),
-        "-".into(), // read prompt from stdin
     ];
+    if let Some(effort) = codex_reasoning_effort(model) {
+        args.push("-c".into());
+        args.push(format!("model_reasoning_effort={effort}"));
+    }
+    args.push("--json".into());
+    args.push("-".into()); // read prompt from stdin
 
     let env = base_env(name, team_name, daemon_socket, app_socket_path);
     CliCommand {
