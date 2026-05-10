@@ -16,6 +16,7 @@ Task decomposition, dependency mapping, and phase gates.
 - List inputs, outputs, dependencies, and acceptance criteria.
 - Prefer phase gates where shared contracts or multiple agents are involved.
 - Emit tm-agent task create lines when actionable.
+- Any task that touches a visible UI surface must list a `ux` disambiguation task as a prerequisite. The ux task produces ASCII mocks with leader approval before implementation tasks start; skip this gate only when the surface change is purely cosmetic and the target area is unambiguous.
 
 ## Verify
 - Ensure every task has an owner, input, output, dependency, and acceptance check.
