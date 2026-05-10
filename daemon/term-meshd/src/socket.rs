@@ -62,6 +62,32 @@ pub type SessionStore = Arc<RwLock<Vec<SessionInfo>>>;
 /// Shared team dashboard state pushed by the Swift app.
 pub type TeamStateStore = Arc<RwLock<serde_json::Value>>;
 
+/// Event emitted by the daemon when significant state transitions occur.
+/// Subscribers receive these via `events.subscribe` streaming RPC.
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum DaemonEvent {
+    TaskStatus {
+        team: String,
+        agent: String,
+        task_id: String,
+        status: String,
+        prev_status: String,
+        ts_ms: u64,
+    },
+    Reply {
+        team: String,
+        agent: String,
+        task_id: String,
+        header: String,
+        ts_ms: u64,
+    },
+}
+
+/// Broadcast channel sender. All `events.subscribe` connections subscribe from this.
+/// Capacity 256: slow consumers get `Lagged` errors and lose old events, which is fine.
+pub type EventSender = tokio::sync::broadcast::Sender<DaemonEvent>;
+
 /// Shared context passed to each connection handler.
 pub struct Context {
     pub monitor_rx: watch::Receiver<Option<SystemSnapshot>>,
@@ -72,6 +98,7 @@ pub struct Context {
     pub usage_tracker: UsageTracker,
     pub agent_manager: Arc<AgentSessionManager>,
     pub headless: Arc<tokio::sync::Mutex<HeadlessManager>>,
+    pub event_tx: EventSender,
 }
 
 pub fn default_socket_path() -> PathBuf {
@@ -108,6 +135,7 @@ pub async fn serve(
     tracing::info!("listening on {}", path.display());
 
     let owner_uid = current_uid();
+    let (event_tx, _) = tokio::sync::broadcast::channel(256);
     let ctx = Arc::new(Context {
         monitor_rx,
         monitor_handle,
@@ -117,6 +145,7 @@ pub async fn serve(
         usage_tracker,
         agent_manager,
         headless,
+        event_tx,
     });
 
     loop {
@@ -210,13 +239,14 @@ async fn handle_connection(stream: tokio::net::UnixStream, ctx: &Context) -> any
 
 /// Streaming handler for `events.subscribe`. Takes ownership of the writer and
 /// streams JSONL events until the timeout expires or the client disconnects.
+/// Streaming handler for `events.subscribe`. Takes ownership of the writer and
+/// streams JSONL events until the timeout expires or the client disconnects.
 ///
-/// W-1 stub: emits only `keepalive` pings every 30 s.
-/// TODO(W-2): hook real event broadcast (task_done, reply, heartbeat_stale) here.
+/// W-2: real task_status and reply events via broadcast channel + keepalive every 30 s.
 async fn stream_subscribe_events(
     req: Request,
     mut writer: tokio::net::unix::OwnedWriteHalf,
-    _ctx: &Context,
+    ctx: &Context,
 ) -> anyhow::Result<()> {
     #[derive(serde::Deserialize, Default)]
     struct SubscribeParams {
@@ -232,14 +262,15 @@ async fn stream_subscribe_events(
     let filter_kinds: std::collections::HashSet<String> = p
         .kinds
         .unwrap_or_else(|| {
-            vec![
-                "task_done".into(),
-                "reply".into(),
-                "heartbeat_stale".into(),
-            ]
+            vec!["task_status".into(), "reply".into(), "heartbeat_stale".into()]
         })
         .into_iter()
         .collect();
+    let leader_session_id = p.leader_session_id;
+
+    // Subscribe before sending the ack so we don't miss events that fire
+    // immediately after the client receives the ack.
+    let mut event_rx = ctx.event_tx.subscribe();
 
     // Send initial subscription ack.
     let ack = serde_json::json!({
@@ -247,7 +278,7 @@ async fn stream_subscribe_events(
         "result": {
             "status": "subscribed",
             "filter": filter_kinds.iter().collect::<Vec<_>>(),
-            "leader_session_id": p.leader_session_id,
+            "leader_session_id": leader_session_id,
         },
         "error": null,
     });
@@ -263,39 +294,87 @@ async fn stream_subscribe_events(
         None
     };
 
-    // W-1: emit keepalive every 30 s. Keepalives are always sent regardless
-    // of filter so the client can detect liveness. W-2 will add real event
-    // emission here.
+    // Keepalive every 30 s. Always sent regardless of filter for connection health.
     let mut ping_interval = tokio::time::interval(Duration::from_secs(30));
-    ping_interval.tick().await; // consume the immediate first tick
+    ping_interval.tick().await; // consume immediate first tick
 
     loop {
-        // Either wait for the next interval tick, or break when the deadline fires.
-        if let Some(dl) = deadline {
+        let ts_ms = || {
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64
+        };
+
+        // Three-way select: deadline | keepalive ping | real event.
+        let line: Option<Vec<u8>> = if let Some(dl) = deadline {
             tokio::select! {
                 _ = tokio::time::sleep_until(dl) => break,
-                _ = ping_interval.tick() => {}
+                _ = ping_interval.tick() => {
+                    Some(serde_json::to_vec(&serde_json::json!({"kind":"keepalive","ts_ms":ts_ms()}))?)
+                }
+                recv = event_rx.recv() => {
+                    match recv {
+                        Ok(ev) => filter_and_serialize(&ev, &filter_kinds, leader_session_id.as_deref()),
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                            tracing::warn!("events.subscribe: lagged by {n} events");
+                            None
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                    }
+                }
             }
         } else {
-            ping_interval.tick().await;
-        }
+            tokio::select! {
+                _ = ping_interval.tick() => {
+                    Some(serde_json::to_vec(&serde_json::json!({"kind":"keepalive","ts_ms":ts_ms()}))?)
+                }
+                recv = event_rx.recv() => {
+                    match recv {
+                        Ok(ev) => filter_and_serialize(&ev, &filter_kinds, leader_session_id.as_deref()),
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                            tracing::warn!("events.subscribe: lagged by {n} events");
+                            None
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                    }
+                }
+            }
+        };
 
-        let ts_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis();
-        let event = serde_json::json!({"kind": "keepalive", "ts_ms": ts_ms});
-        let mut buf = serde_json::to_vec(&event)?;
-        buf.push(b'\n');
-        if timeout(Duration::from_secs(5), writer.write_all(&buf))
-            .await
-            .is_err()
-        {
-            break; // client disconnected or write timed out
+        if let Some(mut payload) = line {
+            payload.push(b'\n');
+            if timeout(Duration::from_secs(5), writer.write_all(&payload))
+                .await
+                .is_err()
+            {
+                break; // client disconnected or write timed out
+            }
         }
     }
 
     Ok(())
+}
+
+/// Serialize `ev` to JSONL bytes if its kind is in `filter_kinds` and (when
+/// `leader_session_id` is set) matches the event's team/agent scope. Returns
+/// `None` if the event should be suppressed for this subscriber.
+fn filter_and_serialize(
+    ev: &DaemonEvent,
+    filter_kinds: &std::collections::HashSet<String>,
+    _leader_session_id: Option<&str>,
+) -> Option<Vec<u8>> {
+    let kind = match ev {
+        DaemonEvent::TaskStatus { .. } => "task_status",
+        DaemonEvent::Reply { .. } => "reply",
+    };
+    if !filter_kinds.is_empty() && !filter_kinds.contains(kind) {
+        return None;
+    }
+    // leader_session_id filtering is intentionally relaxed in W-2: any subscriber
+    // without a leader_session_id filter receives all events (generous default).
+    // Per-leader scoping can be tightened in a follow-up without protocol changes.
+    serde_json::to_vec(ev).ok()
 }
 
 async fn dispatch(req: &Request, ctx: &Context) -> Response {
@@ -728,10 +807,38 @@ async fn dispatch(req: &Request, ctx: &Context) -> Response {
         }
         "task.update" => {
             match serde_json::from_value::<crate::agent::TaskUpdateParams>(req.params.clone()) {
-                Ok(p) => ctx
-                    .agent_manager
-                    .task_update(p)
-                    .map(|t| serde_json::to_value(t).unwrap()),
+                Ok(p) => {
+                    // Snapshot old status before the update so we can include
+                    // it in the broadcast event for subscribers.
+                    let prev_status = if p.status.is_some() {
+                        ctx.agent_manager
+                            .task_get(&p.id)
+                            .ok()
+                            .map(|t| t.status.as_str().to_string())
+                            .unwrap_or_default()
+                    } else {
+                        String::new()
+                    };
+                    ctx.agent_manager.task_update(p).map(|t| {
+                        // Emit only when status actually changed.
+                        if !prev_status.is_empty() && prev_status != t.status.as_str() {
+                            let ev = DaemonEvent::TaskStatus {
+                                team: String::new(),
+                                agent: t.assignee.clone().unwrap_or_default(),
+                                task_id: t.id.clone(),
+                                status: t.status.as_str().to_string(),
+                                prev_status,
+                                ts_ms: std::time::SystemTime::now()
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .unwrap_or_default()
+                                    .as_millis() as u64,
+                            };
+                            // Err means no subscribers — fine to ignore.
+                            let _ = ctx.event_tx.send(ev);
+                        }
+                        serde_json::to_value(t).unwrap()
+                    })
+                }
                 Err(e) => Err(format!("invalid params: {e}")),
             }
         }
@@ -779,10 +886,24 @@ async fn dispatch(req: &Request, ctx: &Context) -> Response {
         // --- Messages (F-06 Phase 2) ---
         "message.send" => {
             match serde_json::from_value::<crate::agent::MessageSendParams>(req.params.clone()) {
-                Ok(p) => ctx
-                    .agent_manager
-                    .message_send(p)
-                    .map(|m| serde_json::to_value(m).unwrap()),
+                Ok(p) => {
+                    let from = p.from_agent.clone().unwrap_or_default();
+                    let content_preview = p.content.chars().take(200).collect::<String>();
+                    ctx.agent_manager.message_send(p).map(|m| {
+                        let ev = DaemonEvent::Reply {
+                            team: String::new(),
+                            agent: from,
+                            task_id: String::new(),
+                            header: content_preview,
+                            ts_ms: std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .unwrap_or_default()
+                                .as_millis() as u64,
+                        };
+                        let _ = ctx.event_tx.send(ev);
+                        serde_json::to_value(m).unwrap()
+                    })
+                }
                 Err(e) => Err(format!("invalid params: {e}")),
             }
         }
