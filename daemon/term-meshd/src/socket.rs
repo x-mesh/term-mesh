@@ -189,6 +189,13 @@ async fn handle_connection(stream: tokio::net::UnixStream, ctx: &Context) -> any
         };
 
         tracing::debug!("req: {} {:?}", req.method, req.params);
+
+        // Streaming handlers hold the writer for their lifetime and must
+        // exit handle_connection entirely — they cannot share the loop.
+        if req.method == "events.subscribe" {
+            return stream_subscribe_events(req, writer, ctx).await;
+        }
+
         let resp = dispatch(&req, ctx).await;
 
         let mut buf = serde_json::to_vec(&resp)?;
@@ -196,6 +203,96 @@ async fn handle_connection(stream: tokio::net::UnixStream, ctx: &Context) -> any
         timeout(Duration::from_secs(5), writer.write_all(&buf))
             .await
             .map_err(|_| anyhow::anyhow!("write timeout"))??;
+    }
+
+    Ok(())
+}
+
+/// Streaming handler for `events.subscribe`. Takes ownership of the writer and
+/// streams JSONL events until the timeout expires or the client disconnects.
+///
+/// W-1 stub: emits only `keepalive` pings every 30 s.
+/// TODO(W-2): hook real event broadcast (task_done, reply, heartbeat_stale) here.
+async fn stream_subscribe_events(
+    req: Request,
+    mut writer: tokio::net::unix::OwnedWriteHalf,
+    _ctx: &Context,
+) -> anyhow::Result<()> {
+    #[derive(serde::Deserialize, Default)]
+    struct SubscribeParams {
+        #[serde(default)]
+        kinds: Option<Vec<String>>,
+        #[serde(default)]
+        timeout: Option<u64>,
+        #[serde(default)]
+        leader_session_id: Option<String>,
+    }
+    let p: SubscribeParams = serde_json::from_value(req.params.clone()).unwrap_or_default();
+    let timeout_secs = p.timeout.unwrap_or(0);
+    let filter_kinds: std::collections::HashSet<String> = p
+        .kinds
+        .unwrap_or_else(|| {
+            vec![
+                "task_done".into(),
+                "reply".into(),
+                "heartbeat_stale".into(),
+            ]
+        })
+        .into_iter()
+        .collect();
+
+    // Send initial subscription ack.
+    let ack = serde_json::json!({
+        "id": req.id,
+        "result": {
+            "status": "subscribed",
+            "filter": filter_kinds.iter().collect::<Vec<_>>(),
+            "leader_session_id": p.leader_session_id,
+        },
+        "error": null,
+    });
+    let mut buf = serde_json::to_vec(&ack)?;
+    buf.push(b'\n');
+    timeout(Duration::from_secs(5), writer.write_all(&buf))
+        .await
+        .map_err(|_| anyhow::anyhow!("ack write timeout"))??;
+
+    let deadline = if timeout_secs > 0 {
+        Some(tokio::time::Instant::now() + Duration::from_secs(timeout_secs))
+    } else {
+        None
+    };
+
+    // W-1: emit keepalive every 30 s. Keepalives are always sent regardless
+    // of filter so the client can detect liveness. W-2 will add real event
+    // emission here.
+    let mut ping_interval = tokio::time::interval(Duration::from_secs(30));
+    ping_interval.tick().await; // consume the immediate first tick
+
+    loop {
+        // Either wait for the next interval tick, or break when the deadline fires.
+        if let Some(dl) = deadline {
+            tokio::select! {
+                _ = tokio::time::sleep_until(dl) => break,
+                _ = ping_interval.tick() => {}
+            }
+        } else {
+            ping_interval.tick().await;
+        }
+
+        let ts_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis();
+        let event = serde_json::json!({"kind": "keepalive", "ts_ms": ts_ms});
+        let mut buf = serde_json::to_vec(&event)?;
+        buf.push(b'\n');
+        if timeout(Duration::from_secs(5), writer.write_all(&buf))
+            .await
+            .is_err()
+        {
+            break; // client disconnected or write timed out
+        }
     }
 
     Ok(())

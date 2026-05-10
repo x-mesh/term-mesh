@@ -406,6 +406,18 @@ enum Commands {
         #[arg(long)]
         from: Option<String>,
     },
+    /// Stream events from the daemon as JSONL (push channel for leader sessions)
+    Watch {
+        /// Comma-separated event kinds to receive (default: task_done,reply,heartbeat_stale)
+        #[arg(long, value_name = "KINDS")]
+        on_event: Option<String>,
+        /// Stop after N seconds (default: 0 = run until Ctrl+C)
+        #[arg(long, default_value_t = 0)]
+        timeout: u32,
+        /// Filter to events belonging to a specific leader session
+        #[arg(long, value_name = "SESSION_ID")]
+        leader_session: Option<String>,
+    },
     /// Claim the next available pending task (work-stealing)
     Claim,
     /// Suggest the best agent for a task description based on capability mapping
@@ -3947,6 +3959,14 @@ fn main() {
             );
             return;
         }
+        Commands::Watch {
+            on_event,
+            timeout,
+            leader_session,
+        } => {
+            run_watch(&sock, timeout, on_event.as_deref(), leader_session.as_deref());
+            return;
+        }
         Commands::Claim => {
             run_claim(&sock, &team, &agent);
             return;
@@ -5845,6 +5865,106 @@ fn run_fan_out(
     // M1: exit with error if all delegates failed.
     if succeeded.is_empty() && !failed.is_empty() {
         process::exit(1);
+    }
+}
+
+/// Connect to the daemon's `events.subscribe` streaming endpoint and print
+/// each received JSONL event to stdout until timeout or Ctrl+C.
+fn run_watch(
+    sock: &PathBuf,
+    timeout_secs: u32,
+    on_event: Option<&str>,
+    leader_session: Option<&str>,
+) {
+    let kinds: Vec<&str> = on_event
+        .unwrap_or("task_done,reply,heartbeat_stale")
+        .split(',')
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .collect();
+
+    let request = json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "events.subscribe",
+        "params": {
+            "kinds": kinds,
+            "timeout": if timeout_secs > 0 { Some(timeout_secs as u64) } else { None::<u64> },
+            "leader_session_id": leader_session,
+        },
+    });
+
+    let stream = match UnixStream::connect(sock) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("error: cannot connect to daemon socket: {e}");
+            process::exit(1);
+        }
+    };
+
+    // Read timeout must outlast the daemon's keepalive interval (30 s) with margin.
+    // When a user-specified timeout is active, the daemon closes the connection,
+    // so the client's read will return EOF naturally.
+    let read_timeout_secs: u64 = if timeout_secs > 0 {
+        (timeout_secs as u64).saturating_add(10)
+    } else {
+        90
+    };
+    stream
+        .set_read_timeout(Some(Duration::from_secs(read_timeout_secs)))
+        .ok();
+    stream.set_write_timeout(Some(Duration::from_secs(10))).ok();
+
+    let mut writer = match stream.try_clone() {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("error: socket clone failed: {e}");
+            process::exit(1);
+        }
+    };
+
+    let mut payload =
+        serde_json::to_string(&request).expect("request serialization cannot fail");
+    payload.push('\n');
+    if let Err(e) = writer.write_all(payload.as_bytes()) {
+        eprintln!("error: failed to send subscribe request: {e}");
+        process::exit(1);
+    }
+    writer.flush().ok();
+
+    eprintln!("[watch] subscribed (kinds: {}, timeout: {}s)", kinds.join(","), timeout_secs);
+
+    let mut reader = BufReader::new(&stream);
+    let mut line = String::new();
+    loop {
+        line.clear();
+        match reader.read_line(&mut line) {
+            Ok(0) => break, // EOF — daemon closed the connection (timeout or shutdown)
+            Ok(_) => {
+                let trimmed = line.trim_end_matches('\n').trim_end_matches('\r');
+                if !trimmed.is_empty() {
+                    println!("{trimmed}");
+                }
+            }
+            Err(e) => {
+                use std::io::ErrorKind;
+                match e.kind() {
+                    ErrorKind::WouldBlock | ErrorKind::TimedOut => {
+                        // No data within read timeout — daemon may be quiet.
+                        // Continue waiting unless a hard timeout has been set.
+                        if timeout_secs > 0 {
+                            eprintln!("[watch] read timeout; exiting");
+                            break;
+                        }
+                        continue;
+                    }
+                    _ => {
+                        eprintln!("[watch] stream error: {e}");
+                        break;
+                    }
+                }
+            }
+        }
     }
 }
 
