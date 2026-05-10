@@ -208,7 +208,15 @@ mod tests {
 
     #[test]
     fn test_solve_prompt() {
-        let prompt = solve_prompt("Fix login bug", "/tmp/board.jsonl", 1, 3, 5, Some("bun test"), Some("src/auth.ts"));
+        let prompt = solve_prompt(
+            "Fix login bug",
+            "/tmp/board.jsonl",
+            1,
+            3,
+            5,
+            Some("bun test"),
+            Some("src/auth.ts"),
+        );
         assert!(prompt.contains("solver-1"));
         assert!(prompt.contains("bun test"));
         assert!(prompt.contains("src/auth.ts"));
@@ -217,7 +225,14 @@ mod tests {
 
     #[test]
     fn test_consensus_prompt() {
-        let prompt = consensus_prompt("REST vs GraphQL", "/tmp/board.jsonl", 2, 4, 4, Some("backend perspective"));
+        let prompt = consensus_prompt(
+            "REST vs GraphQL",
+            "/tmp/board.jsonl",
+            2,
+            4,
+            4,
+            Some("backend perspective"),
+        );
         assert!(prompt.contains("voice-2"));
         assert!(prompt.contains("backend perspective"));
         assert!(prompt.contains("Deliberation Loop"));
@@ -242,7 +257,9 @@ pub fn solve_prompt(
     target: Option<&str>,
 ) -> String {
     let verify_hint = match verify_cmd {
-        Some(cmd) => format!("\nVerification command: `{cmd}` — run this after each attempt to check success.\n"),
+        Some(cmd) => format!(
+            "\nVerification command: `{cmd}` — run this after each attempt to check success.\n"
+        ),
         None => String::new(),
     };
     let target_hint = match target {
@@ -506,7 +523,8 @@ pub fn cross_review_prompt(
     my_name: &str,
     all_agents: &[String],
 ) -> String {
-    let peers: Vec<&str> = all_agents.iter()
+    let peers: Vec<&str> = all_agents
+        .iter()
         .filter(|a| a.as_str() != my_name)
         .map(|a| a.as_str())
         .collect();
@@ -548,10 +566,7 @@ Keep total response under 400 words.
 }
 
 /// Synthesis prompt: converge on consensus after cross-review.
-pub fn synthesis_prompt(
-    topic: &str,
-    cross_review_summary: &str,
-) -> String {
+pub fn synthesis_prompt(topic: &str, cross_review_summary: &str) -> String {
     format!(
         r#"## Research Discussion: Final Synthesis
 

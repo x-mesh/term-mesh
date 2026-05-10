@@ -65,6 +65,11 @@ tm-agent status
 
 2. idle 에이전트 목록을 파악한다. working/blocked 에이전트는 제외한다.
 
+2.5. Agent runbook 상태를 확인한다. 전략 배정 시 `.agent-runbooks/<role>.md`가 있으면 해당 repo-local 운영 규칙이 role preset보다 우선한다. 없으면 기존 preset 지침으로 동작한다.
+```bash
+tm-agent runbook status
+```
+
 3. 전략별 최소 에이전트 수를 확인한다:
    - chain, review, brainstorm: 최소 1명
    - refine, tournament, red-team, distribute, council: 최소 2명 (council은 3명 이상 권장)

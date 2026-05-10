@@ -2,6 +2,25 @@
 
 All notable changes to term-mesh are documented here.
 
+## [0.104.0] - 2026-05-10
+
+### Added
+- **Agent Runbooks — per-role behavior reference for term-mesh teams** — `.agent-runbooks/<role>.md` files are now the source of truth for what each role does (architect, executor, reviewer, security, …). The `tm-agent runbook` CLI manages them: `init` writes the 23 default templates into the current project, `install --tool claude|codex|opencode|all` projects them as tool-specific skill files (e.g. `.claude/skills/term-mesh-<role>/SKILL.md`), and `status` reports whether each projection is in sync. A new "Agent Runbooks" panel in Settings exposes the same flow with one-click Init / Install / Force Repair, and team agents created via the GUI or CLI automatically receive the relevant runbook content as part of their init prompt — an `executor` agent now knows it's an executor without you reminding it every session.
+- **Workflow presets in team creation** — Settings → Team Presets now offers "workflow" presets alongside the existing "smart" presets. Workflow presets bundle a role list, task templates, and review checkpoints that the dashboard auto-creates when you start a team — useful for canned multi-agent flows (build/review/ship loops). The dropdown is wider so the new presets fit without truncation.
+
+### Fixed
+- **Dark mode no longer flips back to light after a slow brew upgrade** — v0.103.3 added a `GhosttyApp` color-scheme sync at startup, but its retry budget (5 × 100 ms) ran out on sluggish brew-upgrade relaunches, leaving the terminal rendering with the light theme even though the saved appearance was Dark. The retry now schedules one final long-delay attempt (3 s) before giving up, so the slow-startup case the original fix targeted actually closes.
+- **Sidebar tint follows the saved appearance from the first frame** — when SwiftUI's environment color scheme had not yet propagated (the same brew-upgrade window where the terminal was light), the sidebar would render with the configured white tint while everything else was already dark. The sidebar now reads the user's explicit appearance preference directly and only falls through to SwiftUI's environment when the user has chosen "System".
+- **`tm-agent team create` agents finally receive their runbook content** — the socket parameter that carried the "include runbook in init prompt" intent was wired to its own inverse on the Swift side, so CLI-created teams were silently spawning with bare instructions and no role context. The wiring now matches the parameter name, so `tm-agent team create` actually injects the runbook into the agent's first prompt.
+- **Editing a managed `.agent-runbooks/<role>.md` file no longer gets clobbered on `tm-agent runbook install`** — the installer was treating the marker line at the top of each file as "still default, regenerate", so any edits below it were silently overwritten by the built-in defaults the next time you ran install. The installer now reads the on-disk content (the same way `tm-agent runbook status` does), so edits propagate into the projected skill files instead of looping "outdated → install → still outdated" without `--force`.
+
+### Security
+- **`tm-agent` binary lookup no longer searches the project's working directory in Release builds** — the runbook installer used to prefer `<projectRoot>/daemon/target/release/tm-agent` over the signed app bundle. A repository with a planted binary at that path would have been executed under the term-mesh app's privileges the moment the user clicked Init / Install / Force Repair in runbook Settings. Release builds now resolve only from the bundled `Contents/Resources/bin/tm-agent` and Homebrew/system paths; the project-relative candidates are kept only in DEBUG builds for development convenience. The `/usr/bin/env tm-agent` PATH-search fallback was also removed — when no known binary is found, the UI surfaces an explicit error instead of silently following `$PATH`.
+
+### Thanks to 1 contributor!
+
+- [@JINWOO-J](https://github.com/JINWOO-J)
+
 ## [0.103.3] - 2026-05-10
 
 ### Added

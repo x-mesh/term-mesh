@@ -22,7 +22,8 @@ const EMBEDDED_DASHBOARD_HTML: &str = include_str!("../../../Resources/dashboard
 
 /// App icon embedded at compile time so `/api/brand-icon` always works
 /// regardless of where the binary is installed.
-const EMBEDDED_BRAND_ICON: &[u8] = include_bytes!("../../../Assets.xcassets/AppIcon.appiconset/128.png");
+const EMBEDDED_BRAND_ICON: &[u8] =
+    include_bytes!("../../../Assets.xcassets/AppIcon.appiconset/128.png");
 
 use crate::agent::AgentSessionManager;
 use crate::monitor::{MonitorHandle, SystemSnapshot};
@@ -85,8 +86,14 @@ pub async fn serve(
         .route("/api/team", get(team_handler))
         .route("/api/team/create", post(team_create_handler))
         .route("/api/team/teams", get(team_teams_handler))
-        .route("/api/team/tasks", get(team_tasks_handler).post(team_tasks_create_handler))
-        .route("/api/team/tasks/{id}/action", post(team_tasks_action_handler))
+        .route(
+            "/api/team/tasks",
+            get(team_tasks_handler).post(team_tasks_create_handler),
+        )
+        .route(
+            "/api/team/tasks/{id}/action",
+            post(team_tasks_action_handler),
+        )
         .route("/api/team/inbox", get(team_inbox_handler))
         .route("/api/team/instance", get(team_instance_handler))
         .route("/api/monitor", get(monitor_handler))
@@ -103,14 +110,23 @@ pub async fn serve(
         .route("/api/agents/{id}/terminate", post(agents_terminate_handler))
         .route("/api/agents/{id}/input", post(agents_input_handler))
         // Task & Message endpoints (F-06 Phase 2)
-        .route("/api/tasks", get(tasks_list_handler).post(tasks_create_handler))
-        .route("/api/tasks/{id}", get(tasks_get_handler).patch(tasks_update_handler))
+        .route(
+            "/api/tasks",
+            get(tasks_list_handler).post(tasks_create_handler),
+        )
+        .route(
+            "/api/tasks/{id}",
+            get(tasks_get_handler).patch(tasks_update_handler),
+        )
         .route("/api/tasks/{id}/assign", post(tasks_assign_handler))
         .route("/api/tasks/{id}/log", get(tasks_log_handler))
         .route("/api/messages", post(messages_send_handler))
         .route("/api/messages/ack", post(messages_ack_handler))
         .route("/api/messages/{agent_id}", get(messages_list_handler))
-        .layer(middleware::from_fn_with_state(state.clone(), auth_middleware));
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            auth_middleware,
+        ));
 
     let app = public_routes
         .merge(protected_routes)
@@ -238,7 +254,8 @@ async fn index_handler(State(state): State<Arc<HttpState>>) -> impl IntoResponse
         }
     }
     // Fall back to compile-time embedded dashboard (always available in binary)
-    let injected = EMBEDDED_DASHBOARD_HTML.replace("</body>", &format!("{}\n</body>", HTTP_POLL_SCRIPT));
+    let injected =
+        EMBEDDED_DASHBOARD_HTML.replace("</body>", &format!("{}\n</body>", HTTP_POLL_SCRIPT));
     Html(injected)
 }
 
@@ -278,22 +295,42 @@ async fn team_handler(State(state): State<Arc<HttpState>>) -> impl IntoResponse 
 
 async fn team_teams_handler(State(state): State<Arc<HttpState>>) -> impl IntoResponse {
     let team_state = refreshed_team_state(&state).await;
-    Json(team_state.get("teams").cloned().unwrap_or_else(|| serde_json::json!([])))
+    Json(
+        team_state
+            .get("teams")
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!([])),
+    )
 }
 
 async fn team_tasks_handler(State(state): State<Arc<HttpState>>) -> impl IntoResponse {
     let team_state = refreshed_team_state(&state).await;
-    Json(team_state.get("tasks").cloned().unwrap_or_else(|| serde_json::json!([])))
+    Json(
+        team_state
+            .get("tasks")
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!([])),
+    )
 }
 
 async fn team_inbox_handler(State(state): State<Arc<HttpState>>) -> impl IntoResponse {
     let team_state = refreshed_team_state(&state).await;
-    Json(team_state.get("attention").cloned().unwrap_or_else(|| serde_json::json!([])))
+    Json(
+        team_state
+            .get("attention")
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!([])),
+    )
 }
 
 async fn team_instance_handler(State(state): State<Arc<HttpState>>) -> impl IntoResponse {
     let team_state = refreshed_team_state(&state).await;
-    Json(team_state.get("instance").cloned().unwrap_or_else(|| serde_json::json!({})))
+    Json(
+        team_state
+            .get("instance")
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!({})),
+    )
 }
 
 async fn refreshed_team_state(state: &Arc<HttpState>) -> serde_json::Value {
@@ -420,8 +457,8 @@ async fn rpc_team_socket(
         }
         break trimmed.to_string();
     };
-    let response: serde_json::Value =
-        serde_json::from_str(&response_line).map_err(|e| format!("invalid rpc response: {e}; raw={response_line}"))?;
+    let response: serde_json::Value = serde_json::from_str(&response_line)
+        .map_err(|e| format!("invalid rpc response: {e}; raw={response_line}"))?;
     if let Some(err) = response.get("error") {
         return Err(err
             .get("message")
@@ -450,10 +487,18 @@ struct TeamCreateAgentRequest {
     instructions: String,
 }
 
-fn default_team_cli() -> String { "claude".to_string() }
-fn default_team_model() -> String { "sonnet".to_string() }
-fn default_team_agent_type() -> String { "general".to_string() }
-fn default_team_color() -> String { "green".to_string() }
+fn default_team_cli() -> String {
+    "claude".to_string()
+}
+fn default_team_model() -> String {
+    "sonnet".to_string()
+}
+fn default_team_agent_type() -> String {
+    "general".to_string()
+}
+fn default_team_color() -> String {
+    "green".to_string()
+}
 
 #[derive(Deserialize)]
 struct TeamCreateRequest {
@@ -464,7 +509,9 @@ struct TeamCreateRequest {
     agents: Vec<TeamCreateAgentRequest>,
 }
 
-fn default_leader_mode() -> String { "repl".to_string() }
+fn default_leader_mode() -> String {
+    "repl".to_string()
+}
 
 async fn team_create_handler(
     State(state): State<Arc<HttpState>>,
@@ -523,8 +570,14 @@ async fn team_tasks_create_handler(
                 let leader_text = format!(
                     "New task created: {}\nTask id: {task_id}\nAssignee: {}\nStatus: {}\n",
                     result.get("title").and_then(|v| v.as_str()).unwrap_or(""),
-                    result.get("assignee").and_then(|v| v.as_str()).unwrap_or("unassigned"),
-                    result.get("status").and_then(|v| v.as_str()).unwrap_or("assigned")
+                    result
+                        .get("assignee")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("unassigned"),
+                    result
+                        .get("status")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("assigned")
                 );
                 let _ = rpc_team_socket(
                     &socket_path,
@@ -533,7 +586,8 @@ async fn team_tasks_create_handler(
                         "team_name": req.team_name,
                         "text": leader_text,
                     }),
-                ).await;
+                )
+                .await;
                 if let Some(assignee) = req.assignee.as_deref() {
                     let assignee_text = format!(
                         "New assigned task: {}\nTask id: {task_id}\nStatus: {}\n\nA new task has been assigned to you.\nWhen you begin work, run:\ntm-agent task start {task_id}\n",
@@ -548,7 +602,8 @@ async fn team_tasks_create_handler(
                             "agent_name": assignee,
                             "text": assignee_text,
                         }),
-                    ).await;
+                    )
+                    .await;
                 }
             }
             (StatusCode::CREATED, Json(result)).into_response()
@@ -600,7 +655,8 @@ async fn team_tasks_action_handler(
                             "team_name": team_name,
                             "text": leader_text,
                         }),
-                    ).await;
+                    )
+                    .await;
                 }
                 Json(result).into_response()
             }
@@ -613,7 +669,13 @@ async fn team_tasks_action_handler(
         "done" => "team.task.done",
         "reassign" => "team.task.reassign",
         "unblock" => "team.task.unblock",
-        other => return (StatusCode::BAD_REQUEST, format!("unsupported action: {other}")).into_response(),
+        other => {
+            return (
+                StatusCode::BAD_REQUEST,
+                format!("unsupported action: {other}"),
+            )
+                .into_response()
+        }
     };
     let mut params = serde_json::json!({
         "team_name": req.team_name,
@@ -750,7 +812,9 @@ struct SpawnRequest {
     command: Option<String>,
 }
 
-fn default_count() -> usize { 1 }
+fn default_count() -> usize {
+    1
+}
 
 async fn agents_spawn_handler(
     State(state): State<Arc<HttpState>>,
@@ -780,7 +844,10 @@ async fn agents_terminate_handler(
     body: Option<Json<TerminateRequest>>,
 ) -> impl IntoResponse {
     let force = body.map(|b| b.force).unwrap_or(false);
-    match state.agent_manager.terminate(&id, force, &state.watcher_handle) {
+    match state
+        .agent_manager
+        .terminate(&id, force, &state.watcher_handle)
+    {
         Ok(_) => Json(serde_json::json!({"status": "ok"})).into_response(),
         Err(e) => (StatusCode::NOT_FOUND, e).into_response(),
     }
@@ -852,7 +919,11 @@ async fn tasks_create_handler(
         fix_budget: None,
     };
     match state.agent_manager.task_create(params) {
-        Ok(task) => (StatusCode::CREATED, Json(serde_json::to_value(task).unwrap())).into_response(),
+        Ok(task) => (
+            StatusCode::CREATED,
+            Json(serde_json::to_value(task).unwrap()),
+        )
+            .into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
     }
 }
@@ -949,7 +1020,11 @@ async fn messages_send_handler(
     State(state): State<Arc<HttpState>>,
     Json(req): Json<MessageSendRequest>,
 ) -> impl IntoResponse {
-    tracing::info!("POST /api/messages: to={} content_len={}", req.to_agent, req.content.len());
+    tracing::info!(
+        "POST /api/messages: to={} content_len={}",
+        req.to_agent,
+        req.content.len()
+    );
     let params = crate::agent::MessageSendParams {
         from_agent: req.from_agent,
         to_agent: req.to_agent,
@@ -958,7 +1033,11 @@ async fn messages_send_handler(
     match state.agent_manager.message_send(params) {
         Ok(msg) => {
             tracing::info!("message sent: id={}", msg.id);
-            (StatusCode::CREATED, Json(serde_json::to_value(msg).unwrap())).into_response()
+            (
+                StatusCode::CREATED,
+                Json(serde_json::to_value(msg).unwrap()),
+            )
+                .into_response()
         }
         Err(e) => {
             tracing::warn!("message send failed: {}", e);
@@ -1007,24 +1086,29 @@ async fn messages_ack_handler(
 fn find_dashboard_dir() -> Option<PathBuf> {
     if let Ok(project_dir) = std::env::var("CMUX_PROJECT_DIR") {
         let path = PathBuf::from(project_dir).join("Resources/dashboard");
-        if path.exists() { return Some(path); }
+        if path.exists() {
+            return Some(path);
+        }
     }
     if let Ok(exe) = std::env::current_exe() {
         if let Some(parent) = exe.parent() {
             // Direct sibling: <dir>/Resources/dashboard (dev layout)
             let path = parent.join("Resources/dashboard");
-            if path.exists() { return Some(path); }
+            if path.exists() {
+                return Some(path);
+            }
             // Deployed app bundle: binary is at Contents/Resources/bin/term-meshd,
             // dashboard is at Contents/Resources/dashboard
             if let Some(grandparent) = parent.parent() {
                 let path = grandparent.join("dashboard");
-                if path.exists() { return Some(path); }
+                if path.exists() {
+                    return Some(path);
+                }
             }
         }
     }
     None
 }
-
 
 const HTTP_POLL_SCRIPT: &str = r#"<script>
 // ── HTTP Fetch Polling + Session Picker (injected by term-meshd) ──
@@ -1179,4 +1263,3 @@ const HTTP_POLL_SCRIPT: &str = r#"<script>
   document.getElementById('status').textContent = 'http polling';
 })();
 </script>"#;
-

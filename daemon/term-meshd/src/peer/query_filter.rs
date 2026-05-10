@@ -173,8 +173,8 @@ fn csi_query_reply(pending: &[u8]) -> Option<&'static [u8]> {
             }
         }
         b'n' => match body {
-            b"5" => Some(b"\x1B[0n"),    // Status: OK
-            b"6" => Some(b"\x1B[1;1R"),  // Cursor Position Report: row 1, col 1
+            b"5" => Some(b"\x1B[0n"),   // Status: OK
+            b"6" => Some(b"\x1B[1;1R"), // Cursor Position Report: row 1, col 1
             _ => None,
         },
         _ => None,

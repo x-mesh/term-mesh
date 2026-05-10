@@ -278,15 +278,32 @@ struct SidebarBackdrop: View {
     @AppStorage("sidebarState") private var sidebarState = SidebarStateOption.followWindow.rawValue
     @AppStorage("sidebarCornerRadius") private var sidebarCornerRadius = 0.0
     @AppStorage("sidebarBlurOpacity") private var sidebarBlurOpacity = 1.0
+    /// Authoritative dark/light source: the user's explicit appearance
+    /// preference. SwiftUI's `\.colorScheme` is derived from the window's
+    /// `effectiveAppearance`, which lags behind on the first frame after
+    /// a brew upgrade relaunch — the sidebar would render with the white
+    /// `sidebarTintHex` while the rest of the app is already dark. Reading
+    /// the saved preference directly closes that gap.
+    @AppStorage(AppearanceSettings.appearanceModeKey) private var appearanceMode = AppearanceSettings.defaultMode.rawValue
     @Environment(\.colorScheme) private var colorScheme
 
     var body: some View {
         let materialOption = SidebarMaterialOption(rawValue: sidebarMaterial)
         let blendingMode = SidebarBlendModeOption(rawValue: sidebarBlendMode)?.mode ?? .behindWindow
         let state = SidebarStateOption(rawValue: sidebarState)?.state ?? .active
+        // Resolve dark/light: explicit user preference wins; only fall
+        // through to the SwiftUI environment when the user picked
+        // `.system` (or the legacy `.auto`).
+        let isDark: Bool = {
+            switch AppearanceMode(rawValue: appearanceMode) ?? .system {
+            case .dark: return true
+            case .light: return false
+            case .system, .auto: return colorScheme == .dark
+            }
+        }()
         // In dark mode, use a deep dark tint instead of the user-configured (typically white) tint
         let effectiveTintColor: NSColor = {
-            if colorScheme == .dark {
+            if isDark {
                 return (NSColor(hex: "#0a0e14") ?? .black).withAlphaComponent(0.85)
             }
             return (NSColor(hex: sidebarTintHex) ?? .black).withAlphaComponent(sidebarTintOpacity)

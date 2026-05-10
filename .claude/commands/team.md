@@ -41,6 +41,15 @@ tm-agent status
 | `status` | `/team status` | Show team and task board status |
 | `list` | `/team list` | List all teams |
 
+### Agent runbooks
+| Command | Example | Description |
+|---------|---------|-------------|
+| `runbook status` | `/team runbook status` | Show `.agent-runbooks` source and Claude/Codex/OpenCode projection status |
+| `runbook init` | `/team runbook init` | Create repo-local source runbooks |
+| `runbook install --tool all` | `/team runbook install --tool all` | Install managed projections for supported agent tools |
+
+Runbook precedence: base term-mesh protocol → role preset → `.agent-runbooks/<role>.md` → per-team custom instructions. Tool-specific files under `.claude/skills`, `.codex/skills`, and `.opencode/runbooks` are projections, not the source of truth.
+
 ### Communication (leader → agent)
 | Command | Example | Description |
 |---------|---------|-------------|
@@ -79,12 +88,11 @@ Agents use `tm-agent` directly (same binary):
 
 ```
 tm-agent task start <task_id>
-tm-agent task done <task_id> '<result>'
 tm-agent task block <task_id> '<reason>'
 tm-agent heartbeat '<summary>'
-tm-agent report '<summary>'
+tm-agent task review <task_id> '<summary>'
 tm-agent msg send '<text>'
-tm-agent reply '<text>'
+tm-agent reply '<STATUS/FILES/VERIFY/NEXT/FULL_REPORT header plus result>'
 tm-agent inbox
 tm-agent status
 ```

@@ -270,9 +270,7 @@ fn peer_uid_matches(_stream: &tokio::net::UnixStream, _expected_uid: u32) -> boo
 mod integration_tests {
     use super::*;
     use peer_proto::v1::envelope::Payload;
-    use peer_proto::v1::{
-        AttachMode, AttachSurface, Auth, Envelope, Hello, Input, ListSurfaces,
-    };
+    use peer_proto::v1::{AttachMode, AttachSurface, Auth, Envelope, Hello, Input, ListSurfaces};
     use tempfile::TempDir;
     use tokio::net::UnixStream;
 
@@ -314,7 +312,9 @@ mod integration_tests {
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let sock_path_task = sock_path.clone();
         let server_task = tokio::spawn(async move {
-            serve_with_manager(sock_path_task, shutdown_rx, manager).await.unwrap();
+            serve_with_manager(sock_path_task, shutdown_rx, manager)
+                .await
+                .unwrap();
         });
 
         for _ in 0..50 {
@@ -842,8 +842,14 @@ mod integration_tests {
         let timeout = std::time::Duration::from_secs(3);
         let seen_on_1 = wait_for_marker(&mut r1, b"MARKER-ONE", timeout).await;
         let seen_on_2 = wait_for_marker(&mut r2, b"MARKER-ONE", timeout).await;
-        assert!(seen_on_1, "client 1 did not receive its own MARKER-ONE echo");
-        assert!(seen_on_2, "client 2 did not receive MARKER-ONE from client 1");
+        assert!(
+            seen_on_1,
+            "client 1 did not receive its own MARKER-ONE echo"
+        );
+        assert!(
+            seen_on_2,
+            "client 2 did not receive MARKER-ONE from client 1"
+        );
 
         // Input from client 2 must reach both readers.
         write_envelope(
@@ -862,8 +868,14 @@ mod integration_tests {
 
         let seen_on_1 = wait_for_marker(&mut r1, b"MARKER-TWO", timeout).await;
         let seen_on_2 = wait_for_marker(&mut r2, b"MARKER-TWO", timeout).await;
-        assert!(seen_on_1, "client 1 did not receive MARKER-TWO from client 2");
-        assert!(seen_on_2, "client 2 did not receive its own MARKER-TWO echo");
+        assert!(
+            seen_on_1,
+            "client 1 did not receive MARKER-TWO from client 2"
+        );
+        assert!(
+            seen_on_2,
+            "client 2 did not receive its own MARKER-TWO echo"
+        );
 
         // Detach client 1 by dropping its stream halves. Client 2 must
         // still be able to round-trip input.
@@ -920,10 +932,7 @@ mod integration_tests {
             SpawnSpec {
                 title: "short-lived".into(),
                 command: "/bin/sh".into(),
-                args: vec![
-                    "-c".into(),
-                    "printf RESPAWN-MARKER".into(),
-                ],
+                args: vec!["-c".into(), "printf RESPAWN-MARKER".into()],
                 cols: 80,
                 rows: 24,
                 cwd: None,
@@ -1159,7 +1168,9 @@ mod integration_tests {
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let sp_task = sock_path.clone();
         let server_task = tokio::spawn(async move {
-            serve_with_manager(sp_task, shutdown_rx, manager).await.unwrap();
+            serve_with_manager(sp_task, shutdown_rx, manager)
+                .await
+                .unwrap();
         });
         for _ in 0..50 {
             if sock_path.exists() {
@@ -1219,7 +1230,9 @@ mod integration_tests {
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let sock_path_task = sock_path.clone();
         let server_task = tokio::spawn(async move {
-            serve_with_manager(sock_path_task, shutdown_rx, manager).await.unwrap();
+            serve_with_manager(sock_path_task, shutdown_rx, manager)
+                .await
+                .unwrap();
         });
 
         for _ in 0..50 {

@@ -17,9 +17,7 @@ impl RpcClient {
     pub fn connect() -> Option<Self> {
         let path = default_socket_path();
         let stream = UnixStream::connect(&path).ok()?;
-        stream
-            .set_read_timeout(Some(Duration::from_secs(5)))
-            .ok()?;
+        stream.set_read_timeout(Some(Duration::from_secs(5))).ok()?;
         stream
             .set_write_timeout(Some(Duration::from_secs(5)))
             .ok()?;

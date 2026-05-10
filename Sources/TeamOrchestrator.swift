@@ -342,10 +342,11 @@ final class TeamOrchestrator: ObservableObject {
     /// - Socket path (TERMMESH_SOCKET / CMUX_SOCKET)
     /// - Team identity (TERMMESH_TEAM*, CMUX_TEAM*)
     /// - CLAUDECODE flag (only for `agentCli == "claude"`; codex/gemini/kiro must not have it)
-    /// - Per-agent routing (TERMMESH_AGENT_NAME, TERMMESH_WINDOW_ID, TERMMESH_WORKSPACE_ID)
+    /// - Per-agent routing (TERMMESH_AGENT_NAME, TERMMESH_AGENT_ROLE, TERMMESH_WINDOW_ID, TERMMESH_WORKSPACE_ID)
     static func buildAgentPaneEnv(
         teamName: String,
         agentName: String,
+        agentType: String,
         agentCli: String,
         windowId: String?,
         workspaceId: UUID
@@ -390,6 +391,7 @@ final class TeamOrchestrator: ObservableObject {
 
         // Per-agent routing — 2026-03-19 regression guard.
         env["TERMMESH_AGENT_NAME"] = agentName
+        env["TERMMESH_AGENT_ROLE"] = agentType
         if let windowId = windowId, !windowId.isEmpty {
             env["TERMMESH_WINDOW_ID"] = windowId
         }
@@ -401,7 +403,13 @@ final class TeamOrchestrator: ObservableObject {
     // MARK: - Agent Pane Construction (shared helper)
 
     /// Build the kiro worker prompt embedded in the kiro agent profile at CLI startup.
-    private static func buildKiroWorkerPrompt(agentName: String, teamName: String) -> String {
+    private static func buildKiroWorkerPrompt(agentName: String, teamName: String, instructions: String) -> String {
+        let roleInstructions = instructions.trimmingCharacters(in: .whitespacesAndNewlines)
+        let roleSection = roleInstructions.isEmpty ? "" : """
+
+        Role instructions:
+        \(roleInstructions)
+        """
         return """
         You are a focused worker agent named '\(agentName)' in team '\(teamName)'. \
         Rules: 1) Be EXTREMELY concise — no preamble, no summaries unless asked. \
@@ -414,10 +422,11 @@ final class TeamOrchestrator: ObservableObject {
         3. While actively working, periodically run `tm-agent heartbeat '<short progress summary>'`.
         4. If blocked, run `tm-agent task block <task_id> '<reason>'`.
         5. If ready for validation, run `tm-agent task review <task_id> '<summary>'`.
-        6. When accepted as done, run `tm-agent task done <task_id> '<result>'`.
+        6. When done, run `tm-agent reply '<5-line header plus result>'`; it auto-reports and completes your active task.
         When you complete any task, you MUST use your bash/execute tool to run:
-        tm-agent report '<summary of your result>'
+        tm-agent reply '<STATUS/FILES/VERIFY/NEXT/FULL_REPORT header plus concise result>'
         Do NOT just write the result as text — actually execute the shell command.
+        \(roleSection)
         """
     }
 
@@ -465,7 +474,7 @@ final class TeamOrchestrator: ObservableObject {
         let agentCommand: String
         switch agentCli {
         case "kiro":
-            let workerPrompt = Self.buildKiroWorkerPrompt(agentName: agentName, teamName: teamName)
+            let workerPrompt = Self.buildKiroWorkerPrompt(agentName: agentName, teamName: teamName, instructions: agentInstructions)
             agentCommand = buildKiroCommand(
                 kiroPath: cliPath,
                 agentName: agentName,
@@ -519,6 +528,7 @@ final class TeamOrchestrator: ObservableObject {
         let paneEnv = Self.buildAgentPaneEnv(
             teamName: teamName,
             agentName: agentName,
+            agentType: agentType,
             agentCli: agentCli,
             windowId: windowId,
             workspaceId: workspace.id
@@ -579,6 +589,7 @@ final class TeamOrchestrator: ObservableObject {
         worktreeMode: String = "off",
         executionMode: String = "pane",
         adoptedLeaderSurfaceId: UUID? = nil,
+        skipRunbookPromptForInteractiveAgents: Bool = false,
         tabManager: TabManager
     ) -> Team? {
         guard !agents.isEmpty else { return nil }
@@ -775,10 +786,15 @@ final class TeamOrchestrator: ObservableObject {
                             ? "  \(i + 1). \(a.name) (\(a.agentType))"
                             : "  \(i + 1). \(a.name) (\(a.agentType)) — \(summary)"
                     }.joined(separator: "\n")
+                    let runbookSection = Self.runbookLeaderSection(
+                        workingDirectory: leaderWorkDir,
+                        roles: agents.map(\.agentType)
+                    )
                     let tmAgent = "tm-agent"
                     let systemPrompt = Self.buildLeaderClaudeSystemPrompt(
                         teamName: name,
                         agentList: agentListStr,
+                        runbookSection: runbookSection,
                         tmAgent: tmAgent,
                         socketPath: socketPath
                     )
@@ -868,12 +884,17 @@ final class TeamOrchestrator: ObservableObject {
             // Spawn agents via daemon RPC (no GUI panes)
             let agentSpecs: [[String: Any]] = agents.map { a in
                 let cli = a.cli.isEmpty ? "claude" : a.cli
-                var spec: [String: Any] = ["name": a.name, "cli": cli, "model": a.model]
+                let effectiveInstructions = AgentRunbookService.shared.composeInstructions(
+                    roleName: a.agentType,
+                    presetInstructions: a.instructions,
+                    workingDirectory: workingDirectory
+                )
+                var spec: [String: Any] = ["name": a.name, "agent_type": a.agentType, "cli": cli, "model": a.model]
                 if let path = cliPaths[cli] {
                     spec["cli_path"] = path
                 }
-                if !a.instructions.isEmpty {
-                    spec["instructions"] = a.instructions
+                if !effectiveInstructions.isEmpty {
+                    spec["instructions"] = effectiveInstructions
                 }
                 return spec
             }
@@ -903,6 +924,11 @@ final class TeamOrchestrator: ObservableObject {
             for (index, agent) in agents.enumerated() {
                 let agentColor = agent.color.isEmpty ? colors[index % colors.count] : agent.color
                 let agentCli = agent.cli.isEmpty ? "claude" : agent.cli
+                let effectiveInstructions = AgentRunbookService.shared.composeInstructions(
+                    roleName: agent.agentType,
+                    presetInstructions: agent.instructions,
+                    workingDirectory: workingDirectory
+                )
                 let member = AgentMember(
                     id: "\(agent.name)@\(name)",
                     name: agent.name,
@@ -911,7 +937,7 @@ final class TeamOrchestrator: ObservableObject {
                     model: agent.model,
                     agentType: agent.agentType,
                     color: agentColor,
-                    instructions: agent.instructions,
+                    instructions: effectiveInstructions,
                     workspaceId: workspace.id,
                     panelId: UUID(), // placeholder — no real panel
                     parentSessionId: leaderSessionId,
@@ -999,6 +1025,16 @@ final class TeamOrchestrator: ObservableObject {
 
             let agentCli = agent.cli.isEmpty ? "claude" : agent.cli
             let cliPath = cliPaths[agentCli]!
+            let effectiveInstructions: String
+            if skipRunbookPromptForInteractiveAgents && agentCli != "kiro" {
+                effectiveInstructions = agent.instructions
+            } else {
+                effectiveInstructions = AgentRunbookService.shared.composeInstructions(
+                    roleName: agent.agentType,
+                    presetInstructions: agent.instructions,
+                    workingDirectory: agentWorkDir
+                )
+            }
 
             // Grid layout: agents are assigned to cells in column-major order.
             // col = index % numCols, row = index / numCols
@@ -1029,7 +1065,7 @@ final class TeamOrchestrator: ObservableObject {
                 agentModel: agent.model,
                 agentType: agent.agentType,
                 agentColor: agentColor,
-                agentInstructions: agent.instructions,
+                agentInstructions: effectiveInstructions,
                 cliPath: cliPath,
                 teamName: name,
                 leaderSessionId: leaderSessionId,
@@ -1095,6 +1131,7 @@ final class TeamOrchestrator: ObservableObject {
             let prompt = buildTeamLeaderPrompt(
                 teamName: name,
                 agents: members,
+                workingDirectory: leaderWorkDir,
                 socketPath: socketPath,
                 scriptDir: scriptDir,
                 worktreeMode: worktreeMode,
@@ -1239,6 +1276,7 @@ final class TeamOrchestrator: ObservableObject {
             }
             team = existing
         } else {
+            let workspaceDirectory = workspace.currentDirectory
             // First attach: register workspace-local team with caller pane as adopted leader
             team = Team(
                 id: teamName,
@@ -1247,7 +1285,7 @@ final class TeamOrchestrator: ObservableObject {
                 leaderModel: "sonnet",
                 leaderPanelId: callerPanelId,
                 leaderWorkspaceId: workspaceId,
-                workingDirectory: FileManager.default.currentDirectoryPath,
+                workingDirectory: workspaceDirectory,
                 workspaceId: workspaceId,
                 agents: [],
                 createdAt: Date(),
@@ -1258,6 +1296,12 @@ final class TeamOrchestrator: ObservableObject {
                 sharedWorktreeBranch: nil
             )
         }
+
+        let effectiveInstructions = AgentRunbookService.shared.composeInstructions(
+            roleName: agentType,
+            presetInstructions: instructions,
+            workingDirectory: team.workingDirectory
+        )
 
         // 5. Resolve CLI binary
         guard let cliPath = agentBinaryPath(cli: normalizedCli) else {
@@ -1289,7 +1333,7 @@ final class TeamOrchestrator: ObservableObject {
             agentModel: agentModel,
             agentType: agentType,
             agentColor: agentColor,
-            agentInstructions: instructions,
+            agentInstructions: effectiveInstructions,
             cliPath: cliPath,
             teamName: teamName,
             leaderSessionId: team.leaderSessionId,
@@ -1518,10 +1562,40 @@ final class TeamOrchestrator: ObservableObject {
         return String(cleaned.prefix(120))
     }
 
+    private static func runbookLeaderSection(workingDirectory: String, roles: [String]) -> String {
+        let normalizedRoles = Array(Set(roles.map(AgentRunbookService.normalizeRoleName))).sorted()
+        let status = AgentRunbookService.shared.status(workingDirectory: workingDirectory, roles: normalizedRoles)
+        let lines = status.roles.map { roleStatus in
+            "  - \(roleStatus.role): \(roleStatus.sourceState.rawValue)"
+        }.joined(separator: "\n")
+        let available = status.roles.filter { $0.sourceState != .missing }.map(\.role)
+        let availability = available.isEmpty
+            ? "No repo-local source runbooks are present; agents fall back to role preset instructions."
+            : "Repo-local runbooks are present for: \(available.joined(separator: ", "))."
+
+        return """
+        ## Agent Runbooks
+
+        Source of truth: `.agent-runbooks/<role>.md` in \(status.projectRoot).
+        Precedence: base term-mesh protocol -> role preset -> repo runbook -> per-team custom instructions.
+        \(availability)
+
+        Current source status:
+        \(lines.isEmpty ? "  - none" : lines)
+
+        Useful commands:
+        ```
+        tm-agent runbook status
+        tm-agent runbook install --tool all
+        ```
+        """
+    }
+
     /// Build system prompt for Claude leader (launched directly, no shell script wrapper).
     private static func buildLeaderClaudeSystemPrompt(
         teamName: String,
         agentList: String,
+        runbookSection: String,
         tmAgent: String,
         socketPath: String
     ) -> String {
@@ -1564,6 +1638,8 @@ final class TeamOrchestrator: ObservableObject {
         Match each task to the agent whose specialty fits best.
         When multiple agents are available, prefer parallel delegation over serial.
         If an agent is idle and there is pending work, assign them a task immediately.
+
+        \(runbookSection)
 
         ## How to Command Agents
 
@@ -1690,6 +1766,7 @@ final class TeamOrchestrator: ObservableObject {
     private func buildTeamLeaderPrompt(
         teamName: String,
         agents: [AgentMember],
+        workingDirectory: String,
         socketPath: String,
         scriptDir: String,
         worktreeMode: String = "off",
@@ -1704,6 +1781,10 @@ final class TeamOrchestrator: ObservableObject {
         }.joined(separator: "\n")
 
         let tmAgent = "tm-agent"
+        let runbookSection = Self.runbookLeaderSection(
+            workingDirectory: workingDirectory,
+            roles: agents.map(\.agentType)
+        )
 
         // Worktree info
         let worktreeSection: String
@@ -1766,6 +1847,8 @@ final class TeamOrchestrator: ObservableObject {
         Match each task to the agent whose specialty fits best.
         When multiple agents are available, prefer parallel delegation over serial.
         If an agent is idle and there is pending work, assign them a task immediately.
+
+        \(runbookSection)
 
         ## How to Command Agents
 
@@ -2002,10 +2085,10 @@ final class TeamOrchestrator: ObservableObject {
             "- tm-agent heartbeat '<short progress summary>'",
             "- tm-agent task block \(taskId) '<reason>'",
             "- tm-agent task review \(taskId) '<summary>'",
-            "- tm-agent task done \(taskId) '<result>'",
+            "- tm-agent reply '<5-line header plus result>'  # final completion; auto-reports and completes the active task",
         ])
         let body = lines.joined(separator: "\n")
-        return body + "\n\n[IMPORTANT] When you finish this task, you MUST use your bash/execute tool to run this SINGLE command:\n```\ntm-agent reply '<one-paragraph summary of your result>'\n```\nThis sends the result to the leader AND registers it as a report in one step.\nDo NOT run separate msg send + report commands. Just use `reply` once."
+        return body + "\n\n[IMPORTANT] When you finish this task, you MUST use your bash/execute tool to run this SINGLE command:\n```\ntm-agent reply '<STATUS/FILES/VERIFY/NEXT/FULL_REPORT header plus concise result>'\n```\nThis sends the result to the leader, registers it as a report, and completes your active task. Do NOT run separate msg send, report, or task done commands. Just use `reply` once."
     }
 
     private func formatTaskDispatchInstruction(task: TeamTask) -> String {
@@ -2033,7 +2116,7 @@ final class TeamOrchestrator: ObservableObject {
         lines.append("- tm-agent task start \(task.id)")
         lines.append("- tm-agent task block \(task.id) '<reason>'")
         lines.append("- tm-agent task review \(task.id) '<summary>'")
-        lines.append("- tm-agent task done \(task.id) '<result>'")
+        lines.append("- tm-agent reply '<5-line header plus result>'")
         return lines.joined(separator: "\n")
     }
 

@@ -2028,6 +2028,13 @@ class TerminalController {
         let leaderMode = params["leader_mode"] as? String ?? "repl"
         let leaderModel = params["leader_model"] as? String ?? "sonnet"
         let resumeSessionId = params["resume_session_id"] as? String
+        // F2 fix: socket param `runbook_init_prompt: true` means "DO inject
+        // the runbook into the agent init prompt" (CLI sends `true` for that
+        // intent). The orchestrator parameter is the inverse — *skip* the
+        // runbook — so invert before passing through. Default behaviour
+        // (param absent → include) is preserved by reading default `true`.
+        let includeRunbookInitPrompt = params["runbook_init_prompt"] as? Bool ?? true
+        let skipRunbookInitPrompt = !includeRunbookInitPrompt
         // Adopted mode: caller's terminal IS the leader; surface_id identifies it.
         let adoptedLeaderSurfaceId: UUID? = leaderMode == "adopted"
             ? (params["surface_id"] as? String).flatMap(UUID.init(uuidString:))
@@ -2133,6 +2140,7 @@ class TerminalController {
                 leaderModel: leaderModel,
                 resumeSessionId: resumeSessionId,
                 adoptedLeaderSurfaceId: adoptedLeaderSurfaceId,
+                skipRunbookPromptForInteractiveAgents: skipRunbookInitPrompt,
                 tabManager: tabManager
             ) {
                 return V2CallResult.ok([
@@ -3583,6 +3591,10 @@ class TerminalController {
         let leaderMode = params["leader_mode"] as? String ?? "repl"
         let leaderModel = params["leader_model"] as? String ?? "sonnet"
         let resumeSessionId = params["resume_session_id"] as? String
+        // F2 fix: see TerminalController.swift:2031 — socket flag means
+        // "include runbook"; orchestrator wants the inverse.
+        let includeRunbookInitPrompt = params["runbook_init_prompt"] as? Bool ?? true
+        let skipRunbookInitPrompt = !includeRunbookInitPrompt
         let adoptedLeaderSurfaceId: UUID? = leaderMode == "adopted"
             ? (params["surface_id"] as? String).flatMap(UUID.init(uuidString:))
             : nil
@@ -3601,6 +3613,7 @@ class TerminalController {
                 leaderModel: leaderModel,
                 resumeSessionId: resumeSessionId,
                 adoptedLeaderSurfaceId: adoptedLeaderSurfaceId,
+                skipRunbookPromptForInteractiveAgents: skipRunbookInitPrompt,
                 tabManager: tabManager
             ) {
                 result = .ok([

@@ -17,24 +17,31 @@ use std::{env, process, thread};
 
 // ── Constants ────────────────────────────────────────────────────────
 
-const DEFAULT_AGENT_NAMES: &[&str] = &["explorer", "executor", "reviewer", "debugger", "writer", "tester"];
+const DEFAULT_AGENT_NAMES: &[&str] = &[
+    "explorer", "executor", "reviewer", "debugger", "writer", "tester",
+];
 const DEFAULT_AGENT_COLORS: &[&str] = &["green", "blue", "yellow", "magenta", "cyan", "red"];
 
 const REPORT_SUFFIX: &str = concat!(
-    "\n\n[IMPORTANT] When done, run: tm-agent reply '<one-paragraph summary of your result>' to report your result.",
+    "\n\n[IMPORTANT] When done, run: tm-agent reply '<STATUS/FILES/VERIFY/NEXT/FULL_REPORT header plus summary>' to report your result. Do not run task done separately; reply auto-reports and completes your active task.",
 );
 
 const BROADCAST_SUFFIX: &str = concat!(
-    "\n\n[IMPORTANT] When done, run: `tm-agent reply '<one-paragraph summary>'` to report your result.",
+    "\n\n[IMPORTANT] When done, run: `tm-agent reply '<STATUS/FILES/VERIFY/NEXT/FULL_REPORT header plus summary>'` to report your result. Do not run task done separately; reply auto-reports and completes your active task.",
 );
 
-fn agent_init_prompt(agent: &str, workdir: &str, socket: &str) -> String {
-    let runbook_section = load_runbook_content_for_agent(Path::new(workdir), agent)
+fn agent_init_prompt(agent_name: &str, agent_role: &str, workdir: &str, socket: &str) -> String {
+    let runbook_section = load_runbook_content_for_role(Path::new(workdir), agent_role)
         .map(|content| format!("\n## Role Runbook\n\n{content}\n"))
         .unwrap_or_default();
+    let identity_line = if agent_name == agent_role {
+        format!("You are a team agent named \"{agent_name}\" with role \"{agent_role}\" in a term-mesh multi-agent team.")
+    } else {
+        format!("You are a team agent named \"{agent_name}\" with role \"{agent_role}\" in a term-mesh multi-agent team. Your identity is \"{agent_name}\"; your behavior runbook is `.agent-runbooks/{agent_role}.md`.")
+    };
 
     format!(
-        "You are a team agent named \"{agent}\" in a term-mesh multi-agent team. \
+        "{identity_line} \
 Use `tm-agent` (Rust, ~2ms) for ALL team operations. \
 Fallback: `./scripts/tm-agent.sh` (bash, ~10ms). \
 NEVER use `./scripts/team.py` \u{2014} it has been removed.\n\
@@ -44,26 +51,25 @@ Task lifecycle:\n\
 2. Progress heartbeat: `tm-agent heartbeat '<short summary>'`\n\
 3. If blocked: `tm-agent task block <task_id> '<reason>'`\n\
 4. If ready for review: `tm-agent task review <task_id> '<summary>'`\n\
-5. When done: `tm-agent task done <task_id> '<result>'`\n\
+5. When done: `tm-agent reply '<full result>'` \u{2014} this auto-reports and completes your active task. Do not run `tm-agent task done` separately.\n\
 \n\
 ## Reply Protocol\n\
 \n\
-Begin every reply with this 4-line header (use n/a / none / NONE when not applicable):\n\
+Begin every `tm-agent reply` body with this 5-line header (use n/a / none / NONE when not applicable):\n\
 \n\
 ```\n\
 STATUS: DONE|BLOCKED|NEEDS_REVIEW\n\
 FILES: <changed paths or \"none\">\n\
 VERIFY: <single shell command or \"n/a\">\n\
 NEXT: <action or \"NONE\">\n\
+FULL_REPORT: <absolute result path or \"n/a\">\n\
 ```\n\
 \n\
 ## Reply Truncation\n\
 \n\
 Replies are truncated to ~1500 chars over the socket but the daemon auto-saves your full\n\
-reply to ~/.term-mesh/results/<team>/<task_id>.md. If your reply body exceeds 1000 chars,\n\
-prefix the very first line (above the Reply Protocol header) with:\n\
-\n\
-  Full report: ~/.term-mesh/results/<team>/<task_id>.md\n\
+reply to ~/.term-mesh/results/<team>/<agent>-reply.md. If your reply body exceeds 1000 chars,\n\
+set FULL_REPORT to that path instead of adding a separate line above the header.\n\
 \n\
 Communication:\n\
 - Send message to leader: `tm-agent msg send '<text>'`\n\
@@ -77,8 +83,8 @@ Environment:\n\
 - Socket: {socket}\n\
 - Project: term-mesh (Swift/macOS terminal multiplexer)\n\
 {runbook_section}\n\
-When you complete any task, run: `tm-agent reply '<one-paragraph summary>'` to report.\n\
-Respond with \"Agent {agent} ready.\" to confirm.",
+When you complete any task, run: `tm-agent reply '<5-line header plus concise result>'` to report.\n\
+Respond with \"Agent {agent_name} ready.\" to confirm.",
     )
 }
 
@@ -88,7 +94,11 @@ const GIT_SHA: &str = env!("TM_GIT_SHA");
 const _BUILD_DATE: &str = env!("TM_BUILD_DATE");
 
 #[derive(Parser)]
-#[command(name = "tm-agent", about = "term-mesh team CLI — unified agent & leader tool", version)]
+#[command(
+    name = "tm-agent",
+    about = "term-mesh team CLI — unified agent & leader tool",
+    version
+)]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -467,10 +477,16 @@ enum Commands {
     TaskStart { task_id: String },
     /// Alias: task-done → task done
     #[command(name = "task-done", hide = true)]
-    TaskDone { task_id: String, result: Option<String> },
+    TaskDone {
+        task_id: String,
+        result: Option<String>,
+    },
     /// Alias: task-block → task block
     #[command(name = "task-block", hide = true)]
-    TaskBlock { task_id: String, reason: Option<String> },
+    TaskBlock {
+        task_id: String,
+        reason: Option<String>,
+    },
     /// Alias: task-list → task list
     #[command(name = "task-list", hide = true)]
     TaskList,
@@ -494,7 +510,11 @@ enum Commands {
     },
     /// Alias: task-update → task update
     #[command(name = "task-update", hide = true)]
-    TaskUpdate2 { id: String, status: String, result: Option<String> },
+    TaskUpdate2 {
+        id: String,
+        status: String,
+        result: Option<String>,
+    },
     /// Alias: task-review → task review
     #[command(name = "task-review", hide = true)]
     TaskReview2 { id: String, summary: Option<String> },
@@ -568,9 +588,15 @@ enum TaskCommands {
     /// Mark task as in_progress
     Start { task_id: String },
     /// Mark task as done with optional result
-    Done { task_id: String, result: Option<String> },
+    Done {
+        task_id: String,
+        result: Option<String>,
+    },
     /// Mark task as blocked with reason
-    Block { task_id: String, reason: Option<String> },
+    Block {
+        task_id: String,
+        reason: Option<String>,
+    },
     /// Submit task for review
     Review { id: String, summary: Option<String> },
     /// Get task details
@@ -796,7 +822,10 @@ fn parse_template_yaml(content: &str) -> TaskTemplate {
 
     TaskTemplate {
         name: map.get("name").cloned().unwrap_or_default(),
-        title: map.get("title").cloned().unwrap_or_else(|| "{{title}}".into()),
+        title: map
+            .get("title")
+            .cloned()
+            .unwrap_or_else(|| "{{title}}".into()),
         description: map.get("description").cloned(),
         priority: map.get("priority").and_then(|s| s.parse().ok()),
         assign: map.get("assign").cloned(),
@@ -834,7 +863,11 @@ fn list_all_templates() -> Vec<(String, String)> {
         for entry in entries.flatten() {
             let p = entry.path();
             if p.extension().and_then(|e| e.to_str()) == Some("yaml") {
-                let name = p.file_stem().and_then(|s| s.to_str()).unwrap_or("").to_string();
+                let name = p
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("")
+                    .to_string();
                 if !result.iter().any(|(n, _)| n == &name) {
                     result.push((name, dir.display().to_string()));
                 }
@@ -870,7 +903,9 @@ struct RunbookRole {
     name: &'static str,
     title: &'static str,
     description: &'static str,
+    when_to_use: &'static [&'static str],
     rules: &'static [&'static str],
+    verify: &'static [&'static str],
 }
 
 fn builtin_runbook_roles() -> Vec<RunbookRole> {
@@ -879,110 +914,418 @@ fn builtin_runbook_roles() -> Vec<RunbookRole> {
             name: "explorer",
             title: "Explorer Runbook",
             description: "Read-only codebase exploration and symbol tracing.",
+            when_to_use: &[
+                "The task asks where something is defined, who calls it, or how modules depend on each other.",
+                "The leader needs precise context before code is changed.",
+            ],
             rules: &[
                 "Use rg or rg --files first for searches.",
                 "Return findings as path:line plus one concise role sentence.",
                 "Do not edit files unless the leader explicitly changes your role.",
                 "Prefer exact call sites, ownership boundaries, and dependency edges over broad summaries.",
             ],
+            verify: &[
+                "Include the exact search command or pattern family you used when absence matters.",
+                "If no match is found, say what paths or symbols were checked.",
+            ],
         },
         RunbookRole {
             name: "executor",
             title: "Executor Runbook",
             description: "Scoped implementation work with direct file edits and verification.",
+            when_to_use: &[
+                "The task has a concrete implementation target and an owned file/module scope.",
+                "A previous planner, architect, explorer, or reviewer has narrowed the change.",
+            ],
             rules: &[
                 "Own the files assigned in the task and avoid unrelated refactors.",
                 "Do not revert edits made by other agents or the user.",
                 "Run the narrowest useful verification command before reporting.",
                 "Report changed files, verification, and remaining risk in the standard header.",
             ],
+            verify: &[
+                "Run the smallest build, test, or CLI dry-run that exercises the changed behavior.",
+                "When verification is blocked, report the exact blocker and the command you would run.",
+            ],
         },
         RunbookRole {
             name: "reviewer",
             title: "Reviewer Runbook",
             description: "Code review focused on regressions, bugs, and missing tests.",
+            when_to_use: &[
+                "An implementation diff is ready for quality, regression, or release gate review.",
+                "The leader needs risk-ranked findings rather than another implementation pass.",
+            ],
             rules: &[
                 "Lead with findings ordered by severity.",
                 "Ground every finding in file:line references.",
                 "Prefer actionable patch snippets over style-only comments.",
                 "Return VERDICT: LGTM or VERDICT: CHANGES after findings.",
             ],
+            verify: &[
+                "Name the tests or manual checks that would catch each material issue.",
+                "If no issues are found, state residual risk and any unrun coverage.",
+            ],
         },
         RunbookRole {
             name: "security",
             title: "Security Runbook",
             description: "Security review for process execution, sockets, quoting, and trust boundaries.",
+            when_to_use: &[
+                "The change touches Process(), shell quoting, sockets, permissions, tokens, or external input.",
+                "A feature changes what agents, CLI commands, or browser automation can access.",
+            ],
             rules: &[
                 "Inspect Process(), shell invocation, socket authorization, allowAll paths, and external input parsing.",
                 "Include severity, CWE when obvious, PoC, fix, and verify command.",
                 "Flag focus stealing or privilege boundary changes when socket commands are involved.",
                 "Do not suggest broad rewrites when a local validation or escaping fix is enough.",
             ],
+            verify: &[
+                "Provide a concrete PoC or negative test for exploitable paths.",
+                "Call out when the issue is theoretical and what evidence would confirm it.",
+            ],
         },
         RunbookRole {
             name: "frontend",
             title: "Frontend Runbook",
             description: "SwiftUI/AppKit interface work for term-mesh panels and dashboard UI.",
+            when_to_use: &[
+                "The change touches Sources/Panels, Sources/Splits, Settings, team UI, keyboard handling, or SwiftUI/AppKit layout.",
+                "The user-visible behavior depends on visual hierarchy, focus, or panel state.",
+            ],
             rules: &[
                 "Preserve portal layering contracts for terminal and browser surfaces.",
                 "Use existing design tokens and avoid nested card layouts.",
                 "Add DEBUG dlog events only behind DEBUG guards when useful.",
                 "Verify responsive layout and avoid overlapping text or controls.",
             ],
+            verify: &[
+                "Run the project xcodebuild command for Swift changes.",
+                "Use reload or UI smoke coverage when the changed surface is interactive.",
+            ],
         },
         RunbookRole {
             name: "backend",
             title: "Backend Runbook",
             description: "Rust daemon, JSON-RPC, IPC, and telemetry implementation.",
+            when_to_use: &[
+                "The change touches daemon/, tm-agent, JSON-RPC schemas, socket commands, peer relay, or telemetry paths.",
+                "A UI change requires new daemon capabilities or contract updates.",
+            ],
             rules: &[
                 "Default new socket commands to off-main handling unless UI state requires main actor access.",
                 "Parse and validate external input before scheduling UI mutation.",
                 "Keep JSON response shapes backward compatible where existing clients depend on them.",
                 "Run cargo test for daemon changes when feasible.",
             ],
+            verify: &[
+                "Run cargo fmt and cargo test for daemon changes.",
+                "Exercise new or changed CLI/socket commands with a dry-run or local request.",
+            ],
+        },
+        RunbookRole {
+            name: "refactorer",
+            title: "Refactorer Runbook",
+            description: "Behavior-preserving refactors with small reversible steps.",
+            when_to_use: &[
+                "The goal is reducing duplication, moving code, or clarifying boundaries without changing behavior.",
+                "The leader needs a contained cleanup before or after feature work.",
+            ],
+            rules: &[
+                "Preserve public behavior and avoid mixed feature work.",
+                "Make mechanical moves separately from semantic edits.",
+                "Run focused regression checks after each meaningful batch.",
+                "Report compatibility risk before broadening the refactor.",
+            ],
+            verify: &[
+                "Run regression checks covering the moved or renamed behavior.",
+                "List any behavior that intentionally changed; otherwise state behavior-preserving.",
+            ],
         },
         RunbookRole {
             name: "architect",
             title: "Architect Runbook",
             description: "Design decisions for module boundaries, threading, and protocol changes.",
+            when_to_use: &[
+                "A change affects module boundaries, protocol shape, threading policy, focus policy, or long-lived extension points.",
+                "Multiple agents or phases need a shared design before implementation.",
+            ],
             rules: &[
                 "Write the decision, rejected alternatives, and compatibility impact.",
                 "Include Swift/Rust stubs or sequence pseudocode when it clarifies the boundary.",
                 "Call out focus policy, socket threading, and panel layering impacts explicitly.",
                 "Avoid abstractions that do not remove real duplication or risk.",
             ],
+            verify: &[
+                "Name the compatibility checks and contract tests the executor or tester should run.",
+                "Flag unresolved decisions as explicit open questions, not hidden assumptions.",
+            ],
         },
         RunbookRole {
             name: "tester",
             title: "Tester Runbook",
             description: "Verification planning and regression execution.",
+            when_to_use: &[
+                "The task needs a test matrix, regression run, smoke test, or reproduction confirmation.",
+                "A change is ready but still lacks confidence across UI, CLI, daemon, or workflow contracts.",
+            ],
             rules: &[
                 "Map tests to user-visible risk and changed contracts.",
                 "Use VM-only UI test commands for macOS UI automation.",
                 "Report test case count, failures, and whether VM coverage is still needed.",
                 "Prefer reproducible shell commands over prose-only validation.",
             ],
+            verify: &[
+                "Report commands exactly as run and summarize pass/fail counts.",
+                "Separate host-only checks from required VM UI checks.",
+            ],
+        },
+        RunbookRole {
+            name: "debugger",
+            title: "Debugger Runbook",
+            description: "Reproduction, root cause isolation, and minimal fix guidance.",
+            when_to_use: &[
+                "There is a failing command, crash, flaky behavior, or user-reported symptom without a known cause.",
+                "The leader needs root cause and a minimal fix path before assigning implementation.",
+            ],
+            rules: &[
+                "Start from observed symptoms and identify a reproducible path.",
+                "Separate root cause from nearby incidental failures.",
+                "Prefer minimal fixes with a clear verification command.",
+                "Escalate to tester when the fix needs UI or regression coverage.",
+            ],
+            verify: &[
+                "Capture the failing command, relevant log excerpt, and expected passing command.",
+                "State confidence in the root cause and what would falsify it.",
+            ],
         },
         RunbookRole {
             name: "writer",
             title: "Writer Runbook",
             description: "Documentation, changelog, and release-note updates.",
+            when_to_use: &[
+                "A shipped or ready change needs README, docs-site, AGENTS/CLAUDE, changelog, or release note updates.",
+                "User-facing CLI, Settings, workflow, or onboarding behavior changed.",
+            ],
             rules: &[
                 "Update the single source of truth first, then linked docs.",
                 "Keep docs aligned with current CLI names and socket methods.",
                 "Mention exact insertion locations and self-check consistency.",
                 "Avoid documenting speculative behavior as shipped behavior.",
             ],
+            verify: &[
+                "Check linked docs for stale command names and mismatched behavior.",
+                "Report the source document and every synchronized projection touched.",
+            ],
+        },
+        RunbookRole {
+            name: "devops",
+            title: "DevOps Runbook",
+            description: "Build, release, CI, packaging, and operational workflows.",
+            when_to_use: &[
+                "The task touches build scripts, CI, release packaging, signing, tags, artifacts, or deployment.",
+                "The leader needs reproducible operational commands and rollback awareness.",
+            ],
+            rules: &[
+                "Check scripts, signing, packaging, and environment assumptions.",
+                "Keep commands reproducible and avoid host-specific hidden state.",
+                "Report artifact paths, versions, and rollback considerations.",
+                "Do not publish, tag, or push unless the leader explicitly requested it.",
+            ],
+            verify: &[
+                "Prefer dry-runs or read-only status commands before publishing actions.",
+                "Record artifact paths and exact versions produced or inspected.",
+            ],
         },
         RunbookRole {
             name: "planner",
             title: "Planner Runbook",
             description: "Task decomposition, dependency mapping, and phase gates.",
+            when_to_use: &[
+                "The work spans several files, agents, phases, or dependencies.",
+                "The leader needs ownership, acceptance criteria, and ordering before execution.",
+            ],
             rules: &[
                 "Split work into independently assignable tasks with clear owners.",
                 "List inputs, outputs, dependencies, and acceptance criteria.",
                 "Prefer phase gates where shared contracts or multiple agents are involved.",
                 "Emit tm-agent task create lines when actionable.",
+            ],
+            verify: &[
+                "Ensure every task has an owner, input, output, dependency, and acceptance check.",
+                "Call out critical-path blockers separately from parallelizable work.",
+            ],
+        },
+        RunbookRole {
+            name: "researcher",
+            title: "Researcher Runbook",
+            description: "Focused research, evidence gathering, and synthesis.",
+            when_to_use: &[
+                "The answer depends on external facts, current docs, prior art, or uncertain project history.",
+                "The leader needs evidence and tradeoffs before design or implementation.",
+            ],
+            rules: &[
+                "State sources and confidence, and separate fact from inference.",
+                "Prefer primary sources and current project artifacts.",
+                "Summarize findings into decisions, risks, and next checks.",
+                "Avoid implementing changes while acting as researcher.",
+            ],
+            verify: &[
+                "Cite sources or local artifacts used for material claims.",
+                "List remaining unknowns and the fastest check to resolve each.",
+            ],
+        },
+        RunbookRole {
+            name: "data",
+            title: "Data Engineer Runbook",
+            description: "Schema design, query optimization, migrations, and data pipeline work.",
+            when_to_use: &[
+                "The task touches database schema, migrations, indexes, ETL/ELT, analytics tables, or query performance.",
+                "The leader needs data-loss risk, rollback planning, or before/after query evidence.",
+            ],
+            rules: &[
+                "Read existing schema, migration, and data access patterns before proposing changes.",
+                "Include rollback strategy for every schema migration.",
+                "Optimize queries from measured plans, not guesses.",
+                "Flag data loss, backfill, locking, and deployment-order risks explicitly.",
+            ],
+            verify: &[
+                "Run the migration, query test, or EXPLAIN command that validates the change.",
+                "Report before/after plan or timing when query performance is part of the task.",
+            ],
+        },
+        RunbookRole {
+            name: "perf",
+            title: "Performance Tuner Runbook",
+            description: "Profiling, bottleneck isolation, optimization, and benchmark verification.",
+            when_to_use: &[
+                "The task asks to reduce latency, memory, CPU, I/O, startup time, or resource usage.",
+                "A change claims performance impact and needs measurement.",
+            ],
+            rules: &[
+                "Measure baseline behavior before changing code.",
+                "Identify whether the bottleneck is CPU, memory, I/O, network, rendering, or algorithmic complexity.",
+                "Apply one targeted optimization at a time.",
+                "Do not trade correctness or maintainability for unmeasured speed.",
+            ],
+            verify: &[
+                "Report BOTTLENECK, CAUSE, FIX, and RESULT with units.",
+                "Include the benchmark/profiling command and before/after numbers.",
+            ],
+        },
+        RunbookRole {
+            name: "syseng",
+            title: "System Engineer Runbook",
+            description: "OS-level debugging, shell automation, daemon configuration, and system hardening.",
+            when_to_use: &[
+                "The task touches launchd/systemd, shell scripts, process state, file permissions, logs, networking, or host resources.",
+                "The leader needs root-cause analysis from system state rather than application code alone.",
+            ],
+            rules: &[
+                "Start with non-destructive observation commands and logs.",
+                "Avoid destructive operations unless the leader explicitly approves them.",
+                "List config files, services, sockets, and processes affected by the fix.",
+                "Prefer idempotent scripts and reversible config changes.",
+            ],
+            verify: &[
+                "Report exact commands used for diagnosis and verification.",
+                "Confirm the symptom is resolved, not merely hidden by a restart.",
+            ],
+        },
+        RunbookRole {
+            name: "api",
+            title: "API Designer Runbook",
+            description: "API contracts, endpoint design, schemas, versioning, and compatibility review.",
+            when_to_use: &[
+                "The task asks for REST, GraphQL, gRPC, JSON-RPC, OpenAPI, protobuf, or webhook contract work.",
+                "A change may affect external or cross-module clients.",
+            ],
+            rules: &[
+                "Read existing API contracts and naming conventions before designing new shapes.",
+                "Define request, response, error, auth, and pagination semantics where applicable.",
+                "Flag breaking changes and provide a migration/versioning path.",
+                "Keep contracts testable and avoid ambiguous nullable/optional behavior.",
+            ],
+            verify: &[
+                "Provide a contract test, schema validation command, or compatibility check.",
+                "Include example payloads for new or changed API surfaces.",
+            ],
+        },
+        RunbookRole {
+            name: "mobile",
+            title: "Mobile Developer Runbook",
+            description: "iOS/Android implementation, platform APIs, adaptive layout, and mobile constraints.",
+            when_to_use: &[
+                "The task touches SwiftUI/UIKit, Android/Compose/Kotlin, mobile permissions, notifications, storage, camera, or location.",
+                "The user-visible behavior depends on mobile layout, accessibility, battery, startup, or offline/network constraints.",
+            ],
+            rules: &[
+                "Follow platform idioms and existing app architecture.",
+                "Account for permissions, OS version support, background behavior, and accessibility.",
+                "Test layout-sensitive work across relevant screen sizes when feasible.",
+                "Avoid introducing platform-specific warnings or entitlement drift.",
+            ],
+            verify: &[
+                "Run the platform build or targeted UI/unit test for changed mobile code.",
+                "Report device/simulator coverage and any unverified screen-size risk.",
+            ],
+        },
+        RunbookRole {
+            name: "infra",
+            title: "Infrastructure Engineer Runbook",
+            description: "Cloud infrastructure, IaC, Kubernetes, networking, scaling, and operational dependencies.",
+            when_to_use: &[
+                "The task touches Terraform, Pulumi, CloudFormation, CDK, Kubernetes, IAM, DNS, certificates, CDN, or scaling.",
+                "The leader needs cost, dependency, secret, or rollout risk before infrastructure changes.",
+            ],
+            rules: &[
+                "Read existing IaC module structure and naming before editing.",
+                "Never hardcode credentials; use IAM, secret managers, or environment references.",
+                "Document cost impact, manual steps, and rollout/rollback considerations.",
+                "Keep resource changes minimal and reviewable.",
+            ],
+            verify: &[
+                "Prefer plan/diff/dry-run commands over direct apply.",
+                "Report resources changed, cost impact, and manual follow-up steps.",
+            ],
+        },
+        RunbookRole {
+            name: "ux",
+            title: "UX Designer Runbook",
+            description: "User flows, interaction design, usability review, component states, and accessibility specs.",
+            when_to_use: &[
+                "The task asks for flow design, wireframes, usability review, onboarding, interaction states, or UX copy.",
+                "A product surface is confusing and needs structure before implementation.",
+            ],
+            rules: &[
+                "Map the user goal and decision points before proposing UI.",
+                "Define empty, loading, error, disabled, hover, focus, and success states where relevant.",
+                "Call out accessibility requirements and keyboard/focus behavior.",
+                "Stay read-only unless the leader explicitly assigns implementation.",
+            ],
+            verify: &[
+                "Check the proposed flow against visibility, feedback, consistency, and recovery heuristics.",
+                "Rank usability issues by impact and name the affected user action.",
+            ],
+        },
+        RunbookRole {
+            name: "ai",
+            title: "AI Engineer Runbook",
+            description: "LLM integration, prompt engineering, RAG, model pipelines, guardrails, and evaluation.",
+            when_to_use: &[
+                "The task touches LLM prompts, tool calls, structured output, embeddings, vector search, RAG, evals, or model selection.",
+                "The leader needs cost, latency, quality, safety, or hallucination risk analysis for AI behavior.",
+            ],
+            rules: &[
+                "Read existing prompt, retrieval, tool, and model-selection code before changing behavior.",
+                "Define input/output schemas and validate model output before downstream use.",
+                "Document cost/latency tradeoffs and model-specific assumptions.",
+                "Never hardcode API keys; use environment variables or secret managers.",
+            ],
+            verify: &[
+                "Run or specify an eval, golden-case test, schema validation, or dry-run for changed AI behavior.",
+                "Report token/request estimates, expected cost per 1K calls, and known model limitations when applicable.",
             ],
         },
     ]
@@ -992,7 +1335,10 @@ fn find_runbook_project_root() -> Result<PathBuf, String> {
     let start = env::current_dir().map_err(|e| format!("current_dir: {e}"))?;
     let mut cur = start.as_path();
     loop {
-        if cur.join(".git").exists() || cur.join("AGENTS.md").exists() || cur.join("TODO.md").exists() {
+        if cur.join(".git").exists()
+            || cur.join("AGENTS.md").exists()
+            || cur.join("TODO.md").exists()
+        {
             return Ok(cur.to_path_buf());
         }
         match cur.parent() {
@@ -1007,7 +1353,13 @@ fn parse_runbook_tools(tool: &str) -> Result<Vec<RunbookTool>, String> {
     for raw in tool.split(',') {
         match raw.trim().to_ascii_lowercase().as_str() {
             "" => {}
-            "all" => return Ok(vec![RunbookTool::Claude, RunbookTool::Codex, RunbookTool::OpenCode]),
+            "all" => {
+                return Ok(vec![
+                    RunbookTool::Claude,
+                    RunbookTool::Codex,
+                    RunbookTool::OpenCode,
+                ])
+            }
             "claude" | "claude-code" | "claudecode" => out.push(RunbookTool::Claude),
             "codex" => out.push(RunbookTool::Codex),
             "opencode" | "open-code" => out.push(RunbookTool::OpenCode),
@@ -1032,18 +1384,21 @@ fn selected_runbook_roles(agent: Option<&str>) -> Result<Vec<RunbookRole>, Strin
 }
 
 fn runbook_source_path(root: &Path, role: &RunbookRole) -> PathBuf {
-    root.join(RUNBOOK_SOURCE_DIR).join(format!("{}.md", role.name))
+    root.join(RUNBOOK_SOURCE_DIR)
+        .join(format!("{}.md", role.name))
 }
 
-fn load_runbook_content_for_agent(root: &Path, agent: &str) -> Option<String> {
-    if !agent
+fn load_runbook_content_for_role(root: &Path, role: &str) -> Option<String> {
+    if !role
         .chars()
         .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
     {
         return None;
     }
-    let path = root.join(RUNBOOK_SOURCE_DIR).join(format!("{agent}.md"));
-    fs::read_to_string(path).ok().filter(|content| !content.trim().is_empty())
+    let path = root.join(RUNBOOK_SOURCE_DIR).join(format!("{role}.md"));
+    fs::read_to_string(path)
+        .ok()
+        .filter(|content| !content.trim().is_empty())
 }
 
 fn runbook_readme_path(root: &Path) -> PathBuf {
@@ -1072,28 +1427,45 @@ fn yaml_escape(s: &str) -> String {
 
 fn source_runbook_content(role: &RunbookRole) -> String {
     let mut out = format!(
-        "{RUNBOOK_MARKER}\n# {}\n\n{}\n\n## Role\n\n`{}` is a term-mesh team role. Use this runbook whenever an agent is assigned this role.\n\n## Operating Rules\n",
+        "{RUNBOOK_MARKER}\n# {}\n\n{}\n\n## Role\n\n`{}` is a term-mesh team role. Use this runbook whenever an agent is assigned this role.\n\n## When To Use\n",
         role.title, role.description, role.name
     );
+    for item in role.when_to_use {
+        out.push_str(&format!("- {item}\n"));
+    }
+    out.push_str("\n## Operating Rules\n");
     for rule in role.rules {
         out.push_str(&format!("- {rule}\n"));
     }
+    out.push_str("\n## Verify\n");
+    for item in role.verify {
+        out.push_str(&format!("- {item}\n"));
+    }
     out.push_str(
-        "\n## Standard Reply Header\n\n```text\nSTATUS: DONE|BLOCKED|NEEDS_REVIEW\nFILES: <changed paths or none>\nVERIFY: <single shell command or n/a>\nNEXT: <leader action or NONE>\n```\n",
+        "\n## Standard Reply Header\n\n```text\nSTATUS: DONE|BLOCKED|NEEDS_REVIEW\nFILES: <changed paths or none>\nVERIFY: <single shell command or n/a>\nNEXT: <leader action or NONE>\nFULL_REPORT: <absolute result path or n/a>\n```\n",
     );
     out
 }
 
-fn tool_runbook_content(tool: RunbookTool, role: &RunbookRole) -> String {
-    let body = source_runbook_content(role);
+fn effective_source_runbook_content(root: &Path, role: &RunbookRole) -> String {
+    fs::read_to_string(runbook_source_path(root, role))
+        .ok()
+        .filter(|content| !content.trim().is_empty())
+        .unwrap_or_else(|| source_runbook_content(role))
+}
+
+fn tool_runbook_content(tool: RunbookTool, role: &RunbookRole, source_content: &str) -> String {
     match tool {
         RunbookTool::Claude | RunbookTool::Codex => format!(
             "---\nname: term-mesh-{}\ndescription: \"{}\"\n---\n{}",
             role.name,
-            yaml_escape(&format!("Use when acting as the {} agent in a term-mesh team.", role.name)),
-            body
+            yaml_escape(&format!(
+                "Use when acting as the {} agent in a term-mesh team.",
+                role.name
+            )),
+            source_content
         ),
-        RunbookTool::OpenCode => body,
+        RunbookTool::OpenCode => source_content.to_string(),
     }
 }
 
@@ -1119,7 +1491,33 @@ fn file_runbook_state(path: &Path) -> &'static str {
     }
 }
 
-fn write_managed_runbook(path: &Path, content: &str, dry_run: bool, force: bool) -> Result<Value, String> {
+fn projection_runbook_state(
+    root: &Path,
+    tool: RunbookTool,
+    role: &RunbookRole,
+    path: &Path,
+) -> &'static str {
+    match fs::read_to_string(path) {
+        Ok(content) if !is_runbook_managed(&content) => "custom",
+        Ok(content) => {
+            let source_content = effective_source_runbook_content(root, role);
+            let expected = tool_runbook_content(tool, role, &source_content);
+            if content == expected {
+                "managed"
+            } else {
+                "outdated"
+            }
+        }
+        Err(_) => "missing",
+    }
+}
+
+fn write_managed_runbook(
+    path: &Path,
+    content: &str,
+    dry_run: bool,
+    force: bool,
+) -> Result<Value, String> {
     let existing = fs::read_to_string(path).ok();
     let action = match existing.as_deref() {
         Some(old) if old == content => "unchanged",
@@ -1132,7 +1530,8 @@ fn write_managed_runbook(path: &Path, content: &str, dry_run: bool, force: bool)
 
     if !dry_run && matches!(action, "created" | "updated") {
         if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent).map_err(|e| format!("create_dir {}: {e}", parent.display()))?;
+            fs::create_dir_all(parent)
+                .map_err(|e| format!("create_dir {}: {e}", parent.display()))?;
         }
         let file_name = path
             .file_name()
@@ -1140,7 +1539,8 @@ fn write_managed_runbook(path: &Path, content: &str, dry_run: bool, force: bool)
             .unwrap_or("runbook");
         let tmp = path.with_file_name(format!(".tmp-{file_name}"));
         fs::write(&tmp, content).map_err(|e| format!("write {}: {e}", tmp.display()))?;
-        fs::rename(&tmp, path).map_err(|e| format!("rename {} -> {}: {e}", tmp.display(), path.display()))?;
+        fs::rename(&tmp, path)
+            .map_err(|e| format!("rename {} -> {}: {e}", tmp.display(), path.display()))?;
     }
 
     Ok(json!({
@@ -1177,7 +1577,12 @@ fn runbook_init(dry_run: bool, force: bool) -> Result<Value, String> {
     }))
 }
 
-fn runbook_install(tool: &str, agent: Option<&str>, dry_run: bool, force: bool) -> Result<Value, String> {
+fn runbook_install(
+    tool: &str,
+    agent: Option<&str>,
+    dry_run: bool,
+    force: bool,
+) -> Result<Value, String> {
     let root = find_runbook_project_root()?;
     let tools = parse_runbook_tools(tool)?;
     let roles = selected_runbook_roles(agent)?;
@@ -1200,9 +1605,15 @@ fn runbook_install(tool: &str, agent: Option<&str>, dry_run: bool, force: bool) 
     }
     for tool in tools {
         for role in &roles {
+            // F1+F4 fix: use effective_source_runbook_content (the same
+            // resolver projection_runbook_state uses) so user edits to
+            // managed source files propagate into projections instead of
+            // being silently regenerated to defaults. Eliminates the
+            // status="outdated" → install → still "outdated" drift loop.
+            let source_content = effective_source_runbook_content(&root, role);
             files.push(write_managed_runbook(
                 &runbook_projection_path(&root, tool, role),
-                &tool_runbook_content(tool, role),
+                &tool_runbook_content(tool, role, &source_content),
                 dry_run,
                 force,
             )?);
@@ -1235,36 +1646,43 @@ fn runbook_status() -> Result<Value, String> {
         })
         .collect();
 
-    let tools: Vec<Value> = [RunbookTool::Claude, RunbookTool::Codex, RunbookTool::OpenCode]
-        .iter()
-        .map(|tool| {
-            let mut files = Vec::new();
-            let mut managed = 0;
-            let mut custom = 0;
-            let mut missing = 0;
-            for role in &roles {
-                let path = runbook_projection_path(&root, *tool, role);
-                let state = file_runbook_state(&path);
-                match state {
-                    "managed" => managed += 1,
-                    "custom" => custom += 1,
-                    _ => missing += 1,
-                }
-                files.push(json!({
-                    "role": role.name,
-                    "path": path.to_string_lossy(),
-                    "state": state,
-                }));
+    let tools: Vec<Value> = [
+        RunbookTool::Claude,
+        RunbookTool::Codex,
+        RunbookTool::OpenCode,
+    ]
+    .iter()
+    .map(|tool| {
+        let mut files = Vec::new();
+        let mut managed = 0;
+        let mut custom = 0;
+        let mut missing = 0;
+        let mut outdated = 0;
+        for role in &roles {
+            let path = runbook_projection_path(&root, *tool, role);
+            let state = projection_runbook_state(&root, *tool, role, &path);
+            match state {
+                "managed" => managed += 1,
+                "custom" => custom += 1,
+                "outdated" => outdated += 1,
+                _ => missing += 1,
             }
-            json!({
-                "tool": tool.as_str(),
-                "managed": managed,
-                "custom": custom,
-                "missing": missing,
-                "files": files,
-            })
+            files.push(json!({
+                "role": role.name,
+                "path": path.to_string_lossy(),
+                "state": state,
+            }));
+        }
+        json!({
+            "tool": tool.as_str(),
+            "managed": managed,
+            "custom": custom,
+            "missing": missing,
+            "outdated": outdated,
+            "files": files,
         })
-        .collect();
+    })
+    .collect();
 
     Ok(json!({
         "ok": true,
@@ -1282,9 +1700,12 @@ fn run_runbook_command(command: &RunbookCommands) -> Result<Value, String> {
     match command {
         RunbookCommands::Status => runbook_status(),
         RunbookCommands::Init { dry_run, force } => runbook_init(*dry_run, *force),
-        RunbookCommands::Install { tool, agent, dry_run, force } => {
-            runbook_install(tool, agent.as_deref(), *dry_run, *force)
-        }
+        RunbookCommands::Install {
+            tool,
+            agent,
+            dry_run,
+            force,
+        } => runbook_install(tool, agent.as_deref(), *dry_run, *force),
     }
 }
 
@@ -1309,8 +1730,10 @@ mod runbook_tests {
         let source = source_runbook_content(&role);
         assert!(source.starts_with(RUNBOOK_MARKER));
         assert!(source.contains("Reviewer Runbook"));
+        assert!(source.contains("## When To Use"));
+        assert!(source.contains("## Verify"));
 
-        let skill = tool_runbook_content(RunbookTool::Codex, &role);
+        let skill = tool_runbook_content(RunbookTool::Codex, &role, &source);
         assert!(skill.starts_with("---\nname: term-mesh-reviewer"));
         assert!(skill.contains(RUNBOOK_MARKER));
     }
@@ -1338,7 +1761,7 @@ mod runbook_tests {
     }
 
     #[test]
-    fn runbook_init_prompt_loads_matching_agent_file() {
+    fn runbook_init_prompt_loads_matching_role_file() {
         let unique = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
@@ -1348,9 +1771,50 @@ mod runbook_tests {
         fs::create_dir_all(&runbook_dir).unwrap();
         fs::write(runbook_dir.join("explorer.md"), "EXPLORER ONLY\n").unwrap();
 
-        let prompt = agent_init_prompt("explorer", &dir.to_string_lossy(), "/tmp/socket");
+        let prompt = agent_init_prompt("exp1", "explorer", &dir.to_string_lossy(), "/tmp/socket");
         assert!(prompt.contains("## Role Runbook"));
         assert!(prompt.contains("EXPLORER ONLY"));
+        assert!(prompt.contains("named \"exp1\" with role \"explorer\""));
+        assert!(prompt.contains(".agent-runbooks/explorer.md"));
+
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn runbook_projection_state_detects_outdated_managed_files() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = env::temp_dir().join(format!("tm-agent-runbook-drift-{unique}"));
+        let role = selected_runbook_roles(Some("reviewer")).unwrap().remove(0);
+        let source_path = runbook_source_path(&dir, &role);
+        let projection_path = runbook_projection_path(&dir, RunbookTool::Codex, &role);
+        fs::create_dir_all(source_path.parent().unwrap()).unwrap();
+        fs::create_dir_all(projection_path.parent().unwrap()).unwrap();
+
+        let custom_source = format!("{RUNBOOK_MARKER}\n# Custom Reviewer\n\n## Role\ncustom\n");
+        fs::write(&source_path, &custom_source).unwrap();
+        fs::write(
+            &projection_path,
+            tool_runbook_content(RunbookTool::Codex, &role, &source_runbook_content(&role)),
+        )
+        .unwrap();
+
+        assert_eq!(
+            projection_runbook_state(&dir, RunbookTool::Codex, &role, &projection_path),
+            "outdated"
+        );
+
+        fs::write(
+            &projection_path,
+            tool_runbook_content(RunbookTool::Codex, &role, &custom_source),
+        )
+        .unwrap();
+        assert_eq!(
+            projection_runbook_state(&dir, RunbookTool::Codex, &role, &projection_path),
+            "managed"
+        );
 
         fs::remove_dir_all(dir).ok();
     }
@@ -1424,10 +1888,19 @@ fn rpc_call(sock: &PathBuf, method: &str, params: Value) -> Result<Value, String
     rpc_call_timeout(sock, method, params, timeout)
 }
 
-fn rpc_call_timeout(sock: &PathBuf, method: &str, params: Value, timeout_secs: u64) -> Result<Value, String> {
+fn rpc_call_timeout(
+    sock: &PathBuf,
+    method: &str,
+    params: Value,
+    timeout_secs: u64,
+) -> Result<Value, String> {
     let stream = UnixStream::connect(sock).map_err(|e| format!("connect: {e}"))?;
-    stream.set_read_timeout(Some(Duration::from_secs(timeout_secs))).ok();
-    stream.set_write_timeout(Some(Duration::from_secs(timeout_secs))).ok();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(timeout_secs)))
+        .ok();
+    stream
+        .set_write_timeout(Some(Duration::from_secs(timeout_secs)))
+        .ok();
 
     let request = json!({
         "jsonrpc": "2.0",
@@ -1440,12 +1913,16 @@ fn rpc_call_timeout(sock: &PathBuf, method: &str, params: Value, timeout_secs: u
     line.push('\n');
 
     let mut writer = stream.try_clone().map_err(|e| format!("clone: {e}"))?;
-    writer.write_all(line.as_bytes()).map_err(|e| format!("write: {e}"))?;
+    writer
+        .write_all(line.as_bytes())
+        .map_err(|e| format!("write: {e}"))?;
     writer.flush().map_err(|e| format!("flush: {e}"))?;
 
     let mut reader = BufReader::new(&stream);
     let mut response = String::new();
-    reader.read_line(&mut response).map_err(|e| format!("read: {e}"))?;
+    reader
+        .read_line(&mut response)
+        .map_err(|e| format!("read: {e}"))?;
 
     serde_json::from_str(&response).map_err(|e| format!("parse: {e}"))
 }
@@ -1473,10 +1950,14 @@ fn rpc_call_with_reader(
     let mut line = serde_json::to_string(&request).map_err(|e| format!("serialize: {e}"))?;
     line.push('\n');
 
-    stream.write_all(line.as_bytes()).map_err(|e| format!("write: {e}"))?;
+    stream
+        .write_all(line.as_bytes())
+        .map_err(|e| format!("write: {e}"))?;
 
     let mut response = String::new();
-    reader.read_line(&mut response).map_err(|e| format!("read: {e}"))?;
+    reader
+        .read_line(&mut response)
+        .map_err(|e| format!("read: {e}"))?;
 
     serde_json::from_str(&response).map_err(|e| format!("parse: {e}"))
 }
@@ -1494,12 +1975,16 @@ fn rpc_batch(sock: &PathBuf, payloads: &[String]) -> Result<Vec<Value>, String> 
         .and_then(|v| v.parse::<u64>().ok())
         .unwrap_or(6);
     let stream = UnixStream::connect(sock).map_err(|e| format!("connect: {e}"))?;
-    stream.set_read_timeout(Some(Duration::from_secs(batch_timeout))).ok();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(batch_timeout)))
+        .ok();
     stream.set_write_timeout(Some(Duration::from_secs(3))).ok();
 
     let mut writer = stream.try_clone().map_err(|e| format!("clone: {e}"))?;
     for payload in payloads {
-        writer.write_all(payload.as_bytes()).map_err(|e| format!("write: {e}"))?;
+        writer
+            .write_all(payload.as_bytes())
+            .map_err(|e| format!("write: {e}"))?;
         writer.write_all(b"\n").map_err(|e| format!("write: {e}"))?;
     }
     writer.flush().map_err(|e| format!("flush: {e}"))?;
@@ -1510,15 +1995,13 @@ fn rpc_batch(sock: &PathBuf, payloads: &[String]) -> Result<Vec<Value>, String> 
         let mut line = String::new();
         match reader.read_line(&mut line) {
             Ok(0) => break, // EOF
-            Ok(_) if !line.trim().is_empty() => {
-                match serde_json::from_str::<Value>(&line) {
-                    Ok(v) => results.push(v),
-                    Err(e) => {
-                        eprintln!("  Warning: rpc_batch parse error: {e}");
-                        results.push(json!({"error": format!("parse: {e}")}));
-                    }
+            Ok(_) if !line.trim().is_empty() => match serde_json::from_str::<Value>(&line) {
+                Ok(v) => results.push(v),
+                Err(e) => {
+                    eprintln!("  Warning: rpc_batch parse error: {e}");
+                    results.push(json!({"error": format!("parse: {e}")}));
                 }
-            }
+            },
             Err(e) => {
                 eprintln!("  Warning: rpc_batch read error: {e}");
                 results.push(json!({"error": format!("read: {e}")}));
@@ -1562,7 +2045,11 @@ fn parse_batch_commands(commands: &str, team: &str) -> Result<Vec<String>, Strin
                         "method": "team.task.list",
                         "params": { "team_name": team }
                     }),
-                    _ => return Err(format!("batch: unknown task subcommand '{sub}'. Supported: list")),
+                    _ => {
+                        return Err(format!(
+                            "batch: unknown task subcommand '{sub}'. Supported: list"
+                        ))
+                    }
                 }
             }
             "send" => {
@@ -1572,9 +2059,11 @@ fn parse_batch_commands(commands: &str, team: &str) -> Result<Vec<String>, Strin
                 } else {
                     match rest.find(' ') {
                         Some(pos) => (&rest[..pos], rest[pos + 1..].trim()),
-                        None => return Err(
-                            "batch: send requires <agent>:<text> or <agent> <text>".to_string()
-                        ),
+                        None => {
+                            return Err(
+                                "batch: send requires <agent>:<text> or <agent> <text>".to_string()
+                            )
+                        }
                     }
                 };
                 json!({
@@ -1597,9 +2086,11 @@ fn parse_batch_commands(commands: &str, team: &str) -> Result<Vec<String>, Strin
                     "params": { "team_name": team, "text": format!("{rest}\n") }
                 })
             }
-            _ => return Err(format!(
+            _ => {
+                return Err(format!(
                 "batch: unsupported command '{verb}'. Supported: status, task list, send, broadcast"
-            )),
+            ))
+            }
         };
         payloads.push(serde_json::to_string(&rpc).map_err(|e| format!("batch: serialize: {e}"))?);
     }
@@ -1615,7 +2106,13 @@ fn pretty(v: &Value) -> String {
 
 /// Run heartbeat in a loop every `interval` seconds.
 /// Stops when the parent process exits (detected via kill -0) or SIGINT/SIGTERM.
-fn run_heartbeat_auto(sock: &PathBuf, team: &str, agent: &str, interval: u64, message: Option<&str>) -> Result<Value, String> {
+fn run_heartbeat_auto(
+    sock: &PathBuf,
+    team: &str,
+    agent: &str,
+    interval: u64,
+    message: Option<&str>,
+) -> Result<Value, String> {
     use std::sync::atomic::{AtomicBool, Ordering};
 
     static STOP: AtomicBool = AtomicBool::new(false);
@@ -1624,22 +2121,35 @@ fn run_heartbeat_auto(sock: &PathBuf, team: &str, agent: &str, interval: u64, me
         STOP.store(true, Ordering::SeqCst);
     }
     unsafe {
-        libc::signal(libc::SIGINT, handle_signal as *const () as libc::sighandler_t);
-        libc::signal(libc::SIGTERM, handle_signal as *const () as libc::sighandler_t);
+        libc::signal(
+            libc::SIGINT,
+            handle_signal as *const () as libc::sighandler_t,
+        );
+        libc::signal(
+            libc::SIGTERM,
+            handle_signal as *const () as libc::sighandler_t,
+        );
     }
 
     let ppid = unsafe { libc::getppid() };
     let msg = message.unwrap_or("working...");
 
-    eprintln!("auto-heartbeat started (interval={}s, ppid={}, send SIGINT/SIGTERM to stop)", interval, ppid);
+    eprintln!(
+        "auto-heartbeat started (interval={}s, ppid={}, send SIGINT/SIGTERM to stop)",
+        interval, ppid
+    );
 
     loop {
         // Send heartbeat
-        let _ = rpc_call(sock, "team.agent.heartbeat", json!({
-            "team_name": team,
-            "agent_name": agent,
-            "summary": msg,
-        }));
+        let _ = rpc_call(
+            sock,
+            "team.agent.heartbeat",
+            json!({
+                "team_name": team,
+                "agent_name": agent,
+                "summary": msg,
+            }),
+        );
 
         // Sleep in 100ms chunks to react to signals quickly
         let ticks = interval * 10;
@@ -1663,7 +2173,11 @@ fn run_heartbeat_auto(sock: &PathBuf, team: &str, agent: &str, interval: u64, me
 // ── Helpers ──────────────────────────────────────────────────────────
 
 fn append_report_suffix(text: &str, no_report: bool) -> String {
-    if no_report { text.to_string() } else { format!("{text}{REPORT_SUFFIX}") }
+    if no_report {
+        text.to_string()
+    } else {
+        format!("{text}{REPORT_SUFFIX}")
+    }
 }
 
 // ── Research helpers ──────────────────────────────────────────────────────────
@@ -1684,7 +2198,12 @@ impl AgentInfo {
         let model = v["model"].as_str().unwrap_or("sonnet").to_string();
         let cli = v["cli"].as_str().unwrap_or("claude").to_string();
         let agent_state = v["agent_state"].as_str().unwrap_or("").to_string();
-        Some(Self { name, model, cli, agent_state })
+        Some(Self {
+            name,
+            model,
+            cli,
+            agent_state,
+        })
     }
 }
 
@@ -1767,9 +2286,7 @@ fn task_title_from_text(text: &str) -> String {
 
 /// Format instruction for autonomous mode: task context + instruction only.
 /// No lifecycle commands (task start/done/reply) since the detached monitor handles completion.
-fn format_autonomous_instruction(
-    task: &Value, instruction: &str, context: Option<&str>,
-) -> String {
+fn format_autonomous_instruction(task: &Value, instruction: &str, context: Option<&str>) -> String {
     let mut lines = vec![
         format!("[TASK_ID] {}", task["id"].as_str().unwrap_or("")),
         format!("[TASK_TITLE] {}", task["title"].as_str().unwrap_or("")),
@@ -1787,14 +2304,21 @@ fn format_autonomous_instruction(
 }
 
 fn format_task_instruction(
-    sock: &PathBuf, team: &str,
-    task: &Value, instruction: &str, no_report: bool,
-    context: Option<&str>, fix_budget: Option<u8>,
+    sock: &PathBuf,
+    team: &str,
+    task: &Value,
+    instruction: &str,
+    no_report: bool,
+    context: Option<&str>,
+    fix_budget: Option<u8>,
 ) -> String {
     let mut lines = vec![
         format!("[TASK_ID] {}", task["id"].as_str().unwrap_or("")),
         format!("[TASK_TITLE] {}", task["title"].as_str().unwrap_or("")),
-        format!("[TASK_STATUS] {}", task["status"].as_str().unwrap_or("assigned")),
+        format!(
+            "[TASK_STATUS] {}",
+            task["status"].as_str().unwrap_or("assigned")
+        ),
     ];
     if let Some(p) = task["priority"].as_u64() {
         lines.push(format!("[TASK_PRIORITY] {p}"));
@@ -1813,9 +2337,13 @@ fn format_task_instruction(
             lines.push(format!("[DEPS] {}", dep_strs.join(", ")));
             // Inject dependency results for completed deps
             for dep_id in &dep_strs {
-                if let Ok(dep_resp) = rpc_call(sock, "team.task.get", json!({
-                    "team_name": team, "task_id": dep_id,
-                })) {
+                if let Ok(dep_resp) = rpc_call(
+                    sock,
+                    "team.task.get",
+                    json!({
+                        "team_name": team, "task_id": dep_id,
+                    }),
+                ) {
                     let dep_task = &dep_resp["result"];
                     if dep_task["status"].as_str() == Some("completed") {
                         let content = if let Some(path) = dep_task["result_path"].as_str() {
@@ -1849,9 +2377,12 @@ fn format_task_instruction(
 
     let task_id = task["id"].as_str().unwrap_or("");
     lines.push(String::new());
-    lines.push("[FORMAT COMPLIANCE] Follow the leader's instructions EXACTLY as given. \
+    lines.push(
+        "[FORMAT COMPLIANCE] Follow the leader's instructions EXACTLY as given. \
 If a specific output format is requested, reproduce it precisely — \
-do not paraphrase, summarize, or restructure the format.".to_string());
+do not paraphrase, summarize, or restructure the format."
+            .to_string(),
+    );
     lines.push(String::new());
     lines.push(instruction.trim().to_string());
     lines.push(String::new());
@@ -1860,7 +2391,7 @@ do not paraphrase, summarize, or restructure the format.".to_string());
     lines.push("- tm-agent heartbeat '<short progress summary>'".to_string());
     lines.push(format!("- tm-agent task block {task_id} '<reason>'"));
     lines.push(format!("- tm-agent task review {task_id} '<summary>'"));
-    lines.push(format!("- tm-agent task done {task_id} '<result>'"));
+    lines.push("- tm-agent reply '<5-line header plus result>'  # final completion; auto-reports and completes the active task".to_string());
 
     // Inject Auto-Fix Budget rules when budget is set
     if let Some(budget) = fix_budget {
@@ -1868,7 +2399,9 @@ do not paraphrase, summarize, or restructure the format.".to_string());
         lines.push(format!("## Auto-Fix Budget: {budget} attempts"));
         lines.push(format!("BEFORE each build/test/error fix attempt, run:"));
         lines.push(format!("  tm-agent task fix-attempt {task_id}"));
-        lines.push(format!("If it prints BUDGET_EXHAUSTED, stop immediately — you are auto-blocked."));
+        lines.push(format!(
+            "If it prints BUDGET_EXHAUSTED, stop immediately — you are auto-blocked."
+        ));
         lines.push(format!("Architecture decisions (new deps, API/schema changes) require immediate block regardless of budget."));
     }
 
@@ -1898,10 +2431,15 @@ fn results_dir(team: &str) -> PathBuf {
 
 fn write_result_file(team: &str, filename: &str, content: &str) -> Result<PathBuf, String> {
     // Sanitize filename to prevent path traversal
-    let safe_filename: String = filename.chars()
+    let safe_filename: String = filename
+        .chars()
         .filter(|c| c.is_alphanumeric() || *c == '-' || *c == '_' || *c == '.')
         .collect();
-    let safe_filename = if safe_filename.is_empty() { "unknown.md".to_string() } else { safe_filename };
+    let safe_filename = if safe_filename.is_empty() {
+        "unknown.md".to_string()
+    } else {
+        safe_filename
+    };
     let filename = safe_filename.as_str();
     let dir = results_dir(team);
     std::fs::create_dir_all(&dir).map_err(|e| format!("mkdir: {e}"))?;
@@ -1913,9 +2451,13 @@ fn write_result_file(team: &str, filename: &str, content: &str) -> Result<PathBu
 }
 
 fn truncate_summary(content: &str, max_chars: usize) -> String {
-    if content.len() <= max_chars { return content.to_string(); }
+    if content.len() <= max_chars {
+        return content.to_string();
+    }
     let mut end = max_chars;
-    while end > 0 && !content.is_char_boundary(end) { end -= 1; }
+    while end > 0 && !content.is_char_boundary(end) {
+        end -= 1;
+    }
     format!("{}...", &content[..end])
 }
 
@@ -1974,14 +2516,10 @@ fn create_board(behavior_type: &str) -> Result<(PathBuf, String), String> {
             .subsec_nanos();
         format!("{:04x}", (nanos ^ (process::id() << 16)) & 0xFFFF)
     };
-    let run_id = format!(
-        "{behavior_type}-{year:04}{month:02}{day:02}-{hour:02}{min:02}{sec:02}-{rand_hex}"
-    );
+    let run_id =
+        format!("{behavior_type}-{year:04}{month:02}{day:02}-{hour:02}{min:02}{sec:02}-{rand_hex}");
 
-    let board_dir = project_root
-        .join(".xm")
-        .join(behavior_type)
-        .join(&run_id);
+    let board_dir = project_root.join(".xm").join(behavior_type).join(&run_id);
 
     std::fs::create_dir_all(&board_dir)
         .map_err(|e| format!("create_dir_all {}: {e}", board_dir.display()))?;
@@ -2104,20 +2642,27 @@ fn main() {
             // Auto-complete the active task using team.task.list (data command,
             // no MainActor) instead of team.status (UI command) to avoid timeout.
             if report_result.is_ok() {
-                if let Ok(task_resp) = rpc_call(&sock, "team.task.list", json!({
-                    "team_name": &team, "assignee": &agent
-                })) {
+                if let Ok(task_resp) = rpc_call(
+                    &sock,
+                    "team.task.list",
+                    json!({
+                        "team_name": &team, "assignee": &agent
+                    }),
+                ) {
                     if let Some(tasks) = task_resp["result"]["tasks"].as_array() {
                         let summary = truncate_summary(report_content, 1500);
                         // Prefer in_progress task (the one actively being worked on),
                         // then fall back to any non-terminal task. This prevents
                         // completing a queued/blocked task when multiple tasks exist.
-                        let target_task = tasks.iter()
+                        let target_task = tasks
+                            .iter()
                             .find(|t| t["status"].as_str() == Some("in_progress"))
-                            .or_else(|| tasks.iter().find(|t| {
-                                let st = t["status"].as_str().unwrap_or("");
-                                st != "completed" && st != "failed" && st != "abandoned"
-                            }));
+                            .or_else(|| {
+                                tasks.iter().find(|t| {
+                                    let st = t["status"].as_str().unwrap_or("");
+                                    st != "completed" && st != "failed" && st != "abandoned"
+                                })
+                            });
                         if let Some(t) = target_task {
                             if let Some(tid) = t["id"].as_str() {
                                 let update = json!({
@@ -2125,7 +2670,8 @@ fn main() {
                                     "status": "completed", "result": summary,
                                 });
                                 // task.update — retry once on failure (task stays in_progress forever if lost)
-                                let update_result = rpc_call(&sock, "team.task.update", update.clone());
+                                let update_result =
+                                    rpc_call(&sock, "team.task.update", update.clone());
                                 if let Err(ref e) = update_result {
                                     eprintln!("  Warning: task.update failed: {e}, retrying...");
                                     let _ = rpc_call(&sock, "team.task.update", update);
@@ -2137,105 +2683,133 @@ fn main() {
             }
             report_result
         }
-        Commands::Ping { summary, auto, interval } | Commands::Heartbeat { summary, auto, interval } => {
+        Commands::Ping {
+            summary,
+            auto,
+            interval,
+        }
+        | Commands::Heartbeat {
+            summary,
+            auto,
+            interval,
+        } => {
             if auto {
                 run_heartbeat_auto(&sock, &team, &agent, interval, summary.as_deref())
             } else {
-                rpc_call(&sock, "team.agent.heartbeat", json!({
-                    "team_name": team,
-                    "agent_name": agent,
-                    "summary": summary.as_deref().unwrap_or("alive"),
-                }))
-            }
-        }
-        Commands::Msg(sub) => {
-            match sub {
-                MsgCommands::Send { content, to } => {
-                    let mut params = json!({
+                rpc_call(
+                    &sock,
+                    "team.agent.heartbeat",
+                    json!({
                         "team_name": team,
-                        "from": agent,
-                        "content": content,
-                        "type": "note",
-                    });
-                    if let Some(target) = to {
-                        params["to"] = json!(target);
-                    }
-                    rpc_call(&sock, "team.message.post", params)
-                }
-                MsgCommands::List { from_agent, to, limit } => {
-                    let mut params = json!({ "team_name": team });
-                    if let Some(f) = from_agent { params["from"] = json!(f); }
-                    if let Some(t) = to { params["to"] = json!(t); }
-                    if let Some(l) = limit { params["limit"] = json!(l); }
-                    rpc_call(&sock, "team.message.list", params)
-                }
-                MsgCommands::Clear => {
-                    rpc_call(&sock, "team.message.clear", json!({ "team_name": team }))
-                }
+                        "agent_name": agent,
+                        "summary": summary.as_deref().unwrap_or("alive"),
+                    }),
+                )
             }
         }
-        Commands::Context(sub) => {
-            match sub {
-                ContextCommands::Set { key, value } => {
-                    let agent = agent.clone();
-                    rpc_call(&sock, "team.context.set", json!({
+        Commands::Msg(sub) => match sub {
+            MsgCommands::Send { content, to } => {
+                let mut params = json!({
+                    "team_name": team,
+                    "from": agent,
+                    "content": content,
+                    "type": "note",
+                });
+                if let Some(target) = to {
+                    params["to"] = json!(target);
+                }
+                rpc_call(&sock, "team.message.post", params)
+            }
+            MsgCommands::List {
+                from_agent,
+                to,
+                limit,
+            } => {
+                let mut params = json!({ "team_name": team });
+                if let Some(f) = from_agent {
+                    params["from"] = json!(f);
+                }
+                if let Some(t) = to {
+                    params["to"] = json!(t);
+                }
+                if let Some(l) = limit {
+                    params["limit"] = json!(l);
+                }
+                rpc_call(&sock, "team.message.list", params)
+            }
+            MsgCommands::Clear => {
+                rpc_call(&sock, "team.message.clear", json!({ "team_name": team }))
+            }
+        },
+        Commands::Context(sub) => match sub {
+            ContextCommands::Set { key, value } => {
+                let agent = agent.clone();
+                rpc_call(
+                    &sock,
+                    "team.context.set",
+                    json!({
                         "team_name": team, "key": key, "value": value, "set_by": agent,
-                    }))
-                }
-                ContextCommands::Get { key } => {
-                    rpc_call(&sock, "team.context.get", json!({ "team_name": team, "key": key }))
-                }
-                ContextCommands::List => {
-                    rpc_call(&sock, "team.context.list", json!({ "team_name": team }))
-                }
+                    }),
+                )
             }
-        }
-        Commands::Template(sub) => {
-            match sub {
-                TemplateCommands::List => {
-                    let templates = list_all_templates();
-                    if templates.is_empty() {
-                        println!("No templates found.");
-                    } else {
-                        println!("{:<20} {}", "NAME", "SOURCE");
-                        println!("{}", "-".repeat(50));
-                        for (name, source) in &templates {
-                            println!("{:<20} {}", name, source);
-                        }
+            ContextCommands::Get { key } => rpc_call(
+                &sock,
+                "team.context.get",
+                json!({ "team_name": team, "key": key }),
+            ),
+            ContextCommands::List => {
+                rpc_call(&sock, "team.context.list", json!({ "team_name": team }))
+            }
+        },
+        Commands::Template(sub) => match sub {
+            TemplateCommands::List => {
+                let templates = list_all_templates();
+                if templates.is_empty() {
+                    println!("No templates found.");
+                } else {
+                    println!("{:<20} {}", "NAME", "SOURCE");
+                    println!("{}", "-".repeat(50));
+                    for (name, source) in &templates {
+                        println!("{:<20} {}", name, source);
+                    }
+                }
+                return;
+            }
+            TemplateCommands::Show { name } => match load_template(&name) {
+                Ok(t) => {
+                    println!("name:     {}", t.name);
+                    println!("title:    {}", t.title);
+                    if let Some(d) = &t.description {
+                        println!("desc:\n  {}", d.replace('\n', "\n  "));
+                    }
+                    if let Some(p) = t.priority {
+                        println!("priority: {p}");
+                    }
+                    if let Some(a) = &t.assign {
+                        println!("assign:   {a}");
                     }
                     return;
                 }
-                TemplateCommands::Show { name } => {
-                    match load_template(&name) {
-                        Ok(t) => {
-                            println!("name:     {}", t.name);
-                            println!("title:    {}", t.title);
-                            if let Some(d) = &t.description {
-                                println!("desc:\n  {}", d.replace('\n', "\n  "));
-                            }
-                            if let Some(p) = t.priority { println!("priority: {p}"); }
-                            if let Some(a) = &t.assign { println!("assign:   {a}"); }
-                            return;
-                        }
-                        Err(e) => {
-                            eprintln!("Error: {e}");
-                            process::exit(1);
-                        }
-                    }
+                Err(e) => {
+                    eprintln!("Error: {e}");
+                    process::exit(1);
                 }
-            }
-        }
+            },
+        },
         Commands::Task(sub) => {
             match sub {
-                TaskCommands::Start { task_id } => {
-                    rpc_call(&sock, "team.task.update", json!({
+                TaskCommands::Start { task_id } => rpc_call(
+                    &sock,
+                    "team.task.update",
+                    json!({
                         "team_name": team, "task_id": task_id, "status": "in_progress",
-                    }))
-                }
+                    }),
+                ),
                 TaskCommands::Done { task_id, result } => {
                     let result_text = result.as_deref().unwrap_or("done");
                     // Write full result to file, send truncated summary via socket
-                    let result_path = write_result_file(&team, &format!("{task_id}.md"), result_text).ok();
+                    let result_path =
+                        write_result_file(&team, &format!("{task_id}.md"), result_text).ok();
                     let summary = truncate_summary(result_text, 1500);
                     let mut params = json!({
                         "team_name": team, "task_id": task_id,
@@ -2246,13 +2820,24 @@ fn main() {
                     }
                     rpc_call(&sock, "team.task.done", params)
                 }
-                TaskCommands::Block { task_id, reason } => {
-                    rpc_call(&sock, "team.task.block", json!({
+                TaskCommands::Block { task_id, reason } => rpc_call(
+                    &sock,
+                    "team.task.block",
+                    json!({
                         "team_name": team, "task_id": task_id,
                         "blocked_reason": reason.as_deref().unwrap_or("blocked"),
-                    }))
-                }
-                TaskCommands::Create { title, assign, desc, priority, accept, deps, template, var } => {
+                    }),
+                ),
+                TaskCommands::Create {
+                    title,
+                    assign,
+                    desc,
+                    priority,
+                    accept,
+                    deps,
+                    template,
+                    var,
+                } => {
                     // Resolve template (if provided), CLI args take precedence over template values
                     let (tmpl_title, tmpl_desc, tmpl_assign, tmpl_priority) =
                         if let Some(ref tname) = template {
@@ -2271,7 +2856,9 @@ fn main() {
                         };
 
                     let final_title = title.or(tmpl_title).unwrap_or_else(|| {
-                        eprintln!("Error: title required (provide as positional arg or via --template)");
+                        eprintln!(
+                            "Error: title required (provide as positional arg or via --template)"
+                        );
                         std::process::exit(1);
                     });
                     let final_desc = desc.or(tmpl_desc);
@@ -2279,18 +2866,30 @@ fn main() {
                     let final_priority = priority.or(tmpl_priority);
 
                     let mut params = json!({ "team_name": team, "title": final_title });
-                    if let Some(a) = final_assign { params["assignee"] = json!(a); }
-                    if let Some(d) = final_desc { params["description"] = json!(d); }
-                    if let Some(p) = final_priority { params["priority"] = json!(p); }
-                    if !accept.is_empty() { params["acceptance_criteria"] = json!(accept); }
-                    if !deps.is_empty() { params["depends_on"] = json!(deps); }
+                    if let Some(a) = final_assign {
+                        params["assignee"] = json!(a);
+                    }
+                    if let Some(d) = final_desc {
+                        params["description"] = json!(d);
+                    }
+                    if let Some(p) = final_priority {
+                        params["priority"] = json!(p);
+                    }
+                    if !accept.is_empty() {
+                        params["acceptance_criteria"] = json!(accept);
+                    }
+                    if !deps.is_empty() {
+                        params["depends_on"] = json!(deps);
+                    }
                     rpc_call(&sock, "team.task.create", params)
                 }
-                TaskCommands::Get { id } => {
-                    rpc_call(&sock, "team.task.get", json!({
+                TaskCommands::Get { id } => rpc_call(
+                    &sock,
+                    "team.task.get",
+                    json!({
                         "team_name": team, "task_id": id,
-                    }))
-                }
+                    }),
+                ),
                 TaskCommands::List => {
                     rpc_call(&sock, "team.task.list", json!({ "team_name": team }))
                 }
@@ -2298,36 +2897,54 @@ fn main() {
                     let mut params = json!({
                         "team_name": team, "task_id": id, "status": status,
                     });
-                    if let Some(r) = result { params["result"] = json!(r); }
+                    if let Some(r) = result {
+                        params["result"] = json!(r);
+                    }
                     rpc_call(&sock, "team.task.update", params)
                 }
-                TaskCommands::Review { id, summary } => {
-                    rpc_call(&sock, "team.task.review", json!({
+                TaskCommands::Review { id, summary } => rpc_call(
+                    &sock,
+                    "team.task.review",
+                    json!({
                         "team_name": team, "task_id": id,
                         "summary": summary.as_deref().unwrap_or(""),
-                    }))
-                }
-                TaskCommands::Reassign { id, agent: ref target } => {
-                    rpc_call(&sock, "team.task.reassign", json!({
+                    }),
+                ),
+                TaskCommands::Reassign {
+                    id,
+                    agent: ref target,
+                } => rpc_call(
+                    &sock,
+                    "team.task.reassign",
+                    json!({
                         "team_name": team, "task_id": id, "assignee": target,
-                    }))
-                }
-                TaskCommands::Unblock { id } => {
-                    rpc_call(&sock, "team.task.unblock", json!({
+                    }),
+                ),
+                TaskCommands::Unblock { id } => rpc_call(
+                    &sock,
+                    "team.task.unblock",
+                    json!({
                         "team_name": team, "task_id": id,
-                    }))
-                }
+                    }),
+                ),
                 TaskCommands::FixAttempt { task_id } => {
-                    match rpc_call(&sock, "team.task.fix_attempt", json!({
-                        "team_name": team, "task_id": task_id,
-                    })) {
+                    match rpc_call(
+                        &sock,
+                        "team.task.fix_attempt",
+                        json!({
+                            "team_name": team, "task_id": task_id,
+                        }),
+                    ) {
                         Ok(ref v) => {
                             let result = &v["result"];
                             let count = result["fix_count"].as_u64().unwrap_or(0);
                             let budget = result["fix_budget"].as_u64().unwrap_or(0);
                             let blocked = result["blocked"].as_bool().unwrap_or(false);
                             if blocked {
-                                eprintln!("⚠️  Fix budget exhausted ({}/{}). Task auto-blocked.", count, budget);
+                                eprintln!(
+                                    "⚠️  Fix budget exhausted ({}/{}). Task auto-blocked.",
+                                    count, budget
+                                );
                             } else {
                                 eprintln!("Fix attempt {}/{} recorded.", count, budget);
                             }
@@ -2336,7 +2953,9 @@ fn main() {
                         Err(e) => {
                             // If server doesn't support fix_attempt yet, warn but don't fail
                             eprintln!("Warning: fix_attempt RPC not available ({}). Continuing without budget tracking.", e);
-                            Ok(json!({"ok": true, "result": {"fix_count": 0, "fix_budget": 0, "blocked": false}}))
+                            Ok(
+                                json!({"ok": true, "result": {"fix_count": 0, "fix_budget": 0, "blocked": false}}),
+                            )
                         }
                     }
                 }
@@ -2344,7 +2963,9 @@ fn main() {
                     let mut params = json!({
                         "team_name": team, "task_id": id, "title": title,
                     });
-                    if let Some(a) = assign { params["assignee"] = json!(a); }
+                    if let Some(a) = assign {
+                        params["assignee"] = json!(a);
+                    }
                     rpc_call(&sock, "team.task.split", params)
                 }
                 TaskCommands::Clear => {
@@ -2353,66 +2974,100 @@ fn main() {
             }
         }
         // ── Legacy hyphenated aliases ────────────────────────────────
-        Commands::TaskGet { id } => {
-            rpc_call(&sock, "team.task.get", json!({
+        Commands::TaskGet { id } => rpc_call(
+            &sock,
+            "team.task.get",
+            json!({
                 "team_name": team, "task_id": id,
-            }))
-        }
-        Commands::TaskStart { task_id } => {
-            rpc_call(&sock, "team.task.update", json!({
+            }),
+        ),
+        Commands::TaskStart { task_id } => rpc_call(
+            &sock,
+            "team.task.update",
+            json!({
                 "team_name": team, "task_id": task_id, "status": "in_progress",
-            }))
-        }
-        Commands::TaskDone { task_id, result } => {
-            rpc_call(&sock, "team.task.done", json!({
+            }),
+        ),
+        Commands::TaskDone { task_id, result } => rpc_call(
+            &sock,
+            "team.task.done",
+            json!({
                 "team_name": team, "task_id": task_id,
                 "result": result.as_deref().unwrap_or("done"),
-            }))
-        }
-        Commands::TaskBlock { task_id, reason } => {
-            rpc_call(&sock, "team.task.block", json!({
+            }),
+        ),
+        Commands::TaskBlock { task_id, reason } => rpc_call(
+            &sock,
+            "team.task.block",
+            json!({
                 "team_name": team, "task_id": task_id,
                 "blocked_reason": reason.as_deref().unwrap_or("blocked"),
-            }))
-        }
+            }),
+        ),
         Commands::TaskList | Commands::Tasks => {
             rpc_call(&sock, "team.task.list", json!({ "team_name": team }))
         }
-        Commands::TaskCreate2 { title, assign, desc, priority, accept, deps } => {
+        Commands::TaskCreate2 {
+            title,
+            assign,
+            desc,
+            priority,
+            accept,
+            deps,
+        } => {
             let mut params = json!({ "team_name": team, "title": title });
-            if let Some(a) = assign { params["assignee"] = json!(a); }
-            if let Some(d) = desc { params["description"] = json!(d); }
-            if let Some(p) = priority { params["priority"] = json!(p); }
-            if !accept.is_empty() { params["acceptance_criteria"] = json!(accept); }
-            if !deps.is_empty() { params["depends_on"] = json!(deps); }
+            if let Some(a) = assign {
+                params["assignee"] = json!(a);
+            }
+            if let Some(d) = desc {
+                params["description"] = json!(d);
+            }
+            if let Some(p) = priority {
+                params["priority"] = json!(p);
+            }
+            if !accept.is_empty() {
+                params["acceptance_criteria"] = json!(accept);
+            }
+            if !deps.is_empty() {
+                params["depends_on"] = json!(deps);
+            }
             rpc_call(&sock, "team.task.create", params)
         }
         Commands::TaskUpdate2 { id, status, result } => {
             let mut params = json!({
                 "team_name": team, "task_id": id, "status": status,
             });
-            if let Some(r) = result { params["result"] = json!(r); }
+            if let Some(r) = result {
+                params["result"] = json!(r);
+            }
             rpc_call(&sock, "team.task.update", params)
         }
-        Commands::TaskReview2 { id, summary } => {
-            rpc_call(&sock, "team.task.review", json!({
+        Commands::TaskReview2 { id, summary } => rpc_call(
+            &sock,
+            "team.task.review",
+            json!({
                 "team_name": team, "task_id": id,
                 "summary": summary.as_deref().unwrap_or(""),
-            }))
-        }
-        Commands::TaskReassign2 { id, agent: ref target } => {
-            rpc_call(&sock, "team.task.reassign", json!({
+            }),
+        ),
+        Commands::TaskReassign2 {
+            id,
+            agent: ref target,
+        } => rpc_call(
+            &sock,
+            "team.task.reassign",
+            json!({
                 "team_name": team, "task_id": id, "assignee": target,
-            }))
-        }
-        Commands::TaskUnblock2 { id } => {
-            rpc_call(&sock, "team.task.unblock", json!({
+            }),
+        ),
+        Commands::TaskUnblock2 { id } => rpc_call(
+            &sock,
+            "team.task.unblock",
+            json!({
                 "team_name": team, "task_id": id,
-            }))
-        }
-        Commands::TaskClear2 => {
-            rpc_call(&sock, "team.task.clear", json!({ "team_name": team }))
-        }
+            }),
+        ),
+        Commands::TaskClear2 => rpc_call(&sock, "team.task.clear", json!({ "team_name": team })),
         Commands::Peer(_) => unreachable!("peer commands exit before detect_socket()"),
         Commands::Runbook(_) => unreachable!("runbook commands exit before detect_socket()"),
         Commands::Status => {
@@ -2441,15 +3096,20 @@ fn main() {
             }
             Ok(status)
         }
-        Commands::Inbox => {
-            rpc_call(&sock, "team.inbox", json!({
+        Commands::Inbox => rpc_call(
+            &sock,
+            "team.inbox",
+            json!({
                 "team_name": team, "agent_name": agent,
-            }))
-        }
+            }),
+        ),
         Commands::Batch { commands } => {
             let payloads = match parse_batch_commands(&commands, &team) {
                 Ok(p) => p,
-                Err(e) => { eprintln!("Error: {e}"); process::exit(1); }
+                Err(e) => {
+                    eprintln!("Error: {e}");
+                    process::exit(1);
+                }
             };
             match rpc_batch(&sock, &payloads) {
                 Ok(results) => {
@@ -2458,7 +3118,10 @@ fn main() {
                     }
                     return;
                 }
-                Err(e) => { eprintln!("Error: {e}"); process::exit(1); }
+                Err(e) => {
+                    eprintln!("Error: {e}");
+                    process::exit(1);
+                }
             }
         }
         Commands::Raw { payload } => {
@@ -2470,8 +3133,18 @@ fn main() {
             match stream {
                 Ok(stream) => {
                     stream.set_read_timeout(Some(Duration::from_secs(2))).ok();
-                    let mut writer = stream.try_clone().map_err(|e| format!("clone: {e}")).unwrap_or_else(|e| { eprintln!("Error: {e}"); process::exit(1); });
-                    if let Err(e) = writer.write_all(payload.as_bytes()).and_then(|_| writer.write_all(b"\n")).and_then(|_| writer.flush()) {
+                    let mut writer = stream
+                        .try_clone()
+                        .map_err(|e| format!("clone: {e}"))
+                        .unwrap_or_else(|e| {
+                            eprintln!("Error: {e}");
+                            process::exit(1);
+                        });
+                    if let Err(e) = writer
+                        .write_all(payload.as_bytes())
+                        .and_then(|_| writer.write_all(b"\n"))
+                        .and_then(|_| writer.flush())
+                    {
                         eprintln!("Error: write: {e}");
                         process::exit(1);
                     }
@@ -2481,7 +3154,10 @@ fn main() {
                     print!("{line}");
                     return;
                 }
-                Err(e) => { eprintln!("Error: {e}"); process::exit(1); }
+                Err(e) => {
+                    eprintln!("Error: {e}");
+                    process::exit(1);
+                }
             }
         }
 
@@ -2491,36 +3167,50 @@ fn main() {
             cleanup_old_results(&team);
             // Also destroy headless team if it exists
             if let Some(daemon_sock) = detect_daemon_socket() {
-                let _ = rpc_call_timeout(&daemon_sock, "headless.destroy_team", json!({ "team_name": team }), 5);
+                let _ = rpc_call_timeout(
+                    &daemon_sock,
+                    "headless.destroy_team",
+                    json!({ "team_name": team }),
+                    5,
+                );
             }
             rpc_call(&sock, "team.destroy", json!({ "team_name": team }))
         }
-        Commands::List => {
-            rpc_call(&sock, "team.list", json!({}))
-        }
-        Commands::Read { agent: ref agent_name, lines } => {
+        Commands::List => rpc_call(&sock, "team.list", json!({})),
+        Commands::Read {
+            agent: ref agent_name,
+            lines,
+        } => {
             // Check if agent is headless — route to daemon socket
             if let Some(daemon_sock) = detect_daemon_socket() {
                 if let Some(agent_id) = is_headless_agent(&daemon_sock, &team, agent_name) {
-                    print_result(rpc_call(&daemon_sock, "headless.read", json!({
-                        "agent_id": agent_id,
-                        "lines": lines,
-                    })));
+                    print_result(rpc_call(
+                        &daemon_sock,
+                        "headless.read",
+                        json!({
+                            "agent_id": agent_id,
+                            "lines": lines,
+                        }),
+                    ));
                     return;
                 }
             }
-            rpc_call(&sock, "team.read", json!({
-                "team_name": team, "agent_name": agent_name, "lines": lines,
-            }))
+            rpc_call(
+                &sock,
+                "team.read",
+                json!({
+                    "team_name": team, "agent_name": agent_name, "lines": lines,
+                }),
+            )
         }
-        Commands::Collect { lines } => {
-            rpc_call(&sock, "team.collect", json!({
+        Commands::Collect { lines } => rpc_call(
+            &sock,
+            "team.collect",
+            json!({
                 "team_name": team, "lines": lines,
-            }))
-        }
-        Commands::Reports => {
-            rpc_call(&sock, "team.result.collect", json!({ "team_name": team }))
-        }
+            }),
+        ),
+        Commands::Reports => rpc_call(&sock, "team.result.collect", json!({ "team_name": team })),
         Commands::ResultStatus => {
             rpc_call(&sock, "team.result.status", json!({ "team_name": team }))
         }
@@ -2528,26 +3218,67 @@ fn main() {
             rpc_call(&sock, "team.result.collect", json!({ "team_name": team }))
         }
         // ── Orchestration commands ──────────────────────────────
-        Commands::Create { count, claude_leader, model, leader_model, kiro, codex, gemini, adopt, preset, roles, headless, resume_session } => {
+        Commands::Create {
+            count,
+            claude_leader,
+            model,
+            leader_model,
+            kiro,
+            codex,
+            gemini,
+            adopt,
+            preset,
+            roles,
+            headless,
+            resume_session,
+        } => {
             if headless {
                 run_create_headless(&sock, &team, count.unwrap_or(2), &model, roles.as_deref());
             } else {
-                run_create(&sock, &team, count.unwrap_or(2), claude_leader, &model, leader_model.as_deref(), &kiro, &codex, &gemini, adopt, preset.as_deref(), roles.as_deref(), resume_session);
+                run_create(
+                    &sock,
+                    &team,
+                    count.unwrap_or(2),
+                    claude_leader,
+                    &model,
+                    leader_model.as_deref(),
+                    &kiro,
+                    &codex,
+                    &gemini,
+                    adopt,
+                    preset.as_deref(),
+                    roles.as_deref(),
+                    resume_session,
+                );
             }
             return;
         }
-        Commands::Add { agent_type, name, model, cli } => {
+        Commands::Add {
+            agent_type,
+            name,
+            model,
+            cli,
+        } => {
             let agent_name = name.unwrap_or_else(|| agent_type.clone());
 
             // Try headless path first
             if let Some(daemon_sock) = detect_daemon_socket() {
                 // Check if the team exists as a headless team
                 if let Ok(resp) = rpc_call(&daemon_sock, "headless.list_teams", json!({})) {
-                    let is_headless = resp["result"].as_array()
+                    let is_headless = resp["result"]
+                        .as_array()
                         .map(|teams| teams.iter().any(|t| t["name"].as_str() == Some(&team)))
                         .unwrap_or(false);
                     if is_headless {
-                        run_add_headless(&sock, &daemon_sock, &team, &agent_name, &agent_type, &model, &cli);
+                        run_add_headless(
+                            &sock,
+                            &daemon_sock,
+                            &team,
+                            &agent_name,
+                            &agent_type,
+                            &model,
+                            &cli,
+                        );
                         return;
                     }
                 }
@@ -2559,7 +3290,12 @@ fn main() {
             eprintln!("      Headless team support: 'tm-agent create --headless ...' then 'tm-agent add ...'");
             process::exit(1);
         }
-        Commands::Attach { agent_type, name, model, cli } => {
+        Commands::Attach {
+            agent_type,
+            name,
+            model,
+            cli,
+        } => {
             let agent_name = name.unwrap_or_else(|| agent_type.clone());
             if let Err(e) = validate_agent_name(&agent_name) {
                 eprintln!("Error: {}", e);
@@ -2576,80 +3312,110 @@ fn main() {
             run_detach(&sock, &agent_name);
             return;
         }
-        Commands::Preset(sub) => {
-            match sub {
-                PresetCommands::List => {
-                    match rpc_call(&sock, "team.preset.list", json!({})) {
-                        Ok(resp) => {
-                            if let Some(presets) = resp["result"]["presets"].as_array() {
+        Commands::Preset(sub) => match sub {
+            PresetCommands::List => {
+                match rpc_call(&sock, "team.preset.list", json!({})) {
+                    Ok(resp) => {
+                        if let Some(presets) = resp["result"]["presets"].as_array() {
+                            println!(
+                                "{:<18} {:<10} {:<24} {:<8} {}",
+                                "ID", "Kind", "Name", "Agents", "Description"
+                            );
+                            println!("{}", "-".repeat(92));
+                            for p in presets {
+                                let id = p["id"].as_str().unwrap_or("");
+                                let kind = p["type"].as_str().unwrap_or("smart");
+                                let name = p["name"].as_str().unwrap_or("");
+                                let desc = p["description"].as_str().unwrap_or("");
+                                let agent_count =
+                                    p["agents"].as_array().map(|a| a.len()).unwrap_or(0);
                                 println!(
                                     "{:<18} {:<10} {:<24} {:<8} {}",
-                                    "ID", "Kind", "Name", "Agents", "Description"
+                                    id, kind, name, agent_count, desc
                                 );
-                                println!("{}", "-".repeat(92));
-                                for p in presets {
-                                    let id = p["id"].as_str().unwrap_or("");
-                                    let kind = p["type"].as_str().unwrap_or("smart");
-                                    let name = p["name"].as_str().unwrap_or("");
-                                    let desc = p["description"].as_str().unwrap_or("");
-                                    let agent_count = p["agents"].as_array().map(|a| a.len()).unwrap_or(0);
-                                    println!(
-                                        "{:<18} {:<10} {:<24} {:<8} {}",
-                                        id, kind, name, agent_count, desc
-                                    );
-                                }
-                            } else {
-                                println!("{}", pretty(&resp));
                             }
+                        } else {
+                            println!("{}", pretty(&resp));
                         }
-                        Err(e) => { eprintln!("Error: {e}"); process::exit(1); }
                     }
-                    return;
+                    Err(e) => {
+                        eprintln!("Error: {e}");
+                        process::exit(1);
+                    }
                 }
+                return;
             }
-        }
+        },
         Commands::Stop { agent, all } => {
             if all || agent.is_none() {
                 // Interrupt all agents in the team
-                print_result(rpc_call(&sock, "team.interrupt_all", json!({
-                    "team_name": team,
-                })));
+                print_result(rpc_call(
+                    &sock,
+                    "team.interrupt_all",
+                    json!({
+                        "team_name": team,
+                    }),
+                ));
             } else if let Some(ref target) = agent {
                 // Interrupt a specific agent
-                print_result(rpc_call(&sock, "team.interrupt", json!({
-                    "team_name": team, "agent_name": target,
-                })));
+                print_result(rpc_call(
+                    &sock,
+                    "team.interrupt",
+                    json!({
+                        "team_name": team, "agent_name": target,
+                    }),
+                ));
             }
             return;
         }
-        Commands::Send { agent: ref target, text, no_report } => {
+        Commands::Send {
+            agent: ref target,
+            text,
+            no_report,
+        } => {
             let text = append_report_suffix(&text, no_report);
             // Check if agent is headless — route to daemon socket
             if let Some(daemon_sock) = detect_daemon_socket() {
                 if let Some(agent_id) = is_headless_agent(&daemon_sock, &team, target) {
-                    print_result(rpc_call(&daemon_sock, "headless.send", json!({
-                        "agent_id": agent_id,
-                        "text": format!("{text}\n"),
-                    })));
+                    print_result(rpc_call(
+                        &daemon_sock,
+                        "headless.send",
+                        json!({
+                            "agent_id": agent_id,
+                            "text": format!("{text}\n"),
+                        }),
+                    ));
                     return;
                 }
             }
-            let send_result = rpc_call(&sock, "team.send", json!({
-                "team_name": team, "agent_name": target,
-                "text": format!("{text}\n"),
-            }));
+            let send_result = rpc_call(
+                &sock,
+                "team.send",
+                json!({
+                    "team_name": team, "agent_name": target,
+                    "text": format!("{text}\n"),
+                }),
+            );
             // Send Return key via team.send_key (reliable sendNamedKey path)
             if let Ok(ref r) = send_result {
                 if r["result"]["text_delivered"].as_bool().unwrap_or(false) {
                     std::thread::sleep(Duration::from_millis(150));
                     for attempt in 0..5u32 {
-                        match rpc_call(&sock, "team.send_key", json!({
-                            "team_name": team, "agent_name": target, "key": "return",
-                        })) {
+                        match rpc_call(
+                            &sock,
+                            "team.send_key",
+                            json!({
+                                "team_name": team, "agent_name": target, "key": "return",
+                            }),
+                        ) {
                             Ok(r) if r["ok"].as_bool().unwrap_or(false) => break,
-                            _ => if attempt < 4 {
-                                std::thread::sleep(Duration::from_millis(200 * (attempt as u64 + 1)));
-                            },
+                            _ => {
+                                if attempt < 4 {
+                                    std::thread::sleep(Duration::from_millis(
+                                        200 * (attempt as u64 + 1),
+                                    ));
+                                }
+                            }
                         }
                     }
                 }
@@ -2658,33 +3424,123 @@ fn main() {
             return;
         }
         Commands::Broadcast { text, no_report } => {
-            let text = if no_report { text } else { format!("{text}{BROADCAST_SUFFIX}") };
-            print_result(rpc_call(&sock, "team.broadcast", json!({
-                "team_name": team, "text": format!("{text}\n"),
-            })));
+            let text = if no_report {
+                text
+            } else {
+                format!("{text}{BROADCAST_SUFFIX}")
+            };
+            print_result(rpc_call(
+                &sock,
+                "team.broadcast",
+                json!({
+                    "team_name": team, "text": format!("{text}\n"),
+                }),
+            ));
             return;
         }
-        Commands::Delegate { agent: ref target, text, title, priority, accept, deps, desc, no_report, context, auto_fix_budget, autonomous } => {
+        Commands::Delegate {
+            agent: ref target,
+            text,
+            title,
+            priority,
+            accept,
+            deps,
+            desc,
+            no_report,
+            context,
+            auto_fix_budget,
+            autonomous,
+        } => {
             // Auto-detect comma-separated agents and route to parallel fan-out
             if target.contains(',') {
-                run_fan_out(&sock, &team, &text, title, priority, no_report, &Some(target.to_string()), context.as_deref(), auto_fix_budget);
+                run_fan_out(
+                    &sock,
+                    &team,
+                    &text,
+                    title,
+                    priority,
+                    no_report,
+                    &Some(target.to_string()),
+                    context.as_deref(),
+                    auto_fix_budget,
+                );
             } else if autonomous {
-                run_delegate_autonomous(&sock, &team, target, &text, title, priority, no_report, context.as_deref(), auto_fix_budget);
+                run_delegate_autonomous(
+                    &sock,
+                    &team,
+                    target,
+                    &text,
+                    title,
+                    priority,
+                    no_report,
+                    context.as_deref(),
+                    auto_fix_budget,
+                );
             } else {
-                run_delegate(&sock, &team, target, &text, title, priority, &accept, &deps, desc, no_report, context.as_deref(), auto_fix_budget);
+                run_delegate(
+                    &sock,
+                    &team,
+                    target,
+                    &text,
+                    title,
+                    priority,
+                    &accept,
+                    &deps,
+                    desc,
+                    no_report,
+                    context.as_deref(),
+                    auto_fix_budget,
+                );
             }
             return;
         }
-        Commands::FanOut { text, title, priority, no_report, agents, context, auto_fix_budget } => {
-            run_fan_out(&sock, &team, &text, title, priority, no_report, &agents, context.as_deref(), auto_fix_budget);
+        Commands::FanOut {
+            text,
+            title,
+            priority,
+            no_report,
+            agents,
+            context,
+            auto_fix_budget,
+        } => {
+            run_fan_out(
+                &sock,
+                &team,
+                &text,
+                title,
+                priority,
+                no_report,
+                &agents,
+                context.as_deref(),
+                auto_fix_budget,
+            );
             return;
         }
-        Commands::Wait { timeout, interval, mode, task, tasks, agents } => {
+        Commands::Wait {
+            timeout,
+            interval,
+            mode,
+            task,
+            tasks,
+            agents,
+        } => {
             let filter = parse_cli_flag(&agents);
             let task_ids: Option<std::collections::HashSet<String>> = tasks.map(|t| {
-                t.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect()
+                t.split(',')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect()
             });
-            run_wait(&sock, &team, timeout, interval, &mode, task.as_deref(), &filter, task_ids.as_ref());
+            run_wait(
+                &sock,
+                &team,
+                timeout,
+                interval,
+                &mode,
+                task.as_deref(),
+                &filter,
+                task_ids.as_ref(),
+            );
             return;
         }
         Commands::Claim => {
@@ -2696,43 +3552,124 @@ fn main() {
             run_suggest(&sock, &team, &description);
             return;
         }
-        Commands::Warmup { agent: ref target, timeout } => {
+        Commands::Warmup {
+            agent: ref target,
+            timeout,
+        } => {
             run_warmup(&sock, &team, target.as_deref(), timeout);
             return;
         }
-        Commands::Research { topic, agents, budget, timeout, depth, web, focus, no_discuss } => {
+        Commands::Research {
+            topic,
+            agents,
+            budget,
+            timeout,
+            depth,
+            web,
+            focus,
+            no_discuss,
+        } => {
             run_autonomous(
-                &sock, &team, "research", &topic, agents, budget, timeout,
-                &depth, web, focus.as_deref(), no_discuss,
-                None, None, None,
+                &sock,
+                &team,
+                "research",
+                &topic,
+                agents,
+                budget,
+                timeout,
+                &depth,
+                web,
+                focus.as_deref(),
+                no_discuss,
+                None,
+                None,
+                None,
             );
             return;
         }
-        Commands::Solve { problem, agents, budget, timeout, verify, target, no_discuss } => {
+        Commands::Solve {
+            problem,
+            agents,
+            budget,
+            timeout,
+            verify,
+            target,
+            no_discuss,
+        } => {
             run_autonomous(
-                &sock, &team, "solve", &problem, agents, budget, timeout,
-                "deep", false, None, no_discuss,
-                verify.as_deref(), target.as_deref(), None,
+                &sock,
+                &team,
+                "solve",
+                &problem,
+                agents,
+                budget,
+                timeout,
+                "deep",
+                false,
+                None,
+                no_discuss,
+                verify.as_deref(),
+                target.as_deref(),
+                None,
             );
             return;
         }
-        Commands::Consensus { question, agents, budget, timeout, perspectives, no_discuss } => {
+        Commands::Consensus {
+            question,
+            agents,
+            budget,
+            timeout,
+            perspectives,
+            no_discuss,
+        } => {
             run_autonomous(
-                &sock, &team, "consensus", &question, agents, budget, timeout,
-                "deep", false, None, no_discuss,
-                None, None, perspectives.as_deref(),
+                &sock,
+                &team,
+                "consensus",
+                &question,
+                agents,
+                budget,
+                timeout,
+                "deep",
+                false,
+                None,
+                no_discuss,
+                None,
+                None,
+                perspectives.as_deref(),
             );
             return;
         }
-        Commands::Swarm { goal, agents, budget, timeout, seed, no_discuss } => {
+        Commands::Swarm {
+            goal,
+            agents,
+            budget,
+            timeout,
+            seed,
+            no_discuss,
+        } => {
             run_autonomous(
-                &sock, &team, "swarm", &goal, agents, budget, timeout,
-                "deep", false, None, no_discuss,
-                None, None, seed.as_deref(),
+                &sock,
+                &team,
+                "swarm",
+                &goal,
+                agents,
+                budget,
+                timeout,
+                "deep",
+                false,
+                None,
+                no_discuss,
+                None,
+                None,
+                seed.as_deref(),
             );
             return;
         }
-        Commands::Brief { agent: ref target, lines } => {
+        Commands::Brief {
+            agent: ref target,
+            lines,
+        } => {
             run_brief(&sock, &team, target, lines);
             return;
         }
@@ -2740,7 +3677,8 @@ fn main() {
             let sender = from.unwrap_or_else(|| agent.clone());
             let content = text.join(" ");
             // Write full result to file, send truncated summary via socket
-            let result_path = write_result_file(&team, &format!("{sender}-reply.md"), &content).ok();
+            let result_path =
+                write_result_file(&team, &format!("{sender}-reply.md"), &content).ok();
             let summary = truncate_summary(&content, 1500);
             let mut msg_params = json!({
                 "team_name": team, "from": sender, "content": summary,
@@ -2768,19 +3706,26 @@ fn main() {
             // (UI command, MainActor) to avoid timeout when main thread is busy —
             // a timeout here silently skips task completion, causing the leader's
             // `wait` to hang indefinitely.
-            if let Ok(task_resp) = rpc_call(&sock, "team.task.list", json!({
-                "team_name": &team, "assignee": &sender
-            })) {
+            if let Ok(task_resp) = rpc_call(
+                &sock,
+                "team.task.list",
+                json!({
+                    "team_name": &team, "assignee": &sender
+                }),
+            ) {
                 if let Some(tasks) = task_resp["result"]["tasks"].as_array() {
                     // Prefer in_progress task (the one actively being worked on),
                     // then fall back to any non-terminal task. This prevents
                     // completing a queued/blocked task when multiple tasks exist.
-                    let target_task = tasks.iter()
+                    let target_task = tasks
+                        .iter()
                         .find(|t| t["status"].as_str() == Some("in_progress"))
-                        .or_else(|| tasks.iter().find(|t| {
-                            let st = t["status"].as_str().unwrap_or("");
-                            st != "completed" && st != "failed" && st != "abandoned"
-                        }));
+                        .or_else(|| {
+                            tasks.iter().find(|t| {
+                                let st = t["status"].as_str().unwrap_or("");
+                                st != "completed" && st != "failed" && st != "abandoned"
+                            })
+                        });
                     if let Some(t) = target_task {
                         if let Some(tid) = t["id"].as_str() {
                             let mut update = json!({
@@ -2810,7 +3755,10 @@ fn main() {
 fn print_result(result: Result<Value, String>) {
     match result {
         Ok(resp) => println!("{}", pretty(&resp)),
-        Err(e) => { eprintln!("Error: {e}"); process::exit(1); }
+        Err(e) => {
+            eprintln!("Error: {e}");
+            process::exit(1);
+        }
     }
 }
 
@@ -2831,7 +3779,11 @@ fn claude_sessions_dir() -> Option<PathBuf> {
     // Claude Code encodes the project path as dash-separated: /Users/foo/bar → -Users-foo-bar
     let encoded = cwd.to_string_lossy().replace('/', "-");
     let dir = PathBuf::from(format!("{home}/.claude/projects/{encoded}"));
-    if dir.is_dir() { Some(dir) } else { None }
+    if dir.is_dir() {
+        Some(dir)
+    } else {
+        None
+    }
 }
 
 /// List recent sessions from the Claude Code sessions directory.
@@ -2850,10 +3802,14 @@ fn list_recent_sessions(limit: usize) -> Vec<SessionEntry> {
                 None => continue,
             };
             // Only .jsonl session files with UUID names
-            if !name.ends_with(".jsonl") { continue; }
+            if !name.ends_with(".jsonl") {
+                continue;
+            }
             let id = name.trim_end_matches(".jsonl");
             // Quick UUID format check (8-4-4-4-12)
-            if id.len() != 36 || id.chars().filter(|c| *c == '-').count() != 4 { continue; }
+            if id.len() != 36 || id.chars().filter(|c| *c == '-').count() != 4 {
+                continue;
+            }
 
             let modified = match entry.metadata().and_then(|m| m.modified()) {
                 Ok(t) => t,
@@ -2888,7 +3844,8 @@ fn extract_text_from_entry(val: &Value) -> String {
         return s.to_string();
     }
     if let Some(arr) = msg.as_array() {
-        let texts: Vec<&str> = arr.iter()
+        let texts: Vec<&str> = arr
+            .iter()
             .filter(|b| b["type"].as_str() == Some("text"))
             .filter_map(|b| b["text"].as_str())
             .collect();
@@ -2917,14 +3874,20 @@ fn extract_messages(path: &PathBuf) -> (String, String) {
     let mut first_message = String::new();
     for line in head_text.lines().take(50) {
         if let Ok(val) = serde_json::from_str::<Value>(line) {
-            if val["type"].as_str() != Some("user") { continue; }
+            if val["type"].as_str() != Some("user") {
+                continue;
+            }
             let text = extract_text_from_entry(&val);
-            if text.contains("<system-reminder>") || text.contains("<command-name>")
-                || text.contains("<local-command") {
+            if text.contains("<system-reminder>")
+                || text.contains("<command-name>")
+                || text.contains("<local-command")
+            {
                 continue;
             }
             let trimmed = text.trim();
-            if trimmed.is_empty() { continue; }
+            if trimmed.is_empty() {
+                continue;
+            }
             // Label commit generator sessions clearly
             if trimmed.starts_with("You are a commit message generator") {
                 first_message = "[commit message]".to_string();
@@ -2942,7 +3905,11 @@ fn extract_messages(path: &PathBuf) -> (String, String) {
 
     // Last message: read last ~32KB
     let file_len = file.metadata().map(|m| m.len()).unwrap_or(0);
-    let tail_offset = if file_len > 32768 { file_len - 32768 } else { 0 };
+    let tail_offset = if file_len > 32768 {
+        file_len - 32768
+    } else {
+        0
+    };
     let _ = file.seek(SeekFrom::Start(tail_offset));
     let mut tail_buf = Vec::new();
     let _ = file.read_to_end(&mut tail_buf);
@@ -2951,7 +3918,9 @@ fn extract_messages(path: &PathBuf) -> (String, String) {
     let mut last_message = String::new();
     for line in tail_text.lines().rev() {
         if let Ok(val) = serde_json::from_str::<Value>(line) {
-            if val["type"].as_str() != Some("assistant") { continue; }
+            if val["type"].as_str() != Some("assistant") {
+                continue;
+            }
             let text = extract_text_from_entry(&val);
             let trimmed = text.trim();
             if !trimmed.is_empty() {
@@ -2973,9 +3942,15 @@ fn extract_messages(path: &PathBuf) -> (String, String) {
 fn format_relative_time(time: std::time::SystemTime) -> String {
     let elapsed = time.elapsed().unwrap_or_default();
     let secs = elapsed.as_secs();
-    if secs < 60 { return "just now".to_string(); }
-    if secs < 3600 { return format!("{}m ago", secs / 60); }
-    if secs < 86400 { return format!("{}h ago", secs / 3600); }
+    if secs < 60 {
+        return "just now".to_string();
+    }
+    if secs < 3600 {
+        return format!("{}m ago", secs / 60);
+    }
+    if secs < 86400 {
+        return format!("{}h ago", secs / 3600);
+    }
     format!("{}d ago", secs / 86400)
 }
 
@@ -3039,9 +4014,18 @@ fn resolve_resume_session(flag: Option<Option<String>>) -> Option<String> {
 // ── Orchestration implementations ────────────────────────────────────
 
 fn run_create(
-    sock: &PathBuf, team: &str, count: u32, claude_leader: bool,
-    model: &str, leader_model: Option<&str>, kiro: &Option<String>, codex: &Option<String>, gemini: &Option<String>,
-    adopt: bool, preset: Option<&str>, roles: Option<&str>,
+    sock: &PathBuf,
+    team: &str,
+    count: u32,
+    claude_leader: bool,
+    model: &str,
+    leader_model: Option<&str>,
+    kiro: &Option<String>,
+    codex: &Option<String>,
+    gemini: &Option<String>,
+    adopt: bool,
+    preset: Option<&str>,
+    roles: Option<&str>,
     resume_session: Option<Option<String>>,
 ) {
     // Guard: --adopt and --claude-leader are mutually exclusive
@@ -3080,10 +4064,15 @@ fn run_create(
     // Resolve agents from preset or roles via RPC, or build from defaults
     let agents: Vec<serde_json::Value> = if let Some(preset_id) = preset {
         eprintln!("Resolving preset '{preset_id}'...");
-        match rpc_call_timeout(sock, "team.preset.resolve", json!({
-            "preset_id": preset_id,
-            "model": model,
-        }), 3) {
+        match rpc_call_timeout(
+            sock,
+            "team.preset.resolve",
+            json!({
+                "preset_id": preset_id,
+                "model": model,
+            }),
+            3,
+        ) {
             Ok(resp) if resp["ok"].as_bool().unwrap_or(false) => {
                 let result = &resp["result"];
                 preset_name = result["preset_name"].as_str().map(str::to_string);
@@ -3092,7 +4081,8 @@ fn run_create(
                         leader_mode = resolved_leader.to_string();
                     }
                 }
-                workflow_task_templates = result["task_templates"].as_array()
+                workflow_task_templates = result["task_templates"]
+                    .as_array()
                     .map(|items| {
                         items
                             .iter()
@@ -3100,7 +4090,8 @@ fn run_create(
                             .collect()
                     })
                     .unwrap_or_default();
-                workflow_review_checkpoints = result["review_checkpoints"].as_array()
+                workflow_review_checkpoints = result["review_checkpoints"]
+                    .as_array()
                     .map(|items| {
                         items
                             .iter()
@@ -3108,38 +4099,54 @@ fn run_create(
                             .collect()
                     })
                     .unwrap_or_default();
-                result["agents"].as_array()
-                    .cloned()
-                    .unwrap_or_default()
+                result["agents"].as_array().cloned().unwrap_or_default()
             }
             Ok(resp) => {
-                eprintln!("Error: preset resolve failed: {}", resp["error"]["message"].as_str().unwrap_or("unknown"));
+                eprintln!(
+                    "Error: preset resolve failed: {}",
+                    resp["error"]["message"].as_str().unwrap_or("unknown")
+                );
                 process::exit(1);
             }
             Err(e) => {
-                eprintln!("Error: team.preset.resolve RPC failed (app may not support presets yet): {e}");
+                eprintln!(
+                    "Error: team.preset.resolve RPC failed (app may not support presets yet): {e}"
+                );
                 process::exit(1);
             }
         }
     } else if let Some(roles_str) = roles {
         eprintln!("Resolving roles '{roles_str}'...");
         // Split comma-separated roles into a JSON array (Swift expects [String], not String)
-        let roles_vec: Vec<&str> = roles_str.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()).collect();
-        match rpc_call_timeout(sock, "team.preset.resolve", json!({
-            "roles": roles_vec,
-            "model": model,
-        }), 3) {
-            Ok(resp) if resp["ok"].as_bool().unwrap_or(false) => {
-                resp["result"]["agents"].as_array()
-                    .cloned()
-                    .unwrap_or_default()
-            }
+        let roles_vec: Vec<&str> = roles_str
+            .split(',')
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .collect();
+        match rpc_call_timeout(
+            sock,
+            "team.preset.resolve",
+            json!({
+                "roles": roles_vec,
+                "model": model,
+            }),
+            3,
+        ) {
+            Ok(resp) if resp["ok"].as_bool().unwrap_or(false) => resp["result"]["agents"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default(),
             Ok(resp) => {
-                eprintln!("Error: roles resolve failed: {}", resp["error"]["message"].as_str().unwrap_or("unknown"));
+                eprintln!(
+                    "Error: roles resolve failed: {}",
+                    resp["error"]["message"].as_str().unwrap_or("unknown")
+                );
                 process::exit(1);
             }
             Err(e) => {
-                eprintln!("Error: team.preset.resolve RPC failed (app may not support roles yet): {e}");
+                eprintln!(
+                    "Error: team.preset.resolve RPC failed (app may not support roles yet): {e}"
+                );
                 process::exit(1);
             }
         }
@@ -3209,6 +4216,7 @@ fn run_create(
         "leader_mode": leader_mode,
         "leader_model": leader_model,
         "agents": agents,
+        "runbook_init_prompt": true,
     });
     if let Some(ref sid) = resume_session_id {
         create_params["resume_session_id"] = json!(sid);
@@ -3224,7 +4232,10 @@ fn run_create(
     }
     let r = match rpc_call_timeout(sock, "team.create", create_params, 5) {
         Ok(v) => v,
-        Err(e) => { eprintln!("Error: {e}"); process::exit(1); }
+        Err(e) => {
+            eprintln!("Error: {e}");
+            process::exit(1);
+        }
     };
 
     println!("{}", pretty(&r));
@@ -3237,10 +4248,7 @@ fn run_create(
 
     if r["ok"].as_bool().unwrap_or(false) {
         if !workflow_task_templates.is_empty() {
-            let workflow_label = preset_name
-                .as_deref()
-                .or(preset)
-                .unwrap_or("workflow");
+            let workflow_label = preset_name.as_deref().or(preset).unwrap_or("workflow");
             let checkpoint_note = if workflow_review_checkpoints.is_empty() {
                 String::new()
             } else {
@@ -3281,7 +4289,9 @@ fn run_create(
                     Ok(resp) => {
                         eprintln!(
                             "  \u{2717} {title}: {}",
-                            resp["error"]["message"].as_str().unwrap_or("task create failed")
+                            resp["error"]["message"]
+                                .as_str()
+                                .unwrap_or("task create failed")
                         );
                     }
                     Err(e) => {
@@ -3291,7 +4301,8 @@ fn run_create(
             }
         }
 
-        let non_kiro: Vec<&Value> = agents.iter()
+        let non_kiro: Vec<&Value> = agents
+            .iter()
             .filter(|a| a["cli"].as_str().unwrap_or("claude") != "kiro")
             .collect();
         if !non_kiro.is_empty() {
@@ -3299,10 +4310,18 @@ fn run_create(
             eprintln!("\nWaiting for agent panels to spawn...");
             let expected = non_kiro.len();
             for i in 0..60 {
-                if let Ok(st) = rpc_call_timeout(sock, "team.status", json!({ "team_name": team }), 2) {
+                if let Ok(st) =
+                    rpc_call_timeout(sock, "team.status", json!({ "team_name": team }), 2)
+                {
                     if let Some(agents_arr) = st["result"]["agents"].as_array() {
-                        let with_panels = agents_arr.iter()
-                            .filter(|a| a["panel_id"].as_str().map(|s| !s.is_empty()).unwrap_or(false))
+                        let with_panels = agents_arr
+                            .iter()
+                            .filter(|a| {
+                                a["panel_id"]
+                                    .as_str()
+                                    .map(|s| !s.is_empty())
+                                    .unwrap_or(false)
+                            })
                             .count();
                         if with_panels >= expected {
                             eprintln!("  All {expected} agent panels ready ({} ms)", (i + 1) * 100);
@@ -3322,11 +4341,17 @@ fn run_create(
             eprintln!("Sending init prompts to non-kiro agents...");
             for a in &non_kiro {
                 let name = a["name"].as_str().unwrap_or("");
-                let init_text = agent_init_prompt(name, &workdir, &sock.to_string_lossy());
-                match rpc_call_timeout(sock, "team.send", json!({
-                    "team_name": team, "agent_name": name,
-                    "text": format!("{init_text}\n"),
-                }), 3) {
+                let role = a["agent_type"].as_str().unwrap_or(name);
+                let init_text = agent_init_prompt(name, role, &workdir, &sock.to_string_lossy());
+                match rpc_call_timeout(
+                    sock,
+                    "team.send",
+                    json!({
+                        "team_name": team, "agent_name": name,
+                        "text": format!("{init_text}\n"),
+                    }),
+                    3,
+                ) {
                     Ok(_) => eprintln!("  \u{2713} {name}: init prompt sent"),
                     Err(e) => eprintln!("  \u{2717} {name}: init prompt FAILED: {e}"),
                 }
@@ -3387,8 +4412,10 @@ fn resolve_workspace_team_name() -> Result<String, String> {
             return Ok(explicit);
         }
     }
-    let ws = env::var("TERMMESH_WORKSPACE_ID")
-        .map_err(|_| "TERMMESH_WORKSPACE_ID env var not set. Not running inside a term-mesh workspace?".to_string())?;
+    let ws = env::var("TERMMESH_WORKSPACE_ID").map_err(|_| {
+        "TERMMESH_WORKSPACE_ID env var not set. Not running inside a term-mesh workspace?"
+            .to_string()
+    })?;
     if ws.is_empty() {
         return Err("TERMMESH_WORKSPACE_ID is empty".to_string());
     }
@@ -3427,7 +4454,9 @@ fn require_termmesh_context() -> Result<(String, String, Option<String>), String
             "TERMMESH_PANEL_ID is empty. Caller pane cannot be identified for attach.".to_string(),
         );
     }
-    let window_id = env::var("TERMMESH_WINDOW_ID").ok().filter(|s| !s.is_empty());
+    let window_id = env::var("TERMMESH_WINDOW_ID")
+        .ok()
+        .filter(|s| !s.is_empty());
     Ok((workspace_id, panel_id, window_id))
 }
 
@@ -3479,9 +4508,18 @@ fn run_attach(sock: &PathBuf, agent_type: &str, agent_name: &str, model: &str, c
             eprintln!();
             eprintln!(
                 "  \u{2713} agent '{}' attached ({} total in team '{}')",
-                result.get("agent_name").and_then(|v| v.as_str()).unwrap_or(agent_name),
-                result.get("agent_count").and_then(|v| v.as_u64()).unwrap_or(0),
-                result.get("team_name").and_then(|v| v.as_str()).unwrap_or(&team_name),
+                result
+                    .get("agent_name")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or(agent_name),
+                result
+                    .get("agent_count")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0),
+                result
+                    .get("team_name")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or(&team_name),
             );
         }
     } else {
@@ -3583,7 +4621,9 @@ fn detect_daemon_socket() -> Option<PathBuf> {
         }
     }
     // Default daemon socket path
-    let dir = env::var("TMPDIR").ok().map(PathBuf::from)
+    let dir = env::var("TMPDIR")
+        .ok()
+        .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("/tmp"));
     let path = dir.join("term-meshd.sock");
     if is_socket_alive(&path) {
@@ -3595,10 +4635,14 @@ fn detect_daemon_socket() -> Option<PathBuf> {
 
 /// Check if an agent is headless by querying the daemon's headless.resolve RPC.
 fn is_headless_agent(daemon_sock: &PathBuf, team: &str, agent_name: &str) -> Option<String> {
-    if let Ok(resp) = rpc_call(daemon_sock, "headless.resolve", json!({
-        "team_name": team,
-        "agent_name": agent_name,
-    })) {
+    if let Ok(resp) = rpc_call(
+        daemon_sock,
+        "headless.resolve",
+        json!({
+            "team_name": team,
+            "agent_name": agent_name,
+        }),
+    ) {
         if resp["result"]["headless"].as_bool().unwrap_or(false) {
             return resp["result"]["agent_id"].as_str().map(String::from);
         }
@@ -3607,7 +4651,11 @@ fn is_headless_agent(daemon_sock: &PathBuf, team: &str, agent_name: &str) -> Opt
 }
 
 fn run_create_headless(
-    app_sock: &PathBuf, team: &str, count: u32, model: &str, roles: Option<&str>,
+    app_sock: &PathBuf,
+    team: &str,
+    count: u32,
+    model: &str,
+    roles: Option<&str>,
 ) {
     let daemon_sock = match detect_daemon_socket() {
         Some(s) => s,
@@ -3619,11 +4667,12 @@ fn run_create_headless(
 
     // Build agent list from roles or defaults
     let agent_specs: Vec<Value> = if let Some(roles_str) = roles {
-        roles_str.split(',')
+        roles_str
+            .split(',')
             .map(|s| s.trim())
             .filter(|s| !s.is_empty())
             .enumerate()
-            .map(|(_i, name)| json!({ "name": name, "cli": "claude", "model": model }))
+            .map(|(_i, name)| json!({ "name": name, "agent_type": name, "cli": "claude", "model": model }))
             .collect()
     } else {
         (0..count as usize)
@@ -3633,7 +4682,7 @@ fn run_create_headless(
                 } else {
                     format!("agent-{i}")
                 };
-                json!({ "name": name, "cli": "claude", "model": model })
+                json!({ "name": name, "agent_type": name, "cli": "claude", "model": model })
             })
             .collect()
     };
@@ -3643,7 +4692,12 @@ fn run_create_headless(
         .unwrap_or_else(|_| ".".to_string());
 
     // Destroy existing headless team first
-    let _ = rpc_call_timeout(&daemon_sock, "headless.destroy_team", json!({ "team_name": team }), 3);
+    let _ = rpc_call_timeout(
+        &daemon_sock,
+        "headless.destroy_team",
+        json!({ "team_name": team }),
+        3,
+    );
 
     let agent_count = agent_specs.len();
     eprintln!("Creating headless team '{team}' with {agent_count} agent(s) on daemon...");
@@ -3670,12 +4724,18 @@ fn run_create_headless(
             let app_sock_str = app_sock.to_string_lossy();
             for spec in &agent_specs {
                 let name = spec["name"].as_str().unwrap_or("");
+                let role = spec["agent_type"].as_str().unwrap_or(name);
                 let agent_id = format!("{name}@{team}");
-                let init_text = agent_init_prompt(name, &workdir, &app_sock_str);
-                match rpc_call_timeout(&daemon_sock, "headless.send", json!({
-                    "agent_id": agent_id,
-                    "text": init_text,
-                }), 5) {
+                let init_text = agent_init_prompt(name, role, &workdir, &app_sock_str);
+                match rpc_call_timeout(
+                    &daemon_sock,
+                    "headless.send",
+                    json!({
+                        "agent_id": agent_id,
+                        "text": init_text,
+                    }),
+                    5,
+                ) {
                     Ok(_) => eprintln!("  \u{2713} {name}: init prompt sent"),
                     Err(e) => eprintln!("  \u{2717} {name}: init prompt FAILED: {e}"),
                 }
@@ -3696,8 +4756,13 @@ fn run_create_headless(
 }
 
 fn run_add_headless(
-    app_sock: &PathBuf, daemon_sock: &PathBuf, team: &str, agent_name: &str,
-    agent_type: &str, model: &str, cli: &str,
+    app_sock: &PathBuf,
+    daemon_sock: &PathBuf,
+    team: &str,
+    agent_name: &str,
+    agent_type: &str,
+    model: &str,
+    cli: &str,
 ) {
     eprintln!("Adding agent '{agent_name}' (type={agent_type}, cli={cli}, model={model}) to headless team '{team}'...");
 
@@ -3725,29 +4790,40 @@ fn run_add_headless(
                 .map(|p| p.to_string_lossy().to_string())
                 .unwrap_or_else(|_| ".".to_string());
             let agent_id = format!("{agent_name}@{team}");
-            let init_text = agent_init_prompt(agent_name, &workdir, &app_sock_str);
+            let init_text = agent_init_prompt(agent_name, agent_type, &workdir, &app_sock_str);
 
-            match rpc_call_timeout(daemon_sock, "headless.send", json!({
-                "agent_id": agent_id,
-                "text": init_text,
-            }), 5) {
+            match rpc_call_timeout(
+                daemon_sock,
+                "headless.send",
+                json!({
+                    "agent_id": agent_id,
+                    "text": init_text,
+                }),
+                5,
+            ) {
                 Ok(_) => eprintln!("  \u{2713} {agent_name}: init prompt sent"),
                 Err(e) => eprintln!("  \u{2717} {agent_name}: init prompt FAILED: {e}"),
             }
 
             // Register the agent with the Swift app's team data store
             // Use agent_type (role) separately from agent_name (display name)
-            match rpc_call(app_sock, "team.register_agent", json!({
-                "team_name": team,
-                "agent_name": agent_name,
-                "agent_type": agent_type,
-                "model": model,
-                "cli": cli,
-            })) {
-                Ok(_) => {},
+            match rpc_call(
+                app_sock,
+                "team.register_agent",
+                json!({
+                    "team_name": team,
+                    "agent_name": agent_name,
+                    "agent_type": agent_type,
+                    "model": model,
+                    "cli": cli,
+                }),
+            ) {
+                Ok(_) => {}
                 Err(e) => {
                     eprintln!("  Warning: failed to register agent with app: {e}");
-                    eprintln!("  (agent process is running on daemon but may not appear in app UI)");
+                    eprintln!(
+                        "  (agent process is running on daemon but may not appear in app UI)"
+                    );
                 }
             }
 
@@ -3761,10 +4837,18 @@ fn run_add_headless(
 }
 
 fn run_delegate_result(
-    sock: &PathBuf, team: &str, target: &str, text: &str,
-    title: Option<String>, priority: Option<u32>,
-    accept: &[String], deps: &[String], desc: Option<String>, no_report: bool,
-    context: Option<&str>, fix_budget: Option<u8>,
+    sock: &PathBuf,
+    team: &str,
+    target: &str,
+    text: &str,
+    title: Option<String>,
+    priority: Option<u32>,
+    accept: &[String],
+    deps: &[String],
+    desc: Option<String>,
+    no_report: bool,
+    context: Option<&str>,
+    fix_budget: Option<u8>,
 ) -> Result<Value, String> {
     let resolved_title = title.unwrap_or_else(|| task_title_from_text(text));
     let resolved_priority = priority.unwrap_or(2);
@@ -3789,15 +4873,21 @@ fn run_delegate_result(
             let text_delivered = v["result"]["text_delivered"].as_bool().unwrap_or(true);
             if !text_delivered {
                 let task_ref = &v["result"]["task"];
-                let instruction = format_task_instruction(sock, team, task_ref, text, no_report, context, fix_budget);
+                let instruction = format_task_instruction(
+                    sock, team, task_ref, text, no_report, context, fix_budget,
+                );
 
                 // Headless agent path: route via daemon socket if available
                 if let Some(daemon_sock) = detect_daemon_socket() {
                     if let Some(agent_id) = is_headless_agent(&daemon_sock, team, target) {
-                        let headless_ok = match rpc_call(&daemon_sock, "headless.send", json!({
-                            "agent_id": agent_id,
-                            "text": format!("{instruction}\n"),
-                        })) {
+                        let headless_ok = match rpc_call(
+                            &daemon_sock,
+                            "headless.send",
+                            json!({
+                                "agent_id": agent_id,
+                                "text": format!("{instruction}\n"),
+                            }),
+                        ) {
                             Ok(ref hr) => !hr["result"].is_null(),
                             Err(_) => false,
                         };
@@ -3811,12 +4901,18 @@ fn run_delegate_result(
                 // In-app panel retry: agent is not headless, retry via team.send.
                 // The server-side already retried twice (150ms + 400ms). Give one final
                 // CLI-side attempt after a short pause for late panel init.
-                eprintln!("  Warning: text not delivered to agent '{target}', retrying via team.send...");
+                eprintln!(
+                    "  Warning: text not delivered to agent '{target}', retrying via team.send..."
+                );
                 std::thread::sleep(std::time::Duration::from_millis(300));
-                let retry = rpc_call(sock, "team.send", json!({
-                    "team_name": team, "agent_name": target,
-                    "text": format!("{instruction}\n"),
-                }));
+                let retry = rpc_call(
+                    sock,
+                    "team.send",
+                    json!({
+                        "team_name": team, "agent_name": target,
+                        "text": format!("{instruction}\n"),
+                    }),
+                );
                 match &retry {
                     Ok(rv) if rv["ok"].as_bool().unwrap_or(false) => {
                         // team.send succeeded — text was delivered. Update the response.
@@ -3839,11 +4935,15 @@ fn run_delegate_result(
 
                 // Retry Return delivery up to 5 times with backoff
                 for attempt in 0..5u32 {
-                    match rpc_call(sock, "team.send_key", json!({
-                        "team_name": team,
-                        "agent_name": target,
-                        "key": "return",
-                    })) {
+                    match rpc_call(
+                        sock,
+                        "team.send_key",
+                        json!({
+                            "team_name": team,
+                            "agent_name": target,
+                            "key": "return",
+                        }),
+                    ) {
                         Ok(r) if r["ok"].as_bool().unwrap_or(false) => break,
                         Ok(_) | Err(_) => {
                             if attempt < 4 {
@@ -3871,15 +4971,27 @@ fn run_delegate_result(
         "assignee": target,
         "priority": resolved_priority,
     });
-    if let Some(d) = desc { params["description"] = json!(d); }
-    if !accept.is_empty() { params["acceptance_criteria"] = json!(accept); }
-    if !deps.is_empty() { params["depends_on"] = json!(deps); }
-    if let Some(fb) = fix_budget { params["fix_budget"] = json!(fb); }
+    if let Some(d) = desc {
+        params["description"] = json!(d);
+    }
+    if !accept.is_empty() {
+        params["acceptance_criteria"] = json!(accept);
+    }
+    if !deps.is_empty() {
+        params["depends_on"] = json!(deps);
+    }
+    if let Some(fb) = fix_budget {
+        params["fix_budget"] = json!(fb);
+    }
 
     // Open one connection for both task.create and team.send.
     let fallback_stream = UnixStream::connect(sock).map_err(|e| format!("connect: {e}"))?;
-    fallback_stream.set_read_timeout(Some(Duration::from_secs(2))).ok();
-    fallback_stream.set_write_timeout(Some(Duration::from_secs(2))).ok();
+    fallback_stream
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .ok();
+    fallback_stream
+        .set_write_timeout(Some(Duration::from_secs(2)))
+        .ok();
 
     // Use one shared BufReader for both sequential RPC calls so its internal
     // read-ahead buffer is preserved between calls.  Creating a new BufReader
@@ -3887,8 +4999,13 @@ fn run_delegate_result(
     // BufReader pre-fetched from the OS socket buffer when it is dropped.
     let mut fallback_reader = BufReader::new(&fallback_stream);
 
-    let created = rpc_call_with_reader(&fallback_stream, &mut fallback_reader, "team.task.create", params)
-        .map_err(|e| format!("task.create: {e}"))?;
+    let created = rpc_call_with_reader(
+        &fallback_stream,
+        &mut fallback_reader,
+        "team.task.create",
+        params,
+    )
+    .map_err(|e| format!("task.create: {e}"))?;
 
     let task = &created["result"];
     let task_id = task["id"].as_str().unwrap_or("");
@@ -3896,16 +5013,21 @@ fn run_delegate_result(
         return Err(format!("task.create failed: {}", pretty(&created)));
     }
 
-    let instruction = format_task_instruction(sock, team, task, text, no_report, context, fix_budget);
+    let instruction =
+        format_task_instruction(sock, team, task, text, no_report, context, fix_budget);
     let send_text = format!("{instruction}\n");
 
     // Headless agent path: route via daemon socket for 2-RPC fallback too
     if let Some(daemon_sock) = detect_daemon_socket() {
         if let Some(agent_id) = is_headless_agent(&daemon_sock, team, target) {
-            let sent_ok = match rpc_call(&daemon_sock, "headless.send", json!({
-                "agent_id": agent_id,
-                "text": &send_text,
-            })) {
+            let sent_ok = match rpc_call(
+                &daemon_sock,
+                "headless.send",
+                json!({
+                    "agent_id": agent_id,
+                    "text": &send_text,
+                }),
+            ) {
                 Ok(ref hr) => !hr["result"].is_null(),
                 Err(_) => false,
             };
@@ -3917,20 +5039,30 @@ fn run_delegate_result(
     }
 
     // In-app panel path: reuse the same connection and BufReader for team.send.
-    let sent = rpc_call_with_reader(&fallback_stream, &mut fallback_reader, "team.send", json!({
-        "team_name": team, "agent_name": target,
-        "text": &send_text,
-    })).map_err(|e| format!("team.send: {e}"))?;
+    let sent = rpc_call_with_reader(
+        &fallback_stream,
+        &mut fallback_reader,
+        "team.send",
+        json!({
+            "team_name": team, "agent_name": target,
+            "text": &send_text,
+        }),
+    )
+    .map_err(|e| format!("team.send: {e}"))?;
 
     if !sent["ok"].as_bool().unwrap_or(false) {
         // Retry once after 300ms — task is already created, so we must not abandon it.
         // Server-side team.send already retries internally (150ms + 400ms).
         eprintln!("  Warning: team.send failed for '{target}', retrying in 300ms...");
         std::thread::sleep(std::time::Duration::from_millis(300));
-        let retry = rpc_call(sock, "team.send", json!({
-            "team_name": team, "agent_name": target,
-            "text": &send_text,
-        }));
+        let retry = rpc_call(
+            sock,
+            "team.send",
+            json!({
+                "team_name": team, "agent_name": target,
+                "text": &send_text,
+            }),
+        );
         match retry {
             Ok(ref rv) if rv["ok"].as_bool().unwrap_or(false) => {
                 eprintln!("  Retry succeeded.");
@@ -3944,14 +5076,28 @@ fn run_delegate_result(
 }
 
 fn run_delegate(
-    sock: &PathBuf, team: &str, target: &str, text: &str,
-    title: Option<String>, priority: Option<u32>,
-    accept: &[String], deps: &[String], desc: Option<String>, no_report: bool,
-    context: Option<&str>, fix_budget: Option<u8>,
+    sock: &PathBuf,
+    team: &str,
+    target: &str,
+    text: &str,
+    title: Option<String>,
+    priority: Option<u32>,
+    accept: &[String],
+    deps: &[String],
+    desc: Option<String>,
+    no_report: bool,
+    context: Option<&str>,
+    fix_budget: Option<u8>,
 ) {
-    match run_delegate_result(sock, team, target, text, title, priority, accept, deps, desc, no_report, context, fix_budget) {
+    match run_delegate_result(
+        sock, team, target, text, title, priority, accept, deps, desc, no_report, context,
+        fix_budget,
+    ) {
         Ok(v) => println!("{}", pretty(&v)),
-        Err(e) => { eprintln!("Error: {e}"); process::exit(1); }
+        Err(e) => {
+            eprintln!("Error: {e}");
+            process::exit(1);
+        }
     }
 }
 
@@ -3960,9 +5106,15 @@ fn run_delegate(
 /// team flags (--agent-id etc.), so no leader approval is needed for edits.
 /// It uses `claude -p` (print mode) for single-shot execution.
 fn run_delegate_autonomous(
-    sock: &PathBuf, team: &str, target: &str, text: &str,
-    title: Option<String>, priority: Option<u32>, _no_report: bool,
-    context: Option<&str>, _fix_budget: Option<u8>,
+    sock: &PathBuf,
+    team: &str,
+    target: &str,
+    text: &str,
+    title: Option<String>,
+    priority: Option<u32>,
+    _no_report: bool,
+    context: Option<&str>,
+    _fix_budget: Option<u8>,
 ) {
     let resolved_title = title.unwrap_or_else(|| task_title_from_text(text));
     let resolved_priority = priority.unwrap_or(2);
@@ -3976,8 +5128,14 @@ fn run_delegate_autonomous(
     });
     let task = match rpc_call(sock, "team.task.create", task_params) {
         Ok(v) if v["ok"].as_bool().unwrap_or(false) => v["result"].clone(),
-        Ok(v) => { eprintln!("Error creating task: {}", pretty(&v)); process::exit(1); }
-        Err(e) => { eprintln!("Error creating task: {e}"); process::exit(1); }
+        Ok(v) => {
+            eprintln!("Error creating task: {}", pretty(&v));
+            process::exit(1);
+        }
+        Err(e) => {
+            eprintln!("Error creating task: {e}");
+            process::exit(1);
+        }
     };
     let task_id = task["id"].as_str().unwrap_or("").to_string();
 
@@ -3987,28 +5145,33 @@ fn run_delegate_autonomous(
 
     // Step 3: Get agent model from team status
     let model = match rpc_call(sock, "team.status", json!({ "team_name": team })) {
-        Ok(v) => {
-            v["result"]["agents"].as_array()
-                .and_then(|arr| arr.iter().find(|a| a["name"].as_str() == Some(target)))
-                .and_then(|a| a["model"].as_str())
-                .unwrap_or("sonnet")
-                .to_string()
-        }
+        Ok(v) => v["result"]["agents"]
+            .as_array()
+            .and_then(|arr| arr.iter().find(|a| a["name"].as_str() == Some(target)))
+            .and_then(|a| a["model"].as_str())
+            .unwrap_or("sonnet")
+            .to_string(),
         Err(_) => "sonnet".to_string(),
     };
 
     // Step 4: Resolve claude binary path
-    let claude_path = env::var("CLAUDE_PATH").ok()
+    let claude_path = env::var("CLAUDE_PATH")
+        .ok()
         .or_else(|| {
             // Check versioned installs
-            let versions_dir = format!("{}/.local/share/claude/versions",
-                env::var("HOME").unwrap_or_default());
+            let versions_dir = format!(
+                "{}/.local/share/claude/versions",
+                env::var("HOME").unwrap_or_default()
+            );
             if let Ok(entries) = std::fs::read_dir(&versions_dir) {
-                let mut paths: Vec<_> = entries.filter_map(|e| e.ok())
+                let mut paths: Vec<_> = entries
+                    .filter_map(|e| e.ok())
                     .filter(|e| e.path().join("claude").exists())
                     .collect();
                 paths.sort_by_key(|e| e.path());
-                paths.last().map(|e| e.path().join("claude").to_string_lossy().to_string())
+                paths
+                    .last()
+                    .map(|e| e.path().join("claude").to_string_lossy().to_string())
             } else {
                 None
             }
@@ -4020,19 +5183,33 @@ fn run_delegate_autonomous(
     let app_socket = env::var("TERMMESH_SOCKET").unwrap_or_default();
     let working_dir = env::current_dir().unwrap_or_default();
 
-    eprintln!("  Autonomous mode: spawning claude subprocess for task {}", &task_id[..8.min(task_id.len())]);
+    eprintln!(
+        "  Autonomous mode: spawning claude subprocess for task {}",
+        &task_id[..8.min(task_id.len())]
+    );
 
     // Create temp file for capturing stdout
-    let results_dir = format!("{}/.term-mesh/results/{}", env::var("HOME").unwrap_or_default(), team);
+    let results_dir = format!(
+        "{}/.term-mesh/results/{}",
+        env::var("HOME").unwrap_or_default(),
+        team
+    );
     let _ = std::fs::create_dir_all(&results_dir);
-    let stdout_file_path = format!("{}/autonomous-{}.stdout", results_dir, &task_id[..8.min(task_id.len())]);
+    let stdout_file_path = format!(
+        "{}/autonomous-{}.stdout",
+        results_dir,
+        &task_id[..8.min(task_id.len())]
+    );
     let stdout_file = match std::fs::File::create(&stdout_file_path) {
         Ok(f) => f,
-        Err(e) => { eprintln!("Error creating stdout file: {e}"); process::exit(1); }
+        Err(e) => {
+            eprintln!("Error creating stdout file: {e}");
+            process::exit(1);
+        }
     };
 
     let child = std::process::Command::new(&claude_path)
-        .arg("-p")  // print mode: single-shot execution
+        .arg("-p") // print mode: single-shot execution
         .arg("--dangerously-skip-permissions")
         .arg("--model")
         .arg(&model)
@@ -4061,16 +5238,19 @@ fn run_delegate_autonomous(
     let child_pid = child.id();
 
     // Output task info immediately (don't wait for subprocess to finish)
-    println!("{}", pretty(&json!({
-        "ok": true,
-        "result": {
-            "task": task,
-            "sent": true,
-            "text_delivered": true,
-            "autonomous": true,
-            "pid": child_pid,
-        }
-    })));
+    println!(
+        "{}",
+        pretty(&json!({
+            "ok": true,
+            "result": {
+                "task": task,
+                "sent": true,
+                "text_delivered": true,
+                "autonomous": true,
+                "pid": child_pid,
+            }
+        }))
+    );
 
     // Step 6: Wait for claude subprocess in a background thread, then auto-complete the task.
     // The thread runs inside this tm-agent process (which is a descendant of term-mesh),
@@ -4087,7 +5267,10 @@ fn run_delegate_autonomous(
         // Wait for the claude subprocess to finish
         let mut child_inner = child;
         let status = child_inner.wait();
-        let exit_code = status.as_ref().map(|s| s.code().unwrap_or(-1)).unwrap_or(-1);
+        let exit_code = status
+            .as_ref()
+            .map(|s| s.code().unwrap_or(-1))
+            .unwrap_or(-1);
 
         // Copy stdout file to result files
         let stdout_content = std::fs::read_to_string(&stdout_path_clone).unwrap_or_default();
@@ -4100,20 +5283,35 @@ fn run_delegate_autonomous(
         let _ = std::fs::remove_file(&stdout_path_clone);
 
         // Auto-complete the task via RPC
-        let completion_msg = format!("autonomous task {} completed (exit={})", task_id_clone, exit_code);
-        let _ = rpc_call(&sock_path, "team.report", json!({
-            "team_name": team_str,
-            "agent_name": target_str,
-            "content": &completion_msg,
-        }));
-        let _ = rpc_call(&sock_path, "team.task.update", json!({
-            "team_name": team_str,
-            "task_id": task_id_clone,
-            "status": "completed",
-            "result": &completion_msg,
-        }));
+        let completion_msg = format!(
+            "autonomous task {} completed (exit={})",
+            task_id_clone, exit_code
+        );
+        let _ = rpc_call(
+            &sock_path,
+            "team.report",
+            json!({
+                "team_name": team_str,
+                "agent_name": target_str,
+                "content": &completion_msg,
+            }),
+        );
+        let _ = rpc_call(
+            &sock_path,
+            "team.task.update",
+            json!({
+                "team_name": team_str,
+                "task_id": task_id_clone,
+                "status": "completed",
+                "result": &completion_msg,
+            }),
+        );
 
-        eprintln!("  Autonomous task {} completed (exit={})", &task_id_clone[..8.min(task_id_clone.len())], exit_code);
+        eprintln!(
+            "  Autonomous task {} completed (exit={})",
+            &task_id_clone[..8.min(task_id_clone.len())],
+            exit_code
+        );
     });
 
     // Wait for the background thread to finish.
@@ -4123,18 +5321,31 @@ fn run_delegate_autonomous(
 }
 
 fn run_fan_out(
-    sock: &PathBuf, team: &str, text: &str,
-    title: Option<String>, priority: Option<u32>, no_report: bool,
-    agents_flag: &Option<String>, context: Option<&str>, fix_budget: Option<u8>,
+    sock: &PathBuf,
+    team: &str,
+    text: &str,
+    title: Option<String>,
+    priority: Option<u32>,
+    no_report: bool,
+    agents_flag: &Option<String>,
+    context: Option<&str>,
+    fix_budget: Option<u8>,
 ) {
     // Get all agent names from team status
-    let all_agents: Vec<String> = match rpc_call(sock, "team.status", json!({ "team_name": team })) {
-        Ok(r) => {
-            r["result"]["agents"].as_array()
-                .map(|arr| arr.iter().filter_map(|a| a["name"].as_str().map(String::from)).collect())
-                .unwrap_or_default()
+    let all_agents: Vec<String> = match rpc_call(sock, "team.status", json!({ "team_name": team }))
+    {
+        Ok(r) => r["result"]["agents"]
+            .as_array()
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|a| a["name"].as_str().map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default(),
+        Err(e) => {
+            eprintln!("Error: {e}");
+            process::exit(1);
         }
-        Err(e) => { eprintln!("Error: {e}"); process::exit(1); }
     };
 
     // Filter agents if --agents flag provided
@@ -4142,7 +5353,11 @@ fn run_fan_out(
     let targets: Vec<&str> = if filter.is_empty() {
         all_agents.iter().map(|s| s.as_str()).collect()
     } else {
-        all_agents.iter().filter(|a| filter.contains(a.as_str())).map(|s| s.as_str()).collect()
+        all_agents
+            .iter()
+            .filter(|a| filter.contains(a.as_str()))
+            .map(|s| s.as_str())
+            .collect()
     };
 
     if targets.is_empty() {
@@ -4150,7 +5365,11 @@ fn run_fan_out(
         process::exit(1);
     }
 
-    eprintln!("Fan-out: delegating to {} agents in parallel: {}", targets.len(), targets.join(", "));
+    eprintln!(
+        "Fan-out: delegating to {} agents in parallel: {}",
+        targets.len(),
+        targets.join(", ")
+    );
 
     // L2: compute task title once outside the thread scope to avoid repeated calls per thread.
     let base_title = title.unwrap_or_else(|| task_title_from_text(text));
@@ -4158,16 +5377,33 @@ fn run_fan_out(
     // Run all delegate calls in parallel using scoped threads.
     // rpc_call_timeout() opens a new UnixStream per call, so threads don't share connections.
     let results: Vec<(&str, Result<Value, String>)> = thread::scope(|s| {
-        let handles: Vec<_> = targets.iter().map(|target| {
-            let t = base_title.clone();
-            s.spawn(move || {
-                let result = run_delegate_result(
-                    sock, team, target, text, Some(t), priority, &[], &[], None, no_report, context, fix_budget,
-                );
-                (*target, result)
+        let handles: Vec<_> = targets
+            .iter()
+            .map(|target| {
+                let t = base_title.clone();
+                s.spawn(move || {
+                    let result = run_delegate_result(
+                        sock,
+                        team,
+                        target,
+                        text,
+                        Some(t),
+                        priority,
+                        &[],
+                        &[],
+                        None,
+                        no_report,
+                        context,
+                        fix_budget,
+                    );
+                    (*target, result)
+                })
             })
-        }).collect();
-        handles.into_iter().map(|h| h.join().expect("thread panicked")).collect()
+            .collect();
+        handles
+            .into_iter()
+            .map(|h| h.join().expect("thread panicked"))
+            .collect()
     });
 
     let mut succeeded: Vec<String> = Vec::new();
@@ -4187,16 +5423,20 @@ fn run_fan_out(
 
     eprintln!(
         "Fan-out complete: {} succeeded, {} failed.",
-        succeeded.len(), failed.len()
+        succeeded.len(),
+        failed.len()
     );
-    println!("{}", pretty(&json!({
-        "fan_out": {
-            "team_name": team,
-            "agents": succeeded,
-            "count": succeeded.len(),
-            "failed": failed,
-        }
-    })));
+    println!(
+        "{}",
+        pretty(&json!({
+            "fan_out": {
+                "team_name": team,
+                "agents": succeeded,
+                "count": succeeded.len(),
+                "failed": failed,
+            }
+        }))
+    );
 
     // M1: exit with error if all delegates failed.
     if succeeded.is_empty() && !failed.is_empty() {
@@ -4204,7 +5444,16 @@ fn run_fan_out(
     }
 }
 
-fn run_wait(sock: &PathBuf, team: &str, timeout: u32, interval: u32, mode: &str, task_id: Option<&str>, agent_filter: &std::collections::HashSet<String>, explicit_task_ids: Option<&std::collections::HashSet<String>>) {
+fn run_wait(
+    sock: &PathBuf,
+    team: &str,
+    timeout: u32,
+    interval: u32,
+    mode: &str,
+    task_id: Option<&str>,
+    agent_filter: &std::collections::HashSet<String>,
+    explicit_task_ids: Option<&std::collections::HashSet<String>>,
+) {
     // Prevent infinite loop: clamp interval to at least 1 second
     let interval = interval.max(1);
     let filter_label = if agent_filter.is_empty() {
@@ -4218,7 +5467,8 @@ fn run_wait(sock: &PathBuf, team: &str, timeout: u32, interval: u32, mode: &str,
     if mode == "msg" || mode == "any" {
         if let Ok(r) = rpc_call(sock, "team.status", json!({ "team_name": team })) {
             if let Some(agents) = r["result"]["agents"].as_array() {
-                agent_names = agents.iter()
+                agent_names = agents
+                    .iter()
                     .filter_map(|a| a["name"].as_str().map(String::from))
                     .filter(|n| agent_filter.is_empty() || agent_filter.contains(n))
                     .collect();
@@ -4234,9 +5484,8 @@ fn run_wait(sock: &PathBuf, team: &str, timeout: u32, interval: u32, mode: &str,
     // For report mode: snapshot task IDs on first poll so we can track them
     // even after agents drop active_task_id on completion.
     // If explicit --tasks are provided, use those directly (no auto-discovery).
-    let mut tracked_task_ids: std::collections::HashSet<String> = explicit_task_ids
-        .cloned()
-        .unwrap_or_default();
+    let mut tracked_task_ids: std::collections::HashSet<String> =
+        explicit_task_ids.cloned().unwrap_or_default();
     let mut tracked_initialized = explicit_task_ids.is_some() && !tracked_task_ids.is_empty();
     while elapsed < timeout {
         if current_interval > 0 {
@@ -4256,15 +5505,21 @@ fn run_wait(sock: &PathBuf, team: &str, timeout: u32, interval: u32, mode: &str,
                     if let Some(agents) = r["result"]["agents"].as_array() {
                         for a in agents {
                             let name = a["name"].as_str().unwrap_or("");
-                            if !agent_filter.is_empty() && !agent_filter.contains(name) { continue; }
+                            if !agent_filter.is_empty() && !agent_filter.contains(name) {
+                                continue;
+                            }
                             if let Some(tid) = a["active_task_id"].as_str() {
                                 let status = a["active_task_status"].as_str().unwrap_or("");
                                 // Only track tasks that are currently active (not already done)
-                                if matches!(status, "completed" | "failed" | "abandoned") { continue; }
+                                if matches!(status, "completed" | "failed" | "abandoned") {
+                                    continue;
+                                }
                                 // Skip stale tasks from previous sessions — they'll never
                                 // complete and would cause wait to hang forever.
                                 let is_stale = a["active_task_is_stale"].as_bool().unwrap_or(false);
-                                if is_stale { continue; }
+                                if is_stale {
+                                    continue;
+                                }
                                 tracked_task_ids.insert(tid.to_string());
                             }
                         }
@@ -4280,13 +5535,15 @@ fn run_wait(sock: &PathBuf, team: &str, timeout: u32, interval: u32, mode: &str,
                 if let Ok(r) = rpc_call(sock, "team.task.list", json!({ "team_name": team })) {
                     if let Some(tasks) = r["result"]["tasks"].as_array() {
                         let total = tracked_task_ids.len() as u64;
-                        let done = tasks.iter()
+                        let done = tasks
+                            .iter()
                             .filter(|t| {
                                 let tid = t["id"].as_str().unwrap_or("");
-                                tracked_task_ids.contains(tid) && matches!(
-                                    t["status"].as_str(),
-                                    Some("completed") | Some("review_ready")
-                                )
+                                tracked_task_ids.contains(tid)
+                                    && matches!(
+                                        t["status"].as_str(),
+                                        Some("completed") | Some("review_ready")
+                                    )
                             })
                             .count() as u64;
                         report_done = total > 0 && done >= total;
@@ -4308,9 +5565,12 @@ fn run_wait(sock: &PathBuf, team: &str, timeout: u32, interval: u32, mode: &str,
             match rpc_call(sock, "team.message.list", json!({ "team_name": team })) {
                 Ok(r) => {
                     if let Some(messages) = r["result"]["messages"].as_array() {
-                        let senders: std::collections::HashSet<&str> = messages.iter()
-                            .filter_map(|m| m["from"].as_str()).collect();
-                        let reported = agent_names.iter().filter(|a| senders.contains(a.as_str())).count();
+                        let senders: std::collections::HashSet<&str> =
+                            messages.iter().filter_map(|m| m["from"].as_str()).collect();
+                        let reported = agent_names
+                            .iter()
+                            .filter(|a| senders.contains(a.as_str()))
+                            .count();
                         let total = agent_names.len();
                         msg_done = reported >= total && total > 0;
                         msg_progress = format!("{reported}/{total}");
@@ -4331,11 +5591,13 @@ fn run_wait(sock: &PathBuf, team: &str, timeout: u32, interval: u32, mode: &str,
                 let p_inbox = serde_json::to_string(&json!({
                     "jsonrpc": "2.0", "id": 1,
                     "method": "team.inbox", "params": { "team_name": team }
-                })).unwrap_or_default();
+                }))
+                .unwrap_or_default();
                 let p_task_get = serde_json::to_string(&json!({
                     "jsonrpc": "2.0", "id": 2,
                     "method": "team.task.get", "params": { "team_name": team, "task_id": tid }
-                })).unwrap_or_default();
+                }))
+                .unwrap_or_default();
                 let (inbox_r, task_r) = match rpc_batch(sock, &[p_inbox, p_task_get]) {
                     Ok(mut results) if results.len() >= 2 => {
                         let tr = results.remove(1);
@@ -4344,18 +5606,32 @@ fn run_wait(sock: &PathBuf, team: &str, timeout: u32, interval: u32, mode: &str,
                     }
                     Ok(_) | Err(_) => (
                         rpc_call(sock, "team.inbox", json!({ "team_name": team })),
-                        rpc_call(sock, "team.task.get", json!({ "team_name": team, "task_id": tid })),
+                        rpc_call(
+                            sock,
+                            "team.task.get",
+                            json!({ "team_name": team, "task_id": tid }),
+                        ),
                     ),
                 };
                 match inbox_r {
                     Ok(r) => {
                         if let Some(items) = r["result"]["items"].as_array() {
-                            inbox_blocked = items.iter()
-                                .filter(|i| i["kind"].as_str() == Some("task") && i["status"].as_str() == Some("blocked"))
-                                .cloned().collect();
-                            inbox_review = items.iter()
-                                .filter(|i| i["kind"].as_str() == Some("task") && i["status"].as_str() == Some("review_ready"))
-                                .cloned().collect();
+                            inbox_blocked = items
+                                .iter()
+                                .filter(|i| {
+                                    i["kind"].as_str() == Some("task")
+                                        && i["status"].as_str() == Some("blocked")
+                                })
+                                .cloned()
+                                .collect();
+                            inbox_review = items
+                                .iter()
+                                .filter(|i| {
+                                    i["kind"].as_str() == Some("task")
+                                        && i["status"].as_str() == Some("review_ready")
+                                })
+                                .cloned()
+                                .collect();
                         }
                     }
                     Err(e) => eprintln!("  Warning: inbox RPC failed: {e}"),
@@ -4373,12 +5649,22 @@ fn run_wait(sock: &PathBuf, team: &str, timeout: u32, interval: u32, mode: &str,
                 match rpc_call(sock, "team.inbox", json!({ "team_name": team })) {
                     Ok(r) => {
                         if let Some(items) = r["result"]["items"].as_array() {
-                            inbox_blocked = items.iter()
-                                .filter(|i| i["kind"].as_str() == Some("task") && i["status"].as_str() == Some("blocked"))
-                                .cloned().collect();
-                            inbox_review = items.iter()
-                                .filter(|i| i["kind"].as_str() == Some("task") && i["status"].as_str() == Some("review_ready"))
-                                .cloned().collect();
+                            inbox_blocked = items
+                                .iter()
+                                .filter(|i| {
+                                    i["kind"].as_str() == Some("task")
+                                        && i["status"].as_str() == Some("blocked")
+                                })
+                                .cloned()
+                                .collect();
+                            inbox_review = items
+                                .iter()
+                                .filter(|i| {
+                                    i["kind"].as_str() == Some("task")
+                                        && i["status"].as_str() == Some("review_ready")
+                                })
+                                .cloned()
+                                .collect();
                         }
                     }
                     Err(e) => eprintln!("  Warning: inbox RPC failed: {e}"),
@@ -4389,8 +5675,14 @@ fn run_wait(sock: &PathBuf, team: &str, timeout: u32, interval: u32, mode: &str,
         if let Some(tid) = task_id {
             let st = task_status.as_deref().unwrap_or("unknown");
             eprintln!("  [{elapsed}/{timeout}s] task={tid} status={st}");
-            if matches!(st, "blocked" | "review_ready" | "completed" | "failed" | "abandoned") {
-                println!("{}", pretty(&json!({ "result": { "team_name": team, "task": task_obj } })));
+            if matches!(
+                st,
+                "blocked" | "review_ready" | "completed" | "failed" | "abandoned"
+            ) {
+                println!(
+                    "{}",
+                    pretty(&json!({ "result": { "team_name": team, "task": task_obj } }))
+                );
                 return;
             }
         }
@@ -4400,7 +5692,9 @@ fn run_wait(sock: &PathBuf, team: &str, timeout: u32, interval: u32, mode: &str,
                 eprintln!("  [{elapsed}/{timeout}s] {report_progress} agents reported (report)");
                 if report_done {
                     eprintln!("All agents have reported results.");
-                    if let Ok(r) = rpc_call(sock, "team.result.collect", json!({ "team_name": team })) {
+                    if let Ok(r) =
+                        rpc_call(sock, "team.result.collect", json!({ "team_name": team }))
+                    {
                         println!("{}", pretty(&r));
                     }
                     return;
@@ -4410,24 +5704,30 @@ fn run_wait(sock: &PathBuf, team: &str, timeout: u32, interval: u32, mode: &str,
                 eprintln!("  [{elapsed}/{timeout}s] {msg_progress} agents messaged (msg)");
                 if msg_done {
                     eprintln!("All agents have posted messages.");
-                    if let Ok(r) = rpc_call(sock, "team.message.list", json!({ "team_name": team })) {
+                    if let Ok(r) = rpc_call(sock, "team.message.list", json!({ "team_name": team }))
+                    {
                         println!("{}", pretty(&r));
                     }
                     return;
                 }
             }
             "any" => {
-                eprintln!("  [{elapsed}/{timeout}s] report={report_progress} msg={msg_progress} (any)");
+                eprintln!(
+                    "  [{elapsed}/{timeout}s] report={report_progress} msg={msg_progress} (any)"
+                );
                 if report_done {
                     eprintln!("All agents have reported results.");
-                    if let Ok(r) = rpc_call(sock, "team.result.collect", json!({ "team_name": team })) {
+                    if let Ok(r) =
+                        rpc_call(sock, "team.result.collect", json!({ "team_name": team }))
+                    {
                         println!("{}", pretty(&r));
                     }
                     return;
                 }
                 if msg_done {
                     eprintln!("All agents have posted messages.");
-                    if let Ok(r) = rpc_call(sock, "team.message.list", json!({ "team_name": team })) {
+                    if let Ok(r) = rpc_call(sock, "team.message.list", json!({ "team_name": team }))
+                    {
                         println!("{}", pretty(&r));
                     }
                     return;
@@ -4437,19 +5737,28 @@ fn run_wait(sock: &PathBuf, team: &str, timeout: u32, interval: u32, mode: &str,
                 eprintln!("  [{elapsed}/{timeout}s] blocked={}", inbox_blocked.len());
                 if !inbox_blocked.is_empty() {
                     eprintln!("A task is blocked.");
-                    println!("{}", pretty(&json!({
-                        "result": { "team_name": team, "items": inbox_blocked, "count": inbox_blocked.len() }
-                    })));
+                    println!(
+                        "{}",
+                        pretty(&json!({
+                            "result": { "team_name": team, "items": inbox_blocked, "count": inbox_blocked.len() }
+                        }))
+                    );
                     return;
                 }
             }
             "review_ready" => {
-                eprintln!("  [{elapsed}/{timeout}s] review_ready={}", inbox_review.len());
+                eprintln!(
+                    "  [{elapsed}/{timeout}s] review_ready={}",
+                    inbox_review.len()
+                );
                 if !inbox_review.is_empty() {
                     eprintln!("A task is ready for review.");
-                    println!("{}", pretty(&json!({
-                        "result": { "team_name": team, "items": inbox_review, "count": inbox_review.len() }
-                    })));
+                    println!(
+                        "{}",
+                        pretty(&json!({
+                            "result": { "team_name": team, "items": inbox_review, "count": inbox_review.len() }
+                        }))
+                    );
                     return;
                 }
             }
@@ -4459,35 +5768,65 @@ fn run_wait(sock: &PathBuf, team: &str, timeout: u32, interval: u32, mode: &str,
                         let filtered: Vec<&Value> = if agent_filter.is_empty() {
                             agents.iter().collect()
                         } else {
-                            agents.iter()
-                                .filter(|a| a["name"].as_str().map(|n| agent_filter.contains(n)).unwrap_or(false))
+                            agents
+                                .iter()
+                                .filter(|a| {
+                                    a["name"]
+                                        .as_str()
+                                        .map(|n| agent_filter.contains(n))
+                                        .unwrap_or(false)
+                                })
                                 .collect()
                         };
-                        let idle_count = filtered.iter()
-                            .filter(|a| a["agent_state"].as_str() == Some("idle")).count();
-                        let active_count = filtered.iter()
-                            .filter(|a| matches!(a["agent_state"].as_str(), Some("running" | "blocked" | "review_ready")))
+                        let idle_count = filtered
+                            .iter()
+                            .filter(|a| a["agent_state"].as_str() == Some("idle"))
+                            .count();
+                        let active_count = filtered
+                            .iter()
+                            .filter(|a| {
+                                matches!(
+                                    a["agent_state"].as_str(),
+                                    Some("running" | "blocked" | "review_ready")
+                                )
+                            })
                             .count();
                         let total = idle_count + active_count;
                         eprintln!("  [{elapsed}/{timeout}s] idle={idle_count}/{total}");
                         if total > 0 && idle_count == total {
-                            let idle_agents: Vec<&&Value> = filtered.iter()
-                                .filter(|a| a["agent_state"].as_str() == Some("idle")).collect();
-                            println!("{}", pretty(&json!({
-                                "result": { "team_name": team, "agents": idle_agents, "count": idle_count }
-                            })));
+                            let idle_agents: Vec<&&Value> = filtered
+                                .iter()
+                                .filter(|a| a["agent_state"].as_str() == Some("idle"))
+                                .collect();
+                            println!(
+                                "{}",
+                                pretty(&json!({
+                                    "result": { "team_name": team, "agents": idle_agents, "count": idle_count }
+                                }))
+                            );
                             return;
                         }
                     }
                 }
             }
-            _ => { eprintln!("Unknown wait mode: {mode}"); process::exit(1); }
+            _ => {
+                eprintln!("Unknown wait mode: {mode}");
+                process::exit(1);
+            }
         }
 
         // Adaptive polling: speed up on progress, slow down on idle
         let current_progress_count: usize = {
-            let r = report_progress.split('/').next().and_then(|s| s.parse().ok()).unwrap_or(0usize);
-            let m = msg_progress.split('/').next().and_then(|s| s.parse().ok()).unwrap_or(0usize);
+            let r = report_progress
+                .split('/')
+                .next()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0usize);
+            let m = msg_progress
+                .split('/')
+                .next()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0usize);
             r + m + inbox_blocked.len() + inbox_review.len()
         };
         if current_progress_count > prev_progress_count {
@@ -4511,9 +5850,15 @@ fn run_warmup(sock: &PathBuf, team: &str, target: Option<&str>, timeout: u32) {
     // Get agent list
     let status = match rpc_call(sock, "team.status", json!({ "team_name": team })) {
         Ok(v) => v,
-        Err(e) => { eprintln!("Error: {e}"); process::exit(1); }
+        Err(e) => {
+            eprintln!("Error: {e}");
+            process::exit(1);
+        }
     };
-    let agents = status["result"]["agents"].as_array().unwrap_or(&vec![]).clone();
+    let agents = status["result"]["agents"]
+        .as_array()
+        .unwrap_or(&vec![])
+        .clone();
     if agents.is_empty() {
         eprintln!("No agents in team '{team}'");
         process::exit(1);
@@ -4521,7 +5866,10 @@ fn run_warmup(sock: &PathBuf, team: &str, target: Option<&str>, timeout: u32) {
 
     // Filter to specific agent if requested
     let targets: Vec<&Value> = if let Some(name) = target {
-        let filtered: Vec<&Value> = agents.iter().filter(|a| a["name"].as_str() == Some(name)).collect();
+        let filtered: Vec<&Value> = agents
+            .iter()
+            .filter(|a| a["name"].as_str() == Some(name))
+            .collect();
         if filtered.is_empty() {
             eprintln!("Agent '{name}' not found in team '{team}'");
             process::exit(1);
@@ -4540,8 +5888,18 @@ fn run_warmup(sock: &PathBuf, team: &str, target: Option<&str>, timeout: u32) {
         let name = agent_val["name"].as_str().unwrap_or("?");
         let start = Instant::now();
         let result = run_delegate_result(
-            sock, team, name, "Reply with exactly one word: pong",
-            Some("warmup-ping".to_string()), Some(3), &[], &[], None, true, None, None,
+            sock,
+            team,
+            name,
+            "Reply with exactly one word: pong",
+            Some("warmup-ping".to_string()),
+            Some(3),
+            &[],
+            &[],
+            None,
+            true,
+            None,
+            None,
         );
         match result {
             Ok(v) => {
@@ -4569,9 +5927,13 @@ fn run_warmup(sock: &PathBuf, team: &str, target: Option<&str>, timeout: u32) {
         thread::sleep(Duration::from_millis(500));
         let mut still_pending = Vec::new();
         for (agent_name, tid, start) in &pending {
-            if let Ok(v) = rpc_call(sock, "team.task.get", json!({
-                "team_name": team, "task_id": tid,
-            })) {
+            if let Ok(v) = rpc_call(
+                sock,
+                "team.task.get",
+                json!({
+                    "team_name": team, "task_id": tid,
+                }),
+            ) {
                 let status = v["result"]["status"].as_str().unwrap_or("");
                 if status == "completed" || status == "review_ready" {
                     let ms = start.elapsed().as_millis();
@@ -4590,7 +5952,11 @@ fn run_warmup(sock: &PathBuf, team: &str, target: Option<&str>, timeout: u32) {
     let fail = task_ids.len() - pass;
     println!();
     for (name, ms, result) in &completed {
-        let icon = if result.to_lowercase().contains("pong") { "✓" } else { "?" };
+        let icon = if result.to_lowercase().contains("pong") {
+            "✓"
+        } else {
+            "?"
+        };
         println!("  {icon} {name}: {ms}ms");
     }
     for (name, _, start) in &pending {
@@ -4608,20 +5974,32 @@ fn run_warmup(sock: &PathBuf, team: &str, target: Option<&str>, timeout: u32) {
 
 /// Work-stealing: claim the next available pending/unassigned task for this agent.
 fn run_claim(sock: &PathBuf, team: &str, agent: &str) {
-    let result = rpc_call(sock, "team.task.claim", json!({
-        "team_name": team,
-        "agent_name": agent,
-    }));
+    let result = rpc_call(
+        sock,
+        "team.task.claim",
+        json!({
+            "team_name": team,
+            "agent_name": agent,
+        }),
+    );
     match result {
         Ok(ref v) if v["ok"].as_bool().unwrap_or(false) => {
             if v["result"].is_null() {
-                println!("{}", pretty(&json!({ "ok": true, "result": null, "message": "No claimable tasks available" })));
+                println!(
+                    "{}",
+                    pretty(
+                        &json!({ "ok": true, "result": null, "message": "No claimable tasks available" })
+                    )
+                );
             } else {
                 println!("{}", pretty(v));
             }
         }
         Ok(ref v) => println!("{}", pretty(v)),
-        Err(e) => { eprintln!("Error: {e}"); process::exit(1); }
+        Err(e) => {
+            eprintln!("Error: {e}");
+            process::exit(1);
+        }
     }
 }
 
@@ -4629,86 +6007,206 @@ fn run_claim(sock: &PathBuf, team: &str, agent: &str) {
 /// Used by `tm-agent suggest` to match task descriptions to agents.
 fn capabilities_for_agent_type(agent_type: &str) -> Vec<&'static str> {
     match agent_type.to_lowercase().as_str() {
-        "architect" => vec!["architecture", "design", "system", "review", "structure", "plan", "interface", "boundary"],
-        "executor"  => vec!["implement", "code", "coding", "refactor", "fix", "build", "develop", "feature"],
-        "explorer"  => vec!["explore", "discover", "search", "analyze", "investigate", "map", "find"],
-        "reviewer"  => vec!["review", "check", "audit", "quality", "lint", "standards", "critique"],
-        "tester"    => vec!["test", "testing", "qa", "verification", "unit", "integration", "e2e", "spec"],
-        "debugger"  => vec!["debug", "trace", "crash", "error", "bug", "fix", "diagnose", "root cause"],
-        "writer"    => vec!["document", "docs", "readme", "guide", "migration", "notes", "write"],
-        "security"  => vec!["security", "auth", "vulnerability", "pentest", "owasp", "injection", "xss"],
-        "ai"        => vec!["ai", "ml", "llm", "model", "inference", "prompt", "embedding", "rag"],
-        "backend"   => vec!["api", "server", "database", "backend", "service", "schema", "query", "rest"],
-        "frontend"  => vec!["ui", "frontend", "component", "react", "swiftui", "css", "layout", "ux"],
+        "architect" => vec![
+            "architecture",
+            "design",
+            "system",
+            "review",
+            "structure",
+            "plan",
+            "interface",
+            "boundary",
+        ],
+        "executor" => vec![
+            "implement",
+            "code",
+            "coding",
+            "refactor",
+            "fix",
+            "build",
+            "develop",
+            "feature",
+        ],
+        "explorer" => vec![
+            "explore",
+            "discover",
+            "search",
+            "analyze",
+            "investigate",
+            "map",
+            "find",
+        ],
+        "reviewer" => vec![
+            "review",
+            "check",
+            "audit",
+            "quality",
+            "lint",
+            "standards",
+            "critique",
+        ],
+        "tester" => vec![
+            "test",
+            "testing",
+            "qa",
+            "verification",
+            "unit",
+            "integration",
+            "e2e",
+            "spec",
+        ],
+        "debugger" => vec![
+            "debug",
+            "trace",
+            "crash",
+            "error",
+            "bug",
+            "fix",
+            "diagnose",
+            "root cause",
+        ],
+        "writer" => vec![
+            "document",
+            "docs",
+            "readme",
+            "guide",
+            "migration",
+            "notes",
+            "write",
+        ],
+        "security" => vec![
+            "security",
+            "auth",
+            "vulnerability",
+            "pentest",
+            "owasp",
+            "injection",
+            "xss",
+        ],
+        "ai" => vec![
+            "ai",
+            "ml",
+            "llm",
+            "model",
+            "inference",
+            "prompt",
+            "embedding",
+            "rag",
+        ],
+        "backend" => vec![
+            "api", "server", "database", "backend", "service", "schema", "query", "rest",
+        ],
+        "frontend" => vec![
+            "ui",
+            "frontend",
+            "component",
+            "react",
+            "swiftui",
+            "css",
+            "layout",
+            "ux",
+        ],
         _ => vec![],
     }
 }
 
 /// Score how well a task description matches an agent's capabilities.
 fn capability_score(description_lower: &str, capabilities: &[&str]) -> usize {
-    capabilities.iter().filter(|kw| description_lower.contains(*kw)).count()
+    capabilities
+        .iter()
+        .filter(|kw| description_lower.contains(*kw))
+        .count()
 }
 
 /// Suggest the best agent for a task description based on capability mapping.
 fn run_suggest(sock: &PathBuf, team: &str, description: &str) {
     let status = match rpc_call(sock, "team.status", json!({ "team_name": team })) {
         Ok(v) => v,
-        Err(e) => { eprintln!("Error: {e}"); process::exit(1); }
+        Err(e) => {
+            eprintln!("Error: {e}");
+            process::exit(1);
+        }
     };
 
     let agents = match status["result"]["agents"].as_array() {
         Some(a) => a.clone(),
-        None => { eprintln!("Error: no agents in team"); process::exit(1); }
+        None => {
+            eprintln!("Error: no agents in team");
+            process::exit(1);
+        }
     };
 
     let desc_lower = description.to_lowercase();
-    let mut scored: Vec<(String, String, Vec<&'static str>, usize)> = agents.iter().filter_map(|a| {
-        let name = a["name"].as_str()?.to_string();
-        let agent_type = a["agent_type"].as_str().unwrap_or(&name).to_string();
-        let caps = capabilities_for_agent_type(&agent_type);
-        let score = capability_score(&desc_lower, &caps);
-        Some((name, agent_type, caps, score))
-    }).collect();
+    let mut scored: Vec<(String, String, Vec<&'static str>, usize)> = agents
+        .iter()
+        .filter_map(|a| {
+            let name = a["name"].as_str()?.to_string();
+            let agent_type = a["agent_type"].as_str().unwrap_or(&name).to_string();
+            let caps = capabilities_for_agent_type(&agent_type);
+            let score = capability_score(&desc_lower, &caps);
+            Some((name, agent_type, caps, score))
+        })
+        .collect();
 
     scored.sort_by(|a, b| b.3.cmp(&a.3));
 
-    let suggestions: Vec<Value> = scored.iter().map(|(name, agent_type, caps, score)| {
-        json!({
-            "agent": name,
-            "agent_type": agent_type,
-            "capabilities": caps,
-            "score": score,
+    let suggestions: Vec<Value> = scored
+        .iter()
+        .map(|(name, agent_type, caps, score)| {
+            json!({
+                "agent": name,
+                "agent_type": agent_type,
+                "capabilities": caps,
+                "score": score,
+            })
         })
-    }).collect();
+        .collect();
 
-    let best = scored.first().map(|(name, _, _, _)| name.as_str()).unwrap_or("none");
-    println!("{}", serde_json::to_string_pretty(&json!({
-        "ok": true,
-        "result": {
-            "task": description,
-            "best_match": best,
-            "ranking": suggestions,
-        }
-    })).unwrap_or_default());
+    let best = scored
+        .first()
+        .map(|(name, _, _, _)| name.as_str())
+        .unwrap_or("none");
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&json!({
+            "ok": true,
+            "result": {
+                "task": description,
+                "best_match": best,
+                "ranking": suggestions,
+            }
+        }))
+        .unwrap_or_default()
+    );
 }
 
 fn run_brief(sock: &PathBuf, team: &str, target: &str, lines: u32) {
     let status = match rpc_call(sock, "team.status", json!({ "team_name": team })) {
         Ok(v) => v,
-        Err(e) => { eprintln!("Error: {e}"); process::exit(1); }
+        Err(e) => {
+            eprintln!("Error: {e}");
+            process::exit(1);
+        }
     };
 
     let agents = status["result"]["agents"].as_array();
     let agent_info = agents.and_then(|arr| arr.iter().find(|a| a["name"].as_str() == Some(target)));
     let agent_info = match agent_info {
         Some(a) => a.clone(),
-        None => { eprintln!("Error: agent '{target}' not found in team '{team}'"); process::exit(1); }
+        None => {
+            eprintln!("Error: agent '{target}' not found in team '{team}'");
+            process::exit(1);
+        }
     };
 
     // Get active task
     let mut active_task = json!(null);
     if let Some(task_id) = agent_info["active_task_id"].as_str() {
-        if let Ok(r) = rpc_call(sock, "team.task.get", json!({ "team_name": team, "task_id": task_id })) {
+        if let Ok(r) = rpc_call(
+            sock,
+            "team.task.get",
+            json!({ "team_name": team, "task_id": task_id }),
+        ) {
             if r["ok"].as_bool().unwrap_or(false) {
                 active_task = r["result"].clone();
             }
@@ -4717,7 +6215,11 @@ fn run_brief(sock: &PathBuf, team: &str, target: &str, lines: u32) {
 
     // Get recent messages
     let mut messages = json!([]);
-    if let Ok(r) = rpc_call(sock, "team.message.list", json!({ "team_name": team, "from": target, "limit": 5 })) {
+    if let Ok(r) = rpc_call(
+        sock,
+        "team.message.list",
+        json!({ "team_name": team, "from": target, "limit": 5 }),
+    ) {
         if r["ok"].as_bool().unwrap_or(false) {
             messages = r["result"]["messages"].clone();
         }
@@ -4727,7 +6229,11 @@ fn run_brief(sock: &PathBuf, team: &str, target: &str, lines: u32) {
     let mut terminal_tail = String::new();
 
     // 1: team.read
-    if let Ok(r) = rpc_call(sock, "team.read", json!({ "team_name": team, "agent_name": target, "lines": lines })) {
+    if let Ok(r) = rpc_call(
+        sock,
+        "team.read",
+        json!({ "team_name": team, "agent_name": target, "lines": lines }),
+    ) {
         if r["ok"].as_bool().unwrap_or(false) {
             terminal_tail = r["result"]["text"].as_str().unwrap_or("").to_string();
         }
@@ -4736,7 +6242,11 @@ fn run_brief(sock: &PathBuf, team: &str, target: &str, lines: u32) {
     // 2: pane.read
     if terminal_tail.trim().is_empty() {
         if let Some(panel_id) = agent_info["panel_id"].as_str() {
-            if let Ok(r) = rpc_call(sock, "pane.read", json!({ "panel_id": panel_id, "lines": lines })) {
+            if let Ok(r) = rpc_call(
+                sock,
+                "pane.read",
+                json!({ "panel_id": panel_id, "lines": lines }),
+            ) {
                 if r["ok"].as_bool().unwrap_or(false) {
                     terminal_tail = r["result"]["text"].as_str().unwrap_or("").to_string();
                 }
@@ -4746,7 +6256,11 @@ fn run_brief(sock: &PathBuf, team: &str, target: &str, lines: u32) {
 
     // 3: last report
     if terminal_tail.trim().is_empty() {
-        if let Ok(r) = rpc_call(sock, "team.reports", json!({ "team_name": team, "agent_name": target, "limit": 1 })) {
+        if let Ok(r) = rpc_call(
+            sock,
+            "team.reports",
+            json!({ "team_name": team, "agent_name": target, "limit": 1 }),
+        ) {
             if r["ok"].as_bool().unwrap_or(false) {
                 if let Some(reports) = r["result"]["reports"].as_array() {
                     if let Some(first) = reports.first() {
@@ -4767,26 +6281,29 @@ fn run_brief(sock: &PathBuf, team: &str, target: &str, lines: u32) {
         }
     }
 
-    println!("{}", pretty(&json!({
-        "team_name": team,
-        "agent": {
-            "name": agent_info["name"],
-            "status": agent_info["status"],
-            "agent_type": agent_info["agent_type"],
-            "panel_id": agent_info["panel_id"],
-            "active_task_id": agent_info["active_task_id"],
-            "active_task_status": agent_info["active_task_status"],
-            "active_task_title": agent_info["active_task_title"],
-            "attention_reason": agent_info["attention_reason"],
-            "last_heartbeat_at": agent_info["last_heartbeat_at"],
-            "last_heartbeat_summary": agent_info["last_heartbeat_summary"],
-            "heartbeat_age_seconds": agent_info["heartbeat_age_seconds"],
-            "heartbeat_is_stale": agent_info["heartbeat_is_stale"],
-        },
-        "active_task": active_task,
-        "recent_messages": messages,
-        "terminal_tail": terminal_tail,
-    })));
+    println!(
+        "{}",
+        pretty(&json!({
+            "team_name": team,
+            "agent": {
+                "name": agent_info["name"],
+                "status": agent_info["status"],
+                "agent_type": agent_info["agent_type"],
+                "panel_id": agent_info["panel_id"],
+                "active_task_id": agent_info["active_task_id"],
+                "active_task_status": agent_info["active_task_status"],
+                "active_task_title": agent_info["active_task_title"],
+                "attention_reason": agent_info["attention_reason"],
+                "last_heartbeat_at": agent_info["last_heartbeat_at"],
+                "last_heartbeat_summary": agent_info["last_heartbeat_summary"],
+                "heartbeat_age_seconds": agent_info["heartbeat_age_seconds"],
+                "heartbeat_is_stale": agent_info["heartbeat_is_stale"],
+            },
+            "active_task": active_task,
+            "recent_messages": messages,
+            "terminal_tail": terminal_tail,
+        }))
+    );
 }
 
 /// Read board.jsonl and print a human-readable synthesis to stderr.
@@ -4795,16 +6312,34 @@ fn run_brief(sock: &PathBuf, team: &str, target: &str, lines: u32) {
 /// Missing fields are tolerated — raw JSON is used as fallback.
 /// Poll task IDs until all are completed/failed/abandoned, or timeout.
 /// Returns the set of task IDs that completed successfully.
-fn wait_for_tasks(sock: &PathBuf, team: &str, task_ids: &[String], timeout_secs: u64, label: &str) -> Vec<String> {
-    if task_ids.is_empty() { return Vec::new(); }
-    eprintln!("Waiting for {} task(s) to complete ({}, timeout: {}s)...", task_ids.len(), label, timeout_secs);
+fn wait_for_tasks(
+    sock: &PathBuf,
+    team: &str,
+    task_ids: &[String],
+    timeout_secs: u64,
+    label: &str,
+) -> Vec<String> {
+    if task_ids.is_empty() {
+        return Vec::new();
+    }
+    eprintln!(
+        "Waiting for {} task(s) to complete ({}, timeout: {}s)...",
+        task_ids.len(),
+        label,
+        timeout_secs
+    );
     let poll_interval = Duration::from_secs(3);
     let start = std::time::Instant::now();
     let deadline = start + Duration::from_secs(timeout_secs);
     let mut completed_ids: Vec<String> = Vec::new();
     loop {
         if std::time::Instant::now() >= deadline {
-            eprintln!("Timeout: {}/{} tasks completed within {}s", completed_ids.len(), task_ids.len(), timeout_secs);
+            eprintln!(
+                "Timeout: {}/{} tasks completed within {}s",
+                completed_ids.len(),
+                task_ids.len(),
+                timeout_secs
+            );
             break;
         }
         thread::sleep(poll_interval);
@@ -4814,20 +6349,37 @@ fn wait_for_tasks(sock: &PathBuf, team: &str, task_ids: &[String], timeout_secs:
             if let Some(tasks) = r["result"]["tasks"].as_array() {
                 completed_ids.clear();
                 for tid in task_ids {
-                    let task_status = tasks.iter()
+                    let task_status = tasks
+                        .iter()
                         .find(|t| t["id"].as_str() == Some(tid.as_str()))
                         .and_then(|t| t["status"].as_str());
                     match task_status {
-                        Some("completed") => { done_count += 1; completed_ids.push(tid.clone()); }
-                        Some("failed") | Some("abandoned") => { done_count += 1; }
-                        _ => { all_done = false; }
+                        Some("completed") => {
+                            done_count += 1;
+                            completed_ids.push(tid.clone());
+                        }
+                        Some("failed") | Some("abandoned") => {
+                            done_count += 1;
+                        }
+                        _ => {
+                            all_done = false;
+                        }
                     }
                 }
             }
         }
         let elapsed = start.elapsed().as_secs();
-        eprintln!("  [{}/{}s] {}/{} done ({})", elapsed, timeout_secs, done_count, task_ids.len(), label);
-        if all_done { break; }
+        eprintln!(
+            "  [{}/{}s] {}/{} done ({})",
+            elapsed,
+            timeout_secs,
+            done_count,
+            task_ids.len(),
+            label
+        );
+        if all_done {
+            break;
+        }
     }
     completed_ids
 }
@@ -4835,10 +6387,13 @@ fn wait_for_tasks(sock: &PathBuf, team: &str, task_ids: &[String], timeout_secs:
 /// Dispatch delegates with stagger and wait for completion.
 /// Returns (agent_name, task_id) for dispatched tasks.
 fn dispatch_and_wait(
-    sock: &PathBuf, team: &str, timeout_secs: u64,
+    sock: &PathBuf,
+    team: &str,
+    timeout_secs: u64,
     agents_and_prompts: Vec<(String, String, String)>, // (agent_name, prompt, title)
     label: &str,
-) -> Vec<(String, String)> { // (agent_name, task_id) for dispatched tasks
+) -> Vec<(String, String)> {
+    // (agent_name, task_id) for dispatched tasks
     let mut handles = Vec::new();
     for (i, (name, prompt, title)) in agents_and_prompts.into_iter().enumerate() {
         if i > 0 {
@@ -4848,16 +6403,28 @@ fn dispatch_and_wait(
         let team_owned = team.to_string();
         let h = thread::spawn(move || {
             let result = run_delegate_result(
-                &sock_clone, &team_owned, &name, &prompt,
-                Some(title), None, &[], &[], None, false, None, None,
+                &sock_clone,
+                &team_owned,
+                &name,
+                &prompt,
+                Some(title),
+                None,
+                &[],
+                &[],
+                None,
+                false,
+                None,
+                None,
             );
             (name, result)
         });
         handles.push(h);
     }
 
-    let results: Vec<(String, Result<Value, String>)> =
-        handles.into_iter().map(|h| h.join().expect("thread panicked")).collect();
+    let results: Vec<(String, Result<Value, String>)> = handles
+        .into_iter()
+        .map(|h| h.join().expect("thread panicked"))
+        .collect();
 
     let mut agent_task_pairs: Vec<(String, String)> = Vec::new();
     let mut task_ids: Vec<String> = Vec::new();
@@ -4869,7 +6436,9 @@ fn dispatch_and_wait(
                     agent_task_pairs.push((name.clone(), tid.to_string()));
                 }
             }
-            Err(e) => { eprintln!("  {name}: delegate failed: {e}"); }
+            Err(e) => {
+                eprintln!("  {name}: delegate failed: {e}");
+            }
         }
     }
 
@@ -4884,7 +6453,10 @@ fn read_task_result(team: &str, task_id: &str, agent_name: &str) -> String {
     let result_file = format!("{}/.term-mesh/results/{}/{}.md", home, team, task_id);
     std::fs::read_to_string(&result_file)
         .or_else(|_| {
-            let reply_file = format!("{}/.term-mesh/results/{}/{}-reply.md", home, team, agent_name);
+            let reply_file = format!(
+                "{}/.term-mesh/results/{}/{}-reply.md",
+                home, team, agent_name
+            );
             std::fs::read_to_string(&reply_file)
         })
         .unwrap_or_else(|_| "(no response)".to_string())
@@ -4937,7 +6509,8 @@ fn synthesize_board(board_path: &PathBuf, board_path_str: &str) {
     let mut per_agent: HashMap<String, usize> = HashMap::new();
     let mut rounds: std::collections::BTreeSet<u64> = std::collections::BTreeSet::new();
     for entry in &entries {
-        let agent = entry.get("agent")
+        let agent = entry
+            .get("agent")
             .and_then(|v| v.as_str())
             .unwrap_or("unknown")
             .to_string();
@@ -4969,20 +6542,22 @@ fn synthesize_board(board_path: &PathBuf, board_path_str: &str) {
     for (i, entry) in entries.iter().enumerate() {
         match entry {
             Value::Object(_) => {
-                let agent = entry.get("agent")
+                let agent = entry
+                    .get("agent")
                     .and_then(|v| v.as_str())
                     .unwrap_or("unknown");
-                let round = entry.get("round")
+                let round = entry
+                    .get("round")
                     .and_then(|v| v.as_u64())
                     .map(|r| r.to_string())
                     .unwrap_or_else(|| "?".to_string());
-                let finding = entry.get("finding")
+                let finding = entry
+                    .get("finding")
                     .and_then(|v| v.as_str())
                     .unwrap_or("(no finding field)");
-                let source = entry.get("source")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
-                let implication = entry.get("implication")
+                let source = entry.get("source").and_then(|v| v.as_str()).unwrap_or("");
+                let implication = entry
+                    .get("implication")
                     .and_then(|v| v.as_str())
                     .unwrap_or("");
 
@@ -5007,16 +6582,21 @@ fn synthesize_board(board_path: &PathBuf, board_path_str: &str) {
 }
 
 fn run_autonomous(
-    sock: &PathBuf, team: &str,
-    mode: &str,          // "research", "solve", "consensus", "swarm"
-    topic: &str,         // topic/problem/question/goal
-    agents_requested: u32, budget: u32,
-    timeout: u64, depth: &str, web: bool,
-    focus: Option<&str>, no_discuss: bool,
+    sock: &PathBuf,
+    team: &str,
+    mode: &str,  // "research", "solve", "consensus", "swarm"
+    topic: &str, // topic/problem/question/goal
+    agents_requested: u32,
+    budget: u32,
+    timeout: u64,
+    depth: &str,
+    web: bool,
+    focus: Option<&str>,
+    no_discuss: bool,
     // Mode-specific options:
-    verify_cmd: Option<&str>,    // solve only
-    target: Option<&str>,        // solve only
-    extra: Option<&str>,         // consensus: perspectives, swarm: seed tasks
+    verify_cmd: Option<&str>, // solve only
+    target: Option<&str>,     // solve only
+    extra: Option<&str>,      // consensus: perspectives, swarm: seed tasks
 ) {
     let idle = detect_idle_agents(sock, team, None);
     let (selected, warn_or_err) = select_agents(idle, agents_requested);
@@ -5033,7 +6613,11 @@ fn run_autonomous(
     let total_agents = agent_names.len() as u32;
     eprintln!(
         "{}: topic='{}' agents={} budget={} timeout={}s",
-        mode.to_uppercase(), topic, agent_names.join(","), budget, timeout
+        mode.to_uppercase(),
+        topic,
+        agent_names.join(","),
+        budget,
+        timeout
     );
 
     let (board_path, run_id) = match create_board(mode) {
@@ -5054,9 +6638,16 @@ fn run_autonomous(
         if seed_tasks.is_empty() {
             // Auto-generate 3 generic seed tasks
             let seeds = vec![
-                format!(r#"{{"type":"task","id":1,"desc":"Analyze scope and requirements for: {}","status":"open","added_by":"leader"}}"#, topic),
-                format!(r#"{{"type":"task","id":2,"desc":"Identify key components and dependencies","status":"open","added_by":"leader"}}"#),
-                format!(r#"{{"type":"task","id":3,"desc":"Create implementation plan with priorities","status":"open","added_by":"leader"}}"#),
+                format!(
+                    r#"{{"type":"task","id":1,"desc":"Analyze scope and requirements for: {}","status":"open","added_by":"leader"}}"#,
+                    topic
+                ),
+                format!(
+                    r#"{{"type":"task","id":2,"desc":"Identify key components and dependencies","status":"open","added_by":"leader"}}"#
+                ),
+                format!(
+                    r#"{{"type":"task","id":3,"desc":"Create implementation plan with priorities","status":"open","added_by":"leader"}}"#
+                ),
             ];
             let mut content = String::new();
             for s in &seeds {
@@ -5069,7 +6660,8 @@ fn run_autonomous(
             for (i, task) in seed_tasks.iter().enumerate() {
                 content.push_str(&format!(
                     r#"{{"type":"task","id":{},"desc":"{}","status":"open","added_by":"leader"}}"#,
-                    i + 1, task
+                    i + 1,
+                    task
                 ));
                 content.push('\n');
             }
@@ -5078,23 +6670,57 @@ fn run_autonomous(
     }
 
     // Build per-agent instructions
-    let instructions: Vec<String> = agent_names.iter().enumerate().map(|(i, _name)| {
-        let n = (i + 1) as u32;
-        match mode {
-            "research" => prompts::research_prompt(topic, &board_path_str, n, total_agents, depth, budget, web, focus),
-            "solve" => prompts::solve_prompt(topic, &board_path_str, n, total_agents, budget, verify_cmd, target),
-            "consensus" => {
-                // Parse perspectives if provided, assign round-robin
-                let perspectives: Vec<&str> = extra
-                    .map(|s| s.split(',').map(|t| t.trim()).collect::<Vec<_>>())
-                    .unwrap_or_default();
-                let perspective = if perspectives.is_empty() { None } else { Some(perspectives[i % perspectives.len()]) };
-                prompts::consensus_prompt(topic, &board_path_str, n, total_agents, budget, perspective)
+    let instructions: Vec<String> = agent_names
+        .iter()
+        .enumerate()
+        .map(|(i, _name)| {
+            let n = (i + 1) as u32;
+            match mode {
+                "research" => prompts::research_prompt(
+                    topic,
+                    &board_path_str,
+                    n,
+                    total_agents,
+                    depth,
+                    budget,
+                    web,
+                    focus,
+                ),
+                "solve" => prompts::solve_prompt(
+                    topic,
+                    &board_path_str,
+                    n,
+                    total_agents,
+                    budget,
+                    verify_cmd,
+                    target,
+                ),
+                "consensus" => {
+                    // Parse perspectives if provided, assign round-robin
+                    let perspectives: Vec<&str> = extra
+                        .map(|s| s.split(',').map(|t| t.trim()).collect::<Vec<_>>())
+                        .unwrap_or_default();
+                    let perspective = if perspectives.is_empty() {
+                        None
+                    } else {
+                        Some(perspectives[i % perspectives.len()])
+                    };
+                    prompts::consensus_prompt(
+                        topic,
+                        &board_path_str,
+                        n,
+                        total_agents,
+                        budget,
+                        perspective,
+                    )
+                }
+                "swarm" => {
+                    prompts::swarm_prompt(topic, &board_path_str, n, total_agents, budget, extra)
+                }
+                _ => unreachable!(),
             }
-            "swarm" => prompts::swarm_prompt(topic, &board_path_str, n, total_agents, budget, extra),
-            _ => unreachable!(),
-        }
-    }).collect();
+        })
+        .collect();
 
     // Stagger timing per mode
     let stagger_secs: u64 = match mode {
@@ -5120,16 +6746,28 @@ fn run_autonomous(
         let name_owned = name.to_string();
         let h = thread::spawn(move || {
             let result = run_delegate_result(
-                &sock_clone, &team_owned, &name_owned, &instr,
-                Some(title), None, &[], &[], None, false, None, None,
+                &sock_clone,
+                &team_owned,
+                &name_owned,
+                &instr,
+                Some(title),
+                None,
+                &[],
+                &[],
+                None,
+                false,
+                None,
+                None,
             );
             (name_owned, result)
         });
         handles.push(h);
     }
 
-    let results: Vec<(String, Result<Value, String>)> =
-        handles.into_iter().map(|h| h.join().expect("thread panicked")).collect();
+    let results: Vec<(String, Result<Value, String>)> = handles
+        .into_iter()
+        .map(|h| h.join().expect("thread panicked"))
+        .collect();
 
     let mut succeeded: Vec<String> = Vec::new();
     let mut failed: Vec<String> = Vec::new();
@@ -5162,15 +6800,24 @@ fn run_autonomous(
             let discuss_timeout = 180u64;
 
             eprintln!("Phase 1: Cross-Review — agents examining each other's findings...");
-            let cross_tasks: Vec<(String, String, String)> = succeeded.iter().map(|name| {
-                let prompt = prompts::cross_review_prompt(topic, &board_text, name, &succeeded);
-                (name.clone(), prompt, format!("{mode}-discuss: cross-review"))
-            }).collect();
-            let cross_pairs = dispatch_and_wait(sock, team, discuss_timeout, cross_tasks, "cross-review");
+            let cross_tasks: Vec<(String, String, String)> = succeeded
+                .iter()
+                .map(|name| {
+                    let prompt = prompts::cross_review_prompt(topic, &board_text, name, &succeeded);
+                    (
+                        name.clone(),
+                        prompt,
+                        format!("{mode}-discuss: cross-review"),
+                    )
+                })
+                .collect();
+            let cross_pairs =
+                dispatch_and_wait(sock, team, discuss_timeout, cross_tasks, "cross-review");
 
-            let cross_texts: Vec<(String, String)> = cross_pairs.iter().map(|(name, tid)| {
-                (name.clone(), read_task_result(team, tid, name))
-            }).collect();
+            let cross_texts: Vec<(String, String)> = cross_pairs
+                .iter()
+                .map(|(name, tid)| (name.clone(), read_task_result(team, tid, name)))
+                .collect();
 
             for (name, text) in &cross_texts {
                 let truncated = match text.char_indices().nth(500) {
@@ -5182,15 +6829,21 @@ fn run_autonomous(
 
             if cross_texts.len() >= 2 {
                 eprintln!("Phase 2: Synthesis — converging on consensus...");
-                let cross_summary: String = cross_texts.iter()
+                let cross_summary: String = cross_texts
+                    .iter()
                     .map(|(name, text)| format!("### {name}의 교차 검토\n{text}"))
-                    .collect::<Vec<_>>().join("\n\n");
+                    .collect::<Vec<_>>()
+                    .join("\n\n");
 
-                let synth_tasks: Vec<(String, String, String)> = succeeded.iter().map(|name| {
-                    let prompt = prompts::synthesis_prompt(topic, &cross_summary);
-                    (name.clone(), prompt, format!("{mode}-discuss: synthesis"))
-                }).collect();
-                let synth_pairs = dispatch_and_wait(sock, team, discuss_timeout, synth_tasks, "synthesis");
+                let synth_tasks: Vec<(String, String, String)> = succeeded
+                    .iter()
+                    .map(|name| {
+                        let prompt = prompts::synthesis_prompt(topic, &cross_summary);
+                        (name.clone(), prompt, format!("{mode}-discuss: synthesis"))
+                    })
+                    .collect();
+                let synth_pairs =
+                    dispatch_and_wait(sock, team, discuss_timeout, synth_tasks, "synthesis");
 
                 eprintln!("\n══ Discussion Results ══");
                 for (name, tid) in &synth_pairs {
@@ -5201,20 +6854,23 @@ fn run_autonomous(
         }
     }
 
-    println!("{}", pretty(&json!({
-        "ok": !succeeded.is_empty(),
-        "result": {
-            "mode": mode,
-            "topic": topic,
-            "budget": budget,
-            "timeout_secs": timeout,
-            "assigned": succeeded,
-            "failed": failed,
-            "agent_count": succeeded.len(),
-            "board_path": board_path_str,
-            "run_id": run_id,
-        }
-    })));
+    println!(
+        "{}",
+        pretty(&json!({
+            "ok": !succeeded.is_empty(),
+            "result": {
+                "mode": mode,
+                "topic": topic,
+                "budget": budget,
+                "timeout_secs": timeout,
+                "assigned": succeeded,
+                "failed": failed,
+                "agent_count": succeeded.len(),
+                "board_path": board_path_str,
+                "run_id": run_id,
+            }
+        }))
+    );
 
     if succeeded.is_empty() {
         process::exit(1);
