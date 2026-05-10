@@ -2,6 +2,15 @@
 
 All notable changes to term-mesh are documented here.
 
+## [0.104.1] - 2026-05-10
+
+### Fixed
+- **Stale running binary now surfaces a "Restart and Update" pill within seconds of launch** — when `brew upgrade --cask term-mesh` runs externally (manual brew CLI, multi-machine sync, the cask smoke-test that publishes a release) the disk bundle is replaced but macOS keeps the old binary mapped into any still-running term-mesh process. The 30-minute `brew outdated` poll then reports "up-to-date" (disk version equals tap latest) and the running app silently keeps executing stale code with no pill. On startup the app now compares `Bundle.main`'s cached `CFBundleShortVersionString` (frozen when the process launched) against the on-disk `Info.plist` (re-read fresh) and immediately publishes `.readyToInstall(running → disk)` when they differ — so a relaunch into the new binary is one click away regardless of how the bundle was replaced.
+
+### Thanks to 1 contributor!
+
+- [@JINWOO-J](https://github.com/JINWOO-J)
+
 ## [0.104.0] - 2026-05-10
 
 ### Added

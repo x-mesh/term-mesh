@@ -217,9 +217,46 @@ final class BrewSelfUpdater {
             viewModel.update(state: .unsupported)
             return
         }
+        // Reconcile running process vs disk bundle BEFORE the 60 s outdated
+        // check. When `brew upgrade --cask` runs externally (manual brew CLI,
+        // multi-machine sync, smoke-test) the disk bundle is replaced but
+        // macOS keeps the old binary mapped into the running process. The
+        // periodic `brew outdated` poll then reports "up-to-date" (disk vs
+        // tap match) and the user is silently running stale code with no
+        // pill. This check covers that gap by comparing `Bundle.main`'s
+        // cached version (frozen at process launch) against the on-disk
+        // Info.plist (re-read fresh).
+        if let stale = Self.detectStaleRunningBinary() {
+            viewModel.update(state: .readyToInstall(installed: stale.running, latest: stale.disk))
+            UpdateLogStore.shared.append(
+                "brew self-update: stale running binary detected running=\(stale.running) disk=\(stale.disk) — pill shown immediately"
+            )
+            // Still arm the periodic timers so a subsequent brew-cask bump
+            // is detected normally; just skip the 60 s initial outdated
+            // check so the immediate stale-restart pill isn't clobbered.
+            scheduleOutdatedTimer()
+            scheduleRefreshTimer()
+            return
+        }
         scheduleInitialCheck()
         scheduleOutdatedTimer()
         scheduleRefreshTimer()
+    }
+
+    /// Return `(running, disk)` when the version cached by `Bundle.main` at
+    /// process launch differs from the version in the on-disk Info.plist of
+    /// the same bundle. nil when they match (the common case) or when the
+    /// disk plist can't be read.
+    nonisolated static func detectStaleRunningBinary() -> (running: String, disk: String)? {
+        guard let running = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String,
+              !running.isEmpty
+        else { return nil }
+        let plistPath = Bundle.main.bundlePath + "/Contents/Info.plist"
+        guard let dict = NSDictionary(contentsOfFile: plistPath),
+              let disk = dict["CFBundleShortVersionString"] as? String,
+              !disk.isEmpty
+        else { return nil }
+        return running != disk ? (running, disk) : nil
     }
 
 #if DEBUG
