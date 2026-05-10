@@ -231,6 +231,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         // status-bar menu — there is no implicit listener.
         PeerHostCoordinator.autoStartIfConfigured()
 
+        // Eager init so the NotificationCenter subscription is wired up
+        // before the sidebar first renders and before any relay window opens.
+        _ = RemoteHostStore.shared
+
         // Reap leftover relay sockets from any previous crashed run
         // before a user opens a fresh relay window — otherwise stale
         // /tmp/tm-peer-relay-*.sock files accumulate indefinitely.

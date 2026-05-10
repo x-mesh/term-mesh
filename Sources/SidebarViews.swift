@@ -24,6 +24,7 @@ struct VerticalTabsSidebar: View {
     @StateObject private var commandKeyMonitor = SidebarCommandKeyMonitor()
     @StateObject private var dragAutoScrollController = SidebarDragAutoScrollController()
     @StateObject private var dragFailsafeMonitor = SidebarDragFailsafeMonitor()
+    @ObservedObject private var remoteHostStore = RemoteHostStore.shared
     @State private var draggedTabId: UUID?
     @State private var dropIndicator: SidebarDropIndicator?
 
@@ -57,6 +58,8 @@ struct VerticalTabsSidebar: View {
                             }
                         }
                         .padding(.vertical, 8)
+
+                        SidebarRemoteHostsSection(store: remoteHostStore)
 
                         SidebarEmptyArea(
                             rowSpacing: tabRowSpacing,
@@ -558,5 +561,110 @@ extension NSColor {
             min(255, max(0, Int(green * 255))),
             min(255, max(0, Int(blue * 255)))
         )
+    }
+}
+
+// MARK: - Remote Hosts Sidebar
+
+struct SidebarRemoteHostsSection: View {
+    @ObservedObject var store: RemoteHostStore
+
+    var body: some View {
+        VStack(spacing: 0) {
+            Divider()
+                .padding(.horizontal, 10)
+                .padding(.top, 4)
+                .padding(.bottom, 2)
+
+            if store.sortedHosts.isEmpty {
+                VStack(alignment: .leading, spacing: 3) {
+                    Text("Remote Hosts")
+                        .font(.system(size: 10, weight: .semibold))
+                        .foregroundColor(.secondary)
+                    Text("Use Peer menu → Connect to Host…")
+                        .font(.system(size: 10))
+                        .foregroundColor(Color.secondary.opacity(0.6))
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.horizontal, 16)
+                .padding(.vertical, 8)
+            } else {
+                ForEach(store.sortedHosts) { host in
+                    RemoteHostGroupView(host: host, store: store)
+                }
+            }
+        }
+        .padding(.bottom, 4)
+    }
+}
+
+struct RemoteHostGroupView: View {
+    let host: HostEntry
+    let store: RemoteHostStore
+    @State private var isExpanded = true
+
+    var body: some View {
+        DisclosureGroup(isExpanded: $isExpanded) {
+            if host.workspaces.isEmpty {
+                Text(host.isConnected ? "Loading…" : "Disconnected")
+                    .font(.system(size: 10))
+                    .foregroundColor(.secondary)
+                    .padding(.leading, 20)
+                    .padding(.vertical, 4)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            } else {
+                ForEach(host.workspaces) { workspace in
+                    RemoteWorkspaceRowView(workspace: workspace, store: store)
+                }
+            }
+        } label: {
+            HStack(spacing: 5) {
+                Image(systemName: host.isConnected ? "network" : "network.slash")
+                    .font(.system(size: 9))
+                    .foregroundColor(host.isConnected ? .secondary : Color.secondary.opacity(0.4))
+                Text(host.displayName)
+                    .font(.system(size: 11, weight: .semibold))
+                    .foregroundColor(host.isConnected ? .primary : .secondary)
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+            }
+            .padding(.horizontal, 10)
+            .padding(.vertical, 3)
+        }
+        .padding(.horizontal, 6)
+    }
+}
+
+struct RemoteWorkspaceRowView: View {
+    let workspace: WorkspaceSummary
+    let store: RemoteHostStore
+    @State private var isHovering = false
+
+    var body: some View {
+        HStack(spacing: 5) {
+            Image(systemName: "terminal")
+                .font(.system(size: 9))
+                .foregroundColor(.secondary)
+            Text(workspace.title)
+                .font(.system(size: 11.5))
+                .foregroundColor(.primary)
+                .lineLimit(1)
+                .truncationMode(.tail)
+            Spacer()
+        }
+        .padding(.leading, 20)
+        .padding(.trailing, 10)
+        .padding(.vertical, 5)
+        .background(
+            RoundedRectangle(cornerRadius: 5)
+                .fill(isHovering ? Color.primary.opacity(0.07) : Color.clear)
+                .padding(.horizontal, 4)
+        )
+        .contentShape(Rectangle())
+        .onTapGesture {
+            store.openWorkspace(workspace)
+        }
+        .onHover { isHovering = $0 }
     }
 }
