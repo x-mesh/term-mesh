@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -82,6 +83,12 @@ pub enum DaemonEvent {
         header: String,
         ts_ms: u64,
     },
+    HeartbeatStale {
+        team: String,
+        agent: String,
+        last_heartbeat_ts: String,
+        age_seconds: u64,
+    },
 }
 
 /// Broadcast channel sender. All `events.subscribe` connections subscribe from this.
@@ -147,6 +154,10 @@ pub async fn serve(
         headless,
         event_tx,
     });
+    let heartbeat_task = tokio::spawn(run_heartbeat_staleness_watcher(
+        ctx.clone(),
+        shutdown_rx.clone(),
+    ));
 
     loop {
         tokio::select! {
@@ -176,6 +187,7 @@ pub async fn serve(
             }
         }
     }
+    heartbeat_task.abort();
 
     // Clean up socket file
     if path.exists() {
@@ -262,7 +274,11 @@ async fn stream_subscribe_events(
     let filter_kinds: std::collections::HashSet<String> = p
         .kinds
         .unwrap_or_else(|| {
-            vec!["task_status".into(), "reply".into(), "heartbeat_stale".into()]
+            vec![
+                "task_status".into(),
+                "reply".into(),
+                "heartbeat_stale".into(),
+            ]
         })
         .into_iter()
         .collect();
@@ -367,6 +383,7 @@ fn filter_and_serialize(
     let kind = match ev {
         DaemonEvent::TaskStatus { .. } => "task_status",
         DaemonEvent::Reply { .. } => "reply",
+        DaemonEvent::HeartbeatStale { .. } => "heartbeat_stale",
     };
     if !filter_kinds.is_empty() && !filter_kinds.contains(kind) {
         return None;
@@ -375,6 +392,147 @@ fn filter_and_serialize(
     // without a leader_session_id filter receives all events (generous default).
     // Per-leader scoping can be tightened in a follow-up without protocol changes.
     serde_json::to_vec(ev).ok()
+}
+
+async fn run_heartbeat_staleness_watcher(
+    ctx: Arc<Context>,
+    mut shutdown_rx: watch::Receiver<bool>,
+) {
+    let mut interval = tokio::time::interval(Duration::from_secs(30));
+    interval.tick().await; // consume immediate first tick
+    let mut notified = HashSet::new();
+
+    loop {
+        tokio::select! {
+            _ = interval.tick() => {
+                let now_ms = current_time_ms();
+                let events = {
+                    let team_state = ctx.team_state.read().unwrap();
+                    collect_heartbeat_stale_events(&team_state, &mut notified, now_ms)
+                };
+                for ev in events {
+                    let _ = ctx.event_tx.send(ev);
+                }
+            }
+            changed = shutdown_rx.changed() => {
+                if changed.is_err() || *shutdown_rx.borrow() {
+                    break;
+                }
+            }
+        }
+    }
+}
+
+fn collect_heartbeat_stale_events(
+    team_state: &serde_json::Value,
+    notified: &mut HashSet<String>,
+    now_ms: u64,
+) -> Vec<DaemonEvent> {
+    const STALE_AFTER_SECONDS: u64 = 60;
+    let mut active_keys = HashSet::new();
+    let mut events = Vec::new();
+
+    let Some(teams) = team_state
+        .get("teams")
+        .and_then(serde_json::Value::as_array)
+    else {
+        notified.clear();
+        return events;
+    };
+
+    for team in teams {
+        let team_name = team
+            .get("team_name")
+            .or_else(|| team.get("name"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        if team_name.is_empty() {
+            continue;
+        }
+        let Some(agents) = team.get("agents").and_then(serde_json::Value::as_array) else {
+            continue;
+        };
+
+        for agent in agents {
+            let agent_name = agent
+                .get("name")
+                .or_else(|| agent.get("agent_name"))
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default();
+            if agent_name.is_empty() {
+                continue;
+            }
+
+            let key = format!("{team_name}\0{agent_name}");
+            active_keys.insert(key.clone());
+
+            let Some(age_seconds) = json_u64(agent.get("heartbeat_age_seconds")) else {
+                notified.remove(&key);
+                continue;
+            };
+
+            if age_seconds < STALE_AFTER_SECONDS {
+                notified.remove(&key);
+                continue;
+            }
+
+            if notified.insert(key) {
+                let last_heartbeat_ts = agent
+                    .get("last_heartbeat_at")
+                    .or_else(|| agent.get("last_heartbeat_ts"))
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string)
+                    .unwrap_or_else(|| {
+                        iso8601_from_unix_secs(now_ms.saturating_sub(age_seconds * 1000) / 1000)
+                    });
+                events.push(DaemonEvent::HeartbeatStale {
+                    team: team_name.to_string(),
+                    agent: agent_name.to_string(),
+                    last_heartbeat_ts,
+                    age_seconds,
+                });
+            }
+        }
+    }
+
+    notified.retain(|key| active_keys.contains(key));
+    events
+}
+
+fn json_u64(value: Option<&serde_json::Value>) -> Option<u64> {
+    match value? {
+        serde_json::Value::Number(n) => n
+            .as_u64()
+            .or_else(|| n.as_i64().and_then(|v| v.try_into().ok())),
+        serde_json::Value::String(s) => s.parse().ok(),
+        _ => None,
+    }
+}
+
+fn current_time_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
+
+fn iso8601_from_unix_secs(secs: u64) -> String {
+    // Simple ISO 8601 UTC formatter without adding a chrono dependency.
+    let s = secs % 60;
+    let m = (secs / 60) % 60;
+    let h = (secs / 3600) % 24;
+    let days = secs / 86400;
+    let jd = days as i64 + 2440588; // 1970-01-01 = JD 2440588
+    let p = jd + 68569;
+    let q = 4 * p / 146097;
+    let r = p - (146097 * q + 3) / 4;
+    let s2 = 4000 * (r + 1) / 1461001;
+    let r2 = r - 1461 * s2 / 4 + 31;
+    let month = 80 * r2 / 2447;
+    let day = r2 - 2447 * month / 80;
+    let month2 = month + 2 - 12 * (month / 11);
+    let year = 100 * (q - 49) + s2 + month / 11;
+    format!("{year:04}-{month2:02}-{day:02}T{h:02}:{m:02}:{s:02}Z")
 }
 
 async fn dispatch(req: &Request, ctx: &Context) -> Response {
@@ -1338,4 +1496,83 @@ fn compute_agent_anomalies(agent_manager: &AgentSessionManager) -> Vec<Anomaly> 
     }
 
     anomalies
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn heartbeat_stale_event_emits_once_until_recovered() {
+        let mut notified = HashSet::new();
+        let state = json!({
+            "teams": [{
+                "team_name": "team-a",
+                "agents": [{
+                    "name": "agent-a",
+                    "heartbeat_age_seconds": 65
+                }]
+            }]
+        });
+
+        let events = collect_heartbeat_stale_events(&state, &mut notified, 1_700_000_065_000);
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            DaemonEvent::HeartbeatStale {
+                team,
+                agent,
+                last_heartbeat_ts,
+                age_seconds,
+            } => {
+                assert_eq!(team, "team-a");
+                assert_eq!(agent, "agent-a");
+                assert_eq!(last_heartbeat_ts, "2023-11-14T22:13:20Z");
+                assert_eq!(*age_seconds, 65);
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+
+        let duplicate = collect_heartbeat_stale_events(&state, &mut notified, 1_700_000_095_000);
+        assert!(duplicate.is_empty());
+
+        let recovered = json!({
+            "teams": [{
+                "team_name": "team-a",
+                "agents": [{
+                    "name": "agent-a",
+                    "heartbeat_age_seconds": 2
+                }]
+            }]
+        });
+        assert!(
+            collect_heartbeat_stale_events(&recovered, &mut notified, 1_700_000_097_000).is_empty()
+        );
+
+        let stale_again = collect_heartbeat_stale_events(&state, &mut notified, 1_700_000_125_000);
+        assert_eq!(stale_again.len(), 1);
+    }
+
+    #[test]
+    fn heartbeat_stale_event_prefers_payload_timestamp() {
+        let mut notified = HashSet::new();
+        let state = json!({
+            "teams": [{
+                "team_name": "team-a",
+                "agents": [{
+                    "name": "agent-a",
+                    "heartbeat_age_seconds": 60,
+                    "last_heartbeat_at": "2026-05-10T16:00:00Z"
+                }]
+            }]
+        });
+
+        let events = collect_heartbeat_stale_events(&state, &mut notified, 1_700_000_060_000);
+        match &events[0] {
+            DaemonEvent::HeartbeatStale {
+                last_heartbeat_ts, ..
+            } => assert_eq!(last_heartbeat_ts, "2026-05-10T16:00:00Z"),
+            other => panic!("unexpected event: {other:?}"),
+        }
+    }
 }

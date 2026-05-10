@@ -1,3 +1,9 @@
+#![allow(
+    clippy::needless_late_init,
+    clippy::too_many_arguments,
+    clippy::useless_format
+)]
+
 mod prompts;
 mod pty;
 mod rpc;

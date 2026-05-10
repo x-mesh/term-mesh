@@ -1,3 +1,9 @@
+#![allow(
+    clippy::doc_lazy_continuation,
+    clippy::too_many_arguments,
+    clippy::while_let_loop
+)]
+
 mod agent;
 mod headless;
 mod http;

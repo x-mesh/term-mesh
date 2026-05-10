@@ -1199,7 +1199,7 @@ impl AgentSessionManager {
         let ts = now_ms();
 
         // Check if budget is exhausted after this attempt
-        let budget_exhausted = fix_budget.map_or(false, |b| new_count >= b);
+        let budget_exhausted = fix_budget.is_some_and(|b| new_count >= b);
 
         if budget_exhausted {
             // Auto-block: increment count AND set status to blocked in one transaction

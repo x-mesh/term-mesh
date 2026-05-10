@@ -1,3 +1,14 @@
+#![allow(
+    clippy::implicit_saturating_sub,
+    clippy::manual_is_multiple_of,
+    clippy::print_literal,
+    clippy::ptr_arg,
+    clippy::too_many_arguments,
+    clippy::unused_enumerate_index,
+    clippy::useless_concat,
+    clippy::useless_format
+)]
+
 //! tm-agent: Unified Rust CLI for term-mesh team operations.
 //!
 //! Replaces both tm-rpc (agent-side) and team.py (leader-side).
@@ -3964,7 +3975,12 @@ fn main() {
             timeout,
             leader_session,
         } => {
-            run_watch(&sock, timeout, on_event.as_deref(), leader_session.as_deref());
+            run_watch(
+                &sock,
+                timeout,
+                on_event.as_deref(),
+                leader_session.as_deref(),
+            );
             return;
         }
         Commands::Claim => {
@@ -5923,8 +5939,7 @@ fn run_watch(
         }
     };
 
-    let mut payload =
-        serde_json::to_string(&request).expect("request serialization cannot fail");
+    let mut payload = serde_json::to_string(&request).expect("request serialization cannot fail");
     payload.push('\n');
     if let Err(e) = writer.write_all(payload.as_bytes()) {
         eprintln!("error: failed to send subscribe request: {e}");
@@ -5932,7 +5947,11 @@ fn run_watch(
     }
     writer.flush().ok();
 
-    eprintln!("[watch] subscribed (kinds: {}, timeout: {}s)", kinds.join(","), timeout_secs);
+    eprintln!(
+        "[watch] subscribed (kinds: {}, timeout: {}s)",
+        kinds.join(","),
+        timeout_secs
+    );
 
     let mut reader = BufReader::new(&stream);
     let mut line = String::new();
