@@ -124,6 +124,34 @@ impl RemoteMultiplexerBackend for TmuxControlBackend {
             // Send initial terminal size.
             sess.write_command(&encoder::refresh_client_size(size.cols, size.rows)).await?;
 
+            // Pre-register the real tmux pane_id via a lightweight non-interactive
+            // SSH query so that send_input works immediately without waiting for the
+            // first %output event.  On failure we fall back to lazy registration in
+            // the demux task (send_input will work after the first output frame).
+            // `#{pane_id}` must be single-quoted to prevent the remote shell from
+            // treating `#` as a comment character when SSH passes arguments as a
+            // space-joined command string to the remote shell.
+            let list_panes_cmd = format!(
+                "tmux list-panes -t '{}' -F '#{{pane_id}}'",
+                self.session_name
+            );
+            if let Ok(out) = tokio::process::Command::new("ssh")
+                .args([
+                    "-o", "StrictHostKeyChecking=accept-new",
+                    "-o", "LogLevel=QUIET",
+                    "-o", "ConnectTimeout=5",
+                    &self.host,
+                    &list_panes_cmd,
+                ])
+                .output()
+                .await
+            {
+                let stdout = String::from_utf8_lossy(&out.stdout);
+                if let Some(pane_id) = stdout.lines().next().map(str::trim).filter(|s| !s.is_empty()) {
+                    self.surface_map.register(pane_id, surface_id.clone()).await;
+                }
+            }
+
             // Retain the session handle for send_input / resize.
             *sess_guard = Some(Arc::clone(&sess));
 
@@ -132,9 +160,9 @@ impl RemoteMultiplexerBackend for TmuxControlBackend {
             //
             // `session_rx` delivers (SurfaceId(real_pane_id), bytes) where
             // real_pane_id is the tmux control-mode id (e.g. "%1").  On the
-            // first frame we lazy-register real_pane_id → surface_id so that
-            // send_input / lookup_pane works without requiring a separate
-            // list-panes round-trip.
+            // first frame we also lazy-register (idempotent if pre-registration
+            // already succeeded above).
+
             let senders = Arc::clone(&self.surface_senders);
             let output_tx = self.output_tx.clone();
             let surface_map_demux = self.surface_map.clone();
