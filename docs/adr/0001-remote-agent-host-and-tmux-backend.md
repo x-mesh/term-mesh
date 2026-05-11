@@ -308,27 +308,44 @@ Coexistence model:
 
 - Confirm the existing Linux-ready Rust surface:
   - macOS-only crates in the daemon/CLI remote-agent path: 0.
+  - Full Cargo.toml audit found no remote-agent dependency on macOS-only crates
+    such as `core-foundation`, `cocoa`, `objc`, or `security-framework`.
   - `cfg(target_os = "linux")` peer credential checks already exist in
     `daemon/term-meshd/src/socket.rs:1386` and
     `daemon/term-meshd/src/peer/server.rs:239`.
   - `HeadlessManager` is a first-class `term-meshd` subsystem and can boot
-    without Swift panels.
+    without Swift panels (`daemon/term-meshd/src/main.rs:80`).
   - Required Rust source changes for Phase 0: 0.
-- Prepare the host build environment:
-  - `rustup target add aarch64-unknown-linux-gnu` for ARM Linux, or
-    `rustup target add x86_64-unknown-linux-gnu` for Intel Linux.
-  - Install `cmake` and either `musl-tools` or a compatible cross toolchain if
-    building static/musl artifacts.
-  - Build from the daemon Cargo workspace with:
+- Build `term-meshd` and `tm-agent` for Linux. The verified 2026-05-11 path is
+  Docker `rust:alpine`, not host `rustup` + Homebrew musl cross tools:
 
-    ```bash
-    cd daemon
-    cargo build --release --target aarch64-unknown-linux-gnu -p term-meshd -p tm-agent
-    ```
+  ```bash
+  docker run --rm --platform linux/amd64 \
+    -v "$PWD":/work -w /work/daemon rust:alpine \
+    sh -lc 'apk add --no-cache musl-dev cmake git pkgconfig openssl-dev openssl-libs-static perl make protobuf-dev && cargo build --release --target x86_64-unknown-linux-musl -p term-meshd -p tm-agent'
 
-  - If `cargo check` fails with `E0463: can't find crate for core`, treat it as
-    a missing Rust target installation, not a source defect.
-- Build `term-meshd`, `tm-agent`, and related Rust CLIs for Linux.
+  docker run --rm --platform linux/arm64 \
+    -v "$PWD":/work -w /work/daemon rust:alpine \
+    sh -lc 'apk add --no-cache musl-dev cmake git pkgconfig openssl-dev openssl-libs-static perl make protobuf-dev && cargo build --release --target aarch64-unknown-linux-musl -p term-meshd -p tm-agent'
+  ```
+
+  The project root must be mounted at `/work` because `peer-proto` reads
+  `proto/peer/v1/peer.proto` outside the `daemon/` workspace directory.
+- The host-rustup alternative remains possible but is not the standard path:
+  it requires installing the Rust target plus a compatible musl linker/toolchain
+  on macOS, which is slower and more fragile than the Docker build.
+- Verified musl build outputs on 2026-05-11:
+
+  | Target | Binary | Size | Format |
+  | --- | --- | ---: | --- |
+  | `x86_64-unknown-linux-musl` | `term-meshd` | 16M | ELF x86-64, static-pie |
+  | `x86_64-unknown-linux-musl` | `tm-agent` | 2.9M | ELF x86-64, static-pie |
+  | `aarch64-unknown-linux-musl` | `term-meshd` | 15M | ELF ARM aarch64, static |
+  | `aarch64-unknown-linux-musl` | `tm-agent` | 2.8M | ELF ARM aarch64, static |
+
+- `git2` with `vendored-openssl` and `vendored-libgit2` is compatible with the
+  musl static build when the Alpine container includes `cmake`, `perl`, and
+  `make`; no external system libgit2/OpenSSL is required.
 - Use the implemented Linux daemon socket path. `default_socket_path()` first
   honors `TERMMESH_DAEMON_UNIX_PATH`; otherwise it uses
   `dirs::runtime_dir()` and appends `term-meshd.sock`. On a systemd Linux host,
@@ -416,6 +433,13 @@ open Phase 0/Phase 2 questions.
   and the implemented `TERMMESH_DAEMON_UNIX_PATH` override without daemon
   protocol changes. A future typed Protobuf/gRPC transport can replace the
   framing layer later without changing the AgentHost task model.
+- Cross-compile build method: standardize on Docker `rust:alpine` with
+  `musl-dev`, `cmake`, `git`, `pkgconfig`, `openssl-dev`,
+  `openssl-libs-static`, `perl`, `make`, and `protobuf-dev`. This was verified
+  on 2026-05-11 for both `x86_64-unknown-linux-musl` and
+  `aarch64-unknown-linux-musl`. The `cross` crate or host rustup/musl toolchain
+  can remain optional, but Docker is the documented Phase 0 path. The `git2`
+  vendored-libgit2/cmake concern is resolved by the same Alpine package set.
 
 ## Open Questions
 
