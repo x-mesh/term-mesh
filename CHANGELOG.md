@@ -2,6 +2,15 @@
 
 All notable changes to term-mesh are documented here.
 
+## [0.110.0] - 2026-05-12
+
+### Fixed
+- **Spacebar no longer inserts two spaces** — the v0.109.0 key-handling change caused space (and other plain text keys) to be processed twice: once by the explicit `keyDown` call added in that release, and again by AppKit's normal responder-chain dispatch. The dispatch logic is simplified back to returning `performKeyEquivalent`'s result directly so AppKit handles the single `keyDown` dispatch as before.
+
+### Thanks to 1 contributor!
+
+- [@JINWOO-J](https://github.com/JINWOO-J)
+
 ## [0.109.0] - 2026-05-11
 
 ### Fixed

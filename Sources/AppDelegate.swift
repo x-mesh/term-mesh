@@ -3036,27 +3036,11 @@ extension NSWindow {
 
             let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
             if !flags.contains(.command) {
-                let savedResponder = self.firstResponder
-                let consumed = ghosttyView.performKeyEquivalent(with: event)
-                if !consumed {
-                    if self.firstResponder === savedResponder {
-                        // performKeyEquivalent returned false without moving focus —
-                        // call keyDown explicitly to prevent AppKit from dispatching
-                        // it again (which would cause ghostty_surface_key to fire twice).
-                        ghosttyView.keyDown(with: event)
-                    } else {
-                        // performKeyEquivalent moved focus (e.g. to IME bar) — let
-                        // AppKit dispatch the event normally to the new first responder.
+                let result = ghosttyView.performKeyEquivalent(with: event)
 #if DEBUG
-                        dlog("key.performEquiv.nonCmd focus-moved keycode=\(event.keyCode)")
+                dlog("key.performEquiv.nonCmd result=\(result) keycode=\(event.keyCode) chars=\(event.charactersIgnoringModifiers ?? "")")
 #endif
-                        return false
-                    }
-                }
-#if DEBUG
-                dlog("key.performEquiv.nonCmd consumed=\(consumed) keycode=\(event.keyCode) chars=\(event.charactersIgnoringModifiers ?? "")")
-#endif
-                return true
+                return result
             }
 
             // Preserve Ghostty's terminal font-size shortcuts (Cmd +/−/0) when
