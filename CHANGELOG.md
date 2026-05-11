@@ -2,6 +2,16 @@
 
 All notable changes to term-mesh are documented here.
 
+## [0.108.0] - 2026-05-11
+
+### Fixed
+- **Terminal typing no longer duplicates plain characters after the v0.107.0 IME fix** — the IME text accumulator is used by normal AppKit text input too, not only by active CJK composition. v0.107.0 correctly split committed IME text into a keycode-free UTF-8 event, but then replayed the physical key for every accumulated-text path. Plain ASCII input could therefore arrive as both `insertText("a")` and a replayed physical `a`, showing up as doubled characters in Claude Code, shells, and other terminal apps. Term-mesh now replays the physical key only when it is still needed: actual IME composition commits and control/special keys whose accumulated text was not sent as printable text. Plain left-arrow remains suppressed for macOS IME finalization.
+- **Opening a sheet no longer sends portal geometry sync into a CPU/log loop** — terminal and browser portal windows defer geometry synchronization while an `NSSheet` is attached, but the retry was being scheduled back onto the main queue immediately. If the sheet stayed open, DEBUG builds could emit `portal.sync.deferSheet reason=attachedSheetActive` hundreds of times per second, trigger the debug log circuit breaker, and drive the app above 100% CPU. The retry is now delayed while the sheet remains attached, preserving the hang avoidance without spinning.
+
+### Thanks to 1 contributor!
+
+- [@JINWOO-J](https://github.com/JINWOO-J)
+
 ## [0.107.0] - 2026-05-11
 
 ### Fixed

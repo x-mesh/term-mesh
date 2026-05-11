@@ -760,4 +760,56 @@ final class CJKIMEKeyTextAccumulatorTests: XCTestCase {
         // but the important thing is that it doesn't crash or accumulate.
         XCTAssertNil(view.keyTextAccumulatorForTesting)
     }
+
+    func testAccumulatedPlainTextDoesNotReplayPhysicalKey() {
+        XCTAssertFalse(
+            GhosttyNSView.shouldReplayPhysicalKeyAfterAccumulatedText(
+                keyCode: 0,
+                modifierFlags: [],
+                markedTextBefore: false,
+                hasMarkedTextAfter: false,
+                sentAccumulatedText: true
+            ),
+            "Plain ASCII insertText already delivered text; replaying the physical key duplicates input"
+        )
+    }
+
+    func testAccumulatedControlTextReplaysPhysicalKey() {
+        XCTAssertTrue(
+            GhosttyNSView.shouldReplayPhysicalKeyAfterAccumulatedText(
+                keyCode: 36,
+                modifierFlags: [],
+                markedTextBefore: false,
+                hasMarkedTextAfter: false,
+                sentAccumulatedText: false
+            ),
+            "Return/Tab-style accumulated control text is not sent as text, so the physical key must be delivered"
+        )
+    }
+
+    func testAccumulatedIMECommitReplaysReturn() {
+        XCTAssertTrue(
+            GhosttyNSView.shouldReplayPhysicalKeyAfterAccumulatedText(
+                keyCode: 36,
+                modifierFlags: [],
+                markedTextBefore: true,
+                hasMarkedTextAfter: false,
+                sentAccumulatedText: true
+            ),
+            "IME commit text plus Return should preserve Terminal.app-style confirmation behavior"
+        )
+    }
+
+    func testAccumulatedIMECommitDropsPlainLeftArrowReplay() {
+        XCTAssertFalse(
+            GhosttyNSView.shouldReplayPhysicalKeyAfterAccumulatedText(
+                keyCode: 123,
+                modifierFlags: [],
+                markedTextBefore: true,
+                hasMarkedTextAfter: false,
+                sentAccumulatedText: true
+            ),
+            "Plain left-arrow is an IME finalization convention, not user navigation"
+        )
+    }
 }

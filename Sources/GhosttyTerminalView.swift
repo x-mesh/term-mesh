@@ -2355,6 +2355,8 @@ func pushTargetSurfaceSize(_ size: CGSize) {
 
         // Use accumulated text from insertText (for IME), or compute text for key
         if let accumulated = keyTextAccumulator, !accumulated.isEmpty {
+            var sentAccumulatedText = false
+
             // Step 1: Send accumulated IME-committed text as keycode-free text events.
             // keycode=0 (.unidentified) activates the ghostty fdfc9fea2 UTF-8 fallback,
             // which sends the text bytes directly without keycode-based encoding.
@@ -2377,17 +2379,17 @@ func pushTargetSurfaceSize(_ size: CGSize) {
                         #endif
                         _ = ghostty_surface_key(surface, textEvent)
                     }
+                    sentAccumulatedText = true
                 }
             }
 
-            // Step 2: Replay the physical key that committed the composition.
-            // Plain left-arrow (keyCode 123, no command/shift/option/control) is the macOS
-            // IME finalization convention — not user-intended navigation, so drop it.
-            // All other keys (Enter, arrows with modifiers, etc.) are replayed to match
-            // Terminal.app behavior.
-            let userMods = event.modifierFlags.intersection([.command, .shift, .option, .control])
-            let isPlainLeftArrow = event.keyCode == 123 && userMods.isEmpty
-            if !isPlainLeftArrow {
+            if Self.shouldReplayPhysicalKeyAfterAccumulatedText(
+                keyCode: event.keyCode,
+                modifierFlags: event.modifierFlags,
+                markedTextBefore: markedTextBefore,
+                hasMarkedTextAfter: markedText.length > 0,
+                sentAccumulatedText: sentAccumulatedText
+            ) {
                 keyEvent.composing = false
                 keyEvent.text = nil
                 _ = ghostty_surface_key(surface, keyEvent)
@@ -2499,6 +2501,23 @@ func pushTargetSurfaceSize(_ size: CGSize) {
     private func shouldSendText(_ text: String) -> Bool {
         guard let first = text.utf8.first else { return false }
         return first >= 0x20
+    }
+
+    static func shouldReplayPhysicalKeyAfterAccumulatedText(
+        keyCode: UInt16,
+        modifierFlags: NSEvent.ModifierFlags,
+        markedTextBefore: Bool,
+        hasMarkedTextAfter: Bool,
+        sentAccumulatedText: Bool
+    ) -> Bool {
+        let wasComposing = markedTextBefore || hasMarkedTextAfter
+        if wasComposing {
+            let userMods = modifierFlags.intersection([.command, .shift, .option, .control])
+            let isPlainLeftArrow = keyCode == 123 && userMods.isEmpty
+            return !isPlainLeftArrow
+        }
+
+        return !sentAccumulatedText
     }
 
     private func ghosttyKeyEvent(for event: NSEvent, surface: ghostty_surface_t) -> ghostty_input_key_s {

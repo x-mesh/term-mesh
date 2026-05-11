@@ -648,13 +648,18 @@ final class WindowTerminalPortal: NSObject {
         geometryObservers.removeAll()
     }
 
-    private func scheduleExternalGeometrySynchronize() {
+    private func scheduleExternalGeometrySynchronize(after delay: TimeInterval = 0) {
         guard !hasExternalGeometrySyncScheduled else { return }
         hasExternalGeometrySyncScheduled = true
-        DispatchQueue.main.async { [weak self] in
+        let work = { [weak self] in
             guard let self else { return }
             self.hasExternalGeometrySyncScheduled = false
             self.synchronizeAllEntriesFromExternalGeometryChange()
+        }
+        if delay > 0 {
+            DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: work)
+        } else {
+            DispatchQueue.main.async(execute: work)
         }
     }
 
@@ -706,7 +711,7 @@ final class WindowTerminalPortal: NSObject {
 #if DEBUG
             dlog("portal.sync.deferSheet reason=attachedSheetActive")
 #endif
-            scheduleExternalGeometrySynchronize()
+            scheduleExternalGeometrySynchronize(after: 0.25)
             return
         }
         guard ensureInstalled() else { return }
