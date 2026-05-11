@@ -32,6 +32,9 @@ pub enum TmuxEvent {
     Pause { pane_id: String },
     /// tmux allows client to resume input.
     Continue { pane_id: String },
+    /// The active session changed (per ADR 0002 §"Whitelisted Events").
+    /// Format: `%session-changed <session-id> <name>`
+    SessionChanged { session_id: String, name: String },
     /// tmux is exiting.
     Exit,
     /// Start of a command block response.
@@ -42,6 +45,20 @@ pub enum TmuxEvent {
     ErrorBlock(u32),
     /// Unrecognised notification — stored verbatim for debugging.
     Unknown(String),
+}
+
+/// Extract the command number from a `%begin`/`%end`/`%error` argument string.
+///
+/// Real tmux format: `"<timestamp> <cmd-number> <flags>"` → second field.
+/// Simplified format (tests): `"<cmd-number>"` → first and only field.
+fn parse_cmd_number(rest: &str) -> u32 {
+    let mut fields = rest.split_whitespace();
+    let first = fields.next().unwrap_or("0");
+    if let Some(second) = fields.next() {
+        second.parse().unwrap_or(0)
+    } else {
+        first.parse().unwrap_or(0)
+    }
 }
 
 /// Per ADR 0002 §"Control mode state machine".
@@ -58,25 +75,37 @@ impl ControlModeParser {
     }
 
     /// Process a single line (without trailing newline) and return any events.
+    ///
+    /// Per ADR 0002 §"DCS framing": tmux wraps the entire control-mode stream
+    /// in a DCS string (`\x1bP1000p` … `\x1b\\`).  The opening prefix appears
+    /// on the very first line before the first `%begin`; the terminator `\x1b\\`
+    /// may appear on the final `%exit` line.  Both are stripped here so the
+    /// rest of the parser never sees raw DCS bytes.
     pub fn feed_line(&mut self, line: &str) -> Vec<TmuxEvent> {
         let mut events = Vec::new();
 
+        // Strip DCS opening prefix (\x1bP1000p) and/or closing ST (\x1b\).
+        let line = line.strip_prefix("\x1bP1000p").unwrap_or(line);
+        let line = line.strip_suffix("\x1b\\").unwrap_or(line);
+
         if let Some(rest) = line.strip_prefix("%begin ") {
-            let n = rest.split_whitespace().next().unwrap_or("0").parse().unwrap_or(0);
+            // Real tmux: "%begin <timestamp> <cmd-number> <flags>"
+            // Simplified: "%begin <cmd-number>"
+            let n = parse_cmd_number(rest);
             self.state = ParserState::InCommandBlock { cmd_number: n };
             events.push(TmuxEvent::BeginBlock(n));
             return events;
         }
 
         if let Some(rest) = line.strip_prefix("%end ") {
-            let n = rest.split_whitespace().next().unwrap_or("0").parse().unwrap_or(0);
+            let n = parse_cmd_number(rest);
             self.state = ParserState::Idle;
             events.push(TmuxEvent::EndBlock(n));
             return events;
         }
 
         if let Some(rest) = line.strip_prefix("%error ") {
-            let n = rest.split_whitespace().next().unwrap_or("0").parse().unwrap_or(0);
+            let n = parse_cmd_number(rest);
             self.state = ParserState::Idle;
             events.push(TmuxEvent::ErrorBlock(n));
             return events;
@@ -103,6 +132,19 @@ impl ControlModeParser {
         if let Some(rest) = line.strip_prefix("%continue") {
             let pane_id = rest.trim().to_string();
             events.push(TmuxEvent::Continue { pane_id });
+            return events;
+        }
+
+        if let Some(rest) = line.strip_prefix("%session-changed ") {
+            let mut parts = rest.splitn(2, ' ');
+            if let (Some(id), Some(name)) = (parts.next(), parts.next()) {
+                events.push(TmuxEvent::SessionChanged {
+                    session_id: id.to_string(),
+                    name: name.to_string(),
+                });
+            } else {
+                events.push(TmuxEvent::Unknown(line.to_string()));
+            }
             return events;
         }
 
@@ -174,5 +216,36 @@ mod tests {
         let ev = p.feed_line("%layout-change @0 some-layout-data");
         assert_eq!(ev.len(), 1);
         assert!(matches!(&ev[0], TmuxEvent::Unknown(s) if s.contains("layout-change")));
+    }
+
+    #[test]
+    fn session_changed_parsed() {
+        let mut p = ControlModeParser::new();
+        let ev = p.feed_line("%session-changed $0 main");
+        assert_eq!(ev.len(), 1);
+        assert!(
+            matches!(&ev[0], TmuxEvent::SessionChanged { session_id, name }
+                if session_id == "$0" && name == "main"),
+            "got {:?}",
+            ev[0]
+        );
+    }
+
+    #[test]
+    fn dcs_prefix_stripped_from_first_line() {
+        let mut p = ControlModeParser::new();
+        // Real tmux first line: \x1bP1000p%begin <timestamp> 0 0
+        let ev = p.feed_line("\x1bP1000p%begin 1730000000 0 0");
+        assert_eq!(ev.len(), 1);
+        assert!(matches!(&ev[0], TmuxEvent::BeginBlock(0)));
+    }
+
+    #[test]
+    fn dcs_terminator_stripped() {
+        let mut p = ControlModeParser::new();
+        // ST (\x1b\) appended to %exit line at session end
+        let ev = p.feed_line("%exit\x1b\\");
+        assert_eq!(ev.len(), 1);
+        assert!(matches!(&ev[0], TmuxEvent::Exit));
     }
 }
