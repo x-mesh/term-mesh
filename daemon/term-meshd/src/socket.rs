@@ -11,7 +11,7 @@ use crate::agent::AgentSessionManager;
 use crate::headless::HeadlessManager;
 use crate::monitor::{Anomaly, MonitorHandle, SystemSnapshot};
 use crate::multiplexer::tmux::TmuxControlBackend;
-use crate::multiplexer::{CellSize, RemoteMultiplexerBackend, SurfaceId};
+use crate::multiplexer::{CellSize, RemoteMultiplexerBackend, SplitDirection, SurfaceId, WorkspaceControl};
 use crate::tokens::UsageTracker;
 use crate::watcher::WatcherHandle;
 use crate::worktree;
@@ -1313,6 +1313,95 @@ async fn dispatch(req: &Request, ctx: &Context) -> Response {
                         }
                         Err(e) => Err(format!("attach failed: {e}")),
                     }
+                }
+                Err(e) => Err(format!("invalid params: {e}")),
+            }
+        }
+
+        "multiplexer.tmux.input" => {
+            #[derive(Deserialize)]
+            struct Params { surface_id: String, text: String }
+            match serde_json::from_value::<Params>(req.params.clone()) {
+                Ok(p) => {
+                    let backend = ctx.tmux_backends.read().await.get(&p.surface_id).map(Arc::clone);
+                    match backend {
+                        None => Err(format!("unknown surface_id: {}", p.surface_id)),
+                        Some(b) => match b.send_input(SurfaceId(p.surface_id), p.text.into_bytes()).await {
+                            Ok(()) => Ok(serde_json::json!({ "ok": true })),
+                            Err(e) => Err(format!("send_input failed: {e}")),
+                        }
+                    }
+                }
+                Err(e) => Err(format!("invalid params: {e}")),
+            }
+        }
+
+        "multiplexer.tmux.resize" => {
+            #[derive(Deserialize)]
+            struct Params { surface_id: String, cols: u16, rows: u16 }
+            match serde_json::from_value::<Params>(req.params.clone()) {
+                Ok(p) => {
+                    let backend = ctx.tmux_backends.read().await.get(&p.surface_id).map(Arc::clone);
+                    match backend {
+                        None => Err(format!("unknown surface_id: {}", p.surface_id)),
+                        Some(b) => match b.resize(SurfaceId(p.surface_id), CellSize { cols: p.cols, rows: p.rows }).await {
+                            Ok(()) => Ok(serde_json::json!({ "ok": true })),
+                            Err(e) => Err(format!("resize failed: {e}")),
+                        }
+                    }
+                }
+                Err(e) => Err(format!("invalid params: {e}")),
+            }
+        }
+
+        "multiplexer.tmux.control" => {
+            #[derive(Deserialize)]
+            struct Params {
+                surface_id: String,
+                command: String,
+                pane_id: String,
+                #[serde(default)]
+                direction: Option<String>,
+            }
+            match serde_json::from_value::<Params>(req.params.clone()) {
+                Ok(p) => {
+                    let ctrl = match p.command.as_str() {
+                        "split-pane" => {
+                            let dir = match p.direction.as_deref().unwrap_or("horizontal") {
+                                "vertical" | "v" => SplitDirection::Vertical,
+                                _ => SplitDirection::Horizontal,
+                            };
+                            Ok(WorkspaceControl::SplitPane { pane_id: p.pane_id.clone(), direction: dir })
+                        }
+                        "kill-pane" => Ok(WorkspaceControl::KillPane { pane_id: p.pane_id.clone() }),
+                        "select-pane" => Ok(WorkspaceControl::SelectPane { pane_id: p.pane_id.clone() }),
+                        other => Err(format!("unknown command: {other}")),
+                    };
+                    match ctrl {
+                        Err(e) => Err(e),
+                        Ok(ctrl) => {
+                            let backend = ctx.tmux_backends.read().await.get(&p.surface_id).map(Arc::clone);
+                            match backend {
+                                None => Err(format!("unknown surface_id: {}", p.surface_id)),
+                                Some(b) => match b.control(ctrl).await {
+                                    Ok(()) => Ok(serde_json::json!({ "ok": true })),
+                                    Err(e) => Err(format!("control failed: {e}")),
+                                }
+                            }
+                        }
+                    }
+                }
+                Err(e) => Err(format!("invalid params: {e}")),
+            }
+        }
+
+        "multiplexer.tmux.detach" => {
+            #[derive(Deserialize)]
+            struct Params { surface_id: String }
+            match serde_json::from_value::<Params>(req.params.clone()) {
+                Ok(p) => {
+                    let removed = ctx.tmux_backends.write().await.remove(&p.surface_id).is_some();
+                    Ok(serde_json::json!({ "ok": true, "removed": removed }))
                 }
                 Err(e) => Err(format!("invalid params: {e}")),
             }

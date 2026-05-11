@@ -663,6 +663,61 @@ enum TmuxCommands {
         /// tmux session name on the remote host
         session: String,
     },
+    /// Send text input to a surface (encoded as UTF-8 bytes).
+    Input {
+        /// surface_id returned by `attach`
+        surface_id: String,
+        /// Text to send (use --cr to append a carriage return)
+        text: String,
+        /// Append CR (\\r) so the remote shell executes the line
+        #[arg(long)]
+        cr: bool,
+    },
+    /// Resize the remote tmux client.
+    Resize {
+        /// surface_id returned by `attach`
+        surface_id: String,
+        /// Terminal width in columns
+        cols: u16,
+        /// Terminal height in rows
+        rows: u16,
+    },
+    /// Send a workspace control command (split/kill/select pane).
+    #[command(subcommand)]
+    Control(ControlTmuxCommands),
+    /// Detach from a surface and close the SSH connection.
+    Detach {
+        /// surface_id returned by `attach`
+        surface_id: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum ControlTmuxCommands {
+    /// Split a pane (default: horizontal; use --vertical for vertical split).
+    Split {
+        /// surface_id returned by `attach`
+        surface_id: String,
+        /// Target pane ID (e.g. %1)
+        pane_id: String,
+        /// Split vertically (stacked) instead of horizontally (side-by-side)
+        #[arg(long)]
+        vertical: bool,
+    },
+    /// Kill (close) a pane.
+    Kill {
+        /// surface_id returned by `attach`
+        surface_id: String,
+        /// Target pane ID (e.g. %1)
+        pane_id: String,
+    },
+    /// Focus (select) a pane.
+    Select {
+        /// surface_id returned by `attach`
+        surface_id: String,
+        /// Target pane ID (e.g. %1)
+        pane_id: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -3528,12 +3583,52 @@ fn main() {
                 process::exit(1);
             });
             match sub {
-                MultiplexerCommands::Tmux(TmuxCommands::Attach { host, session }) => {
-                    rpc_call(
+                MultiplexerCommands::Tmux(cmd) => match cmd {
+                    TmuxCommands::Attach { host, session } => rpc_call(
                         &daemon_sock,
                         "multiplexer.tmux.attach",
                         json!({ "host": host, "session": session }),
-                    )
+                    ),
+                    TmuxCommands::Input { surface_id, text, cr } => {
+                        let text = if cr { format!("{text}\r") } else { text };
+                        rpc_call(
+                            &daemon_sock,
+                            "multiplexer.tmux.input",
+                            json!({ "surface_id": surface_id, "text": text }),
+                        )
+                    }
+                    TmuxCommands::Resize { surface_id, cols, rows } => rpc_call(
+                        &daemon_sock,
+                        "multiplexer.tmux.resize",
+                        json!({ "surface_id": surface_id, "cols": cols, "rows": rows }),
+                    ),
+                    TmuxCommands::Control(ctrl) => match ctrl {
+                        ControlTmuxCommands::Split { surface_id, pane_id, vertical } => rpc_call(
+                            &daemon_sock,
+                            "multiplexer.tmux.control",
+                            json!({
+                                "surface_id": surface_id,
+                                "command": "split-pane",
+                                "pane_id": pane_id,
+                                "direction": if vertical { "vertical" } else { "horizontal" },
+                            }),
+                        ),
+                        ControlTmuxCommands::Kill { surface_id, pane_id } => rpc_call(
+                            &daemon_sock,
+                            "multiplexer.tmux.control",
+                            json!({ "surface_id": surface_id, "command": "kill-pane", "pane_id": pane_id }),
+                        ),
+                        ControlTmuxCommands::Select { surface_id, pane_id } => rpc_call(
+                            &daemon_sock,
+                            "multiplexer.tmux.control",
+                            json!({ "surface_id": surface_id, "command": "select-pane", "pane_id": pane_id }),
+                        ),
+                    },
+                    TmuxCommands::Detach { surface_id } => rpc_call(
+                        &daemon_sock,
+                        "multiplexer.tmux.detach",
+                        json!({ "surface_id": surface_id }),
+                    ),
                 }
             }
         }
