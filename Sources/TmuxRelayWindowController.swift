@@ -39,6 +39,17 @@ final class TmuxRelayWindowController: NSWindowController, NSWindowDelegate {
     /// Stored so `windowWillClose` can shutdown the socket from the main
     /// actor and unblock the reader task's `read(2)` call.
     private var eventStreamFd: Int32 = -1
+    /// Window-scoped NSEvent monitors. Cmd+D / click tracking live here
+    /// instead of `PaneHostView.performKeyEquivalent` because (a) the
+    /// app-wide shortcut monitor in `AppDelegate` runs first and (b)
+    /// depth-first responder traversal would hit the leftmost pane
+    /// rather than the focused one.
+    private var keyMonitor: Any?
+    private var clickMonitor: Any?
+    /// surface_id of whichever pane the user last clicked. Trusted over
+    /// `window.firstResponder` because Ghostty's surface view doesn't
+    /// always propagate focus changes on first click.
+    private var lastClickedSurfaceId: String?
 
     init(host: String, session: String, daemonSocket: String) {
         self.sshHost = host
@@ -62,6 +73,8 @@ final class TmuxRelayWindowController: NSWindowController, NSWindowDelegate {
     }
 
     func windowWillClose(_ notification: Notification) {
+        if let keyMonitor { NSEvent.removeMonitor(keyMonitor); self.keyMonitor = nil }
+        if let clickMonitor { NSEvent.removeMonitor(clickMonitor); self.clickMonitor = nil }
         // Tear down the event stream first so its reader task exits before
         // the controller is deallocated.
         if eventStreamFd >= 0 {
@@ -156,7 +169,55 @@ final class TmuxRelayWindowController: NSWindowController, NSWindowDelegate {
         }
         swapContent(to: liveView)
         focusFirstAvailableSurface()
+        installEventMonitors()
         startEventStream()
+    }
+
+    /// Install window-local NSEvent monitors for Cmd+D and click-focus
+    /// tracking. Local monitors run only while this window is key, so
+    /// shortcuts in other windows are unaffected.
+    private func installEventMonitors() {
+        if let keyMonitor { NSEvent.removeMonitor(keyMonitor); self.keyMonitor = nil }
+        if let clickMonitor { NSEvent.removeMonitor(clickMonitor); self.clickMonitor = nil }
+
+        keyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
+            guard let self,
+                  let window = self.window,
+                  window.isKeyWindow,
+                  event.modifierFlags.contains(.command),
+                  event.window === window
+            else { return event }
+            let chars = event.charactersIgnoringModifiers?.lowercased() ?? ""
+            let shift = event.modifierFlags.contains(.shift)
+            if chars == "d" {
+                let direction = shift ? "vertical" : "horizontal"
+                if let sid = self.focusedSurfaceId(),
+                   self.handleSplitCommand(surfaceId: sid, direction: direction) {
+                    return nil
+                }
+            }
+            return event
+        }
+
+        clickMonitor = NSEvent.addLocalMonitorForEvents(matching: .leftMouseDown) { [weak self] event in
+            guard let self,
+                  let window = self.window,
+                  event.window === window,
+                  let contentView = window.contentView
+            else { return event }
+            let point = contentView.convert(event.locationInWindow, from: nil)
+            guard let hit = contentView.hitTest(point) else { return event }
+            // Walk up to the nearest PaneHostView and remember its surface_id.
+            var view: NSView? = hit
+            while let v = view {
+                if let host = v as? PaneHostView {
+                    self.lastClickedSurfaceId = host.surfaceId
+                    break
+                }
+                view = v.superview
+            }
+            return event
+        }
     }
 
     /// Open the long-lived `multiplexer.tmux.events` JSONL stream and
@@ -172,7 +233,7 @@ final class TmuxRelayWindowController: NSWindowController, NSWindowDelegate {
             guard fd >= 0 else { return }
             // Hand the fd back to the main actor so windowWillClose can
             // shutdown the socket and unblock our read loop.
-            await MainActor.run { self?.eventStreamFd = fd }
+            await MainActor.run { [weak self] in self?.eventStreamFd = fd }
 
             let request = "{\"id\":1,\"method\":\"multiplexer.tmux.events\",\"params\":{\"surface_id\":\"\(primary)\"}}\n"
             guard let reqData = request.data(using: .utf8),
@@ -197,7 +258,7 @@ final class TmuxRelayWindowController: NSWindowController, NSWindowDelegate {
                     // Skip anything without a `kind` field.
                     guard let kind = obj["kind"] as? String else { continue }
                     if kind == "layout-change" {
-                        await MainActor.run { self?.refreshLayout() }
+                        await MainActor.run { [weak self] in self?.refreshLayout() }
                     }
                     // `keepalive` / `warning` frames are intentionally ignored.
                 }
@@ -392,13 +453,19 @@ final class TmuxRelayWindowController: NSWindowController, NSWindowDelegate {
     // ── Focus / Cmd+D ─────────────────────────────────────────────────────
 
     fileprivate func focusedSurfaceId() -> String? {
-        guard let responder = window?.firstResponder as? NSView else { return nil }
-        var view: NSView? = responder
-        while let v = view {
-            if let host = v as? PaneHostView { return host.surfaceId }
-            view = v.superview
+        // Click-tracked focus is the authoritative source — Ghostty surfaces
+        // do not always promote themselves to firstResponder on first click
+        // (NSView.window.firstResponder lags behind the user's intent).
+        if let sid = lastClickedSurfaceId, surfaces[sid] != nil {
+            return sid
         }
-        // Fallback: any view-tag walk failed, just return primary.
+        if let responder = window?.firstResponder as? NSView {
+            var view: NSView? = responder
+            while let v = view {
+                if let host = v as? PaneHostView { return host.surfaceId }
+                view = v.superview
+            }
+        }
         return primarySurfaceId
     }
 
@@ -582,9 +649,10 @@ private struct BootstrapData {
 
 // MARK: - PaneHostView (Cmd+D / focus tracking)
 
-/// Thin NSView wrapper around each leaf so we can: (1) walk the responder
-/// chain to identify the focused pane on Cmd+D, (2) intercept Cmd+D /
-/// Cmd+Shift+D before they reach the underlying Ghostty surface.
+/// Thin NSView wrapper around each leaf. The wrapper itself is purely
+/// structural — Cmd+D handling lives on the window-level NSEvent monitor
+/// in `TmuxRelayWindowController.installEventMonitors`, and click-based
+/// focus tracking inspects the responder chain looking for this view.
 private final class PaneHostView: NSView {
     let surfaceId: String
     private weak var controller: TmuxRelayWindowController?
@@ -604,22 +672,6 @@ private final class PaneHostView: NSView {
     }
 
     required init?(coder: NSCoder) { fatalError("not used") }
-
-    override func performKeyEquivalent(with event: NSEvent) -> Bool {
-        // Cmd+D = horizontal split, Cmd+Shift+D = vertical split. This
-        // matches Ghostty's native split shortcuts so users do not have to
-        // re-learn keys when the surface happens to be tmux-backed.
-        guard let controller else { return super.performKeyEquivalent(with: event) }
-        let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
-        let chars = event.charactersIgnoringModifiers?.lowercased() ?? ""
-        if chars == "d" && flags.contains(.command) {
-            let direction = flags.contains(.shift) ? "vertical" : "horizontal"
-            if controller.handleSplitCommand(surfaceId: surfaceId, direction: direction) {
-                return true
-            }
-        }
-        return super.performKeyEquivalent(with: event)
-    }
 }
 
 // MARK: - NSSplitView arranged-subview compatibility

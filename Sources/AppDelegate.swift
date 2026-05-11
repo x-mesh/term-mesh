@@ -2266,6 +2266,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
            keyWindow is PeerRelayWorkspaceWindow {
             return false
         }
+        // Phase 1.1 tmux relay windows have the same problem: Cmd+D must
+        // reach `PaneHostView.performKeyEquivalent` so the focused remote
+        // pane is the one tmux splits. The shortcut monitor runs before
+        // the window's responder chain, so we explicitly opt out here.
+        if let keyWindow = NSApp.keyWindow,
+           keyWindow.windowController is TmuxRelayWindowController {
+            return false
+        }
 
         // `charactersIgnoringModifiers` can be nil for some synthetic NSEvents and certain special keys.
         // Most shortcuts below use keyCode fallbacks, so treat nil as "" rather than bailing out.
