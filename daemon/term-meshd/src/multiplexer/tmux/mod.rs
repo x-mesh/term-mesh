@@ -89,6 +89,38 @@ impl TmuxControlBackend {
         let _ = self.output_tx.send(frame);
     }
 
+    /// Verify that the remote tmux session exists before attempting a full attach.
+    ///
+    /// Runs `ssh <host> tmux has-session -t <session>` as a one-shot subprocess.
+    /// Returns `Ok(())` when the session is present, or an `Err` with a clear
+    /// message when it is missing or the SSH connection fails.  Called at the
+    /// start of `attach_surface` so callers get an actionable error instead of a
+    /// silent SSH failure buried in control-mode startup noise.
+    async fn verify_session_exists(&self) -> Result<()> {
+        let cmd = format!("tmux has-session -t '{}'", self.session_name);
+        let out = tokio::process::Command::new("ssh")
+            .args([
+                "-o", "BatchMode=yes",
+                "-o", "StrictHostKeyChecking=accept-new",
+                "-o", "ConnectTimeout=5",
+                &self.host,
+                &cmd,
+            ])
+            .output()
+            .await
+            .map_err(|e| anyhow!("ssh probe failed: {e}"))?;
+        if !out.status.success() {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            return Err(anyhow!(
+                "remote tmux session '{}' not found on {} — {}",
+                self.session_name,
+                self.host,
+                stderr.trim()
+            ));
+        }
+        Ok(())
+    }
+
     /// Capture the current visible screen of the first pane in the session.
     ///
     /// Runs `ssh <host> tmux capture-pane -e -p -t <pane>` as a one-shot
@@ -169,6 +201,10 @@ impl RemoteMultiplexerBackend for TmuxControlBackend {
         surface_id: SurfaceId,
         size: CellSize,
     ) -> Result<RemoteSurfaceStream> {
+        // Fail fast if the session does not exist rather than letting ssh
+        // tmux -CC start and immediately exit with opaque control-mode errors.
+        self.verify_session_exists().await?;
+
         let (per_surface_tx, per_surface_rx) = mpsc::channel::<Vec<u8>>(256);
 
         self.surface_senders.write().await.insert(surface_id.clone(), per_surface_tx);
