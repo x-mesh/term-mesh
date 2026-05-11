@@ -7,6 +7,7 @@
 mod agent;
 mod headless;
 mod http;
+mod multiplexer;
 mod monitor;
 mod peer;
 mod socket;
