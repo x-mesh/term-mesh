@@ -11,6 +11,13 @@
 #   @explorer find the main entry point
 #   @all report your status
 #   @status / @inbox / @inbox --all / @destroy / @help
+#
+# Parallel routing (round-robin active since d69c9d0c):
+#   Sequential delegates route to different panels automatically.
+#   Work-pool: create unassigned tasks + broadcast "tm-agent claim" (Option A) or
+#             send executor "tm-agent claim"; sleep 0.5; send again (Option B round-robin)
+#   Broadcast: reaches all panels including duplicate-named agents.
+#   Regression: ./scripts/test-parallel.sh --skip-team-create
 
 SOCKET="$1"
 TEAM="$2"

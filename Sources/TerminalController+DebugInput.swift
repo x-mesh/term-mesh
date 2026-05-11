@@ -18,21 +18,30 @@ extension TerminalController {
         keyEvent.consumed_mods = GHOSTTY_MODS_NONE
         keyEvent.unshifted_codepoint = 0
         keyEvent.composing = false
+        var pressResult = true
         if let text {
             text.withCString { ptr in
                 keyEvent.text = ptr
-                _ = ghostty_surface_key(surface, keyEvent)
+                pressResult = ghostty_surface_key(surface, keyEvent)
             }
         } else {
             keyEvent.text = nil
-            _ = ghostty_surface_key(surface, keyEvent)
+            pressResult = ghostty_surface_key(surface, keyEvent)
         }
         // Send matching RELEASE event — TUI apps (Claude Code, kiro-cli) track
         // key state and may ignore subsequent PRESS events if the previous key
         // was never released.
         keyEvent.action = GHOSTTY_ACTION_RELEASE
         keyEvent.text = nil
-        _ = ghostty_surface_key(surface, keyEvent)
+        let releaseResult = ghostty_surface_key(surface, keyEvent)
+        #if DEBUG
+        if !pressResult {
+            dlog("key.PRESS_ignored keycode=\(keycode) mods=\(mods.rawValue)")
+        }
+        if !releaseResult {
+            dlog("key.RELEASE_ignored keycode=\(keycode) mods=\(mods.rawValue)")
+        }
+        #endif
     }
 
     func sendTextEvent(surface: ghostty_surface_t, text: String) {

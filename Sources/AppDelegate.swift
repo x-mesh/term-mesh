@@ -2367,7 +2367,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
 
         // When the notifications popover is showing an empty state, consume plain typing
         // so key presses do not leak through into the focused terminal.
+        // P2 fix: Return(36) and Tab(48) are functional keys — never swallow them.
         if flags.isDisjoint(with: [.command, .control, .option]),
+           event.keyCode != 36, // Return
+           event.keyCode != 48, // Tab
            titlebarAccessoryController.isNotificationsPopoverShown(),
            (notificationStore?.notifications.isEmpty ?? false) {
             return true

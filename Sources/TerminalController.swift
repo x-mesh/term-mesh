@@ -2409,20 +2409,23 @@ class TerminalController {
         }
         // Stagger sends: 100ms between each agent to avoid main-thread congestion
         // that causes text/Enter key drops. 10 agents × 100ms = 1s total (acceptable).
-        let agentNames: [String] = await MainActor.run {
+        // Use (workspaceId, panelId) pairs — not names — so duplicate-named agents each
+        // receive the broadcast instead of collapsing to a single recipient.
+        let agentPanels: [(workspaceId: UUID, panelId: UUID)] = await MainActor.run {
             guard let team = TeamOrchestrator.shared.teams[teamName] else { return [] }
-            return team.agents.map(\.name)
+            return team.agents.map { (workspaceId: $0.workspaceId, panelId: $0.panelId) }
         }
         var count = 0
-        for (index, agentName) in agentNames.enumerated() {
+        for (index, panel) in agentPanels.enumerated() {
             if index > 0 {
                 try? await Task.sleep(nanoseconds: 100_000_000) // 100ms
             }
             let success = await MainActor.run {
                 let tabManager = TeamOrchestrator.shared.resolveTabManager(teamName: teamName) ?? self.tabManager
                 guard let tabManager else { return false }
-                return TeamOrchestrator.shared.sendToAgent(
-                    teamName: teamName, agentName: agentName, text: text, tabManager: tabManager
+                return TeamOrchestrator.shared.sendToAgentByPanel(
+                    teamName: teamName, panelId: panel.panelId, workspaceId: panel.workspaceId,
+                    text: text, tabManager: tabManager
                 )
             }
             if success { count += 1 }
@@ -3270,6 +3273,18 @@ class TerminalController {
             return v2Error(id: id, code: "invalid_params", message: "Missing agent_name")
         }
         if let task = store.claimTask(teamName: teamName, agentName: agentName) {
+            let claimedTask = task
+            let fallbackTabManager = self.tabManager
+            // Push task instruction to the claiming agent after a short delay to let
+            // the RPC response land first, so the agent's terminal is ready to receive.
+            // Pass task directly to avoid re-reading taskBoards (claimed task lives in
+            // TeamDataStore, not TeamOrchestrator.taskBoards — re-read would miss it).
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak self] in
+                guard self != nil else { return }
+                let tm = TeamOrchestrator.shared.resolveTabManager(teamName: teamName) ?? fallbackTabManager
+                guard let tm else { return }
+                TeamOrchestrator.shared.notifyTaskCreated(teamName: teamName, task: claimedTask, tabManager: tm)
+            }
             return v2Ok(id: id, result: store.taskDictionary(task))
         }
         return v2Ok(id: id, result: NSNull())

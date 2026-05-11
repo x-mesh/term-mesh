@@ -238,7 +238,53 @@ tm-agent task done <id> '<result summary>'
 - **NEVER synthesize your own answer when agents are working — always read their output first**
 - After sending tasks, wait briefly (10-30s), then use \`read\`, \`collect\`, \`wait\`, or \`inbox\` to get results
 - Prefer parallel work: send independent tasks to multiple agents simultaneously
-- When worktree isolation is active, instruct agents to commit + push + create PR when done"
+- When worktree isolation is active, instruct agents to commit + push + create PR when done
+
+## Parallel Delegation Pattern (round-robin routing active)
+
+Sequential delegate routes to DIFFERENT panels via round-robin — no gap needed:
+\`\`\`bash
+tm-agent delegate executor 'task A'  # → executor panel 1
+tm-agent delegate executor 'task B'  # → executor panel 2 (round-robin)
+\`\`\`
+Both-idle race: if both executors become idle at the same instant, add a 0.5–1 s
+gap between the two delegates, or use the work-pool pattern below.
+
+Work-pool / autonomous claim pattern:
+\`\`\`bash
+tm-agent task create 'task A'   # unassigned — enters pool
+tm-agent task create 'task B'   # unassigned — enters pool
+# Option A — all panels claim simultaneously (preferred for N pools):
+tm-agent broadcast 'tm-agent claim'
+# Option B — round-robin sequential (gap ensures different panels pick different tasks):
+tm-agent send executor 'tm-agent claim'; sleep 0.5; tm-agent send executor 'tm-agent claim'
+\`\`\`
+After a claim, task instructions are pushed automatically — no separate delegate needed.
+
+Broadcast reaches every panel including duplicate-named agents:
+\`\`\`bash
+tm-agent broadcast 'message'   # every pane receives — no name-based collapse
+\`\`\`
+
+Routing self-fix exception: when fixing tm-agent routing code itself use
+sequential leader-direct edits (avoid validating a broken router). Single-file
+trivial doc changes may also be done leader-direct with the Edit tool.
+
+## Telemetry & Verification
+
+Regression test for parallel routing (run with existing team):
+\`\`\`bash
+./scripts/test-parallel.sh --skip-team-create [--verbose]
+\`\`\`
+
+Enter-swallow and IME instrumentation patterns (DEBUG builds only):
+\`\`\`bash
+tail -f /tmp/term-mesh-debug.log | grep -E 'key\\.PRESS_ignored|ime\\.return_with_markedText|ime\\.resignFirstResponder|accumulated\\.text'
+# key.PRESS_ignored keycode=36  → synthetic send_key rejected by Ghostty (sendKeyEvent) — Rust retry not triggered (Layer 3 P2 candidate)
+# ime.return_with_markedText    → IME composition finalizing — NOT swallowed
+# ime.resignFirstResponder hadMarkedText=true → normal IME focus resign
+# ime.ghosttyKey path=accumulated.text → composed text sent via UTF-8 fallback (d3773d92)
+\`\`\`"
 
 export TERMMESH_SOCKET="$SOCKET"
 export TERMMESH_TEAM="$TEAM"

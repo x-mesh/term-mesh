@@ -118,6 +118,11 @@ tail -f "$(cat /tmp/term-mesh-last-debug-log-path 2>/dev/null || echo /tmp/term-
 - Mouse/UI events logged inline in views (ContentView, BrowserPanelView, etc.)
 - Focus events: `focus.panel`, `focus.bonsplit`, `focus.firstResponder`, `focus.moveFocus`
 - Bonsplit events: `tab.select`, `tab.close`, `tab.dragStart`, `tab.drop`, `pane.focus`, `pane.drop`, `divider.dragStart`
+- Enter-swallow / IME instrumentation patterns:
+  - `key.PRESS_ignored keycode=36` — synthetic send_key rejected by Ghostty (from sendKeyEvent); Rust retry not triggered
+  - `ime.return_with_markedText` — Return pressed during IME composition (not swallowed)
+  - `ime.resignFirstResponder hadMarkedText=true` — normal IME resign on focus loss
+  - `ime.ghosttyKey path=accumulated.text keycode=0` — composed text sent via UTF-8 fallback
 
 ## Pitfalls
 
@@ -237,6 +242,25 @@ tm-agent collect --headers                    # header-only result collection fo
 tm-agent reports --summary                    # headers + concise summaries, full files lazy-read via FULL_REPORT
 tm-agent wait --timeout 120 --mode any
 tm-agent brief <agent>
+
+# Parallel delegation pattern — round-robin routing (active since d69c9d0c)
+# Sequential delegate routes to DIFFERENT panels automatically:
+#   1. tm-agent delegate executor 'task A'   # → executor panel 1
+#   2. tm-agent delegate executor 'task B'   # → executor panel 2 (round-robin)
+# Both-idle race: if both panels are idle simultaneously, add a 0.5–1s gap or
+# use the work-pool pattern (unassigned task create + tm-agent claim).
+# Do NOT delegate the same task twice — that always produces duplicate work.
+#
+# Work-pool / autonomous claim pattern (GAP-4 claim-push active since 3b312b7a):
+#   tm-agent task create 'task A'            # unassigned — enters pool
+#   tm-agent task create 'task B'            # unassigned — enters pool
+#   tm-agent broadcast 'tm-agent claim'       # Option A: all panels claim simultaneously (preferred)
+#   tm-agent send executor 'tm-agent claim'; sleep 0.5; tm-agent send executor 'tm-agent claim'  # Option B: round-robin sequential
+#
+# Broadcast reaches ALL panels including duplicate-named agents (BUG-3 fix d69c9d0c):
+#   tm-agent broadcast 'msg'   # every pane receives — no name-based collapse
+#
+# Regression test: ./scripts/test-parallel.sh --skip-team-create
 
 # Agent task lifecycle
 tm-agent task start <task_id>

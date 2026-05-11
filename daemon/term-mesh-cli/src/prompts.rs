@@ -61,7 +61,7 @@ Your peers are also writing findings to the shared board.
 ### Shared Board (Stigmergy)
 BOARD FILE: {board_path}
 
-- To POST a finding: Bash("echo '{{json}}' >> {board_path}")
+- To POST a finding: Bash("python3 -c \"import fcntl,sys; f=open(sys.argv[1],'a'); fcntl.flock(f,fcntl.LOCK_EX); f.write(sys.argv[2]+'\\n'); f.flush(); fcntl.flock(f,fcntl.LOCK_UN)\" {board_path} '{{json}}'")
   Format: {{"agent":"researcher-{agent_n}","round":R,"finding":"...","source":"...","implication":"..."}}
 - To READ peer findings: Bash("cat {board_path}")
 
@@ -84,7 +84,7 @@ Run up to {budget} rounds. Each round:
    - Cite every finding: file path, line number, URL, or inference
 
 4. **POST** — Write your finding to the board
-   - Bash("echo '{{\"agent\":\"researcher-{agent_n}\",\"round\":R,\"finding\":\"...\",\"source\":\"...\",\"implication\":\"...\"}}' >> {board_path}")
+   - Bash("python3 -c \"import fcntl,sys; f=open(sys.argv[1],'a'); fcntl.flock(f,fcntl.LOCK_EX); f.write(sys.argv[2]+'\\n'); f.flush(); fcntl.flock(f,fcntl.LOCK_UN)\" {board_path} '{{\"agent\":\"researcher-{agent_n}\",\"round\":R,\"finding\":\"...\",\"source\":\"...\",\"implication\":\"...\"}}'")
    - Only post genuinely useful discoveries, not every observation
 
 5. **JUDGE** — Should you continue?
@@ -286,7 +286,7 @@ Board entry types:
 - adopt: {{"type":"adopt","agent":"solver-{agent_n}","round":R,"from":"solver-M","approach":"...","adaptation":"..."}}
 - solved: {{"type":"solved","agent":"solver-{agent_n}","round":R,"solution":"...","verification":"..."}}
 
-To POST: Bash("echo '{{json}}' >> {board_path}")
+To POST: Bash("python3 -c \"import fcntl,sys; f=open(sys.argv[1],'a'); fcntl.flock(f,fcntl.LOCK_EX); f.write(sys.argv[2]+'\\n'); f.flush(); fcntl.flock(f,fcntl.LOCK_UN)\" {board_path} '{{json}}'")
 To READ: Bash("cat {board_path}")
 
 ### Try-Share-Adapt Loop
@@ -374,7 +374,7 @@ Board entry types:
 - concede: {{"type":"concede","agent":"voice-{agent_n}","round":R,"point":"...","to":"voice-M","reason":"..."}}
 
 confidence is 1-10 (10 = absolute certainty).
-To POST: Bash("echo '{{json}}' >> {board_path}")
+To POST: Bash("python3 -c \"import fcntl,sys; f=open(sys.argv[1],'a'); fcntl.flock(f,fcntl.LOCK_EX); f.write(sys.argv[2]+'\\n'); f.flush(); fcntl.flock(f,fcntl.LOCK_UN)\" {board_path} '{{json}}'")
 To READ: Bash("cat {board_path}")
 
 ### Deliberation Loop
@@ -459,7 +459,7 @@ Board entry types:
 - result: {{"type":"result","id":N,"agent":"swarm-{agent_n}","status":"done|failed","output":"summary","new_tasks":["desc1","desc2"]}}
 - goal_check: {{"type":"goal_check","agent":"swarm-{agent_n}","progress":"...","remaining":N}}
 
-To POST: Bash("echo '{{json}}' >> {board_path}")
+To POST: Bash("python3 -c \"import fcntl,sys; f=open(sys.argv[1],'a'); fcntl.flock(f,fcntl.LOCK_EX); f.write(sys.argv[2]+'\\n'); f.flush(); fcntl.flock(f,fcntl.LOCK_UN)\" {board_path} '{{json}}'")
 To READ: Bash("cat {board_path}")
 
 ### Swarm Loop

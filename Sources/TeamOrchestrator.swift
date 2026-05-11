@@ -47,6 +47,8 @@ final class TeamOrchestrator: ObservableObject {
     }
 
     @Published private(set) var teams: [String: Team] = [:]
+    // Round-robin counter per "teamName/agentName" key — cycles across duplicate-named agents.
+    private var agentSendRoundRobin: [String: Int] = [:]
 
     /// Resolve the correct TabManager for a team by locating any agent panel in the window hierarchy.
     /// Returns nil only if no agent panel can be found (all closed or headless).
@@ -1935,11 +1937,31 @@ final class TeamOrchestrator: ObservableObject {
         """
     }
 
+    /// Pick one agent by name using round-robin across duplicates.
+    /// Thread-safety: must be called on the main actor (mutates agentSendRoundRobin).
+    private func selectAgent(in agents: [AgentMember], name: String) -> AgentMember? {
+        let candidates = agents.filter { $0.name == name }
+        guard !candidates.isEmpty else { return nil }
+        guard candidates.count > 1 else { return candidates[0] }
+        let key = "\(candidates[0].teamName)/\(name)"
+        let idx = (agentSendRoundRobin[key] ?? 0) % candidates.count
+        agentSendRoundRobin[key] = idx + 1
+        return candidates[idx]
+    }
+
     /// Send text to a specific agent in a team.
+    /// When multiple agents share the same name, round-robins across them.
     func sendToAgent(teamName: String, agentName: String, text: String, tabManager: TabManager, withReturn: Bool = true, completion: ((Bool) -> Void)? = nil) -> Bool {
         guard let team = teams[teamName] else { completion?(false); return false }
-        guard let agent = team.agents.first(where: { $0.name == agentName }) else { completion?(false); return false }
+        guard let agent = selectAgent(in: team.agents, name: agentName) else { completion?(false); return false }
         return sendTextToPanel(workspaceId: agent.workspaceId, panelId: agent.panelId, text: text, tabManager: tabManager, withReturn: withReturn, completion: completion)
+    }
+
+    /// Send text to an agent by its unique panelId (skips name lookup entirely).
+    /// Used by broadcast and asyncTeamBroadcast to avoid duplicate-name collapse.
+    @discardableResult
+    func sendToAgentByPanel(teamName: String, panelId: UUID, workspaceId: UUID, text: String, tabManager: TabManager, withReturn: Bool = true) -> Bool {
+        return sendTextToPanel(workspaceId: workspaceId, panelId: panelId, text: text, tabManager: tabManager, withReturn: withReturn)
     }
 
     /// Send text to an agent without requiring a tabManager.
@@ -1948,7 +1970,7 @@ final class TeamOrchestrator: ObservableObject {
     @discardableResult
     func sendToAgentAutoLocate(teamName: String, agentName: String, text: String) -> Bool {
         guard let team = teams[teamName],
-              let agent = team.agents.first(where: { $0.name == agentName }),
+              let agent = selectAgent(in: team.agents, name: agentName),
               let located = AppDelegate.shared?.locateSurface(surfaceId: agent.panelId) else { return false }
         return sendTextToPanel(workspaceId: agent.workspaceId, panelId: agent.panelId, text: text, tabManager: located.tabManager)
     }
@@ -1967,10 +1989,17 @@ final class TeamOrchestrator: ObservableObject {
     @discardableResult
     func notifyTaskCreated(teamName: String, taskId: String, tabManager: TabManager) -> Bool {
         guard let task = getTask(teamName: teamName, taskId: taskId) else { return false }
+        return notifyTaskCreated(teamName: teamName, task: task, tabManager: tabManager)
+    }
+
+    /// Overload that accepts a pre-fetched task — avoids re-reading taskBoards
+    /// (used by claim paths where the task lives in TeamDataStore, not taskBoards).
+    @discardableResult
+    func notifyTaskCreated(teamName: String, task: TeamTask, tabManager: TabManager) -> Bool {
         // Skip leader stdin injection — leader gets notifications via tm-agent wait/inbox
-        Logger.team.info("[notifyTaskCreated] task=\(taskId.prefix(8), privacy: .public)")
+        Logger.team.info("[notifyTaskCreated] task=\(task.id.prefix(8), privacy: .public)")
         #if DEBUG
-        dlog("[team.notifyTaskCreated] task=\(taskId.prefix(8)) — suppressed leader stdin injection")
+        dlog("[team.notifyTaskCreated] task=\(task.id.prefix(8)) — suppressed leader stdin injection")
         #endif
         guard let assignee = task.assignee?.nilIfBlank else { return true }
         let assigneeNotice = formatTaskAssignmentInstruction(task: task)
@@ -2274,13 +2303,13 @@ final class TeamOrchestrator: ObservableObject {
     }
 
     /// Broadcast text to all agents in a team.
-    /// Uses sendIMEText for atomic text+Enter delivery — no staggering needed since
-    /// each sendIMEText call is synchronous within its GCD block.
+    /// Iterates by panelId (not name) so every agent pane receives the message,
+    /// including multiple agents that share the same name.
     func broadcast(teamName: String, text: String, tabManager: TabManager) -> Int {
         guard let team = teams[teamName] else { return 0 }
         var count = 0
         for agent in team.agents {
-            if sendToAgent(teamName: teamName, agentName: agent.name, text: text, tabManager: tabManager) {
+            if sendTextToPanel(workspaceId: agent.workspaceId, panelId: agent.panelId, text: text, tabManager: tabManager) {
                 count += 1
             }
         }

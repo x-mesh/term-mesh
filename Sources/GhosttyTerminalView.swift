@@ -1927,6 +1927,7 @@ func pushTargetSurfaceSize(_ size: CGSize) {
             Self.focusLog("becomeFirstResponder: surface=\(terminalSurface?.id.uuidString ?? "nil") deltaSinceScrollMs=\(String(format: "%.2f", deltaMs))")
 #if DEBUG
             dlog("focus.firstResponder surface=\(terminalSurface?.id.uuidString.prefix(5) ?? "nil")")
+            dlog("ime.becomeFirstResponder hasMarkedText=\(markedText.length > 0) surface=\(terminalSurface?.id.uuidString.prefix(5) ?? "nil")")
             if let terminalSurface {
                 AppDelegate.shared?.recordJumpUnreadFocusIfExpected(
                     tabId: terminalSurface.tabId,
@@ -1965,6 +1966,9 @@ func pushTargetSurfaceSize(_ size: CGSize) {
     override func resignFirstResponder() -> Bool {
         let hadMarkedText = markedText.length > 0
         let result = super.resignFirstResponder()
+        #if DEBUG
+        dlog("ime.resignFirstResponder hadMarkedText=\(hadMarkedText) resigned=\(result) surface=\(terminalSurface?.id.uuidString.prefix(5) ?? "nil")")
+        #endif
         if result && hadMarkedText {
             // Clear IME composition after confirmed resign to prevent stale
             // markedText ranges causing NSRangeException (TERM-MESH-9 prevention).
@@ -2343,23 +2347,50 @@ func pushTargetSurfaceSize(_ size: CGSize) {
         // breaks vim normal-mode switching over SSH even when no IME box is open.
         let isEscape = event.keyCode == 53 // kVK_Escape
         keyEvent.composing = !isEscape && (markedText.length > 0 || markedTextBefore)
+        #if DEBUG
+        if event.keyCode == 36 && (markedTextBefore || markedText.length > 0) {
+            dlog("ime.return_with_markedText markedTextBefore=\(markedTextBefore) hasMarkedText=\(markedText.length > 0) composing=\(keyEvent.composing) surface=\(terminalSurface?.id.uuidString.prefix(5) ?? "nil")")
+        }
+        #endif
 
         // Use accumulated text from insertText (for IME), or compute text for key
         if let accumulated = keyTextAccumulator, !accumulated.isEmpty {
-            // Accumulated text comes from insertText (IME composition result).
-            // These never have "composing" set to true because these are the
-            // result of a composition.
-            keyEvent.composing = false
+            // Step 1: Send accumulated IME-committed text as keycode-free text events.
+            // keycode=0 (.unidentified) activates the ghostty fdfc9fea2 UTF-8 fallback,
+            // which sends the text bytes directly without keycode-based encoding.
+            // This prevents the physical trigger key's keycode (e.g. left-arrow=123) from
+            // corrupting the encoded output.
             for text in accumulated {
                 if shouldSendText(text) {
+                    var textEvent = ghostty_input_key_s()
+                    textEvent.action = GHOSTTY_ACTION_PRESS
+                    textEvent.keycode = 0
+                    textEvent.mods = GHOSTTY_MODS_NONE
+                    textEvent.consumed_mods = GHOSTTY_MODS_NONE
+                    textEvent.unshifted_codepoint = 0
+                    textEvent.composing = false
                     text.withCString { ptr in
-                        keyEvent.text = ptr
-                        _ = ghostty_surface_key(surface, keyEvent)
+                        textEvent.text = ptr
+                        #if DEBUG
+                        let scalars = text.unicodeScalars.map { "U+\(String($0.value, radix: 16, uppercase: true))" }.joined(separator: " ")
+                        dlog("ime.ghosttyKey path=accumulated.text keycode=0 text=\(scalars)")
+                        #endif
+                        _ = ghostty_surface_key(surface, textEvent)
                     }
-                } else {
-                    keyEvent.text = nil
-                    _ = ghostty_surface_key(surface, keyEvent)
                 }
+            }
+
+            // Step 2: Replay the physical key that committed the composition.
+            // Plain left-arrow (keyCode 123, no command/shift/option/control) is the macOS
+            // IME finalization convention — not user-intended navigation, so drop it.
+            // All other keys (Enter, arrows with modifiers, etc.) are replayed to match
+            // Terminal.app behavior.
+            let userMods = event.modifierFlags.intersection([.command, .shift, .option, .control])
+            let isPlainLeftArrow = event.keyCode == 123 && userMods.isEmpty
+            if !isPlainLeftArrow {
+                keyEvent.composing = false
+                keyEvent.text = nil
+                _ = ghostty_surface_key(surface, keyEvent)
             }
         } else {
             // Get the appropriate text for this key event

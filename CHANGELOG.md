@@ -2,6 +2,24 @@
 
 All notable changes to term-mesh are documented here.
 
+## [0.107.0] - 2026-05-11
+
+### Fixed
+- **Korean/Japanese/Chinese IME input is now reliable in kitty-protocol terminals** — typing CJK characters in zsh inside term-mesh used to occasionally lose the composed text or emit the bare physical key (e.g., `d` instead of `ㄴ`) because the kitty keyboard protocol encoded the physical key code instead of the composed UTF-8 text. Two layers were fixed:
+  - The bundled Ghostty now sends the committed composed text directly as UTF-8 when the key has no physical mapping (cherry-pick of upstream `fdfc9fea2`).
+  - The terminal view now emits the IME-committed text as a separate keycode-free event before replaying the physical key, so a Korean syllable followed by a physical arrow no longer mixes its character with the arrow's keycode. Plain left-arrow that macOS sends to finalize composition is dropped; other navigation keys still replay so cursor movement after committing works.
+- **Return/Tab no longer swallowed when the notifications popover is empty** — an internal popover would consume every plain keyDown event with no modifier while it was shown, including Return and Tab. The empty-popover guard now explicitly lets keyCode 36 (Return) and 48 (Tab) through, so pressing Enter to send a line or Tab to autocomplete works even if the popover is open and empty.
+- **`team.delegate` no longer races Return ahead of the pasted instruction** — three independent races in the IME paste pipeline are addressed; together they eliminate the "Enter intermittently dropped" symptom observed when chaining `tm-agent delegate` commands. `processPaste()` no longer leaves the paste queue blocked when the surface is momentarily nil during peer workspace transitions, the Rust CLI now waits for an actual paste-completion ack from Swift before sending Return (instead of a hard-coded 150 ms sleep, now 20 ms safety margin), and the ack timeout is aligned with the paste watchdog so a stale paste can't be left behind a suppressed Return.
+
+### Added
+- **`tm-agent` agent routing now distributes work across same-named workers** — previously, teams with two agents of the same name (e.g. two `executor`) routed every `tm-agent delegate executor` call to the first matching pane, leaving the second one permanently idle. `selectAgent()` now round-robins across duplicate-named workers, `tm-agent broadcast` reaches every pane (not just the first match per name), and `tm-agent claim` automatically pushes the claimed task to the worker so autonomous claim-and-work patterns can run without leader intervention. A new `scripts/test-parallel.sh` exercises all four behaviours as a regression check.
+- **Atomic appends to research/swarm board.jsonl** — multi-agent research, solve, consensus, and swarm modes used a plain `echo >> board_path` to record observations, so concurrent writers could interleave JSON lines and break downstream parsing. Writes now go through a `python3 fcntl.flock` exclusive-lock append, so the board file stays line-valid under parallel agents.
+- **Debug log signals for diagnosing Enter/IME issues** — DEBUG builds now emit `key.PRESS_ignored`/`RELEASE_ignored` when Ghostty reports a synthetic keypress wasn't handled, and `ime.return_with_markedText`, `ime.resignFirstResponder`, `ime.becomeFirstResponder`, and `ime.ghosttyKey path=accumulated.text` to trace IME state and composed-text delivery. Useful for narrowing down "Enter intermittently doesn't fire" reports — see `CLAUDE.md` "Debug event log" for the grep patterns.
+
+### Thanks to 1 contributor!
+
+- [@JINWOO-J](https://github.com/JINWOO-J)
+
 ## [0.106.0] - 2026-05-11
 
 ### Added
