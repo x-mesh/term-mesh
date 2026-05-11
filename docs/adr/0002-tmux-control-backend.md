@@ -75,6 +75,12 @@ Idle --%event--> InNotify --route event--> Idle
 without holding the state across reads. Command blocks may contain arbitrary
 text output lines until their `%end` or `%error` boundary.
 
+Initial DCS framing: the first stdout chunk from `tmux -CC` begins with
+`\033P1000p`, and the control-mode stream is conceptually wrapped in a DCS
+envelope terminated by `\033\\` at session exit. The parser must strip the
+leading `\033P1000p` and terminating ST before applying the `%`-line state
+machine.
+
 Pseudo Rust shape:
 
 ```rust
@@ -314,8 +320,11 @@ Distinction:
 Initial connection:
 
 ```text
-ssh user@host tmux -CC attach-session -t <name>
+ssh -tt user@host tmux -CC attach-session -t <name>
 ```
+
+tmux `-CC` requires a PTY. The SSH invocation must allocate one explicitly
+(`ssh -tt`); without `-t`/`-tt`, tmux aborts with `tcgetattr failed`.
 
 Optional flags:
 
@@ -393,10 +402,15 @@ Scope:
 - Forward filtered key bytes through `send-keys -H`.
 - Send explicit `refresh-client -C <w>x<h>`.
 - Handle `%pause` with `refresh-client -A %<pane-id>:on`.
+- Implement `%session-changed` in the parser even if semantic handling is
+  deferred; otherwise it appears as `Unknown`.
 - No focus changes.
 - No automatic layout synchronization.
 - No split/close commands.
 - Scrollback seed optional; live output is sufficient.
+- Integration-tested against tmux 3.4 on Ubuntu 24.04 (2026-05-11): 95% event
+  recognition over a 10s attach window, 0 parse errors, and 730
+  octal-unescaped control bytes processed.
 
 ### Phase 1.1: Single window multi-pane mirror
 
