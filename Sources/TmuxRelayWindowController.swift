@@ -216,7 +216,36 @@ final class TmuxRelayWindowController: NSWindowController, NSWindowDelegate {
         // surfaces. Without this the per-pane relays paint pre-resize
         // content into post-resize PTYs and lose the leftmost column.
         pushClientResize()
+        #if DEBUG
+        // Dump the post-layout frame tree so we can diagnose split/
+        // distribution issues without taking a screenshot. Wait one run
+        // loop turn so autolayout finishes its first pass.
+        DispatchQueue.main.async { [weak self] in
+            self?.dumpLayoutFrames(liveView, depth: 0)
+        }
+        #endif
     }
+
+    #if DEBUG
+    private func dumpLayoutFrames(_ view: NSView, depth: Int) {
+        let indent = String(repeating: "  ", count: depth)
+        let cls = String(describing: type(of: view))
+        let frame = view.frame
+        let frameStr = "\(Int(frame.origin.x)),\(Int(frame.origin.y)) \(Int(frame.width))x\(Int(frame.height))"
+        var extra = ""
+        if let pane = view as? PaneHostView { extra = " surface=\(pane.surfaceId.prefix(8))" }
+        if let stack = view as? NSStackView {
+            extra = " stack orient=\(stack.orientation == .horizontal ? "H" : "V") dist=\(stack.distribution.rawValue) spacing=\(stack.spacing) arranged=\(stack.arrangedSubviews.count)"
+        }
+        if let split = view as? NSSplitView {
+            extra = " split vertical=\(split.isVertical) subviews=\(split.subviews.count)"
+        }
+        dlog("tmux.relay.frame \(indent)\(cls) \(frameStr)\(extra)")
+        for sub in view.subviews {
+            dumpLayoutFrames(sub, depth: depth + 1)
+        }
+    }
+    #endif
 
     private func installWindowResizeObserver() {
         NotificationCenter.default.addObserver(
@@ -481,26 +510,48 @@ final class TmuxRelayWindowController: NSWindowController, NSWindowDelegate {
     private func makeSplit(isVertical: Bool, children: [TermMeshDaemon.TmuxLayoutNode]) -> NSView? {
         let leaves = children.compactMap { buildLayoutView($0) }
         guard !leaves.isEmpty else { return nil }
-        let split = NSSplitView()
-        split.translatesAutoresizingMaskIntoConstraints = false
-        split.isVertical = isVertical
-        // `.paneSplitter` draws a clearly visible thick divider — `.thin` is
-        // a 1-pt grey line that vanishes against Ghostty's black background.
-        // PeerRelayWorkspaceWindowController uses `.thin` but its leaves are
-        // wrapped in NSViews with non-terminal backgrounds, so the divider
-        // gets contrast from the wrap. Our leaves go straight to Ghostty.
-        split.dividerStyle = .paneSplitter
+        // Use NSStackView instead of NSSplitView. NSSplitView's behaviour
+        // with programmatically-added subviews is brittle in nested layouts:
+        // it inconsistently distributes space, especially when the inner
+        // split is itself an arranged subview of an outer one (the user's
+        // 4-column screenshot with a missing vertical-stacked column was
+        // exactly this case). NSStackView with .fillEqually distributes
+        // arranged subviews predictably via autolayout, supports nesting
+        // cleanly, and gives us a non-zero `spacing` we can colour as a
+        // divider via the PaneHostView border. Phase 1.1 does not need
+        // interactive divider drag — that arrives in 1.2+.
+        //
+        // tmux `Horizontal` = panes side-by-side → NSStackView.horizontal
+        // tmux `Vertical`   = panes top-to-bottom → NSStackView.vertical
+        let stack = NSStackView()
+        stack.translatesAutoresizingMaskIntoConstraints = false
+        stack.orientation = isVertical ? .horizontal : .vertical
+        stack.distribution = .fillEqually
+        stack.spacing = 1
         for leaf in leaves {
-            // Do NOT pin leaves with autolayout constraints — NSSplitView
-            // manages child frames itself via autoresizing masks. Forcing
-            // `translatesAutoresizingMaskIntoConstraints = false` on a leaf
-            // makes it stretch to fill the entire split bounds (overlapping
-            // siblings + hiding dividers). Peer relay (`materializeLayout`
-            // in PeerRelayWorkspaceWindowController.swift) deliberately
-            // does not touch this flag, which is why its splits render.
-            split.addArrangedSubview(leaf)
+            stack.addArrangedSubview(leaf)
+            // `fillEqually` divides space along the stack's main axis only.
+            // Without an explicit constraint, each arranged subview shrinks
+            // along the perpendicular axis to its intrinsic content size —
+            // which for PaneHostView is `noIntrinsicMetric`, i.e. 0. The
+            // user-visible symptom is panes collapsing to the leading edge
+            // and pretending to vanish. Pin both perpendicular edges so
+            // every leaf fills the stack's cross axis.
+            if isVertical {
+                // horizontal stack: leaves stretch vertically
+                NSLayoutConstraint.activate([
+                    leaf.topAnchor.constraint(equalTo: stack.topAnchor),
+                    leaf.bottomAnchor.constraint(equalTo: stack.bottomAnchor),
+                ])
+            } else {
+                // vertical stack: leaves stretch horizontally
+                NSLayoutConstraint.activate([
+                    leaf.leadingAnchor.constraint(equalTo: stack.leadingAnchor),
+                    leaf.trailingAnchor.constraint(equalTo: stack.trailingAnchor),
+                ])
+            }
         }
-        return split
+        return stack
     }
 
     /// Used when the layout RPC fails — show every surface stacked
