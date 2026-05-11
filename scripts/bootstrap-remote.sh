@@ -203,8 +203,9 @@ if [[ ! -f "$KEY_FILE" ]]; then
     echo "    WARNING: $KEY_FILE not found — skipping upload"
     echo "    Create it locally with: mkdir -p $(dirname "$KEY_FILE") && echo 'ANTHROPIC_API_KEY=sk-ant-...' > $KEY_FILE"
 else
+    ssh_run 'mkdir -p ~/.config/term-mesh && chmod 700 ~/.config/term-mesh'
     run scp -q -o LogLevel=QUIET "$KEY_FILE" "$SSH_TARGET:~/.config/term-mesh/env.tmp"
-    ssh_run 'mkdir -p ~/.config/term-mesh && mv ~/.config/term-mesh/env.tmp ~/.config/term-mesh/env && chmod 600 ~/.config/term-mesh/env'
+    ssh_run 'mv ~/.config/term-mesh/env.tmp ~/.config/term-mesh/env && chmod 600 ~/.config/term-mesh/env'
     echo "    uploaded → ~/.config/term-mesh/env (chmod 600)"
 fi
 
@@ -239,6 +240,15 @@ if [[ -n "$DAEMON_BINARY" ]]; then
     run scp -q -o LogLevel=QUIET "$DAEMON_BINARY" "$SSH_TARGET:~/bin/term-meshd"
     ssh_run 'chmod +x ~/bin/term-meshd'
     echo "    deployed"
+
+    # Auto-deploy tm-agent if present in the same directory as term-meshd
+    CLI_BINARY="$(dirname "$DAEMON_BINARY")/tm-agent"
+    if [[ -f "$CLI_BINARY" ]]; then
+        echo "==> deploying tm-agent: $CLI_BINARY → $SSH_TARGET:~/bin/tm-agent"
+        run scp -q -o LogLevel=QUIET "$CLI_BINARY" "$SSH_TARGET:~/bin/tm-agent"
+        ssh_run 'chmod +x ~/bin/tm-agent'
+        echo "    deployed"
+    fi
 
     echo "==> starting term-meshd on remote"
     # Use TERMMESH_DAEMON_UNIX_PATH to put socket in a predictable location
