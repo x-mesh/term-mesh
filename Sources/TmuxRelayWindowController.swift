@@ -633,48 +633,33 @@ final class TmuxRelayWindowController: NSWindowController, NSWindowDelegate {
     private func makeSplit(isVertical: Bool, children: [TermMeshDaemon.TmuxLayoutNode]) -> NSView? {
         let leaves = children.compactMap { buildLayoutView($0) }
         guard !leaves.isEmpty else { return nil }
-        // Use NSStackView instead of NSSplitView. NSSplitView's behaviour
-        // with programmatically-added subviews is brittle in nested layouts:
-        // it inconsistently distributes space, especially when the inner
-        // split is itself an arranged subview of an outer one (the user's
-        // 4-column screenshot with a missing vertical-stacked column was
-        // exactly this case). NSStackView with .fillEqually distributes
-        // arranged subviews predictably via autolayout, supports nesting
-        // cleanly, and gives us a non-zero `spacing` we can colour as a
-        // divider via the PaneHostView border. Phase 1.1 does not need
-        // interactive divider drag — that arrives in 1.2+.
-        //
-        // tmux `Horizontal` = panes side-by-side → NSStackView.horizontal
-        // tmux `Vertical`   = panes top-to-bottom → NSStackView.vertical
-        let stack = NSStackView()
-        stack.translatesAutoresizingMaskIntoConstraints = false
-        stack.orientation = isVertical ? .horizontal : .vertical
-        stack.distribution = .fillEqually
-        stack.spacing = 1
+        let split = NSSplitView()
+        split.translatesAutoresizingMaskIntoConstraints = false
+        split.isVertical = isVertical
+        // `.paneSplitter` draws a clearly visible thick divider — `.thin` is
+        // a 1-pt grey line that vanishes against Ghostty's black background.
+        // PeerRelayWorkspaceWindowController uses `.thin` but its leaves are
+        // wrapped in NSViews with non-terminal backgrounds, so the divider
+        // gets contrast from the wrap. Our leaves go straight to Ghostty.
+        split.dividerStyle = .paneSplitter
         for leaf in leaves {
-            stack.addArrangedSubview(leaf)
-            // `fillEqually` divides space along the stack's main axis only.
-            // Without an explicit constraint, each arranged subview shrinks
-            // along the perpendicular axis to its intrinsic content size —
-            // which for PaneHostView is `noIntrinsicMetric`, i.e. 0. The
-            // user-visible symptom is panes collapsing to the leading edge
-            // and pretending to vanish. Pin both perpendicular edges so
-            // every leaf fills the stack's cross axis.
-            if isVertical {
-                // horizontal stack: leaves stretch vertically
-                NSLayoutConstraint.activate([
-                    leaf.topAnchor.constraint(equalTo: stack.topAnchor),
-                    leaf.bottomAnchor.constraint(equalTo: stack.bottomAnchor),
-                ])
-            } else {
-                // vertical stack: leaves stretch horizontally
-                NSLayoutConstraint.activate([
-                    leaf.leadingAnchor.constraint(equalTo: stack.leadingAnchor),
-                    leaf.trailingAnchor.constraint(equalTo: stack.trailingAnchor),
-                ])
-            }
+            // Do NOT pin leaves with autolayout constraints — NSSplitView
+            // manages child frames itself via autoresizing masks. Forcing
+            // `translatesAutoresizingMaskIntoConstraints = false` on a leaf
+            // makes it stretch to fill the entire split bounds (overlapping
+            // siblings + hiding dividers). Peer relay (`materializeLayout`
+            // in PeerRelayWorkspaceWindowController.swift) deliberately
+            // does not touch this flag, which is why its splits render.
+            split.addArrangedSubview(leaf)
         }
-        return stack
+        for idx in split.arrangedSubviews.indices {
+            split.setHoldingPriority(.defaultLow, forSubviewAt: idx)
+        }
+        split.adjustSubviews()
+        #if DEBUG
+        dlog("tmux.relay.makeSplit isVertical=\(isVertical) childCount=\(children.count) leafCount=\(leaves.count)")
+        #endif
+        return split
     }
 
     /// Used when the layout RPC fails — show every surface stacked
