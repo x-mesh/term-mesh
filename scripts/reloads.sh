@@ -213,8 +213,12 @@ APP_PATH="$STAGING_APP_PATH"
 # Ensure any running instance is fully terminated, regardless of DerivedData path.
 /usr/bin/osascript -e "tell application id \"${BUNDLE_ID}\" to quit" >/dev/null 2>&1 || true
 sleep 0.3
-# Kill any running staging instance; allow side-by-side with the main and dev apps.
-pkill -f "${APP_NAME}.app/Contents/MacOS/${BASE_APP_NAME}" || true
+# Kill any running staging instance; use APP_PATH so /Applications/term-mesh.app is never matched.
+if pgrep -fl "${APP_NAME}.app/Contents/MacOS/${BASE_APP_NAME}" 2>/dev/null | grep -q "/Applications/"; then
+  echo "ERROR: pkill would hit prod /Applications/term-mesh.app — aborting to protect prod" >&2
+  exit 1
+fi
+pkill -f "${APP_PATH}/Contents/MacOS/${BASE_APP_NAME}" || true
 sleep 0.3
 TERMMESHD_SRC="$PWD/daemon/zig-out/bin/term-meshd"
 if [[ -d "$PWD/daemon" ]]; then

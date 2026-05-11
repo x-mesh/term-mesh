@@ -283,11 +283,16 @@ fi
 /usr/bin/osascript -e "tell application id \"${BUNDLE_ID}\" to quit" >/dev/null 2>&1 || true
 sleep 0.3
 if [[ -z "$TAG" ]]; then
-  # Non-tag mode: kill any running instance (across any DerivedData path) to avoid socket conflicts.
-  pkill -f "/${BASE_APP_NAME}.app/Contents/MacOS/${BASE_APP_NAME}" || true
+  # Non-tag mode: kill the DerivedData instance. Use APP_PATH so /Applications/term-mesh.app
+  # can never be matched, even if BASE_APP_NAME is accidentally renamed to "term-mesh".
+  if pgrep -fl "/${BASE_APP_NAME}.app/Contents/MacOS/${BASE_APP_NAME}" 2>/dev/null | grep -q "/Applications/"; then
+    echo "ERROR: pkill would hit prod /Applications/term-mesh.app — aborting to protect prod" >&2
+    exit 1
+  fi
+  pkill -f "${APP_PATH}/Contents/MacOS/${BASE_APP_NAME}" || true
 else
-  # Tag mode: only kill the tagged instance; allow side-by-side with the main app.
-  pkill -f "${APP_NAME}.app/Contents/MacOS/${BASE_APP_NAME}" || true
+  # Tag mode: only kill the tagged instance (APP_PATH is the tag-specific copy).
+  pkill -f "${APP_PATH}/Contents/MacOS/${BASE_APP_NAME}" || true
 fi
 sleep 0.3
 if [[ -d "$PWD/daemon" && -f "$PWD/daemon/Cargo.toml" ]]; then
