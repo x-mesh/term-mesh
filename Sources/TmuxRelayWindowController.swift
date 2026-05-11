@@ -63,6 +63,8 @@ final class TmuxRelayWindowController: NSWindowController, NSWindowDelegate {
     /// on every frame of an interactive drag so only the final pause
     /// reaches tmux.
     private var windowResizeWorkItem: DispatchWorkItem?
+    private var layoutRefreshInFlight = false
+    private var layoutRefreshPending = false
 
     init(host: String, session: String, daemonSocket: String) {
         self.sshHost = host
@@ -346,10 +348,19 @@ final class TmuxRelayWindowController: NSWindowController, NSWindowDelegate {
     /// user running `tmux split-window` over plain SSH).
     private func startEventStream() {
         guard let primary = primarySurfaceId else { return }
+        #if DEBUG
+        dlog("tmux.relay.eventStream.open surfaceId=\(primary)")
+        #endif
         let socketPath = daemonSocket
         Task.detached(priority: .userInitiated) { [weak self, primary, socketPath] in
             let fd = TmuxRelayWindowController.connectUnixSocket(path: socketPath)
-            guard fd >= 0 else { return }
+            guard fd >= 0 else {
+                #if DEBUG
+                dlog("tmux.relay.eventStream.lagged reason=connect-failed")
+                dlog("tmux.relay.eventStream.closed")
+                #endif
+                return
+            }
             // Hand the fd back to the main actor so windowWillClose can
             // shutdown the socket and unblock our read loop.
             await MainActor.run { [weak self] in self?.eventStreamFd = fd }
@@ -357,6 +368,10 @@ final class TmuxRelayWindowController: NSWindowController, NSWindowDelegate {
             let request = "{\"id\":1,\"method\":\"multiplexer.tmux.events\",\"params\":{\"surface_id\":\"\(primary)\"}}\n"
             guard let reqData = request.data(using: .utf8),
                   TmuxRelayWindowController.writeFully(fd: fd, data: reqData) else {
+                #if DEBUG
+                dlog("tmux.relay.eventStream.lagged reason=write-failed")
+                dlog("tmux.relay.eventStream.closed")
+                #endif
                 Darwin.close(fd)
                 return
             }
@@ -372,16 +387,34 @@ final class TmuxRelayWindowController: NSWindowController, NSWindowDelegate {
                 while let nl = buffer.firstIndex(of: 0x0A) {
                     let line = buffer.subdata(in: buffer.startIndex..<nl)
                     buffer.removeSubrange(buffer.startIndex...nl)
-                    guard let obj = try? JSONSerialization.jsonObject(with: line) as? [String: Any] else { continue }
+                    guard let obj = try? JSONSerialization.jsonObject(with: line) as? [String: Any] else {
+                        #if DEBUG
+                        dlog("tmux.relay.eventStream.lagged reason=json-parse-failed")
+                        #endif
+                        continue
+                    }
                     // The first line is the ACK from the daemon — { "id": 1, "result": { ... } }.
                     // Skip anything without a `kind` field.
                     guard let kind = obj["kind"] as? String else { continue }
                     if kind == "layout-change" {
+                        let tree = obj["tree"]
+                        let treeNonNil = tree != nil && !(tree is NSNull)
+                        #if DEBUG
+                        dlog("tmux.relay.layoutChange.received treeNonNil=\(treeNonNil)")
+                        #endif
                         await MainActor.run { [weak self] in self?.refreshLayout() }
+                    } else if kind == "warning" {
+                        let reason = obj["msg"] as? String ?? "warning"
+                        #if DEBUG
+                        dlog("tmux.relay.eventStream.lagged reason=\(reason)")
+                        #endif
                     }
                     // `keepalive` / `warning` frames are intentionally ignored.
                 }
             }
+            #if DEBUG
+            dlog("tmux.relay.eventStream.closed")
+            #endif
         }
     }
 
@@ -391,7 +424,23 @@ final class TmuxRelayWindowController: NSWindowController, NSWindowDelegate {
     /// are torn down. Called manually after Cmd+D; later tied to
     /// `%layout-change` (Phase 1.2).
     private func refreshLayout() {
-        guard let primary = primarySurfaceId else { return }
+        #if DEBUG
+        dlog("tmux.relay.refresh.enter inFlight=\(layoutRefreshInFlight)")
+        #endif
+        if layoutRefreshInFlight {
+            layoutRefreshPending = true
+            #if DEBUG
+            dlog("tmux.relay.refresh.exit reason=skipped-inflight pending=true")
+            #endif
+            return
+        }
+        guard let primary = primarySurfaceId else {
+            #if DEBUG
+            dlog("tmux.relay.refresh.exit reason=no-primary")
+            #endif
+            return
+        }
+        layoutRefreshInFlight = true
         let initialSize = currentCellSize()
         // Snapshot known pane ids on the main actor so the detached task
         // does not need to read `self`'s state mid-flight.
@@ -399,29 +448,62 @@ final class TmuxRelayWindowController: NSWindowController, NSWindowDelegate {
 
         Task.detached(priority: .userInitiated) { [primary, initialSize, knownPaneIds, weak self] in
             let daemon = TermMeshDaemon.shared
-            let panes = daemon.tmuxListPanes(surfaceId: primary) ?? []
+            guard let panes = daemon.tmuxListPanes(surfaceId: primary) else {
+                await MainActor.run { [weak self] in
+                    self?.finishRefresh(reason: "list_panes-failed")
+                }
+                return
+            }
             let layout = daemon.tmuxGetLayout(surfaceId: primary)
+            var exitReason = layout == nil ? "get_layout-failed" : "success"
             var newBindings: [(pane: TermMeshDaemon.TmuxPaneInfo, surfaceId: String)] = []
             for pane in panes where !knownPaneIds.contains(pane.paneId) {
-                if let newId = daemon.tmuxAttachPane(
+                #if DEBUG
+                dlog("tmux.relay.attach.request paneId=\(pane.paneId) cells=\(initialSize.cols)x\(initialSize.rows)")
+                #endif
+                let newId = daemon.tmuxAttachPane(
                     surfaceId: primary,
                     paneId: pane.paneId,
                     cols: initialSize.cols,
                     rows: initialSize.rows
-                ) {
+                )
+                #if DEBUG
+                let errorString = newId == nil ? "rpcCall-nil" : "none"
+                dlog("tmux.relay.attach.response newSurfaceId=\(newId ?? "nil") error=\(errorString)")
+                #endif
+                if let newId {
                     newBindings.append((pane, newId))
+                } else {
+                    exitReason = "attach_pane-failed"
                 }
             }
             let panesCopy = panes
             let layoutCopy = layout
             let bindingsCopy = newBindings
+            let finalExitReason = exitReason
             await MainActor.run { [weak self] in
-                self?.applyRefresh(
+                guard let self else { return }
+                self.applyRefresh(
                     panes: panesCopy,
                     layout: layoutCopy,
                     newBindings: bindingsCopy
                 )
+                self.finishRefresh(reason: finalExitReason)
             }
+        }
+    }
+
+    private func finishRefresh(reason: String) {
+        #if DEBUG
+        dlog("tmux.relay.refresh.exit reason=\(reason)")
+        #endif
+        layoutRefreshInFlight = false
+        if layoutRefreshPending {
+            layoutRefreshPending = false
+            #if DEBUG
+            dlog("tmux.relay.refresh.replay reason=pending-after-inflight")
+            #endif
+            refreshLayout()
         }
     }
 
@@ -455,10 +537,20 @@ final class TmuxRelayWindowController: NSWindowController, NSWindowDelegate {
 
         guard let layout else { return }
         let signature = layoutSignature(of: layout)
-        if signature == layoutSignature { return }
+        if signature == layoutSignature {
+            #if DEBUG
+            dlog("tmux.relay.applyRefresh path=early-return-no-changes newPaneCount=\(panes.count) bindingsCount=\(newBindings.count)")
+            #endif
+            return
+        }
         layoutSignature = signature
 
-        let view = buildLayoutView(layout) ?? fallbackStackView()
+        let builtView = buildLayoutView(layout)
+        let path = builtView == nil ? "buildLayoutView-nil-fallback" : "ok"
+        #if DEBUG
+        dlog("tmux.relay.applyRefresh path=\(path) newPaneCount=\(panes.count) bindingsCount=\(newBindings.count)")
+        #endif
+        let view = builtView ?? fallbackStackView()
         swapContent(to: view)
     }
 
@@ -647,14 +739,30 @@ final class TmuxRelayWindowController: NSWindowController, NSWindowDelegate {
     /// Cmd+D entry point — called from `PaneHostView.performKeyEquivalent`.
     /// Returns true if the key was consumed.
     fileprivate func handleSplitCommand(surfaceId: String, direction: String) -> Bool {
+        let targetPaneId = paneIds[surfaceId]
+        #if DEBUG
+        dlog("tmux.relay.split.dispatch dir=\(direction) focusedSurfaceId=\(focusedSurfaceId() ?? "nil") targetPaneId=\(targetPaneId ?? "nil")")
+        #endif
         guard let primary = primarySurfaceId,
-              let paneId = paneIds[surfaceId] else { return false }
+              let paneId = targetPaneId else {
+            #if DEBUG
+            dlog("tmux.relay.rpc.response ok=false error=missing-primary-or-pane")
+            #endif
+            return false
+        }
+        #if DEBUG
+        dlog("tmux.relay.rpc.request method=control action=split-pane pane=\(paneId) dir=\(direction)")
+        #endif
         let ok = TermMeshDaemon.shared.tmuxControl(
             surfaceId: primary,
             command: "split-pane",
             paneId: paneId,
             direction: direction
         )
+        #if DEBUG
+        let errorString = ok ? "none" : "rpcCall-nil"
+        dlog("tmux.relay.rpc.response ok=\(ok) error=\(errorString)")
+        #endif
         // Layout refresh is driven by the `multiplexer.tmux.events` stream:
         // tmux fires %layout-change right after split-window completes and
         // the daemon broadcasts it on `notify_tx`. No explicit polling.
