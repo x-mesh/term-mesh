@@ -182,8 +182,16 @@ final class TermMeshDaemon: ObservableObject {
                 Thread.sleep(forTimeInterval: 0.3)
             }
 
+            // Resolve the socket path once; publish it to the app process env so
+            // that getenv("TERMMESH_DAEMON_UNIX_PATH") stays in sync with what the
+            // daemon uses.  ProcessInfo.processInfo.environment is a cached snapshot
+            // and cannot be mutated, but POSIX setenv(3) updates the live env so that
+            // getenv(3) — and any child processes spawned later — see the right path.
+            let resolvedSocketPath = self.socketPath
+            setenv("TERMMESH_DAEMON_UNIX_PATH", resolvedSocketPath, 1)
+
             // Clean up stale socket before starting
-            try? FileManager.default.removeItem(atPath: self.socketPath)
+            try? FileManager.default.removeItem(atPath: resolvedSocketPath)
 
             // Find the daemon binary next to the app bundle, or in the daemon build dir
             let binaryPath = self.daemonBinaryPath()
@@ -195,6 +203,9 @@ final class TermMeshDaemon: ObservableObject {
             let process = Process()
             process.executableURL = URL(fileURLWithPath: binaryPath)
             var env = ProcessInfo.processInfo.environment
+            // Ensure the daemon inherits the resolved socket path even if ProcessInfo
+            // snapshot predates the setenv call above.
+            env["TERMMESH_DAEMON_UNIX_PATH"] = resolvedSocketPath
 
             // Ensure Resources/bin is in PATH for daemon and all its child processes.
             // When launched from Finder/Spotlight, macOS provides a minimal PATH that

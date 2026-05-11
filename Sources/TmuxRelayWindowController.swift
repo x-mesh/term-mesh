@@ -224,7 +224,9 @@ final class TmuxMenuCoordinator: NSObject {
         let session = sessionField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !host.isEmpty, !session.isEmpty else { return }
 
-        let daemonSocket = TmuxRelayWindowController.detectDaemonSocket()
+        // TermMeshDaemon.shared.socketPath is the authoritative socket path
+        // (already set via LSEnvironment or setenv in startDaemon).
+        let daemonSocket = TermMeshDaemon.shared.socketPath
         let controller = TmuxRelayWindowController(host: host, session: session, daemonSocket: daemonSocket)
         openControllers.append(controller)
         controller.show()
