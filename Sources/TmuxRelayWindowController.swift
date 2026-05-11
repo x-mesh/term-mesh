@@ -1,58 +1,54 @@
-// Phase 2.1: NSWindow that hosts a Ghostty terminal surface driven by the
-// term-meshd-tmux-relay binary.  The relay binary connects to term-meshd,
-// calls multiplexer.tmux.{attach,subscribe}, decodes hex-encoded output
-// frames, and writes raw PTY bytes to stdout — which Ghostty renders.
+// Phase 1.1 — NSWindow that mirrors a remote tmux window's full pane tree.
 //
-// Only the relay → Ghostty direction (display) is wired in Phase 2.1.
-// Keyboard input (stdin → multiplexer.tmux.input) is Phase 2.2.
+// The controller is the orchestrator: it talks to term-meshd over JSON-RPC
+// to attach + list panes + attach extras + get layout, then builds an
+// NSSplitView tree where every leaf hosts one Ghostty surface driven by
+// `term-meshd-tmux-relay` in secondary mode (`TERMMESH_TMUX_SURFACE_ID`).
+//
+// Cmd+D triggers a remote `split-pane` against the focused surface and
+// polls the layout briefly so the new pane appears as soon as tmux acks.
 
 import AppKit
 
 @MainActor
 final class TmuxRelayWindowController: NSWindowController, NSWindowDelegate {
-    private let terminalSurface: TerminalSurface
     private let sshHost: String
     private let tmuxSession: String
+    private let daemonSocket: String
+
+    /// surface_id (primary or attach_pane result) → managed terminal surface.
+    private var surfaces: [String: TerminalSurface] = [:]
+    /// surface_id → tmux pane id (e.g. `%1`). Required so split/kill RPCs
+    /// can target the focused pane without re-walking list_panes.
+    private var paneIds: [String: String] = [:]
+    /// pane_index → surface_id, used while wiring leaf nodes from the
+    /// layout tree to their hosted surface.
+    private var paneIndexToSurface: [Int: String] = [:]
+    /// Primary surface = the active pane at attach time. Anchors the
+    /// SSH/tmux session lifecycle; closing the window detaches it.
+    private var primarySurfaceId: String?
+
+    /// Container that swaps between the spinner and the live layout.
+    private let rootContainer = NSView()
+    private var loadingLabel: NSTextField?
+    private var statusLabel: NSTextField?
+    /// Last applied layout signature — skips redundant rebuilds when
+    /// poll-after-split arrives with identical content.
+    private var layoutSignature: String?
 
     init(host: String, session: String, daemonSocket: String) {
         self.sshHost = host
         self.tmuxSession = session
+        self.daemonSocket = daemonSocket
 
-        guard let relayBinary = TmuxRelayWindowController.findRelayBinary() else {
-            // Surface will just show an error message from the shell.
-            let surface = TerminalSurface(
-                tabId: UUID(),
-                context: GHOSTTY_SURFACE_CONTEXT_WINDOW,
-                configTemplate: nil,
-                command: "/bin/sh",
-                environment: [:]
-            )
-            self.terminalSurface = surface
-            let window = TmuxRelayWindowController.makeWindow(title: "tmux relay: binary not found")
-            super.init(window: window)
-            TmuxRelayWindowController.embed(surface.hostedView, in: window)
-            window.delegate = self
-            return
-        }
-
-        let surface = TerminalSurface(
-            tabId: UUID(),
-            context: GHOSTTY_SURFACE_CONTEXT_WINDOW,
-            configTemplate: nil,
-            command: relayBinary,
-            environment: [
-                "TERMMESH_DAEMON_UNIX_PATH": daemonSocket,
-                "TERMMESH_TMUX_HOST": host,
-                "TERMMESH_TMUX_SESSION": session,
-            ]
+        let window = TmuxRelayWindowController.makeWindow(
+            title: "tmux · \(session) @ \(host)"
         )
-        self.terminalSurface = surface
-
-        let title = "tmux · \(session) @ \(host)"
-        let window = TmuxRelayWindowController.makeWindow(title: title)
         super.init(window: window)
-        TmuxRelayWindowController.embed(surface.hostedView, in: window)
         window.delegate = self
+        window.contentView = rootContainer
+        showLoading(message: "Connecting to \(host)…")
+        Task { [weak self] in await self?.bootstrap() }
     }
 
     required init?(coder: NSCoder) { fatalError("not used") }
@@ -62,14 +58,336 @@ final class TmuxRelayWindowController: NSWindowController, NSWindowDelegate {
     }
 
     func windowWillClose(_ notification: Notification) {
-        // TerminalSurface.deinit handles PTY/Ghostty cleanup.
+        // TerminalSurface.deinit owns PTY teardown; the relay process exits
+        // when its stdin/stdout pipes close. Best-effort detach so the
+        // daemon-side backend can release its SSH connection.
+        if let primary = primarySurfaceId {
+            Task.detached { [primary] in
+                _ = TermMeshDaemon.shared.rpcCallRaw(
+                    method: "multiplexer.tmux.detach",
+                    params: ["surface_id": primary]
+                )
+            }
+        }
     }
 
-    // ── Helpers ────────────────────────────────────────────────────────────
+    // ── Bootstrap orchestration ───────────────────────────────────────────
+
+    private func bootstrap() async {
+        let host = sshHost
+        let session = tmuxSession
+        let initialSize = currentCellSize()
+
+        // Heavy lifting (sync RPCs) goes off the main actor.
+        let result: BootstrapResult = await Task.detached(priority: .userInitiated) {
+            let daemon = TermMeshDaemon.shared
+            guard let attach = daemon.tmuxAttach(
+                host: host,
+                session: session,
+                cols: initialSize.cols,
+                rows: initialSize.rows,
+                createIfMissing: false
+            ) else {
+                return .failure("tmux attach failed — is the daemon running?")
+            }
+            let panes = daemon.tmuxListPanes(surfaceId: attach.surfaceId) ?? []
+            guard !panes.isEmpty else {
+                return .failure("session has no panes")
+            }
+            // Primary = whichever pane the daemon bound to attach.surfaceId.
+            // attach_surface_with_options prefers the active pane, so we
+            // mirror that choice here for the UI.
+            let primaryPane = panes.first(where: { $0.active }) ?? panes[0]
+            var paneBindings: [(pane: TermMeshDaemon.TmuxPaneInfo, surfaceId: String)] = [
+                (primaryPane, attach.surfaceId)
+            ]
+            for pane in panes where pane.paneId != primaryPane.paneId {
+                if let newId = daemon.tmuxAttachPane(
+                    surfaceId: attach.surfaceId,
+                    paneId: pane.paneId,
+                    cols: initialSize.cols,
+                    rows: initialSize.rows
+                ) {
+                    paneBindings.append((pane, newId))
+                }
+            }
+            let layout = daemon.tmuxGetLayout(surfaceId: attach.surfaceId)
+            return .success(BootstrapData(
+                primaryPaneId: primaryPane.paneId,
+                bindings: paneBindings,
+                layout: layout
+            ))
+        }.value
+
+        switch result {
+        case .failure(let message):
+            showError(message: message)
+        case .success(let data):
+            applyBootstrap(data)
+        }
+    }
+
+    private func applyBootstrap(_ data: BootstrapData) {
+        // Mint surfaces for every binding (primary + extras).
+        for binding in data.bindings {
+            let surface = makeRelaySurface(surfaceId: binding.surfaceId)
+            surfaces[binding.surfaceId] = surface
+            paneIds[binding.surfaceId] = binding.pane.paneId
+            paneIndexToSurface[binding.pane.paneIndex] = binding.surfaceId
+        }
+        primarySurfaceId = data.bindings.first?.surfaceId
+
+        let liveView: NSView
+        if let layout = data.layout {
+            liveView = buildLayoutView(layout) ?? fallbackStackView()
+        } else {
+            liveView = fallbackStackView()
+        }
+        swapContent(to: liveView)
+        focusFirstAvailableSurface()
+    }
+
+    /// Re-fetch the layout (after a split or any topology change) and
+    /// rebuild the NSSplitView tree. Surfaces for newly discovered panes
+    /// are attached via `tmuxAttachPane`; surfaces for now-missing panes
+    /// are torn down. Called manually after Cmd+D; later tied to
+    /// `%layout-change` (Phase 1.2).
+    private func refreshLayout() {
+        guard let primary = primarySurfaceId else { return }
+        let initialSize = currentCellSize()
+        // Snapshot known pane ids on the main actor so the detached task
+        // does not need to read `self`'s state mid-flight.
+        let knownPaneIds = Set(paneIds.values)
+
+        Task.detached(priority: .userInitiated) { [primary, initialSize, knownPaneIds, weak self] in
+            let daemon = TermMeshDaemon.shared
+            let panes = daemon.tmuxListPanes(surfaceId: primary) ?? []
+            let layout = daemon.tmuxGetLayout(surfaceId: primary)
+            var newBindings: [(pane: TermMeshDaemon.TmuxPaneInfo, surfaceId: String)] = []
+            for pane in panes where !knownPaneIds.contains(pane.paneId) {
+                if let newId = daemon.tmuxAttachPane(
+                    surfaceId: primary,
+                    paneId: pane.paneId,
+                    cols: initialSize.cols,
+                    rows: initialSize.rows
+                ) {
+                    newBindings.append((pane, newId))
+                }
+            }
+            let panesCopy = panes
+            let layoutCopy = layout
+            let bindingsCopy = newBindings
+            await MainActor.run { [weak self] in
+                self?.applyRefresh(
+                    panes: panesCopy,
+                    layout: layoutCopy,
+                    newBindings: bindingsCopy
+                )
+            }
+        }
+    }
+
+    private func applyRefresh(
+        panes: [TermMeshDaemon.TmuxPaneInfo],
+        layout: TermMeshDaemon.TmuxLayoutNode?,
+        newBindings: [(pane: TermMeshDaemon.TmuxPaneInfo, surfaceId: String)]
+    ) {
+        for binding in newBindings {
+            let surface = makeRelaySurface(surfaceId: binding.surfaceId)
+            surfaces[binding.surfaceId] = surface
+            paneIds[binding.surfaceId] = binding.pane.paneId
+            paneIndexToSurface[binding.pane.paneIndex] = binding.surfaceId
+        }
+
+        // Drop surfaces for panes that no longer exist remotely.
+        let liveIndices = Set(panes.map { $0.paneIndex })
+        let stalePaneIndices = paneIndexToSurface.keys.filter { !liveIndices.contains($0) }
+        for idx in stalePaneIndices {
+            if let sid = paneIndexToSurface.removeValue(forKey: idx) {
+                surfaces.removeValue(forKey: sid)
+                paneIds.removeValue(forKey: sid)
+            }
+        }
+
+        guard let layout else { return }
+        let signature = layoutSignature(of: layout)
+        if signature == layoutSignature { return }
+        layoutSignature = signature
+
+        let view = buildLayoutView(layout) ?? fallbackStackView()
+        swapContent(to: view)
+    }
+
+    private func makeRelaySurface(surfaceId: String) -> TerminalSurface {
+        let relayBinary = TmuxRelayWindowController.findRelayBinary() ?? "/bin/sh"
+        return TerminalSurface(
+            tabId: UUID(),
+            context: GHOSTTY_SURFACE_CONTEXT_WINDOW,
+            configTemplate: nil,
+            command: relayBinary,
+            environment: [
+                "TERMMESH_DAEMON_UNIX_PATH": daemonSocket,
+                "TERMMESH_TMUX_HOST": sshHost,
+                "TERMMESH_TMUX_SESSION": tmuxSession,
+                "TERMMESH_TMUX_SURFACE_ID": surfaceId,
+            ]
+        )
+    }
+
+    // ── Layout → NSSplitView ──────────────────────────────────────────────
+
+    private func buildLayoutView(_ node: TermMeshDaemon.TmuxLayoutNode) -> NSView? {
+        switch node.kind {
+        case .pane:
+            guard let idx = node.paneIndex,
+                  let sid = paneIndexToSurface[idx],
+                  let surface = surfaces[sid] else { return nil }
+            return PaneHostView(surfaceId: sid, controller: self, content: surface.hostedView)
+        case .horizontal:
+            return makeSplit(isVertical: true, children: node.children)
+        case .vertical:
+            return makeSplit(isVertical: false, children: node.children)
+        }
+    }
+
+    private func makeSplit(isVertical: Bool, children: [TermMeshDaemon.TmuxLayoutNode]) -> NSView? {
+        let leaves = children.compactMap { buildLayoutView($0) }
+        guard !leaves.isEmpty else { return nil }
+        let split = NSSplitView()
+        split.translatesAutoresizingMaskIntoConstraints = false
+        split.isVertical = isVertical
+        split.dividerStyle = .thin
+        for leaf in leaves {
+            leaf.translatesAutoresizingMaskIntoConstraints = false
+            split.addArrangedSubview(leaf)
+        }
+        return split
+    }
+
+    /// Used when the layout RPC fails — show every surface stacked
+    /// vertically so the user at least gets I/O.
+    private func fallbackStackView() -> NSView {
+        let stack = NSStackView()
+        stack.orientation = .vertical
+        stack.distribution = .fillEqually
+        stack.spacing = 0
+        stack.translatesAutoresizingMaskIntoConstraints = false
+        for (sid, surface) in surfaces {
+            let host = PaneHostView(surfaceId: sid, controller: self, content: surface.hostedView)
+            stack.addArrangedSubview(host)
+        }
+        return stack
+    }
+
+    /// Stable string that changes whenever the layout topology changes.
+    private func layoutSignature(of node: TermMeshDaemon.TmuxLayoutNode) -> String {
+        switch node.kind {
+        case .pane:
+            return "P\(node.paneIndex ?? -1)"
+        case .horizontal:
+            return "H[\(node.children.map(layoutSignature(of:)).joined(separator: ","))]"
+        case .vertical:
+            return "V[\(node.children.map(layoutSignature(of:)).joined(separator: ","))]"
+        }
+    }
+
+    // ── Container view swapping ───────────────────────────────────────────
+
+    private func showLoading(message: String) {
+        let label = NSTextField(labelWithString: message)
+        label.translatesAutoresizingMaskIntoConstraints = false
+        label.alignment = .center
+        label.font = NSFont.systemFont(ofSize: 13)
+        loadingLabel = label
+        swapContent(to: label, centered: true)
+    }
+
+    private func showError(message: String) {
+        let label = NSTextField(labelWithString: message)
+        label.translatesAutoresizingMaskIntoConstraints = false
+        label.alignment = .center
+        label.font = NSFont.systemFont(ofSize: 12)
+        label.textColor = .systemRed
+        statusLabel = label
+        swapContent(to: label, centered: true)
+    }
+
+    private func swapContent(to view: NSView, centered: Bool = false) {
+        for sub in rootContainer.subviews { sub.removeFromSuperview() }
+        view.translatesAutoresizingMaskIntoConstraints = false
+        rootContainer.addSubview(view)
+        if centered {
+            NSLayoutConstraint.activate([
+                view.centerXAnchor.constraint(equalTo: rootContainer.centerXAnchor),
+                view.centerYAnchor.constraint(equalTo: rootContainer.centerYAnchor),
+            ])
+        } else {
+            NSLayoutConstraint.activate([
+                view.topAnchor.constraint(equalTo: rootContainer.topAnchor),
+                view.bottomAnchor.constraint(equalTo: rootContainer.bottomAnchor),
+                view.leadingAnchor.constraint(equalTo: rootContainer.leadingAnchor),
+                view.trailingAnchor.constraint(equalTo: rootContainer.trailingAnchor),
+            ])
+        }
+    }
+
+    // ── Focus / Cmd+D ─────────────────────────────────────────────────────
+
+    fileprivate func focusedSurfaceId() -> String? {
+        guard let responder = window?.firstResponder as? NSView else { return nil }
+        var view: NSView? = responder
+        while let v = view {
+            if let host = v as? PaneHostView { return host.surfaceId }
+            view = v.superview
+        }
+        // Fallback: any view-tag walk failed, just return primary.
+        return primarySurfaceId
+    }
+
+    fileprivate func surfaceIdFor(paneIndex: Int) -> String? {
+        paneIndexToSurface[paneIndex]
+    }
+
+    /// Cmd+D entry point — called from `PaneHostView.performKeyEquivalent`.
+    /// Returns true if the key was consumed.
+    fileprivate func handleSplitCommand(surfaceId: String, direction: String) -> Bool {
+        guard let primary = primarySurfaceId,
+              let paneId = paneIds[surfaceId] else { return false }
+        let ok = TermMeshDaemon.shared.tmuxControl(
+            surfaceId: primary,
+            command: "split-pane",
+            paneId: paneId,
+            direction: direction
+        )
+        if ok {
+            // tmux is asynchronous through control mode; give it a brief
+            // moment to emit %layout-change before we poll list_panes.
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.20) { [weak self] in
+                self?.refreshLayout()
+            }
+        }
+        return ok
+    }
+
+    private func focusFirstAvailableSurface() {
+        guard let sid = primarySurfaceId,
+              let surface = surfaces[sid] else { return }
+        window?.makeFirstResponder(surface.hostedView)
+    }
+
+    // ── Helpers ───────────────────────────────────────────────────────────
+
+    private func currentCellSize() -> (cols: UInt16, rows: UInt16) {
+        // Pre-bootstrap we don't have a Ghostty surface yet, so use a sane
+        // initial size matched against the window's content rect (~80x24
+        // cell baseline at 10pt). The first SIGWINCH from the relay
+        // refines it instantly.
+        return (220, 50)
+    }
 
     private static func makeWindow(title: String) -> NSWindow {
         let w = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 900, height: 550),
+            contentRect: NSRect(x: 0, y: 0, width: 1100, height: 650),
             styleMask: [.titled, .closable, .resizable, .miniaturizable],
             backing: .buffered,
             defer: false
@@ -80,26 +398,12 @@ final class TmuxRelayWindowController: NSWindowController, NSWindowDelegate {
         return w
     }
 
-    private static func embed(_ hostedView: NSView, in window: NSWindow) {
-        hostedView.translatesAutoresizingMaskIntoConstraints = false
-        let container = NSView(frame: window.contentRect(forFrameRect: window.frame))
-        container.addSubview(hostedView)
-        NSLayoutConstraint.activate([
-            hostedView.topAnchor.constraint(equalTo: container.topAnchor),
-            hostedView.bottomAnchor.constraint(equalTo: container.bottomAnchor),
-            hostedView.leadingAnchor.constraint(equalTo: container.leadingAnchor),
-            hostedView.trailingAnchor.constraint(equalTo: container.trailingAnchor),
-        ])
-        window.contentView = container
-    }
-
     /// Search for term-meshd-tmux-relay binary in development and bundled locations.
     static func findRelayBinary() -> String? {
         let fm = FileManager.default
 
         // Development: daemon workspace relative to the Swift source file.
         let srcFile = URL(fileURLWithPath: #file)
-        // Sources/TmuxRelayWindowController.swift → ../../daemon/target/release/
         let devPath = srcFile
             .deletingLastPathComponent()          // Sources/
             .deletingLastPathComponent()          // project root
@@ -118,14 +422,8 @@ final class TmuxRelayWindowController: NSWindowController, NSWindowDelegate {
         return candidates.first { fm.fileExists(atPath: $0) && fm.isExecutableFile(atPath: $0) }
     }
 
-    /// Best-effort daemon socket path. Order:
-    ///   1. TERMMESH_DAEMON_UNIX_PATH / TERMMESH_DAEMON_SOCKET env
-    ///   2. macOS Library/Application Support/term-mesh/term-meshd-*.sock
-    ///      (this is where the app-spawned daemon writes its socket when
-    ///       a build tag is in effect; the value also lives in the daemon
-    ///       child's env but is not always re-exported to the app)
-    ///   3. ~/.local/share/term-mesh/term-meshd.sock
-    ///   4. /tmp/term-meshd.sock fallback
+    /// Best-effort daemon socket path resolution. Same chain as before so
+    /// tagged builds still find their isolated socket.
     static func detectDaemonSocket() -> String {
         if let p = ProcessInfo.processInfo.environment["TERMMESH_DAEMON_UNIX_PATH"], !p.isEmpty {
             return p
@@ -133,14 +431,11 @@ final class TmuxRelayWindowController: NSWindowController, NSWindowDelegate {
         if let p = ProcessInfo.processInfo.environment["TERMMESH_DAEMON_SOCKET"], !p.isEmpty {
             return p
         }
-        // Probe getenv directly in case ProcessInfo cached an empty env.
         if let raw = getenv("TERMMESH_DAEMON_UNIX_PATH") {
             let s = String(cString: raw)
             if !s.isEmpty { return s }
         }
 
-        // macOS app-spawned daemon writes its socket into
-        // ~/Library/Application Support/term-mesh/term-meshd-*.sock.
         let appSupport = FileManager.default.homeDirectoryForCurrentUser
             .appendingPathComponent("Library/Application Support/term-mesh")
             .path
@@ -149,7 +444,6 @@ final class TmuxRelayWindowController: NSWindowController, NSWindowDelegate {
                 .filter { $0.hasPrefix("term-meshd-") && $0.hasSuffix(".sock") }
                 .map { "\(appSupport)/\($0)" }
                 .filter { FileManager.default.fileExists(atPath: $0) }
-            // Prefer the one matching the current TERMMESH_TAG, otherwise newest.
             if let tag = ProcessInfo.processInfo.environment["TERMMESH_TAG"], !tag.isEmpty {
                 if let match = socks.first(where: { $0.contains("-\(tag).sock") }) {
                     return match
@@ -163,11 +457,75 @@ final class TmuxRelayWindowController: NSWindowController, NSWindowDelegate {
             if let s = newest { return s }
         }
 
-        // Standard path written by term-meshd at startup (Linux / non-tagged).
         let home = FileManager.default.homeDirectoryForCurrentUser.path
         let standard = home + "/.local/share/term-mesh/term-meshd.sock"
         if FileManager.default.fileExists(atPath: standard) { return standard }
         return "/tmp/term-meshd.sock"
+    }
+}
+
+// MARK: - Bootstrap data
+
+private enum BootstrapResult {
+    case success(BootstrapData)
+    case failure(String)
+}
+
+private struct BootstrapData {
+    let primaryPaneId: String
+    let bindings: [(pane: TermMeshDaemon.TmuxPaneInfo, surfaceId: String)]
+    let layout: TermMeshDaemon.TmuxLayoutNode?
+}
+
+// MARK: - PaneHostView (Cmd+D / focus tracking)
+
+/// Thin NSView wrapper around each leaf so we can: (1) walk the responder
+/// chain to identify the focused pane on Cmd+D, (2) intercept Cmd+D /
+/// Cmd+Shift+D before they reach the underlying Ghostty surface.
+private final class PaneHostView: NSView {
+    let surfaceId: String
+    private weak var controller: TmuxRelayWindowController?
+
+    init(surfaceId: String, controller: TmuxRelayWindowController, content: NSView) {
+        self.surfaceId = surfaceId
+        self.controller = controller
+        super.init(frame: .zero)
+        content.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(content)
+        NSLayoutConstraint.activate([
+            content.topAnchor.constraint(equalTo: topAnchor),
+            content.bottomAnchor.constraint(equalTo: bottomAnchor),
+            content.leadingAnchor.constraint(equalTo: leadingAnchor),
+            content.trailingAnchor.constraint(equalTo: trailingAnchor),
+        ])
+    }
+
+    required init?(coder: NSCoder) { fatalError("not used") }
+
+    override func performKeyEquivalent(with event: NSEvent) -> Bool {
+        // Cmd+D = horizontal split, Cmd+Shift+D = vertical split. This
+        // matches Ghostty's native split shortcuts so users do not have to
+        // re-learn keys when the surface happens to be tmux-backed.
+        guard let controller else { return super.performKeyEquivalent(with: event) }
+        let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+        let chars = event.charactersIgnoringModifiers?.lowercased() ?? ""
+        if chars == "d" && flags.contains(.command) {
+            let direction = flags.contains(.shift) ? "vertical" : "horizontal"
+            if controller.handleSplitCommand(surfaceId: surfaceId, direction: direction) {
+                return true
+            }
+        }
+        return super.performKeyEquivalent(with: event)
+    }
+}
+
+// MARK: - NSSplitView arranged-subview compatibility
+
+private extension NSSplitView {
+    /// NSSplitView has no first-class arranged-subview API on macOS 12
+    /// targets. addSubview is enough — it inserts dividers between siblings.
+    func addArrangedSubview(_ view: NSView) {
+        addSubview(view)
     }
 }
 
@@ -195,19 +553,6 @@ final class TmuxMenuCoordinator: NSObject {
     private static let shellOptions = ["Default", "/bin/bash", "/bin/zsh", "/bin/sh"]
 
     private var openControllers: [TmuxRelayWindowController] = []
-
-    private struct TmuxPaneOption {
-        let index: Int
-        let paneID: String
-        let command: String
-        let active: Bool
-
-        var displayTitle: String {
-            let commandLabel = command.isEmpty ? "unknown" : command
-            let state = active ? ", active" : ""
-            return "pane \(index) (\(paneID), \(commandLabel)\(state))"
-        }
-    }
 
     @MainActor
     @objc func promptAndConnect(_ sender: Any?) {
@@ -265,19 +610,6 @@ final class TmuxMenuCoordinator: NSObject {
                 Self.showSessionCreateFailure(session: session, failure: failure)
                 return
             }
-
-            let panes = await Self.listPanesViaSSH(host: host, session: session)
-            if panes.count >= 2,
-               let selectedPane = Self.promptForPaneSelection(host: host, session: session, panes: panes) {
-                let didSelect = await Self.selectPaneViaSSH(host: host, paneID: selectedPane.paneID)
-                if !didSelect {
-                    let shouldContinue = Self.confirmPaneSelectionFailure(pane: selectedPane)
-                    guard shouldContinue else { return }
-                }
-            } else if panes.count >= 2 {
-                return
-            }
-
             self?.openRelay(host: host, session: session)
         }
     }
@@ -287,8 +619,6 @@ final class TmuxMenuCoordinator: NSObject {
         UserDefaults.standard.set(host, forKey: Self.lastHostKey)
         UserDefaults.standard.set(session, forKey: Self.lastSessionKey)
 
-        // TermMeshDaemon.shared.socketPath is the authoritative socket path
-        // (already set via LSEnvironment or setenv in startDaemon).
         let daemonSocket = TermMeshDaemon.shared.socketPath
         let controller = TmuxRelayWindowController(host: host, session: session, daemonSocket: daemonSocket)
         openControllers.append(controller)
@@ -347,71 +677,6 @@ final class TmuxMenuCoordinator: NSObject {
         alert.runModal()
     }
 
-    private static func listPanesViaSSH(host: String, session: String) async -> [TmuxPaneOption] {
-        let format = "#{pane_index}\t#{pane_id}\t#{pane_current_command}\t#{pane_active}"
-        let command = [
-            "tmux",
-            "list-panes",
-            "-t",
-            shellQuote(session),
-            "-F",
-            shellQuote(format),
-        ].joined(separator: " ")
-        let result = await runSSHCommand(host: host, command: command, timeout: 6)
-        guard result.exitCode == 0, !result.stdout.isEmpty else { return [] }
-        return parsePaneList(result.stdout)
-    }
-
-    private static func selectPaneViaSSH(host: String, paneID: String) async -> Bool {
-        let command = "tmux select-pane -t \(shellQuote(paneID))"
-        let result = await runSSHCommand(host: host, command: command, timeout: 6)
-        return result.exitCode == 0 && !result.timedOut
-    }
-
-    @MainActor
-    private static func promptForPaneSelection(
-        host: String,
-        session: String,
-        panes: [TmuxPaneOption]
-    ) -> TmuxPaneOption? {
-        let alert = NSAlert()
-        alert.messageText = "Choose a tmux pane"
-        alert.informativeText = "\(session) on \(host) has multiple panes. Select the pane to show before connecting."
-        alert.addButton(withTitle: "Connect")
-        alert.addButton(withTitle: "Cancel")
-
-        let stackView = NSStackView(frame: NSRect(x: 0, y: 0, width: 420, height: 30))
-        stackView.orientation = .vertical
-        stackView.spacing = 8
-        stackView.alignment = .leading
-
-        let popup = NSPopUpButton(frame: NSRect(x: 0, y: 0, width: 420, height: 26), pullsDown: false)
-        for pane in panes {
-            popup.addItem(withTitle: pane.displayTitle)
-        }
-        if let activeIndex = panes.firstIndex(where: \.active) {
-            popup.selectItem(at: activeIndex)
-        }
-        stackView.addArrangedSubview(popup)
-        alert.accessoryView = stackView
-
-        guard alert.runModal() == .alertFirstButtonReturn else { return nil }
-        let selectedIndex = max(0, popup.indexOfSelectedItem)
-        guard panes.indices.contains(selectedIndex) else { return panes.first }
-        return panes[selectedIndex]
-    }
-
-    @MainActor
-    private static func confirmPaneSelectionFailure(pane: TmuxPaneOption) -> Bool {
-        let alert = NSAlert()
-        alert.messageText = "Could not select \(pane.displayTitle)"
-        alert.informativeText = "term-mesh can still connect, but tmux may open on the session's current active pane."
-        alert.alertStyle = .warning
-        alert.addButton(withTitle: "Continue Default")
-        alert.addButton(withTitle: "Cancel")
-        return alert.runModal() == .alertFirstButtonReturn
-    }
-
     private struct SSHResult {
         let exitCode: Int32
         let stdout: String
@@ -466,21 +731,6 @@ final class TmuxMenuCoordinator: NSObject {
                 timedOut: timedOut
             )
         }.value
-    }
-
-    private static func parsePaneList(_ output: String) -> [TmuxPaneOption] {
-        output
-            .split(separator: "\n", omittingEmptySubsequences: true)
-            .compactMap { line -> TmuxPaneOption? in
-                let columns = line.split(separator: "\t", omittingEmptySubsequences: false)
-                guard columns.count >= 4, let index = Int(columns[0]) else { return nil }
-                return TmuxPaneOption(
-                    index: index,
-                    paneID: String(columns[1]),
-                    command: String(columns[2]),
-                    active: columns[3] == "1"
-                )
-            }
     }
 
     private static func shellQuote(_ value: String) -> String {

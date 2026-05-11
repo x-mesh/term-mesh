@@ -1091,3 +1091,152 @@ struct PendingInputInfo {
     let text: String
     let createdAtMs: UInt64
 }
+
+// MARK: - tmux multiplexer (Phase 1.1)
+
+/// Lightweight, synchronous wrappers around `multiplexer.tmux.*` RPCs.
+/// Used by `TmuxRelayWindowController` to discover panes, mirror layout,
+/// and trigger splits without re-implementing the JSON-RPC plumbing.
+extension TermMeshDaemon {
+    struct TmuxAttachResult {
+        let surfaceId: String
+        let host: String
+        let session: String
+    }
+
+    struct TmuxPaneInfo: Equatable {
+        let paneId: String
+        let paneIndex: Int
+        let active: Bool
+        let width: UInt16
+        let height: UInt16
+        let command: String
+    }
+
+    /// Mirrors the daemon's JSON encoding: every node carries cell coords,
+    /// leaves add `paneIndex`, splits add `children`.
+    struct TmuxLayoutNode: Equatable {
+        enum Kind: String { case pane, horizontal, vertical }
+        let kind: Kind
+        let cols: UInt16
+        let rows: UInt16
+        let x: UInt16
+        let y: UInt16
+        let paneIndex: Int?
+        let children: [TmuxLayoutNode]
+    }
+
+    func tmuxAttach(
+        host: String,
+        session: String,
+        cols: UInt16,
+        rows: UInt16,
+        createIfMissing: Bool
+    ) -> TmuxAttachResult? {
+        let params: [String: Any] = [
+            "host": host,
+            "session": session,
+            "cols": Int(cols),
+            "rows": Int(rows),
+            "create_if_missing": createIfMissing,
+        ]
+        guard let resp = rpcCall(method: "multiplexer.tmux.attach", params: params) as? [String: Any],
+              let surfaceId = resp["surface_id"] as? String else { return nil }
+        return TmuxAttachResult(
+            surfaceId: surfaceId,
+            host: resp["host"] as? String ?? host,
+            session: resp["session"] as? String ?? session
+        )
+    }
+
+    func tmuxListPanes(surfaceId: String) -> [TmuxPaneInfo]? {
+        guard let resp = rpcCall(
+            method: "multiplexer.tmux.list_panes",
+            params: ["surface_id": surfaceId]
+        ) as? [String: Any],
+              let raw = resp["panes"] as? [[String: Any]] else { return nil }
+        return raw.compactMap { dict -> TmuxPaneInfo? in
+            guard let paneId = dict["pane_id"] as? String,
+                  let paneIndex = (dict["pane_index"] as? NSNumber)?.intValue,
+                  let active = dict["active"] as? Bool,
+                  let width = (dict["width"] as? NSNumber)?.uint16Value,
+                  let height = (dict["height"] as? NSNumber)?.uint16Value else { return nil }
+            return TmuxPaneInfo(
+                paneId: paneId,
+                paneIndex: paneIndex,
+                active: active,
+                width: width,
+                height: height,
+                command: dict["command"] as? String ?? ""
+            )
+        }
+    }
+
+    /// Register an additional pane on an already-attached session. Returns
+    /// the new surface_id paired with the same backend, ready for the
+    /// secondary relay binary to consume via `TERMMESH_TMUX_SURFACE_ID`.
+    func tmuxAttachPane(
+        surfaceId: String,
+        paneId: String,
+        cols: UInt16,
+        rows: UInt16
+    ) -> String? {
+        let params: [String: Any] = [
+            "surface_id": surfaceId,
+            "pane_id": paneId,
+            "cols": Int(cols),
+            "rows": Int(rows),
+        ]
+        guard let resp = rpcCall(method: "multiplexer.tmux.attach_pane", params: params) as? [String: Any],
+              let newId = resp["surface_id"] as? String else { return nil }
+        return newId
+    }
+
+    func tmuxGetLayout(surfaceId: String) -> TmuxLayoutNode? {
+        guard let resp = rpcCall(
+            method: "multiplexer.tmux.get_layout",
+            params: ["surface_id": surfaceId]
+        ) as? [String: Any],
+              let tree = resp["tree"] as? [String: Any] else { return nil }
+        return parseLayoutNode(tree)
+    }
+
+    /// Send a workspace control command (split-pane / kill-pane / select-pane).
+    /// Returns true on RPC success.
+    @discardableResult
+    func tmuxControl(
+        surfaceId: String,
+        command: String,
+        paneId: String,
+        direction: String? = nil
+    ) -> Bool {
+        var params: [String: Any] = [
+            "surface_id": surfaceId,
+            "command": command,
+            "pane_id": paneId,
+        ]
+        if let direction { params["direction"] = direction }
+        return rpcCall(method: "multiplexer.tmux.control", params: params) != nil
+    }
+
+    private func parseLayoutNode(_ dict: [String: Any]) -> TmuxLayoutNode? {
+        guard let kindStr = dict["kind"] as? String,
+              let kind = TmuxLayoutNode.Kind(rawValue: kindStr),
+              let cols = (dict["cols"] as? NSNumber)?.uint16Value,
+              let rows = (dict["rows"] as? NSNumber)?.uint16Value,
+              let x = (dict["x"] as? NSNumber)?.uint16Value,
+              let y = (dict["y"] as? NSNumber)?.uint16Value else { return nil }
+        let paneIndex = (dict["pane_index"] as? NSNumber)?.intValue
+        let childDicts = dict["children"] as? [[String: Any]] ?? []
+        let children = childDicts.compactMap { parseLayoutNode($0) }
+        return TmuxLayoutNode(
+            kind: kind,
+            cols: cols,
+            rows: rows,
+            x: x,
+            y: y,
+            paneIndex: paneIndex,
+            children: children
+        )
+    }
+}
