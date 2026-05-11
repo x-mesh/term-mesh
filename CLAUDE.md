@@ -238,6 +238,15 @@ tm-agent reports --summary                    # headers + concise summaries, ful
 tm-agent wait --timeout 120 --mode any
 tm-agent brief <agent>
 
+# Parallel delegation pattern — when multiple agents share the same name
+# (e.g. team created with 2+ executors all named "executor"), `tm-agent delegate executor`
+# routes to whichever instance is currently idle. To run two executors in parallel:
+#   1. tm-agent delegate executor 'task A'   # picked up by first idle executor
+#   2. tm-agent delegate executor 'task B'   # picked up by the OTHER executor (now idle)
+# Do NOT delegate the same task twice expecting parallel work — both executors would
+# silently start the same task. The queue-based router only diverges when the first
+# delegate has already been claimed.
+
 # Agent task lifecycle
 tm-agent task start <task_id>
 tm-agent task block <task_id> '<reason>'
