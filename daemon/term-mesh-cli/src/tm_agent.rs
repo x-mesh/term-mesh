@@ -690,6 +690,18 @@ enum TmuxCommands {
         /// surface_id returned by `attach`
         surface_id: String,
     },
+    /// Stream PTY output from a surface as JSONL (one JSON object per line).
+    ///
+    /// Each line is {"kind":"output","surface_id":"...","pane_id":"...","bytes_hex":"..."}.
+    /// Keepalive pings arrive as {"kind":"keepalive"}.
+    /// Press Ctrl-C or let --timeout-secs elapse to stop.
+    Subscribe {
+        /// surface_id returned by `attach`
+        surface_id: String,
+        /// Stop after N seconds (default: 0 = run until Ctrl-C)
+        #[arg(long, default_value_t = 0)]
+        timeout_secs: u64,
+    },
 }
 
 #[derive(Subcommand)]
@@ -3629,6 +3641,10 @@ fn main() {
                         "multiplexer.tmux.detach",
                         json!({ "surface_id": surface_id }),
                     ),
+                    TmuxCommands::Subscribe { surface_id, timeout_secs } => {
+                        run_subscribe_tmux(&daemon_sock, &surface_id, timeout_secs);
+                        return;
+                    }
                 }
             }
         }
@@ -6150,6 +6166,59 @@ fn run_watch(
                         eprintln!("[watch] stream error: {e}");
                         break;
                     }
+                }
+            }
+        }
+    }
+}
+
+/// Connect to `multiplexer.tmux.subscribe` and print JSONL output frames to stdout.
+fn run_subscribe_tmux(sock: &PathBuf, surface_id: &str, timeout_secs: u64) {
+    let timeout_ms: Option<u64> = if timeout_secs > 0 { Some(timeout_secs * 1000) } else { None };
+    let request = json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "multiplexer.tmux.subscribe",
+        "params": { "surface_id": surface_id, "timeout_ms": timeout_ms },
+    });
+
+    let stream = match UnixStream::connect(sock) {
+        Ok(s) => s,
+        Err(e) => { eprintln!("error: cannot connect to daemon socket: {e}"); process::exit(1); }
+    };
+
+    let read_timeout_secs: u64 = if timeout_secs > 0 { timeout_secs.saturating_add(10) } else { 90 };
+    stream.set_read_timeout(Some(Duration::from_secs(read_timeout_secs))).ok();
+    stream.set_write_timeout(Some(Duration::from_secs(10))).ok();
+
+    let mut writer = stream.try_clone().unwrap_or_else(|e| { eprintln!("error: {e}"); process::exit(1); });
+    let mut payload = serde_json::to_string(&request).expect("serialization cannot fail");
+    payload.push('\n');
+    if let Err(e) = writer.write_all(payload.as_bytes()) {
+        eprintln!("error: failed to send subscribe request: {e}"); process::exit(1);
+    }
+    writer.flush().ok();
+
+    eprintln!("[subscribe] surface={surface_id} timeout={}s", timeout_secs);
+
+    let mut reader = BufReader::new(&stream);
+    let mut line = String::new();
+    loop {
+        line.clear();
+        match reader.read_line(&mut line) {
+            Ok(0) => break,
+            Ok(_) => {
+                let trimmed = line.trim_end_matches('\n').trim_end_matches('\r');
+                if !trimmed.is_empty() { println!("{trimmed}"); }
+            }
+            Err(e) => {
+                use std::io::ErrorKind;
+                match e.kind() {
+                    ErrorKind::WouldBlock | ErrorKind::TimedOut => {
+                        if timeout_secs > 0 { eprintln!("[subscribe] read timeout; exiting"); break; }
+                        continue;
+                    }
+                    _ => { eprintln!("[subscribe] stream error: {e}"); break; }
                 }
             }
         }

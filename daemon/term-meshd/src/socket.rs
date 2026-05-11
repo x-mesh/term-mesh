@@ -241,6 +241,9 @@ async fn handle_connection(stream: tokio::net::UnixStream, ctx: &Context) -> any
         if req.method == "events.subscribe" {
             return stream_subscribe_events(req, writer, ctx).await;
         }
+        if req.method == "multiplexer.tmux.subscribe" {
+            return stream_subscribe_tmux_output(req, writer, ctx).await;
+        }
 
         let resp = dispatch(&req, ctx).await;
 
@@ -375,6 +378,128 @@ async fn stream_subscribe_events(
     }
 
     Ok(())
+}
+
+/// Streaming handler for `multiplexer.tmux.subscribe`.
+///
+/// Streams JSONL-encoded `%output` frames from a live tmux backend until
+/// the timeout expires or the client disconnects.  Keepalive pings every 30 s.
+async fn stream_subscribe_tmux_output(
+    req: Request,
+    mut writer: tokio::net::unix::OwnedWriteHalf,
+    ctx: &Context,
+) -> anyhow::Result<()> {
+    #[derive(serde::Deserialize)]
+    struct SubscribeParams {
+        surface_id: String,
+        #[serde(default)]
+        timeout_ms: Option<u64>,
+    }
+    let p: SubscribeParams = match serde_json::from_value(req.params.clone()) {
+        Ok(p) => p,
+        Err(e) => {
+            let resp = Response {
+                id: req.id,
+                result: None,
+                error: Some(RpcError { code: -32602, message: format!("invalid params: {e}") }),
+            };
+            let mut buf = serde_json::to_vec(&resp)?;
+            buf.push(b'\n');
+            let _ = writer.write_all(&buf).await;
+            return Ok(());
+        }
+    };
+
+    let backend = ctx.tmux_backends.read().await.get(&p.surface_id).map(Arc::clone);
+    let backend = match backend {
+        Some(b) => b,
+        None => {
+            let resp = Response {
+                id: req.id,
+                result: None,
+                error: Some(RpcError { code: -32602, message: format!("unknown surface_id: {}", p.surface_id) }),
+            };
+            let mut buf = serde_json::to_vec(&resp)?;
+            buf.push(b'\n');
+            let _ = writer.write_all(&buf).await;
+            return Ok(());
+        }
+    };
+
+    let mut output_rx = backend.subscribe_output();
+
+    // ACK.
+    let ack = serde_json::json!({ "id": req.id, "result": { "status": "subscribed", "surface_id": p.surface_id }, "error": null });
+    let mut buf = serde_json::to_vec(&ack)?;
+    buf.push(b'\n');
+    timeout(Duration::from_secs(5), writer.write_all(&buf))
+        .await
+        .map_err(|_| anyhow::anyhow!("ack write timeout"))??;
+
+    let deadline = p.timeout_ms.map(|ms| tokio::time::Instant::now() + Duration::from_millis(ms));
+    let mut ping_interval = tokio::time::interval(Duration::from_secs(30));
+    ping_interval.tick().await;
+
+    loop {
+        let line: Option<Vec<u8>> = if let Some(dl) = deadline {
+            tokio::select! {
+                _ = tokio::time::sleep_until(dl) => break,
+                _ = ping_interval.tick() => {
+                    Some(serde_json::to_vec(&serde_json::json!({"kind":"keepalive"}))?)
+                }
+                recv = output_rx.recv() => {
+                    match recv {
+                        Ok(frame) => Some(serialize_output_frame(&frame)),
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                            tracing::warn!("multiplexer.tmux.subscribe: lagged by {n} frames");
+                            Some(serde_json::to_vec(&serde_json::json!({"kind":"warning","msg":"lagged"}))?)
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                    }
+                }
+            }
+        } else {
+            tokio::select! {
+                _ = ping_interval.tick() => {
+                    Some(serde_json::to_vec(&serde_json::json!({"kind":"keepalive"}))?)
+                }
+                recv = output_rx.recv() => {
+                    match recv {
+                        Ok(frame) => Some(serialize_output_frame(&frame)),
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                            tracing::warn!("multiplexer.tmux.subscribe: lagged by {n} frames");
+                            Some(serde_json::to_vec(&serde_json::json!({"kind":"warning","msg":"lagged"}))?)
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                    }
+                }
+            }
+        };
+
+        if let Some(mut payload) = line {
+            payload.push(b'\n');
+            if timeout(Duration::from_secs(5), writer.write_all(&payload))
+                .await
+                .is_err()
+            {
+                break;
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Encode an `OutputFrame` as a JSONL payload with hex-encoded bytes.
+fn serialize_output_frame(frame: &crate::multiplexer::tmux::OutputFrame) -> Vec<u8> {
+    let hex: String = frame.bytes.iter().map(|b| format!("{b:02x}")).collect();
+    serde_json::to_vec(&serde_json::json!({
+        "kind": "output",
+        "surface_id": frame.surface_id.0,
+        "pane_id": frame.pane_id,
+        "bytes_hex": hex,
+    }))
+    .unwrap_or_default()
 }
 
 /// Serialize `ev` to JSONL bytes if its kind is in `filter_kinds` and (when

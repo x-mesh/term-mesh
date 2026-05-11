@@ -16,13 +16,23 @@ pub mod surface;
 use std::collections::HashMap;
 use std::sync::Arc;
 use anyhow::{anyhow, Result};
-use tokio::sync::{mpsc, RwLock};
+use tokio::sync::{broadcast, mpsc, RwLock};
 
 use crate::multiplexer::{
     CellSize, RemoteMultiplexerBackend, RemoteSurfaceStream, RemoteWorkspace,
     SurfaceId, WorkspaceControl,
 };
 use surface::SurfaceMap;
+
+/// A parsed PTY output frame from a remote tmux pane.  Broadcast to all active
+/// `subscribe_output()` receivers.
+#[derive(Clone)]
+pub struct OutputFrame {
+    pub surface_id: SurfaceId,
+    /// Raw tmux pane-id (e.g. `%1`).
+    pub pane_id: String,
+    pub bytes: Vec<u8>,
+}
 
 /// Backend handle for a single remote `ssh tmux -CC` session.
 pub struct TmuxControlBackend {
@@ -35,6 +45,9 @@ pub struct TmuxControlBackend {
     tmux_session: Arc<RwLock<Option<Arc<session::TmuxSession>>>>,
     /// Per-surface byte-stream senders, keyed by SurfaceId.
     surface_senders: Arc<RwLock<HashMap<SurfaceId, mpsc::Sender<Vec<u8>>>>>,
+    /// Broadcast channel: every parsed %output frame is sent here so multiple
+    /// `subscribe_output()` callers can each receive a copy.
+    output_tx: broadcast::Sender<OutputFrame>,
 }
 
 impl TmuxControlBackend {
@@ -43,13 +56,24 @@ impl TmuxControlBackend {
     /// The SSH process is not started until `attach_surface` is called for the
     /// first time.
     pub fn new(host: impl Into<String>, session: impl Into<String>) -> Self {
+        let (output_tx, _) = broadcast::channel(256);
         Self {
             host: host.into(),
             session_name: session.into(),
             surface_map: SurfaceMap::new(),
             tmux_session: Arc::new(RwLock::new(None)),
             surface_senders: Arc::new(RwLock::new(HashMap::new())),
+            output_tx,
         }
+    }
+
+    /// Subscribe to all parsed PTY output frames from this backend.
+    ///
+    /// Returns a broadcast receiver that yields one `OutputFrame` per `%output`
+    /// event received from the remote tmux session.  Multiple callers get
+    /// independent receivers.
+    pub fn subscribe_output(&self) -> broadcast::Receiver<OutputFrame> {
+        self.output_tx.subscribe()
     }
 
     /// Test-only: inject a pre-built session and register a surface mapping.
@@ -99,14 +123,20 @@ impl RemoteMultiplexerBackend for TmuxControlBackend {
             // Retain the session handle for send_input / resize.
             *sess_guard = Some(Arc::clone(&sess));
 
-            // Demux task: fan-out raw PTY output to per-surface channels.
+            // Demux task: fan-out raw PTY output to per-surface channels and
+            // to the broadcast channel for subscribe_output() callers.
             let senders = Arc::clone(&self.surface_senders);
+            let output_tx = self.output_tx.clone();
             let mut demux_rx = session_rx;
             tokio::spawn(async move {
                 while let Some((sid, bytes)) = demux_rx.recv().await {
+                    // Per-surface mpsc (existing consumers).
                     if let Some(tx) = senders.read().await.get(&sid) {
-                        let _ = tx.send(bytes).await;
+                        let _ = tx.send(bytes.clone()).await;
                     }
+                    // Broadcast to all subscribe_output() receivers.
+                    let pane_id = sid.0.clone();
+                    let _ = output_tx.send(OutputFrame { surface_id: sid, pane_id, bytes });
                 }
             });
         }
