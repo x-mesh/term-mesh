@@ -2,6 +2,15 @@
 
 All notable changes to term-mesh are documented here.
 
+## [0.109.0] - 2026-05-11
+
+### Fixed
+- **Plain ASCII characters no longer double when typing in TUI applications such as claude code** — the `termMesh_performKeyEquivalent` window swizzle forwarded non-Command key events to the Ghostty surface but returned the surface's raw result. When that came back `false` (which it does for ordinary letters that aren't a keyboard binding), AppKit re-dispatched the same `NSEvent` through `keyDown`, firing `ghostty_surface_key` twice and producing duplicated characters. The swizzle now snapshots the first responder, calls `keyDown` itself exactly once on a `false` return, and tells AppKit the event was consumed — except when `performKeyEquivalent` moved focus (e.g. into the IME bar), in which case the original `false` return is preserved so the new responder still receives the key. The Cmd-modifier, font-zoom, and IME `markedText` paths are unchanged.
+
+### Thanks to 1 contributor!
+
+- [@JINWOO-J](https://github.com/JINWOO-J)
+
 ## [0.108.0] - 2026-05-11
 
 ### Fixed
