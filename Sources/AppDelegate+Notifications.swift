@@ -61,17 +61,48 @@ extension AppDelegate {
         }
     }
 
-    func enforceSingleInstance() {
-        guard let bundleId = Bundle.main.bundleIdentifier else { return }
+    func enforceSingleInstance() -> Bool {
+        guard let bundleId = Bundle.main.bundleIdentifier else { return true }
         let currentPid = ProcessInfo.processInfo.processIdentifier
 
-        for app in NSRunningApplication.runningApplications(withBundleIdentifier: bundleId) {
-            guard app.processIdentifier != currentPid else { continue }
-            app.terminate()
-            if !app.isTerminated {
-                _ = app.forceTerminate()
+        let existing = NSRunningApplication
+            .runningApplications(withBundleIdentifier: bundleId)
+            .first { app in
+                app.processIdentifier != currentPid && !app.isTerminated
             }
+        guard let existing else { return true }
+
+        let alert = NSAlert()
+        alert.messageText = "term-mesh is already running. Switch to existing instance?"
+        alert.informativeText = "Running two copies with the same bundle identifier can race on the app socket. Tagged dev builds with distinct bundle identifiers are not blocked."
+        alert.alertStyle = .warning
+        alert.addButton(withTitle: "Activate Existing")
+        alert.addButton(withTitle: "Quit This")
+        alert.addButton(withTitle: "Run Anyway (dev mode)")
+
+        if isDevelopmentInstance() {
+            alert.buttons[0].keyEquivalent = ""
+            alert.buttons[2].keyEquivalent = "\r"
         }
+
+        switch alert.runModal() {
+        case .alertFirstButtonReturn:
+            existing.activate(options: [.activateAllWindows, .activateIgnoringOtherApps])
+            NSApp.terminate(nil)
+            return false
+        case .alertSecondButtonReturn:
+            NSApp.terminate(nil)
+            return false
+        default:
+            return true
+        }
+    }
+
+    func isDevelopmentInstance() -> Bool {
+        let env = ProcessInfo.processInfo.environment
+        if let tag = env["TERMMESH_TAG"], !tag.isEmpty { return true }
+        if let tag = env["CMUX_TAG"], !tag.isEmpty { return true }
+        return SocketControlSettings.isDebugLikeBundleIdentifier(Bundle.main.bundleIdentifier)
     }
 
     func observeDuplicateLaunches() {
@@ -87,11 +118,9 @@ extension AppDelegate {
             guard let app = notification.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication else { return }
             guard app.bundleIdentifier == bundleId, app.processIdentifier != currentPid else { return }
 
-            app.terminate()
-            if !app.isTerminated {
-                _ = app.forceTerminate()
-            }
-            NSRunningApplication.current.activate(options: [.activateAllWindows, .activateIgnoringOtherApps])
+            // The newly launched process owns the duplicate-instance prompt.
+            // Keep the existing app non-destructive so a prod instance never
+            // kills another process that may still be showing that decision.
         }
     }
 

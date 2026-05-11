@@ -225,6 +225,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         }
 #endif
 
+        if !isRunningUnderXCTest && !enforceSingleInstance() {
+            return
+        }
+
         // Peer federation: opt-in auto-start via `TERMMESH_PEER_SERVER_PATH`
         // (or its legacy `TERMMESH_DEBUG_PEER_SERVER_PATH` alias). Without
         // the env var the user must manually start the server from the
@@ -307,7 +311,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
             DispatchQueue.main.async { [weak self] in
                 guard let self else { return }
                 self.registerLaunchServicesBundle()
-                self.enforceSingleInstance()
                 self.observeDuplicateLaunches()
             }
         }

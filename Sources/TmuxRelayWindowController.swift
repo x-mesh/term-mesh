@@ -192,6 +192,19 @@ final class TmuxMenuCoordinator: NSObject {
     static let shared = TmuxMenuCoordinator()
     private var openControllers: [TmuxRelayWindowController] = []
 
+    private struct TmuxPaneOption {
+        let index: Int
+        let paneID: String
+        let command: String
+        let active: Bool
+
+        var displayTitle: String {
+            let commandLabel = command.isEmpty ? "unknown" : command
+            let state = active ? ", active" : ""
+            return "pane \(index) (\(paneID), \(commandLabel)\(state))"
+        }
+    }
+
     @MainActor
     @objc func promptAndConnect(_ sender: Any?) {
         let alert = NSAlert()
@@ -224,11 +237,169 @@ final class TmuxMenuCoordinator: NSObject {
         let session = sessionField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !host.isEmpty, !session.isEmpty else { return }
 
+        Task { [weak self] in
+            let panes = await Self.listPanesViaSSH(host: host, session: session)
+            if panes.count >= 2,
+               let selectedPane = Self.promptForPaneSelection(host: host, session: session, panes: panes) {
+                let didSelect = await Self.selectPaneViaSSH(host: host, paneID: selectedPane.paneID)
+                if !didSelect {
+                    let shouldContinue = Self.confirmPaneSelectionFailure(pane: selectedPane)
+                    guard shouldContinue else { return }
+                }
+            } else if panes.count >= 2 {
+                return
+            }
+
+            self?.openRelay(host: host, session: session)
+        }
+    }
+
+    @MainActor
+    private func openRelay(host: String, session: String) {
         // TermMeshDaemon.shared.socketPath is the authoritative socket path
         // (already set via LSEnvironment or setenv in startDaemon).
         let daemonSocket = TermMeshDaemon.shared.socketPath
         let controller = TmuxRelayWindowController(host: host, session: session, daemonSocket: daemonSocket)
         openControllers.append(controller)
         controller.show()
+    }
+
+    private static func listPanesViaSSH(host: String, session: String) async -> [TmuxPaneOption] {
+        let format = "#{pane_index}\t#{pane_id}\t#{pane_current_command}\t#{pane_active}"
+        let command = [
+            "tmux",
+            "list-panes",
+            "-t",
+            shellQuote(session),
+            "-F",
+            shellQuote(format),
+        ].joined(separator: " ")
+        let result = await runSSHCommand(host: host, command: command, timeout: 6)
+        guard result.exitCode == 0, !result.stdout.isEmpty else { return [] }
+        return parsePaneList(result.stdout)
+    }
+
+    private static func selectPaneViaSSH(host: String, paneID: String) async -> Bool {
+        let command = "tmux select-pane -t \(shellQuote(paneID))"
+        let result = await runSSHCommand(host: host, command: command, timeout: 6)
+        return result.exitCode == 0 && !result.timedOut
+    }
+
+    @MainActor
+    private static func promptForPaneSelection(
+        host: String,
+        session: String,
+        panes: [TmuxPaneOption]
+    ) -> TmuxPaneOption? {
+        let alert = NSAlert()
+        alert.messageText = "Choose a tmux pane"
+        alert.informativeText = "\(session) on \(host) has multiple panes. Select the pane to show before connecting."
+        alert.addButton(withTitle: "Connect")
+        alert.addButton(withTitle: "Cancel")
+
+        let stackView = NSStackView(frame: NSRect(x: 0, y: 0, width: 420, height: 30))
+        stackView.orientation = .vertical
+        stackView.spacing = 8
+        stackView.alignment = .leading
+
+        let popup = NSPopUpButton(frame: NSRect(x: 0, y: 0, width: 420, height: 26), pullsDown: false)
+        for pane in panes {
+            popup.addItem(withTitle: pane.displayTitle)
+        }
+        if let activeIndex = panes.firstIndex(where: \.active) {
+            popup.selectItem(at: activeIndex)
+        }
+        stackView.addArrangedSubview(popup)
+        alert.accessoryView = stackView
+
+        guard alert.runModal() == .alertFirstButtonReturn else { return nil }
+        let selectedIndex = max(0, popup.indexOfSelectedItem)
+        guard panes.indices.contains(selectedIndex) else { return panes.first }
+        return panes[selectedIndex]
+    }
+
+    @MainActor
+    private static func confirmPaneSelectionFailure(pane: TmuxPaneOption) -> Bool {
+        let alert = NSAlert()
+        alert.messageText = "Could not select \(pane.displayTitle)"
+        alert.informativeText = "term-mesh can still connect, but tmux may open on the session's current active pane."
+        alert.alertStyle = .warning
+        alert.addButton(withTitle: "Continue Default")
+        alert.addButton(withTitle: "Cancel")
+        return alert.runModal() == .alertFirstButtonReturn
+    }
+
+    private struct SSHResult {
+        let exitCode: Int32
+        let stdout: String
+        let stderr: String
+        let timedOut: Bool
+    }
+
+    private static func runSSHCommand(host: String, command: String, timeout: TimeInterval) async -> SSHResult {
+        await Task.detached(priority: .userInitiated) {
+            guard !host.hasPrefix("-") else {
+                return SSHResult(exitCode: 64, stdout: "", stderr: "invalid host", timedOut: false)
+            }
+
+            let process = Process()
+            process.executableURL = URL(fileURLWithPath: "/usr/bin/ssh")
+            process.arguments = [
+                "-o", "ConnectTimeout=5",
+                host,
+                command,
+            ]
+
+            let stdoutPipe = Pipe()
+            let stderrPipe = Pipe()
+            process.standardOutput = stdoutPipe
+            process.standardError = stderrPipe
+
+            do {
+                try process.run()
+            } catch {
+                return SSHResult(exitCode: 127, stdout: "", stderr: String(describing: error), timedOut: false)
+            }
+
+            let deadline = Date().addingTimeInterval(timeout)
+            var timedOut = false
+            while process.isRunning && Date() < deadline {
+                usleep(50_000)
+            }
+
+            if process.isRunning {
+                timedOut = true
+                process.terminate()
+            }
+            process.waitUntilExit()
+
+            let stdoutData = stdoutPipe.fileHandleForReading.readDataToEndOfFile()
+            let stderrData = stderrPipe.fileHandleForReading.readDataToEndOfFile()
+            return SSHResult(
+                exitCode: timedOut ? 124 : process.terminationStatus,
+                stdout: String(data: stdoutData, encoding: .utf8) ?? "",
+                stderr: String(data: stderrData, encoding: .utf8) ?? "",
+                timedOut: timedOut
+            )
+        }.value
+    }
+
+    private static func parsePaneList(_ output: String) -> [TmuxPaneOption] {
+        output
+            .split(separator: "\n", omittingEmptySubsequences: true)
+            .compactMap { line -> TmuxPaneOption? in
+                let columns = line.split(separator: "\t", omittingEmptySubsequences: false)
+                guard columns.count >= 4, let index = Int(columns[0]) else { return nil }
+                return TmuxPaneOption(
+                    index: index,
+                    paneID: String(columns[1]),
+                    command: String(columns[2]),
+                    active: columns[3] == "1"
+                )
+            }
+    }
+
+    private static func shellQuote(_ value: String) -> String {
+        "'\(value.replacingOccurrences(of: "'", with: "'\\''"))'"
     }
 }
