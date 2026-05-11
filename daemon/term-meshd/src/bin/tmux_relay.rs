@@ -270,7 +270,28 @@ async fn main() -> Result<()> {
     // and the result looks "broken" with stretched separators.
     push_resize(&sock, &surface_id).await;
 
-    // Step 1c: keep the remote pane in sync when the local window resizes.
+    // Step 1c: seed the screen with the current pane content so the TUI
+    // renders immediately (ADR 0002 "scrollback seed").  Called after
+    // push_resize so tmux already knows our actual terminal size and the
+    // captured screen is rendered at the right width.  Best-effort:
+    // errors are silently ignored so attach is never disrupted.
+    if let Ok(cap) = rpc(
+        &sock,
+        "multiplexer.tmux.capture",
+        json!({ "surface_id": &surface_id }),
+    )
+    .await
+    {
+        let hex = cap["result"]["bytes_hex"].as_str().unwrap_or("");
+        let seed_bytes = decode_hex(hex);
+        if !seed_bytes.is_empty() {
+            let mut stdout = tokio::io::stdout();
+            let _ = stdout.write_all(&seed_bytes).await;
+            let _ = stdout.flush().await;
+        }
+    }
+
+    // Step 1d: keep the remote pane in sync when the local window resizes.
     // SIGWINCH fires on every NSWindow drag. We re-emit a resize RPC and
     // let the daemon translate it into `refresh-client -C cols x rows`.
     let resize_sock = sock.clone();

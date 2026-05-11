@@ -1532,6 +1532,34 @@ async fn dispatch(req: &Request, ctx: &Context) -> Response {
             }
         }
 
+        "multiplexer.tmux.capture" => {
+            // ADR 0002 "scrollback seed": capture current visible screen of the
+            // attached pane and return it as hex-encoded bytes.  The relay calls
+            // this once after attach+resize so the TUI renders immediately without
+            // waiting for the first live %output event.
+            #[derive(Deserialize)]
+            struct Params {
+                surface_id: String,
+                /// Optional scrollback line count. None = visible screen only.
+                #[serde(default)]
+                lines: Option<i32>,
+            }
+            match serde_json::from_value::<Params>(req.params.clone()) {
+                Ok(p) => {
+                    let backend = ctx.tmux_backends.read().await.get(&p.surface_id).map(Arc::clone);
+                    match backend {
+                        None => Err(format!("unknown surface_id: {}", p.surface_id)),
+                        Some(b) => {
+                            let bytes = b.capture_pane(p.lines).await;
+                            let hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+                            Ok(serde_json::json!({ "bytes_hex": hex }))
+                        }
+                    }
+                }
+                Err(e) => Err(format!("invalid params: {e}")),
+            }
+        }
+
         _ => Err(format!("unknown method: {}", req.method)),
     };
 

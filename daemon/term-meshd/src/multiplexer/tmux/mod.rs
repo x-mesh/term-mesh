@@ -88,6 +88,50 @@ impl TmuxControlBackend {
     pub fn inject_output_frame_for_test(&self, frame: OutputFrame) {
         let _ = self.output_tx.send(frame);
     }
+
+    /// Capture the current visible screen of the first pane in the session.
+    ///
+    /// Runs `ssh <host> tmux capture-pane -e -p -t <session>:0` as a one-shot
+    /// subprocess and returns raw stdout.  The `-e` flag preserves ANSI escape
+    /// sequences (colour, SGR) so the client TUI re-renders correctly.
+    ///
+    /// If `lines` is `Some(n)`, also includes up to `n` lines of scrollback
+    /// via `-S -<n>`.  If `None`, only the visible screen (default tmux
+    /// behaviour) is captured.
+    ///
+    /// Always succeeds: returns empty bytes on any error so callers do not
+    /// need to handle failures (ADR 0002 "scrollback seed" — attach must
+    /// succeed even when capture is unavailable).
+    pub async fn capture_pane(&self, lines: Option<i32>) -> Vec<u8> {
+        let cmd = match lines {
+            Some(n) if n > 0 => format!(
+                "tmux capture-pane -e -p -S -{} -t '{}':0",
+                n, self.session_name
+            ),
+            Some(_) => format!(
+                "tmux capture-pane -e -p -S - -E - -t '{}':0",
+                self.session_name
+            ),
+            None => format!(
+                "tmux capture-pane -e -p -t '{}':0",
+                self.session_name
+            ),
+        };
+        match tokio::process::Command::new("ssh")
+            .args([
+                "-o", "StrictHostKeyChecking=accept-new",
+                "-o", "LogLevel=QUIET",
+                "-o", "ConnectTimeout=5",
+                &self.host,
+                &cmd,
+            ])
+            .output()
+            .await
+        {
+            Ok(out) => out.stdout,
+            Err(_) => Vec::new(),
+        }
+    }
 }
 
 impl RemoteMultiplexerBackend for TmuxControlBackend {
