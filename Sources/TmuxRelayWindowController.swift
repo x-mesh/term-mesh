@@ -24,9 +24,15 @@ final class TmuxRelayWindowController: NSWindowController, NSWindowDelegate {
     /// surface_id → tmux pane id (e.g. `%1`). Required so split/kill RPCs
     /// can target the focused pane without re-walking list_panes.
     private var paneIds: [String: String] = [:]
-    /// pane_index → surface_id, used while wiring leaf nodes from the
-    /// layout tree to their hosted surface.
+    /// pane_index (0-based within window, from `#{pane_index}`) →
+    /// surface_id. Useful for "find a surface by its slot number"
+    /// queries, but the LAYOUT TREE leaves do not key by this.
     private var paneIndexToSurface: [Int: String] = [:]
+    /// tmux pane id NUMBER (the `N` in `%N`) → surface_id. This is
+    /// what `LayoutNode::Pane.paneIndex` actually carries — the layout
+    /// string from tmux encodes the pane's globally-unique id, not the
+    /// per-window pane_index. Wiring leaf nodes goes through this map.
+    private var paneIdNumberToSurface: [Int: String] = [:]
     /// Primary surface = the active pane at attach time. Anchors the
     /// SSH/tmux session lifecycle; closing the window detaches it.
     private var primarySurfaceId: String?
@@ -175,6 +181,9 @@ final class TmuxRelayWindowController: NSWindowController, NSWindowDelegate {
             surfaces[binding.surfaceId] = surface
             paneIds[binding.surfaceId] = binding.pane.paneId
             paneIndexToSurface[binding.pane.paneIndex] = binding.surfaceId
+            if let idNum = Self.paneIdNumber(from: binding.pane.paneId) {
+                paneIdNumberToSurface[idNum] = binding.surfaceId
+            }
         }
         primarySurfaceId = data.bindings.first?.surfaceId
 
@@ -397,6 +406,9 @@ final class TmuxRelayWindowController: NSWindowController, NSWindowDelegate {
             surfaces[binding.surfaceId] = surface
             paneIds[binding.surfaceId] = binding.pane.paneId
             paneIndexToSurface[binding.pane.paneIndex] = binding.surfaceId
+            if let idNum = Self.paneIdNumber(from: binding.pane.paneId) {
+                paneIdNumberToSurface[idNum] = binding.surfaceId
+            }
         }
 
         // Drop surfaces for panes that no longer exist remotely.
@@ -405,7 +417,10 @@ final class TmuxRelayWindowController: NSWindowController, NSWindowDelegate {
         for idx in stalePaneIndices {
             if let sid = paneIndexToSurface.removeValue(forKey: idx) {
                 surfaces.removeValue(forKey: sid)
-                paneIds.removeValue(forKey: sid)
+                if let removedPaneId = paneIds.removeValue(forKey: sid),
+                   let idNum = Self.paneIdNumber(from: removedPaneId) {
+                    paneIdNumberToSurface.removeValue(forKey: idNum)
+                }
             }
         }
 
@@ -436,11 +451,24 @@ final class TmuxRelayWindowController: NSWindowController, NSWindowDelegate {
 
     // ── Layout → NSSplitView ──────────────────────────────────────────────
 
+    /// Extract `N` from a tmux pane id of the form `%N`. Returns nil if
+    /// the input doesn't start with `%` or the suffix isn't an integer.
+    /// The layout-string parser emits the same integer as `paneIndex` on
+    /// leaf nodes (tmux encodes pane id, not pane_index, in its layout
+    /// dump), so this is how we bridge the two namespaces.
+    fileprivate static func paneIdNumber(from paneId: String) -> Int? {
+        guard paneId.hasPrefix("%") else { return nil }
+        return Int(paneId.dropFirst())
+    }
+
     private func buildLayoutView(_ node: TermMeshDaemon.TmuxLayoutNode) -> NSView? {
         switch node.kind {
         case .pane:
-            guard let idx = node.paneIndex,
-                  let sid = paneIndexToSurface[idx],
+            // `node.paneIndex` is misnamed — it actually carries the tmux
+            // pane id NUMBER (the `N` in `%N`), not the per-window index.
+            // Look up via the pane-id-number map populated at bootstrap.
+            guard let idNum = node.paneIndex,
+                  let sid = paneIdNumberToSurface[idNum],
                   let surface = surfaces[sid] else { return nil }
             return PaneHostView(surfaceId: sid, controller: self, content: surface.hostedView)
         case .horizontal:
