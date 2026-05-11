@@ -38,6 +38,11 @@ pub fn refresh_client_pause(pane_id: &str, paused: bool) -> String {
     format!("refresh-client -A {}:{}", pane_id, flag)
 }
 
+/// Continue a pane paused by the control-mode `pause-after` flag.
+pub fn refresh_client_continue(pane_id: &str) -> String {
+    format!("refresh-client -A {}:continue", pane_id)
+}
+
 /// Lift the global pause for all panes (`refresh-client -A :off`).
 pub fn refresh_client_resume_all() -> String {
     "refresh-client -A :off".to_string()
@@ -92,7 +97,18 @@ mod tests {
 
     #[test]
     fn refresh_client_pause_off() {
-        assert_eq!(refresh_client_pause("%1", false), "refresh-client -A %1:off");
+        assert_eq!(
+            refresh_client_pause("%1", false),
+            "refresh-client -A %1:off"
+        );
+    }
+
+    #[test]
+    fn refresh_client_continue_format() {
+        assert_eq!(
+            refresh_client_continue("%1"),
+            "refresh-client -A %1:continue"
+        );
     }
 
     #[test]
@@ -102,12 +118,18 @@ mod tests {
 
     #[test]
     fn split_window_horizontal_format() {
-        assert_eq!(split_window("%1", SplitDirection::Horizontal), "split-window -h -t %1");
+        assert_eq!(
+            split_window("%1", SplitDirection::Horizontal),
+            "split-window -h -t %1"
+        );
     }
 
     #[test]
     fn split_window_vertical_format() {
-        assert_eq!(split_window("%2", SplitDirection::Vertical), "split-window -v -t %2");
+        assert_eq!(
+            split_window("%2", SplitDirection::Vertical),
+            "split-window -v -t %2"
+        );
     }
 
     #[test]

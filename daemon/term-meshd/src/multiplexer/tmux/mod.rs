@@ -13,16 +13,64 @@ pub mod parser;
 pub mod session;
 pub mod surface;
 
+use anyhow::{anyhow, Result};
 use std::collections::HashMap;
 use std::sync::Arc;
-use anyhow::{anyhow, Result};
 use tokio::sync::{broadcast, mpsc, RwLock};
 
 use crate::multiplexer::{
-    CellSize, RemoteMultiplexerBackend, RemoteSurfaceStream, RemoteWorkspace,
-    SurfaceId, WorkspaceControl,
+    CellSize, RemoteMultiplexerBackend, RemoteSurfaceStream, RemoteWorkspace, SurfaceId,
+    WorkspaceControl,
 };
 use surface::SurfaceMap;
+
+fn shell_single_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+fn capture_pane_commands(
+    target: &str,
+    lines: Option<i32>,
+    alternate_on: Option<bool>,
+) -> Vec<(String, bool)> {
+    let target = shell_single_quote(target);
+    match lines {
+        Some(n) if n > 0 => vec![(
+            format!("tmux capture-pane -e -p -N -S -{} -t {}", n, target),
+            false,
+        )],
+        Some(_) => vec![(
+            format!("tmux capture-pane -e -p -N -S - -E - -t {}", target),
+            false,
+        )],
+        None => {
+            // Do not use -N for visible snapshots. We clear the local screen
+            // first, and replaying full-width trailing spaces can trigger
+            // auto-wrap before the row separator arrives.
+            let primary = (format!("tmux capture-pane -e -p -t {}", target), false);
+            match alternate_on {
+                Some(true) => vec![
+                    // TUIs can run in tmux's alternate screen. Only prefer it
+                    // when tmux says the pane is currently using it; on tmux
+                    // 3.4, `capture-pane -a` succeeds with empty output even
+                    // when alternate screen is off.
+                    (format!("tmux capture-pane -a -q -e -p -t {}", target), true),
+                    primary,
+                ],
+                Some(false) => vec![primary],
+                None => vec![
+                    (format!("tmux capture-pane -a -q -e -p -t {}", target), true),
+                    primary,
+                ],
+            }
+        }
+    }
+}
+
+pub struct TmuxCapture {
+    pub bytes: Vec<u8>,
+    pub alternate_screen: bool,
+}
 
 /// A parsed PTY output frame from a remote tmux pane.  Broadcast to all active
 /// `subscribe_output()` receivers.
@@ -56,7 +104,7 @@ impl TmuxControlBackend {
     /// The SSH process is not started until `attach_surface` is called for the
     /// first time.
     pub fn new(host: impl Into<String>, session: impl Into<String>) -> Self {
-        let (output_tx, _) = broadcast::channel(256);
+        let (output_tx, _) = broadcast::channel(4096);
         Self {
             host: host.into(),
             session_name: session.into(),
@@ -78,7 +126,12 @@ impl TmuxControlBackend {
 
     /// Test-only: inject a pre-built session and register a surface mapping.
     #[cfg(test)]
-    async fn inject_for_test(&self, sess: session::TmuxSession, pane_id: &str, surface_id: SurfaceId) {
+    async fn inject_for_test(
+        &self,
+        sess: session::TmuxSession,
+        pane_id: &str,
+        surface_id: SurfaceId,
+    ) {
         *self.tmux_session.write().await = Some(Arc::new(sess));
         self.surface_map.register(pane_id, surface_id).await;
     }
@@ -96,20 +149,27 @@ impl TmuxControlBackend {
     /// message when it is missing or the SSH connection fails.  Called at the
     /// start of `attach_surface` so callers get an actionable error instead of a
     /// silent SSH failure buried in control-mode startup noise.
-    async fn verify_session_exists(&self) -> Result<()> {
-        let cmd = format!("tmux has-session -t '{}'", self.session_name);
+    async fn ensure_session_exists(&self, size: CellSize, create_if_missing: bool) -> Result<bool> {
+        let quoted_session = shell_single_quote(&self.session_name);
+        let check_cmd = format!("tmux has-session -t {}", quoted_session);
         let out = tokio::process::Command::new("ssh")
             .args([
-                "-o", "BatchMode=yes",
-                "-o", "StrictHostKeyChecking=accept-new",
-                "-o", "ConnectTimeout=5",
+                "-o",
+                "BatchMode=yes",
+                "-o",
+                "StrictHostKeyChecking=accept-new",
+                "-o",
+                "ConnectTimeout=5",
                 &self.host,
-                &cmd,
+                &check_cmd,
             ])
             .output()
             .await
             .map_err(|e| anyhow!("ssh probe failed: {e}"))?;
-        if !out.status.success() {
+        if out.status.success() {
+            return Ok(false);
+        }
+        if !create_if_missing {
             let stderr = String::from_utf8_lossy(&out.stderr);
             return Err(anyhow!(
                 "remote tmux session '{}' not found on {} — {}",
@@ -118,7 +178,37 @@ impl TmuxControlBackend {
                 stderr.trim()
             ));
         }
-        Ok(())
+
+        let create_cmd = format!(
+            "tmux new-session -d -s {} -x {} -y {}",
+            quoted_session,
+            size.cols.max(1),
+            size.rows.max(1)
+        );
+        let create = tokio::process::Command::new("ssh")
+            .args([
+                "-o",
+                "BatchMode=yes",
+                "-o",
+                "StrictHostKeyChecking=accept-new",
+                "-o",
+                "ConnectTimeout=8",
+                &self.host,
+                &create_cmd,
+            ])
+            .output()
+            .await
+            .map_err(|e| anyhow!("ssh create-session failed: {e}"))?;
+        if !create.status.success() {
+            let stderr = String::from_utf8_lossy(&create.stderr);
+            return Err(anyhow!(
+                "remote tmux session '{}' not found and could not be created on {} — {}",
+                self.session_name,
+                self.host,
+                stderr.trim()
+            ));
+        }
+        Ok(true)
     }
 
     /// Capture the current visible screen of the first pane in the session.
@@ -142,7 +232,7 @@ impl TmuxControlBackend {
     /// Always succeeds: returns empty bytes on any error so callers do not
     /// need to handle failures (ADR 0002 "scrollback seed" — attach must
     /// succeed even when capture is unavailable).
-    pub async fn capture_pane(&self, surface_id: &SurfaceId, lines: Option<i32>) -> Vec<u8> {
+    pub async fn capture_pane(&self, surface_id: &SurfaceId, lines: Option<i32>) -> TmuxCapture {
         // Resolve to the same tmux pane id that send_input uses. If we
         // cannot find a mapping yet (capture racing the first %output),
         // fall back to <session>:0 so the seed is at least *something*.
@@ -150,33 +240,69 @@ impl TmuxControlBackend {
             Some(pane_id) => pane_id,
             None => format!("{}:0", self.session_name),
         };
-        let cmd = match lines {
-            Some(n) if n > 0 => format!(
-                "tmux capture-pane -e -p -S -{} -t '{}'",
-                n, target
-            ),
-            Some(_) => format!(
-                "tmux capture-pane -e -p -S - -E - -t '{}'",
-                target
-            ),
-            None => format!(
-                "tmux capture-pane -e -p -t '{}'",
-                target
-            ),
+        let alternate_on = if lines.is_none() {
+            self.pane_alternate_on(&target).await
+        } else {
+            None
         };
-        match tokio::process::Command::new("ssh")
+        for (cmd, alternate_screen) in capture_pane_commands(&target, lines, alternate_on) {
+            if let Ok(out) = tokio::process::Command::new("ssh")
+                .args([
+                    "-o",
+                    "StrictHostKeyChecking=accept-new",
+                    "-o",
+                    "LogLevel=QUIET",
+                    "-o",
+                    "ConnectTimeout=5",
+                    &self.host,
+                    &cmd,
+                ])
+                .output()
+                .await
+            {
+                if out.status.success() {
+                    if alternate_screen && alternate_on.is_none() && out.stdout.is_empty() {
+                        continue;
+                    }
+                    return TmuxCapture {
+                        bytes: out.stdout,
+                        alternate_screen,
+                    };
+                }
+            }
+        }
+        TmuxCapture {
+            bytes: Vec::new(),
+            alternate_screen: false,
+        }
+    }
+
+    async fn pane_alternate_on(&self, target: &str) -> Option<bool> {
+        let cmd = format!(
+            "tmux display-message -p -t {} '#{{alternate_on}}'",
+            shell_single_quote(target)
+        );
+        let out = tokio::process::Command::new("ssh")
             .args([
-                "-o", "StrictHostKeyChecking=accept-new",
-                "-o", "LogLevel=QUIET",
-                "-o", "ConnectTimeout=5",
+                "-o",
+                "StrictHostKeyChecking=accept-new",
+                "-o",
+                "LogLevel=QUIET",
+                "-o",
+                "ConnectTimeout=5",
                 &self.host,
                 &cmd,
             ])
             .output()
             .await
-        {
-            Ok(out) => out.stdout,
-            Err(_) => Vec::new(),
+            .ok()?;
+        if !out.status.success() {
+            return None;
+        }
+        match String::from_utf8_lossy(&out.stdout).trim() {
+            "1" => Some(true),
+            "0" => Some(false),
+            _ => None,
         }
     }
 }
@@ -201,13 +327,40 @@ impl RemoteMultiplexerBackend for TmuxControlBackend {
         surface_id: SurfaceId,
         size: CellSize,
     ) -> Result<RemoteSurfaceStream> {
-        // Fail fast if the session does not exist rather than letting ssh
-        // tmux -CC start and immediately exit with opaque control-mode errors.
-        self.verify_session_exists().await?;
+        self.attach_surface_with_options(surface_id, size, false)
+            .await
+    }
 
-        let (per_surface_tx, per_surface_rx) = mpsc::channel::<Vec<u8>>(256);
+    async fn send_input(&self, surface_id: SurfaceId, bytes: Vec<u8>) -> Result<()> {
+        self.send_input_impl(surface_id, bytes).await
+    }
 
-        self.surface_senders.write().await.insert(surface_id.clone(), per_surface_tx);
+    /// Per ADR 0002 §"Input routing" — encode bytes as hex and forward to the
+    /// tmux pane via `send-keys -H`.
+    async fn resize(&self, surface_id: SurfaceId, size: CellSize) -> Result<()> {
+        self.resize_impl(surface_id, size).await
+    }
+
+    async fn control(&self, command: WorkspaceControl) -> Result<()> {
+        self.control_impl(command).await
+    }
+}
+
+impl TmuxControlBackend {
+    pub async fn attach_surface_with_options(
+        &self,
+        surface_id: SurfaceId,
+        size: CellSize,
+        create_if_missing: bool,
+    ) -> Result<RemoteSurfaceStream> {
+        self.ensure_session_exists(size, create_if_missing).await?;
+
+        let (per_surface_tx, per_surface_rx) = mpsc::channel::<Vec<u8>>(4096);
+
+        self.surface_senders
+            .write()
+            .await
+            .insert(surface_id.clone(), per_surface_tx);
 
         // Start the session process if this is the first attach.
         let mut sess_guard = self.tmux_session.write().await;
@@ -217,7 +370,8 @@ impl RemoteMultiplexerBackend for TmuxControlBackend {
             let sess = Arc::new(raw_sess);
 
             // Send initial terminal size.
-            sess.write_command(&encoder::refresh_client_size(size.cols, size.rows)).await?;
+            sess.write_command(&encoder::refresh_client_size(size.cols, size.rows))
+                .await?;
 
             // Pre-register the real tmux pane_id via a lightweight non-interactive
             // SSH query so that send_input works immediately without waiting for the
@@ -227,14 +381,17 @@ impl RemoteMultiplexerBackend for TmuxControlBackend {
             // treating `#` as a comment character when SSH passes arguments as a
             // space-joined command string to the remote shell.
             let list_panes_cmd = format!(
-                "tmux list-panes -t '{}' -F '#{{pane_id}}'",
-                self.session_name
+                "tmux list-panes -t {} -F '#{{pane_id}}'",
+                shell_single_quote(&self.session_name)
             );
             if let Ok(out) = tokio::process::Command::new("ssh")
                 .args([
-                    "-o", "StrictHostKeyChecking=accept-new",
-                    "-o", "LogLevel=QUIET",
-                    "-o", "ConnectTimeout=5",
+                    "-o",
+                    "StrictHostKeyChecking=accept-new",
+                    "-o",
+                    "LogLevel=QUIET",
+                    "-o",
+                    "ConnectTimeout=5",
                     &self.host,
                     &list_panes_cmd,
                 ])
@@ -242,7 +399,12 @@ impl RemoteMultiplexerBackend for TmuxControlBackend {
                 .await
             {
                 let stdout = String::from_utf8_lossy(&out.stdout);
-                if let Some(pane_id) = stdout.lines().next().map(str::trim).filter(|s| !s.is_empty()) {
+                if let Some(pane_id) = stdout
+                    .lines()
+                    .next()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                {
                     self.surface_map.register(pane_id, surface_id.clone()).await;
                 }
             }
@@ -274,8 +436,16 @@ impl RemoteMultiplexerBackend for TmuxControlBackend {
                         pane_registered = true;
                     }
                     // Per-surface mpsc — keyed by UUID surface_id, not pane_id.
-                    if let Some(tx) = senders.read().await.get(&surface_id_demux) {
-                        let _ = tx.send(bytes.clone()).await;
+                    let per_surface_tx = {
+                        senders
+                            .read()
+                            .await
+                            .get(&surface_id_demux)
+                            .filter(|tx| !tx.is_closed())
+                            .cloned()
+                    };
+                    if let Some(tx) = per_surface_tx {
+                        let _ = tx.try_send(bytes.clone());
                     }
                     // Broadcast with the UUID surface_id so subscribers can
                     // correlate frames back to their attach call.
@@ -292,15 +462,14 @@ impl RemoteMultiplexerBackend for TmuxControlBackend {
         Ok(per_surface_rx)
     }
 
-    /// Per ADR 0002 §"Input routing" — encode bytes as hex and forward to the
-    /// tmux pane via `send-keys -H`.
-    async fn send_input(&self, surface_id: SurfaceId, bytes: Vec<u8>) -> Result<()> {
+    async fn send_input_impl(&self, surface_id: SurfaceId, bytes: Vec<u8>) -> Result<()> {
         let sess_guard = self.tmux_session.read().await;
         let sess = sess_guard
             .as_ref()
             .ok_or_else(|| anyhow!("no active session — call attach_surface first"))?;
 
-        let pane_id = self.surface_map
+        let pane_id = self
+            .surface_map
             .lookup_pane(&surface_id)
             .await
             .ok_or_else(|| anyhow!("unknown surface {:?}", surface_id.0))?;
@@ -312,28 +481,28 @@ impl RemoteMultiplexerBackend for TmuxControlBackend {
     /// Per ADR 0002 §"Resize Policy": resize applies to the tmux client as a
     /// whole (`refresh-client -C`).  `surface_id` is accepted for API symmetry
     /// but is not used to scope the resize to an individual pane.
-    async fn resize(&self, _surface_id: SurfaceId, size: CellSize) -> Result<()> {
+    async fn resize_impl(&self, _surface_id: SurfaceId, size: CellSize) -> Result<()> {
         let sess = self.tmux_session.read().await;
         let sess = sess
             .as_ref()
             .ok_or_else(|| anyhow!("no active session — call attach_surface first"))?;
-        sess.write_command(&encoder::refresh_client_size(size.cols, size.rows)).await
+        sess.write_command(&encoder::refresh_client_size(size.cols, size.rows))
+            .await
     }
 
     /// Per ADR 0002 §"WorkspaceControl encoding" — dispatch pane lifecycle
     /// commands through the control-mode session.
-    async fn control(&self, command: WorkspaceControl) -> Result<()> {
+    async fn control_impl(&self, command: WorkspaceControl) -> Result<()> {
         let sess = self.tmux_session.read().await;
         let sess = sess
             .as_ref()
             .ok_or_else(|| anyhow!("no active session — call attach_surface first"))?;
         let cmd = match command {
-            WorkspaceControl::SplitPane { pane_id, direction } =>
-                encoder::split_window(&pane_id, direction),
-            WorkspaceControl::KillPane { pane_id } =>
-                encoder::kill_pane(&pane_id),
-            WorkspaceControl::SelectPane { pane_id } =>
-                encoder::select_pane(&pane_id),
+            WorkspaceControl::SplitPane { pane_id, direction } => {
+                encoder::split_window(&pane_id, direction)
+            }
+            WorkspaceControl::KillPane { pane_id } => encoder::kill_pane(&pane_id),
+            WorkspaceControl::SelectPane { pane_id } => encoder::select_pane(&pane_id),
         };
         sess.write_command(&cmd).await
     }
@@ -343,10 +512,10 @@ impl RemoteMultiplexerBackend for TmuxControlBackend {
 mod tests {
     use super::*;
     use crate::multiplexer::SplitDirection;
+    use std::time::Duration;
+    use tokio::io::AsyncBufReadExt;
     use tokio::process::Command;
     use tokio::sync::mpsc;
-    use tokio::io::AsyncBufReadExt;
-    use std::time::Duration;
 
     fn make_fake_session() -> (session::TmuxSession, tokio::process::ChildStdout) {
         let mut child = Command::new("cat")
@@ -374,9 +543,14 @@ mod tests {
     #[tokio::test]
     async fn send_input_no_session_returns_error() {
         let backend = TmuxControlBackend::new("localhost", "test-session");
-        let result = backend.send_input(SurfaceId("pane-1".into()), b"hello".to_vec()).await;
+        let result = backend
+            .send_input(SurfaceId("pane-1".into()), b"hello".to_vec())
+            .await;
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("no active session"));
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("no active session"));
     }
 
     #[tokio::test]
@@ -385,7 +559,9 @@ mod tests {
         let (sess, _stdout) = make_fake_session();
         *backend.tmux_session.write().await = Some(Arc::new(sess));
 
-        let result = backend.send_input(SurfaceId("ghost".into()), b"x".to_vec()).await;
+        let result = backend
+            .send_input(SurfaceId("ghost".into()), b"x".to_vec())
+            .await;
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("ghost"));
     }
@@ -394,9 +570,14 @@ mod tests {
     async fn send_input_writes_send_keys_hex_command() {
         let backend = TmuxControlBackend::new("localhost", "test-session");
         let (sess, stdout) = make_fake_session();
-        backend.inject_for_test(sess, "%1", SurfaceId("surf-1".into())).await;
+        backend
+            .inject_for_test(sess, "%1", SurfaceId("surf-1".into()))
+            .await;
 
-        backend.send_input(SurfaceId("surf-1".into()), vec![0x41, 0x42]).await.unwrap();
+        backend
+            .send_input(SurfaceId("surf-1".into()), vec![0x41, 0x42])
+            .await
+            .unwrap();
         assert_eq!(read_line(stdout).await, "send-keys -t %1 -H 41 42");
     }
 
@@ -405,9 +586,14 @@ mod tests {
     #[tokio::test]
     async fn resize_no_session_returns_error() {
         let backend = TmuxControlBackend::new("localhost", "test-session");
-        let result = backend.resize(SurfaceId("s".into()), CellSize { cols: 80, rows: 24 }).await;
+        let result = backend
+            .resize(SurfaceId("s".into()), CellSize { cols: 80, rows: 24 })
+            .await;
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("no active session"));
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("no active session"));
     }
 
     #[tokio::test]
@@ -416,7 +602,16 @@ mod tests {
         let (sess, stdout) = make_fake_session();
         *backend.tmux_session.write().await = Some(Arc::new(sess));
 
-        backend.resize(SurfaceId("s".into()), CellSize { cols: 120, rows: 40 }).await.unwrap();
+        backend
+            .resize(
+                SurfaceId("s".into()),
+                CellSize {
+                    cols: 120,
+                    rows: 40,
+                },
+            )
+            .await
+            .unwrap();
         assert_eq!(read_line(stdout).await, "refresh-client -C 120x40");
     }
 
@@ -428,10 +623,13 @@ mod tests {
         let (sess, stdout) = make_fake_session();
         *backend.tmux_session.write().await = Some(Arc::new(sess));
 
-        backend.control(WorkspaceControl::SplitPane {
-            pane_id: "%1".into(),
-            direction: SplitDirection::Horizontal,
-        }).await.unwrap();
+        backend
+            .control(WorkspaceControl::SplitPane {
+                pane_id: "%1".into(),
+                direction: SplitDirection::Horizontal,
+            })
+            .await
+            .unwrap();
         assert_eq!(read_line(stdout).await, "split-window -h -t %1");
     }
 
@@ -441,7 +639,12 @@ mod tests {
         let (sess, stdout) = make_fake_session();
         *backend.tmux_session.write().await = Some(Arc::new(sess));
 
-        backend.control(WorkspaceControl::KillPane { pane_id: "%2".into() }).await.unwrap();
+        backend
+            .control(WorkspaceControl::KillPane {
+                pane_id: "%2".into(),
+            })
+            .await
+            .unwrap();
         assert_eq!(read_line(stdout).await, "kill-pane -t %2");
     }
 
@@ -451,7 +654,12 @@ mod tests {
         let (sess, stdout) = make_fake_session();
         *backend.tmux_session.write().await = Some(Arc::new(sess));
 
-        backend.control(WorkspaceControl::SelectPane { pane_id: "%3".into() }).await.unwrap();
+        backend
+            .control(WorkspaceControl::SelectPane {
+                pane_id: "%3".into(),
+            })
+            .await
+            .unwrap();
         assert_eq!(read_line(stdout).await, "select-pane -t %3");
     }
 
@@ -492,11 +700,45 @@ mod tests {
         });
 
         let f1 = tokio::time::timeout(Duration::from_millis(200), rx1.recv())
-            .await.unwrap().unwrap();
+            .await
+            .unwrap()
+            .unwrap();
         let f2 = tokio::time::timeout(Duration::from_millis(200), rx2.recv())
-            .await.unwrap().unwrap();
+            .await
+            .unwrap()
+            .unwrap();
 
         assert_eq!(f1.pane_id, "%2");
         assert_eq!(f2.pane_id, "%2");
+    }
+
+    #[test]
+    fn capture_pane_prefers_alternate_screen_for_visible_snapshot() {
+        let cmds = capture_pane_commands("%1", None, Some(true));
+        assert_eq!(cmds.len(), 2);
+        assert!(cmds[0].0.contains("capture-pane -a -q -e -p"));
+        assert!(cmds[0].1);
+        assert!(cmds[1].0.contains("capture-pane -e -p"));
+        assert!(!cmds[1].0.contains(" -a "));
+        assert!(!cmds[1].1);
+        assert!(!cmds[0].0.contains(" -N "));
+    }
+
+    #[test]
+    fn capture_pane_uses_primary_when_alternate_screen_is_off() {
+        let cmds = capture_pane_commands("%1", None, Some(false));
+        assert_eq!(cmds.len(), 1);
+        assert!(cmds[0].0.contains("capture-pane -e -p"));
+        assert!(!cmds[0].0.contains(" -a "));
+        assert!(!cmds[0].1);
+    }
+
+    #[test]
+    fn capture_pane_preserves_trailing_spaces_for_scrollback() {
+        let cmds = capture_pane_commands("%1", Some(200), None);
+        assert_eq!(
+            cmds,
+            vec![("tmux capture-pane -e -p -N -S -200 -t '%1'".into(), false)]
+        );
     }
 }

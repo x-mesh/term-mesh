@@ -20,6 +20,7 @@ use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 use tokio::signal::unix::{signal, SignalKind};
+use tokio::time::{sleep, Duration};
 
 /// Query the controlling TTY (stdout) for its current size. macOS Ghostty
 /// gives the relay a real PTY, so TIOCGWINSZ works against any of stdin/
@@ -32,7 +33,6 @@ fn current_winsize() -> Option<(u16, u16)> {
         ws_xpixel: u16,
         ws_ypixel: u16,
     }
-    const TIOCGWINSZ: libc::c_ulong = 0x40087468;
     let fd = std::io::stdout().as_raw_fd();
     let mut ws = WinSize {
         ws_row: 0,
@@ -40,12 +40,45 @@ fn current_winsize() -> Option<(u16, u16)> {
         ws_xpixel: 0,
         ws_ypixel: 0,
     };
-    let rc = unsafe { libc::ioctl(fd, TIOCGWINSZ, &mut ws as *mut WinSize as *mut libc::c_void) };
+    let rc = unsafe {
+        libc::ioctl(
+            fd,
+            libc::TIOCGWINSZ,
+            &mut ws as *mut WinSize as *mut libc::c_void,
+        )
+    };
     if rc == 0 && ws.ws_col > 0 && ws.ws_row > 0 {
         Some((ws.ws_col, ws.ws_row))
     } else {
         None
     }
+}
+
+fn trim_snapshot_trailing_lf(bytes: &mut Vec<u8>) {
+    if bytes.last() == Some(&b'\n') {
+        bytes.pop();
+    }
+}
+
+async fn paint_remote_snapshot<W>(
+    stdout: &mut W,
+    seed_bytes: &[u8],
+    alternate_screen: bool,
+) -> Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    if alternate_screen {
+        stdout.write_all(b"\x1b[?1049h").await?;
+    } else {
+        stdout.write_all(b"\x1b[?1049l").await?;
+    }
+    stdout.write_all(b"\x1b[2J\x1b[H").await?;
+    if !seed_bytes.is_empty() {
+        stdout.write_all(seed_bytes).await?;
+    }
+    stdout.flush().await?;
+    Ok(())
 }
 
 // ── Raw stdin ──────────────────────────────────────────────────────
@@ -148,16 +181,13 @@ async fn send_input(sock: &std::path::Path, surface_id: &str, bytes: &[u8]) -> R
         return Ok(());
     }
 
-    // The current daemon RPC accepts `text`. PTY keyboard input is normally
-    // UTF-8/control/escape bytes, all representable in a JSON string. Invalid
-    // UTF-8 is replaced rather than dropping the whole chunk.
-    let text = String::from_utf8_lossy(bytes).into_owned();
+    let bytes_hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
     rpc(
         sock,
         "multiplexer.tmux.input",
         json!({
             "surface_id": surface_id,
-            "text": text,
+            "bytes_hex": bytes_hex,
         }),
     )
     .await?;
@@ -249,19 +279,25 @@ async fn main() -> Result<()> {
     // the banner remains as the only visible output — making the error obvious.
     let mut stdout = tokio::io::stdout();
     stdout.write_all(b"\x1b[2J\x1b[H").await?;
-    stdout.write_all(b"\x1b[36m[term-mesh] connecting to ").await?;
+    stdout
+        .write_all(b"\x1b[36m[term-mesh] connecting to ")
+        .await?;
     stdout.write_all(host.as_bytes()).await?;
     stdout.write_all(b"...\x1b[0m\r\n").await?;
     stdout.flush().await?;
     drop(stdout);
 
     // Step 1: Attach — registers the tmux session in the daemon.
+    let (initial_cols, initial_rows) = current_winsize().unwrap_or((220, 50));
     let attach = rpc(
         &sock,
         "multiplexer.tmux.attach",
         json!({
             "host": host,
             "session": session,
+            "cols": initial_cols,
+            "rows": initial_rows,
+            "create_if_missing": true,
         }),
     )
     .await?;
@@ -270,31 +306,24 @@ async fn main() -> Result<()> {
         .ok_or_else(|| anyhow!("no surface_id in attach response"))?
         .to_string();
 
-    {
-        let mut stdout = tokio::io::stdout();
-        stdout.write_all(b"\x1b[32m[term-mesh] attached to ").await?;
-        stdout.write_all(session.as_bytes()).await?;
-        stdout.write_all(b"\x1b[0m\r\n").await?;
-        stdout.flush().await?;
-    }
-
     // Step 1b: push the local PTY size to tmux immediately so the remote
     // pane redraws at our actual width/height instead of tmux's
     // smallest-client default. Without this the claude TUI inside the
     // remote pane renders against 80x24 (or the previous client's size)
     // and the result looks "broken" with stretched separators.
     push_resize(&sock, &surface_id).await;
+    // Give tmux and the foreground TUI a brief chance to process SIGWINCH
+    // before we capture the initial viewport. A later command-correlated
+    // resize ACK can replace this debounce.
+    sleep(Duration::from_millis(80)).await;
 
     // Step 1c: seed the screen with the current pane content so the TUI
     // renders immediately (ADR 0002 "scrollback seed").  Called after
     // push_resize so tmux already knows our actual terminal size and the
     // captured screen is rendered at the right width.  Best-effort:
     // errors are silently ignored so attach is never disrupted.
-    {
-        let mut stdout = tokio::io::stdout();
-        stdout.write_all(b"\x1b[36m[term-mesh] painting current pane...\x1b[0m\r\n").await?;
-        stdout.flush().await?;
-    }
+    let mut seed_bytes = Vec::new();
+    let mut alternate_screen = false;
     if let Ok(cap) = rpc(
         &sock,
         "multiplexer.tmux.capture",
@@ -303,13 +332,11 @@ async fn main() -> Result<()> {
     .await
     {
         let hex = cap["result"]["bytes_hex"].as_str().unwrap_or("");
-        let seed_bytes = decode_hex(hex);
-        if !seed_bytes.is_empty() {
-            let mut stdout = tokio::io::stdout();
-            let _ = stdout.write_all(&seed_bytes).await;
-            let _ = stdout.flush().await;
-        }
+        seed_bytes = decode_hex(hex);
+        trim_snapshot_trailing_lf(&mut seed_bytes);
+        alternate_screen = cap["result"]["alternate_screen"].as_bool().unwrap_or(false);
     }
+    paint_remote_snapshot(&mut tokio::io::stdout(), &seed_bytes, alternate_screen).await?;
 
     // Step 1d: keep the remote pane in sync when the local window resizes.
     // SIGWINCH fires on every NSWindow drag. We re-emit a resize RPC and
@@ -433,9 +460,42 @@ mod tests {
             .unwrap();
         assert_eq!(req["method"], "multiplexer.tmux.input");
         assert_eq!(req["params"]["surface_id"], "surf-1");
-        assert_eq!(req["params"]["text"], "abc\r");
+        assert_eq!(req["params"]["bytes_hex"], "6162630d");
 
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn paint_remote_snapshot_clears_and_homes_before_seed() {
+        let (mut reader, mut writer) = tokio::io::duplex(64);
+        paint_remote_snapshot(&mut writer, b"abc", false)
+            .await
+            .unwrap();
+        writer.shutdown().await.unwrap();
+
+        let mut rendered = Vec::new();
+        reader.read_to_end(&mut rendered).await.unwrap();
+        assert_eq!(rendered, b"\x1b[?1049l\x1b[2J\x1b[Habc");
+    }
+
+    #[tokio::test]
+    async fn paint_remote_snapshot_enters_alternate_screen_when_needed() {
+        let (mut reader, mut writer) = tokio::io::duplex(64);
+        paint_remote_snapshot(&mut writer, b"abc", true)
+            .await
+            .unwrap();
+        writer.shutdown().await.unwrap();
+
+        let mut rendered = Vec::new();
+        reader.read_to_end(&mut rendered).await.unwrap();
+        assert_eq!(rendered, b"\x1b[?1049h\x1b[2J\x1b[Habc");
+    }
+
+    #[test]
+    fn trim_snapshot_trailing_lf_removes_only_one_final_newline() {
+        let mut bytes = b"a\nb\n".to_vec();
+        trim_snapshot_trailing_lf(&mut bytes);
+        assert_eq!(bytes, b"a\nb");
     }
 
     #[tokio::test]

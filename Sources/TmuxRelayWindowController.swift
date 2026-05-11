@@ -236,7 +236,7 @@ final class TmuxMenuCoordinator: NSObject {
         createStack.alignment = .centerY
 
         let createSessionButton = NSButton(checkboxWithTitle: "Create if missing", target: nil, action: nil)
-        createSessionButton.state = .off
+        createSessionButton.state = .on
 
         let shellPopup = NSPopUpButton(frame: NSRect(x: 0, y: 0, width: 145, height: 26), pullsDown: false)
         shellPopup.addItems(withTitles: Self.shellOptions)

@@ -1,11 +1,12 @@
 //! Per ADR 0002 §"Session lifecycle" — SSH + `tmux -CC` process management.
 
-use std::sync::Arc;
 use anyhow::{Context, Result};
+use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, Command};
 use tokio::sync::{mpsc, Mutex};
 
+use super::encoder;
 use super::parser::ControlModeParser;
 use crate::multiplexer::SurfaceId;
 
@@ -24,14 +25,23 @@ impl TmuxSession {
     ///
     /// Requires a reachable SSH host and an existing tmux session; only
     /// exercised by integration tests tagged `#[ignore]`.
-    pub async fn connect(host: &str, session: &str) -> Result<(Self, mpsc::Receiver<(SurfaceId, Vec<u8>)>)> {
+    pub async fn connect(
+        host: &str,
+        session: &str,
+    ) -> Result<(Self, mpsc::Receiver<(SurfaceId, Vec<u8>)>)> {
         let mut child = Command::new("ssh")
             .args([
                 "-tt",
-                "-o", "LogLevel=QUIET",
-                "-o", "StrictHostKeyChecking=accept-new",
+                "-o",
+                "LogLevel=QUIET",
+                "-o",
+                "StrictHostKeyChecking=accept-new",
                 host,
-                "tmux", "-CC", "attach", "-t", session,
+                "tmux",
+                "-CC",
+                "attach",
+                "-t",
+                session,
             ])
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
@@ -42,25 +52,59 @@ impl TmuxSession {
 
         let stdin = child.stdin.take().context("missing stdin")?;
         let stdout = child.stdout.take().context("missing stdout")?;
-        let (tx, rx) = mpsc::channel(256);
+        let (tx, rx) = mpsc::channel(4096);
         let tx_clone = tx.clone();
+        let stdin = Arc::new(Mutex::new(stdin));
+        let reader_stdin = Arc::clone(&stdin);
 
         // Stdout reader task: feed lines to the parser and forward Output events.
         tokio::spawn(async move {
-            let mut reader = BufReader::new(stdout).lines();
+            let mut reader = BufReader::new(stdout);
             let mut parser = ControlModeParser::new();
-            while let Ok(Some(line)) = reader.next_line().await {
-                for ev in parser.feed_line(&line) {
+            let mut line = Vec::new();
+            loop {
+                line.clear();
+                let n = match reader.read_until(b'\n', &mut line).await {
+                    Ok(n) => n,
+                    Err(_) => break,
+                };
+                if n == 0 {
+                    break;
+                }
+                if line.ends_with(b"\n") {
+                    line.pop();
+                }
+                if line.ends_with(b"\r") {
+                    line.pop();
+                }
+                for ev in parser.feed_line_bytes(&line) {
                     use super::parser::TmuxEvent;
-                    if let TmuxEvent::Output { pane_id, bytes } = ev {
-                        let sid = SurfaceId(pane_id);
-                        let _ = tx_clone.send((sid, bytes)).await;
+                    match ev {
+                        TmuxEvent::Output { pane_id, bytes } => {
+                            let sid = SurfaceId(pane_id);
+                            let _ = tx_clone.send((sid, bytes)).await;
+                        }
+                        TmuxEvent::Pause { pane_id } => {
+                            let cmd = encoder::refresh_client_continue(&pane_id);
+                            let mut g = reader_stdin.lock().await;
+                            let _ = g.write_all(cmd.as_bytes()).await;
+                            let _ = g.write_all(b"\n").await;
+                            let _ = g.flush().await;
+                        }
+                        _ => {}
                     }
                 }
             }
         });
 
-        Ok((TmuxSession { child, stdin: Arc::new(Mutex::new(stdin)), output_tx: tx }, rx))
+        Ok((
+            TmuxSession {
+                child,
+                stdin,
+                output_tx: tx,
+            },
+            rx,
+        ))
     }
 
     /// Write a single tmux control command to stdin (appends `\n`).  Shared,
@@ -80,7 +124,11 @@ impl TmuxSession {
         stdin: ChildStdin,
         output_tx: mpsc::Sender<(SurfaceId, Vec<u8>)>,
     ) -> Self {
-        Self { child, stdin: Arc::new(Mutex::new(stdin)), output_tx }
+        Self {
+            child,
+            stdin: Arc::new(Mutex::new(stdin)),
+            output_tx,
+        }
     }
 }
 
@@ -104,7 +152,9 @@ mod tests {
         let (tx, _rx) = mpsc::channel(1);
 
         let sess = TmuxSession::from_parts(child, stdin, tx);
-        sess.write_command("send-keys -t %1 -H 41 42").await.unwrap();
+        sess.write_command("send-keys -t %1 -H 41 42")
+            .await
+            .unwrap();
 
         let mut reader = BufReader::new(stdout).lines();
         let line = tokio::time::timeout(Duration::from_secs(1), reader.next_line())
@@ -119,10 +169,11 @@ mod tests {
     #[tokio::test]
     #[ignore]
     async fn connect_to_real_host() {
-        let (sess, _rx) =
-            TmuxSession::connect("ubuntu@100.70.102.125", "feat-tmux-remote")
-                .await
-                .expect("connect failed");
-        sess.write_command("display-message -p 'hello from test'").await.unwrap();
+        let (sess, _rx) = TmuxSession::connect("ubuntu@100.70.102.125", "feat-tmux-remote")
+            .await
+            .expect("connect failed");
+        sess.write_command("display-message -p 'hello from test'")
+            .await
+            .unwrap();
     }
 }

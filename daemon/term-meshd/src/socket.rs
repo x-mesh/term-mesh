@@ -11,7 +11,9 @@ use crate::agent::AgentSessionManager;
 use crate::headless::HeadlessManager;
 use crate::monitor::{Anomaly, MonitorHandle, SystemSnapshot};
 use crate::multiplexer::tmux::TmuxControlBackend;
-use crate::multiplexer::{CellSize, RemoteMultiplexerBackend, SplitDirection, SurfaceId, WorkspaceControl};
+use crate::multiplexer::{
+    CellSize, RemoteMultiplexerBackend, SplitDirection, SurfaceId, WorkspaceControl,
+};
 use crate::tokens::UsageTracker;
 use crate::watcher::WatcherHandle;
 use crate::worktree;
@@ -109,7 +111,8 @@ pub struct Context {
     pub headless: Arc<tokio::sync::Mutex<HeadlessManager>>,
     pub event_tx: EventSender,
     /// Active tmux control-mode backends, keyed by surface_id string.
-    pub tmux_backends: Arc<tokio::sync::RwLock<std::collections::HashMap<String, Arc<TmuxControlBackend>>>>,
+    pub tmux_backends:
+        Arc<tokio::sync::RwLock<std::collections::HashMap<String, Arc<TmuxControlBackend>>>>,
 }
 
 pub fn default_socket_path() -> PathBuf {
@@ -401,7 +404,10 @@ async fn stream_subscribe_tmux_output(
             let resp = Response {
                 id: req.id,
                 result: None,
-                error: Some(RpcError { code: -32602, message: format!("invalid params: {e}") }),
+                error: Some(RpcError {
+                    code: -32602,
+                    message: format!("invalid params: {e}"),
+                }),
             };
             let mut buf = serde_json::to_vec(&resp)?;
             buf.push(b'\n');
@@ -410,14 +416,22 @@ async fn stream_subscribe_tmux_output(
         }
     };
 
-    let backend = ctx.tmux_backends.read().await.get(&p.surface_id).map(Arc::clone);
+    let backend = ctx
+        .tmux_backends
+        .read()
+        .await
+        .get(&p.surface_id)
+        .map(Arc::clone);
     let backend = match backend {
         Some(b) => b,
         None => {
             let resp = Response {
                 id: req.id,
                 result: None,
-                error: Some(RpcError { code: -32602, message: format!("unknown surface_id: {}", p.surface_id) }),
+                error: Some(RpcError {
+                    code: -32602,
+                    message: format!("unknown surface_id: {}", p.surface_id),
+                }),
             };
             let mut buf = serde_json::to_vec(&resp)?;
             buf.push(b'\n');
@@ -436,7 +450,9 @@ async fn stream_subscribe_tmux_output(
         .await
         .map_err(|_| anyhow::anyhow!("ack write timeout"))??;
 
-    let deadline = p.timeout_ms.map(|ms| tokio::time::Instant::now() + Duration::from_millis(ms));
+    let deadline = p
+        .timeout_ms
+        .map(|ms| tokio::time::Instant::now() + Duration::from_millis(ms));
     let mut ping_interval = tokio::time::interval(Duration::from_secs(30));
     ping_interval.tick().await;
 
@@ -478,10 +494,7 @@ async fn stream_subscribe_tmux_output(
 
         if let Some(mut payload) = line {
             payload.push(b'\n');
-            if timeout(Duration::from_secs(5), writer.write_all(&payload))
-                .await
-                .is_err()
-            {
+            if writer.write_all(&payload).await.is_err() {
                 break;
             }
         }
@@ -500,6 +513,19 @@ fn serialize_output_frame(frame: &crate::multiplexer::tmux::OutputFrame) -> Vec<
         "bytes_hex": hex,
     }))
     .unwrap_or_default()
+}
+
+fn decode_hex_bytes(hex: &str) -> Result<Vec<u8>, String> {
+    if hex.len() % 2 != 0 {
+        return Err("bytes_hex must have an even length".into());
+    }
+    (0..hex.len())
+        .step_by(2)
+        .map(|i| {
+            u8::from_str_radix(&hex[i..i + 2], 16)
+                .map_err(|e| format!("invalid bytes_hex at offset {i}: {e}"))
+        })
+        .collect()
 }
 
 /// Serialize `ev` to JSONL bytes if its kind is in `filter_kinds` and (when
@@ -1420,15 +1446,33 @@ async fn dispatch(req: &Request, ctx: &Context) -> Response {
 
         "multiplexer.tmux.attach" => {
             #[derive(Deserialize)]
-            struct Params { host: String, session: String }
+            struct Params {
+                host: String,
+                session: String,
+                #[serde(default)]
+                cols: Option<u16>,
+                #[serde(default)]
+                rows: Option<u16>,
+                #[serde(default)]
+                create_if_missing: bool,
+            }
             match serde_json::from_value::<Params>(req.params.clone()) {
                 Ok(p) => {
                     let surface_id_str = uuid::Uuid::new_v4().to_string();
                     let surface_id = SurfaceId(surface_id_str.clone());
                     let backend = Arc::new(TmuxControlBackend::new(&p.host, &p.session));
-                    match backend.attach_surface(surface_id, CellSize { cols: 220, rows: 50 }).await {
+                    let size = CellSize {
+                        cols: p.cols.unwrap_or(220).max(1),
+                        rows: p.rows.unwrap_or(50).max(1),
+                    };
+                    match backend
+                        .attach_surface_with_options(surface_id, size, p.create_if_missing)
+                        .await
+                    {
                         Ok(_rx) => {
-                            ctx.tmux_backends.write().await
+                            ctx.tmux_backends
+                                .write()
+                                .await
                                 .insert(surface_id_str.clone(), Arc::clone(&backend));
                             Ok(serde_json::json!({
                                 "surface_id": surface_id_str,
@@ -1445,16 +1489,43 @@ async fn dispatch(req: &Request, ctx: &Context) -> Response {
 
         "multiplexer.tmux.input" => {
             #[derive(Deserialize)]
-            struct Params { surface_id: String, text: String }
+            struct Params {
+                surface_id: String,
+                #[serde(default)]
+                text: Option<String>,
+                #[serde(default)]
+                bytes_hex: Option<String>,
+            }
             match serde_json::from_value::<Params>(req.params.clone()) {
                 Ok(p) => {
-                    let backend = ctx.tmux_backends.read().await.get(&p.surface_id).map(Arc::clone);
+                    let bytes = match p.bytes_hex.as_deref() {
+                        Some(hex) => match decode_hex_bytes(hex) {
+                            Ok(bytes) => bytes,
+                            Err(e) => {
+                                return Response {
+                                    id: req.id.clone(),
+                                    result: None,
+                                    error: Some(RpcError {
+                                        code: -32602,
+                                        message: e,
+                                    }),
+                                }
+                            }
+                        },
+                        None => p.text.unwrap_or_default().into_bytes(),
+                    };
+                    let backend = ctx
+                        .tmux_backends
+                        .read()
+                        .await
+                        .get(&p.surface_id)
+                        .map(Arc::clone);
                     match backend {
                         None => Err(format!("unknown surface_id: {}", p.surface_id)),
-                        Some(b) => match b.send_input(SurfaceId(p.surface_id), p.text.into_bytes()).await {
+                        Some(b) => match b.send_input(SurfaceId(p.surface_id), bytes).await {
                             Ok(()) => Ok(serde_json::json!({ "ok": true })),
                             Err(e) => Err(format!("send_input failed: {e}")),
-                        }
+                        },
                     }
                 }
                 Err(e) => Err(format!("invalid params: {e}")),
@@ -1463,16 +1534,34 @@ async fn dispatch(req: &Request, ctx: &Context) -> Response {
 
         "multiplexer.tmux.resize" => {
             #[derive(Deserialize)]
-            struct Params { surface_id: String, cols: u16, rows: u16 }
+            struct Params {
+                surface_id: String,
+                cols: u16,
+                rows: u16,
+            }
             match serde_json::from_value::<Params>(req.params.clone()) {
                 Ok(p) => {
-                    let backend = ctx.tmux_backends.read().await.get(&p.surface_id).map(Arc::clone);
+                    let backend = ctx
+                        .tmux_backends
+                        .read()
+                        .await
+                        .get(&p.surface_id)
+                        .map(Arc::clone);
                     match backend {
                         None => Err(format!("unknown surface_id: {}", p.surface_id)),
-                        Some(b) => match b.resize(SurfaceId(p.surface_id), CellSize { cols: p.cols, rows: p.rows }).await {
+                        Some(b) => match b
+                            .resize(
+                                SurfaceId(p.surface_id),
+                                CellSize {
+                                    cols: p.cols,
+                                    rows: p.rows,
+                                },
+                            )
+                            .await
+                        {
                             Ok(()) => Ok(serde_json::json!({ "ok": true })),
                             Err(e) => Err(format!("resize failed: {e}")),
-                        }
+                        },
                     }
                 }
                 Err(e) => Err(format!("invalid params: {e}")),
@@ -1496,22 +1585,34 @@ async fn dispatch(req: &Request, ctx: &Context) -> Response {
                                 "vertical" | "v" => SplitDirection::Vertical,
                                 _ => SplitDirection::Horizontal,
                             };
-                            Ok(WorkspaceControl::SplitPane { pane_id: p.pane_id.clone(), direction: dir })
+                            Ok(WorkspaceControl::SplitPane {
+                                pane_id: p.pane_id.clone(),
+                                direction: dir,
+                            })
                         }
-                        "kill-pane" => Ok(WorkspaceControl::KillPane { pane_id: p.pane_id.clone() }),
-                        "select-pane" => Ok(WorkspaceControl::SelectPane { pane_id: p.pane_id.clone() }),
+                        "kill-pane" => Ok(WorkspaceControl::KillPane {
+                            pane_id: p.pane_id.clone(),
+                        }),
+                        "select-pane" => Ok(WorkspaceControl::SelectPane {
+                            pane_id: p.pane_id.clone(),
+                        }),
                         other => Err(format!("unknown command: {other}")),
                     };
                     match ctrl {
                         Err(e) => Err(e),
                         Ok(ctrl) => {
-                            let backend = ctx.tmux_backends.read().await.get(&p.surface_id).map(Arc::clone);
+                            let backend = ctx
+                                .tmux_backends
+                                .read()
+                                .await
+                                .get(&p.surface_id)
+                                .map(Arc::clone);
                             match backend {
                                 None => Err(format!("unknown surface_id: {}", p.surface_id)),
                                 Some(b) => match b.control(ctrl).await {
                                     Ok(()) => Ok(serde_json::json!({ "ok": true })),
                                     Err(e) => Err(format!("control failed: {e}")),
-                                }
+                                },
                             }
                         }
                     }
@@ -1522,10 +1623,17 @@ async fn dispatch(req: &Request, ctx: &Context) -> Response {
 
         "multiplexer.tmux.detach" => {
             #[derive(Deserialize)]
-            struct Params { surface_id: String }
+            struct Params {
+                surface_id: String,
+            }
             match serde_json::from_value::<Params>(req.params.clone()) {
                 Ok(p) => {
-                    let removed = ctx.tmux_backends.write().await.remove(&p.surface_id).is_some();
+                    let removed = ctx
+                        .tmux_backends
+                        .write()
+                        .await
+                        .remove(&p.surface_id)
+                        .is_some();
                     Ok(serde_json::json!({ "ok": true, "removed": removed }))
                 }
                 Err(e) => Err(format!("invalid params: {e}")),
@@ -1546,14 +1654,23 @@ async fn dispatch(req: &Request, ctx: &Context) -> Response {
             }
             match serde_json::from_value::<Params>(req.params.clone()) {
                 Ok(p) => {
-                    let backend = ctx.tmux_backends.read().await.get(&p.surface_id).map(Arc::clone);
+                    let backend = ctx
+                        .tmux_backends
+                        .read()
+                        .await
+                        .get(&p.surface_id)
+                        .map(Arc::clone);
                     match backend {
                         None => Err(format!("unknown surface_id: {}", p.surface_id)),
                         Some(b) => {
                             let sid = SurfaceId(p.surface_id.clone());
-                            let bytes = b.capture_pane(&sid, p.lines).await;
-                            let hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
-                            Ok(serde_json::json!({ "bytes_hex": hex }))
+                            let capture = b.capture_pane(&sid, p.lines).await;
+                            let hex: String =
+                                capture.bytes.iter().map(|b| format!("{b:02x}")).collect();
+                            Ok(serde_json::json!({
+                                "bytes_hex": hex,
+                                "alternate_screen": capture.alternate_screen,
+                            }))
                         }
                     }
                 }
@@ -1775,6 +1892,17 @@ fn compute_agent_anomalies(agent_manager: &AgentSessionManager) -> Vec<Anomaly> 
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn decode_hex_bytes_accepts_binary_input() {
+        assert_eq!(decode_hex_bytes("001bff").unwrap(), vec![0x00, 0x1b, 0xff]);
+    }
+
+    #[test]
+    fn decode_hex_bytes_rejects_invalid_input() {
+        assert!(decode_hex_bytes("abc").is_err());
+        assert!(decode_hex_bytes("xx").is_err());
+    }
 
     #[test]
     fn heartbeat_stale_event_emits_once_until_recovered() {
