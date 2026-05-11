@@ -2275,7 +2275,44 @@ fn detect_socket() -> Option<PathBuf> {
         }
     }
 
-    // Priority 3: Glob fallback — try each, skip dead sockets
+    // Priority 3: ~/Library/Application Support/term-mesh/*.sock
+    // macOS tagged-build sockets written by the app (term-mesh-debug-<tag>.sock).
+    // Prefer TERMMESH_TAG match; fall back to newest mtime.
+    if let Ok(home) = env::var("HOME") {
+        let app_support = PathBuf::from(&home).join("Library/Application Support/term-mesh");
+        if let Ok(entries) = std::fs::read_dir(&app_support) {
+            let tag = env::var("TERMMESH_TAG").ok();
+            let mut candidates: Vec<(PathBuf, std::time::SystemTime)> = entries
+                .filter_map(|e| e.ok())
+                .filter(|e| {
+                    let name = e.file_name();
+                    let s = name.to_string_lossy();
+                    s.starts_with("term-mesh") && s.ends_with(".sock")
+                })
+                .filter_map(|e| {
+                    let p = e.path();
+                    let mtime = e.metadata().ok()?.modified().ok()?;
+                    Some((p, mtime))
+                })
+                .filter(|(p, _)| is_socket_alive(p))
+                .collect();
+            if let Some(ref t) = tag {
+                if let Some(matched) = candidates.iter().find(|(p, _)| {
+                    p.file_name()
+                        .map(|n| n.to_string_lossy().contains(t.as_str()))
+                        .unwrap_or(false)
+                }) {
+                    return Some(matched.0.clone());
+                }
+            }
+            candidates.sort_by_key(|(_, mt)| std::cmp::Reverse(*mt));
+            if let Some((p, _)) = candidates.first() {
+                return Some(p.clone());
+            }
+        }
+    }
+
+    // Priority 4: Glob fallback — try each, skip dead sockets
     let patterns = [
         "/tmp/term-mesh-debug-*.sock",
         "/tmp/term-mesh-debug.sock",
@@ -3601,7 +3638,11 @@ fn main() {
                         "multiplexer.tmux.attach",
                         json!({ "host": host, "session": session }),
                     ),
-                    TmuxCommands::Input { surface_id, text, cr } => {
+                    TmuxCommands::Input {
+                        surface_id,
+                        text,
+                        cr,
+                    } => {
                         let text = if cr { format!("{text}\r") } else { text };
                         rpc_call(
                             &daemon_sock,
@@ -3609,13 +3650,21 @@ fn main() {
                             json!({ "surface_id": surface_id, "text": text }),
                         )
                     }
-                    TmuxCommands::Resize { surface_id, cols, rows } => rpc_call(
+                    TmuxCommands::Resize {
+                        surface_id,
+                        cols,
+                        rows,
+                    } => rpc_call(
                         &daemon_sock,
                         "multiplexer.tmux.resize",
                         json!({ "surface_id": surface_id, "cols": cols, "rows": rows }),
                     ),
                     TmuxCommands::Control(ctrl) => match ctrl {
-                        ControlTmuxCommands::Split { surface_id, pane_id, vertical } => rpc_call(
+                        ControlTmuxCommands::Split {
+                            surface_id,
+                            pane_id,
+                            vertical,
+                        } => rpc_call(
                             &daemon_sock,
                             "multiplexer.tmux.control",
                             json!({
@@ -3625,12 +3674,18 @@ fn main() {
                                 "direction": if vertical { "vertical" } else { "horizontal" },
                             }),
                         ),
-                        ControlTmuxCommands::Kill { surface_id, pane_id } => rpc_call(
+                        ControlTmuxCommands::Kill {
+                            surface_id,
+                            pane_id,
+                        } => rpc_call(
                             &daemon_sock,
                             "multiplexer.tmux.control",
                             json!({ "surface_id": surface_id, "command": "kill-pane", "pane_id": pane_id }),
                         ),
-                        ControlTmuxCommands::Select { surface_id, pane_id } => rpc_call(
+                        ControlTmuxCommands::Select {
+                            surface_id,
+                            pane_id,
+                        } => rpc_call(
                             &daemon_sock,
                             "multiplexer.tmux.control",
                             json!({ "surface_id": surface_id, "command": "select-pane", "pane_id": pane_id }),
@@ -3641,11 +3696,14 @@ fn main() {
                         "multiplexer.tmux.detach",
                         json!({ "surface_id": surface_id }),
                     ),
-                    TmuxCommands::Subscribe { surface_id, timeout_secs } => {
+                    TmuxCommands::Subscribe {
+                        surface_id,
+                        timeout_secs,
+                    } => {
                         run_subscribe_tmux(&daemon_sock, &surface_id, timeout_secs);
                         return;
                     }
-                }
+                },
             }
         }
         Commands::Status => {
@@ -5244,7 +5302,52 @@ fn detect_daemon_socket() -> Option<PathBuf> {
             }
         }
     }
-    // Default daemon socket path
+    // Priority 3: ~/Library/Application Support/term-mesh/term-meshd-*.sock
+    // Written by the macOS app when it spawns a tagged daemon (reload.sh --tag).
+    // Mirrors Swift detectDaemonSocket (commit a8a4dd08).
+    if let Ok(home) = env::var("HOME") {
+        let app_support = PathBuf::from(&home).join("Library/Application Support/term-mesh");
+        if let Ok(entries) = std::fs::read_dir(&app_support) {
+            let tag = env::var("TERMMESH_TAG").ok();
+            let mut candidates: Vec<(PathBuf, std::time::SystemTime)> = entries
+                .filter_map(|e| e.ok())
+                .filter(|e| {
+                    let name = e.file_name();
+                    let s = name.to_string_lossy();
+                    s.starts_with("term-meshd-") && s.ends_with(".sock")
+                })
+                .filter_map(|e| {
+                    let p = e.path();
+                    let mtime = e.metadata().ok()?.modified().ok()?;
+                    Some((p, mtime))
+                })
+                .filter(|(p, _)| is_socket_alive(p))
+                .collect();
+            if let Some(ref t) = tag {
+                if let Some(matched) = candidates.iter().find(|(p, _)| {
+                    p.file_name()
+                        .map(|n| n.to_string_lossy().contains(t.as_str()))
+                        .unwrap_or(false)
+                }) {
+                    return Some(matched.0.clone());
+                }
+            }
+            candidates.sort_by_key(|(_, mt)| std::cmp::Reverse(*mt));
+            if let Some((p, _)) = candidates.first() {
+                return Some(p.clone());
+            }
+        }
+    }
+
+    // Priority 4: ~/.local/share/term-mesh/term-meshd.sock (Linux / non-tagged)
+    if let Ok(home) = env::var("HOME") {
+        let standard = PathBuf::from(&home).join(".local/share/term-mesh/term-meshd.sock");
+        if is_socket_alive(&standard) {
+            return Some(standard);
+        }
+    }
+
+    // Priority 5: $TMPDIR/term-meshd.sock (final fallback)
     let dir = env::var("TMPDIR")
         .ok()
         .map(PathBuf::from)
@@ -6174,7 +6277,11 @@ fn run_watch(
 
 /// Connect to `multiplexer.tmux.subscribe` and print JSONL output frames to stdout.
 fn run_subscribe_tmux(sock: &PathBuf, surface_id: &str, timeout_secs: u64) {
-    let timeout_ms: Option<u64> = if timeout_secs > 0 { Some(timeout_secs * 1000) } else { None };
+    let timeout_ms: Option<u64> = if timeout_secs > 0 {
+        Some(timeout_secs * 1000)
+    } else {
+        None
+    };
     let request = json!({
         "jsonrpc": "2.0",
         "id": 1,
@@ -6184,18 +6291,31 @@ fn run_subscribe_tmux(sock: &PathBuf, surface_id: &str, timeout_secs: u64) {
 
     let stream = match UnixStream::connect(sock) {
         Ok(s) => s,
-        Err(e) => { eprintln!("error: cannot connect to daemon socket: {e}"); process::exit(1); }
+        Err(e) => {
+            eprintln!("error: cannot connect to daemon socket: {e}");
+            process::exit(1);
+        }
     };
 
-    let read_timeout_secs: u64 = if timeout_secs > 0 { timeout_secs.saturating_add(10) } else { 90 };
-    stream.set_read_timeout(Some(Duration::from_secs(read_timeout_secs))).ok();
+    let read_timeout_secs: u64 = if timeout_secs > 0 {
+        timeout_secs.saturating_add(10)
+    } else {
+        90
+    };
+    stream
+        .set_read_timeout(Some(Duration::from_secs(read_timeout_secs)))
+        .ok();
     stream.set_write_timeout(Some(Duration::from_secs(10))).ok();
 
-    let mut writer = stream.try_clone().unwrap_or_else(|e| { eprintln!("error: {e}"); process::exit(1); });
+    let mut writer = stream.try_clone().unwrap_or_else(|e| {
+        eprintln!("error: {e}");
+        process::exit(1);
+    });
     let mut payload = serde_json::to_string(&request).expect("serialization cannot fail");
     payload.push('\n');
     if let Err(e) = writer.write_all(payload.as_bytes()) {
-        eprintln!("error: failed to send subscribe request: {e}"); process::exit(1);
+        eprintln!("error: failed to send subscribe request: {e}");
+        process::exit(1);
     }
     writer.flush().ok();
 
@@ -6209,16 +6329,24 @@ fn run_subscribe_tmux(sock: &PathBuf, surface_id: &str, timeout_secs: u64) {
             Ok(0) => break,
             Ok(_) => {
                 let trimmed = line.trim_end_matches('\n').trim_end_matches('\r');
-                if !trimmed.is_empty() { println!("{trimmed}"); }
+                if !trimmed.is_empty() {
+                    println!("{trimmed}");
+                }
             }
             Err(e) => {
                 use std::io::ErrorKind;
                 match e.kind() {
                     ErrorKind::WouldBlock | ErrorKind::TimedOut => {
-                        if timeout_secs > 0 { eprintln!("[subscribe] read timeout; exiting"); break; }
+                        if timeout_secs > 0 {
+                            eprintln!("[subscribe] read timeout; exiting");
+                            break;
+                        }
                         continue;
                     }
-                    _ => { eprintln!("[subscribe] stream error: {e}"); break; }
+                    _ => {
+                        eprintln!("[subscribe] stream error: {e}");
+                        break;
+                    }
                 }
             }
         }
