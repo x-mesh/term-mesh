@@ -29,7 +29,7 @@ PROJECT_DIR   := $(shell pwd)
 # that needs to ship with the app? Append it here — every install/dmg
 # target picks it up automatically. `verify-daemon-binaries` enforces
 # that each one was actually built before any packaging step runs.
-DAEMON_BINS   := term-meshd term-mesh-run tm-agent term-mesh-peer-relay
+DAEMON_BINS   := term-meshd term-mesh-run tm-agent term-mesh-peer-relay term-meshd-tmux-relay
 
 .PHONY: build prod deploy deploy-prod dmg run stop clean daemon test install-commands sentry-upload-dsym verify-daemon-binaries
 

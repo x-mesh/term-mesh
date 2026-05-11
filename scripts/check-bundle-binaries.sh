@@ -26,6 +26,7 @@ REQUIRED_BINS=(
   term-mesh-run
   tm-agent
   term-mesh-peer-relay
+  term-meshd-tmux-relay
 )
 
 BIN_DIR="$APP/Contents/Resources/bin"

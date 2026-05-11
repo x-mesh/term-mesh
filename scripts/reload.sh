@@ -295,7 +295,7 @@ if [[ -d "$PWD/daemon" && -f "$PWD/daemon/Cargo.toml" ]]; then
 fi
 BIN_DIR="$APP_PATH/Contents/Resources/bin"
 mkdir -p "$BIN_DIR"
-for bin in term-meshd term-mesh-run tm-agent term-mesh-peer-relay; do
+for bin in term-meshd term-mesh-run tm-agent term-mesh-peer-relay term-meshd-tmux-relay; do
   src="$PWD/daemon/target/release/$bin"
   if [[ -x "$src" ]]; then
     cp "$src" "$BIN_DIR/$bin"

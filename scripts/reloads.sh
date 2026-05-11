@@ -225,7 +225,7 @@ if [[ -x "$TERMMESHD_SRC" ]]; then
   mkdir -p "$BIN_DIR"
   cp "$TERMMESHD_SRC" "$BIN_DIR/term-meshd"
   chmod +x "$BIN_DIR/term-meshd"
-  for bin in term-mesh-run tm-agent term-mesh-peer-relay; do
+  for bin in term-mesh-run tm-agent term-mesh-peer-relay term-meshd-tmux-relay; do
     src="$PWD/daemon/target/release/$bin"
     if [[ -x "$src" ]]; then
       cp "$src" "$BIN_DIR/$bin"
