@@ -48,6 +48,49 @@ fn current_winsize() -> Option<(u16, u16)> {
     }
 }
 
+// ── Raw stdin ──────────────────────────────────────────────────────
+//
+// Ghostty gives the relay a real PTY. If the relay leaves that PTY in
+// canonical mode, keys such as Tab, Ctrl-C, arrows, and ordinary text are
+// buffered or transformed by the local line discipline before the daemon can
+// forward them to remote tmux. Raw mode makes the relay behave like the peer
+// relay: every byte from Ghostty becomes immediate tmux input.
+struct RawStdinGuard {
+    original: Option<libc::termios>,
+}
+
+impl RawStdinGuard {
+    fn enable() -> Self {
+        let mut original: libc::termios = unsafe { std::mem::zeroed() };
+        let got = unsafe { libc::tcgetattr(libc::STDIN_FILENO, &mut original) };
+        if got != 0 {
+            return Self { original: None };
+        }
+
+        let mut raw = original;
+        unsafe { libc::cfmakeraw(&mut raw) };
+        raw.c_cc[libc::VMIN] = 1;
+        raw.c_cc[libc::VTIME] = 0;
+
+        let set = unsafe { libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &raw) };
+        if set != 0 {
+            return Self { original: None };
+        }
+
+        Self {
+            original: Some(original),
+        }
+    }
+}
+
+impl Drop for RawStdinGuard {
+    fn drop(&mut self) {
+        if let Some(ref tio) = self.original {
+            unsafe { libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, tio) };
+        }
+    }
+}
+
 /// Send multiplexer.tmux.resize for the given surface, using whatever size
 /// the controlling PTY reports right now. Best-effort; errors are swallowed
 /// so a resize miss never tears down the subscribe loop.
@@ -192,6 +235,13 @@ where
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    let _raw_stdin_guard = RawStdinGuard::enable();
+    {
+        let mut stdout = tokio::io::stdout();
+        stdout.write_all(b"\x1b[2J\x1b[H").await?;
+        stdout.flush().await?;
+    }
+
     let host =
         std::env::var("TERMMESH_TMUX_HOST").unwrap_or_else(|_| "ubuntu@100.70.102.125".into());
     let session =
