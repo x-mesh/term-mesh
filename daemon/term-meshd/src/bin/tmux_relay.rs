@@ -10,12 +10,51 @@
 //   TERMMESH_TMUX_HOST         — SSH host (e.g. ubuntu@100.70.102.125)
 //   TERMMESH_TMUX_SESSION      — tmux session name
 
+use std::os::unix::io::AsRawFd;
 use std::path::PathBuf;
 
 use anyhow::{anyhow, Result};
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
+use tokio::signal::unix::{signal, SignalKind};
+
+/// Query the controlling TTY (stdout) for its current size. macOS Ghostty
+/// gives the relay a real PTY, so TIOCGWINSZ works against any of stdin/
+/// stdout/stderr. Returns (cols, rows).
+fn current_winsize() -> Option<(u16, u16)> {
+    #[repr(C)]
+    struct WinSize {
+        ws_row: u16,
+        ws_col: u16,
+        ws_xpixel: u16,
+        ws_ypixel: u16,
+    }
+    const TIOCGWINSZ: libc::c_ulong = 0x40087468;
+    let fd = std::io::stdout().as_raw_fd();
+    let mut ws = WinSize { ws_row: 0, ws_col: 0, ws_xpixel: 0, ws_ypixel: 0 };
+    let rc = unsafe {
+        libc::ioctl(fd, TIOCGWINSZ, &mut ws as *mut WinSize as *mut libc::c_void)
+    };
+    if rc == 0 && ws.ws_col > 0 && ws.ws_row > 0 {
+        Some((ws.ws_col, ws.ws_row))
+    } else {
+        None
+    }
+}
+
+/// Send multiplexer.tmux.resize for the given surface, using whatever size
+/// the controlling PTY reports right now. Best-effort; errors are swallowed
+/// so a resize miss never tears down the subscribe loop.
+async fn push_resize(sock: &std::path::Path, surface_id: &str) {
+    if let Some((cols, rows)) = current_winsize() {
+        let _ = rpc(sock, "multiplexer.tmux.resize", json!({
+            "surface_id": surface_id,
+            "cols": cols,
+            "rows": rows,
+        })).await;
+    }
+}
 
 fn daemon_sock() -> PathBuf {
     std::env::var("TERMMESH_DAEMON_UNIX_PATH")
@@ -68,6 +107,25 @@ async fn main() -> Result<()> {
         .as_str()
         .ok_or_else(|| anyhow!("no surface_id in attach response"))?
         .to_string();
+
+    // Step 1b: push the local PTY size to tmux immediately so the remote
+    // pane redraws at our actual width/height instead of tmux's
+    // smallest-client default. Without this the claude TUI inside the
+    // remote pane renders against 80x24 (or the previous client's size)
+    // and the result looks "broken" with stretched separators.
+    push_resize(&sock, &surface_id).await;
+
+    // Step 1c: keep the remote pane in sync when the local window resizes.
+    // SIGWINCH fires on every NSWindow drag. We re-emit a resize RPC and
+    // let the daemon translate it into `refresh-client -C cols x rows`.
+    let resize_sock = sock.clone();
+    let resize_sid = surface_id.clone();
+    tokio::spawn(async move {
+        let Ok(mut wch) = signal(SignalKind::window_change()) else { return };
+        while wch.recv().await.is_some() {
+            push_resize(&resize_sock, &resize_sid).await;
+        }
+    });
 
     // Step 2: Open long-lived subscribe connection.
     let sub_stream = UnixStream::connect(&sock).await
