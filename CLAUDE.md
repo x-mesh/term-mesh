@@ -119,7 +119,7 @@ tail -f "$(cat /tmp/term-mesh-last-debug-log-path 2>/dev/null || echo /tmp/term-
 - Focus events: `focus.panel`, `focus.bonsplit`, `focus.firstResponder`, `focus.moveFocus`
 - Bonsplit events: `tab.select`, `tab.close`, `tab.dragStart`, `tab.drop`, `pane.focus`, `pane.drop`, `divider.dragStart`
 - Enter-swallow / IME instrumentation patterns:
-  - `key.PRESS_ignored keycode=36` — Enter swallowed by empty-popover guard (expected)
+  - `key.PRESS_ignored keycode=36` — synthetic send_key rejected by Ghostty (from sendKeyEvent); Rust retry not triggered
   - `ime.return_with_markedText` — Return pressed during IME composition (not swallowed)
   - `ime.resignFirstResponder hadMarkedText=true` — normal IME resign on focus loss
   - `ime.ghosttyKey path=accumulated.text keycode=0` — composed text sent via UTF-8 fallback
@@ -254,7 +254,8 @@ tm-agent brief <agent>
 # Work-pool / autonomous claim pattern (GAP-4 claim-push active since 3b312b7a):
 #   tm-agent task create 'task A'            # unassigned — enters pool
 #   tm-agent task create 'task B'            # unassigned — enters pool
-#   tm-agent send executor 'tm-agent claim'  # each panel self-claims + auto-receives instructions
+#   tm-agent broadcast 'tm-agent claim'       # Option A: all panels claim simultaneously (preferred)
+#   tm-agent send executor 'tm-agent claim'; sleep 0.5; tm-agent send executor 'tm-agent claim'  # Option B: round-robin sequential
 #
 # Broadcast reaches ALL panels including duplicate-named agents (BUG-3 fix d69c9d0c):
 #   tm-agent broadcast 'msg'   # every pane receives — no name-based collapse

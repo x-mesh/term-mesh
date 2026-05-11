@@ -254,7 +254,10 @@ Work-pool / autonomous claim pattern:
 \`\`\`bash
 tm-agent task create 'task A'   # unassigned — enters pool
 tm-agent task create 'task B'   # unassigned — enters pool
-tm-agent send executor 'tm-agent claim'  # each panel self-claims one task
+# Option A — all panels claim simultaneously (preferred for N pools):
+tm-agent broadcast 'tm-agent claim'
+# Option B — round-robin sequential (gap ensures different panels pick different tasks):
+tm-agent send executor 'tm-agent claim'; sleep 0.5; tm-agent send executor 'tm-agent claim'
 \`\`\`
 After a claim, task instructions are pushed automatically — no separate delegate needed.
 
@@ -276,10 +279,11 @@ Regression test for parallel routing (run with existing team):
 
 Enter-swallow and IME instrumentation patterns (DEBUG builds only):
 \`\`\`bash
-tail -f /tmp/term-mesh-debug.log | grep -E 'key\\.PRESS_ignored|ime\\.return_with_markedText|ime\\.resignFirstResponder'
-# key.PRESS_ignored keycode=36  → Enter swallowed by UI layer (expected for empty popover)
+tail -f /tmp/term-mesh-debug.log | grep -E 'key\\.PRESS_ignored|ime\\.return_with_markedText|ime\\.resignFirstResponder|accumulated\\.text'
+# key.PRESS_ignored keycode=36  → synthetic send_key rejected by Ghostty (sendKeyEvent) — Rust retry not triggered (Layer 3 P2 candidate)
 # ime.return_with_markedText    → IME composition finalizing — NOT swallowed
 # ime.resignFirstResponder hadMarkedText=true → normal IME focus resign
+# ime.ghosttyKey path=accumulated.text → composed text sent via UTF-8 fallback (d3773d92)
 \`\`\`"
 
 export TERMMESH_SOCKET="$SOCKET"
