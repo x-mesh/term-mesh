@@ -236,17 +236,24 @@ where
 #[tokio::main]
 async fn main() -> Result<()> {
     let _raw_stdin_guard = RawStdinGuard::enable();
-    {
-        let mut stdout = tokio::io::stdout();
-        stdout.write_all(b"\x1b[2J\x1b[H").await?;
-        stdout.flush().await?;
-    }
 
     let host =
         std::env::var("TERMMESH_TMUX_HOST").unwrap_or_else(|_| "ubuntu@100.70.102.125".into());
     let session =
         std::env::var("TERMMESH_TMUX_SESSION").unwrap_or_else(|_| "feat-tmux-remote".into());
     let sock = daemon_sock();
+
+    // Banner sequence: all banners appear before capture seed, which overwrites
+    // them with the actual pane content. The user sees the banner briefly during
+    // the attach/resize round-trip, then sees the live screen. On attach failure
+    // the banner remains as the only visible output — making the error obvious.
+    let mut stdout = tokio::io::stdout();
+    stdout.write_all(b"\x1b[2J\x1b[H").await?;
+    stdout.write_all(b"\x1b[36m[term-mesh] connecting to ").await?;
+    stdout.write_all(host.as_bytes()).await?;
+    stdout.write_all(b"...\x1b[0m\r\n").await?;
+    stdout.flush().await?;
+    drop(stdout);
 
     // Step 1: Attach — registers the tmux session in the daemon.
     let attach = rpc(
@@ -263,6 +270,14 @@ async fn main() -> Result<()> {
         .ok_or_else(|| anyhow!("no surface_id in attach response"))?
         .to_string();
 
+    {
+        let mut stdout = tokio::io::stdout();
+        stdout.write_all(b"\x1b[32m[term-mesh] attached to ").await?;
+        stdout.write_all(session.as_bytes()).await?;
+        stdout.write_all(b"\x1b[0m\r\n").await?;
+        stdout.flush().await?;
+    }
+
     // Step 1b: push the local PTY size to tmux immediately so the remote
     // pane redraws at our actual width/height instead of tmux's
     // smallest-client default. Without this the claude TUI inside the
@@ -275,6 +290,11 @@ async fn main() -> Result<()> {
     // push_resize so tmux already knows our actual terminal size and the
     // captured screen is rendered at the right width.  Best-effort:
     // errors are silently ignored so attach is never disrupted.
+    {
+        let mut stdout = tokio::io::stdout();
+        stdout.write_all(b"\x1b[36m[term-mesh] painting current pane...\x1b[0m\r\n").await?;
+        stdout.flush().await?;
+    }
     if let Ok(cap) = rpc(
         &sock,
         "multiplexer.tmux.capture",

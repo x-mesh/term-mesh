@@ -2253,12 +2253,33 @@ mod runbook_tests {
 
 // ── Socket / RPC infrastructure ──────────────────────────────────────
 
+#[allow(dead_code)]
 fn detect_socket() -> Option<PathBuf> {
+    detect_socket_inner(&mut Vec::new())
+}
+
+/// Like `detect_socket` but also collects a human-readable description of every
+/// candidate that was tried.  Used to produce actionable error messages when no
+/// socket is found.
+fn detect_socket_verbose() -> (Option<PathBuf>, Vec<String>) {
+    let mut diag = Vec::new();
+    let result = detect_socket_inner(&mut diag);
+    (result, diag)
+}
+
+fn detect_socket_inner(diag: &mut Vec<String>) -> Option<PathBuf> {
     // Priority 1: Explicit environment variable (always wins)
-    if let Ok(sock) = env::var("TERMMESH_SOCKET") {
-        let p = PathBuf::from(&sock);
-        if is_socket_alive(&p) {
-            return Some(p);
+    match env::var("TERMMESH_SOCKET") {
+        Ok(sock) => {
+            let p = PathBuf::from(&sock);
+            if is_socket_alive(&p) {
+                return Some(p);
+            }
+            let reason = if p.exists() { "not responding" } else { "file missing" };
+            diag.push(format!("TERMMESH_SOCKET={sock} ({reason})"));
+        }
+        Err(_) => {
+            diag.push("TERMMESH_SOCKET (not set)".to_string());
         }
     }
 
@@ -2271,7 +2292,7 @@ fn detect_socket() -> Option<PathBuf> {
             if is_socket_alive(&p) {
                 return Some(p);
             }
-            // Stale/dead socket — fall through to glob detection
+            diag.push(format!("/tmp/term-mesh-last-socket-path → {} (stale)", p.display()));
         }
     }
 
@@ -2280,34 +2301,40 @@ fn detect_socket() -> Option<PathBuf> {
     // Prefer TERMMESH_TAG match; fall back to newest mtime.
     if let Ok(home) = env::var("HOME") {
         let app_support = PathBuf::from(&home).join("Library/Application Support/term-mesh");
-        if let Ok(entries) = std::fs::read_dir(&app_support) {
-            let tag = env::var("TERMMESH_TAG").ok();
-            let mut candidates: Vec<(PathBuf, std::time::SystemTime)> = entries
-                .filter_map(|e| e.ok())
-                .filter(|e| {
-                    let name = e.file_name();
-                    let s = name.to_string_lossy();
-                    s.starts_with("term-mesh") && s.ends_with(".sock")
-                })
-                .filter_map(|e| {
-                    let p = e.path();
-                    let mtime = e.metadata().ok()?.modified().ok()?;
-                    Some((p, mtime))
-                })
-                .filter(|(p, _)| is_socket_alive(p))
-                .collect();
-            if let Some(ref t) = tag {
-                if let Some(matched) = candidates.iter().find(|(p, _)| {
-                    p.file_name()
-                        .map(|n| n.to_string_lossy().contains(t.as_str()))
-                        .unwrap_or(false)
-                }) {
-                    return Some(matched.0.clone());
+        match std::fs::read_dir(&app_support) {
+            Ok(entries) => {
+                let tag = env::var("TERMMESH_TAG").ok();
+                let mut candidates: Vec<(PathBuf, std::time::SystemTime)> = entries
+                    .filter_map(|e| e.ok())
+                    .filter(|e| {
+                        let name = e.file_name();
+                        let s = name.to_string_lossy();
+                        s.starts_with("term-mesh") && s.ends_with(".sock")
+                    })
+                    .filter_map(|e| {
+                        let p = e.path();
+                        let mtime = e.metadata().ok()?.modified().ok()?;
+                        Some((p, mtime))
+                    })
+                    .filter(|(p, _)| is_socket_alive(p))
+                    .collect();
+                if let Some(ref t) = tag {
+                    if let Some(matched) = candidates.iter().find(|(p, _)| {
+                        p.file_name()
+                            .map(|n| n.to_string_lossy().contains(t.as_str()))
+                            .unwrap_or(false)
+                    }) {
+                        return Some(matched.0.clone());
+                    }
                 }
+                candidates.sort_by_key(|(_, mt)| std::cmp::Reverse(*mt));
+                if let Some((p, _)) = candidates.first() {
+                    return Some(p.clone());
+                }
+                diag.push("~/Library/Application Support/term-mesh/*.sock (none responding)".to_string());
             }
-            candidates.sort_by_key(|(_, mt)| std::cmp::Reverse(*mt));
-            if let Some((p, _)) = candidates.first() {
-                return Some(p.clone());
+            Err(_) => {
+                diag.push("~/Library/Application Support/term-mesh/ (directory not found)".to_string());
             }
         }
     }
@@ -2319,14 +2346,21 @@ fn detect_socket() -> Option<PathBuf> {
         "/tmp/term-mesh.sock",
         "/tmp/cmux.sock",
     ];
+    let mut glob_found_any = false;
     for pattern in &patterns {
         if let Ok(paths) = glob::glob(pattern) {
             for entry in paths.flatten() {
+                glob_found_any = true;
                 if is_socket_alive(&entry) {
                     return Some(entry);
                 }
             }
         }
+    }
+    if glob_found_any {
+        diag.push("/tmp/term-mesh*.sock (found but not responding)".to_string());
+    } else {
+        diag.push("/tmp/term-mesh*.sock (none found)".to_string());
     }
     None
 }
@@ -3158,22 +3192,33 @@ fn main() {
         leader_session,
     } = &cli.command
     {
-        let sock = detect_daemon_socket()
-            .or_else(detect_socket)
-            .unwrap_or_else(|| {
-                eprintln!("Error: no daemon socket found");
-                process::exit(1);
-            });
+        let sock = {
+            let (s, diag) = detect_socket_verbose();
+            detect_daemon_socket().or(s).unwrap_or_else(|| {
+                eprintln!("Error: cannot reach the term-mesh daemon.");
+                for msg in &diag {
+                    eprintln!("  Tried: {msg}");
+                }
+                eprintln!();
+                eprintln!("Is term-mesh.app running? Re-launch the app or set TERMMESH_SOCKET.");
+                process::exit(2);
+            })
+        };
         run_xmb_bridge(&sock, *timeout, leader_session.as_deref());
         return;
     }
 
-    let sock = match detect_socket() {
-        Some(s) => s,
-        None => {
-            eprintln!("Error: no socket found");
-            process::exit(1);
-        }
+    let sock = {
+        let (s, diag) = detect_socket_verbose();
+        s.unwrap_or_else(|| {
+            eprintln!("Error: cannot reach the term-mesh daemon.");
+            for msg in &diag {
+                eprintln!("  Tried: {msg}");
+            }
+            eprintln!();
+            eprintln!("Is term-mesh.app running? Re-launch the app or set TERMMESH_SOCKET.");
+            process::exit(2);
+        })
     };
 
     let team = env::var("TERMMESH_TEAM").unwrap_or_else(|_| "live-team".into());
