@@ -151,6 +151,9 @@ final class MenuBarExtraController: NSObject, NSMenuDelegate {
         menu.addItem(PeerServerMenu.stopItem())
         menu.addItem(.separator())
 
+        menu.addItem(TmuxMenu.connectItem())
+        menu.addItem(.separator())
+
         quitItem.target = self
         quitItem.action = #selector(quitAction)
         menu.addItem(quitItem)

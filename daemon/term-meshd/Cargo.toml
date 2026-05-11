@@ -12,6 +12,10 @@ path = "src/lib.rs"
 name = "term-meshd"
 path = "src/main.rs"
 
+[[bin]]
+name = "term-meshd-tmux-relay"
+path = "src/bin/tmux_relay.rs"
+
 [dependencies]
 # Async runtime
 tokio = { version = "1", features = ["full"] }
