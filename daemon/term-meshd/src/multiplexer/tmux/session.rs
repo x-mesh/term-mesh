@@ -27,6 +27,7 @@ impl TmuxSession {
     pub async fn connect(host: &str, session: &str) -> Result<(Self, mpsc::Receiver<(SurfaceId, Vec<u8>)>)> {
         let mut child = Command::new("ssh")
             .args([
+                "-tt",
                 "-o", "LogLevel=QUIET",
                 "-o", "StrictHostKeyChecking=accept-new",
                 host,

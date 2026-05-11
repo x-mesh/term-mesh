@@ -3521,15 +3521,22 @@ fn main() {
         Commands::TaskClear2 => rpc_call(&sock, "team.task.clear", json!({ "team_name": team })),
         Commands::Peer(_) => unreachable!("peer commands exit before detect_socket()"),
         Commands::Runbook(_) => unreachable!("runbook commands exit before detect_socket()"),
-        Commands::Multiplexer(sub) => match sub {
-            MultiplexerCommands::Tmux(TmuxCommands::Attach { host, session }) => {
-                rpc_call(
-                    &sock,
-                    "multiplexer.tmux.attach",
-                    json!({ "host": host, "session": session }),
-                )
+        Commands::Multiplexer(sub) => {
+            // Multiplexer RPCs live in term-meshd (daemon), not the Swift app socket.
+            let daemon_sock = detect_daemon_socket().unwrap_or_else(|| {
+                eprintln!("Error: no daemon socket found — is term-meshd running?");
+                process::exit(1);
+            });
+            match sub {
+                MultiplexerCommands::Tmux(TmuxCommands::Attach { host, session }) => {
+                    rpc_call(
+                        &daemon_sock,
+                        "multiplexer.tmux.attach",
+                        json!({ "host": host, "session": session }),
+                    )
+                }
             }
-        },
+        }
         Commands::Status => {
             // Inject version info into the team.status response JSON
             let mut status = rpc_call(&sock, "team.status", json!({ "team_name": team }))
