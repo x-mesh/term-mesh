@@ -680,16 +680,32 @@ impl TmuxControlBackend {
         sess.write_command(&cmd).await
     }
 
-    /// Per ADR 0002 §"Resize Policy": resize applies to the tmux client as a
-    /// whole (`refresh-client -C`).  `surface_id` is accepted for API symmetry
-    /// but is not used to scope the resize to an individual pane.
-    async fn resize_impl(&self, _surface_id: SurfaceId, size: CellSize) -> Result<()> {
+    /// Phase 1.1 resize policy: each attached surface drives its own pane
+    /// via `resize-pane -t %N -x cols -y rows`.
+    ///
+    /// The previous client-wide `refresh-client -C` was racy under the
+    /// multi-pane mirror (Step 5+): N secondary relays each running
+    /// SIGWINCH would call resize() with their own slot dimensions, and
+    /// whichever update arrived last would shrink the entire client view
+    /// to one slot's size — leaving panes mis-sized and content clipped.
+    ///
+    /// resize-pane targets a specific pane and is idempotent under
+    /// concurrent calls against different panes. tmux re-balances the
+    /// surrounding layout to satisfy each absolute size.
+    ///
+    /// If the surface has no registered pane id yet (e.g. attach RPC
+    /// raced ahead of the first %output mapping), fall back to the
+    /// client-wide refresh so the initial size still propagates.
+    async fn resize_impl(&self, surface_id: SurfaceId, size: CellSize) -> Result<()> {
         let sess = self.tmux_session.read().await;
         let sess = sess
             .as_ref()
             .ok_or_else(|| anyhow!("no active session — call attach_surface first"))?;
-        sess.write_command(&encoder::refresh_client_size(size.cols, size.rows))
-            .await
+        let cmd = match self.surface_map.lookup_pane(&surface_id).await {
+            Some(pane_id) => encoder::resize_pane(&pane_id, size.cols, size.rows),
+            None => encoder::refresh_client_size(size.cols, size.rows),
+        };
+        sess.write_command(&cmd).await
     }
 
     /// Per ADR 0002 §"WorkspaceControl encoding" — dispatch pane lifecycle
@@ -799,7 +815,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn resize_writes_refresh_client_command() {
+    async fn resize_falls_back_to_refresh_client_when_pane_unmapped() {
+        // Phase 1.1: resize() prefers per-pane `resize-pane` once the
+        // surface has a known pane id. With no mapping yet (e.g. before
+        // the first %output frame), it falls back to the client-wide
+        // refresh so the initial size still reaches tmux.
         let backend = TmuxControlBackend::new("localhost", "test-session");
         let (sess, stdout) = make_fake_session();
         *backend.tmux_session.write().await = Some(Arc::new(sess));
@@ -815,6 +835,27 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(read_line(stdout).await, "refresh-client -C 120x40");
+    }
+
+    #[tokio::test]
+    async fn resize_targets_mapped_pane_with_resize_pane() {
+        let backend = TmuxControlBackend::new("localhost", "test-session");
+        let (sess, stdout) = make_fake_session();
+        backend
+            .inject_for_test(sess, "%3", SurfaceId("surf-x".into()))
+            .await;
+
+        backend
+            .resize(
+                SurfaceId("surf-x".into()),
+                CellSize {
+                    cols: 100,
+                    rows: 30,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(read_line(stdout).await, "resize-pane -t %3 -x 100 -y 30");
     }
 
     // ── control ───────────────────────────────────────────────────────────────
@@ -1028,7 +1069,9 @@ mod tests {
         // Pane → surface mapping is bidirectional.
         let resolved = backend.surface_map.lookup_surface("%2").await;
         assert_eq!(resolved.as_ref().map(|s| s.0.as_str()), Some(sid.0.as_str()));
-        // Resize is best-effort but must have been written exactly once.
-        assert_eq!(read_line(stdout).await, "refresh-client -C 120x40");
+        // attach_additional_pane registers the pane *before* the
+        // best-effort resize, so the resize takes the per-pane path
+        // (Phase 1.1 multi-pane fix).
+        assert_eq!(read_line(stdout).await, "resize-pane -t %2 -x 120 -y 40");
     }
 }

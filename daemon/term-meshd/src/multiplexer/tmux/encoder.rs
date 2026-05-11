@@ -28,6 +28,17 @@ pub fn refresh_client_size(cols: u16, rows: u16) -> String {
     format!("refresh-client -C {}x{}", cols, rows)
 }
 
+/// Per Phase 1.1: resize a specific tmux pane to an absolute size in cells.
+///
+/// Used by the per-pane resize path so multiple Bonsplit slots can each
+/// drive their own pane independently. Unlike `refresh-client -C`, this
+/// does NOT race when multiple control-mode clients (or, in our case,
+/// multiple relay processes attached to the same tmux client) push
+/// resize events simultaneously — each call targets a different pane.
+pub fn resize_pane(pane_id: &str, cols: u16, rows: u16) -> String {
+    format!("resize-pane -t {} -x {} -y {}", pane_id, cols, rows)
+}
+
 /// Per ADR 0002: respond to a `%pause` notification by suspending or resuming
 /// tmux's output to this client.
 ///
