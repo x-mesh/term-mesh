@@ -2,6 +2,24 @@
 
 All notable changes to term-mesh are documented here.
 
+## [0.106.0] - 2026-05-11
+
+### Added
+- **Peer Workspace inner sidebar** — opening a Peer Workspace window now shows a host-workspaces sidebar inside the window itself, so you can switch between a peer host's workspaces without going back to the main window. The main window also gains a "Remote Hosts" section in its sidebar listing all peers you have configured.
+- **Keychain-backed Peer ID with Settings UI** — your peer identity is now stored in the macOS Keychain and surfaced in a dedicated Settings panel; previously the ID lived only in plaintext on disk and there was no in-app way to inspect or rotate it.
+- **`tm-agent watch` CLI for live agent events** — a new CLI subcommand streams JSONL events (task status changes, agent replies, stale heartbeats) from the daemon as they happen, replacing the previous "poll `tm-agent status` every few seconds" workflow that leader sessions had to use. Backed by a new `events.subscribe` RPC and a 30s stale-heartbeat scanner that broadcasts a `heartbeat_stale` event when an agent stops checking in.
+- **`xm-build` reply bridge for tm-agent tasks** — when an agent's reply includes a `XMB_TASK:` line in its Standard Header, the daemon now writes the status straight into the matching `xm-build` `tasks.json`, so dogfooding tm-agent with xm-build no longer requires the leader to hand-edit task files.
+
+### Fixed
+- **Enter key intermittently swallowed during workspace transitions and after `tm-agent delegate`** — three independent races in the paste/Return pipeline are addressed:
+  - `processPaste()` no longer leaves `pasteInFlight = true` when the surface is momentarily nil (e.g., during peer workspace split or close), which used to block every subsequent paste/Enter for up to 8 seconds until the watchdog fired. The flag is now cleared on the surface-nil path so the next trigger drains the queue immediately.
+  - `team.delegate` now waits for an actual paste-completion ack before responding to the Rust CLI, instead of letting the CLI rely on a hard-coded 150 ms sleep. The CLI also drops its post-ack delay from 150 ms to 20 ms now that ordering is guaranteed at the Swift layer.
+  - The new ack timeout is aligned with the paste watchdog (12 s ≥ 8 s watchdog + retry budget + margin) so a timeout firing first can no longer leave a stale paste queued behind a Return that the CLI already suppressed — the bug-the-fix-introduced regression that the original ack patch shipped with.
+
+### Thanks to 1 contributor!
+
+- [@JINWOO-J](https://github.com/JINWOO-J)
+
 ## [0.105.0] - 2026-05-10
 
 ### Added
