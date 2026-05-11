@@ -1927,6 +1927,7 @@ func pushTargetSurfaceSize(_ size: CGSize) {
             Self.focusLog("becomeFirstResponder: surface=\(terminalSurface?.id.uuidString ?? "nil") deltaSinceScrollMs=\(String(format: "%.2f", deltaMs))")
 #if DEBUG
             dlog("focus.firstResponder surface=\(terminalSurface?.id.uuidString.prefix(5) ?? "nil")")
+            dlog("ime.becomeFirstResponder hasMarkedText=\(markedText.length > 0) surface=\(terminalSurface?.id.uuidString.prefix(5) ?? "nil")")
             if let terminalSurface {
                 AppDelegate.shared?.recordJumpUnreadFocusIfExpected(
                     tabId: terminalSurface.tabId,
@@ -1965,6 +1966,9 @@ func pushTargetSurfaceSize(_ size: CGSize) {
     override func resignFirstResponder() -> Bool {
         let hadMarkedText = markedText.length > 0
         let result = super.resignFirstResponder()
+        #if DEBUG
+        dlog("ime.resignFirstResponder hadMarkedText=\(hadMarkedText) resigned=\(result) surface=\(terminalSurface?.id.uuidString.prefix(5) ?? "nil")")
+        #endif
         if result && hadMarkedText {
             // Clear IME composition after confirmed resign to prevent stale
             // markedText ranges causing NSRangeException (TERM-MESH-9 prevention).
@@ -2343,6 +2347,11 @@ func pushTargetSurfaceSize(_ size: CGSize) {
         // breaks vim normal-mode switching over SSH even when no IME box is open.
         let isEscape = event.keyCode == 53 // kVK_Escape
         keyEvent.composing = !isEscape && (markedText.length > 0 || markedTextBefore)
+        #if DEBUG
+        if event.keyCode == 36 && (markedTextBefore || markedText.length > 0) {
+            dlog("ime.return_with_markedText markedTextBefore=\(markedTextBefore) hasMarkedText=\(markedText.length > 0) composing=\(keyEvent.composing) surface=\(terminalSurface?.id.uuidString.prefix(5) ?? "nil")")
+        }
+        #endif
 
         // Use accumulated text from insertText (for IME), or compute text for key
         if let accumulated = keyTextAccumulator, !accumulated.isEmpty {
