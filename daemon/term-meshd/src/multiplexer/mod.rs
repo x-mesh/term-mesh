@@ -32,15 +32,24 @@ pub struct RemoteWorkspace {
 /// Produced by `attach_surface`; consumer drives the terminal emulator.
 pub type RemoteSurfaceStream = mpsc::Receiver<Vec<u8>>;
 
-/// High-level workspace control requests.
+/// Direction for pane splits — per ADR 0002 §"WorkspaceControl encoding".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SplitDirection {
+    /// Side-by-side split (`split-window -h`).
+    Horizontal,
+    /// Stacked split (`split-window -v`).
+    Vertical,
+}
+
+/// High-level workspace control requests — Phase 1.1 variants.
 #[derive(Debug, Clone)]
 pub enum WorkspaceControl {
-    /// Rename the workspace.
-    Rename { name: String },
-    /// Split the current pane.
-    Split { vertical: bool },
-    /// Close a specific surface.
-    CloseSurface { id: SurfaceId },
+    /// Split `pane_id` in the given direction.
+    SplitPane { pane_id: String, direction: SplitDirection },
+    /// Close the pane identified by `pane_id`.
+    KillPane { pane_id: String },
+    /// Focus the pane identified by `pane_id`.
+    SelectPane { pane_id: String },
 }
 
 /// Per ADR 0001 §"tmux Adapter Boundary" — backend contract shared by

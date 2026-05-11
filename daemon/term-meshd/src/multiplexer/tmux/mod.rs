@@ -19,8 +19,8 @@ use anyhow::{anyhow, Result};
 use tokio::sync::{mpsc, RwLock};
 
 use crate::multiplexer::{
-    CellSize, RemoteMultiplexerBackend, RemoteSurfaceStream, RemoteWorkspace, SurfaceId,
-    WorkspaceControl,
+    CellSize, RemoteMultiplexerBackend, RemoteSurfaceStream, RemoteWorkspace,
+    SurfaceId, WorkspaceControl,
 };
 use surface::SurfaceMap;
 
@@ -131,29 +131,46 @@ impl RemoteMultiplexerBackend for TmuxControlBackend {
         sess.write_command(&cmd).await
     }
 
-    async fn resize(&self, surface_id: SurfaceId, size: CellSize) -> Result<()> {
-        let _ = (surface_id, size);
-        // Phase 1.1 next slice: send refresh_client_size via write_command
-        Ok(())
+    /// Per ADR 0002 §"Resize Policy": resize applies to the tmux client as a
+    /// whole (`refresh-client -C`).  `surface_id` is accepted for API symmetry
+    /// but is not used to scope the resize to an individual pane.
+    async fn resize(&self, _surface_id: SurfaceId, size: CellSize) -> Result<()> {
+        let sess = self.tmux_session.read().await;
+        let sess = sess
+            .as_ref()
+            .ok_or_else(|| anyhow!("no active session — call attach_surface first"))?;
+        sess.write_command(&encoder::refresh_client_size(size.cols, size.rows)).await
     }
 
+    /// Per ADR 0002 §"WorkspaceControl encoding" — dispatch pane lifecycle
+    /// commands through the control-mode session.
     async fn control(&self, command: WorkspaceControl) -> Result<()> {
-        let _ = command;
-        // Phase 1.2+
-        Ok(())
+        let sess = self.tmux_session.read().await;
+        let sess = sess
+            .as_ref()
+            .ok_or_else(|| anyhow!("no active session — call attach_surface first"))?;
+        let cmd = match command {
+            WorkspaceControl::SplitPane { pane_id, direction } =>
+                encoder::split_window(&pane_id, direction),
+            WorkspaceControl::KillPane { pane_id } =>
+                encoder::kill_pane(&pane_id),
+            WorkspaceControl::SelectPane { pane_id } =>
+                encoder::select_pane(&pane_id),
+        };
+        sess.write_command(&cmd).await
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::multiplexer::SplitDirection;
     use tokio::process::Command;
     use tokio::sync::mpsc;
     use tokio::io::AsyncBufReadExt;
     use std::time::Duration;
 
     fn make_fake_session() -> (session::TmuxSession, tokio::process::ChildStdout) {
-        // Use `cat` as a fake tmux stdin sink + stdout echo.
         let mut child = Command::new("cat")
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
@@ -164,6 +181,17 @@ mod tests {
         let (tx, _rx) = mpsc::channel(1);
         (session::TmuxSession::from_parts(child, stdin, tx), stdout)
     }
+
+    async fn read_line(stdout: tokio::process::ChildStdout) -> String {
+        let mut reader = tokio::io::BufReader::new(stdout).lines();
+        tokio::time::timeout(Duration::from_secs(1), reader.next_line())
+            .await
+            .expect("timeout")
+            .expect("io error")
+            .expect("eof")
+    }
+
+    // ── send_input ────────────────────────────────────────────────────────────
 
     #[tokio::test]
     async fn send_input_no_session_returns_error() {
@@ -177,7 +205,6 @@ mod tests {
     async fn send_input_unknown_surface_returns_error() {
         let backend = TmuxControlBackend::new("localhost", "test-session");
         let (sess, _stdout) = make_fake_session();
-        // Inject session but do NOT register the surface being sent to.
         *backend.tmux_session.write().await = Some(Arc::new(sess));
 
         let result = backend.send_input(SurfaceId("ghost".into()), b"x".to_vec()).await;
@@ -191,15 +218,62 @@ mod tests {
         let (sess, stdout) = make_fake_session();
         backend.inject_for_test(sess, "%1", SurfaceId("surf-1".into())).await;
 
-        // Send bytes 0x41 0x42 ('A' 'B') — expect "send-keys -t %1 -H 41 42"
         backend.send_input(SurfaceId("surf-1".into()), vec![0x41, 0x42]).await.unwrap();
+        assert_eq!(read_line(stdout).await, "send-keys -t %1 -H 41 42");
+    }
 
-        let mut reader = tokio::io::BufReader::new(stdout).lines();
-        let line = tokio::time::timeout(Duration::from_secs(1), reader.next_line())
-            .await
-            .expect("timeout waiting for command")
-            .expect("io error")
-            .expect("eof before command");
-        assert_eq!(line, "send-keys -t %1 -H 41 42");
+    // ── resize ────────────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn resize_no_session_returns_error() {
+        let backend = TmuxControlBackend::new("localhost", "test-session");
+        let result = backend.resize(SurfaceId("s".into()), CellSize { cols: 80, rows: 24 }).await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("no active session"));
+    }
+
+    #[tokio::test]
+    async fn resize_writes_refresh_client_command() {
+        let backend = TmuxControlBackend::new("localhost", "test-session");
+        let (sess, stdout) = make_fake_session();
+        *backend.tmux_session.write().await = Some(Arc::new(sess));
+
+        backend.resize(SurfaceId("s".into()), CellSize { cols: 120, rows: 40 }).await.unwrap();
+        assert_eq!(read_line(stdout).await, "refresh-client -C 120x40");
+    }
+
+    // ── control ───────────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn control_split_writes_split_window() {
+        let backend = TmuxControlBackend::new("localhost", "test-session");
+        let (sess, stdout) = make_fake_session();
+        *backend.tmux_session.write().await = Some(Arc::new(sess));
+
+        backend.control(WorkspaceControl::SplitPane {
+            pane_id: "%1".into(),
+            direction: SplitDirection::Horizontal,
+        }).await.unwrap();
+        assert_eq!(read_line(stdout).await, "split-window -h -t %1");
+    }
+
+    #[tokio::test]
+    async fn control_kill_writes_kill_pane() {
+        let backend = TmuxControlBackend::new("localhost", "test-session");
+        let (sess, stdout) = make_fake_session();
+        *backend.tmux_session.write().await = Some(Arc::new(sess));
+
+        backend.control(WorkspaceControl::KillPane { pane_id: "%2".into() }).await.unwrap();
+        assert_eq!(read_line(stdout).await, "kill-pane -t %2");
+    }
+
+    #[tokio::test]
+    async fn control_select_writes_select_pane() {
+        let backend = TmuxControlBackend::new("localhost", "test-session");
+        let (sess, stdout) = make_fake_session();
+        *backend.tmux_session.write().await = Some(Arc::new(sess));
+
+        backend.control(WorkspaceControl::SelectPane { pane_id: "%3".into() }).await.unwrap();
+        assert_eq!(read_line(stdout).await, "select-pane -t %3");
     }
 }
