@@ -10,6 +10,7 @@
 //!
 //! The parser is fed one line at a time via `feed_line`.
 
+use super::layout::{parse_window_layout, WindowLayout};
 use super::octal::unescape_octal;
 
 /// State of the control-mode line parser.
@@ -37,6 +38,16 @@ pub enum TmuxEvent {
     /// The active session changed (per ADR 0002 §"Whitelisted Events").
     /// Format: `%session-changed <session-id> <name>`
     SessionChanged { session_id: String, name: String },
+    /// Per ADR 0002 §"Layout Parser" — tmux emits this on every pane
+    /// split / close / resize. Format:
+    ///   `%layout-change @<window-id> <layout-string> [<visible-layout> <flags>]`
+    /// We keep only the canonical layout. `raw` preserves the original
+    /// string for debugging when the structured `layout` parse fails.
+    LayoutChange {
+        window_id: String,
+        raw: String,
+        layout: Option<WindowLayout>,
+    },
     /// tmux is exiting.
     Exit,
     /// Start of a command block response.
@@ -208,12 +219,32 @@ impl ControlModeParser {
             return events;
         }
 
+        if let Some(rest) = line.strip_prefix(b"%layout-change ") {
+            // Format: %layout-change @<window-id> <layout> [<visible-layout> <flags>]
+            // We only care about <window-id> + the first <layout> token.
+            // Anything after the second space is informational and discarded.
+            let mut fields = rest.splitn(3, |b| *b == b' ');
+            let window_id = fields.next().map(lossy_string).unwrap_or_default();
+            let raw = fields.next().map(lossy_string).unwrap_or_default();
+            let layout = if raw.is_empty() {
+                None
+            } else {
+                parse_window_layout(&raw).ok()
+            };
+            events.push(TmuxEvent::LayoutChange {
+                window_id,
+                raw,
+                layout,
+            });
+            return events;
+        }
+
         if line == b"%exit" {
             events.push(TmuxEvent::Exit);
             return events;
         }
 
-        // %layout-change and other notifications — ignore per Phase 1.0 scope.
+        // Other Phase 1.0+ notifications fall through as Unknown.
         if line.starts_with(b"%") {
             events.push(TmuxEvent::Unknown(lossy_string(line)));
         }
@@ -330,9 +361,65 @@ mod tests {
     #[test]
     fn unknown_notification_stored() {
         let mut p = ControlModeParser::new();
+        // A real notification we haven't whitelisted — the channel still
+        // surfaces it so debug logs can flag it.
+        let ev = p.feed_line("%window-renamed @0 dev");
+        assert_eq!(ev.len(), 1);
+        assert!(matches!(&ev[0], TmuxEvent::Unknown(s) if s.contains("window-renamed")));
+    }
+
+    #[test]
+    fn layout_change_unparseable_payload_preserves_raw() {
+        let mut p = ControlModeParser::new();
         let ev = p.feed_line("%layout-change @0 some-layout-data");
         assert_eq!(ev.len(), 1);
-        assert!(matches!(&ev[0], TmuxEvent::Unknown(s) if s.contains("layout-change")));
+        match &ev[0] {
+            TmuxEvent::LayoutChange {
+                window_id,
+                raw,
+                layout,
+            } => {
+                assert_eq!(window_id, "@0");
+                assert_eq!(raw, "some-layout-data");
+                assert!(layout.is_none());
+            }
+            other => panic!("expected LayoutChange, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn layout_change_with_well_formed_layout_decodes_tree() {
+        let mut p = ControlModeParser::new();
+        let ev = p.feed_line("%layout-change @0 abcd,80x24,0,0,1");
+        assert_eq!(ev.len(), 1);
+        let TmuxEvent::LayoutChange {
+            window_id,
+            layout: Some(layout),
+            ..
+        } = &ev[0]
+        else {
+            panic!("expected LayoutChange with decoded layout, got {:?}", ev[0]);
+        };
+        assert_eq!(window_id, "@0");
+        assert_eq!(layout.checksum, 0xabcd);
+        assert_eq!(layout.root.pane_indices(), vec![1]);
+    }
+
+    #[test]
+    fn layout_change_ignores_trailing_visible_layout_and_flags() {
+        let mut p = ControlModeParser::new();
+        let ev = p.feed_line(
+            "%layout-change @0 abcd,80x24,0,0{40x24,0,0,0,40x24,40,0,1} efgh,80x24,0,0,1 *",
+        );
+        assert_eq!(ev.len(), 1);
+        let TmuxEvent::LayoutChange {
+            layout: Some(layout),
+            ..
+        } = &ev[0]
+        else {
+            panic!("expected LayoutChange, got {:?}", ev[0]);
+        };
+        assert_eq!(layout.root.pane_indices(), vec![0, 1]);
     }
 
     #[test]

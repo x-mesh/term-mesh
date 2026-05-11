@@ -8,6 +8,7 @@
 //!             `encoder::send_keys_hex`; session handle retained after connect.
 
 pub mod encoder;
+pub mod layout;
 pub mod octal;
 pub mod parser;
 pub mod session;
@@ -26,6 +27,34 @@ use surface::SurfaceMap;
 
 fn shell_single_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+/// Parse the tab-separated output of `tmux list-panes -F` with the format
+/// string used by [`TmuxControlBackend::fetch_panes`]. Rows that don't have
+/// the expected six fields are silently dropped — a partial line is far
+/// less useful than an explicit error, but it should not poison the rest
+/// of the response.
+fn parse_list_panes(stdout: &str) -> Vec<RemotePane> {
+    stdout
+        .lines()
+        .filter_map(|line| {
+            let mut cols = line.split('\t');
+            let pane_id = cols.next()?.trim().to_string();
+            let pane_index: u32 = cols.next()?.trim().parse().ok()?;
+            let active = cols.next()?.trim() == "1";
+            let width: u16 = cols.next()?.trim().parse().ok()?;
+            let height: u16 = cols.next()?.trim().parse().ok()?;
+            let command = cols.next().unwrap_or("").trim().to_string();
+            Some(RemotePane {
+                pane_id,
+                pane_index,
+                active,
+                width,
+                height,
+                command,
+            })
+        })
+        .collect()
 }
 
 fn capture_pane_commands(
@@ -70,6 +99,24 @@ fn capture_pane_commands(
 pub struct TmuxCapture {
     pub bytes: Vec<u8>,
     pub alternate_screen: bool,
+}
+
+/// Phase 1.1: metadata for a single tmux pane within the attached window.
+///
+/// Sourced from `tmux list-panes -F '#{pane_id} #{pane_index} #{pane_active}
+///   #{pane_width} #{pane_height} #{pane_current_command}'` so each row is
+/// fully self-describing — the caller does not need to issue a follow-up
+/// query just to learn the dimensions.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemotePane {
+    /// tmux control-mode id, e.g. `%1`.
+    pub pane_id: String,
+    /// 0-based pane index within the window — matches layout-string leaves.
+    pub pane_index: u32,
+    pub active: bool,
+    pub width: u16,
+    pub height: u16,
+    pub command: String,
 }
 
 /// A parsed PTY output frame from a remote tmux pane.  Broadcast to all active
@@ -373,40 +420,24 @@ impl TmuxControlBackend {
             sess.write_command(&encoder::refresh_client_size(size.cols, size.rows))
                 .await?;
 
-            // Pre-register the real tmux pane_id via a lightweight non-interactive
-            // SSH query so that send_input works immediately without waiting for the
-            // first %output event.  On failure we fall back to lazy registration in
-            // the demux task (send_input will work after the first output frame).
-            // `#{pane_id}` must be single-quoted to prevent the remote shell from
-            // treating `#` as a comment character when SSH passes arguments as a
-            // space-joined command string to the remote shell.
-            let list_panes_cmd = format!(
-                "tmux list-panes -t {} -F '#{{pane_id}}'",
-                shell_single_quote(&self.session_name)
-            );
-            if let Ok(out) = tokio::process::Command::new("ssh")
-                .args([
-                    "-o",
-                    "StrictHostKeyChecking=accept-new",
-                    "-o",
-                    "LogLevel=QUIET",
-                    "-o",
-                    "ConnectTimeout=5",
-                    &self.host,
-                    &list_panes_cmd,
-                ])
-                .output()
-                .await
-            {
-                let stdout = String::from_utf8_lossy(&out.stdout);
-                if let Some(pane_id) = stdout
-                    .lines()
-                    .next()
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty())
-                {
-                    self.surface_map.register(pane_id, surface_id.clone()).await;
-                }
+            // Pre-register the *active* tmux pane so send_input works
+            // immediately without waiting for the first %output frame. With
+            // multi-pane support we cannot blindly pick `list-panes`'s first
+            // row — it would bind the caller's surface to whichever pane
+            // happened to be created first, which is almost never the user's
+            // currently focused pane. We prefer the active pane and fall back
+            // to the first listed pane only when the query fails.
+            //
+            // `#{...}` is single-quoted to prevent the remote shell from
+            // treating `#` as a comment character when SSH joins arguments.
+            let panes = self.fetch_panes().await.unwrap_or_default();
+            let primary_pane_id = panes
+                .iter()
+                .find(|p| p.active)
+                .or_else(|| panes.first())
+                .map(|p| p.pane_id.clone());
+            if let Some(pane_id) = primary_pane_id {
+                self.surface_map.register(pane_id, surface_id.clone()).await;
             }
 
             // Retain the session handle for send_input / resize.
@@ -416,42 +447,45 @@ impl TmuxControlBackend {
             // to the broadcast channel for subscribe_output() callers.
             //
             // `session_rx` delivers (SurfaceId(real_pane_id), bytes) where
-            // real_pane_id is the tmux control-mode id (e.g. "%1").  On the
-            // first frame we also lazy-register (idempotent if pre-registration
-            // already succeeded above).
+            // real_pane_id is the tmux control-mode id (e.g. "%1"). The
+            // demux only routes frames whose pane_id has been explicitly
+            // registered (via attach_surface or attach_additional_pane);
+            // unknown panes are still broadcast so subscribers can see them,
+            // but their bytes are not forwarded to any per-surface mpsc.
+            //
+            // Frames for not-yet-attached panes are dropped intentionally —
+            // callers that attach additional panes later issue
+            // `multiplexer.tmux.capture` to seed the visible screen, per
+            // ADR 0002 §"Scrollback seed".
 
             let senders = Arc::clone(&self.surface_senders);
             let output_tx = self.output_tx.clone();
             let surface_map_demux = self.surface_map.clone();
-            let surface_id_demux = surface_id.clone();
             let mut demux_rx = session_rx;
             tokio::spawn(async move {
-                let mut pane_registered = false;
                 while let Some((sid, bytes)) = demux_rx.recv().await {
-                    // sid.0 is the real tmux pane_id (e.g. "%1").
-                    if !pane_registered {
-                        surface_map_demux
-                            .register(sid.0.clone(), surface_id_demux.clone())
-                            .await;
-                        pane_registered = true;
+                    let pane_id = sid.0;
+                    let mapped_surface = surface_map_demux.lookup_surface(&pane_id).await;
+                    if let Some(ref surf) = mapped_surface {
+                        let per_surface_tx = {
+                            senders
+                                .read()
+                                .await
+                                .get(surf)
+                                .filter(|tx| !tx.is_closed())
+                                .cloned()
+                        };
+                        if let Some(tx) = per_surface_tx {
+                            let _ = tx.try_send(bytes.clone());
+                        }
                     }
-                    // Per-surface mpsc — keyed by UUID surface_id, not pane_id.
-                    let per_surface_tx = {
-                        senders
-                            .read()
-                            .await
-                            .get(&surface_id_demux)
-                            .filter(|tx| !tx.is_closed())
-                            .cloned()
-                    };
-                    if let Some(tx) = per_surface_tx {
-                        let _ = tx.try_send(bytes.clone());
-                    }
-                    // Broadcast with the UUID surface_id so subscribers can
-                    // correlate frames back to their attach call.
-                    let pane_id = sid.0.clone();
+                    // Broadcast with whatever surface_id the frame resolved
+                    // to (or a synthesized "unmapped" id for unknown panes).
+                    // Subscribers filter on surface_id themselves.
+                    let broadcast_surface = mapped_surface
+                        .unwrap_or_else(|| SurfaceId(format!("unmapped:{}", pane_id)));
                     let _ = output_tx.send(OutputFrame {
-                        surface_id: surface_id_demux.clone(),
+                        surface_id: broadcast_surface,
                         pane_id,
                         bytes,
                     });
@@ -460,6 +494,130 @@ impl TmuxControlBackend {
         }
 
         Ok(per_surface_rx)
+    }
+
+    /// Phase 1.1: snapshot all panes in the attached window via a one-shot
+    /// SSH `tmux list-panes`. Does *not* require the control session to be
+    /// open — useful as a discovery step before deciding what to attach.
+    pub async fn list_panes(&self) -> Result<Vec<RemotePane>> {
+        self.fetch_panes().await
+    }
+
+    async fn fetch_panes(&self) -> Result<Vec<RemotePane>> {
+        // Format string is single-quoted to keep `#{...}` away from remote
+        // shell expansion. Tabs separate fields so command names containing
+        // spaces (e.g. "/usr/bin/python3 -m foo") stay in one column.
+        let fmt = "#{pane_id}\t#{pane_index}\t#{pane_active}\t#{pane_width}\t#{pane_height}\t#{pane_current_command}";
+        let cmd = format!(
+            "tmux list-panes -t {} -F {}",
+            shell_single_quote(&self.session_name),
+            shell_single_quote(fmt)
+        );
+        let out = tokio::process::Command::new("ssh")
+            .args([
+                "-o",
+                "BatchMode=yes",
+                "-o",
+                "StrictHostKeyChecking=accept-new",
+                "-o",
+                "LogLevel=QUIET",
+                "-o",
+                "ConnectTimeout=5",
+                &self.host,
+                &cmd,
+            ])
+            .output()
+            .await
+            .map_err(|e| anyhow!("ssh list-panes failed: {e}"))?;
+        if !out.status.success() {
+            return Err(anyhow!(
+                "tmux list-panes failed: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            ));
+        }
+        Ok(parse_list_panes(&String::from_utf8_lossy(&out.stdout)))
+    }
+
+    /// Phase 1.1: fetch the active window's layout string and parse it.
+    /// Returns Err on either an SSH failure or a parse error so the caller
+    /// can decide whether to retry or fall back to `list_panes`.
+    pub async fn current_layout(&self) -> Result<layout::WindowLayout> {
+        let cmd = format!(
+            "tmux display-message -p -t {} {}",
+            shell_single_quote(&self.session_name),
+            shell_single_quote("#{window_layout}")
+        );
+        let out = tokio::process::Command::new("ssh")
+            .args([
+                "-o",
+                "BatchMode=yes",
+                "-o",
+                "StrictHostKeyChecking=accept-new",
+                "-o",
+                "LogLevel=QUIET",
+                "-o",
+                "ConnectTimeout=5",
+                &self.host,
+                &cmd,
+            ])
+            .output()
+            .await
+            .map_err(|e| anyhow!("ssh display-message failed: {e}"))?;
+        if !out.status.success() {
+            return Err(anyhow!(
+                "tmux display-message failed: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            ));
+        }
+        let raw = String::from_utf8_lossy(&out.stdout);
+        layout::parse_window_layout(raw.trim())
+    }
+
+    /// Phase 1.1: attach an additional pane on the existing SSH+tmux session.
+    /// Returns a freshly minted SurfaceId paired with its byte-stream
+    /// receiver. `attach_surface` (or `attach_surface_with_options`) must
+    /// have been called first — this method reuses that session and refuses
+    /// to bootstrap a new one.
+    ///
+    /// The pane is also resized via `refresh-client -C` so the new surface
+    /// matches the caller's terminal dimensions.
+    pub async fn attach_additional_pane(
+        &self,
+        pane_id: &str,
+        size: CellSize,
+    ) -> Result<(SurfaceId, RemoteSurfaceStream)> {
+        let sess_guard = self.tmux_session.read().await;
+        if sess_guard.is_none() {
+            return Err(anyhow!(
+                "attach_additional_pane requires an active session — call attach_surface first"
+            ));
+        }
+        drop(sess_guard);
+
+        // Reject re-attach against the same pane: the existing SurfaceId
+        // already owns the routing slot and overwriting it would silently
+        // strand the previous mpsc receiver.
+        if let Some(existing) = self.surface_map.lookup_surface(pane_id).await {
+            return Err(anyhow!(
+                "pane {pane_id} is already attached as surface {}",
+                existing.0
+            ));
+        }
+
+        let surface_id = SurfaceId(uuid::Uuid::new_v4().to_string());
+        let (tx, rx) = mpsc::channel::<Vec<u8>>(4096);
+        self.surface_senders
+            .write()
+            .await
+            .insert(surface_id.clone(), tx);
+        self.surface_map.register(pane_id, surface_id.clone()).await;
+
+        // Push the caller's size to tmux so the newly attached pane redraws
+        // at the right width/height. Errors are swallowed — resize is a
+        // best-effort sync, not a hard precondition for attach success.
+        let _ = self.resize_impl(surface_id.clone(), size).await;
+
+        Ok((surface_id, rx))
     }
 
     async fn send_input_impl(&self, surface_id: SurfaceId, bytes: Vec<u8>) -> Result<()> {
@@ -740,5 +898,93 @@ mod tests {
             cmds,
             vec![("tmux capture-pane -e -p -N -S -200 -t '%1'".into(), false)]
         );
+    }
+
+    // ── parse_list_panes ─────────────────────────────────────────────────────
+
+    #[test]
+    fn parse_list_panes_extracts_full_pane_metadata() {
+        let raw = concat!(
+            "%1\t0\t1\t80\t24\tzsh\n",
+            "%2\t1\t0\t40\t24\tvim\n",
+        );
+        let panes = parse_list_panes(raw);
+        assert_eq!(
+            panes,
+            vec![
+                RemotePane {
+                    pane_id: "%1".into(),
+                    pane_index: 0,
+                    active: true,
+                    width: 80,
+                    height: 24,
+                    command: "zsh".into(),
+                },
+                RemotePane {
+                    pane_id: "%2".into(),
+                    pane_index: 1,
+                    active: false,
+                    width: 40,
+                    height: 24,
+                    command: "vim".into(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_list_panes_drops_rows_with_missing_fields() {
+        // Last row only has 3 fields → discarded; first two still parse.
+        let raw = "%1\t0\t1\t80\t24\tzsh\n%2\t1\t0\n";
+        let panes = parse_list_panes(raw);
+        assert_eq!(panes.len(), 1);
+        assert_eq!(panes[0].pane_id, "%1");
+    }
+
+    // ── attach_additional_pane ───────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn attach_additional_pane_without_session_errors() {
+        let backend = TmuxControlBackend::new("localhost", "test-session");
+        let err = backend
+            .attach_additional_pane("%2", CellSize { cols: 80, rows: 24 })
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("requires an active session"));
+    }
+
+    #[tokio::test]
+    async fn attach_additional_pane_rejects_duplicate_pane() {
+        let backend = TmuxControlBackend::new("localhost", "test-session");
+        let (sess, _stdout) = make_fake_session();
+        backend
+            .inject_for_test(sess, "%1", SurfaceId("primary".into()))
+            .await;
+
+        let err = backend
+            .attach_additional_pane("%1", CellSize { cols: 80, rows: 24 })
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("already attached"));
+    }
+
+    #[tokio::test]
+    async fn attach_additional_pane_registers_new_surface_and_resizes() {
+        let backend = TmuxControlBackend::new("localhost", "test-session");
+        let (sess, stdout) = make_fake_session();
+        backend
+            .inject_for_test(sess, "%1", SurfaceId("primary".into()))
+            .await;
+
+        let (sid, _rx) = backend
+            .attach_additional_pane("%2", CellSize { cols: 120, rows: 40 })
+            .await
+            .unwrap();
+        assert_ne!(sid.0, "primary");
+        // Pane → surface mapping is bidirectional.
+        let resolved = backend.surface_map.lookup_surface("%2").await;
+        assert_eq!(resolved.as_ref().map(|s| s.0.as_str()), Some(sid.0.as_str()));
+        // Resize is best-effort but must have been written exactly once.
+        assert_eq!(read_line(stdout).await, "refresh-client -C 120x40");
     }
 }
