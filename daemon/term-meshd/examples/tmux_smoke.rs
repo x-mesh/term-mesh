@@ -54,6 +54,7 @@ struct Stats {
     error_events: u64,
     pause_continue_events: u64,
     session_changed_events: u64,
+    layout_change_events: u64,
     exit_events: u64,
     unknown_names: HashMap<String, u64>,
     control_bytes: u64,
@@ -77,6 +78,7 @@ impl Stats {
             TmuxEvent::ErrorBlock(_) => { self.error_events += 1; }
             TmuxEvent::Pause { .. } | TmuxEvent::Continue { .. } => { self.pause_continue_events += 1; }
             TmuxEvent::SessionChanged { .. } => { self.session_changed_events += 1; }
+            TmuxEvent::LayoutChange { .. } => { self.layout_change_events += 1; }
             TmuxEvent::Exit => { self.exit_events += 1; }
             TmuxEvent::Unknown(s) => {
                 let name = s.split_whitespace().next().unwrap_or("?").to_string();

@@ -9,8 +9,15 @@
 //
 // Env vars:
 //   TERMMESH_DAEMON_UNIX_PATH  — path to term-meshd socket (required)
-//   TERMMESH_TMUX_HOST         — SSH host (e.g. ubuntu@100.70.102.125)
-//   TERMMESH_TMUX_SESSION      — tmux session name
+//   TERMMESH_TMUX_HOST         — SSH host (primary mode)
+//   TERMMESH_TMUX_SESSION      — tmux session name (primary mode)
+//
+//   TERMMESH_TMUX_SURFACE_ID   — secondary mode: existing surface_id to
+//                                subscribe to. When set, the relay skips
+//                                the attach/capture bootstrap and goes
+//                                straight to subscribe+stdin forwarding.
+//                                Used by the macOS app to host one Bonsplit
+//                                surface per tmux pane (Phase 1.1).
 
 use std::os::unix::io::AsRawFd;
 use std::path::PathBuf;
@@ -263,9 +270,82 @@ where
     Ok(())
 }
 
+/// Phase 1.1 secondary mode — attach to an already-bound surface_id and
+/// just bridge PTY stdin/stdout against it.
+///
+/// The primary relay (or the app, depending on who calls
+/// `multiplexer.tmux.attach_pane`) handles attach + initial capture +
+/// SIGWINCH handling. The secondary still pushes its own resize on every
+/// SIGWINCH so each Bonsplit pane drives the right `refresh-client` size
+/// when the user drags a divider.
+async fn run_secondary(surface_id: String) -> Result<()> {
+    let sock = daemon_sock();
+
+    // Push the initial size so the remote pane matches our PTY before we
+    // ask for a snapshot. Best-effort: errors do not block subscribe.
+    push_resize(&sock, &surface_id).await;
+
+    // Seed the local screen with the current pane contents — same logic
+    // as the primary path, scoped to the bound surface_id.
+    let mut stdout = tokio::io::stdout();
+    if let Ok(cap) = rpc(
+        &sock,
+        "multiplexer.tmux.capture",
+        json!({ "surface_id": &surface_id }),
+    )
+    .await
+    {
+        let hex = cap["result"]["bytes_hex"].as_str().unwrap_or("");
+        let mut seed_bytes = decode_hex(hex);
+        trim_snapshot_trailing_lf(&mut seed_bytes);
+        let alternate_screen = cap["result"]["alternate_screen"].as_bool().unwrap_or(false);
+        paint_remote_snapshot(&mut stdout, &seed_bytes, alternate_screen).await?;
+    } else {
+        stdout.write_all(b"\x1b[2J\x1b[H").await?;
+        stdout.flush().await?;
+    }
+    drop(stdout);
+
+    let resize_sock = sock.clone();
+    let resize_sid = surface_id.clone();
+    tokio::spawn(async move {
+        let Ok(mut wch) = signal(SignalKind::window_change()) else {
+            return;
+        };
+        while wch.recv().await.is_some() {
+            push_resize(&resize_sock, &resize_sid).await;
+        }
+    });
+
+    let input_sock = sock.clone();
+    let input_sid = surface_id.clone();
+    tokio::spawn(async move {
+        if let Err(e) = forward_stdin_to_daemon(tokio::io::stdin(), input_sock, input_sid).await {
+            eprintln!("tmux relay (secondary) input stopped: {e}");
+        }
+    });
+
+    let subscribe_result =
+        subscribe_output_to_writer(sock.clone(), surface_id.clone(), tokio::io::stdout()).await;
+
+    // Detach is *not* called here — the primary owns the session lifecycle.
+    // Closing this binary just unwires one Bonsplit pane.
+    subscribe_result
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let _raw_stdin_guard = RawStdinGuard::enable();
+
+    // Phase 1.1: if the app already opened the session and called
+    // attach_pane, it passes the resulting surface_id here so we skip
+    // every bootstrap RPC and just stream output / forward input. The
+    // primary relay still owns attach + capture + resize signalling.
+    if let Ok(secondary_surface) = std::env::var("TERMMESH_TMUX_SURFACE_ID") {
+        if !secondary_surface.is_empty() {
+            return run_secondary(secondary_surface).await;
+        }
+    }
 
     let host =
         std::env::var("TERMMESH_TMUX_HOST").unwrap_or_else(|_| "ubuntu@100.70.102.125".into());

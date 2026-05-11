@@ -10,6 +10,7 @@ use tokio::time::{timeout, Duration};
 use crate::agent::AgentSessionManager;
 use crate::headless::HeadlessManager;
 use crate::monitor::{Anomaly, MonitorHandle, SystemSnapshot};
+use crate::multiplexer::tmux::layout::LayoutNode;
 use crate::multiplexer::tmux::TmuxControlBackend;
 use crate::multiplexer::{
     CellSize, RemoteMultiplexerBackend, SplitDirection, SurfaceId, WorkspaceControl,
@@ -441,6 +442,11 @@ async fn stream_subscribe_tmux_output(
     };
 
     let mut output_rx = backend.subscribe_output();
+    // Phase 1.1 multi-pane: one backend can now own several surface_ids
+    // (the primary attach + every attach_pane), and they all share a
+    // single broadcast channel. Filter here so a subscribe call for pane
+    // %1 never sees frames destined for pane %2.
+    let filter_surface = p.surface_id.clone();
 
     // ACK.
     let ack = serde_json::json!({ "id": req.id, "result": { "status": "subscribed", "surface_id": p.surface_id }, "error": null });
@@ -465,7 +471,10 @@ async fn stream_subscribe_tmux_output(
                 }
                 recv = output_rx.recv() => {
                     match recv {
-                        Ok(frame) => Some(serialize_output_frame(&frame)),
+                        Ok(frame) if frame.surface_id.0 == filter_surface => {
+                            Some(serialize_output_frame(&frame))
+                        }
+                        Ok(_) => None,
                         Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
                             tracing::warn!("multiplexer.tmux.subscribe: lagged by {n} frames");
                             Some(serde_json::to_vec(&serde_json::json!({"kind":"warning","msg":"lagged"}))?)
@@ -481,7 +490,10 @@ async fn stream_subscribe_tmux_output(
                 }
                 recv = output_rx.recv() => {
                     match recv {
-                        Ok(frame) => Some(serialize_output_frame(&frame)),
+                        Ok(frame) if frame.surface_id.0 == filter_surface => {
+                            Some(serialize_output_frame(&frame))
+                        }
+                        Ok(_) => None,
                         Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
                             tracing::warn!("multiplexer.tmux.subscribe: lagged by {n} frames");
                             Some(serde_json::to_vec(&serde_json::json!({"kind":"warning","msg":"lagged"}))?)
@@ -501,6 +513,44 @@ async fn stream_subscribe_tmux_output(
     }
 
     Ok(())
+}
+
+/// Phase 1.1: serialize a tmux layout subtree as JSON for `tmux.get_layout`.
+///
+/// Shape mirrors `LayoutNode` so the wire format stays trivially decodable
+/// from any client: `kind` ∈ {`pane`, `horizontal`, `vertical`}, every node
+/// carries `cols`/`rows`/`x`/`y`, leaves add `pane_index`, splits add
+/// `children`.
+fn layout_node_to_json(node: &LayoutNode) -> serde_json::Value {
+    let size = node.size();
+    let base = serde_json::json!({
+        "cols": size.cols,
+        "rows": size.rows,
+        "x": size.x,
+        "y": size.y,
+    });
+    let mut obj = base.as_object().cloned().unwrap_or_default();
+    match node {
+        LayoutNode::Pane { pane_index, .. } => {
+            obj.insert("kind".into(), serde_json::json!("pane"));
+            obj.insert("pane_index".into(), serde_json::json!(pane_index));
+        }
+        LayoutNode::Horizontal { children, .. } => {
+            obj.insert("kind".into(), serde_json::json!("horizontal"));
+            obj.insert(
+                "children".into(),
+                serde_json::Value::Array(children.iter().map(layout_node_to_json).collect()),
+            );
+        }
+        LayoutNode::Vertical { children, .. } => {
+            obj.insert("kind".into(), serde_json::json!("vertical"));
+            obj.insert(
+                "children".into(),
+                serde_json::Value::Array(children.iter().map(layout_node_to_json).collect()),
+            );
+        }
+    }
+    serde_json::Value::Object(obj)
 }
 
 /// Encode an `OutputFrame` as a JSONL payload with hex-encoded bytes.
@@ -1678,6 +1728,141 @@ async fn dispatch(req: &Request, ctx: &Context) -> Response {
             }
         }
 
+        "multiplexer.tmux.list_panes" => {
+            // Phase 1.1: enumerate every pane in the attached window so the
+            // client can decide what to mirror. Uses a one-shot SSH
+            // subprocess via the backend; no control-mode round-trip.
+            #[derive(Deserialize)]
+            struct Params {
+                surface_id: String,
+            }
+            match serde_json::from_value::<Params>(req.params.clone()) {
+                Ok(p) => {
+                    let backend = ctx
+                        .tmux_backends
+                        .read()
+                        .await
+                        .get(&p.surface_id)
+                        .map(Arc::clone);
+                    match backend {
+                        None => Err(format!("unknown surface_id: {}", p.surface_id)),
+                        Some(b) => match b.list_panes().await {
+                            Ok(panes) => Ok(serde_json::json!({
+                                "panes": panes
+                                    .into_iter()
+                                    .map(|rp| serde_json::json!({
+                                        "pane_id": rp.pane_id,
+                                        "pane_index": rp.pane_index,
+                                        "active": rp.active,
+                                        "width": rp.width,
+                                        "height": rp.height,
+                                        "command": rp.command,
+                                    }))
+                                    .collect::<Vec<_>>(),
+                            })),
+                            Err(e) => Err(format!("list_panes failed: {e}")),
+                        },
+                    }
+                }
+                Err(e) => Err(format!("invalid params: {e}")),
+            }
+        }
+
+        "multiplexer.tmux.get_layout" => {
+            // Phase 1.1: return the parsed `window_layout` so the client can
+            // mirror tmux's split tree. The raw string is included for
+            // debugging when the structured form is unexpected.
+            #[derive(Deserialize)]
+            struct Params {
+                surface_id: String,
+            }
+            match serde_json::from_value::<Params>(req.params.clone()) {
+                Ok(p) => {
+                    let backend = ctx
+                        .tmux_backends
+                        .read()
+                        .await
+                        .get(&p.surface_id)
+                        .map(Arc::clone);
+                    match backend {
+                        None => Err(format!("unknown surface_id: {}", p.surface_id)),
+                        Some(b) => match b.current_layout().await {
+                            Ok(layout) => Ok(serde_json::json!({
+                                "checksum": layout.checksum,
+                                "tree": layout_node_to_json(&layout.root),
+                            })),
+                            Err(e) => Err(format!("get_layout failed: {e}")),
+                        },
+                    }
+                }
+                Err(e) => Err(format!("invalid params: {e}")),
+            }
+        }
+
+        "multiplexer.tmux.attach_pane" => {
+            // Phase 1.1: bind an additional pane to a new surface that reuses
+            // the existing SSH+tmux session associated with `surface_id`.
+            // Returns the freshly minted surface_id so the caller can
+            // subscribe/input/resize against it like any other surface.
+            #[derive(Deserialize)]
+            struct Params {
+                /// An existing surface_id whose backend we should extend.
+                surface_id: String,
+                /// The tmux pane to attach (e.g. `%2`).
+                pane_id: String,
+                #[serde(default)]
+                cols: Option<u16>,
+                #[serde(default)]
+                rows: Option<u16>,
+            }
+            match serde_json::from_value::<Params>(req.params.clone()) {
+                Ok(p) => {
+                    let backend = ctx
+                        .tmux_backends
+                        .read()
+                        .await
+                        .get(&p.surface_id)
+                        .map(Arc::clone);
+                    let Some(backend) = backend else {
+                        return Response {
+                            id: req.id.clone(),
+                            result: None,
+                            error: Some(RpcError {
+                                code: -32602,
+                                message: format!("unknown surface_id: {}", p.surface_id),
+                            }),
+                        };
+                    };
+                    let size = CellSize {
+                        cols: p.cols.unwrap_or(220).max(1),
+                        rows: p.rows.unwrap_or(50).max(1),
+                    };
+                    match backend.attach_additional_pane(&p.pane_id, size).await {
+                        Ok((new_sid, _rx)) => {
+                            // Make the new surface_id reachable from every
+                            // other RPC by mapping it to the same backend.
+                            // The receiver returned by attach_additional_pane
+                            // is intentionally dropped here — once the
+                            // mpsc::Sender registered inside the backend is
+                            // the only retained handle, the demux's
+                            // try_send_to_sender path keeps working and the
+                            // bytes are still broadcast to subscribers.
+                            ctx.tmux_backends
+                                .write()
+                                .await
+                                .insert(new_sid.0.clone(), Arc::clone(&backend));
+                            Ok(serde_json::json!({
+                                "surface_id": new_sid.0,
+                                "pane_id": p.pane_id,
+                            }))
+                        }
+                        Err(e) => Err(format!("attach_pane failed: {e}")),
+                    }
+                }
+                Err(e) => Err(format!("invalid params: {e}")),
+            }
+        }
+
         _ => Err(format!("unknown method: {}", req.method)),
     };
 
@@ -1952,6 +2137,65 @@ mod tests {
 
         let stale_again = collect_heartbeat_stale_events(&state, &mut notified, 1_700_000_125_000);
         assert_eq!(stale_again.len(), 1);
+    }
+
+    #[test]
+    fn layout_node_to_json_emits_kind_and_pane_index_for_leaf() {
+        use crate::multiplexer::tmux::layout::{CellRect, LayoutNode};
+        let leaf = LayoutNode::Pane {
+            size: CellRect {
+                cols: 80,
+                rows: 24,
+                x: 0,
+                y: 0,
+            },
+            pane_index: 3,
+        };
+        let v = layout_node_to_json(&leaf);
+        assert_eq!(v["kind"], "pane");
+        assert_eq!(v["pane_index"], 3);
+        assert_eq!(v["cols"], 80);
+        assert_eq!(v["rows"], 24);
+        assert!(v.get("children").is_none());
+    }
+
+    #[test]
+    fn layout_node_to_json_nests_horizontal_with_children_array() {
+        use crate::multiplexer::tmux::layout::{CellRect, LayoutNode};
+        let parent = LayoutNode::Horizontal {
+            size: CellRect {
+                cols: 80,
+                rows: 24,
+                x: 0,
+                y: 0,
+            },
+            children: vec![
+                LayoutNode::Pane {
+                    size: CellRect {
+                        cols: 40,
+                        rows: 24,
+                        x: 0,
+                        y: 0,
+                    },
+                    pane_index: 0,
+                },
+                LayoutNode::Pane {
+                    size: CellRect {
+                        cols: 40,
+                        rows: 24,
+                        x: 40,
+                        y: 0,
+                    },
+                    pane_index: 1,
+                },
+            ],
+        };
+        let v = layout_node_to_json(&parent);
+        assert_eq!(v["kind"], "horizontal");
+        let children = v["children"].as_array().unwrap();
+        assert_eq!(children.len(), 2);
+        assert_eq!(children[0]["pane_index"], 0);
+        assert_eq!(children[1]["x"], 40);
     }
 
     #[test]
