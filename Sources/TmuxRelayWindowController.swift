@@ -801,16 +801,6 @@ private final class PaneHostView: NSView {
     required init?(coder: NSCoder) { fatalError("not used") }
 }
 
-// MARK: - NSSplitView arranged-subview compatibility
-
-private extension NSSplitView {
-    /// NSSplitView has no first-class arranged-subview API on macOS 12
-    /// targets. addSubview is enough — it inserts dividers between siblings.
-    func addArrangedSubview(_ view: NSView) {
-        addSubview(view)
-    }
-}
-
 // MARK: - TmuxMenu
 
 enum TmuxMenu {
