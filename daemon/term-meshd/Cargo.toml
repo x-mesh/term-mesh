@@ -4,6 +4,10 @@ version = "0.72.0"
 edition = "2021"
 description = "term-mesh background daemon — worktree orchestration, resource monitoring, file heatmap"
 
+[lib]
+name = "term_meshd"
+path = "src/lib.rs"
+
 [[bin]]
 name = "term-meshd"
 path = "src/main.rs"
