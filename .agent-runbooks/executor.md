@@ -23,22 +23,30 @@ Scoped implementation work with direct file edits and verification.
 
 ## Commit Policy
 
-코드 변경이 있는 task는 reply 전에 반드시 git commit을 수행한다.
+The leader controls all commits. Executor must preserve working tree changes
+for the leader to review, commit, amend, or discard.
 
-**의무 순서 (변경 있는 경우):**
-1. 변경 파일 확인: `git status --short` (untracked 파일 포함)
-2. commit message 작성 + sanitize — 백틱(`) 및 코드블록 마커(```) 제거 후 사용
-3. 스테이징 및 커밋: `git add <files> && git commit -m "<sanitized message>"`
-4. working tree clean 확인: `git status` — uncommitted 변경이 남아 있으면 커밋 후 재확인
-5. reply FILES 필드에 commit hash 명시 (단일 파일: `FILES: path/to/file.swift (commit: abc1234)` / 복수: `FILES: a.swift b.swift (commit: abc1234)`)
+**DO NOT COMMIT:**
+- Do not run `git add`, `git commit`, `git push`, or equivalent staging, commit,
+  or publish commands.
+- Do not create WIP commits to preserve task results.
+- Do not clean, reset, stash, or otherwise hide uncommitted changes unless the
+  leader explicitly instructs it.
 
-**변경 없는 task (read-only, exploration):**
-- commit 생략 가능
-- reply에서 `FILES: none` 명시
+**self-pause on disconnect:**
+- If `tm-agent reply` cannot reach the team daemon, cannot find the socket,
+  returns a parse error, or gets connection refused, stop all file mutation
+  immediately.
+- Preserve the current working tree exactly as-is.
+- Wait for the user to start or reconnect a leader session before making any
+  further edits.
 
-**금지 사항:**
-- working tree에 uncommitted 변경을 남긴 채 STATUS: DONE 보고 금지
-- commit 없이 FULL_REPORT만 남기고 task 종료 금지
+**STATUS reporting safety:**
+- `NEEDS_REVIEW` or `BLOCKED` is always safer than a self-created commit.
+- When task work is complete but leader communication is unavailable, keep the
+  working tree intact and report only after communication is restored.
+- `STATUS: DONE` means the requested file changes are present and verified; it
+  does not imply the executor committed them.
 
 ## Standard Reply Header
 
