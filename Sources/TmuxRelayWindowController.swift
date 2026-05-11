@@ -190,6 +190,10 @@ enum TmuxMenu {
 /// Coordinates the "Connect to Linux Tmux…" menu action.
 final class TmuxMenuCoordinator: NSObject {
     static let shared = TmuxMenuCoordinator()
+    private static let lastHostKey = "termMeshTmuxLastHost"
+    private static let lastSessionKey = "termMeshTmuxLastSession"
+    private static let shellOptions = ["Default", "/bin/bash", "/bin/zsh", "/bin/sh"]
+
     private var openControllers: [TmuxRelayWindowController] = []
 
     private struct TmuxPaneOption {
@@ -213,21 +217,37 @@ final class TmuxMenuCoordinator: NSObject {
         alert.addButton(withTitle: "Connect")
         alert.addButton(withTitle: "Cancel")
 
-        let stackView = NSStackView(frame: NSRect(x: 0, y: 0, width: 340, height: 66))
+        let stackView = NSStackView(frame: NSRect(x: 0, y: 0, width: 380, height: 100))
         stackView.orientation = .vertical
         stackView.spacing = 8
         stackView.alignment = .leading
 
-        let hostField = NSTextField(frame: NSRect(x: 0, y: 0, width: 340, height: 24))
+        let hostField = NSTextField(frame: NSRect(x: 0, y: 0, width: 380, height: 24))
         hostField.placeholderString = "SSH host (e.g. ubuntu@192.168.1.10)"
-        hostField.stringValue = ProcessInfo.processInfo.environment["TERMMESH_TMUX_HOST"] ?? ""
+        hostField.stringValue = Self.lastHostValue()
 
-        let sessionField = NSTextField(frame: NSRect(x: 0, y: 0, width: 340, height: 24))
+        let sessionField = NSTextField(frame: NSRect(x: 0, y: 0, width: 380, height: 24))
         sessionField.placeholderString = "tmux session name (e.g. main)"
-        sessionField.stringValue = ProcessInfo.processInfo.environment["TERMMESH_TMUX_SESSION"] ?? ""
+        sessionField.stringValue = Self.lastSessionValue()
+
+        let createStack = NSStackView(frame: NSRect(x: 0, y: 0, width: 380, height: 26))
+        createStack.orientation = .horizontal
+        createStack.spacing = 10
+        createStack.alignment = .centerY
+
+        let createSessionButton = NSButton(checkboxWithTitle: "Create if missing", target: nil, action: nil)
+        createSessionButton.state = .off
+
+        let shellPopup = NSPopUpButton(frame: NSRect(x: 0, y: 0, width: 145, height: 26), pullsDown: false)
+        shellPopup.addItems(withTitles: Self.shellOptions)
+        shellPopup.selectItem(at: 0)
+
+        createStack.addArrangedSubview(createSessionButton)
+        createStack.addArrangedSubview(shellPopup)
 
         stackView.addArrangedSubview(hostField)
         stackView.addArrangedSubview(sessionField)
+        stackView.addArrangedSubview(createStack)
         alert.accessoryView = stackView
 
         let response = alert.runModal()
@@ -236,8 +256,16 @@ final class TmuxMenuCoordinator: NSObject {
         let host = hostField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
         let session = sessionField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !host.isEmpty, !session.isEmpty else { return }
+        let shouldCreateSession = createSessionButton.state == .on
+        let selectedShell = Self.selectedShell(from: shellPopup)
 
         Task { [weak self] in
+            if shouldCreateSession,
+               let failure = await Self.ensureSessionExists(host: host, session: session, shell: selectedShell) {
+                Self.showSessionCreateFailure(session: session, failure: failure)
+                return
+            }
+
             let panes = await Self.listPanesViaSSH(host: host, session: session)
             if panes.count >= 2,
                let selectedPane = Self.promptForPaneSelection(host: host, session: session, panes: panes) {
@@ -256,12 +284,67 @@ final class TmuxMenuCoordinator: NSObject {
 
     @MainActor
     private func openRelay(host: String, session: String) {
+        UserDefaults.standard.set(host, forKey: Self.lastHostKey)
+        UserDefaults.standard.set(session, forKey: Self.lastSessionKey)
+
         // TermMeshDaemon.shared.socketPath is the authoritative socket path
         // (already set via LSEnvironment or setenv in startDaemon).
         let daemonSocket = TermMeshDaemon.shared.socketPath
         let controller = TmuxRelayWindowController(host: host, session: session, daemonSocket: daemonSocket)
         openControllers.append(controller)
         controller.show()
+    }
+
+    private static func lastHostValue() -> String {
+        UserDefaults.standard.string(forKey: lastHostKey)
+            ?? ProcessInfo.processInfo.environment["TERMMESH_TMUX_HOST"]
+            ?? ""
+    }
+
+    private static func lastSessionValue() -> String {
+        UserDefaults.standard.string(forKey: lastSessionKey)
+            ?? ProcessInfo.processInfo.environment["TERMMESH_TMUX_SESSION"]
+            ?? ""
+    }
+
+    private static func selectedShell(from popup: NSPopUpButton) -> String? {
+        guard popup.indexOfSelectedItem > 0 else { return nil }
+        let title = popup.titleOfSelectedItem?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        return title.isEmpty ? nil : title
+    }
+
+    private static func ensureSessionExists(host: String, session: String, shell: String?) async -> SSHResult? {
+        let check = await runSSHCommand(
+            host: host,
+            command: "tmux has-session -t \(shellQuote(session))",
+            timeout: 6
+        )
+        if check.exitCode == 0 && !check.timedOut {
+            return nil
+        }
+
+        var command = "tmux new-session -d -s \(shellQuote(session))"
+        if let shell {
+            command += " -- \(shellQuote(shell))"
+        }
+        let create = await runSSHCommand(host: host, command: command, timeout: 8)
+        if create.exitCode == 0 && !create.timedOut {
+            return nil
+        }
+        return create
+    }
+
+    @MainActor
+    private static func showSessionCreateFailure(session: String, failure: SSHResult) {
+        let detail = failure.stderr.trimmingCharacters(in: .whitespacesAndNewlines)
+        let alert = NSAlert()
+        alert.messageText = "Could not create tmux session \(session)"
+        alert.informativeText = detail.isEmpty
+            ? "tmux new-session failed on the remote host."
+            : detail
+        alert.alertStyle = .warning
+        alert.addButton(withTitle: "OK")
+        alert.runModal()
     }
 
     private static func listPanesViaSSH(host: String, session: String) async -> [TmuxPaneOption] {
@@ -345,6 +428,7 @@ final class TmuxMenuCoordinator: NSObject {
             let process = Process()
             process.executableURL = URL(fileURLWithPath: "/usr/bin/ssh")
             process.arguments = [
+                "-o", "BatchMode=yes",
                 "-o", "ConnectTimeout=5",
                 host,
                 command,
