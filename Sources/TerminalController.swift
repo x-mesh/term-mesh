@@ -2895,33 +2895,50 @@ class TerminalController {
             try? await Task.sleep(nanoseconds: delegateStaggerNs)
         }
 
-        // Create task + send instruction on MainActor (sendToAgent requires main thread).
-        // Resolve the correct tabManager from the team's actual workspace first — self.tabManager
-        // may point to a different window (e.g., after window switch or adopted leader mode).
-        let delegateResult: TeamOrchestrator.DelegateResult? = await MainActor.run {
-            let tabManager = TeamOrchestrator.shared.resolveTabManager(teamName: teamName) ?? self.tabManager
-            guard let tabManager else { return nil }
-            return TeamOrchestrator.shared.delegateToAgent(
-                teamName: teamName,
-                agentName: agentName,
-                text: text,
-                taskTitle: taskTitle,
-                priority: priority,
-                context: context,
-                tabManager: tabManager
-            )
+        // Create task + send instruction on MainActor, then await paste-completion ack.
+        // Continuation resumes when finalizePaste fires (via sendIMETextResult callback)
+        // or after a 12s last-resort timeout. Timeout must exceed paste watchdog (8s)
+        // plus max retry backoff (~2s) to avoid racing a still-live paste in the queue.
+        // Primary completion path is the watchdog's finalizePaste; 12s is a dead-man switch
+        // for cases where completion is never called due to a deeper bug.
+        // The Rust CLI sends Return via team.send_key only after receiving this ack,
+        // eliminating the race between paste flush and the previous 150ms fixed sleep.
+        var capturedDelegateResult: TeamOrchestrator.DelegateResult? = nil
+        let textDelivered: Bool = await withCheckedContinuation { cont in
+            var resumed = false
+            let resume: (Bool) -> Void = { ok in
+                guard !resumed else { return }
+                resumed = true
+                cont.resume(returning: ok)
+            }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 12.0) { resume(false) }
+            Task { @MainActor in
+                let tabManager = TeamOrchestrator.shared.resolveTabManager(teamName: teamName) ?? self.tabManager
+                guard let tabManager else { resume(false); return }
+                capturedDelegateResult = TeamOrchestrator.shared.delegateToAgent(
+                    teamName: teamName,
+                    agentName: agentName,
+                    text: text,
+                    taskTitle: taskTitle,
+                    priority: priority,
+                    context: context,
+                    tabManager: tabManager,
+                    completion: { ok in resume(ok) }
+                )
+                if capturedDelegateResult == nil { resume(false) }
+            }
         }
 
-        guard let delegateResult else {
+        guard let delegateResult = capturedDelegateResult else {
             return v2Error(id: id, code: "internal_error", message: "Task creation failed for agent '\(agentName)'")
         }
 
         // delegateToAgent sends text WITHOUT Return (withReturn: false).
-        // The Rust CLI sends Return separately via team.send_key RPC.
+        // The Rust CLI sends Return separately via team.send_key RPC after this ack.
         return v2Ok(id: id, result: [
             "task": store.taskDictionary(delegateResult.task),
             "sent": true,
-            "text_delivered": delegateResult.textDelivered,
+            "text_delivered": textDelivered,
         ])
     }
 

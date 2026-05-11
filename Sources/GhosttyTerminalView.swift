@@ -1190,6 +1190,7 @@ final class TerminalSurface: Identifiable, ObservableObject {
 
     private func processPaste(_ p: PendingPaste) {
         guard let surface = surface else {
+            pasteInFlight = false  // surface 복귀 후 drainPasteQueue가 즉시 재시도할 수 있도록 해제
             pasteQueue.insert(p, at: 0)
             return
         }
