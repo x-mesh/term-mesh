@@ -1201,6 +1201,24 @@ extension TermMeshDaemon {
         return parseLayoutNode(tree)
     }
 
+    /// Phase 1.1 multi-pane fix: explicit `refresh-client -C` so a single
+    /// owner can drive the canonical tmux window size. Avoids the race
+    /// where N secondary relays each push their slot dimensions and
+    /// fight over the vertical-layout window width.
+    @discardableResult
+    func tmuxResizeClient(
+        surfaceId: String,
+        cols: UInt16,
+        rows: UInt16
+    ) -> Bool {
+        let params: [String: Any] = [
+            "surface_id": surfaceId,
+            "cols": Int(cols),
+            "rows": Int(rows),
+        ]
+        return rpcCall(method: "multiplexer.tmux.resize_client", params: params) != nil
+    }
+
     /// Send a workspace control command (split-pane / kill-pane / select-pane).
     /// Returns true on RPC success.
     @discardableResult

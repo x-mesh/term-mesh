@@ -1735,6 +1735,45 @@ async fn dispatch(req: &Request, ctx: &Context) -> Response {
             }
         }
 
+        "multiplexer.tmux.resize_client" => {
+            // Phase 1.1 multi-pane fix: explicit client-wide refresh.
+            // Multiple secondary relays each calling per-pane resize_impl
+            // race in vertical layouts (tmux reflows the whole window
+            // width when any pane's -x changes). This RPC lets a single
+            // owner (the macOS controller) drive the canonical window
+            // size while individual relays stay passive.
+            #[derive(Deserialize)]
+            struct Params {
+                surface_id: String,
+                cols: u16,
+                rows: u16,
+            }
+            match serde_json::from_value::<Params>(req.params.clone()) {
+                Ok(p) => {
+                    let backend = ctx
+                        .tmux_backends
+                        .read()
+                        .await
+                        .get(&p.surface_id)
+                        .map(Arc::clone);
+                    match backend {
+                        None => Err(format!("unknown surface_id: {}", p.surface_id)),
+                        Some(b) => match b
+                            .resize_client(CellSize {
+                                cols: p.cols,
+                                rows: p.rows,
+                            })
+                            .await
+                        {
+                            Ok(()) => Ok(serde_json::json!({ "ok": true })),
+                            Err(e) => Err(format!("resize_client failed: {e}")),
+                        },
+                    }
+                }
+                Err(e) => Err(format!("invalid params: {e}")),
+            }
+        }
+
         "multiplexer.tmux.resize" => {
             #[derive(Deserialize)]
             struct Params {

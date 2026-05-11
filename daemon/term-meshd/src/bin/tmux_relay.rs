@@ -281,12 +281,21 @@ where
 async fn run_secondary(surface_id: String) -> Result<()> {
     let sock = daemon_sock();
 
-    // Push the initial size so the remote pane matches our PTY before we
-    // ask for a snapshot. Best-effort: errors do not block subscribe.
-    push_resize(&sock, &surface_id).await;
+    // Phase 1.1 multi-pane fix: secondary relays no longer push their PTY
+    // size to tmux. Each relay process boots at a slightly different time
+    // with a slightly different Ghostty surface bound, and tmux's
+    // resize-pane in a vertical layout reflows the *whole window* width.
+    // N relays racing produced the inconsistent per-pane state seen in
+    // user screenshots (pane 1 wrapping at 1 col, pane 2 shifted by 1,
+    // pane 3 clean, etc.). The canonical size is now driven by the macOS
+    // controller via `multiplexer.tmux.resize_client`.
 
-    // Seed the local screen with the current pane contents — same logic
-    // as the primary path, scoped to the bound surface_id.
+    // Initial paint: best-effort capture-pane seed at whatever size the
+    // controller has already set. This will only look correct after the
+    // controller's resize_client lands, so we delay briefly to let the
+    // window's first layout pass + the controller's resize complete.
+    sleep(Duration::from_millis(120)).await;
+
     let mut stdout = tokio::io::stdout();
     if let Ok(cap) = rpc(
         &sock,
@@ -306,14 +315,16 @@ async fn run_secondary(surface_id: String) -> Result<()> {
     }
     drop(stdout);
 
-    let resize_sock = sock.clone();
-    let resize_sid = surface_id.clone();
+    // SIGWINCH listener — we still need to drain the signal so it doesn't
+    // pile up, but the resize itself is now the controller's job. Logging
+    // only, no RPC.
     tokio::spawn(async move {
         let Ok(mut wch) = signal(SignalKind::window_change()) else {
             return;
         };
         while wch.recv().await.is_some() {
-            push_resize(&resize_sock, &resize_sid).await;
+            // Intentionally silent: controller-driven resize is the
+            // single source of truth.
         }
     });
 

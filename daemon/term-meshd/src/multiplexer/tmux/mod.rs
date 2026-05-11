@@ -696,6 +696,19 @@ impl TmuxControlBackend {
     /// If the surface has no registered pane id yet (e.g. attach RPC
     /// raced ahead of the first %output mapping), fall back to the
     /// client-wide refresh so the initial size still propagates.
+    /// Phase 1.1: explicit `refresh-client -C` for the controlling app
+    /// to drive the canonical window size. Unlike `resize_impl` this is
+    /// pane-agnostic — used when one owner needs to set every pane's
+    /// width in a vertical layout without N relays racing.
+    pub async fn resize_client(&self, size: CellSize) -> Result<()> {
+        let sess = self.tmux_session.read().await;
+        let sess = sess
+            .as_ref()
+            .ok_or_else(|| anyhow!("no active session — call attach_surface first"))?;
+        sess.write_command(&encoder::refresh_client_size(size.cols, size.rows))
+            .await
+    }
+
     async fn resize_impl(&self, surface_id: SurfaceId, size: CellSize) -> Result<()> {
         let sess = self.tmux_session.read().await;
         let sess = sess

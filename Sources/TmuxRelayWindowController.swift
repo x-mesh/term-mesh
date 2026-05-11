@@ -9,6 +9,9 @@
 // polls the layout briefly so the new pane appears as soon as tmux acks.
 
 import AppKit
+#if DEBUG
+import Bonsplit
+#endif
 
 @MainActor
 final class TmuxRelayWindowController: NSWindowController, NSWindowDelegate {
@@ -50,6 +53,10 @@ final class TmuxRelayWindowController: NSWindowController, NSWindowDelegate {
     /// `window.firstResponder` because Ghostty's surface view doesn't
     /// always propagate focus changes on first click.
     private var lastClickedSurfaceId: String?
+    /// Debounce token for `windowDidResize` → `pushClientResize`. Replaced
+    /// on every frame of an interactive drag so only the final pause
+    /// reaches tmux.
+    private var windowResizeWorkItem: DispatchWorkItem?
 
     init(host: String, session: String, daemonSocket: String) {
         self.sshHost = host
@@ -73,6 +80,9 @@ final class TmuxRelayWindowController: NSWindowController, NSWindowDelegate {
     }
 
     func windowWillClose(_ notification: Notification) {
+        NotificationCenter.default.removeObserver(self, name: NSWindow.didResizeNotification, object: window)
+        windowResizeWorkItem?.cancel()
+        windowResizeWorkItem = nil
         if let keyMonitor { NSEvent.removeMonitor(keyMonitor); self.keyMonitor = nil }
         if let clickMonitor { NSEvent.removeMonitor(clickMonitor); self.clickMonitor = nil }
         // Tear down the event stream first so its reader task exits before
@@ -126,11 +136,18 @@ final class TmuxRelayWindowController: NSWindowController, NSWindowDelegate {
                 (primaryPane, attach.surfaceId)
             ]
             for pane in panes where pane.paneId != primaryPane.paneId {
+                // Use the pane's actual width/height as reported by
+                // list-panes — every secondary relay's first SIGWINCH will
+                // refine it to the local Ghostty surface size, but starting
+                // from each pane's real geometry avoids forcing tmux to
+                // briefly resize every pane to the placeholder 220x50 and
+                // then snap back. The mismatch window was the root cause
+                // of the leftmost-column shift seen in the relay screenshot.
                 if let newId = daemon.tmuxAttachPane(
                     surfaceId: attach.surfaceId,
                     paneId: pane.paneId,
-                    cols: initialSize.cols,
-                    rows: initialSize.rows
+                    cols: pane.width,
+                    rows: pane.height
                 ) {
                     paneBindings.append((pane, newId))
                 }
@@ -163,14 +180,78 @@ final class TmuxRelayWindowController: NSWindowController, NSWindowDelegate {
 
         let liveView: NSView
         if let layout = data.layout {
-            liveView = buildLayoutView(layout) ?? fallbackStackView()
+            if let split = buildLayoutView(layout) {
+                #if DEBUG
+                dlog("tmux.relay.applyBootstrap path=split bindings=\(data.bindings.count) layout=\(layoutSignature(of: layout))")
+                #endif
+                liveView = split
+            } else {
+                #if DEBUG
+                dlog("tmux.relay.applyBootstrap path=fallback reason=buildLayoutView-nil bindings=\(data.bindings.count) layout=\(layoutSignature(of: layout))")
+                #endif
+                liveView = fallbackStackView()
+            }
         } else {
+            #if DEBUG
+            dlog("tmux.relay.applyBootstrap path=fallback reason=no-layout bindings=\(data.bindings.count)")
+            #endif
             liveView = fallbackStackView()
         }
         swapContent(to: liveView)
         focusFirstAvailableSurface()
         installEventMonitors()
+        installWindowResizeObserver()
         startEventStream()
+        // Sync tmux to whatever cell size the window currently shows so
+        // captured seed + live %output land at the same width as Ghostty
+        // surfaces. Without this the per-pane relays paint pre-resize
+        // content into post-resize PTYs and lose the leftmost column.
+        pushClientResize()
+    }
+
+    private func installWindowResizeObserver() {
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(windowDidResizeNotification(_:)),
+            name: NSWindow.didResizeNotification,
+            object: window
+        )
+    }
+
+    @objc private func windowDidResizeNotification(_ note: Notification) {
+        // Coalesce rapid drags: NSWindow fires didResize every frame
+        // during a live drag. We only want to talk to tmux once when
+        // the user pauses. A 60 ms debounce is short enough to feel
+        // responsive but long enough to skip per-frame chatter.
+        windowResizeWorkItem?.cancel()
+        let item = DispatchWorkItem { [weak self] in self?.pushClientResize() }
+        windowResizeWorkItem = item
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.060, execute: item)
+    }
+
+    /// Compute the window's content area in tmux cells and push it to the
+    /// daemon as a single `refresh-client -C cols x rows`. This is the
+    /// only place that resizes tmux post-bootstrap — secondary relays
+    /// intentionally no longer push their own PTY sizes (which raced in
+    /// vertical layouts and caused per-pane mis-sizing).
+    private func pushClientResize() {
+        guard let primary = primarySurfaceId,
+              let contentRect = window?.contentLayoutRect else { return }
+        // Cell-size heuristic. Ghostty's default font (SF Mono 13pt at
+        // 1.0 backing scale) measures ~8.0 × 17.0 pt per cell. Erring on
+        // the slightly-smaller side leaves a couple of unused pixels on
+        // the edges instead of clipping content.
+        let cellW: CGFloat = 8.0
+        let cellH: CGFloat = 17.0
+        let cols = UInt16(max(20, Int(contentRect.width / cellW)))
+        let rows = UInt16(max(5, Int(contentRect.height / cellH)))
+        Task.detached { [primary, cols, rows] in
+            _ = TermMeshDaemon.shared.tmuxResizeClient(
+                surfaceId: primary,
+                cols: cols,
+                rows: rows
+            )
+        }
     }
 
     /// Install window-local NSEvent monitors for Cmd+D and click-focus
@@ -375,9 +456,20 @@ final class TmuxRelayWindowController: NSWindowController, NSWindowDelegate {
         let split = NSSplitView()
         split.translatesAutoresizingMaskIntoConstraints = false
         split.isVertical = isVertical
-        split.dividerStyle = .thin
+        // `.paneSplitter` draws a clearly visible thick divider — `.thin` is
+        // a 1-pt grey line that vanishes against Ghostty's black background.
+        // PeerRelayWorkspaceWindowController uses `.thin` but its leaves are
+        // wrapped in NSViews with non-terminal backgrounds, so the divider
+        // gets contrast from the wrap. Our leaves go straight to Ghostty.
+        split.dividerStyle = .paneSplitter
         for leaf in leaves {
-            leaf.translatesAutoresizingMaskIntoConstraints = false
+            // Do NOT pin leaves with autolayout constraints — NSSplitView
+            // manages child frames itself via autoresizing masks. Forcing
+            // `translatesAutoresizingMaskIntoConstraints = false` on a leaf
+            // makes it stretch to fill the entire split bounds (overlapping
+            // siblings + hiding dividers). Peer relay (`materializeLayout`
+            // in PeerRelayWorkspaceWindowController.swift) deliberately
+            // does not touch this flag, which is why its splits render.
             split.addArrangedSubview(leaf)
         }
         return split
@@ -661,14 +753,21 @@ private final class PaneHostView: NSView {
         self.surfaceId = surfaceId
         self.controller = controller
         super.init(frame: .zero)
-        content.translatesAutoresizingMaskIntoConstraints = false
+        // Use autoresizing-mask sizing throughout so NSSplitView can drive
+        // frames directly without fighting autolayout. The outer leaf in
+        // makeSplit has the same policy. Mixing autolayout here would
+        // re-introduce the divider-hiding regression.
+        autoresizesSubviews = true
+        // Always-on subtle border so the user can see pane boundaries
+        // even when `.paneSplitter` draws a near-invisible thin grey
+        // line on top of Ghostty's black background. Kept narrow (1px)
+        // and dim so it doesn't compete with terminal content.
+        wantsLayer = true
+        layer?.borderColor = NSColor(white: 0.30, alpha: 1.0).cgColor
+        layer?.borderWidth = 1.0
+        content.frame = bounds
+        content.autoresizingMask = [.width, .height]
         addSubview(content)
-        NSLayoutConstraint.activate([
-            content.topAnchor.constraint(equalTo: topAnchor),
-            content.bottomAnchor.constraint(equalTo: bottomAnchor),
-            content.leadingAnchor.constraint(equalTo: leadingAnchor),
-            content.trailingAnchor.constraint(equalTo: trailingAnchor),
-        ])
     }
 
     required init?(coder: NSCoder) { fatalError("not used") }
