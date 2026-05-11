@@ -65,6 +65,9 @@ final class TmuxRelayWindowController: NSWindowController, NSWindowDelegate {
     private var windowResizeWorkItem: DispatchWorkItem?
     private var layoutRefreshInFlight = false
     private var layoutRefreshPending = false
+    #if DEBUG
+    private var buildLayoutLeafLogged = false
+    #endif
 
     init(host: String, session: String, daemonSocket: String) {
         self.sshHost = host
@@ -457,6 +460,12 @@ final class TmuxRelayWindowController: NSWindowController, NSWindowDelegate {
             let layout = daemon.tmuxGetLayout(surfaceId: primary)
             var exitReason = layout == nil ? "get_layout-failed" : "success"
             var newBindings: [(pane: TermMeshDaemon.TmuxPaneInfo, surfaceId: String)] = []
+            #if DEBUG
+            let newIds = Set(panes.map { $0.paneId })
+            let added = newIds.subtracting(knownPaneIds).sorted()
+            let attachBranchReason = added.isEmpty ? "no-added-panes" : "added-panes"
+            dlog("tmux.relay.applyRefresh.attachBranch reason=\(attachBranchReason) paneCount=\(added.count)")
+            #endif
             for pane in panes where !knownPaneIds.contains(pane.paneId) {
                 #if DEBUG
                 dlog("tmux.relay.attach.request paneId=\(pane.paneId) cells=\(initialSize.cols)x\(initialSize.rows)")
@@ -512,6 +521,14 @@ final class TmuxRelayWindowController: NSWindowController, NSWindowDelegate {
         layout: TermMeshDaemon.TmuxLayoutNode?,
         newBindings: [(pane: TermMeshDaemon.TmuxPaneInfo, surfaceId: String)]
     ) {
+        #if DEBUG
+        let oldIds = Set(paneIds.values)
+        let newIds = Set(panes.map { $0.paneId })
+        let added = newIds.subtracting(oldIds).sorted()
+        let removed = oldIds.subtracting(newIds).sorted()
+        dlog("tmux.relay.applyRefresh.diff oldIds=\(oldIds.sorted()) newIds=\(newIds.sorted()) added=\(added) removed=\(removed)")
+        #endif
+
         for binding in newBindings {
             let surface = makeRelaySurface(surfaceId: binding.surfaceId)
             surfaces[binding.surfaceId] = surface
@@ -545,9 +562,14 @@ final class TmuxRelayWindowController: NSWindowController, NSWindowDelegate {
         }
         layoutSignature = signature
 
+        #if DEBUG
+        buildLayoutLeafLogged = false
+        #endif
         let builtView = buildLayoutView(layout)
         let path = builtView == nil ? "buildLayoutView-nil-fallback" : "ok"
+        let kind = builtView == nil ? "nil-fallback" : "splitview"
         #if DEBUG
+        dlog("tmux.relay.applyRefresh.buildResult kind=\(kind)")
         dlog("tmux.relay.applyRefresh path=\(path) newPaneCount=\(panes.count) bindingsCount=\(newBindings.count)")
         #endif
         let view = builtView ?? fallbackStackView()
@@ -588,6 +610,15 @@ final class TmuxRelayWindowController: NSWindowController, NSWindowDelegate {
             // `node.paneIndex` is misnamed — it actually carries the tmux
             // pane id NUMBER (the `N` in `%N`), not the per-window index.
             // Look up via the pane-id-number map populated at bootstrap.
+            #if DEBUG
+            if !buildLayoutLeafLogged {
+                buildLayoutLeafLogged = true
+                let paneIndex = node.paneIndex
+                let key = paneIndex.map(String.init) ?? "nil"
+                let found = paneIndex.flatMap { paneIdNumberToSurface[$0] } != nil
+                dlog("tmux.relay.buildLayout.leaf paneIndex=\(paneIndex.map(String.init) ?? "nil") lookupKey=\(key) found=\(found) registeredKeys=\(paneIdNumberToSurface.keys.sorted())")
+            }
+            #endif
             guard let idNum = node.paneIndex,
                   let sid = paneIdNumberToSurface[idNum],
                   let surface = surfaces[sid] else { return nil }
