@@ -693,7 +693,16 @@ final class TerminalSurface: Identifiable, ObservableObject {
         // in `$SHELL -l -c '...'` so .profile/.zshrc are always sourced.
         let resolvedCommand: String? = {
             guard let command, !command.isEmpty else { return nil }
-            if additionalEnvironment["TERMMESH_PEER_RELAY_SOCKET"] != nil {
+            // Bypass login-shell wrapping for surfaces that are explicitly
+            // hosting an RPC/relay process. Such surfaces don't want a user
+            // shell at all — the binary is supposed to own the PTY and emit
+            // remote bytes directly. Without this, `$SHELL -l -c '...'` runs
+            // ~/.zshrc first and prints the local banner before the relay
+            // ever writes anything (see Phase 2.1 e2e).
+            if additionalEnvironment["TERMMESH_PEER_RELAY_SOCKET"] != nil
+                || additionalEnvironment["TERMMESH_TMUX_HOST"] != nil
+                || additionalEnvironment["TERMMESH_BYPASS_LOGIN_SHELL"] == "1"
+            {
                 return command
             }
             let loginShellMode = UserDefaults.standard.string(forKey: "shellLoginMode") ?? "login"
