@@ -10,6 +10,8 @@ use tokio::time::{timeout, Duration};
 use crate::agent::AgentSessionManager;
 use crate::headless::HeadlessManager;
 use crate::monitor::{Anomaly, MonitorHandle, SystemSnapshot};
+use crate::multiplexer::tmux::TmuxControlBackend;
+use crate::multiplexer::{CellSize, RemoteMultiplexerBackend, SurfaceId};
 use crate::tokens::UsageTracker;
 use crate::watcher::WatcherHandle;
 use crate::worktree;
@@ -106,6 +108,8 @@ pub struct Context {
     pub agent_manager: Arc<AgentSessionManager>,
     pub headless: Arc<tokio::sync::Mutex<HeadlessManager>>,
     pub event_tx: EventSender,
+    /// Active tmux control-mode backends, keyed by surface_id string.
+    pub tmux_backends: Arc<tokio::sync::RwLock<std::collections::HashMap<String, Arc<TmuxControlBackend>>>>,
 }
 
 pub fn default_socket_path() -> PathBuf {
@@ -153,6 +157,7 @@ pub async fn serve(
         agent_manager,
         headless,
         event_tx,
+        tmux_backends: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
     });
     let heartbeat_task = tokio::spawn(run_heartbeat_staleness_watcher(
         ctx.clone(),
@@ -1282,6 +1287,31 @@ async fn dispatch(req: &Request, ctx: &Context) -> Response {
                     match mgr.resolve_agent_id(&p.team_name, &p.agent_name) {
                         Some(id) => Ok(serde_json::json!({ "agent_id": id, "headless": true })),
                         None => Ok(serde_json::json!({ "agent_id": null, "headless": false })),
+                    }
+                }
+                Err(e) => Err(format!("invalid params: {e}")),
+            }
+        }
+
+        "multiplexer.tmux.attach" => {
+            #[derive(Deserialize)]
+            struct Params { host: String, session: String }
+            match serde_json::from_value::<Params>(req.params.clone()) {
+                Ok(p) => {
+                    let surface_id_str = uuid::Uuid::new_v4().to_string();
+                    let surface_id = SurfaceId(surface_id_str.clone());
+                    let backend = Arc::new(TmuxControlBackend::new(&p.host, &p.session));
+                    match backend.attach_surface(surface_id, CellSize { cols: 220, rows: 50 }).await {
+                        Ok(_rx) => {
+                            ctx.tmux_backends.write().await
+                                .insert(surface_id_str.clone(), Arc::clone(&backend));
+                            Ok(serde_json::json!({
+                                "surface_id": surface_id_str,
+                                "host": p.host,
+                                "session": p.session,
+                            }))
+                        }
+                        Err(e) => Err(format!("attach failed: {e}")),
                     }
                 }
                 Err(e) => Err(format!("invalid params: {e}")),

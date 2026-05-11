@@ -608,6 +608,10 @@ enum Commands {
 
     /// Peer-federation operations (attach to a remote term-mesh host).
     Peer(PeerCommands),
+
+    /// Remote multiplexer operations (tmux control-mode backend).
+    #[command(subcommand)]
+    Multiplexer(MultiplexerCommands),
 }
 
 #[derive(clap::Args)]
@@ -637,6 +641,27 @@ enum PeerCommand {
         /// Title of the surface to attach to; defaults to the first listed.
         #[arg(long)]
         name: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum MultiplexerCommands {
+    /// tmux control-mode operations
+    #[command(subcommand)]
+    Tmux(TmuxCommands),
+}
+
+#[derive(Subcommand)]
+enum TmuxCommands {
+    /// Attach to a remote tmux session via SSH control mode.
+    ///
+    /// Opens an SSH+tmux -CC connection to <host> and attaches to <session>.
+    /// Returns the surface_id assigned by the daemon.
+    Attach {
+        /// SSH host (e.g. user@host or a Host entry from ~/.ssh/config)
+        host: String,
+        /// tmux session name on the remote host
+        session: String,
     },
 }
 
@@ -3496,6 +3521,15 @@ fn main() {
         Commands::TaskClear2 => rpc_call(&sock, "team.task.clear", json!({ "team_name": team })),
         Commands::Peer(_) => unreachable!("peer commands exit before detect_socket()"),
         Commands::Runbook(_) => unreachable!("runbook commands exit before detect_socket()"),
+        Commands::Multiplexer(sub) => match sub {
+            MultiplexerCommands::Tmux(TmuxCommands::Attach { host, session }) => {
+                rpc_call(
+                    &sock,
+                    "multiplexer.tmux.attach",
+                    json!({ "host": host, "session": session }),
+                )
+            }
+        },
         Commands::Status => {
             // Inject version info into the team.status response JSON
             let mut status = rpc_call(&sock, "team.status", json!({ "team_name": team }))
