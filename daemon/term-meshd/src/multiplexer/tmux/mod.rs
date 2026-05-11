@@ -129,6 +129,19 @@ pub struct OutputFrame {
     pub bytes: Vec<u8>,
 }
 
+/// Window-scoped notification emitted on every tmux topology change.
+/// Phase 1.1: only `%layout-change` is surfaced; future variants
+/// (`%window-add`, `%window-renamed`, `%session-window-changed`) plug in
+/// here without touching the wire protocol.
+#[derive(Clone)]
+pub enum NotifyEvent {
+    LayoutChange {
+        window_id: String,
+        raw: String,
+        layout: Option<layout::WindowLayout>,
+    },
+}
+
 /// Backend handle for a single remote `ssh tmux -CC` session.
 pub struct TmuxControlBackend {
     host: String,
@@ -143,6 +156,10 @@ pub struct TmuxControlBackend {
     /// Broadcast channel: every parsed %output frame is sent here so multiple
     /// `subscribe_output()` callers can each receive a copy.
     output_tx: broadcast::Sender<OutputFrame>,
+    /// Broadcast channel: window-scoped notifications (layout changes etc).
+    /// Capacity is small — these arrive at human-edit cadence, not the
+    /// per-frame cadence of output bytes.
+    notify_tx: broadcast::Sender<NotifyEvent>,
 }
 
 impl TmuxControlBackend {
@@ -152,6 +169,7 @@ impl TmuxControlBackend {
     /// first time.
     pub fn new(host: impl Into<String>, session: impl Into<String>) -> Self {
         let (output_tx, _) = broadcast::channel(4096);
+        let (notify_tx, _) = broadcast::channel(128);
         Self {
             host: host.into(),
             session_name: session.into(),
@@ -159,6 +177,7 @@ impl TmuxControlBackend {
             tmux_session: Arc::new(RwLock::new(None)),
             surface_senders: Arc::new(RwLock::new(HashMap::new())),
             output_tx,
+            notify_tx,
         }
     }
 
@@ -169,6 +188,13 @@ impl TmuxControlBackend {
     /// independent receivers.
     pub fn subscribe_output(&self) -> broadcast::Receiver<OutputFrame> {
         self.output_tx.subscribe()
+    }
+
+    /// Phase 1.1: subscribe to non-output window notifications (layout
+    /// changes, future window-add/-renamed). Independent of output_tx so
+    /// slow notify consumers cannot lag the high-frequency byte stream.
+    pub fn subscribe_notify(&self) -> broadcast::Receiver<NotifyEvent> {
+        self.notify_tx.subscribe()
     }
 
     /// Test-only: inject a pre-built session and register a surface mapping.
@@ -460,35 +486,53 @@ impl TmuxControlBackend {
 
             let senders = Arc::clone(&self.surface_senders);
             let output_tx = self.output_tx.clone();
+            let notify_tx = self.notify_tx.clone();
             let surface_map_demux = self.surface_map.clone();
             let mut demux_rx = session_rx;
             tokio::spawn(async move {
-                while let Some((sid, bytes)) = demux_rx.recv().await {
-                    let pane_id = sid.0;
-                    let mapped_surface = surface_map_demux.lookup_surface(&pane_id).await;
-                    if let Some(ref surf) = mapped_surface {
-                        let per_surface_tx = {
-                            senders
-                                .read()
-                                .await
-                                .get(surf)
-                                .filter(|tx| !tx.is_closed())
-                                .cloned()
-                        };
-                        if let Some(tx) = per_surface_tx {
-                            let _ = tx.try_send(bytes.clone());
+                use session::SessionFrame;
+                while let Some(frame) = demux_rx.recv().await {
+                    match frame {
+                        SessionFrame::Output { surface_id, bytes } => {
+                            let pane_id = surface_id.0;
+                            let mapped_surface =
+                                surface_map_demux.lookup_surface(&pane_id).await;
+                            if let Some(ref surf) = mapped_surface {
+                                let per_surface_tx = {
+                                    senders
+                                        .read()
+                                        .await
+                                        .get(surf)
+                                        .filter(|tx| !tx.is_closed())
+                                        .cloned()
+                                };
+                                if let Some(tx) = per_surface_tx {
+                                    let _ = tx.try_send(bytes.clone());
+                                }
+                            }
+                            let broadcast_surface = mapped_surface
+                                .unwrap_or_else(|| SurfaceId(format!("unmapped:{}", pane_id)));
+                            let _ = output_tx.send(OutputFrame {
+                                surface_id: broadcast_surface,
+                                pane_id,
+                                bytes,
+                            });
+                        }
+                        SessionFrame::LayoutChange {
+                            window_id,
+                            raw,
+                            layout,
+                        } => {
+                            // No subscribers is the steady state for sessions
+                            // whose client (CLI relay) does not care about
+                            // topology — send errors are intentionally swallowed.
+                            let _ = notify_tx.send(NotifyEvent::LayoutChange {
+                                window_id,
+                                raw,
+                                layout,
+                            });
                         }
                     }
-                    // Broadcast with whatever surface_id the frame resolved
-                    // to (or a synthesized "unmapped" id for unknown panes).
-                    // Subscribers filter on surface_id themselves.
-                    let broadcast_surface = mapped_surface
-                        .unwrap_or_else(|| SurfaceId(format!("unmapped:{}", pane_id)));
-                    let _ = output_tx.send(OutputFrame {
-                        surface_id: broadcast_surface,
-                        pane_id,
-                        bytes,
-                    });
                 }
             });
         }

@@ -35,6 +35,10 @@ final class TmuxRelayWindowController: NSWindowController, NSWindowDelegate {
     /// Last applied layout signature — skips redundant rebuilds when
     /// poll-after-split arrives with identical content.
     private var layoutSignature: String?
+    /// File descriptor of the long-lived `multiplexer.tmux.events` stream.
+    /// Stored so `windowWillClose` can shutdown the socket from the main
+    /// actor and unblock the reader task's `read(2)` call.
+    private var eventStreamFd: Int32 = -1
 
     init(host: String, session: String, daemonSocket: String) {
         self.sshHost = host
@@ -58,6 +62,13 @@ final class TmuxRelayWindowController: NSWindowController, NSWindowDelegate {
     }
 
     func windowWillClose(_ notification: Notification) {
+        // Tear down the event stream first so its reader task exits before
+        // the controller is deallocated.
+        if eventStreamFd >= 0 {
+            Darwin.shutdown(eventStreamFd, SHUT_RDWR)
+            Darwin.close(eventStreamFd)
+            eventStreamFd = -1
+        }
         // TerminalSurface.deinit owns PTY teardown; the relay process exits
         // when its stdin/stdout pipes close. Best-effort detach so the
         // daemon-side backend can release its SSH connection.
@@ -145,6 +156,53 @@ final class TmuxRelayWindowController: NSWindowController, NSWindowDelegate {
         }
         swapContent(to: liveView)
         focusFirstAvailableSurface()
+        startEventStream()
+    }
+
+    /// Open the long-lived `multiplexer.tmux.events` JSONL stream and
+    /// dispatch `layout-change` notifications to `refreshLayout` on the
+    /// main actor. Replaces the 200 ms poll-after-Cmd-D fallback and
+    /// also picks up splits triggered outside of term-mesh (e.g. the
+    /// user running `tmux split-window` over plain SSH).
+    private func startEventStream() {
+        guard let primary = primarySurfaceId else { return }
+        let socketPath = daemonSocket
+        Task.detached(priority: .userInitiated) { [weak self, primary, socketPath] in
+            let fd = TmuxRelayWindowController.connectUnixSocket(path: socketPath)
+            guard fd >= 0 else { return }
+            // Hand the fd back to the main actor so windowWillClose can
+            // shutdown the socket and unblock our read loop.
+            await MainActor.run { self?.eventStreamFd = fd }
+
+            let request = "{\"id\":1,\"method\":\"multiplexer.tmux.events\",\"params\":{\"surface_id\":\"\(primary)\"}}\n"
+            guard let reqData = request.data(using: .utf8),
+                  TmuxRelayWindowController.writeFully(fd: fd, data: reqData) else {
+                Darwin.close(fd)
+                return
+            }
+
+            var buffer = Data()
+            var tmp = [UInt8](repeating: 0, count: 4096)
+            readLoop: while true {
+                let n = tmp.withUnsafeMutableBufferPointer { ptr -> Int in
+                    Darwin.read(fd, ptr.baseAddress, ptr.count)
+                }
+                if n <= 0 { break }
+                buffer.append(tmp, count: n)
+                while let nl = buffer.firstIndex(of: 0x0A) {
+                    let line = buffer.subdata(in: buffer.startIndex..<nl)
+                    buffer.removeSubrange(buffer.startIndex...nl)
+                    guard let obj = try? JSONSerialization.jsonObject(with: line) as? [String: Any] else { continue }
+                    // The first line is the ACK from the daemon — { "id": 1, "result": { ... } }.
+                    // Skip anything without a `kind` field.
+                    guard let kind = obj["kind"] as? String else { continue }
+                    if kind == "layout-change" {
+                        await MainActor.run { self?.refreshLayout() }
+                    }
+                    // `keepalive` / `warning` frames are intentionally ignored.
+                }
+            }
+        }
     }
 
     /// Re-fetch the layout (after a split or any topology change) and
@@ -359,13 +417,9 @@ final class TmuxRelayWindowController: NSWindowController, NSWindowDelegate {
             paneId: paneId,
             direction: direction
         )
-        if ok {
-            // tmux is asynchronous through control mode; give it a brief
-            // moment to emit %layout-change before we poll list_panes.
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.20) { [weak self] in
-                self?.refreshLayout()
-            }
-        }
+        // Layout refresh is driven by the `multiplexer.tmux.events` stream:
+        // tmux fires %layout-change right after split-window completes and
+        // the daemon broadcasts it on `notify_tx`. No explicit polling.
         return ok
     }
 
@@ -420,6 +474,55 @@ final class TmuxRelayWindowController: NSWindowController, NSWindowDelegate {
         ]
 
         return candidates.first { fm.fileExists(atPath: $0) && fm.isExecutableFile(atPath: $0) }
+    }
+
+    /// Open an AF_UNIX SOCK_STREAM connection to the daemon socket.
+    /// Returns the connected fd, or -1 on any failure (path too long,
+    /// connect denied, etc.). Used by the event stream reader task.
+    nonisolated static func connectUnixSocket(path: String) -> Int32 {
+        let fd = Darwin.socket(AF_UNIX, SOCK_STREAM, 0)
+        guard fd >= 0 else { return -1 }
+        var addr = sockaddr_un()
+        addr.sun_family = sa_family_t(AF_UNIX)
+        let pathBytes = path.utf8CString
+        let sunCapacity = MemoryLayout.size(ofValue: addr.sun_path)
+        guard pathBytes.count <= sunCapacity else {
+            Darwin.close(fd)
+            return -1
+        }
+        withUnsafeMutablePointer(to: &addr.sun_path) { ptr in
+            ptr.withMemoryRebound(to: CChar.self, capacity: pathBytes.count) { dest in
+                for (i, byte) in pathBytes.enumerated() {
+                    dest[i] = byte
+                }
+            }
+        }
+        let rc = withUnsafePointer(to: &addr) { ptr in
+            ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { sa in
+                Darwin.connect(fd, sa, socklen_t(MemoryLayout<sockaddr_un>.size))
+            }
+        }
+        if rc != 0 {
+            Darwin.close(fd)
+            return -1
+        }
+        return fd
+    }
+
+    /// Write every byte of `data` to `fd`, retrying on partial writes.
+    /// Returns false on any I/O failure. Matches the framing expectation
+    /// of the JSON-RPC dispatcher (one full line per request).
+    nonisolated static func writeFully(fd: Int32, data: Data) -> Bool {
+        var written = 0
+        return data.withUnsafeBytes { raw -> Bool in
+            guard let base = raw.baseAddress else { return false }
+            while written < data.count {
+                let n = Darwin.write(fd, base.advanced(by: written), data.count - written)
+                if n <= 0 { return false }
+                written += n
+            }
+            return true
+        }
     }
 
     /// Best-effort daemon socket path resolution. Same chain as before so

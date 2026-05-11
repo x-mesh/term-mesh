@@ -248,6 +248,9 @@ async fn handle_connection(stream: tokio::net::UnixStream, ctx: &Context) -> any
         if req.method == "multiplexer.tmux.subscribe" {
             return stream_subscribe_tmux_output(req, writer, ctx).await;
         }
+        if req.method == "multiplexer.tmux.events" {
+            return stream_subscribe_tmux_events(req, writer, ctx).await;
+        }
 
         let resp = dispatch(&req, ctx).await;
 
@@ -513,6 +516,156 @@ async fn stream_subscribe_tmux_output(
     }
 
     Ok(())
+}
+
+/// Phase 1.1: streaming handler for `multiplexer.tmux.events`. Pushes
+/// window-scoped notifications (layout changes for now) as JSONL to the
+/// client until disconnect. Independent of the per-pane `subscribe`
+/// stream so slow event consumers cannot back-pressure pane output.
+async fn stream_subscribe_tmux_events(
+    req: Request,
+    mut writer: tokio::net::unix::OwnedWriteHalf,
+    ctx: &Context,
+) -> anyhow::Result<()> {
+    #[derive(serde::Deserialize)]
+    struct SubscribeParams {
+        surface_id: String,
+        #[serde(default)]
+        timeout_ms: Option<u64>,
+    }
+    let p: SubscribeParams = match serde_json::from_value(req.params.clone()) {
+        Ok(p) => p,
+        Err(e) => {
+            let resp = Response {
+                id: req.id,
+                result: None,
+                error: Some(RpcError {
+                    code: -32602,
+                    message: format!("invalid params: {e}"),
+                }),
+            };
+            let mut buf = serde_json::to_vec(&resp)?;
+            buf.push(b'\n');
+            let _ = writer.write_all(&buf).await;
+            return Ok(());
+        }
+    };
+
+    let backend = ctx
+        .tmux_backends
+        .read()
+        .await
+        .get(&p.surface_id)
+        .map(Arc::clone);
+    let backend = match backend {
+        Some(b) => b,
+        None => {
+            let resp = Response {
+                id: req.id,
+                result: None,
+                error: Some(RpcError {
+                    code: -32602,
+                    message: format!("unknown surface_id: {}", p.surface_id),
+                }),
+            };
+            let mut buf = serde_json::to_vec(&resp)?;
+            buf.push(b'\n');
+            let _ = writer.write_all(&buf).await;
+            return Ok(());
+        }
+    };
+
+    let mut notify_rx = backend.subscribe_notify();
+
+    // ACK so the caller can confirm the subscription started before any
+    // events arrive (or, in the steady state, before the keepalive ticks).
+    let ack = serde_json::json!({
+        "id": req.id,
+        "result": { "status": "subscribed", "surface_id": p.surface_id },
+        "error": null,
+    });
+    let mut buf = serde_json::to_vec(&ack)?;
+    buf.push(b'\n');
+    timeout(Duration::from_secs(5), writer.write_all(&buf))
+        .await
+        .map_err(|_| anyhow::anyhow!("ack write timeout"))??;
+
+    let deadline = p
+        .timeout_ms
+        .map(|ms| tokio::time::Instant::now() + Duration::from_millis(ms));
+    let mut ping_interval = tokio::time::interval(Duration::from_secs(30));
+    ping_interval.tick().await;
+
+    loop {
+        let payload: Option<Vec<u8>> = if let Some(dl) = deadline {
+            tokio::select! {
+                _ = tokio::time::sleep_until(dl) => break,
+                _ = ping_interval.tick() => {
+                    Some(serde_json::to_vec(&serde_json::json!({"kind":"keepalive"}))?)
+                }
+                recv = notify_rx.recv() => {
+                    match recv {
+                        Ok(ev) => Some(serialize_notify_event(&ev)),
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                            tracing::warn!("multiplexer.tmux.events: lagged by {n} notifications");
+                            Some(serde_json::to_vec(&serde_json::json!({
+                                "kind": "warning", "msg": "lagged"
+                            }))?)
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                    }
+                }
+            }
+        } else {
+            tokio::select! {
+                _ = ping_interval.tick() => {
+                    Some(serde_json::to_vec(&serde_json::json!({"kind":"keepalive"}))?)
+                }
+                recv = notify_rx.recv() => {
+                    match recv {
+                        Ok(ev) => Some(serialize_notify_event(&ev)),
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                            tracing::warn!("multiplexer.tmux.events: lagged by {n} notifications");
+                            Some(serde_json::to_vec(&serde_json::json!({
+                                "kind": "warning", "msg": "lagged"
+                            }))?)
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                    }
+                }
+            }
+        };
+
+        if let Some(mut line) = payload {
+            line.push(b'\n');
+            if writer.write_all(&line).await.is_err() {
+                break;
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Encode a `NotifyEvent` as the JSONL payload sent over `tmux.events`.
+fn serialize_notify_event(ev: &crate::multiplexer::tmux::NotifyEvent) -> Vec<u8> {
+    use crate::multiplexer::tmux::NotifyEvent;
+    let value = match ev {
+        NotifyEvent::LayoutChange {
+            window_id,
+            raw,
+            layout,
+        } => {
+            let tree = layout.as_ref().map(|l| layout_node_to_json(&l.root));
+            serde_json::json!({
+                "kind": "layout-change",
+                "window_id": window_id,
+                "raw": raw,
+                "tree": tree,
+            })
+        }
+    };
+    serde_json::to_vec(&value).unwrap_or_default()
 }
 
 /// Phase 1.1: serialize a tmux layout subtree as JSON for `tmux.get_layout`.
@@ -2157,6 +2310,37 @@ mod tests {
         assert_eq!(v["cols"], 80);
         assert_eq!(v["rows"], 24);
         assert!(v.get("children").is_none());
+    }
+
+    #[test]
+    fn serialize_notify_event_layout_change_includes_tree_when_parsed() {
+        use crate::multiplexer::tmux::layout::{parse_window_layout, WindowLayout};
+        use crate::multiplexer::tmux::NotifyEvent;
+        let layout: WindowLayout = parse_window_layout("abcd,80x24,0,0,1").unwrap();
+        let bytes = serialize_notify_event(&NotifyEvent::LayoutChange {
+            window_id: "@0".into(),
+            raw: "abcd,80x24,0,0,1".into(),
+            layout: Some(layout),
+        });
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["kind"], "layout-change");
+        assert_eq!(v["window_id"], "@0");
+        assert_eq!(v["tree"]["kind"], "pane");
+        assert_eq!(v["tree"]["pane_index"], 1);
+    }
+
+    #[test]
+    fn serialize_notify_event_layout_change_emits_null_tree_when_unparseable() {
+        use crate::multiplexer::tmux::NotifyEvent;
+        let bytes = serialize_notify_event(&NotifyEvent::LayoutChange {
+            window_id: "@2".into(),
+            raw: "garbage-string".into(),
+            layout: None,
+        });
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["kind"], "layout-change");
+        assert!(v["tree"].is_null());
+        assert_eq!(v["raw"], "garbage-string");
     }
 
     #[test]

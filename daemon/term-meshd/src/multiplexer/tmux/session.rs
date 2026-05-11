@@ -7,8 +7,26 @@ use tokio::process::{Child, ChildStdin, Command};
 use tokio::sync::{mpsc, Mutex};
 
 use super::encoder;
+use super::layout::WindowLayout;
 use super::parser::ControlModeParser;
 use crate::multiplexer::SurfaceId;
+
+/// Frame produced by the stdout reader task. We carry both pane output and
+/// the (much rarer) window-level notifications on a single channel so the
+/// reader task can decide ordering. Adding a second channel would split
+/// causality across two queues — a LayoutChange could arrive before the
+/// final `%output` of the pre-split pane on the consumer side.
+pub enum SessionFrame {
+    Output {
+        surface_id: SurfaceId,
+        bytes: Vec<u8>,
+    },
+    LayoutChange {
+        window_id: String,
+        raw: String,
+        layout: Option<WindowLayout>,
+    },
+}
 
 /// A live `ssh <host> tmux -CC attach -t <session>` control-mode process.
 pub struct TmuxSession {
@@ -16,7 +34,7 @@ pub struct TmuxSession {
     child: Child,
     /// Shared so `write_command` can be called from multiple tasks concurrently.
     stdin: Arc<Mutex<ChildStdin>>,
-    pub output_tx: mpsc::Sender<(SurfaceId, Vec<u8>)>,
+    pub frame_tx: mpsc::Sender<SessionFrame>,
 }
 
 impl TmuxSession {
@@ -28,7 +46,7 @@ impl TmuxSession {
     pub async fn connect(
         host: &str,
         session: &str,
-    ) -> Result<(Self, mpsc::Receiver<(SurfaceId, Vec<u8>)>)> {
+    ) -> Result<(Self, mpsc::Receiver<SessionFrame>)> {
         let mut child = Command::new("ssh")
             .args([
                 "-tt",
@@ -82,7 +100,22 @@ impl TmuxSession {
                     match ev {
                         TmuxEvent::Output { pane_id, bytes } => {
                             let sid = SurfaceId(pane_id);
-                            let _ = tx_clone.send((sid, bytes)).await;
+                            let _ = tx_clone
+                                .send(SessionFrame::Output { surface_id: sid, bytes })
+                                .await;
+                        }
+                        TmuxEvent::LayoutChange {
+                            window_id,
+                            raw,
+                            layout,
+                        } => {
+                            let _ = tx_clone
+                                .send(SessionFrame::LayoutChange {
+                                    window_id,
+                                    raw,
+                                    layout,
+                                })
+                                .await;
                         }
                         TmuxEvent::Pause { pane_id } => {
                             let cmd = encoder::refresh_client_continue(&pane_id);
@@ -101,7 +134,7 @@ impl TmuxSession {
             TmuxSession {
                 child,
                 stdin,
-                output_tx: tx,
+                frame_tx: tx,
             },
             rx,
         ))
@@ -122,12 +155,12 @@ impl TmuxSession {
     pub(crate) fn from_parts(
         child: Child,
         stdin: ChildStdin,
-        output_tx: mpsc::Sender<(SurfaceId, Vec<u8>)>,
+        frame_tx: mpsc::Sender<SessionFrame>,
     ) -> Self {
         Self {
             child,
             stdin: Arc::new(Mutex::new(stdin)),
-            output_tx,
+            frame_tx,
         }
     }
 }
