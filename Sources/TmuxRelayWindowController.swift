@@ -634,7 +634,12 @@ final class TmuxRelayWindowController: NSWindowController, NSWindowDelegate {
         let leaves = children.compactMap { buildLayoutView($0) }
         guard !leaves.isEmpty else { return nil }
         let split = NSSplitView()
-        split.translatesAutoresizingMaskIntoConstraints = false
+        // TAMRIC intentionally omitted — stays true (default).
+        // swapContent sets TAMRIC=false on the root split before anchoring it via
+        // autolayout. Inner NSSplitViews must keep TAMRIC=true so the parent
+        // NSSplitView's frame-writes via adjustSubviews() propagate through
+        // autoresizing masks instead of being overridden by autolayout's
+        // unconstrained zero-size pass. See architect ADR 2026-05-11.
         split.isVertical = isVertical
         // `.paneSplitter` draws a clearly visible thick divider — `.thin` is
         // a 1-pt grey line that vanishes against Ghostty's black background.
@@ -650,11 +655,15 @@ final class TmuxRelayWindowController: NSWindowController, NSWindowDelegate {
             // siblings + hiding dividers). Peer relay (`materializeLayout`
             // in PeerRelayWorkspaceWindowController.swift) deliberately
             // does not touch this flag, which is why its splits render.
-            split.addArrangedSubview(leaf)
+            split.addSubview(leaf)
         }
-        for idx in split.arrangedSubviews.indices {
+        // holdingPriority has no effect on the last subview.
+        for idx in split.subviews.indices.dropLast() {
             split.setHoldingPriority(.defaultLow, forSubviewAt: idx)
         }
+        // adjustSubviews() sees zero bounds here, but keeping it is harmless.
+        // The real distribution happens when the outer NSSplitView cascades
+        // setFrameSize -> adjustSubviews after swapContent anchors the root.
         split.adjustSubviews()
         #if DEBUG
         dlog("tmux.relay.makeSplit isVertical=\(isVertical) childCount=\(children.count) leafCount=\(leaves.count)")
@@ -726,6 +735,21 @@ final class TmuxRelayWindowController: NSWindowController, NSWindowDelegate {
                 view.leadingAnchor.constraint(equalTo: rootContainer.leadingAnchor),
                 view.trailingAnchor.constraint(equalTo: rootContainer.trailingAnchor),
             ])
+            // Force layout so inner NSSplitViews get valid bounds before their
+            // own adjustSubviews(). Without this, inner splits see zero bounds
+            // at addSubview time and panes appear collapsed to the leading edge.
+            // PeerRelayWorkspaceWindowController.materializeLayout uses the same trick.
+            rootContainer.layoutSubtreeIfNeeded()
+            Self.recursiveAdjustSplitViews(view)
+        }
+    }
+
+    private static func recursiveAdjustSplitViews(_ view: NSView) {
+        if let split = view as? NSSplitView {
+            split.adjustSubviews()
+        }
+        for sub in view.subviews {
+            recursiveAdjustSplitViews(sub)
         }
     }
 
