@@ -118,8 +118,14 @@ final class TmuxRelayWindowController: NSWindowController, NSWindowDelegate {
         return candidates.first { fm.fileExists(atPath: $0) && fm.isExecutableFile(atPath: $0) }
     }
 
-    /// Best-effort daemon socket path: prefer TERMMESH_DAEMON_UNIX_PATH env, then
-    /// the standard path used by reload.sh, then /tmp/term-meshd.sock.
+    /// Best-effort daemon socket path. Order:
+    ///   1. TERMMESH_DAEMON_UNIX_PATH / TERMMESH_DAEMON_SOCKET env
+    ///   2. macOS Library/Application Support/term-mesh/term-meshd-*.sock
+    ///      (this is where the app-spawned daemon writes its socket when
+    ///       a build tag is in effect; the value also lives in the daemon
+    ///       child's env but is not always re-exported to the app)
+    ///   3. ~/.local/share/term-mesh/term-meshd.sock
+    ///   4. /tmp/term-meshd.sock fallback
     static func detectDaemonSocket() -> String {
         if let p = ProcessInfo.processInfo.environment["TERMMESH_DAEMON_UNIX_PATH"], !p.isEmpty {
             return p
@@ -127,7 +133,37 @@ final class TmuxRelayWindowController: NSWindowController, NSWindowDelegate {
         if let p = ProcessInfo.processInfo.environment["TERMMESH_DAEMON_SOCKET"], !p.isEmpty {
             return p
         }
-        // Standard path written by term-meshd at startup.
+        // Probe getenv directly in case ProcessInfo cached an empty env.
+        if let raw = getenv("TERMMESH_DAEMON_UNIX_PATH") {
+            let s = String(cString: raw)
+            if !s.isEmpty { return s }
+        }
+
+        // macOS app-spawned daemon writes its socket into
+        // ~/Library/Application Support/term-mesh/term-meshd-*.sock.
+        let appSupport = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("Library/Application Support/term-mesh")
+            .path
+        if let entries = try? FileManager.default.contentsOfDirectory(atPath: appSupport) {
+            let socks = entries
+                .filter { $0.hasPrefix("term-meshd-") && $0.hasSuffix(".sock") }
+                .map { "\(appSupport)/\($0)" }
+                .filter { FileManager.default.fileExists(atPath: $0) }
+            // Prefer the one matching the current TERMMESH_TAG, otherwise newest.
+            if let tag = ProcessInfo.processInfo.environment["TERMMESH_TAG"], !tag.isEmpty {
+                if let match = socks.first(where: { $0.contains("-\(tag).sock") }) {
+                    return match
+                }
+            }
+            let newest = socks.sorted { lhs, rhs in
+                let l = (try? FileManager.default.attributesOfItem(atPath: lhs)[.modificationDate] as? Date) ?? .distantPast
+                let r = (try? FileManager.default.attributesOfItem(atPath: rhs)[.modificationDate] as? Date) ?? .distantPast
+                return l > r
+            }.first
+            if let s = newest { return s }
+        }
+
+        // Standard path written by term-meshd at startup (Linux / non-tagged).
         let home = FileManager.default.homeDirectoryForCurrentUser.path
         let standard = home + "/.local/share/term-mesh/term-meshd.sock"
         if FileManager.default.fileExists(atPath: standard) { return standard }
