@@ -1550,7 +1550,8 @@ async fn dispatch(req: &Request, ctx: &Context) -> Response {
                     match backend {
                         None => Err(format!("unknown surface_id: {}", p.surface_id)),
                         Some(b) => {
-                            let bytes = b.capture_pane(p.lines).await;
+                            let sid = SurfaceId(p.surface_id.clone());
+                            let bytes = b.capture_pane(&sid, p.lines).await;
                             let hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
                             Ok(serde_json::json!({ "bytes_hex": hex }))
                         }

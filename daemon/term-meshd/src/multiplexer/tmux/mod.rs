@@ -91,7 +91,7 @@ impl TmuxControlBackend {
 
     /// Capture the current visible screen of the first pane in the session.
     ///
-    /// Runs `ssh <host> tmux capture-pane -e -p -t <session>:0` as a one-shot
+    /// Runs `ssh <host> tmux capture-pane -e -p -t <pane>` as a one-shot
     /// subprocess and returns raw stdout.  The `-e` flag preserves ANSI escape
     /// sequences (colour, SGR) so the client TUI re-renders correctly.
     ///
@@ -99,22 +99,37 @@ impl TmuxControlBackend {
     /// via `-S -<n>`.  If `None`, only the visible screen (default tmux
     /// behaviour) is captured.
     ///
+    /// `surface_id` lets the caller name a specific surface; the function
+    /// resolves it to the real tmux pane id that attach_surface registered
+    /// in surface_map. Without this resolution the seed would target
+    /// `<session>:0` (the default = active pane), which is not necessarily
+    /// the same pane that send_input is writing to.  When the active pane
+    /// differs from the attached pane the user sees the wrong window's
+    /// contents and their keystrokes appear to do nothing.
+    ///
     /// Always succeeds: returns empty bytes on any error so callers do not
     /// need to handle failures (ADR 0002 "scrollback seed" — attach must
     /// succeed even when capture is unavailable).
-    pub async fn capture_pane(&self, lines: Option<i32>) -> Vec<u8> {
+    pub async fn capture_pane(&self, surface_id: &SurfaceId, lines: Option<i32>) -> Vec<u8> {
+        // Resolve to the same tmux pane id that send_input uses. If we
+        // cannot find a mapping yet (capture racing the first %output),
+        // fall back to <session>:0 so the seed is at least *something*.
+        let target = match self.surface_map.lookup_pane(surface_id).await {
+            Some(pane_id) => pane_id,
+            None => format!("{}:0", self.session_name),
+        };
         let cmd = match lines {
             Some(n) if n > 0 => format!(
-                "tmux capture-pane -e -p -S -{} -t '{}':0",
-                n, self.session_name
+                "tmux capture-pane -e -p -S -{} -t '{}'",
+                n, target
             ),
             Some(_) => format!(
-                "tmux capture-pane -e -p -S - -E - -t '{}':0",
-                self.session_name
+                "tmux capture-pane -e -p -S - -E - -t '{}'",
+                target
             ),
             None => format!(
-                "tmux capture-pane -e -p -t '{}':0",
-                self.session_name
+                "tmux capture-pane -e -p -t '{}'",
+                target
             ),
         };
         match tokio::process::Command::new("ssh")
