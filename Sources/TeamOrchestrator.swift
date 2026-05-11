@@ -1989,10 +1989,17 @@ final class TeamOrchestrator: ObservableObject {
     @discardableResult
     func notifyTaskCreated(teamName: String, taskId: String, tabManager: TabManager) -> Bool {
         guard let task = getTask(teamName: teamName, taskId: taskId) else { return false }
+        return notifyTaskCreated(teamName: teamName, task: task, tabManager: tabManager)
+    }
+
+    /// Overload that accepts a pre-fetched task — avoids re-reading taskBoards
+    /// (used by claim paths where the task lives in TeamDataStore, not taskBoards).
+    @discardableResult
+    func notifyTaskCreated(teamName: String, task: TeamTask, tabManager: TabManager) -> Bool {
         // Skip leader stdin injection — leader gets notifications via tm-agent wait/inbox
-        Logger.team.info("[notifyTaskCreated] task=\(taskId.prefix(8), privacy: .public)")
+        Logger.team.info("[notifyTaskCreated] task=\(task.id.prefix(8), privacy: .public)")
         #if DEBUG
-        dlog("[team.notifyTaskCreated] task=\(taskId.prefix(8)) — suppressed leader stdin injection")
+        dlog("[team.notifyTaskCreated] task=\(task.id.prefix(8)) — suppressed leader stdin injection")
         #endif
         guard let assignee = task.assignee?.nilIfBlank else { return true }
         let assigneeNotice = formatTaskAssignmentInstruction(task: task)

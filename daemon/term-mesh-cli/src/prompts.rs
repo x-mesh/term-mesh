@@ -61,7 +61,7 @@ Your peers are also writing findings to the shared board.
 ### Shared Board (Stigmergy)
 BOARD FILE: {board_path}
 
-- To POST a finding: Bash("echo '{{json}}' >> {board_path}")
+- To POST a finding: Bash("python3 -c \"import fcntl,sys; f=open(sys.argv[1],'a'); fcntl.flock(f,fcntl.LOCK_EX); f.write(sys.argv[2]+'\\n'); f.flush(); fcntl.flock(f,fcntl.LOCK_UN)\" {board_path} '{{json}}'")
   Format: {{"agent":"researcher-{agent_n}","round":R,"finding":"...","source":"...","implication":"..."}}
 - To READ peer findings: Bash("cat {board_path}")
 
@@ -84,7 +84,7 @@ Run up to {budget} rounds. Each round:
    - Cite every finding: file path, line number, URL, or inference
 
 4. **POST** — Write your finding to the board
-   - Bash("echo '{{\"agent\":\"researcher-{agent_n}\",\"round\":R,\"finding\":\"...\",\"source\":\"...\",\"implication\":\"...\"}}' >> {board_path}")
+   - Bash("python3 -c \"import fcntl,sys; f=open(sys.argv[1],'a'); fcntl.flock(f,fcntl.LOCK_EX); f.write(sys.argv[2]+'\\n'); f.flush(); fcntl.flock(f,fcntl.LOCK_UN)\" {board_path} '{{\"agent\":\"researcher-{agent_n}\",\"round\":R,\"finding\":\"...\",\"source\":\"...\",\"implication\":\"...\"}}'")
    - Only post genuinely useful discoveries, not every observation
 
 5. **JUDGE** — Should you continue?

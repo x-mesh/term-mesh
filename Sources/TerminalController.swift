@@ -3273,15 +3273,17 @@ class TerminalController {
             return v2Error(id: id, code: "invalid_params", message: "Missing agent_name")
         }
         if let task = store.claimTask(teamName: teamName, agentName: agentName) {
-            let taskId = task.id
+            let claimedTask = task
             let fallbackTabManager = self.tabManager
             // Push task instruction to the claiming agent after a short delay to let
             // the RPC response land first, so the agent's terminal is ready to receive.
+            // Pass task directly to avoid re-reading taskBoards (claimed task lives in
+            // TeamDataStore, not TeamOrchestrator.taskBoards — re-read would miss it).
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak self] in
                 guard self != nil else { return }
                 let tm = TeamOrchestrator.shared.resolveTabManager(teamName: teamName) ?? fallbackTabManager
                 guard let tm else { return }
-                TeamOrchestrator.shared.notifyTaskCreated(teamName: teamName, taskId: taskId, tabManager: tm)
+                TeamOrchestrator.shared.notifyTaskCreated(teamName: teamName, task: claimedTask, tabManager: tm)
             }
             return v2Ok(id: id, result: store.taskDictionary(task))
         }
