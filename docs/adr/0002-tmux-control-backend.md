@@ -408,9 +408,16 @@ Scope:
 - No automatic layout synchronization.
 - No split/close commands.
 - Scrollback seed optional; live output is sufficient.
-- Integration-tested against tmux 3.4 on Ubuntu 24.04 (2026-05-11): 95% event
-  recognition over a 10s attach window, 0 parse errors, and 730
-  octal-unescaped control bytes processed.
+- Integration-tested against tmux 3.4 on Ubuntu 24.04 (2026-05-11): 100%
+  event recognition (BeginBlock/EndBlock/Output/SessionChanged) over a 5s
+  attach window after the term-meshd lib split and the parser `%session-changed`
+  plus DCS-prefix patches, with 0 parse errors and 17+ octal-unescaped control
+  bytes. The earlier 95% figure was an artifact of an inline parser copy in the
+  smoke example; `examples/tmux_smoke.rs` now imports
+  `term_meshd::multiplexer::tmux::parser` directly.
+- Validated end-to-end via
+  `cargo run --example tmux_smoke -- <ssh-host> > <tmux-session>` on
+  2026-05-11; see commit history for the lib split and smoke rewrite sequence.
 
 ### Phase 1.1: Single window multi-pane mirror
 
