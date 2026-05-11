@@ -82,6 +82,12 @@ impl TmuxControlBackend {
         *self.tmux_session.write().await = Some(Arc::new(sess));
         self.surface_map.register(pane_id, surface_id).await;
     }
+
+    /// Test-only: directly send an OutputFrame on the broadcast channel.
+    #[cfg(test)]
+    pub fn inject_output_frame_for_test(&self, frame: OutputFrame) {
+        let _ = self.output_tx.send(frame);
+    }
 }
 
 impl RemoteMultiplexerBackend for TmuxControlBackend {
@@ -106,8 +112,6 @@ impl RemoteMultiplexerBackend for TmuxControlBackend {
     ) -> Result<RemoteSurfaceStream> {
         let (per_surface_tx, per_surface_rx) = mpsc::channel::<Vec<u8>>(256);
 
-        // Register the surface so the demux task can route output to it.
-        self.surface_map.register(surface_id.0.clone(), surface_id.clone()).await;
         self.surface_senders.write().await.insert(surface_id.clone(), per_surface_tx);
 
         // Start the session process if this is the first attach.
@@ -125,18 +129,39 @@ impl RemoteMultiplexerBackend for TmuxControlBackend {
 
             // Demux task: fan-out raw PTY output to per-surface channels and
             // to the broadcast channel for subscribe_output() callers.
+            //
+            // `session_rx` delivers (SurfaceId(real_pane_id), bytes) where
+            // real_pane_id is the tmux control-mode id (e.g. "%1").  On the
+            // first frame we lazy-register real_pane_id → surface_id so that
+            // send_input / lookup_pane works without requiring a separate
+            // list-panes round-trip.
             let senders = Arc::clone(&self.surface_senders);
             let output_tx = self.output_tx.clone();
+            let surface_map_demux = self.surface_map.clone();
+            let surface_id_demux = surface_id.clone();
             let mut demux_rx = session_rx;
             tokio::spawn(async move {
+                let mut pane_registered = false;
                 while let Some((sid, bytes)) = demux_rx.recv().await {
-                    // Per-surface mpsc (existing consumers).
-                    if let Some(tx) = senders.read().await.get(&sid) {
+                    // sid.0 is the real tmux pane_id (e.g. "%1").
+                    if !pane_registered {
+                        surface_map_demux
+                            .register(sid.0.clone(), surface_id_demux.clone())
+                            .await;
+                        pane_registered = true;
+                    }
+                    // Per-surface mpsc — keyed by UUID surface_id, not pane_id.
+                    if let Some(tx) = senders.read().await.get(&surface_id_demux) {
                         let _ = tx.send(bytes.clone()).await;
                     }
-                    // Broadcast to all subscribe_output() receivers.
+                    // Broadcast with the UUID surface_id so subscribers can
+                    // correlate frames back to their attach call.
                     let pane_id = sid.0.clone();
-                    let _ = output_tx.send(OutputFrame { surface_id: sid, pane_id, bytes });
+                    let _ = output_tx.send(OutputFrame {
+                        surface_id: surface_id_demux.clone(),
+                        pane_id,
+                        bytes,
+                    });
                 }
             });
         }
@@ -305,5 +330,50 @@ mod tests {
 
         backend.control(WorkspaceControl::SelectPane { pane_id: "%3".into() }).await.unwrap();
         assert_eq!(read_line(stdout).await, "select-pane -t %3");
+    }
+
+    // ── subscribe_output broadcast ────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn subscribe_output_receives_injected_frame() {
+        let backend = TmuxControlBackend::new("localhost", "test-session");
+        let mut rx = backend.subscribe_output();
+
+        let frame = OutputFrame {
+            surface_id: SurfaceId("surf-42".into()),
+            pane_id: "%1".into(),
+            bytes: b"hello broadcast".to_vec(),
+        };
+        backend.inject_output_frame_for_test(frame);
+
+        let received = tokio::time::timeout(Duration::from_millis(200), rx.recv())
+            .await
+            .expect("timeout waiting for broadcast frame")
+            .expect("broadcast channel closed");
+
+        assert_eq!(received.pane_id, "%1");
+        assert_eq!(received.surface_id.0, "surf-42");
+        assert_eq!(received.bytes, b"hello broadcast");
+    }
+
+    #[tokio::test]
+    async fn multiple_subscribers_each_receive_frame() {
+        let backend = TmuxControlBackend::new("localhost", "test-session");
+        let mut rx1 = backend.subscribe_output();
+        let mut rx2 = backend.subscribe_output();
+
+        backend.inject_output_frame_for_test(OutputFrame {
+            surface_id: SurfaceId("s".into()),
+            pane_id: "%2".into(),
+            bytes: vec![0x41],
+        });
+
+        let f1 = tokio::time::timeout(Duration::from_millis(200), rx1.recv())
+            .await.unwrap().unwrap();
+        let f2 = tokio::time::timeout(Duration::from_millis(200), rx2.recv())
+            .await.unwrap().unwrap();
+
+        assert_eq!(f1.pane_id, "%2");
+        assert_eq!(f2.pane_id, "%2");
     }
 }
