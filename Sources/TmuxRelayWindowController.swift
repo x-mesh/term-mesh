@@ -65,6 +65,11 @@ final class TmuxRelayWindowController: NSWindowController, NSWindowDelegate {
     private var windowResizeWorkItem: DispatchWorkItem?
     private var layoutRefreshInFlight = false
     private var layoutRefreshPending = false
+    /// Pending fraction info for each NSSplitView created during the
+    /// current layout build. Indexed by ObjectIdentifier(split).
+    /// Populated by makeSplit, consumed by applyDividerPositions after
+    /// swapContent forces layout. Cleared after each swapContent run.
+    private var pendingDividerExtents: [ObjectIdentifier: [CGFloat]] = [:]
     #if DEBUG
     private var buildLayoutLeafLogged = false
     #endif
@@ -631,8 +636,17 @@ final class TmuxRelayWindowController: NSWindowController, NSWindowDelegate {
     }
 
     private func makeSplit(isVertical: Bool, children: [TermMeshDaemon.TmuxLayoutNode]) -> NSView? {
-        let leaves = children.compactMap { buildLayoutView($0) }
-        guard !leaves.isEmpty else { return nil }
+        // Collect (view, fraction) pairs in step so leaves and their tmux
+        // extents stay aligned. NSSplitView is built independently of any
+        // arranged-subview API.
+        var leafExtents: [CGFloat] = []
+        let leafViews: [NSView] = children.compactMap { child in
+            guard let view = buildLayoutView(child) else { return nil }
+            let extent = isVertical ? CGFloat(child.cols) : CGFloat(child.rows)
+            leafExtents.append(extent)
+            return view
+        }
+        guard !leafViews.isEmpty else { return nil }
         let split = NSSplitView()
         // TAMRIC intentionally omitted — stays true (default).
         // swapContent sets TAMRIC=false on the root split before anchoring it via
@@ -647,7 +661,7 @@ final class TmuxRelayWindowController: NSWindowController, NSWindowDelegate {
         // wrapped in NSViews with non-terminal backgrounds, so the divider
         // gets contrast from the wrap. Our leaves go straight to Ghostty.
         split.dividerStyle = .paneSplitter
-        for leaf in leaves {
+        for leaf in leafViews {
             // Do NOT pin leaves with autolayout constraints — NSSplitView
             // manages child frames itself via autoresizing masks. Forcing
             // `translatesAutoresizingMaskIntoConstraints = false` on a leaf
@@ -665,8 +679,9 @@ final class TmuxRelayWindowController: NSWindowController, NSWindowDelegate {
         // The real distribution happens when the outer NSSplitView cascades
         // setFrameSize -> adjustSubviews after swapContent anchors the root.
         split.adjustSubviews()
+        pendingDividerExtents[ObjectIdentifier(split)] = leafExtents
         #if DEBUG
-        dlog("tmux.relay.makeSplit isVertical=\(isVertical) childCount=\(children.count) leafCount=\(leaves.count)")
+        dlog("tmux.relay.makeSplit isVertical=\(isVertical) childCount=\(children.count) leafCount=\(leafViews.count) extents=\(leafExtents)")
         #endif
         return split
     }
@@ -741,7 +756,9 @@ final class TmuxRelayWindowController: NSWindowController, NSWindowDelegate {
             // PeerRelayWorkspaceWindowController.materializeLayout uses the same trick.
             rootContainer.layoutSubtreeIfNeeded()
             Self.recursiveAdjustSplitViews(view)
+            applyDividerPositions(in: view)
         }
+        pendingDividerExtents.removeAll()
     }
 
     private static func recursiveAdjustSplitViews(_ view: NSView) {
@@ -750,6 +767,33 @@ final class TmuxRelayWindowController: NSWindowController, NSWindowDelegate {
         }
         for sub in view.subviews {
             recursiveAdjustSplitViews(sub)
+        }
+    }
+
+    private func applyDividerPositions(in view: NSView) {
+        if let split = view as? NSSplitView,
+           let fractions = pendingDividerExtents[ObjectIdentifier(split)],
+           !fractions.isEmpty {
+            let total = fractions.reduce(0, +)
+            let mainExtent = split.isVertical ? split.bounds.width : split.bounds.height
+            if total > 0 && mainExtent > 0 {
+                var cumulative: CGFloat = 0
+                for idx in 0..<(fractions.count - 1) {
+                    cumulative += fractions[idx]
+                    let raw = mainExtent * (cumulative / total)
+                    let position = max(20, min(mainExtent - 20, raw))
+                    split.setPosition(position, ofDividerAt: idx)
+                }
+                #if DEBUG
+                let positions = (0..<(fractions.count - 1)).map { idx in
+                    Int(mainExtent * (fractions.prefix(idx + 1).reduce(0, +) / total))
+                }
+                dlog("tmux.relay.applyDividers split=\(split.isVertical ? "H" : "V") extent=\(mainExtent) positions=\(positions)")
+                #endif
+            }
+        }
+        for sub in view.subviews {
+            applyDividerPositions(in: sub)
         }
     }
 
