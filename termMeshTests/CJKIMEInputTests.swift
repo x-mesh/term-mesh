@@ -800,6 +800,67 @@ final class CJKIMEKeyTextAccumulatorTests: XCTestCase {
         )
     }
 
+    func testAccumulatedIMECommitDropsPlainSpaceWhenTextInputAlreadyInsertedIt() {
+        XCTAssertFalse(
+            GhosttyNSView.shouldReplayPhysicalKeyAfterAccumulatedText(
+                keyCode: 49,
+                modifierFlags: [],
+                markedTextBefore: true,
+                hasMarkedTextAfter: false,
+                sentAccumulatedText: true,
+                physicalKeyAlreadyInsertedByTextInput: true
+            ),
+            "Korean IME can commit text plus the plain Space in insertText; replaying Space duplicates the separator"
+        )
+    }
+
+    func testAccumulatedIMECommitReplaysPlainSpaceWhenTextInputDidNotInsertIt() {
+        XCTAssertTrue(
+            GhosttyNSView.shouldReplayPhysicalKeyAfterAccumulatedText(
+                keyCode: 49,
+                modifierFlags: [],
+                markedTextBefore: true,
+                hasMarkedTextAfter: false,
+                sentAccumulatedText: true,
+                physicalKeyAlreadyInsertedByTextInput: false
+            ),
+            "If the IME commit only inserted composed text, the physical Space is still needed"
+        )
+    }
+
+    func testAccumulatedTextDoesNotTreatInternalSpaceAsPhysicalSpace() {
+        XCTAssertFalse(
+            GhosttyNSView.accumulatedTextIncludesPhysicalKey(
+                ["New York"],
+                keyCode: 49,
+                modifierFlags: []
+            ),
+            "An internal space in committed IME text is content, not the trigger Space"
+        )
+    }
+
+    func testAccumulatedTextTreatsTrailingSpaceAsPhysicalSpace() {
+        XCTAssertTrue(
+            GhosttyNSView.accumulatedTextIncludesPhysicalKey(
+                ["New York "],
+                keyCode: 49,
+                modifierFlags: []
+            ),
+            "A trailing space in the final accumulated chunk means text input already inserted the trigger Space"
+        )
+    }
+
+    func testAccumulatedTextTreatsSeparateSpaceChunkAsPhysicalSpace() {
+        XCTAssertTrue(
+            GhosttyNSView.accumulatedTextIncludesPhysicalKey(
+                ["한", " "],
+                keyCode: 49,
+                modifierFlags: []
+            ),
+            "Some IMEs deliver the trigger Space as its own accumulated text chunk"
+        )
+    }
+
     func testAccumulatedIMECommitDropsPlainLeftArrowReplay() {
         XCTAssertFalse(
             GhosttyNSView.shouldReplayPhysicalKeyAfterAccumulatedText(

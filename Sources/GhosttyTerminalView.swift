@@ -2388,7 +2388,12 @@ func pushTargetSurfaceSize(_ size: CGSize) {
                 modifierFlags: event.modifierFlags,
                 markedTextBefore: markedTextBefore,
                 hasMarkedTextAfter: markedText.length > 0,
-                sentAccumulatedText: sentAccumulatedText
+                sentAccumulatedText: sentAccumulatedText,
+                physicalKeyAlreadyInsertedByTextInput: Self.accumulatedTextIncludesPhysicalKey(
+                    accumulated,
+                    keyCode: event.keyCode,
+                    modifierFlags: event.modifierFlags
+                )
             ) {
                 keyEvent.composing = false
                 keyEvent.text = nil
@@ -2508,16 +2513,33 @@ func pushTargetSurfaceSize(_ size: CGSize) {
         modifierFlags: NSEvent.ModifierFlags,
         markedTextBefore: Bool,
         hasMarkedTextAfter: Bool,
-        sentAccumulatedText: Bool
+        sentAccumulatedText: Bool,
+        physicalKeyAlreadyInsertedByTextInput: Bool = false
     ) -> Bool {
         let wasComposing = markedTextBefore || hasMarkedTextAfter
         if wasComposing {
             let userMods = modifierFlags.intersection([.command, .shift, .option, .control])
             let isPlainLeftArrow = keyCode == 123 && userMods.isEmpty
-            return !isPlainLeftArrow
+            return !isPlainLeftArrow && !physicalKeyAlreadyInsertedByTextInput
         }
 
         return !sentAccumulatedText
+    }
+
+    static func accumulatedTextIncludesPhysicalKey(
+        _ accumulated: [String],
+        keyCode: UInt16,
+        modifierFlags: NSEvent.ModifierFlags
+    ) -> Bool {
+        let userMods = modifierFlags.intersection([.command, .shift, .option, .control])
+        guard userMods.isEmpty else { return false }
+
+        switch keyCode {
+        case 49: // kVK_Space
+            return accumulated.contains { $0 == " " } || (accumulated.last?.hasSuffix(" ") ?? false)
+        default:
+            return false
+        }
     }
 
     private func ghosttyKeyEvent(for event: NSEvent, surface: ghostty_surface_t) -> ghostty_input_key_s {
