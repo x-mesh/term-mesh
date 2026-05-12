@@ -2,6 +2,15 @@
 
 All notable changes to term-mesh are documented here.
 
+## [0.111.0] - 2026-05-12
+
+### Fixed
+- **Korean IME no longer doubles the separator space** — some Korean input methods (e.g. Korean 2-bulsik) deliver the trigger Space that commits a syllable as part of the accumulated `insertText` buffer (either as a trailing space on the last chunk or as a separate `" "` chunk). The physical Space key was then replayed on top of it, inserting two spaces instead of one. Term-mesh now detects when the text-input layer has already included the Space and skips the replay.
+
+### Thanks to 1 contributor!
+
+- [@JINWOO-J](https://github.com/JINWOO-J)
+
 ## [0.110.0] - 2026-05-12
 
 ### Fixed
