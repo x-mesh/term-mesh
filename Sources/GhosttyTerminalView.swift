@@ -2397,6 +2397,7 @@ func pushTargetSurfaceSize(_ size: CGSize) {
             ) {
                 keyEvent.composing = false
                 keyEvent.text = nil
+                keyEvent.consumed_mods = GHOSTTY_MODS_NONE
                 _ = ghostty_surface_key(surface, keyEvent)
             }
         } else {
@@ -2531,14 +2532,64 @@ func pushTargetSurfaceSize(_ size: CGSize) {
         keyCode: UInt16,
         modifierFlags: NSEvent.ModifierFlags
     ) -> Bool {
-        let userMods = modifierFlags.intersection([.command, .shift, .option, .control])
-        guard userMods.isEmpty else { return false }
+        let nonTextMods = modifierFlags.intersection([.command, .option, .control])
+        guard nonTextMods.isEmpty else { return false }
 
-        switch keyCode {
-        case 49: // kVK_Space
-            return accumulated.contains { $0 == " " } || (accumulated.last?.hasSuffix(" ") ?? false)
-        default:
+        let shifted = modifierFlags.contains(.shift)
+        guard let insertedText = physicalTextInsertedByTextInput(keyCode: keyCode, shifted: shifted) else {
             return false
+        }
+
+        guard let last = accumulated.last else { return false }
+        return last == insertedText || last.hasSuffix(insertedText)
+    }
+
+    private static func physicalTextInsertedByTextInput(keyCode: UInt16, shifted: Bool) -> String? {
+        switch keyCode {
+        case 18: // kVK_ANSI_1
+            return shifted ? "!" : "1"
+        case 19: // kVK_ANSI_2
+            return shifted ? "@" : "2"
+        case 20: // kVK_ANSI_3
+            return shifted ? "#" : "3"
+        case 21: // kVK_ANSI_4
+            return shifted ? "$" : "4"
+        case 22: // kVK_ANSI_6
+            return shifted ? "^" : "6"
+        case 23: // kVK_ANSI_5
+            return shifted ? "%" : "5"
+        case 24: // kVK_ANSI_Equal
+            return shifted ? "+" : "="
+        case 25: // kVK_ANSI_9
+            return shifted ? "(" : "9"
+        case 26: // kVK_ANSI_7
+            return shifted ? "&" : "7"
+        case 27: // kVK_ANSI_Minus
+            return shifted ? "_" : "-"
+        case 28: // kVK_ANSI_8
+            return shifted ? "*" : "8"
+        case 29: // kVK_ANSI_0
+            return shifted ? ")" : "0"
+        case 30: // kVK_ANSI_RightBracket
+            return shifted ? "}" : "]"
+        case 33: // kVK_ANSI_LeftBracket
+            return shifted ? "{" : "["
+        case 39: // kVK_ANSI_Quote
+            return shifted ? "\"" : "'"
+        case 41: // kVK_ANSI_Semicolon
+            return shifted ? ":" : ";"
+        case 42: // kVK_ANSI_Backslash
+            return shifted ? "|" : "\\"
+        case 43: // kVK_ANSI_Comma
+            return shifted ? "<" : ","
+        case 44: // kVK_ANSI_Slash
+            return shifted ? "?" : "/"
+        case 47: // kVK_ANSI_Period
+            return shifted ? ">" : "."
+        case 49: // kVK_Space
+            return " "
+        default:
+            return nil
         }
     }
 

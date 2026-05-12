@@ -861,6 +861,157 @@ final class CJKIMEKeyTextAccumulatorTests: XCTestCase {
         )
     }
 
+    func testAccumulatedIMECommitDropsPlainPeriodWhenTextInputAlreadyInsertedIt() {
+        XCTAssertFalse(
+            GhosttyNSView.shouldReplayPhysicalKeyAfterAccumulatedText(
+                keyCode: 47,
+                modifierFlags: [],
+                markedTextBefore: true,
+                hasMarkedTextAfter: false,
+                sentAccumulatedText: true,
+                physicalKeyAlreadyInsertedByTextInput: true
+            ),
+            "Some IMEs commit text plus the trigger Period; replaying Period duplicates the punctuation"
+        )
+    }
+
+    func testAccumulatedTextTreatsTrailingPeriodAsPhysicalPeriod() {
+        XCTAssertTrue(
+            GhosttyNSView.accumulatedTextIncludesPhysicalKey(
+                ["완료."],
+                keyCode: 47,
+                modifierFlags: []
+            ),
+            "A trailing period in the final accumulated chunk means text input already inserted the trigger Period"
+        )
+    }
+
+    func testAccumulatedTextTreatsSeparateSlashChunkAsPhysicalSlash() {
+        XCTAssertTrue(
+            GhosttyNSView.accumulatedTextIncludesPhysicalKey(
+                ["경로", "/"],
+                keyCode: 44,
+                modifierFlags: []
+            ),
+            "Some IMEs deliver the trigger Slash as its own accumulated text chunk"
+        )
+    }
+
+    func testAccumulatedTextDoesNotTreatEarlierSeparateSlashAsPhysicalSlash() {
+        XCTAssertFalse(
+            GhosttyNSView.accumulatedTextIncludesPhysicalKey(
+                ["/", "경로"],
+                keyCode: 44,
+                modifierFlags: []
+            ),
+            "Only the final accumulated chunk can represent the physical trigger key"
+        )
+    }
+
+    func testAccumulatedTextDoesNotTreatInternalSlashAsPhysicalSlash() {
+        XCTAssertFalse(
+            GhosttyNSView.accumulatedTextIncludesPhysicalKey(
+                ["path/to"],
+                keyCode: 44,
+                modifierFlags: []
+            ),
+            "An internal slash in committed text is content, not the trigger Slash"
+        )
+    }
+
+    func testAccumulatedTextTreatsTrailingQuestionMarkAsShiftSlashPhysicalKey() {
+        XCTAssertTrue(
+            GhosttyNSView.accumulatedTextIncludesPhysicalKey(
+                ["질문?"],
+                keyCode: 44,
+                modifierFlags: [.shift]
+            ),
+            "A trailing question mark means text input already inserted the Shift+Slash trigger"
+        )
+    }
+
+    func testAccumulatedIMECommitDropsShiftSlashWhenQuestionMarkAlreadyInsertedIt() {
+        XCTAssertFalse(
+            GhosttyNSView.shouldReplayPhysicalKeyAfterAccumulatedText(
+                keyCode: 44,
+                modifierFlags: [.shift],
+                markedTextBefore: true,
+                hasMarkedTextAfter: false,
+                sentAccumulatedText: true,
+                physicalKeyAlreadyInsertedByTextInput: true
+            ),
+            "Replaying Shift+Slash after text input inserted '?' can produce duplicated punctuation in Claude"
+        )
+    }
+
+    func testAccumulatedTextDetectsAnsiPunctuationAndDigitTriggers() {
+        let cases: [(keyCode: UInt16, flags: NSEvent.ModifierFlags, inserted: String)] = [
+            (18, [], "1"),
+            (18, [.shift], "!"),
+            (19, [], "2"),
+            (19, [.shift], "@"),
+            (20, [], "3"),
+            (20, [.shift], "#"),
+            (21, [], "4"),
+            (21, [.shift], "$"),
+            (22, [], "6"),
+            (22, [.shift], "^"),
+            (23, [], "5"),
+            (23, [.shift], "%"),
+            (24, [], "="),
+            (24, [.shift], "+"),
+            (25, [], "9"),
+            (25, [.shift], "("),
+            (26, [], "7"),
+            (26, [.shift], "&"),
+            (27, [], "-"),
+            (27, [.shift], "_"),
+            (28, [], "8"),
+            (28, [.shift], "*"),
+            (29, [], "0"),
+            (29, [.shift], ")"),
+            (30, [], "]"),
+            (30, [.shift], "}"),
+            (33, [], "["),
+            (33, [.shift], "{"),
+            (39, [], "'"),
+            (39, [.shift], "\""),
+            (41, [], ";"),
+            (41, [.shift], ":"),
+            (42, [], "\\"),
+            (42, [.shift], "|"),
+            (43, [], ","),
+            (43, [.shift], "<"),
+            (44, [], "/"),
+            (44, [.shift], "?"),
+            (47, [], "."),
+            (47, [.shift], ">"),
+            (49, [], " "),
+        ]
+
+        for entry in cases {
+            XCTAssertTrue(
+                GhosttyNSView.accumulatedTextIncludesPhysicalKey(
+                    ["commit\(entry.inserted)"],
+                    keyCode: entry.keyCode,
+                    modifierFlags: entry.flags
+                ),
+                "Expected keyCode \(entry.keyCode) to match inserted text '\(entry.inserted)'"
+            )
+        }
+    }
+
+    func testAccumulatedTextIgnoresOptionModifiedPunctuation() {
+        XCTAssertFalse(
+            GhosttyNSView.accumulatedTextIncludesPhysicalKey(
+                ["경로/"],
+                keyCode: 44,
+                modifierFlags: [.option]
+            ),
+            "Option-modified punctuation can be layout/dead-key text and should not suppress physical replay"
+        )
+    }
+
     func testAccumulatedIMECommitDropsPlainLeftArrowReplay() {
         XCTAssertFalse(
             GhosttyNSView.shouldReplayPhysicalKeyAfterAccumulatedText(
