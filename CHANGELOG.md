@@ -2,6 +2,15 @@
 
 All notable changes to term-mesh are documented here.
 
+## [0.112.0] - 2026-05-12
+
+### Fixed
+- **CJK IME no longer doubles punctuation when used as a commit trigger** — Korean, Chinese, and Japanese input methods often commit composed text when the user presses a punctuation key (`.`, `/`, `?`, `!`, `-`, `=`, `[`, `]`, `'`, `;`, `,`, and their Shift variants). The physical key was then replayed on top of the composed text, inserting the punctuation character twice (e.g. "완료.." instead of "완료."). Term-mesh now detects when the text-input layer already included the trigger character as part of the IME commit and skips the redundant replay.
+
+### Thanks to 1 contributor!
+
+- [@JINWOO-J](https://github.com/JINWOO-J)
+
 ## [0.111.0] - 2026-05-12
 
 ### Fixed
