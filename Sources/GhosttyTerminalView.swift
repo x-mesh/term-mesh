@@ -2519,6 +2519,13 @@ func pushTargetSurfaceSize(_ size: CGSize) {
     ) -> Bool {
         let wasComposing = markedTextBefore || hasMarkedTextAfter
         if wasComposing {
+            // Korean IMEs can commit the previous syllable while starting the next
+            // marked syllable in the same keyDown. The physical key was consumed
+            // by the IME in that case; replaying it duplicates the leading jamo.
+            if hasMarkedTextAfter && sentAccumulatedText {
+                return false
+            }
+
             let userMods = modifierFlags.intersection([.command, .shift, .option, .control])
             let isPlainLeftArrow = keyCode == 123 && userMods.isEmpty
             return !isPlainLeftArrow && !physicalKeyAlreadyInsertedByTextInput

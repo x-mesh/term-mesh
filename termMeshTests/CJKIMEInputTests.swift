@@ -800,6 +800,19 @@ final class CJKIMEKeyTextAccumulatorTests: XCTestCase {
         )
     }
 
+    func testAccumulatedKoreanCommitWithContinuingMarkedTextDoesNotReplayPhysicalLetter() {
+        XCTAssertFalse(
+            GhosttyNSView.shouldReplayPhysicalKeyAfterAccumulatedText(
+                keyCode: 13, // kVK_ANSI_W, Korean 2-set "ㅈ"
+                modifierFlags: [],
+                markedTextBefore: true,
+                hasMarkedTextAfter: true,
+                sentAccumulatedText: true
+            ),
+            "Continuous Korean typing can commit the previous syllable and start the next marked syllable in one keyDown; replaying the physical letter duplicates the jamo in raw TUIs"
+        )
+    }
+
     func testAccumulatedIMECommitDropsPlainSpaceWhenTextInputAlreadyInsertedIt() {
         XCTAssertFalse(
             GhosttyNSView.shouldReplayPhysicalKeyAfterAccumulatedText(
