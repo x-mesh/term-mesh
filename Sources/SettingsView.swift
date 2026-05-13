@@ -2982,6 +2982,10 @@ enum CLIPathSettings {
         case "claude":
             candidates = [
                 (home as NSString).appendingPathComponent(".local/bin/claude"),
+                "/opt/homebrew/bin/claude",
+                "/usr/local/bin/claude",
+                (home as NSString).appendingPathComponent(".npm-global/bin/claude"),
+                "/opt/homebrew/opt/node/bin/claude",
             ]
         case "kiro":
             candidates = [
@@ -2995,12 +2999,18 @@ enum CLIPathSettings {
                 "/usr/local/bin/codex",
                 (home as NSString).appendingPathComponent(".local/bin/codex"),
                 (home as NSString).appendingPathComponent(".cargo/bin/codex"),
+                (home as NSString).appendingPathComponent(".npm-global/bin/codex"),
+                (home as NSString).appendingPathComponent(".volta/bin/codex"),
+                "/opt/homebrew/opt/node/bin/codex",
             ]
         case "gemini":
             candidates = [
                 "/opt/homebrew/bin/gemini",
                 "/usr/local/bin/gemini",
                 (home as NSString).appendingPathComponent(".local/bin/gemini"),
+                (home as NSString).appendingPathComponent(".npm-global/bin/gemini"),
+                (home as NSString).appendingPathComponent(".volta/bin/gemini"),
+                "/opt/homebrew/opt/node/bin/gemini",
             ]
         default:
             candidates = []

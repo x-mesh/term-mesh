@@ -2,6 +2,17 @@
 
 All notable changes to term-mesh are documented here.
 
+## [0.113.0] - 2026-05-13
+
+### Fixed
+- **Team leader pane no longer launches as a blank shell when the CLI binary lives outside `~/.local/bin`** — `claude`, `codex`, and `gemini` are now also auto-detected at `/opt/homebrew/bin`, `/usr/local/bin`, `~/.npm-global/bin`, `~/.volta/bin`, and `/opt/homebrew/opt/node/bin`. Previously a Homebrew/npm/Volta install would silently fall back to a bare shell with the title still showing "👑 Leader (Claude)".
+- **Missing CLI binary is now surfaced as a visible error in the leader pane** instead of silently dropping into a blank shell. The pane prints a red `term-mesh: '<cli>' binary not found …` message pointing to Settings → Agent Teams → CLI Paths.
+- **Korean IME no longer doubles the leading jamo of the next syllable** in raw-mode TUI panes such as `codex` and `kiro-cli`. When the IME committed the previous syllable and started a new marked syllable in the same `keyDown` (e.g. typing "정진우"), the physical key was replayed on top of the new preedit, producing "정ㅈ진ㅇ우 나ㅡ는 뭔ㄱ가". Term-mesh now skips the physical-key replay whenever a CJK IME starts a fresh composition right after committing prior text.
+
+### Thanks to 1 contributor!
+
+- [@JINWOO-J](https://github.com/JINWOO-J)
+
 ## [0.112.0] - 2026-05-12
 
 ### Fixed

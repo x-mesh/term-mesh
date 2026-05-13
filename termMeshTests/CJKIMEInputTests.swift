@@ -800,6 +800,69 @@ final class CJKIMEKeyTextAccumulatorTests: XCTestCase {
         )
     }
 
+    func testAccumulatedKoreanCommitWithContinuingMarkedTextDoesNotReplayPhysicalLetter() {
+        XCTAssertFalse(
+            GhosttyNSView.shouldReplayPhysicalKeyAfterAccumulatedText(
+                keyCode: 13, // kVK_ANSI_W, Korean 2-set "ㅈ"
+                modifierFlags: [],
+                markedTextBefore: true,
+                hasMarkedTextAfter: true,
+                sentAccumulatedText: true
+            ),
+            "Continuous Korean typing can commit the previous syllable and start the next marked syllable in one keyDown; replaying the physical letter duplicates the jamo in raw TUIs"
+        )
+    }
+
+    func testAccumulatedJapaneseInlineCommitWithContinuingMarkedTextDoesNotReplayPhysicalLetter() {
+        // Some Japanese IMEs (e.g. Kotoeri inline mode) can commit a converted
+        // chunk and immediately start a new romaji composition in the same
+        // keyDown — the same commit_and_restart pattern as Korean 2-set.
+        XCTAssertFalse(
+            GhosttyNSView.shouldReplayPhysicalKeyAfterAccumulatedText(
+                keyCode: 40, // kVK_ANSI_K (romaji "k")
+                modifierFlags: [],
+                markedTextBefore: true,
+                hasMarkedTextAfter: true,
+                sentAccumulatedText: true
+            ),
+            "Japanese inline commit + new romaji markedText must not replay the physical letter"
+        )
+    }
+
+    func testAccumulatedChinesePinyinCommitWithContinuingMarkedTextDoesNotReplayPhysicalLetter() {
+        // Chinese pinyin IMEs can finalize a pinyin chunk and start a new one
+        // when the user presses a non-trigger letter — same commit_and_restart
+        // pattern. Replaying the physical letter would duplicate the pinyin
+        // initial in the buffer.
+        XCTAssertFalse(
+            GhosttyNSView.shouldReplayPhysicalKeyAfterAccumulatedText(
+                keyCode: 1, // kVK_ANSI_S (pinyin "s")
+                modifierFlags: [],
+                markedTextBefore: true,
+                hasMarkedTextAfter: true,
+                sentAccumulatedText: true
+            ),
+            "Chinese pinyin commit + new markedText must not replay the physical letter"
+        )
+    }
+
+    func testAccumulatedKoreanFinalCommitWithoutContinuationStillReplaysReturn() {
+        // Regression guard: when composition ENDS (no new markedText), Return /
+        // navigation keys must still replay so that Terminal.app-style commit +
+        // newline behavior is preserved. The new commit_and_restart guard must
+        // not fire here because hasMarkedTextAfter is false.
+        XCTAssertTrue(
+            GhosttyNSView.shouldReplayPhysicalKeyAfterAccumulatedText(
+                keyCode: 36, // kVK_Return
+                modifierFlags: [],
+                markedTextBefore: true,
+                hasMarkedTextAfter: false,
+                sentAccumulatedText: true
+            ),
+            "Korean final commit + Return (no new markedText) must still replay Return for newline"
+        )
+    }
+
     func testAccumulatedIMECommitDropsPlainSpaceWhenTextInputAlreadyInsertedIt() {
         XCTAssertFalse(
             GhosttyNSView.shouldReplayPhysicalKeyAfterAccumulatedText(
