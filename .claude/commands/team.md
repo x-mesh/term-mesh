@@ -54,6 +54,8 @@ Agent init uses compact runbook digests by default; set `TERMMESH_RUNBOOK_MODE=f
 
 ### Communication (leader → agent)
 
+> **Parallel fan-out shortcut:** 모든 idle agent에 동시 dispatch + 3-line synthesis는 `/tm "<instruction>"` 사용. 이 문서는 thin CLI router; orchestration workflow는 `.claude/commands/tm.md` 참고.
+
 **NEVER use `sleep N && tm-agent read`** — `sleep` chained with another command is blocked by Claude Code hooks.
 To wait for agents to finish, always use `tm-agent wait` then read:
 ```bash

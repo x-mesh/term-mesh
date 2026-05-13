@@ -8,6 +8,8 @@
 
 ## When to use
 
+> **팀 생성·상태·태스크 보드 관리는 `/team` 또는 `tm-agent <subcommand>` 직접 사용.** 이 커맨드는 fan-out workflow에 집중. 다른 tm-agent 기능은 `.claude/commands/team.md` 참고.
+
 | 상황 | 커맨드 |
 |------|--------|
 | 모든 에이전트가 동시에 같은 목표를 보고 각자 역할 관점으로 답해야 할 때 | `/tm` |
