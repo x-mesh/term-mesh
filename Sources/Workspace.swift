@@ -334,10 +334,12 @@ final class Workspace: Identifiable, ObservableObject {
                         if optionHeld {
                             TeamOrchestrator.shared.restartAgentPane(panelId: panelId)
                         } else {
+                            // panelId-keyed so duplicate-named agents (e.g. two
+                            // `executor` panes) resolve to the exact pane the
+                            // user clicked rather than the first by name.
                             Task { @MainActor in
                                 _ = await TeamOrchestrator.shared.restartAgentPaneHard(
-                                    teamName: agent.teamName,
-                                    agentName: agent.agentName
+                                    panelId: panelId
                                 )
                             }
                         }

@@ -2572,14 +2572,58 @@ final class TeamOrchestrator: ObservableObject {
         }
     }
 
+    /// PanelId-keyed entry point. Use this from UI sites that already know the
+    /// exact panel being restarted (e.g. the pane-header ↻ button) so duplicate
+    /// agent names — two `executor` panes in the same team — don't collapse to
+    /// the first match. Resolves to (teamName, panelId-matched index) and runs
+    /// the full restart sequence with that index.
+    @discardableResult
+    func restartAgentPaneHard(
+        panelId: UUID,
+        tabManager preferred: TabManager? = nil
+    ) async -> Result<(old: UUID, new: UUID), RestartHardError> {
+        var resolved: (team: String, agent: String)?
+        for (teamName, team) in teams {
+            if let agent = team.agents.first(where: { $0.panelId == panelId }) {
+                resolved = (teamName, agent.name)
+                break
+            }
+        }
+        guard let r = resolved else {
+            #if DEBUG
+            dlog("[team.restart] mode=hard panelId-lookup miss panel=\(panelId.uuidString.prefix(8))")
+            #endif
+            Logger.team.info(
+                "[team.restart] mode=hard panelId-lookup miss panel=\(panelId.uuidString.prefix(8), privacy: .public)"
+            )
+            return .failure(.agentNotFound)
+        }
+        return await restartAgentPaneHard(
+            teamName: r.team,
+            agentName: r.agent,
+            disambiguatePanelId: panelId,
+            tabManager: preferred
+        )
+    }
+
     func restartAgentPaneHard(
         teamName: String,
         agentName: String,
+        disambiguatePanelId: UUID? = nil,
         tabManager preferred: TabManager? = nil
     ) async -> Result<(old: UUID, new: UUID), RestartHardError> {
-        guard var team = teams[teamName],
-              let idx = team.agents.firstIndex(where: { $0.name == agentName })
-        else {
+        // When `disambiguatePanelId` is provided, match by (name, panelId) so
+        // duplicate-named agents resolve to the correct pane. Falls back to
+        // first-name-match for the legacy CLI/RPC entry point.
+        let idxOpt: Int?
+        if let target = disambiguatePanelId {
+            idxOpt = teams[teamName]?.agents.firstIndex(where: {
+                $0.name == agentName && $0.panelId == target
+            })
+        } else {
+            idxOpt = teams[teamName]?.agents.firstIndex(where: { $0.name == agentName })
+        }
+        guard var team = teams[teamName], let idx = idxOpt else {
             return .failure(.agentNotFound)
         }
         let old = team.agents[idx]
