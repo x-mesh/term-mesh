@@ -2403,20 +2403,15 @@ func pushTargetSurfaceSize(_ size: CGSize) {
         // ESC (keyCode 53) is never a composing event — it *cancels* composition.
         // Marking it composing causes Ghostty to suppress the 0x1B byte, which
         // breaks vim normal-mode switching over SSH even when no IME box is open.
-        let isEscape = event.keyCode == 53 // kVK_Escape
-        // Return (keyCode 36) that *clears* composition without committing text is also
-        // not composing: markedText was present before but IME discarded the preedit
-        // instead of committing it (accumulator empty). Without this carve-out the
-        // composing=true flag suppresses the "\r" byte and the Enter is swallowed.
-        let isReturnClearingIME = event.keyCode == 36
-            && markedTextBefore
-            && markedText.length == 0
-            && (keyTextAccumulator == nil || keyTextAccumulator!.isEmpty)
-        keyEvent.composing = !isEscape
-            && !isReturnClearingIME
-            && (markedText.length > 0 || markedTextBefore)
+        let accumulatedTextIsEmpty = keyTextAccumulator == nil || keyTextAccumulator!.isEmpty
+        keyEvent.composing = GhosttyNSView.computeComposingFlag(
+            keyCode: event.keyCode,
+            markedTextBefore: markedTextBefore,
+            hasMarkedTextAfter: markedText.length > 0,
+            accumulatedTextIsEmpty: accumulatedTextIsEmpty
+        )
         #if DEBUG
-        if isReturnClearingIME {
+        if event.keyCode == 36 && markedTextBefore && markedText.length == 0 && accumulatedTextIsEmpty {
             dlog("key.return.clearingIME markedTextBefore=true accumulator=empty → composing=false")
         }
         if event.keyCode == 36 && (markedTextBefore || markedText.length > 0) {
@@ -2578,6 +2573,40 @@ func pushTargetSurfaceSize(_ size: CGSize) {
     private func shouldSendText(_ text: String) -> Bool {
         guard let first = text.utf8.first else { return false }
         return first >= 0x20
+    }
+
+    /// Decide whether a key event should be flagged as composing (= part of an
+    /// active IME composition) when handed to Ghostty.
+    ///
+    /// Ghostty key_encode.zig early-returns on composing=true (suppressing the
+    /// byte), so this decision is the single point that prevents Enter/Tab/Esc
+    /// swallow when an IME ends composition without committing text.
+    ///
+    /// Pure function — no AppKit / Ghostty side effects. Trivially unit-testable.
+    ///
+    /// Decision matrix:
+    /// | keyCode | markedTextBefore | hasMarkedTextAfter | accumulatedTextIsEmpty | result |
+    /// |---------|------------------|--------------------|------------------------|--------|
+    /// | 53 (Esc)| any              | any                | any                    | false  |
+    /// | 36 (Ret)| true             | false              | true                   | false  |
+    /// | any     | true or false    | true               | any                    | true   |
+    /// | any     | true             | false              | any                    | true   |
+    /// | any     | false            | false              | any                    | false  |
+    static func computeComposingFlag(
+        keyCode: UInt16,
+        markedTextBefore: Bool,
+        hasMarkedTextAfter: Bool,
+        accumulatedTextIsEmpty: Bool
+    ) -> Bool {
+        // ESC cancels composition — never composing.
+        guard keyCode != 53 else { return false }
+        // Return that clears composition without committing text is not composing:
+        // accumulator empty means no text was sent via insertText, so Ghostty must
+        // receive the physical "\r" or the Enter is permanently swallowed.
+        if keyCode == 36 && markedTextBefore && !hasMarkedTextAfter && accumulatedTextIsEmpty {
+            return false
+        }
+        return markedTextBefore || hasMarkedTextAfter
     }
 
     static func shouldReplayPhysicalKeyAfterAccumulatedText(
