@@ -1058,6 +1058,10 @@ class ProviderDetector: ObservableObject {
         return [
             "claude": [
                 (home as NSString).appendingPathComponent(".local/bin/claude"),
+                "/opt/homebrew/bin/claude",
+                "/usr/local/bin/claude",
+                (home as NSString).appendingPathComponent(".npm-global/bin/claude"),
+                "/opt/homebrew/opt/node/bin/claude",
             ],
             "codex": [
                 "/opt/homebrew/bin/codex",

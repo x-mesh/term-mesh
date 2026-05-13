@@ -833,15 +833,30 @@ final class TeamOrchestrator: ObservableObject {
             dlog("[team] leaderMode=\(leaderMode) leaderCommand=\(leaderCommand ?? "nil")")
             #endif
 
+            // If a CLI leader was requested but the binary wasn't found, surface
+            // a visible error in the pane instead of silently launching a blank
+            // shell (which looks like "leader is empty" to the user).
+            // Use a marker so the cd-wrapper below can decide whether to `exec`.
+            struct ResolvedLeader { let cmd: String; let isExec: Bool }
+            let resolvedLeader: ResolvedLeader? = {
+                if let cmd = leaderCommand { return ResolvedLeader(cmd: cmd, isExec: true) }
+                if leaderMode == "repl" { return nil }
+                let cliName = leaderMode
+                let msg = "term-mesh: '\(cliName)' binary not found on PATH or known install locations.\\nSet a custom path under Settings → Agent Teams → CLI Paths, then recreate the team."
+                let escaped = msg.replacingOccurrences(of: "'", with: "'\\''")
+                return ResolvedLeader(cmd: "printf '\\033[1;31m%b\\033[0m\\n' '\(escaped)'", isExec: false)
+            }()
+
             // Build leader shell command with explicit cd when worktree is active
-            let leaderShellCommand: String? = leaderCommand.map { cmd in
+            let leaderShellCommand: String? = resolvedLeader.map { rl in
+                let runVerb = rl.isExec ? "exec " : ""
                 if leaderWorkDir != workingDirectory {
                     let shell = ProcessInfo.processInfo.environment["SHELL"] ?? "/bin/zsh"
-                    let inner = "cd \"\(leaderWorkDir)\" && exec \(cmd); exec $SHELL"
+                    let inner = "cd \"\(leaderWorkDir)\" && \(runVerb)\(rl.cmd); exec $SHELL"
                     let escaped = inner.replacingOccurrences(of: "'", with: "'\\''")
                     return "\(shell) -l -c '\(escaped)'"
                 } else {
-                    return "\(cmd); exec $SHELL"
+                    return "\(rl.cmd); exec $SHELL"
                 }
             }
 
