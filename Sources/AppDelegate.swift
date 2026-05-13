@@ -100,6 +100,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
     var splitButtonTooltipRefreshScheduled = false
     var ghosttyConfigObserver: NSObjectProtocol?
     private var systemAppearanceObserver: NSObjectProtocol?
+    private var wakeRecoveryObserver: NSObjectProtocol?
+    private var screensWakeRecoveryObserver: NSObjectProtocol?
+    private var lastWakeRecoveryAt: Date?
     var ghosttyGotoSplitLeftShortcut: StoredShortcut?
     var ghosttyGotoSplitRightShortcut: StoredShortcut?
     var ghosttyGotoSplitUpShortcut: StoredShortcut?
@@ -456,6 +459,74 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
                 options: .mappedIfSafe
             )
         }
+
+        wakeRecoveryObserver = NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.didWakeNotification,
+            object: nil,
+            queue: .main
+        ) { _ in
+            MainActor.assumeIsolated {
+                AppDelegate.shared?.triggerWakeRecovery(reason: "didWake")
+            }
+        }
+
+        // Some configurations (especially with external displays / clamshell) deliver
+        // screensDidWakeNotification slightly after didWakeNotification, when the GPU
+        // and IOSurface bindings are guaranteed to be ready. Hook both; the cooldown
+        // inside triggerWakeRecovery coalesces them into a single redraw.
+        screensWakeRecoveryObserver = NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.screensDidWakeNotification,
+            object: nil,
+            queue: .main
+        ) { _ in
+            MainActor.assumeIsolated {
+                AppDelegate.shared?.triggerWakeRecovery(reason: "screensDidWake")
+            }
+        }
+
+#if DEBUG
+        // Sleep/wake instrumentation for diagnosing kiro-cli agent pane black regression.
+        NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.willSleepNotification,
+            object: nil,
+            queue: .main
+        ) { _ in
+            MainActor.assumeIsolated {
+                let teamCount = TeamOrchestrator.shared.teams.count
+                let agentCount = TeamOrchestrator.shared.teams.values.reduce(0) { $0 + $1.agents.count }
+                let paused = TeamOrchestrator.shared.agentRenderingPaused
+                dlog("workspace.willSleep teams=\(teamCount) agents=\(agentCount) agentPaused=\(paused)")
+            }
+        }
+        NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.screensDidSleepNotification,
+            object: nil,
+            queue: .main
+        ) { _ in
+            dlog("workspace.screensDidSleep")
+        }
+#endif
+    }
+
+    /// Coalesces wake-related notifications (didWake, screensDidWake) into a single
+    /// agent-surface redraw with a 1-second cooldown. Both notifications can fire
+    /// within ms of each other on wake; without coalescing we would issue 2N draws.
+    @MainActor
+    private func triggerWakeRecovery(reason: String) {
+        let now = Date()
+        if let last = lastWakeRecoveryAt, now.timeIntervalSince(last) < 1.0 {
+#if DEBUG
+            dlog("wakeRecovery.skipped reason=\(reason) elapsed=\(String(format: "%.3f", now.timeIntervalSince(last)))")
+#endif
+            return
+        }
+        lastWakeRecoveryAt = now
+#if DEBUG
+        let agentCount = TeamOrchestrator.shared.teams.values.reduce(0) { $0 + $1.agents.count }
+        let paused = TeamOrchestrator.shared.agentRenderingPaused
+        dlog("wakeRecovery.fire reason=\(reason) agents=\(agentCount) paused=\(paused)")
+#endif
+        TeamOrchestrator.shared.drawAgentSurfacesAfterWake()
     }
 
 #if DEBUG
@@ -570,6 +641,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
     func applicationWillTerminate(_ notification: Notification) {
         if let observer = systemAppearanceObserver {
             DistributedNotificationCenter.default.removeObserver(observer)
+        }
+        if let observer = wakeRecoveryObserver {
+            NSWorkspace.shared.notificationCenter.removeObserver(observer)
+        }
+        if let observer = screensWakeRecoveryObserver {
+            NSWorkspace.shared.notificationCenter.removeObserver(observer)
         }
         tabManager?.saveSessionState()
         TerminalController.shared.stop()

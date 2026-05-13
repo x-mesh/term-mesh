@@ -105,6 +105,11 @@ final class TeamOrchestrator: ObservableObject {
 
     private var periodicRenderTimer: DispatchSourceTimer?
 
+#if DEBUG
+    /// Debug-only one-shot flag: log periodicRenderAgents on first fire only to avoid noise.
+    private static var _periodicRenderLogged = false
+#endif
+
     /// Reads the user-configured interval (seconds) from UserDefaults; defaults to 3.
     private var periodicRenderInterval: TimeInterval {
         let stored = UserDefaults.standard.integer(forKey: "agentRenderingInterval")
@@ -123,6 +128,9 @@ final class TeamOrchestrator: ObservableObject {
     /// Paused: occludes surfaces (stops CVDisplayLink + wakeup rendering) and starts a 3-second
     /// periodic draw so new output is still captured. Resumed: restores normal rendering.
     func toggleAgentRendering() {
+#if DEBUG
+        dlog("team.toggleAgentRendering paused=\(agentRenderingPaused)")
+#endif
         agentRenderingPaused.toggle()
         if agentRenderingPaused {
             setAgentSurfaceOcclusion(visible: false)
@@ -134,6 +142,10 @@ final class TeamOrchestrator: ObservableObject {
     }
 
     private func setAgentSurfaceOcclusion(visible: Bool) {
+#if DEBUG
+        let agentCount = teams.values.reduce(0) { $0 + $1.agents.count }
+        dlog("team.setAgentSurfaceOcclusion visible=\(visible) agentCount=\(agentCount)")
+#endif
         for team in teams.values {
             for agent in team.agents {
                 guard let pid = agent.panelId,
@@ -171,10 +183,36 @@ final class TeamOrchestrator: ObservableObject {
         periodicRenderTimer = nil
     }
 
+    /// Re-present agent terminal surfaces after macOS wakes the display.
+    /// Unlike the periodic path which only fires when rendering is paused,
+    /// this runs unconditionally because wake can black-out any surface
+    /// regardless of its paused state.
+    /// Issues an immediate draw plus a 50ms-delayed follow-up to absorb cases where IOSurface /
+    /// CALayer rebinding completes a few frames after didWakeNotification fires (especially on
+    /// external displays returning from sleep).
+    func drawAgentSurfacesAfterWake() {
+        drawAgentSurfaces(reason: "wake")
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) { [weak self] in
+            self?.drawAgentSurfaces(reason: "wake-followup")
+        }
+    }
+
     /// Called by the periodic timer while rendering is paused.
     /// Issues a single ghostty_surface_draw per agent so new terminal output is captured.
     private func periodicRenderAgents() {
+#if DEBUG
+        if !Self._periodicRenderLogged {
+            Self._periodicRenderLogged = true
+            let agentCount = teams.values.reduce(0) { $0 + $1.agents.count }
+            dlog("team.periodicRenderAgents firstFire=true paused=\(agentRenderingPaused) agentCount=\(agentCount)")
+        }
+#endif
         guard agentRenderingPaused else { return }
+        drawAgentSurfaces(reason: "periodic")
+    }
+
+    private func drawAgentSurfaces(reason: String) {
+        var drawnCount = 0
         for team in teams.values {
             for agent in team.agents {
                 guard let pid = agent.panelId,
@@ -184,8 +222,12 @@ final class TeamOrchestrator: ObservableObject {
                       let panel = workspace.panels[pid] as? TerminalPanel,
                       let surface = panel.surface.surface else { continue }
                 ghostty_surface_draw(surface)
+                drawnCount += 1
             }
         }
+#if DEBUG
+        dlog("team.drawAgentSurfaces reason=\(reason) drawn=\(drawnCount) paused=\(agentRenderingPaused)")
+#endif
     }
 
     // MARK: - Bidirectional Communication
