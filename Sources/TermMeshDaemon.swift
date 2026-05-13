@@ -12,6 +12,9 @@ final class TermMeshDaemon: ObservableObject {
     private let queue = DispatchQueue(label: "term-mesh.daemon", qos: .utility)
     private var nextId: Int = 1
 
+    // Cancellation token for the events.subscribe streaming Task.
+    private var eventSubscriptionTask: Task<Void, Never>?
+
     /// Whether worktree sandboxing is enabled for new tabs.
     @Published var worktreeEnabled: Bool = false
 
@@ -851,6 +854,158 @@ final class TermMeshDaemon: ObservableObject {
         var size = socklen_t(MemoryLayout<pid_t>.size)
         getsockopt(fd, SOL_LOCAL, LOCAL_PEERPID, &pid, &size)
         return pid > 0 ? pid : nil
+    }
+
+    // MARK: - Phase 2.5 — agent.usage_tick push handler
+
+    /// Entry point for socket-notify `agent.usage_tick` events. The daemon is
+    /// expected to coalesce per-agent usage at ~1Hz before emitting; the
+    /// payload mirrors `AgentUsageSnapshot` shape:
+    ///
+    ///   { "team_name": "...", "agents": [
+    ///     { "name": "explorer",
+    ///       "input_tokens": 8200,
+    ///       "output_tokens": 1300,
+    ///       "cache_read_tokens": 22000,
+    ///       "cache_creation_tokens": 13000 }
+    ///   ] }
+    ///
+    /// Marshals onto the main thread and forwards to `TeamDataStore.updateUsage`.
+    /// Safe to call from any thread. Backend wiring (socket-notify subscription)
+    /// is intentionally left as a future addition — until then this method is
+    /// callable from tests / debug bridges without breakage.
+    func handleAgentUsageTick(payload: [String: Any]) {
+        guard let teamName = payload["team_name"] as? String,
+              let agentsRaw = payload["agents"] as? [[String: Any]] else {
+            return
+        }
+        var parsed: [(name: String, snapshot: AgentUsageSnapshot)] = []
+        let now = Date()
+        for entry in agentsRaw {
+            guard let name = entry["name"] as? String else { continue }
+            let input = (entry["input_tokens"] as? NSNumber)?.uint64Value ?? 0
+            let output = (entry["output_tokens"] as? NSNumber)?.uint64Value ?? 0
+            let cacheRead = (entry["cache_read_tokens"] as? NSNumber)?.uint64Value ?? 0
+            let cacheCreation = (entry["cache_creation_tokens"] as? NSNumber)?.uint64Value ?? 0
+            parsed.append((
+                name: name,
+                snapshot: AgentUsageSnapshot(
+                    inputTokens: input,
+                    outputTokens: output,
+                    cacheReadTokens: cacheRead,
+                    cacheCreationTokens: cacheCreation,
+                    updatedAt: now
+                )
+            ))
+        }
+        DispatchQueue.main.async {
+            TeamDataStore.shared.updateUsage(teamName: teamName, agents: parsed)
+        }
+    }
+
+    // MARK: - Event Subscription (Phase 2.5)
+
+    /// Open a long-lived streaming `events.subscribe` connection to the daemon and
+    /// dispatch incoming events to their handlers.  Reconnects automatically with
+    /// exponential backoff (1 s → 2 s → 5 s) on disconnect or daemon restart.
+    /// Call once from AppDelegate after `startDaemon()`.  Safe to call multiple
+    /// times — a running subscription is cancelled before the new one starts.
+    func startEventSubscription() {
+        eventSubscriptionTask?.cancel()
+        eventSubscriptionTask = Task.detached(priority: .utility) { [weak self] in
+            let backoffSequence = [1.0, 2.0, 5.0]
+            var attempt = 0
+            while !Task.isCancelled {
+                guard let self else { return }
+                let path = self.socketPath
+                let id = self.nextRpcId()
+                let request: [String: Any] = [
+                    "id": id,
+                    "method": "events.subscribe",
+                    "params": ["kinds": ["agent_usage_tick"]],
+                ]
+                guard var jsonLine = try? JSONSerialization.data(withJSONObject: request),
+                      !Task.isCancelled else { break }
+                jsonLine.append(UInt8(ascii: "\n"))
+
+                let fd = socket(AF_UNIX, SOCK_STREAM, 0)
+                guard fd >= 0 else {
+                    let delay = backoffSequence[min(attempt, backoffSequence.count - 1)]
+                    try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
+                    attempt += 1
+                    continue
+                }
+
+                var connectOK = false
+                var addr = sockaddr_un()
+                addr.sun_family = sa_family_t(AF_UNIX)
+                let pathBytes = path.utf8CString
+                if pathBytes.count <= MemoryLayout.size(ofValue: addr.sun_path) {
+                    withUnsafeMutablePointer(to: &addr.sun_path) { ptr in
+                        ptr.withMemoryRebound(to: CChar.self, capacity: pathBytes.count) { dest in
+                            for (i, b) in pathBytes.enumerated() { dest[i] = b }
+                        }
+                    }
+                    connectOK = withUnsafePointer(to: &addr) { ptr in
+                        ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { sp in
+                            Darwin.connect(fd, sp, socklen_t(MemoryLayout<sockaddr_un>.size)) == 0
+                        }
+                    }
+                }
+
+                guard connectOK else {
+                    close(fd)
+                    let delay = backoffSequence[min(attempt, backoffSequence.count - 1)]
+                    try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
+                    attempt += 1
+                    continue
+                }
+
+                // Connected — send the subscribe request.
+                _ = jsonLine.withUnsafeBytes { Darwin.write(fd, $0.baseAddress!, $0.count) }
+                attempt = 0  // reset backoff on successful connect
+
+                // Read NDJSON lines until the connection drops or task is cancelled.
+                var buf = Data(capacity: 65536)
+                var readBuf = [UInt8](repeating: 0, count: 4096)
+                var firstLine = true  // skip the ack line
+                readLoop: while !Task.isCancelled {
+                    let n = Darwin.read(fd, &readBuf, readBuf.count)
+                    if n <= 0 { break }
+                    buf.append(contentsOf: readBuf[0..<n])
+                    // Process all complete lines (\n-terminated) from buf.
+                    while let nlIdx = buf.firstIndex(of: UInt8(ascii: "\n")) {
+                        let lineData = buf[buf.startIndex..<nlIdx]
+                        buf = buf[(nlIdx + 1)...]
+                        if firstLine { firstLine = false; continue }  // skip ack
+                        guard !lineData.isEmpty,
+                              let msg = try? JSONSerialization.jsonObject(with: lineData) as? [String: Any],
+                              let kind = msg["kind"] as? String else { continue }
+                        switch kind {
+                        case "agent_usage_tick":
+                            self.handleAgentUsageTick(payload: msg)
+                        case "keepalive":
+                            break  // heartbeat — no action needed
+                        default:
+                            Logger.daemon.debug("events.subscribe unhandled kind: \(kind, privacy: .public)")
+                        }
+                    }
+                }
+                close(fd)
+                if Task.isCancelled { break }
+                // Brief pause before reconnect attempt.
+                try? await Task.sleep(nanoseconds: 1_000_000_000)
+            }
+        }
+    }
+
+    /// Thread-safe RPC ID increment (called from multiple threads).
+    private func nextRpcId() -> Int {
+        queue.sync {
+            let id = nextId
+            nextId += 1
+            return id
+        }
     }
 
     /// Raw RPC call that returns the result as a JSON string (for injecting into WKWebView).

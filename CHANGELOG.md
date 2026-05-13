@@ -2,6 +2,35 @@
 
 All notable changes to term-mesh are documented here.
 
+## [0.114.0] - 2026-05-13
+
+### Added
+- **Smart Preset v3 — built-in 위에 사용자 편집 inline 적용** — Smart preset 카드를 그 자리에서 직접 편집할 수 있게 됨. 변경한 카드에는 `(Modified)` 배지가 뜨고, 클릭하면 built-in 기본값으로 즉시 복원. 새 Preview Panel로 카드를 클릭하면 agent / model / instructions를 미리 볼 수 있고, 마지막에 사용한 preset의 override가 다음 New Agent Team 다이얼로그에서 자동 복원됨.
+- **Headless agent 모드 + 세션 재개 (Phase 2)** — daemon이 GUI pane 없이 agent CLI를 subprocess로 관리. 워크스페이스 닫고 다시 열어도 진행 중이던 세션이 그대로 재개되며, 사이드바에 agent별 input/output 토큰 카운터가 1초 간격으로 갱신.
+- **사이드바 agent 가시화 (Phase 2.5)** — agent별 상태 dot (running / idle / parked / error), 인라인 펼침으로 토큰 사용량과 status label, per-agent 우클릭 메뉴, footer에 재개 가능한 세션 카운터.
+- **`tm-agent restart <agent>` 명령** — agent CLI가 응답 없을 때 재시작. Soft mode (⌥-click)는 Ctrl-C + launch command 재타이핑, Hard mode (기본 click)는 패널을 닫고 같은 자리에 새 split으로 재spawn하여 stuck 상태 회복.
+- **Agent pane 헤더에 ↻ 재시작 버튼** — agent 터미널 pane 우상단에 항상 표시. agent pane에만 노출되어 browser / debug pane은 영향 없음.
+- **`tm-agent doctor` 명령 (초기 골격)** — 환경 변수, daemon socket, 살아있는 process를 한 번에 진단 (WIP).
+- **xm/op override 파일 안내 토스트** — `~/.xm/op/agent-role-presets-override.json`이 외부 도구(xm:op) 전용임을 첫 실행 시 1회 안내.
+
+### Changed
+- **Smart Preset — v2 Force-Copy 흐름 폐기, v3 inline 편집 채택** — v2의 "Customize → 새 custom 복제" 흐름이 발견성 결여로 사용자 의도와 불일치. v3에서는 built-in 카드를 그 자리에서 편집하고 디스크에 override만 저장, 다음 사용 시 `(Modified)` 표시.
+- **Agent pane ↻ 버튼 default 동작** — 단순 click이 hard restart (close + respawn)로 변경됨. soft mode (text retype만)는 ⌥-click. 사용자가 ↻를 누르는 거의 모든 상황 = stuck 회복이므로 default를 더 강력한 동작으로.
+
+### Fixed
+- **`tm-agent send` Return이 silent drop되던 race condition (Enter swallow)** — agent 패널에 텍스트는 들어가는데 Enter가 적용 안 되던 문제. surface attach 재구성 중 `ghostty_surface_key`가 false 반환하면 Rust CLI retry가 활성화되도록 RPC 응답에 `delivery_failed` 전파. KeyDeliveryToken + attachGeneration으로 stale callback 무효화, 10ms~3s exponential backoff retry. broadcast 후 응답 누락이 거의 사라짐.
+- **Hard restart 시 pane 위치 보존** — agent pane을 닫고 새로 spawn할 때 원래 자리가 아닌 다른 곳에 떨어지던 결함. `paneLayoutSnapshot`의 walk를 pre-order에서 post-order로 변경하여 root가 아닌 immediate parent split을 정확히 매치하도록 fix. nested split layout에서도 정확한 슬롯에 재spawn.
+- **Headless agent 사이드바 토큰 표시 안 되던 결함** — Swift이 headless member에 placeholder UUID를 panelId로 sync해서 daemon이 pane mode agent로 잘못 분류하던 결함. `AgentMember.panelId`를 `Optional<UUID>`로 변경 + JSON 직렬화 시 nil이면 omit하여 daemon이 진짜 headless로 인식하도록 fix. stream-json 토큰 캐치 + 1초 coalesced broadcast 정상 동작.
+- **Smart Preset various** — schema:1 → schema:2 자동 migration, custom store eager seed (첫 실행 시 빈 파일 생성), 마지막 선택한 preset의 override 자동 복원, `(Modified)` 배지 클릭 영역 확장, leader_mode resolution 순위 (pinned preset → AppStorage fallback).
+- **Restart 시 풀 spawn invocation 복원** — agent를 처음 spawn할 때 사용한 model flag, system prompt, MCP config, worktree cd 등을 보존했다가 restart 시 그대로 재실행. 기존엔 `claude` / `codex` 같은 binary 이름만 retype해서 system prompt가 누락되던 문제 회복.
+
+### Removed
+- **v2 Force-Copy "Customize" 버튼** — Smart Preset v3 inline edit 채택으로 UI에서 제거 (코드는 보존, 추후 "Save as new" 액션으로 부활 가능).
+
+### Thanks to 1 contributor!
+
+- [@JINWOO-J](https://github.com/JINWOO-J)
+
 ## [0.113.0] - 2026-05-13
 
 ### Fixed

@@ -138,6 +138,10 @@ struct SettingsView: View {
     @AppStorage("teamDefaultModel") private var teamDefaultModel = "sonnet"
     @AppStorage("teamDefaultWorkingDirectory") private var teamDefaultWorkingDirectory = ""
     @AppStorage("agentRenderingInterval") private var agentRenderingInterval = 3
+    // Phase 2 headless: idle-park threshold (0 = disabled, max 1440 min/24h)
+    @AppStorage("headlessIdleParkMinutes") private var headlessIdleParkMinutes = 60
+    // Phase 2 headless: archive retention (days, 1–30)
+    @AppStorage("headlessSessionRetentionDays") private var headlessSessionRetentionDays = 7
     @AppStorage("cliPath.claude") private var cliPathClaude = ""
     @AppStorage("cliPath.kiro") private var cliPathKiro = ""
     @AppStorage("cliPath.codex") private var cliPathCodex = ""
@@ -1210,8 +1214,8 @@ struct SettingsView: View {
                         SettingsCardRow(
                             "Default Leader Mode",
                             subtitle: teamDefaultLeaderMode == "claude"
-                                ? "Leader runs Claude automatically."
-                                : "Leader provides a manual REPL console.",
+                                ? "Leader runs Claude automatically. (핀이 없을 때만 사용)"
+                                : "Leader provides a manual REPL console. (핀이 없을 때만 사용)",
                             controlWidth: pickerColumnWidth
                         ) {
                             Picker("", selection: $teamDefaultLeaderMode) {
@@ -1294,6 +1298,61 @@ struct SettingsView: View {
                             }
                         }
                         }
+
+                        // Phase 2 Headless options
+                        if settingsMatch("headless", "park", "idle", "auto", "agent", "team") {
+                        SettingsCardDivider()
+
+                        SettingsCardRow(
+                            "Idle Auto-Park (min)",
+                            subtitle: headlessIdleParkMinutes == 0
+                                ? "Disabled — headless agents stay alive indefinitely."
+                                : "Headless agents are parked after this many idle minutes (subprocess terminated, session preserved).",
+                            controlWidth: pickerColumnWidth
+                        ) {
+                            HStack(spacing: 6) {
+                                Stepper(value: $headlessIdleParkMinutes, in: 0...1440, step: 5) {
+                                    Text(headlessIdleParkMinutes == 0 ? "Off" : "\(headlessIdleParkMinutes) min")
+                                        .font(.system(.body, design: .monospaced))
+                                        .frame(minWidth: 70, alignment: .trailing)
+                                }
+                                .labelsHidden()
+                            }
+                            .onChange(of: headlessIdleParkMinutes) { newValue in
+                                pushIdleParkMinutes(newValue)
+                            }
+                        }
+                        }
+
+                        if settingsMatch("headless", "retention", "archive", "session", "days") {
+                        SettingsCardDivider()
+
+                        SettingsCardRow(
+                            "Session Retention (days)",
+                            subtitle: "Destroyed headless team sessions remain resumable for this many days before they are garbage-collected.",
+                            controlWidth: pickerColumnWidth
+                        ) {
+                            Stepper(value: $headlessSessionRetentionDays, in: 1...30, step: 1) {
+                                Text("\(headlessSessionRetentionDays) day\(headlessSessionRetentionDays == 1 ? "" : "s")")
+                                    .font(.system(.body, design: .monospaced))
+                                    .frame(minWidth: 70, alignment: .trailing)
+                            }
+                            .labelsHidden()
+                        }
+                        }
+        }
+    }
+
+    /// Phase 2: push idle-park threshold to the daemon. Fire-and-forget;
+    /// failure is non-fatal (setting persists in AppStorage either way and
+    /// re-syncs on next change). Off-main per "Socket command threading policy".
+    private func pushIdleParkMinutes(_ minutes: Int) {
+        let clamped = max(0, min(1440, minutes))
+        DispatchQueue.global(qos: .utility).async {
+            _ = TermMeshDaemon.shared.rpcCallRaw(
+                method: "headless.set_idle_park_minutes",
+                params: ["minutes": clamped]
+            )
         }
     }
 
@@ -2400,7 +2459,9 @@ struct SettingsView: View {
             var ids = Set<UUID>()
             for team in TeamOrchestrator.shared.teams.values {
                 for agent in team.agents {
-                    ids.insert(agent.panelId)
+                    if let pid = agent.panelId {
+                        ids.insert(pid)
+                    }
                 }
             }
             return ids

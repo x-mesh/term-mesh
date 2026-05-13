@@ -1,12 +1,46 @@
 import Foundation
+import Combine
+
+/// Phase 2.5 — per-agent token usage snapshot, mirrored from the daemon's
+/// `agent.usage_tick` notify pushes. Values are absolute totals (the daemon is
+/// expected to coalesce at ~1Hz before sending). The Swift side simply replaces
+/// the entry whenever a fresher snapshot arrives.
+struct AgentUsageSnapshot: Equatable {
+    var inputTokens: UInt64
+    var outputTokens: UInt64
+    var cacheReadTokens: UInt64
+    var cacheCreationTokens: UInt64
+    var updatedAt: Date
+
+    static let empty = AgentUsageSnapshot(
+        inputTokens: 0,
+        outputTokens: 0,
+        cacheReadTokens: 0,
+        cacheCreationTokens: 0,
+        updatedAt: .distantPast
+    )
+
+    /// Cache-hit ratio: cacheRead / (cacheRead + cacheCreation). Nil when both are zero.
+    var cacheHitRatio: Double? {
+        let denom = cacheReadTokens &+ cacheCreationTokens
+        guard denom > 0 else { return nil }
+        return Double(cacheReadTokens) / Double(denom)
+    }
+}
 
 /// Thread-safe data store for team operations that don't require MainActor access.
 /// Handles messages, tasks, heartbeats, and file-based results independently of the UI thread.
 /// This is approach C (Dual Queue) for fixing the IME hang caused by v2MainSync contention.
-final class TeamDataStore: @unchecked Sendable {
+final class TeamDataStore: ObservableObject, @unchecked Sendable {
     static let shared = TeamDataStore()
 
     private let lock = NSLock()
+
+    /// Phase 2.5 — published per-team / per-agent usage map. Updated from
+    /// `updateUsage(teamName:agents:)` which the daemon notify handler calls.
+    /// Observers should `.objectWillChange` via the data store, and read this
+    /// map under the assumption it changes on the main thread.
+    @Published var agentUsage: [String: [String: AgentUsageSnapshot]] = [:]
 
     // Team registry: name → agent names (synced from TeamOrchestrator on create/destroy)
     private var teamRegistry: [String: [String]] = [:]
@@ -23,6 +57,10 @@ final class TeamDataStore: @unchecked Sendable {
     private var taskBoards: [String: [TeamOrchestrator.TeamTask]] = [:]
     private var heartbeats: [String: [String: (at: Date, summary: String?)]] = [:]
     private var contextStore: [String: [String: ContextEntry]] = [:]
+    /// Phase 2 idle-park: per-team / per-agent flag mirrored from daemon
+    /// (`agents/<name>.json:parked`). Set via `setAgentParked` whenever the
+    /// daemon emits a parked-state update.
+    private var parkedAgents: [String: Set<String>] = [:]
 
     private let staleTaskThreshold: TimeInterval = 10 * 60
     private let staleHeartbeatThreshold: TimeInterval = 5 * 60
@@ -64,8 +102,72 @@ final class TeamDataStore: @unchecked Sendable {
         taskBoards.removeValue(forKey: name)
         heartbeats.removeValue(forKey: name)
         contextStore.removeValue(forKey: name)
+        parkedAgents.removeValue(forKey: name)
         lock.unlock()
+        clearUsageUnsafe(teamName: name)
         notifyChanged()
+    }
+
+    // MARK: - Parked agent state (Phase 2)
+
+    /// Update the parked flag for an agent. Called by TeamOrchestrator when
+    /// the daemon emits a state update with `agent_state == "parked"`.
+    func setAgentParked(teamName: String, agentName: String, parked: Bool) {
+        lock.lock()
+        var changed = false
+        if parked {
+            if parkedAgents[teamName, default: []].insert(agentName).inserted {
+                changed = true
+            }
+        } else if parkedAgents[teamName]?.remove(agentName) != nil {
+            changed = true
+            if parkedAgents[teamName]?.isEmpty == true {
+                parkedAgents.removeValue(forKey: teamName)
+            }
+        }
+        lock.unlock()
+        if changed { notifyChanged() }
+    }
+
+    /// Public, lock-acquiring query for callers outside the data store.
+    func isAgentParked(teamName: String, agentName: String) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return parkedAgents[teamName]?.contains(agentName) ?? false
+    }
+
+    /// Internal query for callers that already hold `lock`.
+    private func isAgentParkedUnsafe(teamName: String, agentName: String) -> Bool {
+        return parkedAgents[teamName]?.contains(agentName) ?? false
+    }
+
+    // MARK: - Agent Usage (Phase 2.5)
+
+    /// Replace usage snapshots for one team. Each `(name, snapshot)` overrides
+    /// the existing entry; agents absent from the payload are left untouched
+    /// (the daemon emits per-agent tick events, so partial updates are normal).
+    /// MUST be called on the main thread — `agentUsage` is `@Published`.
+    func updateUsage(teamName: String, agents: [(name: String, snapshot: AgentUsageSnapshot)]) {
+        var bucket = agentUsage[teamName] ?? [:]
+        for entry in agents {
+            bucket[entry.name] = entry.snapshot
+        }
+        agentUsage[teamName] = bucket
+    }
+
+    /// Convenience accessor — returns `.empty` placeholder snapshot when no
+    /// data has arrived yet. Callers can check `updatedAt == .distantPast`
+    /// to render an em-dash.
+    func usage(teamName: String, agentName: String) -> AgentUsageSnapshot? {
+        agentUsage[teamName]?[agentName]
+    }
+
+    /// Drop all usage data for a team (called from `unregisterTeam`).
+    private func clearUsageUnsafe(teamName: String) {
+        // We can't mutate @Published from off-main, so dispatch.
+        DispatchQueue.main.async { [weak self] in
+            self?.agentUsage.removeValue(forKey: teamName)
+        }
     }
 
     func teamExists(_ name: String) -> Bool {
@@ -490,13 +592,22 @@ final class TeamDataStore: @unchecked Sendable {
             .first
 
         // Runtime state derived from task status
+        // Phase 2: "parked" is a daemon-authoritative state — when an agent's
+        // subprocess has been terminated but metadata is preserved on disk
+        // (idle auto-park or explicit park_agent RPC). The daemon mirrors the
+        // flag into headlessAgentParked[teamName][agentName]. Parked overrides
+        // task-derived state because there is no live subprocess regardless of
+        // the task board entry. See docs/phase2-rpc-contract.md §5.
         let agentState: String
-        if let task = activeTask {
+        if isAgentParkedUnsafe(teamName: teamName, agentName: agentName) {
+            agentState = "parked"
+        } else if let task = activeTask {
             switch task.status {
             case "blocked": agentState = "blocked"
             case "review_ready": agentState = "review_ready"
             case "failed": agentState = "error"
             case "queued", "assigned": agentState = "idle"
+            case "parked": agentState = "parked"
             default: agentState = "running"
             }
         } else {

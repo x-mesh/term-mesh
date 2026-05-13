@@ -96,6 +96,10 @@ struct VerticalTabsSidebar: View {
             SidebarWorktreeSandboxToggle()
                 .frame(maxWidth: .infinity, alignment: .leading)
 
+            // Phase 2.5 — resumable team counter. Hidden when count == 0.
+            SidebarResumableFooter()
+                .frame(maxWidth: .infinity, alignment: .leading)
+
 #if DEBUG
             SidebarDevFooter(updateViewModel: updateViewModel)
                 .frame(maxWidth: .infinity, alignment: .leading)
@@ -166,6 +170,79 @@ struct VerticalTabsSidebar: View {
     private func debugShortSidebarTabId(_ id: UUID?) -> String {
         guard let id else { return "nil" }
         return String(id.uuidString.prefix(5))
+    }
+}
+
+// MARK: - Phase 2.5 — Resumable team counter (sidebar footer)
+
+/// Footer row showing the number of resumable headless teams plus the
+/// configured auto-park threshold. Hidden entirely when no resumable teams
+/// exist. Click the count → opens the New Agent Team sheet in Resume mode;
+/// click the info glyph → jumps to Settings > Agent Teams (where the
+/// Headless idle-park threshold lives).
+struct SidebarResumableFooter: View {
+    @State private var resumableCount: Int = 0
+    @AppStorage("headlessIdleParkMinutes") private var headlessIdleParkMinutes: Int = 60
+
+    var body: some View {
+        Group {
+            if resumableCount > 0 {
+                HStack(spacing: 6) {
+                    Button {
+                        NotificationCenter.default.post(
+                            name: .openCreateTeamSheetInResumeMode,
+                            object: nil
+                        )
+                    } label: {
+                        Text("\(resumableCount) resumable team\(resumableCount == 1 ? "" : "s")")
+                            .font(.system(size: 10, weight: .medium))
+                            .foregroundColor(.primary)
+                    }
+                    .buttonStyle(.plain)
+                    .help("Open New Agent Team in Resume mode")
+
+                    Text("·")
+                        .font(.system(size: 10))
+                        .foregroundColor(.secondary)
+
+                    Text(autoParkLabel)
+                        .font(.system(size: 10))
+                        .foregroundColor(.secondary)
+
+                    Button {
+                        NotificationCenter.default.post(
+                            name: .settingsNavigateToSection,
+                            object: nil,
+                            userInfo: [SettingsNavigationUserInfoKey.section: SettingsSection.agentTeams.rawValue]
+                        )
+                        NSApp.sendAction(Selector(("showSettingsWindow:")), to: nil, from: nil)
+                    } label: {
+                        Image(systemName: "info.circle")
+                            .font(.system(size: 10))
+                            .foregroundColor(.secondary)
+                    }
+                    .buttonStyle(.plain)
+                    .help("Open Settings > Agent Teams")
+                }
+                .padding(.horizontal, 10)
+                .padding(.vertical, 4)
+            }
+        }
+        .onAppear { refresh() }
+        .onReceive(NotificationCenter.default.publisher(for: .headlessTeamDestroyed)) { _ in
+            refresh()
+        }
+    }
+
+    private var autoParkLabel: String {
+        if headlessIdleParkMinutes <= 0 { return "Auto-park off" }
+        return "Auto-park \(headlessIdleParkMinutes)min"
+    }
+
+    private func refresh() {
+        TeamOrchestrator.shared.countResumableTeams { count in
+            self.resumableCount = count
+        }
     }
 }
 

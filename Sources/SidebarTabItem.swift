@@ -2,6 +2,25 @@ import SwiftUI
 import AppKit
 import Bonsplit
 
+// MARK: - Phase 2.5 — Token compaction helper
+
+/// Compact integer token counts for sidebar display.
+///   0..999            → "123"
+///   1_000..999_999    → "1.2k"
+///   1_000_000..       → "1.2M"
+///   1_000_000_000..   → "1.2G"
+fileprivate func compactToken(_ n: UInt64) -> String {
+    if n < 1_000 { return "\(n)" }
+    let formatter: (Double) -> String = { v in
+        // Show one decimal unless the value is an exact multiple (e.g. 5.0 → 5).
+        if v.truncatingRemainder(dividingBy: 1) == 0 { return String(format: "%.0f", v) }
+        return String(format: "%.1f", v)
+    }
+    if n < 1_000_000 { return formatter(Double(n) / 1_000) + "k" }
+    if n < 1_000_000_000 { return formatter(Double(n) / 1_000_000) + "M" }
+    return formatter(Double(n) / 1_000_000_000) + "G"
+}
+
 struct SidebarEmptyArea: View {
     @EnvironmentObject var tabManager: TabManager
     let rowSpacing: CGFloat
@@ -846,40 +865,17 @@ struct TabItemView: View {
 
     @ViewBuilder
     private func teamIndicatorView(teamName: String) -> some View {
-        let attentionCount = teamAttentionCount(teamName: teamName)
-
-        VStack(alignment: .leading, spacing: 4) {
-            // Team badge row with inbox count
-            HStack(spacing: 4) {
-                Image(systemName: "person.3.fill")
-                    .font(.system(size: 8))
-                Text(teamName)
-                    .font(.system(size: 10, weight: .medium))
-
-                if attentionCount > 0 {
-                    Text("\(attentionCount)")
-                        .font(.system(size: 8, weight: .bold))
-                        .foregroundColor(.white)
-                        .padding(.horizontal, 4)
-                        .padding(.vertical, 1)
-                        .background(Capsule().fill(attentionCount > 2 ? Color.red : Color.orange))
-                }
-            }
-            .foregroundColor(activeSecondaryColor(0.9))
-            .padding(.horizontal, 6)
-            .padding(.vertical, 2)
-            .background(Capsule().fill(Color.accentColor.opacity(0.15)))
-
-            // Agent status dots (compact overview)
-            if let team = activeTeam {
-                HStack(spacing: 3) {
-                    ForEach(team.agents, id: \.id) { agent in
-                        agentDot(teamName: teamName, agent: agent)
-                    }
-                }
-                .padding(.leading, 4)
-            }
-        }
+        // Wrapped in a per-team view so @AppStorage for expansion state
+        // can drive both the chevron orientation and the inline agent list
+        // in a single SwiftUI subtree.
+        TeamIndicatorBlock(
+            teamName: teamName,
+            activeTeam: activeTeam,
+            attentionCount: teamAttentionCount(teamName: teamName),
+            badgeForegroundColor: activeSecondaryColor(0.9),
+            teamContextMenuBuilder: { AnyView(self.teamRowContextMenu(teamName: teamName)) },
+            agentDotBuilder: { agent in AnyView(self.agentDot(teamName: teamName, agent: agent)) }
+        )
     }
 
     @ViewBuilder
@@ -890,13 +886,66 @@ struct TabItemView: View {
         case "blocked":      .red
         case "review_ready": .yellow
         case "error":        .red.opacity(0.7)
+        case "parked":       .gray.opacity(0.5)
         default:             .gray  // idle
         }
 
-        Circle()
-            .fill(color)
-            .frame(width: 6, height: 6)
-            .help("\(agent.name): \(state)")
+        ZStack {
+            Circle()
+                .fill(color)
+                .frame(width: 6, height: 6)
+            // Phase 2: parked → small pause glyph overlay so the gray dot is
+            // distinguishable from plain idle.
+            if state == "parked" {
+                Image(systemName: "pause.fill")
+                    .font(.system(size: 4, weight: .bold))
+                    .foregroundStyle(Color.primary.opacity(0.85))
+            }
+        }
+        .frame(width: 8, height: 8)
+        .help("\(agent.name): \(state)")
+    }
+
+    // MARK: - Phase 2.5 — Team-row context menu
+
+    @ViewBuilder
+    private func teamRowContextMenu(teamName: String) -> some View {
+        Button("Park all agents") {
+            guard let team = TeamOrchestrator.shared.teams[teamName] else { return }
+            for agent in team.agents {
+                TeamOrchestrator.shared.parkAgent(teamName: teamName, agentName: agent.name)
+            }
+        }
+        Button("Destroy team…") {
+            confirmAndDestroyTeam(teamName: teamName)
+        }
+        Divider()
+        Button("Reveal worktree in Finder") {
+            revealWorktreeInFinder(teamName: teamName)
+        }
+        .disabled(TeamOrchestrator.shared.teams[teamName]?.sharedWorktreePath == nil
+                  && TeamOrchestrator.shared.teams[teamName]?.agents.first?.worktreePath == nil)
+    }
+
+    private func confirmAndDestroyTeam(teamName: String) {
+        let alert = NSAlert()
+        alert.messageText = "Destroy team \"\(teamName)\"?"
+        alert.informativeText = "All agent panes will be closed. The session metadata is preserved (resumable for the configured retention window)."
+        alert.addButton(withTitle: "Destroy")
+        alert.addButton(withTitle: "Cancel")
+        alert.alertStyle = .warning
+        alert.presentAsSheet { response in
+            guard response == .alertFirstButtonReturn else { return }
+            _ = TeamOrchestrator.shared.destroyTeam(name: teamName, tabManager: self.tabManager)
+        }
+    }
+
+    private func revealWorktreeInFinder(teamName: String) {
+        guard let team = TeamOrchestrator.shared.teams[teamName] else { return }
+        let path = team.sharedWorktreePath
+            ?? team.agents.first(where: { $0.worktreePath != nil })?.worktreePath
+            ?? team.workingDirectory
+        NSWorkspace.shared.selectFile(nil, inFileViewerRootedAtPath: path)
     }
 
     private var branchDirectoryRow: String? {
@@ -1103,6 +1152,346 @@ struct TabItemView: View {
             guard response == .alertFirstButtonReturn else { return }
             self.tabManager.setCustomTitle(tabId: self.tab.id, title: input.stringValue)
         }
+    }
+}
+
+// MARK: - Phase 2.5 — Inline Team Expansion
+
+/// A single team's sidebar indicator block: chevron + name capsule, status
+/// dots row, and (when expanded) indented agent list. Owns the `@AppStorage`
+/// for its chevron state so toggling persists across launches AND drives the
+/// inline-list visibility without forcing the parent view to redraw.
+private struct TeamIndicatorBlock: View {
+    let teamName: String
+    let activeTeam: TeamOrchestrator.Team?
+    let attentionCount: Int
+    let badgeForegroundColor: Color
+    let teamContextMenuBuilder: () -> AnyView
+    let agentDotBuilder: (TeamOrchestrator.AgentMember) -> AnyView
+    @AppStorage private var isExpanded: Bool
+
+    init(
+        teamName: String,
+        activeTeam: TeamOrchestrator.Team?,
+        attentionCount: Int,
+        badgeForegroundColor: Color,
+        teamContextMenuBuilder: @escaping () -> AnyView,
+        agentDotBuilder: @escaping (TeamOrchestrator.AgentMember) -> AnyView
+    ) {
+        self.teamName = teamName
+        self.activeTeam = activeTeam
+        self.attentionCount = attentionCount
+        self.badgeForegroundColor = badgeForegroundColor
+        self.teamContextMenuBuilder = teamContextMenuBuilder
+        self.agentDotBuilder = agentDotBuilder
+        self._isExpanded = AppStorage(wrappedValue: false, "sidebar.team.\(teamName).expanded")
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            HStack(spacing: 4) {
+                Button {
+                    isExpanded.toggle()
+                } label: {
+                    HStack(spacing: 4) {
+                        Image(systemName: isExpanded ? "chevron.down" : "chevron.right")
+                            .font(.system(size: 8, weight: .semibold))
+                        Image(systemName: "person.3.fill")
+                            .font(.system(size: 8))
+                        Text(teamName)
+                            .font(.system(size: 10, weight: .medium))
+
+                        if attentionCount > 0 {
+                            Text("\(attentionCount)")
+                                .font(.system(size: 8, weight: .bold))
+                                .foregroundColor(.white)
+                                .padding(.horizontal, 4)
+                                .padding(.vertical, 1)
+                                .background(Capsule().fill(attentionCount > 2 ? Color.red : Color.orange))
+                        }
+                    }
+                    .foregroundColor(badgeForegroundColor)
+                    .padding(.horizontal, 6)
+                    .padding(.vertical, 2)
+                    .background(Capsule().fill(Color.accentColor.opacity(0.15)))
+                }
+                .buttonStyle(.plain)
+                .contextMenu {
+                    teamContextMenuBuilder()
+                }
+            }
+
+            if let team = activeTeam {
+                HStack(spacing: 3) {
+                    ForEach(team.agents, id: \.id) { agent in
+                        agentDotBuilder(agent)
+                    }
+                }
+                .padding(.leading, 4)
+
+                if isExpanded {
+                    ExpandedTeamAgentList(team: team)
+                        .padding(.leading, 4)
+                }
+            }
+        }
+    }
+}
+
+/// Indented agent list shown when a team row is expanded. Subscribes to
+/// `TeamDataStore.shared` so it re-renders on `agent.usage_tick` pushes.
+/// Lives in a separate view so the parent row body does not re-evaluate on
+/// every usage update (collapsed teams pay nothing).
+private struct ExpandedTeamAgentList: View {
+    let team: TeamOrchestrator.Team
+    @ObservedObject private var dataStore = TeamDataStore.shared
+    @ObservedObject private var orchestrator = TeamOrchestrator.shared
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 3) {
+            ForEach(team.agents, id: \.id) { agent in
+                ExpandedAgentRow(teamName: team.id, agent: agent)
+            }
+        }
+        .padding(.vertical, 4)
+        .padding(.horizontal, 6)
+        .background(
+            RoundedRectangle(cornerRadius: 4)
+                .fill(Color.primary.opacity(0.04))
+        )
+    }
+}
+
+/// A single expanded agent row: state dot + name + relative activity time +
+/// optional branch + token-usage column + status label.
+private struct ExpandedAgentRow: View {
+    let teamName: String
+    let agent: TeamOrchestrator.AgentMember
+    @ObservedObject private var dataStore = TeamDataStore.shared
+    @ObservedObject private var orchestrator = TeamOrchestrator.shared
+
+    private var state: String {
+        TeamOrchestrator.shared.agentState(teamName: teamName, agentName: agent.name)
+    }
+
+    private var stateColor: Color {
+        switch state {
+        case "running":      return .green
+        case "blocked":      return .red
+        case "review_ready": return .yellow
+        case "error":        return .red.opacity(0.7)
+        case "parked":       return .gray.opacity(0.5)
+        default:             return .gray  // idle
+        }
+    }
+
+    /// SF Symbol overlay on the status dot. Only present for states that
+    /// otherwise look like idle (parked) or that demand attention (needs_input
+    /// surfaced via `review_ready` → exclamationmark).
+    private var stateGlyph: String? {
+        switch state {
+        case "parked": return "pause.fill"
+        case "review_ready", "blocked": return "exclamationmark"
+        default: return nil
+        }
+    }
+
+    private var usage: AgentUsageSnapshot? {
+        dataStore.agentUsage[teamName]?[agent.name]
+    }
+
+    private var tokenLabel: String {
+        guard let u = usage, u.updatedAt != .distantPast else { return "—" }
+        return "\(compactToken(u.inputTokens)) in · \(compactToken(u.outputTokens)) out"
+    }
+
+    private var tokenTooltip: String {
+        guard let u = usage, u.updatedAt != .distantPast else { return "No usage data yet." }
+        let total = u.cacheReadTokens &+ u.cacheCreationTokens
+        if total > 0, let ratio = u.cacheHitRatio {
+            let pct = Int((ratio * 100).rounded())
+            return "cache hit \(pct)% · \(compactToken(u.cacheReadTokens)) cached · \(compactToken(u.cacheCreationTokens)) fresh"
+        }
+        return "input \(u.inputTokens) · output \(u.outputTokens)"
+    }
+
+    private var relativeActivity: String {
+        // Prefer usage update; fall back to agent createdAt.
+        let anchor: Date = (usage?.updatedAt ?? .distantPast) > agent.createdAt
+            ? (usage?.updatedAt ?? agent.createdAt)
+            : agent.createdAt
+        return Self.compactRelative(date: anchor)
+    }
+
+    var body: some View {
+        HStack(spacing: 6) {
+            // Status dot + optional glyph overlay.
+            ZStack {
+                Circle()
+                    .fill(stateColor)
+                    .frame(width: 8, height: 8)
+                if let glyph = stateGlyph {
+                    Image(systemName: glyph)
+                        .font(.system(size: 5, weight: .bold))
+                        .foregroundStyle(Color.primary.opacity(0.85))
+                }
+            }
+            .frame(width: 10, height: 10)
+
+            Text(agent.name)
+                .font(.system(size: 10.5, weight: .medium))
+                .lineLimit(1)
+
+            Text(relativeActivity)
+                .font(.system(size: 9))
+                .foregroundStyle(.secondary)
+
+            if let branch = agent.worktreeBranch, !branch.isEmpty {
+                Text(branch)
+                    .font(.system(size: 9, design: .monospaced))
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+            }
+
+            if state == "parked" {
+                Text("[parked]")
+                    .font(.system(size: 9))
+                    .foregroundStyle(.secondary)
+            }
+
+            Spacer(minLength: 4)
+
+            Text(tokenLabel)
+                .font(.system(size: 9.5, design: .monospaced))
+                .foregroundStyle(.secondary)
+                .help(tokenTooltip)
+        }
+        .help(agent.worktreePath ?? agent.workspaceId.uuidString)
+        .contentShape(Rectangle())
+        .contextMenu {
+            agentRowContextMenu()
+        }
+    }
+
+    @ViewBuilder
+    private func agentRowContextMenu() -> some View {
+        Button("Send message…") {
+            promptAndSendMessage()
+        }
+        .keyboardShortcut(.return, modifiers: .command)
+
+        Button("Park now") {
+            TeamOrchestrator.shared.parkAgent(teamName: teamName, agentName: agent.name)
+        }
+        .disabled(state == "parked")
+
+        Button("Unpark") {
+            TeamOrchestrator.shared.unparkAgent(teamName: teamName, agentName: agent.name)
+        }
+        .disabled(state != "parked")
+
+        Button("Copy session id") {
+            copySessionId()
+        }
+
+        Button("View logs") {
+            revealLogsInFinder()
+        }
+
+        Divider()
+
+        Button("Detach (keep session)") {
+            // Destroy team in-memory but session metadata stays archived for resume.
+            confirmDestroyTeam(discardSession: false)
+        }
+
+        Button("Destroy (discard session)") {
+            confirmDestroyTeam(discardSession: true)
+        }
+    }
+
+    private func promptAndSendMessage() {
+        let alert = NSAlert()
+        alert.messageText = "Send message to \(agent.name)"
+        alert.informativeText = "The message will be delivered to the leader pane for routing."
+        let input = NSTextField(string: "")
+        input.placeholderString = "Message"
+        input.frame = NSRect(x: 0, y: 0, width: 320, height: 22)
+        alert.accessoryView = input
+        alert.addButton(withTitle: "Send")
+        alert.addButton(withTitle: "Cancel")
+        alert.window.initialFirstResponder = input
+        DispatchQueue.main.async {
+            alert.window.makeFirstResponder(input)
+        }
+        alert.presentAsSheet { response in
+            guard response == .alertFirstButtonReturn else { return }
+            let text = input.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !text.isEmpty else { return }
+            // Use TeamDataStore for delivery so we work in both pane and headless modes.
+            TeamDataStore.shared.postMessage(
+                teamName: teamName,
+                from: "leader",
+                to: agent.name,
+                content: text,
+                type: "note"
+            )
+        }
+    }
+
+    private func copySessionId() {
+        // Phase 2.5 — AgentMember carries parentSessionId; per-agent session IDs
+        // are stored on the daemon side. Best-effort: copy parentSessionId.
+        let sessionId = agent.parentSessionId ?? agent.id
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(sessionId, forType: .string)
+    }
+
+    private func revealLogsInFinder() {
+        // Reveal the agent metadata JSON under ~/.term-mesh/headless/<uuid>/agents/.
+        // We don't have direct access to the team UUID without a lookup —
+        // fall back to the team's results directory if uuid is unavailable.
+        let home = NSHomeDirectory()
+        if let teamUuid = TeamOrchestrator.shared.teamUuid(for: teamName) {
+            let path = "\(home)/.term-mesh/headless/\(teamUuid)/agents/\(agent.name).json"
+            if FileManager.default.fileExists(atPath: path) {
+                NSWorkspace.shared.selectFile(path, inFileViewerRootedAtPath: "\(home)/.term-mesh/headless/\(teamUuid)/agents")
+                return
+            }
+            // Fall back to the team directory.
+            NSWorkspace.shared.selectFile(nil, inFileViewerRootedAtPath: "\(home)/.term-mesh/headless/\(teamUuid)")
+            return
+        }
+        let resultsDir = "/tmp/term-mesh-team-\(teamName)"
+        NSWorkspace.shared.selectFile(nil, inFileViewerRootedAtPath: resultsDir)
+    }
+
+    private func confirmDestroyTeam(discardSession: Bool) {
+        let alert = NSAlert()
+        alert.messageText = discardSession
+            ? "Destroy team \"\(teamName)\"?"
+            : "Detach team \"\(teamName)\"?"
+        alert.informativeText = discardSession
+            ? "All agent panes will be closed and the session archive will be removed at the next GC sweep."
+            : "All agent panes will be closed but the session archive remains resumable until the retention window expires."
+        alert.addButton(withTitle: discardSession ? "Destroy" : "Detach")
+        alert.addButton(withTitle: "Cancel")
+        alert.alertStyle = .warning
+        alert.presentAsSheet { response in
+            guard response == .alertFirstButtonReturn else { return }
+            guard let tabManager = AppDelegate.shared?.tabManagerFor(tabId: agent.workspaceId) else { return }
+            _ = TeamOrchestrator.shared.destroyTeam(name: teamName, tabManager: tabManager)
+        }
+    }
+
+    private static func compactRelative(date: Date) -> String {
+        let elapsed = max(0, Date().timeIntervalSince(date))
+        if elapsed < 1 { return "now" }
+        if elapsed < 60 { return "\(Int(elapsed))s" }
+        if elapsed < 3600 { return "\(Int(elapsed / 60))m" }
+        if elapsed < 86400 { return "\(Int(elapsed / 3600))h" }
+        return "\(Int(elapsed / 86400))d"
     }
 }
 

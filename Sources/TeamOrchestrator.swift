@@ -10,22 +10,35 @@ final class TeamOrchestrator: ObservableObject {
     static let shared = TeamOrchestrator()
 
     struct AgentMember: Identifiable {
-        let id: String           // agent-name@team-name
+        let id: String           // agent-name@team-name (stable identity across hard restart)
         let name: String         // e.g. "executor", "reviewer"
         let teamName: String
         let cli: String          // "claude", "kiro" (which CLI to run)
+        let launchCommand: String // bare binary name fallback (e.g. "claude") for retype
         let model: String        // "opus", "sonnet", "haiku"
         let agentType: String    // "Explore", "executor", etc.
         let color: String        // terminal color
         let instructions: String // role description for leader routing
         let workspaceId: UUID
-        let panelId: UUID        // specific panel within the workspace
+        /// nil for headless agents (no GUI pane); set for pane-mode agents.
+        /// Mutable so hard restart (pane close + respawn) can rewrite the panel
+        /// without rebuilding the AgentMember from scratch.
+        var panelId: UUID?
         var parentSessionId: String?
         let createdAt: Date
         // Worktree isolation
         var worktreeName: String?
         var worktreePath: String?
         var worktreeBranch: String?
+        /// Full CLI invocation captured at spawn time (binary + model flag + system
+        /// prompt + agent-type flags). Retyped on soft restart to recover original
+        /// agent context rather than the bare binary name. nil for headless agents
+        /// (daemon-managed subprocess, no pane to retype into).
+        var originalSpawnCommand: String?
+        /// The exact `agentWorkDir` used when the pane was first spawned (either
+        /// the worktree path or the team's working directory). Hard restart feeds
+        /// it back into `addAgentPaneToWorkspace` so cwd is preserved.
+        var originalAgentWorkDir: String?
     }
 
     struct Team: Identifiable {
@@ -44,11 +57,33 @@ final class TeamOrchestrator: ObservableObject {
         var sharedWorktreeName: String?
         var sharedWorktreePath: String?
         var sharedWorktreeBranch: String?
+        /// Phase 2 — stable headless team UUID returned by `headless.create_team` /
+        /// `headless.resume_team`. Nil for pane-mode (non-headless) teams.
+        var teamUuid: String? = nil
+    }
+
+    struct AgentPaneIdentity: Equatable {
+        let teamName: String
+        let agentName: String
+        let panelId: UUID
+        let workspaceId: UUID
+        let launchCommand: String
+        /// Full CLI invocation; falls back to launchCommand at use sites when nil.
+        var originalSpawnCommand: String?
     }
 
     @Published private(set) var teams: [String: Team] = [:]
     // Round-robin counter per "teamName/agentName" key — cycles across duplicate-named agents.
     private var agentSendRoundRobin: [String: Int] = [:]
+
+    /// In-flight send counter keyed by "<team>/<agent>". Incremented at the start
+    /// of sendToAgent and decremented after sendIMEText completes. Hard restart
+    /// waits for this counter to drain (with a 200ms grace) before closing the pane.
+    private var activeSends: [String: Int] = [:]
+
+    /// Per-agent migration guard. While the key is present, panelId-bound
+    /// operations on that agent should bail out with `migration_in_flight`.
+    private var migratingAgents: Set<String> = []
 
     /// Resolve the correct TabManager for a team by locating any agent panel in the window hierarchy.
     /// Returns nil only if no agent panel can be found (all closed or headless).
@@ -56,7 +91,8 @@ final class TeamOrchestrator: ObservableObject {
         guard let team = teams[teamName] else { return nil }
         // Try each agent until we find one whose panel is still alive in a window.
         for agent in team.agents {
-            if let located = AppDelegate.shared?.locateSurface(surfaceId: agent.panelId) {
+            guard let pid = agent.panelId else { continue }
+            if let located = AppDelegate.shared?.locateSurface(surfaceId: pid) {
                 return located.tabManager
             }
         }
@@ -100,10 +136,11 @@ final class TeamOrchestrator: ObservableObject {
     private func setAgentSurfaceOcclusion(visible: Bool) {
         for team in teams.values {
             for agent in team.agents {
-                guard let appDelegate = AppDelegate.shared,
-                      let located = appDelegate.locateSurface(surfaceId: agent.panelId),
+                guard let pid = agent.panelId,
+                      let appDelegate = AppDelegate.shared,
+                      let located = appDelegate.locateSurface(surfaceId: pid),
                       let workspace = located.tabManager.tabs.first(where: { $0.id == located.workspaceId }),
-                      let panel = workspace.panels[agent.panelId] as? TerminalPanel else { continue }
+                      let panel = workspace.panels[pid] as? TerminalPanel else { continue }
                 // Set renderingPaused before any focus/occlusion calls so guards work correctly.
                 panel.surface.renderingPaused = !visible
                 // setOcclusion(false) blocks all rendering paths (CVDisplayLink + wakeup-driven).
@@ -140,10 +177,11 @@ final class TeamOrchestrator: ObservableObject {
         guard agentRenderingPaused else { return }
         for team in teams.values {
             for agent in team.agents {
-                guard let appDelegate = AppDelegate.shared,
-                      let located = appDelegate.locateSurface(surfaceId: agent.panelId),
+                guard let pid = agent.panelId,
+                      let appDelegate = AppDelegate.shared,
+                      let located = appDelegate.locateSurface(surfaceId: pid),
                       let workspace = located.tabManager.tabs.first(where: { $0.id == located.workspaceId }),
-                      let panel = workspace.panels[agent.panelId] as? TerminalPanel,
+                      let panel = workspace.panels[pid] as? TerminalPanel,
                       let surface = panel.surface.surface else { continue }
                 ghostty_surface_draw(surface)
             }
@@ -468,6 +506,7 @@ final class TeamOrchestrator: ObservableObject {
         worktreeBranch: String?,
         splitFrom: UUID,
         orientation: SplitOrientation,
+        insertFirst: Bool = false,
         tabManager: TabManager
     ) -> AgentMember? {
         let agentId = "\(agentName)@\(teamName)"
@@ -536,10 +575,12 @@ final class TeamOrchestrator: ObservableObject {
             workspaceId: workspace.id
         )
 
-        // Spawn the split pane
+        // Spawn the split pane. `insertFirst` lets hard-restart respawn into the
+        // exact slot the dead pane occupied within its parent split.
         guard let panel = workspace.newTerminalSplit(
             from: splitFrom,
             orientation: orientation,
+            insertFirst: insertFirst,
             focus: false,
             skipEqualization: true,
             workingDirectory: agentWorkDir,
@@ -561,6 +602,7 @@ final class TeamOrchestrator: ObservableObject {
             name: agentName,
             teamName: teamName,
             cli: agentCli,
+            launchCommand: Self.defaultLaunchCommand(for: agentCli),
             model: agentModel,
             agentType: agentType,
             color: agentColor,
@@ -571,7 +613,9 @@ final class TeamOrchestrator: ObservableObject {
             createdAt: Date(),
             worktreeName: worktreeName,
             worktreePath: worktreePath,
-            worktreeBranch: worktreeBranch
+            worktreeBranch: worktreeBranch,
+            originalSpawnCommand: agentCommand,
+            originalAgentWorkDir: agentWorkDir
         )
     }
 
@@ -926,7 +970,25 @@ final class TeamOrchestrator: ObservableObject {
             DispatchQueue.global(qos: .userInitiated).async { [weak self] in
                 guard let self else { return }
                 let result = self.daemon.rpcCallRaw(method: "headless.create_team", params: createParams)
-                if result == nil {
+                if let raw = result,
+                   let data = raw.data(using: .utf8),
+                   let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+                    let teamUuid: String?
+                    if let inner = obj["result"] as? [String: Any], let uuid = inner["team_uuid"] as? String {
+                        teamUuid = uuid
+                    } else {
+                        teamUuid = obj["team_uuid"] as? String
+                    }
+                    if let teamUuid {
+                        DispatchQueue.main.async { [weak self] in
+                            guard let self else { return }
+                            if var existing = self.teams[name] {
+                                existing.teamUuid = teamUuid
+                                self.teams[name] = existing
+                            }
+                        }
+                    }
+                } else {
                     Logger.team.error("[headless] create_team RPC failed")
                 }
             }
@@ -953,17 +1015,20 @@ final class TeamOrchestrator: ObservableObject {
                     name: agent.name,
                     teamName: name,
                     cli: agentCli,
+                    launchCommand: Self.defaultLaunchCommand(for: agentCli),
                     model: agent.model,
                     agentType: agent.agentType,
                     color: agentColor,
                     instructions: effectiveInstructions,
                     workspaceId: workspace.id,
-                    panelId: UUID(), // placeholder — no real panel
+                    panelId: nil, // headless — no real panel
                     parentSessionId: leaderSessionId,
                     createdAt: Date(),
                     worktreeName: nil,
                     worktreePath: nil,
-                    worktreeBranch: nil
+                    worktreeBranch: nil,
+                    originalSpawnCommand: nil, // headless — daemon owns subprocess
+                    originalAgentWorkDir: nil
                 )
                 headlessMembers.append(member)
             }
@@ -1070,11 +1135,11 @@ final class TeamOrchestrator: ObservableObject {
                 if col == 0 {
                     splitFrom = agentAnchorPanelId
                 } else {
-                    splitFrom = members[col - 1].panelId
+                    splitFrom = members[col - 1].panelId ?? agentAnchorPanelId
                 }
             } else {
                 orientation = .vertical
-                splitFrom = members[index - numCols].panelId
+                splitFrom = members[index - numCols].panelId ?? agentAnchorPanelId
             }
 
             // Delegate pane construction to shared helper (see addAgentPaneToWorkspace).
@@ -1338,8 +1403,8 @@ final class TeamOrchestrator: ObservableObject {
         // - Subsequent: split DOWN from the last existing agent (vertical) — stacks under prior agents
         let splitFrom: UUID
         let orientation: SplitOrientation
-        if let lastAgent = team.agents.last {
-            splitFrom = lastAgent.panelId
+        if let lastAgent = team.agents.last, let lastPanel = lastAgent.panelId {
+            splitFrom = lastPanel
             orientation = .vertical
         } else {
             splitFrom = team.leaderPanelId
@@ -1438,8 +1503,9 @@ final class TeamOrchestrator: ObservableObject {
         // `Workspace.closePanel` is idempotent — returns false if the panel
         // has already been closed (user-initiated or otherwise), which we
         // treat as successful detach.
-        if let workspace = tabManager.tabs.first(where: { $0.id == team.workspaceId }) {
-            _ = workspace.closePanel(agent.panelId, force: true)
+        if let workspace = tabManager.tabs.first(where: { $0.id == team.workspaceId }),
+           let pid = agent.panelId {
+            _ = workspace.closePanel(pid, force: true)
         }
 
         // Remove from team.agents
@@ -1966,10 +2032,38 @@ final class TeamOrchestrator: ObservableObject {
 
     /// Send text to a specific agent in a team.
     /// When multiple agents share the same name, round-robins across them.
+    /// Maintains an in-flight counter and a panelId snapshot so a concurrent
+    /// hard restart can either drain (preferred) or detect mid-flight migration.
     func sendToAgent(teamName: String, agentName: String, text: String, tabManager: TabManager, withReturn: Bool = true, completion: ((Bool) -> Void)? = nil) -> Bool {
         guard let team = teams[teamName] else { completion?(false); return false }
         guard let agent = selectAgent(in: team.agents, name: agentName) else { completion?(false); return false }
-        return sendTextToPanel(workspaceId: agent.workspaceId, panelId: agent.panelId, text: text, tabManager: tabManager, withReturn: withReturn, completion: completion)
+        let teamAgentKey = "\(teamName)/\(agentName)"
+        if migratingAgents.contains(teamAgentKey) {
+            #if DEBUG
+            dlog("[team.sendToAgent] aborted reason=migration_in_flight team=\(teamName) agent=\(agentName)")
+            #endif
+            completion?(false)
+            return false
+        }
+        guard let pid = agent.panelId else { completion?(false); return false }
+        activeSends[teamAgentKey, default: 0] += 1
+        return sendTextToPanel(
+            workspaceId: agent.workspaceId,
+            panelId: pid,
+            text: text,
+            tabManager: tabManager,
+            withReturn: withReturn
+        ) { [weak self] sent in
+            if let self = self {
+                let remaining = (self.activeSends[teamAgentKey] ?? 0) - 1
+                if remaining <= 0 {
+                    self.activeSends.removeValue(forKey: teamAgentKey)
+                } else {
+                    self.activeSends[teamAgentKey] = remaining
+                }
+            }
+            completion?(sent)
+        }
     }
 
     /// Send text to an agent by its unique panelId (skips name lookup entirely).
@@ -1986,8 +2080,9 @@ final class TeamOrchestrator: ObservableObject {
     func sendToAgentAutoLocate(teamName: String, agentName: String, text: String) -> Bool {
         guard let team = teams[teamName],
               let agent = selectAgent(in: team.agents, name: agentName),
-              let located = AppDelegate.shared?.locateSurface(surfaceId: agent.panelId) else { return false }
-        return sendTextToPanel(workspaceId: agent.workspaceId, panelId: agent.panelId, text: text, tabManager: located.tabManager)
+              let pid = agent.panelId,
+              let located = AppDelegate.shared?.locateSurface(surfaceId: pid) else { return false }
+        return sendTextToPanel(workspaceId: agent.workspaceId, panelId: pid, text: text, tabManager: located.tabManager)
     }
 
     func sendToLeader(teamName: String, text: String, tabManager: TabManager) -> Bool {
@@ -2324,7 +2419,8 @@ final class TeamOrchestrator: ObservableObject {
         guard let team = teams[teamName] else { return 0 }
         var count = 0
         for agent in team.agents {
-            if sendTextToPanel(workspaceId: agent.workspaceId, panelId: agent.panelId, text: text, tabManager: tabManager) {
+            guard let pid = agent.panelId else { continue }
+            if sendTextToPanel(workspaceId: agent.workspaceId, panelId: pid, text: text, tabManager: tabManager) {
                 count += 1
             }
         }
@@ -2370,6 +2466,372 @@ final class TeamOrchestrator: ObservableObject {
         return total
     }
 
+    func agentIdentity(teamName: String, agentName: String) -> AgentPaneIdentity? {
+        guard let team = teams[teamName],
+              let agent = team.agents.first(where: { $0.name == agentName }) else { return nil }
+        return agentIdentity(for: agent)
+    }
+
+    func agentIdentity(forPanelId panelId: UUID) -> AgentPaneIdentity? {
+        for team in teams.values {
+            if let agent = team.agents.first(where: { $0.panelId == panelId }) {
+                if let identity = agentIdentity(for: agent) { return identity }
+            }
+        }
+        return nil
+    }
+
+    @discardableResult
+    func restartAgentPane(
+        panelId: UUID,
+        tabManager preferredTabManager: TabManager? = nil,
+        completion: ((Bool) -> Void)? = nil
+    ) -> Bool {
+        guard let identity = agentIdentity(forPanelId: panelId),
+              let panel = terminalPanel(for: identity, preferredTabManager: preferredTabManager) else {
+            return false
+        }
+
+        // Prefer the full spawn invocation (CLI + model + system prompt + agent-type
+        // flags) captured at addAgentPaneToWorkspace time. Falls back to the bare
+        // binary name when unavailable (older sessions, headless edge cases).
+        let invocation: String = {
+            if let original = identity.originalSpawnCommand, !original.isEmpty {
+                return original
+            }
+            return identity.launchCommand
+        }()
+        let usingOriginal = identity.originalSpawnCommand?.isEmpty == false
+
+        // Soft-restart escalation: ETX → 150ms → ETX → 200ms → SIGQUIT (\u{1c}) → 150ms → retype.
+        // ETX×2 + SIGQUIT is harmless against a healthy CLI (just an extra interrupt
+        // it ignores at its prompt) and gives a stuck foreground process two more
+        // signals to act on before we attempt to retype.
+        panel.sendText("\u{03}")
+        #if DEBUG
+        dlog("[team.restart] mode=soft ETX#1 team=\(identity.teamName) agent=\(identity.agentName) panel=\(panel.id.uuidString.prefix(8)) invocation_len=\(invocation.count) using_original=\(usingOriginal)")
+        #endif
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
+            panel.sendText("\u{03}")
+            #if DEBUG
+            dlog("[team.restart] mode=soft ETX#2 panel=\(panel.id.uuidString.prefix(8))")
+            #endif
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.20) {
+                panel.sendText("\u{1c}")
+                #if DEBUG
+                dlog("[team.restart] mode=soft SIGQUIT panel=\(panel.id.uuidString.prefix(8))")
+                #endif
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
+                    Task { @MainActor in
+                        let sent = panel.surface.sendIMEText(invocation, withReturn: true)
+                        if sent {
+                            panel.surface.forceRefresh()
+                        }
+                        #if DEBUG
+                        dlog("[team.restart] mode=soft retype sent=\(sent) team=\(identity.teamName) agent=\(identity.agentName) panel=\(panel.id.uuidString.prefix(8)) invocation_len=\(invocation.count) preview=\(invocation.prefix(80).debugDescription)")
+                        #endif
+                        completion?(sent)
+                    }
+                }
+            }
+        }
+        return true
+    }
+
+    /// Hard restart — close the agent pane and respawn a fresh one in the same
+    /// position using the captured spawn metadata. Returns the (old, new) panel
+    /// IDs on success. Pane-mode only — headless agents return `.headlessNoPane`.
+    ///
+    /// In-flight drain policy: waits up to 200ms for active sends to this agent
+    /// to finish, then proceeds. Concurrent sends after the migration flag is set
+    /// are rejected with `migration_in_flight`.
+    enum RestartHardError: Error {
+        case agentNotFound
+        case headlessNoPane
+        case workspaceMissing
+        case spawnFailed
+        case alreadyMigrating
+
+        var code: String {
+            switch self {
+            case .agentNotFound: return "not_found"
+            case .headlessNoPane: return "headless_no_pane"
+            case .workspaceMissing: return "workspace_missing"
+            case .spawnFailed: return "spawn_failed"
+            case .alreadyMigrating: return "migration_locked"
+            }
+        }
+        var message: String {
+            switch self {
+            case .agentNotFound: return "Agent not found"
+            case .headlessNoPane: return "Hard restart not supported for headless agents"
+            case .workspaceMissing: return "Workspace for agent no longer alive"
+            case .spawnFailed: return "Failed to spawn new agent pane"
+            case .alreadyMigrating: return "Another migration is already in progress for this agent"
+            }
+        }
+    }
+
+    func restartAgentPaneHard(
+        teamName: String,
+        agentName: String,
+        tabManager preferred: TabManager? = nil
+    ) async -> Result<(old: UUID, new: UUID), RestartHardError> {
+        guard var team = teams[teamName],
+              let idx = team.agents.firstIndex(where: { $0.name == agentName })
+        else {
+            return .failure(.agentNotFound)
+        }
+        let old = team.agents[idx]
+        guard let oldPid = old.panelId else {
+            return .failure(.headlessNoPane)
+        }
+        let teamAgentKey = "\(teamName)/\(agentName)"
+        if migratingAgents.contains(teamAgentKey) {
+            return .failure(.alreadyMigrating)
+        }
+        guard let tabManager = preferred ?? resolveTabManager(teamName: teamName),
+              let workspace = tabManager.tabs.first(where: { $0.id == old.workspaceId })
+        else {
+            return .failure(.workspaceMissing)
+        }
+
+        // Phase A — flag agent as migrating, drain in-flight sends (200ms grace).
+        migratingAgents.insert(teamAgentKey)
+        #if DEBUG
+        dlog("[team.restart] mode=hard begin team=\(teamName) agent=\(agentName) oldPanel=\(oldPid.uuidString.prefix(8)) active=\(activeSends[teamAgentKey] ?? 0)")
+        #endif
+        Logger.team.info(
+            "[team.restart] mode=hard begin team=\(teamName, privacy: .public) agent=\(agentName, privacy: .public) oldPanel=\(oldPid.uuidString.prefix(8), privacy: .public)"
+        )
+        let drainDeadline = Date().addingTimeInterval(0.20)
+        while (activeSends[teamAgentKey] ?? 0) > 0 && Date() < drainDeadline {
+            try? await Task.sleep(nanoseconds: 20_000_000) // 20ms poll
+        }
+        let postDrainActive = activeSends[teamAgentKey] ?? 0
+        if postDrainActive > 0 {
+            #if DEBUG
+            dlog("[team.restart] mode=hard drain_timeout team=\(teamName) agent=\(agentName) remaining=\(postDrainActive) — proceeding anyway")
+            #endif
+        }
+
+        // Pick splitFrom + orientation + insertFirst while the dead pane is still
+        // alive in the bonsplit tree. We need its parent-split info to choose the
+        // correct sibling anchor + insert side.
+        let (splitFrom, orientation, insertFirst) = splitFromForRespawn(
+            workspace: workspace, deadPanelId: oldPid, team: team
+        )
+
+        // Phase B — SPAWN FIRST, then close. If we close first, bonsplit collapses
+        // the parent split and promotes the sibling up one level; the subsequent
+        // newTerminalSplit then splits the promoted sibling and produces a totally
+        // different layout. By spawning while the dead pane still exists, the new
+        // panel is inserted *next to the sibling inside the parent split*. After
+        // we then close the dead panel, the outer parent split collapses and the
+        // inner (new, sibling) split takes over the slot — visually identical to
+        // the original (dead, sibling) layout.
+
+        guard let cliPath = agentBinaryPath(cli: old.cli) else {
+            migratingAgents.remove(teamAgentKey)
+            return .failure(.spawnFailed)
+        }
+        let agentWorkDir = old.originalAgentWorkDir ?? team.workingDirectory
+        guard let newMember = addAgentPaneToWorkspace(
+            workspace: workspace,
+            agentName: old.name,
+            agentCli: old.cli,
+            agentModel: old.model,
+            agentType: old.agentType,
+            agentColor: old.color,
+            agentInstructions: old.instructions,
+            cliPath: cliPath,
+            teamName: teamName,
+            leaderSessionId: old.parentSessionId ?? team.leaderSessionId,
+            workingDirectory: team.workingDirectory,
+            agentWorkDir: agentWorkDir,
+            worktreeName: old.worktreeName,
+            worktreePath: old.worktreePath,
+            worktreeBranch: old.worktreeBranch,
+            splitFrom: splitFrom,
+            orientation: orientation,
+            insertFirst: insertFirst,
+            tabManager: tabManager
+        ) else {
+            // Spawn failed — dead panel is still alive; leave it in place rather
+            // than orphaning the user with neither old nor new pane.
+            migratingAgents.remove(teamAgentKey)
+            return .failure(.spawnFailed)
+        }
+
+        guard let newPid = newMember.panelId else {
+            migratingAgents.remove(teamAgentKey)
+            return .failure(.spawnFailed)
+        }
+
+        #if DEBUG
+        dlog("[team.restart] mode=hard spawned team=\(teamName) agent=\(agentName) newPanel=\(newPid.uuidString.prefix(8)) splitFrom=\(splitFrom.uuidString.prefix(8)) orientation=\(orientation) insertFirst=\(insertFirst) — now closing oldPanel=\(oldPid.uuidString.prefix(8))")
+        #endif
+
+        // Now close the dead panel. bonsplit collapses the outer parent split,
+        // promoting the inner (new, sibling) split into the slot it occupied.
+        let closed = workspace.closePanel(oldPid, force: true)
+        #if DEBUG
+        dlog("[team.restart] mode=hard closed=\(closed) oldPanel=\(oldPid.uuidString.prefix(8))")
+        if !closed {
+            dlog("[team.restart] mode=hard WARNING close of oldPanel failed — new pane is up but dead pane may linger; user should close manually")
+        }
+        #endif
+
+        // Phase C — atomic swap. Replace the AgentMember in place (id/name stable).
+        // dispatcher / heartbeat / task routing are all (team, agent_name) keyed and
+        // resolve agent.panelId fresh on every call, so no explicit rebind is needed.
+        team.agents[idx] = newMember
+        teams[teamName] = team
+        TeamDataStore.shared.registerTeam(teamName, agentNames: team.agents.map(\.name))
+        syncTeamStateToDaemon()
+        migratingAgents.remove(teamAgentKey)
+
+        #if DEBUG
+        dlog("[team.restart] mode=hard ok team=\(teamName) agent=\(agentName) oldPanel=\(oldPid.uuidString.prefix(8)) newPanel=\(newPid.uuidString.prefix(8)) splitFrom=\(splitFrom.uuidString.prefix(8)) orientation=\(orientation) insertFirst=\(insertFirst) close_ok=\(closed)")
+        #endif
+        Logger.team.info(
+            "[team.restart] mode=hard ok team=\(teamName, privacy: .public) agent=\(agentName, privacy: .public) oldPanel=\(oldPid.uuidString.prefix(8), privacy: .public) newPanel=\(newPid.uuidString.prefix(8), privacy: .public) splitFrom=\(splitFrom.uuidString.prefix(8), privacy: .public) insertFirst=\(insertFirst, privacy: .public) close_ok=\(closed, privacy: .public)"
+        )
+        return .success((old: oldPid, new: newPid))
+    }
+
+    /// Snapshot of a pane's position in the bonsplit tree, captured before
+    /// closing so the respawned pane can re-occupy the same slot.
+    private struct PaneLayoutSnapshot {
+        /// Live sibling panel id under the same parent split. Used as splitFrom anchor.
+        let siblingPanelId: UUID
+        /// Orientation of the parent split (horizontal = side-by-side, vertical = stacked).
+        let orientation: SplitOrientation
+        /// Was the dead pane on the `first` side of the parent split?
+        /// `insertFirst: true` on newTerminalSplit puts the new pane back on that side.
+        let deadWasFirst: Bool
+    }
+
+    /// Walk the bonsplit treeSnapshot to find the parent split of `deadPanelId`
+    /// and return its sibling + orientation + side info. Returns nil if the dead
+    /// panel is at the root (no split parent) or cannot be located.
+    private func paneLayoutSnapshot(
+        workspace: Workspace,
+        deadPanelId: UUID
+    ) -> PaneLayoutSnapshot? {
+        guard let deadTabId = workspace.surfaceIdFromPanelId(deadPanelId) else { return nil }
+        let deadTabIdString = deadTabId.uuid.uuidString
+
+        // Walk the tree: at each split, check if `deadTabIdString` is in the first or
+        // second subtree's pane-tabs. Return the parent split's info.
+        func contains(_ node: ExternalTreeNode, tabId: String) -> Bool {
+            switch node {
+            case .pane(let pane):
+                return pane.tabs.contains(where: { $0.id == tabId })
+            case .split(let split):
+                return contains(split.first, tabId: tabId) || contains(split.second, tabId: tabId)
+            }
+        }
+
+        // Returns the first live sibling tab's TabID in the given subtree.
+        func firstSiblingTabId(in node: ExternalTreeNode) -> String? {
+            switch node {
+            case .pane(let pane):
+                return pane.selectedTabId ?? pane.tabs.first?.id
+            case .split(let split):
+                return firstSiblingTabId(in: split.first) ?? firstSiblingTabId(in: split.second)
+            }
+        }
+
+        var found: PaneLayoutSnapshot?
+
+        // Post-order walk — descend into both children first, only matching the
+        // current split as a parent if neither subtree was the immediate parent.
+        // root.contains(dead) is trivially true for every ancestor split, so a
+        // pre-order match would always pin to the root and pick the wrong sibling
+        // (e.g. for root.h(leader, vsplit(a1, a2)), restarting a1 would resolve
+        // sibling=leader rather than sibling=a2). Post-order resolves to the
+        // *immediate* parent split.
+        func walk(_ node: ExternalTreeNode) -> Bool {
+            guard case .split(let split) = node else { return false }
+            if walk(split.first) { return true }
+            if walk(split.second) { return true }
+            let inFirst = contains(split.first, tabId: deadTabIdString)
+            let inSecond = !inFirst && contains(split.second, tabId: deadTabIdString)
+            if inFirst || inSecond {
+                let siblingSubtree = inFirst ? split.second : split.first
+                if let siblingTabIdString = firstSiblingTabId(in: siblingSubtree),
+                   let siblingUUID = UUID(uuidString: siblingTabIdString),
+                   let siblingPanelId = workspace.panelIdFromSurfaceId(TabID(uuid: siblingUUID)) {
+                    let orient: SplitOrientation = (split.orientation == "horizontal") ? .horizontal : .vertical
+                    found = PaneLayoutSnapshot(
+                        siblingPanelId: siblingPanelId,
+                        orientation: orient,
+                        deadWasFirst: inFirst
+                    )
+                    #if DEBUG
+                    dlog("[team.restart] snapshot match deadIn=\(inFirst ? "first" : "second") sibling=\(siblingPanelId.uuidString.prefix(8)) orient=\(orient)")
+                    #endif
+                    Logger.team.info(
+                        "[team.restart] snapshot match deadIn=\(inFirst ? "first" : "second", privacy: .public) sibling=\(siblingPanelId.uuidString.prefix(8), privacy: .public)"
+                    )
+                    return true
+                }
+            }
+            return false
+        }
+        _ = walk(workspace.bonsplitController.treeSnapshot())
+        if found == nil {
+            #if DEBUG
+            dlog("[team.restart] snapshot miss — no parent split located for deadPanel=\(deadPanelId.uuidString.prefix(8))")
+            #endif
+            Logger.team.info(
+                "[team.restart] snapshot miss deadPanel=\(deadPanelId.uuidString.prefix(8), privacy: .public)"
+            )
+        }
+        return found
+    }
+
+    /// Decide the splitFrom anchor + orientation + insertFirst flag for respawning
+    /// a dead pane. When possible, restore the exact slot via the parent-split
+    /// snapshot; otherwise fall through a chain of weaker anchors.
+    private func splitFromForRespawn(
+        workspace: Workspace,
+        deadPanelId: UUID,
+        team: Team
+    ) -> (UUID, SplitOrientation, Bool) {
+        // 0. Layout-aware: rebuild in the same slot using parent split info.
+        if let snap = paneLayoutSnapshot(workspace: workspace, deadPanelId: deadPanelId),
+           workspace.panels[snap.siblingPanelId] != nil {
+            return (snap.siblingPanelId, snap.orientation, snap.deadWasFirst)
+        }
+        // 1. Same bonsplit pane — pick the first surviving tab as anchor.
+        if let paneId = workspace.paneId(forPanelId: deadPanelId) {
+            for tab in workspace.bonsplitController.tabs(inPane: paneId) {
+                if let sibling = workspace.panelIdFromSurfaceId(tab.id), sibling != deadPanelId {
+                    return (sibling, .horizontal, false)
+                }
+            }
+        }
+        // 2. Another live agent panel.
+        for other in team.agents {
+            guard let pid = other.panelId, pid != deadPanelId else { continue }
+            if workspace.panels[pid] != nil {
+                return (pid, .horizontal, false)
+            }
+        }
+        // 3. Team leader panel, if alive here.
+        if workspace.panels[team.leaderPanelId] != nil {
+            return (team.leaderPanelId, .horizontal, false)
+        }
+        // 4. First workspace panel (e.g. focusedPanelId).
+        if let firstPid = workspace.panels.keys.first {
+            return (firstPid, .horizontal, false)
+        }
+        // Shouldn't reach here — newTerminalSplit will fail and we'll return spawnFailed.
+        return (team.leaderPanelId, .horizontal, false)
+    }
+
     /// List all teams.
     func listTeams() -> [[String: Any]] {
         teams.values.map { team in
@@ -2383,7 +2845,7 @@ final class TeamOrchestrator: ObservableObject {
                 "agents": team.agents.map { agent in
                     let activeTask = activeTask(for: team.id, agentName: agent.name)
                     let heartbeat = heartbeats[team.id]?[agent.name]
-                    return [
+                    var info: [String: Any] = [
                         "id": agent.id,
                         "name": agent.name,
                         "cli": agent.cli,
@@ -2399,8 +2861,11 @@ final class TeamOrchestrator: ObservableObject {
                         "last_heartbeat_summary": heartbeat?.summary as Any? ?? NSNull(),
                         "heartbeat_is_stale": heartbeat.map(isHeartbeatStale) ?? false,
                         "workspace_id": agent.workspaceId.uuidString,
-                        "panel_id": agent.panelId.uuidString
-                    ] as [String: Any]
+                    ]
+                    if let pid = agent.panelId {
+                        info["panel_id"] = pid.uuidString
+                    }
+                    return info
                 },
                 "attention_count": teamInbox.count,
                 "created_at": ISO8601DateFormatter().string(from: team.createdAt)
@@ -2475,8 +2940,10 @@ final class TeamOrchestrator: ObservableObject {
                     "last_heartbeat_summary": heartbeat?.summary as Any? ?? NSNull(),
                     "heartbeat_is_stale": heartbeat.map(isHeartbeatStale) ?? false,
                     "workspace_id": agent.workspaceId.uuidString,
-                    "panel_id": agent.panelId.uuidString
                 ]
+                if let pid = agent.panelId {
+                    info["panel_id"] = pid.uuidString
+                }
                 if let branch = agent.worktreeBranch {
                     info["worktree_branch"] = branch
                 }
@@ -2507,7 +2974,8 @@ final class TeamOrchestrator: ObservableObject {
 
         // Send Ctrl-C to all agent panels
         for agent in team.agents {
-            if let panel = workspace.terminalPanel(for: agent.panelId) {
+            guard let pid = agent.panelId else { continue }
+            if let panel = workspace.terminalPanel(for: pid) {
                 panel.sendText("\u{03}")  // Ctrl-C
             }
         }
@@ -2517,7 +2985,8 @@ final class TeamOrchestrator: ObservableObject {
         let teamCopy = team
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
             for agent in teamCopy.agents {
-                if let panel = wsRef.terminalPanel(for: agent.panelId) {
+                guard let pid = agent.panelId else { continue }
+                if let panel = wsRef.terminalPanel(for: pid) {
                     panel.sendText("exit\n")
                 }
             }
@@ -2553,7 +3022,113 @@ final class TeamOrchestrator: ObservableObject {
         teams.removeValue(forKey: name)
         syncTeamStateToDaemon()
         Logger.team.info("destroyed team '\(name, privacy: .public)'")
+        // Phase 2: notify any open TeamCreationView so its "Resume from previous
+        // team" list refreshes promptly when a team is destroyed mid-dialog.
+        NotificationCenter.default.post(name: .headlessTeamDestroyed, object: nil, userInfo: ["team_name": name])
         return true
+    }
+
+    /// Phase 2: register a previously-destroyed headless team that the daemon
+    /// has just resumed via `headless.resume_team`. The daemon has already
+    /// respawned all agent subprocesses; we mirror the team in our in-memory
+    /// registry and open a workspace at the worktree path so the UI surfaces
+    /// the resumed agents. Best-effort — if the result is malformed we log and
+    /// return without throwing (caller is a UI completion handler).
+    @discardableResult
+    func adoptResumedHeadlessTeam(result: [String: Any], tabManager: TabManager) -> Team? {
+        guard let teamName = result["name"] as? String,
+              let agentIds = result["agents"] as? [String],
+              let workingDirectory = result["working_directory"] as? String,
+              let leaderSessionId = result["leader_session_id"] as? String else {
+            Logger.team.error("[headless] resume_team result missing required fields")
+            return nil
+        }
+        let teamUuid = result["team_uuid"] as? String
+
+        // Avoid clobbering a live team with the same name (defense — daemon
+        // would normally reject this with team_name_in_use, but UI may race).
+        if let existing = teams[teamName] {
+            Logger.team.info("[headless] resumed team '\(teamName, privacy: .public)' already exists locally — skipping adopt")
+            return existing
+        }
+
+        // Optional worktree info from resume_team result. The contract does
+        // not require these to be echoed back, but if they are, prefer the
+        // worktree path as workspace cwd.
+        var worktreePath: String?
+        var worktreeBranch: String?
+        var worktreeName: String?
+        if let wt = result["worktree"] as? [String: Any] {
+            worktreePath = wt["path"] as? String
+            worktreeBranch = wt["branch"] as? String
+            if let p = worktreePath, let name = (p as NSString).lastPathComponent as String? {
+                worktreeName = name
+            }
+        }
+        let workspaceCwd = worktreePath ?? workingDirectory
+
+        // Open a workspace tab pointed at the resumed team's worktree (or
+        // working_directory). The headless agents have no panes — this
+        // workspace acts as the leader console host.
+        let workspace = tabManager.addWorkspace(
+            workingDirectory: workspaceCwd,
+            select: true
+        )
+        workspace.customTitle = "[\(teamName)] \(agentIds.count) headless"
+        workspace.title = "[\(teamName)] \(agentIds.count) headless"
+
+        // Build minimal AgentMember stubs from the agent id strings
+        // ("<name>@<team>"). We don't have full per-agent metadata in the
+        // resume result envelope, so cli/model/color/instructions default
+        // sensibly until the daemon emits state updates.
+        let colors = ["green", "blue", "yellow", "magenta", "cyan", "red"]
+        let members: [AgentMember] = agentIds.enumerated().map { index, fullId in
+            let name = String(fullId.split(separator: "@").first ?? Substring(fullId))
+            return AgentMember(
+                id: fullId,
+                name: name,
+                teamName: teamName,
+                cli: "claude",
+                launchCommand: Self.defaultLaunchCommand(for: "claude"),
+                model: "sonnet",
+                agentType: name,
+                color: colors[index % colors.count],
+                instructions: "",
+                workspaceId: workspace.id,
+                panelId: nil, // headless — no real panel (resumed team)
+                parentSessionId: leaderSessionId,
+                createdAt: Date(),
+                worktreeName: worktreeName,
+                worktreePath: worktreePath,
+                worktreeBranch: worktreeBranch,
+                originalSpawnCommand: nil, // headless — daemon owns subprocess
+                originalAgentWorkDir: nil
+            )
+        }
+
+        let team = Team(
+            id: teamName,
+            leaderSessionId: leaderSessionId,
+            leaderMode: "claude",
+            leaderModel: "sonnet",
+            leaderPanelId: UUID(), // placeholder — headless team has no leader pane
+            leaderWorkspaceId: workspace.id,
+            workingDirectory: workingDirectory,
+            workspaceId: workspace.id,
+            agents: members,
+            createdAt: Date(),
+            gitRepoRoot: nil,
+            worktreeMode: worktreePath == nil ? "off" : "isolated",
+            sharedWorktreeName: nil,
+            sharedWorktreePath: nil,
+            sharedWorktreeBranch: nil,
+            teamUuid: teamUuid
+        )
+        teams[teamName] = team
+        TeamDataStore.shared.registerTeam(teamName, agentNames: members.map(\.name))
+        syncTeamStateToDaemon()
+        Logger.team.info("[headless] adopted resumed team '\(teamName, privacy: .public)' uuid=\(teamUuid ?? "?", privacy: .public)")
+        return team
     }
 
     /// Log detached worktrees from a destroyed team (no longer auto-deleted).
@@ -2565,6 +3140,52 @@ final class TeamOrchestrator: ObservableObject {
     }
 
     // MARK: - Private
+
+    private func agentIdentity(for agent: AgentMember) -> AgentPaneIdentity? {
+        guard let pid = agent.panelId else { return nil }
+        return AgentPaneIdentity(
+            teamName: agent.teamName,
+            agentName: agent.name,
+            panelId: pid,
+            workspaceId: agent.workspaceId,
+            launchCommand: agent.launchCommand.isEmpty
+                ? Self.defaultLaunchCommand(for: agent.cli)
+                : agent.launchCommand,
+            originalSpawnCommand: agent.originalSpawnCommand
+        )
+    }
+
+    private func terminalPanel(
+        for identity: AgentPaneIdentity,
+        preferredTabManager: TabManager?
+    ) -> TerminalPanel? {
+        let tabManager = preferredTabManager ?? resolveTabManager(teamName: identity.teamName)
+        if let tabManager,
+           let workspace = tabManager.tabs.first(where: { $0.id == identity.workspaceId }),
+           let panel = workspace.terminalPanel(for: identity.panelId) {
+            return panel
+        }
+        if let located = AppDelegate.shared?.locateSurface(surfaceId: identity.panelId),
+           let workspace = located.tabManager.tabs.first(where: { $0.id == located.workspaceId }) {
+            return workspace.terminalPanel(for: identity.panelId)
+        }
+        return nil
+    }
+
+    private static func defaultLaunchCommand(for cli: String) -> String {
+        switch cli.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
+        case "", "claude":
+            return "claude"
+        case "codex":
+            return "codex"
+        case "gemini":
+            return "gemini"
+        case "kiro", "kiro-cli":
+            return "kiro-cli"
+        default:
+            return cli
+        }
+    }
 
     private func buildClaudeCommand(
         claudePath: String,
@@ -2866,8 +3487,9 @@ final class TeamOrchestrator: ObservableObject {
     func agentPanel(teamName: String, agentName: String, tabManager: TabManager) -> TerminalPanel? {
         guard let team = teams[teamName] else { return nil }
         guard let agent = team.agents.first(where: { $0.name == agentName }) else { return nil }
+        guard let pid = agent.panelId else { return nil }
         guard let workspace = tabManager.tabs.first(where: { $0.id == agent.workspaceId }) else { return nil }
-        return workspace.terminalPanel(for: agent.panelId)
+        return workspace.terminalPanel(for: pid)
     }
 
     /// Get all agent panels for a team.
@@ -2875,8 +3497,9 @@ final class TeamOrchestrator: ObservableObject {
         guard let team = teams[teamName] else { return [] }
         var results: [(name: String, panel: TerminalPanel)] = []
         for agent in team.agents {
-            guard let workspace = tabManager.tabs.first(where: { $0.id == agent.workspaceId }),
-                  let panel = workspace.terminalPanel(for: agent.panelId) else { continue }
+            guard let pid = agent.panelId,
+                  let workspace = tabManager.tabs.first(where: { $0.id == agent.workspaceId }),
+                  let panel = workspace.terminalPanel(for: pid) else { continue }
             results.append((name: agent.name, panel: panel))
         }
         return results
@@ -3365,7 +3988,89 @@ final class TeamOrchestrator: ObservableObject {
         agentRuntimeState(teamName: teamName, agentName: agentName)
     }
 
+    // MARK: - Phase 2.5 — Sidebar context-menu RPC helpers
+
+    /// Resolve the headless `team_uuid` for a given team name. Nil for
+    /// pane-mode teams or teams whose UUID has not yet been captured from
+    /// `headless.create_team`.
+    func teamUuid(for teamName: String) -> String? {
+        teams[teamName]?.teamUuid
+    }
+
+    /// Park one agent immediately via `headless.park_agent` (off-main).
+    /// `completion` (optional) is invoked on the main thread with the raw
+    /// response dictionary or `nil` on transport failure.
+    func parkAgent(teamName: String, agentName: String, completion: (([String: Any]?) -> Void)? = nil) {
+        let params: [String: Any] = [
+            "team_name": teamName,
+            "agent_name": agentName,
+        ]
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            guard let self else { return }
+            let raw = self.daemon.rpcCallRaw(method: "headless.park_agent", params: params)
+            var dict: [String: Any]?
+            if let raw, let data = raw.data(using: .utf8),
+               let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+                dict = (obj["result"] as? [String: Any]) ?? obj
+            }
+            DispatchQueue.main.async { completion?(dict) }
+        }
+    }
+
+    /// Unpark a previously parked agent via `headless.unpark_agent`.
+    func unparkAgent(teamName: String, agentName: String, completion: (([String: Any]?) -> Void)? = nil) {
+        let params: [String: Any] = [
+            "team_name": teamName,
+            "agent_name": agentName,
+            "app_socket_path": SocketControlSettings.socketPath(),
+        ]
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            guard let self else { return }
+            let raw = self.daemon.rpcCallRaw(method: "headless.unpark_agent", params: params)
+            var dict: [String: Any]?
+            if let raw, let data = raw.data(using: .utf8),
+               let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+                dict = (obj["result"] as? [String: Any]) ?? obj
+            }
+            DispatchQueue.main.async { completion?(dict) }
+        }
+    }
+
+    /// Count of resumable headless teams via `headless.list_resumable`. The
+    /// daemon already excludes corrupt / non-resumable rows; this helper
+    /// counts only entries whose `resumable == true`.
+    func countResumableTeams(gitRoot: String? = nil, completion: @escaping (Int) -> Void) {
+        var params: [String: Any] = ["limit": 200]
+        if let root = gitRoot { params["git_root"] = root }
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            guard let self else {
+                DispatchQueue.main.async { completion(0) }
+                return
+            }
+            let raw = self.daemon.rpcCallRaw(method: "headless.list_resumable", params: params)
+            var count = 0
+            if let raw, let data = raw.data(using: .utf8),
+               let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+                let teamList: [[String: Any]]?
+                if let inner = obj["result"] as? [String: Any] {
+                    teamList = inner["teams"] as? [[String: Any]]
+                } else {
+                    teamList = obj["teams"] as? [[String: Any]]
+                }
+                if let teamList {
+                    count = teamList.filter { ($0["resumable"] as? Bool) == true }.count
+                }
+            }
+            DispatchQueue.main.async { completion(count) }
+        }
+    }
+
     private func agentRuntimeState(teamName: String, agentName: String) -> String {
+        // Phase 2: parked is daemon-authoritative — overrides task-derived state
+        // because the subprocess is not live regardless of task board entry.
+        if TeamDataStore.shared.isAgentParked(teamName: teamName, agentName: agentName) {
+            return "parked"
+        }
         guard let task = activeTask(for: teamName, agentName: agentName) else { return "idle" }
         switch task.status {
         case "blocked":
@@ -3376,6 +4081,8 @@ final class TeamOrchestrator: ObservableObject {
             return "error"
         case "queued", "assigned":
             return "idle"
+        case "parked":
+            return "parked"
         default:
             return "running"
         }

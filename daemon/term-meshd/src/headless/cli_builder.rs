@@ -1,12 +1,26 @@
+use std::ffi::OsString;
 use std::path::PathBuf;
 
 /// Configuration for spawning a headless agent subprocess.
+///
+/// `args` is `Vec<OsString>` so the `--append-system-prompt` value can carry
+/// raw bytes verbatim on Unix (via `OsStrExt::from_bytes`). Phase 2 contract §4
+/// mandates no encoding conversion / quote escaping on instructions.
 pub struct CliCommand {
     pub program: String,
-    pub args: Vec<String>,
+    pub args: Vec<OsString>,
     pub env: Vec<(String, String)>,
     /// Environment variables to remove from the child process.
     pub env_remove: Vec<String>,
+}
+
+/// Phase 2: spawn mode for the claude CLI.
+#[derive(Debug, Clone)]
+pub enum ClaudeSpawnMode {
+    /// New session — `--session-id <uuid>`.
+    Fresh { session_id: String },
+    /// Resuming an existing session — `--resume <uuid>`.
+    Resume { session_id: String },
 }
 
 /// Common term-mesh environment variables for all agent CLIs.
@@ -56,6 +70,15 @@ fn resolve_cli_path(cli_path: Option<&str>, env_key: &str, fallback: &str) -> St
 }
 
 /// Build the CLI command for a Claude Code agent in stream-json mode.
+///
+/// Phase 2 contract §4:
+/// - `--session-id <uuid>` (fresh) or `--resume <uuid>` (resume), supplied by
+///   the daemon (never CLI-derived).
+/// - `--print` is added unconditionally so behavior is independent of the CLI's
+///   TTY autodetection.
+/// - `--append-system-prompt` carries the **raw bytes** of instructions —
+///   no quote escaping, no UTF-8 round trip. Empty / `None` ⇒ flag omitted
+///   entirely (NEVER pass an empty value).
 pub fn build_claude_command(
     name: &str,
     team_name: &str,
@@ -64,27 +87,47 @@ pub fn build_claude_command(
     daemon_socket: &str,
     cli_path: Option<&str>,
     app_socket_path: Option<&str>,
-    instructions: Option<&str>,
+    instructions: Option<&[u8]>,
+    mode: ClaudeSpawnMode,
 ) -> CliCommand {
     let program = resolve_cli_path(cli_path, "CLAUDE_PATH", "claude");
 
-    let mut args = vec![
-        "--input-format".into(),
-        "stream-json".into(),
-        "--output-format".into(),
-        "stream-json".into(),
-        "--verbose".into(),
-        "--dangerously-skip-permissions".into(),
-        "--model".into(),
-        model.to_string(),
-    ];
+    let mut args: Vec<OsString> = Vec::new();
 
-    // Pass agent-specific instructions as --append-system-prompt
+    // Session flag must come first for diff/audit stability (§4.3).
+    match &mode {
+        ClaudeSpawnMode::Fresh { session_id } => {
+            args.push(OsString::from("--session-id"));
+            args.push(OsString::from(session_id));
+        }
+        ClaudeSpawnMode::Resume { session_id } => {
+            args.push(OsString::from("--resume"));
+            args.push(OsString::from(session_id));
+        }
+    }
+
+    for s in [
+        "--print",
+        "--input-format",
+        "stream-json",
+        "--output-format",
+        "stream-json",
+        "--verbose",
+        "--dangerously-skip-permissions",
+        "--model",
+    ] {
+        args.push(OsString::from(s));
+    }
+    args.push(OsString::from(model));
+
+    // Pass agent-specific instructions as --append-system-prompt.
+    // Raw bytes — no escaping. `Command::arg` does NOT pass through a shell,
+    // so the previous `replace('\'', "'\\''")` was a bug (silent bytewise drift
+    // on instructions containing single quotes). See contract §4.3.
     if let Some(inst) = instructions {
         if !inst.is_empty() {
-            let escaped = inst.replace('\'', "'\\''");
-            args.push("--append-system-prompt".into());
-            args.push(escaped);
+            args.push(OsString::from("--append-system-prompt"));
+            args.push(os_string_from_bytes(inst));
         }
     }
 
@@ -99,6 +142,19 @@ pub fn build_claude_command(
         env,
         env_remove,
     }
+}
+
+/// Construct an `OsString` from raw bytes verbatim on Unix; lossy UTF-8 fallback
+/// elsewhere (term-meshd is Unix-only in practice).
+#[cfg(unix)]
+fn os_string_from_bytes(b: &[u8]) -> OsString {
+    use std::os::unix::ffi::OsStringExt;
+    OsString::from_vec(b.to_vec())
+}
+
+#[cfg(not(unix))]
+fn os_string_from_bytes(b: &[u8]) -> OsString {
+    OsString::from(String::from_utf8_lossy(b).into_owned())
 }
 
 /// Map short model names to Kiro CLI model identifiers.
@@ -138,15 +194,15 @@ pub fn build_kiro_command(
     );
 
     let kiro_model = kiro_model_name(model);
-    let args = vec![
+    let args: Vec<OsString> = vec![
         "chat".into(),
         "--trust-all-tools".into(),
         "--wrap".into(),
         "never".into(),
         "--agent".into(),
-        profile_name,
+        OsString::from(&profile_name),
         "--model".into(),
-        kiro_model.to_string(),
+        OsString::from(kiro_model),
     ];
 
     let env = base_env(name, team_name, daemon_socket, app_socket_path);
@@ -212,16 +268,16 @@ pub fn build_codex_command(
     let program = resolve_cli_path(cli_path, "CODEX_PATH", "codex");
 
     let codex_model = codex_model_name(model);
-    let mut args: Vec<String> = vec![
+    let mut args: Vec<OsString> = vec![
         "exec".into(),
         "--sandbox".into(),
         "danger-full-access".into(),
         "--model".into(),
-        codex_model.to_string(),
+        OsString::from(codex_model),
     ];
     if let Some(effort) = codex_reasoning_effort(model) {
         args.push("-c".into());
-        args.push(format!("model_reasoning_effort={effort}"));
+        args.push(OsString::from(format!("model_reasoning_effort={effort}")));
     }
     args.push("--json".into());
     args.push("-".into()); // read prompt from stdin
@@ -257,7 +313,7 @@ pub fn build_gemini_command(
     let program = resolve_cli_path(cli_path, "GEMINI_PATH", "gemini");
 
     let gemini_model = gemini_model_name(model);
-    let args = vec!["--yolo".into(), "--model".into(), gemini_model.to_string()];
+    let args: Vec<OsString> = vec!["--yolo".into(), "--model".into(), OsString::from(gemini_model)];
 
     let env = base_env(name, team_name, daemon_socket, app_socket_path);
     CliCommand {
@@ -279,4 +335,113 @@ pub fn daemon_socket_path() -> PathBuf {
         .or_else(|| std::env::var("TMPDIR").ok().map(PathBuf::from))
         .unwrap_or_else(|| PathBuf::from("/tmp"));
     dir.join("term-meshd.sock")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn claude_fresh_argv_order() {
+        let cmd = build_claude_command(
+            "explorer",
+            "my-team",
+            "sonnet",
+            "/proj",
+            "/tmp/term-meshd.sock",
+            None,
+            None,
+            None,
+            ClaudeSpawnMode::Fresh {
+                session_id: "1a2b3c4d-1111-2222-3333-444455556666".into(),
+            },
+        );
+        let argv: Vec<&str> = cmd.args.iter().map(|s| s.to_str().unwrap()).collect();
+        assert_eq!(
+            argv,
+            vec![
+                "--session-id",
+                "1a2b3c4d-1111-2222-3333-444455556666",
+                "--print",
+                "--input-format",
+                "stream-json",
+                "--output-format",
+                "stream-json",
+                "--verbose",
+                "--dangerously-skip-permissions",
+                "--model",
+                "sonnet",
+            ]
+        );
+    }
+
+    #[test]
+    fn claude_resume_argv_uses_resume_flag() {
+        let cmd = build_claude_command(
+            "explorer",
+            "my-team",
+            "sonnet",
+            "/proj",
+            "/tmp/term-meshd.sock",
+            None,
+            None,
+            None,
+            ClaudeSpawnMode::Resume {
+                session_id: "abc-resume".into(),
+            },
+        );
+        assert_eq!(cmd.args[0], OsString::from("--resume"));
+        assert_eq!(cmd.args[1], OsString::from("abc-resume"));
+    }
+
+    #[test]
+    fn claude_append_system_prompt_passes_raw_bytes() {
+        // Contains single quote — used to be corrupted by `replace('\'', "'\\''")`.
+        let inst = b"You're an explorer. Say 'hello'.";
+        let cmd = build_claude_command(
+            "explorer",
+            "my-team",
+            "sonnet",
+            "/proj",
+            "/tmp/term-meshd.sock",
+            None,
+            None,
+            Some(inst),
+            ClaudeSpawnMode::Fresh {
+                session_id: "uuid".into(),
+            },
+        );
+        let last = cmd.args.last().unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStrExt;
+            assert_eq!(last.as_bytes(), inst);
+        }
+        // The --append-system-prompt flag is the penultimate arg.
+        assert_eq!(
+            cmd.args[cmd.args.len() - 2],
+            OsString::from("--append-system-prompt")
+        );
+    }
+
+    #[test]
+    fn claude_empty_instructions_omits_flag() {
+        let cmd = build_claude_command(
+            "x",
+            "t",
+            "sonnet",
+            "/p",
+            "/tmp/s",
+            None,
+            None,
+            Some(b""),
+            ClaudeSpawnMode::Fresh {
+                session_id: "u".into(),
+            },
+        );
+        assert!(!cmd
+            .args
+            .iter()
+            .any(|a| a == &OsString::from("--append-system-prompt")));
+    }
 }

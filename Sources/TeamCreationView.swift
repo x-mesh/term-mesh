@@ -1,4 +1,17 @@
+import AppKit
 import SwiftUI
+
+// MARK: - Phase 2 Notifications
+
+extension Notification.Name {
+    /// Posted after a headless team is destroyed so any open TeamCreationView
+    /// in "Resume from previous team" mode can refresh its candidate list.
+    static let headlessTeamDestroyed = Notification.Name("term-mesh.headlessTeamDestroyed")
+    /// Phase 2.5 — request opening the New Agent Team sheet pre-flipped to the
+    /// "Resume from previous team" mode. Posted from the sidebar resumable
+    /// footer. The sheet host reads the optional `mode` user-info key.
+    static let openCreateTeamSheetInResumeMode = Notification.Name("term-mesh.openCreateTeamSheetInResumeMode")
+}
 
 // MARK: - Claude Session Discovery
 
@@ -145,7 +158,7 @@ struct ClaudeSession: Identifiable, Hashable {
 }
 
 /// A row representing one agent slot in the team creation form.
-struct TeamAgentRow: Identifiable {
+struct TeamAgentRow: Identifiable, Equatable {
     let id = UUID()
     var preset: AgentRolePreset
     var customInstructions: String  // overrides preset instructions if non-empty
@@ -158,14 +171,165 @@ struct TeamAgentRow: Identifiable {
     }
 }
 
+// MARK: - Phase 2 Resumable Team Models (headless.list_resumable result)
+
+/// Lightweight model decoded from `headless.list_resumable` RPC.
+struct ResumableTeam: Identifiable, Hashable {
+    let teamUuid: String
+    let teamName: String
+    let createdAt: Int
+    let destroyedAt: Int
+    let workingDirectory: String
+    let gitRoot: String?
+    let gitBranchAtCreate: String?
+    let gitBranchNow: String?
+    let worktree: Worktree?
+    let agents: [Agent]
+    let validity: Validity
+    let resumable: Bool
+    let blockingReason: String?
+
+    var id: String { teamUuid }
+
+    struct Worktree: Hashable {
+        let mode: String
+        let path: String
+        let branch: String
+        let exists: Bool
+        let branchNow: String?
+    }
+
+    struct Agent: Hashable, Identifiable {
+        let name: String
+        let agentType: String
+        let cli: String
+        let model: String
+        let color: String
+        let hasSession: Bool
+        let hasInstructions: Bool
+        var id: String { name }
+    }
+
+    struct Validity: Hashable {
+        let worktreeExists: Bool
+        let branchMatches: Bool
+        let runbookMatches: Bool
+        let cliVersionMatches: Bool
+        let allSessionsPresent: Bool
+    }
+
+    /// Human relative time for `destroyed_at`.
+    var destroyedRelative: String {
+        let elapsed = Date().timeIntervalSince(Date(timeIntervalSince1970: TimeInterval(destroyedAt)))
+        if elapsed < 60 { return "just now" }
+        if elapsed < 3600 { return "\(Int(elapsed / 60))m ago" }
+        if elapsed < 86400 { return "\(Int(elapsed / 3600))h ago" }
+        return "\(Int(elapsed / 86400))d ago"
+    }
+
+    /// Reason a row should be presented as disabled (subset of validity).
+    /// Returns nil when the row is selectable.
+    var disabledReason: String? {
+        if !validity.worktreeExists, let w = worktree {
+            return "Worktree directory no longer exists: \(w.path)"
+        }
+        if !validity.allSessionsPresent {
+            return "Cannot resume — agents have no session IDs (created before Phase 2)"
+        }
+        switch blockingReason {
+        case "worktree_gone":
+            return "Worktree directory no longer exists"
+        case "no_sessions":
+            return "No resumable sessions (created before Phase 2)"
+        case "corrupt":
+            return "Metadata is corrupt — cannot resume"
+        default:
+            return nil
+        }
+    }
+
+    /// Branch drift summary used for ⚠ row and confirm dialog. Returns
+    /// `(from, to)` only when `branch_matches == false`.
+    var branchDrift: (from: String, to: String)? {
+        guard !validity.branchMatches else { return nil }
+        let from = gitBranchAtCreate ?? worktree?.branch ?? "?"
+        let to = worktree?.branchNow ?? gitBranchNow ?? "?"
+        return (from, to)
+    }
+
+    static func decode(_ dict: [String: Any]) -> ResumableTeam? {
+        guard let uuid = dict["team_uuid"] as? String,
+              let name = dict["team_name"] as? String,
+              let created = dict["created_at"] as? Int,
+              let destroyed = dict["destroyed_at"] as? Int,
+              let wd = dict["working_directory"] as? String else { return nil }
+        let validityRaw = dict["validity"] as? [String: Any] ?? [:]
+        let validity = Validity(
+            worktreeExists:     validityRaw["worktree_exists"] as? Bool ?? false,
+            branchMatches:      validityRaw["branch_matches"] as? Bool ?? false,
+            runbookMatches:     validityRaw["runbook_matches"] as? Bool ?? false,
+            cliVersionMatches:  validityRaw["cli_version_matches"] as? Bool ?? false,
+            allSessionsPresent: validityRaw["all_sessions_present"] as? Bool ?? false
+        )
+        var worktree: Worktree?
+        if let wt = dict["worktree"] as? [String: Any] {
+            worktree = Worktree(
+                mode: wt["mode"] as? String ?? "",
+                path: wt["path"] as? String ?? "",
+                branch: wt["branch"] as? String ?? "",
+                exists: wt["exists"] as? Bool ?? false,
+                branchNow: wt["branch_now"] as? String
+            )
+        }
+        let agentsRaw = dict["agents"] as? [[String: Any]] ?? []
+        let agents: [Agent] = agentsRaw.compactMap { a in
+            guard let aname = a["name"] as? String else { return nil }
+            return Agent(
+                name: aname,
+                agentType: a["agent_type"] as? String ?? aname,
+                cli: a["cli"] as? String ?? "claude",
+                model: a["model"] as? String ?? "sonnet",
+                color: a["color"] as? String ?? "gray",
+                hasSession: a["has_session"] as? Bool ?? false,
+                hasInstructions: a["has_instructions"] as? Bool ?? false
+            )
+        }
+        return ResumableTeam(
+            teamUuid: uuid,
+            teamName: name,
+            createdAt: created,
+            destroyedAt: destroyed,
+            workingDirectory: wd,
+            gitRoot: dict["git_root"] as? String,
+            gitBranchAtCreate: dict["git_branch_at_create"] as? String,
+            gitBranchNow: dict["git_branch_now"] as? String,
+            worktree: worktree,
+            agents: agents,
+            validity: validity,
+            resumable: dict["resumable"] as? Bool ?? false,
+            blockingReason: dict["blocking_reason"] as? String
+        )
+    }
+}
+
 /// Sheet for creating a new multi-agent team.
 struct TeamCreationView: View {
     @Environment(\.dismiss) private var dismiss
     @ObservedObject var presetManager = AgentRolePresetManager.shared
-    @ObservedObject var templateManager = TeamTemplateManager.shared
+    @ObservedObject var savedTemplateManager = SavedTeamTemplateManager.shared
+    @ObservedObject var teamTemplateManager = TeamTemplateManager.shared
     @ObservedObject var providerDetector = ProviderDetector.shared
 
     var onCreate: ((_ teamName: String, _ leaderMode: String, _ leaderModel: String, _ agents: [TeamAgentRow], _ worktreeMode: String, _ executionMode: String, _ resumeSessionId: String?) -> Void)?
+    /// Phase 2: called after a successful `headless.resume_team` RPC.
+    /// Receives the decoded result dictionary. Caller is responsible for
+    /// registering the team in TeamOrchestrator and switching workspace cwd
+    /// to the worktree path (or working_directory if no worktree).
+    var onResume: ((_ result: [String: Any]) -> Void)?
+    /// Phase 2.5 — initial creation mode. Defaults to "new". Pass "resume" to
+    /// open directly into the Resume picker (used by the sidebar footer
+    /// resumable counter).
+    var initialMode: String = "new"
 
     @AppStorage("teamDefaultLeaderMode") private var defaultLeaderMode = "claude"
     @AppStorage("teamDefaultModel") private var defaultModel = "sonnet"
@@ -179,6 +343,7 @@ struct TeamCreationView: View {
     @State private var showSaveTemplate = false
     @State private var saveTemplateName = ""
     @State private var selectedWorkflowName: String?
+    @State private var previewTemplate: TeamTemplate?
     @State private var hoveredAgentId: UUID?
     @State private var bulkModel = "sonnet"
     @State private var selectedSmartPresetId: String?
@@ -190,6 +355,22 @@ struct TeamCreationView: View {
     @State private var selectedSessionId: String?
     @State private var manualSessionId = ""
     @State private var runbookStatus = AgentRunbookService.shared.status()
+
+    // MARK: - Phase 2 Resume state
+
+    /// "new" (fresh team) or "resume" (rehydrate a previously-destroyed team).
+    /// This is orthogonal to the per-leader `resumeSession` Claude-session toggle.
+    @State private var creationMode: String = "new"
+    /// "thisRepo" or "all" — toggles whether list_resumable filters by git_root.
+    @State private var resumeFilter: String = "thisRepo"
+    @State private var resumableTeams: [ResumableTeam] = []
+    @State private var isLoadingResumable: Bool = false
+    @State private var resumeLoadError: String?
+    @State private var selectedResumeTeamId: String?
+    @State private var expandedResumeAgentTeams: Set<String> = []
+    @State private var pendingBranchDriftTeam: ResumableTeam?
+    @State private var resumeInFlight: Bool = false
+    @State private var resumeErrorMessage: String?
 
     /// A team name is only truly duplicate if the entry exists AND its workspace
     /// tab is still open.  When the user closes a workspace tab manually the team
@@ -212,17 +393,26 @@ struct TeamCreationView: View {
         VStack(spacing: 0) {
             header
             Divider()
+            creationModeSelector
+                .padding(.horizontal, 20)
+                .padding(.vertical, 10)
+            Divider()
             ScrollView {
-                VStack(alignment: .leading, spacing: 16) {
-                    teamSettings
-                    Divider().padding(.vertical, 2)
-                    presetButtons
-                    Divider().padding(.vertical, 2)
-                    agentList
-                    Divider().padding(.vertical, 2)
-                    workflowButtons
+                if creationMode == "resume" {
+                    resumePanel
+                        .padding(20)
+                } else {
+                    VStack(alignment: .leading, spacing: 16) {
+                        teamSettings
+                        Divider().padding(.vertical, 2)
+                        presetButtons
+                        Divider().padding(.vertical, 2)
+                        agentList
+                        Divider().padding(.vertical, 2)
+                        workflowButtons
+                    }
+                    .padding(20)
                 }
-                .padding(20)
             }
             Divider()
             footer
@@ -230,17 +420,434 @@ struct TeamCreationView: View {
         .frame(width: 880, height: 850)
         .background(Color(nsColor: .windowBackgroundColor))
         .onAppear {
-            leaderMode = defaultLeaderMode
+            leaderMode = TeamTemplateManager.shared.resolveLeaderMode(fallback: defaultLeaderMode)
             leaderModel = defaultLeaderModel
             bulkModel = defaultModel
             worktreeMode = TermMeshDaemon.shared.worktreeEnabled ? "isolated" : "off"
             if agents.isEmpty {
-                applyQuickPreset(count: 2)
+                applyInitialPreset()
             }
             refreshRunbookStatus()
+            // Phase 2.5 — honor caller's requested initial mode (sidebar
+            // resumable footer opens us directly into resume picker).
+            if initialMode == "resume" && creationMode != "resume" {
+                creationMode = "resume"
+                loadResumableTeams()
+            }
+        }
+        // Phase 2: refresh the resume list when a destroy event arrives while
+        // the sheet is open. We listen on the .headlessTeamDestroyed
+        // notification (defined locally below); TeamOrchestrator posts it from
+        // its destroy path. Cheap to re-call list_resumable.
+        .onReceive(NotificationCenter.default.publisher(for: .headlessTeamDestroyed)) { _ in
+            if creationMode == "resume" { loadResumableTeams() }
         }
         .sheet(isPresented: $showPresetEditor) {
             RolePresetEditorView()
+        }
+        .alert(
+            "Branch has changed",
+            isPresented: Binding(
+                get: { pendingBranchDriftTeam != nil },
+                set: { if !$0 { pendingBranchDriftTeam = nil } }
+            ),
+            presenting: pendingBranchDriftTeam
+        ) { team in
+            Button("Resume anyway", role: .destructive) {
+                if let team = pendingBranchDriftTeam {
+                    pendingBranchDriftTeam = nil
+                    invokeResume(team: team, acceptBranchDrift: true)
+                }
+            }
+            Button("Cancel", role: .cancel) { pendingBranchDriftTeam = nil }
+        } message: { team in
+            if let drift = team.branchDrift {
+                Text("Branch has changed since this team was created (was \(drift.from), now \(drift.to)). Resume anyway on the current branch?")
+            } else {
+                Text("Branch has changed since this team was created. Resume anyway?")
+            }
+        }
+        .sheet(item: $previewTemplate) { template in
+            TeamTemplatePreviewPanel(
+                template: template,
+                providerDetector: providerDetector,
+                onUse: {
+                    applyTemplate(template)
+                    previewTemplate = nil
+                }
+            )
+        }
+    }
+
+    // MARK: - Phase 2 Creation Mode Selector
+
+    private var creationModeSelector: some View {
+        HStack(spacing: 20) {
+            // Spec §6.1 asks for a radio group. We use SwiftUI Picker with
+            // .segmented style for consistency with the codebase (no other
+            // .radioGroup usage in Sources/). Functionally equivalent.
+            Picker("", selection: $creationMode) {
+                Text("New session").tag("new")
+                Text("Resume from previous team").tag("resume")
+            }
+            .pickerStyle(.segmented)
+            .frame(maxWidth: 360)
+            .labelsHidden()
+            .onChange(of: creationMode) { mode in
+                if mode == "resume" {
+                    loadResumableTeams()
+                }
+            }
+            Spacer()
+        }
+    }
+
+    // MARK: - Phase 2 Resume Panel
+
+    @ViewBuilder
+    private var resumePanel: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack {
+                Text("Resumable Teams")
+                    .font(.subheadline.bold())
+                Spacer()
+                Picker("", selection: $resumeFilter) {
+                    Text("This repo").tag("thisRepo")
+                    Text("All").tag("all")
+                }
+                .pickerStyle(.segmented)
+                .frame(width: 180)
+                .labelsHidden()
+                .onChange(of: resumeFilter) { _ in loadResumableTeams() }
+
+                Button {
+                    loadResumableTeams()
+                } label: {
+                    Image(systemName: "arrow.clockwise")
+                }
+                .buttonStyle(.borderless)
+                .help("Refresh list")
+                .disabled(isLoadingResumable)
+            }
+
+            if isLoadingResumable {
+                HStack(spacing: 8) {
+                    ProgressView().controlSize(.small)
+                    Text("Loading…").font(.caption).foregroundStyle(.secondary)
+                }
+                .frame(maxWidth: .infinity, alignment: .center)
+                .padding(.vertical, 40)
+            } else if let err = resumeLoadError {
+                VStack(spacing: 8) {
+                    Image(systemName: "exclamationmark.triangle.fill")
+                        .foregroundStyle(.yellow)
+                    Text("Failed to load resumable teams")
+                        .font(.subheadline)
+                    Text(err)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .multilineTextAlignment(.center)
+                }
+                .frame(maxWidth: .infinity, alignment: .center)
+                .padding(.vertical, 30)
+            } else if resumableTeams.isEmpty {
+                VStack(spacing: 8) {
+                    Image(systemName: "tray")
+                        .font(.title2)
+                        .foregroundStyle(.tertiary)
+                    Text(resumeFilter == "thisRepo"
+                         ? "No resumable teams found for this repo."
+                         : "No resumable teams found.")
+                        .font(.subheadline)
+                        .foregroundStyle(.secondary)
+                    Text("Teams appear here after they are destroyed and within the retention window.")
+                        .font(.caption)
+                        .foregroundStyle(.tertiary)
+                        .multilineTextAlignment(.center)
+                }
+                .frame(maxWidth: .infinity, alignment: .center)
+                .padding(.vertical, 30)
+            } else {
+                LazyVStack(alignment: .leading, spacing: 8) {
+                    ForEach(resumableTeams) { team in
+                        resumableRow(team)
+                    }
+                }
+            }
+
+            if let msg = resumeErrorMessage {
+                HStack(spacing: 4) {
+                    Image(systemName: "exclamationmark.octagon.fill")
+                        .foregroundStyle(.red)
+                    Text(msg)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(3)
+                }
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func resumableRow(_ team: ResumableTeam) -> some View {
+        let isSelected = selectedResumeTeamId == team.teamUuid
+        let disabledReason = team.disabledReason
+        let isDisabled = disabledReason != nil
+        let isExpanded = expandedResumeAgentTeams.contains(team.teamUuid)
+
+        VStack(alignment: .leading, spacing: 6) {
+            // Row 1: team name + agent count
+            HStack {
+                Text(team.teamName)
+                    .font(.headline)
+                    .foregroundStyle(isDisabled ? .secondary : .primary)
+                Spacer()
+                Text("\(team.agents.count) agent\(team.agents.count == 1 ? "" : "s")")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .padding(.horizontal, 6)
+                    .padding(.vertical, 2)
+                    .background(Capsule().fill(.quaternary))
+            }
+
+            // Row 2: destroyed-relative + working directory
+            HStack(spacing: 6) {
+                Image(systemName: "clock.arrow.circlepath")
+                    .font(.caption2)
+                    .foregroundStyle(.tertiary)
+                Text("destroyed \(team.destroyedRelative)")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                Text("•")
+                    .font(.caption)
+                    .foregroundStyle(.tertiary)
+                Text(shortenedHome(team.workingDirectory))
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+            }
+
+            // Row 3: worktree + branch indicator (when present)
+            if let wt = team.worktree {
+                HStack(spacing: 6) {
+                    Image(systemName: "arrow.triangle.branch")
+                        .font(.caption2)
+                        .foregroundStyle(.tertiary)
+                    Text("worktree: \(wt.branch) @ \(shortenedHome(wt.path))")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                    Spacer(minLength: 6)
+                    if let drift = team.branchDrift {
+                        Text("⚠ branch was \(drift.from) → now \(drift.to)")
+                            .font(.caption2)
+                            .foregroundStyle(.orange)
+                    } else if team.validity.branchMatches {
+                        Image(systemName: "checkmark.circle.fill")
+                            .font(.caption2)
+                            .foregroundStyle(.green)
+                            .help("Branch matches creation state")
+                    }
+                }
+            }
+
+            // Optional warnings (runbook drift, CLI version drift) — non-blocking
+            if !team.validity.runbookMatches {
+                HStack(spacing: 4) {
+                    Image(systemName: "book.closed")
+                        .font(.caption2)
+                        .foregroundStyle(.orange)
+                    Text("Runbook has changed since creation — resume will use the original instructions.")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                }
+            }
+            if !team.validity.cliVersionMatches {
+                HStack(spacing: 4) {
+                    Image(systemName: "terminal")
+                        .font(.caption2)
+                        .foregroundStyle(.orange)
+                    Text("Claude CLI version differs from creation — resume may fail.")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                }
+            }
+
+            // Disclosure: per-agent rows
+            DisclosureGroup(isExpanded: Binding(
+                get: { isExpanded },
+                set: { open in
+                    if open { expandedResumeAgentTeams.insert(team.teamUuid) }
+                    else { expandedResumeAgentTeams.remove(team.teamUuid) }
+                }
+            )) {
+                VStack(alignment: .leading, spacing: 3) {
+                    ForEach(team.agents) { agent in
+                        HStack(spacing: 6) {
+                            Circle()
+                                .fill(agentColor(agent.color))
+                                .frame(width: 8, height: 8)
+                            Text(agent.name)
+                                .font(.caption)
+                            Text("(\(agent.cli), \(agent.model))")
+                                .font(.caption2)
+                                .foregroundStyle(.tertiary)
+                            Spacer()
+                            if agent.hasSession && agent.hasInstructions {
+                                Image(systemName: "checkmark.circle.fill")
+                                    .font(.caption2)
+                                    .foregroundStyle(.green)
+                            } else {
+                                Image(systemName: "xmark.circle.fill")
+                                    .font(.caption2)
+                                    .foregroundStyle(.red)
+                                    .help(agent.hasSession
+                                          ? "Instructions missing"
+                                          : "No session — cannot resume")
+                            }
+                        }
+                    }
+                }
+                .padding(.top, 4)
+            } label: {
+                Text("Agents")
+                    .font(.caption.bold())
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .padding(10)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(
+            RoundedRectangle(cornerRadius: 8)
+                .fill(isSelected ? Color.accentColor.opacity(0.10) : Color(nsColor: .controlBackgroundColor))
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 8)
+                .stroke(isSelected ? Color.accentColor : Color.secondary.opacity(0.2),
+                        lineWidth: isSelected ? 2 : 1)
+        )
+        .opacity(isDisabled ? 0.55 : 1.0)
+        .contentShape(Rectangle())
+        .onTapGesture {
+            guard !isDisabled else { return }
+            selectedResumeTeamId = team.teamUuid
+        }
+        .help(disabledReason ?? "")
+    }
+
+    /// Replace a leading $HOME with `~` for display.
+    private func shortenedHome(_ path: String) -> String {
+        let home = FileManager.default.homeDirectoryForCurrentUser.path
+        if path.hasPrefix(home) {
+            return "~" + path.dropFirst(home.count)
+        }
+        return path
+    }
+
+    // MARK: - Phase 2 Resume RPC
+
+    private func loadResumableTeams() {
+        isLoadingResumable = true
+        resumeLoadError = nil
+        let filterRoot: String? = (resumeFilter == "thisRepo") ? currentGitRoot() : nil
+        var params: [String: Any] = ["limit": 50]
+        if let root = filterRoot { params["git_root"] = root }
+
+        DispatchQueue.global(qos: .userInitiated).async {
+            let raw = TermMeshDaemon.shared.rpcCallRaw(
+                method: "headless.list_resumable",
+                params: params
+            )
+            var decoded: [ResumableTeam] = []
+            var loadError: String?
+            if let raw, let data = raw.data(using: .utf8),
+               let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+                if let errMsg = obj["error"] as? String {
+                    loadError = errMsg
+                } else if let result = obj["result"] as? [String: Any],
+                          let teams = result["teams"] as? [[String: Any]] {
+                    decoded = teams.compactMap { ResumableTeam.decode($0) }
+                } else if let teams = obj["teams"] as? [[String: Any]] {
+                    // Tolerate bare-result shape (no JSON-RPC envelope).
+                    decoded = teams.compactMap { ResumableTeam.decode($0) }
+                }
+            } else if raw == nil {
+                // Daemon not reachable or RPC timed out — surface as empty list
+                // with a soft error so the panel does not break.
+                loadError = "Daemon did not respond. Make sure term-meshd is running."
+            }
+            DispatchQueue.main.async {
+                resumableTeams = decoded
+                resumeLoadError = loadError
+                isLoadingResumable = false
+                // Drop selection if no longer in list
+                if let sel = selectedResumeTeamId,
+                   !decoded.contains(where: { $0.teamUuid == sel }) {
+                    selectedResumeTeamId = nil
+                }
+            }
+        }
+    }
+
+    /// Best-effort git root resolution for the current workspace cwd. Uses
+    /// the daemon helper (no main-thread focus side effects) so we share the
+    /// same realpath logic the daemon uses for list_resumable filtering.
+    private func currentGitRoot() -> String? {
+        let cwd = resolveWorkingDirectory()
+        return TermMeshDaemon.shared.findGitRoot(from: cwd)
+    }
+
+    /// Invoke `headless.resume_team`. On success, calls `onResume` with the
+    /// decoded result dictionary and dismisses the sheet. On error, surfaces
+    /// the message inline (panel stays open).
+    private func invokeResume(team: ResumableTeam, acceptBranchDrift: Bool = false) {
+        guard !resumeInFlight else { return }
+        resumeInFlight = true
+        resumeErrorMessage = nil
+
+        let leaderSessionId = UUID().uuidString
+        let params: [String: Any] = [
+            "team_uuid": team.teamUuid,
+            "leader_session_id": leaderSessionId,
+            "app_socket_path": SocketControlSettings.socketPath(),
+            "accept_branch_drift": acceptBranchDrift,
+        ]
+
+        DispatchQueue.global(qos: .userInitiated).async {
+            let raw = TermMeshDaemon.shared.rpcCallRaw(
+                method: "headless.resume_team",
+                params: params
+            )
+            var resultDict: [String: Any]?
+            var errMsg: String?
+            if let raw, let data = raw.data(using: .utf8),
+               let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+                if let e = obj["error"] as? String {
+                    errMsg = e
+                } else if let r = obj["result"] as? [String: Any] {
+                    resultDict = r
+                } else {
+                    // Tolerate bare result
+                    resultDict = obj
+                }
+            } else if raw == nil {
+                errMsg = "Daemon did not respond. Make sure term-meshd is running."
+            } else {
+                errMsg = "Unexpected response from daemon."
+            }
+            DispatchQueue.main.async {
+                resumeInFlight = false
+                if let errMsg {
+                    resumeErrorMessage = errMsg
+                    return
+                }
+                if let resultDict {
+                    onResume?(resultDict)
+                    dismiss()
+                }
+            }
         }
     }
 
@@ -257,19 +864,19 @@ struct TeamCreationView: View {
 
             // Load saved template
             Menu {
-                if templateManager.templates.isEmpty {
+                if savedTemplateManager.templates.isEmpty {
                     Text("No saved templates").foregroundStyle(.secondary)
                 } else {
-                    ForEach(templateManager.templates) { template in
+                    ForEach(savedTemplateManager.templates) { template in
                         Button(action: { loadTemplate(template) }) {
                             Text("\(template.name) (\(template.agents.count) agents)")
                         }
                     }
                     Divider()
                     Menu("Delete…") {
-                        ForEach(templateManager.templates) { template in
+                        ForEach(savedTemplateManager.templates) { template in
                             Button(template.name, role: .destructive) {
-                                templateManager.delete(template)
+                                savedTemplateManager.delete(template)
                             }
                         }
                     }
@@ -278,8 +885,8 @@ struct TeamCreationView: View {
                 HStack(spacing: 4) {
                     Image(systemName: "folder")
                     Text("Load")
-                    if !templateManager.templates.isEmpty {
-                        Text("(\(templateManager.templates.count))")
+                    if !savedTemplateManager.templates.isEmpty {
+                        Text("(\(savedTemplateManager.templates.count))")
                             .foregroundStyle(.secondary)
                     }
                 }
@@ -357,6 +964,7 @@ struct TeamCreationView: View {
                         if newMode != "repl" && AgentRolePreset.models(for: oldMode) != AgentRolePreset.models(for: newMode) {
                             leaderModel = AgentRolePreset.defaultModel(for: newMode)
                         }
+                        persistSelectedSmartPresetOverride()
                     }
                 )) {
                     Text("REPL (Manual)").tag("repl")
@@ -628,6 +1236,7 @@ struct TeamCreationView: View {
             }
             .onMove { source, destination in
                 agents.move(fromOffsets: source, toOffset: destination)
+                persistSelectedSmartPresetOverride()
             }
 
             Button(action: addAgent) {
@@ -669,6 +1278,7 @@ struct TeamCreationView: View {
                         if let preset = presetManager.presets.first(where: { $0.id == newId }) {
                             agents[index].preset = preset
                             agents[index].customInstructions = ""
+                            persistSelectedSmartPresetOverride()
                         }
                     }
                 )) {
@@ -689,6 +1299,7 @@ struct TeamCreationView: View {
                         if AgentRolePreset.models(for: oldCli) != AgentRolePreset.models(for: newCli) {
                             agents[index].preset.model = AgentRolePreset.defaultModel(for: newCli)
                         }
+                        persistSelectedSmartPresetOverride()
                     }
                 )) {
                     ForEach(AgentRolePreset.supportedCLIs, id: \.self) { cli in
@@ -700,7 +1311,10 @@ struct TeamCreationView: View {
                 // Model picker — shows CLI-appropriate models
                 Picker("", selection: Binding(
                     get: { agent.preset.model },
-                    set: { agents[index].preset.model = $0 }
+                    set: {
+                        agents[index].preset.model = $0
+                        persistSelectedSmartPresetOverride()
+                    }
                 )) {
                     ForEach(AgentRolePreset.models(for: agent.preset.cli), id: \.self) { m in
                         Text(AgentRolePreset.modelDisplayLabel(m, for: agent.preset.cli)).tag(m)
@@ -743,7 +1357,10 @@ struct TeamCreationView: View {
                 Spacer()
 
                 // Remove button
-                Button(action: { agents.remove(at: index) }) {
+                Button(action: {
+                    agents.remove(at: index)
+                    persistSelectedSmartPresetOverride()
+                }) {
                     Image(systemName: "minus.circle")
                         .foregroundStyle(.red.opacity(0.7))
                 }
@@ -769,7 +1386,10 @@ struct TeamCreationView: View {
                                     ? agent.preset.instructions
                                     : agent.customInstructions
                             },
-                            set: { agents[index].customInstructions = $0 }
+                            set: {
+                                agents[index].customInstructions = $0
+                                persistSelectedSmartPresetOverride()
+                            }
                         ))
                         .font(.system(.caption, design: .monospaced))
                         .frame(height: 80)
@@ -781,6 +1401,7 @@ struct TeamCreationView: View {
                     if isCustomized {
                         Button(action: {
                             agents[index].customInstructions = ""
+                            persistSelectedSmartPresetOverride()
                         }) {
                             Label("Reset to default", systemImage: "arrow.counterclockwise")
                                 .font(.caption2)
@@ -821,26 +1442,6 @@ struct TeamCreationView: View {
 
     // MARK: - Quick Presets (legacy, simple role-only)
 
-    /// Named team preset: a display name + list of role names to compose.
-    private struct TeamPreset {
-        let name: String
-        let icon: String
-        let roles: [String]
-    }
-
-    private static let teamPresets: [TeamPreset] = [
-        TeamPreset(name: "2 Agents", icon: "person.2", roles: ["explorer", "executor"]),
-        TeamPreset(name: "3 Agents", icon: "person.3", roles: ["explorer", "executor", "reviewer"]),
-        TeamPreset(name: "Debug Squad", icon: "ladybug", roles: ["debugger", "tester", "explorer"]),
-        TeamPreset(name: "Deep Search", icon: "magnifyingglass", roles: ["explorer", "researcher", "architect"]),
-        TeamPreset(name: "Ship It", icon: "shippingbox", roles: ["executor", "tester", "writer", "devops"]),
-        TeamPreset(name: "Super Team", icon: "star.circle", roles: [
-            "planner", "architect", "explorer",
-            "executor", "frontend", "backend",
-            "tester", "reviewer", "security", "writer"
-        ]),
-    ]
-
     private var workflowButtons: some View {
         VStack(alignment: .leading, spacing: 8) {
             Text("Workflow Presets")
@@ -851,7 +1452,7 @@ struct TeamCreationView: View {
                 GridItem(.adaptive(minimum: 120), spacing: 6)
             ], spacing: 6) {
                 ForEach(WorkflowPresetDefinition.builtIn, id: \.name) { preset in
-                    Button(action: { applyWorkflowPreset(preset) }) {
+                    Button(action: { showPreview(for: TemplateID(category: .workflow, slug: preset.id)) }) {
                         HStack(spacing: 6) {
                             Image(systemName: preset.icon)
                                 .font(.caption)
@@ -935,8 +1536,8 @@ struct TeamCreationView: View {
                 LazyVGrid(columns: [
                     GridItem(.adaptive(minimum: 100), spacing: 6)
                 ], spacing: 6) {
-                    ForEach(Self.teamPresets, id: \.name) { preset in
-                        Button(action: { applyTeamPreset(preset) }) {
+                    ForEach(TeamPreset.builtIn, id: \.name) { preset in
+                        Button(action: { showPreview(for: TemplateID(category: .quick, slug: preset.slug)) }) {
                             HStack(spacing: 4) {
                                 Image(systemName: preset.icon)
                                     .font(.caption2)
@@ -954,83 +1555,101 @@ struct TeamCreationView: View {
     }
 
     private func smartPresetCard(_ preset: SmartTeamPreset) -> some View {
-        let resolved = preset.resolve(with: providerDetector)
+        let templateId = TemplateID(category: .smart, slug: preset.id)
+        let displayPreset: SmartTeamPreset
+        if case .smart(let overridePreset) = teamTemplateManager.effectivePayload(for: templateId) {
+            displayPreset = overridePreset
+        } else {
+            displayPreset = preset
+        }
+        let resolved = displayPreset.resolve(with: providerDetector)
         let bestCount = resolved.filter { $0.status == .best }.count
         let fbCount = resolved.filter { if case .fallback = $0.status { return true }; return false }.count
         let isSelected = selectedSmartPresetId == preset.id
+        let isOverridden = teamTemplateManager.isOverridden(templateId)
 
-        return Button(action: { applySmartPreset(preset) }) {
-            VStack(alignment: .leading, spacing: 6) {
-                HStack {
-                    Image(systemName: preset.icon)
-                        .font(.subheadline)
-                    Text(preset.name)
-                        .font(.subheadline.bold())
-                    Spacer()
-                    Text("\(resolved.count)")
-                        .font(.caption2)
-                        .foregroundStyle(.secondary)
-                        .padding(.horizontal, 5)
-                        .padding(.vertical, 1)
-                        .background(Capsule().fill(.quaternary))
-                }
-
-                Text(preset.description)
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
-
-                // Resolved agents preview
-                HStack(spacing: 4) {
-                    ForEach(Array(resolved.enumerated()), id: \.offset) { _, agent in
-                        HStack(spacing: 2) {
-                            Text(agent.role)
-                                .font(.system(size: 9, design: .monospaced))
-                            if agent.status == .best {
-                                Text("\u{26A1}")
-                                    .font(.system(size: 8))
-                            } else if case .fallback = agent.status {
-                                Text("\u{21A9}")
-                                    .font(.system(size: 8))
-                            }
+        return VStack(alignment: .leading, spacing: 6) {
+            HStack {
+                Image(systemName: displayPreset.icon)
+                    .font(.subheadline)
+                Text(displayPreset.name)
+                    .font(.subheadline.bold())
+                if isOverridden {
+                    ModifiedPresetBadgeButton {
+                        teamTemplateManager.resetOverride(for: templateId)
+                        if selectedSmartPresetId == preset.id {
+                            applySmartPreset(preset)
                         }
-                        .padding(.horizontal, 4)
-                        .padding(.vertical, 1)
-                        .background(
-                            RoundedRectangle(cornerRadius: 3)
-                                .fill(badgeBackground(agent.status))
-                        )
                     }
                 }
+                Spacer()
+                Text("\(resolved.count)")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .padding(.horizontal, 5)
+                    .padding(.vertical, 1)
+                    .background(Capsule().fill(.quaternary))
+            }
 
-                // Status line
-                if bestCount > 0 || fbCount > 0 {
-                    HStack(spacing: 8) {
-                        if bestCount > 0 {
-                            HStack(spacing: 2) {
-                                Text("\u{26A1}")
-                                    .font(.system(size: 8))
-                                Text("\(bestCount) optimal")
-                                    .font(.system(size: 9))
-                                    .foregroundStyle(.green)
-                            }
+            Text(displayPreset.description)
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+
+            // Resolved agents preview
+            HStack(spacing: 4) {
+                ForEach(Array(resolved.enumerated()), id: \.offset) { _, agent in
+                    HStack(spacing: 2) {
+                        Text(agent.role)
+                            .font(.system(size: 9, design: .monospaced))
+                        if agent.status == .best {
+                            Text("\u{26A1}")
+                                .font(.system(size: 8))
+                        } else if case .fallback = agent.status {
+                            Text("\u{21A9}")
+                                .font(.system(size: 8))
                         }
-                        if fbCount > 0 {
-                            HStack(spacing: 2) {
-                                Text("\u{21A9}")
-                                    .font(.system(size: 8))
-                                Text("\(fbCount) fallback")
-                                    .font(.system(size: 9))
-                                    .foregroundStyle(.orange)
-                            }
+                    }
+                    .padding(.horizontal, 4)
+                    .padding(.vertical, 1)
+                    .background(
+                        RoundedRectangle(cornerRadius: 3)
+                            .fill(badgeBackground(agent.status))
+                    )
+                }
+            }
+
+            // Status line
+            if bestCount > 0 || fbCount > 0 {
+                HStack(spacing: 8) {
+                    if bestCount > 0 {
+                        HStack(spacing: 2) {
+                            Text("\u{26A1}")
+                                .font(.system(size: 8))
+                            Text("\(bestCount) optimal")
+                                .font(.system(size: 9))
+                                .foregroundStyle(.green)
+                        }
+                    }
+                    if fbCount > 0 {
+                        HStack(spacing: 2) {
+                            Text("\u{21A9}")
+                                .font(.system(size: 8))
+                            Text("\(fbCount) fallback")
+                                .font(.system(size: 9))
+                                .foregroundStyle(.orange)
                         }
                     }
                 }
             }
-            .padding(10)
-            .frame(maxWidth: .infinity, alignment: .leading)
         }
-        .buttonStyle(.plain)
+        .padding(10)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .contentShape(Rectangle())
+        .onTapGesture {
+            applySmartPreset(displayPreset)
+        }
+        .accessibilityAddTraits(.isButton)
         .background(
             RoundedRectangle(cornerRadius: 8)
                 .fill(isSelected ? Color.accentColor.opacity(0.12) : Color(nsColor: .controlBackgroundColor))
@@ -1049,40 +1668,112 @@ struct TeamCreationView: View {
         }
     }
 
+    private struct ModifiedPresetBadgeButton: View {
+        let action: () -> Void
+        @State private var isHovered = false
+
+        var body: some View {
+            Button(action: action) {
+                HStack(spacing: 3) {
+                    Text("Modified")
+                    Image(systemName: "arrow.counterclockwise")
+                        .font(.system(size: 8, weight: .semibold))
+                }
+                .font(.system(size: 9, weight: .medium))
+                .foregroundStyle(isHovered ? Color.orange : Color.orange.opacity(0.86))
+                .padding(.horizontal, 5)
+                .padding(.vertical, 1)
+                .background(Capsule().fill(Color.orange.opacity(isHovered ? 0.18 : 0.12)))
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .help("Reset this preset to its built-in defaults")
+            .onHover { hovering in
+                if hovering && !isHovered {
+                    NSCursor.pointingHand.push()
+                } else if !hovering && isHovered {
+                    NSCursor.pop()
+                }
+                isHovered = hovering
+            }
+            .onDisappear {
+                if isHovered {
+                    NSCursor.pop()
+                    isHovered = false
+                }
+            }
+        }
+    }
+
     // MARK: - Footer
 
     private var footer: some View {
         HStack {
-            Button(action: {
-                saveTemplateName = teamName
-                showSaveTemplate = true
-            }) {
-                Label("Save as Template", systemImage: "square.and.arrow.down")
-                    .font(.caption)
+            if creationMode == "new" {
+                Button(action: {
+                    saveTemplateName = teamName
+                    showSaveTemplate = true
+                }) {
+                    Label("Save as Template", systemImage: "square.and.arrow.down")
+                        .font(.caption)
+                }
+                .buttonStyle(.borderless)
+                .help("Save current configuration as template")
+                .disabled(agents.isEmpty)
             }
-            .buttonStyle(.borderless)
-            .help("Save current configuration as template")
-            .disabled(agents.isEmpty)
+
+            if let smartPresetId = selectedSmartPresetId,
+               teamTemplateManager.isOverridden(TemplateID(category: .smart, slug: smartPresetId)) {
+                Button(action: resetSelectedSmartPresetOverride) {
+                    Label("Reset Preset", systemImage: "arrow.counterclockwise")
+                        .font(.caption)
+                }
+                .buttonStyle(.borderless)
+                .help("Restore the selected preset to its built-in defaults")
+            }
 
             Spacer()
-            if executionMode == "headless" {
-                Label("Headless", systemImage: "terminal")
-                    .font(.caption)
-                    .foregroundStyle(.orange)
-                    .padding(.trailing, 4)
-            }
-            if worktreeMode != "off" {
-                Label(worktreeMode == "shared" ? "Shared Worktree" : "Isolated Worktrees",
-                      systemImage: "arrow.triangle.branch")
-                    .font(.caption)
-                    .foregroundStyle(worktreeMode == "shared" ? .blue : .green)
-                    .padding(.trailing, 4)
+            if creationMode == "new" {
+                if executionMode == "headless" {
+                    Label("Headless", systemImage: "terminal")
+                        .font(.caption)
+                        .foregroundStyle(.orange)
+                        .padding(.trailing, 4)
+                }
+                if worktreeMode != "off" {
+                    Label(worktreeMode == "shared" ? "Shared Worktree" : "Isolated Worktrees",
+                          systemImage: "arrow.triangle.branch")
+                        .font(.caption)
+                        .foregroundStyle(worktreeMode == "shared" ? .blue : .green)
+                        .padding(.trailing, 4)
+                }
+            } else if resumeInFlight {
+                HStack(spacing: 6) {
+                    ProgressView().controlSize(.small)
+                    Text("Resuming…").font(.caption).foregroundStyle(.secondary)
+                }
+                .padding(.trailing, 4)
             }
             Button("Cancel") { dismiss() }
                 .keyboardShortcut(.cancelAction)
-            Button(executionMode == "headless" ? "Create Headless Team" : "Create Team") { createTeam() }
+
+            if creationMode == "resume" {
+                Button("Resume Team") {
+                    guard let id = selectedResumeTeamId,
+                          let team = resumableTeams.first(where: { $0.teamUuid == id }) else { return }
+                    if team.branchDrift != nil {
+                        pendingBranchDriftTeam = team
+                    } else {
+                        invokeResume(team: team, acceptBranchDrift: false)
+                    }
+                }
                 .keyboardShortcut(.defaultAction)
-                .disabled(teamName.isEmpty || agents.isEmpty || isTeamNameDuplicate)
+                .disabled(selectedResumeTeamId == nil || resumeInFlight)
+            } else {
+                Button(executionMode == "headless" ? "Create Headless Team" : "Create Team") { createTeam() }
+                    .keyboardShortcut(.defaultAction)
+                    .disabled(teamName.isEmpty || agents.isEmpty || isTeamNameDuplicate)
+            }
         }
         .padding(.horizontal, 20)
         .padding(.vertical, 12)
@@ -1096,6 +1787,7 @@ struct TeamCreationView: View {
         preset.model = defaultModel
         let row = TeamAgentRow(preset: preset, customInstructions: "")
         agents.append(row)
+        persistSelectedSmartPresetOverride()
     }
 
     private func applyQuickPreset(count: Int) {
@@ -1107,12 +1799,55 @@ struct TeamCreationView: View {
         }
     }
 
+    private func applyInitialPreset() {
+        let initialId = teamTemplateManager.pinnedId ?? teamTemplateManager.lastSelectedId
+        if let initialId,
+           initialId.category == .smart,
+           let template = teamTemplateManager.template(for: initialId),
+           teamTemplateManager.builtInTemplate(for: initialId) != nil {
+            applyTemplate(template)
+        } else {
+            applyQuickPreset(count: 2)
+        }
+    }
+
+    private func showPreview(for id: TemplateID) {
+        previewTemplate = teamTemplateManager.template(for: id)
+    }
+
+    private func applyTemplate(_ template: TeamTemplate) {
+        try? TeamTemplateManager.shared.setLastSelected(id: template.id)
+        let payload = template.origin == .builtIn
+            ? (teamTemplateManager.effectivePayload(for: template.id) ?? template.payload)
+            : template.payload
+        switch payload {
+        case .smart(let preset):
+            applySmartPreset(preset)
+        case .workflow(let preset):
+            applyWorkflowPreset(preset)
+        case .quick(let preset):
+            applyTeamPreset(preset)
+        }
+    }
+
+    private func customizeTemplate(_ template: TeamTemplate) {
+        _ = template
+    }
+
     private func applySmartPreset(_ preset: SmartTeamPreset) {
         let available = presetManager.presets
-        let resolved = preset.resolve(with: providerDetector)
-        selectedSmartPresetId = preset.id
+        let templateId = TemplateID(category: .smart, slug: preset.id)
+        let effectivePreset: SmartTeamPreset
+        if case .smart(let overridePreset) = teamTemplateManager.effectivePayload(for: templateId) {
+            effectivePreset = overridePreset
+        } else {
+            effectivePreset = preset
+        }
+        let resolved = effectivePreset.resolve(with: providerDetector)
+        selectedSmartPresetId = effectivePreset.id
         selectedWorkflowName = nil
-        leaderMode = preset.leaderMode
+        leaderMode = effectivePreset.leaderMode
+        try? TeamTemplateManager.shared.setLastSelected(id: templateId)
 
         agents = resolved.compactMap { agent in
             guard var rolePreset = available.first(where: { $0.name == agent.role })
@@ -1133,7 +1868,7 @@ struct TeamCreationView: View {
         }
 
         if teamName == "my-team" || teamName.isEmpty {
-            teamName = preset.id
+            teamName = effectivePreset.id
         }
         syncBulkFromAgents()
     }
@@ -1142,6 +1877,7 @@ struct TeamCreationView: View {
         let available = presetManager.presets
         selectedWorkflowName = nil
         selectedSmartPresetId = nil
+        try? TeamTemplateManager.shared.setLastSelected(id: TemplateID(category: .quick, slug: preset.slug))
         agents = preset.roles.compactMap { roleName in
             guard var p = available.first(where: { $0.name == roleName })
                     ?? available.first else { return nil as TeamAgentRow? }
@@ -1156,6 +1892,7 @@ struct TeamCreationView: View {
         selectedWorkflowName = preset.name
         selectedSmartPresetId = nil
         leaderMode = preset.leaderMode
+        try? TeamTemplateManager.shared.setLastSelected(id: TemplateID(category: .workflow, slug: preset.id))
         agents = preset.roles.compactMap { roleName in
             guard var p = available.first(where: { $0.name == roleName })
                     ?? available.first else { return nil as TeamAgentRow? }
@@ -1172,18 +1909,18 @@ struct TeamCreationView: View {
     private func saveCurrentAsTemplate() {
         guard !saveTemplateName.isEmpty, !agents.isEmpty else { return }
         let slots = agents.map { row in
-            TeamTemplate.AgentSlot(
+            SavedTeamTemplate.AgentSlot(
                 roleName: row.preset.name,
                 cli: row.preset.cli,
                 model: row.preset.model,
                 customInstructions: row.customInstructions
             )
         }
-        let template = TeamTemplate(name: saveTemplateName, leaderMode: leaderMode, agents: slots)
-        templateManager.add(template)
+        let template = SavedTeamTemplate(name: saveTemplateName, leaderMode: leaderMode, agents: slots)
+        savedTemplateManager.add(template)
     }
 
-    private func loadTemplate(_ template: TeamTemplate) {
+    private func loadTemplate(_ template: SavedTeamTemplate) {
         teamName = template.name
         leaderMode = template.leaderMode
         let available = presetManager.presets
@@ -1203,6 +1940,7 @@ struct TeamCreationView: View {
         for i in agents.indices {
             agents[i].preset.cli = leaderMode
         }
+        persistSelectedSmartPresetOverride()
     }
 
     private func applyModelToAll() {
@@ -1211,6 +1949,7 @@ struct TeamCreationView: View {
             agents[i].preset.model = bulkModel
             agents[i].providerBadge = .none
         }
+        persistSelectedSmartPresetOverride()
     }
 
     private func applyMaxCost() {
@@ -1218,6 +1957,7 @@ struct TeamCreationView: View {
             agents[i].preset.model = "opus"
             agents[i].providerBadge = .none
         }
+        persistSelectedSmartPresetOverride()
     }
 
     private func applyMinCost() {
@@ -1225,6 +1965,7 @@ struct TeamCreationView: View {
             agents[i].preset.model = "haiku"
             agents[i].providerBadge = .none
         }
+        persistSelectedSmartPresetOverride()
     }
 
     private func applyBalanced() {
@@ -1236,7 +1977,43 @@ struct TeamCreationView: View {
                 agents[i].preset.model = "sonnet"
                 agents[i].providerBadge = .none
             }
+            persistSelectedSmartPresetOverride()
         }
+    }
+
+    private func resetSelectedSmartPresetOverride() {
+        guard let smartPresetId = selectedSmartPresetId else { return }
+        let templateId = TemplateID(category: .smart, slug: smartPresetId)
+        TeamTemplateManager.shared.resetOverride(for: templateId)
+        guard case .smart(let preset) = teamTemplateManager.builtInTemplate(for: templateId)?.payload else { return }
+        applySmartPreset(preset)
+    }
+
+    private func persistSelectedSmartPresetOverride() {
+        guard let smartPresetId = selectedSmartPresetId,
+              let payload = currentSmartPresetPayload(for: smartPresetId) else { return }
+        TeamTemplateManager.shared.saveOverride(
+            for: TemplateID(category: .smart, slug: smartPresetId),
+            payload: .smart(payload)
+        )
+    }
+
+    private func currentSmartPresetPayload(for presetId: String) -> SmartTeamPreset? {
+        guard case .smart(var preset) = teamTemplateManager.builtInTemplate(
+            for: TemplateID(category: .smart, slug: presetId)
+        )?.payload else { return nil }
+        preset.leaderMode = leaderMode
+        preset.agents = agents.map { row in
+            ProviderPreference(
+                role: row.preset.name,
+                primaryCli: row.preset.cli,
+                primaryModel: row.preset.model,
+                fallbackCli: row.preset.cli,
+                fallbackModel: row.preset.model,
+                reason: "Inline override"
+            )
+        }
+        return preset
     }
 
     private func syncBulkFromAgents() {
@@ -1381,6 +2158,517 @@ struct TeamCreationView: View {
         case "cyan":    return .cyan
         case "magenta": return .purple
         default:        return .gray
+        }
+    }
+}
+
+private struct TeamTemplatePreviewPanel: View {
+    let template: TeamTemplate
+    @ObservedObject var providerDetector: ProviderDetector
+    let onUse: () -> Void
+    @Environment(\.dismiss) private var dismiss
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            HStack(alignment: .top, spacing: 12) {
+                Image(systemName: template.previewIcon)
+                    .font(.title2)
+                    .frame(width: 28)
+                VStack(alignment: .leading, spacing: 4) {
+                    HStack(spacing: 8) {
+                        Text(template.name)
+                            .font(.headline)
+                        originBadge
+                    }
+                    Text(template.previewDescription)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                Spacer()
+            }
+
+            Divider()
+
+            VStack(alignment: .leading, spacing: 10) {
+                previewRow(label: "Roles", value: template.previewRoles.joined(separator: ", "))
+                previewRow(label: "Instructions excerpt", value: template.instructionsExcerpt)
+                previewRow(label: "Best-model Fallback", value: template.hasBestModelFallback ? "Enabled" : "Disabled")
+                previewRow(label: "Provider", value: "Claude API")
+            }
+
+            Spacer(minLength: 0)
+
+            HStack {
+                Button("Cancel") {
+                    dismiss()
+                }
+                Spacer()
+                Button("Use this preset", action: onUse)
+                    .buttonStyle(.borderedProminent)
+            }
+        }
+        .padding(20)
+        .frame(width: 480, height: 340)
+    }
+
+    private var originBadge: some View {
+        Text(template.origin == .builtIn ? "기본 제공" : "사용자 정의")
+            .font(.system(size: 10, weight: .medium))
+            .foregroundStyle(.secondary)
+            .padding(.horizontal, 6)
+            .padding(.vertical, 2)
+            .background(Capsule().fill(.quaternary.opacity(0.65)))
+    }
+
+    private func previewRow(label: String, value: String) -> some View {
+        VStack(alignment: .leading, spacing: 3) {
+            Text(label)
+                .font(.caption.bold())
+                .foregroundStyle(.secondary)
+            Text(value.isEmpty ? "None" : value)
+                .font(.caption)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+}
+
+struct TeamTemplateEditorView: View {
+    @ObservedObject private var manager = TeamTemplateManager.shared
+    let templateId: TemplateID
+    @Environment(\.dismiss) private var dismiss
+    @FocusState private var nameFocused: Bool
+    @State private var draft: TeamTemplate?
+    @State private var hoveredField: TeamTemplateField?
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            if let draft {
+                HStack {
+                    Text("Customize")
+                        .font(.headline)
+                    Spacer()
+                    Button("Done") {
+                        dismiss()
+                    }
+                    .buttonStyle(.borderedProminent)
+                }
+                VStack(alignment: .leading, spacing: 12) {
+                    editableField(.name, title: "Name", draft: draft) {
+                        TextField("Preset name", text: nameBinding)
+                            .textFieldStyle(.roundedBorder)
+                            .focused($nameFocused)
+                    }
+                    payloadFields(for: draft)
+                }
+                Divider()
+                localOverrideInspector(for: draft)
+                HStack {
+                    Spacer()
+                }
+            } else {
+                Text("Preset not found")
+                    .font(.headline)
+                Button("Close") {
+                    dismiss()
+                }
+            }
+        }
+        .padding(20)
+        .frame(width: 520)
+        .onAppear {
+            draft = manager.template(for: templateId)
+            DispatchQueue.main.async {
+                nameFocused = true
+            }
+        }
+    }
+
+    private var nameBinding: Binding<String> {
+        Binding(
+            get: { draft?.name ?? "" },
+            set: { draft?.name = $0 }
+        )
+    }
+
+    @ViewBuilder
+    private func payloadFields(for draft: TeamTemplate) -> some View {
+        switch draft.payload {
+        case .smart:
+            editableField(.description, title: "Description", draft: draft) {
+                TextField("Description", text: smartDescriptionBinding)
+                    .textFieldStyle(.roundedBorder)
+            }
+            editableField(.leaderMode, title: "Leader Mode", draft: draft) {
+                leaderModePicker
+            }
+            editableField(.agents, title: "Roles", draft: draft) {
+                TextField("Roles", text: smartRolesBinding)
+                    .textFieldStyle(.roundedBorder)
+            }
+        case .workflow:
+            editableField(.leaderMode, title: "Leader Mode", draft: draft) {
+                leaderModePicker
+            }
+            editableField(.roles, title: "Roles", draft: draft) {
+                TextField("Roles", text: workflowRolesBinding)
+                    .textFieldStyle(.roundedBorder)
+            }
+            editableField(.taskTemplates, title: "Task Templates", draft: draft) {
+                TextField("Task Templates", text: workflowTaskTemplatesBinding)
+                    .textFieldStyle(.roundedBorder)
+            }
+            editableField(.reviewCheckpoints, title: "Review Checkpoints", draft: draft) {
+                TextField("Review Checkpoints", text: workflowReviewCheckpointsBinding)
+                    .textFieldStyle(.roundedBorder)
+            }
+        case .quick:
+            editableField(.roles, title: "Roles", draft: draft) {
+                TextField("Roles", text: quickRolesBinding)
+                    .textFieldStyle(.roundedBorder)
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func editableField<Content: View>(
+        _ field: TeamTemplateField,
+        title: String,
+        draft: TeamTemplate,
+        @ViewBuilder content: () -> Content
+    ) -> some View {
+        let modified = modifiedFields(for: draft).contains(field)
+        VStack(alignment: .leading, spacing: 5) {
+            HStack(spacing: 6) {
+                Circle()
+                    .fill(modified ? Color.blue : Color.clear)
+                    .frame(width: 7, height: 7)
+                Text(title)
+                    .font(.caption.bold())
+                    .foregroundStyle(.secondary)
+                Spacer()
+                if modified && hoveredField == field {
+                    Button("↺") {
+                        reset(field)
+                    }
+                    .buttonStyle(.borderless)
+                    .help("Reset this field to default")
+                }
+            }
+            content()
+        }
+        .onHover { inside in
+            hoveredField = inside ? field : nil
+        }
+    }
+
+    private var leaderModePicker: some View {
+        Picker("", selection: leaderModeBinding) {
+            Text("REPL").tag("repl")
+            Text("Claude").tag("claude")
+        }
+        .labelsHidden()
+        .pickerStyle(.segmented)
+    }
+
+    private func localOverrideInspector(for draft: TeamTemplate) -> some View {
+        let fields = modifiedFields(for: draft)
+        return VStack(alignment: .leading, spacing: 8) {
+            Text("Local Customizations")
+                .font(.caption.bold())
+                .foregroundStyle(.secondary)
+            if fields.isEmpty {
+                Text("No customizations yet")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            } else {
+                ForEach(fields, id: \.self) { field in
+                    HStack(spacing: 6) {
+                        Circle()
+                            .fill(Color.blue)
+                            .frame(width: 6, height: 6)
+                        Text(field.displayName)
+                            .font(.caption)
+                    }
+                }
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    private func modifiedFields(for template: TeamTemplate) -> [TeamTemplateField] {
+        guard let parentId = template.parentBuiltInId,
+              let parent = manager.builtInTemplate(for: parentId) else {
+            return []
+        }
+        return template.modifiedFields(comparedTo: parent)
+    }
+
+    private func reset(_ field: TeamTemplateField) {
+        try? manager.resetField(id: templateId, field: field)
+        draft = manager.template(for: templateId)
+    }
+
+    private func updateDraft(_ mutate: (inout TeamTemplate) -> Void) {
+        guard var updated = draft else { return }
+        mutate(&updated)
+        draft = updated
+        try? manager.updateCustom(updated)
+    }
+
+    private var leaderModeBinding: Binding<String> {
+        Binding(
+            get: {
+                switch draft?.payload {
+                case .smart(let preset):
+                    return preset.leaderMode
+                case .workflow(let preset):
+                    return preset.leaderMode
+                default:
+                    return "claude"
+                }
+            },
+            set: { value in
+                updateDraft { template in
+                    switch template.payload {
+                    case .smart(var preset):
+                        preset.leaderMode = value
+                        template.payload = .smart(preset)
+                    case .workflow(var preset):
+                        preset.leaderMode = value
+                        template.payload = .workflow(preset)
+                    default:
+                        break
+                    }
+                }
+            }
+        )
+    }
+
+    private var smartDescriptionBinding: Binding<String> {
+        Binding(
+            get: {
+                guard case .smart(let preset) = draft?.payload else { return "" }
+                return preset.description
+            },
+            set: { value in
+                updateDraft { template in
+                    guard case .smart(var preset) = template.payload else { return }
+                    preset.description = value
+                    template.payload = .smart(preset)
+                }
+            }
+        )
+    }
+
+    private var smartRolesBinding: Binding<String> {
+        Binding(
+            get: {
+                guard case .smart(let preset) = draft?.payload else { return "" }
+                return preset.agents.map(\.role).joined(separator: ", ")
+            },
+            set: { value in
+                let roles = splitList(value)
+                updateDraft { template in
+                    guard case .smart(var preset) = template.payload else { return }
+                    preset.agents = roles.enumerated().map { index, role in
+                        var preference = index < preset.agents.count
+                            ? preset.agents[index]
+                            : ProviderPreference(
+                                role: role,
+                                primaryCli: "claude",
+                                primaryModel: "sonnet",
+                                fallbackCli: "claude",
+                                fallbackModel: "sonnet",
+                                reason: "Custom role"
+                            )
+                        preference.role = role
+                        return preference
+                    }
+                    template.payload = .smart(preset)
+                }
+            }
+        )
+    }
+
+    private var workflowRolesBinding: Binding<String> {
+        listBinding(
+            get: {
+                guard case .workflow(let preset) = draft?.payload else { return [] }
+                return preset.roles
+            },
+            set: { roles in
+                updateDraft { template in
+                    guard case .workflow(var preset) = template.payload else { return }
+                    preset.roles = roles
+                    template.payload = .workflow(preset)
+                }
+            }
+        )
+    }
+
+    private var workflowTaskTemplatesBinding: Binding<String> {
+        listBinding(
+            get: {
+                guard case .workflow(let preset) = draft?.payload else { return [] }
+                return preset.taskTemplates
+            },
+            set: { values in
+                updateDraft { template in
+                    guard case .workflow(var preset) = template.payload else { return }
+                    preset.taskTemplates = values
+                    template.payload = .workflow(preset)
+                }
+            }
+        )
+    }
+
+    private var workflowReviewCheckpointsBinding: Binding<String> {
+        listBinding(
+            get: {
+                guard case .workflow(let preset) = draft?.payload else { return [] }
+                return preset.reviewCheckpoints
+            },
+            set: { values in
+                updateDraft { template in
+                    guard case .workflow(var preset) = template.payload else { return }
+                    preset.reviewCheckpoints = values
+                    template.payload = .workflow(preset)
+                }
+            }
+        )
+    }
+
+    private var quickRolesBinding: Binding<String> {
+        listBinding(
+            get: {
+                guard case .quick(let preset) = draft?.payload else { return [] }
+                return preset.roles
+            },
+            set: { roles in
+                updateDraft { template in
+                    guard case .quick(var preset) = template.payload else { return }
+                    preset.roles = roles
+                    template.payload = .quick(preset)
+                }
+            }
+        )
+    }
+
+    private func listBinding(get: @escaping () -> [String], set: @escaping ([String]) -> Void) -> Binding<String> {
+        Binding(
+            get: { get().joined(separator: ", ") },
+            set: { set(splitList($0)) }
+        )
+    }
+
+    private func splitList(_ value: String) -> [String] {
+        value
+            .split { $0 == "," || $0 == "\n" }
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+    }
+}
+
+private extension TeamTemplate {
+    var previewIcon: String {
+        switch payload {
+        case .smart(let preset):
+            return preset.icon
+        case .workflow(let preset):
+            return preset.icon
+        case .quick(let preset):
+            return preset.icon
+        }
+    }
+
+    var previewDescription: String {
+        switch payload {
+        case .smart(let preset):
+            return preset.description
+        case .workflow(let preset):
+            return preset.taskTemplates.joined(separator: " · ")
+        case .quick(let preset):
+            return preset.roles.joined(separator: " · ")
+        }
+    }
+
+    var previewRoles: [String] {
+        switch payload {
+        case .smart(let preset):
+            return preset.agents.map(\.role)
+        case .workflow(let preset):
+            return preset.roles
+        case .quick(let preset):
+            return preset.roles
+        }
+    }
+
+    var instructionsExcerpt: String {
+        switch payload {
+        case .smart(let preset):
+            return preset.agents.prefix(3).map { "\($0.role): \($0.reason)" }.joined(separator: " · ")
+        case .workflow(let preset):
+            return preset.reviewCheckpoints.joined(separator: " · ")
+        case .quick(let preset):
+            return "Uses the selected CLI and model for each role."
+        }
+    }
+
+    var hasBestModelFallback: Bool {
+        if case .smart = payload {
+            return true
+        }
+        return false
+    }
+
+    func modifiedFields(comparedTo parent: TeamTemplate) -> [TeamTemplateField] {
+        var fields: [TeamTemplateField] = []
+        if name != parent.name {
+            fields.append(.name)
+        }
+        switch (payload, parent.payload) {
+        case (.smart(let current), .smart(let original)):
+            if current.icon != original.icon { fields.append(.icon) }
+            if current.description != original.description { fields.append(.description) }
+            if current.leaderMode != original.leaderMode { fields.append(.leaderMode) }
+            if current.agents != original.agents { fields.append(.agents) }
+        case (.workflow(let current), .workflow(let original)):
+            if current.icon != original.icon { fields.append(.icon) }
+            if current.leaderMode != original.leaderMode { fields.append(.leaderMode) }
+            if current.roles != original.roles { fields.append(.roles) }
+            if current.taskTemplates != original.taskTemplates { fields.append(.taskTemplates) }
+            if current.reviewCheckpoints != original.reviewCheckpoints { fields.append(.reviewCheckpoints) }
+        case (.quick(let current), .quick(let original)):
+            if current.icon != original.icon { fields.append(.icon) }
+            if current.roles != original.roles { fields.append(.roles) }
+        default:
+            break
+        }
+        return fields
+    }
+}
+
+private extension TeamTemplateField {
+    var displayName: String {
+        switch self {
+        case .name:
+            return "Name"
+        case .icon:
+            return "Icon"
+        case .description:
+            return "Description"
+        case .leaderMode:
+            return "Leader Mode"
+        case .agents:
+            return "Roles"
+        case .roles:
+            return "Roles"
+        case .taskTemplates:
+            return "Task Templates"
+        case .reviewCheckpoints:
+            return "Review Checkpoints"
         }
     }
 }

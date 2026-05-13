@@ -369,6 +369,16 @@ enum Commands {
         #[arg(long)]
         all: bool,
     },
+    /// Restart an agent CLI. Soft (default) sends Ctrl+C + retypes the launch
+    /// command in-place. --hard closes the pane and respawns a fresh one in
+    /// the same slot (scrollback lost; recovers stuck/IME-swallowed surfaces).
+    Restart {
+        /// Agent name to restart
+        agent: String,
+        /// Hard restart: close + respawn the pane (panelId changes; scrollback lost).
+        #[arg(long, default_value_t = false)]
+        hard: bool,
+    },
     /// Wait for agent signals (report, msg, blocked, review_ready, idle, any)
     Wait {
         #[arg(long, default_value_t = 120)]
@@ -605,6 +615,16 @@ enum Commands {
     /// Alias: task-clear → task clear
     #[command(name = "task-clear", hide = true)]
     TaskClear2,
+
+    /// Diagnose environment: sockets, daemons, teams, version mismatches
+    Doctor {
+        /// Show extra detail (process paths, full socket list)
+        #[arg(long)]
+        verbose: bool,
+        /// Output as JSON instead of human-readable text
+        #[arg(long)]
+        json: bool,
+    },
 
     /// Peer-federation operations (attach to a remote term-mesh host).
     Peer(PeerCommands),
@@ -3024,6 +3044,12 @@ fn main() {
         return;
     }
 
+    // Doctor runs without a socket (it probes all sockets itself).
+    if let Commands::Doctor { verbose, json } = &cli.command {
+        cmd_doctor(*verbose, *json);
+        return;
+    }
+
     if let Commands::XmbBridge {
         timeout,
         leader_session,
@@ -3496,6 +3522,7 @@ fn main() {
         Commands::TaskClear2 => rpc_call(&sock, "team.task.clear", json!({ "team_name": team })),
         Commands::Peer(_) => unreachable!("peer commands exit before detect_socket()"),
         Commands::Runbook(_) => unreachable!("runbook commands exit before detect_socket()"),
+        Commands::Doctor { .. } => unreachable!("doctor command exits before detect_socket()"),
         Commands::Status => {
             // Inject version info into the team.status response JSON
             let mut status = rpc_call(&sock, "team.status", json!({ "team_name": team }))
@@ -3819,6 +3846,33 @@ fn main() {
             }
             return;
         }
+        Commands::Restart { agent: ref target, hard } => {
+            if hard {
+                eprintln!(
+                    "hard restart: closing pane and respawning. scrollback will be lost; panelId changes."
+                );
+            } else {
+                eprintln!(
+                    "soft restart: types the launch command after Ctrl-C. Stuck CLIs are NOT recovered. Use --hard for true panel respawn."
+                );
+            }
+            let result = rpc_call(
+                &sock,
+                "team.restart",
+                json!({
+                    "team_name": team,
+                    "agent_name": target,
+                    "mode": if hard { "hard" } else { "soft" },
+                }),
+            );
+            if let Ok(ref r) = result {
+                if r["ok"].as_bool().unwrap_or(false) {
+                    eprintln!("restart issued for {target}");
+                }
+            }
+            print_result(result);
+            return;
+        }
         Commands::Send {
             agent: ref target,
             text,
@@ -3851,7 +3905,10 @@ fn main() {
             if let Ok(ref r) = send_result {
                 if r["result"]["text_delivered"].as_bool().unwrap_or(false) {
                     std::thread::sleep(Duration::from_millis(150));
-                    for attempt in 0..5u32 {
+                    let max_attempts = 5u32;
+                    let mut send_key_delivered = false;
+                    for attempt in 0..max_attempts {
+                        eprintln!("team.send_key attempt {}/{}", attempt + 1, max_attempts);
                         match rpc_call(
                             &sock,
                             "team.send_key",
@@ -3859,15 +3916,21 @@ fn main() {
                                 "team_name": team, "agent_name": target, "key": "return",
                             }),
                         ) {
-                            Ok(r) if r["ok"].as_bool().unwrap_or(false) => break,
+                            Ok(r) if r["ok"].as_bool().unwrap_or(false) => {
+                                send_key_delivered = true;
+                                break;
+                            }
                             _ => {
-                                if attempt < 4 {
+                                if attempt + 1 < max_attempts {
                                     std::thread::sleep(Duration::from_millis(
                                         200 * (attempt as u64 + 1),
                                     ));
                                 }
                             }
                         }
+                    }
+                    if !send_key_delivered {
+                        eprintln!("team.send_key giving up after {max_attempts} attempts");
                     }
                 }
             }
@@ -5103,6 +5166,101 @@ fn detect_daemon_socket() -> Option<PathBuf> {
     } else {
         None
     }
+}
+
+fn discover_term_mesh_sockets() -> Vec<Value> {
+    let patterns = [
+        "/tmp/term-mesh-debug-*.sock",
+        "/tmp/term-mesh-debug.sock",
+        "/tmp/term-mesh*.sock",
+        "/tmp/cmux.sock",
+    ];
+    let mut sockets = Vec::new();
+    let mut seen = std::collections::BTreeSet::new();
+
+    for pattern in patterns {
+        if let Ok(paths) = glob::glob(pattern) {
+            for path in paths.flatten() {
+                let display = path.to_string_lossy().to_string();
+                if !seen.insert(display.clone()) {
+                    continue;
+                }
+                sockets.push(json!({
+                    "path": display,
+                    "alive": is_socket_alive(&path),
+                }));
+            }
+        }
+    }
+
+    sockets
+}
+
+fn cmd_doctor(verbose: bool, json_output: bool) {
+    let app_socket = detect_socket();
+    let daemon_socket = detect_daemon_socket();
+    let sockets = discover_term_mesh_sockets();
+    let team = env::var("TERMMESH_TEAM").unwrap_or_else(|_| "live-team".into());
+    let agent = env::var("TERMMESH_AGENT_NAME").unwrap_or_else(|_| "anonymous".into());
+
+    let app_status = app_socket
+        .as_ref()
+        .and_then(|sock| rpc_call(sock, "team.status", json!({ "team_name": &team })).ok());
+    let daemon_status = daemon_socket
+        .as_ref()
+        .and_then(|sock| rpc_call(sock, "daemon.status", json!({})).ok());
+
+    let result = json!({
+        "ok": app_socket.is_some() || daemon_socket.is_some(),
+        "team": team,
+        "agent": agent,
+        "app_socket": app_socket.as_ref().map(|p| p.to_string_lossy().to_string()),
+        "daemon_socket": daemon_socket.as_ref().map(|p| p.to_string_lossy().to_string()),
+        "app_status": app_status,
+        "daemon_status": daemon_status,
+        "sockets": if verbose { Value::Array(sockets.clone()) } else { json!(sockets.iter().filter(|s| s["alive"].as_bool().unwrap_or(false)).count()) },
+    });
+
+    if json_output {
+        println!("{}", pretty(&result));
+        return;
+    }
+
+    println!("tm-agent doctor");
+    println!("team: {}", result["team"].as_str().unwrap_or("unknown"));
+    println!("agent: {}", result["agent"].as_str().unwrap_or("unknown"));
+    println!(
+        "app socket: {}",
+        result["app_socket"].as_str().unwrap_or("not found")
+    );
+    println!(
+        "daemon socket: {}",
+        result["daemon_socket"].as_str().unwrap_or("not found")
+    );
+    if verbose {
+        println!("sockets:");
+        for socket in sockets {
+            println!(
+                "  {} {}",
+                if socket["alive"].as_bool().unwrap_or(false) {
+                    "alive"
+                } else {
+                    "dead"
+                },
+                socket["path"].as_str().unwrap_or("")
+            );
+        }
+    } else {
+        println!("alive sockets: {}", result["sockets"].as_u64().unwrap_or(0));
+    }
+    println!(
+        "status: {}",
+        if result["ok"].as_bool().unwrap_or(false) {
+            "ok"
+        } else {
+            "no live sockets found"
+        }
+    );
 }
 
 /// Check if an agent is headless by querying the daemon's headless.resolve RPC.

@@ -450,6 +450,11 @@ struct TabBarView: View {
     @ViewBuilder
     private var splitButtons: some View {
         let tooltips = controller.configuration.appearance.splitButtonTooltips
+        let headerActions = controller.paneHeaderActions?(
+            pane.id,
+            pane.selectedTabId.map { TabID(id: $0) }
+        ) ?? []
+
         HStack(spacing: 4) {
             Button {
                 controller.requestNewTab(kind: "terminal", inPane: pane.id)
@@ -488,6 +493,18 @@ struct TabBarView: View {
             }
             .buttonStyle(SplitActionButtonStyle(appearance: appearance))
             .safeHelp(tooltips.splitDown)
+
+            ForEach(headerActions) { action in
+                Button {
+                    action.action()
+                } label: {
+                    Image(systemName: action.systemImage)
+                        .font(.system(size: 12))
+                }
+                .buttonStyle(SplitActionButtonStyle(appearance: appearance))
+                .safeHelp(action.help)
+                .accessibilityLabel(action.accessibilityLabel)
+            }
         }
         .padding(.trailing, 8)
     }

@@ -80,6 +80,45 @@ async fn main() -> anyhow::Result<()> {
     let headless_manager = Arc::new(tokio::sync::Mutex::new(headless::HeadlessManager::new()));
     tracing::info!("headless manager initialized");
 
+    // Phase 2: startup fixup for crashed-mid-destroy / crashed-mid-resume
+    // teams, then run an initial GC sweep. Both are filesystem-only and run
+    // off the main socket-handler thread (we're still in main's async setup,
+    // not inside any RPC handler). See contract §3.3 and §7.
+    tokio::task::spawn_blocking(|| {
+        headless::meta::startup_fixup();
+        let removed = headless::meta::gc_sweep();
+        if removed > 0 {
+            tracing::info!("headless gc: removed {removed} archived team(s) on startup");
+        }
+    });
+
+    // Phase 2: periodic GC sweep every 12 hours (contract §3.3).
+    tokio::spawn(async {
+        let mut interval =
+            tokio::time::interval(std::time::Duration::from_secs(headless::meta::GC_INTERVAL_SECS));
+        interval.tick().await; // skip immediate tick (startup already swept)
+        loop {
+            interval.tick().await;
+            let _ = tokio::task::spawn_blocking(headless::meta::gc_sweep).await;
+        }
+    });
+
+    // Phase 2: idle auto-park timer (60s granularity).
+    {
+        let mgr = headless_manager.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
+            interval.tick().await; // skip first immediate tick
+            loop {
+                interval.tick().await;
+                let parked = mgr.lock().await.idle_park_sweep().await;
+                if !parked.is_empty() {
+                    tracing::debug!("idle park sweep parked {} agent(s)", parked.len());
+                }
+            }
+        });
+    }
+
     // Shared session store (populated by Swift app via session.sync RPC)
     let sessions: socket::SessionStore = Arc::new(RwLock::new(Vec::new()));
     let team_state: socket::TeamStateStore = Arc::new(RwLock::new(serde_json::json!({

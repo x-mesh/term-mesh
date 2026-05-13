@@ -217,6 +217,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         let env = ProcessInfo.processInfo.environment
         let isRunningUnderXCTest = isRunningUnderXCTest(env)
 
+        DispatchQueue.main.async {
+            TeamTemplateManager.shared.ensureSeeded()
+            XmOpToastChecker.checkOnLaunch()
+        }
+
 #if DEBUG
         // UI tests run on a shared VM user profile, so persisted shortcuts can drift and make
         // key-equivalent routing flaky. Force defaults for deterministic tests.
@@ -337,6 +342,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         // term-mesh: Start the background daemon
         if !isRunningUnderXCTest {
             daemon.startDaemon()
+            // Phase 2.5: subscribe to daemon event broadcasts (agent_usage_tick → sidebar tokens).
+            // Delayed slightly so the daemon socket is ready before the first connect attempt.
+            DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 1.0) { [weak self] in
+                guard let self, self.daemon is TermMeshDaemon else { return }
+                (self.daemon as! TermMeshDaemon).startEventSubscription()
+            }
         }
 
         // Fix initial terminal size (intermittent cursor-in-middle-of-prompt bug):
@@ -3205,5 +3216,31 @@ extension NSWindow {
             return false
         }
         return hitWebView === webView
+    }
+}
+
+enum XmOpToastChecker {
+    private static let dismissedKey = "xmOpOverrideToast.dismissed"
+    private static let externalPresetPath = "~/.xm/op/agent-role-presets-override.json"
+
+    static func checkOnLaunch() {
+        guard !UserDefaults.standard.bool(forKey: dismissedKey) else { return }
+        let expandedPath = NSString(string: externalPresetPath).expandingTildeInPath
+        guard FileManager.default.fileExists(atPath: expandedPath) else { return }
+
+        let alert = NSAlert()
+        alert.messageText = "Note: Agent Presets"
+        alert.informativeText = """
+We found an external file:
+~/.xm/op/agent-role-presets-override.json
+
+This file is managed by /xm:op strategy tools and won't affect term-mesh. Built-in and custom presets are stored here:
+
+~/Library/Application Support/term-mesh/...
+"""
+        alert.addButton(withTitle: "Got it")
+        alert.addButton(withTitle: "Don't show again")
+        _ = alert.runModal()
+        UserDefaults.standard.set(true, forKey: dismissedKey)
     }
 }

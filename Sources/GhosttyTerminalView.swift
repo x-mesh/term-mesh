@@ -205,6 +205,7 @@ final class GhosttyMetalLayer: CAMetalLayer {
 /// Once a retry succeeds (`delivered = true`), subsequent closures skip sending.
 /// Safe because all closures run on MainActor (DispatchQueue.main.asyncAfter).
 private class ReturnDeliveryToken { var delivered = false }
+final class KeyDeliveryToken { var delivered = false }
 
 final class TerminalSurface: Identifiable, ObservableObject {
     final class SearchState: ObservableObject {
@@ -219,7 +220,16 @@ final class TerminalSurface: Identifiable, ObservableObject {
         }
     }
 
-    private(set) var surface: ghostty_surface_t?
+    private(set) var attachGeneration: UInt64 = 0
+    private(set) var surface: ghostty_surface_t? {
+        didSet {
+            guard oldValue != surface else { return }
+            attachGeneration &+= 1
+            #if DEBUG
+            dlog("surface.attachGeneration panel=\(id.uuidString.prefix(8)) gen=\(attachGeneration)")
+            #endif
+        }
+    }
     private weak var attachedView: GhosttyNSView?
     /// When true, setFocus(true) calls are ignored to keep CVDisplayLink suspended.
     /// Set by TeamOrchestrator.setAgentSurfaceFocus() when pausing/resuming agent rendering.
@@ -312,6 +322,10 @@ final class TerminalSurface: Identifiable, ObservableObject {
         self.hostedView = GhosttySurfaceScrollView(surfaceView: view)
         // Surface is created when attached to a view
         hostedView.attachSurface(self)
+    }
+
+    var hasMarkedTextForInput: Bool {
+        surfaceView.markedText.length > 0
     }
 
 
@@ -1143,15 +1157,22 @@ final class TerminalSurface: Identifiable, ObservableObject {
                 "dropped_text_prefix": String(dropped.text.prefix(40))
             ])
             #if DEBUG
+            dlog("paste.drop reason=queue_overflow panel=\(id.uuidString.prefix(8)) gen=\(pasteGeneration) needsReturn=\(dropped.needsReturn) textLen=\(dropped.text.count)")
             dlog("paste.queue.overflow surface=\(id.uuidString.prefix(8)) dropped=\(dropped.text.prefix(40))")
             #endif
         }
         pasteQueue.append(p)
+        #if DEBUG
+        dlog("paste.enqueue panel=\(id.uuidString.prefix(8)) gen=\(pasteGeneration) needsReturn=\(p.needsReturn) textLen=\(p.text.count)")
+        #endif
     }
 
     private func drainPasteQueue() {
         guard !pasteInFlight, !pasteQueue.isEmpty else { return }
         let next = pasteQueue.removeFirst()
+        #if DEBUG
+        dlog("paste.drain.start gen=\(pasteGeneration + 1)")
+        #endif
         processPaste(next)
     }
 
@@ -1169,7 +1190,13 @@ final class TerminalSurface: Identifiable, ObservableObject {
         let src = DispatchSource.makeTimerSource(queue: .main)
         src.schedule(deadline: .now() + 8.0)
         src.setEventHandler { [weak self] in
-            guard let self, self.pasteGeneration == generation else { return }
+            guard let self else { return }
+            guard self.pasteGeneration == generation else {
+                #if DEBUG
+                dlog("paste.drop reason=token_stale gen=\(generation) currentGen=\(self.pasteGeneration)")
+                #endif
+                return
+            }
             self.pasteWatchdog = nil
             self.pasteGeneration &+= 1  // invalidate stale async retry callbacks
             self.pasteInFlight = false
@@ -1190,6 +1217,9 @@ final class TerminalSurface: Identifiable, ObservableObject {
 
     private func processPaste(_ p: PendingPaste) {
         guard let surface = surface else {
+            #if DEBUG
+            dlog("paste.drop reason=surface_nil panel=\(id.uuidString.prefix(8)) gen=\(pasteGeneration) needsReturn=\(p.needsReturn) textLen=\(p.text.count)")
+            #endif
             pasteInFlight = false  // surface 복귀 후 drainPasteQueue가 즉시 재시도할 수 있도록 해제
             pasteQueue.insert(p, at: 0)
             return
@@ -1207,17 +1237,26 @@ final class TerminalSurface: Identifiable, ObservableObject {
             } ?? p.text.withCString { cstr in
                 ghostty_surface_text(surface, cstr, len)
             }
+            #if DEBUG
+            dlog("paste.text.sent gen=\(gen) textLen=\(p.text.count)")
+            #endif
             if p.needsReturn {
                 usleep(5_000) // 5ms — let IO thread flush paste to PTY before Return
             }
         }
 
         guard p.needsReturn else {
+            #if DEBUG
+            dlog("paste.return.skipped reason=no_need_return gen=\(gen)")
+            #endif
             finalizePaste(result: .success(()), completion: p.completion)
             return
         }
 
         let delivered = sendReturnKey(to: surface)
+        #if DEBUG
+        dlog("paste.return.sent gen=\(gen) handled=\(delivered)")
+        #endif
         if delivered {
             finalizePaste(result: .success(()), completion: p.completion)
             return
@@ -1227,6 +1266,9 @@ final class TerminalSurface: Identifiable, ObservableObject {
         #endif
         usleep(10_000)
         let retryDelivered = sendReturnKey(to: surface)
+        #if DEBUG
+        dlog("paste.return.sent gen=\(gen) handled=\(retryDelivered) retry=sync")
+        #endif
         if retryDelivered {
             finalizePaste(result: .success(()), completion: p.completion)
             return
@@ -1240,8 +1282,23 @@ final class TerminalSurface: Identifiable, ObservableObject {
         for (i, delay) in asyncDelays.enumerated() {
             let isLast = i == asyncDelays.count - 1
             DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self, token] in
-                guard let self, !token.delivered, self.pasteGeneration == gen else { return }
+                guard let self else { return }
+                guard !token.delivered else {
+                    #if DEBUG
+                    dlog("paste.drop reason=token_stale gen=\(gen) retry=async\(i + 1)")
+                    #endif
+                    return
+                }
+                guard self.pasteGeneration == gen else {
+                    #if DEBUG
+                    dlog("paste.drop reason=token_stale gen=\(gen) currentGen=\(self.pasteGeneration) retry=async\(i + 1)")
+                    #endif
+                    return
+                }
                 guard let surf = self.surface else {
+                    #if DEBUG
+                    dlog("paste.drop reason=surface_nil gen=\(gen) retry=async\(i + 1)")
+                    #endif
                     if isLast {
                         self.finalizePaste(result: .failure(.surfaceUnavailable), completion: p.completion)
                     }
@@ -1250,6 +1307,7 @@ final class TerminalSurface: Identifiable, ObservableObject {
                 let ok = self.sendReturnKey(to: surf)
                 if ok { token.delivered = true }
                 #if DEBUG
+                dlog("paste.return.sent gen=\(gen) handled=\(ok) retry=async\(i + 1)")
                 dlog("[processPaste.Return] async retry \(i + 1)/\(asyncDelays.count) delay=\(delay)s handled=\(ok) token.delivered=\(token.delivered) surface=\(self.id.uuidString.prefix(8))")
                 #endif
                 if ok {

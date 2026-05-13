@@ -278,6 +278,7 @@ final class Workspace: Identifiable, ObservableObject {
 
         // Set ourselves as delegate
         bonsplitController.delegate = self
+        configurePaneHeaderActions()
 
         // Ensure bonsplit has a focused pane and our didSelectTab handler runs for the
         // initial terminal. bonsplit's createTab selects internally but does not emit
@@ -296,6 +297,53 @@ final class Workspace: Identifiable, ObservableObject {
                 bonsplitController.focusPane(paneToFocus)
             }
             bonsplitController.selectTab(initialTabId)
+        }
+    }
+
+    private func configurePaneHeaderActions() {
+        bonsplitController.paneHeaderActions = { [weak self] _, selectedTabId in
+            guard let self,
+                  let selectedTabId,
+                  let panelId = self.panelIdFromSurfaceId(selectedTabId),
+                  self.panels[panelId] is TerminalPanel,
+                  let agent = TeamOrchestrator.shared.agentIdentity(forPanelId: panelId) else {
+                return []
+            }
+
+            // Click = hard restart (close + respawn); Option-click = soft (ETX +
+            // retype). Interactive CLIs (claude/codex/gemini) swallow Ctrl-C so
+            // soft restart is effectively useless against the stuck-pane scenario
+            // that drives almost every ↻ press — hard is the safer default.
+            //
+            // Modifier read via NSEvent.currentEvent (the actual mouse-down event)
+            // rather than NSEvent.modifierFlags (process-global, can be stale by
+            // the time the SwiftUI Button closure fires).
+            return [
+                BonsplitController.PaneHeaderAction(
+                    id: "agent-restart-\(panelId.uuidString)",
+                    systemImage: "arrow.clockwise",
+                    help: "Restart \(agent.agentName) CLI — close + respawn (⌥-click: soft restart, just type the launch command)",
+                    accessibilityLabel: "Restart \(agent.agentName) CLI",
+                    action: {
+                        let optionHeld =
+                            NSApp.currentEvent?.modifierFlags.contains(.option)
+                            ?? NSEvent.modifierFlags.contains(.option)
+                        #if DEBUG
+                        dlog("[team.restart] header.click team=\(agent.teamName) agent=\(agent.agentName) optionHeld=\(optionHeld) mode=\(optionHeld ? "soft" : "hard")")
+                        #endif
+                        if optionHeld {
+                            TeamOrchestrator.shared.restartAgentPane(panelId: panelId)
+                        } else {
+                            Task { @MainActor in
+                                _ = await TeamOrchestrator.shared.restartAgentPaneHard(
+                                    teamName: agent.teamName,
+                                    agentName: agent.agentName
+                                )
+                            }
+                        }
+                    }
+                )
+            ]
         }
     }
 
@@ -2206,4 +2254,3 @@ final class Workspace: Identifiable, ObservableObject {
     }
 
 }
-

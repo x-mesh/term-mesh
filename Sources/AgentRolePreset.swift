@@ -152,7 +152,11 @@ struct WorkflowPresetDefinition: Identifiable, Codable, Equatable {
         self.reviewCheckpoints = reviewCheckpoints
     }
 
-    static let builtIn: [WorkflowPresetDefinition] = [
+    static var builtIn: [WorkflowPresetDefinition] {
+        BuiltInCatalog.shared.workflow
+    }
+
+    static let fallbackBuiltIn: [WorkflowPresetDefinition] = [
         WorkflowPresetDefinition(
             id: "bug-triage",
             name: "Bug Triage",
@@ -981,10 +985,10 @@ class AgentRolePresetManager: ObservableObject {
     }
 }
 
-// MARK: - Team Templates
+// MARK: - Legacy Saved Team Templates
 
 /// A saved team configuration: name + ordered list of agent slots.
-struct TeamTemplate: Identifiable, Codable, Equatable {
+struct SavedTeamTemplate: Identifiable, Codable, Equatable {
     var id: UUID
     var name: String
     var leaderMode: String  // "repl" or "claude"
@@ -1006,10 +1010,10 @@ struct TeamTemplate: Identifiable, Codable, Equatable {
 }
 
 /// Manages saved team templates.
-class TeamTemplateManager: ObservableObject {
-    static let shared = TeamTemplateManager()
+class SavedTeamTemplateManager: ObservableObject {
+    static let shared = SavedTeamTemplateManager()
 
-    @Published var templates: [TeamTemplate] = []
+    @Published var templates: [SavedTeamTemplate] = []
 
     private let fileURL: URL = {
         let dir = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
@@ -1028,18 +1032,743 @@ class TeamTemplateManager: ObservableObject {
 
     func load() {
         guard let data = try? Data(contentsOf: fileURL),
-              let decoded = try? JSONDecoder().decode([TeamTemplate].self, from: data) else { return }
+              let decoded = try? JSONDecoder().decode([SavedTeamTemplate].self, from: data) else { return }
         templates = decoded
     }
 
-    func add(_ template: TeamTemplate) {
+    func add(_ template: SavedTeamTemplate) {
         templates.append(template)
         save()
     }
 
-    func delete(_ template: TeamTemplate) {
+    func delete(_ template: SavedTeamTemplate) {
         templates.removeAll { $0.id == template.id }
         save()
+    }
+}
+
+// MARK: - Team Template Catalog v2
+
+enum TemplateOrigin: String, Codable, Equatable {
+    case builtIn
+    case custom
+}
+
+enum Category: String, Codable, Hashable {
+    case smart
+    case workflow
+    case quick
+}
+
+struct TemplateID: Codable, Hashable, CustomStringConvertible {
+    var category: Category
+    var slug: String
+
+    var description: String { "\(category.rawValue):\(slug)" }
+
+    init(category: Category, slug: String) {
+        self.category = category
+        self.slug = slug
+    }
+}
+
+struct TeamPreset: Identifiable, Codable, Equatable {
+    var slug: String
+    var name: String
+    var icon: String
+    var roles: [String]
+
+    var id: String { slug }
+
+    init(slug: String, name: String, icon: String, roles: [String]) {
+        self.slug = slug
+        self.name = name
+        self.icon = icon
+        self.roles = roles
+    }
+
+    static var builtIn: [TeamPreset] {
+        BuiltInCatalog.shared.quick
+    }
+
+    static let fallbackBuiltIn: [TeamPreset] = [
+        TeamPreset(slug: "2-agents", name: "2 Agents", icon: "person.2", roles: ["explorer", "executor"]),
+        TeamPreset(slug: "3-agents", name: "3 Agents", icon: "person.3", roles: ["explorer", "executor", "reviewer"]),
+        TeamPreset(slug: "debug-squad", name: "Debug Squad", icon: "ladybug", roles: ["debugger", "tester", "explorer"]),
+        TeamPreset(slug: "deep-search", name: "Deep Search", icon: "magnifyingglass", roles: ["explorer", "researcher", "architect"]),
+        TeamPreset(slug: "ship-it", name: "Ship It", icon: "shippingbox", roles: ["executor", "tester", "writer", "devops"]),
+        TeamPreset(slug: "super-team", name: "Super Team", icon: "star.circle", roles: [
+            "planner", "architect", "explorer",
+            "executor", "frontend", "backend",
+            "tester", "reviewer", "security", "writer"
+        ]),
+    ]
+}
+
+enum TeamTemplatePayload: Codable, Equatable {
+    case smart(SmartTeamPreset)
+    case workflow(WorkflowPresetDefinition)
+    case quick(TeamPreset)
+
+    private enum CodingKeys: String, CodingKey {
+        case type
+        case smart
+        case workflow
+        case quick
+    }
+
+    private enum PayloadType: String, Codable {
+        case smart
+        case workflow
+        case quick
+    }
+
+    var leaderMode: String? {
+        switch self {
+        case .smart(let preset):
+            return preset.leaderMode
+        case .workflow(let preset):
+            return preset.leaderMode
+        case .quick:
+            return nil
+        }
+    }
+
+    var displayName: String {
+        switch self {
+        case .smart(let preset):
+            return preset.name
+        case .workflow(let preset):
+            return preset.name
+        case .quick(let preset):
+            return preset.name
+        }
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        let type = try container.decode(PayloadType.self, forKey: .type)
+        switch type {
+        case .smart:
+            self = .smart(try container.decode(SmartTeamPreset.self, forKey: .smart))
+        case .workflow:
+            self = .workflow(try container.decode(WorkflowPresetDefinition.self, forKey: .workflow))
+        case .quick:
+            self = .quick(try container.decode(TeamPreset.self, forKey: .quick))
+        }
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        switch self {
+        case .smart(let preset):
+            try container.encode(PayloadType.smart, forKey: .type)
+            try container.encode(preset, forKey: .smart)
+        case .workflow(let preset):
+            try container.encode(PayloadType.workflow, forKey: .type)
+            try container.encode(preset, forKey: .workflow)
+        case .quick(let preset):
+            try container.encode(PayloadType.quick, forKey: .type)
+            try container.encode(preset, forKey: .quick)
+        }
+    }
+}
+
+struct TeamTemplate: Identifiable, Codable, Equatable {
+    var id: TemplateID
+    var origin: TemplateOrigin
+    var parentBuiltInId: TemplateID?
+    var name: String
+    var createdAt: Date
+    var payload: TeamTemplatePayload
+    var schema: Int
+
+    init(
+        id: TemplateID,
+        origin: TemplateOrigin,
+        parentBuiltInId: TemplateID? = nil,
+        name: String,
+        createdAt: Date = Date(),
+        payload: TeamTemplatePayload,
+        schema: Int = 1
+    ) {
+        self.id = id
+        self.origin = origin
+        self.parentBuiltInId = parentBuiltInId
+        self.name = name
+        self.createdAt = createdAt
+        self.payload = payload
+        self.schema = schema
+    }
+}
+
+struct BuiltInOverride: Codable, Equatable {
+    var baseId: TemplateID
+    var payload: TeamTemplatePayload
+    let modifiedAt: Date
+
+    init(baseId: TemplateID, payload: TeamTemplatePayload, modifiedAt: Date = Date()) {
+        self.baseId = baseId
+        self.payload = payload
+        self.modifiedAt = modifiedAt
+    }
+}
+
+struct BuiltInCatalog: Codable, Equatable {
+    var schema: Int
+    var smart: [SmartTeamPreset]
+    var workflow: [WorkflowPresetDefinition]
+    var quick: [TeamPreset]
+
+    var templates: [TeamTemplate] {
+        smart.map { preset in
+            TeamTemplate(
+                id: TemplateID(category: .smart, slug: preset.id),
+                origin: .builtIn,
+                name: preset.name,
+                payload: .smart(preset)
+            )
+        } + workflow.map { preset in
+            TeamTemplate(
+                id: TemplateID(category: .workflow, slug: preset.id),
+                origin: .builtIn,
+                name: preset.name,
+                payload: .workflow(preset)
+            )
+        } + quick.map { preset in
+            TeamTemplate(
+                id: TemplateID(category: .quick, slug: preset.slug),
+                origin: .builtIn,
+                name: preset.name,
+                payload: .quick(preset)
+            )
+        }
+    }
+
+    static let resourceName = "team-templates.builtin"
+
+    static let fallback = BuiltInCatalog(
+        schema: 1,
+        smart: SmartTeamPreset.fallbackBuiltIn,
+        workflow: WorkflowPresetDefinition.fallbackBuiltIn,
+        quick: TeamPreset.fallbackBuiltIn
+    )
+
+    static let shared: BuiltInCatalog = load()
+
+    static func load(bundle: Bundle = .main) -> BuiltInCatalog {
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        let urls = [
+            bundle.url(forResource: resourceName, withExtension: "json"),
+            bundle.resourceURL?.appendingPathComponent("\(resourceName).json"),
+            Bundle(for: BundleMarker.self).url(forResource: resourceName, withExtension: "json"),
+            Bundle(for: BundleMarker.self).resourceURL?.appendingPathComponent("\(resourceName).json"),
+        ].compactMap { $0 }
+
+        for url in urls {
+            guard let data = try? Data(contentsOf: url),
+                  let decoded = try? decoder.decode(BuiltInCatalog.self, from: data),
+                  decoded.schema == 1,
+                  !decoded.smart.isEmpty,
+                  !decoded.workflow.isEmpty,
+                  !decoded.quick.isEmpty else { continue }
+            return decoded
+        }
+        return fallback
+    }
+
+    private final class BundleMarker {}
+}
+
+struct UserCustomTemplateStore: Codable, Equatable {
+    var schema: Int
+    var pinnedId: TemplateID?
+    var lastSelectedId: TemplateID?
+    var customs: [TeamTemplate]
+    var overrides: [BuiltInOverride]
+
+    private enum CodingKeys: String, CodingKey {
+        case schema
+        case pinnedId
+        case lastSelectedId
+        case customs
+        case overrides
+    }
+
+    init(
+        schema: Int = 2,
+        pinnedId: TemplateID? = nil,
+        lastSelectedId: TemplateID? = nil,
+        customs: [TeamTemplate] = [],
+        overrides: [BuiltInOverride] = []
+    ) {
+        self.schema = schema
+        self.pinnedId = pinnedId
+        self.lastSelectedId = lastSelectedId
+        self.customs = customs
+        self.overrides = overrides
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        schema = max(2, try container.decodeIfPresent(Int.self, forKey: .schema) ?? 1)
+        pinnedId = try container.decodeIfPresent(TemplateID.self, forKey: .pinnedId)
+        lastSelectedId = try container.decodeIfPresent(TemplateID.self, forKey: .lastSelectedId)
+        customs = try container.decodeIfPresent([TeamTemplate].self, forKey: .customs) ?? []
+        overrides = try container.decodeIfPresent([BuiltInOverride].self, forKey: .overrides) ?? []
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(schema, forKey: .schema)
+        if let pinnedId {
+            try container.encode(pinnedId, forKey: .pinnedId)
+        } else {
+            try container.encodeNil(forKey: .pinnedId)
+        }
+        if let lastSelectedId {
+            try container.encode(lastSelectedId, forKey: .lastSelectedId)
+        } else {
+            try container.encodeNil(forKey: .lastSelectedId)
+        }
+        try container.encode(customs, forKey: .customs)
+        try container.encode(overrides, forKey: .overrides)
+    }
+}
+
+enum TeamTemplateField: String, Codable, CaseIterable, Hashable {
+    case name
+    case icon
+    case description
+    case leaderMode
+    case agents
+    case roles
+    case taskTemplates
+    case reviewCheckpoints
+}
+
+enum TeamTemplateManagerError: LocalizedError {
+    case builtInNotFound(TemplateID)
+    case customNotFound(TemplateID)
+    case parentNotFound(TemplateID)
+    case templateNotFound(TemplateID)
+
+    var errorDescription: String? {
+        switch self {
+        case .builtInNotFound(let id):
+            return "Built-in template not found: \(id)"
+        case .customNotFound(let id):
+            return "Custom template not found: \(id)"
+        case .parentNotFound(let id):
+            return "Parent built-in template not found: \(id)"
+        case .templateNotFound(let id):
+            return "Template not found: \(id)"
+        }
+    }
+}
+
+class TeamTemplateManager: ObservableObject {
+    static let shared = TeamTemplateManager()
+
+    @Published private(set) var templates: [TeamTemplate] = []
+    @Published private(set) var customTemplates: [TeamTemplate] = []
+    @Published private(set) var pinnedId: TemplateID?
+    @Published private(set) var lastSelectedId: TemplateID?
+
+    private let builtIns: [TeamTemplate]
+    private var store: UserCustomTemplateStore
+    private let fileURL: URL
+
+    init(catalog: BuiltInCatalog = .shared, fileURL: URL = TeamTemplateManager.defaultStoreURL()) {
+        let needsSeedOrMigration = !FileManager.default.fileExists(atPath: fileURL.path)
+            || Self.storeNeedsSchema2Rewrite(fileURL: fileURL)
+        self.builtIns = catalog.templates
+        self.fileURL = fileURL
+        self.store = Self.loadStore(from: fileURL)
+        if needsSeedOrMigration {
+            save()
+        }
+        rebuildTemplates()
+    }
+
+    func template(for id: TemplateID) -> TeamTemplate? {
+        templates.first { $0.id == id }
+    }
+
+    func builtInTemplate(for id: TemplateID) -> TeamTemplate? {
+        builtIns.first { $0.id == id }
+    }
+
+    func override(for id: TemplateID) -> BuiltInOverride? {
+        store.overrides.first { $0.baseId == id }
+    }
+
+    func saveOverride(for id: TemplateID, payload: TeamTemplatePayload) {
+        guard let builtIn = builtInTemplate(for: id), builtIn.payload != payload else {
+            resetOverride(for: id)
+            return
+        }
+        let next = BuiltInOverride(baseId: id, payload: payload)
+        if let index = store.overrides.firstIndex(where: { $0.baseId == id }) {
+            store.overrides[index] = next
+        } else {
+            store.overrides.append(next)
+        }
+        save()
+        rebuildTemplates()
+    }
+
+    func resetOverride(for id: TemplateID) {
+        store.overrides.removeAll { $0.baseId == id }
+        save()
+        rebuildTemplates()
+    }
+
+    func isOverridden(_ id: TemplateID) -> Bool {
+        override(for: id) != nil
+    }
+
+    func effectivePayload(for id: TemplateID) -> TeamTemplatePayload? {
+        override(for: id)?.payload ?? builtInTemplate(for: id)?.payload
+    }
+
+    @discardableResult
+    func customize(from builtInId: TemplateID, name: String? = nil) throws -> TemplateID {
+        guard let source = builtInTemplate(for: builtInId) else {
+            throw TeamTemplateManagerError.builtInNotFound(builtInId)
+        }
+        let customName = name?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty
+            ?? nextAvailableName(source.name)
+        let customId = TemplateID(
+            category: builtInId.category,
+            slug: nextAvailableSlug(category: builtInId.category, base: customName)
+        )
+        let custom = TeamTemplate(
+            id: customId,
+            origin: .custom,
+            parentBuiltInId: builtInId,
+            name: customName,
+            payload: source.payload
+        )
+        store.customs.append(custom)
+        store.lastSelectedId = customId
+        save()
+        rebuildTemplates()
+        return customId
+    }
+
+    func nextAvailableName(_ base: String) -> String {
+        let existingNames = Set(templates.map(\.name))
+        let escapedBase = NSRegularExpression.escapedPattern(for: base)
+        let pattern = "^\(escapedBase) \\(my copy(?: ([0-9]+))?\\)$"
+        let regex = try? NSRegularExpression(pattern: pattern)
+        let matches = existingNames.compactMap { name -> Int? in
+            let range = NSRange(name.startIndex..<name.endIndex, in: name)
+            guard let match = regex?.firstMatch(in: name, range: range) else { return nil }
+            let suffixRange = match.range(at: 1)
+            guard suffixRange.location != NSNotFound,
+                  let swiftRange = Range(suffixRange, in: name),
+                  let number = Int(name[swiftRange]) else {
+                return 1
+            }
+            return number
+        }
+        var candidateIndex = (matches.max() ?? 0) + 1
+        var candidate = candidateIndex == 1 ? "\(base) (my copy)" : "\(base) (my copy \(candidateIndex))"
+        while existingNames.contains(candidate) {
+            candidateIndex += 1
+            candidate = "\(base) (my copy \(candidateIndex))"
+        }
+        return candidate
+    }
+
+    func deleteCustom(id: TemplateID) throws {
+        guard let index = store.customs.firstIndex(where: { $0.id == id && $0.origin == .custom }) else {
+            throw TeamTemplateManagerError.customNotFound(id)
+        }
+        store.customs.remove(at: index)
+        if store.pinnedId == id {
+            store.pinnedId = nil
+        }
+        if store.lastSelectedId == id {
+            store.lastSelectedId = nil
+        }
+        save()
+        rebuildTemplates()
+    }
+
+    func updateCustom(_ template: TeamTemplate) throws {
+        guard template.origin == .custom,
+              let index = store.customs.firstIndex(where: { $0.id == template.id && $0.origin == .custom }) else {
+            throw TeamTemplateManagerError.customNotFound(template.id)
+        }
+        store.customs[index] = template
+        save()
+        rebuildTemplates()
+    }
+
+    func pin(id: TemplateID) throws {
+        guard template(for: id) != nil else {
+            throw TeamTemplateManagerError.templateNotFound(id)
+        }
+        store.pinnedId = id
+        save()
+        rebuildTemplates()
+    }
+
+    func unpin() {
+        store.pinnedId = nil
+        save()
+        rebuildTemplates()
+    }
+
+    func setLastSelected(id: TemplateID) throws {
+        guard template(for: id) != nil else {
+            throw TeamTemplateManagerError.templateNotFound(id)
+        }
+        store.lastSelectedId = id
+        save()
+        rebuildTemplates()
+    }
+
+    func resolveLeaderMode(fallback appStorageMode: String? = nil) -> String {
+        if let pinnedId,
+           let leaderMode = effectivePayload(for: pinnedId)?.leaderMode ?? template(for: pinnedId)?.payload.leaderMode {
+            return leaderMode
+        }
+        if let lastSelectedId,
+           let leaderMode = effectivePayload(for: lastSelectedId)?.leaderMode ?? template(for: lastSelectedId)?.payload.leaderMode {
+            return leaderMode
+        }
+        if let appStorageMode = appStorageMode?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !appStorageMode.isEmpty {
+            return appStorageMode
+        }
+        return "claude"
+    }
+
+    func resetField(id: TemplateID, field: TeamTemplateField) throws {
+        try updateCustom(id: id) { custom in
+            guard let parentId = custom.parentBuiltInId,
+                  let parent = builtInTemplate(for: parentId) else {
+                throw TeamTemplateManagerError.parentNotFound(id)
+            }
+            custom.reset(field: field, from: parent)
+        }
+    }
+
+    func resetAll(id: TemplateID) throws {
+        try updateCustom(id: id) { custom in
+            guard let parentId = custom.parentBuiltInId,
+                  let parent = builtInTemplate(for: parentId) else {
+                throw TeamTemplateManagerError.parentNotFound(id)
+            }
+            custom.name = parent.name
+            custom.payload = parent.payload
+        }
+    }
+
+    func resetAll() {
+        for index in store.customs.indices {
+            guard let parentId = store.customs[index].parentBuiltInId,
+                  let parent = builtInTemplate(for: parentId) else { continue }
+            store.customs[index].name = parent.name
+            store.customs[index].payload = parent.payload
+        }
+        save()
+        rebuildTemplates()
+    }
+
+    /// 첫 실행 시 호출하여 디스크에 빈 스토어 + schema:2 마커 즉시 박음.
+    /// 기존 파일 있으면 noop.
+    func ensureSeeded() {
+        if !FileManager.default.fileExists(atPath: fileURL.path) {
+            save()
+        }
+    }
+
+    func save() {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        encoder.dateEncodingStrategy = .iso8601
+        guard let data = try? encoder.encode(store) else { return }
+        try? data.write(to: fileURL, options: .atomic)
+    }
+
+    private func rebuildTemplates() {
+        customTemplates = store.customs
+        pinnedId = store.pinnedId
+        lastSelectedId = store.lastSelectedId
+        templates = builtIns + store.customs
+    }
+
+    private func updateCustom(id: TemplateID, mutate: (inout TeamTemplate) throws -> Void) throws {
+        guard let index = store.customs.firstIndex(where: { $0.id == id && $0.origin == .custom }) else {
+            throw TeamTemplateManagerError.customNotFound(id)
+        }
+        try mutate(&store.customs[index])
+        save()
+        rebuildTemplates()
+    }
+
+    private func nextAvailableSlug(category: Category, base: String) -> String {
+        let baseSlug = slugify(base)
+        let existingSlugs = Set(templates.filter { $0.id.category == category }.map { $0.id.slug })
+        var candidate = baseSlug
+        var suffix = 2
+        while existingSlugs.contains(candidate) {
+            candidate = "\(baseSlug)-\(suffix)"
+            suffix += 1
+        }
+        return candidate
+    }
+
+    private func slugify(_ value: String) -> String {
+        let lowercased = value.lowercased()
+        let allowed = CharacterSet.alphanumerics
+        var result = ""
+        var previousWasDash = false
+        for scalar in lowercased.unicodeScalars {
+            if allowed.contains(scalar) {
+                result.append(Character(scalar))
+                previousWasDash = false
+            } else if !previousWasDash {
+                result.append("-")
+                previousWasDash = true
+            }
+        }
+        let trimmed = result.trimmingCharacters(in: CharacterSet(charactersIn: "-"))
+        return trimmed.isEmpty ? "custom" : trimmed
+    }
+
+    private static func loadStore(from fileURL: URL) -> UserCustomTemplateStore {
+        guard let data = try? Data(contentsOf: fileURL) else {
+            return UserCustomTemplateStore()
+        }
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        guard let decoded = try? decoder.decode(UserCustomTemplateStore.self, from: data),
+              (1...2).contains(decoded.schema) else {
+            return UserCustomTemplateStore()
+        }
+        return decoded
+    }
+
+    private static func storeNeedsSchema2Rewrite(fileURL: URL) -> Bool {
+        guard let data = try? Data(contentsOf: fileURL),
+              let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            return true
+        }
+        return (object["schema"] as? Int) != 2 || object["overrides"] == nil
+    }
+
+    static func defaultStoreURL() -> URL {
+        let dir = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
+            .appendingPathComponent("term-mesh", isDirectory: true)
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        return dir.appendingPathComponent("team-templates.custom.json")
+    }
+}
+
+private extension String {
+    var nonEmpty: String? {
+        isEmpty ? nil : self
+    }
+}
+
+private extension TeamTemplate {
+    mutating func reset(field: TeamTemplateField, from parent: TeamTemplate) {
+        switch field {
+        case .name:
+            name = parent.name
+        case .icon:
+            payload.resetIcon(from: parent.payload)
+        case .description:
+            payload.resetDescription(from: parent.payload)
+        case .leaderMode:
+            payload.resetLeaderMode(from: parent.payload)
+        case .agents:
+            payload.resetAgents(from: parent.payload)
+        case .roles:
+            payload.resetRoles(from: parent.payload)
+        case .taskTemplates:
+            payload.resetTaskTemplates(from: parent.payload)
+        case .reviewCheckpoints:
+            payload.resetReviewCheckpoints(from: parent.payload)
+        }
+    }
+}
+
+private extension TeamTemplatePayload {
+    mutating func resetIcon(from parent: TeamTemplatePayload) {
+        switch (self, parent) {
+        case (.smart(var current), .smart(let original)):
+            current.icon = original.icon
+            self = .smart(current)
+        case (.workflow(var current), .workflow(let original)):
+            current.icon = original.icon
+            self = .workflow(current)
+        case (.quick(var current), .quick(let original)):
+            current.icon = original.icon
+            self = .quick(current)
+        default:
+            break
+        }
+    }
+
+    mutating func resetDescription(from parent: TeamTemplatePayload) {
+        guard case .smart(var current) = self,
+              case .smart(let original) = parent else { return }
+        current.description = original.description
+        self = .smart(current)
+    }
+
+    mutating func resetLeaderMode(from parent: TeamTemplatePayload) {
+        switch (self, parent) {
+        case (.smart(var current), .smart(let original)):
+            current.leaderMode = original.leaderMode
+            self = .smart(current)
+        case (.workflow(var current), .workflow(let original)):
+            current.leaderMode = original.leaderMode
+            self = .workflow(current)
+        default:
+            break
+        }
+    }
+
+    mutating func resetAgents(from parent: TeamTemplatePayload) {
+        guard case .smart(var current) = self,
+              case .smart(let original) = parent else { return }
+        current.agents = original.agents
+        self = .smart(current)
+    }
+
+    mutating func resetRoles(from parent: TeamTemplatePayload) {
+        switch (self, parent) {
+        case (.workflow(var current), .workflow(let original)):
+            current.roles = original.roles
+            self = .workflow(current)
+        case (.quick(var current), .quick(let original)):
+            current.roles = original.roles
+            self = .quick(current)
+        default:
+            break
+        }
+    }
+
+    mutating func resetTaskTemplates(from parent: TeamTemplatePayload) {
+        guard case .workflow(var current) = self,
+              case .workflow(let original) = parent else { return }
+        current.taskTemplates = original.taskTemplates
+        self = .workflow(current)
+    }
+
+    mutating func resetReviewCheckpoints(from parent: TeamTemplatePayload) {
+        guard case .workflow(var current) = self,
+              case .workflow(let original) = parent else { return }
+        current.reviewCheckpoints = original.reviewCheckpoints
+        self = .workflow(current)
     }
 }
 
@@ -1131,13 +1860,13 @@ class ProviderDetector: ObservableObject {
 // MARK: - Smart Team Presets
 
 /// Provider preference for a single agent slot in a smart preset.
-struct ProviderPreference {
-    let role: String
-    let primaryCli: String
-    let primaryModel: String?   // nil = use CLI default
-    let fallbackCli: String
-    let fallbackModel: String?  // nil = use CLI default
-    let reason: String          // why this provider is optimal for this role
+struct ProviderPreference: Codable, Equatable {
+    var role: String
+    var primaryCli: String
+    var primaryModel: String?   // nil = use CLI default
+    var fallbackCli: String
+    var fallbackModel: String?  // nil = use CLI default
+    var reason: String          // why this provider is optimal for this role
 }
 
 /// Resolved agent slot after provider detection.
@@ -1156,13 +1885,13 @@ struct ResolvedAgent {
 }
 
 /// A team preset with per-role optimal provider assignments and automatic fallback.
-struct SmartTeamPreset: Identifiable {
-    let id: String
-    let name: String
-    let icon: String
-    let description: String
-    let leaderMode: String
-    let agents: [ProviderPreference]
+struct SmartTeamPreset: Identifiable, Codable, Equatable {
+    var id: String
+    var name: String
+    var icon: String
+    var description: String
+    var leaderMode: String
+    var agents: [ProviderPreference]
 
     /// Resolve all agent slots against detected providers.
     func resolve(with detector: ProviderDetector) -> [ResolvedAgent] {
@@ -1196,7 +1925,11 @@ struct SmartTeamPreset: Identifiable {
         resolve(with: detector).filter { $0.status == .best }.count
     }
 
-    static let builtIn: [SmartTeamPreset] = [
+    static var builtIn: [SmartTeamPreset] {
+        BuiltInCatalog.shared.smart
+    }
+
+    static let fallbackBuiltIn: [SmartTeamPreset] = [
         SmartTeamPreset(
             id: "standard",
             name: "Standard",

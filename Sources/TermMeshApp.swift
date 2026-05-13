@@ -51,6 +51,9 @@ struct TermMeshApp: App {
     @State private var showTeamCreation = false
     /// TabManager captured at menu-click time (before sheet steals key window).
     @State private var teamCreationTabManager: TabManager?
+    /// Phase 2.5 — initial mode for next sheet presentation ("new" or "resume").
+    /// Reset to "new" each time the sheet closes so subsequent menu opens behave normally.
+    @State private var teamCreationInitialMode: String = "new"
     @State private var ghosttyTheme = GhosttyTheme.current
 
     init() {
@@ -197,6 +200,169 @@ struct TermMeshApp: App {
         defaults.set(targetVersion, forKey: migrationKey)
     }
 
+    private func makeTeamCreationView() -> TeamCreationView {
+        TeamCreationView(
+            onCreate: { teamName, leaderMode, leaderModel, agents, worktreeMode, executionMode, resumeSessionId in
+                let activeTabManager = teamCreationTabManager ?? tabManager
+                let workDir = activeTabManager.selectedTab?.currentDirectory
+                    ?? FileManager.default.currentDirectoryPath
+                let agentTuples: [(name: String, cli: String, model: String, agentType: String, color: String, instructions: String)] = agents.map { row in
+                    let customInstructions = row.customInstructions == row.preset.instructions
+                        ? ""
+                        : row.customInstructions
+                    let effectiveInstructions = AgentRunbookService.shared.composeInstructions(
+                        roleName: row.preset.name,
+                        presetInstructions: row.preset.instructions,
+                        customInstructions: customInstructions,
+                        workingDirectory: workDir,
+                        mode: .digest
+                    )
+                    return (
+                        name: row.preset.name,
+                        cli: row.preset.cli,
+                        model: row.preset.model,
+                        agentType: row.preset.name,
+                        color: row.preset.color,
+                        instructions: effectiveInstructions
+                    )
+                }
+                let leaderSessionId = UUID().uuidString
+                _ = TeamOrchestrator.shared.createTeam(
+                    name: teamName,
+                    agents: agentTuples,
+                    workingDirectory: workDir,
+                    leaderSessionId: leaderSessionId,
+                    leaderMode: leaderMode,
+                    leaderModel: leaderModel,
+                    resumeSessionId: resumeSessionId,
+                    worktreeMode: worktreeMode,
+                    executionMode: executionMode,
+                    tabManager: activeTabManager
+                )
+            },
+            onResume: { (result: [String: Any]) in
+                let activeTabManager = teamCreationTabManager ?? tabManager
+                TeamOrchestrator.shared.adoptResumedHeadlessTeam(
+                    result: result,
+                    tabManager: activeTabManager
+                )
+            },
+            initialMode: teamCreationInitialMode
+        )
+    }
+
+    @ViewBuilder
+    private var primaryWindowBaseContent: some View {
+    ContentView(updateViewModel: appDelegate.updateViewModel, windowId: primaryWindowId)
+        .environmentObject(tabManager)
+        .environmentObject(notificationStore)
+        .environmentObject(sidebarState)
+        .environmentObject(sidebarSelectionState)
+        .environment(\.ghosttyTheme, ghosttyTheme)
+        .withServices()
+        .onReceive(NotificationCenter.default.publisher(for: .ghosttyDefaultBackgroundDidChange)) { _ in
+            ghosttyTheme = .current
+        }
+        .onAppear {
+#if DEBUG
+            if termMeshEnv("UI_TEST_MODE") == "1" {
+                UpdateLogStore.shared.append("ui test: TermMeshApp onAppear")
+            }
+#endif
+            // Duplicate WindowGroup scene guard: if a primary window is already
+            // registered, this onAppear is firing for a duplicate scene. Skip
+            // configure/socket setup to prevent AppDelegate.tabManager from being
+            // overwritten, and close the duplicate window.
+            let existingWindows = appDelegate.mainWindowContexts.count
+#if DEBUG
+            dlog("window.WindowGroup.onAppear primaryWindowId=\(primaryWindowId.uuidString.prefix(8)) existingWindows=\(existingWindows)")
+#endif
+            // The primary window registers via WindowAccessor before onAppear fires,
+            // so count == 1 is normal. A duplicate scene produces count >= 2.
+            if existingWindows > 1 {
+#if DEBUG
+                dlog("window.WindowGroup.onAppear DUPLICATE_SCENE existingWindows=\(existingWindows) — blocking configure, closing duplicate")
+#endif
+                DispatchQueue.main.async {
+                    if let duplicateWindow = NSApp.windows.last,
+                       duplicateWindow.contentView != nil,
+                       appDelegate.mainWindowContexts.count > 1 {
+                        duplicateWindow.close()
+                    }
+                }
+                return
+            }
+            // Start the Unix socket controller for programmatic access
+            updateSocketController()
+            appDelegate.configure(tabManager: tabManager, notificationStore: notificationStore, sidebarState: sidebarState)
+            applyAppearance()
+            // Sync Ghostty app-level color scheme on startup so the
+            // GUI theme picker (`theme = light:X,dark:Y`) selects the
+            // right variant. Without this the user sees the light
+            // theme on every launch when their saved appearanceMode
+            // is `dark` — `.onChange(of: appearanceMode)` doesn't
+            // fire on initial load (no change to react to), so the
+            // GhosttyApp keeps the default LIGHT scheme it was
+            // initialized with and the next config reload picks the
+            // light theme.
+            syncGhosttyAppColorScheme()
+            if termMeshEnv("UI_TEST_SHOW_SETTINGS") == "1" {
+                DispatchQueue.main.async {
+                    showSettingsPanel()
+                }
+            }
+        }
+        .onChange(of: appearanceMode) { _ in
+            applyAppearance()
+            // Write terminal color override and reload Ghostty config
+            TerminalThemeOverride.write(for: appearanceMode)
+            configProvider.reloadConfiguration(source: "appearance.toggle")
+            // Sync Ghostty app-level color scheme so new surfaces inherit the correct theme
+            syncGhosttyAppColorScheme()
+        }
+        .onChange(of: terminalFontFamily) { _ in applyTerminalSettings() }
+        .onChange(of: terminalFontSize) { _ in applyTerminalSettings() }
+        .onChange(of: terminalThemeLight) { _ in applyTerminalSettings() }
+        .onChange(of: terminalThemeDark) { _ in applyTerminalSettings() }
+        .onChange(of: terminalBgOpacity) { _ in applyTerminalSettings() }
+        .onChange(of: terminalCursorColor) { _ in applyTerminalSettings() }
+        .onChange(of: terminalCursorStyle) { _ in applyTerminalSettings() }
+        .onChange(of: terminalScrollback) { _ in applyTerminalSettings() }
+        .onChange(of: terminalUnfocusedOpacity) { _ in applyTerminalSettings() }
+        .onChange(of: terminalDividerColor) { _ in applyTerminalSettings() }
+        .onChange(of: socketControlMode) { _ in
+            updateSocketController()
+        }
+    }
+
+    @ViewBuilder
+    private var primaryWindowContent: some View {
+        primaryWindowBaseContent
+            .onReceive(
+                NotificationCenter.default.publisher(for: .teamCreationRequested)
+                    .merge(with: NotificationCenter.default.publisher(for: .openCreateTeamSheetInResumeMode))
+                    .eraseToAnyPublisher()
+            ) { note in
+                if let kw = NSApp.keyWindow, let ctx = AppDelegate.shared?.contextForMainWindow(kw) {
+                    teamCreationTabManager = ctx.tabManager
+                } else if let mw = NSApp.mainWindow, let ctx = AppDelegate.shared?.contextForMainWindow(mw) {
+                    teamCreationTabManager = ctx.tabManager
+                } else {
+                    teamCreationTabManager = nil
+                }
+                teamCreationInitialMode = note.name == .openCreateTeamSheetInResumeMode ? "resume" : "new"
+                showTeamCreation = true
+            }
+            .onReceive(NotificationCenter.default.publisher(for: .spawnCLIRequested)) { _ in
+                Task { @MainActor in
+                    await showSpawnCLIDialog()
+                }
+            }
+            .sheet(isPresented: $showTeamCreation) {
+                makeTeamCreationView()
+            }
+    }
+
     var body: some Scene {
         // Restrict WindowGroup to only create the initial primary window.
         // Use a unique ID that the system won't match for state-restoration
@@ -204,144 +370,7 @@ struct TermMeshApp: App {
         // All additional windows are created via AppDelegate.createMainWindow()
         // with their own TabManager, avoiding the shared-@StateObject problem.
         WindowGroup(id: "term-mesh-primary") {
-            ContentView(updateViewModel: appDelegate.updateViewModel, windowId: primaryWindowId)
-                .environmentObject(tabManager)
-                .environmentObject(notificationStore)
-                .environmentObject(sidebarState)
-                .environmentObject(sidebarSelectionState)
-                .environment(\.ghosttyTheme, ghosttyTheme)
-                .withServices()
-                .onReceive(NotificationCenter.default.publisher(for: .ghosttyDefaultBackgroundDidChange)) { _ in
-                    ghosttyTheme = .current
-                }
-                .onAppear {
-#if DEBUG
-                    if termMeshEnv("UI_TEST_MODE") == "1" {
-                        UpdateLogStore.shared.append("ui test: TermMeshApp onAppear")
-                    }
-#endif
-                    // Duplicate WindowGroup scene guard: if a primary window is already
-                    // registered, this onAppear is firing for a duplicate scene. Skip
-                    // configure/socket setup to prevent AppDelegate.tabManager from being
-                    // overwritten, and close the duplicate window.
-                    let existingWindows = appDelegate.mainWindowContexts.count
-#if DEBUG
-                    dlog("window.WindowGroup.onAppear primaryWindowId=\(primaryWindowId.uuidString.prefix(8)) existingWindows=\(existingWindows)")
-#endif
-                    // The primary window registers via WindowAccessor before onAppear fires,
-                    // so count == 1 is normal. A duplicate scene produces count >= 2.
-                    if existingWindows > 1 {
-#if DEBUG
-                        dlog("window.WindowGroup.onAppear DUPLICATE_SCENE existingWindows=\(existingWindows) — blocking configure, closing duplicate")
-#endif
-                        DispatchQueue.main.async {
-                            if let duplicateWindow = NSApp.windows.last,
-                               duplicateWindow.contentView != nil,
-                               appDelegate.mainWindowContexts.count > 1 {
-                                duplicateWindow.close()
-                            }
-                        }
-                        return
-                    }
-                    // Start the Unix socket controller for programmatic access
-                    updateSocketController()
-                    appDelegate.configure(tabManager: tabManager, notificationStore: notificationStore, sidebarState: sidebarState)
-                    applyAppearance()
-                    // Sync Ghostty app-level color scheme on startup so the
-                    // GUI theme picker (`theme = light:X,dark:Y`) selects the
-                    // right variant. Without this the user sees the light
-                    // theme on every launch when their saved appearanceMode
-                    // is `dark` — `.onChange(of: appearanceMode)` doesn't
-                    // fire on initial load (no change to react to), so the
-                    // GhosttyApp keeps the default LIGHT scheme it was
-                    // initialized with and the next config reload picks the
-                    // light theme.
-                    syncGhosttyAppColorScheme()
-                    if termMeshEnv("UI_TEST_SHOW_SETTINGS") == "1" {
-                        DispatchQueue.main.async {
-                            showSettingsPanel()
-                        }
-                    }
-                }
-                .onChange(of: appearanceMode) { _ in
-                    applyAppearance()
-                    // Write terminal color override and reload Ghostty config
-                    TerminalThemeOverride.write(for: appearanceMode)
-                    configProvider.reloadConfiguration(source: "appearance.toggle")
-                    // Sync Ghostty app-level color scheme so new surfaces inherit the correct theme
-                    syncGhosttyAppColorScheme()
-                }
-                .onChange(of: terminalFontFamily) { _ in applyTerminalSettings() }
-                .onChange(of: terminalFontSize) { _ in applyTerminalSettings() }
-                .onChange(of: terminalThemeLight) { _ in applyTerminalSettings() }
-                .onChange(of: terminalThemeDark) { _ in applyTerminalSettings() }
-                .onChange(of: terminalBgOpacity) { _ in applyTerminalSettings() }
-                .onChange(of: terminalCursorColor) { _ in applyTerminalSettings() }
-                .onChange(of: terminalCursorStyle) { _ in applyTerminalSettings() }
-                .onChange(of: terminalScrollback) { _ in applyTerminalSettings() }
-                .onChange(of: terminalUnfocusedOpacity) { _ in applyTerminalSettings() }
-                .onChange(of: terminalDividerColor) { _ in applyTerminalSettings() }
-                .onChange(of: socketControlMode) { _ in
-                    updateSocketController()
-                }
-                .onReceive(NotificationCenter.default.publisher(for: .teamCreationRequested)) { _ in
-                    if let kw = NSApp.keyWindow, let ctx = AppDelegate.shared?.contextForMainWindow(kw) {
-                        teamCreationTabManager = ctx.tabManager
-                    } else if let mw = NSApp.mainWindow, let ctx = AppDelegate.shared?.contextForMainWindow(mw) {
-                        teamCreationTabManager = ctx.tabManager
-                    } else {
-                        teamCreationTabManager = nil
-                    }
-                    showTeamCreation = true
-                }
-                .onReceive(NotificationCenter.default.publisher(for: .spawnCLIRequested)) { _ in
-                    Task { @MainActor in
-                        await showSpawnCLIDialog()
-                    }
-                }
-                .sheet(isPresented: $showTeamCreation) {
-                    TeamCreationView { teamName, leaderMode, leaderModel, agents, worktreeMode, executionMode, resumeSessionId in
-                        // Use the TabManager captured at menu-click time (before
-                        // the sheet stole key window focus).
-                        let activeTabManager = teamCreationTabManager ?? tabManager
-                        let workDir = activeTabManager.selectedTab?.currentDirectory
-                            ?? FileManager.default.currentDirectoryPath
-                        let agentTuples: [(name: String, cli: String, model: String, agentType: String, color: String, instructions: String)] = agents.map { row in
-                            let customInstructions = row.customInstructions == row.preset.instructions
-                                ? ""
-                                : row.customInstructions
-                            let effectiveInstructions = AgentRunbookService.shared.composeInstructions(
-                                roleName: row.preset.name,
-                                presetInstructions: row.preset.instructions,
-                                customInstructions: customInstructions,
-                                workingDirectory: workDir,
-                                mode: .digest
-                            )
-                            return (
-                                name: row.preset.name,
-                                cli: row.preset.cli,
-                                model: row.preset.model,
-                                agentType: row.preset.name,
-                                color: row.preset.color,
-                                instructions: effectiveInstructions
-                            )
-                        }
-                        let leaderSessionId = UUID().uuidString
-                        let orchestrator = TeamOrchestrator.shared
-                        _ = orchestrator.createTeam(
-                            name: teamName,
-                            agents: agentTuples,
-                            workingDirectory: workDir,
-                            leaderSessionId: leaderSessionId,
-                            leaderMode: leaderMode,
-                            leaderModel: leaderModel,
-                            resumeSessionId: resumeSessionId,
-                            worktreeMode: worktreeMode,
-                            executionMode: executionMode,
-                            tabManager: activeTabManager
-                        )
-                    }
-                }
+            primaryWindowContent
         }
         // Prevent macOS from creating duplicate WindowGroup scenes via
         // state restoration, dock clicks, or external events. Only the

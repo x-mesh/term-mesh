@@ -1,0 +1,838 @@
+{
+  "quick" : [
+    {
+      "icon" : "person.2",
+      "name" : "2 Agents",
+      "roles" : [
+        "explorer",
+        "executor"
+      ],
+      "slug" : "2-agents"
+    },
+    {
+      "icon" : "person.3",
+      "name" : "3 Agents",
+      "roles" : [
+        "explorer",
+        "executor",
+        "reviewer"
+      ],
+      "slug" : "3-agents"
+    },
+    {
+      "icon" : "ladybug",
+      "name" : "Debug Squad",
+      "roles" : [
+        "debugger",
+        "tester",
+        "explorer"
+      ],
+      "slug" : "debug-squad"
+    },
+    {
+      "icon" : "magnifyingglass",
+      "name" : "Deep Search",
+      "roles" : [
+        "explorer",
+        "researcher",
+        "architect"
+      ],
+      "slug" : "deep-search"
+    },
+    {
+      "icon" : "shippingbox",
+      "name" : "Ship It",
+      "roles" : [
+        "executor",
+        "tester",
+        "writer",
+        "devops"
+      ],
+      "slug" : "ship-it"
+    },
+    {
+      "icon" : "star.circle",
+      "name" : "Super Team",
+      "roles" : [
+        "planner",
+        "architect",
+        "explorer",
+        "executor",
+        "frontend",
+        "backend",
+        "tester",
+        "reviewer",
+        "security",
+        "writer"
+      ],
+      "slug" : "super-team"
+    }
+  ],
+  "schema" : 1,
+  "smart" : [
+    {
+      "agents" : [
+        {
+          "fallbackCli" : "claude",
+          "fallbackModel" : "sonnet",
+          "primaryCli" : "claude",
+          "primaryModel" : "haiku",
+          "reason" : "Fast lookups",
+          "role" : "explorer"
+        },
+        {
+          "fallbackCli" : "claude",
+          "fallbackModel" : "sonnet",
+          "primaryCli" : "claude",
+          "primaryModel" : "sonnet",
+          "reason" : "Best general coding",
+          "role" : "executor"
+        },
+        {
+          "fallbackCli" : "claude",
+          "fallbackModel" : "sonnet",
+          "primaryCli" : "codex",
+          "primaryModel" : "opus",
+          "reason" : "Fast code review",
+          "role" : "reviewer"
+        }
+      ],
+      "description" : "General development — explore, code, review",
+      "icon" : "person.3",
+      "id" : "standard",
+      "leaderMode" : "claude",
+      "name" : "Standard"
+    },
+    {
+      "agents" : [
+        {
+          "fallbackCli" : "claude",
+          "fallbackModel" : "opus",
+          "primaryCli" : "claude",
+          "primaryModel" : "opus",
+          "reason" : "Spec-driven design",
+          "role" : "architect"
+        },
+        {
+          "fallbackCli" : "claude",
+          "fallbackModel" : "sonnet",
+          "primaryCli" : "claude",
+          "primaryModel" : "sonnet",
+          "reason" : "Implementation",
+          "role" : "executor"
+        },
+        {
+          "fallbackCli" : "claude",
+          "fallbackModel" : "sonnet",
+          "primaryCli" : "codex",
+          "primaryModel" : "opus",
+          "reason" : "Fast review",
+          "role" : "reviewer"
+        },
+        {
+          "fallbackCli" : "claude",
+          "fallbackModel" : "sonnet",
+          "primaryCli" : "codex",
+          "reason" : "Test writing speed",
+          "role" : "tester"
+        }
+      ],
+      "description" : "Spec-driven design + implementation",
+      "icon" : "building.columns",
+      "id" : "architect",
+      "leaderMode" : "claude",
+      "name" : "Architect"
+    },
+    {
+      "agents" : [
+        {
+          "fallbackCli" : "claude",
+          "fallbackModel" : "haiku",
+          "primaryCli" : "gemini",
+          "reason" : "1M context",
+          "role" : "explorer"
+        },
+        {
+          "fallbackCli" : "claude",
+          "fallbackModel" : "sonnet",
+          "primaryCli" : "gemini",
+          "reason" : "WebDev Arena #1",
+          "role" : "frontend"
+        },
+        {
+          "fallbackCli" : "claude",
+          "fallbackModel" : "sonnet",
+          "primaryCli" : "claude",
+          "primaryModel" : "sonnet",
+          "reason" : "API \/ logic",
+          "role" : "backend"
+        },
+        {
+          "fallbackCli" : "claude",
+          "fallbackModel" : "sonnet",
+          "primaryCli" : "codex",
+          "primaryModel" : "opus",
+          "reason" : "Fast review",
+          "role" : "reviewer"
+        },
+        {
+          "fallbackCli" : "claude",
+          "fallbackModel" : "sonnet",
+          "primaryCli" : "claude",
+          "primaryModel" : "sonnet",
+          "reason" : "Test coverage",
+          "role" : "tester"
+        }
+      ],
+      "description" : "Frontend + backend with optimal providers",
+      "icon" : "rectangle.stack",
+      "id" : "fullstack",
+      "leaderMode" : "claude",
+      "name" : "Full Stack"
+    },
+    {
+      "agents" : [
+        {
+          "fallbackCli" : "claude",
+          "fallbackModel" : "sonnet",
+          "primaryCli" : "gemini",
+          "reason" : "1M context analysis",
+          "role" : "explorer"
+        },
+        {
+          "fallbackCli" : "claude",
+          "fallbackModel" : "sonnet",
+          "primaryCli" : "claude",
+          "primaryModel" : "sonnet",
+          "reason" : "Multi-file changes",
+          "role" : "refactorer"
+        },
+        {
+          "fallbackCli" : "claude",
+          "fallbackModel" : "sonnet",
+          "primaryCli" : "codex",
+          "primaryModel" : "opus",
+          "reason" : "Change verification",
+          "role" : "reviewer"
+        },
+        {
+          "fallbackCli" : "claude",
+          "fallbackModel" : "sonnet",
+          "primaryCli" : "claude",
+          "primaryModel" : "sonnet",
+          "reason" : "Regression tests",
+          "role" : "tester"
+        }
+      ],
+      "description" : "Large-scale refactoring with deep analysis",
+      "icon" : "arrow.triangle.2.circlepath",
+      "id" : "refactor",
+      "leaderMode" : "claude",
+      "name" : "Refactor"
+    },
+    {
+      "agents" : [
+        {
+          "fallbackCli" : "claude",
+          "fallbackModel" : "sonnet",
+          "primaryCli" : "claude",
+          "primaryModel" : "sonnet",
+          "reason" : "Spec → test gen",
+          "role" : "architect"
+        },
+        {
+          "fallbackCli" : "claude",
+          "fallbackModel" : "sonnet",
+          "primaryCli" : "codex",
+          "reason" : "Fast test writing",
+          "role" : "tester"
+        },
+        {
+          "fallbackCli" : "claude",
+          "fallbackModel" : "sonnet",
+          "primaryCli" : "codex",
+          "primaryModel" : "opus",
+          "reason" : "Review + safety",
+          "role" : "reviewer"
+        },
+        {
+          "fallbackCli" : "claude",
+          "fallbackModel" : "sonnet",
+          "primaryCli" : "claude",
+          "primaryModel" : "opus",
+          "reason" : "Deep security audit",
+          "role" : "security"
+        }
+      ],
+      "description" : "Quality-focused with spec and security review",
+      "icon" : "checkmark.shield",
+      "id" : "quality",
+      "leaderMode" : "claude",
+      "name" : "Quality"
+    },
+    {
+      "agents" : [
+        {
+          "fallbackCli" : "claude",
+          "fallbackModel" : "sonnet",
+          "primaryCli" : "claude",
+          "primaryModel" : "opus",
+          "reason" : "AWS native",
+          "role" : "architect"
+        },
+        {
+          "fallbackCli" : "claude",
+          "fallbackModel" : "sonnet",
+          "primaryCli" : "claude",
+          "primaryModel" : "sonnet",
+          "reason" : "IAM Autopilot",
+          "role" : "infra"
+        },
+        {
+          "fallbackCli" : "claude",
+          "fallbackModel" : "sonnet",
+          "primaryCli" : "claude",
+          "primaryModel" : "sonnet",
+          "reason" : "CDK \/ CF coding",
+          "role" : "executor"
+        }
+      ],
+      "description" : "AWS infrastructure with Kiro native integration",
+      "icon" : "cloud",
+      "id" : "aws",
+      "leaderMode" : "claude",
+      "name" : "AWS Infra"
+    },
+    {
+      "agents" : [
+        {
+          "fallbackCli" : "claude",
+          "fallbackModel" : "opus",
+          "primaryCli" : "claude",
+          "primaryModel" : "opus",
+          "reason" : "Market\/tech research",
+          "role" : "researcher"
+        },
+        {
+          "fallbackCli" : "claude",
+          "fallbackModel" : "opus",
+          "primaryCli" : "claude",
+          "primaryModel" : "opus",
+          "reason" : "System architecture draft",
+          "role" : "architect"
+        },
+        {
+          "fallbackCli" : "claude",
+          "fallbackModel" : "sonnet",
+          "primaryCli" : "gemini",
+          "reason" : "User flow & wireframes",
+          "role" : "ux"
+        },
+        {
+          "fallbackCli" : "claude",
+          "fallbackModel" : "opus",
+          "primaryCli" : "claude",
+          "primaryModel" : "opus",
+          "reason" : "Task decomposition",
+          "role" : "planner"
+        },
+        {
+          "fallbackCli" : "claude",
+          "fallbackModel" : "sonnet",
+          "primaryCli" : "claude",
+          "primaryModel" : "opus",
+          "reason" : "Early risk assessment",
+          "role" : "security"
+        },
+        {
+          "fallbackCli" : "claude",
+          "fallbackModel" : "haiku",
+          "primaryCli" : "claude",
+          "primaryModel" : "haiku",
+          "reason" : "PRD & spec documentation",
+          "role" : "writer"
+        }
+      ],
+      "description" : "Turn a vague idea into a validated plan with 6 specialists",
+      "icon" : "lightbulb",
+      "id" : "idea",
+      "leaderMode" : "claude",
+      "name" : "Idea Discovery"
+    },
+    {
+      "agents" : [
+        {
+          "fallbackCli" : "claude",
+          "fallbackModel" : "opus",
+          "primaryCli" : "claude",
+          "primaryModel" : "opus",
+          "reason" : "Core tech research",
+          "role" : "researcher"
+        },
+        {
+          "fallbackCli" : "claude",
+          "fallbackModel" : "sonnet",
+          "primaryCli" : "gemini",
+          "reason" : "1M context codebase scan",
+          "role" : "explorer"
+        },
+        {
+          "fallbackCli" : "claude",
+          "fallbackModel" : "opus",
+          "primaryCli" : "claude",
+          "primaryModel" : "opus",
+          "reason" : "Architecture evaluation",
+          "role" : "architect"
+        },
+        {
+          "fallbackCli" : "claude",
+          "fallbackModel" : "sonnet",
+          "primaryCli" : "claude",
+          "primaryModel" : "sonnet",
+          "reason" : "Data model research",
+          "role" : "data"
+        },
+        {
+          "fallbackCli" : "claude",
+          "fallbackModel" : "sonnet",
+          "primaryCli" : "claude",
+          "primaryModel" : "opus",
+          "reason" : "Threat modeling",
+          "role" : "security"
+        },
+        {
+          "fallbackCli" : "claude",
+          "fallbackModel" : "opus",
+          "primaryCli" : "claude",
+          "primaryModel" : "opus",
+          "reason" : "AI\/ML feasibility & cost",
+          "role" : "ai"
+        }
+      ],
+      "description" : "6 domain experts research in parallel for comprehensive analysis",
+      "icon" : "magnifyingglass",
+      "id" : "researcher",
+      "leaderMode" : "claude",
+      "name" : "Full Researcher"
+    },
+    {
+      "agents" : [
+        {
+          "fallbackCli" : "claude",
+          "fallbackModel" : "opus",
+          "primaryCli" : "claude",
+          "primaryModel" : "opus",
+          "reason" : "Scope & MVP boundary",
+          "role" : "planner"
+        },
+        {
+          "fallbackCli" : "claude",
+          "fallbackModel" : "sonnet",
+          "primaryCli" : "gemini",
+          "reason" : "WebDev Arena #1",
+          "role" : "frontend"
+        },
+        {
+          "fallbackCli" : "claude",
+          "fallbackModel" : "sonnet",
+          "primaryCli" : "claude",
+          "primaryModel" : "sonnet",
+          "reason" : "API & business logic",
+          "role" : "backend"
+        },
+        {
+          "fallbackCli" : "claude",
+          "fallbackModel" : "sonnet",
+          "primaryCli" : "codex",
+          "reason" : "Fast boilerplate",
+          "role" : "executor"
+        },
+        {
+          "fallbackCli" : "claude",
+          "fallbackModel" : "sonnet",
+          "primaryCli" : "codex",
+          "reason" : "Critical path tests",
+          "role" : "tester"
+        },
+        {
+          "fallbackCli" : "claude",
+          "fallbackModel" : "haiku",
+          "primaryCli" : "claude",
+          "primaryModel" : "haiku",
+          "reason" : "README & setup guide",
+          "role" : "writer"
+        }
+      ],
+      "description" : "Ship a minimum viable product fast with a full team",
+      "icon" : "rocket",
+      "id" : "mvp",
+      "leaderMode" : "claude",
+      "name" : "Startup MVP"
+    },
+    {
+      "agents" : [
+        {
+          "fallbackCli" : "claude",
+          "fallbackModel" : "opus",
+          "primaryCli" : "claude",
+          "primaryModel" : "opus",
+          "reason" : "OWASP Top 10 audit",
+          "role" : "security"
+        },
+        {
+          "fallbackCli" : "claude",
+          "fallbackModel" : "sonnet",
+          "primaryCli" : "gemini",
+          "reason" : "Full codebase scan",
+          "role" : "explorer"
+        },
+        {
+          "fallbackCli" : "claude",
+          "fallbackModel" : "opus",
+          "primaryCli" : "codex",
+          "primaryModel" : "opus",
+          "reason" : "Logic flaw detection",
+          "role" : "reviewer"
+        },
+        {
+          "fallbackCli" : "claude",
+          "fallbackModel" : "sonnet",
+          "primaryCli" : "claude",
+          "primaryModel" : "sonnet",
+          "reason" : "Cloud\/IAM security",
+          "role" : "infra"
+        },
+        {
+          "fallbackCli" : "claude",
+          "fallbackModel" : "sonnet",
+          "primaryCli" : "claude",
+          "primaryModel" : "sonnet",
+          "reason" : "OS\/network hardening",
+          "role" : "syseng"
+        },
+        {
+          "fallbackCli" : "claude",
+          "fallbackModel" : "sonnet",
+          "primaryCli" : "claude",
+          "primaryModel" : "sonnet",
+          "reason" : "Security test cases",
+          "role" : "tester"
+        }
+      ],
+      "description" : "Comprehensive security review across code, infra, and network",
+      "icon" : "shield.lefthalf.filled",
+      "id" : "security-audit",
+      "leaderMode" : "claude",
+      "name" : "Security Audit"
+    },
+    {
+      "agents" : [
+        {
+          "fallbackCli" : "claude",
+          "fallbackModel" : "sonnet",
+          "primaryCli" : "claude",
+          "primaryModel" : "sonnet",
+          "reason" : "Profiling & bottlenecks",
+          "role" : "perf"
+        },
+        {
+          "fallbackCli" : "claude",
+          "fallbackModel" : "sonnet",
+          "primaryCli" : "gemini",
+          "reason" : "Hot path tracing",
+          "role" : "explorer"
+        },
+        {
+          "fallbackCli" : "claude",
+          "fallbackModel" : "sonnet",
+          "primaryCli" : "claude",
+          "primaryModel" : "sonnet",
+          "reason" : "Memory leak analysis",
+          "role" : "debugger"
+        },
+        {
+          "fallbackCli" : "claude",
+          "fallbackModel" : "sonnet",
+          "primaryCli" : "claude",
+          "primaryModel" : "sonnet",
+          "reason" : "Query optimization",
+          "role" : "data"
+        },
+        {
+          "fallbackCli" : "claude",
+          "fallbackModel" : "sonnet",
+          "primaryCli" : "claude",
+          "primaryModel" : "sonnet",
+          "reason" : "Optimization impl",
+          "role" : "executor"
+        },
+        {
+          "fallbackCli" : "claude",
+          "fallbackModel" : "sonnet",
+          "primaryCli" : "codex",
+          "reason" : "Benchmarks & regression",
+          "role" : "tester"
+        }
+      ],
+      "description" : "Find bottlenecks, optimize, and verify with benchmarks",
+      "icon" : "gauge.with.dots.needle.67percent",
+      "id" : "perf-lab",
+      "leaderMode" : "claude",
+      "name" : "Performance Lab"
+    },
+    {
+      "agents" : [
+        {
+          "fallbackCli" : "claude",
+          "fallbackModel" : "sonnet",
+          "primaryCli" : "claude",
+          "primaryModel" : "sonnet",
+          "reason" : "OpenAPI spec design",
+          "role" : "api"
+        },
+        {
+          "fallbackCli" : "claude",
+          "fallbackModel" : "opus",
+          "primaryCli" : "claude",
+          "primaryModel" : "opus",
+          "reason" : "Schema & versioning",
+          "role" : "architect"
+        },
+        {
+          "fallbackCli" : "claude",
+          "fallbackModel" : "sonnet",
+          "primaryCli" : "claude",
+          "primaryModel" : "sonnet",
+          "reason" : "Endpoint implementation",
+          "role" : "backend"
+        },
+        {
+          "fallbackCli" : "claude",
+          "fallbackModel" : "sonnet",
+          "primaryCli" : "codex",
+          "reason" : "Contract testing",
+          "role" : "tester"
+        },
+        {
+          "fallbackCli" : "claude",
+          "fallbackModel" : "sonnet",
+          "primaryCli" : "claude",
+          "primaryModel" : "opus",
+          "reason" : "Auth & injection defense",
+          "role" : "security"
+        },
+        {
+          "fallbackCli" : "claude",
+          "fallbackModel" : "haiku",
+          "primaryCli" : "claude",
+          "primaryModel" : "haiku",
+          "reason" : "API docs & examples",
+          "role" : "writer"
+        }
+      ],
+      "description" : "Design, build, secure, and document APIs end-to-end",
+      "icon" : "arrow.left.arrow.right",
+      "id" : "api-factory",
+      "leaderMode" : "claude",
+      "name" : "API Factory"
+    },
+    {
+      "agents" : [
+        {
+          "fallbackCli" : "claude",
+          "fallbackModel" : "sonnet",
+          "primaryCli" : "gemini",
+          "reason" : "1M ctx full scan",
+          "role" : "explorer"
+        },
+        {
+          "fallbackCli" : "claude",
+          "fallbackModel" : "opus",
+          "primaryCli" : "claude",
+          "primaryModel" : "opus",
+          "reason" : "Migration strategy",
+          "role" : "architect"
+        },
+        {
+          "fallbackCli" : "claude",
+          "fallbackModel" : "sonnet",
+          "primaryCli" : "claude",
+          "primaryModel" : "sonnet",
+          "reason" : "Incremental conversion",
+          "role" : "refactorer"
+        },
+        {
+          "fallbackCli" : "claude",
+          "fallbackModel" : "sonnet",
+          "primaryCli" : "codex",
+          "reason" : "Bulk transforms",
+          "role" : "executor"
+        },
+        {
+          "fallbackCli" : "claude",
+          "fallbackModel" : "sonnet",
+          "primaryCli" : "claude",
+          "primaryModel" : "sonnet",
+          "reason" : "Regression & diff verify",
+          "role" : "tester"
+        },
+        {
+          "fallbackCli" : "claude",
+          "fallbackModel" : "opus",
+          "primaryCli" : "codex",
+          "primaryModel" : "opus",
+          "reason" : "Conversion accuracy",
+          "role" : "reviewer"
+        }
+      ],
+      "description" : "Large-scale framework, language, or architecture migration",
+      "icon" : "arrow.triangle.swap",
+      "id" : "migration",
+      "leaderMode" : "claude",
+      "name" : "Migration"
+    },
+    {
+      "agents" : [
+        {
+          "fallbackCli" : "claude",
+          "fallbackModel" : "opus",
+          "primaryCli" : "claude",
+          "primaryModel" : "opus",
+          "reason" : "Prompt & RAG pipeline",
+          "role" : "ai"
+        },
+        {
+          "fallbackCli" : "claude",
+          "fallbackModel" : "opus",
+          "primaryCli" : "claude",
+          "primaryModel" : "opus",
+          "reason" : "System & cost design",
+          "role" : "architect"
+        },
+        {
+          "fallbackCli" : "claude",
+          "fallbackModel" : "sonnet",
+          "primaryCli" : "claude",
+          "primaryModel" : "sonnet",
+          "reason" : "API orchestration",
+          "role" : "backend"
+        },
+        {
+          "fallbackCli" : "claude",
+          "fallbackModel" : "sonnet",
+          "primaryCli" : "claude",
+          "primaryModel" : "sonnet",
+          "reason" : "Vector DB & embeddings",
+          "role" : "data"
+        },
+        {
+          "fallbackCli" : "claude",
+          "fallbackModel" : "sonnet",
+          "primaryCli" : "claude",
+          "primaryModel" : "sonnet",
+          "reason" : "Integration impl",
+          "role" : "executor"
+        },
+        {
+          "fallbackCli" : "claude",
+          "fallbackModel" : "sonnet",
+          "primaryCli" : "claude",
+          "primaryModel" : "sonnet",
+          "reason" : "Eval & hallucination tests",
+          "role" : "tester"
+        }
+      ],
+      "description" : "Build LLM\/RAG-powered features with AI specialists",
+      "icon" : "cpu",
+      "id" : "ai-product",
+      "leaderMode" : "claude",
+      "name" : "AI Product"
+    }
+  ],
+  "workflow" : [
+    {
+      "icon" : "ladybug",
+      "id" : "bug-triage",
+      "leaderMode" : "repl",
+      "name" : "Bug Triage",
+      "reviewCheckpoints" : [
+        "blocked on repro",
+        "review fix scope"
+      ],
+      "roles" : [
+        "debugger",
+        "explorer",
+        "tester"
+      ],
+      "taskTemplates" : [
+        "reproduce issue",
+        "isolate root cause",
+        "verify fix"
+      ]
+    },
+    {
+      "icon" : "hammer",
+      "id" : "feature-build",
+      "leaderMode" : "claude",
+      "name" : "Feature Build",
+      "reviewCheckpoints" : [
+        "implementation review",
+        "final acceptance"
+      ],
+      "roles" : [
+        "planner",
+        "executor",
+        "tester",
+        "reviewer"
+      ],
+      "taskTemplates" : [
+        "spec slice",
+        "implement slice",
+        "test slice",
+        "review handoff"
+      ]
+    },
+    {
+      "icon" : "arrow.triangle.2.circlepath",
+      "id" : "refactor-verify",
+      "leaderMode" : "claude",
+      "name" : "Refactor + Verify",
+      "reviewCheckpoints" : [
+        "behavior-preserving review",
+        "test pass review"
+      ],
+      "roles" : [
+        "refactorer",
+        "reviewer",
+        "tester"
+      ],
+      "taskTemplates" : [
+        "map risky areas",
+        "refactor small batch",
+        "run regression checks"
+      ]
+    },
+    {
+      "icon" : "shippingbox",
+      "id" : "release-prep",
+      "leaderMode" : "claude",
+      "name" : "Release Prep",
+      "reviewCheckpoints" : [
+        "go\/no-go review",
+        "release artifact review"
+      ],
+      "roles" : [
+        "planner",
+        "reviewer",
+        "tester",
+        "writer",
+        "devops"
+      ],
+      "taskTemplates" : [
+        "release checklist",
+        "validation pass",
+        "notes + packaging"
+      ]
+    }
+  ]
+}

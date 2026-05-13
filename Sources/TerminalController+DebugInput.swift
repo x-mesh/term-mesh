@@ -5,12 +5,13 @@ import Bonsplit
 import WebKit
 
 extension TerminalController {
+    @discardableResult
     func sendKeyEvent(
         surface: ghostty_surface_t,
         keycode: UInt32,
         mods: ghostty_input_mods_e = GHOSTTY_MODS_NONE,
         text: String? = nil
-    ) {
+    ) -> Bool {
         var keyEvent = ghostty_input_key_s()
         keyEvent.action = GHOSTTY_ACTION_PRESS
         keyEvent.keycode = keycode
@@ -19,6 +20,10 @@ extension TerminalController {
         keyEvent.unshifted_codepoint = 0
         keyEvent.composing = false
         var pressResult = true
+        #if DEBUG
+        let surfaceLabel = AppDelegate.shared?.locateGhosttySurface(surface)?.panelId.uuidString.prefix(8) ?? "unknown"
+        dlog("keyEvent.attempt keycode=\(keycode) surface=\(surfaceLabel)")
+        #endif
         if let text {
             text.withCString { ptr in
                 keyEvent.text = ptr
@@ -35,13 +40,16 @@ extension TerminalController {
         keyEvent.text = nil
         let releaseResult = ghostty_surface_key(surface, keyEvent)
         #if DEBUG
-        if !pressResult {
-            dlog("key.PRESS_ignored keycode=\(keycode) mods=\(mods.rawValue)")
+        if pressResult {
+            dlog("keyEvent.PRESS_ok keycode=\(keycode) surface=\(surfaceLabel)")
+        } else {
+            dlog("key.PRESS_ignored keycode=\(keycode) surface=\(surfaceLabel) mods=\(mods.rawValue)")
         }
         if !releaseResult {
-            dlog("key.RELEASE_ignored keycode=\(keycode) mods=\(mods.rawValue)")
+            dlog("key.RELEASE_ignored keycode=\(keycode) surface=\(surfaceLabel) mods=\(mods.rawValue)")
         }
         #endif
+        return pressResult
     }
 
     func sendTextEvent(surface: ghostty_surface_t, text: String) {
@@ -165,38 +173,115 @@ extension TerminalController {
     func sendNamedKey(_ surface: ghostty_surface_t, keyName: String) -> Bool {
         switch keyName.lowercased() {
         case "ctrl-c", "ctrl+c", "sigint":
-            sendKeyEvent(surface: surface, keycode: UInt32(kVK_ANSI_C), mods: GHOSTTY_MODS_CTRL)
-            return true
+            return sendKeyEvent(surface: surface, keycode: UInt32(kVK_ANSI_C), mods: GHOSTTY_MODS_CTRL)
         case "ctrl-d", "ctrl+d", "eof":
-            sendKeyEvent(surface: surface, keycode: UInt32(kVK_ANSI_D), mods: GHOSTTY_MODS_CTRL)
-            return true
+            return sendKeyEvent(surface: surface, keycode: UInt32(kVK_ANSI_D), mods: GHOSTTY_MODS_CTRL)
         case "ctrl-z", "ctrl+z", "sigtstp":
-            sendKeyEvent(surface: surface, keycode: UInt32(kVK_ANSI_Z), mods: GHOSTTY_MODS_CTRL)
-            return true
+            return sendKeyEvent(surface: surface, keycode: UInt32(kVK_ANSI_Z), mods: GHOSTTY_MODS_CTRL)
         case "ctrl-\\", "ctrl+\\", "sigquit":
-            sendKeyEvent(surface: surface, keycode: UInt32(kVK_ANSI_Backslash), mods: GHOSTTY_MODS_CTRL)
-            return true
+            return sendKeyEvent(surface: surface, keycode: UInt32(kVK_ANSI_Backslash), mods: GHOSTTY_MODS_CTRL)
         case "enter", "return":
-            sendKeyEvent(surface: surface, keycode: UInt32(kVK_Return), text: "\r")
-            return true
+            return sendKeyEvent(surface: surface, keycode: UInt32(kVK_Return), text: "\r")
         case "tab":
-            sendKeyEvent(surface: surface, keycode: UInt32(kVK_Tab), text: "\t")
-            return true
+            return sendKeyEvent(surface: surface, keycode: UInt32(kVK_Tab), text: "\t")
         case "escape", "esc":
-            sendKeyEvent(surface: surface, keycode: UInt32(kVK_Escape), text: "\u{1b}")
-            return true
+            return sendKeyEvent(surface: surface, keycode: UInt32(kVK_Escape), text: "\u{1b}")
         case "backspace":
-            sendKeyEvent(surface: surface, keycode: UInt32(kVK_Delete), text: "\u{7f}")
-            return true
+            return sendKeyEvent(surface: surface, keycode: UInt32(kVK_Delete), text: "\u{7f}")
         default:
             if keyName.lowercased().hasPrefix("ctrl-") || keyName.lowercased().hasPrefix("ctrl+") {
                 let letter = keyName.dropFirst(5)
                 if letter.count == 1, let char = letter.first, let keycode = keycodeForLetter(char) {
-                    sendKeyEvent(surface: surface, keycode: keycode, mods: GHOSTTY_MODS_CTRL)
-                    return true
+                    return sendKeyEvent(surface: surface, keycode: keycode, mods: GHOSTTY_MODS_CTRL)
                 }
             }
             return false
+        }
+    }
+
+    func sendNamedKeyWithRetry(
+        on terminalSurface: TerminalSurface,
+        keyName: String,
+        completion: @escaping (Bool, String) -> Void
+    ) {
+        let token = KeyDeliveryToken()
+        let generation = terminalSurface.attachGeneration
+        let panelLabel = terminalSurface.id.uuidString.prefix(8)
+        let retryDelays: [Double] = [0.2, 0.5, 1.0, 2.0, 3.0]
+        let totalAttempts = 2 + retryDelays.count
+        var completed = false
+        var lastFailureReason = "delivery_failed"
+
+        func finish(_ delivered: Bool, reason: String) {
+            guard !completed else { return }
+            completed = true
+            if delivered {
+                token.delivered = true
+            }
+            completion(delivered, reason)
+        }
+
+        func attempt(_ ordinal: Int, label: String) -> Bool {
+            guard terminalSurface.attachGeneration == generation else {
+                lastFailureReason = "stale_generation"
+                #if DEBUG
+                dlog("key.retry.drop reason=stale_generation panel=\(panelLabel) key=\(keyName) gen=\(generation) currentGen=\(terminalSurface.attachGeneration) attempt=\(ordinal)/\(totalAttempts)")
+                #endif
+                return false
+            }
+            guard !terminalSurface.hasMarkedTextForInput else {
+                lastFailureReason = "ime_composing"
+                #if DEBUG
+                dlog("key.retry.defer reason=ime_composing panel=\(panelLabel) key=\(keyName) gen=\(generation) attempt=\(ordinal)/\(totalAttempts)")
+                #endif
+                return false
+            }
+            guard let surface = terminalSurface.surface else {
+                lastFailureReason = "surface_nil"
+                #if DEBUG
+                dlog("key.retry.drop reason=surface_nil panel=\(panelLabel) key=\(keyName) gen=\(generation) attempt=\(ordinal)/\(totalAttempts)")
+                #endif
+                return false
+            }
+
+            let ok = sendNamedKey(surface, keyName: keyName)
+            lastFailureReason = ok ? "none" : "press_ignored"
+            #if DEBUG
+            dlog("key.retry.attempt panel=\(panelLabel) key=\(keyName) gen=\(generation) attempt=\(ordinal)/\(totalAttempts) label=\(label) handled=\(ok)")
+            #endif
+            return ok
+        }
+
+        if attempt(1, label: "initial") {
+            finish(true, reason: "delivered")
+            return
+        }
+
+        usleep(10_000)
+        if attempt(2, label: "sync10ms") {
+            finish(true, reason: "delivered")
+            return
+        }
+
+        for (index, delay) in retryDelays.enumerated() {
+            let ordinal = index + 3
+            let isLast = index == retryDelays.count - 1
+            DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [token] in
+                guard !completed else { return }
+                guard !token.delivered else {
+                    #if DEBUG
+                    dlog("key.retry.drop reason=token_delivered panel=\(panelLabel) key=\(keyName) gen=\(generation) attempt=\(ordinal)/\(totalAttempts)")
+                    #endif
+                    return
+                }
+                if attempt(ordinal, label: "async\(index + 1)") {
+                    finish(true, reason: "delivered")
+                } else if lastFailureReason == "stale_generation" {
+                    finish(false, reason: lastFailureReason)
+                } else if isLast {
+                    finish(false, reason: lastFailureReason)
+                }
+            }
         }
     }
 

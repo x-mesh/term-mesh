@@ -89,6 +89,15 @@ pub enum DaemonEvent {
         last_heartbeat_ts: String,
         age_seconds: u64,
     },
+    /// Phase 2.5: 1-second coalesced per-team cumulative token usage. Emitted
+    /// only when at least one agent's counters changed since the previous
+    /// tick. Wire kind is `agent_usage_tick`.
+    AgentUsageTick {
+        team_uuid: String,
+        team_name: String,
+        agents: Vec<crate::headless::UsageTickAgent>,
+        ts_ms: u64,
+    },
 }
 
 /// Broadcast channel sender. All `events.subscribe` connections subscribe from this.
@@ -158,6 +167,16 @@ pub async fn serve(
         ctx.clone(),
         shutdown_rx.clone(),
     ));
+    // Phase 2.5: 1s coalesce → emit `agent_usage_tick` broadcasts.
+    let usage_broadcast_task = tokio::spawn(run_usage_tick_broadcaster(
+        ctx.clone(),
+        shutdown_rx.clone(),
+    ));
+    // Phase 2.5: 30s disk flush for dirty usage counters.
+    let usage_flush_task = tokio::spawn(run_usage_disk_flusher(
+        ctx.clone(),
+        shutdown_rx.clone(),
+    ));
 
     loop {
         tokio::select! {
@@ -188,6 +207,23 @@ pub async fn serve(
         }
     }
     heartbeat_task.abort();
+    usage_broadcast_task.abort();
+    usage_flush_task.abort();
+
+    // Phase 2.5: final usage flush before exit (best-effort).
+    {
+        let mgr = ctx.headless.clone();
+        let _ = tokio::task::spawn_blocking(move || {
+            // We cannot `.lock().await` synchronously here; reuse the runtime's
+            // current_thread executor via blocking_lock.
+            let guard = mgr.blocking_lock();
+            let flushed = guard.flush_dirty_usage();
+            if flushed > 0 {
+                tracing::info!("shutdown: flushed {flushed} usage record(s)");
+            }
+        })
+        .await;
+    }
 
     // Clean up socket file
     if path.exists() {
@@ -278,6 +314,7 @@ async fn stream_subscribe_events(
                 "task_status".into(),
                 "reply".into(),
                 "heartbeat_stale".into(),
+                "agent_usage_tick".into(),
             ]
         })
         .into_iter()
@@ -384,6 +421,7 @@ fn filter_and_serialize(
         DaemonEvent::TaskStatus { .. } => "task_status",
         DaemonEvent::Reply { .. } => "reply",
         DaemonEvent::HeartbeatStale { .. } => "heartbeat_stale",
+        DaemonEvent::AgentUsageTick { .. } => "agent_usage_tick",
     };
     if !filter_kinds.is_empty() && !filter_kinds.contains(kind) {
         return None;
@@ -392,6 +430,76 @@ fn filter_and_serialize(
     // without a leader_session_id filter receives all events (generous default).
     // Per-leader scoping can be tightened in a follow-up without protocol changes.
     serde_json::to_vec(ev).ok()
+}
+
+/// Phase 2.5: every 1s, ask the headless manager which agents have a dirty
+/// usage counter and emit `agent_usage_tick` for each team that has at least
+/// one. Coalesces all stream-json increments observed in the past second.
+async fn run_usage_tick_broadcaster(
+    ctx: Arc<Context>,
+    mut shutdown_rx: watch::Receiver<bool>,
+) {
+    let mut interval = tokio::time::interval(Duration::from_secs(1));
+    interval.tick().await; // consume immediate first tick
+
+    loop {
+        tokio::select! {
+            _ = interval.tick() => {
+                let teams = {
+                    let mgr = ctx.headless.lock().await;
+                    mgr.collect_usage_tick()
+                };
+                if teams.is_empty() {
+                    continue;
+                }
+                let ts_ms = current_time_ms();
+                for t in teams {
+                    let _ = ctx.event_tx.send(DaemonEvent::AgentUsageTick {
+                        team_uuid: t.team_uuid,
+                        team_name: t.team_name,
+                        agents: t.agents,
+                        ts_ms,
+                    });
+                }
+            }
+            changed = shutdown_rx.changed() => {
+                if changed.is_err() || *shutdown_rx.borrow() {
+                    break;
+                }
+            }
+        }
+    }
+}
+
+/// Phase 2.5: every 30s, flush dirty usage counters to `agent.json` on disk.
+/// Disk I/O runs on `spawn_blocking` so the socket runtime is not stalled.
+async fn run_usage_disk_flusher(
+    ctx: Arc<Context>,
+    mut shutdown_rx: watch::Receiver<bool>,
+) {
+    let mut interval = tokio::time::interval(Duration::from_secs(30));
+    interval.tick().await; // skip immediate tick
+
+    loop {
+        tokio::select! {
+            _ = interval.tick() => {
+                let mgr = ctx.headless.clone();
+                let _ = tokio::task::spawn_blocking(move || {
+                    let guard = mgr.blocking_lock();
+                    let flushed = guard.flush_dirty_usage();
+                    if flushed > 0 {
+                        tracing::debug!("usage flush: persisted {flushed} record(s)");
+                    }
+                })
+                .await;
+            }
+            changed = shutdown_rx.changed() => {
+                if changed.is_err() || *shutdown_rx.borrow() {
+                    break;
+                }
+            }
+        }
+    }
 }
 
 async fn run_heartbeat_staleness_watcher(
@@ -1215,9 +1323,109 @@ async fn dispatch(req: &Request, ctx: &Context) -> Response {
             match serde_json::from_value::<P>(req.params.clone()) {
                 Ok(p) => {
                     let mut mgr = ctx.headless.lock().await;
-                    mgr.destroy_team(&p.team_name)
+                    mgr.destroy_team(&p.team_name).await.map(|res| {
+                        serde_json::json!({
+                            "status": "ok",
+                            "team_uuid": res.team_uuid,
+                            "archived_path": res.archived_path,
+                        })
+                    })
+                }
+                Err(e) => Err(format!("invalid params: {e}")),
+            }
+        }
+        "headless.list_resumable" => {
+            #[derive(Deserialize)]
+            struct P {
+                #[serde(default)]
+                git_root: Option<String>,
+                #[serde(default = "default_limit")]
+                limit: usize,
+            }
+            fn default_limit() -> usize {
+                50
+            }
+            let params: P =
+                serde_json::from_value(req.params.clone()).unwrap_or(P {
+                    git_root: None,
+                    limit: 50,
+                });
+            let limit = params.limit.min(200);
+            let mgr = ctx.headless.lock().await;
+            let res = mgr.list_resumable(params.git_root.as_deref(), limit);
+            if let Some(err) = res.fatal_error.as_ref() {
+                Err(err.clone())
+            } else {
+                Ok(serde_json::to_value(res).unwrap())
+            }
+        }
+        "headless.resume_team" => {
+            match serde_json::from_value::<crate::headless::ResumeTeamParams>(
+                req.params.clone(),
+            ) {
+                Ok(p) => {
+                    let mut mgr = ctx.headless.lock().await;
+                    mgr.resume_team(p)
                         .await
-                        .map(|_| serde_json::json!({"status": "ok"}))
+                        .map(|r| serde_json::to_value(r).unwrap())
+                }
+                Err(e) => Err(format!("invalid params: {e}")),
+            }
+        }
+        "headless.set_idle_park_minutes" => {
+            #[derive(Deserialize)]
+            struct P {
+                minutes: u32,
+            }
+            match serde_json::from_value::<P>(req.params.clone()) {
+                Ok(p) => {
+                    let mut mgr = ctx.headless.lock().await;
+                    mgr.set_idle_park_minutes(p.minutes).map(|_| {
+                        serde_json::json!({
+                            "minutes": p.minutes,
+                            "active": p.minutes > 0,
+                        })
+                    })
+                }
+                Err(e) => Err(format!("invalid params: {e}")),
+            }
+        }
+        "headless.park_agent" => {
+            #[derive(Deserialize)]
+            struct P {
+                team_name: String,
+                agent_name: String,
+            }
+            match serde_json::from_value::<P>(req.params.clone()) {
+                Ok(p) => {
+                    let mut mgr = ctx.headless.lock().await;
+                    mgr.park_agent(&p.team_name, &p.agent_name)
+                        .await
+                        .map(|r| serde_json::to_value(r).unwrap())
+                }
+                Err(e) => Err(format!("invalid params: {e}")),
+            }
+        }
+        "headless.unpark_agent" => {
+            #[derive(Deserialize)]
+            struct P {
+                team_name: String,
+                agent_name: String,
+                #[serde(default)]
+                app_socket_path: Option<String>,
+            }
+            match serde_json::from_value::<P>(req.params.clone()) {
+                Ok(p) => {
+                    let mut mgr = ctx.headless.lock().await;
+                    mgr.unpark_agent(&p.team_name, &p.agent_name, p.app_socket_path.as_deref())
+                        .await
+                        .map(|info| {
+                            let mut v = serde_json::to_value(info).unwrap();
+                            if let Some(obj) = v.as_object_mut() {
+                                obj.insert("unparked".into(), serde_json::Value::Bool(true));
+                            }
+                            v
+                        })
                 }
                 Err(e) => Err(format!("invalid params: {e}")),
             }
@@ -1257,6 +1465,8 @@ async fn dispatch(req: &Request, ctx: &Context) -> Response {
                         model: p.model,
                         cli_path: p.cli_path,
                         instructions: p.instructions,
+                        agent_type: None,
+                        color: None,
                     };
                     let mut mgr = ctx.headless.lock().await;
                     match mgr

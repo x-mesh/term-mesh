@@ -6,6 +6,28 @@ import SwiftUI
 @Observable
 public final class BonsplitController {
 
+    public struct PaneHeaderAction: Identifiable {
+        public let id: String
+        public let systemImage: String
+        public let help: String
+        public let accessibilityLabel: String
+        public let action: @MainActor () -> Void
+
+        public init(
+            id: String,
+            systemImage: String,
+            help: String,
+            accessibilityLabel: String,
+            action: @escaping @MainActor () -> Void
+        ) {
+            self.id = id
+            self.systemImage = systemImage
+            self.help = help
+            self.accessibilityLabel = accessibilityLabel
+            self.action = action
+        }
+    }
+
     public struct ExternalTabDropRequest {
         public enum Destination {
             case insert(targetPane: PaneID, targetIndex: Int?)
@@ -54,6 +76,9 @@ public final class BonsplitController {
     /// Called when the user explicitly requests to close a tab from the tab strip UI.
     /// Internal host-driven closes should not use this hook.
     @ObservationIgnored public var onTabCloseRequest: ((_ tabId: TabID, _ paneId: PaneID) -> Void)?
+
+    /// Host-provided action buttons rendered in a pane's header action row.
+    @ObservationIgnored public var paneHeaderActions: ((_ paneId: PaneID, _ selectedTabId: TabID?) -> [PaneHeaderAction])?
 
     // MARK: - Internal State
 
