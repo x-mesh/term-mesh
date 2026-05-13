@@ -320,7 +320,7 @@ struct TeamCreationView: View {
     @ObservedObject var teamTemplateManager = TeamTemplateManager.shared
     @ObservedObject var providerDetector = ProviderDetector.shared
 
-    var onCreate: ((_ teamName: String, _ leaderMode: String, _ leaderModel: String, _ agents: [TeamAgentRow], _ worktreeMode: String, _ executionMode: String, _ resumeSessionId: String?) -> Void)?
+    var onCreate: ((_ teamName: String, _ leaderMode: String, _ leaderModel: String, _ agents: [TeamAgentRow], _ worktreeMode: String, _ executionMode: String, _ resumeSessionId: String?) -> Bool)?
     /// Phase 2: called after a successful `headless.resume_team` RPC.
     /// Receives the decoded result dictionary. Caller is responsible for
     /// registering the team in TeamOrchestrator and switching workspace cwd
@@ -426,6 +426,11 @@ struct TeamCreationView: View {
             worktreeMode = TermMeshDaemon.shared.worktreeEnabled ? "isolated" : "off"
             if agents.isEmpty {
                 applyInitialPreset()
+            }
+            // leaderModel stored in AppStorage may not be valid for the resolved leaderMode
+            // (e.g. "gpt-5.5" stored from a previous codex session, now reopened with claude).
+            if !AgentRolePreset.models(for: leaderMode).contains(leaderModel) {
+                leaderModel = AgentRolePreset.defaultModel(for: leaderMode)
             }
             refreshRunbookStatus()
             // Phase 2.5 — honor caller's requested initial mode (sidebar
@@ -1847,6 +1852,9 @@ struct TeamCreationView: View {
         selectedSmartPresetId = effectivePreset.id
         selectedWorkflowName = nil
         leaderMode = effectivePreset.leaderMode
+        if !AgentRolePreset.models(for: effectivePreset.leaderMode).contains(leaderModel) {
+            leaderModel = AgentRolePreset.defaultModel(for: effectivePreset.leaderMode)
+        }
         try? TeamTemplateManager.shared.setLastSelected(id: templateId)
 
         agents = resolved.compactMap { agent in
@@ -1892,6 +1900,9 @@ struct TeamCreationView: View {
         selectedWorkflowName = preset.name
         selectedSmartPresetId = nil
         leaderMode = preset.leaderMode
+        if !AgentRolePreset.models(for: leaderMode).contains(leaderModel) {
+            leaderModel = AgentRolePreset.defaultModel(for: leaderMode)
+        }
         try? TeamTemplateManager.shared.setLastSelected(id: TemplateID(category: .workflow, slug: preset.id))
         agents = preset.roles.compactMap { roleName in
             guard var p = available.first(where: { $0.name == roleName })
@@ -1923,6 +1934,9 @@ struct TeamCreationView: View {
     private func loadTemplate(_ template: SavedTeamTemplate) {
         teamName = template.name
         leaderMode = template.leaderMode
+        if !AgentRolePreset.models(for: leaderMode).contains(leaderModel) {
+            leaderModel = AgentRolePreset.defaultModel(for: leaderMode)
+        }
         let available = presetManager.presets
         agents = template.agents.compactMap { slot in
             let preset = available.first(where: { $0.name == slot.roleName })
@@ -2137,7 +2151,6 @@ struct TeamCreationView: View {
     }
 
     private func createTeam() {
-        defaultLeaderModel = leaderModel
         let sid: String? = if resumeSession {
             !manualSessionId.trimmingCharacters(in: .whitespaces).isEmpty
                 ? manualSessionId.trimmingCharacters(in: .whitespaces)
@@ -2145,7 +2158,10 @@ struct TeamCreationView: View {
         } else {
             nil
         }
-        onCreate?(teamName, leaderMode, leaderModel, agents, worktreeMode, executionMode, sid)
+        let success = onCreate?(teamName, leaderMode, leaderModel, agents, worktreeMode, executionMode, sid) ?? false
+        guard success else { return }
+        defaultLeaderMode = leaderMode
+        defaultLeaderModel = leaderModel
         dismiss()
     }
 

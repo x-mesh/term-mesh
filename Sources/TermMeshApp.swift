@@ -227,7 +227,7 @@ struct TermMeshApp: App {
                     )
                 }
                 let leaderSessionId = UUID().uuidString
-                _ = TeamOrchestrator.shared.createTeam(
+                let team = TeamOrchestrator.shared.createTeam(
                     name: teamName,
                     agents: agentTuples,
                     workingDirectory: workDir,
@@ -239,6 +239,7 @@ struct TermMeshApp: App {
                     executionMode: executionMode,
                     tabManager: activeTabManager
                 )
+                return team != nil
             },
             onResume: { (result: [String: Any]) in
                 let activeTabManager = teamCreationTabManager ?? tabManager
