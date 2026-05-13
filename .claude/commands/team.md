@@ -22,11 +22,23 @@ If `tm-agent` is not in PATH, use the project-local binary:
 ./daemon/target/release/tm-agent $ARGUMENTS
 ```
 
-If `$ARGUMENTS` is empty, show the team status:
+If `$ARGUMENTS` is empty (`/team`만 입력), print this onboarding cheat sheet (do NOT run tm-agent status):
 
-```bash
-tm-agent status
 ```
+자주 쓰는 명령:
+
+  /team status             지금 누가 무엇 중 (raw JSON)
+  /team task list          진행 중 작업
+  /team task clear         끝난 것 정리
+  /team create 4           새 팀 4명
+  /team delegate <a> "..." 1명에게 일 시키기
+  /team destroy            팀 종료
+
+한 줄로 모두 동원하려면: /tm "<instruction>"
+전체 reference: .claude/commands/team.md
+```
+
+If user wanted raw status, instruct them to type `/team status` explicitly.
 
 ## Subcommand Reference
 
@@ -54,7 +66,7 @@ Agent init uses compact runbook digests by default; set `TERMMESH_RUNBOOK_MODE=f
 
 ### Communication (leader → agent)
 
-> **Parallel fan-out shortcut:** 모든 idle agent에 동시 dispatch + 3-line synthesis는 `/tm "<instruction>"` 사용. 이 문서는 thin CLI router; orchestration workflow는 `.claude/commands/tm.md` 참고.
+> **이 문서는 low-level CLI primitive** (tm-agent `<subcommand>` 1:1 매핑). high-level 워크플로(모든 idle agent 동시 dispatch + 3-line synthesis)는 `/tm "<instruction>"`이며, /tm은 아래 표의 명령들을 내부적으로 조합한다. 새 사용자는 보통 `/tm` 먼저 시도해 본 후 필요할 때만 이 표의 명령을 직접 호출한다. 전체 `/tm` workflow: `.claude/commands/tm.md`
 
 **NEVER use `sleep N && tm-agent read`** — `sleep` chained with another command is blocked by Claude Code hooks.
 To wait for agents to finish, always use `tm-agent wait` then read:

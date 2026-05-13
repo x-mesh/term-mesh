@@ -19,6 +19,29 @@
 
 `/tm`은 `/tm-op`의 경량 진입점 — rounds 없고, 전략 선택 없고, 1회 dispatch 후 즉시 synthesis.
 
+## Empty input
+
+If `$ARGUMENTS` is empty (사용자가 `/tm`만 입력), do NOT run the workflow. Instead print:
+
+```
+이 명령은 모든 idle agent를 동시 동원하고 결과를 종합합니다.
+
+  /tm "review src/auth.ts"
+  /tm "monolith vs microservices" --timeout 120
+
+내부 단계에서 호출하는 low-level 명령들 (직접 사용 가능):
+
+  /team status               누가 idle인가
+  /team delegate <a> "..."   특정 한 명에게
+  /team wait                 모두 완료까지 대기
+  /team collect --headers    헤더만 모아 보기
+  /team task clear           끝난 태스크 정리
+
+자세히: .claude/commands/tm.md / .claude/commands/team.md
+```
+
+Do NOT proceed to Workflow.
+
 ## Arguments
 
 User provided: $ARGUMENTS
@@ -41,17 +64,17 @@ User provided: $ARGUMENTS
 
 `$ARGUMENTS`에서 instruction과 `--timeout` 파싱 후 아래 5단계 순서 엄수.
 
-### Step 1 — 팀 상태 확인
+### Step 1 — 팀 상태 확인 (= /team status)
 
 ```bash
-tm-agent status
+tm-agent status  # = /team status
 ```
 
 - `in_progress` 태스크가 있는 에이전트가 있으면 → **REJECT**: "team busy; run `tm-agent task clear` first"
 - idle 에이전트가 0명이면 → **REJECT**: "no idle agents available"
 - idle 에이전트 목록 확인 후 Step 2 진행.
 
-### Step 2 — Sequential per-agent delegate (mixed-CLI safe)
+### Step 2 — Sequential per-agent delegate (= /team delegate per agent, mixed-CLI safe)
 
 Instructions are passed to `tm-agent delegate` as a single argument (RPC arg vector, no shell expansion). Wrap in double-quotes; do NOT use unquoted `$VAR` substitution.
 
@@ -60,7 +83,7 @@ All `tm-agent delegate &` + `wait` MUST live inside ONE Bash tool call. Spawning
 ```bash
 # double-quote + INSTR variable form (single-quote-safe)
 INSTR="<the user's instruction>"
-tm-agent delegate <agent1> "$INSTR" &
+tm-agent delegate <agent1> "$INSTR" &  # = /team delegate <agent> "$INSTR"
 tm-agent delegate <agent2> "$INSTR" &
 tm-agent delegate <agent3> "$INSTR" &
 # ... 나머지 idle 에이전트
@@ -69,20 +92,20 @@ wait
 
 > **주의**: `broadcast` + `tm-agent claim` 패턴은 claude-CLI 전용이며 codex/gemini/kiro 패널에서는 silent no-op. 반드시 `delegate` 개별 발행.
 
-### Step 3 — Sync barrier
+### Step 3 — Sync barrier (= /team wait)
 
 ```bash
-tm-agent wait --timeout <timeout> --mode report
+tm-agent wait --timeout <timeout> --mode report  # = /team wait --timeout <n> --mode report
 ```
 
 timeout 만료 시에도 Step 4로 진행 (부분 결과 수렴).
 
-### Step 4 — Read & synthesize
+### Step 4 — Read & synthesize (= /team collect + leader synthesis)
 
 **(a) 헤더 수집 및 full report 접근**
 
 ```bash
-tm-agent collect --headers
+tm-agent collect --headers  # = /team collect --headers
 ```
 
 BLOCKED 또는 NEEDS_REVIEW 에이전트는 task_id 파악 후 전체 보고서 직접 읽기:
