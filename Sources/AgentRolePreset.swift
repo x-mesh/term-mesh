@@ -1068,11 +1068,17 @@ class ProviderDetector: ObservableObject {
                 "/usr/local/bin/codex",
                 (home as NSString).appendingPathComponent(".local/bin/codex"),
                 (home as NSString).appendingPathComponent(".cargo/bin/codex"),
+                (home as NSString).appendingPathComponent(".npm-global/bin/codex"),
+                (home as NSString).appendingPathComponent(".volta/bin/codex"),
+                "/opt/homebrew/opt/node/bin/codex",
             ],
             "gemini": [
                 "/opt/homebrew/bin/gemini",
                 "/usr/local/bin/gemini",
                 (home as NSString).appendingPathComponent(".local/bin/gemini"),
+                (home as NSString).appendingPathComponent(".npm-global/bin/gemini"),
+                (home as NSString).appendingPathComponent(".volta/bin/gemini"),
+                "/opt/homebrew/opt/node/bin/gemini",
             ],
             "kiro": [
                 (home as NSString).appendingPathComponent(".local/bin/kiro-cli"),
