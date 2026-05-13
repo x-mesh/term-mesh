@@ -240,7 +240,7 @@ tm-agent read <agent> --lines 100
 tm-agent collect --lines 100
 tm-agent collect --headers                    # header-only result collection for token-efficient synthesis
 tm-agent reports --summary                    # headers + concise summaries, full files lazy-read via FULL_REPORT
-tm-agent wait --timeout 120 --mode any
+tm-agent wait --timeout 120 --mode any        # ALWAYS use this to wait; NEVER use `sleep N && tm-agent read`
 tm-agent brief <agent>
 
 # Parallel delegation pattern — round-robin routing (active since d69c9d0c)

@@ -53,6 +53,15 @@ Runbook precedence: base term-mesh protocol → role preset → `.agent-runbooks
 Agent init uses compact runbook digests by default; set `TERMMESH_RUNBOOK_MODE=full` only for debugging or deep role-behavior audits.
 
 ### Communication (leader → agent)
+
+**NEVER use `sleep N && tm-agent read`** — `sleep` chained with another command is blocked by Claude Code hooks.
+To wait for agents to finish, always use `tm-agent wait` then read:
+```bash
+tm-agent wait --timeout 120 --mode any && tm-agent collect --lines 100
+# or wait for a specific agent's reply:
+tm-agent wait --timeout 120 --mode any && tm-agent read executor --lines 80
+```
+
 | Command | Example | Description |
 |---------|---------|-------------|
 | `send <agent> '<text>'` | `/team send explorer 'fix the bug'` | Send instruction to agent |
@@ -60,7 +69,7 @@ Agent init uses compact runbook digests by default; set `TERMMESH_RUNBOOK_MODE=f
 | `broadcast '<text>'` | `/team broadcast 'stop and report'` | Send to all agents |
 | `read <agent>` | `/team read explorer --lines 50` | Read agent's terminal output |
 | `collect` | `/team collect --lines 100` | Read all agents' output |
-| `wait` | `/team wait --timeout 120 --mode any` | Wait for agent signals |
+| `wait` | `/team wait --timeout 120 --mode any` | Wait for agent signals (use this instead of sleep) |
 | `brief <agent>` | `/team brief explorer` | Get concise agent status |
 | `inbox` | `/team inbox` | Priority-sorted attention queue (blocked/review_ready/stale) |
 
