@@ -2404,8 +2404,21 @@ func pushTargetSurfaceSize(_ size: CGSize) {
         // Marking it composing causes Ghostty to suppress the 0x1B byte, which
         // breaks vim normal-mode switching over SSH even when no IME box is open.
         let isEscape = event.keyCode == 53 // kVK_Escape
-        keyEvent.composing = !isEscape && (markedText.length > 0 || markedTextBefore)
+        // Return (keyCode 36) that *clears* composition without committing text is also
+        // not composing: markedText was present before but IME discarded the preedit
+        // instead of committing it (accumulator empty). Without this carve-out the
+        // composing=true flag suppresses the "\r" byte and the Enter is swallowed.
+        let isReturnClearingIME = event.keyCode == 36
+            && markedTextBefore
+            && markedText.length == 0
+            && (keyTextAccumulator == nil || keyTextAccumulator!.isEmpty)
+        keyEvent.composing = !isEscape
+            && !isReturnClearingIME
+            && (markedText.length > 0 || markedTextBefore)
         #if DEBUG
+        if isReturnClearingIME {
+            dlog("key.return.clearingIME markedTextBefore=true accumulator=empty → composing=false")
+        }
         if event.keyCode == 36 && (markedTextBefore || markedText.length > 0) {
             dlog("ime.return_with_markedText markedTextBefore=\(markedTextBefore) hasMarkedText=\(markedText.length > 0) composing=\(keyEvent.composing) surface=\(terminalSurface?.id.uuidString.prefix(5) ?? "nil")")
         }
