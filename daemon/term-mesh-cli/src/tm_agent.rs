@@ -2965,9 +2965,15 @@ fn return_retry_delays_ms(text_delivered: bool) -> &'static [u64] {
         // codex has fully rendered the pasted text and is ready to accept input.
         // Swift asyncTeamSendKey also holds an additional 250 ms post-Return gate
         // before releasing the next paste, providing two layers of protection.
-        &[250, 400, 600, 800, 1000]
+        //
+        // Long tail (1500/2500/4000 ms) added defensively for the Layer-2
+        // congestion race: during multi-agent `create`, simultaneous panel/CLI
+        // startup + layout churn can keep the freshly spawned panel from being
+        // key-ready well past 1 s. The common case still resolves at attempt 1
+        // (250 ms); only a stubborn panel walks the tail (~11 s worst case).
+        &[250, 400, 600, 800, 1000, 1500, 2500, 4000]
     } else {
-        &[200, 500]
+        &[200, 500, 1000, 2000]
     }
 }
 
