@@ -1965,7 +1965,7 @@ fn runbook_digest(agent: Option<&str>) -> Result<Value, String> {
             json!({
                 "role": role.name,
                 "path": runbook_source_path(&root, role).to_string_lossy(),
-                "digest": runbook_digest_content(&root, role),
+                "digest": runbook_digest_content(&root, role, agent.unwrap_or("generic"), "cli-tools"),
             })
         })
         .collect();
@@ -2132,7 +2132,7 @@ mod runbook_tests {
         )
         .unwrap();
 
-        let digest = runbook_digest_content(&dir, &role);
+        let digest = runbook_digest_content(&dir, &role, "test-agent", "test-team");
         assert!(digest.contains("ROLE: executor"));
         assert!(digest.contains("Custom rule A"));
         assert!(digest.contains("Custom verify"));
@@ -2160,6 +2160,8 @@ mod runbook_tests {
             &dir,
             "custom",
             load_runbook_content_for_role(&dir, "custom").as_deref(),
+            "test-agent",
+            "test-team",
         );
         assert!(digest.contains("ROLE: custom"));
         assert!(digest.contains("Custom must"));
