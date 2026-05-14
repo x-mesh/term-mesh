@@ -505,10 +505,12 @@ async fn run_jsonl_usage_tick_broadcaster(
         tokio::select! {
             _ = interval.tick() => {
                 let pane_map = ctx.pane_tracker.snapshot();
-                let claude_panes: Vec<(String, String, i64)> = pane_map
+                let claude_panes: Vec<(String, String, i64, u32)> = pane_map
                     .iter()
                     .filter(|(_, info)| info.cli == "claude")
-                    .map(|(id, info)| (id.clone(), info.cwd.clone(), info.proc_start_unix))
+                    .map(|(id, info)| {
+                        (id.clone(), info.cwd.clone(), info.proc_start_unix, info.pid)
+                    })
                     .collect();
                 if claude_panes.is_empty() {
                     continue;
@@ -622,10 +624,12 @@ async fn run_codex_usage_tick_broadcaster(
         tokio::select! {
             _ = interval.tick() => {
                 let pane_map = ctx.pane_tracker.snapshot();
-                let codex_panes: Vec<(String, String, i64)> = pane_map
+                let codex_panes: Vec<(String, String, i64, u32)> = pane_map
                     .iter()
                     .filter(|(_, info)| info.cli == "codex")
-                    .map(|(id, info)| (id.clone(), info.cwd.clone(), info.proc_start_unix))
+                    .map(|(id, info)| {
+                        (id.clone(), info.cwd.clone(), info.proc_start_unix, info.pid)
+                    })
                     .collect();
                 if codex_panes.is_empty() {
                     continue;

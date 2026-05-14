@@ -6,7 +6,6 @@ use std::time::Duration;
 pub struct PaneInfo {
     pub cli: String,
     pub cwd: String,
-    #[allow(dead_code)]
     pub pid: u32,
     /// Approximate Unix timestamp (seconds) when the process was started.
     /// Derived from `ps -o etime=` (elapsed seconds subtracted from now).

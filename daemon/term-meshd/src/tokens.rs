@@ -355,51 +355,76 @@ impl UsageTracker {
         by_project
     }
 
-    /// Per-panel token totals correlated by process start time.
-    /// `panes`: (panel_id, cwd, proc_start_unix) from PaneTracker.
-    /// Matches each pane to the session whose earliest in-JSONL `timestamp` is
-    /// closest to `proc_start_unix` (within 300s). Refuses the match if two
-    /// sessions are within 1s of each other (ambiguous).
+    /// Per-panel token totals correlated by process start time, with a PID
+    /// tiebreaker for same-second spawns.
+    ///
+    /// `panes`: (panel_id, cwd, proc_start_unix, pid) from PaneTracker.
+    ///
+    /// Mirrors `CodexUsageTracker::snapshot_by_panel`: within one cwd, panes
+    /// sorted by (proc_start, pid) zip 1:1 against sessions sorted by
+    /// (session_started_at, session_id). Claude's in-JSONL timestamps usually
+    /// disambiguate on their own, but `iso8601_to_unix` is 1-second resolution,
+    /// so the PID-ordered zip is the safety net when several agents start in
+    /// the same second. The 300s `MAX_DIFF` guard drops stale sessions.
     /// Returns: panel_id → (in, out, cr, cw).
     pub fn snapshot_by_panel(
         &self,
-        panes: &[(String, String, i64)],
+        panes: &[(String, String, i64, u32)],
     ) -> HashMap<String, (u64, u64, u64, u64)> {
         const MAX_DIFF: i64 = 300;
-        const TIE: i64 = 1;
         let state = self.state.lock().unwrap();
+
+        // (started_at, session_id, tokens) per cwd, sorted by (started_at, session_id).
+        let mut sessions_by_cwd: HashMap<&str, Vec<(i64, &str, (u64, u64, u64, u64))>> =
+            HashMap::new();
+        for s in state.sessions.values() {
+            let Some(&started) = state.session_started_at.get(&s.session_id) else {
+                continue;
+            };
+            sessions_by_cwd.entry(s.project_path.as_str()).or_default().push((
+                started,
+                s.session_id.as_str(),
+                (s.input_tokens, s.output_tokens, s.cache_read_tokens, s.cache_write_tokens),
+            ));
+        }
+        for v in sessions_by_cwd.values_mut() {
+            // session_id is the stable secondary key for same-second sessions.
+            v.sort_unstable_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(b.1)));
+        }
+
+        // Group panes by cwd.
+        let mut panes_by_cwd: HashMap<&str, Vec<(&str, i64, u32)>> = HashMap::new();
+        for (panel_id, cwd, proc_start, pid) in panes {
+            panes_by_cwd
+                .entry(cwd.as_str())
+                .or_default()
+                .push((panel_id.as_str(), *proc_start, *pid));
+        }
+
         let mut by_panel = HashMap::new();
-        for (panel_id, cwd, proc_start) in panes {
-            let mut candidates: Vec<(i64, &str)> = state
-                .sessions
-                .values()
-                .filter(|s| &s.project_path == cwd)
-                .filter_map(|s| {
-                    state
-                        .session_started_at
-                        .get(&s.session_id)
-                        .map(|&started| ((started - proc_start).abs(), s.session_id.as_str()))
+        for (cwd, mut cwd_panes) in panes_by_cwd {
+            let Some(cwd_sessions) = sessions_by_cwd.get(cwd) else {
+                continue;
+            };
+            // Spawn order: earlier proc_start first, PID breaks the same-second tie.
+            cwd_panes.sort_unstable_by_key(|&(_, proc_start, pid)| (proc_start, pid));
+            // Drop stale sessions not near any pane (keeps the index-zip aligned).
+            let relevant: Vec<&(i64, &str, (u64, u64, u64, u64))> = cwd_sessions
+                .iter()
+                .filter(|(started, _, _)| {
+                    cwd_panes
+                        .iter()
+                        .any(|&(_, proc_start, _)| (started - proc_start).abs() <= MAX_DIFF)
                 })
                 .collect();
-            if candidates.is_empty() {
-                continue;
-            }
-            candidates.sort_unstable_by_key(|&(diff, _)| diff);
-            let (best_diff, best_id) = candidates[0];
-            if best_diff > MAX_DIFF {
-                continue;
-            }
-            if candidates.len() >= 2 && candidates[1].0 - best_diff <= TIE {
-                tracing::debug!(
-                    "sidebar.token.skip reason=ambiguous-start-time panel={panel_id}"
-                );
-                continue;
-            }
-            if let Some(s) = state.sessions.get(best_id) {
-                by_panel.insert(
-                    panel_id.clone(),
-                    (s.input_tokens, s.output_tokens, s.cache_read_tokens, s.cache_write_tokens),
-                );
+            for (i, &(panel_id, proc_start, _pid)) in cwd_panes.iter().enumerate() {
+                let Some(&&(started, _sid, tokens)) = relevant.get(i) else {
+                    continue;
+                };
+                if (started - proc_start).abs() > MAX_DIFF {
+                    continue;
+                }
+                by_panel.insert(panel_id.to_string(), tokens);
             }
         }
         by_panel
@@ -1040,11 +1065,12 @@ mod tests {
         let base = iso8601_to_unix("2026-05-13T01:00:00.000Z").unwrap();
         let tracker = UsageTracker { state: Arc::new(Mutex::new(state)) };
 
-        // paneA proc_start = base+5 → closest to sessA (diff=5)
-        // paneB proc_start = base+62 → closest to sessB (started base+60, diff=2)
+        // Sessions sorted by started_at: [sessA@base, sessB@base+60].
+        // Panes sorted by (proc_start, pid): [panelA@base+5, panelB@base+62].
+        // Index-zip: panelA→sessA, panelB→sessB.
         let panes = vec![
-            ("panelA".to_string(), "/cwd/shared".to_string(), base + 5),
-            ("panelB".to_string(), "/cwd/shared".to_string(), base + 62),
+            ("panelA".to_string(), "/cwd/shared".to_string(), base + 5, 1_u32),
+            ("panelB".to_string(), "/cwd/shared".to_string(), base + 62, 2_u32),
         ];
         let by_panel = tracker.snapshot_by_panel(&panes);
 
@@ -1068,39 +1094,48 @@ mod tests {
 
         let base = iso8601_to_unix("2026-05-13T01:00:00.000Z").unwrap();
         let tracker = UsageTracker { state: Arc::new(Mutex::new(state)) };
-        // proc_start = base+500 → diff 500s > MAX_DIFF(300)
-        let panes = vec![("panelX".to_string(), "/cwd/far".to_string(), base + 500)];
+        // proc_start = base+500 → diff 500s > MAX_DIFF(300) → not relevant → skip
+        let panes = vec![("panelX".to_string(), "/cwd/far".to_string(), base + 500, 1_u32)];
         let by_panel = tracker.snapshot_by_panel(&panes);
         assert!(by_panel.is_empty(), "diff > 300s should be skipped");
     }
 
     #[test]
-    fn snapshot_by_panel_tie_refusal_skipped() {
+    fn snapshot_by_panel_same_second_spawn_pid_tiebreak() {
+        // Two sessions with the *same* start timestamp (1-second resolution).
+        // The old code refused this as an ambiguous tie; now panes sorted by
+        // (proc_start, pid) zip 1:1 against sessions sorted by (started, id).
         let mut state = make_state();
         let path = PathBuf::from("/home/user/.claude/projects/-test/file.jsonl");
-        // Two sessions with the same start timestamp → ambiguous tie.
-        let entry1 = assistant_entry(
-            "sessT1",
+        let entry_a = assistant_entry(
+            "sessA",
             Some("/cwd/tie"),
             Some("2026-05-13T01:00:00.000Z"),
             usage(100, 0, 0, 0),
         );
-        let entry2 = assistant_entry(
-            "sessT2",
+        let entry_b = assistant_entry(
+            "sessB",
             Some("/cwd/tie"),
             Some("2026-05-13T01:00:00.000Z"),
             usage(200, 0, 0, 0),
         );
-        record_session_start(&mut state, &entry1);
-        process_line(&mut state, &entry1, &path);
-        record_session_start(&mut state, &entry2);
-        process_line(&mut state, &entry2, &path);
+        record_session_start(&mut state, &entry_a);
+        process_line(&mut state, &entry_a, &path);
+        record_session_start(&mut state, &entry_b);
+        process_line(&mut state, &entry_b, &path);
 
         let base = iso8601_to_unix("2026-05-13T01:00:00.000Z").unwrap();
         let tracker = UsageTracker { state: Arc::new(Mutex::new(state)) };
-        let panes = vec![("panelT".to_string(), "/cwd/tie".to_string(), base)];
+        // Same proc_start, distinct PIDs given out of order. Sessions sort
+        // (base, "sessA") < (base, "sessB"); panes sort by pid 10 < 20.
+        let panes = vec![
+            ("panelHigh".to_string(), "/cwd/tie".to_string(), base, 20_u32),
+            ("panelLow".to_string(), "/cwd/tie".to_string(), base, 10_u32),
+        ];
         let by_panel = tracker.snapshot_by_panel(&panes);
-        assert!(by_panel.is_empty(), "tie within 1s should be skipped as ambiguous");
+        assert_eq!(by_panel.len(), 2, "no tie-refusal — both panels matched");
+        assert_eq!(by_panel["panelLow"].0, 100); // lower pid → sessA
+        assert_eq!(by_panel["panelHigh"].0, 200); // higher pid → sessB
     }
 
     // ── JSONL parsing from string ──
