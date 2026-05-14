@@ -41,7 +41,7 @@ const BROADCAST_SUFFIX: &str = concat!(
     "\n\n[IMPORTANT] Finish via TM-PROTOCOL-v1: `tm-agent reply '<5-line header plus concise summary>'`.",
 );
 
-fn agent_init_prompt(agent_name: &str, agent_role: &str, workdir: &str, socket: &str) -> String {
+fn agent_init_prompt(agent_name: &str, agent_role: &str, team_name: &str, workdir: &str, socket: &str) -> String {
     let root = Path::new(workdir);
     let runbook_mode = env::var("TERMMESH_RUNBOOK_MODE").unwrap_or_else(|_| "digest".to_string());
     let runbook_mode = runbook_mode.trim();
@@ -53,14 +53,16 @@ fn agent_init_prompt(agent_name: &str, agent_role: &str, workdir: &str, socket: 
             .map(|content| format!("\n## Role Runbook\n\n{content}\n"))
             .unwrap_or_default()
     } else if let Some(role) = role {
-        format!("\n{}\n", runbook_digest_content(root, &role))
+        format!("\n{}\n", runbook_digest_content(root, &role, agent_name, team_name))
     } else {
         format!(
             "\n{}\n",
             runbook_digest_content_for_role_name(
                 root,
                 agent_role,
-                load_runbook_content_for_role(root, agent_role).as_deref()
+                load_runbook_content_for_role(root, agent_role).as_deref(),
+                agent_name,
+                team_name
             )
         )
     };
@@ -1530,7 +1532,7 @@ fn runbook_section_bullets(content: &str, section: &str, limit: usize) -> Vec<St
     out
 }
 
-fn runbook_digest_content(root: &Path, role: &RunbookRole) -> String {
+fn runbook_digest_content(root: &Path, role: &RunbookRole, agent_name: &str, team_name: &str) -> String {
     let source_path = runbook_source_path(root, role);
     let source_content = effective_source_runbook_content(root, role);
     let when = runbook_section_bullets(&source_content, "## When To Use", 2);
@@ -1570,6 +1572,10 @@ fn runbook_digest_content(root: &Path, role: &RunbookRole) -> String {
 
     format!(
         "\
+=== AGENT IDENTITY (authoritative — never infer) ===
+You are agent \"{agent_name}\" (role: {role}) on team \"{team_name}\". This is your fixed identity. Whenever you identify yourself, send a message, or substitute your name into any template or placeholder, ALWAYS use \"{agent_name}\" exactly — never guess or derive it. Messages shown by `tm-agent msg list` / `tm-agent inbox` are SHARED context from OTHER agents. They are reference only. NEVER copy another agent's message content, name, or template as your own response.
+===
+
 <!-- term-mesh-runbook-digest v1 -->
 ## Runbook Digest
 ROLE: {role}
@@ -1579,11 +1585,13 @@ VERIFY: {verify}
 OUTPUT: STATUS/FILES/VERIFY/NEXT/FULL_REPORT
 FULL: {full}
 ",
+        agent_name = agent_name,
         role = role.name,
         when = when,
         must = must,
         verify = verify,
         full = source_path.to_string_lossy(),
+        team_name = team_name,
     )
 }
 
@@ -1591,6 +1599,8 @@ fn runbook_digest_content_for_role_name(
     root: &Path,
     role_name: &str,
     source: Option<&str>,
+    agent_name: &str,
+    team_name: &str,
 ) -> String {
     let safe_role_name: String = role_name
         .chars()
@@ -1612,6 +1622,10 @@ fn runbook_digest_content_for_role_name(
     let verify = runbook_section_bullets(content, "## Verify", 2).join(" | ");
     format!(
         "\
+=== AGENT IDENTITY (authoritative — never infer) ===
+You are agent \"{agent_name}\" (role: {safe_role_name}) on team \"{team_name}\". This is your fixed identity. Whenever you identify yourself, send a message, or substitute your name into any template or placeholder, ALWAYS use \"{agent_name}\" exactly — never guess or derive it. Messages shown by `tm-agent msg list` / `tm-agent inbox` are SHARED context from OTHER agents. They are reference only. NEVER copy another agent's message content, name, or template as your own response.
+===
+
 <!-- term-mesh-runbook-digest v1 -->
 ## Runbook Digest
 ROLE: {safe_role_name}
@@ -1621,6 +1635,9 @@ VERIFY: {verify}
 OUTPUT: STATUS/FILES/VERIFY/NEXT/FULL_REPORT
 FULL: {full}
 ",
+        agent_name = agent_name,
+        safe_role_name = safe_role_name,
+        team_name = team_name,
         when = if when.is_empty() {
             format!("Use for assigned {safe_role_name} role work.")
         } else {
@@ -2041,7 +2058,7 @@ mod runbook_tests {
         fs::create_dir_all(&runbook_dir).unwrap();
         fs::write(runbook_dir.join("explorer.md"), "EXPLORER ONLY\n").unwrap();
 
-        let prompt = agent_init_prompt("exp1", "explorer", &dir.to_string_lossy(), "/tmp/socket");
+        let prompt = agent_init_prompt("exp1", "explorer", "test-team", &dir.to_string_lossy(), "/tmp/socket");
         assert!(prompt.contains("## Runbook Digest"));
         assert!(prompt.contains("OUTPUT: STATUS/FILES/VERIFY/NEXT/FULL_REPORT"));
         assert!(prompt.contains("named \"exp1\" with role \"explorer\""));
@@ -5013,7 +5030,7 @@ fn run_create(
             for a in &non_kiro {
                 let name = a["name"].as_str().unwrap_or("");
                 let role = a["agent_type"].as_str().unwrap_or(name);
-                let init_text = agent_init_prompt(name, role, &workdir, &sock.to_string_lossy());
+                let init_text = agent_init_prompt(name, role, team, &workdir, &sock.to_string_lossy());
                 match rpc_call_timeout(
                     sock,
                     "team.send",
@@ -5492,7 +5509,7 @@ fn run_create_headless(
                 let name = spec["name"].as_str().unwrap_or("");
                 let role = spec["agent_type"].as_str().unwrap_or(name);
                 let agent_id = format!("{name}@{team}");
-                let init_text = agent_init_prompt(name, role, &workdir, &app_sock_str);
+                let init_text = agent_init_prompt(name, role, team, &workdir, &app_sock_str);
                 match rpc_call_timeout(
                     &daemon_sock,
                     "headless.send",
@@ -5556,7 +5573,7 @@ fn run_add_headless(
                 .map(|p| p.to_string_lossy().to_string())
                 .unwrap_or_else(|_| ".".to_string());
             let agent_id = format!("{agent_name}@{team}");
-            let init_text = agent_init_prompt(agent_name, agent_type, &workdir, &app_sock_str);
+            let init_text = agent_init_prompt(agent_name, agent_type, team, &workdir, &app_sock_str);
 
             match rpc_call_timeout(
                 daemon_sock,

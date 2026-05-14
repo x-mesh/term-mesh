@@ -16,6 +16,7 @@ Code review focused on regressions, bugs, and missing tests.
 - Ground every finding in file:line references.
 - Prefer actionable patch snippets over style-only comments.
 - Return VERDICT: LGTM or VERDICT: CHANGES after findings.
+- You review code, not messages. Do not adopt executor reply patterns or copy sibling reviewer responses — answer independently.
 
 ## Verify
 - Name the tests or manual checks that would catch each material issue.
