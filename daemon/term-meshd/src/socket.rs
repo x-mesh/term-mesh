@@ -504,13 +504,19 @@ async fn run_jsonl_usage_tick_broadcaster(
     loop {
         tokio::select! {
             _ = interval.tick() => {
-                let by_project = ctx.usage_tracker.snapshot_by_project();
-                if by_project.is_empty() {
+                let pane_map = ctx.pane_tracker.snapshot();
+                let claude_panes: Vec<(String, String, i64)> = pane_map
+                    .iter()
+                    .filter(|(_, info)| info.cli == "claude")
+                    .map(|(id, info)| (id.clone(), info.cwd.clone(), info.proc_start_unix))
+                    .collect();
+                if claude_panes.is_empty() {
                     continue;
                 }
-                let pane_map = ctx.pane_tracker.snapshot();
-                let cwd_pane_count =
-                    crate::pane_tracker::count_panes_per_cwd(&pane_map, "claude");
+                let by_panel = ctx.usage_tracker.snapshot_by_panel(&claude_panes);
+                if by_panel.is_empty() {
+                    continue;
+                }
                 let team_state = ctx.team_state.read().unwrap().clone();
                 let Some(teams) = team_state.get("teams").and_then(|v| v.as_array()) else {
                     continue;
@@ -548,22 +554,9 @@ async fn run_jsonl_usage_tick_broadcaster(
                             Some(id) if !id.is_empty() => id,
                             _ => continue,
                         };
-                        // Skip until pane_tracker observes this panel (3s poll lag → "—").
-                        // team working_directory fallback removed: risks wrong value when
-                        // same-cwd has 2+ panes before the first poll completes.
-                        let Some(info) = pane_map.get(panel_id).filter(|i| i.cli == "claude") else {
-                            continue;
-                        };
-                        let cwd = info.cwd.clone();
-                        // Same-cwd guard: 2+ OS-confirmed claude panes in this cwd → the
-                        // "latest session" is ambiguous. Skip all of them.
-                        if cwd_pane_count.get(&cwd).copied().unwrap_or(0) >= 2 {
-                            tracing::debug!(
-                                "sidebar.token.skip reason=multi-pane-same-cwd cwd={cwd}"
-                            );
-                            continue;
-                        }
-                        let Some(&(in_tok, out_tok, cr_tok, cw_tok)) = by_project.get(&cwd) else {
+                        // Skip until pane_tracker has confirmed this panel AND
+                        // start-time correlation has matched it to a session.
+                        let Some(&(in_tok, out_tok, cr_tok, cw_tok)) = by_panel.get(panel_id) else {
                             continue;
                         };
                         let agent_name = agent
@@ -628,19 +621,25 @@ async fn run_codex_usage_tick_broadcaster(
     loop {
         tokio::select! {
             _ = interval.tick() => {
-                let by_project = match tracker.snapshot_by_project() {
+                let pane_map = ctx.pane_tracker.snapshot();
+                let codex_panes: Vec<(String, String, i64)> = pane_map
+                    .iter()
+                    .filter(|(_, info)| info.cli == "codex")
+                    .map(|(id, info)| (id.clone(), info.cwd.clone(), info.proc_start_unix))
+                    .collect();
+                if codex_panes.is_empty() {
+                    continue;
+                }
+                let by_panel = match tracker.snapshot_by_panel(&codex_panes) {
                     Ok(m) => m,
                     Err(e) => {
                         tracing::debug!("codex.token.parse.skip reason=db_error: {e}");
                         continue;
                     }
                 };
-                if by_project.is_empty() {
+                if by_panel.is_empty() {
                     continue;
                 }
-                let pane_map = ctx.pane_tracker.snapshot();
-                let cwd_pane_count =
-                    crate::pane_tracker::count_panes_per_cwd(&pane_map, "codex");
                 let team_state = ctx.team_state.read().unwrap().clone();
                 let Some(teams) = team_state.get("teams").and_then(|v| v.as_array()) else {
                     continue;
@@ -676,20 +675,9 @@ async fn run_codex_usage_tick_broadcaster(
                             Some(id) if !id.is_empty() => id,
                             _ => continue,
                         };
-                        // Skip until pane_tracker observes this panel (3s poll lag → "—").
-                        let Some(info) = pane_map.get(panel_id).filter(|i| i.cli == "codex") else {
-                            continue;
-                        };
-                        let cwd = info.cwd.clone();
-                        // Same-cwd guard: 2+ OS-confirmed codex panes in this cwd → the
-                        // "latest thread" is ambiguous. Skip all of them.
-                        if cwd_pane_count.get(&cwd).copied().unwrap_or(0) >= 2 {
-                            tracing::debug!(
-                                "codex.token.skip reason=multi-pane-same-cwd cwd={cwd}"
-                            );
-                            continue;
-                        }
-                        let Some(&total_tokens) = by_project.get(&cwd) else {
+                        // Skip until pane_tracker has confirmed this panel AND
+                        // start-time correlation has matched it to a Codex thread.
+                        let Some(&total_tokens) = by_panel.get(panel_id) else {
                             continue;
                         };
                         let agent_name = agent

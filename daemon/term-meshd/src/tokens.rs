@@ -68,6 +68,10 @@ struct JsonlLine {
     session_id: Option<String>,
     cwd: Option<String>,
     message: Option<AssistantMessage>,
+    /// ISO-8601 UTC timestamp (e.g. "2026-05-13T01:18:43.744Z"). Present on
+    /// attachment/user/assistant lines; absent on last-prompt/permission-mode/
+    /// file-history-snapshot lines. Used to derive the session start time.
+    timestamp: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -133,6 +137,10 @@ struct TrackerState {
     /// Updated every time a new assistant line is processed for a given cwd.
     /// Used by snapshot_by_project() to return only the current session's tokens.
     latest_session_per_cwd: HashMap<String, String>,
+    /// session_id → Unix timestamp (seconds) of the session's earliest line.
+    /// Parsed from the `timestamp` field inside the JSONL itself (not file
+    /// metadata), so backup/copy/restore of the file does not skew it.
+    session_started_at: HashMap<String, i64>,
 }
 
 /// Tracks real API token usage by parsing Claude Code JSONL log files.
@@ -152,6 +160,7 @@ impl UsageTracker {
                 file_positions: HashMap::new(),
                 claude_projects_dir: claude_dir,
                 latest_session_per_cwd: HashMap::new(),
+                session_started_at: HashMap::new(),
             })),
         }
     }
@@ -299,6 +308,11 @@ impl UsageTracker {
             if !trimmed.is_empty() {
                 match serde_json::from_str::<JsonlLine>(trimmed) {
                     Ok(entry) => {
+                        // Session start time comes from the line's own ISO-8601
+                        // `timestamp` field — not file metadata, which drifts on
+                        // backup/copy/dotfile-sync/restore. Recorded for every line
+                        // type that carries a timestamp (attachment is usually first).
+                        record_session_start(&mut state, &entry);
                         let had_usage = entry.message.as_ref()
                             .and_then(|m| m.usage.as_ref()).is_some();
                         if !had_usage && entry.line_type == "assistant" {
@@ -326,6 +340,7 @@ impl UsageTracker {
     /// Current-session token totals keyed by project_path.
     /// Returns only the most recently active session per cwd (not a cumulative sum).
     /// Returns: project_path → (input, output, cache_read, cache_write)
+    #[allow(dead_code)]
     pub fn snapshot_by_project(&self) -> HashMap<String, (u64, u64, u64, u64)> {
         let state = self.state.lock().unwrap();
         let mut by_project: HashMap<String, (u64, u64, u64, u64)> = HashMap::new();
@@ -338,6 +353,56 @@ impl UsageTracker {
             }
         }
         by_project
+    }
+
+    /// Per-panel token totals correlated by process start time.
+    /// `panes`: (panel_id, cwd, proc_start_unix) from PaneTracker.
+    /// Matches each pane to the session whose earliest in-JSONL `timestamp` is
+    /// closest to `proc_start_unix` (within 300s). Refuses the match if two
+    /// sessions are within 1s of each other (ambiguous).
+    /// Returns: panel_id → (in, out, cr, cw).
+    pub fn snapshot_by_panel(
+        &self,
+        panes: &[(String, String, i64)],
+    ) -> HashMap<String, (u64, u64, u64, u64)> {
+        const MAX_DIFF: i64 = 300;
+        const TIE: i64 = 1;
+        let state = self.state.lock().unwrap();
+        let mut by_panel = HashMap::new();
+        for (panel_id, cwd, proc_start) in panes {
+            let mut candidates: Vec<(i64, &str)> = state
+                .sessions
+                .values()
+                .filter(|s| &s.project_path == cwd)
+                .filter_map(|s| {
+                    state
+                        .session_started_at
+                        .get(&s.session_id)
+                        .map(|&started| ((started - proc_start).abs(), s.session_id.as_str()))
+                })
+                .collect();
+            if candidates.is_empty() {
+                continue;
+            }
+            candidates.sort_unstable_by_key(|&(diff, _)| diff);
+            let (best_diff, best_id) = candidates[0];
+            if best_diff > MAX_DIFF {
+                continue;
+            }
+            if candidates.len() >= 2 && candidates[1].0 - best_diff <= TIE {
+                tracing::debug!(
+                    "sidebar.token.skip reason=ambiguous-start-time panel={panel_id}"
+                );
+                continue;
+            }
+            if let Some(s) = state.sessions.get(best_id) {
+                by_panel.insert(
+                    panel_id.clone(),
+                    (s.input_tokens, s.output_tokens, s.cache_read_tokens, s.cache_write_tokens),
+                );
+            }
+        }
+        by_panel
     }
 
     /// Get a snapshot of all session usage data.
@@ -395,7 +460,7 @@ fn process_line(state: &mut TrackerState, entry: &JsonlLine, file_path: &Path) {
         .sessions
         .entry(session_id.clone())
         .or_insert_with(|| SessionUsageStats {
-            session_id,
+            session_id: session_id.clone(),
             project_path: project_path.clone(),
             model: model.clone(),
             ..Default::default()
@@ -425,7 +490,7 @@ fn process_line(state: &mut TrackerState, entry: &JsonlLine, file_path: &Path) {
     }
 
     // Track most recently active session per cwd for current-session view.
-    state.latest_session_per_cwd.insert(project_path, stats.session_id.clone());
+    state.latest_session_per_cwd.insert(project_path, session_id);
 
     tracing::debug!(
         "sidebar.token.update agent={} in={} out={}",
@@ -433,6 +498,54 @@ fn process_line(state: &mut TrackerState, entry: &JsonlLine, file_path: &Path) {
         usage.input_tokens,
         usage.output_tokens
     );
+}
+
+/// Record the earliest observed timestamp for a session.
+/// Called for every JSONL line; the minimum wins (lines are appended
+/// chronologically, so the first timestamped line of a session is its start).
+fn record_session_start(state: &mut TrackerState, entry: &JsonlLine) {
+    let (Some(sid), Some(ts_str)) = (&entry.session_id, &entry.timestamp) else {
+        return;
+    };
+    let Some(ts) = iso8601_to_unix(ts_str) else {
+        return;
+    };
+    state
+        .session_started_at
+        .entry(sid.clone())
+        .and_modify(|e| {
+            if ts < *e {
+                *e = ts;
+            }
+        })
+        .or_insert(ts);
+}
+
+/// Parse an ISO-8601 UTC timestamp ("YYYY-MM-DDTHH:MM:SS(.sss)Z") to Unix
+/// seconds. Sub-second precision and the trailing 'Z' are ignored. Returns
+/// None if the prefix does not match the expected fixed-width layout.
+fn iso8601_to_unix(s: &str) -> Option<i64> {
+    if s.len() < 19 {
+        return None;
+    }
+    let year: i64 = s.get(0..4)?.parse().ok()?;
+    let month: i64 = s.get(5..7)?.parse().ok()?;
+    let day: i64 = s.get(8..10)?.parse().ok()?;
+    let hour: i64 = s.get(11..13)?.parse().ok()?;
+    let minute: i64 = s.get(14..16)?.parse().ok()?;
+    let second: i64 = s.get(17..19)?.parse().ok()?;
+    if !(1..=12).contains(&month) || !(1..=31).contains(&day) {
+        return None;
+    }
+    // days-from-civil (Howard Hinnant's algorithm), valid for the Gregorian calendar.
+    let y = if month <= 2 { year - 1 } else { year };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400;
+    let mp = if month > 2 { month - 3 } else { month + 9 };
+    let doy = (153 * mp + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146097 + doe - 719468;
+    Some(days * 86400 + hour * 3600 + minute * 60 + second)
 }
 
 fn calculate_line_cost(usage: &TokenUsage, model: &str) -> f64 {
@@ -639,27 +752,48 @@ mod tests {
             file_positions: HashMap::new(),
             claude_projects_dir: PathBuf::from("/tmp"),
             latest_session_per_cwd: HashMap::new(),
+            session_started_at: HashMap::new(),
+        }
+    }
+
+    /// Build an assistant JsonlLine. `timestamp` is the line's ISO-8601 field.
+    fn assistant_entry(
+        session_id: &str,
+        cwd: Option<&str>,
+        timestamp: Option<&str>,
+        usage: TokenUsage,
+    ) -> JsonlLine {
+        JsonlLine {
+            line_type: "assistant".into(),
+            session_id: Some(session_id.into()),
+            cwd: cwd.map(str::to_string),
+            timestamp: timestamp.map(str::to_string),
+            message: Some(AssistantMessage {
+                model: Some("claude-sonnet-4-6".into()),
+                usage: Some(usage),
+            }),
+        }
+    }
+
+    fn usage(input: u64, output: u64, cr: u64, cw: u64) -> TokenUsage {
+        TokenUsage {
+            input_tokens: input,
+            output_tokens: output,
+            cache_creation_input_tokens: cw,
+            cache_read_input_tokens: cr,
+            cache_creation: None,
         }
     }
 
     #[test]
     fn process_assistant_line() {
         let mut state = make_state();
-        let entry = JsonlLine {
-            line_type: "assistant".into(),
-            session_id: Some("sess1".into()),
-            cwd: Some("/home/user/project".into()),
-            message: Some(AssistantMessage {
-                model: Some("claude-opus-4-6".into()),
-                usage: Some(TokenUsage {
-                    input_tokens: 100,
-                    output_tokens: 50,
-                    cache_creation_input_tokens: 0,
-                    cache_read_input_tokens: 0,
-                    cache_creation: None,
-                }),
-            }),
-        };
+        let entry = assistant_entry(
+            "sess1",
+            Some("/home/user/project"),
+            None,
+            usage(100, 50, 0, 0),
+        );
         let path = PathBuf::from("/home/user/.claude/projects/-test/file.jsonl");
         process_line(&mut state, &entry, &path);
 
@@ -678,6 +812,7 @@ mod tests {
             line_type: "user".into(),
             session_id: Some("sess1".into()),
             cwd: None,
+            timestamp: None,
             message: None,
         };
         let path = PathBuf::from("/tmp/file.jsonl");
@@ -692,15 +827,10 @@ mod tests {
             line_type: "assistant".into(),
             session_id: None,
             cwd: None,
+            timestamp: None,
             message: Some(AssistantMessage {
                 model: Some("claude-opus-4-6".into()),
-                usage: Some(TokenUsage {
-                    input_tokens: 100,
-                    output_tokens: 50,
-                    cache_creation_input_tokens: 0,
-                    cache_read_input_tokens: 0,
-                    cache_creation: None,
-                }),
+                usage: Some(usage(100, 50, 0, 0)),
             }),
         };
         let path = PathBuf::from("/tmp/file.jsonl");
@@ -715,6 +845,7 @@ mod tests {
             line_type: "assistant".into(),
             session_id: Some("sess1".into()),
             cwd: None,
+            timestamp: None,
             message: Some(AssistantMessage {
                 model: Some("claude-opus-4-6".into()),
                 usage: None,
@@ -731,21 +862,8 @@ mod tests {
         let path = PathBuf::from("/home/user/.claude/projects/-test/file.jsonl");
 
         for _ in 0..3 {
-            let entry = JsonlLine {
-                line_type: "assistant".into(),
-                session_id: Some("sess1".into()),
-                cwd: Some("/project".into()),
-                message: Some(AssistantMessage {
-                    model: Some("claude-haiku-4-5".into()),
-                    usage: Some(TokenUsage {
-                        input_tokens: 100,
-                        output_tokens: 50,
-                        cache_creation_input_tokens: 0,
-                        cache_read_input_tokens: 20,
-                        cache_creation: None,
-                    }),
-                }),
-            };
+            let entry =
+                assistant_entry("sess1", Some("/project"), None, usage(100, 50, 20, 0));
             process_line(&mut state, &entry, &path);
         }
 
@@ -763,40 +881,12 @@ mod tests {
         let mut state = make_state();
         let path = PathBuf::from("/home/user/.claude/projects/-test/file.jsonl");
 
-        // Session 1
-        let entry1 = JsonlLine {
-            line_type: "assistant".into(),
-            session_id: Some("sess1".into()),
-            cwd: Some("/project1".into()),
-            message: Some(AssistantMessage {
-                model: Some("claude-opus-4-6".into()),
-                usage: Some(TokenUsage {
-                    input_tokens: 1_000_000,
-                    output_tokens: 500_000,
-                    cache_creation_input_tokens: 0,
-                    cache_read_input_tokens: 0,
-                    cache_creation: None,
-                }),
-            }),
-        };
+        let entry1 =
+            assistant_entry("sess1", Some("/project1"), None, usage(1_000_000, 500_000, 0, 0));
         process_line(&mut state, &entry1, &path);
 
-        // Session 2
-        let entry2 = JsonlLine {
-            line_type: "assistant".into(),
-            session_id: Some("sess2".into()),
-            cwd: Some("/project2".into()),
-            message: Some(AssistantMessage {
-                model: Some("claude-haiku-4-5".into()),
-                usage: Some(TokenUsage {
-                    input_tokens: 500_000,
-                    output_tokens: 200_000,
-                    cache_creation_input_tokens: 0,
-                    cache_read_input_tokens: 0,
-                    cache_creation: None,
-                }),
-            }),
-        };
+        let entry2 =
+            assistant_entry("sess2", Some("/project2"), None, usage(500_000, 200_000, 0, 0));
         process_line(&mut state, &entry2, &path);
 
         // Build snapshot manually (same logic as UsageTracker::snapshot)
@@ -817,57 +907,18 @@ mod tests {
         let path = PathBuf::from("/home/user/.claude/projects/-test/file.jsonl");
 
         // sessA processed first (older)
-        let entry_a = JsonlLine {
-            line_type: "assistant".into(),
-            session_id: Some("sessA".into()),
-            cwd: Some("/project/foo".into()),
-            message: Some(AssistantMessage {
-                model: Some("claude-sonnet-4-6".into()),
-                usage: Some(TokenUsage {
-                    input_tokens: 999,
-                    output_tokens: 888,
-                    cache_creation_input_tokens: 0,
-                    cache_read_input_tokens: 0,
-                    cache_creation: None,
-                }),
-            }),
-        };
+        let entry_a =
+            assistant_entry("sessA", Some("/project/foo"), None, usage(999, 888, 0, 0));
         process_line(&mut state, &entry_a, &path);
 
         // sessB processed second (newer — becomes "current session")
-        let entry_b = JsonlLine {
-            line_type: "assistant".into(),
-            session_id: Some("sessB".into()),
-            cwd: Some("/project/foo".into()),
-            message: Some(AssistantMessage {
-                model: Some("claude-sonnet-4-6".into()),
-                usage: Some(TokenUsage {
-                    input_tokens: 100,
-                    output_tokens: 50,
-                    cache_creation_input_tokens: 10,
-                    cache_read_input_tokens: 20,
-                    cache_creation: None,
-                }),
-            }),
-        };
+        let entry_b =
+            assistant_entry("sessB", Some("/project/foo"), None, usage(100, 50, 20, 10));
         process_line(&mut state, &entry_b, &path);
 
         // sessC in a different project
-        let entry_c = JsonlLine {
-            line_type: "assistant".into(),
-            session_id: Some("sessC".into()),
-            cwd: Some("/project/bar".into()),
-            message: Some(AssistantMessage {
-                model: Some("claude-haiku-4-5".into()),
-                usage: Some(TokenUsage {
-                    input_tokens: 300,
-                    output_tokens: 150,
-                    cache_creation_input_tokens: 0,
-                    cache_read_input_tokens: 0,
-                    cache_creation: None,
-                }),
-            }),
-        };
+        let entry_c =
+            assistant_entry("sessC", Some("/project/bar"), None, usage(300, 150, 0, 0));
         process_line(&mut state, &entry_c, &path);
 
         let tracker = UsageTracker {
@@ -886,6 +937,170 @@ mod tests {
         let bar = by_project["/project/bar"];
         assert_eq!(bar.0, 300);
         assert_eq!(bar.1, 150);
+    }
+
+    // ── iso8601_to_unix ──
+
+    #[test]
+    fn iso8601_parses_known_epoch() {
+        // 1970-01-01T00:00:00Z is Unix 0.
+        assert_eq!(iso8601_to_unix("1970-01-01T00:00:00.000Z"), Some(0));
+        // 2000-01-01T00:00:00Z = 946684800.
+        assert_eq!(iso8601_to_unix("2000-01-01T00:00:00Z"), Some(946684800));
+        // A real Claude jsonl timestamp; sub-second precision is dropped.
+        assert_eq!(
+            iso8601_to_unix("2026-05-13T01:18:43.744Z"),
+            Some(1778635123)
+        );
+    }
+
+    #[test]
+    fn iso8601_rejects_malformed() {
+        assert_eq!(iso8601_to_unix(""), None);
+        assert_eq!(iso8601_to_unix("not-a-date"), None);
+        assert_eq!(iso8601_to_unix("2026-13-01T00:00:00Z"), None); // month 13
+        assert_eq!(iso8601_to_unix("2026-05-00T00:00:00Z"), None); // day 0
+    }
+
+    // ── record_session_start ──
+
+    #[test]
+    fn record_session_start_keeps_earliest_timestamp() {
+        let mut state = make_state();
+        // attachment line is usually first and carries the timestamp.
+        let early = JsonlLine {
+            line_type: "attachment".into(),
+            session_id: Some("sess1".into()),
+            cwd: Some("/cwd".into()),
+            timestamp: Some("2026-05-13T01:00:00.000Z".into()),
+            message: None,
+        };
+        let late = assistant_entry(
+            "sess1",
+            Some("/cwd"),
+            Some("2026-05-13T01:05:00.000Z"),
+            usage(1, 1, 0, 0),
+        );
+        // Process in chronological order, then again out of order.
+        record_session_start(&mut state, &early);
+        record_session_start(&mut state, &late);
+        let expected = iso8601_to_unix("2026-05-13T01:00:00.000Z").unwrap();
+        assert_eq!(state.session_started_at.get("sess1"), Some(&expected));
+        // A later re-scan of an even-earlier line still lowers the value.
+        let earlier = JsonlLine {
+            timestamp: Some("2026-05-13T00:55:00.000Z".into()),
+            ..early
+        };
+        record_session_start(&mut state, &earlier);
+        let expected_earlier = iso8601_to_unix("2026-05-13T00:55:00.000Z").unwrap();
+        assert_eq!(state.session_started_at.get("sess1"), Some(&expected_earlier));
+    }
+
+    #[test]
+    fn record_session_start_ignores_lines_without_timestamp() {
+        let mut state = make_state();
+        // last-prompt / permission-mode lines have sessionId but no timestamp.
+        let no_ts = JsonlLine {
+            line_type: "last-prompt".into(),
+            session_id: Some("sess1".into()),
+            cwd: None,
+            timestamp: None,
+            message: None,
+        };
+        record_session_start(&mut state, &no_ts);
+        assert!(state.session_started_at.is_empty());
+    }
+
+    // ── snapshot_by_panel ──
+
+    #[test]
+    fn snapshot_by_panel_same_cwd_two_panes_distinct_sessions() {
+        let mut state = make_state();
+        let path = PathBuf::from("/home/user/.claude/projects/-test/file.jsonl");
+
+        // Two sessions in the same cwd, started 60s apart — start time is taken
+        // from each line's own ISO-8601 timestamp via record_session_start.
+        let entry_a = assistant_entry(
+            "sessA",
+            Some("/cwd/shared"),
+            Some("2026-05-13T01:00:00.000Z"),
+            usage(100, 50, 0, 0),
+        );
+        let entry_b = assistant_entry(
+            "sessB",
+            Some("/cwd/shared"),
+            Some("2026-05-13T01:01:00.000Z"),
+            usage(200, 100, 0, 0),
+        );
+        record_session_start(&mut state, &entry_a);
+        process_line(&mut state, &entry_a, &path);
+        record_session_start(&mut state, &entry_b);
+        process_line(&mut state, &entry_b, &path);
+
+        let base = iso8601_to_unix("2026-05-13T01:00:00.000Z").unwrap();
+        let tracker = UsageTracker { state: Arc::new(Mutex::new(state)) };
+
+        // paneA proc_start = base+5 → closest to sessA (diff=5)
+        // paneB proc_start = base+62 → closest to sessB (started base+60, diff=2)
+        let panes = vec![
+            ("panelA".to_string(), "/cwd/shared".to_string(), base + 5),
+            ("panelB".to_string(), "/cwd/shared".to_string(), base + 62),
+        ];
+        let by_panel = tracker.snapshot_by_panel(&panes);
+
+        assert_eq!(by_panel.len(), 2, "both panes should match distinct sessions");
+        assert_eq!(by_panel["panelA"].0, 100); // → sessA
+        assert_eq!(by_panel["panelB"].0, 200); // → sessB
+    }
+
+    #[test]
+    fn snapshot_by_panel_exceeds_max_diff_skipped() {
+        let mut state = make_state();
+        let path = PathBuf::from("/home/user/.claude/projects/-test/file.jsonl");
+        let entry = assistant_entry(
+            "sessX",
+            Some("/cwd/far"),
+            Some("2026-05-13T01:00:00.000Z"),
+            usage(50, 25, 0, 0),
+        );
+        record_session_start(&mut state, &entry);
+        process_line(&mut state, &entry, &path);
+
+        let base = iso8601_to_unix("2026-05-13T01:00:00.000Z").unwrap();
+        let tracker = UsageTracker { state: Arc::new(Mutex::new(state)) };
+        // proc_start = base+500 → diff 500s > MAX_DIFF(300)
+        let panes = vec![("panelX".to_string(), "/cwd/far".to_string(), base + 500)];
+        let by_panel = tracker.snapshot_by_panel(&panes);
+        assert!(by_panel.is_empty(), "diff > 300s should be skipped");
+    }
+
+    #[test]
+    fn snapshot_by_panel_tie_refusal_skipped() {
+        let mut state = make_state();
+        let path = PathBuf::from("/home/user/.claude/projects/-test/file.jsonl");
+        // Two sessions with the same start timestamp → ambiguous tie.
+        let entry1 = assistant_entry(
+            "sessT1",
+            Some("/cwd/tie"),
+            Some("2026-05-13T01:00:00.000Z"),
+            usage(100, 0, 0, 0),
+        );
+        let entry2 = assistant_entry(
+            "sessT2",
+            Some("/cwd/tie"),
+            Some("2026-05-13T01:00:00.000Z"),
+            usage(200, 0, 0, 0),
+        );
+        record_session_start(&mut state, &entry1);
+        process_line(&mut state, &entry1, &path);
+        record_session_start(&mut state, &entry2);
+        process_line(&mut state, &entry2, &path);
+
+        let base = iso8601_to_unix("2026-05-13T01:00:00.000Z").unwrap();
+        let tracker = UsageTracker { state: Arc::new(Mutex::new(state)) };
+        let panes = vec![("panelT".to_string(), "/cwd/tie".to_string(), base)];
+        let by_panel = tracker.snapshot_by_panel(&panes);
+        assert!(by_panel.is_empty(), "tie within 1s should be skipped as ambiguous");
     }
 
     // ── JSONL parsing from string ──
