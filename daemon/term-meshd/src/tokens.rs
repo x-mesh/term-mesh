@@ -549,7 +549,7 @@ fn record_session_start(state: &mut TrackerState, entry: &JsonlLine) {
 /// Parse an ISO-8601 UTC timestamp ("YYYY-MM-DDTHH:MM:SS(.sss)Z") to Unix
 /// seconds. Sub-second precision and the trailing 'Z' are ignored. Returns
 /// None if the prefix does not match the expected fixed-width layout.
-fn iso8601_to_unix(s: &str) -> Option<i64> {
+pub(crate) fn iso8601_to_unix(s: &str) -> Option<i64> {
     if s.len() < 19 {
         return None;
     }

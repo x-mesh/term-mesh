@@ -610,13 +610,13 @@ async fn run_codex_usage_tick_broadcaster(
     mut shutdown_rx: watch::Receiver<bool>,
 ) {
     let Some(tracker) = crate::codex_tokens::CodexUsageTracker::new() else {
-        tracing::info!("codex.token.watch: ~/.codex/state_5.sqlite not found, broadcaster disabled");
+        tracing::info!("codex.token.watch: ~/.codex/sessions not found, broadcaster disabled");
         return;
     };
-    tracing::info!("codex.token.watch: started polling {}", tracker.db_path.display());
+    tracing::info!("codex.token.watch: started polling ~/.codex/sessions rollout JSONL");
 
-    // (team_name, agent_name) → last-emitted total_tokens
-    let mut last_emitted: HashMap<(String, String), u64> = HashMap::new();
+    // (team_name, agent_name) → last-emitted (input, output, cache_read, cache_write)
+    let mut last_emitted: HashMap<(String, String), (u64, u64, u64, u64)> = HashMap::new();
     let mut interval = tokio::time::interval(Duration::from_secs(2));
     interval.tick().await; // skip immediate first tick
 
@@ -637,7 +637,7 @@ async fn run_codex_usage_tick_broadcaster(
                 let by_panel = match tracker.snapshot_by_panel(&codex_panes) {
                     Ok(m) => m,
                     Err(e) => {
-                        tracing::debug!("codex.token.parse.skip reason=db_error: {e}");
+                        tracing::debug!("codex.token.parse.skip reason=scan_error: {e}");
                         continue;
                     }
                 };
@@ -680,8 +680,9 @@ async fn run_codex_usage_tick_broadcaster(
                             _ => continue,
                         };
                         // Skip until pane_tracker has confirmed this panel AND
-                        // start-time correlation has matched it to a Codex thread.
-                        let Some(&total_tokens) = by_panel.get(panel_id) else {
+                        // start-time correlation has matched it to a Codex session.
+                        let Some(&(in_tok, out_tok, cr_tok, cw_tok)) = by_panel.get(panel_id)
+                        else {
                             continue;
                         };
                         let agent_name = agent
@@ -693,18 +694,19 @@ async fn run_codex_usage_tick_broadcaster(
                             continue;
                         }
                         let key = (team_name.to_string(), agent_name.to_string());
-                        let last = last_emitted.get(&key).copied().unwrap_or(0);
-                        if total_tokens == last {
+                        let last = last_emitted.get(&key).copied().unwrap_or_default();
+                        if (in_tok, out_tok, cr_tok, cw_tok) == last {
                             continue;
                         }
-                        last_emitted.insert(key, total_tokens);
-                        // Codex doesn't expose input/output split; report aggregate as output_tokens.
+                        last_emitted.insert(key, (in_tok, out_tok, cr_tok, cw_tok));
+                        // Rollout JSONL splits usage: input / output(+reasoning) /
+                        // cached_input → cache_read. Codex has no cache-write.
                         tick_agents.push(crate::headless::UsageTickAgent {
                             name: agent_name.to_string(),
-                            input_tokens: 0,
-                            output_tokens: total_tokens,
-                            cache_read_input_tokens: 0,
-                            cache_creation_input_tokens: 0,
+                            input_tokens: in_tok,
+                            output_tokens: out_tok,
+                            cache_read_input_tokens: cr_tok,
+                            cache_creation_input_tokens: cw_tok,
                         });
                     }
                     if !tick_agents.is_empty() {
