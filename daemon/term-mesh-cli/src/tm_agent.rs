@@ -5043,7 +5043,19 @@ fn run_create(
                     }),
                     3,
                 ) {
-                    Ok(_) => eprintln!("  \u{2713} {name}: init prompt sent"),
+                    Ok(ref r) => {
+                        // team.send pastes text with withReturn=false; the trailing "\n"
+                        // is stripped by sendTextToPanel, so the Enter must be delivered
+                        // separately via team.send_key — same follow-up as `tm-agent send`
+                        // and `tm-agent delegate`. Without this the init prompt sits
+                        // unsubmitted in the freshly spawned agent pane (enter-swallow).
+                        let text_delivered =
+                            r["result"]["text_delivered"].as_bool().unwrap_or(false);
+                        let _ = send_return_key_with_retry(
+                            sock, team, name, text_delivered, "team.create.init",
+                        );
+                        eprintln!("  \u{2713} {name}: init prompt sent");
+                    }
                     Err(e) => eprintln!("  \u{2717} {name}: init prompt FAILED: {e}"),
                 }
                 // Keep 1s delay between sends: this is NOT state synchronization but
