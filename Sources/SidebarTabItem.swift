@@ -891,15 +891,24 @@ struct TabItemView: View {
         }
 
         ZStack {
-            Circle()
-                .fill(color)
-                .frame(width: 6, height: 6)
-            // Phase 2: parked → small pause glyph overlay so the gray dot is
-            // distinguishable from plain idle.
-            if state == "parked" {
-                Image(systemName: "pause.fill")
-                    .font(.system(size: 4, weight: .bold))
-                    .foregroundStyle(Color.primary.opacity(0.85))
+            if state == "running" {
+                // in_progress task → animated spinner replaces static dot
+                ProgressView()
+                    .progressViewStyle(.circular)
+                    .controlSize(.mini)
+                    .scaleEffect(0.55)
+                    .opacity(0.85)
+            } else {
+                Circle()
+                    .fill(color)
+                    .frame(width: 6, height: 6)
+                // Phase 2: parked → small pause glyph overlay so the gray dot is
+                // distinguishable from plain idle.
+                if state == "parked" {
+                    Image(systemName: "pause.fill")
+                        .font(.system(size: 4, weight: .bold))
+                        .foregroundStyle(Color.primary.opacity(0.85))
+                }
             }
         }
         .frame(width: 8, height: 8)
