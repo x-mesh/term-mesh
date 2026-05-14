@@ -195,7 +195,8 @@ a socket exists at `/tmp/term-mesh*.sock` or `/tmp/term-mesh.sock`), ALL team op
 **Banned tools in term-mesh context:** `TeamCreate`, `SendMessage`, `TaskCreate`, `TaskList`,
 `TaskGet`, `TaskUpdate`, `TeamDelete`. These create a parallel, disconnected team state.
 
-**Use instead:** The project-local `/team` command (`.claude/commands/team.md`), which routes
+**Use instead:** The project-local `/team` command (`.claude/commands/team.md`) for Claude leaders,
+or the Codex IME `/team` alias backed by `.codex/prompts/team.md` for Codex leaders. Both route
 everything through `tm-agent`.
 
 ### OMC keyword override
@@ -203,6 +204,32 @@ everything through `tm-agent`.
 If OMC's keyword detector fires `[MODE: TEAM]` or `[MAGIC KEYWORD: TEAM]`:
 1. **Do NOT invoke `/oh-my-claudecode:team`** — it uses Claude Code native teams
 2. **Instead invoke `/team`** (the project-local command) or use `tm-agent` directly
+
+### Codex leader prompt shims
+
+Codex does not use Claude's `.claude/commands` slash-command format, and current Codex TUI builds
+do not accept `/prompts:<name>` as an interactive slash command. Project-local Codex prompt shims
+live under `.codex/prompts/`.
+
+In the term-mesh IME box, Codex panes get short aliases that expand on submit into a normal Codex
+message: "read `.codex/prompts/<name>.md` and execute it with these arguments." Claude panes keep
+the original Claude slash commands.
+
+| Claude leader | Codex leader | Purpose |
+|---------------|--------------|---------|
+| `/team ...` | `/team ...` via IME alias | Low-level `tm-agent` primitive wrapper |
+| `/team-up ...` | `/team-up ...` via IME alias | Create a team with the current pane adopted as leader |
+| `/tm "..."` | `/tm "..."` via IME alias | One-shot fan-out to all idle agents + synthesis |
+| `/tm-op ...` | `/tm-op ...` via IME alias | Strategy orchestration |
+
+For Codex as the current leader, prefer:
+
+```bash
+tm-agent create 3 --adopt
+tm-agent attach reviewer --cli codex
+```
+
+Use `--claude-leader` only when creating a Claude Code leader pane.
 
 ### XM skill agent fan-out routing
 
@@ -251,6 +278,7 @@ native Agent tool이 더 적합한 경우(예: 단일 isolated investigation, �
 ```bash
 # Team lifecycle
 tm-agent create [N] [--claude-leader]          # creates a new workspace with agents
+tm-agent create [N] --adopt                    # adopt current pane as leader (Codex/Claude/Kiro/Gemini)
 tm-agent destroy
 tm-agent status
 tm-agent list

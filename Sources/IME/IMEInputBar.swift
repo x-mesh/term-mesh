@@ -60,6 +60,8 @@ struct IMEInputBar: View {
     var onSendKey: ((_ keycode: UInt16, _ mods: UInt32) -> Void)? = nil
     /// Terminal working directory — used to discover project-local slash commands.
     var workingDirectory: String? = nil
+    /// Slash aliases expanded just before submit, e.g. /tm -> read .codex/prompts/tm.md.
+    var slashCommandAliases: [String: String] = [:]
 
     @State private var text: String = ""
     @State private var history: [String] = IMEHistory.load()   // Q4: fast sync init; merged async in .task
@@ -185,12 +187,28 @@ struct IMEInputBar: View {
     private var filteredSlashCommands: [SlashCommand] {
         guard showSlashPicker else { return [] }
         let query = text.lowercased()
+        let commands = mergedSlashCommands
         if query == "/" {
-            return Array(slashCommands.prefix(15))
+            return Array(commands.prefix(15))
         }
-        return Array(slashCommands
+        return Array(commands
             .filter { $0.name.lowercased().hasPrefix(query) }
             .prefix(15))
+    }
+
+    private var mergedSlashCommands: [SlashCommand] {
+        guard !slashCommandAliases.isEmpty else { return slashCommands }
+        var seen = Set<String>()
+        var merged: [SlashCommand] = []
+        for alias in slashCommandAliases.keys.sorted() {
+            if seen.insert(alias).inserted {
+                merged.append(SlashCommand(name: alias, desc: "Codex prompt alias"))
+            }
+        }
+        for command in slashCommands where seen.insert(command.name).inserted {
+            merged.append(command)
+        }
+        return merged.sorted { $0.name < $1.name }
     }
 
     private var filteredAgentMentions: [IMEAgentMention] {
@@ -239,10 +257,29 @@ struct IMEInputBar: View {
     }
 
     private func submitText(_ submitted: String) -> Bool {
-        if let route = agentRoute(for: submitted), let onAgentMentionSend {
+        let expanded = expandSlashAlias(in: submitted)
+        if let route = agentRoute(for: expanded), let onAgentMentionSend {
             return onAgentMentionSend(route.mention, route.message)
         }
-        return onSubmit(submitted)
+        return onSubmit(expanded)
+    }
+
+    private func expandSlashAlias(in submitted: String) -> String {
+        guard submitted.hasPrefix("/") else { return submitted }
+        let separators = CharacterSet.whitespacesAndNewlines
+        let tokenEnd = submitted.rangeOfCharacter(from: separators)?.lowerBound ?? submitted.endIndex
+        let token = String(submitted[..<tokenEnd])
+        guard let promptFile = slashCommandAliases[token] else { return submitted }
+        let args = String(submitted[tokenEnd...])
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return """
+        TERM-MESH CODEX PROMPT REQUEST
+        PROMPT_FILE: \(promptFile)
+        ARGUMENTS:
+        \(args)
+
+        Read PROMPT_FILE, treat ARGUMENTS as that prompt's $ARGUMENTS, and execute the prompt's workflow. This is a user-facing shortcut for \(token); do not try to run \(token) or /prompts:* as a Codex slash command.
+        """
     }
 
     private func doSubmit() {

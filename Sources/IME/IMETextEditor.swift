@@ -18,7 +18,7 @@ struct IMETextEditor: NSViewRepresentable {
     var onComposingChanged: ((Bool) -> Void)? = nil
     /// History entries for ghost suggestion prefix matching.
     var history: [String] = []
-    /// Claude slash commands for ghost suggestion when text starts with "/".
+    /// AI CLI slash commands/prompts for ghost suggestion when text starts with "/".
     var slashCommands: [String] = []
     /// Whether the fuzzy history picker overlay is visible.
     var isHistoryPickerOpen: Bool = false

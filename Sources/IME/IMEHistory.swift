@@ -130,7 +130,7 @@ enum ShellHistory {
     }
 }
 
-// MARK: - Claude Code slash commands
+// MARK: - AI CLI slash commands
 
 struct SlashCommand: Equatable, Hashable {
     let name: String
@@ -138,7 +138,7 @@ struct SlashCommand: Equatable, Hashable {
 }
 
 enum SlashCommands {
-    /// Built-in Claude Code slash commands with descriptions
+    /// Built-in Claude Code slash commands with descriptions.
     static let builtinCommands: [SlashCommand] = [
         .init(name: "/add-dir", desc: "Add a directory to context"),
         .init(name: "/agents", desc: "View agent status"),
@@ -220,21 +220,30 @@ enum SlashCommands {
         .init(name: "/simplify", desc: "Simplify code"),
     ]
 
-    /// Loads built-in commands merged with custom commands from .claude/commands/ directories.
+    /// Loads built-in commands merged with project/user Claude commands.
     /// - Parameter workingDirectory: Terminal's current working directory; used to find the project root.
     static func loadAll(workingDirectory: String? = nil) -> [SlashCommand] {
         var commands = builtinCommands
-        // Project-local commands: walk up from the terminal CWD to find .claude/commands/
-        let projectDir = findProjectCommandsDir(from: workingDirectory)
-            ?? findProjectCommandsDir(from: GhosttyConfig.load().workingDirectory)
-            ?? findProjectCommandsDir(from: FileManager.default.currentDirectoryPath)
-        if let projectDir {
-            commands += scanCommandDir(projectDir)
+
+        // Project-local Claude commands: walk up from the terminal CWD.
+        let projectSearchRoots = [
+            workingDirectory,
+            GhosttyConfig.load().workingDirectory,
+            FileManager.default.currentDirectoryPath,
+        ]
+        for root in projectSearchRoots {
+            if let claudeDir = findProjectDir(relativePath: ".claude/commands", from: root) {
+                commands += scanMarkdownDir(claudeDir, prefix: "/", desc: "Claude command")
+                break
+            }
         }
-        // User global commands
-        let userDir = FileManager.default.homeDirectoryForCurrentUser
+
+        // User global Claude commands.
+        let home = FileManager.default.homeDirectoryForCurrentUser
+        let userClaudeDir = home
             .appendingPathComponent(".claude/commands").path
-        commands += scanCommandDir(userDir)
+        commands += scanMarkdownDir(userClaudeDir, prefix: "/", desc: "Claude command")
+
         // Dedupe by name and sort
         var seen = Set<String>()
         var unique: [SlashCommand] = []
@@ -247,13 +256,13 @@ enum SlashCommands {
         return unique.sorted { $0.name < $1.name }
     }
 
-    /// Walk up from `startDir` looking for `.claude/commands/`.
-    private static func findProjectCommandsDir(from startDir: String?) -> String? {
+    /// Walk up from `startDir` looking for a project-local command/prompt directory.
+    private static func findProjectDir(relativePath: String, from startDir: String?) -> String? {
         guard let start = startDir, !start.isEmpty else { return nil }
         var dir = start
         let fm = FileManager.default
         for _ in 0..<10 {
-            let candidate = (dir as NSString).appendingPathComponent(".claude/commands")
+            let candidate = (dir as NSString).appendingPathComponent(relativePath)
             if fm.fileExists(atPath: candidate) {
                 return candidate
             }
@@ -264,12 +273,12 @@ enum SlashCommands {
         return nil
     }
 
-    private static func scanCommandDir(_ path: String) -> [SlashCommand] {
+    private static func scanMarkdownDir(_ path: String, prefix: String, desc: String) -> [SlashCommand] {
         guard let files = try? FileManager.default.contentsOfDirectory(atPath: path) else { return [] }
         return files.compactMap { file -> SlashCommand? in
             guard file.hasSuffix(".md") else { return nil }
-            let name = "/" + file.replacingOccurrences(of: ".md", with: "")
-            return SlashCommand(name: name, desc: "Custom command")
+            let stem = file.replacingOccurrences(of: ".md", with: "")
+            return SlashCommand(name: prefix + stem, desc: desc)
         }
     }
 }

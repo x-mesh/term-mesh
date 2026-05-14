@@ -860,7 +860,8 @@ final class GhosttySurfaceScrollView: NSView {
                 keyEvent.action = GHOSTTY_ACTION_RELEASE
                 _ = ghostty_surface_key(surface, keyEvent)
             },
-            workingDirectory: workingDirectory
+            workingDirectory: workingDirectory,
+            slashCommandAliases: self.imeSlashCommandAliases()
         )
 
         let overlay = NSHostingView(rootView: rootView)
@@ -939,6 +940,44 @@ final class GhosttySurfaceScrollView: NSView {
             )
         })
         return mentions
+    }
+
+    private func imeSlashCommandAliases() -> [String: String] {
+        guard isCodexLikePane() else { return [:] }
+        return [
+            "/team": ".codex/prompts/team.md",
+            "/team-up": ".codex/prompts/team-up.md",
+            "/tm": ".codex/prompts/tm.md",
+            "/tm-op": ".codex/prompts/tm-op.md",
+        ]
+    }
+
+    private func isCodexLikePane() -> Bool {
+        guard let located = AppDelegate.shared?.locateGhosttySurface(surfaceView.surface) else {
+            return false
+        }
+
+        let panelId = located.panelId
+        let orchestrator = TeamOrchestrator.shared
+
+        for team in orchestrator.teams.values {
+            if team.leaderPanelId == panelId, team.leaderMode.lowercased() == "codex" {
+                return true
+            }
+            if team.agents.contains(where: {
+                $0.panelId == panelId &&
+                    ($0.cli.lowercased() == "codex" || $0.launchCommand.lowercased().contains("codex"))
+            }) {
+                return true
+            }
+        }
+
+        guard let workspace = located.tabManager.tabs.first(where: { $0.id == located.workspaceId }),
+              let panel = workspace.panels[panelId] as? TerminalPanel else {
+            return false
+        }
+        let title = panel.displayTitle.lowercased()
+        return title.contains("codex") || title.contains("gpt-")
     }
 
     private enum IMEAgentDispatchKind {
