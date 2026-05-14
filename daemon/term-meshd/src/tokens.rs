@@ -1,3 +1,4 @@
+use notify::{Config, Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Seek, SeekFrom};
@@ -5,8 +6,8 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-/// Scan interval for JSONL files.
-const SCAN_INTERVAL: Duration = Duration::from_secs(5);
+/// Scan interval for JSONL files (fallback poll; FSEvents trigger is primary).
+const SCAN_INTERVAL: Duration = Duration::from_secs(30);
 
 // ── Model Pricing (USD per million tokens) ──
 
@@ -150,8 +151,49 @@ impl UsageTracker {
         }
     }
 
-    /// Start the background scanning loop. Returns self for chaining.
+    /// Start FSEvents watcher + fallback poll loop. Returns self for chaining.
     pub fn start(self) -> Self {
+        let claude_dir = self.state.lock().unwrap().claude_projects_dir.clone();
+
+        // Primary: FSEvents-triggered scan via notify crate.
+        // Watches ~/.claude/projects/ recursively; fires scan_all() immediately
+        // on any *.jsonl create/modify event. Fallback poll (every 30s) catches
+        // edge cases where the OS coalesces events under heavy write load.
+        if claude_dir.exists() {
+            let tracker_fsevent = self.clone();
+            let watch_dir = claude_dir.clone();
+            tokio::task::spawn_blocking(move || {
+                let (tx, rx) = std::sync::mpsc::channel::<Event>();
+                let mut watcher: RecommendedWatcher = Watcher::new(
+                    move |res: Result<Event, notify::Error>| {
+                        if let Ok(ev) = res { let _ = tx.send(ev); }
+                    },
+                    Config::default(),
+                ).expect("failed to create jsonl notify watcher");
+                if let Err(e) = watcher.watch(&watch_dir, RecursiveMode::Recursive) {
+                    tracing::warn!("sidebar.token.watch.start failed: {e}");
+                    return;
+                }
+                tracing::info!("sidebar.token.watch.start path={}", watch_dir.display());
+                for event in rx {
+                    let is_jsonl_change = matches!(
+                        event.kind,
+                        EventKind::Create(_) | EventKind::Modify(_)
+                    ) && event.paths.iter().any(|p| {
+                        p.extension().and_then(|e| e.to_str()) == Some("jsonl")
+                    });
+                    if is_jsonl_change {
+                        if let Err(e) = tracker_fsevent.scan_all() {
+                            tracing::debug!("sidebar.token.parse.skip reason=scan_error: {e}");
+                        }
+                    }
+                }
+            });
+        } else {
+            tracing::info!("sidebar.token.watch.start dormant: ~/.claude/projects not found");
+        }
+
+        // Fallback: periodic poll to catch any missed FSEvents.
         let tracker = self.clone();
         tokio::spawn(async move {
             // Initial scan
@@ -245,11 +287,27 @@ impl UsageTracker {
 
         let mut line_buf = String::new();
 
+        let mut line_n: u64 = 0;
         while reader.read_line(&mut line_buf)? > 0 {
+            line_n += 1;
             let trimmed = line_buf.trim();
             if !trimmed.is_empty() {
-                if let Ok(entry) = serde_json::from_str::<JsonlLine>(trimmed) {
-                    process_line(&mut state, &entry, path);
+                match serde_json::from_str::<JsonlLine>(trimmed) {
+                    Ok(entry) => {
+                        let had_usage = entry.message.as_ref()
+                            .and_then(|m| m.usage.as_ref()).is_some();
+                        if !had_usage && entry.line_type == "assistant" {
+                            tracing::debug!(
+                                "sidebar.token.parse.skip reason=no-usage line_n={line_n}"
+                            );
+                        }
+                        process_line(&mut state, &entry, path);
+                    }
+                    Err(_) => {
+                        tracing::debug!(
+                            "sidebar.token.parse.skip reason=json line_n={line_n}"
+                        );
+                    }
                 }
             }
             line_buf.clear();
@@ -258,6 +316,22 @@ impl UsageTracker {
         let new_offset = reader.stream_position()?;
         state.file_positions.insert(path.to_path_buf(), new_offset);
         Ok(())
+    }
+
+    /// Cumulative token totals aggregated by project_path.
+    /// Multiple sessions in the same project are summed.
+    /// Returns: project_path → (input, output, cache_read, cache_write)
+    pub fn snapshot_by_project(&self) -> HashMap<String, (u64, u64, u64, u64)> {
+        let state = self.state.lock().unwrap();
+        let mut by_project: HashMap<String, (u64, u64, u64, u64)> = HashMap::new();
+        for s in state.sessions.values() {
+            let e = by_project.entry(s.project_path.clone()).or_default();
+            e.0 += s.input_tokens;
+            e.1 += s.output_tokens;
+            e.2 += s.cache_read_tokens;
+            e.3 += s.cache_write_tokens;
+        }
+        by_project
     }
 
     /// Get a snapshot of all session usage data.
@@ -343,6 +417,13 @@ fn process_line(state: &mut TrackerState, entry: &JsonlLine, file_path: &Path) {
     if entry.cwd.is_some() {
         stats.project_path = project_path;
     }
+
+    tracing::debug!(
+        "sidebar.token.update agent={} in={} out={}",
+        stats.session_id,
+        usage.input_tokens,
+        usage.output_tokens
+    );
 }
 
 fn calculate_line_cost(usage: &TokenUsage, model: &str) -> f64 {
@@ -716,6 +797,71 @@ mod tests {
         assert_eq!(sessions.len(), 2);
         assert_eq!(total_input, 1_500_000);
         assert_eq!(total_output, 700_000);
+    }
+
+    // ── snapshot_by_project ──
+
+    #[test]
+    fn snapshot_by_project_groups_by_cwd() {
+        let mut state = make_state();
+        let path = PathBuf::from("/home/user/.claude/projects/-test/file.jsonl");
+
+        // Two sessions for the same project
+        for sess in ["sessA", "sessB"] {
+            let entry = JsonlLine {
+                line_type: "assistant".into(),
+                session_id: Some(sess.into()),
+                cwd: Some("/project/foo".into()),
+                message: Some(AssistantMessage {
+                    model: Some("claude-sonnet-4-6".into()),
+                    usage: Some(TokenUsage {
+                        input_tokens: 100,
+                        output_tokens: 50,
+                        cache_creation_input_tokens: 10,
+                        cache_read_input_tokens: 20,
+                        cache_creation: None,
+                    }),
+                }),
+            };
+            process_line(&mut state, &entry, &path);
+        }
+
+        // One session for a different project
+        let entry2 = JsonlLine {
+            line_type: "assistant".into(),
+            session_id: Some("sessC".into()),
+            cwd: Some("/project/bar".into()),
+            message: Some(AssistantMessage {
+                model: Some("claude-haiku-4-5".into()),
+                usage: Some(TokenUsage {
+                    input_tokens: 300,
+                    output_tokens: 150,
+                    cache_creation_input_tokens: 0,
+                    cache_read_input_tokens: 0,
+                    cache_creation: None,
+                }),
+            }),
+        };
+        process_line(&mut state, &entry2, &path);
+
+        // Build tracker with pre-seeded state
+        let tracker = UsageTracker {
+            state: Arc::new(Mutex::new(state)),
+        };
+        let by_project = tracker.snapshot_by_project();
+
+        assert_eq!(by_project.len(), 2);
+        let foo = by_project["/project/foo"];
+        assert_eq!(foo.0, 200); // input: 2 * 100
+        assert_eq!(foo.1, 100); // output: 2 * 50
+        assert_eq!(foo.2, 40);  // cache_read: 2 * 20
+        assert_eq!(foo.3, 20);  // cache_write: 2 * 10
+
+        let bar = by_project["/project/bar"];
+        assert_eq!(bar.0, 300);
+        assert_eq!(bar.1, 150);
+        assert_eq!(bar.2, 0);
+        assert_eq!(bar.3, 0);
     }
 
     // ── JSONL parsing from string ──

@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -167,8 +167,13 @@ pub async fn serve(
         ctx.clone(),
         shutdown_rx.clone(),
     ));
-    // Phase 2.5: 1s coalesce → emit `agent_usage_tick` broadcasts.
+    // Phase 2.5: 1s coalesce → emit `agent_usage_tick` broadcasts (headless path).
     let usage_broadcast_task = tokio::spawn(run_usage_tick_broadcaster(
+        ctx.clone(),
+        shutdown_rx.clone(),
+    ));
+    // Phase 2.5-B: 1s JSONL-watcher → emit `agent_usage_tick` for pane-mode claude agents.
+    let jsonl_usage_broadcast_task = tokio::spawn(run_jsonl_usage_tick_broadcaster(
         ctx.clone(),
         shutdown_rx.clone(),
     ));
@@ -208,6 +213,7 @@ pub async fn serve(
     }
     heartbeat_task.abort();
     usage_broadcast_task.abort();
+    jsonl_usage_broadcast_task.abort();
     usage_flush_task.abort();
 
     // Phase 2.5: final usage flush before exit (best-effort).
@@ -460,6 +466,113 @@ async fn run_usage_tick_broadcaster(
                         agents: t.agents,
                         ts_ms,
                     });
+                }
+            }
+            changed = shutdown_rx.changed() => {
+                if changed.is_err() || *shutdown_rx.borrow() {
+                    break;
+                }
+            }
+        }
+    }
+}
+
+/// Phase 2.5-B: every 1s, match JSONL-tracked cumulative token stats to pane-mode
+/// claude agents via `working_directory == project_path`. Emits `agent_usage_tick`
+/// for any team that has at least one claude agent whose counters changed since the
+/// previous tick.  Pane-mode agents share the team cwd so all receive the same
+/// aggregate (R4 v2-deferred: per-agent attribution is deferred).
+async fn run_jsonl_usage_tick_broadcaster(
+    ctx: Arc<Context>,
+    mut shutdown_rx: watch::Receiver<bool>,
+) {
+    // (team_name, agent_name) → last-emitted (input, output, cache_read, cache_write)
+    let mut last_emitted: HashMap<(String, String), (u64, u64, u64, u64)> = HashMap::new();
+    let mut interval = tokio::time::interval(Duration::from_secs(1));
+    interval.tick().await; // skip the immediate first tick
+
+    loop {
+        tokio::select! {
+            _ = interval.tick() => {
+                let by_project = ctx.usage_tracker.snapshot_by_project();
+                if by_project.is_empty() {
+                    continue;
+                }
+                let team_state = ctx.team_state.read().unwrap().clone();
+                let Some(teams) = team_state.get("teams").and_then(|v| v.as_array()) else {
+                    continue;
+                };
+                let ts_ms = current_time_ms();
+                for team in teams {
+                    let team_name = team
+                        .get("team_name")
+                        .or_else(|| team.get("name"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or_default();
+                    if team_name.is_empty() {
+                        continue;
+                    }
+                    // For pane-mode teams the team_uuid is not stored separately;
+                    // reuse team_name as the uuid (matches existing Swift handler contract).
+                    let team_uuid = team
+                        .get("team_uuid")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or(team_name);
+                    let cwd = team
+                        .get("working_directory")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or_default();
+                    let Some(&(in_tok, out_tok, cr_tok, cw_tok)) = by_project.get(cwd) else {
+                        continue;
+                    };
+                    let Some(agents) = team.get("agents").and_then(|v| v.as_array()) else {
+                        continue;
+                    };
+                    let mut tick_agents = Vec::new();
+                    for agent in agents {
+                        let cli = agent
+                            .get("cli")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or_default();
+                        if cli != "claude" {
+                            continue;
+                        }
+                        // Pane-mode only: headless agents lack panel_id and already receive
+                        // their cumulative counts via collect_usage_tick (in-memory counters).
+                        // Double-emitting would overwrite the in-memory delta with a stale sum.
+                        if agent.get("panel_id").map_or(true, |v| v.is_null()) {
+                            continue;
+                        }
+                        let agent_name = agent
+                            .get("name")
+                            .or_else(|| agent.get("agent_name"))
+                            .and_then(|v| v.as_str())
+                            .unwrap_or_default();
+                        if agent_name.is_empty() {
+                            continue;
+                        }
+                        let key = (team_name.to_string(), agent_name.to_string());
+                        let last = last_emitted.get(&key).copied().unwrap_or_default();
+                        if (in_tok, out_tok, cr_tok, cw_tok) == last {
+                            continue;
+                        }
+                        last_emitted.insert(key, (in_tok, out_tok, cr_tok, cw_tok));
+                        tick_agents.push(crate::headless::UsageTickAgent {
+                            name: agent_name.to_string(),
+                            input_tokens: in_tok,
+                            output_tokens: out_tok,
+                            cache_read_input_tokens: cr_tok,
+                            cache_creation_input_tokens: cw_tok,
+                        });
+                    }
+                    if !tick_agents.is_empty() {
+                        let _ = ctx.event_tx.send(DaemonEvent::AgentUsageTick {
+                            team_uuid: team_uuid.to_string(),
+                            team_name: team_name.to_string(),
+                            agents: tick_agents,
+                            ts_ms,
+                        });
+                    }
                 }
             }
             changed = shutdown_rx.changed() => {
