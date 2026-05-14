@@ -507,7 +507,17 @@ impl AgentSessionManager {
                 let (session_id, pid, pgid) = row?;
                 if let Some(session) = sessions.get_mut(&session_id) {
                     session.tracked_pids.push(pid);
-                    session.tracked_pgids.insert(pid, pgid);
+                    // Discard stored pgids that are not self-leaders (pgid != pid).
+                    // Such entries are stale or corrupt shared-parent group IDs that
+                    // would cause unintended blast radius via killpg on next terminate.
+                    let normalized_pgid = pgid.filter(|&g| g == pid);
+                    if pgid.is_some() && normalized_pgid.is_none() {
+                        tracing::warn!(
+                            "DB load: normalizing pgid {:?} → None for pid {} (not self-leader); stale entry discarded",
+                            pgid, pid
+                        );
+                    }
+                    session.tracked_pgids.insert(pid, normalized_pgid);
                 }
             }
         }
@@ -741,6 +751,10 @@ impl AgentSessionManager {
                         .get(&pid)
                         .copied()
                         .flatten()
+                        // Stored pgid is only valid for killpg when it's the self-leader
+                        // (pgid == pid). Discard shared-parent pgids that bypass the
+                        // resolve_pgid guard and fall through to resolve_pgid instead.
+                        .filter(|&stored_pgid| stored_pgid == pid)
                         .or_else(|| match resolve_pgid(pid) {
                             Ok(pgid) => pgid,
                             Err(e) => {
