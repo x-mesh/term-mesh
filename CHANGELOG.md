@@ -2,6 +2,28 @@
 
 All notable changes to term-mesh are documented here.
 
+## [0.115.0] - 2026-05-14
+
+### Added
+- **`/tm` 슬래시 커맨드 — 팀 일괄 dispatch** — 한 줄 instruction을 활성 팀의 모든 idle agent에게 동시에 위임하고 결과를 `[결론] / [충돌] / [다음]` 3줄로 수렴. `/tm-op`(10+ 전략)의 경량 진입점으로, 라운드·전략 선택 없이 "지금 전원 동원" 한 가지만 한다. `/team`과 양방향으로 연결되어 New 사용자가 `/tm`만 알아도 `/team`의 low-level 명령을 자연스럽게 발견.
+- **Gemini CLI agent 지원** — 팀 구성 시 claude / codex / kiro에 더해 gemini agent를 띄울 수 있음.
+- **New Agent Team 다이얼로그 — Smart Preset 추가/삭제** — preset 목록 끝의 점선 "+" 카드로 새 preset을 그 자리에서 즉석 생성(이름 입력 후 자동 저장), 카드에 hover하면 "×"로 삭제. built-in preset은 🔒로 보호되어 삭제 대신 Reset만 가능. preset이 하나도 없을 땐 "+" 카드가 전체 폭으로 확장.
+- **Pane mode agent 사이드바 토큰 표시** — 이전엔 headless agent만 토큰 카운터가 보였으나, 이제 사용자가 직접 split에 띄운 Claude / Codex agent도 input·output 토큰이 사이드바에 표시됨. 같은 작업 디렉토리를 공유하는 여러 agent도 프로세스 시작 시각으로 각자의 세션을 구분해 정확히 귀속. Codex는 rollout 로그를 직접 파싱해 input / output / cached를 정확히 분리.
+- **작업 중 agent 스피너** — task가 `in_progress`인 agent row에 정적 dot 대신 애니메이션 스피너가 표시되어 지금 일하는 agent를 한눈에 구분.
+
+### Fixed
+- **Enter 씹힘 — 두 개의 별개 경로 모두 수정** — (1) IME 조립 중 Enter를 누르면 Ghostty의 composing 가드가 `\r`을 삼키던 문제, (2) 리더가 `tm-agent send`/`delegate`로 pane에 메시지를 주입할 때 paste watchdog 타임아웃 후 Return 재시도가 통째로 skip되던 문제. 두 경로 다 막혀 텍스트는 들어가는데 실행이 안 되던 증상을 해소.
+- **슬립에서 깨어난 후 검은 pane** — wake 이벤트를 합쳐 agent surface를 다시 그리도록 수정.
+- **New Agent Team — leader 모델 선택이 저장되지 않던 문제** — leader 모델 / 모드가 팀 생성 성공 직후에만 저장되도록 변경. 이전 세션의 다른 CLI 모델이 남아 모델 셀렉트 박스가 빈 상태로 보이던 문제도 함께 해소. 미완성·중복 Smart Preset은 실행 시 자동 정리.
+- **사이드바 토큰 카운터가 누적 합계를 표시하던 문제** — 같은 작업 디렉토리의 과거 세션 전체가 합산돼 수치가 부풀던 문제를 현재 세션만 표시하도록 수정. Codex 토큰은 전체 합(total)을 output 칸에 잘못 넣던 것을 input / output / cached로 정확히 분리.
+
+### Changed
+- **사이드바 토큰 라벨 간결화** — `13 in · 1.1k out` → `13↑ 1.1k↓`로 축약, 상세는 hover tooltip으로 이동.
+
+### Thanks to 1 contributor!
+
+- [@JINWOO-J](https://github.com/JINWOO-J)
+
 ## [0.114.0] - 2026-05-13
 
 ### Added
