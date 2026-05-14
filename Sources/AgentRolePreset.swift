@@ -1389,7 +1389,19 @@ class TeamTemplateManager: ObservableObject {
         if needsSeedOrMigration {
             save()
         }
+        pruneAbandonedBlanks()
         rebuildTemplates()
+    }
+
+    // Silently remove blank user-created presets (no agents, no description, no parent) left from aborted adds.
+    private func pruneAbandonedBlanks() {
+        let before = store.customs.count
+        store.customs.removeAll { template in
+            guard template.origin == .custom, template.parentBuiltInId == nil,
+                  case .smart(let p) = template.payload else { return false }
+            return p.agents.isEmpty && p.description.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        }
+        if store.customs.count != before { save() }
     }
 
     func template(for id: TemplateID) -> TeamTemplate? {

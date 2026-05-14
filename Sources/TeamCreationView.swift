@@ -1526,7 +1526,11 @@ struct TeamCreationView: View {
                     }
                 }
 
-                let smartTemplates = teamTemplateManager.templates.filter { $0.id.category == .smart }
+                // Show built-ins + truly-new user customs (parentBuiltInId == nil).
+                // v3 "customize" copies (parentBuiltInId != nil) are NOT shown here to avoid duplicates.
+                let smartTemplates = teamTemplateManager.templates.filter {
+                    $0.id.category == .smart && ($0.origin == .builtIn || $0.parentBuiltInId == nil)
+                }
                 if smartTemplates.isEmpty {
                     addSmartPresetCard
                         .frame(maxWidth: .infinity, minHeight: 80)
