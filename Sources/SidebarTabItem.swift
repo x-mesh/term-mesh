@@ -1311,13 +1311,13 @@ private struct ExpandedAgentRow: View {
 
     private var tokenLabel: String {
         guard let u = usage, u.updatedAt != .distantPast else { return "—" }
-        return "\(compactToken(u.inputTokens)) in · \(compactToken(u.outputTokens)) out (sess)"
+        return "\(compactToken(u.inputTokens))↑ \(compactToken(u.outputTokens))↓"
     }
 
     private var tokenTooltip: String {
-        guard let u = usage, u.updatedAt != .distantPast else { return "No session token data yet." }
+        guard let u = usage, u.updatedAt != .distantPast else { return "No token data yet." }
         let total = u.cacheReadTokens &+ u.cacheCreationTokens
-        let base = "Current session only — not cumulative.\ninput \(u.inputTokens) · output \(u.outputTokens)"
+        let base = "input \(u.inputTokens) · output \(u.outputTokens)"
         if total > 0, let ratio = u.cacheHitRatio {
             let pct = Int((ratio * 100).rounded())
             return "\(base)\ncache hit \(pct)% · \(compactToken(u.cacheReadTokens)) cached · \(compactToken(u.cacheCreationTokens)) fresh"
