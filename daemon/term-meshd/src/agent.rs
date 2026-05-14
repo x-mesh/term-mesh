@@ -308,7 +308,16 @@ fn resolve_pgid(pid: u32) -> Result<Option<u32>, String> {
     let pid_i32 = validated_pid(pid)?;
     let pgid = unsafe { libc::getpgid(pid_i32) };
     if pgid > 1 {
-        Ok(Some(pgid as u32))
+        // Only use killpg when this process is its own group leader (pgid == pid).
+        // Session-registered PIDs come from Swift pane-CLIs that did not call
+        // setsid(), so their pgid may be a shared parent shell group — using
+        // killpg on those would kill a much wider process tree than intended.
+        // headless-spawned agents always have pgid == pid (setsid in pre_exec).
+        if pgid as u32 == pid {
+            Ok(Some(pgid as u32))
+        } else {
+            Ok(None)
+        }
     } else if pgid == 0 {
         tracing::warn!("getpgid returned invalid pgid=0 for pid {pid}; falling back to pid kill");
         Ok(None)
@@ -704,10 +713,12 @@ impl AgentSessionManager {
             return Ok(());
         }
 
-        // Kill the process group recorded for each tracked PID so grandchildren
-        // (MCP servers, sub-shells) are reaped. If pgid was unavailable at
-        // registration time, fall back to the individual PID. Never call
-        // killpg(0, ...): that would target the daemon's own process group.
+        // Kill each tracked process. killpg is used only when the process is its
+        // own group leader (pgid == pid, guaranteed for headless-spawned agents via
+        // setsid in pre_exec). Session-registered PIDs from Swift pane-CLIs may
+        // share a parent shell group, so they fall back to kill(pid) to avoid
+        // unintended blast radius. Never call killpg(0, ...): that would target
+        // the daemon's own process group.
         let pids_to_kill: Vec<KillTarget> = {
             let mut raw = session.tracked_pids.clone();
             if let Some(pid) = session.pid {
