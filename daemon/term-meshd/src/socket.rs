@@ -731,6 +731,10 @@ async fn run_codex_usage_tick_broadcaster(
                             continue;
                         }
                         last_emitted.insert(key, (in_tok, out_tok, cr_tok, cw_tok));
+                        tracing::debug!(
+                            "codex.token.update agent={agent_name} panel={panel_id} \
+                             in={in_tok} out={out_tok} cache_read={cr_tok}"
+                        );
                         // Rollout JSONL splits usage: input / output(+reasoning) /
                         // cached_input → cache_read. Codex has no cache-write.
                         tick_agents.push(crate::headless::UsageTickAgent {
