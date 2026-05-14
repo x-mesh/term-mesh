@@ -1483,6 +1483,34 @@ class TeamTemplateManager: ObservableObject {
         return candidate
     }
 
+    @discardableResult
+    func createBlankSmartPreset(name: String) -> TemplateID {
+        let displayName = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        let customId = TemplateID(
+            category: .smart,
+            slug: nextAvailableSlug(category: .smart, base: displayName.isEmpty ? "new-preset" : displayName)
+        )
+        let blank = SmartTeamPreset(
+            id: customId.slug,
+            name: displayName,
+            icon: "person.3",
+            description: "",
+            leaderMode: "claude",
+            agents: []
+        )
+        let custom = TeamTemplate(
+            id: customId,
+            origin: .custom,
+            name: displayName,
+            payload: .smart(blank)
+        )
+        store.customs.append(custom)
+        store.lastSelectedId = customId
+        save()
+        rebuildTemplates()
+        return customId
+    }
+
     func deleteCustom(id: TemplateID) throws {
         guard let index = store.customs.firstIndex(where: { $0.id == id && $0.origin == .custom }) else {
             throw TeamTemplateManagerError.customNotFound(id)

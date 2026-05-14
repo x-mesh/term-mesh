@@ -347,6 +347,11 @@ struct TeamCreationView: View {
     @State private var hoveredAgentId: UUID?
     @State private var bulkModel = "sonnet"
     @State private var selectedSmartPresetId: String?
+    @State private var hoveredSmartPresetId: String? = nil
+    @State private var deletingSmartPresetId: String? = nil
+    @State private var editingNewSmartPresetSlug: String? = nil
+    @State private var newSmartPresetName: String = ""
+    @FocusState private var isNewSmartPresetNameFocused: Bool
     @State private var worktreeMode = "off"  // "off", "shared", "isolated"
     @State private var executionMode = "pane"  // "pane" or "headless"
     @State private var showDaemonWarning = false
@@ -1521,11 +1526,39 @@ struct TeamCreationView: View {
                     }
                 }
 
-                LazyVGrid(columns: [
-                    GridItem(.adaptive(minimum: 250), spacing: 8)
-                ], spacing: 8) {
-                    ForEach(SmartTeamPreset.builtIn) { preset in
-                        smartPresetCard(preset)
+                let smartTemplates = teamTemplateManager.templates.filter { $0.id.category == .smart }
+                if smartTemplates.isEmpty {
+                    addSmartPresetCard
+                        .frame(maxWidth: .infinity, minHeight: 80)
+                } else {
+                    LazyVGrid(columns: [
+                        GridItem(.adaptive(minimum: 250), spacing: 8)
+                    ], spacing: 8) {
+                        ForEach(smartTemplates) { template in
+                            if case .smart(let basePreset) = template.payload {
+                                smartPresetCard(basePreset, template: template)
+                            }
+                        }
+                        addSmartPresetCard
+                    }
+                    .alert("Delete preset?", isPresented: Binding(
+                        get: { deletingSmartPresetId != nil },
+                        set: { if !$0 { deletingSmartPresetId = nil } }
+                    )) {
+                        Button("Cancel", role: .cancel) { deletingSmartPresetId = nil }
+                        Button("Delete", role: .destructive) {
+                            if let slug = deletingSmartPresetId {
+                                let id = TemplateID(category: .smart, slug: slug)
+                                try? teamTemplateManager.deleteCustom(id: id)
+                                if selectedSmartPresetId == slug { selectedSmartPresetId = nil }
+                            }
+                            deletingSmartPresetId = nil
+                        }
+                    } message: {
+                        if let slug = deletingSmartPresetId,
+                           let name = teamTemplateManager.templates.first(where: { $0.id.slug == slug })?.name {
+                            Text("Delete \"\(name)\"?")
+                        }
                     }
                 }
             }
@@ -1559,8 +1592,9 @@ struct TeamCreationView: View {
         }
     }
 
-    private func smartPresetCard(_ preset: SmartTeamPreset) -> some View {
+    private func smartPresetCard(_ preset: SmartTeamPreset, template: TeamTemplate) -> some View {
         let templateId = TemplateID(category: .smart, slug: preset.id)
+        let isUserCustom = template.origin == .custom
         let displayPreset: SmartTeamPreset
         if case .smart(let overridePreset) = teamTemplateManager.effectivePayload(for: templateId) {
             displayPreset = overridePreset
@@ -1572,14 +1606,28 @@ struct TeamCreationView: View {
         let fbCount = resolved.filter { if case .fallback = $0.status { return true }; return false }.count
         let isSelected = selectedSmartPresetId == preset.id
         let isOverridden = teamTemplateManager.isOverridden(templateId)
+        let isHovered = hoveredSmartPresetId == preset.id
+        let isEditingName = editingNewSmartPresetSlug == preset.id
 
         return VStack(alignment: .leading, spacing: 6) {
             HStack {
                 Image(systemName: displayPreset.icon)
                     .font(.subheadline)
-                Text(displayPreset.name)
-                    .font(.subheadline.bold())
-                if isOverridden {
+                if isEditingName {
+                    TextField("Preset name", text: $newSmartPresetName)
+                        .font(.subheadline.bold())
+                        .focused($isNewSmartPresetNameFocused)
+                        .onSubmit {
+                            commitNewPresetName(slug: preset.id)
+                        }
+                        .onChange(of: isNewSmartPresetNameFocused) { focused in
+                            if !focused { commitNewPresetName(slug: preset.id) }
+                        }
+                } else {
+                    Text(displayPreset.name)
+                        .font(.subheadline.bold())
+                }
+                if isOverridden && !isUserCustom {
                     ModifiedPresetBadgeButton {
                         teamTemplateManager.resetOverride(for: templateId)
                         if selectedSmartPresetId == preset.id {
@@ -1588,12 +1636,19 @@ struct TeamCreationView: View {
                     }
                 }
                 Spacer()
-                Text("\(resolved.count)")
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
-                    .padding(.horizontal, 5)
-                    .padding(.vertical, 1)
-                    .background(Capsule().fill(.quaternary))
+                if !isUserCustom && !isOverridden {
+                    Image(systemName: "lock.fill")
+                        .font(.system(size: 10))
+                        .foregroundStyle(.tertiary)
+                }
+                if resolved.count > 0 {
+                    Text("\(resolved.count)")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                        .padding(.horizontal, 5)
+                        .padding(.vertical, 1)
+                        .background(Capsule().fill(.quaternary))
+                }
             }
 
             Text(displayPreset.description)
@@ -1652,7 +1707,21 @@ struct TeamCreationView: View {
         .frame(maxWidth: .infinity, alignment: .leading)
         .contentShape(Rectangle())
         .onTapGesture {
-            applySmartPreset(displayPreset)
+            if !isEditingName { applySmartPreset(displayPreset) }
+        }
+        .onHover { hovered in
+            hoveredSmartPresetId = hovered ? preset.id : (hoveredSmartPresetId == preset.id ? nil : hoveredSmartPresetId)
+        }
+        .overlay(alignment: .topTrailing) {
+            if isUserCustom && isHovered {
+                Button(action: { deletingSmartPresetId = preset.id }) {
+                    Image(systemName: "xmark.circle.fill")
+                        .font(.system(size: 16))
+                        .foregroundStyle(.secondary)
+                }
+                .buttonStyle(.plain)
+                .padding(6)
+            }
         }
         .accessibilityAddTraits(.isButton)
         .background(
@@ -1663,6 +1732,51 @@ struct TeamCreationView: View {
             RoundedRectangle(cornerRadius: 8)
                 .stroke(isSelected ? Color.accentColor : Color.secondary.opacity(0.2), lineWidth: isSelected ? 2 : 1)
         )
+    }
+
+    private var addSmartPresetCard: some View {
+        Button(action: {
+            let newId = teamTemplateManager.createBlankSmartPreset(name: "")
+            newSmartPresetName = ""
+            editingNewSmartPresetSlug = newId.slug
+            DispatchQueue.main.async { isNewSmartPresetNameFocused = true }
+        }) {
+            VStack(spacing: 4) {
+                Image(systemName: "plus")
+                    .font(.title3)
+                    .foregroundStyle(.secondary)
+                Text("Add new")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            .frame(maxWidth: .infinity, minHeight: 80)
+        }
+        .buttonStyle(.plain)
+        .background(
+            RoundedRectangle(cornerRadius: 8)
+                .strokeBorder(style: StrokeStyle(lineWidth: 1, dash: [4, 3]))
+                .foregroundStyle(.secondary.opacity(0.4))
+        )
+    }
+
+    private func commitNewPresetName(slug: String) {
+        guard editingNewSmartPresetSlug == slug else { return }
+        let trimmed = newSmartPresetName.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed.isEmpty {
+            let id = TemplateID(category: .smart, slug: slug)
+            try? teamTemplateManager.deleteCustom(id: id)
+        } else {
+            let id = TemplateID(category: .smart, slug: slug)
+            if var template = teamTemplateManager.templates.first(where: { $0.id == id }),
+               case .smart(var p) = template.payload {
+                p.name = trimmed
+                template.name = trimmed
+                template.payload = .smart(p)
+                try? teamTemplateManager.updateCustom(template)
+            }
+        }
+        editingNewSmartPresetSlug = nil
+        newSmartPresetName = ""
     }
 
     private func badgeBackground(_ status: ResolvedAgent.Status) -> Color {
