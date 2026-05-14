@@ -32,6 +32,11 @@ struct IMETextEditor: NSViewRepresentable {
     var onSlashPickerMove: ((Int) -> Void)? = nil
     var onSlashPickerConfirm: (() -> Void)? = nil
     var onSlashPickerCancel: (() -> Void)? = nil
+    // Agent @mention picker
+    var isAgentPickerOpen: Bool = false
+    var onAgentPickerMove: ((Int) -> Void)? = nil
+    var onAgentPickerConfirm: (() -> Void)? = nil
+    var onAgentPickerCancel: (() -> Void)? = nil
     @Environment(\.colorScheme) private var colorScheme
 
     func makeCoordinator() -> Coordinator {
@@ -112,6 +117,11 @@ struct IMETextEditor: NSViewRepresentable {
         textView.slashPickerMoveHandler = onSlashPickerMove
         textView.slashPickerConfirmHandler = onSlashPickerConfirm
         textView.slashPickerCancelHandler = onSlashPickerCancel
+        // Agent @mention picker state and callbacks
+        textView.isAgentPickerOpen = isAgentPickerOpen
+        textView.agentPickerMoveHandler = onAgentPickerMove
+        textView.agentPickerConfirmHandler = onAgentPickerConfirm
+        textView.agentPickerCancelHandler = onAgentPickerCancel
 
         scrollView.documentView = textView
         context.coordinator.textView = textView
@@ -204,6 +214,11 @@ struct IMETextEditor: NSViewRepresentable {
         textView.slashPickerMoveHandler = onSlashPickerMove
         textView.slashPickerConfirmHandler = onSlashPickerConfirm
         textView.slashPickerCancelHandler = onSlashPickerCancel
+        // Agent @mention picker state and callbacks
+        textView.isAgentPickerOpen = isAgentPickerOpen
+        textView.agentPickerMoveHandler = onAgentPickerMove
+        textView.agentPickerConfirmHandler = onAgentPickerConfirm
+        textView.agentPickerCancelHandler = onAgentPickerCancel
     }
 
     class Coordinator: NSObject, NSTextViewDelegate {

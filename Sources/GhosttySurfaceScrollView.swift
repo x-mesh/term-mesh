@@ -820,6 +820,10 @@ final class GhosttySurfaceScrollView: NSView {
                     object: nil
                 )
             },
+            agentMentions: self.imeAgentMentions(),
+            onAgentMentionSend: { [weak self] mention, text in
+                self?.sendIMEAgentMention(mention: mention, text: text) ?? false
+            },
             onSendKey: { [weak self] keycode, mods in
                 guard let self, let surface = self.surfaceView.surface else { return }
                 // Map virtual keycode → unshifted Unicode codepoint.
@@ -896,6 +900,175 @@ final class GhosttySurfaceScrollView: NSView {
                 window.makeFirstResponder(imeTextView)
             }
         }
+    }
+
+    private func imeTeamLocation() -> (teamName: String, panelId: UUID, workspaceId: UUID, tabManager: TabManager)? {
+        guard let located = AppDelegate.shared?.locateGhosttySurface(surfaceView.surface),
+              let teamName = TeamOrchestrator.shared.teamName(
+                containingPanelId: located.panelId,
+                workspaceId: located.workspaceId
+              ) else { return nil }
+        return (teamName, located.panelId, located.workspaceId, located.tabManager)
+    }
+
+    private func imeAgentMentions() -> [IMEAgentMention] {
+        guard let located = AppDelegate.shared?.locateGhosttySurface(surfaceView.surface) else { return [] }
+        let targets = TeamOrchestrator.shared.agentMentionTargets(
+            containingPanelId: located.panelId,
+            workspaceId: located.workspaceId
+        )
+        guard !targets.isEmpty else { return [] }
+
+        var mentions: [IMEAgentMention] = [
+            IMEAgentMention(
+                mention: "all",
+                title: "@all",
+                subtitle: "Route to all agents",
+                isBroadcast: true
+            )
+        ]
+        mentions.append(contentsOf: targets.map { target in
+            let detail = [target.agentType, target.cli, target.model]
+                .filter { !$0.isEmpty }
+                .joined(separator: " · ")
+            return IMEAgentMention(
+                mention: target.name,
+                title: "@\(target.name)",
+                subtitle: detail.isEmpty ? target.teamName : detail,
+                isBroadcast: false
+            )
+        })
+        return mentions
+    }
+
+    private enum IMEAgentDispatchKind {
+        case message(String)
+        case task(String)
+        case ping(String)
+    }
+
+    private func classifyIMEAgentDispatch(_ raw: String) -> IMEAgentDispatchKind {
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        let lower = trimmed.lowercased()
+
+        let taskPrefixes = ["task ", "delegate ", "작업 ", "일감 "]
+        if trimmed.hasPrefix(":") {
+            let body = String(trimmed.dropFirst()).trimmingCharacters(in: .whitespacesAndNewlines)
+            return .task(body.isEmpty ? trimmed : body)
+        }
+        for prefix in taskPrefixes where lower.hasPrefix(prefix) {
+            let body = String(trimmed.dropFirst(prefix.count)).trimmingCharacters(in: .whitespacesAndNewlines)
+            return .task(body.isEmpty ? trimmed : body)
+        }
+
+        if lower == "ping" || lower.contains("ping") || lower.contains("pong") ||
+            lower.contains("핑") || lower.contains("퐁") {
+            return .ping(trimmed)
+        }
+        return .message(trimmed)
+    }
+
+    private func imeAgentDispatchLabel(_ mode: IMEAgentDispatchKind) -> String {
+        switch mode {
+        case .message: return "MESSAGE"
+        case .task: return "TASK"
+        case .ping: return "PING"
+        }
+    }
+
+    private func imeLeaderRoutingRequest(
+        teamName: String,
+        mention: String,
+        body: String,
+        mode: IMEAgentDispatchKind,
+        targets: [TeamOrchestrator.AgentMentionTarget]
+    ) -> String {
+        let targetNames = targets.map(\.name)
+        let targetLine = mention.lowercased() == "all" || mention.lowercased() == "team"
+            ? "@all (\(targetNames.joined(separator: ", ")))"
+            : "@\(mention)"
+        let commandHint: String
+        switch mode {
+        case .ping:
+            commandHint = targetNames.count > 1
+                ? "Send a short ping to each target, ask them to reply with `tm-agent msg send 'PONG <agent>: ready'`, then check `tm-agent msg list` and summarize who responded."
+                : "Send a short ping to @\(mention), ask them to reply with `tm-agent msg send 'PONG \(mention): ready'`, then check `tm-agent msg list` and summarize the response."
+        case .message:
+            commandHint = targetNames.count > 1
+                ? "Forward this as a leader-mediated message to each target, then track replies with `tm-agent msg list` if a response is expected."
+                : "Forward this as a leader-mediated message to @\(mention), then track replies with `tm-agent msg list` if a response is expected."
+        case .task:
+            commandHint = targetNames.count > 1
+                ? "Create/delegate a trackable task for each listed target with `tm-agent delegate`, then wait/collect and summarize results."
+                : "Create/delegate a trackable task for @\(mention) with `tm-agent delegate`, then wait/collect and summarize the result."
+        }
+
+        return """
+        IME ROUTING REQUEST
+        TEAM: \(teamName)
+        TARGET: \(targetLine)
+        MODE: \(imeAgentDispatchLabel(mode))
+        USER_TEXT:
+        \(body)
+
+        ACTION:
+        \(commandHint)
+        Keep the leader in the loop. Do not treat this as already completed just because the IME box sent it.
+        """
+    }
+
+    private func sendIMEAgentMention(mention: String, text: String) -> Bool {
+        guard let location = imeTeamLocation() else {
+            NSSound.beep()
+            return false
+        }
+        let normalized = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !normalized.isEmpty else {
+            NSSound.beep()
+            return false
+        }
+
+        let dispatch = classifyIMEAgentDispatch(normalized)
+        let messageBody: String
+        switch dispatch {
+        case .message(let body), .task(let body), .ping(let body):
+            messageBody = body
+        }
+        guard !messageBody.isEmpty else {
+            NSSound.beep()
+            return false
+        }
+
+        let allTargets = TeamOrchestrator.shared.agentMentionTargets(
+            containingPanelId: location.panelId,
+            workspaceId: location.workspaceId
+        )
+        let resolvedTargets: [TeamOrchestrator.AgentMentionTarget]
+        switch mention.lowercased() {
+        case "all", "team":
+            resolvedTargets = allTargets
+        default:
+            resolvedTargets = allTargets.filter { $0.name.lowercased() == mention.lowercased() }
+        }
+        guard !resolvedTargets.isEmpty else {
+            NSSound.beep()
+            return false
+        }
+
+        let request = imeLeaderRoutingRequest(
+            teamName: location.teamName,
+            mention: mention,
+            body: messageBody,
+            mode: dispatch,
+            targets: resolvedTargets
+        )
+        let sent = TeamOrchestrator.shared.sendToLeader(
+            teamName: location.teamName,
+            text: request,
+            tabManager: location.tabManager
+        )
+        if !sent { NSSound.beep() }
+        return sent
     }
 
     private func dismissIMEInputBar() {
