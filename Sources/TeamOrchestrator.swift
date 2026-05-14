@@ -2087,8 +2087,18 @@ final class TeamOrchestrator: ObservableObject {
     /// Maintains an in-flight counter and a panelId snapshot so a concurrent
     /// hard restart can either drain (preferred) or detect mid-flight migration.
     func sendToAgent(teamName: String, agentName: String, text: String, tabManager: TabManager, withReturn: Bool = true, completion: ((Bool) -> Void)? = nil) -> Bool {
-        guard let team = teams[teamName] else { completion?(false); return false }
-        guard let agent = selectAgent(in: team.agents, name: agentName) else { completion?(false); return false }
+        guard let team = teams[teamName] else {
+            #if DEBUG
+            dlog("[team.sendToAgent] DROP reason=team_not_found team=\(teamName) agent=\(agentName)")
+            #endif
+            completion?(false); return false
+        }
+        guard let agent = selectAgent(in: team.agents, name: agentName) else {
+            #if DEBUG
+            dlog("[team.sendToAgent] DROP reason=agent_not_found team=\(teamName) agent=\(agentName) agentCount=\(team.agents.count)")
+            #endif
+            completion?(false); return false
+        }
         let teamAgentKey = "\(teamName)/\(agentName)"
         if migratingAgents.contains(teamAgentKey) {
             #if DEBUG
@@ -2097,7 +2107,15 @@ final class TeamOrchestrator: ObservableObject {
             completion?(false)
             return false
         }
-        guard let pid = agent.panelId else { completion?(false); return false }
+        guard let pid = agent.panelId else {
+            #if DEBUG
+            dlog("[team.sendToAgent] DROP reason=panelId_nil team=\(teamName) agent=\(agentName) workspaceId=\(agent.workspaceId.uuidString.prefix(8))")
+            #endif
+            completion?(false); return false
+        }
+        #if DEBUG
+        dlog("[team.sendToAgent] enter team=\(teamName) agent=\(agentName) panelId=\(pid.uuidString.prefix(8)) withReturn=\(withReturn) textLen=\(text.count)")
+        #endif
         activeSends[teamAgentKey, default: 0] += 1
         return sendTextToPanel(
             workspaceId: agent.workspaceId,
