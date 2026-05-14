@@ -9,12 +9,12 @@ pub struct PaneInfo {
     #[allow(dead_code)]
     pub pid: u32,
     /// Approximate Unix timestamp (seconds) when the process was started.
-    /// Derived from `ps -o etimes=` (elapsed seconds subtracted from now).
+    /// Derived from `ps -o etime=` (elapsed seconds subtracted from now).
     pub proc_start_unix: i64,
 }
 
 /// Maps `TERMMESH_PANEL_ID` → `PaneInfo` by polling live process environments.
-/// Every 3 s: `pgrep -x <cli>` → `ps -Eww` (TERMMESH_PANEL_ID) + `ps -o etimes=`
+/// Every 3 s: `pgrep -x <cli>` → `ps -Eww` (TERMMESH_PANEL_ID) + `ps -o etime=`
 /// (start time) → `lsof -a -d cwd` (working directory). macOS-only.
 #[derive(Clone)]
 pub struct PaneTracker {
@@ -101,23 +101,51 @@ fn read_panel_id(pid: u32) -> Option<String> {
 }
 
 fn read_proc_start_unix(pid: u32) -> Option<i64> {
+    // macOS BSD `ps` has no `etimes` keyword (that is GNU/Linux only); it
+    // only exposes `etime`, which prints elapsed time as `[[DD-]HH:]MM:SS`.
     let output = std::process::Command::new("ps")
-        .args(["-p", &pid.to_string(), "-o", "etimes="])
+        .args(["-p", &pid.to_string(), "-o", "etime="])
         .output()
         .ok()?;
     if !output.status.success() {
         return None;
     }
-    parse_etimes(std::str::from_utf8(&output.stdout).unwrap_or_default())
+    parse_etime(std::str::from_utf8(&output.stdout).unwrap_or_default())
 }
 
-fn parse_etimes(output: &str) -> Option<i64> {
-    let elapsed_secs: i64 = output.trim().parse().ok()?;
+/// Parse BSD `ps -o etime` output (`[[DD-]HH:]MM:SS`) into an absolute Unix
+/// timestamp (now - elapsed_seconds).
+fn parse_etime(output: &str) -> Option<i64> {
+    let elapsed_secs = parse_etime_seconds(output.trim())?;
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs() as i64;
     Some(now - elapsed_secs)
+}
+
+/// Convert a BSD `etime` string (`MM:SS`, `HH:MM:SS`, or `DD-HH:MM:SS`) to
+/// total elapsed seconds.
+fn parse_etime_seconds(s: &str) -> Option<i64> {
+    if s.is_empty() {
+        return None;
+    }
+    // Split optional `DD-` day prefix.
+    let (days, hms) = match s.split_once('-') {
+        Some((d, rest)) => (d.parse::<i64>().ok()?, rest),
+        None => (0, s),
+    };
+    let parts: Vec<i64> = hms
+        .split(':')
+        .map(|p| p.parse::<i64>())
+        .collect::<Result<_, _>>()
+        .ok()?;
+    let (h, m, sec) = match parts.as_slice() {
+        [m, s] => (0, *m, *s),
+        [h, m, s] => (*h, *m, *s),
+        _ => return None,
+    };
+    Some(days * 86400 + h * 3600 + m * 60 + sec)
 }
 
 fn read_cwd(pid: u32) -> Option<String> {
@@ -180,9 +208,24 @@ mod tests {
     }
 
     #[test]
-    fn etimes_zero_means_just_started() {
-        // etimes=0 → proc_start_unix ≈ now (within a few seconds)
-        let result = parse_etimes("0");
+    fn etime_seconds_parses_all_bsd_formats() {
+        assert_eq!(parse_etime_seconds("05:07"), Some(307)); // MM:SS
+        assert_eq!(parse_etime_seconds("00:00"), Some(0));
+        assert_eq!(parse_etime_seconds("01:02:03"), Some(3723)); // HH:MM:SS
+        assert_eq!(parse_etime_seconds("2-03:04:05"), Some(183845)); // DD-HH:MM:SS
+    }
+
+    #[test]
+    fn etime_seconds_invalid_returns_none() {
+        assert_eq!(parse_etime_seconds(""), None);
+        assert_eq!(parse_etime_seconds("abc"), None);
+        assert_eq!(parse_etime_seconds("12"), None); // single field, no colon
+    }
+
+    #[test]
+    fn etime_zero_means_just_started() {
+        // etime=00:00 → proc_start_unix ≈ now (within a few seconds)
+        let result = parse_etime("00:00");
         assert!(result.is_some());
         let start = result.unwrap();
         let now = std::time::SystemTime::now()
@@ -193,9 +236,9 @@ mod tests {
     }
 
     #[test]
-    fn etimes_invalid_returns_none() {
-        assert_eq!(parse_etimes(""), None);
-        assert_eq!(parse_etimes("abc"), None);
+    fn etime_invalid_returns_none() {
+        assert_eq!(parse_etime(""), None);
+        assert_eq!(parse_etime("abc"), None);
     }
 
     #[test]
