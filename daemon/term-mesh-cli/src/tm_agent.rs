@@ -785,7 +785,7 @@ enum RunbookCommands {
     },
     /// Install runbooks for one tool or all supported tools
     Install {
-        /// claude, codex, opencode, or all
+        /// claude, codex, opencode, gemini, or all
         #[arg(long, default_value = "all")]
         tool: String,
         /// Install only one role runbook
@@ -991,6 +991,7 @@ enum RunbookTool {
     Claude,
     Codex,
     OpenCode,
+    Gemini,
 }
 
 impl RunbookTool {
@@ -999,6 +1000,7 @@ impl RunbookTool {
             RunbookTool::Claude => "claude",
             RunbookTool::Codex => "codex",
             RunbookTool::OpenCode => "opencode",
+            RunbookTool::Gemini => "gemini",
         }
     }
 }
@@ -1462,11 +1464,13 @@ fn parse_runbook_tools(tool: &str) -> Result<Vec<RunbookTool>, String> {
                     RunbookTool::Claude,
                     RunbookTool::Codex,
                     RunbookTool::OpenCode,
+                    RunbookTool::Gemini,
                 ])
             }
             "claude" | "claude-code" | "claudecode" => out.push(RunbookTool::Claude),
             "codex" => out.push(RunbookTool::Codex),
             "opencode" | "open-code" => out.push(RunbookTool::OpenCode),
+            "gemini" => out.push(RunbookTool::Gemini),
             other => return Err(format!("unknown runbook tool: {other}")),
         }
     }
@@ -1652,6 +1656,10 @@ fn runbook_projection_path(root: &Path, tool: RunbookTool, role: &RunbookRole) -
         RunbookTool::OpenCode => root
             .join(".opencode/runbooks")
             .join(format!("{}.md", role.name)),
+        RunbookTool::Gemini => root
+            .join(".gemini/skills")
+            .join(format!("term-mesh-{}", role.name))
+            .join("SKILL.md"),
     }
 }
 
@@ -1690,7 +1698,7 @@ fn effective_source_runbook_content(root: &Path, role: &RunbookRole) -> String {
 
 fn tool_runbook_content(tool: RunbookTool, role: &RunbookRole, source_content: &str) -> String {
     match tool {
-        RunbookTool::Claude | RunbookTool::Codex => format!(
+        RunbookTool::Claude | RunbookTool::Codex | RunbookTool::Gemini => format!(
             "---\nname: term-mesh-{}\ndescription: \"{}\"\n---\n{}",
             role.name,
             yaml_escape(&format!(
@@ -1884,6 +1892,7 @@ fn runbook_status() -> Result<Value, String> {
         RunbookTool::Claude,
         RunbookTool::Codex,
         RunbookTool::OpenCode,
+        RunbookTool::Gemini,
     ]
     .iter()
     .map(|tool| {
@@ -1976,7 +1985,9 @@ mod runbook_tests {
     #[test]
     fn runbook_parse_tools_accepts_all_and_aliases() {
         let all = parse_runbook_tools("all").unwrap();
-        assert_eq!(all.len(), 3);
+        assert_eq!(all.len(), 4);
+        let all_names: Vec<&str> = all.iter().map(|t| t.as_str()).collect();
+        assert_eq!(all_names, vec!["claude", "codex", "opencode", "gemini"]);
 
         let tools = parse_runbook_tools("claude-code,codex,open-code").unwrap();
         let names: Vec<&str> = tools.iter().map(|t| t.as_str()).collect();
