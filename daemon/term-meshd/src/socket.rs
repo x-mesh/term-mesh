@@ -177,6 +177,11 @@ pub async fn serve(
         ctx.clone(),
         shutdown_rx.clone(),
     ));
+    // Phase 2.5-C: 2s SQLite-poller → emit `agent_usage_tick` for pane-mode codex agents.
+    let codex_usage_broadcast_task = tokio::spawn(run_codex_usage_tick_broadcaster(
+        ctx.clone(),
+        shutdown_rx.clone(),
+    ));
     // Phase 2.5: 30s disk flush for dirty usage counters.
     let usage_flush_task = tokio::spawn(run_usage_disk_flusher(
         ctx.clone(),
@@ -214,6 +219,7 @@ pub async fn serve(
     heartbeat_task.abort();
     usage_broadcast_task.abort();
     jsonl_usage_broadcast_task.abort();
+    codex_usage_broadcast_task.abort();
     usage_flush_task.abort();
 
     // Phase 2.5: final usage flush before exit (best-effort).
@@ -563,6 +569,120 @@ async fn run_jsonl_usage_tick_broadcaster(
                             output_tokens: out_tok,
                             cache_read_input_tokens: cr_tok,
                             cache_creation_input_tokens: cw_tok,
+                        });
+                    }
+                    if !tick_agents.is_empty() {
+                        let _ = ctx.event_tx.send(DaemonEvent::AgentUsageTick {
+                            team_uuid: team_uuid.to_string(),
+                            team_name: team_name.to_string(),
+                            agents: tick_agents,
+                            ts_ms,
+                        });
+                    }
+                }
+            }
+            changed = shutdown_rx.changed() => {
+                if changed.is_err() || *shutdown_rx.borrow() {
+                    break;
+                }
+            }
+        }
+    }
+}
+
+/// Phase 2.5-C: every 2s, query ~/.codex/state_5.sqlite for pane-mode codex agents.
+/// Codex does not split input/output tokens; total is reported as output_tokens.
+/// Disabled silently if the DB file does not exist (codex not installed).
+async fn run_codex_usage_tick_broadcaster(
+    ctx: Arc<Context>,
+    mut shutdown_rx: watch::Receiver<bool>,
+) {
+    let Some(tracker) = crate::codex_tokens::CodexUsageTracker::new() else {
+        tracing::info!("codex.token.watch: ~/.codex/state_5.sqlite not found, broadcaster disabled");
+        return;
+    };
+    tracing::info!("codex.token.watch: started polling {}", tracker.db_path.display());
+
+    // (team_name, agent_name) → last-emitted total_tokens
+    let mut last_emitted: HashMap<(String, String), u64> = HashMap::new();
+    let mut interval = tokio::time::interval(Duration::from_secs(2));
+    interval.tick().await; // skip immediate first tick
+
+    loop {
+        tokio::select! {
+            _ = interval.tick() => {
+                let by_project = match tracker.snapshot_by_project() {
+                    Ok(m) => m,
+                    Err(e) => {
+                        tracing::debug!("codex.token.parse.skip reason=db_error: {e}");
+                        continue;
+                    }
+                };
+                if by_project.is_empty() {
+                    continue;
+                }
+                let team_state = ctx.team_state.read().unwrap().clone();
+                let Some(teams) = team_state.get("teams").and_then(|v| v.as_array()) else {
+                    continue;
+                };
+                let ts_ms = current_time_ms();
+                for team in teams {
+                    let team_name = team
+                        .get("team_name")
+                        .or_else(|| team.get("name"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or_default();
+                    if team_name.is_empty() {
+                        continue;
+                    }
+                    let team_uuid = team
+                        .get("team_uuid")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or(team_name);
+                    let cwd = team
+                        .get("working_directory")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or_default();
+                    let Some(&total_tokens) = by_project.get(cwd) else {
+                        continue;
+                    };
+                    let Some(agents) = team.get("agents").and_then(|v| v.as_array()) else {
+                        continue;
+                    };
+                    let mut tick_agents = Vec::new();
+                    for agent in agents {
+                        let cli = agent
+                            .get("cli")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or_default();
+                        if cli != "codex" {
+                            continue;
+                        }
+                        // Pane-mode only: headless codex agents handled separately.
+                        if agent.get("panel_id").map_or(true, |v| v.is_null()) {
+                            continue;
+                        }
+                        let agent_name = agent
+                            .get("name")
+                            .or_else(|| agent.get("agent_name"))
+                            .and_then(|v| v.as_str())
+                            .unwrap_or_default();
+                        if agent_name.is_empty() {
+                            continue;
+                        }
+                        let key = (team_name.to_string(), agent_name.to_string());
+                        let last = last_emitted.get(&key).copied().unwrap_or(0);
+                        if total_tokens == last {
+                            continue;
+                        }
+                        last_emitted.insert(key, total_tokens);
+                        // Codex doesn't expose input/output split; report aggregate as output_tokens.
+                        tick_agents.push(crate::headless::UsageTickAgent {
+                            name: agent_name.to_string(),
+                            input_tokens: 0,
+                            output_tokens: total_tokens,
+                            cache_read_input_tokens: 0,
+                            cache_creation_input_tokens: 0,
                         });
                     }
                     if !tick_agents.is_empty() {
