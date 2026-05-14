@@ -635,16 +635,48 @@ impl AgentSessionManager {
             return Ok(());
         }
 
-        // Kill tracked PIDs
-        let signal = if force { libc::SIGKILL } else { libc::SIGTERM };
-        for &pid in &session.tracked_pids {
-            unsafe {
-                libc::kill(pid as i32, signal);
+        // Kill the process group for each tracked PID (pid == pgid after setsid in
+        // headless pre_exec), so grandchildren (MCP servers, sub-shells) are reaped.
+        // On force=true send SIGKILL immediately; otherwise SIGTERM then SIGKILL fallback.
+        let pids_to_kill: Vec<u32> = {
+            let mut v = session.tracked_pids.clone();
+            if let Some(pid) = session.pid {
+                if !v.contains(&pid) {
+                    v.push(pid);
+                }
             }
-        }
-        if let Some(pid) = session.pid {
-            unsafe {
-                libc::kill(pid as i32, signal);
+            v
+        };
+
+        if force {
+            for &pid in &pids_to_kill {
+                unsafe {
+                    libc::killpg(pid as i32, libc::SIGKILL);
+                }
+            }
+        } else {
+            for &pid in &pids_to_kill {
+                unsafe {
+                    libc::killpg(pid as i32, libc::SIGTERM);
+                }
+            }
+            // Brief wait (up to 1.5 s, 150 ms steps) then SIGKILL any survivors.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_millis(1500);
+            loop {
+                std::thread::sleep(std::time::Duration::from_millis(150));
+                let all_dead = pids_to_kill.iter().all(|&pid| unsafe {
+                    libc::kill(pid as i32, 0) != 0
+                });
+                if all_dead || std::time::Instant::now() >= deadline {
+                    break;
+                }
+            }
+            for &pid in &pids_to_kill {
+                unsafe {
+                    if libc::kill(pid as i32, 0) == 0 {
+                        libc::killpg(pid as i32, libc::SIGKILL);
+                    }
+                }
             }
         }
 

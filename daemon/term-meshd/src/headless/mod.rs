@@ -532,6 +532,14 @@ impl HeadlessManager {
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .kill_on_drop(true);
+        // Each CLI agent gets its own process group (pid == pgid) so that
+        // killpg can reap grandchildren (MCP servers, sub-shells, etc.).
+        unsafe {
+            command.pre_exec(|| {
+                libc::setsid();
+                Ok(())
+            });
+        }
 
         if let Some(ref name_override) = args.agent_name_override {
             command.env("TERMMESH_AGENT_NAME", name_override);
@@ -701,8 +709,10 @@ impl HeadlessManager {
 
         tracing::info!("terminating headless agent: {agent_id} (pid={pid})");
 
+        // Kill the entire process group (pid == pgid after setsid in pre_exec),
+        // so grandchildren (MCP servers, sub-shells) are reaped too.
         unsafe {
-            libc::kill(pid as i32, libc::SIGTERM);
+            libc::killpg(pid as i32, libc::SIGTERM);
         }
 
         if let Some(agent) = self.agents.get_mut(agent_id) {
@@ -716,7 +726,7 @@ impl HeadlessManager {
                     _ => {
                         tracing::warn!("agent {agent_id} did not exit within 5s, sending SIGKILL");
                         unsafe {
-                            libc::kill(pid as i32, libc::SIGKILL);
+                            libc::killpg(pid as i32, libc::SIGKILL);
                         }
                         let _ = child.wait().await;
                     }
