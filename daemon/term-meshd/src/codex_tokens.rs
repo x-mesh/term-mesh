@@ -20,23 +20,30 @@ impl CodexUsageTracker {
         }
     }
 
-    /// Cumulative token totals keyed by cwd.
-    /// Excludes archived threads (archived=0 only).
-    /// Returns: cwd → total_tokens_used
+    /// Current-session token count keyed by cwd.
+    /// Returns only the most recently updated (active) thread per cwd.
+    /// Returns: cwd → tokens_used of the latest thread
     pub fn snapshot_by_project(&self) -> anyhow::Result<HashMap<String, u64>> {
         let conn = Connection::open_with_flags(
             &self.db_path,
             OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
         )?;
+        // Join each thread against the per-cwd MAX(updated_at) to pick the latest only.
         let mut stmt = conn.prepare(
-            "SELECT cwd, COALESCE(SUM(tokens_used), 0) \
-             FROM threads WHERE archived = 0 GROUP BY cwd",
+            "SELECT t.cwd, t.tokens_used \
+             FROM threads t \
+             INNER JOIN ( \
+               SELECT cwd, MAX(updated_at) AS max_ts \
+               FROM threads WHERE archived = 0 GROUP BY cwd \
+             ) latest ON t.cwd = latest.cwd AND t.updated_at = latest.max_ts \
+             WHERE t.archived = 0",
         )?;
         let rows: HashMap<String, u64> = stmt
             .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)? as u64)))?
             .collect::<Result<_, _>>()?;
         Ok(rows)
     }
+
 }
 
 #[cfg(test)]
@@ -84,17 +91,19 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_sums_by_cwd_and_excludes_archived() {
+    fn snapshot_returns_most_recent_thread_not_sum() {
         let dir = TempDir::new().unwrap();
         let db_path = create_test_db(&dir);
         let tracker = CodexUsageTracker { db_path };
         let snap = tracker.snapshot_by_project().unwrap();
 
         assert_eq!(snap.len(), 2);
-        // 1000 + 500, not 999 (archived excluded)
-        assert_eq!(snap["/project/foo"], 1500);
+        // t2 has updated_at=1001 > t1's 1000 → t2's 500 tokens, NOT sum 1500
+        // t4 archived=1 is excluded; t3 is the only bar thread → 2000
+        assert_eq!(snap["/project/foo"], 500);
         assert_eq!(snap["/project/bar"], 2000);
     }
+
 
     #[test]
     fn snapshot_empty_table_returns_empty_map() {

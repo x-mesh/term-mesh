@@ -129,6 +129,10 @@ struct TrackerState {
     sessions: HashMap<String, SessionUsageStats>,
     file_positions: HashMap<PathBuf, u64>,
     claude_projects_dir: PathBuf,
+    /// cwd → session_id of the most recently active session.
+    /// Updated every time a new assistant line is processed for a given cwd.
+    /// Used by snapshot_by_project() to return only the current session's tokens.
+    latest_session_per_cwd: HashMap<String, String>,
 }
 
 /// Tracks real API token usage by parsing Claude Code JSONL log files.
@@ -147,6 +151,7 @@ impl UsageTracker {
                 sessions: HashMap::new(),
                 file_positions: HashMap::new(),
                 claude_projects_dir: claude_dir,
+                latest_session_per_cwd: HashMap::new(),
             })),
         }
     }
@@ -318,18 +323,19 @@ impl UsageTracker {
         Ok(())
     }
 
-    /// Cumulative token totals aggregated by project_path.
-    /// Multiple sessions in the same project are summed.
+    /// Current-session token totals keyed by project_path.
+    /// Returns only the most recently active session per cwd (not a cumulative sum).
     /// Returns: project_path → (input, output, cache_read, cache_write)
     pub fn snapshot_by_project(&self) -> HashMap<String, (u64, u64, u64, u64)> {
         let state = self.state.lock().unwrap();
         let mut by_project: HashMap<String, (u64, u64, u64, u64)> = HashMap::new();
-        for s in state.sessions.values() {
-            let e = by_project.entry(s.project_path.clone()).or_default();
-            e.0 += s.input_tokens;
-            e.1 += s.output_tokens;
-            e.2 += s.cache_read_tokens;
-            e.3 += s.cache_write_tokens;
+        for (cwd, session_id) in &state.latest_session_per_cwd {
+            if let Some(s) = state.sessions.get(session_id) {
+                by_project.insert(
+                    cwd.clone(),
+                    (s.input_tokens, s.output_tokens, s.cache_read_tokens, s.cache_write_tokens),
+                );
+            }
         }
         by_project
     }
@@ -415,8 +421,11 @@ fn process_line(state: &mut TrackerState, entry: &JsonlLine, file_path: &Path) {
     }
     // Update project_path if cwd is available
     if entry.cwd.is_some() {
-        stats.project_path = project_path;
+        stats.project_path = project_path.clone();
     }
+
+    // Track most recently active session per cwd for current-session view.
+    state.latest_session_per_cwd.insert(project_path, stats.session_id.clone());
 
     tracing::debug!(
         "sidebar.token.update agent={} in={} out={}",
@@ -629,6 +638,7 @@ mod tests {
             sessions: HashMap::new(),
             file_positions: HashMap::new(),
             claude_projects_dir: PathBuf::from("/tmp"),
+            latest_session_per_cwd: HashMap::new(),
         }
     }
 
@@ -802,32 +812,48 @@ mod tests {
     // ── snapshot_by_project ──
 
     #[test]
-    fn snapshot_by_project_groups_by_cwd() {
+    fn snapshot_by_project_returns_only_latest_session() {
         let mut state = make_state();
         let path = PathBuf::from("/home/user/.claude/projects/-test/file.jsonl");
 
-        // Two sessions for the same project
-        for sess in ["sessA", "sessB"] {
-            let entry = JsonlLine {
-                line_type: "assistant".into(),
-                session_id: Some(sess.into()),
-                cwd: Some("/project/foo".into()),
-                message: Some(AssistantMessage {
-                    model: Some("claude-sonnet-4-6".into()),
-                    usage: Some(TokenUsage {
-                        input_tokens: 100,
-                        output_tokens: 50,
-                        cache_creation_input_tokens: 10,
-                        cache_read_input_tokens: 20,
-                        cache_creation: None,
-                    }),
+        // sessA processed first (older)
+        let entry_a = JsonlLine {
+            line_type: "assistant".into(),
+            session_id: Some("sessA".into()),
+            cwd: Some("/project/foo".into()),
+            message: Some(AssistantMessage {
+                model: Some("claude-sonnet-4-6".into()),
+                usage: Some(TokenUsage {
+                    input_tokens: 999,
+                    output_tokens: 888,
+                    cache_creation_input_tokens: 0,
+                    cache_read_input_tokens: 0,
+                    cache_creation: None,
                 }),
-            };
-            process_line(&mut state, &entry, &path);
-        }
+            }),
+        };
+        process_line(&mut state, &entry_a, &path);
 
-        // One session for a different project
-        let entry2 = JsonlLine {
+        // sessB processed second (newer — becomes "current session")
+        let entry_b = JsonlLine {
+            line_type: "assistant".into(),
+            session_id: Some("sessB".into()),
+            cwd: Some("/project/foo".into()),
+            message: Some(AssistantMessage {
+                model: Some("claude-sonnet-4-6".into()),
+                usage: Some(TokenUsage {
+                    input_tokens: 100,
+                    output_tokens: 50,
+                    cache_creation_input_tokens: 10,
+                    cache_read_input_tokens: 20,
+                    cache_creation: None,
+                }),
+            }),
+        };
+        process_line(&mut state, &entry_b, &path);
+
+        // sessC in a different project
+        let entry_c = JsonlLine {
             line_type: "assistant".into(),
             session_id: Some("sessC".into()),
             cwd: Some("/project/bar".into()),
@@ -842,26 +868,24 @@ mod tests {
                 }),
             }),
         };
-        process_line(&mut state, &entry2, &path);
+        process_line(&mut state, &entry_c, &path);
 
-        // Build tracker with pre-seeded state
         let tracker = UsageTracker {
             state: Arc::new(Mutex::new(state)),
         };
         let by_project = tracker.snapshot_by_project();
 
         assert_eq!(by_project.len(), 2);
+        // Only sessB (the latest-processed session for foo), NOT sessA+sessB sum
         let foo = by_project["/project/foo"];
-        assert_eq!(foo.0, 200); // input: 2 * 100
-        assert_eq!(foo.1, 100); // output: 2 * 50
-        assert_eq!(foo.2, 40);  // cache_read: 2 * 20
-        assert_eq!(foo.3, 20);  // cache_write: 2 * 10
+        assert_eq!(foo.0, 100);
+        assert_eq!(foo.1, 50);
+        assert_eq!(foo.2, 20);
+        assert_eq!(foo.3, 10);
 
         let bar = by_project["/project/bar"];
         assert_eq!(bar.0, 300);
         assert_eq!(bar.1, 150);
-        assert_eq!(bar.2, 0);
-        assert_eq!(bar.3, 0);
     }
 
     // ── JSONL parsing from string ──

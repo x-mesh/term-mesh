@@ -534,6 +534,16 @@ async fn run_jsonl_usage_tick_broadcaster(
                     let Some(agents) = team.get("agents").and_then(|v| v.as_array()) else {
                         continue;
                     };
+                    // Multi-pane same-cwd: two+ claude pane agents share this working dir.
+                    // "Latest session" is ambiguous — skip emit to avoid showing wrong counts.
+                    let claude_pane_count = agents.iter().filter(|a| {
+                        a.get("cli").and_then(|v| v.as_str()) == Some("claude")
+                            && !a.get("panel_id").map_or(true, |v| v.is_null())
+                    }).count();
+                    if claude_pane_count >= 2 {
+                        tracing::debug!("sidebar.token.skip reason=multi-pane team={team_name}");
+                        continue;
+                    }
                     let mut tick_agents = Vec::new();
                     for agent in agents {
                         let cli = agent
@@ -649,6 +659,15 @@ async fn run_codex_usage_tick_broadcaster(
                     let Some(agents) = team.get("agents").and_then(|v| v.as_array()) else {
                         continue;
                     };
+                    // Multi-pane same-cwd: most recent thread is ambiguous — skip emit.
+                    let codex_pane_count = agents.iter().filter(|a| {
+                        a.get("cli").and_then(|v| v.as_str()) == Some("codex")
+                            && !a.get("panel_id").map_or(true, |v| v.is_null())
+                    }).count();
+                    if codex_pane_count >= 2 {
+                        tracing::debug!("codex.token.skip reason=multi-pane team={team_name}");
+                        continue;
+                    }
                     let mut tick_agents = Vec::new();
                     for agent in agents {
                         let cli = agent
