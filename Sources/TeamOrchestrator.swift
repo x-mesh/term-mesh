@@ -2457,7 +2457,24 @@ final class TeamOrchestrator: ObservableObject {
             // ensuring capturedDelegateResult is set before the caller reads it.
             panel.surface.sendIMETextResult(normalized, withReturn: withReturn) { result in
                 let ok: Bool
-                switch result { case .success: ok = true; default: ok = false }
+                switch result {
+                case .success:
+                    ok = true
+                case .failure(let error):
+                    ok = false
+                    #if DEBUG
+                    let reason: String
+                    switch error {
+                    case .queueOverflow:
+                        reason = "queue_overflow"
+                    case .surfaceUnavailable:
+                        reason = "surface_unavailable"
+                    case .returnRetryExhausted:
+                        reason = "watchdog"
+                    }
+                    dlog("text.delivered.false reason=\(reason) panelId=\(panelId.uuidString.prefix(8)) textLen=\(normalized.count) withReturn=\(withReturn)")
+                    #endif
+                }
                 DispatchQueue.main.async { completion(ok) }
             }
             #if DEBUG

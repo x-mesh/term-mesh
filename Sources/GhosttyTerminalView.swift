@@ -1188,6 +1188,7 @@ final class TerminalSurface: Identifiable, ObservableObject {
     }
 
     private func startPasteWatchdog(generation: Int,
+                                    instructionLength: Int,
                                     completion: ((Result<Void, PasteSendError>) -> Void)?) {
         pasteWatchdog?.cancel()
         let src = DispatchSource.makeTimerSource(queue: .main)
@@ -1206,6 +1207,7 @@ final class TerminalSurface: Identifiable, ObservableObject {
             completion?(.failure(.returnRetryExhausted))
             self.drainPasteQueue()
             #if DEBUG
+            dlog("paste.watchdog.fire surface=\(self.id.uuidString.prefix(8)) instruction_len=\(instructionLength)")
             dlog("[paste.watchdog] 8s timeout forced surface=\(self.id.uuidString.prefix(8))")
             #endif
         }
@@ -1230,7 +1232,7 @@ final class TerminalSurface: Identifiable, ObservableObject {
         pasteInFlight = true
         pasteGeneration &+= 1
         let gen = pasteGeneration
-        startPasteWatchdog(generation: gen, completion: p.completion)
+        startPasteWatchdog(generation: gen, instructionLength: p.text.count, completion: p.completion)
 
         if !p.text.isEmpty {
             let data = p.text.utf8

@@ -2201,6 +2201,12 @@ mod runbook_tests {
 
         fs::remove_dir_all(dir).ok();
     }
+
+    #[test]
+    fn return_retry_policy_is_conservative_when_text_delivery_failed() {
+        assert_eq!(return_retry_delays_ms(true), &[20, 200, 400, 600, 800]);
+        assert_eq!(return_retry_delays_ms(false), &[200, 500]);
+    }
 }
 
 // ── Socket / RPC infrastructure ──────────────────────────────────────
@@ -2920,6 +2926,58 @@ fn reply_target_task_id(sock: &PathBuf, team: &str, sender: &str) -> Option<Stri
             })
         })?;
     target_task["id"].as_str().map(str::to_string)
+}
+
+fn return_retry_delays_ms(text_delivered: bool) -> &'static [u64] {
+    if text_delivered {
+        &[20, 200, 400, 600, 800]
+    } else {
+        &[200, 500]
+    }
+}
+
+fn send_return_key_with_retry(
+    sock: &PathBuf,
+    team: &str,
+    target: &str,
+    text_delivered: bool,
+    context: &str,
+) -> bool {
+    let delays = return_retry_delays_ms(text_delivered);
+    eprintln!(
+        "send_key.skip_or_retry context={context} text_delivered={text_delivered} attempts={} delays_ms={}",
+        delays.len(),
+        delays
+            .iter()
+            .map(u64::to_string)
+            .collect::<Vec<_>>()
+            .join(",")
+    );
+
+    for (attempt, delay_ms) in delays.iter().enumerate() {
+        if *delay_ms > 0 {
+            std::thread::sleep(Duration::from_millis(*delay_ms));
+        }
+        eprintln!("team.send_key attempt {}/{}", attempt + 1, delays.len());
+        match rpc_call(
+            sock,
+            "team.send_key",
+            json!({
+                "team_name": team,
+                "agent_name": target,
+                "key": "return",
+            }),
+        ) {
+            Ok(r) if r["ok"].as_bool().unwrap_or(false) => return true,
+            Ok(_) | Err(_) => {}
+        }
+    }
+
+    eprintln!(
+        "  Warning: Return key delivery failed after {} retries",
+        delays.len()
+    );
+    false
 }
 
 fn truncate_summary(content: &str, max_chars: usize) -> String {
@@ -4003,36 +4061,12 @@ fn main() {
             );
             // Send Return key via team.send_key (reliable sendNamedKey path)
             if let Ok(ref r) = send_result {
-                if r["result"]["text_delivered"].as_bool().unwrap_or(false) {
-                    std::thread::sleep(Duration::from_millis(150));
-                    let max_attempts = 5u32;
-                    let mut send_key_delivered = false;
-                    for attempt in 0..max_attempts {
-                        eprintln!("team.send_key attempt {}/{}", attempt + 1, max_attempts);
-                        match rpc_call(
-                            &sock,
-                            "team.send_key",
-                            json!({
-                                "team_name": team, "agent_name": target, "key": "return",
-                            }),
-                        ) {
-                            Ok(r) if r["ok"].as_bool().unwrap_or(false) => {
-                                send_key_delivered = true;
-                                break;
-                            }
-                            _ => {
-                                if attempt + 1 < max_attempts {
-                                    std::thread::sleep(Duration::from_millis(
-                                        200 * (attempt as u64 + 1),
-                                    ));
-                                }
-                            }
-                        }
-                    }
-                    if !send_key_delivered {
-                        eprintln!("team.send_key giving up after {max_attempts} attempts");
-                    }
+                let text_delivered = r["result"]["text_delivered"].as_bool().unwrap_or(false);
+                if !text_delivered {
+                    eprintln!("text.delivered.false reason=team.send_ack agent={target}");
                 }
+                let _ =
+                    send_return_key_with_retry(&sock, &team, target, text_delivered, "team.send");
             }
             print_result(send_result);
             return;
@@ -5584,8 +5618,9 @@ fn run_delegate_result(
     if let Ok(v) = rpc_call(sock, "team.delegate", delegate_params) {
         if v["ok"].as_bool().unwrap_or(false) {
             // Check if text was actually delivered to the agent's terminal
-            let text_delivered = v["result"]["text_delivered"].as_bool().unwrap_or(true);
+            let mut text_delivered = v["result"]["text_delivered"].as_bool().unwrap_or(true);
             if !text_delivered {
+                eprintln!("text.delivered.false reason=team.delegate_ack agent={target}");
                 let task_ref = &v["result"]["task"];
                 let instruction = format_task_instruction(
                     sock, team, task_ref, text, no_report, context, fix_budget,
@@ -5632,6 +5667,14 @@ fn run_delegate_result(
                         // team.send succeeded — text was delivered. Update the response.
                         let mut patched = v.clone();
                         patched["result"]["text_delivered"] = json!(true);
+                        text_delivered = true;
+                        let _ = send_return_key_with_retry(
+                            sock,
+                            team,
+                            target,
+                            text_delivered,
+                            "team.delegate.retry",
+                        );
                         return Ok(patched);
                     }
                     _ => {
@@ -5645,32 +5688,7 @@ fn run_delegate_result(
             // through the reliable sendNamedKey path (same as surface.send_key RPC).
             // Swift ack-based completion is the primary ordering guarantee;
             // this sleep is a minimal safety margin only.
-            if text_delivered {
-                std::thread::sleep(Duration::from_millis(20));
-
-                // Retry Return delivery up to 5 times with backoff
-                for attempt in 0..5u32 {
-                    match rpc_call(
-                        sock,
-                        "team.send_key",
-                        json!({
-                            "team_name": team,
-                            "agent_name": target,
-                            "key": "return",
-                        }),
-                    ) {
-                        Ok(r) if r["ok"].as_bool().unwrap_or(false) => break,
-                        Ok(_) | Err(_) => {
-                            if attempt < 4 {
-                                let delay = Duration::from_millis(200 * (attempt as u64 + 1));
-                                std::thread::sleep(delay);
-                            } else {
-                                eprintln!("  Warning: Return key delivery failed after 5 retries");
-                            }
-                        }
-                    }
-                }
-            }
+            let _ = send_return_key_with_retry(sock, team, target, text_delivered, "team.delegate");
 
             return Ok(v);
         }
