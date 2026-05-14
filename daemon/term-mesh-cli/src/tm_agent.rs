@@ -1965,6 +1965,7 @@ fn runbook_digest(agent: Option<&str>) -> Result<Value, String> {
             json!({
                 "role": role.name,
                 "path": runbook_source_path(&root, role).to_string_lossy(),
+                // CLI digest preview has no live agent/team context.
                 "digest": runbook_digest_content(&root, role, agent.unwrap_or("generic"), "cli-tools"),
             })
         })
