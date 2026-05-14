@@ -13,6 +13,44 @@ use tokio::sync::Mutex;
 use buffer::OutputBuffer;
 use protocol::AgentProtocol;
 
+fn validated_signal_pid(pid: u32) -> Result<libc::pid_t, String> {
+    if pid <= 1 || pid > i32::MAX as u32 {
+        return Err(format!("invalid pid for signal target: {pid}"));
+    }
+    Ok(pid as libc::pid_t)
+}
+
+fn signal_agent_process_group(pid: u32, signal: libc::c_int) -> Result<(), String> {
+    let pid_i32 = validated_signal_pid(pid)?;
+    let pgid = unsafe { libc::getpgid(pid_i32) };
+    if pgid > 1 {
+        unsafe {
+            libc::killpg(pgid, signal);
+        }
+        return Ok(());
+    }
+
+    if pgid == 0 {
+        tracing::warn!(
+            "getpgid returned invalid pgid=0 for headless pid {pid}; falling back to pid kill"
+        );
+    } else {
+        let err = std::io::Error::last_os_error();
+        if err.raw_os_error() == Some(libc::ESRCH) {
+            tracing::warn!(
+                "getpgid failed with ESRCH for headless pid {pid}; process may already be gone"
+            );
+            return Ok(());
+        }
+        tracing::warn!("getpgid failed for headless pid {pid}: {err}; falling back to pid kill");
+    }
+
+    unsafe {
+        libc::kill(pid_i32, signal);
+    }
+    Ok(())
+}
+
 /// Status of a headless agent subprocess.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -492,9 +530,10 @@ impl HeadlessManager {
                 args.app_socket_path.as_deref(),
             ),
             _ => {
-                let session_id = args.claude_session_id.clone().ok_or_else(|| {
-                    "internal: claude spawn missing session_id".to_string()
-                })?;
+                let session_id = args
+                    .claude_session_id
+                    .clone()
+                    .ok_or_else(|| "internal: claude spawn missing session_id".to_string())?;
                 let mode = if args.resume_claude {
                     cli_builder::ClaudeSpawnMode::Resume { session_id }
                 } else {
@@ -536,7 +575,9 @@ impl HeadlessManager {
         // killpg can reap grandchildren (MCP servers, sub-shells, etc.).
         unsafe {
             command.pre_exec(|| {
-                libc::setsid();
+                if libc::setsid() == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
                 Ok(())
             });
         }
@@ -563,8 +604,7 @@ impl HeadlessManager {
         let stderr = child.stderr.take().ok_or("failed to capture stderr")?;
 
         let stdout_buffer = Arc::new(Mutex::new(OutputBuffer::new(10_000)));
-        let last_activity_ms =
-            Arc::new(std::sync::atomic::AtomicU64::new(now_ms()));
+        let last_activity_ms = Arc::new(std::sync::atomic::AtomicU64::new(now_ms()));
 
         // Phase 2.5: per-agent usage counters. Seed from any preloaded
         // snapshot (resume / unpark).
@@ -711,9 +751,7 @@ impl HeadlessManager {
 
         // Kill the entire process group (pid == pgid after setsid in pre_exec),
         // so grandchildren (MCP servers, sub-shells) are reaped too.
-        unsafe {
-            libc::killpg(pid as i32, libc::SIGTERM);
-        }
+        signal_agent_process_group(pid, libc::SIGTERM)?;
 
         if let Some(agent) = self.agents.get_mut(agent_id) {
             if let Some(child) = agent.child.as_mut() {
@@ -725,9 +763,7 @@ impl HeadlessManager {
                     }
                     _ => {
                         tracing::warn!("agent {agent_id} did not exit within 5s, sending SIGKILL");
-                        unsafe {
-                            libc::killpg(pid as i32, libc::SIGKILL);
-                        }
+                        signal_agent_process_group(pid, libc::SIGKILL)?;
                         let _ = child.wait().await;
                     }
                 }
@@ -816,8 +852,14 @@ impl HeadlessManager {
         let mut written_paths: Vec<std::path::PathBuf> = Vec::new();
 
         // Determine leader_mode/model for metadata.
-        let leader_mode = params.leader_mode.clone().unwrap_or_else(|| "claude".into());
-        let leader_model = params.leader_model.clone().unwrap_or_else(|| "sonnet".into());
+        let leader_mode = params
+            .leader_mode
+            .clone()
+            .unwrap_or_else(|| "claude".into());
+        let leader_model = params
+            .leader_model
+            .clone()
+            .unwrap_or_else(|| "sonnet".into());
 
         // Pre-create the team dir + agents + instructions subdirs so partial
         // failures are easier to clean up.
@@ -856,10 +898,7 @@ impl HeadlessManager {
                 schema: meta::SCHEMA_VERSION,
                 team_uuid: team_uuid.clone(),
                 name: spec.name.clone(),
-                agent_type: spec
-                    .agent_type
-                    .clone()
-                    .unwrap_or_else(|| spec.name.clone()),
+                agent_type: spec.agent_type.clone().unwrap_or_else(|| spec.name.clone()),
                 cli: spec.cli.clone(),
                 model: spec.model.clone(),
                 session_id: session_id.clone(),
@@ -1117,10 +1156,7 @@ impl HeadlessManager {
                 schema: meta::SCHEMA_VERSION,
                 team_uuid: team_uuid.clone(),
                 name: spec.name.clone(),
-                agent_type: spec
-                    .agent_type
-                    .clone()
-                    .unwrap_or_else(|| spec.name.clone()),
+                agent_type: spec.agent_type.clone().unwrap_or_else(|| spec.name.clone()),
                 cli: spec.cli.clone(),
                 model: spec.model.clone(),
                 session_id: session_id.clone(),
@@ -1232,16 +1268,11 @@ impl HeadlessManager {
         let session_id = agent.session_id.clone();
 
         // SIGTERM then wait.
-        unsafe {
-            libc::kill(pid as i32, libc::SIGTERM);
-        }
+        signal_agent_process_group(pid, libc::SIGTERM)?;
         if let Some(child) = agent.child.as_mut() {
-            let _ =
-                tokio::time::timeout(std::time::Duration::from_secs(5), child.wait()).await;
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(5), child.wait()).await;
         }
-        unsafe {
-            libc::kill(pid as i32, libc::SIGKILL);
-        }
+        signal_agent_process_group(pid, libc::SIGKILL)?;
         if let Some(child) = agent.child.as_mut() {
             let _ = child.wait().await;
         }
@@ -1625,7 +1656,11 @@ impl HeadlessManager {
                     Ok(actual) => actual == &w.path,
                     Err(_) => false,
                 };
-                let branch_now = if exists { current_branch_at(&w.path) } else { None };
+                let branch_now = if exists {
+                    current_branch_at(&w.path)
+                } else {
+                    None
+                };
                 WorktreeStatus {
                     mode: w.mode.clone(),
                     path: w.path.clone(),
@@ -1635,10 +1670,7 @@ impl HeadlessManager {
                 }
             });
 
-            let worktree_exists = worktree_status
-                .as_ref()
-                .map(|w| w.exists)
-                .unwrap_or(true); // no worktree ⇒ vacuously OK
+            let worktree_exists = worktree_status.as_ref().map(|w| w.exists).unwrap_or(true); // no worktree ⇒ vacuously OK
             let branch_matches = match (
                 team_meta.git_branch_at_create.as_deref(),
                 worktree_status
@@ -1679,7 +1711,9 @@ impl HeadlessManager {
                 team_uuid: team_meta.team_uuid.clone(),
                 team_name: team_meta.team_name.clone(),
                 created_at: team_meta.created_at,
-                destroyed_at: team_meta.destroyed_at.unwrap_or(entry.destroyed_at_from_suffix),
+                destroyed_at: team_meta
+                    .destroyed_at
+                    .unwrap_or(entry.destroyed_at_from_suffix),
                 working_directory,
                 git_root: team_meta.git_root.clone(),
                 git_branch_at_create: team_meta.git_branch_at_create.clone(),
@@ -1731,8 +1765,8 @@ impl HeadlessManager {
         }
 
         // Locate archived dir.
-        let archived = meta::list_archived_teams()
-            .map_err(|e| format!("cannot read headless dir: {e}"))?;
+        let archived =
+            meta::list_archived_teams().map_err(|e| format!("cannot read headless dir: {e}"))?;
         let archived_entry = archived
             .into_iter()
             .find(|e| e.team_uuid == team_uuid)
@@ -1751,8 +1785,7 @@ impl HeadlessManager {
         }
 
         // Load all agent metas.
-        let agent_metas =
-            meta::read_all_agent_metas(&archived_entry.archived_dir, &team_uuid);
+        let agent_metas = meta::read_all_agent_metas(&archived_entry.archived_dir, &team_uuid);
         for name in &team_meta.agents {
             if !agent_metas.contains_key(name) {
                 return Err(format!("corrupt_metadata: agents/{name}.json"));
@@ -1761,8 +1794,8 @@ impl HeadlessManager {
 
         // Worktree existence check.
         if let Some(w) = team_meta.worktree.as_ref() {
-            let canonical = std::fs::canonicalize(&w.path)
-                .map(|p| p.to_string_lossy().into_owned());
+            let canonical =
+                std::fs::canonicalize(&w.path).map(|p| p.to_string_lossy().into_owned());
             match canonical {
                 Ok(actual) if actual == w.path => {}
                 _ => return Err("worktree_gone".into()),
@@ -1776,9 +1809,10 @@ impl HeadlessManager {
                 .as_ref()
                 .and_then(|w| current_branch_at(&w.path))
                 .or_else(|| current_branch_at(&team_meta.working_directory));
-            if let (Some(was), Some(now)) =
-                (team_meta.git_branch_at_create.as_deref(), now_branch.as_deref())
-            {
+            if let (Some(was), Some(now)) = (
+                team_meta.git_branch_at_create.as_deref(),
+                now_branch.as_deref(),
+            ) {
                 if was != now {
                     return Err("branch_drift_rejected".into());
                 }
@@ -1808,7 +1842,12 @@ impl HeadlessManager {
                 let bytes = meta::read_instructions(&team_uuid, name).or_else(|_| {
                     // The archived dir was just located but is not yet renamed
                     // to live — read from the archived path directly.
-                    std::fs::read(archived_entry.archived_dir.join("instructions").join(format!("{name}.txt")))
+                    std::fs::read(
+                        archived_entry
+                            .archived_dir
+                            .join("instructions")
+                            .join(format!("{name}.txt")),
+                    )
                 });
                 let bytes = bytes.map_err(|_| "corrupt_metadata: instructions_hash".to_string())?;
                 if meta::sha256_hex(&bytes) != expected {
@@ -1830,9 +1869,10 @@ impl HeadlessManager {
         for name in &agent_names {
             let m = agent_metas.get(name).unwrap().clone();
             let instr_bytes = if m.instructions_sha256.is_some() {
-                Some(std::fs::read(meta::instructions_path(&team_uuid, name)).map_err(
-                    |e| format!("corrupt_metadata: instructions read failed: {e}"),
-                )?)
+                Some(
+                    std::fs::read(meta::instructions_path(&team_uuid, name))
+                        .map_err(|e| format!("corrupt_metadata: instructions read failed: {e}"))?,
+                )
             } else {
                 None
             };
@@ -1904,9 +1944,11 @@ impl HeadlessManager {
         // above (existence of claude session_ids).
         let _ = session_ids;
 
-        Ok(ResumeTeamResult { team, resumed: true })
+        Ok(ResumeTeamResult {
+            team,
+            resumed: true,
+        })
     }
-
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -2091,8 +2133,8 @@ mod tests {
         let destroyed_at = 1715600000u64;
 
         // Build the archived directory manually.
-        let archived_dir = meta::headless_root()
-            .join(format!("{team_uuid}.archived.{destroyed_at}"));
+        let archived_dir =
+            meta::headless_root().join(format!("{team_uuid}.archived.{destroyed_at}"));
         let agents_dir = archived_dir.join("agents");
         std::fs::create_dir_all(&agents_dir).unwrap();
         let instr_dir = archived_dir.join("instructions");
@@ -2173,8 +2215,7 @@ mod tests {
         let _scope = scoped_root();
         // Create an "archived" dir with malformed team.json.
         let team_uuid = "11111111-2222-3333-4444-555555555555";
-        let archived_dir = meta::headless_root()
-            .join(format!("{team_uuid}.archived.1000"));
+        let archived_dir = meta::headless_root().join(format!("{team_uuid}.archived.1000"));
         std::fs::create_dir_all(&archived_dir).unwrap();
         std::fs::write(archived_dir.join("team.json"), b"not valid json").unwrap();
 

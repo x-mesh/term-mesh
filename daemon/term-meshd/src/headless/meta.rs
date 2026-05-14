@@ -167,9 +167,7 @@ pub fn validate_agent_name(name: &str) -> Result<(), String> {
         ));
     }
     if name.contains('/') || name.contains('\0') {
-        return Err(format!(
-            "invalid agent name '{name}': contains '/' or NUL"
-        ));
+        return Err(format!("invalid agent name '{name}': contains '/' or NUL"));
     }
     Ok(())
 }
@@ -201,7 +199,10 @@ pub fn atomic_write(path: &Path, bytes: &[u8], mode: u32) -> std::io::Result<()>
         create_dir_secure(parent)?;
     }
     let tmp_path = {
-        let stem = path.file_name().map(|s| s.to_os_string()).unwrap_or_default();
+        let stem = path
+            .file_name()
+            .map(|s| s.to_os_string())
+            .unwrap_or_default();
         let mut tmp_name = std::ffi::OsString::from(".");
         tmp_name.push(&stem);
         tmp_name.push(".tmp");
@@ -248,16 +249,15 @@ pub fn create_dir_secure(path: &Path) -> std::io::Result<()> {
 
 pub fn write_team_meta(meta: &TeamMeta) -> Result<(), String> {
     let path = team_json_path(&meta.team_uuid);
-    let bytes = serde_json::to_vec_pretty(meta)
-        .map_err(|e| format!("serialize team.json: {e}"))?;
+    let bytes = serde_json::to_vec_pretty(meta).map_err(|e| format!("serialize team.json: {e}"))?;
     atomic_write(&path, &bytes, 0o600).map_err(|e| format!("write team.json: {e}"))?;
     Ok(())
 }
 
 pub fn write_agent_meta(meta: &AgentMeta) -> Result<(), String> {
     let path = agent_json_path(&meta.team_uuid, &meta.name);
-    let bytes = serde_json::to_vec_pretty(meta)
-        .map_err(|e| format!("serialize agent.json: {e}"))?;
+    let bytes =
+        serde_json::to_vec_pretty(meta).map_err(|e| format!("serialize agent.json: {e}"))?;
     atomic_write(&path, &bytes, 0o600).map_err(|e| format!("write agent.json: {e}"))?;
     Ok(())
 }
@@ -270,8 +270,8 @@ pub fn write_instructions(team_uuid: &str, agent_name: &str, bytes: &[u8]) -> Re
 pub fn read_team_meta(team_uuid_or_dir: &Path) -> Result<TeamMeta, String> {
     let p = team_uuid_or_dir.join("team.json");
     let bytes = std::fs::read(&p).map_err(|e| format!("read {}: {e}", p.display()))?;
-    let meta: TeamMeta = serde_json::from_slice(&bytes)
-        .map_err(|e| format!("parse {}: {e}", p.display()))?;
+    let meta: TeamMeta =
+        serde_json::from_slice(&bytes).map_err(|e| format!("parse {}: {e}", p.display()))?;
     if meta.schema != SCHEMA_VERSION {
         return Err(format!(
             "schema mismatch in {}: expected {}, got {}",
@@ -286,8 +286,8 @@ pub fn read_team_meta(team_uuid_or_dir: &Path) -> Result<TeamMeta, String> {
 pub fn read_agent_meta(team_uuid: &str, agent_name: &str) -> Result<AgentMeta, String> {
     let p = agent_json_path(team_uuid, agent_name);
     let bytes = std::fs::read(&p).map_err(|e| format!("read {}: {e}", p.display()))?;
-    let meta: AgentMeta = serde_json::from_slice(&bytes)
-        .map_err(|e| format!("parse {}: {e}", p.display()))?;
+    let meta: AgentMeta =
+        serde_json::from_slice(&bytes).map_err(|e| format!("parse {}: {e}", p.display()))?;
     if meta.schema != SCHEMA_VERSION {
         return Err(format!(
             "schema mismatch in {}: expected {}, got {}",
@@ -312,15 +312,13 @@ pub fn sha256_hex(bytes: &[u8]) -> String {
 pub fn load_config() -> DaemonConfig {
     let path = config_path();
     match std::fs::read(&path) {
-        Ok(bytes) => serde_json::from_slice::<DaemonConfig>(&bytes)
-            .unwrap_or_default(),
+        Ok(bytes) => serde_json::from_slice::<DaemonConfig>(&bytes).unwrap_or_default(),
         Err(_) => DaemonConfig::default(),
     }
 }
 
 pub fn save_config(cfg: &DaemonConfig) -> Result<(), String> {
-    let bytes = serde_json::to_vec_pretty(cfg)
-        .map_err(|e| format!("serialize config: {e}"))?;
+    let bytes = serde_json::to_vec_pretty(cfg).map_err(|e| format!("serialize config: {e}"))?;
     atomic_write(&config_path(), &bytes, 0o600).map_err(|e| format!("write config: {e}"))
 }
 
@@ -418,13 +416,8 @@ pub fn rename_to_archived(team_uuid: &str, destroyed_at: u64) -> Result<PathBuf,
 /// Rename an archived dir back to live (resume path).
 pub fn rename_to_live(archived_dir: &Path, team_uuid: &str) -> Result<PathBuf, String> {
     let to = headless_root().join(team_uuid);
-    std::fs::rename(archived_dir, &to).map_err(|e| {
-        format!(
-            "rename {} -> {}: {e}",
-            archived_dir.display(),
-            to.display()
-        )
-    })?;
+    std::fs::rename(archived_dir, &to)
+        .map_err(|e| format!("rename {} -> {}: {e}", archived_dir.display(), to.display()))?;
     Ok(to)
 }
 
@@ -540,17 +533,15 @@ mod tests {
 
     #[test]
     fn archived_name_parser() {
-        let (u, ts) = parse_archived_name(
-            "8f3d1a2b-4c5e-4f6a-9b8c-0d1e2f3a4b5c.archived.1715600000",
-        )
-        .unwrap();
+        let (u, ts) =
+            parse_archived_name("8f3d1a2b-4c5e-4f6a-9b8c-0d1e2f3a4b5c.archived.1715600000")
+                .unwrap();
         assert_eq!(u, "8f3d1a2b-4c5e-4f6a-9b8c-0d1e2f3a4b5c");
         assert_eq!(ts, 1715600000);
         assert!(parse_archived_name("not-a-uuid.archived.123").is_none());
-        assert!(parse_archived_name(
-            "8f3d1a2b-4c5e-4f6a-9b8c-0d1e2f3a4b5c.archived.notnum"
-        )
-        .is_none());
+        assert!(
+            parse_archived_name("8f3d1a2b-4c5e-4f6a-9b8c-0d1e2f3a4b5c.archived.notnum").is_none()
+        );
     }
 
     #[test]

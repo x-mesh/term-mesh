@@ -4015,7 +4015,10 @@ fn main() {
             }
             return;
         }
-        Commands::Restart { agent: ref target, hard } => {
+        Commands::Restart {
+            agent: ref target,
+            hard,
+        } => {
             if hard {
                 eprintln!(
                     "hard restart: closing pane and respawning. scrollback will be lost; panelId changes."

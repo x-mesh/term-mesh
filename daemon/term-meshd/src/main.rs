@@ -96,8 +96,9 @@ async fn main() -> anyhow::Result<()> {
 
     // Phase 2: periodic GC sweep every 12 hours (contract §3.3).
     tokio::spawn(async {
-        let mut interval =
-            tokio::time::interval(std::time::Duration::from_secs(headless::meta::GC_INTERVAL_SECS));
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(
+            headless::meta::GC_INTERVAL_SECS,
+        ));
         interval.tick().await; // skip immediate tick (startup already swept)
         loop {
             interval.tick().await;
