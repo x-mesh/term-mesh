@@ -10,6 +10,7 @@ use tokio::time::{timeout, Duration};
 use crate::agent::AgentSessionManager;
 use crate::headless::HeadlessManager;
 use crate::monitor::{Anomaly, MonitorHandle, SystemSnapshot};
+use crate::pane_tracker::PaneTracker;
 use crate::tokens::UsageTracker;
 use crate::watcher::WatcherHandle;
 use crate::worktree;
@@ -114,6 +115,7 @@ pub struct Context {
     pub usage_tracker: UsageTracker,
     pub agent_manager: Arc<AgentSessionManager>,
     pub headless: Arc<tokio::sync::Mutex<HeadlessManager>>,
+    pub pane_tracker: PaneTracker,
     pub event_tx: EventSender,
 }
 
@@ -152,6 +154,7 @@ pub async fn serve(
 
     let owner_uid = current_uid();
     let (event_tx, _) = tokio::sync::broadcast::channel(256);
+    let pane_tracker = PaneTracker::new().start();
     let ctx = Arc::new(Context {
         monitor_rx,
         monitor_handle,
@@ -161,6 +164,7 @@ pub async fn serve(
         usage_tracker,
         agent_manager,
         headless,
+        pane_tracker,
         event_tx,
     });
     let heartbeat_task = tokio::spawn(run_heartbeat_staleness_watcher(
@@ -504,6 +508,9 @@ async fn run_jsonl_usage_tick_broadcaster(
                 if by_project.is_empty() {
                     continue;
                 }
+                let pane_map = ctx.pane_tracker.snapshot();
+                let cwd_pane_count =
+                    crate::pane_tracker::count_panes_per_cwd(&pane_map, "claude");
                 let team_state = ctx.team_state.read().unwrap().clone();
                 let Some(teams) = team_state.get("teams").and_then(|v| v.as_array()) else {
                     continue;
@@ -524,26 +531,9 @@ async fn run_jsonl_usage_tick_broadcaster(
                         .get("team_uuid")
                         .and_then(|v| v.as_str())
                         .unwrap_or(team_name);
-                    let cwd = team
-                        .get("working_directory")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or_default();
-                    let Some(&(in_tok, out_tok, cr_tok, cw_tok)) = by_project.get(cwd) else {
-                        continue;
-                    };
                     let Some(agents) = team.get("agents").and_then(|v| v.as_array()) else {
                         continue;
                     };
-                    // Multi-pane same-cwd: two+ claude pane agents share this working dir.
-                    // "Latest session" is ambiguous — skip emit to avoid showing wrong counts.
-                    let claude_pane_count = agents.iter().filter(|a| {
-                        a.get("cli").and_then(|v| v.as_str()) == Some("claude")
-                            && !a.get("panel_id").map_or(true, |v| v.is_null())
-                    }).count();
-                    if claude_pane_count >= 2 {
-                        tracing::debug!("sidebar.token.skip reason=multi-pane team={team_name}");
-                        continue;
-                    }
                     let mut tick_agents = Vec::new();
                     for agent in agents {
                         let cli = agent
@@ -553,12 +543,29 @@ async fn run_jsonl_usage_tick_broadcaster(
                         if cli != "claude" {
                             continue;
                         }
-                        // Pane-mode only: headless agents lack panel_id and already receive
-                        // their cumulative counts via collect_usage_tick (in-memory counters).
-                        // Double-emitting would overwrite the in-memory delta with a stale sum.
-                        if agent.get("panel_id").map_or(true, |v| v.is_null()) {
+                        // Pane-mode only: headless agents lack panel_id.
+                        let panel_id = match agent.get("panel_id").and_then(|v| v.as_str()) {
+                            Some(id) if !id.is_empty() => id,
+                            _ => continue,
+                        };
+                        // Skip until pane_tracker observes this panel (3s poll lag → "—").
+                        // team working_directory fallback removed: risks wrong value when
+                        // same-cwd has 2+ panes before the first poll completes.
+                        let Some(info) = pane_map.get(panel_id).filter(|i| i.cli == "claude") else {
+                            continue;
+                        };
+                        let cwd = info.cwd.clone();
+                        // Same-cwd guard: 2+ OS-confirmed claude panes in this cwd → the
+                        // "latest session" is ambiguous. Skip all of them.
+                        if cwd_pane_count.get(&cwd).copied().unwrap_or(0) >= 2 {
+                            tracing::debug!(
+                                "sidebar.token.skip reason=multi-pane-same-cwd cwd={cwd}"
+                            );
                             continue;
                         }
+                        let Some(&(in_tok, out_tok, cr_tok, cw_tok)) = by_project.get(&cwd) else {
+                            continue;
+                        };
                         let agent_name = agent
                             .get("name")
                             .or_else(|| agent.get("agent_name"))
@@ -631,6 +638,9 @@ async fn run_codex_usage_tick_broadcaster(
                 if by_project.is_empty() {
                     continue;
                 }
+                let pane_map = ctx.pane_tracker.snapshot();
+                let cwd_pane_count =
+                    crate::pane_tracker::count_panes_per_cwd(&pane_map, "codex");
                 let team_state = ctx.team_state.read().unwrap().clone();
                 let Some(teams) = team_state.get("teams").and_then(|v| v.as_array()) else {
                     continue;
@@ -649,25 +659,9 @@ async fn run_codex_usage_tick_broadcaster(
                         .get("team_uuid")
                         .and_then(|v| v.as_str())
                         .unwrap_or(team_name);
-                    let cwd = team
-                        .get("working_directory")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or_default();
-                    let Some(&total_tokens) = by_project.get(cwd) else {
-                        continue;
-                    };
                     let Some(agents) = team.get("agents").and_then(|v| v.as_array()) else {
                         continue;
                     };
-                    // Multi-pane same-cwd: most recent thread is ambiguous — skip emit.
-                    let codex_pane_count = agents.iter().filter(|a| {
-                        a.get("cli").and_then(|v| v.as_str()) == Some("codex")
-                            && !a.get("panel_id").map_or(true, |v| v.is_null())
-                    }).count();
-                    if codex_pane_count >= 2 {
-                        tracing::debug!("codex.token.skip reason=multi-pane team={team_name}");
-                        continue;
-                    }
                     let mut tick_agents = Vec::new();
                     for agent in agents {
                         let cli = agent
@@ -678,9 +672,26 @@ async fn run_codex_usage_tick_broadcaster(
                             continue;
                         }
                         // Pane-mode only: headless codex agents handled separately.
-                        if agent.get("panel_id").map_or(true, |v| v.is_null()) {
+                        let panel_id = match agent.get("panel_id").and_then(|v| v.as_str()) {
+                            Some(id) if !id.is_empty() => id,
+                            _ => continue,
+                        };
+                        // Skip until pane_tracker observes this panel (3s poll lag → "—").
+                        let Some(info) = pane_map.get(panel_id).filter(|i| i.cli == "codex") else {
+                            continue;
+                        };
+                        let cwd = info.cwd.clone();
+                        // Same-cwd guard: 2+ OS-confirmed codex panes in this cwd → the
+                        // "latest thread" is ambiguous. Skip all of them.
+                        if cwd_pane_count.get(&cwd).copied().unwrap_or(0) >= 2 {
+                            tracing::debug!(
+                                "codex.token.skip reason=multi-pane-same-cwd cwd={cwd}"
+                            );
                             continue;
                         }
+                        let Some(&total_tokens) = by_project.get(&cwd) else {
+                            continue;
+                        };
                         let agent_name = agent
                             .get("name")
                             .or_else(|| agent.get("agent_name"))
