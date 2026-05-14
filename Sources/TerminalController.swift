@@ -2364,6 +2364,20 @@ class TerminalController {
         guard let text = params["text"] as? String else {
             return v2Error(id: id, code: "invalid_params", message: "Missing text")
         }
+
+        // Per-agent send serialization: wait for the preceding paste+Return cycle to
+        // finish (including 250 ms post-Return cooldown) before pasting new text.
+        // This prevents rapid consecutive sends from racing inside the codex TUI
+        // submit window and dropping every other message.
+        let agentKey = "\(teamName)/\(agentName)"
+        let (prevGate, _): (SendGate?, SendGate) = await MainActor.run {
+            let prev = TerminalController.perAgentGateQueue[agentKey]?.last
+            let gate = SendGate()
+            TerminalController.perAgentGateQueue[agentKey, default: []].append(gate)
+            return (prev, gate)
+        }
+        if let prev = prevGate { await prev.wait() }
+
         // Stagger: dynamic gap based on team size to prevent GCD main-queue saturation
         // when the CLI sends to 10+ agents in rapid succession.
         let staggerNs = await MainActor.run {
@@ -3130,6 +3144,23 @@ class TerminalController {
             }
         }
 
+        // After Return delivery: wait 250 ms cooldown then open the per-agent gate
+        // so the next paste+Return sequence can proceed. This is the companion to the
+        // gate enqueued in asyncTeamSend; together they serialize consecutive sends to
+        // the same codex/agent pane and prevent TUI submit-window drops.
+        if result.sent && key.lowercased() == "return" {
+            let agentKey = "\(teamName)/\(agentName)"
+            try? await Task.sleep(nanoseconds: TerminalController.kPostReturnCooldownNs)
+            let gateToOpen: SendGate? = await MainActor.run {
+                guard var queue = TerminalController.perAgentGateQueue[agentKey],
+                      !queue.isEmpty else { return nil }
+                let gate = queue.removeFirst()
+                TerminalController.perAgentGateQueue[agentKey] = queue.isEmpty ? nil : queue
+                return gate
+            }
+            gateToOpen?.open()
+        }
+
         return result.sent
             ? v2Ok(id: id, result: ["sent": true, "team_name": teamName, "agent_name": agentName, "key": key])
             : v2Error(
@@ -3146,6 +3177,49 @@ class TerminalController {
                 ]
             )
     }
+
+    // MARK: - Per-Agent Send Serialization
+
+    /// One-shot async gate used to serialize paste+Return sequences per agent.
+    /// asyncTeamSend enqueues a gate; asyncTeamSendKey opens it after the post-Return
+    /// cooldown. A 2 s watchdog auto-opens to prevent deadlock on orphaned sequences.
+    private final class SendGate: @unchecked Sendable {
+        private var cont: CheckedContinuation<Void, Never>?
+        private var opened = false
+        private let lock = NSLock()
+
+        init() {
+            Task.detached { [weak self] in
+                try? await Task.sleep(nanoseconds: 2_000_000_000) // 2 s watchdog
+                self?.open()
+            }
+        }
+
+        func wait() async {
+            await withCheckedContinuation { c in
+                lock.withLock {
+                    if opened { c.resume() } else { cont = c }
+                }
+            }
+        }
+
+        func open() {
+            lock.withLock {
+                guard !opened else { return }
+                opened = true
+                cont?.resume()
+                cont = nil
+            }
+        }
+    }
+
+    /// FIFO gate queues per agent key ("teamName/agentName"). Protected by @MainActor.
+    /// asyncTeamSend appends its gate and waits for the preceding one;
+    /// asyncTeamSendKey dequeues and opens the head gate after the post-Return cooldown.
+    @MainActor private static var perAgentGateQueue: [String: [SendGate]] = [:]
+
+    /// Cooldown after Return delivery before the next paste is allowed (ms → ns).
+    private static let kPostReturnCooldownNs: UInt64 = 250_000_000 // 250 ms
 
     // MARK: - Team Send Stagger
 
