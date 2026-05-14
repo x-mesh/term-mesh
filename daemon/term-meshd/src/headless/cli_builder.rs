@@ -313,7 +313,11 @@ pub fn build_gemini_command(
     let program = resolve_cli_path(cli_path, "GEMINI_PATH", "gemini");
 
     let gemini_model = gemini_model_name(model);
-    let args: Vec<OsString> = vec!["--yolo".into(), "--model".into(), OsString::from(gemini_model)];
+    let args: Vec<OsString> = vec![
+        "--yolo".into(),
+        "--model".into(),
+        OsString::from(gemini_model),
+    ];
 
     let env = base_env(name, team_name, daemon_socket, app_socket_path);
     CliCommand {

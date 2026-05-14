@@ -960,6 +960,10 @@ final class TerminalSurface: Identifiable, ObservableObject {
         return ghostty_surface_needs_confirm_quit(surface)
     }
 
+    func closeGhosttySurface() {
+        releaseGhosttySurfaceAsync(reason: "panelClose")
+    }
+
     func sendText(_ text: String) {
         guard let data = text.data(using: .utf8), !data.isEmpty else { return }
         guard let surface = surface else {
@@ -1441,7 +1445,7 @@ final class TerminalSurface: Identifiable, ObservableObject {
         return ghostty_surface_has_selection(surface)
     }
 
-    deinit {
+    private func releaseGhosttySurfaceAsync(reason: String) {
         let callbackContext = surfaceCallbackContext
         surfaceCallbackContext = nil
 
@@ -1450,13 +1454,28 @@ final class TerminalSurface: Identifiable, ObservableObject {
             return
         }
 
+        self.surface = nil
+        pendingTextQueue.removeAll(keepingCapacity: false)
+        pendingTextBytes = 0
+        #if DEBUG
+        dlog("surface.free.request surface=\(id.uuidString.prefix(8)) reason=\(reason)")
+        #endif
+
         // Keep teardown asynchronous to avoid re-entrant close/deinit loops, but retain
         // callback userdata until surface free completes so callbacks never dereference
         // a deallocated view pointer.
+        let surfaceId = id
         Task { @MainActor in
+            #if DEBUG
+            dlog("surface.free.perform surface=\(surfaceId.uuidString.prefix(8)) reason=\(reason)")
+            #endif
             ghostty_surface_free(surface)
             callbackContext?.release()
         }
+    }
+
+    deinit {
+        releaseGhosttySurfaceAsync(reason: "deinit")
     }
 }
 

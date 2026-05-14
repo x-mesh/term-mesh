@@ -2215,7 +2215,7 @@ mod runbook_tests {
 
     #[test]
     fn return_retry_policy_is_conservative_when_text_delivery_failed() {
-        assert_eq!(return_retry_delays_ms(true), &[20, 200, 400, 600, 800]);
+        assert_eq!(return_retry_delays_ms(true), &[250, 400, 600, 800, 1000]);
         assert_eq!(return_retry_delays_ms(false), &[200, 500]);
     }
 }
@@ -2941,7 +2941,11 @@ fn reply_target_task_id(sock: &PathBuf, team: &str, sender: &str) -> Option<Stri
 
 fn return_retry_delays_ms(text_delivered: bool) -> &'static [u64] {
     if text_delivered {
-        &[20, 200, 400, 600, 800]
+        // First delay raised from 20 ms → 250 ms so the Return key arrives after
+        // codex has fully rendered the pasted text and is ready to accept input.
+        // Swift asyncTeamSendKey also holds an additional 250 ms post-Return gate
+        // before releasing the next paste, providing two layers of protection.
+        &[250, 400, 600, 800, 1000]
     } else {
         &[200, 500]
     }
@@ -4015,7 +4019,10 @@ fn main() {
             }
             return;
         }
-        Commands::Restart { agent: ref target, hard } => {
+        Commands::Restart {
+            agent: ref target,
+            hard,
+        } => {
             if hard {
                 eprintln!(
                     "hard restart: closing pane and respawning. scrollback will be lost; panelId changes."

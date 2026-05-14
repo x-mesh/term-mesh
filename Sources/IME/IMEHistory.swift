@@ -4,7 +4,9 @@ import Foundation
 
 enum IMEInputBarSettings {
     static let defaultFontSize: Double = 12
-    static let defaultHeight: Double = 90
+    // 180 matches the @mention / slash-command picker maxHeight so the
+    // autocomplete popups are no longer clipped by a too-short input bar.
+    static let defaultHeight: Double = 180
 
     static var fontSize: CGFloat {
         let val = UserDefaults.standard.double(forKey: "imeBarFontSize")
@@ -14,6 +16,21 @@ enum IMEInputBarSettings {
     static var height: CGFloat {
         let val = UserDefaults.standard.double(forKey: "imeBarHeight")
         return val > 0 ? CGFloat(val) : CGFloat(defaultHeight)
+    }
+
+    /// One-time migration: users on (or near) the legacy 90pt default had the
+    /// `imeBarHeight` value persisted by the resize handle, so simply raising
+    /// `defaultHeight` would not reach them. Bump any stored height below the
+    /// new default up to it once; taller custom heights are left untouched.
+    static func migrateHeightIfNeeded() {
+        let defaults = UserDefaults.standard
+        let migratedKey = "imeBarHeightV2Migrated"
+        guard !defaults.bool(forKey: migratedKey) else { return }
+        let stored = defaults.double(forKey: "imeBarHeight")
+        if stored > 0 && stored < defaultHeight {
+            defaults.set(defaultHeight, forKey: "imeBarHeight")
+        }
+        defaults.set(true, forKey: migratedKey)
     }
 }
 

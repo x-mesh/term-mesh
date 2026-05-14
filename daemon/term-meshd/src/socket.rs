@@ -172,10 +172,8 @@ pub async fn serve(
         shutdown_rx.clone(),
     ));
     // Phase 2.5: 1s coalesce → emit `agent_usage_tick` broadcasts (headless path).
-    let usage_broadcast_task = tokio::spawn(run_usage_tick_broadcaster(
-        ctx.clone(),
-        shutdown_rx.clone(),
-    ));
+    let usage_broadcast_task =
+        tokio::spawn(run_usage_tick_broadcaster(ctx.clone(), shutdown_rx.clone()));
     // Phase 2.5-B: 1s JSONL-watcher → emit `agent_usage_tick` for pane-mode claude agents.
     let jsonl_usage_broadcast_task = tokio::spawn(run_jsonl_usage_tick_broadcaster(
         ctx.clone(),
@@ -187,10 +185,7 @@ pub async fn serve(
         shutdown_rx.clone(),
     ));
     // Phase 2.5: 30s disk flush for dirty usage counters.
-    let usage_flush_task = tokio::spawn(run_usage_disk_flusher(
-        ctx.clone(),
-        shutdown_rx.clone(),
-    ));
+    let usage_flush_task = tokio::spawn(run_usage_disk_flusher(ctx.clone(), shutdown_rx.clone()));
 
     loop {
         tokio::select! {
@@ -451,10 +446,7 @@ fn filter_and_serialize(
 /// Phase 2.5: every 1s, ask the headless manager which agents have a dirty
 /// usage counter and emit `agent_usage_tick` for each team that has at least
 /// one. Coalesces all stream-json increments observed in the past second.
-async fn run_usage_tick_broadcaster(
-    ctx: Arc<Context>,
-    mut shutdown_rx: watch::Receiver<bool>,
-) {
+async fn run_usage_tick_broadcaster(ctx: Arc<Context>, mut shutdown_rx: watch::Receiver<bool>) {
     let mut interval = tokio::time::interval(Duration::from_secs(1));
     interval.tick().await; // consume immediate first tick
 
@@ -766,10 +758,7 @@ async fn run_codex_usage_tick_broadcaster(
 
 /// Phase 2.5: every 30s, flush dirty usage counters to `agent.json` on disk.
 /// Disk I/O runs on `spawn_blocking` so the socket runtime is not stalled.
-async fn run_usage_disk_flusher(
-    ctx: Arc<Context>,
-    mut shutdown_rx: watch::Receiver<bool>,
-) {
+async fn run_usage_disk_flusher(ctx: Arc<Context>, mut shutdown_rx: watch::Receiver<bool>) {
     let mut interval = tokio::time::interval(Duration::from_secs(30));
     interval.tick().await; // skip immediate tick
 
@@ -1283,10 +1272,19 @@ async fn dispatch(req: &Request, ctx: &Context) -> Response {
                 force: bool,
             }
             match serde_json::from_value::<TerminateParams>(req.params.clone()) {
-                Ok(p) => ctx
-                    .agent_manager
-                    .terminate(&p.id, p.force, &ctx.watcher_handle)
-                    .map(|_| serde_json::json!({"status": "ok"})),
+                Ok(p) => {
+                    let agent_manager = ctx.agent_manager.clone();
+                    let watcher_handle = ctx.watcher_handle.clone();
+                    match tokio::task::spawn_blocking(move || {
+                        agent_manager.terminate(&p.id, p.force, &watcher_handle)
+                    })
+                    .await
+                    {
+                        Ok(Ok(())) => Ok(serde_json::json!({"status": "ok"})),
+                        Ok(Err(e)) => Err(e),
+                        Err(e) => Err(format!("agent terminate task failed: {e}")),
+                    }
+                }
                 Err(e) => Err(format!("invalid params: {e}")),
             }
         }
@@ -1638,11 +1636,10 @@ async fn dispatch(req: &Request, ctx: &Context) -> Response {
             fn default_limit() -> usize {
                 50
             }
-            let params: P =
-                serde_json::from_value(req.params.clone()).unwrap_or(P {
-                    git_root: None,
-                    limit: 50,
-                });
+            let params: P = serde_json::from_value(req.params.clone()).unwrap_or(P {
+                git_root: None,
+                limit: 50,
+            });
             let limit = params.limit.min(200);
             let mgr = ctx.headless.lock().await;
             let res = mgr.list_resumable(params.git_root.as_deref(), limit);
@@ -1653,9 +1650,7 @@ async fn dispatch(req: &Request, ctx: &Context) -> Response {
             }
         }
         "headless.resume_team" => {
-            match serde_json::from_value::<crate::headless::ResumeTeamParams>(
-                req.params.clone(),
-            ) {
+            match serde_json::from_value::<crate::headless::ResumeTeamParams>(req.params.clone()) {
                 Ok(p) => {
                     let mut mgr = ctx.headless.lock().await;
                     mgr.resume_team(p)

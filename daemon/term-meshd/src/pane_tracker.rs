@@ -54,10 +54,20 @@ fn scan_pane_sessions() -> HashMap<String, PaneInfo> {
     for cli in ["claude", "codex"] {
         let Some(pids) = pgrep(cli) else { continue };
         for pid in pids {
-            let Some(panel_id) = read_panel_id(pid) else { continue };
+            let Some(panel_id) = read_panel_id(pid) else {
+                continue;
+            };
             let Some(cwd) = read_cwd(pid) else { continue };
             let proc_start_unix = read_proc_start_unix(pid).unwrap_or(0);
-            result.insert(panel_id, PaneInfo { cli: cli.to_string(), cwd, pid, proc_start_unix });
+            result.insert(
+                panel_id,
+                PaneInfo {
+                    cli: cli.to_string(),
+                    cwd,
+                    pid,
+                    proc_start_unix,
+                },
+            );
         }
     }
     result
@@ -76,7 +86,11 @@ fn pgrep(name: &str) -> Option<Vec<u32>> {
         .lines()
         .filter_map(|l| l.trim().parse().ok())
         .collect();
-    if pids.is_empty() { None } else { Some(pids) }
+    if pids.is_empty() {
+        None
+    } else {
+        Some(pids)
+    }
 }
 
 fn parse_panel_id(ps_output: &str) -> Option<String> {
@@ -231,7 +245,10 @@ mod tests {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs() as i64;
-        assert!((now - start).abs() < 5, "proc_start should be within 5s of now");
+        assert!(
+            (now - start).abs() < 5,
+            "proc_start should be within 5s of now"
+        );
     }
 
     #[test]

@@ -844,9 +844,12 @@ async fn agents_terminate_handler(
     body: Option<Json<TerminateRequest>>,
 ) -> impl IntoResponse {
     let force = body.map(|b| b.force).unwrap_or(false);
-    match state
-        .agent_manager
-        .terminate(&id, force, &state.watcher_handle)
+    let agent_manager = state.agent_manager.clone();
+    let watcher_handle = state.watcher_handle.clone();
+    match tokio::task::spawn_blocking(move || agent_manager.terminate(&id, force, &watcher_handle))
+        .await
+        .map_err(|e| format!("agent terminate task failed: {e}"))
+        .and_then(|r| r)
     {
         Ok(_) => Json(serde_json::json!({"status": "ok"})).into_response(),
         Err(e) => (StatusCode::NOT_FOUND, e).into_response(),

@@ -150,9 +150,10 @@ final class TerminalPanel: Panel, ObservableObject {
                 let _ = self.daemon.terminateAgent(id: sessionId, force: false)
             }
         }
-        // The surface will be cleaned up by its deinit
-        // Just unfocus before closing
+        // Close the Ghostty surface immediately so plain shell PTY children are
+        // terminated even if SwiftUI/AppKit keeps view references alive briefly.
         unfocus()
+        surface.closeGhosttySurface()
     }
 
     func requestViewReattach() {
