@@ -492,6 +492,11 @@ async fn run_usage_tick_broadcaster(
 /// for any team that has at least one claude agent whose counters changed since the
 /// previous tick.  Pane-mode agents share the team cwd so all receive the same
 /// aggregate (R4 v2-deferred: per-agent attribution is deferred).
+/// Reserved agent name used to attribute usage-tick data to a team's leader
+/// pane. The leader is not a member of the `agents` array, so it is broadcast
+/// under this sentinel name; the Swift sidebar renders it as a dedicated row.
+const LEADER_USAGE_NAME: &str = "__leader__";
+
 async fn run_jsonl_usage_tick_broadcaster(
     ctx: Arc<Context>,
     mut shutdown_rx: watch::Receiver<bool>,
@@ -582,6 +587,33 @@ async fn run_jsonl_usage_tick_broadcaster(
                             cache_read_input_tokens: cr_tok,
                             cache_creation_input_tokens: cw_tok,
                         });
+                    }
+                    // Leader pane: runs its own claude session but is not part of
+                    // the `agents` array. Attribute its usage under the reserved
+                    // LEADER_USAGE_NAME sentinel so the sidebar can show a leader row.
+                    if team.get("leader_cli").and_then(|v| v.as_str()) == Some("claude") {
+                        if let Some(leader_panel) = team
+                            .get("leader_panel_id")
+                            .and_then(|v| v.as_str())
+                            .filter(|id| !id.is_empty())
+                        {
+                            if let Some(&(in_tok, out_tok, cr_tok, cw_tok)) =
+                                by_panel.get(leader_panel)
+                            {
+                                let key = (team_name.to_string(), LEADER_USAGE_NAME.to_string());
+                                let last = last_emitted.get(&key).copied().unwrap_or_default();
+                                if (in_tok, out_tok, cr_tok, cw_tok) != last {
+                                    last_emitted.insert(key, (in_tok, out_tok, cr_tok, cw_tok));
+                                    tick_agents.push(crate::headless::UsageTickAgent {
+                                        name: LEADER_USAGE_NAME.to_string(),
+                                        input_tokens: in_tok,
+                                        output_tokens: out_tok,
+                                        cache_read_input_tokens: cr_tok,
+                                        cache_creation_input_tokens: cw_tok,
+                                    });
+                                }
+                            }
+                        }
                     }
                     if !tick_agents.is_empty() {
                         let _ = ctx.event_tx.send(DaemonEvent::AgentUsageTick {

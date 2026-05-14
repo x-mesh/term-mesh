@@ -1258,6 +1258,11 @@ private struct ExpandedTeamAgentList: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 3) {
+            // Leader runs its own CLI session; the daemon attributes its token
+            // usage under the reserved `__leader__` name (see socket.rs).
+            if team.leaderMode == "claude" {
+                ExpandedLeaderRow(teamName: team.id, leaderMode: team.leaderMode)
+            }
             ForEach(team.agents, id: \.id) { agent in
                 ExpandedAgentRow(teamName: team.id, agent: agent)
             }
@@ -1268,6 +1273,63 @@ private struct ExpandedTeamAgentList: View {
             RoundedRectangle(cornerRadius: 4)
                 .fill(Color.primary.opacity(0.04))
         )
+    }
+}
+
+/// Reserved usage-tick name the daemon broadcasts the leader pane's token
+/// usage under. Must stay in sync with `LEADER_USAGE_NAME` in socket.rs.
+private let leaderUsageName = "__leader__"
+
+/// A single expanded leader row: 👑 + "leader" + CLI + token-usage column.
+/// The leader is not a `team.agents` member, so it gets its own lightweight
+/// row that reads usage from the reserved `__leader__` key.
+private struct ExpandedLeaderRow: View {
+    let teamName: String
+    let leaderMode: String
+    @ObservedObject private var dataStore = TeamDataStore.shared
+
+    private var usage: AgentUsageSnapshot? {
+        dataStore.agentUsage[teamName]?[leaderUsageName]
+    }
+
+    private var tokenLabel: String {
+        guard let u = usage, u.updatedAt != .distantPast else { return "—" }
+        return "\(compactToken(u.inputTokens))↑ \(compactToken(u.outputTokens))↓"
+    }
+
+    private var tokenTooltip: String {
+        guard let u = usage, u.updatedAt != .distantPast else { return "No token data yet." }
+        let total = u.cacheReadTokens &+ u.cacheCreationTokens
+        let base = "input \(u.inputTokens) · output \(u.outputTokens)"
+        if total > 0, let ratio = u.cacheHitRatio {
+            let pct = Int((ratio * 100).rounded())
+            return "\(base)\ncache hit \(pct)% · \(compactToken(u.cacheReadTokens)) cached · \(compactToken(u.cacheCreationTokens)) fresh"
+        }
+        return base
+    }
+
+    var body: some View {
+        HStack(spacing: 6) {
+            Text("👑")
+                .font(.system(size: 9))
+                .frame(width: 10, height: 10)
+
+            Text("leader")
+                .font(.system(size: 10.5, weight: .medium))
+                .lineLimit(1)
+
+            Text(leaderMode)
+                .font(.system(size: 9))
+                .foregroundStyle(.secondary)
+
+            Spacer(minLength: 4)
+
+            Text(tokenLabel)
+                .font(.system(size: 9.5, design: .monospaced))
+                .foregroundStyle(.secondary)
+                .help(tokenTooltip)
+        }
+        .contentShape(Rectangle())
     }
 }
 

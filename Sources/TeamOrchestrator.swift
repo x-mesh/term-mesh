@@ -3025,7 +3025,12 @@ final class TeamOrchestrator: ObservableObject {
                     return info
                 },
                 "attention_count": teamInbox.count,
-                "created_at": ISO8601DateFormatter().string(from: team.createdAt)
+                "created_at": ISO8601DateFormatter().string(from: team.createdAt),
+                // Leader pane runs its own CLI session — expose it so the daemon's
+                // usage-tick broadcaster can attribute token usage to the leader
+                // (the leader is intentionally NOT part of the `agents` array).
+                "leader_cli": team.leaderMode,
+                "leader_panel_id": team.leaderPanelId.uuidString
             ] as [String: Any]
         }
     }
