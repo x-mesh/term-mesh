@@ -12,18 +12,30 @@ Prepare a new release for term-mesh. This command updates the changelog, bumps t
    - Create branch: `git checkout -b release/vX.Y.Z`
 
 3. **Gather changes and contributors since the last release**
+   - **API budget preflight** — before any `gh` call, check the GraphQL pool:
+     ```bash
+     gh api rate_limit --jq '.resources.graphql | "graphql remaining=\(.remaining)/\(.limit)"'
+     ```
+     If `remaining` < 500, stop and tell the user — do NOT proceed with PR/issue lookups
+     until the pool resets (the `reset` epoch is in the same payload).
    - Find the most recent git tag: `git describe --tags --abbrev=0`
    - Get commits since that tag: `git log --oneline <last-tag>..HEAD --no-merges`
    - **Filter for end-user visible changes only** - ignore developer tooling, CI, docs, tests
    - Categorize changes into: Added, Changed, Fixed, Removed
-   - **Collect contributors:** For each PR referenced in the commits, get the author:
+   - **Collect contributors — use REST, not GraphQL.** `gh pr view --json` and
+     `gh issue view --json` are GraphQL-backed and burn the 5000/hr GraphQL pool one
+     call per PR. Use the REST endpoints instead (separate 5000/hr core pool):
      ```bash
-     gh pr view <N> --repo JINWOO-J/term-mesh --json author --jq '.author.login'
+     # PR author (REST):
+     gh api repos/JINWOO-J/term-mesh/pulls/<N> --jq '.user.login'
+     # Linked issue reporter (REST):
+     gh api repos/JINWOO-J/term-mesh/issues/<N> --jq '.user.login'
      ```
-   - Also check for linked issue reporters (the person who filed the bug):
-     ```bash
-     gh issue view <N> --repo JINWOO-J/term-mesh --json author --jq '.author.login'
-     ```
+   - **Prefer zero-API extraction when possible:** `git log <last-tag>..HEAD` already
+     carries `Co-authored-by:` trailers and `(#N)` PR refs. Parse those first; only fall
+     back to `gh api` for PRs whose author can't be derived from the log.
+   - De-duplicate the unique PR/issue numbers BEFORE looping — never call `gh api` per
+     commit, only once per distinct PR/issue.
    - Build a deduplicated list of all contributor `@handle`s for the release
 
 4. **Update the changelog**
@@ -48,14 +60,28 @@ Prepare a new release for term-mesh. This command updates the changelog, bumps t
    - Include the changelog entries in the PR body
 
 8. **Monitor CI**
-   - Watch the CI workflow: `gh pr checks --watch`
+   - **Do NOT use `gh pr checks --watch`** — it polls the GraphQL pool continuously and a
+     long CI run can drain thousands of GraphQL calls in a single release.
+   - Instead, poll with a bounded loop on the underlying workflow run (uses the REST/core
+     pool, and `gh run watch` streams without per-tick GraphQL):
+     ```bash
+     # Resolve the run id once, then stream it (REST-backed):
+     RUN_ID=$(gh run list --repo JINWOO-J/term-mesh --branch release/vX.Y.Z \
+       --limit 1 --json databaseId --jq '.[0].databaseId')
+     gh run watch "$RUN_ID" --repo JINWOO-J/term-mesh --exit-status
+     ```
+   - If `gh run watch` is unavailable, fall back to a capped manual poll: `gh run view
+     "$RUN_ID" --json status,conclusion` every ~30s, max ~40 iterations (~20 min), then
+     stop and report rather than polling forever.
    - If CI fails, fix the issues and push again
    - Wait for all checks to pass before proceeding
 
 9. **Merge the PR into main**
    - Target branch is `main` (see CLAUDE.md — main is the released-version branch).
    - Merge: `gh pr merge <N> --repo JINWOO-J/term-mesh --squash --delete-branch`
-   - Capture the squash-merge commit SHA: `gh pr view <N> --repo JINWOO-J/term-mesh --json mergeCommit --jq '.mergeCommit.oid'` — the tag must point at this SHA.
+   - Capture the squash-merge commit SHA via REST (not the GraphQL `gh pr view --json`):
+     `gh api repos/JINWOO-J/term-mesh/pulls/<N> --jq '.merge_commit_sha'` — the tag must
+     point at this SHA.
 
 10. **Create and push the tag at the squash-merge commit**
     - `git fetch origin main` (do NOT fast-forward local main — it may carry local-only commits that diverge from the squash-merge result; the tag only needs the remote SHA).
