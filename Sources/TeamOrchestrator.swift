@@ -72,6 +72,16 @@ final class TeamOrchestrator: ObservableObject {
         var originalSpawnCommand: String?
     }
 
+    struct AgentMentionTarget: Equatable {
+        let teamName: String
+        let name: String
+        let cli: String
+        let model: String
+        let agentType: String
+        let workspaceId: UUID
+        let panelId: UUID?
+    }
+
     @Published private(set) var teams: [String: Team] = [:]
     // Round-robin counter per "teamName/agentName" key — cycles across duplicate-named agents.
     private var agentSendRoundRobin: [String: Int] = [:]
@@ -105,6 +115,11 @@ final class TeamOrchestrator: ObservableObject {
 
     private var periodicRenderTimer: DispatchSourceTimer?
 
+#if DEBUG
+    /// Debug-only one-shot flag: log periodicRenderAgents on first fire only to avoid noise.
+    private static var _periodicRenderLogged = false
+#endif
+
     /// Reads the user-configured interval (seconds) from UserDefaults; defaults to 3.
     private var periodicRenderInterval: TimeInterval {
         let stored = UserDefaults.standard.integer(forKey: "agentRenderingInterval")
@@ -123,6 +138,9 @@ final class TeamOrchestrator: ObservableObject {
     /// Paused: occludes surfaces (stops CVDisplayLink + wakeup rendering) and starts a 3-second
     /// periodic draw so new output is still captured. Resumed: restores normal rendering.
     func toggleAgentRendering() {
+#if DEBUG
+        dlog("team.toggleAgentRendering paused=\(agentRenderingPaused)")
+#endif
         agentRenderingPaused.toggle()
         if agentRenderingPaused {
             setAgentSurfaceOcclusion(visible: false)
@@ -134,6 +152,10 @@ final class TeamOrchestrator: ObservableObject {
     }
 
     private func setAgentSurfaceOcclusion(visible: Bool) {
+#if DEBUG
+        let agentCount = teams.values.reduce(0) { $0 + $1.agents.count }
+        dlog("team.setAgentSurfaceOcclusion visible=\(visible) agentCount=\(agentCount)")
+#endif
         for team in teams.values {
             for agent in team.agents {
                 guard let pid = agent.panelId,
@@ -171,10 +193,36 @@ final class TeamOrchestrator: ObservableObject {
         periodicRenderTimer = nil
     }
 
+    /// Re-present agent terminal surfaces after macOS wakes the display.
+    /// Unlike the periodic path which only fires when rendering is paused,
+    /// this runs unconditionally because wake can black-out any surface
+    /// regardless of its paused state.
+    /// Issues an immediate draw plus a 50ms-delayed follow-up to absorb cases where IOSurface /
+    /// CALayer rebinding completes a few frames after didWakeNotification fires (especially on
+    /// external displays returning from sleep).
+    func drawAgentSurfacesAfterWake() {
+        drawAgentSurfaces(reason: "wake")
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) { [weak self] in
+            self?.drawAgentSurfaces(reason: "wake-followup")
+        }
+    }
+
     /// Called by the periodic timer while rendering is paused.
     /// Issues a single ghostty_surface_draw per agent so new terminal output is captured.
     private func periodicRenderAgents() {
+#if DEBUG
+        if !Self._periodicRenderLogged {
+            Self._periodicRenderLogged = true
+            let agentCount = teams.values.reduce(0) { $0 + $1.agents.count }
+            dlog("team.periodicRenderAgents firstFire=true paused=\(agentRenderingPaused) agentCount=\(agentCount)")
+        }
+#endif
         guard agentRenderingPaused else { return }
+        drawAgentSurfaces(reason: "periodic")
+    }
+
+    private func drawAgentSurfaces(reason: String) {
+        var drawnCount = 0
         for team in teams.values {
             for agent in team.agents {
                 guard let pid = agent.panelId,
@@ -184,8 +232,12 @@ final class TeamOrchestrator: ObservableObject {
                       let panel = workspace.panels[pid] as? TerminalPanel,
                       let surface = panel.surface.surface else { continue }
                 ghostty_surface_draw(surface)
+                drawnCount += 1
             }
         }
+#if DEBUG
+        dlog("team.drawAgentSurfaces reason=\(reason) drawn=\(drawnCount) paused=\(agentRenderingPaused)")
+#endif
     }
 
     // MARK: - Bidirectional Communication
@@ -2186,6 +2238,7 @@ final class TeamOrchestrator: ObservableObject {
         priority: Int? = nil,
         context: String? = nil,
         tabManager: TabManager,
+        submit: Bool = false,
         completion: ((Bool) -> Void)? = nil
     ) -> DelegateResult? {
         let title = taskTitle?.nilIfBlank ?? String(text.prefix(80))
@@ -2196,9 +2249,16 @@ final class TeamOrchestrator: ObservableObject {
             priority: priority ?? 2
         ) else { return nil }
         let instruction = formatDelegateInstruction(task: task, text: text, context: context)
-        // Send text WITHOUT Return — the Rust CLI sends Return separately via
-        // team.send_key RPC after receiving the paste-completion ack (completion callback).
-        let delivered = sendToAgent(teamName: teamName, agentName: agentName, text: instruction, tabManager: tabManager, withReturn: false, completion: completion)
+        // CLI callers keep submit=false and send Return separately after paste ack.
+        // GUI callers can submit=true to use the IME paste path's inline Return.
+        let delivered = sendToAgent(
+            teamName: teamName,
+            agentName: agentName,
+            text: instruction,
+            tabManager: tabManager,
+            withReturn: submit,
+            completion: completion
+        )
         return DelegateResult(task: task, textDelivered: delivered, instruction: instruction)
     }
 
@@ -2397,7 +2457,24 @@ final class TeamOrchestrator: ObservableObject {
             // ensuring capturedDelegateResult is set before the caller reads it.
             panel.surface.sendIMETextResult(normalized, withReturn: withReturn) { result in
                 let ok: Bool
-                switch result { case .success: ok = true; default: ok = false }
+                switch result {
+                case .success:
+                    ok = true
+                case .failure(let error):
+                    ok = false
+                    #if DEBUG
+                    let reason: String
+                    switch error {
+                    case .queueOverflow:
+                        reason = "queue_overflow"
+                    case .surfaceUnavailable:
+                        reason = "surface_unavailable"
+                    case .returnRetryExhausted:
+                        reason = "watchdog"
+                    }
+                    dlog("text.delivered.false reason=\(reason) panelId=\(panelId.uuidString.prefix(8)) textLen=\(normalized.count) withReturn=\(withReturn)")
+                    #endif
+                }
                 DispatchQueue.main.async { completion(ok) }
             }
             #if DEBUG
@@ -2479,6 +2556,42 @@ final class TeamOrchestrator: ObservableObject {
             }
         }
         return nil
+    }
+
+    func teamName(containingPanelId panelId: UUID, workspaceId: UUID? = nil) -> String? {
+        for team in teams.values {
+            if team.leaderPanelId == panelId {
+                return team.id
+            }
+            if team.agents.contains(where: { $0.panelId == panelId }) {
+                return team.id
+            }
+        }
+        if let workspaceId {
+            let candidates = teams.values.filter {
+                $0.workspaceId == workspaceId || $0.leaderWorkspaceId == workspaceId
+            }
+            if candidates.count == 1 {
+                return candidates[0].id
+            }
+        }
+        return nil
+    }
+
+    func agentMentionTargets(containingPanelId panelId: UUID, workspaceId: UUID? = nil) -> [AgentMentionTarget] {
+        guard let teamName = teamName(containingPanelId: panelId, workspaceId: workspaceId),
+              let team = teams[teamName] else { return [] }
+        return team.agents.map {
+            AgentMentionTarget(
+                teamName: team.id,
+                name: $0.name,
+                cli: $0.cli,
+                model: $0.model,
+                agentType: $0.agentType,
+                workspaceId: $0.workspaceId,
+                panelId: $0.panelId
+            )
+        }
     }
 
     @discardableResult
@@ -2912,7 +3025,12 @@ final class TeamOrchestrator: ObservableObject {
                     return info
                 },
                 "attention_count": teamInbox.count,
-                "created_at": ISO8601DateFormatter().string(from: team.createdAt)
+                "created_at": ISO8601DateFormatter().string(from: team.createdAt),
+                // Leader pane runs its own CLI session — expose it so the daemon's
+                // usage-tick broadcaster can attribute token usage to the leader
+                // (the leader is intentionally NOT part of the `agents` array).
+                "leader_cli": team.leaderMode,
+                "leader_panel_id": team.leaderPanelId.uuidString
             ] as [String: Any]
         }
     }

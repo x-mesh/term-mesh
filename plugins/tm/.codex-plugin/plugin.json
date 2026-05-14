@@ -1,0 +1,39 @@
+{
+  "name": "tm",
+  "version": "0.1.0",
+  "description": "term-mesh team orchestration for Codex via tm-agent",
+  "author": {
+    "name": "term-mesh"
+  },
+  "homepage": "https://github.com/x-mesh/term-mesh",
+  "repository": "https://github.com/x-mesh/term-mesh",
+  "license": "MIT",
+  "keywords": [
+    "term-mesh",
+    "tm-agent",
+    "multi-agent",
+    "orchestration",
+    "codex"
+  ],
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "tm",
+    "shortDescription": "Route Codex team work through term-mesh tm-agent.",
+    "longDescription": "Adds term-mesh-oriented Codex commands and skills for fan-out, team lifecycle, team-up, and strategy orchestration. This plugin keeps Codex leaders on tm-agent instead of disconnected native sub-agent state.",
+    "developerName": "term-mesh",
+    "category": "Coding",
+    "websiteURL": "https://github.com/x-mesh/term-mesh",
+    "privacyPolicyURL": "https://github.com/x-mesh/term-mesh",
+    "termsOfServiceURL": "https://github.com/x-mesh/term-mesh",
+    "capabilities": [
+      "Interactive",
+      "Write"
+    ],
+    "defaultPrompt": [
+      "Use tm-agent to show team status",
+      "Fan out this task to the term-mesh team",
+      "Create a term-mesh team with this Codex pane as leader"
+    ],
+    "brandColor": "#23c55e"
+  }
+}

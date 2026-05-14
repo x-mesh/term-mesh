@@ -20,10 +20,10 @@ mod prompts;
 use clap::{Parser, Subcommand};
 use serde_json::{json, Value};
 use std::fs;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, ErrorKind, Write};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use std::{env, process, thread};
 
 // ── Constants ────────────────────────────────────────────────────────
@@ -785,7 +785,7 @@ enum RunbookCommands {
     },
     /// Install runbooks for one tool or all supported tools
     Install {
-        /// claude, codex, opencode, or all
+        /// claude, codex, opencode, gemini, or all
         #[arg(long, default_value = "all")]
         tool: String,
         /// Install only one role runbook
@@ -991,6 +991,7 @@ enum RunbookTool {
     Claude,
     Codex,
     OpenCode,
+    Gemini,
 }
 
 impl RunbookTool {
@@ -999,6 +1000,7 @@ impl RunbookTool {
             RunbookTool::Claude => "claude",
             RunbookTool::Codex => "codex",
             RunbookTool::OpenCode => "opencode",
+            RunbookTool::Gemini => "gemini",
         }
     }
 }
@@ -1462,11 +1464,13 @@ fn parse_runbook_tools(tool: &str) -> Result<Vec<RunbookTool>, String> {
                     RunbookTool::Claude,
                     RunbookTool::Codex,
                     RunbookTool::OpenCode,
+                    RunbookTool::Gemini,
                 ])
             }
             "claude" | "claude-code" | "claudecode" => out.push(RunbookTool::Claude),
             "codex" => out.push(RunbookTool::Codex),
             "opencode" | "open-code" => out.push(RunbookTool::OpenCode),
+            "gemini" => out.push(RunbookTool::Gemini),
             other => return Err(format!("unknown runbook tool: {other}")),
         }
     }
@@ -1652,6 +1656,10 @@ fn runbook_projection_path(root: &Path, tool: RunbookTool, role: &RunbookRole) -
         RunbookTool::OpenCode => root
             .join(".opencode/runbooks")
             .join(format!("{}.md", role.name)),
+        RunbookTool::Gemini => root
+            .join(".gemini/skills")
+            .join(format!("term-mesh-{}", role.name))
+            .join("SKILL.md"),
     }
 }
 
@@ -1690,7 +1698,7 @@ fn effective_source_runbook_content(root: &Path, role: &RunbookRole) -> String {
 
 fn tool_runbook_content(tool: RunbookTool, role: &RunbookRole, source_content: &str) -> String {
     match tool {
-        RunbookTool::Claude | RunbookTool::Codex => format!(
+        RunbookTool::Claude | RunbookTool::Codex | RunbookTool::Gemini => format!(
             "---\nname: term-mesh-{}\ndescription: \"{}\"\n---\n{}",
             role.name,
             yaml_escape(&format!(
@@ -1884,6 +1892,7 @@ fn runbook_status() -> Result<Value, String> {
         RunbookTool::Claude,
         RunbookTool::Codex,
         RunbookTool::OpenCode,
+        RunbookTool::Gemini,
     ]
     .iter()
     .map(|tool| {
@@ -1976,7 +1985,9 @@ mod runbook_tests {
     #[test]
     fn runbook_parse_tools_accepts_all_and_aliases() {
         let all = parse_runbook_tools("all").unwrap();
-        assert_eq!(all.len(), 3);
+        assert_eq!(all.len(), 4);
+        let all_names: Vec<&str> = all.iter().map(|t| t.as_str()).collect();
+        assert_eq!(all_names, vec!["claude", "codex", "opencode", "gemini"]);
 
         let tools = parse_runbook_tools("claude-code,codex,open-code").unwrap();
         let names: Vec<&str> = tools.iter().map(|t| t.as_str()).collect();
@@ -2176,6 +2187,36 @@ mod runbook_tests {
             Some("/tmp/full.md")
         );
         assert!(item["summary"].as_str().unwrap().contains("Changed code"));
+    }
+
+    #[test]
+    fn atomic_write_file_replaces_content_without_temp_residue() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = env::temp_dir().join(format!("tm-agent-atomic-result-{unique}"));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("task.md");
+
+        atomic_write_file(&path, "first").unwrap();
+        atomic_write_file(&path, "second").unwrap();
+
+        assert_eq!(fs::read_to_string(&path).unwrap(), "second");
+        let leftovers: Vec<_> = fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| entry.file_name().to_string_lossy().ends_with(".tmp"))
+            .collect();
+        assert!(leftovers.is_empty());
+
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn return_retry_policy_is_conservative_when_text_delivery_failed() {
+        assert_eq!(return_retry_delays_ms(true), &[20, 200, 400, 600, 800]);
+        assert_eq!(return_retry_delays_ms(false), &[200, 500]);
     }
 }
 
@@ -2816,10 +2857,138 @@ fn write_result_file(team: &str, filename: &str, content: &str) -> Result<PathBu
     let dir = results_dir(team);
     std::fs::create_dir_all(&dir).map_err(|e| format!("mkdir: {e}"))?;
     let path = dir.join(filename);
-    let tmp = dir.join(format!(".{filename}.tmp"));
-    std::fs::write(&tmp, content).map_err(|e| format!("write: {e}"))?;
-    std::fs::rename(&tmp, &path).map_err(|e| format!("rename: {e}"))?;
+    atomic_write_file(&path, content)?;
     Ok(path)
+}
+
+fn atomic_write_file(path: &Path, content: &str) -> Result<(), String> {
+    let dir = path
+        .parent()
+        .ok_or_else(|| format!("missing parent for {}", path.display()))?;
+    std::fs::create_dir_all(dir).map_err(|e| format!("mkdir {}: {e}", dir.display()))?;
+    let filename = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("result");
+
+    for attempt in 0..16 {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let tmp = dir.join(format!(
+            ".{filename}.{}.{}.{}.tmp",
+            process::id(),
+            nonce,
+            attempt
+        ));
+        let mut file = match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp)
+        {
+            Ok(file) => file,
+            Err(e) if e.kind() == ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(format!("create temp {}: {e}", tmp.display())),
+        };
+        if let Err(e) = file.write_all(content.as_bytes()) {
+            let _ = fs::remove_file(&tmp);
+            return Err(format!("write {}: {e}", tmp.display()));
+        }
+        if let Err(e) = file.sync_all() {
+            let _ = fs::remove_file(&tmp);
+            return Err(format!("sync {}: {e}", tmp.display()));
+        }
+        drop(file);
+        if let Err(e) = fs::rename(&tmp, path) {
+            let _ = fs::remove_file(&tmp);
+            return Err(format!(
+                "rename {} -> {}: {e}",
+                tmp.display(),
+                path.display()
+            ));
+        }
+        return Ok(());
+    }
+
+    Err(format!(
+        "failed to create unique temp file for {}",
+        path.display()
+    ))
+}
+
+fn reply_target_task_id(sock: &PathBuf, team: &str, sender: &str) -> Option<String> {
+    let task_resp = rpc_call(
+        sock,
+        "team.task.list",
+        json!({
+            "team_name": team, "assignee": sender
+        }),
+    )
+    .ok()?;
+    let tasks = task_resp["result"]["tasks"].as_array()?;
+    let target_task = tasks
+        .iter()
+        .find(|t| t["status"].as_str() == Some("in_progress"))
+        .or_else(|| {
+            tasks.iter().find(|t| {
+                let st = t["status"].as_str().unwrap_or("");
+                st != "completed" && st != "failed" && st != "abandoned"
+            })
+        })?;
+    target_task["id"].as_str().map(str::to_string)
+}
+
+fn return_retry_delays_ms(text_delivered: bool) -> &'static [u64] {
+    if text_delivered {
+        &[20, 200, 400, 600, 800]
+    } else {
+        &[200, 500]
+    }
+}
+
+fn send_return_key_with_retry(
+    sock: &PathBuf,
+    team: &str,
+    target: &str,
+    text_delivered: bool,
+    context: &str,
+) -> bool {
+    let delays = return_retry_delays_ms(text_delivered);
+    eprintln!(
+        "send_key.skip_or_retry context={context} text_delivered={text_delivered} attempts={} delays_ms={}",
+        delays.len(),
+        delays
+            .iter()
+            .map(u64::to_string)
+            .collect::<Vec<_>>()
+            .join(",")
+    );
+
+    for (attempt, delay_ms) in delays.iter().enumerate() {
+        if *delay_ms > 0 {
+            std::thread::sleep(Duration::from_millis(*delay_ms));
+        }
+        eprintln!("team.send_key attempt {}/{}", attempt + 1, delays.len());
+        match rpc_call(
+            sock,
+            "team.send_key",
+            json!({
+                "team_name": team,
+                "agent_name": target,
+                "key": "return",
+            }),
+        ) {
+            Ok(r) if r["ok"].as_bool().unwrap_or(false) => return true,
+            Ok(_) | Err(_) => {}
+        }
+    }
+
+    eprintln!(
+        "  Warning: Return key delivery failed after {} retries",
+        delays.len()
+    );
+    false
 }
 
 fn truncate_summary(content: &str, max_chars: usize) -> String {
@@ -3903,36 +4072,12 @@ fn main() {
             );
             // Send Return key via team.send_key (reliable sendNamedKey path)
             if let Ok(ref r) = send_result {
-                if r["result"]["text_delivered"].as_bool().unwrap_or(false) {
-                    std::thread::sleep(Duration::from_millis(150));
-                    let max_attempts = 5u32;
-                    let mut send_key_delivered = false;
-                    for attempt in 0..max_attempts {
-                        eprintln!("team.send_key attempt {}/{}", attempt + 1, max_attempts);
-                        match rpc_call(
-                            &sock,
-                            "team.send_key",
-                            json!({
-                                "team_name": team, "agent_name": target, "key": "return",
-                            }),
-                        ) {
-                            Ok(r) if r["ok"].as_bool().unwrap_or(false) => {
-                                send_key_delivered = true;
-                                break;
-                            }
-                            _ => {
-                                if attempt + 1 < max_attempts {
-                                    std::thread::sleep(Duration::from_millis(
-                                        200 * (attempt as u64 + 1),
-                                    ));
-                                }
-                            }
-                        }
-                    }
-                    if !send_key_delivered {
-                        eprintln!("team.send_key giving up after {max_attempts} attempts");
-                    }
+                let text_delivered = r["result"]["text_delivered"].as_bool().unwrap_or(false);
+                if !text_delivered {
+                    eprintln!("text.delivered.false reason=team.send_ack agent={target}");
                 }
+                let _ =
+                    send_return_key_with_retry(&sock, &team, target, text_delivered, "team.send");
             }
             print_result(send_result);
             return;
@@ -4211,15 +4356,21 @@ fn main() {
         Commands::Reply { text, from } => {
             let sender = from.unwrap_or_else(|| agent.clone());
             let content = text.join(" ");
-            // Write full result to file, send truncated summary via socket
-            let result_path =
+            // Write the canonical task result when possible, plus the legacy
+            // per-agent alias for compatibility with older readers.
+            let reply_task_id = reply_target_task_id(&sock, &team, &sender);
+            let alias_result_path =
                 write_result_file(&team, &format!("{sender}-reply.md"), &content).ok();
+            let task_result_path = reply_task_id
+                .as_deref()
+                .and_then(|tid| write_result_file(&team, &format!("{tid}.md"), &content).ok());
+            let result_path = task_result_path.as_ref().or(alias_result_path.as_ref());
             let summary = truncate_summary(&content, 1500);
             let mut msg_params = json!({
                 "team_name": team, "from": sender, "content": summary,
                 "to": "leader", "type": "report",
             });
-            if let Some(ref path) = result_path {
+            if let Some(path) = result_path {
                 msg_params["result_path"] = json!(path.to_string_lossy());
             }
             print_result(rpc_call(&sock, "team.message.post", msg_params));
@@ -4227,7 +4378,7 @@ fn main() {
             let mut report_params = json!({
                 "team_name": team, "agent_name": sender, "content": summary,
             });
-            if let Some(ref path) = result_path {
+            if let Some(path) = result_path {
                 report_params["result_path"] = json!(path.to_string_lossy());
             }
             // team.report — retry once on failure (wait hangs permanently if this is lost)
@@ -4241,44 +4392,22 @@ fn main() {
             // (UI command, MainActor) to avoid timeout when main thread is busy —
             // a timeout here silently skips task completion, causing the leader's
             // `wait` to hang indefinitely.
-            if let Ok(task_resp) = rpc_call(
-                &sock,
-                "team.task.list",
-                json!({
-                    "team_name": &team, "assignee": &sender
-                }),
-            ) {
-                if let Some(tasks) = task_resp["result"]["tasks"].as_array() {
-                    // Prefer in_progress task (the one actively being worked on),
-                    // then fall back to any non-terminal task. This prevents
-                    // completing a queued/blocked task when multiple tasks exist.
-                    let target_task = tasks
-                        .iter()
-                        .find(|t| t["status"].as_str() == Some("in_progress"))
-                        .or_else(|| {
-                            tasks.iter().find(|t| {
-                                let st = t["status"].as_str().unwrap_or("");
-                                st != "completed" && st != "failed" && st != "abandoned"
-                            })
-                        });
-                    if let Some(t) = target_task {
-                        if let Some(tid) = t["id"].as_str() {
-                            let mut update = json!({
-                                "team_name": &team, "task_id": tid,
-                                "status": "completed", "result": &summary,
-                            });
-                            if let Some(ref path) = result_path {
-                                update["result_path"] = json!(path.to_string_lossy());
-                            }
-                            // task.update — retry once on failure (task stays in_progress forever if lost)
-                            let update_result = rpc_call(&sock, "team.task.update", update.clone());
-                            if let Err(ref e) = update_result {
-                                eprintln!("  Warning: task.update failed: {e}, retrying...");
-                                let _ = rpc_call(&sock, "team.task.update", update);
-                            }
-                        }
-                    }
+            if let Some(tid) = reply_task_id {
+                let mut update = json!({
+                    "team_name": &team, "task_id": tid,
+                    "status": "completed", "result": &summary,
+                });
+                if let Some(path) = result_path {
+                    update["result_path"] = json!(path.to_string_lossy());
                 }
+                // task.update — retry once on failure (task stays in_progress forever if lost)
+                let update_result = rpc_call(&sock, "team.task.update", update.clone());
+                if let Err(ref e) = update_result {
+                    eprintln!("  Warning: task.update failed: {e}, retrying...");
+                    let _ = rpc_call(&sock, "team.task.update", update);
+                }
+            } else {
+                eprintln!("  Warning: no active task found for {sender}; wrote reply alias only");
             }
             return;
         }
@@ -5500,8 +5629,9 @@ fn run_delegate_result(
     if let Ok(v) = rpc_call(sock, "team.delegate", delegate_params) {
         if v["ok"].as_bool().unwrap_or(false) {
             // Check if text was actually delivered to the agent's terminal
-            let text_delivered = v["result"]["text_delivered"].as_bool().unwrap_or(true);
+            let mut text_delivered = v["result"]["text_delivered"].as_bool().unwrap_or(true);
             if !text_delivered {
+                eprintln!("text.delivered.false reason=team.delegate_ack agent={target}");
                 let task_ref = &v["result"]["task"];
                 let instruction = format_task_instruction(
                     sock, team, task_ref, text, no_report, context, fix_budget,
@@ -5548,6 +5678,14 @@ fn run_delegate_result(
                         // team.send succeeded — text was delivered. Update the response.
                         let mut patched = v.clone();
                         patched["result"]["text_delivered"] = json!(true);
+                        text_delivered = true;
+                        let _ = send_return_key_with_retry(
+                            sock,
+                            team,
+                            target,
+                            text_delivered,
+                            "team.delegate.retry",
+                        );
                         return Ok(patched);
                     }
                     _ => {
@@ -5561,32 +5699,7 @@ fn run_delegate_result(
             // through the reliable sendNamedKey path (same as surface.send_key RPC).
             // Swift ack-based completion is the primary ordering guarantee;
             // this sleep is a minimal safety margin only.
-            if text_delivered {
-                std::thread::sleep(Duration::from_millis(20));
-
-                // Retry Return delivery up to 5 times with backoff
-                for attempt in 0..5u32 {
-                    match rpc_call(
-                        sock,
-                        "team.send_key",
-                        json!({
-                            "team_name": team,
-                            "agent_name": target,
-                            "key": "return",
-                        }),
-                    ) {
-                        Ok(r) if r["ok"].as_bool().unwrap_or(false) => break,
-                        Ok(_) | Err(_) => {
-                            if attempt < 4 {
-                                let delay = Duration::from_millis(200 * (attempt as u64 + 1));
-                                std::thread::sleep(delay);
-                            } else {
-                                eprintln!("  Warning: Return key delivery failed after 5 retries");
-                            }
-                        }
-                    }
-                }
-            }
+            let _ = send_return_key_with_retry(sock, team, target, text_delivered, "team.delegate");
 
             return Ok(v);
         }
@@ -5892,7 +6005,6 @@ fn run_delegate_autonomous(
     let target_str = target.to_string();
     let task_id_clone = task_id.clone();
     let stdout_path_clone = stdout_file_path.clone();
-    let results_dir_clone = results_dir.clone();
 
     let handle = std::thread::spawn(move || {
         // Wait for the claude subprocess to finish
@@ -5906,10 +6018,12 @@ fn run_delegate_autonomous(
         // Copy stdout file to result files
         let stdout_content = std::fs::read_to_string(&stdout_path_clone).unwrap_or_default();
         if !stdout_content.trim().is_empty() {
-            let task_result_path = format!("{}/{}.md", results_dir_clone, task_id_clone);
-            let agent_reply_path = format!("{}/{}-reply.md", results_dir_clone, target_str);
-            let _ = std::fs::write(&task_result_path, &stdout_content);
-            let _ = std::fs::write(&agent_reply_path, &stdout_content);
+            let _ = write_result_file(&team_str, &format!("{task_id_clone}.md"), &stdout_content);
+            let _ = write_result_file(
+                &team_str,
+                &format!("{target_str}-reply.md"),
+                &stdout_content,
+            );
         }
         let _ = std::fs::remove_file(&stdout_path_clone);
 

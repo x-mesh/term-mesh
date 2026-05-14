@@ -5,9 +5,11 @@
 )]
 
 mod agent;
+mod codex_tokens;
 mod headless;
 mod http;
 mod monitor;
+mod pane_tracker;
 mod peer;
 mod socket;
 mod tokens;

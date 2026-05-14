@@ -1389,7 +1389,19 @@ class TeamTemplateManager: ObservableObject {
         if needsSeedOrMigration {
             save()
         }
+        pruneAbandonedBlanks()
         rebuildTemplates()
+    }
+
+    // Silently remove blank user-created presets (no agents, no description, no parent) left from aborted adds.
+    private func pruneAbandonedBlanks() {
+        let before = store.customs.count
+        store.customs.removeAll { template in
+            guard template.origin == .custom, template.parentBuiltInId == nil,
+                  case .smart(let p) = template.payload else { return false }
+            return p.agents.isEmpty && p.description.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        }
+        if store.customs.count != before { save() }
     }
 
     func template(for id: TemplateID) -> TeamTemplate? {
@@ -1481,6 +1493,34 @@ class TeamTemplateManager: ObservableObject {
             candidate = "\(base) (my copy \(candidateIndex))"
         }
         return candidate
+    }
+
+    @discardableResult
+    func createBlankSmartPreset(name: String) -> TemplateID {
+        let displayName = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        let customId = TemplateID(
+            category: .smart,
+            slug: nextAvailableSlug(category: .smart, base: displayName.isEmpty ? "new-preset" : displayName)
+        )
+        let blank = SmartTeamPreset(
+            id: customId.slug,
+            name: displayName,
+            icon: "person.3",
+            description: "",
+            leaderMode: "claude",
+            agents: []
+        )
+        let custom = TeamTemplate(
+            id: customId,
+            origin: .custom,
+            name: displayName,
+            payload: .smart(blank)
+        )
+        store.customs.append(custom)
+        store.lastSelectedId = customId
+        save()
+        rebuildTemplates()
+        return customId
     }
 
     func deleteCustom(id: TemplateID) throws {

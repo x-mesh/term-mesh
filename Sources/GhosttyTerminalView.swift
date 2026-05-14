@@ -927,6 +927,9 @@ final class TerminalSurface: Identifiable, ObservableObject {
     }
 
     func setFocus(_ focused: Bool) {
+#if DEBUG
+        dlog("surface.setFocus paused=\(renderingPaused) focused=\(focused)")
+#endif
         // If rendering is paused (agent pane suppressed), block re-focus attempts.
         // This prevents CVDisplayLink from restarting when panel.focus() or
         // becomeFirstResponder triggers setFocus(true) after pause.
@@ -1185,6 +1188,7 @@ final class TerminalSurface: Identifiable, ObservableObject {
     }
 
     private func startPasteWatchdog(generation: Int,
+                                    instructionLength: Int,
                                     completion: ((Result<Void, PasteSendError>) -> Void)?) {
         pasteWatchdog?.cancel()
         let src = DispatchSource.makeTimerSource(queue: .main)
@@ -1203,6 +1207,7 @@ final class TerminalSurface: Identifiable, ObservableObject {
             completion?(.failure(.returnRetryExhausted))
             self.drainPasteQueue()
             #if DEBUG
+            dlog("paste.watchdog.fire surface=\(self.id.uuidString.prefix(8)) instruction_len=\(instructionLength)")
             dlog("[paste.watchdog] 8s timeout forced surface=\(self.id.uuidString.prefix(8))")
             #endif
         }
@@ -1227,7 +1232,7 @@ final class TerminalSurface: Identifiable, ObservableObject {
         pasteInFlight = true
         pasteGeneration &+= 1
         let gen = pasteGeneration
-        startPasteWatchdog(generation: gen, completion: p.completion)
+        startPasteWatchdog(generation: gen, instructionLength: p.text.count, completion: p.completion)
 
         if !p.text.isEmpty {
             let data = p.text.utf8
@@ -2403,9 +2408,17 @@ func pushTargetSurfaceSize(_ size: CGSize) {
         // ESC (keyCode 53) is never a composing event — it *cancels* composition.
         // Marking it composing causes Ghostty to suppress the 0x1B byte, which
         // breaks vim normal-mode switching over SSH even when no IME box is open.
-        let isEscape = event.keyCode == 53 // kVK_Escape
-        keyEvent.composing = !isEscape && (markedText.length > 0 || markedTextBefore)
+        let accumulatedTextIsEmpty = keyTextAccumulator == nil || keyTextAccumulator!.isEmpty
+        keyEvent.composing = GhosttyNSView.computeComposingFlag(
+            keyCode: event.keyCode,
+            markedTextBefore: markedTextBefore,
+            hasMarkedTextAfter: markedText.length > 0,
+            accumulatedTextIsEmpty: accumulatedTextIsEmpty
+        )
         #if DEBUG
+        if event.keyCode == 36 && markedTextBefore && markedText.length == 0 && accumulatedTextIsEmpty {
+            dlog("key.return.clearingIME markedTextBefore=true accumulator=empty → composing=false")
+        }
         if event.keyCode == 36 && (markedTextBefore || markedText.length > 0) {
             dlog("ime.return_with_markedText markedTextBefore=\(markedTextBefore) hasMarkedText=\(markedText.length > 0) composing=\(keyEvent.composing) surface=\(terminalSurface?.id.uuidString.prefix(5) ?? "nil")")
         }
@@ -2565,6 +2578,40 @@ func pushTargetSurfaceSize(_ size: CGSize) {
     private func shouldSendText(_ text: String) -> Bool {
         guard let first = text.utf8.first else { return false }
         return first >= 0x20
+    }
+
+    /// Decide whether a key event should be flagged as composing (= part of an
+    /// active IME composition) when handed to Ghostty.
+    ///
+    /// Ghostty key_encode.zig early-returns on composing=true (suppressing the
+    /// byte), so this decision is the single point that prevents Enter/Tab/Esc
+    /// swallow when an IME ends composition without committing text.
+    ///
+    /// Pure function — no AppKit / Ghostty side effects. Trivially unit-testable.
+    ///
+    /// Decision matrix:
+    /// | keyCode | markedTextBefore | hasMarkedTextAfter | accumulatedTextIsEmpty | result |
+    /// |---------|------------------|--------------------|------------------------|--------|
+    /// | 53 (Esc)| any              | any                | any                    | false  |
+    /// | 36 (Ret)| true             | false              | true                   | false  |
+    /// | any     | true or false    | true               | any                    | true   |
+    /// | any     | true             | false              | any                    | true   |
+    /// | any     | false            | false              | any                    | false  |
+    static func computeComposingFlag(
+        keyCode: UInt16,
+        markedTextBefore: Bool,
+        hasMarkedTextAfter: Bool,
+        accumulatedTextIsEmpty: Bool
+    ) -> Bool {
+        // ESC cancels composition — never composing.
+        guard keyCode != 53 else { return false }
+        // Return that clears composition without committing text is not composing:
+        // accumulator empty means no text was sent via insertText, so Ghostty must
+        // receive the physical "\r" or the Enter is permanently swallowed.
+        if keyCode == 36 && markedTextBefore && !hasMarkedTextAfter && accumulatedTextIsEmpty {
+            return false
+        }
+        return markedTextBefore || hasMarkedTextAfter
     }
 
     static func shouldReplayPhysicalKeyAfterAccumulatedText(
@@ -2926,6 +2973,10 @@ func pushTargetSurfaceSize(_ size: CGSize) {
     }
 
     private func windowDidChangeScreen(_ notification: Notification) {
+#if DEBUG
+        let dispID = (notification.object as? NSWindow)?.screen?.displayID ?? 0
+        dlog("surface.didChangeScreen displayID=\(dispID)")
+#endif
         guard let window else { return }
         guard let object = notification.object as? NSWindow, window == object else { return }
         guard let screen = window.screen else { return }

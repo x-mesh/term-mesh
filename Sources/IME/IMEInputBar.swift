@@ -1,5 +1,36 @@
 import SwiftUI
 
+struct IMEAgentMention: Identifiable, Equatable {
+    let mention: String
+    let title: String
+    let subtitle: String
+    let isBroadcast: Bool
+
+    var id: String { mention }
+}
+
+private enum IMEAgentRouteMode: Equatable {
+    case message
+    case task
+    case ping
+
+    var label: String {
+        switch self {
+        case .message: return "msg"
+        case .task: return "task"
+        case .ping: return "ping"
+        }
+    }
+
+    func color(isDark: Bool) -> Color {
+        switch self {
+        case .message: return Color.cyan.opacity(isDark ? 0.9 : 0.78)
+        case .task: return Color.indigo.opacity(isDark ? 0.9 : 0.75)
+        case .ping: return Color.green.opacity(isDark ? 0.85 : 0.74)
+        }
+    }
+}
+
 /// A bottom-docked input bar for CJK IME composition.
 ///
 /// Raw-mode TUI apps (ink/Claude Code) break IME preedit rendering because
@@ -21,10 +52,16 @@ struct IMEInputBar: View {
     var onCtrlC: (() -> Void)? = nil
     /// Stop all team agents — sends Ctrl+C to every agent panel.
     var onStopAllAgents: (() -> Void)? = nil
+    /// Available team targets for @mention routing.
+    var agentMentions: [IMEAgentMention] = []
+    /// Route the current text through the leader for an @mention target. The mention is passed without "@".
+    var onAgentMentionSend: ((_ mention: String, _ text: String) -> Bool)? = nil
     /// Send a raw key event (keycode + modifier flags) to the terminal surface.
     var onSendKey: ((_ keycode: UInt16, _ mods: UInt32) -> Void)? = nil
     /// Terminal working directory — used to discover project-local slash commands.
     var workingDirectory: String? = nil
+    /// Slash aliases expanded just before submit, e.g. /tm -> read .codex/prompts/tm.md.
+    var slashCommandAliases: [String: String] = [:]
 
     @State private var text: String = ""
     @State private var history: [String] = IMEHistory.load()   // Q4: fast sync init; merged async in .task
@@ -41,6 +78,9 @@ struct IMEInputBar: View {
     // Slash command picker state
     @State private var showSlashPicker: Bool = false
     @State private var slashPickerSelection: Int = 0
+    // Agent @mention picker state
+    @State private var showAgentPicker: Bool = false
+    @State private var agentPickerSelection: Int = 0
     @Environment(\.colorScheme) private var colorScheme
     @FocusState private var isFieldFocused: Bool
 
@@ -56,6 +96,48 @@ struct IMEInputBar: View {
         case .success: return Color(red: 0.55, green: 0.45, blue: 0.95)
         case .failure: return .red
         }
+    }
+
+    private var activeAgentTarget: IMEAgentMention? {
+        guard text.hasPrefix("@") else { return nil }
+        let token = text
+            .dropFirst()
+            .split(whereSeparator: \.isWhitespace)
+            .first
+            .map(String.init)?
+            .lowercased()
+        guard let token, !token.isEmpty else { return nil }
+        if token == "team" {
+            return IMEAgentMention(
+                mention: "team",
+                title: "@team",
+                subtitle: "Route to all agents",
+                isBroadcast: true
+            )
+        }
+        return agentMentions.first { $0.mention.lowercased() == token }
+    }
+
+    private var activeAgentMode: IMEAgentRouteMode? {
+        guard activeAgentTarget != nil,
+              let route = agentRoute(for: text) else {
+            return activeAgentTarget == nil ? nil : .message
+        }
+        return classifyAgentRouteMode(route.message)
+    }
+
+    private var activeAgentBorderColor: Color {
+        guard let mode = activeAgentMode else { return .clear }
+        return mode.color(isDark: isDark)
+    }
+
+    private var effectiveBorderColor: Color {
+        feedbackState == .none ? activeAgentBorderColor : feedbackColor
+    }
+
+    private var effectiveBorderWidth: CGFloat {
+        if feedbackState != .none { return 2 }
+        return activeAgentTarget == nil ? 0 : 1.5
     }
 
     // MARK: - M1: Fuzzy history matching
@@ -105,15 +187,100 @@ struct IMEInputBar: View {
     private var filteredSlashCommands: [SlashCommand] {
         guard showSlashPicker else { return [] }
         let query = text.lowercased()
+        let commands = mergedSlashCommands
         if query == "/" {
-            return Array(slashCommands.prefix(15))
+            return Array(commands.prefix(15))
         }
-        return Array(slashCommands
+        return Array(commands
             .filter { $0.name.lowercased().hasPrefix(query) }
             .prefix(15))
     }
 
+    private var mergedSlashCommands: [SlashCommand] {
+        guard !slashCommandAliases.isEmpty else { return slashCommands }
+        var seen = Set<String>()
+        var merged: [SlashCommand] = []
+        for alias in slashCommandAliases.keys.sorted() {
+            if seen.insert(alias).inserted {
+                merged.append(SlashCommand(name: alias, desc: "Codex prompt alias"))
+            }
+        }
+        for command in slashCommands where seen.insert(command.name).inserted {
+            merged.append(command)
+        }
+        return merged.sorted { $0.name < $1.name }
+    }
+
+    private var filteredAgentMentions: [IMEAgentMention] {
+        guard showAgentPicker else { return [] }
+        let query = String(text.dropFirst()).lowercased()
+        if query.isEmpty {
+            return Array(agentMentions.prefix(15))
+        }
+        return Array(agentMentions
+            .filter {
+                $0.mention.lowercased().hasPrefix(query)
+                    || $0.title.lowercased().hasPrefix("@\(query)")
+            }
+            .prefix(15))
+    }
+
     // MARK: - Actions
+
+    private func agentRoute(for raw: String) -> (mention: String, message: String)? {
+        guard raw.hasPrefix("@") else { return nil }
+        let separators = CharacterSet.whitespacesAndNewlines
+        guard let split = raw.rangeOfCharacter(from: separators) else { return nil }
+        let token = String(raw[..<split.lowerBound]).dropFirst().lowercased()
+        guard !token.isEmpty else { return nil }
+        let message = String(raw[split.upperBound...]).trimmingCharacters(in: separators)
+        guard !message.isEmpty else { return nil }
+
+        let knownMentions = Set(agentMentions.map { $0.mention.lowercased() } + ["team"])
+        guard knownMentions.contains(String(token)) else { return nil }
+        return (String(token), message)
+    }
+
+    private func classifyAgentRouteMode(_ raw: String) -> IMEAgentRouteMode {
+        let value = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        let lower = value.lowercased()
+        if lower.hasPrefix("task ") || lower.hasPrefix("delegate ") ||
+            lower.hasPrefix("작업 ") || lower.hasPrefix("일감 ") ||
+            value.hasPrefix(":") {
+            return .task
+        }
+        if lower == "ping" || lower.contains("ping") || lower.contains("pong") ||
+            lower.contains("핑") || lower.contains("퐁") {
+            return .ping
+        }
+        return .message
+    }
+
+    private func submitText(_ submitted: String) -> Bool {
+        let expanded = expandSlashAlias(in: submitted)
+        if let route = agentRoute(for: expanded), let onAgentMentionSend {
+            return onAgentMentionSend(route.mention, route.message)
+        }
+        return onSubmit(expanded)
+    }
+
+    private func expandSlashAlias(in submitted: String) -> String {
+        guard submitted.hasPrefix("/") else { return submitted }
+        let separators = CharacterSet.whitespacesAndNewlines
+        let tokenEnd = submitted.rangeOfCharacter(from: separators)?.lowerBound ?? submitted.endIndex
+        let token = String(submitted[..<tokenEnd])
+        guard let promptFile = slashCommandAliases[token] else { return submitted }
+        let args = String(submitted[tokenEnd...])
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return """
+        TERM-MESH CODEX PROMPT REQUEST
+        PROMPT_FILE: \(promptFile)
+        ARGUMENTS:
+        \(args)
+
+        Read PROMPT_FILE, treat ARGUMENTS as that prompt's $ARGUMENTS, and execute the prompt's workflow. This is a user-facing shortcut for \(token); do not try to run \(token) or /prompts:* as a Codex slash command.
+        """
+    }
 
     private func doSubmit() {
         if text.isEmpty {
@@ -122,7 +289,7 @@ struct IMEInputBar: View {
             return
         }
         let submitted = text
-        let success = onSubmit(submitted)
+        let success = submitText(submitted)
         if success {
             addToHistory(submitted)  // Bug fix: record only on success
             text = ""
@@ -140,7 +307,7 @@ struct IMEInputBar: View {
     private func doSubmitAndClose() {
         if !text.isEmpty {
             let submitted = text
-            let success = onSubmit(submitted)
+            let success = submitText(submitted)
             if success {
                 addToHistory(submitted)  // Bug fix: record only on success
                 text = ""
@@ -204,6 +371,12 @@ struct IMEInputBar: View {
 
     var body: some View {
         VStack(spacing: 0) {
+            // Agent @mention picker (above input row, expands upward into available space)
+            if showAgentPicker && !filteredAgentMentions.isEmpty {
+                agentMentionPickerView
+                    .transition(.opacity.combined(with: .move(edge: .top)))
+            }
+
             // Slash command picker (above input row, expands upward into available space)
             if showSlashPicker && !filteredSlashCommands.isEmpty {
                 slashCommandPickerView
@@ -266,6 +439,22 @@ struct IMEInputBar: View {
                     onSlashPickerCancel: {
                         showSlashPicker = false
                         slashPickerSelection = 0
+                    },
+                    isAgentPickerOpen: showAgentPicker,
+                    onAgentPickerMove: { delta in
+                        let count = filteredAgentMentions.count
+                        guard count > 0 else { return }
+                        agentPickerSelection = (agentPickerSelection + delta + count) % count
+                    },
+                    onAgentPickerConfirm: {
+                        guard agentPickerSelection < filteredAgentMentions.count else { return }
+                        text = "@\(filteredAgentMentions[agentPickerSelection].mention) "
+                        showAgentPicker = false
+                        agentPickerSelection = 0
+                    },
+                    onAgentPickerCancel: {
+                        showAgentPicker = false
+                        agentPickerSelection = 0
                     }
                 )
                 .focused($isFieldFocused)
@@ -291,6 +480,13 @@ struct IMEInputBar: View {
 
                 // Status indicators (right-aligned)
                 HStack(spacing: 8) {
+                    if let target = activeAgentTarget, let mode = activeAgentMode {
+                        Text("leader \(mode.label) → @\(target.mention)")
+                            .font(.system(size: 10, weight: .semibold, design: .monospaced))
+                            .foregroundColor(mode.color(isDark: isDark))
+                            .lineLimit(1)
+                    }
+
                     // Q3: multiline line count
                     let lineCount = text.components(separatedBy: "\n").count
                     if lineCount >= 2 {
@@ -321,8 +517,9 @@ struct IMEInputBar: View {
         // Q1: send feedback border overlay
         .overlay(
             RoundedRectangle(cornerRadius: 6)
-                .stroke(feedbackColor, lineWidth: feedbackState == .none ? 0 : 2)
+                .stroke(effectiveBorderColor, lineWidth: effectiveBorderWidth)
                 .animation(.easeInOut(duration: 0.15), value: feedbackState)
+                .animation(.easeInOut(duration: 0.12), value: activeAgentTarget?.mention)
         )
         // M1: fuzzy history picker popover (appears above the bar)
         .popover(isPresented: $showHistoryPicker, arrowEdge: .bottom) {
@@ -347,10 +544,30 @@ struct IMEInputBar: View {
         // M1: reset picker selection when text changes; auto-open slash picker
         .onChange(of: text) { _ in
             if showHistoryPicker { historyPickerSelection = 0 }
+            if showAgentPicker { agentPickerSelection = 0 }
+
+            let isAgentQuery = !isComposing
+                && text.hasPrefix("@")
+                && !text.contains(" ")
+                && !text.contains("\n")
+                && !agentMentions.isEmpty
+            if isAgentQuery && !showAgentPicker {
+                showAgentPicker = true
+                showSlashPicker = false
+                showHistoryPicker = false
+                agentPickerSelection = 0
+            } else if !isAgentQuery && showAgentPicker {
+                showAgentPicker = false
+                agentPickerSelection = 0
+            } else if showAgentPicker {
+                agentPickerSelection = 0
+            }
+
             // Auto-trigger slash picker when text is a bare slash command prefix
-            let isSlashQuery = text.hasPrefix("/") && !text.contains(" ") && !text.contains("\n")
+            let isSlashQuery = !isComposing && text.hasPrefix("/") && !text.contains(" ") && !text.contains("\n")
             if isSlashQuery && !showSlashPicker {
                 showSlashPicker = true
+                showAgentPicker = false
                 showHistoryPicker = false
                 slashPickerSelection = 0
             } else if !isSlashQuery && showSlashPicker {
@@ -439,6 +656,9 @@ struct IMEInputBar: View {
                 hintLabel("⇧⏎ newline")
                 hintLabel("Tab →term")
                 hintLabel("⇧Tab accept")
+                if !agentMentions.isEmpty {
+                    hintLabel("@ agent")
+                }
                 hintLabel("Esc →term")
                 hintLabel("⌃U clear")
                 hintLabel("⌃C interrupt")
@@ -524,6 +744,70 @@ struct IMEInputBar: View {
             }
         }
         .frame(width: 420)
+    }
+
+    // MARK: - Agent @mention picker content
+
+    private var agentMentionPickerView: some View {
+        VStack(spacing: 0) {
+            Divider()
+
+            HStack {
+                Text("Agents")
+                    .font(.system(size: 10, weight: .semibold))
+                    .foregroundColor(.secondary)
+                Spacer()
+                Text("↑↓ nav · Tab/⏎ select · Esc close")
+                    .font(.system(size: 9))
+                    .foregroundColor(.secondary.opacity(0.6))
+            }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 3)
+
+            ScrollViewReader { proxy in
+                ScrollView(.vertical, showsIndicators: false) {
+                    VStack(spacing: 1) {
+                        ForEach(Array(filteredAgentMentions.enumerated()), id: \.offset) { i, target in
+                            Button(action: {
+                                text = "@\(target.mention) "
+                                showAgentPicker = false
+                                agentPickerSelection = 0
+                            }) {
+                                HStack(spacing: 8) {
+                                    Text("@\(target.mention)")
+                                        .font(.system(size: 11, weight: .medium, design: .monospaced))
+                                        .foregroundColor(i == agentPickerSelection ? .white : .primary)
+                                        .lineLimit(1)
+                                        .frame(minWidth: 130, minHeight: 16, alignment: .leading)
+                                    Text(target.subtitle)
+                                        .font(.system(size: 10))
+                                        .foregroundColor(i == agentPickerSelection ? .white.opacity(0.75) : .secondary)
+                                        .lineLimit(1)
+                                    Spacer()
+                                }
+                                .padding(.horizontal, 10)
+                                .frame(minHeight: 26, alignment: .center)
+                                .background(
+                                    i == agentPickerSelection
+                                        ? Color.indigo.opacity(0.65)
+                                        : Color.clear
+                                )
+                                .cornerRadius(3)
+                            }
+                            .buttonStyle(.plain)
+                            .id(i)
+                        }
+                    }
+                    .padding(.horizontal, 4)
+                    .padding(.vertical, 1)
+                }
+                .frame(maxHeight: 180)
+                .onChange(of: agentPickerSelection) { newVal in
+                    withAnimation(.easeOut(duration: 0.1)) { proxy.scrollTo(newVal, anchor: .center) }
+                }
+            }
+        }
+        .frame(maxWidth: .infinity)
     }
 
     // MARK: - Slash command picker popover content

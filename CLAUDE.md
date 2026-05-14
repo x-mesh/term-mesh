@@ -195,7 +195,8 @@ a socket exists at `/tmp/term-mesh*.sock` or `/tmp/term-mesh.sock`), ALL team op
 **Banned tools in term-mesh context:** `TeamCreate`, `SendMessage`, `TaskCreate`, `TaskList`,
 `TaskGet`, `TaskUpdate`, `TeamDelete`. These create a parallel, disconnected team state.
 
-**Use instead:** The project-local `/team` command (`.claude/commands/team.md`), which routes
+**Use instead:** The project-local `/team` command (`.claude/commands/team.md`) for Claude leaders,
+or the Codex IME `/team` alias backed by `.codex/prompts/team.md` for Codex leaders. Both route
 everything through `tm-agent`.
 
 ### OMC keyword override
@@ -204,12 +205,80 @@ If OMC's keyword detector fires `[MODE: TEAM]` or `[MAGIC KEYWORD: TEAM]`:
 1. **Do NOT invoke `/oh-my-claudecode:team`** — it uses Claude Code native teams
 2. **Instead invoke `/team`** (the project-local command) or use `tm-agent` directly
 
+### Codex leader prompt shims
+
+Codex does not use Claude's `.claude/commands` slash-command format, and current Codex TUI builds
+do not accept `/prompts:<name>` as an interactive slash command. Project-local Codex prompt shims
+live under `.codex/prompts/`.
+
+In the term-mesh IME box, Codex panes get short aliases that expand on submit into a normal Codex
+message: "read `.codex/prompts/<name>.md` and execute it with these arguments." Claude panes keep
+the original Claude slash commands.
+
+| Claude leader | Codex leader | Purpose |
+|---------------|--------------|---------|
+| `/team ...` | `/team ...` via IME alias | Low-level `tm-agent` primitive wrapper |
+| `/team-up ...` | `/team-up ...` via IME alias | Create a team with the current pane adopted as leader |
+| `/tm "..."` | `/tm "..."` via IME alias | One-shot fan-out to all idle agents + synthesis |
+| `/tm-op ...` | `/tm-op ...` via IME alias | Strategy orchestration |
+
+For Codex as the current leader, prefer:
+
+```bash
+tm-agent create 3 --adopt
+tm-agent attach reviewer --cli codex
+```
+
+Use `--claude-leader` only when creating a Claude Code leader pane.
+
+### XM skill agent fan-out routing
+
+xm 스킬(`/xm:build`, `/xm:solver`, `/xm:op`, `/xm:agent` 등)의 SKILL.md가 *Claude Code native Agent tool*을 통한 fan-out을 지시하는 경우(예: x-build research의 4-perspective spawn, x-solver iterate test phase 가설별 spawn), term-mesh 컨텍스트(`TERMMESH_SOCKET` env 또는 `/tmp/term-mesh*.sock` 존재)에서는 **반드시 `tm-agent delegate` × N로 자동 치환**한다.
+
+이유: xm 스킬은 Claude Code native multi-agent를 가정하지만 term-mesh의 OMC override는 native Agent tool 사용 금지. 한 메시지에 모든 delegate를 발사해 진짜 병렬 확보.
+
+#### Substitution rules
+
+| xm 스킬 지시 | term-mesh 대치 |
+|------------|---------------|
+| "Spawn N Agent tools in parallel" (Research/Plan-check/Test) | 단일 Bash 메시지에서 `tm-agent delegate <agent> "$INSTR" &` × N + `wait` |
+| "Spawn one Agent tool per perspective" (4 perspectives 등) | idle agent 중 4–6에 1 INSTR 동시 발사. agent role lens가 perspective 역할 자연 수행 |
+| `model: "sonnet"` (Agent tool 옵션) | 무시 — 각 agent의 model은 `tm-agent create` 시 결정됨 |
+| "fan-out", "broadcast", "swarm" 원시 | `/tm "<instruction>"` 또는 `tm-agent delegate` × N (broadcast는 claude-CLI 전용; mixed CLI는 delegate) |
+
+#### 4-perspective → role mapping (xm:build research용)
+
+xm:build research 표준 4 perspectives의 role 매핑:
+
+| xm perspective | 권장 agent role |
+|---------------|----------------|
+| stack | reviewer |
+| features | frontend |
+| architecture | architect |
+| pitfalls | security |
+
+여분의 idle agents(tester / refactorer 등)는 보너스 관점으로 추가 동원해도 됨 — 정보량 +50%, 비용 ~0(단일 Bash 메시지).
+
+#### 결과 합성
+
+xm 스킬은 일반적으로 raw agent output을 직접 보여줄 것을 요구. /tm은 3-line synthesis 강제. **둘 다 한다**:
+1. `tm-agent collect --headers` → STATUS/NEXT 표 출력
+2. `[결론][충돌][다음]` 3줄 synthesis 출력
+3. 각 agent의 task_id.md path를 `xm build save research-notes --agent <name>` 등 xm 스킬 cli에 저장
+
+이 패턴은 `/tm` Workflow Step 4와 같음. xm 스킬의 phase 통과 검증 (`gate pass`, `phase next`)은 정상 진행.
+
+#### Bypass (드물게 native가 더 적합한 경우)
+
+native Agent tool이 더 적합한 경우(예: 단일 isolated investigation, 외부 worktree 격리 필요)는 위 규칙 미적용. 이 경우 CLAUDE.md의 "DELEGATE-FIRST PRINCIPLE" 자체는 여전히 유효하며, `tm-agent` 외 다른 본인 도구 사용 가능.
+
 ### Quick CLI reference
 
 **All operations** use `tm-agent` (Rust, ~2ms; fallback `./scripts/tm-agent.sh` ~10ms):
 ```bash
 # Team lifecycle
 tm-agent create [N] [--claude-leader]          # creates a new workspace with agents
+tm-agent create [N] --adopt                    # adopt current pane as leader (Codex/Claude/Kiro/Gemini)
 tm-agent destroy
 tm-agent status
 tm-agent list
@@ -240,7 +309,7 @@ tm-agent read <agent> --lines 100
 tm-agent collect --lines 100
 tm-agent collect --headers                    # header-only result collection for token-efficient synthesis
 tm-agent reports --summary                    # headers + concise summaries, full files lazy-read via FULL_REPORT
-tm-agent wait --timeout 120 --mode any
+tm-agent wait --timeout 120 --mode any        # ALWAYS use this to wait; NEVER use `sleep N && tm-agent read`
 tm-agent brief <agent>
 
 # Parallel delegation pattern — round-robin routing (active since d69c9d0c)

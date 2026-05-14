@@ -2155,38 +2155,7 @@ final class QuitWarningSettingsTests: XCTestCase {
     }
 }
 
-final class UpdateChannelSettingsTests: XCTestCase {
-    func testResolvedFeedFallsBackWhenInfoFeedMissing() {
-        let resolved = UpdateFeedResolver.resolvedFeedURLString(infoFeedURL: nil)
-        XCTAssertEqual(resolved.url, UpdateFeedResolver.fallbackFeedURL)
-        XCTAssertFalse(resolved.isNightly)
-        XCTAssertTrue(resolved.usedFallback)
-    }
-
-    func testResolvedFeedFallsBackWhenInfoFeedEmpty() {
-        let resolved = UpdateFeedResolver.resolvedFeedURLString(infoFeedURL: "")
-        XCTAssertEqual(resolved.url, UpdateFeedResolver.fallbackFeedURL)
-        XCTAssertFalse(resolved.isNightly)
-        XCTAssertTrue(resolved.usedFallback)
-    }
-
-    func testResolvedFeedUsesInfoFeedForStableChannel() {
-        let infoFeed = "https://example.com/custom/appcast.xml"
-        let resolved = UpdateFeedResolver.resolvedFeedURLString(infoFeedURL: infoFeed)
-        XCTAssertEqual(resolved.url, infoFeed)
-        XCTAssertFalse(resolved.isNightly)
-        XCTAssertFalse(resolved.usedFallback)
-    }
-
-    func testResolvedFeedDetectsNightlyFromInfoFeedURL() {
-        let resolved = UpdateFeedResolver.resolvedFeedURLString(
-            infoFeedURL: "https://example.com/nightly/appcast.xml"
-        )
-        XCTAssertEqual(resolved.url, "https://example.com/nightly/appcast.xml")
-        XCTAssertTrue(resolved.isNightly)
-        XCTAssertFalse(resolved.usedFallback)
-    }
-}
+// UpdateChannelSettingsTests removed — UpdateFeedResolver was deleted with Sparkle (8c666a29).
 
 final class WorkspaceReorderTests: XCTestCase {
     @MainActor
