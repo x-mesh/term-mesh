@@ -725,7 +725,20 @@ impl AgentSessionManager {
                             return None;
                         }
                     };
-                    let pgid = session.tracked_pgids.get(&pid).copied().flatten();
+                    let pgid = session
+                        .tracked_pgids
+                        .get(&pid)
+                        .copied()
+                        .flatten()
+                        .or_else(|| match resolve_pgid(pid) {
+                            Ok(pgid) => pgid,
+                            Err(e) => {
+                                tracing::warn!(
+                                    "failed to resolve pgid for pid {pid} during terminate: {e}; falling back to pid kill"
+                                );
+                                None
+                            }
+                        });
                     let pgid_i32 = match pgid {
                         Some(pgid) => match validated_pid(pgid) {
                             Ok(pgid_i32) => Some(pgid_i32),
@@ -839,7 +852,10 @@ impl AgentSessionManager {
 
     /// Register an additional PID for a session.
     pub fn add_pid(&self, session_id: &str, pid: u32) -> Result<(), String> {
-        validated_pid(pid)?;
+        if let Err(e) = validated_pid(pid) {
+            tracing::warn!("reject agent pid registration for session {session_id}: {e}");
+            return Err(e);
+        }
         let pgid = resolve_pgid(pid)?;
 
         let mut inner = self.inner.lock().unwrap();
