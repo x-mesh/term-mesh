@@ -3430,7 +3430,12 @@ final class TeamOrchestrator: ObservableObject {
     /// `--resume <leaderSessionId>` and each agent's `parentSessionId`
     /// (captured by the sidebar token-tracking infrastructure in 0.115.0) are
     /// sufficient to bring the team back via `team.resume_pane`.
-    private func archivePaneTeamIfApplicable(_ team: Team) {
+    ///
+    /// - Parameter synchronous: when true (used by `applicationWillTerminate`),
+    ///   the RPC runs inline on the caller's queue so the archive write
+    ///   completes before the daemon is stopped. The normal destroy path
+    ///   defaults to false so the UI doesn't block on disk I/O.
+    private func archivePaneTeamIfApplicable(_ team: Team, synchronous: Bool = false) {
         // Headless teams have a daemon-side teamUuid and are archived by
         // `headless.destroy_team`. Pane-mode teams have teamUuid == nil at
         // this point.
@@ -3476,7 +3481,7 @@ final class TeamOrchestrator: ObservableObject {
             payload["worktree_branch"] = wtBranch
         }
 
-        DispatchQueue.global(qos: .utility).async {
+        let work = {
             let raw = TermMeshDaemon.shared.rpcCallRaw(
                 method: "team.archive_pane",
                 params: payload
@@ -3492,6 +3497,26 @@ final class TeamOrchestrator: ObservableObject {
             } else {
                 Logger.team.warning("[archive_pane] daemon did not respond")
             }
+        }
+        if synchronous {
+            work()
+        } else {
+            DispatchQueue.global(qos: .utility).async(execute: work)
+        }
+    }
+
+    /// Phase 2 (pane-mode resume): archive every live pane-mode team
+    /// synchronously. Called from `applicationWillTerminate` so a plain Cmd+Q
+    /// also leaves resumable archives on disk — users shouldn't have to
+    /// explicitly destroy a team just to see it in the resume picker later.
+    /// Runs each archive RPC inline on the calling queue (the main thread
+    /// during termination) so the writes finish before the daemon is stopped.
+    func archiveAllLivePaneTeamsForQuit() {
+        let live = teams.values.filter { $0.teamUuid == nil }
+        if live.isEmpty { return }
+        Logger.team.info("[archive_pane] quit: archiving \(live.count) live pane team(s)")
+        for team in live {
+            archivePaneTeamIfApplicable(team, synchronous: true)
         }
     }
 
