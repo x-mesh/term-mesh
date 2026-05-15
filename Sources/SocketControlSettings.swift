@@ -435,3 +435,49 @@ struct SocketControlSettings {
         return .allowAll
     }
 }
+
+// MARK: - Socket health
+
+/// Health of the app's Unix control socket listener (`/tmp/term-mesh.sock`).
+///
+/// The socket can be in three observable states. `halfDead` is the failure mode
+/// behind the "Connection refused while the app is running" incident: the
+/// `serverSocket` fd is still held but `acceptLoop()` has exited, so no incoming
+/// connection is ever serviced.
+enum SocketHealth: Equatable {
+    /// Listening and the accept loop is servicing connections.
+    case healthy
+    /// Socket fd is held but the accept loop has died — needs recovery.
+    case halfDead
+    /// Not listening (stopped or never started).
+    case stopped
+
+    var shortLabel: String {
+        switch self {
+        case .healthy: return "Socket OK"
+        case .halfDead: return "Socket stalled"
+        case .stopped: return "Socket off"
+        }
+    }
+}
+
+/// Observable socket-health state for SwiftUI.
+///
+/// Updates are **pushed at transition points only** (end of `start()`, `stop()`,
+/// and the `acceptLoop()` exit path) — there is no polling, per the socket
+/// telemetry threading policy. UI binds to `@Published health` and reacts to
+/// changes; `update(_:)` is a no-op when the value is unchanged.
+@MainActor
+final class SocketStatusModel: ObservableObject {
+    static let shared = SocketStatusModel()
+
+    @Published private(set) var health: SocketHealth = .stopped
+
+    private init() {}
+
+    /// Push a new health value. No-ops when unchanged so SwiftUI doesn't churn.
+    func update(_ newHealth: SocketHealth) {
+        guard health != newHealth else { return }
+        health = newHealth
+    }
+}
