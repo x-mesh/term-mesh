@@ -928,6 +928,8 @@ impl HeadlessManager {
                 cli_path_at_create: spec.cli_path.clone(),
                 parked: false,
                 usage_total: None,
+                extra_args: spec.extra_args.clone(),
+                extra_env: spec.extra_env.clone(),
             };
 
             // Persist instructions (raw bytes) + agent.json before spawn so a
@@ -1207,6 +1209,8 @@ impl HeadlessManager {
                 cli_path_at_create: None,
                 parked: false,
                 usage_total: None,
+                extra_args: Vec::new(),
+                extra_env: std::collections::HashMap::new(),
             };
             meta::write_agent_meta(&agent_meta)?;
         }
@@ -1389,6 +1393,8 @@ impl HeadlessManager {
                 cli_path_at_create: spec.cli_path.clone(),
                 parked: false,
                 usage_total: None,
+                extra_args: spec.extra_args.clone(),
+                extra_env: spec.extra_env.clone(),
             };
             if let Some(ref bytes) = instr_bytes {
                 let _ = meta::write_instructions(&team_uuid, &spec.name, bytes);
@@ -1595,8 +1601,9 @@ impl HeadlessManager {
             resume_claude: agent_meta.cli == "claude",
             // Phase 2.5: carry usage forward through park→unpark.
             preloaded_usage: agent_meta.usage_total.clone(),
-            extra_args: Vec::new(),
-            extra_env: std::collections::HashMap::new(),
+            // Carry CLI profile forward through park→unpark.
+            extra_args: agent_meta.extra_args.clone(),
+            extra_env: agent_meta.extra_env.clone(),
         };
 
         let info = self
@@ -2121,8 +2128,9 @@ impl HeadlessManager {
                 resume_claude: m.cli == "claude",
                 // Phase 2.5: carry usage forward through destroy→resume.
                 preloaded_usage: m.usage_total.clone(),
-                extra_args: Vec::new(),
-                extra_env: std::collections::HashMap::new(),
+                // Carry CLI profile forward through destroy→resume.
+                extra_args: m.extra_args.clone(),
+                extra_env: m.extra_env.clone(),
             };
 
             match self.spawn_internal(internal).await {
@@ -2500,6 +2508,8 @@ mod tests {
             cli_path_at_create: Some("/opt/homebrew/bin/claude".into()),
             parked: false,
             usage_total: None,
+            extra_args: Vec::new(),
+            extra_env: std::collections::HashMap::new(),
         };
         std::fs::write(
             agents_dir.join("explorer.json"),
@@ -2676,6 +2686,8 @@ mod tests {
                 cache_creation_input_tokens: 13000,
                 last_updated_ms: 1715600000_000,
             }),
+            extra_args: Vec::new(),
+            extra_env: std::collections::HashMap::new(),
         };
         let bytes = serde_json::to_vec_pretty(&meta_in).unwrap();
         let meta_out: meta::AgentMeta = serde_json::from_slice(&bytes).unwrap();

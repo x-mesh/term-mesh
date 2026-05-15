@@ -82,6 +82,14 @@ pub struct AgentMeta {
     /// Survives park/unpark and destroy/resume cycles.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub usage_total: Option<UsageTotals>,
+    /// CLI profile: extra arguments appended after the standard args.
+    /// Persisted so park→unpark and destroy→resume preserve the profile.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub extra_args: Vec<String>,
+    /// CLI profile: extra environment variables merged into the subprocess env.
+    /// Persisted so park→unpark and destroy→resume preserve the profile.
+    #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
+    pub extra_env: std::collections::HashMap<String, String>,
 }
 
 /// Phase 2.5: cumulative stream-json `usage` counters for a single agent.

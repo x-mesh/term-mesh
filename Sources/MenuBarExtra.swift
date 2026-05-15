@@ -340,13 +340,13 @@ final class MenuBarExtraController: NSObject, NSMenuDelegate {
                         keyEquivalent: ""
                     )
                     item.target = self
-                    item.state = (profile.id == active?.id) ? .on : .off
+                    item.state = (active?.id == profile.id) ? .on : .off
                     item.representedObject = ProfileMenuItemPayload(profile: profile)
                     profileSubmenu.addItem(item)
                 }
             }
 
-            // TODO: Enable when active agent pane lookup per CLI family is wired up
+            let hasFocusedAgent = focusedAgentPaneInfo(for: cli) != nil
             let applyItem = NSMenuItem(
                 title: "  Apply to Active Pane (Restart)",
                 action: #selector(applyProfileToActivePaneAction(_:)),
@@ -354,11 +354,30 @@ final class MenuBarExtraController: NSObject, NSMenuDelegate {
             )
             applyItem.target = self
             applyItem.representedObject = cli
-            applyItem.isEnabled = false
+            applyItem.isEnabled = hasFocusedAgent
+            if !hasFocusedAgent {
+                applyItem.toolTip = "Focus a \(cli) agent pane to enable"
+            }
             profileSubmenu.addItem(applyItem)
 
             profileSubmenu.addItem(.separator())
         }
+    }
+
+    /// Returns the panel ID and agent info if the currently focused pane belongs to a
+    /// pane-mode agent of the given CLI family.
+    private func focusedAgentPaneInfo(for cli: String) -> (panelId: UUID, teamName: String, agentName: String)? {
+        guard let panelId = AppDelegate.shared?.tabManager?.selectedWorkspace?.focusedPanelId else {
+            return nil
+        }
+        for (teamName, team) in TeamOrchestrator.shared.teams {
+            if let agent = team.agents.first(where: {
+                $0.panelId == panelId && ($0.cli.isEmpty ? "claude" : $0.cli) == cli
+            }) {
+                return (panelId, teamName, agent.name)
+            }
+        }
+        return nil
     }
 
     @objc private func switchProfileAction(_ sender: NSMenuItem) {
@@ -369,11 +388,25 @@ final class MenuBarExtraController: NSObject, NSMenuDelegate {
     }
 
     @objc private func applyProfileToActivePaneAction(_ sender: NSMenuItem) {
-        // TODO: Identify active agent pane for this CLI family, show confirmation alert,
-        // then call TeamOrchestrator.shared.restartAgentPaneHard(panelId:)
+        guard let cli = sender.representedObject as? String,
+              let info = focusedAgentPaneInfo(for: cli) else { return }
+
+        let alert = NSAlert()
+        alert.messageText = "Restart \(info.agentName) with new profile?"
+        alert.informativeText = "The current pane will be terminated and restarted with the active \(cli) profile."
+        alert.alertStyle = .warning
+        alert.addButton(withTitle: "Restart")
+        alert.addButton(withTitle: "Cancel")
+
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+
+        let panelId = info.panelId
         #if DEBUG
-        dlog("[cliProfile.applyToPane] not yet implemented")
+        dlog("[cliProfile.applyToPane] hard-restarting panelId=\(panelId.uuidString.prefix(8)) cli=\(cli)")
         #endif
+        Task { @MainActor in
+            _ = await TeamOrchestrator.shared.restartAgentPaneHard(panelId: panelId)
+        }
     }
 }
 

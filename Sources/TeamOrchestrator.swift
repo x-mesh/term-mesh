@@ -3770,10 +3770,7 @@ final class TeamOrchestrator: ObservableObject {
     }
 
     private func shellQuote(_ s: String) -> String {
-        if s.rangeOfCharacter(from: CharacterSet(charactersIn: " \t\"'\\$`!")) != nil {
-            return "\"" + s.replacingOccurrences(of: "\"", with: "\\\"") + "\""
-        }
-        return s
+        return "'" + s.replacingOccurrences(of: "'", with: "'\\''") + "'"
     }
 
     /// Map short model names (used internally) to kiro-cli model identifiers.

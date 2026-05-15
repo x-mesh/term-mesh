@@ -2901,6 +2901,9 @@ private struct CLIPathRow: View {
             CLIProfileManageSheet(cliKey: cliKey, cliLabel: label)
         }
         .onAppear { refresh() }
+        .onReceive(NotificationCenter.default.publisher(for: .cliActiveProfileChanged)) { _ in
+            refresh()
+        }
     }
 
     private func refresh() {
@@ -3272,7 +3275,7 @@ private struct CLIProfileEditView: View {
         for line in envText.split(separator: "\n") {
             let kv = line.split(separator: "=", maxSplits: 1)
             if kv.count == 2 {
-                profile.env[String(kv[0]).trimmingCharacters(in: .whitespaces)] = String(kv[1])
+                profile.env[String(kv[0]).trimmingCharacters(in: .whitespaces)] = String(kv[1]).trimmingCharacters(in: .whitespaces)
             }
         }
         CliProfileStore.shared.save(profile, for: cliKey)
