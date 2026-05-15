@@ -2,6 +2,15 @@
 
 All notable changes to term-mesh are documented here.
 
+## [0.117.0] - 2026-05-15
+
+### Added
+- **컨트롤 소켓 상태 표시 + 자가 복구** — 타이틀바에 컨트롤 소켓 health를 보여주는 버튼이 추가됨(녹색=정상 / 주황=half-dead / 회색=중단). 앱은 떠 있는데 소켓이 "Connection refused"로 응답하지 않던 half-dead 상태를 감지하면, 버튼 클릭만으로 앱 재시작 없이 리스너를 그 자리에서 복구한다. accept 루프가 비정상 종료(연속 50회 실패)하면 누수된 fd를 닫고 리스너를 자동으로 재시작.
+
+### Thanks to 1 contributor!
+
+- [@JINWOO-J](https://github.com/JINWOO-J)
+
 ## [0.116.0] - 2026-05-15
 
 ### Fixed
