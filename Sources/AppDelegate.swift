@@ -639,6 +639,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
     }
 
     func applicationWillTerminate(_ notification: Notification) {
+        #if DEBUG
+        dlog("[app.willTerminate] fired — archiving live pane teams before daemon shutdown")
+        #endif
         if let observer = systemAppearanceObserver {
             DistributedNotificationCenter.default.removeObserver(observer)
         }

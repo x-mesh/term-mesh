@@ -3505,12 +3505,22 @@ final class TeamOrchestrator: ObservableObject {
     ///   completes before the daemon is stopped. The normal destroy path
     ///   defaults to false so the UI doesn't block on disk I/O.
     private func archivePaneTeamIfApplicable(_ team: Team, synchronous: Bool = false) {
-        // Headless teams have a daemon-side teamUuid and are archived by
-        // `headless.destroy_team`. Pane-mode teams have teamUuid == nil at
-        // this point.
-        if team.teamUuid != nil {
+        // Skip headless teams — the daemon's `headless.destroy_team` already
+        // writes their archive. Pane-mode agents always have a `panelId` (real
+        // GUI pane); headless agents have `panelId == nil` (daemon subprocess).
+        // Note: `teamUuid` alone is not a reliable headless signal here because
+        // a RESUMED pane team carries the archived uuid forward — it's still
+        // pane-mode and must be re-archived on next destroy / quit.
+        let isHeadless = !team.agents.isEmpty && team.agents.allSatisfy { $0.panelId == nil }
+        if isHeadless {
+            #if DEBUG
+            dlog("[archive_pane] skip — headless team=\(team.id) (agents have no panelId)")
+            #endif
             return
         }
+        #if DEBUG
+        dlog("[archive_pane] proceed team=\(team.id) sync=\(synchronous) agents=\(team.agents.count) teamUuid=\(team.teamUuid ?? "nil")")
+        #endif
 
         let appVersion = (Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String) ?? "unknown"
         // For each pane we need the REAL claude session id (not the team's
@@ -3612,7 +3622,14 @@ final class TeamOrchestrator: ObservableObject {
     /// Runs each archive RPC inline on the calling queue (the main thread
     /// during termination) so the writes finish before the daemon is stopped.
     func archiveAllLivePaneTeamsForQuit() {
-        let live = teams.values.filter { $0.teamUuid == nil }
+        // Pane-mode = at least one agent has a real GUI panel. Mirrors the
+        // skip rule in `archivePaneTeamIfApplicable`.
+        let live = teams.values.filter { team in
+            !team.agents.isEmpty && !team.agents.allSatisfy { $0.panelId == nil }
+        }
+        #if DEBUG
+        dlog("[archive_pane] quit hook: total teams=\(teams.count) live-pane=\(live.count)")
+        #endif
         if live.isEmpty { return }
         Logger.team.info("[archive_pane] quit: archiving \(live.count) live pane team(s)")
         for team in live {
