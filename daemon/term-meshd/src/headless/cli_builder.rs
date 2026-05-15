@@ -89,6 +89,8 @@ pub fn build_claude_command(
     app_socket_path: Option<&str>,
     instructions: Option<&[u8]>,
     mode: ClaudeSpawnMode,
+    extra_args: &[String],
+    extra_env: &std::collections::HashMap<String, String>,
 ) -> CliCommand {
     let program = resolve_cli_path(cli_path, "CLAUDE_PATH", "claude");
 
@@ -131,7 +133,16 @@ pub fn build_claude_command(
         }
     }
 
-    let env = base_env(name, team_name, daemon_socket, app_socket_path);
+    for arg in extra_args {
+        args.push(OsString::from(arg));
+    }
+
+    // extra_env first so base_env values take precedence on key collision.
+    let mut env: Vec<(String, String)> = extra_env
+        .iter()
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
+    env.extend(base_env(name, team_name, daemon_socket, app_socket_path));
 
     // Remove env vars that cause nested-session detection in Claude Code
     let env_remove = vec!["CLAUDECODE".into(), "CLAUDE_CODE_ENTRYPOINT".into()];
@@ -175,6 +186,8 @@ pub fn build_kiro_command(
     daemon_socket: &str,
     cli_path: Option<&str>,
     app_socket_path: Option<&str>,
+    extra_args: &[String],
+    extra_env: &std::collections::HashMap<String, String>,
 ) -> CliCommand {
     let program = resolve_cli_path(cli_path, "KIRO_PATH", "kiro-cli");
 
@@ -194,7 +207,7 @@ pub fn build_kiro_command(
     );
 
     let kiro_model = kiro_model_name(model);
-    let args: Vec<OsString> = vec![
+    let mut args: Vec<OsString> = vec![
         "chat".into(),
         "--trust-all-tools".into(),
         "--wrap".into(),
@@ -205,7 +218,16 @@ pub fn build_kiro_command(
         OsString::from(kiro_model),
     ];
 
-    let env = base_env(name, team_name, daemon_socket, app_socket_path);
+    for arg in extra_args {
+        args.push(OsString::from(arg));
+    }
+
+    let mut env: Vec<(String, String)> = extra_env
+        .iter()
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
+    env.extend(base_env(name, team_name, daemon_socket, app_socket_path));
+
     CliCommand {
         program,
         args,
@@ -264,6 +286,8 @@ pub fn build_codex_command(
     daemon_socket: &str,
     cli_path: Option<&str>,
     app_socket_path: Option<&str>,
+    extra_args: &[String],
+    extra_env: &std::collections::HashMap<String, String>,
 ) -> CliCommand {
     let program = resolve_cli_path(cli_path, "CODEX_PATH", "codex");
 
@@ -282,7 +306,16 @@ pub fn build_codex_command(
     args.push("--json".into());
     args.push("-".into()); // read prompt from stdin
 
-    let env = base_env(name, team_name, daemon_socket, app_socket_path);
+    for arg in extra_args {
+        args.push(OsString::from(arg));
+    }
+
+    let mut env: Vec<(String, String)> = extra_env
+        .iter()
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
+    env.extend(base_env(name, team_name, daemon_socket, app_socket_path));
+
     CliCommand {
         program,
         args,
@@ -309,17 +342,28 @@ pub fn build_gemini_command(
     daemon_socket: &str,
     cli_path: Option<&str>,
     app_socket_path: Option<&str>,
+    extra_args: &[String],
+    extra_env: &std::collections::HashMap<String, String>,
 ) -> CliCommand {
     let program = resolve_cli_path(cli_path, "GEMINI_PATH", "gemini");
 
     let gemini_model = gemini_model_name(model);
-    let args: Vec<OsString> = vec![
+    let mut args: Vec<OsString> = vec![
         "--yolo".into(),
         "--model".into(),
         OsString::from(gemini_model),
     ];
 
-    let env = base_env(name, team_name, daemon_socket, app_socket_path);
+    for arg in extra_args {
+        args.push(OsString::from(arg));
+    }
+
+    let mut env: Vec<(String, String)> = extra_env
+        .iter()
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
+    env.extend(base_env(name, team_name, daemon_socket, app_socket_path));
+
     CliCommand {
         program,
         args,
@@ -359,6 +403,8 @@ mod tests {
             ClaudeSpawnMode::Fresh {
                 session_id: "1a2b3c4d-1111-2222-3333-444455556666".into(),
             },
+            &[],
+            &std::collections::HashMap::new(),
         );
         let argv: Vec<&str> = cmd.args.iter().map(|s| s.to_str().unwrap()).collect();
         assert_eq!(
@@ -393,6 +439,8 @@ mod tests {
             ClaudeSpawnMode::Resume {
                 session_id: "abc-resume".into(),
             },
+            &[],
+            &std::collections::HashMap::new(),
         );
         assert_eq!(cmd.args[0], OsString::from("--resume"));
         assert_eq!(cmd.args[1], OsString::from("abc-resume"));
