@@ -3220,12 +3220,19 @@ final class TeamOrchestrator: ObservableObject {
     /// the resumed agents. Best-effort — if the result is malformed we log and
     /// return without throwing (caller is a UI completion handler).
     /// Phase 2 (pane-mode resume): adopt a pane-mode archive that the daemon
-    /// returned via `team.resume_pane`. Opens a new workspace at the archived
-    /// working_directory and registers the team identity (name, agents with
-    /// their captured session IDs, worktree info) so the leader UI can address
-    /// them. Full agent-pane re-spawn with `--resume <sid>` per CLI is a
-    /// follow-up — for now the user reopens panes manually or uses the leader
-    /// to re-engage, with the session IDs available for that path.
+    /// returned via `team.resume_pane`. Delegates to `createTeam` so the
+    /// workspace, leader pane, and agent panes are all materialized the same
+    /// way a fresh `New Agent Team` would create them — then patches the
+    /// archived `team_uuid` and per-agent `session_id`s back onto the live
+    /// `Team` so a subsequent destroy archives to the same UUID and preserves
+    /// the per-agent session IDs (re-resumable).
+    ///
+    /// The **leader** pane resumes via `--resume <leader.session_id>` (already
+    /// wired through `createTeam`'s `resumeSessionId` parameter). Per-agent
+    /// `--resume <sid>` for individual agent CLIs is a follow-up — agents
+    /// currently start fresh but their captured session IDs are preserved on
+    /// the in-memory `AgentMember` so a future iteration can wire them through
+    /// `addAgentPaneToWorkspace`'s CLI command builders.
     @discardableResult
     func adoptResumedPaneTeam(result: [String: Any], tabManager: TabManager) -> Team? {
         guard let teamName = result["team_name"] as? String,
@@ -3238,90 +3245,86 @@ final class TeamOrchestrator: ObservableObject {
             Logger.team.info("[pane-resume] team '\(teamName, privacy: .public)' already live — skipping adopt")
             return teams[teamName]
         }
-        let teamUuid = result["team_uuid"] as? String
-
+        let archivedTeamUuid = result["team_uuid"] as? String
         let leaderDict = result["leader"] as? [String: Any]
         let leaderSessionId = (leaderDict?["session_id"] as? String) ?? ""
         let leaderMode = (leaderDict?["mode"] as? String) ?? "claude"
         let leaderModel = (leaderDict?["model"] as? String) ?? "sonnet"
 
-        // Optional worktree.
-        var worktreePath: String?
-        var worktreeBranch: String?
-        var worktreeName: String?
-        var worktreeMode = "off"
-        if let wt = result["worktree"] as? [String: Any] {
-            worktreePath = wt["path"] as? String
-            worktreeBranch = wt["branch"] as? String
-            worktreeMode = (wt["mode"] as? String) ?? "isolated"
-            if let p = worktreePath {
-                worktreeName = (p as NSString).lastPathComponent
+        // worktree mode from archive (off / shared / isolated). If the archive
+        // had a shared worktree, the createTeam path will reuse the same
+        // configuration when laying out panes.
+        let archivedWorktreeMode: String = {
+            if let wt = result["worktree"] as? [String: Any],
+               let mode = wt["mode"] as? String, !mode.isEmpty {
+                return mode
             }
-        }
-        let workspaceCwd = worktreePath ?? workingDirectory
+            return "off"
+        }()
 
-        let workspace = tabManager.addWorkspace(
-            workingDirectory: workspaceCwd,
-            select: true
-        )
-        workspace.customTitle = "[\(teamName)] \(agentsArr.count) pane"
-        workspace.title = "[\(teamName)] \(agentsArr.count) pane"
-
-        // Build AgentMember stubs preserving session IDs so the leader UI can
-        // address them. panelId is nil for now — agent pane re-spawn with
-        // `--resume <sid>` per CLI is a follow-up.
-        let members: [AgentMember] = agentsArr.map { a in
-            let name = (a["name"] as? String) ?? "agent"
-            let cli = (a["cli"] as? String) ?? "claude"
-            let model = (a["model"] as? String) ?? "sonnet"
-            let agentType = (a["agent_type"] as? String) ?? name
-            let color = (a["color"] as? String) ?? "blue"
-            let session = a["session_id"] as? String
-            let instructions = (a["instructions"] as? String) ?? ""
-            return AgentMember(
-                id: "\(name)@\(teamName)",
-                name: name,
-                teamName: teamName,
-                cli: cli,
-                launchCommand: Self.defaultLaunchCommand(for: cli),
-                model: model,
-                agentType: agentType,
-                color: color,
-                instructions: instructions,
-                workspaceId: workspace.id,
-                panelId: nil,
-                parentSessionId: session,
-                createdAt: Date(),
-                worktreeName: worktreeName,
-                worktreePath: worktreePath,
-                worktreeBranch: worktreeBranch,
-                originalSpawnCommand: nil,
-                originalAgentWorkDir: nil
+        // Build agents tuple in createTeam's expected shape.
+        typealias AgentTuple = (name: String, cli: String, model: String, agentType: String, color: String, instructions: String)
+        let agentTuples: [AgentTuple] = agentsArr.map { a in
+            (
+                name: (a["name"] as? String) ?? "agent",
+                cli: (a["cli"] as? String) ?? "claude",
+                model: (a["model"] as? String) ?? "sonnet",
+                agentType: (a["agent_type"] as? String) ?? ((a["name"] as? String) ?? "agent"),
+                color: (a["color"] as? String) ?? "blue",
+                instructions: (a["instructions"] as? String) ?? ""
             )
         }
 
-        let team = Team(
-            id: teamName,
-            leaderSessionId: leaderSessionId,
+        // Fresh leader session id for the new leader pane. The archived
+        // `leader.session_id` is passed as `resumeSessionId` so the claude
+        // leader CLI re-attaches to its previous transcript.
+        let freshLeaderSessionId = UUID().uuidString
+
+        guard let team = createTeam(
+            name: teamName,
+            agents: agentTuples,
+            workingDirectory: workingDirectory,
+            leaderSessionId: freshLeaderSessionId,
             leaderMode: leaderMode,
             leaderModel: leaderModel,
-            leaderPanelId: UUID(), // placeholder until leader pane is materialized
-            leaderWorkspaceId: workspace.id,
-            workingDirectory: workingDirectory,
-            workspaceId: workspace.id,
-            agents: members,
-            createdAt: Date(),
-            gitRepoRoot: result["git_root"] as? String,
-            worktreeMode: worktreeMode,
-            sharedWorktreeName: worktreeName,
-            sharedWorktreePath: worktreePath,
-            sharedWorktreeBranch: worktreeBranch,
-            teamUuid: teamUuid
-        )
-        teams[teamName] = team
-        syncTeamStateToDaemon()
-        Logger.team.info("[pane-resume] adopted team '\(teamName, privacy: .public)' with \(members.count) agent(s) — session IDs captured; pane re-spawn pending")
-        return team
+            resumeSessionId: leaderSessionId.isEmpty ? nil : leaderSessionId,
+            worktreeMode: archivedWorktreeMode,
+            executionMode: "pane",
+            tabManager: tabManager
+        ) else {
+            Logger.team.error("[pane-resume] createTeam failed for '\(teamName, privacy: .public)'")
+            return nil
+        }
+
+        // Patch back the archived team_uuid + per-agent session IDs so the
+        // live team round-trips: a future destroy archives to the same UUID
+        // and carries forward each agent's resume identity.
+        if var t = teams[teamName] {
+            if let uuid = archivedTeamUuid, !uuid.isEmpty {
+                t.teamUuid = uuid
+            }
+            // Map archived agents by name and copy session_id back.
+            var archivedSessionsByName: [String: String] = [:]
+            for a in agentsArr {
+                guard let name = a["name"] as? String,
+                      let sid = a["session_id"] as? String,
+                      !sid.isEmpty else { continue }
+                archivedSessionsByName[name] = sid
+            }
+            if !archivedSessionsByName.isEmpty {
+                t.agents = t.agents.map { member in
+                    var m = member
+                    if let sid = archivedSessionsByName[member.name] {
+                        m.parentSessionId = sid
+                    }
+                    return m
+                }
+            }
+            teams[teamName] = t
+        }
+
+        Logger.team.info("[pane-resume] adopted team '\(teamName, privacy: .public)' with \(agentTuples.count) agent(s); leader resumed via --resume, agents start fresh (per-agent --resume is a follow-up)")
+        return teams[teamName]
     }
 
     @discardableResult
