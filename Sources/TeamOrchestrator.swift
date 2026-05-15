@@ -3140,6 +3140,11 @@ final class TeamOrchestrator: ObservableObject {
     /// Destroy a team — send Ctrl-C to all agents and close the workspace.
     func destroyTeam(name: String, tabManager: TabManager) -> Bool {
         guard let team = teams[name] else { return false }
+        // Phase 2 (pane-mode resume): persist a `mode: "pane"` archive so this
+        // team shows up in `Resume from previous team`. Best-effort — failures
+        // don't block destroy. Headless teams are archived daemon-side by
+        // `headless.destroy_team` and never enter this code path.
+        archivePaneTeamIfApplicable(team)
         guard let workspace = tabManager.tabs.first(where: { $0.id == team.workspaceId }) else {
             cleanupWorktrees(team: team)
             clearResults(teamName: name)
@@ -3215,6 +3220,111 @@ final class TeamOrchestrator: ObservableObject {
     /// the resumed agents. Best-effort — if the result is malformed we log and
     /// return without throwing (caller is a UI completion handler).
     @discardableResult
+    /// Phase 2 (pane-mode resume): adopt a pane-mode archive that the daemon
+    /// returned via `team.resume_pane`. Opens a new workspace at the archived
+    /// working_directory and registers the team identity (name, agents with
+    /// their captured session IDs, worktree info) so the leader UI can address
+    /// them. Full agent-pane re-spawn with `--resume <sid>` per CLI is a
+    /// follow-up — for now the user reopens panes manually or uses the leader
+    /// to re-engage, with the session IDs available for that path.
+    @discardableResult
+    func adoptResumedPaneTeam(result: [String: Any], tabManager: TabManager) -> Team? {
+        guard let teamName = result["team_name"] as? String,
+              let workingDirectory = result["working_directory"] as? String,
+              let agentsArr = result["agents"] as? [[String: Any]] else {
+            Logger.team.error("[pane-resume] result missing required fields")
+            return nil
+        }
+        if teams[teamName] != nil {
+            Logger.team.info("[pane-resume] team '\(teamName, privacy: .public)' already live — skipping adopt")
+            return teams[teamName]
+        }
+        let teamUuid = result["team_uuid"] as? String
+
+        let leaderDict = result["leader"] as? [String: Any]
+        let leaderSessionId = (leaderDict?["session_id"] as? String) ?? ""
+        let leaderMode = (leaderDict?["mode"] as? String) ?? "claude"
+        let leaderModel = (leaderDict?["model"] as? String) ?? "sonnet"
+
+        // Optional worktree.
+        var worktreePath: String?
+        var worktreeBranch: String?
+        var worktreeName: String?
+        var worktreeMode = "off"
+        if let wt = result["worktree"] as? [String: Any] {
+            worktreePath = wt["path"] as? String
+            worktreeBranch = wt["branch"] as? String
+            worktreeMode = (wt["mode"] as? String) ?? "isolated"
+            if let p = worktreePath {
+                worktreeName = (p as NSString).lastPathComponent
+            }
+        }
+        let workspaceCwd = worktreePath ?? workingDirectory
+
+        let workspace = tabManager.addWorkspace(
+            workingDirectory: workspaceCwd,
+            select: true
+        )
+        workspace.customTitle = "[\(teamName)] \(agentsArr.count) pane"
+        workspace.title = "[\(teamName)] \(agentsArr.count) pane"
+
+        // Build AgentMember stubs preserving session IDs so the leader UI can
+        // address them. panelId is nil for now — agent pane re-spawn with
+        // `--resume <sid>` per CLI is a follow-up.
+        let members: [AgentMember] = agentsArr.map { a in
+            let name = (a["name"] as? String) ?? "agent"
+            let cli = (a["cli"] as? String) ?? "claude"
+            let model = (a["model"] as? String) ?? "sonnet"
+            let agentType = (a["agent_type"] as? String) ?? name
+            let color = (a["color"] as? String) ?? "blue"
+            let session = a["session_id"] as? String
+            let instructions = (a["instructions"] as? String) ?? ""
+            return AgentMember(
+                id: "\(name)@\(teamName)",
+                name: name,
+                teamName: teamName,
+                cli: cli,
+                launchCommand: Self.defaultLaunchCommand(for: cli),
+                model: model,
+                agentType: agentType,
+                color: color,
+                instructions: instructions,
+                workspaceId: workspace.id,
+                panelId: nil,
+                parentSessionId: session,
+                createdAt: Date(),
+                worktreeName: worktreeName,
+                worktreePath: worktreePath,
+                worktreeBranch: worktreeBranch,
+                originalSpawnCommand: nil,
+                originalAgentWorkDir: nil
+            )
+        }
+
+        let team = Team(
+            id: teamName,
+            leaderSessionId: leaderSessionId,
+            leaderMode: leaderMode,
+            leaderModel: leaderModel,
+            leaderPanelId: UUID(), // placeholder until leader pane is materialized
+            leaderWorkspaceId: workspace.id,
+            workingDirectory: workingDirectory,
+            workspaceId: workspace.id,
+            agents: members,
+            createdAt: Date(),
+            gitRepoRoot: result["git_root"] as? String,
+            worktreeMode: worktreeMode,
+            sharedWorktreeName: worktreeName,
+            sharedWorktreePath: worktreePath,
+            sharedWorktreeBranch: worktreeBranch,
+            teamUuid: teamUuid
+        )
+        teams[teamName] = team
+        syncTeamStateToDaemon()
+        Logger.team.info("[pane-resume] adopted team '\(teamName, privacy: .public)' with \(members.count) agent(s) — session IDs captured; pane re-spawn pending")
+        return team
+    }
+
     func adoptResumedHeadlessTeam(result: [String: Any], tabManager: TabManager) -> Team? {
         guard let teamName = result["name"] as? String,
               let agentIds = result["agents"] as? [String],
@@ -3309,6 +3419,80 @@ final class TeamOrchestrator: ObservableObject {
         syncTeamStateToDaemon()
         Logger.team.info("[headless] adopted resumed team '\(teamName, privacy: .public)' uuid=\(teamUuid ?? "?", privacy: .public)")
         return team
+    }
+
+    /// Phase 2 (pane-mode resume): on destroy of a pane-mode team, ship a
+    /// `team.archive_pane` RPC to the daemon so the team appears in
+    /// `headless.list_resumable` with `mode: "pane"`. Headless teams (managed by
+    /// the daemon) are archived by the daemon's own destroy path and skip this.
+    ///
+    /// Best-effort: failures are logged and don't block destroy. The leader's
+    /// `--resume <leaderSessionId>` and each agent's `parentSessionId`
+    /// (captured by the sidebar token-tracking infrastructure in 0.115.0) are
+    /// sufficient to bring the team back via `team.resume_pane`.
+    private func archivePaneTeamIfApplicable(_ team: Team) {
+        // Headless teams have a daemon-side teamUuid and are archived by
+        // `headless.destroy_team`. Pane-mode teams have teamUuid == nil at
+        // this point.
+        if team.teamUuid != nil {
+            return
+        }
+
+        let appVersion = (Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String) ?? "unknown"
+        var payload: [String: Any] = [
+            "team_name": team.id,
+            "leader_session_id": team.leaderSessionId,
+            "leader_mode": team.leaderMode,
+            "leader_model": team.leaderModel,
+            "working_directory": team.workingDirectory,
+            "termmesh_app_version": appVersion,
+            "agents": team.agents.map { a -> [String: Any] in
+                var row: [String: Any] = [
+                    "name": a.name,
+                    "cli": a.cli,
+                    "model": a.model,
+                    "agent_type": a.agentType,
+                    "color": a.color,
+                ]
+                if let sid = a.parentSessionId, !sid.isEmpty {
+                    row["session_id"] = sid
+                }
+                if !a.instructions.isEmpty {
+                    row["instructions"] = a.instructions
+                }
+                return row
+            },
+        ]
+        if let root = team.gitRepoRoot, !root.isEmpty {
+            payload["git_root"] = root
+        }
+        // worktree info: pane-mode teams may share or per-agent. Capture shared.
+        if let wtName = team.sharedWorktreeName,
+           let wtPath = team.sharedWorktreePath,
+           let wtBranch = team.sharedWorktreeBranch,
+           !wtName.isEmpty {
+            payload["worktree_mode"] = team.worktreeMode
+            payload["worktree_path"] = wtPath
+            payload["worktree_branch"] = wtBranch
+        }
+
+        DispatchQueue.global(qos: .utility).async {
+            let raw = TermMeshDaemon.shared.rpcCallRaw(
+                method: "team.archive_pane",
+                params: payload
+            )
+            if let raw, let data = raw.data(using: .utf8),
+               let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+                if let errMsg = obj["error"] as? String {
+                    Logger.team.warning("[archive_pane] daemon error: \(errMsg, privacy: .public)")
+                } else if let result = obj["result"] as? [String: Any],
+                          let path = result["archived_path"] as? String {
+                    Logger.team.info("[archive_pane] archived → \(path, privacy: .public)")
+                }
+            } else {
+                Logger.team.warning("[archive_pane] daemon did not respond")
+            }
+        }
     }
 
     /// Log detached worktrees from a destroyed team (no longer auto-deleted).

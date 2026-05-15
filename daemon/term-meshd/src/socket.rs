@@ -1660,6 +1660,33 @@ async fn dispatch(req: &Request, ctx: &Context) -> Response {
                 Err(e) => Err(format!("invalid params: {e}")),
             }
         }
+        "team.archive_pane" => {
+            // pane-mode counterpart of headless `destroy_team`'s archive step.
+            // Called by the Swift app from `TeamOrchestrator.destroyTeam` so a
+            // pane-mode team shows up in `list_resumable` with `mode: "pane"`.
+            match serde_json::from_value::<crate::headless::ArchivePaneParams>(req.params.clone()) {
+                Ok(p) => {
+                    let mut mgr = ctx.headless.lock().await;
+                    mgr.archive_pane_team(p)
+                        .map(|r| serde_json::to_value(r).unwrap())
+                }
+                Err(e) => Err(format!("invalid params: {e}")),
+            }
+        }
+        "team.resume_pane" => {
+            // pane-mode resume: returns metadata + session IDs so the Swift app
+            // can recreate the workspace and spawn each CLI with `--resume <sid>`.
+            // Does NOT spawn anything — the daemon owns headless subprocesses,
+            // the app owns pane lifecycles.
+            match serde_json::from_value::<crate::headless::ResumePaneParams>(req.params.clone()) {
+                Ok(p) => {
+                    let mgr = ctx.headless.lock().await;
+                    mgr.resume_pane(p)
+                        .map(|r| serde_json::to_value(r).unwrap())
+                }
+                Err(e) => Err(format!("invalid params: {e}")),
+            }
+        }
         "headless.set_idle_park_minutes" => {
             #[derive(Deserialize)]
             struct P {

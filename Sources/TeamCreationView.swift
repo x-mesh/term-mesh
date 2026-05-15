@@ -188,6 +188,11 @@ struct ResumableTeam: Identifiable, Hashable {
     let validity: Validity
     let resumable: Bool
     let blockingReason: String?
+    /// "headless" (daemon-managed subprocesses) or "pane" (GUI panes).
+    /// Drives resume routing: pane archives use `team.resume_pane` instead of
+    /// `headless.resume_team`. Defaults to "headless" for back-compat when the
+    /// daemon predates this field.
+    let mode: String
 
     var id: String { teamUuid }
 
@@ -307,7 +312,8 @@ struct ResumableTeam: Identifiable, Hashable {
             agents: agents,
             validity: validity,
             resumable: dict["resumable"] as? Bool ?? false,
-            blockingReason: dict["blocking_reason"] as? String
+            blockingReason: dict["blocking_reason"] as? String,
+            mode: (dict["mode"] as? String) ?? "headless"
         )
     }
 }
@@ -606,11 +612,19 @@ struct TeamCreationView: View {
         let isExpanded = expandedResumeAgentTeams.contains(team.teamUuid)
 
         VStack(alignment: .leading, spacing: 6) {
-            // Row 1: team name + agent count
-            HStack {
+            // Row 1: team name + mode badge + agent count
+            HStack(spacing: 6) {
                 Text(team.teamName)
                     .font(.headline)
                     .foregroundStyle(isDisabled ? .secondary : .primary)
+                // Mode badge: pane vs headless. Tooltip explains the distinction
+                // so users understand why the icons differ.
+                Image(systemName: team.mode == "pane" ? "rectangle.split.2x2" : "server.rack")
+                    .font(.caption)
+                    .foregroundStyle(.tertiary)
+                    .help(team.mode == "pane"
+                        ? "Pane-mode team — agents run in visible terminal panes"
+                        : "Headless team — agents run as background subprocesses")
                 Spacer()
                 Text("\(team.agents.count) agent\(team.agents.count == 1 ? "" : "s")")
                     .font(.caption)
@@ -809,25 +823,40 @@ struct TeamCreationView: View {
         return TermMeshDaemon.shared.findGitRoot(from: cwd)
     }
 
-    /// Invoke `headless.resume_team`. On success, calls `onResume` with the
-    /// decoded result dictionary and dismisses the sheet. On error, surfaces
-    /// the message inline (panel stays open).
+    /// Invoke the appropriate resume RPC based on the team's archive mode.
+    /// Headless archives go through `headless.resume_team` (daemon respawns the
+    /// subprocesses). Pane-mode archives go through `team.resume_pane` (daemon
+    /// returns metadata + session IDs and the app side creates the workspace
+    /// and panes).
+    ///
+    /// On success, calls `onResume` with the decoded result dictionary and
+    /// dismisses the sheet. On error, surfaces the message inline (panel stays
+    /// open).
     private func invokeResume(team: ResumableTeam, acceptBranchDrift: Bool = false) {
         guard !resumeInFlight else { return }
         resumeInFlight = true
         resumeErrorMessage = nil
 
-        let leaderSessionId = UUID().uuidString
-        let params: [String: Any] = [
-            "team_uuid": team.teamUuid,
-            "leader_session_id": leaderSessionId,
-            "app_socket_path": SocketControlSettings.socketPath(),
-            "accept_branch_drift": acceptBranchDrift,
-        ]
+        let isPaneMode = team.mode == "pane"
+        let method: String
+        let params: [String: Any]
+        if isPaneMode {
+            method = "team.resume_pane"
+            params = ["team_uuid": team.teamUuid]
+        } else {
+            method = "headless.resume_team"
+            let leaderSessionId = UUID().uuidString
+            params = [
+                "team_uuid": team.teamUuid,
+                "leader_session_id": leaderSessionId,
+                "app_socket_path": SocketControlSettings.socketPath(),
+                "accept_branch_drift": acceptBranchDrift,
+            ]
+        }
 
         DispatchQueue.global(qos: .userInitiated).async {
             let raw = TermMeshDaemon.shared.rpcCallRaw(
-                method: "headless.resume_team",
+                method: method,
                 params: params
             )
             var resultDict: [String: Any]?
@@ -853,7 +882,11 @@ struct TeamCreationView: View {
                     resumeErrorMessage = errMsg
                     return
                 }
-                if let resultDict {
+                if var resultDict {
+                    // Tag the dict with mode so the receiving onResume handler
+                    // can branch between headless (daemon already spawned the
+                    // subprocesses) and pane (app must create workspace + panes).
+                    resultDict["mode"] = isPaneMode ? "pane" : "headless"
                     onResume?(resultDict)
                     dismiss()
                 }

@@ -1090,6 +1090,175 @@ impl HeadlessManager {
         })
     }
 
+    // ────────────────────────────────────────────────────────────────────────
+    // Pane-mode archive / resume
+    //
+    // pane-mode teams live entirely in the Swift app (the daemon has no live
+    // record of them). On destroy, the app calls `team.archive_pane` with a
+    // payload assembled from its in-memory `Team` struct; the daemon writes
+    // the same `team.json` / `agents/*.json` layout headless uses and renames
+    // the dir to `.archived.<ts>` so `list_resumable` picks it up. The
+    // `execution_mode` field on `TeamMeta` distinguishes the two modes so
+    // resume routing can branch.
+    // ────────────────────────────────────────────────────────────────────────
+
+    pub fn archive_pane_team(
+        &mut self,
+        params: ArchivePaneParams,
+    ) -> Result<ArchivePaneResult, String> {
+        let team_uuid = match params.team_uuid {
+            Some(s) if !s.is_empty() => meta::parse_uuid(&s)?,
+            _ => meta::new_uuid(),
+        };
+        let now = meta::now_unix();
+
+        // Build TeamMeta — mirrors headless format with execution_mode = "pane".
+        let team_meta = meta::TeamMeta {
+            schema: meta::SCHEMA_VERSION,
+            team_uuid: team_uuid.clone(),
+            team_name: params.team_name.clone(),
+            created_at: now, // best effort — Swift doesn't always know exact creation epoch
+            destroyed_at: Some(now),
+            working_directory: params.working_directory.clone(),
+            git_root: params.git_root.clone(),
+            git_branch_at_create: params.git_branch_at_create.clone(),
+            leader: meta::LeaderMeta {
+                mode: params.leader_mode.clone(),
+                model: params.leader_model.clone(),
+                session_id: Some(params.leader_session_id.clone())
+                    .filter(|s| !s.is_empty()),
+            },
+            agents: params.agents.iter().map(|a| a.name.clone()).collect(),
+            worktree: match (params.worktree_mode.as_deref(), params.worktree_path.as_deref(), params.worktree_branch.as_deref()) {
+                (Some(m), Some(p), Some(b)) if !m.is_empty() && !p.is_empty() => {
+                    Some(meta::WorktreeMeta {
+                        mode: m.to_string(),
+                        path: p.to_string(),
+                        branch: b.to_string(),
+                    })
+                }
+                _ => None,
+            },
+            execution_mode: "pane".to_string(),
+            claude_cli_version: None,
+            termmesh_app_version: params
+                .termmesh_app_version
+                .clone()
+                .unwrap_or_else(|| "unknown".to_string()),
+            app_socket_path_at_create: None,
+            runbook_digest_hash: None,
+        };
+
+        // Create dirs.
+        meta::create_dir_secure(&meta::team_dir(&team_uuid))
+            .map_err(|e| format!("create team dir: {e}"))?;
+        meta::create_dir_secure(&meta::agents_subdir(&team_uuid))
+            .map_err(|e| format!("create agents subdir: {e}"))?;
+        meta::create_dir_secure(&meta::instructions_subdir(&team_uuid))
+            .map_err(|e| format!("create instructions subdir: {e}"))?;
+
+        // Write team.json.
+        meta::write_team_meta(&team_meta)?;
+
+        // Write per-agent meta + instructions.
+        for a in &params.agents {
+            let instr_bytes = a.instructions.as_deref().unwrap_or("").as_bytes();
+            let instr_sha = if instr_bytes.is_empty() {
+                None
+            } else {
+                Some(meta::sha256_hex(instr_bytes))
+            };
+            if !instr_bytes.is_empty() {
+                meta::write_instructions(&team_uuid, &a.name, instr_bytes)?;
+            }
+            let agent_meta = meta::AgentMeta {
+                schema: meta::SCHEMA_VERSION,
+                team_uuid: team_uuid.clone(),
+                name: a.name.clone(),
+                agent_type: a.agent_type.clone(),
+                cli: a.cli.clone(),
+                model: a.model.clone(),
+                session_id: a.session_id.clone().filter(|s| !s.is_empty()),
+                color: a.color.clone(),
+                created_at: now,
+                instructions_sha256: instr_sha,
+                cli_path_at_create: None,
+                parked: false,
+                usage_total: None,
+            };
+            meta::write_agent_meta(&agent_meta)?;
+        }
+
+        // Rename live → archived.<ts>.
+        let archived = meta::rename_to_archived(&team_uuid, now)?;
+        tracing::info!(
+            "archived pane-mode team {} ({}) → {}",
+            params.team_name,
+            team_uuid,
+            archived.display()
+        );
+        Ok(ArchivePaneResult {
+            team_uuid,
+            archived_path: archived.to_string_lossy().into_owned(),
+        })
+    }
+
+    /// Resume metadata for a pane-mode archive. Returns the team meta + per-agent
+    /// session IDs / instructions so the Swift app can recreate the workspace
+    /// and spawn each CLI with `--resume <sid>`. Renames `.archived.<ts>` back
+    /// to live so the dir won't be GC'd while the resume flow runs (the app
+    /// owns the in-memory lifecycle once it has the metadata).
+    pub fn resume_pane(&self, params: ResumePaneParams) -> Result<ResumePaneResult, String> {
+        let team_uuid = meta::parse_uuid(&params.team_uuid)?;
+        // Find the archived dir for this UUID.
+        let archived_entries = meta::list_archived_teams()
+            .map_err(|e| format!("scan archived: {e}"))?;
+        let entry = archived_entries
+            .into_iter()
+            .find(|e| e.team_uuid == team_uuid)
+            .ok_or_else(|| format!("no archive for team_uuid={team_uuid}"))?;
+
+        // Promote archived → live so future operations can find it under team_dir().
+        let live_dir = meta::rename_to_live(&entry.archived_dir, &team_uuid)?;
+        let team_meta = meta::read_team_meta(&live_dir)?;
+        if team_meta.team_uuid != team_uuid {
+            return Err(format!(
+                "uuid mismatch in archive: dir={team_uuid} file={}",
+                team_meta.team_uuid
+            ));
+        }
+
+        let mut agents = Vec::with_capacity(team_meta.agents.len());
+        for agent_name in &team_meta.agents {
+            let am = meta::read_agent_meta(&team_uuid, agent_name)?;
+            let instr = match meta::read_instructions(&team_uuid, agent_name) {
+                Ok(bytes) => String::from_utf8(bytes).ok(),
+                Err(_) => None,
+            };
+            agents.push(ResumePaneAgent {
+                name: am.name,
+                agent_type: am.agent_type,
+                cli: am.cli,
+                model: am.model,
+                color: am.color,
+                session_id: am.session_id,
+                instructions: instr,
+            });
+        }
+
+        Ok(ResumePaneResult {
+            team_uuid: team_meta.team_uuid,
+            team_name: team_meta.team_name,
+            created_at: team_meta.created_at,
+            destroyed_at: team_meta.destroyed_at,
+            working_directory: team_meta.working_directory,
+            git_root: team_meta.git_root,
+            leader: team_meta.leader,
+            agents,
+            worktree: team_meta.worktree,
+        })
+    }
+
     pub fn list_teams(&self) -> Vec<&HeadlessTeam> {
         self.teams.values().collect()
     }
@@ -1729,6 +1898,7 @@ impl HeadlessManager {
                 },
                 resumable,
                 blocking_reason,
+                mode: team_meta.execution_mode.clone(),
             });
 
             if rows.len() >= limit {
@@ -1983,6 +2153,94 @@ pub struct ResumeTeamResult {
     pub resumed: bool,
 }
 
+// ────────────────────────────────────────────────────────────────────────────
+// Pane-mode archive params/result
+// ────────────────────────────────────────────────────────────────────────────
+
+/// Params for `team.archive_pane` — the Swift app calls this from
+/// `TeamOrchestrator.destroyTeam` to persist a pane-mode team archive so it
+/// shows up in `headless.list_resumable` (with `mode: "pane"`).
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct ArchivePaneParams {
+    #[serde(default)]
+    pub team_uuid: Option<String>,
+    pub team_name: String,
+    pub leader_session_id: String,
+    pub leader_mode: String,
+    pub leader_model: String,
+    pub working_directory: String,
+    #[serde(default)]
+    pub git_root: Option<String>,
+    #[serde(default)]
+    pub git_branch_at_create: Option<String>,
+    #[serde(default)]
+    pub worktree_mode: Option<String>,
+    #[serde(default)]
+    pub worktree_path: Option<String>,
+    #[serde(default)]
+    pub worktree_branch: Option<String>,
+    pub agents: Vec<ArchivePaneAgent>,
+    #[serde(default)]
+    pub termmesh_app_version: Option<String>,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct ArchivePaneAgent {
+    pub name: String,
+    pub cli: String,
+    pub model: String,
+    pub agent_type: String,
+    #[serde(default)]
+    pub color: Option<String>,
+    /// claude/codex session id captured by the sidebar token-tracking
+    /// infrastructure. None when the agent never opened a session.
+    #[serde(default)]
+    pub session_id: Option<String>,
+    /// Raw instructions bytes (utf-8); written into the archive so resume can
+    /// rebuild the agent's role description. May be empty.
+    #[serde(default)]
+    pub instructions: Option<String>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ArchivePaneResult {
+    pub team_uuid: String,
+    pub archived_path: String,
+}
+
+/// Params for `team.resume_pane` — pure metadata read. Unlike
+/// `headless.resume_team` this does NOT spawn subprocesses; the Swift app is
+/// responsible for creating the workspace and panes, and consumes the agent
+/// `session_id`s here to pass `--resume <sid>` to each CLI.
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct ResumePaneParams {
+    pub team_uuid: String,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ResumePaneResult {
+    pub team_uuid: String,
+    pub team_name: String,
+    pub created_at: u64,
+    pub destroyed_at: Option<u64>,
+    pub working_directory: String,
+    pub git_root: Option<String>,
+    pub leader: meta::LeaderMeta,
+    pub agents: Vec<ResumePaneAgent>,
+    pub worktree: Option<meta::WorktreeMeta>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ResumePaneAgent {
+    pub name: String,
+    pub agent_type: String,
+    pub cli: String,
+    pub model: String,
+    pub color: Option<String>,
+    pub session_id: Option<String>,
+    pub instructions: Option<String>,
+}
+
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct ResumableAgent {
     pub name: String,
@@ -2027,6 +2285,10 @@ pub struct ResumableTeam {
     pub validity: ResumableValidity,
     pub resumable: bool,
     pub blocking_reason: Option<String>,
+    /// "headless" (daemon-managed subprocesses) or "pane" (GUI panes).
+    /// Drives resume routing on the client (pane archives use `team.resume_pane`
+    /// instead of `headless.resume_team`).
+    pub mode: String,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]

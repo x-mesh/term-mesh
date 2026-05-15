@@ -244,10 +244,20 @@ struct TermMeshApp: App {
             },
             onResume: { (result: [String: Any]) in
                 let activeTabManager = teamCreationTabManager ?? tabManager
-                TeamOrchestrator.shared.adoptResumedHeadlessTeam(
-                    result: result,
-                    tabManager: activeTabManager
-                )
+                // The picker tags pane-mode resumes so we route to a separate
+                // app-side rehydration path. Headless resumes go through the
+                // existing daemon-respawn-driven adoption.
+                if (result["mode"] as? String) == "pane" {
+                    TeamOrchestrator.shared.adoptResumedPaneTeam(
+                        result: result,
+                        tabManager: activeTabManager
+                    )
+                } else {
+                    TeamOrchestrator.shared.adoptResumedHeadlessTeam(
+                        result: result,
+                        tabManager: activeTabManager
+                    )
+                }
             },
             initialMode: teamCreationInitialMode
         )
