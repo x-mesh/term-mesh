@@ -3305,19 +3305,13 @@ final class TeamOrchestrator: ObservableObject {
             agentResumeMap[name] = sid
         }
 
-        // Fresh leader session id for the new leader pane (this is tm-agent's
-        // internal routing UUID, not a claude session id).
+        // Fresh leader routing UUID for the new team (regenerated each create).
         let freshLeaderSessionId = UUID().uuidString
 
-        // NOTE: we intentionally do NOT pass `resumeSessionId` here.
-        // The archive's `leader.session_id` is what Swift had stored as
-        // `team.leaderSessionId` — a routing UUID generated at create time,
-        // not the claude CLI's actual session id. Passing it as `--resume`
-        // caused claude to fail with "session not found". A future iteration
-        // can capture the leader pane's real claude session id (same
-        // mechanism as the sidebar token tracker uses for agents) and pass
-        // it through here. For now the leader pane starts fresh.
-        _ = leaderSessionId // keep archived value referenced for future use
+        // `leaderSessionId` from the archive is the REAL claude session id
+        // (discovered from ~/.claude/projects/ at archive time). Passing it
+        // as `--resume` re-attaches claude to its prior transcript.
+        let leaderClaudeSid = leaderSessionId.isEmpty ? nil : leaderSessionId
 
         guard let team = createTeam(
             name: teamName,
@@ -3326,7 +3320,7 @@ final class TeamOrchestrator: ObservableObject {
             leaderSessionId: freshLeaderSessionId,
             leaderMode: leaderMode,
             leaderModel: leaderModel,
-            resumeSessionId: nil,
+            resumeSessionId: leaderClaudeSid,
             worktreeMode: archivedWorktreeMode,
             executionMode: "pane",
             agentResumeSessionIds: agentResumeMap.isEmpty ? nil : agentResumeMap,
@@ -3464,6 +3458,38 @@ final class TeamOrchestrator: ObservableObject {
         return team
     }
 
+    /// Phase 2 (pane-mode resume): discover the real claude session id for a
+    /// pane by scanning `~/.claude/projects/<encoded-workdir>/`. Claude writes
+    /// its conversation transcript to `<sessionId>.jsonl` in that directory,
+    /// so the most recently modified file there is the live session for any
+    /// claude CLI started in that working directory.
+    ///
+    /// Returns nil when the directory is absent or empty. The encoded directory
+    /// name mirrors what claude itself produces (`/` → `-`).
+    private static func discoverClaudeSessionId(workingDirectory: String) -> String? {
+        guard !workingDirectory.isEmpty else { return nil }
+        let encoded = workingDirectory.replacingOccurrences(of: "/", with: "-")
+        let home = FileManager.default.homeDirectoryForCurrentUser.path
+        let dir = "\(home)/.claude/projects/\(encoded)"
+        let fm = FileManager.default
+        guard fm.fileExists(atPath: dir),
+              let items = try? fm.contentsOfDirectory(atPath: dir) else { return nil }
+        var best: (sid: String, mtime: Date)?
+        for item in items {
+            guard item.hasSuffix(".jsonl") else { continue }
+            let sid = String(item.dropLast(6))
+            // claude session ids are RFC4122 UUIDs (8-4-4-4-12 = 36 chars, 4 dashes).
+            guard sid.count == 36, sid.filter({ $0 == "-" }).count == 4 else { continue }
+            let path = "\(dir)/\(item)"
+            guard let attrs = try? fm.attributesOfItem(atPath: path),
+                  let mtime = attrs[.modificationDate] as? Date else { continue }
+            if best == nil || mtime > best!.mtime {
+                best = (sid, mtime)
+            }
+        }
+        return best?.sid
+    }
+
     /// Phase 2 (pane-mode resume): on destroy of a pane-mode team, ship a
     /// `team.archive_pane` RPC to the daemon so the team appears in
     /// `headless.list_resumable` with `mode: "pane"`. Headless teams (managed by
@@ -3487,9 +3513,22 @@ final class TeamOrchestrator: ObservableObject {
         }
 
         let appVersion = (Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String) ?? "unknown"
+        // For each pane we need the REAL claude session id (not the team's
+        // routing UUID stored in `parentSessionId` / `leaderSessionId`). Claude
+        // writes its transcripts to `~/.claude/projects/<encoded-workdir>/<sid>.jsonl`,
+        // so the most recently modified file in that directory is the live
+        // session for that pane. This is imperfect when multiple panes share a
+        // workdir (no worktree / shared worktree) — in that case the latest
+        // file wins for the agent we look up last; worktree-isolated mode
+        // gives clean 1-to-1 mapping.
+        // `leader_session_id` carries the REAL claude session id (discovered
+        // from `~/.claude/projects/`), not the team's ephemeral routing UUID.
+        // Empty string when no claude transcript exists yet (e.g., a team
+        // destroyed before the leader pane was used).
+        let leaderSid = Self.discoverClaudeSessionId(workingDirectory: team.workingDirectory) ?? ""
         var payload: [String: Any] = [
             "team_name": team.id,
-            "leader_session_id": team.leaderSessionId,
+            "leader_session_id": leaderSid,
             "leader_mode": team.leaderMode,
             "leader_model": team.leaderModel,
             "working_directory": team.workingDirectory,
@@ -3502,7 +3541,13 @@ final class TeamOrchestrator: ObservableObject {
                     "agent_type": a.agentType,
                     "color": a.color,
                 ]
-                if let sid = a.parentSessionId, !sid.isEmpty {
+                // Per-agent claude session id. Prefer the agent's own worktree
+                // path (worktree-isolated → one session per pane). Falls back
+                // to the team cwd when no worktree (shared workdir — ambiguous
+                // assignment between agents).
+                let agentWorkdir = a.worktreePath ?? team.workingDirectory
+                if let sid = Self.discoverClaudeSessionId(workingDirectory: agentWorkdir),
+                   !sid.isEmpty {
                     row["session_id"] = sid
                 }
                 if !a.instructions.isEmpty {
