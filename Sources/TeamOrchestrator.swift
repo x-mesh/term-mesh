@@ -565,6 +565,8 @@ final class TeamOrchestrator: ObservableObject {
         /// Other CLIs (codex/kiro/gemini) currently ignore this; resume
         /// support for them is a follow-up.
         resumeSessionId: String? = nil,
+        extraArgs: [String] = [],
+        extraEnv: [String: String] = [:],
         tabManager: TabManager
     ) -> AgentMember? {
         let agentId = "\(agentName)@\(teamName)"
@@ -579,21 +581,24 @@ final class TeamOrchestrator: ObservableObject {
                 agentName: agentName,
                 teamName: teamName,
                 model: agentModel,
-                systemPrompt: workerPrompt
+                systemPrompt: workerPrompt,
+                extraArgs: extraArgs
             )
         case "codex":
             agentCommand = buildCodexCommand(
                 codexPath: cliPath,
                 agentName: agentName,
                 teamName: teamName,
-                model: agentModel
+                model: agentModel,
+                extraArgs: extraArgs
             )
         case "gemini":
             agentCommand = buildGeminiCommand(
                 geminiPath: cliPath,
                 agentName: agentName,
                 teamName: teamName,
-                model: agentModel
+                model: agentModel,
+                extraArgs: extraArgs
             )
         default:
             agentCommand = buildClaudeCommand(
@@ -605,7 +610,8 @@ final class TeamOrchestrator: ObservableObject {
                 parentSessionId: leaderSessionId,
                 agentType: agentType,
                 model: agentModel,
-                instructions: agentInstructions
+                instructions: agentInstructions,
+                extraArgs: extraArgs
             )
             if let sid = resumeSessionId, !sid.isEmpty {
                 // Mirror the leader pattern (createTeam, claude case) — append
@@ -629,7 +635,7 @@ final class TeamOrchestrator: ObservableObject {
 
         // Build env via shared helper (2026-03-19 regression guard — single source of truth)
         let windowId = AppDelegate.shared?.windowId(for: tabManager)?.uuidString
-        let paneEnv = Self.buildAgentPaneEnv(
+        var paneEnv = Self.buildAgentPaneEnv(
             teamName: teamName,
             agentName: agentName,
             agentType: agentType,
@@ -637,6 +643,10 @@ final class TeamOrchestrator: ObservableObject {
             windowId: windowId,
             workspaceId: workspace.id
         )
+        // Profile env is merged last — user-defined values take precedence over defaults.
+        if !extraEnv.isEmpty {
+            paneEnv.merge(extraEnv) { _, new in new }
+        }
 
         // Spawn the split pane. `insertFirst` lets hard-restart respawn into the
         // exact slot the dead pane occupied within its parent split.
@@ -1018,12 +1028,22 @@ final class TeamOrchestrator: ObservableObject {
                     workingDirectory: workingDirectory,
                     mode: .digest
                 )
-                var spec: [String: Any] = ["name": a.name, "agent_type": a.agentType, "cli": cli, "model": a.model]
+                let headlessProfile = CLIPathSettings.activeProfile(for: cli)
+                let headlessExtraArgs = headlessProfile?.extraArgs ?? []
+                let headlessExtraEnv = headlessProfile?.env ?? [:]
+                let headlessModel = headlessProfile?.modelOverride ?? a.model
+                var spec: [String: Any] = ["name": a.name, "agent_type": a.agentType, "cli": cli, "model": headlessModel]
                 if let path = cliPaths[cli] {
                     spec["cli_path"] = path
                 }
                 if !effectiveInstructions.isEmpty {
                     spec["instructions"] = effectiveInstructions
+                }
+                if !headlessExtraArgs.isEmpty {
+                    spec["extra_args"] = headlessExtraArgs
+                }
+                if !headlessExtraEnv.isEmpty {
+                    spec["extra_env"] = headlessExtraEnv
                 }
                 return spec
             }
@@ -1211,11 +1231,15 @@ final class TeamOrchestrator: ObservableObject {
 
             // Delegate pane construction to shared helper (see addAgentPaneToWorkspace).
             let agentResumeSid = agentResumeSessionIds?[agent.name]
+            let activeProfile = CLIPathSettings.activeProfile(for: agentCli)
+            let profileExtraArgs = activeProfile?.extraArgs ?? []
+            let profileExtraEnv = activeProfile?.env ?? [:]
+            let effectiveModel = activeProfile?.modelOverride ?? agent.model
             guard let member = addAgentPaneToWorkspace(
                 workspace: workspace,
                 agentName: agent.name,
                 agentCli: agentCli,
-                agentModel: agent.model,
+                agentModel: effectiveModel,
                 agentType: agent.agentType,
                 agentColor: agentColor,
                 agentInstructions: effectiveInstructions,
@@ -1230,6 +1254,8 @@ final class TeamOrchestrator: ObservableObject {
                 splitFrom: splitFrom,
                 orientation: orientation,
                 resumeSessionId: agentResumeSid,
+                extraArgs: profileExtraArgs,
+                extraEnv: profileExtraEnv,
                 tabManager: tabManager
             ) else {
                 if index == 0 {
@@ -1481,11 +1507,15 @@ final class TeamOrchestrator: ObservableObject {
         }
 
         // 8. Delegate pane construction to the shared helper
+        let attachProfile = CLIPathSettings.activeProfile(for: normalizedCli)
+        let attachExtraArgs = attachProfile?.extraArgs ?? []
+        let attachExtraEnv = attachProfile?.env ?? [:]
+        let attachEffectiveModel = attachProfile?.modelOverride ?? agentModel
         guard let member = addAgentPaneToWorkspace(
             workspace: workspace,
             agentName: agentName,
             agentCli: normalizedCli,
-            agentModel: agentModel,
+            agentModel: attachEffectiveModel,
             agentType: agentType,
             agentColor: agentColor,
             agentInstructions: effectiveInstructions,
@@ -1499,6 +1529,8 @@ final class TeamOrchestrator: ObservableObject {
             worktreeBranch: nil,
             splitFrom: splitFrom,
             orientation: orientation,
+            extraArgs: attachExtraArgs,
+            extraEnv: attachExtraEnv,
             tabManager: tabManager
         ) else {
             return .failure(.paneCreationFailed)
@@ -2828,11 +2860,15 @@ final class TeamOrchestrator: ObservableObject {
             return .failure(.spawnFailed)
         }
         let agentWorkDir = old.originalAgentWorkDir ?? team.workingDirectory
+        let restartProfile = CLIPathSettings.activeProfile(for: old.cli)
+        let restartExtraArgs = restartProfile?.extraArgs ?? []
+        let restartExtraEnv = restartProfile?.env ?? [:]
+        let restartEffectiveModel = restartProfile?.modelOverride ?? old.model
         guard let newMember = addAgentPaneToWorkspace(
             workspace: workspace,
             agentName: old.name,
             agentCli: old.cli,
-            agentModel: old.model,
+            agentModel: restartEffectiveModel,
             agentType: old.agentType,
             agentColor: old.color,
             agentInstructions: old.instructions,
@@ -2847,6 +2883,8 @@ final class TeamOrchestrator: ObservableObject {
             splitFrom: splitFrom,
             orientation: orientation,
             insertFirst: insertFirst,
+            extraArgs: restartExtraArgs,
+            extraEnv: restartExtraEnv,
             tabManager: tabManager
         ) else {
             // Spawn failed — dead panel is still alive; leave it in place rather
@@ -3702,7 +3740,8 @@ final class TeamOrchestrator: ObservableObject {
         parentSessionId: String,
         agentType: String,
         model: String,
-        instructions: String = ""
+        instructions: String = "",
+        extraArgs: [String] = []
     ) -> String {
         var parts = [
             claudePath.contains(" ") ? "\"\(claudePath)\"" : claudePath,
@@ -3725,7 +3764,16 @@ final class TeamOrchestrator: ObservableObject {
             parts.append("--append-system-prompt '\(escaped)'")
         }
 
+        parts += extraArgs.map { shellQuote($0) }
+
         return parts.joined(separator: " ")
+    }
+
+    private func shellQuote(_ s: String) -> String {
+        if s.rangeOfCharacter(from: CharacterSet(charactersIn: " \t\"'\\$`!")) != nil {
+            return "\"" + s.replacingOccurrences(of: "\"", with: "\\\"") + "\""
+        }
+        return s
     }
 
     /// Map short model names (used internally) to kiro-cli model identifiers.
@@ -3788,7 +3836,8 @@ final class TeamOrchestrator: ObservableObject {
         teamName: String,
         model: String,
         isLeader: Bool = false,
-        systemPrompt: String? = nil
+        systemPrompt: String? = nil,
+        extraArgs: [String] = []
     ) -> String {
         let profileName = "team-\(teamName)-\(agentName)"
 
@@ -3835,6 +3884,8 @@ final class TeamOrchestrator: ObservableObject {
             parts.append("--model \(kiroModel)")
         }
 
+        parts += extraArgs.map { shellQuote($0) }
+
         return parts.joined(separator: " ")
     }
 
@@ -3863,7 +3914,8 @@ final class TeamOrchestrator: ObservableObject {
         codexPath: String,
         agentName: String,
         teamName: String,
-        model: String
+        model: String,
+        extraArgs: [String] = []
     ) -> String {
         let path = codexPath.contains(" ") ? "\"\(codexPath)\"" : codexPath
         var parts = [
@@ -3880,6 +3932,8 @@ final class TeamOrchestrator: ObservableObject {
         if !model.isEmpty, let effort = Self.codexReasoningEffort(model) {
             parts.append("-c model_reasoning_effort=\(effort)")
         }
+
+        parts += extraArgs.map { shellQuote($0) }
 
         // Start interactively — leader sends instructions via tm-agent send.
         return parts.joined(separator: " ")
@@ -3900,7 +3954,8 @@ final class TeamOrchestrator: ObservableObject {
         geminiPath: String,
         agentName: String,
         teamName: String,
-        model: String
+        model: String,
+        extraArgs: [String] = []
     ) -> String {
         let path = geminiPath.contains(" ") ? "\"\(geminiPath)\"" : geminiPath
         var parts = [
@@ -3912,6 +3967,8 @@ final class TeamOrchestrator: ObservableObject {
             let geminiModel = Self.geminiModelName(model)
             parts.append("--model \(geminiModel)")
         }
+
+        parts += extraArgs.map { shellQuote($0) }
 
         // Start interactively — leader sends instructions via tm-agent send.
         return parts.joined(separator: " ")

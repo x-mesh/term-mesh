@@ -2,6 +2,14 @@
 
 All notable changes to term-mesh are documented here.
 
+## [Unreleased]
+
+### Added
+- **CLI Profiles** — 여러 개의 named CLI 프로파일(path + extraArgs + env + modelOverride)을 저장하고 메뉴바 / Settings에서 즉시 전환.
+- **Settings → CLI Paths: Recent/Detected dropdown** — 경로 입력 필드에 자동 감지된 경로와 최근 사용 경로를 드롭다운으로 표시.
+- **CLI Profile 자동 마이그레이션** — 기존 `cliPath.<cli>` 값이 시작 시 자동으로 "Default" 프로파일로 변환. 구버전 빌드 호환을 위해 dual-write 유지.
+- **메뉴바 › CLI Profile 서브메뉴** — CLI별 프로파일 목록을 라디오 항목으로 표시하며 즉시 전환 가능. 옵션으로 현재 pane을 새 프로파일로 hard restart.
+
 ## [0.118.0] - 2026-05-15
 
 ### Changed

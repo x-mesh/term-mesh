@@ -462,6 +462,8 @@ mod tests {
             ClaudeSpawnMode::Fresh {
                 session_id: "uuid".into(),
             },
+            &[],
+            &std::collections::HashMap::new(),
         );
         let last = cmd.args.last().unwrap();
         #[cfg(unix)]
@@ -490,6 +492,8 @@ mod tests {
             ClaudeSpawnMode::Fresh {
                 session_id: "u".into(),
             },
+            &[],
+            &std::collections::HashMap::new(),
         );
         assert!(!cmd
             .args

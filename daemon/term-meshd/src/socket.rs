@@ -1777,6 +1777,10 @@ async fn dispatch(req: &Request, ctx: &Context) -> Response {
                 app_socket_path: Option<String>,
                 #[serde(default)]
                 instructions: Option<String>,
+                #[serde(default)]
+                extra_args: Vec<String>,
+                #[serde(default)]
+                extra_env: std::collections::HashMap<String, String>,
             }
             fn default_cli() -> String {
                 "claude".into()
@@ -1794,6 +1798,8 @@ async fn dispatch(req: &Request, ctx: &Context) -> Response {
                         instructions: p.instructions,
                         agent_type: None,
                         color: None,
+                        extra_args: p.extra_args,
+                        extra_env: p.extra_env,
                     };
                     let mut mgr = ctx.headless.lock().await;
                     match mgr

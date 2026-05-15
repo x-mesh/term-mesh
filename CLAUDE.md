@@ -98,6 +98,20 @@ This creates an isolated app with its own name, bundle ID, socket, and derived d
 
 Before launching a new tagged run, clean up any older tags you started in this session (quit old tagged app + remove its `/tmp` socket/derived data).
 
+## CLI Profiles
+
+Named CLI profile sets (path + extraArgs + env + modelOverride) stored in `~/Library/Application Support/term-mesh/cli-profiles.json`.
+
+**Settings에서 만들기:** Settings → CLI Paths에서 각 CLI(claude / kiro / codex / gemini)별로 프로파일을 추가하고 이름, 실행 경로, 추가 인수(extraArgs), 환경 변수, 모델 override를 지정. 경로 필드에는 자동 감지된 경로와 최근 사용 경로가 dropdown으로 표시됨.
+
+**메뉴바에서 전환:** 메뉴바 아이콘 → CLI Profile 서브메뉴에서 CLI별 프로파일을 라디오 버튼으로 즉시 전환. "Apply to Active Pane (Restart)"를 선택하면 현재 pane을 새 프로파일로 hard restart.
+
+**마이그레이션:** 기존 `cliPath.<cli>` 값은 앱 시작 시 자동으로 "Default" 프로파일로 변환되며 원본 UserDefaults 키도 dual-write로 유지됨(구버전 빌드 호환).
+
+**extraArgs 주의:** `--model`, `--resume`, `--session-id`, `--dangerously-skip-permissions`, `--print`, `--append-system-prompt`는 term-mesh가 자동으로 주입하므로 extraArgs에 넣지 말 것(경고 표시됨).
+
+**헤드리스 모드:** `tm-agent create` / `tm-agent attach` 시에도 활성 프로파일의 extraArgs / env / modelOverride가 동일하게 적용됨.
+
 ## Debug event log
 
 All debug events (keys, mouse, focus, splits, tabs) go to a unified log in DEBUG builds:

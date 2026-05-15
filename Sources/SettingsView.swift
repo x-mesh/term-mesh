@@ -1369,7 +1369,7 @@ struct SettingsView: View {
                         SettingsCardDivider()
                         CLIPathRow(label: "Gemini", cliKey: "gemini", path: $cliPathGemini)
                     }
-        SettingsCardNote("Leave empty to use auto-detected path. Custom paths take priority.")
+        SettingsCardNote("Select or create profiles to customize path, extra args, and env per CLI. Active profile takes priority over auto-detect.")
     }
 
     // MARK: - Section: Agent Models

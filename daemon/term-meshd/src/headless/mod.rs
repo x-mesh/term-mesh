@@ -380,6 +380,12 @@ pub struct AgentSpec {
     /// Phase 2: optional UI color hint persisted in metadata.
     #[serde(default)]
     pub color: Option<String>,
+    /// Extra CLI arguments appended after the standard args (no shell escaping needed).
+    #[serde(default)]
+    pub extra_args: Vec<String>,
+    /// Extra environment variables merged into the subprocess env (base env takes precedence).
+    #[serde(default)]
+    pub extra_env: std::collections::HashMap<String, String>,
 }
 
 /// Manages all headless agent subprocesses and teams.
@@ -418,6 +424,10 @@ struct InternalSpawnArgs {
     /// Phase 2.5: existing cumulative usage to seed counters with (resume /
     /// unpark path). None ⇒ fresh zero counters.
     preloaded_usage: Option<meta::UsageTotals>,
+    /// Extra CLI arguments appended after the standard args.
+    extra_args: Vec<String>,
+    /// Extra environment variables merged into the subprocess env.
+    extra_env: std::collections::HashMap<String, String>,
 }
 
 impl HeadlessManager {
@@ -488,6 +498,8 @@ impl HeadlessManager {
             claude_session_id: session_id.clone(),
             resume_claude: false,
             preloaded_usage: None,
+            extra_args: Vec::new(),
+            extra_env: std::collections::HashMap::new(),
         };
 
         self.spawn_internal(internal).await
@@ -512,6 +524,8 @@ impl HeadlessManager {
                 &daemon_socket,
                 args.cli_path.as_deref(),
                 args.app_socket_path.as_deref(),
+                &args.extra_args,
+                &args.extra_env,
             ),
             "codex" => cli_builder::build_codex_command(
                 &args.name,
@@ -520,6 +534,8 @@ impl HeadlessManager {
                 &daemon_socket,
                 args.cli_path.as_deref(),
                 args.app_socket_path.as_deref(),
+                &args.extra_args,
+                &args.extra_env,
             ),
             "gemini" => cli_builder::build_gemini_command(
                 &args.name,
@@ -528,6 +544,8 @@ impl HeadlessManager {
                 &daemon_socket,
                 args.cli_path.as_deref(),
                 args.app_socket_path.as_deref(),
+                &args.extra_args,
+                &args.extra_env,
             ),
             _ => {
                 let session_id = args
@@ -549,6 +567,8 @@ impl HeadlessManager {
                     args.app_socket_path.as_deref(),
                     args.instructions.as_deref(),
                     mode,
+                    &args.extra_args,
+                    &args.extra_env,
                 )
             }
         };
@@ -993,6 +1013,8 @@ impl HeadlessManager {
                 // create_team always starts fresh counters; resume_team has
                 // its own path that seeds preloaded_usage from disk.
                 preloaded_usage: None,
+                extra_args: spec.extra_args.clone(),
+                extra_env: spec.extra_env.clone(),
             };
 
             match self.spawn_internal(internal).await {
@@ -1395,6 +1417,8 @@ impl HeadlessManager {
             claude_session_id: session_id,
             resume_claude: false,
             preloaded_usage: None,
+            extra_args: spec.extra_args,
+            extra_env: spec.extra_env,
         };
 
         let info = self.spawn_internal(internal).await?;
@@ -1571,6 +1595,8 @@ impl HeadlessManager {
             resume_claude: agent_meta.cli == "claude",
             // Phase 2.5: carry usage forward through park→unpark.
             preloaded_usage: agent_meta.usage_total.clone(),
+            extra_args: Vec::new(),
+            extra_env: std::collections::HashMap::new(),
         };
 
         let info = self
@@ -2095,6 +2121,8 @@ impl HeadlessManager {
                 resume_claude: m.cli == "claude",
                 // Phase 2.5: carry usage forward through destroy→resume.
                 preloaded_usage: m.usage_total.clone(),
+                extra_args: Vec::new(),
+                extra_env: std::collections::HashMap::new(),
             };
 
             match self.spawn_internal(internal).await {
