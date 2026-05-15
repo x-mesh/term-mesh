@@ -630,7 +630,7 @@ struct TeamCreationView: View {
         let isExpanded = expandedResumeAgentTeams.contains(team.teamUuid)
 
         VStack(alignment: .leading, spacing: 6) {
-            // Row 1: team name + mode badge + agent count
+            // Row 1: team name + mode badge + delete + agent count
             HStack(spacing: 6) {
                 Text(team.teamName)
                     .font(.headline)
@@ -644,6 +644,16 @@ struct TeamCreationView: View {
                         ? "Pane-mode team — agents run in visible terminal panes"
                         : "Headless team — agents run as background subprocesses")
                 Spacer()
+                // On-demand archive delete. Auto GC sweeps anything older than
+                // 7 days; this lets users drop archives they're done with.
+                Button(action: { confirmDeleteArchive(team) }) {
+                    Image(systemName: "trash")
+                        .font(.caption)
+                        .foregroundStyle(.tertiary)
+                }
+                .buttonStyle(.plain)
+                .help("Delete this archived team (auto-deleted after 7 days)")
+                .accessibilityLabel("Delete archive")
                 Text("\(team.agents.count) agent\(team.agents.count == 1 ? "" : "s")")
                     .font(.caption)
                     .foregroundStyle(.secondary)
@@ -879,6 +889,38 @@ struct TeamCreationView: View {
     private func currentGitRoot() -> String? {
         let cwd = resolveWorkingDirectory()
         return TermMeshDaemon.shared.findGitRoot(from: cwd)
+    }
+
+    /// Confirm and delete an archived team via `team.delete_archive`. Refreshes
+    /// the picker list on success. Auto-GC sweeps anything older than 7 days
+    /// (`ARCHIVE_RETENTION_SECS` in the daemon), but this gives users on-demand
+    /// control to drop archives they're done with.
+    private func confirmDeleteArchive(_ team: ResumableTeam) {
+        let alert = NSAlert()
+        alert.messageText = "Delete archived team \"\(team.teamName)\"?"
+        alert.informativeText = "The archive will be permanently removed. Sessions inside this archive will no longer be resumable. Auto-GC also removes archives older than 7 days."
+        alert.addButton(withTitle: "Delete")
+        alert.addButton(withTitle: "Cancel")
+        alert.alertStyle = .warning
+        alert.presentAsSheet { response in
+            guard response == .alertFirstButtonReturn else { return }
+            let params: [String: Any] = ["team_uuid": team.teamUuid]
+            DispatchQueue.global(qos: .userInitiated).async {
+                let raw = TermMeshDaemon.shared.rpcCallRaw(
+                    method: "team.delete_archive",
+                    params: params
+                )
+                DispatchQueue.main.async {
+                    if let raw, raw.contains("\"error\"") {
+                        resumeErrorMessage = "Failed to delete archive."
+                    }
+                    if selectedResumeTeamId == team.teamUuid {
+                        selectedResumeTeamId = nil
+                    }
+                    loadResumableTeams()
+                }
+            }
+        }
     }
 
     /// Invoke the appropriate resume RPC based on the team's archive mode.

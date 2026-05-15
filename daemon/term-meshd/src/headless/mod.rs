@@ -1259,6 +1259,38 @@ impl HeadlessManager {
         })
     }
 
+    /// Delete a single archived team on demand. Mirrors what `gc_sweep` does
+    /// after `ARCHIVE_RETENTION_SECS`, but available immediately from the
+    /// resume picker so users can drop archives they no longer need. Returns
+    /// `deleted: false` (without error) when the uuid has no archive — keeps
+    /// the UI idempotent (clicking delete after another machine already swept
+    /// shouldn't surface as an error).
+    pub fn delete_archive(&self, params: DeleteArchiveParams) -> Result<DeleteArchiveResult, String> {
+        let team_uuid = meta::parse_uuid(&params.team_uuid)?;
+        let entries = meta::list_archived_teams()
+            .map_err(|e| format!("scan archived: {e}"))?;
+        let entry = match entries.into_iter().find(|e| e.team_uuid == team_uuid) {
+            Some(e) => e,
+            None => {
+                return Ok(DeleteArchiveResult {
+                    team_uuid,
+                    deleted: false,
+                });
+            }
+        };
+        std::fs::remove_dir_all(&entry.archived_dir)
+            .map_err(|e| format!("remove {}: {e}", entry.archived_dir.display()))?;
+        tracing::info!(
+            "manually deleted archived team {} ({})",
+            entry.archived_dir.display(),
+            team_uuid
+        );
+        Ok(DeleteArchiveResult {
+            team_uuid,
+            deleted: true,
+        })
+    }
+
     pub fn list_teams(&self) -> Vec<&HeadlessTeam> {
         self.teams.values().collect()
     }
@@ -2216,6 +2248,20 @@ pub struct ArchivePaneResult {
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct ResumePaneParams {
     pub team_uuid: String,
+}
+
+/// Params for `team.delete_archive` — remove a single archived team. Mirrors
+/// what `gc_sweep` would do after the retention window, but on-demand from the
+/// resume picker so users can drop an archive they no longer need.
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct DeleteArchiveParams {
+    pub team_uuid: String,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct DeleteArchiveResult {
+    pub team_uuid: String,
+    pub deleted: bool,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]

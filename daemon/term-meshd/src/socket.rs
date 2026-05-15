@@ -1687,6 +1687,18 @@ async fn dispatch(req: &Request, ctx: &Context) -> Response {
                 Err(e) => Err(format!("invalid params: {e}")),
             }
         }
+        "team.delete_archive" => {
+            // On-demand archive removal from the resume picker. Works for both
+            // pane-mode and headless archives — both live in the same directory.
+            match serde_json::from_value::<crate::headless::DeleteArchiveParams>(req.params.clone()) {
+                Ok(p) => {
+                    let mgr = ctx.headless.lock().await;
+                    mgr.delete_archive(p)
+                        .map(|r| serde_json::to_value(r).unwrap())
+                }
+                Err(e) => Err(format!("invalid params: {e}")),
+            }
+        }
         "headless.set_idle_park_minutes" => {
             #[derive(Deserialize)]
             struct P {
