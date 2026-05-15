@@ -2810,43 +2810,473 @@ private struct CLIPathRow: View {
     let label: String
     let cliKey: String
     @Binding var path: String
-    @State private var autoDetected: String = ""
+
+    @State private var profiles: [CliProfile] = []
+    @State private var activeProfileId: UUID? = nil
+    @State private var detectedCandidates: [String] = []
+    @State private var recentPaths: [String] = []
+    @State private var showManageSheet = false
+
+    private var activeProfile: CliProfile? {
+        profiles.first { $0.id == activeProfileId }
+    }
+
+    private var resolvedPath: String {
+        if let exe = activeProfile?.executable, !exe.isEmpty { return exe }
+        return detectedCandidates.first ?? ""
+    }
+
+    private var pathExists: Bool {
+        !resolvedPath.isEmpty && FileManager.default.fileExists(atPath: resolvedPath)
+    }
 
     var body: some View {
-        let resolvedPath = path.isEmpty ? autoDetected : path
-        let exists = !resolvedPath.isEmpty && FileManager.default.fileExists(atPath: resolvedPath)
-
         SettingsCardRow(
             label,
-            subtitle: resolvedPath.isEmpty
-                ? "Not found"
-                : resolvedPath
+            subtitle: resolvedPath.isEmpty ? "Not found" : resolvedPath
         ) {
             HStack(spacing: 6) {
                 Circle()
-                    .fill(resolvedPath.isEmpty ? Color.red : (exists ? Color.green : Color.red))
+                    .fill(resolvedPath.isEmpty ? Color.red : (pathExists ? Color.green : Color.red))
                     .frame(width: 8, height: 8)
-                    .help(resolvedPath.isEmpty ? "Not found" : (exists ? "Found" : "File not found"))
-                TextField("auto-detect", text: $path)
-                    .textFieldStyle(.roundedBorder)
-                    .frame(width: 200)
-                Button("Browse…") {
-                    let panel = NSOpenPanel()
-                    panel.canChooseDirectories = false
-                    panel.canChooseFiles = true
-                    panel.allowsMultipleSelection = false
-                    panel.treatsFilePackagesAsDirectories = true
-                    panel.presentAsSheet { response in
-                        if response == .OK, let url = panel.url {
-                            path = url.path
+                    .help(resolvedPath.isEmpty ? "Not found"
+                          : (pathExists ? "Found" : "File not found at path"))
+
+                Text(activeProfile?.name ?? "auto-detect")
+                    .font(.system(size: 12))
+                    .foregroundColor(activeProfileId == nil ? .secondary : .primary)
+                    .frame(minWidth: 60, maxWidth: 120, alignment: .leading)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+
+                Menu {
+                    if !profiles.isEmpty {
+                        Section("Profiles") {
+                            Picker(
+                                selection: Binding<UUID?>(
+                                    get: { activeProfileId },
+                                    set: { id in
+                                        guard let id,
+                                              let p = profiles.first(where: { $0.id == id })
+                                        else { return }
+                                        activateProfile(p)
+                                    }
+                                )
+                            ) {
+                                ForEach(profiles) { p in
+                                    Text(p.name).tag(Optional(p.id))
+                                }
+                            } label: { EmptyView() }
+                                .pickerStyle(.inline)
+                        }
+                        Divider()
+                    }
+                    if !detectedCandidates.isEmpty {
+                        Section("Detected") {
+                            ForEach(detectedCandidates, id: \.self) { p in
+                                Button(p) { useExecutable(p) }
+                            }
                         }
                     }
+                    if !recentPaths.isEmpty {
+                        Section("Recent") {
+                            ForEach(recentPaths, id: \.self) { p in
+                                Button(p) { useExecutable(p) }
+                            }
+                        }
+                    }
+                    Divider()
+                    Button("Browse…") { browse() }
+                    Button("Manage Profiles…") { showManageSheet = true }
+                } label: {
+                    Image(systemName: "chevron.down")
+                        .font(.system(size: 10))
+                        .foregroundColor(.secondary)
+                }
+                .menuStyle(.borderlessButton)
+                .frame(width: 22)
+            }
+        }
+        .sheet(isPresented: $showManageSheet, onDismiss: refresh) {
+            CLIProfileManageSheet(cliKey: cliKey, cliLabel: label)
+        }
+        .onAppear { refresh() }
+    }
+
+    private func refresh() {
+        profiles = CLIPathSettings.profiles(for: cliKey)
+        activeProfileId = CLIPathSettings.activeProfile(for: cliKey)?.id
+        detectedCandidates = Self.allCandidates(for: cliKey)
+        recentPaths = CLIPathSettings.recent(for: cliKey)
+    }
+
+    private func activateProfile(_ profile: CliProfile) {
+        CLIPathSettings.setActiveProfile(profile, for: cliKey)
+        if !profile.executable.isEmpty {
+            CLIPathSettings.addRecent(profile.executable, for: cliKey)
+            path = profile.executable
+        }
+        refresh()
+    }
+
+    private func useExecutable(_ exe: String) {
+        CLIPathSettings.addRecent(exe, for: cliKey)
+        if var active = CLIPathSettings.activeProfile(for: cliKey) {
+            active.executable = exe
+            CliProfileStore.shared.save(active, for: cliKey)
+            CLIPathSettings.setActiveProfile(active, for: cliKey)
+        } else {
+            let newProfile = CliProfile(name: "Default", family: cliKey, executable: exe)
+            CliProfileStore.shared.save(newProfile, for: cliKey)
+            CLIPathSettings.setActiveProfile(newProfile, for: cliKey)
+        }
+        path = exe
+        refresh()
+    }
+
+    private func browse() {
+        let panel = NSOpenPanel()
+        panel.canChooseDirectories = false
+        panel.canChooseFiles = true
+        panel.allowsMultipleSelection = false
+        panel.treatsFilePackagesAsDirectories = true
+        panel.presentAsSheet { response in
+            if response == .OK, let url = panel.url {
+                useExecutable(url.path)
+            }
+        }
+    }
+
+    private static func allCandidates(for cli: String) -> [String] {
+        let home = NSHomeDirectory()
+        let list: [String]
+        switch cli {
+        case "claude":
+            list = [
+                (home as NSString).appendingPathComponent(".local/bin/claude"),
+                "/opt/homebrew/bin/claude",
+                "/usr/local/bin/claude",
+                (home as NSString).appendingPathComponent(".npm-global/bin/claude"),
+                "/opt/homebrew/opt/node/bin/claude",
+            ]
+        case "kiro":
+            list = [
+                (home as NSString).appendingPathComponent(".local/bin/kiro-cli"),
+                "/usr/local/bin/kiro-cli",
+                "/opt/homebrew/bin/kiro-cli",
+            ]
+        case "codex":
+            list = [
+                "/opt/homebrew/bin/codex",
+                "/usr/local/bin/codex",
+                (home as NSString).appendingPathComponent(".local/bin/codex"),
+                (home as NSString).appendingPathComponent(".cargo/bin/codex"),
+                (home as NSString).appendingPathComponent(".npm-global/bin/codex"),
+                (home as NSString).appendingPathComponent(".volta/bin/codex"),
+                "/opt/homebrew/opt/node/bin/codex",
+            ]
+        case "gemini":
+            list = [
+                "/opt/homebrew/bin/gemini",
+                "/usr/local/bin/gemini",
+                (home as NSString).appendingPathComponent(".local/bin/gemini"),
+                (home as NSString).appendingPathComponent(".npm-global/bin/gemini"),
+                (home as NSString).appendingPathComponent(".volta/bin/gemini"),
+                "/opt/homebrew/opt/node/bin/gemini",
+            ]
+        default:
+            list = []
+        }
+        return list.filter { FileManager.default.fileExists(atPath: $0) }
+    }
+}
+
+private struct CLIProfileManageSheet: View {
+    let cliKey: String
+    let cliLabel: String
+    @Environment(\.dismiss) private var dismiss
+
+    @State private var profiles: [CliProfile] = []
+    @State private var activeId: UUID? = nil
+    @State private var editingProfile: CliProfile? = nil
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            HStack {
+                Text("\(cliLabel) Profiles")
+                    .font(.headline)
+                Spacer()
+                Button("Done") { dismiss() }
+                    .keyboardShortcut(.defaultAction)
+            }
+            .padding(.horizontal, 20)
+            .padding(.vertical, 14)
+
+            Divider()
+
+            if profiles.isEmpty {
+                VStack(spacing: 8) {
+                    Text("No profiles yet.")
+                        .foregroundColor(.secondary)
+                    Text("Add a profile to customize the executable, extra args, or environment variables.")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                        .multilineTextAlignment(.center)
+                        .padding(.horizontal, 40)
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+            } else {
+                List {
+                    ForEach(profiles) { profile in
+                        HStack(spacing: 10) {
+                            Button {
+                                CLIPathSettings.setActiveProfile(profile, for: cliKey)
+                                activeId = profile.id
+                            } label: {
+                                Image(systemName: activeId == profile.id
+                                      ? "largecircle.fill.circle" : "circle")
+                                    .font(.system(size: 16))
+                                    .foregroundColor(activeId == profile.id ? .accentColor : .secondary)
+                            }
+                            .buttonStyle(.plain)
+
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text(profile.name)
+                                    .font(.system(size: 13, weight: .medium))
+                                Text(profile.executable.isEmpty ? "auto-detect" : profile.executable)
+                                    .font(.caption)
+                                    .foregroundColor(.secondary)
+                                    .lineLimit(1)
+                                    .truncationMode(.middle)
+                                if !profile.extraArgs.isEmpty {
+                                    Text("args: " + profile.extraArgs.joined(separator: " "))
+                                        .font(.caption)
+                                        .foregroundColor(.secondary)
+                                        .lineLimit(1)
+                                }
+                            }
+                            Spacer()
+
+                            Button("Edit") { editingProfile = profile }
+                                .buttonStyle(.bordered)
+                                .controlSize(.small)
+
+                            Button(role: .destructive) { deleteProfile(profile) } label: {
+                                Image(systemName: "trash")
+                            }
+                            .buttonStyle(.plain)
+                            .foregroundColor(.red)
+                            .help("Delete \"\(profile.name)\"")
+                        }
+                        .padding(.vertical, 2)
+                    }
+                }
+                .listStyle(.inset)
+            }
+
+            Divider()
+
+            HStack {
+                Button {
+                    editingProfile = CliProfile(name: "", family: cliKey, executable: "")
+                } label: {
+                    Label("Add Profile", systemImage: "plus")
                 }
                 .buttonStyle(.bordered)
                 .controlSize(.small)
+                Spacer()
+            }
+            .padding(.horizontal, 20)
+            .padding(.vertical, 12)
+        }
+        .frame(width: 520, height: 360)
+        .onAppear { loadProfiles() }
+        .sheet(item: $editingProfile, onDismiss: loadProfiles) { profile in
+            CLIProfileEditView(profile: profile, cliKey: cliKey)
+        }
+    }
+
+    private func loadProfiles() {
+        profiles = CLIPathSettings.profiles(for: cliKey)
+        activeId = CLIPathSettings.activeProfile(for: cliKey)?.id
+    }
+
+    private func deleteProfile(_ profile: CliProfile) {
+        CliProfileStore.shared.delete(profile, for: cliKey)
+        if activeId == profile.id {
+            UserDefaults.standard.removeObject(forKey: "cliProfiles.active.\(cliKey)")
+        }
+        loadProfiles()
+    }
+}
+
+private struct CLIProfileEditView: View {
+    @State private var profile: CliProfile
+    let cliKey: String
+    let titleText: String
+    @Environment(\.dismiss) private var dismiss
+
+    @State private var extraArgsText = ""
+    @State private var envText = ""
+
+    private static let bannedArgs = [
+        "--model", "--dangerously-skip-permissions", "--session-id",
+        "--resume", "--print", "--append-system-prompt"
+    ]
+
+    private var hasBannedArgs: Bool {
+        extraArgsText.split(separator: " ").contains { Self.bannedArgs.contains(String($0)) }
+    }
+
+    init(profile: CliProfile, cliKey: String) {
+        _profile = State(initialValue: profile)
+        self.cliKey = cliKey
+        let exists = CliProfileStore.shared.profiles(for: cliKey).contains { $0.id == profile.id }
+        self.titleText = exists ? "Edit Profile" : "Add Profile"
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            HStack {
+                Text(titleText).font(.headline)
+                Spacer()
+                Button("Cancel") { dismiss() }
+                    .keyboardShortcut(.cancelAction)
+            }
+            .padding(.horizontal, 20)
+            .padding(.vertical, 14)
+
+            Divider()
+
+            ScrollView {
+                VStack(alignment: .leading, spacing: 14) {
+                    fieldRow(label: "Name") {
+                        TextField("e.g. Work, Opus Heavy", text: $profile.name)
+                            .textFieldStyle(.roundedBorder)
+                            .frame(width: 260)
+                    }
+
+                    fieldRow(label: "Executable") {
+                        HStack(spacing: 6) {
+                            TextField("auto-detect", text: $profile.executable)
+                                .textFieldStyle(.roundedBorder)
+                                .frame(width: 220)
+                            Button("Browse…") {
+                                let panel = NSOpenPanel()
+                                panel.canChooseFiles = true
+                                panel.canChooseDirectories = false
+                                panel.allowsMultipleSelection = false
+                                panel.treatsFilePackagesAsDirectories = true
+                                panel.presentAsSheet { response in
+                                    if response == .OK, let url = panel.url {
+                                        profile.executable = url.path
+                                    }
+                                }
+                            }
+                            .buttonStyle(.bordered)
+                            .controlSize(.small)
+                        }
+                    }
+
+                    VStack(alignment: .leading, spacing: 4) {
+                        HStack(spacing: 4) {
+                            Text("Extra Args")
+                                .font(.system(size: 13, weight: .medium))
+                            if hasBannedArgs {
+                                Image(systemName: "exclamationmark.triangle.fill")
+                                    .foregroundColor(.yellow)
+                                    .font(.system(size: 12))
+                                    .help("Contains flags auto-injected by term-mesh:\n"
+                                          + Self.bannedArgs.joined(separator: ", "))
+                            }
+                        }
+                        TextField("e.g. --no-cache --timeout 60", text: $extraArgsText)
+                            .textFieldStyle(.roundedBorder)
+                        Text("Space-separated. Appended after term-mesh's built-in flags.")
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                    }
+
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("Environment Variables")
+                            .font(.system(size: 13, weight: .medium))
+                        TextEditor(text: $envText)
+                            .font(.system(.caption, design: .monospaced))
+                            .frame(minHeight: 64, maxHeight: 96)
+                            .overlay(
+                                RoundedRectangle(cornerRadius: 5)
+                                    .stroke(Color(NSColor.separatorColor), lineWidth: 1)
+                            )
+                        Text("One KEY=VALUE per line.")
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                    }
+
+                    fieldRow(label: "Model Override") {
+                        Picker("", selection: $profile.modelOverride) {
+                            Text("None (use team default)").tag(Optional<String>.none)
+                            Text("opus").tag(Optional<String>.some("opus"))
+                            Text("sonnet").tag(Optional<String>.some("sonnet"))
+                            Text("haiku").tag(Optional<String>.some("haiku"))
+                        }
+                        .pickerStyle(.menu)
+                        .frame(width: 200)
+                    }
+                }
+                .padding(20)
+            }
+
+            Divider()
+
+            HStack {
+                Spacer()
+                Button("Save") { saveAndDismiss() }
+                    .buttonStyle(.borderedProminent)
+                    .keyboardShortcut(.defaultAction)
+                    .disabled(profile.name.trimmingCharacters(in: .whitespaces).isEmpty)
+            }
+            .padding(.horizontal, 20)
+            .padding(.vertical, 12)
+        }
+        .frame(width: 480)
+        .onAppear {
+            extraArgsText = profile.extraArgs.joined(separator: " ")
+            envText = profile.env
+                .sorted { $0.key < $1.key }
+                .map { "\($0.key)=\($0.value)" }
+                .joined(separator: "\n")
+        }
+    }
+
+    @ViewBuilder
+    private func fieldRow<Content: View>(
+        label: String,
+        @ViewBuilder content: () -> Content
+    ) -> some View {
+        HStack(alignment: .center, spacing: 12) {
+            Text(label)
+                .font(.system(size: 13, weight: .medium))
+                .frame(width: 120, alignment: .trailing)
+            content()
+            Spacer()
+        }
+    }
+
+    private func saveAndDismiss() {
+        profile.name = profile.name.trimmingCharacters(in: .whitespaces)
+        profile.extraArgs = extraArgsText
+            .split(separator: " ")
+            .map(String.init)
+            .filter { !$0.isEmpty }
+        profile.env = [:]
+        for line in envText.split(separator: "\n") {
+            let kv = line.split(separator: "=", maxSplits: 1)
+            if kv.count == 2 {
+                profile.env[String(kv[0]).trimmingCharacters(in: .whitespaces)] = String(kv[1])
             }
         }
-        .onAppear { autoDetected = CLIPathSettings.autoDetect(cli: cliKey) }
+        CliProfileStore.shared.save(profile, for: cliKey)
+        dismiss()
     }
 }
 
