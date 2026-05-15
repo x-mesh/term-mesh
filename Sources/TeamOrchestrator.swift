@@ -3565,6 +3565,9 @@ final class TeamOrchestrator: ObservableObject {
             if let root = team.gitRepoRoot, !root.isEmpty { return root }
             return TermMeshDaemon.shared.findGitRoot(from: team.workingDirectory)
         }()
+        #if DEBUG
+        dlog("[archive_pane.git_root] team=\(team.id) team.gitRepoRoot=\(team.gitRepoRoot ?? "nil") workingDirectory=\(team.workingDirectory) resolved=\(resolvedGitRoot ?? "nil")")
+        #endif
         if let root = resolvedGitRoot, !root.isEmpty {
             payload["git_root"] = root
         }
