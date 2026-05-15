@@ -349,6 +349,49 @@ struct TitlebarControlButton<Content: View>: View {
     }
 }
 
+/// Titlebar control showing the control-socket health and offering a one-click
+/// restart. Self-contained: observes `SocketStatusModel.shared` directly so it
+/// can be dropped into the controls group without threading new state through
+/// `TitlebarControlsView`. The button routes through
+/// `TerminalController.recoverSocket()` — the same `start()` path a Settings
+/// mode-toggle uses — so recovery never requires an app restart.
+struct SocketStatusControl: View {
+    let config: TitlebarControlsStyleConfig
+    @ObservedObject private var status = SocketStatusModel.shared
+
+    private var tint: Color {
+        switch status.health {
+        case .healthy: return .green
+        case .halfDead: return .orange
+        case .stopped: return .secondary
+        }
+    }
+
+    private var iconName: String {
+        switch status.health {
+        case .healthy: return "bolt.horizontal.circle.fill"
+        case .halfDead, .stopped: return "bolt.horizontal.circle"
+        }
+    }
+
+    var body: some View {
+        TitlebarControlButton(config: config, action: {
+            #if DEBUG
+            dlog("titlebar.socketRestart health=\(status.health.shortLabel)")
+            #endif
+            TerminalController.shared.recoverSocket()
+        }) {
+            Image(systemName: iconName)
+                .font(.system(size: config.iconSize, weight: .semibold))
+                .foregroundColor(tint)
+                .frame(width: config.buttonSize, height: config.buttonSize)
+        }
+        .accessibilityIdentifier("titlebarControl.socketStatus")
+        .accessibilityLabel("Socket status: \(status.health.shortLabel)")
+        .help("\(status.health.shortLabel) — click to restart the control socket")
+    }
+}
+
 struct TitlebarControlsView: View {
     @ObservedObject var notificationStore: TerminalNotificationStore
     @ObservedObject var viewModel: TitlebarControlsViewModel
@@ -502,6 +545,8 @@ struct TitlebarControlsView: View {
                     viewModel: viewModel
                 )
             )
+
+            SocketStatusControl(config: config)
         }
 
         let paddedContent = content.padding(config.groupPadding)

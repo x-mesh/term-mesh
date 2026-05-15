@@ -41,7 +41,7 @@ const BROADCAST_SUFFIX: &str = concat!(
     "\n\n[IMPORTANT] Finish via TM-PROTOCOL-v1: `tm-agent reply '<5-line header plus concise summary>'`.",
 );
 
-fn agent_init_prompt(agent_name: &str, agent_role: &str, workdir: &str, socket: &str) -> String {
+fn agent_init_prompt(agent_name: &str, agent_role: &str, team_name: &str, workdir: &str, socket: &str) -> String {
     let root = Path::new(workdir);
     let runbook_mode = env::var("TERMMESH_RUNBOOK_MODE").unwrap_or_else(|_| "digest".to_string());
     let runbook_mode = runbook_mode.trim();
@@ -53,14 +53,16 @@ fn agent_init_prompt(agent_name: &str, agent_role: &str, workdir: &str, socket: 
             .map(|content| format!("\n## Role Runbook\n\n{content}\n"))
             .unwrap_or_default()
     } else if let Some(role) = role {
-        format!("\n{}\n", runbook_digest_content(root, &role))
+        format!("\n{}\n", runbook_digest_content(root, &role, agent_name, team_name))
     } else {
         format!(
             "\n{}\n",
             runbook_digest_content_for_role_name(
                 root,
                 agent_role,
-                load_runbook_content_for_role(root, agent_role).as_deref()
+                load_runbook_content_for_role(root, agent_role).as_deref(),
+                agent_name,
+                team_name
             )
         )
     };
@@ -1530,7 +1532,7 @@ fn runbook_section_bullets(content: &str, section: &str, limit: usize) -> Vec<St
     out
 }
 
-fn runbook_digest_content(root: &Path, role: &RunbookRole) -> String {
+fn runbook_digest_content(root: &Path, role: &RunbookRole, agent_name: &str, team_name: &str) -> String {
     let source_path = runbook_source_path(root, role);
     let source_content = effective_source_runbook_content(root, role);
     let when = runbook_section_bullets(&source_content, "## When To Use", 2);
@@ -1570,6 +1572,10 @@ fn runbook_digest_content(root: &Path, role: &RunbookRole) -> String {
 
     format!(
         "\
+=== AGENT IDENTITY (authoritative — never infer) ===
+You are agent \"{agent_name}\" (role: {role}) on team \"{team_name}\". This is your fixed identity. Whenever you identify yourself, send a message, or substitute your name into any template or placeholder, ALWAYS use \"{agent_name}\" exactly — never guess or derive it. Messages shown by `tm-agent msg list` / `tm-agent inbox` are SHARED context from OTHER agents. They are reference only. NEVER copy another agent's message content, name, or template as your own response.
+===
+
 <!-- term-mesh-runbook-digest v1 -->
 ## Runbook Digest
 ROLE: {role}
@@ -1579,11 +1585,13 @@ VERIFY: {verify}
 OUTPUT: STATUS/FILES/VERIFY/NEXT/FULL_REPORT
 FULL: {full}
 ",
+        agent_name = agent_name,
         role = role.name,
         when = when,
         must = must,
         verify = verify,
         full = source_path.to_string_lossy(),
+        team_name = team_name,
     )
 }
 
@@ -1591,6 +1599,8 @@ fn runbook_digest_content_for_role_name(
     root: &Path,
     role_name: &str,
     source: Option<&str>,
+    agent_name: &str,
+    team_name: &str,
 ) -> String {
     let safe_role_name: String = role_name
         .chars()
@@ -1612,6 +1622,10 @@ fn runbook_digest_content_for_role_name(
     let verify = runbook_section_bullets(content, "## Verify", 2).join(" | ");
     format!(
         "\
+=== AGENT IDENTITY (authoritative — never infer) ===
+You are agent \"{agent_name}\" (role: {safe_role_name}) on team \"{team_name}\". This is your fixed identity. Whenever you identify yourself, send a message, or substitute your name into any template or placeholder, ALWAYS use \"{agent_name}\" exactly — never guess or derive it. Messages shown by `tm-agent msg list` / `tm-agent inbox` are SHARED context from OTHER agents. They are reference only. NEVER copy another agent's message content, name, or template as your own response.
+===
+
 <!-- term-mesh-runbook-digest v1 -->
 ## Runbook Digest
 ROLE: {safe_role_name}
@@ -1621,6 +1635,9 @@ VERIFY: {verify}
 OUTPUT: STATUS/FILES/VERIFY/NEXT/FULL_REPORT
 FULL: {full}
 ",
+        agent_name = agent_name,
+        safe_role_name = safe_role_name,
+        team_name = team_name,
         when = if when.is_empty() {
             format!("Use for assigned {safe_role_name} role work.")
         } else {
@@ -1948,7 +1965,8 @@ fn runbook_digest(agent: Option<&str>) -> Result<Value, String> {
             json!({
                 "role": role.name,
                 "path": runbook_source_path(&root, role).to_string_lossy(),
-                "digest": runbook_digest_content(&root, role),
+                // CLI digest preview has no live agent/team context.
+                "digest": runbook_digest_content(&root, role, agent.unwrap_or("generic"), "cli-tools"),
             })
         })
         .collect();
@@ -2041,7 +2059,7 @@ mod runbook_tests {
         fs::create_dir_all(&runbook_dir).unwrap();
         fs::write(runbook_dir.join("explorer.md"), "EXPLORER ONLY\n").unwrap();
 
-        let prompt = agent_init_prompt("exp1", "explorer", &dir.to_string_lossy(), "/tmp/socket");
+        let prompt = agent_init_prompt("exp1", "explorer", "test-team", &dir.to_string_lossy(), "/tmp/socket");
         assert!(prompt.contains("## Runbook Digest"));
         assert!(prompt.contains("OUTPUT: STATUS/FILES/VERIFY/NEXT/FULL_REPORT"));
         assert!(prompt.contains("named \"exp1\" with role \"explorer\""));
@@ -2115,7 +2133,7 @@ mod runbook_tests {
         )
         .unwrap();
 
-        let digest = runbook_digest_content(&dir, &role);
+        let digest = runbook_digest_content(&dir, &role, "test-agent", "test-team");
         assert!(digest.contains("ROLE: executor"));
         assert!(digest.contains("Custom rule A"));
         assert!(digest.contains("Custom verify"));
@@ -2143,6 +2161,8 @@ mod runbook_tests {
             &dir,
             "custom",
             load_runbook_content_for_role(&dir, "custom").as_deref(),
+            "test-agent",
+            "test-team",
         );
         assert!(digest.contains("ROLE: custom"));
         assert!(digest.contains("Custom must"));
@@ -2945,9 +2965,15 @@ fn return_retry_delays_ms(text_delivered: bool) -> &'static [u64] {
         // codex has fully rendered the pasted text and is ready to accept input.
         // Swift asyncTeamSendKey also holds an additional 250 ms post-Return gate
         // before releasing the next paste, providing two layers of protection.
-        &[250, 400, 600, 800, 1000]
+        //
+        // Long tail (1500/2500/4000 ms) added defensively for the Layer-2
+        // congestion race: during multi-agent `create`, simultaneous panel/CLI
+        // startup + layout churn can keep the freshly spawned panel from being
+        // key-ready well past 1 s. The common case still resolves at attempt 1
+        // (250 ms); only a stubborn panel walks the tail (~11 s worst case).
+        &[250, 400, 600, 800, 1000, 1500, 2500, 4000]
     } else {
-        &[200, 500]
+        &[200, 500, 1000, 2000]
     }
 }
 
@@ -5013,7 +5039,7 @@ fn run_create(
             for a in &non_kiro {
                 let name = a["name"].as_str().unwrap_or("");
                 let role = a["agent_type"].as_str().unwrap_or(name);
-                let init_text = agent_init_prompt(name, role, &workdir, &sock.to_string_lossy());
+                let init_text = agent_init_prompt(name, role, team, &workdir, &sock.to_string_lossy());
                 match rpc_call_timeout(
                     sock,
                     "team.send",
@@ -5023,7 +5049,19 @@ fn run_create(
                     }),
                     3,
                 ) {
-                    Ok(_) => eprintln!("  \u{2713} {name}: init prompt sent"),
+                    Ok(ref r) => {
+                        // team.send pastes text with withReturn=false; the trailing "\n"
+                        // is stripped by sendTextToPanel, so the Enter must be delivered
+                        // separately via team.send_key — same follow-up as `tm-agent send`
+                        // and `tm-agent delegate`. Without this the init prompt sits
+                        // unsubmitted in the freshly spawned agent pane (enter-swallow).
+                        let text_delivered =
+                            r["result"]["text_delivered"].as_bool().unwrap_or(false);
+                        let _ = send_return_key_with_retry(
+                            sock, team, name, text_delivered, "team.create.init",
+                        );
+                        eprintln!("  \u{2713} {name}: init prompt sent");
+                    }
                     Err(e) => eprintln!("  \u{2717} {name}: init prompt FAILED: {e}"),
                 }
                 // Keep 1s delay between sends: this is NOT state synchronization but
@@ -5492,7 +5530,7 @@ fn run_create_headless(
                 let name = spec["name"].as_str().unwrap_or("");
                 let role = spec["agent_type"].as_str().unwrap_or(name);
                 let agent_id = format!("{name}@{team}");
-                let init_text = agent_init_prompt(name, role, &workdir, &app_sock_str);
+                let init_text = agent_init_prompt(name, role, team, &workdir, &app_sock_str);
                 match rpc_call_timeout(
                     &daemon_sock,
                     "headless.send",
@@ -5556,7 +5594,7 @@ fn run_add_headless(
                 .map(|p| p.to_string_lossy().to_string())
                 .unwrap_or_else(|_| ".".to_string());
             let agent_id = format!("{agent_name}@{team}");
-            let init_text = agent_init_prompt(agent_name, agent_type, &workdir, &app_sock_str);
+            let init_text = agent_init_prompt(agent_name, agent_type, team, &workdir, &app_sock_str);
 
             match rpc_call_timeout(
                 daemon_sock,

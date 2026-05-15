@@ -104,10 +104,20 @@ public final class DebugEventLog: @unchecked Sendable {
 
     // MARK: - Internal (always on `queue`)
 
+    /// Critical diagnostic events that must never be dropped by the circuit
+    /// breaker — they are low-frequency, high-signal markers used to debug the
+    /// enter-swallow / key-delivery path. Layout spam (portal.*) can trip the
+    /// breaker and bury these; whitelisting keeps them even while the circuit is open.
+    private static let circuitBypassMarkers: [String] = [
+        "key.retry", "keyEvent", "key.PRESS", "sendToAgent",
+        "paste.", "sendTextToPanel", "text.delivered", "send_key",
+    ]
+
     private func logInternal(_ msg: String, date: Date) {
-        // 1. Circuit breaker check
-        if !checkCircuitBreaker(date: date) {
-            return  // circuit open → drop
+        // 1. Circuit breaker check — critical key-delivery diagnostics bypass the drop.
+        let isCritical = Self.circuitBypassMarkers.contains { msg.contains($0) }
+        if !checkCircuitBreaker(date: date) && !isCritical {
+            return  // circuit open → drop (non-critical only)
         }
 
         let ts = formatter.string(from: date)

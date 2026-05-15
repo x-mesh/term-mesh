@@ -247,7 +247,14 @@ extension TerminalController {
             let ok = sendNamedKey(surface, keyName: keyName)
             lastFailureReason = ok ? "none" : "press_ignored"
             #if DEBUG
-            dlog("key.retry.attempt panel=\(panelLabel) key=\(keyName) gen=\(generation) attempt=\(ordinal)/\(totalAttempts) label=\(label) handled=\(ok)")
+            if !ok {
+                let isAttached = terminalSurface.isViewInWindow
+                let hasMarkedText = terminalSurface.hasMarkedTextForInput
+                let renderingPaused = terminalSurface.renderingPaused
+                dlog("key.retry.R2_rejected panel=\(panelLabel) key=\(keyName) attempt=\(ordinal)/\(totalAttempts) label=\(label) attached=\(isAttached) ime=\(hasMarkedText) paused=\(renderingPaused)")
+            } else {
+                dlog("key.retry.attempt panel=\(panelLabel) key=\(keyName) gen=\(generation) attempt=\(ordinal)/\(totalAttempts) label=\(label) handled=\(ok)")
+            }
             #endif
             return ok
         }
