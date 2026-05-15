@@ -559,12 +559,18 @@ final class TeamOrchestrator: ObservableObject {
         splitFrom: UUID,
         orientation: SplitOrientation,
         insertFirst: Bool = false,
+        /// Phase 2 (pane-mode resume): when set and `agentCli == "claude"`,
+        /// the agent CLI is invoked with `--resume <sid>` so claude
+        /// re-attaches to the captured session. Defaults to nil — fresh spawn.
+        /// Other CLIs (codex/kiro/gemini) currently ignore this; resume
+        /// support for them is a follow-up.
+        resumeSessionId: String? = nil,
         tabManager: TabManager
     ) -> AgentMember? {
         let agentId = "\(agentName)@\(teamName)"
 
         // Build CLI-specific invocation
-        let agentCommand: String
+        var agentCommand: String
         switch agentCli {
         case "kiro":
             let workerPrompt = Self.buildKiroWorkerPrompt(agentName: agentName, teamName: teamName, instructions: agentInstructions)
@@ -601,6 +607,11 @@ final class TeamOrchestrator: ObservableObject {
                 model: agentModel,
                 instructions: agentInstructions
             )
+            if let sid = resumeSessionId, !sid.isEmpty {
+                // Mirror the leader pattern (createTeam, claude case) — append
+                // `--resume <sid>` so claude re-attaches to its prior session.
+                agentCommand.append(" --resume \(sid)")
+            }
         }
 
         // Wrap so the terminal stays open (drops to shell) if the CLI exits.
@@ -688,6 +699,10 @@ final class TeamOrchestrator: ObservableObject {
         executionMode: String = "pane",
         adoptedLeaderSurfaceId: UUID? = nil,
         skipRunbookPromptForInteractiveAgents: Bool = false,
+        /// Phase 2 (pane-mode resume): agent name → claude session id, used to
+        /// invoke each agent CLI with `--resume <sid>`. Pane-mode resume passes
+        /// this; fresh team creation leaves it nil.
+        agentResumeSessionIds: [String: String]? = nil,
         tabManager: TabManager
     ) -> Team? {
         guard !agents.isEmpty else { return nil }
@@ -1195,6 +1210,7 @@ final class TeamOrchestrator: ObservableObject {
             }
 
             // Delegate pane construction to shared helper (see addAgentPaneToWorkspace).
+            let agentResumeSid = agentResumeSessionIds?[agent.name]
             guard let member = addAgentPaneToWorkspace(
                 workspace: workspace,
                 agentName: agent.name,
@@ -1213,6 +1229,7 @@ final class TeamOrchestrator: ObservableObject {
                 worktreeBranch: wtBranch,
                 splitFrom: splitFrom,
                 orientation: orientation,
+                resumeSessionId: agentResumeSid,
                 tabManager: tabManager
             ) else {
                 if index == 0 {
@@ -3275,6 +3292,19 @@ final class TeamOrchestrator: ObservableObject {
             )
         }
 
+        // Phase 2: per-agent claude session IDs (captured at archive time via
+        // sidebar token tracker, stored in AgentMember.parentSessionId). Passed
+        // into createTeam so each claude agent CLI starts with `--resume <sid>`
+        // and re-attaches to its previous transcript. Codex/kiro/gemini agents
+        // currently ignore this; resume support for them is a follow-up.
+        var agentResumeMap: [String: String] = [:]
+        for a in agentsArr {
+            guard let name = a["name"] as? String,
+                  let sid = a["session_id"] as? String,
+                  !sid.isEmpty else { continue }
+            agentResumeMap[name] = sid
+        }
+
         // Fresh leader session id for the new leader pane (this is tm-agent's
         // internal routing UUID, not a claude session id).
         let freshLeaderSessionId = UUID().uuidString
@@ -3299,6 +3329,7 @@ final class TeamOrchestrator: ObservableObject {
             resumeSessionId: nil,
             worktreeMode: archivedWorktreeMode,
             executionMode: "pane",
+            agentResumeSessionIds: agentResumeMap.isEmpty ? nil : agentResumeMap,
             tabManager: tabManager
         ) else {
             Logger.team.error("[pane-resume] createTeam failed for '\(teamName, privacy: .public)'")
