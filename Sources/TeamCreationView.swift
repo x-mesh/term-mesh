@@ -116,6 +116,15 @@ struct ClaudeSession: Identifiable, Hashable {
     }
 
     /// Extract the first user message and last assistant message from a session JSONL.
+    /// Read the most recent assistant snippet from the leader's transcript
+    /// jsonl. Returns nil when the file is unreadable or has no assistant
+    /// messages. Used by the resume picker to surface where the conversation
+    /// left off without re-spawning the leader.
+    static func lastUserMessage(path: String) -> String? {
+        let (_, last) = extractMessages(path: path)
+        return last.isEmpty ? nil : last
+    }
+
     private static func extractMessages(path: String) -> (first: String, last: String) {
         // First user message: scan first 50 lines
         var firstMsg = ""
@@ -193,6 +202,14 @@ struct ResumableTeam: Identifiable, Hashable {
     /// `headless.resume_team`. Defaults to "headless" for back-compat when the
     /// daemon predates this field.
     let mode: String
+    /// Leader's claude session id (used by the picker preview to surface the
+    /// last leader message; also informs resume routing). Empty / nil when no
+    /// session was captured.
+    let leaderSessionId: String?
+    /// Last user/assistant message text from the leader's transcript jsonl,
+    /// resolved lazily by the picker. nil until resolved or when the leader
+    /// session file is unavailable.
+    var leaderLastMessage: String? = nil
 
     var id: String { teamUuid }
 
@@ -313,7 +330,8 @@ struct ResumableTeam: Identifiable, Hashable {
             validity: validity,
             resumable: dict["resumable"] as? Bool ?? false,
             blockingReason: dict["blocking_reason"] as? String,
-            mode: (dict["mode"] as? String) ?? "headless"
+            mode: (dict["mode"] as? String) ?? "headless",
+            leaderSessionId: (dict["leader_session_id"] as? String).flatMap { $0.isEmpty ? nil : $0 }
         )
     }
 }
@@ -652,6 +670,32 @@ struct TeamCreationView: View {
                     .truncationMode(.middle)
             }
 
+            // Row 2.5: leader session id + last leader message (when known).
+            // Surfaces what conversation the picker would resume to so users
+            // can pick the right team at a glance.
+            if let sid = team.leaderSessionId, !sid.isEmpty {
+                HStack(spacing: 6) {
+                    Image(systemName: "person.text.rectangle")
+                        .font(.caption2)
+                        .foregroundStyle(.tertiary)
+                    Text("leader \(String(sid.prefix(8)))")
+                        .font(.caption2.monospaced())
+                        .foregroundStyle(.tertiary)
+                        .help(sid)
+                    if let last = team.leaderLastMessage, !last.isEmpty {
+                        Text("•")
+                            .font(.caption2)
+                            .foregroundStyle(.tertiary)
+                        Text("\u{201C}\(last)\u{201D}")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                            .truncationMode(.tail)
+                            .help(last)
+                    }
+                }
+            }
+
             // Row 3: worktree + branch indicator (when present)
             if let wt = team.worktree {
                 HStack(spacing: 6) {
@@ -796,6 +840,20 @@ struct TeamCreationView: View {
                 } else if let teams = obj["teams"] as? [[String: Any]] {
                     // Tolerate bare-result shape (no JSON-RPC envelope).
                     decoded = teams.compactMap { ResumableTeam.decode($0) }
+                }
+                // Resolve leader's last transcript message for the picker
+                // preview. Reads `~/.claude/projects/<encoded-wd>/<sid>.jsonl`
+                // tail — best-effort, leaves nil when unavailable.
+                for i in decoded.indices {
+                    guard let sid = decoded[i].leaderSessionId, !sid.isEmpty else { continue }
+                    let wd = decoded[i].workingDirectory
+                    let encoded = wd.replacingOccurrences(of: "/", with: "-")
+                    let home = FileManager.default.homeDirectoryForCurrentUser.path
+                    let path = "\(home)/.claude/projects/\(encoded)/\(sid).jsonl"
+                    if FileManager.default.fileExists(atPath: path),
+                       let snippet = ClaudeSession.lastUserMessage(path: path), !snippet.isEmpty {
+                        decoded[i].leaderLastMessage = snippet
+                    }
                 }
             } else if raw == nil {
                 // Daemon not reachable or RPC timed out — surface as empty list

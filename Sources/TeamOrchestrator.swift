@@ -3556,7 +3556,16 @@ final class TeamOrchestrator: ObservableObject {
                 return row
             },
         ]
-        if let root = team.gitRepoRoot, !root.isEmpty {
+        // git_root drives the "this repo" filter in the resume picker. Pane
+        // teams created with worktreeMode = "off" leave `team.gitRepoRoot`
+        // nil, so fall back to discovering it from the team's working
+        // directory at archive time. Without this, worktree-off pane teams
+        // only show up under "All" — a UX regression vs. headless teams.
+        let resolvedGitRoot: String? = {
+            if let root = team.gitRepoRoot, !root.isEmpty { return root }
+            return TermMeshDaemon.shared.findGitRoot(from: team.workingDirectory)
+        }()
+        if let root = resolvedGitRoot, !root.isEmpty {
             payload["git_root"] = root
         }
         // worktree info: pane-mode teams may share or per-agent. Capture shared.

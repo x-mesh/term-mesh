@@ -1899,6 +1899,7 @@ impl HeadlessManager {
                 resumable,
                 blocking_reason,
                 mode: team_meta.execution_mode.clone(),
+                leader_session_id: team_meta.leader.session_id.clone(),
             });
 
             if rows.len() >= limit {
@@ -2289,6 +2290,12 @@ pub struct ResumableTeam {
     /// Drives resume routing on the client (pane archives use `team.resume_pane`
     /// instead of `headless.resume_team`).
     pub mode: String,
+    /// Leader's session id from the archived `team.json`. For pane-mode this
+    /// is the actual claude session id (used to look up the leader's last
+    /// transcript message for the picker preview); for headless this is the
+    /// daemon-spawned leader's session id. May be None when the leader never
+    /// produced a session.
+    pub leader_session_id: Option<String>,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
