@@ -3275,10 +3275,19 @@ final class TeamOrchestrator: ObservableObject {
             )
         }
 
-        // Fresh leader session id for the new leader pane. The archived
-        // `leader.session_id` is passed as `resumeSessionId` so the claude
-        // leader CLI re-attaches to its previous transcript.
+        // Fresh leader session id for the new leader pane (this is tm-agent's
+        // internal routing UUID, not a claude session id).
         let freshLeaderSessionId = UUID().uuidString
+
+        // NOTE: we intentionally do NOT pass `resumeSessionId` here.
+        // The archive's `leader.session_id` is what Swift had stored as
+        // `team.leaderSessionId` — a routing UUID generated at create time,
+        // not the claude CLI's actual session id. Passing it as `--resume`
+        // caused claude to fail with "session not found". A future iteration
+        // can capture the leader pane's real claude session id (same
+        // mechanism as the sidebar token tracker uses for agents) and pass
+        // it through here. For now the leader pane starts fresh.
+        _ = leaderSessionId // keep archived value referenced for future use
 
         guard let team = createTeam(
             name: teamName,
@@ -3287,7 +3296,7 @@ final class TeamOrchestrator: ObservableObject {
             leaderSessionId: freshLeaderSessionId,
             leaderMode: leaderMode,
             leaderModel: leaderModel,
-            resumeSessionId: leaderSessionId.isEmpty ? nil : leaderSessionId,
+            resumeSessionId: nil,
             worktreeMode: archivedWorktreeMode,
             executionMode: "pane",
             tabManager: tabManager
