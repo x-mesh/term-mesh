@@ -719,6 +719,9 @@ struct ContentView: View {
                 .help(teamOrchestrator.agentRenderingPaused ? "Resume agent rendering" : "Pause agent rendering")
             }
             titlebarInfoSeparator
+            SocketStatusControl()
+
+            titlebarInfoSeparator
             Text(Self.appVersion)
                 .font(.system(size: 11, design: .monospaced))
                 .foregroundColor(titlebarColor(opacity: 0.4))

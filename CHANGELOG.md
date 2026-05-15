@@ -2,6 +2,15 @@
 
 All notable changes to term-mesh are documented here.
 
+## [0.118.0] - 2026-05-15
+
+### Changed
+- **컨트롤 소켓 상태 버튼 위치 조정** — 0.117.0에서 추가된 소켓 상태/복구 버튼을 타이틀바 정보 행(세션 시간·버전 옆)으로 옮김. 이전 위치에서 윈도우 제목 및 버전 텍스트와 겹치던 문제를 해소.
+
+### Thanks to 1 contributor!
+
+- [@JINWOO-J](https://github.com/JINWOO-J)
+
 ## [0.117.0] - 2026-05-15
 
 ### Added
