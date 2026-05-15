@@ -349,21 +349,19 @@ struct TitlebarControlButton<Content: View>: View {
     }
 }
 
-/// Top-right titlebar control showing control-socket health with a one-click
-/// restart. Self-contained (no external config / state threading): observes
-/// `SocketStatusModel.shared` directly and routes the button through
+/// Control-socket health indicator with a one-click restart, styled to match the
+/// titlebar info row (theme toggle, session timer, version). Self-contained:
+/// observes `SocketStatusModel.shared` directly and routes the button through
 /// `TerminalController.recoverSocket()` — the same `start()` path a Settings
-/// mode-toggle uses — so recovery never requires an app restart. Lives in the
-/// `.right` titlebar accessory next to the update pill.
+/// mode-toggle uses — so recovery never requires an app restart.
 struct SocketStatusControl: View {
     @ObservedObject private var status = SocketStatusModel.shared
-    @State private var isHovering = false
 
     private var tint: Color {
         switch status.health {
-        case .healthy: return .green
-        case .halfDead: return .orange
-        case .stopped: return .secondary
+        case .healthy: return .green.opacity(0.7)
+        case .halfDead: return .orange.opacity(0.9)
+        case .stopped: return .secondary.opacity(0.7)
         }
     }
 
@@ -382,17 +380,10 @@ struct SocketStatusControl: View {
             TerminalController.shared.recoverSocket()
         }) {
             Image(systemName: iconName)
-                .font(.system(size: 13, weight: .semibold))
+                .font(.system(size: 11))
                 .foregroundColor(tint)
-                .frame(width: 22, height: 22)
-                .contentShape(Rectangle())
-                .background(
-                    RoundedRectangle(cornerRadius: 6, style: .continuous)
-                        .fill(Color.primary.opacity(isHovering ? 0.08 : 0))
-                )
         }
         .buttonStyle(.plain)
-        .onHover { isHovering = $0 }
         .accessibilityIdentifier("titlebarControl.socketStatus")
         .accessibilityLabel("Socket status: \(status.health.shortLabel)")
         .help("\(status.health.shortLabel) — click to restart the control socket")
@@ -1226,17 +1217,12 @@ final class UpdatePillAccessoryViewController: NSTitlebarAccessoryViewController
 }
 
 /// SwiftUI host that re-evaluates accessory sizing whenever the pill text changes.
-/// Hosts the `.right` titlebar accessory: the update pill plus the socket-status
-/// control (placed rightmost so it sits at the true top-right of the window).
 private struct UpdatePillAccessoryHost: View {
     @ObservedObject var model: UpdateViewModel
 
     var body: some View {
-        HStack(spacing: 4) {
-            UpdatePill(model: model)
-            SocketStatusControl()
-        }
-        .padding(.horizontal, 6)
+        UpdatePill(model: model)
+            .padding(.horizontal, 6)
     }
 }
 
