@@ -191,19 +191,29 @@ extension TerminalController {
         }
     }
 
-    /// Re-establish the control socket after an abnormal accept-loop exit.
+    /// Re-establish the control socket — used by both the auto-recovery path
+    /// (abnormal `acceptLoop` exit) and the manual titlebar restart button.
     ///
     /// Reuses the last-known `tabManager` / `socketPath` / `accessMode` captured
-    /// by the previous `start()` call, so it routes through the exact same
-    /// `start()` → `stop()` → bind/listen path as a Settings-driven restart —
-    /// no app restart required. Safe to call when already healthy: `start()`
-    /// short-circuits if the socket path is unchanged and the loop is alive.
+    /// by the previous `start()` call. Always forces a clean restart: the inline
+    /// teardown guarantees `start()` does not short-circuit on an already-healthy
+    /// socket (so the manual button always does something), and it is done inline
+    /// rather than via `stop()` because `stop()`'s async `.stopped` status push
+    /// would otherwise land after `start()`'s synchronous `.healthy` push and
+    /// clobber the final state. No app restart required.
     func recoverSocket() {
         guard let tabManager else {
             Logger.socket.error("recoverSocket: no tabManager — cannot restart socket")
             return
         }
         Logger.socket.info("recoverSocket: restarting control socket listener")
+        isRunning = false
+        acceptLoopAlive = false
+        if serverSocket >= 0 {
+            close(serverSocket)
+            serverSocket = -1
+        }
+        unlink(socketPath)
         start(tabManager: tabManager, socketPath: socketPath, accessMode: accessMode)
     }
 
