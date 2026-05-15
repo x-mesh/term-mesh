@@ -3219,7 +3219,6 @@ final class TeamOrchestrator: ObservableObject {
     /// registry and open a workspace at the worktree path so the UI surfaces
     /// the resumed agents. Best-effort — if the result is malformed we log and
     /// return without throwing (caller is a UI completion handler).
-    @discardableResult
     /// Phase 2 (pane-mode resume): adopt a pane-mode archive that the daemon
     /// returned via `team.resume_pane`. Opens a new workspace at the archived
     /// working_directory and registers the team identity (name, agents with
@@ -3325,6 +3324,7 @@ final class TeamOrchestrator: ObservableObject {
         return team
     }
 
+    @discardableResult
     func adoptResumedHeadlessTeam(result: [String: Any], tabManager: TabManager) -> Team? {
         guard let teamName = result["name"] as? String,
               let agentIds = result["agents"] as? [String],
