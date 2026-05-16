@@ -150,11 +150,11 @@ If `tm-agent` is not in PATH:
 | `/team` (no args) | `/team` | Interactive editor: add/remove/swap/destroy |
 | `/team edit` | `/team edit` | Alias for interactive mode |
 | `/team status` | `/team status` | Formatted status table |
-| `/team add <role>` | `/team add reviewer` | Attach agent; defaults cli=claude, model=sonnet |
-| `/team add <role> --cli codex` | `/team add executor --cli codex` | Attach with specific CLI |
-| `/team add <role> --model opus` | `/team add architect --model opus` | Attach with specific model |
-| `/team remove <name>` | `/team remove reviewer` | Detach agent (warns if working) |
-| `/team remove <name> --force` | `/team remove reviewer --force` | Force detach even if working |
+| `/team add <role>` | `/team add reviewer` | Add agent to team (headless + GUI); cli=claude, model=sonnet defaults; rejects duplicate name |
+| `/team add <role> --cli codex` | `/team add executor --cli codex` | Add with specific CLI |
+| `/team add <role> --model opus` | `/team add architect --model opus` | Add with specific model |
+| `/team remove <name>` | `/team remove reviewer` | Remove agent from team (team-scoped; cf. `tm-agent detach` = workspace-adopt path) |
+| `/team remove <name> --force` | `/team remove reviewer --force` | Force remove even if working |
 | `/team swap <name> <model>` | `/team swap executor opus` | Re-attach with new model, same CLI |
 | `/team swap <name> <model> --force` | `/team swap executor opus --force` | Swap even if working |
 | `/team ensure <roles>` | `/team ensure reviewer security` | Attach missing roles, skip present ones |

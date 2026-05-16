@@ -42,13 +42,15 @@ Parse the first token of `$ARGUMENTS`:
 
 Valid roles: `architect` `executor` `explorer` `frontend` `backend` `tester` `reviewer` `security` `writer` `planner`
 
-Defaults: `--cli claude`, `--model sonnet`. Run:
+Defaults: `--cli claude`, `--model sonnet`. Works for headless and GUI teams. Rejects duplicate name within the team. Run:
 
 ```bash
-tm-agent attach <role> [--cli X] [--model Y] [--name Z]
+tm-agent add <role> [--cli X] [--model Y] [--name Z]
 ```
 
 ### `remove <name> [--force]`
+
+Team-name–scoped remove (does NOT require TERMMESH_WORKSPACE_ID/PANEL_ID). This is distinct from `tm-agent detach` which is workspace-adopt scoped. `--force` defaults to true.
 
 Check `tm-agent status`. If working and no `--force`, print:
 
@@ -59,7 +61,7 @@ Warning: <name> is currently working. Use --force to remove anyway.
 Otherwise run:
 
 ```bash
-tm-agent detach <name>
+tm-agent remove <name> [--force]
 ```
 
 ### `swap <name> <new-model> [--force]`
@@ -137,8 +139,10 @@ Use `--claude-leader` only when the leader pane should be Claude Code, not Codex
 tm-agent status
 tm-agent list
 tm-agent create 3 --adopt
-tm-agent attach executor --cli codex
-tm-agent detach executor
+tm-agent add reviewer                       # team-scoped; works for GUI + headless teams
+tm-agent remove reviewer                    # team-scoped counterpart of add
+tm-agent attach executor --cli codex        # workspace-adopt scoped (creates ws-* team)
+tm-agent detach executor                    # workspace-adopt scoped
 tm-agent delegate executor '<instruction>'
 tm-agent send reviewer '<message>'
 tm-agent broadcast '<message>'

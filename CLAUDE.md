@@ -333,6 +333,16 @@ tm-agent runbook init [--dry-run] [--force]
 tm-agent runbook digest [--agent <role>]       # compact prompt-efficient role brief
 tm-agent runbook install --tool claude|codex|opencode|all [--agent <role>] [--dry-run] [--force]
 
+# Team-scoped add/remove (works for headless AND GUI teams — no workspace ID required)
+tm-agent add <role> [--name N] [--model M] [--cli claude|codex|kiro|gemini]
+tm-agent remove <agent_name> [--force]
+# Examples:
+#   tm-agent add reviewer                   # add reviewer to current team (any team type)
+#   tm-agent add executor --model opus      # add executor with opus model
+#   tm-agent remove reviewer               # remove agent from team (--force default: true)
+# `add` routes to team.add_agent Swift RPC; rejects duplicate name within team.
+# `remove` routes to team.detach Swift RPC; team-name–scoped (not workspace-panel–scoped).
+
 # Workspace-local attach/detach (NO new workspace — uses the caller's current one)
 tm-agent attach <agent_type> [--name N] [--model M] [--cli claude|codex|kiro|gemini]
 tm-agent detach <agent_name>
