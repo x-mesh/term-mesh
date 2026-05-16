@@ -142,17 +142,30 @@ timeout 만료 시에도 Step 4로 진행 (부분 결과 수렴).
 
 ### Step 4 — Read & synthesize (= /team collect + leader synthesis)
 
-**(a) 헤더 수집 및 full report 접근**
+**(a) 헤더 수집 — 3-tier 읽기 룰**
+
+모드에 따라 T1 → T2 → T3 순서로 필요한 만큼만 읽는다.
+
+**T1 (항상, ~1,200 tok):**
+
+- **균질 fan-out** (동일 instruction → 모든 에이전트): `tm-agent collect --headers`
+- **이종 sub-task** (N≥6, 서로 다른 instruction): `tm-agent reports --summary` (~2,200 tok) — 개별 FULL_REPORT N개 합산(~3,400–5,200 tok)보다 우월
 
 ```bash
-tm-agent collect --headers  # = /team collect --headers
+# 균질 fan-out
+tm-agent collect --headers
+
+# 이종 sub-task (N≥6)
+tm-agent reports --summary
 ```
 
-BLOCKED 또는 NEEDS_REVIEW 에이전트는 task_id 파악 후 전체 보고서 직접 읽기:
+**T2 (조건부, ~500 tok/agent):** BLOCKED 또는 NEEDS_REVIEW agent에 한해 해당 task 보고서 읽기:
 
 ```bash
 cat ~/.term-mesh/results/<team>/<task_id>.md
 ```
+
+**T3 (예외, ~2,000 tok/agent):** 교차모순 탐지 시만 — 충돌 당사자 FULL_REPORT만 읽기. 전체 읽기 금지(Anti-pattern 5).
 
 > **절대 금지**: `~/.term-mesh/results/<team>/<agent>-reply.md` 직접 읽기 — 동일 에이전트에 serial delegate가 쌓이면 last-writer-wins race 발생, 잘못된 태스크 결과 반환.
 
@@ -161,10 +174,26 @@ cat ~/.term-mesh/results/<team>/<task_id>.md
 수집 결과를 바탕으로 **정확히 아래 형식**으로 요약:
 
 ```
-[결론]  모든 에이전트가 수렴하는 단일 문장 — 결정/진단/핵심 발견
-[충돌]  이견 에이전트명 + 주장 요약 + 채택 근거 | "전원 동의" (이견 없을 때)
-[다음]  leader가 즉시 실행할 액션 한 줄
+[결론]  K/N DONE + severity-tier 최고-영향 발견 1문장
+[충돌]  교차모순 | 병목 | 미해결 게이트 | "독립 완료"
+[다음]  P0→P5 결정 트리 첫 비어있지 않은 버킷 액션
 ```
+
+**[결론] 압축 룰** — `K/N DONE` 진척 분수 + severity-tier 최고-영향 발견 1문장. Tier 우선순위: `Blocker → Security → Cross-cutting → Feature → Net achievement`. 손실 허용 = 개별 세부 발견; 손실 불가 = K/N 카운트 + 최고 위험.
+
+**[충돌] 3종 후보** (이종 sub-task 모드에서 "이견" 개념 부적용 — 교체):
+- **교차모순**: 한 agent 변경이 다른 agent 전제를 무효화 — NEXT 필드 파일 경로 중복으로 탐지
+- **병목**: BLOCKED agent + downstream 의존 존재
+- **미해결 게이트**: NEEDS_REVIEW agent 존재
+- 셋 다 없으면 → `독립 완료`
+
+**[다음] 결정 트리 P0→P5** — 첫 번째 비어있지 않은 버킷이 NEXT:
+- P0: BLOCKED unblock
+- P1: NEEDS_REVIEW review
+- P2: 교차모순 우선 결정
+- P3: 가장 많은 downstream unlock
+- P4: security > perf > feat > docs
+- P5: PR/release
 
 이후 각 에이전트의 FULL_REPORT 경로 나열:
 
@@ -174,12 +203,22 @@ FULL_REPORTS:
   <agent2>: ~/.term-mesh/results/<team>/<task_id>.md
 ```
 
+**(c) Truncation 감지**
+
+아래 신뢰도 순으로 truncation 여부를 판단한다:
+- **[확실]** FULL_REPORT 필드 값이 `n/a`가 아님 → agent 선언 경로 사용
+- **[확실]** content 끝이 `...` → truncate 마커
+- **[높음]** NEXT 또는 VERIFY 필드 문장이 중간에 끊김
+
+truncation 확인 시 T2/T3 단계로 진입한다.
+
 ## Anti-patterns
 
 1. **`<agent>-reply.md` 직접 읽기 금지** — 반드시 `<task_id>.md` 사용. 동일 에이전트에 serial delegate가 쌓이면 `agent-reply.md`는 마지막 결과만 남음 (last-writer-wins, daemon/term-mesh-cli/src/tm_agent.rs:5912 atomic-write). task_id 기반 파일만 신뢰할 수 있음.
 2. **`/tm-op`과 동시 실행 금지** — 두 커맨드 모두 팀의 태스크 어사이니를 경쟁적으로 사용. 한 번에 하나만 실행.
 3. **`--agents N` 플래그 노출 및 수용 금지** — 팀 크기는 `tm-agent create N`으로 이미 결정됨. 런타임 agent 수 변경은 이 커맨드 범위 밖.
-4. **3줄 synthesis 생략 또는 축약 금지** — `[충돌]` 라인은 "전원 동의"여도 반드시 출력. synthesis 없는 raw collect 결과 출력은 이 커맨드의 존재 이유를 없앰.
+4. **3줄 synthesis 생략 또는 축약 금지** — `[충돌]` 라인은 "독립 완료"여도 반드시 출력. synthesis 없는 raw collect 결과 출력은 이 커맨드의 존재 이유를 없앰.
+5. **이종 sub-task 모드에서 FULL_REPORT 전체 읽기 금지** — N≥6 이종 모드에서 모든 FULL_REPORT를 읽으면 ~3,400–5,200 tok 소비. `reports --summary`(~2,200 tok)로 충분; T3(FULL_REPORT)는 교차모순 탐지 시 당사자 파일만 읽는다.
 
 ## Examples
 
