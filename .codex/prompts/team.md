@@ -98,7 +98,9 @@ Render as a human-readable table: `NAME (state, cli, model) — active_task_titl
 
 ### `edit` or no args (interactive)
 
-Show the formatted status table, then ask the user which action to take: Add / Remove / Swap / Refresh / Destroy. Execute per the subcommand logic above. After each action, reprint the table and ask "Another action?".
+Show the formatted status table, then ask the user which action to take: Add / Remove / Swap / Ensure roles / Refresh / Destroy. Execute per the subcommand logic above. After each action, reprint the table and ask "Another action?".
+
+For **Ensure roles**: prompt the user for a comma-separated list of roles (or present the 10 valid roles as a multi-select). For each role, check `tm-agent status`; if missing run `tm-agent attach <role>`; else skip. Print `ENSURED: <role> (added)` or `ENSURED: <role> (already present)` per entry.
 
 ### Any other first token → passthrough
 

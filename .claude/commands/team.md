@@ -29,6 +29,7 @@ security    idle     codex    —        —
    - "Add agent"
    - "Remove agent"
    - "Swap model"
+   - "Ensure roles"
    - "Show status (refresh)"
    - "Destroy team"
 
@@ -51,6 +52,11 @@ security    idle     codex    —        —
    - AskUserQuestion: new model — `sonnet` / `opus` / `haiku`.
    - If working: AskUserQuestion "This agent is currently working. Swap anyway?" (yes/cancel).
    - Read `cli` and `agent_type` from status; run `tm-agent detach <name>` then `tm-agent attach <agent_type> --name <name> --cli <cli> --model <new-model>`.
+
+   **Ensure roles:**
+   - AskUserQuestion (multiSelect): which roles to ensure — `architect` / `executor` / `explorer` / `frontend` / `backend` / `tester` / `reviewer` / `security` / `writer` / `planner`.
+   - For each selected role: check `tm-agent status`; if missing, run `tm-agent attach <role>`; else skip.
+   - Print: `ENSURED: <role> (added)` or `ENSURED: <role> (already present)` per entry.
 
 4. After each action: reprint status table → AskUserQuestion "Another action?" (yes/no).
 

@@ -47,6 +47,18 @@ Reject unsupported flags such as `--rounds`, `--agents`, or `--mode`; use `/tm-o
 
    **`--ensure` handling (when flag is present):** For each role in the comma-separated list, check status. Skip if already present; otherwise run `tm-agent attach <role>`. Print `ENSURED: <role> (added)` or `ENSURED: <role> (already present)` per entry. Re-read status after attaching to refresh idle agent list.
 
+   **Missing-role guard (only when `--ensure` is NOT given):** If the instruction matches a heuristic below, check whether that role is present in the team. If missing, print before fan-out and then continue with available agents — do NOT auto-attach:
+
+   ```
+   Note: <role> agent not in team. Run /team add <role> first, or rerun with /tm --ensure <role> "..."
+   ```
+
+   Heuristics:
+   - "security review", "security audit", "vulnerability" → `security`
+   - "design review", "UI review", "UX review" → `reviewer`
+   - "code review", "review the code" → `reviewer`
+   - "performance audit", "perf review" → `tester`
+
 2. Identify idle agent names from the status output. If there are no idle agents, tell the user the team is busy and suggest:
    ```bash
    tm-agent task list
