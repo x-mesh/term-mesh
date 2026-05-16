@@ -2292,6 +2292,7 @@ class TerminalController {
             return v2Error(id: id, code: "invalid_params", message: "Missing agent_name")
         }
         let explicitTeamName = params["team_name"] as? String
+        let force = (params["force"] as? Bool) ?? true
 
         let result: V2CallResult = await MainActor.run {
             let appDelegate = AppDelegate.shared
@@ -2337,7 +2338,8 @@ class TerminalController {
             let outcome = TeamOrchestrator.shared.detachAgent(
                 teamName: teamName,
                 agentName: agentName,
-                tabManager: resolved.tabManager
+                tabManager: resolved.tabManager,
+                force: force
             )
 
             switch outcome {

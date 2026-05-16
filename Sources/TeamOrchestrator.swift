@@ -1586,7 +1586,8 @@ final class TeamOrchestrator: ObservableObject {
     func detachAgent(
         teamName: String,
         agentName: String,
-        tabManager: TabManager
+        tabManager: TabManager,
+        force: Bool = true
     ) -> Result<DetachResult, DetachError> {
         guard var team = teams[teamName] else {
             return .failure(.teamNotFound(name: teamName))
@@ -1604,9 +1605,10 @@ final class TeamOrchestrator: ObservableObject {
         // `Workspace.closePanel` is idempotent — returns false if the panel
         // has already been closed (user-initiated or otherwise), which we
         // treat as successful detach.
+        // TODO: when force=false, check daemon task state for agent_busy before closing
         if let workspace = tabManager.tabs.first(where: { $0.id == team.workspaceId }),
            let pid = agent.panelId {
-            _ = workspace.closePanel(pid, force: true)
+            _ = workspace.closePanel(pid, force: force)
         }
 
         // Remove from team.agents

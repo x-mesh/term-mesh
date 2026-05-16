@@ -5402,7 +5402,8 @@ fn run_add_gui(
                 team_name
             ),
             "workspace_gone" => "\nHint: The team's workspace is no longer open. Recreate the team with 'tm-agent create'.".to_string(),
-            "pane_limit" => "\nHint: The workspace has reached its maximum pane count. Detach another agent first.".to_string(),
+            "cli_not_found" => "\nHint: CLI executable not found — check Settings → CLI Paths or the cliPath.<cli> UserDefaults key.".to_string(),
+            "pane_creation_failed" => "\nHint: Pane creation failed — check term-mesh logs at /tmp/term-mesh-debug.log.".to_string(),
             _ => String::new(),
         };
         eprintln!("Error [{}]: {}{}", code, msg, hint);
@@ -5463,7 +5464,11 @@ fn run_remove_gui(sock: &PathBuf, team_name: &str, agent_name: &str, force: bool
         let msg = resp["error"]["message"]
             .as_str()
             .unwrap_or("remove failed");
-        eprintln!("Error [{}]: {}", code, msg);
+        let hint = match code {
+            "agent_busy" => "\nHint: Agent has an active task — pass --force to close anyway, or finish/block the task first.".to_string(),
+            _ => String::new(),
+        };
+        eprintln!("Error [{}]: {}{}", code, msg, hint);
         process::exit(1);
     }
 }
