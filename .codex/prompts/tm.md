@@ -12,6 +12,8 @@ This prompt is the Codex equivalent of the Claude `/tm` command. It must use `tm
 
 ## Empty input
 
+> **Note:** `/tm` 인터랙티브 메뉴(AskUserQuestion 기반)는 Claude leader에서만 동작 — Codex leader는 `/tm "<instruction>"` 형식으로 직접 입력.
+
 If `$ARGUMENTS` is empty, print:
 
 ```text

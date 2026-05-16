@@ -21,9 +21,113 @@
 
 `/tm`은 `/tm-op`의 경량 진입점 — rounds 없고, 전략 선택 없고, 1회 dispatch 후 즉시 synthesis.
 
-## Empty input
+## Empty input — interactive menu
 
-If `$ARGUMENTS` is empty (사용자가 `/tm`만 입력), do NOT run the workflow. Instead print:
+If `$ARGUMENTS` is empty (사용자가 `/tm`만 입력), do NOT run the workflow. Instead launch the interactive menu below. **Never proceed to Step 1 directly from this section.**
+
+### Step 1 — Top-level menu
+
+Present AskUserQuestion:
+
+> **`/tm` — 무엇을 할까요?**
+
+| label | description |
+|-------|-------------|
+| 자유 instruction 실행 | instruction을 직접 입력하고 fan-out (Other 옵션으로 텍스트 입력) |
+| 템플릿 선택 후 실행 | T1-T8 중 하나를 골라 키워드 맞춤 dispatch |
+| 옵션 보기 | --no-decompose / --ensure / --timeout 플래그 설명 후 메뉴로 복귀 |
+| 도움말 (전체 cheat sheet) | 정적 안내 출력 후 종료 |
+
+### Step 2 — Per-choice flow
+
+**(a) 자유 instruction 실행**
+
+1. AskUserQuestion (Other로 자유 입력):
+   > "어떤 instruction을 보낼까요?"
+   Receive the user's instruction text.
+
+2. AskUserQuestion (single select):
+   > "Step 1.5 자동 분해를 사용할까요?"
+
+   | label | description |
+   |-------|-------------|
+   | 자동 분해 (기본) | T1-T8 템플릿 매칭 시 역할별 sub-task 분배 |
+   | --no-decompose | 모든 에이전트에게 동일 instruction (v1 동작) |
+
+3. Print the final command line and stop:
+   ```
+   다음 명령을 복사해 실행하세요:
+
+   /tm "<입력한 instruction>"[ --no-decompose]
+   ```
+   Do NOT execute the workflow. User re-enters the command to trigger Step 1 → 1.5 → ... flow.
+
+**(b) 템플릿 선택 후 실행**
+
+1. AskUserQuestion (single select):
+   > "어떤 템플릿을 사용할까요?"
+
+   | label | description |
+   |-------|-------------|
+   | T1 PR 리뷰 | PR/pull request 보안·코드품질·테스트·영향 범위 분담 |
+   | T2 성능 최적화 | 프로파일링·복잡도 검토·벤치마크·아키텍처 대안 분담 |
+   | T3 기능 구현 | 계획·설계·구현 스텁·테스트·문서 분담 |
+   | T4 버그 디버그 | 위치 탐색·근본 원인·회귀 테스트·패턴 확산 분담 |
+   | T5 시스템 설계 | ADR·구현 단계·설계 검토·보안 분담 |
+   | T6 문서 정리 | 문서 감사·누락 API·변경 추적 분담 |
+   | T7 보안 점검 | 위협 모델·인증 감사·침투 테스트·의존성 분담 |
+   | T8 범용 정리/점검 | 데드코드·코드 품질·테스트 커버리지 분담 |
+
+2. Print the template's trigger keyword example and the suggested command line:
+
+   | Template | 예시 명령 라인 |
+   |----------|--------------|
+   | T1 | `/tm "feature/<branch> PR 보안 리뷰"` |
+   | T2 | `/tm "<모듈명> 성능 최적화"` |
+   | T3 | `/tm "<기능 설명> 구현"` |
+   | T4 | `/tm "<증상 설명> 디버그"` |
+   | T5 | `/tm "<컴포넌트명> 설계"` |
+   | T6 | `/tm "문서 정리 <경로 또는 대상>"` |
+   | T7 | `/tm "<대상 범위> 보안 점검"` |
+   | T8 | `/tm "<대상 범위> 정리"` |
+
+   ```
+   선택한 템플릿: <T번호 이름>
+   컨텍스트를 채워 아래 명령을 실행하세요:
+
+   /tm "<위 예시 수정>"
+   ```
+   Do NOT execute the workflow. User re-enters the customised command.
+
+**(c) 옵션 보기**
+
+Print:
+```
+사용 가능한 플래그:
+
+  --no-decompose          Step 1.5 분해 건너뜀 — 모든 에이전트에게 동일 instruction (v1 동작)
+                          예: /tm "PR 리뷰" --no-decompose
+
+  --ensure <roles>        팀에 없는 role 자동 추가 후 fan-out
+                          예: /tm "PR 리뷰" --ensure reviewer,security
+
+  --timeout <seconds>     tm-agent wait 타임아웃 (기본 300초)
+                          예: /tm "분석" --timeout 120
+```
+
+Then AskUserQuestion:
+> "계속할까요?"
+
+| label | description |
+|-------|-------------|
+| 메뉴로 돌아가기 | Step 1 메뉴 재표시 |
+| 종료 | 종료 |
+
+If "메뉴로 돌아가기" → re-present Step 1 menu. If "종료" → stop.
+
+**(d) 도움말 (cheat sheet)**
+
+Print the static cheat sheet and stop (no further AskUserQuestion):
 
 ```
 이 명령은 모든 idle agent를 동시 동원하고 결과를 종합합니다.
@@ -31,6 +135,7 @@ If `$ARGUMENTS` is empty (사용자가 `/tm`만 입력), do NOT run the workflow
   /tm "review src/auth.ts"
   /tm "monolith vs microservices" --timeout 120
   /tm --ensure reviewer,security "이 PR 보안 리뷰"
+  /tm "PR 리뷰" --no-decompose      # v1 동작 (분해 건너뜀)
 
 내부 단계에서 호출하는 low-level 명령들 (직접 사용 가능):
 
@@ -43,7 +148,9 @@ If `$ARGUMENTS` is empty (사용자가 `/tm`만 입력), do NOT run the workflow
 자세히: .claude/commands/tm.md / .claude/commands/team.md
 ```
 
-Do NOT proceed to Workflow.
+### Step 3 — 종료 규칙
+
+Empty input 분기는 **어떤 경우에도** Step 1 (status) → Step 1.5 (decompose) → ... 워크플로를 직접 실행하지 않는다. 항상 "명령 라인 출력 + 사용자 재입력 안내"로 끝낸다.
 
 ## Arguments
 
