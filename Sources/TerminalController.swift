@@ -2296,8 +2296,19 @@ class TerminalController {
 
         let result: V2CallResult = await MainActor.run {
             let appDelegate = AppDelegate.shared
-            // Resolve TabManager + workspaceId — reuse attach's logic minus the callerPanelId requirement.
+            // Resolution priority:
+            // 1. explicit team_name → look up stored team, resolve tabManager from team.workspaceId
+            //    (used by `tm-agent remove` against GUI teams — no caller env required)
+            // 2. caller-env params (window_id / surface_id / workspace_id)
+            //    (used by `tm-agent detach` from inside a workspace pane)
             let resolved: (tabManager: TabManager, workspaceId: UUID)? = {
+                // Path 1: team_name-scoped resolution (mirrors asyncTeamAddAgent)
+                if let tn = explicitTeamName,
+                   let team = TeamOrchestrator.shared.teams[tn],
+                   let tm = appDelegate?.tabManagerFor(tabId: team.workspaceId) {
+                    return (tm, team.workspaceId)
+                }
+                // Path 2: caller-env resolution (workspace-adopt path)
                 if let windowIdStr = params["window_id"] as? String,
                    let windowId = UUID(uuidString: windowIdStr),
                    let tm = appDelegate?.tabManagerFor(windowId: windowId) {
@@ -2327,7 +2338,7 @@ class TerminalController {
             guard let resolved else {
                 return V2CallResult.err(
                     code: "not_in_workspace",
-                    message: "team.detach requires workspace_id or surface_id from a term-mesh pane.",
+                    message: "team.detach requires team_name, workspace_id, or surface_id.",
                     data: nil
                 )
             }
