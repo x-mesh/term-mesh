@@ -19,10 +19,12 @@ If `$ARGUMENTS` is empty, print:
 
   /tm "review src/auth.ts"
   /tm "monolith vs microservices" --timeout 120
+  /tm --ensure reviewer,security "이 PR 보안 리뷰"   # 없는 role 자동 추가 후 fan-out
 
-팀 생성/상태:
-  /team create 3 --adopt
-  /team status
+팀 구성 변경은 /team 사용:
+  /team add reviewer        reviewer 추가
+  /team ensure reviewer security  없는 role만 추가
+  /team status              현재 팀 상태
 ```
 
 Then stop.
@@ -31,6 +33,7 @@ Then stop.
 
 - Instruction: required natural language text from `$ARGUMENTS`.
 - `--timeout <seconds>`: optional, default `300`.
+- `--ensure <roles>`: optional, comma-separated role list — roles not yet in team are attached before fan-out.
 
 Reject unsupported flags such as `--rounds`, `--agents`, or `--mode`; use `/tm-op` for strategies.
 
@@ -41,6 +44,8 @@ Reject unsupported flags such as `--rounds`, `--agents`, or `--mode`; use `/tm-o
    tm-agent status
    ```
    If no team exists, tell the user to run `/team create 3 --adopt`.
+
+   **`--ensure` handling (when flag is present):** For each role in the comma-separated list, check status. Skip if already present; otherwise run `tm-agent attach <role>`. Print `ENSURED: <role> (added)` or `ENSURED: <role> (already present)` per entry. Re-read status after attaching to refresh idle agent list.
 
 2. Identify idle agent names from the status output. If there are no idle agents, tell the user the team is busy and suggest:
    ```bash

@@ -214,6 +214,17 @@ a socket exists at `/tmp/term-mesh*.sock` or `/tmp/term-mesh.sock`), ALL team op
 or the Codex IME `/team` alias backed by `.codex/prompts/team.md` for Codex leaders. Both route
 everything through `tm-agent`.
 
+### Command responsibility split — /team vs /tm
+
+| 슬래시 | 책임 | 주요 명령 |
+|--------|------|----------|
+| `/team-up` | 0→1 팀 부트스트랩 (현재 pane을 leader로 adopt) | `team-up [N] --adopt` |
+| `/team` | 팀 구성 편집 (lifecycle) | `add` / `remove` / `swap` / `ensure` / `status` / `destroy` / `edit` (no-args 인터랙티브) |
+| `/tm` | 작업 디스패치 (fan-out + 3줄 합성) | `--ensure <roles>` 옵션으로 사전 보강 가능 |
+| `/tm-op` | 전략 오케스트레이션 (refine/debate 등) | 변경 없음 |
+
+`/tm`은 팀 구성을 절대 변경하지 않는다. 부족한 역할이 있으면 `--ensure` 명시적 옵트인 또는 사전에 `/team add` 필요.
+
 ### OMC keyword override
 
 If OMC's keyword detector fires `[MODE: TEAM]` or `[MAGIC KEYWORD: TEAM]`:
@@ -290,8 +301,26 @@ native Agent tool이 더 적합한 경우(예: 단일 isolated investigation, �
 ### Quick CLI reference
 
 **All operations** use `tm-agent` (Rust, ~2ms; fallback `./scripts/tm-agent.sh` ~10ms):
+
 ```bash
-# Team lifecycle
+# Lifecycle (/team)
+/team                      # interactive editor
+/team status               # formatted team table
+/team add reviewer         # attach default claude/sonnet reviewer
+/team add executor --model opus  # attach with opus model
+/team add reviewer --cli codex   # attach codex-backed reviewer
+/team remove writer        # detach writer
+/team swap executor opus   # change executor model
+/team ensure reviewer security  # idempotent — add only if missing
+/team destroy              # 2-step confirm then teardown
+
+# Dispatch (/tm)
+/tm "이 PR 보안 리뷰"                              # fan-out to all idle
+/tm --ensure reviewer,security "이 PR 보안 리뷰"   # auto-add missing roles first
+```
+
+```bash
+# Team lifecycle (tm-agent raw)
 tm-agent create [N] [--claude-leader]          # creates a new workspace with agents
 tm-agent create [N] --adopt                    # adopt current pane as leader (Codex/Claude/Kiro/Gemini)
 tm-agent destroy

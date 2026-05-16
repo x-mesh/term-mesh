@@ -15,7 +15,9 @@
 | 모든 에이전트가 동시에 같은 목표를 보고 각자 역할 관점으로 답해야 할 때 | `/tm` |
 | 라운드 기반 정제, 토론, 파이프라인이 필요할 때 | `/tm-op refine|debate|chain` |
 | 에이전트 1명에게만 작업 위임 | `tm-agent delegate <agent>` |
+| 팀 구성 (add/remove/swap) | `/team add <role>` |
 | 팀 생성·상태·태스크 관리 | `/team` |
+| dispatch 전 role 사전 보장 | `/tm --ensure <roles> ...` |
 
 `/tm`은 `/tm-op`의 경량 진입점 — rounds 없고, 전략 선택 없고, 1회 dispatch 후 즉시 synthesis.
 
@@ -28,6 +30,7 @@ If `$ARGUMENTS` is empty (사용자가 `/tm`만 입력), do NOT run the workflow
 
   /tm "review src/auth.ts"
   /tm "monolith vs microservices" --timeout 120
+  /tm --ensure reviewer,security "이 PR 보안 리뷰"
 
 내부 단계에서 호출하는 low-level 명령들 (직접 사용 가능):
 
@@ -57,6 +60,13 @@ User provided: $ARGUMENTS
 |------|--------|------|
 | `"instruction"` | (필수) | 모든 에이전트에게 전달되는 단일 instruction |
 | `--timeout <s>` | 300 | `tm-agent wait` 타임아웃 (초) |
+| `--ensure <roles>` | (없음) | 쉼표 구분 role 목록 — 없는 role은 fan-out 전 자동 attach |
+
+```
+/tm "instruction"
+/tm "instruction" --timeout 300
+/tm "instruction" --ensure reviewer,security
+```
 
 **금지 옵션**: `--mode`, `--agents N`, `--rounds` — 이 커맨드 범위 밖.
 
@@ -64,11 +74,41 @@ User provided: $ARGUMENTS
 
 `$ARGUMENTS`에서 instruction과 `--timeout` 파싱 후 아래 5단계 순서 엄수.
 
-### Step 1 — 팀 상태 확인 (= /team status)
+### Step 1 — 팀 상태 확인 + --ensure 처리 (= /team status)
 
 ```bash
 tm-agent status  # = /team status
 ```
+
+**`--ensure` 처리 (있을 때만):**
+
+`$ARGUMENTS`에서 `--ensure <roles>` 파싱 후, 쉼표 구분 각 role에 대해:
+- `tm-agent status`에 해당 type의 에이전트가 존재하면 → `SKIPPED <role> (already present)`
+- 없으면 → `tm-agent attach <role>` 실행 → `ENSURED: <role> (added)`
+
+```bash
+# 예: /tm "review auth.ts" --ensure reviewer,security
+# → ENSURED: reviewer (added), security (already present)
+```
+
+`--ensure` 처리 후 status를 다시 읽어 idle 에이전트 목록 갱신.
+
+**Missing-role guard (--ensure 없을 때만):**
+
+instruction에 아래 heuristic이 일치하면, 해당 role이 팀에 없는지 확인:
+- "security review", "security audit", "vulnerability" → `security`
+- "design review", "UI review", "UX review" → `reviewer`
+- "code review", "review the code" → `reviewer`
+
+해당 role이 팀에 없고 `--ensure`도 주어지지 않았으면, fan-out 전 경고 출력:
+
+```
+Note: <role> agent not in team. Run `/team add <role>` first, or rerun with `/tm --ensure <role> ...`
+```
+
+그 다음 가용 에이전트로 fan-out 계속 진행. 자동 attach 하지 않는다.
+
+**상태 확인:**
 
 - `in_progress` 태스크가 있는 에이전트가 있으면 → **REJECT**: "team busy; run `tm-agent task clear` first"
 - idle 에이전트가 0명이면 → **REJECT**: "no idle agents available"

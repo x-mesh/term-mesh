@@ -10,47 +10,153 @@ User provided: $ARGUMENTS
 
 ## Routing
 
-Parse the first word of `$ARGUMENTS` to determine the subcommand, then execute via `tm-agent`:
+Parse the **first token** of `$ARGUMENTS` and route to the matching subcommand below. If the first token does not match any named subcommand, fall through to the passthrough.
+
+### `/team` (no args) — interactive editor mode
+
+When `$ARGUMENTS` is empty:
+
+1. Run `tm-agent status` and render a formatted table:
+
+```
+NAME        STATE    CLI      MODEL    TASK
+executor    working  claude   sonnet   Fix login bug
+reviewer    idle     claude   opus     —
+security    idle     codex    —        —
+```
+
+2. Present AskUserQuestion with options:
+   - "Add agent"
+   - "Remove agent"
+   - "Swap model"
+   - "Show status (refresh)"
+   - "Destroy team"
+
+3. Per choice:
+
+   **Add agent:**
+   - AskUserQuestion: role — `architect` / `executor` / `explorer` / `frontend` / `backend` / `tester` / `reviewer` / `security` / `writer` / `planner`
+   - AskUserQuestion: CLI — `claude` / `codex` / `kiro` / `gemini`
+   - If `cli=claude`: AskUserQuestion: model — `sonnet` / `opus` / `haiku`
+   - Optional: ask for custom name (or skip)
+   - Print the exact `tm-agent attach ...` command and AskUserQuestion "Execute?" before running.
+
+   **Remove agent:**
+   - AskUserQuestion: select from current agent list.
+   - If working or active task: AskUserQuestion "This agent is currently working. Remove anyway?" (yes/cancel).
+   - Run `tm-agent detach <name>`.
+
+   **Swap model:**
+   - AskUserQuestion: select agent from current list.
+   - AskUserQuestion: new model — `sonnet` / `opus` / `haiku`.
+   - If working: AskUserQuestion "This agent is currently working. Swap anyway?" (yes/cancel).
+   - Read `cli` and `agent_type` from status; run `tm-agent detach <name>` then `tm-agent attach <agent_type> --name <name> --cli <cli> --model <new-model>`.
+
+4. After each action: reprint status table → AskUserQuestion "Another action?" (yes/no).
+
+### `/team edit`
+
+Alias for interactive mode — same behavior as no-args.
+
+### `/team status`
+
+```bash
+tm-agent status
+```
+
+Render JSON output as a human-readable table: `NAME (state, cli, model) — active_task_title or "idle"` per agent.
+
+### `/team add <role> [--cli X] [--model Y] [--name Z]`
+
+Valid roles: `architect` `executor` `explorer` `frontend` `backend` `tester` `reviewer` `security` `writer` `planner`
+
+Defaults: `--cli claude`, `--model sonnet`. If role is not in the list, print the valid list and stop.
+
+```bash
+tm-agent attach <role> [--cli X] [--model Y] [--name Z]
+```
+
+### `/team remove <name> [--force]`
+
+Check `tm-agent status`. If the named agent is `working` or has an `active_task_id`, print:
+
+```
+Warning: <name> is currently working on "<task_title>". Use --force to remove anyway.
+```
+
+Without `--force`: stop. With `--force` (or if idle):
+
+```bash
+tm-agent detach <name>
+```
+
+### `/team swap <name> <new-model> [--force]`
+
+Read `cli` and `agent_type` from `tm-agent status`. If working and no `--force`: print warning and stop. Otherwise:
+
+```bash
+tm-agent detach <name>
+tm-agent attach <agent_type> --name <name> --cli <stored-cli> --model <new-model>
+```
+
+### `/team ensure <role1> [role2] ...`
+
+Idempotent: for each role, check `tm-agent status`. Skip if any agent of that type already exists; attach otherwise.
+
+```bash
+# /team ensure reviewer security
+# → ENSURED: reviewer (already present)
+# → ENSURED: security (added)
+```
+
+Print one line per role: `ENSURED: <role> (added)` or `ENSURED: <role> (already present)`.
+
+### `/team destroy`
+
+Two-step confirm:
+
+1. AskUserQuestion: "Are you sure? This will close all agent panes." (Confirm / Cancel)
+2. AskUserQuestion: "Type DESTROY to confirm." — only proceed if input is exactly `DESTROY`.
+
+```bash
+tm-agent destroy
+```
+
+### Unrecognized first arg → passthrough
+
+For any first token not listed above, pass through to `tm-agent`:
 
 ```bash
 tm-agent $ARGUMENTS
 ```
 
-If `tm-agent` is not in PATH, use the project-local binary:
+If `tm-agent` is not in PATH:
 
 ```bash
 ./daemon/target/release/tm-agent $ARGUMENTS
 ```
-
-If `$ARGUMENTS` is empty (`/team`만 입력), print this onboarding cheat sheet (do NOT run tm-agent status):
-
-```
-자주 쓰는 명령:
-
-  /team status             지금 누가 무엇 중 (raw JSON)
-  /team task list          진행 중 작업
-  /team task clear         끝난 것 정리
-  /team create 4           새 팀 4명
-  /team delegate <a> "..." 1명에게 일 시키기
-  /team destroy            팀 종료
-
-한 줄로 모두 동원하려면: /tm "<instruction>"
-전체 reference: .claude/commands/team.md
-```
-
-If user wanted raw status, instruct them to type `/team status` explicitly.
 
 ## Subcommand Reference
 
 ### Team lifecycle
 | Command | Example | Description |
 |---------|---------|-------------|
+| `/team` (no args) | `/team` | Interactive editor: add/remove/swap/destroy |
+| `/team edit` | `/team edit` | Alias for interactive mode |
+| `/team status` | `/team status` | Formatted status table |
+| `/team add <role>` | `/team add reviewer` | Attach agent; defaults cli=claude, model=sonnet |
+| `/team add <role> --cli codex` | `/team add executor --cli codex` | Attach with specific CLI |
+| `/team add <role> --model opus` | `/team add architect --model opus` | Attach with specific model |
+| `/team remove <name>` | `/team remove reviewer` | Detach agent (warns if working) |
+| `/team remove <name> --force` | `/team remove reviewer --force` | Force detach even if working |
+| `/team swap <name> <model>` | `/team swap executor opus` | Re-attach with new model, same CLI |
+| `/team swap <name> <model> --force` | `/team swap executor opus --force` | Swap even if working |
+| `/team ensure <roles>` | `/team ensure reviewer security` | Attach missing roles, skip present ones |
+| `/team destroy` | `/team destroy` | 2-step confirm then destroy team |
 | `create [N]` | `/team create 3` | Create team with N agents (default 2) |
 | `create N --claude-leader` | `/team create 3 --claude-leader` | Create team with you as leader |
 | `create N --model opus` | `/team create 3 --model opus` | Set model for all agents (sonnet/opus/haiku) |
-| `create N --kiro N --codex N` | `/team create 4 --kiro 2 --codex 1` | Mix CLI types |
-| `destroy` | `/team destroy` | Destroy the current team |
-| `status` | `/team status` | Show team and task board status |
+| `create N (CLI mix)` | `/team create 4 --kiro 2 --cli-mix` | Mix CLI types (see CLAUDE.md for full flags) |
 | `list` | `/team list` | List all teams |
 
 ### Agent runbooks

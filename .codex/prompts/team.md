@@ -12,40 +12,105 @@ Do not use Codex sub-agents, native delegation, or any disconnected team state f
 
 ## Empty input
 
-If `$ARGUMENTS` is empty, print this cheat sheet and stop:
+If `$ARGUMENTS` is empty, run `tm-agent status`, render a formatted table (NAME / STATE / CLI / MODEL / TASK), then print:
 
 ```text
 자주 쓰는 명령:
 
-  /team status              지금 팀 상태
+  /team status              지금 팀 상태 (테이블)
+  /team add reviewer        reviewer 추가 (claude/sonnet 기본)
+  /team add executor --model opus  opus 모델로 executor 추가
+  /team add reviewer --cli codex   codex-backed reviewer 추가
+  /team remove writer       writer 제거
+  /team swap executor opus  executor 모델 교체
+  /team ensure reviewer security  없는 role만 추가
+  /team destroy             2단계 확인 후 팀 종료
   /team task list           진행 중 작업
-  /team task clear          끝난 태스크 정리
-  /team create 4 --adopt    현재 Codex pane을 리더로 팀 생성
-  /team attach reviewer     현재 workspace에 에이전트 추가
-  /team delegate <a> "..."  1명에게 추적 가능한 일감 위임
-  /team destroy             팀 종료
 
 한 줄로 모두 동원하려면: /tm "instruction"
+역할 자동 보충: /tm --ensure reviewer,security "instruction"
 전략 오케스트레이션: /tm-op refine|review|debate|...
 ```
 
-Do not run `tm-agent status` for empty input unless the user explicitly asks for status.
+Do not run additional `tm-agent` commands for empty input unless the user explicitly asks for status.
 
-## Execution
+## Subcommand routing
 
-For non-empty `$ARGUMENTS`, run:
+Parse the first token of `$ARGUMENTS`:
+
+### `add <role> [--cli X] [--model Y] [--name Z]`
+
+Valid roles: `architect` `executor` `explorer` `frontend` `backend` `tester` `reviewer` `security` `writer` `planner`
+
+Defaults: `--cli claude`, `--model sonnet`. Run:
+
+```bash
+tm-agent attach <role> [--cli X] [--model Y] [--name Z]
+```
+
+### `remove <name> [--force]`
+
+Check `tm-agent status`. If working and no `--force`, print:
+
+```
+Warning: <name> is currently working. Use --force to remove anyway.
+```
+
+Otherwise run:
+
+```bash
+tm-agent detach <name>
+```
+
+### `swap <name> <new-model> [--force]`
+
+Read `cli` and `agent_type` from `tm-agent status`. If working and no `--force`, warn and stop. Otherwise:
+
+```bash
+tm-agent detach <name>
+tm-agent attach <agent_type> --name <name> --cli <stored-cli> --model <new-model>
+```
+
+### `ensure <role1> [role2] ...`
+
+For each role, check `tm-agent status`. Skip if already present; attach otherwise. Print one line per role:
+
+```
+ENSURED: <role> (added)
+ENSURED: <role> (already present)
+```
+
+### `destroy`
+
+Two-step confirm: (1) "Are you sure? This will close all agent panes." (2) "Type DESTROY to confirm." Only if exactly `DESTROY`:
+
+```bash
+tm-agent destroy
+```
+
+### `status`
+
+```bash
+tm-agent status
+```
+
+Render as a human-readable table: `NAME (state, cli, model) — active_task_title or "idle"` per agent.
+
+### `edit` or no args (interactive)
+
+Show the formatted status table, then ask the user which action to take: Add / Remove / Swap / Refresh / Destroy. Execute per the subcommand logic above. After each action, reprint the table and ask "Another action?".
+
+### Any other first token → passthrough
 
 ```bash
 tm-agent $ARGUMENTS
 ```
 
-If `tm-agent` is unavailable in PATH, run:
+If `tm-agent` is unavailable in PATH:
 
 ```bash
 ./daemon/target/release/tm-agent $ARGUMENTS
 ```
-
-Show the meaningful output to the user.
 
 ## Codex leader defaults
 
@@ -57,9 +122,9 @@ Show the meaningful output to the user.
   ```bash
   tm-agent attach <role> [--cli claude|codex|kiro|gemini] [--model <model>]
   ```
-- To create Codex-backed worker panes:
+- To create Codex-backed worker panes, use CLI mix count flags (see CLAUDE.md):
   ```bash
-  tm-agent create 3 --adopt --codex all
+  tm-agent create 3 --adopt  # add --kiro N / CLI-count flags to mix CLI types
   ```
 
 Use `--claude-leader` only when the leader pane should be Claude Code, not Codex.
