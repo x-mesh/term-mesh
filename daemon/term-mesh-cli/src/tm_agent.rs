@@ -277,7 +277,11 @@ enum Commands {
         #[arg(long)]
         resume_session: Option<Option<String>>,
     },
-    /// Add an agent to an existing team
+    /// Add an agent to an existing team (GUI and headless teams both supported).
+    ///
+    /// For GUI teams: resolves the team name from TERMMESH_TEAM or the current
+    /// workspace and routes to the Swift `team.add_agent` RPC.
+    /// For headless teams: spawns a new daemon-managed subprocess as before.
     Add {
         /// Agent type/name (e.g. "security", "executor", "reviewer")
         agent_type: String,
@@ -320,6 +324,19 @@ enum Commands {
     Detach {
         /// Agent name to detach
         agent_name: String,
+    },
+    /// Remove an agent from a named GUI team by team name.
+    ///
+    /// Team-name–scoped: does not require TERMMESH_WORKSPACE_ID/PANEL_ID.
+    /// This is the counterpart of `add` for GUI teams — use this when you
+    /// know the team name but may not be running inside the workspace.
+    /// Unlike `detach` (workspace-local), `remove` operates on a named team.
+    Remove {
+        /// Agent name to remove from the team
+        agent_name: String,
+        /// Force removal even if the agent is busy (default: true)
+        #[arg(long, default_value_t = true)]
+        force: bool,
     },
     /// Preset operations (list)
     #[command(subcommand)]
@@ -3961,11 +3978,10 @@ fn main() {
                 }
             }
 
-            // GUI team: not yet supported
-            eprintln!("Error: 'tm-agent add' for GUI teams is not yet supported.");
-            eprintln!("Hint: Use 'tm-agent destroy' then 'tm-agent create' to recreate with different agents.");
-            eprintln!("      Headless team support: 'tm-agent create --headless ...' then 'tm-agent add ...'");
-            process::exit(1);
+            // GUI team: route to team.add_agent RPC
+            let gui_team = resolve_workspace_team_name().unwrap_or_else(|_| team.clone());
+            run_add_gui(&sock, &gui_team, &agent_type, &agent_name, &model, &cli);
+            return;
         }
         Commands::Attach {
             agent_type,
@@ -3987,6 +4003,15 @@ fn main() {
                 process::exit(1);
             }
             run_detach(&sock, &agent_name);
+            return;
+        }
+        Commands::Remove { agent_name, force } => {
+            if let Err(e) = validate_agent_name(&agent_name) {
+                eprintln!("Error: {}", e);
+                process::exit(1);
+            }
+            let gui_team = resolve_workspace_team_name().unwrap_or_else(|_| team.clone());
+            run_remove_gui(&sock, &gui_team, &agent_name, force);
             return;
         }
         Commands::Preset(sub) => match sub {
@@ -5305,6 +5330,139 @@ fn run_detach(sock: &PathBuf, agent_name: &str) {
     } else {
         let code = resp["error"]["code"].as_str().unwrap_or("unknown");
         let msg = resp["error"]["message"].as_str().unwrap_or("detach failed");
+        eprintln!("Error [{}]: {}", code, msg);
+        process::exit(1);
+    }
+}
+
+/// Add a single agent pane to a named GUI team via `team.add_agent` RPC.
+///
+/// Team-name–scoped: does not require TERMMESH_WORKSPACE_ID or PANEL_ID.
+fn run_add_gui(
+    sock: &PathBuf,
+    team_name: &str,
+    agent_type: &str,
+    agent_name: &str,
+    model: &str,
+    cli: &str,
+) {
+    eprintln!(
+        "Adding agent '{}' (type={}, cli={}, model={}) to GUI team '{}'...",
+        agent_name, agent_type, cli, model, team_name
+    );
+
+    let params = json!({
+        "team_name": team_name,
+        "agent_type": agent_type,
+        "name": agent_name,
+        "model": model,
+        "cli": cli,
+    });
+
+    let resp = match rpc_call_timeout(sock, "team.add_agent", params, 10) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("Error: {}", e);
+            process::exit(1);
+        }
+    };
+
+    if resp["ok"].as_bool().unwrap_or(false) {
+        println!("{}", pretty(&resp));
+        if let Some(result) = resp["result"].as_object() {
+            eprintln!();
+            eprintln!(
+                "  \u{2713} agent '{}' added ({} total in team '{}')",
+                result
+                    .get("agent_name")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or(agent_name),
+                result
+                    .get("agent_count")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0),
+                result
+                    .get("team_name")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or(team_name),
+            );
+        }
+    } else {
+        let code = resp["error"]["code"].as_str().unwrap_or("unknown");
+        let msg = resp["error"]["message"]
+            .as_str()
+            .unwrap_or("add_agent failed");
+        let hint = match code {
+            "duplicate_name" => format!(
+                "\nHint: An agent named '{}' already exists in team '{}'. Use --name to pick a unique name.",
+                agent_name, team_name
+            ),
+            "team_not_found" => format!(
+                "\nHint: Team '{}' not found. Run 'tm-agent status' to see active teams.",
+                team_name
+            ),
+            "workspace_gone" => "\nHint: The team's workspace is no longer open. Recreate the team with 'tm-agent create'.".to_string(),
+            "pane_limit" => "\nHint: The workspace has reached its maximum pane count. Detach another agent first.".to_string(),
+            _ => String::new(),
+        };
+        eprintln!("Error [{}]: {}{}", code, msg, hint);
+        process::exit(1);
+    }
+}
+
+/// Remove an agent from a named GUI team via `team.detach` RPC (team-name–scoped).
+///
+/// Unlike `run_detach` (workspace-local), this variant looks up the team by name
+/// and does not require TERMMESH_WORKSPACE_ID or PANEL_ID.
+fn run_remove_gui(sock: &PathBuf, team_name: &str, agent_name: &str, force: bool) {
+    eprintln!(
+        "Removing agent '{}' from GUI team '{}'...",
+        agent_name, team_name
+    );
+
+    let params = json!({
+        "team_name": team_name,
+        "agent_name": agent_name,
+        "force": force,
+    });
+
+    let resp = match rpc_call_timeout(sock, "team.detach", params, 10) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("Error: {}", e);
+            process::exit(1);
+        }
+    };
+
+    if resp["ok"].as_bool().unwrap_or(false) {
+        println!("{}", pretty(&resp));
+        if let Some(result) = resp["result"].as_object() {
+            let remaining = result
+                .get("remaining_agents")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+            let team_destroyed = result
+                .get("team_destroyed")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            eprintln!();
+            if team_destroyed {
+                eprintln!(
+                    "  \u{2713} agent '{}' removed. Team '{}' destroyed (leader pane preserved).",
+                    agent_name, team_name
+                );
+            } else {
+                eprintln!(
+                    "  \u{2713} agent '{}' removed ({} remaining in team '{}')",
+                    agent_name, remaining, team_name
+                );
+            }
+        }
+    } else {
+        let code = resp["error"]["code"].as_str().unwrap_or("unknown");
+        let msg = resp["error"]["message"]
+            .as_str()
+            .unwrap_or("remove failed");
         eprintln!("Error [{}]: {}", code, msg);
         process::exit(1);
     }

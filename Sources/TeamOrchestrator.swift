@@ -1640,6 +1640,147 @@ final class TeamOrchestrator: ObservableObject {
         }
     }
 
+    // MARK: - GUI Team Add Agent
+
+    /// Errors returned by `addAgentToTeam`.
+    enum AddAgentError: Error, CustomStringConvertible {
+        case teamNotFound(name: String)
+        case duplicateName(name: String, team: String)
+        case workspaceGone(teamName: String)
+        case cliBinaryNotFound(cli: String)
+        case paneCreationFailed
+
+        var description: String {
+            switch self {
+            case .teamNotFound(let name):
+                return "Team '\(name)' not found."
+            case .duplicateName(let name, let team):
+                return "Agent '\(name)' already exists in team '\(team)'. Use a different --name."
+            case .workspaceGone(let teamName):
+                return "Team '\(teamName)' workspace no longer exists."
+            case .cliBinaryNotFound(let cli):
+                return "\(cli) binary not found"
+            case .paneCreationFailed:
+                return "Failed to create agent pane."
+            }
+        }
+
+        var code: String {
+            switch self {
+            case .teamNotFound: return "team_not_found"
+            case .duplicateName: return "duplicate_name"
+            case .workspaceGone: return "workspace_gone"
+            case .cliBinaryNotFound: return "cli_not_found"
+            case .paneCreationFailed: return "pane_creation_failed"
+            }
+        }
+    }
+
+    /// Add a new agent pane to an existing GUI team (created via `createTeam`).
+    ///
+    /// Unlike `attachToWorkspace`, this:
+    ///   - resolves the workspace from the stored team record (no caller surface_id), and
+    ///   - bypasses the `existingGuiTeam` guard — it intentionally targets GUI teams.
+    ///
+    /// Used by the `team.add_agent` RPC, which is what `tm-agent add <role>` calls.
+    func addAgentToTeam(
+        teamName: String,
+        agentType: String,
+        agentName: String,
+        agentModel: String,
+        agentCli: String
+    ) -> Result<AgentMember, AddAgentError> {
+        // 1. Look up team by name
+        guard var team = teams[teamName] else {
+            return .failure(.teamNotFound(name: teamName))
+        }
+
+        // 2. Reject duplicate name within the team
+        if team.agents.contains(where: { $0.name == agentName }) {
+            return .failure(.duplicateName(name: agentName, team: teamName))
+        }
+
+        // 3. Resolve TabManager from team.workspaceId (no caller env required)
+        guard let tabManager = AppDelegate.shared?.tabManagerFor(tabId: team.workspaceId) else {
+            return .failure(.workspaceGone(teamName: teamName))
+        }
+
+        // 4. Confirm workspace is still alive within that TabManager
+        guard let workspace = tabManager.tabs.first(where: { $0.id == team.workspaceId }) else {
+            return .failure(.workspaceGone(teamName: teamName))
+        }
+
+        // 5. Normalize CLI and resolve binary path
+        let normalizedCli = agentCli.isEmpty ? "claude" : agentCli
+        guard let cliPath = agentBinaryPath(cli: normalizedCli) else {
+            return .failure(.cliBinaryNotFound(cli: normalizedCli))
+        }
+
+        // 6. Compose runbook instructions for the role
+        let effectiveInstructions = AgentRunbookService.shared.composeInstructions(
+            roleName: agentType,
+            presetInstructions: "",
+            workingDirectory: team.workingDirectory,
+            mode: .digest
+        )
+
+        // 7. Pick color deterministically from current agent count
+        let colorList = ["green", "blue", "yellow", "magenta", "cyan", "red"]
+        let agentColor = colorList[team.agents.count % colorList.count]
+
+        // 8. Choose split target — last agent pane or leader pane
+        let splitFrom: UUID
+        let orientation: SplitOrientation
+        if let lastAgent = team.agents.last, let lastPanel = lastAgent.panelId {
+            splitFrom = lastPanel
+            orientation = .vertical
+        } else {
+            splitFrom = team.leaderPanelId
+            orientation = .horizontal
+        }
+
+        // 9. Apply active CLI profile overrides (extraArgs / env / modelOverride)
+        let profile = CLIPathSettings.activeProfile(for: normalizedCli)
+        let extraArgs = profile?.extraArgs ?? []
+        let extraEnv = profile?.env ?? [:]
+        let effectiveModel = profile?.modelOverride ?? agentModel
+
+        // 10. Spawn the pane via shared helper
+        guard let member = addAgentPaneToWorkspace(
+            workspace: workspace,
+            agentName: agentName,
+            agentCli: normalizedCli,
+            agentModel: effectiveModel,
+            agentType: agentType,
+            agentColor: agentColor,
+            agentInstructions: effectiveInstructions,
+            cliPath: cliPath,
+            teamName: teamName,
+            leaderSessionId: team.leaderSessionId,
+            workingDirectory: team.workingDirectory,
+            agentWorkDir: team.workingDirectory,
+            worktreeName: nil,
+            worktreePath: nil,
+            worktreeBranch: nil,
+            splitFrom: splitFrom,
+            orientation: orientation,
+            extraArgs: extraArgs,
+            extraEnv: extraEnv,
+            tabManager: tabManager
+        ) else {
+            return .failure(.paneCreationFailed)
+        }
+
+        // 11. Commit updated team state
+        team.agents.append(member)
+        teams[teamName] = team
+        TeamDataStore.shared.registerTeam(teamName, agentNames: team.agents.map(\.name))
+        syncTeamStateToDaemon()
+        Logger.team.info("add_agent: added '\(agentName, privacy: .public)' to team '\(teamName, privacy: .public)' (\(team.agents.count, privacy: .public) total)")
+
+        return .success(member)
+    }
+
     /// Send a lightweight "pong" task to each agent after a delay, warming the Anthropic prompt cache.
     /// This reduces first-real-task latency from ~10s (cold) to ~1.2s (hot cache).
     /// Staggers agent warmups by 2s each to avoid flooding the GCD main queue with concurrent

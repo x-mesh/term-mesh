@@ -2009,6 +2009,8 @@ class TerminalController {
             return await asyncTeamAttach(params: params, id: id)
         case "team.detach":
             return await asyncTeamDetach(params: params, id: id)
+        case "team.add_agent":
+            return await asyncTeamAddAgent(params: params, id: id)
         default:
             return v2Error(id: id, code: "unknown_method", message: "Unknown team command: \(method)")
         }
@@ -2347,6 +2349,57 @@ class TerminalController {
                     "remaining_agents": detachResult.remainingAgents,
                     "team_destroyed": detachResult.teamDestroyed,
                 ] as [String: Any])
+            case .failure(let err):
+                return V2CallResult.err(code: err.code, message: err.description, data: nil)
+            }
+        }
+        return v2Result(id: id, result)
+    }
+
+    /// Add a new agent pane to an existing GUI team by team name.
+    /// Unlike team.attach, this does not require a caller surface_id — the workspace
+    /// is resolved from the stored team record, mirroring team.detach's routing.
+    ///
+    /// Params:
+    ///   - team_name  (required): target team name
+    ///   - agent_type (required): role type (e.g. "executor", "reviewer")
+    ///   - name       (optional): display name; defaults to agent_type if omitted
+    ///   - model      (optional): CLI model string; defaults to "sonnet"
+    ///   - cli        (optional): CLI binary; defaults to "claude"
+    private func asyncTeamAddAgent(params: [String: Any], id: Any?) async -> String {
+        guard let teamName = params["team_name"] as? String, !teamName.isEmpty else {
+            return v2Error(id: id, code: "invalid_params", message: "Missing team_name")
+        }
+        guard let agentType = params["agent_type"] as? String, !agentType.isEmpty else {
+            return v2Error(id: id, code: "invalid_params", message: "Missing agent_type")
+        }
+        let rawName = params["name"] as? String ?? ""
+        let agentName = rawName.isEmpty ? agentType : rawName
+        let agentModel = (params["model"] as? String) ?? "sonnet"
+        let agentCli = (params["cli"] as? String) ?? "claude"
+
+        let result: V2CallResult = await MainActor.run {
+            let outcome = TeamOrchestrator.shared.addAgentToTeam(
+                teamName: teamName,
+                agentType: agentType,
+                agentName: agentName,
+                agentModel: agentModel,
+                agentCli: agentCli
+            )
+            switch outcome {
+            case .success(let member):
+                var payload: [String: Any] = [
+                    "team_name": teamName,
+                    "agent_name": member.name,
+                    "agent_id": member.id,
+                    "agent_type": member.agentType,
+                    "cli": member.cli,
+                    "model": member.model,
+                ]
+                if let pid = member.panelId {
+                    payload["panel_id"] = pid.uuidString
+                }
+                return V2CallResult.ok(payload)
             case .failure(let err):
                 return V2CallResult.err(code: err.code, message: err.description, data: nil)
             }
