@@ -3732,13 +3732,20 @@ final class TeamOrchestrator: ObservableObject {
                     "agent_type": a.agentType,
                     "color": a.color,
                 ]
-                // Per-agent claude session id. Prefer the agent's own worktree
-                // path (worktree-isolated → one session per pane). Falls back
-                // to the team cwd when no worktree (shared workdir — ambiguous
-                // assignment between agents).
-                let agentWorkdir = a.worktreePath ?? team.workingDirectory
-                if let sid = Self.discoverClaudeSessionId(workingDirectory: agentWorkdir),
-                   !sid.isEmpty {
+                // Per-agent claude session id. Only safe to discover when the
+                // agent has its OWN worktree (1-to-1 mapping). When agents share
+                // the team workdir, mtime-based discovery returns the same jsonl
+                // for every agent — almost always the leader's — which causes
+                // resume to rehydrate every pane with the leader's conversation.
+                // Leave session_id nil in that case so the team is marked
+                // `no_sessions` rather than silently corrupting on resume.
+                // Also drop the value if it collides with the leader sid even
+                // when a worktree path is set (catches edge cases like a freshly
+                // created worktree where claude hasn't yet written a transcript
+                // and discovery falls through to the parent dir).
+                if let wt = a.worktreePath, !wt.isEmpty, wt != team.workingDirectory,
+                   let sid = Self.discoverClaudeSessionId(workingDirectory: wt),
+                   !sid.isEmpty, sid != leaderSid {
                     row["session_id"] = sid
                 }
                 if !a.instructions.isEmpty {
