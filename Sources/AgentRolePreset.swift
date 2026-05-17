@@ -17,7 +17,11 @@ struct AgentRolePreset: Identifiable, Codable, Equatable {
     /// Built-in default models per CLI type.
     static func builtInModels(for cli: String) -> [String] {
         switch cli {
-        case "claude", "kiro":
+        case "claude":
+            // opus-1m: 1M-context variant of Opus 4.7, mapped to
+            // claude-opus-4-7[1m] when the --model flag is rendered.
+            return ["sonnet", "opus", "opus-1m", "haiku"]
+        case "kiro":
             return ["sonnet", "opus", "haiku"]
         case "codex":
             return ["sonnet", "opus", "haiku",
@@ -38,6 +42,7 @@ struct AgentRolePreset: Identifiable, Codable, Equatable {
     /// but UI shows CLI-native text.
     static func modelDisplayLabel(_ model: String, for cli: String) -> String {
         switch (cli.lowercased(), model.lowercased()) {
+        case ("claude", "opus-1m"): return "opus (1M context)"
         case ("codex", "opus"):   return "gpt-5.5 (high)"
         case ("codex", "sonnet"): return "gpt-5.5 (medium)"
         case ("codex", "haiku"):  return "gpt-5.5 (low)"
