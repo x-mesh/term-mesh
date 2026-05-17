@@ -4,6 +4,20 @@ All notable changes to term-mesh are documented here.
 
 ## [Unreleased]
 
+## [0.120.0] - 2026-05-17
+
+### Added
+- **Claude leader/agent에 opus 1M context 모델 선택지** — New Agent Team 다이얼로그의 leader / bulk / per-agent 모델 picker에 `opus (1M context)`가 추가됨. 선택 시 내부적으로 `--model claude-opus-4-7[1m]`가 전달되어 1M 토큰 컨텍스트 변형으로 실행. 마지막 선택값은 AppStorage에 영구 저장되어 다음 다이얼로그부터 기본 선택.
+- **`/tm` 슬래시 커맨드 자동 설치** — 앱이 첫 실행되면 `~/.claude/commands/tm.md`를 번들에서 자동으로 install. 이전 버전은 `team`·`team-up`·`tm-op`·`tm-bench`만 install 됐다.
+
+### Changed
+- **기존 사용자의 슬래시 커맨드 일회성 마이그레이션** — `team.md` / `tm.md` / `team-up.md` / `tm-op.md` / `tm-bench.md` 5개는 term-mesh가 소유권을 갖는 managed 이름으로 지정. 이미 같은 이름의 마커 없는 파일(직접 복사·심볼릭 링크·구버전 잔여물 등)이 있어도 자동으로 `<name>.bak-yyyyMMdd-HHmmss`로 백업한 뒤 번들 버전을 install. 첫 launch 시 일회성으로만 수행되며, 그 외 사용자 커스텀 파일은 그대로 건드리지 않는다.
+- **모델 picker 빈 선택 방지** — leader / bulk / per-agent 모델 picker가 AppStorage에 저장된 모델이 현재 CLI의 목록에 없을 때(예: codex로 바꾼 뒤 claude로 돌아옴) selectbox가 잠깐 비어 보이던 문제를 self-healing 바인딩으로 차단. 잘못된 값은 fallback으로 즉시 정상화된다.
+
+### Thanks to 1 contributor!
+
+- [@JINWOO-J](https://github.com/JINWOO-J)
+
 ## [0.119.0] - 2026-05-17
 
 ### Added
