@@ -1118,7 +1118,20 @@ struct TeamCreationView: View {
                 .fixedSize()
 
                 if leaderMode != "repl" {
-                    Picker("", selection: $leaderModel) {
+                    // Self-healing binding: if leaderModel isn't in the current CLI's
+                    // model list (stale AppStorage, removed custom model, etc.), the
+                    // get-side returns a valid fallback for this render and schedules
+                    // a state correction so SwiftUI never paints a blank selection.
+                    Picker("", selection: Binding(
+                        get: {
+                            let opts = AgentRolePreset.models(for: leaderMode)
+                            if opts.contains(leaderModel) { return leaderModel }
+                            let fallback = AgentRolePreset.defaultModel(for: leaderMode)
+                            DispatchQueue.main.async { leaderModel = fallback }
+                            return fallback
+                        },
+                        set: { leaderModel = $0 }
+                    )) {
                         ForEach(AgentRolePreset.models(for: leaderMode), id: \.self) { m in
                             Text(AgentRolePreset.modelDisplayLabel(m, for: leaderMode)).tag(m)
                         }
@@ -1358,7 +1371,18 @@ struct TeamCreationView: View {
                         }
                     }
                     .frame(width: 85)
-                    Picker("", selection: $bulkModel) {
+                    // Self-healing binding mirrors the leader picker pattern so
+                    // bulkModel can never be visually empty when bulkCli changes.
+                    Picker("", selection: Binding(
+                        get: {
+                            let opts = bulkModels
+                            if opts.contains(bulkModel) { return bulkModel }
+                            let fallback = AgentRolePreset.defaultModel(for: bulkCli)
+                            DispatchQueue.main.async { bulkModel = fallback }
+                            return fallback
+                        },
+                        set: { bulkModel = $0 }
+                    )) {
                         ForEach(bulkModels, id: \.self) { m in
                             Text(AgentRolePreset.modelDisplayLabel(m, for: bulkCli)).tag(m)
                         }
@@ -1451,9 +1475,23 @@ struct TeamCreationView: View {
                 }
                 .frame(width: 90)
 
-                // Model picker — shows CLI-appropriate models
+                // Model picker — shows CLI-appropriate models.
+                // Self-healing: when the agent's CLI flips (e.g. claude→codex), the
+                // previously-stored model tier may no longer be valid for the new CLI.
+                // Returning a fallback in get + scheduling a state correction keeps
+                // the picker from rendering empty before onChange handlers re-sync.
                 Picker("", selection: Binding(
-                    get: { agent.preset.model },
+                    get: {
+                        let opts = AgentRolePreset.models(for: agent.preset.cli)
+                        let current = agent.preset.model
+                        if opts.contains(current) { return current }
+                        let fallback = AgentRolePreset.defaultModel(for: agent.preset.cli)
+                        DispatchQueue.main.async {
+                            guard index < agents.count else { return }
+                            agents[index].preset.model = fallback
+                        }
+                        return fallback
+                    },
                     set: {
                         agents[index].preset.model = $0
                         persistSelectedSmartPresetOverride()

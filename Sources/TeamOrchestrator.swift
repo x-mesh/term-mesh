@@ -926,7 +926,7 @@ final class TeamOrchestrator: ObservableObject {
                     let quotedPath = claudePath.contains(" ") ? "\"\(claudePath)\"" : claudePath
                     var claudeLeaderParts = ["\(quotedPath)", "--system-prompt '\(escaped)'", "--dangerously-skip-permissions"]
                     if !leaderModel.isEmpty && leaderModel != "sonnet" {
-                        claudeLeaderParts.append("--model \(leaderModel)")
+                        claudeLeaderParts.append("--model \(Self.resolveClaudeModelArg(leaderModel))")
                     }
                     if let sid = resumeSessionId, !sid.isEmpty {
                         claudeLeaderParts.append("--resume \(sid)")
@@ -3905,7 +3905,7 @@ final class TeamOrchestrator: ObservableObject {
         ]
 
         if !model.isEmpty {
-            parts.append("--model \(model)")
+            parts.append("--model \(Self.resolveClaudeModelArg(model))")
         }
 
         if !instructions.isEmpty {
@@ -3921,6 +3921,16 @@ final class TeamOrchestrator: ObservableObject {
 
     private func shellQuote(_ s: String) -> String {
         return "'" + s.replacingOccurrences(of: "'", with: "'\\''") + "'"
+    }
+
+    /// Map term-mesh tier names to the exact `--model` argument Claude CLI expects.
+    /// Only `opus-1m` needs explicit translation today; other tiers are passed through
+    /// (Claude CLI accepts `sonnet`/`opus`/`haiku` and full model IDs verbatim).
+    static func resolveClaudeModelArg(_ model: String) -> String {
+        switch model {
+        case "opus-1m": return "claude-opus-4-7[1m]"
+        default:        return model
+        }
     }
 
     /// Map short model names (used internally) to kiro-cli model identifiers.
