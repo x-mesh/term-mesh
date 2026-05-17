@@ -4,11 +4,27 @@ All notable changes to term-mesh are documented here.
 
 ## [Unreleased]
 
+## [0.119.0] - 2026-05-17
+
 ### Added
-- **CLI Profiles** — 여러 개의 named CLI 프로파일(path + extraArgs + env + modelOverride)을 저장하고 메뉴바 / Settings에서 즉시 전환.
+- **CLI Profiles** — 여러 개의 named CLI 프로파일(path + extraArgs + env + modelOverride)을 저장하고 메뉴바 / Settings에서 즉시 전환. 같은 CLI(claude / codex / kiro / gemini)라도 모델·인수·환경변수가 다른 여러 구성을 만들어 두고 한 번의 클릭으로 갈아탈 수 있다.
 - **Settings → CLI Paths: Recent/Detected dropdown** — 경로 입력 필드에 자동 감지된 경로와 최근 사용 경로를 드롭다운으로 표시.
 - **CLI Profile 자동 마이그레이션** — 기존 `cliPath.<cli>` 값이 시작 시 자동으로 "Default" 프로파일로 변환. 구버전 빌드 호환을 위해 dual-write 유지.
-- **메뉴바 › CLI Profile 서브메뉴** — CLI별 프로파일 목록을 라디오 항목으로 표시하며 즉시 전환 가능. 옵션으로 현재 pane을 새 프로파일로 hard restart.
+- **메뉴바 › CLI Profile 서브메뉴** — CLI별 프로파일 목록을 라디오 항목으로 표시하며 즉시 전환 가능. "Apply to Active Pane (Restart)"로 현재 pane을 새 프로파일로 hard restart.
+- **Pane mode 팀 archive & resume** — 사용자가 split으로 직접 띄운 agent 팀(pane mode)의 leader / agent 구성, 작업 디렉토리, claude session id를 워크스페이스 종료(Cmd+Q) / destroy 시 자동으로 archive. 다음 실행 때 New Agent Team 다이얼로그의 Resume picker에서 leader session id와 마지막 메시지를 보고 한 번에 복원되며, agent들은 이전 대화 컨텍스트를 그대로 이어간다 (leader는 항상 새 세션으로 시작해 stale id 회피).
+- **Resume picker — archive 삭제** — 더 이상 필요 없는 pane 팀 archive를 picker에서 바로 삭제.
+- **`/team` 슬래시 커맨드 — lifecycle 전용으로 분리** — 팀 *구성 편집* 책임만 가지며 `add` / `remove` / `swap` / `ensure` / `status` / `destroy` / `edit` 서브커맨드를 제공. 인자 없이 호출하면 인터랙티브 편집기. GUI 팀에서도 동작 (`tm-agent add`/`remove` RPC 신설). `/tm`(dispatch)과 양방향으로 안내된다.
+- **`/tm --ensure <roles>` 옵션** — fan-out 직전에 누락된 role을 자동으로 보강한 뒤 instruction을 전파. 팀 구성 변경은 명시적 opt-in일 때만 일어난다.
+- **`/tm` 인터랙티브 메뉴** — 인자 없이 호출 시 instruction 입력 + 옵션 선택 UI를 표시.
+- **`/tm` 이질적 fan-out 합성** — reviewer / planner / executor 등 서로 다른 역할의 결과를 3-tier read rules로 자동 종합하고 `[결론] / [충돌] / [다음]` 3줄로 수렴. instruction을 자동 분해해 역할별로 분배하며, `--no-decompose`로 분해를 비활성화할 수 있다.
+
+### Changed
+- **`/team` ↔ `/tm` 책임 분리** — 이전엔 `/team`이 lifecycle + dispatch를 둘 다 처리해 의도가 섞였다. 이제 `/team` = 구성 편집, `/tm` = 실행으로 단일 책임을 가진다. 기존 호출 패턴은 호환되며 인터랙티브 메뉴와 안내 메시지가 신구 사용자를 모두 이끈다.
+- **Pane mode 팀 leader 재개 정책** — resume 시 leader는 항상 새 세션으로 시작 (이전엔 stale session id로 인해 첫 메시지가 무시되는 경우가 있었다). agent들은 자신의 worktree에 기록된 실제 claude session id로 정확히 재개.
+
+### Thanks to 1 contributor!
+
+- [@JINWOO-J](https://github.com/JINWOO-J)
 
 ## [0.118.0] - 2026-05-15
 
