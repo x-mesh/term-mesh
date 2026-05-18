@@ -4,6 +4,27 @@ All notable changes to term-mesh are documented here.
 
 ## [Unreleased]
 
+## [0.123.0] - 2026-05-18
+
+### Added
+- **Agent 사이드바 새 visual cue — `★` (active) / `◯` (assigned) / `⏳` (assigned + stale) / `✓` (completed) / `✗` (blocked/failed) / `🔍` (review_ready)** — `tm-agent task list` / `tm-agent inbox` 출력이 raw JSON dump에서 한 줄 표 포맷으로 전환. 파이프/자동화는 `--json` 옵트인으로 기존 동작 유지.
+- **`tm-agent task current` 신규 서브커맨드** — 호출자의 현재 active task를 한 줄로 즉시 확인.
+- **Agent 좀비 task 자동 정리** — agent가 `tm-agent reply`를 빼먹고 idle로 돌아가도 daemon이 3~6분 안에 해당 task를 자동으로 `blocked`로 전이해 다음 라운드 inbox 오염을 차단. 부팅 시에도 1회 sweep으로 직전 run의 좀비 정리.
+
+### Fixed
+- **Agent reply 누락으로 인한 좀비 task 누적** — Sonnet 4.6 agent가 작업을 마치고도 reply를 안 보내고 idle로 복귀하면 task가 `assigned`로 영구 잔존하던 문제. daemon이 `Assigned→Blocked` 자동 전이 + `task_assign` 중복 in_progress 가드 + `compute_agent_anomalies`에 `assigned_stale` branch 추가로 lifecycle을 강제. 사이드바 active_task_id도 task가 terminal 상태가 되면 즉시 클리어.
+- **`tm-agent reply`가 stale task에 잘못 매칭되던 문제** — 동일 assignee에 다수 `in_progress` 후보가 있을 때 가장 오래된 stale task를 닫던 버그. 이제 `is_stale=false` 우선 + `created_at desc` 정렬로 정확한 active task를 선택. 후보가 다수면 stderr 경고 + `--task-id` opt-in.
+- **`tm-agent reply` 실패 silent fail** — active task 없을 때 stderr warning만 띄우고 exit 0이던 동작을 `code: "no_active_task"` JSON error + exit 2로 강화.
+
+### Internal
+- 8개 role runbook (`.agent-runbooks/{explorer,executor,reviewer,backend,frontend,architect,api,syseng}.md`)에 reply-first invariant reminder 추가
+- `.agent-runbooks/_common.md` 신설 — 모든 role에 적용되는 task lifecycle 규약(P0)
+- `scripts/cleanup-stale-tasks.sh` — 부팅 sweep 누락 시 backstop으로 사용 가능한 운영 스크립트 (기본 `--dry-run`)
+
+### Thanks to 1 contributor!
+
+- [@JINWOO-J](https://github.com/JINWOO-J)
+
 ## [0.122.0] - 2026-05-18
 
 ### Fixed
