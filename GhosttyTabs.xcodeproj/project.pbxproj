@@ -77,6 +77,10 @@
 		A5001704 /* dashboard in Resources */ = {isa = PBXBuildFile; fileRef = A5001705 /* dashboard */; };
 		ARB00002 /* AgentRunbookService.swift in Sources */ = {isa = PBXBuildFile; fileRef = ARB00001 /* AgentRunbookService.swift */; };
 		ARB00004 /* AgentRunbookSettingsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = ARB00003 /* AgentRunbookSettingsView.swift */; };
+		CPF00002 /* CliProfile.swift in Sources */ = {isa = PBXBuildFile; fileRef = CPF00001 /* CliProfile.swift */; };
+		CPF00004 /* CliProfileStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = CPF00003 /* CliProfileStore.swift */; };
+		CPF00006 /* CliProfileMigrator.swift in Sources */ = {isa = PBXBuildFile; fileRef = CPF00005 /* CliProfileMigrator.swift */; };
+		CPF00008 /* CLIPathSettings+Profiles.swift in Sources */ = {isa = PBXBuildFile; fileRef = CPF00007 /* CLIPathSettings+Profiles.swift */; };
 			A5001006 /* GhosttyKit.xcframework in Frameworks */ = {isa = PBXBuildFile; fileRef = A5001016 /* GhosttyKit.xcframework */; };
 		A5001007 /* TerminalController.swift in Sources */ = {isa = PBXBuildFile; fileRef = A5001019 /* TerminalController.swift */; };
 		TC0B0001 /* TerminalController+Process.swift in Sources */ = {isa = PBXBuildFile; fileRef = TC0F0001 /* TerminalController+Process.swift */; };
@@ -293,6 +297,10 @@
 		A5001705 /* dashboard */ = {isa = PBXFileReference; lastKnownFileType = folder; path = dashboard; sourceTree = "<group>"; };
 		ARB00001 /* AgentRunbookService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AgentRunbookService.swift; sourceTree = "<group>"; };
 		ARB00003 /* AgentRunbookSettingsView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AgentRunbookSettingsView.swift; sourceTree = "<group>"; };
+		CPF00001 /* CliProfile.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CliProfile.swift; sourceTree = "<group>"; };
+		CPF00003 /* CliProfileStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CliProfileStore.swift; sourceTree = "<group>"; };
+		CPF00005 /* CliProfileMigrator.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CliProfileMigrator.swift; sourceTree = "<group>"; };
+		CPF00007 /* CLIPathSettings+Profiles.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "CLIPathSettings+Profiles.swift"; sourceTree = "<group>"; };
 			A5001016 /* GhosttyKit.xcframework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.xcframework; path = GhosttyKit.xcframework; sourceTree = "<group>"; };
 		A5001017 /* ghostty.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = ghostty.h; sourceTree = "<group>"; };
 		A5001018 /* term-mesh-Bridging-Header.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = "term-mesh-Bridging-Header.h"; sourceTree = "<group>"; };
@@ -464,7 +472,7 @@
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 			shellPath = /bin/sh;
-			shellScript = "# Generate BuildInfo.swift with git SHA\n\"${SRCROOT}/scripts/generate-build-info.sh\"\nset -euo pipefail\nDEST=\"${TARGET_BUILD_DIR}/${UNLOCALIZED_RESOURCES_FOLDER_PATH}\"\nGHOSTTY_DEST=\"${DEST}/ghostty\"\nTERMINFO_DEST=\"${DEST}/terminfo\"\nTERMMESH_SHELL_DEST=\"${DEST}/shell-integration\"\nSRC_SHARE=\"${SRCROOT}/ghostty/zig-out/share\"\nGHOSTTY_SRC=\"${SRC_SHARE}/ghostty\"\nTERMINFO_SRC=\"${SRC_SHARE}/terminfo\"\nFALLBACK_GHOSTTY=\"${SRCROOT}/Resources/ghostty\"\nFALLBACK_TERMINFO=\"${SRCROOT}/Resources/ghostty/terminfo\"\nTERMINFO_OVERLAY=\"${SRCROOT}/Resources/terminfo-overlay\"\nTERMMESH_SHELL_SRC=\"${SRCROOT}/Resources/shell-integration\"\nif [ -d \"$GHOSTTY_SRC\" ]; then\n  mkdir -p \"$GHOSTTY_DEST\"\n  rsync -a --delete \"$GHOSTTY_SRC/\" \"$GHOSTTY_DEST/\"\nelif [ -d \"$FALLBACK_GHOSTTY\" ]; then\n  mkdir -p \"$GHOSTTY_DEST\"\n  rsync -a --delete \"$FALLBACK_GHOSTTY/\" \"$GHOSTTY_DEST/\"\nfi\nif [ -d \"$TERMINFO_SRC\" ]; then\n  mkdir -p \"$TERMINFO_DEST\"\n  rsync -a --delete \"$TERMINFO_SRC/\" \"$TERMINFO_DEST/\"\nelif [ -d \"$FALLBACK_TERMINFO\" ]; then\n  mkdir -p \"$TERMINFO_DEST\"\n  rsync -a --delete \"$FALLBACK_TERMINFO/\" \"$TERMINFO_DEST/\"\nfi\n# Overlay any term-mesh-specific terminfo adjustments.\n# This intentionally does not use --delete so we only patch specific entries.\nif [ -d \"$TERMINFO_OVERLAY\" ]; then\n  mkdir -p \"$TERMINFO_DEST\"\n  rsync -a \"$TERMINFO_OVERLAY/\" \"$TERMINFO_DEST/\"\nfi\nif [ -d \"$TERMMESH_SHELL_SRC\" ]; then\n  mkdir -p \"$TERMMESH_SHELL_DEST\"\n  # Use '/.' so dotfiles like .zshenv/.zprofile are copied too.\n  rsync -a \"$TERMMESH_SHELL_SRC/.\" \"$TERMMESH_SHELL_DEST/\"\nfi\n# Copy term-mesh Ghostty config overrides (e.g. shell-integration=none).\nTERMMESH_CONF=\"${SRCROOT}/Resources/ghostty-termmesh.conf\"\nif [ -f \"$TERMMESH_CONF\" ]; then\n  cp -p \"$TERMMESH_CONF\" \"$DEST/ghostty-termmesh.conf\"\nfi\nTEAM_TEMPLATES_BUILTIN=\"${SRCROOT}/Resources/team-templates.builtin.json\"\nif [ -f \"$TEAM_TEMPLATES_BUILTIN\" ]; then\n  cp -p \"$TEAM_TEMPLATES_BUILTIN\" \"$DEST/team-templates.builtin.json\"\nfi\n# Copy team scripts into the bundle for Release builds.\nTEAM_SCRIPTS_SRC=\"${SRCROOT}/scripts\"\nTEAM_SCRIPTS_DEST=\"${DEST}/scripts\"\nif [ -d \"$TEAM_SCRIPTS_SRC\" ]; then\n  mkdir -p \"$TEAM_SCRIPTS_DEST\"\n  for f in team-leader.sh team-leader-claude.sh tm-agent.sh; do\n    [ -f \"$TEAM_SCRIPTS_SRC/$f\" ] && cp -p \"$TEAM_SCRIPTS_SRC/$f\" \"$TEAM_SCRIPTS_DEST/$f\"\n  done\n  chmod +x \"$TEAM_SCRIPTS_DEST\"/*.sh 2>/dev/null || true\nfi\n# Copy Claude slash commands into the bundle with managed-file marker.\nCLAUDE_SRC=\"${SRCROOT}/.claude/commands\"\nCLAUDE_DEST=\"${DEST}/claude-commands\"\nCLAUDE_COMMANDS=(team.md team-up.md tm-bench.md tm-op.md)\nmkdir -p \"$CLAUDE_DEST\"\nfor f in \"${CLAUDE_COMMANDS[@]}\"; do\n  if [ -f \"$CLAUDE_SRC/$f\" ]; then\n    { echo '<!-- term-mesh-managed: do not remove this line -->'; cat \"$CLAUDE_SRC/$f\"; } > \"$CLAUDE_DEST/$f\"\n  fi\ndone\n# Copy Claude skills (each skill is <name>/SKILL.md with YAML frontmatter; marker is inserted after the frontmatter block).\nCLAUDE_SKILLS_SRC=\"${SRCROOT}/.claude/skills\"\nCLAUDE_SKILLS_DEST=\"${DEST}/claude-skills\"\nCLAUDE_SKILLS=(term-mesh-cli)\nmkdir -p \"$CLAUDE_SKILLS_DEST\"\nfor s in \"${CLAUDE_SKILLS[@]}\"; do\n  src_file=\"$CLAUDE_SKILLS_SRC/$s/SKILL.md\"\n  if [ -f \"$src_file\" ]; then\n    mkdir -p \"$CLAUDE_SKILLS_DEST/$s\"\n    awk 'BEGIN{in_fm=0} NR==1 && /^---[[:space:]]*$/ {in_fm=1; print; next} in_fm && /^---[[:space:]]*$/ {print; print \"<!-- term-mesh-managed: do not remove this line -->\"; in_fm=0; next} {print}' \"$src_file\" > \"$CLAUDE_SKILLS_DEST/$s/SKILL.md\"\n  fi\ndone\nINFO_PLIST=\"${TARGET_BUILD_DIR}/${INFOPLIST_PATH}\"\nCOMMIT=\"$(git -C \"${SRCROOT}\" rev-parse --short=9 HEAD 2>/dev/null || true)\"\nif [ -n \"$COMMIT\" ] && [ -f \"$INFO_PLIST\" ]; then\n  /usr/libexec/PlistBuddy -c \"Set :TermMeshCommit $COMMIT\" \"$INFO_PLIST\" >/dev/null 2>&1 || /usr/libexec/PlistBuddy -c \"Add :TermMeshCommit string $COMMIT\" \"$INFO_PLIST\" >/dev/null 2>&1 || true\nfi\n";
+			shellScript = "# Generate BuildInfo.swift with git SHA\n\"${SRCROOT}/scripts/generate-build-info.sh\"\nset -euo pipefail\nDEST=\"${TARGET_BUILD_DIR}/${UNLOCALIZED_RESOURCES_FOLDER_PATH}\"\nGHOSTTY_DEST=\"${DEST}/ghostty\"\nTERMINFO_DEST=\"${DEST}/terminfo\"\nTERMMESH_SHELL_DEST=\"${DEST}/shell-integration\"\nSRC_SHARE=\"${SRCROOT}/ghostty/zig-out/share\"\nGHOSTTY_SRC=\"${SRC_SHARE}/ghostty\"\nTERMINFO_SRC=\"${SRC_SHARE}/terminfo\"\nFALLBACK_GHOSTTY=\"${SRCROOT}/Resources/ghostty\"\nFALLBACK_TERMINFO=\"${SRCROOT}/Resources/ghostty/terminfo\"\nTERMINFO_OVERLAY=\"${SRCROOT}/Resources/terminfo-overlay\"\nTERMMESH_SHELL_SRC=\"${SRCROOT}/Resources/shell-integration\"\nif [ -d \"$GHOSTTY_SRC\" ]; then\n  mkdir -p \"$GHOSTTY_DEST\"\n  rsync -a --delete \"$GHOSTTY_SRC/\" \"$GHOSTTY_DEST/\"\nelif [ -d \"$FALLBACK_GHOSTTY\" ]; then\n  mkdir -p \"$GHOSTTY_DEST\"\n  rsync -a --delete \"$FALLBACK_GHOSTTY/\" \"$GHOSTTY_DEST/\"\nfi\nif [ -d \"$TERMINFO_SRC\" ]; then\n  mkdir -p \"$TERMINFO_DEST\"\n  rsync -a --delete \"$TERMINFO_SRC/\" \"$TERMINFO_DEST/\"\nelif [ -d \"$FALLBACK_TERMINFO\" ]; then\n  mkdir -p \"$TERMINFO_DEST\"\n  rsync -a --delete \"$FALLBACK_TERMINFO/\" \"$TERMINFO_DEST/\"\nfi\n# Overlay any term-mesh-specific terminfo adjustments.\n# This intentionally does not use --delete so we only patch specific entries.\nif [ -d \"$TERMINFO_OVERLAY\" ]; then\n  mkdir -p \"$TERMINFO_DEST\"\n  rsync -a \"$TERMINFO_OVERLAY/\" \"$TERMINFO_DEST/\"\nfi\nif [ -d \"$TERMMESH_SHELL_SRC\" ]; then\n  mkdir -p \"$TERMMESH_SHELL_DEST\"\n  # Use '/.' so dotfiles like .zshenv/.zprofile are copied too.\n  rsync -a \"$TERMMESH_SHELL_SRC/.\" \"$TERMMESH_SHELL_DEST/\"\nfi\n# Copy term-mesh Ghostty config overrides (e.g. shell-integration=none).\nTERMMESH_CONF=\"${SRCROOT}/Resources/ghostty-termmesh.conf\"\nif [ -f \"$TERMMESH_CONF\" ]; then\n  cp -p \"$TERMMESH_CONF\" \"$DEST/ghostty-termmesh.conf\"\nfi\nTEAM_TEMPLATES_BUILTIN=\"${SRCROOT}/Resources/team-templates.builtin.json\"\nif [ -f \"$TEAM_TEMPLATES_BUILTIN\" ]; then\n  cp -p \"$TEAM_TEMPLATES_BUILTIN\" \"$DEST/team-templates.builtin.json\"\nfi\n# Copy team scripts into the bundle for Release builds.\nTEAM_SCRIPTS_SRC=\"${SRCROOT}/scripts\"\nTEAM_SCRIPTS_DEST=\"${DEST}/scripts\"\nif [ -d \"$TEAM_SCRIPTS_SRC\" ]; then\n  mkdir -p \"$TEAM_SCRIPTS_DEST\"\n  for f in team-leader.sh team-leader-claude.sh tm-agent.sh; do\n    [ -f \"$TEAM_SCRIPTS_SRC/$f\" ] && cp -p \"$TEAM_SCRIPTS_SRC/$f\" \"$TEAM_SCRIPTS_DEST/$f\"\n  done\n  chmod +x \"$TEAM_SCRIPTS_DEST\"/*.sh 2>/dev/null || true\nfi\n# Copy Claude slash commands into the bundle with managed-file marker.\nCLAUDE_SRC=\"${SRCROOT}/.claude/commands\"\nCLAUDE_DEST=\"${DEST}/claude-commands\"\nCLAUDE_COMMANDS=(team.md team-up.md tm.md tm-bench.md tm-op.md)\nmkdir -p \"$CLAUDE_DEST\"\nfor f in \"${CLAUDE_COMMANDS[@]}\"; do\n  if [ -f \"$CLAUDE_SRC/$f\" ]; then\n    { echo '<!-- term-mesh-managed: do not remove this line -->'; cat \"$CLAUDE_SRC/$f\"; } > \"$CLAUDE_DEST/$f\"\n  fi\ndone\n# Copy Claude skills (each skill is <name>/SKILL.md with YAML frontmatter; marker is inserted after the frontmatter block).\nCLAUDE_SKILLS_SRC=\"${SRCROOT}/.claude/skills\"\nCLAUDE_SKILLS_DEST=\"${DEST}/claude-skills\"\nCLAUDE_SKILLS=(term-mesh-cli)\nmkdir -p \"$CLAUDE_SKILLS_DEST\"\nfor s in \"${CLAUDE_SKILLS[@]}\"; do\n  src_file=\"$CLAUDE_SKILLS_SRC/$s/SKILL.md\"\n  if [ -f \"$src_file\" ]; then\n    mkdir -p \"$CLAUDE_SKILLS_DEST/$s\"\n    awk 'BEGIN{in_fm=0} NR==1 && /^---[[:space:]]*$/ {in_fm=1; print; next} in_fm && /^---[[:space:]]*$/ {print; print \"<!-- term-mesh-managed: do not remove this line -->\"; in_fm=0; next} {print}' \"$src_file\" > \"$CLAUDE_SKILLS_DEST/$s/SKILL.md\"\n  fi\ndone\nINFO_PLIST=\"${TARGET_BUILD_DIR}/${INFOPLIST_PATH}\"\nCOMMIT=\"$(git -C \"${SRCROOT}\" rev-parse --short=9 HEAD 2>/dev/null || true)\"\nif [ -n \"$COMMIT\" ] && [ -f \"$INFO_PLIST\" ]; then\n  /usr/libexec/PlistBuddy -c \"Set :TermMeshCommit $COMMIT\" \"$INFO_PLIST\" >/dev/null 2>&1 || /usr/libexec/PlistBuddy -c \"Add :TermMeshCommit string $COMMIT\" \"$INFO_PLIST\" >/dev/null 2>&1 || true\nfi\n";
 		};
 /* End PBXShellScriptBuildPhase section */
 
@@ -573,6 +581,10 @@
 				A5001721 /* TeamDataStore.swift */,
 				ARB00001 /* AgentRunbookService.swift */,
 				ARB00003 /* AgentRunbookSettingsView.swift */,
+				CPF00001 /* CliProfile.swift */,
+				CPF00003 /* CliProfileStore.swift */,
+				CPF00005 /* CliProfileMigrator.swift */,
+				CPF00007 /* CLIPathSettings+Profiles.swift */,
 				813264D854BA4B5F9AA4F9FC /* RolePresetEditorView.swift */,
 				B848F672710C48B1944F70BF /* TeamCreationView.swift */,
 				DE801F330BAD4EB88D9D875E /* AgentRolePreset.swift */,
@@ -902,6 +914,10 @@
 				A5001720 /* TeamDataStore.swift in Sources */,
 				ARB00002 /* AgentRunbookService.swift in Sources */,
 				ARB00004 /* AgentRunbookSettingsView.swift in Sources */,
+				CPF00002 /* CliProfile.swift in Sources */,
+				CPF00004 /* CliProfileStore.swift in Sources */,
+				CPF00006 /* CliProfileMigrator.swift in Sources */,
+				CPF00008 /* CLIPathSettings+Profiles.swift in Sources */,
 				4C9D95957760492496CD2E3E /* RolePresetEditorView.swift in Sources */,
 				562D55FA859F4E8B94EB49CB /* TeamCreationView.swift in Sources */,
 				F46F7DFF875543329CD15B08 /* AgentRolePreset.swift in Sources */,
@@ -1079,7 +1095,7 @@
 				CODE_SIGN_ENTITLEMENTS = "";
 				CODE_SIGN_STYLE = Automatic;
 				COMBINE_HIDPI_IMAGES = YES;
-				CURRENT_PROJECT_VERSION = 173;
+				CURRENT_PROJECT_VERSION = 179;
 				DEVELOPMENT_TEAM = "";
 				ENABLE_HARDENED_RUNTIME = NO;
 				GENERATE_INFOPLIST_FILE = NO;
@@ -1088,7 +1104,7 @@
 					"$(inherited)",
 					"@executable_path/../Frameworks",
 				);
-				MARKETING_VERSION = 0.114.0;
+				MARKETING_VERSION = 0.120.0;
 				OTHER_LDFLAGS = (
 					"-lc++",
 					"-framework",
@@ -1118,7 +1134,7 @@
 				CODE_SIGN_ENTITLEMENTS = "";
 				CODE_SIGN_STYLE = Automatic;
 				COMBINE_HIDPI_IMAGES = YES;
-				CURRENT_PROJECT_VERSION = 173;
+				CURRENT_PROJECT_VERSION = 179;
 				DEVELOPMENT_TEAM = "";
 				ENABLE_HARDENED_RUNTIME = NO;
 				GENERATE_INFOPLIST_FILE = NO;
@@ -1127,7 +1143,7 @@
 					"$(inherited)",
 					"@executable_path/../Frameworks",
 				);
-				MARKETING_VERSION = 0.114.0;
+				MARKETING_VERSION = 0.120.0;
 				OTHER_LDFLAGS = (
 					"-lc++",
 					"-framework",
@@ -1181,10 +1197,10 @@
 			isa = XCBuildConfiguration;
 			buildSettings = {
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 173;
+				CURRENT_PROJECT_VERSION = 179;
 				GENERATE_INFOPLIST_FILE = YES;
 				MACOSX_DEPLOYMENT_TARGET = 14.0;
-				MARKETING_VERSION = 0.114.0;
+				MARKETING_VERSION = 0.120.0;
 				ONLY_ACTIVE_ARCH = YES;
 				PRODUCT_BUNDLE_IDENTIFIER = com.termmesh.appuitests;
 				PRODUCT_NAME = "$(TARGET_NAME)";
@@ -1198,10 +1214,10 @@
 			isa = XCBuildConfiguration;
 			buildSettings = {
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 173;
+				CURRENT_PROJECT_VERSION = 179;
 				GENERATE_INFOPLIST_FILE = YES;
 				MACOSX_DEPLOYMENT_TARGET = 14.0;
-				MARKETING_VERSION = 0.114.0;
+				MARKETING_VERSION = 0.120.0;
 				ONLY_ACTIVE_ARCH = YES;
 				PRODUCT_BUNDLE_IDENTIFIER = com.termmesh.appuitests;
 				PRODUCT_NAME = "$(TARGET_NAME)";
@@ -1215,10 +1231,10 @@
 			buildSettings = {
 				BUNDLE_LOADER = "$(TEST_HOST)";
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 173;
+				CURRENT_PROJECT_VERSION = 179;
 				GENERATE_INFOPLIST_FILE = YES;
 				MACOSX_DEPLOYMENT_TARGET = 14.0;
-				MARKETING_VERSION = 0.114.0;
+				MARKETING_VERSION = 0.120.0;
 				ONLY_ACTIVE_ARCH = YES;
 				PRODUCT_BUNDLE_IDENTIFIER = com.termmesh.apptests;
 				PRODUCT_NAME = "$(TARGET_NAME)";
@@ -1234,10 +1250,10 @@
 			buildSettings = {
 				BUNDLE_LOADER = "$(TEST_HOST)";
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 173;
+				CURRENT_PROJECT_VERSION = 179;
 				GENERATE_INFOPLIST_FILE = YES;
 				MACOSX_DEPLOYMENT_TARGET = 14.0;
-				MARKETING_VERSION = 0.114.0;
+				MARKETING_VERSION = 0.120.0;
 				ONLY_ACTIVE_ARCH = YES;
 				PRODUCT_BUNDLE_IDENTIFIER = com.termmesh.apptests;
 				PRODUCT_NAME = "$(TARGET_NAME)";

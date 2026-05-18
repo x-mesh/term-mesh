@@ -180,22 +180,25 @@ impl UsageTracker {
                 let (tx, rx) = std::sync::mpsc::channel::<Event>();
                 let mut watcher: RecommendedWatcher = Watcher::new(
                     move |res: Result<Event, notify::Error>| {
-                        if let Ok(ev) = res { let _ = tx.send(ev); }
+                        if let Ok(ev) = res {
+                            let _ = tx.send(ev);
+                        }
                     },
                     Config::default(),
-                ).expect("failed to create jsonl notify watcher");
+                )
+                .expect("failed to create jsonl notify watcher");
                 if let Err(e) = watcher.watch(&watch_dir, RecursiveMode::Recursive) {
                     tracing::warn!("sidebar.token.watch.start failed: {e}");
                     return;
                 }
                 tracing::info!("sidebar.token.watch.start path={}", watch_dir.display());
                 for event in rx {
-                    let is_jsonl_change = matches!(
-                        event.kind,
-                        EventKind::Create(_) | EventKind::Modify(_)
-                    ) && event.paths.iter().any(|p| {
-                        p.extension().and_then(|e| e.to_str()) == Some("jsonl")
-                    });
+                    let is_jsonl_change =
+                        matches!(event.kind, EventKind::Create(_) | EventKind::Modify(_))
+                            && event
+                                .paths
+                                .iter()
+                                .any(|p| p.extension().and_then(|e| e.to_str()) == Some("jsonl"));
                     if is_jsonl_change {
                         if let Err(e) = tracker_fsevent.scan_all() {
                             tracing::debug!("sidebar.token.parse.skip reason=scan_error: {e}");
@@ -313,8 +316,11 @@ impl UsageTracker {
                         // backup/copy/dotfile-sync/restore. Recorded for every line
                         // type that carries a timestamp (attachment is usually first).
                         record_session_start(&mut state, &entry);
-                        let had_usage = entry.message.as_ref()
-                            .and_then(|m| m.usage.as_ref()).is_some();
+                        let had_usage = entry
+                            .message
+                            .as_ref()
+                            .and_then(|m| m.usage.as_ref())
+                            .is_some();
                         if !had_usage && entry.line_type == "assistant" {
                             tracing::debug!(
                                 "sidebar.token.parse.skip reason=no-usage line_n={line_n}"
@@ -323,9 +329,7 @@ impl UsageTracker {
                         process_line(&mut state, &entry, path);
                     }
                     Err(_) => {
-                        tracing::debug!(
-                            "sidebar.token.parse.skip reason=json line_n={line_n}"
-                        );
+                        tracing::debug!("sidebar.token.parse.skip reason=json line_n={line_n}");
                     }
                 }
             }
@@ -348,7 +352,12 @@ impl UsageTracker {
             if let Some(s) = state.sessions.get(session_id) {
                 by_project.insert(
                     cwd.clone(),
-                    (s.input_tokens, s.output_tokens, s.cache_read_tokens, s.cache_write_tokens),
+                    (
+                        s.input_tokens,
+                        s.output_tokens,
+                        s.cache_read_tokens,
+                        s.cache_write_tokens,
+                    ),
                 );
             }
         }
@@ -381,11 +390,19 @@ impl UsageTracker {
             let Some(&started) = state.session_started_at.get(&s.session_id) else {
                 continue;
             };
-            sessions_by_cwd.entry(s.project_path.as_str()).or_default().push((
-                started,
-                s.session_id.as_str(),
-                (s.input_tokens, s.output_tokens, s.cache_read_tokens, s.cache_write_tokens),
-            ));
+            sessions_by_cwd
+                .entry(s.project_path.as_str())
+                .or_default()
+                .push((
+                    started,
+                    s.session_id.as_str(),
+                    (
+                        s.input_tokens,
+                        s.output_tokens,
+                        s.cache_read_tokens,
+                        s.cache_write_tokens,
+                    ),
+                ));
         }
         for v in sessions_by_cwd.values_mut() {
             // session_id is the stable secondary key for same-second sessions.
@@ -395,10 +412,11 @@ impl UsageTracker {
         // Group panes by cwd.
         let mut panes_by_cwd: HashMap<&str, Vec<(&str, i64, u32)>> = HashMap::new();
         for (panel_id, cwd, proc_start, pid) in panes {
-            panes_by_cwd
-                .entry(cwd.as_str())
-                .or_default()
-                .push((panel_id.as_str(), *proc_start, *pid));
+            panes_by_cwd.entry(cwd.as_str()).or_default().push((
+                panel_id.as_str(),
+                *proc_start,
+                *pid,
+            ));
         }
 
         let mut by_panel = HashMap::new();
@@ -515,7 +533,9 @@ fn process_line(state: &mut TrackerState, entry: &JsonlLine, file_path: &Path) {
     }
 
     // Track most recently active session per cwd for current-session view.
-    state.latest_session_per_cwd.insert(project_path, session_id);
+    state
+        .latest_session_per_cwd
+        .insert(project_path, session_id);
 
     tracing::debug!(
         "sidebar.token.update agent={} in={} out={}",
@@ -887,8 +907,7 @@ mod tests {
         let path = PathBuf::from("/home/user/.claude/projects/-test/file.jsonl");
 
         for _ in 0..3 {
-            let entry =
-                assistant_entry("sess1", Some("/project"), None, usage(100, 50, 20, 0));
+            let entry = assistant_entry("sess1", Some("/project"), None, usage(100, 50, 20, 0));
             process_line(&mut state, &entry, &path);
         }
 
@@ -906,12 +925,20 @@ mod tests {
         let mut state = make_state();
         let path = PathBuf::from("/home/user/.claude/projects/-test/file.jsonl");
 
-        let entry1 =
-            assistant_entry("sess1", Some("/project1"), None, usage(1_000_000, 500_000, 0, 0));
+        let entry1 = assistant_entry(
+            "sess1",
+            Some("/project1"),
+            None,
+            usage(1_000_000, 500_000, 0, 0),
+        );
         process_line(&mut state, &entry1, &path);
 
-        let entry2 =
-            assistant_entry("sess2", Some("/project2"), None, usage(500_000, 200_000, 0, 0));
+        let entry2 = assistant_entry(
+            "sess2",
+            Some("/project2"),
+            None,
+            usage(500_000, 200_000, 0, 0),
+        );
         process_line(&mut state, &entry2, &path);
 
         // Build snapshot manually (same logic as UsageTracker::snapshot)
@@ -932,18 +959,15 @@ mod tests {
         let path = PathBuf::from("/home/user/.claude/projects/-test/file.jsonl");
 
         // sessA processed first (older)
-        let entry_a =
-            assistant_entry("sessA", Some("/project/foo"), None, usage(999, 888, 0, 0));
+        let entry_a = assistant_entry("sessA", Some("/project/foo"), None, usage(999, 888, 0, 0));
         process_line(&mut state, &entry_a, &path);
 
         // sessB processed second (newer — becomes "current session")
-        let entry_b =
-            assistant_entry("sessB", Some("/project/foo"), None, usage(100, 50, 20, 10));
+        let entry_b = assistant_entry("sessB", Some("/project/foo"), None, usage(100, 50, 20, 10));
         process_line(&mut state, &entry_b, &path);
 
         // sessC in a different project
-        let entry_c =
-            assistant_entry("sessC", Some("/project/bar"), None, usage(300, 150, 0, 0));
+        let entry_c = assistant_entry("sessC", Some("/project/bar"), None, usage(300, 150, 0, 0));
         process_line(&mut state, &entry_c, &path);
 
         let tracker = UsageTracker {
@@ -1018,7 +1042,10 @@ mod tests {
         };
         record_session_start(&mut state, &earlier);
         let expected_earlier = iso8601_to_unix("2026-05-13T00:55:00.000Z").unwrap();
-        assert_eq!(state.session_started_at.get("sess1"), Some(&expected_earlier));
+        assert_eq!(
+            state.session_started_at.get("sess1"),
+            Some(&expected_earlier)
+        );
     }
 
     #[test]
@@ -1063,18 +1090,34 @@ mod tests {
         process_line(&mut state, &entry_b, &path);
 
         let base = iso8601_to_unix("2026-05-13T01:00:00.000Z").unwrap();
-        let tracker = UsageTracker { state: Arc::new(Mutex::new(state)) };
+        let tracker = UsageTracker {
+            state: Arc::new(Mutex::new(state)),
+        };
 
         // Sessions sorted by started_at: [sessA@base, sessB@base+60].
         // Panes sorted by (proc_start, pid): [panelA@base+5, panelB@base+62].
         // Index-zip: panelA→sessA, panelB→sessB.
         let panes = vec![
-            ("panelA".to_string(), "/cwd/shared".to_string(), base + 5, 1_u32),
-            ("panelB".to_string(), "/cwd/shared".to_string(), base + 62, 2_u32),
+            (
+                "panelA".to_string(),
+                "/cwd/shared".to_string(),
+                base + 5,
+                1_u32,
+            ),
+            (
+                "panelB".to_string(),
+                "/cwd/shared".to_string(),
+                base + 62,
+                2_u32,
+            ),
         ];
         let by_panel = tracker.snapshot_by_panel(&panes);
 
-        assert_eq!(by_panel.len(), 2, "both panes should match distinct sessions");
+        assert_eq!(
+            by_panel.len(),
+            2,
+            "both panes should match distinct sessions"
+        );
         assert_eq!(by_panel["panelA"].0, 100); // → sessA
         assert_eq!(by_panel["panelB"].0, 200); // → sessB
     }
@@ -1093,9 +1136,16 @@ mod tests {
         process_line(&mut state, &entry, &path);
 
         let base = iso8601_to_unix("2026-05-13T01:00:00.000Z").unwrap();
-        let tracker = UsageTracker { state: Arc::new(Mutex::new(state)) };
+        let tracker = UsageTracker {
+            state: Arc::new(Mutex::new(state)),
+        };
         // proc_start = base+500 → diff 500s > MAX_DIFF(300) → not relevant → skip
-        let panes = vec![("panelX".to_string(), "/cwd/far".to_string(), base + 500, 1_u32)];
+        let panes = vec![(
+            "panelX".to_string(),
+            "/cwd/far".to_string(),
+            base + 500,
+            1_u32,
+        )];
         let by_panel = tracker.snapshot_by_panel(&panes);
         assert!(by_panel.is_empty(), "diff > 300s should be skipped");
     }
@@ -1125,11 +1175,18 @@ mod tests {
         process_line(&mut state, &entry_b, &path);
 
         let base = iso8601_to_unix("2026-05-13T01:00:00.000Z").unwrap();
-        let tracker = UsageTracker { state: Arc::new(Mutex::new(state)) };
+        let tracker = UsageTracker {
+            state: Arc::new(Mutex::new(state)),
+        };
         // Same proc_start, distinct PIDs given out of order. Sessions sort
         // (base, "sessA") < (base, "sessB"); panes sort by pid 10 < 20.
         let panes = vec![
-            ("panelHigh".to_string(), "/cwd/tie".to_string(), base, 20_u32),
+            (
+                "panelHigh".to_string(),
+                "/cwd/tie".to_string(),
+                base,
+                20_u32,
+            ),
             ("panelLow".to_string(), "/cwd/tie".to_string(), base, 10_u32),
         ];
         let by_panel = tracker.snapshot_by_panel(&panes);

@@ -41,7 +41,7 @@ const BROADCAST_SUFFIX: &str = concat!(
     "\n\n[IMPORTANT] Finish via TM-PROTOCOL-v1: `tm-agent reply '<5-line header plus concise summary>'`.",
 );
 
-fn agent_init_prompt(agent_name: &str, agent_role: &str, workdir: &str, socket: &str) -> String {
+fn agent_init_prompt(agent_name: &str, agent_role: &str, team_name: &str, workdir: &str, socket: &str) -> String {
     let root = Path::new(workdir);
     let runbook_mode = env::var("TERMMESH_RUNBOOK_MODE").unwrap_or_else(|_| "digest".to_string());
     let runbook_mode = runbook_mode.trim();
@@ -53,14 +53,16 @@ fn agent_init_prompt(agent_name: &str, agent_role: &str, workdir: &str, socket: 
             .map(|content| format!("\n## Role Runbook\n\n{content}\n"))
             .unwrap_or_default()
     } else if let Some(role) = role {
-        format!("\n{}\n", runbook_digest_content(root, &role))
+        format!("\n{}\n", runbook_digest_content(root, &role, agent_name, team_name))
     } else {
         format!(
             "\n{}\n",
             runbook_digest_content_for_role_name(
                 root,
                 agent_role,
-                load_runbook_content_for_role(root, agent_role).as_deref()
+                load_runbook_content_for_role(root, agent_role).as_deref(),
+                agent_name,
+                team_name
             )
         )
     };
@@ -275,7 +277,11 @@ enum Commands {
         #[arg(long)]
         resume_session: Option<Option<String>>,
     },
-    /// Add an agent to an existing team
+    /// Add an agent to an existing team (GUI and headless teams both supported).
+    ///
+    /// For GUI teams: resolves the team name from TERMMESH_TEAM or the current
+    /// workspace and routes to the Swift `team.add_agent` RPC.
+    /// For headless teams: spawns a new daemon-managed subprocess as before.
     Add {
         /// Agent type/name (e.g. "security", "executor", "reviewer")
         agent_type: String,
@@ -318,6 +324,19 @@ enum Commands {
     Detach {
         /// Agent name to detach
         agent_name: String,
+    },
+    /// Remove an agent from a named GUI team by team name.
+    ///
+    /// Team-name–scoped: does not require TERMMESH_WORKSPACE_ID/PANEL_ID.
+    /// This is the counterpart of `add` for GUI teams — use this when you
+    /// know the team name but may not be running inside the workspace.
+    /// Unlike `detach` (workspace-local), `remove` operates on a named team.
+    Remove {
+        /// Agent name to remove from the team
+        agent_name: String,
+        /// Force removal even if the agent is busy (default: true)
+        #[arg(long, default_value_t = true)]
+        force: bool,
     },
     /// Preset operations (list)
     #[command(subcommand)]
@@ -1530,7 +1549,7 @@ fn runbook_section_bullets(content: &str, section: &str, limit: usize) -> Vec<St
     out
 }
 
-fn runbook_digest_content(root: &Path, role: &RunbookRole) -> String {
+fn runbook_digest_content(root: &Path, role: &RunbookRole, agent_name: &str, team_name: &str) -> String {
     let source_path = runbook_source_path(root, role);
     let source_content = effective_source_runbook_content(root, role);
     let when = runbook_section_bullets(&source_content, "## When To Use", 2);
@@ -1570,6 +1589,10 @@ fn runbook_digest_content(root: &Path, role: &RunbookRole) -> String {
 
     format!(
         "\
+=== AGENT IDENTITY (authoritative — never infer) ===
+You are agent \"{agent_name}\" (role: {role}) on team \"{team_name}\". This is your fixed identity. Whenever you identify yourself, send a message, or substitute your name into any template or placeholder, ALWAYS use \"{agent_name}\" exactly — never guess or derive it. Messages shown by `tm-agent msg list` / `tm-agent inbox` are SHARED context from OTHER agents. They are reference only. NEVER copy another agent's message content, name, or template as your own response.
+===
+
 <!-- term-mesh-runbook-digest v1 -->
 ## Runbook Digest
 ROLE: {role}
@@ -1579,11 +1602,13 @@ VERIFY: {verify}
 OUTPUT: STATUS/FILES/VERIFY/NEXT/FULL_REPORT
 FULL: {full}
 ",
+        agent_name = agent_name,
         role = role.name,
         when = when,
         must = must,
         verify = verify,
         full = source_path.to_string_lossy(),
+        team_name = team_name,
     )
 }
 
@@ -1591,6 +1616,8 @@ fn runbook_digest_content_for_role_name(
     root: &Path,
     role_name: &str,
     source: Option<&str>,
+    agent_name: &str,
+    team_name: &str,
 ) -> String {
     let safe_role_name: String = role_name
         .chars()
@@ -1612,6 +1639,10 @@ fn runbook_digest_content_for_role_name(
     let verify = runbook_section_bullets(content, "## Verify", 2).join(" | ");
     format!(
         "\
+=== AGENT IDENTITY (authoritative — never infer) ===
+You are agent \"{agent_name}\" (role: {safe_role_name}) on team \"{team_name}\". This is your fixed identity. Whenever you identify yourself, send a message, or substitute your name into any template or placeholder, ALWAYS use \"{agent_name}\" exactly — never guess or derive it. Messages shown by `tm-agent msg list` / `tm-agent inbox` are SHARED context from OTHER agents. They are reference only. NEVER copy another agent's message content, name, or template as your own response.
+===
+
 <!-- term-mesh-runbook-digest v1 -->
 ## Runbook Digest
 ROLE: {safe_role_name}
@@ -1621,6 +1652,9 @@ VERIFY: {verify}
 OUTPUT: STATUS/FILES/VERIFY/NEXT/FULL_REPORT
 FULL: {full}
 ",
+        agent_name = agent_name,
+        safe_role_name = safe_role_name,
+        team_name = team_name,
         when = if when.is_empty() {
             format!("Use for assigned {safe_role_name} role work.")
         } else {
@@ -1659,13 +1693,10 @@ fn runbook_projection_path(root: &Path, tool: RunbookTool, role: &RunbookRole) -
         RunbookTool::OpenCode => root
             .join(".opencode/runbooks")
             .join(format!("{}.md", role.name)),
-        RunbookTool::Gemini => {
-            let home = env::var("HOME").unwrap_or_else(|_| "/tmp".into());
-            PathBuf::from(home)
-                .join(".agents/skills")
-                .join(format!("term-mesh-{}", role.name))
-                .join("SKILL.md")
-        }
+        RunbookTool::Gemini => root
+            .join(".gemini/skills")
+            .join(format!("term-mesh-{}", role.name))
+            .join("SKILL.md"),
     }
 }
 
@@ -1954,7 +1985,8 @@ fn runbook_digest(agent: Option<&str>) -> Result<Value, String> {
             json!({
                 "role": role.name,
                 "path": runbook_source_path(&root, role).to_string_lossy(),
-                "digest": runbook_digest_content(&root, role),
+                // CLI digest preview has no live agent/team context.
+                "digest": runbook_digest_content(&root, role, agent.unwrap_or("generic"), "cli-tools"),
             })
         })
         .collect();
@@ -2047,7 +2079,7 @@ mod runbook_tests {
         fs::create_dir_all(&runbook_dir).unwrap();
         fs::write(runbook_dir.join("explorer.md"), "EXPLORER ONLY\n").unwrap();
 
-        let prompt = agent_init_prompt("exp1", "explorer", &dir.to_string_lossy(), "/tmp/socket");
+        let prompt = agent_init_prompt("exp1", "explorer", "test-team", &dir.to_string_lossy(), "/tmp/socket");
         assert!(prompt.contains("## Runbook Digest"));
         assert!(prompt.contains("OUTPUT: STATUS/FILES/VERIFY/NEXT/FULL_REPORT"));
         assert!(prompt.contains("named \"exp1\" with role \"explorer\""));
@@ -2121,7 +2153,7 @@ mod runbook_tests {
         )
         .unwrap();
 
-        let digest = runbook_digest_content(&dir, &role);
+        let digest = runbook_digest_content(&dir, &role, "test-agent", "test-team");
         assert!(digest.contains("ROLE: executor"));
         assert!(digest.contains("Custom rule A"));
         assert!(digest.contains("Custom verify"));
@@ -2149,6 +2181,8 @@ mod runbook_tests {
             &dir,
             "custom",
             load_runbook_content_for_role(&dir, "custom").as_deref(),
+            "test-agent",
+            "test-team",
         );
         assert!(digest.contains("ROLE: custom"));
         assert!(digest.contains("Custom must"));
@@ -2221,7 +2255,7 @@ mod runbook_tests {
 
     #[test]
     fn return_retry_policy_is_conservative_when_text_delivery_failed() {
-        assert_eq!(return_retry_delays_ms(true), &[20, 200, 400, 600, 800]);
+        assert_eq!(return_retry_delays_ms(true), &[250, 400, 600, 800, 1000]);
         assert_eq!(return_retry_delays_ms(false), &[200, 500]);
     }
 }
@@ -2947,9 +2981,19 @@ fn reply_target_task_id(sock: &PathBuf, team: &str, sender: &str) -> Option<Stri
 
 fn return_retry_delays_ms(text_delivered: bool) -> &'static [u64] {
     if text_delivered {
-        &[20, 200, 400, 600, 800]
+        // First delay raised from 20 ms → 250 ms so the Return key arrives after
+        // codex has fully rendered the pasted text and is ready to accept input.
+        // Swift asyncTeamSendKey also holds an additional 250 ms post-Return gate
+        // before releasing the next paste, providing two layers of protection.
+        //
+        // Long tail (1500/2500/4000 ms) added defensively for the Layer-2
+        // congestion race: during multi-agent `create`, simultaneous panel/CLI
+        // startup + layout churn can keep the freshly spawned panel from being
+        // key-ready well past 1 s. The common case still resolves at attempt 1
+        // (250 ms); only a stubborn panel walks the tail (~11 s worst case).
+        &[250, 400, 600, 800, 1000, 1500, 2500, 4000]
     } else {
-        &[200, 500]
+        &[200, 500, 1000, 2000]
     }
 }
 
@@ -3937,11 +3981,10 @@ fn main() {
                 }
             }
 
-            // GUI team: not yet supported
-            eprintln!("Error: 'tm-agent add' for GUI teams is not yet supported.");
-            eprintln!("Hint: Use 'tm-agent destroy' then 'tm-agent create' to recreate with different agents.");
-            eprintln!("      Headless team support: 'tm-agent create --headless ...' then 'tm-agent add ...'");
-            process::exit(1);
+            // GUI team: route to team.add_agent RPC
+            let gui_team = resolve_workspace_team_name().unwrap_or_else(|_| team.clone());
+            run_add_gui(&sock, &gui_team, &agent_type, &agent_name, &model, &cli);
+            return;
         }
         Commands::Attach {
             agent_type,
@@ -3963,6 +4006,15 @@ fn main() {
                 process::exit(1);
             }
             run_detach(&sock, &agent_name);
+            return;
+        }
+        Commands::Remove { agent_name, force } => {
+            if let Err(e) = validate_agent_name(&agent_name) {
+                eprintln!("Error: {}", e);
+                process::exit(1);
+            }
+            let gui_team = resolve_workspace_team_name().unwrap_or_else(|_| team.clone());
+            run_remove_gui(&sock, &gui_team, &agent_name, force);
             return;
         }
         Commands::Preset(sub) => match sub {
@@ -4021,7 +4073,10 @@ fn main() {
             }
             return;
         }
-        Commands::Restart { agent: ref target, hard } => {
+        Commands::Restart {
+            agent: ref target,
+            hard,
+        } => {
             if hard {
                 eprintln!(
                     "hard restart: closing pane and respawning. scrollback will be lost; panelId changes."
@@ -5012,7 +5067,7 @@ fn run_create(
             for a in &non_kiro {
                 let name = a["name"].as_str().unwrap_or("");
                 let role = a["agent_type"].as_str().unwrap_or(name);
-                let init_text = agent_init_prompt(name, role, &workdir, &sock.to_string_lossy());
+                let init_text = agent_init_prompt(name, role, team, &workdir, &sock.to_string_lossy());
                 match rpc_call_timeout(
                     sock,
                     "team.send",
@@ -5022,7 +5077,19 @@ fn run_create(
                     }),
                     3,
                 ) {
-                    Ok(_) => eprintln!("  \u{2713} {name}: init prompt sent"),
+                    Ok(ref r) => {
+                        // team.send pastes text with withReturn=false; the trailing "\n"
+                        // is stripped by sendTextToPanel, so the Enter must be delivered
+                        // separately via team.send_key — same follow-up as `tm-agent send`
+                        // and `tm-agent delegate`. Without this the init prompt sits
+                        // unsubmitted in the freshly spawned agent pane (enter-swallow).
+                        let text_delivered =
+                            r["result"]["text_delivered"].as_bool().unwrap_or(false);
+                        let _ = send_return_key_with_retry(
+                            sock, team, name, text_delivered, "team.create.init",
+                        );
+                        eprintln!("  \u{2713} {name}: init prompt sent");
+                    }
                     Err(e) => eprintln!("  \u{2717} {name}: init prompt FAILED: {e}"),
                 }
                 // Keep 1s delay between sends: this is NOT state synchronization but
@@ -5271,6 +5338,144 @@ fn run_detach(sock: &PathBuf, agent_name: &str) {
     }
 }
 
+/// Add a single agent pane to a named GUI team via `team.add_agent` RPC.
+///
+/// Team-name–scoped: does not require TERMMESH_WORKSPACE_ID or PANEL_ID.
+fn run_add_gui(
+    sock: &PathBuf,
+    team_name: &str,
+    agent_type: &str,
+    agent_name: &str,
+    model: &str,
+    cli: &str,
+) {
+    eprintln!(
+        "Adding agent '{}' (type={}, cli={}, model={}) to GUI team '{}'...",
+        agent_name, agent_type, cli, model, team_name
+    );
+
+    let params = json!({
+        "team_name": team_name,
+        "agent_type": agent_type,
+        "name": agent_name,
+        "model": model,
+        "cli": cli,
+    });
+
+    let resp = match rpc_call_timeout(sock, "team.add_agent", params, 10) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("Error: {}", e);
+            process::exit(1);
+        }
+    };
+
+    if resp["ok"].as_bool().unwrap_or(false) {
+        println!("{}", pretty(&resp));
+        if let Some(result) = resp["result"].as_object() {
+            eprintln!();
+            eprintln!(
+                "  \u{2713} agent '{}' added ({} total in team '{}')",
+                result
+                    .get("agent_name")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or(agent_name),
+                result
+                    .get("agent_count")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0),
+                result
+                    .get("team_name")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or(team_name),
+            );
+        }
+    } else {
+        let code = resp["error"]["code"].as_str().unwrap_or("unknown");
+        let msg = resp["error"]["message"]
+            .as_str()
+            .unwrap_or("add_agent failed");
+        let hint = match code {
+            "duplicate_name" => format!(
+                "\nHint: An agent named '{}' already exists in team '{}'. Use --name to pick a unique name.",
+                agent_name, team_name
+            ),
+            "team_not_found" => format!(
+                "\nHint: Team '{}' not found. Run 'tm-agent status' to see active teams.",
+                team_name
+            ),
+            "workspace_gone" => "\nHint: The team's workspace is no longer open. Recreate the team with 'tm-agent create'.".to_string(),
+            "cli_not_found" => "\nHint: CLI executable not found — check Settings → CLI Paths or the cliPath.<cli> UserDefaults key.".to_string(),
+            "pane_creation_failed" => "\nHint: Pane creation failed — check term-mesh logs at /tmp/term-mesh-debug.log.".to_string(),
+            _ => String::new(),
+        };
+        eprintln!("Error [{}]: {}{}", code, msg, hint);
+        process::exit(1);
+    }
+}
+
+/// Remove an agent from a named GUI team via `team.detach` RPC (team-name–scoped).
+///
+/// Unlike `run_detach` (workspace-local), this variant looks up the team by name
+/// and does not require TERMMESH_WORKSPACE_ID or PANEL_ID.
+fn run_remove_gui(sock: &PathBuf, team_name: &str, agent_name: &str, force: bool) {
+    eprintln!(
+        "Removing agent '{}' from GUI team '{}'...",
+        agent_name, team_name
+    );
+
+    let params = json!({
+        "team_name": team_name,
+        "agent_name": agent_name,
+        "force": force,
+    });
+
+    let resp = match rpc_call_timeout(sock, "team.detach", params, 10) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("Error: {}", e);
+            process::exit(1);
+        }
+    };
+
+    if resp["ok"].as_bool().unwrap_or(false) {
+        println!("{}", pretty(&resp));
+        if let Some(result) = resp["result"].as_object() {
+            let remaining = result
+                .get("remaining_agents")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+            let team_destroyed = result
+                .get("team_destroyed")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            eprintln!();
+            if team_destroyed {
+                eprintln!(
+                    "  \u{2713} agent '{}' removed. Team '{}' destroyed (leader pane preserved).",
+                    agent_name, team_name
+                );
+            } else {
+                eprintln!(
+                    "  \u{2713} agent '{}' removed ({} remaining in team '{}')",
+                    agent_name, remaining, team_name
+                );
+            }
+        }
+    } else {
+        let code = resp["error"]["code"].as_str().unwrap_or("unknown");
+        let msg = resp["error"]["message"]
+            .as_str()
+            .unwrap_or("remove failed");
+        let hint = match code {
+            "agent_busy" => "\nHint: Agent has an active task — pass --force to close anyway, or finish/block the task first.".to_string(),
+            _ => String::new(),
+        };
+        eprintln!("Error [{}]: {}{}", code, msg, hint);
+        process::exit(1);
+    }
+}
+
 fn detect_daemon_socket() -> Option<PathBuf> {
     // Priority 1: TERMMESH_DAEMON_SOCKET (injected by daemon into headless agent env)
     if let Ok(p) = env::var("TERMMESH_DAEMON_SOCKET") {
@@ -5491,7 +5696,7 @@ fn run_create_headless(
                 let name = spec["name"].as_str().unwrap_or("");
                 let role = spec["agent_type"].as_str().unwrap_or(name);
                 let agent_id = format!("{name}@{team}");
-                let init_text = agent_init_prompt(name, role, &workdir, &app_sock_str);
+                let init_text = agent_init_prompt(name, role, team, &workdir, &app_sock_str);
                 match rpc_call_timeout(
                     &daemon_sock,
                     "headless.send",
@@ -5555,7 +5760,7 @@ fn run_add_headless(
                 .map(|p| p.to_string_lossy().to_string())
                 .unwrap_or_else(|_| ".".to_string());
             let agent_id = format!("{agent_name}@{team}");
-            let init_text = agent_init_prompt(agent_name, agent_type, &workdir, &app_sock_str);
+            let init_text = agent_init_prompt(agent_name, agent_type, team, &workdir, &app_sock_str);
 
             match rpc_call_timeout(
                 daemon_sock,

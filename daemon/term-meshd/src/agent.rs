@@ -57,6 +57,8 @@ pub struct AgentSession {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pid: Option<u32>,
     pub tracked_pids: Vec<u32>,
+    #[serde(skip)]
+    tracked_pgids: HashMap<u32, Option<u32>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub panel_id: Option<String>,
     pub created_at_ms: u64,
@@ -295,6 +297,62 @@ fn now_ms() -> u64 {
         .as_millis() as u64
 }
 
+fn validated_pid(pid: u32) -> Result<libc::pid_t, String> {
+    if pid <= 1 || pid > i32::MAX as u32 {
+        return Err(format!("invalid pid for signal target: {pid}"));
+    }
+    Ok(pid as libc::pid_t)
+}
+
+fn resolve_pgid(pid: u32) -> Result<Option<u32>, String> {
+    let pid_i32 = validated_pid(pid)?;
+    let pgid = unsafe { libc::getpgid(pid_i32) };
+    if pgid > 1 {
+        // Only use killpg when this process is its own group leader (pgid == pid).
+        // Session-registered PIDs come from Swift pane-CLIs that did not call
+        // setsid(), so their pgid may be a shared parent shell group — using
+        // killpg on those would kill a much wider process tree than intended.
+        // headless-spawned agents always have pgid == pid (setsid in pre_exec).
+        if pgid as u32 == pid {
+            Ok(Some(pgid as u32))
+        } else {
+            Ok(None)
+        }
+    } else if pgid == 0 {
+        tracing::warn!("getpgid returned invalid pgid=0 for pid {pid}; falling back to pid kill");
+        Ok(None)
+    } else {
+        let err = std::io::Error::last_os_error();
+        if err.raw_os_error() == Some(libc::ESRCH) {
+            tracing::warn!("getpgid failed with ESRCH for pid {pid}; falling back to pid kill");
+            Ok(None)
+        } else {
+            tracing::warn!("getpgid failed for pid {pid}: {err}; falling back to pid kill");
+            Ok(None)
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct KillTarget {
+    pid: libc::pid_t,
+    pgid: Option<libc::pid_t>,
+}
+
+fn kill_target(target: KillTarget, signal: libc::c_int) {
+    unsafe {
+        if let Some(pgid) = target.pgid {
+            libc::killpg(pgid, signal);
+        } else {
+            libc::kill(target.pid, signal);
+        }
+    }
+}
+
+fn is_pid_alive(pid: libc::pid_t) -> bool {
+    unsafe { libc::kill(pid, 0) == 0 }
+}
+
 impl AgentSessionManager {
     /// Open (or create) the SQLite database and run migrations.
     pub fn new(db_path: PathBuf) -> anyhow::Result<Self> {
@@ -325,6 +383,7 @@ impl AgentSessionManager {
             CREATE TABLE IF NOT EXISTS session_pids (
                 session_id TEXT NOT NULL REFERENCES agent_sessions(id),
                 pid        INTEGER NOT NULL,
+                pgid       INTEGER,
                 PRIMARY KEY (session_id, pid)
             );
 
@@ -389,6 +448,16 @@ impl AgentSessionManager {
             );
         }
 
+        // Migration: add pgid column for process-group termination of agent trees.
+        let has_session_pids_pgid: bool = db
+            .prepare("SELECT COUNT(*) FROM pragma_table_info('session_pids') WHERE name='pgid'")
+            .and_then(|mut s| s.query_row([], |r| r.get::<_, i64>(0)))
+            .map(|c| c > 0)
+            .unwrap_or(false);
+        if !has_session_pids_pgid {
+            let _ = db.execute_batch("ALTER TABLE session_pids ADD COLUMN pgid INTEGER");
+        }
+
         // Load non-terminated sessions into memory
         let mut sessions = HashMap::new();
         {
@@ -413,6 +482,7 @@ impl AgentSessionManager {
                     status: SessionStatus::from_str(&row.get::<_, String>(7)?),
                     pid: row.get::<_, Option<u32>>(8)?,
                     tracked_pids: Vec::new(), // loaded below
+                    tracked_pgids: HashMap::new(),
                     panel_id: row.get(9)?,
                     created_at_ms: row.get(10)?,
                     terminated_at_ms: row.get(11)?,
@@ -425,14 +495,29 @@ impl AgentSessionManager {
             }
 
             // Load tracked PIDs
-            let mut pid_stmt = db.prepare("SELECT session_id, pid FROM session_pids")?;
+            let mut pid_stmt = db.prepare("SELECT session_id, pid, pgid FROM session_pids")?;
             let pid_rows = pid_stmt.query_map([], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, u32>(1)?))
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, u32>(1)?,
+                    row.get::<_, Option<u32>>(2)?,
+                ))
             })?;
             for row in pid_rows {
-                let (session_id, pid) = row?;
+                let (session_id, pid, pgid) = row?;
                 if let Some(session) = sessions.get_mut(&session_id) {
                     session.tracked_pids.push(pid);
+                    // Discard stored pgids that are not self-leaders (pgid != pid).
+                    // Such entries are stale or corrupt shared-parent group IDs that
+                    // would cause unintended blast radius via killpg on next terminate.
+                    let normalized_pgid = pgid.filter(|&g| g == pid);
+                    if pgid.is_some() && normalized_pgid.is_none() {
+                        tracing::warn!(
+                            "DB load: normalizing pgid {:?} → None for pid {} (not self-leader); stale entry discarded",
+                            pgid, pid
+                        );
+                    }
+                    session.tracked_pgids.insert(pid, normalized_pgid);
                 }
             }
         }
@@ -490,6 +575,7 @@ impl AgentSessionManager {
                 status: SessionStatus::Running,
                 pid: None,
                 tracked_pids: Vec::new(),
+                tracked_pgids: HashMap::new(),
                 panel_id: None,
                 created_at_ms: now_ms(),
                 terminated_at_ms: None,
@@ -566,6 +652,7 @@ impl AgentSessionManager {
                         status: SessionStatus::from_str(&row.get::<_, String>(7)?),
                         pid: row.get::<_, Option<u32>>(8)?,
                         tracked_pids: Vec::new(),
+                        tracked_pgids: HashMap::new(),
                         panel_id: row.get(9)?,
                         created_at_ms: row.get(10)?,
                         terminated_at_ms: row.get(11)?,
@@ -613,6 +700,7 @@ impl AgentSessionManager {
                         status: SessionStatus::from_str(&row.get::<_, String>(7)?),
                         pid: row.get::<_, Option<u32>>(8)?,
                         tracked_pids: Vec::new(),
+                        tracked_pgids: HashMap::new(),
                         panel_id: row.get(9)?,
                         created_at_ms: row.get(10)?,
                         terminated_at_ms: row.get(11)?,
@@ -635,16 +723,88 @@ impl AgentSessionManager {
             return Ok(());
         }
 
-        // Kill tracked PIDs
-        let signal = if force { libc::SIGKILL } else { libc::SIGTERM };
-        for &pid in &session.tracked_pids {
-            unsafe {
-                libc::kill(pid as i32, signal);
+        // Kill each tracked process. killpg is used only when the process is its
+        // own group leader (pgid == pid, guaranteed for headless-spawned agents via
+        // setsid in pre_exec). Session-registered PIDs from Swift pane-CLIs may
+        // share a parent shell group, so they fall back to kill(pid) to avoid
+        // unintended blast radius. Never call killpg(0, ...): that would target
+        // the daemon's own process group.
+        let pids_to_kill: Vec<KillTarget> = {
+            let mut raw = session.tracked_pids.clone();
+            if let Some(pid) = session.pid {
+                if !raw.contains(&pid) {
+                    raw.push(pid);
+                }
             }
-        }
-        if let Some(pid) = session.pid {
-            unsafe {
-                libc::kill(pid as i32, signal);
+
+            raw.into_iter()
+                .filter_map(|pid| {
+                    let pid_i32 = match validated_pid(pid) {
+                        Ok(pid_i32) => pid_i32,
+                        Err(e) => {
+                            tracing::warn!("skip invalid tracked pid during terminate: {e}");
+                            return None;
+                        }
+                    };
+                    let pgid = session
+                        .tracked_pgids
+                        .get(&pid)
+                        .copied()
+                        .flatten()
+                        // Stored pgid is only valid for killpg when it's the self-leader
+                        // (pgid == pid). Discard shared-parent pgids that bypass the
+                        // resolve_pgid guard and fall through to resolve_pgid instead.
+                        .filter(|&stored_pgid| stored_pgid == pid)
+                        .or_else(|| match resolve_pgid(pid) {
+                            Ok(pgid) => pgid,
+                            Err(e) => {
+                                tracing::warn!(
+                                    "failed to resolve pgid for pid {pid} during terminate: {e}; falling back to pid kill"
+                                );
+                                None
+                            }
+                        });
+                    let pgid_i32 = match pgid {
+                        Some(pgid) => match validated_pid(pgid) {
+                            Ok(pgid_i32) => Some(pgid_i32),
+                            Err(e) => {
+                                tracing::warn!(
+                                    "skip invalid tracked pgid {pgid} for pid {pid}: {e}; falling back to pid kill"
+                                );
+                                None
+                            }
+                        },
+                        None => None,
+                    };
+                    Some(KillTarget {
+                        pid: pid_i32,
+                        pgid: pgid_i32,
+                    })
+                })
+                .collect()
+        };
+
+        if force {
+            for &target in &pids_to_kill {
+                kill_target(target, libc::SIGKILL);
+            }
+        } else {
+            for &target in &pids_to_kill {
+                kill_target(target, libc::SIGTERM);
+            }
+            // Brief wait (up to 1.5 s, 150 ms steps) then SIGKILL any survivors.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_millis(1500);
+            loop {
+                std::thread::sleep(std::time::Duration::from_millis(150));
+                let all_dead = pids_to_kill.iter().all(|target| !is_pid_alive(target.pid));
+                if all_dead || std::time::Instant::now() >= deadline {
+                    break;
+                }
+            }
+            for &target in &pids_to_kill {
+                if is_pid_alive(target.pid) {
+                    kill_target(target, libc::SIGKILL);
+                }
             }
         }
 
@@ -717,6 +877,12 @@ impl AgentSessionManager {
 
     /// Register an additional PID for a session.
     pub fn add_pid(&self, session_id: &str, pid: u32) -> Result<(), String> {
+        if let Err(e) = validated_pid(pid) {
+            tracing::warn!("reject agent pid registration for session {session_id}: {e}");
+            return Err(e);
+        }
+        let pgid = resolve_pgid(pid)?;
+
         let mut inner = self.inner.lock().unwrap();
         if !inner.sessions.contains_key(session_id) {
             return Err(format!("session not found: {session_id}"));
@@ -728,16 +894,18 @@ impl AgentSessionManager {
             if need_insert {
                 session.tracked_pids.push(pid);
             }
+            session.tracked_pgids.insert(pid, pgid);
             if need_main {
                 session.pid = Some(pid);
                 session.status = SessionStatus::Running;
             }
             (need_insert, need_main)
         };
-        if need_insert_pid {
+        if need_insert_pid || pgid.is_some() {
             let _ = inner.db.execute(
-                "INSERT OR IGNORE INTO session_pids (session_id, pid) VALUES (?1, ?2)",
-                params![session_id, pid],
+                "INSERT INTO session_pids (session_id, pid, pgid) VALUES (?1, ?2, ?3)
+                 ON CONFLICT(session_id, pid) DO UPDATE SET pgid = excluded.pgid",
+                params![session_id, pid, pgid],
             );
         }
         if need_set_main {
@@ -1658,6 +1826,7 @@ mod tests {
                     status: SessionStatus::Running,
                     pid: None,
                     tracked_pids: vec![],
+                    tracked_pgids: HashMap::new(),
                     panel_id: None,
                     created_at_ms: 1000,
                     terminated_at_ms: None,
@@ -1702,6 +1871,7 @@ mod tests {
                     status: SessionStatus::Spawning,
                     pid: None,
                     tracked_pids: vec![],
+                    tracked_pgids: HashMap::new(),
                     panel_id: None,
                     created_at_ms: 2000,
                     terminated_at_ms: None,
@@ -1743,6 +1913,7 @@ mod tests {
                 status: SessionStatus::Running,
                 pid: None,
                 tracked_pids: vec![],
+                tracked_pgids: HashMap::new(),
                 panel_id: None,
                 created_at_ms: 1000,
                 terminated_at_ms: None,

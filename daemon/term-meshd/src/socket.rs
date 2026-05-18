@@ -172,10 +172,8 @@ pub async fn serve(
         shutdown_rx.clone(),
     ));
     // Phase 2.5: 1s coalesce → emit `agent_usage_tick` broadcasts (headless path).
-    let usage_broadcast_task = tokio::spawn(run_usage_tick_broadcaster(
-        ctx.clone(),
-        shutdown_rx.clone(),
-    ));
+    let usage_broadcast_task =
+        tokio::spawn(run_usage_tick_broadcaster(ctx.clone(), shutdown_rx.clone()));
     // Phase 2.5-B: 1s JSONL-watcher → emit `agent_usage_tick` for pane-mode claude agents.
     let jsonl_usage_broadcast_task = tokio::spawn(run_jsonl_usage_tick_broadcaster(
         ctx.clone(),
@@ -187,10 +185,7 @@ pub async fn serve(
         shutdown_rx.clone(),
     ));
     // Phase 2.5: 30s disk flush for dirty usage counters.
-    let usage_flush_task = tokio::spawn(run_usage_disk_flusher(
-        ctx.clone(),
-        shutdown_rx.clone(),
-    ));
+    let usage_flush_task = tokio::spawn(run_usage_disk_flusher(ctx.clone(), shutdown_rx.clone()));
 
     loop {
         tokio::select! {
@@ -451,10 +446,7 @@ fn filter_and_serialize(
 /// Phase 2.5: every 1s, ask the headless manager which agents have a dirty
 /// usage counter and emit `agent_usage_tick` for each team that has at least
 /// one. Coalesces all stream-json increments observed in the past second.
-async fn run_usage_tick_broadcaster(
-    ctx: Arc<Context>,
-    mut shutdown_rx: watch::Receiver<bool>,
-) {
+async fn run_usage_tick_broadcaster(ctx: Arc<Context>, mut shutdown_rx: watch::Receiver<bool>) {
     let mut interval = tokio::time::interval(Duration::from_secs(1));
     interval.tick().await; // consume immediate first tick
 
@@ -767,9 +759,140 @@ async fn run_codex_usage_tick_broadcaster(
 /// Phase 2.5: every 30s, flush dirty usage counters to `agent.json` on disk.
 /// Disk I/O runs on `spawn_blocking` so the socket runtime is not stalled.
 async fn run_usage_disk_flusher(
+
+/// Phase 2.5-C: every 2s, query ~/.codex/state_5.sqlite for pane-mode codex agents.
+/// Codex does not split input/output tokens; total is reported as output_tokens.
+/// Disabled silently if the DB file does not exist (codex not installed).
+async fn run_codex_usage_tick_broadcaster(
     ctx: Arc<Context>,
     mut shutdown_rx: watch::Receiver<bool>,
 ) {
+    let Some(tracker) = crate::codex_tokens::CodexUsageTracker::new() else {
+        tracing::info!("codex.token.watch: ~/.codex/sessions not found, broadcaster disabled");
+        return;
+    };
+    tracing::info!("codex.token.watch: started polling ~/.codex/sessions rollout JSONL");
+
+    // (team_name, agent_name) → last-emitted (input, output, cache_read, cache_write)
+    let mut last_emitted: HashMap<(String, String), (u64, u64, u64, u64)> = HashMap::new();
+    let mut interval = tokio::time::interval(Duration::from_secs(2));
+    interval.tick().await; // skip immediate first tick
+
+    loop {
+        tokio::select! {
+            _ = interval.tick() => {
+                let pane_map = ctx.pane_tracker.snapshot();
+                let codex_panes: Vec<(String, String, i64, u32)> = pane_map
+                    .iter()
+                    .filter(|(_, info)| info.cli == "codex")
+                    .map(|(id, info)| {
+                        (id.clone(), info.cwd.clone(), info.proc_start_unix, info.pid)
+                    })
+                    .collect();
+                if codex_panes.is_empty() {
+                    continue;
+                }
+                let by_panel = match tracker.snapshot_by_panel(&codex_panes) {
+                    Ok(m) => m,
+                    Err(e) => {
+                        tracing::debug!("codex.token.parse.skip reason=scan_error: {e}");
+                        continue;
+                    }
+                };
+                if by_panel.is_empty() {
+                    continue;
+                }
+                let team_state = ctx.team_state.read().unwrap().clone();
+                let Some(teams) = team_state.get("teams").and_then(|v| v.as_array()) else {
+                    continue;
+                };
+                let ts_ms = current_time_ms();
+                for team in teams {
+                    let team_name = team
+                        .get("team_name")
+                        .or_else(|| team.get("name"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or_default();
+                    if team_name.is_empty() {
+                        continue;
+                    }
+                    let team_uuid = team
+                        .get("team_uuid")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or(team_name);
+                    let Some(agents) = team.get("agents").and_then(|v| v.as_array()) else {
+                        continue;
+                    };
+                    let mut tick_agents = Vec::new();
+                    for agent in agents {
+                        let cli = agent
+                            .get("cli")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or_default();
+                        if cli != "codex" {
+                            continue;
+                        }
+                        // Pane-mode only: headless codex agents handled separately.
+                        let panel_id = match agent.get("panel_id").and_then(|v| v.as_str()) {
+                            Some(id) if !id.is_empty() => id,
+                            _ => continue,
+                        };
+                        // Skip until pane_tracker has confirmed this panel AND
+                        // start-time correlation has matched it to a Codex session.
+                        let Some(&(in_tok, out_tok, cr_tok, cw_tok)) = by_panel.get(panel_id)
+                        else {
+                            continue;
+                        };
+                        let agent_name = agent
+                            .get("name")
+                            .or_else(|| agent.get("agent_name"))
+                            .and_then(|v| v.as_str())
+                            .unwrap_or_default();
+                        if agent_name.is_empty() {
+                            continue;
+                        }
+                        let key = (team_name.to_string(), agent_name.to_string());
+                        let last = last_emitted.get(&key).copied().unwrap_or_default();
+                        if (in_tok, out_tok, cr_tok, cw_tok) == last {
+                            continue;
+                        }
+                        last_emitted.insert(key, (in_tok, out_tok, cr_tok, cw_tok));
+                        tracing::debug!(
+                            "codex.token.update agent={agent_name} panel={panel_id} \
+                             in={in_tok} out={out_tok} cache_read={cr_tok}"
+                        );
+                        // Rollout JSONL splits usage: input / output(+reasoning) /
+                        // cached_input → cache_read. Codex has no cache-write.
+                        tick_agents.push(crate::headless::UsageTickAgent {
+                            name: agent_name.to_string(),
+                            input_tokens: in_tok,
+                            output_tokens: out_tok,
+                            cache_read_input_tokens: cr_tok,
+                            cache_creation_input_tokens: cw_tok,
+                        });
+                    }
+                    if !tick_agents.is_empty() {
+                        let _ = ctx.event_tx.send(DaemonEvent::AgentUsageTick {
+                            team_uuid: team_uuid.to_string(),
+                            team_name: team_name.to_string(),
+                            agents: tick_agents,
+                            ts_ms,
+                        });
+                    }
+                }
+            }
+            changed = shutdown_rx.changed() => {
+                if changed.is_err() || *shutdown_rx.borrow() {
+                    break;
+                }
+            }
+        }
+    }
+}
+
+/// Phase 2.5: every 30s, flush dirty usage counters to `agent.json` on disk.
+/// Disk I/O runs on `spawn_blocking` so the socket runtime is not stalled.
+async fn run_usage_disk_flusher(ctx: Arc<Context>, mut shutdown_rx: watch::Receiver<bool>) {
     let mut interval = tokio::time::interval(Duration::from_secs(30));
     interval.tick().await; // skip immediate tick
 
@@ -1283,10 +1406,19 @@ async fn dispatch(req: &Request, ctx: &Context) -> Response {
                 force: bool,
             }
             match serde_json::from_value::<TerminateParams>(req.params.clone()) {
-                Ok(p) => ctx
-                    .agent_manager
-                    .terminate(&p.id, p.force, &ctx.watcher_handle)
-                    .map(|_| serde_json::json!({"status": "ok"})),
+                Ok(p) => {
+                    let agent_manager = ctx.agent_manager.clone();
+                    let watcher_handle = ctx.watcher_handle.clone();
+                    match tokio::task::spawn_blocking(move || {
+                        agent_manager.terminate(&p.id, p.force, &watcher_handle)
+                    })
+                    .await
+                    {
+                        Ok(Ok(())) => Ok(serde_json::json!({"status": "ok"})),
+                        Ok(Err(e)) => Err(e),
+                        Err(e) => Err(format!("agent terminate task failed: {e}")),
+                    }
+                }
                 Err(e) => Err(format!("invalid params: {e}")),
             }
         }
@@ -1638,11 +1770,10 @@ async fn dispatch(req: &Request, ctx: &Context) -> Response {
             fn default_limit() -> usize {
                 50
             }
-            let params: P =
-                serde_json::from_value(req.params.clone()).unwrap_or(P {
-                    git_root: None,
-                    limit: 50,
-                });
+            let params: P = serde_json::from_value(req.params.clone()).unwrap_or(P {
+                git_root: None,
+                limit: 50,
+            });
             let limit = params.limit.min(200);
             let mgr = ctx.headless.lock().await;
             let res = mgr.list_resumable(params.git_root.as_deref(), limit);
@@ -1653,13 +1784,50 @@ async fn dispatch(req: &Request, ctx: &Context) -> Response {
             }
         }
         "headless.resume_team" => {
-            match serde_json::from_value::<crate::headless::ResumeTeamParams>(
-                req.params.clone(),
-            ) {
+            match serde_json::from_value::<crate::headless::ResumeTeamParams>(req.params.clone()) {
                 Ok(p) => {
                     let mut mgr = ctx.headless.lock().await;
                     mgr.resume_team(p)
                         .await
+                        .map(|r| serde_json::to_value(r).unwrap())
+                }
+                Err(e) => Err(format!("invalid params: {e}")),
+            }
+        }
+        "team.archive_pane" => {
+            // pane-mode counterpart of headless `destroy_team`'s archive step.
+            // Called by the Swift app from `TeamOrchestrator.destroyTeam` so a
+            // pane-mode team shows up in `list_resumable` with `mode: "pane"`.
+            match serde_json::from_value::<crate::headless::ArchivePaneParams>(req.params.clone()) {
+                Ok(p) => {
+                    let mut mgr = ctx.headless.lock().await;
+                    mgr.archive_pane_team(p)
+                        .map(|r| serde_json::to_value(r).unwrap())
+                }
+                Err(e) => Err(format!("invalid params: {e}")),
+            }
+        }
+        "team.resume_pane" => {
+            // pane-mode resume: returns metadata + session IDs so the Swift app
+            // can recreate the workspace and spawn each CLI with `--resume <sid>`.
+            // Does NOT spawn anything — the daemon owns headless subprocesses,
+            // the app owns pane lifecycles.
+            match serde_json::from_value::<crate::headless::ResumePaneParams>(req.params.clone()) {
+                Ok(p) => {
+                    let mgr = ctx.headless.lock().await;
+                    mgr.resume_pane(p)
+                        .map(|r| serde_json::to_value(r).unwrap())
+                }
+                Err(e) => Err(format!("invalid params: {e}")),
+            }
+        }
+        "team.delete_archive" => {
+            // On-demand archive removal from the resume picker. Works for both
+            // pane-mode and headless archives — both live in the same directory.
+            match serde_json::from_value::<crate::headless::DeleteArchiveParams>(req.params.clone()) {
+                Ok(p) => {
+                    let mgr = ctx.headless.lock().await;
+                    mgr.delete_archive(p)
                         .map(|r| serde_json::to_value(r).unwrap())
                 }
                 Err(e) => Err(format!("invalid params: {e}")),
@@ -1743,6 +1911,10 @@ async fn dispatch(req: &Request, ctx: &Context) -> Response {
                 app_socket_path: Option<String>,
                 #[serde(default)]
                 instructions: Option<String>,
+                #[serde(default)]
+                extra_args: Vec<String>,
+                #[serde(default)]
+                extra_env: std::collections::HashMap<String, String>,
             }
             fn default_cli() -> String {
                 "claude".into()
@@ -1760,6 +1932,8 @@ async fn dispatch(req: &Request, ctx: &Context) -> Response {
                         instructions: p.instructions,
                         agent_type: None,
                         color: None,
+                        extra_args: p.extra_args,
+                        extra_env: p.extra_env,
                     };
                     let mut mgr = ctx.headless.lock().await;
                     match mgr

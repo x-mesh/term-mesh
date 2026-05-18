@@ -2009,6 +2009,8 @@ class TerminalController {
             return await asyncTeamAttach(params: params, id: id)
         case "team.detach":
             return await asyncTeamDetach(params: params, id: id)
+        case "team.add_agent":
+            return await asyncTeamAddAgent(params: params, id: id)
         default:
             return v2Error(id: id, code: "unknown_method", message: "Unknown team command: \(method)")
         }
@@ -2290,11 +2292,23 @@ class TerminalController {
             return v2Error(id: id, code: "invalid_params", message: "Missing agent_name")
         }
         let explicitTeamName = params["team_name"] as? String
+        let force = (params["force"] as? Bool) ?? true
 
         let result: V2CallResult = await MainActor.run {
             let appDelegate = AppDelegate.shared
-            // Resolve TabManager + workspaceId — reuse attach's logic minus the callerPanelId requirement.
+            // Resolution priority:
+            // 1. explicit team_name → look up stored team, resolve tabManager from team.workspaceId
+            //    (used by `tm-agent remove` against GUI teams — no caller env required)
+            // 2. caller-env params (window_id / surface_id / workspace_id)
+            //    (used by `tm-agent detach` from inside a workspace pane)
             let resolved: (tabManager: TabManager, workspaceId: UUID)? = {
+                // Path 1: team_name-scoped resolution (mirrors asyncTeamAddAgent)
+                if let tn = explicitTeamName,
+                   let team = TeamOrchestrator.shared.teams[tn],
+                   let tm = appDelegate?.tabManagerFor(tabId: team.workspaceId) {
+                    return (tm, team.workspaceId)
+                }
+                // Path 2: caller-env resolution (workspace-adopt path)
                 if let windowIdStr = params["window_id"] as? String,
                    let windowId = UUID(uuidString: windowIdStr),
                    let tm = appDelegate?.tabManagerFor(windowId: windowId) {
@@ -2324,7 +2338,7 @@ class TerminalController {
             guard let resolved else {
                 return V2CallResult.err(
                     code: "not_in_workspace",
-                    message: "team.detach requires workspace_id or surface_id from a term-mesh pane.",
+                    message: "team.detach requires team_name, workspace_id, or surface_id.",
                     data: nil
                 )
             }
@@ -2335,7 +2349,8 @@ class TerminalController {
             let outcome = TeamOrchestrator.shared.detachAgent(
                 teamName: teamName,
                 agentName: agentName,
-                tabManager: resolved.tabManager
+                tabManager: resolved.tabManager,
+                force: force
             )
 
             switch outcome {
@@ -2354,6 +2369,57 @@ class TerminalController {
         return v2Result(id: id, result)
     }
 
+    /// Add a new agent pane to an existing GUI team by team name.
+    /// Unlike team.attach, this does not require a caller surface_id — the workspace
+    /// is resolved from the stored team record, mirroring team.detach's routing.
+    ///
+    /// Params:
+    ///   - team_name  (required): target team name
+    ///   - agent_type (required): role type (e.g. "executor", "reviewer")
+    ///   - name       (optional): display name; defaults to agent_type if omitted
+    ///   - model      (optional): CLI model string; defaults to "sonnet"
+    ///   - cli        (optional): CLI binary; defaults to "claude"
+    private func asyncTeamAddAgent(params: [String: Any], id: Any?) async -> String {
+        guard let teamName = params["team_name"] as? String, !teamName.isEmpty else {
+            return v2Error(id: id, code: "invalid_params", message: "Missing team_name")
+        }
+        guard let agentType = params["agent_type"] as? String, !agentType.isEmpty else {
+            return v2Error(id: id, code: "invalid_params", message: "Missing agent_type")
+        }
+        let rawName = params["name"] as? String ?? ""
+        let agentName = rawName.isEmpty ? agentType : rawName
+        let agentModel = (params["model"] as? String) ?? "sonnet"
+        let agentCli = (params["cli"] as? String) ?? "claude"
+
+        let result: V2CallResult = await MainActor.run {
+            let outcome = TeamOrchestrator.shared.addAgentToTeam(
+                teamName: teamName,
+                agentType: agentType,
+                agentName: agentName,
+                agentModel: agentModel,
+                agentCli: agentCli
+            )
+            switch outcome {
+            case .success(let member):
+                var payload: [String: Any] = [
+                    "team_name": teamName,
+                    "agent_name": member.name,
+                    "agent_id": member.id,
+                    "agent_type": member.agentType,
+                    "cli": member.cli,
+                    "model": member.model,
+                ]
+                if let pid = member.panelId {
+                    payload["panel_id"] = pid.uuidString
+                }
+                return V2CallResult.ok(payload)
+            case .failure(let err):
+                return V2CallResult.err(code: err.code, message: err.description, data: nil)
+            }
+        }
+        return v2Result(id: id, result)
+    }
+
     private func asyncTeamSend(params: [String: Any], id: Any?) async -> String {
         guard let teamName = params["team_name"] as? String else {
             return v2Error(id: id, code: "invalid_params", message: "Missing team_name")
@@ -2364,6 +2430,20 @@ class TerminalController {
         guard let text = params["text"] as? String else {
             return v2Error(id: id, code: "invalid_params", message: "Missing text")
         }
+
+        // Per-agent send serialization: wait for the preceding paste+Return cycle to
+        // finish (including 250 ms post-Return cooldown) before pasting new text.
+        // This prevents rapid consecutive sends from racing inside the codex TUI
+        // submit window and dropping every other message.
+        let agentKey = "\(teamName)/\(agentName)"
+        let (prevGate, _): (SendGate?, SendGate) = await MainActor.run {
+            let prev = TerminalController.perAgentGateQueue[agentKey]?.last
+            let gate = SendGate()
+            TerminalController.perAgentGateQueue[agentKey, default: []].append(gate)
+            return (prev, gate)
+        }
+        if let prev = prevGate { await prev.wait() }
+
         // Stagger: dynamic gap based on team size to prevent GCD main-queue saturation
         // when the CLI sends to 10+ agents in rapid succession.
         let staggerNs = await MainActor.run {
@@ -3130,6 +3210,23 @@ class TerminalController {
             }
         }
 
+        // After Return delivery: wait 250 ms cooldown then open the per-agent gate
+        // so the next paste+Return sequence can proceed. This is the companion to the
+        // gate enqueued in asyncTeamSend; together they serialize consecutive sends to
+        // the same codex/agent pane and prevent TUI submit-window drops.
+        if result.sent && key.lowercased() == "return" {
+            let agentKey = "\(teamName)/\(agentName)"
+            try? await Task.sleep(nanoseconds: TerminalController.kPostReturnCooldownNs)
+            let gateToOpen: SendGate? = await MainActor.run {
+                guard var queue = TerminalController.perAgentGateQueue[agentKey],
+                      !queue.isEmpty else { return nil }
+                let gate = queue.removeFirst()
+                TerminalController.perAgentGateQueue[agentKey] = queue.isEmpty ? nil : queue
+                return gate
+            }
+            gateToOpen?.open()
+        }
+
         return result.sent
             ? v2Ok(id: id, result: ["sent": true, "team_name": teamName, "agent_name": agentName, "key": key])
             : v2Error(
@@ -3146,6 +3243,49 @@ class TerminalController {
                 ]
             )
     }
+
+    // MARK: - Per-Agent Send Serialization
+
+    /// One-shot async gate used to serialize paste+Return sequences per agent.
+    /// asyncTeamSend enqueues a gate; asyncTeamSendKey opens it after the post-Return
+    /// cooldown. A 2 s watchdog auto-opens to prevent deadlock on orphaned sequences.
+    private final class SendGate: @unchecked Sendable {
+        private var cont: CheckedContinuation<Void, Never>?
+        private var opened = false
+        private let lock = NSLock()
+
+        init() {
+            Task.detached { [weak self] in
+                try? await Task.sleep(nanoseconds: 2_000_000_000) // 2 s watchdog
+                self?.open()
+            }
+        }
+
+        func wait() async {
+            await withCheckedContinuation { c in
+                lock.withLock {
+                    if opened { c.resume() } else { cont = c }
+                }
+            }
+        }
+
+        func open() {
+            lock.withLock {
+                guard !opened else { return }
+                opened = true
+                cont?.resume()
+                cont = nil
+            }
+        }
+    }
+
+    /// FIFO gate queues per agent key ("teamName/agentName"). Protected by @MainActor.
+    /// asyncTeamSend appends its gate and waits for the preceding one;
+    /// asyncTeamSendKey dequeues and opens the head gate after the post-Return cooldown.
+    @MainActor private static var perAgentGateQueue: [String: [SendGate]] = [:]
+
+    /// Cooldown after Return delivery before the next paste is allowed (ms → ns).
+    private static let kPostReturnCooldownNs: UInt64 = 250_000_000 // 250 ms
 
     // MARK: - Team Send Stagger
 

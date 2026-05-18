@@ -98,6 +98,20 @@ This creates an isolated app with its own name, bundle ID, socket, and derived d
 
 Before launching a new tagged run, clean up any older tags you started in this session (quit old tagged app + remove its `/tmp` socket/derived data).
 
+## CLI Profiles
+
+Named CLI profile sets (path + extraArgs + env + modelOverride) stored in `~/Library/Application Support/term-mesh/cli-profiles.json`.
+
+**Settings에서 만들기:** Settings → CLI Paths에서 각 CLI(claude / kiro / codex / gemini)별로 프로파일을 추가하고 이름, 실행 경로, 추가 인수(extraArgs), 환경 변수, 모델 override를 지정. 경로 필드에는 자동 감지된 경로와 최근 사용 경로가 dropdown으로 표시됨.
+
+**메뉴바에서 전환:** 메뉴바 아이콘 → CLI Profile 서브메뉴에서 CLI별 프로파일을 라디오 버튼으로 즉시 전환. "Apply to Active Pane (Restart)"를 선택하면 현재 pane을 새 프로파일로 hard restart.
+
+**마이그레이션:** 기존 `cliPath.<cli>` 값은 앱 시작 시 자동으로 "Default" 프로파일로 변환되며 원본 UserDefaults 키도 dual-write로 유지됨(구버전 빌드 호환).
+
+**extraArgs 주의:** `--model`, `--resume`, `--session-id`, `--dangerously-skip-permissions`, `--print`, `--append-system-prompt`는 term-mesh가 자동으로 주입하므로 extraArgs에 넣지 말 것(경고 표시됨).
+
+**헤드리스 모드:** `tm-agent create` / `tm-agent attach` 시에도 활성 프로파일의 extraArgs / env / modelOverride가 동일하게 적용됨.
+
 ## Debug event log
 
 All debug events (keys, mouse, focus, splits, tabs) go to a unified log in DEBUG builds:
@@ -129,7 +143,8 @@ tail -f "$(cat /tmp/term-mesh-last-debug-log-path 2>/dev/null || echo /tmp/term-
 - **Custom UTTypes** for drag-and-drop must be declared in `Resources/Info.plist` under `UTExportedTypeDeclarations` (e.g. `com.splittabbar.tabtransfer`, `com.termmesh.sidebar-tab-reorder`).
 - Do not add an app-level display link or manual `ghostty_surface_draw` loop; rely on Ghostty wakeups/renderer to avoid typing lag.
 - **Terminal find layering contract:** `SurfaceSearchOverlay` must be mounted from `GhosttySurfaceScrollView` in `Sources/GhosttyTerminalView.swift` (AppKit portal layer), not from SwiftUI panel containers such as `Sources/Panels/TerminalPanelView.swift`. Portal-hosted terminal views can sit above SwiftUI during split/workspace churn.
-- **Submodule safety:** When modifying a submodule (ghostty, vendor/bonsplit, etc.), always push the submodule commit to its remote `main` branch BEFORE committing the updated pointer in the parent repo. Never commit on a detached HEAD or temporary branch — the commit will be orphaned and lost. Verify with: `cd <submodule> && git merge-base --is-ancestor HEAD origin/main`.
+- **Submodule safety:** `ghostty` is the only git submodule. When modifying it, always push the submodule commit to its remote `main` branch BEFORE committing the updated pointer in the parent repo. Never commit on a detached HEAD or temporary branch — the commit will be orphaned and lost. Verify with: `cd ghostty && git merge-base --is-ancestor HEAD origin/main`.
+- **`vendor/bonsplit` is vendored code, not a submodule** (converted in `c56fdbe1`). Its files are tracked directly by this repo — edit and commit them like any other source file; no submodule push/pointer dance.
 
 ## Socket command threading policy
 
@@ -198,6 +213,17 @@ a socket exists at `/tmp/term-mesh*.sock` or `/tmp/term-mesh.sock`), ALL team op
 **Use instead:** The project-local `/team` command (`.claude/commands/team.md`) for Claude leaders,
 or the Codex IME `/team` alias backed by `.codex/prompts/team.md` for Codex leaders. Both route
 everything through `tm-agent`.
+
+### Command responsibility split — /team vs /tm
+
+| 슬래시 | 책임 | 주요 명령 |
+|--------|------|----------|
+| `/team-up` | 0→1 팀 부트스트랩 (현재 pane을 leader로 adopt) | `team-up [N] --adopt` |
+| `/team` | 팀 구성 편집 (lifecycle) | `add` / `remove` / `swap` / `ensure` / `status` / `destroy` / `edit` (no-args 인터랙티브) |
+| `/tm` | 작업 디스패치 (fan-out + 3줄 합성) | `--ensure <roles>` 옵션으로 사전 보강 가능 |
+| `/tm-op` | 전략 오케스트레이션 (refine/debate 등) | 변경 없음 |
+
+`/tm`은 팀 구성을 절대 변경하지 않는다. 부족한 역할이 있으면 `--ensure` 명시적 옵트인 또는 사전에 `/team add` 필요.
 
 ### OMC keyword override
 
@@ -275,8 +301,26 @@ native Agent tool이 더 적합한 경우(예: 단일 isolated investigation, �
 ### Quick CLI reference
 
 **All operations** use `tm-agent` (Rust, ~2ms; fallback `./scripts/tm-agent.sh` ~10ms):
+
 ```bash
-# Team lifecycle
+# Lifecycle (/team)
+/team                      # interactive editor
+/team status               # formatted team table
+/team add reviewer         # attach default claude/sonnet reviewer
+/team add executor --model opus  # attach with opus model
+/team add reviewer --cli codex   # attach codex-backed reviewer
+/team remove writer        # detach writer
+/team swap executor opus   # change executor model
+/team ensure reviewer security  # idempotent — add only if missing
+/team destroy              # 2-step confirm then teardown
+
+# Dispatch (/tm)
+/tm "이 PR 보안 리뷰"                              # fan-out to all idle
+/tm --ensure reviewer,security "이 PR 보안 리뷰"   # auto-add missing roles first
+```
+
+```bash
+# Team lifecycle (tm-agent raw)
 tm-agent create [N] [--claude-leader]          # creates a new workspace with agents
 tm-agent create [N] --adopt                    # adopt current pane as leader (Codex/Claude/Kiro/Gemini)
 tm-agent destroy
@@ -288,6 +332,16 @@ tm-agent runbook status
 tm-agent runbook init [--dry-run] [--force]
 tm-agent runbook digest [--agent <role>]       # compact prompt-efficient role brief
 tm-agent runbook install --tool claude|codex|opencode|all [--agent <role>] [--dry-run] [--force]
+
+# Team-scoped add/remove (works for headless AND GUI teams — no workspace ID required)
+tm-agent add <role> [--name N] [--model M] [--cli claude|codex|kiro|gemini]
+tm-agent remove <agent_name> [--force]
+# Examples:
+#   tm-agent add reviewer                   # add reviewer to current team (any team type)
+#   tm-agent add executor --model opus      # add executor with opus model
+#   tm-agent remove reviewer               # remove agent from team (--force default: true)
+# `add` routes to team.add_agent Swift RPC; rejects duplicate name within team.
+# `remove` routes to team.detach Swift RPC; team-name–scoped (not workspace-panel–scoped).
 
 # Workspace-local attach/detach (NO new workspace — uses the caller's current one)
 tm-agent attach <agent_type> [--name N] [--model M] [--cli claude|codex|kiro|gemini]

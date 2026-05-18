@@ -116,6 +116,15 @@ struct ClaudeSession: Identifiable, Hashable {
     }
 
     /// Extract the first user message and last assistant message from a session JSONL.
+    /// Read the most recent assistant snippet from the leader's transcript
+    /// jsonl. Returns nil when the file is unreadable or has no assistant
+    /// messages. Used by the resume picker to surface where the conversation
+    /// left off without re-spawning the leader.
+    static func lastUserMessage(path: String) -> String? {
+        let (_, last) = extractMessages(path: path)
+        return last.isEmpty ? nil : last
+    }
+
     private static func extractMessages(path: String) -> (first: String, last: String) {
         // First user message: scan first 50 lines
         var firstMsg = ""
@@ -188,6 +197,19 @@ struct ResumableTeam: Identifiable, Hashable {
     let validity: Validity
     let resumable: Bool
     let blockingReason: String?
+    /// "headless" (daemon-managed subprocesses) or "pane" (GUI panes).
+    /// Drives resume routing: pane archives use `team.resume_pane` instead of
+    /// `headless.resume_team`. Defaults to "headless" for back-compat when the
+    /// daemon predates this field.
+    let mode: String
+    /// Leader's claude session id (used by the picker preview to surface the
+    /// last leader message; also informs resume routing). Empty / nil when no
+    /// session was captured.
+    let leaderSessionId: String?
+    /// Last user/assistant message text from the leader's transcript jsonl,
+    /// resolved lazily by the picker. nil until resolved or when the leader
+    /// session file is unavailable.
+    var leaderLastMessage: String? = nil
 
     var id: String { teamUuid }
 
@@ -307,7 +329,9 @@ struct ResumableTeam: Identifiable, Hashable {
             agents: agents,
             validity: validity,
             resumable: dict["resumable"] as? Bool ?? false,
-            blockingReason: dict["blocking_reason"] as? String
+            blockingReason: dict["blocking_reason"] as? String,
+            mode: (dict["mode"] as? String) ?? "headless",
+            leaderSessionId: (dict["leader_session_id"] as? String).flatMap { $0.isEmpty ? nil : $0 }
         )
     }
 }
@@ -606,12 +630,30 @@ struct TeamCreationView: View {
         let isExpanded = expandedResumeAgentTeams.contains(team.teamUuid)
 
         VStack(alignment: .leading, spacing: 6) {
-            // Row 1: team name + agent count
-            HStack {
+            // Row 1: team name + mode badge + delete + agent count
+            HStack(spacing: 6) {
                 Text(team.teamName)
                     .font(.headline)
                     .foregroundStyle(isDisabled ? .secondary : .primary)
+                // Mode badge: pane vs headless. Tooltip explains the distinction
+                // so users understand why the icons differ.
+                Image(systemName: team.mode == "pane" ? "rectangle.split.2x2" : "server.rack")
+                    .font(.caption)
+                    .foregroundStyle(.tertiary)
+                    .help(team.mode == "pane"
+                        ? "Pane-mode team — agents run in visible terminal panes"
+                        : "Headless team — agents run as background subprocesses")
                 Spacer()
+                // On-demand archive delete. Auto GC sweeps anything older than
+                // 7 days; this lets users drop archives they're done with.
+                Button(action: { confirmDeleteArchive(team) }) {
+                    Image(systemName: "trash")
+                        .font(.caption)
+                        .foregroundStyle(.tertiary)
+                }
+                .buttonStyle(.plain)
+                .help("Delete this archived team (auto-deleted after 7 days)")
+                .accessibilityLabel("Delete archive")
                 Text("\(team.agents.count) agent\(team.agents.count == 1 ? "" : "s")")
                     .font(.caption)
                     .foregroundStyle(.secondary)
@@ -636,6 +678,32 @@ struct TeamCreationView: View {
                     .foregroundStyle(.secondary)
                     .lineLimit(1)
                     .truncationMode(.middle)
+            }
+
+            // Row 2.5: leader session id + last leader message (when known).
+            // Surfaces what conversation the picker would resume to so users
+            // can pick the right team at a glance.
+            if let sid = team.leaderSessionId, !sid.isEmpty {
+                HStack(spacing: 6) {
+                    Image(systemName: "person.text.rectangle")
+                        .font(.caption2)
+                        .foregroundStyle(.tertiary)
+                    Text("leader \(String(sid.prefix(8)))")
+                        .font(.caption2.monospaced())
+                        .foregroundStyle(.tertiary)
+                        .help(sid)
+                    if let last = team.leaderLastMessage, !last.isEmpty {
+                        Text("•")
+                            .font(.caption2)
+                            .foregroundStyle(.tertiary)
+                        Text("\u{201C}\(last)\u{201D}")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                            .truncationMode(.tail)
+                            .help(last)
+                    }
+                }
             }
 
             // Row 3: worktree + branch indicator (when present)
@@ -783,6 +851,20 @@ struct TeamCreationView: View {
                     // Tolerate bare-result shape (no JSON-RPC envelope).
                     decoded = teams.compactMap { ResumableTeam.decode($0) }
                 }
+                // Resolve leader's last transcript message for the picker
+                // preview. Reads `~/.claude/projects/<encoded-wd>/<sid>.jsonl`
+                // tail — best-effort, leaves nil when unavailable.
+                for i in decoded.indices {
+                    guard let sid = decoded[i].leaderSessionId, !sid.isEmpty else { continue }
+                    let wd = decoded[i].workingDirectory
+                    let encoded = wd.replacingOccurrences(of: "/", with: "-")
+                    let home = FileManager.default.homeDirectoryForCurrentUser.path
+                    let path = "\(home)/.claude/projects/\(encoded)/\(sid).jsonl"
+                    if FileManager.default.fileExists(atPath: path),
+                       let snippet = ClaudeSession.lastUserMessage(path: path), !snippet.isEmpty {
+                        decoded[i].leaderLastMessage = snippet
+                    }
+                }
             } else if raw == nil {
                 // Daemon not reachable or RPC timed out — surface as empty list
                 // with a soft error so the panel does not break.
@@ -809,25 +891,72 @@ struct TeamCreationView: View {
         return TermMeshDaemon.shared.findGitRoot(from: cwd)
     }
 
-    /// Invoke `headless.resume_team`. On success, calls `onResume` with the
-    /// decoded result dictionary and dismisses the sheet. On error, surfaces
-    /// the message inline (panel stays open).
+    /// Confirm and delete an archived team via `team.delete_archive`. Refreshes
+    /// the picker list on success. Auto-GC sweeps anything older than 7 days
+    /// (`ARCHIVE_RETENTION_SECS` in the daemon), but this gives users on-demand
+    /// control to drop archives they're done with.
+    private func confirmDeleteArchive(_ team: ResumableTeam) {
+        let alert = NSAlert()
+        alert.messageText = "Delete archived team \"\(team.teamName)\"?"
+        alert.informativeText = "The archive will be permanently removed. Sessions inside this archive will no longer be resumable. Auto-GC also removes archives older than 7 days."
+        alert.addButton(withTitle: "Delete")
+        alert.addButton(withTitle: "Cancel")
+        alert.alertStyle = .warning
+        alert.presentAsSheet { response in
+            guard response == .alertFirstButtonReturn else { return }
+            let params: [String: Any] = ["team_uuid": team.teamUuid]
+            DispatchQueue.global(qos: .userInitiated).async {
+                let raw = TermMeshDaemon.shared.rpcCallRaw(
+                    method: "team.delete_archive",
+                    params: params
+                )
+                DispatchQueue.main.async {
+                    if let raw, raw.contains("\"error\"") {
+                        resumeErrorMessage = "Failed to delete archive."
+                    }
+                    if selectedResumeTeamId == team.teamUuid {
+                        selectedResumeTeamId = nil
+                    }
+                    loadResumableTeams()
+                }
+            }
+        }
+    }
+
+    /// Invoke the appropriate resume RPC based on the team's archive mode.
+    /// Headless archives go through `headless.resume_team` (daemon respawns the
+    /// subprocesses). Pane-mode archives go through `team.resume_pane` (daemon
+    /// returns metadata + session IDs and the app side creates the workspace
+    /// and panes).
+    ///
+    /// On success, calls `onResume` with the decoded result dictionary and
+    /// dismisses the sheet. On error, surfaces the message inline (panel stays
+    /// open).
     private func invokeResume(team: ResumableTeam, acceptBranchDrift: Bool = false) {
         guard !resumeInFlight else { return }
         resumeInFlight = true
         resumeErrorMessage = nil
 
-        let leaderSessionId = UUID().uuidString
-        let params: [String: Any] = [
-            "team_uuid": team.teamUuid,
-            "leader_session_id": leaderSessionId,
-            "app_socket_path": SocketControlSettings.socketPath(),
-            "accept_branch_drift": acceptBranchDrift,
-        ]
+        let isPaneMode = team.mode == "pane"
+        let method: String
+        let params: [String: Any]
+        if isPaneMode {
+            method = "team.resume_pane"
+            params = ["team_uuid": team.teamUuid]
+        } else {
+            method = "headless.resume_team"
+            let leaderSessionId = UUID().uuidString
+            params = [
+                "team_uuid": team.teamUuid,
+                "leader_session_id": leaderSessionId,
+                "app_socket_path": SocketControlSettings.socketPath(),
+                "accept_branch_drift": acceptBranchDrift,
+            ]
+        }
 
         DispatchQueue.global(qos: .userInitiated).async {
             let raw = TermMeshDaemon.shared.rpcCallRaw(
-                method: "headless.resume_team",
+                method: method,
                 params: params
             )
             var resultDict: [String: Any]?
@@ -853,7 +982,11 @@ struct TeamCreationView: View {
                     resumeErrorMessage = errMsg
                     return
                 }
-                if let resultDict {
+                if var resultDict {
+                    // Tag the dict with mode so the receiving onResume handler
+                    // can branch between headless (daemon already spawned the
+                    // subprocesses) and pane (app must create workspace + panes).
+                    resultDict["mode"] = isPaneMode ? "pane" : "headless"
                     onResume?(resultDict)
                     dismiss()
                 }
@@ -985,7 +1118,20 @@ struct TeamCreationView: View {
                 .fixedSize()
 
                 if leaderMode != "repl" {
-                    Picker("", selection: $leaderModel) {
+                    // Self-healing binding: if leaderModel isn't in the current CLI's
+                    // model list (stale AppStorage, removed custom model, etc.), the
+                    // get-side returns a valid fallback for this render and schedules
+                    // a state correction so SwiftUI never paints a blank selection.
+                    Picker("", selection: Binding(
+                        get: {
+                            let opts = AgentRolePreset.models(for: leaderMode)
+                            if opts.contains(leaderModel) { return leaderModel }
+                            let fallback = AgentRolePreset.defaultModel(for: leaderMode)
+                            DispatchQueue.main.async { leaderModel = fallback }
+                            return fallback
+                        },
+                        set: { leaderModel = $0 }
+                    )) {
                         ForEach(AgentRolePreset.models(for: leaderMode), id: \.self) { m in
                             Text(AgentRolePreset.modelDisplayLabel(m, for: leaderMode)).tag(m)
                         }
@@ -1225,7 +1371,18 @@ struct TeamCreationView: View {
                         }
                     }
                     .frame(width: 85)
-                    Picker("", selection: $bulkModel) {
+                    // Self-healing binding mirrors the leader picker pattern so
+                    // bulkModel can never be visually empty when bulkCli changes.
+                    Picker("", selection: Binding(
+                        get: {
+                            let opts = bulkModels
+                            if opts.contains(bulkModel) { return bulkModel }
+                            let fallback = AgentRolePreset.defaultModel(for: bulkCli)
+                            DispatchQueue.main.async { bulkModel = fallback }
+                            return fallback
+                        },
+                        set: { bulkModel = $0 }
+                    )) {
                         ForEach(bulkModels, id: \.self) { m in
                             Text(AgentRolePreset.modelDisplayLabel(m, for: bulkCli)).tag(m)
                         }
@@ -1318,9 +1475,23 @@ struct TeamCreationView: View {
                 }
                 .frame(width: 90)
 
-                // Model picker — shows CLI-appropriate models
+                // Model picker — shows CLI-appropriate models.
+                // Self-healing: when the agent's CLI flips (e.g. claude→codex), the
+                // previously-stored model tier may no longer be valid for the new CLI.
+                // Returning a fallback in get + scheduling a state correction keeps
+                // the picker from rendering empty before onChange handlers re-sync.
                 Picker("", selection: Binding(
-                    get: { agent.preset.model },
+                    get: {
+                        let opts = AgentRolePreset.models(for: agent.preset.cli)
+                        let current = agent.preset.model
+                        if opts.contains(current) { return current }
+                        let fallback = AgentRolePreset.defaultModel(for: agent.preset.cli)
+                        DispatchQueue.main.async {
+                            guard index < agents.count else { return }
+                            agents[index].preset.model = fallback
+                        }
+                        return fallback
+                    },
                     set: {
                         agents[index].preset.model = $0
                         persistSelectedSmartPresetOverride()

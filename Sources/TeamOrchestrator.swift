@@ -559,12 +559,20 @@ final class TeamOrchestrator: ObservableObject {
         splitFrom: UUID,
         orientation: SplitOrientation,
         insertFirst: Bool = false,
+        /// Phase 2 (pane-mode resume): when set and `agentCli == "claude"`,
+        /// the agent CLI is invoked with `--resume <sid>` so claude
+        /// re-attaches to the captured session. Defaults to nil — fresh spawn.
+        /// Other CLIs (codex/kiro/gemini) currently ignore this; resume
+        /// support for them is a follow-up.
+        resumeSessionId: String? = nil,
+        extraArgs: [String] = [],
+        extraEnv: [String: String] = [:],
         tabManager: TabManager
     ) -> AgentMember? {
         let agentId = "\(agentName)@\(teamName)"
 
         // Build CLI-specific invocation
-        let agentCommand: String
+        var agentCommand: String
         switch agentCli {
         case "kiro":
             let workerPrompt = Self.buildKiroWorkerPrompt(agentName: agentName, teamName: teamName, instructions: agentInstructions)
@@ -573,21 +581,24 @@ final class TeamOrchestrator: ObservableObject {
                 agentName: agentName,
                 teamName: teamName,
                 model: agentModel,
-                systemPrompt: workerPrompt
+                systemPrompt: workerPrompt,
+                extraArgs: extraArgs
             )
         case "codex":
             agentCommand = buildCodexCommand(
                 codexPath: cliPath,
                 agentName: agentName,
                 teamName: teamName,
-                model: agentModel
+                model: agentModel,
+                extraArgs: extraArgs
             )
         case "gemini":
             agentCommand = buildGeminiCommand(
                 geminiPath: cliPath,
                 agentName: agentName,
                 teamName: teamName,
-                model: agentModel
+                model: agentModel,
+                extraArgs: extraArgs
             )
         default:
             agentCommand = buildClaudeCommand(
@@ -599,8 +610,14 @@ final class TeamOrchestrator: ObservableObject {
                 parentSessionId: leaderSessionId,
                 agentType: agentType,
                 model: agentModel,
-                instructions: agentInstructions
+                instructions: agentInstructions,
+                extraArgs: extraArgs
             )
+            if let sid = resumeSessionId, !sid.isEmpty {
+                // Mirror the leader pattern (createTeam, claude case) — append
+                // `--resume <sid>` so claude re-attaches to its prior session.
+                agentCommand.append(" --resume \(sid)")
+            }
         }
 
         // Wrap so the terminal stays open (drops to shell) if the CLI exits.
@@ -618,7 +635,7 @@ final class TeamOrchestrator: ObservableObject {
 
         // Build env via shared helper (2026-03-19 regression guard — single source of truth)
         let windowId = AppDelegate.shared?.windowId(for: tabManager)?.uuidString
-        let paneEnv = Self.buildAgentPaneEnv(
+        var paneEnv = Self.buildAgentPaneEnv(
             teamName: teamName,
             agentName: agentName,
             agentType: agentType,
@@ -626,6 +643,10 @@ final class TeamOrchestrator: ObservableObject {
             windowId: windowId,
             workspaceId: workspace.id
         )
+        // Profile env is merged last — user-defined values take precedence over defaults.
+        if !extraEnv.isEmpty {
+            paneEnv.merge(extraEnv) { _, new in new }
+        }
 
         // Spawn the split pane. `insertFirst` lets hard-restart respawn into the
         // exact slot the dead pane occupied within its parent split.
@@ -688,6 +709,10 @@ final class TeamOrchestrator: ObservableObject {
         executionMode: String = "pane",
         adoptedLeaderSurfaceId: UUID? = nil,
         skipRunbookPromptForInteractiveAgents: Bool = false,
+        /// Phase 2 (pane-mode resume): agent name → claude session id, used to
+        /// invoke each agent CLI with `--resume <sid>`. Pane-mode resume passes
+        /// this; fresh team creation leaves it nil.
+        agentResumeSessionIds: [String: String]? = nil,
         tabManager: TabManager
     ) -> Team? {
         guard !agents.isEmpty else { return nil }
@@ -901,7 +926,7 @@ final class TeamOrchestrator: ObservableObject {
                     let quotedPath = claudePath.contains(" ") ? "\"\(claudePath)\"" : claudePath
                     var claudeLeaderParts = ["\(quotedPath)", "--system-prompt '\(escaped)'", "--dangerously-skip-permissions"]
                     if !leaderModel.isEmpty && leaderModel != "sonnet" {
-                        claudeLeaderParts.append("--model \(leaderModel)")
+                        claudeLeaderParts.append("--model \(Self.resolveClaudeModelArg(leaderModel))")
                     }
                     if let sid = resumeSessionId, !sid.isEmpty {
                         claudeLeaderParts.append("--resume \(sid)")
@@ -1003,12 +1028,22 @@ final class TeamOrchestrator: ObservableObject {
                     workingDirectory: workingDirectory,
                     mode: .digest
                 )
-                var spec: [String: Any] = ["name": a.name, "agent_type": a.agentType, "cli": cli, "model": a.model]
+                let headlessProfile = CLIPathSettings.activeProfile(for: cli)
+                let headlessExtraArgs = headlessProfile?.extraArgs ?? []
+                let headlessExtraEnv = headlessProfile?.env ?? [:]
+                let headlessModel = headlessProfile?.modelOverride ?? a.model
+                var spec: [String: Any] = ["name": a.name, "agent_type": a.agentType, "cli": cli, "model": headlessModel]
                 if let path = cliPaths[cli] {
                     spec["cli_path"] = path
                 }
                 if !effectiveInstructions.isEmpty {
                     spec["instructions"] = effectiveInstructions
+                }
+                if !headlessExtraArgs.isEmpty {
+                    spec["extra_args"] = headlessExtraArgs
+                }
+                if !headlessExtraEnv.isEmpty {
+                    spec["extra_env"] = headlessExtraEnv
                 }
                 return spec
             }
@@ -1195,11 +1230,16 @@ final class TeamOrchestrator: ObservableObject {
             }
 
             // Delegate pane construction to shared helper (see addAgentPaneToWorkspace).
+            let agentResumeSid = agentResumeSessionIds?[agent.name]
+            let activeProfile = CLIPathSettings.activeProfile(for: agentCli)
+            let profileExtraArgs = activeProfile?.extraArgs ?? []
+            let profileExtraEnv = activeProfile?.env ?? [:]
+            let effectiveModel = activeProfile?.modelOverride ?? agent.model
             guard let member = addAgentPaneToWorkspace(
                 workspace: workspace,
                 agentName: agent.name,
                 agentCli: agentCli,
-                agentModel: agent.model,
+                agentModel: effectiveModel,
                 agentType: agent.agentType,
                 agentColor: agentColor,
                 agentInstructions: effectiveInstructions,
@@ -1213,6 +1253,9 @@ final class TeamOrchestrator: ObservableObject {
                 worktreeBranch: wtBranch,
                 splitFrom: splitFrom,
                 orientation: orientation,
+                resumeSessionId: agentResumeSid,
+                extraArgs: profileExtraArgs,
+                extraEnv: profileExtraEnv,
                 tabManager: tabManager
             ) else {
                 if index == 0 {
@@ -1464,11 +1507,15 @@ final class TeamOrchestrator: ObservableObject {
         }
 
         // 8. Delegate pane construction to the shared helper
+        let attachProfile = CLIPathSettings.activeProfile(for: normalizedCli)
+        let attachExtraArgs = attachProfile?.extraArgs ?? []
+        let attachExtraEnv = attachProfile?.env ?? [:]
+        let attachEffectiveModel = attachProfile?.modelOverride ?? agentModel
         guard let member = addAgentPaneToWorkspace(
             workspace: workspace,
             agentName: agentName,
             agentCli: normalizedCli,
-            agentModel: agentModel,
+            agentModel: attachEffectiveModel,
             agentType: agentType,
             agentColor: agentColor,
             agentInstructions: effectiveInstructions,
@@ -1482,6 +1529,8 @@ final class TeamOrchestrator: ObservableObject {
             worktreeBranch: nil,
             splitFrom: splitFrom,
             orientation: orientation,
+            extraArgs: attachExtraArgs,
+            extraEnv: attachExtraEnv,
             tabManager: tabManager
         ) else {
             return .failure(.paneCreationFailed)
@@ -1537,7 +1586,8 @@ final class TeamOrchestrator: ObservableObject {
     func detachAgent(
         teamName: String,
         agentName: String,
-        tabManager: TabManager
+        tabManager: TabManager,
+        force: Bool = true
     ) -> Result<DetachResult, DetachError> {
         guard var team = teams[teamName] else {
             return .failure(.teamNotFound(name: teamName))
@@ -1555,9 +1605,10 @@ final class TeamOrchestrator: ObservableObject {
         // `Workspace.closePanel` is idempotent — returns false if the panel
         // has already been closed (user-initiated or otherwise), which we
         // treat as successful detach.
+        // TODO: when force=false, check daemon task state for agent_busy before closing
         if let workspace = tabManager.tabs.first(where: { $0.id == team.workspaceId }),
            let pid = agent.panelId {
-            _ = workspace.closePanel(pid, force: true)
+            _ = workspace.closePanel(pid, force: force)
         }
 
         // Remove from team.agents
@@ -1589,6 +1640,147 @@ final class TeamOrchestrator: ObservableObject {
                 teamDestroyed: false
             ))
         }
+    }
+
+    // MARK: - GUI Team Add Agent
+
+    /// Errors returned by `addAgentToTeam`.
+    enum AddAgentError: Error, CustomStringConvertible {
+        case teamNotFound(name: String)
+        case duplicateName(name: String, team: String)
+        case workspaceGone(teamName: String)
+        case cliBinaryNotFound(cli: String)
+        case paneCreationFailed
+
+        var description: String {
+            switch self {
+            case .teamNotFound(let name):
+                return "Team '\(name)' not found."
+            case .duplicateName(let name, let team):
+                return "Agent '\(name)' already exists in team '\(team)'. Use a different --name."
+            case .workspaceGone(let teamName):
+                return "Team '\(teamName)' workspace no longer exists."
+            case .cliBinaryNotFound(let cli):
+                return "\(cli) binary not found"
+            case .paneCreationFailed:
+                return "Failed to create agent pane."
+            }
+        }
+
+        var code: String {
+            switch self {
+            case .teamNotFound: return "team_not_found"
+            case .duplicateName: return "duplicate_name"
+            case .workspaceGone: return "workspace_gone"
+            case .cliBinaryNotFound: return "cli_not_found"
+            case .paneCreationFailed: return "pane_creation_failed"
+            }
+        }
+    }
+
+    /// Add a new agent pane to an existing GUI team (created via `createTeam`).
+    ///
+    /// Unlike `attachToWorkspace`, this:
+    ///   - resolves the workspace from the stored team record (no caller surface_id), and
+    ///   - bypasses the `existingGuiTeam` guard — it intentionally targets GUI teams.
+    ///
+    /// Used by the `team.add_agent` RPC, which is what `tm-agent add <role>` calls.
+    func addAgentToTeam(
+        teamName: String,
+        agentType: String,
+        agentName: String,
+        agentModel: String,
+        agentCli: String
+    ) -> Result<AgentMember, AddAgentError> {
+        // 1. Look up team by name
+        guard var team = teams[teamName] else {
+            return .failure(.teamNotFound(name: teamName))
+        }
+
+        // 2. Reject duplicate name within the team
+        if team.agents.contains(where: { $0.name == agentName }) {
+            return .failure(.duplicateName(name: agentName, team: teamName))
+        }
+
+        // 3. Resolve TabManager from team.workspaceId (no caller env required)
+        guard let tabManager = AppDelegate.shared?.tabManagerFor(tabId: team.workspaceId) else {
+            return .failure(.workspaceGone(teamName: teamName))
+        }
+
+        // 4. Confirm workspace is still alive within that TabManager
+        guard let workspace = tabManager.tabs.first(where: { $0.id == team.workspaceId }) else {
+            return .failure(.workspaceGone(teamName: teamName))
+        }
+
+        // 5. Normalize CLI and resolve binary path
+        let normalizedCli = agentCli.isEmpty ? "claude" : agentCli
+        guard let cliPath = agentBinaryPath(cli: normalizedCli) else {
+            return .failure(.cliBinaryNotFound(cli: normalizedCli))
+        }
+
+        // 6. Compose runbook instructions for the role
+        let effectiveInstructions = AgentRunbookService.shared.composeInstructions(
+            roleName: agentType,
+            presetInstructions: "",
+            workingDirectory: team.workingDirectory,
+            mode: .digest
+        )
+
+        // 7. Pick color deterministically from current agent count
+        let colorList = ["green", "blue", "yellow", "magenta", "cyan", "red"]
+        let agentColor = colorList[team.agents.count % colorList.count]
+
+        // 8. Choose split target — last agent pane or leader pane
+        let splitFrom: UUID
+        let orientation: SplitOrientation
+        if let lastAgent = team.agents.last, let lastPanel = lastAgent.panelId {
+            splitFrom = lastPanel
+            orientation = .vertical
+        } else {
+            splitFrom = team.leaderPanelId
+            orientation = .horizontal
+        }
+
+        // 9. Apply active CLI profile overrides (extraArgs / env / modelOverride)
+        let profile = CLIPathSettings.activeProfile(for: normalizedCli)
+        let extraArgs = profile?.extraArgs ?? []
+        let extraEnv = profile?.env ?? [:]
+        let effectiveModel = profile?.modelOverride ?? agentModel
+
+        // 10. Spawn the pane via shared helper
+        guard let member = addAgentPaneToWorkspace(
+            workspace: workspace,
+            agentName: agentName,
+            agentCli: normalizedCli,
+            agentModel: effectiveModel,
+            agentType: agentType,
+            agentColor: agentColor,
+            agentInstructions: effectiveInstructions,
+            cliPath: cliPath,
+            teamName: teamName,
+            leaderSessionId: team.leaderSessionId,
+            workingDirectory: team.workingDirectory,
+            agentWorkDir: team.workingDirectory,
+            worktreeName: nil,
+            worktreePath: nil,
+            worktreeBranch: nil,
+            splitFrom: splitFrom,
+            orientation: orientation,
+            extraArgs: extraArgs,
+            extraEnv: extraEnv,
+            tabManager: tabManager
+        ) else {
+            return .failure(.paneCreationFailed)
+        }
+
+        // 11. Commit updated team state
+        team.agents.append(member)
+        teams[teamName] = team
+        TeamDataStore.shared.registerTeam(teamName, agentNames: team.agents.map(\.name))
+        syncTeamStateToDaemon()
+        Logger.team.info("add_agent: added '\(agentName, privacy: .public)' to team '\(teamName, privacy: .public)' (\(team.agents.count, privacy: .public) total)")
+
+        return .success(member)
     }
 
     /// Send a lightweight "pong" task to each agent after a delay, warming the Anthropic prompt cache.
@@ -2087,8 +2279,18 @@ final class TeamOrchestrator: ObservableObject {
     /// Maintains an in-flight counter and a panelId snapshot so a concurrent
     /// hard restart can either drain (preferred) or detect mid-flight migration.
     func sendToAgent(teamName: String, agentName: String, text: String, tabManager: TabManager, withReturn: Bool = true, completion: ((Bool) -> Void)? = nil) -> Bool {
-        guard let team = teams[teamName] else { completion?(false); return false }
-        guard let agent = selectAgent(in: team.agents, name: agentName) else { completion?(false); return false }
+        guard let team = teams[teamName] else {
+            #if DEBUG
+            dlog("[team.sendToAgent] DROP reason=team_not_found team=\(teamName) agent=\(agentName)")
+            #endif
+            completion?(false); return false
+        }
+        guard let agent = selectAgent(in: team.agents, name: agentName) else {
+            #if DEBUG
+            dlog("[team.sendToAgent] DROP reason=agent_not_found team=\(teamName) agent=\(agentName) agentCount=\(team.agents.count)")
+            #endif
+            completion?(false); return false
+        }
         let teamAgentKey = "\(teamName)/\(agentName)"
         if migratingAgents.contains(teamAgentKey) {
             #if DEBUG
@@ -2097,7 +2299,15 @@ final class TeamOrchestrator: ObservableObject {
             completion?(false)
             return false
         }
-        guard let pid = agent.panelId else { completion?(false); return false }
+        guard let pid = agent.panelId else {
+            #if DEBUG
+            dlog("[team.sendToAgent] DROP reason=panelId_nil team=\(teamName) agent=\(agentName) workspaceId=\(agent.workspaceId.uuidString.prefix(8))")
+            #endif
+            completion?(false); return false
+        }
+        #if DEBUG
+        dlog("[team.sendToAgent] enter team=\(teamName) agent=\(agentName) panelId=\(pid.uuidString.prefix(8)) withReturn=\(withReturn) textLen=\(text.count)")
+        #endif
         activeSends[teamAgentKey, default: 0] += 1
         return sendTextToPanel(
             workspaceId: agent.workspaceId,
@@ -2793,11 +3003,15 @@ final class TeamOrchestrator: ObservableObject {
             return .failure(.spawnFailed)
         }
         let agentWorkDir = old.originalAgentWorkDir ?? team.workingDirectory
+        let restartProfile = CLIPathSettings.activeProfile(for: old.cli)
+        let restartExtraArgs = restartProfile?.extraArgs ?? []
+        let restartExtraEnv = restartProfile?.env ?? [:]
+        let restartEffectiveModel = restartProfile?.modelOverride ?? old.model
         guard let newMember = addAgentPaneToWorkspace(
             workspace: workspace,
             agentName: old.name,
             agentCli: old.cli,
-            agentModel: old.model,
+            agentModel: restartEffectiveModel,
             agentType: old.agentType,
             agentColor: old.color,
             agentInstructions: old.instructions,
@@ -2812,6 +3026,8 @@ final class TeamOrchestrator: ObservableObject {
             splitFrom: splitFrom,
             orientation: orientation,
             insertFirst: insertFirst,
+            extraArgs: restartExtraArgs,
+            extraEnv: restartExtraEnv,
             tabManager: tabManager
         ) else {
             // Spawn failed — dead panel is still alive; leave it in place rather
@@ -3122,6 +3338,11 @@ final class TeamOrchestrator: ObservableObject {
     /// Destroy a team — send Ctrl-C to all agents and close the workspace.
     func destroyTeam(name: String, tabManager: TabManager) -> Bool {
         guard let team = teams[name] else { return false }
+        // Phase 2 (pane-mode resume): persist a `mode: "pane"` archive so this
+        // team shows up in `Resume from previous team`. Best-effort — failures
+        // don't block destroy. Headless teams are archived daemon-side by
+        // `headless.destroy_team` and never enter this code path.
+        archivePaneTeamIfApplicable(team)
         guard let workspace = tabManager.tabs.first(where: { $0.id == team.workspaceId }) else {
             cleanupWorktrees(team: team)
             clearResults(teamName: name)
@@ -3196,6 +3417,131 @@ final class TeamOrchestrator: ObservableObject {
     /// registry and open a workspace at the worktree path so the UI surfaces
     /// the resumed agents. Best-effort — if the result is malformed we log and
     /// return without throwing (caller is a UI completion handler).
+    /// Phase 2 (pane-mode resume): adopt a pane-mode archive that the daemon
+    /// returned via `team.resume_pane`. Delegates to `createTeam` so the
+    /// workspace, leader pane, and agent panes are all materialized the same
+    /// way a fresh `New Agent Team` would create them — then patches the
+    /// archived `team_uuid` and per-agent `session_id`s back onto the live
+    /// `Team` so a subsequent destroy archives to the same UUID and preserves
+    /// the per-agent session IDs (re-resumable).
+    ///
+    /// The **leader** pane resumes via `--resume <leader.session_id>` (already
+    /// wired through `createTeam`'s `resumeSessionId` parameter). Per-agent
+    /// `--resume <sid>` for individual agent CLIs is a follow-up — agents
+    /// currently start fresh but their captured session IDs are preserved on
+    /// the in-memory `AgentMember` so a future iteration can wire them through
+    /// `addAgentPaneToWorkspace`'s CLI command builders.
+    @discardableResult
+    func adoptResumedPaneTeam(result: [String: Any], tabManager: TabManager) -> Team? {
+        guard let teamName = result["team_name"] as? String,
+              let workingDirectory = result["working_directory"] as? String,
+              let agentsArr = result["agents"] as? [[String: Any]] else {
+            Logger.team.error("[pane-resume] result missing required fields")
+            return nil
+        }
+        if teams[teamName] != nil {
+            Logger.team.info("[pane-resume] team '\(teamName, privacy: .public)' already live — skipping adopt")
+            return teams[teamName]
+        }
+        let archivedTeamUuid = result["team_uuid"] as? String
+        let leaderDict = result["leader"] as? [String: Any]
+        let leaderSessionId = (leaderDict?["session_id"] as? String) ?? ""
+        let leaderMode = (leaderDict?["mode"] as? String) ?? "claude"
+        let leaderModel = (leaderDict?["model"] as? String) ?? "sonnet"
+
+        // worktree mode from archive (off / shared / isolated). If the archive
+        // had a shared worktree, the createTeam path will reuse the same
+        // configuration when laying out panes.
+        let archivedWorktreeMode: String = {
+            if let wt = result["worktree"] as? [String: Any],
+               let mode = wt["mode"] as? String, !mode.isEmpty {
+                return mode
+            }
+            return "off"
+        }()
+
+        // Build agents tuple in createTeam's expected shape.
+        typealias AgentTuple = (name: String, cli: String, model: String, agentType: String, color: String, instructions: String)
+        let agentTuples: [AgentTuple] = agentsArr.map { a in
+            (
+                name: (a["name"] as? String) ?? "agent",
+                cli: (a["cli"] as? String) ?? "claude",
+                model: (a["model"] as? String) ?? "sonnet",
+                agentType: (a["agent_type"] as? String) ?? ((a["name"] as? String) ?? "agent"),
+                color: (a["color"] as? String) ?? "blue",
+                instructions: (a["instructions"] as? String) ?? ""
+            )
+        }
+
+        // Phase 2: per-agent claude session IDs (captured at archive time via
+        // sidebar token tracker, stored in AgentMember.parentSessionId). Passed
+        // into createTeam so each claude agent CLI starts with `--resume <sid>`
+        // and re-attaches to its previous transcript. Codex/kiro/gemini agents
+        // currently ignore this; resume support for them is a follow-up.
+        var agentResumeMap: [String: String] = [:]
+        for a in agentsArr {
+            guard let name = a["name"] as? String,
+                  let sid = a["session_id"] as? String,
+                  !sid.isEmpty else { continue }
+            agentResumeMap[name] = sid
+        }
+
+        // Fresh leader routing UUID for the new team (regenerated each create).
+        let freshLeaderSessionId = UUID().uuidString
+
+        // `leaderSessionId` from the archive is the REAL claude session id
+        // (discovered from ~/.claude/projects/ at archive time). Passing it
+        // as `--resume` re-attaches claude to its prior transcript.
+        let leaderClaudeSid = leaderSessionId.isEmpty ? nil : leaderSessionId
+
+        guard let team = createTeam(
+            name: teamName,
+            agents: agentTuples,
+            workingDirectory: workingDirectory,
+            leaderSessionId: freshLeaderSessionId,
+            leaderMode: leaderMode,
+            leaderModel: leaderModel,
+            resumeSessionId: leaderClaudeSid,
+            worktreeMode: archivedWorktreeMode,
+            executionMode: "pane",
+            agentResumeSessionIds: agentResumeMap.isEmpty ? nil : agentResumeMap,
+            tabManager: tabManager
+        ) else {
+            Logger.team.error("[pane-resume] createTeam failed for '\(teamName, privacy: .public)'")
+            return nil
+        }
+
+        // Patch back the archived team_uuid + per-agent session IDs so the
+        // live team round-trips: a future destroy archives to the same UUID
+        // and carries forward each agent's resume identity.
+        if var t = teams[teamName] {
+            if let uuid = archivedTeamUuid, !uuid.isEmpty {
+                t.teamUuid = uuid
+            }
+            // Map archived agents by name and copy session_id back.
+            var archivedSessionsByName: [String: String] = [:]
+            for a in agentsArr {
+                guard let name = a["name"] as? String,
+                      let sid = a["session_id"] as? String,
+                      !sid.isEmpty else { continue }
+                archivedSessionsByName[name] = sid
+            }
+            if !archivedSessionsByName.isEmpty {
+                t.agents = t.agents.map { member in
+                    var m = member
+                    if let sid = archivedSessionsByName[member.name] {
+                        m.parentSessionId = sid
+                    }
+                    return m
+                }
+            }
+            teams[teamName] = t
+        }
+
+        Logger.team.info("[pane-resume] adopted team '\(teamName, privacy: .public)' with \(agentTuples.count) agent(s); leader resumed via --resume, agents start fresh (per-agent --resume is a follow-up)")
+        return teams[teamName]
+    }
+
     @discardableResult
     func adoptResumedHeadlessTeam(result: [String: Any], tabManager: TabManager) -> Team? {
         guard let teamName = result["name"] as? String,
@@ -3293,6 +3639,192 @@ final class TeamOrchestrator: ObservableObject {
         return team
     }
 
+    /// Phase 2 (pane-mode resume): discover the real claude session id for a
+    /// pane by scanning `~/.claude/projects/<encoded-workdir>/`. Claude writes
+    /// its conversation transcript to `<sessionId>.jsonl` in that directory,
+    /// so the most recently modified file there is the live session for any
+    /// claude CLI started in that working directory.
+    ///
+    /// Returns nil when the directory is absent or empty. The encoded directory
+    /// name mirrors what claude itself produces (`/` → `-`).
+    private static func discoverClaudeSessionId(workingDirectory: String) -> String? {
+        guard !workingDirectory.isEmpty else { return nil }
+        let encoded = workingDirectory.replacingOccurrences(of: "/", with: "-")
+        let home = FileManager.default.homeDirectoryForCurrentUser.path
+        let dir = "\(home)/.claude/projects/\(encoded)"
+        let fm = FileManager.default
+        guard fm.fileExists(atPath: dir),
+              let items = try? fm.contentsOfDirectory(atPath: dir) else { return nil }
+        var best: (sid: String, mtime: Date)?
+        for item in items {
+            guard item.hasSuffix(".jsonl") else { continue }
+            let sid = String(item.dropLast(6))
+            // claude session ids are RFC4122 UUIDs (8-4-4-4-12 = 36 chars, 4 dashes).
+            guard sid.count == 36, sid.filter({ $0 == "-" }).count == 4 else { continue }
+            let path = "\(dir)/\(item)"
+            guard let attrs = try? fm.attributesOfItem(atPath: path),
+                  let mtime = attrs[.modificationDate] as? Date else { continue }
+            if best == nil || mtime > best!.mtime {
+                best = (sid, mtime)
+            }
+        }
+        return best?.sid
+    }
+
+    /// Phase 2 (pane-mode resume): on destroy of a pane-mode team, ship a
+    /// `team.archive_pane` RPC to the daemon so the team appears in
+    /// `headless.list_resumable` with `mode: "pane"`. Headless teams (managed by
+    /// the daemon) are archived by the daemon's own destroy path and skip this.
+    ///
+    /// Best-effort: failures are logged and don't block destroy. The leader's
+    /// `--resume <leaderSessionId>` and each agent's `parentSessionId`
+    /// (captured by the sidebar token-tracking infrastructure in 0.115.0) are
+    /// sufficient to bring the team back via `team.resume_pane`.
+    ///
+    /// - Parameter synchronous: when true (used by `applicationWillTerminate`),
+    ///   the RPC runs inline on the caller's queue so the archive write
+    ///   completes before the daemon is stopped. The normal destroy path
+    ///   defaults to false so the UI doesn't block on disk I/O.
+    private func archivePaneTeamIfApplicable(_ team: Team, synchronous: Bool = false) {
+        // Skip headless teams — the daemon's `headless.destroy_team` already
+        // writes their archive. Pane-mode agents always have a `panelId` (real
+        // GUI pane); headless agents have `panelId == nil` (daemon subprocess).
+        // Note: `teamUuid` alone is not a reliable headless signal here because
+        // a RESUMED pane team carries the archived uuid forward — it's still
+        // pane-mode and must be re-archived on next destroy / quit.
+        let isHeadless = !team.agents.isEmpty && team.agents.allSatisfy { $0.panelId == nil }
+        if isHeadless {
+            #if DEBUG
+            dlog("[archive_pane] skip — headless team=\(team.id) (agents have no panelId)")
+            #endif
+            return
+        }
+        #if DEBUG
+        dlog("[archive_pane] proceed team=\(team.id) sync=\(synchronous) agents=\(team.agents.count) teamUuid=\(team.teamUuid ?? "nil")")
+        #endif
+
+        let appVersion = (Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String) ?? "unknown"
+        // For each pane we need the REAL claude session id (not the team's
+        // routing UUID stored in `parentSessionId` / `leaderSessionId`). Claude
+        // writes its transcripts to `~/.claude/projects/<encoded-workdir>/<sid>.jsonl`,
+        // so the most recently modified file in that directory is the live
+        // session for that pane. This is imperfect when multiple panes share a
+        // workdir (no worktree / shared worktree) — in that case the latest
+        // file wins for the agent we look up last; worktree-isolated mode
+        // gives clean 1-to-1 mapping.
+        // `leader_session_id` carries the REAL claude session id (discovered
+        // from `~/.claude/projects/`), not the team's ephemeral routing UUID.
+        // Empty string when no claude transcript exists yet (e.g., a team
+        // destroyed before the leader pane was used).
+        let leaderSid = Self.discoverClaudeSessionId(workingDirectory: team.workingDirectory) ?? ""
+        var payload: [String: Any] = [
+            "team_name": team.id,
+            "leader_session_id": leaderSid,
+            "leader_mode": team.leaderMode,
+            "leader_model": team.leaderModel,
+            "working_directory": team.workingDirectory,
+            "termmesh_app_version": appVersion,
+            "agents": team.agents.map { a -> [String: Any] in
+                var row: [String: Any] = [
+                    "name": a.name,
+                    "cli": a.cli,
+                    "model": a.model,
+                    "agent_type": a.agentType,
+                    "color": a.color,
+                ]
+                // Per-agent claude session id. Only safe to discover when the
+                // agent has its OWN worktree (1-to-1 mapping). When agents share
+                // the team workdir, mtime-based discovery returns the same jsonl
+                // for every agent — almost always the leader's — which causes
+                // resume to rehydrate every pane with the leader's conversation.
+                // Leave session_id nil in that case so the team is marked
+                // `no_sessions` rather than silently corrupting on resume.
+                // Also drop the value if it collides with the leader sid even
+                // when a worktree path is set (catches edge cases like a freshly
+                // created worktree where claude hasn't yet written a transcript
+                // and discovery falls through to the parent dir).
+                if let wt = a.worktreePath, !wt.isEmpty, wt != team.workingDirectory,
+                   let sid = Self.discoverClaudeSessionId(workingDirectory: wt),
+                   !sid.isEmpty, sid != leaderSid {
+                    row["session_id"] = sid
+                }
+                if !a.instructions.isEmpty {
+                    row["instructions"] = a.instructions
+                }
+                return row
+            },
+        ]
+        // git_root drives the "this repo" filter in the resume picker. Pane
+        // teams created with worktreeMode = "off" leave `team.gitRepoRoot`
+        // nil, so fall back to discovering it from the team's working
+        // directory at archive time. Without this, worktree-off pane teams
+        // only show up under "All" — a UX regression vs. headless teams.
+        let resolvedGitRoot: String? = {
+            if let root = team.gitRepoRoot, !root.isEmpty { return root }
+            return TermMeshDaemon.shared.findGitRoot(from: team.workingDirectory)
+        }()
+        #if DEBUG
+        dlog("[archive_pane.git_root] team=\(team.id) team.gitRepoRoot=\(team.gitRepoRoot ?? "nil") workingDirectory=\(team.workingDirectory) resolved=\(resolvedGitRoot ?? "nil")")
+        #endif
+        if let root = resolvedGitRoot, !root.isEmpty {
+            payload["git_root"] = root
+        }
+        // worktree info: pane-mode teams may share or per-agent. Capture shared.
+        if let wtName = team.sharedWorktreeName,
+           let wtPath = team.sharedWorktreePath,
+           let wtBranch = team.sharedWorktreeBranch,
+           !wtName.isEmpty {
+            payload["worktree_mode"] = team.worktreeMode
+            payload["worktree_path"] = wtPath
+            payload["worktree_branch"] = wtBranch
+        }
+
+        let work = {
+            let raw = TermMeshDaemon.shared.rpcCallRaw(
+                method: "team.archive_pane",
+                params: payload
+            )
+            if let raw, let data = raw.data(using: .utf8),
+               let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+                if let errMsg = obj["error"] as? String {
+                    Logger.team.warning("[archive_pane] daemon error: \(errMsg, privacy: .public)")
+                } else if let result = obj["result"] as? [String: Any],
+                          let path = result["archived_path"] as? String {
+                    Logger.team.info("[archive_pane] archived → \(path, privacy: .public)")
+                }
+            } else {
+                Logger.team.warning("[archive_pane] daemon did not respond")
+            }
+        }
+        if synchronous {
+            work()
+        } else {
+            DispatchQueue.global(qos: .utility).async(execute: work)
+        }
+    }
+
+    /// Phase 2 (pane-mode resume): archive every live pane-mode team
+    /// synchronously. Called from `applicationWillTerminate` so a plain Cmd+Q
+    /// also leaves resumable archives on disk — users shouldn't have to
+    /// explicitly destroy a team just to see it in the resume picker later.
+    /// Runs each archive RPC inline on the calling queue (the main thread
+    /// during termination) so the writes finish before the daemon is stopped.
+    func archiveAllLivePaneTeamsForQuit() {
+        // Pane-mode = at least one agent has a real GUI panel. Mirrors the
+        // skip rule in `archivePaneTeamIfApplicable`.
+        let live = teams.values.filter { team in
+            !team.agents.isEmpty && !team.agents.allSatisfy { $0.panelId == nil }
+        }
+        #if DEBUG
+        dlog("[archive_pane] quit hook: total teams=\(teams.count) live-pane=\(live.count)")
+        #endif
+        if live.isEmpty { return }
+        Logger.team.info("[archive_pane] quit: archiving \(live.count) live pane team(s)")
+        for team in live {
+            archivePaneTeamIfApplicable(team, synchronous: true)
+        }
+    }
+
     /// Log detached worktrees from a destroyed team (no longer auto-deleted).
     private func cleanupWorktrees(team: Team) {
         for agent in team.agents {
@@ -3358,7 +3890,8 @@ final class TeamOrchestrator: ObservableObject {
         parentSessionId: String,
         agentType: String,
         model: String,
-        instructions: String = ""
+        instructions: String = "",
+        extraArgs: [String] = []
     ) -> String {
         var parts = [
             claudePath.contains(" ") ? "\"\(claudePath)\"" : claudePath,
@@ -3372,7 +3905,7 @@ final class TeamOrchestrator: ObservableObject {
         ]
 
         if !model.isEmpty {
-            parts.append("--model \(model)")
+            parts.append("--model \(Self.resolveClaudeModelArg(model))")
         }
 
         if !instructions.isEmpty {
@@ -3381,7 +3914,23 @@ final class TeamOrchestrator: ObservableObject {
             parts.append("--append-system-prompt '\(escaped)'")
         }
 
+        parts += extraArgs.map { shellQuote($0) }
+
         return parts.joined(separator: " ")
+    }
+
+    private func shellQuote(_ s: String) -> String {
+        return "'" + s.replacingOccurrences(of: "'", with: "'\\''") + "'"
+    }
+
+    /// Map term-mesh tier names to the exact `--model` argument Claude CLI expects.
+    /// Only `opus-1m` needs explicit translation today; other tiers are passed through
+    /// (Claude CLI accepts `sonnet`/`opus`/`haiku` and full model IDs verbatim).
+    static func resolveClaudeModelArg(_ model: String) -> String {
+        switch model {
+        case "opus-1m": return "claude-opus-4-7[1m]"
+        default:        return model
+        }
     }
 
     /// Map short model names (used internally) to kiro-cli model identifiers.
@@ -3444,7 +3993,8 @@ final class TeamOrchestrator: ObservableObject {
         teamName: String,
         model: String,
         isLeader: Bool = false,
-        systemPrompt: String? = nil
+        systemPrompt: String? = nil,
+        extraArgs: [String] = []
     ) -> String {
         let profileName = "team-\(teamName)-\(agentName)"
 
@@ -3491,6 +4041,8 @@ final class TeamOrchestrator: ObservableObject {
             parts.append("--model \(kiroModel)")
         }
 
+        parts += extraArgs.map { shellQuote($0) }
+
         return parts.joined(separator: " ")
     }
 
@@ -3519,7 +4071,8 @@ final class TeamOrchestrator: ObservableObject {
         codexPath: String,
         agentName: String,
         teamName: String,
-        model: String
+        model: String,
+        extraArgs: [String] = []
     ) -> String {
         let path = codexPath.contains(" ") ? "\"\(codexPath)\"" : codexPath
         var parts = [
@@ -3536,6 +4089,8 @@ final class TeamOrchestrator: ObservableObject {
         if !model.isEmpty, let effort = Self.codexReasoningEffort(model) {
             parts.append("-c model_reasoning_effort=\(effort)")
         }
+
+        parts += extraArgs.map { shellQuote($0) }
 
         // Start interactively — leader sends instructions via tm-agent send.
         return parts.joined(separator: " ")
@@ -3556,7 +4111,8 @@ final class TeamOrchestrator: ObservableObject {
         geminiPath: String,
         agentName: String,
         teamName: String,
-        model: String
+        model: String,
+        extraArgs: [String] = []
     ) -> String {
         let path = geminiPath.contains(" ") ? "\"\(geminiPath)\"" : geminiPath
         var parts = [
@@ -3568,6 +4124,8 @@ final class TeamOrchestrator: ObservableObject {
             let geminiModel = Self.geminiModelName(model)
             parts.append("--model \(geminiModel)")
         }
+
+        parts += extraArgs.map { shellQuote($0) }
 
         // Start interactively — leader sends instructions via tm-agent send.
         return parts.joined(separator: " ")

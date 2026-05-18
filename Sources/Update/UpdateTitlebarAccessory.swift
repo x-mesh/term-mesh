@@ -349,6 +349,47 @@ struct TitlebarControlButton<Content: View>: View {
     }
 }
 
+/// Control-socket health indicator with a one-click restart, styled to match the
+/// titlebar info row (theme toggle, session timer, version). Self-contained:
+/// observes `SocketStatusModel.shared` directly and routes the button through
+/// `TerminalController.recoverSocket()` — the same `start()` path a Settings
+/// mode-toggle uses — so recovery never requires an app restart.
+struct SocketStatusControl: View {
+    @ObservedObject private var status = SocketStatusModel.shared
+
+    private var tint: Color {
+        switch status.health {
+        case .healthy: return .green.opacity(0.7)
+        case .halfDead: return .orange.opacity(0.9)
+        case .stopped: return .secondary.opacity(0.7)
+        }
+    }
+
+    private var iconName: String {
+        switch status.health {
+        case .healthy: return "bolt.horizontal.circle.fill"
+        case .halfDead, .stopped: return "bolt.horizontal.circle"
+        }
+    }
+
+    var body: some View {
+        Button(action: {
+            #if DEBUG
+            dlog("titlebar.socketRestart health=\(status.health.shortLabel)")
+            #endif
+            TerminalController.shared.recoverSocket()
+        }) {
+            Image(systemName: iconName)
+                .font(.system(size: 11))
+                .foregroundColor(tint)
+        }
+        .buttonStyle(.plain)
+        .accessibilityIdentifier("titlebarControl.socketStatus")
+        .accessibilityLabel("Socket status: \(status.health.shortLabel)")
+        .help("\(status.health.shortLabel) — click to restart the control socket")
+    }
+}
+
 struct TitlebarControlsView: View {
     @ObservedObject var notificationStore: TerminalNotificationStore
     @ObservedObject var viewModel: TitlebarControlsViewModel

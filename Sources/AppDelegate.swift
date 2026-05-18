@@ -639,6 +639,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
     }
 
     func applicationWillTerminate(_ notification: Notification) {
+        #if DEBUG
+        dlog("[app.willTerminate] fired — archiving live pane teams before daemon shutdown")
+        #endif
         if let observer = systemAppearanceObserver {
             DistributedNotificationCenter.default.removeObserver(observer)
         }
@@ -649,6 +652,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
             NSWorkspace.shared.notificationCenter.removeObserver(observer)
         }
         tabManager?.saveSessionState()
+        // Phase 2 (pane-mode resume): archive live pane teams to disk before
+        // the daemon goes away — without this, a plain Cmd+Q would lose the
+        // team and leave the resume picker empty. Headless teams are persisted
+        // by the daemon's own shutdown path.
+        TeamOrchestrator.shared.archiveAllLivePaneTeamsForQuit()
         TerminalController.shared.stop()
         // Worktree auto-cleanup disabled — worktrees are managed explicitly via Worktree Manager
         daemon.stopDaemon()

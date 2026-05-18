@@ -110,6 +110,7 @@ extension TerminalController {
         serverSocket = socket(AF_UNIX, SOCK_STREAM, 0)
         guard serverSocket >= 0 else {
             Logger.socket.error("Failed to create socket")
+            SocketStatusModel.shared.update(.stopped)
             return
         }
 
@@ -132,6 +133,8 @@ extension TerminalController {
         guard bindResult >= 0 else {
             Logger.socket.error("Failed to bind socket")
             close(serverSocket)
+            serverSocket = -1
+            SocketStatusModel.shared.update(.stopped)
             return
         }
 
@@ -141,6 +144,8 @@ extension TerminalController {
         guard listen(serverSocket, 128) >= 0 else {
             Logger.socket.error("Failed to listen on socket")
             close(serverSocket)
+            serverSocket = -1
+            SocketStatusModel.shared.update(.stopped)
             return
         }
 
@@ -170,6 +175,8 @@ extension TerminalController {
         Thread.detachNewThread { [weak self] in
             self?.acceptLoop()
         }
+
+        SocketStatusModel.shared.update(.healthy)
     }
 
     nonisolated func stop() {
@@ -179,6 +186,35 @@ extension TerminalController {
             serverSocket = -1
         }
         unlink(socketPath)
+        DispatchQueue.main.async {
+            SocketStatusModel.shared.update(.stopped)
+        }
+    }
+
+    /// Re-establish the control socket — used by both the auto-recovery path
+    /// (abnormal `acceptLoop` exit) and the manual titlebar restart button.
+    ///
+    /// Reuses the last-known `tabManager` / `socketPath` / `accessMode` captured
+    /// by the previous `start()` call. Always forces a clean restart: the inline
+    /// teardown guarantees `start()` does not short-circuit on an already-healthy
+    /// socket (so the manual button always does something), and it is done inline
+    /// rather than via `stop()` because `stop()`'s async `.stopped` status push
+    /// would otherwise land after `start()`'s synchronous `.healthy` push and
+    /// clobber the final state. No app restart required.
+    func recoverSocket() {
+        guard let tabManager else {
+            Logger.socket.error("recoverSocket: no tabManager — cannot restart socket")
+            return
+        }
+        Logger.socket.info("recoverSocket: restarting control socket listener")
+        isRunning = false
+        acceptLoopAlive = false
+        if serverSocket >= 0 {
+            close(serverSocket)
+            serverSocket = -1
+        }
+        unlink(socketPath)
+        start(tabManager: tabManager, socketPath: socketPath, accessMode: accessMode)
     }
 
     func applySocketPermissions() {
@@ -324,9 +360,26 @@ extension TerminalController {
 
     nonisolated func acceptLoop() {
         acceptLoopAlive = true
+        // Distinguishes a normal exit (stop() set isRunning = false, fd already
+        // closed) from an abnormal exit (accept() failed repeatedly and we broke
+        // out while the fd is still bound — the "half-dead listener" state).
+        var abnormalExit = false
         defer {
             acceptLoopAlive = false
             isRunning = false
+            if abnormalExit {
+                // The fd is still bound but no thread is calling accept(), so
+                // new connections get ECONNREFUSED. Close the leaked fd and
+                // restart the listener in place — no app restart needed.
+                if serverSocket >= 0 {
+                    close(serverSocket)
+                    serverSocket = -1
+                }
+                DispatchQueue.main.async {
+                    SocketStatusModel.shared.update(.halfDead)
+                    TerminalController.shared.recoverSocket()
+                }
+            }
         }
 
         var consecutiveFailures = 0
@@ -346,6 +399,7 @@ extension TerminalController {
                     Logger.socket.error("Accept failed (\(consecutiveFailures, privacy: .public) consecutive)")
                     if consecutiveFailures >= 50 {
                         Logger.socket.error("Too many consecutive accept failures, exiting accept loop")
+                        abnormalExit = true
                         break
                     }
                     usleep(10_000) // 10ms backoff

@@ -96,8 +96,9 @@ async fn main() -> anyhow::Result<()> {
 
     // Phase 2: periodic GC sweep every 12 hours (contract §3.3).
     tokio::spawn(async {
-        let mut interval =
-            tokio::time::interval(std::time::Duration::from_secs(headless::meta::GC_INTERVAL_SECS));
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(
+            headless::meta::GC_INTERVAL_SECS,
+        ));
         interval.tick().await; // skip immediate tick (startup already swept)
         loop {
             interval.tick().await;
@@ -207,7 +208,13 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!("headless agents terminated");
 
     // c. Terminate all agent sessions (cleanup worktrees + PIDs)
-    agent_manager.terminate_all(&watcher_handle);
+    // terminate_all() contains a blocking sleep (SIGTERM → wait → SIGKILL), so
+    // offload it to a blocking thread to avoid starving the tokio executor.
+    {
+        let mgr = agent_manager.clone();
+        let wh = watcher_handle.clone();
+        let _ = tokio::task::spawn_blocking(move || mgr.terminate_all(&wh)).await;
+    }
     tracing::info!("agent sessions terminated");
 
     // c. Resume all stopped processes

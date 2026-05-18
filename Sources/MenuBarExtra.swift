@@ -1,6 +1,7 @@
 import AppKit
 import SwiftUI
 import Combine
+import Bonsplit
 @MainActor
 final class MenuBarExtraController: NSObject, NSMenuDelegate {
     private let statusItem: NSStatusItem
@@ -31,6 +32,10 @@ final class MenuBarExtraController: NSObject, NSMenuDelegate {
     private let brewUpdateItem = NSMenuItem(title: "Restart and Update term-mesh", action: nil, keyEquivalent: "")
     private let preferencesItem = NSMenuItem(title: "Preferences…", action: nil, keyEquivalent: "")
     private let quitItem = NSMenuItem(title: "Quit Term-Mesh", action: nil, keyEquivalent: "")
+
+    private let profileSubmenuItem = NSMenuItem(title: "CLI Profile", action: nil, keyEquivalent: "")
+    private let profileSubmenu = NSMenu(title: "CLI Profile")
+    private var profileObserver: NSObjectProtocol?
 
     private var notificationItems: [NSMenuItem] = []
     private let maxInlineNotificationItems = 6
@@ -90,6 +95,14 @@ final class MenuBarExtraController: NSObject, NSMenuDelegate {
             self?.refreshUI()
         }
 
+        profileObserver = NotificationCenter.default.addObserver(
+            forName: .cliActiveProfileChanged,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            self?.updateProfileSubmenu()
+        }
+
         refreshUI()
     }
 
@@ -132,6 +145,10 @@ final class MenuBarExtraController: NSObject, NSMenuDelegate {
         brewUpdateItem.isHidden = true
         menu.addItem(brewUpdateItem)
 
+        profileSubmenuItem.submenu = profileSubmenu
+        menu.addItem(profileSubmenuItem)
+        updateProfileSubmenu()
+
         checkForUpdatesItem.target = self
         checkForUpdatesItem.action = #selector(checkForUpdatesAction)
         menu.addItem(checkForUpdatesItem)
@@ -158,6 +175,7 @@ final class MenuBarExtraController: NSObject, NSMenuDelegate {
 
     func menuWillOpen(_ menu: NSMenu) {
         refreshUI()
+        updateProfileSubmenu()
     }
 
     func refreshForDebugControls() {
@@ -296,6 +314,100 @@ final class MenuBarExtraController: NSObject, NSMenuDelegate {
     @objc private func quitAction() {
         onQuitApp()
     }
+
+    // MARK: - CLI Profile submenu
+
+    private func updateProfileSubmenu() {
+        profileSubmenu.removeAllItems()
+        let cliFamilies = ["claude", "kiro", "codex", "gemini"]
+        for cli in cliFamilies {
+            let familyItem = NSMenuItem(title: cli.capitalized, action: nil, keyEquivalent: "")
+            familyItem.isEnabled = false
+            profileSubmenu.addItem(familyItem)
+
+            let profiles = CLIPathSettings.profiles(for: cli)
+            let active = CLIPathSettings.activeProfile(for: cli)
+
+            if profiles.isEmpty {
+                let emptyItem = NSMenuItem(title: "  (no profiles)", action: nil, keyEquivalent: "")
+                emptyItem.isEnabled = false
+                profileSubmenu.addItem(emptyItem)
+            } else {
+                for profile in profiles {
+                    let item = NSMenuItem(
+                        title: "  \(profile.name)",
+                        action: #selector(switchProfileAction(_:)),
+                        keyEquivalent: ""
+                    )
+                    item.target = self
+                    item.state = (active?.id == profile.id) ? .on : .off
+                    item.representedObject = ProfileMenuItemPayload(profile: profile)
+                    profileSubmenu.addItem(item)
+                }
+            }
+
+            let hasFocusedAgent = focusedAgentPaneInfo(for: cli) != nil
+            let applyItem = NSMenuItem(
+                title: "  Apply to Active Pane (Restart)",
+                action: #selector(applyProfileToActivePaneAction(_:)),
+                keyEquivalent: ""
+            )
+            applyItem.target = self
+            applyItem.representedObject = cli
+            applyItem.isEnabled = hasFocusedAgent
+            if !hasFocusedAgent {
+                applyItem.toolTip = "Focus a \(cli) agent pane to enable"
+            }
+            profileSubmenu.addItem(applyItem)
+
+            profileSubmenu.addItem(.separator())
+        }
+    }
+
+    /// Returns the panel ID and agent info if the currently focused pane belongs to a
+    /// pane-mode agent of the given CLI family.
+    private func focusedAgentPaneInfo(for cli: String) -> (panelId: UUID, teamName: String, agentName: String)? {
+        guard let panelId = AppDelegate.shared?.tabManager?.selectedWorkspace?.focusedPanelId else {
+            return nil
+        }
+        for (teamName, team) in TeamOrchestrator.shared.teams {
+            if let agent = team.agents.first(where: {
+                $0.panelId == panelId && ($0.cli.isEmpty ? "claude" : $0.cli) == cli
+            }) {
+                return (panelId, teamName, agent.name)
+            }
+        }
+        return nil
+    }
+
+    @objc private func switchProfileAction(_ sender: NSMenuItem) {
+        guard let payload = sender.representedObject as? ProfileMenuItemPayload else { return }
+        CLIPathSettings.setActiveProfile(payload.profile, for: payload.profile.family)
+        NotificationCenter.default.post(name: .cliActiveProfileChanged, object: payload.profile)
+        updateProfileSubmenu()
+    }
+
+    @objc private func applyProfileToActivePaneAction(_ sender: NSMenuItem) {
+        guard let cli = sender.representedObject as? String,
+              let info = focusedAgentPaneInfo(for: cli) else { return }
+
+        let alert = NSAlert()
+        alert.messageText = "Restart \(info.agentName) with new profile?"
+        alert.informativeText = "The current pane will be terminated and restarted with the active \(cli) profile."
+        alert.alertStyle = .warning
+        alert.addButton(withTitle: "Restart")
+        alert.addButton(withTitle: "Cancel")
+
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+
+        let panelId = info.panelId
+        #if DEBUG
+        dlog("[cliProfile.applyToPane] hard-restarting panelId=\(panelId.uuidString.prefix(8)) cli=\(cli)")
+        #endif
+        Task { @MainActor in
+            _ = await TeamOrchestrator.shared.restartAgentPaneHard(panelId: panelId)
+        }
+    }
 }
 
 private final class NotificationMenuItemPayload: NSObject {
@@ -305,6 +417,19 @@ private final class NotificationMenuItemPayload: NSObject {
         self.notification = notification
         super.init()
     }
+}
+
+private final class ProfileMenuItemPayload: NSObject {
+    let profile: CliProfile
+
+    init(profile: CliProfile) {
+        self.profile = profile
+        super.init()
+    }
+}
+
+extension Notification.Name {
+    static let cliActiveProfileChanged = Notification.Name("cliActiveProfileChanged")
 }
 
 struct NotificationMenuSnapshot {

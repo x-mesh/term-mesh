@@ -151,10 +151,11 @@ impl CodexUsageTracker {
         // Group panes by cwd.
         let mut panes_by_cwd: HashMap<&str, Vec<(&str, i64, u32)>> = HashMap::new();
         for (panel_id, cwd, proc_start, pid) in panes {
-            panes_by_cwd
-                .entry(cwd.as_str())
-                .or_default()
-                .push((panel_id.as_str(), *proc_start, *pid));
+            panes_by_cwd.entry(cwd.as_str()).or_default().push((
+                panel_id.as_str(),
+                *proc_start,
+                *pid,
+            ));
         }
 
         let mut by_panel = HashMap::new();
@@ -413,9 +414,27 @@ mod tests {
         // 3 rollout sessions, same cwd, same start second. Panes share
         // proc_start; PID order must align 1:1 with rollout-path order.
         let dir = TempDir::new().unwrap();
-        write_rollout(dir.path(), "rollout-a.jsonl", "/team", "2026-01-01T05:00:00.000Z", (111, 0, 0, 0));
-        write_rollout(dir.path(), "rollout-b.jsonl", "/team", "2026-01-01T05:00:00.000Z", (222, 0, 0, 0));
-        write_rollout(dir.path(), "rollout-c.jsonl", "/team", "2026-01-01T05:00:00.000Z", (333, 0, 0, 0));
+        write_rollout(
+            dir.path(),
+            "rollout-a.jsonl",
+            "/team",
+            "2026-01-01T05:00:00.000Z",
+            (111, 0, 0, 0),
+        );
+        write_rollout(
+            dir.path(),
+            "rollout-b.jsonl",
+            "/team",
+            "2026-01-01T05:00:00.000Z",
+            (222, 0, 0, 0),
+        );
+        write_rollout(
+            dir.path(),
+            "rollout-c.jsonl",
+            "/team",
+            "2026-01-01T05:00:00.000Z",
+            (333, 0, 0, 0),
+        );
         let tracker = CodexUsageTracker {
             sessions_dir: dir.path().to_path_buf(),
             state: Arc::new(Mutex::new(CodexState::default())),

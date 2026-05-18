@@ -2,6 +2,96 @@
 
 All notable changes to term-mesh are documented here.
 
+## [Unreleased]
+
+## [0.120.0] - 2026-05-17
+
+### Added
+- **Claude leader/agent에 opus 1M context 모델 선택지** — New Agent Team 다이얼로그의 leader / bulk / per-agent 모델 picker에 `opus (1M context)`가 추가됨. 선택 시 내부적으로 `--model claude-opus-4-7[1m]`가 전달되어 1M 토큰 컨텍스트 변형으로 실행. 마지막 선택값은 AppStorage에 영구 저장되어 다음 다이얼로그부터 기본 선택.
+- **`/tm` 슬래시 커맨드 자동 설치** — 앱이 첫 실행되면 `~/.claude/commands/tm.md`를 번들에서 자동으로 install. 이전 버전은 `team`·`team-up`·`tm-op`·`tm-bench`만 install 됐다.
+
+### Changed
+- **기존 사용자의 슬래시 커맨드 일회성 마이그레이션** — `team.md` / `tm.md` / `team-up.md` / `tm-op.md` / `tm-bench.md` 5개는 term-mesh가 소유권을 갖는 managed 이름으로 지정. 이미 같은 이름의 마커 없는 파일(직접 복사·심볼릭 링크·구버전 잔여물 등)이 있어도 자동으로 `<name>.bak-yyyyMMdd-HHmmss`로 백업한 뒤 번들 버전을 install. 첫 launch 시 일회성으로만 수행되며, 그 외 사용자 커스텀 파일은 그대로 건드리지 않는다.
+- **모델 picker 빈 선택 방지** — leader / bulk / per-agent 모델 picker가 AppStorage에 저장된 모델이 현재 CLI의 목록에 없을 때(예: codex로 바꾼 뒤 claude로 돌아옴) selectbox가 잠깐 비어 보이던 문제를 self-healing 바인딩으로 차단. 잘못된 값은 fallback으로 즉시 정상화된다.
+
+### Thanks to 1 contributor!
+
+- [@JINWOO-J](https://github.com/JINWOO-J)
+
+## [0.119.0] - 2026-05-17
+
+### Added
+- **CLI Profiles** — 여러 개의 named CLI 프로파일(path + extraArgs + env + modelOverride)을 저장하고 메뉴바 / Settings에서 즉시 전환. 같은 CLI(claude / codex / kiro / gemini)라도 모델·인수·환경변수가 다른 여러 구성을 만들어 두고 한 번의 클릭으로 갈아탈 수 있다.
+- **Settings → CLI Paths: Recent/Detected dropdown** — 경로 입력 필드에 자동 감지된 경로와 최근 사용 경로를 드롭다운으로 표시.
+- **CLI Profile 자동 마이그레이션** — 기존 `cliPath.<cli>` 값이 시작 시 자동으로 "Default" 프로파일로 변환. 구버전 빌드 호환을 위해 dual-write 유지.
+- **메뉴바 › CLI Profile 서브메뉴** — CLI별 프로파일 목록을 라디오 항목으로 표시하며 즉시 전환 가능. "Apply to Active Pane (Restart)"로 현재 pane을 새 프로파일로 hard restart.
+- **Pane mode 팀 archive & resume** — 사용자가 split으로 직접 띄운 agent 팀(pane mode)의 leader / agent 구성, 작업 디렉토리, claude session id를 워크스페이스 종료(Cmd+Q) / destroy 시 자동으로 archive. 다음 실행 때 New Agent Team 다이얼로그의 Resume picker에서 leader session id와 마지막 메시지를 보고 한 번에 복원되며, agent들은 이전 대화 컨텍스트를 그대로 이어간다 (leader는 항상 새 세션으로 시작해 stale id 회피).
+- **Resume picker — archive 삭제** — 더 이상 필요 없는 pane 팀 archive를 picker에서 바로 삭제.
+- **`/team` 슬래시 커맨드 — lifecycle 전용으로 분리** — 팀 *구성 편집* 책임만 가지며 `add` / `remove` / `swap` / `ensure` / `status` / `destroy` / `edit` 서브커맨드를 제공. 인자 없이 호출하면 인터랙티브 편집기. GUI 팀에서도 동작 (`tm-agent add`/`remove` RPC 신설). `/tm`(dispatch)과 양방향으로 안내된다.
+- **`/tm --ensure <roles>` 옵션** — fan-out 직전에 누락된 role을 자동으로 보강한 뒤 instruction을 전파. 팀 구성 변경은 명시적 opt-in일 때만 일어난다.
+- **`/tm` 인터랙티브 메뉴** — 인자 없이 호출 시 instruction 입력 + 옵션 선택 UI를 표시.
+- **`/tm` 이질적 fan-out 합성** — reviewer / planner / executor 등 서로 다른 역할의 결과를 3-tier read rules로 자동 종합하고 `[결론] / [충돌] / [다음]` 3줄로 수렴. instruction을 자동 분해해 역할별로 분배하며, `--no-decompose`로 분해를 비활성화할 수 있다.
+
+### Changed
+- **`/team` ↔ `/tm` 책임 분리** — 이전엔 `/team`이 lifecycle + dispatch를 둘 다 처리해 의도가 섞였다. 이제 `/team` = 구성 편집, `/tm` = 실행으로 단일 책임을 가진다. 기존 호출 패턴은 호환되며 인터랙티브 메뉴와 안내 메시지가 신구 사용자를 모두 이끈다.
+- **Pane mode 팀 leader 재개 정책** — resume 시 leader는 항상 새 세션으로 시작 (이전엔 stale session id로 인해 첫 메시지가 무시되는 경우가 있었다). agent들은 자신의 worktree에 기록된 실제 claude session id로 정확히 재개.
+
+### Thanks to 1 contributor!
+
+- [@JINWOO-J](https://github.com/JINWOO-J)
+
+## [0.118.0] - 2026-05-15
+
+### Changed
+- **컨트롤 소켓 상태 버튼 위치 조정** — 0.117.0에서 추가된 소켓 상태/복구 버튼을 타이틀바 정보 행(세션 시간·버전 옆)으로 옮김. 이전 위치에서 윈도우 제목 및 버전 텍스트와 겹치던 문제를 해소.
+
+### Thanks to 1 contributor!
+
+- [@JINWOO-J](https://github.com/JINWOO-J)
+
+## [0.117.0] - 2026-05-15
+
+### Added
+- **컨트롤 소켓 상태 표시 + 자가 복구** — 타이틀바에 컨트롤 소켓 health를 보여주는 버튼이 추가됨(녹색=정상 / 주황=half-dead / 회색=중단). 앱은 떠 있는데 소켓이 "Connection refused"로 응답하지 않던 half-dead 상태를 감지하면, 버튼 클릭만으로 앱 재시작 없이 리스너를 그 자리에서 복구한다. accept 루프가 비정상 종료(연속 50회 실패)하면 누수된 fd를 닫고 리스너를 자동으로 재시작.
+
+### Thanks to 1 contributor!
+
+- [@JINWOO-J](https://github.com/JINWOO-J)
+
+## [0.116.0] - 2026-05-15
+
+### Fixed
+- **IME 입력 박스 높이 확대** — 입력 박스가 너무 낮아 `@`(에이전트 멘션) / `/`(슬래시 커맨드) 자동완성 팝업이 잘리던 문제. 기본 높이를 2배로 늘려 팝업이 온전히 보이며, 이전에 직접 키워 둔 사용자 설정은 그대로 유지.
+- **에이전트에 보낸 Return이 씹히던 문제** — 리더가 `tm-agent send`/`delegate`로 에이전트 pane에 빠르게 연속 전송할 때 paste와 Return이 겹쳐 매 두 번째 입력이 통째로 누락되던 버그. pane별로 전송을 직렬화하고 Return 재시도 간격을 조정해 해소.
+- **에이전트/패널을 닫아도 자식 CLI 프로세스가 고아로 남던 문제** — claude / codex / gemini 등 에이전트 CLI 프로세스가 패널 종료 후에도 백그라운드에 살아 있던 문제를 수정.
+- **에이전트 종료 시 관련 없는 프로세스가 함께 종료되던 문제** — 에이전트를 종료할 때 프로세스 그룹 처리가 부정확해 같은 부모를 공유하는 다른 프로세스까지 영향을 받을 수 있던 문제를 수정.
+
+### Thanks to 1 contributor!
+
+- [@JINWOO-J](https://github.com/JINWOO-J)
+
+## [0.115.0] - 2026-05-14
+
+### Added
+- **`/tm` 슬래시 커맨드 — 팀 일괄 dispatch** — 한 줄 instruction을 활성 팀의 모든 idle agent에게 동시에 위임하고 결과를 `[결론] / [충돌] / [다음]` 3줄로 수렴. `/tm-op`(10+ 전략)의 경량 진입점으로, 라운드·전략 선택 없이 "지금 전원 동원" 한 가지만 한다. `/team`과 양방향으로 연결되어 New 사용자가 `/tm`만 알아도 `/team`의 low-level 명령을 자연스럽게 발견.
+- **Gemini CLI agent 지원** — 팀 구성 시 claude / codex / kiro에 더해 gemini agent를 띄울 수 있음.
+- **New Agent Team 다이얼로그 — Smart Preset 추가/삭제** — preset 목록 끝의 점선 "+" 카드로 새 preset을 그 자리에서 즉석 생성(이름 입력 후 자동 저장), 카드에 hover하면 "×"로 삭제. built-in preset은 🔒로 보호되어 삭제 대신 Reset만 가능. preset이 하나도 없을 땐 "+" 카드가 전체 폭으로 확장.
+- **Pane mode agent 사이드바 토큰 표시** — 이전엔 headless agent만 토큰 카운터가 보였으나, 이제 사용자가 직접 split에 띄운 Claude / Codex agent도 input·output 토큰이 사이드바에 표시됨. 같은 작업 디렉토리를 공유하는 여러 agent도 프로세스 시작 시각으로 각자의 세션을 구분해 정확히 귀속. Codex는 rollout 로그를 직접 파싱해 input / output / cached를 정확히 분리.
+- **작업 중 agent 스피너** — task가 `in_progress`인 agent row에 정적 dot 대신 애니메이션 스피너가 표시되어 지금 일하는 agent를 한눈에 구분.
+
+### Fixed
+- **Enter 씹힘 — 두 개의 별개 경로 모두 수정** — (1) IME 조립 중 Enter를 누르면 Ghostty의 composing 가드가 `\r`을 삼키던 문제, (2) 리더가 `tm-agent send`/`delegate`로 pane에 메시지를 주입할 때 paste watchdog 타임아웃 후 Return 재시도가 통째로 skip되던 문제. 두 경로 다 막혀 텍스트는 들어가는데 실행이 안 되던 증상을 해소.
+- **슬립에서 깨어난 후 검은 pane** — wake 이벤트를 합쳐 agent surface를 다시 그리도록 수정.
+- **New Agent Team — leader 모델 선택이 저장되지 않던 문제** — leader 모델 / 모드가 팀 생성 성공 직후에만 저장되도록 변경. 이전 세션의 다른 CLI 모델이 남아 모델 셀렉트 박스가 빈 상태로 보이던 문제도 함께 해소. 미완성·중복 Smart Preset은 실행 시 자동 정리.
+- **사이드바 토큰 카운터가 누적 합계를 표시하던 문제** — 같은 작업 디렉토리의 과거 세션 전체가 합산돼 수치가 부풀던 문제를 현재 세션만 표시하도록 수정. Codex 토큰은 전체 합(total)을 output 칸에 잘못 넣던 것을 input / output / cached로 정확히 분리.
+
+### Changed
+- **사이드바 토큰 라벨 간결화** — `13 in · 1.1k out` → `13↑ 1.1k↓`로 축약, 상세는 hover tooltip으로 이동.
+
+### Thanks to 1 contributor!
+
+- [@JINWOO-J](https://github.com/JINWOO-J)
+
 ## [0.114.0] - 2026-05-13
 
 ### Added

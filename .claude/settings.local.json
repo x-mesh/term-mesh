@@ -26,7 +26,12 @@
       "mcp__mem-mesh__pin_complete",
       "Bash(git add *)",
       "Bash(git reset *)",
-      "Bash(git commit -m ' *)"
+      "Bash(git commit -m ' *)",
+      "Bash(git --no-pager branch)",
+      "Bash(git --no-pager log --oneline -5)",
+      "Bash(git checkout *)",
+      "Bash(git --no-pager log --oneline -3)",
+      "Bash(git stash *)"
     ]
   },
   "enabledPlugins": {
