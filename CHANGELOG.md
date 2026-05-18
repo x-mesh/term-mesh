@@ -4,6 +4,42 @@ All notable changes to term-mesh are documented here.
 
 ## [Unreleased]
 
+## [0.122.0] - 2026-05-18
+
+### Added
+- **Gemini CLI 도구 지원** — daemon이 gemini를 1급 CLI로 인식. agent를 gemini로 attach/create 가능하고 IME 입력 box 슬래시 alias도 gemini pane에서 동작.
+- **Pane mode 팀의 토큰 카운트 표시 부활** — Claude agent는 `~/.claude/projects/<encoded-wd>/<sid>.jsonl` FSEvents 감시로, Codex agent는 rollout JSONL 파싱으로 각 pane의 실시간 input/output 토큰 사용량을 사이드바에 표시. 같은 host에 여러 pane이 있어도 process start-time을 tiebreaker로 사용해 정확히 1-to-1 라우팅.
+- **사이드바 active task spinner** — agent가 in_progress 상태일 때 작은 spinner가 돌아 어떤 agent가 현재 실제로 작업 중인지 한눈에 식별.
+- **Team Create — Smart Preset 추가/삭제 UI** — 자주 쓰는 role mix를 직접 grid에 추가하고 제거 가능. 사용 빈도/최근성 기반 자동 추천 위에 사용자 정의 preset을 영구 저장한다.
+- **Codex IME slash alias 정식 지원** — Codex pane의 IME 입력 box에서도 `/team`·`/team-up`·`/tm`·`/tm-op`를 그대로 입력하면 `.codex/prompts/*.md` 기반 풀 프롬프트로 자동 확장. Claude pane의 슬래시 커맨드와 동일한 사용 경험.
+
+### Fixed
+- **사이드바 update pill이 항상 *가장 최신* 버전 표시** — 이전엔 사용자 로컬 brew tap 클론이 stale이면 한 단계 옛 버전(예: 0.121)만 보여서 latest까지 도달하려면 여러 번 update해야 했다. 이제 boot 시점과 매 시간 tap refresh 직후에 outdated check를 자동 chain해 pill이 항상 truly-latest를 보여준다.
+- **Resumable Teams 좀비 archive 제거** — destroyed로 표시되지만 휴지통만 누를 수 있는 좀비 entry가 쌓이던 문제. archive_pane RPC가 매번 새 UUID를 발급해 중복 archive가 양산되던 것을 idempotent(replace-in-place)로 정정. pane 팀 종료 시 실제 Claude session id를 FSEventStream으로 캡처해 archive에 함께 저장하므로 다음 launch에서 Resume 버튼이 정상적으로 활성화된다. 부팅 시 session id가 빠진 기존 좀비 archive는 자동 GC.
+- **슬립/웨이크 후 agent pane 검은 화면** — wake 이벤트가 너무 빠르게 연속될 때 일부 agent pane이 그려지지 않고 검게 남아있던 문제. wake 이벤트를 coalesce하고 surface를 강제 redraw해 해결.
+- **`--model` 인수 zsh glob expansion (`opus-1m`)** — leader를 `opus-1m`로 adopt할 때 zsh가 `1m`을 glob으로 해석해 실패하던 문제. 모든 `--model` 값을 quote해 회피.
+- **delegate/send 직후 Return key swallow** — Path C 경로에서 delegate/send 호출 직후 보낸 Return이 swallow되어 명령이 전송되지 않던 문제. Return key 자동 retry 추가.
+- **사이드바 토큰 카운트 — 현재 세션 기준** — 이전엔 누적 토큰이 표시되어 실제 이번 대화에서 얼마나 썼는지 알기 어려웠다. 이제 현재 진행 중인 session의 토큰만 보고.
+- **사이드바 토큰 라벨 정리** — 불필요한 "(sess)" 접미사 제거로 간결화.
+- **Codex rollout JSONL — input/output 토큰 분리 파싱** — Codex의 input/output 토큰이 합산되어 표시되던 문제 수정.
+- **Team Create 실패 시 leader model이 영구 저장되던 문제** — 팀 생성이 실패해도 leader model 선택이 AppStorage에 박혀 다음 다이얼로그에 잘못된 기본값으로 남던 문제 수정. 이제 성공 시에만 persist.
+- **Smart Preset grid 중복 제거 + abandoned blank 정리** — 같은 role 조합이 여러 번 노출되거나 빈 preset이 grid에 남던 문제 수정.
+- **Gemini runbook 경로 복원** — daemon이 Gemini runbook을 `$HOME/.agents/skills`에서 찾도록 경로 복원.
+- **머지 중복 broadcaster 제거** — origin/main merge 후 broadcaster가 중복 등록되어 동일 이벤트를 두 번 처리하던 문제 수정.
+
+### Thanks to 1 contributor!
+
+- [@JINWOO-J](https://github.com/JINWOO-J)
+
+## [0.121.0] - 2026-05-18
+
+### Fixed
+- **IME composition 중 Enter swallow** — 한글 등 IME 조합 중에 Return으로 조합을 종료(빈 markedText)할 때 Swift가 여전히 `composing=true`로 키 이벤트를 보내 Ghostty의 `key_encode.zig` 가드에서 `\r`이 PTY에 도달하지 못하던 문제. Return-clearing-IME에 한해 Escape 예외와 동일하게 `composing=false`를 설정해 줄바꿈/제출이 정상 동작하도록 수정.
+
+### Thanks to 1 contributor!
+
+- [@JINWOO-J](https://github.com/JINWOO-J)
+
 ## [0.120.0] - 2026-05-17
 
 ### Added
