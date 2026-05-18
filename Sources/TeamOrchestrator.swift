@@ -25,6 +25,12 @@ final class TeamOrchestrator: ObservableObject {
         /// without rebuilding the AgentMember from scratch.
         var panelId: UUID?
         var parentSessionId: String?
+        /// Real Claude CLI session id (UUID written by Claude to
+        /// `~/.claude/projects/<encoded-workdir>/<sid>.jsonl`). Captured at
+        /// pane spawn time via FSEventStream and used as the authoritative
+        /// `session_id` for archive_pane / pane-resume. Distinct from
+        /// `parentSessionId`, which is term-mesh's routing UUID.
+        var claudeSessionId: String?
         let createdAt: Date
         // Worktree isolation
         var worktreeName: String?
@@ -57,8 +63,14 @@ final class TeamOrchestrator: ObservableObject {
         var sharedWorktreeName: String?
         var sharedWorktreePath: String?
         var sharedWorktreeBranch: String?
-        /// Phase 2 — stable headless team UUID returned by `headless.create_team` /
-        /// `headless.resume_team`. Nil for pane-mode (non-headless) teams.
+        /// Stable team UUID used by the daemon for archive identity.
+        /// - Pane-mode: Swift generates this at team creation (createTeam) so
+        ///   archive_pane → resume_pane → destroy round-trips use the same
+        ///   uuid. Without it, the daemon falls back to grace mode and
+        ///   produces a fresh archive per cycle (D1/D2 same-uuid replacement
+        ///   degrades).
+        /// - Headless: backfilled from `headless.create_team` /
+        ///   `headless.resume_team` result (line ~1085).
         var teamUuid: String? = nil
     }
 
@@ -670,6 +682,20 @@ final class TeamOrchestrator: ObservableObject {
             : "\(colorEmoji) \(agentName)"
         workspace.setPanelCustomTitle(panelId: panel.id, title: paneTitle)
 
+        // For claude panes: register an FSEventStream watcher on
+        // `~/.claude/projects/<encoded-workdir>/` so the real Claude session
+        // id (written to <sid>.jsonl) can be captured asynchronously and
+        // back-filled into `claudeSessionId`. Other CLIs skip this — they
+        // don't write into ~/.claude/projects/.
+        if agentCli == "claude" {
+            ClaudeSessionWatcher.shared.bindIfNeeded()
+            ClaudeSessionWatcher.shared.registerPendingClaudePane(
+                teamName: teamName,
+                agentName: agentName,
+                workDir: agentWorkDir
+            )
+        }
+
         return AgentMember(
             id: agentId,
             name: agentName,
@@ -683,6 +709,7 @@ final class TeamOrchestrator: ObservableObject {
             workspaceId: workspace.id,
             panelId: panel.id,
             parentSessionId: leaderSessionId,
+            claudeSessionId: nil,
             createdAt: Date(),
             worktreeName: worktreeName,
             worktreePath: worktreePath,
@@ -1110,6 +1137,7 @@ final class TeamOrchestrator: ObservableObject {
                     workspaceId: workspace.id,
                     panelId: nil, // headless — no real panel
                     parentSessionId: leaderSessionId,
+                    claudeSessionId: nil,
                     createdAt: Date(),
                     worktreeName: nil,
                     worktreePath: nil,
@@ -1281,6 +1309,13 @@ final class TeamOrchestrator: ObservableObject {
             }
         }
 
+        // D3-A P1-A: fresh pane teams must carry a stable teamUuid from
+        // creation. Without it, archive_pane sends an empty team_uuid and
+        // the daemon's same-uuid replacement (D1/D2) degrades into grace
+        // mode — each destroy/resume cycle produces a fresh archive instead
+        // of overwriting the prior one. Headless teams skip this branch and
+        // get their uuid backfilled by `headless.create_team` (line ~1085).
+        let paneTeamUuid = UUID().uuidString
         let team = Team(
             id: name,
             leaderSessionId: leaderSessionId,
@@ -1296,7 +1331,8 @@ final class TeamOrchestrator: ObservableObject {
             worktreeMode: worktreeMode,
             sharedWorktreeName: sharedWtName,
             sharedWorktreePath: sharedWtPath,
-            sharedWorktreeBranch: sharedWtBranch
+            sharedWorktreeBranch: sharedWtBranch,
+            teamUuid: paneTeamUuid
         )
         teams[name] = team
         // Register in thread-safe data store for off-main access (approach C: dual queue)
@@ -1457,7 +1493,10 @@ final class TeamOrchestrator: ObservableObject {
             team = existing
         } else {
             let workspaceDirectory = workspace.currentDirectory
-            // First attach: register workspace-local team with caller pane as adopted leader
+            // First attach: register workspace-local team with caller pane as adopted leader.
+            // D3-A P1-A (extension): assign a stable teamUuid at creation so
+            // archive_pane carries the same identity across destroy/resume —
+            // mirrors the createTeam fix at line ~1319.
             team = Team(
                 id: teamName,
                 leaderSessionId: "leader-attach-\(UUID().uuidString.prefix(8))",
@@ -1473,7 +1512,8 @@ final class TeamOrchestrator: ObservableObject {
                 worktreeMode: "off",
                 sharedWorktreeName: nil,
                 sharedWorktreePath: nil,
-                sharedWorktreeBranch: nil
+                sharedWorktreeBranch: nil,
+                teamUuid: UUID().uuidString
             )
         }
 
@@ -1600,6 +1640,17 @@ final class TeamOrchestrator: ObservableObject {
         }
 
         let agent = team.agents[agentIndex]
+
+        // D3-A P2 (b): release any pending claude-sid watcher slot so the
+        // FSEventStream tears down promptly. Safe to call regardless of cli.
+        if agent.cli == "claude" {
+            let workDir = agent.worktreePath ?? agent.originalAgentWorkDir ?? team.workingDirectory
+            ClaudeSessionWatcher.shared.unregisterPendingClaudePane(
+                teamName: teamName,
+                agentName: agentName,
+                workDir: workDir
+            )
+        }
 
         // Close the pane if the workspace still exists.
         // `Workspace.closePanel` is idempotent — returns false if the panel
@@ -3343,6 +3394,17 @@ final class TeamOrchestrator: ObservableObject {
         // don't block destroy. Headless teams are archived daemon-side by
         // `headless.destroy_team` and never enter this code path.
         archivePaneTeamIfApplicable(team)
+
+        // D3-A P2 (b): release any pending claude-sid watcher slots so
+        // FSEventStream(s) for this team's workdirs tear down promptly.
+        for agent in team.agents where agent.cli == "claude" {
+            let workDir = agent.worktreePath ?? agent.originalAgentWorkDir ?? team.workingDirectory
+            ClaudeSessionWatcher.shared.unregisterPendingClaudePane(
+                teamName: name,
+                agentName: agent.name,
+                workDir: workDir
+            )
+        }
         guard let workspace = tabManager.tabs.first(where: { $0.id == team.workspaceId }) else {
             cleanupWorktrees(team: team)
             clearResults(teamName: name)
@@ -3473,11 +3535,13 @@ final class TeamOrchestrator: ObservableObject {
             )
         }
 
-        // Phase 2: per-agent claude session IDs (captured at archive time via
-        // sidebar token tracker, stored in AgentMember.parentSessionId). Passed
-        // into createTeam so each claude agent CLI starts with `--resume <sid>`
-        // and re-attaches to its previous transcript. Codex/kiro/gemini agents
-        // currently ignore this; resume support for them is a follow-up.
+        // Phase 2 (D3-A): per-agent Claude session IDs captured at archive
+        // time via FSEventStream-based sid discovery, stored in
+        // AgentMember.claudeSessionId (NOT parentSessionId — that's the
+        // term-mesh routing UUID). Passed into createTeam so each claude
+        // agent CLI starts with `--resume <sid>` and re-attaches to its
+        // previous transcript. Codex/kiro/gemini agents currently ignore
+        // this; resume support for them is a follow-up.
         var agentResumeMap: [String: String] = [:]
         for a in agentsArr {
             guard let name = a["name"] as? String,
@@ -3530,7 +3594,9 @@ final class TeamOrchestrator: ObservableObject {
                 t.agents = t.agents.map { member in
                     var m = member
                     if let sid = archivedSessionsByName[member.name] {
-                        m.parentSessionId = sid
+                        // Store as claudeSessionId (the real Claude sid).
+                        // parentSessionId stays as the term-mesh routing UUID.
+                        m.claudeSessionId = sid
                     }
                     return m
                 }
@@ -3605,6 +3671,7 @@ final class TeamOrchestrator: ObservableObject {
                 workspaceId: workspace.id,
                 panelId: nil, // headless — no real panel (resumed team)
                 parentSessionId: leaderSessionId,
+                claudeSessionId: nil,
                 createdAt: Date(),
                 worktreeName: worktreeName,
                 worktreePath: worktreePath,
@@ -3649,9 +3716,7 @@ final class TeamOrchestrator: ObservableObject {
     /// name mirrors what claude itself produces (`/` → `-`).
     private static func discoverClaudeSessionId(workingDirectory: String) -> String? {
         guard !workingDirectory.isEmpty else { return nil }
-        let encoded = workingDirectory.replacingOccurrences(of: "/", with: "-")
-        let home = FileManager.default.homeDirectoryForCurrentUser.path
-        let dir = "\(home)/.claude/projects/\(encoded)"
+        let dir = ClaudeSessionWatcher.encodedProjectDir(workDir: workingDirectory)
         let fm = FileManager.default
         guard fm.fileExists(atPath: dir),
               let items = try? fm.contentsOfDirectory(atPath: dir) else { return nil }
@@ -3659,8 +3724,7 @@ final class TeamOrchestrator: ObservableObject {
         for item in items {
             guard item.hasSuffix(".jsonl") else { continue }
             let sid = String(item.dropLast(6))
-            // claude session ids are RFC4122 UUIDs (8-4-4-4-12 = 36 chars, 4 dashes).
-            guard sid.count == 36, sid.filter({ $0 == "-" }).count == 4 else { continue }
+            guard ClaudeSessionWatcher.isValidSid(sid) else { continue }
             let path = "\(dir)/\(item)"
             guard let attrs = try? fm.attributesOfItem(atPath: path),
                   let mtime = attrs[.modificationDate] as? Date else { continue }
@@ -3669,6 +3733,21 @@ final class TeamOrchestrator: ObservableObject {
             }
         }
         return best?.sid
+    }
+
+    /// D3-A: callback installed by `ClaudeSessionWatcher.bindIfNeeded()`
+    /// when the first claude pane is spawned. Stamps the captured Claude sid
+    /// onto the matching `AgentMember.claudeSessionId` and syncs daemon state.
+    fileprivate func applyClaudeSessionId(teamName: String, agentName: String, sid: String) {
+        guard var team = teams[teamName] else { return }
+        guard let idx = team.agents.firstIndex(where: { $0.name == agentName }) else { return }
+        if team.agents[idx].claudeSessionId == sid { return }
+        team.agents[idx].claudeSessionId = sid
+        teams[teamName] = team
+        syncTeamStateToDaemon()
+        #if DEBUG
+        dlog("[claude.sid.captured] team=\(teamName) agent=\(agentName) sid=\(sid)")
+        #endif
     }
 
     /// Phase 2 (pane-mode resume): on destroy of a pane-mode team, ship a
@@ -3732,20 +3811,30 @@ final class TeamOrchestrator: ObservableObject {
                     "agent_type": a.agentType,
                     "color": a.color,
                 ]
-                // Per-agent claude session id. Only safe to discover when the
-                // agent has its OWN worktree (1-to-1 mapping). When agents share
-                // the team workdir, mtime-based discovery returns the same jsonl
-                // for every agent — almost always the leader's — which causes
-                // resume to rehydrate every pane with the leader's conversation.
-                // Leave session_id nil in that case so the team is marked
-                // `no_sessions` rather than silently corrupting on resume.
-                // Also drop the value if it collides with the leader sid even
-                // when a worktree path is set (catches edge cases like a freshly
-                // created worktree where claude hasn't yet written a transcript
-                // and discovery falls through to the parent dir).
-                if let wt = a.worktreePath, !wt.isEmpty, wt != team.workingDirectory,
-                   let sid = Self.discoverClaudeSessionId(workingDirectory: wt),
-                   !sid.isEmpty, sid != leaderSid {
+                // Per-agent claude session id — D3-A priority:
+                //   1. `claudeSessionId` captured at pane spawn by the
+                //      FSEventStream watcher (authoritative 1-to-1 mapping,
+                //      works even when agents share the team workdir).
+                //   2. `discoverClaudeSessionId(worktreePath)` fallback —
+                //      only safe when the agent has its own worktree distinct
+                //      from the team workdir, since mtime-based discovery in
+                //      a shared dir returns the same jsonl for every agent.
+                //   3. nil → daemon marks the team `no_sessions` rather than
+                //      silently corrupting on resume.
+                // Always reject the leader sid as a collision guard (catches
+                // the freshly-created-worktree edge case where claude has
+                // not yet written a transcript and discovery falls through).
+                let captured = (a.claudeSessionId?.nilIfBlank).flatMap { sid -> String? in
+                    sid != leaderSid ? sid : nil
+                }
+                let fallback: String? = {
+                    guard captured == nil,
+                          let wt = a.worktreePath, !wt.isEmpty, wt != team.workingDirectory,
+                          let sid = Self.discoverClaudeSessionId(workingDirectory: wt),
+                          !sid.isEmpty, sid != leaderSid else { return nil }
+                    return sid
+                }()
+                if let sid = captured ?? fallback {
                     row["session_id"] = sid
                 }
                 if !a.instructions.isEmpty {
@@ -3754,6 +3843,13 @@ final class TeamOrchestrator: ObservableObject {
                 return row
             },
         ]
+        // D3-A: include the headless team_uuid so the backend can round-trip
+        // a resumed team to the same archive on next destroy. Empty/nil is
+        // accepted by the daemon's grace-mode parser, so we send the field
+        // whenever it's known.
+        if let uuid = team.teamUuid, !uuid.isEmpty {
+            payload["team_uuid"] = uuid
+        }
         // git_root drives the "this repo" filter in the resume picker. Pane
         // teams created with worktreeMode = "off" leave `team.gitRepoRoot`
         // nil, so fall back to discovering it from the team's working
@@ -4839,5 +4935,219 @@ private extension String {
     var nilIfBlank: String? {
         let trimmed = trimmingCharacters(in: .whitespacesAndNewlines)
         return trimmed.isEmpty ? nil : trimmed
+    }
+}
+
+// MARK: - ClaudeSessionWatcher (D3-A)
+//
+// Watches `~/.claude/projects/<encoded-workdir>/` per active workdir and
+// attributes each newly created `<sid>.jsonl` to the most recently spawned
+// (LIFO) claude pane registered for that workdir. The Claude CLI creates its
+// transcript file shortly after spawn, so this lets us back-fill the real
+// session id onto `AgentMember.claudeSessionId` without polling.
+//
+// Race handling: caller (`addAgentPaneToWorkspace`) is invoked serially from
+// the `createTeam` loop on the main actor, so registrations land in spawn
+// order. A 5-minute pending-entry TTL drops stale registrations whose Claude
+// process never produced a transcript (e.g. CLI launch error).
+
+@MainActor
+final class ClaudeSessionWatcher {
+    static let shared = ClaudeSessionWatcher()
+
+    private struct Pending {
+        let teamName: String
+        let agentName: String
+        let registeredAt: Date
+    }
+
+    private struct WatchState {
+        var stream: FSEventStreamRef?
+        var pending: [Pending] = []
+        var knownSids: Set<String> = []
+    }
+
+    private var states: [String: WatchState] = [:]
+    private var bound = false
+
+    static func encodedProjectDir(workDir: String) -> String {
+        let encoded = workDir.replacingOccurrences(of: "/", with: "-")
+        let home = FileManager.default.homeDirectoryForCurrentUser.path
+        return "\(home)/.claude/projects/\(encoded)"
+    }
+
+    /// claude session ids are RFC4122 UUIDs (8-4-4-4-12 = 36 chars, 4 dashes).
+    static func isValidSid(_ s: String) -> Bool {
+        return s.count == 36 && s.filter({ $0 == "-" }).count == 4
+    }
+
+    /// Wire the resolve callback into TeamOrchestrator. Idempotent — only
+    /// the first call installs the closure.
+    func bindIfNeeded() {
+        guard !bound else { return }
+        bound = true
+    }
+
+    /// Register an agent pane that just spawned `claude` and is awaiting its
+    /// real session id. The next new `<sid>.jsonl` appearing in this workdir
+    /// is attributed to the most recently registered pending pane (LIFO),
+    /// matching the spec for "가장 최근 spawn agent에 sid 귀속".
+    func registerPendingClaudePane(teamName: String, agentName: String, workDir: String) {
+        let dir = Self.encodedProjectDir(workDir: workDir)
+        // Make sure the dir exists so FSEvents has something to watch.
+        try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+
+        var state = states[dir] ?? WatchState()
+        if state.knownSids.isEmpty,
+           let items = try? FileManager.default.contentsOfDirectory(atPath: dir) {
+            for item in items where item.hasSuffix(".jsonl") {
+                let sid = String(item.dropLast(6))
+                if Self.isValidSid(sid) { state.knownSids.insert(sid) }
+            }
+        }
+        state.pending.append(Pending(teamName: teamName, agentName: agentName, registeredAt: Date()))
+        if state.stream == nil {
+            state.stream = makeStream(forDir: dir)
+        }
+        states[dir] = state
+
+        #if DEBUG
+        dlog("[claude.sid.watch] register team=\(teamName) agent=\(agentName) dir=\(dir) pending=\(state.pending.count) known=\(state.knownSids.count)")
+        #endif
+
+        // D3-A P2 (a): safety net — if Claude never writes a transcript (CLI
+        // launch error, user kills pane before first response, etc.) the
+        // pending entry would otherwise linger because TTL drains only on
+        // scan(). Force a sweep at 5 min so the watcher tears down cleanly.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 300) { [weak self] in
+            guard let self else { return }
+            self.expirePendingIfStillRegistered(dir: dir, teamName: teamName, agentName: agentName)
+        }
+    }
+
+    /// D3-A P2 (b): called from pane teardown (detachAgent / destroyTeam) so
+    /// a normally-closed pane releases its pending slot immediately rather
+    /// than waiting for the 5-min safety net. Idempotent.
+    func unregisterPendingClaudePane(teamName: String, agentName: String, workDir: String) {
+        let dir = Self.encodedProjectDir(workDir: workDir)
+        guard var state = states[dir] else { return }
+        let before = state.pending.count
+        state.pending.removeAll { $0.teamName == teamName && $0.agentName == agentName }
+        let removed = before - state.pending.count
+        states[dir] = state
+        #if DEBUG
+        if removed > 0 {
+            dlog("[claude.sid.watch] unregister team=\(teamName) agent=\(agentName) dir=\(dir) removed=\(removed) remaining=\(state.pending.count)")
+        }
+        #endif
+        if state.pending.isEmpty {
+            tearDown(dir: dir)
+        }
+    }
+
+    private func expirePendingIfStillRegistered(dir: String, teamName: String, agentName: String) {
+        guard var state = states[dir] else { return }
+        let before = state.pending.count
+        state.pending.removeAll { $0.teamName == teamName && $0.agentName == agentName }
+        let removed = before - state.pending.count
+        guard removed > 0 else { return }
+        states[dir] = state
+        #if DEBUG
+        dlog("[claude.sid.watch] expire team=\(teamName) agent=\(agentName) dir=\(dir) (5min safety-net)")
+        #endif
+        if state.pending.isEmpty {
+            tearDown(dir: dir)
+        }
+    }
+
+    private func makeStream(forDir dir: String) -> FSEventStreamRef? {
+        var ctx = FSEventStreamContext(
+            version: 0,
+            info: Unmanaged.passUnretained(self).toOpaque(),
+            retain: nil,
+            release: nil,
+            copyDescription: nil
+        )
+        // We don't decode the per-event payload — FSEvents coalesces and we
+        // scan every active dir on each fire. Cheap (<= a handful of dirs).
+        let callback: FSEventStreamCallback = { _, _, _, _, _, _ in
+            DispatchQueue.main.async {
+                ClaudeSessionWatcher.shared.scanAll()
+            }
+        }
+        let paths = [dir] as CFArray
+        let flags = UInt32(kFSEventStreamCreateFlagFileEvents | kFSEventStreamCreateFlagNoDefer)
+        guard let stream = FSEventStreamCreate(
+            kCFAllocatorDefault,
+            callback,
+            &ctx,
+            paths,
+            FSEventStreamEventId(kFSEventStreamEventIdSinceNow),
+            0.1, // 100ms coalescing
+            flags
+        ) else { return nil }
+        FSEventStreamSetDispatchQueue(stream, DispatchQueue.main)
+        FSEventStreamStart(stream)
+        return stream
+    }
+
+    private func scanAll() {
+        for dir in Array(states.keys) {
+            scan(dir: dir)
+        }
+    }
+
+    private func scan(dir: String) {
+        guard var state = states[dir] else { return }
+        guard let items = try? FileManager.default.contentsOfDirectory(atPath: dir) else { return }
+        var resolved: [(team: String, agent: String, sid: String)] = []
+        // Drop pending registrations older than 5 minutes — the Claude
+        // process clearly didn't make it to first-response.
+        let cutoff = Date().addingTimeInterval(-300)
+        state.pending.removeAll { $0.registeredAt < cutoff }
+
+        // D3-A P1-B: `contentsOfDirectory` returns items in unspecified order,
+        // so when FSEvents coalesces multiple .jsonl creations into one batch,
+        // iterating raw would cross-wire sids onto the wrong agents. Build
+        // (sid, mtime) tuples first, then sort newest-first so the newest
+        // transcript pairs with the newest pending registration (LIFO).
+        let fm = FileManager.default
+        let candidates: [(sid: String, mtime: Date)] = items.compactMap { item in
+            guard item.hasSuffix(".jsonl") else { return nil }
+            let sid = String(item.dropLast(6))
+            guard Self.isValidSid(sid) else { return nil }
+            let path = "\(dir)/\(item)"
+            guard let attrs = try? fm.attributesOfItem(atPath: path),
+                  let mtime = attrs[.modificationDate] as? Date else { return nil }
+            return (sid, mtime)
+        }
+        for c in candidates.sorted(by: { $0.mtime > $1.mtime }) {
+            guard !state.knownSids.contains(c.sid) else { continue }
+            state.knownSids.insert(c.sid)
+            guard let target = state.pending.popLast() else {
+                #if DEBUG
+                dlog("[claude.sid.watch] new sid=\(c.sid) dir=\(dir) but no pending agent — drop")
+                #endif
+                continue
+            }
+            resolved.append((target.teamName, target.agentName, c.sid))
+        }
+        states[dir] = state
+        for r in resolved {
+            TeamOrchestrator.shared.applyClaudeSessionId(teamName: r.team, agentName: r.agent, sid: r.sid)
+        }
+        if state.pending.isEmpty {
+            tearDown(dir: dir)
+        }
+    }
+
+    private func tearDown(dir: String) {
+        guard let state = states.removeValue(forKey: dir), let stream = state.stream else { return }
+        FSEventStreamStop(stream)
+        FSEventStreamInvalidate(stream)
+        FSEventStreamRelease(stream)
+        #if DEBUG
+        dlog("[claude.sid.watch] teardown dir=\(dir)")
+        #endif
     }
 }

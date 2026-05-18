@@ -92,6 +92,12 @@ async fn main() -> anyhow::Result<()> {
         if removed > 0 {
             tracing::info!("headless gc: removed {removed} archived team(s) on startup");
         }
+        let zombies = headless::meta::sweep_zombie_pane_archives();
+        if zombies > 0 {
+            tracing::info!(
+                "headless gc: removed {zombies} zombie pane archive(s) on startup"
+            );
+        }
     });
 
     // Phase 2: periodic GC sweep every 12 hours (contract §3.3).
@@ -102,7 +108,11 @@ async fn main() -> anyhow::Result<()> {
         interval.tick().await; // skip immediate tick (startup already swept)
         loop {
             interval.tick().await;
-            let _ = tokio::task::spawn_blocking(headless::meta::gc_sweep).await;
+            let _ = tokio::task::spawn_blocking(|| {
+                headless::meta::gc_sweep();
+                headless::meta::sweep_zombie_pane_archives();
+            })
+            .await;
         }
     });
 

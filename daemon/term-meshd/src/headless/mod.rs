@@ -3,7 +3,7 @@ pub mod cli_builder;
 pub mod meta;
 pub mod protocol;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -401,6 +401,34 @@ pub struct HeadlessManager {
     pub current_runbook_digest_hash: Option<String>,
     /// Same as above for `claude --version`.
     pub current_claude_cli_version: Option<String>,
+    /// D2 in-flight guard: team_uuids whose `archive_pane_team` is currently
+    /// executing. Prevents concurrent archive of the same team racing on the
+    /// rename step. Outer `tokio::Mutex` on `HeadlessManager` already serializes
+    /// RPC handlers, but this guard documents intent and remains correct if the
+    /// archive path becomes finer-grained in the future.
+    ///
+    /// Held behind `Arc` so an `InFlightGuard` (RAII Drop) can outlive the
+    /// `&mut self` borrow on `archive_pane_team` and release the slot under
+    /// every exit path — `?` early-return, normal return, AND panic unwind.
+    archive_in_flight: Arc<std::sync::Mutex<HashSet<String>>>,
+}
+
+/// RAII release of an `archive_in_flight` slot. Removed under Drop so any
+/// exit path — including panic unwinds inside `archive_pane_team` — frees the
+/// uuid for the next caller. Lock poisoning is swallowed silently: a poisoned
+/// mutex already implies a previous panic, and there is no useful recovery
+/// path from inside `Drop`.
+struct InFlightGuard {
+    set: Arc<std::sync::Mutex<HashSet<String>>>,
+    key: String,
+}
+
+impl Drop for InFlightGuard {
+    fn drop(&mut self) {
+        if let Ok(mut s) = self.set.lock() {
+            s.remove(&self.key);
+        }
+    }
 }
 
 /// Internal spawn parameters that carry Phase 2 metadata (session id + raw
@@ -439,6 +467,7 @@ impl HeadlessManager {
             idle_park_minutes: cfg.idle_park_minutes,
             current_runbook_digest_hash: None,
             current_claude_cli_version: None,
+            archive_in_flight: Arc::new(std::sync::Mutex::new(HashSet::new())),
         }
     }
 
@@ -1130,18 +1159,90 @@ impl HeadlessManager {
         &mut self,
         params: ArchivePaneParams,
     ) -> Result<ArchivePaneResult, String> {
-        let team_uuid = match params.team_uuid {
-            Some(s) if !s.is_empty() => meta::parse_uuid(&s)?,
-            _ => meta::new_uuid(),
+        // D1: team_uuid grace mode. Swift already holds Team.teamUuid; future
+        // versions will hard-reject missing/empty uuids with `invalid_params`.
+        let team_uuid = match params.team_uuid.as_deref() {
+            Some(s) if !s.is_empty() => meta::parse_uuid(s)?,
+            _ => {
+                let fallback = meta::new_uuid();
+                tracing::warn!(
+                    "archive_pane: missing team_uuid for team_name={} — falling back to {} (grace mode; future versions will reject)",
+                    params.team_name,
+                    fallback
+                );
+                fallback
+            }
         };
+
+        // D2: in-flight guard. Reject concurrent archive of the same uuid so
+        // two racing callers can't trample each other's rename step. The
+        // returned `InFlightGuard` releases the slot on Drop — covers `?`
+        // early-return, normal return, AND panic unwind.
+        let _in_flight = {
+            let mut guard = self
+                .archive_in_flight
+                .lock()
+                .map_err(|e| format!("archive_in_flight lock poisoned: {e}"))?;
+            if !guard.insert(team_uuid.clone()) {
+                return Err(format!(
+                    "in_flight: archive already running for team_uuid={team_uuid}"
+                ));
+            }
+            drop(guard);
+            InFlightGuard {
+                set: Arc::clone(&self.archive_in_flight),
+                key: team_uuid.clone(),
+            }
+        };
+
         let now = meta::now_unix();
+
+        // D2: replace-in-place. Drop any prior archived dirs for this uuid
+        // plus any orphan live dir from a crashed/aborted previous run.
+        let mut replaced = false;
+        match meta::list_archived_teams() {
+            Ok(entries) => {
+                for e in entries.into_iter().filter(|e| e.team_uuid == team_uuid) {
+                    match std::fs::remove_dir_all(&e.archived_dir) {
+                        Ok(_) => {
+                            replaced = true;
+                            tracing::info!(
+                                "archive_pane: replaced stale archive {} (uuid={})",
+                                e.archived_dir.display(),
+                                team_uuid
+                            );
+                        }
+                        Err(err) => {
+                            tracing::warn!(
+                                "archive_pane: failed to remove stale archive {}: {err}",
+                                e.archived_dir.display()
+                            );
+                        }
+                    }
+                }
+            }
+            Err(err) => {
+                tracing::warn!("archive_pane: scan archived dirs failed: {err}");
+            }
+        }
+        let live_dir = meta::team_dir(&team_uuid);
+        if live_dir.exists() {
+            std::fs::remove_dir_all(&live_dir)
+                .map_err(|err| format!("clear orphan live dir {}: {err}", live_dir.display()))?;
+            replaced = true;
+            tracing::info!(
+                "archive_pane: cleared orphan live dir {} (uuid={})",
+                live_dir.display(),
+                team_uuid
+            );
+        }
 
         // Build TeamMeta — mirrors headless format with execution_mode = "pane".
         let team_meta = meta::TeamMeta {
             schema: meta::SCHEMA_VERSION,
             team_uuid: team_uuid.clone(),
             team_name: params.team_name.clone(),
-            created_at: now, // best effort — Swift doesn't always know exact creation epoch
+            created_at: now,
             destroyed_at: Some(now),
             working_directory: params.working_directory.clone(),
             git_root: params.git_root.clone(),
@@ -1153,7 +1254,11 @@ impl HeadlessManager {
                     .filter(|s| !s.is_empty()),
             },
             agents: params.agents.iter().map(|a| a.name.clone()).collect(),
-            worktree: match (params.worktree_mode.as_deref(), params.worktree_path.as_deref(), params.worktree_branch.as_deref()) {
+            worktree: match (
+                params.worktree_mode.as_deref(),
+                params.worktree_path.as_deref(),
+                params.worktree_branch.as_deref(),
+            ) {
                 (Some(m), Some(p), Some(b)) if !m.is_empty() && !p.is_empty() => {
                     Some(meta::WorktreeMeta {
                         mode: m.to_string(),
@@ -1173,7 +1278,6 @@ impl HeadlessManager {
             runbook_digest_hash: None,
         };
 
-        // Create dirs.
         meta::create_dir_secure(&meta::team_dir(&team_uuid))
             .map_err(|e| format!("create team dir: {e}"))?;
         meta::create_dir_secure(&meta::agents_subdir(&team_uuid))
@@ -1181,10 +1285,8 @@ impl HeadlessManager {
         meta::create_dir_secure(&meta::instructions_subdir(&team_uuid))
             .map_err(|e| format!("create instructions subdir: {e}"))?;
 
-        // Write team.json.
         meta::write_team_meta(&team_meta)?;
 
-        // Write per-agent meta + instructions.
         for a in &params.agents {
             let instr_bytes = a.instructions.as_deref().unwrap_or("").as_bytes();
             let instr_sha = if instr_bytes.is_empty() {
@@ -1215,18 +1317,19 @@ impl HeadlessManager {
             meta::write_agent_meta(&agent_meta)?;
         }
 
-        // Rename live → archived.<ts>.
         let archived = meta::rename_to_archived(&team_uuid, now)?;
         tracing::info!(
-            "archived pane-mode team {} ({}) → {}",
+            "archived pane-mode team {} ({}) → {} (replaced={replaced})",
             params.team_name,
             team_uuid,
             archived.display()
         );
         Ok(ArchivePaneResult {
-            team_uuid,
+            team_uuid: team_uuid.clone(),
             archived_path: archived.to_string_lossy().into_owned(),
+            replaced,
         })
+        // `_in_flight` drops here, removing the slot.
     }
 
     /// Resume metadata for a pane-mode archive. Returns the team meta + per-agent
@@ -1794,6 +1897,17 @@ impl HeadlessManager {
         git_root_filter: Option<&str>,
         limit: usize,
     ) -> ListResumableResult {
+        // D4: lazy zombie sweep — drop pane archives that can never be resumed
+        // (leader + all agents lack session_id) so the picker never shows them.
+        // Cheap relative to the scan that follows; cleans up immediately after
+        // a buggy/aborted archive instead of waiting for the periodic timer.
+        let zombies = meta::sweep_zombie_pane_archives();
+        if zombies > 0 {
+            tracing::info!(
+                "headless gc: removed {zombies} zombie pane archive(s) during list_resumable"
+            );
+        }
+
         let archived = match meta::list_archived_teams() {
             Ok(v) => v,
             Err(e) => {
@@ -2275,6 +2389,10 @@ pub struct ArchivePaneAgent {
 pub struct ArchivePaneResult {
     pub team_uuid: String,
     pub archived_path: String,
+    /// D2: `true` when this call removed at least one prior archive or orphan
+    /// live dir for the same `team_uuid` before writing the new archive.
+    /// Backward-compatible — older Swift clients ignore unknown fields.
+    pub replaced: bool,
 }
 
 /// Params for `team.resume_pane` — pure metadata read. Unlike
@@ -2718,5 +2836,204 @@ mod tests {
         }"#;
         let parsed: meta::AgentMeta = serde_json::from_str(json).unwrap();
         assert!(parsed.usage_total.is_none());
+    }
+
+    // ────────────────────────────────────────────────────────────────────
+    // D1 + D2 + D4: pane-mode archive_pane / zombie sweep
+    // ────────────────────────────────────────────────────────────────────
+
+    fn sample_archive_params(team_uuid: Option<String>) -> ArchivePaneParams {
+        ArchivePaneParams {
+            team_uuid,
+            team_name: "iso".into(),
+            leader_session_id: "lead-sid".into(),
+            leader_mode: "claude".into(),
+            leader_model: "sonnet".into(),
+            working_directory: "/tmp/iso".into(),
+            git_root: None,
+            git_branch_at_create: None,
+            worktree_mode: None,
+            worktree_path: None,
+            worktree_branch: None,
+            agents: vec![ArchivePaneAgent {
+                name: "explorer".into(),
+                cli: "claude".into(),
+                model: "sonnet".into(),
+                agent_type: "explorer".into(),
+                color: None,
+                session_id: Some("agent-sid".into()),
+                instructions: Some("test".into()),
+            }],
+            termmesh_app_version: Some("0.0.0-test".into()),
+        }
+    }
+
+    #[test]
+    fn archive_pane_replaces_in_place_for_same_uuid() {
+        let _scope = scoped_root();
+        let mut mgr = HeadlessManager::new();
+        let team_uuid = "22222222-3333-4444-5555-666666666666".to_string();
+
+        let r1 = mgr
+            .archive_pane_team(sample_archive_params(Some(team_uuid.clone())))
+            .expect("first archive");
+        assert!(!r1.replaced, "first archive should not replace");
+        assert_eq!(r1.team_uuid, team_uuid);
+
+        let r2 = mgr
+            .archive_pane_team(sample_archive_params(Some(team_uuid.clone())))
+            .expect("second archive");
+        assert!(r2.replaced, "second archive must replace the first");
+        assert_eq!(r2.team_uuid, team_uuid);
+
+        let archived = meta::list_archived_teams().unwrap();
+        let matching: Vec<_> = archived
+            .iter()
+            .filter(|e| e.team_uuid == team_uuid)
+            .collect();
+        assert_eq!(
+            matching.len(),
+            1,
+            "exactly one archived dir per uuid after replace"
+        );
+    }
+
+    #[test]
+    fn archive_pane_grace_mode_assigns_uuid_when_missing() {
+        let _scope = scoped_root();
+        let mut mgr = HeadlessManager::new();
+
+        let r = mgr
+            .archive_pane_team(sample_archive_params(None))
+            .expect("grace-mode archive");
+        assert!(!r.team_uuid.is_empty(), "fallback uuid was assigned");
+        assert!(!r.replaced);
+    }
+
+    #[test]
+    fn sweep_zombie_pane_archives_removes_all_session_none() {
+        let _scope = scoped_root();
+        let team_uuid = "33333333-4444-5555-6666-777777777777".to_string();
+        let destroyed_at = 1_000_000u64;
+        let archived = meta::headless_root()
+            .join(format!("{team_uuid}.archived.{destroyed_at}"));
+        std::fs::create_dir_all(archived.join("agents")).unwrap();
+
+        let team_meta = meta::TeamMeta {
+            schema: meta::SCHEMA_VERSION,
+            team_uuid: team_uuid.clone(),
+            team_name: "zombie".into(),
+            created_at: destroyed_at - 100,
+            destroyed_at: Some(destroyed_at),
+            working_directory: "/tmp".into(),
+            git_root: None,
+            git_branch_at_create: None,
+            leader: meta::LeaderMeta {
+                mode: "claude".into(),
+                model: "sonnet".into(),
+                session_id: None,
+            },
+            agents: vec!["a".into()],
+            worktree: None,
+            execution_mode: "pane".into(),
+            claude_cli_version: None,
+            termmesh_app_version: "test".into(),
+            app_socket_path_at_create: None,
+            runbook_digest_hash: None,
+        };
+        std::fs::write(
+            archived.join("team.json"),
+            serde_json::to_vec_pretty(&team_meta).unwrap(),
+        )
+        .unwrap();
+        let agent_meta = meta::AgentMeta {
+            schema: meta::SCHEMA_VERSION,
+            team_uuid: team_uuid.clone(),
+            name: "a".into(),
+            agent_type: "explorer".into(),
+            cli: "claude".into(),
+            model: "sonnet".into(),
+            session_id: None,
+            color: None,
+            created_at: destroyed_at - 100,
+            instructions_sha256: None,
+            cli_path_at_create: None,
+            parked: false,
+            usage_total: None,
+            extra_args: Vec::new(),
+            extra_env: std::collections::HashMap::new(),
+        };
+        std::fs::write(
+            archived.join("agents/a.json"),
+            serde_json::to_vec_pretty(&agent_meta).unwrap(),
+        )
+        .unwrap();
+
+        let removed = meta::sweep_zombie_pane_archives();
+        assert_eq!(removed, 1);
+        assert!(!archived.exists(), "zombie archive must be removed");
+    }
+
+    #[test]
+    fn in_flight_guard_releases_on_panic() {
+        use std::panic::{catch_unwind, AssertUnwindSafe};
+        let set: Arc<std::sync::Mutex<HashSet<String>>> =
+            Arc::new(std::sync::Mutex::new(HashSet::new()));
+        set.lock().unwrap().insert("k".to_string());
+        let captured = Arc::clone(&set);
+        let res = catch_unwind(AssertUnwindSafe(|| {
+            let _g = InFlightGuard {
+                set: Arc::clone(&captured),
+                key: "k".to_string(),
+            };
+            panic!("boom");
+        }));
+        assert!(res.is_err(), "panic must propagate from catch_unwind");
+        assert!(
+            set.lock().unwrap().is_empty(),
+            "InFlightGuard must release the slot during panic unwind"
+        );
+    }
+
+    #[test]
+    fn sweep_zombie_pane_archives_keeps_headless_mode_and_with_session() {
+        let _scope = scoped_root();
+        // pane-mode but with leader session_id → must NOT be removed.
+        let team_uuid = "44444444-5555-6666-7777-888888888888".to_string();
+        let destroyed_at = 1_000_001u64;
+        let archived = meta::headless_root()
+            .join(format!("{team_uuid}.archived.{destroyed_at}"));
+        std::fs::create_dir_all(archived.join("agents")).unwrap();
+        let team_meta = meta::TeamMeta {
+            schema: meta::SCHEMA_VERSION,
+            team_uuid: team_uuid.clone(),
+            team_name: "alive".into(),
+            created_at: destroyed_at - 100,
+            destroyed_at: Some(destroyed_at),
+            working_directory: "/tmp".into(),
+            git_root: None,
+            git_branch_at_create: None,
+            leader: meta::LeaderMeta {
+                mode: "claude".into(),
+                model: "sonnet".into(),
+                session_id: Some("lead-sid".into()),
+            },
+            agents: vec![],
+            worktree: None,
+            execution_mode: "pane".into(),
+            claude_cli_version: None,
+            termmesh_app_version: "test".into(),
+            app_socket_path_at_create: None,
+            runbook_digest_hash: None,
+        };
+        std::fs::write(
+            archived.join("team.json"),
+            serde_json::to_vec_pretty(&team_meta).unwrap(),
+        )
+        .unwrap();
+
+        let removed = meta::sweep_zombie_pane_archives();
+        assert_eq!(removed, 0);
+        assert!(archived.exists(), "archive with leader session must remain");
     }
 }
