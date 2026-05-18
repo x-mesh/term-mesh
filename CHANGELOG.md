@@ -4,6 +4,31 @@ All notable changes to term-mesh are documented here.
 
 ## [Unreleased]
 
+## [0.121.0] - 2026-05-18
+
+### Added
+- **Gemini CLI 에이전트 지원** — New Agent Team에서 Gemini CLI 기반 에이전트를 추가할 수 있음. 팀 생성 시 Gemini 에이전트가 올바른 경로(`~/.agents/skills/`)로 runbook을 읽어 실행.
+- **에이전트 사이드바 실시간 토큰 사용량** — Claude(JSONL FSEvents) / Codex(rollout JSONL) 에이전트의 input·output 토큰을 사이드바에서 현재 세션 기준으로 실시간 표시. leader 토큰 사용량도 팀 확장 행에 표시.
+- **pane별 세션 바인딩** — 프로세스 시작 시간(`proc_start_unix`) 기준으로 pane과 agent 세션을 1:1 매핑해 동시 spawn 시에도 토큰 귀속이 정확.
+- **Team Creation Smart Preset 추가/삭제 UI** — 팀 생성 그리드에서 프리셋을 직접 추가·삭제 가능.
+- **진행 중 태스크 스피너** — 사이드바의 `in_progress` 태스크에 스피너 인디케이터 표시.
+
+### Fixed
+- **Opus 1M 리더/에이전트가 뜨지 않는 버그** — `claude-opus-4-7[1m]`의 `[1m]`이 zsh에서 glob 패턴으로 해석되어 커맨드 실행이 실패하던 문제 수정. `--model` 인자를 single-quote로 보호.
+- **Return키가 IME 조합 해제 시 삼켜지는 버그** — IME 조합을 커밋 없이 취소(Return)할 때 `composing=true` 플래그가 잘못 설정되어 `\r`이 Ghostty에 전달되지 않던 문제 수정.
+- **`delegate`/`send` 후 Return키 재시도 누락** — Path C(텍스트 전달 실패)에서 Return키 재시도가 항상 수행되도록 수정.
+- **시스템 sleep/wake 후 에이전트 pane 검은 화면** — wake 이벤트를 병합·지연 처리하고 모든 에이전트 surface를 강제 재드로우.
+- **팀 생성 실패 시 리더 모델 선택이 초기화되는 버그** — `createTeam`이 성공한 경우에만 AppStorage에 저장하도록 수정.
+- **Team Preset 그리드 중복/빈 항목** — Smart Preset 그리드에서 중복 항목과 방치된 빈 행 제거.
+- **사이드바 토큰 카운터가 누적값 표시** — 현재 세션의 토큰만 표시하도록 수정.
+- **Codex 토큰 input/output 분리 오류** — rollout JSONL 파싱을 수정해 input·output 토큰을 올바르게 분리.
+- **에이전트 결과 파일 동시 쓰기 시 손상** — 원자적 쓰기(임시 파일 → rename)와 고정 경로(`<task_id>.md`)로 전환.
+- **동시 pane spawn 시 세션 바인딩 오류** — 같은 초에 생성된 pane들을 PID tiebreaker로 구분.
+
+### Thanks to 1 contributor!
+
+- [@JINWOO-J](https://github.com/JINWOO-J)
+
 ## [0.120.0] - 2026-05-17
 
 ### Added
