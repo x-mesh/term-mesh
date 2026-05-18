@@ -837,6 +837,20 @@ final class TerminalSurface: Identifiable, ObservableObject {
 
         flushPendingTextIfNeeded()
 
+        // Register the PTY data callback so we can detect when the child
+        // process (claude / codex / shell) starts writing output — that's
+        // our cleanest signal that its stdin reader is alive. Used by
+        // processPaste to gate cold-start pastes. The callback fires on
+        // ghostty's IO thread and must be non-blocking; we only flip a
+        // single Bool flag (the surface ref is retained for the lifetime
+        // of this surface, so a raw unmanaged pointer is safe).
+        let surfaceRef = Unmanaged.passUnretained(self).toOpaque()
+        ghostty_surface_set_pty_data_callback(createdSurface, { userdata, _, _ in
+            guard let userdata else { return }
+            let surface = Unmanaged<TerminalSurface>.fromOpaque(userdata).takeUnretainedValue()
+            surface.markPtyOutputReceived()
+        }, surfaceRef)
+
 #if DEBUG
         let runtimeFontText = termMeshCurrentSurfaceFontSizePoints(createdSurface).map {
             String(format: "%.2f", $0)
@@ -1105,6 +1119,10 @@ final class TerminalSurface: Identifiable, ObservableObject {
         let needsReturn: Bool
         let enqueuedAt: TimeInterval
         let completion: ((Result<Void, PasteSendError>) -> Void)?
+        /// Number of times this paste has been deferred while waiting for
+        /// the TUI's PTY output to confirm it's ready to read input. Capped
+        /// inside processPaste so a never-output child doesn't stall forever.
+        var tuiReadyDeferCount: Int = 0
     }
     private var pasteQueue: [PendingPaste] = []
     private var pasteInFlight: Bool = false
@@ -1115,6 +1133,31 @@ final class TerminalSurface: Identifiable, ObservableObject {
     /// pipeline aren't yet warm — first long paste needs extra drain time
     /// before we can safely fire the text_delivered ack.
     private var hasCompletedPaste: Bool = false
+    /// Flipped to true the first time ghostty's pty_data_callback fires —
+    /// i.e., the child process (claude / codex / shell) has written its
+    /// first byte to the PTY. This is the cleanest available proxy for
+    /// "the TUI's stdin reader loop is alive and ready to receive input."
+    ///
+    /// Used by processPaste to defer the first paste on a cold surface
+    /// until the TUI has started outputting; without this gate the paste
+    /// truncates at exactly the same byte position every run, because
+    /// the TUI's input buffer hasn't been allocated yet.
+    ///
+    /// Atomic / lock-free read from main thread is safe because:
+    /// - The callback runs on ghostty's IO reader thread
+    /// - We only ever transition false → true (never back)
+    /// - Bool reads/writes are atomic on supported architectures
+    /// Marked @atomic via NSLock for strict ordering on weakly-ordered hosts.
+    private var _hasReceivedPtyOutput: Bool = false
+    private let ptyOutputLock = NSLock()
+    var hasReceivedPtyOutput: Bool {
+        ptyOutputLock.lock(); defer { ptyOutputLock.unlock() }
+        return _hasReceivedPtyOutput
+    }
+    fileprivate func markPtyOutputReceived() {
+        ptyOutputLock.lock(); defer { ptyOutputLock.unlock() }
+        _hasReceivedPtyOutput = true
+    }
     private static let maxPasteQueueDepth = 16
 
     /// Enqueues text+Return for serialized delivery via the paste queue,
@@ -1238,6 +1281,44 @@ final class TerminalSurface: Identifiable, ObservableObject {
             pasteQueue.insert(p, at: 0)
             return
         }
+
+        // Cold-start gate: before the very first paste on this surface,
+        // wait until ghostty's pty_data_callback has fired at least once —
+        // i.e., the child process has written its first byte. This is the
+        // cleanest proxy for "TUI stdin reader loop is alive." Without it,
+        // long pastes get truncated at a deterministic byte position because
+        // the TUI hasn't allocated its input buffer yet.
+        //
+        // Polled at 100 ms cadence, capped at 25 attempts (~2.5 s total).
+        // After the cap we proceed anyway as a last resort — a child that
+        // never outputs (silent script) shouldn't deadlock paste forever.
+        if !hasCompletedPaste, !hasReceivedPtyOutput, p.tuiReadyDeferCount < 25 {
+            pasteInFlight = false  // unlock the queue so drain can re-enter
+            pasteQueue.insert(p, at: 0)  // put this paste back at the head
+            var deferred = p
+            deferred.tuiReadyDeferCount += 1
+            // We re-queued above, so increment the count on the head entry.
+            pasteQueue[0] = deferred
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) { [weak self] in
+                self?.drainPasteQueue()
+            }
+            #if DEBUG
+            if deferred.tuiReadyDeferCount == 1 {
+                dlog("paste.defer.tui_cold panel=\(id.uuidString.prefix(8)) textLen=\(p.text.count) (waiting for first PTY output)")
+            }
+            #endif
+            return
+        }
+        #if DEBUG
+        if !hasCompletedPaste {
+            if hasReceivedPtyOutput {
+                dlog("paste.cold.ready panel=\(id.uuidString.prefix(8)) defers=\(p.tuiReadyDeferCount) textLen=\(p.text.count)")
+            } else {
+                dlog("paste.cold.fallback panel=\(id.uuidString.prefix(8)) defers=\(p.tuiReadyDeferCount) textLen=\(p.text.count) (no PTY output observed in 2.5s, proceeding)")
+            }
+        }
+        #endif
+
         pasteInFlight = true
         pasteGeneration &+= 1
         let gen = pasteGeneration
@@ -1293,19 +1374,14 @@ final class TerminalSurface: Identifiable, ObservableObject {
             // with the ~2000-char agent init prompt — first ~700 chars submit,
             // the rest is discarded).
             //
-            // Drain wait after the (chunked) paste finishes.
-            //
-            // Empirical: chunking + 2ms yields alone did NOT prevent first-pane
-            // truncation — the first pane reliably truncated at the same byte
-            // position regardless of chunk size. The cause is cold-start: the
-            // ghostty surface and Claude TUI's input pipeline aren't ready to
-            // receive paste bytes for the first ~1s of life. Until then any
-            // paste content lands in a void and is silently lost.
-            //
-            // Fix: substantial cold-start bonus on the first paste per surface.
-            // Warm pastes use a small base so subsequent sends stay snappy.
+            // Drain wait after the (chunked) paste finishes. Cold-start is
+            // now handled by the pty_data_callback ready gate at the top of
+            // processPaste, so we no longer need a "cold bonus" here — the
+            // gate guarantees the TUI was alive when we started the paste.
+            // Keep a small base so the last chunk has time to land in PTY
+            // before the Rust CLI fires Enter via team.send_key.
             let baseMs = max(15, min(120, p.text.count / 32))
-            let coldBonusMs = self.hasCompletedPaste ? 0 : 800
+            let coldBonusMs = 0
             let waitMs = baseMs + coldBonusMs
             DispatchQueue.main.asyncAfter(deadline: .now() + Double(waitMs) / 1000.0) { [weak self] in
                 guard let self else { return }
@@ -1537,6 +1613,12 @@ final class TerminalSurface: Identifiable, ObservableObject {
             #if DEBUG
             dlog("surface.free.perform surface=\(surfaceId.uuidString.prefix(8)) reason=\(reason)")
             #endif
+            // Clear our pty_data_callback first so it can't fire mid-free
+            // and dereference a freed Surface pointer via the userdata
+            // unmanaged ref (which points to `self`, kept alive by the
+            // surrounding TerminalSurface — but ghostty_surface_free can
+            // trigger one last drain from the IO thread).
+            ghostty_surface_clear_pty_data_callback(surface)
             ghostty_surface_free(surface)
             callbackContext?.release()
         }
