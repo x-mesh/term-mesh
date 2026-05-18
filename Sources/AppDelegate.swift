@@ -223,6 +223,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         DispatchQueue.main.async {
             TeamTemplateManager.shared.ensureSeeded()
             XmOpToastChecker.checkOnLaunch()
+            // Phase B4: start the GUI agent auto-reply poller. Headless agents
+            // get auto-reply via the daemon's PTY reader; GUI agents need this
+            // scrollback-polling path because ghostty owns their PTY.
+            AutoReplyPoller.shared.ensureRunning()
         }
 
 #if DEBUG
