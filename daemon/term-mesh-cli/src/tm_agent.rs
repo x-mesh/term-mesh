@@ -2327,8 +2327,11 @@ mod runbook_tests {
 
     #[test]
     fn return_retry_policy_is_conservative_when_text_delivery_failed() {
-        assert_eq!(return_retry_delays_ms(true), &[250, 400, 600, 800, 1000, 1500, 2500, 4000]);
-        assert_eq!(return_retry_delays_ms(false), &[200, 500, 1000, 2000]);
+        assert_eq!(return_retry_delays_ms(true, "team.send"), &[250, 400, 600, 800, 1000, 1500, 2500, 4000]);
+        assert_eq!(return_retry_delays_ms(false, "team.send"), &[200, 500, 1000, 2000]);
+        // Init prompt path gets a longer first delay so long pastes settle
+        // in the TUI input field before Enter is sent.
+        assert_eq!(return_retry_delays_ms(true, "team.create.init"), &[800, 800, 1000, 1500, 2500, 4000]);
     }
 }
 
@@ -3300,7 +3303,18 @@ fn select_reply_task(sock: &PathBuf, team: &str, sender: &str) -> (Option<String
     (selected, all)
 }
 
-fn return_retry_delays_ms(text_delivered: bool) -> &'static [u64] {
+fn return_retry_delays_ms(text_delivered: bool, context: &str) -> &'static [u64] {
+    // Long-paste contexts: the init prompt and (less often) the delegate
+    // payload can run into hundreds of bytes, which Claude TUI takes
+    // noticeably longer to render into its input field than codex. The
+    // first 250 ms delay tuned for codex is not enough for those cases —
+    // ghostty_surface_key reports success but the Enter lands before the
+    // TUI has the input field focused, so it gets swallowed silently
+    // (Swift's per-attempt retry can't help since each attempt also
+    // reports success). Bump the first delay to 800 ms here.
+    if context == "team.create.init" {
+        return &[800, 800, 1000, 1500, 2500, 4000];
+    }
     if text_delivered {
         // First delay raised from 20 ms → 250 ms so the Return key arrives after
         // codex has fully rendered the pasted text and is ready to accept input.
@@ -3325,7 +3339,7 @@ fn send_return_key_with_retry(
     text_delivered: bool,
     context: &str,
 ) -> bool {
-    let delays = return_retry_delays_ms(text_delivered);
+    let delays = return_retry_delays_ms(text_delivered, context);
     eprintln!(
         "send_key.skip_or_retry context={context} text_delivered={text_delivered} attempts={} delays_ms={}",
         delays.len(),
