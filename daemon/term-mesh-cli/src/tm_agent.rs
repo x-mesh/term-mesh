@@ -2329,9 +2329,9 @@ mod runbook_tests {
     fn return_retry_policy_is_conservative_when_text_delivery_failed() {
         assert_eq!(return_retry_delays_ms(true, "team.send"), &[250, 400, 600, 800, 1000, 1500, 2500, 4000]);
         assert_eq!(return_retry_delays_ms(false, "team.send"), &[200, 500, 1000, 2000]);
-        // Init prompt path gets a longer first delay so long pastes settle
-        // in the TUI input field before Enter is sent.
-        assert_eq!(return_retry_delays_ms(true, "team.create.init"), &[800, 800, 1000, 1500, 2500, 4000]);
+        // Init prompt path now uses the same cadence as team.send — paste
+        // truncation is handled by chunking in Swift, not by Rust delays.
+        assert_eq!(return_retry_delays_ms(true, "team.create.init"), &[250, 400, 600, 800, 1000, 1500, 2500, 4000]);
     }
 }
 
@@ -3304,17 +3304,13 @@ fn select_reply_task(sock: &PathBuf, team: &str, sender: &str) -> (Option<String
 }
 
 fn return_retry_delays_ms(text_delivered: bool, context: &str) -> &'static [u64] {
-    // Long-paste contexts: the init prompt and (less often) the delegate
-    // payload can run into hundreds of bytes, which Claude TUI takes
-    // noticeably longer to render into its input field than codex. The
-    // first 250 ms delay tuned for codex is not enough for those cases —
-    // ghostty_surface_key reports success but the Enter lands before the
-    // TUI has the input field focused, so it gets swallowed silently
-    // (Swift's per-attempt retry can't help since each attempt also
-    // reports success). Bump the first delay to 800 ms here.
-    if context == "team.create.init" {
-        return &[800, 800, 1000, 1500, 2500, 4000];
-    }
+    // Long-paste contexts (init prompt, delegate payload) used to need an
+    // 800ms first delay to avoid the paste truncation race. That race is
+    // now resolved at the source by chunking ghostty_surface_text calls in
+    // Swift's processPaste, so the init path can use the default cadence.
+    // Keeping the branch as a no-op for easy future tuning if a regression
+    // surfaces; the explicit context match documents the historical issue.
+    let _ = context;
     if text_delivered {
         // First delay raised from 20 ms → 250 ms so the Return key arrives after
         // codex has fully rendered the pasted text and is ready to accept input.
@@ -5521,16 +5517,6 @@ fn run_create(
             }
 
             eprintln!("Sending init prompts to non-kiro agents...");
-            // Cold-start protection for the first agent. Subsequent agents
-            // get a 1s inter-send delay (below) that incidentally warms them
-            // up, but the FIRST agent has no such cushion — its ghostty
-            // IO thread + TUI input pipeline are freshly spawned and have
-            // been observed to truncate long pastes (the ~2000-char init
-            // prompt) even with the Swift-side cold bonus. Give them 2s.
-            if !non_kiro.is_empty() {
-                eprintln!("  ...warming up before first init (2s)");
-                thread::sleep(Duration::from_secs(2));
-            }
             for a in &non_kiro {
                 let name = a["name"].as_str().unwrap_or("");
                 let role = a["agent_type"].as_str().unwrap_or(name);

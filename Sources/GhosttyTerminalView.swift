@@ -1244,18 +1244,40 @@ final class TerminalSurface: Identifiable, ObservableObject {
         startPasteWatchdog(generation: gen, instructionLength: p.text.count, completion: p.completion)
 
         if !p.text.isEmpty {
-            let data = p.text.utf8
-            let len = UInt(data.count)
-            data.withContiguousStorageIfAvailable { buf in
-                ghostty_surface_text(surface, buf.baseAddress, len)
-            } ?? p.text.withCString { cstr in
-                ghostty_surface_text(surface, cstr, len)
+            // Chunked paste: ghostty_surface_text appears to have an internal
+            // input buffer that truncates large single-shot pastes (observed:
+            // ~700-char cutoff at exactly the same position regardless of
+            // timing, ruling out a Swift-side race). Splitting into 256-char
+            // chunks with a 2ms yield between each lets ghostty's IO thread
+            // drain the buffer between calls, removing the size ceiling.
+            // Side effect: removes the need for the large drain wait + cold
+            // bonus that earlier attempts piled on.
+            //
+            // Char-based chunking (not byte) so we never split a multi-byte
+            // UTF-8 codepoint mid-sequence.
+            let chunkChars = 256
+            let chars = Array(p.text)
+            var idx = 0
+            while idx < chars.count {
+                let end = min(idx + chunkChars, chars.count)
+                let chunk = String(chars[idx..<end])
+                let data = chunk.utf8
+                let len = UInt(data.count)
+                data.withContiguousStorageIfAvailable { buf in
+                    ghostty_surface_text(surface, buf.baseAddress, len)
+                } ?? chunk.withCString { cstr in
+                    ghostty_surface_text(surface, cstr, len)
+                }
+                idx = end
+                if idx < chars.count {
+                    usleep(2_000) // 2ms yield per chunk for ghostty IO thread
+                }
             }
             #if DEBUG
-            dlog("paste.text.sent gen=\(gen) textLen=\(p.text.count)")
+            dlog("paste.text.sent gen=\(gen) textLen=\(p.text.count) chunks=\((chars.count + chunkChars - 1) / chunkChars)")
             #endif
             if p.needsReturn {
-                usleep(5_000) // 5ms — let IO thread flush paste to PTY before Return
+                usleep(5_000) // 5ms — let IO thread flush final chunk before Return
             }
         }
 
@@ -1271,18 +1293,12 @@ final class TerminalSurface: Identifiable, ObservableObject {
             // with the ~2000-char agent init prompt — first ~700 chars submit,
             // the rest is discarded).
             //
-            // Heuristic:
-            // - Base: max(50ms, min(800ms, len/8)) — scales with paste size.
-            //   2026-05-18: bumped from len/16 to len/8 after observing the
-            //   first pane in a 4-agent spawn still truncating with the
-            //   smaller ratio. ghostty's IO thread + the TUI's input pipeline
-            //   take longer than the linear estimate on first-touch.
-            // - Cold-start bonus: +1000ms on the first paste per surface,
-            //   when ghostty + the TUI haven't warmed their IO/render
-            //   pipelines yet. 300ms was insufficient; 1000ms gives the
-            //   cold first-pane enough headroom to drain before Enter.
-            let baseMs = max(50, min(800, p.text.count / 8))
-            let coldBonusMs = self.hasCompletedPaste ? 0 : 1000
+            // Drain wait after the (now chunked) paste finishes. Chunking
+            // already gave the IO thread 2ms per 256 chars to drain, so this
+            // final wait only needs to cover the last-chunk straggler.
+            // Keep small so simple pastes don't pay latency.
+            let baseMs = max(15, min(80, p.text.count / 64))
+            let coldBonusMs = 0
             let waitMs = baseMs + coldBonusMs
             DispatchQueue.main.asyncAfter(deadline: .now() + Double(waitMs) / 1000.0) { [weak self] in
                 guard let self else { return }
