@@ -1149,14 +1149,27 @@ final class TerminalSurface: Identifiable, ObservableObject {
     /// - Bool reads/writes are atomic on supported architectures
     /// Marked @atomic via NSLock for strict ordering on weakly-ordered hosts.
     private var _hasReceivedPtyOutput: Bool = false
+    private var _ptyOutputFirstAt: TimeInterval = 0
     private let ptyOutputLock = NSLock()
     var hasReceivedPtyOutput: Bool {
         ptyOutputLock.lock(); defer { ptyOutputLock.unlock() }
         return _hasReceivedPtyOutput
     }
+    /// Time elapsed (in seconds) since the first pty_data_callback fire.
+    /// Returns nil when no output has been observed yet. Used by processPaste
+    /// to enforce a settle window after the TUI starts outputting — the
+    /// banner/prompt can arrive before the TUI's stdin reader loop is up.
+    var ptyOutputAge: TimeInterval? {
+        ptyOutputLock.lock(); defer { ptyOutputLock.unlock() }
+        guard _hasReceivedPtyOutput else { return nil }
+        return ProcessInfo.processInfo.systemUptime - _ptyOutputFirstAt
+    }
     fileprivate func markPtyOutputReceived() {
         ptyOutputLock.lock(); defer { ptyOutputLock.unlock() }
-        _hasReceivedPtyOutput = true
+        if !_hasReceivedPtyOutput {
+            _hasReceivedPtyOutput = true
+            _ptyOutputFirstAt = ProcessInfo.processInfo.systemUptime
+        }
     }
     private static let maxPasteQueueDepth = 16
 
@@ -1283,38 +1296,53 @@ final class TerminalSurface: Identifiable, ObservableObject {
         }
 
         // Cold-start gate: before the very first paste on this surface,
-        // wait until ghostty's pty_data_callback has fired at least once —
-        // i.e., the child process has written its first byte. This is the
-        // cleanest proxy for "TUI stdin reader loop is alive." Without it,
-        // long pastes get truncated at a deterministic byte position because
-        // the TUI hasn't allocated its input buffer yet.
+        // wait until BOTH conditions hold:
+        //   1. ghostty's pty_data_callback has fired at least once
+        //   2. At least 800 ms have elapsed since that first fire
         //
-        // Polled at 100 ms cadence, capped at 25 attempts (~2.5 s total).
-        // After the cap we proceed anyway as a last resort — a child that
-        // never outputs (silent script) shouldn't deadlock paste forever.
-        if !hasCompletedPaste, !hasReceivedPtyOutput, p.tuiReadyDeferCount < 25 {
+        // Why (1)+(2), not just (1): empirically the child process (Claude
+        // TUI) writes its banner/prompt to PTY several hundred ms BEFORE
+        // its stdin reader loop activates. Gating only on PTY output makes
+        // us paste during that window, and the input bytes get silently
+        // discarded — same deterministic truncation as before.
+        //
+        // 800 ms matches the cold bonus from the previous timing-only fix
+        // (which was empirically enough). Combining with the PTY-output
+        // signal means slow-to-start children wait longer than 800 ms
+        // automatically; fast ones (~200 ms to first output) still only
+        // wait ~1 s total instead of the old 1.8 s blind warmup.
+        //
+        // Polled at 100 ms cadence. After 30 attempts (~3 s) we proceed
+        // anyway so a silent-startup child doesn't deadlock paste forever.
+        let coldSettleSeconds: TimeInterval = 0.8
+        let coldDeferCap = 30
+        let coldReady: Bool = {
+            guard let age = ptyOutputAge else { return false }
+            return age >= coldSettleSeconds
+        }()
+        if !hasCompletedPaste, !coldReady, p.tuiReadyDeferCount < coldDeferCap {
             pasteInFlight = false  // unlock the queue so drain can re-enter
             pasteQueue.insert(p, at: 0)  // put this paste back at the head
             var deferred = p
             deferred.tuiReadyDeferCount += 1
-            // We re-queued above, so increment the count on the head entry.
             pasteQueue[0] = deferred
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) { [weak self] in
                 self?.drainPasteQueue()
             }
             #if DEBUG
             if deferred.tuiReadyDeferCount == 1 {
-                dlog("paste.defer.tui_cold panel=\(id.uuidString.prefix(8)) textLen=\(p.text.count) (waiting for first PTY output)")
+                dlog("paste.defer.tui_cold panel=\(id.uuidString.prefix(8)) textLen=\(p.text.count) (waiting for PTY output + 800ms settle)")
             }
             #endif
             return
         }
         #if DEBUG
         if !hasCompletedPaste {
-            if hasReceivedPtyOutput {
-                dlog("paste.cold.ready panel=\(id.uuidString.prefix(8)) defers=\(p.tuiReadyDeferCount) textLen=\(p.text.count)")
+            let ageMs = (ptyOutputAge ?? 0) * 1000
+            if coldReady {
+                dlog("paste.cold.ready panel=\(id.uuidString.prefix(8)) defers=\(p.tuiReadyDeferCount) ptyAgeMs=\(Int(ageMs)) textLen=\(p.text.count)")
             } else {
-                dlog("paste.cold.fallback panel=\(id.uuidString.prefix(8)) defers=\(p.tuiReadyDeferCount) textLen=\(p.text.count) (no PTY output observed in 2.5s, proceeding)")
+                dlog("paste.cold.fallback panel=\(id.uuidString.prefix(8)) defers=\(p.tuiReadyDeferCount) ptyAgeMs=\(Int(ageMs)) textLen=\(p.text.count) (deadline reached, proceeding)")
             }
         }
         #endif
