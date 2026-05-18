@@ -1258,7 +1258,33 @@ final class TerminalSurface: Identifiable, ObservableObject {
             #if DEBUG
             dlog("paste.return.skipped reason=no_need_return gen=\(gen)")
             #endif
-            finalizePaste(result: .success(()), completion: p.completion)
+            // Even without Return, the ghostty IO thread may still be flushing
+            // paste bytes to the PTY when ghostty_surface_text returns. Firing
+            // finalizePaste synchronously here is a lie: the Rust CLI uses our
+            // ack to decide when to send Enter via team.send_key, and if it
+            // fires Enter too early the paste truncates mid-stream (observed
+            // with the ~2000-char agent init prompt — first ~700 chars submit,
+            // the rest is discarded). Scale the wait with text length so short
+            // pastes don't pay extra latency.
+            // Heuristic: ~1ms per 32 chars, floor 20ms, cap 400ms.
+            let waitMs = max(20, min(400, p.text.count / 32))
+            DispatchQueue.main.asyncAfter(deadline: .now() + Double(waitMs) / 1000.0) { [weak self] in
+                guard let self else { return }
+                // Generation check: if a later paste was already queued and
+                // bumped the generation, this paste's window has closed.
+                // finalizePaste still has to run so the queue can drain, but
+                // we don't want to ack a paste that's been superseded.
+                guard self.pasteGeneration == gen else {
+                    #if DEBUG
+                    dlog("paste.return.skipped.drain.stale gen=\(gen) currentGen=\(self.pasteGeneration)")
+                    #endif
+                    return
+                }
+                #if DEBUG
+                dlog("paste.return.skipped.drain.complete gen=\(gen) waitMs=\(waitMs) textLen=\(p.text.count)")
+                #endif
+                self.finalizePaste(result: .success(()), completion: p.completion)
+            }
             return
         }
 
