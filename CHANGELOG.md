@@ -4,6 +4,19 @@ All notable changes to term-mesh are documented here.
 
 ## [Unreleased]
 
+## [0.126.0] - 2026-05-18
+
+### Changed
+- **`/tm` 기본 동작이 v1 동일 instruction fan-out으로 복귀** — Step 1.5 자동 분해(T1-T8 template matching)는 이제 `--decompose` opt-in 플래그가 있을 때만 실행. 이전엔 자동 분해가 기본이었는데 단순 fan-out에서도 leader가 매번 template 매칭·dispatch plan 생성을 거쳐 응답이 느리던 문제 해소. `--no-decompose`는 새 기본값과 동일한 no-op 별칭으로 유지.
+- **`/tm` slash command 컨텍스트 크기 ~37% 감소** — T1-T8 템플릿 라이브러리, fallback policy, worked examples를 `tm-decompose-templates.md`로 분리. 기본 `/tm` 호출에서는 로드하지 않고 `--decompose` 명시 시에만 leader가 참조. 매 호출마다 leader가 따라가야 할 본문이 733줄에서 461줄로 줄어 응답 지연 감소.
+
+### Fixed
+- **`tm-agent collect --headers`가 한 줄짜리 5필드 STATUS 헤더를 잘못 파싱해 FILES/VERIFY/NEXT/FULL_REPORT 정보 손실되던 문제** — codex agent 등이 `STATUS: DONE FILES: none VERIFY: ... NEXT: ... FULL_REPORT: ...`를 한 줄로 출력하면 line-based parser가 첫 KEY만 잡고 나머지 4필드를 `n/a`로 떨어뜨리던 silent data loss. `split_inline_headers` normalize 단계 추가로 ` KEY:` 경계마다 줄바꿈을 삽입해 multi-line/single-line 모두 일관되게 파싱. body 본문의 `Run:` 같은 자유 콜론은 영향 없음.
+
+### Thanks to 1 contributor!
+
+- [@JINWOO-J](https://github.com/JINWOO-J)
+
 ## [0.125.0] - 2026-05-18
 
 ### Fixed
