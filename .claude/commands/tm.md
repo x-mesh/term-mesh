@@ -35,7 +35,7 @@ Present AskUserQuestion:
 |-------|-------------|
 | 자유 instruction 실행 | instruction을 직접 입력하고 fan-out (Other 옵션으로 텍스트 입력) |
 | 템플릿 선택 후 실행 | T1-T8 중 하나를 골라 키워드 맞춤 dispatch |
-| 옵션 보기 | --no-decompose / --ensure / --timeout 플래그 설명 후 메뉴로 복귀 |
+| 옵션 보기 | --decompose / --ensure / --timeout 플래그 설명 후 메뉴로 복귀 |
 | 도움말 (전체 cheat sheet) | 정적 안내 출력 후 종료 |
 
 ### Step 2 — Per-choice flow
@@ -51,16 +51,16 @@ Present AskUserQuestion:
 
    | label | description |
    |-------|-------------|
-   | 자동 분해 (기본) | T1-T8 템플릿 매칭 시 역할별 sub-task 분배 |
-   | --no-decompose | 모든 에이전트에게 동일 instruction (v1 동작) |
+   | 동일 instruction fan-out (기본) | 모든 에이전트에게 동일 instruction (v1 동작) |
+   | --decompose (자동 분해) | T1-T8 템플릿 매칭 시 역할별 sub-task 분배 |
 
 3. Print the final command line and stop:
    ```
    다음 명령을 복사해 실행하세요:
 
-   /tm "<입력한 instruction>"[ --no-decompose]
+   /tm "<입력한 instruction>"[ --decompose]
    ```
-   Do NOT execute the workflow. User re-enters the command to trigger Step 1 → 1.5 → ... flow.
+   Do NOT execute the workflow. User re-enters the command to trigger Step 1 → (Step 1.5 if --decompose) → ... flow.
 
 **(b) 템플릿 선택 후 실행**
 
@@ -105,8 +105,9 @@ Print:
 ```
 사용 가능한 플래그:
 
-  --no-decompose          Step 1.5 분해 건너뜀 — 모든 에이전트에게 동일 instruction (v1 동작)
-                          예: /tm "PR 리뷰" --no-decompose
+  --decompose             Step 1.5 자동 분해 켜기 (opt-in) — T1-T8 템플릿 매칭 시 역할별 sub-task 분배
+                          기본은 v1 동일 instruction fan-out. --no-decompose는 동일 동작(no-op).
+                          예: /tm "PR 리뷰" --decompose
 
   --ensure <roles>        팀에 없는 role 자동 추가 후 fan-out
                           예: /tm "PR 리뷰" --ensure reviewer,security
@@ -132,10 +133,10 @@ Print the static cheat sheet and stop (no further AskUserQuestion):
 ```
 이 명령은 모든 idle agent를 동시 동원하고 결과를 종합합니다.
 
-  /tm "review src/auth.ts"
+  /tm "review src/auth.ts"                # 기본: 동일 instruction fan-out
   /tm "monolith vs microservices" --timeout 120
   /tm --ensure reviewer,security "이 PR 보안 리뷰"
-  /tm "PR 리뷰" --no-decompose      # v1 동작 (분해 건너뜀)
+  /tm "PR 리뷰" --decompose             # opt-in: T1-T8 매칭 시 역할별 분배
 
 내부 단계에서 호출하는 low-level 명령들 (직접 사용 가능):
 
@@ -150,7 +151,7 @@ Print the static cheat sheet and stop (no further AskUserQuestion):
 
 ### Step 3 — 종료 규칙
 
-Empty input 분기는 **어떤 경우에도** Step 1 (status) → Step 1.5 (decompose) → ... 워크플로를 직접 실행하지 않는다. 항상 "명령 라인 출력 + 사용자 재입력 안내"로 끝낸다.
+Empty input 분기는 **어떤 경우에도** Step 1 (status) → Step 2 (delegate) → ... 워크플로를 직접 실행하지 않는다. 항상 "명령 라인 출력 + 사용자 재입력 안내"로 끝낸다. (`--decompose`가 명시된 경우에만 Step 1.5가 끼어든다.)
 
 ## Arguments
 
@@ -168,16 +169,17 @@ User provided: $ARGUMENTS
 | `"instruction"` | (필수) | 모든 에이전트에게 전달되는 단일 instruction |
 | `--timeout <s>` | 300 | `tm-agent wait` 타임아웃 (초) |
 | `--ensure <roles>` | (없음) | 쉼표 구분 role 목록 — 없는 role은 fan-out 전 자동 attach |
-| `--no-decompose` | false | Step 1.5 decomposition을 건너뛰고 v1 same-instruction-to-all 동작으로 회귀 (opt-out) |
+| `--decompose` | false | Step 1.5 자동 분해 켜기 (opt-in). T1-T8 템플릿 매칭 시 역할별 sub-task 분배 |
+| `--no-decompose` | (기본) | v1 same-instruction-to-all 동작 명시. 기본 동작이므로 plain `/tm`과 동일 |
 
 ```
 /tm "instruction"
 /tm "instruction" --timeout 300
 /tm "instruction" --ensure reviewer,security
-/tm "instruction" --no-decompose
+/tm "instruction" --decompose
 ```
 
-**금지 옵션**: `--mode`, `--agents N`, `--rounds`, `--decompose` — 이 커맨드 범위 밖. (`--decompose`는 decompose가 새 기본값이므로 명시적 affirmation 불필요 — 일관된 거부로 처리.)
+**금지 옵션**: `--mode`, `--agents N`, `--rounds` — 이 커맨드 범위 밖.
 
 ## Workflow
 
@@ -221,15 +223,18 @@ Note: <role> agent not in team. Run `/team add <role>` first, or rerun with `/tm
 
 - `in_progress` 태스크가 있는 에이전트가 있으면 → **REJECT**: "team busy; run `tm-agent task clear` first"
 - idle 에이전트가 0명이면 → **REJECT**: "no idle agents available"
-- idle 에이전트 목록 확인 후 Step 1.5 진행.
+- idle 에이전트 목록 확인 후 다음 단계로 진행.
+- **기본 경로**: `--decompose` 미지정 시 Step 1.5는 **완전히 건너뛴다** — 곧바로 Step 2(delegate)로 이동. DECOMPOSE_MODE=`off`.
 
-### Step 1.5 — Instruction decomposition
+### Step 1.5 — Instruction decomposition (opt-in only)
+
+**진입 조건**: 사용자가 `--decompose` 플래그를 명시한 경우에만 이 단계 실행. 그 외에는 통째로 skip.
 
 **DECOMPOSE_MODE state machine** (determined at Step 1.5 entry):
 
-- `off` — User passed `--no-decompose`. Skip Step 1.5 entirely. Step 2 sends original `$INSTR` to all idle agents (v1 behavior). Step 4 uses `collect --headers` + homogeneous synthesis ([충돌] = "전원 동의 / 이견").
-- `on` — Template T1-T8 matched. Leader emits a 2-4 line decomposition preview, then Step 2 dispatches N heterogeneous sub-tasks via the matched dispatch plan. Step 4 uses `reports --summary` + heterogeneous synthesis ([충돌] = "독립 완료" default).
-- `fallback` — No template matched OR non-decomposable heuristic hit. Leader emits 1-line Note `[plan] N개 동일 instruction fan-out — 분해 패턴 미일치, 폴백 적용`. Step 2 sends original `$INSTR` to all (same as `off` but with the explicit note). Step 4 uses `collect --headers`.
+- `off` — `--decompose` 미지정 (기본) 또는 `--no-decompose` 명시. Step 1.5 자체를 건너뛴다. Step 2 sends original `$INSTR` to all idle agents (v1 behavior). Step 4 uses `collect --headers` + homogeneous synthesis ([충돌] = "전원 동의 / 이견").
+- `on` — `--decompose` 명시 + Template T1-T8 matched. Leader emits a 2-4 line decomposition preview, then Step 2 dispatches N heterogeneous sub-tasks via the matched dispatch plan. Step 4 uses `reports --summary` + heterogeneous synthesis ([충돌] = "독립 완료" default).
+- `fallback` — `--decompose` 명시 but no template matched OR non-decomposable heuristic hit. Leader emits 1-line Note `[plan] N개 동일 instruction fan-out — 분해 패턴 미일치, 폴백 적용`. Step 2 sends original `$INSTR` to all (same as `off` but with the explicit note). Step 4 uses `collect --headers`.
 
 ---
 
@@ -635,13 +640,13 @@ FULL_REPORTS:
 
 ---
 
-### Example 3 — auto-decompose (T1 매칭)
+### Example 3 — auto-decompose opt-in (T1 매칭)
 
 ```
-/tm "feature/auth PR 보안 리뷰"
+/tm "feature/auth PR 보안 리뷰" --decompose
 ```
 
-DECOMPOSE_MODE=`on`, T1 matched (keywords: "PR" + "보안 리뷰"). Leader emits decomposition preview:
+DECOMPOSE_MODE=`on` (사용자가 `--decompose` 명시), T1 matched (keywords: "PR" + "보안 리뷰"). Leader emits decomposition preview:
 
 ```
 [plan] T1 PR 리뷰 — security/reviewer/tester/explorer 분담 (4 sub-tasks)
@@ -657,13 +662,13 @@ Step 2 dispatches heterogeneous sub-tasks (per D1 above). Step 4 synthesis uses 
 
 ---
 
-### Example 4 — explicit opt-out (`--no-decompose`)
+### Example 4 — 기본 동작 (분해 없이 동일 instruction fan-out)
 
 ```
-/tm "feature/auth PR 보안 리뷰" --no-decompose
+/tm "feature/auth PR 보안 리뷰"
 ```
 
-DECOMPOSE_MODE=`off`, Step 1.5 skipped. All idle agents receive the identical original instruction (v1 behavior). Step 4 synthesis uses `collect --headers`.
+DECOMPOSE_MODE=`off` (기본), Step 1.5 자체를 건너뛴다. All idle agents receive the identical original instruction (v1 behavior). Step 4 synthesis uses `collect --headers`. (`--no-decompose`를 명시해도 동일 동작 — 기본이므로 no-op.)
 
 ```
 [결론]  Auth PR에서 force-unwrap 3곳 + token 평문 로깅 확인.
@@ -673,13 +678,13 @@ DECOMPOSE_MODE=`off`, Step 1.5 skipped. All idle agents receive the identical or
 
 ---
 
-### Example 5 — fallback (template miss)
+### Example 5 — fallback (`--decompose` 명시했으나 template miss)
 
 ```
-/tm "hello there"
+/tm "hello there" --decompose
 ```
 
-Non-decomposable heuristic match (pure-ping pattern). DECOMPOSE_MODE=`fallback`. Leader emits:
+`--decompose` 명시됨 + non-decomposable heuristic match (pure-ping pattern). DECOMPOSE_MODE=`fallback`. Leader emits:
 
 ```
 [plan] 2개 동일 instruction fan-out — 분해 패턴 미일치, 폴백 적용
