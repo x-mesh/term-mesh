@@ -926,7 +926,7 @@ final class TeamOrchestrator: ObservableObject {
                     let quotedPath = claudePath.contains(" ") ? "\"\(claudePath)\"" : claudePath
                     var claudeLeaderParts = ["\(quotedPath)", "--system-prompt '\(escaped)'", "--dangerously-skip-permissions"]
                     if !leaderModel.isEmpty && leaderModel != "sonnet" {
-                        claudeLeaderParts.append("--model \(Self.resolveClaudeModelArg(leaderModel))")
+                        claudeLeaderParts.append("--model '\(Self.resolveClaudeModelArg(leaderModel))'")
                     }
                     if let sid = resumeSessionId, !sid.isEmpty {
                         claudeLeaderParts.append("--resume \(sid)")
@@ -3905,7 +3905,7 @@ final class TeamOrchestrator: ObservableObject {
         ]
 
         if !model.isEmpty {
-            parts.append("--model \(Self.resolveClaudeModelArg(model))")
+            parts.append("--model '\(Self.resolveClaudeModelArg(model))'")
         }
 
         if !instructions.isEmpty {
