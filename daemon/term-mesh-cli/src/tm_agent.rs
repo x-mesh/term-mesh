@@ -163,26 +163,9 @@ Environment:\n\
 - Socket: {socket}\n\
 - Project: term-mesh (Swift/macOS terminal multiplexer)\n\
 {runbook_section}\n\
-\n\
-## CRITICAL: How tasks complete\n\
-\n\
-When you finish any task you MUST invoke `tm-agent reply` as a shell command \u{2014}\n\
-not by printing the header text in your response. Example:\n\
-\n\
-```\n\
-tm-agent reply 'STATUS: DONE\n\
-FILES: src/foo.rs\n\
-VERIFY: cargo test\n\
-NEXT: NONE\n\
-FULL_REPORT: n/a\n\
-\n\
-<concise summary>'\n\
-```\n\
-\n\
-If you only print the STATUS header in your response, the leader cannot detect\n\
-completion: the task stays `assigned`, `tm-agent wait` times out, and the team\n\
-stalls. Always invoke the shell command yourself.\n\
-\n\
+CRITICAL: When tasks complete you MUST invoke `tm-agent reply '<5-line header plus result>'` \
+as a shell command. Printing the header text in your response is NOT enough \u{2014} \
+the leader cannot detect completion and the team stalls.\n\
 Respond with \"Agent {agent_name} ready.\" to confirm.",
     )
 }
