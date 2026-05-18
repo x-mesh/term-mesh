@@ -406,7 +406,9 @@ final class BrewSelfUpdater {
 
     private func scheduleInitialCheck() {
         startWorkItem?.cancel()
-        let item = DispatchWorkItem { [weak self] in self?.runOutdatedCheck() }
+        let item = DispatchWorkItem { [weak self] in
+            Task.detached(priority: .utility) { await self?.runTapRefresh() }
+        }
         startWorkItem = item
         DispatchQueue.main.asyncAfter(deadline: .now() + Self.initialDelay, execute: item)
     }
@@ -552,6 +554,10 @@ final class BrewSelfUpdater {
         }.value
         UpdateLogStore.shared.append("brew self-update: `brew update` \(result) duration=\(String(format: "%.1f", -started.timeIntervalSinceNow))s")
         viewModel.recordTapRefresh(at: Date())
+        // tap refresh 후 outdated check를 chain하여 latest 버전을 즉시 반영
+        await MainActor.run { [weak self] in
+            self?.runOutdatedCheck()
+        }
     }
 
     // MARK: - Detection
