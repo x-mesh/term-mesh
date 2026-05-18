@@ -4,6 +4,16 @@ All notable changes to term-mesh are documented here.
 
 ## [Unreleased]
 
+## [0.124.0] - 2026-05-18
+
+### Fixed
+- **Smart Preset Balanced가 사용자 추가 에이전트를 덮어쓰던 문제** — Balanced 프리셋 적용 시 원래 프리셋 구성으로 행이 재생성되어 사용자가 직접 추가한 에이전트가 사라지던 문제. 이제 현재 에이전트 목록은 보존하고 각 role에 권장 모델만 적용한다.
+- **Pane-mode 팀 Resume 가용성 확장** — leader 또는 에이전트 중 하나라도 Claude session id가 캡처된 archive는 Resume 후보로 노출. 이전에는 leader session id가 없으면 Resume 버튼이 비활성화되어 복구 가능한 archive조차 휴지통밖에 누를 수 없었다.
+
+### Thanks to 1 contributor!
+
+- [@JINWOO-J](https://github.com/JINWOO-J)
+
 ## [0.123.0] - 2026-05-18
 
 ### Added
