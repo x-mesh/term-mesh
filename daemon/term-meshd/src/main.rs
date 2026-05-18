@@ -63,6 +63,25 @@ async fn main() -> anyhow::Result<()> {
     );
     tracing::info!("agent session manager initialized");
 
+    // Wave 1 D5: startup sweep — force-block any `assigned` tasks older than
+    // the conservative 360s bound (the codex/kiro/gemini watcher window).
+    // Using the wider bound at boot avoids false-blocking non-claude agents
+    // whose tasks legitimately sit in `assigned` between 181s and 359s after
+    // a daemon restart; any claude-owned zombie inside that window is picked
+    // up by the periodic watcher on its next 30s tick.
+    {
+        const STARTUP_ASSIGNED_THRESHOLD_MS: u64 = 360_000;
+        let blocked = agent_manager
+            .sweep_assigned_timeouts(STARTUP_ASSIGNED_THRESHOLD_MS, "startup_sweep");
+        if !blocked.is_empty() {
+            tracing::info!(
+                "startup sweep: force-blocked {} assigned-state zombie task(s): {:?}",
+                blocked.len(),
+                blocked
+            );
+        }
+    }
+
     // Prune old DB data on startup and every 6 hours (24h TTL)
     {
         let mgr = Arc::clone(&agent_manager);

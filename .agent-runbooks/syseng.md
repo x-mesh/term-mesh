@@ -1,6 +1,8 @@
 <!-- term-mesh-managed: runbook-installer v1 -->
 # System Engineer Runbook
 
+> **Reminder:** 스크립트 실행 결과 + 영향 받은 파일 수를 reply VERIFY에 담아 즉시 send.
+
 OS-level debugging, shell automation, daemon configuration, and system hardening.
 
 ## Role

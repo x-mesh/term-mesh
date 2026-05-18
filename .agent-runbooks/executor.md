@@ -1,6 +1,8 @@
 <!-- term-mesh-managed: runbook-installer v1 -->
 # Executor Runbook
 
+> **Reminder:** diff 작업 끝나면 빌드/테스트 결과를 reply VERIFY에 담아 즉시 send. task.done은 reply 후 자동.
+
 Scoped implementation work with direct file edits and verification.
 
 ## Role

@@ -4483,7 +4483,12 @@ final class TeamOrchestrator: ObservableObject {
             case "review_ready":
                 tasks[idx].lastProgressAt = now
                 tasks[idx].blockedReason = nil
-            case "completed", "failed", "abandoned":
+            case "completed", "failed", "abandoned", "cancelled":
+                // Phase E Wave 1: "cancelled" terminates the task identically
+                // to completed/failed/abandoned so the `activeTask` filter
+                // drops it and the sidebar's active_task_id clears in the
+                // same tick. syncTeamStateToDaemon() below re-publishes
+                // agent_state for downstream consumers.
                 tasks[idx].completedAt = now
                 tasks[idx].lastProgressAt = now
                 if normalizedStatus == "completed" {
@@ -4888,6 +4893,14 @@ final class TeamOrchestrator: ObservableObject {
             return "parked"
         }
         guard let task = activeTask(for: teamName, agentName: agentName) else { return "idle" }
+        // Phase E Wave 1: an assigned/queued task that has gone stale past the
+        // threshold surfaces as `assigned_stale` so the sidebar can render an
+        // amber/⏳ indicator. Daemon may also push the same label via an
+        // anomaly event — both paths converge on this string. Fallback to
+        // legacy switch keeps existing callers compatible.
+        if (task.status == "assigned" || task.status == "queued") && isTaskStale(task) {
+            return "assigned_stale"
+        }
         switch task.status {
         case "blocked":
             return "blocked"
@@ -4912,7 +4925,9 @@ final class TeamOrchestrator: ObservableObject {
     }
 
     private func isTerminalTaskStatus(_ status: String) -> Bool {
-        ["completed", "failed", "abandoned"].contains(status)
+        // Phase E Wave 1: "cancelled" joins the terminal set so it drops out of
+        // `activeTask` derivation in the same tick as the status flip.
+        ["completed", "failed", "abandoned", "cancelled"].contains(status)
     }
 
     private func taskNeedsAttention(_ task: TeamTask) -> Bool {

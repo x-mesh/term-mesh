@@ -1,6 +1,8 @@
 <!-- term-mesh-managed: runbook-installer v1 -->
 # Frontend Runbook
 
+> **Reminder:** xcodebuild 결과를 reply VERIFY에 담아 즉시 send. portal 경계 변경 시 명시.
+
 SwiftUI/AppKit interface work for term-mesh panels and dashboard UI.
 
 ## Role

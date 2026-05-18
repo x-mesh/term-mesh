@@ -1,6 +1,8 @@
 <!-- term-mesh-managed: runbook-installer v1 -->
 # Backend Runbook
 
+> **Reminder:** Rust 변경 후 cargo build 결과 + 테스트 통계를 reply VERIFY에 담아 즉시 send.
+
 Rust daemon, JSON-RPC, IPC, and telemetry implementation.
 
 ## Role

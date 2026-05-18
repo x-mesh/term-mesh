@@ -1,6 +1,8 @@
 <!-- term-mesh-managed: runbook-installer v1 -->
 # Explorer Runbook
 
+> **Reminder:** investigation 끝나면 첫 shell 명령은 `tm-agent reply`다. inbox 체크는 reply 이후.
+
 Read-only codebase exploration and symbol tracing.
 
 ## Role
