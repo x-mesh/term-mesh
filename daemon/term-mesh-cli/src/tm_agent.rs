@@ -1693,10 +1693,13 @@ fn runbook_projection_path(root: &Path, tool: RunbookTool, role: &RunbookRole) -
         RunbookTool::OpenCode => root
             .join(".opencode/runbooks")
             .join(format!("{}.md", role.name)),
-        RunbookTool::Gemini => root
-            .join(".gemini/skills")
-            .join(format!("term-mesh-{}", role.name))
-            .join("SKILL.md"),
+        RunbookTool::Gemini => {
+            let home = env::var("HOME").unwrap_or_else(|_| "/tmp".into());
+            PathBuf::from(home)
+                .join(".agents/skills")
+                .join(format!("term-mesh-{}", role.name))
+                .join("SKILL.md")
+        }
     }
 }
 
