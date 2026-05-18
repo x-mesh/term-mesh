@@ -33,12 +33,53 @@ const DEFAULT_AGENT_NAMES: &[&str] = &[
 ];
 const DEFAULT_AGENT_COLORS: &[&str] = &["green", "blue", "yellow", "magenta", "cyan", "red"];
 
+// Literal block agents must invoke as a shell command before stopping. TUI CLIs
+// (Claude/Codex) frequently print this header in their response text but never
+// actually run the shell command, which leaves the task stuck in "assigned" and
+// causes `tm-agent wait` to time out. The strong wording + literal example here
+// is the prompt-side mitigation; the scrollback auto-detector is the safety net.
+const REQUIRED_FINAL_STEP_BLOCK: &str = concat!(
+    "[REQUIRED FINAL STEP \u{2014} you MUST run this shell command before stopping]\n",
+    "```\n",
+    "tm-agent reply 'STATUS: DONE|BLOCKED|NEEDS_REVIEW\n",
+    "FILES: <changed paths, space-separated, or none>\n",
+    "VERIFY: <single shell command to verify, or n/a>\n",
+    "NEXT: <one-line action for leader, or NONE>\n",
+    "FULL_REPORT: <path to full result file, or n/a>\n",
+    "\n",
+    "<concise summary body>'\n",
+    "```\n",
+    "Without running this shell command the leader cannot detect completion \u{2014} the task hangs and wait times out. Printing the header text in your response is NOT enough; you must invoke the `tm-agent reply` shell command yourself.",
+);
+
 const REPORT_SUFFIX: &str = concat!(
-    "\n\n[IMPORTANT] Finish via TM-PROTOCOL-v1: tm-agent reply '<5-line header plus concise summary>'.",
+    "\n\n",
+    "[REQUIRED FINAL STEP \u{2014} you MUST run this shell command before stopping]\n",
+    "```\n",
+    "tm-agent reply 'STATUS: DONE|BLOCKED|NEEDS_REVIEW\n",
+    "FILES: <changed paths or none>\n",
+    "VERIFY: <single shell command or n/a>\n",
+    "NEXT: <action or NONE>\n",
+    "FULL_REPORT: <result file path or n/a>\n",
+    "\n",
+    "<concise summary body>'\n",
+    "```\n",
+    "Without running this shell command the leader cannot detect completion \u{2014} the task hangs and wait times out. Printing the header in your response is NOT enough; you must invoke `tm-agent reply` as a shell command.",
 );
 
 const BROADCAST_SUFFIX: &str = concat!(
-    "\n\n[IMPORTANT] Finish via TM-PROTOCOL-v1: `tm-agent reply '<5-line header plus concise summary>'`.",
+    "\n\n",
+    "[REQUIRED FINAL STEP \u{2014} every recipient MUST run this shell command before stopping]\n",
+    "```\n",
+    "tm-agent reply 'STATUS: DONE|BLOCKED|NEEDS_REVIEW\n",
+    "FILES: <changed paths or none>\n",
+    "VERIFY: <single shell command or n/a>\n",
+    "NEXT: <action or NONE>\n",
+    "FULL_REPORT: <result file path or n/a>\n",
+    "\n",
+    "<concise summary body>'\n",
+    "```\n",
+    "Without running this shell command the leader cannot detect completion. Printing the header in your response is NOT enough; you must invoke `tm-agent reply` as a shell command.",
 );
 
 fn agent_init_prompt(agent_name: &str, agent_role: &str, team_name: &str, workdir: &str, socket: &str) -> String {
@@ -122,7 +163,9 @@ Environment:\n\
 - Socket: {socket}\n\
 - Project: term-mesh (Swift/macOS terminal multiplexer)\n\
 {runbook_section}\n\
-When you complete any task, run: `tm-agent reply '<5-line header plus concise result>'` to report.\n\
+CRITICAL: When tasks complete you MUST invoke `tm-agent reply '<5-line header plus result>'` \
+as a shell command. Printing the header text in your response is NOT enough \u{2014} \
+the leader cannot detect completion and the team stalls.\n\
 Respond with \"Agent {agent_name} ready.\" to confirm.",
     )
 }
@@ -2284,8 +2327,11 @@ mod runbook_tests {
 
     #[test]
     fn return_retry_policy_is_conservative_when_text_delivery_failed() {
-        assert_eq!(return_retry_delays_ms(true), &[250, 400, 600, 800, 1000, 1500, 2500, 4000]);
-        assert_eq!(return_retry_delays_ms(false), &[200, 500, 1000, 2000]);
+        assert_eq!(return_retry_delays_ms(true, "team.send"), &[250, 400, 600, 800, 1000, 1500, 2500, 4000]);
+        assert_eq!(return_retry_delays_ms(false, "team.send"), &[200, 500, 1000, 2000]);
+        // Init prompt path now uses the same cadence as team.send — paste
+        // truncation is handled by chunking in Swift, not by Rust delays.
+        assert_eq!(return_retry_delays_ms(true, "team.create.init"), &[250, 400, 600, 800, 1000, 1500, 2500, 4000]);
     }
 }
 
@@ -2999,7 +3045,14 @@ fn format_task_instruction(
     fix_budget: Option<u8>,
 ) -> String {
     let task_id = task["id"].as_str().unwrap_or("");
-    let mut lines = vec![
+    // Mirror Swift formatDelegateInstruction: prepend the required final step
+    // at the top so the model sees the literal shell command before the goal.
+    let mut lines: Vec<String> = REQUIRED_FINAL_STEP_BLOCK
+        .lines()
+        .map(|s| s.to_string())
+        .collect();
+    lines.push(String::new());
+    lines.extend(vec![
         "## Task Capsule".to_string(),
         format!("TASK_ID: {task_id}"),
         format!("TASK_TITLE: {}", task["title"].as_str().unwrap_or("")),
@@ -3009,7 +3062,7 @@ fn format_task_instruction(
         ),
         "PROTOCOL: TM-PROTOCOL-v1".to_string(),
         "OUTPUT: STATUS/FILES/VERIFY/NEXT/FULL_REPORT header plus concise summary".to_string(),
-    ];
+    ]);
     if let Some(p) = task["priority"].as_u64() {
         lines.push(format!("TASK_PRIORITY: {p}"));
     }
@@ -3250,7 +3303,14 @@ fn select_reply_task(sock: &PathBuf, team: &str, sender: &str) -> (Option<String
     (selected, all)
 }
 
-fn return_retry_delays_ms(text_delivered: bool) -> &'static [u64] {
+fn return_retry_delays_ms(text_delivered: bool, context: &str) -> &'static [u64] {
+    // Long-paste contexts (init prompt, delegate payload) used to need an
+    // 800ms first delay to avoid the paste truncation race. That race is
+    // now resolved at the source by chunking ghostty_surface_text calls in
+    // Swift's processPaste, so the init path can use the default cadence.
+    // Keeping the branch as a no-op for easy future tuning if a regression
+    // surfaces; the explicit context match documents the historical issue.
+    let _ = context;
     if text_delivered {
         // First delay raised from 20 ms → 250 ms so the Return key arrives after
         // codex has fully rendered the pasted text and is ready to accept input.
@@ -3275,7 +3335,7 @@ fn send_return_key_with_retry(
     text_delivered: bool,
     context: &str,
 ) -> bool {
-    let delays = return_retry_delays_ms(text_delivered);
+    let delays = return_retry_delays_ms(text_delivered, context);
     eprintln!(
         "send_key.skip_or_retry context={context} text_delivered={text_delivered} attempts={} delays_ms={}",
         delays.len(),
@@ -5457,6 +5517,9 @@ fn run_create(
             }
 
             eprintln!("Sending init prompts to non-kiro agents...");
+            // Cold-start protection moved to Swift: the TerminalSurface gates
+            // the first paste on each surface until ghostty's pty_data_callback
+            // confirms the child has started outputting. No fixed warmup here.
             for a in &non_kiro {
                 let name = a["name"].as_str().unwrap_or("");
                 let role = a["agent_type"].as_str().unwrap_or(name);
@@ -7313,6 +7376,10 @@ fn run_wait(
     let mut tracked_task_ids: std::collections::HashSet<String> =
         explicit_task_ids.cloned().unwrap_or_default();
     let mut tracked_initialized = explicit_task_ids.is_some() && !tracked_task_ids.is_empty();
+    // Accumulating set of agents observed with an active task at any poll. Used by
+    // the result.status fallback so it doesn't count team members who were never
+    // delegated to in this round (the root cause of wait hangs on partial fan-out).
+    let mut tracked_agents: std::collections::HashSet<String> = std::collections::HashSet::new();
     while elapsed < timeout {
         if current_interval > 0 {
             thread::sleep(Duration::from_secs(current_interval));
@@ -7324,9 +7391,11 @@ fn run_wait(
         let mut msg_progress = "0/0".to_string();
 
         if mode == "report" || mode == "any" {
-            // On first poll, snapshot the task IDs we want to track.
-            // This is immune to agents dropping active_task_id on completion.
-            if !tracked_initialized {
+            // Every poll: observe agents that currently have an active task and
+            // accumulate both their task IDs and names. Re-running on each poll
+            // (not just the first) closes the race where wait fires before
+            // delegate's task is visible in team.status.
+            if !tracked_initialized || tracked_agents.is_empty() {
                 if let Ok(r) = rpc_call(sock, "team.status", json!({ "team_name": team })) {
                     if let Some(agents) = r["result"]["agents"].as_array() {
                         for a in agents {
@@ -7347,6 +7416,9 @@ fn run_wait(
                                     continue;
                                 }
                                 tracked_task_ids.insert(tid.to_string());
+                                if !name.is_empty() {
+                                    tracked_agents.insert(name.to_string());
+                                }
                             }
                         }
                         if !tracked_task_ids.is_empty() {
@@ -7377,8 +7449,22 @@ fn run_wait(
                     }
                 }
             } else {
-                // Fallback: legacy result.status (no tasks assigned yet)
-                if let Ok(rs) = rpc_call(sock, "team.result.status", json!({ "team_name": team })) {
+                // Fallback: result.status restricted to the agents we care about.
+                // Precedence: explicit --agents filter > accumulated tracked_agents
+                // > active_only (server-side filter to agents with non-terminal task).
+                // This prevents wait from waiting on team members who were never
+                // delegated to in this round (root cause of partial-fan-out hangs).
+                let mut params = json!({ "team_name": team });
+                if !agent_filter.is_empty() {
+                    let names: Vec<String> = agent_filter.iter().cloned().collect();
+                    params["agents"] = json!(names);
+                } else if !tracked_agents.is_empty() {
+                    let names: Vec<String> = tracked_agents.iter().cloned().collect();
+                    params["agents"] = json!(names);
+                } else {
+                    params["active_only"] = json!(true);
+                }
+                if let Ok(rs) = rpc_call(sock, "team.result.status", params) {
                     let done = rs["result"]["completed"].as_u64().unwrap_or(0);
                     let total = rs["result"]["total"].as_u64().unwrap_or(0);
                     report_done = rs["result"]["all_done"].as_bool().unwrap_or(false);

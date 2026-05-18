@@ -746,9 +746,30 @@ final class TeamDataStore: ObservableObject, @unchecked Sendable {
         return obj
     }
 
-    func resultStatus(teamName: String) -> [String: Any] {
-        let agents = agentNames(for: teamName)
-        guard !agents.isEmpty else { return [:] }
+    /// Returns result-file presence per agent.
+    ///
+    /// - Parameters:
+    ///   - agentFilter: if non-empty, restrict to these agent names (intersected with team members).
+    ///   - activeOnly: if true (and `agentFilter` is empty), restrict to agents who currently have
+    ///     a non-terminal task assigned. Used by `tm-agent wait` fallback to avoid counting
+    ///     team members who were never delegated to in this round.
+    func resultStatus(
+        teamName: String,
+        agentFilter: [String]? = nil,
+        activeOnly: Bool = false
+    ) -> [String: Any] {
+        let allAgents = agentNames(for: teamName)
+        guard !allAgents.isEmpty else { return [:] }
+        let agents: [String]
+        if let filter = agentFilter, !filter.isEmpty {
+            let filterSet = Set(filter)
+            agents = allAgents.filter { filterSet.contains($0) }
+        } else if activeOnly {
+            let activeAssignees = agentsWithActiveTask(teamName: teamName)
+            agents = allAgents.filter { activeAssignees.contains($0) }
+        } else {
+            agents = allAgents
+        }
         let dir = Self.resultDirectory(teamName: teamName)
         var agentStatus: [[String: Any]] = []
         for name in agents {
@@ -759,13 +780,30 @@ final class TeamDataStore: ObservableObject, @unchecked Sendable {
             ])
         }
         let completed = agentStatus.filter { $0["has_result"] as? Bool == true }.count
+        let total = agents.count
         return [
             "team_name": teamName,
             "agents": agentStatus,
             "completed": completed,
-            "total": agents.count,
-            "all_done": completed == agents.count,
+            "total": total,
+            // all_done requires at least one agent to be meaningful — empty filter
+            // means "no work tracked yet", not "all done".
+            "all_done": total > 0 && completed == total,
         ]
+    }
+
+    /// Names of agents in `teamName` that currently have a non-terminal task assigned.
+    private func agentsWithActiveTask(teamName: String) -> Set<String> {
+        lock.lock()
+        defer { lock.unlock() }
+        let terminalStatuses: Set<String> = ["completed", "failed", "abandoned", "cancelled"]
+        var result: Set<String> = []
+        for task in taskBoards[teamName, default: []] {
+            if let assignee = task.assignee, !terminalStatuses.contains(task.status) {
+                result.insert(assignee)
+            }
+        }
+        return result
     }
 
     func collectResults(teamName: String) -> [[String: Any]] {

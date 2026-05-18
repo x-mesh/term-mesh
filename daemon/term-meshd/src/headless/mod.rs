@@ -668,16 +668,83 @@ impl HeadlessManager {
         let id_clone = id.clone();
         let activity_clone = last_activity_ms.clone();
         let usage_clone = usage_counters.clone();
+        // Phase B2: auto-reply detector wire-up. TUI agents (Claude/Codex) often
+        // print the STATUS/FILES/VERIFY/NEXT/FULL_REPORT header in their response
+        // but skip invoking `tm-agent reply`, leaving tasks stuck. The detector
+        // observes their stdout and synthesises the reply when the agent forgets.
+        // Disable via TERMMESH_AUTO_REPLY=off.
+        let auto_reply_enabled = std::env::var("TERMMESH_AUTO_REPLY")
+            .map(|v| !matches!(v.trim().to_lowercase().as_str(), "off" | "0" | "false" | "no"))
+            .unwrap_or(true);
+        let ar_team = args.team_name.clone();
+        let ar_agent = args.name.clone();
+        let ar_socket = args.app_socket_path.clone();
+        let ar_last_hash = Arc::new(std::sync::Mutex::new(None::<u64>));
         tokio::spawn(async move {
+            use crate::auto_reply::AutoReplyDetector;
             let mut reader = BufReader::new(stdout).lines();
-            while let Ok(Some(line)) = reader.next_line().await {
-                activity_clone.store(now_ms(), std::sync::atomic::Ordering::Relaxed);
-                if parse_usage_for_this_cli {
-                    if let Some(u) = parse_usage_from_line(&line) {
-                        usage_clone.observe(&u, now_ms());
+            let mut detector = AutoReplyDetector::new();
+            let mut tick_timer = tokio::time::interval(std::time::Duration::from_millis(200));
+            // Skip the first immediate tick — it would fire before any input arrives.
+            tick_timer.tick().await;
+
+            loop {
+                tokio::select! {
+                    line_result = reader.next_line() => {
+                        match line_result {
+                            Ok(Some(line)) => {
+                                activity_clone.store(now_ms(), std::sync::atomic::Ordering::Relaxed);
+                                if parse_usage_for_this_cli {
+                                    if let Some(u) = parse_usage_from_line(&line) {
+                                        usage_clone.observe(&u, now_ms());
+                                    }
+                                }
+                                buf_clone.lock().await.push(line.clone());
+
+                                if auto_reply_enabled {
+                                    let now = std::time::Instant::now();
+                                    // Detector is line-based and adds its own newline
+                                    // handling internally; push line + "\n" to match.
+                                    let mut payload = line.into_bytes();
+                                    payload.push(b'\n');
+                                    if let Some(ev) = detector.push_bytes(&payload, now) {
+                                        try_emit_auto_reply(
+                                            &ar_team,
+                                            &ar_agent,
+                                            ar_socket.as_deref(),
+                                            &ar_last_hash,
+                                            ev,
+                                        ).await;
+                                    }
+                                }
+                            }
+                            Ok(None) | Err(_) => break,
+                        }
+                    }
+                    _ = tick_timer.tick(), if auto_reply_enabled => {
+                        if let Some(ev) = detector.tick(std::time::Instant::now()) {
+                            try_emit_auto_reply(
+                                &ar_team,
+                                &ar_agent,
+                                ar_socket.as_deref(),
+                                &ar_last_hash,
+                                ev,
+                            ).await;
+                        }
                     }
                 }
-                buf_clone.lock().await.push(line);
+            }
+            // On reader exit, flush any pending body capture (best effort).
+            if auto_reply_enabled {
+                if let Some(ev) = detector.flush() {
+                    try_emit_auto_reply(
+                        &ar_team,
+                        &ar_agent,
+                        ar_socket.as_deref(),
+                        &ar_last_hash,
+                        ev,
+                    ).await;
+                }
             }
             tracing::debug!("stdout reader exited for {id_clone}");
         });
@@ -2561,6 +2628,52 @@ fn now_ms() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
+}
+
+/// Best-effort auto-reply emission. Skips when:
+/// - no app socket is configured (no GUI side to call back to)
+/// - the same event content was just fired (idempotency via content_hash)
+///
+/// All failures log + drop. Never returns an error — auto-reply must not
+/// disrupt the PTY reader loop. Caller is the headless stdout reader task.
+async fn try_emit_auto_reply(
+    team_name: &str,
+    agent_name: &str,
+    socket_path: Option<&str>,
+    last_hash: &Arc<std::sync::Mutex<Option<u64>>>,
+    event: crate::auto_reply::AutoReplyEvent,
+) {
+    let Some(sock) = socket_path else {
+        tracing::debug!(
+            "auto-reply skipped: no app socket configured (agent={agent_name})"
+        );
+        return;
+    };
+    let hash = event.content_hash();
+    {
+        let mut guard = last_hash.lock().expect("auto-reply hash lock poisoned");
+        if *guard == Some(hash) {
+            tracing::debug!(
+                "auto-reply skipped: duplicate content hash (agent={agent_name})"
+            );
+            return;
+        }
+        *guard = Some(hash);
+    }
+    match crate::auto_reply_emit::emit(sock, team_name, agent_name, &event).await {
+        Ok(true) => tracing::info!(
+            "auto-reply emitted: agent={agent_name} status={} task_updated=true",
+            event.status
+        ),
+        Ok(false) => tracing::info!(
+            "auto-reply emitted: agent={agent_name} status={} task_updated=false (no matching task)",
+            event.status
+        ),
+        Err(e) => tracing::warn!(
+            "auto-reply emit failed: agent={agent_name} status={} err={e}",
+            event.status
+        ),
+    }
 }
 
 #[cfg(test)]

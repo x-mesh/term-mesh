@@ -4,6 +4,23 @@ All notable changes to term-mesh are documented here.
 
 ## [Unreleased]
 
+## [0.125.0] - 2026-05-18
+
+### Fixed
+- **첫 agent spawn 시 init prompt가 중간에 잘려서 들어가던 paste truncation 문제** — Claude TUI의 stdin reader loop이 banner 출력 시작 후 1.5초 이상 늦게 활성화되어 그 사이 paste한 byte가 silent drop되던 race. ghostty `pty_data_callback`을 TUI readiness proxy로 활용해 첫 paste 전에 `age ≥ 1500ms AND bytes ≥ 500` 조건을 자동으로 기다린다. 빠른 TUI는 ~1s, 느리면 자동으로 더 대기. 매번 같은 byte 위치에서 잘리던 deterministic 패턴 해소.
+- **paste→Enter race** — 긴 paste(2KB+ agent init prompt)에서 paste 중간에 Enter가 들어가 부분만 submit되던 race. `asyncTeamSend`가 ack을 paste dispatch 직후가 아니라 `finalizePaste` callback 시점에 보내도록 변경. `ghostty_surface_text`도 256-char chunk + 2ms yield로 호출해 IO thread가 매 chunk 후 drain 보장.
+- **`tm-agent wait --mode report`이 부분 fan-out에서 영원히 timeout되던 문제** — fallback path `team.result.status`가 팀 전체 agent를 count해서 6명 팀에 3명만 delegate하면 영원히 `all_done=false`. `agentFilter`/`activeOnly` 옵션 추가로 wait이 active task 있는 agent만 카운트.
+
+### Added
+- **Agent auto-reply detector** — agent CLI(Claude/Codex)가 응답에 STATUS 5-line header 텍스트만 출력하고 `tm-agent reply` shell command를 안 부르면 task가 영원히 `assigned`로 stuck되던 문제 해소. headless agent는 daemon PTY reader에서, GUI agent는 ghostty scrollback polling으로 5라인 헤더(`STATUS: ... FILES: ... VERIFY: ... NEXT: ... FULL_REPORT: ...`)를 자동 감지해 `team.report` + `team.task.update`를 leader 대신 호출. 500ms idle debounce + 5s hard cap + per-task content_hash dedup. `TERMMESH_AUTO_REPLY=off`로 끌 수 있음.
+
+### Changed
+- **Agent init prompt 강조 메시지 강화** — `[REQUIRED FINAL STEP — you MUST run this shell command]` 블록을 prompt 최상단으로 이동 + literal command block + "printing the header in your response is NOT enough" 경고. agent가 reply shell command 호출 누락하는 빈도를 prompt-side에서도 줄임 (detector는 safety net).
+
+### Thanks to 1 contributor!
+
+- [@JINWOO-J](https://github.com/JINWOO-J)
+
 ## [0.124.0] - 2026-05-18
 
 ### Fixed

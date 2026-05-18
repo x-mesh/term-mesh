@@ -2453,17 +2453,41 @@ class TerminalController {
         if staggerNs > 0 {
             try? await Task.sleep(nanoseconds: staggerNs)
         }
-        // Resolve the correct tabManager from the team's workspace, not self.tabManager
-        let success = await MainActor.run {
-            let tabManager = TeamOrchestrator.shared.resolveTabManager(teamName: teamName) ?? self.tabManager
-            guard let tabManager else { return false }
-            return TeamOrchestrator.shared.sendToAgent(
-                teamName: teamName, agentName: agentName, text: text, tabManager: tabManager,
-                withReturn: false // Return is sent separately by Rust CLI via team.send_key
-            )
+        // Resolve the correct tabManager from the team's workspace, not self.tabManager.
+        // Use the same finalizePaste-ack pattern as asyncTeamDelegate so the caller
+        // (Rust CLI) doesn't fire Enter until the paste has fully landed in the agent's
+        // input field. Previously this returned text_delivered=true unconditionally,
+        // which let send_return_key_with_retry race the paste mid-stream and truncated
+        // long init prompts to whatever had been pasted before Enter arrived.
+        //
+        // 12s last-resort timeout mirrors asyncTeamDelegate: it must exceed the paste
+        // watchdog (8s) + max retry backoff (~2s) so it doesn't trip a still-live paste.
+        var dispatched = false
+        let textDelivered: Bool = await withCheckedContinuation { cont in
+            var resumed = false
+            let resume: (Bool) -> Void = { ok in
+                guard !resumed else { return }
+                resumed = true
+                cont.resume(returning: ok)
+            }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 12.0) { resume(false) }
+            Task { @MainActor in
+                let tabManager = TeamOrchestrator.shared.resolveTabManager(teamName: teamName) ?? self.tabManager
+                guard let tabManager else { resume(false); return }
+                let ok = TeamOrchestrator.shared.sendToAgent(
+                    teamName: teamName,
+                    agentName: agentName,
+                    text: text,
+                    tabManager: tabManager,
+                    withReturn: false, // Return is sent separately by Rust CLI via team.send_key
+                    completion: { ack in resume(ack) }
+                )
+                dispatched = ok
+                if !ok { resume(false) }
+            }
         }
-        return success
-            ? v2Ok(id: id, result: ["sent": true, "text_delivered": true, "team_name": teamName, "agent_name": agentName])
+        return dispatched
+            ? v2Ok(id: id, result: ["sent": true, "text_delivered": textDelivered, "team_name": teamName, "agent_name": agentName])
             : v2Error(id: id, code: "not_found", message: "Agent or team not found")
     }
 
@@ -3473,7 +3497,13 @@ class TerminalController {
         guard let teamName = params["team_name"] as? String else {
             return v2Error(id: id, code: "invalid_params", message: "Missing team_name")
         }
-        let status = store.resultStatus(teamName: teamName)
+        let agentFilter = params["agents"] as? [String]
+        let activeOnly = params["active_only"] as? Bool ?? false
+        let status = store.resultStatus(
+            teamName: teamName,
+            agentFilter: agentFilter,
+            activeOnly: activeOnly
+        )
         if status.isEmpty {
             return v2Error(id: id, code: "not_found", message: "Team not found")
         }

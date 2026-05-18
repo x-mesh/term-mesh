@@ -73,6 +73,9 @@
 		4C9D95957760492496CD2E3E /* RolePresetEditorView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 813264D854BA4B5F9AA4F9FC /* RolePresetEditorView.swift */; };
 		A5001710 /* TeamOrchestrator.swift in Sources */ = {isa = PBXBuildFile; fileRef = A5001711 /* TeamOrchestrator.swift */; };
 		A5001720 /* TeamDataStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = A5001721 /* TeamDataStore.swift */; };
+		ARD00002 /* AutoReplyDetector.swift in Sources */ = {isa = PBXBuildFile; fileRef = ARD00001 /* AutoReplyDetector.swift */; };
+		ARE00002 /* AutoReplyEmit.swift in Sources */ = {isa = PBXBuildFile; fileRef = ARE00001 /* AutoReplyEmit.swift */; };
+		ARP00002 /* AutoReplyPoller.swift in Sources */ = {isa = PBXBuildFile; fileRef = ARP00001 /* AutoReplyPoller.swift */; };
 		A5001702 /* DashboardController.swift in Sources */ = {isa = PBXBuildFile; fileRef = A5001703 /* DashboardController.swift */; };
 		A5001704 /* dashboard in Resources */ = {isa = PBXBuildFile; fileRef = A5001705 /* dashboard */; };
 		ARB00002 /* AgentRunbookService.swift in Sources */ = {isa = PBXBuildFile; fileRef = ARB00001 /* AgentRunbookService.swift */; };
@@ -293,6 +296,9 @@
 		813264D854BA4B5F9AA4F9FC /* RolePresetEditorView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RolePresetEditorView.swift; sourceTree = "<group>"; };
 		A5001711 /* TeamOrchestrator.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TeamOrchestrator.swift; sourceTree = "<group>"; };
 		A5001721 /* TeamDataStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TeamDataStore.swift; sourceTree = "<group>"; };
+		ARD00001 /* AutoReplyDetector.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AutoReplyDetector.swift; sourceTree = "<group>"; };
+		ARE00001 /* AutoReplyEmit.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AutoReplyEmit.swift; sourceTree = "<group>"; };
+		ARP00001 /* AutoReplyPoller.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AutoReplyPoller.swift; sourceTree = "<group>"; };
 		A5001703 /* DashboardController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DashboardController.swift; sourceTree = "<group>"; };
 		A5001705 /* dashboard */ = {isa = PBXFileReference; lastKnownFileType = folder; path = dashboard; sourceTree = "<group>"; };
 		ARB00001 /* AgentRunbookService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AgentRunbookService.swift; sourceTree = "<group>"; };
@@ -579,6 +585,9 @@
 				A5001701 /* TermMeshDaemon.swift */,
 				A5001711 /* TeamOrchestrator.swift */,
 				A5001721 /* TeamDataStore.swift */,
+				ARD00001 /* AutoReplyDetector.swift */,
+				ARE00001 /* AutoReplyEmit.swift */,
+				ARP00001 /* AutoReplyPoller.swift */,
 				ARB00001 /* AgentRunbookService.swift */,
 				ARB00003 /* AgentRunbookSettingsView.swift */,
 				CPF00001 /* CliProfile.swift */,
@@ -912,6 +921,9 @@
 				A5001700 /* TermMeshDaemon.swift in Sources */,
 				A5001710 /* TeamOrchestrator.swift in Sources */,
 				A5001720 /* TeamDataStore.swift in Sources */,
+				ARD00002 /* AutoReplyDetector.swift in Sources */,
+				ARE00002 /* AutoReplyEmit.swift in Sources */,
+				ARP00002 /* AutoReplyPoller.swift in Sources */,
 				ARB00002 /* AgentRunbookService.swift in Sources */,
 				ARB00004 /* AgentRunbookSettingsView.swift in Sources */,
 				CPF00002 /* CliProfile.swift in Sources */,
@@ -1095,7 +1107,7 @@
 				CODE_SIGN_ENTITLEMENTS = "";
 				CODE_SIGN_STYLE = Automatic;
 				COMBINE_HIDPI_IMAGES = YES;
-				CURRENT_PROJECT_VERSION = 182;
+				CURRENT_PROJECT_VERSION = 183;
 				DEVELOPMENT_TEAM = "";
 				ENABLE_HARDENED_RUNTIME = NO;
 				GENERATE_INFOPLIST_FILE = NO;
@@ -1104,7 +1116,7 @@
 					"$(inherited)",
 					"@executable_path/../Frameworks",
 				);
-				MARKETING_VERSION = 0.124.0;
+				MARKETING_VERSION = 0.125.0;
 				OTHER_LDFLAGS = (
 					"-lc++",
 					"-framework",
@@ -1134,7 +1146,7 @@
 				CODE_SIGN_ENTITLEMENTS = "";
 				CODE_SIGN_STYLE = Automatic;
 				COMBINE_HIDPI_IMAGES = YES;
-				CURRENT_PROJECT_VERSION = 182;
+				CURRENT_PROJECT_VERSION = 183;
 				DEVELOPMENT_TEAM = "";
 				ENABLE_HARDENED_RUNTIME = NO;
 				GENERATE_INFOPLIST_FILE = NO;
@@ -1143,7 +1155,7 @@
 					"$(inherited)",
 					"@executable_path/../Frameworks",
 				);
-				MARKETING_VERSION = 0.124.0;
+				MARKETING_VERSION = 0.125.0;
 				OTHER_LDFLAGS = (
 					"-lc++",
 					"-framework",
@@ -1197,10 +1209,10 @@
 			isa = XCBuildConfiguration;
 			buildSettings = {
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 182;
+				CURRENT_PROJECT_VERSION = 183;
 				GENERATE_INFOPLIST_FILE = YES;
 				MACOSX_DEPLOYMENT_TARGET = 14.0;
-				MARKETING_VERSION = 0.124.0;
+				MARKETING_VERSION = 0.125.0;
 				ONLY_ACTIVE_ARCH = YES;
 				PRODUCT_BUNDLE_IDENTIFIER = com.termmesh.appuitests;
 				PRODUCT_NAME = "$(TARGET_NAME)";
@@ -1214,10 +1226,10 @@
 			isa = XCBuildConfiguration;
 			buildSettings = {
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 182;
+				CURRENT_PROJECT_VERSION = 183;
 				GENERATE_INFOPLIST_FILE = YES;
 				MACOSX_DEPLOYMENT_TARGET = 14.0;
-				MARKETING_VERSION = 0.124.0;
+				MARKETING_VERSION = 0.125.0;
 				ONLY_ACTIVE_ARCH = YES;
 				PRODUCT_BUNDLE_IDENTIFIER = com.termmesh.appuitests;
 				PRODUCT_NAME = "$(TARGET_NAME)";
@@ -1231,10 +1243,10 @@
 			buildSettings = {
 				BUNDLE_LOADER = "$(TEST_HOST)";
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 182;
+				CURRENT_PROJECT_VERSION = 183;
 				GENERATE_INFOPLIST_FILE = YES;
 				MACOSX_DEPLOYMENT_TARGET = 14.0;
-				MARKETING_VERSION = 0.124.0;
+				MARKETING_VERSION = 0.125.0;
 				ONLY_ACTIVE_ARCH = YES;
 				PRODUCT_BUNDLE_IDENTIFIER = com.termmesh.apptests;
 				PRODUCT_NAME = "$(TARGET_NAME)";
@@ -1250,10 +1262,10 @@
 			buildSettings = {
 				BUNDLE_LOADER = "$(TEST_HOST)";
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 182;
+				CURRENT_PROJECT_VERSION = 183;
 				GENERATE_INFOPLIST_FILE = YES;
 				MACOSX_DEPLOYMENT_TARGET = 14.0;
-				MARKETING_VERSION = 0.124.0;
+				MARKETING_VERSION = 0.125.0;
 				ONLY_ACTIVE_ARCH = YES;
 				PRODUCT_BUNDLE_IDENTIFIER = com.termmesh.apptests;
 				PRODUCT_NAME = "$(TARGET_NAME)";
