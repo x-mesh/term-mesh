@@ -4,6 +4,14 @@ All notable changes to term-mesh are documented here.
 
 ## [Unreleased]
 
+## [0.122.0] - 2026-05-18
+
+### Fixed
+- **사이드바 update pill이 항상 *가장 최신* 버전 표시** — 이전엔 사용자 로컬 brew tap 클론이 stale이면 한 단계 옛 버전만 보여서 latest까지 도달하려면 update를 여러 번 해야 했다. 이제 boot 시점과 매 시간 tap refresh 직후에 outdated check를 자동 chain해 pill이 항상 truly-latest 버전을 가리킨다.
+- **Resumable Teams 좀비 archive 제거** — destroyed로 표시되지만 휴지통만 누를 수 있고 Resume 버튼은 비활성화된 좀비 entry가 쌓이던 문제. `archive_pane` RPC가 매번 새 UUID를 발급해 중복 archive가 양산되던 것을 idempotent(replace-in-place)로 정정. pane 팀 종료 시 실제 Claude session id를 FSEventStream으로 캡처해 archive에 함께 저장하므로 다음 launch에서 Resume 버튼이 정상적으로 활성화된다. 부팅 시 session id가 빠진 기존 좀비 archive는 자동 GC.
+- **Gemini runbook 경로 복원** — 0.121.0 이후 daemon이 Gemini runbook을 잘못된 경로에서 찾던 문제. 기존 `$HOME/.agents/skills` 경로로 복원.
+- **머지 중복 broadcaster 제거** — origin/main merge 후 broadcaster가 중복 등록되어 동일 이벤트를 두 번 처리하던 문제 수정.
+
 ## [0.121.0] - 2026-05-18
 
 ### Added

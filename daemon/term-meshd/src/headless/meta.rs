@@ -429,6 +429,58 @@ pub fn rename_to_live(archived_dir: &Path, team_uuid: &str) -> Result<PathBuf, S
     Ok(to)
 }
 
+/// Zombie sweep: remove archived pane-mode teams that can never be resumed
+/// (leader and every agent lack a `session_id`). Ignores retention age — a
+/// pane archive without any session IDs is dead weight and clutters the
+/// resume picker. Returns count removed.
+///
+/// Runs alongside `gc_sweep` at boot and lazily on each `list_resumable`
+/// call so stale entries are pruned without waiting for the 7d window.
+pub fn sweep_zombie_pane_archives() -> usize {
+    let entries = match list_archived_teams() {
+        Ok(v) => v,
+        Err(_) => return 0,
+    };
+    let mut removed = 0usize;
+    for entry in entries {
+        let team_meta = match read_team_meta(&entry.archived_dir) {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
+        if team_meta.execution_mode != "pane" {
+            continue;
+        }
+        if team_meta.leader.session_id.is_some() {
+            continue;
+        }
+        let agent_metas = read_all_agent_metas(&entry.archived_dir, &entry.team_uuid);
+        let all_sessions_missing = team_meta.agents.iter().all(|name| match agent_metas.get(name) {
+            Some(m) => m.session_id.is_none(),
+            None => true,
+        });
+        if !all_sessions_missing {
+            continue;
+        }
+        match std::fs::remove_dir_all(&entry.archived_dir) {
+            Ok(_) => {
+                tracing::info!(
+                    "headless gc: removed zombie pane archive {} (uuid={}, no resumable sessions)",
+                    entry.archived_dir.display(),
+                    entry.team_uuid
+                );
+                removed += 1;
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "headless gc: failed to remove zombie pane archive {}: {e}",
+                    entry.archived_dir.display()
+                );
+            }
+        }
+    }
+    removed
+}
+
 /// GC sweep: remove archived dirs older than 7d.
 /// Returns count removed.
 pub fn gc_sweep() -> usize {
