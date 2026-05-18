@@ -2255,8 +2255,8 @@ mod runbook_tests {
 
     #[test]
     fn return_retry_policy_is_conservative_when_text_delivery_failed() {
-        assert_eq!(return_retry_delays_ms(true), &[250, 400, 600, 800, 1000]);
-        assert_eq!(return_retry_delays_ms(false), &[200, 500]);
+        assert_eq!(return_retry_delays_ms(true), &[250, 400, 600, 800, 1000, 1500, 2500, 4000]);
+        assert_eq!(return_retry_delays_ms(false), &[200, 500, 1000, 2000]);
     }
 }
 
