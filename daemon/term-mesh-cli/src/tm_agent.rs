@@ -5521,6 +5521,16 @@ fn run_create(
             }
 
             eprintln!("Sending init prompts to non-kiro agents...");
+            // Cold-start protection for the first agent. Subsequent agents
+            // get a 1s inter-send delay (below) that incidentally warms them
+            // up, but the FIRST agent has no such cushion — its ghostty
+            // IO thread + TUI input pipeline are freshly spawned and have
+            // been observed to truncate long pastes (the ~2000-char init
+            // prompt) even with the Swift-side cold bonus. Give them 2s.
+            if !non_kiro.is_empty() {
+                eprintln!("  ...warming up before first init (2s)");
+                thread::sleep(Duration::from_secs(2));
+            }
             for a in &non_kiro {
                 let name = a["name"].as_str().unwrap_or("");
                 let role = a["agent_type"].as_str().unwrap_or(name);

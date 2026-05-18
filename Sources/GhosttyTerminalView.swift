@@ -1272,12 +1272,17 @@ final class TerminalSurface: Identifiable, ObservableObject {
             // the rest is discarded).
             //
             // Heuristic:
-            // - Base: max(50ms, min(600ms, len/16)) — scales with paste size
-            // - Cold-start bonus: +300ms on the first paste per surface, when
-            //   ghostty + the TUI haven't warmed their IO/render pipelines yet.
-            //   Observed symptom: 4-agent spawn, only the first pane truncates.
-            let baseMs = max(50, min(600, p.text.count / 16))
-            let coldBonusMs = self.hasCompletedPaste ? 0 : 300
+            // - Base: max(50ms, min(800ms, len/8)) — scales with paste size.
+            //   2026-05-18: bumped from len/16 to len/8 after observing the
+            //   first pane in a 4-agent spawn still truncating with the
+            //   smaller ratio. ghostty's IO thread + the TUI's input pipeline
+            //   take longer than the linear estimate on first-touch.
+            // - Cold-start bonus: +1000ms on the first paste per surface,
+            //   when ghostty + the TUI haven't warmed their IO/render
+            //   pipelines yet. 300ms was insufficient; 1000ms gives the
+            //   cold first-pane enough headroom to drain before Enter.
+            let baseMs = max(50, min(800, p.text.count / 8))
+            let coldBonusMs = self.hasCompletedPaste ? 0 : 1000
             let waitMs = baseMs + coldBonusMs
             DispatchQueue.main.asyncAfter(deadline: .now() + Double(waitMs) / 1000.0) { [weak self] in
                 guard let self else { return }
