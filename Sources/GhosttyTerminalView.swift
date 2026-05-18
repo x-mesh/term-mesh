@@ -1110,6 +1110,11 @@ final class TerminalSurface: Identifiable, ObservableObject {
     private var pasteInFlight: Bool = false
     private var pasteWatchdog: DispatchSourceTimer?
     private var pasteGeneration: Int = 0
+    /// True once this surface has completed at least one paste. Used to detect
+    /// the "cold start" case where ghostty's IO thread + the TUI's input
+    /// pipeline aren't yet warm — first long paste needs extra drain time
+    /// before we can safely fire the text_delivered ack.
+    private var hasCompletedPaste: Bool = false
     private static let maxPasteQueueDepth = 16
 
     /// Enqueues text+Return for serialized delivery via the paste queue,
@@ -1264,10 +1269,16 @@ final class TerminalSurface: Identifiable, ObservableObject {
             // ack to decide when to send Enter via team.send_key, and if it
             // fires Enter too early the paste truncates mid-stream (observed
             // with the ~2000-char agent init prompt — first ~700 chars submit,
-            // the rest is discarded). Scale the wait with text length so short
-            // pastes don't pay extra latency.
-            // Heuristic: ~1ms per 32 chars, floor 20ms, cap 400ms.
-            let waitMs = max(20, min(400, p.text.count / 32))
+            // the rest is discarded).
+            //
+            // Heuristic:
+            // - Base: max(50ms, min(600ms, len/16)) — scales with paste size
+            // - Cold-start bonus: +300ms on the first paste per surface, when
+            //   ghostty + the TUI haven't warmed their IO/render pipelines yet.
+            //   Observed symptom: 4-agent spawn, only the first pane truncates.
+            let baseMs = max(50, min(600, p.text.count / 16))
+            let coldBonusMs = self.hasCompletedPaste ? 0 : 300
+            let waitMs = baseMs + coldBonusMs
             DispatchQueue.main.asyncAfter(deadline: .now() + Double(waitMs) / 1000.0) { [weak self] in
                 guard let self else { return }
                 // Generation check: if a later paste was already queued and
@@ -1280,8 +1291,9 @@ final class TerminalSurface: Identifiable, ObservableObject {
                     #endif
                     return
                 }
+                self.hasCompletedPaste = true
                 #if DEBUG
-                dlog("paste.return.skipped.drain.complete gen=\(gen) waitMs=\(waitMs) textLen=\(p.text.count)")
+                dlog("paste.return.skipped.drain.complete gen=\(gen) waitMs=\(waitMs) baseMs=\(baseMs) coldBonusMs=\(coldBonusMs) textLen=\(p.text.count)")
                 #endif
                 self.finalizePaste(result: .success(()), completion: p.completion)
             }
@@ -1293,6 +1305,7 @@ final class TerminalSurface: Identifiable, ObservableObject {
         dlog("paste.return.sent gen=\(gen) handled=\(delivered)")
         #endif
         if delivered {
+            hasCompletedPaste = true
             finalizePaste(result: .success(()), completion: p.completion)
             return
         }
@@ -1305,6 +1318,7 @@ final class TerminalSurface: Identifiable, ObservableObject {
         dlog("paste.return.sent gen=\(gen) handled=\(retryDelivered) retry=sync")
         #endif
         if retryDelivered {
+            hasCompletedPaste = true
             finalizePaste(result: .success(()), completion: p.completion)
             return
         }
