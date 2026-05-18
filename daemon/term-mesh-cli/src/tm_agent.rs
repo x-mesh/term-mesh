@@ -20,7 +20,7 @@ mod prompts;
 use clap::{Parser, Subcommand};
 use serde_json::{json, Value};
 use std::fs;
-use std::io::{BufRead, BufReader, ErrorKind, Write};
+use std::io::{BufRead, BufReader, ErrorKind, IsTerminal, Write};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -170,8 +170,12 @@ enum Commands {
     },
     /// Show team status
     Status,
-    /// Check agent inbox
-    Inbox,
+    /// Check agent inbox (pretty table by default on tty; pass --json for raw RPC output)
+    Inbox {
+        /// Force raw JSON output (otherwise pretty table when stdout is a tty)
+        #[arg(long)]
+        json: bool,
+    },
     /// Execute multiple commands in a single socket roundtrip
     Batch {
         /// Commands separated by semicolons (e.g., "send a:msg1; send b:msg2; status")
@@ -445,6 +449,9 @@ enum Commands {
         text: Vec<String>,
         #[arg(long)]
         from: Option<String>,
+        /// Explicit task id to close (skips auto-selection when multiple active tasks exist)
+        #[arg(long = "task-id")]
+        task_id: Option<String>,
     },
     /// Stream events from the daemon as JSONL (push channel for leader sessions)
     Watch {
@@ -718,8 +725,27 @@ enum TaskCommands {
     Review { id: String, summary: Option<String> },
     /// Get task details
     Get { id: String },
-    /// List all tasks
-    List,
+    /// List all tasks (pretty table by default on tty; pass --json for raw RPC output)
+    List {
+        /// Force raw JSON output (otherwise pretty table when stdout is a tty)
+        #[arg(long)]
+        json: bool,
+        /// Filter by assignee
+        #[arg(long)]
+        assignee: Option<String>,
+        /// Filter by status (e.g. in_progress, assigned, completed)
+        #[arg(long)]
+        status: Option<String>,
+        /// Show only active tasks (assigned + in_progress, excluding stale)
+        #[arg(long)]
+        active: bool,
+    },
+    /// Show this agent's current active task (one-line summary)
+    Current {
+        /// Force raw JSON output
+        #[arg(long)]
+        json: bool,
+    },
     /// Update task status
     Update {
         id: String,
@@ -2547,6 +2573,223 @@ fn pretty(v: &Value) -> String {
     serde_json::to_string_pretty(v).unwrap_or_default()
 }
 
+/// True when stdout is a terminal — used to default pretty output without
+/// breaking pipes/scripts that parse raw JSON.
+fn stdout_is_tty() -> bool {
+    std::io::stdout().is_terminal()
+}
+
+/// Compact "12s" / "3m" / "2h" / "5d" age strings.
+fn humanize_age_secs(secs: i64) -> String {
+    if secs < 0 {
+        return "0s".to_string();
+    }
+    if secs < 60 {
+        format!("{secs}s")
+    } else if secs < 3600 {
+        format!("{}m", secs / 60)
+    } else if secs < 86400 {
+        format!("{}h", secs / 3600)
+    } else {
+        format!("{}d", secs / 86400)
+    }
+}
+
+/// Truncate to `n` chars (unicode-aware), append `…` when cut.
+fn truncate_chars(s: &str, n: usize) -> String {
+    let chars: Vec<char> = s.chars().collect();
+    if chars.len() <= n {
+        s.to_string()
+    } else {
+        let mut out: String = chars.into_iter().take(n.saturating_sub(1)).collect();
+        out.push('…');
+        out
+    }
+}
+
+/// Icon + status label for a task row.
+fn task_status_glyph(status: &str, is_stale: bool, needs_attention: bool) -> (&'static str, &'static str) {
+    match status {
+        "in_progress" => ("★", "in_progress"),
+        "assigned" if is_stale => ("⏳", "stale"),
+        "assigned" => ("◯", "assigned"),
+        "completed" => ("✓", "completed"),
+        "blocked" => ("✗", "blocked"),
+        "failed" => ("✗", "failed"),
+        "cancelled" => ("✗", "cancelled"),
+        "abandoned" => ("✗", "abandoned"),
+        "review_ready" | "needs_review" => ("🔍", "review"),
+        _ if needs_attention => ("⏳", status_or_unknown(status)),
+        _ => ("·", status_or_unknown(status)),
+    }
+}
+
+fn status_or_unknown(s: &str) -> &'static str {
+    // Convert dynamic str into a small static set without leaking; fall back to "?".
+    match s {
+        "open" => "open",
+        "queued" => "queued",
+        "running" => "running",
+        "pending" => "pending",
+        _ => "?",
+    }
+}
+
+/// Render `team.task.list` response as a compact table.
+fn format_task_list_pretty(v: &Value) -> String {
+    let tasks = match v["result"]["tasks"].as_array() {
+        Some(t) => t,
+        None => return "(no tasks)".to_string(),
+    };
+    if tasks.is_empty() {
+        return "(no tasks)".to_string();
+    }
+    let now_secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let mut lines: Vec<String> = Vec::with_capacity(tasks.len() + 1);
+    lines.push(format!(
+        "{:<2} {:<11} {:<8} {:<12} {:<5} {:>6}  {}",
+        "", "status", "id", "assignee", "prio", "age", "title"
+    ));
+    for t in tasks {
+        let status = t["status"].as_str().unwrap_or("?");
+        let is_stale = t["is_stale"].as_bool().unwrap_or(false);
+        let needs_attn = t["needs_attention"].as_bool().unwrap_or(false);
+        let (icon, label) = task_status_glyph(status, is_stale, needs_attn);
+        let id = t["id"].as_str().unwrap_or("");
+        let id_short: String = id.chars().take(8).collect();
+        let assignee = t["assignee"].as_str().unwrap_or("-");
+        let prio = t["priority"].as_u64().unwrap_or(0);
+        let age = task_age_seconds(t, now_secs);
+        let title = t["title"].as_str().unwrap_or("");
+        lines.push(format!(
+            "{:<2} {:<11} {:<8} {:<12} P{:<4} {:>6}  {}",
+            icon,
+            label,
+            id_short,
+            truncate_chars(assignee, 12),
+            prio,
+            humanize_age_secs(age),
+            truncate_chars(title, 60)
+        ));
+    }
+    lines.join("\n")
+}
+
+/// One-line summary for a single task (used by `task current`).
+fn format_task_oneline(t: &Value) -> String {
+    let now_secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let status = t["status"].as_str().unwrap_or("?");
+    let is_stale = t["is_stale"].as_bool().unwrap_or(false);
+    let needs_attn = t["needs_attention"].as_bool().unwrap_or(false);
+    let (icon, label) = task_status_glyph(status, is_stale, needs_attn);
+    let id = t["id"].as_str().unwrap_or("");
+    let id_short: String = id.chars().take(8).collect();
+    let prio = t["priority"].as_u64().unwrap_or(0);
+    let age = task_age_seconds(t, now_secs);
+    let title = t["title"].as_str().unwrap_or("");
+    format!(
+        "{} {} [P{}] {} {} — \"{}\"",
+        icon,
+        id_short,
+        prio,
+        label,
+        humanize_age_secs(age),
+        truncate_chars(title, 80)
+    )
+}
+
+/// Best-effort age in seconds — prefers server-supplied `stale_seconds` or a
+/// timestamp delta from `last_progress_at`/`updated_at`/`created_at`.
+fn task_age_seconds(t: &Value, now_secs: i64) -> i64 {
+    if let Some(s) = t["stale_seconds"].as_i64() {
+        return s.max(0);
+    }
+    for field in ["last_progress_at", "updated_at", "created_at"] {
+        if let Some(ts) = t[field].as_str() {
+            if let Some(d) = parse_rfc3339_to_unix(ts) {
+                return (now_secs - d).max(0);
+            }
+        }
+    }
+    0
+}
+
+/// Minimal ISO-8601/RFC3339 parser (`2026-05-18T02:07:14Z`) → unix seconds.
+fn parse_rfc3339_to_unix(s: &str) -> Option<i64> {
+    if s.len() < 20 || !s.ends_with('Z') {
+        return None;
+    }
+    let year: i64 = s.get(0..4)?.parse().ok()?;
+    let month: i64 = s.get(5..7)?.parse().ok()?;
+    let day: i64 = s.get(8..10)?.parse().ok()?;
+    let hour: i64 = s.get(11..13)?.parse().ok()?;
+    let minute: i64 = s.get(14..16)?.parse().ok()?;
+    let second: i64 = s.get(17..19)?.parse().ok()?;
+    // Days from civil — Howard Hinnant's formula.
+    let y = if month <= 2 { year - 1 } else { year };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = (y - era * 400) as i64;
+    let m = month as i64;
+    let d = day as i64;
+    let doy = (153 * (m + if m > 2 { -3 } else { 9 }) + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146097 + doe - 719468;
+    Some(days * 86400 + hour * 3600 + minute * 60 + second)
+}
+
+/// Render `team.inbox` response as a compact table.
+fn format_inbox_pretty(v: &Value) -> String {
+    let items = match v["result"]["items"].as_array() {
+        Some(i) => i,
+        None => return "(empty inbox)".to_string(),
+    };
+    if items.is_empty() {
+        return "(empty inbox)".to_string();
+    }
+    let mut lines: Vec<String> = Vec::with_capacity(items.len() + 1);
+    lines.push(format!(
+        "{:<2} {:<8} {:<10} {:<12} {:<5} {:>6}  {}",
+        "", "kind", "status", "from", "prio", "age", "summary/title"
+    ));
+    for it in items {
+        let kind = it["kind"].as_str().unwrap_or("?");
+        let status = it["status"].as_str().unwrap_or("-");
+        let is_stale = it["is_stale"].as_bool().unwrap_or(false);
+        let age = it["age_seconds"].as_i64().unwrap_or(0);
+        let from = it["agent_name"].as_str().unwrap_or("-");
+        let prio = it["priority"].as_u64().unwrap_or(0);
+        let title = it["task_title"]
+            .as_str()
+            .or_else(|| it["summary"].as_str())
+            .or_else(|| it["reason"].as_str())
+            .unwrap_or("");
+        let icon = match kind {
+            _ if is_stale => "⏳",
+            "task" => "★",
+            "report" => "📄",
+            "note" => "·",
+            _ => "·",
+        };
+        lines.push(format!(
+            "{:<2} {:<8} {:<10} {:<12} P{:<4} {:>6}  {}",
+            icon,
+            truncate_chars(kind, 8),
+            truncate_chars(status, 10),
+            truncate_chars(from, 12),
+            prio,
+            humanize_age_secs(age),
+            truncate_chars(title, 60)
+        ));
+    }
+    lines.join("\n")
+}
+
 /// Run heartbeat in a loop every `interval` seconds.
 /// Stops when the parent process exits (detected via kill -0) or SIGINT/SIGTERM.
 fn run_heartbeat_auto(
@@ -2960,26 +3203,51 @@ fn atomic_write_file(path: &Path, content: &str) -> Result<(), String> {
     ))
 }
 
-fn reply_target_task_id(sock: &PathBuf, team: &str, sender: &str) -> Option<String> {
-    let task_resp = rpc_call(
+/// Pick the task that `tm-agent reply` should close, plus the full list of
+/// non-terminal candidate task ids for that sender.
+///
+/// Priority: non-stale tasks first, then `in_progress` over `assigned`/other,
+/// then most recent `created_at` wins. Returns `(selected_id, all_candidates)`.
+fn select_reply_task(sock: &PathBuf, team: &str, sender: &str) -> (Option<String>, Vec<String>) {
+    let Ok(task_resp) = rpc_call(
         sock,
         "team.task.list",
-        json!({
-            "team_name": team, "assignee": sender
-        }),
-    )
-    .ok()?;
-    let tasks = task_resp["result"]["tasks"].as_array()?;
-    let target_task = tasks
+        json!({ "team_name": team, "assignee": sender }),
+    ) else {
+        return (None, Vec::new());
+    };
+    let Some(tasks) = task_resp["result"]["tasks"].as_array() else {
+        return (None, Vec::new());
+    };
+    let mut candidates: Vec<&Value> = tasks
         .iter()
-        .find(|t| t["status"].as_str() == Some("in_progress"))
-        .or_else(|| {
-            tasks.iter().find(|t| {
-                let st = t["status"].as_str().unwrap_or("");
-                st != "completed" && st != "failed" && st != "abandoned"
-            })
-        })?;
-    target_task["id"].as_str().map(str::to_string)
+        .filter(|t| {
+            let st = t["status"].as_str().unwrap_or("");
+            !matches!(
+                st,
+                "completed" | "failed" | "abandoned" | "cancelled" | "superseded"
+            )
+        })
+        .collect();
+    // Sort by (non-stale first, in_progress first, created_at desc).
+    candidates.sort_by(|a, b| {
+        let stale_a = a["is_stale"].as_bool().unwrap_or(false);
+        let stale_b = b["is_stale"].as_bool().unwrap_or(false);
+        let ip_a = a["status"].as_str() == Some("in_progress");
+        let ip_b = b["status"].as_str() == Some("in_progress");
+        let created_a = a["created_at"].as_str().unwrap_or("");
+        let created_b = b["created_at"].as_str().unwrap_or("");
+        stale_a
+            .cmp(&stale_b) // false < true → non-stale first
+            .then_with(|| ip_b.cmp(&ip_a)) // true < false swap → in_progress first
+            .then_with(|| created_b.cmp(created_a)) // newer created_at first
+    });
+    let all: Vec<String> = candidates
+        .iter()
+        .filter_map(|t| t["id"].as_str().map(str::to_string))
+        .collect();
+    let selected = all.first().cloned();
+    (selected, all)
 }
 
 fn return_retry_delays_ms(text_delivered: bool) -> &'static [u64] {
@@ -3564,8 +3832,91 @@ fn main() {
                         "team_name": team, "task_id": id,
                     }),
                 ),
-                TaskCommands::List => {
-                    rpc_call(&sock, "team.task.list", json!({ "team_name": team }))
+                TaskCommands::List {
+                    json: as_json,
+                    assignee,
+                    status,
+                    active,
+                } => {
+                    let mut params = json!({ "team_name": team });
+                    if let Some(a) = assignee.as_ref() {
+                        params["assignee"] = json!(a);
+                    }
+                    if let Some(s) = status.as_ref() {
+                        params["status"] = json!(s);
+                    }
+                    let result = rpc_call(&sock, "team.task.list", params);
+                    match result {
+                        Ok(mut v) => {
+                            if active {
+                                if let Some(arr) = v["result"]["tasks"].as_array_mut() {
+                                    arr.retain(|t| {
+                                        let st = t["status"].as_str().unwrap_or("");
+                                        let stale = t["is_stale"].as_bool().unwrap_or(false);
+                                        !stale && (st == "assigned" || st == "in_progress")
+                                    });
+                                }
+                            }
+                            if as_json || !stdout_is_tty() {
+                                println!("{}", pretty(&v));
+                            } else {
+                                println!("{}", format_task_list_pretty(&v));
+                            }
+                            return;
+                        }
+                        Err(e) => {
+                            eprintln!("Error: {e}");
+                            process::exit(1);
+                        }
+                    }
+                }
+                TaskCommands::Current { json: as_json } => {
+                    let task_resp = rpc_call(
+                        &sock,
+                        "team.task.list",
+                        json!({ "team_name": team, "assignee": &agent }),
+                    );
+                    match task_resp {
+                        Ok(v) => {
+                            let tasks = v["result"]["tasks"].as_array().cloned().unwrap_or_default();
+                            let mut candidates: Vec<&Value> = tasks
+                                .iter()
+                                .filter(|t| {
+                                    matches!(
+                                        t["status"].as_str().unwrap_or(""),
+                                        "in_progress" | "assigned"
+                                    )
+                                })
+                                .collect();
+                            candidates.sort_by(|a, b| {
+                                let sa = a["is_stale"].as_bool().unwrap_or(false);
+                                let sb = b["is_stale"].as_bool().unwrap_or(false);
+                                let ia = a["status"].as_str() == Some("in_progress");
+                                let ib = b["status"].as_str() == Some("in_progress");
+                                let ca = a["created_at"].as_str().unwrap_or("");
+                                let cb = b["created_at"].as_str().unwrap_or("");
+                                sa.cmp(&sb).then_with(|| ib.cmp(&ia)).then_with(|| cb.cmp(ca))
+                            });
+                            match candidates.first() {
+                                Some(t) => {
+                                    if as_json {
+                                        println!("{}", pretty(t));
+                                    } else {
+                                        println!("{}", format_task_oneline(t));
+                                    }
+                                    return;
+                                }
+                                None => {
+                                    eprintln!("no active task");
+                                    process::exit(1);
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!("Error: {e}");
+                            process::exit(1);
+                        }
+                    }
                 }
                 TaskCommands::Update { id, status, result } => {
                     let mut params = json!({
@@ -3771,13 +4122,27 @@ fn main() {
             }
             Ok(status)
         }
-        Commands::Inbox => rpc_call(
-            &sock,
-            "team.inbox",
-            json!({
-                "team_name": team, "agent_name": agent,
-            }),
-        ),
+        Commands::Inbox { json: as_json } => {
+            let result = rpc_call(
+                &sock,
+                "team.inbox",
+                json!({ "team_name": team, "agent_name": agent }),
+            );
+            match result {
+                Ok(v) => {
+                    if as_json || !stdout_is_tty() {
+                        println!("{}", pretty(&v));
+                    } else {
+                        println!("{}", format_inbox_pretty(&v));
+                    }
+                    return;
+                }
+                Err(e) => {
+                    eprintln!("Error: {e}");
+                    process::exit(1);
+                }
+            }
+        }
         Commands::Batch { commands } => {
             let payloads = match parse_batch_commands(&commands, &team) {
                 Ok(p) => p,
@@ -4417,12 +4782,23 @@ fn main() {
             run_brief(&sock, &team, target, lines);
             return;
         }
-        Commands::Reply { text, from } => {
+        Commands::Reply { text, from, task_id: explicit_task_id } => {
             let sender = from.unwrap_or_else(|| agent.clone());
             let content = text.join(" ");
             // Write the canonical task result when possible, plus the legacy
             // per-agent alias for compatibility with older readers.
-            let reply_task_id = reply_target_task_id(&sock, &team, &sender);
+            let reply_task_id = if let Some(tid) = explicit_task_id {
+                Some(tid)
+            } else {
+                let (selected, candidates) = select_reply_task(&sock, &team, &sender);
+                if candidates.len() >= 2 {
+                    eprintln!(
+                        "  Warning: multiple candidate tasks for {sender}: {} — pass --task-id explicitly to disambiguate.",
+                        candidates.join(" ")
+                    );
+                }
+                selected
+            };
             let alias_result_path =
                 write_result_file(&team, &format!("{sender}-reply.md"), &content).ok();
             let task_result_path = reply_task_id
@@ -4456,7 +4832,7 @@ fn main() {
             // (UI command, MainActor) to avoid timeout when main thread is busy —
             // a timeout here silently skips task completion, causing the leader's
             // `wait` to hang indefinitely.
-            if let Some(tid) = reply_task_id {
+            if let Some(tid) = reply_task_id.as_deref() {
                 let mut update = json!({
                     "team_name": &team, "task_id": tid,
                     "status": "completed", "result": &summary,
@@ -4470,8 +4846,22 @@ fn main() {
                     eprintln!("  Warning: task.update failed: {e}, retrying...");
                     let _ = rpc_call(&sock, "team.task.update", update);
                 }
+                eprintln!("closed task {tid} for {sender}");
             } else {
+                // Emit a structured JSON error so leader-side parsers can
+                // recognize the condition (and exit 2 to distinguish from
+                // RPC/transport failures which already exit 1).
+                let err = json!({
+                    "ok": false,
+                    "error": {
+                        "code": "no_active_task",
+                        "message": format!("no active task found for {sender}; wrote reply alias only"),
+                        "sender": sender,
+                    }
+                });
+                eprintln!("{}", pretty(&err));
                 eprintln!("  Warning: no active task found for {sender}; wrote reply alias only");
+                process::exit(2);
             }
             return;
         }

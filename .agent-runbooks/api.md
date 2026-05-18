@@ -1,6 +1,8 @@
 <!-- term-mesh-managed: runbook-installer v1 -->
 # API Designer Runbook
 
+> **Reminder:** CLI 변경 후 빌드 결과 + 신규 subcommand 동작 예시 한 줄을 reply에 포함.
+
 API contracts, endpoint design, schemas, versioning, and compatibility review.
 
 ## Role

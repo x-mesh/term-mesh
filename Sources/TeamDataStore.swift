@@ -380,7 +380,11 @@ final class TeamDataStore: ObservableObject, @unchecked Sendable {
             case "review_ready":
                 tasks[idx].lastProgressAt = now
                 tasks[idx].blockedReason = nil
-            case "completed", "failed", "abandoned":
+            case "completed", "failed", "abandoned", "cancelled":
+                // Phase E Wave 1: include "cancelled" so daemon-driven auto
+                // transitions stamp completedAt and let `activeTask` filter
+                // (terminalStatuses) drop the row — keeps sidebar's
+                // active_task_id in sync without a per-agent cache.
                 tasks[idx].completedAt = now
                 tasks[idx].lastProgressAt = now
                 if normalizedStatus == "completed" {
@@ -584,12 +588,26 @@ final class TeamDataStore: ObservableObject, @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
 
-        // Active task: most recently updated non-terminal task assigned to this agent
-        let terminalStatuses: Set<String> = ["completed", "failed", "abandoned"]
+        // Active task: most recently updated non-terminal task assigned to this agent.
+        // Phase E Wave 1: "cancelled" joins the terminal set so daemon-driven
+        // cancellation clears the sidebar's active_task_id pointer in the same
+        // tick as the status flip (no per-agent cache to invalidate — the
+        // derived filter is the single source of truth).
+        let terminalStatuses: Set<String> = ["completed", "failed", "abandoned", "cancelled"]
         let activeTask = taskBoards[teamName, default: []]
             .filter { $0.assignee == agentName && !terminalStatuses.contains($0.status) }
             .sorted { $0.updatedAt > $1.updatedAt }
             .first
+
+        // Task staleness (computed before agent_state so we can derive
+        // "assigned_stale" when an assigned task hasn't progressed in time).
+        let isTaskStale: Bool
+        if let task = activeTask, !terminalStatuses.contains(task.status) {
+            let anchor = task.lastProgressAt ?? task.startedAt ?? task.updatedAt
+            isTaskStale = Date().timeIntervalSince(anchor) >= staleTaskThreshold
+        } else {
+            isTaskStale = false
+        }
 
         // Runtime state derived from task status
         // Phase 2: "parked" is a daemon-authoritative state — when an agent's
@@ -598,29 +616,30 @@ final class TeamDataStore: ObservableObject, @unchecked Sendable {
         // flag into headlessAgentParked[teamName][agentName]. Parked overrides
         // task-derived state because there is no live subprocess regardless of
         // the task board entry. See docs/phase2-rpc-contract.md §5.
+        //
+        // Phase E Wave 1: "assigned_stale" surfaces a task that was assigned
+        // but never picked up (or has gone silent past the stale threshold).
+        // Sidebar renders this as an amber/⏳ indicator. Derived locally;
+        // daemon may also push the same label via an anomaly event in the
+        // future — both paths converge on the same case string.
         let agentState: String
         if isAgentParkedUnsafe(teamName: teamName, agentName: agentName) {
             agentState = "parked"
         } else if let task = activeTask {
-            switch task.status {
-            case "blocked": agentState = "blocked"
-            case "review_ready": agentState = "review_ready"
-            case "failed": agentState = "error"
-            case "queued", "assigned": agentState = "idle"
-            case "parked": agentState = "parked"
-            default: agentState = "running"
+            if (task.status == "assigned" || task.status == "queued") && isTaskStale {
+                agentState = "assigned_stale"
+            } else {
+                switch task.status {
+                case "blocked": agentState = "blocked"
+                case "review_ready": agentState = "review_ready"
+                case "failed": agentState = "error"
+                case "queued", "assigned": agentState = "idle"
+                case "parked": agentState = "parked"
+                default: agentState = "running"
+                }
             }
         } else {
             agentState = "idle"
-        }
-
-        // Task staleness
-        let isTaskStale: Bool
-        if let task = activeTask, !terminalStatuses.contains(task.status) {
-            let anchor = task.lastProgressAt ?? task.startedAt ?? task.updatedAt
-            isTaskStale = Date().timeIntervalSince(anchor) >= staleTaskThreshold
-        } else {
-            isTaskStale = false
         }
 
         // Heartbeat

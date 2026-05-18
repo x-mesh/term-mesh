@@ -134,6 +134,7 @@ impl TaskStatus {
                 | (Self::Pending, Self::Cancelled)
                 | (Self::Assigned, Self::InProgress)
                 | (Self::Assigned, Self::Cancelled)
+                | (Self::Assigned, Self::Blocked)
                 | (Self::InProgress, Self::Completed)
                 | (Self::InProgress, Self::Failed)
                 | (Self::InProgress, Self::Cancelled)
@@ -1253,6 +1254,27 @@ impl AgentSessionManager {
             ));
         }
 
+        // Wave 1 D2: reject if the target agent already has an in-flight task
+        // (assigned or in_progress). Re-assigning the same task to the same
+        // agent is allowed (idempotent no-op path) by excluding `task_id`.
+        let busy: Option<String> = inner
+            .db
+            .query_row(
+                "SELECT id FROM tasks
+                 WHERE assignee = ?1
+                   AND status IN ('assigned', 'in_progress')
+                   AND id != ?2
+                 LIMIT 1",
+                params![params.agent_id, params.task_id],
+                |row| row.get(0),
+            )
+            .ok();
+        if let Some(busy_id) = busy {
+            return Err(format!(
+                "already_busy: existing in-flight task {busy_id}"
+            ));
+        }
+
         // Check all deps are completed
         let deps = Self::load_deps(&inner.db, &params.task_id);
         if !deps.is_empty() {
@@ -1322,6 +1344,114 @@ impl AgentSessionManager {
         };
 
         rows.flatten().collect()
+    }
+
+    // -----------------------------------------------------------------------
+    // Wave 1 D5: assigned-state timeout handling
+    // -----------------------------------------------------------------------
+
+    /// Test-only: register a fake `running` agent without spawning a subprocess.
+    /// Used by unit tests that need to exercise task-assignment code paths.
+    #[cfg(test)]
+    pub fn testing_register_agent(&self, id: &str) {
+        let mut inner = self.inner.lock().unwrap();
+        inner
+            .db
+            .execute(
+                "INSERT INTO agent_sessions
+                    (id, name, repo_path, worktree_name, worktree_path, worktree_branch,
+                     status, created_at_ms)
+                 VALUES (?1, ?1, '/r', 'wt', '/wt', 'b', 'running', 1000)",
+                params![id],
+            )
+            .ok();
+        inner.sessions.insert(
+            id.to_string(),
+            AgentSession {
+                id: id.into(),
+                name: id.into(),
+                repo_path: "/r".into(),
+                worktree_name: "wt".into(),
+                worktree_path: "/wt".into(),
+                worktree_branch: "b".into(),
+                command: None,
+                status: SessionStatus::Running,
+                pid: None,
+                tracked_pids: vec![],
+                tracked_pgids: HashMap::new(),
+                panel_id: None,
+                created_at_ms: 1000,
+                terminated_at_ms: None,
+            },
+        );
+    }
+
+    /// Test-only: backdate `updated_at_ms` so age-based code paths fire
+    /// deterministically in unit tests.
+    #[cfg(test)]
+    pub fn testing_backdate_task(&self, task_id: &str, age_ms: u64) {
+        let inner = self.inner.lock().unwrap();
+        let old_ms = now_ms().saturating_sub(age_ms);
+        let _ = inner.db.execute(
+            "UPDATE tasks SET updated_at_ms = ?1 WHERE id = ?2",
+            params![old_ms, task_id],
+        );
+    }
+
+    /// Force-transition a task that is currently `assigned` into `blocked`
+    /// with a reason logged in `task_log`. No-op (Ok(false)) when the task is
+    /// no longer in `assigned`. Used by the periodic assigned-timeout watcher
+    /// and by the startup sweep so zombie tasks can never linger across
+    /// daemon restarts.
+    pub fn force_block_assigned(&self, task_id: &str, reason: &str) -> Result<bool, String> {
+        let current = self.task_get(task_id)?;
+        if current.status != TaskStatus::Assigned {
+            return Ok(false);
+        }
+        self.task_update(TaskUpdateParams {
+            id: task_id.to_string(),
+            title: None,
+            description: None,
+            status: Some("blocked".to_string()),
+            priority: None,
+            assignee: None,
+        })?;
+        let inner = self.inner.lock().unwrap();
+        let _ = inner.db.execute(
+            "INSERT INTO task_log (task_id, agent_id, message, created_at_ms) VALUES (?1, NULL, ?2, ?3)",
+            params![task_id, format!("auto-blocked: {reason}"), now_ms()],
+        );
+        Ok(true)
+    }
+
+    /// Sweep every task stuck in `assigned` longer than `threshold_ms` and
+    /// force-block them with `reason`. Returns the ids that transitioned.
+    /// Designed for startup (`reason="startup_sweep"`) and could be reused
+    /// from the periodic watcher if a bulk pass is preferred.
+    pub fn sweep_assigned_timeouts(&self, threshold_ms: u64, reason: &str) -> Vec<String> {
+        let cutoff = now_ms().saturating_sub(threshold_ms);
+        let ids: Vec<String> = {
+            let inner = self.inner.lock().unwrap();
+            let mut stmt = match inner.db.prepare(
+                "SELECT id FROM tasks
+                 WHERE status = 'assigned' AND updated_at_ms < ?1",
+            ) {
+                Ok(s) => s,
+                Err(_) => return Vec::new(),
+            };
+            let rows = match stmt.query_map(params![cutoff], |row| row.get::<_, String>(0)) {
+                Ok(r) => r.flatten().collect::<Vec<_>>(),
+                Err(_) => return Vec::new(),
+            };
+            rows
+        };
+        let mut blocked = Vec::new();
+        for id in &ids {
+            if let Ok(true) = self.force_block_assigned(id, reason) {
+                blocked.push(id.clone());
+            }
+        }
+        blocked
     }
 
     // -----------------------------------------------------------------------
@@ -2263,5 +2393,132 @@ mod tests {
         });
         assert_eq!(all.len(), 2);
         assert!(all.iter().all(|m| m.read));
+    }
+
+    // ──────────────────────────────────────────────────────────────────────
+    // Wave 1 (D1+D2+D5) — assigned-state guard / transition / sweep
+    // ──────────────────────────────────────────────────────────────────────
+
+    fn make_assigned_task(mgr: &AgentSessionManager, agent: &str, title: &str) -> Task {
+        let task = mgr
+            .task_create(TaskCreateParams {
+                title: title.into(),
+                description: None,
+                priority: None,
+                created_by: None,
+                deps: None,
+                fix_budget: None,
+            })
+            .unwrap();
+        mgr.task_assign(TaskAssignParams {
+            task_id: task.id.clone(),
+            agent_id: agent.into(),
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn can_transition_assigned_to_blocked_allowed() {
+        let (_dir, mgr) = test_manager();
+        insert_fake_agent(&mgr, "a1");
+        let task = make_assigned_task(&mgr, "a1", "blockable");
+
+        // assigned → blocked must now be a valid edge (Wave 1 D1).
+        let updated = mgr
+            .task_update(TaskUpdateParams {
+                id: task.id.clone(),
+                title: None,
+                description: None,
+                status: Some("blocked".into()),
+                priority: None,
+                assignee: None,
+            })
+            .expect("assigned -> blocked must be allowed");
+        assert_eq!(updated.status, TaskStatus::Blocked);
+
+        // assigned → cancelled remains valid for completeness.
+        let task2 = make_assigned_task(&mgr, "a1", "cancellable");
+        let cancelled = mgr
+            .task_update(TaskUpdateParams {
+                id: task2.id.clone(),
+                title: None,
+                description: None,
+                status: Some("cancelled".into()),
+                priority: None,
+                assignee: None,
+            })
+            .expect("assigned -> cancelled must be allowed");
+        assert_eq!(cancelled.status, TaskStatus::Cancelled);
+    }
+
+    #[test]
+    fn task_assign_blocks_when_agent_busy() {
+        let (_dir, mgr) = test_manager();
+        insert_fake_agent(&mgr, "a1");
+        let busy_task = make_assigned_task(&mgr, "a1", "first");
+
+        // A second task assigned to the same agent must be rejected with
+        // the busy-task id in the error message.
+        let second = mgr
+            .task_create(TaskCreateParams {
+                title: "second".into(),
+                description: None,
+                priority: None,
+                created_by: None,
+                deps: None,
+                fix_budget: None,
+            })
+            .unwrap();
+        let err = mgr
+            .task_assign(TaskAssignParams {
+                task_id: second.id.clone(),
+                agent_id: "a1".into(),
+            })
+            .unwrap_err();
+        assert!(err.starts_with("already_busy:"), "unexpected error: {err}");
+        assert!(err.contains(&busy_task.id), "error must name the busy task");
+
+        // Once the first task is finished the second one can be assigned.
+        mgr.task_update(TaskUpdateParams {
+            id: busy_task.id.clone(),
+            title: None,
+            description: None,
+            status: Some("blocked".into()),
+            priority: None,
+            assignee: None,
+        })
+        .unwrap();
+        mgr.task_assign(TaskAssignParams {
+            task_id: second.id.clone(),
+            agent_id: "a1".into(),
+        })
+        .expect("agent free after blocking first task");
+    }
+
+    #[test]
+    fn startup_sweep_blocks_existing_zombies() {
+        let (_dir, mgr) = test_manager();
+        insert_fake_agent(&mgr, "a1");
+        let zombie = make_assigned_task(&mgr, "a1", "stuck");
+
+        // Backdate the task so the sweep cutoff catches it.
+        mgr.testing_backdate_task(&zombie.id, 10 * 60_000);
+
+        let blocked = mgr.sweep_assigned_timeouts(180_000, "startup_sweep");
+        assert_eq!(blocked, vec![zombie.id.clone()]);
+
+        let now = mgr.task_get(&zombie.id).unwrap();
+        assert_eq!(now.status, TaskStatus::Blocked);
+
+        // task_log must carry the reason.
+        let log = mgr.task_log(&zombie.id, None);
+        assert!(
+            log.iter().any(|e| e.message.contains("auto-blocked: startup_sweep")),
+            "task_log missing auto-blocked reason"
+        );
+
+        // Second sweep is a no-op (task no longer assigned).
+        let again = mgr.sweep_assigned_timeouts(180_000, "startup_sweep");
+        assert!(again.is_empty());
     }
 }

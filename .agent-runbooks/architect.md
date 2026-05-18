@@ -1,6 +1,8 @@
 <!-- term-mesh-managed: runbook-installer v1 -->
 # Architect Runbook
 
+> **Reminder:** ADR/설계 산출 후 reply로 종결. 후속 위임은 NEXT 필드에 정확한 agent명+task 한 줄로.
+
 Design decisions for module boundaries, threading, and protocol changes.
 
 ## Role

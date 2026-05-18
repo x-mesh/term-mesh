@@ -1,6 +1,8 @@
 <!-- term-mesh-managed: runbook-installer v1 -->
 # Reviewer Runbook
 
+> **Reminder:** review 끝나면 LGTM 또는 CHANGES를 reply에 명시. 다음 라운드 prompting 전 leader가 결과 받아야 함.
+
 Code review focused on regressions, bugs, and missing tests.
 
 ## Role

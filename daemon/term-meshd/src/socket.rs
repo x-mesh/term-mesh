@@ -171,6 +171,12 @@ pub async fn serve(
         ctx.clone(),
         shutdown_rx.clone(),
     ));
+    // Wave 1 D5: assigned-state timeout watcher — auto-blocks tasks that
+    // never transitioned to `in_progress` within the per-CLI window.
+    let assigned_timeout_task = tokio::spawn(run_assigned_timeout_watcher(
+        ctx.clone(),
+        shutdown_rx.clone(),
+    ));
     // Phase 2.5: 1s coalesce → emit `agent_usage_tick` broadcasts (headless path).
     let usage_broadcast_task =
         tokio::spawn(run_usage_tick_broadcaster(ctx.clone(), shutdown_rx.clone()));
@@ -216,6 +222,7 @@ pub async fn serve(
         }
     }
     heartbeat_task.abort();
+    assigned_timeout_task.abort();
     usage_broadcast_task.abort();
     jsonl_usage_broadcast_task.abort();
     codex_usage_broadcast_task.abort();
@@ -774,6 +781,132 @@ async fn run_usage_disk_flusher(ctx: Arc<Context>, mut shutdown_rx: watch::Recei
                     }
                 })
                 .await;
+            }
+            changed = shutdown_rx.changed() => {
+                if changed.is_err() || *shutdown_rx.borrow() {
+                    break;
+                }
+            }
+        }
+    }
+}
+
+// Wave 1 D5: thresholds for the assigned-timeout watcher. claude agents are
+// expected to acknowledge a task within 180s; codex/gemini/kiro are slower at
+// cold-start so they get double. Unknown CLIs default to the claude bound.
+const ASSIGNED_TIMEOUT_CLAUDE_MS: u64 = 180_000;
+const ASSIGNED_TIMEOUT_OTHER_MS: u64 = 360_000;
+
+/// Walk the synced team-state JSON to build `agent_name -> cli` so the
+/// assigned-timeout watcher can pick the right threshold per assignee.
+/// Returns an empty map when no team state has been synced yet — callers fall
+/// back to the claude default.
+fn extract_assignee_cli_map(state: &serde_json::Value) -> HashMap<String, String> {
+    let mut out = HashMap::new();
+    let Some(teams) = state.get("teams").and_then(serde_json::Value::as_array) else {
+        return out;
+    };
+    for team in teams {
+        let Some(agents) = team.get("agents").and_then(serde_json::Value::as_array) else {
+            continue;
+        };
+        for agent in agents {
+            let name = agent
+                .get("name")
+                .or_else(|| agent.get("agent_name"))
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default();
+            let cli = agent
+                .get("cli")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("claude");
+            if !name.is_empty() {
+                out.insert(name.to_string(), cli.to_string());
+            }
+        }
+    }
+    out
+}
+
+fn assigned_threshold_for_cli(cli: &str) -> u64 {
+    match cli {
+        "claude" => ASSIGNED_TIMEOUT_CLAUDE_MS,
+        _ => ASSIGNED_TIMEOUT_OTHER_MS,
+    }
+}
+
+async fn run_assigned_timeout_watcher(
+    ctx: Arc<Context>,
+    mut shutdown_rx: watch::Receiver<bool>,
+) {
+    let mut interval = tokio::time::interval(Duration::from_secs(30));
+    interval.tick().await; // consume immediate first tick
+    let mut notified: HashSet<String> = HashSet::new();
+
+    loop {
+        tokio::select! {
+            _ = interval.tick() => {
+                let now_ms = current_time_ms();
+                let cli_map = {
+                    let st = ctx.team_state.read().unwrap();
+                    extract_assignee_cli_map(&st)
+                };
+                let tasks = ctx.agent_manager.task_list(crate::agent::TaskListParams {
+                    status: None,
+                    assignee: None,
+                });
+                for task in &tasks {
+                    if !matches!(task.status, crate::agent::TaskStatus::Assigned) {
+                        notified.remove(&task.id);
+                        continue;
+                    }
+                    let cli = task
+                        .assignee
+                        .as_deref()
+                        .and_then(|name| cli_map.get(name).cloned())
+                        .unwrap_or_else(|| "claude".to_string());
+                    let threshold = assigned_threshold_for_cli(&cli);
+                    if now_ms.saturating_sub(task.updated_at_ms) < threshold {
+                        notified.remove(&task.id);
+                        continue;
+                    }
+                    if !notified.insert(task.id.clone()) {
+                        continue;
+                    }
+                    let reason = format!("no_start_within_{}s", threshold / 1000);
+                    match ctx.agent_manager.force_block_assigned(&task.id, &reason) {
+                        Ok(true) => {
+                            tracing::info!(
+                                "assigned-timeout: blocked task {} assignee={:?} cli={} reason={}",
+                                task.id,
+                                task.assignee,
+                                cli,
+                                reason
+                            );
+                            let ev = DaemonEvent::TaskStatus {
+                                team: String::new(),
+                                agent: task.assignee.clone().unwrap_or_default(),
+                                task_id: task.id.clone(),
+                                status: "blocked".into(),
+                                prev_status: "assigned".into(),
+                                ts_ms: now_ms,
+                            };
+                            let _ = ctx.event_tx.send(ev);
+                        }
+                        Ok(false) => {
+                            // Task changed status under us between read and block;
+                            // remove from notified set so a re-entry can flag again.
+                            notified.remove(&task.id);
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                "assigned-timeout: failed to block {}: {e}",
+                                task.id
+                            );
+                            notified.remove(&task.id);
+                        }
+                    }
+                }
             }
             changed = shutdown_rx.changed() => {
                 if changed.is_err() || *shutdown_rx.borrow() {
@@ -1995,7 +2128,35 @@ fn compute_agent_anomalies(agent_manager: &AgentSessionManager) -> Vec<Anomaly> 
         )
     };
 
+    // Wave 1 D5: how long an `assigned` task may sit before being flagged.
+    // Matches the watcher's claude default; codex/gemini/kiro get a 2× grace
+    // before the watcher actually blocks them, so flagging at the lower bound
+    // still surfaces the problem early.
+    const ASSIGNED_STALE_MS: u64 = 180_000;
+
     for task in &tasks {
+        // assigned_stale: task assigned but never started within threshold
+        if matches!(task.status, crate::agent::TaskStatus::Assigned)
+            && now_ms.saturating_sub(task.updated_at_ms) >= ASSIGNED_STALE_MS
+        {
+            let idle_secs = now_ms.saturating_sub(task.updated_at_ms) / 1000;
+            let agent_id = task.assignee.clone().unwrap_or_else(|| task.id.clone());
+            anomalies.push(Anomaly {
+                agent_id,
+                kind: "assigned_stale".into(),
+                message: format!(
+                    "Task '{}' (id={}) has been assigned for {}s without start",
+                    task.title, task.id, idle_secs
+                ),
+                severity: if idle_secs >= 360 {
+                    "critical".into()
+                } else {
+                    "warning".into()
+                },
+                detected_at: detected_at.clone(),
+            });
+        }
+
         // no_heartbeat: task is in_progress and hasn't been updated in 5+ minutes
         if matches!(task.status, crate::agent::TaskStatus::InProgress)
             && now_ms.saturating_sub(task.updated_at_ms) >= five_min_ms
@@ -2094,6 +2255,49 @@ mod tests {
 
         let stale_again = collect_heartbeat_stale_events(&state, &mut notified, 1_700_000_125_000);
         assert_eq!(stale_again.len(), 1);
+    }
+
+    #[test]
+    fn assigned_anomaly_after_threshold() {
+        use crate::agent::{AgentSessionManager, TaskAssignParams, TaskCreateParams};
+        let dir = tempfile::tempdir().unwrap();
+        let mgr = AgentSessionManager::new(dir.path().join("anom.db")).unwrap();
+        mgr.testing_register_agent("a1");
+
+        let task = mgr
+            .task_create(TaskCreateParams {
+                title: "stuck".into(),
+                description: None,
+                priority: None,
+                created_by: None,
+                deps: None,
+                fix_budget: None,
+            })
+            .unwrap();
+        mgr.task_assign(TaskAssignParams {
+            task_id: task.id.clone(),
+            agent_id: "a1".into(),
+        })
+        .unwrap();
+
+        let fresh = compute_agent_anomalies(&mgr);
+        assert!(
+            !fresh.iter().any(|a| a.kind == "assigned_stale"),
+            "fresh assign should not raise assigned_stale: {:?}",
+            fresh
+        );
+
+        // Backdate by 4 minutes (> 180s threshold).
+        mgr.testing_backdate_task(&task.id, 4 * 60_000);
+
+        let stale = compute_agent_anomalies(&mgr);
+        let assigned = stale.iter().find(|a| a.kind == "assigned_stale");
+        assert!(
+            assigned.is_some(),
+            "expected assigned_stale anomaly: {:?}",
+            stale
+        );
+        assert_eq!(assigned.unwrap().agent_id, "a1");
     }
 
     #[test]
