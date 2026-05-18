@@ -5,6 +5,7 @@
 )]
 
 mod agent;
+mod auto_reply;
 mod codex_tokens;
 mod headless;
 mod http;
