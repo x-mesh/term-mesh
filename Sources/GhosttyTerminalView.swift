@@ -845,10 +845,10 @@ final class TerminalSurface: Identifiable, ObservableObject {
         // single Bool flag (the surface ref is retained for the lifetime
         // of this surface, so a raw unmanaged pointer is safe).
         let surfaceRef = Unmanaged.passUnretained(self).toOpaque()
-        ghostty_surface_set_pty_data_callback(createdSurface, { userdata, _, _ in
+        ghostty_surface_set_pty_data_callback(createdSurface, { userdata, _, len in
             guard let userdata else { return }
             let surface = Unmanaged<TerminalSurface>.fromOpaque(userdata).takeUnretainedValue()
-            surface.markPtyOutputReceived()
+            surface.recordPtyOutput(byteCount: Int(len))
         }, surfaceRef)
 
 #if DEBUG
@@ -1150,26 +1150,35 @@ final class TerminalSurface: Identifiable, ObservableObject {
     /// Marked @atomic via NSLock for strict ordering on weakly-ordered hosts.
     private var _hasReceivedPtyOutput: Bool = false
     private var _ptyOutputFirstAt: TimeInterval = 0
+    private var _ptyOutputTotalBytes: Int = 0
     private let ptyOutputLock = NSLock()
     var hasReceivedPtyOutput: Bool {
         ptyOutputLock.lock(); defer { ptyOutputLock.unlock() }
         return _hasReceivedPtyOutput
     }
     /// Time elapsed (in seconds) since the first pty_data_callback fire.
-    /// Returns nil when no output has been observed yet. Used by processPaste
-    /// to enforce a settle window after the TUI starts outputting — the
-    /// banner/prompt can arrive before the TUI's stdin reader loop is up.
+    /// Returns nil when no output has been observed yet.
     var ptyOutputAge: TimeInterval? {
         ptyOutputLock.lock(); defer { ptyOutputLock.unlock() }
         guard _hasReceivedPtyOutput else { return nil }
         return ProcessInfo.processInfo.systemUptime - _ptyOutputFirstAt
     }
-    fileprivate func markPtyOutputReceived() {
+    /// Total bytes observed via pty_data_callback so far. Used in combination
+    /// with ptyOutputAge as the cold-start ready signal — Claude TUI streams
+    /// its banner/prompt over several hundred bytes before its stdin reader
+    /// loop activates, so a byte threshold catches the case where the timer
+    /// alone is too generous.
+    var ptyOutputBytes: Int {
+        ptyOutputLock.lock(); defer { ptyOutputLock.unlock() }
+        return _ptyOutputTotalBytes
+    }
+    fileprivate func recordPtyOutput(byteCount: Int) {
         ptyOutputLock.lock(); defer { ptyOutputLock.unlock() }
         if !_hasReceivedPtyOutput {
             _hasReceivedPtyOutput = true
             _ptyOutputFirstAt = ProcessInfo.processInfo.systemUptime
         }
+        _ptyOutputTotalBytes &+= byteCount
     }
     private static let maxPasteQueueDepth = 16
 
@@ -1296,29 +1305,27 @@ final class TerminalSurface: Identifiable, ObservableObject {
         }
 
         // Cold-start gate: before the very first paste on this surface,
-        // wait until BOTH conditions hold:
-        //   1. ghostty's pty_data_callback has fired at least once
-        //   2. At least 800 ms have elapsed since that first fire
+        // require ALL THREE conditions:
+        //   1. pty_data_callback has fired (TUI started outputting)
+        //   2. At least 1500 ms have elapsed since the first fire
+        //   3. At least 500 bytes have been observed via the callback
         //
-        // Why (1)+(2), not just (1): empirically the child process (Claude
-        // TUI) writes its banner/prompt to PTY several hundred ms BEFORE
-        // its stdin reader loop activates. Gating only on PTY output makes
-        // us paste during that window, and the input bytes get silently
-        // discarded — same deterministic truncation as before.
+        // Why all three: empirically, neither (1) alone nor (1)+(2) caught
+        // the case where Claude TUI's stdin reader activates noticeably
+        // after the banner has started streaming. Byte threshold catches
+        // the slow-init case (fast streams the banner in chunks while the
+        // input loop is still booting); age threshold catches the
+        // small-banner case. AND-combining is intentional.
         //
-        // 800 ms matches the cold bonus from the previous timing-only fix
-        // (which was empirically enough). Combining with the PTY-output
-        // signal means slow-to-start children wait longer than 800 ms
-        // automatically; fast ones (~200 ms to first output) still only
-        // wait ~1 s total instead of the old 1.8 s blind warmup.
-        //
-        // Polled at 100 ms cadence. After 30 attempts (~3 s) we proceed
-        // anyway so a silent-startup child doesn't deadlock paste forever.
-        let coldSettleSeconds: TimeInterval = 0.8
-        let coldDeferCap = 30
+        // Cadence: 100 ms polls, capped at 40 attempts (~4 s) so a silent
+        // startup doesn't deadlock paste forever — but the cap is rare;
+        // typical Claude/Codex hits 500 bytes well within 1.5 s.
+        let coldSettleSeconds: TimeInterval = 1.5
+        let coldByteThreshold = 500
+        let coldDeferCap = 40
         let coldReady: Bool = {
             guard let age = ptyOutputAge else { return false }
-            return age >= coldSettleSeconds
+            return age >= coldSettleSeconds && ptyOutputBytes >= coldByteThreshold
         }()
         if !hasCompletedPaste, !coldReady, p.tuiReadyDeferCount < coldDeferCap {
             pasteInFlight = false  // unlock the queue so drain can re-enter
@@ -1331,7 +1338,7 @@ final class TerminalSurface: Identifiable, ObservableObject {
             }
             #if DEBUG
             if deferred.tuiReadyDeferCount == 1 {
-                dlog("paste.defer.tui_cold panel=\(id.uuidString.prefix(8)) textLen=\(p.text.count) (waiting for PTY output + 800ms settle)")
+                dlog("paste.defer.tui_cold panel=\(id.uuidString.prefix(8)) textLen=\(p.text.count) (waiting for age≥1.5s AND bytes≥500)")
             }
             #endif
             return
@@ -1339,10 +1346,11 @@ final class TerminalSurface: Identifiable, ObservableObject {
         #if DEBUG
         if !hasCompletedPaste {
             let ageMs = (ptyOutputAge ?? 0) * 1000
+            let bytes = ptyOutputBytes
             if coldReady {
-                dlog("paste.cold.ready panel=\(id.uuidString.prefix(8)) defers=\(p.tuiReadyDeferCount) ptyAgeMs=\(Int(ageMs)) textLen=\(p.text.count)")
+                dlog("paste.cold.ready panel=\(id.uuidString.prefix(8)) defers=\(p.tuiReadyDeferCount) ptyAgeMs=\(Int(ageMs)) ptyBytes=\(bytes) textLen=\(p.text.count)")
             } else {
-                dlog("paste.cold.fallback panel=\(id.uuidString.prefix(8)) defers=\(p.tuiReadyDeferCount) ptyAgeMs=\(Int(ageMs)) textLen=\(p.text.count) (deadline reached, proceeding)")
+                dlog("paste.cold.fallback panel=\(id.uuidString.prefix(8)) defers=\(p.tuiReadyDeferCount) ptyAgeMs=\(Int(ageMs)) ptyBytes=\(bytes) textLen=\(p.text.count) (deadline reached, proceeding)")
             }
         }
         #endif
