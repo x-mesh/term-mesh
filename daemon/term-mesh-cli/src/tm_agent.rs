@@ -33,12 +33,53 @@ const DEFAULT_AGENT_NAMES: &[&str] = &[
 ];
 const DEFAULT_AGENT_COLORS: &[&str] = &["green", "blue", "yellow", "magenta", "cyan", "red"];
 
+// Literal block agents must invoke as a shell command before stopping. TUI CLIs
+// (Claude/Codex) frequently print this header in their response text but never
+// actually run the shell command, which leaves the task stuck in "assigned" and
+// causes `tm-agent wait` to time out. The strong wording + literal example here
+// is the prompt-side mitigation; the scrollback auto-detector is the safety net.
+const REQUIRED_FINAL_STEP_BLOCK: &str = concat!(
+    "[REQUIRED FINAL STEP \u{2014} you MUST run this shell command before stopping]\n",
+    "```\n",
+    "tm-agent reply 'STATUS: DONE|BLOCKED|NEEDS_REVIEW\n",
+    "FILES: <changed paths, space-separated, or none>\n",
+    "VERIFY: <single shell command to verify, or n/a>\n",
+    "NEXT: <one-line action for leader, or NONE>\n",
+    "FULL_REPORT: <path to full result file, or n/a>\n",
+    "\n",
+    "<concise summary body>'\n",
+    "```\n",
+    "Without running this shell command the leader cannot detect completion \u{2014} the task hangs and wait times out. Printing the header text in your response is NOT enough; you must invoke the `tm-agent reply` shell command yourself.",
+);
+
 const REPORT_SUFFIX: &str = concat!(
-    "\n\n[IMPORTANT] Finish via TM-PROTOCOL-v1: tm-agent reply '<5-line header plus concise summary>'.",
+    "\n\n",
+    "[REQUIRED FINAL STEP \u{2014} you MUST run this shell command before stopping]\n",
+    "```\n",
+    "tm-agent reply 'STATUS: DONE|BLOCKED|NEEDS_REVIEW\n",
+    "FILES: <changed paths or none>\n",
+    "VERIFY: <single shell command or n/a>\n",
+    "NEXT: <action or NONE>\n",
+    "FULL_REPORT: <result file path or n/a>\n",
+    "\n",
+    "<concise summary body>'\n",
+    "```\n",
+    "Without running this shell command the leader cannot detect completion \u{2014} the task hangs and wait times out. Printing the header in your response is NOT enough; you must invoke `tm-agent reply` as a shell command.",
 );
 
 const BROADCAST_SUFFIX: &str = concat!(
-    "\n\n[IMPORTANT] Finish via TM-PROTOCOL-v1: `tm-agent reply '<5-line header plus concise summary>'`.",
+    "\n\n",
+    "[REQUIRED FINAL STEP \u{2014} every recipient MUST run this shell command before stopping]\n",
+    "```\n",
+    "tm-agent reply 'STATUS: DONE|BLOCKED|NEEDS_REVIEW\n",
+    "FILES: <changed paths or none>\n",
+    "VERIFY: <single shell command or n/a>\n",
+    "NEXT: <action or NONE>\n",
+    "FULL_REPORT: <result file path or n/a>\n",
+    "\n",
+    "<concise summary body>'\n",
+    "```\n",
+    "Without running this shell command the leader cannot detect completion. Printing the header in your response is NOT enough; you must invoke `tm-agent reply` as a shell command.",
 );
 
 fn agent_init_prompt(agent_name: &str, agent_role: &str, team_name: &str, workdir: &str, socket: &str) -> String {
@@ -122,7 +163,26 @@ Environment:\n\
 - Socket: {socket}\n\
 - Project: term-mesh (Swift/macOS terminal multiplexer)\n\
 {runbook_section}\n\
-When you complete any task, run: `tm-agent reply '<5-line header plus concise result>'` to report.\n\
+\n\
+## CRITICAL: How tasks complete\n\
+\n\
+When you finish any task you MUST invoke `tm-agent reply` as a shell command \u{2014}\n\
+not by printing the header text in your response. Example:\n\
+\n\
+```\n\
+tm-agent reply 'STATUS: DONE\n\
+FILES: src/foo.rs\n\
+VERIFY: cargo test\n\
+NEXT: NONE\n\
+FULL_REPORT: n/a\n\
+\n\
+<concise summary>'\n\
+```\n\
+\n\
+If you only print the STATUS header in your response, the leader cannot detect\n\
+completion: the task stays `assigned`, `tm-agent wait` times out, and the team\n\
+stalls. Always invoke the shell command yourself.\n\
+\n\
 Respond with \"Agent {agent_name} ready.\" to confirm.",
     )
 }
@@ -2999,7 +3059,14 @@ fn format_task_instruction(
     fix_budget: Option<u8>,
 ) -> String {
     let task_id = task["id"].as_str().unwrap_or("");
-    let mut lines = vec![
+    // Mirror Swift formatDelegateInstruction: prepend the required final step
+    // at the top so the model sees the literal shell command before the goal.
+    let mut lines: Vec<String> = REQUIRED_FINAL_STEP_BLOCK
+        .lines()
+        .map(|s| s.to_string())
+        .collect();
+    lines.push(String::new());
+    lines.extend(vec![
         "## Task Capsule".to_string(),
         format!("TASK_ID: {task_id}"),
         format!("TASK_TITLE: {}", task["title"].as_str().unwrap_or("")),
@@ -3009,7 +3076,7 @@ fn format_task_instruction(
         ),
         "PROTOCOL: TM-PROTOCOL-v1".to_string(),
         "OUTPUT: STATUS/FILES/VERIFY/NEXT/FULL_REPORT header plus concise summary".to_string(),
-    ];
+    ]);
     if let Some(p) = task["priority"].as_u64() {
         lines.push(format!("TASK_PRIORITY: {p}"));
     }

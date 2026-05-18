@@ -2525,7 +2525,25 @@ final class TeamOrchestrator: ObservableObject {
 
     private func formatDelegateInstruction(task: TeamTask, text: String, context: String? = nil) -> String {
         let taskId = task.id
+        // Top-of-prompt mandatory step: agents (especially TUI CLIs like Claude/Codex)
+        // often print the STATUS header in their response but never run the actual
+        // shell command, leaving the task stuck in "assigned" and wait timing out.
+        // Putting the explicit command literal at the top + closing reminder reduces
+        // the miss rate. The scrollback auto-detector (Phase B) is the safety net
+        // for cases where the command is still omitted.
         var lines: [String] = [
+            "[REQUIRED FINAL STEP — you MUST run this shell command before stopping]",
+            "```",
+            "tm-agent reply 'STATUS: DONE|BLOCKED|NEEDS_REVIEW",
+            "FILES: <changed paths, space-separated, or none>",
+            "VERIFY: <single shell command to verify result, or n/a>",
+            "NEXT: <one-line action for leader, or NONE>",
+            "FULL_REPORT: <path to full result file, or n/a>",
+            "",
+            "<concise summary body here>'",
+            "```",
+            "Without running this command the leader cannot detect completion — the task hangs and wait times out. Printing the header text in your response is NOT enough; you must invoke the `tm-agent reply` shell command yourself.",
+            "",
             "## Task Capsule",
             "TASK_ID: \(taskId)",
             "TASK_TITLE: \(task.title)",
@@ -2548,7 +2566,7 @@ final class TeamOrchestrator: ObservableObject {
             "[/GOAL]",
         ])
         let body = lines.joined(separator: "\n")
-        return body + "\n\n[IMPORTANT] Finish via TM-PROTOCOL-v1: tm-agent reply '<5-line header plus concise summary>'."
+        return body + "\n\n[REMINDER] Finish by actually running the `tm-agent reply '...'` shell command shown at the top — not by printing the header in your reply."
     }
 
     private func formatTaskDispatchInstruction(task: TeamTask) -> String {
