@@ -1293,12 +1293,19 @@ final class TerminalSurface: Identifiable, ObservableObject {
             // with the ~2000-char agent init prompt — first ~700 chars submit,
             // the rest is discarded).
             //
-            // Drain wait after the (now chunked) paste finishes. Chunking
-            // already gave the IO thread 2ms per 256 chars to drain, so this
-            // final wait only needs to cover the last-chunk straggler.
-            // Keep small so simple pastes don't pay latency.
-            let baseMs = max(15, min(80, p.text.count / 64))
-            let coldBonusMs = 0
+            // Drain wait after the (chunked) paste finishes.
+            //
+            // Empirical: chunking + 2ms yields alone did NOT prevent first-pane
+            // truncation — the first pane reliably truncated at the same byte
+            // position regardless of chunk size. The cause is cold-start: the
+            // ghostty surface and Claude TUI's input pipeline aren't ready to
+            // receive paste bytes for the first ~1s of life. Until then any
+            // paste content lands in a void and is silently lost.
+            //
+            // Fix: substantial cold-start bonus on the first paste per surface.
+            // Warm pastes use a small base so subsequent sends stay snappy.
+            let baseMs = max(15, min(120, p.text.count / 32))
+            let coldBonusMs = self.hasCompletedPaste ? 0 : 800
             let waitMs = baseMs + coldBonusMs
             DispatchQueue.main.asyncAfter(deadline: .now() + Double(waitMs) / 1000.0) { [weak self] in
                 guard let self else { return }

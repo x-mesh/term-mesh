@@ -5517,6 +5517,18 @@ fn run_create(
             }
 
             eprintln!("Sending init prompts to non-kiro agents...");
+            // Cold-start protection for the first agent: subsequent agents
+            // get a 1s inter-send delay (below) that incidentally warms
+            // them up, but the first agent has no such cushion. Empirical
+            // observation: without this sleep the first pane's init prompt
+            // truncates at exactly the same byte position every time —
+            // ghostty surface + Claude TUI input pipeline aren't yet ready
+            // to receive paste bytes. Chunking the paste in Swift alone is
+            // insufficient. 1s is the smallest value that has consistently
+            // delivered the full prompt across spawn cadences observed.
+            if !non_kiro.is_empty() {
+                thread::sleep(Duration::from_secs(1));
+            }
             for a in &non_kiro {
                 let name = a["name"].as_str().unwrap_or("");
                 let role = a["agent_type"].as_str().unwrap_or(name);
