@@ -19,10 +19,10 @@ If `$ARGUMENTS` is empty, print:
 ```text
 이 명령은 모든 idle agent를 동시 동원하고 결과를 종합합니다.
 
-  /tm "review src/auth.ts"
+  /tm "review src/auth.ts"                              # 기본: 동일 instruction fan-out
   /tm "monolith vs microservices" --timeout 120
   /tm --ensure reviewer,security "이 PR 보안 리뷰"   # 없는 role 자동 추가 후 fan-out
-  /tm "feature/auth PR 보안 리뷰" --no-decompose       # v1 same-instruction-to-all (opt-out)
+  /tm "feature/auth PR 보안 리뷰" --decompose          # opt-in: T1-T8 매칭 시 역할별 분배
 
 팀 구성 변경은 /team 사용:
   /team add reviewer        reviewer 추가
@@ -37,15 +37,16 @@ Then stop.
 - Instruction: required natural language text from `$ARGUMENTS`.
 - `--timeout <seconds>`: optional, default `300`.
 - `--ensure <roles>`: optional, comma-separated role list — roles not yet in team are attached before fan-out.
-- `--no-decompose`: optional — skip Step 1.5 decomposition and revert to v1 same-instruction-to-all behavior.
+- `--decompose`: optional (opt-in) — enable Step 1.5 template matching for heterogeneous role-based sub-task dispatch.
+- `--no-decompose`: optional — explicitly reaffirm the default same-instruction-to-all behavior (no-op since this is the default).
 
-Reject unsupported flags: `--rounds`, `--agents`, `--mode`, `--decompose` (decompose is the new default; explicit affirmation flag is rejected). Use `/tm-op` for strategies.
+Reject unsupported flags: `--rounds`, `--agents`, `--mode`. Use `/tm-op` for strategies.
 
-**DECOMPOSE_MODE state machine** (evaluated at workflow Step 1.5):
+**DECOMPOSE_MODE state machine**:
 
-- `off` — `--no-decompose` passed. Skip Step 1.5. Step 2 sends original `$INSTR` to all idle agents. Step 4 uses `collect --headers` + homogeneous synthesis ([충돌] = "전원 동의 / 이견").
-- `on` — Template T1–T8 matched (see `.claude/commands/tm.md` Step 1.5 for full template library — single source of truth). Leader emits 2-4 line decomposition preview; Step 2 dispatches N heterogeneous sub-tasks. Step 4 uses `reports --summary` + heterogeneous synthesis ([충돌] = "독립 완료" default).
-- `fallback` — No template matched OR non-decomposable heuristic hit (token count < 3, pure-ping, single-entity lookup). Emit `[plan] N개 동일 instruction fan-out — 분해 패턴 미일치, 폴백 적용`. Step 2 proceeds with original `$INSTR` to all agents. Step 4 uses `collect --headers`.
+- `off` (default) — `--decompose` not passed (or `--no-decompose` explicit). Skip Step 1.5 entirely. Step 2 sends original `$INSTR` to all idle agents. Step 4 uses `collect --headers` + homogeneous synthesis ([충돌] = "전원 동의 / 이견").
+- `on` — `--decompose` passed + Template T1–T8 matched (see `.claude/commands/tm.md` Step 1.5 for full template library — single source of truth). Leader emits 2-4 line decomposition preview; Step 2 dispatches N heterogeneous sub-tasks. Step 4 uses `reports --summary` + heterogeneous synthesis ([충돌] = "독립 완료" default).
+- `fallback` — `--decompose` passed but no template matched OR non-decomposable heuristic hit (token count < 3, pure-ping, single-entity lookup). Emit `[plan] N개 동일 instruction fan-out — 분해 패턴 미일치, 폴백 적용`. Step 2 proceeds with original `$INSTR` to all agents. Step 4 uses `collect --headers`.
 
 ## Workflow
 

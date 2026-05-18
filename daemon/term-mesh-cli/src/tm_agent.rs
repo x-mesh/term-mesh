@@ -2280,6 +2280,49 @@ mod runbook_tests {
     }
 
     #[test]
+    fn reply_summary_parses_single_line_header() {
+        // codex agents often emit all 5 fields on one line — previously the
+        // line-based parser captured the whole line as STATUS and dropped
+        // FILES/VERIFY/NEXT/FULL_REPORT as "n/a". split_inline_headers fixes
+        // this by reshaping into per-line form before parsing.
+        let (headers, _summary) = reply_header_and_summary(
+            "STATUS: DONE FILES: none VERIFY: echo \"pong\" NEXT: NONE FULL_REPORT: n/a executor ping ok",
+            200,
+        );
+        assert_eq!(headers["status"].as_str(), Some("DONE"));
+        assert_eq!(headers["files"].as_str(), Some("none"));
+        assert_eq!(headers["verify"].as_str(), Some("echo \"pong\""));
+        assert_eq!(headers["next"].as_str(), Some("NONE"));
+        assert_eq!(headers["full_report"].as_str(), Some("n/a executor ping ok"));
+    }
+
+    #[test]
+    fn reply_summary_handles_mixed_inline_and_newline_headers() {
+        // Half on one line, half on separate lines — must still parse all 5.
+        let (headers, _) = reply_header_and_summary(
+            "STATUS: DONE FILES: a.rs\nVERIFY: cargo test\nNEXT: NONE FULL_REPORT: /tmp/x.md\n\nbody",
+            200,
+        );
+        assert_eq!(headers["status"].as_str(), Some("DONE"));
+        assert_eq!(headers["files"].as_str(), Some("a.rs"));
+        assert_eq!(headers["verify"].as_str(), Some("cargo test"));
+        assert_eq!(headers["next"].as_str(), Some("NONE"));
+        assert_eq!(headers["full_report"].as_str(), Some("/tmp/x.md"));
+    }
+
+    #[test]
+    fn split_inline_headers_preserves_body_text_with_colon() {
+        // " KEY:" only fires for the 5 known header keys. A body line like
+        // "Run: cargo test" must not be mistaken for a header boundary.
+        let out = split_inline_headers(
+            "STATUS: DONE\nRun: cargo test passes locally",
+            &["STATUS", "FILES", "VERIFY", "NEXT", "FULL_REPORT"],
+        );
+        assert!(out.contains("STATUS: DONE"));
+        assert!(out.contains("Run: cargo test passes locally"));
+    }
+
+    #[test]
     fn result_collect_compaction_removes_full_content() {
         let resp = json!({
             "ok": true,
@@ -3379,11 +3422,54 @@ fn truncate_summary(content: &str, max_chars: usize) -> String {
     format!("{}...", content.chars().take(max_chars).collect::<String>())
 }
 
+/// Inserts a newline before each secondary " KEY:" occurrence so a header
+/// crammed onto one line ("STATUS: DONE FILES: none VERIFY: n/a ...") is
+/// reshaped into the per-line form the line-based parser expects. The first
+/// KEY: on each line is preserved in place; only the 2nd+ are split out.
+fn split_inline_headers(content: &str, keys: &[&str]) -> String {
+    let mut out = String::with_capacity(content.len() + 32);
+    for line in content.lines() {
+        let mut cuts: Vec<usize> = Vec::new();
+        for key in keys {
+            // Match " KEY:" (leading whitespace required) to avoid splitting
+            // mid-word matches like "PRESTATUS:" or values that happen to
+            // contain "STATUS:" without a boundary.
+            let needle = format!(" {key}:");
+            let mut start = 0;
+            while let Some(idx) = line[start..].find(&needle) {
+                let abs = start + idx + 1; // +1 skips the leading space, keeps KEY:
+                cuts.push(abs);
+                start = start + idx + needle.len();
+            }
+        }
+        if cuts.is_empty() {
+            out.push_str(line);
+            out.push('\n');
+        } else {
+            cuts.sort();
+            let mut prev = 0;
+            for cut in cuts {
+                out.push_str(line[prev..cut].trim_end());
+                out.push('\n');
+                prev = cut;
+            }
+            out.push_str(line[prev..].trim_end());
+            out.push('\n');
+        }
+    }
+    out
+}
+
 fn reply_header_and_summary(content: &str, summary_chars: usize) -> (Value, String) {
     let header_keys = ["STATUS", "FILES", "VERIFY", "NEXT", "FULL_REPORT"];
+    // Agents (notably codex) sometimes emit all 5 fields on a single line —
+    // the line-based loop below would then capture only STATUS and drop the
+    // rest as "n/a". Normalize secondary " KEY:" occurrences into newlines
+    // first so the parser sees one header per line either way.
+    let normalized = split_inline_headers(content, &header_keys);
     let mut headers = serde_json::Map::new();
     let mut body_lines = Vec::new();
-    for line in content.lines() {
+    for line in normalized.lines() {
         let trimmed = line.trim();
         let mut matched = false;
         for key in header_keys {
