@@ -7313,6 +7313,10 @@ fn run_wait(
     let mut tracked_task_ids: std::collections::HashSet<String> =
         explicit_task_ids.cloned().unwrap_or_default();
     let mut tracked_initialized = explicit_task_ids.is_some() && !tracked_task_ids.is_empty();
+    // Accumulating set of agents observed with an active task at any poll. Used by
+    // the result.status fallback so it doesn't count team members who were never
+    // delegated to in this round (the root cause of wait hangs on partial fan-out).
+    let mut tracked_agents: std::collections::HashSet<String> = std::collections::HashSet::new();
     while elapsed < timeout {
         if current_interval > 0 {
             thread::sleep(Duration::from_secs(current_interval));
@@ -7324,9 +7328,11 @@ fn run_wait(
         let mut msg_progress = "0/0".to_string();
 
         if mode == "report" || mode == "any" {
-            // On first poll, snapshot the task IDs we want to track.
-            // This is immune to agents dropping active_task_id on completion.
-            if !tracked_initialized {
+            // Every poll: observe agents that currently have an active task and
+            // accumulate both their task IDs and names. Re-running on each poll
+            // (not just the first) closes the race where wait fires before
+            // delegate's task is visible in team.status.
+            if !tracked_initialized || tracked_agents.is_empty() {
                 if let Ok(r) = rpc_call(sock, "team.status", json!({ "team_name": team })) {
                     if let Some(agents) = r["result"]["agents"].as_array() {
                         for a in agents {
@@ -7347,6 +7353,9 @@ fn run_wait(
                                     continue;
                                 }
                                 tracked_task_ids.insert(tid.to_string());
+                                if !name.is_empty() {
+                                    tracked_agents.insert(name.to_string());
+                                }
                             }
                         }
                         if !tracked_task_ids.is_empty() {
@@ -7377,8 +7386,22 @@ fn run_wait(
                     }
                 }
             } else {
-                // Fallback: legacy result.status (no tasks assigned yet)
-                if let Ok(rs) = rpc_call(sock, "team.result.status", json!({ "team_name": team })) {
+                // Fallback: result.status restricted to the agents we care about.
+                // Precedence: explicit --agents filter > accumulated tracked_agents
+                // > active_only (server-side filter to agents with non-terminal task).
+                // This prevents wait from waiting on team members who were never
+                // delegated to in this round (root cause of partial-fan-out hangs).
+                let mut params = json!({ "team_name": team });
+                if !agent_filter.is_empty() {
+                    let names: Vec<String> = agent_filter.iter().cloned().collect();
+                    params["agents"] = json!(names);
+                } else if !tracked_agents.is_empty() {
+                    let names: Vec<String> = tracked_agents.iter().cloned().collect();
+                    params["agents"] = json!(names);
+                } else {
+                    params["active_only"] = json!(true);
+                }
+                if let Ok(rs) = rpc_call(sock, "team.result.status", params) {
                     let done = rs["result"]["completed"].as_u64().unwrap_or(0);
                     let total = rs["result"]["total"].as_u64().unwrap_or(0);
                     report_done = rs["result"]["all_done"].as_bool().unwrap_or(false);

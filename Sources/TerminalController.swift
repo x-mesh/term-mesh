@@ -3473,7 +3473,13 @@ class TerminalController {
         guard let teamName = params["team_name"] as? String else {
             return v2Error(id: id, code: "invalid_params", message: "Missing team_name")
         }
-        let status = store.resultStatus(teamName: teamName)
+        let agentFilter = params["agents"] as? [String]
+        let activeOnly = params["active_only"] as? Bool ?? false
+        let status = store.resultStatus(
+            teamName: teamName,
+            agentFilter: agentFilter,
+            activeOnly: activeOnly
+        )
         if status.isEmpty {
             return v2Error(id: id, code: "not_found", message: "Team not found")
         }
