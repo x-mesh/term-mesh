@@ -255,13 +255,16 @@ struct ResumableTeam: Identifiable, Hashable {
         if !validity.worktreeExists, let w = worktree {
             return "Worktree directory no longer exists: \(w.path)"
         }
-        if !validity.allSessionsPresent {
+        if mode != "pane" && !validity.allSessionsPresent {
             return "Cannot resume — agents have no session IDs (created before Phase 2)"
         }
         switch blockingReason {
         case "worktree_gone":
             return "Worktree directory no longer exists"
         case "no_sessions":
+            if mode == "pane" {
+                return "No resumable leader or agent session was captured"
+            }
             return "No resumable sessions (created before Phase 2)"
         case "corrupt":
             return "Metadata is corrupt — cannot resume"
@@ -2128,11 +2131,12 @@ struct TeamCreationView: View {
         _ = template
     }
 
-    private func applySmartPreset(_ preset: SmartTeamPreset) {
+    private func applySmartPreset(_ preset: SmartTeamPreset, useEffectivePayload: Bool = true) {
         let available = presetManager.presets
         let templateId = TemplateID(category: .smart, slug: preset.id)
         let effectivePreset: SmartTeamPreset
-        if case .smart(let overridePreset) = teamTemplateManager.effectivePayload(for: templateId) {
+        if useEffectivePayload,
+           case .smart(let overridePreset) = teamTemplateManager.effectivePayload(for: templateId) {
             effectivePreset = overridePreset
         } else {
             effectivePreset = preset
@@ -2260,6 +2264,7 @@ struct TeamCreationView: View {
             agents[i].preset.model = "opus"
             agents[i].providerBadge = .none
         }
+        syncBulkFromAgents()
         persistSelectedSmartPresetOverride()
     }
 
@@ -2268,18 +2273,50 @@ struct TeamCreationView: View {
             agents[i].preset.model = "haiku"
             agents[i].providerBadge = .none
         }
+        syncBulkFromAgents()
         persistSelectedSmartPresetOverride()
     }
 
     private func applyBalanced() {
         if let smartPresetId = selectedSmartPresetId,
-           let smart = SmartTeamPreset.builtIn.first(where: { $0.id == smartPresetId }) {
-            applySmartPreset(smart)
+           let template = teamTemplateManager.template(for: TemplateID(category: .smart, slug: smartPresetId)),
+           case .smart(let smart) = template.payload {
+            let templateId = TemplateID(category: .smart, slug: smartPresetId)
+            let recommendations = Dictionary(
+                smart.resolve(with: providerDetector).map { ($0.role, $0) },
+                uniquingKeysWith: { first, _ in first }
+            )
+            if template.origin == .builtIn {
+                teamTemplateManager.resetOverride(for: templateId)
+            }
+            for i in agents.indices {
+                let role = agents[i].preset.name
+                if let recommended = recommendations[role] {
+                    agents[i].preset.model = recommended.model
+                    switch recommended.status {
+                    case .best:
+                        agents[i].providerBadge = .best(reason: recommended.reason)
+                    case .fallback(let wanted):
+                        agents[i].providerBadge = .fallback(wanted: wanted)
+                    case .normal:
+                        agents[i].providerBadge = .none
+                    }
+                } else if let roleDefault = presetManager.presets.first(where: { $0.name == role }) {
+                    agents[i].preset.model = roleDefault.model
+                    agents[i].providerBadge = .none
+                } else {
+                    agents[i].preset.model = AgentRolePreset.defaultModel(for: agents[i].preset.cli)
+                    agents[i].providerBadge = .none
+                }
+            }
+            syncBulkFromAgents()
+            persistSelectedSmartPresetOverride()
         } else {
             for i in agents.indices {
                 agents[i].preset.model = "sonnet"
                 agents[i].providerBadge = .none
             }
+            syncBulkFromAgents()
             persistSelectedSmartPresetOverride()
         }
     }

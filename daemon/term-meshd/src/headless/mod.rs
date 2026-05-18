@@ -2046,10 +2046,22 @@ impl HeadlessManager {
                 (None, _) => true,
                 _ => true,
             };
-            let resumable = worktree_exists && all_present;
+            let has_any_session = team_meta
+                .leader
+                .session_id
+                .as_deref()
+                .map(|s| !s.is_empty())
+                .unwrap_or(false)
+                || agent_rows.iter().any(|a| a.has_session);
+            let sessions_resumable = if team_meta.execution_mode == "pane" {
+                has_any_session
+            } else {
+                all_present
+            };
+            let resumable = worktree_exists && sessions_resumable;
             let blocking_reason = if !worktree_exists {
                 Some("worktree_gone".to_string())
-            } else if !all_present {
+            } else if !sessions_resumable {
                 Some("no_sessions".to_string())
             } else {
                 None
@@ -2679,6 +2691,80 @@ mod tests {
         assert!(row.validity.all_sessions_present);
         assert!(row.validity.worktree_exists); // no worktree ⇒ vacuously true
         assert!(row.resumable);
+    }
+
+    #[test]
+    fn list_resumable_allows_pane_archive_with_leader_session_only() {
+        let _scope = scoped_root();
+        let team_uuid = "22222222-3333-4444-5555-666666666666".to_string();
+        let destroyed_at = 1715600100u64;
+
+        let archived_dir =
+            meta::headless_root().join(format!("{team_uuid}.archived.{destroyed_at}"));
+        std::fs::create_dir_all(archived_dir.join("agents")).unwrap();
+        std::fs::create_dir_all(archived_dir.join("instructions")).unwrap();
+
+        let inst_bytes = b"You are explorer.";
+        std::fs::write(archived_dir.join("instructions/explorer.txt"), inst_bytes).unwrap();
+        let agent_meta = meta::AgentMeta {
+            schema: meta::SCHEMA_VERSION,
+            team_uuid: team_uuid.clone(),
+            name: "explorer".into(),
+            agent_type: "explorer".into(),
+            cli: "claude".into(),
+            model: "sonnet".into(),
+            session_id: None,
+            color: Some("green".into()),
+            created_at: destroyed_at - 100,
+            instructions_sha256: Some(meta::sha256_hex(inst_bytes)),
+            cli_path_at_create: None,
+            parked: false,
+            usage_total: None,
+            extra_args: Vec::new(),
+            extra_env: std::collections::HashMap::new(),
+        };
+        std::fs::write(
+            archived_dir.join("agents/explorer.json"),
+            serde_json::to_vec_pretty(&agent_meta).unwrap(),
+        )
+        .unwrap();
+
+        let team_meta = meta::TeamMeta {
+            schema: meta::SCHEMA_VERSION,
+            team_uuid: team_uuid.clone(),
+            team_name: "pane-team".into(),
+            created_at: destroyed_at - 100,
+            destroyed_at: Some(destroyed_at),
+            working_directory: "/tmp/proj".into(),
+            git_root: None,
+            git_branch_at_create: None,
+            leader: meta::LeaderMeta {
+                mode: "claude".into(),
+                model: "sonnet".into(),
+                session_id: Some("leader-sid".into()),
+            },
+            agents: vec!["explorer".into()],
+            worktree: None,
+            execution_mode: "pane".into(),
+            claude_cli_version: None,
+            termmesh_app_version: "test".into(),
+            app_socket_path_at_create: None,
+            runbook_digest_hash: None,
+        };
+        std::fs::write(
+            archived_dir.join("team.json"),
+            serde_json::to_vec_pretty(&team_meta).unwrap(),
+        )
+        .unwrap();
+
+        let mgr = HeadlessManager::new();
+        let result = mgr.list_resumable(None, 50);
+        assert_eq!(result.teams.len(), 1);
+        let row = &result.teams[0];
+        assert_eq!(row.mode, "pane");
+        assert!(!row.validity.all_sessions_present);
+        assert!(row.resumable);
+        assert!(row.blocking_reason.is_none());
     }
 
     #[test]
