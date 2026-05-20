@@ -726,7 +726,7 @@ final class TeamOrchestrator: ObservableObject {
     /// Returns the team info on success.
     func createTeam(
         name: String,
-        agents: [(name: String, cli: String, model: String, agentType: String, color: String, instructions: String)],
+        agents: [(name: String, cli: String, model: String, agentType: String, color: String, instructions: String, customInstructions: String)],
         workingDirectory: String,
         leaderSessionId: String,
         leaderMode: String = "repl",
@@ -1052,6 +1052,7 @@ final class TeamOrchestrator: ObservableObject {
                 let effectiveInstructions = AgentRunbookService.shared.composeInstructions(
                     roleName: a.agentType,
                     presetInstructions: a.instructions,
+                    customInstructions: a.customInstructions.isEmpty ? nil : a.customInstructions,
                     workingDirectory: workingDirectory,
                     mode: .digest
                 )
@@ -1121,6 +1122,7 @@ final class TeamOrchestrator: ObservableObject {
                 let effectiveInstructions = AgentRunbookService.shared.composeInstructions(
                     roleName: agent.agentType,
                     presetInstructions: agent.instructions,
+                    customInstructions: agent.customInstructions.isEmpty ? nil : agent.customInstructions,
                     workingDirectory: workingDirectory,
                     mode: .digest
                 )
@@ -1231,6 +1233,7 @@ final class TeamOrchestrator: ObservableObject {
                 effectiveInstructions = AgentRunbookService.shared.composeInstructions(
                     roleName: agent.agentType,
                     presetInstructions: agent.instructions,
+                    customInstructions: agent.customInstructions.isEmpty ? nil : agent.customInstructions,
                     workingDirectory: agentWorkDir,
                     mode: .digest
                 )
@@ -1464,6 +1467,7 @@ final class TeamOrchestrator: ObservableObject {
         agentModel: String,
         agentType: String,
         instructions: String,
+        customInstructions: String? = nil,
         tabManager: TabManager
     ) -> Result<(team: Team, newAgent: AgentMember), AttachError> {
         // 1. Resolve workspace in the given TabManager
@@ -1520,6 +1524,7 @@ final class TeamOrchestrator: ObservableObject {
         let effectiveInstructions = AgentRunbookService.shared.composeInstructions(
             roleName: agentType,
             presetInstructions: instructions,
+            customInstructions: (customInstructions?.isEmpty ?? true) ? nil : customInstructions,
             workingDirectory: team.workingDirectory,
             mode: .digest
         )
@@ -1741,7 +1746,8 @@ final class TeamOrchestrator: ObservableObject {
         agentType: String,
         agentName: String,
         agentModel: String,
-        agentCli: String
+        agentCli: String,
+        customInstructions: String? = nil
     ) -> Result<AgentMember, AddAgentError> {
         // 1. Look up team by name
         guard var team = teams[teamName] else {
@@ -1773,6 +1779,7 @@ final class TeamOrchestrator: ObservableObject {
         let effectiveInstructions = AgentRunbookService.shared.composeInstructions(
             roleName: agentType,
             presetInstructions: "",
+            customInstructions: (customInstructions?.isEmpty ?? true) ? nil : customInstructions,
             workingDirectory: team.workingDirectory,
             mode: .digest
         )
@@ -3541,7 +3548,7 @@ final class TeamOrchestrator: ObservableObject {
         }()
 
         // Build agents tuple in createTeam's expected shape.
-        typealias AgentTuple = (name: String, cli: String, model: String, agentType: String, color: String, instructions: String)
+        typealias AgentTuple = (name: String, cli: String, model: String, agentType: String, color: String, instructions: String, customInstructions: String)
         let agentTuples: [AgentTuple] = agentsArr.map { a in
             (
                 name: (a["name"] as? String) ?? "agent",
@@ -3549,7 +3556,11 @@ final class TeamOrchestrator: ObservableObject {
                 model: (a["model"] as? String) ?? "sonnet",
                 agentType: (a["agent_type"] as? String) ?? ((a["name"] as? String) ?? "agent"),
                 color: (a["color"] as? String) ?? "blue",
-                instructions: (a["instructions"] as? String) ?? ""
+                instructions: (a["instructions"] as? String) ?? "",
+                // Resume archives already store the fully composed instructions
+                // (effective-prompt marker present), so re-applying custom
+                // instructions here would double-append. Always empty on resume.
+                customInstructions: ""
             )
         }
 

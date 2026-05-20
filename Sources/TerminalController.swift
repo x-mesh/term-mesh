@@ -2048,14 +2048,18 @@ class TerminalController {
         if leaderMode == "adopted" && adoptedLeaderSurfaceId == nil {
             return v2Error(id: id, code: "invalid_params", message: "adopted mode requires a valid surface_id")
         }
-        let agents = agentsParam.map { dict -> (name: String, cli: String, model: String, agentType: String, color: String, instructions: String) in
+        let agents = agentsParam.map { dict -> (name: String, cli: String, model: String, agentType: String, color: String, instructions: String, customInstructions: String) in
             (
                 name: dict["name"] as? String ?? "agent",
                 cli: dict["cli"] as? String ?? "claude",
                 model: dict["model"] as? String ?? "sonnet",
                 agentType: dict["agent_type"] as? String ?? "",
                 color: dict["color"] as? String ?? "green",
-                instructions: dict["instructions"] as? String ?? ""
+                instructions: dict["instructions"] as? String ?? "",
+                // R7: only the watcher carries custom_instructions (the CLI
+                // attaches `--spec` to the watcher dict only). composeInstructions
+                // appends it verbatim as `## Team Custom Instructions`.
+                customInstructions: dict["custom_instructions"] as? String ?? ""
             )
         }
         // Only the actual team creation needs MainActor
@@ -2207,6 +2211,8 @@ class TerminalController {
         let agentCli = (params["agent_cli"] as? String) ?? "claude"
         let agentModel = (params["agent_model"] as? String) ?? "sonnet"
         let instructions = (params["instructions"] as? String) ?? ""
+        // R7: spec is carried as custom_instructions (watcher only via the CLI).
+        let customInstructions = params["custom_instructions"] as? String
 
         // MainActor-bound resolution + attach
         let result: V2CallResult = await MainActor.run {
@@ -2256,6 +2262,7 @@ class TerminalController {
                 agentModel: agentModel,
                 agentType: agentType,
                 instructions: instructions,
+                customInstructions: customInstructions,
                 tabManager: resolved.tabManager
             )
 
@@ -2390,6 +2397,8 @@ class TerminalController {
         let agentName = rawName.isEmpty ? agentType : rawName
         let agentModel = (params["model"] as? String) ?? "sonnet"
         let agentCli = (params["cli"] as? String) ?? "claude"
+        // R7: spec is carried as custom_instructions (watcher only via the CLI).
+        let customInstructions = params["custom_instructions"] as? String
 
         let result: V2CallResult = await MainActor.run {
             let outcome = TeamOrchestrator.shared.addAgentToTeam(
@@ -2397,7 +2406,8 @@ class TerminalController {
                 agentType: agentType,
                 agentName: agentName,
                 agentModel: agentModel,
-                agentCli: agentCli
+                agentCli: agentCli,
+                customInstructions: customInstructions
             )
             switch outcome {
             case .success(let member):
@@ -3936,14 +3946,18 @@ class TerminalController {
         let workingDirectory = params["working_directory"] as? String ?? FileManager.default.currentDirectoryPath
         let leaderSessionId = params["leader_session_id"] as? String ?? UUID().uuidString
 
-        let agents = agentsParam.map { dict -> (name: String, cli: String, model: String, agentType: String, color: String, instructions: String) in
+        let agents = agentsParam.map { dict -> (name: String, cli: String, model: String, agentType: String, color: String, instructions: String, customInstructions: String) in
             (
                 name: dict["name"] as? String ?? "agent",
                 cli: dict["cli"] as? String ?? "claude",
                 model: dict["model"] as? String ?? "sonnet",
                 agentType: dict["agent_type"] as? String ?? "general",
                 color: dict["color"] as? String ?? "",
-                instructions: dict["instructions"] as? String ?? ""
+                instructions: dict["instructions"] as? String ?? "",
+                // R7: only the watcher carries custom_instructions (the CLI
+                // attaches `--spec` to the watcher dict only). composeInstructions
+                // appends it verbatim as `## Team Custom Instructions`.
+                customInstructions: dict["custom_instructions"] as? String ?? ""
             )
         }
 

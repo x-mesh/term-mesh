@@ -1596,7 +1596,9 @@ struct TeamCreationView: View {
                 }
             } label: {
                 HStack(spacing: 4) {
-                    Text("Instructions")
+                    // Watcher's custom instructions are the oversight spec — label
+                    // it accordingly so users know what to paste here.
+                    Text(agent.preset.name == "watcher" ? "Watcher Spec" : "Instructions")
                     if isCustomized {
                         Text("(customized)")
                             .foregroundStyle(.orange.opacity(0.8))
