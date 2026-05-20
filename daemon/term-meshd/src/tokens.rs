@@ -236,10 +236,25 @@ impl UsageTracker {
             return Ok(());
         }
 
-        // Prune file_positions for deleted files
+        // Prune per-session state for deleted files. Claude writes one session
+        // per JSONL file named <sessionId>.jsonl, so a file's stem is its
+        // session_id (verified). Once the file is gone the session can never
+        // reappear, so drop it from every per-session map. Previously only
+        // file_positions was pruned while sessions / session_started_at /
+        // latest_session_per_cwd grew unbounded for the daemon's lifetime.
         {
             let mut state = self.state.lock().unwrap();
             state.file_positions.retain(|p, _| p.exists());
+            let alive: std::collections::HashSet<String> = state
+                .file_positions
+                .keys()
+                .filter_map(|p| p.file_stem().and_then(|s| s.to_str()).map(str::to_owned))
+                .collect();
+            state.sessions.retain(|sid, _| alive.contains(sid));
+            state.session_started_at.retain(|sid, _| alive.contains(sid));
+            state
+                .latest_session_per_cwd
+                .retain(|_, sid| alive.contains(sid));
         }
 
         for entry in std::fs::read_dir(&claude_dir)? {

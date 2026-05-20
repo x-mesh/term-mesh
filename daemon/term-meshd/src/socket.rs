@@ -528,6 +528,10 @@ async fn run_jsonl_usage_tick_broadcaster(
                     continue;
                 };
                 let ts_ms = current_time_ms();
+                // Track live (team, agent) keys this tick so stale last_emitted
+                // entries can be dropped — teams/agents come and go and the map
+                // would otherwise grow unbounded for the daemon's lifetime.
+                let mut seen_keys: HashSet<(String, String)> = HashSet::new();
                 for team in teams {
                     let team_name = team
                         .get("team_name")
@@ -574,6 +578,7 @@ async fn run_jsonl_usage_tick_broadcaster(
                             continue;
                         }
                         let key = (team_name.to_string(), agent_name.to_string());
+                        seen_keys.insert(key.clone());
                         let last = last_emitted.get(&key).copied().unwrap_or_default();
                         if (in_tok, out_tok, cr_tok, cw_tok) == last {
                             continue;
@@ -600,6 +605,7 @@ async fn run_jsonl_usage_tick_broadcaster(
                                 by_panel.get(leader_panel)
                             {
                                 let key = (team_name.to_string(), LEADER_USAGE_NAME.to_string());
+                                seen_keys.insert(key.clone());
                                 let last = last_emitted.get(&key).copied().unwrap_or_default();
                                 if (in_tok, out_tok, cr_tok, cw_tok) != last {
                                     last_emitted.insert(key, (in_tok, out_tok, cr_tok, cw_tok));
@@ -623,6 +629,9 @@ async fn run_jsonl_usage_tick_broadcaster(
                         });
                     }
                 }
+                // Drop dedup entries for teams/agents that disappeared this tick
+                // so last_emitted stays bounded to the live roster.
+                last_emitted.retain(|k, _| seen_keys.contains(k));
             }
             changed = shutdown_rx.changed() => {
                 if changed.is_err() || *shutdown_rx.borrow() {
@@ -680,6 +689,10 @@ async fn run_codex_usage_tick_broadcaster(
                     continue;
                 };
                 let ts_ms = current_time_ms();
+                // Track live (team, agent) keys this tick so stale last_emitted
+                // entries can be dropped — teams/agents come and go and the map
+                // would otherwise grow unbounded for the daemon's lifetime.
+                let mut seen_keys: HashSet<(String, String)> = HashSet::new();
                 for team in teams {
                     let team_name = team
                         .get("team_name")
@@ -725,6 +738,7 @@ async fn run_codex_usage_tick_broadcaster(
                             continue;
                         }
                         let key = (team_name.to_string(), agent_name.to_string());
+                        seen_keys.insert(key.clone());
                         let last = last_emitted.get(&key).copied().unwrap_or_default();
                         if (in_tok, out_tok, cr_tok, cw_tok) == last {
                             continue;
@@ -753,6 +767,9 @@ async fn run_codex_usage_tick_broadcaster(
                         });
                     }
                 }
+                // Drop dedup entries for teams/agents that disappeared this tick
+                // so last_emitted stays bounded to the live roster.
+                last_emitted.retain(|k, _| seen_keys.contains(k));
             }
             changed = shutdown_rx.changed() => {
                 if changed.is_err() || *shutdown_rx.borrow() {
