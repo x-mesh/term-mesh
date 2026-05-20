@@ -36,9 +36,9 @@ Prepare a new release for term-mesh. This command updates the changelog, bumps t
      call per PR. Use the REST endpoints instead (separate 5000/hr core pool):
      ```bash
      # PR author (REST):
-     gh api repos/JINWOO-J/term-mesh/pulls/<N> --jq '.user.login'
+     gh api repos/x-mesh/term-mesh/pulls/<N> --jq '.user.login'
      # Linked issue reporter (REST):
-     gh api repos/JINWOO-J/term-mesh/issues/<N> --jq '.user.login'
+     gh api repos/x-mesh/term-mesh/issues/<N> --jq '.user.login'
      ```
    - **Prefer zero-API extraction when possible:** `git log <last-tag>..HEAD` already
      carries `Co-authored-by:` trailers and `(#N)` PR refs. Parse those first; only fall
@@ -75,9 +75,9 @@ Prepare a new release for term-mesh. This command updates the changelog, bumps t
      pool, and `gh run watch` streams without per-tick GraphQL):
      ```bash
      # Resolve the run id once, then stream it (REST-backed):
-     RUN_ID=$(gh run list --repo JINWOO-J/term-mesh --branch release/vX.Y.Z \
+     RUN_ID=$(gh run list --repo x-mesh/term-mesh --branch release/vX.Y.Z \
        --limit 1 --json databaseId --jq '.[0].databaseId')
-     gh run watch "$RUN_ID" --repo JINWOO-J/term-mesh --exit-status
+     gh run watch "$RUN_ID" --repo x-mesh/term-mesh --exit-status
      ```
    - If `gh run watch` is unavailable, fall back to a capped manual poll: `gh run view
      "$RUN_ID" --json status,conclusion` every ~30s, max ~40 iterations (~20 min), then
@@ -87,9 +87,9 @@ Prepare a new release for term-mesh. This command updates the changelog, bumps t
 
 9. **Merge the PR into main**
    - Target branch is `main` (see CLAUDE.md — main is the released-version branch).
-   - Merge: `gh pr merge <N> --repo JINWOO-J/term-mesh --squash --delete-branch`
+   - Merge: `gh pr merge <N> --repo x-mesh/term-mesh --squash --delete-branch`
    - Capture the squash-merge commit SHA via REST (not the GraphQL `gh pr view --json`):
-     `gh api repos/JINWOO-J/term-mesh/pulls/<N> --jq '.merge_commit_sha'` — the tag must
+     `gh api repos/x-mesh/term-mesh/pulls/<N> --jq '.merge_commit_sha'` — the tag must
      point at this SHA.
 
 10. **Create and push the tag at the squash-merge commit**
@@ -179,14 +179,14 @@ Credit the people who made each release happen. This builds community and encour
 ## [0.13.0] - 2025-01-30
 
 ### Added
-- New keyboard shortcut for quick tab switching ([#42](https://github.com/JINWOO-J/term-mesh/pull/42)) — thanks @contributor!
+- New keyboard shortcut for quick tab switching ([#42](https://github.com/x-mesh/term-mesh/pull/42)) — thanks @contributor!
 
 ### Fixed
-- Memory leak when closing split panes ([#38](https://github.com/JINWOO-J/term-mesh/pull/38)) — thanks @fixer!
-- Notification badges not clearing properly ([#35](https://github.com/JINWOO-J/term-mesh/pull/35)) — thanks @reporter for the report!
+- Memory leak when closing split panes ([#38](https://github.com/x-mesh/term-mesh/pull/38)) — thanks @fixer!
+- Notification badges not clearing properly ([#35](https://github.com/x-mesh/term-mesh/pull/35)) — thanks @reporter for the report!
 
 ### Changed
-- Improved terminal rendering performance ([#40](https://github.com/JINWOO-J/term-mesh/pull/40))
+- Improved terminal rendering performance ([#40](https://github.com/x-mesh/term-mesh/pull/40))
 
 ### Thanks to 4 contributors!
 

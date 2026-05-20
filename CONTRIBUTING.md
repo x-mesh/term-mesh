@@ -10,7 +10,7 @@
 
 1. Clone the repository with submodules:
    ```bash
-   git clone --recursive https://github.com/JINWOO-J/term-mesh.git
+   git clone --recursive https://github.com/x-mesh/term-mesh.git
    cd term-mesh
    ```
 

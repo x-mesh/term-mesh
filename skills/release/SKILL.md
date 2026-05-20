@@ -20,7 +20,7 @@ Run this workflow to prepare and publish a term-mesh release.
 - `git describe --tags --abbrev=0`
 - `git log --oneline <last-tag>..HEAD --no-merges`
 - Keep only end-user visible changes (features, bug fixes, UX/perf behavior).
-- **Collect contributors:** For each PR, get the author with `gh pr view <N> --repo JINWOO-J/term-mesh --json author --jq '.author.login'`. Also check linked issue reporters with `gh issue view <N> --json author --jq '.author.login'`.
+- **Collect contributors:** For each PR, get the author with `gh pr view <N> --repo x-mesh/term-mesh --json author --jq '.author.login'`. Also check linked issue reporters with `gh issue view <N> --json author --jq '.author.login'`.
 - Build a deduplicated list of all contributor `@handle`s.
 
 4. Update changelogs:
@@ -58,7 +58,7 @@ Run this workflow to prepare and publish a term-mesh release.
 - `git push origin vX.Y.Z`
 
 11. Verify release workflow and assets:
-- `gh run watch --repo JINWOO-J/term-mesh`
+- `gh run watch --repo x-mesh/term-mesh`
 - Confirm release exists in GitHub Releases and includes `term-mesh-macos.dmg`.
 
 ## Changelog Rules
