@@ -374,6 +374,12 @@ pub struct AgentSpec {
     /// Agent-specific instructions (preset system prompt).
     #[serde(default)]
     pub instructions: Option<String>,
+    /// Optional custom instructions (e.g. a watcher `--spec`). Folded into the
+    /// effective instructions at create time so they persist and reach the CLI
+    /// as `--append-system-prompt`. R7 (watcher-only) is enforced by the client,
+    /// which only attaches this to the watcher agent.
+    #[serde(default)]
+    pub custom_instructions: Option<String>,
     /// Phase 2: optional explicit agent_type (defaults to `name` for back-compat).
     #[serde(default)]
     pub agent_type: Option<String>,
@@ -386,6 +392,21 @@ pub struct AgentSpec {
     /// Extra environment variables merged into the subprocess env (base env takes precedence).
     #[serde(default)]
     pub extra_env: std::collections::HashMap<String, String>,
+}
+
+/// Merge a base preset instruction with an optional custom-instruction block.
+/// Returns the combined instruction text, or `None` when both are empty.
+/// Content is preserved verbatim (only emptiness is whitespace-trimmed) so a
+/// watcher `--spec` sentinel survives unchanged.
+fn merge_instructions(base: Option<&str>, custom: Option<&str>) -> Option<String> {
+    let base = base.filter(|s| !s.trim().is_empty());
+    let custom = custom.filter(|s| !s.trim().is_empty());
+    match (base, custom) {
+        (Some(b), Some(c)) => Some(format!("{b}\n\n## Custom Instructions\n\n{c}")),
+        (Some(b), None) => Some(b.to_string()),
+        (None, Some(c)) => Some(c.to_string()),
+        (None, None) => None,
+    }
 }
 
 /// Manages all headless agent subprocesses and teams.
@@ -1003,11 +1024,17 @@ impl HeadlessManager {
                 None
             };
 
-            let instr_bytes = spec
-                .instructions
-                .as_ref()
-                .map(|s| s.as_bytes().to_vec())
-                .filter(|b| !b.is_empty());
+            // Fold any custom_instructions (e.g. watcher --spec) into the
+            // effective instructions so they persist (sha256 + instructions/<name>.txt)
+            // and reach the CLI as --append-system-prompt. R7 (watcher-only) is
+            // enforced by the client, which only attaches custom_instructions to
+            // the watcher agent.
+            let instr_bytes = merge_instructions(
+                spec.instructions.as_deref(),
+                spec.custom_instructions.as_deref(),
+            )
+            .map(String::into_bytes)
+            .filter(|b| !b.is_empty());
             let instr_hash = instr_bytes.as_ref().map(|b| meta::sha256_hex(b));
 
             let agent_meta = meta::AgentMeta {
@@ -1089,11 +1116,15 @@ impl HeadlessManager {
         // also remove disk metadata (the team never went live).
         let resume_claude = params.session_ids.is_some();
         for (spec, agent_meta) in params.agents.iter().zip(agent_metas.iter()) {
-            let instr_bytes = spec
-                .instructions
-                .as_ref()
-                .map(|s| s.as_bytes().to_vec())
-                .filter(|b| !b.is_empty());
+            // Use the SAME merged instructions as the persisted metadata above so
+            // the live process's --append-system-prompt matches instructions/<name>.txt
+            // (and the resume-time sha256 check). Folds in watcher --spec.
+            let instr_bytes = merge_instructions(
+                spec.instructions.as_deref(),
+                spec.custom_instructions.as_deref(),
+            )
+            .map(String::into_bytes)
+            .filter(|b| !b.is_empty());
 
             let internal = InternalSpawnArgs {
                 name: spec.name.clone(),
@@ -2685,6 +2716,110 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::env::set_var("TERMMESH_HEADLESS_ROOT", dir.path());
         dir
+    }
+
+    #[test]
+    fn merge_instructions_custom_only_passes_through_verbatim() {
+        // Headless watcher --spec case: no base preset, only the spec.
+        let out = merge_instructions(None, Some("SPEC-SENTINEL-42")).unwrap();
+        assert_eq!(out, "SPEC-SENTINEL-42");
+    }
+
+    #[test]
+    fn merge_instructions_base_only_unchanged() {
+        let out = merge_instructions(Some("base prompt"), None).unwrap();
+        assert_eq!(out, "base prompt");
+    }
+
+    #[test]
+    fn merge_instructions_both_appends_custom_block() {
+        let out = merge_instructions(Some("base prompt"), Some("SPEC-SENTINEL-42")).unwrap();
+        assert_eq!(
+            out,
+            "base prompt\n\n## Custom Instructions\n\nSPEC-SENTINEL-42"
+        );
+    }
+
+    #[test]
+    fn merge_instructions_empty_inputs_return_none() {
+        assert_eq!(merge_instructions(None, None), None);
+        assert_eq!(merge_instructions(Some("   "), Some("\n")), None);
+    }
+
+    /// End-to-end runtime-artifact proof for the watcher `--spec` fold (F1):
+    /// a real `create_team` writes the merged spec to the watcher's persisted
+    /// instructions, while a sibling executor (no custom_instructions) gets none.
+    /// Uses a fake CLI that just blocks on stdin so spawn succeeds without a real
+    /// agent process. Runs against an isolated TERMMESH_HEADLESS_ROOT — never the
+    /// live team store.
+    #[tokio::test]
+    async fn create_team_folds_watcher_spec_into_persisted_instructions() {
+        let root = scoped_root();
+        const SENTINEL: &str = "SPEC-SENTINEL-F1-7f3a";
+
+        // Fake CLI: stays alive reading stdin so spawn_internal succeeds.
+        let fake_cli = root.path().join("fake-cli.sh");
+        std::fs::write(&fake_cli, "#!/bin/sh\nexec cat >/dev/null 2>&1\n").unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&fake_cli, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let fake_cli = fake_cli.to_string_lossy().to_string();
+        let workdir = root.path().to_string_lossy().to_string();
+
+        let params: TeamCreateParams = serde_json::from_value(serde_json::json!({
+            "team_name": "f1-verify",
+            "working_directory": workdir,
+            "agents": [
+                {
+                    "name": "watcher",
+                    "agent_type": "watcher",
+                    "cli": "claude",
+                    "model": "sonnet",
+                    "cli_path": fake_cli,
+                    "custom_instructions": SENTINEL,
+                },
+                {
+                    "name": "executor",
+                    "agent_type": "executor",
+                    "cli": "claude",
+                    "model": "sonnet",
+                    "cli_path": fake_cli,
+                },
+            ],
+        }))
+        .unwrap();
+
+        let mut mgr = HeadlessManager::new();
+        let team = mgr.create_team(params).await.expect("create_team");
+        let uuid = team.team_uuid.clone();
+
+        // Watcher: spec persisted verbatim + sha256 recorded.
+        let watcher_instr = meta::read_instructions(&uuid, "watcher")
+            .expect("watcher instructions file should exist");
+        let watcher_instr = String::from_utf8(watcher_instr).unwrap();
+        assert!(
+            watcher_instr.contains(SENTINEL),
+            "watcher instructions must contain the spec sentinel verbatim, got: {watcher_instr:?}"
+        );
+        let watcher_meta = meta::read_agent_meta(&uuid, "watcher").unwrap();
+        assert!(
+            watcher_meta.instructions_sha256.is_some(),
+            "watcher instructions_sha256 must be set"
+        );
+
+        // Executor (R7): no instructions file, no sha256.
+        assert!(
+            meta::read_instructions(&uuid, "executor").is_err(),
+            "executor must NOT have an instructions file (R7 watcher-only)"
+        );
+        let executor_meta = meta::read_agent_meta(&uuid, "executor").unwrap();
+        assert!(
+            executor_meta.instructions_sha256.is_none(),
+            "executor instructions_sha256 must be null (R7 watcher-only)"
+        );
+
+        let _ = mgr.destroy_team("f1-verify").await;
     }
 
     #[test]

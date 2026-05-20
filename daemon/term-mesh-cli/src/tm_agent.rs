@@ -6346,17 +6346,10 @@ fn run_create_headless(
                 let name = spec["name"].as_str().unwrap_or("");
                 let role = spec["agent_type"].as_str().unwrap_or(name);
                 let agent_id = format!("{name}@{team}");
-                let mut init_text = agent_init_prompt(name, role, team, &workdir, &app_sock_str);
-                // Watcher-only (R7): inject the spec into the watcher's init prompt
-                // so the headless watcher receives it (no Swift compose step here).
-                if role == "watcher" {
-                    if let Some(spec_text) = spec.get("custom_instructions").and_then(|v| v.as_str())
-                    {
-                        init_text.push_str("\n\n## Watcher Spec\n\n");
-                        init_text.push_str(spec_text);
-                        init_text.push('\n');
-                    }
-                }
+                // Watcher --spec is delivered via the daemon as --append-system-prompt
+                // (custom_instructions folded into the persisted instructions at
+                // create_team time), so no init-prompt injection is needed here.
+                let init_text = agent_init_prompt(name, role, team, &workdir, &app_sock_str);
                 match rpc_call_timeout(
                     &daemon_sock,
                     "headless.send",

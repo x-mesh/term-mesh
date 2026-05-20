@@ -1946,6 +1946,7 @@ async fn dispatch(req: &Request, ctx: &Context) -> Response {
                         model: p.model,
                         cli_path: p.cli_path,
                         instructions: p.instructions,
+                        custom_instructions: None,
                         agent_type: None,
                         color: None,
                         extra_args: p.extra_args,
