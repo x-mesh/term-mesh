@@ -18,11 +18,11 @@ Bumps version, updates changelog, commits, tags, and pushes.
 - If there are no user-facing changes, ask the user if they still want to release
 - **Collect contributors:** For each PR referenced in the commits, get the author:
   ```bash
-  gh pr view <N> --repo JINWOO-J/term-mesh --json author --jq '.author.login'
+  gh pr view <N> --repo x-mesh/term-mesh --json author --jq '.author.login'
   ```
 - Also check for linked issue reporters (the person who filed the bug):
   ```bash
-  gh issue view <N> --repo JINWOO-J/term-mesh --json author --jq '.author.login'
+  gh issue view <N> --repo x-mesh/term-mesh --json author --jq '.author.login'
   ```
 - Build a deduplicated list of all contributor `@handle`s for the release
 
