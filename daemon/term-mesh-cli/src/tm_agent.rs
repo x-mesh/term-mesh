@@ -323,6 +323,10 @@ enum Commands {
         /// With a session ID: resumes that specific session.
         #[arg(long)]
         resume_session: Option<Option<String>>,
+        /// Watcher spec, attached to the watcher agent only as custom instructions.
+        /// Literal text, or @path to read the spec from a file.
+        #[arg(long)]
+        spec: Option<String>,
     },
     /// Add an agent to an existing team (GUI and headless teams both supported).
     ///
@@ -4463,9 +4467,25 @@ fn main() {
             roles,
             headless,
             resume_session,
+            spec,
         } => {
+            // Resolve --spec (literal text or @path) once for both paths.
+            let watcher_spec = match resolve_watcher_spec(spec.as_deref()) {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("Error: {e}");
+                    process::exit(1);
+                }
+            };
             if headless {
-                run_create_headless(&sock, &team, count.unwrap_or(2), &model, roles.as_deref());
+                run_create_headless(
+                    &sock,
+                    &team,
+                    count.unwrap_or(2),
+                    &model,
+                    roles.as_deref(),
+                    watcher_spec.as_deref(),
+                );
             } else {
                 run_create(
                     &sock,
@@ -4481,6 +4501,7 @@ fn main() {
                     preset.as_deref(),
                     roles.as_deref(),
                     resume_session,
+                    watcher_spec.as_deref(),
                 );
             }
             return;
