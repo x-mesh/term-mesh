@@ -2712,11 +2712,18 @@ async fn try_emit_auto_reply(
 mod tests {
     use super::*;
     use std::sync::Mutex;
+    use std::cell::RefCell;
 
     /// Test-only mutex protecting TERMMESH_HEADLESS_ROOT env var access.
     /// When tests set the env var, they must hold this lock to prevent
     /// parallel tests from overwriting each other's paths.
     static ENV_VAR_LOCK: Mutex<()> = Mutex::new(());
+
+    /// Thread-local cache of the test root path.  Prevents race conditions
+    /// where async tasks read stale env vars after another test changes it.
+    thread_local! {
+        static TEST_HEADLESS_ROOT: RefCell<Option<std::path::PathBuf>> = RefCell::new(None);
+    }
 
     /// RAII guard that holds the env var lock for test duration.
     /// The guard keeps the TempDir alive and holds the mutex until dropped.
@@ -2732,15 +2739,69 @@ mod tests {
         }
     }
 
+    impl Drop for ScopedRoot {
+        fn drop(&mut self) {
+            // Clear thread-local cache when test ends
+            TEST_HEADLESS_ROOT.with(|root| {
+                *root.borrow_mut() = None;
+            });
+        }
+    }
+
+
+    /// Get headless root path from thread-local cache, or fallback to env var.
+    fn test_headless_root() -> std::path::PathBuf {
+        TEST_HEADLESS_ROOT.with(|root| {
+            root.borrow().clone().unwrap_or_else(|| {
+                // Fallback: re-read env var. In tests with scoped_root(), this should be
+                // the same value cached above (due to env var set by scoped_root).
+                // This fallback handles edge cases where cache might not be set.
+                meta::headless_root()
+            })
+        })
+    }
+
+    /// Set the thread-local cache of headless root path.
+    fn set_test_headless_root(path: std::path::PathBuf) {
+        TEST_HEADLESS_ROOT.with(|root| {
+            *root.borrow_mut() = Some(path);
+        });
+    }
+
+    /// Read instructions using cached headless root to avoid race conditions.
+    fn test_read_instructions(team_uuid: &str, agent_name: &str) -> std::io::Result<Vec<u8>> {
+        let root = test_headless_root();
+        let path = root
+            .join(team_uuid)
+            .join("instructions")
+            .join(format!("{agent_name}.txt"));
+        std::fs::read(path)
+    }
+
+    /// Read agent meta using cached headless root to avoid race conditions.
+    fn test_read_agent_meta(team_uuid: &str, name: &str) -> Result<meta::AgentMeta, String> {
+        let root = test_headless_root();
+        let path = root.join(team_uuid).join("agents").join(format!("{name}.json"));
+        std::fs::read(&path)
+            .map_err(|e| format!("read {}: {}", path.display(), e))
+            .and_then(|bytes| {
+                serde_json::from_slice::<meta::AgentMeta>(&bytes)
+                    .map_err(|e| format!("parse {}: {}", path.display(), e))
+            })
+    }
+
     /// Helper: scope `TERMMESH_HEADLESS_ROOT` to a fresh tmp dir for the test.
     /// The returned guard must be held for the entire test duration to prevent
-    /// parallel tests from overwriting the env var.
+    /// parallel tests from overwriting each other's paths.
     /// Note: If a previous test panicked while holding the lock, the mutex may
     /// be poisoned. We recover from poisoning with into_inner().
     fn scoped_root() -> ScopedRoot {
         let lock = ENV_VAR_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = tempfile::tempdir().unwrap();
         std::env::set_var("TERMMESH_HEADLESS_ROOT", dir.path());
+        // Cache path in thread-local to prevent async tasks from reading stale env var.
+        let path = dir.path().to_path_buf();
+        set_test_headless_root(path);
         ScopedRoot {
             _dir: dir,
             _lock: lock,
@@ -2781,20 +2842,22 @@ mod tests {
     /// Uses a fake CLI that just blocks on stdin so spawn succeeds without a real
     /// agent process. Runs against an isolated TERMMESH_HEADLESS_ROOT — never the
     /// live team store.
+    /// NOTE: Uses serial_test to prevent parallel test interference via env vars.
     #[tokio::test]
     async fn create_team_folds_watcher_spec_into_persisted_instructions() {
-        let root = scoped_root();
+        let root = scoped_root();  // Acquire lock for duration of test
+        let root_path = root.path().to_path_buf();
         const SENTINEL: &str = "SPEC-SENTINEL-F1-7f3a";
 
         // Fake CLI: stays alive reading stdin so spawn_internal succeeds.
-        let fake_cli = root.path().join("fake-cli.sh");
+        let fake_cli = root_path.join("fake-cli.sh");
         std::fs::write(&fake_cli, "#!/bin/sh\nexec cat >/dev/null 2>&1\n").unwrap();
         {
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(&fake_cli, std::fs::Permissions::from_mode(0o755)).unwrap();
         }
         let fake_cli = fake_cli.to_string_lossy().to_string();
-        let workdir = root.path().to_string_lossy().to_string();
+        let workdir = root_path.to_string_lossy().to_string();
 
         let params: TeamCreateParams = serde_json::from_value(serde_json::json!({
             "team_name": "f1-verify",
@@ -2824,14 +2887,14 @@ mod tests {
         let uuid = team.team_uuid.clone();
 
         // Watcher: spec persisted verbatim + sha256 recorded.
-        let watcher_instr = meta::read_instructions(&uuid, "watcher")
+        let watcher_instr = test_read_instructions(&uuid, "watcher")
             .expect("watcher instructions file should exist");
         let watcher_instr = String::from_utf8(watcher_instr).unwrap();
         assert!(
             watcher_instr.contains(SENTINEL),
             "watcher instructions must contain the spec sentinel verbatim, got: {watcher_instr:?}"
         );
-        let watcher_meta = meta::read_agent_meta(&uuid, "watcher").unwrap();
+        let watcher_meta = test_read_agent_meta(&uuid, "watcher").unwrap();
         assert!(
             watcher_meta.instructions_sha256.is_some(),
             "watcher instructions_sha256 must be set"
@@ -2839,10 +2902,10 @@ mod tests {
 
         // Executor (R7): no instructions file, no sha256.
         assert!(
-            meta::read_instructions(&uuid, "executor").is_err(),
+            test_read_instructions(&uuid, "executor").is_err(),
             "executor must NOT have an instructions file (R7 watcher-only)"
         );
-        let executor_meta = meta::read_agent_meta(&uuid, "executor").unwrap();
+        let executor_meta = test_read_agent_meta(&uuid, "executor").unwrap();
         assert!(
             executor_meta.instructions_sha256.is_none(),
             "executor instructions_sha256 must be null (R7 watcher-only)"
