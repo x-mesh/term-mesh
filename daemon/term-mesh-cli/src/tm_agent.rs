@@ -5317,6 +5317,64 @@ fn resolve_resume_session(flag: Option<Option<String>>) -> Option<String> {
     }
 }
 
+/// Resolve --spec: literal text, or @path to read the spec from a file.
+/// Returns Ok(None) when no spec was supplied. A leading `@` reads the file
+/// at the remaining path (error if it cannot be read). Empty input is treated
+/// as absent.
+fn resolve_watcher_spec(spec: Option<&str>) -> Result<Option<String>, String> {
+    let Some(raw) = spec else {
+        return Ok(None);
+    };
+    if raw.is_empty() {
+        return Ok(None);
+    }
+    if let Some(path) = raw.strip_prefix('@') {
+        let path = path.trim();
+        if path.is_empty() {
+            return Err("--spec @<path> requires a file path after '@'".to_string());
+        }
+        let content = fs::read_to_string(path)
+            .map_err(|e| format!("--spec: cannot read file '{path}': {e}"))?;
+        if content.trim().is_empty() {
+            return Err(format!("--spec: file '{path}' is empty"));
+        }
+        Ok(Some(content))
+    } else {
+        Ok(Some(raw.to_string()))
+    }
+}
+
+/// Attach `watcher_spec` as `custom_instructions` to watcher agents only (R7:
+/// watcher-only invariant). Warns when a spec is supplied but no watcher role
+/// is present in the team. Mutates the agents JSON array in place.
+fn apply_watcher_spec(agents: &mut [serde_json::Value], watcher_spec: Option<&str>) {
+    let Some(spec) = watcher_spec else {
+        return;
+    };
+    let mut attached = 0usize;
+    for agent in agents.iter_mut() {
+        let role = agent
+            .get("agent_type")
+            .and_then(|v| v.as_str())
+            .or_else(|| agent.get("name").and_then(|v| v.as_str()))
+            .unwrap_or("");
+        if role == "watcher" {
+            if let Some(obj) = agent.as_object_mut() {
+                obj.insert(
+                    "custom_instructions".to_string(),
+                    serde_json::Value::String(spec.to_string()),
+                );
+                attached += 1;
+            }
+        }
+    }
+    if attached == 0 {
+        eprintln!(
+            "Warning: --spec was provided but no 'watcher' agent is in this team; spec ignored."
+        );
+    }
+}
+
 // ── Orchestration implementations ────────────────────────────────────
 
 fn run_create(
@@ -5333,6 +5391,7 @@ fn run_create(
     preset: Option<&str>,
     roles: Option<&str>,
     resume_session: Option<Option<String>>,
+    watcher_spec: Option<&str>,
 ) {
     // Guard: --adopt and --claude-leader are mutually exclusive
     if adopt && claude_leader {
@@ -5368,7 +5427,7 @@ fn run_create(
     let mut workflow_review_checkpoints: Vec<String> = Vec::new();
 
     // Resolve agents from preset or roles via RPC, or build from defaults
-    let agents: Vec<serde_json::Value> = if let Some(preset_id) = preset {
+    let mut agents: Vec<serde_json::Value> = if let Some(preset_id) = preset {
         eprintln!("Resolving preset '{preset_id}'...");
         match rpc_call_timeout(
             sock,
@@ -5482,6 +5541,9 @@ fn run_create(
         }
         default_agents
     };
+
+    // Attach watcher spec (if any) to watcher agents only (R7: watcher-only).
+    apply_watcher_spec(&mut agents, watcher_spec);
 
     // Destroy existing team first, then poll until gone (max 10 × 50ms = 500ms)
     let _ = rpc_call_timeout(sock, "team.destroy", json!({ "team_name": team }), 2);
@@ -6210,6 +6272,7 @@ fn run_create_headless(
     count: u32,
     model: &str,
     roles: Option<&str>,
+    watcher_spec: Option<&str>,
 ) {
     let daemon_sock = match detect_daemon_socket() {
         Some(s) => s,
@@ -6220,7 +6283,7 @@ fn run_create_headless(
     };
 
     // Build agent list from roles or defaults
-    let agent_specs: Vec<Value> = if let Some(roles_str) = roles {
+    let mut agent_specs: Vec<Value> = if let Some(roles_str) = roles {
         roles_str
             .split(',')
             .map(|s| s.trim())
@@ -6240,6 +6303,9 @@ fn run_create_headless(
             })
             .collect()
     };
+
+    // Attach watcher spec (if any) to watcher agents only (R7: watcher-only).
+    apply_watcher_spec(&mut agent_specs, watcher_spec);
 
     let workdir = env::current_dir()
         .map(|p| p.to_string_lossy().to_string())
@@ -6280,7 +6346,17 @@ fn run_create_headless(
                 let name = spec["name"].as_str().unwrap_or("");
                 let role = spec["agent_type"].as_str().unwrap_or(name);
                 let agent_id = format!("{name}@{team}");
-                let init_text = agent_init_prompt(name, role, team, &workdir, &app_sock_str);
+                let mut init_text = agent_init_prompt(name, role, team, &workdir, &app_sock_str);
+                // Watcher-only (R7): inject the spec into the watcher's init prompt
+                // so the headless watcher receives it (no Swift compose step here).
+                if role == "watcher" {
+                    if let Some(spec_text) = spec.get("custom_instructions").and_then(|v| v.as_str())
+                    {
+                        init_text.push_str("\n\n## Watcher Spec\n\n");
+                        init_text.push_str(spec_text);
+                        init_text.push('\n');
+                    }
+                }
                 match rpc_call_timeout(
                     &daemon_sock,
                     "headless.send",
@@ -8923,5 +8999,78 @@ fn run_autonomous(
 
     if succeeded.is_empty() {
         process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod watcher_spec_tests {
+    use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn resolve_watcher_spec_absent_and_empty_return_none() {
+        assert_eq!(resolve_watcher_spec(None).unwrap(), None);
+        assert_eq!(resolve_watcher_spec(Some("")).unwrap(), None);
+    }
+
+    #[test]
+    fn resolve_watcher_spec_literal_passthrough() {
+        assert_eq!(
+            resolve_watcher_spec(Some("watch the diff scope")).unwrap(),
+            Some("watch the diff scope".to_string())
+        );
+    }
+
+    #[test]
+    fn resolve_watcher_spec_at_path_reads_file() {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = env::temp_dir().join(format!("tm-spec-{nanos}.txt"));
+        fs::write(&path, "SPEC: do not drift from the plan").unwrap();
+        let arg = format!("@{}", path.display());
+        let resolved = resolve_watcher_spec(Some(&arg)).unwrap();
+        assert_eq!(resolved, Some("SPEC: do not drift from the plan".to_string()));
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn resolve_watcher_spec_at_missing_file_errors() {
+        assert!(resolve_watcher_spec(Some("@/nonexistent/tm-spec-xyz.txt")).is_err());
+        assert!(resolve_watcher_spec(Some("@")).is_err());
+    }
+
+    #[test]
+    fn apply_watcher_spec_attaches_to_watcher_only() {
+        // R7 invariant: spec lands on watcher, never on other roles.
+        let mut agents = vec![
+            json!({ "name": "watcher", "agent_type": "watcher", "cli": "claude", "model": "sonnet" }),
+            json!({ "name": "executor", "agent_type": "executor", "cli": "claude", "model": "sonnet" }),
+        ];
+        apply_watcher_spec(&mut agents, Some("oversight spec"));
+        assert_eq!(
+            agents[0]["custom_instructions"].as_str(),
+            Some("oversight spec")
+        );
+        assert!(agents[1].get("custom_instructions").is_none());
+    }
+
+    #[test]
+    fn apply_watcher_spec_uses_name_when_agent_type_missing() {
+        let mut agents = vec![json!({ "name": "watcher", "cli": "claude", "model": "sonnet" })];
+        apply_watcher_spec(&mut agents, Some("spec via name"));
+        assert_eq!(
+            agents[0]["custom_instructions"].as_str(),
+            Some("spec via name")
+        );
+    }
+
+    #[test]
+    fn apply_watcher_spec_none_is_noop() {
+        let mut agents =
+            vec![json!({ "name": "watcher", "agent_type": "watcher", "cli": "claude" })];
+        apply_watcher_spec(&mut agents, None);
+        assert!(agents[0].get("custom_instructions").is_none());
     }
 }
