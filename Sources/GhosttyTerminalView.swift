@@ -1641,20 +1641,23 @@ final class TerminalSurface: Identifiable, ObservableObject {
         dlog("surface.free.request surface=\(id.uuidString.prefix(8)) reason=\(reason)")
         #endif
 
-        // Keep teardown asynchronous to avoid re-entrant close/deinit loops, but retain
-        // callback userdata until surface free completes so callbacks never dereference
-        // a deallocated view pointer.
+        // Clear the pty_data_callback synchronously here — before the async free
+        // Task and before `self` finishes deallocating. The callback's userdata
+        // is an unmanaged pointer to `self` (passUnretained); deferring the
+        // clear into the Task left a window where the IO thread could fire the
+        // callback into a dangling `self` between deinit and the Task running
+        // (observed as an objc_retain crash in recordPtyOutput on the io-reader
+        // thread during rapid pane close). clear is mutex-guarded in ghostty and
+        // serialized with callback dispatch, so once it returns no further
+        // callback can run.
+        ghostty_surface_clear_pty_data_callback(surface)
+
+        // Keep the actual free asynchronous to avoid re-entrant close/deinit loops.
         let surfaceId = id
         Task { @MainActor in
             #if DEBUG
             dlog("surface.free.perform surface=\(surfaceId.uuidString.prefix(8)) reason=\(reason)")
             #endif
-            // Clear our pty_data_callback first so it can't fire mid-free
-            // and dereference a freed Surface pointer via the userdata
-            // unmanaged ref (which points to `self`, kept alive by the
-            // surrounding TerminalSurface — but ghostty_surface_free can
-            // trigger one last drain from the IO thread).
-            ghostty_surface_clear_pty_data_callback(surface)
             ghostty_surface_free(surface)
             callbackContext?.release()
         }
