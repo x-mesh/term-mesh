@@ -10,6 +10,10 @@
 #   make clean          — remove build artifacts
 #   make daemon         — build only the Rust daemon (release)
 #   make test           — run daemon tests
+#   make init           — submodule sync + GhosttyKit build, only if out of date
+#   make doctor         — diagnose submodule / xcframework / toolchain state
+#   make sync           — force ghostty submodule sync (scripts/sync-submodules.sh)
+#   make setup          — build/cache GhosttyKit.xcframework + symlink (scripts/setup.sh)
 
 TAG           ?= term-mesh
 DERIVED_DATA  := /tmp/term-mesh-$(TAG)
@@ -23,6 +27,8 @@ BUNDLE_ID     := com.term-mesh.app.debug
 APP_VERSION   := $(shell grep 'MARKETING_VERSION' GhosttyTabs.xcodeproj/project.pbxproj | head -1 | sed 's/.*= *//;s/ *;.*//')
 DMG_NAME      := term-mesh-macos-$(APP_VERSION).dmg
 PROJECT_DIR   := $(shell pwd)
+CACHE_ROOT    := $(or $(TERMMESH_GHOSTTYKIT_CACHE_DIR),$(HOME)/.cache/term-mesh/ghosttykit)
+XCFW          := GhosttyKit.xcframework
 
 # Single source of truth for daemon binaries shipped inside the app
 # bundle's Contents/Resources/bin. Adding a new Rust workspace member
@@ -31,7 +37,64 @@ PROJECT_DIR   := $(shell pwd)
 # that each one was actually built before any packaging step runs.
 DAEMON_BINS   := term-meshd term-mesh-run tm-agent term-mesh-peer-relay
 
-.PHONY: build prod deploy deploy-prod dmg run stop clean daemon test install-commands sentry-upload-dsym verify-daemon-binaries
+.PHONY: init doctor sync setup build prod deploy deploy-prod dmg run stop clean daemon test install-commands sentry-upload-dsym verify-daemon-binaries
+
+# One-shot onboarding: sync the ghostty submodule and build/cache GhosttyKit
+# only when out of date. Safe to run repeatedly — no-op when everything matches.
+init:
+	@set -e; \
+	if git submodule status ghostty | grep -qE '^[+-]'; then \
+		echo "==> ghostty submodule out of sync — running sync-submodules.sh"; \
+		./scripts/sync-submodules.sh; \
+	else \
+		echo "==> ghostty submodule in sync"; \
+	fi; \
+	sha="$$(git -C ghostty rev-parse HEAD)"; \
+	want="$(CACHE_ROOT)/$$sha/$(XCFW)"; \
+	have="$$(readlink $(XCFW) 2>/dev/null || true)"; \
+	if [ "$$have" = "$$want" ] && [ -e "$(XCFW)/macos-arm64_x86_64/libghostty.a" ]; then \
+		echo "==> GhosttyKit.xcframework ready ($$sha)"; \
+	else \
+		echo "==> GhosttyKit.xcframework not ready for $$sha — running setup.sh"; \
+		./scripts/setup.sh; \
+	fi; \
+	echo "==> init complete (run 'make build' next)"
+
+# Read-only diagnosis of submodule / xcframework / toolchain state.
+doctor:
+	@echo "term-mesh doctor"; \
+	st="$$(git submodule status ghostty 2>/dev/null)"; \
+	case "$$st" in \
+		" "*) echo "  [ok]   ghostty submodule in sync";; \
+		"+"*) echo "  [warn] ghostty submodule SHA mismatch     -> make sync";; \
+		"-"*) echo "  [warn] ghostty submodule not initialized  -> make init";; \
+		*)    echo "  [warn] ghostty submodule status unknown   -> make init";; \
+	esac; \
+	sha="$$(git -C ghostty rev-parse HEAD 2>/dev/null)"; \
+	want="$(CACHE_ROOT)/$$sha/$(XCFW)"; \
+	have="$$(readlink $(XCFW) 2>/dev/null || true)"; \
+	if [ "$$have" = "$$want" ] && [ -e "$(XCFW)/macos-arm64_x86_64/libghostty.a" ]; then \
+		echo "  [ok]   GhosttyKit.xcframework ready ($$sha)"; \
+	else \
+		echo "  [warn] GhosttyKit.xcframework stale/missing   -> make setup"; \
+	fi; \
+	if [ -x /opt/homebrew/opt/zig@0.15/bin/zig ] || [ -x /usr/local/opt/zig@0.15/bin/zig ] || { command -v zig >/dev/null 2>&1 && zig version | grep -q '^0\.15\.'; }; then \
+		echo "  [ok]   zig 0.15.x available"; \
+	else \
+		echo "  [warn] zig 0.15.x missing                     -> brew install zig@0.15"; \
+	fi; \
+	if [ -x /opt/homebrew/opt/llvm/bin/llvm-libtool-darwin ] || [ -x /usr/local/opt/llvm/bin/llvm-libtool-darwin ] || command -v llvm-libtool-darwin >/dev/null 2>&1; then \
+		echo "  [ok]   llvm-libtool-darwin available"; \
+	else \
+		echo "  [warn] llvm-libtool-darwin missing            -> brew install llvm"; \
+	fi
+
+# Force submodule sync / GhosttyKit build (init runs these only when needed).
+sync:
+	@./scripts/sync-submodules.sh
+
+setup:
+	@./scripts/setup.sh
 
 build:
 	@echo "==> Generating BuildInfo.swift..."
