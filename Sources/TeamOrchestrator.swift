@@ -920,13 +920,15 @@ final class TeamOrchestrator: ObservableObject {
                let workspace = located.tabManager.tabs.first(where: { $0.id == located.workspaceId }),
                let panel = workspace.panels[adoptedSurfaceId] as? TerminalPanel {
                 let titleLower = panel.displayTitle.lowercased()
-                if titleLower.contains("codex") {
+                // "gpt-" indicates an OpenAI/Codex model (e.g. "gpt-5") — treat as codex,
+                // consistent with the isCodexLikePane title fallback. Gemini matches "gemini" only.
+                if titleLower.contains("codex") || titleLower.contains("gpt-") {
                     leaderCli = "codex"
                 } else if titleLower.contains("kiro") {
                     leaderCli = "kiro"
                 } else if titleLower.contains("claude") {
                     leaderCli = "claude"
-                } else if titleLower.contains("gpt-") || titleLower.contains("gemini") {
+                } else if titleLower.contains("gemini") {
                     leaderCli = "gemini"
                 }
             }
@@ -1546,13 +1548,15 @@ final class TeamOrchestrator: ObservableObject {
             var leaderCli: String? = nil
             if let panel = workspace.panels[callerPanelId] as? TerminalPanel {
                 let titleLower = panel.displayTitle.lowercased()
-                if titleLower.contains("codex") {
+                // "gpt-" indicates an OpenAI/Codex model (e.g. "gpt-5") — treat as codex,
+                // consistent with the isCodexLikePane title fallback. Gemini matches "gemini" only.
+                if titleLower.contains("codex") || titleLower.contains("gpt-") {
                     leaderCli = "codex"
                 } else if titleLower.contains("kiro") {
                     leaderCli = "kiro"
                 } else if titleLower.contains("claude") {
                     leaderCli = "claude"
-                } else if titleLower.contains("gpt-") || titleLower.contains("gemini") {
+                } else if titleLower.contains("gemini") {
                     leaderCli = "gemini"
                 }
             }
