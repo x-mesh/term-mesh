@@ -4,6 +4,21 @@ All notable changes to term-mesh are documented here.
 
 ## [Unreleased]
 
+## [0.128.0] - 2026-05-20
+
+### Added
+- **Watcher — 에이전트 drift 감시(페어 프로그래밍)** — 매번 새 컨텍스트로 동작하는 watcher가 spec과 대상 에이전트의 최근 작업을 대조해 **execution drift**(작업을 잘못 수행 — 오류 무시·스코프 이탈·잘못된 파일 수정)와 **direction drift**(애초에 잘못된 작업 수행)를 잡아 리더에게 보고한다. 장시간 에이전트 세션이 조용히 이탈하는 문제를 사람이 일일이 지켜보지 않아도 잡아낸다.
+  - 신규 `watcher` 에이전트 role + `/watch review|on|off|status` 명령. `/watch review`는 즉시 단발 점검, `/watch on`은 데몬이 주기적으로 자율 점검(켜고/끄는 토글로 비용 통제).
+  - `tm-agent create --spec <텍스트|@경로>`로 watcher에 점검 기준(spec)을 주입(watcher에만 적용). `tm-agent watch on/off/status`로 자율 감시를 토글·상태 확인.
+  - drift 발견 이력은 `.xm/watch/board.jsonl`에 누적되고 `/watch status`로 이번 세션 drift 횟수를 확인. 감시 결과는 리더에게만 보고하며 코드를 자동 수정하지 않는다(항상 사람 승인).
+
+### Changed
+- **Peer-relay 워크스페이스 분할의 최소 패널 크기 보장** — peer-relay 워크스페이스 창에서 디바이더를 드래그해 패널을 지나치게 작게 줄이거나 접어버릴 수 없도록 최소 패널 크기(100pt, 컨테이너 절반 상한)를 적용. 패널이 사실상 사라져 내용을 못 보던 문제 해소.
+
+### Thanks to 1 contributor!
+
+- [@JINWOO-J](https://github.com/JINWOO-J)
+
 ## [0.127.0] - 2026-05-20
 
 ### Fixed
