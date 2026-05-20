@@ -2711,12 +2711,40 @@ async fn try_emit_auto_reply(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    /// Test-only mutex protecting TERMMESH_HEADLESS_ROOT env var access.
+    /// When tests set the env var, they must hold this lock to prevent
+    /// parallel tests from overwriting each other's paths.
+    static ENV_VAR_LOCK: Mutex<()> = Mutex::new(());
+
+    /// RAII guard that holds the env var lock for test duration.
+    /// The guard keeps the TempDir alive and holds the mutex until dropped.
+    struct ScopedRoot {
+        _dir: tempfile::TempDir,
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl ScopedRoot {
+        /// Get the path to the scoped temp directory.
+        fn path(&self) -> &std::path::Path {
+            self._dir.path()
+        }
+    }
 
     /// Helper: scope `TERMMESH_HEADLESS_ROOT` to a fresh tmp dir for the test.
-    fn scoped_root() -> tempfile::TempDir {
+    /// The returned guard must be held for the entire test duration to prevent
+    /// parallel tests from overwriting the env var.
+    /// Note: If a previous test panicked while holding the lock, the mutex may
+    /// be poisoned. We recover from poisoning with into_inner().
+    fn scoped_root() -> ScopedRoot {
+        let lock = ENV_VAR_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = tempfile::tempdir().unwrap();
         std::env::set_var("TERMMESH_HEADLESS_ROOT", dir.path());
-        dir
+        ScopedRoot {
+            _dir: dir,
+            _lock: lock,
+        }
     }
 
     #[test]

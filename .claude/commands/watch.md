@@ -108,6 +108,10 @@ In the interactive wizard, prompt for every input the chosen action needs that w
 
 Never expand the spec into persistent watcher context. Every check gets a fresh prompt containing only the resolved spec and bounded recent delta.
 
+### Task-format override
+
+The watch spec is the default oversight contract, not a higher-priority output schema. If the leader's current task capsule gives a more specific output format, severity taxonomy, review lens, file scope, or verify command, that task instruction wins for that task. Do not count the format difference itself as drift. Example: if a reviewer spec says `P0-P3 + VERDICT` but the active review task explicitly requires security-lens findings as `[SEVERITY]`, the watcher must treat `[SEVERITY]` as an allowed task-format override and only flag real scope, safety, or correctness drift.
+
 ### Stance lens
 
 | Stance | Behavior |
@@ -317,6 +321,54 @@ If `.xm/watch/board.jsonl` is missing, print `DRIFT_COUNT_THIS_SESSION: 0`. If d
 10. **Do not let autonomous ticks steal focus or overlap indefinitely.** daemon ticks run in the background, obey `--every`/budget guards, and skip overruns while a check is `in_flight`.
 
 ## Examples
+
+### Recommended spec template
+
+Use a spec that states the stable contract, but explicitly leaves room for task-specific output formats:
+
+```text
+# Watch Spec
+Goal: <what the watcher must protect>
+Default lens: <critic|advisor|pair expectations>
+Default output: <baseline verdict shape, e.g. VERDICT/DRIFT_TYPE/SEVERITY/FINDING/SPEC_CLAUSE>
+Task override: if the leader's current task capsule specifies a more specific output format, severity taxonomy, review lens, file scope, or verify command, obey the task capsule for that task. Do not record drift for format differences alone.
+Count as drift: <ignored errors, false success, scope escape, forbidden side effects, unsafe behavior>
+Do not count as drift: <task-format override, explicitly read-only behavior, intentionally narrower scope>
+Reporting: leader-only structured verdict. The watcher never edits code, messages watched agents, or writes `.xm/watch/board.jsonl`.
+```
+
+Reviewer spec example:
+
+```text
+Goal: keep code review focused on regressions that matter.
+Default lens: prioritize P0-P3 bugs, behavioral regressions, missing tests, and incorrect verification.
+Default output: findings first with file:line and VERDICT.
+Task override: task-specific review lenses and output schemas are allowed. If the leader asks for security findings as [SEVERITY] or another taxonomy, treat that format as compliant and judge only the substance.
+Count as drift: reviewing unrelated files, inventing findings, ignoring failed tests, or reporting success without evidence.
+Do not count as drift: using a task-requested severity schema instead of P0-P3.
+```
+
+Executor spec example:
+
+```text
+Goal: keep implementation scoped and verified.
+Default lens: confirm changed files match the task, tests/builds are run or blockers are explicit, and no unrelated refactor lands.
+Default output: changed files, verify command, result, next action.
+Task override: if the task capsule names exact files, verification commands, or a different report header, prefer that task contract for this run.
+Count as drift: editing outside scope, skipping required verify, hiding failures, or committing when forbidden.
+Do not count as drift: stopping at read-only analysis when the task says read-only.
+```
+
+Security spec example:
+
+```text
+Goal: catch security regressions introduced or worsened by the target diff.
+Default lens: command injection, path traversal, socket/auth boundary, secret exposure, unsafe process/env handling.
+Default output: severity, file:line, evidence snippet, fix.
+Task override: if the task capsule defines a severity format such as [SEVERITY] or limits findings to Medium+, use that task-specific taxonomy and threshold.
+Count as drift: reporting pre-existing Low issues as blocking, missing a new exploitable path, or exposing secrets in the report.
+Do not count as drift: omitting Low findings when the task asks for Medium+ only.
+```
 
 ### On-demand review of one agent
 

@@ -26,6 +26,7 @@ term-mesh는 이미 multi-agent 인프라(`tm-agent` collect/read/msg, role/runb
 | **stance(성격)** | `critic`(기본) / `advisor` / `pair` | "긍정+부정 항상 곁에"는 비용 2배·노이즈·역할 중복. 차별화 가치는 회의적 검수자. 둘 다 필요하면 `pair`로 옵트인 |
 | **트리거** | on-demand "지금 리뷰" + watch **토글**(기본 off) | 매번 필요 없음. 토글이 곧 비용 통제 스위치. 긴/위험 작업에만 ON |
 | **spec** | **필수** | direction drift는 spec 대비 판단이 필수. execution drift도 기준이 있어야 명확 |
+| **task override** | 현재 task capsule의 구체 지시가 기본 spec보다 우선 | 출력 포맷, severity 체계, 리뷰 lens, 파일 범위, verify 명령이 task에 명시되면 그 task에서는 override로 인정. 형식 차이만으로 drift 기록 금지 |
 | **model/CLI** | **사용자 선택** (claude/codex/gemini) | cross-model 협력이 최종 목적. executor=Claude / watcher=Codex 같은 조합 자유 |
 | **표면** | 전용 `/watch` 스킬 (`/tm` 기본 유지, `/tm-op pair`는 one-shot alias) | watch는 켜고/끄는 지속 모드라 one-shot 전략(`/tm-op`)에 안 맞음 |
 
@@ -107,7 +108,24 @@ watcher를 first-class role로 등록 + 팀 생성 시 spec 주입. 데몬 변�
 - headless one-shot watcher (pane 점유 없이)
 - 최종 목적인 **자율 cross-model 협력**이 여기서 완성
 
-## 7. 미해결 / 추후 결정
+## 7. 운영 교훈 — 2026-05-20 false drift
+
+사례: `/watch on reviewer`에 reviewer 페르소나 spec(`P0-P3 + VERDICT`)을 걸어둔 상태에서,
+리더가 보안 리뷰 task에 `[SEVERITY]` 형식을 명시했다. watcher가 기본 spec의 출력 형식을
+현재 task 지시보다 강하게 해석하면서 16건의 false drift를 기록했다.
+
+교훈: watcher spec는 지속적인 기본 계약이고, task capsule은 현재 작업의 구체 계약이다.
+둘이 충돌할 때는 task capsule의 구체 지시가 우선한다. 특히 출력 포맷, severity taxonomy,
+리뷰 lens, 파일 범위, verify 명령은 task-format override로 인정해야 한다. watcher는 형식
+차이만으로 drift를 기록하지 말고, task override를 따른 결과가 spec의 핵심 안전/스코프 계약과
+양립 가능한지 판단한다.
+
+문서화 원칙: 권장 spec 템플릿에는 `Task override`와 `Do not count as drift` 항목을 포함한다.
+예: reviewer 기본 spec가 `P0-P3 + VERDICT`를 요구하더라도 security-lens task가 `[SEVERITY]`
+형식을 요구하면, 그 형식 차이는 drift가 아니다. drift는 override를 무시했거나, override 범위를
+넘어 오류 은폐, scope escape, 금지된 side effect 같은 핵심 계약을 깼을 때만 기록한다.
+
+## 8. 미해결 / 추후 결정
 - 이력 비휘발 저장 정확한 경로 (worktree `.xm/` vs app-support)
 - `pair` stance에서 critic/advisor를 한 에이전트가 겸하는지 vs 2-pane 분리
 - continuous 모드의 기본 interval, execution:direction 점검 비율

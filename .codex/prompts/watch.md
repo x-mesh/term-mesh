@@ -67,6 +67,8 @@ Common flags:
 
 `review` and `on` require a spec. Resolve in order: `--spec` flag, then team spec.
 
+Task-format override: the spec is the default oversight contract. If the leader's current task capsule gives a more specific output format, severity taxonomy, review lens, file scope, or verify command, that task instruction wins for that task. Do not report drift for format differences alone. Full template examples live in `.claude/commands/watch.md`; the compressed form is: `Goal`, `Default lens`, `Default output`, `Task override`, `Count as drift`, `Do not count as drift`, `Reporting`.
+
 If no spec can be resolved:
 - **Interactive (default):** do NOT reject. Ask the user a direct question and wait for their reply: ask what to watch and accept either inline spec text or an `@path`. Use the answer as the spec for this run only; never persist it.
 - **Non-interactive (`--no-input` / automation / headless):** reject with:
@@ -188,5 +190,6 @@ If the board is missing, report drift count `0`. If duplicate `check_id` rows ex
 - Do not store drift history only under `~/.term-mesh/results`; those files are pruned. Use `.xm/watch/board.jsonl`.
 - Keep watcher context fresh every check: hard restart or true one-shot, with input limited to spec + recent delta.
 - watcher returns a structured verdict only. Manual `/watch review` writes through this leader shim; autonomous `/watch on` writes through daemon `WatchController`.
+- Do not treat task-format override as drift: when the active task explicitly requests a different output schema or severity taxonomy, judge substance against the spec and task together.
 - watcher proposes course corrections only; code edits are leader-approved follow-up work.
 - Autonomous watch is report-only, focus-safe, cost-guarded, and skips overlapping checks while a prior tick is `in_flight`.

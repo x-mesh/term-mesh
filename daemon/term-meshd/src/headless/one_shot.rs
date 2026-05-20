@@ -181,10 +181,12 @@ pub fn compose_watcher_instructions(spec: &str) -> Option<String> {
 pub fn build_review_message(input: &WatchCheckInput) -> String {
     let delta_section = if input.delta.trim().is_empty() {
         format!(
-            "Step 1 (read-only): fetch the watched agent's recent output yourself, \
+            "Step 1 (read-only): fetch the watched agent's recent output yourself via your app socket, \
              BOUNDED to the last {n} lines — never the full history (R6). Run: \
              tm-agent read {target} --lines {n}  (or: tm-agent collect --lines {n}, \
-             then focus on \"{target}\"). Use ONLY that bounded recent delta.",
+             then focus on \"{target}\"). Use ONLY that bounded recent delta. \
+             If the socket is unavailable or the agent is not active, report that as an error \
+             (do not output a verdict).",
             n = DELTA_TAIL_LINES,
             target = input.target,
         )
@@ -329,8 +331,32 @@ impl HeadlessOneShotRunner {
         let terminated = self.manager.lock().await.terminate(&agent_id).await.is_ok();
 
         let reported = !verdict_text.trim().is_empty();
+
+        // P13 fallback: detect collection/RPC errors and surface as errors (not drifts).
+        // If the watcher tried to run tm-agent read/collect and got an error, it should
+        // report that explicitly, not output a verdict. Errors like "unknown method",
+        // "socket unavailable", "agent not active" indicate collection failure.
+        let collection_error = verdict_text.contains("unknown method")
+            || verdict_text.contains("socket")
+            || verdict_text.contains("not active")
+            || verdict_text.contains("connection refused")
+            || verdict_text.contains("team.read")
+            || verdict_text.contains("team.collect")
+            || verdict_text.contains("team.status");
+
         let error = match status {
             WatchExitStatus::Timeout if !reported => Some("verdict timeout".to_string()),
+            _ if collection_error && reported => {
+                // Watcher reported a collection/RPC error instead of a verdict.
+                // Surface this as an error, not a drift.
+                tracing::warn!(
+                    "watch: collection error from watcher (team={} check={}): {}",
+                    team_id,
+                    check_id,
+                    verdict_text.chars().take(200).collect::<String>()
+                );
+                Some(format!("collection failed: {}", verdict_text.chars().take(100).collect::<String>()))
+            }
             _ => None,
         };
         WatchCheckOutcome {
@@ -339,7 +365,7 @@ impl HeadlessOneShotRunner {
             drift_kind,
             target,
             spawned: true,
-            reported,
+            reported: reported && !collection_error,  // Don't mark as reported if it's an error
             terminated,
             exit_status: status,
             panel_id: None,

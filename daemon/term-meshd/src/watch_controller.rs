@@ -277,6 +277,47 @@ async fn post_team_message(
     Ok(())
 }
 
+/// Post a watch drift finding via new RPC team.watch_drift.post.
+/// Increases visibility of drift findings in leader inbox (vs. audit-only notes).
+/// Gracefully handles "unknown method" if app hasn't yet implemented the handler (t4).
+/// Returns Err only if socket connection fails; RPC errors (including unknown method)
+/// are logged but not propagated (F4 graceful handling).
+async fn post_watch_drift(
+    app_socket: &str,
+    team_id: &str,
+    target: &str,
+    drift_type: &str,
+    severity: &str,
+    finding: &str,
+    spec_clause: &str,
+    check_id: &str,
+) -> std::io::Result<()> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut stream = tokio::net::UnixStream::connect(app_socket).await?;
+    let req = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "team.watch_drift.post",
+        "params": {
+            "team_name": team_id,
+            "target": target,
+            "drift_type": drift_type,
+            "severity": severity,
+            "finding": finding,
+            "spec_clause": spec_clause,
+            "check_id": check_id,
+        },
+    });
+    let mut line = serde_json::to_string(&req).unwrap_or_default();
+    line.push('\n');
+    stream.write_all(line.as_bytes()).await?;
+    stream.flush().await?;
+    // Best-effort, bounded read of the one-line response (ignored on success or unknown method).
+    let mut buf = [0u8; 4096];
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(3), stream.read(&mut buf)).await;
+    Ok(())
+}
+
 /// Handle a single check outcome: parse → (DRIFT) board append + leader inbox.
 /// The inbox post happens only when a *new* board row was written, so retried
 /// ticks with the same `check_id` neither duplicate the board nor re-notify the
@@ -285,11 +326,15 @@ async fn post_team_message(
 /// `working_dir` (team worktree) and `app_socket` are resolved by the caller
 /// from the [`WatchRegistry`] — they are not on the outcome, so the
 /// `WatchCheckOutcome` shape stays owned by P1/P4 (`watch.rs`/`one_shot.rs`).
+///
+/// If `app_socket` is None, the board is still written but the leader inbox
+/// post is skipped (logged + error recorded in registry).
 pub(crate) async fn handle_outcome<I: LeaderInbox + ?Sized>(
     outcome: &WatchCheckOutcome,
     working_dir: &Path,
     app_socket: Option<&str>,
     inbox: &I,
+    registry: &crate::drift_watch::WatchRegistry,
 ) -> ControllerAction {
     if let Some(err) = &outcome.error {
         if !outcome.reported {
@@ -339,7 +384,46 @@ pub(crate) async fn handle_outcome<I: LeaderInbox + ?Sized>(
                 cid = outcome.check_id,
             );
             // Leader inbox only — never --to <agent>. Focus-free.
-            inbox.post(&outcome.team_id, &content, app_socket).await;
+            if app_socket.is_none() {
+                let err_msg = format!(
+                    "no app socket — leader inbox not posted (check_id={})",
+                    outcome.check_id
+                );
+                tracing::warn!("watch: {}", err_msg);
+                // Record the error in the registry so it's visible in watch.status
+                let mut reg = registry.lock().await;
+                if let Some(st) = reg.get_mut(&outcome.team_id) {
+                    st.last_error = Some(err_msg);
+                }
+            } else {
+                // Post audit note (existing behavior).
+                inbox.post(&outcome.team_id, &content, app_socket).await;
+
+                // Post detailed drift finding via new RPC (t3/t4 enhancement for visibility).
+                // Graceful error handling: if app returns unknown method (hasn't implemented handler yet),
+                // log it but don't fail — the audit note still provides visibility.
+                if let Some(sock) = app_socket {
+                    if let Err(e) = post_watch_drift(
+                        sock,
+                        &outcome.team_id,
+                        &outcome.target,
+                        &drift_type,
+                        &severity,
+                        &finding,
+                        &spec_clause,
+                        &outcome.check_id,
+                    )
+                    .await
+                    {
+                        tracing::debug!(
+                            "watch: post_watch_drift failed (team={} check={}): {e}",
+                            outcome.team_id,
+                            outcome.check_id
+                        );
+                        // Don't escalate to error — audit note still provides visibility.
+                    }
+                }
+            }
             ControllerAction::Appended
         }
         Ok(false) => ControllerAction::Duplicate,
@@ -382,6 +466,7 @@ pub async fn run_watch_controller<I: LeaderInbox + 'static>(
             Path::new(&working_dir),
             app_socket.as_deref(),
             &inbox,
+            &registry,
         )
         .await;
     }
@@ -449,9 +534,26 @@ mod tests {
     async fn drift_appends_board_and_posts_inbox() {
         let dir = tempfile::tempdir().unwrap();
         let inbox = RecordingInbox::new();
+        let registry = crate::drift_watch::new_registry();
+        // Populate registry with a team entry
+        {
+            let mut reg = registry.lock().await;
+            reg.insert(
+                "standard".into(),
+                crate::drift_watch::WatchState::enabled(
+                    5,
+                    Some("executor".into()),
+                    "claude",
+                    "sonnet",
+                    "critic",
+                    "spec",
+                    dir.path().to_string_lossy().to_string(),
+                ),
+            );
+        }
         let o = outcome("chk-1", DRIFT_VERDICT);
 
-        let action = handle_outcome(&o, dir.path(), None, &inbox).await;
+        let action = handle_outcome(&o, dir.path(), Some("/tmp/dummy.sock"), &inbox, &registry).await;
         assert_eq!(action, ControllerAction::Appended);
 
         let board = std::fs::read_to_string(board_dir(dir.path()).join("board.jsonl")).unwrap();
@@ -472,13 +574,29 @@ mod tests {
     async fn duplicate_check_id_skips_board_and_inbox() {
         let dir = tempfile::tempdir().unwrap();
         let inbox = RecordingInbox::new();
+        let registry = crate::drift_watch::new_registry();
+        {
+            let mut reg = registry.lock().await;
+            reg.insert(
+                "standard".into(),
+                crate::drift_watch::WatchState::enabled(
+                    5,
+                    Some("executor".into()),
+                    "claude",
+                    "sonnet",
+                    "critic",
+                    "spec",
+                    dir.path().to_string_lossy().to_string(),
+                ),
+            );
+        }
 
         let first =
-            handle_outcome(&outcome("chk-dup", DRIFT_VERDICT), dir.path(), None, &inbox).await;
+            handle_outcome(&outcome("chk-dup", DRIFT_VERDICT), dir.path(), Some("/tmp/dummy.sock"), &inbox, &registry).await;
         assert_eq!(first, ControllerAction::Appended);
         // Same check_id again (a retried tick) → idempotent skip.
         let second =
-            handle_outcome(&outcome("chk-dup", DRIFT_VERDICT), dir.path(), None, &inbox).await;
+            handle_outcome(&outcome("chk-dup", DRIFT_VERDICT), dir.path(), Some("/tmp/dummy.sock"), &inbox, &registry).await;
         assert_eq!(second, ControllerAction::Duplicate);
 
         let board = std::fs::read_to_string(board_dir(dir.path()).join("board.jsonl")).unwrap();
@@ -494,9 +612,25 @@ mod tests {
     async fn on_track_records_nothing() {
         let dir = tempfile::tempdir().unwrap();
         let inbox = RecordingInbox::new();
+        let registry = crate::drift_watch::new_registry();
+        {
+            let mut reg = registry.lock().await;
+            reg.insert(
+                "standard".into(),
+                crate::drift_watch::WatchState::enabled(
+                    5,
+                    Some("executor".into()),
+                    "claude",
+                    "sonnet",
+                    "critic",
+                    "spec",
+                    dir.path().to_string_lossy().to_string(),
+                ),
+            );
+        }
         let ok = "[VERDICT] on-track\n[FINDING] none\n[SPEC_CLAUSE] n/a";
 
-        let action = handle_outcome(&outcome("chk-ok", ok), dir.path(), None, &inbox).await;
+        let action = handle_outcome(&outcome("chk-ok", ok), dir.path(), Some("/tmp/dummy.sock"), &inbox, &registry).await;
         assert_eq!(action, ControllerAction::NoDrift);
 
         assert!(
@@ -513,11 +647,27 @@ mod tests {
     async fn errored_outcome_is_logged_only() {
         let dir = tempfile::tempdir().unwrap();
         let inbox = RecordingInbox::new();
+        let registry = crate::drift_watch::new_registry();
+        {
+            let mut reg = registry.lock().await;
+            reg.insert(
+                "standard".into(),
+                crate::drift_watch::WatchState::enabled(
+                    5,
+                    Some("executor".into()),
+                    "claude",
+                    "sonnet",
+                    "critic",
+                    "spec",
+                    dir.path().to_string_lossy().to_string(),
+                ),
+            );
+        }
         let mut o = outcome("chk-err", "");
         o.reported = false;
         o.error = Some("spawn failed: boom".into());
 
-        let action = handle_outcome(&o, dir.path(), None, &inbox).await;
+        let action = handle_outcome(&o, dir.path(), Some("/tmp/dummy.sock"), &inbox, &registry).await;
         assert_eq!(action, ControllerAction::Errored);
         assert!(!board_dir(dir.path()).join("board.jsonl").exists());
         assert!(inbox.posts.lock().unwrap().is_empty());
@@ -612,7 +762,23 @@ mod tests {
 
         // Controller turns it into a board row + leader inbox message.
         let inbox = RecordingInbox::new();
-        let action = handle_outcome(&outcome, dir.path(), None, &inbox).await;
+        let registry = crate::drift_watch::new_registry();
+        {
+            let mut reg = registry.lock().await;
+            reg.insert(
+                "e2e".into(),
+                crate::drift_watch::WatchState::enabled(
+                    5,
+                    Some("executor".into()),
+                    "claude",
+                    "sonnet",
+                    "critic",
+                    "spec",
+                    dir.path().to_string_lossy().to_string(),
+                ),
+            );
+        }
+        let action = handle_outcome(&outcome, dir.path(), Some("/tmp/dummy.sock"), &inbox, &registry).await;
         assert_eq!(action, ControllerAction::Appended);
 
         let board =
@@ -631,18 +797,17 @@ mod tests {
         // board.jsonl and the leader inbox.
         let dir = tempfile::tempdir().unwrap();
         let registry = crate::drift_watch::new_registry();
-        registry.lock().await.insert(
-            "standard".into(),
-            crate::drift_watch::WatchState::enabled(
-                5,
-                Some("executor".into()),
-                "claude",
-                "sonnet",
-                "critic",
-                "spec",
-                dir.path().to_string_lossy().to_string(),
-            ),
+        let mut state = crate::drift_watch::WatchState::enabled(
+            5,
+            Some("executor".into()),
+            "claude",
+            "sonnet",
+            "critic",
+            "spec",
+            dir.path().to_string_lossy().to_string(),
         );
+        state.app_socket_path = Some("/tmp/dummy.sock".to_string());
+        registry.lock().await.insert("standard".into(), state);
         let inbox = RecordingInbox::new();
         let posts = Arc::clone(&inbox.posts);
         let (tx, rx) = mpsc::unbounded_channel();

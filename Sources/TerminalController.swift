@@ -1945,6 +1945,8 @@ class TerminalController {
             return teamDataContextGet(params: params, id: id, store: store)
         case "team.context.list":
             return teamDataContextList(params: params, id: id, store: store)
+        case "team.watch_drift.post":
+            return teamDataWatchDriftPost(params: params, id: id, store: store)
         case "team.preset.list":
             return teamDataPresetList(params: params, id: id)
         case "team.preset.resolve":
@@ -3362,6 +3364,7 @@ class TerminalController {
         "team.result.collect",
         "team.agent.heartbeat",
         "team.inbox",
+        "team.watch_drift.post",
         "team.task.get",
         "team.task.list",
         "team.task.dependents",
@@ -3725,6 +3728,11 @@ class TerminalController {
         }
         let entries = store.contextList(teamName: teamName)
         return v2Ok(id: id, result: ["entries": entries, "count": entries.count])
+    }
+
+    private func teamDataWatchDriftPost(params: [String: Any], id: Any?, store: TeamDataStore) -> String {
+        let result = v2TeamWatchDriftPost(params: params)
+        return v2Result(id: id, result)
     }
 
     // MARK: - Team Preset Handlers (off-main-thread safe)
@@ -4786,6 +4794,56 @@ class TerminalController {
         }
         let entries = TeamDataStore.shared.contextList(teamName: teamName)
         return .ok(["entries": entries, "count": entries.count])
+    }
+
+    // MARK: - Watch Drift Posting
+
+    /// Data-only RPC: post a watch drift item to the leader inbox.
+    /// Focus-safe: no window.focus, send_key, or app activation (data mutation only).
+    private func v2TeamWatchDriftPost(params: [String: Any]) -> V2CallResult {
+        guard let teamName = params["team_name"] as? String else {
+            return .err(code: "invalid_params", message: "Missing team_name", data: nil)
+        }
+        guard let checkId = params["check_id"] as? String else {
+            return .err(code: "invalid_params", message: "Missing check_id", data: nil)
+        }
+        guard let target = params["target"] as? String else {
+            return .err(code: "invalid_params", message: "Missing target", data: nil)
+        }
+        // Read drift_type (daemon convention), with fallback to drift_kind for backward compat
+        let driftKind = (params["drift_type"] as? String) ?? (params["drift_kind"] as? String)
+        guard let driftKind else {
+            return .err(code: "invalid_params", message: "Missing drift_type", data: nil)
+        }
+        guard let severity = params["severity"] as? String else {
+            return .err(code: "invalid_params", message: "Missing severity", data: nil)
+        }
+        guard let finding = params["finding"] as? String else {
+            return .err(code: "invalid_params", message: "Missing finding", data: nil)
+        }
+        guard let specClause = params["spec_clause"] as? String else {
+            return .err(code: "invalid_params", message: "Missing spec_clause", data: nil)
+        }
+
+        let success = TeamDataStore.shared.postWatchDrift(
+            teamName: teamName,
+            checkId: checkId,
+            target: target,
+            driftKind: driftKind,
+            severity: severity,
+            finding: finding,
+            specClause: specClause
+        )
+
+        if success {
+            return .ok([
+                "team_name": teamName,
+                "check_id": checkId,
+                "posted": true
+            ])
+        } else {
+            return .err(code: "not_found", message: "Team not found", data: nil)
+        }
     }
 
     // MARK: - V2 Notification Methods
