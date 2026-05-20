@@ -28,35 +28,50 @@ User provided: $ARGUMENTS
 
 ## Routing
 
-Parse the first token of `$ARGUMENTS` and route to the matching subcommand:
+Parse the first token and route:
 
-- `review` -> [Subcommand: review] 실행
-- `on` -> [Subcommand: on] 실행
-- `off` -> [Subcommand: off] 실행
-- `status` -> [Subcommand: status] 실행
-- empty input -> help 출력 후 종료
-- unrecognized token -> valid subcommand 목록 출력 후 종료
+- `help` -> print the usage block (see below) and stop. This is the ONLY case that prints documentation.
+- `review` -> [Subcommand: review]
+- `on` -> [Subcommand: on]
+- `off` -> [Subcommand: off]
+- `status` -> [Subcommand: status]
+- empty input -> start the full interactive wizard
+- unrecognized token -> start the full interactive wizard
 
-### Empty input
+A recognized subcommand still enters the wizard for any required input it is missing, unless `--no-input` is set. Only `/watch help` prints documentation; every other invocation acts.
 
-If `$ARGUMENTS` is empty, print:
+### Interactive wizard (default)
+
+If the first token is `help`, print this usage block and stop:
 
 ```text
 /watch — stateless drift oversight
 
 Usage:
+  /watch help                    show this help
   /watch review [agent] --spec <text|@path> [--stance critic|advisor|pair]
-  /watch on [agent] --spec <text|@path> [--every 300]
-  /watch off [agent|all]
+  /watch on     [agent] --spec <text|@path> [--every 300]
+  /watch off    [agent|all]
   /watch status [agent]
 
 Responsibility:
-  /tm          fan-out dispatch
-  /tm-op pair one-shot pair round
-  /watch      oversight review/on/off/status only
+  /tm           fan-out dispatch
+  /tm-op pair   one-shot pair round
+  /watch        oversight review/on/off/status only
 ```
 
-Then stop. Do not run `tm-agent status` for empty input unless the user explicitly asks for status.
+For every other invocation (empty input, unrecognized token, or a subcommand missing required inputs), run the **full interactive wizard**. Only `/watch help` prints documentation; everything else acts.
+
+**Wizard steps** — use `AskUserQuestion`, one step at a time. Skip any step already satisfied by command-line args:
+
+1. **Action**: if no subcommand was given, ask which action — `review`, `on`, `off`, `status`.
+2. **Target agent**: ask which agent — list each worker (except leader and watcher) plus an "all workers" option. For `off`/`status`, "all" is allowed.
+3. **Spec** (review/on only): ask what to watch; accept inline text or an `@path`. Required, no default.
+4. **Stance** (review/on only): ask the lens — `critic` (default), `advisor`, `pair`.
+5. **Interval** (on only): ask the autonomous interval in seconds (default `300`).
+6. **Confirm & run**: when the wizard collected one or more values, show the resolved command and run it. If all required inputs were already supplied on the command line, run directly with NO confirmation step.
+
+Non-interactive context (`--no-input` / automation / headless): do NOT run the wizard. Require all inputs as flags; reject when a required input is missing (see each subcommand).
 
 ## Options
 
@@ -71,11 +86,17 @@ Parse common options before executing any subcommand.
 | `--every <sec>` | `300` | on only | daemon autonomous interval |
 | `--ratio <R>` | daemon default | on only | autonomous budget or sampling ratio |
 
-`review` and `on` require a spec. If no team spec exists and `--spec` is missing, reject with:
+`review` and `on` require a spec. Resolve in order: `--spec` flag, then team spec.
+
+If no spec can be resolved:
+- **Interactive (default):** do NOT reject. Prompt the user for the spec with `AskUserQuestion` (or a single direct question if the tool is unavailable): ask what to watch and accept either inline spec text or an `@path`. Use the answer as the spec for this run only; never persist it.
+- **Non-interactive (`--no-input` / automation / headless):** reject with:
 
 ```text
 REJECT: /watch review/on requires a spec. Provide --spec "<text>" or --spec @path.
 ```
+
+In the interactive wizard, prompt for every input the chosen action needs that was not supplied on the command line — including `--stance` (default `critic`) and, for `on`, `--every` (default `300`) — pre-selecting the defaults. Always respect values already passed on the command line and skip prompting for those. If all required inputs are already supplied, run directly without any prompt. Under `--no-input`, never prompt: require flags and reject when a required input is missing.
 
 `off` and `status` do not require a spec.
 
@@ -111,7 +132,7 @@ On-demand stateless check. If `[agent]` is omitted, review all worker agents exc
 
    - If no team exists, reject and ask the user to create/adopt a team first.
    - If `[agent]` is provided, verify that agent exists and is not the watcher.
-   - If `[agent]` is omitted, target all worker agents except leader and watcher.
+   - If `[agent]` is omitted: in **interactive** mode, prompt with `AskUserQuestion` to choose the target — list each worker agent (except leader and watcher) as an option plus an "all workers" option (default). In **non-interactive** mode, target all worker agents except leader and watcher.
    - Verify a watcher agent exists. If missing, stop with:
 
    ```text
@@ -208,8 +229,8 @@ Enable daemon autonomous watch for one target or all workers. This is no longer 
 
 ### Flow
 
-1. Validate spec exactly as `review` does. Reject if no team spec or `--spec` is available.
-2. Resolve `[agent]` to a single target or `all` workers. Do not create or remove panes.
+1. Resolve and validate the spec exactly as `review` does, including the interactive spec prompt when it is missing (reject only in non-interactive mode).
+2. Resolve `[agent]` to a single target or `all` workers. Do not create or remove panes. If `[agent]` is omitted: in **interactive** mode, prompt with `AskUserQuestion` to choose the target (same choices as `review`); in **non-interactive** mode, default to all workers. If `--stance` or `--every` were omitted: in interactive mode prompt for them (defaults `critic` / `300`); under `--no-input` apply the defaults silently.
 3. Execute the daemon watch primitive:
 
    ```bash

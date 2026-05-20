@@ -10,34 +10,51 @@ Use this prompt as the Codex leader wrapper for `/watch`. All operations must us
 
 `.claude/commands/watch.md` is the single source of truth. This file is a compressed IME shim for Codex leaders and must not contradict the Claude command.
 
-## Empty input
+## Routing and interactive wizard
 
-If `$ARGUMENTS` is empty, print:
+If the first token is `help`, print this usage block and stop — this is the ONLY case that prints documentation:
 
 ```text
 /watch — stateless drift oversight
 
+Usage:
+  /watch help                    show this help
   /watch review [agent] --spec <text|@path> [--stance critic|advisor|pair]
-  /watch on [agent] --spec <text|@path> [--every 300]
-  /watch off [agent|all]
+  /watch on     [agent] --spec <text|@path> [--every 300]
+  /watch off    [agent|all]
   /watch status [agent]
 
-Responsibilities:
-  /tm          fan-out dispatch
-  /tm-op pair one-shot pair round
-  /watch      oversight review/on/off/status only
+Responsibility:
+  /tm           fan-out dispatch
+  /tm-op pair   one-shot pair round
+  /watch        oversight review/on/off/status only
 ```
 
-Then stop.
+For every other invocation (empty input, unrecognized token, or a recognized subcommand missing required inputs), run the **full interactive wizard**. Only `/watch help` prints documentation; everything else acts.
+
+**Wizard steps** — ask the user directly and wait for their reply, one step at a time. Skip any step already satisfied by command-line args:
+
+1. **Action**: if no subcommand was given, ask which action — `review`, `on`, `off`, `status`.
+2. **Target agent**: ask which agent — list each worker (except leader and watcher) plus an "all workers" option. For `off`/`status`, "all" is allowed.
+3. **Spec** (review/on only): ask what to watch; accept inline text or an `@path`. Required, no default.
+4. **Stance** (review/on only): ask the lens — `critic` (default), `advisor`, `pair`.
+5. **Interval** (on only): ask the autonomous interval in seconds (default `300`).
+6. **Confirm & run**: when the wizard collected one or more values, show the resolved command and run it. If all required inputs were already supplied on the command line, run directly with NO confirmation step.
+
+Non-interactive context (`--no-input` / automation / headless): do NOT run the wizard. Require all inputs as flags; reject when a required input is missing.
 
 ## Parse arguments
 
 Parse the first token of `$ARGUMENTS`:
 
+- `help` — print the usage block (see above) and stop. This is the ONLY case that prints documentation.
 - `review` — on-demand stateless drift check
 - `on` — enable daemon autonomous watch via `tm-agent watch on`
 - `off` — disable daemon autonomous watch via `tm-agent watch off`
 - `status` — show daemon watch config and summarize `.xm/watch/board.jsonl`
+- empty input or unrecognized token — start the full interactive wizard
+
+A recognized subcommand still enters the wizard for any required input it is missing, unless `--no-input` is set.
 
 Common flags:
 
@@ -48,11 +65,17 @@ Common flags:
 - `--every <sec>` — `on` only, default `300`
 - `--ratio <R>` — `on` only, daemon budget or sampling ratio
 
-`review` and `on` require a spec from team config or `--spec`. If no spec exists, reject:
+`review` and `on` require a spec. Resolve in order: `--spec` flag, then team spec.
+
+If no spec can be resolved:
+- **Interactive (default):** do NOT reject. Ask the user a direct question and wait for their reply: ask what to watch and accept either inline spec text or an `@path`. Use the answer as the spec for this run only; never persist it.
+- **Non-interactive (`--no-input` / automation / headless):** reject with:
 
 ```text
 REJECT: /watch review/on requires a spec. Provide --spec "<text>" or --spec @path.
 ```
+
+In the interactive wizard, ask the user directly and wait for their reply for every input the chosen action needs that was not supplied on the command line — including `--stance` (default `critic`) and, for `on`, `--every` (default `300`) — pre-selecting the defaults. Always respect values already passed on the command line and skip asking for those. If all required inputs are already supplied, run directly without any prompt. Under `--no-input`, never prompt: require flags and reject when a required input is missing.
 
 ## Workflow
 
@@ -63,6 +86,7 @@ REJECT: /watch review/on requires a spec. Provide --spec "<text>" or --spec @pat
    tm-agent status
    ```
    If watcher is missing, tell the user to run `/team add watcher` or `tm-agent add watcher`. Do not auto-add it.
+   If `[agent]` is omitted: in **interactive** mode, ask the user a direct question and wait for their reply — list each worker agent (except leader and watcher) as a choice plus an "all workers" option (default). In **non-interactive** mode, target all worker agents except leader and watcher.
 
 2. Resolve spec. For `--spec @path`, read the file now. For text spec, use it verbatim.
 
@@ -104,7 +128,7 @@ REJECT: /watch review/on requires a spec. Provide --spec "<text>" or --spec @pat
 
 ### `on [agent]`
 
-Validate spec and resolve target like `review`, then enable daemon autonomous watch:
+Resolve and validate the spec exactly as `review` does, including the interactive spec prompt when it is missing (reject only in non-interactive mode). Resolve `[agent]` the same way as `review`: in **interactive** mode, ask the user a direct question and wait for their reply; in **non-interactive** mode, default to all workers. Then enable daemon autonomous watch:
 
 ```bash
 tm-agent watch on --target <agent|all> --every <sec> --stance <stance> --cli <cli> --model <model> --spec <text|@path> --ratio <R>
