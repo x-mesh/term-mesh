@@ -61,6 +61,21 @@ extension NSWindow {
     }
 }
 
+/// Minimum extent (pt) for any pane inside a peer-workspace split, so a
+/// divider drag (or a remote layout pushing a near-edge ratio) can never
+/// shrink a pane down to an invisible sliver. Mirrors bonsplit's default
+/// 100 pt min pane size. Relaxed to half the container when the window is
+/// too small to honor it for both panes, so both stay visible.
+private let peerWorkspaceMinPaneExtent: CGFloat = 100
+
+/// Resolve the effective per-pane minimum for a split of the given extent:
+/// the configured minimum, capped at half the container so two panes can
+/// always coexist even in a tiny window.
+private func peerWorkspaceMinPane(forExtent extent: CGFloat) -> CGFloat {
+    guard extent > 0 else { return 0 }
+    return min(peerWorkspaceMinPaneExtent, extent / 2)
+}
+
 /// Adapter that forwards NSSplitView delegate callbacks back to the
 /// owning controller. Lives separately because NSSplitView holds its
 /// `delegate` weakly.
@@ -73,6 +88,32 @@ private final class WorkspaceSplitWatcher: NSObject, NSSplitViewDelegate {
     func splitViewDidResizeSubviews(_ notification: Notification) {
         guard let splitView = notification.object as? NSSplitView else { return }
         controller?.dividerDidResize(splitView)
+    }
+
+    // Enforce a minimum extent on user divider drags. Without these the
+    // NSSplitView lets a divider travel to the very edge, collapsing the
+    // opposite pane to 0 pt — the "hidden pane" the user hit.
+    func splitView(
+        _ splitView: NSSplitView,
+        constrainMinCoordinate proposedMinimumPosition: CGFloat,
+        ofSubviewAt dividerIndex: Int
+    ) -> CGFloat {
+        let extent = splitView.isVertical ? splitView.bounds.width : splitView.bounds.height
+        return max(proposedMinimumPosition, peerWorkspaceMinPane(forExtent: extent))
+    }
+
+    func splitView(
+        _ splitView: NSSplitView,
+        constrainMaxCoordinate proposedMaximumPosition: CGFloat,
+        ofSubviewAt dividerIndex: Int
+    ) -> CGFloat {
+        let extent = splitView.isVertical ? splitView.bounds.width : splitView.bounds.height
+        return min(proposedMaximumPosition, extent - peerWorkspaceMinPane(forExtent: extent))
+    }
+
+    // Never let a double-click / drag collapse a pane out of sight.
+    func splitView(_ splitView: NSSplitView, canCollapseSubview subview: NSView) -> Bool {
+        false
     }
 }
 
@@ -1099,7 +1140,8 @@ final class PeerRelayWorkspaceWindowController: NSWindowController, NSWindowDele
         if let nsSplit = splitsByID[split.splitID] {
             let extent: CGFloat = nsSplit.isVertical ? nsSplit.bounds.width : nsSplit.bounds.height
             if extent > 0 {
-                let position = max(20, min(extent - 20, extent * CGFloat(split.dividerPosition)))
+                let m = peerWorkspaceMinPane(forExtent: extent)
+                let position = max(m, min(extent - m, extent * CGFloat(split.dividerPosition)))
                 nsSplit.setPosition(position, ofDividerAt: 0)
             }
         }
@@ -1133,7 +1175,8 @@ final class PeerRelayWorkspaceWindowController: NSWindowController, NSWindowDele
         for (split, fraction) in dividers {
             let extent: CGFloat = split.isVertical ? split.bounds.width : split.bounds.height
             guard extent > 0 else { continue }
-            let position = max(20, min(extent - 20, extent * fraction))
+            let m = peerWorkspaceMinPane(forExtent: extent)
+            let position = max(m, min(extent - m, extent * fraction))
             split.setPosition(position, ofDividerAt: 0)
         }
         DispatchQueue.main.async { [weak self] in
