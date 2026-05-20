@@ -78,10 +78,14 @@ doctor:
 	else \
 		echo "  [warn] GhosttyKit.xcframework stale/missing   -> make setup"; \
 	fi; \
-	if [ -x /opt/homebrew/opt/zig@0.15/bin/zig ] || [ -x /usr/local/opt/zig@0.15/bin/zig ] || { command -v zig >/dev/null 2>&1 && zig version | grep -q '^0\.15\.'; }; then \
-		echo "  [ok]   zig 0.15.x available"; \
+	zig15=""; \
+	for z in "$${ZIG:-}" /opt/homebrew/opt/zig@0.15/bin/zig /usr/local/opt/zig@0.15/bin/zig $$HOME/.local/zig-0.15*/zig $$HOME/zig/zig-*-0.15*/zig "$$(command -v zig 2>/dev/null)"; do \
+		[ -n "$$z" ] && [ -x "$$z" ] && "$$z" version 2>/dev/null | grep -q '^0\.15\.' && { zig15="$$z"; break; }; \
+	done; \
+	if [ -n "$$zig15" ]; then \
+		echo "  [ok]   zig 0.15.x available ($$zig15)"; \
 	else \
-		echo "  [warn] zig 0.15.x missing                     -> brew install zig@0.15"; \
+		echo "  [warn] zig 0.15.x missing/resolves to 0.16    -> brew install zig@0.15 (or set ZIG=...)"; \
 	fi; \
 	if [ -x /opt/homebrew/opt/llvm/bin/llvm-libtool-darwin ] || [ -x /usr/local/opt/llvm/bin/llvm-libtool-darwin ] || command -v llvm-libtool-darwin >/dev/null 2>&1; then \
 		echo "  [ok]   llvm-libtool-darwin available"; \
