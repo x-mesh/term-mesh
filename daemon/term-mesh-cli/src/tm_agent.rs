@@ -1671,6 +1671,25 @@ fn load_runbook_content_for_role(root: &Path, role: &str) -> Option<String> {
         .filter(|content| !content.trim().is_empty())
 }
 
+fn load_common_runbook_content(root: &Path) -> String {
+    let path = root.join(RUNBOOK_SOURCE_DIR).join("_common.md");
+    fs::read_to_string(&path)
+        .ok()
+        .filter(|content| !content.trim().is_empty())
+        .unwrap_or_default()
+}
+
+fn get_common_runbook_p0_rule(root: &Path) -> String {
+    let common = load_common_runbook_content(root);
+    if common.is_empty() {
+        return "명시 지시 없으면 git 상태를 바꾸지 않는다 — working tree 변경만 남기고 커밋은 leader가 결정".to_string();
+    }
+    let bullets = runbook_section_bullets(&common, "## P0. Git 상태 변경 금지", 1);
+    bullets.first().cloned().unwrap_or_else(|| {
+        "명시 지시 없으면 git 상태를 바꾸지 않는다 — working tree 변경만 남기고 커밋은 leader가 결정".to_string()
+    })
+}
+
 fn runbook_section_bullets(content: &str, section: &str, limit: usize) -> Vec<String> {
     let mut in_section = false;
     let mut out = Vec::new();
@@ -1709,7 +1728,7 @@ fn runbook_digest_content(root: &Path, role: &RunbookRole, agent_name: &str, tea
     } else {
         when.join(" | ")
     };
-    let must = if rules.is_empty() {
+    let mut must = if rules.is_empty() {
         role.rules
             .iter()
             .take(3)
@@ -1719,6 +1738,10 @@ fn runbook_digest_content(root: &Path, role: &RunbookRole, agent_name: &str, tea
     } else {
         rules.join(" | ")
     };
+    let common_p0 = get_common_runbook_p0_rule(root);
+    if !common_p0.is_empty() {
+        must = format!("{} | {}", common_p0, must);
+    }
     let verify = if verify.is_empty() {
         role.verify
             .iter()
@@ -1778,7 +1801,11 @@ fn runbook_digest_content_for_role_name(
         .to_string();
     let content = source.unwrap_or("");
     let when = runbook_section_bullets(content, "## When To Use", 2).join(" | ");
-    let must = runbook_section_bullets(content, "## Operating Rules", 3).join(" | ");
+    let mut must = runbook_section_bullets(content, "## Operating Rules", 3).join(" | ");
+    let common_p0 = get_common_runbook_p0_rule(root);
+    if !common_p0.is_empty() {
+        must = format!("{} | {}", common_p0, must);
+    }
     let verify = runbook_section_bullets(content, "## Verify", 2).join(" | ");
     format!(
         "\
