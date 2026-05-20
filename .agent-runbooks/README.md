@@ -30,3 +30,4 @@ tm-agent runbook install --tool all
 - `infra`: Cloud infrastructure, IaC, Kubernetes, networking, scaling, and operational dependencies.
 - `ux`: User flows, interaction design, usability review, component states, and accessibility specs.
 - `ai`: LLM integration, prompt engineering, RAG, model pipelines, guardrails, and evaluation.
+- `watcher`: Stateless drift reviewer — compares spec against a watched agent's recent delta, detects execution/direction drift, reports to the leader only.
