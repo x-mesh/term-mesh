@@ -9,12 +9,9 @@ cd "$PROJECT_DIR"
 echo "==> Initializing submodules..."
 git submodule update --init --recursive
 
-echo "==> Checking for zig..."
-if ! command -v zig &> /dev/null; then
-    echo "Error: zig is not installed."
-    echo "Install via: brew install zig"
-    exit 1
-fi
+# zig and llvm-libtool-darwin are only needed for a local GhosttyKit build;
+# they are checked inside the local-build branch below so a prebuilt/cached
+# xcframework can be used without them.
 
 echo "==> Checking for Metal Toolchain..."
 if ! xcrun metal --version &> /dev/null; then
@@ -99,10 +96,65 @@ else
     fi
 
     if [ -z "$SEEDED_FROM" ]; then
-        echo "==> Building GhosttyKit.xcframework (this may take a few minutes)..."
+        # A local build needs zig 0.15.x — ghostty's build.zig rejects 0.16 —
+        # and llvm-libtool-darwin. macOS /usr/bin/libtool silently skips
+        # 8-byte-misaligned archive members (warning only), which drops
+        # libghostty_zcu.o and erases every ghostty_surface_* symbol from the
+        # combined xcframework. llvm-libtool-darwin keeps misaligned members.
+        #
+        # Verify each zig candidate's *actual* version, not just the path: a
+        # `brew upgrade zig` to 0.16 can leave /opt/homebrew/opt/zig@0.15 as a
+        # stale symlink pointing at the 0.16 keg, and a broken brew keg can
+        # resolve to an unusable binary — both pass a path-only check and then
+        # fail the build. Override with ZIG=/path/to/zig-0.15.x/zig; standalone
+        # tarball extracts under ~/.local and ~/zig are searched too.
+        _zig_is_0_15() { [ -x "$1" ] && "$1" version 2>/dev/null | grep -q '^0\.15\.'; }
+        ZIG_BIN=""
+        for cand in \
+            "${ZIG:-}" \
+            /opt/homebrew/opt/zig@0.15/bin/zig /usr/local/opt/zig@0.15/bin/zig \
+            "$HOME"/.local/zig-0.15*/zig "$HOME"/zig/zig-*-0.15*/zig \
+            "$(command -v zig 2>/dev/null)"; do
+            [ -n "$cand" ] || continue
+            if _zig_is_0_15 "$cand"; then ZIG_BIN="$cand"; break; fi
+        done
+        if [ -z "$ZIG_BIN" ]; then
+            echo "Error: zig 0.15.x is required to build GhosttyKit (ghostty rejects 0.16)."
+            echo "Install via: brew install zig@0.15, or set ZIG=/path/to/zig-0.15.x/zig"
+            echo "If zig@0.15 is installed but resolves to 0.16 (stale keg symlink):"
+            echo "  brew unlink zig 2>/dev/null; brew link --overwrite --force zig@0.15"
+            exit 1
+        fi
+
+        LLVM_BIN=""
+        for cand in /opt/homebrew/opt/llvm/bin /usr/local/opt/llvm/bin; do
+            [ -x "$cand/llvm-libtool-darwin" ] && { LLVM_BIN="$cand"; break; }
+        done
+        if [ -z "$LLVM_BIN" ] && command -v llvm-libtool-darwin &> /dev/null; then
+            LLVM_BIN="$(dirname "$(command -v llvm-libtool-darwin)")"
+        fi
+        if [ -z "$LLVM_BIN" ]; then
+            echo "Error: llvm-libtool-darwin is required to build GhosttyKit."
+            echo "Without it macOS /usr/bin/libtool silently drops ghostty_surface_* symbols."
+            echo "Install via: brew install llvm"
+            exit 1
+        fi
+
+        # Pin the macOS SDK explicitly. A standalone zig tarball can latch onto
+        # a stale/broken CommandLineTools SDK during auto-detection and fail to
+        # link libSystem (undefined _free / _dispatch_queue_create / ...). Force
+        # the SDK that `xcrun --sdk macosx` resolves (the full Xcode SDK when
+        # available) plus the matching developer dir.
+        SDKROOT_VAL="$(xcrun --sdk macosx --show-sdk-path 2>/dev/null || true)"
+        DEVDIR_VAL="$(xcode-select -p 2>/dev/null || true)"
+        echo "==> Building GhosttyKit.xcframework with $ZIG_BIN + $LLVM_BIN/llvm-libtool-darwin (this may take a few minutes)..."
+        [ -n "$SDKROOT_VAL" ] && echo "==> Using SDKROOT=$SDKROOT_VAL"
         (
             cd ghostty
-            zig build -Demit-xcframework=true -Doptimize=ReleaseFast
+            export PATH="$LLVM_BIN:$PATH"
+            [ -n "$SDKROOT_VAL" ] && export SDKROOT="$SDKROOT_VAL"
+            [ -n "$DEVDIR_VAL" ] && export DEVELOPER_DIR="$DEVDIR_VAL"
+            "$ZIG_BIN" build -Demit-xcframework=true -Doptimize=ReleaseFast
         )
         # Stamp the build output with the SHA it was built from
         echo "$GHOSTTY_SHA" > "$LOCAL_SHA_STAMP"

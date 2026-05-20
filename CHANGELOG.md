@@ -4,6 +4,17 @@ All notable changes to term-mesh are documented here.
 
 ## [Unreleased]
 
+## [0.127.0] - 2026-05-20
+
+### Fixed
+- **pane을 닫을 때 발생하던 use-after-free 크래시** — pane이 닫힐 때 `pty_data_callback`을 동기적으로 정리하지 않아, 이미 해제된 pane을 가리키는 콜백이 호출되며 일어나던 use-after-free 크래시를 수정. 분할 패널을 자주 닫는 환경에서 간헐적으로 앱이 죽던 문제 해소.
+- **장시간 실행 시 메모리가 계속 늘어나던 누수** — 데몬의 per-session 캐시와 usage-dedup 캐시가 상한 없이 무한히 커지던 문제를 수정. 오래 켜둘수록 메모리 사용량이 계속 증가하던 누수 해소.
+- **터미널 텍스트 처리 메모리 누수** — ghostty `free_text` ABI 불일치로 텍스트 버퍼가 해제되지 않던 메모리 누수를 수정.
+
+### Thanks to 1 contributor!
+
+- [@JINWOO-J](https://github.com/JINWOO-J)
+
 ## [0.126.0] - 2026-05-18
 
 ### Changed

@@ -635,6 +635,8 @@ Use the `/release` command to prepare a new release. This will:
 5. Commit, tag, and push
 6. Upload dSYM debug symbols to Sentry (`./scripts/upload-dsym.sh --build`)
 
+Running from a non-`main` branch: `/release` cuts the release branch from the current HEAD, so the branch's commits are **folded into the release PR** and squash-merged to `main` together with the version bump (one squash commit). The command first guards a clean tree and that the branch isn't behind `origin/main`. To keep the feature commits as a distinct change, merge the branch to `main` on its own PR first, then run `/release` from `main`.
+
 Version bumping:
 
 ```bash
