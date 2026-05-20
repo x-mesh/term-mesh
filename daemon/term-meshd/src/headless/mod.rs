@@ -1,6 +1,7 @@
 pub mod buffer;
 pub mod cli_builder;
 pub mod meta;
+pub mod one_shot;
 pub mod protocol;
 
 use std::collections::{HashMap, HashSet};

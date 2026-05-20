@@ -14,6 +14,12 @@ Fresh watcher가 **spec + watched agent의 최근 delta**만 보고 execution/di
 
 `/watch`는 fan-out dispatch를 수행하지 않는다. 팀 구성도 변경하지 않는다. watcher가 없으면 자동 생성하지 말고 `/team add watcher` 또는 `tm-agent add watcher` 실행을 안내한다.
 
+Writer ownership:
+
+- Manual `/watch review`: the leader command owns `tm-agent msg send` and `.xm/watch/board.jsonl` append.
+- Autonomous `/watch on`: daemon `WatchController` owns `tm-agent msg send` and `.xm/watch/board.jsonl` append.
+- watcher returns only a structured verdict in both modes; it never writes side effects.
+
 **CRITICAL:** Do NOT use Claude Code native team tools (`TeamCreate`, `SendMessage`, `TaskCreate`, `TaskList`, `TaskGet`, `TaskUpdate`, `TeamDelete`). All operations route through `tm-agent`.
 
 ## Arguments
@@ -41,8 +47,8 @@ If `$ARGUMENTS` is empty, print:
 Usage:
   /watch review [agent] --spec <text|@path> [--stance critic|advisor|pair]
   /watch on [agent] --spec <text|@path> [--every 300]
-  /watch off
-  /watch status
+  /watch off [agent|all]
+  /watch status [agent]
 
 Responsibility:
   /tm          fan-out dispatch
@@ -62,7 +68,8 @@ Parse common options before executing any subcommand.
 | `--cli claude|codex|gemini` | current team default | review/on | watcher CLI preference |
 | `--model <m>` | CLI default | review/on | watcher model preference |
 | `--spec <text|@path>` | team spec if present | review/on | required spec source |
-| `--every <sec>` | `300` | on only | Phase 2 interval setting |
+| `--every <sec>` | `300` | on only | daemon autonomous interval |
+| `--ratio <R>` | daemon default | on only | autonomous budget or sampling ratio |
 
 `review` and `on` require a spec. If no team spec exists and `--spec` is missing, reject with:
 
@@ -142,7 +149,7 @@ On-demand stateless check. If `[agent]` is omitted, review all worker agents exc
    - Ask for `execution` vs `direction` drift classification.
    - Ask for severity, finding, spec_clause, and suggested course correction.
    - For `pair`, require `[CRITIC]`, `[ADVISOR]`, `[VERDICT]` blocks.
-   - Remind watcher: no code edits, no `tm-agent msg send`, no `.xm/watch/board.jsonl` writes. watcher returns only the structured verdict; this `/watch` leader command owns reporting and persistence.
+   - Remind watcher: no code edits, no `tm-agent msg send`, no `.xm/watch/board.jsonl` writes. watcher returns only the structured verdict; this manual `/watch review` leader command owns reporting and persistence.
 
 5. Wait and read watcher result:
 
@@ -151,7 +158,7 @@ On-demand stateless check. If `[agent]` is omitted, review all worker agents exc
    tm-agent read <watcher> --lines 120
    ```
 
-6. Report drift to leader inbox only. This `/watch` leader command is the only owner of `tm-agent msg send` for watcher findings:
+6. Report drift to leader inbox only. For manual `/watch review`, this leader command is the owner of `tm-agent msg send` for watcher findings:
 
    ```bash
    tm-agent msg send "<finding>"
@@ -159,13 +166,13 @@ On-demand stateless check. If `[agent]` is omitted, review all worker agents exc
 
    Never use `tm-agent msg send --to <agent>` for watcher feedback. The leader owns approval and course correction.
 
-7. Append drift findings to `.xm/watch/board.jsonl` exactly once. This `/watch` leader command is the only board writer in Phase 1:
+7. Append drift findings to `.xm/watch/board.jsonl` exactly once. This manual `/watch review` leader command is the board writer for on-demand checks:
 
    ```json
    {"check_id":"<sha256(ts + agent + spec_clause) or uuid>","ts":"<iso8601>","agent":"<watched-agent>","drift_type":"execution|direction","severity":"<severity>","finding":"<finding>","spec_clause":"<spec clause>"}
    ```
 
-   Create `.xm/watch/` if needed. Append only one JSON object per line. Use `check_id` as an idempotency key: before appending, skip the write if the same `check_id` already exists. If no drift is found, do not append a finding; the watcher should return a structured OK verdict.
+   Create `.xm/watch/` if needed. Append only one JSON object per line. Use `check_id` as an idempotency key: before appending, skip the write if the same `check_id` already exists. If no drift is found, do not append a finding; the watcher should return a structured OK verdict. Autonomous checks use the same verdict schema, `check_id`, and board format, but daemon `WatchController` is the single writer for those ticks.
 
 ### Review result shape
 
@@ -197,54 +204,66 @@ VERDICT: DRIFT|OK
 
 `/watch on [agent] --spec <text|@path> [--every <sec>] [options]`
 
-Enable watch configuration for a future interval runner. Phase 1 does not start an autonomous interval loop.
-
-### Phase 1 behavior
-
-1. Validate spec exactly as `review` does.
-2. Resolve `[agent]` to a single target or all workers.
-3. Persist or print the intended config:
-
-   ```json
-   {"enabled":true,"agent":"<agent|all>","stance":"critic|advisor|pair","cli":"<cli>","model":"<model>","spec":"<text|@path>","every_seconds":300}
-   ```
-
-4. Print:
-
-   ```text
-   Watch config recorded. Autonomous interval execution is Phase 2; run `/watch review ...` for an immediate check.
-   ```
-
-Do not dispatch work. Do not create team members. Do not start a background loop unless the daemon has a dedicated watch interval primitive.
-
-### Phase 2 target behavior
-
-When a daemon interval primitive exists, `on` may store config and let `term-meshd` run stateless one-shot checks every `--every <sec>`. Each cycle must still use fresh context and bounded delta.
-
-## Subcommand: off
-
-`/watch off`
-
-Disable the persisted watch configuration.
-
-Phase 1 behavior:
-
-```text
-Watch disabled. Remove or mark disabled the current .xm/watch config if present.
-```
-
-Do not close agents. Do not modify team composition.
-
-## Subcommand: status
-
-`/watch status`
-
-Show current watch configuration and summarize recent drift history.
+Enable daemon autonomous watch for one target or all workers. This is no longer a stub: it uses `tm-agent watch on`, persists config in `.xm/watch/config.json`, and starts the daemon interval trigger.
 
 ### Flow
 
-1. Read current config if present.
-2. Read `.xm/watch/board.jsonl` if present.
+1. Validate spec exactly as `review` does. Reject if no team spec or `--spec` is available.
+2. Resolve `[agent]` to a single target or `all` workers. Do not create or remove panes.
+3. Execute the daemon watch primitive:
+
+   ```bash
+   tm-agent watch on --target <agent|all> --every <sec> --stance <stance> --cli <cli> --model <model> --spec <text|@path> --ratio <R>
+   ```
+
+   Omit optional flags that the user did not provide; let daemon defaults apply.
+
+4. Report the daemon response, including persisted config and `next_tick`.
+
+Autonomous writer ownership:
+
+- daemon `WatchController` is the single owner of leader inbox reporting and `.xm/watch/board.jsonl` append for interval ticks.
+- watcher still returns only a structured verdict; it never calls `tm-agent msg send` and never writes the board.
+- Manual `/watch review` and autonomous `/watch on` share the same verdict schema, `check_id`, and board row shape.
+
+Runtime constraints:
+
+- Report-only: never auto-apply fixes or send correction messages to watched agents.
+- Focus-safe: daemon background ticks must not steal user focus or select panes.
+- Cost guards: enforce daemon minimum `--every`, budget/ratio limits, and skip ticks when a previous check is still `in_flight`.
+- Stateless: each tick uses a fresh headless one-shot watcher prompt with only spec + bounded recent delta.
+
+## Subcommand: off
+
+`/watch off [agent|all]`
+
+Disable daemon autonomous watch.
+
+### Flow
+
+```bash
+tm-agent watch off <agent|all>
+```
+
+The daemon sets `enabled=false`, stops timers, and preserves `.xm/watch/config.json` for audit or later re-enable. Do not close agents. Do not modify team composition.
+
+## Subcommand: status
+
+`/watch status [agent]`
+
+Show daemon watch configuration, scheduler state, and recent drift history.
+
+### Flow
+
+1. Query daemon watch state:
+
+   ```bash
+   tm-agent watch status
+   # or for one target:
+   tm-agent watch status --target <agent>
+   ```
+
+2. Summarize `.xm/watch/board.jsonl` if the daemon response does not already include recent findings.
 3. Print:
 
 ```text
@@ -252,12 +271,16 @@ WATCH: on|off
 TARGET: <agent|all|n/a>
 STANCE: critic|advisor|pair|n/a
 SPEC: <text|@path|team|n/a>
+NEXT_TICK: <iso8601|n/a>
+LAST_TICK: <iso8601|n/a>
+BUDGET: <remaining/limit|n/a>
+LAST_ERROR: <message|n/a>
 DRIFT_COUNT_THIS_SESSION: <unique check_id count, or line count for legacy rows without check_id>
 RECENT:
   <check_id> <ts> <agent> <drift_type> <severity> <finding>
 ```
 
-If `.xm/watch/board.jsonl` is missing, print `DRIFT_COUNT_THIS_SESSION: 0`. If duplicate `check_id` rows exist, count them once and show the newest row for each key.
+If `.xm/watch/board.jsonl` is missing, print `DRIFT_COUNT_THIS_SESSION: 0`. If duplicate `check_id` rows exist, count them once and show the newest row for each key. `status` is read-only and must not start or stop timers.
 
 ## Anti-patterns
 
@@ -268,7 +291,9 @@ If `.xm/watch/board.jsonl` is missing, print `DRIFT_COUNT_THIS_SESSION: 0`. If d
 5. **Do not fan out from `/watch`.** `/watch` audits; `/tm` dispatches.
 6. **Do not mutate team composition.** Missing watcher is a reject with setup guidance, not an implicit add.
 7. **Do not edit code from watcher.** watcher proposes course corrections; leader decides and assigns implementation.
-8. **Do not let watcher write side effects in Phase 1.** watcher returns a structured verdict only; `/watch` leader command is the sole owner of `tm-agent msg send` and `.xm/watch/board.jsonl` append.
+8. **Do not let watcher write side effects.** watcher returns a structured verdict only. Manual `/watch review` writes through the leader command; autonomous `/watch on` writes through daemon `WatchController`.
+9. **Do not auto-apply course corrections.** `/watch` is report-only in both manual and autonomous modes.
+10. **Do not let autonomous ticks steal focus or overlap indefinitely.** daemon ticks run in the background, obey `--every`/budget guards, and skip overruns while a check is `in_flight`.
 
 ## Examples
 
@@ -309,13 +334,31 @@ DRIFT_TYPE: execution
 ...
 ```
 
-### Enable planned interval config
+### Enable autonomous interval watch
 
 ```bash
 /watch on reviewer --spec @docs/release-checklist.md --every 300 --cli codex --model opus
 ```
 
-Phase 1 records or prints the config and reminds the user that autonomous interval execution is Phase 2.
+Expected internal shape:
+
+```bash
+tm-agent watch on --target reviewer --spec @docs/release-checklist.md --every 300 --stance critic --cli codex --model opus
+```
+
+The daemon persists `.xm/watch/config.json`, starts interval checks, and returns `next_tick`.
+
+### Disable autonomous watch
+
+```bash
+/watch off reviewer
+```
+
+Expected internal shape:
+
+```bash
+tm-agent watch off reviewer
+```
 
 ### Check drift history
 
@@ -330,5 +373,5 @@ Reads `.xm/watch/board.jsonl` and summarizes this session's drift count.
 After editing this command file:
 
 ```bash
-test -f .claude/commands/watch.md && rg -n "review|on|off|status|--stance|--spec|board.jsonl|msg send" .claude/commands/watch.md
+rg -n "watch on|watch off|watch status|WatchController|next_tick|--every|daemon|autonomous" .claude/commands/watch.md .codex/prompts/watch.md
 ```

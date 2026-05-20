@@ -596,6 +596,15 @@ final class TerminalSurface: Identifiable, ObservableObject {
         let socketPath = SocketControlSettings.socketPath()
         env["TERMMESH_SOCKET_PATH"] = socketPath
         env["CMUX_SOCKET_PATH"] = socketPath
+        // P15: expose THIS instance's term-meshd daemon socket so `tm-agent watch
+        // on/off/status` (which target the daemon's `watch.*` RPC) reach this app's
+        // own daemon — tagged/isolated builds included — without the user setting
+        // TERMMESH_DAEMON_UNIX_PATH by hand. Per-instance by construction: each app
+        // injects its own daemon path, so a tagged pane never routes to the live
+        // daemon. Non-watch tm-agent commands are unaffected (detect_socket keys off
+        // TERMMESH_SOCKET, not this var).
+        let daemonSocketPath = TermMeshDaemon.shared.socketPath
+        env["TERMMESH_DAEMON_UNIX_PATH"] = daemonSocketPath
         if let bundleId = Bundle.main.bundleIdentifier, !bundleId.isEmpty {
             env["TERMMESH_BUNDLE_ID"] = bundleId
             env["CMUX_BUNDLE_ID"] = bundleId
