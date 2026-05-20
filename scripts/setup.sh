@@ -9,12 +9,9 @@ cd "$PROJECT_DIR"
 echo "==> Initializing submodules..."
 git submodule update --init --recursive
 
-echo "==> Checking for zig..."
-if ! command -v zig &> /dev/null; then
-    echo "Error: zig is not installed."
-    echo "Install via: brew install zig"
-    exit 1
-fi
+# zig and llvm-libtool-darwin are only needed for a local GhosttyKit build;
+# they are checked inside the local-build branch below so a prebuilt/cached
+# xcframework can be used without them.
 
 echo "==> Checking for Metal Toolchain..."
 if ! xcrun metal --version &> /dev/null; then
@@ -99,10 +96,42 @@ else
     fi
 
     if [ -z "$SEEDED_FROM" ]; then
-        echo "==> Building GhosttyKit.xcframework (this may take a few minutes)..."
+        # A local build needs zig 0.15.x — ghostty's build.zig rejects 0.16 —
+        # and llvm-libtool-darwin. macOS /usr/bin/libtool silently skips
+        # 8-byte-misaligned archive members (warning only), which drops
+        # libghostty_zcu.o and erases every ghostty_surface_* symbol from the
+        # combined xcframework. llvm-libtool-darwin keeps misaligned members.
+        ZIG_BIN=""
+        for cand in /opt/homebrew/opt/zig@0.15/bin/zig /usr/local/opt/zig@0.15/bin/zig; do
+            [ -x "$cand" ] && { ZIG_BIN="$cand"; break; }
+        done
+        if [ -z "$ZIG_BIN" ] && command -v zig &> /dev/null && zig version | grep -q '^0\.15\.'; then
+            ZIG_BIN="$(command -v zig)"
+        fi
+        if [ -z "$ZIG_BIN" ]; then
+            echo "Error: zig 0.15.x is required to build GhosttyKit (ghostty rejects 0.16)."
+            echo "Install via: brew install zig@0.15"
+            exit 1
+        fi
+
+        LLVM_BIN=""
+        for cand in /opt/homebrew/opt/llvm/bin /usr/local/opt/llvm/bin; do
+            [ -x "$cand/llvm-libtool-darwin" ] && { LLVM_BIN="$cand"; break; }
+        done
+        if [ -z "$LLVM_BIN" ] && command -v llvm-libtool-darwin &> /dev/null; then
+            LLVM_BIN="$(dirname "$(command -v llvm-libtool-darwin)")"
+        fi
+        if [ -z "$LLVM_BIN" ]; then
+            echo "Error: llvm-libtool-darwin is required to build GhosttyKit."
+            echo "Without it macOS /usr/bin/libtool silently drops ghostty_surface_* symbols."
+            echo "Install via: brew install llvm"
+            exit 1
+        fi
+
+        echo "==> Building GhosttyKit.xcframework with $ZIG_BIN + $LLVM_BIN/llvm-libtool-darwin (this may take a few minutes)..."
         (
             cd ghostty
-            zig build -Demit-xcframework=true -Doptimize=ReleaseFast
+            PATH="$LLVM_BIN:$PATH" "$ZIG_BIN" build -Demit-xcframework=true -Doptimize=ReleaseFast
         )
         # Stamp the build output with the SHA it was built from
         echo "$GHOSTTY_SHA" > "$LOCAL_SHA_STAMP"
