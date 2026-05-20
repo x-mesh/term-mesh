@@ -1522,6 +1522,27 @@ fn builtin_runbook_roles() -> Vec<RunbookRole> {
                 "Report token/request estimates, expected cost per 1K calls, and known model limitations when applicable.",
             ],
         },
+        RunbookRole {
+            name: "watcher",
+            title: "Watcher Runbook",
+            description: "Stateless drift reviewer — compares spec against a watched agent's recent delta, detects execution/direction drift, reports to the leader only.",
+            when_to_use: &[
+                "A long-running or risky session needs oversight against a spec.",
+                "The leader asks for an on-demand \"review now\" drift check, or drift is suspected.",
+            ],
+            rules: &[
+                "Feed only the spec plus the watched agent's recent delta (tm-agent collect --lines N); never the full history.",
+                "Distinguish execution drift (the task done wrong) from direction drift (the wrong task in the first place).",
+                "Report to the leader only via tm-agent msg send; never use --to <agent>.",
+                "When nothing is wrong, report a single OK line.",
+                "Propose course corrections only; never edit code directly — the leader approves and applies.",
+                "Append every drift finding to .xm/watch/board.jsonl.",
+            ],
+            verify: &[
+                "Confirm the leader received the report with tm-agent msg list.",
+                "Tail .xm/watch/board.jsonl to confirm any drift finding was recorded.",
+            ],
+        },
     ]
 }
 
@@ -8103,6 +8124,15 @@ fn capabilities_for_agent_type(agent_type: &str) -> Vec<&'static str> {
             "css",
             "layout",
             "ux",
+        ],
+        "watcher" => vec![
+            "watch",
+            "oversight",
+            "drift",
+            "monitor",
+            "spec",
+            "review",
+            "audit",
         ],
         _ => vec![],
     }
