@@ -1178,11 +1178,22 @@ final class TeamOrchestrator: ObservableObject {
                 headlessMembers.append(member)
             }
 
+            // Set leaderCli for headless modes
+            var headlessLeaderCli: String? = nil
+            switch leaderMode {
+            case "claude": headlessLeaderCli = "claude"
+            case "codex": headlessLeaderCli = "codex"
+            case "kiro": headlessLeaderCli = "kiro"
+            case "gemini": headlessLeaderCli = "gemini"
+            default: headlessLeaderCli = nil
+            }
+
             let team = Team(
                 id: name,
                 leaderSessionId: leaderSessionId,
                 leaderMode: leaderMode,
                 leaderModel: leaderModel,
+                leaderCli: headlessLeaderCli,
                 leaderPanelId: leaderPanelId,
                 leaderWorkspaceId: leaderWorkspaceId,
                 workingDirectory: workingDirectory,
@@ -1530,11 +1541,28 @@ final class TeamOrchestrator: ObservableObject {
             // D3-A P1-A (extension): assign a stable teamUuid at creation so
             // archive_pane carries the same identity across destroy/resume —
             // mirrors the createTeam fix at line ~1319.
+
+            // Detect adopted leader's CLI from its panel displayTitle
+            var leaderCli: String? = nil
+            if let panel = workspace.panels[callerPanelId] as? TerminalPanel {
+                let titleLower = panel.displayTitle.lowercased()
+                if titleLower.contains("codex") {
+                    leaderCli = "codex"
+                } else if titleLower.contains("kiro") {
+                    leaderCli = "kiro"
+                } else if titleLower.contains("claude") {
+                    leaderCli = "claude"
+                } else if titleLower.contains("gpt-") || titleLower.contains("gemini") {
+                    leaderCli = "gemini"
+                }
+            }
+
             team = Team(
                 id: teamName,
                 leaderSessionId: "leader-attach-\(UUID().uuidString.prefix(8))",
                 leaderMode: "adopted",
                 leaderModel: "sonnet",
+                leaderCli: leaderCli,
                 leaderPanelId: callerPanelId,
                 leaderWorkspaceId: workspaceId,
                 workingDirectory: workspaceDirectory,
@@ -3744,6 +3772,7 @@ final class TeamOrchestrator: ObservableObject {
             leaderSessionId: leaderSessionId,
             leaderMode: "claude",
             leaderModel: "sonnet",
+            leaderCli: "claude",
             leaderPanelId: UUID(), // placeholder — headless team has no leader pane
             leaderWorkspaceId: workspace.id,
             workingDirectory: workingDirectory,

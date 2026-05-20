@@ -961,8 +961,15 @@ final class GhosttySurfaceScrollView: NSView {
         let orchestrator = TeamOrchestrator.shared
 
         for team in orchestrator.teams.values {
-            if team.leaderPanelId == panelId, team.leaderMode.lowercased() == "codex" {
-                return true
+            if team.leaderPanelId == panelId {
+                // Check if it's a codex leader (non-adopted mode)
+                if team.leaderMode.lowercased() == "codex" {
+                    return true
+                }
+                // Check if it's an adopted codex leader (detected via leaderCli)
+                if team.leaderMode == "adopted" && team.leaderCli?.lowercased() == "codex" {
+                    return true
+                }
             }
             if team.agents.contains(where: {
                 $0.panelId == panelId &&
