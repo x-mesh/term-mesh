@@ -8,8 +8,17 @@ Prepare a new release for term-mesh. This command updates the changelog, bumps t
    - Get the current version from `GhosttyTabs.xcodeproj/project.pbxproj` (look for `MARKETING_VERSION`)
    - Bump the minor version unless the user specifies otherwise (e.g., 0.12.0 → 0.13.0)
 
-2. **Create a release branch**
-   - Create branch: `git checkout -b release/vX.Y.Z`
+2. **Pick the base, then create the release branch** *(handles running from a non-main branch)*
+   - Sync the remote first so the release sits on top of the latest main:
+     `git fetch origin main`
+   - Detect the current branch: `BRANCH=$(git rev-parse --abbrev-ref HEAD)`
+   - **If on `main`:** fast-forward to `origin/main` (`git merge --ff-only origin/main`), then cut the release branch from it.
+   - **If NOT on `main`** (e.g. a feature branch like `fix/memory-leak`): the current branch's work is **folded into the release PR** and squash-merged to main together with the version bump. Before cutting the branch, run these guards:
+     - **Clean tree:** `git status --porcelain` must be empty. Uncommitted changes are NOT included — commit or stash first.
+     - **Not behind main:** `git rev-list --count HEAD..origin/main` must be `0`. If non-zero, rebase or merge `origin/main` into the branch and resolve conflicts before continuing — otherwise the release PR will conflict.
+     - **Confirm the fold-in set with the user:** `git log --oneline origin/main..HEAD` — every one of these commits gets **squashed into the single `Bump version to X.Y.Z` commit** on main (history is flattened by the squash-merge in step 9). If the user wants the feature commits preserved as a distinct change, stop and merge the feature branch to main on its own PR first, then re-run `/release` from main.
+   - Cut the release branch from the current HEAD: `git checkout -b release/vX.Y.Z`
+   - The PR → squash-merge → tag-on-main steps below then carry the folded work into `main`.
 
 3. **Gather changes and contributors since the last release**
    - **API budget preflight** — before any `gh` call, check the GraphQL pool:
