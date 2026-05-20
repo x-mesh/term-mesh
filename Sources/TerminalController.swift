@@ -2035,6 +2035,7 @@ class TerminalController {
         let leaderSessionId = params["leader_session_id"] as? String ?? UUID().uuidString
         let leaderMode = params["leader_mode"] as? String ?? "repl"
         let leaderModel = params["leader_model"] as? String ?? "sonnet"
+        let leaderCli = params["leader_cli"] as? String ?? "claude"
         let resumeSessionId = params["resume_session_id"] as? String
         // F2 fix: socket param `runbook_init_prompt: true` means "DO inject
         // the runbook into the agent init prompt" (CLI sends `true` for that

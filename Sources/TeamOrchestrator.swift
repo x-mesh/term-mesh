@@ -485,6 +485,7 @@ final class TeamOrchestrator: ObservableObject {
             "CMUX_TEAM": teamName,
             "TERMMESH_SOCKET": socketPath,
             "CMUX_SOCKET": socketPath,
+            "TERMMESH_CLI": agentCli,
             "PATH": currentPath,
         ]
 

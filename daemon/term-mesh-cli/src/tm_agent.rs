@@ -5697,6 +5697,12 @@ fn run_create(
     if let Ok(workspace_id) = env::var("TERMMESH_WORKSPACE_ID") {
         create_params["workspace_id"] = json!(workspace_id);
     }
+    // In --adopt mode, pass the adopted leader's CLI for stable detection
+    if adopt {
+        if let Ok(cli) = env::var("TERMMESH_CLI") {
+            create_params["leader_cli"] = json!(cli);
+        }
+    }
     let r = match rpc_call_timeout(sock, "team.create", create_params, 5) {
         Ok(v) => v,
         Err(e) => {
