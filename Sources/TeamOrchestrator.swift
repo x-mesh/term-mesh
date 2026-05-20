@@ -733,6 +733,7 @@ final class TeamOrchestrator: ObservableObject {
         leaderSessionId: String,
         leaderMode: String = "repl",
         leaderModel: String = "sonnet",
+        leaderCli: String = "claude",
         resumeSessionId: String? = nil,
         worktreeMode: String = "off",
         executionMode: String = "pane",
@@ -902,7 +903,7 @@ final class TeamOrchestrator: ObservableObject {
         // register the caller's surface as leaderPanelId and track its workspace separately.
         let leaderPanelId: UUID
         let leaderWorkspaceId: UUID?
-        var leaderCli: String? = nil
+        var detectedLeaderCli: String? = nil
 
         if leaderMode == "adopted" {
             guard let adoptedSurfaceId = adoptedLeaderSurfaceId else {
@@ -916,26 +917,31 @@ final class TeamOrchestrator: ObservableObject {
             }
             leaderPanelId = adoptedSurfaceId
 
-            // Detect adopted leader's CLI from its panel displayTitle
-            if let located = AppDelegate.shared?.locateSurface(surfaceId: adoptedSurfaceId),
-               let workspace = located.tabManager.tabs.first(where: { $0.id == located.workspaceId }),
-               let panel = workspace.panels[adoptedSurfaceId] as? TerminalPanel {
-                let titleLower = panel.displayTitle.lowercased()
-                // "gpt-" indicates an OpenAI/Codex model (e.g. "gpt-5") — treat as codex,
-                // consistent with the isCodexLikePane title fallback. Gemini matches "gemini" only.
-                if titleLower.contains("codex") || titleLower.contains("gpt-") {
-                    leaderCli = "codex"
-                } else if titleLower.contains("kiro") {
-                    leaderCli = "kiro"
-                } else if titleLower.contains("claude") {
-                    leaderCli = "claude"
-                } else if titleLower.contains("gemini") {
-                    leaderCli = "gemini"
+            // Use leader_cli parameter if provided; otherwise detect from panel displayTitle
+            if !leaderCli.isEmpty && leaderCli != "claude" {
+                detectedLeaderCli = leaderCli
+            } else {
+                // Fallback: detect adopted leader's CLI from its panel displayTitle
+                if let located = AppDelegate.shared?.locateSurface(surfaceId: adoptedSurfaceId),
+                   let workspace = located.tabManager.tabs.first(where: { $0.id == located.workspaceId }),
+                   let panel = workspace.panels[adoptedSurfaceId] as? TerminalPanel {
+                    let titleLower = panel.displayTitle.lowercased()
+                    // "gpt-" indicates an OpenAI/Codex model (e.g. "gpt-5") — treat as codex,
+                    // consistent with the isCodexLikePane title fallback. Gemini matches "gemini" only.
+                    if titleLower.contains("codex") || titleLower.contains("gpt-") {
+                        detectedLeaderCli = "codex"
+                    } else if titleLower.contains("kiro") {
+                        detectedLeaderCli = "kiro"
+                    } else if titleLower.contains("claude") {
+                        detectedLeaderCli = "claude"
+                    } else if titleLower.contains("gemini") {
+                        detectedLeaderCli = "gemini"
+                    }
                 }
             }
 
             #if DEBUG
-            dlog("[team] adopted mode: leaderPanelId=\(adoptedSurfaceId.uuidString.prefix(8)) leaderWorkspaceId=\(leaderWorkspaceId?.uuidString.prefix(8) ?? "nil") leaderCli=\(leaderCli ?? "nil")")
+            dlog("[team] adopted mode: leaderPanelId=\(adoptedSurfaceId.uuidString.prefix(8)) leaderWorkspaceId=\(leaderWorkspaceId?.uuidString.prefix(8) ?? "nil") leaderCli=\(detectedLeaderCli ?? "nil") (from_param=\(!leaderCli.isEmpty))")
             #endif
             // The workspace's defaultPanel will serve as anchor for agent splits.
             // It will be closed after all agent panes are created.
@@ -1061,13 +1067,13 @@ final class TeamOrchestrator: ObservableObject {
             // Close the original empty panel
             workspace.closePanel(defaultPanelId)
 
-            // Set leaderCli for non-adopted modes
+            // Set detectedLeaderCli for non-adopted modes
             switch leaderMode {
-            case "claude": leaderCli = "claude"
-            case "codex": leaderCli = "codex"
-            case "kiro": leaderCli = "kiro"
-            case "gemini": leaderCli = "gemini"
-            default: leaderCli = nil
+            case "claude": detectedLeaderCli = "claude"
+            case "codex": detectedLeaderCli = "codex"
+            case "kiro": detectedLeaderCli = "kiro"
+            case "gemini": detectedLeaderCli = "gemini"
+            default: detectedLeaderCli = nil
             }
         }
 
@@ -1181,14 +1187,15 @@ final class TeamOrchestrator: ObservableObject {
                 headlessMembers.append(member)
             }
 
-            // Set leaderCli for headless modes
-            var headlessLeaderCli: String? = nil
-            switch leaderMode {
-            case "claude": headlessLeaderCli = "claude"
-            case "codex": headlessLeaderCli = "codex"
-            case "kiro": headlessLeaderCli = "kiro"
-            case "gemini": headlessLeaderCli = "gemini"
-            default: headlessLeaderCli = nil
+            // Set detectedLeaderCli for headless modes if not already set
+            if detectedLeaderCli == nil {
+                switch leaderMode {
+                case "claude": detectedLeaderCli = "claude"
+                case "codex": detectedLeaderCli = "codex"
+                case "kiro": detectedLeaderCli = "kiro"
+                case "gemini": detectedLeaderCli = "gemini"
+                default: detectedLeaderCli = nil
+                }
             }
 
             let team = Team(
@@ -1196,7 +1203,7 @@ final class TeamOrchestrator: ObservableObject {
                 leaderSessionId: leaderSessionId,
                 leaderMode: leaderMode,
                 leaderModel: leaderModel,
-                leaderCli: headlessLeaderCli,
+                leaderCli: detectedLeaderCli,
                 leaderPanelId: leaderPanelId,
                 leaderWorkspaceId: leaderWorkspaceId,
                 workingDirectory: workingDirectory,
@@ -1366,7 +1373,7 @@ final class TeamOrchestrator: ObservableObject {
             leaderSessionId: leaderSessionId,
             leaderMode: leaderMode,
             leaderModel: leaderModel,
-            leaderCli: leaderCli,
+            leaderCli: detectedLeaderCli,
             leaderPanelId: leaderPanelId,
             leaderWorkspaceId: leaderWorkspaceId,
             workingDirectory: workingDirectory,

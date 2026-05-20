@@ -2151,6 +2151,7 @@ class TerminalController {
                 leaderSessionId: leaderSessionId,
                 leaderMode: leaderMode,
                 leaderModel: leaderModel,
+                leaderCli: leaderCli,
                 resumeSessionId: resumeSessionId,
                 adoptedLeaderSurfaceId: adoptedLeaderSurfaceId,
                 skipRunbookPromptForInteractiveAgents: skipRunbookInitPrompt,
