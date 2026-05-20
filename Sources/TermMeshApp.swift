@@ -208,7 +208,7 @@ struct TermMeshApp: App {
                 let activeTabManager = teamCreationTabManager ?? tabManager
                 let workDir = activeTabManager.selectedTab?.currentDirectory
                     ?? FileManager.default.currentDirectoryPath
-                let agentTuples: [(name: String, cli: String, model: String, agentType: String, color: String, instructions: String)] = agents.map { row in
+                let agentTuples: [(name: String, cli: String, model: String, agentType: String, color: String, instructions: String, customInstructions: String)] = agents.map { row in
                     let customInstructions = row.customInstructions == row.preset.instructions
                         ? ""
                         : row.customInstructions
@@ -225,7 +225,11 @@ struct TermMeshApp: App {
                         model: row.preset.model,
                         agentType: row.preset.name,
                         color: row.preset.color,
-                        instructions: effectiveInstructions
+                        // GUI composes the custom instructions into `instructions`
+                        // above; pass empty here so createTeam's compose step does
+                        // not append the same spec a second time.
+                        instructions: effectiveInstructions,
+                        customInstructions: ""
                     )
                 }
                 let leaderSessionId = UUID().uuidString

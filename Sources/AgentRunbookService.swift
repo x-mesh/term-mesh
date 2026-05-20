@@ -153,6 +153,7 @@ final class AgentRunbookService: @unchecked Sendable {
         "infra",
         "ux",
         "ai",
+        "watcher",
     ]
 
     private let fileManager: FileManager

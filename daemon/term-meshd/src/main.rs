@@ -15,6 +15,17 @@ mod pane_tracker;
 mod peer;
 mod socket;
 mod tokens;
+// watcher Phase 2 (P1): autonomous drift-watch scheduler. The file is
+// `watch.rs` but the module is named `drift_watch` so it does not collide with
+// the `tokio::sync::watch` import (or the existing `crate::watcher` file
+// monitor). Runtime wiring (main spawn + socket RPC handlers) lands in P4 —
+// until then the module is only exercised by its own unit tests.
+#[path = "watch.rs"]
+#[allow(dead_code)]
+mod drift_watch;
+// watcher Phase 2 (P5): watch result controller — consumes scheduler outcomes,
+// writes .xm/watch/board.jsonl, and posts to the leader inbox.
+mod watch_controller;
 mod watcher;
 mod worktree;
 
@@ -165,6 +176,56 @@ async fn main() -> anyhow::Result<()> {
     // 3. Shutdown channel
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
+    // 3b. watcher Phase 2: autonomous drift-watch scheduler (P4) + result
+    // controller (P5). The scheduler runs one-shot watchers on a cadence and
+    // streams outcomes to the WatchController, which writes .xm/watch/board.jsonl
+    // and posts DRIFT findings to the team leader inbox (focus-free).
+    let watch_registry = drift_watch::new_registry();
+    {
+        // P10: populate the registry from persisted /watch config (P6's loader),
+        // so `/watch on` survives a daemon restart (R13). The daemon cwd is the
+        // best-effort root for the worktree's .xm/watch/config.json.
+        if let Ok(cwd) = std::env::current_dir() {
+            let loaded = crate::socket::watch_config::load_watch_states(&cwd);
+            if !loaded.is_empty() {
+                let mut reg = watch_registry.lock().await;
+                for (team_id, state) in loaded {
+                    reg.insert(team_id, state);
+                }
+                tracing::info!(
+                    "watch: restored {} team(s) from persisted config",
+                    reg.len()
+                );
+            }
+        }
+
+        let (watch_sink_tx, watch_sink_rx) =
+            tokio::sync::mpsc::unbounded_channel::<headless::one_shot::WatchCheckOutcome>();
+
+        // P5 controller: the single board/inbox writer (F2). Replaces the prior
+        // log-only drain. Uses the real app-socket leader inbox (focus-free).
+        tokio::spawn(watch_controller::run_watch_controller(
+            watch_sink_rx,
+            watch_registry.clone(),
+            watch_controller::AppSocketInbox,
+        ));
+
+        let runner: Arc<dyn headless::one_shot::WatchCheckRunner> = Arc::new(
+            headless::one_shot::HeadlessOneShotRunner::new(headless_manager.clone()),
+        );
+        tokio::spawn(drift_watch::run_watch_scheduler(
+            watch_registry.clone(),
+            runner,
+            watch_sink_tx,
+            shutdown_rx.clone(),
+            std::time::Duration::from_secs(drift_watch::SWEEP_GRANULARITY_SECS),
+        ));
+        tracing::info!(
+            "watch scheduler + controller started (sweep {}s)",
+            drift_watch::SWEEP_GRANULARITY_SECS
+        );
+    }
+
     // 4. HTTP server (can be disabled via TERM_MESH_HTTP_DISABLED=1)
     let http_disabled = std::env::var("TERM_MESH_HTTP_DISABLED")
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
@@ -220,6 +281,7 @@ async fn main() -> anyhow::Result<()> {
         usage_tracker,
         agent_manager.clone(),
         headless_manager.clone(),
+        watch_registry,
         shutdown_rx,
     ));
 

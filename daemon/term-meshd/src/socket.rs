@@ -15,6 +15,47 @@ use crate::tokens::UsageTracker;
 use crate::watcher::WatcherHandle;
 use crate::worktree;
 
+/// Watcher Phase 2 (P6): `.xm/watch/config.json` persistence. Contract functions
+/// (`load_watch_states`/`save_watch_state`/`remove_watch_state`) are reused by
+/// `main.rs` (startup re-register) and the `watch.on`/`watch.off` handlers below.
+pub mod watch_config;
+
+/// Watcher Phase 2 (P12 #5): minimum autonomous check interval. A cost guard,
+/// independent of `drift_watch::SWEEP_GRANULARITY_SECS` (the scheduler's wake
+/// resolution, currently 1s): a tiny `--every` would otherwise spawn a one-shot
+/// watcher (an LLM call) every second. Always `>= SWEEP_GRANULARITY_SECS`.
+const MIN_WATCH_INTERVAL_SECS: u64 = 30;
+
+/// Count distinct `check_id`s recorded in `<working_dir>/.xm/watch/board.jsonl`
+/// (P12 #6). Each drift finding is one JSONL line; the controller (P5) keys them
+/// by `check_id`, so distinct ids = number of checks that found drift. Missing or
+/// unreadable lines are skipped; a missing file yields 0.
+fn board_drift_count(working_dir: &str) -> u64 {
+    if working_dir.is_empty() {
+        return 0;
+    }
+    let path = std::path::Path::new(working_dir)
+        .join(".xm")
+        .join("watch")
+        .join("board.jsonl");
+    let Ok(contents) = std::fs::read_to_string(&path) else {
+        return 0;
+    };
+    let mut seen: HashSet<String> = HashSet::new();
+    for line in contents.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(line) {
+            if let Some(id) = v.get("check_id").and_then(|c| c.as_str()) {
+                seen.insert(id.to_string());
+            }
+        }
+    }
+    seen.len() as u64
+}
+
 /// JSON-RPC 2.0 request (simplified)
 #[derive(Debug, Deserialize)]
 pub struct Request {
@@ -115,6 +156,10 @@ pub struct Context {
     pub usage_tracker: UsageTracker,
     pub agent_manager: Arc<AgentSessionManager>,
     pub headless: Arc<tokio::sync::Mutex<HeadlessManager>>,
+    /// watcher Phase 2 (P4): autonomous drift-watch registry. `watch.on/off/status`
+    /// RPC handlers mutate this; the scheduler in `crate::drift_watch` reads it.
+    /// Distinct from `watcher_handle` (the unrelated `crate::watcher` fs monitor).
+    pub watch_registry: crate::drift_watch::WatchRegistry,
     pub pane_tracker: PaneTracker,
     pub event_tx: EventSender,
 }
@@ -142,6 +187,7 @@ pub async fn serve(
     usage_tracker: UsageTracker,
     agent_manager: Arc<AgentSessionManager>,
     headless: Arc<tokio::sync::Mutex<HeadlessManager>>,
+    watch_registry: crate::drift_watch::WatchRegistry,
     mut shutdown_rx: watch::Receiver<bool>,
 ) -> anyhow::Result<()> {
     if path.exists() {
@@ -164,6 +210,7 @@ pub async fn serve(
         usage_tracker,
         agent_manager,
         headless,
+        watch_registry,
         pane_tracker,
         event_tx,
     });
@@ -1775,6 +1822,231 @@ async fn dispatch(req: &Request, ctx: &Context) -> Response {
                 Err(e) => Err(format!("invalid params: {e}")),
             }
         }
+        // ── watcher Phase 2 (P4): drift-watch on/off/status ──────────────
+        // In-memory registry mutations only. NO focus side effects (no send_key,
+        // window.focus, or pane.focus). Config-file persistence is P6.
+        "watch.on" => {
+            #[derive(Deserialize)]
+            struct P {
+                team_id: String,
+                #[serde(default)]
+                interval_secs: u64,
+                #[serde(default)]
+                target: Option<String>,
+                #[serde(default = "default_watch_cli")]
+                cli: String,
+                #[serde(default = "default_watch_model")]
+                model: String,
+                #[serde(default = "default_watch_stance")]
+                stance: String,
+                #[serde(default)]
+                spec: String,
+                #[serde(default)]
+                working_directory: String,
+                #[serde(default)]
+                exec_to_dir_ratio: Option<u32>,
+                #[serde(default)]
+                cli_path: Option<String>,
+                #[serde(default)]
+                app_socket_path: Option<String>,
+                #[serde(default)]
+                reply_timeout_secs: Option<u64>,
+            }
+            fn default_watch_cli() -> String {
+                "claude".into()
+            }
+            fn default_watch_model() -> String {
+                "sonnet".into()
+            }
+            fn default_watch_stance() -> String {
+                "critic".into()
+            }
+            match serde_json::from_value::<P>(req.params.clone()) {
+                Ok(p) if p.team_id.is_empty() => Err("team_id required".to_string()),
+                Ok(p) => {
+                    // P12 #5: clamp the requested interval up to the cost-guard
+                    // minimum. 0 stays 0 → WatchState::enabled applies the default.
+                    let requested_interval = if p.interval_secs == 0 {
+                        0
+                    } else {
+                        p.interval_secs.max(MIN_WATCH_INTERVAL_SECS)
+                    };
+                    let mut reg = ctx.watch_registry.lock().await;
+                    let interval = match reg.get_mut(&p.team_id) {
+                        // Refresh existing config; preserve live counters.
+                        Some(st) => {
+                            st.enabled = true;
+                            if requested_interval > 0 {
+                                st.interval_secs = requested_interval;
+                            }
+                            if let Some(r) = p.exec_to_dir_ratio {
+                                st.exec_to_dir_ratio = r;
+                            }
+                            st.target = p.target.clone();
+                            st.cli = p.cli.clone();
+                            st.model = p.model.clone();
+                            st.stance = p.stance.clone();
+                            st.spec = p.spec.clone();
+                            if !p.working_directory.is_empty() {
+                                st.working_directory = p.working_directory.clone();
+                            }
+                            st.cli_path = p.cli_path.clone();
+                            st.app_socket_path = p.app_socket_path.clone();
+                            if let Some(t) = p.reply_timeout_secs {
+                                st.reply_timeout_secs = t;
+                            }
+                            st.interval_secs
+                        }
+                        None => {
+                            let mut st = crate::drift_watch::WatchState::enabled(
+                                requested_interval,
+                                p.target.clone(),
+                                p.cli.clone(),
+                                p.model.clone(),
+                                p.stance.clone(),
+                                p.spec.clone(),
+                                p.working_directory.clone(),
+                            );
+                            if let Some(r) = p.exec_to_dir_ratio {
+                                st.exec_to_dir_ratio = r;
+                            }
+                            st.cli_path = p.cli_path.clone();
+                            st.app_socket_path = p.app_socket_path.clone();
+                            if let Some(t) = p.reply_timeout_secs {
+                                st.reply_timeout_secs = t;
+                            }
+                            let interval = st.interval_secs;
+                            reg.insert(p.team_id.clone(), st);
+                            interval
+                        }
+                    };
+                    // P6: persist so the team re-registers after a daemon restart.
+                    // Clone under the lock, then drop it before file I/O.
+                    let to_persist = reg
+                        .get(&p.team_id)
+                        .map(|st| (st.working_directory.clone(), st.clone()));
+                    drop(reg);
+                    if let Some((wd, st)) = to_persist {
+                        if !wd.is_empty() {
+                            watch_config::save_watch_state(
+                                std::path::Path::new(&wd),
+                                &p.team_id,
+                                &st,
+                            );
+                        }
+                    }
+                    Ok(serde_json::json!({
+                        "status": "ok",
+                        "team_id": p.team_id,
+                        "enabled": true,
+                        "interval_secs": interval,
+                    }))
+                }
+                Err(e) => Err(format!("invalid params: {e}")),
+            }
+        }
+        "watch.off" => {
+            #[derive(Deserialize)]
+            struct P {
+                team_id: String,
+            }
+            match serde_json::from_value::<P>(req.params.clone()) {
+                Ok(p) => {
+                    let mut reg = ctx.watch_registry.lock().await;
+                    let found = match reg.get_mut(&p.team_id) {
+                        Some(st) => {
+                            st.enabled = false;
+                            true
+                        }
+                        None => false,
+                    };
+                    // P6 (ADR-P6): persist the disabled state rather than removing
+                    // it, so config survives but startup only re-registers enabled
+                    // teams. Clone under the lock, drop it before file I/O.
+                    let to_persist = reg
+                        .get(&p.team_id)
+                        .map(|st| (st.working_directory.clone(), st.clone()));
+                    drop(reg);
+                    if let Some((wd, st)) = to_persist {
+                        if !wd.is_empty() {
+                            watch_config::save_watch_state(
+                                std::path::Path::new(&wd),
+                                &p.team_id,
+                                &st,
+                            );
+                        }
+                    }
+                    Ok(serde_json::json!({
+                        "status": "ok",
+                        "team_id": p.team_id,
+                        "enabled": false,
+                        "found": found,
+                    }))
+                }
+                Err(e) => Err(format!("invalid params: {e}")),
+            }
+        }
+        "watch.status" => {
+            #[derive(Deserialize)]
+            struct P {
+                #[serde(default)]
+                team_id: Option<String>,
+            }
+            fn serialize_state(
+                team: &str,
+                st: &crate::drift_watch::WatchState,
+            ) -> serde_json::Value {
+                // P12 #6: derive human-facing fields the CLI renders directly.
+                // last_tick: 0 = never run yet. next_tick: only meaningful once a
+                // check has run; null when never (the scheduler fires the first
+                // check one interval after the team is first observed).
+                let last_tick = if st.last_check_ts > 0 {
+                    serde_json::json!(st.last_check_ts)
+                } else {
+                    serde_json::Value::Null
+                };
+                let next_tick = if st.enabled && st.last_check_ts > 0 {
+                    serde_json::json!(st.last_check_ts + st.interval_secs)
+                } else {
+                    serde_json::Value::Null
+                };
+                let drift_count = board_drift_count(&st.working_directory);
+                serde_json::json!({
+                    "team_id": team,
+                    "enabled": st.enabled,
+                    "running": st.in_flight,
+                    "interval_secs": st.interval_secs,
+                    "exec_to_dir_ratio": st.exec_to_dir_ratio,
+                    "target": st.target,
+                    "cli": st.cli,
+                    "model": st.model,
+                    "stance": st.stance,
+                    "spec": st.spec,
+                    "last_tick": last_tick,
+                    "next_tick": next_tick,
+                    "drift_count": drift_count,
+                    // Raw fields retained for back-compat / debugging.
+                    "last_check_ts": st.last_check_ts,
+                    "check_count": st.check_count,
+                    "in_flight": st.in_flight,
+                    "last_error": st.last_error,
+                })
+            }
+            let params: P =
+                serde_json::from_value(req.params.clone()).unwrap_or(P { team_id: None });
+            let reg = ctx.watch_registry.lock().await;
+            match params.team_id {
+                Some(tid) => Ok(serde_json::json!({
+                    "status": "ok",
+                    "watch": reg.get(&tid).map(|st| serialize_state(&tid, st)),
+                })),
+                None => {
+                    let all: Vec<serde_json::Value> =
+                        reg.iter().map(|(t, st)| serialize_state(t, st)).collect();
+                    Ok(serde_json::json!({ "status": "ok", "watches": all }))
+                }
+            }
+        }
         "headless.list_resumable" => {
             #[derive(Deserialize)]
             struct P {
@@ -1946,6 +2218,7 @@ async fn dispatch(req: &Request, ctx: &Context) -> Response {
                         model: p.model,
                         cli_path: p.cli_path,
                         instructions: p.instructions,
+                        custom_instructions: None,
                         agent_type: None,
                         color: None,
                         extra_args: p.extra_args,

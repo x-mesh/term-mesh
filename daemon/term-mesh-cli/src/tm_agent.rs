@@ -323,6 +323,10 @@ enum Commands {
         /// With a session ID: resumes that specific session.
         #[arg(long)]
         resume_session: Option<Option<String>>,
+        /// Watcher spec, attached to the watcher agent only as custom instructions.
+        /// Literal text, or @path to read the spec from a file.
+        #[arg(long)]
+        spec: Option<String>,
     },
     /// Add an agent to an existing team (GUI and headless teams both supported).
     ///
@@ -496,15 +500,19 @@ enum Commands {
         #[arg(long = "task-id")]
         task_id: Option<String>,
     },
-    /// Stream events from the daemon as JSONL (push channel for leader sessions)
+    /// Stream daemon events (default), or control autonomous drift-watch via the
+    /// `on`/`off`/`status` subcommands (watcher Phase 2, daemon `watch.*` RPC).
     Watch {
-        /// Comma-separated event kinds to receive (default: task_done,reply,heartbeat_stale)
+        /// Drift-watch control subcommand. Omit to stream daemon events instead.
+        #[command(subcommand)]
+        action: Option<WatchAction>,
+        /// (stream) Comma-separated event kinds (default: task_done,reply,heartbeat_stale)
         #[arg(long, value_name = "KINDS")]
         on_event: Option<String>,
-        /// Stop after N seconds (default: 0 = run until Ctrl+C)
+        /// (stream) Stop after N seconds (default: 0 = run until Ctrl+C)
         #[arg(long, default_value_t = 0)]
         timeout: u32,
-        /// Filter to events belonging to a specific leader session
+        /// (stream) Filter to events belonging to a specific leader session
         #[arg(long, value_name = "SESSION_ID")]
         leader_session: Option<String>,
     },
@@ -891,6 +899,51 @@ enum RunbookCommands {
         /// Show only one role digest
         #[arg(long)]
         agent: Option<String>,
+    },
+}
+
+/// `tm-agent watch <on|off|status>` — daemon-side autonomous drift-watch control
+/// (watcher Phase 2). Routes to the term-meshd `watch.*` RPCs.
+#[derive(Subcommand)]
+enum WatchAction {
+    /// Enable autonomous drift-watch for a team
+    On {
+        /// Team id to watch
+        team: String,
+        /// Check interval in seconds (default: daemon default, 300s)
+        #[arg(long)]
+        every: Option<u64>,
+        /// Watched agent name (default: all workers on the team)
+        #[arg(long)]
+        target: Option<String>,
+        /// Watcher stance: critic | advisor | pair
+        #[arg(long, default_value = "critic")]
+        stance: String,
+        /// Watcher CLI: claude | codex | gemini | kiro
+        #[arg(long, default_value = "claude")]
+        cli: String,
+        /// Watcher model
+        #[arg(long, default_value = "sonnet")]
+        model: String,
+        /// Oversight spec text, or @path to read live each cycle
+        #[arg(long)]
+        spec: Option<String>,
+        /// Executions-per-direction ratio (default 5 → every 6th check is direction)
+        #[arg(long)]
+        ratio: Option<u32>,
+        /// Working dir whose .xm/watch/config.json persists this (default: cwd)
+        #[arg(long)]
+        working_dir: Option<String>,
+    },
+    /// Disable autonomous drift-watch for a team (config persisted, disabled)
+    Off {
+        /// Team id to stop watching
+        team: String,
+    },
+    /// Show watch status for one team, or all teams when omitted
+    Status {
+        /// Team id (optional — omit for all teams)
+        team: Option<String>,
     },
 }
 
@@ -1520,6 +1573,27 @@ fn builtin_runbook_roles() -> Vec<RunbookRole> {
             verify: &[
                 "Run or specify an eval, golden-case test, schema validation, or dry-run for changed AI behavior.",
                 "Report token/request estimates, expected cost per 1K calls, and known model limitations when applicable.",
+            ],
+        },
+        RunbookRole {
+            name: "watcher",
+            title: "Watcher Runbook",
+            description: "Stateless drift reviewer — compares spec against a watched agent's recent delta, detects execution/direction drift, reports to the leader only.",
+            when_to_use: &[
+                "A long-running or risky session needs oversight against a spec.",
+                "The leader asks for an on-demand \"review now\" drift check, or drift is suspected.",
+            ],
+            rules: &[
+                "Feed only the spec plus the watched agent's recent delta (tm-agent collect --lines N); never the full history.",
+                "Distinguish execution drift (the task done wrong) from direction drift (the wrong task in the first place).",
+                "Return only a structured drift verdict: VERDICT, drift_type, severity, finding, and spec_clause.",
+                "Do not call tm-agent msg send and do not append to .xm/watch/board.jsonl; manual /watch review owns leader reporting, autonomous /watch on is owned by the daemon WatchController.",
+                "When nothing is wrong, return a single structured OK verdict.",
+                "Propose course corrections only; never edit code directly — the leader approves and applies.",
+            ],
+            verify: &[
+                "Confirm your reply contains the structured verdict fields requested by /watch.",
+                "If asked to verify persistence, tell the leader to check tm-agent msg list and tail .xm/watch/board.jsonl; do not write those yourself.",
             ],
         },
     ]
@@ -3701,6 +3775,26 @@ fn main() {
         return;
     }
 
+    // `watch <on|off|status>` controls the term-meshd (daemon) drift-watch
+    // scheduler via the `watch.*` RPCs, so resolve the daemon socket directly
+    // (falling back to the app socket). Bare `watch` (no subcommand) is the event
+    // stream, handled in the main match below.
+    if let Commands::Watch {
+        action: Some(ref action),
+        ..
+    } = cli.command
+    {
+        let sock = detect_watch_socket().unwrap_or_else(|| {
+            eprintln!(
+                "Error: no term-meshd socket found (set TERMMESH_DAEMON_SOCKET, \
+                 TERMMESH_DAEMON_UNIX_PATH, or TERMMESH_SOCKET to the daemon socket)"
+            );
+            process::exit(1);
+        });
+        run_watch_command(&sock, action);
+        return;
+    }
+
     let sock = match detect_socket() {
         Some(s) => s,
         None => {
@@ -4442,9 +4536,25 @@ fn main() {
             roles,
             headless,
             resume_session,
+            spec,
         } => {
+            // Resolve --spec (literal text or @path) once for both paths.
+            let watcher_spec = match resolve_watcher_spec(spec.as_deref()) {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("Error: {e}");
+                    process::exit(1);
+                }
+            };
             if headless {
-                run_create_headless(&sock, &team, count.unwrap_or(2), &model, roles.as_deref());
+                run_create_headless(
+                    &sock,
+                    &team,
+                    count.unwrap_or(2),
+                    &model,
+                    roles.as_deref(),
+                    watcher_spec.as_deref(),
+                );
             } else {
                 run_create(
                     &sock,
@@ -4460,6 +4570,7 @@ fn main() {
                     preset.as_deref(),
                     roles.as_deref(),
                     resume_session,
+                    watcher_spec.as_deref(),
                 );
             }
             return;
@@ -4778,6 +4889,9 @@ fn main() {
             return;
         }
         Commands::Watch {
+            // `Some(action)` is handled by the early daemon-socket dispatch above;
+            // reaching here means the bare event-stream form (action == None).
+            action: _,
             on_event,
             timeout,
             leader_session,
@@ -5275,6 +5389,64 @@ fn resolve_resume_session(flag: Option<Option<String>>) -> Option<String> {
     }
 }
 
+/// Resolve --spec: literal text, or @path to read the spec from a file.
+/// Returns Ok(None) when no spec was supplied. A leading `@` reads the file
+/// at the remaining path (error if it cannot be read). Empty input is treated
+/// as absent.
+fn resolve_watcher_spec(spec: Option<&str>) -> Result<Option<String>, String> {
+    let Some(raw) = spec else {
+        return Ok(None);
+    };
+    if raw.is_empty() {
+        return Ok(None);
+    }
+    if let Some(path) = raw.strip_prefix('@') {
+        let path = path.trim();
+        if path.is_empty() {
+            return Err("--spec @<path> requires a file path after '@'".to_string());
+        }
+        let content = fs::read_to_string(path)
+            .map_err(|e| format!("--spec: cannot read file '{path}': {e}"))?;
+        if content.trim().is_empty() {
+            return Err(format!("--spec: file '{path}' is empty"));
+        }
+        Ok(Some(content))
+    } else {
+        Ok(Some(raw.to_string()))
+    }
+}
+
+/// Attach `watcher_spec` as `custom_instructions` to watcher agents only (R7:
+/// watcher-only invariant). Warns when a spec is supplied but no watcher role
+/// is present in the team. Mutates the agents JSON array in place.
+fn apply_watcher_spec(agents: &mut [serde_json::Value], watcher_spec: Option<&str>) {
+    let Some(spec) = watcher_spec else {
+        return;
+    };
+    let mut attached = 0usize;
+    for agent in agents.iter_mut() {
+        let role = agent
+            .get("agent_type")
+            .and_then(|v| v.as_str())
+            .or_else(|| agent.get("name").and_then(|v| v.as_str()))
+            .unwrap_or("");
+        if role == "watcher" {
+            if let Some(obj) = agent.as_object_mut() {
+                obj.insert(
+                    "custom_instructions".to_string(),
+                    serde_json::Value::String(spec.to_string()),
+                );
+                attached += 1;
+            }
+        }
+    }
+    if attached == 0 {
+        eprintln!(
+            "Warning: --spec was provided but no 'watcher' agent is in this team; spec ignored."
+        );
+    }
+}
+
 // ── Orchestration implementations ────────────────────────────────────
 
 fn run_create(
@@ -5291,6 +5463,7 @@ fn run_create(
     preset: Option<&str>,
     roles: Option<&str>,
     resume_session: Option<Option<String>>,
+    watcher_spec: Option<&str>,
 ) {
     // Guard: --adopt and --claude-leader are mutually exclusive
     if adopt && claude_leader {
@@ -5326,7 +5499,7 @@ fn run_create(
     let mut workflow_review_checkpoints: Vec<String> = Vec::new();
 
     // Resolve agents from preset or roles via RPC, or build from defaults
-    let agents: Vec<serde_json::Value> = if let Some(preset_id) = preset {
+    let mut agents: Vec<serde_json::Value> = if let Some(preset_id) = preset {
         eprintln!("Resolving preset '{preset_id}'...");
         match rpc_call_timeout(
             sock,
@@ -5440,6 +5613,9 @@ fn run_create(
         }
         default_agents
     };
+
+    // Attach watcher spec (if any) to watcher agents only (R7: watcher-only).
+    apply_watcher_spec(&mut agents, watcher_spec);
 
     // Destroy existing team first, then poll until gone (max 10 × 50ms = 500ms)
     let _ = rpc_call_timeout(sock, "team.destroy", json!({ "team_name": team }), 2);
@@ -6018,6 +6194,97 @@ fn run_remove_gui(sock: &PathBuf, team_name: &str, agent_name: &str, force: bool
     }
 }
 
+/// Does this socket path look like the term-mesh *app* socket rather than the
+/// term-meshd daemon socket? App sockets are `term-mesh*.sock` (no trailing `d`)
+/// or `cmux.sock`; the daemon is `term-meshd*.sock`. Used to keep daemon RPCs off
+/// the app socket.
+fn is_app_socket_path(path: &Path) -> bool {
+    match path.file_name().and_then(|n| n.to_str()) {
+        Some(name) => {
+            name == "cmux.sock"
+                || (name.starts_with("term-mesh") && !name.starts_with("term-meshd"))
+        }
+        None => false,
+    }
+}
+
+/// Derive this app instance's term-meshd socket from its *app* socket path (P15).
+///
+/// Mirrors `scripts/reload.sh`: a tagged app socket `/tmp/term-mesh-debug-<tag>.sock`
+/// is served by daemon `~/Library/Application Support/term-mesh/term-meshd-dev-<tag>.sock`.
+/// Returns `None` for the live/untagged app socket so it falls through to the
+/// default daemon — preserving instance isolation (a tagged leader never derives
+/// the live daemon, and the live leader keeps using the default).
+fn derive_daemon_socket_from_app(app_path: &Path) -> Option<PathBuf> {
+    let name = app_path.file_name().and_then(|n| n.to_str())?;
+    // Only the tagged debug app socket maps to an isolated Application Support daemon.
+    let tag = name
+        .strip_prefix("term-mesh-debug-")
+        .and_then(|rest| rest.strip_suffix(".sock"))
+        .filter(|t| !t.is_empty())?;
+    let home = env::var("HOME").ok().filter(|h| !h.is_empty())?;
+    Some(
+        PathBuf::from(home)
+            .join("Library/Application Support/term-mesh")
+            .join(format!("term-meshd-dev-{tag}.sock")),
+    )
+}
+
+/// Resolve the term-meshd socket for `tm-agent watch` (P12 #4, P15 routing).
+///
+/// Priority:
+/// 1. `TERMMESH_DAEMON_SOCKET` / `TERMMESH_DAEMON_UNIX_PATH` (the app injects the
+///    latter into every pane env, so a leader pane reaches its own daemon).
+/// 2. `TERMMESH_SOCKET` when it is itself a *daemon* socket (tagged standalone).
+/// 3. `TERMMESH_SOCKET` when it is an *app* socket → derive this instance's daemon
+///    socket from it (P15: `TERMMESH_SOCKET`-only routing, isolation-preserving).
+/// 4. the default daemon socket.
+/// 5. any live socket as a last resort.
+///
+/// The app-socket guard at steps 2/3 keeps a leader pane from misrouting `watch.*`
+/// to the app socket (which returns method_not_found) while still reaching the
+/// correct per-instance daemon.
+fn detect_watch_socket() -> Option<PathBuf> {
+    for var in ["TERMMESH_DAEMON_SOCKET", "TERMMESH_DAEMON_UNIX_PATH"] {
+        if let Ok(p) = env::var(var) {
+            if !p.is_empty() {
+                let path = PathBuf::from(&p);
+                if is_socket_alive(&path) {
+                    return Some(path);
+                }
+            }
+        }
+    }
+    if let Ok(p) = env::var("TERMMESH_SOCKET") {
+        if !p.is_empty() {
+            let path = PathBuf::from(&p);
+            if is_socket_alive(&path) {
+                // Explicit daemon socket → use directly.
+                if !is_app_socket_path(&path) {
+                    return Some(path);
+                }
+                // App socket → derive this instance's daemon (P15).
+                if let Some(derived) = derive_daemon_socket_from_app(&path) {
+                    if is_socket_alive(&derived) {
+                        return Some(derived);
+                    }
+                }
+            }
+        }
+    }
+    // Default daemon socket.
+    let dir = env::var("TMPDIR")
+        .ok()
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/tmp"));
+    let path = dir.join("term-meshd.sock");
+    if is_socket_alive(&path) {
+        return Some(path);
+    }
+    // Last resort: any socket the generic resolver finds.
+    detect_socket()
+}
+
 fn detect_daemon_socket() -> Option<PathBuf> {
     // Priority 1: TERMMESH_DAEMON_SOCKET (injected by daemon into headless agent env)
     if let Ok(p) = env::var("TERMMESH_DAEMON_SOCKET") {
@@ -6168,6 +6435,7 @@ fn run_create_headless(
     count: u32,
     model: &str,
     roles: Option<&str>,
+    watcher_spec: Option<&str>,
 ) {
     let daemon_sock = match detect_daemon_socket() {
         Some(s) => s,
@@ -6178,7 +6446,7 @@ fn run_create_headless(
     };
 
     // Build agent list from roles or defaults
-    let agent_specs: Vec<Value> = if let Some(roles_str) = roles {
+    let mut agent_specs: Vec<Value> = if let Some(roles_str) = roles {
         roles_str
             .split(',')
             .map(|s| s.trim())
@@ -6198,6 +6466,9 @@ fn run_create_headless(
             })
             .collect()
     };
+
+    // Attach watcher spec (if any) to watcher agents only (R7: watcher-only).
+    apply_watcher_spec(&mut agent_specs, watcher_spec);
 
     let workdir = env::current_dir()
         .map(|p| p.to_string_lossy().to_string())
@@ -6238,6 +6509,9 @@ fn run_create_headless(
                 let name = spec["name"].as_str().unwrap_or("");
                 let role = spec["agent_type"].as_str().unwrap_or(name);
                 let agent_id = format!("{name}@{team}");
+                // Watcher --spec is delivered via the daemon as --append-system-prompt
+                // (custom_instructions folded into the persisted instructions at
+                // create_team time), so no init-prompt injection is needed here.
                 let init_text = agent_init_prompt(name, role, team, &workdir, &app_sock_str);
                 match rpc_call_timeout(
                     &daemon_sock,
@@ -7042,6 +7316,164 @@ fn run_watch(
                 }
             }
         }
+    }
+}
+
+/// Dispatch `tm-agent watch <on|off|status>` to the daemon `watch.*` RPCs.
+fn run_watch_command(sock: &PathBuf, action: &WatchAction) {
+    match action {
+        WatchAction::On {
+            team,
+            every,
+            target,
+            stance,
+            cli,
+            model,
+            spec,
+            ratio,
+            working_dir,
+        } => {
+            // The daemon persists config keyed by working_directory; default to cwd.
+            let wd = working_dir.clone().unwrap_or_else(|| {
+                env::current_dir()
+                    .map(|p| p.to_string_lossy().into_owned())
+                    .unwrap_or_default()
+            });
+            let mut params = json!({
+                "team_id": team,
+                "cli": cli,
+                "model": model,
+                "stance": stance,
+                "working_directory": wd,
+            });
+            if let Some(e) = every {
+                params["interval_secs"] = json!(e);
+            }
+            if let Some(t) = target {
+                params["target"] = json!(t);
+            }
+            // Pass `spec` verbatim (incl. any `@path` sentinel — resolved later by
+            // the watcher each cycle), per ADR-P6.
+            if let Some(s) = spec {
+                params["spec"] = json!(s);
+            }
+            if let Some(r) = ratio {
+                params["exec_to_dir_ratio"] = json!(r);
+            }
+            // P14: forward the caller's app socket (TERMMESH_SOCKET) so the daemon
+            // stores it on the WatchState. A GUI team's watched pane lives in the
+            // Swift app (not the daemon's headless manager), so the spawned watcher
+            // needs TERMMESH_SOCKET = app socket to self-collect the target delta
+            // (`tm-agent read <target>`) and the WatchController needs it to post to
+            // the leader inbox (`team.message.post`). Headless callers (daemon
+            // socket) leave it unset → daemon-side pre-fetch (P13) covers them.
+            if let Ok(ts) = env::var("TERMMESH_SOCKET") {
+                if !ts.is_empty() && is_app_socket_path(Path::new(&ts)) {
+                    params["app_socket_path"] = json!(ts);
+                }
+            }
+            print_result(rpc_call(sock, "watch.on", params));
+        }
+        WatchAction::Off { team } => {
+            print_result(rpc_call(sock, "watch.off", json!({ "team_id": team })));
+        }
+        WatchAction::Status { team } => {
+            let mut params = json!({});
+            if let Some(t) = team {
+                params["team_id"] = json!(t);
+            }
+            match rpc_call(sock, "watch.status", params) {
+                Ok(resp) => print_watch_status(&resp),
+                Err(e) => {
+                    eprintln!("Error: {e}");
+                    process::exit(1);
+                }
+            }
+        }
+    }
+}
+
+/// Render `watch.status` as a human-readable summary (P12 #6) instead of raw JSON.
+fn print_watch_status(resp: &Value) {
+    // The handler returns either `{watch: {..}|null}` (single team) or
+    // `{watches: [..]}` (all teams).
+    let states: Vec<&Value> = if let Some(one) = resp.get("watch") {
+        if one.is_null() {
+            Vec::new()
+        } else {
+            vec![one]
+        }
+    } else if let Some(arr) = resp.get("watches").and_then(Value::as_array) {
+        arr.iter().collect()
+    } else {
+        Vec::new()
+    };
+
+    if states.is_empty() {
+        println!("No watches configured.");
+        return;
+    }
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+
+    for st in states {
+        let team = st.get("team_id").and_then(Value::as_str).unwrap_or("?");
+        let enabled = st.get("enabled").and_then(Value::as_bool).unwrap_or(false);
+        let running = st.get("running").and_then(Value::as_bool).unwrap_or(false);
+        let target = st
+            .get("target")
+            .and_then(Value::as_str)
+            .unwrap_or("all (workers)");
+        let interval = st.get("interval_secs").and_then(Value::as_u64).unwrap_or(0);
+        let stance = st.get("stance").and_then(Value::as_str).unwrap_or("?");
+        let cli = st.get("cli").and_then(Value::as_str).unwrap_or("?");
+        let model = st.get("model").and_then(Value::as_str).unwrap_or("?");
+        let drift = st.get("drift_count").and_then(Value::as_u64).unwrap_or(0);
+
+        println!("watch: {team}");
+        println!("  enabled:   {}", if enabled { "yes" } else { "no" });
+        println!("  running:   {}", if running { "yes" } else { "no" });
+        println!("  target:    {target}");
+        println!("  interval:  {interval}s");
+        println!("  stance:    {stance} ({cli}/{model})");
+        println!("  last_tick: {}", fmt_tick(st.get("last_tick"), now, false));
+        println!("  next_tick: {}", fmt_tick(st.get("next_tick"), now, true));
+        println!("  drifts:    {drift}");
+    }
+}
+
+/// Format an epoch-seconds tick value with a relative hint. `future` picks the
+/// "in Ns" vs "Ns ago" phrasing; null/0 renders as "never"/"pending".
+fn fmt_tick(v: Option<&Value>, now: u64, future: bool) -> String {
+    let ts = match v.and_then(Value::as_u64) {
+        Some(t) if t > 0 => t,
+        _ => return if future { "pending".into() } else { "never".into() },
+    };
+    let rel = if future {
+        if ts > now {
+            format!("in {}", fmt_dur(ts - now))
+        } else {
+            "due now".into()
+        }
+    } else if now >= ts {
+        format!("{} ago", fmt_dur(now - ts))
+    } else {
+        "just now".into()
+    };
+    format!("{ts} ({rel})")
+}
+
+/// Compact duration: seconds → `Ns` / `Nm` / `Nh`.
+fn fmt_dur(secs: u64) -> String {
+    if secs < 60 {
+        format!("{secs}s")
+    } else if secs < 3600 {
+        format!("{}m", secs / 60)
+    } else {
+        format!("{}h", secs / 3600)
     }
 }
 
@@ -8104,6 +8536,15 @@ fn capabilities_for_agent_type(agent_type: &str) -> Vec<&'static str> {
             "layout",
             "ux",
         ],
+        "watcher" => vec![
+            "watch",
+            "oversight",
+            "drift",
+            "monitor",
+            "spec",
+            "review",
+            "audit",
+        ],
         _ => vec![],
     }
 }
@@ -8872,5 +9313,126 @@ fn run_autonomous(
 
     if succeeded.is_empty() {
         process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod watcher_spec_tests {
+    use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn resolve_watcher_spec_absent_and_empty_return_none() {
+        assert_eq!(resolve_watcher_spec(None).unwrap(), None);
+        assert_eq!(resolve_watcher_spec(Some("")).unwrap(), None);
+    }
+
+    #[test]
+    fn resolve_watcher_spec_literal_passthrough() {
+        assert_eq!(
+            resolve_watcher_spec(Some("watch the diff scope")).unwrap(),
+            Some("watch the diff scope".to_string())
+        );
+    }
+
+    #[test]
+    fn resolve_watcher_spec_at_path_reads_file() {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = env::temp_dir().join(format!("tm-spec-{nanos}.txt"));
+        fs::write(&path, "SPEC: do not drift from the plan").unwrap();
+        let arg = format!("@{}", path.display());
+        let resolved = resolve_watcher_spec(Some(&arg)).unwrap();
+        assert_eq!(resolved, Some("SPEC: do not drift from the plan".to_string()));
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn resolve_watcher_spec_at_missing_file_errors() {
+        assert!(resolve_watcher_spec(Some("@/nonexistent/tm-spec-xyz.txt")).is_err());
+        assert!(resolve_watcher_spec(Some("@")).is_err());
+    }
+
+    #[test]
+    fn apply_watcher_spec_attaches_to_watcher_only() {
+        // R7 invariant: spec lands on watcher, never on other roles.
+        let mut agents = vec![
+            json!({ "name": "watcher", "agent_type": "watcher", "cli": "claude", "model": "sonnet" }),
+            json!({ "name": "executor", "agent_type": "executor", "cli": "claude", "model": "sonnet" }),
+        ];
+        apply_watcher_spec(&mut agents, Some("oversight spec"));
+        assert_eq!(
+            agents[0]["custom_instructions"].as_str(),
+            Some("oversight spec")
+        );
+        assert!(agents[1].get("custom_instructions").is_none());
+    }
+
+    #[test]
+    fn apply_watcher_spec_uses_name_when_agent_type_missing() {
+        let mut agents = vec![json!({ "name": "watcher", "cli": "claude", "model": "sonnet" })];
+        apply_watcher_spec(&mut agents, Some("spec via name"));
+        assert_eq!(
+            agents[0]["custom_instructions"].as_str(),
+            Some("spec via name")
+        );
+    }
+
+    #[test]
+    fn apply_watcher_spec_none_is_noop() {
+        let mut agents =
+            vec![json!({ "name": "watcher", "agent_type": "watcher", "cli": "claude" })];
+        apply_watcher_spec(&mut agents, None);
+        assert!(agents[0].get("custom_instructions").is_none());
+    }
+
+    // ── P15: watch daemon-socket routing ──────────────────────────────────
+    #[test]
+    fn is_app_socket_path_classifies_app_vs_daemon() {
+        // App sockets (no trailing `d`) and cmux are app sockets.
+        assert!(is_app_socket_path(Path::new("/tmp/term-mesh.sock")));
+        assert!(is_app_socket_path(Path::new("/tmp/term-mesh-debug.sock")));
+        assert!(is_app_socket_path(Path::new("/tmp/term-mesh-debug-watcher-p2.sock")));
+        assert!(is_app_socket_path(Path::new("/tmp/cmux.sock")));
+        // Daemon sockets are NOT app sockets.
+        assert!(!is_app_socket_path(Path::new("/tmp/term-meshd.sock")));
+        assert!(!is_app_socket_path(Path::new(
+            "/Users/x/Library/Application Support/term-mesh/term-meshd-dev-watcher-p2.sock"
+        )));
+    }
+
+    #[test]
+    fn derive_daemon_socket_maps_tagged_app_to_app_support() {
+        std::env::set_var("HOME", "/Users/tester");
+        let derived =
+            derive_daemon_socket_from_app(Path::new("/tmp/term-mesh-debug-watcher-p2.sock"));
+        assert_eq!(
+            derived,
+            Some(PathBuf::from(
+                "/Users/tester/Library/Application Support/term-mesh/term-meshd-dev-watcher-p2.sock"
+            ))
+        );
+    }
+
+    #[test]
+    fn derive_daemon_socket_skips_live_and_untagged() {
+        std::env::set_var("HOME", "/Users/tester");
+        // Live/release app socket → no derivation (falls through to default daemon).
+        assert_eq!(
+            derive_daemon_socket_from_app(Path::new("/tmp/term-mesh.sock")),
+            None
+        );
+        // Untagged debug app socket → no derivation (uses default daemon).
+        assert_eq!(
+            derive_daemon_socket_from_app(Path::new("/tmp/term-mesh-debug.sock")),
+            None
+        );
+        // A daemon socket is never an "app" socket to derive from.
+        assert_eq!(
+            derive_daemon_socket_from_app(Path::new("/tmp/term-meshd.sock")),
+            None
+        );
     }
 }
