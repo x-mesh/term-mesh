@@ -6278,6 +6278,25 @@ fn derive_daemon_socket_from_app(app_path: &Path) -> Option<PathBuf> {
 /// to the app socket (which returns method_not_found) while still reaching the
 /// correct per-instance daemon.
 fn detect_watch_socket() -> Option<PathBuf> {
+    // Highest priority (F1): an explicit *app-socket* TERMMESH_SOCKET is a deliberate
+    // instance selection. Derive its daemon and use it, overriding the ambient
+    // TERMMESH_DAEMON_* env (which reflects the *calling pane's* default instance,
+    // not the explicitly chosen one). Without this, running `tm-agent watch …` with
+    // an explicit TERMMESH_SOCKET from inside another instance's pane misroutes the
+    // watch (and its ticks) to the wrong/stale daemon. Only applies when the app
+    // socket is derivable (tagged) and its daemon is alive; otherwise fall through.
+    if let Ok(p) = env::var("TERMMESH_SOCKET") {
+        if !p.is_empty() {
+            let path = PathBuf::from(&p);
+            if is_socket_alive(&path) && is_app_socket_path(&path) {
+                if let Some(derived) = derive_daemon_socket_from_app(&path) {
+                    if is_socket_alive(&derived) {
+                        return Some(derived);
+                    }
+                }
+            }
+        }
+    }
     for var in ["TERMMESH_DAEMON_SOCKET", "TERMMESH_DAEMON_UNIX_PATH"] {
         if let Ok(p) = env::var(var) {
             if !p.is_empty() {
