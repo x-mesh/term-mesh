@@ -599,7 +599,7 @@ private func sendPeerInputBytes(_ surface: ghostty_surface_t, bytes: Data) {
         }
 
         if let mapping = peerSingleByteKeyMapping(byte) {
-            sendPeerKeyEvent(surface, keycode: mapping.keycode, text: mapping.text)
+            sendPeerKeyEvent(surface, keycode: mapping.keycode, mods: mapping.mods, text: mapping.text)
             i += 1
             continue
         }
@@ -649,12 +649,21 @@ private func sendPeerInputBytes(_ surface: ghostty_surface_t, bytes: Data) {
 }
 
 /// Special single bytes that map to a named macOS keycode.
-private func peerSingleByteKeyMapping(_ byte: UInt8) -> (keycode: UInt32, text: String)? {
+private func peerSingleByteKeyMapping(_ byte: UInt8) -> (keycode: UInt32, mods: ghostty_input_mods_e, text: String)? {
     switch byte {
-    case 0x0d, 0x0a: return (36, "\r")          // kVK_Return
-    case 0x09:        return (0x30, "\t")        // kVK_Tab
-    case 0x7f, 0x08:  return (0x33, "\u{7f}")    // kVK_Delete (Backspace)
-    case 0x1b:        return (0x35, "\u{1b}")    // kVK_Escape
+    // CR → unmodified Return (submit). The host surface's kitty-mode key
+    // encoder turns this into a bare \r.
+    case 0x0d:        return (36, GHOSTTY_MODS_NONE, "\r")   // kVK_Return
+    // LF → Shift+Return (insert newline). The peer-relay binary translates a
+    // kitty `CSI 13;2u` (shift+enter) into a bare LF; replaying it as a plain
+    // Return would submit instead of inserting a newline. Synthesizing
+    // Shift+Return lets the host's kitty-mode encoder regenerate `CSI 13;2u`,
+    // which Claude/codex/jupyter interpret as a literal newline. See
+    // term-mesh-peer-relay translate_terminal_csi_input (shift+enter → LF).
+    case 0x0a:        return (36, GHOSTTY_MODS_SHIFT, "\r")  // kVK_Return + Shift
+    case 0x09:        return (0x30, GHOSTTY_MODS_NONE, "\t")    // kVK_Tab
+    case 0x7f, 0x08:  return (0x33, GHOSTTY_MODS_NONE, "\u{7f}")// kVK_Delete (Backspace)
+    case 0x1b:        return (0x35, GHOSTTY_MODS_NONE, "\u{1b}")// kVK_Escape
     default:          return nil
     }
 }
