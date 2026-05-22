@@ -1671,6 +1671,25 @@ fn load_runbook_content_for_role(root: &Path, role: &str) -> Option<String> {
         .filter(|content| !content.trim().is_empty())
 }
 
+fn load_common_runbook_content(root: &Path) -> String {
+    let path = root.join(RUNBOOK_SOURCE_DIR).join("_common.md");
+    fs::read_to_string(&path)
+        .ok()
+        .filter(|content| !content.trim().is_empty())
+        .unwrap_or_default()
+}
+
+fn get_common_runbook_p0_rule(root: &Path) -> String {
+    let common = load_common_runbook_content(root);
+    if common.is_empty() {
+        return "명시 지시 없으면 git 상태를 바꾸지 않는다 — working tree 변경만 남기고 커밋은 leader가 결정".to_string();
+    }
+    let bullets = runbook_section_bullets(&common, "## P0. Git 상태 변경 금지", 1);
+    bullets.first().cloned().unwrap_or_else(|| {
+        "명시 지시 없으면 git 상태를 바꾸지 않는다 — working tree 변경만 남기고 커밋은 leader가 결정".to_string()
+    })
+}
+
 fn runbook_section_bullets(content: &str, section: &str, limit: usize) -> Vec<String> {
     let mut in_section = false;
     let mut out = Vec::new();
@@ -1709,7 +1728,7 @@ fn runbook_digest_content(root: &Path, role: &RunbookRole, agent_name: &str, tea
     } else {
         when.join(" | ")
     };
-    let must = if rules.is_empty() {
+    let mut must = if rules.is_empty() {
         role.rules
             .iter()
             .take(3)
@@ -1719,6 +1738,10 @@ fn runbook_digest_content(root: &Path, role: &RunbookRole, agent_name: &str, tea
     } else {
         rules.join(" | ")
     };
+    let common_p0 = get_common_runbook_p0_rule(root);
+    if !common_p0.is_empty() {
+        must = format!("{} | {}", common_p0, must);
+    }
     let verify = if verify.is_empty() {
         role.verify
             .iter()
@@ -1778,7 +1801,11 @@ fn runbook_digest_content_for_role_name(
         .to_string();
     let content = source.unwrap_or("");
     let when = runbook_section_bullets(content, "## When To Use", 2).join(" | ");
-    let must = runbook_section_bullets(content, "## Operating Rules", 3).join(" | ");
+    let mut must = runbook_section_bullets(content, "## Operating Rules", 3).join(" | ");
+    let common_p0 = get_common_runbook_p0_rule(root);
+    if !common_p0.is_empty() {
+        must = format!("{} | {}", common_p0, must);
+    }
     let verify = runbook_section_bullets(content, "## Verify", 2).join(" | ");
     format!(
         "\
@@ -5670,6 +5697,12 @@ fn run_create(
     if let Ok(workspace_id) = env::var("TERMMESH_WORKSPACE_ID") {
         create_params["workspace_id"] = json!(workspace_id);
     }
+    // In --adopt mode, pass the adopted leader's CLI for stable detection
+    if adopt {
+        if let Ok(cli) = env::var("TERMMESH_CLI") {
+            create_params["leader_cli"] = json!(cli);
+        }
+    }
     let r = match rpc_call_timeout(sock, "team.create", create_params, 5) {
         Ok(v) => v,
         Err(e) => {
@@ -6245,6 +6278,25 @@ fn derive_daemon_socket_from_app(app_path: &Path) -> Option<PathBuf> {
 /// to the app socket (which returns method_not_found) while still reaching the
 /// correct per-instance daemon.
 fn detect_watch_socket() -> Option<PathBuf> {
+    // Highest priority (F1): an explicit *app-socket* TERMMESH_SOCKET is a deliberate
+    // instance selection. Derive its daemon and use it, overriding the ambient
+    // TERMMESH_DAEMON_* env (which reflects the *calling pane's* default instance,
+    // not the explicitly chosen one). Without this, running `tm-agent watch …` with
+    // an explicit TERMMESH_SOCKET from inside another instance's pane misroutes the
+    // watch (and its ticks) to the wrong/stale daemon. Only applies when the app
+    // socket is derivable (tagged) and its daemon is alive; otherwise fall through.
+    if let Ok(p) = env::var("TERMMESH_SOCKET") {
+        if !p.is_empty() {
+            let path = PathBuf::from(&p);
+            if is_socket_alive(&path) && is_app_socket_path(&path) {
+                if let Some(derived) = derive_daemon_socket_from_app(&path) {
+                    if is_socket_alive(&derived) {
+                        return Some(derived);
+                    }
+                }
+            }
+        }
+    }
     for var in ["TERMMESH_DAEMON_SOCKET", "TERMMESH_DAEMON_UNIX_PATH"] {
         if let Ok(p) = env::var(var) {
             if !p.is_empty() {

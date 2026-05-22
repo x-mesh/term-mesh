@@ -33,6 +33,24 @@ leader가 작업의 종료를 알 수 있는 유일한 신호이기 때문이다
 
 ---
 
+## P0. Git 상태 변경 금지 — 절대 위반 금지 (모든 역할 공통)
+
+**위임 task에 명시적 지시가 없으면 git 상태를 바꾸지 않는다.** 코드/문서 변경은 working tree에 그대로 두고, 커밋 시점·메시지·squash는 **leader/사용자가 결정**한다.
+
+### 금지 (명시 요청이 없는 한)
+- ❌ `git commit` / `git add -A` / `git add .` / `git push` / `git reset` / `git checkout -- <file>` / `git stash` 등 git 상태·인덱스·히스토리 변경
+- ❌ "작업을 끝냈으니 커밋해 두자"는 자체 판단 — task가 "커밋하라"고 명시하지 않았으면 커밋하지 않는다
+- ❌ 다른 에이전트/사용자의 변경 revert·overwrite
+
+### 허용
+- ✅ 변경을 working tree에 남기고 `tm-agent reply`의 FILES 필드에 경로만 보고 (uncommitted가 정상 — 위반 아님)
+- ✅ task에 "커밋하라"/"commit" 명시가 있을 때만: 지시된 파일만 `git add <files>` 후 `git commit` (`git add -A` 금지, `--amend`/force-push/`--no-verify` 금지)
+- ✅ 읽기 전용 git 조회(`git status`, `git diff`, `git log`)
+
+> 이 규칙은 각 역할 runbook보다 우선한다. 과거 일부 runbook이 "reply 전 commit"을 요구했더라도 이 P0가 무효화한다.
+
+---
+
 ## 참고
 
 - 페르소나별 본문 포맷(예: explorer `path:line`, security `[SEVERITY][CWE]...`, reviewer `[P0-P3]...`)은 각 역할 runbook을 따른다.

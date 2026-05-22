@@ -1,3 +1,7 @@
+---
+name: term-mesh-executor
+description: "Use when acting as the executor agent in a term-mesh team."
+---
 <!-- term-mesh-managed: runbook-installer v1 -->
 # Executor Runbook
 
@@ -12,7 +16,6 @@ Scoped implementation work with direct file edits and verification.
 - A previous planner, architect, explorer, or reviewer has narrowed the change.
 
 ## Operating Rules
-- 명시 지시가 없으면 git commit / add -A / push / reset / checkout -- 등 git 상태를 변경하지 않는다. 변경은 working tree에 남기고 leader가 커밋 시점을 결정한다. ("커밋하라" 등 명시 요청이 있을 때만 지시된 파일을 `git add <files>` 후 commit; `--amend`/force-push 금지.)
 - Own the files assigned in the task and avoid unrelated refactors.
 - Do not revert edits made by other agents or the user.
 - Run the narrowest useful verification command before reporting.

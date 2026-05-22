@@ -52,6 +52,7 @@ final class TeamOrchestrator: ObservableObject {
         let leaderSessionId: String
         let leaderMode: String    // "repl", "claude", "kiro", "codex", "gemini", "adopted"
         let leaderModel: String   // e.g. "sonnet", "opus", "haiku"
+        let leaderCli: String?    // detected CLI for adopted leader; nil otherwise
         let leaderPanelId: UUID   // leader pane for sending instructions
         let leaderWorkspaceId: UUID?  // only set in "adopted" mode (leader lives in a separate workspace)
         let workingDirectory: String
@@ -484,6 +485,7 @@ final class TeamOrchestrator: ObservableObject {
             "CMUX_TEAM": teamName,
             "TERMMESH_SOCKET": socketPath,
             "CMUX_SOCKET": socketPath,
+            "TERMMESH_CLI": agentCli,
             "PATH": currentPath,
         ]
 
@@ -731,6 +733,7 @@ final class TeamOrchestrator: ObservableObject {
         leaderSessionId: String,
         leaderMode: String = "repl",
         leaderModel: String = "sonnet",
+        leaderCli: String = "claude",
         resumeSessionId: String? = nil,
         worktreeMode: String = "off",
         executionMode: String = "pane",
@@ -900,6 +903,7 @@ final class TeamOrchestrator: ObservableObject {
         // register the caller's surface as leaderPanelId and track its workspace separately.
         let leaderPanelId: UUID
         let leaderWorkspaceId: UUID?
+        var detectedLeaderCli: String? = nil
 
         if leaderMode == "adopted" {
             guard let adoptedSurfaceId = adoptedLeaderSurfaceId else {
@@ -912,8 +916,32 @@ final class TeamOrchestrator: ObservableObject {
                 Logger.team.warning("[team] adopted mode: locateSurface(surfaceId:) returned nil — leader workspace unknown, cross-workspace send may fail")
             }
             leaderPanelId = adoptedSurfaceId
+
+            // Use leader_cli parameter if provided; otherwise detect from panel displayTitle
+            if !leaderCli.isEmpty && leaderCli != "claude" {
+                detectedLeaderCli = leaderCli
+            } else {
+                // Fallback: detect adopted leader's CLI from its panel displayTitle
+                if let located = AppDelegate.shared?.locateSurface(surfaceId: adoptedSurfaceId),
+                   let workspace = located.tabManager.tabs.first(where: { $0.id == located.workspaceId }),
+                   let panel = workspace.panels[adoptedSurfaceId] as? TerminalPanel {
+                    let titleLower = panel.displayTitle.lowercased()
+                    // "gpt-" indicates an OpenAI/Codex model (e.g. "gpt-5") — treat as codex,
+                    // consistent with the isCodexLikePane title fallback. Gemini matches "gemini" only.
+                    if titleLower.contains("codex") || titleLower.contains("gpt-") {
+                        detectedLeaderCli = "codex"
+                    } else if titleLower.contains("kiro") {
+                        detectedLeaderCli = "kiro"
+                    } else if titleLower.contains("claude") {
+                        detectedLeaderCli = "claude"
+                    } else if titleLower.contains("gemini") {
+                        detectedLeaderCli = "gemini"
+                    }
+                }
+            }
+
             #if DEBUG
-            dlog("[team] adopted mode: leaderPanelId=\(adoptedSurfaceId.uuidString.prefix(8)) leaderWorkspaceId=\(leaderWorkspaceId?.uuidString.prefix(8) ?? "nil")")
+            dlog("[team] adopted mode: leaderPanelId=\(adoptedSurfaceId.uuidString.prefix(8)) leaderWorkspaceId=\(leaderWorkspaceId?.uuidString.prefix(8) ?? "nil") leaderCli=\(detectedLeaderCli ?? "nil") (from_param=\(!leaderCli.isEmpty))")
             #endif
             // The workspace's defaultPanel will serve as anchor for agent splits.
             // It will be closed after all agent panes are created.
@@ -1038,6 +1066,15 @@ final class TeamOrchestrator: ObservableObject {
 
             // Close the original empty panel
             workspace.closePanel(defaultPanelId)
+
+            // Set detectedLeaderCli for non-adopted modes
+            switch leaderMode {
+            case "claude": detectedLeaderCli = "claude"
+            case "codex": detectedLeaderCli = "codex"
+            case "kiro": detectedLeaderCli = "kiro"
+            case "gemini": detectedLeaderCli = "gemini"
+            default: detectedLeaderCli = nil
+            }
         }
 
         // Agent grid anchor: in normal mode agents split from leaderPanel;
@@ -1150,11 +1187,23 @@ final class TeamOrchestrator: ObservableObject {
                 headlessMembers.append(member)
             }
 
+            // Set detectedLeaderCli for headless modes if not already set
+            if detectedLeaderCli == nil {
+                switch leaderMode {
+                case "claude": detectedLeaderCli = "claude"
+                case "codex": detectedLeaderCli = "codex"
+                case "kiro": detectedLeaderCli = "kiro"
+                case "gemini": detectedLeaderCli = "gemini"
+                default: detectedLeaderCli = nil
+                }
+            }
+
             let team = Team(
                 id: name,
                 leaderSessionId: leaderSessionId,
                 leaderMode: leaderMode,
                 leaderModel: leaderModel,
+                leaderCli: detectedLeaderCli,
                 leaderPanelId: leaderPanelId,
                 leaderWorkspaceId: leaderWorkspaceId,
                 workingDirectory: workingDirectory,
@@ -1324,6 +1373,7 @@ final class TeamOrchestrator: ObservableObject {
             leaderSessionId: leaderSessionId,
             leaderMode: leaderMode,
             leaderModel: leaderModel,
+            leaderCli: detectedLeaderCli,
             leaderPanelId: leaderPanelId,
             leaderWorkspaceId: leaderWorkspaceId,
             workingDirectory: workingDirectory,
@@ -1501,11 +1551,30 @@ final class TeamOrchestrator: ObservableObject {
             // D3-A P1-A (extension): assign a stable teamUuid at creation so
             // archive_pane carries the same identity across destroy/resume —
             // mirrors the createTeam fix at line ~1319.
+
+            // Detect adopted leader's CLI from its panel displayTitle
+            var leaderCli: String? = nil
+            if let panel = workspace.panels[callerPanelId] as? TerminalPanel {
+                let titleLower = panel.displayTitle.lowercased()
+                // "gpt-" indicates an OpenAI/Codex model (e.g. "gpt-5") — treat as codex,
+                // consistent with the isCodexLikePane title fallback. Gemini matches "gemini" only.
+                if titleLower.contains("codex") || titleLower.contains("gpt-") {
+                    leaderCli = "codex"
+                } else if titleLower.contains("kiro") {
+                    leaderCli = "kiro"
+                } else if titleLower.contains("claude") {
+                    leaderCli = "claude"
+                } else if titleLower.contains("gemini") {
+                    leaderCli = "gemini"
+                }
+            }
+
             team = Team(
                 id: teamName,
                 leaderSessionId: "leader-attach-\(UUID().uuidString.prefix(8))",
                 leaderMode: "adopted",
                 leaderModel: "sonnet",
+                leaderCli: leaderCli,
                 leaderPanelId: callerPanelId,
                 leaderWorkspaceId: workspaceId,
                 workingDirectory: workspaceDirectory,
@@ -3715,6 +3784,7 @@ final class TeamOrchestrator: ObservableObject {
             leaderSessionId: leaderSessionId,
             leaderMode: "claude",
             leaderModel: "sonnet",
+            leaderCli: "claude",
             leaderPanelId: UUID(), // placeholder — headless team has no leader pane
             leaderWorkspaceId: workspace.id,
             workingDirectory: workingDirectory,

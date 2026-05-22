@@ -62,6 +62,20 @@ final class TeamDataStore: ObservableObject, @unchecked Sendable {
     /// daemon emits a parked-state update.
     private var parkedAgents: [String: Set<String>] = [:]
 
+    /// Watch drift finding in the leader inbox. Deduped by checkId; idempotent on post.
+    struct WatchDriftItem {
+        let checkId: String
+        let target: String
+        let driftKind: String        // "execution" | "direction"
+        let severity: String         // "high" | "medium" | "low"
+        let finding: String
+        let specClause: String
+        let timestamp: Date
+    }
+
+    /// Per-team watch drift items, keyed by checkId for deduplication.
+    private var watchDrifts: [String: [String: WatchDriftItem]] = [:]
+
     private let staleTaskThreshold: TimeInterval = 10 * 60
     private let staleHeartbeatThreshold: TimeInterval = 5 * 60
 
@@ -103,6 +117,7 @@ final class TeamDataStore: ObservableObject, @unchecked Sendable {
         heartbeats.removeValue(forKey: name)
         contextStore.removeValue(forKey: name)
         parkedAgents.removeValue(forKey: name)
+        watchDrifts.removeValue(forKey: name)
         lock.unlock()
         clearUsageUnsafe(teamName: name)
         notifyChanged()
@@ -580,6 +595,32 @@ final class TeamDataStore: ObservableObject, @unchecked Sendable {
         return (age, entry.summary, age >= Int(staleHeartbeatThreshold))
     }
 
+    // MARK: - Watch Drift Items
+
+    /// Idempotently insert/upsert a watch drift item by checkId.
+    /// Returns true if successful, false if team not found.
+    @discardableResult
+    func postWatchDrift(teamName: String, checkId: String, target: String, driftKind: String, severity: String, finding: String, specClause: String) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        guard teamRegistry[teamName] != nil else { return false }
+
+        let item = WatchDriftItem(
+            checkId: checkId,
+            target: target,
+            driftKind: driftKind,
+            severity: severity,
+            finding: finding,
+            specClause: specClause,
+            timestamp: Date()
+        )
+
+        // Idempotent upsert: replace if checkId exists, else append
+        watchDrifts[teamName, default: [:]][checkId] = item
+        notifyChanged()
+        return true
+    }
+
     // MARK: - Agent Status Enrichment (off-main data for team.status)
 
     /// Returns data-layer enrichment for a given agent, avoiding MainActor.
@@ -952,6 +993,25 @@ final class TeamDataStore: ObservableObject, @unchecked Sendable {
             ]
             if let to = message.to { item["to"] = to }
             items.append(item)
+        }
+
+        // Watch drift items (Phase 5)
+        for drift in watchDrifts[teamName, default: [:]].values {
+            let summary = "[watch:\(drift.driftKind)/\(drift.severity)] \(String(drift.finding.prefix(80)))"
+            items.append([
+                "kind": "watch_drift",
+                "priority": 2,
+                "team_name": teamName,
+                "check_id": drift.checkId,
+                "target": drift.target,
+                "drift_type": drift.driftKind,
+                "severity": drift.severity,
+                "finding": drift.finding,
+                "spec_clause": drift.specClause,
+                "age_seconds": Int(now.timeIntervalSince(drift.timestamp)),
+                "summary": summary,
+                "timestamp": ISO8601DateFormatter().string(from: drift.timestamp)
+            ])
         }
 
         items.sort {

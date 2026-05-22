@@ -28,35 +28,50 @@ User provided: $ARGUMENTS
 
 ## Routing
 
-Parse the first token of `$ARGUMENTS` and route to the matching subcommand:
+Parse the first token and route:
 
-- `review` -> [Subcommand: review] 실행
-- `on` -> [Subcommand: on] 실행
-- `off` -> [Subcommand: off] 실행
-- `status` -> [Subcommand: status] 실행
-- empty input -> help 출력 후 종료
-- unrecognized token -> valid subcommand 목록 출력 후 종료
+- `help` -> print the usage block (see below) and stop. This is the ONLY case that prints documentation.
+- `review` -> [Subcommand: review]
+- `on` -> [Subcommand: on]
+- `off` -> [Subcommand: off]
+- `status` -> [Subcommand: status]
+- empty input -> start the full interactive wizard
+- unrecognized token -> start the full interactive wizard
 
-### Empty input
+A recognized subcommand still enters the wizard for any required input it is missing, unless `--no-input` is set. Only `/watch help` prints documentation; every other invocation acts.
 
-If `$ARGUMENTS` is empty, print:
+### Interactive wizard (default)
+
+If the first token is `help`, print this usage block and stop:
 
 ```text
 /watch — stateless drift oversight
 
 Usage:
+  /watch help                    show this help
   /watch review [agent] --spec <text|@path> [--stance critic|advisor|pair]
-  /watch on [agent] --spec <text|@path> [--every 300]
-  /watch off [agent|all]
+  /watch on     [agent] --spec <text|@path> [--every 300]
+  /watch off    [agent|all]
   /watch status [agent]
 
 Responsibility:
-  /tm          fan-out dispatch
-  /tm-op pair one-shot pair round
-  /watch      oversight review/on/off/status only
+  /tm           fan-out dispatch
+  /tm-op pair   one-shot pair round
+  /watch        oversight review/on/off/status only
 ```
 
-Then stop. Do not run `tm-agent status` for empty input unless the user explicitly asks for status.
+For every other invocation (empty input, unrecognized token, or a subcommand missing required inputs), run the **full interactive wizard**. Only `/watch help` prints documentation; everything else acts.
+
+**Wizard steps** — use `AskUserQuestion`, one step at a time. Skip any step already satisfied by command-line args:
+
+1. **Action**: if no subcommand was given, ask which action — `review`, `on`, `off`, `status`.
+2. **Target agent**: ask which agent — list each worker (except leader and watcher) plus an "all workers" option. For `off`/`status`, "all" is allowed.
+3. **Spec** (review/on only): ask what to watch; accept inline text or an `@path`. Required, no default.
+4. **Stance** (review/on only): ask the lens — `critic` (default), `advisor`, `pair`.
+5. **Interval** (on only): ask the autonomous interval in seconds (default `300`).
+6. **Confirm & run**: when the wizard collected one or more values, show the resolved command and run it. If all required inputs were already supplied on the command line, run directly with NO confirmation step.
+
+Non-interactive context (`--no-input` / automation / headless): do NOT run the wizard. Require all inputs as flags; reject when a required input is missing (see each subcommand).
 
 ## Options
 
@@ -71,11 +86,17 @@ Parse common options before executing any subcommand.
 | `--every <sec>` | `300` | on only | daemon autonomous interval |
 | `--ratio <R>` | daemon default | on only | autonomous budget or sampling ratio |
 
-`review` and `on` require a spec. If no team spec exists and `--spec` is missing, reject with:
+`review` and `on` require a spec. Resolve in order: `--spec` flag, then team spec.
+
+If no spec can be resolved:
+- **Interactive (default):** do NOT reject. Prompt the user for the spec with `AskUserQuestion` (or a single direct question if the tool is unavailable): ask what to watch and accept either inline spec text or an `@path`. Use the answer as the spec for this run only; never persist it.
+- **Non-interactive (`--no-input` / automation / headless):** reject with:
 
 ```text
 REJECT: /watch review/on requires a spec. Provide --spec "<text>" or --spec @path.
 ```
+
+In the interactive wizard, prompt for every input the chosen action needs that was not supplied on the command line — including `--stance` (default `critic`) and, for `on`, `--every` (default `300`) — pre-selecting the defaults. Always respect values already passed on the command line and skip prompting for those. If all required inputs are already supplied, run directly without any prompt. Under `--no-input`, never prompt: require flags and reject when a required input is missing.
 
 `off` and `status` do not require a spec.
 
@@ -86,6 +107,10 @@ REJECT: /watch review/on requires a spec. Provide --spec "<text>" or --spec @pat
 - team spec: use the watcher/team custom instructions when already configured.
 
 Never expand the spec into persistent watcher context. Every check gets a fresh prompt containing only the resolved spec and bounded recent delta.
+
+### Task-format override
+
+The watch spec is the default oversight contract, not a higher-priority output schema. If the leader's current task capsule gives a more specific output format, severity taxonomy, review lens, file scope, or verify command, that task instruction wins for that task. Do not count the format difference itself as drift. Example: if a reviewer spec says `P0-P3 + VERDICT` but the active review task explicitly requires security-lens findings as `[SEVERITY]`, the watcher must treat `[SEVERITY]` as an allowed task-format override and only flag real scope, safety, or correctness drift.
 
 ### Stance lens
 
@@ -111,7 +136,7 @@ On-demand stateless check. If `[agent]` is omitted, review all worker agents exc
 
    - If no team exists, reject and ask the user to create/adopt a team first.
    - If `[agent]` is provided, verify that agent exists and is not the watcher.
-   - If `[agent]` is omitted, target all worker agents except leader and watcher.
+   - If `[agent]` is omitted: in **interactive** mode, prompt with `AskUserQuestion` to choose the target — list each worker agent (except leader and watcher) as an option plus an "all workers" option (default). In **non-interactive** mode, target all worker agents except leader and watcher.
    - Verify a watcher agent exists. If missing, stop with:
 
    ```text
@@ -208,8 +233,8 @@ Enable daemon autonomous watch for one target or all workers. This is no longer 
 
 ### Flow
 
-1. Validate spec exactly as `review` does. Reject if no team spec or `--spec` is available.
-2. Resolve `[agent]` to a single target or `all` workers. Do not create or remove panes.
+1. Resolve and validate the spec exactly as `review` does, including the interactive spec prompt when it is missing (reject only in non-interactive mode).
+2. Resolve `[agent]` to a single target or `all` workers. Do not create or remove panes. If `[agent]` is omitted: in **interactive** mode, prompt with `AskUserQuestion` to choose the target (same choices as `review`); in **non-interactive** mode, default to all workers. If `--stance` or `--every` were omitted: in interactive mode prompt for them (defaults `critic` / `300`); under `--no-input` apply the defaults silently.
 3. Execute the daemon watch primitive:
 
    ```bash
@@ -296,6 +321,54 @@ If `.xm/watch/board.jsonl` is missing, print `DRIFT_COUNT_THIS_SESSION: 0`. If d
 10. **Do not let autonomous ticks steal focus or overlap indefinitely.** daemon ticks run in the background, obey `--every`/budget guards, and skip overruns while a check is `in_flight`.
 
 ## Examples
+
+### Recommended spec template
+
+Use a spec that states the stable contract, but explicitly leaves room for task-specific output formats:
+
+```text
+# Watch Spec
+Goal: <what the watcher must protect>
+Default lens: <critic|advisor|pair expectations>
+Default output: <baseline verdict shape, e.g. VERDICT/DRIFT_TYPE/SEVERITY/FINDING/SPEC_CLAUSE>
+Task override: if the leader's current task capsule specifies a more specific output format, severity taxonomy, review lens, file scope, or verify command, obey the task capsule for that task. Do not record drift for format differences alone.
+Count as drift: <ignored errors, false success, scope escape, forbidden side effects, unsafe behavior>
+Do not count as drift: <task-format override, explicitly read-only behavior, intentionally narrower scope>
+Reporting: leader-only structured verdict. The watcher never edits code, messages watched agents, or writes `.xm/watch/board.jsonl`.
+```
+
+Reviewer spec example:
+
+```text
+Goal: keep code review focused on regressions that matter.
+Default lens: prioritize P0-P3 bugs, behavioral regressions, missing tests, and incorrect verification.
+Default output: findings first with file:line and VERDICT.
+Task override: task-specific review lenses and output schemas are allowed. If the leader asks for security findings as [SEVERITY] or another taxonomy, treat that format as compliant and judge only the substance.
+Count as drift: reviewing unrelated files, inventing findings, ignoring failed tests, or reporting success without evidence.
+Do not count as drift: using a task-requested severity schema instead of P0-P3.
+```
+
+Executor spec example:
+
+```text
+Goal: keep implementation scoped and verified.
+Default lens: confirm changed files match the task, tests/builds are run or blockers are explicit, and no unrelated refactor lands.
+Default output: changed files, verify command, result, next action.
+Task override: if the task capsule names exact files, verification commands, or a different report header, prefer that task contract for this run.
+Count as drift: editing outside scope, skipping required verify, hiding failures, or committing when forbidden.
+Do not count as drift: stopping at read-only analysis when the task says read-only.
+```
+
+Security spec example:
+
+```text
+Goal: catch security regressions introduced or worsened by the target diff.
+Default lens: command injection, path traversal, socket/auth boundary, secret exposure, unsafe process/env handling.
+Default output: severity, file:line, evidence snippet, fix.
+Task override: if the task capsule defines a severity format such as [SEVERITY] or limits findings to Medium+, use that task-specific taxonomy and threshold.
+Count as drift: reporting pre-existing Low issues as blocking, missing a new exploitable path, or exposing secrets in the report.
+Do not count as drift: omitting Low findings when the task asks for Medium+ only.
+```
 
 ### On-demand review of one agent
 

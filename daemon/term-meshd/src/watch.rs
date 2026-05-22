@@ -173,6 +173,9 @@ fn now_unix() -> u64 {
 /// `working_dir` — so editing the spec file changes the next check's oversight
 /// contract. A missing/empty/unreadable file is an `Err` (the caller skips the
 /// tick with `last_error`, no board/inbox side effect).
+///
+/// Security (F2): absolute paths, `..`, and symlink escapes are rejected.
+/// File size is capped at 64 KiB.
 pub(crate) fn resolve_spec(spec: &str, working_dir: &str) -> Result<String, String> {
     let Some(path) = spec.strip_prefix('@') else {
         return Ok(spec.to_string());
@@ -181,16 +184,55 @@ pub(crate) fn resolve_spec(spec: &str, working_dir: &str) -> Result<String, Stri
     if path.is_empty() {
         return Err("empty @path".to_string());
     }
+
     let candidate = std::path::Path::new(path);
-    let full = if candidate.is_absolute() {
-        candidate.to_path_buf()
-    } else {
-        std::path::Path::new(working_dir).join(candidate)
-    };
-    let content = std::fs::read_to_string(&full)
-        .map_err(|e| format!("read {}: {e}", full.display()))?;
+
+    // Reject absolute paths.
+    if candidate.is_absolute() {
+        return Err(format!("absolute paths not allowed: {path}"));
+    }
+
+    // Reject paths containing ".." components (parent dir traversal).
+    if candidate.components().any(|c| c == std::path::Component::ParentDir) {
+        return Err(format!("parent dir (..) not allowed in spec path: {path}"));
+    }
+
+    // Canonicalize working_dir to resolve symlinks.
+    let working_canonical = std::fs::canonicalize(working_dir)
+        .map_err(|e| format!("working_dir canonicalize: {e}"))?;
+
+    // Join and canonicalize the full path.
+    let full_path = working_canonical.join(path);
+    let full_canonical = std::fs::canonicalize(&full_path)
+        .map_err(|e| format!("canonicalize {}: {e}", full_path.display()))?;
+
+    // Enforce that the resolved path is under working_dir (symlink escape check).
+    if !full_canonical.starts_with(&working_canonical) {
+        return Err(format!(
+            "spec path {} escapes working_dir {}",
+            full_canonical.display(),
+            working_canonical.display()
+        ));
+    }
+
+    let metadata = std::fs::metadata(&full_canonical)
+        .map_err(|e| format!("stat {}: {e}", full_canonical.display()))?;
+
+    // Enforce file size cap (64 KiB).
+    const MAX_SPEC_SIZE: u64 = 64 * 1024;
+    if metadata.len() > MAX_SPEC_SIZE {
+        return Err(format!(
+            "spec file {} too large: {} bytes (max {})",
+            full_canonical.display(),
+            metadata.len(),
+            MAX_SPEC_SIZE
+        ));
+    }
+
+    let content = std::fs::read_to_string(&full_canonical)
+        .map_err(|e| format!("read {}: {e}", full_canonical.display()))?;
     if content.trim().is_empty() {
-        return Err(format!("spec file {} is empty", full.display()));
+        return Err(format!("spec file {} is empty", full_canonical.display()));
     }
     Ok(content)
 }
@@ -541,5 +583,57 @@ mod tests {
         assert_eq!(a, b, "same identity → same id");
         assert_ne!(a, c, "different target → different id");
         assert_eq!(a.len(), 16);
+    }
+
+    #[test]
+    fn resolve_spec_rejects_absolute_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let result = resolve_spec("@/etc/passwd", dir.path().to_str().unwrap());
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("absolute paths not allowed"));
+    }
+
+    #[test]
+    fn resolve_spec_rejects_parent_dir_escape() {
+        let dir = tempfile::tempdir().unwrap();
+        let workdir = dir.path().to_string_lossy();
+        // Attempt to escape via .. → should be caught by component check
+        let result = resolve_spec("@../../../etc/passwd", &workdir);
+        assert!(result.is_err(), "escape attempt should fail");
+        assert!(result.unwrap_err().contains("parent dir (..) not allowed"));
+    }
+
+    #[test]
+    fn resolve_spec_accepts_valid_relative_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let spec_file = dir.path().join("spec.txt");
+        std::fs::write(&spec_file, "valid spec content").unwrap();
+
+        let workdir = dir.path().to_string_lossy();
+        let result = resolve_spec("@spec.txt", &workdir);
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), "valid spec content");
+    }
+
+    #[test]
+    fn resolve_spec_rejects_oversized_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let spec_file = dir.path().join("huge.txt");
+        // Create a file > 64 KiB
+        let huge_content = "x".repeat(65 * 1024);
+        std::fs::write(&spec_file, huge_content).unwrap();
+
+        let workdir = dir.path().to_string_lossy();
+        let result = resolve_spec("@huge.txt", &workdir);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("too large"));
+    }
+
+    #[test]
+    fn resolve_spec_rejects_nonexistent_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let workdir = dir.path().to_string_lossy();
+        let result = resolve_spec("@nonexistent.txt", &workdir);
+        assert!(result.is_err());
     }
 }

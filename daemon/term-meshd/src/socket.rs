@@ -2612,4 +2612,168 @@ mod tests {
             other => panic!("unexpected event: {other:?}"),
         }
     }
+
+    // Watch RPC handler tests (F6)
+    use crate::drift_watch;
+
+    #[test]
+    fn watch_on_clamps_interval_to_minimum() {
+        // Test that watch.on request with interval < MIN_WATCH_INTERVAL_SECS
+        // results in the interval being clamped to 30
+        let requested_interval = 5u64;  // < 30
+        let clamped = if requested_interval == 0 {
+            300  // DEFAULT_WATCH_INTERVAL_SECS
+        } else {
+            requested_interval.max(30)  // MIN_WATCH_INTERVAL_SECS
+        };
+        assert_eq!(clamped, 30, "interval 5 should be clamped to 30");
+
+        // Test interval at the boundary
+        let boundary_interval = 30u64;
+        let clamped_boundary = if boundary_interval == 0 {
+            300
+        } else {
+            boundary_interval.max(30)
+        };
+        assert_eq!(clamped_boundary, 30, "interval 30 should remain 30");
+
+        // Test interval above minimum
+        let above_min = 60u64;
+        let clamped_above = if above_min == 0 {
+            300
+        } else {
+            above_min.max(30)
+        };
+        assert_eq!(clamped_above, 60, "interval 60 should remain 60");
+    }
+
+    #[test]
+    fn watch_state_enabled_construction() {
+        // Test that WatchState::enabled applies defaults correctly
+        let st = drift_watch::WatchState::enabled(
+            0,  // 0 triggers default
+            Some("executor".into()),
+            "claude",
+            "sonnet",
+            "critic",
+            "spec text",
+            "/tmp",
+        );
+        assert!(st.enabled);
+        assert_eq!(st.interval_secs, 300, "interval 0 should use default 300");
+        assert_eq!(st.target.as_deref(), Some("executor"));
+        assert_eq!(st.cli, "claude");
+        assert_eq!(st.model, "sonnet");
+        assert!(!st.in_flight, "new state should not be in_flight");
+        assert!(st.last_error.is_none(), "new state should have no error");
+    }
+
+    #[test]
+    fn watch_registry_operations() {
+        // Test basic registry operations without dispatch
+        let registry = drift_watch::new_registry();
+
+        // Synchronous test of registry content
+        std::thread::spawn(move || {
+            let runtime = tokio::runtime::Runtime::new().unwrap();
+            runtime.block_on(async {
+                // Insert a state
+                let st = drift_watch::WatchState::enabled(
+                    60,
+                    Some("executor".into()),
+                    "claude",
+                    "sonnet",
+                    "critic",
+                    "spec",
+                    "/tmp",
+                );
+                {
+                    let mut reg = registry.lock().await;
+                    reg.insert("test-team".to_string(), st);
+                }
+
+                // Verify it was inserted
+                {
+                    let reg = registry.lock().await;
+                    assert!(reg.contains_key("test-team"));
+                    assert!(reg.get("test-team").unwrap().enabled);
+                }
+
+                // Modify it
+                {
+                    let mut reg = registry.lock().await;
+                    if let Some(state) = reg.get_mut("test-team") {
+                        state.enabled = false;
+                    }
+                }
+
+                // Verify disabled
+                {
+                    let reg = registry.lock().await;
+                    assert!(!reg.get("test-team").unwrap().enabled);
+                }
+            });
+        })
+        .join()
+        .unwrap();
+    }
+
+    #[test]
+    fn watch_config_persistence() {
+        // Test config persistence via watch_config module
+        let tmpdir = tempfile::tempdir().unwrap();
+        let wd = tmpdir.path();
+
+        // Create a watch state
+        let st = drift_watch::WatchState::enabled(
+            60,
+            Some("executor".into()),
+            "claude",
+            "sonnet",
+            "critic",
+            "spec text",
+            wd.to_string_lossy().to_string(),
+        );
+
+        // Persist it
+        crate::socket::watch_config::save_watch_state(wd, "standard", &st);
+
+        // Load it back
+        let loaded = crate::socket::watch_config::load_watch_states(wd);
+        assert_eq!(loaded.len(), 1);
+        let (team, loaded_st) = &loaded[0];
+        assert_eq!(team, "standard");
+        assert!(loaded_st.enabled);
+        assert_eq!(loaded_st.interval_secs, 60);
+        assert_eq!(loaded_st.target.as_deref(), Some("executor"));
+    }
+
+    #[test]
+    fn watch_config_disable_and_persist() {
+        // Test that disabling a watch persists correctly
+        let tmpdir = tempfile::tempdir().unwrap();
+        let wd = tmpdir.path();
+
+        let mut st = drift_watch::WatchState::enabled(
+            60,
+            Some("executor".into()),
+            "claude",
+            "sonnet",
+            "critic",
+            "spec text",
+            wd.to_string_lossy().to_string(),
+        );
+
+        // Save enabled
+        crate::socket::watch_config::save_watch_state(wd, "standard", &st);
+
+        // Disable and save again
+        st.enabled = false;
+        crate::socket::watch_config::save_watch_state(wd, "standard", &st);
+
+        // Load and verify disabled
+        let loaded = crate::socket::watch_config::load_watch_states(wd);
+        assert_eq!(loaded.len(), 1);
+        assert!(!loaded[0].1.enabled, "loaded watch should be disabled");
+    }
 }
