@@ -574,11 +574,20 @@ tm-agent collect --lines 100 | grep -E "^(STATUS|NEXT):"
 cat ~/.term-mesh/results/my-team/<agent>-reply.md | head -5
 ```
 
-## E2E mac UI tests
+## E2E tests
 
-Run UI tests on the UTM macOS VM (never on the host machine). Always run e2e UI tests via `ssh term-mesh-vm`:
+term-mesh has two e2e layers. **Default to socket e2e**; reserve XCUITest for what the socket can't reach.
+
+- **Socket e2e (`tests_v2/` via `termmesh.py`)** — the standard for app logic, layout, focus, splits, workspaces, browser, notifications, CLI parity, and regressions. Authoring/running rules live in **[`tests/CLAUDE.md`](tests/CLAUDE.md)** (single source of truth; auto-loads when working in `tests/` or `tests_v2/`). New tests go in `tests_v2/`.
+- **XCUITest (`termMeshUITests/`)** — only for OS-level key routing, menu key-equivalents, system dialogs, and Accessibility-driven interaction.
+
+Run on the UTM macOS VM (never the host). Always via `ssh term-mesh-vm`:
 
 ```bash
+# Socket e2e suites (VM-only, guarded to user `term-mesh`)
+ssh term-mesh-vm 'cd /Users/jinwoo/term-mesh/GhosttyTabs && ./scripts/run-tests-v2.sh'
+
+# XCUITest example
 ssh term-mesh-vm 'cd /Users/jinwoo/term-mesh/GhosttyTabs && xcodebuild -project GhosttyTabs.xcodeproj -scheme term-mesh -configuration Debug -destination "platform=macOS" -only-testing:termMeshUITests/UpdatePillUITests test'
 ```
 
