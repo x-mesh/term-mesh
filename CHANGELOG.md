@@ -4,7 +4,7 @@ All notable changes to term-mesh are documented here.
 
 ## [Unreleased]
 
-## [0.128.0] - 2026-05-20
+## [0.129.0] - 2026-05-22
 
 ### Added
 - **Watcher — 에이전트 drift 감시(페어 프로그래밍)** — 매번 새 컨텍스트로 동작하는 watcher가 spec과 대상 에이전트의 최근 작업을 대조해 **execution drift**(작업을 잘못 수행 — 오류 무시·스코프 이탈·잘못된 파일 수정)와 **direction drift**(애초에 잘못된 작업 수행)를 잡아 리더에게 보고한다. 장시간 에이전트 세션이 조용히 이탈하는 문제를 사람이 일일이 지켜보지 않아도 잡아낸다.
@@ -15,9 +15,17 @@ All notable changes to term-mesh are documented here.
 ### Changed
 - **Peer-relay 워크스페이스 분할의 최소 패널 크기 보장** — peer-relay 워크스페이스 창에서 디바이더를 드래그해 패널을 지나치게 작게 줄이거나 접어버릴 수 없도록 최소 패널 크기(100pt, 컨테이너 절반 상한)를 적용. 패널이 사실상 사라져 내용을 못 보던 문제 해소.
 
+### Fixed
+- **connect-to-peer(원격 워크스페이스) 창에서 shift+enter가 줄바꿈 대신 입력을 바로 제출하던 문제** — 원격에 연결한 창에서 Claude·Codex 등 멀티라인 입력창에 shift+enter로 줄바꿈을 넣으려 해도 입력이 즉시 제출되던 문제를 수정. peer-relay가 shift+enter를 LF로 전달하면 호스트가 이를 일반 Return으로 재생하던 것이 원인이었고, 이제 Shift+Return으로 재생해 호스트가 줄바꿈으로 처리한다. 호스트 측 동작이므로 **연결 대상(원격) 피어도 이 버전 이상이어야 적용**된다.
+
 ### Thanks to 1 contributor!
 
 - [@JINWOO-J](https://github.com/JINWOO-J)
+
+## [0.128.0] - 2026-05-20
+
+### Changed
+- 내부 유지보수 릴리즈 — 저장소 슬러그 정정 등 내부 정비. 사용자 화면에 보이는 변경 없음.
 
 ## [0.127.0] - 2026-05-20
 
