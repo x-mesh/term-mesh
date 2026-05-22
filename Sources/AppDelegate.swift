@@ -310,6 +310,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
             PostHogAnalytics.shared.startIfNeeded()
             brewSelfUpdater.bridgeToPill(updateViewModel)
             brewSelfUpdater.start()
+            // Attach layout/hang census to the Sentry scope so AppHang events
+            // (TERM-MESH-1D) carry the constraint count + culprit host. See
+            // LayoutHangDiagnostics.
+            LayoutHangDiagnostics.start()
         }
 
         // UI tests frequently time out waiting for the main window if we do heavyweight
