@@ -247,6 +247,13 @@ the original Claude slash commands.
 | `/team-up ...` | `/team-up ...` via IME alias | Create a team with the current pane adopted as leader |
 | `/tm "..."` | `/tm "..."` via IME alias | One-shot fan-out to all idle agents + synthesis |
 | `/tm-op ...` | `/tm-op ...` via IME alias | Strategy orchestration |
+| `/tm-bench ...` | `/tm-bench ...` via IME alias | Agent team communication benchmark |
+| `/watch ...` | `/watch ...` via IME alias | Stateless drift oversight toggle/review |
+
+The IME alias map lives in `imeSlashCommandAliases()` (`Sources/GhosttySurfaceScrollView.swift`);
+each alias points at a `.codex/prompts/<name>.md` shim. Claude-side equivalents are bundled +
+installed via `scripts/copy-claude-commands.sh` (build phase) and `ClaudeCommandInstaller.swift`
+(runtime). Adding a leader command means touching all of these in lockstep.
 
 For Codex as the current leader, prefer:
 

@@ -1,16 +1,25 @@
 #!/bin/bash
 # Copy Claude slash commands and skills to app bundle with managed-file markers.
 #
+# Invoked from the Xcode "Run Script" build phase (see GhosttyTabs.xcodeproj/project.pbxproj).
+# This is the SINGLE source of truth for which commands/skills ship in the .app bundle;
+# do not re-inline this logic into the build phase.
+#
+# Requires these build-phase env vars: SRCROOT, TARGET_BUILD_DIR, UNLOCALIZED_RESOURCES_FOLDER_PATH.
+#
 # This script prepends a "<!-- term-mesh-managed: ... -->" marker to each file.
 # ClaudeCommandInstaller.swift checks this marker at runtime:
 # - Files WITH the marker in ~/.claude/{commands,skills}/ are overwritten on app update.
 # - Files WITHOUT the marker are treated as user-customized and preserved.
 #
 # NOTE: The bundled files will differ from the source files by 1 line (the marker).
-# Source of truth: .claude/commands/ and .claude/skills/ in the git repo.
+# Source of truth for the file contents: .claude/commands/ and .claude/skills/ in the git repo.
 #
-# IMPORTANT: When adding a new command/skill that should be distributed with the app,
-# add its filename to the arrays below.
+# IMPORTANT: When adding a new command that should be distributed AND installed for users,
+# update all three in lockstep:
+#   1. the COMMANDS array below (bundles it into the .app)
+#   2. ClaudeCommandInstaller.swift managedCommandNames (installs/overwrites ~/.claude/commands)
+#   3. .codex/prompts/<name>.md + imeSlashCommandAliases() (Codex IME alias), if Codex needs it too
 set -euo pipefail
 
 SRC_CMDS="${SRCROOT}/.claude/commands"
