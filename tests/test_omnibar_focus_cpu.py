@@ -13,7 +13,7 @@ This test opens a browser panel, triggers Cmd+L, and asserts that CPU stays
 below threshold for a few seconds afterward.
 
 Requires:
-  - cmux running (debug build)
+  - termmesh running (debug build)
 """
 
 import os
@@ -31,11 +31,11 @@ MONITOR_DURATION_S = 3.0
 SAMPLE_INTERVAL_S = 0.5
 
 
-def get_cmux_pid() -> int | None:
-    socket_path = os.environ.get("CMUX_SOCKET_PATH")
+def get_termmesh_pid() -> int | None:
+    socket_path = os.environ.get("TERMMESH_SOCKET_PATH")
     if not socket_path:
         try:
-            socket_path = cmux().socket_path
+            socket_path = termmesh().socket_path
         except Exception:
             socket_path = None
 
@@ -57,12 +57,12 @@ def get_cmux_pid() -> int | None:
                     return pid
 
     result = subprocess.run(
-        ["pgrep", "-f", r"cmux\.app/Contents/MacOS/cmux$"],
+        ["pgrep", "-f", r"termmesh\.app/Contents/MacOS/termmesh$"],
         capture_output=True, text=True,
     )
     if result.returncode != 0:
         result = subprocess.run(
-            ["pgrep", "-f", r"cmux DEV\.app/Contents/MacOS/cmux"],
+            ["pgrep", "-f", r"termmesh DEV\.app/Contents/MacOS/termmesh"],
             capture_output=True, text=True,
         )
     if result.returncode != 0:
@@ -98,12 +98,12 @@ def main() -> int:
     print("Omnibar Cmd+L Focus CPU Regression Test")
     print("=" * 60)
 
-    pid = get_cmux_pid()
+    pid = get_termmesh_pid()
     if pid is None:
-        print("\nSKIP: cmux is not running")
+        print("\nSKIP: termmesh is not running")
         return 0
 
-    client = cmux()
+    client = termmesh()
     client.connect()
 
     try:
@@ -164,7 +164,7 @@ def main() -> int:
             sample_text = sample.stdout + sample.stderr
             if "updateNSView" in sample_text or "makeFirstResponder" in sample_text:
                 print("  Confirmed: sample shows updateNSView / makeFirstResponder loop")
-            sample_path = f"/tmp/cmux_omnibar_focus_cpu_{pid}.txt"
+            sample_path = f"/tmp/term-mesh_omnibar_focus_cpu_{pid}.txt"
             with open(sample_path, "w") as f:
                 f.write(sample_text)
             print(f"  Sample saved to {sample_path}")

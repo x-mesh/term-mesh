@@ -15,7 +15,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 from termmesh import termmesh, termmeshError
 
 
-SOCKET_PATH = os.environ.get("CMUX_SOCKET", "/tmp/cmux-debug.sock")
+SOCKET_PATH = os.environ.get("TERMMESH_SOCKET", "/tmp/term-mesh-debug.sock")
 
 
 def _wait_until(predicate, timeout_s=4.0, interval_s=0.04, message="timeout"):
@@ -24,7 +24,7 @@ def _wait_until(predicate, timeout_s=4.0, interval_s=0.04, message="timeout"):
         if predicate():
             return
         time.sleep(interval_s)
-    raise cmuxError(message)
+    raise termmeshError(message)
 
 
 def _palette_visible(client, window_id):
@@ -79,7 +79,7 @@ def _open_palette(client, window_id):
 
 
 def main():
-    with cmux(SOCKET_PATH) as client:
+    with termmesh(SOCKET_PATH) as client:
         client.activate_app()
         time.sleep(0.2)
 

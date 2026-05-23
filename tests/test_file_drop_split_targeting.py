@@ -42,7 +42,7 @@ def surface_ids_from_layout(layout: dict):
 
 
 def main() -> int:
-    with cmux() as client:
+    with termmesh() as client:
         try:
             client.activate_app()
         except Exception:

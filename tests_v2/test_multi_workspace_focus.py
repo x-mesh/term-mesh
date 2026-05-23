@@ -10,7 +10,7 @@ workspaces via bonsplit's isInteractive flag.
 
 Bug 2 (webview click focus): Clicking inside a WKWebView didn't focus the browser
 tab because AppKit delivers the click to WKWebView, not to the SwiftUI Color.clear
-overlay used for focus tracking. Fix: CmuxWebView.mouseDown posts a notification
+overlay used for focus tracking. Fix: TermMeshWebView.mouseDown posts a notification
 that BrowserPanelView listens for to call onRequestPanelFocus().
 
 This test validates:
@@ -34,7 +34,7 @@ MARKER_DIR = Path(tempfile.gettempdir())
 
 
 def _marker(name: str) -> Path:
-    return MARKER_DIR / f"cmux_mwf_{name}_{os.getpid()}"
+    return MARKER_DIR / f"termmesh_mwf_{name}_{os.getpid()}"
 
 
 def _clear(marker: Path):

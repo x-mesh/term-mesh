@@ -9,7 +9,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 from termmesh import termmesh, termmeshError
 
 
-SOCKET_PATH = os.environ.get("CMUX_SOCKET", "/tmp/cmux-debug.sock")
+SOCKET_PATH = os.environ.get("TERMMESH_SOCKET", "/tmp/term-mesh-debug.sock")
 
 # Methods expected to be present in system.capabilities for the browser v2 surface.
 EXPECTED_BROWSER_METHODS = {
@@ -119,22 +119,22 @@ WKWEBVIEW_NOT_SUPPORTED = {
 
 def _must(cond: bool, msg: str) -> None:
     if not cond:
-        raise cmuxError(msg)
+        raise termmeshError(msg)
 
 
-def _expect_not_supported(c: cmux, method: str, params: dict) -> None:
+def _expect_not_supported(c: termmesh, method: str, params: dict) -> None:
     try:
         c._call(method, params)
-    except cmuxError as exc:
+    except termmeshError as exc:
         text = str(exc)
         if "not_supported" in text:
             return
-        raise cmuxError(f"Expected not_supported for {method}, got: {text}")
-    raise cmuxError(f"Expected not_supported for {method}, but call succeeded")
+        raise termmeshError(f"Expected not_supported for {method}, got: {text}")
+    raise termmeshError(f"Expected not_supported for {method}, but call succeeded")
 
 
 def main() -> int:
-    with cmux(SOCKET_PATH) as c:
+    with termmesh(SOCKET_PATH) as c:
         caps = c.capabilities() or {}
         methods = set(caps.get("methods") or [])
 

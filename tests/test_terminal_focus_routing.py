@@ -9,7 +9,7 @@ routed elsewhere).
 This test validates:
   1) The focused terminal is actually first responder (`is_terminal_focused`).
   2) Text insertion via debug socket (`simulate_type`) lands in the expected terminal by writing
-     $CMUX_SURFACE_ID to a temp file.
+     $TERMMESH_SURFACE_ID to a temp file.
 """
 
 import os
@@ -21,16 +21,16 @@ sys.path.insert(0, str(Path(__file__).parent))
 from termmesh import termmesh, termmeshError
 
 
-SOCKET_PATH = os.environ.get("CMUX_SOCKET", "/tmp/cmux-debug.sock")
-FOCUS_FILE = Path("/tmp/cmux_focus_routing.txt")
+SOCKET_PATH = os.environ.get("TERMMESH_SOCKET", "/tmp/term-mesh-debug.sock")
+FOCUS_FILE = Path("/tmp/term-mesh_focus_routing.txt")
 
 
-def _focused_surface_id(c: cmux) -> str:
+def _focused_surface_id(c: termmesh) -> str:
     surfaces = c.list_surfaces()
     for _, sid, focused in surfaces:
         if focused:
             return sid
-    raise cmuxError(f"No focused surface in list_surfaces: {surfaces}")
+    raise termmeshError(f"No focused surface in list_surfaces: {surfaces}")
 
 
 def _wait_for_file_content(path: Path, timeout_s: float = 3.0) -> str:
@@ -44,19 +44,19 @@ def _wait_for_file_content(path: Path, timeout_s: float = 3.0) -> str:
             if data:
                 return data
         time.sleep(0.05)
-    raise cmuxError(f"Timed out waiting for file content: {path}")
+    raise termmeshError(f"Timed out waiting for file content: {path}")
 
 
-def _wait_for_terminal_focus(c: cmux, panel_id: str, timeout_s: float = 6.0) -> None:
+def _wait_for_terminal_focus(c: termmesh, panel_id: str, timeout_s: float = 6.0) -> None:
     start = time.time()
     while time.time() - start < timeout_s:
         if c.is_terminal_focused(panel_id):
             return
         time.sleep(0.05)
-    raise cmuxError(f"Timed out waiting for terminal focus: {panel_id}")
+    raise termmeshError(f"Timed out waiting for terminal focus: {panel_id}")
 
 
-def _focus_and_wait(c: cmux, panel_id: str, *, total_timeout_s: float = 8.0) -> None:
+def _focus_and_wait(c: termmesh, panel_id: str, *, total_timeout_s: float = 8.0) -> None:
     """
     Focus can be racy under split/tree churn. Re-issue focus a few times before failing.
     """
@@ -83,10 +83,10 @@ def _focus_and_wait(c: cmux, panel_id: str, *, total_timeout_s: float = 8.0) -> 
             last_err = e
             time.sleep(0.15)
 
-    raise cmuxError(f"Failed to focus terminal surface (panel_id={panel_id}): {last_err}")
+    raise termmeshError(f"Failed to focus terminal surface (panel_id={panel_id}): {last_err}")
 
 
-def _assert_routed_to_surface(c: cmux, expected_surface_id: str, panel_id: str) -> None:
+def _assert_routed_to_surface(c: termmesh, expected_surface_id: str, panel_id: str) -> None:
     last_actual = "<empty>"
     for attempt in range(4):
         _focus_and_wait(c, panel_id, total_timeout_s=4.0)
@@ -97,24 +97,24 @@ def _assert_routed_to_surface(c: cmux, expected_surface_id: str, panel_id: str) 
                 pass
 
         # Write the currently focused surface id into a well-known file.
-        c.simulate_type(f"echo $CMUX_SURFACE_ID > {FOCUS_FILE}")
+        c.simulate_type(f"echo $TERMMESH_SURFACE_ID > {FOCUS_FILE}")
         c.simulate_shortcut("enter")
         try:
             actual = _wait_for_file_content(FOCUS_FILE, timeout_s=3.0 + (attempt * 0.5))
-        except cmuxError:
+        except termmeshError:
             actual = ""
         if actual == expected_surface_id:
             return
         last_actual = actual or "<empty>"
         time.sleep(0.15)
 
-    raise cmuxError(
+    raise termmeshError(
         f"Input routed to wrong surface after retries: expected={expected_surface_id} actual={last_actual}"
     )
 
 
 def main() -> int:
-    with cmux(SOCKET_PATH) as c:
+    with termmesh(SOCKET_PATH) as c:
         # Isolate from any user workspace state.
         c.new_workspace()
         time.sleep(0.2)
@@ -130,7 +130,7 @@ def main() -> int:
 
         surfaces = c.list_surfaces()
         if not surfaces:
-            raise cmuxError("Expected at least one surface after new_workspace")
+            raise termmeshError("Expected at least one surface after new_workspace")
         left_id = surfaces[0][1]
 
         # Create a split to the right (this may trigger bonsplit reparenting/structural updates).

@@ -238,7 +238,7 @@ def main() -> int:
     socket_path = termmesh.DEFAULT_SOCKET_PATH
     if not os.path.exists(socket_path):
         print(f"SKIP: Socket not found at {socket_path}")
-        print("Tip: start term-mesh first (or set TERMMESH_SOCKET_PATH / CMUX_TAG).")
+        print("Tip: start term-mesh first (or set TERMMESH_SOCKET_PATH / TERMMESH_TAG).")
         return 0
 
     bundle_id = os.environ.get("TERMMESH_BUNDLE_ID") or "com.termmesh.app.debug"

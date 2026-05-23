@@ -13,7 +13,7 @@ Test categories:
   8. Split pane cross-delivery
 
 Usage:
-    CMUX_SOCKET=/tmp/term-mesh.sock python3 tests/test_enter_comprehensive.py
+    TERMMESH_SOCKET=/tmp/term-mesh.sock python3 tests/test_enter_comprehensive.py
 """
 
 import os
@@ -437,8 +437,8 @@ def test_verify_screen_output(client):
 
 def main() -> int:
     socket_path = (
-        os.environ.get("CMUX_SOCKET")
-        or os.environ.get("CMUX_SOCKET_PATH")
+        os.environ.get("TERMMESH_SOCKET")
+        or os.environ.get("TERMMESH_SOCKET_PATH")
         or None
     )
 

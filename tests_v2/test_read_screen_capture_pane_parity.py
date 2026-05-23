@@ -14,12 +14,12 @@ sys.path.insert(0, str(Path(__file__).parent))
 from termmesh import termmesh, termmeshError
 
 
-SOCKET_PATH = os.environ.get("CMUX_SOCKET", "/tmp/cmux-debug.sock")
+SOCKET_PATH = os.environ.get("TERMMESH_SOCKET", "/tmp/term-mesh-debug.sock")
 
 
 def _must(cond: bool, msg: str) -> None:
     if not cond:
-        raise cmuxError(msg)
+        raise termmeshError(msg)
 
 
 def _wait_for(pred: Callable[[], bool], timeout_s: float = 5.0, step_s: float = 0.05) -> None:
@@ -28,23 +28,23 @@ def _wait_for(pred: Callable[[], bool], timeout_s: float = 5.0, step_s: float = 
         if pred():
             return
         time.sleep(step_s)
-    raise cmuxError("Timed out waiting for condition")
+    raise termmeshError("Timed out waiting for condition")
 
 
 def _find_cli_binary() -> str:
-    env_cli = os.environ.get("CMUXTERM_CLI")
+    env_cli = os.environ.get("TERMMESH_CLI")
     if env_cli and os.path.isfile(env_cli) and os.access(env_cli, os.X_OK):
         return env_cli
 
-    fixed = os.path.expanduser("~/Library/Developer/Xcode/DerivedData/cmux-tests-v2/Build/Products/Debug/cmux")
+    fixed = os.path.expanduser("~/Library/Developer/Xcode/DerivedData/termmesh-tests-v2/Build/Products/Debug/termmesh")
     if os.path.isfile(fixed) and os.access(fixed, os.X_OK):
         return fixed
 
-    candidates = glob.glob(os.path.expanduser("~/Library/Developer/Xcode/DerivedData/**/Build/Products/Debug/cmux"), recursive=True)
-    candidates += glob.glob("/tmp/cmux-*/Build/Products/Debug/cmux")
+    candidates = glob.glob(os.path.expanduser("~/Library/Developer/Xcode/DerivedData/**/Build/Products/Debug/termmesh"), recursive=True)
+    candidates += glob.glob("/tmp/term-mesh-*/Build/Products/Debug/termmesh")
     candidates = [p for p in candidates if os.path.isfile(p) and os.access(p, os.X_OK)]
     if not candidates:
-        raise cmuxError("Could not locate cmux CLI binary; set CMUXTERM_CLI")
+        raise termmeshError("Could not locate termmesh CLI binary; set TERMMESH_CLI")
     candidates.sort(key=lambda p: os.path.getmtime(p), reverse=True)
     return candidates[0]
 
@@ -54,14 +54,14 @@ def _run_cli(cli: str, args: List[str]) -> str:
     proc = subprocess.run(cmd, capture_output=True, text=True, check=False)
     if proc.returncode != 0:
         merged = f"{proc.stdout}\n{proc.stderr}".strip()
-        raise cmuxError(f"CLI failed ({' '.join(cmd)}): {merged}")
+        raise termmeshError(f"CLI failed ({' '.join(cmd)}): {merged}")
     return proc.stdout
 
 
 def main() -> int:
     cli = _find_cli_binary()
 
-    with cmux(SOCKET_PATH) as c:
+    with termmesh(SOCKET_PATH) as c:
         caps = c.capabilities() or {}
         methods = set(caps.get("methods") or [])
         _must("surface.read_text" in methods, f"Missing surface.read_text in capabilities: {sorted(methods)[:20]}")
@@ -85,7 +85,7 @@ def main() -> int:
         selected = c._call("workspace.current") or {}
         _must(str(selected.get("workspace_id") or "") == ws_other, f"Expected selected workspace {ws_other}, got: {selected}")
 
-        token = f"CMUX_READ_SCREEN_{int(time.time() * 1000)}"
+        token = f"TERMMESH_READ_SCREEN_{int(time.time() * 1000)}"
         c._call("surface.send_text", {
             "workspace_id": ws_target,
             "surface_id": surface_target,
@@ -106,17 +106,17 @@ def main() -> int:
         _must(token in str(ws_only_payload.get("text") or ""), f"surface.read_text workspace-only call missing token {token!r}: {ws_only_payload}")
 
         cli_text = _run_cli(cli, ["read-screen", "--workspace", ws_target, "--surface", surface_target])
-        _must(token in cli_text, f"cmux read-screen output missing token {token!r}: {cli_text!r}")
+        _must(token in cli_text, f"termmesh read-screen output missing token {token!r}: {cli_text!r}")
 
         cli_ws_only = _run_cli(cli, ["read-screen", "--workspace", ws_target])
-        _must(token in cli_ws_only, f"cmux read-screen --workspace output missing token {token!r}: {cli_ws_only!r}")
+        _must(token in cli_ws_only, f"termmesh read-screen --workspace output missing token {token!r}: {cli_ws_only!r}")
 
         cli_text_scrollback = _run_cli(cli, ["read-screen", "--workspace", ws_target, "--surface", surface_target, "--scrollback", "--lines", "80"])
-        _must(token in cli_text_scrollback, f"cmux read-screen --scrollback output missing token {token!r}: {cli_text_scrollback!r}")
+        _must(token in cli_text_scrollback, f"termmesh read-screen --scrollback output missing token {token!r}: {cli_text_scrollback!r}")
 
         cli_json = _run_cli(cli, ["--json", "read-screen", "--workspace", ws_target, "--surface", surface_target])
         payload = json.loads(cli_json or "{}")
-        _must(token in str(payload.get("text") or ""), f"cmux --json read-screen missing token {token!r}: {payload}")
+        _must(token in str(payload.get("text") or ""), f"termmesh --json read-screen missing token {token!r}: {payload}")
 
         invalid = subprocess.run(
             [cli, "--socket", SOCKET_PATH, "read-screen", "--workspace", ws_target, "--surface", surface_target, "--lines", "0"],

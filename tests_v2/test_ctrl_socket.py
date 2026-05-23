@@ -191,7 +191,7 @@ def test_environment_paths(client: termmesh) -> TestResult:
     XDG_DATA_DIRS includes the app resources path (and defaults when unset).
     """
     result = TestResult("Environment Paths")
-    env_path = Path(tempfile.gettempdir()) / f"cmux_env_{os.getpid()}.json"
+    env_path = Path(tempfile.gettempdir()) / f"termmesh_env_{os.getpid()}.json"
     env_path.unlink(missing_ok=True)
 
     try:

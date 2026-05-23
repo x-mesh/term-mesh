@@ -121,7 +121,7 @@ def main() -> int:
     socket_path = termmesh.DEFAULT_SOCKET_PATH
     if not os.path.exists(socket_path):
         print(f"SKIP: Socket not found at {socket_path}")
-        print("Tip: start cmux first (or set CMUX_TAG / CMUX_SOCKET_PATH).")
+        print("Tip: start termmesh first (or set TERMMESH_TAG / TERMMESH_SOCKET_PATH).")
         return 0
 
     with termmesh(socket_path) as client:

@@ -22,10 +22,10 @@ sys.path.insert(0, str(Path(__file__).parent))
 from termmesh import termmesh, termmeshError
 
 
-SOCKET_PATH = os.environ.get("CMUX_SOCKET", "/tmp/cmux-debug.sock")
+SOCKET_PATH = os.environ.get("TERMMESH_SOCKET", "/tmp/term-mesh-debug.sock")
 
 
-def _take_screenshot(c: cmux, label: str) -> str:
+def _take_screenshot(c: termmesh, label: str) -> str:
     info = c.screenshot(label)
     sid = str(info.get("screenshot_id") or "").strip()
     path = str(info.get("path") or "").strip()
@@ -33,7 +33,7 @@ def _take_screenshot(c: cmux, label: str) -> str:
 
 
 def main() -> int:
-    with cmux(SOCKET_PATH) as c:
+    with termmesh(SOCKET_PATH) as c:
         c.new_workspace()
         time.sleep(0.25)
 
@@ -43,7 +43,7 @@ def main() -> int:
 
         panes = c.list_panes()
         if len(panes) < 2:
-            raise cmuxError(f"expected >=2 panes after first split, got {len(panes)}: {panes}")
+            raise termmeshError(f"expected >=2 panes after first split, got {len(panes)}: {panes}")
 
         # Focus the right pane, matching the user scenario.
         right_pane_id = panes[-1][1]
@@ -60,7 +60,7 @@ def main() -> int:
         underflows = c.bonsplit_underflow_count()
         if underflows != 0:
             shot = _take_screenshot(c, "nested_split_underflow")
-            raise cmuxError(f"bonsplit arranged-subview underflow observed ({underflows}); screenshot: {shot}")
+            raise termmeshError(f"bonsplit arranged-subview underflow observed ({underflows}); screenshot: {shot}")
 
         print("PASS: nested split did not underflow arrangedSubviews")
         return 0
