@@ -123,7 +123,7 @@ def _send_cd_and_wait(
 
 
 def main() -> int:
-    tag = os.environ.get("TERMMESH_TAG") or os.environ.get("CMUX_TAG") or ""
+    tag = os.environ.get("TERMMESH_TAG") or os.environ.get("TERMMESH_TAG") or ""
     if not tag:
         print("Tip: set TERMMESH_TAG=<tag> when running this test to avoid socket conflicts.")
 

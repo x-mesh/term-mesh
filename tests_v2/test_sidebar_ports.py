@@ -201,7 +201,7 @@ def _wait_for_lsof_listen_gone(port: int, timeout: float = 8.0) -> None:
 
 
 def main() -> int:
-    tag = os.environ.get("TERMMESH_TAG") or os.environ.get("CMUX_TAG") or ""
+    tag = os.environ.get("TERMMESH_TAG") or os.environ.get("TERMMESH_TAG") or ""
     if not tag:
         print("Tip: set TERMMESH_TAG=<tag> when running this test to avoid socket conflicts.")
 

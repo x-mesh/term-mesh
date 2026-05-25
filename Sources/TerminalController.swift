@@ -19,6 +19,21 @@ class TerminalController {
     nonisolated(unsafe) var serverSocket: Int32 = -1
     nonisolated(unsafe) var isRunning = false
     nonisolated(unsafe) var acceptLoopAlive = false
+    /// Periodic timer that polls `socketPath` for existence. Fires
+    /// `recoverSocket()` when the path is unlinked out from under us
+    /// (external `unlink()`, partial cleanup race, `/tmp` reaper). The
+    /// listener FD stays alive on unlink, but client `connect()` does a
+    /// path lookup and would otherwise get ENOENT until app relaunch.
+    ///
+    /// Polling instead of `DispatchSourceFileSystemObject`: macOS rejects
+    /// `open(O_EVTONLY)` on Unix socket files with `EOPNOTSUPP` (errno 102),
+    /// so the vnode-source path is unavailable for sockets specifically.
+    nonisolated(unsafe) var socketPathWatcher: DispatchSourceTimer?
+    /// Monotonic ns timestamp of the last `installSocketPathWatcher` call.
+    /// Throttles watcher-triggered recoveries — events within this window
+    /// of a fresh install are ignored so a pathological re-unlink loop
+    /// can't spin `recoverSocket()`.
+    nonisolated(unsafe) var socketPathWatcherInstalledNs: UInt64 = 0
     private var clientHandlers: [Int32: Thread] = [:]
     /// Injected notification service (defaults to singleton for backward compatibility).
     var notifications: any NotificationService = TerminalNotificationStore.shared

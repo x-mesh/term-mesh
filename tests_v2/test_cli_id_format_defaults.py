@@ -13,28 +13,28 @@ sys.path.insert(0, str(Path(__file__).parent))
 from termmesh import termmeshError
 
 
-SOCKET_PATH = os.environ.get("CMUX_SOCKET", "/tmp/cmux-debug.sock")
+SOCKET_PATH = os.environ.get("TERMMESH_SOCKET", "/tmp/term-mesh-debug.sock")
 
 
 def _must(cond: bool, msg: str) -> None:
     if not cond:
-        raise cmuxError(msg)
+        raise termmeshError(msg)
 
 
 def _find_cli_binary() -> str:
-    env_cli = os.environ.get("CMUXTERM_CLI")
+    env_cli = os.environ.get("TERMMESH_CLI")
     if env_cli and os.path.isfile(env_cli) and os.access(env_cli, os.X_OK):
         return env_cli
 
-    fixed = os.path.expanduser("~/Library/Developer/Xcode/DerivedData/cmux-tests-v2/Build/Products/Debug/cmux")
+    fixed = os.path.expanduser("~/Library/Developer/Xcode/DerivedData/termmesh-tests-v2/Build/Products/Debug/termmesh")
     if os.path.isfile(fixed) and os.access(fixed, os.X_OK):
         return fixed
 
-    candidates = glob.glob(os.path.expanduser("~/Library/Developer/Xcode/DerivedData/**/Build/Products/Debug/cmux"), recursive=True)
-    candidates += glob.glob("/tmp/cmux-*/Build/Products/Debug/cmux")
+    candidates = glob.glob(os.path.expanduser("~/Library/Developer/Xcode/DerivedData/**/Build/Products/Debug/termmesh"), recursive=True)
+    candidates += glob.glob("/tmp/term-mesh-*/Build/Products/Debug/termmesh")
     candidates = [p for p in candidates if os.path.isfile(p) and os.access(p, os.X_OK)]
     if not candidates:
-        raise cmuxError("Could not locate cmux CLI binary; set CMUXTERM_CLI")
+        raise termmeshError("Could not locate termmesh CLI binary; set TERMMESH_CLI")
     candidates.sort(key=lambda p: os.path.getmtime(p), reverse=True)
     return candidates[0]
 
@@ -48,12 +48,12 @@ def _run_cli_json(cli: str, args: List[str], extra_flags: Optional[List[str]] = 
     proc = subprocess.run(cmd, capture_output=True, text=True, check=False)
     if proc.returncode != 0:
         merged = f"{proc.stdout}\n{proc.stderr}".strip()
-        raise cmuxError(f"CLI failed ({' '.join(cmd)}): {merged}")
+        raise termmeshError(f"CLI failed ({' '.join(cmd)}): {merged}")
 
     try:
         return json.loads(proc.stdout or "{}")
     except Exception as exc:  # noqa: BLE001
-        raise cmuxError(f"Invalid JSON output for {' '.join(cmd)}: {proc.stdout!r} ({exc})")
+        raise termmeshError(f"Invalid JSON output for {' '.join(cmd)}: {proc.stdout!r} ({exc})")
 
 
 def _walk_dicts(value: Any):

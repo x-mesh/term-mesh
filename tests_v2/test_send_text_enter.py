@@ -16,7 +16,7 @@ Usage:
 
 Requirements:
     - term-mesh must be running with the socket controller enabled
-    - CMUX_SOCKET or CMUX_SOCKET_PATH can override the socket path
+    - TERMMESH_SOCKET or TERMMESH_SOCKET_PATH can override the socket path
 """
 
 import os
@@ -325,8 +325,8 @@ def test_read_screen_after_send(client: termmesh) -> TestResult:
 
 def main() -> int:
     socket_path = (
-        os.environ.get("CMUX_SOCKET")
-        or os.environ.get("CMUX_SOCKET_PATH")
+        os.environ.get("TERMMESH_SOCKET")
+        or os.environ.get("TERMMESH_SOCKET_PATH")
         or None
     )
 

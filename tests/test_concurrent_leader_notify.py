@@ -91,7 +91,7 @@ def run_test(name: str, fn, *args):
 
 
 def detect_socket() -> str:
-    env = os.environ.get("CMUX_SOCKET") or os.environ.get("CMUX_SOCKET_PATH")
+    env = os.environ.get("TERMMESH_SOCKET") or os.environ.get("TERMMESH_SOCKET_PATH")
     if env and os.path.exists(env):
         return env
     import glob as _glob
@@ -644,7 +644,7 @@ def main() -> int:
         sock_path = detect_socket()
     except RuntimeError as e:
         print(f"FATAL: {e}")
-        print("Tip: start term-mesh first, or set CMUX_SOCKET=/tmp/term-mesh.sock")
+        print("Tip: start term-mesh first, or set TERMMESH_SOCKET=/tmp/term-mesh.sock")
         return 1
 
     print(f"  Socket: {sock_path}")

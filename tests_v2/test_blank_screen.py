@@ -10,7 +10,7 @@ Usage:
     python3 test_blank_screen.py
 
 Requirements:
-    - cmux must be running with the socket controller enabled
+    - termmesh must be running with the socket controller enabled
 """
 
 import os
@@ -93,8 +93,8 @@ def run_tests():
     socket_path = termmesh().socket_path
     if not os.path.exists(socket_path):
         print(f"Error: Socket not found at {socket_path}")
-        print("Please make sure cmux is running.")
-        print("Tip: set CMUX_TAG=<tag> or CMUX_SOCKET_PATH=<path> to target a tagged instance.")
+        print("Please make sure termmesh is running.")
+        print("Tip: set TERMMESH_TAG=<tag> or TERMMESH_SOCKET_PATH=<path> to target a tagged instance.")
         return 1
 
     results = []

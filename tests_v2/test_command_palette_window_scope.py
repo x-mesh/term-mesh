@@ -15,7 +15,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 from termmesh import termmesh, termmeshError
 
 
-SOCKET_PATH = os.environ.get("CMUX_SOCKET", "/tmp/cmux-debug.sock")
+SOCKET_PATH = os.environ.get("TERMMESH_SOCKET", "/tmp/term-mesh-debug.sock")
 
 
 def _wait_until(predicate, timeout_s: float = 5.0, interval_s: float = 0.05, message: str = "timeout") -> None:
@@ -24,15 +24,15 @@ def _wait_until(predicate, timeout_s: float = 5.0, interval_s: float = 0.05, mes
         if predicate():
             return
         time.sleep(interval_s)
-    raise cmuxError(message)
+    raise termmeshError(message)
 
 
-def _palette_visible(client: cmux, window_id: str) -> bool:
+def _palette_visible(client: termmesh, window_id: str) -> bool:
     res = client._call("debug.command_palette.visible", {"window_id": window_id}) or {}
     return bool(res.get("visible"))
 
 
-def _set_palette_visible(client: cmux, window_id: str, visible: bool) -> None:
+def _set_palette_visible(client: termmesh, window_id: str, visible: bool) -> None:
     if _palette_visible(client, window_id) == visible:
         return
     client._call("debug.command_palette.toggle", {"window_id": window_id})
@@ -44,7 +44,7 @@ def _set_palette_visible(client: cmux, window_id: str, visible: bool) -> None:
 
 
 def main() -> int:
-    with cmux(SOCKET_PATH) as client:
+    with termmesh(SOCKET_PATH) as client:
         client.activate_app()
         time.sleep(0.2)
         w1 = client.current_window()
@@ -65,7 +65,7 @@ def main() -> int:
             message="window1 command palette did not open",
         )
         if _palette_visible(client, w2):
-            raise cmuxError("window2 palette became visible when toggling window1")
+            raise termmeshError("window2 palette became visible when toggling window1")
 
         # Closing window1 palette should not affect window2.
         client._call("debug.command_palette.toggle", {"window_id": w1})
@@ -83,7 +83,7 @@ def main() -> int:
             message="window2 command palette did not open",
         )
         if _palette_visible(client, w1):
-            raise cmuxError("window1 palette became visible when toggling window2")
+            raise termmeshError("window1 palette became visible when toggling window2")
         client._call("debug.command_palette.toggle", {"window_id": w2})
         _wait_until(
             lambda: not _palette_visible(client, w2),

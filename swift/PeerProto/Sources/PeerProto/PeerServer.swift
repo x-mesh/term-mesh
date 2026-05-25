@@ -19,7 +19,13 @@ import Foundation
 import Dispatch
 import SwiftProtobuf
 
-private let maxPeerServerSessions = 16
+// Per-PeerServer cap on concurrent accepted client sessions. 16 is
+// trivially exhausted in normal multi-workspace / multi-surface attach
+// patterns; 64 leaves headroom while still bounding fd consumption.
+// Combined with the per-process FD limit raised at app launch
+// (see AppDelegate.raiseFileDescriptorLimit), this keeps peer
+// attach churn well under the kernel's accept budget.
+private let maxPeerServerSessions = 64
 
 // MARK: - PeerSurfaceProvider
 
@@ -327,8 +333,15 @@ public actor PeerServer {
         activeSessions.removeAll { $0 === session }
     }
 
-    fileprivate func canAcceptSession() -> Bool {
-        activeSessions.count < maxPeerServerSessions
+    /// Atomic capacity-check + insert. The previous "canAcceptSession()
+    /// then register()" pair allowed a TOCTOU window where two concurrent
+    /// accepts could both see capacity and both register, pushing
+    /// `activeSessions` past `maxPeerServerSessions`. Doing both inside
+    /// the same actor-isolated call eliminates that race.
+    fileprivate func tryRegister(_ session: PeerServerSession) -> Bool {
+        guard activeSessions.count < maxPeerServerSessions else { return false }
+        activeSessions.append(session)
+        return true
     }
 
     /// Push a `WorkspaceLayoutChanged` update to every connected
@@ -378,21 +391,35 @@ public actor PeerServer {
                 if errno == EAGAIN || errno == EWOULDBLOCK { continue }
                 break
             }
-            guard let server, await server.canAcceptSession() else {
-                close(clientFd)
-                continue
-            }
+            // Gate on uid + server existence before allocating a Connection;
+            // these raw-fd paths still need an explicit `close(clientFd)`
+            // because no holder has taken ownership of the fd yet.
             guard Self.clientHasSameUser(fd: clientFd) else {
                 close(clientFd)
                 continue
             }
+            guard let server else {
+                close(clientFd)
+                continue
+            }
+            // Hand fd ownership to the RAII holder inside the actor *first*,
+            // so any subsequent failure path (capacity reject, dropped Task)
+            // still reclaims the fd via the holder's deinit. Without this,
+            // a bare clientFd held only by a closure that never runs leaks
+            // the descriptor for the lifetime of the process.
             let connection = AcceptedUnixConnection(fd: clientFd)
             let session = PeerServerSession(
                 connection: connection,
                 config: config,
                 provider: provider
             )
-            await server.register(session)
+            guard await server.tryRegister(session) else {
+                // Cap reached. Explicit close keeps the fd recovery
+                // observable in lsof immediately rather than waiting on
+                // ARC + deinit.
+                await connection.close()
+                continue
+            }
             Task {
                 await session.run()
                 await server.sessionFinished(session)
@@ -472,21 +499,60 @@ public actor PeerServer {
 
 // MARK: - AcceptedUnixConnection
 
+/// RAII fd owner. Guarantees the accepted unix socket fd is closed
+/// exactly once, even on code paths that drop the owning actor without
+/// an explicit `close()` call (Task spawn failure, capacity reject,
+/// stop() racing accept, etc.). Without this, a leaked `AcceptedUnixConnection`
+/// would hold the fd for the lifetime of the process — observed as 87+ unix
+/// FDs accumulating on `peer.sock` until the per-process maxfiles cap of 256
+/// was hit and `accept()` started silently dropping new clients.
+///
+/// Lock-guarded close is idempotent and safe to invoke both from the
+/// actor's `close()` and from the nonisolated `deinit`.
+final class UnixFdHolder: @unchecked Sendable {
+    let fd: Int32
+    private let lock = NSLock()
+    private var didClose = false
+
+    init(fd: Int32) {
+        self.fd = fd
+    }
+
+    var isClosed: Bool {
+        lock.lock(); defer { lock.unlock() }
+        return didClose
+    }
+
+    func close() {
+        lock.lock()
+        let already = didClose
+        didClose = true
+        lock.unlock()
+        if !already {
+            Darwin.close(fd)
+        }
+    }
+
+    deinit { close() }
+}
+
 /// Async wrapper around an accepted client fd. Uses DispatchSourceRead
 /// for readability notifications + plain POSIX read/write for the actual
 /// I/O so the "return as soon as some bytes are available" semantics
 /// match what `PeerSession.readFrame` expects. DispatchIO's batched
 /// streaming model blocks until its target length is filled, which
 /// deadlocks our protocol loop.
+///
+/// The fd is owned by a `UnixFdHolder` so dropping this actor without
+/// an explicit close still reclaims the descriptor.
 actor AcceptedUnixConnection {
-    let fd: Int32
+    private let holder: UnixFdHolder
     private let queue: DispatchQueue
     private var readSource: DispatchSourceRead?
     private var writeSource: DispatchSourceWrite?
-    private var closed = false
 
     init(fd: Int32) {
-        self.fd = fd
+        self.holder = UnixFdHolder(fd: fd)
         self.queue = DispatchQueue(label: "term-mesh.peer.server.conn.\(fd)", qos: .userInitiated)
         // Make fd non-blocking so read/write return EAGAIN instead of
         // sleeping; the readiness sources wake us when the kernel has work.
@@ -500,19 +566,19 @@ actor AcceptedUnixConnection {
     /// EOF. Matches PeerSession.readFrame's "keep reading until a frame
     /// decodes" loop.
     func read() async throws -> Data {
-        if closed { return Data() }
-        while !closed {
+        if holder.isClosed { return Data() }
+        while !holder.isClosed {
             // Try a non-blocking read first. If bytes are already sitting
             // in the kernel, skip the DispatchSource round-trip.
             var buffer = [UInt8](repeating: 0, count: 16 * 1024)
             let n = buffer.withUnsafeMutableBufferPointer { bp -> Int in
-                Darwin.read(fd, bp.baseAddress, bp.count)
+                Darwin.read(holder.fd, bp.baseAddress, bp.count)
             }
             if n > 0 {
                 return Data(buffer.prefix(n))
             }
             if n == 0 {
-                closed = true
+                holder.close()
                 return Data() // EOF
             }
             if errno == EAGAIN || errno == EWOULDBLOCK {
@@ -528,7 +594,7 @@ actor AcceptedUnixConnection {
     }
 
     private func waitForReadable() async throws {
-        let fd = self.fd
+        let fd = self.holder.fd
         let queue = self.queue
         try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
             let source = DispatchSource.makeReadSource(fileDescriptor: fd, queue: queue)
@@ -549,15 +615,15 @@ actor AcceptedUnixConnection {
     }
 
     func write(_ data: Data) async throws {
-        if closed { return }
+        if holder.isClosed { return }
         let bytes = Array(data)
         var offset = 0
         var remaining = bytes.count
         while remaining > 0 {
-            if closed { return }
+            if holder.isClosed { return }
             let n = bytes.withUnsafeBytes { bp -> Int in
                 let base = bp.baseAddress!.advanced(by: offset)
-                return Darwin.write(fd, base, remaining)
+                return Darwin.write(holder.fd, base, remaining)
             }
             if n > 0 {
                 offset += n
@@ -577,9 +643,7 @@ actor AcceptedUnixConnection {
     }
 
     func close() {
-        guard !closed else { return }
-        closed = true
-        Darwin.close(fd)
+        holder.close()
     }
 }
 

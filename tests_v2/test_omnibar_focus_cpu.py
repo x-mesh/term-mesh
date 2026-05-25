@@ -34,8 +34,8 @@ MONITOR_DURATION_S = 3.0
 SAMPLE_INTERVAL_S = 0.5
 
 
-def get_cmux_pid() -> int | None:
-    socket_path = os.environ.get("CMUX_SOCKET_PATH") or os.environ.get("TERMMESH_SOCKET_PATH")
+def get_termmesh_pid() -> int | None:
+    socket_path = os.environ.get("TERMMESH_SOCKET_PATH") or os.environ.get("TERMMESH_SOCKET_PATH")
     if not socket_path:
         try:
             socket_path = termmesh().socket_path
@@ -101,7 +101,7 @@ def main() -> int:
     print("Omnibar Cmd+L Focus CPU Regression Test")
     print("=" * 60)
 
-    pid = get_cmux_pid()
+    pid = get_termmesh_pid()
     if pid is None:
         print("\nSKIP: term-mesh is not running")
         return 0

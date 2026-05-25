@@ -2,12 +2,12 @@
 """
 Tests for socket access control (process ancestry check).
 
-In cmuxOnly mode (default), only processes descended from the term-mesh
+In termMeshOnly mode (default), only processes descended from the term-mesh
 app process can connect. External processes (e.g., SSH) are rejected.
 
 Test strategy:
-  Phase 1: cmuxOnly — external processes get rejected
-  Phase 2: cmuxOnly — internal process CAN connect (inject via shell rc)
+  Phase 1: termMeshOnly — external processes get rejected
+  Phase 2: termMeshOnly — internal process CAN connect (inject via shell rc)
   Phase 3: allowAll env override — existing test commands still work
 
 Usage:
@@ -72,7 +72,7 @@ def _raw_send(sock, command: str, timeout: float = 3.0) -> str:
 
 
 def _preferred_worktree_slug():
-    env_slug = os.environ.get("TERMMESH_TAG") or os.environ.get("CMUX_TAG") or os.environ.get("CMUX_BRANCH_SLUG")
+    env_slug = os.environ.get("TERMMESH_TAG") or os.environ.get("TERMMESH_TAG") or os.environ.get("TERMMESH_BRANCH_SLUG")
     if env_slug:
         return env_slug.strip().lower()
 
@@ -111,7 +111,7 @@ def _derived_app_candidates_for_current_worktree():
 
 
 def _find_app():
-    explicit = os.environ.get("TERMMESH_APP_PATH") or os.environ.get("CMUX_APP_PATH")
+    explicit = os.environ.get("TERMMESH_APP_PATH") or os.environ.get("TERMMESH_APP_PATH")
     if explicit and os.path.exists(explicit):
         return explicit
 
@@ -161,7 +161,7 @@ def _find_app():
 
 
 def _find_cli(preferred_app_path: str = ""):
-    explicit = os.environ.get("TERMMESH_CLI_BIN") or os.environ.get("CMUX_CLI_BIN") or os.environ.get("CMUX_CLI")
+    explicit = os.environ.get("TERMMESH_CLI_BIN") or os.environ.get("TERMMESH_CLI_BIN") or os.environ.get("TERMMESH_CLI")
     if explicit and os.path.exists(explicit) and os.access(explicit, os.X_OK):
         return explicit
 
@@ -226,8 +226,8 @@ def _launch_app(app_path: str, socket_path: str, mode: str = None, extra_env: di
     if mode:
         env_args = ["--env", f"TERMMESH_SOCKET_MODE={mode}"]
     launch_env = {
-        "CMUX_SOCKET_PATH": socket_path,
-        "CMUX_ALLOW_SOCKET_OVERRIDE": "1",
+        "TERMMESH_SOCKET_PATH": socket_path,
+        "TERMMESH_ALLOW_SOCKET_OVERRIDE": "1",
     }
     if extra_env:
         launch_env.update(extra_env)
@@ -349,11 +349,11 @@ else:
 
 def test_internal_process_allowed(socket_path: str, app_path: str) -> TestResult:
     """
-    Verify a term-mesh-spawned terminal process CAN connect in cmuxOnly mode.
-    Inject a test via the shell rc file, then launch term-mesh in cmuxOnly mode.
+    Verify a term-mesh-spawned terminal process CAN connect in termMeshOnly mode.
+    Inject a test via the shell rc file, then launch term-mesh in termMeshOnly mode.
     The shell (a descendant of term-mesh) runs the test on startup.
     """
-    result = TestResult("Internal process can connect (cmuxOnly)")
+    result = TestResult("Internal process can connect (termMeshOnly)")
     marker = os.path.join(tempfile.gettempdir(), f"termmesh_internal_{os.getpid()}")
     hook_file = os.path.join(tempfile.gettempdir(), f"termmesh_rc_hook_{os.getpid()}.sh")
     zprofile_path = os.path.expanduser("~/.zprofile")
@@ -386,9 +386,9 @@ fi
         with open(zprofile_path, "a") as f:
             f.write(hook_line)
 
-        # Kill existing term-mesh, launch in cmuxOnly mode (default)
+        # Kill existing term-mesh, launch in termMeshOnly mode (default)
         _kill_app(app_path)
-        _launch_app(app_path, socket_path, mode="cmuxOnly")
+        _launch_app(app_path, socket_path, mode="termMeshOnly")
 
         # Wait for marker (the shell sources .zprofile on startup)
         for _ in range(40):
@@ -404,7 +404,7 @@ fi
             content = f.read().strip()
 
         if content == "OK":
-            result.success("Internal process pinged socket successfully in cmuxOnly mode")
+            result.success("Internal process pinged socket successfully in termMeshOnly mode")
         else:
             result.failure(f"Internal process got: {content!r}")
 
@@ -469,7 +469,7 @@ def test_password_mode_requires_auth(socket_path: str, app_path: str) -> TestRes
             app_path,
             socket_path,
             mode="password",
-            extra_env={"CMUX_SOCKET_PASSWORD": password}
+            extra_env={"TERMMESH_SOCKET_PASSWORD": password}
         )
 
         sock = _raw_connect(socket_path)
@@ -495,7 +495,7 @@ def test_password_mode_v1_auth_flow(socket_path: str, app_path: str) -> TestResu
             app_path,
             socket_path,
             mode="password",
-            extra_env={"CMUX_SOCKET_PASSWORD": password}
+            extra_env={"TERMMESH_SOCKET_PASSWORD": password}
         )
 
         sock = _raw_connect(socket_path)
@@ -533,7 +533,7 @@ def test_password_mode_v2_auth_flow(socket_path: str, app_path: str) -> TestResu
             app_path,
             socket_path,
             mode="password",
-            extra_env={"CMUX_SOCKET_PASSWORD": password}
+            extra_env={"TERMMESH_SOCKET_PASSWORD": password}
         )
 
         sock = _raw_connect(socket_path)
@@ -592,7 +592,7 @@ def test_password_mode_cli_exit_code(socket_path: str, app_path: str) -> TestRes
             app_path,
             socket_path,
             mode="password",
-            extra_env={"CMUX_SOCKET_PASSWORD": password}
+            extra_env={"TERMMESH_SOCKET_PASSWORD": password}
         )
 
         no_auth = subprocess.run(
@@ -665,14 +665,14 @@ def run_tests():
         status = "\u2705" if r.passed else "\u274c"
         print(f"    {status} {r.message}")
 
-    # ── Phase 1: cmuxOnly — external rejection ──
-    print("Phase 1: cmuxOnly mode — external rejection")
+    # ── Phase 1: termMeshOnly — external rejection ──
+    print("Phase 1: termMeshOnly mode — external rejection")
     print("-" * 50)
 
-    # Ensure term-mesh is running in cmuxOnly mode
+    # Ensure term-mesh is running in termMeshOnly mode
     _kill_app(app_path)
-    print("  Launching term-mesh in cmuxOnly mode...")
-    _launch_app(app_path, socket_path, mode="cmuxOnly")
+    print("  Launching term-mesh in termMeshOnly mode...")
+    _launch_app(app_path, socket_path, mode="termMeshOnly")
 
     run_test(test_external_rejected, socket_path)
     run_test(test_connection_closed_after_reject, socket_path)
@@ -680,8 +680,8 @@ def run_tests():
     run_test(test_subprocess_rejected, socket_path)
     print()
 
-    # ── Phase 2: cmuxOnly — internal process CAN connect ──
-    print("Phase 2: cmuxOnly mode — internal process allowed")
+    # ── Phase 2: termMeshOnly — internal process CAN connect ──
+    print("Phase 2: termMeshOnly mode — internal process allowed")
     print("-" * 50)
 
     run_test(test_internal_process_allowed, socket_path, app_path)
@@ -704,9 +704,9 @@ def run_tests():
     run_test(test_password_mode_cli_exit_code, socket_path, app_path)
     print()
 
-    # ── Cleanup: leave term-mesh in cmuxOnly mode ──
+    # ── Cleanup: leave term-mesh in termMeshOnly mode ──
     _kill_app(app_path)
-    _launch_app(app_path, socket_path, mode="cmuxOnly")
+    _launch_app(app_path, socket_path, mode="termMeshOnly")
 
     # ── Summary ──
     print("=" * 60)

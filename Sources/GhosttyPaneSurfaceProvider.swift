@@ -598,6 +598,89 @@ private func sendPeerInputBytes(_ surface: ghostty_surface_t, bytes: Data) {
             continue
         }
 
+        // Bracketed-paste passthrough. `\e[200~…\e[201~` brackets paste
+        // content from the client. The body must reach the next-hop
+        // verbatim: raw `\n` / `\r` / ESC bytes get re-encoded as
+        // `\e[13;2u` / `\e[27u` when funneled through the surface_key
+        // path (kitty / modifyOtherKeys mode), and vim's paste decoder
+        // then writes those bytes into the buffer as invisible
+        // characters — the user sees only blank lines. Even sending
+        // markers + body as a single surface_key text payload loses the
+        // first few bytes of body (observed: `\e[200~⏺ R…` → vim sees
+        // only `an…`), because Ghostty's text-key handler tries to
+        // parse leading ESC sequences as input encodings.
+        //
+        // Fix: strip the markers and route the inner content through
+        // `ghostty_surface_text`, the same API local paste uses. Ghostty
+        // re-wraps with `\e[200~…\e[201~` automatically when the remote
+        // surface has bracketed-paste mode enabled (set by the
+        // next-hop app), so vim still sees a real paste.
+        //
+        // Stateless across Input frames: only handle the case where
+        // both markers land in this chunk. Multi-chunk pastes fall
+        // through to the legacy per-byte path — still imperfect but no
+        // worse than before this fix.
+        if byte == 0x1b,
+           i + 5 < arr.count,
+           arr[i + 1] == 0x5b,
+           arr[i + 2] == 0x32,
+           arr[i + 3] == 0x30,
+           arr[i + 4] == 0x30,
+           arr[i + 5] == 0x7e {
+            var closeStart: Int? = nil
+            var j = i + 6
+            while j + 5 < arr.count {
+                if arr[j] == 0x1b,
+                   arr[j + 1] == 0x5b,
+                   arr[j + 2] == 0x32,
+                   arr[j + 3] == 0x30,
+                   arr[j + 4] == 0x31,
+                   arr[j + 5] == 0x7e {
+                    closeStart = j
+                    break
+                }
+                j += 1
+            }
+            if let close = closeStart {
+                let body = Data(arr[(i + 6)..<close])
+                if !body.isEmpty {
+                    body.withUnsafeBytes { rawBuffer in
+                        guard let base = rawBuffer.baseAddress?
+                            .assumingMemoryBound(to: CChar.self) else { return }
+                        ghostty_surface_text(surface, base, UInt(rawBuffer.count))
+                    }
+                }
+                i = close + 6
+                continue
+            }
+            // No closing marker in this chunk — fall through.
+        }
+
+        // ESC begins a well-formed but unrecognized control sequence
+        // (single bracketed-paste close marker carried over from the
+        // previous chunk, mouse reports, OSC color queries, …). The
+        // previous behavior split this into a lone ESC key event + a
+        // printable run for the body, which broke end-to-end bracketed
+        // paste: the host Ghostty's surface_key encoder turned the ESC
+        // into either a separate PTY write or, in kitty mode, `\e[27u`
+        // — the next-hop CSI parser then either timed the lone ESC out
+        // or consumed it as part of `\e[27u`, leaving `[200~text[201~`
+        // to display as literal characters in claude/codex/vim.
+        if byte == 0x1b,
+           let consumed = peerEscapeSequenceLength(arr, start: i),
+           consumed > 1 {
+            let raw = Array(arr[i..<i + consumed])
+            // ASCII-only fast path keeps the text-field UTF-8 bytes
+            // byte-identical with the original sequence. Any high bytes
+            // fall through to the existing per-scalar path below.
+            if raw.allSatisfy({ $0 < 0x80 }),
+               let payload = String(bytes: raw, encoding: .ascii) {
+                sendPeerKeyEvent(surface, keycode: 0, text: payload)
+                i += consumed
+                continue
+            }
+        }
+
         if let mapping = peerSingleByteKeyMapping(byte) {
             sendPeerKeyEvent(surface, keycode: mapping.keycode, mods: mapping.mods, text: mapping.text)
             i += 1
@@ -712,6 +795,52 @@ private func peerEscapeKeySequence(
     case 0x4f: // 'O' — SS3, commonly F1-F4 and Home/End.
         guard let keycode = peerSs3Keycode(bytes[start + 2]) else { return nil }
         return (keycode, GHOSTTY_MODS_NONE, 3)
+    default:
+        return nil
+    }
+}
+
+/// Length in bytes of a well-formed ESC-introduced control sequence that
+/// begins at `start`. Returns nil when the sequence is incomplete or
+/// malformed. Recognized shapes:
+///   * CSI:  `\e[` parameters (0x20-0x3F) terminated by 0x40-0x7E
+///   * OSC:  `\e]` body terminated by BEL (0x07) or ESC `\` (ST)
+///   * SS3:  `\eO` + one final byte (3 bytes total)
+/// Used to forward bracketed-paste markers and other unrecognized escape
+/// sequences as a single contiguous text payload instead of splitting
+/// them across a lone-ESC key event and a printable body.
+private func peerEscapeSequenceLength(_ bytes: [UInt8], start: Int) -> Int? {
+    guard start + 1 < bytes.count, bytes[start] == 0x1b else { return nil }
+    switch bytes[start + 1] {
+    case 0x5b: // '[' — CSI
+        var i = start + 2
+        while i < bytes.count {
+            let b = bytes[i]
+            if (0x40...0x7e).contains(b) {
+                return i - start + 1
+            }
+            if !(0x20...0x3f).contains(b) {
+                return nil
+            }
+            i += 1
+        }
+        return nil
+    case 0x5d: // ']' — OSC
+        var i = start + 2
+        while i < bytes.count {
+            let b = bytes[i]
+            if b == 0x07 {
+                return i - start + 1
+            }
+            if b == 0x1b, i + 1 < bytes.count, bytes[i + 1] == 0x5c {
+                return i - start + 2
+            }
+            i += 1
+        }
+        return nil
+    case 0x4f: // 'O' — SS3
+        guard start + 2 < bytes.count else { return nil }
+        return 3
     default:
         return nil
     }

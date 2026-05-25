@@ -34,7 +34,8 @@ enum ClaudeCommandInstaller {
         "team.md",
         "team-up.md",
         "tm-op.md",
-        "tm-bench.md"
+        "tm-bench.md",
+        "watch.md"
     ]
 
     /// 번들 내 커맨드 디렉토리 (claude-commands/)

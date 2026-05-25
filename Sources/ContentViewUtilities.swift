@@ -196,7 +196,10 @@ final class DraggableFolderNSView: NSView, NSDraggingSource {
     }
 
     override var intrinsicContentSize: NSSize {
-        NSSize(width: 16, height: 16)
+        // TERM-MESH-1D: record this host as the most recently measured one so a
+        // main-thread stall inside SwiftUI's measure pass can name it.
+        LayoutHangDiagnostics.markHostMeasure("DraggableFolderIcon")
+        return NSSize(width: 16, height: 16)
     }
 
     override var mouseDownCanMoveWindow: Bool { false }

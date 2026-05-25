@@ -4,6 +4,20 @@ All notable changes to term-mesh are documented here.
 
 ## [Unreleased]
 
+## [0.130.0] - 2026-05-25
+
+### Added
+- **`/watch`, `/tm-bench` slash command가 Claude·Codex 리더 모두에서 동작** — 이전에는 Claude 리더에만 등록되던 `/watch`(drift 감시 토글·점검)와 `/tm-bench`(에이전트 팀 통신 벤치마크)가 Codex IME 별칭 맵에도 등록되어 동일하게 호출 가능. 커맨드 번들 로직을 `scripts/copy-claude-commands.sh` 한 곳으로 통합해 빌드 시 중복 등록과 누락 모두 해소.
+
+### Fixed
+- **connect-to-peer 원격 pane에서 paste가 깨지던 문제 일괄 해소** — bracketed-paste 마커가 ESC와 본문이 분리되어 전송되며 (1) 첫 paste 시 `[200~text[201~`가 literal로 노출되고, (2) vim insert mode + 멀티라인 paste 시 본문이 invisible 바이트로 들어가 빈 줄만 추가되며, (3) 본문 첫 몇 글자(`⏺` 등 multibyte)가 소실되던 문제. peer-relay가 ESC+CSI 시퀀스를 단일 text payload로 묶어 전달하고, `\e[200~…\e[201~` 마커를 stripped 본문으로 ghostty 표준 paste API에 전달하도록 변경. claude·codex CLI·vim 모두 정상 paste. **연결 대상(원격) 피어도 이 버전 이상이어야 호스트 측 수정이 적용**된다.
+- **제어 소켓 `/tmp/term-mesh.sock`이 외부 unlink로 사라져도 자동 복구** — 외부 정리 도구나 부분적 cleanup race로 socket 파일이 unlink되면 listener FD는 살아 있는데 client `connect()`는 path lookup으로 ENOENT를 받아 `term-mesh` CLI·Claude Code stop hook·외부 자동화가 모두 `Socket not found at /tmp/term-mesh.sock`으로 실패하던 orphan listener 문제. 앱이 2초 주기로 socket path 존재 여부를 점검해 사라지면 자동으로 listener를 재bind한다. 앱 재시작 없이도 짧은 지연 후 stop hook이 다시 동작.
+- **Peer-federation 장시간 운영 시 fd 누수와 동시 연결 한계 회피** — peer-federation 연결을 반복 사용할 때 누적되던 file descriptor 누수를 막고, 프로세스 NOFILE 한계를 끌어올려 다수의 동시 원격 워크스페이스 연결에서 fd 고갈로 인한 산발적 실패를 예방.
+
+### Thanks to 1 contributor!
+
+- [@JINWOO-J](https://github.com/JINWOO-J)
+
 ## [0.129.0] - 2026-05-22
 
 ### Added

@@ -247,6 +247,13 @@ the original Claude slash commands.
 | `/team-up ...` | `/team-up ...` via IME alias | Create a team with the current pane adopted as leader |
 | `/tm "..."` | `/tm "..."` via IME alias | One-shot fan-out to all idle agents + synthesis |
 | `/tm-op ...` | `/tm-op ...` via IME alias | Strategy orchestration |
+| `/tm-bench ...` | `/tm-bench ...` via IME alias | Agent team communication benchmark |
+| `/watch ...` | `/watch ...` via IME alias | Stateless drift oversight toggle/review |
+
+The IME alias map lives in `imeSlashCommandAliases()` (`Sources/GhosttySurfaceScrollView.swift`);
+each alias points at a `.codex/prompts/<name>.md` shim. Claude-side equivalents are bundled +
+installed via `scripts/copy-claude-commands.sh` (build phase) and `ClaudeCommandInstaller.swift`
+(runtime). Adding a leader command means touching all of these in lockstep.
 
 For Codex as the current leader, prefer:
 
@@ -574,11 +581,20 @@ tm-agent collect --lines 100 | grep -E "^(STATUS|NEXT):"
 cat ~/.term-mesh/results/my-team/<agent>-reply.md | head -5
 ```
 
-## E2E mac UI tests
+## E2E tests
 
-Run UI tests on the UTM macOS VM (never on the host machine). Always run e2e UI tests via `ssh term-mesh-vm`:
+term-mesh has two e2e layers. **Default to socket e2e**; reserve XCUITest for what the socket can't reach.
+
+- **Socket e2e (`tests_v2/` via `termmesh.py`)** — the standard for app logic, layout, focus, splits, workspaces, browser, notifications, CLI parity, and regressions. Authoring/running rules live in **[`tests/CLAUDE.md`](tests/CLAUDE.md)** (single source of truth; auto-loads when working in `tests/` or `tests_v2/`). New tests go in `tests_v2/`.
+- **XCUITest (`termMeshUITests/`)** — only for OS-level key routing, menu key-equivalents, system dialogs, and Accessibility-driven interaction.
+
+Run on the UTM macOS VM (never the host). Always via `ssh term-mesh-vm`:
 
 ```bash
+# Socket e2e suites (VM-only, guarded to user `term-mesh`)
+ssh term-mesh-vm 'cd /Users/jinwoo/term-mesh/GhosttyTabs && ./scripts/run-tests-v2.sh'
+
+# XCUITest example
 ssh term-mesh-vm 'cd /Users/jinwoo/term-mesh/GhosttyTabs && xcodebuild -project GhosttyTabs.xcodeproj -scheme term-mesh -configuration Debug -destination "platform=macOS" -only-testing:termMeshUITests/UpdatePillUITests test'
 ```
 

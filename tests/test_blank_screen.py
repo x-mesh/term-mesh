@@ -10,7 +10,7 @@ Usage:
     python3 test_blank_screen.py
 
 Requirements:
-    - cmux must be running with the socket controller enabled
+    - termmesh must be running with the socket controller enabled
 """
 
 import os
@@ -37,7 +37,7 @@ class TestResult:
         self.message = msg
 
 
-def test_screen_not_blank(client: cmux) -> TestResult:
+def test_screen_not_blank(client: termmesh) -> TestResult:
     """Test that the terminal has some visible content (shell prompt)."""
     result = TestResult("Screen not blank")
     try:
@@ -57,7 +57,7 @@ def test_screen_not_blank(client: cmux) -> TestResult:
     return result
 
 
-def test_render_marker(client: cmux) -> TestResult:
+def test_render_marker(client: termmesh) -> TestResult:
     """Test that echoed text actually renders on screen."""
     result = TestResult("Render marker")
     marker = "RENDER_TEST_MARKER_12345"
@@ -90,17 +90,17 @@ def run_tests():
     print("=" * 60)
     print()
 
-    socket_path = cmux().socket_path
+    socket_path = termmesh().socket_path
     if not os.path.exists(socket_path):
         print(f"Error: Socket not found at {socket_path}")
-        print("Please make sure cmux is running.")
-        print("Tip: set CMUX_TAG=<tag> or CMUX_SOCKET_PATH=<path> to target a tagged instance.")
+        print("Please make sure termmesh is running.")
+        print("Tip: set TERMMESH_TAG=<tag> or TERMMESH_SOCKET_PATH=<path> to target a tagged instance.")
         return 1
 
     results = []
 
     try:
-        with cmux() as client:
+        with termmesh() as client:
             print("Testing connection...")
             if not client.ping():
                 print("  FAIL: Ping failed")
@@ -122,7 +122,7 @@ def run_tests():
             print(f"  {status}: {results[-1].message}")
             print()
 
-    except cmuxError as e:
+    except termmeshError as e:
         print(f"Error: {e}")
         return 1
 
