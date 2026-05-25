@@ -73,6 +73,15 @@ final class TeamOrchestrator: ObservableObject {
         /// - Headless: backfilled from `headless.create_team` /
         ///   `headless.resume_team` result (line ~1085).
         var teamUuid: String? = nil
+
+        // GUI pair-programming companion: a second pane spawned next to the
+        // leader running a different CLI ("none" = no pair). The pair is not
+        // a member of `agents` and is not addressable via tm-agent; it lives
+        // alongside the leader purely so the user can drive two CLIs in
+        // parallel from one team.
+        var pairMode: String = "none"   // "none", "claude", "kiro", "codex", "gemini"
+        var pairModel: String = ""
+        var pairPanelId: UUID? = nil
     }
 
     struct AgentPaneIdentity: Equatable {
@@ -734,6 +743,8 @@ final class TeamOrchestrator: ObservableObject {
         leaderMode: String = "repl",
         leaderModel: String = "sonnet",
         leaderCli: String = "claude",
+        pairMode: String = "none",
+        pairModel: String = "",
         resumeSessionId: String? = nil,
         worktreeMode: String = "off",
         executionMode: String = "pane",
@@ -1077,6 +1088,69 @@ final class TeamOrchestrator: ObservableObject {
             }
         }
 
+        // ── Pair pane: optional 1:1 companion next to the leader ────────────
+        // Splits horizontally off the leader so the agent grid (below) still
+        // anchors on the leader and never on the pair.
+        var pairPanelId: UUID? = nil
+        let effectivePairMode = (leaderMode == "adopted" || leaderMode == "repl" || pairMode == leaderMode) ? "none" : pairMode
+        if effectivePairMode != "none", let pairBinaryPath = agentBinaryPath(cli: effectivePairMode) {
+            let pairCommand: String
+            switch effectivePairMode {
+            case "claude":
+                let quoted = pairBinaryPath.contains(" ") ? "\"\(pairBinaryPath)\"" : pairBinaryPath
+                var parts = [quoted, "--dangerously-skip-permissions"]
+                if !pairModel.isEmpty && pairModel != "sonnet" {
+                    parts.append("--model '\(Self.resolveClaudeModelArg(pairModel))'")
+                }
+                pairCommand = parts.joined(separator: " ")
+            case "kiro":
+                pairCommand = buildKiroCommand(kiroPath: pairBinaryPath, agentName: "pair", teamName: name, model: pairModel, isLeader: false)
+            case "codex":
+                pairCommand = buildCodexCommand(codexPath: pairBinaryPath, agentName: "pair", teamName: name, model: pairModel)
+            case "gemini":
+                pairCommand = buildGeminiCommand(geminiPath: pairBinaryPath, agentName: "pair", teamName: name, model: pairModel)
+            default:
+                pairCommand = ""
+            }
+            if !pairCommand.isEmpty {
+                let pairShellCommand: String
+                if leaderWorkDir != workingDirectory {
+                    let shell = ProcessInfo.processInfo.environment["SHELL"] ?? "/bin/zsh"
+                    let inner = "cd \"\(leaderWorkDir)\" && exec \(pairCommand); exec $SHELL"
+                    let escaped = inner.replacingOccurrences(of: "'", with: "'\\''")
+                    pairShellCommand = "\(shell) -l -c '\(escaped)'"
+                } else {
+                    pairShellCommand = "\(pairCommand); exec $SHELL"
+                }
+                // Pair env mirrors leaderEnv (CLAUDECODE cleared for non-claude CLIs;
+                // for claude pair, also clear so it can start its own session).
+                let pairEnv = baseEnv.merging(["CLAUDECODE": ""]) { _, new in new }
+                if let pairPanel = workspace.newTerminalSplit(
+                    from: leaderPanelId,
+                    orientation: .horizontal,
+                    insertFirst: false,
+                    focus: false,
+                    skipEqualization: true,
+                    workingDirectory: leaderWorkDir,
+                    command: pairShellCommand,
+                    environment: pairEnv
+                ) {
+                    pairPanelId = pairPanel.id
+                    let pairLabel: String
+                    switch effectivePairMode {
+                    case "claude": pairLabel = "🤝 Pair (Claude)"
+                    case "kiro":   pairLabel = "🤝 Pair (Kiro)"
+                    case "codex":  pairLabel = "🤝 Pair (Codex)"
+                    case "gemini": pairLabel = "🤝 Pair (Gemini)"
+                    default:       pairLabel = "🤝 Pair"
+                    }
+                    workspace.setPanelCustomTitle(panelId: pairPanel.id, title: pairLabel)
+                } else {
+                    Logger.team.warning("[team] failed to create pair pane (cli=\(effectivePairMode, privacy: .public))")
+                }
+            }
+        }
+
         // Agent grid anchor: in normal mode agents split from leaderPanel;
         // in adopted mode they split from the workspace's default panel (no leader pane exists).
         let agentAnchorPanelId = leaderMode == "adopted" ? defaultPanelId : leaderPanelId
@@ -1385,7 +1459,10 @@ final class TeamOrchestrator: ObservableObject {
             sharedWorktreeName: sharedWtName,
             sharedWorktreePath: sharedWtPath,
             sharedWorktreeBranch: sharedWtBranch,
-            teamUuid: paneTeamUuid
+            teamUuid: paneTeamUuid,
+            pairMode: effectivePairMode,
+            pairModel: effectivePairMode == "none" ? "" : pairModel,
+            pairPanelId: pairPanelId
         )
         teams[name] = team
         // Register in thread-safe data store for off-main access (approach C: dual queue)

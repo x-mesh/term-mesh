@@ -347,7 +347,7 @@ struct TeamCreationView: View {
     @ObservedObject var teamTemplateManager = TeamTemplateManager.shared
     @ObservedObject var providerDetector = ProviderDetector.shared
 
-    var onCreate: ((_ teamName: String, _ leaderMode: String, _ leaderModel: String, _ agents: [TeamAgentRow], _ worktreeMode: String, _ executionMode: String, _ resumeSessionId: String?) -> Bool)?
+    var onCreate: ((_ teamName: String, _ leaderMode: String, _ leaderModel: String, _ agents: [TeamAgentRow], _ worktreeMode: String, _ executionMode: String, _ resumeSessionId: String?, _ pairMode: String, _ pairModel: String) -> Bool)?
     /// Phase 2: called after a successful `headless.resume_team` RPC.
     /// Receives the decoded result dictionary. Caller is responsible for
     /// registering the team in TeamOrchestrator and switching workspace cwd
@@ -383,6 +383,8 @@ struct TeamCreationView: View {
     @State private var executionMode = "pane"  // "pane" or "headless"
     @State private var showDaemonWarning = false
     @State private var resumeSession = false
+    @State private var leaderPairMode: String = "none"
+    @AppStorage("teamDefaultPairModel") private var leaderPairModel: String = ""
     @State private var recentSessions: [ClaudeSession] = []
     @State private var selectedSessionId: String?
     @State private var manualSessionId = ""
@@ -1140,6 +1142,63 @@ struct TeamCreationView: View {
                         }
                     }
                     .fixedSize()
+                }
+            }
+
+            // Pair-programming companion: spawns a second pane next to the
+            // leader running a different CLI. Disabled for REPL leaders (no
+            // CLI to pair with).
+            if leaderMode != "repl" {
+                HStack {
+                    Text("Pair with")
+                        .font(.subheadline.bold())
+                    Spacer()
+                    Picker("", selection: Binding(
+                        get: {
+                            // Self-heal: if pair becomes same as leader, reset to none.
+                            if leaderPairMode == leaderMode {
+                                DispatchQueue.main.async { leaderPairMode = "none" }
+                                return "none"
+                            }
+                            return leaderPairMode
+                        },
+                        set: { leaderPairMode = $0 }
+                    )) {
+                        Text("None").tag("none")
+                        ForEach(AgentRolePreset.supportedCLIs.filter { $0 != leaderMode }, id: \.self) { cli in
+                            Text(cli.capitalized).tag(cli)
+                        }
+                    }
+                    .fixedSize()
+
+                    if leaderPairMode != "none" && leaderPairMode != leaderMode {
+                        Picker("", selection: Binding(
+                            get: {
+                                let opts = AgentRolePreset.models(for: leaderPairMode)
+                                if opts.contains(leaderPairModel) { return leaderPairModel }
+                                let fallback = AgentRolePreset.defaultModel(for: leaderPairMode)
+                                DispatchQueue.main.async { leaderPairModel = fallback }
+                                return fallback
+                            },
+                            set: { leaderPairModel = $0 }
+                        )) {
+                            ForEach(AgentRolePreset.models(for: leaderPairMode), id: \.self) { m in
+                                Text(AgentRolePreset.modelDisplayLabel(m, for: leaderPairMode)).tag(m)
+                            }
+                        }
+                        .fixedSize()
+                    }
+                }
+
+                if leaderPairMode != "none" && leaderPairMode != leaderMode && executionMode == "headless" {
+                    HStack(spacing: 4) {
+                        Image(systemName: "exclamationmark.triangle.fill")
+                            .foregroundStyle(.yellow)
+                        Text("Pair runs as a pane — headless mode will skip it")
+                            .foregroundStyle(.secondary)
+                    }
+                    .font(.caption)
+                    .transition(.opacity)
                 }
             }
 
@@ -2486,7 +2545,10 @@ struct TeamCreationView: View {
         } else {
             nil
         }
-        let success = onCreate?(teamName, leaderMode, leaderModel, agents, worktreeMode, executionMode, sid) ?? false
+        // Drop pair when execution mode is headless (pair is pane-only) or
+        // when something has left pair === leader (self-heal guard).
+        let effectivePair = (executionMode == "headless" || leaderPairMode == leaderMode) ? "none" : leaderPairMode
+        let success = onCreate?(teamName, leaderMode, leaderModel, agents, worktreeMode, executionMode, sid, effectivePair, effectivePair == "none" ? "" : leaderPairModel) ?? false
         guard success else { return }
         defaultLeaderMode = leaderMode
         defaultLeaderModel = leaderModel
