@@ -598,16 +598,58 @@ private func sendPeerInputBytes(_ surface: ghostty_surface_t, bytes: Data) {
             continue
         }
 
+        // Bracketed-paste passthrough. `\e[200~` opens a span whose body
+        // is opaque paste content; raw `\n` / `\r` / ESC bytes inside it
+        // must reach the next-hop verbatim. Splitting newlines out into
+        // Shift+Return key events makes Ghostty re-encode them as
+        // `\e[13;2u` (kitty / modifyOtherKeys mode), and vim's paste
+        // decoder then writes those bytes into the buffer as invisible
+        // characters — the user sees only blank lines. Forward the
+        // entire `\e[200~…\e[201~` span as one UTF-8 text payload.
+        // Stateless within a single Input frame: if the closing marker
+        // isn't in this chunk, forward the rest as paste body anyway so
+        // vim stays in paste mode; the close marker rides the next
+        // chunk via the generic ESC-sequence path below.
+        if byte == 0x1b,
+           i + 5 < arr.count,
+           arr[i + 1] == 0x5b,
+           arr[i + 2] == 0x32,
+           arr[i + 3] == 0x30,
+           arr[i + 4] == 0x30,
+           arr[i + 5] == 0x7e {
+            var end = arr.count
+            var j = i + 6
+            while j + 5 < arr.count {
+                if arr[j] == 0x1b,
+                   arr[j + 1] == 0x5b,
+                   arr[j + 2] == 0x32,
+                   arr[j + 3] == 0x30,
+                   arr[j + 4] == 0x31,
+                   arr[j + 5] == 0x7e {
+                    end = j + 6
+                    break
+                }
+                j += 1
+            }
+            let raw = Array(arr[i..<end])
+            if let payload = String(bytes: raw, encoding: .utf8) {
+                sendPeerKeyEvent(surface, keycode: 0, text: payload)
+                i = end
+                continue
+            }
+            // UTF-8 decode failed: fall through to generic ESC path.
+        }
+
         // ESC begins a well-formed but unrecognized control sequence
-        // (bracketed-paste markers `\e[200~` / `\e[201~`, mouse reports,
-        // OSC color queries, …). The previous behavior split this into a
-        // lone ESC key event + a printable run for the body, which broke
-        // bracketed paste end-to-end: the host Ghostty's surface_key
-        // encoder turns the ESC into either a separate PTY write or, in
-        // kitty mode, `\e[27u` — the next-hop bracketed-paste / CSI
-        // parser then either times the lone ESC out or consumes it as
-        // part of `\e[27u`, leaving `[200~text[201~` to display as
-        // literal characters in claude/codex/vim.
+        // (single bracketed-paste close marker carried over from the
+        // previous chunk, mouse reports, OSC color queries, …). The
+        // previous behavior split this into a lone ESC key event + a
+        // printable run for the body, which broke end-to-end bracketed
+        // paste: the host Ghostty's surface_key encoder turned the ESC
+        // into either a separate PTY write or, in kitty mode, `\e[27u`
+        // — the next-hop CSI parser then either timed the lone ESC out
+        // or consumed it as part of `\e[27u`, leaving `[200~text[201~`
+        // to display as literal characters in claude/codex/vim.
         if byte == 0x1b,
            let consumed = peerEscapeSequenceLength(arr, start: i),
            consumed > 1 {
