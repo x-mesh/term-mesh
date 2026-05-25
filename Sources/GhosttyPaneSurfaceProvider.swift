@@ -598,18 +598,28 @@ private func sendPeerInputBytes(_ surface: ghostty_surface_t, bytes: Data) {
             continue
         }
 
-        // Bracketed-paste passthrough. `\e[200~` opens a span whose body
-        // is opaque paste content; raw `\n` / `\r` / ESC bytes inside it
-        // must reach the next-hop verbatim. Splitting newlines out into
-        // Shift+Return key events makes Ghostty re-encode them as
-        // `\e[13;2u` (kitty / modifyOtherKeys mode), and vim's paste
-        // decoder then writes those bytes into the buffer as invisible
-        // characters — the user sees only blank lines. Forward the
-        // entire `\e[200~…\e[201~` span as one UTF-8 text payload.
-        // Stateless within a single Input frame: if the closing marker
-        // isn't in this chunk, forward the rest as paste body anyway so
-        // vim stays in paste mode; the close marker rides the next
-        // chunk via the generic ESC-sequence path below.
+        // Bracketed-paste passthrough. `\e[200~…\e[201~` brackets paste
+        // content from the client. The body must reach the next-hop
+        // verbatim: raw `\n` / `\r` / ESC bytes get re-encoded as
+        // `\e[13;2u` / `\e[27u` when funneled through the surface_key
+        // path (kitty / modifyOtherKeys mode), and vim's paste decoder
+        // then writes those bytes into the buffer as invisible
+        // characters — the user sees only blank lines. Even sending
+        // markers + body as a single surface_key text payload loses the
+        // first few bytes of body (observed: `\e[200~⏺ R…` → vim sees
+        // only `an…`), because Ghostty's text-key handler tries to
+        // parse leading ESC sequences as input encodings.
+        //
+        // Fix: strip the markers and route the inner content through
+        // `ghostty_surface_text`, the same API local paste uses. Ghostty
+        // re-wraps with `\e[200~…\e[201~` automatically when the remote
+        // surface has bracketed-paste mode enabled (set by the
+        // next-hop app), so vim still sees a real paste.
+        //
+        // Stateless across Input frames: only handle the case where
+        // both markers land in this chunk. Multi-chunk pastes fall
+        // through to the legacy per-byte path — still imperfect but no
+        // worse than before this fix.
         if byte == 0x1b,
            i + 5 < arr.count,
            arr[i + 1] == 0x5b,
@@ -617,7 +627,7 @@ private func sendPeerInputBytes(_ surface: ghostty_surface_t, bytes: Data) {
            arr[i + 3] == 0x30,
            arr[i + 4] == 0x30,
            arr[i + 5] == 0x7e {
-            var end = arr.count
+            var closeStart: Int? = nil
             var j = i + 6
             while j + 5 < arr.count {
                 if arr[j] == 0x1b,
@@ -626,18 +636,24 @@ private func sendPeerInputBytes(_ surface: ghostty_surface_t, bytes: Data) {
                    arr[j + 3] == 0x30,
                    arr[j + 4] == 0x31,
                    arr[j + 5] == 0x7e {
-                    end = j + 6
+                    closeStart = j
                     break
                 }
                 j += 1
             }
-            let raw = Array(arr[i..<end])
-            if let payload = String(bytes: raw, encoding: .utf8) {
-                sendPeerKeyEvent(surface, keycode: 0, text: payload)
-                i = end
+            if let close = closeStart {
+                let body = Data(arr[(i + 6)..<close])
+                if !body.isEmpty {
+                    body.withUnsafeBytes { rawBuffer in
+                        guard let base = rawBuffer.baseAddress?
+                            .assumingMemoryBound(to: CChar.self) else { return }
+                        ghostty_surface_text(surface, base, UInt(rawBuffer.count))
+                    }
+                }
+                i = close + 6
                 continue
             }
-            // UTF-8 decode failed: fall through to generic ESC path.
+            // No closing marker in this chunk — fall through.
         }
 
         // ESC begins a well-formed but unrecognized control sequence
