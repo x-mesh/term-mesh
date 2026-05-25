@@ -217,6 +217,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        // Raise the per-process FD soft limit before any subsystem opens
+        // sockets. macOS launchd hands GUI apps a 256-fd default which
+        // peer-federation easily exhausts (each attached peer client
+        // adds multiple unix sockets + pipes). Hitting the limit makes
+        // accept() silently fail and locks both the control socket and
+        // peer.sock into "connect OK / recv timeout" until restart.
+        Self.raiseFileDescriptorLimit()
+
         let env = ProcessInfo.processInfo.environment
         let isRunningUnderXCTest = isRunningUnderXCTest(env)
 
@@ -3335,5 +3343,28 @@ This file is managed by /xm:op strategy tools and won't affect term-mesh. Built-
         alert.addButton(withTitle: "Don't show again")
         _ = alert.runModal()
         UserDefaults.standard.set(true, forKey: dismissedKey)
+    }
+}
+
+extension AppDelegate {
+    /// Raise the process-wide `RLIMIT_NOFILE` soft cap before any
+    /// subsystem opens sockets. macOS launchd gives GUI apps a default
+    /// soft limit of 256, which peer-federation can exhaust under
+    /// sustained attach churn (each peer client adds multiple unix
+    /// sockets + pipes). The historical failure mode is silent: once
+    /// `accept()` returns EMFILE the control socket and peer.sock both
+    /// degrade to "connect OK / recv timeout" until restart.
+    ///
+    /// We bump up to `min(target, hard_limit)`; the hard cap is left
+    /// alone since raising it requires entitlements we don't carry.
+    fileprivate static func raiseFileDescriptorLimit() {
+        var rlim = rlimit()
+        guard getrlimit(RLIMIT_NOFILE, &rlim) == 0 else { return }
+        let target: rlim_t = 8192
+        let desired = min(target, rlim.rlim_max)
+        if desired > rlim.rlim_cur {
+            rlim.rlim_cur = desired
+            _ = setrlimit(RLIMIT_NOFILE, &rlim)
+        }
     }
 }
