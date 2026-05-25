@@ -152,6 +152,8 @@ extension TerminalController {
         isRunning = true
         Logger.socket.info("Listening on \(socketPath, privacy: .public)")
 
+        installSocketPathWatcher()
+
         // Wire batched port scanner results back to workspace state.
         PortScanner.shared.onPortsUpdated = { [weak self] workspaceId, panelId, ports in
             MainActor.assumeIsolated {
@@ -180,6 +182,7 @@ extension TerminalController {
     }
 
     nonisolated func stop() {
+        cancelSocketPathWatcher()
         isRunning = false
         if serverSocket >= 0 {
             close(serverSocket)
@@ -207,6 +210,7 @@ extension TerminalController {
             return
         }
         Logger.socket.info("recoverSocket: restarting control socket listener")
+        cancelSocketPathWatcher()
         isRunning = false
         acceptLoopAlive = false
         if serverSocket >= 0 {
@@ -215,6 +219,50 @@ extension TerminalController {
         }
         unlink(socketPath)
         start(tabManager: tabManager, socketPath: socketPath, accessMode: accessMode)
+    }
+
+    /// Arm a periodic `stat()` poll on `socketPath`. Fires every 2 seconds;
+    /// when the path disappears we trigger `recoverSocket()` to re-bind.
+    /// Replaces any previously installed watcher. See the property doc on
+    /// `socketPathWatcher` for why we poll instead of using a vnode source.
+    nonisolated func installSocketPathWatcher() {
+        cancelSocketPathWatcher()
+        let path = socketPath
+        let timer = DispatchSource.makeTimerSource(queue: DispatchQueue.global(qos: .utility))
+        timer.schedule(
+            deadline: .now() + .seconds(2),
+            repeating: .seconds(2),
+            leeway: .milliseconds(500)
+        )
+        let installedAt = DispatchTime.now().uptimeNanoseconds
+        socketPathWatcherInstalledNs = installedAt
+        timer.setEventHandler { [weak self] in
+            guard let self else { return }
+            if !self.isRunning { return }
+            // Cheapest existence check; avoids a full stat() parse.
+            if access(path, F_OK) == 0 { return }
+            let now = DispatchTime.now().uptimeNanoseconds
+            if now &- self.socketPathWatcherInstalledNs < 2_000_000_000 {
+                // Fresh install grace — we shouldn't trip on a transient
+                // window between unlink() and bind() in our own start().
+                return
+            }
+            Logger.socket.error(
+                "socket watcher: \(path, privacy: .public) missing — recovering"
+            )
+            Task { @MainActor in
+                self.recoverSocket()
+            }
+        }
+        socketPathWatcher = timer
+        timer.resume()
+    }
+
+    nonisolated func cancelSocketPathWatcher() {
+        if let watcher = socketPathWatcher {
+            watcher.cancel()
+            socketPathWatcher = nil
+        }
     }
 
     func applySocketPermissions() {
