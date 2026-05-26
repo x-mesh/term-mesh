@@ -107,6 +107,10 @@ final class TeamOrchestrator: ObservableObject {
     @Published private(set) var teams: [String: Team] = [:]
     // Round-robin counter per "teamName/agentName" key — cycles across duplicate-named agents.
     private var agentSendRoundRobin: [String: Int] = [:]
+    // Last paste target awaiting a separate Return, keyed by "teamName/agentName".
+    // Needed when duplicate-named agents are round-robined: the follow-up
+    // team.send_key must hit the pane that received the text, not the first name match.
+    private var pendingReturnTargets: [String: AgentPaneIdentity] = [:]
 
     /// In-flight send counter keyed by "<team>/<agent>". Incremented at the start
     /// of sendToAgent and decremented after sendIMEText completes. Hard restart
@@ -2488,6 +2492,9 @@ final class TeamOrchestrator: ObservableObject {
         dlog("[team.sendToAgent] enter team=\(teamName) agent=\(agentName) panelId=\(pid.uuidString.prefix(8)) withReturn=\(withReturn) textLen=\(text.count)")
         #endif
         activeSends[teamAgentKey, default: 0] += 1
+        if !withReturn, let identity = agentIdentity(for: agent) {
+            pendingReturnTargets[teamAgentKey] = identity
+        }
         return sendTextToPanel(
             workspaceId: agent.workspaceId,
             panelId: pid,
@@ -2954,6 +2961,21 @@ final class TeamOrchestrator: ObservableObject {
         guard let team = teams[teamName],
               let agent = team.agents.first(where: { $0.name == agentName }) else { return nil }
         return agentIdentity(for: agent)
+    }
+
+    func pendingReturnTarget(teamName: String, agentName: String) -> AgentPaneIdentity? {
+        pendingReturnTargets["\(teamName)/\(agentName)"]
+    }
+
+    func clearPendingReturnTarget(teamName: String, agentName: String, panelId: UUID? = nil) {
+        let key = "\(teamName)/\(agentName)"
+        guard let panelId else {
+            pendingReturnTargets.removeValue(forKey: key)
+            return
+        }
+        if pendingReturnTargets[key]?.panelId == panelId {
+            pendingReturnTargets.removeValue(forKey: key)
+        }
     }
 
     func agentIdentity(forPanelId panelId: UUID) -> AgentPaneIdentity? {

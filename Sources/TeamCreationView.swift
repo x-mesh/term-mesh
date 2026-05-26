@@ -432,6 +432,22 @@ struct TeamCreationView: View {
     @State private var workingDirectoryError: String? = nil
     @State private var isDropTargeted: Bool = false
 
+    init(
+        onCreate: ((_ teamName: String, _ leaderMode: String, _ leaderModel: String, _ agents: [TeamAgentRow], _ worktreeMode: String, _ executionMode: String, _ resumeSessionId: String?, _ pairMode: String, _ pairModel: String, _ pairSpec: String, _ workingDirectory: String) -> Bool)? = nil,
+        onResume: ((_ result: [String: Any]) -> Void)? = nil,
+        initialMode: String = "new",
+        defaultWorkingDirectory: String = "",
+        defaultWorkingDirectorySource: WorkingDirectorySource = .currentPane
+    ) {
+        self.onCreate = onCreate
+        self.onResume = onResume
+        self.initialMode = initialMode
+        self.defaultWorkingDirectory = defaultWorkingDirectory
+        self.defaultWorkingDirectorySource = defaultWorkingDirectorySource
+        _workingDirectory = State(initialValue: defaultWorkingDirectory)
+        _workingDirectorySource = State(initialValue: defaultWorkingDirectorySource)
+    }
+
     var body: some View {
         VStack(spacing: 0) {
             header
@@ -475,8 +491,6 @@ struct TeamCreationView: View {
             if !AgentRolePreset.models(for: leaderMode).contains(leaderModel) {
                 leaderModel = AgentRolePreset.defaultModel(for: leaderMode)
             }
-            workingDirectory = defaultWorkingDirectory
-            workingDirectorySource = defaultWorkingDirectorySource
             validateWorkingDirectory()
             refreshRunbookStatus()
             // Phase 2.5 — honor caller's requested initial mode (sidebar
@@ -2623,7 +2637,17 @@ struct TeamCreationView: View {
                         guard let url, error == nil else { return }
                         var isDir: ObjCBool = false
                         let exists = FileManager.default.fileExists(atPath: url.path, isDirectory: &isDir)
-                        guard exists && isDir.boolValue else { return }
+                        guard exists && isDir.boolValue else {
+                            DispatchQueue.main.async {
+                                workingDirectoryError = "Drop a folder, not a file"
+                                DispatchQueue.main.asyncAfter(deadline: .now() + 2) {
+                                    if workingDirectoryError == "Drop a folder, not a file" {
+                                        workingDirectoryError = nil
+                                    }
+                                }
+                            }
+                            return
+                        }
                         DispatchQueue.main.async {
                             workingDirectory = TeamCreationRecentDirs.normalize(url.path)
                             workingDirectorySource = .userPicked
