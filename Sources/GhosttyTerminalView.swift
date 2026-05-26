@@ -986,7 +986,7 @@ final class TerminalSurface: Identifiable, ObservableObject {
         return ghostty_surface_needs_confirm_quit(surface)
     }
 
-    func closeGhosttySurface() {
+    @MainActor func closeGhosttySurface() {
         releaseGhosttySurfaceAsync(reason: "panelClose")
     }
 
@@ -1655,7 +1655,7 @@ final class TerminalSurface: Identifiable, ObservableObject {
         return ghostty_surface_has_selection(surface)
     }
 
-    private func releaseGhosttySurfaceAsync(reason: String) {
+    @MainActor private func releaseGhosttySurfaceAsync(reason: String) {
         let callbackContext = surfaceCallbackContext
         surfaceCallbackContext = nil
 
@@ -1703,7 +1703,31 @@ final class TerminalSurface: Identifiable, ObservableObject {
     }
 
     deinit {
-        releaseGhosttySurfaceAsync(reason: "deinit")
+        // TerminalSurface is always owned by @MainActor types (TerminalPanel, Workspace),
+        // so deinit effectively runs on the main actor. Swift cannot verify this statically,
+        // so we cannot call @MainActor-isolated releaseGhosttySurfaceAsync directly.
+        //
+        // Instead: capture all needed state now (before self deallocates), clear the
+        // pty_data_callback synchronously (critical — userdata is an unmanaged self pointer
+        // and the IO thread can fire after deinit without this), then schedule the
+        // deferred free through the coordinator via Task. Self must NOT be captured
+        // in the Task closure.
+        let coordinator = surfaceFreeCoordinator
+        let capturedSurface = surface
+        let capturedContext = surfaceCallbackContext
+
+        if let s = capturedSurface {
+            ghostty_surface_clear_pty_data_callback(s)
+        }
+
+        Task { @MainActor in
+            coordinator.scheduleClose {
+                if let s = capturedSurface {
+                    ghostty_surface_free(s)
+                }
+                capturedContext?.release()
+            }
+        }
     }
 }
 

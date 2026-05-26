@@ -13,28 +13,25 @@ final class SurfaceFreeCoordinator {
     private var pendingFreeAction: (() -> Void)?
 
     /// Called by TerminalSurface.beginReadLease() before handing a lease out.
-    /// Must be called on the MainActor.
-    func beginLease() {
+    @MainActor func beginLease() {
         activeLeaseCount += 1
     }
 
     /// Called by SurfaceReadLease.release() (dispatched onto MainActor).
-    /// Must be called on the MainActor.
-    func endLease() {
+    @MainActor func endLease() {
         activeLeaseCount -= 1
         triggerIfReady()
     }
 
     /// Schedule the free action to run once all leases have been released.
     /// If no leases are currently active, the action runs immediately.
-    /// Must be called on the MainActor.
-    func scheduleClose(_ action: @escaping () -> Void) {
+    @MainActor func scheduleClose(_ action: @escaping () -> Void) {
         guard pendingFreeAction == nil else { return }  // guard against double-close
         pendingFreeAction = action
         triggerIfReady()
     }
 
-    private func triggerIfReady() {
+    @MainActor private func triggerIfReady() {
         guard activeLeaseCount == 0, let action = pendingFreeAction else { return }
         pendingFreeAction = nil
         action()
