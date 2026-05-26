@@ -585,12 +585,88 @@ final class GhosttyPaneSurfaceProvider: PeerSurfaceProvider {
 @MainActor private var peerPendingInputTail: [UInt: [UInt8]] = [:]
 private let peerPendingInputTailMax = 32
 
+/// FIX C: Multi-chunk bracketed paste accumulator. When `\e[200~` arrives
+/// without a matching `\e[201~` in the same frame, we stash the body bytes
+/// here and keep consuming subsequent frames as paste content until the
+/// closing marker is seen. Then we flush the buffered body through
+/// `ghostty_surface_text` so Ghostty re-wraps in bracketed paste markers
+/// for the destination surface (vim/codex/claude see a real paste instead
+/// of a stream of keystrokes that triggers autoindent and command-mode
+/// shortcuts mid-paste).
+///
+/// Key = surface pointer identity (UInt(bitPattern:)). @MainActor.
+@MainActor private var peerPendingPasteBody: [UInt: Data] = [:]
+/// Hard cap on accumulated paste body. Exceeding this flushes whatever
+/// has been collected so far and drops the rest of the paste; the
+/// destination app sees a truncated paste rather than an unbounded buffer.
+/// 8 MiB is well above any realistic clipboard payload.
+private let peerPendingPasteBodyMax = 8 * 1024 * 1024
+
 /// FIX A: Release any buffered incomplete-escape tail for a peer surface
 /// when the last client detaches. Prevents stale bytes from being prepended
 /// to a new session if the OS reuses the same surface pointer address.
 @MainActor
 private func clearPeerPendingInputTail(surfaceKey: UInt) {
     peerPendingInputTail.removeValue(forKey: surfaceKey)
+    peerPendingPasteBody.removeValue(forKey: surfaceKey)
+}
+
+/// FIX C helper: flush accumulated paste body to the destination surface.
+@MainActor
+private func flushPeerPasteBody(_ surface: ghostty_surface_t, _ body: Data) {
+    guard !body.isEmpty else { return }
+    body.withUnsafeBytes { rawBuffer in
+        guard let base = rawBuffer.baseAddress?
+            .assumingMemoryBound(to: CChar.self) else { return }
+        ghostty_surface_text(surface, base, UInt(rawBuffer.count))
+    }
+}
+
+/// FIX C helper: consume bytes from `arr` while in paste-accumulate mode.
+/// Returns the number of bytes consumed. If the close marker `\e[201~`
+/// appears in this chunk, flushes the buffered body and returns the
+/// position just past the marker; the caller should resume normal parsing
+/// on the remainder. If no close marker is found, consumes the entire
+/// chunk into the buffer and returns `arr.count`.
+@MainActor
+private func absorbPasteContinuation(
+    surface: ghostty_surface_t,
+    surfaceKey: UInt,
+    arr: [UInt8]
+) -> Int {
+    var closeStart: Int? = nil
+    var j = 0
+    while j + 5 < arr.count {
+        if arr[j] == 0x1b,
+           arr[j + 1] == 0x5b,
+           arr[j + 2] == 0x32,
+           arr[j + 3] == 0x30,
+           arr[j + 4] == 0x31,
+           arr[j + 5] == 0x7e {
+            closeStart = j
+            break
+        }
+        j += 1
+    }
+
+    if let close = closeStart {
+        var body = peerPendingPasteBody.removeValue(forKey: surfaceKey) ?? Data()
+        if close > 0 {
+            body.append(contentsOf: arr[0..<close])
+        }
+        flushPeerPasteBody(surface, body)
+        return close + 6
+    }
+
+    var body = peerPendingPasteBody[surfaceKey] ?? Data()
+    body.append(contentsOf: arr)
+    if body.count > peerPendingPasteBodyMax {
+        flushPeerPasteBody(surface, body)
+        peerPendingPasteBody.removeValue(forKey: surfaceKey)
+    } else {
+        peerPendingPasteBody[surfaceKey] = body
+    }
+    return arr.count
 }
 
 /// FIX B: Return the number of trailing bytes in `arr` that form an
@@ -652,12 +728,26 @@ private func sendPeerInputBytes(_ surface: ghostty_surface_t, bytes: Data) {
     // split CSI/OSC/SS3 heads ("\e[", "\e[<35", etc.) are also deferred — not
     // just lone trailing ESC (the old FIX 2 scope).
     let surfaceKey = UInt(bitPattern: surface)
-    let arr: [UInt8]
+    var arr: [UInt8]
     if let pending = peerPendingInputTail.removeValue(forKey: surfaceKey), !pending.isEmpty {
         arr = pending + Array(bytes)
     } else {
         arr = Array(bytes)
     }
+
+    // FIX C: if a previous frame opened a bracketed paste that hasn't been
+    // closed yet, this frame's bytes belong to the paste body (until the
+    // closing `\e[201~`). Drain those bytes into the accumulator before the
+    // normal parser runs. Bytes past the close marker (if any) fall through.
+    if peerPendingPasteBody[surfaceKey] != nil {
+        let consumed = absorbPasteContinuation(
+            surface: surface, surfaceKey: surfaceKey, arr: arr)
+        if consumed >= arr.count {
+            return
+        }
+        arr = Array(arr[consumed...])
+    }
+
     // FIX B prelude: detect any trailing incomplete escape sequence and buffer
     // it now, before the main loop, so the loop never sees a partial head.
     let tailLen = trailingIncompleteEscape(arr, bound: peerPendingInputTailMax)
@@ -731,7 +821,24 @@ private func sendPeerInputBytes(_ surface: ghostty_surface_t, bytes: Data) {
                 i = close + 6
                 continue
             }
-            // No closing marker in this chunk — fall through.
+            // FIX C: no close marker in this frame — open the paste
+            // accumulator. Everything from `i + 6` to end-of-frame becomes
+            // the first slice of the paste body, including any bytes the
+            // FIX B prelude stashed as `peerPendingInputTail` (they belong
+            // to the paste body, not to a partial escape sequence). The
+            // next frame(s) will be funneled through `absorbPasteContinuation`
+            // until `\e[201~` arrives.
+            var body = Data(arr[(i + 6)..<arr.count])
+            if let tail = peerPendingInputTail.removeValue(forKey: surfaceKey),
+               !tail.isEmpty {
+                body.append(contentsOf: tail)
+            }
+            if body.count > peerPendingPasteBodyMax {
+                flushPeerPasteBody(surface, body)
+            } else {
+                peerPendingPasteBody[surfaceKey] = body
+            }
+            return
         }
 
         // ESC begins a well-formed but unrecognized control sequence
