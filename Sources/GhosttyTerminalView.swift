@@ -1703,6 +1703,9 @@ final class TerminalSurface: Identifiable, ObservableObject {
     }
 
     deinit {
+        #if DEBUG
+        dlog("deinit \(Self.self)")
+        #endif
         // TerminalSurface is always owned by @MainActor types (TerminalPanel, Workspace),
         // so deinit effectively runs on the main actor. Swift cannot verify this statically,
         // so we cannot call @MainActor-isolated releaseGhosttySurfaceAsync directly.
@@ -2924,60 +2927,65 @@ func pushTargetSurfaceSize(_ size: CGSize) {
         guard nonTextMods.isEmpty else { return false }
 
         let shifted = modifierFlags.contains(.shift)
-        guard let insertedText = physicalTextInsertedByTextInput(keyCode: keyCode, shifted: shifted) else {
+        let insertedTexts = physicalTextsInsertedByTextInput(keyCode: keyCode, shifted: shifted)
+        guard !insertedTexts.isEmpty else {
             return false
         }
 
         guard let last = accumulated.last else { return false }
-        return last == insertedText || last.hasSuffix(insertedText)
+        return insertedTexts.contains { insertedText in
+            last == insertedText || last.hasSuffix(insertedText)
+        }
     }
 
-    private static func physicalTextInsertedByTextInput(keyCode: UInt16, shifted: Bool) -> String? {
+    private static func physicalTextsInsertedByTextInput(keyCode: UInt16, shifted: Bool) -> [String] {
         switch keyCode {
         case 18: // kVK_ANSI_1
-            return shifted ? "!" : "1"
+            return [shifted ? "!" : "1"]
         case 19: // kVK_ANSI_2
-            return shifted ? "@" : "2"
+            return [shifted ? "@" : "2"]
         case 20: // kVK_ANSI_3
-            return shifted ? "#" : "3"
+            return [shifted ? "#" : "3"]
         case 21: // kVK_ANSI_4
-            return shifted ? "$" : "4"
+            return [shifted ? "$" : "4"]
         case 22: // kVK_ANSI_6
-            return shifted ? "^" : "6"
+            return [shifted ? "^" : "6"]
         case 23: // kVK_ANSI_5
-            return shifted ? "%" : "5"
+            return [shifted ? "%" : "5"]
         case 24: // kVK_ANSI_Equal
-            return shifted ? "+" : "="
+            return [shifted ? "+" : "="]
         case 25: // kVK_ANSI_9
-            return shifted ? "(" : "9"
+            return [shifted ? "(" : "9"]
         case 26: // kVK_ANSI_7
-            return shifted ? "&" : "7"
+            return [shifted ? "&" : "7"]
         case 27: // kVK_ANSI_Minus
-            return shifted ? "_" : "-"
+            return [shifted ? "_" : "-"]
         case 28: // kVK_ANSI_8
-            return shifted ? "*" : "8"
+            return [shifted ? "*" : "8"]
         case 29: // kVK_ANSI_0
-            return shifted ? ")" : "0"
+            return [shifted ? ")" : "0"]
         case 30: // kVK_ANSI_RightBracket
-            return shifted ? "}" : "]"
+            return [shifted ? "}" : "]"]
         case 33: // kVK_ANSI_LeftBracket
-            return shifted ? "{" : "["
+            return [shifted ? "{" : "["]
         case 39: // kVK_ANSI_Quote
-            return shifted ? "\"" : "'"
+            return [shifted ? "\"" : "'"]
         case 41: // kVK_ANSI_Semicolon
-            return shifted ? ":" : ";"
+            return [shifted ? ":" : ";"]
         case 42: // kVK_ANSI_Backslash
-            return shifted ? "|" : "\\"
+            return [shifted ? "|" : "\\"]
         case 43: // kVK_ANSI_Comma
-            return shifted ? "<" : ","
+            return [shifted ? "<" : ","]
         case 44: // kVK_ANSI_Slash
-            return shifted ? "?" : "/"
+            return [shifted ? "?" : "/"]
         case 47: // kVK_ANSI_Period
-            return shifted ? ">" : "."
+            return [shifted ? ">" : "."]
         case 49: // kVK_Space
-            return " "
+            return [" "]
+        case 50: // kVK_ANSI_Grave: US ` / ~, Korean ₩ / ~
+            return shifted ? ["~"] : ["`", "₩"]
         default:
-            return nil
+            return []
         }
     }
 
@@ -3209,6 +3217,9 @@ func pushTargetSurfaceSize(_ size: CGSize) {
     }
 
     deinit {
+        #if DEBUG
+        dlog("deinit \(Self.self)")
+        #endif
         // Surface lifecycle is managed by TerminalSurface, not the view
         if let eventMonitor {
             NSEvent.removeMonitor(eventMonitor)

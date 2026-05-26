@@ -32,6 +32,12 @@ final class TermMeshWebView: WKWebView {
     }
     var debugPointerFocusAllowanceDepth: Int { pointerFocusAllowanceDepth }
 
+    deinit {
+        #if DEBUG
+        dlog("deinit \(Self.self)")
+        #endif
+    }
+
     override func becomeFirstResponder() -> Bool {
         guard allowsFirstResponderAcquisitionEffective else {
 #if DEBUG

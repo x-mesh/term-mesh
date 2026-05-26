@@ -2,20 +2,18 @@
 
 All notable changes to term-mesh are documented here.
 
-## [Unreleased]
-
-## [0.131.0] - 2026-05-26
+## [0.132.0] - 2026-05-27
 
 ### Fixed
-- **connect-to-peer 원격 pane에서 큰 텍스트(수십 KB+) paste가 깨지거나 vim이 INSERT 모드에서 stuck되던 문제** — bracketed paste 마커(`\e[200~…\e[201~`)가 single frame(≤1 KB)에 모두 담길 때만 정상 처리되고, 멀티-frame paste(빌드 로그·긴 코드 등)는 호스트 측에서 마커가 silent drop돼 본문이 일반 keystroke로 흘러갔다. vim이 autoindent와 명령 모드 트리거로 본문을 망가뜨리고, 심한 경우 paste 누적기가 stuck돼 ESC·`:q!`까지 흡수되어 pane 자체가 사실상 unresponsive해졌다. 호스트에 stateful paste accumulator를 추가해 frame 경계와 무관하게 본문을 모았다가 `\e[201~` 도착 시 ghostty 표준 paste API로 일괄 inject한다. close 마커가 끝내 안 오는 경우(SSH 단절·인터럽트 등)도 frame 간 0.75초 inactivity 감지로 자동 flush + state 초기화해 stuck을 방지. **연결 대상(원격) 피어도 이 버전 이상이어야 호스트 측 수정이 적용**된다.
-- **마지막 team workspace를 닫을 때 40~80GB까지 누적되던 메모리 누수** — 윈도우에 워크스페이스가 하나뿐일 때 `TabManager.closeWorkspace`가 panel cleanup 전체를 skip해서 TerminalPanel·TerminalSurface·Ghostty 렌더 상태가 영구히 살아있던 문제. 이제 cleanup이 무조건 실행되고 마지막 탭은 빈 워크스페이스로 교체된다. 팀을 자주 생성/파괴하는 장시간 세션에서 두드러진 누수가 해소.
-- **panel close 경로에서 AutoReplyPoller per-panel state 미해제** — `AutoReplyPoller.forget(panelId:)`가 일부 close 경로(특히 `closeWorkspace`, `didCloseTab` non-detach)에서 호출되지 않아 lastScrollbackText 버퍼와 detector 인스턴스가 잔존하던 문제. 모든 경로에서 해제되도록 수정.
-- **다수 에이전트 팀 동시 운영 시 AutoReplyPoller가 메인 스레드를 5초 이상 막아 발생하던 ANR/hang** — 폴링 주기를 0.4s → 1.0s로 늘리고, `ghostty_surface_read_text`를 메인 스레드 밖으로 빼냈다. `tick()`이 MainActor에서 `SurfaceReadLease` 토큰만 확보한 뒤 모든 터미널 scrollback 읽기를 `userInitiated` 백그라운드 큐로 분산하고, detector 상태 업데이트와 이벤트 emit만 메인으로 복귀. 여러 팀이 동시에 활성일 때 발생하던 O(N×M) 동기 read 루프가 사라져 Sentry TERM-MESH-2R/2Q/2P/2N/2M/2K/2J/2H/2G/2F/1D 계열 hang이 해소.
-- **`tm-agent`가 제어 소켓 응답이 비어있을 때 raw JSON parse error 대신 명시적 에러 반환** — 앱 미실행·socket reset·early disconnect 시 `{"code":"no_app","message":"no active term-mesh app..."}`로 보고. stop hook과 외부 자동화가 원인 파악 가능.
-
-### Thanks to 1 contributor!
-
-- [@JINWOO-J](https://github.com/JINWOO-J)
+- `tm-agent` now reports `{"code":"no_app","message":"no active term-mesh app..."}` instead of a raw JSON parse error when the control socket returns nothing (app not running, socket reset, or early disconnect).
+- Critical memory leak when destroying the last team workspace in a window — `TabManager.closeWorkspace` previously skipped all panel cleanup if the workspace was the only tab. TerminalPanel + TerminalSurface + Ghostty render state remained alive forever; reported up to 40–80GB after long sessions with repeated team create/destroy. Cleanup now runs unconditionally and the last tab is replaced by a fresh blank workspace.
+- `AutoReplyPoller.forget(panelId:)` is now called on all panel close paths (`closeWorkspace` and `didCloseTab` non-detach) to release per-panel state (lastScrollbackText buffers, detector instances).
+- AutoReplyPoller hang on main thread — increased poll interval from 0.4s to 1.0s to stay under the 5000ms ANR threshold when running multiple agent teams (Sentry TERM-MESH-2R, -2Q, -2P, -2N, -2M, -2K, -2J, -2H, -2G, -2F, -1D).
+- AutoReplyPoller main-thread block (Phase 2) — moved `ghostty_surface_read_text` off the main thread. `tick()` now acquires `SurfaceReadLease` tokens on MainActor then fans out all terminal scrollback reads to a background `userInitiated` queue; only detector state updates and event emission run back on main. Eliminates the O(N×M) synchronous read loop that caused the Sentry hangs when multiple agent teams were active simultaneously.
+- **tapHubs 메모리 누수** — peer-federation 세션이 SSH 단절·relay crash 등 비정상 종료로 끝날 때 `PtyTapHub.surfaceRef` 강참조가 남아 TerminalSurface(10–30MB)가 해제되지 않던 문제. 패널이 닫힐 때 `PeerHostCoordinator.invalidateTapHub` 를 호출해 hub를 즉시 shutdown하고 강참조를 nil로 해제. `TabManager.closeWorkspace`, `Workspace+BonsplitDelegate.didCloseTab`, `didClosePane` 세 경로 모두 처리(`didClosePane` 경로는 이번 패치로 추가).
+- **AutoReplyPoller `lastScrollbackText` 무제한 증가** — 장시간 에이전트 팀 운용 시 scrollback 전체가 per-panel 버퍼에 계속 쌓이며 세션 1시간 이후 수백 MB까지 성장하던 문제. scrollback 저장 시 최근 2MB 꼬리만 보존하도록 캡 적용(`lastScrollbackCapBytes = 2 MB`). delta 감지는 `previous` 전체를 역방향 탐색(A 경로)해 vim/htop의 반복 STATUS 헤더 때문에 256자 anchor가 delta 안에서 재매칭되던 오탐(false drop)을 제거. 롤백 완전 회전 시에는 256자 anchor 폴백(B 경로) 사용.
+- **단일 패널 Bonsplit 닫기(didClosePane) 경로의 cleanup 누락** — Bonsplit에서 패널을 닫을 때 `splitTabBar(_:didClosePane:)` 경로가 `AutoReplyPoller`, `PeerHostCoordinator.invalidateTapHub`, `TerminalController.v2CleanupSurface` 호출을 누락해 per-panel 상태와 PtyTapHub 강참조가 그대로 남아있던 문제. `didCloseTab` 비-분리 경로 및 `TabManager.closeWorkspace`의 동일 cleanup 스택을 `didClosePane`에도 적용.
+- **peer-relay 미인식 CSI/OSC/SS3 시퀀스 전달 버그 재발** — 이전에 DROP으로 수정했던 경로(mouse reports, OSC color queries 등 unrecognized CSI)가 pair WIP 커밋에서 `sendPeerKeyEvent(text: ESC…)` 경로로 복귀해 원격 TUI 화면 깨짐이 재발. DROP 동작 복원. bracketed-paste 본문은 `peerPendingPasteBody` 경로로 처리되므로 영향 없음.
 
 ## [0.130.0] - 2026-05-25
 

@@ -14,6 +14,7 @@ mod monitor;
 mod pane_tracker;
 mod peer;
 mod socket;
+mod supervisor;
 mod tokens;
 // watcher Phase 2 (P1): autonomous drift-watch scheduler. The file is
 // `watch.rs` but the module is named `drift_watch` so it does not collide with

@@ -923,6 +923,7 @@ class TabManager: ObservableObject {
             TerminalController.shared.v2CleanupSurface(panelId)
             panel.close()
             AutoReplyPoller.shared.forget(panelId: panelId)
+            PeerHostCoordinator.shared.invalidateTapHub(forSurfaceId: panelId)
         }
 
         // term-mesh: Mark worktree as stale (no longer auto-deleted on tab close)

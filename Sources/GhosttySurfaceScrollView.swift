@@ -472,6 +472,9 @@ final class GhosttySurfaceScrollView: NSView {
     }
 
     deinit {
+        #if DEBUG
+        dlog("deinit \(Self.self)")
+        #endif
         observers.forEach { NotificationCenter.default.removeObserver($0) }
         windowObservers.forEach { NotificationCenter.default.removeObserver($0) }
         cancelFocusRequest()

@@ -1303,11 +1303,13 @@ final class BrowserPanel: Panel, ObservableObject {
 
         // Set up navigation delegate
         let navDelegate = BrowserNavigationDelegate()
-        navDelegate.didFinish = { webView in
+        navDelegate.didFinish = { [weak self] webView in
+            guard let self else { return }
             self.browserHistory.recordVisit(url: webView.url, title: webView.title)
             Task { @MainActor [weak self] in
-                self?.refreshFavicon(from: webView)
-                self?.applyBrowserThemeModeIfNeeded()
+                guard let self else { return }
+                self.refreshFavicon(from: webView)
+                self.applyBrowserThemeModeIfNeeded()
             }
         }
         navDelegate.didFailNavigation = { [weak self] _, failedURL in
@@ -1820,6 +1822,9 @@ final class BrowserPanel: Panel, ObservableObject {
     }
 
     deinit {
+        #if DEBUG
+        dlog("deinit \(Self.self)")
+        #endif
         developerToolsRestoreRetryWorkItem?.cancel()
         developerToolsRestoreRetryWorkItem = nil
         let webView = webView
@@ -2548,6 +2553,12 @@ private class BrowserNavigationDelegate: NSObject, WKNavigationDelegate {
     /// The URL of the last navigation that was attempted. Used to preserve the omnibar URL
     /// when a provisional navigation fails (e.g. connection refused on localhost:3000).
     var lastAttemptedURL: URL?
+
+    deinit {
+        #if DEBUG
+        dlog("deinit \(Self.self)")
+        #endif
+    }
 
     func webView(_ webView: WKWebView, didStartProvisionalNavigation navigation: WKNavigation!) {
         lastAttemptedURL = webView.url

@@ -42,13 +42,27 @@ final class PtyTapHub: @unchecked Sendable {
 
     let surfaceID: UUID
     let surfacePtr: ghostty_surface_t
-    // Strong reference prevents TerminalSurface.deinit from running while attached.
-    let surfaceRef: TerminalSurface
+    // Strong reference prevents TerminalSurface.deinit during active relay.
+    // Nulled by shutdown() when the panel closes to release the surface.
+    private var surfaceRef: TerminalSurface?
 
     init(surfaceID: UUID, surfacePtr: ghostty_surface_t, surfaceRef: TerminalSurface) {
         self.surfaceID = surfaceID
         self.surfacePtr = surfacePtr
         self.surfaceRef = surfaceRef
+    }
+
+    /// Call when the backing panel closes (not on normal peer detach).
+    /// Finishes all streams and drops the TerminalSurface strong reference.
+    func shutdown() {
+        finishAll()
+        surfaceRef = nil
+    }
+
+    deinit {
+        #if DEBUG
+        dlog("deinit \(Self.self)")
+        #endif
     }
 
     func makeStream(initialBytes: Data?) -> (UUID, AsyncStream<Data>) {
@@ -108,6 +122,16 @@ final class PtyTapHub: @unchecked Sendable {
 @MainActor
 final class GhosttyPaneSurfaceProvider: PeerSurfaceProvider {
     private var tapHubs: [UUID: PtyTapHub] = [:]
+
+    /// Called when a terminal panel closes. Shuts down the hub (finishes all
+    /// peer streams + drops TerminalSurface ref) without waiting for peer detach.
+    func invalidateTapHub(forSurfaceId surfaceId: UUID) {
+        guard let hub = tapHubs.removeValue(forKey: surfaceId) else { return }
+        hub.shutdown()
+        #if DEBUG
+        dlog("tapHub.invalidate surfaceId=\(surfaceId.uuidString.prefix(8))")
+        #endif
+    }
 
     // MARK: PeerSurfaceProvider
 
@@ -876,29 +900,24 @@ private func sendPeerInputBytes(_ surface: ghostty_surface_t, bytes: Data) {
             return
         }
 
-        // ESC begins a well-formed but unrecognized control sequence
-        // (single bracketed-paste close marker carried over from the
-        // previous chunk, mouse reports, OSC color queries, …). The
-        // previous behavior split this into a lone ESC key event + a
-        // printable run for the body, which broke end-to-end bracketed
-        // paste: the host Ghostty's surface_key encoder turned the ESC
-        // into either a separate PTY write or, in kitty mode, `\e[27u`
-        // — the next-hop CSI parser then either timed the lone ESC out
-        // or consumed it as part of `\e[27u`, leaving `[200~text[201~`
-        // to display as literal characters in claude/codex/vim.
+        // Unrecognized CSI/OSC/SS3/SS2: DROP silently.
+        //
+        // Sending via sendPeerKeyEvent(text: ESC…) is broken for two reasons:
+        //   1. ghostty_surface_key re-encodes the leading ESC byte (kitty mode
+        //      → `\e[27u`, legacy → a separate PTY ESC write), corrupting the
+        //      next-hop CSI parser and leaving bracketed-paste markers as
+        //      literal visible characters in claude/codex/vim.
+        //   2. ghostty_surface_text auto-wraps with bracketed-paste markers
+        //      when the destination surface has bracketed-paste mode on —
+        //      also wrong for arbitrary escape sequences.
+        // Drop is the least-bad option until a verbatim-byte-injection API
+        // exists in Ghostty. Bracketed-paste bodies are handled by the
+        // peerPendingPasteBody path BEFORE this point and are never dropped.
         if byte == 0x1b,
            let consumed = peerEscapeSequenceLength(arr, start: i),
            consumed > 1 {
-            let raw = Array(arr[i..<i + consumed])
-            // ASCII-only fast path keeps the text-field UTF-8 bytes
-            // byte-identical with the original sequence. Any high bytes
-            // fall through to the existing per-scalar path below.
-            if raw.allSatisfy({ $0 < 0x80 }),
-               let payload = String(bytes: raw, encoding: .ascii) {
-                sendPeerKeyEvent(surface, keycode: 0, text: payload)
-                i += consumed
-                continue
-            }
+            i += consumed
+            continue
         }
 
         if let mapping = peerSingleByteKeyMapping(byte) {

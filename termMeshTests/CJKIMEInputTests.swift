@@ -1050,6 +1050,9 @@ final class CJKIMEKeyTextAccumulatorTests: XCTestCase {
             (47, [], "."),
             (47, [.shift], ">"),
             (49, [], " "),
+            (50, [], "`"),
+            (50, [], "₩"),
+            (50, [.shift], "~"),
         ]
 
         for entry in cases {
@@ -1072,6 +1075,27 @@ final class CJKIMEKeyTextAccumulatorTests: XCTestCase {
                 modifierFlags: [.option]
             ),
             "Option-modified punctuation can be layout/dead-key text and should not suppress physical replay"
+        )
+    }
+
+    func testKoreanCommitPlusTildeDoesNotReplayWonKey() {
+        let insertedByTextInput = GhosttyNSView.accumulatedTextIncludesPhysicalKey(
+            ["아~"],
+            keyCode: 50,
+            modifierFlags: [.shift]
+        )
+
+        XCTAssertTrue(insertedByTextInput, "Korean IME can commit Hangul plus Shift+Grave as one text chunk")
+        XCTAssertFalse(
+            GhosttyNSView.shouldReplayPhysicalKeyAfterAccumulatedText(
+                keyCode: 50,
+                modifierFlags: [.shift],
+                markedTextBefore: true,
+                hasMarkedTextAfter: false,
+                sentAccumulatedText: true,
+                physicalKeyAlreadyInsertedByTextInput: insertedByTextInput
+            ),
+            "Replaying Shift+Grave after text input inserted '~' can append an extra Korean won sign in Codex"
         )
     }
 

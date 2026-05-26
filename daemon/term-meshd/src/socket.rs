@@ -5,12 +5,14 @@ use std::sync::{Arc, RwLock};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixListener;
 use tokio::sync::watch;
+use tokio::task::JoinSet;
 use tokio::time::{timeout, Duration};
 
 use crate::agent::AgentSessionManager;
 use crate::headless::HeadlessManager;
 use crate::monitor::{Anomaly, MonitorHandle, SystemSnapshot};
 use crate::pane_tracker::PaneTracker;
+use crate::supervisor::{shutdown_supervised, spawn_supervised};
 use crate::tokens::UsageTracker;
 use crate::watcher::WatcherHandle;
 use crate::worktree;
@@ -239,6 +241,7 @@ pub async fn serve(
     ));
     // Phase 2.5: 30s disk flush for dirty usage counters.
     let usage_flush_task = tokio::spawn(run_usage_disk_flusher(ctx.clone(), shutdown_rx.clone()));
+    let mut connection_tasks = JoinSet::new();
 
     loop {
         tokio::select! {
@@ -251,8 +254,9 @@ pub async fn serve(
                             continue;
                         }
                         let ctx = ctx.clone();
-                        tokio::spawn(async move {
-                            if let Err(e) = handle_connection(stream, &ctx).await {
+                        let connection_shutdown_rx = shutdown_rx.clone();
+                        spawn_supervised(&mut connection_tasks, async move {
+                            if let Err(e) = handle_connection(stream, &ctx, connection_shutdown_rx).await {
                                 tracing::error!("connection error: {e}");
                             }
                         });
@@ -274,6 +278,7 @@ pub async fn serve(
     jsonl_usage_broadcast_task.abort();
     codex_usage_broadcast_task.abort();
     usage_flush_task.abort();
+    shutdown_supervised(&mut connection_tasks, "socket").await;
 
     // Phase 2.5: final usage flush before exit (best-effort).
     {
@@ -302,14 +307,30 @@ pub async fn serve(
     Ok(())
 }
 
-async fn handle_connection(stream: tokio::net::UnixStream, ctx: &Context) -> anyhow::Result<()> {
+async fn handle_connection(
+    stream: tokio::net::UnixStream,
+    ctx: &Context,
+    mut shutdown_rx: watch::Receiver<bool>,
+) -> anyhow::Result<()> {
     let (reader, mut writer) = stream.into_split();
     let mut lines = BufReader::new(reader).lines();
 
-    while let Some(line) = timeout(Duration::from_secs(60), lines.next_line())
-        .await
-        .map_err(|_| anyhow::anyhow!("read timeout"))??
-    {
+    loop {
+        let line = tokio::select! {
+            changed = shutdown_rx.changed() => {
+                if changed.is_err() || *shutdown_rx.borrow() {
+                    return Ok(());
+                }
+                continue;
+            }
+            line = timeout(Duration::from_secs(60), lines.next_line()) => {
+                match line.map_err(|_| anyhow::anyhow!("read timeout"))?? {
+                    Some(line) => line,
+                    None => break,
+                }
+            }
+        };
+
         let req: Request = match serde_json::from_str(&line) {
             Ok(r) => r,
             Err(e) => {
@@ -335,7 +356,7 @@ async fn handle_connection(stream: tokio::net::UnixStream, ctx: &Context) -> any
         // Streaming handlers hold the writer for their lifetime and must
         // exit handle_connection entirely — they cannot share the loop.
         if req.method == "events.subscribe" {
-            return stream_subscribe_events(req, writer, ctx).await;
+            return stream_subscribe_events(req, writer, ctx, shutdown_rx).await;
         }
 
         let resp = dispatch(&req, ctx).await;
@@ -360,6 +381,7 @@ async fn stream_subscribe_events(
     req: Request,
     mut writer: tokio::net::unix::OwnedWriteHalf,
     ctx: &Context,
+    mut shutdown_rx: watch::Receiver<bool>,
 ) -> anyhow::Result<()> {
     #[derive(serde::Deserialize, Default)]
     struct SubscribeParams {
@@ -427,6 +449,12 @@ async fn stream_subscribe_events(
         // Three-way select: deadline | keepalive ping | real event.
         let line: Option<Vec<u8>> = if let Some(dl) = deadline {
             tokio::select! {
+                changed = shutdown_rx.changed() => {
+                    if changed.is_err() || *shutdown_rx.borrow() {
+                        break;
+                    }
+                    None
+                }
                 _ = tokio::time::sleep_until(dl) => break,
                 _ = ping_interval.tick() => {
                     Some(serde_json::to_vec(&serde_json::json!({"kind":"keepalive","ts_ms":ts_ms()}))?)
@@ -444,6 +472,12 @@ async fn stream_subscribe_events(
             }
         } else {
             tokio::select! {
+                changed = shutdown_rx.changed() => {
+                    if changed.is_err() || *shutdown_rx.borrow() {
+                        break;
+                    }
+                    None
+                }
                 _ = ping_interval.tick() => {
                     Some(serde_json::to_vec(&serde_json::json!({"kind":"keepalive","ts_ms":ts_ms()}))?)
                 }

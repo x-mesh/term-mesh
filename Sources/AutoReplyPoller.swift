@@ -33,6 +33,8 @@ final class AutoReplyPoller {
     /// rust default's idle_debounce floor; we tick a bit faster so debounce
     /// + scrollback diff catch up promptly after the agent finishes printing.
     private let pollInterval: TimeInterval = 1.0
+    // FIX 2: Cap lastScrollbackText to avoid unbounded memory growth on long-running agents.
+    private static let lastScrollbackCapBytes = 2 * 1024 * 1024
 
     // FIX 1: Private serial queue so concurrent ticks can't interleave reads.
     private let pollQueue = DispatchQueue(label: "term-mesh.auto-reply.poll", qos: .userInitiated)
@@ -233,12 +235,45 @@ final class AutoReplyPoller {
         }
     }
 
+    /// Trim `s` to keep at most `byteLimit` UTF-8 bytes, snapping forward to the
+    /// nearest UTF-8 character boundary so the result is always a valid String.
+    ///
+    /// Using `.suffix(byteLimit)` on a String uses CHARACTER count, which can
+    /// retain >byteLimit bytes for multibyte text. This helper operates in the
+    /// UTF-8 byte view, then walks forward past any UTF-8 continuation bytes
+    /// (0b10xxxxxx) so the slice boundary always lands on a leading byte.
+    ///
+    /// Edge cases:
+    /// - All-ASCII: identical to `.suffix(byteLimit)` — continuation walk is 0 steps.
+    /// - All-multibyte (e.g. Korean): trim lands mid-codepoint → walk advances to
+    ///   next leading byte; result is at most `byteLimit + 3` UTF-8 bytes (one
+    ///   extra 3-byte scalar), which is negligible against a 2MB cap.
+    /// - Empty string: returns "" immediately.
+    nonisolated private static func trimToTailBytes(_ s: String, byteLimit: Int) -> String {
+        let utf8 = s.utf8
+        guard utf8.count > byteLimit else { return s }
+        let dropBytes = utf8.count - byteLimit
+        var idx = utf8.index(utf8.startIndex, offsetBy: dropBytes)
+        // Walk forward past continuation bytes (0b10xxxxxx) to the next leading byte.
+        while idx < utf8.endIndex, (utf8[idx] & 0b1100_0000) == 0b1000_0000 {
+            idx = utf8.index(after: idx)
+        }
+        // Construct result from the UTF-8 sub-view. The loop above guarantees
+        // `idx` is on a leading byte, so this slice is always valid UTF-8.
+        return String(utf8[idx...]) ?? String(s.suffix(byteLimit))
+    }
+
     /// Apply one background read result to the per-panel detector state.
     /// All PanelState mutations happen here, on MainActor.
     private func applyResult(panelId: UUID, teamName: String, agentName: String,
                               snapshot: String?, delta: String, at now: Date) {
         guard let state = perPanel[panelId] else { return }  // panel GC'd between read and apply
-        if let snap = snapshot { state.lastScrollbackText = snap }
+        if let snap = snapshot {
+            // FIX 2: keep only the tail so per-panel state stays bounded.
+            // trimToTailBytes operates in UTF-8 byte space (not character count)
+            // so the cap is a true byte bound, not a potentially-larger char bound.
+            state.lastScrollbackText = Self.trimToTailBytes(snap, byteLimit: Self.lastScrollbackCapBytes)
+        }
         if !delta.isEmpty, let data = delta.data(using: .utf8) {
             if let ev = state.detector.pushBytes(data, at: now) {
                 tryEmit(panelId: panelId, state: state, event: ev,
@@ -315,17 +350,66 @@ final class AutoReplyPoller {
         return String(data: data, encoding: .utf8)
     }
 
-    /// Return the suffix of `current` that wasn't in `previous`. When
-    /// scrollback rotates and the common prefix no longer matches, we
-    /// fall back to returning the entire current text — the detector
-    /// is line-anchored so re-feeding earlier lines just resets to Idle
-    /// (idempotent for our purposes; new emit blocked by lastFiredHash).
+    /// Number of characters to use as an anchor fingerprint when `previous` is
+    /// a cap-trimmed tail (not a full prior snapshot). 256 chars ≈ 1–2 CLI
+    /// output lines; enough to disambiguate vim/htop redraws while staying fast.
+    private static let deltaAnchorCharCount = 256
+
+    /// Return the suffix of `current` that wasn't in `previous`.
+    ///
+    /// Two cases:
+    ///
+    /// **Fast path** — `previous` is the untruncated prior snapshot and is still
+    /// a prefix of `current` (the normal grow-only case). Returns the appended
+    /// suffix directly.
+    ///
+    /// **Anchor path** — `previous` is the cap-trimmed tail stored by
+    /// `applyResult` (after `lastScrollbackCapBytes` was hit). The prefix check
+    /// fails because `previous` is a suffix, not a prefix. We instead take the
+    /// last `deltaAnchorCharCount` chars of `previous` as a fingerprint, search
+    /// for it backwards in `current`, and emit everything after that match.
+    /// Falls back to full `current` only when the anchor isn't found — which
+    /// means scrollback rotated past the anchor window or the terminal cleared
+    /// (genuine fresh-snapshot case). The detector is line-anchored so
+    /// re-feeding earlier lines resets it to Idle (idempotent; duplicate emits
+    /// are blocked by `lastFiredHash`).
     nonisolated static func computeDelta(previous: String, current: String) -> String {
         if previous.isEmpty { return current }
+        if current == previous { return "" }
+        // Fast path: previous is a true prefix of current (no cap was hit).
         if current.hasPrefix(previous) {
             return String(current.dropFirst(previous.count))
         }
-        // Scrollback rotated or screen was cleared
+        // (A) Full-tail search: try `previous` itself as a backwards substring
+        // match. This is the common case when `previous` is the 2MB cap-trimmed
+        // tail and `current` = previous + new output. Even if the new output
+        // contains the same 256-char anchor substring again (e.g. vim/htop
+        // redraws that repeat the STATUS header), matching `previous` in full
+        // finds the correct sync point rather than the duplicate anchor inside
+        // the delta.
+        //
+        // Limitation: if the new output appends `previous` verbatim AGAIN
+        // (rapid identical-tail repeats), `range(of:.backwards)` matches the
+        // LAST occurrence → emits only the bytes after that. Bytes between the
+        // first and second copy are dropped. This is an accepted trade-off:
+        // identical-tail repetition in CLI output is extremely rare, and the
+        // alternative (short-anchor matching) has a much higher false-positive
+        // rate on vim/htop redraws.
+        if let range = current.range(of: previous, options: .backwards) {
+            return String(current[range.upperBound...])
+        }
+        // (B) Rotation fallback: `previous` is not found in `current` at all —
+        // scrollback rotated entirely past `previous` (e.g. `clear` or a
+        // long-running tool that scrolled the buffer). Use the last
+        // `deltaAnchorCharCount` chars as a weak fingerprint to find a re-sync
+        // point. Less precise than (A); only reached when (A) failed.
+        let anchorLen = min(deltaAnchorCharCount, previous.count)
+        let anchor = String(previous.suffix(anchorLen))
+        if let range = current.range(of: anchor, options: .backwards) {
+            return String(current[range.upperBound...])
+        }
+        // (C) No match at all: screen cleared or entirely new content. Treat
+        // current as the fresh delta.
         return current
     }
 }
