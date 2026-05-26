@@ -447,22 +447,6 @@ struct TeamCreationView: View {
     @State private var workingDirectoryError: String? = nil
     @State private var isDropTargeted: Bool = false
 
-    init(
-        onCreate: ((_ teamName: String, _ leaderMode: String, _ leaderModel: String, _ agents: [TeamAgentRow], _ worktreeMode: String, _ executionMode: String, _ resumeSessionId: String?, _ pairMode: String, _ pairModel: String, _ pairSpec: String, _ workingDirectory: String) -> Bool)? = nil,
-        onResume: ((_ result: [String: Any]) -> Void)? = nil,
-        initialMode: String = "new",
-        defaultWorkingDirectory: String = "",
-        defaultWorkingDirectorySource: WorkingDirectorySource = .currentPane
-    ) {
-        self.onCreate = onCreate
-        self.onResume = onResume
-        self.initialMode = initialMode
-        self.defaultWorkingDirectory = defaultWorkingDirectory
-        self.defaultWorkingDirectorySource = defaultWorkingDirectorySource
-        _workingDirectory = State(initialValue: defaultWorkingDirectory)
-        _workingDirectorySource = State(initialValue: defaultWorkingDirectorySource)
-    }
-
     var body: some View {
         VStack(spacing: 0) {
             header
