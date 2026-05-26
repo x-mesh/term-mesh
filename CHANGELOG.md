@@ -2,7 +2,7 @@
 
 All notable changes to term-mesh are documented here.
 
-## [Unreleased]
+## [0.132.0] - 2026-05-27
 
 ### Fixed
 - `tm-agent` now reports `{"code":"no_app","message":"no active term-mesh app..."}` instead of a raw JSON parse error when the control socket returns nothing (app not running, socket reset, or early disconnect).
