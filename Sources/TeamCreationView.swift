@@ -1,5 +1,6 @@
 import AppKit
 import SwiftUI
+import UniformTypeIdentifiers
 
 // MARK: - Phase 2 Notifications
 
@@ -347,7 +348,7 @@ struct TeamCreationView: View {
     @ObservedObject var teamTemplateManager = TeamTemplateManager.shared
     @ObservedObject var providerDetector = ProviderDetector.shared
 
-    var onCreate: ((_ teamName: String, _ leaderMode: String, _ leaderModel: String, _ agents: [TeamAgentRow], _ worktreeMode: String, _ executionMode: String, _ resumeSessionId: String?, _ pairMode: String, _ pairModel: String, _ pairSpec: String) -> Bool)?
+    var onCreate: ((_ teamName: String, _ leaderMode: String, _ leaderModel: String, _ agents: [TeamAgentRow], _ worktreeMode: String, _ executionMode: String, _ resumeSessionId: String?, _ pairMode: String, _ pairModel: String, _ pairSpec: String, _ workingDirectory: String) -> Bool)?
     /// Phase 2: called after a successful `headless.resume_team` RPC.
     /// Receives the decoded result dictionary. Caller is responsible for
     /// registering the team in TeamOrchestrator and switching workspace cwd
@@ -357,6 +358,8 @@ struct TeamCreationView: View {
     /// open directly into the Resume picker (used by the sidebar footer
     /// resumable counter).
     var initialMode: String = "new"
+    var defaultWorkingDirectory: String = ""
+    var defaultWorkingDirectorySource: WorkingDirectorySource = .currentPane
 
     @AppStorage("teamDefaultLeaderMode") private var defaultLeaderMode = "claude"
     @AppStorage("teamDefaultModel") private var defaultModel = "sonnet"
@@ -424,6 +427,11 @@ struct TeamCreationView: View {
     }
     @State private var bulkCli = "claude"
 
+    @State private var workingDirectory: String = ""
+    @State private var workingDirectorySource: WorkingDirectorySource = .currentPane
+    @State private var workingDirectoryError: String? = nil
+    @State private var isDropTargeted: Bool = false
+
     var body: some View {
         VStack(spacing: 0) {
             header
@@ -467,6 +475,9 @@ struct TeamCreationView: View {
             if !AgentRolePreset.models(for: leaderMode).contains(leaderModel) {
                 leaderModel = AgentRolePreset.defaultModel(for: leaderMode)
             }
+            workingDirectory = defaultWorkingDirectory
+            workingDirectorySource = defaultWorkingDirectorySource
+            validateWorkingDirectory()
             refreshRunbookStatus()
             // Phase 2.5 — honor caller's requested initial mode (sidebar
             // resumable footer opens us directly into resume picker).
@@ -474,6 +485,10 @@ struct TeamCreationView: View {
                 creationMode = "resume"
                 loadResumableTeams()
             }
+        }
+        .onChange(of: workingDirectory) { _ in
+            validateWorkingDirectory()
+            refreshRunbookStatus()
         }
         // Phase 2: refresh the resume list when a destroy event arrives while
         // the sheet is open. We listen on the .headlessTeamDestroyed
@@ -893,8 +908,7 @@ struct TeamCreationView: View {
     /// the daemon helper (no main-thread focus side effects) so we share the
     /// same realpath logic the daemon uses for list_resumable filtering.
     private func currentGitRoot() -> String? {
-        let cwd = resolveWorkingDirectory()
-        return TermMeshDaemon.shared.findGitRoot(from: cwd)
+        return TermMeshDaemon.shared.findGitRoot(from: workingDirectory)
     }
 
     /// Confirm and delete an archived team via `team.delete_archive`. Refreshes
@@ -1092,6 +1106,8 @@ struct TeamCreationView: View {
             }
             .animation(.easeInOut(duration: 0.15), value: isTeamNameDuplicate)
 
+            workingDirectoryRow
+
             HStack {
                 Text("Leader")
                     .font(.subheadline.bold())
@@ -1250,7 +1266,7 @@ struct TeamCreationView: View {
                 }
                 .onChange(of: resumeSession) { enabled in
                     if enabled && recentSessions.isEmpty {
-                        let dir = resolveWorkingDirectory()
+                        let dir = workingDirectory
                         Task.detached(priority: .userInitiated) {
                             let sessions = ClaudeSession.listRecent(workingDirectory: dir)
                             await MainActor.run { recentSessions = sessions }
@@ -2166,7 +2182,7 @@ struct TeamCreationView: View {
             } else {
                 Button(executionMode == "headless" ? "Create Headless Team" : "Create Team") { createTeam() }
                     .keyboardShortcut(.defaultAction)
-                    .disabled(teamName.isEmpty || agents.isEmpty || isTeamNameDuplicate)
+                    .disabled(teamName.isEmpty || agents.isEmpty || isTeamNameDuplicate || workingDirectoryError != nil)
             }
         }
         .padding(.horizontal, 20)
@@ -2462,7 +2478,7 @@ struct TeamCreationView: View {
     }
 
     private func refreshRunbookStatus() {
-        runbookStatus = AgentRunbookService.shared.status(workingDirectory: resolveWorkingDirectory())
+        runbookStatus = AgentRunbookService.shared.status(workingDirectory: workingDirectory)
     }
 
     private func runbookBadge(for agent: TeamAgentRow) -> some View {
@@ -2540,7 +2556,7 @@ struct TeamCreationView: View {
             roleName: agent.preset.name,
             presetInstructions: agent.preset.instructions,
             customInstructions: customInstructions,
-            workingDirectory: resolveWorkingDirectory()
+            workingDirectory: workingDirectory
         )
     }
 
@@ -2560,17 +2576,130 @@ struct TeamCreationView: View {
     }
 
     /// Resolve the current project's working directory from the key window's active tab.
-    private func resolveWorkingDirectory() -> String {
-        if let kw = NSApp.keyWindow,
-           let ctx = AppDelegate.shared?.contextForMainWindow(kw),
-           let dir = ctx.tabManager.selectedTab?.currentDirectory {
-            return dir
+    private func validateWorkingDirectory() {
+        let path = TeamCreationRecentDirs.normalize(workingDirectory)
+        guard !path.isEmpty else {
+            workingDirectoryError = "Directory is required"
+            return
         }
-        if let ctx = AppDelegate.shared?.mainWindowContexts.values.first,
-           let dir = ctx.tabManager.selectedTab?.currentDirectory {
-            return dir
+        var isDir: ObjCBool = false
+        let exists = FileManager.default.fileExists(atPath: path, isDirectory: &isDir)
+        if !exists {
+            workingDirectoryError = "Directory does not exist"
+        } else if !isDir.boolValue {
+            workingDirectoryError = "Path is not a directory"
+        } else if !FileManager.default.isReadableFile(atPath: path) {
+            workingDirectoryError = "Directory not readable"
+        } else {
+            workingDirectoryError = nil
         }
-        return FileManager.default.currentDirectoryPath
+    }
+
+    @ViewBuilder
+    private var workingDirectoryRow: some View {
+        VStack(alignment: .trailing, spacing: 4) {
+            HStack(spacing: 6) {
+                Text("Directory")
+                    .font(.subheadline.bold())
+                Spacer()
+                TextField("~/projects", text: Binding(
+                    get: { TeamCreationRecentDirs.displayPath(workingDirectory) },
+                    set: { workingDirectory = TeamCreationRecentDirs.normalize($0) }
+                ))
+                .textFieldStyle(.roundedBorder)
+                .frame(minWidth: 140, maxWidth: 220)
+                .overlay(
+                    RoundedRectangle(cornerRadius: 5)
+                        .stroke(
+                            workingDirectoryError != nil ? Color.red :
+                            isDropTargeted ? Color.accentColor :
+                            Color.clear,
+                            lineWidth: (workingDirectoryError != nil || isDropTargeted) ? 1 : 0
+                        )
+                )
+                .onDrop(of: [UTType.fileURL], isTargeted: $isDropTargeted) { providers in
+                    guard let provider = providers.first else { return false }
+                    _ = provider.loadObject(ofClass: URL.self) { url, error in
+                        guard let url, error == nil else { return }
+                        var isDir: ObjCBool = false
+                        let exists = FileManager.default.fileExists(atPath: url.path, isDirectory: &isDir)
+                        guard exists && isDir.boolValue else { return }
+                        DispatchQueue.main.async {
+                            workingDirectory = TeamCreationRecentDirs.normalize(url.path)
+                            workingDirectorySource = .userPicked
+                            validateWorkingDirectory()
+                        }
+                    }
+                    return true
+                }
+
+                Button("Choose…") {
+                    guard let win = NSApp.keyWindow else { return }
+                    let panel = NSOpenPanel()
+                    panel.canChooseDirectories = true
+                    panel.canChooseFiles = false
+                    panel.allowsMultipleSelection = false
+                    if !workingDirectory.isEmpty {
+                        panel.directoryURL = URL(fileURLWithPath: workingDirectory)
+                    }
+                    panel.beginSheetModal(for: win) { resp in
+                        if resp == .OK, let url = panel.url {
+                            workingDirectory = TeamCreationRecentDirs.normalize(url.path)
+                            workingDirectorySource = .userPicked
+                            validateWorkingDirectory()
+                        }
+                    }
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+
+                let recentDirs = TeamCreationRecentDirs.shared.current()
+                Menu("▾") {
+                    if recentDirs.isEmpty {
+                        Text("No recent directories")
+                            .foregroundStyle(.secondary)
+                    } else {
+                        ForEach(recentDirs, id: \.self) { path in
+                            Button(TeamCreationRecentDirs.displayPath(path)) {
+                                workingDirectory = path
+                                workingDirectorySource = .lastUsed
+                                validateWorkingDirectory()
+                            }
+                        }
+                        Divider()
+                        Button("Clear Recent…", role: .destructive) {
+                            TeamCreationRecentDirs.shared.clear()
+                        }
+                    }
+                }
+                .menuStyle(.borderlessButton)
+                .fixedSize()
+                .help("Recent directories")
+            }
+
+            HStack(spacing: 4) {
+                if workingDirectorySource == .appLaunch {
+                    Text("⚠ source: \(workingDirectorySource.rawValue)")
+                        .foregroundStyle(.orange)
+                } else {
+                    Text("source: \(workingDirectorySource.rawValue)")
+                        .foregroundStyle(.secondary)
+                }
+            }
+            .font(.caption)
+
+            if let err = workingDirectoryError {
+                HStack(spacing: 4) {
+                    Image(systemName: "exclamationmark.triangle.fill")
+                        .foregroundStyle(.red)
+                    Text(err)
+                        .foregroundStyle(.red)
+                }
+                .font(.caption)
+                .transition(.opacity.combined(with: .move(edge: .top)))
+            }
+        }
+        .animation(.easeInOut(duration: 0.15), value: workingDirectoryError)
     }
 
     private func createTeam() {
@@ -2585,8 +2714,9 @@ struct TeamCreationView: View {
         // when something has left pair === leader (self-heal guard).
         let effectivePair = (executionMode == "headless" || leaderPairMode == leaderMode) ? "none" : leaderPairMode
         let effectivePairSpec = effectivePair == "none" ? "" : leaderPairSpec
-        let success = onCreate?(teamName, leaderMode, leaderModel, agents, worktreeMode, executionMode, sid, effectivePair, effectivePair == "none" ? "" : leaderPairModel, effectivePairSpec) ?? false
+        let success = onCreate?(teamName, leaderMode, leaderModel, agents, worktreeMode, executionMode, sid, effectivePair, effectivePair == "none" ? "" : leaderPairModel, effectivePairSpec, workingDirectory) ?? false
         guard success else { return }
+        TeamCreationRecentDirs.shared.promote(workingDirectory)
         defaultLeaderMode = leaderMode
         defaultLeaderModel = leaderModel
         dismiss()
