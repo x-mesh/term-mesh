@@ -349,7 +349,13 @@ else
   echo "/tmp/term-mesh-debug.log" > /tmp/term-mesh-last-debug-log-path || true
   "${OPEN_CLEAN_ENV[@]}" "${EXTRA_ENV[@]}" open "$APP_PATH"
 fi
-osascript -e "tell application id \"${BUNDLE_ID}\" to activate" || true
+# `open` returns before LaunchServices finishes registering the app's bundle id,
+# so an immediate `osascript ... activate` fails with -1728 (errAENoSuchObject).
+# Poll up to ~3s until the bundle id is resolvable, then activate.
+for _ in {1..15}; do
+  osascript -e "tell application id \"${BUNDLE_ID}\" to activate" >/dev/null 2>&1 && break
+  sleep 0.2
+done
 
 # Safety: ensure only one instance is running.
 sleep 0.2
