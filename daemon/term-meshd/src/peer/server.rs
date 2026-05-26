@@ -9,9 +9,11 @@ use std::sync::Arc;
 
 use tokio::net::UnixListener;
 use tokio::sync::{watch, Semaphore};
+use tokio::task::JoinSet;
 
 use super::connection;
 use super::surface::PtyManager;
+use crate::supervisor::{shutdown_supervised, spawn_supervised};
 
 const MAX_PEER_CONNECTIONS: usize = 16;
 
@@ -44,6 +46,7 @@ pub async fn serve_with_manager(
     tracing::info!("peer-federation listening on {}", path.display());
     let connection_permits = Arc::new(Semaphore::new(MAX_PEER_CONNECTIONS));
     let owner_uid = current_uid();
+    let mut connection_tasks = JoinSet::new();
 
     loop {
         tokio::select! {
@@ -68,7 +71,7 @@ pub async fn serve_with_manager(
                             continue;
                         };
                         let manager = manager.clone();
-                        tokio::spawn(async move {
+                        spawn_supervised(&mut connection_tasks, async move {
                             let _permit = permit;
                             if let Err(e) = connection::run(stream, manager).await {
                                 tracing::warn!("peer connection ended with error: {e}");
@@ -86,6 +89,7 @@ pub async fn serve_with_manager(
             }
         }
     }
+    shutdown_supervised(&mut connection_tasks, "peer").await;
 
     if Path::new(&path).exists() {
         let _ = std::fs::remove_file(&path);
