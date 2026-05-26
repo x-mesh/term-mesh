@@ -1703,6 +1703,9 @@ final class TerminalSurface: Identifiable, ObservableObject {
     }
 
     deinit {
+        #if DEBUG
+        dlog("deinit \(Self.self)")
+        #endif
         // TerminalSurface is always owned by @MainActor types (TerminalPanel, Workspace),
         // so deinit effectively runs on the main actor. Swift cannot verify this statically,
         // so we cannot call @MainActor-isolated releaseGhosttySurfaceAsync directly.
@@ -3209,6 +3212,9 @@ func pushTargetSurfaceSize(_ size: CGSize) {
     }
 
     deinit {
+        #if DEBUG
+        dlog("deinit \(Self.self)")
+        #endif
         // Surface lifecycle is managed by TerminalSurface, not the view
         if let eventMonitor {
             NSEvent.removeMonitor(eventMonitor)

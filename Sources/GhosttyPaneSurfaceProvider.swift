@@ -51,6 +51,12 @@ final class PtyTapHub: @unchecked Sendable {
         self.surfaceRef = surfaceRef
     }
 
+    deinit {
+        #if DEBUG
+        dlog("deinit \(Self.self)")
+        #endif
+    }
+
     func makeStream(initialBytes: Data?) -> (UUID, AsyncStream<Data>) {
         let attachID = UUID()
         let stream = AsyncStream<Data>(bufferingPolicy: .bufferingNewest(256)) { continuation in

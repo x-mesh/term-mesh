@@ -1820,6 +1820,9 @@ final class BrowserPanel: Panel, ObservableObject {
     }
 
     deinit {
+        #if DEBUG
+        dlog("deinit \(Self.self)")
+        #endif
         developerToolsRestoreRetryWorkItem?.cancel()
         developerToolsRestoreRetryWorkItem = nil
         let webView = webView
@@ -2548,6 +2551,12 @@ private class BrowserNavigationDelegate: NSObject, WKNavigationDelegate {
     /// The URL of the last navigation that was attempted. Used to preserve the omnibar URL
     /// when a provisional navigation fails (e.g. connection refused on localhost:3000).
     var lastAttemptedURL: URL?
+
+    deinit {
+        #if DEBUG
+        dlog("deinit \(Self.self)")
+        #endif
+    }
 
     func webView(_ webView: WKWebView, didStartProvisionalNavigation navigation: WKNavigation!) {
         lastAttemptedURL = webView.url

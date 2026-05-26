@@ -2255,4 +2255,13 @@ final class Workspace: Identifiable, ObservableObject {
         }
     }
 
+    isolated deinit {
+        #if DEBUG
+        dlog("deinit \(Self.self)")
+        #endif
+        let panelsToClose = panels.values.map { $0 }
+        Task { @MainActor in
+            panelsToClose.forEach { $0.close() }
+        }
+    }
 }
