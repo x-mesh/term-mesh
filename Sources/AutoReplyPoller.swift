@@ -22,7 +22,7 @@ final class AutoReplyPoller {
     /// Polling cadence — matches Rust detector's tick interval. 500ms is the
     /// rust default's idle_debounce floor; we tick a bit faster so debounce
     /// + scrollback diff catch up promptly after the agent finishes printing.
-    private let pollInterval: TimeInterval = 0.4
+    private let pollInterval: TimeInterval = 1.0
 
     private var timer: DispatchSourceTimer?
     private var perPanel: [UUID: PanelState] = [:]
