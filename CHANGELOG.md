@@ -5,7 +5,8 @@ All notable changes to term-mesh are documented here.
 ## [Unreleased]
 
 ### Fixed
-- AutoReplyPoller hang on main thread — increased poll interval from 0.4s to 1.0s to stay under the 5000ms ANR threshold when running multiple agent teams (Sentry TERM-MESH-2R, -2Q, -2P, -2N, -2M, -2K, -2J, -2H, -2G, -2F, -1D). Long-term: move tick() off-main.
+- AutoReplyPoller hang on main thread — increased poll interval from 0.4s to 1.0s to stay under the 5000ms ANR threshold when running multiple agent teams (Sentry TERM-MESH-2R, -2Q, -2P, -2N, -2M, -2K, -2J, -2H, -2G, -2F, -1D).
+- AutoReplyPoller main-thread block (Phase 2) — moved `ghostty_surface_read_text` off the main thread. `tick()` now acquires `SurfaceReadLease` tokens on MainActor then fans out all terminal scrollback reads to a background `userInitiated` queue; only detector state updates and event emission run back on main. Eliminates the O(N×M) synchronous read loop that caused the Sentry hangs when multiple agent teams were active simultaneously.
 
 ## [0.129.0] - 2026-05-22
 
