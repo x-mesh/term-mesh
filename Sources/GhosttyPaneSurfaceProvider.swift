@@ -596,6 +596,19 @@ private let peerPendingInputTailMax = 32
 ///
 /// Key = surface pointer identity (UInt(bitPattern:)). @MainActor.
 @MainActor private var peerPendingPasteBody: [UInt: Data] = [:]
+/// FIX C v2: timestamp of the last byte appended to `peerPendingPasteBody`.
+/// Used to detect a stalled paste accumulator (close marker `\e[201~`
+/// never arrived — relay dropped it, SSH stalled, user aborted, etc.).
+/// Without this safety valve, every subsequent keystroke gets absorbed
+/// as paste body and the destination surface becomes unresponsive: even
+/// a bare ESC never reaches the next-hop vim, so the user can't escape
+/// INSERT mode and `:q!` shows up as literal text. On a stale entry we
+/// flush whatever was buffered and resume normal parsing.
+@MainActor private var peerPendingPasteTimestamp: [UInt: Date] = [:]
+/// Frame-to-frame idle window. Real pastes arrive as a burst (consecutive
+/// frames within milliseconds); a gap of this size means the close
+/// marker is gone and we should not keep eating keystrokes.
+private let peerPendingPasteIdleTimeout: TimeInterval = 0.75
 /// Hard cap on accumulated paste body. Exceeding this flushes whatever
 /// has been collected so far and drops the rest of the paste; the
 /// destination app sees a truncated paste rather than an unbounded buffer.
@@ -609,6 +622,7 @@ private let peerPendingPasteBodyMax = 8 * 1024 * 1024
 private func clearPeerPendingInputTail(surfaceKey: UInt) {
     peerPendingInputTail.removeValue(forKey: surfaceKey)
     peerPendingPasteBody.removeValue(forKey: surfaceKey)
+    peerPendingPasteTimestamp.removeValue(forKey: surfaceKey)
 }
 
 /// FIX C helper: flush accumulated paste body to the destination surface.
@@ -651,6 +665,7 @@ private func absorbPasteContinuation(
 
     if let close = closeStart {
         var body = peerPendingPasteBody.removeValue(forKey: surfaceKey) ?? Data()
+        peerPendingPasteTimestamp.removeValue(forKey: surfaceKey)
         if close > 0 {
             body.append(contentsOf: arr[0..<close])
         }
@@ -663,8 +678,10 @@ private func absorbPasteContinuation(
     if body.count > peerPendingPasteBodyMax {
         flushPeerPasteBody(surface, body)
         peerPendingPasteBody.removeValue(forKey: surfaceKey)
+        peerPendingPasteTimestamp.removeValue(forKey: surfaceKey)
     } else {
         peerPendingPasteBody[surfaceKey] = body
+        peerPendingPasteTimestamp[surfaceKey] = Date()
     }
     return arr.count
 }
@@ -739,13 +756,30 @@ private func sendPeerInputBytes(_ surface: ghostty_surface_t, bytes: Data) {
     // closed yet, this frame's bytes belong to the paste body (until the
     // closing `\e[201~`). Drain those bytes into the accumulator before the
     // normal parser runs. Bytes past the close marker (if any) fall through.
-    if peerPendingPasteBody[surfaceKey] != nil {
-        let consumed = absorbPasteContinuation(
-            surface: surface, surfaceKey: surfaceKey, arr: arr)
-        if consumed >= arr.count {
-            return
+    if let body = peerPendingPasteBody[surfaceKey] {
+        // FIX C v2 safety valve: if the previous paste burst ended without
+        // ever delivering `\e[201~` and the next frame arrives after a
+        // pause, treat the accumulator as stalled. Flush what we have so
+        // the user at least gets the leading half of the paste, clear
+        // state, and run this frame through the normal parser. Without
+        // this, every subsequent keystroke (ESC, `:`, `q`, `!`) gets
+        // absorbed into the paste body and the destination surface
+        // becomes unresponsive.
+        let lastTs = peerPendingPasteTimestamp[surfaceKey]
+        let idle = lastTs.map { Date().timeIntervalSince($0) } ?? .infinity
+        if idle > peerPendingPasteIdleTimeout {
+            flushPeerPasteBody(surface, body)
+            peerPendingPasteBody.removeValue(forKey: surfaceKey)
+            peerPendingPasteTimestamp.removeValue(forKey: surfaceKey)
+            // Fall through to normal parser on this frame.
+        } else {
+            let consumed = absorbPasteContinuation(
+                surface: surface, surfaceKey: surfaceKey, arr: arr)
+            if consumed >= arr.count {
+                return
+            }
+            arr = Array(arr[consumed...])
         }
-        arr = Array(arr[consumed...])
     }
 
     // FIX B prelude: detect any trailing incomplete escape sequence and buffer
@@ -837,6 +871,7 @@ private func sendPeerInputBytes(_ surface: ghostty_surface_t, bytes: Data) {
                 flushPeerPasteBody(surface, body)
             } else {
                 peerPendingPasteBody[surfaceKey] = body
+                peerPendingPasteTimestamp[surfaceKey] = Date()
             }
             return
         }
