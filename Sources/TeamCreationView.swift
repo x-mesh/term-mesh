@@ -1,6 +1,5 @@
 import AppKit
 import SwiftUI
-import UniformTypeIdentifiers
 
 // MARK: - Phase 2 Notifications
 
@@ -360,6 +359,22 @@ struct TeamCreationView: View {
     var initialMode: String = "new"
     var defaultWorkingDirectory: String = ""
     var defaultWorkingDirectorySource: WorkingDirectorySource = .currentPane
+
+    init(
+        onCreate: ((_ teamName: String, _ leaderMode: String, _ leaderModel: String, _ agents: [TeamAgentRow], _ worktreeMode: String, _ executionMode: String, _ resumeSessionId: String?, _ pairMode: String, _ pairModel: String, _ pairSpec: String, _ workingDirectory: String) -> Bool)? = nil,
+        onResume: ((_ result: [String: Any]) -> Void)? = nil,
+        initialMode: String = "new",
+        defaultWorkingDirectory: String = "",
+        defaultWorkingDirectorySource: WorkingDirectorySource = .currentPane
+    ) {
+        self.onCreate = onCreate
+        self.onResume = onResume
+        self.initialMode = initialMode
+        self.defaultWorkingDirectory = defaultWorkingDirectory
+        self.defaultWorkingDirectorySource = defaultWorkingDirectorySource
+        _workingDirectory = State(initialValue: defaultWorkingDirectory)
+        _workingDirectorySource = State(initialValue: defaultWorkingDirectorySource)
+    }
 
     @AppStorage("teamDefaultLeaderMode") private var defaultLeaderMode = "claude"
     @AppStorage("teamDefaultModel") private var defaultModel = "sonnet"
@@ -2631,30 +2646,17 @@ struct TeamCreationView: View {
                             lineWidth: (workingDirectoryError != nil || isDropTargeted) ? 1 : 0
                         )
                 )
-                .onDrop(of: [UTType.fileURL], isTargeted: $isDropTargeted) { providers in
-                    guard let provider = providers.first else { return false }
-                    _ = provider.loadObject(ofClass: URL.self) { url, error in
-                        guard let url, error == nil else { return }
-                        var isDir: ObjCBool = false
-                        let exists = FileManager.default.fileExists(atPath: url.path, isDirectory: &isDir)
-                        guard exists && isDir.boolValue else {
-                            DispatchQueue.main.async {
-                                workingDirectoryError = "Drop a folder, not a file"
-                                DispatchQueue.main.asyncAfter(deadline: .now() + 2) {
-                                    if workingDirectoryError == "Drop a folder, not a file" {
-                                        workingDirectoryError = nil
-                                    }
-                                }
-                            }
-                            return
-                        }
-                        DispatchQueue.main.async {
-                            workingDirectory = TeamCreationRecentDirs.normalize(url.path)
-                            workingDirectorySource = .userPicked
-                            validateWorkingDirectory()
-                        }
-                    }
+                .dropDestination(for: URL.self) { urls, _ in
+                    guard let url = urls.first else { return false }
+                    var isDir: ObjCBool = false
+                    let exists = FileManager.default.fileExists(atPath: url.path, isDirectory: &isDir)
+                    guard exists && isDir.boolValue else { return false }
+                    workingDirectory = TeamCreationRecentDirs.normalize(url.path)
+                    workingDirectorySource = .userPicked
+                    validateWorkingDirectory()
                     return true
+                } isTargeted: { targeted in
+                    isDropTargeted = targeted
                 }
 
                 Button("Choose…") {
