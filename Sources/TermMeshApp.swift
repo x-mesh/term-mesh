@@ -207,10 +207,8 @@ struct TermMeshApp: App {
         if let dir = activeTabManager?.selectedTab?.currentDirectory, !dir.isEmpty {
             return (dir, .currentPane)
         }
-        // 2. Workspace: use only the deterministically identified active window
-        //    (key window first, then main window). Avoids the non-deterministic
-        //    Dictionary iteration order of mainWindowContexts.values.first which
-        //    can resurrect the "team starts in wrong window" bug class.
+        // 2. Workspace: key window first, then main window (deterministic; avoids
+        //    wrong-window bug class from non-deterministic window ordering).
         if let kw = NSApp.keyWindow,
            let ctx = AppDelegate.shared?.contextForMainWindow(kw),
            let dir = ctx.tabManager.selectedTab?.currentDirectory, !dir.isEmpty {

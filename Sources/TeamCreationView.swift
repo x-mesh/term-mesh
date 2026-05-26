@@ -506,6 +506,7 @@ struct TeamCreationView: View {
             // submit (new cwd + stale sessionId) and produce wrong rehydration.
             recentSessions = []
             selectedSessionId = nil
+            manualSessionId = ""
             // If resume toggle is on and the new path is valid, reload sessions.
             if resumeSession, workingDirectoryError == nil, !workingDirectory.isEmpty {
                 let dir = workingDirectory
