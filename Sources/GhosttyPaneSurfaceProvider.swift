@@ -196,6 +196,9 @@ final class GhosttyPaneSurfaceProvider: PeerSurfaceProvider {
         // Capture weak reference to TerminalSurface for input/resize closures;
         // the strong ref lives in PtyTapContext for the lifetime of the attach.
         let weakTS = WeakRef(ts)
+        // FIX A: capture key at attach time so the detach closure can clean up
+        // peerPendingInputTail even if the TerminalSurface is already freed.
+        let sfcPtrKey = UInt(bitPattern: sfcPtr)
 
         let input: @Sendable (Data) async -> Void = { [weakTS] bytes in
             await MainActor.run {
@@ -204,7 +207,7 @@ final class GhosttyPaneSurfaceProvider: PeerSurfaceProvider {
             }
         }
 
-        let detach: @Sendable () async -> Void = { [provider = WeakRef(self), weakTS, hub] in
+        let detach: @Sendable () async -> Void = { [provider = WeakRef(self), weakTS, hub, sfcPtrKey] in
             await MainActor.run {
                 let hubEmpty = hub.finish(attachID: attachID)
                 if let ts = weakTS.value {
@@ -215,6 +218,12 @@ final class GhosttyPaneSurfaceProvider: PeerSurfaceProvider {
                         }
                         provider.value?.tapHubs.removeValue(forKey: ts.id)
                     }
+                }
+                // FIX A: release pending escape-sequence tail on last client detach
+                // to prevent stale bytes prepending to a future session at the same
+                // surface pointer address (OS pointer reuse after surface free).
+                if hubEmpty {
+                    clearPeerPendingInputTail(surfaceKey: sfcPtrKey)
                 }
             }
         }
@@ -566,6 +575,151 @@ final class GhosttyPaneSurfaceProvider: PeerSurfaceProvider {
 
 // MARK: - Helpers
 
+/// Per-surface carry buffer for trailing incomplete escape sequences.
+/// If a TYPE_KEY_INPUT chunk ends with a lone 0x1b (or partial CSI head),
+/// we hold those bytes here and prepend them to the next chunk so the
+/// sequence isn't split across frame boundaries.
+/// Key = surface pointer identity (UInt(bitPattern:)). @MainActor — all
+/// accesses happen on the main thread via sendPeerInputBytes.
+/// Bound to ≤32 bytes per surface to prevent unbounded growth on malformed input.
+@MainActor private var peerPendingInputTail: [UInt: [UInt8]] = [:]
+private let peerPendingInputTailMax = 32
+
+/// FIX C: Multi-chunk bracketed paste accumulator. When `\e[200~` arrives
+/// without a matching `\e[201~` in the same frame, we stash the body bytes
+/// here and keep consuming subsequent frames as paste content until the
+/// closing marker is seen. Then we flush the buffered body through
+/// `ghostty_surface_text` so Ghostty re-wraps in bracketed paste markers
+/// for the destination surface (vim/codex/claude see a real paste instead
+/// of a stream of keystrokes that triggers autoindent and command-mode
+/// shortcuts mid-paste).
+///
+/// Key = surface pointer identity (UInt(bitPattern:)). @MainActor.
+@MainActor private var peerPendingPasteBody: [UInt: Data] = [:]
+/// FIX C v2: timestamp of the last byte appended to `peerPendingPasteBody`.
+/// Used to detect a stalled paste accumulator (close marker `\e[201~`
+/// never arrived — relay dropped it, SSH stalled, user aborted, etc.).
+/// Without this safety valve, every subsequent keystroke gets absorbed
+/// as paste body and the destination surface becomes unresponsive: even
+/// a bare ESC never reaches the next-hop vim, so the user can't escape
+/// INSERT mode and `:q!` shows up as literal text. On a stale entry we
+/// flush whatever was buffered and resume normal parsing.
+@MainActor private var peerPendingPasteTimestamp: [UInt: Date] = [:]
+/// Frame-to-frame idle window. Real pastes arrive as a burst (consecutive
+/// frames within milliseconds); a gap of this size means the close
+/// marker is gone and we should not keep eating keystrokes.
+private let peerPendingPasteIdleTimeout: TimeInterval = 0.75
+/// Hard cap on accumulated paste body. Exceeding this flushes whatever
+/// has been collected so far and drops the rest of the paste; the
+/// destination app sees a truncated paste rather than an unbounded buffer.
+/// 8 MiB is well above any realistic clipboard payload.
+private let peerPendingPasteBodyMax = 8 * 1024 * 1024
+
+/// FIX A: Release any buffered incomplete-escape tail for a peer surface
+/// when the last client detaches. Prevents stale bytes from being prepended
+/// to a new session if the OS reuses the same surface pointer address.
+@MainActor
+private func clearPeerPendingInputTail(surfaceKey: UInt) {
+    peerPendingInputTail.removeValue(forKey: surfaceKey)
+    peerPendingPasteBody.removeValue(forKey: surfaceKey)
+    peerPendingPasteTimestamp.removeValue(forKey: surfaceKey)
+}
+
+/// FIX C helper: flush accumulated paste body to the destination surface.
+@MainActor
+private func flushPeerPasteBody(_ surface: ghostty_surface_t, _ body: Data) {
+    guard !body.isEmpty else { return }
+    body.withUnsafeBytes { rawBuffer in
+        guard let base = rawBuffer.baseAddress?
+            .assumingMemoryBound(to: CChar.self) else { return }
+        ghostty_surface_text(surface, base, UInt(rawBuffer.count))
+    }
+}
+
+/// FIX C helper: consume bytes from `arr` while in paste-accumulate mode.
+/// Returns the number of bytes consumed. If the close marker `\e[201~`
+/// appears in this chunk, flushes the buffered body and returns the
+/// position just past the marker; the caller should resume normal parsing
+/// on the remainder. If no close marker is found, consumes the entire
+/// chunk into the buffer and returns `arr.count`.
+@MainActor
+private func absorbPasteContinuation(
+    surface: ghostty_surface_t,
+    surfaceKey: UInt,
+    arr: [UInt8]
+) -> Int {
+    var closeStart: Int? = nil
+    var j = 0
+    while j + 5 < arr.count {
+        if arr[j] == 0x1b,
+           arr[j + 1] == 0x5b,
+           arr[j + 2] == 0x32,
+           arr[j + 3] == 0x30,
+           arr[j + 4] == 0x31,
+           arr[j + 5] == 0x7e {
+            closeStart = j
+            break
+        }
+        j += 1
+    }
+
+    if let close = closeStart {
+        var body = peerPendingPasteBody.removeValue(forKey: surfaceKey) ?? Data()
+        peerPendingPasteTimestamp.removeValue(forKey: surfaceKey)
+        if close > 0 {
+            body.append(contentsOf: arr[0..<close])
+        }
+        flushPeerPasteBody(surface, body)
+        return close + 6
+    }
+
+    var body = peerPendingPasteBody[surfaceKey] ?? Data()
+    body.append(contentsOf: arr)
+    if body.count > peerPendingPasteBodyMax {
+        flushPeerPasteBody(surface, body)
+        peerPendingPasteBody.removeValue(forKey: surfaceKey)
+        peerPendingPasteTimestamp.removeValue(forKey: surfaceKey)
+    } else {
+        peerPendingPasteBody[surfaceKey] = body
+        peerPendingPasteTimestamp[surfaceKey] = Date()
+    }
+    return arr.count
+}
+
+/// FIX B: Return the number of trailing bytes in `arr` that form an
+/// incomplete ESC-introduced sequence (CSI/OSC/SS3 head split across a frame
+/// boundary). Scans backward up to `bound` bytes from the end looking for
+/// the rightmost 0x1b; if found and `peerEscapeSequenceLength` returns nil
+/// (incomplete), returns the tail length — caller should buffer those bytes.
+/// Returns 0 when no incomplete tail is detected.
+///
+/// Scenarios where tail > 0:
+///   - Lone ESC at end            ("\e")        → tailLen 1
+///   - Partial CSI head           ("\e[")        → tailLen 2
+///   - Partial CSI with params    ("\e[<35")     → tailLen 4+
+///   - SS3 missing final byte     ("\eO")        → tailLen 2
+///   - OSC without BEL/ST         ("\e]0;txt")   → tailLen varies
+///
+/// Bound cap: ESC is only searched within the last `bound` bytes, so
+/// tailLen ≤ bound. A giant OSC split across >32-byte frames falls through
+/// with tailLen = 0 (the leading ESC is beyond the search window) — this
+/// matches the pre-FIX-B behavior for that edge case.
+private func trailingIncompleteEscape(_ arr: [UInt8], bound: Int) -> Int {
+    let start = max(0, arr.count - bound)
+    var i = arr.count - 1
+    while i >= start {
+        if arr[i] == 0x1b {
+            let tail = Array(arr[i..<arr.count])
+            if peerEscapeSequenceLength(tail, start: 0) == nil {
+                return arr.count - i
+            }
+            return 0  // complete sequence — nothing to buffer
+        }
+        i -= 1
+    }
+    return 0
+}
+
 /// Route peer Input bytes into Ghostty as key events.
 ///
 /// All bytes flow through `ghostty_surface_key()`; we deliberately avoid
@@ -586,9 +740,57 @@ final class GhosttyPaneSurfaceProvider: PeerSurfaceProvider {
 /// LF before forwarding over the peer socket.
 @MainActor
 private func sendPeerInputBytes(_ surface: ghostty_surface_t, bytes: Data) {
-    let arr = Array(bytes)
+    // FIX 2 / FIX B: prepend any bytes carried over from the previous chunk,
+    // then trim any new incomplete ESC tail before the main parse loop so that
+    // split CSI/OSC/SS3 heads ("\e[", "\e[<35", etc.) are also deferred — not
+    // just lone trailing ESC (the old FIX 2 scope).
+    let surfaceKey = UInt(bitPattern: surface)
+    var arr: [UInt8]
+    if let pending = peerPendingInputTail.removeValue(forKey: surfaceKey), !pending.isEmpty {
+        arr = pending + Array(bytes)
+    } else {
+        arr = Array(bytes)
+    }
+
+    // FIX C: if a previous frame opened a bracketed paste that hasn't been
+    // closed yet, this frame's bytes belong to the paste body (until the
+    // closing `\e[201~`). Drain those bytes into the accumulator before the
+    // normal parser runs. Bytes past the close marker (if any) fall through.
+    if let body = peerPendingPasteBody[surfaceKey] {
+        // FIX C v2 safety valve: if the previous paste burst ended without
+        // ever delivering `\e[201~` and the next frame arrives after a
+        // pause, treat the accumulator as stalled. Flush what we have so
+        // the user at least gets the leading half of the paste, clear
+        // state, and run this frame through the normal parser. Without
+        // this, every subsequent keystroke (ESC, `:`, `q`, `!`) gets
+        // absorbed into the paste body and the destination surface
+        // becomes unresponsive.
+        let lastTs = peerPendingPasteTimestamp[surfaceKey]
+        let idle = lastTs.map { Date().timeIntervalSince($0) } ?? .infinity
+        if idle > peerPendingPasteIdleTimeout {
+            flushPeerPasteBody(surface, body)
+            peerPendingPasteBody.removeValue(forKey: surfaceKey)
+            peerPendingPasteTimestamp.removeValue(forKey: surfaceKey)
+            // Fall through to normal parser on this frame.
+        } else {
+            let consumed = absorbPasteContinuation(
+                surface: surface, surfaceKey: surfaceKey, arr: arr)
+            if consumed >= arr.count {
+                return
+            }
+            arr = Array(arr[consumed...])
+        }
+    }
+
+    // FIX B prelude: detect any trailing incomplete escape sequence and buffer
+    // it now, before the main loop, so the loop never sees a partial head.
+    let tailLen = trailingIncompleteEscape(arr, bound: peerPendingInputTailMax)
+    let processCount = arr.count - tailLen
+    if tailLen > 0 {
+        peerPendingInputTail[surfaceKey] = Array(arr[processCount...])
+    }
     var i = 0
-    while i < arr.count {
+    while i < processCount {
         let byte = arr[i]
 
         if byte == 0x1b,
@@ -653,7 +855,25 @@ private func sendPeerInputBytes(_ surface: ghostty_surface_t, bytes: Data) {
                 i = close + 6
                 continue
             }
-            // No closing marker in this chunk — fall through.
+            // FIX C: no close marker in this frame — open the paste
+            // accumulator. Everything from `i + 6` to end-of-frame becomes
+            // the first slice of the paste body, including any bytes the
+            // FIX B prelude stashed as `peerPendingInputTail` (they belong
+            // to the paste body, not to a partial escape sequence). The
+            // next frame(s) will be funneled through `absorbPasteContinuation`
+            // until `\e[201~` arrives.
+            var body = Data(arr[(i + 6)..<arr.count])
+            if let tail = peerPendingInputTail.removeValue(forKey: surfaceKey),
+               !tail.isEmpty {
+                body.append(contentsOf: tail)
+            }
+            if body.count > peerPendingPasteBodyMax {
+                flushPeerPasteBody(surface, body)
+            } else {
+                peerPendingPasteBody[surfaceKey] = body
+                peerPendingPasteTimestamp[surfaceKey] = Date()
+            }
+            return
         }
 
         // ESC begins a well-formed but unrecognized control sequence
@@ -701,7 +921,7 @@ private func sendPeerInputBytes(_ surface: ghostty_surface_t, bytes: Data) {
         // batch path it's ~one call per `tokTypeKeyInput` frame
         // sent by the relay.
         let runStart = i
-        while i < arr.count {
+        while i < processCount {
             let bb = arr[i]
             if bb == 0x1b { break }
             if peerSingleByteKeyMapping(bb) != nil { break }

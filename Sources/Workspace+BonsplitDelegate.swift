@@ -340,6 +340,7 @@ extension Workspace: BonsplitDelegate {
                 onClosedBrowserPanel?(closedBrowserRestoreSnapshot)
             }
             panel?.close()
+            AutoReplyPoller.shared.forget(panelId: panelId)
         }
 
         // Clean up TerminalController singleton state for this surface to prevent memory leaks.

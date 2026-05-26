@@ -1,4 +1,5 @@
 import Foundation
+import Bonsplit
 
 // Phase B4: GUI agent pane scrollback poller. Headless agents already get
 // auto-reply via the Rust daemon's PTY reader (see auto_reply_emit.rs);
@@ -12,6 +13,15 @@ import Foundation
 // state (detector instance, last snapshot, last fired hash) is cleaned
 // up when the panel disappears.
 //
+// Threading (Phase 2): tick() runs on MainActor. It acquires SurfaceReadLeases
+// (MainActor-only) then fans out the actual ghostty_surface_read_text calls to
+// a private serial queue (pollQueue) so the main thread is never blocked by
+// the read loop. PanelState (detector, lastScrollbackText) is only touched on
+// MainActor. Leases keep surface pointers alive across the background hop; each
+// is released immediately after its read. tickInFlight prevents overlapping tick
+// batches when reads are slow. Results are revalidated on main before apply to
+// guard against agent detach + surface reuse between read and apply.
+//
 // Disabled via `TERMMESH_AUTO_REPLY=off` (env or `UserDefaults`
 // `termmesh.autoReply.enabled = false`).
 
@@ -22,7 +32,12 @@ final class AutoReplyPoller {
     /// Polling cadence — matches Rust detector's tick interval. 500ms is the
     /// rust default's idle_debounce floor; we tick a bit faster so debounce
     /// + scrollback diff catch up promptly after the agent finishes printing.
-    private let pollInterval: TimeInterval = 0.4
+    private let pollInterval: TimeInterval = 1.0
+
+    // FIX 1: Private serial queue so concurrent ticks can't interleave reads.
+    private let pollQueue = DispatchQueue(label: "term-mesh.auto-reply.poll", qos: .userInitiated)
+    // FIX 1: Skip a new tick while the previous batch's reads are still in flight.
+    private var tickInFlight = false
 
     private var timer: DispatchSourceTimer?
     private var perPanel: [UUID: PanelState] = [:]
@@ -84,15 +99,48 @@ final class AutoReplyPoller {
     // MARK: - Tick
 
     private func tick() {
-        guard enabled else { return }
+        // FIX 1: skip-coalesce — don't start a new batch while one is in flight
+        guard enabled, !tickInFlight else { return }
+        tickInFlight = true
+
         let teams = TeamOrchestrator.shared.teams
         var aliveIds: Set<UUID> = []
+
+        // WorkItem carries everything the background queue needs; all types are Sendable.
+        struct WorkItem: @unchecked Sendable {
+            let teamName: String
+            let agentName: String
+            let panelId: UUID
+            let surfaceGeneration: UInt64  // FIX 3: captured at lease creation time
+            let lease: SurfaceReadLease    // keeps surface alive across the background hop
+            let prevText: String
+        }
+        var workItems: [WorkItem] = []
 
         for team in teams.values {
             for agent in team.agents {
                 guard let panelId = agent.panelId else { continue }
                 aliveIds.insert(panelId)
-                pollAgent(teamName: team.id, agentName: agent.name, panelId: panelId)
+
+                // Resolve panel and acquire a read lease — both MainActor ops.
+                guard let appDelegate = AppDelegate.shared,
+                      let located = appDelegate.locateSurface(surfaceId: panelId),
+                      let workspace = located.tabManager.tabs.first(where: { $0.id == located.workspaceId }),
+                      let panel = workspace.panels[panelId] as? TerminalPanel,
+                      let lease = panel.surface.beginReadLease() else { continue }
+
+                let state = perPanel[panelId] ?? PanelState()
+                state.panel = panel
+                perPanel[panelId] = state
+
+                workItems.append(WorkItem(
+                    teamName: team.id,
+                    agentName: agent.name,
+                    panelId: panelId,
+                    surfaceGeneration: lease.generation,  // FIX 3
+                    lease: lease,
+                    prevText: state.lastScrollbackText
+                ))
             }
         }
 
@@ -101,39 +149,102 @@ final class AutoReplyPoller {
         for id in stale {
             perPanel.removeValue(forKey: id)
         }
-    }
 
-    private func pollAgent(teamName: String, agentName: String, panelId: UUID) {
-        // Resolve panel + surface
-        guard let appDelegate = AppDelegate.shared,
-              let located = appDelegate.locateSurface(surfaceId: panelId),
-              let workspace = located.tabManager.tabs.first(where: { $0.id == located.workspaceId }),
-              let panel = workspace.panels[panelId] as? TerminalPanel,
-              let surface = panel.surface.surface else {
+        guard !workItems.isEmpty else {
+            tickInFlight = false  // nothing to dispatch — clear inline
             return
         }
 
-        let state = perPanel[panelId] ?? PanelState()
-        state.panel = panel
-        perPanel[panelId] = state
+        // FIX 1: use serial pollQueue (not .global) so concurrent ticks can't overlap.
+        // Leases prevent surface free during reads; each is released immediately after read.
+        pollQueue.async { [weak self] in
+            struct ReadResult: @unchecked Sendable {
+                let teamName: String
+                let agentName: String
+                let panelId: UUID
+                let surfaceGeneration: UInt64  // FIX 3
+                let snapshot: String?
+                let delta: String
+                let readAt: Date
+            }
 
-        // Read full scrollback
-        let now = Date()
-        guard let snapshot = Self.readScrollback(surface) else { return }
+            let readAt = Date()
+            var results: [ReadResult] = []
 
-        // Diff: find common prefix vs last snapshot, push only the tail
-        let delta = Self.computeDelta(previous: state.lastScrollbackText, current: snapshot)
-        state.lastScrollbackText = snapshot
+            for item in workItems {
+                let snapshot = AutoReplyPoller.readScrollback(item.lease.surface)
+                item.lease.release()  // unblocks any pending surface free immediately
+                let delta: String
+                if let snap = snapshot {
+                    delta = AutoReplyPoller.computeDelta(previous: item.prevText, current: snap)
+                } else {
+                    delta = ""
+                }
+                results.append(ReadResult(
+                    teamName: item.teamName,
+                    agentName: item.agentName,
+                    panelId: item.panelId,
+                    surfaceGeneration: item.surfaceGeneration,  // FIX 3
+                    snapshot: snapshot,
+                    delta: delta,
+                    readAt: readAt
+                ))
+            }
 
-        if !delta.isEmpty {
-            if let data = delta.data(using: .utf8) {
-                if let ev = state.detector.pushBytes(data, at: now) {
-                    tryEmit(panelId: panelId, state: state, event: ev,
-                            teamName: teamName, agentName: agentName)
+            // Apply detector updates back on MainActor.
+            Task { @MainActor [weak self] in
+                // FIX 1: clear tickInFlight on all exit paths via defer
+                defer { self?.tickInFlight = false }
+                guard let self else { return }
+
+                for r in results {
+                    // FIX 2: revalidate identity — agent/panel may have been detached
+                    // between read and apply; surface may have been detached+reattached.
+                    guard let team = TeamOrchestrator.shared.teams[r.teamName],
+                          let agent = team.agents.first(where: { $0.name == r.agentName }),
+                          agent.panelId == r.panelId else {
+#if DEBUG
+                        dlog("autoreply.dropped reason=agent_gone panelId=\(r.panelId.uuidString.prefix(8))")
+#endif
+                        continue
+                    }
+                    // FIX 3: generation guard — detach+reattach reuses panelId but bumps generation
+                    guard let appDelegate = AppDelegate.shared,
+                          let located = appDelegate.locateSurface(surfaceId: r.panelId),
+                          let workspace = located.tabManager.tabs.first(where: { $0.id == located.workspaceId }),
+                          let panel = workspace.panels[r.panelId] as? TerminalPanel,
+                          panel.surface.attachGeneration == r.surfaceGeneration else {
+#if DEBUG
+                        dlog("autoreply.dropped reason=generation_mismatch panelId=\(r.panelId.uuidString.prefix(8))")
+#endif
+                        continue
+                    }
+
+                    self.applyResult(
+                        panelId: r.panelId,
+                        teamName: r.teamName,
+                        agentName: r.agentName,
+                        snapshot: r.snapshot,
+                        delta: r.delta,
+                        at: r.readAt
+                    )
                 }
             }
         }
+    }
 
+    /// Apply one background read result to the per-panel detector state.
+    /// All PanelState mutations happen here, on MainActor.
+    private func applyResult(panelId: UUID, teamName: String, agentName: String,
+                              snapshot: String?, delta: String, at now: Date) {
+        guard let state = perPanel[panelId] else { return }  // panel GC'd between read and apply
+        if let snap = snapshot { state.lastScrollbackText = snap }
+        if !delta.isEmpty, let data = delta.data(using: .utf8) {
+            if let ev = state.detector.pushBytes(data, at: now) {
+                tryEmit(panelId: panelId, state: state, event: ev,
+                        teamName: teamName, agentName: agentName)
+            }
+        }
         if let ev = state.detector.tick(at: now) {
             tryEmit(panelId: panelId, state: state, event: ev,
                     teamName: teamName, agentName: agentName)
@@ -180,7 +291,7 @@ final class AutoReplyPoller {
 
     // MARK: - Scrollback reader
 
-    private static func readScrollback(_ surface: ghostty_surface_t) -> String? {
+    nonisolated private static func readScrollback(_ surface: ghostty_surface_t) -> String? {
         let topLeft = ghostty_point_s(
             tag: GHOSTTY_POINT_SCREEN,
             coord: GHOSTTY_POINT_COORD_TOP_LEFT,
@@ -209,7 +320,7 @@ final class AutoReplyPoller {
     /// fall back to returning the entire current text — the detector
     /// is line-anchored so re-feeding earlier lines just resets to Idle
     /// (idempotent for our purposes; new emit blocked by lastFiredHash).
-    static func computeDelta(previous: String, current: String) -> String {
+    nonisolated static func computeDelta(previous: String, current: String) -> String {
         if previous.isEmpty { return current }
         if current.hasPrefix(previous) {
             return String(current.dropFirst(previous.count))

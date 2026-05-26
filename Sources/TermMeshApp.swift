@@ -202,12 +202,36 @@ struct TermMeshApp: App {
         defaults.set(targetVersion, forKey: migrationKey)
     }
 
+    private func resolveDefaultWorkingDirectory(activeTabManager: TabManager?) -> (path: String, source: WorkingDirectorySource) {
+        // 1. Caller-provided active tab manager (already from the key/main window context at menu click time)
+        if let dir = activeTabManager?.selectedTab?.currentDirectory, !dir.isEmpty {
+            return (dir, .currentPane)
+        }
+        // 2. Workspace: key window first, then main window (deterministic; avoids
+        //    wrong-window bug class from non-deterministic window ordering).
+        if let kw = NSApp.keyWindow,
+           let ctx = AppDelegate.shared?.contextForMainWindow(kw),
+           let dir = ctx.tabManager.selectedTab?.currentDirectory, !dir.isEmpty {
+            return (dir, .workspace)
+        }
+        if let mw = NSApp.mainWindow,
+           let ctx = AppDelegate.shared?.contextForMainWindow(mw),
+           let dir = ctx.tabManager.selectedTab?.currentDirectory, !dir.isEmpty {
+            return (dir, .workspace)
+        }
+        // 3. Last successfully used directory from MRU list
+        if let dir = TeamCreationRecentDirs.shared.current().first {
+            return (dir, .lastUsed)
+        }
+        // 4. App process CWD — warn via .appLaunch source label
+        return (FileManager.default.currentDirectoryPath, .appLaunch)
+    }
+
     private func makeTeamCreationView() -> TeamCreationView {
-        TeamCreationView(
-            onCreate: { teamName, leaderMode, leaderModel, agents, worktreeMode, executionMode, resumeSessionId in
-                let activeTabManager = teamCreationTabManager ?? tabManager
-                let workDir = activeTabManager.selectedTab?.currentDirectory
-                    ?? FileManager.default.currentDirectoryPath
+        let activeTabManager = teamCreationTabManager ?? tabManager
+        let (defaultDir, defaultSource) = resolveDefaultWorkingDirectory(activeTabManager: activeTabManager)
+        return TeamCreationView(
+            onCreate: { teamName, leaderMode, leaderModel, agents, worktreeMode, executionMode, resumeSessionId, pairMode, pairModel, pairSpec, workingDirectory in
                 let agentTuples: [(name: String, cli: String, model: String, agentType: String, color: String, instructions: String, customInstructions: String)] = agents.map { row in
                     let customInstructions = row.customInstructions == row.preset.instructions
                         ? ""
@@ -216,7 +240,7 @@ struct TermMeshApp: App {
                         roleName: row.preset.name,
                         presetInstructions: row.preset.instructions,
                         customInstructions: customInstructions,
-                        workingDirectory: workDir,
+                        workingDirectory: workingDirectory,
                         mode: .digest
                     )
                     return (
@@ -236,10 +260,13 @@ struct TermMeshApp: App {
                 let team = TeamOrchestrator.shared.createTeam(
                     name: teamName,
                     agents: agentTuples,
-                    workingDirectory: workDir,
+                    workingDirectory: workingDirectory,
                     leaderSessionId: leaderSessionId,
                     leaderMode: leaderMode,
                     leaderModel: leaderModel,
+                    pairMode: pairMode,
+                    pairModel: pairModel,
+                    pairSpec: pairSpec,
                     resumeSessionId: resumeSessionId,
                     worktreeMode: worktreeMode,
                     executionMode: executionMode,
@@ -248,7 +275,6 @@ struct TermMeshApp: App {
                 return team != nil
             },
             onResume: { (result: [String: Any]) in
-                let activeTabManager = teamCreationTabManager ?? tabManager
                 // The picker tags pane-mode resumes so we route to a separate
                 // app-side rehydration path. Headless resumes go through the
                 // existing daemon-respawn-driven adoption.
@@ -264,7 +290,9 @@ struct TermMeshApp: App {
                     )
                 }
             },
-            initialMode: teamCreationInitialMode
+            initialMode: teamCreationInitialMode,
+            defaultWorkingDirectory: defaultDir,
+            defaultWorkingDirectorySource: defaultSource
         )
     }
 

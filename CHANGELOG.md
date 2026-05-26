@@ -4,6 +4,19 @@ All notable changes to term-mesh are documented here.
 
 ## [Unreleased]
 
+## [0.131.0] - 2026-05-26
+
+### Fixed
+- **connect-to-peer 원격 pane에서 큰 텍스트(수십 KB+) paste가 깨지거나 vim이 INSERT 모드에서 stuck되던 문제** — bracketed paste 마커(`\e[200~…\e[201~`)가 single frame(≤1 KB)에 모두 담길 때만 정상 처리되고, 멀티-frame paste(빌드 로그·긴 코드 등)는 호스트 측에서 마커가 silent drop돼 본문이 일반 keystroke로 흘러갔다. vim이 autoindent와 명령 모드 트리거로 본문을 망가뜨리고, 심한 경우 paste 누적기가 stuck돼 ESC·`:q!`까지 흡수되어 pane 자체가 사실상 unresponsive해졌다. 호스트에 stateful paste accumulator를 추가해 frame 경계와 무관하게 본문을 모았다가 `\e[201~` 도착 시 ghostty 표준 paste API로 일괄 inject한다. close 마커가 끝내 안 오는 경우(SSH 단절·인터럽트 등)도 frame 간 0.75초 inactivity 감지로 자동 flush + state 초기화해 stuck을 방지. **연결 대상(원격) 피어도 이 버전 이상이어야 호스트 측 수정이 적용**된다.
+- **마지막 team workspace를 닫을 때 40~80GB까지 누적되던 메모리 누수** — 윈도우에 워크스페이스가 하나뿐일 때 `TabManager.closeWorkspace`가 panel cleanup 전체를 skip해서 TerminalPanel·TerminalSurface·Ghostty 렌더 상태가 영구히 살아있던 문제. 이제 cleanup이 무조건 실행되고 마지막 탭은 빈 워크스페이스로 교체된다. 팀을 자주 생성/파괴하는 장시간 세션에서 두드러진 누수가 해소.
+- **panel close 경로에서 AutoReplyPoller per-panel state 미해제** — `AutoReplyPoller.forget(panelId:)`가 일부 close 경로(특히 `closeWorkspace`, `didCloseTab` non-detach)에서 호출되지 않아 lastScrollbackText 버퍼와 detector 인스턴스가 잔존하던 문제. 모든 경로에서 해제되도록 수정.
+- **다수 에이전트 팀 동시 운영 시 AutoReplyPoller가 메인 스레드를 5초 이상 막아 발생하던 ANR/hang** — 폴링 주기를 0.4s → 1.0s로 늘리고, `ghostty_surface_read_text`를 메인 스레드 밖으로 빼냈다. `tick()`이 MainActor에서 `SurfaceReadLease` 토큰만 확보한 뒤 모든 터미널 scrollback 읽기를 `userInitiated` 백그라운드 큐로 분산하고, detector 상태 업데이트와 이벤트 emit만 메인으로 복귀. 여러 팀이 동시에 활성일 때 발생하던 O(N×M) 동기 read 루프가 사라져 Sentry TERM-MESH-2R/2Q/2P/2N/2M/2K/2J/2H/2G/2F/1D 계열 hang이 해소.
+- **`tm-agent`가 제어 소켓 응답이 비어있을 때 raw JSON parse error 대신 명시적 에러 반환** — 앱 미실행·socket reset·early disconnect 시 `{"code":"no_app","message":"no active term-mesh app..."}`로 보고. stop hook과 외부 자동화가 원인 파악 가능.
+
+### Thanks to 1 contributor!
+
+- [@JINWOO-J](https://github.com/JINWOO-J)
+
 ## [0.130.0] - 2026-05-25
 
 ### Added

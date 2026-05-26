@@ -905,10 +905,13 @@ class TabManager: ObservableObject {
     }
 
     func closeWorkspace(_ workspace: Workspace) {
-        guard tabs.count > 1 else { return }
-        sentryBreadcrumb("workspace.close", data: ["tabCount": tabs.count - 1])
+        sentryBreadcrumb("workspace.close", data: ["tabCount": max(0, tabs.count - 1)])
 
-        // Terminate any bound agent sessions before removing the workspace.
+        // Panel cleanup runs unconditionally regardless of how many tabs remain.
+        // Previously guarded behind `tabs.count > 1`, which silently skipped all
+        // TerminalPanel/Surface/Ghostty resource teardown for the last tab, causing
+        // a 40–80GB memory leak after repeated team create/destroy cycles.
+        //
         // Bonsplit's didCloseTab delegate won't fire when the entire workspace is removed,
         // so we must explicitly close panels here.
         for (panelId, panel) in workspace.panels {
@@ -919,6 +922,7 @@ class TabManager: ObservableObject {
             }
             TerminalController.shared.v2CleanupSurface(panelId)
             panel.close()
+            AutoReplyPoller.shared.forget(panelId: panelId)
         }
 
         // term-mesh: Mark worktree as stale (no longer auto-deleted on tab close)
@@ -930,9 +934,14 @@ class TabManager: ObservableObject {
         unwireClosedBrowserTracking(for: workspace)
         directoryObservers.removeValue(forKey: workspace.id)
 
-        if let index = tabs.firstIndex(where: { $0.id == workspace.id }) {
-            tabs.remove(at: index)
+        guard let index = tabs.firstIndex(where: { $0.id == workspace.id }) else {
+            scheduleSessionSave()
+            return
+        }
 
+        if tabs.count > 1 {
+            // Normal case: multiple tabs — remove and reselect.
+            tabs.remove(at: index)
             if selectedTabId == workspace.id {
                 // Keep the "focused index" stable when possible:
                 // - If we closed workspace i and there is still a workspace at index i, focus it (the one that moved up).
@@ -940,7 +949,15 @@ class TabManager: ObservableObject {
                 let newIndex = min(index, max(0, tabs.count - 1))
                 selectedTabId = tabs[newIndex].id
             }
+        } else {
+            // Last tab: the UI requires at least one workspace. Replace the old
+            // workspace with a fresh blank one so all panels (now closed above)
+            // are released while the window stays open.
+            let replacement = addWorkspace(select: true)
+            tabs.remove(at: tabs.firstIndex(where: { $0.id == workspace.id }) ?? index)
+            selectedTabId = replacement.id
         }
+
         scheduleSessionSave()
     }
 

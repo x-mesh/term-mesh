@@ -83,11 +83,21 @@ In the interactive wizard, ask the user directly and wait for their reply for ev
 
 ### `review [agent]`
 
-1. Resolve team, watcher, and target workers:
+0. Ensure team + watcher exist (auto-create on first use):
    ```bash
    tm-agent status
    ```
-   If watcher is missing, tell the user to run `/team add watcher` or `tm-agent add watcher`. Do not auto-add it.
+   - Normal JSON with `team_name` and `agents` = team exists. Go to step 1.
+   - Error JSON (`{"ok":false,...}`) or non-zero exit = no active team.
+
+   **No active team:**
+   - **Interactive:** ask "활성 team이 없습니다. 새 team을 생성하고 watch를 시작할까요?" (Yes/No). Yes → `tm-agent create 1 --adopt`. No → exit.
+   - **Non-interactive (`--no-input`):** proceed silently → `tm-agent create 1 --adopt`.
+
+   **Team exists, no watcher:** `tm-agent add watcher`. Poll `tm-agent status` up to 5 s (1 s intervals) until watcher appears.
+
+1. Resolve target workers:
+   If `[agent]` is provided, verify it exists and is not the watcher.
    If `[agent]` is omitted: in **interactive** mode, ask the user a direct question and wait for their reply — list each worker agent (except leader and watcher) as a choice plus an "all workers" option (default). In **non-interactive** mode, target all worker agents except leader and watcher.
 
 2. Resolve spec. For `--spec @path`, read the file now. For text spec, use it verbatim.
@@ -130,6 +140,8 @@ In the interactive wizard, ask the user directly and wait for their reply for ev
 
 ### `on [agent]`
 
+0. Ensure team + watcher exist (auto-create on first use) — same logic as `review` Step 0. Run `tm-agent status`, create team with `tm-agent create 1 --adopt` if absent (interactive prompt, or silently under `--no-input`), then add watcher with `tm-agent add watcher` if the team has no watcher agent.
+
 Resolve and validate the spec exactly as `review` does, including the interactive spec prompt when it is missing (reject only in non-interactive mode). Resolve `[agent]` the same way as `review`: in **interactive** mode, ask the user a direct question and wait for their reply; in **non-interactive** mode, default to all workers. Then enable daemon autonomous watch:
 
 ```bash
@@ -149,7 +161,13 @@ Autonomous ownership and UX:
 
 ### `off [agent|all]`
 
-Disable daemon autonomous watch:
+First check for an active team with `tm-agent status`. If no team exists, print and exit:
+
+```text
+WATCH: already off (no active team)
+```
+
+Otherwise, disable daemon autonomous watch:
 
 ```bash
 tm-agent watch off <agent|all>
@@ -159,7 +177,13 @@ The daemon sets `enabled=false`, stops timers, and preserves `.xm/watch/config.j
 
 ### `status [agent]`
 
-Query daemon watch status and summarize `.xm/watch/board.jsonl`:
+First check for an active team with `tm-agent status`. If no team exists, print and exit:
+
+```text
+WATCH: n/a (no active team — run /watch on or /team-up to create one)
+```
+
+Otherwise, query daemon watch status and summarize `.xm/watch/board.jsonl`:
 
 ```bash
 tm-agent watch status
@@ -185,7 +209,7 @@ If the board is missing, report drift count `0`. If duplicate `check_id` rows ex
 ## Guardrails
 
 - Use `tm-agent` only. Do not use Codex sub-agents for term-mesh team work.
-- `/watch` never fan-outs user work and never changes team composition.
+- `/watch review` and `/watch on` auto-create team + watcher on first use (one-time bootstrap). Never remove existing agents, never reassign watcher CLI/model behind the user's back. `/watch off` and `/watch status` never mutate composition.
 - Never send watcher findings with `tm-agent msg send --to <agent>`; send to the leader only with `tm-agent msg send "<finding>"`.
 - Do not store drift history only under `~/.term-mesh/results`; those files are pruned. Use `.xm/watch/board.jsonl`.
 - Keep watcher context fresh every check: hard restart or true one-shot, with input limited to spec + recent delta.
@@ -193,3 +217,25 @@ If the board is missing, report drift count `0`. If duplicate `check_id` rows ex
 - Do not treat task-format override as drift: when the active task explicitly requests a different output schema or severity taxonomy, judge substance against the spec and task together.
 - watcher proposes course corrections only; code edits are leader-approved follow-up work.
 - Autonomous watch is report-only, focus-safe, cost-guarded, and skips overlapping checks while a prior tick is `in_flight`.
+
+## Example: First-time bootstrap (no team, no watcher)
+
+```bash
+/watch review executor --spec @docs/feature.md --stance critic
+```
+
+Expected internal shape:
+
+```bash
+tm-agent status                        # → error/no team
+# interactive: "활성 team이 없습니다. 새 team을 생성하고 watch를 시작할까요?" → Yes
+tm-agent create 1 --adopt
+tm-agent add watcher
+tm-agent status                        # confirm watcher registered
+tm-agent read executor --lines 120
+tm-agent restart watcher --hard
+tm-agent send watcher '<SPEC + RECENT DELTA + critic lens>'
+tm-agent wait --timeout 120 --mode any
+tm-agent read watcher --lines 120
+tm-agent msg send '<finding>'
+```

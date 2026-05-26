@@ -12,7 +12,7 @@ Fresh watcher가 **spec + watched agent의 최근 delta**만 보고 execution/di
 | `/tm-op pair` | one-shot pair 라운드. 한 번만 반박/보조 관점을 붙인다. |
 | `/watch` | oversight 전용 review/on/off/status 토글. drift를 검출하고 leader에게 보고한다. |
 
-`/watch`는 fan-out dispatch를 수행하지 않는다. 팀 구성도 변경하지 않는다. watcher가 없으면 자동 생성하지 말고 `/team add watcher` 또는 `tm-agent add watcher` 실행을 안내한다.
+`/watch`는 fan-out dispatch를 수행하지 않는다. `/watch review`와 `/watch on`은 팀과 watcher가 없을 때 최초 1회 자동 생성한다(one-time bootstrap). 기존 에이전트를 제거하거나 watcher CLI/model을 임의로 변경하지 않는다. `/watch off`와 `/watch status`는 팀 구성을 절대 변경하지 않는다.
 
 Writer ownership:
 
@@ -128,20 +128,35 @@ On-demand stateless check. If `[agent]` is omitted, review all worker agents exc
 
 ### Flow
 
-1. Check team state and resolve targets:
+0. Ensure team + watcher exist (auto-create on first use):
 
    ```bash
    tm-agent status
    ```
 
-   - If no team exists, reject and ask the user to create/adopt a team first.
+   Interpret the result:
+   - Normal JSON with `team_name` and `agents` = team exists. Go to step 1.
+   - Error JSON (`{"ok":false,...}`) or non-zero exit = no active team.
+
+   **No active team:**
+   - **Interactive:** prompt "활성 team이 없습니다. 새 team을 생성하고 watch를 시작할까요?" (Yes/No).
+     - Yes → `tm-agent create 1 --adopt`
+     - No → exit cleanly.
+   - **Non-interactive (`--no-input`):** proceed silently without prompting.
+     ```bash
+     tm-agent create 1 --adopt
+     ```
+
+   **Team exists, but no watcher agent:**
+   ```bash
+   tm-agent add watcher
+   ```
+   Poll `tm-agent status` up to 5 s (1 s intervals) until watcher appears in the agent list.
+
+1. Resolve target workers:
+
    - If `[agent]` is provided, verify that agent exists and is not the watcher.
    - If `[agent]` is omitted: in **interactive** mode, prompt with `AskUserQuestion` to choose the target — list each worker agent (except leader and watcher) as an option plus an "all workers" option (default). In **non-interactive** mode, target all worker agents except leader and watcher.
-   - Verify a watcher agent exists. If missing, stop with:
-
-   ```text
-   REJECT: watcher agent not found. Run `/team add watcher` or `tm-agent add watcher`, then retry.
-   ```
 
 2. Collect recent bounded delta:
 
@@ -233,6 +248,8 @@ Enable daemon autonomous watch for one target or all workers. This is no longer 
 
 ### Flow
 
+0. Ensure team + watcher exist (auto-create on first use) — same logic as `review` Step 0. Run `tm-agent status`, create team with `tm-agent create 1 --adopt` if absent (interactive prompt, or silently under `--no-input`), then add watcher with `tm-agent add watcher` if the team has no watcher agent.
+
 1. Resolve and validate the spec exactly as `review` does, including the interactive spec prompt when it is missing (reject only in non-interactive mode).
 2. Resolve `[agent]` to a single target or `all` workers. Do not create or remove panes. If `[agent]` is omitted: in **interactive** mode, prompt with `AskUserQuestion` to choose the target (same choices as `review`); in **non-interactive** mode, default to all workers. If `--stance` or `--every` were omitted: in interactive mode prompt for them (defaults `critic` / `300`); under `--no-input` apply the defaults silently.
 3. Execute the daemon watch primitive:
@@ -266,6 +283,14 @@ Disable daemon autonomous watch.
 
 ### Flow
 
+First check for an active team. If no team exists, print and exit:
+
+```text
+WATCH: already off (no active team)
+```
+
+Otherwise:
+
 ```bash
 tm-agent watch off <agent|all>
 ```
@@ -279,6 +304,14 @@ The daemon sets `enabled=false`, stops timers, and preserves `.xm/watch/config.j
 Show daemon watch configuration, scheduler state, and recent drift history.
 
 ### Flow
+
+First check for an active team with `tm-agent status`. If no team exists, print and exit:
+
+```text
+WATCH: n/a (no active team — run /watch on or /team-up to create one)
+```
+
+Otherwise:
 
 1. Query daemon watch state:
 
@@ -314,7 +347,7 @@ If `.xm/watch/board.jsonl` is missing, print `DRIFT_COUNT_THIS_SESSION: 0`. If d
 3. **Do not accumulate watcher context.** Every review must hard-restart or use a true one-shot watcher. Input is only spec + recent delta.
 4. **Do not use native team tools.** No `TeamCreate`, `SendMessage`, `TaskCreate`, `TaskList`, `TaskGet`, `TaskUpdate`, or `TeamDelete`.
 5. **Do not fan out from `/watch`.** `/watch` audits; `/tm` dispatches.
-6. **Do not mutate team composition.** Missing watcher is a reject with setup guidance, not an implicit add.
+6. **Auto-create on first use, never destroy.** `/watch review` and `/watch on` may create the team and add a watcher when missing (one-time bootstrap). Never remove existing agents, never reassign watcher CLI/model behind the user's back. `/watch off` and `/watch status` never mutate composition.
 7. **Do not edit code from watcher.** watcher proposes course corrections; leader decides and assigns implementation.
 8. **Do not let watcher write side effects.** watcher returns a structured verdict only. Manual `/watch review` writes through the leader command; autonomous `/watch on` writes through daemon `WatchController`.
 9. **Do not auto-apply course corrections.** `/watch` is report-only in both manual and autonomous modes.
@@ -380,6 +413,28 @@ Expected internal shape:
 
 ```bash
 tm-agent status
+tm-agent read executor --lines 120
+tm-agent restart watcher --hard
+tm-agent send watcher '<SPEC + RECENT DELTA + critic lens>'
+tm-agent wait --timeout 120 --mode any
+tm-agent read watcher --lines 120
+tm-agent msg send '<finding>'
+```
+
+### First-time bootstrap (no team, no watcher)
+
+```bash
+/watch review executor --spec @docs/feature.md --stance critic
+```
+
+Expected internal shape (sequential tm-agent calls):
+
+```bash
+tm-agent status                        # → error/no team
+# interactive: "활성 team이 없습니다. 새 team을 생성하고 watch를 시작할까요?" → Yes
+tm-agent create 1 --adopt              # bootstrap leader-only team
+tm-agent add watcher                   # add watcher
+tm-agent status                        # confirm watcher registered
 tm-agent read executor --lines 120
 tm-agent restart watcher --hard
 tm-agent send watcher '<SPEC + RECENT DELTA + critic lens>'

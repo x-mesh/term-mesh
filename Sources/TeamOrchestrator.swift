@@ -73,6 +73,15 @@ final class TeamOrchestrator: ObservableObject {
         /// - Headless: backfilled from `headless.create_team` /
         ///   `headless.resume_team` result (line ~1085).
         var teamUuid: String? = nil
+
+        // GUI pair-programming companion: a second pane spawned next to the
+        // leader running a different CLI ("none" = no pair). The pair is not
+        // a member of `agents` and is not addressable via tm-agent; it lives
+        // alongside the leader purely so the user can drive two CLIs in
+        // parallel from one team.
+        var pairMode: String = "none"   // "none", "claude", "kiro", "codex", "gemini"
+        var pairModel: String = ""
+        var pairPanelId: UUID? = nil
     }
 
     struct AgentPaneIdentity: Equatable {
@@ -98,6 +107,10 @@ final class TeamOrchestrator: ObservableObject {
     @Published private(set) var teams: [String: Team] = [:]
     // Round-robin counter per "teamName/agentName" key — cycles across duplicate-named agents.
     private var agentSendRoundRobin: [String: Int] = [:]
+    // Last paste target awaiting a separate Return, keyed by "teamName/agentName".
+    // Needed when duplicate-named agents are round-robined: the follow-up
+    // team.send_key must hit the pane that received the text, not the first name match.
+    private var pendingReturnTargets: [String: AgentPaneIdentity] = [:]
 
     /// In-flight send counter keyed by "<team>/<agent>". Incremented at the start
     /// of sendToAgent and decremented after sendIMEText completes. Hard restart
@@ -734,6 +747,9 @@ final class TeamOrchestrator: ObservableObject {
         leaderMode: String = "repl",
         leaderModel: String = "sonnet",
         leaderCli: String = "claude",
+        pairMode: String = "none",
+        pairModel: String = "",
+        pairSpec: String = "",
         resumeSessionId: String? = nil,
         worktreeMode: String = "off",
         executionMode: String = "pane",
@@ -746,6 +762,33 @@ final class TeamOrchestrator: ObservableObject {
         tabManager: TabManager
     ) -> Team? {
         guard !agents.isEmpty else { return nil }
+
+        // Pair = `/watch` entry point. When the GUI selects a pair CLI,
+        // prepend a watcher-role agent at index 0 so the existing grid
+        // places it as `[Leader | Watcher | …]` on the top row. The
+        // watcher runbook (AgentRolePreset.swift:955) wires `/watch
+        // review|on|status` and the daemon's watch_controller without
+        // further setup. Pair eligibility mirrors the GUI guard.
+        let pairEligible = leaderMode != "repl"
+            && leaderMode != "adopted"
+            && pairMode != "none"
+            && pairMode != leaderMode
+            && executionMode == "pane"
+        var agents = agents
+        if pairEligible {
+            let watcherInstructions = AgentRolePresetManager.builtInPresets.first { $0.name == "watcher" }?.instructions ?? ""
+            let watcherModel = pairModel.isEmpty ? "sonnet" : pairModel
+            let watcherTuple: (name: String, cli: String, model: String, agentType: String, color: String, instructions: String, customInstructions: String) = (
+                name: "watcher",
+                cli: pairMode,
+                model: watcherModel,
+                agentType: "watcher",
+                color: "yellow",
+                instructions: watcherInstructions,
+                customInstructions: pairSpec
+            )
+            agents.insert(watcherTuple, at: 0)
+        }
 
         // Always clear stale on-disk state for this team name before creating.
         // Result/message/task files in /tmp persist across app restarts and workspace closures,
@@ -1353,6 +1396,16 @@ final class TeamOrchestrator: ObservableObject {
             workspace.closePanel(defaultPanelId)
         }
 
+        // Surface the watcher's role in the pane title so the user sees it as
+        // "Pair · Watcher" rather than a generic agent. The watcher always
+        // occupies members[0] when pair is eligible (insert(at: 0) above).
+        if pairEligible, let watcherPanelId = members.first?.panelId {
+            workspace.setPanelCustomTitle(
+                panelId: watcherPanelId,
+                title: "🤝 Pair · Watcher (\(pairMode.capitalized))"
+            )
+        }
+
         // Equalize splits multiple times: bonsplit needs layout passes to settle.
         // First pass immediate, then delayed passes for robustness.
         for delay in [0.05, 0.3, 0.8] {
@@ -1385,7 +1438,10 @@ final class TeamOrchestrator: ObservableObject {
             sharedWorktreeName: sharedWtName,
             sharedWorktreePath: sharedWtPath,
             sharedWorktreeBranch: sharedWtBranch,
-            teamUuid: paneTeamUuid
+            teamUuid: paneTeamUuid,
+            pairMode: pairEligible ? pairMode : "none",
+            pairModel: pairEligible ? pairModel : "",
+            pairPanelId: pairEligible ? members.first?.panelId : nil
         )
         teams[name] = team
         // Register in thread-safe data store for off-main access (approach C: dual queue)
@@ -2436,6 +2492,9 @@ final class TeamOrchestrator: ObservableObject {
         dlog("[team.sendToAgent] enter team=\(teamName) agent=\(agentName) panelId=\(pid.uuidString.prefix(8)) withReturn=\(withReturn) textLen=\(text.count)")
         #endif
         activeSends[teamAgentKey, default: 0] += 1
+        if !withReturn, let identity = agentIdentity(for: agent) {
+            pendingReturnTargets[teamAgentKey] = identity
+        }
         return sendTextToPanel(
             workspaceId: agent.workspaceId,
             panelId: pid,
@@ -2902,6 +2961,21 @@ final class TeamOrchestrator: ObservableObject {
         guard let team = teams[teamName],
               let agent = team.agents.first(where: { $0.name == agentName }) else { return nil }
         return agentIdentity(for: agent)
+    }
+
+    func pendingReturnTarget(teamName: String, agentName: String) -> AgentPaneIdentity? {
+        pendingReturnTargets["\(teamName)/\(agentName)"]
+    }
+
+    func clearPendingReturnTarget(teamName: String, agentName: String, panelId: UUID? = nil) {
+        let key = "\(teamName)/\(agentName)"
+        guard let panelId else {
+            pendingReturnTargets.removeValue(forKey: key)
+            return
+        }
+        if pendingReturnTargets[key]?.panelId == panelId {
+            pendingReturnTargets.removeValue(forKey: key)
+        }
     }
 
     func agentIdentity(forPanelId panelId: UUID) -> AgentPaneIdentity? {

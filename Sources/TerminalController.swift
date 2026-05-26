@@ -3236,18 +3236,31 @@ class TerminalController {
                     }
                 }
 
-                guard let team = TeamOrchestrator.shared.teams[teamName],
-                      let agent = team.agents.first(where: { $0.name == agentName }) else {
-                    resume(sent: false, targetMissing: true, reason: "agent_not_found")
-                    return
-                }
-                guard let pid = agent.panelId else {
-                    resume(sent: false, targetMissing: true, reason: "headless_no_pane")
-                    return
+                let keyIsReturn = key.lowercased() == "return"
+                let pendingTarget = keyIsReturn
+                    ? TeamOrchestrator.shared.pendingReturnTarget(teamName: teamName, agentName: agentName)
+                    : nil
+                let pid: UUID
+                let workspaceId: UUID
+                if let pendingTarget {
+                    pid = pendingTarget.panelId
+                    workspaceId = pendingTarget.workspaceId
+                } else {
+                    guard let team = TeamOrchestrator.shared.teams[teamName],
+                          let agent = team.agents.first(where: { $0.name == agentName }) else {
+                        resume(sent: false, targetMissing: true, reason: "agent_not_found")
+                        return
+                    }
+                    guard let agentPanelId = agent.panelId else {
+                        resume(sent: false, targetMissing: true, reason: "headless_no_pane")
+                        return
+                    }
+                    pid = agentPanelId
+                    workspaceId = agent.workspaceId
                 }
                 let tabManager = TeamOrchestrator.shared.resolveTabManager(teamName: teamName) ?? self.tabManager
                 guard let tabManager,
-                      let ws = tabManager.tabs.first(where: { $0.id == agent.workspaceId }),
+                      let ws = tabManager.tabs.first(where: { $0.id == workspaceId }),
                       let panel = ws.terminalPanel(for: pid) else {
                     // Fallback: try global surface lookup
                     if let located = AppDelegate.shared?.locateSurface(surfaceId: pid),
@@ -3269,6 +3282,9 @@ class TerminalController {
         // the same codex/agent pane and prevent TUI submit-window drops.
         if result.sent && key.lowercased() == "return" {
             let agentKey = "\(teamName)/\(agentName)"
+            await MainActor.run {
+                TeamOrchestrator.shared.clearPendingReturnTarget(teamName: teamName, agentName: agentName)
+            }
             try? await Task.sleep(nanoseconds: TerminalController.kPostReturnCooldownNs)
             let gateToOpen: SendGate? = await MainActor.run {
                 guard var queue = TerminalController.perAgentGateQueue[agentKey],

@@ -269,6 +269,9 @@ final class TerminalSurface: Identifiable, ObservableObject {
     private let maxPendingTextBytes = 1_048_576
     private var backgroundSurfaceStartQueued = false
     private var surfaceCallbackContext: Unmanaged<GhosttySurfaceCallbackContext>?
+    /// Coordinates deferred ghostty_surface_free with active read leases.
+    /// Created once per TerminalSurface; outlives the object when leases are held.
+    let surfaceFreeCoordinator = SurfaceFreeCoordinator()
     @Published var searchState: SearchState? = nil {
 	        didSet {
 	            if let searchState {
@@ -983,8 +986,26 @@ final class TerminalSurface: Identifiable, ObservableObject {
         return ghostty_surface_needs_confirm_quit(surface)
     }
 
-    func closeGhosttySurface() {
+    @MainActor func closeGhosttySurface() {
         releaseGhosttySurfaceAsync(reason: "panelClose")
+    }
+
+    // MARK: - Surface read lease API (Phase 1 infrastructure)
+
+    /// Obtain a scoped read-access token for the underlying surface pointer.
+    ///
+    /// Must be called on the MainActor. Returns nil if the surface is absent or
+    /// is already being torn down (releaseGhosttySurfaceAsync in flight).
+    /// The caller must call lease.release() when done; deinit is a safety-net.
+    @MainActor
+    func beginReadLease() -> SurfaceReadLease? {
+        guard let surf = surface else { return nil }
+        surfaceFreeCoordinator.beginLease()
+        return SurfaceReadLease(
+            surface: surf,
+            generation: attachGeneration,
+            coordinator: surfaceFreeCoordinator
+        )
     }
 
     func sendText(_ text: String) {
@@ -1634,7 +1655,7 @@ final class TerminalSurface: Identifiable, ObservableObject {
         return ghostty_surface_has_selection(surface)
     }
 
-    private func releaseGhosttySurfaceAsync(reason: String) {
+    @MainActor private func releaseGhosttySurfaceAsync(reason: String) {
         let callbackContext = surfaceCallbackContext
         surfaceCallbackContext = nil
 
@@ -1662,18 +1683,51 @@ final class TerminalSurface: Identifiable, ObservableObject {
         ghostty_surface_clear_pty_data_callback(surface)
 
         // Keep the actual free asynchronous to avoid re-entrant close/deinit loops.
+        // Route through the coordinator so that ghostty_surface_free() is deferred
+        // until all active SurfaceReadLeases have been released — preventing
+        // use-after-free in async readers (e.g. AutoReplyPoller Phase 2).
         let surfaceId = id
+        let coordinator = surfaceFreeCoordinator  // strong ref survives TerminalSurface deinit
         Task { @MainActor in
             #if DEBUG
-            dlog("surface.free.perform surface=\(surfaceId.uuidString.prefix(8)) reason=\(reason)")
+            dlog("surface.free.schedule surface=\(surfaceId.uuidString.prefix(8)) reason=\(reason)")
             #endif
-            ghostty_surface_free(surface)
-            callbackContext?.release()
+            coordinator.scheduleClose {
+                #if DEBUG
+                dlog("surface.free.perform surface=\(surfaceId.uuidString.prefix(8)) reason=\(reason)")
+                #endif
+                ghostty_surface_free(surface)
+                callbackContext?.release()
+            }
         }
     }
 
     deinit {
-        releaseGhosttySurfaceAsync(reason: "deinit")
+        // TerminalSurface is always owned by @MainActor types (TerminalPanel, Workspace),
+        // so deinit effectively runs on the main actor. Swift cannot verify this statically,
+        // so we cannot call @MainActor-isolated releaseGhosttySurfaceAsync directly.
+        //
+        // Instead: capture all needed state now (before self deallocates), clear the
+        // pty_data_callback synchronously (critical — userdata is an unmanaged self pointer
+        // and the IO thread can fire after deinit without this), then schedule the
+        // deferred free through the coordinator via Task. Self must NOT be captured
+        // in the Task closure.
+        let coordinator = surfaceFreeCoordinator
+        let capturedSurface = surface
+        let capturedContext = surfaceCallbackContext
+
+        if let s = capturedSurface {
+            ghostty_surface_clear_pty_data_callback(s)
+        }
+
+        Task { @MainActor in
+            coordinator.scheduleClose {
+                if let s = capturedSurface {
+                    ghostty_surface_free(s)
+                }
+                capturedContext?.release()
+            }
+        }
     }
 }
 

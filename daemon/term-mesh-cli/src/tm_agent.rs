@@ -2583,6 +2583,13 @@ fn rpc_call_timeout(
         .read_line(&mut response)
         .map_err(|e| format!("read: {e}"))?;
 
+    if response.trim().is_empty() {
+        return Err(json!({
+            "code": "no_app",
+            "message": "no active term-mesh app — launch the app or run /team-up to bootstrap a team"
+        })
+        .to_string());
+    }
     serde_json::from_str(&response).map_err(|e| format!("parse: {e}"))
 }
 
@@ -2618,6 +2625,13 @@ fn rpc_call_with_reader(
         .read_line(&mut response)
         .map_err(|e| format!("read: {e}"))?;
 
+    if response.trim().is_empty() {
+        return Err(json!({
+            "code": "no_app",
+            "message": "no active term-mesh app — launch the app or run /team-up to bootstrap a team"
+        })
+        .to_string());
+    }
     serde_json::from_str(&response).map_err(|e| format!("parse: {e}"))
 }
 
@@ -4366,7 +4380,13 @@ fn main() {
         Commands::Status => {
             // Inject version info into the team.status response JSON
             let mut status = rpc_call(&sock, "team.status", json!({ "team_name": team }))
-                .unwrap_or_else(|e| json!({"ok": false, "error": {"message": e}}));
+                .unwrap_or_else(|e| {
+                    // If the error string is itself a JSON object (e.g. no_app structured error),
+                    // use it directly as the "error" field to preserve code + message.
+                    let err = serde_json::from_str::<Value>(&e)
+                        .unwrap_or_else(|_| json!({"message": e}));
+                    json!({"ok": false, "error": err})
+                });
 
             // Compact version check: "app_sha:cli_sha" + match flag
             let version_info = if let Ok(info) = rpc_call(&sock, "system.info", json!({})) {

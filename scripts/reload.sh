@@ -274,7 +274,6 @@ if [[ -n "$TAG" && "$APP_NAME" != "$SEARCH_APP_NAME" ]]; then
         rm -f "$TERMMESH_SOCKET"
       fi
     fi
-    /usr/bin/codesign --force --sign - --timestamp=none --generate-entitlement-der "$TAG_APP_PATH" >/dev/null 2>&1 || true
   fi
   APP_PATH="$TAG_APP_PATH"
 fi
@@ -302,6 +301,16 @@ for bin in term-meshd term-mesh-run tm-agent term-mesh-peer-relay; do
     chmod +x "$BIN_DIR/$bin"
   fi
 done
+# Re-sign AFTER copying daemon binaries into Contents/Resources/bin. Doing
+# this earlier (right after the Info.plist edits) leaves the resource seal
+# pointing at the pre-copy file set; LaunchServices then refuses to launch
+# the first time with no surfaced error and the app appears to "not start".
+# Surface codesign failures (no silent `2>&1 || true` swallow) so the next
+# bin-layout regression is loud.
+if [[ -n "$TAG" ]]; then
+  /usr/bin/codesign --force --sign - --timestamp=none --generate-entitlement-der "$APP_PATH" \
+    || echo "warning: codesign re-sign failed; first launch may be rejected" >&2
+fi
 # Avoid inheriting term-mesh/ghostty environment variables from the terminal that
 # runs this script (often inside another term-mesh instance), which can cause
 # socket and resource-path conflicts.
@@ -349,7 +358,13 @@ else
   echo "/tmp/term-mesh-debug.log" > /tmp/term-mesh-last-debug-log-path || true
   "${OPEN_CLEAN_ENV[@]}" "${EXTRA_ENV[@]}" open "$APP_PATH"
 fi
-osascript -e "tell application id \"${BUNDLE_ID}\" to activate" || true
+# `open` returns before LaunchServices finishes registering the app's bundle id,
+# so an immediate `osascript ... activate` fails with -1728 (errAENoSuchObject).
+# Poll up to ~3s until the bundle id is resolvable, then activate.
+for _ in {1..15}; do
+  osascript -e "tell application id \"${BUNDLE_ID}\" to activate" >/dev/null 2>&1 && break
+  sleep 0.2
+done
 
 # Safety: ensure only one instance is running.
 sleep 0.2
