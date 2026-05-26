@@ -452,6 +452,17 @@ extension Workspace: BonsplitDelegate {
         if !closedPanelIds.isEmpty {
             for panelId in closedPanelIds {
                 panels[panelId]?.close()
+                // Mirror the cleanup applied in didCloseTab (non-detach) and
+                // TabManager.closeWorkspace so a single-pane Bonsplit close
+                // doesn't leak AutoReplyPoller state or a PtyTapHub strong ref.
+                AutoReplyPoller.shared.forget(panelId: panelId)
+                PeerHostCoordinator.shared.invalidateTapHub(forSurfaceId: panelId)
+                // Clean up TerminalController state for both the bonsplit surface
+                // ID and the panel UUID (mirrors didCloseTab lines 349-350).
+                if let surfaceTabId = surfaceIdToPanelId.first(where: { $0.value == panelId })?.key {
+                    TerminalController.shared.v2CleanupSurface(surfaceTabId.uuid)
+                }
+                TerminalController.shared.v2CleanupSurface(panelId)
                 panels.removeValue(forKey: panelId)
                 panelDirectories.removeValue(forKey: panelId)
                 panelGitBranches.removeValue(forKey: panelId)
