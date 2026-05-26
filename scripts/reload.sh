@@ -274,7 +274,6 @@ if [[ -n "$TAG" && "$APP_NAME" != "$SEARCH_APP_NAME" ]]; then
         rm -f "$TERMMESH_SOCKET"
       fi
     fi
-    /usr/bin/codesign --force --sign - --timestamp=none --generate-entitlement-der "$TAG_APP_PATH" >/dev/null 2>&1 || true
   fi
   APP_PATH="$TAG_APP_PATH"
 fi
@@ -302,6 +301,16 @@ for bin in term-meshd term-mesh-run tm-agent term-mesh-peer-relay; do
     chmod +x "$BIN_DIR/$bin"
   fi
 done
+# Re-sign AFTER copying daemon binaries into Contents/Resources/bin. Doing
+# this earlier (right after the Info.plist edits) leaves the resource seal
+# pointing at the pre-copy file set; LaunchServices then refuses to launch
+# the first time with no surfaced error and the app appears to "not start".
+# Surface codesign failures (no silent `2>&1 || true` swallow) so the next
+# bin-layout regression is loud.
+if [[ -n "$TAG" ]]; then
+  /usr/bin/codesign --force --sign - --timestamp=none --generate-entitlement-der "$APP_PATH" \
+    || echo "warning: codesign re-sign failed; first launch may be rejected" >&2
+fi
 # Avoid inheriting term-mesh/ghostty environment variables from the terminal that
 # runs this script (often inside another term-mesh instance), which can cause
 # socket and resource-path conflicts.
