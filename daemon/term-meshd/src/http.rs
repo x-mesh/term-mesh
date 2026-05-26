@@ -7,7 +7,9 @@ use axum::{
     Router,
 };
 use serde::Deserialize;
+use std::collections::BTreeSet;
 use std::net::SocketAddr;
+use std::os::unix::fs::FileTypeExt;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -343,46 +345,35 @@ async fn refreshed_team_state(state: &Arc<HttpState>) -> serde_json::Value {
 
 async fn fetch_live_team_state(state: &Arc<HttpState>) -> Option<serde_json::Value> {
     let cached = state.team_state.read().unwrap().clone();
-    let socket_path = team_socket_path(state).ok()?;
-    let teams = rpc_team_socket(&socket_path, "team.list", serde_json::json!({}))
-        .await
-        .ok()?
-        .as_array()
-        .cloned()?;
+    let primary_socket = team_socket_path_from_value(&cached).ok();
+    let socket_paths = candidate_team_socket_paths(primary_socket.as_deref());
 
+    let mut teams = Vec::new();
     let mut tasks = Vec::new();
     let mut attention = Vec::new();
-    for team in &teams {
-        let team_name = team.get("team_name").and_then(|v| v.as_str())?;
-        if let Ok(task_result) = rpc_team_socket(
-            &socket_path,
-            "team.task.list",
-            serde_json::json!({ "team_name": team_name }),
-        )
-        .await
-        {
-            if let Some(team_tasks) = task_result.get("tasks").and_then(|v| v.as_array()) {
-                for task in team_tasks {
-                    let mut task = task.clone();
-                    if let Some(obj) = task.as_object_mut() {
-                        obj.insert("team_name".to_string(), serde_json::json!(team_name));
-                    }
-                    tasks.push(task);
-                }
-            }
+    let mut sockets_with_teams = Vec::new();
+    let mut saw_empty_primary = false;
+
+    for socket_path in socket_paths {
+        let Ok((socket_teams, socket_tasks, socket_attention)) =
+            fetch_team_payload_from_socket(&socket_path).await
+        else {
+            continue;
+        };
+
+        if socket_teams.is_empty() {
+            saw_empty_primary |= primary_socket.as_deref() == Some(socket_path.as_str());
+            continue;
         }
 
-        if let Ok(inbox_result) = rpc_team_socket(
-            &socket_path,
-            "team.inbox",
-            serde_json::json!({ "team_name": team_name }),
-        )
-        .await
-        {
-            if let Some(team_items) = inbox_result.get("items").and_then(|v| v.as_array()) {
-                attention.extend(team_items.iter().cloned());
-            }
-        }
+        sockets_with_teams.push(socket_path);
+        teams.extend(socket_teams);
+        tasks.extend(socket_tasks);
+        attention.extend(socket_attention);
+    }
+
+    if teams.is_empty() && !saw_empty_primary {
+        return None;
     }
 
     let mut instance = cached
@@ -390,7 +381,21 @@ async fn fetch_live_team_state(state: &Arc<HttpState>) -> Option<serde_json::Val
         .cloned()
         .unwrap_or_else(|| serde_json::json!({}));
     if let Some(obj) = instance.as_object_mut() {
-        obj.insert("socket_path".to_string(), serde_json::json!(socket_path));
+        let socket_label = match sockets_with_teams.as_slice() {
+            [only] => only.clone(),
+            [] => primary_socket
+                .clone()
+                .unwrap_or_else(|| "unavailable".to_string()),
+            many => format!("{} sockets", many.len()),
+        };
+        obj.insert("socket_path".to_string(), serde_json::json!(socket_label));
+        if let Some(primary) = primary_socket {
+            obj.insert("primary_socket_path".to_string(), serde_json::json!(primary));
+        }
+        obj.insert(
+            "active_socket_paths".to_string(),
+            serde_json::json!(sockets_with_teams),
+        );
         obj.insert("team_count".to_string(), serde_json::json!(teams.len()));
     }
 
@@ -402,15 +407,152 @@ async fn fetch_live_team_state(state: &Arc<HttpState>) -> Option<serde_json::Val
     }))
 }
 
+async fn fetch_team_payload_from_socket(
+    socket_path: &str,
+) -> Result<
+    (
+        Vec<serde_json::Value>,
+        Vec<serde_json::Value>,
+        Vec<serde_json::Value>,
+    ),
+    String,
+> {
+    let mut teams = rpc_team_socket(socket_path, "team.list", serde_json::json!({}))
+        .await
+        ?
+        .as_array()
+        .cloned()
+        .ok_or_else(|| "team.list did not return an array".to_string())?;
+
+    let mut tasks = Vec::new();
+    let mut attention = Vec::new();
+    for team in &mut teams {
+        let Some(team_name) = team.get("team_name").and_then(|v| v.as_str()).map(str::to_string)
+        else {
+            continue;
+        };
+        if let Some(obj) = team.as_object_mut() {
+            obj.insert("socket_path".to_string(), serde_json::json!(socket_path));
+        }
+        if let Ok(task_result) = rpc_team_socket(
+            socket_path,
+            "team.task.list",
+            serde_json::json!({ "team_name": team_name }),
+        )
+        .await
+        {
+            if let Some(team_tasks) = task_result.get("tasks").and_then(|v| v.as_array()) {
+                for task in team_tasks {
+                    let mut task = task.clone();
+                    if let Some(obj) = task.as_object_mut() {
+                        obj.insert("team_name".to_string(), serde_json::json!(team_name));
+                        obj.insert("socket_path".to_string(), serde_json::json!(socket_path));
+                    }
+                    tasks.push(task);
+                }
+            }
+        }
+
+        if let Ok(inbox_result) = rpc_team_socket(
+            socket_path,
+            "team.inbox",
+            serde_json::json!({ "team_name": team_name }),
+        )
+        .await
+        {
+            if let Some(team_items) = inbox_result.get("items").and_then(|v| v.as_array()) {
+                for item in team_items {
+                    let mut item = item.clone();
+                    if let Some(obj) = item.as_object_mut() {
+                        obj.entry("team_name".to_string())
+                            .or_insert_with(|| serde_json::json!(team_name));
+                        obj.insert("socket_path".to_string(), serde_json::json!(socket_path));
+                    }
+                    attention.push(item);
+                }
+            }
+        }
+    }
+
+    Ok((teams, tasks, attention))
+}
+
 fn team_socket_path(state: &HttpState) -> Result<String, String> {
     let team_state = state.team_state.read().unwrap().clone();
-    team_state
-        .get("instance")
-        .and_then(|v| v.get("socket_path"))
+    team_socket_path_from_value(&team_state)
+}
+
+fn team_socket_path_from_value(team_state: &serde_json::Value) -> Result<String, String> {
+    let instance = team_state.get("instance");
+    instance
+        .and_then(|v| v.get("primary_socket_path"))
         .and_then(|v| v.as_str())
-        .filter(|v| !v.is_empty())
+        .or_else(|| {
+            instance
+                .and_then(|v| v.get("socket_path"))
+                .and_then(|v| v.as_str())
+        })
+        .filter(|v| !v.is_empty() && v.starts_with('/'))
         .map(|v| v.to_string())
         .ok_or_else(|| "team instance socket is unavailable".to_string())
+}
+
+fn candidate_team_socket_paths(primary: Option<&str>) -> Vec<String> {
+    let mut candidates = BTreeSet::new();
+    if let Some(path) = primary.filter(|path| path.starts_with('/')) {
+        candidates.insert(path.to_string());
+    }
+
+    if let Ok(entries) = std::fs::read_dir("/tmp") {
+        for entry in entries.flatten() {
+            let file_name = entry.file_name();
+            let Some(file_name) = file_name.to_str() else {
+                continue;
+            };
+            if !file_name.starts_with("term-mesh") || !file_name.ends_with(".sock") {
+                continue;
+            }
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            if file_type.is_socket() {
+                candidates.insert(entry.path().to_string_lossy().to_string());
+            }
+        }
+    }
+
+    candidates.into_iter().collect()
+}
+
+async fn team_socket_path_for_team(
+    state: &Arc<HttpState>,
+    team_name: &str,
+) -> Result<String, String> {
+    if team_name.is_empty() {
+        return team_socket_path(state);
+    }
+
+    let cached = state.team_state.read().unwrap().clone();
+    let primary = team_socket_path_from_value(&cached).ok();
+    for socket_path in candidate_team_socket_paths(primary.as_deref()) {
+        let Ok(teams) = rpc_team_socket(&socket_path, "team.list", serde_json::json!({})).await
+        else {
+            continue;
+        };
+        if teams
+            .as_array()
+            .map(|teams| {
+                teams.iter().any(|team| {
+                    team.get("team_name").and_then(|v| v.as_str()) == Some(team_name)
+                })
+            })
+            .unwrap_or(false)
+        {
+            return Ok(socket_path);
+        }
+    }
+
+    team_socket_path(state)
 }
 
 async fn rpc_team_socket(
@@ -553,7 +695,7 @@ async fn team_tasks_create_handler(
     State(state): State<Arc<HttpState>>,
     Json(req): Json<TeamTaskCreateRequest>,
 ) -> impl IntoResponse {
-    let socket_path = match team_socket_path(&state) {
+    let socket_path = match team_socket_path_for_team(&state, &req.team_name).await {
         Ok(path) => path,
         Err(err) => return (StatusCode::SERVICE_UNAVAILABLE, err).into_response(),
     };
@@ -626,7 +768,8 @@ async fn team_tasks_action_handler(
     Path(id): Path<String>,
     Json(req): Json<TeamTaskActionRequest>,
 ) -> impl IntoResponse {
-    let socket_path = match team_socket_path(&state) {
+    let team_name_for_route = req.team_name.as_deref().unwrap_or("");
+    let socket_path = match team_socket_path_for_team(&state, team_name_for_route).await {
         Ok(path) => path,
         Err(err) => return (StatusCode::SERVICE_UNAVAILABLE, err).into_response(),
     };
