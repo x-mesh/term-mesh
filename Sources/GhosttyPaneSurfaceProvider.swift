@@ -889,20 +889,16 @@ private func sendPeerInputBytes(_ surface: ghostty_surface_t, bytes: Data) {
         if byte == 0x1b,
            let consumed = peerEscapeSequenceLength(arr, start: i),
            consumed > 1 {
-            // FIX 1: DROP unrecognized CSI/OSC/SS3 instead of injecting via
-            // ghostty_surface_key. Forwarding through surface_key re-encodes
-            // the leading ESC byte — Ghostty's text-key handler parses it as
-            // an input encoding, losing bytes and corrupting vim/htop screens
-            // (literal `[<35;...M` text, cursor jumps). ghostty_surface_text
-            // is also unsuitable: it auto-wraps in bracketed paste markers
-            // (confirmed: textCallback → completeClipboardPaste → bracketed
-            // mode check). Silent drop preserves remote app state better
-            // than injecting a garbled sequence. Long-term: ghostty needs a
-            // ghostty_surface_write_raw(surface, bytes, len) API, or mouse
-            // CSI sequences should be parsed into ghostty_surface_mouse_*
-            // calls on the destination surface.
-            i += consumed
-            continue
+            let raw = Array(arr[i..<i + consumed])
+            // ASCII-only fast path keeps the text-field UTF-8 bytes
+            // byte-identical with the original sequence. Any high bytes
+            // fall through to the existing per-scalar path below.
+            if raw.allSatisfy({ $0 < 0x80 }),
+               let payload = String(bytes: raw, encoding: .ascii) {
+                sendPeerKeyEvent(surface, keycode: 0, text: payload)
+                i += consumed
+                continue
+            }
         }
 
         if let mapping = peerSingleByteKeyMapping(byte) {
