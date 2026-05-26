@@ -204,7 +204,7 @@ struct TermMeshApp: App {
 
     private func makeTeamCreationView() -> TeamCreationView {
         TeamCreationView(
-            onCreate: { teamName, leaderMode, leaderModel, agents, worktreeMode, executionMode, resumeSessionId, pairMode, pairModel in
+            onCreate: { teamName, leaderMode, leaderModel, agents, worktreeMode, executionMode, resumeSessionId, pairMode, pairModel, pairSpec in
                 let activeTabManager = teamCreationTabManager ?? tabManager
                 let workDir = activeTabManager.selectedTab?.currentDirectory
                     ?? FileManager.default.currentDirectoryPath
@@ -242,6 +242,7 @@ struct TermMeshApp: App {
                     leaderModel: leaderModel,
                     pairMode: pairMode,
                     pairModel: pairModel,
+                    pairSpec: pairSpec,
                     resumeSessionId: resumeSessionId,
                     worktreeMode: worktreeMode,
                     executionMode: executionMode,

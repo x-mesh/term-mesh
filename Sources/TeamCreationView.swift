@@ -347,7 +347,7 @@ struct TeamCreationView: View {
     @ObservedObject var teamTemplateManager = TeamTemplateManager.shared
     @ObservedObject var providerDetector = ProviderDetector.shared
 
-    var onCreate: ((_ teamName: String, _ leaderMode: String, _ leaderModel: String, _ agents: [TeamAgentRow], _ worktreeMode: String, _ executionMode: String, _ resumeSessionId: String?, _ pairMode: String, _ pairModel: String) -> Bool)?
+    var onCreate: ((_ teamName: String, _ leaderMode: String, _ leaderModel: String, _ agents: [TeamAgentRow], _ worktreeMode: String, _ executionMode: String, _ resumeSessionId: String?, _ pairMode: String, _ pairModel: String, _ pairSpec: String) -> Bool)?
     /// Phase 2: called after a successful `headless.resume_team` RPC.
     /// Receives the decoded result dictionary. Caller is responsible for
     /// registering the team in TeamOrchestrator and switching workspace cwd
@@ -385,6 +385,7 @@ struct TeamCreationView: View {
     @State private var resumeSession = false
     @State private var leaderPairMode: String = "none"
     @AppStorage("teamDefaultPairModel") private var leaderPairModel: String = ""
+    @State private var leaderPairSpec: String = ""
     @State private var recentSessions: [ClaudeSession] = []
     @State private var selectedSessionId: String?
     @State private var manualSessionId = ""
@@ -1199,6 +1200,41 @@ struct TeamCreationView: View {
                     }
                     .font(.caption)
                     .transition(.opacity)
+                }
+
+                if leaderPairMode != "none" && leaderPairMode != leaderMode && executionMode != "headless" {
+                    HStack(spacing: 4) {
+                        Image(systemName: "eye")
+                            .foregroundStyle(.secondary)
+                        Text("Pair acts as a watcher · run `/watch review` in leader pane to start checks")
+                            .foregroundStyle(.secondary)
+                    }
+                    .font(.caption)
+
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("Watcher Spec (optional)")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                        ZStack(alignment: .topLeading) {
+                            TextEditor(text: $leaderPairSpec)
+                                .font(.caption)
+                                .frame(minHeight: 44, maxHeight: 80)
+                                .padding(4)
+                                .background(Color(nsColor: .textBackgroundColor))
+                                .overlay(
+                                    RoundedRectangle(cornerRadius: 4)
+                                        .stroke(Color.secondary.opacity(0.3))
+                                )
+                            if leaderPairSpec.isEmpty {
+                                Text("e.g. Stay within current task scope. Flag --no-verify or scope creep.")
+                                    .font(.caption)
+                                    .foregroundStyle(.tertiary)
+                                    .padding(.horizontal, 8)
+                                    .padding(.vertical, 8)
+                                    .allowsHitTesting(false)
+                            }
+                        }
+                    }
                 }
             }
 
@@ -2548,7 +2584,8 @@ struct TeamCreationView: View {
         // Drop pair when execution mode is headless (pair is pane-only) or
         // when something has left pair === leader (self-heal guard).
         let effectivePair = (executionMode == "headless" || leaderPairMode == leaderMode) ? "none" : leaderPairMode
-        let success = onCreate?(teamName, leaderMode, leaderModel, agents, worktreeMode, executionMode, sid, effectivePair, effectivePair == "none" ? "" : leaderPairModel) ?? false
+        let effectivePairSpec = effectivePair == "none" ? "" : leaderPairSpec
+        let success = onCreate?(teamName, leaderMode, leaderModel, agents, worktreeMode, executionMode, sid, effectivePair, effectivePair == "none" ? "" : leaderPairModel, effectivePairSpec) ?? false
         guard success else { return }
         defaultLeaderMode = leaderMode
         defaultLeaderModel = leaderModel

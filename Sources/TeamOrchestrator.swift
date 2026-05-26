@@ -745,6 +745,7 @@ final class TeamOrchestrator: ObservableObject {
         leaderCli: String = "claude",
         pairMode: String = "none",
         pairModel: String = "",
+        pairSpec: String = "",
         resumeSessionId: String? = nil,
         worktreeMode: String = "off",
         executionMode: String = "pane",
@@ -757,6 +758,33 @@ final class TeamOrchestrator: ObservableObject {
         tabManager: TabManager
     ) -> Team? {
         guard !agents.isEmpty else { return nil }
+
+        // Pair = `/watch` entry point. When the GUI selects a pair CLI,
+        // prepend a watcher-role agent at index 0 so the existing grid
+        // places it as `[Leader | Watcher | …]` on the top row. The
+        // watcher runbook (AgentRolePreset.swift:955) wires `/watch
+        // review|on|status` and the daemon's watch_controller without
+        // further setup. Pair eligibility mirrors the GUI guard.
+        let pairEligible = leaderMode != "repl"
+            && leaderMode != "adopted"
+            && pairMode != "none"
+            && pairMode != leaderMode
+            && executionMode == "pane"
+        var agents = agents
+        if pairEligible {
+            let watcherInstructions = AgentRolePresetManager.builtInPresets.first { $0.name == "watcher" }?.instructions ?? ""
+            let watcherModel = pairModel.isEmpty ? "sonnet" : pairModel
+            let watcherTuple: (name: String, cli: String, model: String, agentType: String, color: String, instructions: String, customInstructions: String) = (
+                name: "watcher",
+                cli: pairMode,
+                model: watcherModel,
+                agentType: "watcher",
+                color: "yellow",
+                instructions: watcherInstructions,
+                customInstructions: pairSpec
+            )
+            agents.insert(watcherTuple, at: 0)
+        }
 
         // Always clear stale on-disk state for this team name before creating.
         // Result/message/task files in /tmp persist across app restarts and workspace closures,
@@ -1088,69 +1116,6 @@ final class TeamOrchestrator: ObservableObject {
             }
         }
 
-        // ── Pair pane: optional 1:1 companion next to the leader ────────────
-        // Splits horizontally off the leader so the agent grid (below) still
-        // anchors on the leader and never on the pair.
-        var pairPanelId: UUID? = nil
-        let effectivePairMode = (leaderMode == "adopted" || leaderMode == "repl" || pairMode == leaderMode) ? "none" : pairMode
-        if effectivePairMode != "none", let pairBinaryPath = agentBinaryPath(cli: effectivePairMode) {
-            let pairCommand: String
-            switch effectivePairMode {
-            case "claude":
-                let quoted = pairBinaryPath.contains(" ") ? "\"\(pairBinaryPath)\"" : pairBinaryPath
-                var parts = [quoted, "--dangerously-skip-permissions"]
-                if !pairModel.isEmpty && pairModel != "sonnet" {
-                    parts.append("--model '\(Self.resolveClaudeModelArg(pairModel))'")
-                }
-                pairCommand = parts.joined(separator: " ")
-            case "kiro":
-                pairCommand = buildKiroCommand(kiroPath: pairBinaryPath, agentName: "pair", teamName: name, model: pairModel, isLeader: false)
-            case "codex":
-                pairCommand = buildCodexCommand(codexPath: pairBinaryPath, agentName: "pair", teamName: name, model: pairModel)
-            case "gemini":
-                pairCommand = buildGeminiCommand(geminiPath: pairBinaryPath, agentName: "pair", teamName: name, model: pairModel)
-            default:
-                pairCommand = ""
-            }
-            if !pairCommand.isEmpty {
-                let pairShellCommand: String
-                if leaderWorkDir != workingDirectory {
-                    let shell = ProcessInfo.processInfo.environment["SHELL"] ?? "/bin/zsh"
-                    let inner = "cd \"\(leaderWorkDir)\" && exec \(pairCommand); exec $SHELL"
-                    let escaped = inner.replacingOccurrences(of: "'", with: "'\\''")
-                    pairShellCommand = "\(shell) -l -c '\(escaped)'"
-                } else {
-                    pairShellCommand = "\(pairCommand); exec $SHELL"
-                }
-                // Pair env mirrors leaderEnv (CLAUDECODE cleared for non-claude CLIs;
-                // for claude pair, also clear so it can start its own session).
-                let pairEnv = baseEnv.merging(["CLAUDECODE": ""]) { _, new in new }
-                if let pairPanel = workspace.newTerminalSplit(
-                    from: leaderPanelId,
-                    orientation: .horizontal,
-                    insertFirst: false,
-                    focus: false,
-                    skipEqualization: true,
-                    workingDirectory: leaderWorkDir,
-                    command: pairShellCommand,
-                    environment: pairEnv
-                ) {
-                    pairPanelId = pairPanel.id
-                    let pairLabel: String
-                    switch effectivePairMode {
-                    case "claude": pairLabel = "🤝 Pair (Claude)"
-                    case "kiro":   pairLabel = "🤝 Pair (Kiro)"
-                    case "codex":  pairLabel = "🤝 Pair (Codex)"
-                    case "gemini": pairLabel = "🤝 Pair (Gemini)"
-                    default:       pairLabel = "🤝 Pair"
-                    }
-                    workspace.setPanelCustomTitle(panelId: pairPanel.id, title: pairLabel)
-                } else {
-                    Logger.team.warning("[team] failed to create pair pane (cli=\(effectivePairMode, privacy: .public))")
-                }
-            }
-        }
-
         // Agent grid anchor: in normal mode agents split from leaderPanel;
         // in adopted mode they split from the workspace's default panel (no leader pane exists).
         let agentAnchorPanelId = leaderMode == "adopted" ? defaultPanelId : leaderPanelId
@@ -1427,6 +1392,16 @@ final class TeamOrchestrator: ObservableObject {
             workspace.closePanel(defaultPanelId)
         }
 
+        // Surface the watcher's role in the pane title so the user sees it as
+        // "Pair · Watcher" rather than a generic agent. The watcher always
+        // occupies members[0] when pair is eligible (insert(at: 0) above).
+        if pairEligible, let watcherPanelId = members.first?.panelId {
+            workspace.setPanelCustomTitle(
+                panelId: watcherPanelId,
+                title: "🤝 Pair · Watcher (\(pairMode.capitalized))"
+            )
+        }
+
         // Equalize splits multiple times: bonsplit needs layout passes to settle.
         // First pass immediate, then delayed passes for robustness.
         for delay in [0.05, 0.3, 0.8] {
@@ -1460,9 +1435,9 @@ final class TeamOrchestrator: ObservableObject {
             sharedWorktreePath: sharedWtPath,
             sharedWorktreeBranch: sharedWtBranch,
             teamUuid: paneTeamUuid,
-            pairMode: effectivePairMode,
-            pairModel: effectivePairMode == "none" ? "" : pairModel,
-            pairPanelId: pairPanelId
+            pairMode: pairEligible ? pairMode : "none",
+            pairModel: pairEligible ? pairModel : "",
+            pairPanelId: pairEligible ? members.first?.panelId : nil
         )
         teams[name] = team
         // Register in thread-safe data store for off-main access (approach C: dual queue)
