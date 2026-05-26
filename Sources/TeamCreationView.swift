@@ -502,6 +502,18 @@ struct TeamCreationView: View {
         .onChange(of: workingDirectory) { _ in
             validateWorkingDirectory()
             refreshRunbookStatus()
+            // Clear session state tied to the previous cwd so createTeam cannot
+            // submit (new cwd + stale sessionId) and produce wrong rehydration.
+            recentSessions = []
+            selectedSessionId = nil
+            // If resume toggle is on and the new path is valid, reload sessions.
+            if resumeSession, workingDirectoryError == nil, !workingDirectory.isEmpty {
+                let dir = workingDirectory
+                Task.detached(priority: .userInitiated) {
+                    let sessions = ClaudeSession.listRecent(workingDirectory: dir)
+                    await MainActor.run { recentSessions = sessions }
+                }
+            }
         }
         // Phase 2: refresh the resume list when a destroy event arrives while
         // the sheet is open. We listen on the .headlessTeamDestroyed

@@ -203,12 +203,22 @@ struct TermMeshApp: App {
     }
 
     private func resolveDefaultWorkingDirectory(activeTabManager: TabManager?) -> (path: String, source: WorkingDirectorySource) {
-        // 1. Current pane CWD tracked via OSC-7
+        // 1. Caller-provided active tab manager (already from the key/main window context at menu click time)
         if let dir = activeTabManager?.selectedTab?.currentDirectory, !dir.isEmpty {
             return (dir, .currentPane)
         }
-        // 2. Any open workspace's selected tab
-        if let dir = AppDelegate.shared?.mainWindowContexts.values.first?.tabManager.selectedTab?.currentDirectory, !dir.isEmpty {
+        // 2. Workspace: use only the deterministically identified active window
+        //    (key window first, then main window). Avoids the non-deterministic
+        //    Dictionary iteration order of mainWindowContexts.values.first which
+        //    can resurrect the "team starts in wrong window" bug class.
+        if let kw = NSApp.keyWindow,
+           let ctx = AppDelegate.shared?.contextForMainWindow(kw),
+           let dir = ctx.tabManager.selectedTab?.currentDirectory, !dir.isEmpty {
+            return (dir, .workspace)
+        }
+        if let mw = NSApp.mainWindow,
+           let ctx = AppDelegate.shared?.contextForMainWindow(mw),
+           let dir = ctx.tabManager.selectedTab?.currentDirectory, !dir.isEmpty {
             return (dir, .workspace)
         }
         // 3. Last successfully used directory from MRU list
