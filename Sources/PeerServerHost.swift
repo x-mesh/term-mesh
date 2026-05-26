@@ -142,6 +142,12 @@ final class PeerHostCoordinator: NSObject {
         }
     }
 
+    /// Forward to the provider so TabManager / Workspace can release stale tapHubs
+    /// without a direct dependency on GhosttyPaneSurfaceProvider.
+    func invalidateTapHub(forSurfaceId surfaceId: UUID) {
+        provider?.invalidateTapHub(forSurfaceId: surfaceId)
+    }
+
     @objc func stopServer(_ sender: Any?) {
         switch lifecycle {
         case .starting(let path):

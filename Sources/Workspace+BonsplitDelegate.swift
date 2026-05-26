@@ -341,6 +341,7 @@ extension Workspace: BonsplitDelegate {
             }
             panel?.close()
             AutoReplyPoller.shared.forget(panelId: panelId)
+            PeerHostCoordinator.shared.invalidateTapHub(forSurfaceId: panelId)
         }
 
         // Clean up TerminalController singleton state for this surface to prevent memory leaks.

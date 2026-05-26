@@ -42,13 +42,21 @@ final class PtyTapHub: @unchecked Sendable {
 
     let surfaceID: UUID
     let surfacePtr: ghostty_surface_t
-    // Strong reference prevents TerminalSurface.deinit from running while attached.
-    let surfaceRef: TerminalSurface
+    // Strong reference prevents TerminalSurface.deinit during active relay.
+    // Nulled by shutdown() when the panel closes to release the surface.
+    private var surfaceRef: TerminalSurface?
 
     init(surfaceID: UUID, surfacePtr: ghostty_surface_t, surfaceRef: TerminalSurface) {
         self.surfaceID = surfaceID
         self.surfacePtr = surfacePtr
         self.surfaceRef = surfaceRef
+    }
+
+    /// Call when the backing panel closes (not on normal peer detach).
+    /// Finishes all streams and drops the TerminalSurface strong reference.
+    func shutdown() {
+        finishAll()
+        surfaceRef = nil
     }
 
     deinit {
@@ -114,6 +122,16 @@ final class PtyTapHub: @unchecked Sendable {
 @MainActor
 final class GhosttyPaneSurfaceProvider: PeerSurfaceProvider {
     private var tapHubs: [UUID: PtyTapHub] = [:]
+
+    /// Called when a terminal panel closes. Shuts down the hub (finishes all
+    /// peer streams + drops TerminalSurface ref) without waiting for peer detach.
+    func invalidateTapHub(forSurfaceId surfaceId: UUID) {
+        guard let hub = tapHubs.removeValue(forKey: surfaceId) else { return }
+        hub.shutdown()
+        #if DEBUG
+        dlog("tapHub.invalidate surfaceId=\(surfaceId.uuidString.prefix(8))")
+        #endif
+    }
 
     // MARK: PeerSurfaceProvider
 

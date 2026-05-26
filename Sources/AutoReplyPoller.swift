@@ -33,6 +33,8 @@ final class AutoReplyPoller {
     /// rust default's idle_debounce floor; we tick a bit faster so debounce
     /// + scrollback diff catch up promptly after the agent finishes printing.
     private let pollInterval: TimeInterval = 1.0
+    // FIX 2: Cap lastScrollbackText to avoid unbounded memory growth on long-running agents.
+    private static let lastScrollbackCapBytes = 2 * 1024 * 1024
 
     // FIX 1: Private serial queue so concurrent ticks can't interleave reads.
     private let pollQueue = DispatchQueue(label: "term-mesh.auto-reply.poll", qos: .userInitiated)
@@ -238,7 +240,12 @@ final class AutoReplyPoller {
     private func applyResult(panelId: UUID, teamName: String, agentName: String,
                               snapshot: String?, delta: String, at now: Date) {
         guard let state = perPanel[panelId] else { return }  // panel GC'd between read and apply
-        if let snap = snapshot { state.lastScrollbackText = snap }
+        if let snap = snapshot {
+            // FIX 2: keep only the tail so per-panel state stays bounded.
+            state.lastScrollbackText = snap.utf8.count <= Self.lastScrollbackCapBytes
+                ? snap
+                : String(snap.suffix(Self.lastScrollbackCapBytes))
+        }
         if !delta.isEmpty, let data = delta.data(using: .utf8) {
             if let ev = state.detector.pushBytes(data, at: now) {
                 tryEmit(panelId: panelId, state: state, event: ev,

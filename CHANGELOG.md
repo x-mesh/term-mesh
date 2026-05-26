@@ -10,6 +10,8 @@ All notable changes to term-mesh are documented here.
 - `AutoReplyPoller.forget(panelId:)` is now called on all panel close paths (`closeWorkspace` and `didCloseTab` non-detach) to release per-panel state (lastScrollbackText buffers, detector instances).
 - AutoReplyPoller hang on main thread — increased poll interval from 0.4s to 1.0s to stay under the 5000ms ANR threshold when running multiple agent teams (Sentry TERM-MESH-2R, -2Q, -2P, -2N, -2M, -2K, -2J, -2H, -2G, -2F, -1D).
 - AutoReplyPoller main-thread block (Phase 2) — moved `ghostty_surface_read_text` off the main thread. `tick()` now acquires `SurfaceReadLease` tokens on MainActor then fans out all terminal scrollback reads to a background `userInitiated` queue; only detector state updates and event emission run back on main. Eliminates the O(N×M) synchronous read loop that caused the Sentry hangs when multiple agent teams were active simultaneously.
+- **tapHubs 메모리 누수** — peer-federation 세션이 SSH 단절·relay crash 등 비정상 종료로 끝날 때 `PtyTapHub.surfaceRef` 강참조가 남아 TerminalSurface(10–30MB)가 해제되지 않던 문제. 패널이 닫힐 때 `PeerHostCoordinator.invalidateTapHub` 를 호출해 hub를 즉시 shutdown하고 강참조를 nil로 해제. `TabManager.closeWorkspace` 와 `Workspace+BonsplitDelegate.didClosePanel` 두 경로 모두 처리.
+- **AutoReplyPoller `lastScrollbackText` 무제한 증가** — 장시간 에이전트 팀 운용 시 scrollback 전체가 per-panel 버퍼에 계속 쌓이며 세션 1시간 이후 수백 MB까지 성장하던 문제. scrollback 저장 시 최근 2MB 꼬리만 보존하도록 캡 적용(`lastScrollbackCapBytes = 2 MB`). delta diff는 캡 이전의 이전 버퍼와 캡 이후의 현재 버퍼 간 비교이므로 이벤트 감지 정확도에 영향 없음.
 
 ## [0.130.0] - 2026-05-25
 
