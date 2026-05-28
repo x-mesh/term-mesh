@@ -502,7 +502,7 @@ async fn wait_for_verdict(
 }
 
 async fn read_lines(manager: &Arc<Mutex<HeadlessManager>>, agent_id: &str) -> Vec<String> {
-    let mgr = manager.lock().await;
+    let mut mgr = manager.lock().await;
     mgr.read_output(agent_id, 10_000).await.unwrap_or_default()
 }
 

@@ -827,8 +827,26 @@ impl HeadlessManager {
         Ok(info)
     }
 
+    /// Reap naturally-exited children using non-blocking try_wait.
+    /// Call at the entry of RPC handlers so stale Running entries are cleared
+    /// before any logic that depends on agent.status or agent.stdin.
+    fn reap_exited_agents(&mut self) {
+        for a in self.agents.values_mut() {
+            if a.status == AgentStatus::Running {
+                if let Some(child) = a.child.as_mut() {
+                    if matches!(child.try_wait(), Ok(Some(_))) {
+                        a.status = AgentStatus::Terminated;
+                        a.stdin = None; // closes parent write-end fd
+                        a.child = None; // drops reaped child handle
+                    }
+                }
+            }
+        }
+    }
+
     /// Send a message to a headless agent's stdin via its protocol adapter.
     pub async fn send_message(&mut self, agent_id: &str, text: &str) -> Result<(), String> {
+        self.reap_exited_agents();
         let agent = self
             .agents
             .get_mut(agent_id)
@@ -861,7 +879,8 @@ impl HeadlessManager {
         Ok(())
     }
 
-    pub async fn read_output(&self, agent_id: &str, lines: usize) -> Result<Vec<String>, String> {
+    pub async fn read_output(&mut self, agent_id: &str, lines: usize) -> Result<Vec<String>, String> {
+        self.reap_exited_agents();
         let agent = self
             .agents
             .get(agent_id)
@@ -912,7 +931,8 @@ impl HeadlessManager {
         Ok(())
     }
 
-    pub async fn status(&self, agent_id: &str) -> Result<AgentInfo, String> {
+    pub async fn status(&mut self, agent_id: &str) -> Result<AgentInfo, String> {
+        self.reap_exited_agents();
         let agent = self
             .agents
             .get(agent_id)
@@ -936,7 +956,8 @@ impl HeadlessManager {
         })
     }
 
-    pub async fn list(&self, team_name: Option<&str>) -> Vec<AgentInfo> {
+    pub async fn list(&mut self, team_name: Option<&str>) -> Vec<AgentInfo> {
+        self.reap_exited_agents();
         let mut result = Vec::new();
         for agent in self.agents.values() {
             if let Some(tn) = team_name {
@@ -3461,5 +3482,49 @@ mod tests {
         let removed = meta::sweep_zombie_pane_archives();
         assert_eq!(removed, 0);
         assert!(archived.exists(), "archive with leader session must remain");
+    }
+
+    #[tokio::test]
+    async fn reap_exited_agents_clears_handles() {
+        let _scope = scoped_root();
+        // Spawn a real process that exits immediately.
+        let mut child = tokio::process::Command::new("true")
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn `true`");
+        // Wait for it so try_wait() will definitely see an exit status.
+        child.wait().await.expect("wait");
+
+        let agent_id = "test-reap-agent".to_string();
+        let agent = HeadlessAgent {
+            id: agent_id.clone(),
+            name: agent_id.clone(),
+            cli: "claude".into(),
+            model: "sonnet".into(),
+            team_name: "test-team".into(),
+            team_uuid: "00000000-0000-0000-0000-000000000000".into(),
+            working_directory: "/tmp".into(),
+            child: Some(child),
+            stdin: None,
+            stdout_buffer: Arc::new(tokio::sync::Mutex::new(OutputBuffer::new(100))),
+            protocol: Box::new(protocol::ClaudeStreamJson),
+            status: AgentStatus::Running,
+            pid: 0,
+            created_at: 0,
+            session_id: None,
+            last_activity_ms: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            parked: false,
+            usage: Arc::new(UsageCounters::default()),
+        };
+
+        let mut mgr = HeadlessManager::new();
+        mgr.agents.insert(agent_id.clone(), agent);
+
+        mgr.reap_exited_agents();
+
+        let a = mgr.agents.get(&agent_id).expect("agent still present");
+        assert_eq!(a.status, AgentStatus::Terminated, "status should be Terminated after reap");
+        assert!(a.child.is_none(), "child handle should be cleared");
+        assert!(a.stdin.is_none(), "stdin handle should be cleared");
     }
 }
