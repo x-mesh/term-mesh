@@ -1632,6 +1632,11 @@ async fn dispatch(req: &Request, ctx: &Context) -> Response {
                     } else {
                         String::new()
                     };
+                    let task_team_name = req.params
+                        .get("team_name")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or_default()
+                        .to_string();
                     ctx.agent_manager.task_update(p).map(|t| {
                         // Emit only when status actually changed.
                         if !prev_status.is_empty() && prev_status != t.status.as_str() {
@@ -1648,6 +1653,33 @@ async fn dispatch(req: &Request, ctx: &Context) -> Response {
                             };
                             // Err means no subscribers — fine to ignore.
                             let _ = ctx.event_tx.send(ev);
+                        }
+                        // Auto-recycle hook: fire on completed transitions only.
+                        if matches!(t.status, crate::agent::TaskStatus::Completed) {
+                            if let Some(assignee_id) = &t.assignee {
+                                if let Some((agent_name, _)) = ctx
+                                    .agent_manager
+                                    .handle_auto_recycle_completion(assignee_id)
+                                {
+                                    // agent_sessions path — use task_team_name from
+                                    // the request to form an unambiguous recycle key.
+                                    let headless = ctx.headless.clone();
+                                    let tn = task_team_name.clone();
+                                    tokio::spawn(async move {
+                                        let mut mgr = headless.lock().await;
+                                        mgr.recycle_by_name(&agent_name, &tn).await;
+                                    });
+                                } else {
+                                    // Headless team agent path (not in agent_sessions).
+                                    let assignee = assignee_id.clone();
+                                    let tn = task_team_name.clone();
+                                    let headless = ctx.headless.clone();
+                                    tokio::spawn(async move {
+                                        let mut mgr = headless.lock().await;
+                                        mgr.handle_auto_recycle_completion_by_name(&assignee, &tn).await;
+                                    });
+                                }
+                            }
                         }
                         serde_json::to_value(t).unwrap()
                     })
@@ -2262,6 +2294,10 @@ async fn dispatch(req: &Request, ctx: &Context) -> Response {
                 extra_args: Vec<String>,
                 #[serde(default)]
                 extra_env: std::collections::HashMap<String, String>,
+                #[serde(default)]
+                agent_type: Option<String>,
+                #[serde(default)]
+                auto_recycle_every: Option<u32>,
             }
             fn default_cli() -> String {
                 "claude".into()
@@ -2278,10 +2314,11 @@ async fn dispatch(req: &Request, ctx: &Context) -> Response {
                         cli_path: p.cli_path,
                         instructions: p.instructions,
                         custom_instructions: None,
-                        agent_type: None,
+                        agent_type: p.agent_type,
                         color: None,
                         extra_args: p.extra_args,
                         extra_env: p.extra_env,
+                        auto_recycle_every: p.auto_recycle_every,
                     };
                     let mut mgr = ctx.headless.lock().await;
                     match mgr

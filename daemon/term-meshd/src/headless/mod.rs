@@ -92,6 +92,10 @@ pub struct HeadlessAgent {
     /// park/unpark and destroy/resume cycles by being seeded from
     /// `agent.json:usage_total` at spawn time.
     pub usage: Arc<UsageCounters>,
+    /// Auto-recycle threshold: recycle every N completed tasks (None = off).
+    pub auto_recycle_every: Option<u32>,
+    /// Running count of completed tasks since last recycle.
+    pub completed_task_count: u32,
 }
 
 /// Phase 2.5: lock-free cumulative token counters for one headless agent.
@@ -393,6 +397,9 @@ pub struct AgentSpec {
     /// Extra environment variables merged into the subprocess env (base env takes precedence).
     #[serde(default)]
     pub extra_env: std::collections::HashMap<String, String>,
+    /// Auto-recycle: recycle this agent every N completed tasks (None = off).
+    #[serde(default)]
+    pub auto_recycle_every: Option<u32>,
 }
 
 /// Merge a base preset instruction with an optional custom-instruction block.
@@ -478,6 +485,10 @@ struct InternalSpawnArgs {
     extra_args: Vec<String>,
     /// Extra environment variables merged into the subprocess env.
     extra_env: std::collections::HashMap<String, String>,
+    /// Auto-recycle threshold from AgentSpec (None = off).
+    auto_recycle_every: Option<u32>,
+    /// Pre-loaded completed_task_count for resume/unpark paths.
+    preloaded_completed_task_count: u32,
 }
 
 impl HeadlessManager {
@@ -551,6 +562,8 @@ impl HeadlessManager {
             preloaded_usage: None,
             extra_args: Vec::new(),
             extra_env: std::collections::HashMap::new(),
+            auto_recycle_every: None,
+            preloaded_completed_task_count: 0,
         };
 
         self.spawn_internal(internal).await
@@ -821,6 +834,8 @@ impl HeadlessManager {
                 last_activity_ms,
                 parked: false,
                 usage: usage_counters,
+                auto_recycle_every: args.auto_recycle_every,
+                completed_task_count: args.preloaded_completed_task_count,
             },
         );
 
@@ -1075,6 +1090,8 @@ impl HeadlessManager {
                 usage_total: None,
                 extra_args: spec.extra_args.clone(),
                 extra_env: spec.extra_env.clone(),
+                auto_recycle_every: spec.auto_recycle_every,
+                completed_task_count: 0,
             };
 
             // Persist instructions (raw bytes) + agent.json before spawn so a
@@ -1166,6 +1183,8 @@ impl HeadlessManager {
                 preloaded_usage: None,
                 extra_args: spec.extra_args.clone(),
                 extra_env: spec.extra_env.clone(),
+                auto_recycle_every: spec.auto_recycle_every,
+                preloaded_completed_task_count: 0,
             };
 
             match self.spawn_internal(internal).await {
@@ -1433,6 +1452,8 @@ impl HeadlessManager {
                 usage_total: None,
                 extra_args: Vec::new(),
                 extra_env: std::collections::HashMap::new(),
+                auto_recycle_every: None,
+                completed_task_count: 0,
             };
             meta::write_agent_meta(&agent_meta)?;
         }
@@ -1561,6 +1582,124 @@ impl HeadlessManager {
         self.agents.clear();
     }
 
+    /// Recycle the agent identified by the fully-qualified `name@team_name` key.
+    /// Loads persisted AgentMeta + instructions so the fresh subprocess retains
+    /// its role instructions, CLI profile (extra_args/extra_env), and cli_path.
+    /// Returns Err if AgentMeta cannot be read (abort — silent context drop is
+    /// worse than a refused recycle).
+    ///
+    /// Requires both `agent_name` and `team_name` to form an unambiguous key.
+    /// Callers that only have the agent name must supply the team name from
+    /// their own context (e.g. the task.update request's `team_name` param).
+    pub async fn recycle_by_name(&mut self, agent_name: &str, team_name: &str) {
+        if let Err(e) = self.recycle_by_name_inner(agent_name, team_name).await {
+            tracing::warn!("auto-recycle: aborted for {agent_name}@{team_name}: {e}");
+        }
+    }
+
+    async fn recycle_by_name_inner(
+        &mut self,
+        agent_name: &str,
+        team_name: &str,
+    ) -> Result<(), String> {
+        let id = format!("{agent_name}@{team_name}");
+
+        // Snapshot team_uuid and working_directory from live agent state.
+        let (team_uuid, working_directory) = {
+            let agent = self
+                .agents
+                .get(&id)
+                .ok_or_else(|| format!("agent not found for key '{id}'"))?;
+            (agent.team_uuid.clone(), agent.working_directory.clone())
+        };
+
+        // Load persisted team metadata to recover app_socket_path_at_create.
+        let app_socket_path = meta::read_team_meta(&meta::team_dir(&team_uuid))
+            .ok()
+            .and_then(|tm| tm.app_socket_path_at_create);
+
+        // Load persisted metadata — abort if corrupt (same policy as unpark).
+        let agent_meta = meta::read_agent_meta(&team_uuid, agent_name)
+            .map_err(|e| format!("corrupt_metadata: {e}"))?;
+
+        // Load persisted instructions bytes (verify hash if present).
+        let instructions_bytes = match agent_meta.instructions_sha256.as_deref() {
+            Some(expected) => {
+                let bytes = meta::read_instructions(&team_uuid, agent_name)
+                    .map_err(|_| "corrupt_metadata: instructions missing".to_string())?;
+                let actual = meta::sha256_hex(&bytes);
+                if actual != expected {
+                    return Err("corrupt_metadata: instructions hash mismatch".into());
+                }
+                Some(bytes)
+            }
+            None => None,
+        };
+
+        let args = InternalSpawnArgs {
+            name: agent_name.to_string(),
+            team_name: team_name.to_string(),
+            team_uuid: team_uuid.clone(),
+            cli: agent_meta.cli.clone(),
+            model: agent_meta.model.clone(),
+            working_directory,
+            cli_path: agent_meta.cli_path_at_create.clone(),
+            app_socket_path,
+            instructions: instructions_bytes,
+            agent_name_override: None,
+            // Fresh session — Claude transcript is intentionally discarded on recycle.
+            claude_session_id: Some(uuid::Uuid::new_v4().to_string()),
+            resume_claude: false,
+            preloaded_usage: None,
+            // Carry CLI profile forward (extra_args, extra_env).
+            extra_args: agent_meta.extra_args.clone(),
+            extra_env: agent_meta.extra_env.clone(),
+            // Carry recycle threshold; reset completed count to 0.
+            auto_recycle_every: agent_meta.auto_recycle_every,
+            preloaded_completed_task_count: 0,
+        };
+
+        tracing::info!("auto-recycle: terminating agent {id}");
+        let _ = self.terminate(&id).await;
+
+        tracing::info!("auto-recycle: respawning agent {}@{}", args.name, args.team_name);
+        self.spawn_internal(args)
+            .await
+            .map(|info| {
+                tracing::info!("auto-recycle: respawned agent {} (pid={})", info.id, info.pid);
+            })
+            .map_err(|e| format!("cli_spawn_failed: {e}"))
+    }
+
+    /// Called when a task assigned to `agent_name` in `team_name` transitions to
+    /// Completed. Increments the agent's completed_task_count and triggers
+    /// recycle_by_name when the effective threshold is hit.
+    pub async fn handle_auto_recycle_completion_by_name(
+        &mut self,
+        agent_name: &str,
+        team_name: &str,
+    ) {
+        let id = format!("{agent_name}@{team_name}");
+        let agent = match self.agents.get_mut(&id) {
+            Some(a) => a,
+            None => return,
+        };
+        let threshold = match agent.auto_recycle_every {
+            Some(n) if n > 0 => n,
+            _ => return,
+        };
+        agent.completed_task_count += 1;
+        // Mark dirty so the 30s flush persists the new count.
+        agent.usage.flush_dirty.store(true, std::sync::atomic::Ordering::Release);
+        let count = agent.completed_task_count;
+        if count % threshold == 0 {
+            tracing::info!(
+                "auto-recycle: headless agent {id} hit threshold ({count}/{threshold}), recycling"
+            );
+            self.recycle_by_name(agent_name, team_name).await;
+        }
+    }
+
     pub async fn add_agent(
         &mut self,
         team_name: &str,
@@ -1618,6 +1757,8 @@ impl HeadlessManager {
                 usage_total: None,
                 extra_args: spec.extra_args.clone(),
                 extra_env: spec.extra_env.clone(),
+                auto_recycle_every: spec.auto_recycle_every,
+                completed_task_count: 0,
             };
             if let Some(ref bytes) = instr_bytes {
                 let _ = meta::write_instructions(&team_uuid, &spec.name, bytes);
@@ -1648,6 +1789,8 @@ impl HeadlessManager {
             preloaded_usage: None,
             extra_args: spec.extra_args,
             extra_env: spec.extra_env,
+            auto_recycle_every: spec.auto_recycle_every,
+            preloaded_completed_task_count: 0,
         };
 
         let info = self.spawn_internal(internal).await?;
@@ -1827,6 +1970,9 @@ impl HeadlessManager {
             // Carry CLI profile forward through park→unpark.
             extra_args: agent_meta.extra_args.clone(),
             extra_env: agent_meta.extra_env.clone(),
+            // Carry recycle config + count forward through park→unpark.
+            auto_recycle_every: agent_meta.auto_recycle_every,
+            preloaded_completed_task_count: agent_meta.completed_task_count,
         };
 
         let info = self
@@ -1935,7 +2081,7 @@ impl HeadlessManager {
     pub fn flush_dirty_usage(&self) -> usize {
         let mut flushed = 0usize;
         // Snapshot candidates first to bound the lock window per agent.
-        let candidates: Vec<(String, String, meta::UsageTotals)> = self
+        let candidates: Vec<(String, String, meta::UsageTotals, u32, Option<u32>)> = self
             .agents
             .values()
             .filter_map(|a| {
@@ -1947,14 +2093,16 @@ impl HeadlessManager {
                     // flush. The dirty bit is consumed (no point retrying).
                     return None;
                 }
-                Some((a.team_uuid.clone(), a.name.clone(), a.usage.snapshot()))
+                Some((a.team_uuid.clone(), a.name.clone(), a.usage.snapshot(), a.completed_task_count, a.auto_recycle_every))
             })
             .collect();
 
-        for (team_uuid, name, snap) in candidates {
+        for (team_uuid, name, snap, completed, recycle_every) in candidates {
             match meta::read_agent_meta(&team_uuid, &name) {
                 Ok(mut m) => {
                     m.usage_total = Some(snap);
+                    m.completed_task_count = completed;
+                    m.auto_recycle_every = recycle_every;
                     if let Err(e) = meta::write_agent_meta(&m) {
                         tracing::warn!(
                             "usage flush: write agent.json failed for {name}@{team_uuid}: {e}"
@@ -1978,7 +2126,7 @@ impl HeadlessManager {
     /// reflect the final state before the agent record may be removed.
     pub fn flush_dirty_usage_for_team(&self, team_name: &str) -> usize {
         let mut flushed = 0usize;
-        let candidates: Vec<(String, String, meta::UsageTotals)> = self
+        let candidates: Vec<(String, String, meta::UsageTotals, u32, Option<u32>)> = self
             .agents
             .values()
             .filter_map(|a| {
@@ -1991,12 +2139,14 @@ impl HeadlessManager {
                 if a.team_uuid.is_empty() {
                     return None;
                 }
-                Some((a.team_uuid.clone(), a.name.clone(), a.usage.snapshot()))
+                Some((a.team_uuid.clone(), a.name.clone(), a.usage.snapshot(), a.completed_task_count, a.auto_recycle_every))
             })
             .collect();
-        for (team_uuid, name, snap) in candidates {
+        for (team_uuid, name, snap, completed, recycle_every) in candidates {
             if let Ok(mut m) = meta::read_agent_meta(&team_uuid, &name) {
                 m.usage_total = Some(snap);
+                m.completed_task_count = completed;
+                m.auto_recycle_every = recycle_every;
                 if meta::write_agent_meta(&m).is_ok() {
                     flushed += 1;
                 }
@@ -2377,6 +2527,9 @@ impl HeadlessManager {
                 // Carry CLI profile forward through destroy→resume.
                 extra_args: m.extra_args.clone(),
                 extra_env: m.extra_env.clone(),
+                // Carry recycle config + count forward through destroy→resume.
+                auto_recycle_every: m.auto_recycle_every,
+                preloaded_completed_task_count: m.completed_task_count,
             };
 
             match self.spawn_internal(internal).await {
@@ -3001,6 +3154,8 @@ mod tests {
             usage_total: None,
             extra_args: Vec::new(),
             extra_env: std::collections::HashMap::new(),
+            auto_recycle_every: None,
+            completed_task_count: 0,
         };
         std::fs::write(
             agents_dir.join("explorer.json"),
@@ -3083,6 +3238,8 @@ mod tests {
             usage_total: None,
             extra_args: Vec::new(),
             extra_env: std::collections::HashMap::new(),
+            auto_recycle_every: None,
+            completed_task_count: 0,
         };
         std::fs::write(
             archived_dir.join("agents/explorer.json"),
@@ -3253,6 +3410,8 @@ mod tests {
             }),
             extra_args: Vec::new(),
             extra_env: std::collections::HashMap::new(),
+            auto_recycle_every: Some(3),
+            completed_task_count: 2,
         };
         let bytes = serde_json::to_vec_pretty(&meta_in).unwrap();
         let meta_out: meta::AgentMeta = serde_json::from_slice(&bytes).unwrap();
@@ -3409,6 +3568,8 @@ mod tests {
             usage_total: None,
             extra_args: Vec::new(),
             extra_env: std::collections::HashMap::new(),
+            auto_recycle_every: None,
+            completed_task_count: 0,
         };
         std::fs::write(
             archived.join("agents/a.json"),
@@ -3515,6 +3676,8 @@ mod tests {
             last_activity_ms: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             parked: false,
             usage: Arc::new(UsageCounters::default()),
+            auto_recycle_every: None,
+            completed_task_count: 0,
         };
 
         let mut mgr = HeadlessManager::new();

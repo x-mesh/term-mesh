@@ -22,6 +22,7 @@ If `$ARGUMENTS` is empty, run `tm-agent status`, render a formatted table (NAME 
   /team add executor --model opus  opus 모델로 executor 추가
   /team add reviewer --cli codex   codex-backed reviewer 추가
   /team remove writer       writer 제거
+  /team recycle reviewer    idle/stopped worker context 비우기
   /team swap executor opus  executor 모델 교체
   /team ensure reviewer security  없는 role만 추가
   /team destroy             2단계 확인 후 팀 종료
@@ -63,6 +64,23 @@ Otherwise run:
 ```bash
 tm-agent remove <name> [--force]
 ```
+
+### `recycle <name> [--force]`
+
+Recycle an agent pane after its task state has been captured. This is a guarded
+hard restart for context hygiene: the pane transcript is discarded, while durable
+state remains in the task board and `~/.term-mesh/results/`.
+
+Run:
+
+```bash
+tm-agent recycle <name> [--force]
+```
+
+Without `--force`, this rejects agents with active non-terminal tasks. For long
+active work, ask the agent to checkpoint first with `tm-agent heartbeat`,
+`tm-agent task block`, `tm-agent task review`, or `tm-agent reply`. Use
+`tm-agent restart <name> --hard` only as the lower-level recovery escape hatch.
 
 ### `swap <name> <new-model> [--force]`
 
@@ -141,6 +159,7 @@ tm-agent list
 tm-agent create 3 --adopt
 tm-agent add reviewer                       # team-scoped; works for GUI + headless teams
 tm-agent remove reviewer                    # team-scoped counterpart of add
+tm-agent recycle reviewer                   # guarded hard restart; drops accumulated worker context
 tm-agent attach executor --cli codex        # workspace-adopt scoped (creates ws-* team)
 tm-agent detach executor                    # workspace-adopt scoped
 tm-agent delegate executor '<instruction>'

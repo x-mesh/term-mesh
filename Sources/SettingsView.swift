@@ -81,7 +81,7 @@ enum SettingsSection: String, CaseIterable, Identifiable {
         case .terminal: return ["terminal", "font", "size", "theme", "monospace", "family"]
         case .workspaceColors: return ["workspace", "color", "indicator", "palette", "custom"]
         case .automation: return ["automation", "socket", "claude", "port", "integration", "password"]
-        case .agentTeams: return ["agent", "team", "leader", "model", "directory", "rendering", "interval", "refresh"]
+        case .agentTeams: return ["agent", "team", "leader", "model", "directory", "rendering", "interval", "refresh", "recycle", "auto"]
         case .agentRunbooks: return ["agent", "runbook", "skill", "claude", "codex", "opencode", "install", "role"]
         case .agentCLIPaths: return ["cli", "path", "claude", "kiro", "codex", "gemini", "binary", "agent"]
         case .agentModels: return ["model", "custom", "version", "gemini", "codex", "kiro", "claude", "preview"]
@@ -148,6 +148,7 @@ struct SettingsView: View {
     @AppStorage("cliPath.gemini") private var cliPathGemini = ""
     @AppStorage("imeBarFontSize") private var imeBarFontSize = IMEInputBarSettings.defaultFontSize
     @AppStorage("imeBarHeight") private var imeBarHeight = IMEInputBarSettings.defaultHeight
+    @AppStorage("termmesh.autoRecycle.globalDefault") private var autoRecycleGlobalDefault: Int = 0
     @AppStorage(TermMeshDaemon.dashboardEnabledKey) private var dashboardEnabled = true
     @AppStorage(TermMeshDaemon.dashboardLocalhostOnlyKey) private var dashboardLocalhostOnly = true
     @AppStorage(TermMeshDaemon.dashboardPortKey) private var dashboardPort = 9876
@@ -1334,6 +1335,24 @@ struct SettingsView: View {
                         ) {
                             Stepper(value: $headlessSessionRetentionDays, in: 1...30, step: 1) {
                                 Text("\(headlessSessionRetentionDays) day\(headlessSessionRetentionDays == 1 ? "" : "s")")
+                                    .font(.system(.body, design: .monospaced))
+                                    .frame(minWidth: 70, alignment: .trailing)
+                            }
+                            .labelsHidden()
+                        }
+                        }
+
+                        if settingsMatch("recycle", "auto", "agent", "team") {
+                        SettingsCardDivider()
+
+                        SettingsCardRow(
+                            "Auto-recycle default",
+                            subtitle: autoRecycleGlobalDefault == 0
+                                ? "Disabled — new teams will not auto-recycle agents."
+                                : "New teams will auto-recycle agents every \(autoRecycleGlobalDefault) completed task\(autoRecycleGlobalDefault == 1 ? "" : "s")."
+                        ) {
+                            Stepper(value: $autoRecycleGlobalDefault, in: 0...100, step: 1) {
+                                Text(autoRecycleGlobalDefault == 0 ? "Off" : "\(autoRecycleGlobalDefault) tasks")
                                     .font(.system(.body, design: .monospaced))
                                     .frame(minWidth: 70, alignment: .trailing)
                             }

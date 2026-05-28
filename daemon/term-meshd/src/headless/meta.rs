@@ -90,6 +90,13 @@ pub struct AgentMeta {
     /// Persisted so park→unpark and destroy→resume preserve the profile.
     #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
     pub extra_env: std::collections::HashMap<String, String>,
+    /// Auto-recycle threshold: recycle this agent every N completed tasks.
+    /// None = disabled; 0 = explicitly disabled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_recycle_every: Option<u32>,
+    /// Running count of tasks completed by this agent (reset on recycle).
+    #[serde(default)]
+    pub completed_task_count: u32,
 }
 
 /// Phase 2.5: cumulative stream-json `usage` counters for a single agent.
