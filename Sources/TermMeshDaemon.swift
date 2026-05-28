@@ -162,6 +162,16 @@ final class TermMeshDaemon: ObservableObject {
            !override_.isEmpty {
             return override_
         }
+        // Fallback: derive tag from bundle id (com.termmesh.app.debug.<tag>)
+        // so the daemon socket isolates correctly even without LSEnvironment.
+        if let bid = Bundle.main.bundleIdentifier,
+           bid.hasPrefix("com.termmesh.app.debug.") {
+            let rawTag = String(bid.dropFirst("com.termmesh.app.debug.".count))
+            let tag = rawTag.filter { $0.isLetter || $0.isNumber || $0 == "-" || $0 == "_" }
+            if !tag.isEmpty {
+                return "/tmp/term-meshd-dev-\(tag).sock"
+            }
+        }
         let tmpDir = ProcessInfo.processInfo.environment["TMPDIR"] ?? "/tmp"
         return (tmpDir as NSString).appendingPathComponent("term-meshd.sock")
     }

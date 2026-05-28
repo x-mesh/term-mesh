@@ -287,6 +287,25 @@ struct SocketControlSettings {
         if bundleIdentifier == "com.termmesh.app.nightly" {
             return "/tmp/term-mesh-nightly.sock"
         }
+        // Tagged debug: com.termmesh.app.debug.<tag> → /tmp/term-mesh-debug-<tag>.sock
+        // Prevents untagged-debug socket collision when LSEnvironment is missing/partial.
+        if let bid = bundleIdentifier,
+           bid.hasPrefix("com.termmesh.app.debug.") {
+            let rawTag = String(bid.dropFirst("com.termmesh.app.debug.".count))
+            let tag = sanitizeTag(rawTag)
+            if !tag.isEmpty {
+                return "/tmp/term-mesh-debug-\(tag).sock"
+            }
+        }
+        // Tagged staging: com.termmesh.app.staging.<tag> → /tmp/term-mesh-staging-<tag>.sock
+        if let bid = bundleIdentifier,
+           bid.hasPrefix("com.termmesh.app.staging.") {
+            let rawTag = String(bid.dropFirst("com.termmesh.app.staging.".count))
+            let tag = sanitizeTag(rawTag)
+            if !tag.isEmpty {
+                return "/tmp/term-mesh-staging-\(tag).sock"
+            }
+        }
         if isDebugLikeBundleIdentifier(bundleIdentifier) || isDebugBuild {
             return "/tmp/term-mesh-debug.sock"
         }
@@ -296,6 +315,11 @@ struct SocketControlSettings {
         return "/tmp/term-mesh.sock"
     }
 
+    /// Keep tag chars consistent with reload.sh sanitization (alphanumeric, -, _).
+    private static func sanitizeTag(_ raw: String) -> String {
+        return raw.filter { $0.isLetter || $0.isNumber || $0 == "-" || $0 == "_" }
+    }
+
     static func shouldHonorSocketPathOverride(
         environment: [String: String],
         bundleIdentifier: String?,
@@ -303,6 +327,16 @@ struct SocketControlSettings {
     ) -> Bool {
         if isTruthy(environment[allowSocketPathOverrideKey] ?? environment[allowSocketPathOverrideKeyLegacy]) {
             return true
+        }
+        // Tagged debug/staging bundles already have a deterministic socket path from
+        // defaultSocketPath (com.termmesh.app.debug.<tag> → /tmp/term-mesh-debug-<tag>.sock).
+        // Honoring an env override here lets a stale TERMMESH_SOCKET_PATH redirect the
+        // tagged bundle to the wrong socket — the root cause of the production socket
+        // collision incident. Only bare (untagged) identifiers respect the env shortcut.
+        let isTaggedDebug = bundleIdentifier.map { $0.hasPrefix("com.termmesh.app.debug.") } ?? false
+        let isTaggedStaging = bundleIdentifier.map { $0.hasPrefix("com.termmesh.app.staging.") } ?? false
+        if isTaggedDebug || isTaggedStaging {
+            return false
         }
         if isDebugLikeBundleIdentifier(bundleIdentifier) || isStagingBundleIdentifier(bundleIdentifier) {
             return true
