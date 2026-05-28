@@ -4,8 +4,24 @@ All notable changes to term-mesh are documented here.
 
 ## [Unreleased]
 
+## [0.133.0] - 2026-05-28
+
+### Added
+- **Headless agent auto-recycle (Phase 1–3)** — long-running headless team agents (claude, codex, kiro, gemini) can now be restarted on a configurable cadence so their context windows stay fresh without manual intervention. Configure via `tm-agent recycle <agent>` for an immediate guarded restart, `--auto-recycle N` / `--auto-recycle-per-agent name:N,name:N` on `tm-agent create` / `add` for cadences, Settings → Auto-recycle for the team-wide default, and the right-click context menu or Team menu-bar entry for ad-hoc recycles. SQLite persistence keeps each agent's `completed_task_count` and cadence across daemon restarts. ([#57](https://github.com/x-mesh/term-mesh/pull/57))
+- **tm-agent wait push + auto-watch** — `tm-agent wait` now subscribes to a real-time event stream from the daemon (`events.subscribe`) with a 200ms inner loop and deadline-decay quiet-stream cadence, so leaders wake on task completion in milliseconds instead of waiting for the next poll tick. Polling fallback retained for older daemons. The `auto-watch` hook fires after any agent add (helper gates internally), and `result_path` propagates end-to-end so leaders can open `FULL_REPORT` without socket truncation. ([#59](https://github.com/x-mesh/term-mesh/pull/59))
+- **AutoReplyDetector v2** — header detection now uses a sliding window (capacity 60) with a partial-commit fallback gated on STATUS-field presence and a 5s hard cap, so paste-race scenarios that previously dropped the reply now commit reliably. New `AutoReplyDetectorTests` covers the FIX C regression scenarios. ([#59](https://github.com/x-mesh/term-mesh/pull/59))
+
 ### Fixed
-- Slash command descriptions in Claude Code now show the human-readable heading (e.g. `/watch — Stateless Drift Oversight`) instead of the internal `<!-- term-mesh-managed: ... -->` marker comment. The managed marker is now inserted on line 2 of bundled command files so the picker reads line 1 as the description.
+- **Tagged debug bundles can no longer steal the production term-mesh socket** — `./scripts/reload.sh --tag <tag>` builds now derive the socket path from their bundle identifier (`/tmp/term-mesh-<bundleid>.sock`) instead of falling back to the shared `/tmp/term-mesh.sock`. Tagged bundles also ignore `TERMMESH_SOCKET_PATH` env overrides so a stray env var in one window can't redirect a tagged build at the prod socket and kill the running production app. ([#55](https://github.com/x-mesh/term-mesh/pull/55))
+- **term-meshd connection lifecycle stability** — three daemon-side fixes squashed: (1) completed tokio connection tasks are now drained from the join set on every accept iteration so long-running term-meshd RSS no longer climbs unbounded, (2) `events.subscribe` subscribers that close their end of the stream are noticed immediately via EOF instead of waiting for the next event, (3) headless agent child processes that exited naturally (CLI quit, `tm-agent destroy`) are now reaped at every RPC entrypoint so no more `<defunct>` zombies. ([#56](https://github.com/x-mesh/term-mesh/pull/56))
+- **AutoReplyEmit false-drop on vim/htop output** — anchor field scans to the latest STATUS block so repeating headers in editors and TUIs no longer match the wrong frame and drop a completed reply. ([#59](https://github.com/x-mesh/term-mesh/pull/59))
+- **tm-agent paste-delivery / delegate-fallback wedge** — failed paste delivery and the legacy 2-RPC delegate fallback path now auto-block the task instead of leaving it `IN_PROGRESS` indefinitely. ([#59](https://github.com/x-mesh/term-mesh/pull/59))
+- **BrewSelfUpdater stale running-binary detection** — periodic update poll now re-checks the running binary version so a tap-side update no longer requires a full app restart to notice. ([#59](https://github.com/x-mesh/term-mesh/pull/59))
+- **Slash command descriptions in Claude Code now show the human-readable heading** (e.g. `/watch — Stateless Drift Oversight`) instead of the internal `<!-- term-mesh-managed: ... -->` marker comment. The managed marker is now inserted on line 2 of bundled command files so the picker reads line 1 as the description.
+
+### Thanks to 1 contributor!
+
+- [@JINWOO-J](https://github.com/JINWOO-J)
 
 ## [0.132.0] - 2026-05-27
 
