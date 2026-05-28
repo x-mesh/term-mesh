@@ -470,6 +470,18 @@ struct TermMeshApp: App {
                     }
                 }
 
+                Divider()
+
+                Button("Recycle Focused Agent…") {
+                    showRecycleFocusedAgentDialog(force: false)
+                }
+                .keyboardShortcut("r", modifiers: [.command, .control])
+
+                Button("Recycle Focused Agent (Force)…") {
+                    showRecycleFocusedAgentDialog(force: true)
+                }
+                .keyboardShortcut("r", modifiers: [.command, .control, .shift])
+
                 // -- Worktrees --
                 Divider()
 
@@ -1272,6 +1284,20 @@ struct TermMeshApp: App {
                 continuation.resume(returning: .cancel)
             }
         }
+    }
+
+    private func showRecycleFocusedAgentDialog(force: Bool) {
+        guard let panelId = AppDelegate.shared?.tabManager?.selectedWorkspace?.focusedPanelId,
+              let identity = TeamOrchestrator.shared.agentIdentity(forPanelId: panelId) else {
+            let alert = NSAlert()
+            alert.messageText = "Recycle Agent"
+            alert.informativeText = "No focused agent pane. Click an agent pane first."
+            alert.alertStyle = .informational
+            alert.addButton(withTitle: "OK")
+            alert.runModal()
+            return
+        }
+        TeamOrchestrator.shared.recycleAgent(teamName: identity.teamName, agentName: identity.agentName, force: force)
     }
 
     @MainActor

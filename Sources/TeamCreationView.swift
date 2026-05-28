@@ -425,6 +425,14 @@ struct TeamCreationView: View {
     @State private var resumeInFlight: Bool = false
     @State private var resumeErrorMessage: String?
 
+    // MARK: - Auto-recycle
+
+    @AppStorage("termmesh.autoRecycle.globalDefault") private var globalAutoRecycleDefault: Int = 0
+    /// 0 = disabled for this team.
+    @State private var autoRecycleEvery: Int = 0
+    /// Per-agent override: agentName → threshold (0 = use team default).
+    @State private var perAgentOverrides: [String: Int] = [:]
+
     /// A team name is only truly duplicate if the entry exists AND its workspace
     /// tab is still open.  When the user closes a workspace tab manually the team
     /// dict entry becomes stale — allow reuse (createTeam auto-cleans it up).
@@ -482,6 +490,7 @@ struct TeamCreationView: View {
             leaderModel = defaultLeaderModel
             bulkModel = defaultModel
             worktreeMode = TermMeshDaemon.shared.worktreeEnabled ? "isolated" : "off"
+            autoRecycleEvery = globalAutoRecycleDefault
             if agents.isEmpty {
                 applyInitialPreset()
             }
@@ -1454,6 +1463,50 @@ struct TeamCreationView: View {
                          ? "term-meshd not running — headless mode requires the daemon"
                          : "term-meshd not running — worktrees require the daemon")
                         .foregroundStyle(.secondary)
+                }
+                .font(.caption)
+            }
+
+            Divider()
+
+            // Auto-recycle team default
+            HStack {
+                Text("Auto-recycle")
+                    .font(.subheadline.bold())
+                Spacer()
+                Stepper(value: $autoRecycleEvery, in: 0...100, step: 1) {
+                    Text(autoRecycleEvery == 0 ? "Off" : "Every \(autoRecycleEvery) tasks")
+                        .font(.system(.body, design: .monospaced))
+                        .frame(minWidth: 100, alignment: .trailing)
+                }
+                .labelsHidden()
+            }
+            Text(autoRecycleEvery == 0
+                 ? "Agents are not automatically recycled."
+                 : "Agents restart after every \(autoRecycleEvery) completed task\(autoRecycleEvery == 1 ? "" : "s") to discard transcript context.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+
+            if autoRecycleEvery > 0 && !agents.isEmpty {
+                DisclosureGroup("Per-agent overrides") {
+                    ForEach(agents) { agent in
+                        HStack {
+                            Text(agent.preset.name)
+                                .font(.caption)
+                                .frame(width: 120, alignment: .leading)
+                            Spacer()
+                            let binding = Binding(
+                                get: { perAgentOverrides[agent.preset.name] ?? 0 },
+                                set: { perAgentOverrides[agent.preset.name] = $0 == 0 ? nil : $0 }
+                            )
+                            Stepper(value: binding, in: 0...100, step: 1) {
+                                Text(binding.wrappedValue == 0 ? "Team default" : "Every \(binding.wrappedValue)")
+                                    .font(.system(.caption, design: .monospaced))
+                                    .frame(minWidth: 100, alignment: .trailing)
+                            }
+                            .labelsHidden()
+                        }
+                    }
                 }
                 .font(.caption)
             }
@@ -2742,6 +2795,12 @@ struct TeamCreationView: View {
         TeamCreationRecentDirs.shared.promote(workingDirectory)
         defaultLeaderMode = leaderMode
         defaultLeaderModel = leaderModel
+        if autoRecycleEvery > 0 {
+            TeamOrchestrator.shared.setTeamDefaultAutoRecycle(teamName: teamName, every: autoRecycleEvery)
+            for (agentName, threshold) in perAgentOverrides where threshold > 0 {
+                TeamOrchestrator.shared.setAgentAutoRecycleByName(teamName: teamName, agentName: agentName, every: threshold)
+            }
+        }
         dismiss()
     }
 

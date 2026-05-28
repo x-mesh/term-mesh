@@ -3133,11 +3133,38 @@ func pushTargetSurfaceSize(_ size: CGSize) {
         }
         let pasteItem = menu.addItem(withTitle: "Paste", action: #selector(paste(_:)), keyEquivalent: "")
         pasteItem.target = self
+        if let surfaceId = terminalSurface?.id,
+           let identity = TeamOrchestrator.shared.agentIdentity(forPanelId: surfaceId) {
+            menu.addItem(.separator())
+            let recycleItem = NSMenuItem(title: "Recycle Agent",
+                                         action: #selector(recycleAgentAction(_:)),
+                                         keyEquivalent: "")
+            recycleItem.representedObject = RecycleAgentPayload(teamName: identity.teamName, agentName: identity.agentName, force: false)
+            recycleItem.target = self
+            menu.addItem(recycleItem)
+            let recycleForceItem = NSMenuItem(title: "Recycle Agent (Force)",
+                                              action: #selector(recycleAgentAction(_:)),
+                                              keyEquivalent: "")
+            recycleForceItem.representedObject = RecycleAgentPayload(teamName: identity.teamName, agentName: identity.agentName, force: true)
+            recycleForceItem.target = self
+            menu.addItem(recycleForceItem)
+        }
         return menu
     }
 
     @objc private func triggerFlash(_ sender: Any?) {
         onTriggerFlash?()
+    }
+
+    @objc private func recycleAgentAction(_ sender: NSMenuItem) {
+        guard let payload = sender.representedObject as? RecycleAgentPayload else { return }
+        TeamOrchestrator.shared.recycleAgent(teamName: payload.teamName, agentName: payload.agentName, force: payload.force)
+    }
+
+    private struct RecycleAgentPayload {
+        let teamName: String
+        let agentName: String
+        let force: Bool
     }
 
     override func mouseMoved(with event: NSEvent) {

@@ -2172,6 +2172,15 @@ class TerminalController {
                 skipRunbookPromptForInteractiveAgents: skipRunbookInitPrompt,
                 tabManager: tabManager
             ) {
+                // Apply auto-recycle settings post-creation (Phase 1: CLI-only)
+                if let recycleEvery = params["default_auto_recycle_every"] as? Int {
+                    TeamOrchestrator.shared.setTeamDefaultAutoRecycle(teamName: teamName, every: recycleEvery)
+                }
+                if let perAgent = params["per_agent_auto_recycle"] as? [String: Int] {
+                    for (agentName, count) in perAgent {
+                        TeamOrchestrator.shared.setAgentAutoRecycleByName(teamName: teamName, agentName: agentName, every: count)
+                    }
+                }
                 return V2CallResult.ok([
                     "team_name": team.id,
                     "agent_count": team.agents.count,
@@ -2419,6 +2428,7 @@ class TerminalController {
         // R7: spec is carried as custom_instructions (watcher only via the CLI).
         let customInstructions = params["custom_instructions"] as? String
 
+        let autoRecycleEvery = params["auto_recycle_every"] as? Int
         let result: V2CallResult = await MainActor.run {
             let outcome = TeamOrchestrator.shared.addAgentToTeam(
                 teamName: teamName,
@@ -2430,6 +2440,9 @@ class TerminalController {
             )
             switch outcome {
             case .success(let member):
+                if let recycleEvery = autoRecycleEvery {
+                    TeamOrchestrator.shared.setAgentAutoRecycle(teamName: teamName, agentId: member.id, every: recycleEvery)
+                }
                 var payload: [String: Any] = [
                     "team_name": teamName,
                     "agent_name": member.name,
@@ -3716,6 +3729,8 @@ class TerminalController {
         let reviewSummary = params["review_summary"] as? String
         let progressNote = params["progress_note"] as? String
 
+        let prevStatus = store.getTask(teamName: teamName, taskId: taskId)?.status ?? ""
+
         if let task = store.updateTask(
             teamName: teamName,
             taskId: taskId,
@@ -3726,6 +3741,24 @@ class TerminalController {
             reviewSummary: reviewSummary,
             progressNote: progressNote
         ) {
+            // Publish task_status event to daemon broadcast channel best-effort
+            // so tm-agent wait push subscribers receive a real-time signal.
+            if let newStatus = status, newStatus != prevStatus {
+                _ = TermMeshDaemon.shared.rpcCallRaw(method: "events.publish", params: [
+                    "kind": "task_status",
+                    "team": teamName,
+                    "agent": task.assignee ?? "",
+                    "task_id": task.id,
+                    "status": newStatus,
+                    "prev_status": prevStatus
+                ])
+                if newStatus == "completed", let assignee = task.assignee, !assignee.isEmpty {
+                    let tn = teamName, an = assignee
+                    Task { @MainActor in
+                        TeamOrchestrator.shared.handleTaskCompletionForAutoRecycle(teamName: tn, agentName: an)
+                    }
+                }
+            }
             return v2Ok(id: id, result: store.taskDictionary(task))
         }
         return v2Error(id: id, code: "not_found", message: "Task not found")
