@@ -45,6 +45,11 @@ final class TeamOrchestrator: ObservableObject {
         /// the worktree path or the team's working directory). Hard restart feeds
         /// it back into `addAgentPaneToWorkspace` so cwd is preserved.
         var originalAgentWorkDir: String?
+        /// Auto-recycle threshold: recycle this agent every N completed tasks.
+        /// nil = inherit team default; 0 = explicitly disabled for this agent.
+        var autoRecycleEvery: Int? = nil
+        /// Running count of tasks completed by this agent (reset on recycle).
+        var completedTaskCount: Int = 0
     }
 
     struct Team: Identifiable {
@@ -82,6 +87,9 @@ final class TeamOrchestrator: ObservableObject {
         var pairMode: String = "none"   // "none", "claude", "kiro", "codex", "gemini"
         var pairModel: String = ""
         var pairPanelId: UUID? = nil
+        /// Team-wide auto-recycle default: recycle an agent every N completed tasks.
+        /// nil = disabled; per-agent autoRecycleEvery overrides this.
+        var defaultAutoRecycleEvery: Int? = nil
     }
 
     struct AgentPaneIdentity: Equatable {
@@ -3290,6 +3298,53 @@ final class TeamOrchestrator: ObservableObject {
             "[team.restart] mode=hard ok team=\(teamName, privacy: .public) agent=\(agentName, privacy: .public) oldPanel=\(oldPid.uuidString.prefix(8), privacy: .public) newPanel=\(newPid.uuidString.prefix(8), privacy: .public) splitFrom=\(splitFrom.uuidString.prefix(8), privacy: .public) insertFirst=\(insertFirst, privacy: .public) close_ok=\(closed, privacy: .public)"
         )
         return .success((old: oldPid, new: newPid))
+    }
+
+    /// Recycle an agent pane: guard on active task status, then hard-restart.
+    /// Mirrors `run_recycle` in the CLI (commit 3cabe882).
+    func recycleAgent(teamName: String, agentName: String, force: Bool) {
+        let safeStatuses: Set<String> = ["blocked", "review_ready", "completed", "abandoned", "failed"]
+        if !force, let task = activeTask(for: teamName, agentName: agentName),
+           !safeStatuses.contains(task.status) {
+            let alert = NSAlert()
+            alert.messageText = "Cannot recycle \(agentName)"
+            alert.informativeText = "Active task \(task.id) is \(task.status). Use Force to bypass."
+            alert.runModal()
+            return
+        }
+        if force {
+            Logger.team.warning("recycle --force on \(agentName, privacy: .public): discarding pane transcript")
+        }
+        Task { @MainActor in
+            _ = await self.restartAgentPaneHard(teamName: teamName, agentName: agentName)
+        }
+    }
+
+    func setTeamDefaultAutoRecycle(teamName: String, every: Int) {
+        teams[teamName]?.defaultAutoRecycleEvery = every
+    }
+
+    func setAgentAutoRecycle(teamName: String, agentId: String, every: Int) {
+        guard let idx = teams[teamName]?.agents.firstIndex(where: { $0.id == agentId }) else { return }
+        teams[teamName]?.agents[idx].autoRecycleEvery = every
+    }
+
+    func setAgentAutoRecycleByName(teamName: String, agentName: String, every: Int) {
+        guard let idx = teams[teamName]?.agents.firstIndex(where: { $0.name == agentName }) else { return }
+        teams[teamName]?.agents[idx].autoRecycleEvery = every
+    }
+
+    /// Called when an agent's task transitions to "completed". Increments the
+    /// agent's completedTaskCount and triggers a guard recycle when the count
+    /// reaches the effective threshold (agent override → team default → nil = off).
+    func handleTaskCompletionForAutoRecycle(teamName: String, agentName: String) {
+        guard let agentIdx = teams[teamName]?.agents.firstIndex(where: { $0.name == agentName }) else { return }
+        teams[teamName]?.agents[agentIdx].completedTaskCount += 1
+        let count = teams[teamName]?.agents[agentIdx].completedTaskCount ?? 0
+        let agentThreshold = teams[teamName]?.agents[agentIdx].autoRecycleEvery
+        let teamThreshold = teams[teamName]?.defaultAutoRecycleEvery
+        guard let threshold = agentThreshold ?? teamThreshold, threshold > 0, count % threshold == 0 else { return }
+        recycleAgent(teamName: teamName, agentName: agentName, force: false)
     }
 
     /// Snapshot of a pane's position in the bonsplit tree, captured before

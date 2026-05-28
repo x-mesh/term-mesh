@@ -264,6 +264,30 @@ tm-agent attach reviewer --cli codex
 
 Use `--claude-leader` only when creating a Claude Code leader pane.
 
+### Agent context lifecycle
+
+Agent panes are reusable workers, not long-term memory stores. Durable project
+state must live in the task board, result files, runbook digests, and task
+capsules rather than in an individual pane transcript. A restarted agent must be
+able to recover its role, constraints, and current assignment from the runbook
+digest plus the next `TM-PROTOCOL-v1` task capsule alone.
+
+After an agent completes a task and reports with the Standard Reply Header, the
+leader may recycle the idle pane to avoid context compaction and transcript
+drift:
+
+```bash
+tm-agent recycle <agent>
+```
+
+`recycle` is a guarded hard restart. It rejects active non-terminal tasks by
+default; checkpoint long-running work first with `tm-agent heartbeat`,
+`tm-agent task block`, `tm-agent task review`, or `tm-agent reply` so another
+worker can resume from the task board or `~/.term-mesh/results/`. Use compaction
+only for a long single task that genuinely must continue in the same pane
+context. Use `tm-agent restart <agent> --hard` as the lower-level recovery
+escape hatch.
+
 ### XM skill agent fan-out routing
 
 xm 스킬(`/xm:build`, `/xm:solver`, `/xm:op`, `/xm:agent` 등)의 SKILL.md가 *Claude Code native Agent tool*을 통한 fan-out을 지시하는 경우(예: x-build research의 4-perspective spawn, x-solver iterate test phase 가설별 spawn), term-mesh 컨텍스트(`TERMMESH_SOCKET` env 또는 `/tmp/term-mesh*.sock` 존재)에서는 **반드시 `tm-agent delegate` × N로 자동 치환**한다.
@@ -371,6 +395,7 @@ tm-agent collect --lines 100
 tm-agent collect --headers                    # header-only result collection for token-efficient synthesis
 tm-agent reports --summary                    # headers + concise summaries, full files lazy-read via FULL_REPORT
 tm-agent wait --timeout 120 --mode any        # ALWAYS use this to wait; NEVER use `sleep N && tm-agent read`
+tm-agent recycle <agent>                      # guarded hard restart for idle/stopped workers; drops transcript context
 tm-agent brief <agent>
 
 # Parallel delegation pattern — round-robin routing (active since d69c9d0c)

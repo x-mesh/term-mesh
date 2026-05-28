@@ -155,6 +155,8 @@ If `tm-agent` is not in PATH:
 | `/team add <role> --model opus` | `/team add architect --model opus` | Add with specific model |
 | `/team remove <name>` | `/team remove reviewer` | Remove agent from team (team-scoped; cf. `tm-agent detach` = workspace-adopt path) |
 | `/team remove <name> --force` | `/team remove reviewer --force` | Force remove even if working |
+| `/team recycle <name>` | `/team recycle reviewer` | Guarded hard restart for an idle/stopped worker; drops accumulated pane context |
+| `/team recycle <name> --force` | `/team recycle reviewer --force` | Recycle after manually checkpointing active work |
 | `/team swap <name> <model>` | `/team swap executor opus` | Re-attach with new model, same CLI |
 | `/team swap <name> <model> --force` | `/team swap executor opus --force` | Swap even if working |
 | `/team ensure <roles>` | `/team ensure reviewer security` | Attach missing roles, skip present ones |
@@ -175,6 +177,19 @@ If `tm-agent` is not in PATH:
 
 Runbook precedence: base term-mesh protocol → role preset → `.agent-runbooks/<role>.md` → per-team custom instructions. Tool-specific files under `.claude/skills`, `.codex/skills`, and `.opencode/runbooks` are projections, not the source of truth.
 Agent init uses compact runbook digests by default; set `TERMMESH_RUNBOOK_MODE=full` only for debugging or deep role-behavior audits.
+
+### Agent context lifecycle
+
+Agent panes are reusable workers, not long-term memory stores. Durable state
+lives in the task board, `~/.term-mesh/results/`, runbook digests, and task
+capsules. After an agent reports with the Standard Reply Header, prefer
+`tm-agent recycle <agent>` over letting an idle pane grow until it compacts.
+
+`recycle` is a guarded hard restart. It refuses active non-terminal tasks unless
+`--force` is passed, so long-running work should checkpoint first with
+`tm-agent heartbeat`, `tm-agent task block`, `tm-agent task review`, or
+`tm-agent reply`. Use `tm-agent restart <agent> --hard` as the lower-level
+escape hatch for recovery cases.
 
 ### Communication (leader → agent)
 

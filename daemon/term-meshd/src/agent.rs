@@ -64,6 +64,9 @@ pub struct AgentSession {
     pub created_at_ms: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub terminated_at_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub auto_recycle_every: Option<i64>,
+    pub completed_task_count: i64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -367,18 +370,20 @@ impl AgentSessionManager {
         // Phase 1 tables
         db.execute_batch(
             "CREATE TABLE IF NOT EXISTS agent_sessions (
-                id               TEXT PRIMARY KEY,
-                name             TEXT NOT NULL,
-                repo_path        TEXT NOT NULL,
-                worktree_name    TEXT NOT NULL,
-                worktree_path    TEXT NOT NULL,
-                worktree_branch  TEXT NOT NULL,
-                command          TEXT,
-                status           TEXT NOT NULL DEFAULT 'spawning',
-                pid              INTEGER,
-                panel_id         TEXT,
-                created_at_ms    INTEGER NOT NULL,
-                terminated_at_ms INTEGER
+                id                    TEXT PRIMARY KEY,
+                name                  TEXT NOT NULL,
+                repo_path             TEXT NOT NULL,
+                worktree_name         TEXT NOT NULL,
+                worktree_path         TEXT NOT NULL,
+                worktree_branch       TEXT NOT NULL,
+                command               TEXT,
+                status                TEXT NOT NULL DEFAULT 'spawning',
+                pid                   INTEGER,
+                panel_id              TEXT,
+                created_at_ms         INTEGER NOT NULL,
+                terminated_at_ms      INTEGER,
+                auto_recycle_every    INTEGER DEFAULT NULL,
+                completed_task_count  INTEGER NOT NULL DEFAULT 0
             );
 
             CREATE TABLE IF NOT EXISTS session_pids (
@@ -459,13 +464,27 @@ impl AgentSessionManager {
             let _ = db.execute_batch("ALTER TABLE session_pids ADD COLUMN pgid INTEGER");
         }
 
+        // Migration: add auto_recycle_every + completed_task_count columns (existing DBs)
+        let has_auto_recycle: bool = db
+            .prepare("SELECT COUNT(*) FROM pragma_table_info('agent_sessions') WHERE name='auto_recycle_every'")
+            .and_then(|mut s| s.query_row([], |r| r.get::<_, i64>(0)))
+            .map(|c| c > 0)
+            .unwrap_or(false);
+        if !has_auto_recycle {
+            let _ = db.execute_batch(
+                "ALTER TABLE agent_sessions ADD COLUMN auto_recycle_every INTEGER DEFAULT NULL;
+                 ALTER TABLE agent_sessions ADD COLUMN completed_task_count INTEGER NOT NULL DEFAULT 0",
+            );
+        }
+
         // Load non-terminated sessions into memory
         let mut sessions = HashMap::new();
         {
             let mut stmt = db.prepare(
                 "SELECT s.id, s.name, s.repo_path, s.worktree_name, s.worktree_path,
                         s.worktree_branch, s.command, s.status, s.pid, s.panel_id,
-                        s.created_at_ms, s.terminated_at_ms
+                        s.created_at_ms, s.terminated_at_ms,
+                        s.auto_recycle_every, s.completed_task_count
                  FROM agent_sessions s
                  WHERE s.status != 'terminated'",
             )?;
@@ -487,6 +506,8 @@ impl AgentSessionManager {
                     panel_id: row.get(9)?,
                     created_at_ms: row.get(10)?,
                     terminated_at_ms: row.get(11)?,
+                    auto_recycle_every: row.get(12)?,
+                    completed_task_count: row.get::<_, Option<i64>>(13)?.unwrap_or(0),
                 })
             })?;
 
@@ -580,6 +601,8 @@ impl AgentSessionManager {
                 panel_id: None,
                 created_at_ms: now_ms(),
                 terminated_at_ms: None,
+                auto_recycle_every: None,
+                completed_task_count: 0,
             };
 
             // Persist to DB + memory
@@ -590,8 +613,9 @@ impl AgentSessionManager {
                     .execute(
                         "INSERT INTO agent_sessions
                         (id, name, repo_path, worktree_name, worktree_path, worktree_branch,
-                         command, status, pid, panel_id, created_at_ms, terminated_at_ms)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                         command, status, pid, panel_id, created_at_ms, terminated_at_ms,
+                         auto_recycle_every, completed_task_count)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
                         params![
                             session.id,
                             session.name,
@@ -605,6 +629,8 @@ impl AgentSessionManager {
                             session.panel_id,
                             session.created_at_ms,
                             session.terminated_at_ms,
+                            session.auto_recycle_every,
+                            session.completed_task_count,
                         ],
                     )
                     .map_err(|e| format!("DB insert failed: {e}"))?;
@@ -638,7 +664,8 @@ impl AgentSessionManager {
 
             if let Ok(mut stmt) = inner.db.prepare(
                 "SELECT id, name, repo_path, worktree_name, worktree_path, worktree_branch,
-                        command, status, pid, panel_id, created_at_ms, terminated_at_ms
+                        command, status, pid, panel_id, created_at_ms, terminated_at_ms,
+                        auto_recycle_every, completed_task_count
                  FROM agent_sessions WHERE status = 'terminated'",
             ) {
                 if let Ok(rows) = stmt.query_map([], |row| {
@@ -657,6 +684,8 @@ impl AgentSessionManager {
                         panel_id: row.get(9)?,
                         created_at_ms: row.get(10)?,
                         terminated_at_ms: row.get(11)?,
+                        auto_recycle_every: row.get(12)?,
+                        completed_task_count: row.get::<_, Option<i64>>(13)?.unwrap_or(0),
                     })
                 }) {
                     for row in rows.flatten() {
@@ -686,7 +715,8 @@ impl AgentSessionManager {
             .db
             .query_row(
                 "SELECT id, name, repo_path, worktree_name, worktree_path, worktree_branch,
-                    command, status, pid, panel_id, created_at_ms, terminated_at_ms
+                    command, status, pid, panel_id, created_at_ms, terminated_at_ms,
+                    auto_recycle_every, completed_task_count
              FROM agent_sessions WHERE id = ?1",
                 params![id],
                 |row| {
@@ -705,6 +735,8 @@ impl AgentSessionManager {
                         panel_id: row.get(9)?,
                         created_at_ms: row.get(10)?,
                         terminated_at_ms: row.get(11)?,
+                        auto_recycle_every: row.get(12)?,
+                        completed_task_count: row.get::<_, Option<i64>>(13)?.unwrap_or(0),
                     })
                 },
             )
@@ -842,6 +874,47 @@ impl AgentSessionManager {
 
         tracing::info!("terminated agent session {id} ({})", session.name);
         Ok(())
+    }
+
+    /// Called when a task assigned to `assignee_id` transitions to Completed.
+    /// Increments the agent's completed_task_count and checks against auto_recycle_every.
+    /// Returns `Some((name, team_name))` when the threshold is hit and a recycle should fire;
+    /// None otherwise (or when auto_recycle is disabled for this agent).
+    pub fn handle_auto_recycle_completion(&self, assignee_id: &str) -> Option<(String, String)> {
+        let mut inner = self.inner.lock().unwrap();
+        let session = inner.sessions.get_mut(assignee_id)?;
+        let every = session.auto_recycle_every?;
+        if every <= 0 {
+            return None;
+        }
+        session.completed_task_count += 1;
+        let count = session.completed_task_count;
+        let name = session.name.clone();
+        let _ = inner.db.execute(
+            "UPDATE agent_sessions SET completed_task_count = ?1 WHERE id = ?2",
+            params![count, assignee_id],
+        );
+        if count % every == 0 {
+            // Extract team name from agent name@team format used by HeadlessManager.
+            // agent_sessions.name is the agent_type (e.g. "executor"); team is not
+            // stored directly. Return the agent name so the caller can resolve via
+            // headless.resolve_agent_id if needed.
+            Some((name, assignee_id.to_string()))
+        } else {
+            None
+        }
+    }
+
+    /// Set auto_recycle_every for an agent session.
+    pub fn set_auto_recycle_every(&self, session_id: &str, every: Option<i64>) {
+        let mut inner = self.inner.lock().unwrap();
+        if let Some(session) = inner.sessions.get_mut(session_id) {
+            session.auto_recycle_every = every;
+            let _ = inner.db.execute(
+                "UPDATE agent_sessions SET auto_recycle_every = ?1 WHERE id = ?2",
+                params![every, session_id],
+            );
+        }
     }
 
     /// Bind a UI panel to a session.
@@ -1382,6 +1455,8 @@ impl AgentSessionManager {
                 panel_id: None,
                 created_at_ms: 1000,
                 terminated_at_ms: None,
+                auto_recycle_every: None,
+                completed_task_count: 0,
             },
         );
     }
@@ -1960,6 +2035,8 @@ mod tests {
                     panel_id: None,
                     created_at_ms: 1000,
                     terminated_at_ms: None,
+                    auto_recycle_every: None,
+                    completed_task_count: 0,
                 },
             );
         }
@@ -2005,6 +2082,8 @@ mod tests {
                     panel_id: None,
                     created_at_ms: 2000,
                     terminated_at_ms: None,
+                    auto_recycle_every: None,
+                    completed_task_count: 0,
                 },
             );
         }
@@ -2047,6 +2126,8 @@ mod tests {
                 panel_id: None,
                 created_at_ms: 1000,
                 terminated_at_ms: None,
+                auto_recycle_every: None,
+                completed_task_count: 0,
             },
         );
     }

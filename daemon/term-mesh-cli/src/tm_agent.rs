@@ -327,6 +327,15 @@ enum Commands {
         /// Literal text, or @path to read the spec from a file.
         #[arg(long)]
         spec: Option<String>,
+        /// Disable automatic /watch on after team creation (also: TERMMESH_AUTO_WATCH=0)
+        #[arg(long)]
+        no_auto_watch: bool,
+        /// Auto-recycle all agents every N completed tasks (team default). 0 = disabled.
+        #[arg(long)]
+        auto_recycle: Option<u32>,
+        /// Per-agent auto-recycle overrides as "name:N,name:N" (overrides --auto-recycle).
+        #[arg(long)]
+        auto_recycle_per_agent: Option<String>,
     },
     /// Add an agent to an existing team (GUI and headless teams both supported).
     ///
@@ -345,6 +354,12 @@ enum Commands {
         /// CLI to use (claude, codex, kiro, gemini)
         #[arg(long, default_value = "claude")]
         cli: String,
+        /// Disable automatic /watch on after adding a watcher (also: TERMMESH_AUTO_WATCH=0)
+        #[arg(long)]
+        no_auto_watch: bool,
+        /// Auto-recycle this agent every N completed tasks. 0 = disabled.
+        #[arg(long)]
+        auto_recycle: Option<u32>,
     },
     /// Attach an agent pane to the current workspace's team.
     ///
@@ -448,6 +463,18 @@ enum Commands {
         /// Hard restart: close + respawn the pane (panelId changes; scrollback lost).
         #[arg(long, default_value_t = false)]
         hard: bool,
+    },
+    /// Safely recycle an idle/stopped agent pane to drop accumulated context.
+    ///
+    /// This is a guarded semantic wrapper around `restart <agent> --hard`.
+    /// It rejects active non-terminal tasks by default so task state must be
+    /// checkpointed into the board/results before the transcript is discarded.
+    Recycle {
+        /// Agent name to recycle
+        agent: String,
+        /// Bypass the active-task guard after manually checkpointing state.
+        #[arg(long, default_value_t = false)]
+        force: bool,
     },
     /// Wait for agent signals (report, msg, blocked, review_ready, idle, any)
     Wait {
@@ -2412,6 +2439,57 @@ mod runbook_tests {
     }
 
     #[test]
+    fn reply_protocol_status_done() {
+        let content = "STATUS: DONE\nFILES: none\nVERIFY: n/a\nNEXT: NONE\nFULL_REPORT: n/a\n\nbody";
+        let (h, _) = reply_header_and_summary(content, 1500);
+        assert_eq!(h["status"].as_str().unwrap(), "DONE");
+    }
+
+    #[test]
+    fn reply_protocol_status_blocked() {
+        let content = "STATUS: BLOCKED\nFILES: none\nVERIFY: n/a\nNEXT: leader\nFULL_REPORT: n/a\n\nreason";
+        let (h, _) = reply_header_and_summary(content, 1500);
+        assert_eq!(h["status"].as_str().unwrap(), "BLOCKED");
+    }
+
+    #[test]
+    fn reply_protocol_status_needs_review() {
+        let content = "STATUS: NEEDS_REVIEW\nFILES: a.rs\nVERIFY: n/a\nNEXT: review\nFULL_REPORT: n/a\n\nsummary";
+        let (h, _) = reply_header_and_summary(content, 1500);
+        assert_eq!(h["status"].as_str().unwrap(), "NEEDS_REVIEW");
+    }
+
+    #[test]
+    fn protocol_status_helper_done() {
+        assert_eq!(protocol_status_to_task_state("DONE"), Some("completed"));
+    }
+
+    #[test]
+    fn protocol_status_helper_blocked() {
+        assert_eq!(protocol_status_to_task_state("BLOCKED"), Some("blocked"));
+    }
+
+    #[test]
+    fn protocol_status_helper_needs_review() {
+        assert_eq!(protocol_status_to_task_state("NEEDS_REVIEW"), Some("review_ready"));
+    }
+
+    #[test]
+    fn protocol_status_helper_invalid() {
+        assert_eq!(protocol_status_to_task_state("invalid"), None);
+        assert_eq!(protocol_status_to_task_state("n/a"), None);
+        assert_eq!(protocol_status_to_task_state(""), None);
+    }
+
+    #[test]
+    fn reply_body_only_blocked_reason() {
+        let content = "STATUS: BLOCKED\nFILES: none\nVERIFY: n/a\nNEXT: escalate\nFULL_REPORT: n/a\n\nbuild failed: linker error";
+        let (_, body) = reply_header_and_summary(content, 1500);
+        assert_eq!(body.trim(), "build failed: linker error");
+        assert!(!body.contains("STATUS:"), "body must not contain headers");
+    }
+
+    #[test]
     fn split_inline_headers_preserves_body_text_with_colon() {
         // " KEY:" only fires for the 5 known header keys. A body line like
         // "Run: cargo test" must not be mistaken for a header boundary.
@@ -2443,6 +2521,48 @@ mod runbook_tests {
             Some("/tmp/full.md")
         );
         assert!(item["summary"].as_str().unwrap().contains("Changed code"));
+    }
+
+    #[test]
+    fn collect_result_path_overrides_header_full_report() {
+        // When task has result_path from DB, it should win over the reply-header FULL_REPORT.
+        let resp = json!({
+            "result": {
+                "results": [{
+                    "agent": "executor",
+                    "content": "STATUS: DONE\nFILES: a.rs\nVERIFY: n/a\nNEXT: NONE\nFULL_REPORT: /tmp/header-path.md\n\nbody",
+                    "result_path": "/home/user/.term-mesh/results/team/executor-reply.md"
+                }]
+            }
+        });
+        let compact = compact_result_collect_response(resp, false);
+        let item = &compact["result"]["results"][0];
+        assert_eq!(
+            item["headers"]["full_report"].as_str(),
+            Some("/home/user/.term-mesh/results/team/executor-reply.md"),
+            "result_path from DB must override header FULL_REPORT"
+        );
+    }
+
+    #[test]
+    fn collect_result_path_skips_na_value() {
+        // result_path = "n/a" must not override a valid header FULL_REPORT.
+        let resp = json!({
+            "result": {
+                "results": [{
+                    "agent": "executor",
+                    "content": "STATUS: DONE\nFILES: a.rs\nVERIFY: n/a\nNEXT: NONE\nFULL_REPORT: /tmp/real.md\n\nbody",
+                    "result_path": "n/a"
+                }]
+            }
+        });
+        let compact = compact_result_collect_response(resp, false);
+        let item = &compact["result"]["results"][0];
+        assert_eq!(
+            item["headers"]["full_report"].as_str(),
+            Some("/tmp/real.md"),
+            "n/a result_path must not override header FULL_REPORT"
+        );
     }
 
     #[test]
@@ -3575,6 +3695,17 @@ fn split_inline_headers(content: &str, keys: &[&str]) -> String {
     out
 }
 
+/// Map a protocol STATUS string to (task_state, detail_field_name).
+/// Returns None if the status is unrecognised (caller should exit 2).
+fn protocol_status_to_task_state(status: &str) -> Option<&'static str> {
+    match status {
+        "DONE" => Some("completed"),
+        "BLOCKED" => Some("blocked"),
+        "NEEDS_REVIEW" => Some("review_ready"),
+        _ => None,
+    }
+}
+
 fn reply_header_and_summary(content: &str, summary_chars: usize) -> (Value, String) {
     let header_keys = ["STATUS", "FILES", "VERIFY", "NEXT", "FULL_REPORT"];
     // Agents (notably codex) sometimes emit all 5 fields on a single line —
@@ -3631,7 +3762,14 @@ fn compact_result_collect_response(mut resp: Value, include_summary: bool) -> Va
                     .and_then(|v| v.as_str())
                     .unwrap_or("")
                     .to_string();
-                let (headers, summary) = reply_header_and_summary(&content, 700);
+                let (mut headers, summary) = reply_header_and_summary(&content, 700);
+                // Prefer task.result_path from the DB over the reply-header FULL_REPORT field
+                // (header may be truncated; DB value is the canonical disk path).
+                if let Some(rp) = obj.get("result_path").and_then(|v| v.as_str()) {
+                    if !rp.is_empty() && !rp.eq_ignore_ascii_case("n/a") {
+                        headers["full_report"] = json!(rp);
+                    }
+                }
                 obj.insert("headers".to_string(), headers);
                 if include_summary {
                     obj.insert("summary".to_string(), json!(summary));
@@ -4584,6 +4722,9 @@ fn main() {
             headless,
             resume_session,
             spec,
+            no_auto_watch,
+            auto_recycle,
+            auto_recycle_per_agent,
         } => {
             // Resolve --spec (literal text or @path) once for both paths.
             let watcher_spec = match resolve_watcher_spec(spec.as_deref()) {
@@ -4601,6 +4742,8 @@ fn main() {
                     &model,
                     roles.as_deref(),
                     watcher_spec.as_deref(),
+                    no_auto_watch,
+                    auto_recycle,
                 );
             } else {
                 run_create(
@@ -4618,6 +4761,9 @@ fn main() {
                     roles.as_deref(),
                     resume_session,
                     watcher_spec.as_deref(),
+                    no_auto_watch,
+                    auto_recycle,
+                    auto_recycle_per_agent.as_deref(),
                 );
             }
             return;
@@ -4627,6 +4773,8 @@ fn main() {
             name,
             model,
             cli,
+            no_auto_watch,
+            auto_recycle,
         } => {
             let agent_name = name.unwrap_or_else(|| agent_type.clone());
 
@@ -4647,6 +4795,8 @@ fn main() {
                             &agent_type,
                             &model,
                             &cli,
+                            no_auto_watch,
+                            auto_recycle,
                         );
                         return;
                     }
@@ -4655,7 +4805,7 @@ fn main() {
 
             // GUI team: route to team.add_agent RPC
             let gui_team = resolve_workspace_team_name().unwrap_or_else(|_| team.clone());
-            run_add_gui(&sock, &gui_team, &agent_type, &agent_name, &model, &cli);
+            run_add_gui(&sock, &gui_team, &agent_type, &agent_name, &model, &cli, no_auto_watch, auto_recycle);
             return;
         }
         Commands::Attach {
@@ -4773,6 +4923,13 @@ fn main() {
                 }
             }
             print_result(result);
+            return;
+        }
+        Commands::Recycle {
+            agent: ref target,
+            force,
+        } => {
+            run_recycle(&sock, &team, target, force);
             return;
         }
         Commands::Send {
@@ -5092,6 +5249,17 @@ fn main() {
         Commands::Reply { text, from, task_id: explicit_task_id } => {
             let sender = from.unwrap_or_else(|| agent.clone());
             let content = text.join(" ");
+            // STATUS enforce (C1) — map protocol STATUS to task state before any I/O
+            let (reply_headers, body_summary) = reply_header_and_summary(&content, 1500);
+            let protocol_status = reply_headers["status"].as_str().unwrap_or("n/a");
+            let task_status = match protocol_status_to_task_state(protocol_status) {
+                Some(s) => s,
+                None => {
+                    eprintln!("STATUS field is required: DONE|BLOCKED|NEEDS_REVIEW (got: {protocol_status})");
+                    eprintln!("Reply header must start with: STATUS: <DONE|BLOCKED|NEEDS_REVIEW>");
+                    std::process::exit(2);
+                }
+            };
             // Write the canonical task result when possible, plus the legacy
             // per-agent alias for compatibility with older readers.
             let reply_task_id = if let Some(tid) = explicit_task_id {
@@ -5142,8 +5310,23 @@ fn main() {
             if let Some(tid) = reply_task_id.as_deref() {
                 let mut update = json!({
                     "team_name": &team, "task_id": tid,
-                    "status": "completed", "result": &summary,
+                    "status": task_status, "result": &summary,
                 });
+                // P2: use body-only text for detail fields, not the full header+body summary
+                let detail: &str = if body_summary.trim().is_empty() {
+                    match task_status {
+                        "blocked" => "Blocked",
+                        "review_ready" => "Ready for review",
+                        _ => "",
+                    }
+                } else {
+                    body_summary.as_str()
+                };
+                if task_status == "blocked" {
+                    update["blocked_reason"] = json!(detail);
+                } else if task_status == "review_ready" {
+                    update["review_summary"] = json!(detail);
+                }
                 if let Some(path) = result_path {
                     update["result_path"] = json!(path.to_string_lossy());
                 }
@@ -5185,6 +5368,73 @@ fn print_result(result: Result<Value, String>) {
             process::exit(1);
         }
     }
+}
+
+fn run_recycle(sock: &PathBuf, team: &str, target: &str, force: bool) {
+    let status = match rpc_call(sock, "team.status", json!({ "team_name": team })) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("Error: {e}");
+            process::exit(1);
+        }
+    };
+
+    let agents = status["result"]["agents"]
+        .as_array()
+        .ok_or_else(|| "team.status response missing result.agents".to_string())
+        .unwrap_or_else(|e| {
+            eprintln!("Error: {e}");
+            process::exit(1);
+        });
+    let matches: Vec<&Value> = agents
+        .iter()
+        .filter(|agent| agent["name"].as_str() == Some(target))
+        .collect();
+
+    if matches.is_empty() {
+        eprintln!("Error: agent not found: {target}");
+        process::exit(1);
+    }
+    if matches.len() > 1 {
+        eprintln!(
+            "Error: multiple agents named {target}; recycle requires a unique agent name. Use `tm-agent restart {target} --hard` only if you accept first-match behavior."
+        );
+        process::exit(1);
+    }
+
+    let agent = matches[0];
+    let active_task_id = agent["active_task_id"].as_str();
+    let active_task_status = agent["active_task_status"].as_str().unwrap_or("");
+    let terminal_checkpoint_status =
+        matches!(active_task_status, "blocked" | "review_ready" | "completed");
+    if active_task_id.is_some() && !terminal_checkpoint_status && !force {
+        eprintln!(
+            "Error: refusing to recycle {target}; active task {} is {active_task_status}. Checkpoint or finish the task first, or pass --force.",
+            active_task_id.unwrap_or("<unknown>")
+        );
+        process::exit(1);
+    }
+
+    if active_task_id.is_some() && force {
+        eprintln!(
+            "recycle --force: discarding pane transcript for {target}; ensure task state was checkpointed in the task board or result files."
+        );
+    } else {
+        eprintln!(
+            "recycle: hard-restarting {target} to drop accumulated context; durable state remains in the task board/results."
+        );
+    }
+
+    let result = rpc_call(
+        sock,
+        "team.restart",
+        json!({
+            "team_name": team,
+            "agent_name": target,
+            "mode": "hard",
+        }),
+    );
+    print_result(result);
 }
 
 // ── Session picker ──────────────────────────────────────────────────
@@ -5511,6 +5761,9 @@ fn run_create(
     roles: Option<&str>,
     resume_session: Option<Option<String>>,
     watcher_spec: Option<&str>,
+    no_auto_watch: bool,
+    auto_recycle: Option<u32>,
+    auto_recycle_per_agent: Option<&str>,
 ) {
     // Guard: --adopt and --claude-leader are mutually exclusive
     if adopt && claude_leader {
@@ -5723,6 +5976,23 @@ fn run_create(
             create_params["leader_cli"] = json!(cli);
         }
     }
+    if let Some(n) = auto_recycle {
+        create_params["default_auto_recycle_every"] = json!(n);
+    }
+    if let Some(per_agent_str) = auto_recycle_per_agent {
+        let map: serde_json::Map<String, serde_json::Value> = per_agent_str
+            .split(',')
+            .filter_map(|s| {
+                let mut parts = s.trim().splitn(2, ':');
+                let name = parts.next()?.trim().to_string();
+                let count: u32 = parts.next()?.trim().parse().ok()?;
+                Some((name, json!(count)))
+            })
+            .collect();
+        if !map.is_empty() {
+            create_params["per_agent_auto_recycle"] = serde_json::Value::Object(map);
+        }
+    }
     let r = match rpc_call_timeout(sock, "team.create", create_params, 5) {
         Ok(v) => v,
         Err(e) => {
@@ -5875,7 +6145,298 @@ fn run_create(
         if kiro_count > 0 {
             eprintln!("\n  \u{2713} {kiro_count} kiro agent(s): prompt loaded via agent profile (no delay)");
         }
+
+        // Auto-watch hook: trigger after successful team creation (best-effort)
+        let wd = env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+        maybe_auto_watch_after_team_change(sock, team, no_auto_watch, &wd);
     }
+}
+
+fn is_auto_watch_disabled_by_env() -> bool {
+    match env::var("TERMMESH_AUTO_WATCH") {
+        Ok(val) => matches!(val.to_ascii_lowercase().as_str(), "0" | "false" | "no" | "off"),
+        Err(_) => false,
+    }
+}
+
+/// Normalized agent descriptor used by the pure decision function.
+#[derive(Debug, Clone)]
+struct AutoWatchAgent {
+    name: String,
+    agent_type: String,
+    cli: String,
+    model: String,
+}
+
+/// Decision returned by `auto_watch_decision`.
+#[derive(Debug, PartialEq)]
+enum AutoWatchDecision {
+    SkipNoWatcher,
+    SkipNoWorker,
+    SkipMultiWorker(usize),
+    SkipMissingSpec,
+    Enable { target: String, watcher_cli: String, watcher_model: String },
+}
+
+/// Pure decision function — no I/O, fully unit-testable.
+fn auto_watch_decision(agents: &[AutoWatchAgent], spec_exists: bool) -> AutoWatchDecision {
+    let watchers: Vec<&AutoWatchAgent> = agents
+        .iter()
+        .filter(|a| a.agent_type == "watcher")
+        .collect();
+    let workers: Vec<&AutoWatchAgent> = agents
+        .iter()
+        .filter(|a| a.agent_type != "watcher")
+        .collect();
+
+    if watchers.is_empty() {
+        return AutoWatchDecision::SkipNoWatcher;
+    }
+    if workers.is_empty() {
+        return AutoWatchDecision::SkipNoWorker;
+    }
+    if workers.len() > 1 {
+        return AutoWatchDecision::SkipMultiWorker(workers.len());
+    }
+    if !spec_exists {
+        return AutoWatchDecision::SkipMissingSpec;
+    }
+    let w = &watchers[0];
+    AutoWatchDecision::Enable {
+        target: workers[0].name.clone(),
+        watcher_cli: w.cli.clone(),
+        watcher_model: w.model.clone(),
+    }
+}
+
+/// Outcome of parsing a watch.on JSON-RPC response envelope.
+#[derive(Debug)]
+enum WatchOnOutcome {
+    Enabled,
+    Failed(String),
+    Unexpected(String),
+}
+
+/// Classify a watch.on JSON-RPC response for unit testing without RPC mocking.
+fn parse_watch_on_response(r: &serde_json::Value) -> WatchOnOutcome {
+    if r.get("error").map_or(true, serde_json::Value::is_null)
+        && r["result"]["enabled"].as_bool().unwrap_or(false)
+    {
+        WatchOnOutcome::Enabled
+    } else if r.get("error").map_or(false, |e| !e.is_null()) {
+        let msg = r["error"]["message"].as_str().unwrap_or("unknown").to_string();
+        WatchOnOutcome::Failed(msg)
+    } else {
+        WatchOnOutcome::Unexpected(r.to_string())
+    }
+}
+
+/// Emit the user-facing message and call watch.on RPC (best-effort).
+fn apply_auto_watch(team_name: &str, working_dir: &std::path::Path, decision: AutoWatchDecision) {
+    match decision {
+        AutoWatchDecision::SkipNoWatcher | AutoWatchDecision::SkipNoWorker => {}
+        AutoWatchDecision::SkipMultiWorker(n) => {
+            eprintln!(
+                "ℹ️  auto-watch skipped: {n} non-watcher workers found; run \
+                 `tm-agent watch on <team> --target <name>` manually"
+            );
+        }
+        AutoWatchDecision::SkipMissingSpec => {
+            eprintln!(
+                "ℹ️  auto-watch skipped: .xm/watch/default-spec.md not present; \
+                 create the file to enable auto drift watch"
+            );
+        }
+        AutoWatchDecision::Enable { target, watcher_cli, watcher_model } => {
+            let wd_str = working_dir.to_string_lossy();
+            let mut params = json!({
+                "team_id": team_name,
+                "target": &target,
+                "interval_secs": 300u64,
+                "stance": "critic",
+                "cli": &watcher_cli,
+                "model": &watcher_model,
+                "spec": "@.xm/watch/default-spec.md",
+                "working_directory": wd_str,
+            });
+            if let Ok(ts) = env::var("TERMMESH_SOCKET") {
+                if !ts.is_empty() && is_app_socket_path(std::path::Path::new(&ts)) {
+                    params["app_socket_path"] = json!(ts);
+                }
+            }
+            let watch_sock = match detect_watch_socket() {
+                Some(s) => s,
+                None => {
+                    eprintln!("⚠️  auto-watch failed: daemon socket not found; skipping");
+                    return;
+                }
+            };
+            match rpc_call(&watch_sock, "watch.on", params) {
+                Ok(r) => match parse_watch_on_response(&r) {
+                    WatchOnOutcome::Enabled => {
+                        eprintln!(
+                            "✓ auto-watch enabled: target={target} \
+                             spec=@.xm/watch/default-spec.md every=300s"
+                        );
+                    }
+                    WatchOnOutcome::Failed(msg) => {
+                        eprintln!("⚠️  auto-watch failed: {msg}; skipping");
+                    }
+                    WatchOnOutcome::Unexpected(r) => {
+                        eprintln!("⚠️  auto-watch failed: unexpected response {r}; skipping");
+                    }
+                },
+                Err(e) => {
+                    eprintln!("⚠️  auto-watch failed: {e}; skipping");
+                }
+            }
+        }
+    }
+}
+
+/// Build AutoWatchAgent roster from a JSON agents array (GUI team.status format).
+fn roster_from_gui_status(agents: &[Value]) -> Vec<AutoWatchAgent> {
+    agents
+        .iter()
+        .map(|a| {
+            let name = a["name"].as_str().unwrap_or("").to_string();
+            let agent_type = a["agent_type"].as_str().unwrap_or(&name).to_string();
+            AutoWatchAgent {
+                name: name.clone(),
+                agent_type,
+                cli: a["cli"].as_str().unwrap_or("claude").to_string(),
+                model: a["model"].as_str().unwrap_or("sonnet").to_string(),
+            }
+        })
+        .collect()
+}
+
+/// Build AutoWatchAgent roster from headless agent specs (Value array from create).
+fn roster_from_headless_specs(specs: &[Value]) -> Vec<AutoWatchAgent> {
+    specs
+        .iter()
+        .map(|a| {
+            let name = a["name"].as_str().unwrap_or("").to_string();
+            // headless specs use "name" as agent_type; watcher is detected by name
+            let agent_type = a["agent_type"].as_str().unwrap_or(&name).to_string();
+            AutoWatchAgent {
+                name: name.clone(),
+                agent_type,
+                cli: a["cli"].as_str().unwrap_or("claude").to_string(),
+                model: a["model"].as_str().unwrap_or("sonnet").to_string(),
+            }
+        })
+        .collect()
+}
+
+/// Build AutoWatchAgent roster via headless.list on daemon socket (for add path).
+fn roster_from_headless_daemon(daemon_sock: &PathBuf, team_name: &str) -> Vec<AutoWatchAgent> {
+    let resp = match rpc_call_timeout(
+        daemon_sock,
+        "headless.list",
+        json!({ "team_name": team_name }),
+        3,
+    ) {
+        Ok(v) => v,
+        Err(_) => return vec![],
+    };
+    // headless.list returns an array directly (not wrapped in result)
+    let arr = if let Some(a) = resp.as_array() {
+        a.as_slice().to_vec()
+    } else if let Some(a) = resp["result"].as_array() {
+        a.clone()
+    } else {
+        return vec![];
+    };
+    arr.iter()
+        .map(|a| {
+            let name = a["name"].as_str().unwrap_or("").to_string();
+            // headless.list AgentInfo has no agent_type field; infer from name
+            AutoWatchAgent {
+                agent_type: name.clone(),
+                name,
+                cli: a["cli"].as_str().unwrap_or("claude").to_string(),
+                model: a["model"].as_str().unwrap_or("sonnet").to_string(),
+            }
+        })
+        .collect()
+}
+
+fn run_auto_watch_if_enabled(
+    team_name: &str,
+    no_auto_watch: bool,
+    working_dir: &std::path::Path,
+    roster: Vec<AutoWatchAgent>,
+) {
+    if no_auto_watch || is_auto_watch_disabled_by_env() {
+        return;
+    }
+    let spec_exists = working_dir.join(".xm/watch/default-spec.md").exists();
+    let decision = auto_watch_decision(&roster, spec_exists);
+    apply_auto_watch(team_name, working_dir, decision);
+}
+
+/// Auto-watch hook for GUI team create/add — fetches roster via app socket.
+fn maybe_auto_watch_after_team_change(
+    app_sock: &PathBuf,
+    team_name: &str,
+    no_auto_watch: bool,
+    working_dir: &std::path::Path,
+) {
+    if no_auto_watch || is_auto_watch_disabled_by_env() {
+        return;
+    }
+    let status = match rpc_call_timeout(app_sock, "team.status", json!({ "team_name": team_name }), 3) {
+        Ok(v) if v["ok"].as_bool().unwrap_or(false) => v,
+        _ => return,
+    };
+    let agents = match status["result"]["agents"].as_array() {
+        Some(a) => a.clone(),
+        None => return,
+    };
+    let roster = roster_from_gui_status(&agents);
+    let spec_exists = working_dir.join(".xm/watch/default-spec.md").exists();
+    let decision = auto_watch_decision(&roster, spec_exists);
+    apply_auto_watch(team_name, working_dir, decision);
+}
+
+/// Auto-watch hook for headless create — uses existing agent_specs (no RPC needed).
+fn maybe_auto_watch_after_headless_create(
+    agent_specs: &[Value],
+    team_name: &str,
+    no_auto_watch: bool,
+    working_dir: &std::path::Path,
+) {
+    let roster = roster_from_headless_specs(agent_specs);
+    run_auto_watch_if_enabled(team_name, no_auto_watch, working_dir, roster);
+}
+
+/// Auto-watch hook for headless add — fetches roster via daemon socket.
+/// `added_agent_name` / `added_agent_type` are patched in because headless.list
+/// AgentInfo has no agent_type field; fallback infers type=name so "drift" becomes worker.
+fn maybe_auto_watch_after_headless_add(
+    daemon_sock: &PathBuf,
+    team_name: &str,
+    no_auto_watch: bool,
+    working_dir: &std::path::Path,
+    added_agent_name: &str,
+    added_agent_type: &str,
+    added_cli: &str,
+    added_model: &str,
+) {
+    let mut roster = roster_from_headless_daemon(daemon_sock, team_name);
+    // Patch the just-added agent with the explicit type the caller knows.
+    if let Some(existing) = roster.iter_mut().find(|a| a.name == added_agent_name) {
+        existing.agent_type = added_agent_type.to_string();
+    } else {
+        roster.push(AutoWatchAgent {
+            name: added_agent_name.to_string(),
+            agent_type: added_agent_type.to_string(),
+            cli: added_cli.to_string(),
+            model: added_model.to_string(),
+        });
+    }
+    run_auto_watch_if_enabled(team_name, no_auto_watch, working_dir, roster);
 }
 
 /// Validate agent name against the whitelist regex `^[a-zA-Z0-9_-]{1,32}$`.
@@ -6119,19 +6680,24 @@ fn run_add_gui(
     agent_name: &str,
     model: &str,
     cli: &str,
+    no_auto_watch: bool,
+    auto_recycle: Option<u32>,
 ) {
     eprintln!(
         "Adding agent '{}' (type={}, cli={}, model={}) to GUI team '{}'...",
         agent_name, agent_type, cli, model, team_name
     );
 
-    let params = json!({
+    let mut params = json!({
         "team_name": team_name,
         "agent_type": agent_type,
         "name": agent_name,
         "model": model,
         "cli": cli,
     });
+    if let Some(n) = auto_recycle {
+        params["auto_recycle_every"] = json!(n);
+    }
 
     let resp = match rpc_call_timeout(sock, "team.add_agent", params, 10) {
         Ok(v) => v,
@@ -6160,6 +6726,12 @@ fn run_add_gui(
                     .and_then(|v| v.as_str())
                     .unwrap_or(team_name),
             );
+        }
+        // P3: auto-watch only fires when a watcher agent is added
+        let added_watcher = agent_type == "watcher" || agent_name.starts_with("watcher");
+        if added_watcher {
+            let wd = env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+            maybe_auto_watch_after_team_change(sock, team_name, no_auto_watch, &wd);
         }
     } else {
         let code = resp["error"]["code"].as_str().unwrap_or("unknown");
@@ -6508,6 +7080,8 @@ fn run_create_headless(
     model: &str,
     roles: Option<&str>,
     watcher_spec: Option<&str>,
+    no_auto_watch: bool,
+    auto_recycle: Option<u32>,
 ) {
     let daemon_sock = match detect_daemon_socket() {
         Some(s) => s,
@@ -6524,7 +7098,11 @@ fn run_create_headless(
             .map(|s| s.trim())
             .filter(|s| !s.is_empty())
             .enumerate()
-            .map(|(_i, name)| json!({ "name": name, "agent_type": name, "cli": "claude", "model": model }))
+            .map(|(_i, name)| {
+                let mut spec = json!({ "name": name, "agent_type": name, "cli": "claude", "model": model });
+                if let Some(n) = auto_recycle { spec["auto_recycle_every"] = json!(n); }
+                spec
+            })
             .collect()
     } else {
         (0..count as usize)
@@ -6534,7 +7112,9 @@ fn run_create_headless(
                 } else {
                     format!("agent-{i}")
                 };
-                json!({ "name": name, "agent_type": name, "cli": "claude", "model": model })
+                let mut spec = json!({ "name": name, "agent_type": name, "cli": "claude", "model": model });
+                if let Some(n) = auto_recycle { spec["auto_recycle_every"] = json!(n); }
+                spec
             })
             .collect()
     };
@@ -6611,6 +7191,10 @@ fn run_create_headless(
     println!("  tm-agent read <agent> --lines 50");
     println!("  tm-agent status");
     println!("  tm-agent destroy");
+
+    // Auto-watch hook: use agent_specs directly (daemon roster, no app_sock)
+    let wd = env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+    maybe_auto_watch_after_headless_create(&agent_specs, team, no_auto_watch, &wd);
 }
 
 fn run_add_headless(
@@ -6621,18 +7205,24 @@ fn run_add_headless(
     agent_type: &str,
     model: &str,
     cli: &str,
+    no_auto_watch: bool,
+    auto_recycle: Option<u32>,
 ) {
     eprintln!("Adding agent '{agent_name}' (type={agent_type}, cli={cli}, model={model}) to headless team '{team}'...");
 
     let app_sock_str = app_sock.to_string_lossy().to_string();
 
-    let add_params = json!({
+    let mut add_params = json!({
         "team_name": team,
         "name": agent_name,
+        "agent_type": agent_type,
         "cli": cli,
         "model": model,
         "app_socket_path": app_sock_str,
     });
+    if let Some(n) = auto_recycle {
+        add_params["auto_recycle_every"] = json!(n);
+    }
 
     match rpc_call_timeout(daemon_sock, "headless.add_agent", add_params, 15) {
         Ok(resp) => {
@@ -6686,6 +7276,16 @@ fn run_add_headless(
             }
 
             eprintln!("\nAgent '{agent_name}' added to team '{team}'.");
+
+            // P3: auto-watch only fires when a watcher agent is added
+            let added_watcher = agent_type == "watcher" || agent_name.starts_with("watcher");
+            if added_watcher {
+                let wd = env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+                maybe_auto_watch_after_headless_add(
+                    daemon_sock, team, no_auto_watch, &wd,
+                    agent_name, agent_type, cli, model,
+                );
+            }
         }
         Err(e) => {
             eprintln!("Error: {e}");
@@ -6752,6 +7352,15 @@ fn run_delegate_result(
                         };
                         if !headless_ok {
                             eprintln!("  Warning: headless.send failed for {target}");
+                            if let Some(task_id) = v["result"]["task"]["id"].as_str() {
+                                let reason = format!("headless paste delivery failed: headless.send RPC returned null (agent={target})");
+                                let _ = rpc_call(sock, "team.task.update", json!({
+                                    "team_name": team,
+                                    "task_id": task_id,
+                                    "status": "blocked",
+                                    "blocked_reason": reason,
+                                }));
+                            }
                         }
                         return Ok(v);
                     }
@@ -6789,6 +7398,15 @@ fn run_delegate_result(
                     }
                     _ => {
                         eprintln!("  Warning: retry also failed — task created but text may not have been delivered.");
+                        if let Some(task_id) = v["result"]["task"]["id"].as_str() {
+                            let reason = format!("paste delivery failed: surface-nil 4-retry + team.send fallback exhausted (agent={target})");
+                            let _ = rpc_call(sock, "team.task.update", json!({
+                                "team_name": team,
+                                "task_id": task_id,
+                                "status": "blocked",
+                                "blocked_reason": reason,
+                            }));
+                        }
                     }
                 }
             }
@@ -6876,6 +7494,13 @@ fn run_delegate_result(
             };
             if !sent_ok {
                 eprintln!("  Warning: headless.send failed in 2-RPC fallback");
+                let reason = format!("legacy delegate fallback failed: headless.send returned null (agent={target})");
+                let _ = rpc_call(sock, "team.task.update", json!({
+                    "team_name": team,
+                    "task_id": task_id,
+                    "status": "blocked",
+                    "blocked_reason": reason,
+                }));
             }
             return Ok(json!({ "task": task, "send": { "ok": sent_ok } }));
         }
@@ -6911,7 +7536,16 @@ fn run_delegate_result(
                 eprintln!("  Retry succeeded.");
                 return Ok(json!({ "task": task, "send": rv }));
             }
-            _ => return Err(format!("team.send failed after retry: {}", pretty(&sent))),
+            _ => {
+                let reason = format!("legacy delegate fallback failed: team.send error after retry (agent={target})");
+                let _ = rpc_call(sock, "team.task.update", json!({
+                    "team_name": team,
+                    "task_id": task_id,
+                    "status": "blocked",
+                    "blocked_reason": reason,
+                }));
+                return Err(format!("team.send failed after retry: {}", pretty(&sent)));
+            }
         }
     }
 
@@ -7923,6 +8557,79 @@ mod xmb_bridge_tests {
     }
 }
 
+/// Open a persistent events.subscribe connection and stream events into an mpsc channel.
+/// Returns Err if the initial connection or ack fails.  The background thread closes
+/// the channel on EOF / socket error, which the caller detects as Disconnected.
+fn subscribe_events_channel(
+    daemon_sock: &PathBuf,
+    kinds: &[&str],
+) -> Result<std::sync::mpsc::Receiver<Value>, String> {
+    let request = json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "events.subscribe",
+        "params": { "kinds": kinds },
+    });
+
+    let stream = UnixStream::connect(daemon_sock)
+        .map_err(|e| format!("subscribe connect: {e}"))?;
+    // 90s read timeout outlasts the daemon's 30s keepalive with margin.
+    stream.set_read_timeout(Some(Duration::from_secs(90))).ok();
+    stream.set_write_timeout(Some(Duration::from_secs(5))).ok();
+
+    let mut writer = stream.try_clone()
+        .map_err(|e| format!("subscribe clone: {e}"))?;
+
+    let mut payload = serde_json::to_string(&request)
+        .map_err(|e| format!("subscribe serialize: {e}"))?;
+    payload.push('\n');
+    writer.write_all(payload.as_bytes())
+        .map_err(|e| format!("subscribe write: {e}"))?;
+    writer.flush().ok();
+
+    // Read ack (first JSONL line from daemon)
+    let mut reader = BufReader::new(stream);
+    let mut ack_line = String::new();
+    reader
+        .read_line(&mut ack_line)
+        .map_err(|e| format!("subscribe ack read: {e}"))?;
+    let ack: Value = serde_json::from_str(ack_line.trim())
+        .map_err(|e| format!("subscribe ack parse: {e}"))?;
+    if ack.get("error").map_or(false, |e| !e.is_null()) {
+        let msg = ack["error"]["message"].as_str().unwrap_or("unknown");
+        return Err(format!("subscribe server error: {msg}"));
+    }
+
+    let (tx, rx) = std::sync::mpsc::channel::<Value>();
+
+    thread::spawn(move || {
+        let mut line = String::new();
+        loop {
+            line.clear();
+            match reader.read_line(&mut line) {
+                Ok(0) => break, // EOF — daemon closed connection
+                Ok(_) => {
+                    let trimmed = line.trim_end_matches('\n').trim_end_matches('\r');
+                    if trimmed.is_empty() {
+                        continue;
+                    }
+                    if let Ok(v) = serde_json::from_str::<Value>(trimmed) {
+                        if v.get("kind").is_some() && tx.send(v).is_err() {
+                            break; // receiver dropped
+                        }
+                    }
+                }
+                Err(e) => match e.kind() {
+                    ErrorKind::WouldBlock | ErrorKind::TimedOut => continue, // keepalive gap
+                    _ => break,
+                },
+            }
+        }
+    });
+
+    Ok(rx)
+}
+
 fn run_wait(
     sock: &PathBuf,
     team: &str,
@@ -7955,6 +8662,42 @@ fn run_wait(
         }
     }
 
+    // B1: daemon push subscribe — eliminates 1-3s polling sleep when available.
+    // Idle mode uses team.status (no matching event kind) so keep polling there.
+    let push_disabled = env::var("TERMMESH_WAIT_PUSH_DISABLE")
+        .map(|v| matches!(v.as_str(), "1" | "true" | "yes"))
+        .unwrap_or(false);
+    let subscribe_kinds: &[&str] = match mode {
+        "report" | "any" => &["task_status", "reply"],
+        "blocked" | "review_ready" => &["task_status"],
+        _ => &[],
+    };
+    // events.subscribe lives on the daemon socket, not the app socket.
+    // Resolve it here so the caller's app `sock` is not misrouted.
+    let daemon_sock_for_push = detect_daemon_socket();
+    let mut event_rx: Option<std::sync::mpsc::Receiver<Value>> =
+        if !push_disabled && !subscribe_kinds.is_empty() {
+            match daemon_sock_for_push.as_ref() {
+                Some(ds) => match subscribe_events_channel(ds, subscribe_kinds) {
+                    Ok(rx) => {
+                        eprintln!("wait: subscribed to push events ({})", subscribe_kinds.join(","));
+                        Some(rx)
+                    }
+                    Err(e) => {
+                        eprintln!("wait: subscribe failed: {e}; falling back to polling");
+                        None
+                    }
+                },
+                None => {
+                    eprintln!("wait: daemon socket not found; using polling");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
+    let wait_started = std::time::Instant::now();
     let mut elapsed: u32 = 0;
     let mut current_interval: u64 = 0; // first poll is immediate (no sleep)
     let min_interval: u64 = 1;
@@ -7972,8 +8715,32 @@ fn run_wait(
     let mut tracked_agents: std::collections::HashSet<String> = std::collections::HashSet::new();
     while elapsed < timeout {
         if current_interval > 0 {
-            thread::sleep(Duration::from_secs(current_interval));
-            elapsed += current_interval as u32;
+            // B1: push channel replaces sleep. Decay toward interval deadline in
+            // 200ms chunks so events get sub-200ms responsiveness while a quiet
+            // stream keeps the configured cadence (no 5Hz RPC hammering).
+            if let Some(ref rx) = event_rx {
+                use std::sync::mpsc::RecvTimeoutError;
+                let deadline = std::time::Instant::now() + Duration::from_secs(current_interval);
+                loop {
+                    let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                    if remaining.is_zero() {
+                        break; // interval elapsed: do the fallback poll
+                    }
+                    let cap = remaining.min(Duration::from_millis(200));
+                    match rx.recv_timeout(cap) {
+                        Ok(_event) => break, // real push: poll immediately
+                        Err(RecvTimeoutError::Timeout) => continue, // no event yet, keep waiting
+                        Err(RecvTimeoutError::Disconnected) => {
+                            eprintln!("wait: subscribe stream closed; falling back to polling");
+                            event_rx = None;
+                            break;
+                        }
+                    }
+                }
+            } else {
+                thread::sleep(Duration::from_secs(current_interval));
+            }
+            elapsed = wait_started.elapsed().as_secs() as u32;
         }
         let mut report_done = false;
         let mut report_progress = "0/0".to_string();
@@ -8030,7 +8797,7 @@ fn run_wait(
                                 tracked_task_ids.contains(tid)
                                     && matches!(
                                         t["status"].as_str(),
-                                        Some("completed") | Some("review_ready")
+                                        Some("completed") | Some("review_ready") | Some("blocked")
                                     )
                             })
                             .count() as u64;
@@ -8437,7 +9204,7 @@ fn run_warmup(sock: &PathBuf, team: &str, target: Option<&str>, timeout: u32) {
                 }),
             ) {
                 let status = v["result"]["status"].as_str().unwrap_or("");
-                if status == "completed" || status == "review_ready" {
+                if status == "completed" || status == "review_ready" || status == "blocked" {
                     let ms = start.elapsed().as_millis();
                     let result = v["result"]["result"].as_str().unwrap_or("").to_string();
                     completed.push((agent_name.clone(), ms, result));
@@ -9505,6 +10272,190 @@ mod watcher_spec_tests {
         assert_eq!(
             derive_daemon_socket_from_app(Path::new("/tmp/term-meshd.sock")),
             None
+        );
+    }
+}
+
+#[cfg(test)]
+mod auto_watch_tests {
+    use super::*;
+
+    #[test]
+    fn auto_watch_env_disabled_by_zero() {
+        std::env::set_var("TERMMESH_AUTO_WATCH", "0");
+        assert!(is_auto_watch_disabled_by_env());
+        std::env::remove_var("TERMMESH_AUTO_WATCH");
+    }
+
+    fn make_agent(name: &str, agent_type: &str) -> AutoWatchAgent {
+        AutoWatchAgent {
+            name: name.to_string(),
+            agent_type: agent_type.to_string(),
+            cli: "claude".to_string(),
+            model: "sonnet".to_string(),
+        }
+    }
+
+    // ── pure auto_watch_decision tests ────────────────────────────────
+
+    #[test]
+    fn decision_no_watcher_returns_skip_no_watcher() {
+        let agents = vec![make_agent("executor", "executor"), make_agent("reviewer", "reviewer")];
+        assert_eq!(auto_watch_decision(&agents, true), AutoWatchDecision::SkipNoWatcher);
+    }
+
+    #[test]
+    fn decision_no_worker_returns_skip_no_worker() {
+        let agents = vec![make_agent("watcher", "watcher")];
+        assert_eq!(auto_watch_decision(&agents, true), AutoWatchDecision::SkipNoWorker);
+    }
+
+    #[test]
+    fn decision_multi_worker_returns_skip_multi_worker() {
+        let agents = vec![
+            make_agent("watcher", "watcher"),
+            make_agent("executor", "executor"),
+            make_agent("reviewer", "reviewer"),
+        ];
+        assert_eq!(auto_watch_decision(&agents, true), AutoWatchDecision::SkipMultiWorker(2));
+    }
+
+    #[test]
+    fn decision_spec_missing_returns_skip_missing_spec() {
+        let agents = vec![
+            make_agent("watcher", "watcher"),
+            make_agent("executor", "executor"),
+        ];
+        assert_eq!(auto_watch_decision(&agents, false), AutoWatchDecision::SkipMissingSpec);
+    }
+
+    #[test]
+    fn decision_single_worker_spec_present_returns_enable() {
+        let agents = vec![
+            make_agent("watcher", "watcher"),
+            make_agent("executor", "executor"),
+        ];
+        let result = auto_watch_decision(&agents, true);
+        assert_eq!(
+            result,
+            AutoWatchDecision::Enable {
+                target: "executor".to_string(),
+                watcher_cli: "claude".to_string(),
+                watcher_model: "sonnet".to_string(),
+            }
+        );
+    }
+
+    // ── env var tests (inline logic, no process env mutation) ─────────
+
+    #[test]
+    fn auto_watch_env_disabled_values() {
+        for val in &["0", "false", "no", "off", "FALSE", "OFF"] {
+            assert!(
+                matches!(val.to_ascii_lowercase().as_str(), "0" | "false" | "no" | "off"),
+                "expected {val} to be disabled"
+            );
+        }
+    }
+
+    #[test]
+    fn auto_watch_env_enabled_values() {
+        for val in &["1", "true", "yes", "on"] {
+            assert!(
+                !matches!(val.to_ascii_lowercase().as_str(), "0" | "false" | "no" | "off"),
+                "expected {val} to be enabled"
+            );
+        }
+    }
+
+    // ── P1: watch.on envelope parsing ────────────────────────────────────
+
+    #[test]
+    fn watch_on_success_envelope_returns_enabled() {
+        let r = json!({"result": {"enabled": true, "status": "ok"}});
+        assert!(matches!(parse_watch_on_response(&r), WatchOnOutcome::Enabled));
+    }
+
+    #[test]
+    fn watch_on_error_envelope_returns_failed_with_message() {
+        let r = json!({"error": {"code": -32601, "message": "unknown method"}, "result": null});
+        match parse_watch_on_response(&r) {
+            WatchOnOutcome::Failed(msg) => assert_eq!(msg, "unknown method"),
+            other => panic!("expected Failed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn watch_on_malformed_envelope_returns_unexpected() {
+        let r = json!({"id": 1});
+        assert!(matches!(parse_watch_on_response(&r), WatchOnOutcome::Unexpected(_)));
+    }
+
+    #[test]
+    fn watch_on_success_with_enabled_false_returns_unexpected() {
+        let r = json!({"result": {"enabled": false}});
+        assert!(matches!(parse_watch_on_response(&r), WatchOnOutcome::Unexpected(_)));
+    }
+
+    // ── P2: roster patch for headless add with custom watcher name ────────
+
+    fn patch_roster_for_added_agent(
+        mut roster: Vec<AutoWatchAgent>,
+        agent_name: &str,
+        agent_type: &str,
+        cli: &str,
+        model: &str,
+    ) -> Vec<AutoWatchAgent> {
+        if let Some(existing) = roster.iter_mut().find(|a| a.name == agent_name) {
+            existing.agent_type = agent_type.to_string();
+        } else {
+            roster.push(AutoWatchAgent {
+                name: agent_name.to_string(),
+                agent_type: agent_type.to_string(),
+                cli: cli.to_string(),
+                model: model.to_string(),
+            });
+        }
+        roster
+    }
+
+    #[test]
+    fn roster_patch_adds_watcher_when_absent() {
+        let roster = vec![make_agent("executor", "executor")];
+        let patched = patch_roster_for_added_agent(roster, "drift", "watcher", "claude", "sonnet");
+        assert_eq!(patched.len(), 2);
+        let w = patched.iter().find(|a| a.name == "drift").unwrap();
+        assert_eq!(w.agent_type, "watcher");
+        let decision = auto_watch_decision(&patched, true);
+        assert_eq!(
+            decision,
+            AutoWatchDecision::Enable {
+                target: "executor".to_string(),
+                watcher_cli: "claude".to_string(),
+                watcher_model: "sonnet".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn roster_patch_overrides_fallback_name_as_watcher_type() {
+        // headless.list fallback sets agent_type=name="drift" → worker
+        let roster = vec![
+            make_agent("executor", "executor"),
+            make_agent("drift", "drift"),
+        ];
+        let patched = patch_roster_for_added_agent(roster, "drift", "watcher", "claude", "sonnet");
+        let drift = patched.iter().find(|a| a.name == "drift").unwrap();
+        assert_eq!(drift.agent_type, "watcher");
+        // Now decision should Enable (1 watcher + 1 worker)
+        let decision = auto_watch_decision(&patched, true);
+        assert_eq!(
+            decision,
+            AutoWatchDecision::Enable {
+                target: "executor".to_string(),
+                watcher_cli: "claude".to_string(),
+                watcher_model: "sonnet".to_string(),
+            }
         );
     }
 }
