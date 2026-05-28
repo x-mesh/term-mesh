@@ -35,17 +35,17 @@ pub async fn emit(
     let reply_text = format_reply_text(event);
 
     // 1. team.report (writes file + posts message)
-    rpc_call(
-        socket_path,
-        "team.report",
-        json!({
-            "team_name": team_name,
-            "agent_name": agent_name,
-            "content": reply_text,
-        }),
-    )
-    .await
-    .map_err(|e| format!("team.report failed: {e}"))?;
+    let mut report_params = json!({
+        "team_name": team_name,
+        "agent_name": agent_name,
+        "content": reply_text,
+    });
+    if let Some(rp) = normalize_full_report_path(&event.full_report) {
+        report_params["result_path"] = json!(rp);
+    }
+    rpc_call(socket_path, "team.report", report_params)
+        .await
+        .map_err(|e| format!("team.report failed: {e}"))?;
 
     // 2. team.task.list — find target task for this assignee
     let tasks_resp = rpc_call(
@@ -102,6 +102,9 @@ pub async fn emit(
         update_params["blocked_reason"] = json!(event.body.clone());
     } else if event.status == "NEEDS_REVIEW" && !event.body.is_empty() {
         update_params["review_summary"] = json!(event.body.clone());
+    }
+    if let Some(rp) = normalize_full_report_path(&event.full_report) {
+        update_params["result_path"] = json!(rp);
     }
     rpc_call(socket_path, "team.task.update", update_params)
         .await
@@ -174,6 +177,16 @@ async fn rpc_call(socket_path: &str, method: &str, params: Value) -> Result<Valu
             .to_string());
     }
     Ok(response.get("result").cloned().unwrap_or_else(|| json!({})))
+}
+
+/// Normalize FULL_REPORT field value: strip whitespace, return None for empty/"n/a".
+fn normalize_full_report_path(s: &str) -> Option<&str> {
+    let t = s.trim();
+    if t.is_empty() || t.eq_ignore_ascii_case("n/a") {
+        None
+    } else {
+        Some(t)
+    }
 }
 
 #[cfg(test)]

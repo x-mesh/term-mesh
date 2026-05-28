@@ -8,6 +8,13 @@ import Foundation
 enum AutoReplyEmit {
     private static let resultTruncChars = 1500
 
+    /// Normalize FULL_REPORT field: strip whitespace, treat "n/a" as nil.
+    private static func normalizedFullReportPath(_ raw: String?) -> String? {
+        guard let s = raw?.trimmingCharacters(in: .whitespacesAndNewlines), !s.isEmpty else { return nil }
+        if s.lowercased() == "n/a" { return nil }
+        return s
+    }
+
     /// Returns `true` when a task was matched and updated, `false` when the
     /// report file was written but no matching task existed (still useful).
     @discardableResult
@@ -18,9 +25,10 @@ enum AutoReplyEmit {
         store: TeamDataStore = .shared
     ) -> Bool {
         let replyText = formatReplyText(event)
+        let resultPath = normalizedFullReportPath(event.fullReport)
 
         // 1. team.report equivalent — write file + post message
-        _ = store.writeResult(teamName: teamName, agentName: agentName, content: replyText)
+        _ = store.writeResult(teamName: teamName, agentName: agentName, content: replyText, resultPath: resultPath)
         store.postMessage(teamName: teamName, from: agentName, content: replyText, type: "report")
 
         // 2. Find target task for this assignee (mirror Rust CLI auto-complete)
@@ -51,17 +59,40 @@ enum AutoReplyEmit {
         let blockedReason = (event.status == "BLOCKED" && !event.body.isEmpty) ? event.body : nil
         let reviewSummary = (event.status == "NEEDS_REVIEW" && !event.body.isEmpty) ? event.body : nil
 
-        _ = store.updateTask(
+        let prevStatus = task.status
+        guard let updated = store.updateTask(
             teamName: teamName,
             taskId: task.id,
             status: taskStatus,
             result: summary,
-            resultPath: nil,
+            resultPath: resultPath,
             assignee: nil,
             blockedReason: blockedReason,
             reviewSummary: reviewSummary,
             progressNote: nil
-        )
+        ) else {
+            return true
+        }
+
+        // 4. Mirror teamDataTaskUpdate hooks so tm-agent wait subscribers are
+        //    woken and auto-recycle counters increment — bypassed when calling
+        //    store.updateTask directly without going through the socket RPC path.
+        if taskStatus != prevStatus {
+            _ = TermMeshDaemon.shared.rpcCallRaw(method: "events.publish", params: [
+                "kind": "task_status",
+                "team": teamName,
+                "agent": updated.assignee ?? agentName,
+                "task_id": updated.id,
+                "status": taskStatus,
+                "prev_status": prevStatus
+            ] as [String: Any])
+            if taskStatus == "completed" {
+                let tn = teamName, an = updated.assignee ?? agentName
+                Task { @MainActor in
+                    TeamOrchestrator.shared.handleTaskCompletionForAutoRecycle(teamName: tn, agentName: an)
+                }
+            }
+        }
         return true
     }
 

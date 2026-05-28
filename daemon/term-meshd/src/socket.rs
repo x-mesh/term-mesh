@@ -1771,6 +1771,61 @@ async fn dispatch(req: &Request, ctx: &Context) -> Response {
             }
         }
 
+        // --- Event publication from Swift app (GUI team path) ---
+        // Swift teamDataTaskUpdate / teamDataReport call this best-effort after
+        // successful GUI-side mutations so that CLI `tm-agent wait` push subscribers
+        // receive real-time events instead of waiting for the polling fallback.
+        "events.publish" => {
+            #[derive(Deserialize)]
+            struct P {
+                kind: String,
+                #[serde(default)]
+                team: String,
+                #[serde(default)]
+                agent: String,
+                #[serde(default)]
+                task_id: String,
+                #[serde(default)]
+                status: String,
+                #[serde(default)]
+                prev_status: String,
+                #[serde(default)]
+                header: String,
+            }
+            match serde_json::from_value::<P>(req.params.clone()) {
+                Ok(p) => {
+                    let ts_ms = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_millis() as u64;
+                    let ev_res: Result<DaemonEvent, String> = match p.kind.as_str() {
+                        "task_status" => Ok(DaemonEvent::TaskStatus {
+                            team: p.team,
+                            agent: p.agent,
+                            task_id: p.task_id,
+                            status: p.status,
+                            prev_status: p.prev_status,
+                            ts_ms,
+                        }),
+                        "reply" => Ok(DaemonEvent::Reply {
+                            team: p.team,
+                            agent: p.agent,
+                            task_id: p.task_id,
+                            header: p.header,
+                            ts_ms,
+                        }),
+                        other => Err(format!("events.publish: unknown kind '{other}'")),
+                    };
+                    ev_res.map(|ev| {
+                        // Err means no subscribers — fine to ignore.
+                        let _ = ctx.event_tx.send(ev);
+                        serde_json::json!({"published": true})
+                    })
+                }
+                Err(e) => Err(format!("invalid params: {e}")),
+            }
+        }
+
         // --- Pending Input (PTY injection via Swift polling) ---
         "input.enqueue" => {
             #[derive(Deserialize)]

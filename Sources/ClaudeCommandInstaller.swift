@@ -190,12 +190,14 @@ enum ClaudeCommandInstaller {
         }
     }
 
-    /// 파일 첫 줄에 "<!-- term-mesh-managed:" prefix 마커 확인.
-    /// hasPrefix를 사용해 부정 주석(NOT term-mesh-managed 등)에 의한 오탐을 방지한다.
+    /// 파일 상단 5줄 이내에 "<!-- term-mesh-managed:" prefix 마커가 있는지 확인.
+    /// 첫 줄은 슬래시 커맨드 picker의 description으로 쓰이는 human-readable heading이
+    /// 차지하고, 마커는 line 2(또는 그 근처)로 옮긴다. hasPrefix를 사용해 부정 주석
+    /// (NOT term-mesh-managed 등)에 의한 오탐을 방지한다.
     private static func isManagedFile(at url: URL) -> Bool {
-        guard let firstLine = (try? String(contentsOf: url, encoding: .utf8))?
-            .components(separatedBy: .newlines).first else { return false }
-        return firstLine.hasPrefix("<!-- term-mesh-managed:")
+        guard let content = try? String(contentsOf: url, encoding: .utf8) else { return false }
+        let headLines = content.components(separatedBy: .newlines).prefix(5)
+        return headLines.contains { $0.hasPrefix("<!-- term-mesh-managed:") }
     }
 
     /// SKILL.md는 YAML frontmatter가 먼저 오므로, marker는 frontmatter 바로 다음 줄에 삽입된다.

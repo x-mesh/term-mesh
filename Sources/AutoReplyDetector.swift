@@ -1,16 +1,16 @@
 import Foundation
 
-// Swift port of `daemon/term-meshd/src/auto_reply.rs` (Phase B3).
+// Swift port of `daemon/term-meshd/src/auto_reply.rs` (Phase B1, Fix D).
 //
-// Spec is identical to the Rust detector: strict 5/5 line-start header in
-// fixed order (STATUS/FILES/VERIFY/NEXT/FULL_REPORT), ANSI-stripped lines,
-// debounce-based commit. See the Rust module for full design notes; this
-// file deliberately mirrors structure so fixture-driven regressions can
-// catch drift between the two implementations.
+// Sliding window approach: keeps the last 30 ANSI-stripped lines in a buffer.
+// On tick(), scans for STATUS (mandatory) + FILES/VERIFY/NEXT/FULL_REPORT
+// (optional, default "n/a"). Commits when:
+//   - all 5 present + idleDebounce elapsed, or
+//   - STATUS + ≥2 others + hardCap elapsed (partial commit), or
+//   - flush() called (agent removal) with STATUS + ≥1 other.
 //
-// Used by `AutoReplyPoller` to monitor GUI agent pane scrollback and emit
-// the equivalent of `tm-agent reply` when the agent printed the header
-// text in their response but skipped invoking the shell command.
+// Order of lines and interleaved noise no longer matter (Fix D replaces
+// strict state machine from Fix C).
 
 struct AutoReplyEvent: Equatable {
     let status: String
@@ -21,8 +21,6 @@ struct AutoReplyEvent: Equatable {
     let body: String
     let raw: String
 
-    /// Stable hash for caller-side dedup. Matches the Rust impl semantics
-    /// (FxHash differs but Swift only needs intra-process stability).
     func contentHash() -> UInt64 {
         var hasher = Hasher()
         hasher.combine(status)
@@ -41,179 +39,160 @@ struct AutoReplyDetectorConfig {
 }
 
 final class AutoReplyDetector {
-    private enum State {
-        case idle, sawStatus, sawFiles, sawVerify, sawNext, body
-    }
-
-    private enum HeaderKey {
-        case status, files, verify, next, fullReport
-    }
+    private static let bufferCap = 30
+    private static let headerPrefixes = ["STATUS:", "FILES:", "VERIFY:", "NEXT:", "FULL_REPORT:"]
 
     private let config: AutoReplyDetectorConfig
-    private var state: State = .idle
+    private var lineBuffer: [String] = []
     private var lineBuf: String = ""
-    private var headerStatus = ""
-    private var headerFiles = ""
-    private var headerVerify = ""
-    private var headerNext = ""
-    private var headerFullReport = ""
-    private var bodyLines: [String] = []
-    private var rawLines: [String] = []
-    private var headerStartedAt: Date?
-    private var lastBodyInputAt: Date?
+    private var statusSeenAt: Date?
+    private var lastInputAt: Date?
+    private var committed = false
 
     init(config: AutoReplyDetectorConfig = .init()) {
         self.config = config
     }
 
-    /// Feed raw bytes from the agent's terminal output. Returns an event when
-    /// a body-phase new STATUS line forces commit of the previous capture.
-    /// Time-based commits arrive via `tick(at:)`.
+    /// Feed raw bytes. Returns nil always; commits via tick(at:) or flush().
     @discardableResult
     func pushBytes(_ bytes: Data, at now: Date) -> AutoReplyEvent? {
         guard let text = String(data: bytes, encoding: .utf8) else { return nil }
-        var emitted: AutoReplyEvent?
         for ch in text {
             if ch == "\n" {
                 let line = lineBuf
                 lineBuf.removeAll(keepingCapacity: true)
-                if let ev = processLine(line, at: now) {
-                    emitted = ev
-                }
+                pushLine(line, at: now)
             } else if ch != "\r" {
                 lineBuf.append(ch)
             }
         }
-        return emitted
+        return nil
     }
 
-    /// Time-based commit check. Call periodically.
+    private func pushLine(_ rawLine: String, at now: Date) {
+        let line = Self.stripAnsi(rawLine).trimmingCharactersAtEnd(in: .whitespaces)
+        if lineBuffer.count >= Self.bufferCap {
+            lineBuffer.removeFirst()
+        }
+        lineBuffer.append(line)
+        lastInputAt = now
+        if line.hasPrefix("STATUS:") {
+            statusSeenAt = now
+            committed = false
+        }
+    }
+
     func tick(at now: Date) -> AutoReplyEvent? {
-        guard state == .body else { return nil }
-        let last = lastBodyInputAt ?? now
-        let started = headerStartedAt ?? now
-        let idleElapsed = now.timeIntervalSince(last)
-        let totalElapsed = now.timeIntervalSince(started)
-        if idleElapsed >= config.idleDebounce || totalElapsed >= config.hardCap {
-            return commit()
+        if committed { return nil }
+        guard let anchor = statusBlockStart() else { statusSeenAt = nil; return nil }
+        guard let status = scanField("STATUS", from: anchor) else { statusSeenAt = nil; return nil }
+        guard let statusAt = statusSeenAt else { return nil }
+
+        let files = scanField("FILES", from: anchor)
+        let verify = scanField("VERIFY", from: anchor)
+        let next = scanField("NEXT", from: anchor)
+        let fullReport = scanField("FULL_REPORT", from: anchor)
+        let others = [files, verify, next, fullReport].filter { $0 != nil }.count
+
+        let last = lastInputAt ?? now
+        let idle = now.timeIntervalSince(last)
+        let cap = now.timeIntervalSince(statusAt)
+
+        let allPresent = others == 4
+        if (allPresent && idle >= config.idleDebounce) || (others >= 2 && cap >= config.hardCap) {
+            return emit(
+                status: status,
+                files: files ?? "n/a",
+                verify: verify ?? "n/a",
+                next: next ?? "n/a",
+                fullReport: fullReport ?? "n/a"
+            )
         }
         return nil
     }
 
-    /// Force commit any pending body (e.g., on agent removal).
     func flush() -> AutoReplyEvent? {
-        guard state == .body else { return nil }
-        return commit()
-    }
-
-    private func processLine(_ rawLine: String, at now: Date) -> AutoReplyEvent? {
-        let stripped = Self.stripAnsi(rawLine)
-        let line = stripped.trimmingCharactersAtEnd(in: .whitespaces)
-        let header = Self.parseHeaderLine(line)
-
-        switch (state, header) {
-        case (.idle, .some((.status, let val))):
-            resetCapture()
-            headerStatus = val
-            rawLines.append(line)
-            state = .sawStatus
-            headerStartedAt = now
-            return nil
-        case (.sawStatus, .some((.files, let val))):
-            headerFiles = val
-            rawLines.append(line)
-            state = .sawFiles
-            return nil
-        case (.sawFiles, .some((.verify, let val))):
-            headerVerify = val
-            rawLines.append(line)
-            state = .sawVerify
-            return nil
-        case (.sawVerify, .some((.next, let val))):
-            headerNext = val
-            rawLines.append(line)
-            state = .sawNext
-            return nil
-        case (.sawNext, .some((.fullReport, let val))):
-            headerFullReport = val
-            rawLines.append(line)
-            state = .body
-            lastBodyInputAt = now
-            return nil
-        case (.body, .some((.status, let val))):
-            // New reply began before debounce fired — commit previous, start fresh
-            let prev = commit()
-            headerStatus = val
-            rawLines.append(line)
-            state = .sawStatus
-            headerStartedAt = now
-            return prev
-        case (.body, _):
-            if !(bodyLines.isEmpty && line.isEmpty) {
-                bodyLines.append(line)
-            }
-            rawLines.append(line)
-            lastBodyInputAt = now
-            return nil
-        default:
-            // Out-of-order header or non-header in header phase: strict 5/5 reset
-            resetCapture()
-            return nil
-        }
-    }
-
-    private func commit() -> AutoReplyEvent? {
-        guard state == .body else { return nil }
-        while bodyLines.last?.isEmpty == true {
-            bodyLines.removeLast()
-        }
-        let event = AutoReplyEvent(
-            status: headerStatus,
-            files: headerFiles,
-            verify: headerVerify,
-            next: headerNext,
-            fullReport: headerFullReport,
-            body: bodyLines.joined(separator: "\n"),
-            raw: rawLines.joined(separator: "\n")
+        if committed { return nil }
+        guard let anchor = statusBlockStart() else { return nil }
+        guard let status = scanField("STATUS", from: anchor) else { return nil }
+        let files = scanField("FILES", from: anchor)
+        let verify = scanField("VERIFY", from: anchor)
+        let next = scanField("NEXT", from: anchor)
+        let fullReport = scanField("FULL_REPORT", from: anchor)
+        let others = [files, verify, next, fullReport].filter { $0 != nil }.count
+        if others == 0 { return nil }
+        return emit(
+            status: status,
+            files: files ?? "n/a",
+            verify: verify ?? "n/a",
+            next: next ?? "n/a",
+            fullReport: fullReport ?? "n/a"
         )
-        resetCapture()
-        return event
     }
 
-    private func resetCapture() {
-        headerStatus = ""
-        headerFiles = ""
-        headerVerify = ""
-        headerNext = ""
-        headerFullReport = ""
-        bodyLines.removeAll(keepingCapacity: true)
-        rawLines.removeAll(keepingCapacity: true)
-        headerStartedAt = nil
-        lastBodyInputAt = nil
-        state = .idle
-    }
-
-    // MARK: - Static helpers
-
-    private static func parseHeaderLine(_ line: String) -> (HeaderKey, String)? {
-        guard let colonRange = line.range(of: ":") else { return nil }
-        let key = String(line[..<colonRange.lowerBound])
-        let rest = String(line[colonRange.upperBound...])
-        let headerKey: HeaderKey
-        switch key {
-        case "STATUS": headerKey = .status
-        case "FILES": headerKey = .files
-        case "VERIFY": headerKey = .verify
-        case "NEXT": headerKey = .next
-        case "FULL_REPORT": headerKey = .fullReport
-        default: return nil
+    private func emit(status: String, files: String, verify: String, next: String, fullReport: String) -> AutoReplyEvent? {
+        // Body starts after the LAST header line so noise between headers is excluded.
+        let lastHeaderIdx = lineBuffer.indices.last { i in
+            Self.headerPrefixes.contains { lineBuffer[i].hasPrefix($0) }
         }
-        let value = rest.hasPrefix(" ") ? String(rest.dropFirst()) : rest
-        return (headerKey, value)
+        let statusIdx = lineBuffer.indices.last { lineBuffer[$0].hasPrefix("STATUS:") } ?? 0
+
+        let bodySlice: [String]
+        if let lh = lastHeaderIdx {
+            bodySlice = Array(lineBuffer.dropFirst(lh + 1))
+        } else {
+            bodySlice = []
+        }
+
+        let bodyStart = bodySlice.firstIndex(where: { !$0.isEmpty }) ?? 0
+        let bodyEnd = bodySlice.indices.last(where: { !bodySlice[$0].isEmpty }).map { $0 + 1 } ?? 0
+        let body = bodyStart < bodyEnd ? bodySlice[bodyStart..<bodyEnd].joined(separator: "\n") : ""
+
+        let raw = lineBuffer.dropFirst(statusIdx).joined(separator: "\n")
+
+        committed = true
+        lineBuffer.removeAll(keepingCapacity: true)
+        statusSeenAt = nil
+        lastInputAt = nil
+
+        return AutoReplyEvent(status: status, files: files, verify: verify, next: next,
+                              fullReport: fullReport, body: body, raw: raw)
     }
 
-    /// Strip ANSI CSI (`ESC [ ... letter`) and OSC (`ESC ] ... BEL | ESC \`) sequences.
-    /// UTF-8 safe (operates on Characters). Lone ESCs are dropped.
+    /// Returns the buffer index from which field scans should start.
+    ///
+    /// When multiple STATUS headers exist in the window, anchors to the latest
+    /// STATUS position so stale fields from a prior block are not picked up.
+    /// When only one STATUS exists, returns 0 to preserve out-of-order scanning.
+    private func statusBlockStart() -> Int? {
+        var latest: Int? = nil
+        var prev: Int? = nil
+        for (i, line) in lineBuffer.enumerated() {
+            if line.hasPrefix("STATUS:") {
+                prev = latest
+                latest = i
+            }
+        }
+        guard latest != nil else { return nil }
+        return prev != nil ? latest : 0
+    }
+
+    private func scanField(_ name: String, from fromIdx: Int = 0) -> String? {
+        let prefix = "\(name):"
+        guard !lineBuffer.isEmpty else { return nil }
+        let maxIdx = lineBuffer.count - 1
+        guard fromIdx <= maxIdx else { return nil }
+        for i in stride(from: maxIdx, through: fromIdx, by: -1) {
+            let line = lineBuffer[i]
+            if line.hasPrefix(prefix) {
+                let rest = String(line.dropFirst(prefix.count))
+                let val = rest.hasPrefix(" ") ? String(rest.dropFirst()) : rest
+                if !val.isEmpty { return val }
+            }
+        }
+        return nil
+    }
+
     static func stripAnsi(_ s: String) -> String {
         var out = ""
         out.reserveCapacity(s.count)
@@ -229,7 +208,6 @@ final class AutoReplyDetector {
             if c == "\u{001b}" {
                 guard let peek = iter.next() else { continue }
                 if peek == "[" {
-                    // CSI: read until 0x40..0x7e
                     while let cc = iter.next() {
                         if let scalar = cc.unicodeScalars.first {
                             let v = scalar.value
@@ -237,18 +215,14 @@ final class AutoReplyDetector {
                         }
                     }
                 } else if peek == "]" {
-                    // OSC: read until BEL or ESC \\
                     while let cc = iter.next() {
                         if cc == "\u{0007}" { break }
                         if cc == "\u{001b}" {
-                            if let nn = iter.next() {
-                                pending = nn == "\\" ? nil : nn
-                            }
+                            if let nn = iter.next() { pending = nn == "\\" ? nil : nn }
                             break
                         }
                     }
                 } else {
-                    // Lone ESC — keep peek as next
                     pending = peek
                 }
                 continue
@@ -260,15 +234,12 @@ final class AutoReplyDetector {
 }
 
 private extension String {
-    /// Trim trailing characters in a given set. (Foundation's
-    /// `trimmingCharacters(in:)` trims both ends; we want trailing only.)
     func trimmingCharactersAtEnd(in set: CharacterSet) -> String {
         var end = endIndex
         while end > startIndex {
             let prev = index(before: end)
             let scalars = self[prev].unicodeScalars
-            let isInSet = scalars.allSatisfy { set.contains($0) }
-            if !isInSet { break }
+            if !scalars.allSatisfy({ set.contains($0) }) { break }
             end = prev
         }
         return String(self[startIndex..<end])
