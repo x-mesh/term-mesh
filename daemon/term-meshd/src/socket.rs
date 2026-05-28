@@ -270,6 +270,16 @@ pub async fn serve(
                 tracing::info!("socket server shutting down");
                 break;
             }
+            // Drain completed connection task entries immediately so JoinSet
+            // does not retain finished handles until daemon shutdown.
+            // join_next() only fires when a task is already done — no busy loop.
+            Some(result) = connection_tasks.join_next() => {
+                if let Err(e) = result {
+                    if !e.is_cancelled() {
+                        tracing::warn!("connection task panicked: {e}");
+                    }
+                }
+            }
         }
     }
     heartbeat_task.abort();
@@ -356,7 +366,7 @@ async fn handle_connection(
         // Streaming handlers hold the writer for their lifetime and must
         // exit handle_connection entirely — they cannot share the loop.
         if req.method == "events.subscribe" {
-            return stream_subscribe_events(req, writer, ctx, shutdown_rx).await;
+            return stream_subscribe_events(req, writer, lines, ctx, shutdown_rx).await;
         }
 
         let resp = dispatch(&req, ctx).await;
@@ -380,6 +390,7 @@ async fn handle_connection(
 async fn stream_subscribe_events(
     req: Request,
     mut writer: tokio::net::unix::OwnedWriteHalf,
+    mut lines: tokio::io::Lines<BufReader<tokio::net::unix::OwnedReadHalf>>,
     ctx: &Context,
     mut shutdown_rx: watch::Receiver<bool>,
 ) -> anyhow::Result<()> {
@@ -469,6 +480,13 @@ async fn stream_subscribe_events(
                         Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                     }
                 }
+                read_result = lines.next_line() => {
+                    match read_result {
+                        Ok(None) => break,   // client disconnected (EOF)
+                        Err(_) => break,     // read error → treat as disconnect
+                        Ok(Some(_)) => None, // ignore unexpected input from client
+                    }
+                }
             }
         } else {
             tokio::select! {
@@ -489,6 +507,13 @@ async fn stream_subscribe_events(
                             None
                         }
                         Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                    }
+                }
+                read_result = lines.next_line() => {
+                    match read_result {
+                        Ok(None) => break,   // client disconnected (EOF)
+                        Err(_) => break,     // read error → treat as disconnect
+                        Ok(Some(_)) => None, // ignore unexpected input from client
                     }
                 }
             }
@@ -1775,7 +1800,7 @@ async fn dispatch(req: &Request, ctx: &Context) -> Response {
             }
             match serde_json::from_value::<P>(req.params.clone()) {
                 Ok(p) => {
-                    let mgr = ctx.headless.lock().await;
+                    let mut mgr = ctx.headless.lock().await;
                     mgr.read_output(&p.agent_id, p.lines)
                         .await
                         .map(|lines| serde_json::json!({ "lines": lines, "count": lines.len() }))
@@ -1805,7 +1830,7 @@ async fn dispatch(req: &Request, ctx: &Context) -> Response {
             }
             match serde_json::from_value::<P>(req.params.clone()) {
                 Ok(p) => {
-                    let mgr = ctx.headless.lock().await;
+                    let mut mgr = ctx.headless.lock().await;
                     mgr.status(&p.agent_id)
                         .await
                         .map(|info| serde_json::to_value(info).unwrap())
@@ -1821,7 +1846,7 @@ async fn dispatch(req: &Request, ctx: &Context) -> Response {
             }
             let params: P =
                 serde_json::from_value(req.params.clone()).unwrap_or(P { team_name: None });
-            let mgr = ctx.headless.lock().await;
+            let mut mgr = ctx.headless.lock().await;
             let agents = mgr.list(params.team_name.as_deref()).await;
             Ok(serde_json::to_value(agents).unwrap())
         }
