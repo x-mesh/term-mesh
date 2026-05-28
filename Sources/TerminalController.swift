@@ -15,7 +15,7 @@ class TerminalController {
     /// Set after daemon spawn or orphan reuse so isDescendant() grants access.
     nonisolated(unsafe) var trustedDaemonPid: pid_t = 0
 
-    nonisolated(unsafe) var socketPath = "/tmp/term-mesh.sock"
+    nonisolated(unsafe) var socketPath = SocketControlSettings.socketPath()
     nonisolated(unsafe) var serverSocket: Int32 = -1
     nonisolated(unsafe) var isRunning = false
     nonisolated(unsafe) var acceptLoopAlive = false
