@@ -762,15 +762,18 @@ final class TeamDataStore: ObservableObject, @unchecked Sendable {
         "/tmp/term-mesh-team-\(teamName)"
     }
 
-    func writeResult(teamName: String, agentName: String, content: String) -> Bool {
+    func writeResult(teamName: String, agentName: String, content: String, resultPath: String? = nil) -> Bool {
         let dir = Self.resultDirectory(teamName: teamName)
         try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
         let path = (dir as NSString).appendingPathComponent("\(agentName).result.json")
-        let payload: [String: Any] = [
+        var payload: [String: Any] = [
             "agent": agentName,
             "content": content,
             "timestamp": ISO8601DateFormatter().string(from: Date()),
         ]
+        if let rp = resultPath, !rp.isEmpty {
+            payload["result_path"] = rp
+        }
         guard let data = try? JSONSerialization.data(withJSONObject: payload, options: [.prettyPrinted]) else {
             return false
         }

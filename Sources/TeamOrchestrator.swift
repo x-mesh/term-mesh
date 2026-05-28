@@ -3303,9 +3303,15 @@ final class TeamOrchestrator: ObservableObject {
     /// Recycle an agent pane: guard on active task status, then hard-restart.
     /// Mirrors `run_recycle` in the CLI (commit 3cabe882).
     func recycleAgent(teamName: String, agentName: String, force: Bool) {
+        #if DEBUG
+        dlog("autoRecycle.recycle teamName=\(teamName) agentName=\(agentName) force=\(force)")
+        #endif
         let safeStatuses: Set<String> = ["blocked", "review_ready", "completed", "abandoned", "failed"]
         if !force, let task = activeTask(for: teamName, agentName: agentName),
            !safeStatuses.contains(task.status) {
+            #if DEBUG
+            dlog("autoRecycle.skip reason=active_task_unsafe teamName=\(teamName) agentName=\(agentName) taskId=\(task.id) status=\(task.status)")
+            #endif
             let alert = NSAlert()
             alert.messageText = "Cannot recycle \(agentName)"
             alert.informativeText = "Active task \(task.id) is \(task.status). Use Force to bypass."
@@ -3316,34 +3322,66 @@ final class TeamOrchestrator: ObservableObject {
             Logger.team.warning("recycle --force on \(agentName, privacy: .public): discarding pane transcript")
         }
         Task { @MainActor in
-            _ = await self.restartAgentPaneHard(teamName: teamName, agentName: agentName)
+            let result = await self.restartAgentPaneHard(teamName: teamName, agentName: agentName)
+            #if DEBUG
+            switch result {
+            case .success(let pids):
+                dlog("autoRecycle.restart teamName=\(teamName) agentName=\(agentName) oldPanel=\(pids.old.uuidString.prefix(8)) newPanel=\(pids.new.uuidString.prefix(8))")
+            case .failure(let err):
+                dlog("autoRecycle.restart.failed teamName=\(teamName) agentName=\(agentName) err=\(err)")
+            }
+            #endif
         }
     }
 
     func setTeamDefaultAutoRecycle(teamName: String, every: Int) {
-        teams[teamName]?.defaultAutoRecycleEvery = every
+        guard var team = teams[teamName] else { return }
+        team.defaultAutoRecycleEvery = every
+        teams[teamName] = team
+        #if DEBUG
+        dlog("autoRecycle.setDefault teamName=\(teamName) every=\(every)")
+        #endif
     }
 
     func setAgentAutoRecycle(teamName: String, agentId: String, every: Int) {
-        guard let idx = teams[teamName]?.agents.firstIndex(where: { $0.id == agentId }) else { return }
-        teams[teamName]?.agents[idx].autoRecycleEvery = every
+        guard var team = teams[teamName],
+              let idx = team.agents.firstIndex(where: { $0.id == agentId }) else { return }
+        team.agents[idx].autoRecycleEvery = every
+        teams[teamName] = team
     }
 
     func setAgentAutoRecycleByName(teamName: String, agentName: String, every: Int) {
-        guard let idx = teams[teamName]?.agents.firstIndex(where: { $0.name == agentName }) else { return }
-        teams[teamName]?.agents[idx].autoRecycleEvery = every
+        guard var team = teams[teamName],
+              let idx = team.agents.firstIndex(where: { $0.name == agentName }) else { return }
+        team.agents[idx].autoRecycleEvery = every
+        teams[teamName] = team
     }
 
     /// Called when an agent's task transitions to "completed". Increments the
     /// agent's completedTaskCount and triggers a guard recycle when the count
     /// reaches the effective threshold (agent override → team default → nil = off).
     func handleTaskCompletionForAutoRecycle(teamName: String, agentName: String) {
-        guard let agentIdx = teams[teamName]?.agents.firstIndex(where: { $0.name == agentName }) else { return }
-        teams[teamName]?.agents[agentIdx].completedTaskCount += 1
-        let count = teams[teamName]?.agents[agentIdx].completedTaskCount ?? 0
-        let agentThreshold = teams[teamName]?.agents[agentIdx].autoRecycleEvery
-        let teamThreshold = teams[teamName]?.defaultAutoRecycleEvery
-        guard let threshold = agentThreshold ?? teamThreshold, threshold > 0, count % threshold == 0 else { return }
+        guard var team = teams[teamName],
+              let agentIdx = team.agents.firstIndex(where: { $0.name == agentName }) else {
+            #if DEBUG
+            dlog("autoRecycle.handleCompletion teamName=\(teamName) agentName=\(agentName) skip=team_or_agent_not_found")
+            #endif
+            return
+        }
+        team.agents[agentIdx].completedTaskCount += 1
+        let count = team.agents[agentIdx].completedTaskCount
+        let agentThreshold = team.agents[agentIdx].autoRecycleEvery
+        let teamThreshold = team.defaultAutoRecycleEvery
+        teams[teamName] = team
+        #if DEBUG
+        dlog("autoRecycle.handleCompletion teamName=\(teamName) agentName=\(agentName) count=\(count) agentThreshold=\(agentThreshold.map(String.init) ?? "nil") teamThreshold=\(teamThreshold.map(String.init) ?? "nil")")
+        #endif
+        guard let threshold = agentThreshold ?? teamThreshold, threshold > 0, count % threshold == 0 else {
+            #if DEBUG
+            dlog("autoRecycle.skip reason=threshold_not_met teamName=\(teamName) agentName=\(agentName) count=\(count) threshold=\(agentThreshold ?? teamThreshold ?? 0)")
+            #endif
+            return
+        }
         recycleAgent(teamName: teamName, agentName: agentName, force: false)
     }
 
@@ -4470,16 +4508,19 @@ final class TeamOrchestrator: ObservableObject {
     // MARK: - B: File-Based Results
 
     /// Write an agent's result to the file-based result directory.
-    func writeResult(teamName: String, agentName: String, content: String) -> Bool {
+    func writeResult(teamName: String, agentName: String, content: String, resultPath: String? = nil) -> Bool {
         let dir = Self.resultDirectory(teamName: teamName)
         try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
         let path = (dir as NSString).appendingPathComponent("\(agentName).result.json")
-        let payload: [String: Any] = [
+        var payload: [String: Any] = [
             "agent": agentName,
             "team": teamName,
             "content": content,
             "timestamp": ISO8601DateFormatter().string(from: Date())
         ]
+        if let rp = resultPath, !rp.isEmpty {
+            payload["result_path"] = rp
+        }
         guard let data = try? JSONSerialization.data(withJSONObject: payload, options: [.prettyPrinted]) else { return false }
         return FileManager.default.createFile(atPath: path, contents: data)
     }
