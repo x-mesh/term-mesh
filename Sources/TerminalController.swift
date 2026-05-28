@@ -15,7 +15,7 @@ class TerminalController {
     /// Set after daemon spawn or orphan reuse so isDescendant() grants access.
     nonisolated(unsafe) var trustedDaemonPid: pid_t = 0
 
-    nonisolated(unsafe) var socketPath = "/tmp/term-mesh.sock"
+    nonisolated(unsafe) var socketPath = SocketControlSettings.socketPath()
     nonisolated(unsafe) var serverSocket: Int32 = -1
     nonisolated(unsafe) var isRunning = false
     nonisolated(unsafe) var acceptLoopAlive = false
@@ -3547,8 +3547,20 @@ class TerminalController {
         guard let content = params["content"] as? String else {
             return v2Error(id: id, code: "invalid_params", message: "Missing content")
         }
-        let wrote = store.writeResult(teamName: teamName, agentName: agentName, content: content)
+        let resultPath = params["result_path"] as? String
+        let wrote = store.writeResult(teamName: teamName, agentName: agentName, content: content, resultPath: resultPath)
         store.postMessage(teamName: teamName, from: agentName, content: content, type: "report")
+
+        // Publish reply event best-effort so tm-agent wait push subscribers are woken.
+        let headerPreview = String(content.prefix(200))
+        _ = TermMeshDaemon.shared.rpcCallRaw(method: "events.publish", params: [
+            "kind": "reply",
+            "team": teamName,
+            "agent": agentName,
+            "task_id": "",
+            "header": headerPreview
+        ])
+
         return v2Ok(id: id, result: ["reported": wrote, "team_name": teamName, "agent_name": agentName])
     }
 
@@ -3724,11 +3736,13 @@ class TerminalController {
         }
         let status = params["status"] as? String
         let taskResult = params["result"] as? String
+        let resultPath = params["result_path"] as? String
         let assignee = params["assignee"] as? String
         let blockedReason = params["blocked_reason"] as? String
         let reviewSummary = params["review_summary"] as? String
         let progressNote = params["progress_note"] as? String
 
+        // Snapshot prev status before update so events.publish can include it.
         let prevStatus = store.getTask(teamName: teamName, taskId: taskId)?.status ?? ""
 
         if let task = store.updateTask(
@@ -3736,6 +3750,7 @@ class TerminalController {
             taskId: taskId,
             status: status,
             result: taskResult,
+            resultPath: resultPath,
             assignee: assignee,
             blockedReason: blockedReason,
             reviewSummary: reviewSummary,
@@ -4279,10 +4294,11 @@ class TerminalController {
         guard let content = params["content"] as? String else {
             return .err(code: "invalid_params", message: "Missing content", data: nil)
         }
+        let resultPath = params["result_path"] as? String
 
         var result: V2CallResult = .err(code: "internal_error", message: "Failed to report", data: nil)
         v2MainSync {
-            let wrote = TeamOrchestrator.shared.writeResult(teamName: teamName, agentName: agentName, content: content)
+            let wrote = TeamOrchestrator.shared.writeResult(teamName: teamName, agentName: agentName, content: content, resultPath: resultPath)
             // Also post to message queue for real-time access
             TeamOrchestrator.shared.postMessage(teamName: teamName, from: agentName, content: content, type: "report")
             result = .ok(["reported": wrote, "team_name": teamName, "agent_name": agentName])

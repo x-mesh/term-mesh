@@ -7,7 +7,10 @@
 #
 # Requires these build-phase env vars: SRCROOT, TARGET_BUILD_DIR, UNLOCALIZED_RESOURCES_FOLDER_PATH.
 #
-# This script prepends a "<!-- term-mesh-managed: ... -->" marker to each file.
+# This script inserts a "<!-- term-mesh-managed: ... -->" marker on line 2 of each
+# command file (line 1 stays as the source file's heading so Claude Code's slash
+# command picker shows the human-readable description). For SKILL.md files the
+# marker goes right after the YAML frontmatter (line 2 of the body).
 # ClaudeCommandInstaller.swift checks this marker at runtime:
 # - Files WITH the marker in ~/.claude/{commands,skills}/ are overwritten on app update.
 # - Files WITHOUT the marker are treated as user-customized and preserved.
@@ -40,9 +43,14 @@ mkdir -p "$DEST_CMDS"
 
 for f in "${COMMANDS[@]}"; do
     if [ -f "$SRC_CMDS/$f" ]; then
+        # Emit the source file's first line FIRST so Claude Code reads the
+        # human-readable heading (e.g. "# /watch — Stateless Drift Oversight")
+        # as the slash-command description. Drop the managed marker on line 2
+        # so ClaudeCommandInstaller can still detect this file as term-mesh-owned.
         {
+            head -n 1 "$SRC_CMDS/$f"
             echo "<!-- term-mesh-managed: do not remove this line -->"
-            cat "$SRC_CMDS/$f"
+            tail -n +2 "$SRC_CMDS/$f"
         } > "$DEST_CMDS/$f"
         echo "Copied command $f to bundle"
     else

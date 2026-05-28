@@ -475,8 +475,20 @@ final class BrewSelfUpdater {
                 UpdateLogStore.shared.append("brew self-update: outdated installed=\(info.installed) latest=\(info.latest)")
                 triggerFetchIfNeeded(info: info)
             } else {
-                viewModel.update(state: .upToDate)
-                UpdateLogStore.shared.append("brew self-update: up-to-date")
+                // brew는 disk plist 기준으로 판단하므로, 외부에서 cask가
+                // 업그레이드된 뒤에는 disk=tap 일치라 "up-to-date"가 떨어진다.
+                // 이때 실행 중 프로세스(Bundle.main 캐시)가 구 버전이면
+                // 영원히 펄이 안 뜬다. 주기 폴마다 stale 재검사로 보완.
+                if let stale = Self.detectStaleRunningBinary() {
+                    viewModel.update(state: .readyToInstall(installed: stale.running, latest: stale.disk))
+                    UpdateLogStore.shared.append(
+                        "brew self-update: stale running binary on periodic check running=\(stale.running) disk=\(stale.disk) — pill shown"
+                    )
+                    prefetchReleaseNotes(for: stale.disk)
+                } else {
+                    viewModel.update(state: .upToDate)
+                    UpdateLogStore.shared.append("brew self-update: up-to-date")
+                }
             }
         case .failure(let err):
             // Don't clobber readyToInstall on a transient outdated-check failure.

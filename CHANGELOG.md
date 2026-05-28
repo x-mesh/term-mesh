@@ -2,6 +2,11 @@
 
 All notable changes to term-mesh are documented here.
 
+## [Unreleased]
+
+### Fixed
+- Slash command descriptions in Claude Code now show the human-readable heading (e.g. `/watch — Stateless Drift Oversight`) instead of the internal `<!-- term-mesh-managed: ... -->` marker comment. The managed marker is now inserted on line 2 of bundled command files so the picker reads line 1 as the description.
+
 ## [0.132.0] - 2026-05-27
 
 ### Fixed

@@ -6727,12 +6727,9 @@ fn run_add_gui(
                     .unwrap_or(team_name),
             );
         }
-        // P3: auto-watch only fires when a watcher agent is added
-        let added_watcher = agent_type == "watcher" || agent_name.starts_with("watcher");
-        if added_watcher {
-            let wd = env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
-            maybe_auto_watch_after_team_change(sock, team_name, no_auto_watch, &wd);
-        }
+        // Fire unconditionally — helper checks (watcher==1 + worker>=1) internally.
+        let wd = env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+        maybe_auto_watch_after_team_change(sock, team_name, no_auto_watch, &wd);
     } else {
         let code = resp["error"]["code"].as_str().unwrap_or("unknown");
         let msg = resp["error"]["message"]
@@ -7277,15 +7274,12 @@ fn run_add_headless(
 
             eprintln!("\nAgent '{agent_name}' added to team '{team}'.");
 
-            // P3: auto-watch only fires when a watcher agent is added
-            let added_watcher = agent_type == "watcher" || agent_name.starts_with("watcher");
-            if added_watcher {
-                let wd = env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
-                maybe_auto_watch_after_headless_add(
-                    daemon_sock, team, no_auto_watch, &wd,
-                    agent_name, agent_type, cli, model,
-                );
-            }
+            // Fire unconditionally — helper checks (watcher==1 + worker>=1) internally.
+            let wd = env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+            maybe_auto_watch_after_headless_add(
+                daemon_sock, team, no_auto_watch, &wd,
+                agent_name, agent_type, cli, model,
+            );
         }
         Err(e) => {
             eprintln!("Error: {e}");
@@ -7352,15 +7346,15 @@ fn run_delegate_result(
                         };
                         if !headless_ok {
                             eprintln!("  Warning: headless.send failed for {target}");
-                            if let Some(task_id) = v["result"]["task"]["id"].as_str() {
-                                let reason = format!("headless paste delivery failed: headless.send RPC returned null (agent={target})");
-                                let _ = rpc_call(sock, "team.task.update", json!({
-                                    "team_name": team,
-                                    "task_id": task_id,
-                                    "status": "blocked",
-                                    "blocked_reason": reason,
-                                }));
-                            }
+                            let task_id = v["result"]["task"]["id"].as_str().unwrap_or("?").to_string();
+                            let reason = format!("headless paste delivery failed: headless.send RPC returned null (agent={target})");
+                            let _ = rpc_call(sock, "team.task.update", json!({
+                                "team_name": team,
+                                "task_id": &task_id,
+                                "status": "blocked",
+                                "blocked_reason": &reason,
+                            }));
+                            return Err(format!("delivery failed; task blocked: {reason} (task_id={task_id})"));
                         }
                         return Ok(v);
                     }
@@ -7409,6 +7403,14 @@ fn run_delegate_result(
                         }
                     }
                 }
+            }
+
+            // If text still not delivered after all retries, return failure so callers
+            // get a nonzero exit code (task was already blocked above).
+            if !text_delivered {
+                let task_id = v["result"]["task"]["id"].as_str().unwrap_or("?").to_string();
+                let reason = format!("paste delivery failed: surface-nil 4-retry + team.send fallback exhausted (agent={target})");
+                return Err(format!("delivery failed; task blocked: {reason} (task_id={task_id})"));
             }
 
             // Send Return key separately via team.send_key RPC.
@@ -7499,8 +7501,9 @@ fn run_delegate_result(
                     "team_name": team,
                     "task_id": task_id,
                     "status": "blocked",
-                    "blocked_reason": reason,
+                    "blocked_reason": &reason,
                 }));
+                return Err(format!("delivery failed; task blocked: {reason} (task_id={task_id})"));
             }
             return Ok(json!({ "task": task, "send": { "ok": sent_ok } }));
         }

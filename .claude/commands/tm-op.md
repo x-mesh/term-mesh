@@ -172,7 +172,19 @@ Error: specific error message
 - refine/tournament에서 투표 라운드 결과가 빈 경우 → 이전 라운드 결과로 best-effort 채택
 
 에이전트에게 보내는 **모든** 메시지 끝에 다음을 추가:
-`[IMPORTANT] When done, run: tm-agent reply '<your result>' to report.`
+
+```
+[IMPORTANT] When done, run:
+tm-agent reply 'STATUS: DONE|BLOCKED|NEEDS_REVIEW
+FILES: <changed paths, space-separated, or none>
+VERIFY: <single shell command to verify result, or n/a>
+NEXT: <one-line action for leader, or NONE>
+FULL_REPORT: <path to full result file, or n/a>
+
+<concise summary body here>'
+```
+
+STATUS는 반드시 `DONE`, `BLOCKED`, `NEEDS_REVIEW` 중 하나. C1 strict enforce로 free-form reply는 exit 2 처리됨.
 
 ## Result Collection
 
@@ -260,7 +272,7 @@ tm-op — 전략 오케스트레이션 커맨드
 > 🔄 [refine] Round 1/{max_rounds}: Diverge — 전원 독립 해결책 생성
 
 ```bash
-tm-agent fan-out '<TASK>. 이 태스크에 대해 독립적으로 해결책을 제시하라. 400단어 이내. 다른 에이전트의 답변을 고려하지 말고 자기만의 접근법을 제안해라. [IMPORTANT] When done, run: tm-agent reply "<your solution>" to report.'
+tm-agent fan-out '<TASK>. 이 태스크에 대해 독립적으로 해결책을 제시하라. 400단어 이내. 다른 에이전트의 답변을 고려하지 말고 자기만의 접근법을 제안해라. [IMPORTANT] When done, run tm-agent reply with the 5-field header (STATUS/FILES/VERIFY/NEXT/FULL_REPORT) followed by your solution.'
 ```
 
 태스크 텍스트는 사용자가 입력한 원본 그대로 전달한다.
@@ -296,7 +308,7 @@ tm-agent broadcast '## 전원 결과 종합
 2. 선택 이유를 2-3줄로 설명
 3. 추가 개선 제안이 있으면 포함
 
-[IMPORTANT] When done, run: tm-agent reply "<your vote and reasoning>" to report.'
+[IMPORTANT] When done, run tm-agent reply with the 5-field header (STATUS/FILES/VERIFY/NEXT/FULL_REPORT) followed by your vote and reasoning.'
 ```
 
 ```bash
@@ -324,7 +336,7 @@ tm-agent broadcast '## 채택안 검증
 - 문제가 있으면: 구체적으로 지적하고 수정안 제시
 - 문제가 없으면: "OK" 라고만 답변
 
-[IMPORTANT] When done, run: tm-agent reply "<your feedback>" to report.'
+[IMPORTANT] When done, run tm-agent reply with the 5-field header (STATUS/FILES/VERIFY/NEXT/FULL_REPORT) followed by your feedback.'
 ```
 
 ```bash
@@ -364,7 +376,7 @@ tm-agent collect --lines 100
 > 🏆 [tournament] Phase 1: Compete — 전원 동시 경쟁
 
 ```bash
-tm-agent fan-out '<TASK>. 최선의 결과를 제출하라. 이것은 경쟁이다 — 가장 뛰어난 결과가 채택된다. 400단어 이내. [IMPORTANT] When done, run: tm-agent reply "<your submission>" to report.'
+tm-agent fan-out '<TASK>. 최선의 결과를 제출하라. 이것은 경쟁이다 — 가장 뛰어난 결과가 채택된다. 400단어 이내. [IMPORTANT] When done, run tm-agent reply with the 5-field header (STATUS/FILES/VERIFY/NEXT/FULL_REPORT) followed by your submission.'
 ```
 
 ```bash
@@ -397,7 +409,7 @@ tm-agent broadcast '## 토너먼트 투표
 {익명화된 솔루션 목록}
 
 형식: 1위: [A|B|C|...], 2위: [...], ... 이유: [한 줄 설명]
-[IMPORTANT] When done, run: tm-agent reply "<your ranking>" to report.'
+[IMPORTANT] When done, run tm-agent reply with the 5-field header (STATUS/FILES/VERIFY/NEXT/FULL_REPORT) followed by your ranking.'
 ```
 
 ```bash
@@ -462,7 +474,7 @@ tm-agent delegate {agent} '## Chain Step {n}/{total}: {step_task}
 이전 단계 결과: {이전 결과 또는 "없음 (첫 단계)"}
 
 위 맥락을 바탕으로 "{step_task}"를 수행하라. 400단어 이내.
-[IMPORTANT] When done, run: tm-agent reply "<your result>" to report.'
+[IMPORTANT] When done, run tm-agent reply with the 5-field header (STATUS/FILES/VERIFY/NEXT/FULL_REPORT) followed by your result.'
 ```
 
 ```bash
@@ -545,7 +557,7 @@ tm-agent delegate {agent} '## Code Review: {perspective} 관점
 - [Critical|High|Medium|Low] 파일:라인 — 설명
 - 이슈가 없으면 "No issues found" 라고만
 
-[IMPORTANT] When done, run: tm-agent reply "<your review>" to report.'
+[IMPORTANT] When done, run tm-agent reply with the 5-field header (STATUS/FILES/VERIFY/NEXT/FULL_REPORT) followed by your review.'
 ```
 
 모든 에이전트를 동시에 delegate한 후:
@@ -613,7 +625,7 @@ tm-agent delegate {pro_agent} '## Debate: PRO 입론
 - 핵심 장점 3가지
 - 구체적 근거와 예시
 - 300단어 이내
-[IMPORTANT] When done, run: tm-agent reply "<your argument>" to report.'
+[IMPORTANT] When done, run tm-agent reply with the 5-field header (STATUS/FILES/VERIFY/NEXT/FULL_REPORT) followed by your argument.'
 ```
 
 CON팀 각 에이전트에게 (동시에):
@@ -624,7 +636,7 @@ tm-agent delegate {con_agent} '## Debate: CON 입론
 - 핵심 위험/단점 3가지
 - 구체적 근거와 대안
 - 300단어 이내
-[IMPORTANT] When done, run: tm-agent reply "<your argument>" to report.'
+[IMPORTANT] When done, run tm-agent reply with the 5-field header (STATUS/FILES/VERIFY/NEXT/FULL_REPORT) followed by your argument.'
 ```
 
 ```bash
@@ -646,7 +658,7 @@ tm-agent delegate {pro_agent} '## Debate: PRO 반박 (Round {n})
 {con_arguments}
 
 위 주장에 반박하라. 200단어 이내.
-[IMPORTANT] When done, run: tm-agent reply "<your rebuttal>" to report.'
+[IMPORTANT] When done, run tm-agent reply with the 5-field header (STATUS/FILES/VERIFY/NEXT/FULL_REPORT) followed by your rebuttal.'
 ```
 
 CON팀에게 PRO 입론을 전달하고 반박 요청 (동시에):
@@ -656,7 +668,7 @@ tm-agent delegate {con_agent} '## Debate: CON 반박 (Round {n})
 {pro_arguments}
 
 위 주장에 반박하라. 200단어 이내.
-[IMPORTANT] When done, run: tm-agent reply "<your rebuttal>" to report.'
+[IMPORTANT] When done, run tm-agent reply with the 5-field header (STATUS/FILES/VERIFY/NEXT/FULL_REPORT) followed by your rebuttal.'
 ```
 
 ```bash
@@ -686,7 +698,7 @@ CON 반박: {con_rebuttal}
 1. 어느 쪽이 더 설득력 있는가? (PRO/CON)
 2. 각 측의 가장 강한 논거 1개
 3. 최종 권고 (200단어 이내)
-[IMPORTANT] When done, run: tm-agent reply "<your verdict>" to report.'
+[IMPORTANT] When done, run tm-agent reply with the 5-field header (STATUS/FILES/VERIFY/NEXT/FULL_REPORT) followed by your verdict.'
 ```
 
 ```bash
@@ -765,7 +777,7 @@ tm-agent fan-out '## Council: 입장 개진
 - 300단어 이내
 
 당신은 어떤 포지션이든 자유롭게 취할 수 있다. 다른 에이전트와 같은 입장이어도 무방하다.
-[IMPORTANT] When done, run: tm-agent reply "<your position>" to report.'
+[IMPORTANT] When done, run tm-agent reply with the 5-field header (STATUS/FILES/VERIFY/NEXT/FULL_REPORT) followed by your position.'
 ```
 
 ```bash
@@ -808,7 +820,7 @@ tm-agent delegate {agent} '## Council: 교차 질의
    - "{agent_name}의 주장 중 ~~ 부분에 대해..." 형식으로 특정 에이전트를 지명하라
 3. 다른 에이전트의 주장을 통해 자신의 입장이 변화했다면 어떻게 변했는지 밝혀라
 - 300단어 이내
-[IMPORTANT] When done, run: tm-agent reply "<your cross-examination>" to report.'
+[IMPORTANT] When done, run tm-agent reply with the 5-field header (STATUS/FILES/VERIFY/NEXT/FULL_REPORT) followed by your cross-examination.'
 ```
 
 (위 delegate를 모든 에이전트에 대해 **병렬로** 실행한다. broadcast가 아닌 개별 delegate — 에이전트마다 {other_agents_positions} 내용이 다르기 때문이다.)
@@ -864,7 +876,7 @@ tm-agent broadcast '## Council: 심화 토의 (Round {n})
 3. 타협안(compromise)이 있다면 제안하라
 4. 자신의 입장이 변했다면 명시적으로 밝혀라: "입장 변경: {이전} → {이후}"
 - 300단어 이내
-[IMPORTANT] When done, run: tm-agent reply "<your deep dive>" to report.'
+[IMPORTANT] When done, run tm-agent reply with the 5-field header (STATUS/FILES/VERIFY/NEXT/FULL_REPORT) followed by your deep dive.'
 ```
 
 ```bash
@@ -907,7 +919,7 @@ tm-agent broadcast '## Council: 합의 수렴
 2. **OBJECT** — 합의안에 동의하지 않는다. 반대 이유와 수정 요구를 구체적으로 밝혀라.
 
 또한 최종 입장을 한 줄로 요약하라: "최종 입장: {summary}"
-[IMPORTANT] When done, run: tm-agent reply "<AGREE or OBJECT + reasoning>" to report.'
+[IMPORTANT] When done, run tm-agent reply with the 5-field header (STATUS/FILES/VERIFY/NEXT/FULL_REPORT) followed by AGREE or OBJECT + reasoning.'
 ```
 
 ```bash
@@ -1009,7 +1021,7 @@ tm-agent delegate {attacker} '## Red Team: ATTACK
 각 발견 항목을 아래 형식으로:
 - [Critical|High|Medium] 위치 — 공격 벡터 — 증명 시나리오
 공격적으로 사고하라. 방어 가능성은 고려하지 마라.
-[IMPORTANT] When done, run: tm-agent reply "<your attacks>" to report.'
+[IMPORTANT] When done, run tm-agent reply with the 5-field header (STATUS/FILES/VERIFY/NEXT/FULL_REPORT) followed by your attacks.'
 ```
 
 ```bash
@@ -1036,7 +1048,7 @@ tm-agent delegate {defender} '## Red Team: DEFEND
 각 공격에 대해:
 1. 유효한 공격이면: 구체적 수정안 코드/설계 제시
 2. 무효한 공격이면: 반박 근거 제시 (왜 실제로는 문제가 아닌지)
-[IMPORTANT] When done, run: tm-agent reply "<your defenses>" to report.'
+[IMPORTANT] When done, run tm-agent reply with the 5-field header (STATUS/FILES/VERIFY/NEXT/FULL_REPORT) followed by your defenses.'
 ```
 
 ```bash
@@ -1056,7 +1068,7 @@ tm-agent delegate {attacker} '## Red Team: REATTACK (Round {n})
 {defense_results}
 
 수정안이 충분한지 검증하라. 여전히 취약한 부분이 있으면 새 공격 벡터를 제시.
-[IMPORTANT] When done, run: tm-agent reply "<your reattack>" to report.'
+[IMPORTANT] When done, run tm-agent reply with the 5-field header (STATUS/FILES/VERIFY/NEXT/FULL_REPORT) followed by your reattack.'
 ```
 
 ```bash
@@ -1118,7 +1130,7 @@ tm-agent fan-out '## Brainstorm: {TASK}
 - 기존 아이디어에 편승(build-on) OK
 - 각 아이디어는 제목 + 1-2줄 설명
 - 최소 5개 이상
-[IMPORTANT] When done, run: tm-agent reply "<your ideas>" to report.'
+[IMPORTANT] When done, run tm-agent reply with the 5-field header (STATUS/FILES/VERIFY/NEXT/FULL_REPORT) followed by your ideas.'
 ```
 
 ```bash
@@ -1151,7 +1163,7 @@ tm-agent broadcast '## Brainstorm: 도트 투표
 {clustered_ideas_with_numbers}
 
 형식: 1. [아이디어 번호], 2. [번호], 3. [번호] — 이유: [한 줄]
-[IMPORTANT] When done, run: tm-agent reply "<your votes>" to report.'
+[IMPORTANT] When done, run tm-agent reply with the 5-field header (STATUS/FILES/VERIFY/NEXT/FULL_REPORT) followed by your votes.'
 ```
 
 ```bash
@@ -1282,7 +1294,7 @@ tm-agent delegate {agent} '## Distributed Task: Subtask {n}/{total}
 
 ⚠️ 범위 밖 파일을 수정하지 마라 — 다른 에이전트와 충돌할 수 있다.
 
-[IMPORTANT] When done, run: tm-agent reply "<your result>" to report.'
+[IMPORTANT] When done, run tm-agent reply with the 5-field header (STATUS/FILES/VERIFY/NEXT/FULL_REPORT) followed by your result.'
 ```
 
 컨텍스트 주입이 활성이면 각 delegate 호출에 `--context` 플래그를 추가한다.
@@ -1344,7 +1356,7 @@ tm-agent broadcast '## Distribute: 교차 검증
 - 문제 있으면: 구체적으로 지적
 - 문제 없으면: "OK"
 
-[IMPORTANT] When done, run: tm-agent reply "<your verification>" to report.'
+[IMPORTANT] When done, run tm-agent reply with the 5-field header (STATUS/FILES/VERIFY/NEXT/FULL_REPORT) followed by your verification.'
 ```
 
 ```bash
