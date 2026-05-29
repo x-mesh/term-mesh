@@ -30,10 +30,12 @@ class TestResult:
     def success(self, msg: str = ""):
         self.passed = True
         self.message = msg
+        return self
 
     def failure(self, msg: str):
         self.passed = False
         self.message = msg
+        return self
 
 
 def _cleanup():
