@@ -644,6 +644,50 @@ final class TerminalSurface: Identifiable, ObservableObject {
             }
         }
 
+        func appendEnvPath(_ key: String, path: String, defaultValue: String? = nil) {
+            guard !path.isEmpty else { return }
+            var current = env[key]
+                ?? getenv(key).map { String(cString: $0) }
+                ?? ProcessInfo.processInfo.environment[key]
+                ?? ""
+            if current.isEmpty, let defaultValue {
+                current = defaultValue
+            }
+            if current.split(separator: ":").contains(Substring(path)) {
+                env[key] = current
+                return
+            }
+            env[key] = current.isEmpty ? path : "\(current):\(path)"
+        }
+
+        if let resourceURL = Bundle.main.resourceURL {
+            let resourcePath = resourceURL.path
+            let overlayTerminfo = resourceURL.appendingPathComponent("terminfo-overlay").path
+            let bundledGhostty = resourceURL.appendingPathComponent("ghostty").path
+            let resolvedTerminfo = (env["TERMINFO"]?.isEmpty == false ? env["TERMINFO"] : nil)
+                ?? getenv("TERMINFO").map { String(cString: $0) }
+                ?? ProcessInfo.processInfo.environment["TERMINFO"]
+                ?? (FileManager.default.fileExists(atPath: overlayTerminfo) ? overlayTerminfo : nil)
+
+            if let resolvedTerminfo, !resolvedTerminfo.isEmpty {
+                env["TERMINFO"] = resolvedTerminfo
+                appendEnvPath(
+                    "XDG_DATA_DIRS",
+                    path: URL(fileURLWithPath: resolvedTerminfo).deletingLastPathComponent().path,
+                    defaultValue: "/usr/local/share:/usr/share"
+                )
+            } else {
+                appendEnvPath("XDG_DATA_DIRS", path: resourcePath, defaultValue: "/usr/local/share:/usr/share")
+            }
+
+            if env["GHOSTTY_RESOURCES_DIR"]?.isEmpty != false,
+               getenv("GHOSTTY_RESOURCES_DIR") == nil,
+               FileManager.default.fileExists(atPath: bundledGhostty) {
+                env["GHOSTTY_RESOURCES_DIR"] = bundledGhostty
+            }
+            appendEnvPath("MANPATH", path: resourceURL.appendingPathComponent("man").path)
+        }
+
         // Shell integration: inject ZDOTDIR wrapper for zsh shells.
         let shellIntegrationEnabled = UserDefaults.standard.object(forKey: "sidebarShellIntegration") as? Bool ?? true
         if shellIntegrationEnabled,

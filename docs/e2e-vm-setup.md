@@ -1,6 +1,18 @@
-# E2E Test VM Setup (UTM)
+# E2E Test Runner Setup (UTM / mac-sub)
 
-term-mesh의 E2E 테스트는 UTM macOS VM에서 실행한다. 호스트의 앱 인스턴스를 실수로 kill하는 것을 방지하기 위해, 테스트 스크립트는 VM 유저(`term-mesh`)에서만 실행되도록 가드되어 있다.
+term-mesh의 E2E 테스트는 전용 macOS runner에서 실행한다. 기본 runner는 UTM macOS VM(`term-mesh-vm`)이고, 보조 runner로 `mac-sub`를 사용할 수 있다.
+
+테스트 스크립트는 실행 중인 term-mesh 인스턴스를 `pkill`하고 `/tmp/term-mesh*.sock`를 정리한다. 실수로 일상 작업 머신에서 실행되는 것을 막기 위해, `scripts/run-tests-v1.sh`와 `scripts/run-tests-v2.sh`는 기본적으로 다음 중 하나만 허용한다:
+
+1. 사용자: `term-mesh`
+2. 호스트: `term-mesh-vm`, `mac-sub`, `jinwooui-MacBookPro`, `jinwooui-MacBookPro.local`
+
+새 runner를 추가할 때는 다음 환경변수로 명시적으로 허용한다:
+
+```bash
+TERMMESH_E2E_ALLOWED_HOSTS=my-runner ./scripts/run-tests-v2.sh
+TERMMESH_E2E_ALLOWED_USERS=ci ./scripts/run-tests-v2.sh
+```
 
 ## 1. UTM macOS VM 생성
 
@@ -18,7 +30,7 @@ VM 부팅 후 macOS 설치 마법사를 완료한다.
 
 ### 2-1. 사용자 계정
 
-**반드시 `term-mesh`라는 이름으로 계정을 생성한다.** 테스트 스크립트(`run-tests-v1.sh`, `run-tests-v2.sh`)가 `id -un`으로 유저명을 체크한다.
+VM은 `term-mesh`라는 이름으로 계정을 생성하는 것을 권장한다. 테스트 스크립트는 `term-mesh` 유저를 기본 허용 대상으로 인식한다.
 
 ### 2-2. Xcode 설치
 
@@ -101,6 +113,34 @@ ssh term-mesh-vm 'pip3 install --user <패키지>'
 
 ## 7. 테스트 실행
 
+### mac-sub
+
+mac-sub의 repo 경로:
+
+```bash
+/Users/jinwoo/work/term-mesh
+```
+
+Python 통합 테스트 v2:
+
+```bash
+ssh mac-sub 'cd /Users/jinwoo/work/term-mesh && ./scripts/run-tests-v2.sh'
+```
+
+Python 통합 테스트 v1:
+
+```bash
+ssh mac-sub 'cd /Users/jinwoo/work/term-mesh && ./scripts/run-tests-v1.sh'
+```
+
+개별 Python 테스트:
+
+```bash
+ssh mac-sub 'cd /Users/jinwoo/work/term-mesh && ./scripts/run-tests-v2.sh tests_v2/test_ctrl_socket.py'
+```
+
+### term-mesh-vm
+
 ### Python 통합 테스트 (v1)
 
 ```bash
@@ -141,7 +181,7 @@ ssh term-mesh-vm 'cd /Users/jinwoo/term-mesh/GhosttyTabs && python3 tests/test_c
 
 `run-tests-v1.sh` / `run-tests-v2.sh`는 다음 순서로 실행된다:
 
-1. **유저 체크** — `term-mesh` 유저가 아니면 즉시 종료
+1. **runner guard** — 허용된 user 또는 host가 아니면 즉시 종료
 2. **빌드** — Debug 빌드 (DerivedData 경로 분리: `term-mesh-tests-v1` / `v2`)
 3. **기존 인스턴스 정리** — `pkill` + 소켓 파일 삭제
 4. **앱 실행** — `TERMMESH_UI_TEST_MODE=1` 환경변수로 실행
