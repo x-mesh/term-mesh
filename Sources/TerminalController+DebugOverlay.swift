@@ -6,6 +6,102 @@ import WebKit
 
 #if DEBUG
 extension TerminalController {
+    private func v2DebugDragOkResponse(_ response: String) -> V2CallResult {
+        response.starts(with: "OK")
+            ? .ok([:])
+            : .err(code: "internal_error", message: response, data: nil)
+    }
+
+    private func v2DebugDragBoolResponse(_ response: String, key: String) -> V2CallResult {
+        if response.starts(with: "ERROR") {
+            return .err(code: "internal_error", message: response, data: nil)
+        }
+        return .ok([key: response.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == "true"])
+    }
+
+    private func v2DebugDragCoordinateArgs(_ params: [String: Any]) -> String? {
+        func number(_ key: String) -> Double? {
+            if let value = params[key] as? Double { return value }
+            if let value = params[key] as? Int { return Double(value) }
+            if let value = params[key] as? NSNumber { return value.doubleValue }
+            if let value = params[key] as? String { return Double(value) }
+            return nil
+        }
+
+        guard let x = number("x"), let y = number("y") else { return nil }
+        return "\(x) \(y)"
+    }
+
+    func v2DebugDragSimulateFileDrop(params: [String: Any]) -> V2CallResult {
+        guard let surfaceId = v2String(params, "surface_id"),
+              let paths = v2String(params, "paths") else {
+            return .err(code: "invalid_params", message: "Missing surface_id/paths", data: nil)
+        }
+        return v2DebugDragOkResponse(simulateFileDrop("\(surfaceId) \(paths)"))
+    }
+
+    func v2DebugDragSeedPasteboard(params: [String: Any]) -> V2CallResult {
+        let payload = v2String(params, "types") ?? v2String(params, "type")
+        guard let payload else {
+            return .err(code: "invalid_params", message: "Missing type/types", data: nil)
+        }
+        return v2DebugDragOkResponse(seedDragPasteboardTypes(payload))
+    }
+
+    func v2DebugDragClearPasteboard() -> V2CallResult {
+        return v2DebugDragOkResponse(clearDragPasteboard())
+    }
+
+    func v2DebugDragOverlayHitGate(params: [String: Any]) -> V2CallResult {
+        return v2DebugDragBoolResponse(
+            overlayHitGate(v2String(params, "event_type") ?? "none"),
+            key: "captured"
+        )
+    }
+
+    func v2DebugDragOverlayDropGate(params: [String: Any]) -> V2CallResult {
+        return v2DebugDragBoolResponse(
+            overlayDropGate(v2String(params, "source") ?? "external"),
+            key: "captured"
+        )
+    }
+
+    func v2DebugDragPortalHitGate(params: [String: Any]) -> V2CallResult {
+        return v2DebugDragBoolResponse(
+            portalHitGate(v2String(params, "event_type") ?? "none"),
+            key: "pass_through"
+        )
+    }
+
+    func v2DebugDragSidebarOverlayGate(params: [String: Any]) -> V2CallResult {
+        return v2DebugDragBoolResponse(
+            sidebarOverlayGate(v2String(params, "state") ?? "active"),
+            key: "captured"
+        )
+    }
+
+    func v2DebugDragDropHitTest(params: [String: Any]) -> V2CallResult {
+        guard let args = v2DebugDragCoordinateArgs(params) else {
+            return .err(code: "invalid_params", message: "Missing or invalid x/y", data: nil)
+        }
+        let response = dropHitTest(args).trimmingCharacters(in: .whitespacesAndNewlines)
+        if response.starts(with: "ERROR") {
+            return .err(code: "internal_error", message: response, data: nil)
+        }
+        return .ok(["surface_id": response])
+    }
+
+    func v2DebugDragHitChain(params: [String: Any]) -> V2CallResult {
+        guard let args = v2DebugDragCoordinateArgs(params) else {
+            return .err(code: "invalid_params", message: "Missing or invalid x/y", data: nil)
+        }
+        let response = dragHitChain(args).trimmingCharacters(in: .whitespacesAndNewlines)
+        if response.starts(with: "ERROR") {
+            return .err(code: "internal_error", message: response, data: nil)
+        }
+        return .ok(["chain": response])
+    }
+
     func simulateFileDrop(_ args: String) -> String {
         guard let tabManager = tabManager else { return "ERROR: TabManager not available" }
 

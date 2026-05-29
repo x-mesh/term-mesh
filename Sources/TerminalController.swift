@@ -1200,6 +1200,24 @@ class TerminalController {
             return v2Result(id: id, self.v2DebugPanelSnapshotReset(params: params))
         case "debug.window.screenshot":
             return v2Result(id: id, self.v2DebugScreenshot(params: params))
+        case "debug.drag.simulate_file_drop":
+            return v2Result(id: id, self.v2DebugDragSimulateFileDrop(params: params))
+        case "debug.drag.seed_pasteboard", "debug.drag_pasteboard.seed":
+            return v2Result(id: id, self.v2DebugDragSeedPasteboard(params: params))
+        case "debug.drag.clear_pasteboard", "debug.drag_pasteboard.clear":
+            return v2Result(id: id, self.v2DebugDragClearPasteboard())
+        case "debug.drag.overlay_hit_gate":
+            return v2Result(id: id, self.v2DebugDragOverlayHitGate(params: params))
+        case "debug.drag.overlay_drop_gate":
+            return v2Result(id: id, self.v2DebugDragOverlayDropGate(params: params))
+        case "debug.drag.portal_hit_gate":
+            return v2Result(id: id, self.v2DebugDragPortalHitGate(params: params))
+        case "debug.drag.sidebar_overlay_gate":
+            return v2Result(id: id, self.v2DebugDragSidebarOverlayGate(params: params))
+        case "debug.drag.drop_hit_test":
+            return v2Result(id: id, self.v2DebugDragDropHitTest(params: params))
+        case "debug.drag.drag_hit_chain":
+            return v2Result(id: id, self.v2DebugDragHitChain(params: params))
 #endif
 
         default:
@@ -1392,6 +1410,17 @@ class TerminalController {
             "debug.panel_snapshot",
             "debug.panel_snapshot.reset",
             "debug.window.screenshot",
+            "debug.drag.simulate_file_drop",
+            "debug.drag.seed_pasteboard",
+            "debug.drag.clear_pasteboard",
+            "debug.drag.overlay_hit_gate",
+            "debug.drag.overlay_drop_gate",
+            "debug.drag.portal_hit_gate",
+            "debug.drag.sidebar_overlay_gate",
+            "debug.drag.drop_hit_test",
+            "debug.drag.drag_hit_chain",
+            "debug.drag_pasteboard.seed",
+            "debug.drag_pasteboard.clear",
         ])
 #endif
 

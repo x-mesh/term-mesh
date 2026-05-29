@@ -42,6 +42,7 @@ cd "$(dirname "$0")/.."
 
 DERIVED_DATA_PATH="$HOME/Library/Developer/Xcode/DerivedData/term-mesh-tests-v1"
 APP="$DERIVED_DATA_PATH/Build/Products/Debug/term-mesh DEV.app"
+CLI="$DERIVED_DATA_PATH/Build/Products/Debug/term-mesh"
 
 echo "== build =="
 # Work around stale explicit-module cache artifacts (notably Sentry headers) that can
@@ -55,11 +56,24 @@ xcodebuild \
   -destination "platform=macOS" \
   -derivedDataPath "$DERIVED_DATA_PATH" \
   build >/dev/null
+xcodebuild \
+  -project GhosttyTabs.xcodeproj \
+  -scheme term-mesh-cli \
+  -configuration Debug \
+  -destination "platform=macOS" \
+  -derivedDataPath "$DERIVED_DATA_PATH" \
+  build >/dev/null
 
 if [ ! -d "$APP" ]; then
   echo "ERROR: term-mesh DEV.app not found at expected path: $APP" >&2
   exit 1
 fi
+if [ ! -x "$CLI" ]; then
+  echo "ERROR: term-mesh CLI not found at expected path: $CLI" >&2
+  exit 1
+fi
+export TERMMESH_CLI="$CLI"
+export TERMMESH_CLI_BIN="$CLI"
 
 cleanup() {
   pkill -x "term-mesh DEV" || true
@@ -174,6 +188,14 @@ else:
 bootstrap_last = None
 for _ in range(3):
     try:
+        if client is not None:
+            try:
+                client.close()
+            except Exception:
+                pass
+        client = termmesh()
+        client.connect()
+
         existing_ids = []
         try:
             existing_ids = [row[1] for row in client.list_workspaces() if len(row) >= 2]

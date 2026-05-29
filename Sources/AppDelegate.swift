@@ -2598,6 +2598,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
             return true
         }
 
+        // Browser navigation should win over pane navigation while a browser
+        // surface is focused. The same literal shortcuts are used for pane
+        // focus when the active surface is a terminal.
+        if normalizedFlags == [.command],
+           let browser = tabManager?.focusedBrowserPanel {
+            if chars == "[" || event.keyCode == 33 {
+                browser.goBack()
+                return true
+            }
+            if chars == "]" || event.keyCode == 30 {
+                browser.goForward()
+                return true
+            }
+        }
+
         // Sequential pane navigation: Cmd+] / Cmd+[
         if matchShortcut(event: event, shortcut: KeyboardShortcutSettings.shortcut(for: .focusNextPane)) {
             tabManager?.focusNextPane()

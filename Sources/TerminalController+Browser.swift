@@ -368,7 +368,11 @@ extension TerminalController {
         let completed = v2MainExec(timeout: 2) {
             guard let ws = self.v2ResolveWorkspace(params: params, tabManager: tabManager),
                   let browserPanel = ws.browserPanel(for: surfaceId) else { return }
-            browserPanel.navigateSmart(url)
+            if let directURL = URL(string: url), directURL.scheme != nil {
+                browserPanel.navigate(to: directURL)
+            } else {
+                browserPanel.navigateSmart(url)
+            }
             var payload: [String: Any] = [
                 "workspace_id": ws.id.uuidString,
                 "workspace_ref": self.v2Ref(kind: .workspace, uuid: ws.id),
@@ -1581,9 +1585,14 @@ extension TerminalController {
 
             self.v2MaybeFocusWindow(for: tabManager)
             self.v2MaybeSelectWorkspace(tabManager, workspace: ws)
+            ws.focusPanel(surfaceId)
+
+            browserPanel.endSuppressWebViewFocusForAddressBar()
+            browserPanel.clearWebViewFocusSuppression()
+            NotificationCenter.default.post(name: .browserDidBlurAddressBar, object: surfaceId)
 
             // Prevent omnibar auto-focus from immediately stealing first responder back.
-            browserPanel.suppressOmnibarAutofocus(for: 1.0)
+            browserPanel.suppressOmnibarAutofocus(for: 1.5)
 
             let webView = browserPanel.webView
             guard let window = webView.window else {
@@ -1595,8 +1604,18 @@ extension TerminalController {
                 return
             }
 
+            if let termMeshWebView = webView as? TermMeshWebView {
+                termMeshWebView.allowsFirstResponderAcquisition = true
+            }
             window.makeFirstResponder(webView)
-            if let fr = window.firstResponder as? NSView, fr.isDescendant(of: webView) {
+            if Self.responderChainContains(window.firstResponder, target: webView) {
+                DispatchQueue.main.async { [weak window, weak webView] in
+                    guard let window, let webView else { return }
+                    guard webView.window === window else { return }
+                    if !Self.responderChainContains(window.firstResponder, target: webView) {
+                        window.makeFirstResponder(webView)
+                    }
+                }
                 result = .ok(["focused": true])
             } else {
                 result = .err(code: "internal_error", message: "Focus did not move into web view", data: nil)
@@ -1624,7 +1643,7 @@ extension TerminalController {
                 focused = false
                 return
             }
-            focused = fr.isDescendant(of: webView)
+            focused = fr.isDescendant(of: webView) || Self.responderChainContains(window.firstResponder, target: webView)
         }
         if !completed { return .err(code: "timeout", message: "Main thread busy", data: nil) }
         return .ok(["focused": focused])
