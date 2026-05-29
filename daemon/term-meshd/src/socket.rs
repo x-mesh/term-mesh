@@ -2215,6 +2215,21 @@ async fn dispatch(req: &Request, ctx: &Context) -> Response {
                     serde_json::Value::Null
                 };
                 let drift_count = board_drift_count(&st.working_directory);
+                // R1: expose worker list and count so the GUI can display
+                // "All workers: N bounded checks" without re-deriving team roster.
+                let is_all = st
+                    .target
+                    .as_deref()
+                    .map(|t| t.is_empty() || t == "all")
+                    .unwrap_or(true);
+                let (workers_json, worker_count) = if is_all {
+                    let count = st.workers.len();
+                    (serde_json::json!(st.workers), count)
+                } else {
+                    // Single specific target — list contains just that one name.
+                    let name = st.target.as_deref().unwrap_or("");
+                    (serde_json::json!([name]), 1_usize)
+                };
                 serde_json::json!({
                     "team_id": team,
                     "enabled": st.enabled,
@@ -2222,6 +2237,9 @@ async fn dispatch(req: &Request, ctx: &Context) -> Response {
                     "interval_secs": st.interval_secs,
                     "exec_to_dir_ratio": st.exec_to_dir_ratio,
                     "target": st.target,
+                    // R1: worker list and count (GUI cost preview + "All workers" label)
+                    "workers": workers_json,
+                    "worker_count": worker_count,
                     "cli": st.cli,
                     "model": st.model,
                     "stance": st.stance,

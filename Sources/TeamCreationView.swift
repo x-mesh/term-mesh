@@ -404,6 +404,8 @@ struct TeamCreationView: View {
     @State private var leaderPairMode: String = "none"
     @AppStorage("teamDefaultPairModel") private var leaderPairModel: String = ""
     @State private var leaderPairSpec: String = ""
+    @State private var leaderPairAutoWatch: Bool = false
+    @State private var leaderPairStance: String = "critic"
     @State private var recentSessions: [ClaudeSession] = []
     @State private var selectedSessionId: String?
     @State private var manualSessionId = ""
@@ -1168,6 +1170,11 @@ struct TeamCreationView: View {
                         if newMode != "repl" && AgentRolePreset.models(for: oldMode) != AgentRolePreset.models(for: newMode) {
                             leaderModel = AgentRolePreset.defaultModel(for: newMode)
                         }
+                        // Reset hidden pair state when switching to repl (no pair pane possible).
+                        if newMode == "repl" {
+                            leaderPairMode = "none"
+                            leaderPairAutoWatch = false
+                        }
                         persistSelectedSmartPresetOverride()
                     }
                 )) {
@@ -1254,18 +1261,44 @@ struct TeamCreationView: View {
                 }
 
                 if leaderPairMode != "none" && executionMode != "headless" {
-                    HStack(spacing: 4) {
-                        Image(systemName: "eye")
-                            .foregroundStyle(.secondary)
-                        Text("Pair acts as a watcher · run `/watch review` in leader pane to start checks")
-                            .foregroundStyle(.secondary)
-                    }
-                    .font(.caption)
-
-                    VStack(alignment: .leading, spacing: 4) {
-                        Text("Watcher Spec (optional)")
+                    // Pair mode: Pane only / Auto watch (PRD §Team Creation)
+                    HStack {
+                        Text("Pair mode")
                             .font(.caption)
                             .foregroundStyle(.secondary)
+                        Spacer()
+                        Picker("", selection: $leaderPairAutoWatch) {
+                            Text("Pane only").tag(false)
+                            Text("Auto watch").tag(true)
+                        }
+                        .pickerStyle(.segmented)
+                        .fixedSize()
+                        .onChange(of: leaderPairAutoWatch) { on in
+                            // PRD: stance=pair by default when Auto watch is selected
+                            if on { leaderPairStance = "pair" }
+                        }
+                    }
+
+                    // Stance segmented (always shown when pair is active)
+                    HStack {
+                        Text("Stance")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                        Spacer()
+                        Picker("", selection: $leaderPairStance) {
+                            Text("Critic").tag("critic")
+                            Text("Advisor").tag("advisor")
+                            Text("Pair").tag("pair")
+                        }
+                        .pickerStyle(.segmented)
+                        .fixedSize()
+                    }
+
+                    // Spec (required for Auto watch)
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text(leaderPairAutoWatch ? "Watcher Spec (required)" : "Watcher Spec (optional)")
+                            .font(.caption)
+                            .foregroundStyle(leaderPairAutoWatch ? .primary : .secondary)
                         ZStack(alignment: .topLeading) {
                             TextEditor(text: $leaderPairSpec)
                                 .font(.caption)
@@ -1274,7 +1307,9 @@ struct TeamCreationView: View {
                                 .background(Color(nsColor: .textBackgroundColor))
                                 .overlay(
                                     RoundedRectangle(cornerRadius: 4)
-                                        .stroke(Color.secondary.opacity(0.3))
+                                        .stroke(leaderPairAutoWatch && leaderPairSpec.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                                                ? Color.red.opacity(0.5)
+                                                : Color.secondary.opacity(0.3))
                                 )
                             if leaderPairSpec.isEmpty {
                                 Text("e.g. Stay within current task scope. Flag --no-verify or scope creep.")
@@ -1285,6 +1320,34 @@ struct TeamCreationView: View {
                                     .allowsHitTesting(false)
                             }
                         }
+                    }
+
+                    // Status / warning line
+                    if leaderPairAutoWatch && leaderPairSpec.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                        HStack(spacing: 4) {
+                            Image(systemName: "exclamationmark.triangle.fill")
+                                .foregroundStyle(.orange)
+                            Text("Spec required for Auto watch — add a spec or switch to Pane only")
+                                .foregroundStyle(.secondary)
+                        }
+                        .font(.caption)
+                        .transition(.opacity)
+                    } else if leaderPairAutoWatch {
+                        HStack(spacing: 4) {
+                            Image(systemName: "eye.fill")
+                                .foregroundStyle(.green)
+                            Text("watch.on (target=all, stance=\(leaderPairStance)) will run after team creation")
+                                .foregroundStyle(.secondary)
+                        }
+                        .font(.caption)
+                    } else {
+                        HStack(spacing: 4) {
+                            Image(systemName: "eye")
+                                .foregroundStyle(.secondary)
+                            Text("Pair acts as a watcher · run `/watch review` in leader pane to start checks")
+                                .foregroundStyle(.secondary)
+                        }
+                        .font(.caption)
                     }
                 }
             }
@@ -2269,7 +2332,9 @@ struct TeamCreationView: View {
             } else {
                 Button(executionMode == "headless" ? "Create Headless Team" : "Create Team") { createTeam() }
                     .keyboardShortcut(.defaultAction)
-                    .disabled(teamName.isEmpty || agents.isEmpty || isTeamNameDuplicate || workingDirectoryError != nil)
+                    .disabled(teamName.isEmpty || agents.isEmpty || isTeamNameDuplicate || workingDirectoryError != nil
+                              || (leaderPairAutoWatch && leaderMode != "repl" && leaderPairMode != "none" && executionMode != "headless"
+                                  && leaderPairSpec.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty))
             }
         }
         .padding(.horizontal, 20)
@@ -2807,6 +2872,31 @@ struct TeamCreationView: View {
             TeamOrchestrator.shared.setTeamDefaultAutoRecycle(teamName: teamName, every: autoRecycleEvery)
             for (agentName, threshold) in perAgentOverrides where threshold > 0 {
                 TeamOrchestrator.shared.setAgentAutoRecycleByName(teamName: teamName, agentName: agentName, every: threshold)
+            }
+        }
+        // Auto watch (PRD §Team Creation): enable watch.on after successful team creation.
+        // Fires only when pair is active, spec is non-empty, and mode is pane (not headless).
+        let specTrimmed = effectivePairSpec.trimmingCharacters(in: .whitespacesAndNewlines)
+        if leaderPairAutoWatch && effectivePair != "none" && !specTrimmed.isEmpty {
+            let tName = teamName
+            let pairCLI = leaderPairMode
+            let pairModel = leaderPairModel.isEmpty ? AgentRolePreset.defaultModel(for: pairCLI) : leaderPairModel
+            let stance = leaderPairStance
+            let wd = workingDirectory
+            let appSock = SocketControlSettings.socketPath()
+            DispatchQueue.global(qos: .utility).async {
+                var params: [String: Any] = [
+                    "team_id": tName,
+                    "cli": pairCLI,
+                    "model": pairModel,
+                    "stance": stance,
+                    "working_directory": wd,
+                    "spec": specTrimmed,
+                ]
+                if !appSock.isEmpty {
+                    params["app_socket_path"] = appSock
+                }
+                _ = TermMeshDaemon.shared.rpcCallRaw(method: "watch.on", params: params)
             }
         }
         dismiss()

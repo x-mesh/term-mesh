@@ -3341,6 +3341,25 @@ struct ContentView: View {
                 when: { _ in !TeamOrchestrator.shared.teams.isEmpty }
             )
         )
+        // P0-5: Watch commands (team must exist; PRD P1 lists these)
+        contributions.append(
+            CommandPaletteCommandContribution(
+                commandId: "palette.configureWatch",
+                title: constant("Configure Watch…"),
+                subtitle: constant("Watch"),
+                keywords: ["watch", "drift", "oversight", "monitor", "configure", "spec", "watcher"],
+                when: { _ in !TeamOrchestrator.shared.teams.isEmpty }
+            )
+        )
+        contributions.append(
+            CommandPaletteCommandContribution(
+                commandId: "palette.stopWatch",
+                title: constant("Stop Watch"),
+                subtitle: constant("Watch"),
+                keywords: ["watch", "drift", "oversight", "stop", "off", "disable"],
+                when: { _ in !TeamOrchestrator.shared.teams.isEmpty }
+            )
+        )
 
         return contributions
     }
@@ -3671,6 +3690,28 @@ struct ContentView: View {
                 TeamOrchestrator.shared.recycleAllAgents(teamName: teamName, force: false)
             }
         }
+        // P0-5: Watch handlers
+        registry.register(commandId: "palette.configureWatch") {
+            let teams = TeamOrchestrator.shared.teams
+            guard let teamName = teams.keys.sorted().first,
+                  let team = teams[teamName] else { return }
+            NotificationCenter.default.post(
+                name: .watchConfigRequested,
+                object: nil,
+                userInfo: [
+                    "teamName": teamName,
+                    "workingDirectory": team.workingDirectory,
+                ]
+            )
+        }
+        registry.register(commandId: "palette.stopWatch") {
+            let teams = TeamOrchestrator.shared.teams
+            guard let teamName = teams.keys.sorted().first else { return }
+            let params: [String: Any] = ["team_id": teamName]
+            _ = TermMeshDaemon.shared.rpcCallRaw(method: "watch.off", params: params)
+        }
+        // palette.runWatchNow is intentionally absent: depends on R4 (watch.trigger_now)
+        // which is not yet implemented in the daemon.
     }
 
     private var focusedPanelContext: (workspace: Workspace, panelId: UUID, panel: any Panel)? {
