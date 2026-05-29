@@ -925,6 +925,9 @@ struct TabItemView: View {
                 TeamOrchestrator.shared.parkAgent(teamName: teamName, agentName: agent.name)
             }
         }
+        Button("Recycle all agents…") {
+            confirmAndRecycleAllAgents(teamName: teamName)
+        }
         Button("Destroy team…") {
             confirmAndDestroyTeam(teamName: teamName)
         }
@@ -934,6 +937,25 @@ struct TabItemView: View {
         }
         .disabled(TeamOrchestrator.shared.teams[teamName]?.sharedWorktreePath == nil
                   && TeamOrchestrator.shared.teams[teamName]?.agents.first?.worktreePath == nil)
+    }
+
+    private func confirmAndRecycleAllAgents(teamName: String) {
+        guard let team = TeamOrchestrator.shared.teams[teamName] else { return }
+        let agentCount = team.agents.count
+        let alert = NSAlert()
+        alert.messageText = "Recycle all agents in \"\(teamName)\"?"
+        alert.informativeText = "\(agentCount) agent pane\(agentCount == 1 ? "" : "s") will be hard-restarted — full transcripts discarded. Agents with active tasks will be skipped."
+        alert.addButton(withTitle: "Recycle")
+        alert.addButton(withTitle: "Cancel")
+        alert.alertStyle = .warning
+        alert.presentAsSheet { response in
+            guard response == .alertFirstButtonReturn else { return }
+            let (recycled, skipped) = TeamOrchestrator.shared.recycleAllAgents(teamName: teamName, force: false)
+            #if DEBUG
+            dlog("recycleAll teamName=\(teamName) recycled=\(recycled) skipped=\(skipped)")
+            #endif
+            _ = (recycled, skipped)
+        }
     }
 
     private func confirmAndDestroyTeam(teamName: String) {

@@ -3332,6 +3332,15 @@ struct ContentView: View {
                 when: { _ in !TeamOrchestrator.shared.teams.isEmpty }
             )
         )
+        contributions.append(
+            CommandPaletteCommandContribution(
+                commandId: "palette.recycleAllAgents",
+                title: constant("Recycle All Agents…"),
+                subtitle: constant("Team"),
+                keywords: ["agent", "team", "recycle", "restart", "hard", "reset", "transcript"],
+                when: { _ in !TeamOrchestrator.shared.teams.isEmpty }
+            )
+        )
 
         return contributions
     }
@@ -3645,6 +3654,21 @@ struct ContentView: View {
             guard let firstTeam = teams.values.sorted(by: { $0.createdAt < $1.createdAt }).first else { return }
             if let workspace = tabManager.tabs.first(where: { $0.id == firstTeam.workspaceId }) {
                 tabManager.selectTab(workspace)
+            }
+        }
+        registry.register(commandId: "palette.recycleAllAgents") {
+            let teams = TeamOrchestrator.shared.teams
+            guard let teamName = teams.keys.sorted().first,
+                  let team = teams[teamName] else { return }
+            let agentCount = team.agents.count
+            let alert = NSAlert()
+            alert.messageText = "Recycle all agents in \"\(teamName)\"?"
+            alert.informativeText = "\(agentCount) agent pane\(agentCount == 1 ? "" : "s") will be hard-restarted — full transcripts discarded. Agents with active tasks will be skipped."
+            alert.addButton(withTitle: "Recycle")
+            alert.addButton(withTitle: "Cancel")
+            alert.alertStyle = .warning
+            if alert.runModal() == .alertFirstButtonReturn {
+                TeamOrchestrator.shared.recycleAllAgents(teamName: teamName, force: false)
             }
         }
     }
