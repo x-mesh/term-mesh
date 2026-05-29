@@ -1375,6 +1375,7 @@ private struct TeamIndicatorBlock: View {
         let stance = w["stance"] as? String ?? "critic"
         let nextTick = w["next_tick"] as? Int
         let lastError = w["last_error"] as? String
+        let dupWarning = w["duplicate_name_warning"] as? String
 
         if let err = lastError, !err.isEmpty {
             return "Watch: Error · \(err.prefix(20))"
@@ -1386,14 +1387,16 @@ private struct TeamIndicatorBlock: View {
             targetLabel = workers.isEmpty ? "All workers" : "All · \(workers.count)"
         }
         let stanceShort = String(stance.prefix(4))
+        // R3: ⚠ prefix when duplicate worker names were detected (chip-level hint).
+        let dupPrefix = dupWarning != nil ? "⚠ " : ""
         if let next = nextTick {
             let remaining = next - Int(Date().timeIntervalSince1970)
             let mins = max(0, remaining / 60)
             let secs = max(0, remaining % 60)
             let timeStr = mins > 0 ? "\(mins)m\(String(format: "%02d", secs))s" : "\(secs)s"
-            return "Watch: \(targetLabel) · \(stanceShort) · \(timeStr)"
+            return "\(dupPrefix)Watch: \(targetLabel) · \(stanceShort) · \(timeStr)"
         }
-        return "Watch: \(targetLabel) · \(stanceShort)"
+        return "\(dupPrefix)Watch: \(targetLabel) · \(stanceShort)"
     }
 }
 

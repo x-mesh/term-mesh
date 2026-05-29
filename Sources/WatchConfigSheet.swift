@@ -364,6 +364,9 @@ struct WatchConfigSheet: View {
                 if let e = info.lastError, !e.isEmpty {
                     statusRow("Last error", e, isError: true)
                 }
+                if let w = info.duplicateNameWarning {
+                    statusRow("⚠ Workers", w, isWarning: true)
+                }
             }
             .frame(maxWidth: .infinity, alignment: .leading)
             .padding(2)
@@ -374,15 +377,15 @@ struct WatchConfigSheet: View {
     }
 
     @ViewBuilder
-    private func statusRow(_ label: String, _ value: String, isError: Bool = false) -> some View {
+    private func statusRow(_ label: String, _ value: String, isError: Bool = false, isWarning: Bool = false) -> some View {
         GridRow {
             Text(label)
                 .font(.caption)
-                .foregroundStyle(.secondary)
+                .foregroundStyle(isError ? AnyShapeStyle(Color.red) : isWarning ? AnyShapeStyle(Color.orange) : AnyShapeStyle(.secondary))
                 .gridColumnAlignment(.leading)
             Text(value)
                 .font(.caption)
-                .foregroundStyle(isError ? .red : .primary)
+                .foregroundStyle(isError ? AnyShapeStyle(Color.red) : isWarning ? AnyShapeStyle(Color.orange) : AnyShapeStyle(.primary))
                 .gridColumnAlignment(.leading)
         }
     }
@@ -541,6 +544,8 @@ struct WatchStatusInfo {
     let lastTick: Int?
     let nextTick: Int?
     let lastError: String?
+    /// R3: set when the workers list contained duplicates (deduped by daemon).
+    let duplicateNameWarning: String?
 
     /// Parse from the JSON string returned by `rpcCallRaw("watch.status", ...)`.
     /// The result is `{"status":"ok","watch":{...}}` (single team) or
@@ -571,9 +576,10 @@ struct WatchStatusInfo {
         self.model        = w["model"] as? String ?? "sonnet"
         self.running      = (w["running"] ?? w["in_flight"]) as? Bool ?? false
         self.driftCount   = w["drift_count"] as? Int ?? 0
-        self.lastTick     = w["last_tick"] as? Int
-        self.nextTick     = w["next_tick"] as? Int
-        self.lastError    = w["last_error"] as? String
+        self.lastTick              = w["last_tick"] as? Int
+        self.nextTick              = w["next_tick"] as? Int
+        self.lastError             = w["last_error"] as? String
+        self.duplicateNameWarning  = w["duplicate_name_warning"] as? String
     }
 }
 

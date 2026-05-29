@@ -84,6 +84,10 @@ pub struct WatchState {
     /// A check is currently running; new ticks coalesce (NFR1: 1 check/team).
     pub in_flight: bool,
     pub last_error: Option<String>,
+    /// R3: set when the workers list contained duplicate names (deduped on watch.on/update).
+    /// GUI shows a warning so users understand only one pane per name is addressed.
+    #[serde(default)]
+    pub duplicate_name_warning: Option<String>,
 }
 
 impl WatchState {
@@ -120,6 +124,7 @@ impl WatchState {
             check_count: 0,
             in_flight: false,
             last_error: None,
+            duplicate_name_warning: None,
         }
     }
 }
