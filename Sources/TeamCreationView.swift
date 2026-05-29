@@ -496,7 +496,11 @@ struct TeamCreationView: View {
             }
             // leaderModel stored in AppStorage may not be valid for the resolved leaderMode
             // (e.g. "gpt-5.5" stored from a previous codex session, now reopened with claude).
-            if !AgentRolePreset.models(for: leaderMode).contains(leaderModel) {
+            // Normalize legacy aliases first so "opus-1m" → "opus" before the contains check.
+            let normalizedLeader = AgentRolePreset.normalizeModel(leaderModel, for: leaderMode)
+            if normalizedLeader != leaderModel {
+                leaderModel = normalizedLeader
+            } else if !AgentRolePreset.models(for: leaderMode).contains(leaderModel) {
                 leaderModel = AgentRolePreset.defaultModel(for: leaderMode)
             }
             validateWorkingDirectory()
@@ -1182,7 +1186,13 @@ struct TeamCreationView: View {
                     Picker("", selection: Binding(
                         get: {
                             let opts = AgentRolePreset.models(for: leaderMode)
-                            if opts.contains(leaderModel) { return leaderModel }
+                            let normalized = AgentRolePreset.normalizeModel(leaderModel, for: leaderMode)
+                            if opts.contains(normalized) {
+                                if normalized != leaderModel {
+                                    DispatchQueue.main.async { leaderModel = normalized }
+                                }
+                                return normalized
+                            }
                             let fallback = AgentRolePreset.defaultModel(for: leaderMode)
                             DispatchQueue.main.async { leaderModel = fallback }
                             return fallback
@@ -1676,8 +1686,16 @@ struct TeamCreationView: View {
                 Picker("", selection: Binding(
                     get: {
                         let opts = AgentRolePreset.models(for: agent.preset.cli)
-                        let current = agent.preset.model
-                        if opts.contains(current) { return current }
+                        let normalized = AgentRolePreset.normalizeModel(agent.preset.model, for: agent.preset.cli)
+                        if opts.contains(normalized) {
+                            if normalized != agent.preset.model {
+                                DispatchQueue.main.async {
+                                    guard index < agents.count else { return }
+                                    agents[index].preset.model = normalized
+                                }
+                            }
+                            return normalized
+                        }
                         let fallback = AgentRolePreset.defaultModel(for: agent.preset.cli)
                         DispatchQueue.main.async {
                             guard index < agents.count else { return }

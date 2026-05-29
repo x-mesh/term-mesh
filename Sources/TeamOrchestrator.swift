@@ -4286,19 +4286,18 @@ final class TeamOrchestrator: ObservableObject {
     }
 
     /// Map term-mesh tier names to the exact `--model` argument Claude CLI expects.
-    /// Only `opus-1m` needs explicit translation today; other tiers are passed through
-    /// (Claude CLI accepts `sonnet`/`opus`/`haiku` and full model IDs verbatim).
+    /// "opus" and legacy "opus-1m" both map to claude-opus-4-8[1m].
     static func resolveClaudeModelArg(_ model: String) -> String {
         switch model {
-        case "opus-1m": return "claude-opus-4-7[1m]"
-        default:        return model
+        case "opus", "opus-1m": return "claude-opus-4-8[1m]"
+        default:                return model
         }
     }
 
     /// Map short model names (used internally) to kiro-cli model identifiers.
     private static func kiroModelName(_ shortName: String) -> String {
         switch shortName.lowercased() {
-        case "opus":   return "claude-opus-4.7"
+        case "opus":   return "claude-opus-4.8"
         case "sonnet": return "claude-sonnet-4.6"
         case "haiku":  return "claude-haiku-4.5"
         default:       return shortName  // pass through if already full name
