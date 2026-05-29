@@ -2137,6 +2137,13 @@ async fn dispatch(req: &Request, ctx: &Context) -> Response {
             struct P {
                 #[serde(default)]
                 team_id: Option<String>,
+                /// Caller's working directory. When present, config.json in
+                /// `<working_directory>/.xm/watch/` is merged as a fallback so
+                /// that teams persisted but not yet in the in-memory registry
+                /// (e.g. after a daemon restart with a mismatched cwd) are still
+                /// visible. In-memory state wins on key collision (has live counters).
+                #[serde(default)]
+                working_directory: Option<String>,
             }
             fn serialize_state(
                 team: &str,
@@ -2178,17 +2185,44 @@ async fn dispatch(req: &Request, ctx: &Context) -> Response {
                     "last_error": st.last_error,
                 })
             }
-            let params: P =
-                serde_json::from_value(req.params.clone()).unwrap_or(P { team_id: None });
-            let reg = ctx.watch_registry.lock().await;
+            let params: P = serde_json::from_value(req.params.clone())
+                .unwrap_or(P { team_id: None, working_directory: None });
+            // Snapshot in-memory registry under the lock, then drop before file I/O.
+            let in_mem: std::collections::HashMap<String, crate::drift_watch::WatchState> = {
+                let reg = ctx.watch_registry.lock().await;
+                reg.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
+            };
+            // Config.json fallback: teams persisted but absent from the registry
+            // (e.g. daemon restarted from a different cwd). In-memory wins on collision.
+            let config_fallback: std::collections::HashMap<String, crate::drift_watch::WatchState> =
+                params.working_directory
+                    .as_deref()
+                    .filter(|wd| !wd.is_empty())
+                    .map(|wd| {
+                        watch_config::load_watch_states(std::path::Path::new(wd))
+                            .into_iter()
+                            .collect()
+                    })
+                    .unwrap_or_default();
             match params.team_id {
-                Some(tid) => Ok(serde_json::json!({
-                    "status": "ok",
-                    "watch": reg.get(&tid).map(|st| serialize_state(&tid, st)),
-                })),
+                Some(tid) => {
+                    let state = in_mem.get(&tid)
+                        .or_else(|| config_fallback.get(&tid))
+                        .map(|st| serialize_state(&tid, st));
+                    Ok(serde_json::json!({ "status": "ok", "watch": state }))
+                }
                 None => {
-                    let all: Vec<serde_json::Value> =
-                        reg.iter().map(|(t, st)| serialize_state(t, st)).collect();
+                    let mut seen = std::collections::HashSet::new();
+                    let mut all: Vec<serde_json::Value> = Vec::new();
+                    for (t, st) in &in_mem {
+                        all.push(serialize_state(t, st));
+                        seen.insert(t.clone());
+                    }
+                    for (t, st) in &config_fallback {
+                        if !seen.contains(t) {
+                            all.push(serialize_state(t, st));
+                        }
+                    }
                     Ok(serde_json::json!({ "status": "ok", "watches": all }))
                 }
             }

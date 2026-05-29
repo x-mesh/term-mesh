@@ -8087,7 +8087,12 @@ fn run_watch_command(sock: &PathBuf, action: &WatchAction) {
             print_result(rpc_call(sock, "watch.off", json!({ "team_id": team })));
         }
         WatchAction::Status { team } => {
-            let mut params = json!({});
+            // Send cwd as working_directory so the daemon can merge config.json
+            // as a fallback for teams not yet in the in-memory registry.
+            let wd = env::current_dir()
+                .map(|p| p.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            let mut params = json!({ "working_directory": wd });
             if let Some(t) = team {
                 params["team_id"] = json!(t);
             }
