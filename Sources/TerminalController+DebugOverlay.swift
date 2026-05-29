@@ -102,6 +102,31 @@ extension TerminalController {
         return .ok(["chain": response])
     }
 
+    func v2DebugTerminalDropOverlayProbe(params: [String: Any]) -> V2CallResult {
+        let mode = v2String(params, "mode") ?? "deferred"
+        let response = terminalDropOverlayProbe(mode).trimmingCharacters(in: .whitespacesAndNewlines)
+        guard response.hasPrefix("OK ") else {
+            return .err(code: "internal_error", message: response, data: nil)
+        }
+
+        var payload: [String: Any] = [:]
+        for part in response.dropFirst(3).split(separator: " ") {
+            let pair = part.split(separator: "=", maxSplits: 1)
+            guard pair.count == 2 else { continue }
+            let key = String(pair[0])
+            let value = String(pair[1])
+            switch key {
+            case "animated":
+                payload[key] = value == "1"
+            case "before", "after":
+                payload[key] = Int(value) ?? 0
+            default:
+                payload[key] = value
+            }
+        }
+        return .ok(payload)
+    }
+
     func simulateFileDrop(_ args: String) -> String {
         guard let tabManager = tabManager else { return "ERROR: TabManager not available" }
 

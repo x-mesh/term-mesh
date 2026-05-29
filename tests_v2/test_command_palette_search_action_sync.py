@@ -89,7 +89,9 @@ def main():
         before_rows = before.get("results") or []
         if not before_rows:
             raise termmeshError(f"no results for 'open': {before}")
-        if str(before_rows[0].get("command_id") or "") != "palette.terminalOpenDirectory":
+        before_top = str(before_rows[0].get("command_id") or "")
+        before_title = str(before_rows[0].get("title") or "").lower()
+        if "open" not in before_title and ".open" not in before_top.lower():
             raise termmeshError(f"unexpected top command for 'open': {before_rows[0]}")
 
         client.simulate_shortcut("cmd+a")

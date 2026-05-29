@@ -69,10 +69,10 @@ def main() -> int:
         token_a = f"cmdp-window-a-{token_suffix}"
         token_b = f"cmdp-window-b-{token_suffix}"
 
-        workspace_a = client.new_workspace(window_id=window_a)
+        workspace_a = client.new_workspace(window_id=window_a, select=False)
         client.rename_workspace(token_a, workspace=workspace_a)
 
-        workspace_b = client.new_workspace(window_id=window_b)
+        workspace_b = client.new_workspace(window_id=window_b, select=False)
         client.rename_workspace(token_b, workspace=workspace_b)
         time.sleep(0.25)
 

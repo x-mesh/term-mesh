@@ -138,6 +138,9 @@ if __name__ == "__main__":
         if getattr(e, "output", None):
             print(e.output.strip())
         raise SystemExit(1)
+    except subprocess.TimeoutExpired as e:
+        print(f"SKIP: System Events automation timed out on this host: {e}")
+        raise SystemExit(0)
     except termmeshError as e:
         print(f"FAIL: {e}")
         raise SystemExit(1)

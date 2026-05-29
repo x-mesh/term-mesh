@@ -43,6 +43,9 @@ cd "$(dirname "$0")/.."
 DERIVED_DATA_PATH="$HOME/Library/Developer/Xcode/DerivedData/term-mesh-tests-v2"
 APP="$DERIVED_DATA_PATH/Build/Products/Debug/term-mesh DEV.app"
 CLI="$DERIVED_DATA_PATH/Build/Products/Debug/term-mesh"
+DAEMON_BIN="$PWD/daemon/target/release/term-meshd"
+DAEMON_SOCK_PATH="${TMPDIR:-/tmp}/term-meshd.sock"
+DAEMON_LOG_PATH="/tmp/term-meshd-e2e.log"
 
 echo "== build =="
 # Work around stale explicit-module cache artifacts (notably Sentry headers) that can
@@ -78,7 +81,11 @@ export TERMMESH_CLI_BIN="$CLI"
 cleanup() {
   pkill -x "term-mesh DEV" || true
   pkill -x "term-mesh" || true
-  rm -f /tmp/term-mesh*.sock /tmp/term-mesh*.sock || true
+  pkill -f "term-meshd" || true
+  rm -f /tmp/term-mesh*.sock /tmp/term-meshd*.sock || true
+  if [ -n "${TMPDIR:-}" ]; then
+    rm -f "$TMPDIR"/term-mesh*.sock "$TMPDIR"/term-meshd*.sock || true
+  fi
 }
 
 launch_and_wait() {
@@ -93,8 +100,18 @@ launch_and_wait() {
   # Force socket mode for deterministic automation runs, independent of prior user settings.
   defaults write com.termmesh.app.debug socketControlMode -string full >/dev/null 2>&1 || true
 
+  if [ -x "$DAEMON_BIN" ]; then
+    TERMMESH_DAEMON_UNIX_PATH="$DAEMON_SOCK_PATH" \
+    TERM_MESH_HTTP_DISABLED=1 \
+    "$DAEMON_BIN" >>"$DAEMON_LOG_PATH" 2>&1 &
+  fi
+
   # Launch directly with UI test mode enabled so startup follows deterministic test codepaths.
-  TERMMESH_UI_TEST_MODE=1 "$APP/Contents/MacOS/term-mesh DEV" >/dev/null 2>&1 &
+  PROJECT_DIR="$PWD" \
+  DAEMON_BINARY_PATH="$PWD/daemon/target/release/term-meshd" \
+  TERMMESH_DAEMON_UNIX_PATH="$DAEMON_SOCK_PATH" \
+  TERMMESH_UI_TEST_MODE=1 \
+  "$APP/Contents/MacOS/term-mesh DEV" >/dev/null 2>&1 &
 
   SOCK=""
   for _ in {1..120}; do
@@ -111,6 +128,26 @@ launch_and_wait() {
   fi
   export TERMMESH_SOCKET_PATH="$SOCK"
   export TERMMESH_SOCKET="$SOCK"
+
+  DAEMON_SOCK=""
+  for _ in {1..80}; do
+    for candidate in "$DAEMON_SOCK_PATH" "${TMPDIR:-/tmp}/term-meshd.sock" /tmp/term-meshd.sock; do
+      if [ -S "$candidate" ]; then
+        DAEMON_SOCK="$candidate"
+        break
+      fi
+    done
+    if [ -n "$DAEMON_SOCK" ]; then
+      break
+    fi
+    sleep 0.1
+  done
+  if [ -n "$DAEMON_SOCK" ]; then
+    export TERMMESH_DAEMON_SOCKET="$DAEMON_SOCK"
+    export TERMMESH_DAEMON_UNIX_PATH="$DAEMON_SOCK"
+  else
+    unset TERMMESH_DAEMON_SOCKET TERMMESH_DAEMON_UNIX_PATH
+  fi
 
   # Ensure LaunchServices has a visible/main window attached for rendering checks.
   open "$APP" >/dev/null 2>&1 || true

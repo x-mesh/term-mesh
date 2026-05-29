@@ -19,6 +19,8 @@ Usage:
     python3 tests_v2/test_omnibar_focus_cpu.py
 """
 
+from __future__ import annotations
+
 import os
 import subprocess
 import sys

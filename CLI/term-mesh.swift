@@ -685,19 +685,19 @@ struct TermMeshCLI {
             if let unknown = remaining.first(where: { $0.hasPrefix("--") }) {
                 throw CLIError(message: "new-workspace: unknown flag '\(unknown)'. Known flags: --command <text>")
             }
-            let response = try sendV1Command("new_workspace", client: client)
-            print(response)
             if let commandText = commandOpt {
-                guard response.hasPrefix("OK ") else {
+                let launchCommand = shellWrappedCommand(unescapeSendText(commandText))
+                let payload = try client.sendV2(method: "workspace.create", params: ["command": launchCommand])
+                guard let dict = payload as? [String: Any],
+                      let wsId = dict["workspace_id"] as? String,
+                      !wsId.isEmpty else {
                     throw CLIError(message: "new-workspace failed, cannot run --command")
                 }
-                let wsId = String(response.dropFirst(3)).trimmingCharacters(in: .whitespacesAndNewlines)
-                // Wait for shell to initialize
-                Thread.sleep(forTimeInterval: 0.5)
-                let text = unescapeSendText(commandText + "\\n")
-                let params: [String: Any] = ["text": text, "workspace_id": wsId]
-                _ = try client.sendV2(method: "surface.send_text", params: params)
+                print("OK \(wsId)")
+                break
             }
+            let response = try sendV1Command("new_workspace", client: client)
+            print(response)
 
         case "new-split":
             let (wsArg, rem0) = parseOption(commandArgs, name: "--workspace")
@@ -3828,6 +3828,14 @@ struct TermMeshCLI {
             .replacingOccurrences(of: "\\n", with: "\r")
             .replacingOccurrences(of: "\\r", with: "\r")
             .replacingOccurrences(of: "\\t", with: "\t")
+    }
+
+    private func shellWrappedCommand(_ command: String) -> String {
+        let shell = ProcessInfo.processInfo.environment["SHELL"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let resolvedShell = (shell?.isEmpty == false) ? shell! : "/bin/zsh"
+        let escaped = command.replacingOccurrences(of: "'", with: "'\\''")
+        return "\(resolvedShell) -l -c '\(escaped)'"
     }
 
     private func workspaceFromArgsOrEnv(_ args: [String], windowOverride: String? = nil) -> String? {

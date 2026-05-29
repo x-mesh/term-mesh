@@ -14,6 +14,8 @@ This test avoids `layout_debug` because it calls `layoutSubtreeIfNeeded()` and c
 layout/view-tree problems.
 """
 
+from __future__ import annotations
+
 import os
 import sys
 import time

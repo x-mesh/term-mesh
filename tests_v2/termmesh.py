@@ -385,7 +385,7 @@ class termmesh:
             ))
         return out
 
-    def new_workspace(self, window_id: Optional[str] = None) -> str:
+    def new_workspace(self, window_id: Optional[str] = None, select: bool = True) -> str:
         params: Dict[str, Any] = {}
         if window_id is not None:
             params["window_id"] = str(window_id)
@@ -393,7 +393,13 @@ class termmesh:
         wsid = res.get("workspace_id")
         if not wsid:
             raise termmeshError(f"workspace.create returned no workspace_id: {res}")
-        return str(wsid)
+        wsid = str(wsid)
+        if select:
+            select_params: Dict[str, Any] = {"workspace_id": wsid}
+            if window_id is not None:
+                select_params["window_id"] = str(window_id)
+            self._call("workspace.select", select_params)
+        return wsid
 
     def select_workspace(self, workspace: Union[str, int]) -> None:
         wsid = self._resolve_workspace_id(workspace)
@@ -1134,6 +1140,11 @@ def _default_daemon_socket_path() -> str:
     candidate = parent / "term-meshd.sock"
     if candidate.exists():
         return str(candidate)
+    tmpdir = os.environ.get("TMPDIR")
+    if tmpdir:
+        candidate = pathlib.Path(tmpdir) / "term-meshd.sock"
+        if candidate.exists():
+            return str(candidate)
     return "/tmp/term-meshd.sock"
 
 

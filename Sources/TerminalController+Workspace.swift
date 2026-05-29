@@ -66,6 +66,12 @@ extension TerminalController {
                 command: command
             )
             newId = ws.id
+            if command != nil, !shouldFocus {
+                for panel in ws.panels.values {
+                    guard let terminalPanel = panel as? TerminalPanel else { continue }
+                    terminalPanel.surface.requestBackgroundSurfaceStartIfNeeded(reason: "workspaceCreateCommand")
+                }
+            }
             if let wt = preCreatedWorktree {
                 ws.worktreeName = wt.name
                 ws.worktreeRepoPath = TermMeshDaemon.shared.findGitRoot(from: cwd ?? "")
@@ -149,6 +155,97 @@ extension TerminalController {
             "workspace_ref": v2Ref(kind: .workspace, uuid: wsId)
         ])
     }
+
+    func v2WorkspaceSidebarState(params: [String: Any]) -> V2CallResult {
+        guard let tabManager = v2ResolveTabManager(params: params) else {
+            return .err(code: "unavailable", message: "TabManager not available", data: nil)
+        }
+
+        var payload: [String: Any]?
+        v2MainSync {
+            guard let ws = v2ResolveWorkspace(params: params, tabManager: tabManager) else { return }
+            var result: [String: Any] = [
+                "tab": ws.id.uuidString,
+                "workspace_id": ws.id.uuidString,
+                "workspace_ref": v2Ref(kind: .workspace, uuid: ws.id),
+                "cwd": ws.currentDirectory
+            ]
+
+            if let focused = ws.focusedPanelId {
+                result["focused_panel"] = focused.uuidString
+                result["focused_panel_ref"] = v2Ref(kind: .surface, uuid: focused)
+                result["focused_cwd"] = ws.panelDirectories[focused] ?? "unknown"
+            } else {
+                result["focused_panel"] = "unknown"
+                result["focused_cwd"] = "unknown"
+            }
+
+            if let liveGit = v2SidebarGitBranch(in: ws.currentDirectory) {
+                result["git_branch"] = "\(liveGit.branch)\(liveGit.isDirty ? " dirty" : " clean")"
+            } else if let git = ws.gitBranch {
+                result["git_branch"] = "\(git.branch)\(git.isDirty ? " dirty" : " clean")"
+            } else {
+                result["git_branch"] = "none"
+            }
+
+            result["ports"] = ws.listeningPorts.isEmpty ? "none" : ws.listeningPorts.map(String.init)
+            if let progress = ws.progress {
+                let label = progress.label ?? ""
+                result["progress"] = "\(String(format: "%.2f", progress.value)) \(label)"
+                    .trimmingCharacters(in: .whitespaces)
+            } else {
+                result["progress"] = "none"
+            }
+            result["status_count"] = ws.statusEntries.count
+            result["log_count"] = ws.logEntries.count
+            payload = result
+        }
+
+        guard let payload else {
+            return .err(code: "not_found", message: "Workspace not found", data: nil)
+        }
+        return .ok(payload)
+    }
+
+    private func v2SidebarGitBranch(in directory: String) -> (branch: String, isDirty: Bool)? {
+        let trimmed = directory.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+
+        let branchProcess = Process()
+        branchProcess.executableURL = URL(fileURLWithPath: "/usr/bin/git")
+        branchProcess.arguments = ["branch", "--show-current"]
+        branchProcess.currentDirectoryURL = URL(fileURLWithPath: trimmed)
+        let branchPipe = Pipe()
+        branchProcess.standardOutput = branchPipe
+        branchProcess.standardError = FileHandle.nullDevice
+        do {
+            try branchProcess.run()
+            branchProcess.waitUntilExit()
+        } catch {
+            return nil
+        }
+        guard branchProcess.terminationStatus == 0 else { return nil }
+        let branch = (String(data: branchPipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? "")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !branch.isEmpty else { return nil }
+
+        let statusProcess = Process()
+        statusProcess.executableURL = URL(fileURLWithPath: "/usr/bin/git")
+        statusProcess.arguments = ["status", "--porcelain", "--short"]
+        statusProcess.currentDirectoryURL = URL(fileURLWithPath: trimmed)
+        let statusPipe = Pipe()
+        statusProcess.standardOutput = statusPipe
+        statusProcess.standardError = FileHandle.nullDevice
+        do {
+            try statusProcess.run()
+            statusProcess.waitUntilExit()
+        } catch {
+            return (branch, false)
+        }
+        let status = String(data: statusPipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+        return (branch, !status.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+    }
+
     func v2WorkspaceClose(params: [String: Any]) -> V2CallResult {
         guard let tabManager = v2ResolveTabManager(params: params) else {
             return .err(code: "unavailable", message: "TabManager not available", data: nil)

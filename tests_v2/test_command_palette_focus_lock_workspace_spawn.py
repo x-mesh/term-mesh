@@ -94,7 +94,7 @@ def main() -> int:
         selection = _palette_input_selection(client, window_id)
         _assert_caret_at_end(selection, "initial state")
 
-        client.new_workspace(window_id=window_id)
+        client.new_workspace(window_id=window_id, select=False)
         _wait_until(
             lambda: len(client.list_workspaces(window_id=window_id)) >= workspace_count_before + 1,
             message="workspace.create did not add a new workspace",

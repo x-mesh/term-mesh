@@ -120,7 +120,8 @@ def main() -> int:
             client.clear_notifications()
 
             workspace_id = client.new_workspace()
-            surfaces = client.list_surfaces()
+            client.select_workspace(workspace_id)
+            surfaces = client.list_surfaces(workspace_id)
             if not surfaces:
                 return fail("Expected at least one surface in new workspace")
 

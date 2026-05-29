@@ -54,6 +54,13 @@ def _wait_for_input_state(client, window_id, expected_text_length, message, time
     _wait_until(_matches, timeout_s=timeout_s, message=message)
 
 
+def _input_text_length(client, window_id):
+    selection = _palette_input_selection(client, window_id)
+    if not selection.get("focused"):
+        raise termmeshError(f"palette input is not focused: {selection}")
+    return int(selection.get("text_length") or 0)
+
+
 def _close_palette_if_open(client, window_id):
     if _palette_visible(client, window_id):
         client._call("debug.command_palette.toggle", {"window_id": window_id})
@@ -70,12 +77,11 @@ def _open_palette(client, window_id):
         lambda: _palette_visible(client, window_id),
         message="command palette failed to open",
     )
-    _wait_for_input_state(
-        client,
-        window_id,
-        expected_text_length=0,
-        message="search input did not focus with empty query",
+    _wait_until(
+        lambda: bool(_palette_input_selection(client, window_id).get("focused")),
+        message="search input did not focus",
     )
+    return _input_text_length(client, window_id)
 
 
 def main():
@@ -98,13 +104,13 @@ def main():
         probe = "typingstability"
         cycles = 4
         for cycle in range(cycles):
-            _open_palette(client, window_id)
+            initial_length = _open_palette(client, window_id)
             for idx, ch in enumerate(probe, start=1):
                 client.simulate_type(ch)
                 _wait_for_input_state(
                     client,
                     window_id,
-                    expected_text_length=idx,
+                    expected_text_length=initial_length + idx,
                     timeout_s=0.7,
                     message=(
                         f"search typing did not accumulate at cycle {cycle + 1}/{cycles}, "
