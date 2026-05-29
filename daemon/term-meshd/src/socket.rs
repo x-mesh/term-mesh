@@ -162,6 +162,10 @@ pub struct Context {
     /// RPC handlers mutate this; the scheduler in `crate::drift_watch` reads it.
     /// Distinct from `watcher_handle` (the unrelated `crate::watcher` fs monitor).
     pub watch_registry: crate::drift_watch::WatchRegistry,
+    /// R4: runner + sink cloned into Context so `watch.trigger_now` can fire
+    /// checks directly without routing through the scheduler's interval loop.
+    pub watch_runner: Option<Arc<dyn crate::headless::one_shot::WatchCheckRunner>>,
+    pub watch_sink: Option<tokio::sync::mpsc::UnboundedSender<crate::headless::one_shot::WatchCheckOutcome>>,
     pub pane_tracker: PaneTracker,
     pub event_tx: EventSender,
 }
@@ -190,6 +194,8 @@ pub async fn serve(
     agent_manager: Arc<AgentSessionManager>,
     headless: Arc<tokio::sync::Mutex<HeadlessManager>>,
     watch_registry: crate::drift_watch::WatchRegistry,
+    watch_runner: Option<Arc<dyn crate::headless::one_shot::WatchCheckRunner>>,
+    watch_sink: Option<tokio::sync::mpsc::UnboundedSender<crate::headless::one_shot::WatchCheckOutcome>>,
     mut shutdown_rx: watch::Receiver<bool>,
 ) -> anyhow::Result<()> {
     if path.exists() {
@@ -213,6 +219,8 @@ pub async fn serve(
         agent_manager,
         headless,
         watch_registry,
+        watch_runner,
+        watch_sink,
         pane_tracker,
         event_tx,
     });
@@ -2179,6 +2187,44 @@ async fn dispatch(req: &Request, ctx: &Context) -> Response {
                         "enabled": false,
                         "found": found,
                     }))
+                }
+                Err(e) => Err(format!("invalid params: {e}")),
+            }
+        }
+        "watch.trigger_now" => {
+            #[derive(Deserialize)]
+            struct P {
+                team_id: String,
+            }
+            match serde_json::from_value::<P>(req.params.clone()) {
+                Ok(p) if p.team_id.is_empty() => Err("team_id required".to_string()),
+                Ok(p) => {
+                    match (&ctx.watch_runner, &ctx.watch_sink) {
+                        (Some(runner), Some(sink)) => {
+                            match crate::drift_watch::trigger_now(
+                                &p.team_id,
+                                &ctx.watch_registry,
+                                runner,
+                                sink,
+                            )
+                            .await
+                            {
+                                Ok(n) => Ok(serde_json::json!({
+                                    "status": "ok",
+                                    "team_id": p.team_id,
+                                    "triggered": true,
+                                    "check_count": n,
+                                })),
+                                Err(reason) => Ok(serde_json::json!({
+                                    "status": "rejected",
+                                    "team_id": p.team_id,
+                                    "triggered": false,
+                                    "reason": reason,
+                                })),
+                            }
+                        }
+                        _ => Err("watch runner not available (headless watch not initialised)".to_string()),
+                    }
                 }
                 Err(e) => Err(format!("invalid params: {e}")),
             }

@@ -1270,9 +1270,38 @@ private struct TeamIndicatorBlock: View {
                         refreshWatchChip()
                     }
                     .disabled(!watchEnabled)
-                    // R4 (watch.trigger_now) not yet implemented — keep disabled
-                    Button("Run Watch Check Now") {}
-                        .disabled(true)
+                    // R4: watch.trigger_now — fires one immediate check, bypassing the interval
+                    Button("Run Watch Check Now") {
+                        let tn = teamName
+                        DispatchQueue.global(qos: .userInitiated).async {
+                            let raw = TermMeshDaemon.shared.rpcCallRaw(
+                                method: "watch.trigger_now", params: ["team_id": tn])
+                            DispatchQueue.main.async {
+                                guard let raw,
+                                      let data = raw.data(using: .utf8),
+                                      let json = try? JSONSerialization.jsonObject(with: data)
+                                            as? [String: Any]
+                                else {
+                                    let a = NSAlert()
+                                    a.messageText = "Watch check failed"
+                                    a.informativeText = "Could not reach the daemon"
+                                    a.alertStyle = .warning
+                                    a.runModal()
+                                    return
+                                }
+                                if (json["status"] as? String) == "rejected" {
+                                    let reason = json["reason"] as? String ?? "in-flight or disabled"
+                                    let a = NSAlert()
+                                    a.messageText = "Watch check skipped"
+                                    a.informativeText = reason.prefix(1).uppercased() + reason.dropFirst()
+                                    a.alertStyle = .informational
+                                    a.runModal()
+                                }
+                                // status == "ok": silent success
+                            }
+                        }
+                    }
+                    .disabled(!watchEnabled)
                 }
             }
 

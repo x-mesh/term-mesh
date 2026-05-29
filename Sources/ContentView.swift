@@ -3360,6 +3360,18 @@ struct ContentView: View {
                 when: { _ in !TeamOrchestrator.shared.teams.isEmpty }
             )
         )
+        // R4: run one immediate check (watch.trigger_now). Only shown when watch is enabled
+        // for at least one team (synchronous check via daemon rpcCallRaw is not used here to
+        // avoid blocking; the handler provides feedback if watch is off/rejected).
+        contributions.append(
+            CommandPaletteCommandContribution(
+                commandId: "palette.runWatchNow",
+                title: constant("Run Watch Check Now"),
+                subtitle: constant("Watch"),
+                keywords: ["watch", "drift", "oversight", "run", "now", "trigger", "check"],
+                when: { _ in !TeamOrchestrator.shared.teams.isEmpty }
+            )
+        )
 
         return contributions
     }
@@ -3710,8 +3722,37 @@ struct ContentView: View {
             let params: [String: Any] = ["team_id": teamName]
             _ = TermMeshDaemon.shared.rpcCallRaw(method: "watch.off", params: params)
         }
-        // palette.runWatchNow is intentionally absent: depends on R4 (watch.trigger_now)
-        // which is not yet implemented in the daemon.
+        // R4: immediately trigger one check cycle for the first active team
+        registry.register(commandId: "palette.runWatchNow") {
+            let teams = TeamOrchestrator.shared.teams
+            guard let teamName = teams.keys.sorted().first else { return }
+            let params: [String: Any] = ["team_id": teamName]
+            DispatchQueue.global(qos: .userInitiated).async {
+                let raw = TermMeshDaemon.shared.rpcCallRaw(method: "watch.trigger_now", params: params)
+                DispatchQueue.main.async {
+                    guard let raw,
+                          let data = raw.data(using: .utf8),
+                          let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+                    else {
+                        let a = NSAlert()
+                        a.messageText = "Watch check failed"
+                        a.informativeText = "Could not reach the daemon"
+                        a.alertStyle = .warning
+                        a.runModal()
+                        return
+                    }
+                    if (json["status"] as? String) == "rejected" {
+                        let reason = json["reason"] as? String ?? "in-flight or disabled"
+                        let a = NSAlert()
+                        a.messageText = "Watch check skipped"
+                        a.informativeText = reason.prefix(1).uppercased() + reason.dropFirst()
+                        a.alertStyle = .informational
+                        a.runModal()
+                    }
+                    // status == "ok": silent success
+                }
+            }
+        }
     }
 
     private var focusedPanelContext: (workspace: Workspace, panelId: UUID, panel: any Panel)? {

@@ -182,6 +182,10 @@ async fn main() -> anyhow::Result<()> {
     // streams outcomes to the WatchController, which writes .xm/watch/board.jsonl
     // and posts DRIFT findings to the team leader inbox (focus-free).
     let watch_registry = drift_watch::new_registry();
+    // R4: keep runner + sink alive in outer scope so socket::serve can use them
+    // for watch.trigger_now without going through the scheduler's interval loop.
+    let watch_runner_for_serve: Option<std::sync::Arc<dyn headless::one_shot::WatchCheckRunner>>;
+    let watch_sink_for_serve: Option<tokio::sync::mpsc::UnboundedSender<headless::one_shot::WatchCheckOutcome>>;
     {
         // P10: populate the registry from persisted /watch config (P6's loader),
         // so `/watch on` survives a daemon restart (R13). The daemon cwd is the
@@ -211,9 +215,12 @@ async fn main() -> anyhow::Result<()> {
             watch_controller::AppSocketInbox,
         ));
 
-        let runner: Arc<dyn headless::one_shot::WatchCheckRunner> = Arc::new(
+        let runner: std::sync::Arc<dyn headless::one_shot::WatchCheckRunner> = std::sync::Arc::new(
             headless::one_shot::HeadlessOneShotRunner::new(headless_manager.clone()),
         );
+        // Stash clones before moving runner + sink into the scheduler task.
+        watch_runner_for_serve = Some(std::sync::Arc::clone(&runner));
+        watch_sink_for_serve = Some(watch_sink_tx.clone());
         tokio::spawn(drift_watch::run_watch_scheduler(
             watch_registry.clone(),
             runner,
@@ -283,6 +290,8 @@ async fn main() -> anyhow::Result<()> {
         agent_manager.clone(),
         headless_manager.clone(),
         watch_registry,
+        watch_runner_for_serve,
+        watch_sink_for_serve,
         shutdown_rx,
     ));
 

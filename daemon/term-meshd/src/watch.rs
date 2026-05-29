@@ -399,6 +399,107 @@ async fn sweep_once(
     }
 }
 
+/// R4: Immediately fire one check for `team_id`, bypassing the cadence timer.
+///
+/// Returns `Ok(n)` where `n` is the number of checks triggered (1 for a
+/// single-target team, N for an all-workers fan-out), or an error string that
+/// the socket handler forwards as an RPC error.
+///
+/// Guards: `enabled=false` and `in_flight=true` are both rejected so the
+/// manual trigger never duplicates a running check or starts a check for a
+/// disabled watch.
+pub async fn trigger_now(
+    team_id: &str,
+    registry: &WatchRegistry,
+    runner: &Arc<dyn WatchCheckRunner>,
+    sink: &mpsc::UnboundedSender<WatchCheckOutcome>,
+) -> Result<usize, String> {
+    let to_fire: Vec<WatchCheckInput>;
+    {
+        let mut reg = registry.lock().await;
+        let st = reg
+            .get_mut(team_id)
+            .ok_or_else(|| format!("no watch config for team '{team_id}'"))?;
+
+        if !st.enabled {
+            return Err("watch is not enabled for this team".to_string());
+        }
+        if st.in_flight {
+            return Err("a check is already in progress for this team".to_string());
+        }
+
+        let is_all = st
+            .target
+            .as_deref()
+            .map(|t| t.is_empty() || t == "all")
+            .unwrap_or(true);
+        let targets: Vec<String> = if is_all {
+            if st.workers.is_empty() {
+                return Err(
+                    "no workers configured (set --target <name> or pass workers via watch.on)"
+                        .to_string(),
+                );
+            }
+            st.workers.clone()
+        } else {
+            vec![st.target.clone().unwrap()]
+        };
+
+        let spec = resolve_spec(&st.spec, &st.working_directory)
+            .map_err(|e| format!("spec resolve failed: {e}"))?;
+
+        st.check_count += 1;
+        st.in_flight = true;
+        st.last_check_ts = now_unix();
+        st.last_error = None;
+
+        let check_kind = drift_kind_for(st.check_count, st.exec_to_dir_ratio);
+        let ts = st.last_check_ts;
+        let count = st.check_count;
+
+        to_fire = targets
+            .into_iter()
+            .map(|target| {
+                let check_id = make_check_id(ts, team_id, Some(target.as_str()), &spec, count);
+                WatchCheckInput {
+                    team_name: team_id.to_string(),
+                    target,
+                    check_id,
+                    check_kind,
+                    stance: st.stance.clone(),
+                    spec: spec.clone(),
+                    delta: String::new(),
+                    cli: st.cli.clone(),
+                    model: st.model.clone(),
+                    working_directory: st.working_directory.clone(),
+                    cli_path: st.cli_path.clone(),
+                    app_socket_path: st.app_socket_path.clone(),
+                    reply_timeout: Duration::from_secs(st.reply_timeout_secs),
+                }
+            })
+            .collect();
+    } // registry lock released
+
+    let n = to_fire.len();
+    let team_id = team_id.to_string();
+    let runner = Arc::clone(runner);
+    let sink = sink.clone();
+    let registry = Arc::clone(registry);
+    tokio::spawn(async move {
+        let mut last_error: Option<String> = None;
+        for input in to_fire {
+            let outcome = runner.run_check(input).await;
+            last_error = outcome.error.clone();
+            let _ = sink.send(outcome);
+        }
+        if let Some(st) = registry.lock().await.get_mut(&team_id) {
+            st.in_flight = false;
+            st.last_error = last_error;
+        }
+    });
+    Ok(n)
+}
+
 /// Run the autonomous watch scheduler until `shutdown_rx` flips to `true`.
 ///
 /// Wakes every `sweep_granularity` (the immediate first interval tick is
