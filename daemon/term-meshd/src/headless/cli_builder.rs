@@ -120,7 +120,12 @@ pub fn build_claude_command(
     ] {
         args.push(OsString::from(s));
     }
-    args.push(OsString::from(model));
+    // "opus" and legacy "opus-1m" both resolve to claude-opus-4-8[1m].
+    let resolved_model = match model {
+        "opus" | "opus-1m" => "claude-opus-4-8[1m]",
+        other => other,
+    };
+    args.push(OsString::from(resolved_model));
 
     // Pass agent-specific instructions as --append-system-prompt.
     // Raw bytes — no escaping. `Command::arg` does NOT pass through a shell,
@@ -171,7 +176,7 @@ fn os_string_from_bytes(b: &[u8]) -> OsString {
 /// Map short model names to Kiro CLI model identifiers.
 fn kiro_model_name(short: &str) -> &str {
     match short.to_lowercase().as_str() {
-        "opus" => "claude-opus-4.7",
+        "opus" => "claude-opus-4.8",
         "sonnet" => "claude-sonnet-4.6",
         "haiku" => "claude-haiku-4.5",
         _ => short,
