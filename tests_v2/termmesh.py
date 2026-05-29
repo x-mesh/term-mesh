@@ -1174,11 +1174,21 @@ def daemon_call(
         except Exception:
             pass
 
-    if resp.get("ok") is True:
+    # Daemon (term-meshd) responds with {"id": N, "result": ...} without an "ok" field.
+    # App socket responds with {"id": N, "ok": true/false, "result": ...}.
+    # Accept either form: if "ok" is present, respect it; if "result" exists and
+    # no "error", treat as success.
+    if "error" in resp:
+        err = resp.get("error") or {}
+        msg = err.get("message") if isinstance(err, dict) else str(err)
+        raise termmeshError(f"daemon RPC error ({method}): {msg}")
+    if resp.get("ok") is False:
+        err = resp.get("error") or {}
+        msg = err.get("message") if isinstance(err, dict) else str(err)
+        raise termmeshError(f"daemon RPC error ({method}): {msg}")
+    if "result" in resp or resp.get("ok") is True:
         return resp.get("result")
-    err = resp.get("error") or {}
-    msg = err.get("message") or str(resp)
-    raise termmeshError(f"daemon RPC error ({method}): {msg}")
+    raise termmeshError(f"daemon_call unexpected response ({method}): {resp}")
 
 
 if __name__ == "__main__":
