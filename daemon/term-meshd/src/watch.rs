@@ -56,8 +56,13 @@ pub struct WatchState {
     pub interval_secs: u64,
     /// Every `exec_to_dir_ratio + 1`-th check is a direction check.
     pub exec_to_dir_ratio: u32,
-    /// Watched agent name; `None` = all workers on the team (fan-out is P5).
+    /// Watched agent name. `None` or `"all"` = fan-out over every name in `workers`.
     pub target: Option<String>,
+    /// Worker names to monitor when target is None/"all" (P5 fan-out).
+    /// Populated by `watch.on` — either from explicit `workers` param (GUI/Swift)
+    /// or auto-queried from HeadlessManager (headless teams).
+    #[serde(default)]
+    pub workers: Vec<String>,
     pub cli: String,
     pub model: String,
     /// `critic` (default) | `advisor` | `pair`.
@@ -102,6 +107,7 @@ impl WatchState {
             },
             exec_to_dir_ratio: DEFAULT_EXEC_TO_DIR_RATIO,
             target,
+            workers: vec![],
             cli: cli.into(),
             model: model.into(),
             stance: stance.into(),
@@ -277,12 +283,26 @@ async fn sweep_once(
             // cadence) regardless of whether the check actually fires below.
             last_fired.insert(team_id.clone(), now);
 
-            // #1-b: a watch target is required (MVP — no all-workers fan-out yet).
-            // Without one, skip and record the reason instead of running an
-            // invalid empty-target check.
-            let Some(target) = st.target.clone().filter(|t| !t.is_empty()) else {
-                st.last_error = Some("watch target required (set --target)".to_string());
-                continue;
+            // #1-b: Resolve target(s). A specific name → single check. None / "" / "all"
+            // → fan-out over every name in `st.workers` (P5). Without workers,
+            // skip and record the reason.
+            let is_all = st
+                .target
+                .as_deref()
+                .map(|t| t.is_empty() || t == "all")
+                .unwrap_or(true);
+            let targets: Vec<String> = if is_all {
+                if st.workers.is_empty() {
+                    st.last_error = Some(
+                        "watch target required: no workers configured \
+                         (set --target <name> or pass workers via watch.on)"
+                            .to_string(),
+                    );
+                    continue;
+                }
+                st.workers.clone()
+            } else {
+                vec![st.target.clone().unwrap()]
             };
 
             // #2: resolve an `@path` spec from the worktree each tick so spec-file
@@ -296,52 +316,64 @@ async fn sweep_once(
                 }
             };
 
-            // Valid → trigger. Update counters under the lock so concurrent
-            // sweeps can't double-fire, then build the spawn input.
+            // Valid → trigger. Update counters once per tick (not per worker) so
+            // the exec/direction cadence counts ticks, not individual agent checks.
             st.check_count += 1;
             st.in_flight = true;
             st.last_check_ts = now_unix();
             st.last_error = None;
             let check_kind = drift_kind_for(st.check_count, st.exec_to_dir_ratio);
-            let check_id = make_check_id(
-                st.last_check_ts,
-                team_id,
-                Some(target.as_str()),
-                &spec,
-                st.check_count,
-            );
-            to_fire.push(WatchCheckInput {
-                team_name: team_id.clone(),
-                target,
-                check_id,
-                check_kind,
-                stance: st.stance.clone(),
-                spec,
-                // The spawned watcher self-collects the bounded target delta over
-                // its own app socket (P10), so the scheduler leaves delta empty.
-                delta: String::new(),
-                cli: st.cli.clone(),
-                model: st.model.clone(),
-                working_directory: st.working_directory.clone(),
-                cli_path: st.cli_path.clone(),
-                app_socket_path: st.app_socket_path.clone(),
-                reply_timeout: Duration::from_secs(st.reply_timeout_secs),
-            });
+            let ts = st.last_check_ts;
+            let count = st.check_count;
+
+            // Fan-out: one WatchCheckInput per target, each with a worker-specific
+            // check_id so board.jsonl can attribute verdicts per worker.
+            for target in targets {
+                let check_id = make_check_id(ts, team_id, Some(target.as_str()), &spec, count);
+                to_fire.push(WatchCheckInput {
+                    team_name: team_id.clone(),
+                    target,
+                    check_id,
+                    check_kind,
+                    stance: st.stance.clone(),
+                    spec: spec.clone(),
+                    // The spawned watcher self-collects the bounded target delta over
+                    // its own app socket (P10), so the scheduler leaves delta empty.
+                    delta: String::new(),
+                    cli: st.cli.clone(),
+                    model: st.model.clone(),
+                    working_directory: st.working_directory.clone(),
+                    cli_path: st.cli_path.clone(),
+                    app_socket_path: st.app_socket_path.clone(),
+                    reply_timeout: Duration::from_secs(st.reply_timeout_secs),
+                });
+            }
         }
     }
 
+    // P2-A fix: group by team so in_flight is cleared exactly once per team
+    // after ALL its workers finish — not by the first worker that completes.
+    // One tokio::spawn per team runs workers sequentially within that team.
+    let mut by_team: HashMap<String, Vec<WatchCheckInput>> = HashMap::new();
     for input in to_fire {
+        by_team.entry(input.team_name.clone()).or_default().push(input);
+    }
+    for (team_id, inputs) in by_team {
         let runner = Arc::clone(runner);
         let sink = sink.clone();
         let registry = Arc::clone(registry);
-        let team_id = input.team_name.clone();
         tokio::spawn(async move {
-            let outcome = runner.run_check(input).await;
+            let mut last_error: Option<String> = None;
+            for input in inputs {
+                let outcome = runner.run_check(input).await;
+                last_error = outcome.error.clone();
+                let _ = sink.send(outcome);
+            }
+            // Clear in_flight once after ALL workers for this team complete.
             if let Some(st) = registry.lock().await.get_mut(&team_id) {
                 st.in_flight = false;
-                st.last_error = outcome.error.clone();
+                st.last_error = last_error;
             }
-            let _ = sink.send(outcome);
         });
     }
 }

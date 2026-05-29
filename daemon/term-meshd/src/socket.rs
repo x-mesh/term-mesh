@@ -1979,6 +1979,11 @@ async fn dispatch(req: &Request, ctx: &Context) -> Response {
                 interval_secs: u64,
                 #[serde(default)]
                 target: Option<String>,
+                /// Explicit worker list for all-workers fan-out (P5).
+                /// GUI/Swift callers pass this; headless teams are auto-queried
+                /// from HeadlessManager when omitted.
+                #[serde(default)]
+                workers: Option<Vec<String>>,
                 #[serde(default = "default_watch_cli")]
                 cli: String,
                 #[serde(default = "default_watch_model")]
@@ -2017,6 +2022,50 @@ async fn dispatch(req: &Request, ctx: &Context) -> Response {
                     } else {
                         p.interval_secs.max(MIN_WATCH_INTERVAL_SECS)
                     };
+
+                    // P5 fan-out: resolve worker list BEFORE acquiring reg lock
+                    // (avoids holding both locks simultaneously).
+                    // Priority: explicit `workers` param > HeadlessManager query.
+                    // GUI teams pass `workers` explicitly; headless teams are
+                    // auto-queried. Workers are agents whose name is not "watcher"
+                    // (heuristic — same convention as auto_watch_decision).
+                    // Note: duplicate-named workers (e.g. two "executor" agents) map
+                    // to a single entry in the list — `tm-agent read` will reach the
+                    // first matching panel. This is a known limitation; per-panelId
+                    // routing would require a richer target format.
+                    let is_all_target = p
+                        .target
+                        .as_deref()
+                        .map(|t| t.is_empty() || t == "all")
+                        .unwrap_or(true);
+                    let resolved_workers: Vec<String> = if let Some(explicit) = p.workers.clone() {
+                        explicit
+                    } else if is_all_target {
+                        let agents = ctx.headless.lock().await.list(Some(&p.team_id)).await;
+                        let mut names: Vec<String> = agents
+                            .into_iter()
+                            .filter(|a| a.name != "watcher" && !a.name.starts_with("watcher"))
+                            .map(|a| a.name)
+                            .collect();
+                        // P1 fix: GUI (pane) teams have no headless agents → headless.list
+                        // returns empty. Fall back to app socket team.status so GUI team
+                        // workers are auto-populated (same as explicit-workers path).
+                        if names.is_empty() {
+                            if let Some(ref app_sock) = p.app_socket_path {
+                                if !app_sock.is_empty() {
+                                    names = query_gui_team_workers(app_sock, &p.team_id).await;
+                                }
+                            }
+                        }
+                        // Deduplicate while preserving order (duplicate-named workers
+                        // can only be addressed by name once via tm-agent read).
+                        let mut seen = std::collections::HashSet::new();
+                        names.retain(|n| seen.insert(n.clone()));
+                        names
+                    } else {
+                        vec![]
+                    };
+
                     let mut reg = ctx.watch_registry.lock().await;
                     let interval = match reg.get_mut(&p.team_id) {
                         // Refresh existing config; preserve live counters.
@@ -2029,6 +2078,7 @@ async fn dispatch(req: &Request, ctx: &Context) -> Response {
                                 st.exec_to_dir_ratio = r;
                             }
                             st.target = p.target.clone();
+                            st.workers = resolved_workers;
                             st.cli = p.cli.clone();
                             st.model = p.model.clone();
                             st.stance = p.stance.clone();
@@ -2056,6 +2106,7 @@ async fn dispatch(req: &Request, ctx: &Context) -> Response {
                             if let Some(r) = p.exec_to_dir_ratio {
                                 st.exec_to_dir_ratio = r;
                             }
+                            st.workers = resolved_workers;
                             st.cli_path = p.cli_path.clone();
                             st.app_socket_path = p.app_socket_path.clone();
                             if let Some(t) = p.reply_timeout_secs {
@@ -2675,6 +2726,51 @@ fn compute_agent_anomalies(agent_manager: &AgentSessionManager) -> Vec<Anomaly> 
     }
 
     anomalies
+}
+
+/// P1 fix: query agent names for a GUI (pane) team via the app socket's
+/// `team.status` RPC. Used as a fallback when `headless.list` returns empty
+/// (GUI teams have no headless-manager agents). Excludes the watcher agent
+/// (same heuristic as the headless path). Returns empty vec on any error so
+/// the watch.on registration still succeeds — workers are simply not pre-filled.
+async fn query_gui_team_workers(app_socket: &str, team_id: &str) -> Vec<String> {
+    use tokio::io::AsyncBufReadExt;
+    let Ok(stream) = tokio::net::UnixStream::connect(app_socket).await else {
+        return vec![];
+    };
+    let req = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "team.status",
+        "params": {"team_name": team_id},
+    });
+    let mut line = serde_json::to_string(&req).unwrap_or_default();
+    line.push('\n');
+    let (rd, mut wr) = stream.into_split();
+    if wr.write_all(line.as_bytes()).await.is_err() {
+        return vec![];
+    }
+    let _ = wr.flush().await;
+    let mut resp = String::new();
+    let mut reader = BufReader::new(rd);
+    if let Ok(Ok(_)) = timeout(
+        Duration::from_secs(3),
+        reader.read_line(&mut resp),
+    )
+    .await
+    {
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&resp) {
+            if let Some(agents) = v["result"]["agents"].as_array() {
+                return agents
+                    .iter()
+                    .filter_map(|a| a["name"].as_str())
+                    .filter(|n| *n != "watcher" && !n.starts_with("watcher"))
+                    .map(String::from)
+                    .collect();
+            }
+        }
+    }
+    vec![]
 }
 
 #[cfg(test)]
