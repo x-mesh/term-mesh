@@ -543,6 +543,9 @@ class termmesh:
         sid = res.get("surface_id")
         if not sid:
             raise termmeshError(f"pane.create returned no surface_id: {res}")
+        pane_id = res.get("pane_id")
+        if pane_id:
+            self._call("pane.focus", {"pane_id": str(pane_id)})
         return str(sid)
 
     def new_surface(self, pane: Union[str, int, None] = None, panel_type: str = "terminal", url: str = None) -> str:
@@ -1110,6 +1113,72 @@ def main() -> None:
             return
         params = json.loads(args.params)
         print(json.dumps(c._call(args.method, params), indent=2, sort_keys=True))
+
+
+def _default_daemon_socket_path() -> str:
+    """Return the daemon socket path for watch.* and headless RPCs.
+
+    Priority:
+    1. TERMMESH_DAEMON_SOCKET or TERMMESH_DAEMON_UNIX_PATH env var.
+    2. Derive from the app socket path (replace 'term-mesh*.sock' with 'term-meshd.sock').
+    3. /tmp/term-meshd.sock default.
+    """
+    for var in ("TERMMESH_DAEMON_SOCKET", "TERMMESH_DAEMON_UNIX_PATH"):
+        val = os.environ.get(var)
+        if val:
+            return val
+    # Derive from app socket sibling (both live in /tmp or TMPDIR)
+    app_sock = _default_socket_path()
+    import pathlib
+    parent = pathlib.Path(app_sock).parent
+    candidate = parent / "term-meshd.sock"
+    if candidate.exists():
+        return str(candidate)
+    return "/tmp/term-meshd.sock"
+
+
+def daemon_call(
+    method: str,
+    params: Optional[Dict[str, Any]] = None,
+    timeout: float = 10.0,
+    daemon_socket: Optional[str] = None,
+) -> Any:
+    """Send a JSON-RPC call to the daemon socket (watch.*, headless.*) and return result.
+
+    watch.* RPCs target the daemon socket (term-meshd), not the app socket.
+    Raises termmeshError on RPC-level errors or connection failures.
+    """
+    sock_path = daemon_socket or _default_daemon_socket_path()
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    s.settimeout(timeout)
+    try:
+        s.connect(sock_path)
+        payload = json.dumps({"id": 1, "method": method, "params": params or {}}) + "\n"
+        s.sendall(payload.encode("utf-8"))
+        data = b""
+        deadline = time.time() + timeout
+        while b"\n" not in data:
+            remaining = max(0.1, deadline - time.time())
+            s.settimeout(remaining)
+            chunk = s.recv(8192)
+            if not chunk:
+                break
+            data += chunk
+        line = data.decode("utf-8", errors="replace").split("\n")[0]
+        resp = json.loads(line)
+    except (OSError, json.JSONDecodeError) as e:
+        raise termmeshError(f"daemon_call {method}: {e}")
+    finally:
+        try:
+            s.close()
+        except Exception:
+            pass
+
+    if resp.get("ok") is True:
+        return resp.get("result")
+    err = resp.get("error") or {}
+    msg = err.get("message") or str(resp)
+    raise termmeshError(f"daemon RPC error ({method}): {msg}")
 
 
 if __name__ == "__main__":

@@ -3668,6 +3668,7 @@ final class TeamOrchestrator: ObservableObject {
                     "heartbeat_is_stale": heartbeat.map(isHeartbeatStale) ?? false,
                     "workspace_id": agent.workspaceId.uuidString,
                 ]
+                info["completed_task_count"] = agent.completedTaskCount
                 if let pid = agent.panelId {
                     info["panel_id"] = pid.uuidString
                 }
