@@ -3323,6 +3323,13 @@ final class TeamOrchestrator: ObservableObject {
         }
         Task { @MainActor in
             let result = await self.restartAgentPaneHard(teamName: teamName, agentName: agentName)
+            if case .success = result,
+               var team = self.teams[teamName],
+               let idx = team.agents.firstIndex(where: { $0.name == agentName }) {
+                // Mirror headless recycle behavior: reset count after actual restart (mod.rs:1658).
+                team.agents[idx].completedTaskCount = 0
+                self.teams[teamName] = team
+            }
             #if DEBUG
             switch result {
             case .success(let pids):
