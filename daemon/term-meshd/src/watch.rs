@@ -174,15 +174,36 @@ fn now_unix() -> u64 {
         .unwrap_or(0)
 }
 
-/// Resolve a watch spec (P11 #2). A literal spec is returned verbatim. An
-/// `@path` spec is read from disk each tick — relative paths resolve against
-/// `working_dir` — so editing the spec file changes the next check's oversight
-/// contract. A missing/empty/unreadable file is an `Err` (the caller skips the
-/// tick with `last_error`, no board/inbox side effect).
+/// Resolve a watch spec (P11 #2). Three forms are supported:
+///
+/// - **Literal**: returned verbatim.
+/// - **`@path`**: read from disk each tick, relative to `working_dir`. Edits
+///   to the file take effect on the next check.
+/// - **`preset:<name>`**: shorthand for `@.xm/watch/specs/<name>.md`. The same
+///   security rules apply (no `..`, no absolute path, 64 KiB cap).
+///
+/// A missing/empty/unreadable file is an `Err` (the caller skips the tick with
+/// `last_error`, no board/inbox side effect).
 ///
 /// Security (F2): absolute paths, `..`, and symlink escapes are rejected.
 /// File size is capped at 64 KiB.
 pub(crate) fn resolve_spec(spec: &str, working_dir: &str) -> Result<String, String> {
+    // `preset:<name>` → `.xm/watch/specs/<name>.md` under working_dir.
+    let spec = if let Some(name) = spec.strip_prefix("preset:") {
+        let name = name.trim();
+        if name.is_empty() {
+            return Err("preset name is empty".to_string());
+        }
+        // Reject names that could escape the specs directory.
+        if name.contains('/') || name.contains('\\') || name.contains("..") {
+            return Err(format!("invalid preset name (no path separators allowed): {name}"));
+        }
+        let preset_path = format!(".xm/watch/specs/{name}.md");
+        return resolve_spec(&format!("@{preset_path}"), working_dir);
+    } else {
+        spec
+    };
+
     let Some(path) = spec.strip_prefix('@') else {
         return Ok(spec.to_string());
     };

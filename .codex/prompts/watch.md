@@ -19,8 +19,8 @@ If the first token is `help`, print this usage block and stop — this is the ON
 
 Usage:
   /watch help                    show this help
-  /watch review [agent] --spec <text|@path> [--stance critic|advisor|pair]
-  /watch on     [agent] --spec <text|@path> [--every 300]
+  /watch review [agent] --spec <text|@path|preset:<name>> [--stance critic|advisor|pair]
+  /watch on     [agent] --spec <text|@path|preset:<name>> [--every 300]
   /watch off    [agent|all]
   /watch status [agent]
 
@@ -61,11 +61,12 @@ Common flags:
 - `--stance critic|advisor|pair` — default `critic`
 - `--cli claude|codex|gemini`
 - `--model <m>`
-- `--spec <text|@path>`
+- `--spec <text|@path|preset:<name>>` — built-in presets: `executor`, `reviewer`, `security`, `general`
 - `--every <sec>` — `on` only, default `300`
 - `--ratio <R>` — `on` only, daemon budget or sampling ratio
 
 `review` and `on` require a spec. Resolve in order: `--spec` flag, then team spec.
+`preset:<name>` expands to `.xm/watch/specs/<name>.md` under the working directory.
 
 Task-format override: the spec is the default oversight contract. If the leader's current task capsule gives a more specific output format, severity taxonomy, review lens, file scope, or verify command, that task instruction wins for that task. Do not report drift for format differences alone. Full template examples live in `.claude/commands/watch.md`; the compressed form is: `Goal`, `Default lens`, `Default output`, `Task override`, `Count as drift`, `Do not count as drift`, `Reporting`.
 
@@ -74,7 +75,7 @@ If no spec can be resolved:
 - **Non-interactive (`--no-input` / automation / headless):** reject with:
 
 ```text
-REJECT: /watch review/on requires a spec. Provide --spec "<text>" or --spec @path.
+REJECT: /watch review/on requires a spec. Provide --spec "<text>", --spec @path, or --spec preset:<name>.
 ```
 
 In the interactive wizard, ask the user directly and wait for their reply for every input the chosen action needs that was not supplied on the command line — including `--stance` (default `critic`) and, for `on`, `--every` (default `300`) — pre-selecting the defaults. Always respect values already passed on the command line and skip asking for those. If all required inputs are already supplied, run directly without any prompt. Under `--no-input`, never prompt: require flags and reject when a required input is missing.

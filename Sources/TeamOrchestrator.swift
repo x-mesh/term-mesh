@@ -780,7 +780,6 @@ final class TeamOrchestrator: ObservableObject {
         let pairEligible = leaderMode != "repl"
             && leaderMode != "adopted"
             && pairMode != "none"
-            && pairMode != leaderMode
             && executionMode == "pane"
         var agents = agents
         if pairEligible {

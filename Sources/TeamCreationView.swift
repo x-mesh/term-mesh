@@ -1208,32 +1208,22 @@ struct TeamCreationView: View {
             }
 
             // Pair-programming companion: spawns a second pane next to the
-            // leader running a different CLI. Disabled for REPL leaders (no
-            // CLI to pair with).
+            // leader running a companion CLI (may be the same CLI as the leader).
+            // Disabled for REPL leaders (no CLI to pair with).
             if leaderMode != "repl" {
                 HStack {
                     Text("Pair with")
                         .font(.subheadline.bold())
                     Spacer()
-                    Picker("", selection: Binding(
-                        get: {
-                            // Self-heal: if pair becomes same as leader, reset to none.
-                            if leaderPairMode == leaderMode {
-                                DispatchQueue.main.async { leaderPairMode = "none" }
-                                return "none"
-                            }
-                            return leaderPairMode
-                        },
-                        set: { leaderPairMode = $0 }
-                    )) {
+                    Picker("", selection: $leaderPairMode) {
                         Text("None").tag("none")
-                        ForEach(AgentRolePreset.supportedCLIs.filter { $0 != leaderMode }, id: \.self) { cli in
+                        ForEach(AgentRolePreset.supportedCLIs, id: \.self) { cli in
                             Text(cli.capitalized).tag(cli)
                         }
                     }
                     .fixedSize()
 
-                    if leaderPairMode != "none" && leaderPairMode != leaderMode {
+                    if leaderPairMode != "none" {
                         Picker("", selection: Binding(
                             get: {
                                 let opts = AgentRolePreset.models(for: leaderPairMode)
@@ -1252,7 +1242,7 @@ struct TeamCreationView: View {
                     }
                 }
 
-                if leaderPairMode != "none" && leaderPairMode != leaderMode && executionMode == "headless" {
+                if leaderPairMode != "none" && executionMode == "headless" {
                     HStack(spacing: 4) {
                         Image(systemName: "exclamationmark.triangle.fill")
                             .foregroundStyle(.yellow)
@@ -1263,7 +1253,7 @@ struct TeamCreationView: View {
                     .transition(.opacity)
                 }
 
-                if leaderPairMode != "none" && leaderPairMode != leaderMode && executionMode != "headless" {
+                if leaderPairMode != "none" && executionMode != "headless" {
                     HStack(spacing: 4) {
                         Image(systemName: "eye")
                             .foregroundStyle(.secondary)
@@ -2804,9 +2794,9 @@ struct TeamCreationView: View {
         } else {
             nil
         }
-        // Drop pair when execution mode is headless (pair is pane-only) or
-        // when something has left pair === leader (self-heal guard).
-        let effectivePair = (executionMode == "headless" || leaderPairMode == leaderMode) ? "none" : leaderPairMode
+        // Drop pair when execution mode is headless (pair is pane-only).
+        // Same-CLI pair is allowed — user may want e.g. claude + claude with a different model.
+        let effectivePair = executionMode == "headless" ? "none" : leaderPairMode
         let effectivePairSpec = effectivePair == "none" ? "" : leaderPairSpec
         let success = onCreate?(teamName, leaderMode, leaderModel, agents, worktreeMode, executionMode, sid, effectivePair, effectivePair == "none" ? "" : leaderPairModel, effectivePairSpec, workingDirectory) ?? false
         guard success else { return }
