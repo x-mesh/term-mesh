@@ -4,6 +4,15 @@ All notable changes to term-mesh are documented here.
 
 ## [Unreleased]
 
+## [0.135.0] - 2026-05-31
+
+### Fixed
+- **원격 peer 연결에서 vim 등 TUI 입력이 먹통 되던 문제 수정** — connect-to-peer로 접속한 원격 호스트에서 vim을 편집할 때, 화살표 이동은 되지만 ESC를 누른 뒤 `:wq!` 같은 문자열을 입력하면 키가 누락되거나 입력이 중간에 멈추던 버그. 호스트 측 키 재인코딩 파서(`sendPeerInputBytes` / `trailingIncompleteEscape`)가 "ESC + 일반 문자"(예: ESC 다음 `:`)를 프레임 경계에서 잘린 미완성 escape 시퀀스로 오판해, 입력을 32바이트가 쌓일 때까지 버퍼에 가둬두고 한꺼번에 쏟아내던 것이 원인이었다. 이제 ESC 다음에 escape 시퀀스를 시작할 수 없는 바이트가 오면 즉시 전달하고, 뒤따르는 입력이 없는 단독 ESC는 짧은 타임아웃 후 flush한다. (이 수정은 vim이 실행되는 **원격 호스트** 측 빌드가 업데이트되어야 적용된다.)
+
+### Thanks to 1 contributor!
+
+- [@JINWOO-J](https://github.com/JINWOO-J)
+
 ## [0.134.0] - 2026-05-30
 
 ### Added
