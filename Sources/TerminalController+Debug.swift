@@ -409,6 +409,57 @@ extension TerminalController {
         return resp == "OK" ? .ok([:]) : .err(code: "internal_error", message: resp, data: nil)
     }
 
+    /// Test-only: inject raw bytes through the host peer-relay re-encode path
+    /// (`sendPeerInputBytes`), exactly as a connected peer client's Input frame
+    /// would. Lets socket e2e exercise `trailingIncompleteEscape` /
+    /// `peerPendingInputTail` (the vim ESC + ":wq!" freeze regression) without a
+    /// live peer server. params: `surface_id`, `bytes_hex` (hex of raw bytes,
+    /// e.g. "1b3a777121" = ESC ':wq!').
+    func v2DebugPeerInjectInput(params: [String: Any]) -> V2CallResult {
+        guard let surfaceArg = v2String(params, "surface_id") else {
+            return .err(code: "invalid_params", message: "Missing surface_id", data: nil)
+        }
+        guard let hex = v2String(params, "bytes_hex"), let data = Self.dataFromHex(hex) else {
+            return .err(code: "invalid_params", message: "Missing/invalid bytes_hex", data: nil)
+        }
+        guard let tabManager else {
+            return .err(code: "internal_error", message: "No TabManager", data: nil)
+        }
+        var result: V2CallResult = .err(code: "not_found", message: "Surface not found", data: nil)
+        _ = v2MainExec(timeout: 5) {
+            guard let surface = self.resolveTerminalSurface(from: surfaceArg, tabManager: tabManager) else {
+                result = .err(code: "not_found", message: "Surface not found", data: nil)
+                return
+            }
+            debugInjectPeerInput(surface, bytes: data)
+            result = .ok(["bytes": data.count])
+        }
+        return result
+    }
+
+    /// Decode an even-length hex string into Data. Returns nil on any
+    /// non-hex character or odd length.
+    static func dataFromHex(_ hex: String) -> Data? {
+        let chars = Array(hex.utf8)
+        guard chars.count % 2 == 0 else { return nil }
+        func nibble(_ b: UInt8) -> UInt8? {
+            switch b {
+            case 0x30...0x39: return b - 0x30          // 0-9
+            case 0x61...0x66: return b - 0x61 + 10     // a-f
+            case 0x41...0x46: return b - 0x41 + 10     // A-F
+            default: return nil
+            }
+        }
+        var out = Data(capacity: chars.count / 2)
+        var i = 0
+        while i < chars.count {
+            guard let hi = nibble(chars[i]), let lo = nibble(chars[i + 1]) else { return nil }
+            out.append((hi << 4) | lo)
+            i += 2
+        }
+        return out
+    }
+
     func v2DebugFlashCount(params: [String: Any]) -> V2CallResult {
         guard let surfaceId = v2String(params, "surface_id") else {
             return .err(code: "invalid_params", message: "Missing surface_id", data: nil)

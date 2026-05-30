@@ -841,6 +841,18 @@ private func peerEscapePrefixCouldComplete(_ tail: [UInt8]) -> Bool {
 /// LF→Return mapping is needed because the relay binary's stdin is a PTY
 /// slave with default ICRNL, so Ghostty writes CR but the relay reads
 /// LF before forwarding over the peer socket.
+#if DEBUG
+/// Test-only entry point: route raw bytes through the host peer-relay
+/// re-encode path exactly as a connected peer client's Input frame would,
+/// without needing a live peer server/relay. Backs the
+/// `debug.peer.inject_input` socket command used by the ESC-freeze
+/// regression test (`tests_v2/test_peer_input_esc_freeze_regression.py`).
+@MainActor
+func debugInjectPeerInput(_ surface: ghostty_surface_t, bytes: Data) {
+    sendPeerInputBytes(surface, bytes: bytes)
+}
+#endif
+
 @MainActor
 private func sendPeerInputBytes(_ surface: ghostty_surface_t, bytes: Data, finalFlush: Bool = false) {
     // FIX 2 / FIX B: prepend any bytes carried over from the previous chunk,
