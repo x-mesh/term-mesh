@@ -665,9 +665,12 @@ private func clearPeerPendingInputTail(surfaceKey: UInt) {
     peerPendingInputTail.removeValue(forKey: surfaceKey)
     peerPendingPasteBody.removeValue(forKey: surfaceKey)
     peerPendingPasteTimestamp.removeValue(forKey: surfaceKey)
-    // Invalidate any in-flight deferred-tail flush timer and drop the weak
-    // surface ref so a fired timer cannot touch a torn-down surface.
-    peerPendingTailFlushGen[surfaceKey] = (peerPendingTailFlushGen[surfaceKey] ?? 0) + 1
+    // Drop the deferred-tail flush bookkeeping so nothing accumulates for a
+    // torn-down surface. An in-flight timer captured its generation by value,
+    // so after this removal its `peerPendingTailFlushGen[surfaceKey]` lookup is
+    // nil (≠ the captured gen) and it no-ops; the tail-equality guard covers the
+    // rare surface-pointer-reuse case.
+    peerPendingTailFlushGen.removeValue(forKey: surfaceKey)
     peerSurfaceRefForKey.removeValue(forKey: surfaceKey)
 }
 
