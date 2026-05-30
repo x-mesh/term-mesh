@@ -1095,6 +1095,20 @@ class termmesh:
     def reset_flash_counts(self) -> None:
         self._call("debug.flash.reset")
 
+    def inject_peer_input(self, surface: Union[str, int], data: bytes) -> int:
+        """Inject raw bytes through the host peer-relay re-encode path
+        (sendPeerInputBytes), exactly as if a connected peer client sent an
+        Input frame — no live peer server required. DEBUG-only. Returns the
+        number of bytes accepted into the re-encode path (a deferred escape
+        tail may not be flushed to the surface yet). Used by the ESC+':wq!'
+        freeze regression test to exercise trailingIncompleteEscape /
+        peerPendingInputTail."""
+        sid = self._resolve_surface_id(surface)
+        if not sid:
+            raise termmeshError(f"Invalid surface: {surface!r}")
+        res = self._call("debug.peer.inject_input", {"surface_id": sid, "bytes_hex": data.hex()}) or {}
+        return int(res.get("bytes") or 0)
+
     def screenshot(self, label: str = "") -> dict:
         params: Dict[str, Any] = {}
         if label:

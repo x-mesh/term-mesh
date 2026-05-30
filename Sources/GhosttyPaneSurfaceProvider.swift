@@ -227,6 +227,9 @@ final class GhosttyPaneSurfaceProvider: PeerSurfaceProvider {
         let input: @Sendable (Data) async -> Void = { [weakTS] bytes in
             await MainActor.run {
                 guard let ptr = weakTS.value?.surface else { return }
+                // Track a weak surface ref so a deferred lone-Escape tail can be
+                // flushed later without capturing the raw (non-Sendable) pointer.
+                peerSurfaceRefForKey[UInt(bitPattern: ptr)] = weakTS
                 sendPeerInputBytes(ptr, bytes: bytes)
             }
         }
@@ -609,6 +612,21 @@ final class GhosttyPaneSurfaceProvider: PeerSurfaceProvider {
 @MainActor private var peerPendingInputTail: [UInt: [UInt8]] = [:]
 private let peerPendingInputTailMax = 32
 
+/// Generation token per surface for the deferred-tail flush timer. Bumped
+/// whenever the pending tail is set or cleared so a stale timer (fired after
+/// the tail was already consumed/replaced) becomes a no-op.
+@MainActor private var peerPendingTailFlushGen: [UInt: Int] = [:]
+/// Weak surface reference per surface key, so schedulePeerPendingTailFlush()
+/// can re-fetch the live surface after its timeout WITHOUT capturing the raw
+/// `ghostty_surface_t` (OpaquePointer, not Sendable) across an await. Mirrors
+/// the attach-time `weakTS.value?.surface` re-fetch pattern.
+@MainActor private var peerSurfaceRefForKey: [UInt: WeakRef<TerminalSurface>] = [:]
+/// Deferred-tail flush delay. Mirrors the relay's ESC_FLUSH_TIMEOUT_MS (100 ms)
+/// plus a little slack for socket jitter, so a lone Escape that has no
+/// follow-up keystroke is still delivered promptly instead of hanging until
+/// the next key.
+private let peerPendingTailFlushDelayNanos: UInt64 = 120_000_000
+
 /// FIX C: Multi-chunk bracketed paste accumulator. When `\e[200~` arrives
 /// without a matching `\e[201~` in the same frame, we stash the body bytes
 /// here and keep consuming subsequent frames as paste content until the
@@ -647,6 +665,31 @@ private func clearPeerPendingInputTail(surfaceKey: UInt) {
     peerPendingInputTail.removeValue(forKey: surfaceKey)
     peerPendingPasteBody.removeValue(forKey: surfaceKey)
     peerPendingPasteTimestamp.removeValue(forKey: surfaceKey)
+    // Drop the deferred-tail flush bookkeeping so nothing accumulates for a
+    // torn-down surface. An in-flight timer captured its generation by value,
+    // so after this removal its `peerPendingTailFlushGen[surfaceKey]` lookup is
+    // nil (≠ the captured gen) and it no-ops; the tail-equality guard covers the
+    // rare surface-pointer-reuse case.
+    peerPendingTailFlushGen.removeValue(forKey: surfaceKey)
+    peerSurfaceRefForKey.removeValue(forKey: surfaceKey)
+}
+
+/// Schedule a one-shot flush of a deferred lone-Escape / incomplete-escape
+/// tail. If, after the timeout, the buffered bytes are unchanged (no follow-up
+/// frame completed or replaced them) the tail is delivered as-is via a final
+/// pass through `sendPeerInputBytes`. The surface is re-fetched from the weak
+/// registry inside the closure, never captured raw across the await.
+@MainActor
+private func schedulePeerPendingTailFlush(surfaceKey: UInt, tail: [UInt8]) {
+    let gen = (peerPendingTailFlushGen[surfaceKey] ?? 0) + 1
+    peerPendingTailFlushGen[surfaceKey] = gen
+    Task { @MainActor in
+        try? await Task.sleep(nanoseconds: peerPendingTailFlushDelayNanos)
+        guard peerPendingTailFlushGen[surfaceKey] == gen,
+              peerPendingInputTail[surfaceKey] == tail,
+              let ptr = peerSurfaceRefForKey[surfaceKey]?.value?.surface else { return }
+        sendPeerInputBytes(ptr, bytes: Data(), finalFlush: true)
+    }
 }
 
 /// FIX C helper: flush accumulated paste body to the destination surface.
@@ -734,14 +777,53 @@ private func trailingIncompleteEscape(_ arr: [UInt8], bound: Int) -> Int {
     while i >= start {
         if arr[i] == 0x1b {
             let tail = Array(arr[i..<arr.count])
-            if peerEscapeSequenceLength(tail, start: 0) == nil {
-                return arr.count - i
-            }
-            return 0  // complete sequence — nothing to buffer
+            return peerEscapePrefixCouldComplete(tail) ? arr.count - i : 0
         }
         i -= 1
     }
     return 0
+}
+
+/// True when `tail` (which begins with ESC) is a *prefix* of a still-
+/// completable escape sequence — i.e. more bytes could turn it into a valid
+/// CSI / OSC / SS3. This is the crucial distinction `peerEscapeSequenceLength`
+/// alone cannot make: that helper returns nil for BOTH a genuinely incomplete
+/// head ("\e[" waiting for a final byte) AND a complete ESC keypress followed
+/// by literal input ("\e:" = Escape then ':'). Deferring the latter is the bug
+/// behind vim ":wq!" after Escape: the host stashes ESC, then mis-reads
+/// ESC+':' / ESC+'w' / … as "still incomplete" and buffers the whole string
+/// into `peerPendingInputTail` until 32 bytes accumulate — the surface freezes
+/// then releases in a burst. Only genuine prefixes may be deferred here.
+private func peerEscapePrefixCouldComplete(_ tail: [UInt8]) -> Bool {
+    guard tail.first == 0x1b else { return false }
+    // Lone trailing ESC: ambiguous (could begin CSI/OSC/SS3, or be a bare
+    // Escape key). Defer; schedulePeerPendingTailFlush() releases it after a
+    // short timeout — mirroring the relay's ESC_FLUSH_TIMEOUT_MS — so a real
+    // Escape never hangs the remote app in e.g. vim INSERT mode.
+    guard tail.count >= 2 else { return true }
+    switch tail[1] {
+    case 0x5b: // '[' — CSI, completable while body bytes stay in 0x20...0x3f
+        for k in 2..<tail.count {
+            let b = tail[k]
+            if (0x40...0x7e).contains(b) { return false }   // already terminated
+            if !(0x20...0x3f).contains(b) { return false }  // invalid CSI body byte
+        }
+        return true                                          // valid, unterminated
+    case 0x5d: // ']' — OSC, completable until BEL (0x07) or ST (ESC '\')
+        var k = 2
+        while k < tail.count {
+            if tail[k] == 0x07 { return false }
+            if tail[k] == 0x1b, k + 1 < tail.count, tail[k + 1] == 0x5c { return false }
+            k += 1
+        }
+        return true
+    case 0x4f: // 'O' — SS3, needs exactly one final byte
+        return tail.count < 3
+    default:
+        // ESC + a byte that cannot introduce CSI/OSC/SS3 ⇒ a complete Escape
+        // keypress immediately followed by literal input. Never defer.
+        return false
+    }
 }
 
 /// Route peer Input bytes into Ghostty as key events.
@@ -762,8 +844,20 @@ private func trailingIncompleteEscape(_ arr: [UInt8], bound: Int) -> Int {
 /// LF→Return mapping is needed because the relay binary's stdin is a PTY
 /// slave with default ICRNL, so Ghostty writes CR but the relay reads
 /// LF before forwarding over the peer socket.
+#if DEBUG
+/// Test-only entry point: route raw bytes through the host peer-relay
+/// re-encode path exactly as a connected peer client's Input frame would,
+/// without needing a live peer server/relay. Backs the
+/// `debug.peer.inject_input` socket command used by the ESC-freeze
+/// regression test (`tests_v2/test_peer_input_esc_freeze_regression.py`).
 @MainActor
-private func sendPeerInputBytes(_ surface: ghostty_surface_t, bytes: Data) {
+func debugInjectPeerInput(_ surface: ghostty_surface_t, bytes: Data) {
+    sendPeerInputBytes(surface, bytes: bytes)
+}
+#endif
+
+@MainActor
+private func sendPeerInputBytes(_ surface: ghostty_surface_t, bytes: Data, finalFlush: Bool = false) {
     // FIX 2 / FIX B: prepend any bytes carried over from the previous chunk,
     // then trim any new incomplete ESC tail before the main parse loop so that
     // split CSI/OSC/SS3 heads ("\e[", "\e[<35", etc.) are also deferred — not
@@ -808,10 +902,15 @@ private func sendPeerInputBytes(_ surface: ghostty_surface_t, bytes: Data) {
 
     // FIX B prelude: detect any trailing incomplete escape sequence and buffer
     // it now, before the main loop, so the loop never sees a partial head.
-    let tailLen = trailingIncompleteEscape(arr, bound: peerPendingInputTailMax)
+    // On a final flush (timer-driven) treat every byte as processable so a
+    // deferred lone Escape / stale escape head is delivered instead of being
+    // re-buffered forever.
+    let tailLen = finalFlush ? 0 : trailingIncompleteEscape(arr, bound: peerPendingInputTailMax)
     let processCount = arr.count - tailLen
     if tailLen > 0 {
-        peerPendingInputTail[surfaceKey] = Array(arr[processCount...])
+        let tail = Array(arr[processCount...])
+        peerPendingInputTail[surfaceKey] = tail
+        schedulePeerPendingTailFlush(surfaceKey: surfaceKey, tail: tail)
     }
     var i = 0
     while i < processCount {
