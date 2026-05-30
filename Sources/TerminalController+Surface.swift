@@ -625,8 +625,12 @@ extension TerminalController {
             let panels = self.orderedPanels(in: ws)
             let items: [[String: Any]] = panels.enumerated().map { index, panel in
                 var inWindow: Any = NSNull()
+                var portal: Any = NSNull()
+                var viewDepth: Any = NSNull()
                 if let tp = panel as? TerminalPanel {
                     inWindow = tp.surface.isViewInWindow
+                    portal = self.isPortalHosted(tp.hostedView)
+                    viewDepth = self.viewDepth(of: tp.hostedView)
                 } else if let bp = panel as? BrowserPanel {
                     inWindow = bp.webView.window != nil
                 }
@@ -635,7 +639,9 @@ extension TerminalController {
                     "id": panel.id.uuidString,
                     "ref": self.v2Ref(kind: .surface, uuid: panel.id),
                     "type": panel.panelType.rawValue,
-                    "in_window": inWindow
+                    "in_window": inWindow,
+                    "portal": portal,
+                    "view_depth": viewDepth
                 ]
             }
             let windowId = self.v2ResolveWindowId(tabManager: tabManager)

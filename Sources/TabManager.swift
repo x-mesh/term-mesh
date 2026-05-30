@@ -998,6 +998,8 @@ class TabManager: ObservableObject {
         if select {
             selectedTabId = workspace.id
         }
+        workspace.scheduleTerminalGeometryReconcile()
+        workspace.scheduleFocusReconcile()
     }
 
     // Keep closeTab as convenience alias

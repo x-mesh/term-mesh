@@ -25,6 +25,14 @@ def focused_pane_id(client: termmesh) -> Optional[str]:
             return pane_id
     return None
 
+def pane_id_for_surface(client: termmesh, surface_id: str) -> Optional[str]:
+    panes = (client._call("pane.list") or {}).get("panes") or []
+    for pane in panes:
+        surface_ids = [str(s) for s in pane.get("surface_ids") or []]
+        if str(surface_id) in surface_ids:
+            return str(pane.get("id"))
+    return None
+
 
 def test_goto_split_from_loaded_browser(client: termmesh) -> tuple[bool, str]:
     """
@@ -50,7 +58,7 @@ def test_goto_split_from_loaded_browser(client: termmesh) -> tuple[bool, str]:
     if len(panes) < 2:
         return False, f"Expected 2 panes, got {len(panes)}"
 
-    browser_pane_id = focused_pane_id(client)
+    browser_pane_id = pane_id_for_surface(client, browser_id)
     terminal_pane_id = None
     for _idx, pid, _count, is_focused in panes:
         if pid != browser_pane_id:
@@ -120,7 +128,7 @@ def test_goto_split_roundtrip_loaded_browser(client: termmesh) -> tuple[bool, st
     if len(panes) < 2:
         return False, f"Expected 2 panes, got {len(panes)}"
 
-    browser_pane_id = focused_pane_id(client)
+    browser_pane_id = pane_id_for_surface(client, browser_id)
     terminal_pane_id = None
     for _idx, pid, _count, is_focused in panes:
         if pid != browser_pane_id:

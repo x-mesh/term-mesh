@@ -162,6 +162,10 @@ pub struct Context {
     /// RPC handlers mutate this; the scheduler in `crate::drift_watch` reads it.
     /// Distinct from `watcher_handle` (the unrelated `crate::watcher` fs monitor).
     pub watch_registry: crate::drift_watch::WatchRegistry,
+    /// R4: runner + sink cloned into Context so `watch.trigger_now` can fire
+    /// checks directly without routing through the scheduler's interval loop.
+    pub watch_runner: Option<Arc<dyn crate::headless::one_shot::WatchCheckRunner>>,
+    pub watch_sink: Option<tokio::sync::mpsc::UnboundedSender<crate::headless::one_shot::WatchCheckOutcome>>,
     pub pane_tracker: PaneTracker,
     pub event_tx: EventSender,
 }
@@ -190,6 +194,8 @@ pub async fn serve(
     agent_manager: Arc<AgentSessionManager>,
     headless: Arc<tokio::sync::Mutex<HeadlessManager>>,
     watch_registry: crate::drift_watch::WatchRegistry,
+    watch_runner: Option<Arc<dyn crate::headless::one_shot::WatchCheckRunner>>,
+    watch_sink: Option<tokio::sync::mpsc::UnboundedSender<crate::headless::one_shot::WatchCheckOutcome>>,
     mut shutdown_rx: watch::Receiver<bool>,
 ) -> anyhow::Result<()> {
     if path.exists() {
@@ -213,6 +219,8 @@ pub async fn serve(
         agent_manager,
         headless,
         watch_registry,
+        watch_runner,
+        watch_sink,
         pane_tracker,
         event_tx,
     });
@@ -1979,6 +1987,11 @@ async fn dispatch(req: &Request, ctx: &Context) -> Response {
                 interval_secs: u64,
                 #[serde(default)]
                 target: Option<String>,
+                /// Explicit worker list for all-workers fan-out (P5).
+                /// GUI/Swift callers pass this; headless teams are auto-queried
+                /// from HeadlessManager when omitted.
+                #[serde(default)]
+                workers: Option<Vec<String>>,
                 #[serde(default = "default_watch_cli")]
                 cli: String,
                 #[serde(default = "default_watch_model")]
@@ -2017,6 +2030,65 @@ async fn dispatch(req: &Request, ctx: &Context) -> Response {
                     } else {
                         p.interval_secs.max(MIN_WATCH_INTERVAL_SECS)
                     };
+
+                    // P5 fan-out: resolve worker list BEFORE acquiring reg lock
+                    // (avoids holding both locks simultaneously).
+                    // Priority: explicit `workers` param > HeadlessManager query.
+                    // GUI teams pass `workers` explicitly; headless teams are
+                    // auto-queried. Workers are agents whose name is not "watcher"
+                    // (heuristic — same convention as auto_watch_decision).
+                    // Note: duplicate-named workers (e.g. two "executor" agents) map
+                    // to a single entry in the list — `tm-agent read` will reach the
+                    // first matching panel. This is a known limitation; per-panelId
+                    // routing would require a richer target format.
+                    let is_all_target = p
+                        .target
+                        .as_deref()
+                        .map(|t| t.is_empty() || t == "all")
+                        .unwrap_or(true);
+                    // R3: track whether the raw list had duplicate names before dedup.
+                    let (resolved_workers, had_dup_names): (Vec<String>, bool) =
+                        if let Some(mut explicit) = p.workers.clone() {
+                            let had = {
+                                let mut s = std::collections::HashSet::new();
+                                explicit.iter().any(|n| !s.insert(n.as_str()))
+                            };
+                            let mut seen = std::collections::HashSet::new();
+                            explicit.retain(|n| seen.insert(n.clone()));
+                            (explicit, had)
+                        } else if is_all_target {
+                            let agents = ctx.headless.lock().await.list(Some(&p.team_id)).await;
+                            let mut names: Vec<String> = agents
+                                .into_iter()
+                                .filter(|a| a.name != "watcher" && !a.name.starts_with("watcher"))
+                                .map(|a| a.name)
+                                .collect();
+                            // P1 fix: GUI (pane) teams have no headless agents → headless.list
+                            // returns empty. Fall back to app socket team.status.
+                            if names.is_empty() {
+                                if let Some(ref app_sock) = p.app_socket_path {
+                                    if !app_sock.is_empty() {
+                                        names = query_gui_team_workers(app_sock, &p.team_id).await;
+                                    }
+                                }
+                            }
+                            // Deduplicate while preserving order; detect dups for R3.
+                            let had = {
+                                let mut s = std::collections::HashSet::new();
+                                names.iter().any(|n| !s.insert(n.as_str()))
+                            };
+                            let mut seen = std::collections::HashSet::new();
+                            names.retain(|n| seen.insert(n.clone()));
+                            (names, had)
+                        } else {
+                            (vec![], false)
+                        };
+                    let dup_warning: Option<String> = if had_dup_names {
+                        Some("Duplicate agent names detected. Watch can address only one pane per name.".to_string())
+                    } else {
+                        None
+                    };
+
                     let mut reg = ctx.watch_registry.lock().await;
                     let interval = match reg.get_mut(&p.team_id) {
                         // Refresh existing config; preserve live counters.
@@ -2029,6 +2101,8 @@ async fn dispatch(req: &Request, ctx: &Context) -> Response {
                                 st.exec_to_dir_ratio = r;
                             }
                             st.target = p.target.clone();
+                            st.workers = resolved_workers;
+                            st.duplicate_name_warning = dup_warning.clone();
                             st.cli = p.cli.clone();
                             st.model = p.model.clone();
                             st.stance = p.stance.clone();
@@ -2056,6 +2130,8 @@ async fn dispatch(req: &Request, ctx: &Context) -> Response {
                             if let Some(r) = p.exec_to_dir_ratio {
                                 st.exec_to_dir_ratio = r;
                             }
+                            st.workers = resolved_workers;
+                            st.duplicate_name_warning = dup_warning;
                             st.cli_path = p.cli_path.clone();
                             st.app_socket_path = p.app_socket_path.clone();
                             if let Some(t) = p.reply_timeout_secs {
@@ -2132,11 +2208,141 @@ async fn dispatch(req: &Request, ctx: &Context) -> Response {
                 Err(e) => Err(format!("invalid params: {e}")),
             }
         }
+        "watch.update" => {
+            // R2: partial-update RPC. Only `Some` fields are patched; absent/null
+            // fields preserve existing values. Live counters (in_flight, last_check_ts,
+            // check_count) are never modified. Returns error when team has no state.
+            #[derive(Deserialize)]
+            struct P {
+                team_id: String,
+                #[serde(default)]
+                target: Option<String>,
+                #[serde(default)]
+                interval_secs: Option<u64>,
+                #[serde(default)]
+                exec_to_dir_ratio: Option<u32>,
+                #[serde(default)]
+                stance: Option<String>,
+                #[serde(default)]
+                spec: Option<String>,
+                #[serde(default)]
+                cli: Option<String>,
+                #[serde(default)]
+                model: Option<String>,
+                #[serde(default)]
+                reply_timeout_secs: Option<u64>,
+                #[serde(default)]
+                workers: Option<Vec<String>>,
+            }
+            match serde_json::from_value::<P>(req.params.clone()) {
+                Ok(p) if p.team_id.is_empty() => Err("team_id required".to_string()),
+                Ok(p) => {
+                    let mut reg = ctx.watch_registry.lock().await;
+                    match reg.get_mut(&p.team_id) {
+                        None => Err(format!("no watch state found for team '{}'", p.team_id)),
+                        Some(st) => {
+                            if let Some(v) = p.target {
+                                st.target = if v.is_empty() || v == "all" { None } else { Some(v) };
+                            }
+                            // Mirror watch.on cost guard: clamp positive values up to the
+                            // minimum so a partial update cannot bypass the 30s floor.
+                            if let Some(v) = p.interval_secs {
+                                if v > 0 {
+                                    st.interval_secs = v.max(MIN_WATCH_INTERVAL_SECS);
+                                }
+                            }
+                            if let Some(v) = p.exec_to_dir_ratio { st.exec_to_dir_ratio = v; }
+                            if let Some(v) = p.stance { st.stance = v; }
+                            if let Some(v) = p.spec { st.spec = v; }
+                            if let Some(v) = p.cli { st.cli = v; }
+                            if let Some(v) = p.model { st.model = v; }
+                            if let Some(v) = p.reply_timeout_secs { st.reply_timeout_secs = v; }
+                            if let Some(mut workers) = p.workers {
+                                let had_dup = {
+                                    let mut s = std::collections::HashSet::new();
+                                    workers.iter().any(|n| !s.insert(n.as_str()))
+                                };
+                                let mut seen = std::collections::HashSet::new();
+                                workers.retain(|n| seen.insert(n.clone()));
+                                st.workers = workers;
+                                st.duplicate_name_warning = if had_dup {
+                                    Some("Duplicate agent names detected. Watch can address only one pane per name.".to_string())
+                                } else {
+                                    None
+                                };
+                            }
+                            let interval = st.interval_secs;
+                            let wd = st.working_directory.clone();
+                            let st_clone = st.clone();
+                            drop(reg);
+                            if !wd.is_empty() {
+                                watch_config::save_watch_state(
+                                    std::path::Path::new(&wd),
+                                    &p.team_id,
+                                    &st_clone,
+                                );
+                            }
+                            Ok(serde_json::json!({
+                                "status": "ok",
+                                "team_id": p.team_id,
+                                "interval_secs": interval,
+                            }))
+                        }
+                    }
+                }
+                Err(e) => Err(format!("invalid params: {e}")),
+            }
+        }
+        "watch.trigger_now" => {
+            #[derive(Deserialize)]
+            struct P {
+                team_id: String,
+            }
+            match serde_json::from_value::<P>(req.params.clone()) {
+                Ok(p) if p.team_id.is_empty() => Err("team_id required".to_string()),
+                Ok(p) => {
+                    match (&ctx.watch_runner, &ctx.watch_sink) {
+                        (Some(runner), Some(sink)) => {
+                            match crate::drift_watch::trigger_now(
+                                &p.team_id,
+                                &ctx.watch_registry,
+                                runner,
+                                sink,
+                            )
+                            .await
+                            {
+                                Ok(n) => Ok(serde_json::json!({
+                                    "status": "ok",
+                                    "team_id": p.team_id,
+                                    "triggered": true,
+                                    "check_count": n,
+                                })),
+                                Err(reason) => Ok(serde_json::json!({
+                                    "status": "rejected",
+                                    "team_id": p.team_id,
+                                    "triggered": false,
+                                    "reason": reason,
+                                })),
+                            }
+                        }
+                        _ => Err("watch runner not available (headless watch not initialised)".to_string()),
+                    }
+                }
+                Err(e) => Err(format!("invalid params: {e}")),
+            }
+        }
         "watch.status" => {
             #[derive(Deserialize)]
             struct P {
                 #[serde(default)]
                 team_id: Option<String>,
+                /// Caller's working directory. When present, config.json in
+                /// `<working_directory>/.xm/watch/` is merged as a fallback so
+                /// that teams persisted but not yet in the in-memory registry
+                /// (e.g. after a daemon restart with a mismatched cwd) are still
+                /// visible. In-memory state wins on key collision (has live counters).
+                #[serde(default)]
+                working_directory: Option<String>,
             }
             fn serialize_state(
                 team: &str,
@@ -2157,6 +2363,21 @@ async fn dispatch(req: &Request, ctx: &Context) -> Response {
                     serde_json::Value::Null
                 };
                 let drift_count = board_drift_count(&st.working_directory);
+                // R1: expose worker list and count so the GUI can display
+                // "All workers: N bounded checks" without re-deriving team roster.
+                let is_all = st
+                    .target
+                    .as_deref()
+                    .map(|t| t.is_empty() || t == "all")
+                    .unwrap_or(true);
+                let (workers_json, worker_count) = if is_all {
+                    let count = st.workers.len();
+                    (serde_json::json!(st.workers), count)
+                } else {
+                    // Single specific target — list contains just that one name.
+                    let name = st.target.as_deref().unwrap_or("");
+                    (serde_json::json!([name]), 1_usize)
+                };
                 serde_json::json!({
                     "team_id": team,
                     "enabled": st.enabled,
@@ -2164,6 +2385,9 @@ async fn dispatch(req: &Request, ctx: &Context) -> Response {
                     "interval_secs": st.interval_secs,
                     "exec_to_dir_ratio": st.exec_to_dir_ratio,
                     "target": st.target,
+                    // R1: worker list and count (GUI cost preview + "All workers" label)
+                    "workers": workers_json,
+                    "worker_count": worker_count,
                     "cli": st.cli,
                     "model": st.model,
                     "stance": st.stance,
@@ -2176,19 +2400,48 @@ async fn dispatch(req: &Request, ctx: &Context) -> Response {
                     "check_count": st.check_count,
                     "in_flight": st.in_flight,
                     "last_error": st.last_error,
+                    // R3: duplicate name warning (null when no duplicates).
+                    "duplicate_name_warning": st.duplicate_name_warning,
                 })
             }
-            let params: P =
-                serde_json::from_value(req.params.clone()).unwrap_or(P { team_id: None });
-            let reg = ctx.watch_registry.lock().await;
+            let params: P = serde_json::from_value(req.params.clone())
+                .unwrap_or(P { team_id: None, working_directory: None });
+            // Snapshot in-memory registry under the lock, then drop before file I/O.
+            let in_mem: std::collections::HashMap<String, crate::drift_watch::WatchState> = {
+                let reg = ctx.watch_registry.lock().await;
+                reg.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
+            };
+            // Config.json fallback: teams persisted but absent from the registry
+            // (e.g. daemon restarted from a different cwd). In-memory wins on collision.
+            let config_fallback: std::collections::HashMap<String, crate::drift_watch::WatchState> =
+                params.working_directory
+                    .as_deref()
+                    .filter(|wd| !wd.is_empty())
+                    .map(|wd| {
+                        watch_config::load_watch_states(std::path::Path::new(wd))
+                            .into_iter()
+                            .collect()
+                    })
+                    .unwrap_or_default();
             match params.team_id {
-                Some(tid) => Ok(serde_json::json!({
-                    "status": "ok",
-                    "watch": reg.get(&tid).map(|st| serialize_state(&tid, st)),
-                })),
+                Some(tid) => {
+                    let state = in_mem.get(&tid)
+                        .or_else(|| config_fallback.get(&tid))
+                        .map(|st| serialize_state(&tid, st));
+                    Ok(serde_json::json!({ "status": "ok", "watch": state }))
+                }
                 None => {
-                    let all: Vec<serde_json::Value> =
-                        reg.iter().map(|(t, st)| serialize_state(t, st)).collect();
+                    let mut seen = std::collections::HashSet::new();
+                    let mut all: Vec<serde_json::Value> = Vec::new();
+                    for (t, st) in &in_mem {
+                        all.push(serialize_state(t, st));
+                        seen.insert(t.clone());
+                    }
+                    for (t, st) in &config_fallback {
+                        if !seen.contains(t) {
+                            all.push(serialize_state(t, st));
+                        }
+                    }
                     Ok(serde_json::json!({ "status": "ok", "watches": all }))
                 }
             }
@@ -2641,6 +2894,51 @@ fn compute_agent_anomalies(agent_manager: &AgentSessionManager) -> Vec<Anomaly> 
     }
 
     anomalies
+}
+
+/// P1 fix: query agent names for a GUI (pane) team via the app socket's
+/// `team.status` RPC. Used as a fallback when `headless.list` returns empty
+/// (GUI teams have no headless-manager agents). Excludes the watcher agent
+/// (same heuristic as the headless path). Returns empty vec on any error so
+/// the watch.on registration still succeeds — workers are simply not pre-filled.
+async fn query_gui_team_workers(app_socket: &str, team_id: &str) -> Vec<String> {
+    use tokio::io::AsyncBufReadExt;
+    let Ok(stream) = tokio::net::UnixStream::connect(app_socket).await else {
+        return vec![];
+    };
+    let req = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "team.status",
+        "params": {"team_name": team_id},
+    });
+    let mut line = serde_json::to_string(&req).unwrap_or_default();
+    line.push('\n');
+    let (rd, mut wr) = stream.into_split();
+    if wr.write_all(line.as_bytes()).await.is_err() {
+        return vec![];
+    }
+    let _ = wr.flush().await;
+    let mut resp = String::new();
+    let mut reader = BufReader::new(rd);
+    if let Ok(Ok(_)) = timeout(
+        Duration::from_secs(3),
+        reader.read_line(&mut resp),
+    )
+    .await
+    {
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&resp) {
+            if let Some(agents) = v["result"]["agents"].as_array() {
+                return agents
+                    .iter()
+                    .filter_map(|a| a["name"].as_str())
+                    .filter(|n| *n != "watcher" && !n.starts_with("watcher"))
+                    .map(String::from)
+                    .collect();
+            }
+        }
+    }
+    vec![]
 }
 
 #[cfg(test)]

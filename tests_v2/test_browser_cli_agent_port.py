@@ -45,7 +45,7 @@ def _find_cli_binary() -> str:
     return candidates[0]
 
 
-def _run_cli_json(cli: str, args: list[str], retries: int = 4) -> dict:
+def _run_cli_json(cli: str, args: list[str], retries: int = 8) -> dict:
     last_merged = ""
     for attempt in range(1, retries + 1):
         proc = subprocess.run(
@@ -62,8 +62,15 @@ def _run_cli_json(cli: str, args: list[str], retries: int = 4) -> dict:
 
         merged = f"{proc.stdout}\n{proc.stderr}".strip()
         last_merged = merged
-        if "Command timed out" in merged and attempt < retries:
-            time.sleep(0.2)
+        transient = (
+            not merged
+            or "Command timed out" in merged
+            or "Failed to connect to socket" in merged
+            or "Connection refused" in merged
+            or "Broken pipe" in merged
+        )
+        if transient and attempt < retries:
+            time.sleep(0.3)
             continue
         raise termmeshError(f"CLI failed ({' '.join(args)}): {merged}")
 

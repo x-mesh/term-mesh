@@ -1,11 +1,40 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# This runner is intended for the UTM macOS VM (ssh term-mesh-vm).
-# It is intentionally guarded so we don't accidentally kill the host user's term-mesh instances.
-if [ "$(id -un)" != "term-mesh" ]; then
-  echo "ERROR: This script is intended to be run on the term-mesh-vm (user: term-mesh)." >&2
-  echo "Run via: ssh term-mesh-vm 'cd /Users/jinwoo/term-mesh/GhosttyTabs && ./scripts/run-tests-v1.sh'" >&2
+# This runner kills any running term-mesh instances while it exercises the app.
+# Keep it guarded to known test hosts/users so it is not run accidentally on a
+# daily-driver session. Override with TERMMESH_E2E_ALLOWED_USERS/HOSTS when
+# provisioning a new runner.
+csv_contains() {
+  local csv="$1"
+  local needle="$2"
+  local item
+  IFS=',' read -r -a items <<<"$csv"
+  for item in "${items[@]}"; do
+    item="${item#"${item%%[![:space:]]*}"}"
+    item="${item%"${item##*[![:space:]]}"}"
+    if [ "$item" = "$needle" ]; then
+      return 0
+    fi
+  done
+  return 1
+}
+
+CURRENT_USER="$(id -un)"
+CURRENT_HOST="$(hostname 2>/dev/null || true)"
+CURRENT_HOST_SHORT="$(hostname -s 2>/dev/null || printf '%s' "$CURRENT_HOST")"
+ALLOWED_USERS="${TERMMESH_E2E_ALLOWED_USERS:-term-mesh}"
+ALLOWED_HOSTS="${TERMMESH_E2E_ALLOWED_HOSTS:-term-mesh-vm,mac-sub,jinwooui-MacBookPro,jinwooui-MacBookPro.local}"
+
+if ! csv_contains "$ALLOWED_USERS" "$CURRENT_USER" \
+  && ! csv_contains "$ALLOWED_HOSTS" "$CURRENT_HOST" \
+  && ! csv_contains "$ALLOWED_HOSTS" "$CURRENT_HOST_SHORT"; then
+  echo "ERROR: E2E runner is not enabled for this user/host." >&2
+  echo "Current: user=$CURRENT_USER host=$CURRENT_HOST short=$CURRENT_HOST_SHORT" >&2
+  echo "Allowed users: $ALLOWED_USERS" >&2
+  echo "Allowed hosts: $ALLOWED_HOSTS" >&2
+  echo "Run via: ssh mac-sub 'cd /Users/jinwoo/work/term-mesh && ./scripts/run-tests-v1.sh'" >&2
+  echo "Or set TERMMESH_E2E_ALLOWED_HOSTS/USERS explicitly for a dedicated runner." >&2
   exit 2
 fi
 
@@ -13,6 +42,7 @@ cd "$(dirname "$0")/.."
 
 DERIVED_DATA_PATH="$HOME/Library/Developer/Xcode/DerivedData/term-mesh-tests-v1"
 APP="$DERIVED_DATA_PATH/Build/Products/Debug/term-mesh DEV.app"
+CLI="$DERIVED_DATA_PATH/Build/Products/Debug/term-mesh"
 
 echo "== build =="
 # Work around stale explicit-module cache artifacts (notably Sentry headers) that can
@@ -26,11 +56,24 @@ xcodebuild \
   -destination "platform=macOS" \
   -derivedDataPath "$DERIVED_DATA_PATH" \
   build >/dev/null
+xcodebuild \
+  -project GhosttyTabs.xcodeproj \
+  -scheme term-mesh-cli \
+  -configuration Debug \
+  -destination "platform=macOS" \
+  -derivedDataPath "$DERIVED_DATA_PATH" \
+  build >/dev/null
 
 if [ ! -d "$APP" ]; then
   echo "ERROR: term-mesh DEV.app not found at expected path: $APP" >&2
   exit 1
 fi
+if [ ! -x "$CLI" ]; then
+  echo "ERROR: term-mesh CLI not found at expected path: $CLI" >&2
+  exit 1
+fi
+export TERMMESH_CLI="$CLI"
+export TERMMESH_CLI_BIN="$CLI"
 
 cleanup() {
   pkill -x "term-mesh DEV" || true
@@ -145,6 +188,14 @@ else:
 bootstrap_last = None
 for _ in range(3):
     try:
+        if client is not None:
+            try:
+                client.close()
+            except Exception:
+                pass
+        client = termmesh()
+        client.connect()
+
         existing_ids = []
         try:
             existing_ids = [row[1] for row in client.list_workspaces() if len(row) >= 2]
@@ -221,7 +272,13 @@ run_test_with_retry() {
 
 echo "== tests (v1) =="
 fail=0
-for f in tests/test_*.py; do
+if [ "$#" -gt 0 ]; then
+  test_files=("$@")
+else
+  test_files=(tests/test_*.py)
+fi
+
+for f in "${test_files[@]}"; do
   base=$(basename "$f")
   if [ "$base" = "test_ctrl_interactive.py" ]; then
     echo "SKIP $f"

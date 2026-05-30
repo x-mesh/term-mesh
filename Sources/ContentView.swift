@@ -3332,6 +3332,46 @@ struct ContentView: View {
                 when: { _ in !TeamOrchestrator.shared.teams.isEmpty }
             )
         )
+        contributions.append(
+            CommandPaletteCommandContribution(
+                commandId: "palette.recycleAllAgents",
+                title: constant("Recycle All Agents…"),
+                subtitle: constant("Team"),
+                keywords: ["agent", "team", "recycle", "restart", "hard", "reset", "transcript"],
+                when: { _ in !TeamOrchestrator.shared.teams.isEmpty }
+            )
+        )
+        // P0-5: Watch commands (team must exist; PRD P1 lists these)
+        contributions.append(
+            CommandPaletteCommandContribution(
+                commandId: "palette.configureWatch",
+                title: constant("Configure Watch…"),
+                subtitle: constant("Watch"),
+                keywords: ["watch", "drift", "oversight", "monitor", "configure", "spec", "watcher"],
+                when: { _ in !TeamOrchestrator.shared.teams.isEmpty }
+            )
+        )
+        contributions.append(
+            CommandPaletteCommandContribution(
+                commandId: "palette.stopWatch",
+                title: constant("Stop Watch"),
+                subtitle: constant("Watch"),
+                keywords: ["watch", "drift", "oversight", "stop", "off", "disable"],
+                when: { _ in !TeamOrchestrator.shared.teams.isEmpty }
+            )
+        )
+        // R4: run one immediate check (watch.trigger_now). Only shown when watch is enabled
+        // for at least one team (synchronous check via daemon rpcCallRaw is not used here to
+        // avoid blocking; the handler provides feedback if watch is off/rejected).
+        contributions.append(
+            CommandPaletteCommandContribution(
+                commandId: "palette.runWatchNow",
+                title: constant("Run Watch Check Now"),
+                subtitle: constant("Watch"),
+                keywords: ["watch", "drift", "oversight", "run", "now", "trigger", "check"],
+                when: { _ in !TeamOrchestrator.shared.teams.isEmpty }
+            )
+        )
 
         return contributions
     }
@@ -3645,6 +3685,72 @@ struct ContentView: View {
             guard let firstTeam = teams.values.sorted(by: { $0.createdAt < $1.createdAt }).first else { return }
             if let workspace = tabManager.tabs.first(where: { $0.id == firstTeam.workspaceId }) {
                 tabManager.selectTab(workspace)
+            }
+        }
+        registry.register(commandId: "palette.recycleAllAgents") {
+            let teams = TeamOrchestrator.shared.teams
+            guard let teamName = teams.keys.sorted().first,
+                  let team = teams[teamName] else { return }
+            let agentCount = team.agents.count
+            let alert = NSAlert()
+            alert.messageText = "Recycle all agents in \"\(teamName)\"?"
+            alert.informativeText = "\(agentCount) agent pane\(agentCount == 1 ? "" : "s") will be hard-restarted — full transcripts discarded. Agents with active tasks will be skipped."
+            alert.addButton(withTitle: "Recycle")
+            alert.addButton(withTitle: "Cancel")
+            alert.alertStyle = .warning
+            if alert.runModal() == .alertFirstButtonReturn {
+                TeamOrchestrator.shared.recycleAllAgents(teamName: teamName, force: false)
+            }
+        }
+        // P0-5: Watch handlers
+        registry.register(commandId: "palette.configureWatch") {
+            let teams = TeamOrchestrator.shared.teams
+            guard let teamName = teams.keys.sorted().first,
+                  let team = teams[teamName] else { return }
+            NotificationCenter.default.post(
+                name: .watchConfigRequested,
+                object: nil,
+                userInfo: [
+                    "teamName": teamName,
+                    "workingDirectory": team.workingDirectory,
+                ]
+            )
+        }
+        registry.register(commandId: "palette.stopWatch") {
+            let teams = TeamOrchestrator.shared.teams
+            guard let teamName = teams.keys.sorted().first else { return }
+            let params: [String: Any] = ["team_id": teamName]
+            _ = TermMeshDaemon.shared.rpcCallRaw(method: "watch.off", params: params)
+        }
+        // R4: immediately trigger one check cycle for the first active team
+        registry.register(commandId: "palette.runWatchNow") {
+            let teams = TeamOrchestrator.shared.teams
+            guard let teamName = teams.keys.sorted().first else { return }
+            let params: [String: Any] = ["team_id": teamName]
+            DispatchQueue.global(qos: .userInitiated).async {
+                let raw = TermMeshDaemon.shared.rpcCallRaw(method: "watch.trigger_now", params: params)
+                DispatchQueue.main.async {
+                    guard let raw,
+                          let data = raw.data(using: .utf8),
+                          let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+                    else {
+                        let a = NSAlert()
+                        a.messageText = "Watch check failed"
+                        a.informativeText = "Could not reach the daemon"
+                        a.alertStyle = .warning
+                        a.runModal()
+                        return
+                    }
+                    if (json["status"] as? String) == "rejected" {
+                        let reason = json["reason"] as? String ?? "in-flight or disabled"
+                        let a = NSAlert()
+                        a.messageText = "Watch check skipped"
+                        a.informativeText = reason.prefix(1).uppercased() + reason.dropFirst()
+                        a.alertStyle = .informational
+                        a.runModal()
+                    }
+                    // status == "ok": silent success
+                }
             }
         }
     }

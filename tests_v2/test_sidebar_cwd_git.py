@@ -62,7 +62,10 @@ def _wait_for_state_field(
 ) -> dict[str, str]:
     def pred():
         state = _parse_sidebar_state(client.sidebar_state())
-        return state if state.get(key) == expected else None
+        actual = state.get(key)
+        if key in {"cwd", "focused_cwd"} and actual:
+            return state if str(Path(actual).resolve()) == str(Path(expected).resolve()) else None
+        return state if actual == expected else None
 
     return _wait_for(pred, timeout=timeout, interval=interval, label=f"{key}={expected!r}")
 

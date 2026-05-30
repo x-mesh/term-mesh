@@ -821,6 +821,8 @@ class TerminalController {
             return v2Result(id: id, self.v2WorkspacePrevious(params: params))
         case "workspace.last":
             return v2Result(id: id, self.v2WorkspaceLast(params: params))
+        case "workspace.sidebar_state":
+            return v2Result(id: id, self.v2WorkspaceSidebarState(params: params))
 
 
         // Surfaces / input
@@ -1178,6 +1180,8 @@ class TerminalController {
             return v2Result(id: id, self.v2DebugReadTerminalText(params: params))
         case "debug.terminal.render_stats":
             return v2Result(id: id, self.v2DebugRenderStats(params: params))
+        case "debug.terminal.drop_overlay_probe":
+            return v2Result(id: id, self.v2DebugTerminalDropOverlayProbe(params: params))
         case "debug.layout":
             return v2Result(id: id, self.v2DebugLayout())
         case "debug.bonsplit_underflow.count":
@@ -1200,6 +1204,24 @@ class TerminalController {
             return v2Result(id: id, self.v2DebugPanelSnapshotReset(params: params))
         case "debug.window.screenshot":
             return v2Result(id: id, self.v2DebugScreenshot(params: params))
+        case "debug.drag.simulate_file_drop":
+            return v2Result(id: id, self.v2DebugDragSimulateFileDrop(params: params))
+        case "debug.drag.seed_pasteboard", "debug.drag_pasteboard.seed":
+            return v2Result(id: id, self.v2DebugDragSeedPasteboard(params: params))
+        case "debug.drag.clear_pasteboard", "debug.drag_pasteboard.clear":
+            return v2Result(id: id, self.v2DebugDragClearPasteboard())
+        case "debug.drag.overlay_hit_gate":
+            return v2Result(id: id, self.v2DebugDragOverlayHitGate(params: params))
+        case "debug.drag.overlay_drop_gate":
+            return v2Result(id: id, self.v2DebugDragOverlayDropGate(params: params))
+        case "debug.drag.portal_hit_gate":
+            return v2Result(id: id, self.v2DebugDragPortalHitGate(params: params))
+        case "debug.drag.sidebar_overlay_gate":
+            return v2Result(id: id, self.v2DebugDragSidebarOverlayGate(params: params))
+        case "debug.drag.drop_hit_test":
+            return v2Result(id: id, self.v2DebugDragDropHitTest(params: params))
+        case "debug.drag.drag_hit_chain":
+            return v2Result(id: id, self.v2DebugDragHitChain(params: params))
 #endif
 
         default:
@@ -1243,6 +1265,7 @@ class TerminalController {
             "workspace.next",
             "workspace.previous",
             "workspace.last",
+            "workspace.sidebar_state",
             "surface.list",
             "surface.current",
             "surface.focus",
@@ -1381,6 +1404,7 @@ class TerminalController {
             "debug.terminal.is_focused",
             "debug.terminal.read_text",
             "debug.terminal.render_stats",
+            "debug.terminal.drop_overlay_probe",
             "debug.layout",
             "debug.bonsplit_underflow.count",
             "debug.bonsplit_underflow.reset",
@@ -1392,6 +1416,17 @@ class TerminalController {
             "debug.panel_snapshot",
             "debug.panel_snapshot.reset",
             "debug.window.screenshot",
+            "debug.drag.simulate_file_drop",
+            "debug.drag.seed_pasteboard",
+            "debug.drag.clear_pasteboard",
+            "debug.drag.overlay_hit_gate",
+            "debug.drag.overlay_drop_gate",
+            "debug.drag.portal_hit_gate",
+            "debug.drag.sidebar_overlay_gate",
+            "debug.drag.drop_hit_test",
+            "debug.drag.drag_hit_chain",
+            "debug.drag_pasteboard.seed",
+            "debug.drag_pasteboard.clear",
         ])
 #endif
 
@@ -2691,7 +2726,7 @@ class TerminalController {
         }
 
         // Minimal MainActor hold: get team struct (agent names, UUIDs, team metadata) only
-        let teamInfo: (leaderSessionId: String, workspaceId: String, agents: [(name: String, id: String, cli: String, model: String, agentType: String, color: String, workspaceId: String, panelId: String?, worktreeBranch: String?, worktreePath: String?)], createdAt: String)? = await MainActor.run {
+        let teamInfo: (leaderSessionId: String, workspaceId: String, agents: [(name: String, id: String, cli: String, model: String, agentType: String, color: String, workspaceId: String, panelId: String?, completedTaskCount: Int, worktreeBranch: String?, worktreePath: String?)], createdAt: String)? = await MainActor.run {
             guard let team = TeamOrchestrator.shared.teamStruct(name: teamName) else { return nil }
             return (
                 leaderSessionId: team.leaderSessionId,
@@ -2699,7 +2734,7 @@ class TerminalController {
                 agents: team.agents.map { a in
                     (name: a.name, id: a.id, cli: a.cli, model: a.model, agentType: a.agentType, color: a.color,
                      workspaceId: a.workspaceId.uuidString, panelId: a.panelId?.uuidString,
-                     worktreeBranch: a.worktreeBranch, worktreePath: a.worktreePath)
+                     completedTaskCount: a.completedTaskCount, worktreeBranch: a.worktreeBranch, worktreePath: a.worktreePath)
                 },
                 createdAt: ISO8601DateFormatter().string(from: team.createdAt)
             )
@@ -2722,6 +2757,7 @@ class TerminalController {
                 "model": agent.model,
                 "agent_type": agent.agentType,
                 "workspace_id": agent.workspaceId,
+                "completed_task_count": agent.completedTaskCount,
             ]
             if let pid = agent.panelId {
                 info["panel_id"] = pid
@@ -2803,7 +2839,7 @@ class TerminalController {
         guard let taskId = params["task_id"] as? String else {
             return v2Error(id: id, code: "invalid_params", message: "Missing task_id")
         }
-        let assignee = params["assignee"] as? String
+        let assignee = (params["assignee"] as? String) ?? (params["assign"] as? String)
         let progressNote = params["progress_note"] as? String
         let store = TeamDataStore.shared
 
@@ -3696,7 +3732,7 @@ class TerminalController {
             return v2Error(id: id, code: "invalid_params", message: "Missing title")
         }
         let details = params["description"] as? String
-        let assignee = params["assignee"] as? String
+        let assignee = (params["assignee"] as? String) ?? (params["assign"] as? String)
         let acceptanceCriteria = params["acceptance_criteria"] as? [String] ?? []
         let labels = params["labels"] as? [String] ?? []
         let estimatedSize = params["estimated_size"] as? Int

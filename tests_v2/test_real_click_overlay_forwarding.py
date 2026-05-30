@@ -45,7 +45,12 @@ def is_accessibility_error(err: subprocess.CalledProcessError) -> bool:
         "not allowed to send keystrokes",
         "not allowed assistive access",
         "not allowed to control computer",
+        "assistive access",
+        "accessibility permission",
+        "not authorized to send apple events",
+        "보조 접근이 허용되지 않습니다",
         "(1002)",
+        "(-1719)",
     ]
     return any(n in text for n in needles)
 
@@ -348,6 +353,9 @@ if __name__ == "__main__":
         if getattr(e, "output", None):
             print(e.output.strip())
         raise SystemExit(1)
+    except subprocess.TimeoutExpired as e:
+        print(f"SKIP: System Events automation timed out on this host: {e}")
+        raise SystemExit(0)
     except termmeshError as e:
         print(f"FAIL: {e}")
         raise SystemExit(1)

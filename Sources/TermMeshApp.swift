@@ -55,6 +55,10 @@ struct TermMeshApp: App {
     /// Reset to "new" each time the sheet closes so subsequent menu opens behave normally.
     @State private var teamCreationInitialMode: String = "new"
     @State private var ghosttyTheme = GhosttyTheme.current
+    // P0-5: Configure Watch sheet state (triggered via palette or sidebar notification)
+    @State private var showWatchConfig = false
+    @State private var watchConfigTeamName = ""
+    @State private var watchConfigWorkingDir = ""
 
     init() {
         Self.configureGhosttyEnvironment()
@@ -403,8 +407,22 @@ struct TermMeshApp: App {
                     await showSpawnCLIDialog()
                 }
             }
+            // P0-5: Configure Watch sheet handler
+            .onReceive(NotificationCenter.default.publisher(for: .watchConfigRequested)) { note in
+                let info = note.userInfo
+                watchConfigTeamName = info?["teamName"] as? String ?? ""
+                watchConfigWorkingDir = info?["workingDirectory"] as? String ?? ""
+                showWatchConfig = true
+            }
             .sheet(isPresented: $showTeamCreation) {
                 makeTeamCreationView()
+            }
+            .sheet(isPresented: $showWatchConfig) {
+                WatchConfigSheet(
+                    teamName: watchConfigTeamName,
+                    workingDirectory: watchConfigWorkingDir
+                )
+                .frame(width: 480)
             }
     }
 

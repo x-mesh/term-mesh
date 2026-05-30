@@ -403,6 +403,32 @@ Count as drift: reporting pre-existing Low issues as blocking, missing a new exp
 Do not count as drift: omitting Low findings when the task asks for Medium+ only.
 ```
 
+### Spec resolution
+
+Three forms are accepted for `--spec`:
+
+| Form | Meaning |
+|------|---------|
+| `"literal text"` | Spec text used verbatim every tick. |
+| `@path/to/spec.md` | File read live from disk each tick (relative to working dir). |
+| `preset:<name>` | Shorthand for `@.xm/watch/specs/<name>.md`. |
+
+**Built-in presets** (files in `.xm/watch/specs/`):
+
+| Name | Focus |
+|------|-------|
+| `executor` | Implementation scope, verify compliance, no unrelated refactor |
+| `reviewer` | P0-P3 bugs, behavioral regressions, missing tests |
+| `security` | Command injection, path traversal, secret exposure, auth boundary |
+| `general` | General execution + direction drift across all workers |
+
+Usage:
+
+```bash
+tm-agent watch on standard --target executor --spec preset:executor
+tm-agent watch on standard --target all --spec preset:general
+```
+
 ### On-demand review of one agent
 
 ```bash

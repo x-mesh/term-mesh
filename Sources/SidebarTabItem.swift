@@ -925,6 +925,9 @@ struct TabItemView: View {
                 TeamOrchestrator.shared.parkAgent(teamName: teamName, agentName: agent.name)
             }
         }
+        Button("Recycle all agents…") {
+            confirmAndRecycleAllAgents(teamName: teamName)
+        }
         Button("Destroy team…") {
             confirmAndDestroyTeam(teamName: teamName)
         }
@@ -934,6 +937,25 @@ struct TabItemView: View {
         }
         .disabled(TeamOrchestrator.shared.teams[teamName]?.sharedWorktreePath == nil
                   && TeamOrchestrator.shared.teams[teamName]?.agents.first?.worktreePath == nil)
+    }
+
+    private func confirmAndRecycleAllAgents(teamName: String) {
+        guard let team = TeamOrchestrator.shared.teams[teamName] else { return }
+        let agentCount = team.agents.count
+        let alert = NSAlert()
+        alert.messageText = "Recycle all agents in \"\(teamName)\"?"
+        alert.informativeText = "\(agentCount) agent pane\(agentCount == 1 ? "" : "s") will be hard-restarted — full transcripts discarded. Agents with active tasks will be skipped."
+        alert.addButton(withTitle: "Recycle")
+        alert.addButton(withTitle: "Cancel")
+        alert.alertStyle = .warning
+        alert.presentAsSheet { response in
+            guard response == .alertFirstButtonReturn else { return }
+            let (recycled, skipped) = TeamOrchestrator.shared.recycleAllAgents(teamName: teamName, force: false)
+            #if DEBUG
+            dlog("recycleAll teamName=\(teamName) recycled=\(recycled) skipped=\(skipped)")
+            #endif
+            _ = (recycled, skipped)
+        }
     }
 
     private func confirmAndDestroyTeam(teamName: String) {
@@ -1179,6 +1201,11 @@ private struct TeamIndicatorBlock: View {
     let agentDotBuilder: (TeamOrchestrator.AgentMember) -> AnyView
     @AppStorage private var isExpanded: Bool
 
+    // P0-2: watch status chip + sheet state
+    @State private var showWatchConfig = false
+    @State private var watchChipText: String? = nil
+    @State private var watchEnabled = false
+
     init(
         teamName: String,
         activeTeam: TeamOrchestrator.Team?,
@@ -1194,6 +1221,10 @@ private struct TeamIndicatorBlock: View {
         self.teamContextMenuBuilder = teamContextMenuBuilder
         self.agentDotBuilder = agentDotBuilder
         self._isExpanded = AppStorage(wrappedValue: false, "sidebar.team.\(teamName).expanded")
+    }
+
+    private var workingDirectory: String {
+        TeamOrchestrator.shared.teams[teamName]?.workingDirectory ?? ""
     }
 
     var body: some View {
@@ -1226,8 +1257,62 @@ private struct TeamIndicatorBlock: View {
                 }
                 .buttonStyle(.plain)
                 .contextMenu {
+                    // Existing team actions
                     teamContextMenuBuilder()
+                    // P0-2: Watch actions
+                    Divider()
+                    Button("Configure Watch…") {
+                        showWatchConfig = true
+                    }
+                    Button("Stop Watch") {
+                        let params: [String: Any] = ["team_id": teamName]
+                        _ = TermMeshDaemon.shared.rpcCallRaw(method: "watch.off", params: params)
+                        refreshWatchChip()
+                    }
+                    .disabled(!watchEnabled)
+                    // R4: watch.trigger_now — fires one immediate check, bypassing the interval
+                    Button("Run Watch Check Now") {
+                        let tn = teamName
+                        DispatchQueue.global(qos: .userInitiated).async {
+                            let raw = TermMeshDaemon.shared.rpcCallRaw(
+                                method: "watch.trigger_now", params: ["team_id": tn])
+                            DispatchQueue.main.async {
+                                guard let raw,
+                                      let data = raw.data(using: .utf8),
+                                      let json = try? JSONSerialization.jsonObject(with: data)
+                                            as? [String: Any]
+                                else {
+                                    let a = NSAlert()
+                                    a.messageText = "Watch check failed"
+                                    a.informativeText = "Could not reach the daemon"
+                                    a.alertStyle = .warning
+                                    a.runModal()
+                                    return
+                                }
+                                if (json["status"] as? String) == "rejected" {
+                                    let reason = json["reason"] as? String ?? "in-flight or disabled"
+                                    let a = NSAlert()
+                                    a.messageText = "Watch check skipped"
+                                    a.informativeText = reason.prefix(1).uppercased() + reason.dropFirst()
+                                    a.alertStyle = .informational
+                                    a.runModal()
+                                }
+                                // status == "ok": silent success
+                            }
+                        }
+                    }
+                    .disabled(!watchEnabled)
                 }
+            }
+
+            // P0-2: watch status chip (shown when watch is enabled)
+            if let chipText = watchChipText {
+                Text(chipText)
+                    .font(.system(size: 9))
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+                    .padding(.leading, 4)
             }
 
             if let team = activeTeam {
@@ -1244,6 +1329,74 @@ private struct TeamIndicatorBlock: View {
                 }
             }
         }
+        .onAppear { refreshWatchChip() }
+        .sheet(isPresented: $showWatchConfig, onDismiss: { refreshWatchChip() }) {
+            WatchConfigSheet(teamName: teamName, workingDirectory: workingDirectory)
+                .frame(width: 480)
+        }
+    }
+
+    private func refreshWatchChip() {
+        let tn = teamName
+        let wd = workingDirectory
+        DispatchQueue.global(qos: .utility).async {
+            let params: [String: Any] = ["team_id": tn, "working_directory": wd]
+            guard let raw = TermMeshDaemon.shared.rpcCallRaw(method: "watch.status", params: params),
+                  let data = raw.data(using: .utf8),
+                  let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+            else {
+                DispatchQueue.main.async { watchChipText = nil; watchEnabled = false }
+                return
+            }
+            let w: [String: Any]?
+            if let watch = root["watch"] as? [String: Any] {
+                w = watch
+            } else if let watches = root["watches"] as? [[String: Any]] {
+                w = watches.first { ($0["team_id"] as? String) == tn }
+            } else {
+                w = nil
+            }
+            guard let watch = w else {
+                DispatchQueue.main.async { watchChipText = nil; watchEnabled = false }
+                return
+            }
+            let enabled = watch["enabled"] as? Bool ?? false
+            let chip: String? = enabled ? Self.buildWatchChip(from: watch) : nil
+            DispatchQueue.main.async {
+                watchEnabled = enabled
+                watchChipText = chip
+            }
+        }
+    }
+
+    private static func buildWatchChip(from w: [String: Any]) -> String {
+        let target = w["target"] as? String
+        let workers = w["workers"] as? [String] ?? []
+        let stance = w["stance"] as? String ?? "critic"
+        let nextTick = w["next_tick"] as? Int
+        let lastError = w["last_error"] as? String
+        let dupWarning = w["duplicate_name_warning"] as? String
+
+        if let err = lastError, !err.isEmpty {
+            return "Watch: Error · \(err.prefix(20))"
+        }
+        let targetLabel: String
+        if let t = target, t != "all", !t.isEmpty {
+            targetLabel = t
+        } else {
+            targetLabel = workers.isEmpty ? "All workers" : "All · \(workers.count)"
+        }
+        let stanceShort = String(stance.prefix(4))
+        // R3: ⚠ prefix when duplicate worker names were detected (chip-level hint).
+        let dupPrefix = dupWarning != nil ? "⚠ " : ""
+        if let next = nextTick {
+            let remaining = next - Int(Date().timeIntervalSince1970)
+            let mins = max(0, remaining / 60)
+            let secs = max(0, remaining % 60)
+            let timeStr = mins > 0 ? "\(mins)m\(String(format: "%02d", secs))s" : "\(secs)s"
+            return "\(dupPrefix)Watch: \(targetLabel) · \(stanceShort) · \(timeStr)"
+        }
+        return "\(dupPrefix)Watch: \(targetLabel) · \(stanceShort)"
     }
 }
 
@@ -1340,6 +1493,8 @@ private struct ExpandedAgentRow: View {
     let agent: TeamOrchestrator.AgentMember
     @ObservedObject private var dataStore = TeamDataStore.shared
     @ObservedObject private var orchestrator = TeamOrchestrator.shared
+    // P0-3: Watch This Agent sheet
+    @State private var showWatchConfig = false
 
     private var state: String {
         TeamOrchestrator.shared.agentState(teamName: teamName, agentName: agent.name)
@@ -1444,6 +1599,15 @@ private struct ExpandedAgentRow: View {
         .contextMenu {
             agentRowContextMenu()
         }
+        .sheet(isPresented: $showWatchConfig) {
+            let wd = TeamOrchestrator.shared.teams[teamName]?.workingDirectory ?? ""
+            WatchConfigSheet(
+                teamName: teamName,
+                workingDirectory: wd,
+                prefillTarget: agent.name
+            )
+            .frame(width: 480)
+        }
     }
 
     @ViewBuilder
@@ -1469,6 +1633,13 @@ private struct ExpandedAgentRow: View {
 
         Button("View logs") {
             revealLogsInFinder()
+        }
+
+        Divider()
+
+        // P0-3: Watch This Agent — opens WatchConfigSheet with this agent pre-filled as target
+        Button("Watch This Agent…") {
+            showWatchConfig = true
         }
 
         Divider()

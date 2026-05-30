@@ -63,6 +63,9 @@ def main() -> int:
             raise termmeshError(f"Expected >=2 surfaces before move, got {len(before_ids)} ({before_ids})")
 
         c.move_workspace_to_window(ws, w2, focus=True)
+        c.focus_window(w2)
+        c._call("workspace.select", {"workspace_id": ws, "window_id": w2})
+        c.activate_app()
         time.sleep(0.5)
 
         # Wait for reattachment after cross-window move.

@@ -27,6 +27,14 @@ def focused_pane_id(client: termmesh) -> Optional[str]:
             return pane_id
     return None
 
+def pane_id_for_surface(client: termmesh, surface_id: str) -> Optional[str]:
+    panes = (client._call("pane.list") or {}).get("panes") or []
+    for pane in panes:
+        surface_ids = [str(s) for s in pane.get("surface_ids") or []]
+        if str(surface_id) in surface_ids:
+            return str(pane.get("id"))
+    return None
+
 
 def wait_url_contains(client: termmesh, panel_id: str, needle: str, timeout_s: float = 10.0) -> None:
     start = time.time()
@@ -59,10 +67,13 @@ def test_cmd_ctrl_h_goto_split_left_from_webview(client: termmesh) -> tuple[bool
         if len(panes) != 2:
             return False, f"Expected 2 panes, got {len(panes)}: {panes}"
 
-        browser_pane_id = focused_pane_id(client)
+        browser_pane_id = pane_id_for_surface(client, browser_id)
         terminal_pane_id = next((pid for _i, pid, _n, _f in panes if pid != browser_pane_id), None)
         if not browser_pane_id or not terminal_pane_id:
             return False, f"Could not identify terminal/browser pane IDs: {panes}"
+
+        client.focus_pane(browser_pane_id)
+        time.sleep(0.3)
 
         # Force WKWebView first responder (socket-driven; avoids flaky clicking).
         client.focus_webview(browser_id)
@@ -107,10 +118,13 @@ def test_cmd_opt_left_arrow_goto_split_left_from_webview(client: termmesh) -> tu
     if len(panes) != 2:
         return False, f"Expected 2 panes, got {len(panes)}: {panes}"
 
-    browser_pane_id = focused_pane_id(client)
+    browser_pane_id = pane_id_for_surface(client, browser_id)
     terminal_pane_id = next((pid for _i, pid, _n, _f in panes if pid != browser_pane_id), None)
     if not browser_pane_id or not terminal_pane_id:
         return False, f"Could not identify terminal/browser pane IDs: {panes}"
+
+    client.focus_pane(browser_pane_id)
+    time.sleep(0.3)
 
     client.focus_webview(browser_id)
     client.wait_for_webview_focus(browser_id, timeout_s=3.0)

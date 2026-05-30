@@ -4,6 +4,29 @@ All notable changes to term-mesh are documented here.
 
 ## [Unreleased]
 
+## [0.134.0] - 2026-05-30
+
+### Added
+- **Watch oversight GUI** — autonomous drift watch is now fully controllable from the app, not just the CLI. A new **Configure Watch** sheet (Enabled toggle, target All/Specific, stance Critic/Advisor/Pair, spec presets or path/inline, interval presets, CLI/model pickers, cost preview, live status panel) is reachable from the sidebar team row context menu, an agent row "Watch This Agent", and the command palette (Configure Watch / Stop Watch / Run Watch Check Now). The sidebar team row also shows a live watch chip (target · worker count · stance · next-tick countdown).
+- **Watch all-workers fan-out** — `--target all` now actually watches every worker on a team (one bounded check per worker each tick) instead of being a no-op. Same-name workers are de-duplicated with a warning surfaced in the watch status and sidebar chip.
+- **Run Watch Check Now** — trigger an immediate watch sweep without waiting for the next interval, from the sidebar menu or command palette.
+- **Watch spec presets** — pick a ready-made oversight spec (`executor`, `reviewer`, `security`, `general`) via `preset:<name>` instead of writing one each time; custom path/inline specs still supported.
+- **Recycle All Agents** — recycle every worker on a team in one action from the sidebar team row context menu or command palette, with a confirmation step; agents with active work are skipped.
+- **Team creation pair options** — the "Pair with" companion watcher can now use the same CLI as the leader (e.g. a Claude leader paired with a Claude watcher), with selectable stance and an Auto-watch toggle that starts watching as soon as the team is created.
+- **Browser Cmd-[ / Cmd-] navigation** — back/forward in browser panes via keyboard.
+
+### Changed
+- **Agent teams now use Opus 4.8 (1M context)** — the `opus` model option resolves to Opus 4.8, replacing the previous Opus 4.7 / `opus-1m` (4.7 1M) entries, which are normalized automatically so existing team and profile settings keep working.
+
+### Fixed
+- **Remote hosts no longer pile up duplicates in the sidebar** — connecting to the same SSH peer host from a new window kept adding a fresh entry every time, because each SSH tunnel used a unique socket path. Hosts are now de-duplicated by a stable SSH identity, and reconnecting refreshes the workspace list against the new tunnel so opening a workspace after reconnect no longer fails.
+- **Auto-recycle task counter** — GUI-team agents now reset their completed-task count consistently on recycle (matching headless agents), so count-based auto-recycle cadence stays accurate.
+- **Browser webview focus** — focus handling hardened to avoid losing keyboard focus during navigation.
+
+### Thanks to 1 contributor!
+
+- [@JINWOO-J](https://github.com/JINWOO-J)
+
 ## [0.133.0] - 2026-05-28
 
 ### Added

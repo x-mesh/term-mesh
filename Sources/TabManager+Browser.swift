@@ -1288,6 +1288,9 @@ extension Notification.Name {
     static let browserFocusAddressBar = Notification.Name("browserFocusAddressBar")
     static let teamCreationRequested = Notification.Name("term-mesh.teamCreationRequested")
     static let spawnCLIRequested = Notification.Name("term-mesh.spawnCLIRequested")
+    /// P0-5: Posted with userInfo ["teamName": String, "workingDirectory": String]
+    /// to open the Configure Watch sheet for the specified team.
+    static let watchConfigRequested = Notification.Name("term-mesh.watchConfigRequested")
     static let browserMoveOmnibarSelection = Notification.Name("browserMoveOmnibarSelection")
     static let browserDidExitAddressBar = Notification.Name("browserDidExitAddressBar")
     static let browserDidFocusAddressBar = Notification.Name("browserDidFocusAddressBar")

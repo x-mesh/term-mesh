@@ -9,10 +9,13 @@ struct WorkspaceSummary: Identifiable, Equatable {
 }
 
 struct HostEntry: Identifiable {
-    let id: String  // hostSockPath
+    let id: String         // stable dedup key (stableKey)
     var displayName: String
     var isConnected: Bool
     var workspaces: [WorkspaceSummary]
+    /// The most-recently-used ephemeral sock path. Updated on each reconnect so
+    /// that fetchWorkspaces always connects over the current live tunnel.
+    var activeSockPath: String
 }
 
 @MainActor
@@ -48,36 +51,60 @@ final class RemoteHostStore: ObservableObject {
 
     private func syncFromCoordinator() {
         let connections = PeerClientCoordinator.shared.activeConnections()
-        let activePaths = Set(connections.map { $0.hostSockPath })
 
+        // Derive a stable dedup key per connection.
+        // SSH tunnels use a unique local socket path per session, so keying by
+        // hostSockPath would insert a new HostEntry on every reconnect. Instead:
+        //   SSH connection  → "ssh:<sshTarget>" (stable across reconnects)
+        //   Direct socket   → hostSockPath (already stable)
+        // LIMITATION: same sshTarget with different remote sockets collapse into
+        // one entry; needs remoteSockPath in connectionInfo to distinguish them.
+        func stableKey(for conn: PeerRelayConnectionInfo) -> String {
+            if let ssh = conn.sshTarget, !ssh.isEmpty { return "ssh:\(ssh)" }
+            return conn.hostSockPath
+        }
+
+        var activeKeys = Set<String>()
         for conn in connections {
-            let path = conn.hostSockPath
-            if hosts[path] == nil {
-                hosts[path] = HostEntry(
-                    id: path,
+            let key = stableKey(for: conn)
+            activeKeys.insert(key)
+            if hosts[key] == nil {
+                hosts[key] = HostEntry(
+                    id: key,
                     displayName: conn.hostDisplay,
                     isConnected: true,
-                    workspaces: []
+                    workspaces: [],
+                    activeSockPath: conn.hostSockPath
                 )
-                fetchWorkspaces(for: path)
+                // Pass the actual (possibly ephemeral) sock path for the relay
+                // connection, but store results under the stable key.
+                fetchWorkspaces(for: conn.hostSockPath, key: key)
             } else {
-                hosts[path]?.isConnected = true
+                hosts[key]?.isConnected = true
                 if !conn.hostDisplay.isEmpty {
-                    hosts[path]?.displayName = conn.hostDisplay
+                    hosts[key]?.displayName = conn.hostDisplay
+                }
+                // P1 fix: SSH reconnects produce a new ephemeral hostSockPath.
+                // If it changed, refresh activeSockPath and re-fetch workspaces so
+                // WorkspaceSummary.hostSockPath never points to the dead tunnel.
+                if hosts[key]?.activeSockPath != conn.hostSockPath {
+                    hosts[key]?.activeSockPath = conn.hostSockPath
+                    hosts[key]?.workspaces = []
+                    fetchWorkspaces(for: conn.hostSockPath, key: key)
                 }
             }
         }
 
-        for key in hosts.keys where !activePaths.contains(key) {
+        for key in hosts.keys where !activeKeys.contains(key) {
             hosts[key]?.isConnected = false
         }
     }
 
-    private func fetchWorkspaces(for hostSockPath: String) {
-        fetchTasks[hostSockPath]?.cancel()
+    private func fetchWorkspaces(for hostSockPath: String, key: String) {
+        fetchTasks[key]?.cancel()
         let path = hostSockPath
         // Task inherits @MainActor; await suspensions yield main without blocking it.
-        fetchTasks[path] = Task {
+        fetchTasks[key] = Task {
             do {
                 let conn = try await PeerRelaySession.connect(hostSockPath: path)
                 let workspaces: [Termmesh_Peer_V1_Workspace]
@@ -88,6 +115,12 @@ final class RemoteHostStore: ObservableObject {
                     return
                 }
                 await conn.cancel()
+                // Stale-path guard: a reconnect may have superseded this fetch with a
+                // newer ephemeral path. Drop the result if this task was cancelled or the
+                // host's active path no longer matches the path we fetched against.
+                if Task.isCancelled || self.hosts[key]?.activeSockPath != path {
+                    return
+                }
                 let summaries = workspaces.map {
                     WorkspaceSummary(
                         id: $0.workspaceID,
@@ -95,7 +128,7 @@ final class RemoteHostStore: ObservableObject {
                         hostSockPath: path
                     )
                 }
-                self.hosts[path]?.workspaces = summaries
+                self.hosts[key]?.workspaces = summaries
             } catch {
                 // Host disconnected between detection and fetch — ignore.
             }

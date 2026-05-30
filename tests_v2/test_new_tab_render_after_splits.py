@@ -16,6 +16,8 @@ Note: We use `panel_snapshot` instead of window screenshots to avoid macOS Scree
 permissions on the UTM VM.
 """
 
+from __future__ import annotations
+
 import os
 import sys
 import time

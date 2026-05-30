@@ -780,7 +780,6 @@ final class TeamOrchestrator: ObservableObject {
         let pairEligible = leaderMode != "repl"
             && leaderMode != "adopted"
             && pairMode != "none"
-            && pairMode != leaderMode
             && executionMode == "pane"
         var agents = agents
         if pairEligible {
@@ -3180,7 +3179,10 @@ final class TeamOrchestrator: ObservableObject {
         guard let oldPid = old.panelId else {
             return .failure(.headlessNoPane)
         }
-        let teamAgentKey = "\(teamName)/\(agentName)"
+        // Use panelId-based key when available so duplicate-named agents each get
+        // their own migration slot and don't block each other (P2-1 fix).
+        let teamAgentKey = disambiguatePanelId.map { "\(teamName)/\($0.uuidString)" }
+            ?? "\(teamName)/\(agentName)"
         if migratingAgents.contains(teamAgentKey) {
             return .failure(.alreadyMigrating)
         }
@@ -3285,7 +3287,12 @@ final class TeamOrchestrator: ObservableObject {
         // Phase C — atomic swap. Replace the AgentMember in place (id/name stable).
         // dispatcher / heartbeat / task routing are all (team, agent_name) keyed and
         // resolve agent.panelId fresh on every call, so no explicit rebind is needed.
-        team.agents[idx] = newMember
+        // Authoritative completedTaskCount reset: mirror headless recycle (mod.rs:1658).
+        // Both single (recycleAgent) and bulk (recycleAllAgents) paths go through here,
+        // so no external post-restart reset is needed or correct.
+        var memberToSwap = newMember
+        memberToSwap.completedTaskCount = 0
+        team.agents[idx] = memberToSwap
         teams[teamName] = team
         TeamDataStore.shared.registerTeam(teamName, agentNames: team.agents.map(\.name))
         syncTeamStateToDaemon()
@@ -3332,6 +3339,36 @@ final class TeamOrchestrator: ObservableObject {
             }
             #endif
         }
+    }
+
+    /// Recycle all agents in a team. force=false skips agents with active non-terminal tasks.
+    /// Returns (recycled, skipped) counts — skipped agents had an unsafe active task.
+    ///
+    /// Restarts are serialized (sequential await) to avoid concurrent stale Team
+    /// struct write-backs (P2-2). Routing is by panelId so duplicate-named agents
+    /// each recycle correctly (P2-1).
+    @discardableResult
+    func recycleAllAgents(teamName: String, force: Bool) -> (recycled: Int, skipped: Int) {
+        guard let team = teams[teamName] else { return (0, 0) }
+        let safeStatuses: Set<String> = ["blocked", "review_ready", "completed", "abandoned", "failed"]
+        var toRecycle: [UUID] = []
+        var skipped = 0
+        for agent in team.agents {
+            if !force, let task = activeTask(for: teamName, agentName: agent.name),
+               !safeStatuses.contains(task.status) {
+                skipped += 1
+                continue
+            }
+            if let pid = agent.panelId {
+                toRecycle.append(pid)
+            }
+        }
+        Task { @MainActor in
+            for panelId in toRecycle {
+                await self.restartAgentPaneHard(panelId: panelId)
+            }
+        }
+        return (toRecycle.count, skipped)
     }
 
     func setTeamDefaultAutoRecycle(teamName: String, every: Int) {
@@ -3631,6 +3668,7 @@ final class TeamOrchestrator: ObservableObject {
                     "heartbeat_is_stale": heartbeat.map(isHeartbeatStale) ?? false,
                     "workspace_id": agent.workspaceId.uuidString,
                 ]
+                info["completed_task_count"] = agent.completedTaskCount
                 if let pid = agent.panelId {
                     info["panel_id"] = pid.uuidString
                 }
@@ -4286,19 +4324,18 @@ final class TeamOrchestrator: ObservableObject {
     }
 
     /// Map term-mesh tier names to the exact `--model` argument Claude CLI expects.
-    /// Only `opus-1m` needs explicit translation today; other tiers are passed through
-    /// (Claude CLI accepts `sonnet`/`opus`/`haiku` and full model IDs verbatim).
+    /// "opus" and legacy "opus-1m" both map to claude-opus-4-8[1m].
     static func resolveClaudeModelArg(_ model: String) -> String {
         switch model {
-        case "opus-1m": return "claude-opus-4-7[1m]"
-        default:        return model
+        case "opus", "opus-1m": return "claude-opus-4-8[1m]"
+        default:                return model
         }
     }
 
     /// Map short model names (used internally) to kiro-cli model identifiers.
     private static func kiroModelName(_ shortName: String) -> String {
         switch shortName.lowercased() {
-        case "opus":   return "claude-opus-4.7"
+        case "opus":   return "claude-opus-4.8"
         case "sonnet": return "claude-sonnet-4.6"
         case "haiku":  return "claude-haiku-4.5"
         default:       return shortName  // pass through if already full name

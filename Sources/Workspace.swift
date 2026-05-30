@@ -2175,6 +2175,7 @@ final class Workspace: Identifiable, ObservableObject {
 
             for panel in self.panels.values {
                 guard let terminalPanel = panel as? TerminalPanel else { continue }
+                terminalPanel.requestViewReattach()
                 terminalPanel.hostedView.reconcileGeometryNow()
                 terminalPanel.surface.forceRefresh()
             }
