@@ -450,17 +450,40 @@ final class TeamDataStore: ObservableObject, @unchecked Sendable {
         return tasks[idx]
     }
 
+    /// True when every task `task` dependsOn has reached the `completed` state.
+    /// A failed / abandoned / cancelled dependency does NOT release the dependent
+    /// (its input never arrived) — the leader must intervene. A dep id no longer
+    /// on the board is treated as satisfied (long-completed / pruned), so a
+    /// pruned dependency can never deadlock the pool. `tasks` is the caller's
+    /// live snapshot (caller holds `lock`).
+    private func dependenciesSatisfied(
+        _ task: TeamOrchestrator.TeamTask,
+        in tasks: [TeamOrchestrator.TeamTask]
+    ) -> Bool {
+        for depId in task.dependsOn {
+            guard let dep = tasks.first(where: { $0.id == depId }) else { continue }
+            if dep.status != "completed" { return false }
+        }
+        return true
+    }
+
     /// Work-stealing: atomically find the highest-priority pending/unassigned task
-    /// and assign it to the given agent (status → assigned).
-    /// Returns nil if no claimable task exists.
+    /// whose dependencies are all completed and assign it to the given agent
+    /// (status → assigned). Returns nil if no claimable task exists.
     @discardableResult
     func claimTask(teamName: String, agentName: String) -> TeamOrchestrator.TeamTask? {
         lock.lock()
         defer { lock.unlock() }
         guard var tasks = taskBoards[teamName] else { return nil }
-        // Find pending tasks with no assignee, sorted by priority descending then createdAt ascending
+        // Find pending tasks with no assignee AND satisfied dependencies, sorted
+        // by priority descending then createdAt ascending. The dependency gate
+        // keeps an autonomous claim loop from pulling a task whose inputs aren't
+        // ready yet (dependents are only logged, never auto-unblocked, on
+        // completion — see updateTask).
         guard let idx = tasks.indices.filter({
-            (tasks[$0].status == "pending" || tasks[$0].status == "queued") && tasks[$0].assignee == nil
+            (tasks[$0].status == "pending" || tasks[$0].status == "queued")
+                && tasks[$0].assignee == nil
+                && dependenciesSatisfied(tasks[$0], in: tasks)
         }).sorted(by: { a, b in
             if tasks[a].priority != tasks[b].priority { return tasks[a].priority > tasks[b].priority }
             return tasks[a].createdAt < tasks[b].createdAt

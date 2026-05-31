@@ -3417,9 +3417,59 @@ final class TeamOrchestrator: ObservableObject {
             #if DEBUG
             dlog("autoRecycle.skip reason=threshold_not_met teamName=\(teamName) agentName=\(agentName) count=\(count) threshold=\(agentThreshold ?? teamThreshold ?? 0)")
             #endif
+            // Not recycling → the agent is now idle and ready. Pull the next task
+            // from the UNASSIGNED work-pool and push it, so a populated pool drains
+            // itself without the leader re-broadcasting `tm-agent claim` after every
+            // wave. This is the self-sustaining parallel loop (finish → auto-claim
+            // next → report). It is intentionally NOT done on the recycle branch,
+            // because recycleAgent hard-restarts the pane (drops context) and a task
+            // claimed into it would be interrupted by the restart.
+            autoClaimNext(teamName: teamName, agentName: agentName)
             return
         }
         recycleAgent(teamName: teamName, agentName: agentName, force: false)
+    }
+
+    /// Continuous work-stealing: when an agent finishes a task (and is not being
+    /// recycled), atomically claim the next task from the team's UNASSIGNED pool
+    /// and push it to that agent. Returns silently when the pool is empty or all
+    /// remaining tasks have unmet dependencies.
+    ///
+    /// Scope & safety: this only ever consumes tasks with `assignee == nil`.
+    /// Directed `delegate`/`fan-out` workflows create tasks already ASSIGNED to a
+    /// specific agent, so the unassigned pool is empty there and this is a no-op —
+    /// it never steals work from, or interferes with, leader-controlled dispatch.
+    /// It activates exactly for the work-pool pattern (`task create` unassigned),
+    /// turning "leader broadcasts `tm-agent claim` every wave" into "idle agents
+    /// drain the pool on their own".
+    ///
+    /// Duplicate-named caveat: the push routes by agent NAME via `notifyTaskCreated`
+    /// → `selectAgent` round-robin. For the common case of uniquely-named agents
+    /// this targets the exact pane that just freed up. When several panes share a
+    /// name, round-robin may push to a sibling pane; correct per-pane addressing
+    /// needs the panel_id field tracked as the Tier-3 BUG-2 fix.
+    private func autoClaimNext(teamName: String, agentName: String) {
+        guard let claimed = TeamDataStore.shared.claimTask(teamName: teamName, agentName: agentName) else {
+            return  // empty pool or all deps unmet — nothing to pull
+        }
+        #if DEBUG
+        dlog("[autoClaimNext] team=\(teamName) agent=\(agentName) claimed task=\(claimed.id.prefix(8)) title=\(claimed.title.prefix(40))")
+        #endif
+        // Push via the auto-locating sender: it makes exactly one selectAgent
+        // (round-robin) decision and resolves the owning tabManager itself through
+        // AppDelegate.locateSurface, so it reaches the pane even for multi-window
+        // teams without a second, possibly-divergent agent lookup.
+        let instruction = formatTaskAssignmentInstruction(task: claimed)
+        let pushed = sendToAgentAutoLocate(teamName: teamName, agentName: agentName, text: instruction)
+        if !pushed {
+            // Delivery failed (pane gone / migrating) — release the task so another
+            // idle agent (or a manual claim) can pick it up instead of it sitting
+            // assigned-but-undelivered.
+            _ = TeamDataStore.shared.reassignTask(teamName: teamName, taskId: claimed.id, assignee: nil)
+            #if DEBUG
+            dlog("[autoClaimNext] push FAILED task=\(claimed.id.prefix(8)) — returned to pool team=\(teamName) agent=\(agentName)")
+            #endif
+        }
     }
 
     /// Snapshot of a pane's position in the bonsplit tree, captured before

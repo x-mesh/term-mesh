@@ -412,6 +412,20 @@ tm-agent brief <agent>
 #   tm-agent broadcast 'tm-agent claim'       # Option A: all panels claim simultaneously (preferred)
 #   tm-agent send executor 'tm-agent claim'; sleep 0.5; tm-agent send executor 'tm-agent claim'  # Option B: round-robin sequential
 #
+# AUTO-CLAIM-NEXT (self-draining pool — Tier 1 work-stealing): when an agent
+# finishes a task and is NOT being auto-recycled, it AUTOMATICALLY claims the
+# next task from the UNASSIGNED pool and is pushed its instruction — no second
+# `tm-agent claim` broadcast needed per wave. So for the work-pool pattern you
+# now kick it ONCE; idle agents drain the pool on their own until it is empty:
+#   tm-agent task create 'task A'; tm-agent task create 'task B'; tm-agent task create 'task C'
+#   tm-agent broadcast 'tm-agent claim'   # one kick — each agent then auto-pulls the next on finish
+# Scope: only consumes UNASSIGNED tasks, so directed delegate/fan-out (which
+# create already-ASSIGNED tasks) are unaffected. Dependency-aware: a pooled task
+# is only auto-claimed once every task it `dependsOn` has COMPLETED (a failed dep
+# does not release it). Auto-claim is skipped on the recycle wave (the pane hard
+# restarts). Duplicate-named agents: the push routes by name (round-robin), so a
+# sibling pane may receive it — exact per-pane delivery awaits the panel_id fix.
+#
 # Broadcast reaches ALL panels including duplicate-named agents (BUG-3 fix d69c9d0c):
 #   tm-agent broadcast 'msg'   # every pane receives — no name-based collapse
 #
