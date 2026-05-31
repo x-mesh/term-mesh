@@ -2523,9 +2523,37 @@ final class TeamOrchestrator: ObservableObject {
 
     /// Send text to an agent by its unique panelId (skips name lookup entirely).
     /// Used by broadcast and asyncTeamBroadcast to avoid duplicate-name collapse.
+    /// When `recordPendingReturnFor` is set and `withReturn` is false, records the
+    /// pasted pane as the pending Return target keyed by "<team>/<agentName>" so a
+    /// separate team.send_key Return lands on the SAME pane (used by panel-targeted
+    /// team.send / team.delegate for deterministic duplicate-name addressing).
     @discardableResult
-    func sendToAgentByPanel(teamName: String, panelId: UUID, workspaceId: UUID, text: String, tabManager: TabManager, withReturn: Bool = true) -> Bool {
-        return sendTextToPanel(workspaceId: workspaceId, panelId: panelId, text: text, tabManager: tabManager, withReturn: withReturn)
+    func sendToAgentByPanel(teamName: String, panelId: UUID, workspaceId: UUID, text: String, tabManager: TabManager, withReturn: Bool = true, recordPendingReturnFor agentName: String? = nil, completion: ((Bool) -> Void)? = nil) -> Bool {
+        if !withReturn,
+           let agentName,
+           let team = teams[teamName],
+           let agent = team.agents.first(where: { $0.panelId == panelId && $0.name == agentName }),
+           let identity = agentIdentity(for: agent) {
+            pendingReturnTargets["\(teamName)/\(agentName)"] = identity
+        }
+        // When an agentName is provided (panel-targeted send/delegate, incl. /tm
+        // fan-out), mirror sendToAgent's in-flight accounting so a concurrent
+        // name-keyed hard restart drains the paste before tearing the pane down,
+        // instead of closing it mid-paste. Broadcast callers pass agentName=nil and
+        // keep the original untracked fast path.
+        let teamAgentKey = agentName.map { "\(teamName)/\($0)" }
+        if let teamAgentKey { activeSends[teamAgentKey, default: 0] += 1 }
+        return sendTextToPanel(workspaceId: workspaceId, panelId: panelId, text: text, tabManager: tabManager, withReturn: withReturn) { [weak self] sent in
+            if let self, let teamAgentKey {
+                let remaining = (self.activeSends[teamAgentKey] ?? 0) - 1
+                if remaining <= 0 {
+                    self.activeSends.removeValue(forKey: teamAgentKey)
+                } else {
+                    self.activeSends[teamAgentKey] = remaining
+                }
+            }
+            completion?(sent)
+        }
     }
 
     /// Send text to an agent without requiring a tabManager.
@@ -2642,9 +2670,12 @@ final class TeamOrchestrator: ObservableObject {
         context: String? = nil,
         tabManager: TabManager,
         submit: Bool = false,
+        panelId: UUID? = nil,
         completion: ((Bool) -> Void)? = nil
     ) -> DelegateResult? {
         let title = taskTitle?.nilIfBlank ?? String(text.prefix(80))
+        // Task assignee stays the agent NAME even when delivery is panel-targeted —
+        // panel_id is DELIVERY-ONLY so wait/collect/reports keyed on name are unaffected.
         guard let task = TeamDataStore.shared.createTask(
             teamName: teamName,
             title: title,
@@ -2652,8 +2683,32 @@ final class TeamOrchestrator: ObservableObject {
             priority: priority ?? 2
         ) else { return nil }
         let instruction = formatDelegateInstruction(task: task, text: text, context: context)
+        // Deterministic per-pane delivery: when a valid, live, non-migrating panelId is
+        // provided, bypass name round-robin (selectAgent) and paste directly into that
+        // pane. The follow-up team.send_key Return carries the same panel_id (Rust side)
+        // AND pendingReturnTargets is keyed to that exact pane.
+        let teamAgentKey = "\(teamName)/\(agentName)"
+        if let pid = panelId,
+           !migratingAgents.contains(teamAgentKey),
+           let team = teams[teamName],
+           let agent = team.agents.first(where: { $0.panelId == pid && $0.name == agentName }) {
+            // pendingReturnTargets is recorded inside sendToAgentByPanel via
+            // recordPendingReturnFor when withReturn==false.
+            let delivered = sendToAgentByPanel(
+                teamName: teamName,
+                panelId: pid,
+                workspaceId: agent.workspaceId,
+                text: instruction,
+                tabManager: tabManager,
+                withReturn: submit,
+                recordPendingReturnFor: agentName,
+                completion: completion
+            )
+            return DelegateResult(task: task, textDelivered: delivered, instruction: instruction)
+        }
         // CLI callers keep submit=false and send Return separately after paste ack.
         // GUI callers can submit=true to use the IME paste path's inline Return.
+        // No panelId (or stale/migrating) → name-based round-robin (backward compat).
         let delivered = sendToAgent(
             teamName: teamName,
             agentName: agentName,
@@ -2962,6 +3017,12 @@ final class TeamOrchestrator: ObservableObject {
             total += interruptAll(teamName: teamName, tabManager: tabManager)
         }
         return total
+    }
+
+    /// True while a hard restart is migrating the named agent's pane. Panel-targeted
+    /// callers use this to fall back to name-based delivery during migration windows.
+    func isAgentMigrating(teamName: String, agentName: String) -> Bool {
+        migratingAgents.contains("\(teamName)/\(agentName)")
     }
 
     func agentIdentity(teamName: String, agentName: String) -> AgentPaneIdentity? {
@@ -3417,9 +3478,59 @@ final class TeamOrchestrator: ObservableObject {
             #if DEBUG
             dlog("autoRecycle.skip reason=threshold_not_met teamName=\(teamName) agentName=\(agentName) count=\(count) threshold=\(agentThreshold ?? teamThreshold ?? 0)")
             #endif
+            // Not recycling → the agent is now idle and ready. Pull the next task
+            // from the UNASSIGNED work-pool and push it, so a populated pool drains
+            // itself without the leader re-broadcasting `tm-agent claim` after every
+            // wave. This is the self-sustaining parallel loop (finish → auto-claim
+            // next → report). It is intentionally NOT done on the recycle branch,
+            // because recycleAgent hard-restarts the pane (drops context) and a task
+            // claimed into it would be interrupted by the restart.
+            autoClaimNext(teamName: teamName, agentName: agentName)
             return
         }
         recycleAgent(teamName: teamName, agentName: agentName, force: false)
+    }
+
+    /// Continuous work-stealing: when an agent finishes a task (and is not being
+    /// recycled), atomically claim the next task from the team's UNASSIGNED pool
+    /// and push it to that agent. Returns silently when the pool is empty or all
+    /// remaining tasks have unmet dependencies.
+    ///
+    /// Scope & safety: this only ever consumes tasks with `assignee == nil`.
+    /// Directed `delegate`/`fan-out` workflows create tasks already ASSIGNED to a
+    /// specific agent, so the unassigned pool is empty there and this is a no-op —
+    /// it never steals work from, or interferes with, leader-controlled dispatch.
+    /// It activates exactly for the work-pool pattern (`task create` unassigned),
+    /// turning "leader broadcasts `tm-agent claim` every wave" into "idle agents
+    /// drain the pool on their own".
+    ///
+    /// Duplicate-named caveat: the push routes by agent NAME via `notifyTaskCreated`
+    /// → `selectAgent` round-robin. For the common case of uniquely-named agents
+    /// this targets the exact pane that just freed up. When several panes share a
+    /// name, round-robin may push to a sibling pane; correct per-pane addressing
+    /// needs the panel_id field tracked as the Tier-3 BUG-2 fix.
+    private func autoClaimNext(teamName: String, agentName: String) {
+        guard let claimed = TeamDataStore.shared.claimTask(teamName: teamName, agentName: agentName) else {
+            return  // empty pool or all deps unmet — nothing to pull
+        }
+        #if DEBUG
+        dlog("[autoClaimNext] team=\(teamName) agent=\(agentName) claimed task=\(claimed.id.prefix(8)) title=\(claimed.title.prefix(40))")
+        #endif
+        // Push via the auto-locating sender: it makes exactly one selectAgent
+        // (round-robin) decision and resolves the owning tabManager itself through
+        // AppDelegate.locateSurface, so it reaches the pane even for multi-window
+        // teams without a second, possibly-divergent agent lookup.
+        let instruction = formatTaskAssignmentInstruction(task: claimed)
+        let pushed = sendToAgentAutoLocate(teamName: teamName, agentName: agentName, text: instruction)
+        if !pushed {
+            // Delivery failed (pane gone / migrating) — release the task so another
+            // idle agent (or a manual claim) can pick it up instead of it sitting
+            // assigned-but-undelivered.
+            _ = TeamDataStore.shared.reassignTask(teamName: teamName, taskId: claimed.id, assignee: nil)
+            #if DEBUG
+            dlog("[autoClaimNext] push FAILED task=\(claimed.id.prefix(8)) — returned to pool team=\(teamName) agent=\(agentName)")
+            #endif
+        }
     }
 
     /// Snapshot of a pane's position in the bonsplit tree, captured before

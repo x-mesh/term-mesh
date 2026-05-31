@@ -4,6 +4,21 @@ All notable changes to term-mesh are documented here.
 
 ## [Unreleased]
 
+## [0.136.0] - 2026-06-01
+
+### Added
+- **원격 peer 접속 시 호스트의 모든 창에 접속** — connect-to-peer로 원격 호스트에 연결하면 이제 활성 창 하나가 아니라 **호스트의 모든 term-mesh 창의 모든 workspace**가 보인다. workspace 선택 창과 사이드바는 창이 여러 개일 때 **창별 섹션**으로 그룹핑되고(같은 제목의 탭도 어느 창인지 구분됨), 창이 하나면 기존 평면 목록을 그대로 유지한다. (이 기능은 vim ESC 수정과 마찬가지로 **원격 호스트** 측 빌드가 업데이트되어야 적용된다.)
+- **에이전트 팀: 작업 풀 자동 소진 (auto-claim-next)** — 작업을 마친 유휴 에이전트가 리더의 추가 지시 없이 미할당 작업 풀에서 다음 작업을 스스로 가져온다. `tm-agent task create`(미할당)로 작업을 쌓고 `tm-agent claim`을 한 번만 보내면, 에이전트들이 풀을 알아서 비운다. 지정한 에이전트에게 직접 위임한 작업(`delegate`/`fan-out`)에는 영향을 주지 않는다.
+- **에이전트 팀: 작업 의존성 지정 (`tm-agent task create --depends-on a,b`)** — 작업 간 선후 관계를 지정하면, 선행 작업이 모두 완료될 때까지 해당 작업은 claim되지 않는다(우선순위가 더 높아도 게이트가 우선).
+- **에이전트 팀: 결정적 pane 지정 전송 (`tm-agent send/delegate --panel`)** — 같은 이름의 에이전트 pane이 여러 개일 때 특정 pane을 명시해 전송할 수 있고, fan-out도 각 대상을 서로 다른 pane에 결정적으로 분배한다.
+
+### Fixed
+- **에이전트 팀: 수동 `tm-agent claim` 복구** — `tm-agent claim`(및 work-pool 패턴 `broadcast 'tm-agent claim'`)이 내부 라우팅 누락으로 `unknown_method`를 반환하며 동작하지 않던 문제. 이제 정상적으로 작업 풀에서 작업을 가져온다.
+
+### Thanks to 1 contributor!
+
+- [@JINWOO-J](https://github.com/JINWOO-J)
+
 ## [0.135.0] - 2026-05-31
 
 ### Fixed

@@ -2510,6 +2510,9 @@ class TerminalController {
         guard let text = params["text"] as? String else {
             return v2Error(id: id, code: "invalid_params", message: "Missing text")
         }
+        // Optional deterministic per-pane addressing. When a valid panel_id resolves to
+        // a live, non-migrating agent pane, delivery bypasses name round-robin.
+        let panelId = (params["panel_id"] as? String).flatMap(UUID.init(uuidString:))
 
         // Per-agent send serialization: wait for the preceding paste+Return cycle to
         // finish (including 250 ms post-Return cooldown) before pasting new text.
@@ -2554,6 +2557,28 @@ class TerminalController {
             Task { @MainActor in
                 let tabManager = TeamOrchestrator.shared.resolveTabManager(teamName: teamName) ?? self.tabManager
                 guard let tabManager else { resume(false); return }
+                // Deterministic per-pane delivery: if a valid panel_id resolves to a live,
+                // non-migrating agent pane in this team, paste directly into that pane and
+                // record it as the pending Return target (the separate team.send_key Return
+                // carries the same panel_id from the Rust CLI). Otherwise fall back to the
+                // name-based round-robin path (backward compatible).
+                if let pid = panelId,
+                   !TeamOrchestrator.shared.isAgentMigrating(teamName: teamName, agentName: agentName),
+                   let agent = TeamOrchestrator.shared.teams[teamName]?.agents.first(where: { $0.panelId == pid && $0.name == agentName }) {
+                    let ok = TeamOrchestrator.shared.sendToAgentByPanel(
+                        teamName: teamName,
+                        panelId: pid,
+                        workspaceId: agent.workspaceId,
+                        text: text,
+                        tabManager: tabManager,
+                        withReturn: false, // Return is sent separately by Rust CLI via team.send_key
+                        recordPendingReturnFor: agentName,
+                        completion: { ack in resume(ack) } // await paste ack like the name path
+                    )
+                    dispatched = ok
+                    if !ok { resume(false) }
+                    return
+                }
                 let ok = TeamOrchestrator.shared.sendToAgent(
                     teamName: teamName,
                     agentName: agentName,
@@ -3201,6 +3226,10 @@ class TerminalController {
         let taskTitle = params["task_title"] as? String
         let priority = params["priority"] as? Int
         let context = params["context"] as? String
+        // Optional deterministic per-pane addressing. delegateToAgent uses this only
+        // when it resolves to a live, non-migrating pane with this panelId+name;
+        // otherwise it falls back to name-based round-robin. Task assignee stays the name.
+        let panelId = (params["panel_id"] as? String).flatMap(UUID.init(uuidString:))
         let store = TeamDataStore.shared
 
         // Stagger: dynamic gap based on team size to prevent main-queue saturation
@@ -3241,6 +3270,7 @@ class TerminalController {
                     priority: priority,
                     context: context,
                     tabManager: tabManager,
+                    panelId: panelId,
                     completion: { ok in resume(ok) }
                 )
                 if capturedDelegateResult == nil { resume(false) }
@@ -3273,6 +3303,12 @@ class TerminalController {
         guard let key = params["key"] as? String else {
             return v2Error(id: id, code: "invalid_params", message: "Missing key")
         }
+        // Optional explicit per-pane target for the Return. When present and it still
+        // resolves to a live agent pane, it takes precedence over pendingReturnTarget
+        // and the name lookup — guaranteeing the Return lands on the exact pane the
+        // paste hit, even for duplicate-named agents. Falls back when stale (e.g. after
+        // a hard restart rewrote the panelId).
+        let explicitPanelId = (params["panel_id"] as? String).flatMap(UUID.init(uuidString:))
 
         let result: (sent: Bool, targetMissing: Bool, reason: String) = await withCheckedContinuation { continuation in
             Task { @MainActor in
@@ -3289,12 +3325,23 @@ class TerminalController {
                 }
 
                 let keyIsReturn = key.lowercased() == "return"
-                let pendingTarget = keyIsReturn
+                // 1) Explicit panel_id (return only) — preferred when it resolves live.
+                let explicitTarget: (panelId: UUID, workspaceId: UUID)? = {
+                    guard keyIsReturn, let epid = explicitPanelId,
+                          let team = TeamOrchestrator.shared.teams[teamName],
+                          let agent = team.agents.first(where: { $0.panelId == epid }) else { return nil }
+                    return (epid, agent.workspaceId)
+                }()
+                // 2) pendingReturnTarget (the pane the last paste landed on).
+                let pendingTarget = (keyIsReturn && explicitTarget == nil)
                     ? TeamOrchestrator.shared.pendingReturnTarget(teamName: teamName, agentName: agentName)
                     : nil
                 let pid: UUID
                 let workspaceId: UUID
-                if let pendingTarget {
+                if let explicitTarget {
+                    pid = explicitTarget.panelId
+                    workspaceId = explicitTarget.workspaceId
+                } else if let pendingTarget {
                     pid = pendingTarget.panelId
                     workspaceId = pendingTarget.workspaceId
                 } else {
@@ -3455,6 +3502,12 @@ class TerminalController {
         "team.task.dependents",
         "team.task.clear",
         "team.task.create",
+        // Route claim to dispatchTeamDataCommandDirect → teamDataTaskClaim
+        // (dependency-aware store.claimTask + main-dispatched push). Without
+        // this entry `tm-agent claim` fell through to unknown_method — the
+        // handler at `case "team.task.claim"` was dead code, breaking the
+        // documented work-pool / manual-claim pattern.
+        "team.task.claim",
         "team.task.update",
         "team.context.set",
         "team.context.get",

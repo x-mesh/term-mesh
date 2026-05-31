@@ -184,6 +184,18 @@ message Workspace {
   string title = 2;
   // Root of the recursive split tree.
   WorkspaceLayout layout = 3;
+  // Identifier of the host *window* that owns this workspace. A host may
+  // have several top-level windows open, each with its own set of
+  // workspaces (tabs); clients group the workspace roster by this id so
+  // tabs from different windows are visually separated. Field-additive
+  // and backward compatible: hosts that predate multi-window enumeration
+  // leave it empty, and clients treat an empty window_id as a single
+  // implied window (legacy flat-list behavior).
+  bytes window_id = 4;
+  // Human-readable label for window_id (e.g. the window's title bar text),
+  // used for the section header in the client's workspace picker/sidebar.
+  // May be empty; clients fall back to a short window_id hex suffix.
+  string window_title = 5;
 }
 
 // Recursive node: either a split (interior) or a pane (leaf).

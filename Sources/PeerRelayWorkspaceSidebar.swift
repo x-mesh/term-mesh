@@ -5,6 +5,10 @@ import PeerProto
 struct PeerRelayWorkspaceSummary: Identifiable, Equatable {
     let id: Data
     let title: String
+    /// Owning host window id; empty for legacy single-window hosts.
+    var windowID: Data = Data()
+    /// Owning host window label (title bar text) for section grouping.
+    var windowTitle: String = ""
 }
 
 @MainActor
@@ -38,13 +42,41 @@ struct PeerRelayWorkspaceSidebarView: View {
                     .padding(.horizontal, 10)
                     .padding(.top, 4)
             } else {
-                ForEach(model.workspaces) { ws in
-                    PeerWorkspaceRowView(
-                        title: ws.title,
-                        isSelected: model.selectedID == ws.id
-                    )
-                    .contentShape(Rectangle())
-                    .onTapGesture { model.select(ws) }
+                let windowGroups = groupWorkspacesByWindow(
+                    model.workspaces,
+                    windowID: { $0.windowID },
+                    windowTitle: { $0.windowTitle }
+                )
+                // Section by host window only when the host reports more than
+                // one; otherwise keep the original flat list.
+                if windowGroups.count > 1 {
+                    ForEach(windowGroups, id: \.windowID) { group in
+                        Text(peerWindowLabel(title: group.windowTitle, id: group.windowID))
+                            .font(.system(size: 9, weight: .semibold))
+                            .foregroundColor(Color.secondary.opacity(0.7))
+                            .lineLimit(1)
+                            .truncationMode(.tail)
+                            .padding(.horizontal, 10)
+                            .padding(.top, 6)
+                            .padding(.bottom, 1)
+                        ForEach(group.items) { ws in
+                            PeerWorkspaceRowView(
+                                title: ws.title,
+                                isSelected: model.selectedID == ws.id
+                            )
+                            .contentShape(Rectangle())
+                            .onTapGesture { model.select(ws) }
+                        }
+                    }
+                } else {
+                    ForEach(model.workspaces) { ws in
+                        PeerWorkspaceRowView(
+                            title: ws.title,
+                            isSelected: model.selectedID == ws.id
+                        )
+                        .contentShape(Rectangle())
+                        .onTapGesture { model.select(ws) }
+                    }
                 }
             }
 

@@ -413,6 +413,9 @@ enum Commands {
         text: String,
         #[arg(long)]
         no_report: bool,
+        /// Target a specific pane by panel_id (deterministic; overrides name round-robin)
+        #[arg(long)]
+        panel: Option<String>,
     },
     /// Broadcast instruction to all agents
     Broadcast {
@@ -430,7 +433,9 @@ enum Commands {
         priority: Option<u32>,
         #[arg(long, num_args = 1..)]
         accept: Vec<String>,
-        #[arg(long, num_args = 1..)]
+        /// Task IDs this task depends on; claimable only once all are completed.
+        /// Accepts comma- or space-separated ids: --depends-on a,b  or  --deps a b
+        #[arg(long, visible_alias = "depends-on", value_delimiter = ',', num_args = 1..)]
         deps: Vec<String>,
         #[arg(long)]
         desc: Option<String>,
@@ -445,6 +450,9 @@ enum Commands {
         /// Run task in autonomous mode (headless subprocess, no leader approval needed for edits)
         #[arg(long)]
         autonomous: bool,
+        /// Target a specific pane by panel_id (deterministic; overrides name round-robin). Task assignee stays the agent name.
+        #[arg(long)]
+        panel: Option<String>,
     },
     /// Stop (interrupt) agents by sending Ctrl+C to their terminals
     Stop {
@@ -697,7 +705,9 @@ enum Commands {
         priority: Option<u32>,
         #[arg(long, num_args = 1..)]
         accept: Vec<String>,
-        #[arg(long, num_args = 1..)]
+        /// Task IDs this task depends on; claimable only once all are completed.
+        /// Accepts comma- or space-separated ids: --depends-on a,b  or  --deps a b
+        #[arg(long, visible_alias = "depends-on", value_delimiter = ',', num_args = 1..)]
         deps: Vec<String>,
     },
     /// Alias: task-update → task update
@@ -778,7 +788,9 @@ enum TaskCommands {
         priority: Option<u32>,
         #[arg(long, num_args = 1..)]
         accept: Vec<String>,
-        #[arg(long, num_args = 1..)]
+        /// Task IDs this task depends on; claimable only once all are completed.
+        /// Accepts comma- or space-separated ids: --depends-on a,b  or  --deps a b
+        #[arg(long, visible_alias = "depends-on", value_delimiter = ',', num_args = 1..)]
         deps: Vec<String>,
         /// Load task from a template (builtin: analysis, review, implement)
         #[arg(long)]
@@ -3200,6 +3212,9 @@ struct AgentInfo {
     model: String,
     cli: String,
     agent_state: String,
+    /// panel_id of this agent's pane (used for deterministic per-pane fan-out routing)
+    #[allow(dead_code)] // Parsed from status; fan-out reads panel_id from raw status JSON directly
+    panel_id: Option<String>,
 }
 
 impl AgentInfo {
@@ -3208,11 +3223,16 @@ impl AgentInfo {
         let model = v["model"].as_str().unwrap_or("sonnet").to_string();
         let cli = v["cli"].as_str().unwrap_or("claude").to_string();
         let agent_state = v["agent_state"].as_str().unwrap_or("").to_string();
+        let panel_id = v["panel_id"]
+            .as_str()
+            .filter(|s| !s.is_empty())
+            .map(String::from);
         Some(Self {
             name,
             model,
             cli,
             agent_state,
+            panel_id,
         })
     }
 }
@@ -3612,6 +3632,7 @@ fn send_return_key_with_retry(
     target: &str,
     text_delivered: bool,
     context: &str,
+    panel_id: Option<&str>,
 ) -> bool {
     let delays = return_retry_delays_ms(text_delivered, context);
     eprintln!(
@@ -3636,6 +3657,7 @@ fn send_return_key_with_retry(
                 "team_name": team,
                 "agent_name": target,
                 "key": "return",
+                "panel_id": panel_id,
             }),
         ) {
             Ok(r) if r["ok"].as_bool().unwrap_or(false) => return true,
@@ -4936,6 +4958,7 @@ fn main() {
             agent: ref target,
             text,
             no_report,
+            panel,
         } => {
             let text = append_report_suffix(&text, no_report);
             // Check if agent is headless — route to daemon socket
@@ -4952,22 +4975,33 @@ fn main() {
                     return;
                 }
             }
+            // panel_id is DELIVERY-ONLY: targets a specific pane deterministically,
+            // overriding name round-robin. None falls back to name-based selection.
             let send_result = rpc_call(
                 &sock,
                 "team.send",
                 json!({
                     "team_name": team, "agent_name": target,
                     "text": format!("{text}\n"),
+                    "panel_id": panel,
                 }),
             );
-            // Send Return key via team.send_key (reliable sendNamedKey path)
+            // Send Return key via team.send_key (reliable sendNamedKey path).
+            // The Return MUST carry the SAME panel_id as the paste so both land on
+            // the same pane (otherwise text lands on pane X, Return on name-match Y).
             if let Ok(ref r) = send_result {
                 let text_delivered = r["result"]["text_delivered"].as_bool().unwrap_or(false);
                 if !text_delivered {
                     eprintln!("text.delivered.false reason=team.send_ack agent={target}");
                 }
-                let _ =
-                    send_return_key_with_retry(&sock, &team, target, text_delivered, "team.send");
+                let _ = send_return_key_with_retry(
+                    &sock,
+                    &team,
+                    target,
+                    text_delivered,
+                    "team.send",
+                    panel.as_deref(),
+                );
             }
             print_result(send_result);
             return;
@@ -4999,8 +5033,11 @@ fn main() {
             context,
             auto_fix_budget,
             autonomous,
+            panel,
         } => {
-            // Auto-detect comma-separated agents and route to parallel fan-out
+            // Auto-detect comma-separated agents and route to parallel fan-out.
+            // Fan-out resolves its OWN per-thread panel_ids from team.status, so the
+            // single CLI --panel is intentionally NOT forwarded here.
             if target.contains(',') {
                 run_fan_out(
                     &sock,
@@ -5014,6 +5051,7 @@ fn main() {
                     auto_fix_budget,
                 );
             } else if autonomous {
+                // Autonomous mode spawns a headless subprocess; --panel does not apply.
                 run_delegate_autonomous(
                     &sock,
                     &team,
@@ -5039,6 +5077,7 @@ fn main() {
                     no_report,
                     context.as_deref(),
                     auto_fix_budget,
+                    panel.as_deref(),
                 );
             }
             return;
@@ -6127,7 +6166,7 @@ fn run_create(
                         let text_delivered =
                             r["result"]["text_delivered"].as_bool().unwrap_or(false);
                         let _ = send_return_key_with_retry(
-                            sock, team, name, text_delivered, "team.create.init",
+                            sock, team, name, text_delivered, "team.create.init", None,
                         );
                         eprintln!("  \u{2713} {name}: init prompt sent");
                     }
@@ -7301,6 +7340,7 @@ fn run_delegate_result(
     no_report: bool,
     context: Option<&str>,
     fix_budget: Option<u8>,
+    panel_id: Option<&str>,
 ) -> Result<Value, String> {
     let resolved_title = title.unwrap_or_else(|| task_title_from_text(text));
     let resolved_priority = priority.unwrap_or(2);
@@ -7318,6 +7358,11 @@ fn run_delegate_result(
     }
     if let Some(fb) = fix_budget {
         delegate_params["fix_budget"] = json!(fb);
+    }
+    // panel_id is DELIVERY-ONLY: it steers which pane the paste lands on, but the
+    // task assignee stays the agent name (see task.create params below).
+    if let Some(pid) = panel_id {
+        delegate_params["panel_id"] = json!(pid);
     }
     if let Ok(v) = rpc_call(sock, "team.delegate", delegate_params) {
         if v["ok"].as_bool().unwrap_or(false) {
@@ -7373,6 +7418,7 @@ fn run_delegate_result(
                     json!({
                         "team_name": team, "agent_name": target,
                         "text": format!("{instruction}\n"),
+                        "panel_id": panel_id,
                     }),
                 );
                 match &retry {
@@ -7387,6 +7433,7 @@ fn run_delegate_result(
                             target,
                             text_delivered,
                             "team.delegate.retry",
+                            panel_id,
                         );
                         return Ok(patched);
                     }
@@ -7418,7 +7465,14 @@ fn run_delegate_result(
             // through the reliable sendNamedKey path (same as surface.send_key RPC).
             // Swift ack-based completion is the primary ordering guarantee;
             // this sleep is a minimal safety margin only.
-            let _ = send_return_key_with_retry(sock, team, target, text_delivered, "team.delegate");
+            let _ = send_return_key_with_retry(
+                sock,
+                team,
+                target,
+                text_delivered,
+                "team.delegate",
+                panel_id,
+            );
 
             return Ok(v);
         }
@@ -7517,6 +7571,7 @@ fn run_delegate_result(
         json!({
             "team_name": team, "agent_name": target,
             "text": &send_text,
+            "panel_id": panel_id,
         }),
     )
     .map_err(|e| format!("team.send: {e}"))?;
@@ -7532,6 +7587,7 @@ fn run_delegate_result(
             json!({
                 "team_name": team, "agent_name": target,
                 "text": &send_text,
+                "panel_id": panel_id,
             }),
         );
         match retry {
@@ -7568,10 +7624,11 @@ fn run_delegate(
     no_report: bool,
     context: Option<&str>,
     fix_budget: Option<u8>,
+    panel_id: Option<&str>,
 ) {
     match run_delegate_result(
         sock, team, target, text, title, priority, accept, deps, desc, no_report, context,
-        fix_budget,
+        fix_budget, panel_id,
     ) {
         Ok(v) => println!("{}", pretty(&v)),
         Err(e) => {
@@ -7812,32 +7869,48 @@ fn run_fan_out(
     context: Option<&str>,
     fix_budget: Option<u8>,
 ) {
-    // Get all agent names from team status
-    let all_agents: Vec<String> = match rpc_call(sock, "team.status", json!({ "team_name": team }))
-    {
-        Ok(r) => r["result"]["agents"]
-            .as_array()
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|a| a["name"].as_str().map(String::from))
-                    .collect()
-            })
-            .unwrap_or_default(),
-        Err(e) => {
-            eprintln!("Error: {e}");
-            process::exit(1);
-        }
-    };
+    // Get all agents from team status as (name, panel_id) pairs. team.status lists
+    // EVERY pane separately, so duplicate-named agents already carry DISTINCT
+    // panel_ids — pair them 1:1 (do NOT dedup by name) so each fan-out thread can
+    // deterministically address its own pane instead of relying on round-robin.
+    let all_agents: Vec<(String, Option<String>)> =
+        match rpc_call(sock, "team.status", json!({ "team_name": team })) {
+            Ok(r) => r["result"]["agents"]
+                .as_array()
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|a| {
+                            a["name"].as_str().map(|n| {
+                                (
+                                    n.to_string(),
+                                    a["panel_id"]
+                                        .as_str()
+                                        .filter(|s| !s.is_empty())
+                                        .map(String::from),
+                                )
+                            })
+                        })
+                        .collect()
+                })
+                .unwrap_or_default(),
+            Err(e) => {
+                eprintln!("Error: {e}");
+                process::exit(1);
+            }
+        };
 
-    // Filter agents if --agents flag provided
+    // Filter agents if --agents flag provided (filter by NAME, keep distinct panes)
     let filter = parse_cli_flag(agents_flag);
-    let targets: Vec<&str> = if filter.is_empty() {
-        all_agents.iter().map(|s| s.as_str()).collect()
+    let targets: Vec<(&str, Option<&str>)> = if filter.is_empty() {
+        all_agents
+            .iter()
+            .map(|(n, p)| (n.as_str(), p.as_deref()))
+            .collect()
     } else {
         all_agents
             .iter()
-            .filter(|a| filter.contains(a.as_str()))
-            .map(|s| s.as_str())
+            .filter(|(n, _)| filter.contains(n.as_str()))
+            .map(|(n, p)| (n.as_str(), p.as_deref()))
             .collect()
     };
 
@@ -7849,7 +7922,11 @@ fn run_fan_out(
     eprintln!(
         "Fan-out: delegating to {} agents in parallel: {}",
         targets.len(),
-        targets.join(", ")
+        targets
+            .iter()
+            .map(|(n, _)| *n)
+            .collect::<Vec<_>>()
+            .join(", ")
     );
 
     // L2: compute task title once outside the thread scope to avoid repeated calls per thread.
@@ -7860,8 +7937,9 @@ fn run_fan_out(
     let results: Vec<(&str, Result<Value, String>)> = thread::scope(|s| {
         let handles: Vec<_> = targets
             .iter()
-            .map(|target| {
+            .map(|(target, panel_id)| {
                 let t = base_title.clone();
+                let panel_id = *panel_id;
                 s.spawn(move || {
                     let result = run_delegate_result(
                         sock,
@@ -7876,6 +7954,7 @@ fn run_fan_out(
                         no_report,
                         context,
                         fix_budget,
+                        panel_id,
                     );
                     (*target, result)
                 })
@@ -9177,6 +9256,7 @@ fn run_warmup(sock: &PathBuf, team: &str, target: Option<&str>, timeout: u32) {
             true,
             None,
             None,
+            None,
         );
         match result {
             Ok(v) => {
@@ -9701,6 +9781,7 @@ fn dispatch_and_wait(
                 false,
                 None,
                 None,
+                None,
             );
             (name, result)
         });
@@ -10042,6 +10123,7 @@ fn run_autonomous(
                 &[],
                 None,
                 false,
+                None,
                 None,
                 None,
             );

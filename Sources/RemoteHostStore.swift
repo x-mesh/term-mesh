@@ -6,6 +6,43 @@ struct WorkspaceSummary: Identifiable, Equatable {
     let id: Data
     let title: String
     let hostSockPath: String
+    /// Id of the host window that owns this workspace. Empty when talking to
+    /// a host that predates multi-window enumeration (legacy single-window).
+    let windowID: Data
+    /// Human-readable window label (window title bar text) for grouping.
+    let windowTitle: String
+}
+
+/// Human label for a host window in the peer workspace UI. Uses the window's
+/// title when the host supplied one, else a short hex of the window id.
+/// Empty id (legacy host) collapses to a bare "Window".
+func peerWindowLabel(title: String, id: Data) -> String {
+    if !title.isEmpty { return title }
+    let hex = id.prefix(3).map { String(format: "%02x", $0) }.joined()
+    return hex.isEmpty ? "Window" : "Window \(hex)"
+}
+
+/// Group an ordered workspace roster by owning window, preserving the input
+/// order of both windows and workspaces. Returns one entry per distinct
+/// windowID. Used by the picker/sidebars to render window sections only when
+/// the host actually reports more than one window.
+func groupWorkspacesByWindow<T>(
+    _ items: [T],
+    windowID: (T) -> Data,
+    windowTitle: (T) -> String
+) -> [(windowID: Data, windowTitle: String, items: [T])] {
+    var indexByID: [Data: Int] = [:]
+    var groups: [(windowID: Data, windowTitle: String, items: [T])] = []
+    for item in items {
+        let wid = windowID(item)
+        if let idx = indexByID[wid] {
+            groups[idx].items.append(item)
+        } else {
+            indexByID[wid] = groups.count
+            groups.append((wid, windowTitle(item), [item]))
+        }
+    }
+    return groups
 }
 
 struct HostEntry: Identifiable {
@@ -125,7 +162,9 @@ final class RemoteHostStore: ObservableObject {
                     WorkspaceSummary(
                         id: $0.workspaceID,
                         title: $0.title.isEmpty ? "<workspace>" : $0.title,
-                        hostSockPath: path
+                        hostSockPath: path,
+                        windowID: $0.windowID,
+                        windowTitle: $0.windowTitle
                     )
                 }
                 self.hosts[key]?.workspaces = summaries
