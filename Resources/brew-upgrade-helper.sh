@@ -66,6 +66,16 @@ done
 # Settle briefly so brew can move the bundle without a "resource busy" race.
 sleep 1
 
+# Refresh the tap metadata BEFORE upgrading. Without this the local tap can be
+# stale (it only knows about an intermediate version), so `brew upgrade` jumps
+# just one release at a time and the user has to update repeatedly to reach the
+# newest version. A fresh `brew update` lets the single upgrade below target the
+# true latest cask version. Failure is non-fatal — we still try the upgrade
+# against whatever tap state exists.
+log "running: $BREW update (refresh tap so upgrade targets the true latest)"
+HOMEBREW_NO_ANALYTICS=1 HOMEBREW_NO_ENV_HINTS=1 HOMEBREW_COLOR=0 \
+    "$BREW" update >>"$LOG" 2>&1 || log "WARN: brew update failed; upgrading against existing tap state"
+
 log "running: $BREW upgrade --cask --force $CASK"
 HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_ANALYTICS=1 HOMEBREW_NO_ENV_HINTS=1 HOMEBREW_COLOR=0 \
     "$BREW" upgrade --cask --force "$CASK" >>"$LOG" 2>&1
