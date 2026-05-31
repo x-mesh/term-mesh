@@ -2523,9 +2523,37 @@ final class TeamOrchestrator: ObservableObject {
 
     /// Send text to an agent by its unique panelId (skips name lookup entirely).
     /// Used by broadcast and asyncTeamBroadcast to avoid duplicate-name collapse.
+    /// When `recordPendingReturnFor` is set and `withReturn` is false, records the
+    /// pasted pane as the pending Return target keyed by "<team>/<agentName>" so a
+    /// separate team.send_key Return lands on the SAME pane (used by panel-targeted
+    /// team.send / team.delegate for deterministic duplicate-name addressing).
     @discardableResult
-    func sendToAgentByPanel(teamName: String, panelId: UUID, workspaceId: UUID, text: String, tabManager: TabManager, withReturn: Bool = true) -> Bool {
-        return sendTextToPanel(workspaceId: workspaceId, panelId: panelId, text: text, tabManager: tabManager, withReturn: withReturn)
+    func sendToAgentByPanel(teamName: String, panelId: UUID, workspaceId: UUID, text: String, tabManager: TabManager, withReturn: Bool = true, recordPendingReturnFor agentName: String? = nil, completion: ((Bool) -> Void)? = nil) -> Bool {
+        if !withReturn,
+           let agentName,
+           let team = teams[teamName],
+           let agent = team.agents.first(where: { $0.panelId == panelId && $0.name == agentName }),
+           let identity = agentIdentity(for: agent) {
+            pendingReturnTargets["\(teamName)/\(agentName)"] = identity
+        }
+        // When an agentName is provided (panel-targeted send/delegate, incl. /tm
+        // fan-out), mirror sendToAgent's in-flight accounting so a concurrent
+        // name-keyed hard restart drains the paste before tearing the pane down,
+        // instead of closing it mid-paste. Broadcast callers pass agentName=nil and
+        // keep the original untracked fast path.
+        let teamAgentKey = agentName.map { "\(teamName)/\($0)" }
+        if let teamAgentKey { activeSends[teamAgentKey, default: 0] += 1 }
+        return sendTextToPanel(workspaceId: workspaceId, panelId: panelId, text: text, tabManager: tabManager, withReturn: withReturn) { [weak self] sent in
+            if let self, let teamAgentKey {
+                let remaining = (self.activeSends[teamAgentKey] ?? 0) - 1
+                if remaining <= 0 {
+                    self.activeSends.removeValue(forKey: teamAgentKey)
+                } else {
+                    self.activeSends[teamAgentKey] = remaining
+                }
+            }
+            completion?(sent)
+        }
     }
 
     /// Send text to an agent without requiring a tabManager.
@@ -2642,9 +2670,12 @@ final class TeamOrchestrator: ObservableObject {
         context: String? = nil,
         tabManager: TabManager,
         submit: Bool = false,
+        panelId: UUID? = nil,
         completion: ((Bool) -> Void)? = nil
     ) -> DelegateResult? {
         let title = taskTitle?.nilIfBlank ?? String(text.prefix(80))
+        // Task assignee stays the agent NAME even when delivery is panel-targeted —
+        // panel_id is DELIVERY-ONLY so wait/collect/reports keyed on name are unaffected.
         guard let task = TeamDataStore.shared.createTask(
             teamName: teamName,
             title: title,
@@ -2652,8 +2683,32 @@ final class TeamOrchestrator: ObservableObject {
             priority: priority ?? 2
         ) else { return nil }
         let instruction = formatDelegateInstruction(task: task, text: text, context: context)
+        // Deterministic per-pane delivery: when a valid, live, non-migrating panelId is
+        // provided, bypass name round-robin (selectAgent) and paste directly into that
+        // pane. The follow-up team.send_key Return carries the same panel_id (Rust side)
+        // AND pendingReturnTargets is keyed to that exact pane.
+        let teamAgentKey = "\(teamName)/\(agentName)"
+        if let pid = panelId,
+           !migratingAgents.contains(teamAgentKey),
+           let team = teams[teamName],
+           let agent = team.agents.first(where: { $0.panelId == pid && $0.name == agentName }) {
+            // pendingReturnTargets is recorded inside sendToAgentByPanel via
+            // recordPendingReturnFor when withReturn==false.
+            let delivered = sendToAgentByPanel(
+                teamName: teamName,
+                panelId: pid,
+                workspaceId: agent.workspaceId,
+                text: instruction,
+                tabManager: tabManager,
+                withReturn: submit,
+                recordPendingReturnFor: agentName,
+                completion: completion
+            )
+            return DelegateResult(task: task, textDelivered: delivered, instruction: instruction)
+        }
         // CLI callers keep submit=false and send Return separately after paste ack.
         // GUI callers can submit=true to use the IME paste path's inline Return.
+        // No panelId (or stale/migrating) → name-based round-robin (backward compat).
         let delivered = sendToAgent(
             teamName: teamName,
             agentName: agentName,
@@ -2962,6 +3017,12 @@ final class TeamOrchestrator: ObservableObject {
             total += interruptAll(teamName: teamName, tabManager: tabManager)
         }
         return total
+    }
+
+    /// True while a hard restart is migrating the named agent's pane. Panel-targeted
+    /// callers use this to fall back to name-based delivery during migration windows.
+    func isAgentMigrating(teamName: String, agentName: String) -> Bool {
+        migratingAgents.contains("\(teamName)/\(agentName)")
     }
 
     func agentIdentity(teamName: String, agentName: String) -> AgentPaneIdentity? {
