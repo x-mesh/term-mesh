@@ -691,8 +691,33 @@ struct RemoteHostGroupView: View {
                     .padding(.vertical, 4)
                     .frame(maxWidth: .infinity, alignment: .leading)
             } else {
-                ForEach(host.workspaces) { workspace in
-                    RemoteWorkspaceRowView(workspace: workspace, store: store)
+                let windowGroups = groupWorkspacesByWindow(
+                    host.workspaces,
+                    windowID: { $0.windowID },
+                    windowTitle: { $0.windowTitle }
+                )
+                // Only surface window sections when the host actually reports
+                // more than one window; a single-window host (or a legacy host
+                // with empty windowID) keeps the flat list it always had.
+                if windowGroups.count > 1 {
+                    ForEach(windowGroups, id: \.windowID) { group in
+                        Text(peerWindowLabel(title: group.windowTitle, id: group.windowID))
+                            .font(.system(size: 9, weight: .semibold))
+                            .foregroundColor(Color.secondary.opacity(0.7))
+                            .lineLimit(1)
+                            .truncationMode(.tail)
+                            .padding(.leading, 20)
+                            .padding(.top, 4)
+                            .padding(.bottom, 1)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                        ForEach(group.items) { workspace in
+                            RemoteWorkspaceRowView(workspace: workspace, store: store)
+                        }
+                    }
+                } else {
+                    ForEach(host.workspaces) { workspace in
+                        RemoteWorkspaceRowView(workspace: workspace, store: store)
+                    }
                 }
             }
         } label: {

@@ -335,18 +335,18 @@ final class GhosttyPaneSurfaceProvider: PeerSurfaceProvider {
     }
 
     private func performSetDivider(splitIDBytes: Data, ratio: Double) {
-        guard let splitUUID = uuidFromSurfaceID(splitIDBytes),
-              let tabManager = AppDelegate.shared?.tabManager
-        else { return }
+        guard let splitUUID = uuidFromSurfaceID(splitIDBytes) else { return }
         let clamped = CGFloat(max(0.05, min(0.95, ratio)))
-        for workspace in tabManager.tabs {
-            if workspace.bonsplitController.findSplit(splitUUID) {
-                workspace.bonsplitController.setDividerPosition(
-                    clamped,
-                    forSplit: splitUUID,
-                    fromExternal: false
-                )
-                return
+        for ctx in allWindowContexts() {
+            for workspace in ctx.tabManager.tabs {
+                if workspace.bonsplitController.findSplit(splitUUID) {
+                    workspace.bonsplitController.setDividerPosition(
+                        clamped,
+                        forSplit: splitUUID,
+                        fromExternal: false
+                    )
+                    return
+                }
             }
         }
     }
@@ -398,10 +398,11 @@ final class GhosttyPaneSurfaceProvider: PeerSurfaceProvider {
     }
 
     private func workspaceContaining(panelUUID: UUID) -> Workspace? {
-        guard let tabManager = AppDelegate.shared?.tabManager else { return nil }
-        for workspace in tabManager.tabs {
-            if workspace.panels[panelUUID] != nil {
-                return workspace
+        for ctx in allWindowContexts() {
+            for workspace in ctx.tabManager.tabs {
+                if workspace.panels[panelUUID] != nil {
+                    return workspace
+                }
             }
         }
         return nil
@@ -440,17 +441,55 @@ final class GhosttyPaneSurfaceProvider: PeerSurfaceProvider {
 
     // MARK: - Private helpers
 
+    /// All live main-window contexts, in a deterministic order.
+    ///
+    /// `AppDelegate.mainWindowContexts` is an unordered dictionary, so it is
+    /// sorted by `windowId` to keep the workspace roster the host advertises
+    /// to peers stable across repeated `listWorkspaces` fetches (a churning
+    /// order would reshuffle the client's picker/sidebar on every refresh).
+    /// Each entry carries the owning window's id + title so a workspace can
+    /// be tagged with the window it belongs to — the host may have several
+    /// top-level windows open, each with its own `TabManager`, and a peer
+    /// client should see ALL of them, not just the active one.
+    private func allWindowContexts()
+        -> [(windowId: UUID, windowTitle: String, tabManager: TabManager)] {
+        guard let appDelegate = AppDelegate.shared else { return [] }
+        return appDelegate.mainWindowContexts.values
+            .sorted { $0.windowId.uuidString < $1.windowId.uuidString }
+            .map { ctx in (ctx.windowId, windowLabel(for: ctx), ctx.tabManager) }
+    }
+
+    /// Best-effort human label for a host window, used by the client to head
+    /// the window's section in the workspace picker/sidebar. Derived from the
+    /// window's *selected* workspace title rather than `NSWindow.title`,
+    /// because the title bar is only kept in sync for the key window — a
+    /// background window's `.title` is often empty or stale. Falls back to the
+    /// live title, then to "" so the client renders a short window-id suffix.
+    /// Snapshot semantics match the other workspace fields: refreshed on each
+    /// `listWorkspaces`/layout-change push, not on bare title edits.
+    private func windowLabel(for ctx: AppDelegate.MainWindowContext) -> String {
+        let mgr = ctx.tabManager
+        if let selID = mgr.selectedTabId,
+           let ws = mgr.tabs.first(where: { $0.id == selID }) {
+            let title = (ws.customTitle ?? ws.title)
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            if !title.isEmpty { return title }
+        }
+        return (ctx.window?.title ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
     /// Wake up any pane whose `ghostty_surface_t` hasn't been created
     /// yet (newly opened splits, background tabs). Non-blocking — caller
     /// polls `allSurfacesReady` to know when init has settled.
     private func kickLazySurfaceStarts() {
-        guard let tabManager = AppDelegate.shared?.tabManager else { return }
-        for workspace in tabManager.tabs {
-            for (_, panel) in workspace.panels {
-                guard let terminal = panel as? TerminalPanel else { continue }
-                let ts = terminal.surface
-                if ts.surface == nil {
-                    ts.requestBackgroundSurfaceStartIfNeeded()
+        for ctx in allWindowContexts() {
+            for workspace in ctx.tabManager.tabs {
+                for (_, panel) in workspace.panels {
+                    guard let terminal = panel as? TerminalPanel else { continue }
+                    let ts = terminal.surface
+                    if ts.surface == nil {
+                        ts.requestBackgroundSurfaceStartIfNeeded()
+                    }
                 }
             }
         }
@@ -458,29 +497,34 @@ final class GhosttyPaneSurfaceProvider: PeerSurfaceProvider {
 
     /// True when every terminal pane has a non-nil `ghostty_surface_t`.
     private func allSurfacesReady() -> Bool {
-        guard let tabManager = AppDelegate.shared?.tabManager else { return true }
-        for workspace in tabManager.tabs {
-            for (_, panel) in workspace.panels {
-                guard let terminal = panel as? TerminalPanel else { continue }
-                if terminal.surface.surface == nil { return false }
+        for ctx in allWindowContexts() {
+            for workspace in ctx.tabManager.tabs {
+                for (_, panel) in workspace.panels {
+                    guard let terminal = panel as? TerminalPanel else { continue }
+                    if terminal.surface.surface == nil { return false }
+                }
             }
         }
         return true
     }
 
     private func collectWorkspaces() -> [Termmesh_Peer_V1_Workspace] {
-        guard let tabManager = AppDelegate.shared?.tabManager else { return [] }
         var result: [Termmesh_Peer_V1_Workspace] = []
-        for workspace in tabManager.tabs {
-            let tree = workspace.bonsplitController.treeSnapshot()
-            guard let layout = translateBonsplitNode(tree, workspace: workspace) else {
-                continue
+        for ctx in allWindowContexts() {
+            let windowIDBytes = withUnsafeBytes(of: ctx.windowId.uuid) { Data($0) }
+            for workspace in ctx.tabManager.tabs {
+                let tree = workspace.bonsplitController.treeSnapshot()
+                guard let layout = translateBonsplitNode(tree, workspace: workspace) else {
+                    continue
+                }
+                var ws = Termmesh_Peer_V1_Workspace()
+                ws.workspaceID = withUnsafeBytes(of: workspace.id.uuid) { Data($0) }
+                ws.title = workspace.customTitle ?? workspace.title
+                ws.layout = layout
+                ws.windowID = windowIDBytes
+                ws.windowTitle = ctx.windowTitle
+                result.append(ws)
             }
-            var ws = Termmesh_Peer_V1_Workspace()
-            ws.workspaceID = withUnsafeBytes(of: workspace.id.uuid) { Data($0) }
-            ws.title = workspace.customTitle ?? workspace.title
-            ws.layout = layout
-            result.append(ws)
         }
         return result
     }
@@ -561,39 +605,41 @@ final class GhosttyPaneSurfaceProvider: PeerSurfaceProvider {
     }
 
     private func collectSurfaces() -> [Termmesh_Peer_V1_SurfaceInfo] {
-        guard let tabManager = AppDelegate.shared?.tabManager else { return [] }
         var result: [Termmesh_Peer_V1_SurfaceInfo] = []
-        for workspace in tabManager.tabs {
-            for (_, panel) in workspace.panels {
-                guard let terminal = panel as? TerminalPanel else { continue }
-                let ts = terminal.surface
-                guard let sfcPtr = ts.surface else { continue }
-                var info = Termmesh_Peer_V1_SurfaceInfo()
-                info.surfaceID = surfaceIDBytes(ts.id)
-                info.title = workspace.panelTitles[terminal.id] ?? "Terminal"
-                info.surfaceType = "terminal"
-                info.attachable = true
-                let sz = ghostty_surface_size(sfcPtr)
-                info.cols = UInt32(sz.columns)
-                info.rows = UInt32(sz.rows)
-                if let cwd = workspace.panelDirectories[terminal.id] {
-                    info.cwd = cwd
+        for ctx in allWindowContexts() {
+            for workspace in ctx.tabManager.tabs {
+                for (_, panel) in workspace.panels {
+                    guard let terminal = panel as? TerminalPanel else { continue }
+                    let ts = terminal.surface
+                    guard let sfcPtr = ts.surface else { continue }
+                    var info = Termmesh_Peer_V1_SurfaceInfo()
+                    info.surfaceID = surfaceIDBytes(ts.id)
+                    info.title = workspace.panelTitles[terminal.id] ?? "Terminal"
+                    info.surfaceType = "terminal"
+                    info.attachable = true
+                    let sz = ghostty_surface_size(sfcPtr)
+                    info.cols = UInt32(sz.columns)
+                    info.rows = UInt32(sz.rows)
+                    if let cwd = workspace.panelDirectories[terminal.id] {
+                        info.cwd = cwd
+                    }
+                    result.append(info)
                 }
-                result.append(info)
             }
         }
         return result
     }
 
     private func findSurface(id: Data) -> (ghostty_surface_t, TerminalSurface)? {
-        guard let tabManager = AppDelegate.shared?.tabManager else { return nil }
-        for workspace in tabManager.tabs {
-            for (_, panel) in workspace.panels {
-                guard let terminal = panel as? TerminalPanel else { continue }
-                let ts = terminal.surface
-                guard surfaceIDBytes(ts.id) == id else { continue }
-                guard let ptr = ts.surface else { continue }
-                return (ptr, ts)
+        for ctx in allWindowContexts() {
+            for workspace in ctx.tabManager.tabs {
+                for (_, panel) in workspace.panels {
+                    guard let terminal = panel as? TerminalPanel else { continue }
+                    let ts = terminal.surface
+                    guard surfaceIDBytes(ts.id) == id else { continue }
+                    guard let ptr = ts.surface else { continue }
+                    return (ptr, ts)
+                }
             }
         }
         return nil

@@ -536,6 +536,20 @@ public struct Termmesh_Peer_V1_Workspace: Sendable {
   /// Clears the value of `layout`. Subsequent reads from it will return its default value.
   public mutating func clearLayout() {self._layout = nil}
 
+  /// Identifier of the host *window* that owns this workspace. A host may
+  /// have several top-level windows open, each with its own set of
+  /// workspaces (tabs); clients group the workspace roster by this id so
+  /// tabs from different windows are visually separated. Field-additive
+  /// and backward compatible: hosts that predate multi-window enumeration
+  /// leave it empty, and clients treat an empty window_id as a single
+  /// implied window (legacy flat-list behavior).
+  public var windowID: Data = Data()
+
+  /// Human-readable label for window_id (e.g. the window's title bar text),
+  /// used for the section header in the client's workspace picker/sidebar.
+  /// May be empty; clients fall back to a short window_id hex suffix.
+  public var windowTitle: String = String()
+
   public var unknownFields = SwiftProtobuf.UnknownStorage()
 
   public init() {}
@@ -640,6 +654,10 @@ public struct Termmesh_Peer_V1_WorkspacePane: Sendable {
   // methods supported on all messages.
 
   /// surface_id of the currently *active* tab in this bonsplit pane.
+  /// Always equals one of `tabs[i].surface_id` — the active tab is
+  /// intentionally also included in `tabs[]` so clients can render
+  /// the strip from a single source. Compare against `surface_id`
+  /// here to highlight which strip entry is selected.
   public var surfaceID: Data = Data()
 
   public var title: String = String()
@@ -650,10 +668,10 @@ public struct Termmesh_Peer_V1_WorkspacePane: Sendable {
 
   public var cwd: String = String()
 
-  /// Every tab the host has stacked in this bonsplit pane (Phase E-4).
-  /// The active one's surface_id matches `surface_id` above; clients
-  /// can render the rest as a tab bar and ask the host to activate one
-  /// via WorkspaceControl.activate_tab.
+  /// Every tab the host has stacked in this bonsplit pane (Phase E-4),
+  /// active one included. Clients render the strip from this list and
+  /// ask the host to switch the active tab via
+  /// WorkspaceControl.activate_tab.
   public var tabs: [Termmesh_Peer_V1_PaneTab] = []
 
   public var unknownFields = SwiftProtobuf.UnknownStorage()
@@ -2186,7 +2204,7 @@ extension Termmesh_Peer_V1_WorkspaceList: SwiftProtobuf.Message, SwiftProtobuf._
 
 extension Termmesh_Peer_V1_Workspace: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
   public static let protoMessageName: String = _protobuf_package + ".Workspace"
-  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{3}workspace_id\0\u{1}title\0\u{1}layout\0")
+  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{3}workspace_id\0\u{1}title\0\u{1}layout\0\u{3}window_id\0\u{3}window_title\0")
 
   public mutating func decodeMessage<D: SwiftProtobuf.Decoder>(decoder: inout D) throws {
     while let fieldNumber = try decoder.nextFieldNumber() {
@@ -2197,6 +2215,8 @@ extension Termmesh_Peer_V1_Workspace: SwiftProtobuf.Message, SwiftProtobuf._Mess
       case 1: try { try decoder.decodeSingularBytesField(value: &self.workspaceID) }()
       case 2: try { try decoder.decodeSingularStringField(value: &self.title) }()
       case 3: try { try decoder.decodeSingularMessageField(value: &self._layout) }()
+      case 4: try { try decoder.decodeSingularBytesField(value: &self.windowID) }()
+      case 5: try { try decoder.decodeSingularStringField(value: &self.windowTitle) }()
       default: break
       }
     }
@@ -2216,6 +2236,12 @@ extension Termmesh_Peer_V1_Workspace: SwiftProtobuf.Message, SwiftProtobuf._Mess
     try { if let v = self._layout {
       try visitor.visitSingularMessageField(value: v, fieldNumber: 3)
     } }()
+    if !self.windowID.isEmpty {
+      try visitor.visitSingularBytesField(value: self.windowID, fieldNumber: 4)
+    }
+    if !self.windowTitle.isEmpty {
+      try visitor.visitSingularStringField(value: self.windowTitle, fieldNumber: 5)
+    }
     try unknownFields.traverse(visitor: &visitor)
   }
 
@@ -2223,6 +2249,8 @@ extension Termmesh_Peer_V1_Workspace: SwiftProtobuf.Message, SwiftProtobuf._Mess
     if lhs.workspaceID != rhs.workspaceID {return false}
     if lhs.title != rhs.title {return false}
     if lhs._layout != rhs._layout {return false}
+    if lhs.windowID != rhs.windowID {return false}
+    if lhs.windowTitle != rhs.windowTitle {return false}
     if lhs.unknownFields != rhs.unknownFields {return false}
     return true
   }

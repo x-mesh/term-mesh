@@ -486,13 +486,41 @@ final class PeerClientCoordinator: NSObject {
             frame: NSRect(x: 0, y: 0, width: 360, height: 26),
             pullsDown: false
         )
-        for w in workspaces {
-            let title = w.title.isEmpty ? "<untitled>" : w.title
-            let count = countLeaves(w.layout)
-            let idHex = w.workspaceID.prefix(4).map { String(format: "%02x", $0) }.joined()
-            let item = NSMenuItem(title: "\(title)  ·  \(count) panes  [\(idHex)]",
-                                  action: nil, keyEquivalent: "")
-            popup.menu?.addItem(item)
+        // Group the roster by owning host window. When the host reports more
+        // than one window, insert a disabled section-header item per window
+        // and indent its workspaces; a single-window host keeps the flat list.
+        let windowGroups = groupWorkspacesByWindow(
+            workspaces,
+            windowID: { $0.windowID },
+            windowTitle: { $0.windowTitle }
+        )
+        let multiWindow = windowGroups.count > 1
+        for group in windowGroups {
+            if multiWindow {
+                let header = NSMenuItem(
+                    title: peerWindowLabel(title: group.windowTitle, id: group.windowID),
+                    action: nil,
+                    keyEquivalent: ""
+                )
+                header.isEnabled = false
+                popup.menu?.addItem(header)
+            }
+            for w in group.items {
+                let title = w.title.isEmpty ? "<untitled>" : w.title
+                let count = countLeaves(w.layout)
+                let idHex = w.workspaceID.prefix(4).map { String(format: "%02x", $0) }.joined()
+                let item = NSMenuItem(title: "\(title)  ·  \(count) panes  [\(idHex)]",
+                                      action: nil, keyEquivalent: "")
+                // Stash the workspace itself so the index→workspace mapping
+                // survives the interleaved (non-selectable) header rows.
+                item.representedObject = w
+                if multiWindow { item.indentationLevel = 1 }
+                popup.menu?.addItem(item)
+            }
+        }
+        // Default the popup to the first real workspace, not a header row.
+        if let firstReal = popup.menu?.items.first(where: { $0.representedObject != nil }) {
+            popup.select(firstReal)
         }
         alert.accessoryView = popup
         alert.addButton(withTitle: "Open")
@@ -500,9 +528,7 @@ final class PeerClientCoordinator: NSObject {
 
         let resp = await Self.runModalAsSheet(alert)
         guard resp == .alertFirstButtonReturn else { return nil }
-        let idx = popup.indexOfSelectedItem
-        guard idx >= 0, idx < workspaces.count else { return nil }
-        return workspaces[idx]
+        return popup.selectedItem?.representedObject as? Termmesh_Peer_V1_Workspace
     }
 
     private func countLeaves(_ layout: Termmesh_Peer_V1_WorkspaceLayout) -> Int {

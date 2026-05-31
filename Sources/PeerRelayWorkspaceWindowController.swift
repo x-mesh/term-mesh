@@ -390,7 +390,12 @@ final class PeerRelayWorkspaceWindowController: NSWindowController, NSWindowDele
         window.delegate = self
 
         let model = PeerRelayWorkspaceSidebarModel()
-        model.workspaces = [PeerRelayWorkspaceSummary(id: self.workspaceID, title: self.workspaceTitle)]
+        model.workspaces = [PeerRelayWorkspaceSummary(
+            id: self.workspaceID,
+            title: self.workspaceTitle,
+            windowID: workspace.windowID,
+            windowTitle: workspace.windowTitle
+        )]
         model.selectedID = self.workspaceID
         model.onSelect = { [weak self] ws in self?.switchToWorkspace(ws) }
         self.sidebarModel = model
@@ -1362,7 +1367,9 @@ final class PeerRelayWorkspaceWindowController: NSWindowController, NSWindowDele
                 let summaries = workspaces.map {
                     PeerRelayWorkspaceSummary(
                         id: $0.workspaceID,
-                        title: $0.title.isEmpty ? "<workspace>" : $0.title
+                        title: $0.title.isEmpty ? "<workspace>" : $0.title,
+                        windowID: $0.windowID,
+                        windowTitle: $0.windowTitle
                     )
                 }
                 await MainActor.run { [weak self] in
