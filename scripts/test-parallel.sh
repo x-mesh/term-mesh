@@ -215,11 +215,13 @@ printf 'Phase 3 (GAP-4 claim push):    '
 
 CLAIM_TITLE="CLAIM_TEST_$$_$(date +%s)"
 create_json=$(tm-agent task create "$CLAIM_TITLE" 2>/dev/null || printf '{}')
-claim_id=$(json_get '.result.task.id' "$create_json")
+# `task create` returns the task fields directly under .result (only delegate /
+# claim responses nest them under .result.task).
+claim_id=$(json_get '.result.id' "$create_json")
 log "pool task created: $claim_id"
 
 if [ -z "$claim_id" ] || [ "$claim_id" = 'null' ]; then
-    fail "task create returned no id" "task_id in result.task.id" \
+    fail "task create returned no id" "task_id in result.id" \
          "$(printf '%s' "$create_json" | head -c 200)"
 else
     # Ask an executor to claim from the pool autonomously.
@@ -250,22 +252,30 @@ fi
 # ── Phase 4: BUG-5 board.jsonl flock ──────────────────────────────────────────
 printf 'Phase 4 (BUG-5 flock):         '
 
-tm-agent research \
+# Capture the dispatch output so we can read board_path directly — the research
+# board now lives at <repo>/.xm/research/<run>/board.jsonl, not ~/.term-mesh/results.
+research_out=$(tm-agent research \
     "PARALLEL_FLOCK_TEST — note 3 observations about terminal pane routing" \
-    --agents 3 --budget 2 --timeout 90 --depth shallow 2>/dev/null || true
+    --agents 3 --budget 2 --timeout 90 --depth shallow 2>/dev/null || printf '')
 
-# Locate the most recently written board.jsonl produced by the research run.
-board_file=""
-results_root="$HOME/.term-mesh/results"
-if [ -d "$results_root" ]; then
-    board_file=$(find "$results_root" -name 'board*.jsonl' 2>/dev/null \
-                 | xargs ls -t 2>/dev/null | head -1 || printf '')
+# Prefer the board_path the dispatch reported; fall back to scanning the
+# project-local research dir (then the legacy results dir).
+board_file=$(printf '%s' "$research_out" \
+    | grep -oE '"board_path"[[:space:]]*:[[:space:]]*"[^"]+"' | head -1 \
+    | sed -E 's/.*"board_path"[[:space:]]*:[[:space:]]*"([^"]+)".*/\1/')
+if [ -z "$board_file" ] || [ ! -f "$board_file" ]; then
+    for root in "$PWD/.xm/research" "$HOME/.term-mesh/results"; do
+        [ -d "$root" ] || continue
+        board_file=$(find "$root" -name 'board*.jsonl' 2>/dev/null \
+                     | xargs ls -t 2>/dev/null | head -1 || printf '')
+        [ -n "$board_file" ] && break
+    done
 fi
 
 if [ -z "$board_file" ] || [ ! -f "$board_file" ]; then
     fail "board.jsonl not found after research run" \
-         "board file under $results_root/**" \
-         "searched $results_root"
+         "board file (board_path from research output, or under .xm/research/**)" \
+         "research_out head: $(printf '%s' "$research_out" | head -c 160)"
 else
     parse_result=$(python3 - "$board_file" <<'PYEOF'
 import json, sys
