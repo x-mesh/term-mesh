@@ -1627,6 +1627,20 @@ private struct ExpandedAgentRow: View {
         }
         .disabled(state != "parked")
 
+        // Mirror the terminal-pane right-click menu (GhosttyTerminalView) so the
+        // agent's own sidebar row also exposes recycle — the most discoverable
+        // place to look for it. recycleAgent() guards active non-terminal tasks
+        // unless force is set, so both variants are always offered.
+        Button("Recycle Agent") {
+            TeamOrchestrator.shared.recycleAgent(teamName: teamName, agentName: agent.name, force: false)
+        }
+
+        Button("Recycle Agent (Force)") {
+            TeamOrchestrator.shared.recycleAgent(teamName: teamName, agentName: agent.name, force: true)
+        }
+
+        Divider()
+
         Button("Copy session id") {
             copySessionId()
         }

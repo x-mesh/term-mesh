@@ -77,6 +77,11 @@ final class BrewSelfUpdater {
     nonisolated static let defaultCaskToken = "term-mesh"
     nonisolated static let defaultOutdatedInterval: TimeInterval = 30 * 60      // 30 min
     nonisolated static let defaultRefreshInterval: TimeInterval = 6 * 60 * 60   // 6 h
+    /// How stale the tap may be before an outdated check refreshes it first.
+    /// Deliberately between the outdated (30 min) and refresh (6 h) cadences:
+    /// short enough that the pill's `latest` rarely lags the true newest cask,
+    /// long enough that `brew update` isn't run on every 30 min outdated poll.
+    nonisolated static let defaultTapStalenessInterval: TimeInterval = 2 * 60 * 60  // 2 h
     nonisolated static let initialDelay: TimeInterval = 60                       // 60 s after start
 
     enum Defaults {
@@ -442,6 +447,18 @@ final class BrewSelfUpdater {
     private func runOutdatedCheck() {
         guard !isRunningCheck else { return }
         guard let brew = cachedBrewPath else { return }
+        // Tap staleness guard: `brew outdated`'s `current_version` only reflects
+        // what the LOCAL tap knows. If the tap hasn't been refreshed recently it
+        // can report an intermediate version (e.g. 0.136.0 when 0.137.0 is out),
+        // so the pill shows an older `latest` and the user has to update twice.
+        // Refresh the tap first; runTapRefresh() chains back into this method,
+        // and by then lastTapRefreshAt is fresh so we fall through to the real
+        // check (no infinite loop).
+        if shouldRefreshTapBeforeCheck() {
+            UpdateLogStore.shared.append("brew self-update: tap stale before outdated check — refreshing first")
+            Task.detached(priority: .utility) { [weak self] in await self?.runTapRefresh() }
+            return
+        }
         let cask = caskToken
         isRunningCheck = true
         viewModel.update(state: .checking)
@@ -546,6 +563,20 @@ final class BrewSelfUpdater {
         }
     }
 
+    /// Whether an outdated check should refresh the tap (`brew update`) first so
+    /// the reported `latest` reflects the true newest cask version rather than a
+    /// stale intermediate. Returns false when offline / Low Power Mode (so the
+    /// check still runs against the existing tap and never stalls) or when a
+    /// refresh is already in flight. Otherwise true if the tap has never been
+    /// refreshed or the last refresh is older than the tap-staleness interval.
+    private func shouldRefreshTapBeforeCheck() -> Bool {
+        guard isOnline else { return false }
+        if isRunningRefresh { return false }
+        if ProcessInfo.processInfo.isLowPowerModeEnabled { return false }
+        guard let last = viewModel.lastTapRefreshAt else { return true }
+        return Date().timeIntervalSince(last) >= Self.defaultTapStalenessInterval
+    }
+
     private func runTapRefresh() async {
         if isRunningRefresh { return }
         isRunningRefresh = true
@@ -564,9 +595,22 @@ final class BrewSelfUpdater {
         let result = await Task.detached(priority: .utility) {
             Self.runBrewUpdate(brew: brew)
         }.value
-        UpdateLogStore.shared.append("brew self-update: `brew update` \(result) duration=\(String(format: "%.1f", -started.timeIntervalSinceNow))s")
-        viewModel.recordTapRefresh(at: Date())
-        // tap refresh 후 outdated check를 chain하여 latest 버전을 즉시 반영
+        let duration = String(format: "%.1f", -started.timeIntervalSinceNow)
+        switch result {
+        case .success:
+            UpdateLogStore.shared.append("brew self-update: `brew update` ok duration=\(duration)s")
+            // Only stamp the timestamp on success. On failure we leave it stale so
+            // shouldRefreshTapBeforeCheck() retries on the next timer tick instead
+            // of serving a stale `latest` for the full staleness window.
+            viewModel.recordTapRefresh(at: Date())
+        case .failure(let err):
+            UpdateLogStore.shared.append("brew self-update: `brew update` failed in \(duration)s — \(err.message)")
+        }
+        // Chain an outdated check regardless: on success it reflects the freshly
+        // refreshed tap; on failure it still refreshes the UI against the existing
+        // tap. The next retry is driven by the timer because the timestamp stayed
+        // stale. isRunningRefresh is still true here, so the chained check won't
+        // re-enter the refresh branch.
         await MainActor.run { [weak self] in
             self?.runOutdatedCheck()
         }
@@ -646,11 +690,13 @@ final class BrewSelfUpdater {
         }
     }
 
-    /// Runs `brew update`. Returns a status string suitable for logging.
-    fileprivate nonisolated static func runBrewUpdate(brew: String) -> String {
+    /// Runs `brew update`. Returns success/failure so the caller can decide
+    /// whether to record the tap-refresh timestamp (a failed refresh must NOT
+    /// be recorded, or the staleness guard would treat the tap as fresh).
+    fileprivate nonisolated static func runBrewUpdate(brew: String) -> Result<Void, BrewRunError> {
         switch runProcess(executable: brew, arguments: ["update"], timeout: 180) {
-        case .success: return "exit=0"
-        case .failure(let err): return err.message
+        case .success: return .success(())
+        case .failure(let err): return .failure(err)
         }
     }
 

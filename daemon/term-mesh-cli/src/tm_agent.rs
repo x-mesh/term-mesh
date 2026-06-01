@@ -8188,6 +8188,12 @@ fn run_watch_command(sock: &PathBuf, action: &WatchAction) {
 
 /// Render `watch.status` as a human-readable summary (P12 #6) instead of raw JSON.
 fn print_watch_status(resp: &Value) {
+    // `rpc_call` returns the full JSON-RPC envelope (`{id, result, ...}`); the
+    // watch payload lives under `result`. Unwrap it (fall back to the raw value
+    // so an already-unwrapped payload still works). Without this the lookups
+    // below always missed and every status printed "No watches configured"
+    // even though the daemon registry held a live watch.
+    let resp = resp.get("result").unwrap_or(resp);
     // The handler returns either `{watch: {..}|null}` (single team) or
     // `{watches: [..]}` (all teams).
     let states: Vec<&Value> = if let Some(one) = resp.get("watch") {
