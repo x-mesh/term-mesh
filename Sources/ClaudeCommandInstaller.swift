@@ -38,6 +38,19 @@ enum ClaudeCommandInstaller {
         "watch.md"
     ]
 
+    /// term-mesh가 소유권을 주장하는 Codex prompt 파일 이름 (~/.codex/prompts/).
+    /// copy-claude-commands.sh 의 CODEX_PROMPTS 배열과 동기화 유지.
+    /// Codex prompt 파일은 YAML frontmatter를 가지므로 marker가 frontmatter 직후에
+    /// 삽입되며, 감지는 isManagedSkillFile (head 30줄) 로 한다.
+    private static let managedCodexPromptNames: Set<String> = [
+        "team.md",
+        "team-up.md",
+        "tm.md",
+        "tm-op.md",
+        "tm-bench.md",
+        "watch.md"
+    ]
+
     /// 번들 내 커맨드 디렉토리 (claude-commands/)
     private static var bundleCommandsURL: URL? {
         Bundle.main.url(forResource: "claude-commands", withExtension: nil)
@@ -46,6 +59,11 @@ enum ClaudeCommandInstaller {
     /// 번들 내 스킬 디렉토리 (claude-skills/)
     private static var bundleSkillsURL: URL? {
         Bundle.main.url(forResource: "claude-skills", withExtension: nil)
+    }
+
+    /// 번들 내 Codex prompt 디렉토리 (codex-prompts/)
+    private static var bundleCodexPromptsURL: URL? {
+        Bundle.main.url(forResource: "codex-prompts", withExtension: nil)
     }
 
     /// 대상: ~/.claude/commands/
@@ -58,6 +76,12 @@ enum ClaudeCommandInstaller {
     private static var targetSkillsURL: URL {
         FileManager.default.homeDirectoryForCurrentUser
             .appendingPathComponent(".claude/skills")
+    }
+
+    /// 대상: ~/.codex/prompts/
+    private static var targetCodexPromptsURL: URL {
+        FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent(".codex/prompts")
     }
 
     /// 앱 시작 시 호출. 번들 버전이 더 새로우면 커맨드/스킬 파일을 설치한다.
@@ -82,7 +106,12 @@ enum ClaudeCommandInstaller {
 
         if let src = bundleCommandsURL {
             do {
-                try installCommands(from: src, to: targetURL)
+                try installManagedMarkdown(
+                    from: src,
+                    to: targetURL,
+                    managedNames: managedCommandNames,
+                    isManaged: isManagedFile
+                )
                 logger.info("Claude commands installed for version \(current, privacy: .public)")
             } catch {
                 logger.error("Command install failed: \(error.localizedDescription, privacy: .public)")
@@ -102,16 +131,45 @@ enum ClaudeCommandInstaller {
             logger.debug("claude-skills bundle resource not found (optional)")
         }
 
+        // Codex prompts → ~/.codex/prompts/ (native Codex `/<name>` support).
+        // Marker sits after YAML frontmatter, so detect ownership with the 30-line check.
+        if let srcCodex = bundleCodexPromptsURL {
+            do {
+                try installManagedMarkdown(
+                    from: srcCodex,
+                    to: targetCodexPromptsURL,
+                    managedNames: managedCodexPromptNames,
+                    isManaged: isManagedSkillFile
+                )
+                logger.info("Codex prompts installed for version \(current, privacy: .public)")
+            } catch {
+                logger.error("Codex prompt install failed: \(error.localizedDescription, privacy: .public)")
+            }
+        } else {
+            logger.debug("codex-prompts bundle resource not found (optional)")
+        }
+
         UserDefaults.standard.set(current, forKey: installedVersionKey)
         UserDefaults.standard.set(true, forKey: managedNameMigrationKey)
     }
 
     // MARK: - Private
 
-    private static func installCommands(from src: URL, to dst: URL) throws {
+    /// 번들의 `.md` 파일들을 대상 디렉토리에 마커 기반 보존 정책으로 설치한다.
+    /// Claude commands (`~/.claude/commands`) 와 Codex prompts (`~/.codex/prompts`) 가
+    /// 동일 로직을 공유한다 — managed 이름 목록과 marker 감지 함수만 다르다.
+    /// - managedNames: 마커 없는 사용자 파일이라도 백업 후 덮어쓸 파일 이름 (그 외엔 보존)
+    /// - isManaged: 파일이 term-mesh 소유(마커 보유)인지 감지하는 함수
+    ///   (Claude commands = 5줄 검사, Codex prompts = frontmatter 뒤 marker라 30줄 검사)
+    private static func installManagedMarkdown(
+        from src: URL,
+        to dst: URL,
+        managedNames: Set<String>,
+        isManaged: (URL) -> Bool
+    ) throws {
         let fm = FileManager.default
 
-        // ~/.claude/commands/ 디렉토리 없으면 생성
+        // 대상 디렉토리 없으면 생성
         if !fm.fileExists(atPath: dst.path) {
             try fm.createDirectory(at: dst, withIntermediateDirectories: true)
         }
@@ -132,8 +190,8 @@ enum ClaudeCommandInstaller {
             let existsRegular = fm.fileExists(atPath: dest.path)
             let existsAsSymlink = (try? fm.attributesOfItem(atPath: dest.path)[.type] as? FileAttributeType) == .typeSymbolicLink
             if existsRegular || existsAsSymlink {
-                if !isManagedFile(at: dest) {
-                    guard managedCommandNames.contains(name) else {
+                if !isManaged(dest) {
+                    guard managedNames.contains(name) else {
                         logger.debug("Skipping user-customized file: \(name, privacy: .public)")
                         continue
                     }

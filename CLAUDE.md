@@ -251,9 +251,13 @@ the original Claude slash commands.
 | `/watch ...` | `/watch ...` via IME alias | Stateless drift oversight toggle/review |
 
 The IME alias map lives in `imeSlashCommandAliases()` (`Sources/GhosttySurfaceScrollView.swift`);
-each alias points at a `.codex/prompts/<name>.md` shim. Claude-side equivalents are bundled +
-installed via `scripts/copy-claude-commands.sh` (build phase) and `ClaudeCommandInstaller.swift`
-(runtime). Adding a leader command means touching all of these in lockstep.
+each alias points at a `.codex/prompts/<name>.md` shim, read live from the repo. Both the Claude
+commands AND the Codex prompts are bundled + installed by `scripts/copy-claude-commands.sh`
+(build phase: `COMMANDS`/`SKILLS`/`CODEX_PROMPTS` arrays) and `ClaudeCommandInstaller.swift`
+(runtime: `managedCommandNames` → `~/.claude/commands/`, `managedCodexPromptNames` →
+`~/.codex/prompts/` for native Codex `/<name>`). Install is version-gated, so new prompts land on
+the next version bump. Adding a leader command means touching all of these in lockstep — see the
+6-point checklist in `scripts/copy-claude-commands.sh`.
 
 For Codex as the current leader, prefer:
 
