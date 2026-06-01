@@ -4,6 +4,14 @@ All notable changes to term-mesh are documented here.
 
 ## [Unreleased]
 
+## [0.140.0] - 2026-06-02
+
+유지보수 릴리즈 — 사용자 영향 변경 없음. leader-as-watch-target watch fallback의 daemon e2e 회귀 테스트를 추가했다(내부 변경).
+
+### Thanks to 1 contributor!
+
+- [@JINWOO-J](https://github.com/JINWOO-J)
+
 ## [0.139.0] - 2026-06-02
 
 ### Added
