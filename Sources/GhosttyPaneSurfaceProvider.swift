@@ -260,19 +260,40 @@ final class GhosttyPaneSurfaceProvider: PeerSurfaceProvider {
         return PeerSurfaceAttachment(
             byteStream: stream,
             input: input,
-            resize: { [weakTS] cols, rows in
+            resize: { [weakTS, hub] cols, rows in
                 await MainActor.run {
                     guard let ptr = weakTS.value?.surface else { return }
                     // ghostty_surface_set_size takes pixel dimensions.
                     // Use current cell size to convert cols×rows → pixels.
                     let curSz = ghostty_surface_size(ptr)
-                    if curSz.cell_width_px > 0 && curSz.cell_height_px > 0 {
-                        let safeCols = min(cols, 1000)
-                        let safeRows = min(rows, 1000)
-                        let (w, wOverflow) = safeCols.multipliedReportingOverflow(by: UInt32(curSz.cell_width_px))
-                        let (h, hOverflow) = safeRows.multipliedReportingOverflow(by: UInt32(curSz.cell_height_px))
-                        guard !wOverflow, !hOverflow else { return }
-                        ghostty_surface_set_size(ptr, w, h)
+                    guard curSz.cell_width_px > 0, curSz.cell_height_px > 0 else { return }
+                    let safeCols = min(cols, 1000)
+                    let safeRows = min(rows, 1000)
+                    let (w, wOverflow) = safeCols.multipliedReportingOverflow(by: UInt32(curSz.cell_width_px))
+                    let (h, hOverflow) = safeRows.multipliedReportingOverflow(by: UInt32(curSz.cell_height_px))
+                    guard !wOverflow, !hOverflow else { return }
+
+                    // The host pane and each remote viewer surface are sized
+                    // independently; the host follows the viewer here. The
+                    // viewer's real size only reaches us via this resize (the
+                    // attach `clientCols/clientRows` carry the host-echoed size,
+                    // not the viewer's). Until it lands, the viewer renders
+                    // host-sized PTY bytes into a differently-sized grid, so
+                    // absolute-cursor TUIs (Claude Code, vim, htop) paint
+                    // spinners/status lines on top of body text and the screen
+                    // looks garbled/duplicated. Match the host pane to the
+                    // viewer, then — only on a real dimension change — wipe the
+                    // viewer's now-stale grid so the SIGWINCH-driven repaint
+                    // lands clean at the new size. The clear is yielded before
+                    // the repaint bytes (which arrive via the PTY tap), so the
+                    // viewer sees: clear → full repaint. Skipped on a no-op
+                    // resize so plain shells don't lose their view.
+                    let sizeChanged = UInt32(curSz.columns) != safeCols
+                        || UInt32(curSz.rows) != safeRows
+                    ghostty_surface_set_size(ptr, w, h)
+                    if sizeChanged {
+                        // ESC[2J (erase screen) + ESC[H (cursor home).
+                        hub.broadcast(Data([0x1B, 0x5B, 0x32, 0x4A, 0x1B, 0x5B, 0x48]))
                     }
                 }
             },
