@@ -255,18 +255,25 @@ VERDICT: DRIFT|OK
 
 `/watch on [agent] --spec <text|@path> [--every <sec>] [options]`
 
-Enable daemon autonomous watch for one target or all workers. This is no longer a stub: it uses `tm-agent watch on`, persists config in `.xm/watch/config.json`, and starts the daemon interval trigger.
+Enable daemon autonomous watch for one target, all workers, or the **leader's own pane**. This is no longer a stub: it uses `tm-agent watch on`, persists config in `.xm/watch/config.json`, and starts the daemon interval trigger.
+
+**Target values:** `<agent>` (one worker) · `all` (every worker except leader/watcher) · `leader` (the leader's own pane). `leader` is for worker-less teams (e.g. an `attach`-bootstrapped 1-person team) where the real work happens in the leader pane. Two ways in:
+
+- **Explicit:** `--target leader`.
+- **Fallback (D1, conservative):** with `--target all`, when the team resolves to **zero workers** and exposes a GUI leader pane, the daemon automatically watches `leader`. As soon as one real worker exists, `all` watches workers only — the leader is never watched in a multi-member team. A purely headless leader (no GUI pane) has nothing to capture, so no fallback applies and watch reports "no target".
+
+When the target is `leader`, the watcher tolerates in-progress/streaming output (it is the user's live work, not a worker's settled result) and drift reports are tagged `[self-watch]` in the leader inbox.
 
 ### Flow
 
 0. Ensure team + watcher exist (auto-create on first use) — same logic as `review` Step 0. Run `tm-agent status`; if no team exists, bootstrap from the current pane with `tm-agent attach watcher --cli <cli>` (single step: adopts this pane as leader AND creates the watcher — see the "Why `attach`" note in `review` Step 0). If a team exists but has no watcher, add one with `tm-agent add watcher --cli <cli>` (or `attach` for `ws-…` workspace-local teams). The chosen `--cli` must match the watcher CLI selected in the wizard so the pane and the autonomous tick CLI agree.
 
 1. Resolve and validate the spec exactly as `review` does, including the interactive spec prompt when it is missing (reject only in non-interactive mode).
-2. Resolve `[agent]` to a single target or `all` workers. Do not create or remove panes. If `[agent]` is omitted: in **interactive** mode, prompt with `AskUserQuestion` to choose the target (same choices as `review`); in **non-interactive** mode, default to all workers. If `--stance` or `--every` were omitted: in interactive mode prompt for them (defaults `critic` / `300`); under `--no-input` apply the defaults silently.
+2. Resolve `[agent]` to a single target, `all` workers, or `leader`. Do not create or remove panes. If `[agent]` is omitted: in **interactive** mode, prompt with `AskUserQuestion` to choose the target (same choices as `review`, plus `leader` when the team has no workers); in **non-interactive** mode, default to all workers (which auto-falls-back to `leader` when zero workers resolve and a GUI leader pane exists). If `--stance` or `--every` were omitted: in interactive mode prompt for them (defaults `critic` / `300`); under `--no-input` apply the defaults silently.
 3. Execute the daemon watch primitive:
 
    ```bash
-   tm-agent watch on --target <agent|all> --every <sec> --stance <stance> --cli <cli> --model <model> --spec <text|@path> --ratio <R>
+   tm-agent watch on --target <agent|all|leader> --every <sec> --stance <stance> --cli <cli> --model <model> --spec <text|@path> --ratio <R>
    ```
 
    Omit optional flags that the user did not provide; let daemon defaults apply.

@@ -2072,6 +2072,15 @@ async fn dispatch(req: &Request, ctx: &Context) -> Response {
                                     }
                                 }
                             }
+                            // Leader-as-watch-target (D1/D6 fallback): a worker-less
+                            // team that still exposes a GUI leader pane watches the
+                            // leader itself; otherwise unchanged. See the helper docs.
+                            let has_gui_leader = p
+                                .app_socket_path
+                                .as_deref()
+                                .map(|s| !s.is_empty())
+                                .unwrap_or(false);
+                            names = apply_leader_watch_fallback(names, has_gui_leader);
                             // Deduplicate while preserving order; detect dups for R3.
                             let had = {
                                 let mut s = std::collections::HashSet::new();
@@ -2901,6 +2910,26 @@ fn compute_agent_anomalies(agent_manager: &AgentSessionManager) -> Vec<Anomaly> 
 /// (GUI teams have no headless-manager agents). Excludes the watcher agent
 /// (same heuristic as the headless path). Returns empty vec on any error so
 /// the watch.on registration still succeeds — workers are simply not pre-filled.
+/// Apply the leader-as-watch-target fallback (D1/D6) to an `--target all` watch.
+///
+/// A worker-less team (e.g. an `attach`-bootstrapped 1-person team) has no agent
+/// to watch, yet its real work happens in the leader pane. Given the workers
+/// resolved for the team and whether it exposes a readable GUI leader pane
+/// (app socket present), decide the final watch target list:
+///
+/// - **workers present** → returned unchanged. The leader is *never* watched in a
+///   multi-member team (D1): as soon as one real worker exists, this is a no-op.
+/// - **no workers + GUI leader** → `["leader"]`: watch the leader's own pane, which
+///   `tm-agent read leader` can capture over the app socket.
+/// - **no workers + no GUI leader** → empty: a purely headless leader has no pane
+///   to read, so watch reports "no target" rather than fabricating one (D6).
+fn apply_leader_watch_fallback(mut names: Vec<String>, has_gui_leader: bool) -> Vec<String> {
+    if names.is_empty() && has_gui_leader {
+        names.push("leader".to_string());
+    }
+    names
+}
+
 async fn query_gui_team_workers(app_socket: &str, team_id: &str) -> Vec<String> {
     use tokio::io::AsyncBufReadExt;
     let Ok(stream) = tokio::net::UnixStream::connect(app_socket).await else {
@@ -2945,6 +2974,38 @@ async fn query_gui_team_workers(app_socket: &str, team_id: &str) -> Vec<String> 
 mod tests {
     use super::*;
     use serde_json::json;
+
+    // ── leader-as-watch-target fallback (D1/D6) ──
+
+    #[test]
+    fn leader_fallback_watches_leader_when_no_workers_and_gui_leader() {
+        // Worker-less GUI team (app socket present) → watch the leader's own pane.
+        let names = apply_leader_watch_fallback(vec![], true);
+        assert_eq!(names, vec!["leader".to_string()]);
+    }
+
+    #[test]
+    fn leader_fallback_skipped_for_headless_leader() {
+        // No workers AND no GUI leader pane → no fabricated target (D6).
+        let names = apply_leader_watch_fallback(vec![], false);
+        assert!(names.is_empty());
+    }
+
+    #[test]
+    fn leader_fallback_never_watches_leader_when_workers_exist() {
+        // D1 regression: a team with even one worker must never get "leader"
+        // injected, regardless of whether a GUI leader pane is readable.
+        let workers = vec!["executor".to_string(), "reviewer".to_string()];
+        assert_eq!(
+            apply_leader_watch_fallback(workers.clone(), true),
+            workers,
+            "leader must never be added when workers are present"
+        );
+        assert_eq!(apply_leader_watch_fallback(workers.clone(), false), workers);
+        // Single-worker boundary case.
+        let one = vec!["executor".to_string()];
+        assert_eq!(apply_leader_watch_fallback(one.clone(), true), one);
+    }
 
     #[test]
     fn heartbeat_stale_event_emits_once_until_recovered() {

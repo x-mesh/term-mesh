@@ -199,6 +199,18 @@ pub fn build_review_message(input: &WatchCheckInput) -> String {
             delta = bound_delta(&input.delta),
         )
     };
+    // D3 (leader-as-watch-target): when the watched target is the team LEADER's
+    // own pane, the delta is the user's live, in-progress work — not a worker's
+    // settled output. Tell the watcher to tolerate mid-stream/incomplete output so
+    // it does not misread an unfinished step as drift.
+    let leader_note = if input.target == "leader" {
+        "IN-PROGRESS TOLERANCE: this target is the team LEADER's own pane — the \
+         user's live, in-progress work (active typing, streaming CLI output, shell \
+         noise). Incomplete or mid-stream output is NOT drift. Judge only a clear, \
+         settled deviation from the spec; when in doubt, report on-track.\n\n"
+    } else {
+        ""
+    };
     format!(
         "REVIEW NOW\n\
          check_id: {check_id}\n\
@@ -206,6 +218,7 @@ pub fn build_review_message(input: &WatchCheckInput) -> String {
          stance: {stance}\n\
          target: {target}\n\n\
          {delta_section}\n\n\
+         {leader_note}\
          Then judge the watched agent \"{target}\" against your spec and output a \
          single structured verdict (and nothing else):\n\
          [VERDICT] on-track | drift(execution) | drift(direction)\n\
@@ -216,6 +229,7 @@ pub fn build_review_message(input: &WatchCheckInput) -> String {
         stance = input.stance,
         target = input.target,
         delta_section = delta_section,
+        leader_note = leader_note,
     )
 }
 

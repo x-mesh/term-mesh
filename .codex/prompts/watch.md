@@ -146,10 +146,10 @@ In the interactive wizard, ask the user directly and wait for their reply for ev
 
 0. Ensure team + watcher exist (auto-create on first use) — same logic as `review` Step 0. Run `tm-agent status`; if no team exists, bootstrap from the current pane with `tm-agent attach watcher --cli <cli>` (single step: adopts this pane as leader AND creates the watcher — see the "Why `attach`" note in `review` Step 0). If a team exists but has no watcher, add with `tm-agent add watcher --cli <cli>` (or `attach` for `ws-…` workspace-local teams). The chosen `--cli` must match the watcher CLI selected in the wizard so the pane and the autonomous tick CLI agree.
 
-Resolve and validate the spec exactly as `review` does, including the interactive spec prompt when it is missing (reject only in non-interactive mode). Resolve `[agent]` the same way as `review`: in **interactive** mode, ask the user a direct question and wait for their reply; in **non-interactive** mode, default to all workers. Then enable daemon autonomous watch:
+Resolve and validate the spec exactly as `review` does, including the interactive spec prompt when it is missing (reject only in non-interactive mode). Resolve `[agent]` the same way as `review`: in **interactive** mode, ask the user a direct question and wait for their reply; in **non-interactive** mode, default to all workers. Targets: `<agent>` (one worker) · `all` (every worker except leader/watcher) · `leader` (the leader's own pane, for worker-less teams). With `--target all`, a team that resolves to **zero workers** but exposes a GUI leader pane auto-falls-back to watching `leader` (D1 conservative: once any worker exists, `all` watches workers only; a purely headless leader gets no fallback and reports "no target"). A `leader` target tolerates in-progress output and tags drift reports `[self-watch]`. Then enable daemon autonomous watch:
 
 ```bash
-tm-agent watch on --target <agent|all> --every <sec> --stance <stance> --cli <cli> --model <model> --spec <text|@path> --ratio <R>
+tm-agent watch on --target <agent|all|leader> --every <sec> --stance <stance> --cli <cli> --model <model> --spec <text|@path> --ratio <R>
 ```
 
 Omit optional flags the user did not provide. The daemon persists `.xm/watch/config.json`, starts interval ticks, and returns `next_tick` plus current config. This command does not dispatch user work, add agents, close panes, or mutate team composition.

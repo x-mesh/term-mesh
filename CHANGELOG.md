@@ -4,6 +4,18 @@ All notable changes to term-mesh are documented here.
 
 ## [Unreleased]
 
+## [0.139.0] - 2026-06-02
+
+### Added
+- **`/watch`가 worker 없는 팀에서 leader를 감시** — `attach`로 만든 1인 팀처럼 감시할 worker가 없을 때, `/watch`가 leader pane 자체를 감시 대상으로 삼는다. `--target leader`로 명시하거나, `--target all`인데 worker가 0이면 자동으로 leader로 전환된다(worker가 한 명이라도 있으면 종전대로 worker만 감시). leader 대상일 때는 진행 중인 미완 출력을 drift로 오판하지 않고, drift 보고에 `[self-watch]` 표식을 단다.
+
+### Fixed
+- **원격 viewer에서 TUI 리사이즈 시 화면 깨짐 수정** — 원격 peer로 접속해 보는 화면에서 창 크기를 바꿀 때 vim·htop 같은 절대 커서 TUI의 출력이 깨지거나 중복되던 문제. 리사이즈 시 stale한 그리드를 지우고 다시 그리도록 해 해결했다.
+
+### Thanks to 1 contributor!
+
+- [@JINWOO-J](https://github.com/JINWOO-J)
+
 ## [0.138.0] - 2026-06-01
 
 ### Added
