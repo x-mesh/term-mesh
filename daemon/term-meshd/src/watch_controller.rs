@@ -378,8 +378,12 @@ pub(crate) async fn handle_outcome<I: LeaderInbox + ?Sized>(
 
     match append_board_finding(working_dir, &finding_row) {
         Ok(true) => {
+            // D2 (leader-as-watch-target): a "leader" target means the report loops
+            // back into the leader's own inbox (self-watch). Tag it so the user can
+            // tell self-oversight from worker oversight at a glance.
+            let self_watch = if outcome.target == "leader" { "[self-watch] " } else { "" };
             let content = format!(
-                "[watch:{drift_type}/{severity}] {target}: {finding} (spec: {spec_clause}) [check_id={cid}]",
+                "{self_watch}[watch:{drift_type}/{severity}] {target}: {finding} (spec: {spec_clause}) [check_id={cid}]",
                 target = outcome.target,
                 cid = outcome.check_id,
             );

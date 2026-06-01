@@ -4719,6 +4719,24 @@ final class TeamOrchestrator: ObservableObject {
     /// Returns the panel for external callers to use with readTerminalTextBase64.
     func agentPanel(teamName: String, agentName: String, tabManager: TabManager) -> TerminalPanel? {
         guard let team = teams[teamName] else { return nil }
+        // Leader-as-watch-target: the leader lives in `leaderPanelId`, outside the
+        // `agents[]` array. Resolve it explicitly so `tm-agent read leader` and a
+        // worker-less watch (`--target leader` or the all-target fallback) can
+        // capture the leader's own pane. Only adopted leaders are readable (they
+        // own a GUI pane); a purely headless leader has no pane to find here.
+        if agentName == "leader" {
+            // Adopted leaders carry an explicit workspace id; create-mode leaders
+            // leave it nil but their pane still lives in one of the open tabs.
+            if let wsId = team.leaderWorkspaceId,
+               let ws = tabManager.tabs.first(where: { $0.id == wsId }),
+               let panel = ws.terminalPanel(for: team.leaderPanelId) {
+                return panel
+            }
+            for ws in tabManager.tabs {
+                if let panel = ws.terminalPanel(for: team.leaderPanelId) { return panel }
+            }
+            return nil
+        }
         guard let agent = team.agents.first(where: { $0.name == agentName }) else { return nil }
         guard let pid = agent.panelId else { return nil }
         guard let workspace = tabManager.tabs.first(where: { $0.id == agent.workspaceId }) else { return nil }
