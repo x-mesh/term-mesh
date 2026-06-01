@@ -4,6 +4,19 @@ All notable changes to term-mesh are documented here.
 
 ## [Unreleased]
 
+## [0.138.0] - 2026-06-01
+
+### Added
+- **`/watch` 마법사에서 watcher CLI 선택** — `/watch`를 처음 설정할 때 watcher를 실행할 CLI(claude/codex/gemini/kiro, 기본 claude)를 고를 수 있다. 선택한 CLI가 watcher pane과 자율 헤드리스 점검 양쪽에 모두 적용된다.
+- **Codex pane에서 네이티브 슬래시 커맨드** — 앱이 `/team`, `/tm`, `/tm-op`, `/watch` 등 팀 커맨드의 Codex 프롬프트를 `~/.codex/prompts/`에 자동 설치한다. 이제 Codex 리더·에이전트 pane에서도 네이티브 `/<command>` 형태로 팀 커맨드를 쓸 수 있다.
+
+### Fixed
+- **`/watch` 첫 설정이 더 견고해짐** — `/watch`를 처음 켤 때 워크스페이스에 단일 단계로 watcher를 붙이도록 바꿔, 간헐적으로 발생하던 watch 설정 실패를 없앴다.
+
+### Thanks to 1 contributor!
+
+- [@JINWOO-J](https://github.com/JINWOO-J)
+
 ## [0.137.0] - 2026-06-01
 
 ### Added

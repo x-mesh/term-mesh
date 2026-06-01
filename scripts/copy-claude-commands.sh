@@ -1,9 +1,9 @@
 #!/bin/bash
-# Copy Claude slash commands and skills to app bundle with managed-file markers.
+# Copy Claude slash commands + skills AND Codex prompts to app bundle with managed-file markers.
 #
 # Invoked from the Xcode "Run Script" build phase (see GhosttyTabs.xcodeproj/project.pbxproj).
-# This is the SINGLE source of truth for which commands/skills ship in the .app bundle;
-# do not re-inline this logic into the build phase.
+# This is the SINGLE source of truth for which commands/skills/codex-prompts ship in the .app
+# bundle; do not re-inline this logic into the build phase.
 #
 # Requires these build-phase env vars: SRCROOT, TARGET_BUILD_DIR, UNLOCALIZED_RESOURCES_FOLDER_PATH.
 #
@@ -19,10 +19,12 @@
 # Source of truth for the file contents: .claude/commands/ and .claude/skills/ in the git repo.
 #
 # IMPORTANT: When adding a new command that should be distributed AND installed for users,
-# update all three in lockstep:
-#   1. the COMMANDS array below (bundles it into the .app)
+# update all FOUR in lockstep:
+#   1. the COMMANDS array below (bundles the Claude command into the .app)
 #   2. ClaudeCommandInstaller.swift managedCommandNames (installs/overwrites ~/.claude/commands)
-#   3. .codex/prompts/<name>.md + imeSlashCommandAliases() (Codex IME alias), if Codex needs it too
+#   3. .codex/prompts/<name>.md + imeSlashCommandAliases() (Codex IME alias, repo-local)
+#   4. the CODEX_PROMPTS array below + ClaudeCommandInstaller.swift managedCodexPromptNames
+#      (bundles + installs the Codex prompt into ~/.codex/prompts for native Codex `/<name>`)
 set -euo pipefail
 
 SRC_CMDS="${SRCROOT}/.claude/commands"
@@ -31,6 +33,9 @@ DEST_CMDS="${TARGET_BUILD_DIR}/${UNLOCALIZED_RESOURCES_FOLDER_PATH}/claude-comma
 SRC_SKILLS="${SRCROOT}/.claude/skills"
 DEST_SKILLS="${TARGET_BUILD_DIR}/${UNLOCALIZED_RESOURCES_FOLDER_PATH}/claude-skills"
 
+SRC_CODEX="${SRCROOT}/.codex/prompts"
+DEST_CODEX="${TARGET_BUILD_DIR}/${UNLOCALIZED_RESOURCES_FOLDER_PATH}/codex-prompts"
+
 # 설치할 커맨드 파일 목록 — 새 커맨드 추가 시 여기에 파일명 추가
 # 이 목록은 Sources/ClaudeCommandInstaller.swift 의 managedCommandNames 와 동기화 유지.
 COMMANDS=(tm.md team.md team-up.md tm-op.md tm-bench.md watch.md)
@@ -38,6 +43,12 @@ COMMANDS=(tm.md team.md team-up.md tm-op.md tm-bench.md watch.md)
 # 설치할 스킬 목록 (디렉토리명) — 새 스킬 추가 시 여기에 추가
 # 각 스킬은 .claude/skills/<name>/SKILL.md 형태여야 함
 SKILLS=(term-mesh-cli)
+
+# 설치할 Codex prompt 파일 목록 — Claude COMMANDS 와 짝을 이룬다.
+# 이 목록은 Sources/ClaudeCommandInstaller.swift 의 managedCodexPromptNames 와 동기화 유지.
+# Codex prompt 파일은 YAML frontmatter(--- description ---)를 가지므로 SKILL.md 처럼
+# 마커를 frontmatter 닫힘 직후에 삽입한다.
+CODEX_PROMPTS=(team.md team-up.md tm.md tm-op.md tm-bench.md watch.md)
 
 mkdir -p "$DEST_CMDS"
 
@@ -87,5 +98,30 @@ for skill in "${SKILLS[@]}"; do
         echo "Copied skill $skill to bundle"
     else
         echo "warning: $src_file not found, skipping"
+    fi
+done
+
+mkdir -p "$DEST_CODEX"
+
+for f in "${CODEX_PROMPTS[@]}"; do
+    if [ -f "$SRC_CODEX/$f" ]; then
+        # Codex prompts open with a YAML frontmatter block (--- description ---).
+        # Insert the managed marker right AFTER the closing '---' so the frontmatter
+        # stays valid for native Codex `/<name>` parsing. Mirrors the SKILL.md logic.
+        awk '
+            BEGIN { in_fm = 0; printed_marker = 0 }
+            NR == 1 && /^---[[:space:]]*$/ { in_fm = 1; print; next }
+            in_fm && /^---[[:space:]]*$/ {
+                print
+                print "<!-- term-mesh-managed: do not remove this line -->"
+                in_fm = 0
+                printed_marker = 1
+                next
+            }
+            { print }
+        ' "$SRC_CODEX/$f" > "$DEST_CODEX/$f"
+        echo "Copied codex prompt $f to bundle"
+    else
+        echo "warning: $SRC_CODEX/$f not found, skipping"
     fi
 done
