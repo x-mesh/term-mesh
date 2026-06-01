@@ -68,8 +68,9 @@ For every other invocation (empty input, unrecognized token, or a subcommand mis
 2. **Target agent**: ask which agent — list each worker (except leader and watcher) plus an "all workers" option. For `off`/`status`, "all" is allowed.
 3. **Spec** (review/on only): ask what to watch; accept inline text or an `@path`. Required, no default.
 4. **Stance** (review/on only): ask the lens — `critic` (default), `advisor`, `pair`.
-5. **Interval** (on only): ask the autonomous interval in seconds (default `300`).
-6. **Confirm & run**: when the wizard collected one or more values, show the resolved command and run it. If all required inputs were already supplied on the command line, run directly with NO confirmation step.
+5. **Watcher CLI** (review/on only): ask which CLI runs the watcher — `claude` (default), `codex`, `gemini`, `kiro`. This sets both the watcher pane CLI (`tm-agent attach watcher --cli <cli>`) and the autonomous headless tick CLI (`tm-agent watch on --cli <cli>`). The watcher needs no skill install on any CLI — each tick is a headless one-shot whose spec is folded into the system prompt. Pre-select the current team default when one exists, else `claude`.
+6. **Interval** (on only): ask the autonomous interval in seconds (default `300`).
+7. **Confirm & run**: when the wizard collected one or more values, show the resolved command and run it. If all required inputs were already supplied on the command line, run directly with NO confirmation step.
 
 Non-interactive context (`--no-input` / automation / headless): do NOT run the wizard. Require all inputs as flags; reject when a required input is missing (see each subcommand).
 
@@ -96,7 +97,7 @@ If no spec can be resolved:
 REJECT: /watch review/on requires a spec. Provide --spec "<text>" or --spec @path.
 ```
 
-In the interactive wizard, prompt for every input the chosen action needs that was not supplied on the command line — including `--stance` (default `critic`) and, for `on`, `--every` (default `300`) — pre-selecting the defaults. Always respect values already passed on the command line and skip prompting for those. If all required inputs are already supplied, run directly without any prompt. Under `--no-input`, never prompt: require flags and reject when a required input is missing.
+In the interactive wizard, prompt for every input the chosen action needs that was not supplied on the command line — including `--stance` (default `critic`), `--cli` (default `claude`, the watcher CLI), and, for `on`, `--every` (default `300`) — pre-selecting the defaults. Always respect values already passed on the command line and skip prompting for those. If all required inputs are already supplied, run directly without any prompt. Under `--no-input`, never prompt: require flags and reject when a required input is missing.
 
 `off` and `status` do not require a spec.
 
@@ -140,17 +141,27 @@ On-demand stateless check. If `[agent]` is omitted, review all worker agents exc
 
    **No active team:**
    - **Interactive:** prompt "활성 team이 없습니다. 새 team을 생성하고 watch를 시작할까요?" (Yes/No).
-     - Yes → `tm-agent create 1 --adopt`
+     - Yes → bootstrap from the current pane in ONE step (adopts this pane as leader AND creates the watcher in the current workspace):
+       ```bash
+       tm-agent attach watcher --cli <cli>
+       ```
      - No → exit cleanly.
-   - **Non-interactive (`--no-input`):** proceed silently without prompting.
+   - **Non-interactive (`--no-input`):** proceed silently without prompting, using the same single-step bootstrap:
      ```bash
-     tm-agent create 1 --adopt
+     tm-agent attach watcher --cli <cli>
      ```
 
+   > **Why `attach`, not `create --adopt` + `add`:** `tm-agent create 1 --adopt` can fail to adopt the caller's pane and instead spawn the team in a *separate* workspace. A subsequent `tm-agent add watcher` then resolves the caller's own workspace id (`ws-<first8hex>`), finds no team there, and fails with `team_not_found`. `tm-agent attach watcher` is workspace-local: it adopts the calling pane as leader and auto-creates team `ws-<first8hex>` from the current workspace UUID, so the watcher always lands in the user's pane. Use `attach` for first-use bootstrap.
+
    **Team exists, but no watcher agent:**
-   ```bash
-   tm-agent add watcher
-   ```
+   - If the existing team is `create`-based (status `team_name` is not `ws-…`), add via the team-scoped route:
+     ```bash
+     tm-agent add watcher --cli <cli>
+     ```
+   - If the team is the workspace-local `ws-…` team (or `add` returns `team_not_found`), use the workspace-local route instead:
+     ```bash
+     tm-agent attach watcher --cli <cli>
+     ```
    Poll `tm-agent status` up to 5 s (1 s intervals) until watcher appears in the agent list.
 
 1. Resolve target workers:
@@ -248,7 +259,7 @@ Enable daemon autonomous watch for one target or all workers. This is no longer 
 
 ### Flow
 
-0. Ensure team + watcher exist (auto-create on first use) — same logic as `review` Step 0. Run `tm-agent status`, create team with `tm-agent create 1 --adopt` if absent (interactive prompt, or silently under `--no-input`), then add watcher with `tm-agent add watcher` if the team has no watcher agent.
+0. Ensure team + watcher exist (auto-create on first use) — same logic as `review` Step 0. Run `tm-agent status`; if no team exists, bootstrap from the current pane with `tm-agent attach watcher --cli <cli>` (single step: adopts this pane as leader AND creates the watcher — see the "Why `attach`" note in `review` Step 0). If a team exists but has no watcher, add one with `tm-agent add watcher --cli <cli>` (or `attach` for `ws-…` workspace-local teams). The chosen `--cli` must match the watcher CLI selected in the wizard so the pane and the autonomous tick CLI agree.
 
 1. Resolve and validate the spec exactly as `review` does, including the interactive spec prompt when it is missing (reject only in non-interactive mode).
 2. Resolve `[agent]` to a single target or `all` workers. Do not create or remove panes. If `[agent]` is omitted: in **interactive** mode, prompt with `AskUserQuestion` to choose the target (same choices as `review`); in **non-interactive** mode, default to all workers. If `--stance` or `--every` were omitted: in interactive mode prompt for them (defaults `critic` / `300`); under `--no-input` apply the defaults silently.
@@ -458,8 +469,8 @@ Expected internal shape (sequential tm-agent calls):
 ```bash
 tm-agent status                        # → error/no team
 # interactive: "활성 team이 없습니다. 새 team을 생성하고 watch를 시작할까요?" → Yes
-tm-agent create 1 --adopt              # bootstrap leader-only team
-tm-agent add watcher                   # add watcher
+# wizard also asks: watcher CLI (claude|codex|gemini|kiro), default claude
+tm-agent attach watcher --cli claude   # one-step bootstrap: adopts THIS pane as leader + creates watcher
 tm-agent status                        # confirm watcher registered
 tm-agent read executor --lines 120
 tm-agent restart watcher --hard
