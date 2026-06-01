@@ -4,6 +4,19 @@ All notable changes to term-mesh are documented here.
 
 ## [Unreleased]
 
+## [0.137.0] - 2026-06-01
+
+### Added
+- **에이전트 팀: 사이드바 행에서 에이전트 리사이클** — 사이드바의 에이전트 행 우클릭 메뉴에 "Recycle Agent" / "Recycle Agent (Force)"가 추가됐다. 기존엔 에이전트 터미널 화면 우클릭에만 있어 찾기 어려웠다.
+
+### Fixed
+- **Homebrew 자동 업데이트가 한 번에 최신 버전으로** — 여러 버전이 밀려 있을 때(예: 0.135 → 0.137) 중간 버전(0.136)을 거쳐 여러 번 업데이트해야 하던 문제. 이제 업데이트 전에 tap을 갱신해 단일 업데이트로 곧장 최신 버전까지 올라간다. 메뉴바 펄(pill)에 표시되는 "최신 버전"도 stale한 중간 버전 대신 실제 최신 버전을 반영한다.
+- **`tm-agent watch status`가 활성 watch를 표시** — watch를 켜도 `tm-agent watch status`가 항상 "No watches configured"로 표시되던 문제. CLI가 JSON-RPC 응답 envelope를 잘못 파싱한 것으로, daemon과 실제 watch 동작은 정상이었다. 이제 활성 watch 상태를 올바로 보여준다.
+
+### Thanks to 1 contributor!
+
+- [@JINWOO-J](https://github.com/JINWOO-J)
+
 ## [0.136.0] - 2026-06-01
 
 ### Added
