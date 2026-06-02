@@ -10,7 +10,9 @@ Run the setup script to initialize submodules, install Metal Toolchain, and buil
 
 This handles: submodule init, Metal Toolchain download, xcframework-* tag cleanup, GhosttyKit build (cached per ghostty SHA), and symlink creation.
 
-Activate project git hooks once per clone (strips code-block markers from commit messages):
+`setup.sh` activates the project git hooks automatically (the `commit-msg` hook
+strips fenced code-block markers that agents tend to wrap commit messages in).
+If you skip `setup.sh`, activate them manually once per clone:
 
 ```bash
 git config core.hooksPath .githooks

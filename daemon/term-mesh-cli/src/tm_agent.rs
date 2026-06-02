@@ -993,6 +993,16 @@ enum WatchAction {
         /// Team id (optional — omit for all teams)
         team: Option<String>,
     },
+    /// Force one drift check immediately, bypassing the cadence timer.
+    ///
+    /// Self-test surface for `/watch test`: lets the leader confirm the watch
+    /// pipeline actually fires (watcher spawn → verdict → board append) without
+    /// waiting a full `--every` interval. Rejected when the watch is disabled or
+    /// a check is already in flight.
+    Trigger {
+        /// Team id to fire a check for (required by watch.trigger_now)
+        team: String,
+    },
 }
 
 // ── Task template system ─────────────────────────────────────────────
@@ -8236,6 +8246,38 @@ fn run_watch_command(sock: &PathBuf, action: &WatchAction) {
                 }
             }
         }
+        WatchAction::Trigger { team } => {
+            match rpc_call(sock, "watch.trigger_now", json!({ "team_id": team })) {
+                Ok(resp) => print_watch_trigger(&resp),
+                Err(e) => {
+                    eprintln!("Error: {e}");
+                    process::exit(1);
+                }
+            }
+        }
+    }
+}
+
+/// Render `watch.trigger_now` as a compact one-line summary. The daemon fires the
+/// check in the background (tokio::spawn), so this confirms the fire was accepted;
+/// the verdict itself lands in `.xm/watch/board.jsonl` and the next `watch status`
+/// `last_error`/`check_count`. `/watch test` polls status after this to surface it.
+fn print_watch_trigger(resp: &Value) {
+    let resp = resp.get("result").unwrap_or(resp);
+    let triggered = resp
+        .get("triggered")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    if triggered {
+        let team = resp.get("team_id").and_then(|v| v.as_str()).unwrap_or("?");
+        let count = resp.get("check_count").and_then(|v| v.as_u64()).unwrap_or(0);
+        println!("TRIGGERED: true  TEAM: {team}  CHECK_COUNT: {count}");
+    } else {
+        let reason = resp
+            .get("reason")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown");
+        println!("TRIGGERED: false  REASON: {reason}");
     }
 }
 

@@ -23,18 +23,19 @@ Usage:
   /watch on     [agent] --spec <text|@path|preset:<name>> [--every 300]
   /watch off    [agent|all]
   /watch status [agent]
+  /watch test   [agent]          force one check now; report verdict
 
 Responsibility:
   /tm           fan-out dispatch
   /tm-op pair   one-shot pair round
-  /watch        oversight review/on/off/status only
+  /watch        oversight review/on/off/status/test only
 ```
 
 For every other invocation (empty input, unrecognized token, or a recognized subcommand missing required inputs), run the **full interactive wizard**. Only `/watch help` prints documentation; everything else acts.
 
 **Wizard steps** — ask the user directly and wait for their reply, one step at a time. Skip any step already satisfied by command-line args:
 
-1. **Action**: if no subcommand was given, ask which action — `review`, `on`, `off`, `status`.
+1. **Action**: if no subcommand was given, ask which action — `review`, `on`, `off`, `status`, `test`.
 2. **Target agent**: ask which agent — list each worker (except leader and watcher) plus an "all workers" option. For `off`/`status`, "all" is allowed.
 3. **Spec** (review/on only): ask what to watch; accept inline text or an `@path`. Required, no default.
 4. **Stance** (review/on only): ask the lens — `critic` (default), `advisor`, `pair`.
@@ -53,6 +54,7 @@ Parse the first token of `$ARGUMENTS`:
 - `on` — enable daemon autonomous watch via `tm-agent watch on`
 - `off` — disable daemon autonomous watch via `tm-agent watch off`
 - `status` — show daemon watch config and summarize `.xm/watch/board.jsonl`
+- `test` — force one check now via `tm-agent watch trigger`, then report the verdict
 - empty input or unrecognized token — start the full interactive wizard
 
 A recognized subcommand still enters the wizard for any required input it is missing, unless `--no-input` is set.
@@ -210,10 +212,36 @@ RECENT:
 
 If the board is missing, report drift count `0`. If duplicate `check_id` rows exist, count them once and show the newest row for each key.
 
+### `test [agent]`
+
+Self-test: force one check now instead of waiting a full `--every` interval, then report the verdict. Requires `watch on` to be enabled. Does not create a team, add a watcher, or change composition; it does advance `check_count`/`last_check_ts`, so it is not read-only. The optional `[agent]` is informational — `trigger` fires for the team's configured target, not a per-agent override.
+
+First check for an active team with `tm-agent status`. If no team exists, print `WATCH: n/a (no active team — run /watch on or /team-up to create one)` and exit. Otherwise resolve `team_name` from `tm-agent status` and:
+
+```bash
+tm-agent watch trigger <team_name>
+```
+
+- `TRIGGERED: false` → report `REASON` verbatim and stop (`watch is not enabled` → run `/watch on` first; `a check is already in progress` → wait and retry; `no workers configured` → set a target via `/watch on`).
+- `TRIGGERED: true` → the daemon fires in the background. Poll `tm-agent watch status <team_name>` every ~2 s (bounded by `reply_timeout`, default 120 s) until `running`/`in_flight` is `false` and `check_count` reaches the value `trigger` returned, then read the freshest row from `.xm/watch/board.jsonl` (no new row = OK verdict, no drift).
+
+```text
+WATCH TEST: <team_name>
+TRIGGERED: true
+CHECK_COUNT: <n>
+SETTLED: true|false (timeout)
+LAST_ERROR: <message|n/a>
+VERDICT: OK|DRIFT|unknown
+RECENT:
+  <check_id> <ts> <agent> <drift_type> <severity> <finding>   # only when DRIFT
+```
+
+`LAST_ERROR: n/a` + `SETTLED: true` means the pipeline works end to end and the autonomous interval can be trusted. A `LAST_ERROR` means the tick fired but the watcher run failed (CLI path, spec resolve, timeout) — fix before relying on autonomous ticks. `SETTLED: false` means the check did not finish within the poll window. `/watch test` only reads and summarizes; the daemon `WatchController` still owns leader-inbox reporting and the board append for the forced tick.
+
 ## Guardrails
 
 - Use `tm-agent` only. Do not use Codex sub-agents for term-mesh team work.
-- `/watch review` and `/watch on` auto-create team + watcher on first use (one-time bootstrap). Never remove existing agents, never reassign watcher CLI/model behind the user's back. `/watch off` and `/watch status` never mutate composition.
+- `/watch review` and `/watch on` auto-create team + watcher on first use (one-time bootstrap). Never remove existing agents, never reassign watcher CLI/model behind the user's back. `/watch off`, `/watch status`, and `/watch test` never mutate team composition (`test` forces a tick and advances watch counters, but adds/removes no panes).
 - Never send watcher findings with `tm-agent msg send --to <agent>`; send to the leader only with `tm-agent msg send "<finding>"`.
 - Do not store drift history only under `~/.term-mesh/results`; those files are pruned. Use `.xm/watch/board.jsonl`.
 - Keep watcher context fresh every check: hard restart or true one-shot, with input limited to spec + recent delta.
