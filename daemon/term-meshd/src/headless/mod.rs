@@ -872,6 +872,7 @@ impl HeadlessManager {
         }
 
         let bytes = agent.protocol.encode_message(text);
+        let close_stdin = agent.protocol.closes_stdin_after_message();
         let stdin = agent
             .stdin
             .as_mut()
@@ -885,6 +886,13 @@ impl HeadlessManager {
             .await
             .map_err(|e| format!("flush stdin failed: {e}"))?;
 
+        // codex exec - reads the whole prompt then blocks on stdin EOF before it
+        // starts; drop stdin so the child sees end-of-input. claude keeps stdin
+        // open for multi-turn stream-json, so close_stdin is false there.
+        if close_stdin {
+            agent.stdin = None;
+        }
+
         // Reset idle tracker on outbound activity (§5.2).
         agent
             .last_activity_ms
@@ -892,6 +900,13 @@ impl HeadlessManager {
 
         tracing::debug!("sent {} bytes to {agent_id}", bytes.len());
         Ok(())
+    }
+
+    /// Whether `team_name` is a daemon-managed headless team. False means the
+    /// team's panes live in the Swift app (a GUI team) — §4's watch routing uses
+    /// this to pick the pane-recycle path over a headless one-shot spawn.
+    pub fn has_team(&self, team_name: &str) -> bool {
+        self.teams.contains_key(team_name)
     }
 
     pub async fn read_output(&mut self, agent_id: &str, lines: usize) -> Result<Vec<String>, String> {

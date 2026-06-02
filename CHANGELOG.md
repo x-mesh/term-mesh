@@ -4,6 +4,22 @@ All notable changes to term-mesh are documented here.
 
 ## [Unreleased]
 
+## [0.141.0] - 2026-06-02
+
+### Added
+- **`/watch test` — watch 파이프라인 즉시 검증** — `/watch on` 후 첫 자율 점검(최대 interval, 기본 300s)을 기다리지 않고 한 번의 drift 점검을 즉시 강제 실행해 watcher가 실제로 동작하는지(spawn → verdict → 기록) 확인한다.
+- **GUI watcher pane 실행 모델** — GUI 팀에서 자율 watch가 숨은 headless one-shot 대신 떠 있는 watcher pane(claude/codex)을 recycle하고 review를 보내 verdict를 받는다. watcher의 추론 과정이 pane에 그대로 보여 신뢰·교정이 쉬워졌다. 순수 headless 팀은 종전 one-shot을 유지한다.
+
+### Fixed
+- **codex 등 사용자 설치 CLI가 watcher로 정상 실행** — GUI 앱이 띄운 daemon이 launchd 최소 PATH를 상속해 `~/.local/bin/codex` 같은 사용자 설치 CLI를 못 찾아 watcher spawn이 매번 실패하던 문제. daemon이 표준 사용자 bin 경로(`~/.local/bin`, `~/.cargo/bin`, Homebrew 등)를 복구하도록 수정.
+- **`watch status`가 실패한 점검을 드러냄** — watcher가 매 tick 실패하는데도 status가 정상으로 보이던 문제. 성공 시각(`last_ok`)과 시도 시각을 분리하고 `health`/`error`를 노출해, 계속 실패하는 watch가 즉시 드러난다.
+- **codex watcher verdict 회수** — codex headless watcher가 spawn은 되지만 출력을 못 읽어 매번 timeout하던 문제. codex 프로토콜 어댑터를 추가해 verdict를 정상 회수한다.
+- **워크스페이스-로컬 팀(`ws-…`)의 에이전트 명령** — `attach`로 만든 `ws-…` 팀에서 `read`/`collect`/`inbox`/`send`가 기본 팀(`live-team`)으로 잘못 해석되던 문제. team 해석에 `--team` 옵션과 workspace fallback을 추가해 해결.
+
+### Thanks to 1 contributor!
+
+- [@JINWOO-J](https://github.com/JINWOO-J)
+
 ## [0.140.0] - 2026-06-02
 
 유지보수 릴리즈 — 사용자 영향 변경 없음. leader-as-watch-target watch fallback의 daemon e2e 회귀 테스트를 추가했다(내부 변경).

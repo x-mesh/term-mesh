@@ -182,6 +182,15 @@ const _BUILD_DATE: &str = env!("TM_BUILD_DATE");
     version
 )]
 struct Cli {
+    /// Override the target team for this command. Without it the team is resolved
+    /// from $TERMMESH_TEAM, then a $TERMMESH_WORKSPACE_ID-derived `ws-<hex>` name,
+    /// then `live-team`. Pass `--team ws-<hex>` from an adopted leader pane that
+    /// never had TERMMESH_TEAM injected (e.g. a workspace-local `ws-…` team) so
+    /// read/collect/inbox/send reach the right team instead of leaking to
+    /// `live-team`. Global: accepted on any subcommand.
+    #[arg(long, global = true)]
+    team: Option<String>,
+
     #[command(subcommand)]
     command: Commands,
 }
@@ -973,6 +982,11 @@ enum WatchAction {
         /// Working dir whose .xm/watch/config.json persists this (default: cwd)
         #[arg(long)]
         working_dir: Option<String>,
+        /// App (Swift) socket the daemon uses to drive a GUI watcher pane (§4).
+        /// Auto-resolved from TERMMESH_SOCKET / detection when omitted; pass it
+        /// explicitly from an adopted leader pane that lacks TERMMESH_SOCKET.
+        #[arg(long)]
+        app_socket: Option<String>,
     },
     /// Disable autonomous drift-watch for a team (config persisted, disabled)
     Off {
@@ -983,6 +997,16 @@ enum WatchAction {
     Status {
         /// Team id (optional — omit for all teams)
         team: Option<String>,
+    },
+    /// Force one drift check immediately, bypassing the cadence timer.
+    ///
+    /// Self-test surface for `/watch test`: lets the leader confirm the watch
+    /// pipeline actually fires (watcher spawn → verdict → board append) without
+    /// waiting a full `--every` interval. Rejected when the watch is disabled or
+    /// a check is already in flight.
+    Trigger {
+        /// Team id to fire a check for (required by watch.trigger_now)
+        team: String,
     },
 }
 
@@ -2231,6 +2255,24 @@ fn run_runbook_command(command: &RunbookCommands) -> Result<Value, String> {
 mod runbook_tests {
     use super::*;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn resolve_team_name_explicit_flag_wins() {
+        // The explicit --team flag returns verbatim and never consults env, so a
+        // command run from an adopted leader pane (no TERMMESH_TEAM) can still
+        // target a workspace-local `ws-…` team. Env-free → parallel-safe.
+        assert_eq!(resolve_team_name(Some("ws-deadbeef")), "ws-deadbeef");
+        assert_eq!(resolve_team_name(Some("standard")), "standard");
+    }
+
+    #[test]
+    fn resolve_team_name_empty_flag_falls_through() {
+        // An empty --team must not be taken as the team; it falls through to the
+        // env/default chain. With no overriding env the floor is some non-empty
+        // name (env TERMMESH_TEAM, a ws-derived name, or the live-team default) —
+        // never the empty string.
+        assert!(!resolve_team_name(Some("")).is_empty());
+    }
 
     #[test]
     fn runbook_parse_tools_accepts_all_and_aliases() {
@@ -4004,7 +4046,7 @@ fn main() {
         }
     };
 
-    let team = env::var("TERMMESH_TEAM").unwrap_or_else(|_| "live-team".into());
+    let team = resolve_team_name(cli.team.as_deref());
     let agent = env::var("TERMMESH_AGENT_NAME").unwrap_or_else(|_| "anonymous".into());
 
     let result = match cli.command {
@@ -6298,10 +6340,8 @@ fn apply_auto_watch(team_name: &str, working_dir: &std::path::Path, decision: Au
                 "spec": "@.xm/watch/default-spec.md",
                 "working_directory": wd_str,
             });
-            if let Ok(ts) = env::var("TERMMESH_SOCKET") {
-                if !ts.is_empty() && is_app_socket_path(std::path::Path::new(&ts)) {
-                    params["app_socket_path"] = json!(ts);
-                }
+            if let Some(app_sock) = resolve_app_socket(None) {
+                params["app_socket_path"] = json!(app_sock);
             }
             let watch_sock = match detect_watch_socket() {
                 Some(s) => s,
@@ -6514,6 +6554,32 @@ fn validate_agent_name(name: &str) -> Result<(), String> {
 ///
 /// Returns `Err` if neither is available.
 #[allow(dead_code)] // used by run_attach/run_detach (t8/t9)
+/// Resolve the team name for agent-side RPCs (report/send/delegate/read/collect/
+/// inbox/task.*). Every agent-side command shares this so a missing TERMMESH_TEAM
+/// can no longer silently leak the whole command set to `live-team`. Priority:
+/// 1. explicit `--team` flag — works from any context, including an adopted leader
+///    pane that never had TERMMESH_TEAM injected,
+/// 2. `$TERMMESH_TEAM` — set on GUI-spawned agent panes,
+/// 3. `$TERMMESH_WORKSPACE_ID` → `ws-<hex>` — same derivation attach/detach use
+///    via [`resolve_workspace_team_name`], so workspace-local teams resolve
+///    symmetrically across all commands,
+/// 4. `live-team` — create-based / legacy default.
+fn resolve_team_name(explicit: Option<&str>) -> String {
+    if let Some(t) = explicit {
+        if !t.is_empty() {
+            return t.to_string();
+        }
+    }
+    if let Ok(t) = env::var("TERMMESH_TEAM") {
+        if !t.is_empty() {
+            return t;
+        }
+    }
+    // resolve_workspace_team_name re-checks TERMMESH_TEAM (already handled above)
+    // then derives ws-<hex> from TERMMESH_WORKSPACE_ID; any error → default.
+    resolve_workspace_team_name().unwrap_or_else(|_| "live-team".to_string())
+}
+
 fn resolve_workspace_team_name() -> Result<String, String> {
     if let Ok(explicit) = env::var("TERMMESH_TEAM") {
         if !explicit.is_empty() {
@@ -6869,6 +6935,31 @@ fn is_app_socket_path(path: &Path) -> bool {
     }
 }
 
+/// Resolve the app (Swift) socket for watch's GUI execution path (§4 pane
+/// recycle). The daemon needs it to drive recycle/send/read on a GUI watcher
+/// pane; without it the GUI path can't run and watch falls back to the headless
+/// one-shot. Priority: an explicit value, then an app `TERMMESH_SOCKET`, then an
+/// auto-detected *app* socket (a detected daemon socket is rejected — the
+/// `watch on` caller's leader pane may lack TERMMESH_SOCKET, so detection covers
+/// it). Returns None for pure-headless callers, which keeps the headless path.
+fn resolve_app_socket(explicit: Option<&str>) -> Option<String> {
+    if let Some(e) = explicit {
+        let p = PathBuf::from(e);
+        if !e.is_empty() && is_app_socket_path(&p) && is_socket_alive(&p) {
+            return Some(e.to_string());
+        }
+    }
+    if let Ok(ts) = env::var("TERMMESH_SOCKET") {
+        let p = PathBuf::from(&ts);
+        if !ts.is_empty() && is_app_socket_path(&p) && is_socket_alive(&p) {
+            return Some(ts);
+        }
+    }
+    detect_socket()
+        .filter(|p| is_app_socket_path(p))
+        .map(|p| p.to_string_lossy().into_owned())
+}
+
 /// Derive this app instance's term-meshd socket from its *app* socket path (P15).
 ///
 /// Mirrors `scripts/reload.sh`: a tagged app socket `/tmp/term-mesh-debug-<tag>.sock`
@@ -7029,7 +7120,7 @@ fn cmd_doctor(verbose: bool, json_output: bool) {
     let app_socket = detect_socket();
     let daemon_socket = detect_daemon_socket();
     let sockets = discover_term_mesh_sockets();
-    let team = env::var("TERMMESH_TEAM").unwrap_or_else(|_| "live-team".into());
+    let team = resolve_team_name(None);
     let agent = env::var("TERMMESH_AGENT_NAME").unwrap_or_else(|_| "anonymous".into());
 
     let app_status = app_socket
@@ -8120,6 +8211,7 @@ fn run_watch_command(sock: &PathBuf, action: &WatchAction) {
             spec,
             ratio,
             working_dir,
+            app_socket,
         } => {
             // The daemon persists config keyed by working_directory; default to cwd.
             let wd = working_dir.clone().unwrap_or_else(|| {
@@ -8148,17 +8240,17 @@ fn run_watch_command(sock: &PathBuf, action: &WatchAction) {
             if let Some(r) = ratio {
                 params["exec_to_dir_ratio"] = json!(r);
             }
-            // P14: forward the caller's app socket (TERMMESH_SOCKET) so the daemon
-            // stores it on the WatchState. A GUI team's watched pane lives in the
-            // Swift app (not the daemon's headless manager), so the spawned watcher
-            // needs TERMMESH_SOCKET = app socket to self-collect the target delta
-            // (`tm-agent read <target>`) and the WatchController needs it to post to
-            // the leader inbox (`team.message.post`). Headless callers (daemon
-            // socket) leave it unset → daemon-side pre-fetch (P13) covers them.
-            if let Ok(ts) = env::var("TERMMESH_SOCKET") {
-                if !ts.is_empty() && is_app_socket_path(Path::new(&ts)) {
-                    params["app_socket_path"] = json!(ts);
-                }
+            // P14/§4: store the app socket on the WatchState. A GUI team's watched
+            // pane lives in the Swift app (not the daemon's headless manager), so
+            // the spawned watcher needs it to self-collect the target delta
+            // (`tm-agent read <target>`), the WatchController needs it to post to
+            // the leader inbox, and §4's GUI execution path needs it to drive
+            // recycle/send/read on the watcher pane. resolve_app_socket covers an
+            // adopted leader pane that lacks TERMMESH_SOCKET (explicit flag >
+            // TERMMESH_SOCKET > detection). Headless callers resolve to None →
+            // daemon-side pre-fetch (P13) / headless one-shot covers them.
+            if let Some(app_sock) = resolve_app_socket(app_socket.as_deref()) {
+                params["app_socket_path"] = json!(app_sock);
             }
             print_result(rpc_call(sock, "watch.on", params));
         }
@@ -8183,6 +8275,38 @@ fn run_watch_command(sock: &PathBuf, action: &WatchAction) {
                 }
             }
         }
+        WatchAction::Trigger { team } => {
+            match rpc_call(sock, "watch.trigger_now", json!({ "team_id": team })) {
+                Ok(resp) => print_watch_trigger(&resp),
+                Err(e) => {
+                    eprintln!("Error: {e}");
+                    process::exit(1);
+                }
+            }
+        }
+    }
+}
+
+/// Render `watch.trigger_now` as a compact one-line summary. The daemon fires the
+/// check in the background (tokio::spawn), so this confirms the fire was accepted;
+/// the verdict itself lands in `.xm/watch/board.jsonl` and the next `watch status`
+/// `last_error`/`check_count`. `/watch test` polls status after this to surface it.
+fn print_watch_trigger(resp: &Value) {
+    let resp = resp.get("result").unwrap_or(resp);
+    let triggered = resp
+        .get("triggered")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    if triggered {
+        let team = resp.get("team_id").and_then(|v| v.as_str()).unwrap_or("?");
+        let count = resp.get("check_count").and_then(|v| v.as_u64()).unwrap_or(0);
+        println!("TRIGGERED: true  TEAM: {team}  CHECK_COUNT: {count}");
+    } else {
+        let reason = resp
+            .get("reason")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown");
+        println!("TRIGGERED: false  REASON: {reason}");
     }
 }
 
@@ -8231,16 +8355,48 @@ fn print_watch_status(resp: &Value) {
         let cli = st.get("cli").and_then(Value::as_str).unwrap_or("?");
         let model = st.get("model").and_then(Value::as_str).unwrap_or("?");
         let drift = st.get("drift_count").and_then(Value::as_u64).unwrap_or(0);
+        // healthy defaults to true when the field is absent (older daemon) so a
+        // back-compat status never shows a spurious failure.
+        let healthy = st.get("healthy").and_then(Value::as_bool).unwrap_or(true);
+        let failures = st
+            .get("consecutive_failures")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        let last_error = st
+            .get("last_error")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty());
+
+        // health makes a 100%-failing watch obvious instead of hiding behind a
+        // progressing next_tick: ok when no failure streak, FAILING with the
+        // consecutive-failure count otherwise.
+        let health = if healthy {
+            "ok".to_string()
+        } else if failures > 0 {
+            format!("FAILING ({failures} consecutive)")
+        } else {
+            "FAILING".to_string()
+        };
 
         println!("watch: {team}");
         println!("  enabled:   {}", if enabled { "yes" } else { "no" });
         println!("  running:   {}", if running { "yes" } else { "no" });
+        println!("  health:    {health}");
         println!("  target:    {target}");
         println!("  interval:  {interval}s");
         println!("  stance:    {stance} ({cli}/{model})");
-        println!("  last_tick: {}", fmt_tick(st.get("last_tick"), now, false));
+        // last_ok is the last *successful* check; last_try is the last attempt
+        // (success or failure). They diverge precisely when the watch is failing.
+        println!("  last_ok:   {}", fmt_tick(st.get("last_tick"), now, false));
+        println!(
+            "  last_try:  {}",
+            fmt_tick(st.get("last_attempt"), now, false)
+        );
         println!("  next_tick: {}", fmt_tick(st.get("next_tick"), now, true));
         println!("  drifts:    {drift}");
+        if let Some(err) = last_error {
+            println!("  error:     {err}");
+        }
     }
 }
 

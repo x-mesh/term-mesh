@@ -13,6 +13,17 @@ if [ -z "$SOCKET" ] || [ -z "$TEAM" ]; then
 fi
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+
+# 2nd-line defense against fenced code-block markers leaking into commit messages.
+# The leader (and the agents it directs) commit from this repo; LLM-authored
+# messages tend to be wrapped in ``` fences. The commit-msg hook strips them, but
+# core.hooksPath is a per-clone local setting that machines skipping setup.sh may
+# never have set. Activate it here (idempotent, best-effort) so the strip defense
+# is guaranteed whenever a leader pane launches — worktrees share the same hook.
+if [ -d "$REPO_ROOT/.githooks/commit-msg" ] || [ -f "$REPO_ROOT/.githooks/commit-msg" ]; then
+    git -C "$REPO_ROOT" config core.hooksPath .githooks 2>/dev/null || true
+fi
 
 # Detect claude binary
 CLAUDE=""
@@ -239,6 +250,7 @@ tm-agent task done <id> '<result summary>'
 - After sending tasks, wait briefly (10-30s), then use \`read\`, \`collect\`, \`wait\`, or \`inbox\` to get results
 - Prefer parallel work: send independent tasks to multiple agents simultaneously
 - When worktree isolation is active, instruct agents to commit + push + create PR when done
+- Commit policy: when you or an agent writes a commit message, NEVER wrap it in \`\`\` fenced code-block markers. The .githooks/commit-msg hook strips them as a backstop, but messages must read cleanly without relying on it.
 
 ## Parallel Delegation Pattern (round-robin routing active)
 

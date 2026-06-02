@@ -15,7 +15,10 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::net::UnixStream;
 use tokio::sync::Mutex;
+use tokio::time::timeout;
 
 use super::{merge_instructions, HeadlessManager, SpawnParams};
 
@@ -283,6 +286,20 @@ impl HeadlessOneShotRunner {
             }
         }
 
+        // §4: route a GUI-pane team (its panes live in the Swift app, not this
+        // daemon's headless manager) with a live app socket to the pane-recycle
+        // path. Pure-headless teams — and GUI teams without an app socket — keep
+        // the one-shot spawn below.
+        let is_headless_team = self.manager.lock().await.has_team(&input.team_name);
+        if should_use_gui_pane_path(is_headless_team, input.app_socket_path.as_deref()) {
+            let app_socket = input.app_socket_path.clone().unwrap_or_default();
+            tracing::debug!(
+                "watch: team {} → §4 GUI pane-recycle path (watcher pane over app socket)",
+                input.team_name
+            );
+            return self.run_check_gui_pane(input, &app_socket).await;
+        }
+
         // Unique per-tick name → a fresh subprocess every check (no context reuse).
         let agent_name = format!("watcher-{}", super::meta::new_uuid());
         let instructions = compose_watcher_instructions(&input.spec);
@@ -387,6 +404,134 @@ impl HeadlessOneShotRunner {
             error,
         }
     }
+
+    /// §4 GUI pane-recycle path: recycle the live watcher pane (drop context),
+    /// send it the review prompt, press Return, then poll the pane's terminal for
+    /// the sentinel-wrapped verdict. Unlike the headless one-shot it never spawns
+    /// or terminates a subprocess — the watcher is a persistent Swift-app pane
+    /// reused across checks, so `recycle` is the stateless guarantee here.
+    async fn run_check_gui_pane(
+        &self,
+        input: WatchCheckInput,
+        app_socket: &str,
+    ) -> WatchCheckOutcome {
+        const WATCHER: &str = "watcher";
+        let make = |spawned: bool,
+                    reported: bool,
+                    exit_status: WatchExitStatus,
+                    verdict_text: String,
+                    error: Option<String>|
+         -> WatchCheckOutcome {
+            WatchCheckOutcome {
+                team_id: input.team_name.clone(),
+                check_id: input.check_id.clone(),
+                drift_kind: input.check_kind,
+                target: input.target.clone(),
+                spawned,
+                reported,
+                terminated: false, // the GUI watcher pane stays live across checks
+                exit_status,
+                panel_id: Some(format!("{}:{}", input.team_name, WATCHER)),
+                verdict_text,
+                error,
+            }
+        };
+
+        // 1. Recycle (hard restart) → drop accumulated context = stateless check.
+        if let Err(e) = app_recycle_pane(app_socket, &input.team_name, WATCHER).await {
+            let msg = format!("recycle failed: {e}");
+            return make(false, false, WatchExitStatus::SpawnFailed, msg.clone(), Some(msg));
+        }
+        // 2. Wait for the respawned CLI to finish cold-starting, then add an
+        //    input-ready buffer: live testing showed the prompt is dropped when it
+        //    lands while the CLI's input box is still initializing (output had
+        //    settled but the TUI was not yet accepting input).
+        wait_pane_ready(
+            app_socket,
+            &input.team_name,
+            WATCHER,
+            Duration::from_millis(GUI_RECYCLE_READY_CAP_MS),
+        )
+        .await;
+        tokio::time::sleep(Duration::from_millis(GUI_INPUT_READY_BUFFER_MS)).await;
+        // 3-5. Send a plain review prompt and poll the watcher's reply file. The
+        //      GUI watcher is a real claude/codex CLI running its own runbook — it
+        //      answers via `tm-agent reply`, which always writes the full reply to
+        //      ~/.term-mesh/results/<team>/<watcher>-reply.md (the leader-inbox
+        //      message is only a truncated summary), so no sentinel directive.
+        //      The recycled CLI's input box may not be ready when the first prompt
+        //      lands (cold-starting Claude Code / codex drops it), so re-send every
+        //      GUI_RESEND_INTERVAL until the watcher replies (reply file rewritten
+        //      after `since`) or the budget elapses. Re-sending a busy watcher is
+        //      harmless — the file holds its latest reply.
+        let since = std::time::SystemTime::now();
+        // build_review_message tells the watcher to "output a single structured
+        // verdict (and nothing else)", which makes a GUI claude/codex print the
+        // verdict to its terminal but NOT run `tm-agent reply` — so no reply file
+        // is written and §4 can't recover it. Override that for the GUI path: the
+        // verdict is only delivered by RUNNING `tm-agent reply` (its result file is
+        // what we poll). Printing alone does nothing here.
+        let message = format!(
+            "{}\n\nDELIVERY (overrides any \"nothing else\" instruction above): you \
+             MUST submit the verdict by RUNNING the shell command `tm-agent reply` \
+             with a STATUS/FILES/VERIFY/NEXT/FULL_REPORT header followed by your \
+             [VERDICT]/[FINDING]/[SPEC_CLAUSE] lines in the body. Running that \
+             command is how the verdict is delivered — printing it to the terminal \
+             alone does nothing.",
+            build_review_message(&input)
+        );
+        let reply_path = watcher_reply_path(&input.team_name, WATCHER);
+        let deadline = Instant::now() + input.reply_timeout;
+        let mut last_send: Option<Instant> = None;
+        let mut last_send_err: Option<String> = None;
+        loop {
+            let resend_due = last_send
+                .map(|t| t.elapsed() >= GUI_RESEND_INTERVAL)
+                .unwrap_or(true);
+            if resend_due {
+                // Send errors are tolerated and retried: a transient team.send
+                // parse/RPC failure (pane mid-transition, app momentarily busy)
+                // must not kill the whole tick. Keep the last error for the
+                // timeout message.
+                if let Err(e) =
+                    app_send_pane(app_socket, &input.team_name, WATCHER, &message).await
+                {
+                    last_send_err = Some(format!("send: {e}"));
+                } else if let Err(e) =
+                    app_send_key_pane(app_socket, &input.team_name, WATCHER, "return").await
+                {
+                    last_send_err = Some(format!("send_key: {e}"));
+                } else {
+                    last_send_err = None;
+                }
+                last_send = Some(Instant::now());
+            }
+            // A fresh (mtime > since) non-empty reply settles this tick's verdict.
+            if let Some(ref p) = reply_path {
+                if let Ok(meta) = tokio::fs::metadata(p).await {
+                    if meta.modified().map(|m| m > since).unwrap_or(false) {
+                        if let Ok(content) = tokio::fs::read_to_string(p).await {
+                            if !content.trim().is_empty() {
+                                return make(true, true, WatchExitStatus::Replied, content, None);
+                            }
+                        }
+                    }
+                }
+            }
+            if Instant::now() >= deadline {
+                let msg = match &last_send_err {
+                    Some(e) => {
+                        format!("verdict timeout (watcher wrote no reply; last send error: {e})")
+                    }
+                    None => {
+                        "verdict timeout (watcher wrote no reply before reply_timeout)".to_string()
+                    }
+                };
+                return make(true, false, WatchExitStatus::Timeout, String::new(), Some(msg));
+            }
+            tokio::time::sleep(Duration::from_millis(400)).await;
+        }
+    }
 }
 
 impl WatchCheckRunner for HeadlessOneShotRunner {
@@ -435,6 +580,19 @@ pub(crate) fn extract_verdict_text(raw_lines: &[String]) -> String {
                     }
                 }
             }
+            // codex: the assistant's reply arrives as a completed `agent_message`
+            // item. codex has no claude-style `result`, so this feeds the
+            // assistant fallback below.
+            Some("item.completed") => {
+                if let Some(item) = v.get("item") {
+                    if item.get("type").and_then(|t| t.as_str()) == Some("agent_message") {
+                        if let Some(t) = item.get("text").and_then(|t| t.as_str()) {
+                            assistant.push_str(t);
+                            assistant.push('\n');
+                        }
+                    }
+                }
+            }
             _ => {}
         }
     }
@@ -449,16 +607,220 @@ pub(crate) fn extract_verdict_text(raw_lines: &[String]) -> String {
     raw_lines.join("\n")
 }
 
+/// §4 routing predicate: a watch tick uses the GUI pane-recycle path when the
+/// team is NOT a daemon-managed headless team (so its panes live in the Swift
+/// app) AND a live app socket is available to drive recycle/send/read on the
+/// pane. Otherwise the tick uses the headless one-shot spawn.
+fn should_use_gui_pane_path(is_headless_team: bool, app_socket_path: Option<&str>) -> bool {
+    !is_headless_team && app_socket_path.map(|s| !s.trim().is_empty()).unwrap_or(false)
+}
+
+// ── §4 P2b-1: daemon → Swift-app RPC client ─────────────────────────────────
+// The GUI watch path drives a watcher pane the daemon does not own, so it must
+// talk to the Swift app over the app socket. Same wire format as
+// query_gui_team_workers (newline-delimited JSON-RPC, single-line response).
+// P2b-2 wires these into the GUI execution path; until then they are unused.
+
+/// Send one JSON-RPC request to the Swift app over its unix socket and return the
+/// parsed response envelope.
+#[allow(dead_code)]
+async fn call_app_rpc(
+    app_socket: &str,
+    method: &str,
+    params: serde_json::Value,
+    timeout_secs: u64,
+) -> Result<serde_json::Value, String> {
+    let stream = UnixStream::connect(app_socket)
+        .await
+        .map_err(|e| format!("connect {app_socket}: {e}"))?;
+    let req = serde_json::json!({
+        "jsonrpc": "2.0", "id": 1, "method": method, "params": params,
+    });
+    let mut line = serde_json::to_string(&req).map_err(|e| format!("serialize: {e}"))?;
+    line.push('\n');
+    let (rd, mut wr) = stream.into_split();
+    wr.write_all(line.as_bytes())
+        .await
+        .map_err(|e| format!("write: {e}"))?;
+    wr.flush().await.map_err(|e| format!("flush: {e}"))?;
+    let mut resp = String::new();
+    let mut reader = BufReader::new(rd);
+    match timeout(Duration::from_secs(timeout_secs), reader.read_line(&mut resp)).await {
+        Ok(Ok(_)) => {}
+        Ok(Err(e)) => return Err(format!("read: {e}")),
+        Err(_) => return Err(format!("app rpc '{method}' timed out after {timeout_secs}s")),
+    }
+    if resp.trim().is_empty() {
+        return Err(format!("app rpc '{method}': empty response (app unreachable?)"));
+    }
+    serde_json::from_str(&resp).map_err(|e| format!("parse '{method}' response: {e}"))
+}
+
+/// Unwrap a Swift v2 RPC envelope: returns the `result` value, or an error when
+/// the app reported an `error` payload or `ok:false`.
+#[allow(dead_code)]
+fn app_rpc_result(v: &serde_json::Value) -> Result<&serde_json::Value, String> {
+    if let Some(err) = v.get("error") {
+        return Err(format!("{err}"));
+    }
+    if v.get("ok").and_then(|b| b.as_bool()) == Some(false) {
+        return Err(format!("rpc reported failure: {v}"));
+    }
+    Ok(v.get("result").unwrap_or(v))
+}
+
+/// §4 GUI path: hard-restart (recycle) a watcher pane to drop accumulated context
+/// before a fresh check — the stateless guarantee, applied to the live pane.
+#[allow(dead_code)]
+async fn app_recycle_pane(app_socket: &str, team: &str, agent: &str) -> Result<(), String> {
+    let v = call_app_rpc(
+        app_socket,
+        "team.restart",
+        serde_json::json!({"team_name": team, "agent_name": agent, "mode": "hard"}),
+        10,
+    )
+    .await?;
+    app_rpc_result(&v).map(|_| ())
+}
+
+/// §4 GUI path: send the review prompt text to the watcher pane.
+#[allow(dead_code)]
+async fn app_send_pane(app_socket: &str, team: &str, agent: &str, text: &str) -> Result<(), String> {
+    let v = call_app_rpc(
+        app_socket,
+        "team.send",
+        serde_json::json!({"team_name": team, "agent_name": agent, "text": text}),
+        10,
+    )
+    .await?;
+    app_rpc_result(&v).map(|_| ())
+}
+
+/// §4 GUI path: read the watcher pane's terminal text. Swift already base64-
+/// decodes it into `result.text`, so we return that string directly.
+#[allow(dead_code)]
+async fn app_read_pane(
+    app_socket: &str,
+    team: &str,
+    agent: &str,
+    lines: usize,
+) -> Result<String, String> {
+    let v = call_app_rpc(
+        app_socket,
+        "team.read",
+        serde_json::json!({"team_name": team, "agent_name": agent, "lines": lines}),
+        10,
+    )
+    .await?;
+    let result = app_rpc_result(&v)?;
+    Ok(result
+        .get("text")
+        .and_then(|t| t.as_str())
+        .unwrap_or("")
+        .to_string())
+}
+
+/// §4 GUI path: press a key (e.g. "return") on the watcher pane. team.send only
+/// injects text (withReturn=false), so the prompt is not executed until Return is
+/// pressed separately via team.send_key.
+async fn app_send_key_pane(
+    app_socket: &str,
+    team: &str,
+    agent: &str,
+    key: &str,
+) -> Result<(), String> {
+    let v = call_app_rpc(
+        app_socket,
+        "team.send_key",
+        serde_json::json!({"team_name": team, "agent_name": agent, "key": key}),
+        10,
+    )
+    .await?;
+    app_rpc_result(&v).map(|_| ())
+}
+
+/// How many trailing terminal lines to read each poll when sensing pane readiness.
+const GUI_READ_LINES: usize = 2000;
+/// Hard cap on waiting for the recycled watcher CLI to finish cold-starting
+/// before injecting the prompt (see `wait_pane_ready`). A fixed short sleep
+/// dropped the prompt in live testing — Claude Code / codex boots (load + MCP +
+/// plugins) take several seconds, longer than the old 1500ms settle.
+const GUI_RECYCLE_READY_CAP_MS: u64 = 12000;
+/// Extra pause after startup output settles, covering the window between "banner
+/// finished rendering" and "input box accepts paste". Live testing showed a
+/// prompt sent right at output-settle was still dropped.
+const GUI_INPUT_READY_BUFFER_MS: u64 = 2500;
+/// Re-send the review if the watcher hasn't replied within this interval — the
+/// recycled CLI may have dropped the first prompt while still cold-starting.
+const GUI_RESEND_INTERVAL: Duration = Duration::from_secs(30);
+
+/// §4 GUI path: after a recycle (hard restart), wait until the freshly respawned
+/// CLI in the watcher pane is ready for input. A fixed sleep is fragile — Claude
+/// Code / codex cold-start (load + MCP + plugins) takes several seconds, and a
+/// too-short wait drops the injected prompt (observed live: the pane showed the
+/// Claude banner but the review never landed). Poll the pane's terminal until its
+/// output stops growing (the startup banner finished rendering) or a hard cap
+/// elapses, then proceed.
+async fn wait_pane_ready(app_socket: &str, team: &str, agent: &str, max_wait: Duration) {
+    const POLL: Duration = Duration::from_millis(300);
+    const QUIET: Duration = Duration::from_millis(1200);
+    let deadline = Instant::now() + max_wait;
+    let mut last_len: usize = 0;
+    let mut last_change = Instant::now();
+    let mut saw_output = false;
+    loop {
+        let len = app_read_pane(app_socket, team, agent, GUI_READ_LINES)
+            .await
+            .map(|t| t.len())
+            .unwrap_or(0);
+        if len != last_len {
+            last_len = len;
+            last_change = Instant::now();
+            if len > 0 {
+                saw_output = true;
+            }
+        }
+        // Ready once the startup output has been quiet (stopped growing) — the
+        // CLI has finished booting and is at its prompt.
+        if saw_output && last_change.elapsed() >= QUIET {
+            return;
+        }
+        if Instant::now() >= deadline {
+            return; // hard cap: proceed anyway
+        }
+        tokio::time::sleep(POLL).await;
+    }
+}
+
+/// Path of the watcher's reply file. `tm-agent reply` ALWAYS writes the full,
+/// untruncated reply here as `<agent>-reply.md` — the canonical verdict source
+/// (the leader-inbox message is only a 1500-char summary). §4 recovers the
+/// verdict from this file.
+fn watcher_reply_path(team: &str, agent: &str) -> Option<std::path::PathBuf> {
+    dirs::home_dir().map(|h| {
+        h.join(".term-mesh")
+            .join("results")
+            .join(team)
+            .join(format!("{agent}-reply.md"))
+    })
+}
+
 /// True once the claude turn has settled — a terminal `result` event is present.
 fn has_result_event(raw_lines: &[String]) -> bool {
     raw_lines.iter().any(|line| {
         let line = line.trim();
-        line.starts_with('{')
-            && serde_json::from_str::<serde_json::Value>(line)
-                .ok()
-                .and_then(|v| v.get("type").and_then(|t| t.as_str()).map(str::to_string))
-                .as_deref()
-                == Some("result")
+        if !line.starts_with('{') {
+            return false;
+        }
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+            return false;
+        };
+        // claude stream-json emits a terminal `result`; codex emits
+        // `turn.completed` when the turn (and its agent_message) is done.
+        matches!(
+            v.get("type").and_then(|t| t.as_str()),
+            Some("result") | Some("turn.completed")
+        )
     })
 }
 
@@ -578,6 +940,69 @@ mod tests {
         assert!(text.contains("[VERDICT] drift(execution)"));
         assert!(text.contains("ignored a failing build"));
         assert!(has_result_event(&lines));
+    }
+
+    #[test]
+    fn extract_verdict_text_reads_codex_agent_message() {
+        // codex emits JSONL: agent_message item carries the reply, turn.completed
+        // is the terminal event. The claude-stream-json adapter could parse none
+        // of this, which is why codex watchers timed out with verdict_len=0.
+        let lines = vec![
+            r#"{"type":"thread.started","thread_id":"x"}"#.to_string(),
+            r#"{"type":"turn.started"}"#.to_string(),
+            r#"{"type":"item.completed","item":{"id":"item_0","type":"agent_message","text":"[VERDICT] OK\n[FINDING] none"}}"#.to_string(),
+            r#"{"type":"turn.completed","usage":{"output_tokens":6}}"#.to_string(),
+        ];
+        let text = extract_verdict_text(&lines);
+        assert!(text.contains("[VERDICT] OK"), "got: {text}");
+        assert!(text.contains("[FINDING] none"));
+        // turn.completed must count as a settle signal so wait_for_verdict returns
+        // Replied instead of waiting out the full timeout.
+        assert!(has_result_event(&lines));
+    }
+
+    #[test]
+    fn has_result_event_ignores_codex_intermediate_events() {
+        // Only the terminal turn.completed settles; earlier codex events must not.
+        let pre = vec![
+            r#"{"type":"thread.started"}"#.to_string(),
+            r#"{"type":"item.completed","item":{"type":"agent_message","text":"partial"}}"#.to_string(),
+        ];
+        assert!(!has_result_event(&pre));
+    }
+
+    #[test]
+    fn gui_pane_path_only_for_gui_team_with_app_socket() {
+        // GUI team (not in the headless manager) + live app socket → recycle path.
+        assert!(should_use_gui_pane_path(false, Some("/tmp/term-mesh.sock")));
+        // Headless team always takes the one-shot, even with an app socket.
+        assert!(!should_use_gui_pane_path(true, Some("/tmp/term-mesh.sock")));
+        // GUI team but no usable app socket → can't drive the pane → one-shot.
+        assert!(!should_use_gui_pane_path(false, None));
+        assert!(!should_use_gui_pane_path(false, Some("")));
+        assert!(!should_use_gui_pane_path(false, Some("   ")));
+    }
+
+    #[test]
+    fn app_rpc_result_unwraps_ok_and_rejects_errors() {
+        // Swift v2 success envelope → return the result object (team.read shape).
+        let ok = serde_json::json!({"id":1,"ok":true,"result":{"text":"verdict"}});
+        assert_eq!(app_rpc_result(&ok).unwrap()["text"], "verdict");
+        // error payload → Err
+        let err = serde_json::json!({"id":1,"error":{"code":"not_found","message":"x"}});
+        assert!(app_rpc_result(&err).is_err());
+        // explicit ok:false → Err
+        let nak = serde_json::json!({"id":1,"ok":false});
+        assert!(app_rpc_result(&nak).is_err());
+    }
+
+    #[test]
+    fn watcher_reply_path_under_results_dir() {
+        // §4 recovers the GUI verdict from the watcher's reply file at
+        // ~/.term-mesh/results/<team>/<agent>-reply.md (canonical, full content).
+        let p = watcher_reply_path("ws-abc123", "watcher").expect("home dir");
+        assert!(p.ends_with("watcher-reply.md"));
+        assert!(p.to_string_lossy().contains(".term-mesh/results/ws-abc123/"));
     }
 
     #[test]

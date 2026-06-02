@@ -12,7 +12,7 @@ Fresh watcher가 **spec + watched agent의 최근 delta**만 보고 execution/di
 | `/tm-op pair` | one-shot pair 라운드. 한 번만 반박/보조 관점을 붙인다. |
 | `/watch` | oversight 전용 review/on/off/status 토글. drift를 검출하고 leader에게 보고한다. |
 
-`/watch`는 fan-out dispatch를 수행하지 않는다. `/watch review`와 `/watch on`은 팀과 watcher가 없을 때 최초 1회 자동 생성한다(one-time bootstrap). 기존 에이전트를 제거하거나 watcher CLI/model을 임의로 변경하지 않는다. `/watch off`와 `/watch status`는 팀 구성을 절대 변경하지 않는다.
+`/watch`는 fan-out dispatch를 수행하지 않는다. `/watch review`와 `/watch on`은 팀과 watcher가 없을 때 최초 1회 자동 생성한다(one-time bootstrap). 기존 에이전트를 제거하거나 watcher CLI/model을 임의로 변경하지 않는다. `/watch off`, `/watch status`, `/watch test`는 팀 구성을 절대 변경하지 않는다. `/watch test`는 첫 틱을 기다리지 않고 한 번의 drift check를 즉시 강제 실행해 watch 파이프라인이 실제로 동작하는지 검증하는 self-test다(`watch on`이 켜져 있어야 함). 팀 구성은 그대로 두지만 watch 카운터(`check_count`/`last_check_ts`)는 갱신되므로 순수 read-only인 `status`와 구분된다.
 
 Writer ownership:
 
@@ -35,6 +35,7 @@ Parse the first token and route:
 - `on` -> [Subcommand: on]
 - `off` -> [Subcommand: off]
 - `status` -> [Subcommand: status]
+- `test` -> [Subcommand: test]
 - empty input -> start the full interactive wizard
 - unrecognized token -> start the full interactive wizard
 
@@ -53,18 +54,19 @@ Usage:
   /watch on     [agent] --spec <text|@path> [--every 300]
   /watch off    [agent|all]
   /watch status [agent]
+  /watch test   [agent]          force one check now; report verdict
 
 Responsibility:
   /tm           fan-out dispatch
   /tm-op pair   one-shot pair round
-  /watch        oversight review/on/off/status only
+  /watch        oversight review/on/off/status/test only
 ```
 
 For every other invocation (empty input, unrecognized token, or a subcommand missing required inputs), run the **full interactive wizard**. Only `/watch help` prints documentation; everything else acts.
 
 **Wizard steps** — use `AskUserQuestion`, one step at a time. Skip any step already satisfied by command-line args:
 
-1. **Action**: if no subcommand was given, ask which action — `review`, `on`, `off`, `status`.
+1. **Action**: if no subcommand was given, ask which action — `review`, `on`, `off`, `status`, `test`.
 2. **Target agent**: ask which agent — list each worker (except leader and watcher) plus an "all workers" option. For `off`/`status`, "all" is allowed.
 3. **Spec** (review/on only): ask what to watch; accept inline text or an `@path`. Required, no default.
 4. **Stance** (review/on only): ask the lens — `critic` (default), `advisor`, `pair`.
@@ -358,6 +360,65 @@ RECENT:
 
 If `.xm/watch/board.jsonl` is missing, print `DRIFT_COUNT_THIS_SESSION: 0`. If duplicate `check_id` rows exist, count them once and show the newest row for each key. `status` is read-only and must not start or stop timers.
 
+## Subcommand: test
+
+`/watch test [agent]`
+
+Force one drift check immediately, bypassing the cadence timer, then report the verdict. This is the self-test for "does the watch pipeline actually fire?" — it removes the need to wait a full `--every` interval (e.g. 300 s) after `/watch on` just to confirm the watcher spawns, returns a verdict, and the board records it.
+
+`test` requires `watch on` to already be enabled for the team. It does not create a team, add a watcher, change CLI/model, or alter team composition. It is **not** read-only: the daemon increments `check_count` and `last_check_ts` for the forced tick. The optional `[agent]` is informational only — `watch.trigger_now` fires for the whole team's configured target (single agent, all workers, or leader), not a per-agent override.
+
+### Flow
+
+First check for an active team with `tm-agent status`. If no team exists, print and exit:
+
+```text
+WATCH: n/a (no active team — run /watch on or /team-up to create one)
+```
+
+1. Resolve the team name from `tm-agent status` (the `team_name` field).
+2. Force one check:
+
+   ```bash
+   tm-agent watch trigger <team_name>
+   ```
+
+   - `TRIGGERED: false` → the daemon rejected the fire. Report the `REASON` verbatim and stop. Common reasons:
+     - `watch is not enabled for this team` → run `/watch on` first.
+     - `a check is already in progress for this team` → a tick is in flight; wait and retry.
+     - `no workers configured` → set a target via `/watch on [agent] --spec ...`.
+   - `TRIGGERED: true` → continue. Note the returned `CHECK_COUNT`.
+
+3. The daemon fires the check in the background, so poll `watch status` until the forced tick settles (it clears `in_flight`/`running` and writes `last_error`). Use a short bounded wait — re-run every ~2 s up to ~`reply_timeout` (default 120 s):
+
+   ```bash
+   tm-agent watch status <team_name>
+   ```
+
+   Stop polling when `running`/`in_flight` is `false` **and** `check_count` has advanced to the value returned by `trigger`.
+
+4. Read the freshest verdict for this tick from `.xm/watch/board.jsonl` (last appended row, or the row whose `check_id` matches this tick). A drift finding is one JSON row; no new row means the watcher returned an OK verdict (no drift).
+
+5. Print a compact self-test result:
+
+```text
+WATCH TEST: <team_name>
+TRIGGERED: true
+CHECK_COUNT: <n>
+SETTLED: true|false (timeout)
+LAST_ERROR: <message|n/a>
+VERDICT: OK|DRIFT|unknown
+RECENT:
+  <check_id> <ts> <agent> <drift_type> <severity> <finding>   # only when DRIFT
+```
+
+Interpretation for the leader:
+- `LAST_ERROR: n/a` + `SETTLED: true` → the watch pipeline works end to end (spawn → verdict → settle). The autonomous interval can be trusted.
+- `LAST_ERROR: <message>` → the pipeline fired but the watcher run failed (CLI path, spec resolve, timeout). Fix before relying on autonomous ticks.
+- `SETTLED: false` → the check did not finish within the poll window; report it and suggest re-running `/watch status` shortly.
+
+`/watch test` does not send watcher findings anywhere itself; the daemon `WatchController` owns leader-inbox reporting and the board append for the forced tick exactly as it does for scheduled ticks. `/watch test` only reads and summarizes.
+
 ## Anti-patterns
 
 1. **Do not depend on `~/.term-mesh/results/<team>/` for drift history.** Result files are pruned after 24h. Use `.xm/watch/board.jsonl`.
@@ -365,7 +426,7 @@ If `.xm/watch/board.jsonl` is missing, print `DRIFT_COUNT_THIS_SESSION: 0`. If d
 3. **Do not accumulate watcher context.** Every review must hard-restart or use a true one-shot watcher. Input is only spec + recent delta.
 4. **Do not use native team tools.** No `TeamCreate`, `SendMessage`, `TaskCreate`, `TaskList`, `TaskGet`, `TaskUpdate`, or `TeamDelete`.
 5. **Do not fan out from `/watch`.** `/watch` audits; `/tm` dispatches.
-6. **Auto-create on first use, never destroy.** `/watch review` and `/watch on` may create the team and add a watcher when missing (one-time bootstrap). Never remove existing agents, never reassign watcher CLI/model behind the user's back. `/watch off` and `/watch status` never mutate composition.
+6. **Auto-create on first use, never destroy.** `/watch review` and `/watch on` may create the team and add a watcher when missing (one-time bootstrap). Never remove existing agents, never reassign watcher CLI/model behind the user's back. `/watch off`, `/watch status`, and `/watch test` never mutate team composition (`test` forces a tick and advances watch counters, but adds/removes no panes).
 7. **Do not edit code from watcher.** watcher proposes course corrections; leader decides and assigns implementation.
 8. **Do not let watcher write side effects.** watcher returns a structured verdict only. Manual `/watch review` writes through the leader command; autonomous `/watch on` writes through daemon `WatchController`.
 9. **Do not auto-apply course corrections.** `/watch` is report-only in both manual and autonomous modes.
@@ -545,5 +606,5 @@ Reads `.xm/watch/board.jsonl` and summarizes this session's drift count.
 After editing this command file:
 
 ```bash
-rg -n "watch on|watch off|watch status|WatchController|next_tick|--every|daemon|autonomous" .claude/commands/watch.md .codex/prompts/watch.md
+rg -n "watch on|watch off|watch status|watch trigger|watch test|trigger_now|WatchController|next_tick|--every|daemon|autonomous" .claude/commands/watch.md .codex/prompts/watch.md
 ```
