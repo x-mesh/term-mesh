@@ -902,6 +902,13 @@ impl HeadlessManager {
         Ok(())
     }
 
+    /// Whether `team_name` is a daemon-managed headless team. False means the
+    /// team's panes live in the Swift app (a GUI team) — §4's watch routing uses
+    /// this to pick the pane-recycle path over a headless one-shot spawn.
+    pub fn has_team(&self, team_name: &str) -> bool {
+        self.teams.contains_key(team_name)
+    }
+
     pub async fn read_output(&mut self, agent_id: &str, lines: usize) -> Result<Vec<String>, String> {
         self.reap_exited_agents();
         let agent = self

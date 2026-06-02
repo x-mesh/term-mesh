@@ -283,6 +283,22 @@ impl HeadlessOneShotRunner {
             }
         }
 
+        // §4: route a GUI-pane team (its panes live in the Swift app, not this
+        // daemon's headless manager) with a live app socket to the pane-recycle
+        // path. Pure-headless teams — and GUI teams without an app socket — keep
+        // the one-shot spawn below.
+        let is_headless_team = self.manager.lock().await.has_team(&input.team_name);
+        if should_use_gui_pane_path(is_headless_team, input.app_socket_path.as_deref()) {
+            // P2b will run recycle + send + read on the live watcher pane here.
+            // Until it lands, fall through to the one-shot spawn (current, verified
+            // behavior) so this routing is a no-op and can be enabled in isolation.
+            tracing::debug!(
+                "watch: team {} is a GUI-pane team with an app socket — §4 \
+                 pane-recycle path eligible (P2b pending; using headless one-shot)",
+                input.team_name
+            );
+        }
+
         // Unique per-tick name → a fresh subprocess every check (no context reuse).
         let agent_name = format!("watcher-{}", super::meta::new_uuid());
         let instructions = compose_watcher_instructions(&input.spec);
@@ -462,6 +478,14 @@ pub(crate) fn extract_verdict_text(raw_lines: &[String]) -> String {
     raw_lines.join("\n")
 }
 
+/// §4 routing predicate: a watch tick uses the GUI pane-recycle path when the
+/// team is NOT a daemon-managed headless team (so its panes live in the Swift
+/// app) AND a live app socket is available to drive recycle/send/read on the
+/// pane. Otherwise the tick uses the headless one-shot spawn.
+fn should_use_gui_pane_path(is_headless_team: bool, app_socket_path: Option<&str>) -> bool {
+    !is_headless_team && app_socket_path.map(|s| !s.trim().is_empty()).unwrap_or(false)
+}
+
 /// True once the claude turn has settled — a terminal `result` event is present.
 fn has_result_event(raw_lines: &[String]) -> bool {
     raw_lines.iter().any(|line| {
@@ -626,6 +650,18 @@ mod tests {
             r#"{"type":"item.completed","item":{"type":"agent_message","text":"partial"}}"#.to_string(),
         ];
         assert!(!has_result_event(&pre));
+    }
+
+    #[test]
+    fn gui_pane_path_only_for_gui_team_with_app_socket() {
+        // GUI team (not in the headless manager) + live app socket → recycle path.
+        assert!(should_use_gui_pane_path(false, Some("/tmp/term-mesh.sock")));
+        // Headless team always takes the one-shot, even with an app socket.
+        assert!(!should_use_gui_pane_path(true, Some("/tmp/term-mesh.sock")));
+        // GUI team but no usable app socket → can't drive the pane → one-shot.
+        assert!(!should_use_gui_pane_path(false, None));
+        assert!(!should_use_gui_pane_path(false, Some("")));
+        assert!(!should_use_gui_pane_path(false, Some("   ")));
     }
 
     #[test]
