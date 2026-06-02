@@ -442,9 +442,10 @@ impl HeadlessOneShotRunner {
             let msg = format!("recycle failed: {e}");
             return make(false, false, WatchExitStatus::SpawnFailed, msg.clone(), Some(msg));
         }
-        // 2. Wait for the respawned CLI to finish cold-starting before injecting
-        //    the prompt. A fixed sleep dropped the prompt for slow CLI boots; poll
-        //    until the startup output settles (or a hard cap).
+        // 2. Wait for the respawned CLI to finish cold-starting, then add an
+        //    input-ready buffer: live testing showed the prompt is dropped when it
+        //    lands while the CLI's input box is still initializing (output had
+        //    settled but the TUI was not yet accepting input).
         wait_pane_ready(
             app_socket,
             &input.team_name,
@@ -452,36 +453,37 @@ impl HeadlessOneShotRunner {
             Duration::from_millis(GUI_RECYCLE_READY_CAP_MS),
         )
         .await;
-        // 3. Send the review prompt + sentinel directive (text only — Return is
-        //    a separate key, since team.send injects with withReturn=false).
-        let message = format!(
-            "{}\n\n{}",
-            build_review_message(&input),
-            gui_sentinel_directive()
-        );
+        tokio::time::sleep(Duration::from_millis(GUI_INPUT_READY_BUFFER_MS)).await;
+        // 3. Send a plain review prompt. The GUI watcher is a real claude/codex
+        //    CLI running its own runbook — it answers via `tm-agent reply`, which
+        //    always writes the full reply to
+        //    ~/.term-mesh/results/<team>/<watcher>-reply.md and posts a truncated
+        //    summary to the leader inbox. So no sentinel directive; we recover the
+        //    verdict from that canonical result file.
+        let since = std::time::SystemTime::now();
+        let message = build_review_message(&input);
         if let Err(e) = app_send_pane(app_socket, &input.team_name, WATCHER, &message).await {
             let msg = format!("send failed: {e}");
             return make(true, false, WatchExitStatus::SpawnFailed, msg.clone(), Some(msg));
         }
-        // 4. Press Return to execute the prompt.
+        // 4. Press Return to submit the prompt.
         if let Err(e) = app_send_key_pane(app_socket, &input.team_name, WATCHER, "return").await {
             let msg = format!("send_key failed: {e}");
             return make(true, false, WatchExitStatus::SpawnFailed, msg.clone(), Some(msg));
         }
-        // 5. Poll the pane's terminal text for the sentinel-wrapped verdict.
-        let (verdict, status, last_read_err) =
-            wait_for_verdict_gui(app_socket, &input.team_name, WATCHER, input.reply_timeout).await;
+        // 5. Poll the watcher's reply result file for this tick's verdict — it is
+        //    (re)written strictly after `since` when the watcher replies.
+        let (verdict, status) =
+            wait_for_reply_gui(&input.team_name, WATCHER, since, input.reply_timeout).await;
         match status {
             WatchExitStatus::Replied => make(true, true, status, verdict, None),
-            _ => {
-                let msg = match last_read_err {
-                    Some(e) => {
-                        format!("verdict timeout (no sentinel marker; last read error: {e})")
-                    }
-                    None => "verdict timeout (no sentinel marker before reply_timeout)".to_string(),
-                };
-                make(true, false, status, verdict, Some(msg))
-            }
+            _ => make(
+                true,
+                false,
+                status,
+                String::new(),
+                Some("verdict timeout (watcher wrote no reply before reply_timeout)".to_string()),
+            ),
         }
     }
 }
@@ -691,58 +693,18 @@ async fn app_send_key_pane(
     app_rpc_result(&v).map(|_| ())
 }
 
-// GUI watcher pane verdict markers. The watcher writes its verdict to a human
-// terminal where ANSI, the shell/CLI prompt, and the echoed prompt all interleave
-// in the scrollback, so it must delimit the verdict and we slice it back out.
-const GUI_VERDICT_START: &str = "<<<WATCH-VERDICT>>>";
-const GUI_VERDICT_END: &str = "<<<WATCH-VERDICT-END>>>";
-/// How many trailing terminal lines to read each poll when hunting the verdict.
+/// How many trailing terminal lines to read each poll when sensing pane readiness.
 const GUI_READ_LINES: usize = 2000;
 /// Hard cap on waiting for the recycled watcher CLI to finish cold-starting
 /// before injecting the prompt (see `wait_pane_ready`). A fixed short sleep
 /// dropped the prompt in live testing — Claude Code / codex boots (load + MCP +
 /// plugins) take several seconds, longer than the old 1500ms settle.
 const GUI_RECYCLE_READY_CAP_MS: u64 = 12000;
+/// Extra pause after startup output settles, covering the window between "banner
+/// finished rendering" and "input box accepts paste". Live testing showed a
+/// prompt sent right at output-settle was still dropped.
+const GUI_INPUT_READY_BUFFER_MS: u64 = 2500;
 
-/// Appended to the review message on the GUI path so the watcher delimits its
-/// verdict for terminal-scrollback extraction.
-fn gui_sentinel_directive() -> String {
-    format!(
-        "IMPORTANT OUTPUT FORMAT: print your entire final verdict between two \
-         marker lines, each alone on its own line — first `{GUI_VERDICT_START}`, \
-         then the verdict body, then `{GUI_VERDICT_END}`. Print nothing after the \
-         end marker."
-    )
-}
-
-/// Extract a GUI watcher's verdict from terminal text wrapped in the sentinel
-/// markers. Returns None when the end marker has not appeared yet (verdict still
-/// streaming or absent).
-///
-/// Markers are matched only when ALONE on their own line (after trim). The
-/// directive we inject names the markers inline inside prose/backticks
-/// ("...first `<<<WATCH-VERDICT>>>`, then..."), and that directive is echoed into
-/// the watcher pane's scrollback before the watcher answers. A naive substring
-/// `rfind`/`find` would extract that echo as a bogus verdict on the very first
-/// poll and settle early. Requiring standalone-line markers — exactly how the
-/// directive tells the watcher to print them — skips the inline echo. The LAST
-/// standalone start line wins so a real re-emitted block beats an earlier one.
-fn extract_sentinel_verdict(text: &str) -> Option<String> {
-    let lines: Vec<&str> = text.lines().collect();
-    let start = lines.iter().rposition(|l| l.trim() == GUI_VERDICT_START)?;
-    let end = (start + 1..lines.len()).find(|&i| lines[i].trim() == GUI_VERDICT_END)?;
-    let body = lines[start + 1..end].join("\n");
-    let body = body.trim();
-    if body.is_empty() {
-        None
-    } else {
-        Some(body.to_string())
-    }
-}
-
-/// §4 GUI path: poll the watcher pane's terminal text until the sentinel-wrapped
-/// verdict appears or the reply budget elapses. Read failures are tolerated
-/// (transient pane churn) and simply retried until the deadline.
 /// §4 GUI path: after a recycle (hard restart), wait until the freshly respawned
 /// CLI in the watcher pane is ready for input. A fixed sleep is fragile — Claude
 /// Code / codex cold-start (load + MCP + plugins) takes several seconds, and a
@@ -781,36 +743,47 @@ async fn wait_pane_ready(app_socket: &str, team: &str, agent: &str, max_wait: Du
     }
 }
 
-/// Returns `(verdict, status, last_read_error)`. `last_read_error` is the most
-/// recent app_read_pane failure when the loop times out — it distinguishes a
-/// persistent RPC failure (socket dead, wrong team/agent) from a watcher that
-/// simply never printed the sentinel.
-async fn wait_for_verdict_gui(
-    app_socket: &str,
+/// Path of the watcher's reply file. `tm-agent reply` ALWAYS writes the full,
+/// untruncated reply here as `<agent>-reply.md` — the canonical verdict source
+/// (the leader-inbox message is only a 1500-char summary). §4 recovers the
+/// verdict from this file.
+fn watcher_reply_path(team: &str, agent: &str) -> Option<std::path::PathBuf> {
+    dirs::home_dir().map(|h| {
+        h.join(".term-mesh")
+            .join("results")
+            .join(team)
+            .join(format!("{agent}-reply.md"))
+    })
+}
+
+/// §4 GUI path: poll the watcher's reply result file until it is (re)written
+/// after `since` (this tick's reply) or the reply budget elapses. The
+/// `mtime > since` check distinguishes this tick's reply from a stale one left by
+/// a prior check, so a recycled watcher's fresh `tm-agent reply` is what settles
+/// the verdict.
+async fn wait_for_reply_gui(
     team: &str,
     agent: &str,
+    since: std::time::SystemTime,
     timeout_budget: Duration,
-) -> (String, WatchExitStatus, Option<String>) {
-    const POLL: Duration = Duration::from_millis(200);
+) -> (String, WatchExitStatus) {
+    const POLL: Duration = Duration::from_millis(300);
+    let Some(path) = watcher_reply_path(team, agent) else {
+        return (String::new(), WatchExitStatus::Timeout);
+    };
     let deadline = Instant::now() + timeout_budget;
-    let mut last_read_err: Option<String> = None;
     loop {
-        match app_read_pane(app_socket, team, agent, GUI_READ_LINES).await {
-            Ok(text) => {
-                if let Some(v) = extract_sentinel_verdict(&text) {
-                    return (v, WatchExitStatus::Replied, None);
+        if let Ok(meta) = tokio::fs::metadata(&path).await {
+            if meta.modified().map(|m| m > since).unwrap_or(false) {
+                if let Ok(content) = tokio::fs::read_to_string(&path).await {
+                    if !content.trim().is_empty() {
+                        return (content, WatchExitStatus::Replied);
+                    }
                 }
-            }
-            Err(e) => {
-                // Transient pane churn is tolerated (retry), but remember the last
-                // error so a persistent read failure surfaces instead of a bare
-                // timeout.
-                tracing::debug!("watch gui: read {agent}@{team} failed (retrying): {e}");
-                last_read_err = Some(e);
             }
         }
         if Instant::now() >= deadline {
-            return (String::new(), WatchExitStatus::Timeout, last_read_err);
+            return (String::new(), WatchExitStatus::Timeout);
         }
         tokio::time::sleep(POLL).await;
     }
@@ -1008,49 +981,12 @@ mod tests {
     }
 
     #[test]
-    fn extract_sentinel_verdict_pulls_marked_block() {
-        let text = "$ shell prompt noise\nblah\n<<<WATCH-VERDICT>>>\n[VERDICT] OK\n[FINDING] none\n<<<WATCH-VERDICT-END>>>\n$ ";
-        assert_eq!(
-            extract_sentinel_verdict(text).unwrap(),
-            "[VERDICT] OK\n[FINDING] none"
-        );
-    }
-
-    #[test]
-    fn extract_sentinel_verdict_none_until_end_marker() {
-        // start marker present but verdict still streaming → None (keep polling)
-        assert!(extract_sentinel_verdict("<<<WATCH-VERDICT>>>\n[VERDICT] OK partial").is_none());
-        // no markers at all → None
-        assert!(extract_sentinel_verdict("just terminal noise").is_none());
-        // empty body between markers → None
-        assert!(extract_sentinel_verdict("<<<WATCH-VERDICT>>>\n\n<<<WATCH-VERDICT-END>>>").is_none());
-    }
-
-    #[test]
-    fn extract_sentinel_verdict_uses_last_start_marker() {
-        // The echoed directive mentions a start marker inline; the real verdict is
-        // a standalone-line marked block, which must win over the inline echo.
-        let text = "echoed: print between <<<WATCH-VERDICT>>> and the end marker\n\
-                    actual output:\n<<<WATCH-VERDICT>>>\nreal verdict\n<<<WATCH-VERDICT-END>>>";
-        assert_eq!(extract_sentinel_verdict(text).unwrap(), "real verdict");
-    }
-
-    #[test]
-    fn extract_sentinel_verdict_ignores_inline_echoed_directive() {
-        // P1 regression: the injected directive names both markers inline inside
-        // prose/backticks, and is echoed into the pane BEFORE the watcher answers.
-        // Inline markers on a non-standalone line must not be read as a verdict —
-        // otherwise the first poll settles on the echoed directive text.
-        let echoed = "IMPORTANT OUTPUT FORMAT: print between `<<<WATCH-VERDICT>>>`, \
-                      the body, then `<<<WATCH-VERDICT-END>>>`. Print nothing after.";
-        assert!(
-            extract_sentinel_verdict(echoed).is_none(),
-            "inline-echoed directive markers must not yield a verdict"
-        );
-        // Echoed inline directive, THEN a real standalone-marker verdict.
-        let mixed = "echoed: first `<<<WATCH-VERDICT>>>` then `<<<WATCH-VERDICT-END>>>`\n\
-                     $ \n<<<WATCH-VERDICT>>>\n[VERDICT] OK\n<<<WATCH-VERDICT-END>>>\n$ ";
-        assert_eq!(extract_sentinel_verdict(mixed).unwrap(), "[VERDICT] OK");
+    fn watcher_reply_path_under_results_dir() {
+        // §4 recovers the GUI verdict from the watcher's reply file at
+        // ~/.term-mesh/results/<team>/<agent>-reply.md (canonical, full content).
+        let p = watcher_reply_path("ws-abc123", "watcher").expect("home dir");
+        assert!(p.ends_with("watcher-reply.md"));
+        assert!(p.to_string_lossy().contains(".term-mesh/results/ws-abc123/"));
     }
 
     #[test]
