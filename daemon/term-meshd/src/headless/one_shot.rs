@@ -469,22 +469,26 @@ impl HeadlessOneShotRunner {
         let reply_path = watcher_reply_path(&input.team_name, WATCHER);
         let deadline = Instant::now() + input.reply_timeout;
         let mut last_send: Option<Instant> = None;
+        let mut last_send_err: Option<String> = None;
         loop {
             let resend_due = last_send
                 .map(|t| t.elapsed() >= GUI_RESEND_INTERVAL)
                 .unwrap_or(true);
             if resend_due {
+                // Send errors are tolerated and retried: a transient team.send
+                // parse/RPC failure (pane mid-transition, app momentarily busy)
+                // must not kill the whole tick. Keep the last error for the
+                // timeout message.
                 if let Err(e) =
                     app_send_pane(app_socket, &input.team_name, WATCHER, &message).await
                 {
-                    let msg = format!("send failed: {e}");
-                    return make(true, false, WatchExitStatus::SpawnFailed, msg.clone(), Some(msg));
-                }
-                if let Err(e) =
+                    last_send_err = Some(format!("send: {e}"));
+                } else if let Err(e) =
                     app_send_key_pane(app_socket, &input.team_name, WATCHER, "return").await
                 {
-                    let msg = format!("send_key failed: {e}");
-                    return make(true, false, WatchExitStatus::SpawnFailed, msg.clone(), Some(msg));
+                    last_send_err = Some(format!("send_key: {e}"));
+                } else {
+                    last_send_err = None;
                 }
                 last_send = Some(Instant::now());
             }
@@ -501,15 +505,15 @@ impl HeadlessOneShotRunner {
                 }
             }
             if Instant::now() >= deadline {
-                return make(
-                    true,
-                    false,
-                    WatchExitStatus::Timeout,
-                    String::new(),
-                    Some(
-                        "verdict timeout (watcher wrote no reply before reply_timeout)".to_string(),
-                    ),
-                );
+                let msg = match &last_send_err {
+                    Some(e) => {
+                        format!("verdict timeout (watcher wrote no reply; last send error: {e})")
+                    }
+                    None => {
+                        "verdict timeout (watcher wrote no reply before reply_timeout)".to_string()
+                    }
+                };
+                return make(true, false, WatchExitStatus::Timeout, String::new(), Some(msg));
             }
             tokio::time::sleep(Duration::from_millis(400)).await;
         }
