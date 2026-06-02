@@ -77,8 +77,20 @@ pub struct WatchState {
     pub app_socket_path: Option<String>,
     /// Per-check verdict wait budget.
     pub reply_timeout_secs: u64,
-    /// Unix seconds of the last *triggered* check (0 = never). Reporting only.
+    /// Unix seconds of the last *triggered* check (0 = never). This is the
+    /// attempt/fire time — it advances whether or not the check succeeds, so it
+    /// drives the next-tick cadence but must NOT be read as proof the watch works.
     pub last_check_ts: u64,
+    /// Unix seconds of the last *successful* check — a tick that actually ran the
+    /// watcher and returned a verdict with no error (0 = never succeeded). Status
+    /// reports `last_tick` from this so a watch that fires every interval but fails
+    /// every time (e.g. a watcher CLI that won't spawn) does not look healthy.
+    #[serde(default)]
+    pub last_success_ts: u64,
+    /// Consecutive failed ticks since the last success. Surfaced in status so a
+    /// 100%-failing watch is obvious instead of masquerading as a progressing one.
+    #[serde(default)]
+    pub consecutive_failures: u32,
     /// Total checks triggered for this team — drives execution/direction choice.
     pub check_count: u64,
     /// A check is currently running; new ticks coalesce (NFR1: 1 check/team).
@@ -121,6 +133,8 @@ impl WatchState {
             app_socket_path: None,
             reply_timeout_secs: DEFAULT_REPLY_TIMEOUT_SECS,
             last_check_ts: 0,
+            last_success_ts: 0,
+            consecutive_failures: 0,
             check_count: 0,
             in_flight: false,
             last_error: None,
@@ -169,6 +183,29 @@ pub fn make_check_id(
     hasher.update(b"|");
     hasher.update(check_count.to_le_bytes());
     hex::encode(&hasher.finalize()[..8]) // 16 hex chars
+}
+
+/// Apply a completed tick's outcome to the team's watch state.
+///
+/// A successful tick (no error) advances `last_success_ts` and clears the failure
+/// streak. A failed tick records the error and increments `consecutive_failures`.
+/// `last_check_ts` (the attempt/fire time) is set separately at fire time and is
+/// intentionally left untouched here, so the scheduler's next-tick cadence keeps
+/// advancing even while checks fail — but `last_success_ts` only moves on success,
+/// which is what status reads as `last_tick`. This is the split that stops a
+/// 100%-failing watch from looking healthy.
+pub fn record_tick_outcome(st: &mut WatchState, last_error: Option<String>) {
+    match last_error {
+        None => {
+            st.last_success_ts = now_unix();
+            st.consecutive_failures = 0;
+            st.last_error = None;
+        }
+        Some(e) => {
+            st.last_error = Some(e);
+            st.consecutive_failures = st.consecutive_failures.saturating_add(1);
+        }
+    }
 }
 
 fn now_unix() -> u64 {
@@ -398,7 +435,7 @@ async fn sweep_once(
             // Clear in_flight once after ALL workers for this team complete.
             if let Some(st) = registry.lock().await.get_mut(&team_id) {
                 st.in_flight = false;
-                st.last_error = last_error;
+                record_tick_outcome(st, last_error);
             }
         });
     }
@@ -499,7 +536,7 @@ pub async fn trigger_now(
         }
         if let Some(st) = registry.lock().await.get_mut(&team_id) {
             st.in_flight = false;
-            st.last_error = last_error;
+            record_tick_outcome(st, last_error);
         }
     });
     Ok(n)
@@ -542,6 +579,37 @@ mod tests {
     use crate::headless::one_shot::{WatchCheckFuture, WatchExitStatus};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::time::{advance, timeout};
+
+    #[test]
+    fn record_tick_outcome_success_advances_success_and_clears_streak() {
+        let mut st =
+            WatchState::enabled(1, Some("executor".into()), "claude", "sonnet", "critic", "spec", "/tmp");
+        st.consecutive_failures = 3;
+        st.last_error = Some("prev failure".into());
+        assert_eq!(st.last_success_ts, 0);
+
+        record_tick_outcome(&mut st, None);
+
+        assert!(st.last_success_ts > 0, "success must stamp last_success_ts");
+        assert_eq!(st.consecutive_failures, 0, "success clears the failure streak");
+        assert!(st.last_error.is_none(), "success clears last_error");
+    }
+
+    #[test]
+    fn record_tick_outcome_failure_records_error_and_increments_streak() {
+        let mut st =
+            WatchState::enabled(1, Some("executor".into()), "claude", "sonnet", "critic", "spec", "/tmp");
+        // A 100%-failing watch: last_success_ts must stay at 0 (never healthy) and
+        // the failure streak must grow so status can report it.
+        record_tick_outcome(&mut st, Some("spawn failed: codex".into()));
+        assert_eq!(st.last_success_ts, 0, "a failed tick must not look successful");
+        assert_eq!(st.consecutive_failures, 1);
+        assert_eq!(st.last_error.as_deref(), Some("spawn failed: codex"));
+
+        record_tick_outcome(&mut st, Some("spawn failed: codex".into()));
+        assert_eq!(st.consecutive_failures, 2, "consecutive failures accumulate");
+        assert_eq!(st.last_success_ts, 0);
+    }
 
     /// Fake runner over the *unified* [`WatchCheckRunner`] trait: counts
     /// invocations and either completes immediately or stays pending forever (to

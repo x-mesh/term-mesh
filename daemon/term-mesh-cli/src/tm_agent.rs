@@ -8231,16 +8231,48 @@ fn print_watch_status(resp: &Value) {
         let cli = st.get("cli").and_then(Value::as_str).unwrap_or("?");
         let model = st.get("model").and_then(Value::as_str).unwrap_or("?");
         let drift = st.get("drift_count").and_then(Value::as_u64).unwrap_or(0);
+        // healthy defaults to true when the field is absent (older daemon) so a
+        // back-compat status never shows a spurious failure.
+        let healthy = st.get("healthy").and_then(Value::as_bool).unwrap_or(true);
+        let failures = st
+            .get("consecutive_failures")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        let last_error = st
+            .get("last_error")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty());
+
+        // health makes a 100%-failing watch obvious instead of hiding behind a
+        // progressing next_tick: ok when no failure streak, FAILING with the
+        // consecutive-failure count otherwise.
+        let health = if healthy {
+            "ok".to_string()
+        } else if failures > 0 {
+            format!("FAILING ({failures} consecutive)")
+        } else {
+            "FAILING".to_string()
+        };
 
         println!("watch: {team}");
         println!("  enabled:   {}", if enabled { "yes" } else { "no" });
         println!("  running:   {}", if running { "yes" } else { "no" });
+        println!("  health:    {health}");
         println!("  target:    {target}");
         println!("  interval:  {interval}s");
         println!("  stance:    {stance} ({cli}/{model})");
-        println!("  last_tick: {}", fmt_tick(st.get("last_tick"), now, false));
+        // last_ok is the last *successful* check; last_try is the last attempt
+        // (success or failure). They diverge precisely when the watch is failing.
+        println!("  last_ok:   {}", fmt_tick(st.get("last_tick"), now, false));
+        println!(
+            "  last_try:  {}",
+            fmt_tick(st.get("last_attempt"), now, false)
+        );
         println!("  next_tick: {}", fmt_tick(st.get("next_tick"), now, true));
         println!("  drifts:    {drift}");
+        if let Some(err) = last_error {
+            println!("  error:     {err}");
+        }
     }
 }
 

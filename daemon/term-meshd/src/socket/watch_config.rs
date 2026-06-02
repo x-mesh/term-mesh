@@ -61,6 +61,11 @@ fn write_map(working_dir: &Path, map: &BTreeMap<String, WatchState>) -> std::io:
 fn sanitize_loaded(mut st: WatchState) -> WatchState {
     st.in_flight = false;
     st.last_error = None;
+    // Keep the failure streak paired with last_error: clearing one but not the
+    // other would render status as "FAILING" with no error to explain it. The
+    // streak is an in-session liveness signal, not durable history, so a restart
+    // starts it fresh (last_success_ts is left intact as a factual past timestamp).
+    st.consecutive_failures = 0;
     st
 }
 
@@ -119,6 +124,7 @@ mod tests {
         // Live counters that must NOT round-trip back as-is.
         st.in_flight = true;
         st.last_error = Some("boom".into());
+        st.consecutive_failures = 4;
         st.check_count = 7;
         st
     }
@@ -144,6 +150,10 @@ mod tests {
         // Live counters are sanitized on load.
         assert!(!got.in_flight, "in_flight must reset to false on load");
         assert!(got.last_error.is_none(), "last_error must reset on load");
+        assert_eq!(
+            got.consecutive_failures, 0,
+            "failure streak must reset on load (paired with last_error)"
+        );
     }
 
     #[test]

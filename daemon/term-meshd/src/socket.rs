@@ -2358,19 +2358,32 @@ async fn dispatch(req: &Request, ctx: &Context) -> Response {
                 st: &crate::drift_watch::WatchState,
             ) -> serde_json::Value {
                 // P12 #6: derive human-facing fields the CLI renders directly.
-                // last_tick: 0 = never run yet. next_tick: only meaningful once a
-                // check has run; null when never (the scheduler fires the first
-                // check one interval after the team is first observed).
-                let last_tick = if st.last_check_ts > 0 {
+                // last_tick is the last *successful* check (verdict received). A
+                // watch that fires every interval but fails every time keeps
+                // last_tick null/stale here, so status cannot mistake a 100%-failing
+                // watch for a healthy one. last_attempt exposes the fire time
+                // separately so the operator can still see the scheduler is alive.
+                let last_tick = if st.last_success_ts > 0 {
+                    serde_json::json!(st.last_success_ts)
+                } else {
+                    serde_json::Value::Null
+                };
+                let last_attempt = if st.last_check_ts > 0 {
                     serde_json::json!(st.last_check_ts)
                 } else {
                     serde_json::Value::Null
                 };
+                // next_tick is keyed off the last *attempt* (not success): a failing
+                // watch still retries on cadence, so the next fire is attempt+interval.
                 let next_tick = if st.enabled && st.last_check_ts > 0 {
                     serde_json::json!(st.last_check_ts + st.interval_secs)
                 } else {
                     serde_json::Value::Null
                 };
+                // healthy: a check has succeeded and no failure streak is open. A
+                // brand-new watch (never fired) is reported healthy=true (nothing
+                // has failed yet); one that has only ever failed is healthy=false.
+                let healthy = st.last_error.is_none() && st.consecutive_failures == 0;
                 let drift_count = board_drift_count(&st.working_directory);
                 // R1: expose worker list and count so the GUI can display
                 // "All workers: N bounded checks" without re-deriving team roster.
@@ -2402,10 +2415,14 @@ async fn dispatch(req: &Request, ctx: &Context) -> Response {
                     "stance": st.stance,
                     "spec": st.spec,
                     "last_tick": last_tick,
+                    "last_attempt": last_attempt,
                     "next_tick": next_tick,
+                    "healthy": healthy,
+                    "consecutive_failures": st.consecutive_failures,
                     "drift_count": drift_count,
                     // Raw fields retained for back-compat / debugging.
                     "last_check_ts": st.last_check_ts,
+                    "last_success_ts": st.last_success_ts,
                     "check_count": st.check_count,
                     "in_flight": st.in_flight,
                     "last_error": st.last_error,
