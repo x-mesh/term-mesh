@@ -6,6 +6,13 @@ PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 
 cd "$PROJECT_DIR"
 
+# Activate project git hooks (commit-msg strips fenced code-block markers that
+# LLM agents tend to wrap commit messages in). core.hooksPath cannot be pinned
+# inside the repo, so it must be set per clone — do it here idempotently so the
+# strip defense is never silently missing on a fresh machine/agent environment.
+echo "==> Activating project git hooks (.githooks)..."
+git config core.hooksPath .githooks
+
 echo "==> Initializing submodules..."
 git submodule update --init --recursive
 
