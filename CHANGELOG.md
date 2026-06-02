@@ -4,6 +4,15 @@ All notable changes to term-mesh are documented here.
 
 ## [Unreleased]
 
+## [0.142.0] - 2026-06-02
+
+### Fixed
+- **여러 term-mesh가 동시에 떠 있을 때 `tm-agent` 명령이 엉뚱한 인스턴스에 붙던 문제** — production 앱과 `--tag`/STAGING 빌드를 함께 실행하면, 일반 pane에서 실행한 `tm-agent attach`/`read`/`collect`가 자기 앱의 daemon이 아니라 다른 인스턴스의 daemon에 연결돼 `not_in_workspace`로 실패하던 문제. 각 pane이 자신이 속한 앱의 control socket을 우선 사용하도록 해 각 명령이 올바른 daemon으로 라우팅된다.
+
+### Thanks to 1 contributor!
+
+- [@JINWOO-J](https://github.com/JINWOO-J)
+
 ## [0.141.0] - 2026-06-02
 
 ### Added

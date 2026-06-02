@@ -2664,6 +2664,24 @@ fn detect_socket() -> Option<PathBuf> {
         }
     }
 
+    // Priority 1.5: The app control socket of the pane THIS process runs in.
+    // Every term-mesh pane gets `TERMMESH_SOCKET_PATH` injected by the app
+    // (GhosttyTerminalView -> SocketControlSettings.socketPath()); agent panes
+    // additionally get `TERMMESH_SOCKET` (handled above). When multiple
+    // term-mesh instances run side by side (e.g. production + a `--tag`/STAGING
+    // build, each with its own daemon socket), the global last-socket-path file
+    // and the `/tmp/*.sock` glob below can resolve to a SIBLING instance's
+    // daemon — whose surface registry does not contain this pane's surface_id,
+    // so team.attach / read / collect fail with `not_in_workspace`. The
+    // pane-injected path is the authoritative socket for the caller, so it must
+    // win over the global fallbacks.
+    if let Ok(sock) = env::var("TERMMESH_SOCKET_PATH") {
+        let p = PathBuf::from(&sock);
+        if is_socket_alive(&p) {
+            return Some(p);
+        }
+    }
+
     // Priority 2: Last-used socket path recorded by reload.sh / reloads.sh
     // This avoids ambiguity when multiple tagged debug sockets exist.
     let last_socket_path = PathBuf::from("/tmp/term-mesh-last-socket-path");
