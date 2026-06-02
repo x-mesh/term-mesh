@@ -442,8 +442,16 @@ impl HeadlessOneShotRunner {
             let msg = format!("recycle failed: {e}");
             return make(false, false, WatchExitStatus::SpawnFailed, msg.clone(), Some(msg));
         }
-        // 2. Let the respawned CLI become ready before injecting the prompt.
-        tokio::time::sleep(Duration::from_millis(GUI_RECYCLE_SETTLE_MS)).await;
+        // 2. Wait for the respawned CLI to finish cold-starting before injecting
+        //    the prompt. A fixed sleep dropped the prompt for slow CLI boots; poll
+        //    until the startup output settles (or a hard cap).
+        wait_pane_ready(
+            app_socket,
+            &input.team_name,
+            WATCHER,
+            Duration::from_millis(GUI_RECYCLE_READY_CAP_MS),
+        )
+        .await;
         // 3. Send the review prompt + sentinel directive (text only — Return is
         //    a separate key, since team.send injects with withReturn=false).
         let message = format!(
@@ -690,9 +698,11 @@ const GUI_VERDICT_START: &str = "<<<WATCH-VERDICT>>>";
 const GUI_VERDICT_END: &str = "<<<WATCH-VERDICT-END>>>";
 /// How many trailing terminal lines to read each poll when hunting the verdict.
 const GUI_READ_LINES: usize = 2000;
-/// Pause after recycle (hard restart) before injecting text, so the freshly
-/// respawned CLI has a render frame and is ready to receive input. Tuned live.
-const GUI_RECYCLE_SETTLE_MS: u64 = 1500;
+/// Hard cap on waiting for the recycled watcher CLI to finish cold-starting
+/// before injecting the prompt (see `wait_pane_ready`). A fixed short sleep
+/// dropped the prompt in live testing — Claude Code / codex boots (load + MCP +
+/// plugins) take several seconds, longer than the old 1500ms settle.
+const GUI_RECYCLE_READY_CAP_MS: u64 = 12000;
 
 /// Appended to the review message on the GUI path so the watcher delimits its
 /// verdict for terminal-scrollback extraction.
@@ -733,6 +743,44 @@ fn extract_sentinel_verdict(text: &str) -> Option<String> {
 /// §4 GUI path: poll the watcher pane's terminal text until the sentinel-wrapped
 /// verdict appears or the reply budget elapses. Read failures are tolerated
 /// (transient pane churn) and simply retried until the deadline.
+/// §4 GUI path: after a recycle (hard restart), wait until the freshly respawned
+/// CLI in the watcher pane is ready for input. A fixed sleep is fragile — Claude
+/// Code / codex cold-start (load + MCP + plugins) takes several seconds, and a
+/// too-short wait drops the injected prompt (observed live: the pane showed the
+/// Claude banner but the review never landed). Poll the pane's terminal until its
+/// output stops growing (the startup banner finished rendering) or a hard cap
+/// elapses, then proceed.
+async fn wait_pane_ready(app_socket: &str, team: &str, agent: &str, max_wait: Duration) {
+    const POLL: Duration = Duration::from_millis(300);
+    const QUIET: Duration = Duration::from_millis(1200);
+    let deadline = Instant::now() + max_wait;
+    let mut last_len: usize = 0;
+    let mut last_change = Instant::now();
+    let mut saw_output = false;
+    loop {
+        let len = app_read_pane(app_socket, team, agent, GUI_READ_LINES)
+            .await
+            .map(|t| t.len())
+            .unwrap_or(0);
+        if len != last_len {
+            last_len = len;
+            last_change = Instant::now();
+            if len > 0 {
+                saw_output = true;
+            }
+        }
+        // Ready once the startup output has been quiet (stopped growing) — the
+        // CLI has finished booting and is at its prompt.
+        if saw_output && last_change.elapsed() >= QUIET {
+            return;
+        }
+        if Instant::now() >= deadline {
+            return; // hard cap: proceed anyway
+        }
+        tokio::time::sleep(POLL).await;
+    }
+}
+
 /// Returns `(verdict, status, last_read_error)`. `last_read_error` is the most
 /// recent app_read_pane failure when the loop times out — it distinguishes a
 /// persistent RPC failure (socket dead, wrong team/agent) from a watcher that
