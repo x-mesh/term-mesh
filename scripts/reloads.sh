@@ -216,23 +216,26 @@ sleep 0.3
 # Kill any running staging instance; allow side-by-side with the main and dev apps.
 pkill -f "${APP_NAME}.app/Contents/MacOS/${BASE_APP_NAME}" || true
 sleep 0.3
-TERMMESHD_SRC="$PWD/daemon/zig-out/bin/term-meshd"
+# daemon is a cargo project (no build.zig). Build all four binaries with cargo
+# and copy from target/release, matching reloadp.sh / reload.sh. The previous
+# `zig build` + `zig-out/bin/term-meshd` path silently failed ("no build.zig
+# file found"), so term-meshd was never copied and STAGING ran a stale daemon.
 if [[ -d "$PWD/daemon" ]]; then
-  (cd "$PWD/daemon" && zig build -Doptimize=ReleaseFast)
+  (cd "$PWD/daemon" && cargo build --release) || echo "warn: cargo build failed; using existing target/release binaries"
 fi
-if [[ -x "$TERMMESHD_SRC" ]]; then
-  BIN_DIR="$APP_PATH/Contents/Resources/bin"
-  mkdir -p "$BIN_DIR"
-  cp "$TERMMESHD_SRC" "$BIN_DIR/term-meshd"
-  chmod +x "$BIN_DIR/term-meshd"
-  for bin in term-mesh-run tm-agent term-mesh-peer-relay; do
-    src="$PWD/daemon/target/release/$bin"
-    if [[ -x "$src" ]]; then
-      cp "$src" "$BIN_DIR/$bin"
-      chmod +x "$BIN_DIR/$bin"
-    fi
-  done
-fi
+BIN_DIR="$APP_PATH/Contents/Resources/bin"
+mkdir -p "$BIN_DIR"
+for bin in term-meshd term-mesh-run tm-agent term-mesh-peer-relay; do
+  src="$PWD/daemon/target/release/$bin"
+  if [[ -x "$src" ]]; then
+    cp "$src" "$BIN_DIR/$bin"
+    chmod +x "$BIN_DIR/$bin"
+  fi
+done
+# Re-seal: the codesign above ran before these binaries were copied, so the
+# bundle's _CodeSignature no longer matches Resources/bin. Re-sign the whole
+# app so macOS doesn't reject the swapped daemon/CLI on launch.
+/usr/bin/codesign --force --sign - --timestamp=none --generate-entitlement-der "$APP_PATH" >/dev/null 2>&1 || true
 # Avoid inheriting term-mesh/ghostty environment variables from the terminal that
 # runs this script (often inside another term-mesh instance), which can cause
 # socket and resource-path conflicts.
