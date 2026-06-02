@@ -982,6 +982,11 @@ enum WatchAction {
         /// Working dir whose .xm/watch/config.json persists this (default: cwd)
         #[arg(long)]
         working_dir: Option<String>,
+        /// App (Swift) socket the daemon uses to drive a GUI watcher pane (§4).
+        /// Auto-resolved from TERMMESH_SOCKET / detection when omitted; pass it
+        /// explicitly from an adopted leader pane that lacks TERMMESH_SOCKET.
+        #[arg(long)]
+        app_socket: Option<String>,
     },
     /// Disable autonomous drift-watch for a team (config persisted, disabled)
     Off {
@@ -6335,10 +6340,8 @@ fn apply_auto_watch(team_name: &str, working_dir: &std::path::Path, decision: Au
                 "spec": "@.xm/watch/default-spec.md",
                 "working_directory": wd_str,
             });
-            if let Ok(ts) = env::var("TERMMESH_SOCKET") {
-                if !ts.is_empty() && is_app_socket_path(std::path::Path::new(&ts)) {
-                    params["app_socket_path"] = json!(ts);
-                }
+            if let Some(app_sock) = resolve_app_socket(None) {
+                params["app_socket_path"] = json!(app_sock);
             }
             let watch_sock = match detect_watch_socket() {
                 Some(s) => s,
@@ -6930,6 +6933,31 @@ fn is_app_socket_path(path: &Path) -> bool {
         }
         None => false,
     }
+}
+
+/// Resolve the app (Swift) socket for watch's GUI execution path (§4 pane
+/// recycle). The daemon needs it to drive recycle/send/read on a GUI watcher
+/// pane; without it the GUI path can't run and watch falls back to the headless
+/// one-shot. Priority: an explicit value, then an app `TERMMESH_SOCKET`, then an
+/// auto-detected *app* socket (a detected daemon socket is rejected — the
+/// `watch on` caller's leader pane may lack TERMMESH_SOCKET, so detection covers
+/// it). Returns None for pure-headless callers, which keeps the headless path.
+fn resolve_app_socket(explicit: Option<&str>) -> Option<String> {
+    if let Some(e) = explicit {
+        let p = PathBuf::from(e);
+        if !e.is_empty() && is_app_socket_path(&p) && is_socket_alive(&p) {
+            return Some(e.to_string());
+        }
+    }
+    if let Ok(ts) = env::var("TERMMESH_SOCKET") {
+        let p = PathBuf::from(&ts);
+        if !ts.is_empty() && is_app_socket_path(&p) && is_socket_alive(&p) {
+            return Some(ts);
+        }
+    }
+    detect_socket()
+        .filter(|p| is_app_socket_path(p))
+        .map(|p| p.to_string_lossy().into_owned())
 }
 
 /// Derive this app instance's term-meshd socket from its *app* socket path (P15).
@@ -8183,6 +8211,7 @@ fn run_watch_command(sock: &PathBuf, action: &WatchAction) {
             spec,
             ratio,
             working_dir,
+            app_socket,
         } => {
             // The daemon persists config keyed by working_directory; default to cwd.
             let wd = working_dir.clone().unwrap_or_else(|| {
@@ -8211,17 +8240,17 @@ fn run_watch_command(sock: &PathBuf, action: &WatchAction) {
             if let Some(r) = ratio {
                 params["exec_to_dir_ratio"] = json!(r);
             }
-            // P14: forward the caller's app socket (TERMMESH_SOCKET) so the daemon
-            // stores it on the WatchState. A GUI team's watched pane lives in the
-            // Swift app (not the daemon's headless manager), so the spawned watcher
-            // needs TERMMESH_SOCKET = app socket to self-collect the target delta
-            // (`tm-agent read <target>`) and the WatchController needs it to post to
-            // the leader inbox (`team.message.post`). Headless callers (daemon
-            // socket) leave it unset → daemon-side pre-fetch (P13) covers them.
-            if let Ok(ts) = env::var("TERMMESH_SOCKET") {
-                if !ts.is_empty() && is_app_socket_path(Path::new(&ts)) {
-                    params["app_socket_path"] = json!(ts);
-                }
+            // P14/§4: store the app socket on the WatchState. A GUI team's watched
+            // pane lives in the Swift app (not the daemon's headless manager), so
+            // the spawned watcher needs it to self-collect the target delta
+            // (`tm-agent read <target>`), the WatchController needs it to post to
+            // the leader inbox, and §4's GUI execution path needs it to drive
+            // recycle/send/read on the watcher pane. resolve_app_socket covers an
+            // adopted leader pane that lacks TERMMESH_SOCKET (explicit flag >
+            // TERMMESH_SOCKET > detection). Headless callers resolve to None →
+            // daemon-side pre-fetch (P13) / headless one-shot covers them.
+            if let Some(app_sock) = resolve_app_socket(app_socket.as_deref()) {
+                params["app_socket_path"] = json!(app_sock);
             }
             print_result(rpc_call(sock, "watch.on", params));
         }
