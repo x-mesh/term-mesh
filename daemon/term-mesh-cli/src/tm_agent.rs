@@ -182,6 +182,15 @@ const _BUILD_DATE: &str = env!("TM_BUILD_DATE");
     version
 )]
 struct Cli {
+    /// Override the target team for this command. Without it the team is resolved
+    /// from $TERMMESH_TEAM, then a $TERMMESH_WORKSPACE_ID-derived `ws-<hex>` name,
+    /// then `live-team`. Pass `--team ws-<hex>` from an adopted leader pane that
+    /// never had TERMMESH_TEAM injected (e.g. a workspace-local `ws-…` team) so
+    /// read/collect/inbox/send reach the right team instead of leaking to
+    /// `live-team`. Global: accepted on any subcommand.
+    #[arg(long, global = true)]
+    team: Option<String>,
+
     #[command(subcommand)]
     command: Commands,
 }
@@ -2233,6 +2242,24 @@ mod runbook_tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
+    fn resolve_team_name_explicit_flag_wins() {
+        // The explicit --team flag returns verbatim and never consults env, so a
+        // command run from an adopted leader pane (no TERMMESH_TEAM) can still
+        // target a workspace-local `ws-…` team. Env-free → parallel-safe.
+        assert_eq!(resolve_team_name(Some("ws-deadbeef")), "ws-deadbeef");
+        assert_eq!(resolve_team_name(Some("standard")), "standard");
+    }
+
+    #[test]
+    fn resolve_team_name_empty_flag_falls_through() {
+        // An empty --team must not be taken as the team; it falls through to the
+        // env/default chain. With no overriding env the floor is some non-empty
+        // name (env TERMMESH_TEAM, a ws-derived name, or the live-team default) —
+        // never the empty string.
+        assert!(!resolve_team_name(Some("")).is_empty());
+    }
+
+    #[test]
     fn runbook_parse_tools_accepts_all_and_aliases() {
         let all = parse_runbook_tools("all").unwrap();
         assert_eq!(all.len(), 4);
@@ -4004,7 +4031,7 @@ fn main() {
         }
     };
 
-    let team = env::var("TERMMESH_TEAM").unwrap_or_else(|_| "live-team".into());
+    let team = resolve_team_name(cli.team.as_deref());
     let agent = env::var("TERMMESH_AGENT_NAME").unwrap_or_else(|_| "anonymous".into());
 
     let result = match cli.command {
@@ -6514,6 +6541,32 @@ fn validate_agent_name(name: &str) -> Result<(), String> {
 ///
 /// Returns `Err` if neither is available.
 #[allow(dead_code)] // used by run_attach/run_detach (t8/t9)
+/// Resolve the team name for agent-side RPCs (report/send/delegate/read/collect/
+/// inbox/task.*). Every agent-side command shares this so a missing TERMMESH_TEAM
+/// can no longer silently leak the whole command set to `live-team`. Priority:
+/// 1. explicit `--team` flag — works from any context, including an adopted leader
+///    pane that never had TERMMESH_TEAM injected,
+/// 2. `$TERMMESH_TEAM` — set on GUI-spawned agent panes,
+/// 3. `$TERMMESH_WORKSPACE_ID` → `ws-<hex>` — same derivation attach/detach use
+///    via [`resolve_workspace_team_name`], so workspace-local teams resolve
+///    symmetrically across all commands,
+/// 4. `live-team` — create-based / legacy default.
+fn resolve_team_name(explicit: Option<&str>) -> String {
+    if let Some(t) = explicit {
+        if !t.is_empty() {
+            return t.to_string();
+        }
+    }
+    if let Ok(t) = env::var("TERMMESH_TEAM") {
+        if !t.is_empty() {
+            return t;
+        }
+    }
+    // resolve_workspace_team_name re-checks TERMMESH_TEAM (already handled above)
+    // then derives ws-<hex> from TERMMESH_WORKSPACE_ID; any error → default.
+    resolve_workspace_team_name().unwrap_or_else(|_| "live-team".to_string())
+}
+
 fn resolve_workspace_team_name() -> Result<String, String> {
     if let Ok(explicit) = env::var("TERMMESH_TEAM") {
         if !explicit.is_empty() {
@@ -7029,7 +7082,7 @@ fn cmd_doctor(verbose: bool, json_output: bool) {
     let app_socket = detect_socket();
     let daemon_socket = detect_daemon_socket();
     let sockets = discover_term_mesh_sockets();
-    let team = env::var("TERMMESH_TEAM").unwrap_or_else(|_| "live-team".into());
+    let team = resolve_team_name(None);
     let agent = env::var("TERMMESH_AGENT_NAME").unwrap_or_else(|_| "anonymous".into());
 
     let app_status = app_socket
