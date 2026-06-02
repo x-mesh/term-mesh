@@ -4,6 +4,15 @@ All notable changes to term-mesh are documented here.
 
 ## [Unreleased]
 
+## [0.143.0] - 2026-06-02
+
+### Fixed
+- **에이전트 watch가 점검 결과 제출에 실패하지 않음** — GUI watch의 watcher(claude/codex)가 drift 점검 결과(verdict)를 제출할 때 heredoc 본문이 누락되거나 "no active task"로 거부돼 여러 번 재시도하던 문제. `tm-agent reply`가 이제 stdin(heredoc/pipe) 본문도 읽고, 일회성 watcher는 닫을 task가 없어도 정상 종료하며, 일시적인 메시지 전송 실패에도 작업 완료를 건너뛰지 않는다.
+
+### Thanks to 1 contributor!
+
+- [@JINWOO-J](https://github.com/JINWOO-J)
+
 ## [0.142.0] - 2026-06-02
 
 ### Fixed
