@@ -12,9 +12,21 @@ leader가 작업의 종료를 알 수 있는 유일한 신호이기 때문이다
 
 ### 종료 순서 (이 순서 고정)
 
-1. **`tm-agent reply '<5-line header + summary>'`**
-   - TM-PROTOCOL-v1: `STATUS / FILES / VERIFY / NEXT / FULL_REPORT` 헤더 5필드 의무.
-   - reply 호출이 동시에 active task를 자동 완료 처리한다 (`Warning: no active task ...`이 떠도 reply alias는 정상 기록됨).
+1. **본문 전체를 하나의 따옴표 positional argument로 넘긴다** (heredoc 아님):
+
+   ```text
+   tm-agent reply 'STATUS: DONE
+   FILES: none
+   VERIFY: n/a
+   NEXT: NONE
+   FULL_REPORT: n/a
+
+   <요약/본문>'
+   ```
+
+   - 첫 줄은 반드시 `STATUS: DONE`(또는 BLOCKED / NEEDS_REVIEW). TM-PROTOCOL-v1: `STATUS / FILES / VERIFY / NEXT / FULL_REPORT` 헤더 5필드 의무.
+   - heredoc(`<<'EOF'`)·파이프도 동작하지만(stdin fallback), 위 arg 형식이 가장 안전하다.
+   - reply 호출이 동시에 active task를 자동 완료 처리한다. stateless watcher(`watcher` role)는 닫을 task가 없으므로 `--task-id` 없이 호출하면 "no active task" 경고 없이 정상 종료한다(verdict는 alias 파일로 전달). 그 외 역할은 active task가 자동 선택되며, 후보가 여럿이라는 경고가 뜨면 `--task-id <id>`로 지정한다.
 2. **(옵션) `tm-agent task done <task_id>`**
    - 명시적 task ID로 완료 보고가 필요할 때만. 일반적으로 1번이 대체한다.
 3. **`tm-agent inbox` / `tm-agent msg list`**

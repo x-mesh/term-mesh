@@ -472,12 +472,15 @@ impl HeadlessOneShotRunner {
         // verdict is only delivered by RUNNING `tm-agent reply` (its result file is
         // what we poll). Printing alone does nothing here.
         let message = format!(
-            "{}\n\nDELIVERY (overrides any \"nothing else\" instruction above): you \
-             MUST submit the verdict by RUNNING the shell command `tm-agent reply` \
-             with a STATUS/FILES/VERIFY/NEXT/FULL_REPORT header followed by your \
-             [VERDICT]/[FINDING]/[SPEC_CLAUSE] lines in the body. Running that \
-             command is how the verdict is delivered — printing it to the terminal \
-             alone does nothing.",
+            "{}\n\nDELIVERY (overrides any \"nothing else\" instruction above): submit \
+             the verdict by RUNNING `tm-agent reply` with the whole header+body as ONE \
+             single-quoted positional argument (a heredoc or pipe also works now, but \
+             the quoted-arg form is simplest — do not rely on stdin alone). The first \
+             line MUST be `STATUS: DONE` (or BLOCKED / NEEDS_REVIEW), then \
+             FILES/VERIFY/NEXT/FULL_REPORT, a blank line, then your \
+             [VERDICT]/[FINDING]/[SPEC_CLAUSE] lines. You are the stateless watcher, so \
+             do NOT pass --task-id and ignore any \"no active task\" note. Running the \
+             command is the only delivery; printing to the terminal alone does nothing.",
             build_review_message(&input)
         );
         let reply_path = watcher_reply_path(&input.team_name, WATCHER);
