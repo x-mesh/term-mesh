@@ -461,17 +461,19 @@ impl HeadlessOneShotRunner {
             return make(true, false, WatchExitStatus::SpawnFailed, msg.clone(), Some(msg));
         }
         // 5. Poll the pane's terminal text for the sentinel-wrapped verdict.
-        let (verdict, status) =
+        let (verdict, status, last_read_err) =
             wait_for_verdict_gui(app_socket, &input.team_name, WATCHER, input.reply_timeout).await;
         match status {
             WatchExitStatus::Replied => make(true, true, status, verdict, None),
-            _ => make(
-                true,
-                false,
-                status,
-                verdict,
-                Some("verdict timeout (no sentinel marker before reply_timeout)".to_string()),
-            ),
+            _ => {
+                let msg = match last_read_err {
+                    Some(e) => {
+                        format!("verdict timeout (no sentinel marker; last read error: {e})")
+                    }
+                    None => "verdict timeout (no sentinel marker before reply_timeout)".to_string(),
+                };
+                make(true, false, status, verdict, Some(msg))
+            }
         }
     }
 }
@@ -705,40 +707,62 @@ fn gui_sentinel_directive() -> String {
 
 /// Extract a GUI watcher's verdict from terminal text wrapped in the sentinel
 /// markers. Returns None when the end marker has not appeared yet (verdict still
-/// streaming or absent). Uses the LAST start marker so the echoed prompt copy of
-/// the directive does not win over the real output.
+/// streaming or absent).
+///
+/// Markers are matched only when ALONE on their own line (after trim). The
+/// directive we inject names the markers inline inside prose/backticks
+/// ("...first `<<<WATCH-VERDICT>>>`, then..."), and that directive is echoed into
+/// the watcher pane's scrollback before the watcher answers. A naive substring
+/// `rfind`/`find` would extract that echo as a bogus verdict on the very first
+/// poll and settle early. Requiring standalone-line markers — exactly how the
+/// directive tells the watcher to print them — skips the inline echo. The LAST
+/// standalone start line wins so a real re-emitted block beats an earlier one.
 fn extract_sentinel_verdict(text: &str) -> Option<String> {
-    let start = text.rfind(GUI_VERDICT_START)? + GUI_VERDICT_START.len();
-    let rest = &text[start..];
-    let end = rest.find(GUI_VERDICT_END)?;
-    let verdict = rest[..end].trim();
-    if verdict.is_empty() {
+    let lines: Vec<&str> = text.lines().collect();
+    let start = lines.iter().rposition(|l| l.trim() == GUI_VERDICT_START)?;
+    let end = (start + 1..lines.len()).find(|&i| lines[i].trim() == GUI_VERDICT_END)?;
+    let body = lines[start + 1..end].join("\n");
+    let body = body.trim();
+    if body.is_empty() {
         None
     } else {
-        Some(verdict.to_string())
+        Some(body.to_string())
     }
 }
 
 /// §4 GUI path: poll the watcher pane's terminal text until the sentinel-wrapped
 /// verdict appears or the reply budget elapses. Read failures are tolerated
 /// (transient pane churn) and simply retried until the deadline.
+/// Returns `(verdict, status, last_read_error)`. `last_read_error` is the most
+/// recent app_read_pane failure when the loop times out — it distinguishes a
+/// persistent RPC failure (socket dead, wrong team/agent) from a watcher that
+/// simply never printed the sentinel.
 async fn wait_for_verdict_gui(
     app_socket: &str,
     team: &str,
     agent: &str,
     timeout_budget: Duration,
-) -> (String, WatchExitStatus) {
+) -> (String, WatchExitStatus, Option<String>) {
     const POLL: Duration = Duration::from_millis(200);
     let deadline = Instant::now() + timeout_budget;
+    let mut last_read_err: Option<String> = None;
     loop {
-        let text = app_read_pane(app_socket, team, agent, GUI_READ_LINES)
-            .await
-            .unwrap_or_default();
-        if let Some(v) = extract_sentinel_verdict(&text) {
-            return (v, WatchExitStatus::Replied);
+        match app_read_pane(app_socket, team, agent, GUI_READ_LINES).await {
+            Ok(text) => {
+                if let Some(v) = extract_sentinel_verdict(&text) {
+                    return (v, WatchExitStatus::Replied, None);
+                }
+            }
+            Err(e) => {
+                // Transient pane churn is tolerated (retry), but remember the last
+                // error so a persistent read failure surfaces instead of a bare
+                // timeout.
+                tracing::debug!("watch gui: read {agent}@{team} failed (retrying): {e}");
+                last_read_err = Some(e);
+            }
         }
         if Instant::now() >= deadline {
-            return (String::new(), WatchExitStatus::Timeout);
+            return (String::new(), WatchExitStatus::Timeout, last_read_err);
         }
         tokio::time::sleep(POLL).await;
     }
@@ -956,11 +980,29 @@ mod tests {
 
     #[test]
     fn extract_sentinel_verdict_uses_last_start_marker() {
-        // The echoed directive contains a start marker; the real verdict is the
-        // LAST marked block, so rfind(start) must win over the echoed copy.
+        // The echoed directive mentions a start marker inline; the real verdict is
+        // a standalone-line marked block, which must win over the inline echo.
         let text = "echoed: print between <<<WATCH-VERDICT>>> and the end marker\n\
                     actual output:\n<<<WATCH-VERDICT>>>\nreal verdict\n<<<WATCH-VERDICT-END>>>";
         assert_eq!(extract_sentinel_verdict(text).unwrap(), "real verdict");
+    }
+
+    #[test]
+    fn extract_sentinel_verdict_ignores_inline_echoed_directive() {
+        // P1 regression: the injected directive names both markers inline inside
+        // prose/backticks, and is echoed into the pane BEFORE the watcher answers.
+        // Inline markers on a non-standalone line must not be read as a verdict —
+        // otherwise the first poll settles on the echoed directive text.
+        let echoed = "IMPORTANT OUTPUT FORMAT: print between `<<<WATCH-VERDICT>>>`, \
+                      the body, then `<<<WATCH-VERDICT-END>>>`. Print nothing after.";
+        assert!(
+            extract_sentinel_verdict(echoed).is_none(),
+            "inline-echoed directive markers must not yield a verdict"
+        );
+        // Echoed inline directive, THEN a real standalone-marker verdict.
+        let mixed = "echoed: first `<<<WATCH-VERDICT>>>` then `<<<WATCH-VERDICT-END>>>`\n\
+                     $ \n<<<WATCH-VERDICT>>>\n[VERDICT] OK\n<<<WATCH-VERDICT-END>>>\n$ ";
+        assert_eq!(extract_sentinel_verdict(mixed).unwrap(), "[VERDICT] OK");
     }
 
     #[test]
