@@ -872,6 +872,7 @@ impl HeadlessManager {
         }
 
         let bytes = agent.protocol.encode_message(text);
+        let close_stdin = agent.protocol.closes_stdin_after_message();
         let stdin = agent
             .stdin
             .as_mut()
@@ -884,6 +885,13 @@ impl HeadlessManager {
             .flush()
             .await
             .map_err(|e| format!("flush stdin failed: {e}"))?;
+
+        // codex exec - reads the whole prompt then blocks on stdin EOF before it
+        // starts; drop stdin so the child sees end-of-input. claude keeps stdin
+        // open for multi-turn stream-json, so close_stdin is false there.
+        if close_stdin {
+            agent.stdin = None;
+        }
 
         // Reset idle tracker on outbound activity (§5.2).
         agent

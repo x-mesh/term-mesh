@@ -435,6 +435,19 @@ pub(crate) fn extract_verdict_text(raw_lines: &[String]) -> String {
                     }
                 }
             }
+            // codex: the assistant's reply arrives as a completed `agent_message`
+            // item. codex has no claude-style `result`, so this feeds the
+            // assistant fallback below.
+            Some("item.completed") => {
+                if let Some(item) = v.get("item") {
+                    if item.get("type").and_then(|t| t.as_str()) == Some("agent_message") {
+                        if let Some(t) = item.get("text").and_then(|t| t.as_str()) {
+                            assistant.push_str(t);
+                            assistant.push('\n');
+                        }
+                    }
+                }
+            }
             _ => {}
         }
     }
@@ -453,12 +466,18 @@ pub(crate) fn extract_verdict_text(raw_lines: &[String]) -> String {
 fn has_result_event(raw_lines: &[String]) -> bool {
     raw_lines.iter().any(|line| {
         let line = line.trim();
-        line.starts_with('{')
-            && serde_json::from_str::<serde_json::Value>(line)
-                .ok()
-                .and_then(|v| v.get("type").and_then(|t| t.as_str()).map(str::to_string))
-                .as_deref()
-                == Some("result")
+        if !line.starts_with('{') {
+            return false;
+        }
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+            return false;
+        };
+        // claude stream-json emits a terminal `result`; codex emits
+        // `turn.completed` when the turn (and its agent_message) is done.
+        matches!(
+            v.get("type").and_then(|t| t.as_str()),
+            Some("result") | Some("turn.completed")
+        )
     })
 }
 
@@ -578,6 +597,35 @@ mod tests {
         assert!(text.contains("[VERDICT] drift(execution)"));
         assert!(text.contains("ignored a failing build"));
         assert!(has_result_event(&lines));
+    }
+
+    #[test]
+    fn extract_verdict_text_reads_codex_agent_message() {
+        // codex emits JSONL: agent_message item carries the reply, turn.completed
+        // is the terminal event. The claude-stream-json adapter could parse none
+        // of this, which is why codex watchers timed out with verdict_len=0.
+        let lines = vec![
+            r#"{"type":"thread.started","thread_id":"x"}"#.to_string(),
+            r#"{"type":"turn.started"}"#.to_string(),
+            r#"{"type":"item.completed","item":{"id":"item_0","type":"agent_message","text":"[VERDICT] OK\n[FINDING] none"}}"#.to_string(),
+            r#"{"type":"turn.completed","usage":{"output_tokens":6}}"#.to_string(),
+        ];
+        let text = extract_verdict_text(&lines);
+        assert!(text.contains("[VERDICT] OK"), "got: {text}");
+        assert!(text.contains("[FINDING] none"));
+        // turn.completed must count as a settle signal so wait_for_verdict returns
+        // Replied instead of waiting out the full timeout.
+        assert!(has_result_event(&lines));
+    }
+
+    #[test]
+    fn has_result_event_ignores_codex_intermediate_events() {
+        // Only the terminal turn.completed settles; earlier codex events must not.
+        let pre = vec![
+            r#"{"type":"thread.started"}"#.to_string(),
+            r#"{"type":"item.completed","item":{"type":"agent_message","text":"partial"}}"#.to_string(),
+        ];
+        assert!(!has_result_event(&pre));
     }
 
     #[test]

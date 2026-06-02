@@ -268,7 +268,9 @@ OPEN_CLEAN_ENV=(
 
 # Always inject staging socket paths via env to ensure they take effect
 # (LSEnvironment requires app restart to pick up plist changes).
-"${OPEN_CLEAN_ENV[@]}" TERMMESH_SOCKET_PATH="$TERMMESH_SOCKET" TERMMESH_DAEMON_UNIX_PATH="$TERMMESH_DAEMON_SOCKET" open "$APP_PATH"
+# STAGING is an isolated verification instance, so allow external tooling
+# (e.g. `tm-agent` run from a non-term-mesh shell) to drive it over the socket.
+"${OPEN_CLEAN_ENV[@]}" TERMMESH_SOCKET_PATH="$TERMMESH_SOCKET" TERMMESH_DAEMON_UNIX_PATH="$TERMMESH_DAEMON_SOCKET" open "$APP_PATH" --env TERMMESH_SOCKET_MODE=allowAll
 osascript -e "tell application id \"${BUNDLE_ID}\" to activate" || true
 
 # Safety: ensure only one instance is running.
