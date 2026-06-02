@@ -15,7 +15,10 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::net::UnixStream;
 use tokio::sync::Mutex;
+use tokio::time::timeout;
 
 use super::{merge_instructions, HeadlessManager, SpawnParams};
 
@@ -486,6 +489,111 @@ fn should_use_gui_pane_path(is_headless_team: bool, app_socket_path: Option<&str
     !is_headless_team && app_socket_path.map(|s| !s.trim().is_empty()).unwrap_or(false)
 }
 
+// ── §4 P2b-1: daemon → Swift-app RPC client ─────────────────────────────────
+// The GUI watch path drives a watcher pane the daemon does not own, so it must
+// talk to the Swift app over the app socket. Same wire format as
+// query_gui_team_workers (newline-delimited JSON-RPC, single-line response).
+// P2b-2 wires these into the GUI execution path; until then they are unused.
+
+/// Send one JSON-RPC request to the Swift app over its unix socket and return the
+/// parsed response envelope.
+#[allow(dead_code)]
+async fn call_app_rpc(
+    app_socket: &str,
+    method: &str,
+    params: serde_json::Value,
+    timeout_secs: u64,
+) -> Result<serde_json::Value, String> {
+    let stream = UnixStream::connect(app_socket)
+        .await
+        .map_err(|e| format!("connect {app_socket}: {e}"))?;
+    let req = serde_json::json!({
+        "jsonrpc": "2.0", "id": 1, "method": method, "params": params,
+    });
+    let mut line = serde_json::to_string(&req).map_err(|e| format!("serialize: {e}"))?;
+    line.push('\n');
+    let (rd, mut wr) = stream.into_split();
+    wr.write_all(line.as_bytes())
+        .await
+        .map_err(|e| format!("write: {e}"))?;
+    wr.flush().await.map_err(|e| format!("flush: {e}"))?;
+    let mut resp = String::new();
+    let mut reader = BufReader::new(rd);
+    match timeout(Duration::from_secs(timeout_secs), reader.read_line(&mut resp)).await {
+        Ok(Ok(_)) => {}
+        Ok(Err(e)) => return Err(format!("read: {e}")),
+        Err(_) => return Err(format!("app rpc '{method}' timed out after {timeout_secs}s")),
+    }
+    if resp.trim().is_empty() {
+        return Err(format!("app rpc '{method}': empty response (app unreachable?)"));
+    }
+    serde_json::from_str(&resp).map_err(|e| format!("parse '{method}' response: {e}"))
+}
+
+/// Unwrap a Swift v2 RPC envelope: returns the `result` value, or an error when
+/// the app reported an `error` payload or `ok:false`.
+#[allow(dead_code)]
+fn app_rpc_result(v: &serde_json::Value) -> Result<&serde_json::Value, String> {
+    if let Some(err) = v.get("error") {
+        return Err(format!("{err}"));
+    }
+    if v.get("ok").and_then(|b| b.as_bool()) == Some(false) {
+        return Err(format!("rpc reported failure: {v}"));
+    }
+    Ok(v.get("result").unwrap_or(v))
+}
+
+/// §4 GUI path: hard-restart (recycle) a watcher pane to drop accumulated context
+/// before a fresh check — the stateless guarantee, applied to the live pane.
+#[allow(dead_code)]
+async fn app_recycle_pane(app_socket: &str, team: &str, agent: &str) -> Result<(), String> {
+    let v = call_app_rpc(
+        app_socket,
+        "team.restart",
+        serde_json::json!({"team_name": team, "agent_name": agent, "mode": "hard"}),
+        10,
+    )
+    .await?;
+    app_rpc_result(&v).map(|_| ())
+}
+
+/// §4 GUI path: send the review prompt text to the watcher pane.
+#[allow(dead_code)]
+async fn app_send_pane(app_socket: &str, team: &str, agent: &str, text: &str) -> Result<(), String> {
+    let v = call_app_rpc(
+        app_socket,
+        "team.send",
+        serde_json::json!({"team_name": team, "agent_name": agent, "text": text}),
+        10,
+    )
+    .await?;
+    app_rpc_result(&v).map(|_| ())
+}
+
+/// §4 GUI path: read the watcher pane's terminal text. Swift already base64-
+/// decodes it into `result.text`, so we return that string directly.
+#[allow(dead_code)]
+async fn app_read_pane(
+    app_socket: &str,
+    team: &str,
+    agent: &str,
+    lines: usize,
+) -> Result<String, String> {
+    let v = call_app_rpc(
+        app_socket,
+        "team.read",
+        serde_json::json!({"team_name": team, "agent_name": agent, "lines": lines}),
+        10,
+    )
+    .await?;
+    let result = app_rpc_result(&v)?;
+    Ok(result
+        .get("text")
+        .and_then(|t| t.as_str())
+        .unwrap_or("")
+        .to_string())
+}
+
 /// True once the claude turn has settled — a terminal `result` event is present.
 fn has_result_event(raw_lines: &[String]) -> bool {
     raw_lines.iter().any(|line| {
@@ -662,6 +770,19 @@ mod tests {
         assert!(!should_use_gui_pane_path(false, None));
         assert!(!should_use_gui_pane_path(false, Some("")));
         assert!(!should_use_gui_pane_path(false, Some("   ")));
+    }
+
+    #[test]
+    fn app_rpc_result_unwraps_ok_and_rejects_errors() {
+        // Swift v2 success envelope → return the result object (team.read shape).
+        let ok = serde_json::json!({"id":1,"ok":true,"result":{"text":"verdict"}});
+        assert_eq!(app_rpc_result(&ok).unwrap()["text"], "verdict");
+        // error payload → Err
+        let err = serde_json::json!({"id":1,"error":{"code":"not_found","message":"x"}});
+        assert!(app_rpc_result(&err).is_err());
+        // explicit ok:false → Err
+        let nak = serde_json::json!({"id":1,"ok":false});
+        assert!(app_rpc_result(&nak).is_err());
     }
 
     #[test]
