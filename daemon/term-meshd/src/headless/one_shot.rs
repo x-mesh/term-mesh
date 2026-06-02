@@ -454,36 +454,64 @@ impl HeadlessOneShotRunner {
         )
         .await;
         tokio::time::sleep(Duration::from_millis(GUI_INPUT_READY_BUFFER_MS)).await;
-        // 3. Send a plain review prompt. The GUI watcher is a real claude/codex
-        //    CLI running its own runbook — it answers via `tm-agent reply`, which
-        //    always writes the full reply to
-        //    ~/.term-mesh/results/<team>/<watcher>-reply.md and posts a truncated
-        //    summary to the leader inbox. So no sentinel directive; we recover the
-        //    verdict from that canonical result file.
+        // 3-5. Send a plain review prompt and poll the watcher's reply file. The
+        //      GUI watcher is a real claude/codex CLI running its own runbook — it
+        //      answers via `tm-agent reply`, which always writes the full reply to
+        //      ~/.term-mesh/results/<team>/<watcher>-reply.md (the leader-inbox
+        //      message is only a truncated summary), so no sentinel directive.
+        //      The recycled CLI's input box may not be ready when the first prompt
+        //      lands (cold-starting Claude Code / codex drops it), so re-send every
+        //      GUI_RESEND_INTERVAL until the watcher replies (reply file rewritten
+        //      after `since`) or the budget elapses. Re-sending a busy watcher is
+        //      harmless — the file holds its latest reply.
         let since = std::time::SystemTime::now();
         let message = build_review_message(&input);
-        if let Err(e) = app_send_pane(app_socket, &input.team_name, WATCHER, &message).await {
-            let msg = format!("send failed: {e}");
-            return make(true, false, WatchExitStatus::SpawnFailed, msg.clone(), Some(msg));
-        }
-        // 4. Press Return to submit the prompt.
-        if let Err(e) = app_send_key_pane(app_socket, &input.team_name, WATCHER, "return").await {
-            let msg = format!("send_key failed: {e}");
-            return make(true, false, WatchExitStatus::SpawnFailed, msg.clone(), Some(msg));
-        }
-        // 5. Poll the watcher's reply result file for this tick's verdict — it is
-        //    (re)written strictly after `since` when the watcher replies.
-        let (verdict, status) =
-            wait_for_reply_gui(&input.team_name, WATCHER, since, input.reply_timeout).await;
-        match status {
-            WatchExitStatus::Replied => make(true, true, status, verdict, None),
-            _ => make(
-                true,
-                false,
-                status,
-                String::new(),
-                Some("verdict timeout (watcher wrote no reply before reply_timeout)".to_string()),
-            ),
+        let reply_path = watcher_reply_path(&input.team_name, WATCHER);
+        let deadline = Instant::now() + input.reply_timeout;
+        let mut last_send: Option<Instant> = None;
+        loop {
+            let resend_due = last_send
+                .map(|t| t.elapsed() >= GUI_RESEND_INTERVAL)
+                .unwrap_or(true);
+            if resend_due {
+                if let Err(e) =
+                    app_send_pane(app_socket, &input.team_name, WATCHER, &message).await
+                {
+                    let msg = format!("send failed: {e}");
+                    return make(true, false, WatchExitStatus::SpawnFailed, msg.clone(), Some(msg));
+                }
+                if let Err(e) =
+                    app_send_key_pane(app_socket, &input.team_name, WATCHER, "return").await
+                {
+                    let msg = format!("send_key failed: {e}");
+                    return make(true, false, WatchExitStatus::SpawnFailed, msg.clone(), Some(msg));
+                }
+                last_send = Some(Instant::now());
+            }
+            // A fresh (mtime > since) non-empty reply settles this tick's verdict.
+            if let Some(ref p) = reply_path {
+                if let Ok(meta) = tokio::fs::metadata(p).await {
+                    if meta.modified().map(|m| m > since).unwrap_or(false) {
+                        if let Ok(content) = tokio::fs::read_to_string(p).await {
+                            if !content.trim().is_empty() {
+                                return make(true, true, WatchExitStatus::Replied, content, None);
+                            }
+                        }
+                    }
+                }
+            }
+            if Instant::now() >= deadline {
+                return make(
+                    true,
+                    false,
+                    WatchExitStatus::Timeout,
+                    String::new(),
+                    Some(
+                        "verdict timeout (watcher wrote no reply before reply_timeout)".to_string(),
+                    ),
+                );
+            }
+            tokio::time::sleep(Duration::from_millis(400)).await;
         }
     }
 }
@@ -704,6 +732,9 @@ const GUI_RECYCLE_READY_CAP_MS: u64 = 12000;
 /// finished rendering" and "input box accepts paste". Live testing showed a
 /// prompt sent right at output-settle was still dropped.
 const GUI_INPUT_READY_BUFFER_MS: u64 = 2500;
+/// Re-send the review if the watcher hasn't replied within this interval — the
+/// recycled CLI may have dropped the first prompt while still cold-starting.
+const GUI_RESEND_INTERVAL: Duration = Duration::from_secs(30);
 
 /// §4 GUI path: after a recycle (hard restart), wait until the freshly respawned
 /// CLI in the watcher pane is ready for input. A fixed sleep is fragile — Claude
@@ -754,39 +785,6 @@ fn watcher_reply_path(team: &str, agent: &str) -> Option<std::path::PathBuf> {
             .join(team)
             .join(format!("{agent}-reply.md"))
     })
-}
-
-/// §4 GUI path: poll the watcher's reply result file until it is (re)written
-/// after `since` (this tick's reply) or the reply budget elapses. The
-/// `mtime > since` check distinguishes this tick's reply from a stale one left by
-/// a prior check, so a recycled watcher's fresh `tm-agent reply` is what settles
-/// the verdict.
-async fn wait_for_reply_gui(
-    team: &str,
-    agent: &str,
-    since: std::time::SystemTime,
-    timeout_budget: Duration,
-) -> (String, WatchExitStatus) {
-    const POLL: Duration = Duration::from_millis(300);
-    let Some(path) = watcher_reply_path(team, agent) else {
-        return (String::new(), WatchExitStatus::Timeout);
-    };
-    let deadline = Instant::now() + timeout_budget;
-    loop {
-        if let Ok(meta) = tokio::fs::metadata(&path).await {
-            if meta.modified().map(|m| m > since).unwrap_or(false) {
-                if let Ok(content) = tokio::fs::read_to_string(&path).await {
-                    if !content.trim().is_empty() {
-                        return (content, WatchExitStatus::Replied);
-                    }
-                }
-            }
-        }
-        if Instant::now() >= deadline {
-            return (String::new(), WatchExitStatus::Timeout);
-        }
-        tokio::time::sleep(POLL).await;
-    }
 }
 
 /// True once the claude turn has settled — a terminal `result` event is present.
