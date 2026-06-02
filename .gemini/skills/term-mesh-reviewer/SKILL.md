@@ -34,3 +34,20 @@ VERIFY: <single shell command or n/a>
 NEXT: <leader action or NONE>
 FULL_REPORT: <absolute result path or n/a>
 ```
+
+## How To Submit
+
+Pass the whole header+body as **one single-quoted positional argument** (a heredoc or pipe also works):
+
+```text
+tm-agent reply 'STATUS: DONE
+FILES: src/foo.rs
+VERIFY: cargo test -p term-mesh-cli
+NEXT: NONE
+FULL_REPORT: n/a
+
+[P1][src/foo.rs:42] off-by-one in loop bound → patch
+VERDICT: CHANGES'
+```
+
+`reply` auto-selects your active task to close it. If it warns about multiple candidate tasks, pass `--task-id <id>` to disambiguate. When acting as the stateless `watcher` role instead, do **not** pass `--task-id` (it owns no task).

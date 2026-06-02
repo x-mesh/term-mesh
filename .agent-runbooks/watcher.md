@@ -34,3 +34,21 @@ VERIFY: <single shell command or n/a>
 NEXT: <leader action or NONE>
 FULL_REPORT: <absolute result path or n/a>
 ```
+
+## How To Submit
+
+Pass the whole header+body as **one single-quoted positional argument** — not a heredoc:
+
+```text
+tm-agent reply 'STATUS: DONE
+FILES: none
+VERIFY: n/a
+NEXT: NONE
+FULL_REPORT: n/a
+
+[VERDICT] on-track
+[FINDING] none
+[SPEC_CLAUSE] n/a'
+```
+
+The watcher is stateless and owns no task, so **do not pass `--task-id`** and ignore any "no active task" note — the reply itself delivers the verdict (it is written to the `<watcher>-reply.md` result file the `/watch` leader polls).

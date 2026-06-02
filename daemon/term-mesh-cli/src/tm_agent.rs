@@ -5347,7 +5347,22 @@ fn main() {
         }
         Commands::Reply { text, from, task_id: explicit_task_id } => {
             let sender = from.unwrap_or_else(|| agent.clone());
-            let content = text.join(" ");
+            let mut content = text.join(" ");
+            // stdin fallback: agents frequently submit the body via a heredoc
+            // (`tm-agent reply <<'EOF' ... EOF`) or pipe. The body is a positional
+            // arg, so without this the piped text is silently dropped and STATUS
+            // parses as n/a (the verdict never reaches the leader). Read stdin only
+            // when no positional body was given AND stdin is not a TTY (a pipe or
+            // heredoc is attached), so interactive use is unaffected.
+            if content.trim().is_empty() && !std::io::stdin().is_terminal() {
+                use std::io::Read as _;
+                let mut piped = String::new();
+                if std::io::stdin().read_to_string(&mut piped).is_ok()
+                    && !piped.trim().is_empty()
+                {
+                    content = piped;
+                }
+            }
             // STATUS enforce (C1) — map protocol STATUS to task state before any I/O
             let (reply_headers, body_summary) = reply_header_and_summary(&content, 1500);
             let protocol_status = reply_headers["status"].as_str().unwrap_or("n/a");
@@ -5361,8 +5376,17 @@ fn main() {
             };
             // Write the canonical task result when possible, plus the legacy
             // per-agent alias for compatibility with older readers.
+            // The watcher role is stateless and per-tick: `/watch` never assigns it
+            // a task (watch_controller writes board.jsonl + leader inbox only), and
+            // the GUI watch path polls the `<watcher>-reply.md` alias file, not a
+            // task result. Skip auto-select for it so a verdict reply never closes
+            // an unrelated task lingering on a recycled watcher pane. An explicit
+            // --task-id still wins for the rare case the leader assigned one.
+            let is_stateless_watcher = sender == "watcher" || sender.starts_with("watcher");
             let reply_task_id = if let Some(tid) = explicit_task_id {
                 Some(tid)
+            } else if is_stateless_watcher {
+                None
             } else {
                 let (selected, candidates) = select_reply_task(&sock, &team, &sender);
                 if candidates.len() >= 2 {
@@ -5387,7 +5411,20 @@ fn main() {
             if let Some(path) = result_path {
                 msg_params["result_path"] = json!(path.to_string_lossy());
             }
-            print_result(rpc_call(&sock, "team.message.post", msg_params));
+            // team.message.post — retry once on failure, but never exit: the
+            // verdict is still recorded in the alias/task result files below and
+            // the task is completed afterward, so a transient inbox-post failure
+            // must not abort the reply (which would skip task completion and hang
+            // the leader's wait). Mirrors the team.report handling just below.
+            match rpc_call(&sock, "team.message.post", msg_params.clone()) {
+                Ok(v) => print_result(Ok(v)),
+                Err(e) => {
+                    eprintln!("  Warning: team.message.post failed: {e}, retrying...");
+                    if let Err(e2) = rpc_call(&sock, "team.message.post", msg_params) {
+                        eprintln!("  Warning: team.message.post retry failed: {e2}");
+                    }
+                }
+            }
             // Auto-submit report for wait detection (with result_path)
             let mut report_params = json!({
                 "team_name": team, "agent_name": sender, "content": summary,
@@ -5436,6 +5473,12 @@ fn main() {
                     let _ = rpc_call(&sock, "team.task.update", update);
                 }
                 eprintln!("closed task {tid} for {sender}");
+            } else if is_stateless_watcher {
+                // The stateless watcher delivered its verdict via the alias reply
+                // file (the GUI watch path polls it); there is no task to close, so
+                // this is success — not the exit-2 path non-watcher roles take when
+                // a task they were expected to own is missing.
+                eprintln!("watcher reply recorded (no task to close)");
             } else {
                 // Emit a structured JSON error so leader-side parsers can
                 // recognize the condition (and exit 2 to distinguish from
