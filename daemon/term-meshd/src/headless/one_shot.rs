@@ -465,7 +465,21 @@ impl HeadlessOneShotRunner {
         //      after `since`) or the budget elapses. Re-sending a busy watcher is
         //      harmless — the file holds its latest reply.
         let since = std::time::SystemTime::now();
-        let message = build_review_message(&input);
+        // build_review_message tells the watcher to "output a single structured
+        // verdict (and nothing else)", which makes a GUI claude/codex print the
+        // verdict to its terminal but NOT run `tm-agent reply` — so no reply file
+        // is written and §4 can't recover it. Override that for the GUI path: the
+        // verdict is only delivered by RUNNING `tm-agent reply` (its result file is
+        // what we poll). Printing alone does nothing here.
+        let message = format!(
+            "{}\n\nDELIVERY (overrides any \"nothing else\" instruction above): you \
+             MUST submit the verdict by RUNNING the shell command `tm-agent reply` \
+             with a STATUS/FILES/VERIFY/NEXT/FULL_REPORT header followed by your \
+             [VERDICT]/[FINDING]/[SPEC_CLAUSE] lines in the body. Running that \
+             command is how the verdict is delivered — printing it to the terminal \
+             alone does nothing.",
+            build_review_message(&input)
+        );
         let reply_path = watcher_reply_path(&input.team_name, WATCHER);
         let deadline = Instant::now() + input.reply_timeout;
         let mut last_send: Option<Instant> = None;
