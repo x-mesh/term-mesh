@@ -4,6 +4,15 @@ All notable changes to term-mesh are documented here.
 
 ## [Unreleased]
 
+## [0.145.0] - 2026-06-03
+
+### Fixed
+- **peer 창에서 한글 등 멀티바이트 텍스트를 붙여넣으면 깨지던 문제** — 다른 호스트의 pane에 한글·이모지 등을 복붙할 때 "결과"가 "ê²°ê³¼"처럼 깨지던 문제. 붙여넣기가 내부 전송 프레임 경계에서 쪼개질 때 불완전한 UTF-8 바이트를 다음 프레임으로 이어붙이도록 해 글자가 온전히 전달된다.
+
+### Thanks to 1 contributor!
+
+- [@JINWOO-J](https://github.com/JINWOO-J)
+
 ## [0.144.0] - 2026-06-03
 
 ### Fixed
