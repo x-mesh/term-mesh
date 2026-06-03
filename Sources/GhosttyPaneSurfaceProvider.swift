@@ -820,8 +820,26 @@ private func absorbPasteContinuation(
         return close + 6
     }
 
+    // Hold back a trailing incomplete ESC sequence so a close marker
+    // (`\e[201~`) that straddles a relay read boundary — e.g. `…\e[20` here
+    // and `1~…` in the next frame — can be reassembled. The buffered tail is
+    // prepended at the next `sendPeerInputBytes` entry (peerPendingInputTail),
+    // so `absorbPasteContinuation` then sees the full marker and closes the
+    // paste. Without this the partial marker is appended to the body verbatim,
+    // the paste never closes, and subsequent keystrokes are swallowed into the
+    // accumulator until the idle timeout. Mirrors the FIX B tail deferral on
+    // the non-paste path (and the UTF-8 tail deferral in sendPeerInputBytes).
+    let tailLen = trailingIncompleteEscape(arr, bound: peerPendingInputTailMax)
+    let bodyEnd = arr.count - tailLen
+    if tailLen > 0 {
+        let tail = Array(arr[bodyEnd...])
+        peerPendingInputTail[surfaceKey] = tail
+        schedulePeerPendingTailFlush(surfaceKey: surfaceKey, tail: tail)
+    }
     var body = peerPendingPasteBody[surfaceKey] ?? Data()
-    body.append(contentsOf: arr)
+    if bodyEnd > 0 {
+        body.append(contentsOf: arr[0..<bodyEnd])
+    }
     if body.count > peerPendingPasteBodyMax {
         flushPeerPasteBody(surface, body)
         peerPendingPasteBody.removeValue(forKey: surfaceKey)
