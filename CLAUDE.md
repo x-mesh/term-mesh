@@ -721,3 +721,8 @@ Notes:
 - Versioning: bump the minor version for updates unless explicitly asked otherwise.
 - Changelog: always update both `CHANGELOG.md` and the docs-site version.
 - Sentry dSYM: required for symbolicated crash reports (EXC_BAD_ACCESS frames otherwise show `None`). `./scripts/upload-dsym.sh` without `--build` uploads the latest Release dSYM already in DerivedData.
+
+## Lessons (x-humble)
+<!-- Section managed by x-humble. Manual editing allowed. -->
+- STOP: 같은 가설이 2회 실패해도 계속 밀어붙이는 것 — 가설 자체를 폐기하고 다른 방향(데이터/호스트/회귀)으로 전환. (L3, confirmed 2 times, 2026-06-03)
+- START: UI/렌더링 버그 디버깅 시 코드·아키텍처 추론 전에 런타임 ground-truth(계측·바이트 단위 로그)부터 확인. (L2, confirmed 2 times, 2026-06-03)

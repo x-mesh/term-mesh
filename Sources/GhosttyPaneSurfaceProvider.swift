@@ -294,6 +294,19 @@ final class GhosttyPaneSurfaceProvider: PeerSurfaceProvider {
                     if sizeChanged {
                         // ESC[2J (erase screen) + ESC[H (cursor home).
                         hub.broadcast(Data([0x1B, 0x5B, 0x32, 0x4A, 0x1B, 0x5B, 0x48]))
+                        // Then re-send the host viewport snapshot at the new
+                        // size. The bare clear above (added in v0.139.0 to stop
+                        // garbled absolute-cursor TUI output) assumed a
+                        // SIGWINCH-driven repaint would refill the grid — but
+                        // plain shells (bash/zsh at a prompt) do NOT repaint on
+                        // SIGWINCH, so the viewer stayed blank after every real
+                        // resize (initial sizing from bounds=.zero, window
+                        // shrink, etc.). Re-sending the snapshot restores
+                        // content for plain shells; TUIs additionally repaint
+                        // via the PTY tap, overwriting the plain-text snapshot.
+                        if let snap = readPaneSnapshot(ptr) {
+                            hub.broadcast(snap)
+                        }
                     }
                 }
             },

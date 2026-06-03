@@ -313,37 +313,58 @@ if [[ -n "$TAG" ]]; then
 fi
 # Avoid inheriting term-mesh/ghostty environment variables from the terminal that
 # runs this script (often inside another term-mesh instance), which can cause
-# socket and resource-path conflicts.
-OPEN_CLEAN_ENV=(
-  env
-  -u TERMMESH_SOCKET_PATH
-  -u TERMMESH_TAB_ID
-  -u TERMMESH_PANEL_ID
-  -u TERMMESH_DAEMON_UNIX_PATH
-  -u TERMMESH_TAG
-  -u TERMMESH_DEBUG_LOG
-  -u TERMMESH_BUNDLE_ID
-  -u TERMMESH_SHELL_INTEGRATION
-  -u CMUX_SOCKET_PATH
-  -u CMUX_TAB_ID
-  -u CMUX_PANEL_ID
-  -u CMUXD_UNIX_PATH
-  -u CMUX_TAG
-  -u CMUX_DEBUG_LOG
-  -u CMUX_BUNDLE_ID
-  -u CMUX_SHELL_INTEGRATION
-  -u GHOSTTY_BIN_DIR
-  -u GHOSTTY_RESOURCES_DIR
-  -u GHOSTTY_SHELL_FEATURES
+# socket and resource-path conflicts. `open` passes its own environment to a
+# freshly-launched app, so scrubbing here keeps the launched app clean.
+#
+# IMPORTANT: do NOT wrap `open` with `env`/`env -u` to scrub. Invoking `open`
+# through `/usr/bin/env` breaks the GUI launch on macOS — `open` returns 0 but
+# LaunchServices never actually starts the app (silent "won't start"). Instead
+# `unset` the vars inside a subshell and call `open` directly; the scrub still
+# applies because the subshell's environment is what the app inherits.
+SCRUB_VARS=(
+  TERMMESH_SOCKET_PATH
+  TERMMESH_TAB_ID
+  TERMMESH_PANEL_ID
+  TERMMESH_DAEMON_UNIX_PATH
+  TERMMESH_TAG
+  TERMMESH_DEBUG_LOG
+  TERMMESH_BUNDLE_ID
+  TERMMESH_SHELL_INTEGRATION
+  CMUX_SOCKET_PATH
+  CMUX_TAB_ID
+  CMUX_PANEL_ID
+  CMUXD_UNIX_PATH
+  CMUX_TAG
+  CMUX_DEBUG_LOG
+  CMUX_BUNDLE_ID
+  CMUX_SHELL_INTEGRATION
+  GHOSTTY_BIN_DIR
+  GHOSTTY_RESOURCES_DIR
+  GHOSTTY_SHELL_FEATURES
   # Dev shells (including CI/Codex) often force-disable paging by exporting these.
   # Don't leak that into term-mesh, otherwise `git diff` won't page even with PAGER=less.
-  -u GIT_PAGER
-  -u GH_PAGER
-  -u TERMINFO
-  -u XDG_DATA_DIRS
+  GIT_PAGER
+  GH_PAGER
+  TERMINFO
+  XDG_DATA_DIRS
 )
 
-# Build optional env vars array for the open command
+# Launch `open "$APP_PATH"` inside a subshell with the scrub applied and any
+# KEY=VAL overrides (passed as args) exported. The subshell isolates the parent
+# environment; `open` is invoked directly (never via `env`) so the GUI launch
+# succeeds.
+open_clean() {
+  (
+    unset "${SCRUB_VARS[@]}"
+    while [[ $# -gt 0 ]]; do
+      export "$1"
+      shift
+    done
+    open "$APP_PATH"
+  )
+}
+
+# Build optional env vars for the open command (KEY=VAL form).
 EXTRA_ENV=()
 if [[ "$ALLOW_ALL" -eq 1 ]]; then
   EXTRA_ENV+=(TERMMESH_SOCKET_MODE=allowAll)
@@ -351,12 +372,18 @@ fi
 
 if [[ -n "${TAG_SLUG:-}" && -n "${TERMMESH_SOCKET:-}" ]]; then
   # Ensure tag-specific socket paths win even if the caller has TERMMESH_* overrides.
-  "${OPEN_CLEAN_ENV[@]}" "${EXTRA_ENV[@]}" TERMMESH_TAG="$TAG_SLUG" TERMMESH_SOCKET_PATH="$TERMMESH_SOCKET" TERMMESH_DAEMON_UNIX_PATH="$TERMMESH_DAEMON_SOCKET" TERMMESH_DEBUG_LOG="$TERMMESH_DEBUG_LOG" open "$APP_PATH"
+  open_clean "${EXTRA_ENV[@]}" \
+    "TERMMESH_TAG=$TAG_SLUG" \
+    "TERMMESH_SOCKET_PATH=$TERMMESH_SOCKET" \
+    "TERMMESH_DAEMON_UNIX_PATH=$TERMMESH_DAEMON_SOCKET" \
+    "TERMMESH_DEBUG_LOG=$TERMMESH_DEBUG_LOG"
 elif [[ -n "${TAG_SLUG:-}" ]]; then
-  "${OPEN_CLEAN_ENV[@]}" "${EXTRA_ENV[@]}" TERMMESH_TAG="$TAG_SLUG" TERMMESH_DEBUG_LOG="$TERMMESH_DEBUG_LOG" open "$APP_PATH"
+  open_clean "${EXTRA_ENV[@]}" \
+    "TERMMESH_TAG=$TAG_SLUG" \
+    "TERMMESH_DEBUG_LOG=$TERMMESH_DEBUG_LOG"
 else
   echo "/tmp/term-mesh-debug.log" > /tmp/term-mesh-last-debug-log-path || true
-  "${OPEN_CLEAN_ENV[@]}" "${EXTRA_ENV[@]}" open "$APP_PATH"
+  open_clean "${EXTRA_ENV[@]}"
 fi
 # `open` returns before LaunchServices finishes registering the app's bundle id,
 # so an immediate `osascript ... activate` fails with -1728 (errAENoSuchObject).

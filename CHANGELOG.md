@@ -4,6 +4,15 @@ All notable changes to term-mesh are documented here.
 
 ## [Unreleased]
 
+## [0.144.0] - 2026-06-03
+
+### Fixed
+- **원격 peer 화면(pane)이 비어 보이던 문제** — 다른 호스트의 작업 공간을 peer로 접속해 볼 때, 처음 연결한 직후나 창 크기를 바꿀 때 pane이 검게 비어 보이던 문제(v0.139.0 회귀). 리사이즈 시 화면을 지운 뒤 호스트의 현재 화면을 다시 보내도록 해, 일반 쉘이든 vim·htop 같은 전체화면 앱이든 내용이 바로 복원된다.
+
+### Thanks to 1 contributor!
+
+- [@JINWOO-J](https://github.com/JINWOO-J)
+
 ## [0.143.0] - 2026-06-02
 
 ### Fixed
