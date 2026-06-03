@@ -4,6 +4,15 @@ All notable changes to term-mesh are documented here.
 
 ## [Unreleased]
 
+## [0.146.0] - 2026-06-04
+
+### Fixed
+- **peer 창에서 긴 텍스트를 붙여넣을 때 간헐적으로 입력이 먹통이 되던 문제** — 붙여넣기 끝을 알리는 제어 시퀀스가 내부 전송 경계에 정확히 걸치면 붙여넣기가 닫히지 않아 이후 키 입력이 삼켜지던 문제. 쪼개진 제어 시퀀스를 다음 프레임에서 이어붙여 항상 정상적으로 닫히게 했다.
+
+### Thanks to 1 contributor!
+
+- [@JINWOO-J](https://github.com/JINWOO-J)
+
 ## [0.145.0] - 2026-06-03
 
 ### Fixed
