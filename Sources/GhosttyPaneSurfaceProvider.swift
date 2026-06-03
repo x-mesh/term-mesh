@@ -936,6 +936,35 @@ func debugInjectPeerInput(_ surface: ghostty_surface_t, bytes: Data) {
 }
 #endif
 
+/// Number of trailing bytes that form an *incomplete* UTF-8 multibyte
+/// sequence (a lead byte plus fewer continuation bytes than its length
+/// requires). Returns 0 when the buffer ends on a complete character or on
+/// invalid data. Used to defer a partial sequence to the next input frame so
+/// `String(bytes:encoding:.utf8)` decodes the full character instead of
+/// garbling it via the Latin-1 per-byte fallback.
+private func trailingIncompleteUTF8(_ arr: [UInt8]) -> Int {
+    let n = arr.count
+    if n == 0 { return 0 }
+    // Walk back over continuation bytes (10xxxxxx). A complete sequence needs
+    // at most 3 continuation bytes (4-byte char), so cap the scan.
+    var cont = 0
+    var idx = n - 1
+    while idx >= 0, cont < 3, (arr[idx] & 0xC0) == 0x80 {
+        cont += 1
+        idx -= 1
+    }
+    if idx < 0 { return 0 }            // ran off the front — malformed, don't buffer
+    let lead = arr[idx]
+    let expected: Int
+    if lead & 0x80 == 0 { return 0 }   // ASCII byte can't start a multibyte seq
+    else if lead & 0xE0 == 0xC0 { expected = 2 }
+    else if lead & 0xF0 == 0xE0 { expected = 3 }
+    else if lead & 0xF8 == 0xF0 { expected = 4 }
+    else { return 0 }                  // not a valid lead byte
+    let have = cont + 1                 // lead + continuation bytes present
+    return have < expected ? have : 0   // incomplete → buffer; complete → process now
+}
+
 @MainActor
 private func sendPeerInputBytes(_ surface: ghostty_surface_t, bytes: Data, finalFlush: Bool = false) {
     // FIX 2 / FIX B: prepend any bytes carried over from the previous chunk,
@@ -985,7 +1014,19 @@ private func sendPeerInputBytes(_ surface: ghostty_surface_t, bytes: Data, final
     // On a final flush (timer-driven) treat every byte as processable so a
     // deferred lone Escape / stale escape head is delivered instead of being
     // re-buffered forever.
-    let tailLen = finalFlush ? 0 : trailingIncompleteEscape(arr, bound: peerPendingInputTailMax)
+    //
+    // Defer two kinds of trailing partials so the main loop never sees a
+    // truncated sequence: (1) an incomplete ESC head, and (2) an incomplete
+    // UTF-8 multibyte sequence. A paste of multibyte text (e.g. Korean, 3
+    // bytes/char) split across protocol frames would otherwise leave a partial
+    // UTF-8 sequence at the frame boundary; the printable path's
+    // `String(bytes:encoding:.utf8)` then fails and the per-byte fallback
+    // decodes each byte as a Latin-1 scalar — turning "결과" into "ê²°ê³¼".
+    // Buffering the partial tail and prepending it to the next frame lets the
+    // full sequence decode correctly.
+    let escTail = finalFlush ? 0 : trailingIncompleteEscape(arr, bound: peerPendingInputTailMax)
+    let utf8Tail = finalFlush ? 0 : trailingIncompleteUTF8(arr)
+    let tailLen = max(escTail, utf8Tail)
     let processCount = arr.count - tailLen
     if tailLen > 0 {
         let tail = Array(arr[processCount...])
