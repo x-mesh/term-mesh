@@ -353,9 +353,13 @@ class GhosttyApp {
             return GhosttyApp.shared.handleAction(target: target, action: action)
         }
         runtimeConfig.read_clipboard_cb = { userdata, location, state in
-            // Read clipboard
+            // Read clipboard. Returns bool (ghostty ABI changed void -> bool):
+            // true means we accepted the request and will complete it, so ghostty
+            // keeps the request state alive; false means unhandled, so ghostty
+            // frees the request state. Mismatching this leaks or double-frees the
+            // request — see ghostty src/apprt/embedded.zig `readClipboard`.
             guard let callbackContext = GhosttyApp.callbackContext(from: userdata),
-                  let surface = callbackContext.runtimeSurface else { return }
+                  let surface = callbackContext.runtimeSurface else { return false }
 
             let pasteboard = GhosttyPasteboardHelper.pasteboard(for: location)
             let value = pasteboard.flatMap { GhosttyPasteboardHelper.stringContents(from: $0) } ?? ""
@@ -363,6 +367,7 @@ class GhosttyApp {
             value.withCString { ptr in
                 ghostty_surface_complete_clipboard_request(surface, ptr, state, false)
             }
+            return true
         }
         runtimeConfig.confirm_read_clipboard_cb = { userdata, content, state, _ in
             guard let content else { return }
