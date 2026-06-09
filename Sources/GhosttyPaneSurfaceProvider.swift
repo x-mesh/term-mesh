@@ -1010,9 +1010,20 @@ private func sendPeerInputBytes(_ surface: ghostty_surface_t, bytes: Data, final
         // this, every subsequent keystroke (ESC, `:`, `q`, `!`) gets
         // absorbed into the paste body and the destination surface
         // becomes unresponsive.
+        //
+        // A `finalFlush` entry forces the same stall handling. The 120ms
+        // deferred-tail timer re-enters here with `finalFlush: true` carrying an
+        // incomplete close prefix (`\e[20`). Routing that through
+        // `absorbPasteContinuation` would re-buffer the same tail and refresh
+        // `peerPendingPasteTimestamp` every tick — a livelock that keeps `idle`
+        // pinned below the 0.75s safety window forever, so the valve never fires
+        // and later keystrokes are swallowed indefinitely. Treat `finalFlush` as
+        // "the burst is over": flush the body, clear state, and let the dangling
+        // bytes fall through (the prelude's `finalFlush` path runs them without
+        // re-deferring a tail).
         let lastTs = peerPendingPasteTimestamp[surfaceKey]
         let idle = lastTs.map { Date().timeIntervalSince($0) } ?? .infinity
-        if idle > peerPendingPasteIdleTimeout {
+        if finalFlush || idle > peerPendingPasteIdleTimeout {
             flushPeerPasteBody(surface, body)
             peerPendingPasteBody.removeValue(forKey: surfaceKey)
             peerPendingPasteTimestamp.removeValue(forKey: surfaceKey)
@@ -1118,17 +1129,25 @@ private func sendPeerInputBytes(_ surface: ghostty_surface_t, bytes: Data, final
                 continue
             }
             // FIX C: no close marker in this frame — open the paste
-            // accumulator. Everything from `i + 6` to end-of-frame becomes
-            // the first slice of the paste body, including any bytes the
-            // FIX B prelude stashed as `peerPendingInputTail` (they belong
-            // to the paste body, not to a partial escape sequence). The
-            // next frame(s) will be funneled through `absorbPasteContinuation`
-            // until `\e[201~` arrives.
-            var body = Data(arr[(i + 6)..<arr.count])
-            if let tail = peerPendingInputTail.removeValue(forKey: surfaceKey),
-               !tail.isEmpty {
-                body.append(contentsOf: tail)
-            }
+            // accumulator. Bytes from `i + 6` up to `processCount` become the
+            // first slice of the paste body. Any trailing incomplete-UTF-8 /
+            // escape tail the FIX B prelude detected (bytes in
+            // `processCount..<arr.count`) is ALREADY stashed in
+            // `peerPendingInputTail`; it must NOT be appended here too. Slicing
+            // to `arr.count` and re-appending the stash would double-count the
+            // partial bytes (e.g. the leading 1–2 bytes of a frame-split Korean
+            // glyph), corrupting the paste. Leave the tail in
+            // `peerPendingInputTail` so the next frame's prelude prepends it
+            // (~`peerPendingInputTail` drain at the top of `sendPeerInputBytes`)
+            // and `absorbPasteContinuation` absorbs the completed glyph. If no
+            // next frame arrives, the scheduled tail flush delivers it.
+            //
+            // `processCount >= i + 6` holds because the opener's terminating
+            // `~` (0x7e, ASCII) stops any trailing-UTF-8/escape tail from
+            // reaching into the marker; `max` is a defensive clamp so a future
+            // tail-detector change can never invert the slice and trap.
+            let bodyEnd = max(i + 6, processCount)
+            let body = Data(arr[(i + 6)..<bodyEnd])
             if body.count > peerPendingPasteBodyMax {
                 flushPeerPasteBody(surface, body)
             } else {
