@@ -1442,13 +1442,18 @@ class TeamTemplateManager: ObservableObject {
         rebuildTemplates()
     }
 
-    // Silently remove blank user-created presets (no agents, no description, no parent) left from aborted adds.
+    // Silently remove blank user-created presets (no agents, no description, no
+    // parent, AND no name) left from aborted adds. A non-empty name means the
+    // user intentionally created and named the preset and may not have added its
+    // first role yet — keep it so it is not lost between rebuild cycles.
     private func pruneAbandonedBlanks() {
         let before = store.customs.count
         store.customs.removeAll { template in
             guard template.origin == .custom, template.parentBuiltInId == nil,
                   case .smart(let p) = template.payload else { return false }
-            return p.agents.isEmpty && p.description.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            return p.agents.isEmpty
+                && p.description.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                && template.name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
         }
         if store.customs.count != before { save() }
     }

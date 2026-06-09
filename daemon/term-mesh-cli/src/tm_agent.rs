@@ -1008,6 +1008,34 @@ enum WatchAction {
         /// Team id to fire a check for (required by watch.trigger_now)
         team: String,
     },
+    /// Diagnose (and optionally repair) a phantom watcher.
+    ///
+    /// A phantom watcher is listed in the team registry but has no live pane —
+    /// `tm-agent status` shows it (often with `heartbeat_age_seconds: null`) yet
+    /// no pane exists, so enabling watch makes every tick fail with
+    /// `recycle failed: workspace_missing`. `doctor` probes liveness (team.read +
+    /// status panel_id), guards a fresh-spawn race, and repairs by recreating the
+    /// pane through the team's own creation path (detach+attach for `ws-*`
+    /// workspace-local teams, remove+add for `create`-based teams). It repairs at
+    /// most once, then fails loud — never loops.
+    Doctor {
+        /// Team id to check (e.g. `ws-1a2b3c4d` or a create-based team name)
+        team: String,
+        /// Watcher agent name (default: `watcher`)
+        watcher: Option<String>,
+        /// Diagnose only — never repair a confirmed phantom (dry-run)
+        #[arg(long)]
+        no_repair: bool,
+        /// Fresh-spawn race guard: poll liveness up to N seconds at 1s intervals
+        #[arg(long)]
+        probe_timeout: Option<u64>,
+        /// CLI to use when recreating the watcher pane (default: current watcher CLI)
+        #[arg(long)]
+        cli: Option<String>,
+        /// Emit machine-readable JSON (always on — accepted for explicitness)
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 // ── Task template system ─────────────────────────────────────────────
@@ -5579,6 +5607,372 @@ fn run_recycle(sock: &PathBuf, team: &str, target: &str, force: bool) {
     print_result(result);
 }
 
+// ── watch doctor: phantom watcher diagnose + repair ─────────────────
+//
+// Design: ~/.term-mesh/results/term-mesh/ai-watch-doctor-design.md
+// Captures the liveness-probe + phantom-repair procedure (previously hand-run
+// prose in watch.md) as one deterministic primitive. All team.* RPCs ride the
+// *app* (Swift) socket; no new RPCs are introduced — only existing team.read /
+// team.status / team.detach / team.attach / team.add_agent are reused.
+
+/// Liveness verdict for a watcher pane, used by `run_watch_doctor`.
+enum WatcherProbe {
+    /// Pane is live and readable, and present in team.status with a `panel_id`.
+    Live,
+    /// No live pane — `team.read` returned `not_found`, the agent is missing from
+    /// status, or its `panel_id` is absent. The phantom condition.
+    Phantom,
+    /// Could not determine — RPC/socket failure (transient during grace loops).
+    RpcError(String),
+}
+
+/// Probe whether a watcher has a live pane via app-socket RPCs.
+///
+/// Phantom triggers (design requirement 1): `team.read` → `not_found`, the agent
+/// is absent from `team.status`, or the status agent's `panel_id` is null/absent.
+/// A null `heartbeat_age_seconds` alone is NOT a trigger (idle live panes report
+/// null too), so it is intentionally ignored.
+fn probe_watcher(app_sock: &PathBuf, team: &str, watcher: &str) -> WatcherProbe {
+    match rpc_call(
+        app_sock,
+        "team.read",
+        json!({ "team_name": team, "agent_name": watcher, "lines": 1 }),
+    ) {
+        Err(e) => return WatcherProbe::RpcError(format!("team.read: {e}")),
+        Ok(r) => {
+            if !r["ok"].as_bool().unwrap_or(false) {
+                let code = r["error"]["code"].as_str().unwrap_or("");
+                if code == "not_found" {
+                    return WatcherProbe::Phantom;
+                }
+                let msg = r["error"]["message"].as_str().unwrap_or("team.read failed");
+                return WatcherProbe::RpcError(format!("team.read [{code}]: {msg}"));
+            }
+        }
+    }
+    // team.read succeeded → pane is reachable. Cross-check status for panel_id.
+    match rpc_call(app_sock, "team.status", json!({ "team_name": team })) {
+        Err(e) => WatcherProbe::RpcError(format!("team.status: {e}")),
+        Ok(st) => {
+            if !st["ok"].as_bool().unwrap_or(false) {
+                let code = st["error"]["code"].as_str().unwrap_or("");
+                let msg = st["error"]["message"]
+                    .as_str()
+                    .unwrap_or("team.status failed");
+                return WatcherProbe::RpcError(format!("team.status [{code}]: {msg}"));
+            }
+            let agent = st["result"]["agents"]
+                .as_array()
+                .and_then(|arr| arr.iter().find(|a| a["name"].as_str() == Some(watcher)));
+            match agent {
+                None => WatcherProbe::Phantom,
+                Some(a) => {
+                    // Hard-proof of a live pane requires BOTH a panel_id and a
+                    // workspace_id; a status row that loses either is a phantom.
+                    let panel_present = a["panel_id"]
+                        .as_str()
+                        .map(|s| !s.is_empty())
+                        .unwrap_or(false);
+                    let workspace_present = a["workspace_id"]
+                        .as_str()
+                        .map(|s| !s.is_empty())
+                        .unwrap_or(false);
+                    if panel_present && workspace_present {
+                        WatcherProbe::Live
+                    } else {
+                        WatcherProbe::Phantom
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Read a watcher's configured `cli`/`model` from `team.status` (best-effort).
+/// Lets a repair inherit the watcher's original CLI/model so the recreated pane
+/// matches the one that went phantom.
+fn read_watcher_cli_model(
+    app_sock: &PathBuf,
+    team: &str,
+    watcher: &str,
+) -> (Option<String>, Option<String>) {
+    match rpc_call(app_sock, "team.status", json!({ "team_name": team })) {
+        Ok(st) => st["result"]["agents"]
+            .as_array()
+            .and_then(|arr| arr.iter().find(|a| a["name"].as_str() == Some(watcher)))
+            .map(|a| {
+                (
+                    a["cli"].as_str().filter(|s| !s.is_empty()).map(String::from),
+                    a["model"]
+                        .as_str()
+                        .filter(|s| !s.is_empty())
+                        .map(String::from),
+                )
+            })
+            .unwrap_or((None, None)),
+        Err(_) => (None, None),
+    }
+}
+
+/// Print the doctor verdict JSON and exit. Diverging so callers don't fall
+/// through after a terminal verdict.
+fn doctor_emit(out: &Value, code: i32) -> ! {
+    println!("{}", pretty(out));
+    process::exit(code);
+}
+
+/// `tm-agent watch doctor <team> [watcher]` — diagnose and repair a phantom watcher.
+///
+/// `_daemon_sock` is unused by the core path (no `watch.*` RPCs); the app (Swift)
+/// socket is resolved internally for every team.* call.
+///
+/// Exit codes: 0 healthy or repaired-alive · 2 phantom confirmed + `--no-repair`
+/// · 3 repair attempted but still dead (fail-loud) · 4 H7 routing risk · 1 RPC /
+/// context error.
+fn run_watch_doctor(
+    _daemon_sock: &PathBuf,
+    team: &str,
+    watcher: Option<&str>,
+    no_repair: bool,
+    probe_timeout: Option<u64>,
+    cli: Option<&str>,
+) {
+    let watcher = watcher.unwrap_or("watcher");
+    let probe_timeout = probe_timeout.unwrap_or(5);
+    let team_type = if team.starts_with("ws-") { "ws" } else { "create" };
+
+    let mut out = json!({
+        "watcher": watcher,
+        "team_type": team_type,
+        "was_phantom": false,
+        "action": "none",
+        "repaired": false,
+        "alive": false,
+        "error": Value::Null,
+        "h7_risk": false,
+    });
+
+    // ── Resolve the app (Swift) socket — all team.* RPCs ride it. ──────────
+    let app_sock = match resolve_app_socket(None) {
+        Some(s) => PathBuf::from(s),
+        None => {
+            // H7 heuristic (requirement 6, heuristic-only this pass): the app
+            // socket is unresolved. If env signals we're inside a GUI pane, the
+            // daemon watch tick may misroute to a headless one-shot → routing risk
+            // (exit 4). Pure-headless callers (no GUI signal) simply cannot probe
+            // (exit 1). No new RPC field is consulted.
+            //
+            // A socket env var only counts as a GUI signal when it points at a
+            // *live app* socket — a daemon socket (term-meshd*.sock) passed via
+            // TERMMESH_SOCKET is a normal headless/CLI path, not H7.
+            let is_live_app_env = |key: &str| {
+                env::var(key)
+                    .ok()
+                    .filter(|v| !v.is_empty())
+                    .map(PathBuf::from)
+                    .map(|p| is_app_socket_path(&p) && is_socket_alive(&p))
+                    .unwrap_or(false)
+            };
+            let gui_signal = env::var("TERMMESH_WORKSPACE_ID")
+                .map(|v| !v.is_empty())
+                .unwrap_or(false)
+                || is_live_app_env("TERMMESH_SOCKET")
+                || is_live_app_env("TERMMESH_SOCKET_PATH");
+            if gui_signal {
+                out["h7_risk"] = json!(true);
+                out["error"] = json!(
+                    "app_socket unresolved despite GUI context \u{2192} watch tick may misroute to headless one-shot (H7)"
+                );
+                doctor_emit(&out, 4);
+            } else {
+                out["error"] = json!(
+                    "app_socket unresolved (headless context) \u{2014} cannot probe watcher liveness"
+                );
+                doctor_emit(&out, 1);
+            }
+        }
+    };
+
+    // ── 1. Initial liveness probe (requirement 1) ─────────────────────────
+    match probe_watcher(&app_sock, team, watcher) {
+        WatcherProbe::RpcError(e) => {
+            out["error"] = json!(e);
+            doctor_emit(&out, 1);
+        }
+        WatcherProbe::Live => {
+            out["alive"] = json!(true);
+            doctor_emit(&out, 0);
+        }
+        WatcherProbe::Phantom => {}
+    }
+    out["was_phantom"] = json!(true);
+
+    // ── 2. Fresh-spawn race guard (requirement 2) ─────────────────────────
+    // A just-spawned pane can momentarily read not_found; poll before judging.
+    let grace_deadline = std::time::Instant::now() + Duration::from_secs(probe_timeout);
+    while std::time::Instant::now() < grace_deadline {
+        thread::sleep(Duration::from_secs(1));
+        match probe_watcher(&app_sock, team, watcher) {
+            WatcherProbe::Live => {
+                out["alive"] = json!(true);
+                out["action"] = json!("settled_during_grace");
+                doctor_emit(&out, 0);
+            }
+            WatcherProbe::Phantom | WatcherProbe::RpcError(_) => {}
+        }
+    }
+
+    // Still phantom after grace → confirmed phantom.
+    if no_repair {
+        out["action"] = json!("diagnose_only");
+        out["error"] = json!("phantom confirmed; repair skipped (--no-repair)");
+        doctor_emit(&out, 2);
+    }
+
+    // ── 3. Team-type-symmetric repair (requirement 3) ─────────────────────
+    // Inherit the watcher's configured cli/model from status when present so the
+    // recreated pane matches; fall back to the flag, then to defaults.
+    let (status_cli, status_model) = read_watcher_cli_model(&app_sock, team, watcher);
+    let repair_cli = cli
+        .map(|s| s.to_string())
+        .or(status_cli)
+        .unwrap_or_else(|| "claude".to_string());
+    let repair_model = status_model.unwrap_or_else(|| "sonnet".to_string());
+
+    if team_type == "ws" {
+        // Workspace-local: needs the caller pane's workspace/panel to re-split.
+        // detach+attach (not team.restart): a phantom has no pane, so a hard
+        // restart fails immediately with workspace_missing — recovery must re-run
+        // the creation path.
+        let (workspace_id, panel_id, window_id) = match require_termmesh_context() {
+            Ok(t) => t,
+            Err(e) => {
+                out["error"] = json!(format!("ws-* repair needs caller pane context: {e}"));
+                doctor_emit(&out, 1);
+            }
+        };
+        // detach the dead registry entry (mirror run_detach)
+        let mut detach_params = json!({
+            "agent_name": watcher,
+            "team_name": team,
+            "workspace_id": workspace_id,
+        });
+        if let Some(ref wid) = window_id {
+            detach_params["window_id"] = json!(wid);
+        }
+        out["action"] = json!("detach+attach");
+        // A hidden detach failure must fail loud, not be masked by a follow-on
+        // attach error. A missing entry (not_found) is benign — proceed.
+        match rpc_call_timeout(&app_sock, "team.detach", detach_params, 10) {
+            Ok(r) if r["ok"].as_bool().unwrap_or(false) => {}
+            Ok(r) => {
+                let code = r["error"]["code"].as_str().unwrap_or("unknown");
+                if !matches!(code, "not_found" | "agent_not_found") {
+                    let msg = r["error"]["message"].as_str().unwrap_or("detach failed");
+                    out["error"] = json!(format!("detach failed [{code}]: {msg}"));
+                    doctor_emit(&out, 3);
+                }
+            }
+            Err(e) => {
+                out["error"] = json!(format!("detach RPC error: {e}"));
+                doctor_emit(&out, 3);
+            }
+        }
+        // re-attach a fresh pane (mirror run_attach)
+        let mut attach_params = json!({
+            "agent_type": "watcher",
+            "agent_name": watcher,
+            "agent_cli": repair_cli,
+            "agent_model": repair_model,
+            "workspace_id": workspace_id,
+            "surface_id": panel_id,
+        });
+        if let Some(ref wid) = window_id {
+            attach_params["window_id"] = json!(wid);
+        }
+        match rpc_call_timeout(&app_sock, "team.attach", attach_params, 10) {
+            Ok(r) if !r["ok"].as_bool().unwrap_or(false) => {
+                let code = r["error"]["code"].as_str().unwrap_or("unknown");
+                let msg = r["error"]["message"].as_str().unwrap_or("attach failed");
+                out["error"] = json!(format!("re-attach failed [{code}]: {msg}"));
+                doctor_emit(&out, 3);
+            }
+            Err(e) => {
+                out["error"] = json!(format!("re-attach RPC error: {e}"));
+                doctor_emit(&out, 3);
+            }
+            Ok(_) => {}
+        }
+    } else {
+        // create-based: team-name-scoped remove + add (mirror run_remove_gui/run_add_gui)
+        out["action"] = json!("remove+add");
+        // Fail loud on a hidden remove failure; a missing entry is benign.
+        // keep_team_if_empty:true preserves the (workspaceId+leader) team record
+        // when the watcher is the last agent, so the following add_agent rebuilds
+        // the pane instead of hitting team_not_found. No-op when other agents
+        // remain, so it is passed unconditionally (no count branch needed).
+        match rpc_call_timeout(
+            &app_sock,
+            "team.detach",
+            json!({ "team_name": team, "agent_name": watcher, "force": true, "keep_team_if_empty": true }),
+            10,
+        ) {
+            Ok(r) if r["ok"].as_bool().unwrap_or(false) => {}
+            Ok(r) => {
+                let code = r["error"]["code"].as_str().unwrap_or("unknown");
+                if !matches!(code, "not_found" | "agent_not_found") {
+                    let msg = r["error"]["message"].as_str().unwrap_or("remove failed");
+                    out["error"] = json!(format!("remove failed [{code}]: {msg}"));
+                    doctor_emit(&out, 3);
+                }
+            }
+            Err(e) => {
+                out["error"] = json!(format!("remove RPC error: {e}"));
+                doctor_emit(&out, 3);
+            }
+        }
+        match rpc_call_timeout(
+            &app_sock,
+            "team.add_agent",
+            json!({
+                "team_name": team,
+                "agent_type": "watcher",
+                "name": watcher,
+                "model": repair_model,
+                "cli": repair_cli,
+            }),
+            10,
+        ) {
+            Ok(r) if !r["ok"].as_bool().unwrap_or(false) => {
+                let code = r["error"]["code"].as_str().unwrap_or("unknown");
+                let msg = r["error"]["message"].as_str().unwrap_or("add_agent failed");
+                out["error"] = json!(format!("re-add failed [{code}]: {msg}"));
+                doctor_emit(&out, 3);
+            }
+            Err(e) => {
+                out["error"] = json!(format!("re-add RPC error: {e}"));
+                doctor_emit(&out, 3);
+            }
+            Ok(_) => {}
+        }
+    }
+    out["repaired"] = json!(true);
+
+    // ── 4. Infinite-loop guard: re-verify once, then fail loud (requirement 4) ──
+    let verify_deadline = std::time::Instant::now() + Duration::from_secs(probe_timeout);
+    while std::time::Instant::now() < verify_deadline {
+        thread::sleep(Duration::from_secs(1));
+        if let WatcherProbe::Live = probe_watcher(&app_sock, team, watcher) {
+            out["alive"] = json!(true);
+            doctor_emit(&out, 0);
+        }
+    }
+    out["error"] = json!(format!(
+        "repair attempted but watcher still not live after {probe_timeout}s"
+    ));
+    doctor_emit(&out, 3); // fail-loud, NO second repair
+}
+
 // ── Session picker ──────────────────────────────────────────────────
 
 /// A Claude Code session entry parsed from the project session directory.
@@ -8344,6 +8738,25 @@ fn run_watch_command(sock: &PathBuf, action: &WatchAction) {
                     process::exit(1);
                 }
             }
+        }
+        WatchAction::Doctor {
+            team,
+            watcher,
+            no_repair,
+            probe_timeout,
+            cli,
+            json: _json,
+        } => {
+            // `sock` here is the daemon socket; doctor resolves the app (Swift)
+            // socket internally for its team.* RPCs (no new daemon RPCs needed).
+            run_watch_doctor(
+                sock,
+                team,
+                watcher.as_deref(),
+                *no_repair,
+                *probe_timeout,
+                cli.as_deref(),
+            );
         }
     }
 }

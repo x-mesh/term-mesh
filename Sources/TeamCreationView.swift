@@ -2595,12 +2595,49 @@ struct TeamCreationView: View {
     }
 
     private func persistSelectedSmartPresetOverride() {
-        guard let smartPresetId = selectedSmartPresetId,
-              let payload = currentSmartPresetPayload(for: smartPresetId) else { return }
-        TeamTemplateManager.shared.saveOverride(
-            for: TemplateID(category: .smart, slug: smartPresetId),
-            payload: .smart(payload)
-        )
+        guard let smartPresetId = selectedSmartPresetId else { return }
+        let templateId = TemplateID(category: .smart, slug: smartPresetId)
+        // `template(for:)` searches the full list (builtIns + customs), so a
+        // user-created custom preset is found here too. Branch on origin so its
+        // inline agent/model/CLI/leaderMode edits route to updateCustom (which
+        // saves immediately) instead of the builtIn-only saveOverride path —
+        // saveOverride resolves its base via builtInTemplate(for:), which is nil
+        // for a custom preset, so those edits were silently dropped.
+        guard let template = teamTemplateManager.template(for: templateId) else { return }
+
+        switch template.origin {
+        case .custom:
+            // Base on the custom's own current payload so description /
+            // parentBuiltInId and other metadata survive; only the live
+            // agents + leaderMode are overwritten.
+            guard case .smart(var preset) = template.payload else { return }
+            preset.leaderMode = leaderMode
+            preset.agents = liveProviderPreferences()
+            var updated = template
+            updated.payload = .smart(preset)
+            try? teamTemplateManager.updateCustom(updated)
+        case .builtIn:
+            guard let payload = currentSmartPresetPayload(for: smartPresetId) else { return }
+            teamTemplateManager.saveOverride(
+                for: templateId,
+                payload: .smart(payload)
+            )
+        }
+    }
+
+    /// Map the live agent rows to the smart-preset `[ProviderPreference]` schema.
+    /// Shared by the custom and builtIn persist branches.
+    private func liveProviderPreferences() -> [ProviderPreference] {
+        agents.map { row in
+            ProviderPreference(
+                role: row.preset.name,
+                primaryCli: row.preset.cli,
+                primaryModel: row.preset.model,
+                fallbackCli: row.preset.cli,
+                fallbackModel: row.preset.model,
+                reason: "Inline edit"
+            )
+        }
     }
 
     private func currentSmartPresetPayload(for presetId: String) -> SmartTeamPreset? {
@@ -2608,16 +2645,7 @@ struct TeamCreationView: View {
             for: TemplateID(category: .smart, slug: presetId)
         )?.payload else { return nil }
         preset.leaderMode = leaderMode
-        preset.agents = agents.map { row in
-            ProviderPreference(
-                role: row.preset.name,
-                primaryCli: row.preset.cli,
-                primaryModel: row.preset.model,
-                fallbackCli: row.preset.cli,
-                fallbackModel: row.preset.model,
-                reason: "Inline override"
-            )
-        }
+        preset.agents = liveProviderPreferences()
         return preset
     }
 
