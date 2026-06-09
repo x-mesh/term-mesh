@@ -2366,6 +2366,10 @@ class TerminalController {
         }
         let explicitTeamName = params["team_name"] as? String
         let force = (params["force"] as? Bool) ?? true
+        // When true (watch doctor create-branch repair), a last-agent detach
+        // preserves the empty team record so the following add_agent can rebuild
+        // the watcher pane. Defaults false → original destroy-on-last behavior.
+        let keepTeamIfEmpty = (params["keep_team_if_empty"] as? Bool) ?? false
 
         let result: V2CallResult = await MainActor.run {
             let appDelegate = AppDelegate.shared
@@ -2423,7 +2427,8 @@ class TerminalController {
                 teamName: teamName,
                 agentName: agentName,
                 tabManager: resolved.tabManager,
-                force: force
+                force: force,
+                keepTeamIfEmpty: keepTeamIfEmpty
             )
 
             switch outcome {

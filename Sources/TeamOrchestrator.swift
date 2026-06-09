@@ -1764,7 +1764,15 @@ final class TeamOrchestrator: ObservableObject {
         teamName: String,
         agentName: String,
         tabManager: TabManager,
-        force: Bool = true
+        force: Bool = true,
+        /// When true, a last-agent detach preserves the (now empty) team record
+        /// — its `workspaceId`/`leaderPanelId` stay intact — instead of removing
+        /// it. Lets a following `addAgentToTeam` re-create the watcher pane by
+        /// splitting from the preserved leader pane (used by `watch doctor`'s
+        /// create-branch phantom repair so `remove`+`add` is symmetric with the
+        /// `ws-*` `detach`+`attach` self-recreation path). Defaults to false so
+        /// every existing caller keeps the original destroy-on-last behavior.
+        keepTeamIfEmpty: Bool = false
     ) -> Result<DetachResult, DetachError> {
         guard var team = teams[teamName] else {
             return .failure(.teamNotFound(name: teamName))
@@ -1804,6 +1812,22 @@ final class TeamOrchestrator: ObservableObject {
         let remaining = team.agents.count
 
         if remaining == 0 {
+            if keepTeamIfEmpty {
+                // Preserve the now-empty team record (workspaceId + leaderPanelId
+                // intact) so a following addAgentToTeam can re-create the watcher
+                // pane from the preserved leader. The team is briefly visible with
+                // agent_count 0 in status/daemon sync until the add fills it.
+                teams[teamName] = team
+                TeamDataStore.shared.registerTeam(teamName, agentNames: [])
+                syncTeamStateToDaemon()
+                Logger.team.info("detached last agent '\(agentName, privacy: .public)' from team '\(teamName, privacy: .public)' — empty team preserved (keepTeamIfEmpty)")
+                return .success(DetachResult(
+                    teamName: teamName,
+                    agentName: agentName,
+                    remainingAgents: 0,
+                    teamDestroyed: false
+                ))
+            }
             // Last agent — remove the team entry. The adopted leader pane is
             // the caller's own pane (external ownership) and must not be closed.
             teams.removeValue(forKey: teamName)

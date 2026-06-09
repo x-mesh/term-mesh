@@ -5907,10 +5907,14 @@ fn run_watch_doctor(
         // create-based: team-name-scoped remove + add (mirror run_remove_gui/run_add_gui)
         out["action"] = json!("remove+add");
         // Fail loud on a hidden remove failure; a missing entry is benign.
+        // keep_team_if_empty:true preserves the (workspaceId+leader) team record
+        // when the watcher is the last agent, so the following add_agent rebuilds
+        // the pane instead of hitting team_not_found. No-op when other agents
+        // remain, so it is passed unconditionally (no count branch needed).
         match rpc_call_timeout(
             &app_sock,
             "team.detach",
-            json!({ "team_name": team, "agent_name": watcher, "force": true }),
+            json!({ "team_name": team, "agent_name": watcher, "force": true, "keep_team_if_empty": true }),
             10,
         ) {
             Ok(r) if r["ok"].as_bool().unwrap_or(false) => {}
