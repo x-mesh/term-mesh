@@ -91,7 +91,7 @@ In the interactive wizard, ask the user directly and wait for their reply for ev
    ```bash
    tm-agent status
    ```
-   - Normal JSON with `team_name` and `agents` = team exists. Go to step 1.
+   - Normal JSON with `team_name` and `agents` = team exists. Verify watcher **liveness** (below) before step 1.
    - Error JSON (`{"ok":false,...}`) or non-zero exit = no active team.
 
    **No active team:**
@@ -100,7 +100,9 @@ In the interactive wizard, ask the user directly and wait for their reply for ev
 
    > **Why `attach`, not `create --adopt` + `add`:** `tm-agent create 1 --adopt` can fail to adopt the caller's pane and spawn the team in a *separate* workspace; a later `tm-agent add watcher` then resolves the caller's own `ws-<first8hex>`, finds no team, and fails with `team_not_found`. `attach` is workspace-local — it adopts the calling pane and auto-creates `ws-<first8hex>`, so the watcher always lands in the user's pane.
 
-   **Team exists, no watcher:** `tm-agent add watcher --cli <cli>` for `create`-based teams, or `tm-agent attach watcher --cli <cli>` for `ws-…` workspace-local teams (or if `add` returns `team_not_found`). Poll `tm-agent status` up to 5 s (1 s intervals) until watcher appears.
+   **Team exists, no watcher:** `tm-agent add watcher --cli <cli>` for `create`-based teams, or `tm-agent attach watcher --cli <cli>` for `ws-…` workspace-local teams (or if `add` returns `team_not_found`).
+
+   **Watcher listed but a phantom (liveness) — one call confirms and repairs:** registry presence ≠ a live pane (a watcher can be listed yet never have spawned; enabling watch on it makes every tick fail with `recycle failed: workspace_missing`). Run `tm-agent watch doctor <team>` (team_name from `tm-agent status`; `[watcher]` defaults to `watcher`): it probes liveness (`read` not_found **or** status `panel_id`/`workspace_id` missing), guards the fresh-spawn race (5 s grace poll), and repairs a confirmed phantom **once** through the team's own creation path (create-based → `remove`+`add`, `ws-…` → `detach`+`attach`), then re-verifies and fails loud — never loops. **`heartbeat_age_seconds: null` is a weak signal, never a trigger alone** — healthy idle panes report null until their first heartbeat; doctor never repairs on null. Interpret exit: `0` healthy/repaired-live · `2` phantom + `--no-repair` · `3` repair failed (do NOT retry) · `4` H7 routing risk · `1` RPC/socket error. On non-zero, surface the JSON `error`.
 
 1. Resolve target workers:
    If `[agent]` is provided, verify it exists and is not the watcher.
@@ -146,7 +148,7 @@ In the interactive wizard, ask the user directly and wait for their reply for ev
 
 ### `on [agent]`
 
-0. Ensure team + watcher exist (auto-create on first use) — same logic as `review` Step 0. Run `tm-agent status`; if no team exists, bootstrap from the current pane with `tm-agent attach watcher --cli <cli>` (single step: adopts this pane as leader AND creates the watcher — see the "Why `attach`" note in `review` Step 0). If a team exists but has no watcher, add with `tm-agent add watcher --cli <cli>` (or `attach` for `ws-…` workspace-local teams). The chosen `--cli` must match the watcher CLI selected in the wizard so the pane and the autonomous tick CLI agree.
+0. Ensure team + watcher exist (auto-create on first use) — same logic as `review` Step 0. Run `tm-agent status`; if no team exists, bootstrap from the current pane with `tm-agent attach watcher --cli <cli>` (single step: adopts this pane as leader AND creates the watcher — see the "Why `attach`" note in `review` Step 0). If a team exists but has no watcher, add with `tm-agent add watcher --cli <cli>` (or `attach` for `ws-…` workspace-local teams). The chosen `--cli` must match the watcher CLI selected in the wizard so the pane and the autonomous tick CLI agree. **Also apply the `review` Step 0 liveness check** by running `tm-agent watch doctor <team>` (team_name from `tm-agent status`): it probes, guards the fresh-spawn race, and repairs a confirmed phantom once (team-type aware), then fails loud. Enable watch only on exit `0`; on `2`/`3`/`4` surface the JSON `error` and stop. Otherwise every tick fails with `recycle failed: workspace_missing`.
 
 Resolve and validate the spec exactly as `review` does, including the interactive spec prompt when it is missing (reject only in non-interactive mode). Resolve `[agent]` the same way as `review`: in **interactive** mode, ask the user a direct question and wait for their reply; in **non-interactive** mode, default to all workers. Targets: `<agent>` (one worker) · `all` (every worker except leader/watcher) · `leader` (the leader's own pane, for worker-less teams). With `--target all`, a team that resolves to **zero workers** but exposes a GUI leader pane auto-falls-back to watching `leader` (D1 conservative: once any worker exists, `all` watches workers only; a purely headless leader gets no fallback and reports "no target"). A `leader` target tolerates in-progress output and tags drift reports `[self-watch]`. Then enable daemon autonomous watch:
 
@@ -241,7 +243,7 @@ RECENT:
 ## Guardrails
 
 - Use `tm-agent` only. Do not use Codex sub-agents for term-mesh team work.
-- `/watch review` and `/watch on` auto-create team + watcher on first use (one-time bootstrap). Never remove existing agents, never reassign watcher CLI/model behind the user's back. `/watch off`, `/watch status`, and `/watch test` never mutate team composition (`test` forces a tick and advances watch counters, but adds/removes no panes).
+- `/watch review` and `/watch on` auto-create team + watcher on first use (one-time bootstrap). Never remove existing agents, never reassign watcher CLI/model behind the user's back. **Exception — phantom repair (one-shot, hard-proof only):** `tm-agent watch doctor <team>` performs this exception. A watcher counts as a no-live-pane phantom only when `read` is **still** `not_found` after a ≤5 s grace poll, or `tm-agent status` shows `panel_id`/`workspace_id` missing — `heartbeat_age_seconds: null` alone is NOT proof (healthy idle panes report null too). doctor then repairs once, branched to mirror creation (`remove`+`add` for a create-based team, `detach`+`attach` for a `ws-…` team, same name/CLI), and fails loud if still not live — it never loops. `/watch off`, `/watch status`, and `/watch test` never mutate team composition (`test` forces a tick and advances watch counters, but adds/removes no panes).
 - Never send watcher findings with `tm-agent msg send --to <agent>`; send to the leader only with `tm-agent msg send "<finding>"`.
 - Do not store drift history only under `~/.term-mesh/results`; those files are pruned. Use `.xm/watch/board.jsonl`.
 - Keep watcher context fresh every check: hard restart or true one-shot, with input limited to spec + recent delta.
