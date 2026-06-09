@@ -4,6 +4,19 @@ All notable changes to term-mesh are documented here.
 
 ## [Unreleased]
 
+## [0.147.0] - 2026-06-09
+
+### Added
+- **에이전트 watch의 유령(phantom) watcher 자동 진단·복구 — `tm-agent watch doctor`** — watch에 watcher가 등록은 됐지만 실제 pane이 만들어지지 않은 "유령" 상태를 감지해 자동으로 다시 만든다. 이전에는 이 상태에서 watch를 켜면 매 점검이 `workspace_missing`으로 실패하기만 했다. 살아있는 watcher는 건드리지 않고, 팀 종류에 맞게 안전하게 복구한다.
+
+### Fixed
+- **peer 창에서 긴 텍스트를 붙여넣으면 깨지거나 이후 입력이 멈추던 문제** — 붙여넣기 시작 프레임에서 멀티바이트(한글·이모지) 글자의 끝 바이트가 내부 전송 경계에 걸치면 중복 전송돼 글자가 깨지고, 붙여넣기 종료 시퀀스가 불완전하게 끝나면 타이머 재전송이 무한 반복돼 이후 키 입력이 삼켜지던(먹통) 문제를 함께 수정했다.
+- **New Agent Team에서 직접 만든 custom 팀 프리셋의 편집이 저장되지 않던 문제** — custom 프리셋에 에이전트를 추가하거나 모델을 바꿔도 저장되지 않고, 앱을 다시 켜면 프리셋 자체가 사라지던 문제. 이제 custom 프리셋 편집이 즉시 저장되고, 이름만 붙여둔 빈 프리셋도 다음 실행까지 보존된다.
+
+### Thanks to 1 contributor!
+
+- [@JINWOO-J](https://github.com/JINWOO-J)
+
 ## [0.146.0] - 2026-06-04
 
 ### Fixed
