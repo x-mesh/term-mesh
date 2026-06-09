@@ -16,6 +16,20 @@ git config core.hooksPath .githooks
 echo "==> Initializing submodules..."
 git submodule update --init --recursive
 
+# Keep the committed root ghostty.h in sync with the ghostty submodule header.
+# Swift compiles the ghostty C API *declarations* from this root copy (imported
+# via term-mesh-Bridging-Header.h); the xcframework only supplies libghostty.a
+# for linking. A stale root header causes ABI-mismatch build errors after a
+# submodule bump (e.g. read_clipboard_cb void vs bool -> "cannot convert 'Bool'
+# to closure result type 'Void'"). The root copy carries no local edits, so a
+# straight sync is safe.
+_SUBMODULE_GHOSTTY_H="$PROJECT_DIR/ghostty/include/ghostty.h"
+_ROOT_GHOSTTY_H="$PROJECT_DIR/ghostty.h"
+if [ -f "$_SUBMODULE_GHOSTTY_H" ] && ! cmp -s "$_SUBMODULE_GHOSTTY_H" "$_ROOT_GHOSTTY_H"; then
+    cp "$_SUBMODULE_GHOSTTY_H" "$_ROOT_GHOSTTY_H"
+    echo "==> Synced root ghostty.h from submodule (Swift bridging-header declarations)"
+fi
+
 # zig and llvm-libtool-darwin are only needed for a local GhosttyKit build;
 # they are checked inside the local-build branch below so a prebuilt/cached
 # xcframework can be used without them.
@@ -134,7 +148,23 @@ else
         fi
 
         LLVM_BIN=""
-        for cand in /opt/homebrew/opt/llvm/bin /usr/local/opt/llvm/bin; do
+        # llvm-libtool-darwin lives in the llvm keg's bin. Homebrew's unversioned
+        # `llvm` links into opt/llvm, but versioned kegs (llvm@21, llvm@20) only
+        # appear under opt/llvm@NN or Cellar and are missed by a bare opt/llvm
+        # check — probe those too, plus `brew --prefix` and PATH.
+        LLVM_CANDS=(
+            /opt/homebrew/opt/llvm/bin /usr/local/opt/llvm/bin
+            /opt/homebrew/opt/llvm@21/bin /opt/homebrew/opt/llvm@20/bin
+            /usr/local/opt/llvm@21/bin /usr/local/opt/llvm@20/bin
+        )
+        for _kegbin in /opt/homebrew/Cellar/llvm@*/*/bin /opt/homebrew/Cellar/llvm/*/bin \
+                       /usr/local/Cellar/llvm@*/*/bin /usr/local/Cellar/llvm/*/bin; do
+            [ -d "$_kegbin" ] && LLVM_CANDS+=("$_kegbin")
+        done
+        for _f in llvm llvm@21 llvm@20; do
+            _p="$(brew --prefix "$_f" 2>/dev/null)" && [ -n "$_p" ] && LLVM_CANDS+=("$_p/bin")
+        done
+        for cand in "${LLVM_CANDS[@]}"; do
             [ -x "$cand/llvm-libtool-darwin" ] && { LLVM_BIN="$cand"; break; }
         done
         if [ -z "$LLVM_BIN" ] && command -v llvm-libtool-darwin &> /dev/null; then
@@ -143,7 +173,7 @@ else
         if [ -z "$LLVM_BIN" ]; then
             echo "Error: llvm-libtool-darwin is required to build GhosttyKit."
             echo "Without it macOS /usr/bin/libtool silently drops ghostty_surface_* symbols."
-            echo "Install via: brew install llvm"
+            echo "Install via: brew install llvm   (llvm@21 / llvm@20 also work)"
             exit 1
         fi
 
