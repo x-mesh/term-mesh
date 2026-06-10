@@ -727,6 +727,12 @@ extension Workspace: BonsplitDelegate {
         case .markAsUnread:
             guard let panelId = panelIdFromSurfaceId(tab.id) else { return }
             markPanelUnread(panelId)
+        case .toggleZoom:
+            // Route through Workspace.togglePaneZoom so portal visibility for
+            // non-zoomed terminals is handled; it toggles the focused pane, so
+            // focus the requesting pane first.
+            bonsplitController.focusPane(pane)
+            togglePaneZoom()
         @unknown default:
             break
         }
