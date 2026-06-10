@@ -4,6 +4,15 @@ All notable changes to term-mesh are documented here.
 
 ## [Unreleased]
 
+## [0.148.0] - 2026-06-10
+
+### Changed
+- **내장 터미널 엔진(ghostty)을 최신 upstream 리비전으로 업데이트** — fork를 상위 ghostty(fork/main)의 최신 상태로 올려, 그동안 누적된 상위 터미널 엔진의 개선과 버그 수정을 반영했다.
+
+### Thanks to 1 contributor!
+
+- [@JINWOO-J](https://github.com/JINWOO-J)
+
 ## [0.147.0] - 2026-06-09
 
 ### Added
