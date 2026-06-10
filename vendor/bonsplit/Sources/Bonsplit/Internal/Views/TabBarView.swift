@@ -257,7 +257,10 @@ struct TabBarView: View {
                 }
             },
             onZoomToggle: {
-                _ = splitViewController.togglePaneZoom(pane.id)
+                // Route through the delegate (same path as the context-menu
+                // action) so the host app can run its portal visibility logic;
+                // toggling the internal controller directly bypasses it.
+                controller.requestTabContextAction(.toggleZoom, for: TabID(id: tab.id), inPane: pane.id)
             },
             onContextAction: { action in
                 controller.requestTabContextAction(action, for: TabID(id: tab.id), inPane: pane.id)

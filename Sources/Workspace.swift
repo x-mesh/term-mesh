@@ -75,10 +75,15 @@ final class Workspace: Identifiable, ObservableObject {
             // content doesn't render above the zoomed browser pane. Portal hosts
             // live in the window content view, outside Bonsplit's hierarchy, so
             // Bonsplit hiding the pane doesn't hide the Metal surface.
-            let zoomedTabIds = Set(bonsplitController.tabs(inPane: zoomedPaneId).map(\.id.uuid))
+            // Bonsplit tab ids and panel ids are distinct UUID namespaces — map
+            // through surfaceIdToPanelId or the zoomed pane's own terminal gets
+            // hidden too and must win a SwiftUI rebind race to come back.
+            let zoomedPanelIds = Set(
+                bonsplitController.tabs(inPane: zoomedPaneId).compactMap { panelIdFromSurfaceId($0.id) }
+            )
             for (_, panel) in panels {
                 guard let terminal = panel as? TerminalPanel else { continue }
-                if !zoomedTabIds.contains(terminal.id) {
+                if !zoomedPanelIds.contains(terminal.id) {
                     terminal.hostedView.setVisibleInUI(false)
                     TerminalWindowPortalRegistry.hideHostedView(terminal.hostedView)
                 }
@@ -90,6 +95,11 @@ final class Workspace: Identifiable, ObservableObject {
                 terminal.hostedView.setVisibleInUI(true)
             }
         }
+
+        // Zoom toggles don't mutate the split tree, so bonsplit emits no
+        // didChangeGeometry — run the reconcile safety net explicitly so a
+        // dropped anchor-geometry callback can't leave a stale-size surface.
+        scheduleTerminalGeometryReconcile()
 
         objectWillChange.send()
     }
