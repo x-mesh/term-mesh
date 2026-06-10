@@ -4,6 +4,16 @@ All notable changes to term-mesh are documented here.
 
 ## [Unreleased]
 
+## [0.149.0] - 2026-06-11
+
+### Fixed
+- **pane 전체화면(zoom) 시 터미널이 좌상단에 이전 크기로 고착되던 문제** — zoom 토글이 내부 ID 불일치로 zoom 대상 pane의 터미널까지 숨겼다가 되살리는 과정에서 race에 지면, 화면이 좌상단에 구 크기로 박히고 입력도 이전 폭으로 줄바꿈되던 문제를 수정했다. zoom 직후 geometry 재동기화 안전망도 추가했다.
+- **탭 우클릭 메뉴의 "Zoom Pane"이 동작하지 않던 문제** — 메뉴 선택이 무시되던 것을 수정했고, 탭의 zoom 해제 버튼도 동일 경로로 통일해 해제 후 다른 pane이 검게 남을 수 있던 가능성을 차단했다.
+
+### Thanks to 1 contributor!
+
+- [@JINWOO-J](https://github.com/JINWOO-J)
+
 ## [0.148.0] - 2026-06-10
 
 ### Changed
