@@ -4,6 +4,18 @@ All notable changes to term-mesh are documented here.
 
 ## [Unreleased]
 
+## [0.150.0] - 2026-06-15
+
+### Fixed
+- **장시간 사용 시 메모리(GPU)가 수십 GB까지 쌓이던 문제** — 다른 워크스페이스로 가려져 보이지 않는 터미널이 Metal 렌더러의 GPU 리소스(스왑 체인·IOSurface, 표면당 약 40MB)를 계속 붙들고 있어, 워크스페이스·탭을 많이 열고 오래 쓰면 메모리가 수십 GB까지 누적되던 문제를 수정했다. 이제 일정 시간 보이지 않은 터미널은 GPU 리소스를 자동으로 반납하고(터미널 내용·세션은 그대로 유지), 다시 보일 때 복원한다.
+
+### Changed
+- **pane 전체화면(zoom) 처리 일원화** — 탭바 zoom을 delegate 경로로 통일하고 내부 panel ID 매핑을 바로잡아, zoom 토글 시 대상 pane이 잘못 처리되던 경계 케이스를 줄였다.
+
+### Thanks to 1 contributor!
+
+- [@JINWOO-J](https://github.com/JINWOO-J)
+
 ## [0.149.0] - 2026-06-11
 
 ### Fixed
