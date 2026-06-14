@@ -319,6 +319,13 @@ extension Workspace: BonsplitDelegate {
         let isDetaching = detachingTabIds.remove(tabId) != nil
         let panel = panels[panelId]
 
+        #if DEBUG
+        // Leak instrumentation: which teardown branch a close takes. The `close`
+        // branch (else) is the only one that calls panel.close()→releaseGhosttySurfaceAsync.
+        // isDetaching=true OR panelNil=true means ghostty_surface_free is never triggered here.
+        dlog("didCloseTab.branch tab=\(tabId.uuid.uuidString.prefix(8)) panel=\(panelId.uuidString.prefix(8)) isDetaching=\(isDetaching) panelNil=\(panel == nil) pendingDetached=\(pendingDetachedSurfaces.count) panelType=\(panel.map { String(describing: type(of: $0)) } ?? "nil")")
+        #endif
+
         if isDetaching, let panel {
             let browserPanel = panel as? BrowserPanel
             pendingDetachedSurfaces[tabId] = DetachedSurfaceTransfer(

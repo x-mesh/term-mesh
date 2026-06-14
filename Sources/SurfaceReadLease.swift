@@ -1,4 +1,5 @@
 import Foundation
+import Bonsplit
 
 // MARK: - SurfaceFreeCoordinator
 
@@ -20,6 +21,15 @@ final class SurfaceFreeCoordinator {
     /// Called by SurfaceReadLease.release() (dispatched onto MainActor).
     @MainActor func endLease() {
         activeLeaseCount -= 1
+        #if DEBUG
+        // Leak instrumentation: a deferred free becoming unblocked. Pairs with the
+        // `surface.free.deferred` line below — a `deferred` with no subsequent
+        // `lease_drained`+`surface.free.perform` is a permanently stuck surface
+        // (no sweeper exists here), i.e. the IOSurface/GPU leak signature.
+        if activeLeaseCount == 0, pendingFreeAction != nil {
+            dlog("surface.free.lease_drained leases=0 — performing deferred free")
+        }
+        #endif
         triggerIfReady()
     }
 
@@ -28,6 +38,14 @@ final class SurfaceFreeCoordinator {
     @MainActor func scheduleClose(_ action: @escaping () -> Void) {
         guard pendingFreeAction == nil else { return }  // guard against double-close
         pendingFreeAction = action
+        #if DEBUG
+        // Leak instrumentation: close requested while reader leases are still held.
+        // The free (ghostty_surface_free) cannot run yet; it is deferred until all
+        // leases release. If a lease never releases, this surface leaks forever.
+        if activeLeaseCount > 0 {
+            dlog("surface.free.deferred leases=\(activeLeaseCount)")
+        }
+        #endif
         triggerIfReady()
     }
 

@@ -1332,6 +1332,11 @@ final class GhosttySurfaceScrollView: NSView {
     func setVisibleInUI(_ visible: Bool) {
         let wasVisible = surfaceView.isVisibleInUI
         surfaceView.setVisibleInUI(visible)
+        // Reclaim renderer GPU resources (~40MB swap chain/IOSurface) for surfaces that
+        // stay invisible; recreate them before a surface is shown again. Driven here so it
+        // tracks workspace selection exactly. Realize runs before `isHidden = false` below
+        // so the swap chain is rebuilding by the time the view is shown.
+        surfaceView.terminalSurface?.setSurfaceVisibleForRenderer(visible)
         isHidden = !visible
 #if DEBUG
         if wasVisible != visible {

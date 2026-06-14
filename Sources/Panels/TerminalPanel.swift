@@ -1,6 +1,7 @@
 import Foundation
 import Combine
 import AppKit
+import Bonsplit
 
 /// TerminalPanel wraps an existing TerminalSurface and conforms to the Panel protocol.
 /// This allows TerminalSurface to be used within the bonsplit-based layout system.
@@ -141,6 +142,15 @@ final class TerminalPanel: Panel, ObservableObject {
         // by a runloop tick, and `requestFocus` retries that are already executing can otherwise
         // schedule new work items that fire after we navigate away.
         hostedView.setActive(false)
+    }
+
+    deinit {
+        #if DEBUG
+        // Leak instrumentation: TerminalPanel holds `surface` strongly, so if this
+        // never fires after a close, the TerminalSurface (and its GPU/IOSurface
+        // backing) is being retained somewhere.
+        dlog("deinit TerminalPanel id=\(id.uuidString.prefix(8))")
+        #endif
     }
 
     func close() {

@@ -111,6 +111,10 @@ public final class DebugEventLog: @unchecked Sendable {
     private static let circuitBypassMarkers: [String] = [
         "key.retry", "keyEvent", "key.PRESS", "sendToAgent",
         "paste.", "sendTextToPanel", "text.delivered", "send_key",
+        // Leak-hunt instrumentation: low-frequency, high-signal surface lifecycle
+        // markers must survive the portal.* layout spam that trips the breaker.
+        "surface.free", "didCloseTab", "deinit Terminal", "deinit Ghostty",
+        "surface.renderer.realized",
     ]
 
     private func logInternal(_ msg: String, date: Date) {

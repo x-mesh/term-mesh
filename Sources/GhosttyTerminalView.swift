@@ -234,6 +234,17 @@ final class TerminalSurface: Identifiable, ObservableObject {
     /// When true, setFocus(true) calls are ignored to keep CVDisplayLink suspended.
     /// Set by TeamOrchestrator.setAgentSurfaceFocus() when pausing/resuming agent rendering.
     var renderingPaused = false
+
+    /// Whether the renderer's GPU resources (Metal swap chain / IOSurface, ~40MB) are
+    /// currently allocated. Toggled via `setRendererRealized` to reclaim GPU memory for
+    /// surfaces that have been invisible (e.g. background workspace) for a while.
+    /// Starts true: a freshly created surface is realized.
+    private var rendererRealized = true
+    /// Debounced unrealize work item, so transient reparent/workspace flaps don't
+    /// thrash the swap chain (recreate cost) when a surface briefly goes invisible.
+    private var rendererUnrealizeWork: DispatchWorkItem?
+    /// How long a surface must stay invisible before its GPU resources are released.
+    private static let rendererUnrealizeDebounce: TimeInterval = 5.0
     /// Whether the terminal surface view is currently attached to a window.
     ///
     /// Use the hosted view rather than the inner surface view, since the surface can be
@@ -1025,6 +1036,43 @@ final class TerminalSurface: Identifiable, ObservableObject {
         ghostty_surface_set_occlusion(surface, visible)
     }
 
+    /// Release or recreate the renderer's GPU resources (Metal swap chain / IOSurface,
+    /// ~40MB) without freeing the surface. libghostty requires strict realize/unrealize
+    /// alternation (displayRealized asserts the swap chain was previously deinited), so
+    /// redundant calls are dropped here. Safe to call after the surface is freed (no-op).
+    @MainActor func setRendererRealized(_ realized: Bool) {
+        guard let surface = surface else { return }
+        guard realized != rendererRealized else { return }  // enforce alternation
+        rendererRealized = realized
+        ghostty_surface_set_renderer_realized(surface, realized)
+        #if DEBUG
+        dlog("surface.renderer.realized=\(realized) surface=\(id.uuidString.prefix(8))")
+        #endif
+    }
+
+    /// Drive renderer GPU realization from UI visibility (workspace selection). A surface
+    /// that becomes visible realizes immediately so it can draw; one that becomes invisible
+    /// unrealizes only after `rendererUnrealizeDebounce` of sustained invisibility, so brief
+    /// reparent/workspace flaps don't churn the swap chain.
+    @MainActor func setSurfaceVisibleForRenderer(_ visible: Bool) {
+        rendererUnrealizeWork?.cancel()
+        rendererUnrealizeWork = nil
+        if visible {
+            setRendererRealized(true)
+        } else {
+            let work = DispatchWorkItem { [weak self] in
+                guard let self else { return }
+                self.rendererUnrealizeWork = nil
+                self.setRendererRealized(false)
+            }
+            rendererUnrealizeWork = work
+            DispatchQueue.main.asyncAfter(
+                deadline: .now() + Self.rendererUnrealizeDebounce,
+                execute: work
+            )
+        }
+    }
+
     func needsConfirmClose() -> Bool {
         guard let surface = surface else { return false }
         return ghostty_surface_needs_confirm_quit(surface)
@@ -1762,13 +1810,20 @@ final class TerminalSurface: Identifiable, ObservableObject {
         let coordinator = surfaceFreeCoordinator
         let capturedSurface = surface
         let capturedContext = surfaceCallbackContext
+        let capturedId = id
 
         if let s = capturedSurface {
             ghostty_surface_clear_pty_data_callback(s)
         }
 
         Task { @MainActor in
+            #if DEBUG
+            dlog("surface.free.schedule.deinit surface=\(capturedId.uuidString.prefix(8))")
+            #endif
             coordinator.scheduleClose {
+                #if DEBUG
+                dlog("surface.free.perform.deinit surface=\(capturedId.uuidString.prefix(8))")
+                #endif
                 if let s = capturedSurface {
                     ghostty_surface_free(s)
                 }
