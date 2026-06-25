@@ -3089,6 +3089,7 @@ mod tests {
                 created_by: None,
                 deps: None,
                 fix_budget: None,
+                worktree_policy: None,
             })
             .unwrap();
         mgr.task_assign(TaskAssignParams {

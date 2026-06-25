@@ -1063,6 +1063,7 @@ async fn tasks_create_handler(
         created_by: req.created_by,
         deps: req.deps,
         fix_budget: None,
+        worktree_policy: None,
     };
     match state.agent_manager.task_create(params) {
         Ok(task) => (
@@ -1110,6 +1111,7 @@ async fn tasks_update_handler(
         status: req.status,
         priority: req.priority,
         assignee: req.assignee,
+        ..Default::default()
     };
     match state.agent_manager.task_update(params) {
         Ok(task) => Json(serde_json::to_value(task).unwrap()).into_response(),

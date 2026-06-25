@@ -168,6 +168,26 @@ pub struct Task {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub fix_budget: Option<i32>,
     pub fix_count: i32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub worktree_policy: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub worktree_path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub worktree_branch: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub worktree_parent: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub worktree_created: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub worktree_reused: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub worktree_init: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub worktree_finished_at_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub worktree_finish_mode: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub worktree_removed: Option<bool>,
     pub created_at_ms: u64,
     pub updated_at_ms: u64,
 }
@@ -195,6 +215,8 @@ pub struct TaskCreateParams {
     pub deps: Option<Vec<String>>,
     #[serde(default)]
     pub fix_budget: Option<i32>,
+    #[serde(default)]
+    pub worktree_policy: Option<String>,
 }
 
 /// Result of a fix attempt: whether it was accepted or the task was auto-blocked.
@@ -206,7 +228,7 @@ pub struct TaskFixAttemptResult {
     pub blocked: bool,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Default)]
 pub struct TaskUpdateParams {
     pub id: String,
     #[serde(default)]
@@ -219,6 +241,26 @@ pub struct TaskUpdateParams {
     pub priority: Option<i32>,
     #[serde(default)]
     pub assignee: Option<String>,
+    #[serde(default)]
+    pub worktree_policy: Option<String>,
+    #[serde(default)]
+    pub worktree_path: Option<String>,
+    #[serde(default)]
+    pub worktree_branch: Option<String>,
+    #[serde(default)]
+    pub worktree_parent: Option<String>,
+    #[serde(default)]
+    pub worktree_created: Option<bool>,
+    #[serde(default)]
+    pub worktree_reused: Option<bool>,
+    #[serde(default)]
+    pub worktree_init: Option<String>,
+    #[serde(default)]
+    pub worktree_finished_at_ms: Option<u64>,
+    #[serde(default)]
+    pub worktree_finish_mode: Option<String>,
+    #[serde(default)]
+    pub worktree_removed: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -402,6 +444,16 @@ impl AgentSessionManager {
                 priority    INTEGER NOT NULL DEFAULT 0,
                 assignee    TEXT REFERENCES agent_sessions(id),
                 created_by  TEXT REFERENCES agent_sessions(id),
+                worktree_policy TEXT,
+                worktree_path TEXT,
+                worktree_branch TEXT,
+                worktree_parent TEXT,
+                worktree_created INTEGER,
+                worktree_reused INTEGER,
+                worktree_init TEXT,
+                worktree_finished_at_ms INTEGER,
+                worktree_finish_mode TEXT,
+                worktree_removed INTEGER,
                 created_at_ms INTEGER NOT NULL,
                 updated_at_ms INTEGER NOT NULL
             );
@@ -451,6 +503,27 @@ impl AgentSessionManager {
             let _ = db.execute_batch(
                 "ALTER TABLE tasks ADD COLUMN fix_budget INTEGER DEFAULT NULL;
                  ALTER TABLE tasks ADD COLUMN fix_count INTEGER NOT NULL DEFAULT 0",
+            );
+        }
+
+        // Migration: add task-scoped gk worktree lifecycle columns if missing.
+        let has_worktree_policy: bool = db
+            .prepare("SELECT COUNT(*) FROM pragma_table_info('tasks') WHERE name='worktree_policy'")
+            .and_then(|mut s| s.query_row([], |r| r.get::<_, i64>(0)))
+            .map(|c| c > 0)
+            .unwrap_or(false);
+        if !has_worktree_policy {
+            let _ = db.execute_batch(
+                "ALTER TABLE tasks ADD COLUMN worktree_policy TEXT;
+                 ALTER TABLE tasks ADD COLUMN worktree_path TEXT;
+                 ALTER TABLE tasks ADD COLUMN worktree_branch TEXT;
+                 ALTER TABLE tasks ADD COLUMN worktree_parent TEXT;
+                 ALTER TABLE tasks ADD COLUMN worktree_created INTEGER;
+                 ALTER TABLE tasks ADD COLUMN worktree_reused INTEGER;
+                 ALTER TABLE tasks ADD COLUMN worktree_init TEXT;
+                 ALTER TABLE tasks ADD COLUMN worktree_finished_at_ms INTEGER;
+                 ALTER TABLE tasks ADD COLUMN worktree_finish_mode TEXT;
+                 ALTER TABLE tasks ADD COLUMN worktree_removed INTEGER",
             );
         }
 
@@ -1052,9 +1125,9 @@ impl AgentSessionManager {
 
         let fix_budget = params.fix_budget;
         inner.db.execute(
-            "INSERT INTO tasks (id, title, description, status, priority, assignee, created_by, fix_budget, fix_count, created_at_ms, updated_at_ms)
-             VALUES (?1, ?2, ?3, 'pending', ?4, NULL, ?5, ?6, 0, ?7, ?8)",
-            params![id, params.title, params.description, priority, params.created_by, fix_budget, ts, ts],
+            "INSERT INTO tasks (id, title, description, status, priority, assignee, created_by, fix_budget, fix_count, worktree_policy, created_at_ms, updated_at_ms)
+             VALUES (?1, ?2, ?3, 'pending', ?4, NULL, ?5, ?6, 0, ?7, ?8, ?9)",
+            params![id, params.title, params.description, priority, params.created_by, fix_budget, params.worktree_policy, ts, ts],
         ).map_err(|e| format!("DB insert failed: {e}"))?;
 
         for dep in &deps {
@@ -1084,6 +1157,16 @@ impl AgentSessionManager {
             deps,
             fix_budget,
             fix_count: 0,
+            worktree_policy: params.worktree_policy,
+            worktree_path: None,
+            worktree_branch: None,
+            worktree_parent: None,
+            worktree_created: None,
+            worktree_reused: None,
+            worktree_init: None,
+            worktree_finished_at_ms: None,
+            worktree_finish_mode: None,
+            worktree_removed: None,
             created_at_ms: ts,
             updated_at_ms: ts,
         })
@@ -1099,7 +1182,10 @@ impl AgentSessionManager {
                 "SELECT t.id, t.title, t.description, t.status, t.priority, t.assignee,
                     t.created_by, t.created_at_ms, t.updated_at_ms,
                     GROUP_CONCAT(td.depends_on, '|') as dep_ids,
-                    t.fix_budget, t.fix_count
+                    t.fix_budget, t.fix_count,
+                    t.worktree_policy, t.worktree_path, t.worktree_branch, t.worktree_parent,
+                    t.worktree_created, t.worktree_reused, t.worktree_init,
+                    t.worktree_finished_at_ms, t.worktree_finish_mode, t.worktree_removed
              FROM tasks t
              LEFT JOIN task_deps td ON td.task_id = t.id
              WHERE t.id = ?1
@@ -1122,6 +1208,16 @@ impl AgentSessionManager {
                         deps,
                         fix_budget: row.get(10)?,
                         fix_count: row.get::<_, i32>(11).unwrap_or(0),
+                        worktree_policy: row.get(12)?,
+                        worktree_path: row.get(13)?,
+                        worktree_branch: row.get(14)?,
+                        worktree_parent: row.get(15)?,
+                        worktree_created: row.get::<_, Option<i64>>(16)?.map(|v| v != 0),
+                        worktree_reused: row.get::<_, Option<i64>>(17)?.map(|v| v != 0),
+                        worktree_init: row.get(18)?,
+                        worktree_finished_at_ms: row.get::<_, Option<i64>>(19)?.map(|v| v as u64),
+                        worktree_finish_mode: row.get(20)?,
+                        worktree_removed: row.get::<_, Option<i64>>(21)?.map(|v| v != 0),
                         created_at_ms: row.get(7)?,
                         updated_at_ms: row.get(8)?,
                     })
@@ -1139,7 +1235,10 @@ impl AgentSessionManager {
             "SELECT t.id, t.title, t.description, t.status, t.priority, t.assignee,
                     t.created_by, t.created_at_ms, t.updated_at_ms,
                     GROUP_CONCAT(td.depends_on, '|') as dep_ids,
-                    t.fix_budget, t.fix_count
+                    t.fix_budget, t.fix_count,
+                    t.worktree_policy, t.worktree_path, t.worktree_branch, t.worktree_parent,
+                    t.worktree_created, t.worktree_reused, t.worktree_init,
+                    t.worktree_finished_at_ms, t.worktree_finish_mode, t.worktree_removed
              FROM tasks t
              LEFT JOIN task_deps td ON td.task_id = t.id
              WHERE 1=1",
@@ -1180,6 +1279,16 @@ impl AgentSessionManager {
                 deps,
                 fix_budget: row.get(10)?,
                 fix_count: row.get::<_, i32>(11).unwrap_or(0),
+                worktree_policy: row.get(12)?,
+                worktree_path: row.get(13)?,
+                worktree_branch: row.get(14)?,
+                worktree_parent: row.get(15)?,
+                worktree_created: row.get::<_, Option<i64>>(16)?.map(|v| v != 0),
+                worktree_reused: row.get::<_, Option<i64>>(17)?.map(|v| v != 0),
+                worktree_init: row.get(18)?,
+                worktree_finished_at_ms: row.get::<_, Option<i64>>(19)?.map(|v| v as u64),
+                worktree_finish_mode: row.get(20)?,
+                worktree_removed: row.get::<_, Option<i64>>(21)?.map(|v| v != 0),
                 created_at_ms: row.get(7)?,
                 updated_at_ms: row.get(8)?,
             })
@@ -1246,6 +1355,46 @@ impl AgentSessionManager {
             bind_values.push(Box::new(params.assignee.clone()));
             sets.push(format!("assignee = ?{}", bind_values.len()));
         }
+        if let Some(ref value) = params.worktree_policy {
+            bind_values.push(Box::new(value.clone()));
+            sets.push(format!("worktree_policy = ?{}", bind_values.len()));
+        }
+        if let Some(ref value) = params.worktree_path {
+            bind_values.push(Box::new(value.clone()));
+            sets.push(format!("worktree_path = ?{}", bind_values.len()));
+        }
+        if let Some(ref value) = params.worktree_branch {
+            bind_values.push(Box::new(value.clone()));
+            sets.push(format!("worktree_branch = ?{}", bind_values.len()));
+        }
+        if let Some(ref value) = params.worktree_parent {
+            bind_values.push(Box::new(value.clone()));
+            sets.push(format!("worktree_parent = ?{}", bind_values.len()));
+        }
+        if let Some(value) = params.worktree_created {
+            bind_values.push(Box::new(if value { 1_i64 } else { 0_i64 }));
+            sets.push(format!("worktree_created = ?{}", bind_values.len()));
+        }
+        if let Some(value) = params.worktree_reused {
+            bind_values.push(Box::new(if value { 1_i64 } else { 0_i64 }));
+            sets.push(format!("worktree_reused = ?{}", bind_values.len()));
+        }
+        if let Some(ref value) = params.worktree_init {
+            bind_values.push(Box::new(value.clone()));
+            sets.push(format!("worktree_init = ?{}", bind_values.len()));
+        }
+        if let Some(value) = params.worktree_finished_at_ms {
+            bind_values.push(Box::new(value as i64));
+            sets.push(format!("worktree_finished_at_ms = ?{}", bind_values.len()));
+        }
+        if let Some(ref value) = params.worktree_finish_mode {
+            bind_values.push(Box::new(value.clone()));
+            sets.push(format!("worktree_finish_mode = ?{}", bind_values.len()));
+        }
+        if let Some(value) = params.worktree_removed {
+            bind_values.push(Box::new(if value { 1_i64 } else { 0_i64 }));
+            sets.push(format!("worktree_removed = ?{}", bind_values.len()));
+        }
 
         bind_values.push(Box::new(params.id.clone()));
         let id_idx = bind_values.len();
@@ -1278,6 +1427,19 @@ impl AgentSessionManager {
         }
         if params.assignee.is_some() {
             log_parts.push("assignee");
+        }
+        if params.worktree_policy.is_some()
+            || params.worktree_path.is_some()
+            || params.worktree_branch.is_some()
+            || params.worktree_parent.is_some()
+            || params.worktree_created.is_some()
+            || params.worktree_reused.is_some()
+            || params.worktree_init.is_some()
+            || params.worktree_finished_at_ms.is_some()
+            || params.worktree_finish_mode.is_some()
+            || params.worktree_removed.is_some()
+        {
+            log_parts.push("worktree");
         }
         let log_msg = format!("updated: {}", log_parts.join(", "));
         let _ = inner.db.execute(
@@ -1343,9 +1505,7 @@ impl AgentSessionManager {
             )
             .ok();
         if let Some(busy_id) = busy {
-            return Err(format!(
-                "already_busy: existing in-flight task {busy_id}"
-            ));
+            return Err(format!("already_busy: existing in-flight task {busy_id}"));
         }
 
         // Check all deps are completed
@@ -1490,6 +1650,7 @@ impl AgentSessionManager {
             status: Some("blocked".to_string()),
             priority: None,
             assignee: None,
+            ..Default::default()
         })?;
         let inner = self.inner.lock().unwrap();
         let _ = inner.db.execute(
@@ -2143,6 +2304,7 @@ mod tests {
                 created_by: None,
                 deps: None,
                 fix_budget: None,
+                worktree_policy: None,
             })
             .unwrap();
 
@@ -2168,6 +2330,7 @@ mod tests {
                 created_by: None,
                 deps: None,
                 fix_budget: None,
+                worktree_policy: None,
             })
             .unwrap();
         let _t2 = mgr
@@ -2178,6 +2341,7 @@ mod tests {
                 created_by: None,
                 deps: None,
                 fix_budget: None,
+                worktree_policy: None,
             })
             .unwrap();
 
@@ -2223,6 +2387,7 @@ mod tests {
                 created_by: None,
                 deps: None,
                 fix_budget: None,
+                worktree_policy: None,
             })
             .unwrap();
 
@@ -2234,6 +2399,7 @@ mod tests {
             status: Some("in_progress".into()),
             priority: None,
             assignee: None,
+            ..Default::default()
         });
         assert!(err.is_err());
 
@@ -2246,6 +2412,7 @@ mod tests {
                 status: Some("cancelled".into()),
                 priority: None,
                 assignee: None,
+                ..Default::default()
             })
             .unwrap();
         assert_eq!(updated.status, TaskStatus::Cancelled);
@@ -2259,6 +2426,7 @@ mod tests {
                 created_by: None,
                 deps: None,
                 fix_budget: None,
+                worktree_policy: None,
             })
             .unwrap();
 
@@ -2278,6 +2446,7 @@ mod tests {
                 status: Some("in_progress".into()),
                 priority: None,
                 assignee: None,
+                ..Default::default()
             })
             .unwrap();
         assert_eq!(t2.status, TaskStatus::InProgress);
@@ -2291,6 +2460,7 @@ mod tests {
                 status: Some("completed".into()),
                 priority: None,
                 assignee: None,
+                ..Default::default()
             })
             .unwrap();
         assert_eq!(t2.status, TaskStatus::Completed);
@@ -2310,6 +2480,7 @@ mod tests {
                 created_by: None,
                 deps: None,
                 fix_budget: None,
+                worktree_policy: None,
             })
             .unwrap();
 
@@ -2322,6 +2493,7 @@ mod tests {
                 created_by: None,
                 deps: Some(vec![dep.id.clone()]),
                 fix_budget: None,
+                worktree_policy: None,
             })
             .unwrap();
 
@@ -2346,6 +2518,7 @@ mod tests {
             status: Some("in_progress".into()),
             priority: None,
             assignee: None,
+            ..Default::default()
         })
         .unwrap();
         mgr.task_update(TaskUpdateParams {
@@ -2355,6 +2528,7 @@ mod tests {
             status: Some("completed".into()),
             priority: None,
             assignee: None,
+            ..Default::default()
         })
         .unwrap();
 
@@ -2380,6 +2554,7 @@ mod tests {
                 created_by: None,
                 deps: None,
                 fix_budget: None,
+                worktree_policy: None,
             })
             .unwrap();
 
@@ -2390,6 +2565,7 @@ mod tests {
             status: None,
             priority: None,
             assignee: None,
+            ..Default::default()
         })
         .unwrap();
 
@@ -2489,6 +2665,7 @@ mod tests {
                 created_by: None,
                 deps: None,
                 fix_budget: None,
+                worktree_policy: None,
             })
             .unwrap();
         mgr.task_assign(TaskAssignParams {
@@ -2513,6 +2690,7 @@ mod tests {
                 status: Some("blocked".into()),
                 priority: None,
                 assignee: None,
+                ..Default::default()
             })
             .expect("assigned -> blocked must be allowed");
         assert_eq!(updated.status, TaskStatus::Blocked);
@@ -2527,6 +2705,7 @@ mod tests {
                 status: Some("cancelled".into()),
                 priority: None,
                 assignee: None,
+                ..Default::default()
             })
             .expect("assigned -> cancelled must be allowed");
         assert_eq!(cancelled.status, TaskStatus::Cancelled);
@@ -2548,6 +2727,7 @@ mod tests {
                 created_by: None,
                 deps: None,
                 fix_budget: None,
+                worktree_policy: None,
             })
             .unwrap();
         let err = mgr
@@ -2567,6 +2747,7 @@ mod tests {
             status: Some("blocked".into()),
             priority: None,
             assignee: None,
+            ..Default::default()
         })
         .unwrap();
         mgr.task_assign(TaskAssignParams {
@@ -2594,7 +2775,8 @@ mod tests {
         // task_log must carry the reason.
         let log = mgr.task_log(&zombie.id, None);
         assert!(
-            log.iter().any(|e| e.message.contains("auto-blocked: startup_sweep")),
+            log.iter()
+                .any(|e| e.message.contains("auto-blocked: startup_sweep")),
             "task_log missing auto-blocked reason"
         );
 
