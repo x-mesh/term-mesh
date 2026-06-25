@@ -17,7 +17,7 @@
 mod peer;
 mod prompts;
 
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use serde_json::{json, Value};
 use std::fs;
 use std::io::{BufRead, BufReader, ErrorKind, IsTerminal, Write};
@@ -32,6 +32,29 @@ const DEFAULT_AGENT_NAMES: &[&str] = &[
     "explorer", "executor", "reviewer", "debugger", "writer", "tester",
 ];
 const DEFAULT_AGENT_COLORS: &[&str] = &["green", "blue", "yellow", "magenta", "cyan", "red"];
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+enum WorktreePolicyArg {
+    Auto,
+    Always,
+    Off,
+}
+
+fn worktree_policy_name(policy: WorktreePolicyArg) -> &'static str {
+    match policy {
+        WorktreePolicyArg::Auto => "auto",
+        WorktreePolicyArg::Always => "always",
+        WorktreePolicyArg::Off => "off",
+    }
+}
+
+fn parse_worktree_policy_name(value: Option<&str>) -> WorktreePolicyArg {
+    match value.unwrap_or("auto").to_ascii_lowercase().as_str() {
+        "always" => WorktreePolicyArg::Always,
+        "off" | "false" | "none" => WorktreePolicyArg::Off,
+        _ => WorktreePolicyArg::Auto,
+    }
+}
 
 // Literal block agents must invoke as a shell command before stopping. TUI CLIs
 // (Claude/Codex) frequently print this header in their response text but never
@@ -82,7 +105,13 @@ const BROADCAST_SUFFIX: &str = concat!(
     "Without running this shell command the leader cannot detect completion. Printing the header in your response is NOT enough; you must invoke `tm-agent reply` as a shell command.",
 );
 
-fn agent_init_prompt(agent_name: &str, agent_role: &str, team_name: &str, workdir: &str, socket: &str) -> String {
+fn agent_init_prompt(
+    agent_name: &str,
+    agent_role: &str,
+    team_name: &str,
+    workdir: &str,
+    socket: &str,
+) -> String {
     let root = Path::new(workdir);
     let runbook_mode = env::var("TERMMESH_RUNBOOK_MODE").unwrap_or_else(|_| "digest".to_string());
     let runbook_mode = runbook_mode.trim();
@@ -94,7 +123,10 @@ fn agent_init_prompt(agent_name: &str, agent_role: &str, team_name: &str, workdi
             .map(|content| format!("\n## Role Runbook\n\n{content}\n"))
             .unwrap_or_default()
     } else if let Some(role) = role {
-        format!("\n{}\n", runbook_digest_content(root, &role, agent_name, team_name))
+        format!(
+            "\n{}\n",
+            runbook_digest_content(root, &role, agent_name, team_name)
+        )
     } else {
         format!(
             "\n{}\n",
@@ -462,6 +494,12 @@ enum Commands {
         /// Target a specific pane by panel_id (deterministic; overrides name round-robin). Task assignee stays the agent name.
         #[arg(long)]
         panel: Option<String>,
+        /// gk worktree policy for this task: auto isolates mutating executor work.
+        #[arg(long, value_enum, default_value_t = WorktreePolicyArg::Auto)]
+        worktree: WorktreePolicyArg,
+        /// Base ref for `git-kit wt acquire --from <ref>` when a worktree is acquired.
+        #[arg(long = "from")]
+        from_ref: Option<String>,
     },
     /// Stop (interrupt) agents by sending Ctrl+C to their terminals
     Stop {
@@ -528,6 +566,12 @@ enum Commands {
         /// Auto-fix budget: max number of fix attempts before auto-blocking
         #[arg(long)]
         auto_fix_budget: Option<u8>,
+        /// gk worktree policy for each delegated task.
+        #[arg(long, value_enum, default_value_t = WorktreePolicyArg::Auto)]
+        worktree: WorktreePolicyArg,
+        /// Base ref for `git-kit wt acquire --from <ref>` when worktrees are acquired.
+        #[arg(long = "from")]
+        from_ref: Option<String>,
     },
     /// Get concise agent status (status + task + messages + terminal)
     Brief {
@@ -718,6 +762,10 @@ enum Commands {
         /// Accepts comma- or space-separated ids: --depends-on a,b  or  --deps a b
         #[arg(long, visible_alias = "depends-on", value_delimiter = ',', num_args = 1..)]
         deps: Vec<String>,
+        #[arg(long, value_enum, default_value_t = WorktreePolicyArg::Auto)]
+        worktree: WorktreePolicyArg,
+        #[arg(long = "from")]
+        from_ref: Option<String>,
     },
     /// Alias: task-update → task update
     #[command(name = "task-update", hide = true)]
@@ -807,6 +855,12 @@ enum TaskCommands {
         /// Template variable substitution: --var key=value (repeatable)
         #[arg(long, value_parser = parse_template_var)]
         var: Vec<(String, String)>,
+        /// Store a worktree policy on the task for later delegate/claim handling.
+        #[arg(long, value_enum, default_value_t = WorktreePolicyArg::Auto)]
+        worktree: WorktreePolicyArg,
+        /// Base ref hint for future worktree acquisition.
+        #[arg(long = "from")]
+        from_ref: Option<String>,
     },
     /// Mark task as in_progress
     Start { task_id: String },
@@ -867,6 +921,17 @@ enum TaskCommands {
     FixAttempt { task_id: String },
     /// Clear all tasks
     Clear,
+    /// Finish the gk worktree attached to a task.
+    #[command(name = "finish-worktree")]
+    FinishWorktree {
+        task_id: String,
+        #[arg(long, default_value = "parent")]
+        to: String,
+        #[arg(long)]
+        cleanup: bool,
+        #[arg(long)]
+        push: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1802,7 +1867,12 @@ fn runbook_section_bullets(content: &str, section: &str, limit: usize) -> Vec<St
     out
 }
 
-fn runbook_digest_content(root: &Path, role: &RunbookRole, agent_name: &str, team_name: &str) -> String {
+fn runbook_digest_content(
+    root: &Path,
+    role: &RunbookRole,
+    agent_name: &str,
+    team_name: &str,
+) -> String {
     let source_path = runbook_source_path(root, role);
     let source_content = effective_source_runbook_content(root, role);
     let when = runbook_section_bullets(&source_content, "## When To Use", 2);
@@ -2361,7 +2431,13 @@ mod runbook_tests {
         fs::create_dir_all(&runbook_dir).unwrap();
         fs::write(runbook_dir.join("explorer.md"), "EXPLORER ONLY\n").unwrap();
 
-        let prompt = agent_init_prompt("exp1", "explorer", "test-team", &dir.to_string_lossy(), "/tmp/socket");
+        let prompt = agent_init_prompt(
+            "exp1",
+            "explorer",
+            "test-team",
+            &dir.to_string_lossy(),
+            "/tmp/socket",
+        );
         assert!(prompt.contains("## Runbook Digest"));
         assert!(prompt.contains("OUTPUT: STATUS/FILES/VERIFY/NEXT/FULL_REPORT"));
         assert!(prompt.contains("named \"exp1\" with role \"explorer\""));
@@ -2503,7 +2579,10 @@ mod runbook_tests {
         assert_eq!(headers["files"].as_str(), Some("none"));
         assert_eq!(headers["verify"].as_str(), Some("echo \"pong\""));
         assert_eq!(headers["next"].as_str(), Some("NONE"));
-        assert_eq!(headers["full_report"].as_str(), Some("n/a executor ping ok"));
+        assert_eq!(
+            headers["full_report"].as_str(),
+            Some("n/a executor ping ok")
+        );
     }
 
     #[test]
@@ -2522,14 +2601,16 @@ mod runbook_tests {
 
     #[test]
     fn reply_protocol_status_done() {
-        let content = "STATUS: DONE\nFILES: none\nVERIFY: n/a\nNEXT: NONE\nFULL_REPORT: n/a\n\nbody";
+        let content =
+            "STATUS: DONE\nFILES: none\nVERIFY: n/a\nNEXT: NONE\nFULL_REPORT: n/a\n\nbody";
         let (h, _) = reply_header_and_summary(content, 1500);
         assert_eq!(h["status"].as_str().unwrap(), "DONE");
     }
 
     #[test]
     fn reply_protocol_status_blocked() {
-        let content = "STATUS: BLOCKED\nFILES: none\nVERIFY: n/a\nNEXT: leader\nFULL_REPORT: n/a\n\nreason";
+        let content =
+            "STATUS: BLOCKED\nFILES: none\nVERIFY: n/a\nNEXT: leader\nFULL_REPORT: n/a\n\nreason";
         let (h, _) = reply_header_and_summary(content, 1500);
         assert_eq!(h["status"].as_str().unwrap(), "BLOCKED");
     }
@@ -2553,7 +2634,10 @@ mod runbook_tests {
 
     #[test]
     fn protocol_status_helper_needs_review() {
-        assert_eq!(protocol_status_to_task_state("NEEDS_REVIEW"), Some("review_ready"));
+        assert_eq!(
+            protocol_status_to_task_state("NEEDS_REVIEW"),
+            Some("review_ready")
+        );
     }
 
     #[test]
@@ -2673,11 +2757,20 @@ mod runbook_tests {
 
     #[test]
     fn return_retry_policy_is_conservative_when_text_delivery_failed() {
-        assert_eq!(return_retry_delays_ms(true, "team.send"), &[250, 400, 600, 800, 1000, 1500, 2500, 4000]);
-        assert_eq!(return_retry_delays_ms(false, "team.send"), &[200, 500, 1000, 2000]);
+        assert_eq!(
+            return_retry_delays_ms(true, "team.send"),
+            &[250, 400, 600, 800, 1000, 1500, 2500, 4000]
+        );
+        assert_eq!(
+            return_retry_delays_ms(false, "team.send"),
+            &[200, 500, 1000, 2000]
+        );
         // Init prompt path now uses the same cadence as team.send — paste
         // truncation is handled by chunking in Swift, not by Rust delays.
-        assert_eq!(return_retry_delays_ms(true, "team.create.init"), &[250, 400, 600, 800, 1000, 1500, 2500, 4000]);
+        assert_eq!(
+            return_retry_delays_ms(true, "team.create.init"),
+            &[250, 400, 600, 800, 1000, 1500, 2500, 4000]
+        );
     }
 }
 
@@ -3032,7 +3125,11 @@ fn truncate_chars(s: &str, n: usize) -> String {
 }
 
 /// Icon + status label for a task row.
-fn task_status_glyph(status: &str, is_stale: bool, needs_attention: bool) -> (&'static str, &'static str) {
+fn task_status_glyph(
+    status: &str,
+    is_stale: bool,
+    needs_attention: bool,
+) -> (&'static str, &'static str) {
     match status {
         "in_progress" => ("★", "in_progress"),
         "assigned" if is_stale => ("⏳", "stale"),
@@ -3290,6 +3387,10 @@ fn append_report_suffix(text: &str, no_report: bool) -> String {
     }
 }
 
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
 // ── Research helpers ──────────────────────────────────────────────────────────
 
 /// Lightweight info about one agent, extracted from `team.status` response.
@@ -3301,7 +3402,8 @@ struct AgentInfo {
     cli: String,
     agent_state: String,
     /// panel_id of this agent's pane (used for deterministic per-pane fan-out routing)
-    #[allow(dead_code)] // Parsed from status; fan-out reads panel_id from raw status JSON directly
+    #[allow(dead_code)]
+    // Parsed from status; fan-out reads panel_id from raw status JSON directly
     panel_id: Option<String>,
 }
 
@@ -3451,6 +3553,19 @@ fn format_task_instruction(
     ]);
     if let Some(p) = task["priority"].as_u64() {
         lines.push(format!("TASK_PRIORITY: {p}"));
+    }
+    if let Some(path) = task["worktree_path"].as_str().filter(|s| !s.is_empty()) {
+        lines.push(format!("WORKTREE_PATH: {path}"));
+        if let Some(branch) = task["worktree_branch"].as_str().filter(|s| !s.is_empty()) {
+            lines.push(format!("WORKTREE_BRANCH: {branch}"));
+        }
+        lines.push(format!(
+            "WORKDIR_INSTRUCTION: Run commands from this worktree: cd {}",
+            shell_quote(path)
+        ));
+        lines.push(format!(
+            "NEXT_HINT: after reporting, the leader can run `tm-agent task finish-worktree {task_id} --to parent --cleanup`"
+        ));
     }
     if let Some(ac) = task["acceptance_criteria"].as_array() {
         if !ac.is_empty() {
@@ -4308,6 +4423,8 @@ fn main() {
                     deps,
                     template,
                     var,
+                    worktree,
+                    from_ref: _,
                 } => {
                     // Resolve template (if provided), CLI args take precedence over template values
                     let (tmpl_title, tmpl_desc, tmpl_assign, tmpl_priority) =
@@ -4337,6 +4454,7 @@ fn main() {
                     let final_priority = priority.or(tmpl_priority);
 
                     let mut params = json!({ "team_name": team, "title": final_title });
+                    params["worktree_policy"] = json!(worktree_policy_name(worktree));
                     if let Some(a) = final_assign {
                         params["assignee"] = json!(a);
                     }
@@ -4407,7 +4525,8 @@ fn main() {
                     );
                     match task_resp {
                         Ok(v) => {
-                            let tasks = v["result"]["tasks"].as_array().cloned().unwrap_or_default();
+                            let tasks =
+                                v["result"]["tasks"].as_array().cloned().unwrap_or_default();
                             let mut candidates: Vec<&Value> = tasks
                                 .iter()
                                 .filter(|t| {
@@ -4424,7 +4543,9 @@ fn main() {
                                 let ib = b["status"].as_str() == Some("in_progress");
                                 let ca = a["created_at"].as_str().unwrap_or("");
                                 let cb = b["created_at"].as_str().unwrap_or("");
-                                sa.cmp(&sb).then_with(|| ib.cmp(&ia)).then_with(|| cb.cmp(ca))
+                                sa.cmp(&sb)
+                                    .then_with(|| ib.cmp(&ia))
+                                    .then_with(|| cb.cmp(ca))
                             });
                             match candidates.first() {
                                 Some(t) => {
@@ -4522,6 +4643,12 @@ fn main() {
                     }
                     rpc_call(&sock, "team.task.split", params)
                 }
+                TaskCommands::FinishWorktree {
+                    task_id,
+                    to,
+                    cleanup,
+                    push,
+                } => run_task_finish_worktree(&sock, &team, &task_id, &to, cleanup, push),
                 TaskCommands::Clear => {
                     rpc_call(&sock, "team.task.clear", json!({ "team_name": team }))
                 }
@@ -4568,8 +4695,11 @@ fn main() {
             priority,
             accept,
             deps,
+            worktree,
+            from_ref: _,
         } => {
             let mut params = json!({ "team_name": team, "title": title });
+            params["worktree_policy"] = json!(worktree_policy_name(worktree));
             if let Some(a) = assign {
                 params["assignee"] = json!(a);
             }
@@ -4631,8 +4761,8 @@ fn main() {
                 .unwrap_or_else(|e| {
                     // If the error string is itself a JSON object (e.g. no_app structured error),
                     // use it directly as the "error" field to preserve code + message.
-                    let err = serde_json::from_str::<Value>(&e)
-                        .unwrap_or_else(|_| json!({"message": e}));
+                    let err =
+                        serde_json::from_str::<Value>(&e).unwrap_or_else(|_| json!({"message": e}));
                     json!({"ok": false, "error": err})
                 });
 
@@ -4915,7 +5045,16 @@ fn main() {
 
             // GUI team: route to team.add_agent RPC
             let gui_team = resolve_workspace_team_name().unwrap_or_else(|_| team.clone());
-            run_add_gui(&sock, &gui_team, &agent_type, &agent_name, &model, &cli, no_auto_watch, auto_recycle);
+            run_add_gui(
+                &sock,
+                &gui_team,
+                &agent_type,
+                &agent_name,
+                &model,
+                &cli,
+                no_auto_watch,
+                auto_recycle,
+            );
             return;
         }
         Commands::Attach {
@@ -5122,6 +5261,8 @@ fn main() {
             auto_fix_budget,
             autonomous,
             panel,
+            worktree,
+            from_ref,
         } => {
             // Auto-detect comma-separated agents and route to parallel fan-out.
             // Fan-out resolves its OWN per-thread panel_ids from team.status, so the
@@ -5137,6 +5278,8 @@ fn main() {
                     &Some(target.to_string()),
                     context.as_deref(),
                     auto_fix_budget,
+                    worktree,
+                    from_ref.as_deref(),
                 );
             } else if autonomous {
                 // Autonomous mode spawns a headless subprocess; --panel does not apply.
@@ -5166,6 +5309,8 @@ fn main() {
                     context.as_deref(),
                     auto_fix_budget,
                     panel.as_deref(),
+                    worktree,
+                    from_ref.as_deref(),
                 );
             }
             return;
@@ -5178,6 +5323,8 @@ fn main() {
             agents,
             context,
             auto_fix_budget,
+            worktree,
+            from_ref,
         } => {
             run_fan_out(
                 &sock,
@@ -5189,6 +5336,8 @@ fn main() {
                 &agents,
                 context.as_deref(),
                 auto_fix_budget,
+                worktree,
+                from_ref.as_deref(),
             );
             return;
         }
@@ -5373,7 +5522,11 @@ fn main() {
             run_brief(&sock, &team, target, lines);
             return;
         }
-        Commands::Reply { text, from, task_id: explicit_task_id } => {
+        Commands::Reply {
+            text,
+            from,
+            task_id: explicit_task_id,
+        } => {
             let sender = from.unwrap_or_else(|| agent.clone());
             let mut content = text.join(" ");
             // stdin fallback: agents frequently submit the body via a heredoc
@@ -5385,9 +5538,7 @@ fn main() {
             if content.trim().is_empty() && !std::io::stdin().is_terminal() {
                 use std::io::Read as _;
                 let mut piped = String::new();
-                if std::io::stdin().read_to_string(&mut piped).is_ok()
-                    && !piped.trim().is_empty()
-                {
+                if std::io::stdin().read_to_string(&mut piped).is_ok() && !piped.trim().is_empty() {
                     content = piped;
                 }
             }
@@ -5702,7 +5853,10 @@ fn read_watcher_cli_model(
             .and_then(|arr| arr.iter().find(|a| a["name"].as_str() == Some(watcher)))
             .map(|a| {
                 (
-                    a["cli"].as_str().filter(|s| !s.is_empty()).map(String::from),
+                    a["cli"]
+                        .as_str()
+                        .filter(|s| !s.is_empty())
+                        .map(String::from),
                     a["model"]
                         .as_str()
                         .filter(|s| !s.is_empty())
@@ -5739,7 +5893,11 @@ fn run_watch_doctor(
 ) {
     let watcher = watcher.unwrap_or("watcher");
     let probe_timeout = probe_timeout.unwrap_or(5);
-    let team_type = if team.starts_with("ws-") { "ws" } else { "create" };
+    let team_type = if team.starts_with("ws-") {
+        "ws"
+    } else {
+        "create"
+    };
 
     let mut out = json!({
         "watcher": watcher,
@@ -6644,7 +6802,8 @@ fn run_create(
             for a in &non_kiro {
                 let name = a["name"].as_str().unwrap_or("");
                 let role = a["agent_type"].as_str().unwrap_or(name);
-                let init_text = agent_init_prompt(name, role, team, &workdir, &sock.to_string_lossy());
+                let init_text =
+                    agent_init_prompt(name, role, team, &workdir, &sock.to_string_lossy());
                 match rpc_call_timeout(
                     sock,
                     "team.send",
@@ -6663,7 +6822,12 @@ fn run_create(
                         let text_delivered =
                             r["result"]["text_delivered"].as_bool().unwrap_or(false);
                         let _ = send_return_key_with_retry(
-                            sock, team, name, text_delivered, "team.create.init", None,
+                            sock,
+                            team,
+                            name,
+                            text_delivered,
+                            "team.create.init",
+                            None,
                         );
                         eprintln!("  \u{2713} {name}: init prompt sent");
                     }
@@ -6690,7 +6854,10 @@ fn run_create(
 
 fn is_auto_watch_disabled_by_env() -> bool {
     match env::var("TERMMESH_AUTO_WATCH") {
-        Ok(val) => matches!(val.to_ascii_lowercase().as_str(), "0" | "false" | "no" | "off"),
+        Ok(val) => matches!(
+            val.to_ascii_lowercase().as_str(),
+            "0" | "false" | "no" | "off"
+        ),
         Err(_) => false,
     }
 }
@@ -6711,7 +6878,11 @@ enum AutoWatchDecision {
     SkipNoWorker,
     SkipMultiWorker(usize),
     SkipMissingSpec,
-    Enable { target: String, watcher_cli: String, watcher_model: String },
+    Enable {
+        target: String,
+        watcher_cli: String,
+        watcher_model: String,
+    },
 }
 
 /// Pure decision function — no I/O, fully unit-testable.
@@ -6760,7 +6931,10 @@ fn parse_watch_on_response(r: &serde_json::Value) -> WatchOnOutcome {
     {
         WatchOnOutcome::Enabled
     } else if r.get("error").map_or(false, |e| !e.is_null()) {
-        let msg = r["error"]["message"].as_str().unwrap_or("unknown").to_string();
+        let msg = r["error"]["message"]
+            .as_str()
+            .unwrap_or("unknown")
+            .to_string();
         WatchOnOutcome::Failed(msg)
     } else {
         WatchOnOutcome::Unexpected(r.to_string())
@@ -6783,7 +6957,11 @@ fn apply_auto_watch(team_name: &str, working_dir: &std::path::Path, decision: Au
                  create the file to enable auto drift watch"
             );
         }
-        AutoWatchDecision::Enable { target, watcher_cli, watcher_model } => {
+        AutoWatchDecision::Enable {
+            target,
+            watcher_cli,
+            watcher_model,
+        } => {
             let wd_str = working_dir.to_string_lossy();
             let mut params = json!({
                 "team_id": team_name,
@@ -6920,7 +7098,12 @@ fn maybe_auto_watch_after_team_change(
     if no_auto_watch || is_auto_watch_disabled_by_env() {
         return;
     }
-    let status = match rpc_call_timeout(app_sock, "team.status", json!({ "team_name": team_name }), 3) {
+    let status = match rpc_call_timeout(
+        app_sock,
+        "team.status",
+        json!({ "team_name": team_name }),
+        3,
+    ) {
         Ok(v) if v["ok"].as_bool().unwrap_or(false) => v,
         _ => return,
     };
@@ -7364,9 +7547,7 @@ fn run_remove_gui(sock: &PathBuf, team_name: &str, agent_name: &str, force: bool
         }
     } else {
         let code = resp["error"]["code"].as_str().unwrap_or("unknown");
-        let msg = resp["error"]["message"]
-            .as_str()
-            .unwrap_or("remove failed");
+        let msg = resp["error"]["message"].as_str().unwrap_or("remove failed");
         let hint = match code {
             "agent_busy" => "\nHint: Agent has an active task — pass --force to close anyway, or finish/block the task first.".to_string(),
             _ => String::new(),
@@ -7681,8 +7862,11 @@ fn run_create_headless(
             .filter(|s| !s.is_empty())
             .enumerate()
             .map(|(_i, name)| {
-                let mut spec = json!({ "name": name, "agent_type": name, "cli": "claude", "model": model });
-                if let Some(n) = auto_recycle { spec["auto_recycle_every"] = json!(n); }
+                let mut spec =
+                    json!({ "name": name, "agent_type": name, "cli": "claude", "model": model });
+                if let Some(n) = auto_recycle {
+                    spec["auto_recycle_every"] = json!(n);
+                }
                 spec
             })
             .collect()
@@ -7694,8 +7878,11 @@ fn run_create_headless(
                 } else {
                     format!("agent-{i}")
                 };
-                let mut spec = json!({ "name": name, "agent_type": name, "cli": "claude", "model": model });
-                if let Some(n) = auto_recycle { spec["auto_recycle_every"] = json!(n); }
+                let mut spec =
+                    json!({ "name": name, "agent_type": name, "cli": "claude", "model": model });
+                if let Some(n) = auto_recycle {
+                    spec["auto_recycle_every"] = json!(n);
+                }
                 spec
             })
             .collect()
@@ -7820,7 +8007,8 @@ fn run_add_headless(
                 .map(|p| p.to_string_lossy().to_string())
                 .unwrap_or_else(|_| ".".to_string());
             let agent_id = format!("{agent_name}@{team}");
-            let init_text = agent_init_prompt(agent_name, agent_type, team, &workdir, &app_sock_str);
+            let init_text =
+                agent_init_prompt(agent_name, agent_type, team, &workdir, &app_sock_str);
 
             match rpc_call_timeout(
                 daemon_sock,
@@ -7862,8 +8050,14 @@ fn run_add_headless(
             // Fire unconditionally — helper checks (watcher==1 + worker>=1) internally.
             let wd = env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
             maybe_auto_watch_after_headless_add(
-                daemon_sock, team, no_auto_watch, &wd,
-                agent_name, agent_type, cli, model,
+                daemon_sock,
+                team,
+                no_auto_watch,
+                &wd,
+                agent_name,
+                agent_type,
+                cli,
+                model,
             );
         }
         Err(e) => {
@@ -7887,9 +8081,37 @@ fn run_delegate_result(
     context: Option<&str>,
     fix_budget: Option<u8>,
     panel_id: Option<&str>,
+    worktree_policy: WorktreePolicyArg,
+    from_ref: Option<&str>,
 ) -> Result<Value, String> {
     let resolved_title = title.unwrap_or_else(|| task_title_from_text(text));
     let resolved_priority = priority.unwrap_or(2);
+
+    if should_acquire_worktree(
+        worktree_policy,
+        target,
+        text,
+        &resolved_title,
+        desc.as_deref(),
+    ) {
+        return run_delegate_result_with_worktree(
+            sock,
+            team,
+            target,
+            text,
+            resolved_title,
+            resolved_priority,
+            accept,
+            deps,
+            desc,
+            no_report,
+            context,
+            fix_budget,
+            panel_id,
+            worktree_policy,
+            from_ref,
+        );
+    }
 
     // Try unified team.delegate RPC first (single round-trip)
     let mut delegate_params = json!({
@@ -7937,15 +8159,24 @@ fn run_delegate_result(
                         };
                         if !headless_ok {
                             eprintln!("  Warning: headless.send failed for {target}");
-                            let task_id = v["result"]["task"]["id"].as_str().unwrap_or("?").to_string();
+                            let task_id = v["result"]["task"]["id"]
+                                .as_str()
+                                .unwrap_or("?")
+                                .to_string();
                             let reason = format!("headless paste delivery failed: headless.send RPC returned null (agent={target})");
-                            let _ = rpc_call(sock, "team.task.update", json!({
-                                "team_name": team,
-                                "task_id": &task_id,
-                                "status": "blocked",
-                                "blocked_reason": &reason,
-                            }));
-                            return Err(format!("delivery failed; task blocked: {reason} (task_id={task_id})"));
+                            let _ = rpc_call(
+                                sock,
+                                "team.task.update",
+                                json!({
+                                    "team_name": team,
+                                    "task_id": &task_id,
+                                    "status": "blocked",
+                                    "blocked_reason": &reason,
+                                }),
+                            );
+                            return Err(format!(
+                                "delivery failed; task blocked: {reason} (task_id={task_id})"
+                            ));
                         }
                         return Ok(v);
                     }
@@ -7987,12 +8218,16 @@ fn run_delegate_result(
                         eprintln!("  Warning: retry also failed — task created but text may not have been delivered.");
                         if let Some(task_id) = v["result"]["task"]["id"].as_str() {
                             let reason = format!("paste delivery failed: surface-nil 4-retry + team.send fallback exhausted (agent={target})");
-                            let _ = rpc_call(sock, "team.task.update", json!({
-                                "team_name": team,
-                                "task_id": task_id,
-                                "status": "blocked",
-                                "blocked_reason": reason,
-                            }));
+                            let _ = rpc_call(
+                                sock,
+                                "team.task.update",
+                                json!({
+                                    "team_name": team,
+                                    "task_id": task_id,
+                                    "status": "blocked",
+                                    "blocked_reason": reason,
+                                }),
+                            );
                         }
                     }
                 }
@@ -8001,9 +8236,14 @@ fn run_delegate_result(
             // If text still not delivered after all retries, return failure so callers
             // get a nonzero exit code (task was already blocked above).
             if !text_delivered {
-                let task_id = v["result"]["task"]["id"].as_str().unwrap_or("?").to_string();
+                let task_id = v["result"]["task"]["id"]
+                    .as_str()
+                    .unwrap_or("?")
+                    .to_string();
                 let reason = format!("paste delivery failed: surface-nil 4-retry + team.send fallback exhausted (agent={target})");
-                return Err(format!("delivery failed; task blocked: {reason} (task_id={task_id})"));
+                return Err(format!(
+                    "delivery failed; task blocked: {reason} (task_id={task_id})"
+                ));
             }
 
             // Send Return key separately via team.send_key RPC.
@@ -8096,14 +8336,22 @@ fn run_delegate_result(
             };
             if !sent_ok {
                 eprintln!("  Warning: headless.send failed in 2-RPC fallback");
-                let reason = format!("legacy delegate fallback failed: headless.send returned null (agent={target})");
-                let _ = rpc_call(sock, "team.task.update", json!({
-                    "team_name": team,
-                    "task_id": task_id,
-                    "status": "blocked",
-                    "blocked_reason": &reason,
-                }));
-                return Err(format!("delivery failed; task blocked: {reason} (task_id={task_id})"));
+                let reason = format!(
+                    "legacy delegate fallback failed: headless.send returned null (agent={target})"
+                );
+                let _ = rpc_call(
+                    sock,
+                    "team.task.update",
+                    json!({
+                        "team_name": team,
+                        "task_id": task_id,
+                        "status": "blocked",
+                        "blocked_reason": &reason,
+                    }),
+                );
+                return Err(format!(
+                    "delivery failed; task blocked: {reason} (task_id={task_id})"
+                ));
             }
             return Ok(json!({ "task": task, "send": { "ok": sent_ok } }));
         }
@@ -8142,19 +8390,470 @@ fn run_delegate_result(
                 return Ok(json!({ "task": task, "send": rv }));
             }
             _ => {
-                let reason = format!("legacy delegate fallback failed: team.send error after retry (agent={target})");
-                let _ = rpc_call(sock, "team.task.update", json!({
-                    "team_name": team,
-                    "task_id": task_id,
-                    "status": "blocked",
-                    "blocked_reason": reason,
-                }));
+                let reason = format!(
+                    "legacy delegate fallback failed: team.send error after retry (agent={target})"
+                );
+                let _ = rpc_call(
+                    sock,
+                    "team.task.update",
+                    json!({
+                        "team_name": team,
+                        "task_id": task_id,
+                        "status": "blocked",
+                        "blocked_reason": reason,
+                    }),
+                );
                 return Err(format!("team.send failed after retry: {}", pretty(&sent)));
             }
         }
     }
 
     Ok(json!({ "task": task, "send": sent }))
+}
+
+#[derive(Debug, Clone)]
+struct GkWorktreeMeta {
+    path: String,
+    branch: String,
+    parent: Option<String>,
+    created: Option<bool>,
+    reused: Option<bool>,
+    init: Option<String>,
+}
+
+fn should_acquire_worktree(
+    policy: WorktreePolicyArg,
+    target: &str,
+    text: &str,
+    title: &str,
+    desc: Option<&str>,
+) -> bool {
+    match policy {
+        WorktreePolicyArg::Off => false,
+        WorktreePolicyArg::Always => true,
+        WorktreePolicyArg::Auto => {
+            let target_l = target.to_lowercase();
+            let hay = format!("{}\n{}\n{}", title, text, desc.unwrap_or_default()).to_lowercase();
+            let mutating_role = target_l.contains("executor")
+                || target_l.contains("frontend")
+                || target_l.contains("backend");
+            let mutating_word = [
+                "implement",
+                "fix",
+                "refactor",
+                "update",
+                "edit",
+                "add",
+                "remove",
+                "change",
+                "build",
+                "code",
+                "patch",
+                "구현",
+                "수정",
+                "리팩터",
+                "변경",
+                "추가",
+                "삭제",
+            ]
+            .iter()
+            .any(|w| hay.contains(w));
+            let read_only_word = [
+                "review",
+                "research",
+                "inspect",
+                "analyze",
+                "plan",
+                "audit",
+                "read-only",
+                "리뷰",
+                "조사",
+                "분석",
+                "계획",
+            ]
+            .iter()
+            .any(|w| hay.contains(w));
+            (mutating_role || mutating_word) && !read_only_word
+        }
+    }
+}
+
+fn sanitize_branch_component(raw: &str) -> String {
+    let mut out = String::new();
+    let mut last_dash = false;
+    for c in raw.chars() {
+        let mapped = if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
+            c.to_ascii_lowercase()
+        } else {
+            '-'
+        };
+        if mapped == '-' {
+            if !last_dash {
+                out.push(mapped);
+                last_dash = true;
+            }
+        } else {
+            out.push(mapped);
+            last_dash = false;
+        }
+    }
+    out.trim_matches('-').chars().take(48).collect()
+}
+
+fn xmb_project_from_text(text: &str) -> Option<String> {
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if let Some(rest) = trimmed.strip_prefix("XMB_TASK:") {
+            let rest = rest.trim();
+            if let Some((project, task_id)) = rest.split_once('/') {
+                if !project.is_empty() && !task_id.is_empty() {
+                    return Some(sanitize_branch_component(project));
+                }
+            }
+        }
+    }
+    None
+}
+
+fn worktree_branch_for_task(team: &str, task: &Value, text: &str) -> String {
+    let task_id = task["id"].as_str().unwrap_or("task");
+    let task_short = sanitize_branch_component(task_id);
+    if let Some(project) = xmb_project_from_text(text) {
+        format!("xmb/{project}/{task_short}")
+    } else {
+        format!("tm/{}/{}", sanitize_branch_component(team), task_short)
+    }
+}
+
+fn run_gk_json(args: &[String], cwd: Option<&str>) -> Result<Value, String> {
+    let mut cmd = process::Command::new("git-kit");
+    cmd.args(args).env("GK_AGENT", "1").env("NO_COLOR", "1");
+    if let Some(cwd) = cwd {
+        cmd.current_dir(cwd);
+    }
+    let output = cmd
+        .output()
+        .map_err(|e| format!("failed to run git-kit: {e}"))?;
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    if !stdout.is_empty() {
+        if let Ok(value) = serde_json::from_str::<Value>(&stdout) {
+            return Ok(value);
+        }
+    }
+    if !output.status.success() {
+        return Err(format!(
+            "git-kit exited with {}: {}{}{}",
+            output.status,
+            stdout,
+            if stderr.is_empty() { "" } else { "\n" },
+            stderr
+        ));
+    }
+    serde_json::from_str::<Value>(&stdout).map_err(|e| {
+        format!(
+            "git-kit did not return JSON for `{}`; upgrade git-kit for `wt acquire/finish` support ({e})",
+            args.join(" ")
+        )
+    })
+}
+
+fn epoch_ms_now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
+
+struct TaskWorktreeLock {
+    path: PathBuf,
+}
+
+impl Drop for TaskWorktreeLock {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
+fn acquire_task_worktree_lock(team: &str, task_id: &str) -> Result<TaskWorktreeLock, String> {
+    let dir = env::temp_dir().join("term-mesh-worktree-locks");
+    fs::create_dir_all(&dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
+    let team = sanitize_branch_component(team);
+    let task = sanitize_branch_component(task_id);
+    let path = dir.join(format!("{team}-{task}.lock"));
+    match fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)
+    {
+        Ok(mut file) => {
+            let _ = writeln!(file, "pid={}", process::id());
+            Ok(TaskWorktreeLock { path })
+        }
+        Err(e) if e.kind() == ErrorKind::AlreadyExists => Err(format!(
+            "another worktree finish is already running for task {task_id}; lock={}",
+            path.display()
+        )),
+        Err(e) => Err(format!("create lock {}: {e}", path.display())),
+    }
+}
+
+fn gk_wt_acquire(branch: &str, from_ref: Option<&str>) -> Result<GkWorktreeMeta, String> {
+    let mut args = vec![
+        "wt".to_string(),
+        "acquire".to_string(),
+        branch.to_string(),
+        "--json".to_string(),
+    ];
+    if let Some(base) = from_ref.filter(|s| !s.trim().is_empty()) {
+        args.push("--from".to_string());
+        args.push(base.to_string());
+    }
+    let value = run_gk_json(&args, None)?;
+    if !value["ok"].as_bool().unwrap_or(false) {
+        return Err(format!("git-kit wt acquire failed: {}", pretty(&value)));
+    }
+    let result = &value["result"];
+    let path = result["path"]
+        .as_str()
+        .ok_or_else(|| format!("git-kit wt acquire missing result.path: {}", pretty(&value)))?;
+    let branch = result["branch"].as_str().unwrap_or(branch);
+    Ok(GkWorktreeMeta {
+        path: path.to_string(),
+        branch: branch.to_string(),
+        parent: result["parent"].as_str().map(String::from),
+        created: result["created"].as_bool(),
+        reused: result["reused"].as_bool(),
+        init: result["init"].as_str().map(String::from),
+    })
+}
+
+fn update_task_with_worktree(
+    sock: &PathBuf,
+    team: &str,
+    task_id: &str,
+    meta: &GkWorktreeMeta,
+    policy: WorktreePolicyArg,
+) -> Result<Value, String> {
+    let mut params = json!({
+        "team_name": team,
+        "task_id": task_id,
+        "worktree_policy": worktree_policy_name(policy),
+        "worktree_path": meta.path,
+        "worktree_branch": meta.branch,
+    });
+    if let Some(parent) = &meta.parent {
+        params["worktree_parent"] = json!(parent);
+    }
+    if let Some(created) = meta.created {
+        params["worktree_created"] = json!(created);
+    }
+    if let Some(reused) = meta.reused {
+        params["worktree_reused"] = json!(reused);
+    }
+    if let Some(init) = &meta.init {
+        params["worktree_init"] = json!(init);
+    }
+    rpc_call(sock, "team.task.update", params)
+}
+
+fn block_task_for_worktree_error(sock: &PathBuf, team: &str, task_id: &str, reason: &str) {
+    let _ = rpc_call(
+        sock,
+        "team.task.update",
+        json!({
+            "team_name": team,
+            "task_id": task_id,
+            "status": "blocked",
+            "blocked_reason": reason,
+        }),
+    );
+}
+
+fn run_task_finish_worktree(
+    sock: &PathBuf,
+    team: &str,
+    task_id: &str,
+    to: &str,
+    cleanup: bool,
+    push: bool,
+) -> Result<Value, String> {
+    let _lock = acquire_task_worktree_lock(team, task_id)?;
+    let task_resp = rpc_call(
+        sock,
+        "team.task.get",
+        json!({
+            "team_name": team,
+            "task_id": task_id,
+        }),
+    )
+    .map_err(|e| format!("task.get: {e}"))?;
+    let task = &task_resp["result"];
+    let path = task["worktree_path"]
+        .as_str()
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| {
+            format!(
+                "task {task_id} has no worktree_path; delegate with --worktree always/auto first"
+            )
+        })?;
+
+    let mut args = vec![
+        "wt".to_string(),
+        "finish".to_string(),
+        "--to".to_string(),
+        to.to_string(),
+        "--json".to_string(),
+    ];
+    if cleanup {
+        args.push("--cleanup".to_string());
+    }
+    if push {
+        args.push("--push".to_string());
+    }
+    let finish = run_gk_json(&args, Some(path))?;
+    if !finish["ok"].as_bool().unwrap_or(false) {
+        let state = finish["state"].as_str().unwrap_or("error");
+        let reason = format!(
+            "git-kit wt finish ended with state={state}: {}",
+            pretty(&finish)
+        );
+        block_task_for_worktree_error(sock, team, task_id, &reason);
+        return Err(reason);
+    }
+
+    let result = &finish["result"];
+    let mut params = json!({
+        "team_name": team,
+        "task_id": task_id,
+        "worktree_finished_at": iso8601_utc_now(),
+        "worktree_finished_at_ms": epoch_ms_now(),
+    });
+    if let Some(mode) = result["mode"].as_str() {
+        params["worktree_finish_mode"] = json!(mode);
+    }
+    if let Some(removed) = result["removed"].as_bool() {
+        params["worktree_removed"] = json!(removed);
+    }
+    let updated = rpc_call(sock, "team.task.update", params)
+        .map_err(|e| format!("task.update worktree finish metadata: {e}"))?;
+    Ok(json!({
+        "finish": finish,
+        "task": updated["result"].clone(),
+    }))
+}
+
+fn run_delegate_result_with_worktree(
+    sock: &PathBuf,
+    team: &str,
+    target: &str,
+    text: &str,
+    resolved_title: String,
+    resolved_priority: u32,
+    accept: &[String],
+    deps: &[String],
+    desc: Option<String>,
+    no_report: bool,
+    context: Option<&str>,
+    fix_budget: Option<u8>,
+    panel_id: Option<&str>,
+    worktree_policy: WorktreePolicyArg,
+    from_ref: Option<&str>,
+) -> Result<Value, String> {
+    let mut params = json!({
+        "team_name": team,
+        "title": resolved_title,
+        "assignee": target,
+        "priority": resolved_priority,
+        "worktree_policy": worktree_policy_name(worktree_policy),
+    });
+    if let Some(d) = desc {
+        params["description"] = json!(d);
+    }
+    if !accept.is_empty() {
+        params["acceptance_criteria"] = json!(accept);
+    }
+    if !deps.is_empty() {
+        params["depends_on"] = json!(deps);
+    }
+    if let Some(fb) = fix_budget {
+        params["fix_budget"] = json!(fb);
+    }
+
+    let created = rpc_call(sock, "team.task.create", params)
+        .map_err(|e| format!("task.create before worktree acquire failed: {e}"))?;
+    let mut task = created["result"].clone();
+    let task_id = task["id"]
+        .as_str()
+        .ok_or_else(|| format!("task.create missing task id: {}", pretty(&created)))?
+        .to_string();
+
+    let branch = worktree_branch_for_task(team, &task, text);
+    let meta = match gk_wt_acquire(&branch, from_ref) {
+        Ok(meta) => meta,
+        Err(e) => {
+            let reason = format!("worktree acquire failed: {e}");
+            block_task_for_worktree_error(sock, team, &task_id, &reason);
+            return Err(format!("{reason} (task_id={task_id})"));
+        }
+    };
+    let updated = update_task_with_worktree(sock, team, &task_id, &meta, worktree_policy)
+        .map_err(|e| format!("task.update worktree metadata failed: {e}"))?;
+    task = updated["result"].clone();
+
+    let instruction =
+        format_task_instruction(sock, team, &task, text, no_report, context, fix_budget);
+    let send_text = format!("{instruction}\n");
+
+    if let Some(daemon_sock) = detect_daemon_socket() {
+        if let Some(agent_id) = is_headless_agent(&daemon_sock, team, target) {
+            let sent_ok = match rpc_call(
+                &daemon_sock,
+                "headless.send",
+                json!({
+                    "agent_id": agent_id,
+                    "text": &send_text,
+                }),
+            ) {
+                Ok(ref hr) => !hr["result"].is_null(),
+                Err(_) => false,
+            };
+            if !sent_ok {
+                let reason = format!(
+                    "worktree delegate failed: headless.send returned null (agent={target})"
+                );
+                block_task_for_worktree_error(sock, team, &task_id, &reason);
+                return Err(format!(
+                    "delivery failed; task blocked: {reason} (task_id={task_id})"
+                ));
+            }
+            return Ok(json!({ "task": task, "send": { "ok": sent_ok }, "worktree": meta.path }));
+        }
+    }
+
+    let sent = rpc_call(
+        sock,
+        "team.send",
+        json!({
+            "team_name": team,
+            "agent_name": target,
+            "text": &send_text,
+            "panel_id": panel_id,
+        }),
+    )
+    .map_err(|e| format!("team.send: {e}"))?;
+    if !sent["ok"].as_bool().unwrap_or(false) {
+        let reason =
+            format!("worktree delegate failed: team.send returned non-ok (agent={target})");
+        block_task_for_worktree_error(sock, team, &task_id, &reason);
+        return Err(format!(
+            "delivery failed; task blocked: {reason} (task_id={task_id})"
+        ));
+    }
+
+    let _ =
+        send_return_key_with_retry(sock, team, target, true, "team.delegate.worktree", panel_id);
+    Ok(json!({ "task": task, "send": sent, "worktree": meta.path }))
 }
 
 fn run_delegate(
@@ -8171,10 +8870,25 @@ fn run_delegate(
     context: Option<&str>,
     fix_budget: Option<u8>,
     panel_id: Option<&str>,
+    worktree_policy: WorktreePolicyArg,
+    from_ref: Option<&str>,
 ) {
     match run_delegate_result(
-        sock, team, target, text, title, priority, accept, deps, desc, no_report, context,
-        fix_budget, panel_id,
+        sock,
+        team,
+        target,
+        text,
+        title,
+        priority,
+        accept,
+        deps,
+        desc,
+        no_report,
+        context,
+        fix_budget,
+        panel_id,
+        worktree_policy,
+        from_ref,
     ) {
         Ok(v) => println!("{}", pretty(&v)),
         Err(e) => {
@@ -8414,6 +9128,8 @@ fn run_fan_out(
     agents_flag: &Option<String>,
     context: Option<&str>,
     fix_budget: Option<u8>,
+    worktree_policy: WorktreePolicyArg,
+    from_ref: Option<&str>,
 ) {
     // Get all agents from team status as (name, panel_id) pairs. team.status lists
     // EVERY pane separately, so duplicate-named agents already carry DISTINCT
@@ -8501,6 +9217,8 @@ fn run_fan_out(
                         context,
                         fix_budget,
                         panel_id,
+                        worktree_policy,
+                        from_ref,
                     );
                     (*target, result)
                 })
@@ -8773,7 +9491,10 @@ fn print_watch_trigger(resp: &Value) {
         .unwrap_or(false);
     if triggered {
         let team = resp.get("team_id").and_then(|v| v.as_str()).unwrap_or("?");
-        let count = resp.get("check_count").and_then(|v| v.as_u64()).unwrap_or(0);
+        let count = resp
+            .get("check_count")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
         println!("TRIGGERED: true  TEAM: {team}  CHECK_COUNT: {count}");
     } else {
         let reason = resp
@@ -8879,7 +9600,13 @@ fn print_watch_status(resp: &Value) {
 fn fmt_tick(v: Option<&Value>, now: u64, future: bool) -> String {
     let ts = match v.and_then(Value::as_u64) {
         Some(t) if t > 0 => t,
-        _ => return if future { "pending".into() } else { "never".into() },
+        _ => {
+            return if future {
+                "pending".into()
+            } else {
+                "never".into()
+            }
+        }
     };
     let rel = if future {
         if ts > now {
@@ -9294,19 +10021,20 @@ fn subscribe_events_channel(
         "params": { "kinds": kinds },
     });
 
-    let stream = UnixStream::connect(daemon_sock)
-        .map_err(|e| format!("subscribe connect: {e}"))?;
+    let stream = UnixStream::connect(daemon_sock).map_err(|e| format!("subscribe connect: {e}"))?;
     // 90s read timeout outlasts the daemon's 30s keepalive with margin.
     stream.set_read_timeout(Some(Duration::from_secs(90))).ok();
     stream.set_write_timeout(Some(Duration::from_secs(5))).ok();
 
-    let mut writer = stream.try_clone()
+    let mut writer = stream
+        .try_clone()
         .map_err(|e| format!("subscribe clone: {e}"))?;
 
-    let mut payload = serde_json::to_string(&request)
-        .map_err(|e| format!("subscribe serialize: {e}"))?;
+    let mut payload =
+        serde_json::to_string(&request).map_err(|e| format!("subscribe serialize: {e}"))?;
     payload.push('\n');
-    writer.write_all(payload.as_bytes())
+    writer
+        .write_all(payload.as_bytes())
         .map_err(|e| format!("subscribe write: {e}"))?;
     writer.flush().ok();
 
@@ -9316,8 +10044,8 @@ fn subscribe_events_channel(
     reader
         .read_line(&mut ack_line)
         .map_err(|e| format!("subscribe ack read: {e}"))?;
-    let ack: Value = serde_json::from_str(ack_line.trim())
-        .map_err(|e| format!("subscribe ack parse: {e}"))?;
+    let ack: Value =
+        serde_json::from_str(ack_line.trim()).map_err(|e| format!("subscribe ack parse: {e}"))?;
     if ack.get("error").map_or(false, |e| !e.is_null()) {
         let msg = ack["error"]["message"].as_str().unwrap_or("unknown");
         return Err(format!("subscribe server error: {msg}"));
@@ -9403,7 +10131,10 @@ fn run_wait(
             match daemon_sock_for_push.as_ref() {
                 Some(ds) => match subscribe_events_channel(ds, subscribe_kinds) {
                     Ok(rx) => {
-                        eprintln!("wait: subscribed to push events ({})", subscribe_kinds.join(","));
+                        eprintln!(
+                            "wait: subscribed to push events ({})",
+                            subscribe_kinds.join(",")
+                        );
                         Some(rx)
                     }
                     Err(e) => {
@@ -9451,7 +10182,7 @@ fn run_wait(
                     }
                     let cap = remaining.min(Duration::from_millis(200));
                     match rx.recv_timeout(cap) {
-                        Ok(_event) => break, // real push: poll immediately
+                        Ok(_event) => break,                        // real push: poll immediately
                         Err(RecvTimeoutError::Timeout) => continue, // no event yet, keep waiting
                         Err(RecvTimeoutError::Disconnected) => {
                             eprintln!("wait: subscribe stream closed; falling back to polling");
@@ -9893,6 +10624,8 @@ fn run_warmup(sock: &PathBuf, team: &str, target: Option<&str>, timeout: u32) {
             None,
             None,
             None,
+            WorktreePolicyArg::Off,
+            None,
         );
         match result {
             Ok(v) => {
@@ -9973,10 +10706,11 @@ fn run_claim(sock: &PathBuf, team: &str, agent: &str) {
         json!({
             "team_name": team,
             "agent_name": agent,
+            "push": false,
         }),
     );
     match result {
-        Ok(ref v) if v["ok"].as_bool().unwrap_or(false) => {
+        Ok(mut v) if v["ok"].as_bool().unwrap_or(false) => {
             if v["result"].is_null() {
                 println!(
                     "{}",
@@ -9985,7 +10719,119 @@ fn run_claim(sock: &PathBuf, team: &str, agent: &str) {
                     )
                 );
             } else {
-                println!("{}", pretty(v));
+                let mut task = v["result"].clone();
+                let task_id = task["id"].as_str().unwrap_or("").to_string();
+                let title = task["title"].as_str().unwrap_or("Claimed task").to_string();
+                let details = task["details"]
+                    .as_str()
+                    .or_else(|| task["description"].as_str())
+                    .filter(|s| !s.is_empty())
+                    .map(String::from);
+                let goal = details.clone().unwrap_or_else(|| title.clone());
+                let policy = parse_worktree_policy_name(task["worktree_policy"].as_str());
+
+                if task["worktree_path"].as_str().filter(|s| !s.is_empty()).is_none()
+                    && should_acquire_worktree(policy, agent, &goal, &title, details.as_deref())
+                {
+                    let branch = worktree_branch_for_task(team, &task, &goal);
+                    match gk_wt_acquire(&branch, None) {
+                        Ok(meta) => match update_task_with_worktree(sock, team, &task_id, &meta, policy)
+                        {
+                            Ok(updated) => {
+                                task = updated["result"].clone();
+                                v["result"] = task.clone();
+                            }
+                            Err(e) => {
+                                let reason = format!("task.update worktree metadata failed: {e}");
+                                block_task_for_worktree_error(sock, team, &task_id, &reason);
+                                eprintln!("Error: {reason}");
+                                process::exit(1);
+                            }
+                        },
+                        Err(e) => {
+                            let reason = format!("worktree acquire failed: {e}");
+                            block_task_for_worktree_error(sock, team, &task_id, &reason);
+                            eprintln!("Error: {reason} (task_id={task_id})");
+                            process::exit(1);
+                        }
+                    }
+                }
+
+                let instruction = format_task_instruction(sock, team, &task, &goal, false, None, None);
+                let send_text = format!("{instruction}\n");
+                let send_result = if let Some(daemon_sock) = detect_daemon_socket() {
+                    if let Some(agent_id) = is_headless_agent(&daemon_sock, team, agent) {
+                        match rpc_call(
+                            &daemon_sock,
+                            "headless.send",
+                            json!({
+                                "agent_id": agent_id,
+                                "text": &send_text,
+                            }),
+                        ) {
+                            Ok(hr) if !hr["result"].is_null() => {
+                                Ok(json!({ "ok": true, "result": hr["result"].clone() }))
+                            }
+                            Ok(hr) => Err(format!("headless.send returned null: {}", pretty(&hr))),
+                            Err(e) => Err(format!("headless.send: {e}")),
+                        }
+                    } else {
+                        rpc_call(
+                            sock,
+                            "team.send",
+                            json!({
+                                "team_name": team,
+                                "agent_name": agent,
+                                "text": &send_text,
+                            }),
+                        )
+                    }
+                } else {
+                    rpc_call(
+                        sock,
+                        "team.send",
+                        json!({
+                            "team_name": team,
+                            "agent_name": agent,
+                            "text": &send_text,
+                        }),
+                    )
+                };
+
+                match send_result {
+                    Ok(sent) if sent["ok"].as_bool().unwrap_or(true) => {
+                        let _ = send_return_key_with_retry(
+                            sock,
+                            team,
+                            agent,
+                            true,
+                            "team.task.claim",
+                            None,
+                        );
+                        println!(
+                            "{}",
+                            pretty(&json!({
+                                "ok": true,
+                                "result": {
+                                    "task": task,
+                                    "send": sent,
+                                }
+                            }))
+                        );
+                    }
+                    Ok(sent) => {
+                        let reason = format!("claim delivery failed: {}", pretty(&sent));
+                        block_task_for_worktree_error(sock, team, &task_id, &reason);
+                        eprintln!("Error: {reason}");
+                        process::exit(1);
+                    }
+                    Err(e) => {
+                        let reason = format!("claim delivery failed: {e}");
+                        block_task_for_worktree_error(sock, team, &task_id, &reason);
+                        eprintln!("Error: {reason}");
+                        process::exit(1);
+                    }
+                }
             }
         }
         Ok(ref v) => println!("{}", pretty(v)),
@@ -10418,6 +11264,8 @@ fn dispatch_and_wait(
                 None,
                 None,
                 None,
+                WorktreePolicyArg::Off,
+                None,
             );
             (name, result)
         });
@@ -10762,6 +11610,8 @@ fn run_autonomous(
                 None,
                 None,
                 None,
+                WorktreePolicyArg::Off,
+                None,
             );
             (name_owned, result)
         });
@@ -10910,7 +11760,10 @@ mod watcher_spec_tests {
         fs::write(&path, "SPEC: do not drift from the plan").unwrap();
         let arg = format!("@{}", path.display());
         let resolved = resolve_watcher_spec(Some(&arg)).unwrap();
-        assert_eq!(resolved, Some("SPEC: do not drift from the plan".to_string()));
+        assert_eq!(
+            resolved,
+            Some("SPEC: do not drift from the plan".to_string())
+        );
         let _ = fs::remove_file(&path);
     }
 
@@ -10959,7 +11812,9 @@ mod watcher_spec_tests {
         // App sockets (no trailing `d`) and cmux are app sockets.
         assert!(is_app_socket_path(Path::new("/tmp/term-mesh.sock")));
         assert!(is_app_socket_path(Path::new("/tmp/term-mesh-debug.sock")));
-        assert!(is_app_socket_path(Path::new("/tmp/term-mesh-debug-watcher-p2.sock")));
+        assert!(is_app_socket_path(Path::new(
+            "/tmp/term-mesh-debug-watcher-p2.sock"
+        )));
         assert!(is_app_socket_path(Path::new("/tmp/cmux.sock")));
         // Daemon sockets are NOT app sockets.
         assert!(!is_app_socket_path(Path::new("/tmp/term-meshd.sock")));
@@ -11026,14 +11881,23 @@ mod auto_watch_tests {
 
     #[test]
     fn decision_no_watcher_returns_skip_no_watcher() {
-        let agents = vec![make_agent("executor", "executor"), make_agent("reviewer", "reviewer")];
-        assert_eq!(auto_watch_decision(&agents, true), AutoWatchDecision::SkipNoWatcher);
+        let agents = vec![
+            make_agent("executor", "executor"),
+            make_agent("reviewer", "reviewer"),
+        ];
+        assert_eq!(
+            auto_watch_decision(&agents, true),
+            AutoWatchDecision::SkipNoWatcher
+        );
     }
 
     #[test]
     fn decision_no_worker_returns_skip_no_worker() {
         let agents = vec![make_agent("watcher", "watcher")];
-        assert_eq!(auto_watch_decision(&agents, true), AutoWatchDecision::SkipNoWorker);
+        assert_eq!(
+            auto_watch_decision(&agents, true),
+            AutoWatchDecision::SkipNoWorker
+        );
     }
 
     #[test]
@@ -11043,7 +11907,10 @@ mod auto_watch_tests {
             make_agent("executor", "executor"),
             make_agent("reviewer", "reviewer"),
         ];
-        assert_eq!(auto_watch_decision(&agents, true), AutoWatchDecision::SkipMultiWorker(2));
+        assert_eq!(
+            auto_watch_decision(&agents, true),
+            AutoWatchDecision::SkipMultiWorker(2)
+        );
     }
 
     #[test]
@@ -11052,7 +11919,10 @@ mod auto_watch_tests {
             make_agent("watcher", "watcher"),
             make_agent("executor", "executor"),
         ];
-        assert_eq!(auto_watch_decision(&agents, false), AutoWatchDecision::SkipMissingSpec);
+        assert_eq!(
+            auto_watch_decision(&agents, false),
+            AutoWatchDecision::SkipMissingSpec
+        );
     }
 
     #[test]
@@ -11078,7 +11948,10 @@ mod auto_watch_tests {
     fn auto_watch_env_disabled_values() {
         for val in &["0", "false", "no", "off", "FALSE", "OFF"] {
             assert!(
-                matches!(val.to_ascii_lowercase().as_str(), "0" | "false" | "no" | "off"),
+                matches!(
+                    val.to_ascii_lowercase().as_str(),
+                    "0" | "false" | "no" | "off"
+                ),
                 "expected {val} to be disabled"
             );
         }
@@ -11088,7 +11961,10 @@ mod auto_watch_tests {
     fn auto_watch_env_enabled_values() {
         for val in &["1", "true", "yes", "on"] {
             assert!(
-                !matches!(val.to_ascii_lowercase().as_str(), "0" | "false" | "no" | "off"),
+                !matches!(
+                    val.to_ascii_lowercase().as_str(),
+                    "0" | "false" | "no" | "off"
+                ),
                 "expected {val} to be enabled"
             );
         }
@@ -11099,7 +11975,10 @@ mod auto_watch_tests {
     #[test]
     fn watch_on_success_envelope_returns_enabled() {
         let r = json!({"result": {"enabled": true, "status": "ok"}});
-        assert!(matches!(parse_watch_on_response(&r), WatchOnOutcome::Enabled));
+        assert!(matches!(
+            parse_watch_on_response(&r),
+            WatchOnOutcome::Enabled
+        ));
     }
 
     #[test]
@@ -11114,13 +11993,19 @@ mod auto_watch_tests {
     #[test]
     fn watch_on_malformed_envelope_returns_unexpected() {
         let r = json!({"id": 1});
-        assert!(matches!(parse_watch_on_response(&r), WatchOnOutcome::Unexpected(_)));
+        assert!(matches!(
+            parse_watch_on_response(&r),
+            WatchOnOutcome::Unexpected(_)
+        ));
     }
 
     #[test]
     fn watch_on_success_with_enabled_false_returns_unexpected() {
         let r = json!({"result": {"enabled": false}});
-        assert!(matches!(parse_watch_on_response(&r), WatchOnOutcome::Unexpected(_)));
+        assert!(matches!(
+            parse_watch_on_response(&r),
+            WatchOnOutcome::Unexpected(_)
+        ));
     }
 
     // ── P2: roster patch for headless add with custom watcher name ────────

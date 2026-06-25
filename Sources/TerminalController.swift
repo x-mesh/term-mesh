@@ -3767,6 +3767,7 @@ class TerminalController {
         guard let agentName = params["agent_name"] as? String else {
             return v2Error(id: id, code: "invalid_params", message: "Missing agent_name")
         }
+        let shouldPush = params["push"] as? Bool ?? true
         if let task = store.claimTask(teamName: teamName, agentName: agentName) {
             let claimedTask = task
             let fallbackTabManager = self.tabManager
@@ -3774,11 +3775,13 @@ class TerminalController {
             // the RPC response land first, so the agent's terminal is ready to receive.
             // Pass task directly to avoid re-reading taskBoards (claimed task lives in
             // TeamDataStore, not TeamOrchestrator.taskBoards — re-read would miss it).
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak self] in
-                guard self != nil else { return }
-                let tm = TeamOrchestrator.shared.resolveTabManager(teamName: teamName) ?? fallbackTabManager
-                guard let tm else { return }
-                TeamOrchestrator.shared.notifyTaskCreated(teamName: teamName, task: claimedTask, tabManager: tm)
+            if shouldPush {
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak self] in
+                    guard self != nil else { return }
+                    let tm = TeamOrchestrator.shared.resolveTabManager(teamName: teamName) ?? fallbackTabManager
+                    guard let tm else { return }
+                    TeamOrchestrator.shared.notifyTaskCreated(teamName: teamName, task: claimedTask, tabManager: tm)
+                }
             }
             return v2Ok(id: id, result: store.taskDictionary(task))
         }
@@ -3801,6 +3804,7 @@ class TerminalController {
         let dependsOn = params["depends_on"] as? [String] ?? []
         let parentTaskId = params["parent_task_id"] as? String
         let createdBy = params["created_by"] as? String ?? "leader"
+        let worktreePolicy = params["worktree_policy"] as? String
 
         if let task = store.createTask(
             teamName: teamName,
@@ -3813,7 +3817,8 @@ class TerminalController {
             priority: priority,
             dependsOn: dependsOn,
             parentTaskId: parentTaskId,
-            createdBy: createdBy
+            createdBy: createdBy,
+            worktreePolicy: worktreePolicy
         ) {
             // Note: task notification (sendTextToPanel to leader/assignee) is skipped
             // in the off-main data path. The caller already receives the task data
@@ -3838,6 +3843,16 @@ class TerminalController {
         let blockedReason = params["blocked_reason"] as? String
         let reviewSummary = params["review_summary"] as? String
         let progressNote = params["progress_note"] as? String
+        let worktreePolicy = params["worktree_policy"] as? String
+        let worktreePath = params["worktree_path"] as? String
+        let worktreeBranch = params["worktree_branch"] as? String
+        let worktreeParent = params["worktree_parent"] as? String
+        let worktreeCreated = params["worktree_created"] as? Bool
+        let worktreeReused = params["worktree_reused"] as? Bool
+        let worktreeInit = params["worktree_init"] as? String
+        let worktreeFinishedAt = (params["worktree_finished_at"] as? String).flatMap { ISO8601DateFormatter().date(from: $0) }
+        let worktreeFinishMode = params["worktree_finish_mode"] as? String
+        let worktreeRemoved = params["worktree_removed"] as? Bool
 
         // Snapshot prev status before update so events.publish can include it.
         let prevStatus = store.getTask(teamName: teamName, taskId: taskId)?.status ?? ""
@@ -3851,7 +3866,17 @@ class TerminalController {
             assignee: assignee,
             blockedReason: blockedReason,
             reviewSummary: reviewSummary,
-            progressNote: progressNote
+            progressNote: progressNote,
+            worktreePolicy: worktreePolicy,
+            worktreePath: worktreePath,
+            worktreeBranch: worktreeBranch,
+            worktreeParent: worktreeParent,
+            worktreeCreated: worktreeCreated,
+            worktreeReused: worktreeReused,
+            worktreeInit: worktreeInit,
+            worktreeFinishedAt: worktreeFinishedAt,
+            worktreeFinishMode: worktreeFinishMode,
+            worktreeRemoved: worktreeRemoved
         ) {
             // Publish task_status event to daemon broadcast channel best-effort
             // so tm-agent wait push subscribers receive a real-time signal.
@@ -4840,6 +4865,7 @@ class TerminalController {
         let dependsOn = params["depends_on"] as? [String] ?? []
         let parentTaskId = params["parent_task_id"] as? String
         let createdBy = params["created_by"] as? String ?? "leader"
+        let worktreePolicy = params["worktree_policy"] as? String
         let tabManager = v2ResolveTabManager(params: params)
 
         var result: V2CallResult = .err(code: "internal_error", message: "Failed to create task", data: nil)
@@ -4855,7 +4881,8 @@ class TerminalController {
                 priority: priority,
                 dependsOn: dependsOn,
                 parentTaskId: parentTaskId,
-                createdBy: createdBy
+                createdBy: createdBy,
+                worktreePolicy: worktreePolicy
             ) {
                 if let tabManager {
                     _ = TeamOrchestrator.shared.notifyTaskCreated(
@@ -4884,6 +4911,16 @@ class TerminalController {
         let blockedReason = params["blocked_reason"] as? String
         let reviewSummary = params["review_summary"] as? String
         let progressNote = params["progress_note"] as? String
+        let worktreePolicy = params["worktree_policy"] as? String
+        let worktreePath = params["worktree_path"] as? String
+        let worktreeBranch = params["worktree_branch"] as? String
+        let worktreeParent = params["worktree_parent"] as? String
+        let worktreeCreated = params["worktree_created"] as? Bool
+        let worktreeReused = params["worktree_reused"] as? Bool
+        let worktreeInit = params["worktree_init"] as? String
+        let worktreeFinishedAt = (params["worktree_finished_at"] as? String).flatMap { ISO8601DateFormatter().date(from: $0) }
+        let worktreeFinishMode = params["worktree_finish_mode"] as? String
+        let worktreeRemoved = params["worktree_removed"] as? Bool
 
         var result: V2CallResult = .err(code: "not_found", message: "Task not found", data: nil)
         v2MainSync {
@@ -4895,7 +4932,17 @@ class TerminalController {
                 assignee: assignee,
                 blockedReason: blockedReason,
                 reviewSummary: reviewSummary,
-                progressNote: progressNote
+                progressNote: progressNote,
+                worktreePolicy: worktreePolicy,
+                worktreePath: worktreePath,
+                worktreeBranch: worktreeBranch,
+                worktreeParent: worktreeParent,
+                worktreeCreated: worktreeCreated,
+                worktreeReused: worktreeReused,
+                worktreeInit: worktreeInit,
+                worktreeFinishedAt: worktreeFinishedAt,
+                worktreeFinishMode: worktreeFinishMode,
+                worktreeRemoved: worktreeRemoved
             ) {
                 result = .ok(TeamOrchestrator.shared.taskDictionary(task))
             }

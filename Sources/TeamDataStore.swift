@@ -265,7 +265,8 @@ final class TeamDataStore: ObservableObject, @unchecked Sendable {
         priority: Int = 2,
         dependsOn: [String] = [],
         parentTaskId: String? = nil,
-        createdBy: String = "leader"
+        createdBy: String = "leader",
+        worktreePolicy: String? = nil
     ) -> TeamOrchestrator.TeamTask? {
         lock.lock()
         defer { lock.unlock() }
@@ -319,6 +320,8 @@ final class TeamDataStore: ObservableObject, @unchecked Sendable {
             reviewSummary: nil,
             createdBy: normalizedCreatedBy,
             result: nil,
+            resultPath: nil,
+            worktreePolicy: worktreePolicy?.teamDataNilIfBlank,
             createdAt: now,
             updatedAt: now,
             startedAt: nil,
@@ -347,7 +350,17 @@ final class TeamDataStore: ObservableObject, @unchecked Sendable {
         assignee: String? = nil,
         blockedReason: String? = nil,
         reviewSummary: String? = nil,
-        progressNote: String? = nil
+        progressNote: String? = nil,
+        worktreePolicy: String? = nil,
+        worktreePath: String? = nil,
+        worktreeBranch: String? = nil,
+        worktreeParent: String? = nil,
+        worktreeCreated: Bool? = nil,
+        worktreeReused: Bool? = nil,
+        worktreeInit: String? = nil,
+        worktreeFinishedAt: Date? = nil,
+        worktreeFinishMode: String? = nil,
+        worktreeRemoved: Bool? = nil
     ) -> TeamOrchestrator.TeamTask? {
         lock.lock()
         defer { lock.unlock() }
@@ -368,6 +381,16 @@ final class TeamDataStore: ObservableObject, @unchecked Sendable {
         }
         if let result { tasks[idx].result = result }
         if let resultPath { tasks[idx].resultPath = resultPath.teamDataNilIfBlank }
+        if let worktreePolicy { tasks[idx].worktreePolicy = worktreePolicy.teamDataNilIfBlank }
+        if let worktreePath { tasks[idx].worktreePath = worktreePath.teamDataNilIfBlank }
+        if let worktreeBranch { tasks[idx].worktreeBranch = worktreeBranch.teamDataNilIfBlank }
+        if let worktreeParent { tasks[idx].worktreeParent = worktreeParent.teamDataNilIfBlank }
+        if let worktreeCreated { tasks[idx].worktreeCreated = worktreeCreated }
+        if let worktreeReused { tasks[idx].worktreeReused = worktreeReused }
+        if let worktreeInit { tasks[idx].worktreeInit = worktreeInit.teamDataNilIfBlank }
+        if let worktreeFinishedAt { tasks[idx].worktreeFinishedAt = worktreeFinishedAt }
+        if let worktreeFinishMode { tasks[idx].worktreeFinishMode = worktreeFinishMode.teamDataNilIfBlank }
+        if let worktreeRemoved { tasks[idx].worktreeRemoved = worktreeRemoved }
         if let progressNote = progressNote?.teamDataNilIfBlank {
             tasks[idx].lastProgressAt = now
             // Post progress message (inline, already holding lock — use messages directly)
@@ -901,6 +924,15 @@ final class TeamDataStore: ObservableObject, @unchecked Sendable {
             "created_by": task.createdBy,
             "result": task.result as Any? ?? NSNull(),
             "result_path": task.resultPath as Any? ?? NSNull(),
+            "worktree_policy": task.worktreePolicy as Any? ?? NSNull(),
+            "worktree_path": task.worktreePath as Any? ?? NSNull(),
+            "worktree_branch": task.worktreeBranch as Any? ?? NSNull(),
+            "worktree_parent": task.worktreeParent as Any? ?? NSNull(),
+            "worktree_created": task.worktreeCreated as Any? ?? NSNull(),
+            "worktree_reused": task.worktreeReused as Any? ?? NSNull(),
+            "worktree_init": task.worktreeInit as Any? ?? NSNull(),
+            "worktree_finish_mode": task.worktreeFinishMode as Any? ?? NSNull(),
+            "worktree_removed": task.worktreeRemoved as Any? ?? NSNull(),
             "created_at": ISO8601DateFormatter().string(from: task.createdAt),
             "updated_at": ISO8601DateFormatter().string(from: task.updatedAt),
             "needs_attention": Self.taskNeedsAttention(task, threshold: staleTaskThreshold),
@@ -911,6 +943,9 @@ final class TeamDataStore: ObservableObject, @unchecked Sendable {
         }
         if let completedAt = task.completedAt {
             dict["completed_at"] = ISO8601DateFormatter().string(from: completedAt)
+        }
+        if let worktreeFinishedAt = task.worktreeFinishedAt {
+            dict["worktree_finished_at"] = ISO8601DateFormatter().string(from: worktreeFinishedAt)
         }
         if let lastProgressAt = task.lastProgressAt {
             dict["last_progress_at"] = ISO8601DateFormatter().string(from: lastProgressAt)
