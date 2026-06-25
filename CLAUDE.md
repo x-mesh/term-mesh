@@ -331,6 +331,18 @@ xm 스킬은 일반적으로 raw agent output을 직접 보여줄 것을 요구.
 
 이 패턴은 `/tm` Workflow Step 4와 같음. xm 스킬의 phase 통과 검증 (`gate pass`, `phase next`)은 정상 진행.
 
+#### Worktree lifecycle (xm:build implement용)
+
+xm:build가 implementation/fix 단계 task를 분배할 때는 `tm-agent delegate ... --worktree auto`가 기본이다. `auto`는 mutating role(executor/frontend/backend) 또는 구현·수정·리팩터 키워드에서만 `git-kit wt acquire <branch>`를 실행하고, review/research/plan 계열은 기존 cwd를 쓴다. 강제 격리는 `--worktree always`, 비활성화는 `--worktree off`, base ref 지정은 `--from <ref>`를 쓴다.
+
+worktree task capsule에는 `WORKTREE_PATH`, `WORKTREE_BRANCH`, `WORKDIR_INSTRUCTION`이 들어간다. agent는 반드시 해당 path를 cwd로 사용하고, 완료 보고 후 leader가 다음을 실행한다:
+
+```bash
+tm-agent task finish-worktree <task_id> --to parent --cleanup
+```
+
+push까지 필요한 land 흐름은 `--push`를 붙인다. stale/merged 정리는 필요 시 leader가 `git-kit wt cleanup --merged --stale 7d` dry-run 후 `-y`로 확정한다.
+
 #### Bypass (드물게 native가 더 적합한 경우)
 
 native Agent tool이 더 적합한 경우(예: 단일 isolated investigation, 외부 worktree 격리 필요)는 위 규칙 미적용. 이 경우 CLAUDE.md의 "DELEGATE-FIRST PRINCIPLE" 자체는 여전히 유효하며, `tm-agent` 외 다른 본인 도구 사용 가능.
@@ -395,7 +407,10 @@ tm-agent detach <agent_name>
 # Leader → agent communication
 tm-agent send <agent> '<instruction>'
 tm-agent delegate <agent> '<instruction>' [--context '<prior context>']
+tm-agent delegate executor 'implement T1' --worktree auto
+tm-agent delegate executor 'implement T1' --worktree always --from develop
 tm-agent broadcast '<instruction>'
+tm-agent fan-out 'implement phase tasks' --worktree auto
 tm-agent read <agent> --lines 100
 tm-agent collect --lines 100
 tm-agent collect --headers                    # header-only result collection for token-efficient synthesis
@@ -417,6 +432,7 @@ tm-agent brief <agent>
 #   tm-agent task create 'task B'            # unassigned — enters pool
 #   tm-agent broadcast 'tm-agent claim'       # Option A: all panels claim simultaneously (preferred)
 #   tm-agent send executor 'tm-agent claim'; sleep 0.5; tm-agent send executor 'tm-agent claim'  # Option B: round-robin sequential
+#   tm-agent task finish-worktree <task_id> --to parent --cleanup  # finish gk wt attached to a task
 #
 # AUTO-CLAIM-NEXT (self-draining pool — Tier 1 work-stealing): when an agent
 # finishes a task and is NOT being auto-recycled, it AUTOMATICALLY claims the
