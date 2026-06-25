@@ -312,7 +312,17 @@ final class TeamOrchestrator: ObservableObject {
         var reviewSummary: String?
         var createdBy: String
         var result: String?
-        var resultPath: String?
+        var resultPath: String? = nil
+        var worktreePolicy: String? = nil
+        var worktreePath: String? = nil
+        var worktreeBranch: String? = nil
+        var worktreeParent: String? = nil
+        var worktreeCreated: Bool? = nil
+        var worktreeReused: Bool? = nil
+        var worktreeInit: String? = nil
+        var worktreeFinishedAt: Date? = nil
+        var worktreeFinishMode: String? = nil
+        var worktreeRemoved: Bool? = nil
         let createdAt: Date
         var updatedAt: Date
         var startedAt: Date?
@@ -2773,6 +2783,14 @@ final class TeamOrchestrator: ObservableObject {
             "PROTOCOL: TM-PROTOCOL-v1",
             "OUTPUT: STATUS/FILES/VERIFY/NEXT/FULL_REPORT header plus concise summary",
         ]
+        if let path = task.worktreePath?.nilIfBlank {
+            lines.append("WORKTREE_PATH: \(path)")
+            if let branch = task.worktreeBranch?.nilIfBlank {
+                lines.append("WORKTREE_BRANCH: \(branch)")
+            }
+            lines.append("WORKDIR_INSTRUCTION: Run commands from this worktree: cd \(path)")
+            lines.append("NEXT_HINT: When code changes are ready, set NEXT to `tm-agent task finish-worktree \(taskId) --to parent --cleanup` or ask the leader to run it.")
+        }
         if let ctx = context, !ctx.isEmpty {
             let truncated = String(ctx.prefix(500))
             lines.append("")
@@ -2808,6 +2826,13 @@ final class TeamOrchestrator: ObservableObject {
         if let description = task.details?.nilIfBlank {
             lines.append("Details: \(description)")
         }
+        if let path = task.worktreePath?.nilIfBlank {
+            lines.append("Worktree: \(path)")
+            if let branch = task.worktreeBranch?.nilIfBlank {
+                lines.append("Branch: \(branch)")
+            }
+            lines.append("Run commands from this worktree: cd \(path)")
+        }
         lines.append("")
         lines.append("Resume or start this assigned task now.")
         lines.append("")
@@ -2828,6 +2853,15 @@ final class TeamOrchestrator: ObservableObject {
         if let description = task.details?.nilIfBlank {
             lines.append("")
             lines.append(description)
+        }
+        if let path = task.worktreePath?.nilIfBlank {
+            lines.append("")
+            lines.append("WORKTREE_PATH: \(path)")
+            if let branch = task.worktreeBranch?.nilIfBlank {
+                lines.append("WORKTREE_BRANCH: \(branch)")
+            }
+            lines.append("WORKDIR_INSTRUCTION: Run commands from this worktree: cd \(path)")
+            lines.append("NEXT_HINT: finish with `tm-agent task finish-worktree \(task.id) --to parent --cleanup` after reporting.")
         }
         lines.append("")
         lines.append("A new task has been assigned to you.")
@@ -4837,7 +4871,8 @@ final class TeamOrchestrator: ObservableObject {
         priority: Int = 2,
         dependsOn: [String] = [],
         parentTaskId: String? = nil,
-        createdBy: String = "leader"
+        createdBy: String = "leader",
+        worktreePolicy: String? = nil
     ) -> TeamTask? {
         guard teams[teamName] != nil else { return nil }
         let now = Date()
@@ -4872,6 +4907,7 @@ final class TeamOrchestrator: ObservableObject {
             createdBy: normalizedCreatedBy,
             result: nil,
             resultPath: nil,
+            worktreePolicy: worktreePolicy?.nilIfBlank,
             createdAt: now,
             updatedAt: now,
             startedAt: nil,
@@ -4901,7 +4937,17 @@ final class TeamOrchestrator: ObservableObject {
         assignee: String? = nil,
         blockedReason: String? = nil,
         reviewSummary: String? = nil,
-        progressNote: String? = nil
+        progressNote: String? = nil,
+        worktreePolicy: String? = nil,
+        worktreePath: String? = nil,
+        worktreeBranch: String? = nil,
+        worktreeParent: String? = nil,
+        worktreeCreated: Bool? = nil,
+        worktreeReused: Bool? = nil,
+        worktreeInit: String? = nil,
+        worktreeFinishedAt: Date? = nil,
+        worktreeFinishMode: String? = nil,
+        worktreeRemoved: Bool? = nil
     ) -> TeamTask? {
         guard var tasks = taskBoards[teamName],
               let idx = tasks.firstIndex(where: { $0.id == taskId }) else { return nil }
@@ -4920,6 +4966,16 @@ final class TeamOrchestrator: ObservableObject {
         }
         if let result { tasks[idx].result = result }
         if let resultPath { tasks[idx].resultPath = resultPath.nilIfBlank }
+        if let worktreePolicy { tasks[idx].worktreePolicy = worktreePolicy.nilIfBlank }
+        if let worktreePath { tasks[idx].worktreePath = worktreePath.nilIfBlank }
+        if let worktreeBranch { tasks[idx].worktreeBranch = worktreeBranch.nilIfBlank }
+        if let worktreeParent { tasks[idx].worktreeParent = worktreeParent.nilIfBlank }
+        if let worktreeCreated { tasks[idx].worktreeCreated = worktreeCreated }
+        if let worktreeReused { tasks[idx].worktreeReused = worktreeReused }
+        if let worktreeInit { tasks[idx].worktreeInit = worktreeInit.nilIfBlank }
+        if let worktreeFinishedAt { tasks[idx].worktreeFinishedAt = worktreeFinishedAt }
+        if let worktreeFinishMode { tasks[idx].worktreeFinishMode = worktreeFinishMode.nilIfBlank }
+        if let worktreeRemoved { tasks[idx].worktreeRemoved = worktreeRemoved }
         if let progressNote = progressNote?.nilIfBlank {
             tasks[idx].lastProgressAt = now
             _ = postMessage(
@@ -5195,6 +5251,15 @@ final class TeamOrchestrator: ObservableObject {
             "created_by": task.createdBy,
             "result": task.result as Any? ?? NSNull(),
             "result_path": task.resultPath as Any? ?? NSNull(),
+            "worktree_policy": task.worktreePolicy as Any? ?? NSNull(),
+            "worktree_path": task.worktreePath as Any? ?? NSNull(),
+            "worktree_branch": task.worktreeBranch as Any? ?? NSNull(),
+            "worktree_parent": task.worktreeParent as Any? ?? NSNull(),
+            "worktree_created": task.worktreeCreated as Any? ?? NSNull(),
+            "worktree_reused": task.worktreeReused as Any? ?? NSNull(),
+            "worktree_init": task.worktreeInit as Any? ?? NSNull(),
+            "worktree_finish_mode": task.worktreeFinishMode as Any? ?? NSNull(),
+            "worktree_removed": task.worktreeRemoved as Any? ?? NSNull(),
             "created_at": ISO8601DateFormatter().string(from: task.createdAt),
             "updated_at": ISO8601DateFormatter().string(from: task.updatedAt),
             "needs_attention": taskNeedsAttention(task),
@@ -5205,6 +5270,9 @@ final class TeamOrchestrator: ObservableObject {
         }
         if let completedAt = task.completedAt {
             dict["completed_at"] = ISO8601DateFormatter().string(from: completedAt)
+        }
+        if let worktreeFinishedAt = task.worktreeFinishedAt {
+            dict["worktree_finished_at"] = ISO8601DateFormatter().string(from: worktreeFinishedAt)
         }
         if let lastProgressAt = task.lastProgressAt {
             dict["last_progress_at"] = ISO8601DateFormatter().string(from: lastProgressAt)
