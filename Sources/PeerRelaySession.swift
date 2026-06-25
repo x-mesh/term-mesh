@@ -131,6 +131,106 @@ enum RelayError: Error {
     case acceptTimedOut
 }
 
+private final class RelayFrameWriter: @unchecked Sendable {
+    private let relay: RelaySocket
+    private let queue = DispatchQueue(label: "term-mesh.peer.relay.writer", qos: .userInitiated)
+    private let pendingSlots = DispatchSemaphore(value: 256)
+    private let lock = NSLock()
+    private var stopped = false
+    private let onFailure: @Sendable (Error) -> Void
+
+    init(relay: RelaySocket, onFailure: @escaping @Sendable (Error) -> Void) {
+        self.relay = relay
+        self.onFailure = onFailure
+    }
+
+    func enqueue(type: UInt8, payload: Data) throws {
+        let framePayload = payload
+        pendingSlots.wait()
+        guard !isStopped else {
+            pendingSlots.signal()
+            throw RelayError.ioError("relay writer stopped")
+        }
+
+        queue.async {
+            defer { self.pendingSlots.signal() }
+            guard !self.isStopped else { return }
+            do {
+                try self.relay.writeFrame(type: type, payload: framePayload)
+            } catch {
+                if self.markStopped() {
+                    self.onFailure(error)
+                }
+            }
+        }
+    }
+
+    func stop() {
+        _ = markStopped()
+    }
+
+    private var isStopped: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return stopped
+    }
+
+    private func markStopped() -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        guard !stopped else { return false }
+        stopped = true
+        return true
+    }
+}
+
+private actor RelayResizeCoalescer {
+    private let session: PeerSession
+    private let surfaceID: Data
+    private let delayNs: UInt64
+    private var pending: (cols: UInt32, rows: UInt32)?
+    private var flushTask: Task<Void, Never>?
+
+    init(session: PeerSession, surfaceID: Data, delayMs: UInt64 = 24) {
+        self.session = session
+        self.surfaceID = surfaceID
+        self.delayNs = delayMs * 1_000_000
+    }
+
+    func submit(cols: UInt32, rows: UInt32) {
+        pending = (cols, rows)
+        guard flushTask == nil else { return }
+        let delayNs = self.delayNs
+        flushTask = Task { [weak self] in
+            guard let self else { return }
+            try? await Task.sleep(nanoseconds: delayNs)
+            await self.flushPending()
+        }
+    }
+
+    func flushNow() async {
+        flushTask?.cancel()
+        flushTask = nil
+        await flushPending()
+    }
+
+    func cancel() {
+        flushTask?.cancel()
+        flushTask = nil
+        pending = nil
+    }
+
+    private func flushPending() async {
+        guard let size = pending else {
+            flushTask = nil
+            return
+        }
+        pending = nil
+        flushTask = nil
+        try? await session.sendResize(surfaceID: surfaceID, cols: size.cols, rows: size.rows)
+    }
+}
+
 // ── PeerRelaySession ─────────────────────────────────────────────────
 
 /// Manages the full relay lifetime for one remote-pane window.
@@ -139,6 +239,8 @@ enum RelayError: Error {
 /// 3. After start(), pumps data between host and relay.
 @MainActor
 final class PeerRelaySession {
+    private static let setupReadTimeoutSeconds: TimeInterval = 10
+
     // Path the relay binary should connect to.
     let relaySockPath: String
     // Per-session secret the relay binary must echo before we forward input.
@@ -226,7 +328,16 @@ final class PeerRelaySession {
 
     static func connectAndList(hostSockPath: String) async throws -> PeerRelayConnection {
         let connection = try await connect(hostSockPath: hostSockPath)
-        let surfaces = try await connection.session.listSurfaces()
+        await connection.transport.setReadTimeoutSeconds(setupReadTimeoutSeconds)
+        let surfaces: [Termmesh_Peer_V1_SurfaceInfo]
+        do {
+            surfaces = try await connection.session.listSurfaces()
+        } catch {
+            await connection.transport.setReadTimeoutSeconds(nil)
+            await connection.cancel()
+            throw error
+        }
+        await connection.transport.setReadTimeoutSeconds(nil)
         return PeerRelayConnection(
             hostSockPath: hostSockPath,
             hostDisplayName: connection.hostDisplayName,
@@ -238,11 +349,19 @@ final class PeerRelaySession {
 
     static func connect(hostSockPath: String) async throws -> PeerRelayConnection {
         let transport = try await UnixSocketTransport.connect(socketPath: hostSockPath)
+        await transport.setReadTimeoutSeconds(setupReadTimeoutSeconds)
         let session = PeerSession(
             read: { try await transport.read() },
             write: { try await transport.write($0) }
         )
-        let info = try await session.handshake()
+        let info: PeerSessionInfo
+        do {
+            info = try await session.handshake()
+        } catch {
+            await transport.close()
+            throw error
+        }
+        await transport.setReadTimeoutSeconds(nil)
         return PeerRelayConnection(
             hostSockPath: hostSockPath,
             hostDisplayName: info.hostDisplayName,
@@ -256,12 +375,20 @@ final class PeerRelaySession {
         _ connection: PeerRelayConnection,
         surface: Termmesh_Peer_V1_SurfaceInfo
     ) async throws -> PeerRelaySession {
-        let outcome = try await connection.session.attachSurface(
-            id: surface.surfaceID,
-            mode: .coWrite,
-            cols: UInt32(surface.cols),
-            rows: UInt32(surface.rows)
-        )
+        await connection.transport.setReadTimeoutSeconds(setupReadTimeoutSeconds)
+        let outcome: PeerAttachOutcome
+        do {
+            outcome = try await connection.session.attachSurface(
+                id: surface.surfaceID,
+                mode: .coWrite,
+                cols: UInt32(surface.cols),
+                rows: UInt32(surface.rows)
+            )
+        } catch {
+            await connection.transport.setReadTimeoutSeconds(nil)
+            throw error
+        }
+        await connection.transport.setReadTimeoutSeconds(nil)
 
         let relaySockPath = try Self.makeRelaySocketPath()
 
@@ -287,7 +414,12 @@ final class PeerRelaySession {
             await conn.cancel()
             throw RelayError.ioError("host has no attachable surfaces")
         }
-        return try await attach(conn, surface: chosen)
+        do {
+            return try await attach(conn, surface: chosen)
+        } catch {
+            await conn.cancel()
+            throw error
+        }
     }
 
     private init(
@@ -535,37 +667,46 @@ final class PeerRelaySession {
     private func startPumping(relay: RelaySocket) {
         guard let session else { return }
         let surfaceID = self.surfaceID
+        let disconnect: @Sendable () -> Void = { [weak self] in
+            Task { @MainActor in
+                self?.disconnect()
+            }
+        }
+        let writer = RelayFrameWriter(relay: relay) { _ in
+            disconnect()
+        }
+        let resizeCoalescer = RelayResizeCoalescer(session: session, surfaceID: surfaceID)
 
-        pumpTask = Task {
+        pumpTask = Task.detached(priority: .userInitiated) {
             // Host → relay: receive PtyData frames, write to relay socket.
-            let hostToRelay = Task {
+            let hostToRelay = Task.detached(priority: .userInitiated) {
                 while !Task.isCancelled {
                     let msg: PeerIncomingMessage
                     do {
                         msg = try await session.receiveNextMessage()
                     } catch {
-                        try? relay.writeFrame(type: kTypeGoodbye, payload: Data("host-error".utf8))
+                        try? writer.enqueue(type: kTypeGoodbye, payload: Data("host-error".utf8))
                         break
                     }
                     switch msg {
                     case .ptyData(_, _, let data):
                         do {
-                            try relay.writeFrame(type: kTypePtyData, payload: data)
+                            try writer.enqueue(type: kTypePtyData, payload: data)
                         } catch {
                             break
                         }
                     case .goodbye:
-                        try? relay.writeFrame(type: kTypeGoodbye, payload: Data("host-goodbye".utf8))
+                        try? writer.enqueue(type: kTypeGoodbye, payload: Data("host-goodbye".utf8))
                         return
                     default:
                         break
                     }
                 }
-                self.disconnect()
+                disconnect()
             }
 
             // Relay → host: read frames from relay socket, forward to PeerSession.
-            let relayToHost = Task {
+            let relayToHost = Task.detached(priority: .userInitiated) {
                 while !Task.isCancelled {
                     let frame: (type: UInt8, payload: Data)
                     do {
@@ -583,19 +724,23 @@ final class PeerRelaySession {
                         let rows = UInt32(UInt16(littleEndian: frame.payload.withUnsafeBytes {
                             $0.loadUnaligned(fromByteOffset: 2, as: UInt16.self)
                         }))
-                        try? await session.sendResize(surfaceID: surfaceID, cols: cols, rows: rows)
+                        await resizeCoalescer.submit(cols: cols, rows: rows)
                     case kTypeGoodbye:
+                        await resizeCoalescer.flushNow()
                         try? await session.sendGoodbye(reason: "relay disconnected")
                         return
                     default:
                         break
                     }
                 }
-                self.disconnect()
+                await resizeCoalescer.flushNow()
+                disconnect()
             }
 
             _ = await hostToRelay.result
             _ = await relayToHost.result
+            writer.stop()
+            await resizeCoalescer.cancel()
         }
     }
 

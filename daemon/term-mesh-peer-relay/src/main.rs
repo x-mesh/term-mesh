@@ -30,6 +30,7 @@ const TYPE_GOODBYE: u8 = 0xFF;
 const TYPE_AUTH: u8 = 0xFE;
 const MAX_FRAME_BYTES: usize = 1024 * 1024;
 const MAX_RESPONSE_PENDING: usize = 256;
+const RESIZE_COALESCE_MS: u64 = 16;
 
 // ── SIGWINCH self-pipe ─────────────────────────────────────────────
 
@@ -51,6 +52,8 @@ fn install_sigwinch_pipe() -> io::Result<libc::c_int> {
     if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
         return Err(io::Error::last_os_error());
     }
+    set_fd_nonblocking(fds[0]);
+    set_fd_nonblocking(fds[1]);
     SIGWINCH_PIPE_WRITE.store(fds[1], Ordering::Relaxed);
     let mut sa: libc::sigaction = unsafe { std::mem::zeroed() };
     sa.sa_sigaction = sigwinch_handler as *const () as usize;
@@ -62,6 +65,15 @@ fn install_sigwinch_pipe() -> io::Result<libc::c_int> {
     Ok(fds[0])
 }
 
+fn set_fd_nonblocking(fd: libc::c_int) {
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if flags >= 0 {
+        unsafe {
+            libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
+        }
+    }
+}
+
 fn current_winsize() -> Option<(u16, u16)> {
     let mut ws: libc::winsize = unsafe { std::mem::zeroed() };
     let rc = unsafe { libc::ioctl(libc::STDIN_FILENO, libc::TIOCGWINSZ, &mut ws) };
@@ -69,6 +81,55 @@ fn current_winsize() -> Option<(u16, u16)> {
         Some((ws.ws_col, ws.ws_row))
     } else {
         None
+    }
+}
+
+fn resize_payload(cols: u16, rows: u16) -> [u8; 4] {
+    let mut payload = [0u8; 4];
+    payload[..2].copy_from_slice(&cols.to_le_bytes());
+    payload[2..4].copy_from_slice(&rows.to_le_bytes());
+    payload
+}
+
+fn resize_frame(cols: u16, rows: u16) -> Vec<u8> {
+    let payload = resize_payload(cols, rows);
+    let mut frame = Vec::with_capacity(5 + payload.len());
+    frame.push(TYPE_RESIZE);
+    frame.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+    frame.extend_from_slice(&payload);
+    frame
+}
+
+fn send_current_resize(
+    tx: &mpsc::Sender<Vec<u8>>,
+    last_sent: &mut Option<(u16, u16)>,
+) -> bool {
+    let Some((cols, rows)) = current_winsize() else {
+        return true;
+    };
+    if last_sent.is_some_and(|prev| prev == (cols, rows)) {
+        return true;
+    }
+    *last_sent = Some((cols, rows));
+    tx.send(resize_frame(cols, rows)).is_ok()
+}
+
+fn drain_sigwinch_pipe(fd: libc::c_int) -> bool {
+    let mut scratch = [0u8; 64];
+    loop {
+        let n = unsafe { libc::read(fd, scratch.as_mut_ptr() as *mut _, scratch.len()) };
+        if n > 0 {
+            continue;
+        }
+        if n == 0 {
+            return false;
+        }
+        let err = io::Error::last_os_error();
+        match err.raw_os_error() {
+            Some(libc::EINTR) => continue,
+            Some(code) if code == libc::EAGAIN || code == libc::EWOULDBLOCK => return true,
+            _ => return false,
+        }
     }
 }
 
@@ -582,10 +643,9 @@ fn main() {
     let _raw_guard = RawStdinGuard::enable();
 
     // Send initial Resize so the host knows our terminal size.
-    if let Some((cols, rows)) = current_winsize() {
-        let mut payload = [0u8; 4];
-        payload[..2].copy_from_slice(&cols.to_le_bytes());
-        payload[2..4].copy_from_slice(&rows.to_le_bytes());
+    let initial_resize = current_winsize();
+    if let Some((cols, rows)) = initial_resize {
+        let payload = resize_payload(cols, rows);
         let _ = write_frame(&mut sock, TYPE_RESIZE, &payload);
     }
 
@@ -618,24 +678,46 @@ fn main() {
     let sigwinch_handle = sigwinch_rx_fd.map(|fd| {
         let tx = tx.clone();
         std::thread::spawn(move || {
-            let mut scratch = [0u8; 16];
+            let mut last_sent = initial_resize;
             loop {
-                let n = unsafe { libc::read(fd, scratch.as_mut_ptr() as *mut _, scratch.len()) };
-                if n <= 0 || STOPPING.load(Ordering::Relaxed) {
+                let mut pfd = libc::pollfd {
+                    fd,
+                    events: libc::POLLIN,
+                    revents: 0,
+                };
+                let ret = unsafe { libc::poll(&mut pfd, 1, -1) };
+                if STOPPING.load(Ordering::Relaxed) {
                     break;
                 }
-                if let Some((cols, rows)) = current_winsize() {
-                    let mut payload = [0u8; 4];
-                    payload[..2].copy_from_slice(&cols.to_le_bytes());
-                    payload[2..4].copy_from_slice(&rows.to_le_bytes());
-                    let mut frame = Vec::with_capacity(5 + 4);
-                    frame.push(TYPE_RESIZE);
-                    frame.extend_from_slice(&4u32.to_le_bytes());
-                    frame.extend_from_slice(&payload);
-                    if tx.send(frame).is_err() {
-                        break;
+                if ret < 0 {
+                    let err = io::Error::last_os_error();
+                    if err.raw_os_error() == Some(libc::EINTR) {
+                        continue;
                     }
+                    break;
                 }
+                if ret == 0 {
+                    continue;
+                }
+                if pfd.revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) != 0 {
+                    break;
+                }
+                if pfd.revents & libc::POLLIN == 0 {
+                    continue;
+                }
+                if !drain_sigwinch_pipe(fd) {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(RESIZE_COALESCE_MS));
+                if !drain_sigwinch_pipe(fd) {
+                    break;
+                }
+                if !send_current_resize(&tx, &mut last_sent) {
+                    break;
+                }
+            }
+            unsafe {
+                libc::close(fd);
             }
         })
     });
