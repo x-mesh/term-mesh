@@ -100,11 +100,16 @@ fn resize_frame(cols: u16, rows: u16) -> Vec<u8> {
     frame
 }
 
-fn send_current_resize(
+fn send_current_resize(tx: &mpsc::Sender<Vec<u8>>, last_sent: &mut Option<(u16, u16)>) -> bool {
+    send_resize_if_changed(tx, last_sent, current_winsize())
+}
+
+fn send_resize_if_changed(
     tx: &mpsc::Sender<Vec<u8>>,
     last_sent: &mut Option<(u16, u16)>,
+    size: Option<(u16, u16)>,
 ) -> bool {
-    let Some((cols, rows)) = current_winsize() else {
+    let Some((cols, rows)) = size else {
         return true;
     };
     if last_sent.is_some_and(|prev| prev == (cols, rows)) {
@@ -852,6 +857,27 @@ mod tests {
     fn filter(input: &[u8]) -> Vec<u8> {
         let mut f = TerminalResponseFilter::default();
         f.process(input)
+    }
+
+    #[test]
+    fn resize_payload_is_cols_rows_little_endian() {
+        assert_eq!(resize_payload(0x1234, 0xABCD), [0x34, 0x12, 0xCD, 0xAB]);
+    }
+
+    #[test]
+    fn send_resize_if_changed_skips_duplicate_size() {
+        let (tx, rx) = mpsc::channel();
+        let mut last_sent = None;
+
+        assert!(send_resize_if_changed(&tx, &mut last_sent, Some((80, 24))));
+        assert!(send_resize_if_changed(&tx, &mut last_sent, Some((80, 24))));
+        assert!(send_resize_if_changed(&tx, &mut last_sent, Some((100, 30))));
+
+        let first = rx.recv().unwrap();
+        let second = rx.recv().unwrap();
+        assert!(rx.try_recv().is_err());
+        assert_eq!(first, resize_frame(80, 24));
+        assert_eq!(second, resize_frame(100, 30));
     }
 
     #[test]

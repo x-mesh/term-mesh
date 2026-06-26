@@ -78,13 +78,11 @@ public actor UnixSocketTransport {
                     fail(UnixSocketTransportError.connectFailed(
                         description: String(describing: err)
                     ))
-                case .waiting(let err):
-                    // .waiting means the OS can't yet reach the endpoint (e.g. path
-                    // doesn't exist). Treat as fatal here; callers poll for the
-                    // socket to appear before connecting.
-                    fail(UnixSocketTransportError.connectFailed(
-                        description: "waiting: \(err)"
-                    ))
+                case .waiting:
+                    // Keep waiting until the explicit timeout fires. NWConnection
+                    // can stay in `.waiting` for unreachable Unix endpoints, and
+                    // callers need a deterministic upper bound for that state.
+                    break
                 case .cancelled:
                     fail(UnixSocketTransportError.closed)
                 default:

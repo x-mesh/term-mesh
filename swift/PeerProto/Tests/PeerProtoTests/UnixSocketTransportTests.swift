@@ -10,6 +10,22 @@ import Darwin
 /// `swift test` from failing on a fresh checkout where the Rust
 /// workspace hasn't been compiled yet.
 final class UnixSocketTransportTests: XCTestCase {
+    func testConnectTimeoutForMissingSocketPath() async throws {
+        let sockPath = "/tmp/tm-peer-swift-missing-\(UUID().uuidString.prefix(8)).sock"
+        try? FileManager.default.removeItem(atPath: sockPath)
+
+        do {
+            _ = try await UnixSocketTransport.connect(socketPath: sockPath, timeoutSeconds: 0.05)
+            XCTFail("missing socket path should time out")
+        } catch let error as UnixSocketTransportError {
+            guard case .connectTimedOut(let seconds) = error else {
+                XCTFail("expected connectTimedOut, got \(error)")
+                return
+            }
+            XCTAssertEqual(seconds, 0.05, accuracy: 0.001)
+        }
+    }
+
     func testReadTimeoutClosesSilentSocket() async throws {
         let fm = FileManager.default
         let sockPath = "/tmp/tm-peer-swift-timeout-\(UUID().uuidString.prefix(8)).sock"

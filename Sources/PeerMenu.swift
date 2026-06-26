@@ -17,6 +17,7 @@
 
 import AppKit
 import Bonsplit
+import Darwin
 import PeerProto
 
 @MainActor
@@ -845,6 +846,13 @@ final class PeerClientCoordinator: NSObject {
         }
         if isDirectory.boolValue {
             return "Socket path points to a directory:\n\(path)"
+        }
+        var st = stat()
+        guard stat(path, &st) == 0 else {
+            return "Socket path is not accessible:\n\(path)"
+        }
+        guard (st.st_mode & S_IFMT) == S_IFSOCK else {
+            return "Socket path is not a Unix socket:\n\(path)"
         }
         return nil
     }

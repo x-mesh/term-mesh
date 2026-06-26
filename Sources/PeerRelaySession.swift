@@ -24,6 +24,7 @@ private let kTypeGoodbye: UInt8  = 0xFF
 private let kTypeAuth: UInt8     = 0xFE
 private let kRelayMaxFrameBytes = 1024 * 1024
 private let kRelayAuthMaxPayload = 256
+private typealias RelayFrame = (type: UInt8, payload: Data)
 
 // ── Two-stage handshake result ─────────────────────────────────────
 
@@ -124,17 +125,65 @@ private func readFull(fd: Int32, into data: inout Data) throws {
     }
 }
 
-enum RelayError: Error {
+enum RelayError: Error, Sendable {
     case ioError(String)
     case noRelayBinary(String)
     case listenerSetupFailed(String)
     case acceptTimedOut
 }
 
+private actor RelayFrameSlots {
+    private let limit: Int
+    private var available: Int
+    private var waiters: [CheckedContinuation<Void, Error>] = []
+    private var stoppedError: Error?
+
+    init(limit: Int) {
+        self.limit = limit
+        self.available = limit
+    }
+
+    func acquire() async throws {
+        if let stoppedError {
+            throw stoppedError
+        }
+        if available > 0 {
+            available -= 1
+            return
+        }
+        try await withCheckedThrowingContinuation { continuation in
+            waiters.append(continuation)
+        }
+    }
+
+    func release() {
+        if stoppedError != nil {
+            available = min(limit, available + 1)
+            return
+        }
+        if waiters.isEmpty {
+            available = min(limit, available + 1)
+        } else {
+            waiters.removeFirst().resume()
+        }
+    }
+
+    func stop(error: Error) {
+        guard stoppedError == nil else { return }
+        stoppedError = error
+        let pending = waiters
+        waiters.removeAll()
+        available = 0
+        for waiter in pending {
+            waiter.resume(throwing: error)
+        }
+    }
+}
+
 private final class RelayFrameWriter: @unchecked Sendable {
     private let relay: RelaySocket
     private let queue = DispatchQueue(label: "term-mesh.peer.relay.writer", qos: .userInitiated)
-    private let pendingSlots = DispatchSemaphore(value: 256)
+    private let slots = RelayFrameSlots(limit: 256)
     private let lock = NSLock()
     private var stopped = false
     private let onFailure: @Sendable (Error) -> Void
@@ -144,21 +193,24 @@ private final class RelayFrameWriter: @unchecked Sendable {
         self.onFailure = onFailure
     }
 
-    func enqueue(type: UInt8, payload: Data) throws {
+    func enqueue(type: UInt8, payload: Data) async throws {
         let framePayload = payload
-        pendingSlots.wait()
+        try await slots.acquire()
         guard !isStopped else {
-            pendingSlots.signal()
+            await slots.release()
             throw RelayError.ioError("relay writer stopped")
         }
 
         queue.async {
-            defer { self.pendingSlots.signal() }
+            defer { Task { await self.slots.release() } }
             guard !self.isStopped else { return }
             do {
                 try self.relay.writeFrame(type: type, payload: framePayload)
             } catch {
                 if self.markStopped() {
+                    Task {
+                        await self.slots.stop(error: RelayError.ioError("relay writer stopped"))
+                    }
                     self.onFailure(error)
                 }
             }
@@ -166,7 +218,11 @@ private final class RelayFrameWriter: @unchecked Sendable {
     }
 
     func stop() {
-        _ = markStopped()
+        if markStopped() {
+            Task {
+                await self.slots.stop(error: RelayError.ioError("relay writer stopped"))
+            }
+        }
     }
 
     private var isStopped: Bool {
@@ -181,6 +237,56 @@ private final class RelayFrameWriter: @unchecked Sendable {
         guard !stopped else { return false }
         stopped = true
         return true
+    }
+}
+
+private final class RelayFrameReader: @unchecked Sendable {
+    private let relay: RelaySocket
+    private let queue = DispatchQueue(label: "term-mesh.peer.relay.reader", qos: .userInitiated)
+    private let lock = NSLock()
+    private var stopped = false
+
+    init(relay: RelaySocket) {
+        self.relay = relay
+    }
+
+    func frames() -> AsyncThrowingStream<RelayFrame, Error> {
+        AsyncThrowingStream { continuation in
+            queue.async {
+                while !self.isStopped {
+                    do {
+                        continuation.yield(try self.relay.readFrame())
+                    } catch {
+                        if self.isStopped {
+                            continuation.finish()
+                        } else {
+                            continuation.finish(throwing: error)
+                        }
+                        return
+                    }
+                }
+                continuation.finish()
+            }
+            continuation.onTermination = { @Sendable _ in
+                self.stop()
+            }
+        }
+    }
+
+    func stop() {
+        lock.lock()
+        let shouldStop = !stopped
+        stopped = true
+        lock.unlock()
+        if shouldStop {
+            relay.close()
+        }
+    }
+
+    private var isStopped: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return stopped
     }
 }
 
@@ -675,6 +781,7 @@ final class PeerRelaySession {
         let writer = RelayFrameWriter(relay: relay) { _ in
             disconnect()
         }
+        let reader = RelayFrameReader(relay: relay)
         let resizeCoalescer = RelayResizeCoalescer(session: session, surfaceID: surfaceID)
 
         pumpTask = Task.detached(priority: .userInitiated) {
@@ -685,18 +792,18 @@ final class PeerRelaySession {
                     do {
                         msg = try await session.receiveNextMessage()
                     } catch {
-                        try? writer.enqueue(type: kTypeGoodbye, payload: Data("host-error".utf8))
+                        try? await writer.enqueue(type: kTypeGoodbye, payload: Data("host-error".utf8))
                         break
                     }
                     switch msg {
                     case .ptyData(_, _, let data):
                         do {
-                            try writer.enqueue(type: kTypePtyData, payload: data)
+                            try await writer.enqueue(type: kTypePtyData, payload: data)
                         } catch {
                             break
                         }
                     case .goodbye:
-                        try? writer.enqueue(type: kTypeGoodbye, payload: Data("host-goodbye".utf8))
+                        try? await writer.enqueue(type: kTypeGoodbye, payload: Data("host-goodbye".utf8))
                         return
                     default:
                         break
@@ -707,31 +814,31 @@ final class PeerRelaySession {
 
             // Relay → host: read frames from relay socket, forward to PeerSession.
             let relayToHost = Task.detached(priority: .userInitiated) {
-                while !Task.isCancelled {
-                    let frame: (type: UInt8, payload: Data)
-                    do {
-                        frame = try await Task.detached { try relay.readFrame() }.value
-                    } catch {
-                        break
+                do {
+                    for try await frame in reader.frames() {
+                        if Task.isCancelled { break }
+                        switch frame.type {
+                        case kTypeKeyInput:
+                            try? await session.sendInput(surfaceID: surfaceID, keys: frame.payload)
+                        case kTypeResize where frame.payload.count >= 4:
+                            let cols = UInt32(UInt16(littleEndian: frame.payload.withUnsafeBytes {
+                                $0.loadUnaligned(fromByteOffset: 0, as: UInt16.self)
+                            }))
+                            let rows = UInt32(UInt16(littleEndian: frame.payload.withUnsafeBytes {
+                                $0.loadUnaligned(fromByteOffset: 2, as: UInt16.self)
+                            }))
+                            await resizeCoalescer.submit(cols: cols, rows: rows)
+                        case kTypeGoodbye:
+                            await resizeCoalescer.flushNow()
+                            try? await session.sendGoodbye(reason: "relay disconnected")
+                            return
+                        default:
+                            break
+                        }
                     }
-                    switch frame.type {
-                    case kTypeKeyInput:
-                        try? await session.sendInput(surfaceID: surfaceID, keys: frame.payload)
-                    case kTypeResize where frame.payload.count >= 4:
-                        let cols = UInt32(UInt16(littleEndian: frame.payload.withUnsafeBytes {
-                            $0.loadUnaligned(fromByteOffset: 0, as: UInt16.self)
-                        }))
-                        let rows = UInt32(UInt16(littleEndian: frame.payload.withUnsafeBytes {
-                            $0.loadUnaligned(fromByteOffset: 2, as: UInt16.self)
-                        }))
-                        await resizeCoalescer.submit(cols: cols, rows: rows)
-                    case kTypeGoodbye:
-                        await resizeCoalescer.flushNow()
-                        try? await session.sendGoodbye(reason: "relay disconnected")
-                        return
-                    default:
-                        break
-                    }
+                } catch {
+                    // The normal teardown path also arrives here after the relay
+                    // fd is closed. `disconnect()` below owns the user-visible state.
                 }
                 await resizeCoalescer.flushNow()
                 disconnect()
@@ -740,6 +847,7 @@ final class PeerRelaySession {
             _ = await hostToRelay.result
             _ = await relayToHost.result
             writer.stop()
+            reader.stop()
             await resizeCoalescer.cancel()
         }
     }
