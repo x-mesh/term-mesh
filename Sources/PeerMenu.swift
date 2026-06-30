@@ -17,6 +17,7 @@
 
 import AppKit
 import Bonsplit
+import Darwin
 import PeerProto
 
 @MainActor
@@ -75,6 +76,7 @@ enum PeerMenu {
 @MainActor
 final class PeerClientCoordinator: NSObject {
     static let shared = PeerClientCoordinator()
+    private static let setupReadTimeoutSeconds: TimeInterval = 10
 
     /// Posted whenever the active-relays roster changes (open / close).
     /// `PeerConnectionsWindowController` listens to refresh its table.
@@ -89,6 +91,27 @@ final class PeerClientCoordinator: NSObject {
     /// tunnel must outlive the relay window; dropped tunnels yank the
     /// forwarded socket out from under the relay sessions.
     private var sshTunnels: [ObjectIdentifier: PeerSSHTunnel] = [:]
+    private var activeConnectionFlows: Set<ConnectionFlow> = []
+
+    private enum ConnectionFlow: Hashable {
+        case console(String)
+        case relayPane(String)
+        case workspace(String)
+        case workspaceSSH(target: String, remote: String)
+
+        var displayName: String {
+            switch self {
+            case .console(let path):
+                return "peer console at \(path)"
+            case .relayPane(let path):
+                return "peer relay at \(path)"
+            case .workspace(let path):
+                return "peer workspace at \(path)"
+            case .workspaceSSH(let target, let remote):
+                return "SSH peer workspace \(target):\(remote)"
+            }
+        }
+    }
 
     /// Snapshot of every active peer connection for the Connections
     /// panel. Returned in open-order. Exposes value types rather than
@@ -130,6 +153,22 @@ final class PeerClientCoordinator: NSObject {
         dlog("peer.connections.post consoles=\(openConsoles.count) relays=\(openRelays.count) workspaces=\(openWorkspaceRelays.count)")
 #endif
         NotificationCenter.default.post(name: Self.relaysDidChangeNotification, object: self)
+    }
+
+    private func beginConnectionFlow(_ flow: ConnectionFlow) -> Bool {
+        guard !activeConnectionFlows.contains(flow) else {
+            showAlert(
+                title: "Connection Already in Progress",
+                body: "term-mesh is already connecting to \(flow.displayName)."
+            )
+            return false
+        }
+        activeConnectionFlows.insert(flow)
+        return true
+    }
+
+    private func finishConnectionFlow(_ flow: ConnectionFlow) {
+        activeConnectionFlows.remove(flow)
     }
 
     @objc func showConnections(_ sender: Any?) {
@@ -188,8 +227,8 @@ final class PeerClientCoordinator: NSObject {
         recentMenu.addItem(withTitle: recents.isEmpty ? "(no recent hosts)" : "(pick a recent host…)",
                            action: nil, keyEquivalent: "")
         for r in recents {
-            recentMenu.addItem(withTitle: "\(r.sshTarget)  ·  \(r.remoteSocket)",
-                               action: nil, keyEquivalent: "")
+            let title = Self.menuSafeTitle("\(r.sshTarget)  ·  \(r.remoteSocket)", maxLength: 110)
+            recentMenu.addItem(withTitle: title, action: nil, keyEquivalent: "")
         }
         recentPopup.menu = recentMenu
 
@@ -250,7 +289,8 @@ final class PeerClientCoordinator: NSObject {
                 menu.addItem(withTitle: "(pick a host…)", action: nil, keyEquivalent: "")
                 for p in peers {
                     let label = "\(p.serviceName)  ·  \(p.hostname)\(p.socketPath.map { "  ·  \($0)" } ?? "")"
-                    menu.addItem(withTitle: label, action: nil, keyEquivalent: "")
+                    menu.addItem(withTitle: Self.menuSafeTitle(label, maxLength: 110),
+                                 action: nil, keyEquivalent: "")
                 }
             }
             discoveredPopup.menu = menu
@@ -278,9 +318,19 @@ final class PeerClientCoordinator: NSObject {
 
         let resp = await Self.runModalAsSheet(alert)
         guard resp == .alertFirstButtonReturn else { return }
-        let target = targetField.stringValue.trimmingCharacters(in: .whitespaces)
-        let remote = remoteField.stringValue.trimmingCharacters(in: .whitespaces)
-        guard !target.isEmpty, !remote.isEmpty else { return }
+        let target = targetField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        let remote = remoteField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !target.isEmpty, !remote.isEmpty else {
+            self.showAlert(
+                title: "Peer Socket Required",
+                body: "Enter both an SSH target and the remote peer socket path."
+            )
+            return
+        }
+
+        let flow = ConnectionFlow.workspaceSSH(target: target, remote: remote)
+        guard beginConnectionFlow(flow) else { return }
+        defer { finishConnectionFlow(flow) }
 
         let tunnel = PeerSSHTunnel(sshTarget: target, remoteSockPath: remote)
         do {
@@ -312,7 +362,7 @@ final class PeerClientCoordinator: NSObject {
                                     tunnel: PeerSSHTunnel? = nil) async {
         let probe: PeerRelayConnection
         do {
-            probe = try await PeerRelaySession.connectAndList(hostSockPath: hostSockPath)
+            probe = try await PeerRelaySession.connect(hostSockPath: hostSockPath)
         } catch {
             tunnel?.stop()
             await MainActor.run {
@@ -322,9 +372,11 @@ final class PeerClientCoordinator: NSObject {
             return
         }
         let workspaces: [Termmesh_Peer_V1_Workspace]
+        await probe.transport.setReadTimeoutSeconds(Self.setupReadTimeoutSeconds)
         do {
             workspaces = try await probe.session.listWorkspaces()
         } catch {
+            await probe.transport.setReadTimeoutSeconds(nil)
             await probe.cancel()
             tunnel?.stop()
             await MainActor.run {
@@ -333,6 +385,7 @@ final class PeerClientCoordinator: NSObject {
             }
             return
         }
+        await probe.transport.setReadTimeoutSeconds(nil)
         await probe.cancel()
 
         guard !workspaces.isEmpty else {
@@ -363,7 +416,7 @@ final class PeerClientCoordinator: NSObject {
             )
             self.openWorkspaceRelays.append(controller)
 #if DEBUG
-            dlog("peer.connections.openWorkspaceRelay appended hasTunnel=\(tunnel != nil) host=\(hostSockPath) hostDisplay=\(probe.hostDisplayName ?? "nil") workspace=\(controller.connectionInfo.targetTitle)")
+            dlog("peer.connections.openWorkspaceRelay appended hasTunnel=\(tunnel != nil) host=\(hostSockPath) hostDisplay=\(probe.hostDisplayName) workspace=\(controller.connectionInfo.targetTitle)")
 #endif
             if let tunnel {
                 self.sshTunnels[ObjectIdentifier(controller)] = tunnel
@@ -404,8 +457,12 @@ final class PeerClientCoordinator: NSObject {
         Task { @MainActor in
             let resp = await Self.runModalAsSheet(alert)
             guard resp == .alertFirstButtonReturn else { return }
-            let path = input.stringValue.trimmingCharacters(in: .whitespaces)
-            guard !path.isEmpty else { return }
+            let path = self.normalizedSocketPath(from: input.stringValue)
+            guard !path.isEmpty else {
+                self.showAlert(title: "Peer Socket Required", body: "Enter a peer socket path.")
+                return
+            }
+            guard self.validateLocalSocketPathForConnect(path) else { return }
             await self.runWorkspaceFlow(path: path)
         }
     }
@@ -414,65 +471,62 @@ final class PeerClientCoordinator: NSObject {
     /// promptAndRunRelayWorkspace so the sheet-based completion can
     /// call it cleanly.
     private func runWorkspaceFlow(path: String) async {
-        Task {
-            // Open a probe connection to enumerate workspaces, then
-            // discard it — each pane in the chosen workspace will
-            // open its own connection.
-            let probe: PeerRelayConnection
-            do {
-                probe = try await PeerRelaySession.connectAndList(hostSockPath: path)
-            } catch {
-                await MainActor.run {
-                    self.showAlert(title: "Peer Workspace Failed",
-                                   body: String(describing: error))
-                }
-                return
-            }
-            let workspaces: [Termmesh_Peer_V1_Workspace]
-            do {
-                workspaces = try await probe.session.listWorkspaces()
-            } catch {
-                await probe.cancel()
-                await MainActor.run {
-                    self.showAlert(title: "Peer Workspace Failed",
-                                   body: "listWorkspaces failed: \(error)")
-                }
-                return
-            }
-            await probe.cancel()
+        let flow = ConnectionFlow.workspace(path)
+        guard beginConnectionFlow(flow) else { return }
+        defer { finishConnectionFlow(flow) }
 
-            guard !workspaces.isEmpty else {
-                await MainActor.run {
-                    self.showAlert(title: "Peer Workspace Failed",
-                                   body: "Host did not return any workspaces.")
-                }
-                return
-            }
-
-            let chosen: Termmesh_Peer_V1_Workspace?
-            if workspaces.count == 1 {
-                chosen = workspaces[0]
-            } else {
-                chosen = await self.promptForWorkspaceSelection(from: workspaces)
-            }
-            guard let chosen else { return }
-
-            await MainActor.run {
-                let controller = PeerRelayWorkspaceWindowController(
-                    hostSockPath: path,
-                    workspace: chosen,
-                    hostDisplayName: probe.hostDisplayName
-                )
-                self.openWorkspaceRelays.append(controller)
-                controller.onClose = { [weak self, weak controller] in
-                    guard let self, let controller else { return }
-                    self.openWorkspaceRelays.removeAll { $0 === controller }
-                    self.postRelaysChanged()
-                }
-                controller.show()
-                self.postRelaysChanged()
-            }
+        // Open a probe connection to enumerate workspaces, then
+        // discard it — each pane in the chosen workspace will
+        // open its own connection.
+        let probe: PeerRelayConnection
+        do {
+            probe = try await PeerRelaySession.connect(hostSockPath: path)
+        } catch {
+            self.showAlert(title: "Peer Workspace Failed",
+                           body: String(describing: error))
+            return
         }
+        let workspaces: [Termmesh_Peer_V1_Workspace]
+        await probe.transport.setReadTimeoutSeconds(Self.setupReadTimeoutSeconds)
+        do {
+            workspaces = try await probe.session.listWorkspaces()
+        } catch {
+            await probe.transport.setReadTimeoutSeconds(nil)
+            await probe.cancel()
+            self.showAlert(title: "Peer Workspace Failed",
+                           body: "listWorkspaces failed: \(error)")
+            return
+        }
+        await probe.transport.setReadTimeoutSeconds(nil)
+        await probe.cancel()
+
+        guard !workspaces.isEmpty else {
+            self.showAlert(title: "Peer Workspace Failed",
+                           body: "Host did not return any workspaces.")
+            return
+        }
+
+        let chosen: Termmesh_Peer_V1_Workspace?
+        if workspaces.count == 1 {
+            chosen = workspaces[0]
+        } else {
+            chosen = await self.promptForWorkspaceSelection(from: workspaces)
+        }
+        guard let chosen else { return }
+
+        let controller = PeerRelayWorkspaceWindowController(
+            hostSockPath: path,
+            workspace: chosen,
+            hostDisplayName: probe.hostDisplayName
+        )
+        self.openWorkspaceRelays.append(controller)
+        controller.onClose = { [weak self, weak controller] in
+            guard let self, let controller else { return }
+            self.openWorkspaceRelays.removeAll { $0 === controller }
+            self.postRelaysChanged()
+        }
+        controller.show()
+        self.postRelaysChanged()
     }
 
     private func promptForWorkspaceSelection(
@@ -498,7 +552,10 @@ final class PeerClientCoordinator: NSObject {
         for group in windowGroups {
             if multiWindow {
                 let header = NSMenuItem(
-                    title: peerWindowLabel(title: group.windowTitle, id: group.windowID),
+                    title: Self.menuSafeTitle(
+                        peerWindowLabel(title: group.windowTitle, id: group.windowID),
+                        maxLength: 80
+                    ),
                     action: nil,
                     keyEquivalent: ""
                 )
@@ -506,7 +563,10 @@ final class PeerClientCoordinator: NSObject {
                 popup.menu?.addItem(header)
             }
             for w in group.items {
-                let title = w.title.isEmpty ? "<untitled>" : w.title
+                let title = Self.menuSafeTitle(
+                    w.title.isEmpty ? "<untitled>" : w.title,
+                    maxLength: 64
+                )
                 let count = countLeaves(w.layout)
                 let idHex = w.workspaceID.prefix(4).map { String(format: "%02x", $0) }.joined()
                 let item = NSMenuItem(title: "\(title)  ·  \(count) panes  [\(idHex)]",
@@ -555,76 +615,73 @@ final class PeerClientCoordinator: NSObject {
         Task { @MainActor in
             let resp = await Self.runModalAsSheet(alert)
             guard resp == .alertFirstButtonReturn else { return }
-            let path = input.stringValue.trimmingCharacters(in: .whitespaces)
-            guard !path.isEmpty else { return }
+            let path = self.normalizedSocketPath(from: input.stringValue)
+            guard !path.isEmpty else {
+                self.showAlert(title: "Peer Socket Required", body: "Enter a peer socket path.")
+                return
+            }
+            guard self.validateLocalSocketPathForConnect(path) else { return }
             await self.runRelayFlow(path: path)
         }
     }
 
     /// Body of the legacy single-pane relay flow, extracted so the
     /// promptAndRunRelay sheet completion can call it cleanly.
-    /// The body remains its own detached Task so the sheet
-    /// completion isn't blocked while we connect, list surfaces,
-    /// and pop a follow-up picker.
+    /// The body stays async end-to-end so duplicate-connect guards remain
+    /// active until connect, list, selection, and attach have all finished.
     private func runRelayFlow(path: String) async {
-        Task {
-            let connection: PeerRelayConnection
-            do {
-                connection = try await PeerRelaySession.connectAndList(hostSockPath: path)
-            } catch {
-                await MainActor.run {
-                    self.showAlert(title: "Peer Relay Failed", body: String(describing: error))
-                }
-                return
-            }
+        let flow = ConnectionFlow.relayPane(path)
+        guard beginConnectionFlow(flow) else { return }
+        defer { finishConnectionFlow(flow) }
 
-            // Pick a surface — auto-skip the dialog when there's nothing
-            // to choose between.
-            let attachable = connection.surfaces.filter { $0.attachable }
-            let pickFrom = attachable.isEmpty ? connection.surfaces : attachable
-            guard !pickFrom.isEmpty else {
-                await connection.cancel()
-                await MainActor.run {
-                    self.showAlert(title: "Peer Relay Failed",
-                                   body: "Host has no surfaces to attach to.")
-                }
-                return
-            }
+        let connection: PeerRelayConnection
+        do {
+            connection = try await PeerRelaySession.connectAndList(hostSockPath: path)
+        } catch {
+            self.showAlert(title: "Peer Relay Failed", body: String(describing: error))
+            return
+        }
 
-            let chosen: Termmesh_Peer_V1_SurfaceInfo?
-            if pickFrom.count == 1 {
-                chosen = pickFrom[0]
-            } else {
-                chosen = await self.promptForSurfaceSelection(from: pickFrom)
-            }
-            guard let chosen else {
-                await connection.cancel()
-                return
-            }
+        // Pick a surface — auto-skip the dialog when there's nothing
+        // to choose between.
+        let attachable = connection.surfaces.filter { $0.attachable }
+        let pickFrom = attachable.isEmpty ? connection.surfaces : attachable
+        guard !pickFrom.isEmpty else {
+            await connection.cancel()
+            self.showAlert(title: "Peer Relay Failed",
+                           body: "Host has no surfaces to attach to.")
+            return
+        }
 
-            do {
-                let session = try await PeerRelaySession.attach(connection, surface: chosen)
-                try session.prepareListener()
-                await MainActor.run {
-                    let controller = PeerRelayWindowController(
-                        session: session,
-                        surfaceTitle: chosen.title
-                    )
-                    self.openRelays.append(controller)
-                    controller.onClose = { [weak self, weak controller] in
-                        guard let self, let controller else { return }
-                        self.openRelays.removeAll { $0 === controller }
-                        self.postRelaysChanged()
-                    }
-                    controller.show()
-                    self.postRelaysChanged()
-                }
-            } catch {
-                await connection.cancel()
-                await MainActor.run {
-                    self.showAlert(title: "Peer Relay Failed", body: String(describing: error))
-                }
+        let chosen: Termmesh_Peer_V1_SurfaceInfo?
+        if pickFrom.count == 1 {
+            chosen = pickFrom[0]
+        } else {
+            chosen = await self.promptForSurfaceSelection(from: pickFrom)
+        }
+        guard let chosen else {
+            await connection.cancel()
+            return
+        }
+
+        do {
+            let session = try await PeerRelaySession.attach(connection, surface: chosen)
+            try session.prepareListener()
+            let controller = PeerRelayWindowController(
+                session: session,
+                surfaceTitle: chosen.title
+            )
+            self.openRelays.append(controller)
+            controller.onClose = { [weak self, weak controller] in
+                guard let self, let controller else { return }
+                self.openRelays.removeAll { $0 === controller }
+                self.postRelaysChanged()
             }
+            controller.show()
+            self.postRelaysChanged()
+        } catch {
+            await connection.cancel()
+            self.showAlert(title: "Peer Relay Failed", body: String(describing: error))
         }
     }
 
@@ -648,8 +705,11 @@ final class PeerClientCoordinator: NSObject {
         // directly (rather than addItem(withTitle:)) so each row stays
         // distinct.
         for s in surfaces {
-            let title = s.title.isEmpty ? "<untitled>" : s.title
-            let detail = s.cwd.isEmpty ? "" : "  ·  \(s.cwd)"
+            let title = Self.menuSafeTitle(
+                s.title.isEmpty ? "<untitled>" : s.title,
+                maxLength: 48
+            )
+            let detail = s.cwd.isEmpty ? "" : "  ·  \(Self.abbreviatedMenuPath(s.cwd))"
             let dims = "  (\(s.cols)×\(s.rows))"
             let idHex = s.surfaceID.prefix(4).map { String(format: "%02x", $0) }.joined()
             let display = "\(title)\(detail)\(dims)  [\(idHex)]"
@@ -682,19 +742,35 @@ final class PeerClientCoordinator: NSObject {
         Task { @MainActor in
             let resp = await Self.runModalAsSheet(alert)
             guard resp == .alertFirstButtonReturn else { return }
-            let path = input.stringValue.trimmingCharacters(in: .whitespaces)
-            guard !path.isEmpty else { return }
+            let path = self.normalizedSocketPath(from: input.stringValue)
+            guard !path.isEmpty else {
+                self.showAlert(title: "Peer Socket Required", body: "Enter a peer socket path.")
+                return
+            }
+            guard self.validateLocalSocketPathForConnect(path) else { return }
             await self.run(socketPath: path)
         }
     }
 
     private func run(socketPath: String) async {
+        let flow = ConnectionFlow.console(socketPath)
+        guard beginConnectionFlow(flow) else { return }
+        defer { finishConnectionFlow(flow) }
+
+        let transport: UnixSocketTransport
         do {
-            let transport = try await UnixSocketTransport.connect(socketPath: socketPath)
+            transport = try await UnixSocketTransport.connect(socketPath: socketPath)
+        } catch {
+            showAlert(title: "Peer connection failed", body: String(describing: error))
+            return
+        }
+
+        do {
             let session = PeerSession(
                 read: { try await transport.read() },
                 write: { try await transport.write($0) }
             )
+            await transport.setReadTimeoutSeconds(Self.setupReadTimeoutSeconds)
             let info = try await session.handshake()
             let surfaces = try await session.listSurfaces()
             guard let chosen = surfaces.first(where: { $0.attachable }) ?? surfaces.first else {
@@ -709,6 +785,7 @@ final class PeerClientCoordinator: NSObject {
                 cols: 80,
                 rows: 24
             )
+            await transport.setReadTimeoutSeconds(nil)
 
             let controller = PeerConsoleWindowController(
                 hostSockPath: socketPath,
@@ -727,6 +804,7 @@ final class PeerClientCoordinator: NSObject {
             controller.show()
             self.postRelaysChanged()
         } catch {
+            await transport.close()
             showAlert(title: "Peer connection failed", body: String(describing: error))
         }
     }
@@ -735,9 +813,75 @@ final class PeerClientCoordinator: NSObject {
         let alert = NSAlert()
         alert.messageText = title
         alert.informativeText = body
-        alert.alertStyle = .informational
+        alert.alertStyle = .warning
         alert.addButton(withTitle: "OK")
         Self.presentAsSheetIfPossible(alert) { _ in }
+    }
+
+    private func normalizedSocketPath(from raw: String) -> String {
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return "" }
+        return ((trimmed as NSString).expandingTildeInPath as NSString).standardizingPath
+    }
+
+    private func validateLocalSocketPathForConnect(_ path: String) -> Bool {
+        if let message = localSocketPathValidationMessage(path) {
+            showAlert(title: "Peer Socket Unavailable", body: message)
+            return false
+        }
+        return true
+    }
+
+    private func localSocketPathValidationMessage(_ path: String) -> String? {
+        guard !path.isEmpty else {
+            return "Enter a peer socket path."
+        }
+        if path.utf8.count >= 104 {
+            return "Unix socket path is too long (\(path.utf8.count) bytes). Use a path under 104 bytes."
+        }
+
+        var isDirectory: ObjCBool = false
+        guard FileManager.default.fileExists(atPath: path, isDirectory: &isDirectory) else {
+            return "Socket path does not exist:\n\(path)"
+        }
+        if isDirectory.boolValue {
+            return "Socket path points to a directory:\n\(path)"
+        }
+        var st = stat()
+        guard stat(path, &st) == 0 else {
+            return "Socket path is not accessible:\n\(path)"
+        }
+        guard (st.st_mode & S_IFMT) == S_IFSOCK else {
+            return "Socket path is not a Unix socket:\n\(path)"
+        }
+        return nil
+    }
+
+    private static func menuSafeTitle(_ value: String, maxLength: Int) -> String {
+        let singleLine = value
+            .replacingOccurrences(of: "\n", with: " ")
+            .replacingOccurrences(of: "\r", with: " ")
+        guard singleLine.count > maxLength else { return singleLine }
+        guard maxLength > 3 else { return String(singleLine.prefix(maxLength)) }
+        return "..." + String(singleLine.suffix(maxLength - 3))
+    }
+
+    private static func abbreviatedMenuPath(_ path: String, maxLength: Int = 72) -> String {
+        let singleLine = path
+            .replacingOccurrences(of: "\n", with: " ")
+            .replacingOccurrences(of: "\r", with: " ")
+        guard singleLine.count > maxLength else { return singleLine }
+
+        let last = (singleLine as NSString).lastPathComponent
+        guard !last.isEmpty else {
+            return menuSafeTitle(singleLine, maxLength: maxLength)
+        }
+
+        let candidate = ".../\(last)"
+        if candidate.count <= maxLength {
+            return candidate
+        }
+        return menuSafeTitle(last, maxLength: maxLength)
     }
 
     /// Present `alert` as a window-attached sheet when possible so the
@@ -893,10 +1037,10 @@ final class PeerConsoleWindowController: NSWindowController, NSWindowDelegate {
                 do {
                     msg = try await self.session.receiveNextMessage()
                 } catch {
-                    await self.handleStreamError(error)
+                    self.handleStreamError(error)
                     return
                 }
-                await self.handle(msg)
+                self.handle(msg)
                 if case .goodbye = msg { return }
             }
         }

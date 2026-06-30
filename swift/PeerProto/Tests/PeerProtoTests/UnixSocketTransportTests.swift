@@ -1,4 +1,5 @@
 import XCTest
+import Darwin
 @testable import PeerProto
 
 /// End-to-end: spawn the real Rust `term-meshd` binary, connect to its
@@ -9,6 +10,60 @@ import XCTest
 /// `swift test` from failing on a fresh checkout where the Rust
 /// workspace hasn't been compiled yet.
 final class UnixSocketTransportTests: XCTestCase {
+    func testConnectTimeoutForMissingSocketPath() async throws {
+        let sockPath = "/tmp/tm-peer-swift-missing-\(UUID().uuidString.prefix(8)).sock"
+        try? FileManager.default.removeItem(atPath: sockPath)
+
+        do {
+            _ = try await UnixSocketTransport.connect(socketPath: sockPath, timeoutSeconds: 0.05)
+            XCTFail("missing socket path should time out")
+        } catch let error as UnixSocketTransportError {
+            guard case .connectTimedOut(let seconds) = error else {
+                XCTFail("expected connectTimedOut, got \(error)")
+                return
+            }
+            XCTAssertEqual(seconds, 0.05, accuracy: 0.001)
+        }
+    }
+
+    func testReadTimeoutClosesSilentSocket() async throws {
+        let fm = FileManager.default
+        let sockPath = "/tmp/tm-peer-swift-timeout-\(UUID().uuidString.prefix(8)).sock"
+        let listenerFd = try Self.makeUnixListener(socketPath: sockPath)
+        defer {
+            Darwin.close(listenerFd)
+            try? fm.removeItem(atPath: sockPath)
+        }
+
+        let acceptTask = Task.detached {
+            var addr = sockaddr_un()
+            var len = socklen_t(MemoryLayout<sockaddr_un>.size)
+            let clientFd = withUnsafeMutablePointer(to: &addr) { ptr -> Int32 in
+                ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { sockPtr in
+                    Darwin.accept(listenerFd, sockPtr, &len)
+                }
+            }
+            guard clientFd >= 0 else { return }
+            try? await Task.sleep(nanoseconds: 1_000_000_000)
+            Darwin.close(clientFd)
+        }
+        defer { acceptTask.cancel() }
+
+        let transport = try await UnixSocketTransport.connect(socketPath: sockPath, timeoutSeconds: 1)
+        await transport.setReadTimeoutSeconds(0.1)
+        do {
+            _ = try await transport.read()
+            XCTFail("silent socket read should time out")
+        } catch let error as UnixSocketTransportError {
+            guard case .readTimedOut(let seconds) = error else {
+                XCTFail("expected readTimedOut, got \(error)")
+                return
+            }
+            XCTAssertEqual(seconds, 0.1, accuracy: 0.001)
+        }
+        await transport.close()
+    }
+
     /// Locate repo root by walking up from this test's source file.
     /// swift/PeerProto/Tests/PeerProtoTests/UnixSocketTransportTests.swift
     /// → PeerProtoTests → Tests → PeerProto → swift → repo root.
@@ -24,6 +79,47 @@ final class UnixSocketTransportTests: XCTestCase {
         repoRoot
             .appendingPathComponent("daemon/target/debug/term-meshd")
             .path
+    }
+
+    private static func makeUnixListener(socketPath: String) throws -> Int32 {
+        unlink(socketPath)
+        let fd = socket(AF_UNIX, SOCK_STREAM, 0)
+        guard fd >= 0 else {
+            throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno))
+        }
+
+        var addr = sockaddr_un()
+        addr.sun_family = sa_family_t(AF_UNIX)
+        let maxPathLen = MemoryLayout.size(ofValue: addr.sun_path)
+        let pathBytes = Array(socketPath.utf8)
+        guard pathBytes.count < maxPathLen else {
+            Darwin.close(fd)
+            throw NSError(domain: NSPOSIXErrorDomain, code: Int(ENAMETOOLONG))
+        }
+        withUnsafeMutablePointer(to: &addr.sun_path) { tuplePtr in
+            tuplePtr.withMemoryRebound(to: CChar.self, capacity: maxPathLen) { cPtr in
+                for (i, byte) in pathBytes.enumerated() {
+                    cPtr[i] = CChar(bitPattern: byte)
+                }
+            }
+        }
+
+        let bindResult = withUnsafePointer(to: &addr) { ptr -> Int32 in
+            ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { sockPtr in
+                Darwin.bind(fd, sockPtr, socklen_t(MemoryLayout<sockaddr_un>.size))
+            }
+        }
+        guard bindResult == 0 else {
+            let err = errno
+            Darwin.close(fd)
+            throw NSError(domain: NSPOSIXErrorDomain, code: Int(err))
+        }
+        guard listen(fd, 1) == 0 else {
+            let err = errno
+            Darwin.close(fd)
+            throw NSError(domain: NSPOSIXErrorDomain, code: Int(err))
+        }
+        return fd
     }
 
     /// Spawn a daemon with a `cat` surface, run handshake + attach, send

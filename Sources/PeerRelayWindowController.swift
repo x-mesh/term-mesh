@@ -21,8 +21,10 @@ final class PeerRelayWindowController: NSWindowController, NSWindowDelegate {
     private let surfaceTitle: String
     private let connectedAt = Date()
     private let terminalSurface: TerminalSurface
+    private let container: NSView
     private var startTask: Task<Void, Never>?
     private var isClosing = false
+    private var disconnectOverlay: NSView?
 
     var onClose: (@MainActor () -> Void)?
 
@@ -77,6 +79,7 @@ final class PeerRelayWindowController: NSWindowController, NSWindowDelegate {
         hostedView.translatesAutoresizingMaskIntoConstraints = false
 
         let container = NSView(frame: NSRect(x: 0, y: 0, width: 800, height: 500))
+        self.container = container
         container.addSubview(hostedView)
         NSLayoutConstraint.activate([
             hostedView.topAnchor.constraint(equalTo: container.topAnchor),
@@ -89,11 +92,14 @@ final class PeerRelayWindowController: NSWindowController, NSWindowDelegate {
         super.init(window: window)
         window.delegate = self
 
-        // Relay errors/disconnects close the window.
+        // Relay errors/disconnects leave context visible and show an
+        // explicit close affordance instead of making the window vanish.
         session.onDisconnect = { [weak self] in
             guard let self, !self.isClosing else { return }
-            self.isClosing = true
-            self.window?.performClose(nil)
+            self.showDisconnectedOverlay(
+                title: "Connection lost",
+                detail: "The peer relay closed. Close this window and reconnect from Connect to Peer."
+            )
         }
     }
 
@@ -113,9 +119,70 @@ final class PeerRelayWindowController: NSWindowController, NSWindowDelegate {
                 NSLog("[peer-relay] relay connected; streaming")
             } catch {
                 NSLog("[peer-relay] start failed: %@", String(describing: error))
-                self.window?.performClose(nil)
+                self.showDisconnectedOverlay(
+                    title: "Relay failed",
+                    detail: String(describing: error)
+                )
             }
         }
+    }
+
+    private func showDisconnectedOverlay(title: String, detail: String) {
+        guard disconnectOverlay == nil else { return }
+
+        let overlay = NSVisualEffectView(frame: container.bounds)
+        overlay.translatesAutoresizingMaskIntoConstraints = false
+        overlay.blendingMode = .withinWindow
+        overlay.material = .hudWindow
+        overlay.state = .active
+
+        let stack = NSStackView()
+        stack.translatesAutoresizingMaskIntoConstraints = false
+        stack.orientation = .vertical
+        stack.alignment = .centerX
+        stack.spacing = 10
+
+        let titleField = NSTextField(labelWithString: title)
+        titleField.font = .boldSystemFont(ofSize: 14)
+        titleField.alignment = .center
+
+        let detailField = NSTextField(wrappingLabelWithString: detail)
+        detailField.textColor = .secondaryLabelColor
+        detailField.alignment = .center
+        detailField.maximumNumberOfLines = 3
+
+        let closeButton = NSButton(
+            title: "Close",
+            target: self,
+            action: #selector(closeFromDisconnectOverlay(_:))
+        )
+        closeButton.bezelStyle = .rounded
+        closeButton.setButtonType(.momentaryPushIn)
+
+        stack.addArrangedSubview(titleField)
+        stack.addArrangedSubview(detailField)
+        stack.addArrangedSubview(closeButton)
+
+        overlay.addSubview(stack)
+        container.addSubview(overlay)
+
+        NSLayoutConstraint.activate([
+            overlay.topAnchor.constraint(equalTo: container.topAnchor),
+            overlay.bottomAnchor.constraint(equalTo: container.bottomAnchor),
+            overlay.leadingAnchor.constraint(equalTo: container.leadingAnchor),
+            overlay.trailingAnchor.constraint(equalTo: container.trailingAnchor),
+            stack.centerXAnchor.constraint(equalTo: overlay.centerXAnchor),
+            stack.centerYAnchor.constraint(equalTo: overlay.centerYAnchor),
+            stack.widthAnchor.constraint(lessThanOrEqualToConstant: 420),
+            stack.leadingAnchor.constraint(greaterThanOrEqualTo: overlay.leadingAnchor, constant: 24),
+            stack.trailingAnchor.constraint(lessThanOrEqualTo: overlay.trailingAnchor, constant: -24),
+        ])
+
+        disconnectOverlay = overlay
+    }
+
+    @objc private func closeFromDisconnectOverlay(_ sender: Any?) {
+        window?.performClose(sender)
     }
 
     // ── NSWindowDelegate ─────────────────────────────────────────────
