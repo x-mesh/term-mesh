@@ -119,7 +119,10 @@ private func writeFull(fd: Int32, data: Data) throws {
         let n = data.withUnsafeBytes { ptr in
             Darwin.write(fd, ptr.baseAddress! + sent, data.count - sent)
         }
-        if n <= 0 { throw RelayError.ioError("write failed: errno \(errno)") }
+        if n <= 0 {
+            if n < 0 && errno == EINTR { continue }  // signal-interrupted; retry
+            throw RelayError.ioError("write failed: errno \(errno)")
+        }
         sent += n
     }
 }
@@ -131,7 +134,10 @@ private func readFull(fd: Int32, into data: inout Data) throws {
         let n = data.withUnsafeMutableBytes { ptr -> Int in
             Darwin.read(fd, ptr.baseAddress! + received, total - received)
         }
-        if n <= 0 { throw RelayError.ioError("read EOF or error: errno \(errno)") }
+        if n <= 0 {
+            if n < 0 && errno == EINTR { continue }  // signal-interrupted; retry (EOF n==0 stays fatal)
+            throw RelayError.ioError("read EOF or error: errno \(errno)")
+        }
         received += n
     }
 }
@@ -819,6 +825,9 @@ final class PeerRelaySession {
                         }
                     case .goodbye:
                         try? await writer.enqueue(type: kTypeGoodbye, payload: Data("host-goodbye".utf8))
+                        // Tear down now so the sibling relayToHost task unblocks
+                        // immediately instead of hanging until the heartbeat (~30s).
+                        disconnect()
                         return
                     default:
                         break
@@ -846,6 +855,9 @@ final class PeerRelaySession {
                         case kTypeGoodbye:
                             await resizeCoalescer.flushNow()
                             try? await session.sendGoodbye(reason: "relay disconnected")
+                            // Tear down now so the sibling hostToRelay task unblocks
+                            // immediately instead of hanging until the heartbeat (~30s).
+                            disconnect()
                             return
                         default:
                             break
