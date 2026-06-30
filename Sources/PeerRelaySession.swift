@@ -51,6 +51,9 @@ struct PeerRelayConnection: Sendable {
 final class RelaySocket: @unchecked Sendable {
     let fd: Int32
     private let writeLock = NSLock()
+    // Guards `isClosed` only; never held during a blocking write, so close()
+    // can flip the flag without waiting on an in-flight writeFrame.
+    private let closeStateLock = NSLock()
     private var isClosed = false
 
     init(fd: Int32) {
@@ -93,11 +96,19 @@ final class RelaySocket: @unchecked Sendable {
     }
 
     func close() {
+        // Flip the closed flag under a lock that is NEVER held during a
+        // blocking write, so a stalled peer cannot make close() (and its
+        // MainActor caller) block. shutdown() then wakes any in-flight
+        // writeFrame holding writeLock with an error, so the writeLock
+        // acquisition below cannot hang. shutdown/close run exactly once.
+        closeStateLock.lock()
+        let alreadyClosed = isClosed
+        isClosed = true
+        closeStateLock.unlock()
+        guard !alreadyClosed else { return }
+        Darwin.shutdown(fd, SHUT_RDWR)
         writeLock.lock()
         defer { writeLock.unlock() }
-        guard !isClosed else { return }
-        isClosed = true
-        Darwin.shutdown(fd, SHUT_RDWR)
         Darwin.close(fd)
     }
 }
@@ -369,6 +380,7 @@ final class PeerRelaySession {
     private var session: PeerSession?
     private var transport: UnixSocketTransport?
     private var pumpTask: Task<Void, Never>?
+    private var isTorndown = false
 
     var onError: (@MainActor (Error) -> Void)?
     var onDisconnect: (@MainActor () -> Void)?
@@ -787,20 +799,23 @@ final class PeerRelaySession {
         pumpTask = Task.detached(priority: .userInitiated) {
             // Host → relay: receive PtyData frames, write to relay socket.
             let hostToRelay = Task.detached(priority: .userInitiated) {
-                while !Task.isCancelled {
+                // Labeled so a relay-write failure breaks the pump loop, not
+                // just the switch — a bare `break` inside the switch would keep
+                // looping and silently drop frames to a dead writer.
+                pumpLoop: while !Task.isCancelled {
                     let msg: PeerIncomingMessage
                     do {
                         msg = try await session.receiveNextMessage()
                     } catch {
                         try? await writer.enqueue(type: kTypeGoodbye, payload: Data("host-error".utf8))
-                        break
+                        break pumpLoop
                     }
                     switch msg {
                     case .ptyData(_, _, let data):
                         do {
                             try await writer.enqueue(type: kTypePtyData, payload: data)
                         } catch {
-                            break
+                            break pumpLoop
                         }
                     case .goodbye:
                         try? await writer.enqueue(type: kTypeGoodbye, payload: Data("host-goodbye".utf8))
@@ -853,6 +868,11 @@ final class PeerRelaySession {
     }
 
     private func disconnect() {
+        // Multiple teardown paths (writer onFailure, hostToRelay end,
+        // relayToHost end) all funnel here; without this guard onDisconnect?()
+        // fires 2-3 times per session.
+        guard !isTorndown else { return }
+        isTorndown = true
         pumpTask?.cancel()
         pumpTask = nil
         relaySocket?.close()
