@@ -12,6 +12,7 @@
 //        ↑ SIGWINCH (relay) → type=0x03 → app → PeerSession Resize
 
 import Foundation
+import Bonsplit
 import Darwin
 import PeerProto
 
@@ -682,6 +683,15 @@ final class PeerRelaySession {
     func start() async throws {
         let relay = try await acceptRelay()
         self.relaySocket = relay
+        // The listener has done its single job (one relay connection, no
+        // reconnect). Release the fd + socket file now instead of holding them
+        // until deinit. The accept poll has already resolved, so nothing else
+        // touches listenerFd — closing it here cannot race a concurrent accept.
+        if listenerFd >= 0 {
+            Darwin.close(listenerFd)
+            listenerFd = -1
+        }
+        try? FileManager.default.removeItem(atPath: relaySockPath)
         // App-level heartbeat: detect a remote daemon that has stopped
         // responding while its TCP socket is still considered alive
         // (laptop sleep on the remote, deadlocked daemon, etc.). When
@@ -796,7 +806,14 @@ final class PeerRelaySession {
                 self?.disconnect()
             }
         }
-        let writer = RelayFrameWriter(relay: relay) { _ in
+        let writer = RelayFrameWriter(relay: relay) { [weak self] error in
+            // Surface the failure instead of letting every relay I/O error look
+            // like a clean disconnect: log it (DEBUG) and fire onError so a
+            // consumer can distinguish a crash from a goodbye.
+            #if DEBUG
+            dlog("peer.relay.writer.failure error=\(error)")
+            #endif
+            Task { @MainActor in self?.onError?(error) }
             disconnect()
         }
         let reader = RelayFrameReader(relay: relay)
@@ -843,7 +860,15 @@ final class PeerRelaySession {
                         if Task.isCancelled { break }
                         switch frame.type {
                         case kTypeKeyInput:
-                            try? await session.sendInput(surfaceID: surfaceID, keys: frame.payload)
+                            do {
+                                try await session.sendInput(surfaceID: surfaceID, keys: frame.payload)
+                            } catch {
+                                // Don't tear down on a single dropped keystroke, but
+                                // make the loss visible instead of silently swallowing.
+                                #if DEBUG
+                                dlog("peer.relay.sendInput.failed error=\(error)")
+                                #endif
+                            }
                         case kTypeResize where frame.payload.count >= 4:
                             let cols = UInt32(UInt16(littleEndian: frame.payload.withUnsafeBytes {
                                 $0.loadUnaligned(fromByteOffset: 0, as: UInt16.self)
