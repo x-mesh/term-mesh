@@ -1516,6 +1516,24 @@ private func sendPeerCtrlLetterKey(_ surface: ghostty_surface_t, keycode: UInt32
 /// the host's current screen instead of a blank canvas.
 @MainActor
 private func readPaneSnapshot(_ surface: ghostty_surface_t) -> Data? {
+    // Replay terminal mode state the viewer missed. Apps that enabled
+    // mouse reporting before this attach (Claude Code, vim, htop) sent
+    // their DECSET sequences long before the PTY tap existed, so the
+    // viewer surface never sees them: mouse_captured stays false on the
+    // viewer, scroll events scroll the (empty) local scrollback, and
+    // nothing reaches the host pty. Prepending the enable sequences puts
+    // the viewer in captured mode so wheel/click events are encoded as
+    // SGR mouse reports and flow to the host via relay stdin → Input.
+    // Best-effort approximation: the C API only exposes captured yes/no,
+    // not the exact tracking mode, so use button-event tracking (1002)
+    // + SGR encoding (1006). A later mode change on the host streams
+    // through the tap normally, so replay is only needed here.
+    var snapshot = Data()
+    if ghostty_surface_mouse_captured(surface) {
+        snapshot.append(contentsOf: Array("\u{1b}[?1002h".utf8))
+        snapshot.append(contentsOf: Array("\u{1b}[?1006h".utf8))
+    }
+
     let topLeft = ghostty_point_s(
         tag: GHOSTTY_POINT_VIEWPORT,
         coord: GHOSTTY_POINT_COORD_TOP_LEFT,
@@ -1532,9 +1550,13 @@ private func readPaneSnapshot(_ surface: ghostty_surface_t) -> Data? {
         rectangle: true
     )
     var out = ghostty_text_s()
-    guard ghostty_surface_read_text(surface, selection, &out) else { return nil }
+    guard ghostty_surface_read_text(surface, selection, &out) else {
+        return snapshot.isEmpty ? nil : snapshot
+    }
     defer { ghostty_surface_free_text(surface, &out) }
-    guard let ptr = out.text, out.text_len > 0 else { return nil }
+    guard let ptr = out.text, out.text_len > 0 else {
+        return snapshot.isEmpty ? nil : snapshot
+    }
 
     let raw = Data(bytes: ptr, count: Int(out.text_len))
     // Convert bare LFs to CR+LF so each line lands on column 0 in the
@@ -1550,7 +1572,6 @@ private func readPaneSnapshot(_ surface: ghostty_surface_t) -> Data? {
         prev = b
     }
 
-    var snapshot = Data()
     snapshot.append(contentsOf: [0x1b, 0x5b, 0x32, 0x4a]) // ESC [ 2 J — clear screen
     snapshot.append(contentsOf: [0x1b, 0x5b, 0x48])       // ESC [ H   — cursor home
     snapshot.append(body)
