@@ -1,7 +1,12 @@
 # 상세설계 — 세션·팀 영속화와 Restore Fleet
 
 작성일: 2026-07-07
-상태: Design Draft (구현 전)
+상태: P1 구현됨 (Layer 1 + 2) — Layer 3(Restore UX)은 미착수
+
+구현 상태 (2026-07-07):
+- 데몬: schema v2(`live`/`last_snapshot_at`/`layout_workspace_title`/`session_id_captured_at`), `team.snapshot_pane`, `headless.list_live_pane`, `resume_pane`의 live 디렉토리 지원, stale live 스냅샷 GC 강등 — **구현 + 단위테스트 통과** (`cargo test -p term-meshd headless`).
+- Swift: `syncTeamStateToDaemon` 훅 기반 디바운스 live 스냅샷(직렬 persist 큐 + retire/revive 게이트), `TeamTask: Codable`, `TeamDataStore` board.json 영속화(`~/.term-mesh/teams/<uuid>/board.json`) + pane-resume 시 `loadBoard`(in_progress→assigned 정규화) — **구현됨, macOS 빌드 검증 필요** (이 작업은 Linux 환경에서 수행되어 xcodebuild 미실행).
+- Layer 3 구현 시 주의: resume 직후 앱이 스냅샷을 다시 쓰기 전에 데몬이 재시작하면 같은 uuid가 archived(startup_fixup의 재-아카이브)와 live 양쪽에 존재할 수 있다. 복원 후보 UI는 **uuid 기준으로 dedupe**하고 live 스냅샷을 우선해야 한다.
 상위 문서: `docs/strategy-differentiation-roadmap.md` §B-1
 관련 코드: `Sources/TabManager.swift`, `Sources/TeamOrchestrator.swift`, `Sources/TeamDataStore.swift`, `daemon/term-meshd/src/headless/meta.rs`, `daemon/term-mesh-cli/src/tm_agent.rs`
 

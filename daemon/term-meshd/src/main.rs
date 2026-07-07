@@ -121,6 +121,12 @@ async fn main() -> anyhow::Result<()> {
     // not inside any RPC handler). See contract §3.3 and §7.
     tokio::task::spawn_blocking(|| {
         headless::meta::startup_fixup();
+        let demoted = headless::meta::sweep_stale_live_snapshots();
+        if demoted > 0 {
+            tracing::info!(
+                "headless gc: demoted {demoted} stale live snapshot(s) to archived on startup"
+            );
+        }
         let removed = headless::meta::gc_sweep();
         if removed > 0 {
             tracing::info!("headless gc: removed {removed} archived team(s) on startup");
@@ -142,6 +148,7 @@ async fn main() -> anyhow::Result<()> {
         loop {
             interval.tick().await;
             let _ = tokio::task::spawn_blocking(|| {
+                headless::meta::sweep_stale_live_snapshots();
                 headless::meta::gc_sweep();
                 headless::meta::sweep_zombie_pane_archives();
             })
