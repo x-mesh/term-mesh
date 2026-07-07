@@ -10109,7 +10109,11 @@ fn handle_xk_reply(event: &Value, state: &mut XkBridgeState) -> Result<(), Strin
                 "correlation_id": parsed.corr,
                 "timestamp": ts,
             });
-            let metrics_path = root.join("metrics").join("sessions.jsonl");
+            // Path matches x-build's cost engine (ROOT = .xm/build).
+            let metrics_path = root
+                .join("build")
+                .join("metrics")
+                .join("sessions.jsonl");
             if let Err(e) = xk_append_jsonl(&metrics_path, &metric) {
                 eprintln!("[xk-bridge] metrics: {e}");
             }
