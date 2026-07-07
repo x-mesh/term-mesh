@@ -9992,6 +9992,14 @@ struct XkBridgeState {
     /// (plugin/project/ref, status) pairs already applied — idempotency guard.
     seen: std::collections::HashSet<(String, String)>,
     xm_root: Option<PathBuf>,
+    /// T2 xk_run mirroring: panel run id → mirrored board task id.
+    panel_tasks: std::collections::HashMap<String, String>,
+    /// (run, board status) transitions already applied — duplicate/out-of-order guard.
+    panel_applied: std::collections::HashSet<(String, String)>,
+    /// Swift app socket for `team.task.*` board mirroring; None → mirroring disabled.
+    app_sock: Option<PathBuf>,
+    /// Team whose task board mirrors panel runs.
+    team: String,
 }
 
 fn run_xk_bridge(sock: &PathBuf, timeout_secs: u32, leader_session: Option<&str>) {
@@ -10004,15 +10012,28 @@ fn run_xk_bridge(sock: &PathBuf, timeout_secs: u32, leader_session: Option<&str>
             env::current_dir().map(|p| p.display().to_string()).unwrap_or_default()
         ),
     }
+    // T2: xk_run (x-panel run telemetry, XK-EVENTS-v1) is mirrored onto the team
+    // task board so a leader `tm-agent wait`s on a panel instead of polling files.
+    // Board mutations go over the APP socket (team.task.* is Swift-served) — its
+    // absence disables mirroring only; .xm writeback keeps working.
+    let app_sock = detect_socket();
+    if app_sock.is_none() {
+        eprintln!("[xk-bridge] warning: no app socket — xk_run task-board mirroring disabled");
+    }
+    let team = resolve_team_name(None);
     let mut state = XkBridgeState {
         handled: 0,
         seen: std::collections::HashSet::new(),
         xm_root,
+        panel_tasks: std::collections::HashMap::new(),
+        panel_applied: std::collections::HashSet::new(),
+        app_sock,
+        team,
     };
     stream_events(
         sock,
         timeout_secs,
-        &["reply", "task_status"],
+        &["reply", "task_status", "xk_run"],
         leader_session,
         |event| {
             if let Err(e) = handle_xk_event(event, &mut state) {
@@ -10027,6 +10048,7 @@ fn handle_xk_event(event: Value, state: &mut XkBridgeState) -> Result<(), String
     match event.get("kind").and_then(Value::as_str) {
         Some("reply") => handle_xk_reply(&event, state),
         Some("task_status") => handle_xk_task_status(&event, state),
+        Some("xk_run") => handle_xk_run(&event, state),
         _ => Ok(()),
     }
 }
@@ -10168,6 +10190,104 @@ fn handle_xk_task_status(event: &Value, state: &mut XkBridgeState) -> Result<(),
     });
     xk_append_jsonl(&trace_path, &entry)?;
     state.handled += 1;
+    Ok(())
+}
+
+/// T2 (docs/xk-panel-phase2.md): mirror x-panel run lifecycle (`xk_run`,
+/// XK-EVENTS-v1) onto the team task board — one task per run, transitioning
+/// pending → in_progress → completed/blocked — so a leader can `tm-agent wait`
+/// on a panel instead of polling `.xm/…/status.json`.
+///
+/// Rules: run-level events only (per-model progress stays off the board);
+/// idempotent per (run, status); never creates a task for an already-terminal
+/// run; unknown contract versions are skipped, not errors.
+fn handle_xk_run(event: &Value, state: &mut XkBridgeState) -> Result<(), String> {
+    if event.get("v").and_then(Value::as_u64).unwrap_or(1) != 1 {
+        return Ok(()); // unknown major version — ignore (XK-EVENTS-v1 rule 5)
+    }
+    let run = event.get("run").and_then(Value::as_str).unwrap_or("");
+    if run.is_empty() {
+        return Ok(());
+    }
+    if !event
+        .get("model")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .is_empty()
+    {
+        return Ok(()); // per-model progress event — board tracks the run, not models
+    }
+    let Some(app_sock) = state.app_sock.clone() else {
+        return Ok(()); // no app → no board; .xm writeback continues elsewhere
+    };
+    let phase = event.get("phase").and_then(Value::as_str).unwrap_or("");
+    let terminal = matches!(phase, "done" | "failed");
+
+    let task_id = match state.panel_tasks.get(run) {
+        Some(id) => id.clone(),
+        None if terminal => return Ok(()), // late/replayed terminal event — never create for it
+        None => {
+            let run_kind = event
+                .get("run_kind")
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty())
+                .unwrap_or("run");
+            let title_txt = event
+                .get("title")
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty())
+                .unwrap_or(run);
+            let ns = if run_kind == "cross" { "cross" } else { "panel" };
+            let created = rpc_call(
+                &app_sock,
+                "team.task.create",
+                json!({
+                    "team_name": state.team,
+                    "title": format!("panel:{run_kind} {title_txt}"),
+                    "description": format!(
+                        "x-panel {run_kind} run {run} — mirrored by xk-bridge; live detail: .xm/{ns}/{run}/status.json"
+                    ),
+                }),
+            )?;
+            let id = created["result"]["id"].as_str().unwrap_or("").to_string();
+            if !created["ok"].as_bool().unwrap_or(false) || id.is_empty() {
+                return Err(format!("xk_run task.create failed: {}", pretty(&created)));
+            }
+            eprintln!("[xk-bridge] panel run {run} → board task {id}");
+            state.handled += 1;
+            state.panel_tasks.insert(run.to_string(), id.clone());
+            id
+        }
+    };
+
+    let status = match phase {
+        "done" => "completed",
+        "failed" => "blocked",
+        _ => "in_progress",
+    };
+    if !state
+        .panel_applied
+        .insert((run.to_string(), status.to_string()))
+    {
+        return Ok(()); // duplicate / out-of-order — the board already has this state
+    }
+    let mut params = json!({
+        "team_name": state.team,
+        "task_id": task_id,
+        "status": status,
+    });
+    if status == "completed" {
+        params["result"] = json!(format!("x-panel run {run} finished"));
+    } else if status == "blocked" {
+        params["result"] = json!(format!("x-panel run {run} failed"));
+        params["blocked_reason"] = json!(format!("x-panel reported phase=failed for run {run}"));
+    }
+    let updated = rpc_call(&app_sock, "team.task.update", params)?;
+    if !updated["ok"].as_bool().unwrap_or(false) {
+        return Err(format!("xk_run task.update failed: {}", pretty(&updated)));
+    }
+    state.handled += 1;
+    eprintln!("[xk-bridge] panel run {run}: board task {task_id} → {status}");
     Ok(())
 }
 
@@ -10430,11 +10550,7 @@ mod xk_bridge_tests {
 
     #[test]
     fn reply_event_dedupes_same_ref_and_status() {
-        let mut state = XkBridgeState {
-            handled: 0,
-            seen: std::collections::HashSet::new(),
-            xm_root: None, // no .xm — exercises the pure dedupe/parse path
-        };
+        let mut state = xk_state(None); // no .xm/app — exercises the pure dedupe/parse path
         let ev = json!({
             "kind": "reply",
             "team": "my-team",
@@ -10461,11 +10577,7 @@ mod xk_bridge_tests {
 
     #[test]
     fn xk_team_task_status_events_are_ignored() {
-        let mut state = XkBridgeState {
-            handled: 0,
-            seen: std::collections::HashSet::new(),
-            xm_root: None,
-        };
+        let mut state = xk_state(None);
         let ev = json!({
             "kind": "task_status",
             "team": "xk:my-project",
@@ -10487,6 +10599,135 @@ mod xk_bridge_tests {
         assert_eq!(lines.len(), 2);
         assert_eq!(lines[0], r#"{"a":1}"#);
         fs::remove_dir_all(&dir).ok();
+    }
+
+    // ── T2: xk_run → task board mirroring ──
+
+    fn xk_state(app_sock: Option<PathBuf>) -> XkBridgeState {
+        XkBridgeState {
+            handled: 0,
+            seen: std::collections::HashSet::new(),
+            xm_root: None,
+            panel_tasks: std::collections::HashMap::new(),
+            panel_applied: std::collections::HashSet::new(),
+            app_sock,
+            team: "test-team".to_string(),
+        }
+    }
+
+    fn xk_run_event(phase: &str, model: &str) -> Value {
+        json!({
+            "kind": "xk_run", "v": 1, "source": "x-panel",
+            "run": "20260707-r1", "run_kind": "review",
+            "phase": phase, "model": model, "state": "running",
+            "elapsed_ms": 10, "title": "diff HEAD~1", "ts_ms": 1,
+        })
+    }
+
+    /// Fake app socket serving team.task.create/update; records requests.
+    fn fake_app_socket() -> (PathBuf, std::sync::Arc<std::sync::Mutex<Vec<Value>>>) {
+        let dir = std::env::temp_dir().join(format!(
+            "xk-run-app-{}-{}",
+            process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("app.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        let calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::<Value>::new()));
+        let calls2 = calls.clone();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(stream) = stream else { break };
+                let calls3 = calls2.clone();
+                std::thread::spawn(move || {
+                    let mut reader = BufReader::new(stream.try_clone().unwrap());
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).is_ok() && !line.trim().is_empty() {
+                        let req: Value = serde_json::from_str(&line).unwrap_or(json!({}));
+                        let method = req["method"].as_str().unwrap_or("").to_string();
+                        calls3.lock().unwrap().push(req);
+                        let result = if method == "team.task.create" {
+                            json!({"ok": true, "result": {"id": "TASK-1"}})
+                        } else {
+                            json!({"ok": true, "result": {}})
+                        };
+                        let mut w = stream;
+                        let _ = w.write_all(format!("{result}\n").as_bytes());
+                    }
+                });
+            }
+        });
+        (path, calls)
+    }
+
+    #[test]
+    fn xk_run_mirrors_lifecycle_onto_board_idempotently() {
+        let (sock, calls) = fake_app_socket();
+        let mut state = xk_state(Some(sock));
+        // starting → create + in_progress
+        handle_xk_run(&xk_run_event("starting", ""), &mut state).expect("starting");
+        // duplicate / same-status phases coalesce (no extra board writes)
+        handle_xk_run(&xk_run_event("round1", ""), &mut state).expect("round1");
+        handle_xk_run(&xk_run_event("round2", ""), &mut state).expect("round2");
+        // per-model events never touch the board
+        handle_xk_run(&xk_run_event("round2", "codex"), &mut state).expect("model event");
+        // done → completed
+        handle_xk_run(&xk_run_event("done", ""), &mut state).expect("done");
+        let calls = calls.lock().unwrap();
+        let methods: Vec<&str> = calls.iter().map(|c| c["method"].as_str().unwrap()).collect();
+        assert_eq!(
+            methods,
+            vec!["team.task.create", "team.task.update", "team.task.update"],
+            "create + in_progress + completed, nothing else"
+        );
+        assert!(calls[0]["params"]["title"]
+            .as_str()
+            .unwrap()
+            .starts_with("panel:review "));
+        assert_eq!(calls[1]["params"]["status"], "in_progress");
+        assert_eq!(calls[2]["params"]["status"], "completed");
+        assert_eq!(calls[2]["params"]["task_id"], "TASK-1");
+    }
+
+    #[test]
+    fn xk_run_failed_maps_to_blocked_with_reason() {
+        let (sock, calls) = fake_app_socket();
+        let mut state = xk_state(Some(sock));
+        handle_xk_run(&xk_run_event("starting", ""), &mut state).expect("starting");
+        handle_xk_run(&xk_run_event("failed", ""), &mut state).expect("failed");
+        let calls = calls.lock().unwrap();
+        let last = calls.last().unwrap();
+        assert_eq!(last["params"]["status"], "blocked");
+        assert!(last["params"]["blocked_reason"]
+            .as_str()
+            .unwrap()
+            .contains("failed"));
+    }
+
+    #[test]
+    fn xk_run_guards_skip_without_touching_the_board() {
+        // no app socket → no-op, no error
+        let mut no_app = xk_state(None);
+        handle_xk_run(&xk_run_event("starting", ""), &mut no_app).expect("no app");
+        assert_eq!(no_app.handled, 0);
+
+        let (sock, calls) = fake_app_socket();
+        let mut state = xk_state(Some(sock));
+        // unknown contract version → skipped
+        let mut v2 = xk_run_event("starting", "");
+        v2["v"] = json!(2);
+        handle_xk_run(&v2, &mut state).expect("v2");
+        // terminal event for a run the bridge never saw → no task created
+        handle_xk_run(&xk_run_event("done", ""), &mut state).expect("late done");
+        // empty run id → skipped
+        let mut no_run = xk_run_event("starting", "");
+        no_run["run"] = json!("");
+        handle_xk_run(&no_run, &mut state).expect("no run");
+        assert!(calls.lock().unwrap().is_empty(), "board untouched");
     }
 }
 

@@ -1,6 +1,13 @@
 # x-kit (xm) Panel Integration — Phase 2, term-mesh side
 
-Status: **plan** (no code yet). The integration contract source of truth lives in the xm
+Status: **T1 done** (daemon `xk_run` kind + opt-in filter + caps, unit-tested) ·
+**T2 done** (xk-bridge mirrors run lifecycle onto the task board via `team.task.*`
+app-socket RPCs — `handle_xk_run` in `daemon/term-mesh-cli/src/tm_agent.rs`; Phase-1
+branch merged into this phase2 branch to provide the bridge) · **T3 done** (this doc +
+CLAUDE.md note) · **T4 authored** (`tests_v2/test_daemon_xk_run_events.py` — run on the
+UTM VM; SKIPs cleanly when no daemon socket exists).
+
+Original plan below. The integration contract source of truth lives in the xm
 repo: `xm/docs/x-panel-term-mesh-phase2.md` (event schema `XK-EVENTS-v1`, requirements,
 cross-repo task table). This doc covers only what changes **in this repo**.
 

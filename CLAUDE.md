@@ -308,6 +308,11 @@ Execution Backend 섹션이 term-mesh 감지 시 자동 로드). 로컬 요약: 
 reply는 Standard Reply Header + `XK_TASK`/`XK_CORR` 라인으로 종결해야 하며(xk-bridge
 writeback 계약), 이 섹션과 원본이 다르면 원본이 우선한다.
 
+Panel runs on the task board: `tm-agent xk-bridge`가 켜져 있으면 x-panel review/cross 런이
+`xk_run` 이벤트(XK-EVENTS-v1)로 팀 태스크보드에 자동 미러링된다(run당 task 1개,
+pending→in_progress→completed/blocked). leader는 `.xm/…/status.json` 폴링 대신
+`tm-agent wait`/`task list`로 패널 완료를 기다리면 된다. 상세: `docs/xk-panel-phase2.md`.
+
 
 ### Quick CLI reference
 
