@@ -296,7 +296,7 @@ escape hatch.
 
 ### XM skill agent fan-out routing
 
-**단일 원본**: x-kit 저장소 `docs/term-mesh-integration.md` (계약) + xm 플러그인 내장
+**단일 원본**: xm 저장소(x-mesh/xm) `docs/term-mesh-integration.md` (계약) + xm 플러그인 내장
 `x-agent/skills/agent/references/term-mesh-backend.md` (실행 시점 규칙 — xm 스킬의
 Execution Backend 섹션이 term-mesh 감지 시 자동 로드). 로컬 요약: `docs/x-kit-integration.md`.
 

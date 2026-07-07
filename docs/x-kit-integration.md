@@ -1,11 +1,12 @@
 # x-kit (xm plugins) integration
 
-term-mesh integrates with the [x-kit / xm plugin marketplace](https://github.com/x-mesh/x-kit)
-(structured multi-agent orchestration for Claude Code). The **single source of truth for the
-integration contract** — backend detection, fan-out substitution rules, the `XK_TASK`/`XK_CORR`
-reply-header contract, and the component map — lives in the x-kit repo:
+term-mesh integrates with the [xm plugin marketplace](https://github.com/x-mesh/xm)
+(structured multi-agent orchestration for Claude Code; formerly `x-mesh/x-kit`). The
+**single source of truth for the integration contract** — backend detection, fan-out
+substitution rules, the `XK_TASK`/`XK_CORR` reply-header contract, and the component map —
+lives in the xm repo:
 
-> `x-kit/docs/term-mesh-integration.md`
+> `xm/docs/term-mesh-integration.md`
 
 The runtime rules agents actually need at execution time ship inside the plugins themselves
 (`x-agent/skills/agent/references/term-mesh-backend.md`), so any session with the xm plugins
