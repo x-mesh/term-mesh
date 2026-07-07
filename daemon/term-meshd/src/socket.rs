@@ -2520,6 +2520,48 @@ async fn dispatch(req: &Request, ctx: &Context) -> Response {
                 Err(e) => Err(format!("invalid params: {e}")),
             }
         }
+        "team.snapshot_pane" => {
+            // Restore Fleet Layer 1: debounced live snapshot of a running
+            // pane-mode team. Overwrites `<team_uuid>/` in place with
+            // `live: true`; never renames to archived. Crash recovery and
+            // `headless.list_live_pane` read what this writes.
+            match serde_json::from_value::<crate::headless::SnapshotPaneParams>(req.params.clone())
+            {
+                Ok(p) => {
+                    let mut mgr = ctx.headless.lock().await;
+                    mgr.snapshot_pane_team(p)
+                        .map(|r| serde_json::to_value(r).unwrap())
+                }
+                Err(e) => Err(format!("invalid params: {e}")),
+            }
+        }
+        "headless.list_live_pane" => {
+            // Restore Fleet: live pane snapshots that may be restorable after
+            // a crash. The Swift caller filters out teams it currently has
+            // live in memory.
+            #[derive(Deserialize)]
+            struct P {
+                #[serde(default)]
+                app_socket_path: Option<String>,
+                #[serde(default = "default_live_limit")]
+                limit: usize,
+            }
+            fn default_live_limit() -> usize {
+                50
+            }
+            let params: P = serde_json::from_value(req.params.clone()).unwrap_or(P {
+                app_socket_path: None,
+                limit: 50,
+            });
+            let limit = params.limit.min(200);
+            let mgr = ctx.headless.lock().await;
+            let res = mgr.list_live_pane(params.app_socket_path.as_deref(), limit);
+            if let Some(err) = res.fatal_error.as_ref() {
+                Err(err.clone())
+            } else {
+                Ok(serde_json::to_value(res).unwrap())
+            }
+        }
         "team.resume_pane" => {
             // pane-mode resume: returns metadata + session IDs so the Swift app
             // can recreate the workspace and spawn each CLI with `--resume <sid>`.

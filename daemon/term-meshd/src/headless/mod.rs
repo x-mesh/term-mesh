@@ -1107,6 +1107,7 @@ impl HeadlessManager {
                 extra_env: spec.extra_env.clone(),
                 auto_recycle_every: spec.auto_recycle_every,
                 completed_task_count: 0,
+                session_id_captured_at: None,
             };
 
             // Persist instructions (raw bytes) + agent.json before spawn so a
@@ -1159,6 +1160,9 @@ impl HeadlessManager {
                 .unwrap_or_else(|| env!("CARGO_PKG_VERSION").into()),
             app_socket_path_at_create: params.app_socket_path.clone(),
             runbook_digest_hash: params.runbook_digest_hash.clone(),
+            live: false,
+            last_snapshot_at: None,
+            layout_workspace_title: None,
         };
         if let Err(e) = meta::write_team_meta(&team_meta) {
             // Cleanup written metadata.
@@ -1430,6 +1434,9 @@ impl HeadlessManager {
                 .unwrap_or_else(|| "unknown".to_string()),
             app_socket_path_at_create: None,
             runbook_digest_hash: None,
+            live: false,
+            last_snapshot_at: None,
+            layout_workspace_title: None,
         };
 
         meta::create_dir_secure(&meta::team_dir(&team_uuid))
@@ -1469,6 +1476,7 @@ impl HeadlessManager {
                 extra_env: std::collections::HashMap::new(),
                 auto_recycle_every: None,
                 completed_task_count: 0,
+                session_id_captured_at: None,
             };
             meta::write_agent_meta(&agent_meta)?;
         }
@@ -1488,6 +1496,186 @@ impl HeadlessManager {
         // `_in_flight` drops here, removing the slot.
     }
 
+    /// Restore Fleet Layer 1 — live snapshot of a running pane-mode team.
+    ///
+    /// Same payload family as `archive_pane_team`, but written continuously
+    /// while the team is alive (debounced on the Swift side): the dir stays at
+    /// `<team_uuid>/` with `live: true` and is overwritten in place, never
+    /// renamed to `.archived.<ts>`. Crash recovery reads the last snapshot;
+    /// destroy still goes through `archive_pane_team`, which clears the live
+    /// dir before writing the final archive.
+    ///
+    /// Write order matters for crash consistency: agent metas + instructions
+    /// first, `team.json` last (it names the authoritative agent list), then
+    /// best-effort pruning of stray per-agent files from detached agents. A
+    /// crash mid-write leaves either the previous consistent `team.json` or
+    /// the new one; stray agent files are ignored by all readers because they
+    /// iterate `team.json:agents[]`.
+    pub fn snapshot_pane_team(
+        &mut self,
+        params: SnapshotPaneParams,
+    ) -> Result<SnapshotPaneResult, String> {
+        // Unlike archive's D1 grace mode, snapshot is a new API: hard-reject a
+        // missing/invalid uuid.
+        let team_uuid = meta::parse_uuid(&params.team_uuid)?;
+        for a in &params.agents {
+            meta::validate_agent_name(&a.name)?;
+        }
+
+        // Share the archive in-flight set so a snapshot can't interleave with
+        // a concurrent archive/destroy of the same uuid.
+        let _in_flight = {
+            let mut guard = self
+                .archive_in_flight
+                .lock()
+                .map_err(|e| format!("archive_in_flight lock poisoned: {e}"))?;
+            if !guard.insert(team_uuid.clone()) {
+                return Err(format!(
+                    "in_flight: snapshot/archive already running for team_uuid={team_uuid}"
+                ));
+            }
+            drop(guard);
+            InFlightGuard {
+                set: Arc::clone(&self.archive_in_flight),
+                key: team_uuid.clone(),
+            }
+        };
+
+        let now = meta::now_unix();
+        let live_dir = meta::team_dir(&team_uuid);
+
+        // Preserve created_at across snapshots (first snapshot stamps it).
+        let created_at = meta::read_team_meta(&live_dir)
+            .ok()
+            .map(|m| m.created_at)
+            .unwrap_or(now);
+
+        meta::create_dir_secure(&live_dir).map_err(|e| format!("create team dir: {e}"))?;
+        meta::create_dir_secure(&meta::agents_subdir(&team_uuid))
+            .map_err(|e| format!("create agents subdir: {e}"))?;
+        meta::create_dir_secure(&meta::instructions_subdir(&team_uuid))
+            .map_err(|e| format!("create instructions subdir: {e}"))?;
+
+        for a in &params.agents {
+            let instr_bytes = a.instructions.as_deref().unwrap_or("").as_bytes();
+            let instr_sha = if instr_bytes.is_empty() {
+                None
+            } else {
+                Some(meta::sha256_hex(instr_bytes))
+            };
+            if !instr_bytes.is_empty() {
+                meta::write_instructions(&team_uuid, &a.name, instr_bytes)?;
+            }
+            let agent_meta = meta::AgentMeta {
+                schema: meta::SCHEMA_VERSION,
+                team_uuid: team_uuid.clone(),
+                name: a.name.clone(),
+                agent_type: a.agent_type.clone(),
+                cli: a.cli.clone(),
+                model: a.model.clone(),
+                session_id: a.session_id.clone().filter(|s| !s.is_empty()),
+                color: a.color.clone(),
+                created_at: now,
+                instructions_sha256: instr_sha,
+                cli_path_at_create: None,
+                parked: a.parked.unwrap_or(false),
+                usage_total: None,
+                extra_args: Vec::new(),
+                extra_env: std::collections::HashMap::new(),
+                auto_recycle_every: a.auto_recycle_every,
+                completed_task_count: a.completed_task_count.unwrap_or(0),
+                session_id_captured_at: a.session_id_captured_at,
+            };
+            meta::write_agent_meta(&agent_meta)?;
+        }
+
+        let team_meta = meta::TeamMeta {
+            schema: meta::SCHEMA_VERSION,
+            team_uuid: team_uuid.clone(),
+            team_name: params.team_name.clone(),
+            created_at,
+            destroyed_at: None,
+            working_directory: params.working_directory.clone(),
+            git_root: params.git_root.clone(),
+            git_branch_at_create: params.git_branch_at_create.clone(),
+            leader: meta::LeaderMeta {
+                mode: params.leader_mode.clone(),
+                model: params.leader_model.clone(),
+                session_id: Some(params.leader_session_id.clone()).filter(|s| !s.is_empty()),
+            },
+            agents: params.agents.iter().map(|a| a.name.clone()).collect(),
+            worktree: match (
+                params.worktree_mode.as_deref(),
+                params.worktree_path.as_deref(),
+                params.worktree_branch.as_deref(),
+            ) {
+                (Some(m), Some(p), Some(b)) if !m.is_empty() && !p.is_empty() => {
+                    Some(meta::WorktreeMeta {
+                        mode: m.to_string(),
+                        path: p.to_string(),
+                        branch: b.to_string(),
+                    })
+                }
+                _ => None,
+            },
+            execution_mode: "pane".to_string(),
+            claude_cli_version: None,
+            termmesh_app_version: params
+                .termmesh_app_version
+                .clone()
+                .unwrap_or_else(|| "unknown".to_string()),
+            app_socket_path_at_create: params.app_socket_path.clone(),
+            runbook_digest_hash: None,
+            live: true,
+            last_snapshot_at: Some(now),
+            layout_workspace_title: params.layout_workspace_title.clone(),
+        };
+        meta::write_team_meta(&team_meta)?;
+
+        // Best-effort: prune per-agent files left behind by detached agents.
+        let keep: std::collections::HashSet<&str> =
+            params.agents.iter().map(|a| a.name.as_str()).collect();
+        let mut pruned = 0usize;
+        for (dir, ext) in [
+            (meta::agents_subdir(&team_uuid), "json"),
+            (meta::instructions_subdir(&team_uuid), "txt"),
+        ] {
+            let Ok(entries) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.extension().and_then(|s| s.to_str()) != Some(ext) {
+                    continue;
+                }
+                let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+                    continue;
+                };
+                if keep.contains(stem) || stem.starts_with('.') {
+                    continue;
+                }
+                if std::fs::remove_file(&path).is_ok() {
+                    pruned += 1;
+                }
+            }
+        }
+
+        tracing::debug!(
+            "snapshotted pane-mode team {} ({}) — {} agent(s), pruned {pruned}",
+            params.team_name,
+            team_uuid,
+            params.agents.len()
+        );
+        Ok(SnapshotPaneResult {
+            team_uuid,
+            snapshot_path: live_dir.to_string_lossy().into_owned(),
+            last_snapshot_at: now,
+            agents_written: params.agents.len(),
+            stray_agents_pruned: pruned,
+        })
+        // `_in_flight` drops here, removing the slot.
+    }
+
     /// Resume metadata for a pane-mode archive. Returns the team meta + per-agent
     /// session IDs / instructions so the Swift app can recreate the workspace
     /// and spawn each CLI with `--resume <sid>`. Renames `.archived.<ts>` back
@@ -1495,16 +1683,28 @@ impl HeadlessManager {
     /// owns the in-memory lifecycle once it has the metadata).
     pub fn resume_pane(&self, params: ResumePaneParams) -> Result<ResumePaneResult, String> {
         let team_uuid = meta::parse_uuid(&params.team_uuid)?;
-        // Find the archived dir for this UUID.
+        // Find the archived dir for this UUID — or, Restore Fleet Layer 1, a
+        // live snapshot dir (crash / quit-while-live). Archived wins when both
+        // somehow exist (archive is the more deliberate state).
         let archived_entries = meta::list_archived_teams()
             .map_err(|e| format!("scan archived: {e}"))?;
-        let entry = archived_entries
+        let live_dir = match archived_entries
             .into_iter()
             .find(|e| e.team_uuid == team_uuid)
-            .ok_or_else(|| format!("no archive for team_uuid={team_uuid}"))?;
-
-        // Promote archived → live so future operations can find it under team_dir().
-        let live_dir = meta::rename_to_live(&entry.archived_dir, &team_uuid)?;
+        {
+            // Promote archived → live so future operations can find it under team_dir().
+            Some(entry) => meta::rename_to_live(&entry.archived_dir, &team_uuid)?,
+            None => {
+                let dir = meta::team_dir(&team_uuid);
+                let is_live_snapshot = meta::read_team_meta(&dir)
+                    .map(|m| m.live && m.destroyed_at.is_none())
+                    .unwrap_or(false);
+                if !is_live_snapshot {
+                    return Err(format!("no archive for team_uuid={team_uuid}"));
+                }
+                dir
+            }
+        };
         let team_meta = meta::read_team_meta(&live_dir)?;
         if team_meta.team_uuid != team_uuid {
             return Err(format!(
@@ -1774,6 +1974,7 @@ impl HeadlessManager {
                 extra_env: spec.extra_env.clone(),
                 auto_recycle_every: spec.auto_recycle_every,
                 completed_task_count: 0,
+                session_id_captured_at: None,
             };
             if let Some(ref bytes) = instr_bytes {
                 let _ = meta::write_instructions(&team_uuid, &spec.name, bytes);
@@ -2398,6 +2599,134 @@ impl HeadlessManager {
         }
     }
 
+    /// Restore Fleet — enumerate live pane-mode snapshots (`live: true`,
+    /// `destroyed_at: null`). These are teams that were running when the app
+    /// last wrote a snapshot: crash leftovers, or quit-while-live once the
+    /// Swift quit path migrates from archive to snapshot. The caller (Swift)
+    /// is responsible for filtering out uuids it currently has live in
+    /// `TeamOrchestrator.teams` — the daemon cannot know pane-team liveness.
+    ///
+    /// `app_socket_path_filter`: when set, only snapshots whose recorded
+    /// `app_socket_path_at_create` matches (or is absent) are returned, so a
+    /// prod instance never offers a STAGING/tagged instance's fleet.
+    pub fn list_live_pane(
+        &self,
+        app_socket_path_filter: Option<&str>,
+        limit: usize,
+    ) -> ListLivePaneResult {
+        let live_dirs = match meta::list_live_team_dirs() {
+            Ok(v) => v,
+            Err(e) => {
+                return ListLivePaneResult {
+                    teams: Vec::new(),
+                    scanned: 0,
+                    skipped: 0,
+                    fatal_error: Some(format!("cannot read headless dir: {e}")),
+                }
+            }
+        };
+
+        let mut scanned = 0usize;
+        let mut skipped = 0usize;
+        let mut rows: Vec<LiveSnapshotTeam> = Vec::new();
+
+        for (uuid, dir) in live_dirs {
+            scanned += 1;
+            let team_meta = match meta::read_team_meta(&dir) {
+                Ok(m) => m,
+                Err(e) => {
+                    skipped += 1;
+                    tracing::warn!("list_live_pane: skip {}: {e}", dir.display());
+                    continue;
+                }
+            };
+            if team_meta.team_uuid != uuid
+                || team_meta.execution_mode != "pane"
+                || !team_meta.live
+                || team_meta.destroyed_at.is_some()
+            {
+                continue;
+            }
+            if let Some(filter) = app_socket_path_filter {
+                match team_meta.app_socket_path_at_create.as_deref() {
+                    Some(recorded) if recorded != filter => continue,
+                    _ => {}
+                }
+            }
+
+            let agent_metas = meta::read_all_agent_metas(&dir, &uuid);
+            let mut agent_rows = Vec::new();
+            for name in &team_meta.agents {
+                match agent_metas.get(name) {
+                    Some(m) => agent_rows.push(ResumableAgent {
+                        name: m.name.clone(),
+                        agent_type: m.agent_type.clone(),
+                        cli: m.cli.clone(),
+                        model: m.model.clone(),
+                        color: m.color.clone(),
+                        has_session: m.session_id.is_some(),
+                        has_instructions: m.instructions_sha256.is_some(),
+                    }),
+                    None => {
+                        // Tolerate partial snapshots (crash mid-write): the
+                        // agent list is still restorable, minus session resume
+                        // for the missing entry.
+                        agent_rows.push(ResumableAgent {
+                            name: name.clone(),
+                            agent_type: String::new(),
+                            cli: String::new(),
+                            model: String::new(),
+                            color: None,
+                            has_session: false,
+                            has_instructions: false,
+                        });
+                    }
+                }
+            }
+
+            let has_any_session = team_meta
+                .leader
+                .session_id
+                .as_deref()
+                .map(|s| !s.is_empty())
+                .unwrap_or(false)
+                || agent_rows.iter().any(|a| a.has_session);
+
+            rows.push(LiveSnapshotTeam {
+                team_uuid: team_meta.team_uuid.clone(),
+                team_name: team_meta.team_name.clone(),
+                created_at: team_meta.created_at,
+                last_snapshot_at: team_meta.last_snapshot_at.unwrap_or(0),
+                working_directory: team_meta.working_directory.clone(),
+                git_root: team_meta.git_root.clone(),
+                layout_workspace_title: team_meta.layout_workspace_title.clone(),
+                leader_mode: team_meta.leader.mode.clone(),
+                leader_model: team_meta.leader.model.clone(),
+                leader_session_id: team_meta.leader.session_id.clone(),
+                agents: agent_rows,
+                has_any_session,
+                app_socket_path: team_meta.app_socket_path_at_create.clone(),
+            });
+            if rows.len() >= limit {
+                break;
+            }
+        }
+
+        // Most recently snapshotted first, name as tiebreak.
+        rows.sort_by(|a, b| {
+            b.last_snapshot_at
+                .cmp(&a.last_snapshot_at)
+                .then(a.team_name.cmp(&b.team_name))
+        });
+
+        ListLivePaneResult {
+            teams: rows,
+            scanned,
+            skipped,
+            fatal_error: None,
+        }
+    }
+
     /// Resume a team. Thin wrapper that reads metadata then calls `create_team`
     /// with session_ids/team_uuid populated.
     pub async fn resume_team(
@@ -2695,6 +3024,73 @@ pub struct ArchivePaneResult {
     pub replaced: bool,
 }
 
+/// Params for `team.snapshot_pane` — Restore Fleet Layer 1. The Swift app
+/// calls this (debounced) on every team mutation so a crash never loses more
+/// than the debounce window. Unlike `team.archive_pane`, `team_uuid` is
+/// required: continuous snapshots must target a stable identity.
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct SnapshotPaneParams {
+    pub team_uuid: String,
+    pub team_name: String,
+    pub leader_session_id: String,
+    pub leader_mode: String,
+    pub leader_model: String,
+    pub working_directory: String,
+    #[serde(default)]
+    pub git_root: Option<String>,
+    #[serde(default)]
+    pub git_branch_at_create: Option<String>,
+    #[serde(default)]
+    pub worktree_mode: Option<String>,
+    #[serde(default)]
+    pub worktree_path: Option<String>,
+    #[serde(default)]
+    pub worktree_branch: Option<String>,
+    pub agents: Vec<SnapshotPaneAgent>,
+    #[serde(default)]
+    pub termmesh_app_version: Option<String>,
+    /// Workspace tab title at snapshot time (restored verbatim).
+    #[serde(default)]
+    pub layout_workspace_title: Option<String>,
+    /// Control-socket path of the app instance that owns this team. Restore
+    /// candidates are filtered by this so a prod app never offers to restore
+    /// a STAGING/tagged instance's fleet (and vice versa).
+    #[serde(default)]
+    pub app_socket_path: Option<String>,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct SnapshotPaneAgent {
+    pub name: String,
+    pub cli: String,
+    pub model: String,
+    pub agent_type: String,
+    #[serde(default)]
+    pub color: Option<String>,
+    #[serde(default)]
+    pub session_id: Option<String>,
+    #[serde(default)]
+    pub instructions: Option<String>,
+    /// Unix-seconds when the claude session id was captured (FSEvents).
+    #[serde(default)]
+    pub session_id_captured_at: Option<u64>,
+    #[serde(default)]
+    pub parked: Option<bool>,
+    #[serde(default)]
+    pub auto_recycle_every: Option<u32>,
+    #[serde(default)]
+    pub completed_task_count: Option<u32>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct SnapshotPaneResult {
+    pub team_uuid: String,
+    pub snapshot_path: String,
+    pub last_snapshot_at: u64,
+    pub agents_written: usize,
+    pub stray_agents_pruned: usize,
+}
+
 /// Params for `team.resume_pane` — pure metadata read. Unlike
 /// `headless.resume_team` this does NOT spawn subprocesses; the Swift app is
 /// responsible for creating the workspace and panes, and consumes the agent
@@ -2807,6 +3203,34 @@ pub struct ListResumableResult {
     pub fatal_error: Option<String>,
 }
 
+/// Row from `headless.list_live_pane` — a live pane-mode snapshot that may be
+/// restorable after a crash or a quit-while-live.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct LiveSnapshotTeam {
+    pub team_uuid: String,
+    pub team_name: String,
+    pub created_at: u64,
+    pub last_snapshot_at: u64,
+    pub working_directory: String,
+    pub git_root: Option<String>,
+    pub layout_workspace_title: Option<String>,
+    pub leader_mode: String,
+    pub leader_model: String,
+    pub leader_session_id: Option<String>,
+    pub agents: Vec<ResumableAgent>,
+    pub has_any_session: bool,
+    pub app_socket_path: Option<String>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ListLivePaneResult {
+    pub teams: Vec<LiveSnapshotTeam>,
+    pub scanned: usize,
+    pub skipped: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fatal_error: Option<String>,
+}
+
 /// Migration stub for pre-Phase-2 teams (§8).
 fn make_pre_phase2_stub(team: &HeadlessTeam, destroyed_at: u64) -> meta::TeamMeta {
     meta::TeamMeta {
@@ -2834,6 +3258,9 @@ fn make_pre_phase2_stub(team: &HeadlessTeam, destroyed_at: u64) -> meta::TeamMet
         termmesh_app_version: env!("CARGO_PKG_VERSION").into(),
         app_socket_path_at_create: None,
         runbook_digest_hash: None,
+        live: false,
+        last_snapshot_at: None,
+        layout_workspace_title: None,
     }
 }
 
@@ -3171,6 +3598,7 @@ mod tests {
             extra_env: std::collections::HashMap::new(),
             auto_recycle_every: None,
             completed_task_count: 0,
+            session_id_captured_at: None,
         };
         std::fs::write(
             agents_dir.join("explorer.json"),
@@ -3199,6 +3627,9 @@ mod tests {
             termmesh_app_version: "0.72.0".into(),
             app_socket_path_at_create: None,
             runbook_digest_hash: None,
+            live: false,
+            last_snapshot_at: None,
+            layout_workspace_title: None,
         };
         std::fs::write(
             archived_dir.join("team.json"),
@@ -3255,6 +3686,7 @@ mod tests {
             extra_env: std::collections::HashMap::new(),
             auto_recycle_every: None,
             completed_task_count: 0,
+            session_id_captured_at: None,
         };
         std::fs::write(
             archived_dir.join("agents/explorer.json"),
@@ -3283,6 +3715,9 @@ mod tests {
             termmesh_app_version: "test".into(),
             app_socket_path_at_create: None,
             runbook_digest_hash: None,
+            live: false,
+            last_snapshot_at: None,
+            layout_workspace_title: None,
         };
         std::fs::write(
             archived_dir.join("team.json"),
@@ -3427,6 +3862,7 @@ mod tests {
             extra_env: std::collections::HashMap::new(),
             auto_recycle_every: Some(3),
             completed_task_count: 2,
+            session_id_captured_at: None,
         };
         let bytes = serde_json::to_vec_pretty(&meta_in).unwrap();
         let meta_out: meta::AgentMeta = serde_json::from_slice(&bytes).unwrap();
@@ -3531,6 +3967,239 @@ mod tests {
         assert!(!r.replaced);
     }
 
+    // ────────────────────────────────────────────────────────────────────
+    // Restore Fleet Layer 1: snapshot_pane / list_live_pane / resume-from-live
+    // ────────────────────────────────────────────────────────────────────
+
+    fn sample_snapshot_params(team_uuid: &str) -> SnapshotPaneParams {
+        SnapshotPaneParams {
+            team_uuid: team_uuid.to_string(),
+            team_name: "live-iso".into(),
+            leader_session_id: "lead-sid".into(),
+            leader_mode: "claude".into(),
+            leader_model: "sonnet".into(),
+            working_directory: "/tmp/iso".into(),
+            git_root: None,
+            git_branch_at_create: None,
+            worktree_mode: None,
+            worktree_path: None,
+            worktree_branch: None,
+            agents: vec![
+                SnapshotPaneAgent {
+                    name: "explorer".into(),
+                    cli: "claude".into(),
+                    model: "sonnet".into(),
+                    agent_type: "explorer".into(),
+                    color: None,
+                    session_id: Some("agent-sid".into()),
+                    instructions: Some("explore".into()),
+                    session_id_captured_at: Some(1_715_600_000),
+                    parked: None,
+                    auto_recycle_every: Some(5),
+                    completed_task_count: Some(2),
+                },
+                SnapshotPaneAgent {
+                    name: "reviewer".into(),
+                    cli: "codex".into(),
+                    model: "gpt".into(),
+                    agent_type: "reviewer".into(),
+                    color: None,
+                    session_id: None,
+                    instructions: None,
+                    session_id_captured_at: None,
+                    parked: Some(true),
+                    auto_recycle_every: None,
+                    completed_task_count: None,
+                },
+            ],
+            termmesh_app_version: Some("0.0.0-test".into()),
+            layout_workspace_title: Some("My Team".into()),
+            app_socket_path: Some("/tmp/term-mesh-test.sock".into()),
+        }
+    }
+
+    #[test]
+    fn snapshot_pane_writes_live_dir_and_preserves_created_at() {
+        let _scope = scoped_root();
+        let mut mgr = HeadlessManager::new();
+        let team_uuid = "44444444-5555-4666-8777-888888888888";
+
+        let r1 = mgr
+            .snapshot_pane_team(sample_snapshot_params(team_uuid))
+            .expect("first snapshot");
+        assert_eq!(r1.agents_written, 2);
+        assert_eq!(r1.stray_agents_pruned, 0);
+
+        let dir = meta::headless_root().join(team_uuid);
+        assert!(dir.join("team.json").exists(), "live dir written in place");
+        let m1 = meta::read_team_meta(&dir).unwrap();
+        assert!(m1.live);
+        assert!(m1.destroyed_at.is_none());
+        assert_eq!(m1.last_snapshot_at, Some(r1.last_snapshot_at));
+        assert_eq!(m1.layout_workspace_title.as_deref(), Some("My Team"));
+        assert_eq!(m1.schema, meta::SCHEMA_VERSION);
+
+        // Agent fields round-trip, including v2 additions.
+        let a = meta::read_agent_meta(team_uuid, "explorer").unwrap();
+        assert_eq!(a.session_id.as_deref(), Some("agent-sid"));
+        assert_eq!(a.session_id_captured_at, Some(1_715_600_000));
+        assert_eq!(a.auto_recycle_every, Some(5));
+        assert_eq!(a.completed_task_count, 2);
+        let b = meta::read_agent_meta(team_uuid, "reviewer").unwrap();
+        assert!(b.parked);
+
+        // Second snapshot overwrites in place and preserves created_at; no
+        // archived dir ever appears.
+        let r2 = mgr
+            .snapshot_pane_team(sample_snapshot_params(team_uuid))
+            .expect("second snapshot");
+        let m2 = meta::read_team_meta(&dir).unwrap();
+        assert_eq!(m2.created_at, m1.created_at, "created_at preserved");
+        assert!(m2.last_snapshot_at >= m1.last_snapshot_at);
+        assert_eq!(r2.team_uuid, team_uuid);
+        assert!(meta::list_archived_teams().unwrap().is_empty());
+    }
+
+    #[test]
+    fn snapshot_pane_prunes_detached_agents() {
+        let _scope = scoped_root();
+        let mut mgr = HeadlessManager::new();
+        let team_uuid = "55555555-6666-4777-8888-999999999999";
+
+        mgr.snapshot_pane_team(sample_snapshot_params(team_uuid))
+            .expect("snapshot with 2 agents");
+
+        // Detach `reviewer` → next snapshot carries only `explorer` and must
+        // prune the stray agent/instructions files.
+        let mut p = sample_snapshot_params(team_uuid);
+        p.agents.truncate(1);
+        let r = mgr.snapshot_pane_team(p).expect("snapshot after detach");
+        assert_eq!(r.agents_written, 1);
+        assert!(r.stray_agents_pruned >= 1, "reviewer.json pruned");
+        assert!(meta::read_agent_meta(team_uuid, "reviewer").is_err());
+        let m = meta::read_team_meta(&meta::headless_root().join(team_uuid)).unwrap();
+        assert_eq!(m.agents, vec!["explorer".to_string()]);
+    }
+
+    #[test]
+    fn snapshot_pane_rejects_missing_uuid_and_bad_agent_names() {
+        let _scope = scoped_root();
+        let mut mgr = HeadlessManager::new();
+        let mut p = sample_snapshot_params("not-a-uuid");
+        assert!(mgr.snapshot_pane_team(p.clone()).is_err());
+        p.team_uuid = "66666666-7777-4888-8999-aaaaaaaaaaaa".into();
+        p.agents[0].name = "bad/name".into();
+        assert!(mgr.snapshot_pane_team(p).is_err());
+    }
+
+    #[test]
+    fn list_live_pane_returns_live_snapshots_and_honors_socket_filter() {
+        let _scope = scoped_root();
+        let mut mgr = HeadlessManager::new();
+        let live_uuid = "77777777-8888-4999-8aaa-bbbbbbbbbbbb";
+        let archived_uuid = "88888888-9999-4aaa-8bbb-cccccccccccc";
+
+        mgr.snapshot_pane_team(sample_snapshot_params(live_uuid))
+            .expect("live snapshot");
+        mgr.archive_pane_team(sample_archive_params(Some(archived_uuid.into())))
+            .expect("archive");
+
+        let res = mgr.list_live_pane(None, 50);
+        assert!(res.fatal_error.is_none());
+        assert_eq!(res.teams.len(), 1, "archived team must not be listed");
+        let row = &res.teams[0];
+        assert_eq!(row.team_uuid, live_uuid);
+        assert!(row.has_any_session);
+        assert_eq!(row.layout_workspace_title.as_deref(), Some("My Team"));
+        assert_eq!(row.agents.len(), 2);
+
+        // Instance isolation: mismatching socket filter hides the row;
+        // matching filter keeps it.
+        let miss = mgr.list_live_pane(Some("/tmp/other-instance.sock"), 50);
+        assert!(miss.teams.is_empty());
+        let hit = mgr.list_live_pane(Some("/tmp/term-mesh-test.sock"), 50);
+        assert_eq!(hit.teams.len(), 1);
+    }
+
+    #[test]
+    fn resume_pane_reads_live_snapshot_without_archive() {
+        let _scope = scoped_root();
+        let mut mgr = HeadlessManager::new();
+        let team_uuid = "99999999-aaaa-4bbb-8ccc-dddddddddddd";
+
+        mgr.snapshot_pane_team(sample_snapshot_params(team_uuid))
+            .expect("live snapshot");
+
+        let res = mgr
+            .resume_pane(ResumePaneParams {
+                team_uuid: team_uuid.into(),
+            })
+            .expect("resume from live snapshot");
+        assert_eq!(res.team_uuid, team_uuid);
+        assert_eq!(res.team_name, "live-iso");
+        assert!(res.destroyed_at.is_none());
+        let explorer = res
+            .agents
+            .iter()
+            .find(|a| a.name == "explorer")
+            .expect("explorer present");
+        assert_eq!(explorer.session_id.as_deref(), Some("agent-sid"));
+        assert_eq!(explorer.instructions.as_deref(), Some("explore"));
+        // Live dir remains live (no rename happened).
+        let m = meta::read_team_meta(&meta::headless_root().join(team_uuid)).unwrap();
+        assert!(m.live);
+    }
+
+    #[test]
+    fn archive_after_snapshot_clears_live_dir() {
+        let _scope = scoped_root();
+        let mut mgr = HeadlessManager::new();
+        let team_uuid = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
+
+        mgr.snapshot_pane_team(sample_snapshot_params(team_uuid))
+            .expect("live snapshot");
+        mgr.archive_pane_team(sample_archive_params(Some(team_uuid.into())))
+            .expect("destroy archives over the snapshot");
+
+        assert!(!meta::headless_root().join(team_uuid).exists());
+        assert!(mgr.list_live_pane(None, 50).teams.is_empty());
+        let archived = meta::list_archived_teams().unwrap();
+        assert_eq!(archived.len(), 1);
+        assert_eq!(archived[0].team_uuid, team_uuid);
+    }
+
+    #[test]
+    fn sweep_stale_live_snapshots_demotes_only_expired() {
+        let _scope = scoped_root();
+        let mut mgr = HeadlessManager::new();
+        let now = meta::now_unix();
+        let stale = "bbbbbbbb-cccc-4ddd-8eee-ffffffffffff";
+        let fresh = "cccccccc-dddd-4eee-8fff-000000000000";
+
+        mgr.snapshot_pane_team(sample_snapshot_params(stale))
+            .expect("stale snapshot");
+        mgr.snapshot_pane_team(sample_snapshot_params(fresh))
+            .expect("fresh snapshot");
+
+        // Age the stale team's snapshot past the retention window.
+        let dir = meta::headless_root().join(stale);
+        let mut m = meta::read_team_meta(&dir).unwrap();
+        m.last_snapshot_at = Some(now - meta::ARCHIVE_RETENTION_SECS - 10);
+        meta::write_team_meta(&m).unwrap();
+
+        let demoted = meta::sweep_stale_live_snapshots();
+        assert_eq!(demoted, 1);
+        assert!(!meta::headless_root().join(stale).exists());
+        assert!(meta::headless_root().join(fresh).exists());
+        let archived = meta::list_archived_teams().unwrap();
+        assert_eq!(archived.len(), 1);
+        assert_eq!(archived[0].team_uuid, stale);
+        // Demoted snapshot re-enters the normal resume picker path.
+        let listed = mgr.list_live_pane(None, 50);
+        assert_eq!(listed.teams.len(), 1);
+        assert_eq!(listed.teams[0].team_uuid, fresh);
+    }
+
     #[test]
     fn sweep_zombie_pane_archives_removes_all_session_none() {
         let _scope = scoped_root();
@@ -3561,6 +4230,9 @@ mod tests {
             termmesh_app_version: "test".into(),
             app_socket_path_at_create: None,
             runbook_digest_hash: None,
+            live: false,
+            last_snapshot_at: None,
+            layout_workspace_title: None,
         };
         std::fs::write(
             archived.join("team.json"),
@@ -3585,6 +4257,7 @@ mod tests {
             extra_env: std::collections::HashMap::new(),
             auto_recycle_every: None,
             completed_task_count: 0,
+            session_id_captured_at: None,
         };
         std::fs::write(
             archived.join("agents/a.json"),
@@ -3648,6 +4321,9 @@ mod tests {
             termmesh_app_version: "test".into(),
             app_socket_path_at_create: None,
             runbook_digest_hash: None,
+            live: false,
+            last_snapshot_at: None,
+            layout_workspace_title: None,
         };
         std::fs::write(
             archived.join("team.json"),

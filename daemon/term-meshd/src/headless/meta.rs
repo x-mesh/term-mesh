@@ -23,7 +23,10 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-pub const SCHEMA_VERSION: u32 = 1;
+pub const SCHEMA_VERSION: u32 = 2;
+/// Oldest schema this daemon still reads. v1 files (pre live-snapshot) parse
+/// cleanly because every v2 field defaults via serde.
+pub const MIN_SCHEMA_VERSION: u32 = 1;
 pub const ARCHIVE_RETENTION_SECS: u64 = 7 * 24 * 60 * 60; // 7 days
 pub const GC_INTERVAL_SECS: u64 = 12 * 60 * 60; // 12 hours
 
@@ -46,6 +49,21 @@ pub struct TeamMeta {
     pub termmesh_app_version: String,
     pub app_socket_path_at_create: Option<String>,
     pub runbook_digest_hash: Option<String>,
+    /// Schema v2 — live-snapshot support (Restore Fleet Layer 1).
+    /// `true` while the team is (believed to be) running: the dir under
+    /// `<team_uuid>/` is a continuously-refreshed snapshot, not an archive.
+    /// Set back to `false` (and the dir renamed to `.archived.<ts>`) on
+    /// destroy. v1 files default to `false`, which preserves their meaning.
+    #[serde(default)]
+    pub live: bool,
+    /// Unix-seconds of the most recent live snapshot write. None on v1 files
+    /// and on archives written by the destroy path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_snapshot_at: Option<u64>,
+    /// Title of the team's workspace tab at snapshot time, reused verbatim
+    /// when the fleet is restored.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub layout_workspace_title: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -97,6 +115,11 @@ pub struct AgentMeta {
     /// Running count of tasks completed by this agent (reset on recycle).
     #[serde(default)]
     pub completed_task_count: u32,
+    /// Schema v2 — unix-seconds when the pane-mode claude `session_id` was
+    /// captured (FSEvents watcher on `~/.claude/projects/`). Used by restore
+    /// to judge staleness. None for headless agents (sid is spawn-time there).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id_captured_at: Option<u64>,
 }
 
 /// Phase 2.5: cumulative stream-json `usage` counters for a single agent.
@@ -287,10 +310,11 @@ pub fn read_team_meta(team_uuid_or_dir: &Path) -> Result<TeamMeta, String> {
     let bytes = std::fs::read(&p).map_err(|e| format!("read {}: {e}", p.display()))?;
     let meta: TeamMeta =
         serde_json::from_slice(&bytes).map_err(|e| format!("parse {}: {e}", p.display()))?;
-    if meta.schema != SCHEMA_VERSION {
+    if !schema_supported(meta.schema) {
         return Err(format!(
-            "schema mismatch in {}: expected {}, got {}",
+            "schema mismatch in {}: expected {}..={}, got {}",
             p.display(),
+            MIN_SCHEMA_VERSION,
             SCHEMA_VERSION,
             meta.schema
         ));
@@ -298,15 +322,23 @@ pub fn read_team_meta(team_uuid_or_dir: &Path) -> Result<TeamMeta, String> {
     Ok(meta)
 }
 
+/// Accept any schema this daemon knows how to read (v1 files parse via serde
+/// defaults; newer-than-current files are rejected so we never mis-handle a
+/// format written by a future daemon).
+pub fn schema_supported(schema: u32) -> bool {
+    (MIN_SCHEMA_VERSION..=SCHEMA_VERSION).contains(&schema)
+}
+
 pub fn read_agent_meta(team_uuid: &str, agent_name: &str) -> Result<AgentMeta, String> {
     let p = agent_json_path(team_uuid, agent_name);
     let bytes = std::fs::read(&p).map_err(|e| format!("read {}: {e}", p.display()))?;
     let meta: AgentMeta =
         serde_json::from_slice(&bytes).map_err(|e| format!("parse {}: {e}", p.display()))?;
-    if meta.schema != SCHEMA_VERSION {
+    if !schema_supported(meta.schema) {
         return Err(format!(
-            "schema mismatch in {}: expected {}, got {}",
+            "schema mismatch in {}: expected {}..={}, got {}",
             p.display(),
+            MIN_SCHEMA_VERSION,
             SCHEMA_VERSION,
             meta.schema
         ));
@@ -488,6 +520,54 @@ pub fn sweep_zombie_pane_archives() -> usize {
     removed
 }
 
+/// Sweep live snapshot dirs whose `last_snapshot_at` is older than the
+/// archive retention window into the normal archive lifecycle. Covers the
+/// "app crashed long ago and the fleet was never restored" case — the dir is
+/// renamed to `.archived.<last_snapshot_at>` (with `live` cleared and
+/// `destroyed_at` stamped) so `gc_sweep` reclaims it on the same schedule as
+/// ordinary archives. Never touches dirs that are missing `live`/
+/// `last_snapshot_at` (v1 files, headless live teams, in-progress destroys).
+/// Returns count demoted.
+pub fn sweep_stale_live_snapshots() -> usize {
+    let now = now_unix();
+    let live = match list_live_team_dirs() {
+        Ok(v) => v,
+        Err(_) => return 0,
+    };
+    let mut demoted = 0usize;
+    for (uuid, dir) in live {
+        let mut meta = match read_team_meta(&dir) {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
+        if !meta.live || meta.destroyed_at.is_some() {
+            continue;
+        }
+        let Some(last) = meta.last_snapshot_at else {
+            continue;
+        };
+        if now.saturating_sub(last) < ARCHIVE_RETENTION_SECS {
+            continue;
+        }
+        meta.live = false;
+        meta.destroyed_at = Some(last);
+        if write_team_meta(&meta).is_err() {
+            continue;
+        }
+        match rename_to_archived(&uuid, last) {
+            Ok(to) => {
+                tracing::info!(
+                    "headless gc: demoted stale live snapshot {uuid} → {} (last_snapshot_at={last})",
+                    to.display()
+                );
+                demoted += 1;
+            }
+            Err(e) => tracing::warn!("headless gc: demote {uuid} failed: {e}"),
+        }
+    }
+    demoted
+}
+
 /// GC sweep: remove archived dirs older than 7d.
 /// Returns count removed.
 pub fn gc_sweep() -> usize {
@@ -572,7 +652,7 @@ pub fn read_all_agent_metas(team_uuid_dir: &Path, team_uuid: &str) -> BTreeMap<S
                 continue;
             }
         };
-        if meta.schema != SCHEMA_VERSION || meta.team_uuid != team_uuid {
+        if !schema_supported(meta.schema) || meta.team_uuid != team_uuid {
             tracing::warn!(
                 "headless: skip agent json {} (schema/team mismatch)",
                 path.display()
@@ -618,6 +698,57 @@ mod tests {
         atomic_write(&path, b"hello", 0o600).unwrap();
         assert_eq!(std::fs::read(&path).unwrap(), b"hello");
     }
+
+    fn v1_team_json() -> &'static str {
+        r#"{
+            "schema": 1,
+            "team_uuid": "8f3d1a2b-4c5e-4f6a-9b8c-0d1e2f3a4b5c",
+            "team_name": "legacy",
+            "created_at": 1715600000,
+            "destroyed_at": 1715600100,
+            "working_directory": "/tmp/x",
+            "git_root": null,
+            "git_branch_at_create": null,
+            "leader": { "mode": "claude", "model": "sonnet", "session_id": null },
+            "agents": ["explorer"],
+            "worktree": null,
+            "execution_mode": "pane",
+            "claude_cli_version": null,
+            "termmesh_app_version": "0.151.0",
+            "app_socket_path_at_create": null,
+            "runbook_digest_hash": null
+        }"#
+    }
+
+    #[test]
+    fn schema_v1_team_meta_still_parses() {
+        // v1 files predate `live`/`last_snapshot_at`/`layout_workspace_title`;
+        // serde defaults must fill them and the schema gate must accept v1.
+        let meta: TeamMeta = serde_json::from_str(v1_team_json()).unwrap();
+        assert_eq!(meta.schema, 1);
+        assert!(schema_supported(meta.schema));
+        assert!(!meta.live);
+        assert!(meta.last_snapshot_at.is_none());
+        assert!(meta.layout_workspace_title.is_none());
+        // Future schema is rejected.
+        assert!(!schema_supported(SCHEMA_VERSION + 1));
+    }
+
+    #[test]
+    fn v2_serialization_omits_absent_optionals() {
+        let mut meta: TeamMeta = serde_json::from_str(v1_team_json()).unwrap();
+        meta.schema = SCHEMA_VERSION;
+        let json = serde_json::to_string(&meta).unwrap();
+        // skip_serializing_if keeps v2 files free of null-noise for absent fields.
+        assert!(!json.contains("last_snapshot_at"));
+        assert!(!json.contains("layout_workspace_title"));
+        assert!(json.contains("\"live\":false"));
+    }
+
+    // NOTE: filesystem-level sweep tests for `sweep_stale_live_snapshots` live
+    // in `super::tests` (mod.rs) — they need the shared `ENV_VAR_LOCK` /
+    // `scoped_root()` guard for `TERMMESH_HEADLESS_ROOT`, which is private to
+    // that test module.
 
     #[test]
     fn sha256_known_value() {

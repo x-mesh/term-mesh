@@ -1,5 +1,6 @@
 import Foundation
 import Combine
+import os
 
 /// Phase 2.5 — per-agent token usage snapshot, mirrored from the daemon's
 /// `agent.usage_tick` notify pushes. Values are absolute totals (the daemon is
@@ -98,6 +99,9 @@ final class TeamDataStore: ObservableObject, @unchecked Sendable {
                 self?.onDataChanged?()
             }
         }
+        // Restore Fleet Layer 2: every data change also refreshes the on-disk
+        // board snapshots (own debounce + content dedup inside).
+        scheduleBoardSave()
     }
 
     // MARK: - Team Registry
@@ -118,9 +122,207 @@ final class TeamDataStore: ObservableObject, @unchecked Sendable {
         contextStore.removeValue(forKey: name)
         parkedAgents.removeValue(forKey: name)
         watchDrifts.removeValue(forKey: name)
+        let boardUuid = boardUuids.removeValue(forKey: name)
         lock.unlock()
         clearUsageUnsafe(teamName: name)
+        // Deliberate destroy → the persisted board is no longer restorable
+        // state; remove it. Crash/quit paths never unregister, so their board
+        // files survive for Restore Fleet.
+        if let boardUuid {
+            removeBoardFile(teamUuid: boardUuid)
+        }
         notifyChanged()
+    }
+
+    // MARK: - Restore Fleet Layer 2: board persistence
+    //
+    // Task boards (and the shared context store) used to be in-memory only —
+    // an app crash or restart lost every task, breaking `tm-agent recycle`'s
+    // "durable state remains in the task board" contract at the restart
+    // boundary. Every data change now debounces a JSON snapshot to
+    // `~/.term-mesh/teams/<team_uuid>/board.json` (atomic write, content
+    // deduped). See docs/design/restore-fleet-session-persistence.md §3.2.
+    //
+    // Inter-agent messages are deliberately NOT persisted: the leader inbox is
+    // re-synthesized from task state (`inboxItems`), so tasks are the durable
+    // record. Heartbeats/usage are ephemeral or daemon-owned.
+
+    struct PersistedContextEntry: Codable {
+        var value: String
+        var setBy: String
+        var updatedAt: Date
+    }
+
+    struct PersistedBoard: Codable {
+        var schema: Int
+        var teamUuid: String
+        var teamName: String
+        var savedAt: Date
+        var tasks: [TeamOrchestrator.TeamTask]
+        var context: [String: PersistedContextEntry]
+    }
+
+    /// Dedup payload — everything in `PersistedBoard` except `savedAt`, so an
+    /// unchanged board doesn't rewrite the file on every debounce tick.
+    private struct BoardContent: Codable {
+        var tasks: [TeamOrchestrator.TeamTask]
+        var context: [String: PersistedContextEntry]
+    }
+
+    static let boardSchemaVersion = 1
+
+    /// Serial queue owning all board file IO plus `boardSavePending` /
+    /// `lastBoardContentBytes` below.
+    private let boardIOQueue = DispatchQueue(label: "team.board.persist", qos: .utility)
+    private var boardSavePending = false
+    private var lastBoardContentBytes: [String: Data] = [:]
+
+    /// team_name → team_uuid. Refreshed by `TeamOrchestrator` on every state
+    /// sync (uuid is the on-disk identity; teams without one predate D3-A
+    /// P1-A and are not persisted). Guarded by `lock`.
+    private var boardUuids: [String: String] = [:]
+
+    static func boardsRoot() -> URL {
+        if let override = ProcessInfo.processInfo.environment["TERMMESH_TEAMS_ROOT"],
+           !override.isEmpty {
+            return URL(fileURLWithPath: override, isDirectory: true)
+        }
+        return FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent(".term-mesh", isDirectory: true)
+            .appendingPathComponent("teams", isDirectory: true)
+    }
+
+    static func boardFileURL(teamUuid: String) -> URL {
+        boardsRoot()
+            .appendingPathComponent(teamUuid, isDirectory: true)
+            .appendingPathComponent("board.json", isDirectory: false)
+    }
+
+    /// Refresh the name→uuid map (merge; uuids are stable for a team's life).
+    func updateBoardUuids(_ map: [String: String]) {
+        lock.lock()
+        boardUuids.merge(map) { _, new in new }
+        lock.unlock()
+    }
+
+    /// Debounced save of every known team board. Cheap to call on any change.
+    private func scheduleBoardSave() {
+        boardIOQueue.async { [weak self] in
+            guard let self, !self.boardSavePending else { return }
+            self.boardSavePending = true
+            self.boardIOQueue.asyncAfter(deadline: .now() + 0.5) { [weak self] in
+                guard let self else { return }
+                self.boardSavePending = false
+                self.saveAllBoardsNow()
+            }
+        }
+    }
+
+    /// boardIOQueue only.
+    private func saveAllBoardsNow() {
+        lock.lock()
+        let uuids = boardUuids
+        let boards = taskBoards
+        let contexts = contextStore
+        lock.unlock()
+
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        encoder.outputFormatting = [.sortedKeys]
+
+        for (teamName, teamUuid) in uuids {
+            let tasks = boards[teamName] ?? []
+            let context = (contexts[teamName] ?? [:]).mapValues {
+                PersistedContextEntry(value: $0.value, setBy: $0.setBy, updatedAt: $0.updatedAt)
+            }
+            guard let contentBytes = try? encoder.encode(BoardContent(tasks: tasks, context: context))
+            else { continue }
+            if lastBoardContentBytes[teamUuid] == contentBytes { continue }
+
+            let board = PersistedBoard(
+                schema: Self.boardSchemaVersion,
+                teamUuid: teamUuid,
+                teamName: teamName,
+                savedAt: Date(),
+                tasks: tasks,
+                context: context
+            )
+            do {
+                let url = Self.boardFileURL(teamUuid: teamUuid)
+                try FileManager.default.createDirectory(
+                    at: url.deletingLastPathComponent(),
+                    withIntermediateDirectories: true,
+                    attributes: [.posixPermissions: 0o700]
+                )
+                let data = try encoder.encode(board)
+                try data.write(to: url, options: .atomic)
+                lastBoardContentBytes[teamUuid] = contentBytes
+            } catch {
+                Logger.team.warning(
+                    "[board.persist] save failed team=\(teamName, privacy: .public): \(error.localizedDescription, privacy: .public)"
+                )
+            }
+        }
+    }
+
+    /// Load a persisted board into memory for a resumed/restored team,
+    /// replacing that team's in-memory board. Normalization: `in_progress`
+    /// tasks become `assigned` — the worker process died with the app, so
+    /// nothing is genuinely in progress; the existing dispatch/auto-claim
+    /// machinery re-drives them. All other statuses (blocked / review_ready /
+    /// completed / failed) carry over verbatim, including worktree fields
+    /// (worktrees are real dirs on disk and stay finishable).
+    ///
+    /// Returns the number of restored tasks (0 when no/invalid board file).
+    @discardableResult
+    func loadBoard(teamName: String, teamUuid: String) -> Int {
+        let url = Self.boardFileURL(teamUuid: teamUuid)
+        guard let data = try? Data(contentsOf: url) else { return 0 }
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        guard let board = try? decoder.decode(PersistedBoard.self, from: data),
+              board.schema == Self.boardSchemaVersion,
+              board.teamUuid == teamUuid else {
+            Logger.team.warning(
+                "[board.persist] load skipped team=\(teamName, privacy: .public): schema/uuid mismatch or corrupt file"
+            )
+            return 0
+        }
+
+        var restored = board.tasks
+        let now = Date()
+        for i in restored.indices where restored[i].status == "in_progress" {
+            restored[i].status = "assigned"
+            restored[i].updatedAt = now
+        }
+        let context = board.context.reduce(into: [String: ContextEntry]()) { acc, kv in
+            acc[kv.key] = ContextEntry(
+                key: kv.key, value: kv.value.value, setBy: kv.value.setBy,
+                updatedAt: kv.value.updatedAt
+            )
+        }
+
+        lock.lock()
+        taskBoards[teamName] = restored
+        if !context.isEmpty {
+            contextStore[teamName] = context
+        }
+        boardUuids[teamName] = teamUuid
+        lock.unlock()
+        notifyChanged()
+        Logger.team.info(
+            "[board.persist] restored \(restored.count) task(s) for team=\(teamName, privacy: .public)"
+        )
+        return restored.count
+    }
+
+    /// Remove a board file after a deliberate destroy.
+    private func removeBoardFile(teamUuid: String) {
+        boardIOQueue.async { [weak self] in
+            self?.lastBoardContentBytes[teamUuid] = nil
+            let dir = Self.boardFileURL(teamUuid: teamUuid).deletingLastPathComponent()
+            try? FileManager.default.removeItem(at: dir)
+        }
     }
 
     // MARK: - Parked agent state (Phase 2)
