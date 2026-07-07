@@ -605,7 +605,20 @@ enum Commands {
         leader_session: Option<String>,
     },
     /// Bridge reply events with XMB_TASK headers into xm-build tasks.json updates
+    /// (deprecated: superseded by xk-bridge, kept as a compatibility alias)
     XmbBridge {
+        /// Stop after N seconds (default: 0 = run until Ctrl+C)
+        #[arg(long, default_value_t = 0)]
+        timeout: u32,
+        /// Filter to events belonging to a specific leader session
+        #[arg(long, value_name = "SESSION_ID")]
+        leader_session: Option<String>,
+    },
+    /// Bridge reply/task_status events into x-kit .xm state: XK_TASK/XK_CORR
+    /// headers (legacy XMB_TASK accepted) update x-build tasks.json, append
+    /// agent_step entries to the active .xm trace, and record task_complete
+    /// metrics. Contract: x-kit docs/term-mesh-integration.md.
+    XkBridge {
         /// Stop after N seconds (default: 0 = run until Ctrl+C)
         #[arg(long, default_value_t = 0)]
         timeout: u32,
@@ -4179,6 +4192,21 @@ fn main() {
         return;
     }
 
+    if let Commands::XkBridge {
+        timeout,
+        leader_session,
+    } = &cli.command
+    {
+        let sock = detect_daemon_socket()
+            .or_else(detect_socket)
+            .unwrap_or_else(|| {
+                eprintln!("Error: no daemon socket found");
+                process::exit(1);
+            });
+        run_xk_bridge(&sock, *timeout, leader_session.as_deref());
+        return;
+    }
+
     // `watch <on|off|status>` controls the term-meshd (daemon) drift-watch
     // scheduler via the `watch.*` RPCs, so resolve the daemon socket directly
     // (falling back to the app socket). Bare `watch` (no subcommand) is the event
@@ -5390,6 +5418,14 @@ fn main() {
         } => {
             let bridge_sock = detect_daemon_socket().unwrap_or_else(|| sock.clone());
             run_xmb_bridge(&bridge_sock, timeout, leader_session.as_deref());
+            return;
+        }
+        Commands::XkBridge {
+            timeout,
+            leader_session,
+        } => {
+            let bridge_sock = detect_daemon_socket().unwrap_or_else(|| sock.clone());
+            run_xk_bridge(&bridge_sock, timeout, leader_session.as_deref());
             return;
         }
         Commands::Claim => {
@@ -9942,6 +9978,516 @@ fn iso8601_utc_now() -> String {
         .as_secs();
     let (year, month, day, hour, min, sec) = unix_ts_to_ymd_hms(now);
     format!("{year:04}-{month:02}-{day:02}T{hour:02}:{min:02}:{sec:02}Z")
+}
+
+// ── xk-bridge: daemon events → x-kit .xm writeback ───────────────────
+// Generalizes xmb-bridge. Contract: x-kit docs/term-mesh-integration.md.
+// Reply headers carry `XK_TASK: <plugin>/<project>/<ref>` (+ optional
+// `XK_CORR: ce-XXXXXXXX`); legacy `XMB_TASK: <project>/<tid>` still maps to
+// plugin "build". Writeback targets: x-build tasks.json transitions, the
+// active .xm/traces/*.jsonl session, and .xm/metrics/sessions.jsonl.
+
+struct XkBridgeState {
+    handled: u64,
+    /// (plugin/project/ref, status) pairs already applied — idempotency guard.
+    seen: std::collections::HashSet<(String, String)>,
+    xm_root: Option<PathBuf>,
+}
+
+fn run_xk_bridge(sock: &PathBuf, timeout_secs: u32, leader_session: Option<&str>) {
+    eprintln!("[xk-bridge] starting (timeout: {timeout_secs}s)");
+    let xm_root = resolve_xk_xm_root();
+    match &xm_root {
+        Some(p) => eprintln!("[xk-bridge] .xm root: {}", p.display()),
+        None => eprintln!(
+            "[xk-bridge] warning: no .xm directory found from {} — trace/metric writeback disabled",
+            env::current_dir().map(|p| p.display().to_string()).unwrap_or_default()
+        ),
+    }
+    let mut state = XkBridgeState {
+        handled: 0,
+        seen: std::collections::HashSet::new(),
+        xm_root,
+    };
+    stream_events(
+        sock,
+        timeout_secs,
+        &["reply", "task_status"],
+        leader_session,
+        |event| {
+            if let Err(e) = handle_xk_event(event, &mut state) {
+                eprintln!("[xk-bridge] warning: {e}");
+            }
+        },
+    );
+    eprintln!("[xk-bridge] stopped (updates: {})", state.handled);
+}
+
+fn handle_xk_event(event: Value, state: &mut XkBridgeState) -> Result<(), String> {
+    match event.get("kind").and_then(Value::as_str) {
+        Some("reply") => handle_xk_reply(&event, state),
+        Some("task_status") => handle_xk_task_status(&event, state),
+        _ => Ok(()),
+    }
+}
+
+fn handle_xk_reply(event: &Value, state: &mut XkBridgeState) -> Result<(), String> {
+    let Some(header) = event.get("header").and_then(Value::as_str) else {
+        return Ok(());
+    };
+    let Some(parsed) = parse_xk_header(header) else {
+        return Ok(());
+    };
+    let task_ref_full = format!("{}/{}/{}", parsed.plugin, parsed.project, parsed.task_ref);
+    if !state
+        .seen
+        .insert((task_ref_full.clone(), parsed.status.clone()))
+    {
+        return Ok(()); // same (ref, status) already applied
+    }
+    let Some(xk_status) = xmb_status_for_protocol_status(&parsed.status) else {
+        eprintln!(
+            "[xk-bridge] skip {task_ref_full}: unsupported STATUS {}",
+            parsed.status
+        );
+        return Ok(());
+    };
+    let agent = event.get("agent").and_then(Value::as_str).unwrap_or("agent");
+    let team = event.get("team").and_then(Value::as_str).unwrap_or("");
+
+    // 1) build plugin → x-build tasks.json transition (reuses xmb machinery).
+    if parsed.plugin == "build" && is_valid_xmb_task_id(&parsed.task_ref) {
+        match resolve_xmb_tasks_path(&parsed.project)
+            .and_then(|p| update_xmb_task_status(&p, &parsed.task_ref, xk_status))
+        {
+            Ok(XmbUpdateOutcome::Updated { old_status }) => {
+                eprintln!("[xk-bridge] {task_ref_full}: {old_status} -> {xk_status}");
+            }
+            Ok(XmbUpdateOutcome::SkippedSameStatus) => {
+                eprintln!("[xk-bridge] {task_ref_full}: already {xk_status}");
+            }
+            Err(e) => eprintln!("[xk-bridge] tasks.json: {e}"),
+        }
+    }
+
+    if let Some(root) = state.xm_root.clone() {
+        let ts = iso8601_utc_now();
+        // 2) agent_step into the active trace session (if one is running).
+        if let Some(trace_path) = xk_active_trace_path(&root) {
+            let session_id = trace_path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("term-mesh")
+                .to_string();
+            let entry = json!({
+                "type": "agent_step",
+                "id": task_ref_full,
+                "backend": "term-mesh",
+                "role": agent,
+                "team": team,
+                "status": xk_status,
+                "source": "xk-bridge",
+                "session_id": session_id,
+                "ts": ts,
+                "v": 1,
+            });
+            if let Err(e) = xk_append_jsonl(&trace_path, &entry) {
+                eprintln!("[xk-bridge] trace: {e}");
+            }
+        }
+        // 3) terminal statuses → task_complete metric (joins on correlation_id).
+        if matches!(xk_status, "completed" | "failed") {
+            let metric = json!({
+                "type": "task_complete",
+                "backend": "term-mesh",
+                "plugin": parsed.plugin,
+                "project": parsed.project,
+                "taskId": parsed.task_ref,
+                "role": agent,
+                "team": team,
+                "success": xk_status == "completed",
+                "correlation_id": parsed.corr,
+                "timestamp": ts,
+            });
+            // Path matches x-build's cost engine (ROOT = .xm/build).
+            let metrics_path = root
+                .join("build")
+                .join("metrics")
+                .join("sessions.jsonl");
+            if let Err(e) = xk_append_jsonl(&metrics_path, &metric) {
+                eprintln!("[xk-bridge] metrics: {e}");
+            }
+        }
+    }
+
+    state.handled += 1;
+    Ok(())
+}
+
+fn handle_xk_task_status(event: &Value, state: &mut XkBridgeState) -> Result<(), String> {
+    let team = event.get("team").and_then(Value::as_str).unwrap_or("");
+    // Events published by x-kit's own tm-bridge use synthetic `xk:` teams —
+    // writing those back into .xm would echo-loop.
+    if team.starts_with("xk:") {
+        return Ok(());
+    }
+    let Some(root) = state.xm_root.clone() else {
+        return Ok(());
+    };
+    let Some(trace_path) = xk_active_trace_path(&root) else {
+        return Ok(());
+    };
+    let task_id = event.get("task_id").and_then(Value::as_str).unwrap_or("");
+    let status = event.get("status").and_then(Value::as_str).unwrap_or("");
+    if task_id.is_empty() || status.is_empty() {
+        return Ok(());
+    }
+    if !state
+        .seen
+        .insert((format!("tm/{team}/{task_id}"), status.to_string()))
+    {
+        return Ok(());
+    }
+    let session_id = trace_path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("term-mesh")
+        .to_string();
+    let entry = json!({
+        "type": "agent_step",
+        "id": format!("tm/{team}/{task_id}"),
+        "backend": "term-mesh",
+        "role": event.get("agent").and_then(Value::as_str).unwrap_or("agent"),
+        "team": team,
+        "status": status,
+        "step": "task_status",
+        "source": "xk-bridge",
+        "session_id": session_id,
+        "ts": iso8601_utc_now(),
+        "v": 1,
+    });
+    xk_append_jsonl(&trace_path, &entry)?;
+    state.handled += 1;
+    Ok(())
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct XkHeader {
+    status: String,
+    corr: Option<String>,
+    plugin: String,
+    project: String,
+    task_ref: String,
+}
+
+fn parse_xk_header(header: &str) -> Option<XkHeader> {
+    let mut status = None;
+    let mut corr = None;
+    let mut task: Option<(String, String, String)> = None;
+    for line in header.lines() {
+        let trimmed = line.trim();
+        if let Some(value) = trimmed.strip_prefix("STATUS:") {
+            status = Some(value.trim().to_ascii_uppercase());
+        } else if let Some(value) = trimmed.strip_prefix("XK_TASK:") {
+            // XK_TASK wins over a legacy XMB_TASK regardless of line order.
+            if let Some(t) = parse_xk_task_ref(value.trim()) {
+                task = Some(t);
+            }
+        } else if let Some(value) = trimmed.strip_prefix("XK_CORR:") {
+            let v = value.trim();
+            if !v.is_empty() && v != "n/a" {
+                corr = Some(v.to_string());
+            }
+        } else if let Some(value) = trimmed.strip_prefix("XMB_TASK:") {
+            if task.is_none() {
+                if let Some((project, tid)) = parse_xmb_task_ref(value.trim()) {
+                    task = Some(("build".to_string(), project, tid));
+                }
+            }
+        }
+    }
+    let (plugin, project, task_ref) = task?;
+    Some(XkHeader {
+        status: status?,
+        corr,
+        plugin,
+        project,
+        task_ref,
+    })
+}
+
+fn parse_xk_task_ref(value: &str) -> Option<(String, String, String)> {
+    let mut parts = value.splitn(3, '/');
+    let plugin = parts.next()?;
+    let project = parts.next()?;
+    let task_ref = parts.next()?;
+    if !is_valid_xk_segment(plugin) || !is_valid_xk_segment(project) || !is_valid_xk_ref(task_ref) {
+        return None;
+    }
+    Some((
+        plugin.to_ascii_lowercase(),
+        project.to_string(),
+        task_ref.to_string(),
+    ))
+}
+
+fn is_valid_xk_segment(s: &str) -> bool {
+    !s.is_empty()
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+}
+
+fn is_valid_xk_ref(s: &str) -> bool {
+    // No '/', no whitespace, no '..' — a ref can never escape its directory.
+    !s.is_empty()
+        && !s.contains("..")
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.')
+}
+
+/// Resolve the .xm root like x-kit's resolveSharedRoot(): cwd → git toplevel →
+/// main repo via git-common-dir (worktree case). None disables writeback.
+fn resolve_xk_xm_root() -> Option<PathBuf> {
+    let cwd = env::current_dir().ok()?;
+    let local = cwd.join(".xm");
+    if local.is_dir() {
+        return Some(local);
+    }
+    if let Some(root) = git_root(&cwd) {
+        let p = root.join(".xm");
+        if p.is_dir() {
+            return Some(p);
+        }
+    }
+    let output = std::process::Command::new("git")
+        .args(["rev-parse", "--git-common-dir"])
+        .current_dir(&cwd)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let common = String::from_utf8(output.stdout).ok()?;
+    let common = common.trim();
+    if common.is_empty() {
+        return None;
+    }
+    let common_path = if Path::new(common).is_absolute() {
+        PathBuf::from(common)
+    } else {
+        cwd.join(common)
+    };
+    let p = common_path.parent()?.join(".xm");
+    if p.is_dir() {
+        Some(p)
+    } else {
+        None
+    }
+}
+
+/// The active trace session file, per `.xm/traces/.active` (stores a path or
+/// bare filename ending in .jsonl). None when no session is running.
+fn xk_active_trace_path(xm_root: &Path) -> Option<PathBuf> {
+    let marker = xm_root.join("traces").join(".active");
+    let content = fs::read_to_string(&marker).ok()?;
+    let value = content.trim();
+    if value.is_empty() {
+        return None;
+    }
+    let fname = Path::new(value).file_name()?.to_str()?;
+    if !fname.ends_with(".jsonl") {
+        return None;
+    }
+    let path = xm_root.join("traces").join(fname);
+    if path.exists() {
+        Some(path)
+    } else {
+        None
+    }
+}
+
+fn xk_append_jsonl(path: &Path, entry: &Value) -> Result<(), String> {
+    if let Some(dir) = path.parent() {
+        fs::create_dir_all(dir).map_err(|e| format!("mkdir {}: {e}", dir.display()))?;
+    }
+    let mut file = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .map_err(|e| format!("open {}: {e}", path.display()))?;
+    let mut line =
+        serde_json::to_string(entry).map_err(|e| format!("serialize {}: {e}", path.display()))?;
+    line.push('\n');
+    file.write_all(line.as_bytes())
+        .map_err(|e| format!("append {}: {e}", path.display()))
+}
+
+#[cfg(test)]
+mod xk_bridge_tests {
+    use super::*;
+
+    fn header(lines: &[&str]) -> String {
+        lines.join("\n")
+    }
+
+    #[test]
+    fn parses_xk_task_header() {
+        let h = header(&[
+            "STATUS: DONE",
+            "FILES: none",
+            "XK_TASK: op/refine-20260707/r2",
+            "XK_CORR: ce-abc12345",
+        ]);
+        let parsed = parse_xk_header(&h).expect("parse");
+        assert_eq!(parsed.status, "DONE");
+        assert_eq!(parsed.plugin, "op");
+        assert_eq!(parsed.project, "refine-20260707");
+        assert_eq!(parsed.task_ref, "r2");
+        assert_eq!(parsed.corr.as_deref(), Some("ce-abc12345"));
+    }
+
+    #[test]
+    fn legacy_xmb_task_maps_to_build_plugin() {
+        let h = header(&["STATUS: BLOCKED", "XMB_TASK: my-proj/t3"]);
+        let parsed = parse_xk_header(&h).expect("parse");
+        assert_eq!(parsed.plugin, "build");
+        assert_eq!(parsed.project, "my-proj");
+        assert_eq!(parsed.task_ref, "t3");
+        assert_eq!(parsed.corr, None);
+    }
+
+    #[test]
+    fn xk_task_wins_over_xmb_regardless_of_order() {
+        let h = header(&[
+            "STATUS: DONE",
+            "XMB_TASK: legacy/t1",
+            "XK_TASK: build/new-proj/t9",
+        ]);
+        let parsed = parse_xk_header(&h).expect("parse");
+        assert_eq!(parsed.project, "new-proj");
+        assert_eq!(parsed.task_ref, "t9");
+
+        let h2 = header(&[
+            "STATUS: DONE",
+            "XK_TASK: build/new-proj/t9",
+            "XMB_TASK: legacy/t1",
+        ]);
+        let parsed2 = parse_xk_header(&h2).expect("parse");
+        assert_eq!(parsed2.project, "new-proj");
+    }
+
+    #[test]
+    fn rejects_traversal_and_malformed_refs() {
+        assert_eq!(parse_xk_task_ref("op/../../etc"), None);
+        assert_eq!(parse_xk_task_ref("op/proj/../escape"), None);
+        assert_eq!(parse_xk_task_ref("op/proj/a/b"), None); // '/' in ref
+        assert_eq!(parse_xk_task_ref("op/proj/"), None);
+        assert_eq!(parse_xk_task_ref("op/proj"), None); // too few segments
+        assert_eq!(parse_xk_task_ref("op//r1"), None); // empty project
+        assert_eq!(parse_xk_task_ref("op/pr oj/r1"), None); // whitespace
+        assert!(parse_xk_task_ref("solver/run-1/step.2").is_some());
+    }
+
+    #[test]
+    fn missing_status_or_task_yields_none() {
+        assert_eq!(parse_xk_header("XK_TASK: op/p/r1"), None);
+        assert_eq!(parse_xk_header("STATUS: DONE"), None);
+    }
+
+    #[test]
+    fn corr_na_is_dropped() {
+        let h = header(&["STATUS: DONE", "XK_TASK: op/p/r1", "XK_CORR: n/a"]);
+        assert_eq!(parse_xk_header(&h).expect("parse").corr, None);
+    }
+
+    #[test]
+    fn active_trace_path_resolves_marker_forms() {
+        let dir = std::env::temp_dir().join(format!("xk-bridge-test-{}", process::id()));
+        let traces = dir.join("traces");
+        fs::create_dir_all(&traces).expect("mkdir");
+        fs::write(traces.join("op-1.jsonl"), "").expect("touch");
+
+        // Path form (as written by trace subcommand `start`)
+        fs::write(traces.join(".active"), ".xm/traces/op-1.jsonl\n").expect("marker");
+        assert_eq!(
+            xk_active_trace_path(&dir),
+            Some(traces.join("op-1.jsonl"))
+        );
+
+        // Bare filename form
+        fs::write(traces.join(".active"), "op-1.jsonl").expect("marker");
+        assert_eq!(
+            xk_active_trace_path(&dir),
+            Some(traces.join("op-1.jsonl"))
+        );
+
+        // Stale marker (file gone) → None
+        fs::write(traces.join(".active"), "gone.jsonl").expect("marker");
+        assert_eq!(xk_active_trace_path(&dir), None);
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn reply_event_dedupes_same_ref_and_status() {
+        let mut state = XkBridgeState {
+            handled: 0,
+            seen: std::collections::HashSet::new(),
+            xm_root: None, // no .xm — exercises the pure dedupe/parse path
+        };
+        let ev = json!({
+            "kind": "reply",
+            "team": "my-team",
+            "agent": "executor",
+            "task_id": "T-1",
+            "header": "STATUS: DONE\nXK_TASK: op/p/r1",
+        });
+        handle_xk_event(ev.clone(), &mut state).expect("first");
+        assert_eq!(state.handled, 1);
+        handle_xk_event(ev, &mut state).expect("dup");
+        assert_eq!(state.handled, 1, "duplicate (ref,status) must be skipped");
+
+        // Same ref, different status → applies
+        let ev2 = json!({
+            "kind": "reply",
+            "team": "my-team",
+            "agent": "executor",
+            "task_id": "T-1",
+            "header": "STATUS: FAILED\nXK_TASK: op/p/r1",
+        });
+        handle_xk_event(ev2, &mut state).expect("second status");
+        assert_eq!(state.handled, 2);
+    }
+
+    #[test]
+    fn xk_team_task_status_events_are_ignored() {
+        let mut state = XkBridgeState {
+            handled: 0,
+            seen: std::collections::HashSet::new(),
+            xm_root: None,
+        };
+        let ev = json!({
+            "kind": "task_status",
+            "team": "xk:my-project",
+            "task_id": "op-1",
+            "status": "in_progress",
+        });
+        handle_xk_event(ev, &mut state).expect("ok");
+        assert_eq!(state.handled, 0);
+    }
+
+    #[test]
+    fn append_jsonl_appends_lines() {
+        let dir = std::env::temp_dir().join(format!("xk-append-test-{}", process::id()));
+        let path = dir.join("out.jsonl");
+        xk_append_jsonl(&path, &json!({"a": 1})).expect("first");
+        xk_append_jsonl(&path, &json!({"b": 2})).expect("second");
+        let text = fs::read_to_string(&path).expect("read");
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0], r#"{"a":1}"#);
+        fs::remove_dir_all(&dir).ok();
+    }
 }
 
 #[cfg(test)]
