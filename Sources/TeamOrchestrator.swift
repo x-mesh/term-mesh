@@ -3754,6 +3754,11 @@ final class TeamOrchestrator: ObservableObject {
                         "active_task_status": activeTask?.status as Any? ?? NSNull(),
                         "active_task_is_stale": activeTask.map(isTaskStale) ?? false,
                         "agent_state": agentRuntimeState(teamName: team.id, agentName: agent.name),
+                        // Mission Control: separate boolean rather than a new
+                        // agent_state value — tm-agent hard-matches
+                        // agent_state == "idle" for delegation eligibility, so
+                        // the state machine's values stay stable.
+                        "waiting_input": agentIsWaitingInput(agent),
                         "heartbeat_age_seconds": heartbeatAgeSeconds(teamName: team.id, agentName: agent.name) as Any? ?? NSNull(),
                         "last_heartbeat_summary": heartbeat?.summary as Any? ?? NSNull(),
                         "heartbeat_is_stale": heartbeat.map(isHeartbeatStale) ?? false,
@@ -3803,6 +3808,39 @@ final class TeamOrchestrator: ObservableObject {
         ]
     }
 
+    /// Mission Control: "waiting for input" signal — the agent pane has an
+    /// unread terminal notification (permission prompt, completed-turn bell,
+    /// OSC 9/777). Notification `surfaceId`s share the bonsplit panel-id
+    /// space (`TabManager.focusedSurfaceId(for:)` returns
+    /// `focusedPanelId(for:)`), so the member's `panelId` addresses its
+    /// pane's notifications directly. Headless agents (no pane) are never
+    /// waiting on UI input.
+    private func agentIsWaitingInput(_ agent: AgentMember) -> Bool {
+        guard let panelId = agent.panelId else { return false }
+        return TerminalNotificationStore.shared.hasUnreadNotification(
+            forTabId: agent.workspaceId, surfaceId: panelId
+        )
+    }
+
+    /// Mission Control aggregator — one call returns everything the mission
+    /// dashboard preset renders: teams (with per-agent state / waiting_input /
+    /// heartbeats), the full task board, the attention inbox, and the derived
+    /// approval queue (`review_ready` tasks; worktree-backed ones carry their
+    /// worktree fields for the future diff/approve card). Served via the v2
+    /// `fleet.state` socket method and mirrored at the daemon's `/api/fleet`.
+    /// Watch drift history is deliberately NOT aggregated here — it lives in
+    /// the Rust daemon (`watch.board`), and blocking on a daemon round-trip
+    /// inside an app-socket handler would violate the socket threading policy.
+    func fleetState() -> [String: Any] {
+        var payload = daemonPayload()
+        payload["schema"] = 1
+        let approvals = (payload["tasks"] as? [[String: Any]] ?? []).filter {
+            ($0["status"] as? String) == "review_ready"
+        }
+        payload["approvals"] = approvals
+        return payload
+    }
+
     private func syncTeamStateToDaemon() {
         let payload = daemonPayload()
         DispatchQueue.global(qos: .utility).async {
@@ -3849,6 +3887,7 @@ final class TeamOrchestrator: ObservableObject {
                     "active_task_status": activeTask?.status as Any? ?? NSNull(),
                     "active_task_is_stale": activeTask.map(isTaskStale) ?? false,
                     "agent_state": agentRuntimeState(teamName: team.id, agentName: agent.name),
+                    "waiting_input": agentIsWaitingInput(agent),
                     "heartbeat_age_seconds": heartbeatAgeSeconds(teamName: team.id, agentName: agent.name) as Any? ?? NSNull(),
                     "last_heartbeat_summary": heartbeat?.summary as Any? ?? NSNull(),
                     "heartbeat_is_stale": heartbeat.map(isHeartbeatStale) ?? false,

@@ -1,7 +1,14 @@
 # 상세설계 — Mission Control 뷰 + Diff 리뷰·승인 큐
 
 작성일: 2026-07-07
-상태: Design Draft (구현 전)
+상태: P1 구현됨 — 승인 큐 액션(P2: diff_summary/approve/reject RPC)과 push 전송(P3)은 미착수
+
+구현 상태 (2026-07-07):
+- 데몬: `watch.board`(board.jsonl tail, 단위테스트 포함), `GET /api/fleet`(멀티 소켓 fleet.state 프록시 + 데몬 로컬 watch 병합), HTTP 폴링 스크립트에 fleet 폴링 추가 — **구현 + cargo 테스트 통과**.
+- Swift: v2 `fleet.state` RPC + `TeamOrchestrator.fleetState()`(approvals = review_ready 파생 포함), per-agent `waiting_input`, `DashboardController` fleet push + `focusAgentPane` 딥링크 핸들러 — **구현됨, macOS 빌드 검증 필요**.
+- 대시보드: `mission` 프리셋 + Fleet 매트릭스(상태 칩·active task·heartbeat 인라인)/Review Queue(읽기 전용)/Watch Verdicts 카드, 칸반·Gantt·요약 타일 공유 — **구현됨(JS 문법 검증만 수행), 시각 확인 필요**.
+- **설계 변경(§3)**: `waiting_input`을 `agent_state`의 새 값으로 덮어쓰지 않고 **별도 boolean 필드**로 추가했다. 근거: `tm-agent`가 `agent_state == "idle"`을 위임 대상 선정에 하드매칭(`tm_agent.rs:3449` 등)하므로 상태값 변경은 fan-out 회귀를 유발한다. `running`/`assigned_stale` 값도 유지. enum 통합은 소비자(tm-agent·dashboard) 동시 마이그레이션이 가능할 때 재검토.
+- 매핑 근거: notification `surfaceId` == bonsplit panel id (`TabManager.focusedSurfaceId == focusedPanelId`) — per-agent waiting_input은 `hasUnreadNotification(forTabId: workspaceId, surfaceId: panelId)`로 도출.
 상위 문서: `docs/strategy-differentiation-roadmap.md` §B-2, §B-3
 관련 코드: `Resources/dashboard/index.html`, `Sources/DashboardController.swift`, `Sources/TeamOrchestrator.swift`, `Sources/TerminalController.swift`, `daemon/term-meshd/src/http.rs`, `daemon/term-meshd/src/watch_controller.rs`, `daemon/term-mesh-cli/src/tm_agent.rs`
 

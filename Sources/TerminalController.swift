@@ -784,6 +784,12 @@ class TerminalController {
                 ]
             )
 
+        // Mission Control — one-shot fleet aggregate (teams × agents × tasks
+        // × attention × approvals). Read-only synchronous snapshot, so
+        // main-actor execution is allowed per the socket threading policy.
+        case "fleet.state":
+            return v2Ok(id: id, result: TeamOrchestrator.shared.fleetState())
+
         // Windows
         case "window.list":
             return v2Result(id: id, self.v2WindowList(params: params))
@@ -1250,6 +1256,7 @@ class TerminalController {
             "system.capabilities",
             "system.identify",
             "auth.login",
+            "fleet.state",
             "window.list",
             "window.current",
             "window.focus",

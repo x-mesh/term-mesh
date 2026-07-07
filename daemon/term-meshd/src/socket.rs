@@ -32,7 +32,7 @@ const MIN_WATCH_INTERVAL_SECS: u64 = 30;
 /// (P12 #6). Each drift finding is one JSONL line; the controller (P5) keys them
 /// by `check_id`, so distinct ids = number of checks that found drift. Missing or
 /// unreadable lines are skipped; a missing file yields 0.
-fn board_drift_count(working_dir: &str) -> u64 {
+pub(crate) fn board_drift_count(working_dir: &str) -> u64 {
     if working_dir.is_empty() {
         return 0;
     }
@@ -56,6 +56,40 @@ fn board_drift_count(working_dir: &str) -> u64 {
         }
     }
     seen.len() as u64
+}
+
+/// Mission Control: the most recent drift rows from
+/// `<working_dir>/.xm/watch/board.jsonl`, newest first, capped at `limit`.
+/// Rows are returned as raw JSON values (`{ts, agent, drift_type, severity,
+/// finding, spec_clause, check_id}` — see `watch_controller::BoardFinding`).
+/// Unparseable lines are skipped; a missing file yields an empty vec.
+pub(crate) fn board_recent_rows(working_dir: &str, limit: usize) -> Vec<serde_json::Value> {
+    if working_dir.is_empty() || limit == 0 {
+        return Vec::new();
+    }
+    let path = std::path::Path::new(working_dir)
+        .join(".xm")
+        .join("watch")
+        .join("board.jsonl");
+    let Ok(contents) = std::fs::read_to_string(&path) else {
+        return Vec::new();
+    };
+    let mut rows: Vec<serde_json::Value> = contents
+        .lines()
+        .filter_map(|line| {
+            let line = line.trim();
+            if line.is_empty() {
+                return None;
+            }
+            serde_json::from_str::<serde_json::Value>(line).ok()
+        })
+        .collect();
+    // Appends are chronological; sort by ts anyway to tolerate hand edits,
+    // then keep the newest `limit`, newest first.
+    rows.sort_by_key(|v| v.get("ts").and_then(|t| t.as_u64()).unwrap_or(0));
+    rows.reverse();
+    rows.truncate(limit);
+    rows
 }
 
 /// JSON-RPC 2.0 request (simplified)
@@ -2472,6 +2506,70 @@ async fn dispatch(req: &Request, ctx: &Context) -> Response {
                 }
             }
         }
+        "watch.board" => {
+            // Mission Control: return the recent drift-verdict rows themselves
+            // (`board.jsonl`), not just the `drift_count` aggregate that
+            // `watch.status` exposes. Resolution order for the board's
+            // working directory: explicit param → watch registry by team_id →
+            // registry singleton when exactly one watch exists.
+            #[derive(Deserialize)]
+            struct P {
+                #[serde(default)]
+                team_id: Option<String>,
+                #[serde(default)]
+                working_directory: Option<String>,
+                #[serde(default = "default_board_limit")]
+                limit: usize,
+            }
+            fn default_board_limit() -> usize {
+                50
+            }
+            let params: P = serde_json::from_value(req.params.clone()).unwrap_or(P {
+                team_id: None,
+                working_directory: None,
+                limit: 50,
+            });
+            let limit = params.limit.min(500);
+            let explicit_wd = params
+                .working_directory
+                .as_deref()
+                .filter(|s| !s.is_empty())
+                .map(|s| s.to_string());
+            let resolved: Result<(Option<String>, String), String> = if let Some(wd) = explicit_wd
+            {
+                Ok((params.team_id.clone(), wd))
+            } else {
+                let reg = ctx.watch_registry.lock().await;
+                if let Some(team) = params.team_id.as_deref().filter(|s| !s.is_empty()) {
+                    match reg.get(team) {
+                        Some(st) => Ok((Some(team.to_string()), st.working_directory.clone())),
+                        None => Err(format!("no watch registered for team_id={team}")),
+                    }
+                } else if reg.len() == 1 {
+                    let (team, st) = reg.iter().next().expect("len checked");
+                    Ok((Some(team.clone()), st.working_directory.clone()))
+                } else {
+                    Err(format!(
+                        "ambiguous watch target: {} watches registered — pass team_id or working_directory",
+                        reg.len()
+                    ))
+                }
+            };
+            match resolved {
+                Ok((team_id, working_dir)) => {
+                    let rows = board_recent_rows(&working_dir, limit);
+                    Ok(serde_json::json!({
+                        "status": "ok",
+                        "team_id": team_id,
+                        "working_directory": working_dir,
+                        "count": rows.len(),
+                        "drift_count": board_drift_count(&working_dir),
+                        "rows": rows,
+                    }))
+                }
+                Err(e) => Err(e),
+            }
+        }
         "headless.list_resumable" => {
             #[derive(Deserialize)]
             struct P {
@@ -3345,5 +3443,36 @@ mod tests {
         let loaded = crate::socket::watch_config::load_watch_states(wd);
         assert_eq!(loaded.len(), 1);
         assert!(!loaded[0].1.enabled, "loaded watch should be disabled");
+    }
+
+    #[test]
+    fn board_recent_rows_tails_newest_first_and_skips_garbage() {
+        let dir = tempfile::tempdir().unwrap();
+        let wd = dir.path();
+        let watch_dir = wd.join(".xm").join("watch");
+        std::fs::create_dir_all(&watch_dir).unwrap();
+        let mut lines = Vec::new();
+        for i in 1..=5u64 {
+            lines.push(format!(
+                r#"{{"ts":{},"agent":"critic","drift_type":"execution","severity":"high","finding":"f{}","spec_clause":"c","check_id":"chk-{}"}}"#,
+                1_000 + i,
+                i,
+                i
+            ));
+        }
+        lines.push("not-json garbage".to_string());
+        std::fs::write(watch_dir.join("board.jsonl"), lines.join("\n")).unwrap();
+
+        let wd_str = wd.to_string_lossy().to_string();
+        let rows = super::board_recent_rows(&wd_str, 3);
+        assert_eq!(rows.len(), 3, "limit respected, garbage line skipped");
+        // Newest first: ts 1005, 1004, 1003.
+        assert_eq!(rows[0]["ts"], 1005);
+        assert_eq!(rows[2]["ts"], 1003);
+        assert_eq!(rows[0]["finding"], "f5");
+
+        // Missing file / empty dir yields empty.
+        assert!(super::board_recent_rows("/nonexistent/path", 10).is_empty());
+        assert!(super::board_recent_rows(&wd_str, 0).is_empty());
     }
 }

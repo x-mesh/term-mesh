@@ -43,6 +43,10 @@ pub struct HttpState {
     pub agent_manager: Arc<AgentSessionManager>,
     pub dashboard_dir: Option<PathBuf>,
     pub auth_password: Option<String>,
+    /// Mission Control: drift-watch registry, so `/api/fleet` can merge watch
+    /// status + recent board rows into the fleet aggregate without a
+    /// socket round-trip.
+    pub watch_registry: crate::drift_watch::WatchRegistry,
 }
 
 pub async fn serve(
@@ -55,6 +59,7 @@ pub async fn serve(
     usage_tracker: UsageTracker,
     agent_manager: Arc<AgentSessionManager>,
     auth_password: Option<String>,
+    watch_registry: crate::drift_watch::WatchRegistry,
     mut shutdown_rx: watch::Receiver<bool>,
 ) -> anyhow::Result<()> {
     let dashboard_dir = find_dashboard_dir();
@@ -73,6 +78,7 @@ pub async fn serve(
         agent_manager,
         dashboard_dir,
         auth_password,
+        watch_registry,
     });
 
     // Public routes (no auth required)
@@ -85,6 +91,7 @@ pub async fn serve(
     // Protected routes (auth required when password is set)
     let protected_routes = Router::new()
         .route("/api/sessions", get(sessions_handler))
+        .route("/api/fleet", get(fleet_handler))
         .route("/api/team", get(team_handler))
         .route("/api/team/create", post(team_create_handler))
         .route("/api/team/teams", get(team_teams_handler))
@@ -341,6 +348,90 @@ async fn refreshed_team_state(state: &Arc<HttpState>) -> serde_json::Value {
         return live;
     }
     state.team_state.read().unwrap().clone()
+}
+
+/// Mission Control: `/api/fleet` — live-proxy of the app socket's
+/// `fleet.state` aggregate (teams × agents × tasks × attention × approvals),
+/// merged across every reachable app instance (same multi-socket scan as
+/// `/api/team`), then enriched with daemon-local watch state: per-team
+/// `{enabled, healthy, drift_count, recent[]}` from the drift-watch registry
+/// and each team's `.xm/watch/board.jsonl`.
+async fn fleet_handler(State(state): State<Arc<HttpState>>) -> Json<serde_json::Value> {
+    let cached = state.team_state.read().unwrap().clone();
+    let primary_socket = team_socket_path_from_value(&cached).ok();
+    let socket_paths = candidate_team_socket_paths(primary_socket.as_deref());
+
+    let mut teams = Vec::new();
+    let mut tasks = Vec::new();
+    let mut attention = Vec::new();
+    let mut approvals = Vec::new();
+    let mut sockets_with_teams = Vec::new();
+
+    for socket_path in socket_paths {
+        let Ok(fleet) = rpc_team_socket(&socket_path, "fleet.state", serde_json::json!({})).await
+        else {
+            continue;
+        };
+        let tag = |mut v: serde_json::Value| -> serde_json::Value {
+            if let Some(obj) = v.as_object_mut() {
+                obj.insert("socket_path".to_string(), serde_json::json!(socket_path));
+            }
+            v
+        };
+        let socket_teams: Vec<_> = fleet
+            .get("teams")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default();
+        if socket_teams.is_empty() {
+            continue;
+        }
+        sockets_with_teams.push(socket_path.clone());
+        teams.extend(socket_teams.into_iter().map(&tag));
+        for (key, out) in [
+            ("tasks", &mut tasks),
+            ("attention", &mut attention),
+            ("approvals", &mut approvals),
+        ] {
+            if let Some(rows) = fleet.get(key).and_then(|v| v.as_array()) {
+                out.extend(rows.iter().cloned().map(&tag));
+            }
+        }
+    }
+
+    // Daemon-local watch enrichment (no socket hop needed).
+    let mut watch = serde_json::Map::new();
+    {
+        let reg = state.watch_registry.lock().await;
+        for (team_id, st) in reg.iter() {
+            let recent = crate::socket::board_recent_rows(&st.working_directory, 10);
+            watch.insert(
+                team_id.clone(),
+                serde_json::json!({
+                    "enabled": st.enabled,
+                    "healthy": st.last_error.is_none() && st.consecutive_failures == 0,
+                    "interval_secs": st.interval_secs,
+                    "last_success_ts": st.last_success_ts,
+                    "consecutive_failures": st.consecutive_failures,
+                    "drift_count": crate::socket::board_drift_count(&st.working_directory),
+                    "recent": recent,
+                }),
+            );
+        }
+    }
+
+    Json(serde_json::json!({
+        "schema": 1,
+        "teams": teams,
+        "tasks": tasks,
+        "attention": attention,
+        "approvals": approvals,
+        "watch": watch,
+        "instance": {
+            "active_socket_paths": sockets_with_teams,
+            "team_count": teams.len(),
+        },
+    }))
 }
 
 async fn fetch_live_team_state(state: &Arc<HttpState>) -> Option<serde_json::Value> {
@@ -1294,6 +1385,11 @@ const HTTP_POLL_SCRIPT: &str = r#"<script>
         if (window.updateTeamAttention) updateTeamAttention(teamData.attention || []);
         if (window.updateInstanceStatus) updateInstanceStatus(teamData.instance || {});
       }
+
+      // Mission Control fleet aggregate (teams x agents x approvals + watch)
+      fetch(baseUrl + '/api/fleet').then(r => r.ok ? r.json() : null).then(d => {
+        if (d && window.updateFleet) updateFleet(d);
+      }).catch(() => {});
 
       // Agents + Tasks + Messages
       fetch(baseUrl + '/api/agents').then(r => r.ok ? r.json() : []).then(d => {
