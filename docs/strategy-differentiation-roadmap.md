@@ -4,6 +4,11 @@
 상태: Proposal (Draft)
 관련 문서: `PRD.md`, `TODO.md`, `PROJECTS.md`, `docs/peer-federation-impl-status.md`
 
+상세설계 (P0 항목):
+- §B-1 → [`docs/design/restore-fleet-session-persistence.md`](design/restore-fleet-session-persistence.md)
+- §B-2, §B-3 → [`docs/design/mission-control-approval-queue.md`](design/mission-control-approval-queue.md)
+- §E-1 → [`docs/design/mcp-server.md`](design/mcp-server.md)
+
 이 문서는 term-mesh가 "여러 AI 에이전트를 띄울 수 있는 터미널"에서
 **"AI 에이전트 함대(fleet)를 운영하는 표준 관제탑(control plane)"**으로 진화하기 위해
 해야 할 일을 전략 축별로 최대한 넓게 계획·제안한다.
