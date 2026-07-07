@@ -360,6 +360,13 @@ struct TermMeshApp: App {
                     showSettingsPanel()
                 }
             }
+            // Restore Fleet Layer 3: once the primary window is configured
+            // (and session.json layout restore has run inside TabManager
+            // init), look for crash-recoverable live team snapshots. Small
+            // delay so the daemon spawned by this launch is accepting RPCs.
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
+                TeamOrchestrator.shared.detectRestorableFleets()
+            }
         }
         .onChange(of: appearanceMode) { _ in
             applyAppearance()
@@ -406,6 +413,24 @@ struct TermMeshApp: App {
                 Task { @MainActor in
                     await showSpawnCLIDialog()
                 }
+            }
+            // Restore Fleet Layer 3: perform the restore where an active
+            // TabManager is in scope (sidebar banner button, or auto-posted
+            // by detectRestorableFleets in `always` mode).
+            .onReceive(NotificationCenter.default.publisher(for: .restoreFleetRequested)) { note in
+                guard let uuid = note.userInfo?["team_uuid"] as? String else { return }
+                let targetTabManager: TabManager = {
+                    if let kw = NSApp.keyWindow,
+                       let ctx = AppDelegate.shared?.contextForMainWindow(kw) {
+                        return ctx.tabManager
+                    }
+                    if let mw = NSApp.mainWindow,
+                       let ctx = AppDelegate.shared?.contextForMainWindow(mw) {
+                        return ctx.tabManager
+                    }
+                    return tabManager
+                }()
+                TeamOrchestrator.shared.restoreFleet(teamUuid: uuid, tabManager: targetTabManager)
             }
             // P0-5: Configure Watch sheet handler
             .onReceive(NotificationCenter.default.publisher(for: .watchConfigRequested)) { note in

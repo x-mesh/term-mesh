@@ -1,12 +1,14 @@
 # 상세설계 — 세션·팀 영속화와 Restore Fleet
 
 작성일: 2026-07-07
-상태: P1 구현됨 (Layer 1 + 2) — Layer 3(Restore UX)은 미착수
+상태: P1+P2 구현됨 (Layer 1 + 2 + 3)
 
 구현 상태 (2026-07-07):
 - 데몬: schema v2(`live`/`last_snapshot_at`/`layout_workspace_title`/`session_id_captured_at`), `team.snapshot_pane`, `headless.list_live_pane`, `resume_pane`의 live 디렉토리 지원, stale live 스냅샷 GC 강등 — **구현 + 단위테스트 통과** (`cargo test -p term-meshd headless`).
 - Swift: `syncTeamStateToDaemon` 훅 기반 디바운스 live 스냅샷(직렬 persist 큐 + retire/revive 게이트), `TeamTask: Codable`, `TeamDataStore` board.json 영속화(`~/.term-mesh/teams/<uuid>/board.json`) + pane-resume 시 `loadBoard`(in_progress→assigned 정규화) — **구현됨, macOS 빌드 검증 필요** (이 작업은 Linux 환경에서 수행되어 xcodebuild 미실행).
-- Layer 3 구현 시 주의: resume 직후 앱이 스냅샷을 다시 쓰기 전에 데몬이 재시작하면 같은 uuid가 archived(startup_fixup의 재-아카이브)와 live 양쪽에 존재할 수 있다. 복원 후보 UI는 **uuid 기준으로 dedupe**하고 live 스냅샷을 우선해야 한다.
+- Layer 3: `detectRestorableFleets`(launch +1.5s, `headless.list_live_pane` + 인스턴스 소켓 필터 + 라이브 팀 uuid 제외), 사이드바 `SidebarFleetRestoreBanner`(ask 모드), `fleetRestoreMode` UserDefaults 키(ask/always/never — Settings UI는 후속), `restoreFleet` → `team.resume_pane` → `adoptResumedPaneTeam`(worker `--resume` 포함 — 기존 배선 사용) + sid transcript 존재 가드(worktree off 팀·leader) — **구현됨, macOS 빌드 검증 필요**.
+- 미구현 (후속): 복원 직후 assigned task 자동 재디스패치 킥(§3.3 시퀀스 5단계) — CLI 기동 타이밍 race를 피하기 위해 보류. 복원된 task는 `assigned`로 보드에 노출되며 리더가 `tm-agent broadcast 'tm-agent claim'` 한 번으로 재개.
+- Layer 3 주의(구현 반영됨): resume 직후 앱이 스냅샷을 다시 쓰기 전에 데몬이 재시작하면 같은 uuid가 archived와 live 양쪽에 존재할 수 있다. 현재 배너는 live만 열거하고 기존 피커는 archived만 열거하므로 충돌하지 않지만, 두 목록을 합치는 UI를 만들 때는 uuid dedupe(live 우선)가 필요하다.
 상위 문서: `docs/strategy-differentiation-roadmap.md` §B-1
 관련 코드: `Sources/TabManager.swift`, `Sources/TeamOrchestrator.swift`, `Sources/TeamDataStore.swift`, `daemon/term-meshd/src/headless/meta.rs`, `daemon/term-mesh-cli/src/tm_agent.rs`
 

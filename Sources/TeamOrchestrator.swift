@@ -3972,12 +3972,12 @@ final class TeamOrchestrator: ObservableObject {
     /// `Team` so a subsequent destroy archives to the same UUID and preserves
     /// the per-agent session IDs (re-resumable).
     ///
-    /// The **leader** pane resumes via `--resume <leader.session_id>` (already
-    /// wired through `createTeam`'s `resumeSessionId` parameter). Per-agent
-    /// `--resume <sid>` for individual agent CLIs is a follow-up — agents
-    /// currently start fresh but their captured session IDs are preserved on
-    /// the in-memory `AgentMember` so a future iteration can wire them through
-    /// `addAgentPaneToWorkspace`'s CLI command builders.
+    /// The **leader** pane resumes via `--resume <leader.session_id>` (wired
+    /// through `createTeam`'s `resumeSessionId` parameter) and each claude
+    /// agent resumes via `--resume <sid>` (wired through
+    /// `agentResumeSessionIds` → `addAgentPaneToWorkspace`). Sids whose
+    /// transcript jsonl no longer exists are dropped (fresh start) rather than
+    /// letting the CLI error out at spawn — see the validity guard below.
     @discardableResult
     func adoptResumedPaneTeam(result: [String: Any], tabManager: TabManager) -> Team? {
         guard let teamName = result["team_name"] as? String,
@@ -4031,11 +4031,26 @@ final class TeamOrchestrator: ObservableObject {
         // agent CLI starts with `--resume <sid>` and re-attaches to its
         // previous transcript. Codex/kiro/gemini agents currently ignore
         // this; resume support for them is a follow-up.
+        // `--resume` validity guard: a sid whose transcript jsonl is gone
+        // would make the claude CLI error out at spawn. The leader always ran
+        // in the team workdir; workers share it when worktreeMode == "off".
+        // Worktree-isolated workers can't be verified here (their transcripts
+        // live under each worktree's encoded dir), so their sids pass through
+        // and degrade at the CLI level in the worst case.
+        let sharedTranscriptDir = ClaudeSessionWatcher.encodedProjectDir(workDir: workingDirectory)
+        func transcriptExists(_ sid: String) -> Bool {
+            FileManager.default.fileExists(atPath: "\(sharedTranscriptDir)/\(sid).jsonl")
+        }
+
         var agentResumeMap: [String: String] = [:]
         for a in agentsArr {
             guard let name = a["name"] as? String,
                   let sid = a["session_id"] as? String,
                   !sid.isEmpty else { continue }
+            if archivedWorktreeMode == "off" && !transcriptExists(sid) {
+                Logger.team.info("[pane-resume] dropping stale sid for agent '\(name, privacy: .public)' — transcript missing, starting fresh")
+                continue
+            }
             agentResumeMap[name] = sid
         }
 
@@ -4045,7 +4060,14 @@ final class TeamOrchestrator: ObservableObject {
         // `leaderSessionId` from the archive is the REAL claude session id
         // (discovered from ~/.claude/projects/ at archive time). Passing it
         // as `--resume` re-attaches claude to its prior transcript.
-        let leaderClaudeSid = leaderSessionId.isEmpty ? nil : leaderSessionId
+        let leaderClaudeSid: String? = {
+            guard !leaderSessionId.isEmpty else { return nil }
+            guard transcriptExists(leaderSessionId) else {
+                Logger.team.info("[pane-resume] dropping stale leader sid — transcript missing, starting fresh")
+                return nil
+            }
+            return leaderSessionId
+        }()
 
         guard let team = createTeam(
             name: teamName,
@@ -5599,6 +5621,147 @@ final class TeamOrchestrator: ObservableObject {
         }
     }
 
+    // ────────────────────────────────────────────────────────────────────────
+    // Restore Fleet Layer 3 — crash-recovery detection + one-click restore
+    //
+    // Live snapshots (Layer 1) leave `~/.term-mesh/headless/<uuid>/` behind
+    // when the app crashes. At launch we ask the daemon for those snapshots
+    // (`headless.list_live_pane`), filter out teams that are already live in
+    // this process, and surface the rest as restorable fleets — a sidebar
+    // banner in `ask` mode, automatic restore in `always` mode.
+    // ────────────────────────────────────────────────────────────────────────
+
+    /// A crash-recoverable team found via `headless.list_live_pane`.
+    struct RestorableFleet: Identifiable {
+        var id: String { teamUuid }
+        let teamUuid: String
+        let teamName: String
+        let agentCount: Int
+        let lastSnapshotAt: Date?
+        let workingDirectory: String
+        let hasAnySession: Bool
+    }
+
+    /// Published for the sidebar banner (`SidebarFleetRestoreBanner`).
+    @Published private(set) var restorableFleets: [RestorableFleet] = []
+    /// Uuids the user dismissed this run — excluded from future detects.
+    private var dismissedFleetUuids: Set<String> = []
+    /// Restore re-entrancy guard.
+    private var restoreInFlightUuids: Set<String> = []
+
+    /// Scan for crash-recoverable live snapshots and publish them. In
+    /// `always` mode each candidate immediately posts
+    /// `.restoreFleetRequested` (handled where a `TabManager` is in scope).
+    func detectRestorableFleets() {
+        guard FleetRestoreMode.current != .never else { return }
+        let params: [String: Any] = [
+            "limit": 20,
+            "app_socket_path": SocketControlSettings.socketPath(),
+        ]
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            guard let self else { return }
+            let raw = self.daemon.rpcCallRaw(method: "headless.list_live_pane", params: params)
+            var rows: [[String: Any]] = []
+            if let raw, let data = raw.data(using: .utf8),
+               let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+               let inner = obj["result"] as? [String: Any],
+               let teams = inner["teams"] as? [[String: Any]] {
+                rows = teams
+            }
+            DispatchQueue.main.async {
+                let liveUuids = Set(self.teams.values.compactMap { $0.teamUuid })
+                let fleets: [RestorableFleet] = rows.compactMap { row in
+                    guard let uuid = row["team_uuid"] as? String,
+                          let name = row["team_name"] as? String,
+                          !liveUuids.contains(uuid),
+                          !self.dismissedFleetUuids.contains(uuid) else { return nil }
+                    let ts = (row["last_snapshot_at"] as? Double) ?? 0
+                    return RestorableFleet(
+                        teamUuid: uuid,
+                        teamName: name,
+                        agentCount: ((row["agents"] as? [[String: Any]]) ?? []).count,
+                        lastSnapshotAt: ts > 0 ? Date(timeIntervalSince1970: ts) : nil,
+                        workingDirectory: (row["working_directory"] as? String) ?? "",
+                        hasAnySession: (row["has_any_session"] as? Bool) ?? false
+                    )
+                }
+                self.restorableFleets = fleets
+                if fleets.isEmpty { return }
+                Logger.team.info("[restore-fleet] detected \(fleets.count) restorable fleet(s)")
+                if FleetRestoreMode.current == .always {
+                    for fleet in fleets {
+                        NotificationCenter.default.post(
+                            name: .restoreFleetRequested,
+                            object: nil,
+                            userInfo: ["team_uuid": fleet.teamUuid]
+                        )
+                    }
+                }
+            }
+        }
+    }
+
+    /// Restore one fleet: `team.resume_pane` (which also resolves live
+    /// snapshot dirs) → `adoptResumedPaneTeam` (workspace + panes +
+    /// per-agent `--resume` + board reload). Mirrors the manual resume
+    /// picker's flow (`TeamCreationView.invokeResume`).
+    func restoreFleet(
+        teamUuid: String,
+        tabManager: TabManager,
+        completion: ((Bool, String?) -> Void)? = nil
+    ) {
+        guard !restoreInFlightUuids.contains(teamUuid) else {
+            completion?(false, "restore already in flight")
+            return
+        }
+        restoreInFlightUuids.insert(teamUuid)
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            guard let self else { return }
+            let raw = self.daemon.rpcCallRaw(
+                method: "team.resume_pane", params: ["team_uuid": teamUuid]
+            )
+            var resultDict: [String: Any]?
+            var errMsg: String?
+            if let raw, let data = raw.data(using: .utf8),
+               let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+                if let e = obj["error"] as? String {
+                    errMsg = e
+                } else if let r = obj["result"] as? [String: Any] {
+                    resultDict = r
+                } else {
+                    resultDict = obj
+                }
+            } else {
+                errMsg = "daemon did not respond"
+            }
+            DispatchQueue.main.async {
+                self.restoreInFlightUuids.remove(teamUuid)
+                if let errMsg {
+                    Logger.team.warning("[restore-fleet] resume_pane failed uuid=\(teamUuid, privacy: .public): \(errMsg, privacy: .public)")
+                    completion?(false, errMsg)
+                    return
+                }
+                guard let resultDict,
+                      let team = self.adoptResumedPaneTeam(result: resultDict, tabManager: tabManager)
+                else {
+                    Logger.team.warning("[restore-fleet] adopt failed uuid=\(teamUuid, privacy: .public)")
+                    completion?(false, "adopt failed")
+                    return
+                }
+                self.restorableFleets.removeAll { $0.teamUuid == teamUuid }
+                Logger.team.info("[restore-fleet] restored team '\(team.id, privacy: .public)' (\(team.agents.count) agents)")
+                completion?(true, nil)
+            }
+        }
+    }
+
+    /// Hide a fleet from the banner for the rest of this app run. The
+    /// snapshot stays on disk (stale-snapshot GC handles eventual cleanup).
+    func dismissRestorableFleet(teamUuid: String) {
+        dismissedFleetUuids.insert(teamUuid)
+        restorableFleets.removeAll { $0.teamUuid == teamUuid }
+    }
+
     private func agentRuntimeState(teamName: String, agentName: String) -> String {
         // Phase 2: parked is daemon-authoritative — overrides task-derived state
         // because the subprocess is not live regardless of task board entry.
@@ -5664,6 +5827,28 @@ private extension String {
         let trimmed = trimmingCharacters(in: .whitespacesAndNewlines)
         return trimmed.isEmpty ? nil : trimmed
     }
+}
+
+/// Restore Fleet Layer 3 — launch-time behavior when crash-recoverable live
+/// team snapshots are found. Stored in UserDefaults key "fleetRestoreMode"
+/// ("ask" | "always" | "never"); missing/unknown values fall back to `.ask`.
+enum FleetRestoreMode: String {
+    case ask
+    case always
+    case never
+
+    static var current: FleetRestoreMode {
+        let raw = UserDefaults.standard.string(forKey: "fleetRestoreMode") ?? "ask"
+        return FleetRestoreMode(rawValue: raw) ?? .ask
+    }
+}
+
+extension Notification.Name {
+    /// Posted with userInfo `{"team_uuid": String}` to request a fleet
+    /// restore. Handled in `TermMeshApp` (where the active `TabManager` is in
+    /// scope). Posted by the sidebar banner's Restore button and, in
+    /// `FleetRestoreMode.always`, by `detectRestorableFleets` itself.
+    static let restoreFleetRequested = Notification.Name("term-mesh.restoreFleetRequested")
 }
 
 /// Shared gate instance. File-scope (not a static on the @MainActor class) so
