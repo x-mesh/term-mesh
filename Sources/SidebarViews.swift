@@ -96,6 +96,11 @@ struct VerticalTabsSidebar: View {
             SidebarWorktreeSandboxToggle()
                 .frame(maxWidth: .infinity, alignment: .leading)
 
+            // Restore Fleet — crash-recovery banner. Empty when no live
+            // snapshots were found at launch (or all were restored/dismissed).
+            SidebarFleetRestoreBanner()
+                .frame(maxWidth: .infinity, alignment: .leading)
+
             // Phase 2.5 — resumable team counter. Hidden when count == 0.
             SidebarResumableFooter()
                 .frame(maxWidth: .infinity, alignment: .leading)
@@ -170,6 +175,69 @@ struct VerticalTabsSidebar: View {
     private func debugShortSidebarTabId(_ id: UUID?) -> String {
         guard let id else { return "nil" }
         return String(id.uuidString.prefix(5))
+    }
+}
+
+// MARK: - Restore Fleet Layer 3 — crash-recovery banner
+
+/// One row per crash-recoverable team snapshot (`TeamOrchestrator.
+/// restorableFleets`, populated by `detectRestorableFleets()` at launch in
+/// `ask` mode). Restore routes through `.restoreFleetRequested` so the
+/// handler with an active `TabManager` (TermMeshApp) performs the adopt;
+/// the X button hides the row for this app run.
+struct SidebarFleetRestoreBanner: View {
+    @ObservedObject private var orchestrator = TeamOrchestrator.shared
+
+    var body: some View {
+        ForEach(orchestrator.restorableFleets) { fleet in
+            HStack(spacing: 6) {
+                Image(systemName: "arrow.counterclockwise.circle.fill")
+                    .font(.system(size: 10))
+                    .foregroundColor(.orange)
+                VStack(alignment: .leading, spacing: 1) {
+                    Text(fleet.teamName)
+                        .font(.system(size: 10, weight: .semibold))
+                        .lineLimit(1)
+                    Text(subtitle(for: fleet))
+                        .font(.system(size: 9))
+                        .foregroundColor(.secondary)
+                        .lineLimit(1)
+                }
+                Spacer(minLength: 4)
+                Button("Restore") {
+                    NotificationCenter.default.post(
+                        name: .restoreFleetRequested,
+                        object: nil,
+                        userInfo: ["team_uuid": fleet.teamUuid]
+                    )
+                }
+                .buttonStyle(.plain)
+                .font(.system(size: 10, weight: .medium))
+                .foregroundColor(.accentColor)
+                .help("Restore this team's workspace, agents, and task board")
+                Button {
+                    orchestrator.dismissRestorableFleet(teamUuid: fleet.teamUuid)
+                } label: {
+                    Image(systemName: "xmark")
+                        .font(.system(size: 8, weight: .bold))
+                        .foregroundColor(.secondary)
+                }
+                .buttonStyle(.plain)
+                .help("Dismiss (snapshot stays on disk)")
+            }
+            .padding(.horizontal, 10)
+            .padding(.vertical, 4)
+        }
+    }
+
+    private func subtitle(for fleet: TeamOrchestrator.RestorableFleet) -> String {
+        var parts = ["\(fleet.agentCount) agent\(fleet.agentCount == 1 ? "" : "s")"]
+        if let at = fleet.lastSnapshotAt {
+            let formatter = RelativeDateTimeFormatter()
+            formatter.unitsStyle = .abbreviated
+            parts.append(formatter.localizedString(for: at, relativeTo: Date()))
+        }
+        return parts.joined(separator: " · ")
     }
 }
 
