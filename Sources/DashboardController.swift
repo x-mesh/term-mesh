@@ -6,7 +6,7 @@ import os
 // MARK: - Dashboard Preset
 
 enum DashboardPreset: String {
-    case overview, teamOps, devOps, cost
+    case overview, teamOps, devOps, cost, mission
 }
 
 // MARK: - Agent Timeline
@@ -124,6 +124,7 @@ final class DashboardController: NSObject, WKNavigationDelegate {
             config.userContentController.add(handler, name: "teamTaskAction")
             config.userContentController.add(handler, name: "teamTaskCreate")
             config.userContentController.add(handler, name: "switchPreset")
+            config.userContentController.add(handler, name: "focusAgentPane")
         }
 
         let wv = WKWebView(frame: .zero, configuration: config)
@@ -622,6 +623,31 @@ final class DashboardController: NSObject, WKNavigationDelegate {
             let agentsData = daemon.rpcCallRaw(method: "agent.list", params: ["include_terminated": false])
             let tasksData = daemon.rpcCallRaw(method: "task.list", params: [:] as [String: Any])
 
+            // Mission Control: drift-watch status + recent board rows per
+            // watched team ({team_id: {enabled, healthy, …, recent[]}}).
+            var watchMap: [String: Any] = [:]
+            if let statusRaw = daemon.rpcCallRaw(method: "watch.status", params: [:]),
+               let statusData = statusRaw.data(using: .utf8),
+               let statusObj = try? JSONSerialization.jsonObject(with: statusData) as? [String: Any],
+               let statusResult = statusObj["result"] as? [String: Any],
+               let watches = statusResult["watches"] as? [[String: Any]] {
+                for st in watches.prefix(6) {
+                    guard let teamId = st["team_id"] as? String else { continue }
+                    var entry = st
+                    if let boardRaw = daemon.rpcCallRaw(
+                        method: "watch.board",
+                        params: ["team_id": teamId, "limit": 10]
+                    ),
+                       let boardData = boardRaw.data(using: .utf8),
+                       let boardObj = try? JSONSerialization.jsonObject(with: boardData) as? [String: Any],
+                       let boardResult = boardObj["result"] as? [String: Any] {
+                        entry["recent"] = boardResult["rows"] ?? []
+                        entry["drift_count"] = boardResult["drift_count"] ?? 0
+                    }
+                    watchMap[teamId] = entry
+                }
+            }
+
             DispatchQueue.main.async {
                 let teamPayload = self.currentTeamPayload()
                 let teamData = teamPayload["teams"] as? [[String: Any]] ?? []
@@ -708,6 +734,14 @@ final class DashboardController: NSObject, WKNavigationDelegate {
                 }
                 if let perfJson = Self.dashboardJSONString(perfPayload) {
                     webView.evaluateJavaScript("if(window.updatePerformance)updatePerformance(\(perfJson));") { _, _ in }
+                }
+
+                // Mission Control: fleet aggregate (teams × agents × tasks ×
+                // attention × approvals) + daemon watch enrichment.
+                var fleet = TeamOrchestrator.shared.fleetState()
+                fleet["watch"] = watchMap
+                if let fleetJson = Self.dashboardJSONString(fleet) {
+                    webView.evaluateJavaScript("if(window.updateFleet)updateFleet(\(fleetJson));") { _, _ in }
                 }
 
                 // Context-based auto-focus (skip if user manually selected a preset)
@@ -913,6 +947,20 @@ private class DashboardMessageHandler: NSObject, WKScriptMessageHandler {
             Task { @MainActor in
                 self.controller?.currentPreset = preset
                 self.controller?.userOverride = true
+            }
+        case "focusAgentPane":
+            // Mission Control deep link: matrix row click → jump to the
+            // agent's pane. User-initiated (a click in the dashboard), so
+            // mutating in-app focus is within the socket focus policy. Only
+            // available in the WKWebView dashboard — the HTTP dashboard has
+            // no message handler and hides the affordance.
+            guard let dict = message.body as? [String: Any],
+                  let workspaceStr = dict["workspace_id"] as? String,
+                  let tabId = UUID(uuidString: workspaceStr) else { return }
+            let panelId = (dict["panel_id"] as? String).flatMap(UUID.init(uuidString:))
+            Task { @MainActor in
+                NSApp.activate(ignoringOtherApps: true)
+                self.controller?.tabManager?.focusTabFromNotification(tabId, surfaceId: panelId)
             }
         default:
             break

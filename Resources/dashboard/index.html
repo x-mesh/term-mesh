@@ -1227,6 +1227,7 @@
 
     <div class="preset-switcher">
       <button data-preset="overview" class="active" onclick="switchPreset('overview')">Overview</button>
+      <button data-preset="mission" onclick="switchPreset('mission')">Mission</button>
       <button data-preset="teamOps" onclick="switchPreset('teamOps')">Team Ops</button>
       <button data-preset="devOps" onclick="switchPreset('devOps')">DevOps</button>
       <button data-preset="cost" onclick="switchPreset('cost')">Cost</button>
@@ -1235,7 +1236,7 @@
     <div class="sidebar-section">
       <div class="sidebar-label">Operations</div>
       <nav class="sidebar-nav">
-        <a class="active" href="#overview" data-presets="overview,teamOps,devOps,cost">Executive Summary</a>
+        <a class="active" href="#overview" data-presets="overview,teamOps,devOps,cost,mission">Executive Summary</a>
         <a href="#team-attention-card" data-presets="overview,teamOps">Needs Attention</a>
         <a href="#team-completions-card" data-presets="teamOps">Recent Completions</a>
         <a href="#team-tasks-card" data-presets="overview,teamOps">Team Tasks</a>
@@ -1289,7 +1290,7 @@
       </div>
     </div>
 
-    <div class="metrics-grid dashboard-section" data-presets="overview,teamOps,devOps,cost">
+    <div class="metrics-grid dashboard-section" data-presets="overview,teamOps,devOps,cost,mission">
       <div class="metric-card">
         <div class="label">Teams</div>
         <div class="value" id="summary-team-count">0</div>
@@ -1313,8 +1314,51 @@
     </div>
 
     <div class="grid">
+  <!-- Mission Control (Mission) — agent × state matrix with heartbeats -->
+  <style>
+    .fleet-row { display:flex; align-items:center; gap:8px; padding:5px 8px; border-radius:6px; font-size:12px; }
+    .fleet-row:hover { background: rgba(127,127,127,0.08); }
+    .fleet-row.clickable { cursor:pointer; }
+    .fleet-chip { flex:0 0 auto; min-width:86px; text-align:center; padding:1px 8px; border-radius:9px; font-size:10px; font-weight:600; text-transform:uppercase; letter-spacing:.04em; }
+    .fleet-chip.working { background:rgba(52,199,89,.18); color:#34c759; }
+    .fleet-chip.idle { background:rgba(127,127,127,.15); color:#8e8e93; }
+    .fleet-chip.waiting { background:rgba(255,159,10,.2); color:#ff9f0a; }
+    .fleet-chip.blocked { background:rgba(255,69,58,.18); color:#ff453a; }
+    .fleet-chip.review { background:rgba(10,132,255,.18); color:#0a84ff; }
+    .fleet-chip.stale { background:rgba(255,214,10,.18); color:#b8860b; }
+    .fleet-name { flex:0 0 auto; min-width:110px; font-weight:600; }
+    .fleet-task { flex:1 1 auto; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; opacity:.85; }
+    .fleet-heartbeat { flex:0 1 auto; max-width:38%; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-size:10.5px; opacity:.6; }
+    .fleet-heartbeat.stale { color:#ff9f0a; opacity:.9; }
+    .fleet-team-header { font-size:11px; font-weight:700; opacity:.65; margin:8px 0 2px; text-transform:uppercase; letter-spacing:.05em; }
+    .fleet-empty { font-size:12px; opacity:.55; padding:8px; }
+    .fleet-watch-row { display:flex; gap:8px; padding:4px 8px; font-size:11.5px; align-items:baseline; }
+    .fleet-watch-sev { flex:0 0 auto; min-width:52px; font-weight:700; text-transform:uppercase; font-size:9.5px; }
+    .fleet-watch-sev.high { color:#ff453a; }
+    .fleet-watch-sev.medium { color:#ff9f0a; }
+    .fleet-watch-sev.low { color:#8e8e93; }
+    .fleet-watch-ts { flex:0 0 auto; opacity:.5; font-size:10px; min-width:64px; }
+    .fleet-approval { padding:6px 8px; border-left:3px solid #0a84ff; margin:4px 0; border-radius:4px; background:rgba(10,132,255,.06); font-size:12px; }
+  </style>
+  <div class="card full dashboard-section" data-presets="mission" id="fleet-matrix-card">
+    <h2>Fleet — Agents</h2>
+    <div id="fleet-matrix"><div class="fleet-empty">No fleet data yet.</div></div>
+  </div>
+
+  <!-- Mission Control — review queue (review_ready tasks) -->
+  <div class="card dashboard-section" data-presets="mission" id="fleet-approvals-card">
+    <h2>Review Queue</h2>
+    <div id="fleet-approvals"><div class="fleet-empty">Nothing waiting for review.</div></div>
+  </div>
+
+  <!-- Mission Control — watch drift verdict history -->
+  <div class="card dashboard-section" data-presets="mission" id="fleet-watch-card">
+    <h2>Watch Verdicts</h2>
+    <div id="fleet-watch"><div class="fleet-empty">No watch configured.</div></div>
+  </div>
+
   <!-- Agent Timeline (Team Ops) -->
-  <div class="card full dashboard-section" data-presets="teamOps" id="agent-timeline-card">
+  <div class="card full dashboard-section" data-presets="teamOps,mission" id="agent-timeline-card">
     <h2>Agent Timeline</h2>
     <div class="chart-container" style="height:250px">
       <canvas id="timelineGanttChart"></canvas>
@@ -1518,7 +1562,7 @@
     <div id="tasks-board"><div class="empty">No tasks</div></div>
   </div>
 
-  <div class="card dashboard-section" id="team-tasks-card" data-presets="overview,teamOps">
+  <div class="card dashboard-section" id="team-tasks-card" data-presets="overview,teamOps,mission">
     <h2>Team Tasks</h2>
     <div id="team-tasks-toolbar"></div>
     <div id="team-tasks-board" class="kanban-board">
@@ -2979,6 +3023,139 @@ function updateAgents(agents) {
   _cachedAgents = agents;
   renderAgents();
   updateSummaryCards();
+}
+
+// ── Mission Control (fleet.state aggregate) ────────────────────────────────
+let _fleet = null;
+
+function updateFleet(fleet) {
+  _fleet = fleet || {};
+  renderFleetMatrix();
+  renderFleetApprovals();
+  renderFleetWatch();
+}
+
+function fleetStateChip(agent) {
+  if (agent.waiting_input) return { cls: 'waiting', text: 'waiting input' };
+  const s = agent.agent_state || 'idle';
+  const map = {
+    running: 'working', idle: 'idle', blocked: 'blocked',
+    review_ready: 'review', error: 'blocked', parked: 'idle',
+    assigned_stale: 'stale',
+  };
+  return { cls: map[s] || 'idle', text: s.replace(/_/g, ' ') };
+}
+
+function fleetCanFocus() {
+  return !!(window.webkit && window.webkit.messageHandlers
+    && window.webkit.messageHandlers.focusAgentPane);
+}
+
+function fleetFocusPane(workspaceId, panelId) {
+  if (!fleetCanFocus()) return;
+  window.webkit.messageHandlers.focusAgentPane.postMessage({
+    workspace_id: workspaceId, panel_id: panelId || null,
+  });
+}
+
+function fleetAgo(tsSeconds) {
+  if (!tsSeconds) return '';
+  const secs = Math.max(0, Math.floor(Date.now() / 1000 - tsSeconds));
+  if (secs < 60) return secs + 's ago';
+  if (secs < 3600) return Math.floor(secs / 60) + 'm ago';
+  if (secs < 86400) return Math.floor(secs / 3600) + 'h ago';
+  return Math.floor(secs / 86400) + 'd ago';
+}
+
+function renderFleetMatrix() {
+  const el = document.getElementById('fleet-matrix');
+  if (!el) return;
+  const teams = (_fleet && _fleet.teams) || [];
+  if (!teams.length) {
+    el.innerHTML = '<div class="fleet-empty">No teams running. Create one with tm-agent create or the New Agent Team sheet.</div>';
+    return;
+  }
+  const canFocus = fleetCanFocus();
+  let html = '';
+  for (const team of teams) {
+    html += '<div class="fleet-team-header">' + escapeHTML(team.team_name || '') + '</div>';
+    for (const agent of (team.agents || [])) {
+      const chip = fleetStateChip(agent);
+      const task = agent.active_task_title || '';
+      let hb = '';
+      let hbStale = '';
+      if (agent.last_heartbeat_summary) {
+        hb = escapeHTML(agent.last_heartbeat_summary);
+        if (agent.heartbeat_age_seconds != null) {
+          hb += ' · ' + escapeHTML(fleetAgo(Date.now() / 1000 - agent.heartbeat_age_seconds));
+        }
+        if (agent.heartbeat_is_stale) hbStale = ' stale';
+      }
+      const clickable = canFocus && agent.workspace_id;
+      const attrs = clickable
+        ? ' class="fleet-row clickable" onclick="fleetFocusPane(\'' + escapeHTML(agent.workspace_id) + '\',\'' + escapeHTML(agent.panel_id || '') + '\')"'
+        : ' class="fleet-row"';
+      html += '<div' + attrs + '>'
+        + '<span class="fleet-chip ' + chip.cls + '">' + escapeHTML(chip.text) + '</span>'
+        + '<span class="fleet-name">' + escapeHTML(agent.name || '') + '</span>'
+        + '<span class="fleet-task">' + escapeHTML(task) + '</span>'
+        + '<span class="fleet-heartbeat' + hbStale + '">' + hb + '</span>'
+        + '</div>';
+    }
+  }
+  el.innerHTML = html;
+}
+
+function renderFleetApprovals() {
+  const el = document.getElementById('fleet-approvals');
+  if (!el) return;
+  const approvals = (_fleet && _fleet.approvals) || [];
+  if (!approvals.length) {
+    el.innerHTML = '<div class="fleet-empty">Nothing waiting for review.</div>';
+    return;
+  }
+  el.innerHTML = approvals.map(t => {
+    const meta = [t.team_name, t.assignee, t.worktree_branch]
+      .filter(Boolean).map(escapeHTML).join(' · ');
+    const summary = t.review_summary ? '<div style="opacity:.7;font-size:11px;margin-top:2px">'
+      + escapeHTML(t.review_summary) + '</div>' : '';
+    return '<div class="fleet-approval"><strong>' + escapeHTML(t.title || t.id || '')
+      + '</strong><div style="opacity:.6;font-size:10.5px">' + meta + '</div>' + summary + '</div>';
+  }).join('');
+}
+
+function renderFleetWatch() {
+  const el = document.getElementById('fleet-watch');
+  if (!el) return;
+  const watch = (_fleet && _fleet.watch) || {};
+  const teamIds = Object.keys(watch);
+  if (!teamIds.length) {
+    el.innerHTML = '<div class="fleet-empty">No watch configured. Enable with /watch on.</div>';
+    return;
+  }
+  let html = '';
+  for (const teamId of teamIds) {
+    const w = watch[teamId] || {};
+    const health = w.enabled === false ? 'off' : (w.healthy === false ? 'unhealthy' : 'healthy');
+    html += '<div class="fleet-team-header">' + escapeHTML(teamId)
+      + ' — ' + escapeHTML(health)
+      + (w.drift_count ? ' · ' + escapeHTML(String(w.drift_count)) + ' drift(s)' : '')
+      + '</div>';
+    const rows = w.recent || [];
+    if (!rows.length) {
+      html += '<div class="fleet-empty">No drift findings — on track.</div>';
+      continue;
+    }
+    for (const row of rows) {
+      const sev = (row.severity || 'low').toLowerCase();
+      html += '<div class="fleet-watch-row">'
+        + '<span class="fleet-watch-ts">' + escapeHTML(fleetAgo(row.ts)) + '</span>'
+        + '<span class="fleet-watch-sev ' + escapeHTML(sev) + '">' + escapeHTML(sev) + '</span>'
+        + '<span>' + escapeHTML(row.finding || '') + '</span>'
+        + '</div>';
+    }
+  }
+  el.innerHTML = html;
 }
 
 function updateTeamAgents(teams) {

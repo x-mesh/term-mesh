@@ -269,6 +269,7 @@ async fn main() -> anyhow::Result<()> {
             usage_tracker.clone(),
             agent_manager.clone(),
             http_password,
+            watch_registry.clone(),
             shutdown_rx.clone(),
         ))
     };
