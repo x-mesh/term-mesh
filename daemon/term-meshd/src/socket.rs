@@ -142,6 +142,26 @@ pub enum DaemonEvent {
         agents: Vec<crate::headless::UsageTickAgent>,
         ts_ms: u64,
     },
+    /// XK-EVENTS-v1 (x-kit panel integration Phase 2): external-run telemetry
+    /// published by x-kit tools (x-panel review/cross runs). Pure fan-out —
+    /// never persisted; the producer's `.xm/` status files remain the durable
+    /// record. Only delivered to subscribers that explicitly request
+    /// `kinds:["xk_run"]`. Contract: `xm/docs/x-panel-term-mesh-phase2.md` §4.
+    XkRun {
+        v: u32,
+        source: String,
+        run: String,
+        run_kind: String,
+        phase: String,
+        model: String,
+        state: String,
+        elapsed_ms: u64,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        tail: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        title: Option<String>,
+        ts_ms: u64,
+    },
 }
 
 /// Broadcast channel sender. All `events.subscribe` connections subscribe from this.
@@ -554,7 +574,14 @@ fn filter_and_serialize(
         DaemonEvent::Reply { .. } => "reply",
         DaemonEvent::HeartbeatStale { .. } => "heartbeat_stale",
         DaemonEvent::AgentUsageTick { .. } => "agent_usage_tick",
+        DaemonEvent::XkRun { .. } => "xk_run",
     };
+    // xk_run is strictly opt-in: an empty filter set (wildcard) or the default
+    // set must never receive it, so `tm-agent wait`/Swift stay noise-free
+    // (XK-EVENTS-v1 rule 3).
+    if kind == "xk_run" && !filter_kinds.contains(kind) {
+        return None;
+    }
     if !filter_kinds.is_empty() && !filter_kinds.contains(kind) {
         return None;
     }
@@ -562,6 +589,92 @@ fn filter_and_serialize(
     // without a leader_session_id filter receives all events (generous default).
     // Per-leader scoping can be tightened in a follow-up without protocol changes.
     serde_json::to_vec(ev).ok()
+}
+
+/// XK-EVENTS-v1 caps (contract §4 rule 4): whole event and redacted tail.
+const XK_RUN_MAX_EVENT_BYTES: usize = 4096;
+const XK_RUN_MAX_TAIL_BYTES: usize = 512;
+
+/// Truncate to at most `max` bytes without splitting a UTF-8 code point.
+fn truncate_utf8(s: &str, max: usize) -> &str {
+    if s.len() <= max {
+        return s;
+    }
+    let mut end = max;
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
+}
+
+/// `events.publish {kind:"xk_run", …}` — XK-EVENTS-v1 external-run telemetry
+/// (x-kit panel integration Phase 2). Validates, caps sizes, stamps `ts_ms`
+/// server-side (consistent with the task_status/reply publish path), and fans
+/// out on the broadcast bus. Never persisted.
+fn publish_xk_run(
+    params: &serde_json::Value,
+    event_tx: &EventSender,
+) -> Result<serde_json::Value, String> {
+    fn default_v() -> u32 {
+        1
+    }
+    #[derive(Deserialize)]
+    struct P {
+        #[serde(default = "default_v")]
+        v: u32,
+        #[serde(default)]
+        source: String,
+        #[serde(default)]
+        run: String,
+        #[serde(default)]
+        run_kind: String,
+        #[serde(default)]
+        phase: String,
+        #[serde(default)]
+        model: String,
+        #[serde(default)]
+        state: String,
+        #[serde(default)]
+        elapsed_ms: u64,
+        #[serde(default)]
+        tail: Option<String>,
+        #[serde(default)]
+        title: Option<String>,
+    }
+
+    let raw_len = serde_json::to_string(params).map(|s| s.len()).unwrap_or(0);
+    if raw_len > XK_RUN_MAX_EVENT_BYTES {
+        return Err(format!(
+            "events.publish: xk_run event {raw_len} bytes exceeds {XK_RUN_MAX_EVENT_BYTES}"
+        ));
+    }
+    let p: P =
+        serde_json::from_value(params.clone()).map_err(|e| format!("invalid params: {e}"))?;
+    if p.source.is_empty() || p.run.is_empty() {
+        return Err("events.publish: xk_run requires non-empty 'source' and 'run'".into());
+    }
+    let tail = p
+        .tail
+        .map(|t| truncate_utf8(&t, XK_RUN_MAX_TAIL_BYTES).to_string());
+    let ts_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    // Err means no subscribers — fine to ignore (fan-out only, no persistence).
+    let _ = event_tx.send(DaemonEvent::XkRun {
+        v: p.v,
+        source: p.source,
+        run: p.run,
+        run_kind: p.run_kind,
+        phase: p.phase,
+        model: p.model,
+        state: p.state,
+        elapsed_ms: p.elapsed_ms,
+        tail,
+        title: p.title,
+        ts_ms,
+    });
+    Ok(serde_json::json!({"published": true}))
 }
 
 /// Phase 2.5: every 1s, ask the headless manager which agents have a dirty
@@ -1784,6 +1897,11 @@ async fn dispatch(req: &Request, ctx: &Context) -> Response {
         // successful GUI-side mutations so that CLI `tm-agent wait` push subscribers
         // receive real-time events instead of waiting for the polling fallback.
         "events.publish" => {
+            // xk_run has its own field set, validation, and size caps — handled
+            // by a dedicated function so it stays unit-testable (XK-EVENTS-v1).
+            if req.params.get("kind").and_then(|v| v.as_str()) == Some("xk_run") {
+                publish_xk_run(&req.params, &ctx.event_tx)
+            } else {
             #[derive(Deserialize)]
             struct P {
                 kind: String,
@@ -1831,6 +1949,7 @@ async fn dispatch(req: &Request, ctx: &Context) -> Response {
                     })
                 }
                 Err(e) => Err(format!("invalid params: {e}")),
+            }
             }
         }
 
@@ -2991,6 +3110,142 @@ async fn query_gui_team_workers(app_socket: &str, team_id: &str) -> Vec<String> 
 mod tests {
     use super::*;
     use serde_json::json;
+
+    // ── xk_run publish/subscribe (XK-EVENTS-v1) ──
+
+    fn xk_kinds(kinds: &[&str]) -> std::collections::HashSet<String> {
+        kinds.iter().map(|s| s.to_string()).collect()
+    }
+
+    fn valid_xk_params() -> serde_json::Value {
+        json!({
+            "kind": "xk_run",
+            "source": "x-panel",
+            "run": "20260707-1030-ab12",
+            "run_kind": "review",
+            "phase": "round1",
+            "model": "codex",
+            "state": "running",
+            "elapsed_ms": 41200,
+            "tail": "…last output…",
+            "title": "diff HEAD~1"
+        })
+    }
+
+    #[test]
+    fn xk_run_publish_round_trip() {
+        let (tx, mut rx) = tokio::sync::broadcast::channel(8);
+        let res = publish_xk_run(&valid_xk_params(), &tx).expect("publish ok");
+        assert_eq!(res, json!({"published": true}));
+        let ev = rx.try_recv().expect("event delivered");
+        match &ev {
+            DaemonEvent::XkRun {
+                v,
+                source,
+                run,
+                phase,
+                model,
+                state,
+                ts_ms,
+                ..
+            } => {
+                assert_eq!(*v, 1, "v defaults to 1 when omitted-compatible");
+                assert_eq!(source, "x-panel");
+                assert_eq!(run, "20260707-1030-ab12");
+                assert_eq!(phase, "round1");
+                assert_eq!(model, "codex");
+                assert_eq!(state, "running");
+                assert!(*ts_ms > 0, "ts_ms stamped server-side");
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+        // Wire shape: serde tag = kind, snake_case.
+        let bytes = filter_and_serialize(&ev, &xk_kinds(&["xk_run"]), None).expect("delivered");
+        let wire: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(wire["kind"], "xk_run");
+        assert_eq!(wire["run_kind"], "review");
+    }
+
+    #[test]
+    fn xk_run_is_opt_in_only() {
+        let (tx, mut rx) = tokio::sync::broadcast::channel(8);
+        publish_xk_run(&valid_xk_params(), &tx).unwrap();
+        let ev = rx.try_recv().unwrap();
+        // Default subscriber filter set (events.subscribe with no kinds param).
+        let default_set = xk_kinds(&["task_status", "reply", "heartbeat_stale", "agent_usage_tick"]);
+        assert!(
+            filter_and_serialize(&ev, &default_set, None).is_none(),
+            "default subscribers must not receive xk_run"
+        );
+        // Empty set = wildcard for other kinds, but still not xk_run.
+        assert!(
+            filter_and_serialize(&ev, &xk_kinds(&[]), None).is_none(),
+            "wildcard subscribers must not receive xk_run"
+        );
+        // Sanity: wildcard still receives non-xk kinds.
+        let task_ev = DaemonEvent::TaskStatus {
+            team: "t".into(),
+            agent: "a".into(),
+            task_id: "id".into(),
+            status: "completed".into(),
+            prev_status: "in_progress".into(),
+            ts_ms: 1,
+        };
+        assert!(filter_and_serialize(&task_ev, &xk_kinds(&[]), None).is_some());
+        // Explicit opt-in receives it.
+        assert!(filter_and_serialize(&ev, &xk_kinds(&["xk_run", "reply"]), None).is_some());
+    }
+
+    #[test]
+    fn xk_run_rejects_oversized_event() {
+        let (tx, mut rx) = tokio::sync::broadcast::channel(8);
+        let mut params = valid_xk_params();
+        params["title"] = json!("x".repeat(XK_RUN_MAX_EVENT_BYTES));
+        let err = publish_xk_run(&params, &tx).expect_err("must reject > 4 KiB");
+        assert!(err.contains("exceeds"), "error names the cap: {err}");
+        assert!(rx.try_recv().is_err(), "nothing published on reject");
+    }
+
+    #[test]
+    fn xk_run_rejects_missing_source_or_run() {
+        let (tx, _rx) = tokio::sync::broadcast::channel(8);
+        let mut no_source = valid_xk_params();
+        no_source["source"] = json!("");
+        assert!(publish_xk_run(&no_source, &tx).is_err());
+        let mut no_run = valid_xk_params();
+        no_run.as_object_mut().unwrap().remove("run");
+        assert!(publish_xk_run(&no_run, &tx).is_err());
+    }
+
+    #[test]
+    fn xk_run_truncates_tail_on_char_boundary() {
+        let (tx, mut rx) = tokio::sync::broadcast::channel(8);
+        let mut params = valid_xk_params();
+        // 3-byte chars ("한") straddle the 512-byte cap: 171*3 = 513 → must cut
+        // back to 510, never mid-code-point.
+        params["tail"] = json!("한".repeat(171));
+        publish_xk_run(&params, &tx).unwrap();
+        match rx.try_recv().unwrap() {
+            DaemonEvent::XkRun { tail: Some(t), .. } => {
+                assert!(t.len() <= XK_RUN_MAX_TAIL_BYTES);
+                assert_eq!(t.len(), 510);
+                assert!(t.chars().all(|c| c == '한'), "no broken code points");
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn xk_run_default_v_is_1_when_absent() {
+        let (tx, mut rx) = tokio::sync::broadcast::channel(8);
+        let mut params = valid_xk_params();
+        params.as_object_mut().unwrap().remove("v");
+        publish_xk_run(&params, &tx).unwrap();
+        match rx.try_recv().unwrap() {
+            DaemonEvent::XkRun { v, .. } => assert_eq!(v, 1),
+            other => panic!("unexpected event: {other:?}"),
+        }
+    }
 
     // ── leader-as-watch-target fallback (D1/D6) ──
 
