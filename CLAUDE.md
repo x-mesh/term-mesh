@@ -296,6 +296,10 @@ escape hatch.
 
 ### XM skill agent fan-out routing
 
+> 이 계약의 단일 원본은 x-kit 저장소의 `docs/term-mesh-integration.md`이며, 실행 시점 규칙은
+> xm 플러그인에 내장된 `x-agent/skills/agent/references/term-mesh-backend.md`로 배포된다.
+> 이 섹션과 원본이 다르면 원본이 우선. (see also: `docs/x-kit-integration.md`)
+
 xm 스킬(`/xm:build`, `/xm:solver`, `/xm:op`, `/xm:agent` 등)의 SKILL.md가 *Claude Code native Agent tool*을 통한 fan-out을 지시하는 경우(예: x-build research의 4-perspective spawn, x-solver iterate test phase 가설별 spawn), term-mesh 컨텍스트(`TERMMESH_SOCKET` env 또는 `/tmp/term-mesh*.sock` 존재)에서는 **반드시 `tm-agent delegate` × N로 자동 치환**한다.
 
 이유: xm 스킬은 Claude Code native multi-agent를 가정하지만 term-mesh의 OMC override는 native Agent tool 사용 금지. 한 메시지에 모든 delegate를 발사해 진짜 병렬 확보.
