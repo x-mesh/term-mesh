@@ -5691,8 +5691,14 @@ final class TeamOrchestrator: ObservableObject {
     /// Scan for crash-recoverable live snapshots and publish them. In
     /// `always` mode each candidate immediately posts
     /// `.restoreFleetRequested` (handled where a `TabManager` is in scope).
-    func detectRestorableFleets() {
+    func detectRestorableFleets(attempt: Int = 0) {
         guard FleetRestoreMode.current != .never else { return }
+        // The parse fix below is the real fix; testing shows a freshly-spawned
+        // daemon is ready by launch+1.5s (restore succeeds on attempt 0). This
+        // short retry is defense-in-depth only — for a cold or loaded daemon
+        // that might briefly report an empty scan — and stops on the first
+        // non-empty result, so the normal path runs exactly once.
+        let maxAttempts = 3
         let params: [String: Any] = [
             "limit": 20,
             "app_socket_path": SocketControlSettings.socketPath(),
@@ -5700,13 +5706,23 @@ final class TeamOrchestrator: ObservableObject {
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             guard let self else { return }
             let raw = self.daemon.rpcCallRaw(method: "headless.list_live_pane", params: params)
+            // `rpcCallRaw` already unwraps the JSON-RPC `result`, so `raw` is the
+            // ListLivePaneResult payload itself (`{scanned, teams, ...}`). Parse
+            // `teams` directly — the old `result.teams` double-unwrap always
+            // yielded nil, so rows stayed 0 and restore was silently skipped on
+            // every launch (not a daemon race — a client parse bug).
             var rows: [[String: Any]] = []
             if let raw, let data = raw.data(using: .utf8),
                let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-               let inner = obj["result"] as? [String: Any],
-               let teams = inner["teams"] as? [[String: Any]] {
+               let teams = obj["teams"] as? [[String: Any]] {
                 rows = teams
             }
+            #if DEBUG
+            // An empty scan from an RPC/parse failure is otherwise
+            // indistinguishable from a legitimately empty result — the blind
+            // spot that hid the double-unwrap bug. Surface the empty/nil path.
+            if rows.isEmpty { dlog("restore.detect empty rawNil=\(raw == nil) attempt=\(attempt)") }
+            #endif
             DispatchQueue.main.async {
                 let liveUuids = Set(self.teams.values.compactMap { $0.teamUuid })
                 let fleets: [RestorableFleet] = rows.compactMap { row in
@@ -5725,7 +5741,14 @@ final class TeamOrchestrator: ObservableObject {
                     )
                 }
                 self.restorableFleets = fleets
-                if fleets.isEmpty { return }
+                if fleets.isEmpty {
+                    if attempt + 1 < maxAttempts {
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self] in
+                            self?.detectRestorableFleets(attempt: attempt + 1)
+                        }
+                    }
+                    return
+                }
                 Logger.team.info("[restore-fleet] detected \(fleets.count) restorable fleet(s)")
                 if FleetRestoreMode.current == .always {
                     for fleet in fleets {

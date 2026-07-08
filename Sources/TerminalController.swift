@@ -6,6 +6,11 @@ import os
 import Bonsplit
 import WebKit
 
+// The worktree-lock helpers below return `Result<_, String>`, using a String
+// message as the Failure type. `Result`'s Failure must be an `Error`, so this
+// retroactive conformance lets those `.failure("…")` sites compile.
+extension String: Error {}
+
 /// Unix socket-based controller for programmatic terminal control
 /// Allows automated testing and external control of terminal tabs
 @MainActor
