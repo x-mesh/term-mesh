@@ -460,6 +460,148 @@ pub fn status(params: serde_json::Value) -> Result<WorktreeStatus, String> {
     Ok(WorktreeStatus { dirty, unpushed })
 }
 
+/// One changed file in a `worktree.diff_summary` response.
+#[derive(Debug, Serialize)]
+pub struct DiffFileStat {
+    pub path: String,
+    /// "added" | "modified" | "deleted" | "renamed" | "copied" | "typechange" | "other"
+    pub kind: String,
+    pub add: usize,
+    pub del: usize,
+}
+
+/// Mission Control approval-queue diff card. File-level stats only — no
+/// patch body (large patches don't belong on the 1500-char socket reply
+/// path; "view full diff" is a pane-side `git diff` deep link instead).
+#[derive(Debug, Serialize)]
+pub struct DiffSummaryResult {
+    pub base: String,
+    pub branch: String,
+    pub ahead: usize,
+    pub behind: usize,
+    pub dirty: bool,
+    pub files: Vec<DiffFileStat>,
+    pub total_add: usize,
+    pub total_del: usize,
+    pub file_count: usize,
+}
+
+/// Diff summary for a worktree-isolated task's approval card: what changed on
+/// `branch` since it diverged from `base_ref` (merge-base diff, so upstream
+/// commits made to `base_ref` after the branch point don't pollute the
+/// count), plus ahead/behind and a dirty (uncommitted changes) flag so the
+/// approval UI can refuse to finish a worktree with unsaved work.
+///
+/// `path` is the worktree's own checkout directory (what `tm-agent delegate
+/// --worktree` records as `WORKTREE_PATH` / `TeamTask.worktreePath`) — git2
+/// opens a worktree checkout directly, no need to go through the main repo.
+pub fn diff_summary(params: serde_json::Value) -> Result<DiffSummaryResult, String> {
+    #[derive(Deserialize)]
+    struct P {
+        path: String,
+        /// Branch/tag/ref name the worktree branched from (task capsule's
+        /// `worktree_parent`). Required — there is no reliable default when
+        /// opening a worktree directly (no "current branch of the main
+        /// repo" concept from here).
+        base_ref: String,
+    }
+    let params: P = serde_json::from_value(params).map_err(|e| format!("invalid params: {e}"))?;
+
+    let repo = Repository::open(&params.path)
+        .map_err(|e| format!("cannot open worktree at {}: {e}", params.path))?;
+
+    let head = repo.head().map_err(|e| format!("cannot read HEAD: {e}"))?;
+    let head_oid = head
+        .target()
+        .ok_or_else(|| "HEAD is not a direct reference (detached/unborn?)".to_string())?;
+    let branch_name = head.shorthand().unwrap_or("HEAD").to_string();
+
+    let base_obj = repo
+        .revparse_single(&params.base_ref)
+        .map_err(|e| format!("cannot resolve base_ref '{}': {e}", params.base_ref))?;
+    let base_oid = base_obj.id();
+
+    let (ahead, behind) = repo
+        .graph_ahead_behind(head_oid, base_oid)
+        .map_err(|e| format!("cannot compute ahead/behind: {e}"))?;
+
+    let merge_base_oid = repo
+        .merge_base(head_oid, base_oid)
+        .map_err(|e| format!("cannot compute merge-base: {e}"))?;
+
+    let merge_base_tree = repo
+        .find_commit(merge_base_oid)
+        .and_then(|c| c.tree())
+        .map_err(|e| format!("cannot read merge-base tree: {e}"))?;
+    let head_tree = repo
+        .find_commit(head_oid)
+        .and_then(|c| c.tree())
+        .map_err(|e| format!("cannot read HEAD tree: {e}"))?;
+
+    let diff = repo
+        .diff_tree_to_tree(Some(&merge_base_tree), Some(&head_tree), None)
+        .map_err(|e| format!("cannot diff trees: {e}"))?;
+
+    let mut files = Vec::new();
+    let mut total_add = 0usize;
+    let mut total_del = 0usize;
+    let delta_count = diff.deltas().len();
+    for i in 0..delta_count {
+        let Some(delta) = diff.get_delta(i) else {
+            continue;
+        };
+        let path = delta
+            .new_file()
+            .path()
+            .or_else(|| delta.old_file().path())
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let kind = match delta.status() {
+            git2::Delta::Added => "added",
+            git2::Delta::Deleted => "deleted",
+            git2::Delta::Modified => "modified",
+            git2::Delta::Renamed => "renamed",
+            git2::Delta::Copied => "copied",
+            git2::Delta::Typechange => "typechange",
+            _ => "other",
+        }
+        .to_string();
+        let (add, del) = match git2::Patch::from_diff(&diff, i) {
+            Ok(Some(patch)) => patch
+                .line_stats()
+                .map(|(_ctx, add, del)| (add, del))
+                .unwrap_or((0, 0)),
+            _ => (0, 0),
+        };
+        total_add += add;
+        total_del += del;
+        files.push(DiffFileStat { path, kind, add, del });
+    }
+
+    // Dirty: uncommitted changes in the worktree (mirrors `status()`).
+    let statuses = repo
+        .statuses(Some(
+            git2::StatusOptions::new()
+                .include_untracked(true)
+                .recurse_untracked_dirs(true),
+        ))
+        .map_err(|e| format!("cannot get status: {e}"))?;
+    let dirty = !statuses.is_empty();
+
+    let file_count = files.len();
+    Ok(DiffSummaryResult {
+        base: params.base_ref,
+        branch: branch_name,
+        ahead,
+        behind,
+        dirty,
+        files,
+        total_add,
+        total_del,
+        file_count,
+    })
+}
+
 /// Remove a worktree only if it has no uncommitted changes.
 /// Delegates to `remove()` with `force=false` (the default).
 pub fn safe_remove(params: serde_json::Value) -> Result<(), String> {
@@ -680,5 +822,123 @@ mod tests {
             .path
             .starts_with(&base.path().to_string_lossy().to_string()));
         assert!(std::path::Path::new(&info.path).exists());
+    }
+
+    // ────────────────────────────────────────────────────────────────────
+    // Mission Control approval queue: diff_summary
+    // ────────────────────────────────────────────────────────────────────
+
+    fn commit_all(repo_path: &std::path::Path, message: &str) {
+        Command::new("git")
+            .args(["add", "."])
+            .current_dir(repo_path)
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["commit", "-m", message])
+            .current_dir(repo_path)
+            .output()
+            .unwrap();
+    }
+
+    #[test]
+    fn diff_summary_reports_file_stats_relative_to_base() {
+        let (_dir, repo_path) = init_temp_repo();
+        let repo_path_buf = std::path::PathBuf::from(&repo_path);
+
+        // Create the worktree off `main`/`master` (whatever init_temp_repo
+        // named it) — this is `base_ref`.
+        let base_branch = {
+            let out = Command::new("git")
+                .args(["branch", "--show-current"])
+                .current_dir(&repo_path_buf)
+                .output()
+                .unwrap();
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+
+        let info = create(serde_json::json!({ "repo_path": repo_path })).unwrap();
+        let wt_path = std::path::PathBuf::from(&info.path);
+
+        // One added file, one modified file, on the worktree branch.
+        std::fs::write(wt_path.join("README.md"), "# test\nmore content\n").unwrap();
+        std::fs::write(wt_path.join("NEW.md"), "brand new file\n").unwrap();
+        commit_all(&wt_path, "agent change");
+
+        let result = diff_summary(serde_json::json!({
+            "path": info.path,
+            "base_ref": base_branch,
+        }))
+        .expect("diff_summary should succeed");
+
+        assert_eq!(result.branch, info.branch);
+        assert_eq!(result.base, base_branch);
+        assert_eq!(result.ahead, 1);
+        assert_eq!(result.behind, 0);
+        assert!(!result.dirty, "worktree has no uncommitted changes");
+        assert_eq!(result.file_count, 2);
+        assert!(result.total_add > 0);
+
+        let new_file = result
+            .files
+            .iter()
+            .find(|f| f.path == "NEW.md")
+            .expect("NEW.md present");
+        assert_eq!(new_file.kind, "added");
+        let modified = result
+            .files
+            .iter()
+            .find(|f| f.path == "README.md")
+            .expect("README.md present");
+        assert_eq!(modified.kind, "modified");
+    }
+
+    #[test]
+    fn diff_summary_flags_dirty_worktree() {
+        let (_dir, repo_path) = init_temp_repo();
+        let base_branch = {
+            let out = Command::new("git")
+                .args(["branch", "--show-current"])
+                .current_dir(std::path::Path::new(&repo_path))
+                .output()
+                .unwrap();
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        let info = create(serde_json::json!({ "repo_path": repo_path })).unwrap();
+        let wt_path = std::path::PathBuf::from(&info.path);
+
+        // Uncommitted change only — no commit.
+        std::fs::write(wt_path.join("README.md"), "# test\nuncommitted\n").unwrap();
+
+        let result = diff_summary(serde_json::json!({
+            "path": info.path,
+            "base_ref": base_branch,
+        }))
+        .expect("diff_summary should succeed");
+        assert!(result.dirty);
+        assert_eq!(result.ahead, 0, "no commits made, only a dirty file");
+        assert_eq!(result.file_count, 0, "diff is tree-to-tree, not working dir");
+    }
+
+    #[test]
+    fn diff_summary_rejects_unknown_base_ref() {
+        let (_dir, repo_path) = init_temp_repo();
+        let info = create(serde_json::json!({ "repo_path": repo_path })).unwrap();
+        let err = diff_summary(serde_json::json!({
+            "path": info.path,
+            "base_ref": "does-not-exist",
+        }))
+        .unwrap_err();
+        assert!(err.contains("cannot resolve base_ref"), "got: {err}");
+    }
+
+    #[test]
+    fn diff_summary_rejects_nonexistent_path() {
+        let err = diff_summary(serde_json::json!({
+            "path": "/nonexistent/worktree/path",
+            "base_ref": "main",
+        }))
+        .unwrap_err();
+        assert!(err.contains("cannot open worktree"), "got: {err}");
     }
 }

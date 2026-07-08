@@ -1378,6 +1378,16 @@ async fn dispatch(req: &Request, ctx: &Context) -> Response {
             .await
             .unwrap_or_else(|e| Err(e.to_string()))
         }
+        "worktree.diff_summary" => {
+            // Mission Control approval-queue diff card (git2, file-level
+            // stats only — see worktree::diff_summary doc comment).
+            let params = req.params.clone();
+            tokio::task::spawn_blocking(move || {
+                worktree::diff_summary(params).map(|v| serde_json::to_value(v).unwrap())
+            })
+            .await
+            .unwrap_or_else(|e| Err(e.to_string()))
+        }
 
         // --- Resource Monitor (F-03/F-04) ---
         "monitor.snapshot" => {
