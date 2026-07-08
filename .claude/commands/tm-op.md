@@ -21,6 +21,7 @@ Parse `$ARGUMENTS`의 첫 단어로 전략을 결정한다:
 - `distribute` → [Strategy: distribute] 섹션 실행
 - `council` → [Strategy: council] 섹션 실행
 - `research` → [Strategy: research] 섹션 실행
+- `socratic` / `persona` / `scaffold` / `compose` / `decompose` / `hypothesis` / `investigate` / `monitor` → tm-op에 없는 전략. xm 플러그인이 설치되어 있으면 `/xm:op <strategy> ...`로 실행하라 — x-op의 Execution Backend가 term-mesh를 감지해 같은 pane 팀 위에서 tm-agent로 실행한다 (규칙: x-agent `references/term-mesh-backend.md`). 미설치면 지원 불가라고 안내.
 - 빈 입력 → 사용자에게 전략 선택 질문
 
 ## Options

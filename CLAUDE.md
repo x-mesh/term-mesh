@@ -296,56 +296,23 @@ escape hatch.
 
 ### XM skill agent fan-out routing
 
-xm 스킬(`/xm:build`, `/xm:solver`, `/xm:op`, `/xm:agent` 등)의 SKILL.md가 *Claude Code native Agent tool*을 통한 fan-out을 지시하는 경우(예: x-build research의 4-perspective spawn, x-solver iterate test phase 가설별 spawn), term-mesh 컨텍스트(`TERMMESH_SOCKET` env 또는 `/tmp/term-mesh*.sock` 존재)에서는 **반드시 `tm-agent delegate` × N로 자동 치환**한다.
+**단일 원본**: x-kit 저장소 `docs/term-mesh-integration.md` (계약) + xm 플러그인 내장
+`x-agent/skills/agent/references/term-mesh-backend.md` (실행 시점 규칙 — xm 스킬의
+Execution Backend 섹션이 term-mesh 감지 시 자동 로드). 로컬 요약: `docs/x-kit-integration.md`.
 
-이유: xm 스킬은 Claude Code native multi-agent를 가정하지만 term-mesh의 OMC override는 native Agent tool 사용 금지. 한 메시지에 모든 delegate를 발사해 진짜 병렬 확보.
+핵심 규칙: term-mesh 컨텍스트(`TERMMESH_SOCKET` env 또는 `/tmp/term-mesh*.sock` 존재,
+`XK_BACKEND`/`.xm/config.json`의 `execution_backend`로 override 가능)에서 xm 스킬이
+*Claude Code native Agent tool* fan-out을 지시하면 **반드시 `tm-agent delegate` × N
+(단일 Bash 메시지) + `tm-agent wait`로 치환**한다. 치환 테이블, 4-perspective→role 맵,
+결과 합성 계약, worktree lifecycle, bypass 조건은 위 reference가 규정한다. 위임 태스크의
+reply는 Standard Reply Header + `XK_TASK`/`XK_CORR` 라인으로 종결해야 하며(xk-bridge
+writeback 계약), 이 섹션과 원본이 다르면 원본이 우선한다.
 
-#### Substitution rules
+Panel runs on the task board: `tm-agent xk-bridge`가 켜져 있으면 x-panel review/cross 런이
+`xk_run` 이벤트(XK-EVENTS-v1)로 팀 태스크보드에 자동 미러링된다(run당 task 1개,
+pending→in_progress→completed/blocked). leader는 `.xm/…/status.json` 폴링 대신
+`tm-agent wait`/`task list`로 패널 완료를 기다리면 된다. 상세: `docs/xk-panel-phase2.md`.
 
-| xm 스킬 지시 | term-mesh 대치 |
-|------------|---------------|
-| "Spawn N Agent tools in parallel" (Research/Plan-check/Test) | 단일 Bash 메시지에서 `tm-agent delegate <agent> "$INSTR" &` × N + `wait` |
-| "Spawn one Agent tool per perspective" (4 perspectives 등) | idle agent 중 4–6에 1 INSTR 동시 발사. agent role lens가 perspective 역할 자연 수행 |
-| `model: "sonnet"` (Agent tool 옵션) | 무시 — 각 agent의 model은 `tm-agent create` 시 결정됨 |
-| "fan-out", "broadcast", "swarm" 원시 | `/tm "<instruction>"` 또는 `tm-agent delegate` × N (broadcast는 claude-CLI 전용; mixed CLI는 delegate) |
-
-#### 4-perspective → role mapping (xm:build research용)
-
-xm:build research 표준 4 perspectives의 role 매핑:
-
-| xm perspective | 권장 agent role |
-|---------------|----------------|
-| stack | reviewer |
-| features | frontend |
-| architecture | architect |
-| pitfalls | security |
-
-여분의 idle agents(tester / refactorer 등)는 보너스 관점으로 추가 동원해도 됨 — 정보량 +50%, 비용 ~0(단일 Bash 메시지).
-
-#### 결과 합성
-
-xm 스킬은 일반적으로 raw agent output을 직접 보여줄 것을 요구. /tm은 3-line synthesis 강제. **둘 다 한다**:
-1. `tm-agent collect --headers` → STATUS/NEXT 표 출력
-2. `[결론][충돌][다음]` 3줄 synthesis 출력
-3. 각 agent의 task_id.md path를 `xm build save research-notes --agent <name>` 등 xm 스킬 cli에 저장
-
-이 패턴은 `/tm` Workflow Step 4와 같음. xm 스킬의 phase 통과 검증 (`gate pass`, `phase next`)은 정상 진행.
-
-#### Worktree lifecycle (xm:build implement용)
-
-xm:build가 implementation/fix 단계 task를 분배할 때는 `tm-agent delegate ... --worktree auto`가 기본이다. `auto`는 mutating role(executor/frontend/backend) 또는 구현·수정·리팩터 키워드에서만 `git-kit wt acquire <branch>`를 실행하고, review/research/plan 계열은 기존 cwd를 쓴다. 강제 격리는 `--worktree always`, 비활성화는 `--worktree off`, base ref 지정은 `--from <ref>`를 쓴다.
-
-worktree task capsule에는 `WORKTREE_PATH`, `WORKTREE_BRANCH`, `WORKDIR_INSTRUCTION`이 들어간다. agent는 반드시 해당 path를 cwd로 사용하고, 완료 보고 후 leader가 다음을 실행한다:
-
-```bash
-tm-agent task finish-worktree <task_id> --to parent --cleanup
-```
-
-push까지 필요한 land 흐름은 `--push`를 붙인다. stale/merged 정리는 필요 시 leader가 `git-kit wt cleanup --merged --stale 7d` dry-run 후 `-y`로 확정한다.
-
-#### Bypass (드물게 native가 더 적합한 경우)
-
-native Agent tool이 더 적합한 경우(예: 단일 isolated investigation, 외부 worktree 격리 필요)는 위 규칙 미적용. 이 경우 CLAUDE.md의 "DELEGATE-FIRST PRINCIPLE" 자체는 여전히 유효하며, `tm-agent` 외 다른 본인 도구 사용 가능.
 
 ### Quick CLI reference
 
