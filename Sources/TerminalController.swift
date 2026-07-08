@@ -5500,7 +5500,17 @@ private enum WorktreeApprovalHelper {
         return .success(mode: result["mode"] as? String, removed: result["removed"] as? Bool)
     }
 
-    private static func acquireLock(teamName: String, taskId: String) -> Result<TaskWorktreeLock, String> {
+    /// Local success/failure enum instead of Swift's `Result<_, Error>` — this
+    /// codebase has no `String: Error` conformance, and adding a blanket
+    /// `extension String: Error` just to satisfy `Result`'s generic bound
+    /// would be a global change for a purely local need. Case shapes match
+    /// `Result` exactly, so the call site's `switch` reads identically.
+    private enum LockOutcome {
+        case success(TaskWorktreeLock)
+        case failure(String)
+    }
+
+    private static func acquireLock(teamName: String, taskId: String) -> LockOutcome {
         let dir = (NSTemporaryDirectory() as NSString).appendingPathComponent("term-mesh-worktree-locks")
         try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true, attributes: nil)
         let team = sanitizeBranchComponent(teamName)

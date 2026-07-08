@@ -5700,13 +5700,26 @@ final class TeamOrchestrator: ObservableObject {
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             guard let self else { return }
             let raw = self.daemon.rpcCallRaw(method: "headless.list_live_pane", params: params)
+            // `rpcCallRaw` already unwraps the JSON-RPC envelope's `result`
+            // field (TermMeshDaemon.rpcCall), so the top-level object here IS
+            // the `ListLivePaneResult` payload — `{"scanned":…,"teams":[…]}`,
+            // no further `result` wrapper. Handle both shapes defensively
+            // anyway (matches `countResumableTeams` above) in case a caller
+            // ever hands this a raw, non-unwrapped envelope.
             var rows: [[String: Any]] = []
             if let raw, let data = raw.data(using: .utf8),
-               let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-               let inner = obj["result"] as? [String: Any],
-               let teams = inner["teams"] as? [[String: Any]] {
-                rows = teams
+               let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+                if let inner = obj["result"] as? [String: Any], let teams = inner["teams"] as? [[String: Any]] {
+                    rows = teams
+                } else if let teams = obj["teams"] as? [[String: Any]] {
+                    rows = teams
+                }
             }
+            #if DEBUG
+            if rows.isEmpty {
+                dlog("[restore-fleet] detect: no rows (rawNil=\(raw == nil))")
+            }
+            #endif
             DispatchQueue.main.async {
                 let liveUuids = Set(self.teams.values.compactMap { $0.teamUuid })
                 let fleets: [RestorableFleet] = rows.compactMap { row in
