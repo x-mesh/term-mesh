@@ -31,6 +31,9 @@ final class TeamOrchestrator: ObservableObject {
         /// `session_id` for archive_pane / pane-resume. Distinct from
         /// `parentSessionId`, which is term-mesh's routing UUID.
         var claudeSessionId: String?
+        /// When `claudeSessionId` was captured. Persisted into live snapshots
+        /// (`session_id_captured_at`) so restore can judge sid staleness.
+        var claudeSessionIdCapturedAt: Date?
         let createdAt: Date
         // Worktree isolation
         var worktreeName: String?
@@ -293,7 +296,10 @@ final class TeamOrchestrator: ObservableObject {
     }
 
     /// D: Shared task board
-    struct TeamTask {
+    /// Codable: persisted verbatim by `TeamDataStore` board snapshots
+    /// (Restore Fleet Layer 2) — see
+    /// docs/design/restore-fleet-session-persistence.md §3.2.
+    struct TeamTask: Codable {
         let id: String
         var title: String
         var details: String?
@@ -3748,6 +3754,11 @@ final class TeamOrchestrator: ObservableObject {
                         "active_task_status": activeTask?.status as Any? ?? NSNull(),
                         "active_task_is_stale": activeTask.map(isTaskStale) ?? false,
                         "agent_state": agentRuntimeState(teamName: team.id, agentName: agent.name),
+                        // Mission Control: separate boolean rather than a new
+                        // agent_state value — tm-agent hard-matches
+                        // agent_state == "idle" for delegation eligibility, so
+                        // the state machine's values stay stable.
+                        "waiting_input": agentIsWaitingInput(agent),
                         "heartbeat_age_seconds": heartbeatAgeSeconds(teamName: team.id, agentName: agent.name) as Any? ?? NSNull(),
                         "last_heartbeat_summary": heartbeat?.summary as Any? ?? NSNull(),
                         "heartbeat_is_stale": heartbeat.map(isHeartbeatStale) ?? false,
@@ -3797,11 +3808,55 @@ final class TeamOrchestrator: ObservableObject {
         ]
     }
 
+    /// Mission Control: "waiting for input" signal — the agent pane has an
+    /// unread terminal notification (permission prompt, completed-turn bell,
+    /// OSC 9/777). Notification `surfaceId`s share the bonsplit panel-id
+    /// space (`TabManager.focusedSurfaceId(for:)` returns
+    /// `focusedPanelId(for:)`), so the member's `panelId` addresses its
+    /// pane's notifications directly. Headless agents (no pane) are never
+    /// waiting on UI input.
+    private func agentIsWaitingInput(_ agent: AgentMember) -> Bool {
+        guard let panelId = agent.panelId else { return false }
+        return TerminalNotificationStore.shared.hasUnreadNotification(
+            forTabId: agent.workspaceId, surfaceId: panelId
+        )
+    }
+
+    /// Mission Control aggregator — one call returns everything the mission
+    /// dashboard preset renders: teams (with per-agent state / waiting_input /
+    /// heartbeats), the full task board, the attention inbox, and the derived
+    /// approval queue (`review_ready` tasks; worktree-backed ones carry their
+    /// worktree fields for the future diff/approve card). Served via the v2
+    /// `fleet.state` socket method and mirrored at the daemon's `/api/fleet`.
+    /// Watch drift history is deliberately NOT aggregated here — it lives in
+    /// the Rust daemon (`watch.board`), and blocking on a daemon round-trip
+    /// inside an app-socket handler would violate the socket threading policy.
+    func fleetState() -> [String: Any] {
+        var payload = daemonPayload()
+        payload["schema"] = 1
+        let approvals = (payload["tasks"] as? [[String: Any]] ?? []).filter {
+            ($0["status"] as? String) == "review_ready"
+        }
+        payload["approvals"] = approvals
+        return payload
+    }
+
     private func syncTeamStateToDaemon() {
         let payload = daemonPayload()
         DispatchQueue.global(qos: .utility).async {
             self.daemon.syncTeams(payload)
         }
+        // Restore Fleet Layer 2: keep the data store's name→uuid map current
+        // so board snapshots land under the right team identity on disk.
+        TeamDataStore.shared.updateBoardUuids(
+            teams.values.reduce(into: [String: String]()) { acc, t in
+                if let uuid = t.teamUuid?.nilIfBlank { acc[t.id] = uuid }
+            }
+        )
+        // Restore Fleet Layer 1: every daemon sync is also a signal that team
+        // state changed — refresh the on-disk live snapshots (debounced,
+        // hash-deduped) so a crash never loses more than the debounce window.
+        scheduleLiveTeamSnapshots()
     }
 
     /// Get raw team struct for minimal MainActor access (used by hybrid team.status).
@@ -3832,6 +3887,7 @@ final class TeamOrchestrator: ObservableObject {
                     "active_task_status": activeTask?.status as Any? ?? NSNull(),
                     "active_task_is_stale": activeTask.map(isTaskStale) ?? false,
                     "agent_state": agentRuntimeState(teamName: team.id, agentName: agent.name),
+                    "waiting_input": agentIsWaitingInput(agent),
                     "heartbeat_age_seconds": heartbeatAgeSeconds(teamName: team.id, agentName: agent.name) as Any? ?? NSNull(),
                     "last_heartbeat_summary": heartbeat?.summary as Any? ?? NSNull(),
                     "heartbeat_is_stale": heartbeat.map(isHeartbeatStale) ?? false,
@@ -3955,12 +4011,12 @@ final class TeamOrchestrator: ObservableObject {
     /// `Team` so a subsequent destroy archives to the same UUID and preserves
     /// the per-agent session IDs (re-resumable).
     ///
-    /// The **leader** pane resumes via `--resume <leader.session_id>` (already
-    /// wired through `createTeam`'s `resumeSessionId` parameter). Per-agent
-    /// `--resume <sid>` for individual agent CLIs is a follow-up — agents
-    /// currently start fresh but their captured session IDs are preserved on
-    /// the in-memory `AgentMember` so a future iteration can wire them through
-    /// `addAgentPaneToWorkspace`'s CLI command builders.
+    /// The **leader** pane resumes via `--resume <leader.session_id>` (wired
+    /// through `createTeam`'s `resumeSessionId` parameter) and each claude
+    /// agent resumes via `--resume <sid>` (wired through
+    /// `agentResumeSessionIds` → `addAgentPaneToWorkspace`). Sids whose
+    /// transcript jsonl no longer exists are dropped (fresh start) rather than
+    /// letting the CLI error out at spawn — see the validity guard below.
     @discardableResult
     func adoptResumedPaneTeam(result: [String: Any], tabManager: TabManager) -> Team? {
         guard let teamName = result["team_name"] as? String,
@@ -4014,11 +4070,26 @@ final class TeamOrchestrator: ObservableObject {
         // agent CLI starts with `--resume <sid>` and re-attaches to its
         // previous transcript. Codex/kiro/gemini agents currently ignore
         // this; resume support for them is a follow-up.
+        // `--resume` validity guard: a sid whose transcript jsonl is gone
+        // would make the claude CLI error out at spawn. The leader always ran
+        // in the team workdir; workers share it when worktreeMode == "off".
+        // Worktree-isolated workers can't be verified here (their transcripts
+        // live under each worktree's encoded dir), so their sids pass through
+        // and degrade at the CLI level in the worst case.
+        let sharedTranscriptDir = ClaudeSessionWatcher.encodedProjectDir(workDir: workingDirectory)
+        func transcriptExists(_ sid: String) -> Bool {
+            FileManager.default.fileExists(atPath: "\(sharedTranscriptDir)/\(sid).jsonl")
+        }
+
         var agentResumeMap: [String: String] = [:]
         for a in agentsArr {
             guard let name = a["name"] as? String,
                   let sid = a["session_id"] as? String,
                   !sid.isEmpty else { continue }
+            if archivedWorktreeMode == "off" && !transcriptExists(sid) {
+                Logger.team.info("[pane-resume] dropping stale sid for agent '\(name, privacy: .public)' — transcript missing, starting fresh")
+                continue
+            }
             agentResumeMap[name] = sid
         }
 
@@ -4028,7 +4099,14 @@ final class TeamOrchestrator: ObservableObject {
         // `leaderSessionId` from the archive is the REAL claude session id
         // (discovered from ~/.claude/projects/ at archive time). Passing it
         // as `--resume` re-attaches claude to its prior transcript.
-        let leaderClaudeSid = leaderSessionId.isEmpty ? nil : leaderSessionId
+        let leaderClaudeSid: String? = {
+            guard !leaderSessionId.isEmpty else { return nil }
+            guard transcriptExists(leaderSessionId) else {
+                Logger.team.info("[pane-resume] dropping stale leader sid — transcript missing, starting fresh")
+                return nil
+            }
+            return leaderSessionId
+        }()
 
         guard let team = createTeam(
             name: teamName,
@@ -4053,6 +4131,12 @@ final class TeamOrchestrator: ObservableObject {
         if var t = teams[teamName] {
             if let uuid = archivedTeamUuid, !uuid.isEmpty {
                 t.teamUuid = uuid
+                // Same-run destroy → resume: lift the snapshot retirement so
+                // the revived team persists live snapshots again.
+                teamLiveSnapshotGate.revive(uuid: uuid)
+                // Restore Fleet Layer 2: bring back the persisted task board
+                // (in_progress tasks are normalized to assigned inside).
+                TeamDataStore.shared.loadBoard(teamName: teamName, teamUuid: uuid)
             }
             // Map archived agents by name and copy session_id back.
             var archivedSessionsByName: [String: String] = [:]
@@ -4216,6 +4300,7 @@ final class TeamOrchestrator: ObservableObject {
         guard let idx = team.agents.firstIndex(where: { $0.name == agentName }) else { return }
         if team.agents[idx].claudeSessionId == sid { return }
         team.agents[idx].claudeSessionId = sid
+        team.agents[idx].claudeSessionIdCapturedAt = Date()
         teams[teamName] = team
         syncTeamStateToDaemon()
         #if DEBUG
@@ -4284,30 +4369,9 @@ final class TeamOrchestrator: ObservableObject {
                     "agent_type": a.agentType,
                     "color": a.color,
                 ]
-                // Per-agent claude session id — D3-A priority:
-                //   1. `claudeSessionId` captured at pane spawn by the
-                //      FSEventStream watcher (authoritative 1-to-1 mapping,
-                //      works even when agents share the team workdir).
-                //   2. `discoverClaudeSessionId(worktreePath)` fallback —
-                //      only safe when the agent has its own worktree distinct
-                //      from the team workdir, since mtime-based discovery in
-                //      a shared dir returns the same jsonl for every agent.
-                //   3. nil → daemon marks the team `no_sessions` rather than
-                //      silently corrupting on resume.
-                // Always reject the leader sid as a collision guard (catches
-                // the freshly-created-worktree edge case where claude has
-                // not yet written a transcript and discovery falls through).
-                let captured = (a.claudeSessionId?.nilIfBlank).flatMap { sid -> String? in
-                    sid != leaderSid ? sid : nil
-                }
-                let fallback: String? = {
-                    guard captured == nil,
-                          let wt = a.worktreePath, !wt.isEmpty, wt != team.workingDirectory,
-                          let sid = Self.discoverClaudeSessionId(workingDirectory: wt),
-                          !sid.isEmpty, sid != leaderSid else { return nil }
-                    return sid
-                }()
-                if let sid = captured ?? fallback {
+                if let sid = Self.resolvedAgentSessionId(
+                    a, leaderSid: leaderSid, teamWorkingDirectory: team.workingDirectory
+                ) {
                     row["session_id"] = sid
                 }
                 if !a.instructions.isEmpty {
@@ -4365,10 +4429,19 @@ final class TeamOrchestrator: ObservableObject {
                 Logger.team.warning("[archive_pane] daemon did not respond")
             }
         }
+        // Retire the uuid BEFORE dispatching the archive write: any live
+        // snapshot still queued behind us on `panePersistQueue` re-checks the
+        // gate and skips, so a snapshot can never recreate the live dir after
+        // the archive cleared it (ghost team in the crash-recovery picker).
+        if let uuid = team.teamUuid?.nilIfBlank {
+            teamLiveSnapshotGate.retire(uuid: uuid)
+        }
+        // Both archive and live-snapshot writes go through the same SERIAL
+        // queue so their daemon RPCs can never reorder relative to each other.
         if synchronous {
-            work()
+            panePersistQueue.sync(execute: work)
         } else {
-            DispatchQueue.global(qos: .utility).async(execute: work)
+            panePersistQueue.async(execute: work)
         }
     }
 
@@ -4392,6 +4465,180 @@ final class TeamOrchestrator: ObservableObject {
         for team in live {
             archivePaneTeamIfApplicable(team, synchronous: true)
         }
+    }
+
+    // ────────────────────────────────────────────────────────────────────────
+    // Restore Fleet Layer 1 — live team snapshots
+    //
+    // `team.archive_pane` only runs at destroy/quit, so a crash used to lose
+    // the team entirely. These snapshots write the same archive layout to the
+    // daemon continuously (debounced, hash-deduped) with `live: true`, so the
+    // last consistent team state is always on disk under
+    // `~/.term-mesh/headless/<team_uuid>/`. See
+    // docs/design/restore-fleet-session-persistence.md §3.1.
+    // ────────────────────────────────────────────────────────────────────────
+
+    /// Serial queue for ALL pane-persist daemon RPCs (live snapshots AND
+    /// destroy/quit archives). Serializing them guarantees an archive can
+    /// never be overtaken by an earlier-enqueued snapshot write.
+    private let panePersistQueue = DispatchQueue(
+        label: "com.termmesh.team.pane-persist", qos: .utility
+    )
+    private var liveSnapshotDebounce: DispatchWorkItem?
+    private static let liveSnapshotDebounceInterval: TimeInterval = 1.0
+
+    /// Debounce entry point — cheap to call on every team mutation (hooked in
+    /// `syncTeamStateToDaemon`, which all mutation paths already funnel
+    /// through).
+    private func scheduleLiveTeamSnapshots() {
+        liveSnapshotDebounce?.cancel()
+        let item = DispatchWorkItem { [weak self] in
+            self?.snapshotLivePaneTeams()
+        }
+        liveSnapshotDebounce = item
+        DispatchQueue.main.asyncAfter(
+            deadline: .now() + Self.liveSnapshotDebounceInterval, execute: item
+        )
+    }
+
+    /// Snapshot every live pane-mode team whose persisted payload changed.
+    /// Payload build (including the `~/.claude/projects` sid scan) runs on the
+    /// main actor — same as the destroy-time archive path — and only the
+    /// daemon RPC is shipped to the serial persist queue.
+    private func snapshotLivePaneTeams() {
+        let appVersion =
+            (Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String) ?? "unknown"
+        let appSocketPath = SocketControlSettings.socketPath()
+        for team in teams.values {
+            // Mirror the archive skip rule: headless teams are persisted by
+            // the daemon itself.
+            let isHeadless = !team.agents.isEmpty && team.agents.allSatisfy { $0.panelId == nil }
+            if isHeadless { continue }
+            // Fresh pane teams carry a stable uuid since D3-A P1-A; teams
+            // without one predate that and are skipped (they still archive at
+            // destroy/quit via grace mode).
+            guard let uuid = team.teamUuid?.nilIfBlank else { continue }
+            let payload = Self.buildLiveSnapshotParams(
+                team: team, appVersion: appVersion, appSocketPath: appSocketPath
+            )
+            guard let hash = Self.stableParamsHash(payload) else { continue }
+            guard teamLiveSnapshotGate.shouldWrite(uuid: uuid, hash: hash) else { continue }
+            panePersistQueue.async {
+                // Re-check on the persist queue: a destroy may have retired
+                // the uuid between the gate pass above and this write.
+                guard teamLiveSnapshotGate.isWritable(uuid: uuid) else { return }
+                let raw = TermMeshDaemon.shared.rpcCallRaw(
+                    method: "team.snapshot_pane", params: payload
+                )
+                if let raw, let data = raw.data(using: .utf8),
+                   let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                   let errMsg = obj["error"] as? String {
+                    Logger.team.warning("[snapshot_pane] daemon error: \(errMsg, privacy: .public)")
+                }
+            }
+        }
+    }
+
+    /// `team.snapshot_pane` params. Superset of the `team.archive_pane`
+    /// payload: adds `layout_workspace_title`, `app_socket_path` (instance
+    /// isolation for restore candidates) and per-agent
+    /// `session_id_captured_at` / `parked` / `auto_recycle_every` /
+    /// `completed_task_count`.
+    private static func buildLiveSnapshotParams(
+        team: Team, appVersion: String, appSocketPath: String
+    ) -> [String: Any] {
+        let leaderSid = discoverClaudeSessionId(workingDirectory: team.workingDirectory) ?? ""
+        var payload: [String: Any] = [
+            "team_uuid": team.teamUuid ?? "",
+            "team_name": team.id,
+            "leader_session_id": leaderSid,
+            "leader_mode": team.leaderMode,
+            "leader_model": team.leaderModel,
+            "working_directory": team.workingDirectory,
+            "termmesh_app_version": appVersion,
+            "layout_workspace_title": team.id,
+            "app_socket_path": appSocketPath,
+            "agents": team.agents.map { a -> [String: Any] in
+                var row: [String: Any] = [
+                    "name": a.name,
+                    "cli": a.cli,
+                    "model": a.model,
+                    "agent_type": a.agentType,
+                    "color": a.color,
+                ]
+                if let sid = resolvedAgentSessionId(
+                    a, leaderSid: leaderSid, teamWorkingDirectory: team.workingDirectory
+                ) {
+                    row["session_id"] = sid
+                }
+                if let capturedAt = a.claudeSessionIdCapturedAt {
+                    row["session_id_captured_at"] = Int(capturedAt.timeIntervalSince1970)
+                }
+                if !a.instructions.isEmpty {
+                    row["instructions"] = a.instructions
+                }
+                if TeamDataStore.shared.isAgentParked(teamName: team.id, agentName: a.name) {
+                    row["parked"] = true
+                }
+                if let every = a.autoRecycleEvery {
+                    row["auto_recycle_every"] = every
+                }
+                if a.completedTaskCount > 0 {
+                    row["completed_task_count"] = a.completedTaskCount
+                }
+                return row
+            },
+        ]
+        if let root = team.gitRepoRoot?.nilIfBlank
+            ?? TermMeshDaemon.shared.findGitRoot(from: team.workingDirectory) {
+            payload["git_root"] = root
+        }
+        if let wtName = team.sharedWorktreeName,
+           let wtPath = team.sharedWorktreePath,
+           let wtBranch = team.sharedWorktreeBranch,
+           !wtName.isEmpty {
+            payload["worktree_mode"] = team.worktreeMode
+            payload["worktree_path"] = wtPath
+            payload["worktree_branch"] = wtBranch
+        }
+        return payload
+    }
+
+    /// Per-agent claude session id resolution shared by destroy-time archives
+    /// and live snapshots — D3-A priority:
+    ///   1. `claudeSessionId` captured at pane spawn by the FSEventStream
+    ///      watcher (authoritative 1-to-1 mapping, works even when agents
+    ///      share the team workdir).
+    ///   2. `discoverClaudeSessionId(worktreePath)` fallback — only safe when
+    ///      the agent has its own worktree distinct from the team workdir,
+    ///      since mtime-based discovery in a shared dir returns the same
+    ///      jsonl for every agent.
+    ///   3. nil → daemon marks the team `no_sessions` rather than silently
+    ///      corrupting on resume.
+    /// Always rejects the leader sid as a collision guard (catches the
+    /// freshly-created-worktree edge case where claude has not yet written a
+    /// transcript and discovery falls through).
+    private static func resolvedAgentSessionId(
+        _ a: AgentMember, leaderSid: String, teamWorkingDirectory: String
+    ) -> String? {
+        if let captured = a.claudeSessionId?.nilIfBlank, captured != leaderSid {
+            return captured
+        }
+        guard let wt = a.worktreePath, !wt.isEmpty, wt != teamWorkingDirectory,
+              let sid = discoverClaudeSessionId(workingDirectory: wt),
+              !sid.isEmpty, sid != leaderSid else { return nil }
+        return sid
+    }
+
+    /// Deterministic hash of an RPC params dictionary (sorted-keys JSON), used
+    /// to skip snapshot writes when nothing changed. nil when the payload is
+    /// not JSON-encodable (never expected — all values are plist types).
+    private static func stableParamsHash(_ params: [String: Any]) -> Int? {
+        guard JSONSerialization.isValidJSONObject(params),
+              let data = try? JSONSerialization.data(
+                  withJSONObject: params, options: [.sortedKeys]
+              ) else { return nil }
+        return data.hashValue
     }
 
     /// Log detached worktrees from a destroyed team (no longer auto-deleted).
@@ -5413,6 +5660,170 @@ final class TeamOrchestrator: ObservableObject {
         }
     }
 
+    // ────────────────────────────────────────────────────────────────────────
+    // Restore Fleet Layer 3 — crash-recovery detection + one-click restore
+    //
+    // Live snapshots (Layer 1) leave `~/.term-mesh/headless/<uuid>/` behind
+    // when the app crashes. At launch we ask the daemon for those snapshots
+    // (`headless.list_live_pane`), filter out teams that are already live in
+    // this process, and surface the rest as restorable fleets — a sidebar
+    // banner in `ask` mode, automatic restore in `always` mode.
+    // ────────────────────────────────────────────────────────────────────────
+
+    /// A crash-recoverable team found via `headless.list_live_pane`.
+    struct RestorableFleet: Identifiable {
+        var id: String { teamUuid }
+        let teamUuid: String
+        let teamName: String
+        let agentCount: Int
+        let lastSnapshotAt: Date?
+        let workingDirectory: String
+        let hasAnySession: Bool
+    }
+
+    /// Published for the sidebar banner (`SidebarFleetRestoreBanner`).
+    @Published private(set) var restorableFleets: [RestorableFleet] = []
+    /// Uuids the user dismissed this run — excluded from future detects.
+    private var dismissedFleetUuids: Set<String> = []
+    /// Restore re-entrancy guard.
+    private var restoreInFlightUuids: Set<String> = []
+
+    /// Scan for crash-recoverable live snapshots and publish them. In
+    /// `always` mode each candidate immediately posts
+    /// `.restoreFleetRequested` (handled where a `TabManager` is in scope).
+    func detectRestorableFleets(attempt: Int = 0) {
+        guard FleetRestoreMode.current != .never else { return }
+        // The parse fix below is the real fix; testing shows a freshly-spawned
+        // daemon is ready by launch+1.5s (restore succeeds on attempt 0). This
+        // short retry is defense-in-depth only — for a cold or loaded daemon
+        // that might briefly report an empty scan — and stops on the first
+        // non-empty result, so the normal path runs exactly once.
+        let maxAttempts = 3
+        let params: [String: Any] = [
+            "limit": 20,
+            "app_socket_path": SocketControlSettings.socketPath(),
+        ]
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            guard let self else { return }
+            let raw = self.daemon.rpcCallRaw(method: "headless.list_live_pane", params: params)
+            // `rpcCallRaw` already unwraps the JSON-RPC `result`, so `raw` is the
+            // ListLivePaneResult payload itself (`{scanned, teams, ...}`). Parse
+            // `teams` directly — the old `result.teams` double-unwrap always
+            // yielded nil, so rows stayed 0 and restore was silently skipped on
+            // every launch (not a daemon race — a client parse bug).
+            var rows: [[String: Any]] = []
+            if let raw, let data = raw.data(using: .utf8),
+               let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+               let teams = obj["teams"] as? [[String: Any]] {
+                rows = teams
+            }
+            #if DEBUG
+            // An empty scan from an RPC/parse failure is otherwise
+            // indistinguishable from a legitimately empty result — the blind
+            // spot that hid the double-unwrap bug. Surface the empty/nil path.
+            if rows.isEmpty { dlog("restore.detect empty rawNil=\(raw == nil) attempt=\(attempt)") }
+            #endif
+            DispatchQueue.main.async {
+                let liveUuids = Set(self.teams.values.compactMap { $0.teamUuid })
+                let fleets: [RestorableFleet] = rows.compactMap { row in
+                    guard let uuid = row["team_uuid"] as? String,
+                          let name = row["team_name"] as? String,
+                          !liveUuids.contains(uuid),
+                          !self.dismissedFleetUuids.contains(uuid) else { return nil }
+                    let ts = (row["last_snapshot_at"] as? Double) ?? 0
+                    return RestorableFleet(
+                        teamUuid: uuid,
+                        teamName: name,
+                        agentCount: ((row["agents"] as? [[String: Any]]) ?? []).count,
+                        lastSnapshotAt: ts > 0 ? Date(timeIntervalSince1970: ts) : nil,
+                        workingDirectory: (row["working_directory"] as? String) ?? "",
+                        hasAnySession: (row["has_any_session"] as? Bool) ?? false
+                    )
+                }
+                self.restorableFleets = fleets
+                if fleets.isEmpty {
+                    if attempt + 1 < maxAttempts {
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self] in
+                            self?.detectRestorableFleets(attempt: attempt + 1)
+                        }
+                    }
+                    return
+                }
+                Logger.team.info("[restore-fleet] detected \(fleets.count) restorable fleet(s)")
+                if FleetRestoreMode.current == .always {
+                    for fleet in fleets {
+                        NotificationCenter.default.post(
+                            name: .restoreFleetRequested,
+                            object: nil,
+                            userInfo: ["team_uuid": fleet.teamUuid]
+                        )
+                    }
+                }
+            }
+        }
+    }
+
+    /// Restore one fleet: `team.resume_pane` (which also resolves live
+    /// snapshot dirs) → `adoptResumedPaneTeam` (workspace + panes +
+    /// per-agent `--resume` + board reload). Mirrors the manual resume
+    /// picker's flow (`TeamCreationView.invokeResume`).
+    func restoreFleet(
+        teamUuid: String,
+        tabManager: TabManager,
+        completion: ((Bool, String?) -> Void)? = nil
+    ) {
+        guard !restoreInFlightUuids.contains(teamUuid) else {
+            completion?(false, "restore already in flight")
+            return
+        }
+        restoreInFlightUuids.insert(teamUuid)
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            guard let self else { return }
+            let raw = self.daemon.rpcCallRaw(
+                method: "team.resume_pane", params: ["team_uuid": teamUuid]
+            )
+            var resultDict: [String: Any]?
+            var errMsg: String?
+            if let raw, let data = raw.data(using: .utf8),
+               let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+                if let e = obj["error"] as? String {
+                    errMsg = e
+                } else if let r = obj["result"] as? [String: Any] {
+                    resultDict = r
+                } else {
+                    resultDict = obj
+                }
+            } else {
+                errMsg = "daemon did not respond"
+            }
+            DispatchQueue.main.async {
+                self.restoreInFlightUuids.remove(teamUuid)
+                if let errMsg {
+                    Logger.team.warning("[restore-fleet] resume_pane failed uuid=\(teamUuid, privacy: .public): \(errMsg, privacy: .public)")
+                    completion?(false, errMsg)
+                    return
+                }
+                guard let resultDict,
+                      let team = self.adoptResumedPaneTeam(result: resultDict, tabManager: tabManager)
+                else {
+                    Logger.team.warning("[restore-fleet] adopt failed uuid=\(teamUuid, privacy: .public)")
+                    completion?(false, "adopt failed")
+                    return
+                }
+                self.restorableFleets.removeAll { $0.teamUuid == teamUuid }
+                Logger.team.info("[restore-fleet] restored team '\(team.id, privacy: .public)' (\(team.agents.count) agents)")
+                completion?(true, nil)
+            }
+        }
+    }
+
+    /// Hide a fleet from the banner for the rest of this app run. The
+    /// snapshot stays on disk (stale-snapshot GC handles eventual cleanup).
+    func dismissRestorableFleet(teamUuid: String) {
+        dismissedFleetUuids.insert(teamUuid)
+        restorableFleets.removeAll { $0.teamUuid == teamUuid }
+    }
+
     private func agentRuntimeState(teamName: String, agentName: String) -> String {
         // Phase 2: parked is daemon-authoritative — overrides task-derived state
         // because the subprocess is not live regardless of task board entry.
@@ -5477,6 +5888,87 @@ private extension String {
     var nilIfBlank: String? {
         let trimmed = trimmingCharacters(in: .whitespacesAndNewlines)
         return trimmed.isEmpty ? nil : trimmed
+    }
+}
+
+/// Restore Fleet Layer 3 — launch-time behavior when crash-recoverable live
+/// team snapshots are found. Stored in UserDefaults key "fleetRestoreMode"
+/// ("ask" | "always" | "never"); missing/unknown values fall back to `.ask`.
+enum FleetRestoreMode: String {
+    case ask
+    case always
+    case never
+
+    static var current: FleetRestoreMode {
+        let raw = UserDefaults.standard.string(forKey: "fleetRestoreMode") ?? "ask"
+        return FleetRestoreMode(rawValue: raw) ?? .ask
+    }
+}
+
+extension Notification.Name {
+    /// Posted with userInfo `{"team_uuid": String}` to request a fleet
+    /// restore. Handled in `TermMeshApp` (where the active `TabManager` is in
+    /// scope). Posted by the sidebar banner's Restore button and, in
+    /// `FleetRestoreMode.always`, by `detectRestorableFleets` itself.
+    static let restoreFleetRequested = Notification.Name("term-mesh.restoreFleetRequested")
+}
+
+/// Shared gate instance. File-scope (not a static on the @MainActor class) so
+/// it can be touched from both the main actor and `panePersistQueue` without
+/// actor-isolation friction; the class is internally locked.
+private let teamLiveSnapshotGate = LiveSnapshotGate()
+
+/// Restore Fleet Layer 1 — write gate for live team snapshots.
+///
+/// Two jobs, both keyed by `team_uuid`:
+/// 1. **Dedup** — remembers the last written payload hash so unchanged teams
+///    don't re-write their snapshot on every debounce tick.
+/// 2. **Retirement** — once a destroy/quit archive is initiated for a uuid,
+///    all further live-snapshot writes for it are refused until the team is
+///    resumed again. Combined with the serial `panePersistQueue`, this makes
+///    "snapshot recreates the live dir after the archive cleared it"
+///    impossible.
+///
+/// Thread-safety: called from the main actor (gate check at schedule time)
+/// and from `panePersistQueue` (re-check before the RPC), hence the lock.
+private final class LiveSnapshotGate: @unchecked Sendable {
+    private let lock = NSLock()
+    private var lastWrittenHashes: [String: Int] = [:]
+    private var retired: Set<String> = []
+
+    /// Returns true when the payload changed AND the uuid isn't retired;
+    /// records the hash as written.
+    func shouldWrite(uuid: String, hash: Int) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        if retired.contains(uuid) { return false }
+        if lastWrittenHashes[uuid] == hash { return false }
+        lastWrittenHashes[uuid] = hash
+        return true
+    }
+
+    /// Cheap re-check on the persist queue right before the RPC.
+    func isWritable(uuid: String) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return !retired.contains(uuid)
+    }
+
+    /// Destroy/quit archive initiated — block further snapshots for this uuid.
+    func retire(uuid: String) {
+        lock.lock()
+        defer { lock.unlock() }
+        retired.insert(uuid)
+        lastWrittenHashes[uuid] = nil
+    }
+
+    /// Team resumed in the same app run — allow snapshots again (hash reset so
+    /// the first post-resume snapshot always writes).
+    func revive(uuid: String) {
+        lock.lock()
+        defer { lock.unlock() }
+        retired.remove(uuid)
+        lastWrittenHashes[uuid] = nil
     }
 }
 

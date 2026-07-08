@@ -6,7 +6,7 @@ import os
 // MARK: - Dashboard Preset
 
 enum DashboardPreset: String {
-    case overview, teamOps, devOps, cost
+    case overview, teamOps, devOps, cost, mission
 }
 
 // MARK: - Agent Timeline
@@ -124,6 +124,9 @@ final class DashboardController: NSObject, WKNavigationDelegate {
             config.userContentController.add(handler, name: "teamTaskAction")
             config.userContentController.add(handler, name: "teamTaskCreate")
             config.userContentController.add(handler, name: "switchPreset")
+            config.userContentController.add(handler, name: "focusAgentPane")
+            config.userContentController.add(handler, name: "approveTask")
+            config.userContentController.add(handler, name: "rejectTask")
         }
 
         let wv = WKWebView(frame: .zero, configuration: config)
@@ -622,6 +625,31 @@ final class DashboardController: NSObject, WKNavigationDelegate {
             let agentsData = daemon.rpcCallRaw(method: "agent.list", params: ["include_terminated": false])
             let tasksData = daemon.rpcCallRaw(method: "task.list", params: [:] as [String: Any])
 
+            // Mission Control: drift-watch status + recent board rows per
+            // watched team ({team_id: {enabled, healthy, …, recent[]}}).
+            var watchMap: [String: Any] = [:]
+            if let statusRaw = daemon.rpcCallRaw(method: "watch.status", params: [:]),
+               let statusData = statusRaw.data(using: .utf8),
+               let statusObj = try? JSONSerialization.jsonObject(with: statusData) as? [String: Any],
+               let statusResult = statusObj["result"] as? [String: Any],
+               let watches = statusResult["watches"] as? [[String: Any]] {
+                for st in watches.prefix(6) {
+                    guard let teamId = st["team_id"] as? String else { continue }
+                    var entry = st
+                    if let boardRaw = daemon.rpcCallRaw(
+                        method: "watch.board",
+                        params: ["team_id": teamId, "limit": 10]
+                    ),
+                       let boardData = boardRaw.data(using: .utf8),
+                       let boardObj = try? JSONSerialization.jsonObject(with: boardData) as? [String: Any],
+                       let boardResult = boardObj["result"] as? [String: Any] {
+                        entry["recent"] = boardResult["rows"] ?? []
+                        entry["drift_count"] = boardResult["drift_count"] ?? 0
+                    }
+                    watchMap[teamId] = entry
+                }
+            }
+
             DispatchQueue.main.async {
                 let teamPayload = self.currentTeamPayload()
                 let teamData = teamPayload["teams"] as? [[String: Any]] ?? []
@@ -710,6 +738,14 @@ final class DashboardController: NSObject, WKNavigationDelegate {
                     webView.evaluateJavaScript("if(window.updatePerformance)updatePerformance(\(perfJson));") { _, _ in }
                 }
 
+                // Mission Control: fleet aggregate (teams × agents × tasks ×
+                // attention × approvals) + daemon watch enrichment.
+                var fleet = TeamOrchestrator.shared.fleetState()
+                fleet["watch"] = watchMap
+                if let fleetJson = Self.dashboardJSONString(fleet) {
+                    webView.evaluateJavaScript("if(window.updateFleet)updateFleet(\(fleetJson));") { _, _ in }
+                }
+
                 // Context-based auto-focus (skip if user manually selected a preset)
                 if !self.userOverride {
                     let hasTeams = !teamData.isEmpty
@@ -742,6 +778,19 @@ final class DashboardController: NSObject, WKNavigationDelegate {
         let instanceMeta = currentTeamPayload()["instance"] as? [String: Any] ?? [:]
         guard let instanceJson = Self.dashboardJSONString(instanceMeta) else { return }
         webView.evaluateJavaScript("if(window.updateInstanceStatus)updateInstanceStatus(\(instanceJson));") { _, _ in }
+    }
+
+    /// Mission Control Review Queue — deliver the `team.task.approve`/
+    /// `team.task.reject` result back to the dashboard. `raw` is already a
+    /// single-line JSON string from `v2Ok`/`v2Error` (id-less since these are
+    /// called in-process, not over the socket), so it can be interpolated
+    /// directly as a JS object literal — same technique `fetchAndPush`
+    /// already uses for daemon RPC results.
+    fileprivate func pushApprovalResult(_ raw: String) {
+        guard let webView else { return }
+        webView.evaluateJavaScript("if(window.onFleetApprovalResult)onFleetApprovalResult(\(raw));") { _, error in
+            if let error { Logger.app.error("dashboard approval result push error: \(error, privacy: .public)") }
+        }
     }
 
     private func currentTeamPayload() -> [String: Any] {
@@ -913,6 +962,45 @@ private class DashboardMessageHandler: NSObject, WKScriptMessageHandler {
             Task { @MainActor in
                 self.controller?.currentPreset = preset
                 self.controller?.userOverride = true
+            }
+        case "focusAgentPane":
+            // Mission Control deep link: matrix row click → jump to the
+            // agent's pane. User-initiated (a click in the dashboard), so
+            // mutating in-app focus is within the socket focus policy. Only
+            // available in the WKWebView dashboard — the HTTP dashboard has
+            // no message handler and hides the affordance.
+            guard let dict = message.body as? [String: Any],
+                  let workspaceStr = dict["workspace_id"] as? String,
+                  let tabId = UUID(uuidString: workspaceStr) else { return }
+            let panelId = (dict["panel_id"] as? String).flatMap(UUID.init(uuidString:))
+            Task { @MainActor in
+                NSApp.activate(ignoringOtherApps: true)
+                self.controller?.tabManager?.focusTabFromNotification(tabId, surfaceId: panelId)
+            }
+        case "approveTask":
+            // Mission Control Review Queue — Approve. Runs the same
+            // git-kit-backed flow as `tm-agent task finish-worktree`
+            // (TerminalController.asyncTeamTaskApprove); WKWebView-only,
+            // since the subprocess runs in this app process.
+            guard let dict = message.body as? [String: Any],
+                  let teamName = dict["team_name"] as? String,
+                  let taskId = dict["task_id"] as? String else { return }
+            Task { @MainActor in
+                let raw = await TerminalController.shared.asyncTeamTaskApprove(
+                    params: ["team_name": teamName, "task_id": taskId], id: nil
+                )
+                self.controller?.pushApprovalResult(raw)
+            }
+        case "rejectTask":
+            guard let dict = message.body as? [String: Any],
+                  let teamName = dict["team_name"] as? String,
+                  let taskId = dict["task_id"] as? String else { return }
+            var params: [String: Any] = ["team_name": teamName, "task_id": taskId]
+            if let reason = dict["reason"] as? String { params["reason"] = reason }
+            if let reassignTo = dict["reassign_to"] as? String { params["reassign_to"] = reassignTo }
+            Task { @MainActor in
+                let raw = await TerminalController.shared.asyncTeamTaskReject(params: params, id: nil)
+                self.controller?.pushApprovalResult(raw)
             }
         default:
             break
