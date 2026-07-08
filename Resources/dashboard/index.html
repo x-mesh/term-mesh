@@ -1352,6 +1352,11 @@
   </div>
 
   <!-- Mission Control — watch drift verdict history -->
+  <div class="card full dashboard-section" data-presets="overview,teamOps,mission" id="xk-panel-runs-card" style="display:none">
+    <h2>Panel Runs (x-kit)</h2>
+    <div id="xk-panel-runs"><div class="fleet-empty">No panel runs.</div></div>
+  </div>
+
   <div class="card dashboard-section" data-presets="mission" id="fleet-watch-card">
     <h2>Watch Verdicts</h2>
     <div id="fleet-watch"><div class="fleet-empty">No watch configured.</div></div>
@@ -1682,7 +1687,7 @@ function switchPreset(preset) {
   document.querySelectorAll('.dashboard-section').forEach(section => {
     const presets = section.dataset.presets || '';
     if (presets.includes(preset)) {
-      const isEmpty = section.id === 'agent-status-card' || section.id === 'team-attention-card' || section.id === 'leader-console-card' || section.id === 'team-completions-card';
+      const isEmpty = section.id === 'agent-status-card' || section.id === 'team-attention-card' || section.id === 'leader-console-card' || section.id === 'team-completions-card' || section.id === 'xk-panel-runs-card';
       if (isEmpty && section.innerHTML.includes('empty')) {
         section.style.display = 'none';
       } else {
@@ -3033,6 +3038,43 @@ function updateFleet(fleet) {
   renderFleetMatrix();
   renderFleetApprovals();
   renderFleetWatch();
+  // Panel runs ride on the fleet payload so WKWebView push and HTTP /api/fleet
+  // polling share one path.
+  updatePanelRuns(_fleet.panel_runs || []);
+}
+
+// x-kit panel runs (XK-EVENTS-v1) — pushed by DashboardController from the
+// TeamDataStore xk_run mirror. Card hides itself when there are no runs.
+function updatePanelRuns(runs) {
+  const card = document.getElementById('xk-panel-runs-card');
+  const el = document.getElementById('xk-panel-runs');
+  if (!card || !el) return;
+  runs = runs || [];
+  if (!runs.length) {
+    el.innerHTML = '<div class="fleet-empty">No panel runs.</div>';
+    card.style.display = 'none';
+    return;
+  }
+  let html = '';
+  for (const r of runs) {
+    const chip = r.phase === 'done' ? { cls: 'idle', text: 'done' }
+      : r.phase === 'failed' ? { cls: 'blocked', text: 'failed' }
+      : { cls: 'working', text: r.phase || 'running' };
+    const models = (r.models || [])
+      .map(m => escapeHTML((m.model || '') + ':' + (m.state || '')))
+      .join(' · ');
+    const meta = [];
+    if (r.elapsed_ms) meta.push(Math.round(r.elapsed_ms / 1000) + 's');
+    if (r.source) meta.push(r.source);
+    html += '<div class="fleet-row">'
+      + '<span class="fleet-chip ' + chip.cls + '">' + escapeHTML(chip.text) + '</span>'
+      + '<span class="fleet-name">' + escapeHTML(r.run_kind || 'run') + '</span>'
+      + '<span class="fleet-task">' + escapeHTML(r.title || r.run || '') + (models ? ' — ' + models : '') + '</span>'
+      + '<span class="fleet-heartbeat">' + escapeHTML(meta.join(' · ')) + '</span>'
+      + '</div>';
+  }
+  el.innerHTML = html;
+  if ((card.dataset.presets || '').includes(currentPreset)) card.style.display = '';
 }
 
 function fleetStateChip(agent) {

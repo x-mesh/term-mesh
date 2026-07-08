@@ -932,7 +932,9 @@ final class TermMeshDaemon: ObservableObject {
                 let request: [String: Any] = [
                     "id": id,
                     "method": "events.subscribe",
-                    "params": ["kinds": ["agent_usage_tick"]],
+                    // xk_run is strictly opt-in on the daemon side — it is only
+                    // delivered because we name it here (docs/xk-panel-phase2.md).
+                    "params": ["kinds": ["agent_usage_tick", "xk_run"]],
                 ]
                 guard var jsonLine = try? JSONSerialization.data(withJSONObject: request),
                       !Task.isCancelled else { break }
@@ -994,6 +996,10 @@ final class TermMeshDaemon: ObservableObject {
                         switch kind {
                         case "agent_usage_tick":
                             self.handleAgentUsageTick(payload: msg)
+                        case "xk_run":
+                            // XK-EVENTS-v1 panel-run telemetry → dashboard store.
+                            // Thread-safe ingest; no main-thread hop needed here.
+                            TeamDataStore.shared.ingestXkPanelRun(payload: msg)
                         case "keepalive":
                             break  // heartbeat — no action needed
                         default:

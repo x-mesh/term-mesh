@@ -739,7 +739,7 @@ final class DashboardController: NSObject, WKNavigationDelegate {
                 }
 
                 // Mission Control: fleet aggregate (teams × agents × tasks ×
-                // attention × approvals) + daemon watch enrichment.
+                // attention × approvals + panel_runs) + daemon watch enrichment.
                 var fleet = TeamOrchestrator.shared.fleetState()
                 fleet["watch"] = watchMap
                 if let fleetJson = Self.dashboardJSONString(fleet) {

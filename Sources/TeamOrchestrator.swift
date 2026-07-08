@@ -3838,6 +3838,11 @@ final class TeamOrchestrator: ObservableObject {
             ($0["status"] as? String) == "review_ready"
         }
         payload["approvals"] = approvals
+        // x-kit panel runs (XK-EVENTS-v1) — instance-global, mirrored from the
+        // daemon's xk_run bus into TeamDataStore. Carried on fleet.state so both
+        // the WKWebView dashboard and the HTTP dashboard (/api/fleet proxy) get
+        // it through one path.
+        payload["panel_runs"] = TeamDataStore.shared.xkPanelRunsSnapshot()
         return payload
     }
 

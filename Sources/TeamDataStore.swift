@@ -869,6 +869,127 @@ final class TeamDataStore: ObservableObject, @unchecked Sendable {
         return true
     }
 
+    // MARK: - x-kit Panel Runs (XK-EVENTS-v1)
+
+    /// Live x-panel run mirrored from daemon `xk_run` events
+    /// (docs/xk-panel-phase2.md). Instance-global, not team-scoped — runs are
+    /// keyed by the `run` id. Never persisted: `.xm/` files remain the durable
+    /// record; this map only feeds the dashboard.
+    struct XkPanelRun {
+        var run: String
+        var source: String
+        var runKind: String
+        var title: String
+        var phase: String                    // latest run-level phase ("starting" … "done"/"failed")
+        var modelStates: [String: String]    // model → last reported state
+        var elapsedMs: Int
+        var tail: String?
+        var firstSeenAt: Date
+        var updatedAt: Date
+
+        var isTerminal: Bool { phase == "done" || phase == "failed" }
+    }
+
+    /// run id → live run state. Guarded by `lock`.
+    private var xkPanelRuns: [String: XkPanelRun] = [:]
+
+    /// Terminal runs linger this long for the dashboard, then are pruned.
+    private let xkPanelRunRetention: TimeInterval = 15 * 60
+    private let maxXkPanelRuns = 24
+
+    /// Ingest one `xk_run` event (any thread). Mirrors the xk-bridge rules
+    /// (`handle_xk_run` in tm_agent.rs): unknown `v` is ignored; run-level
+    /// events (empty `model`) drive `phase`; per-model events only update that
+    /// model's state; a terminal event for an unknown run never creates an
+    /// entry (late replay).
+    func ingestXkPanelRun(payload: [String: Any]) {
+        guard (payload["v"] as? NSNumber)?.intValue ?? 1 == 1,
+              let run = (payload["run"] as? String)?.teamDataNilIfBlank else { return }
+        let model = (payload["model"] as? String)?.teamDataNilIfBlank
+        let phase = (payload["phase"] as? String)?.teamDataNilIfBlank
+        let now = Date()
+
+        lock.lock()
+        defer { lock.unlock() }
+        var updated: XkPanelRun
+        if let existing = xkPanelRuns[run] {
+            updated = existing
+        } else {
+            if model == nil, phase == "done" || phase == "failed" { return }
+            updated = XkPanelRun(
+                run: run, source: "", runKind: "run", title: run,
+                phase: phase ?? "starting", modelStates: [:], elapsedMs: 0,
+                tail: nil, firstSeenAt: now, updatedAt: now
+            )
+        }
+        if let source = (payload["source"] as? String)?.teamDataNilIfBlank { updated.source = source }
+        if let kind = (payload["run_kind"] as? String)?.teamDataNilIfBlank { updated.runKind = kind }
+        if let title = (payload["title"] as? String)?.teamDataNilIfBlank { updated.title = title }
+        if let model {
+            if let state = (payload["state"] as? String)?.teamDataNilIfBlank {
+                updated.modelStates[model] = state
+            }
+        } else if let phase {
+            updated.phase = phase
+        }
+        if let elapsed = (payload["elapsed_ms"] as? NSNumber)?.intValue {
+            updated.elapsedMs = max(updated.elapsedMs, elapsed)
+        }
+        if let tail = (payload["tail"] as? String)?.teamDataNilIfBlank { updated.tail = tail }
+        updated.updatedAt = now
+        xkPanelRuns[run] = updated
+        pruneXkPanelRunsUnsafe(now: now)
+    }
+
+    /// Caller holds `lock`.
+    private func pruneXkPanelRunsUnsafe(now: Date) {
+        xkPanelRuns = xkPanelRuns.filter {
+            !$0.value.isTerminal || now.timeIntervalSince($0.value.updatedAt) < xkPanelRunRetention
+        }
+        let overflow = xkPanelRuns.count - maxXkPanelRuns
+        guard overflow > 0 else { return }
+        // Evict oldest terminal runs first, then oldest overall.
+        let victims = xkPanelRuns.values
+            .sorted {
+                if $0.isTerminal != $1.isTerminal { return $0.isTerminal }
+                return $0.updatedAt < $1.updatedAt
+            }
+            .prefix(overflow)
+        for victim in victims {
+            xkPanelRuns.removeValue(forKey: victim.run)
+        }
+    }
+
+    /// Dashboard snapshot — active runs first, most recently updated first.
+    func xkPanelRunsSnapshot() -> [[String: Any]] {
+        lock.lock()
+        let now = Date()
+        pruneXkPanelRunsUnsafe(now: now)
+        let runs = Array(xkPanelRuns.values)
+        lock.unlock()
+        return runs
+            .sorted {
+                if $0.isTerminal != $1.isTerminal { return $1.isTerminal }
+                return $0.updatedAt > $1.updatedAt
+            }
+            .map { run in
+                [
+                    "run": run.run,
+                    "source": run.source,
+                    "run_kind": run.runKind,
+                    "title": run.title,
+                    "phase": run.phase,
+                    "terminal": run.isTerminal,
+                    "models": run.modelStates
+                        .sorted { $0.key < $1.key }
+                        .map { ["model": $0.key, "state": $0.value] },
+                    "elapsed_ms": run.elapsedMs,
+                    "age_seconds": Int(now.timeIntervalSince(run.updatedAt)),
+                    "tail": run.tail as Any? ?? NSNull(),
+                ]
+            }
+    }
+
     // MARK: - Agent Status Enrichment (off-main data for team.status)
 
     /// Returns data-layer enrichment for a given agent, avoiding MainActor.

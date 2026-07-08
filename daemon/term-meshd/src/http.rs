@@ -365,6 +365,7 @@ async fn fleet_handler(State(state): State<Arc<HttpState>>) -> Json<serde_json::
     let mut tasks = Vec::new();
     let mut attention = Vec::new();
     let mut approvals = Vec::new();
+    let mut panel_runs = Vec::new();
     let mut sockets_with_teams = Vec::new();
 
     for socket_path in socket_paths {
@@ -378,6 +379,12 @@ async fn fleet_handler(State(state): State<Arc<HttpState>>) -> Json<serde_json::
             }
             v
         };
+        // panel_runs is instance-global (x-panel telemetry, team-independent):
+        // collect it before the no-teams skip so the HTTP dashboard matches the
+        // WKWebView path, which surfaces panel runs regardless of team presence.
+        if let Some(rows) = fleet.get("panel_runs").and_then(|v| v.as_array()) {
+            panel_runs.extend(rows.iter().cloned().map(&tag));
+        }
         let socket_teams: Vec<_> = fleet
             .get("teams")
             .and_then(|v| v.as_array())
@@ -426,6 +433,7 @@ async fn fleet_handler(State(state): State<Arc<HttpState>>) -> Json<serde_json::
         "tasks": tasks,
         "attention": attention,
         "approvals": approvals,
+        "panel_runs": panel_runs,
         "watch": watch,
         "instance": {
             "active_socket_paths": sockets_with_teams,
