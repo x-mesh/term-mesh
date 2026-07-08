@@ -3106,6 +3106,59 @@ function renderFleetMatrix() {
   el.innerHTML = html;
 }
 
+// Approve/reject are WKWebView-only (git-kit runs in the app process — see
+// docs/design/mission-control-approval-queue.md §9). The HTTP dashboard
+// falls back to the existing "Mark Done" action for non-worktree tasks.
+const _fleetApprovalInFlight = new Set();
+
+function fleetCanApprove() {
+  return !!(window.webkit && window.webkit.messageHandlers
+    && window.webkit.messageHandlers.approveTask && window.webkit.messageHandlers.rejectTask);
+}
+
+function fleetApprove(teamName, taskId) {
+  if (!fleetCanApprove() || _fleetApprovalInFlight.has(taskId)) return;
+  _fleetApprovalInFlight.add(taskId);
+  renderFleetApprovals();
+  window.webkit.messageHandlers.approveTask.postMessage({ team_name: teamName, task_id: taskId });
+}
+
+function fleetReject(teamName, taskId) {
+  if (!fleetCanApprove() || _fleetApprovalInFlight.has(taskId)) return;
+  const reason = window.prompt('What needs to change before this can be approved?', '');
+  if (reason === null) return; // cancelled
+  _fleetApprovalInFlight.add(taskId);
+  renderFleetApprovals();
+  window.webkit.messageHandlers.rejectTask.postMessage({
+    team_name: teamName, task_id: taskId, reason: reason || 'Changes requested',
+  });
+}
+
+function fleetMarkDone(teamName, taskId) {
+  if (_fleetApprovalInFlight.has(taskId)) return;
+  _fleetApprovalInFlight.add(taskId);
+  if (_fleet && _fleet.approvals) _fleet.approvals = _fleet.approvals.filter(t => t.id !== taskId);
+  renderFleetApprovals();
+  runTeamTaskAction(teamName, taskId, 'done');
+}
+
+// Called by DashboardController after approveTask/rejectTask completes —
+// the raw single-line v2 RPC response ({ok, result|error}), evaluated
+// directly as a JS object literal (see DashboardController.pushApprovalResult).
+function onFleetApprovalResult(resp) {
+  const taskId = resp && resp.result && resp.result.task && resp.result.task.id;
+  if (taskId) _fleetApprovalInFlight.delete(taskId);
+  if (!resp || !resp.ok) {
+    const msg = (resp && resp.error && resp.error.message) || 'Action failed';
+    alert('Mission Control: ' + msg);
+  } else if (taskId && _fleet && _fleet.approvals) {
+    // Approved/rejected tasks leave review_ready — drop optimistically
+    // instead of waiting for the next 2s poll tick.
+    _fleet.approvals = _fleet.approvals.filter(t => t.id !== taskId);
+  }
+  renderFleetApprovals();
+}
+
 function renderFleetApprovals() {
   const el = document.getElementById('fleet-approvals');
   if (!el) return;
@@ -3114,13 +3167,35 @@ function renderFleetApprovals() {
     el.innerHTML = '<div class="fleet-empty">Nothing waiting for review.</div>';
     return;
   }
+  const canApprove = fleetCanApprove();
   el.innerHTML = approvals.map(t => {
     const meta = [t.team_name, t.assignee, t.worktree_branch]
       .filter(Boolean).map(escapeHTML).join(' · ');
     const summary = t.review_summary ? '<div style="opacity:.7;font-size:11px;margin-top:2px">'
       + escapeHTML(t.review_summary) + '</div>' : '';
+    const busy = _fleetApprovalInFlight.has(t.id);
+    const teamArg = quoteJS(t.team_name || '');
+    const idArg = quoteJS(t.id || '');
+    // Single-quoted onclick attribute: quoteJS()'s JSON.stringify output uses
+    // double quotes, so the attribute delimiter must be the other quote style
+    // (matches the existing runTeamTaskAction button convention below).
+    const btn = (label, bg, fg, onclick) => '<button ' + (busy ? 'disabled' : '')
+      + " onclick='" + onclick + "' style=\"font-size:11px;padding:3px 10px;border-radius:5px;border:none;"
+      + 'background:' + bg + ';color:' + fg + ';cursor:pointer;opacity:' + (busy ? '.5' : '1') + '">'
+      + label + '</button>';
+    let actions;
+    if (canApprove && t.worktree_path) {
+      actions = btn('Approve', '#34c759', '#fff', 'fleetApprove(' + teamArg + ',' + idArg + ')')
+        + btn('Reject', 'rgba(255,69,58,.15)', '#ff453a', 'fleetReject(' + teamArg + ',' + idArg + ')');
+    } else if (canApprove) {
+      actions = btn('Mark Done', '#0a84ff', '#fff', 'fleetMarkDone(' + teamArg + ',' + idArg + ')')
+        + btn('Reject', 'rgba(255,69,58,.15)', '#ff453a', 'fleetReject(' + teamArg + ',' + idArg + ')');
+    } else {
+      actions = btn('Mark Done', '#0a84ff', '#fff', 'fleetMarkDone(' + teamArg + ',' + idArg + ')');
+    }
     return '<div class="fleet-approval"><strong>' + escapeHTML(t.title || t.id || '')
-      + '</strong><div style="opacity:.6;font-size:10.5px">' + meta + '</div>' + summary + '</div>';
+      + '</strong><div style="opacity:.6;font-size:10.5px">' + meta + '</div>' + summary
+      + '<div style="margin-top:6px;display:flex;gap:8px">' + actions + '</div></div>';
   }).join('');
 }
 

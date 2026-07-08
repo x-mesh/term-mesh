@@ -1,12 +1,15 @@
 # 상세설계 — Mission Control 뷰 + Diff 리뷰·승인 큐
 
 작성일: 2026-07-07
-상태: P1 구현됨 — 승인 큐 액션(P2: diff_summary/approve/reject RPC)과 push 전송(P3)은 미착수
+상태: P1 + P2 구현됨 — push 전송(P3)은 미착수
 
-구현 상태 (2026-07-07):
+구현 상태 (2026-07-08):
 - 데몬: `watch.board`(board.jsonl tail, 단위테스트 포함), `GET /api/fleet`(멀티 소켓 fleet.state 프록시 + 데몬 로컬 watch 병합), HTTP 폴링 스크립트에 fleet 폴링 추가 — **구현 + cargo 테스트 통과**.
+- 데몬(P2): **`worktree.diff_summary`**(git2 — merge-base 기준 파일별 add/del/kind, ahead/behind, dirty; 패치 본문 없음) — **구현 + 단위테스트 4종 통과**(`diff_summary_reports_file_stats_relative_to_base`, `_flags_dirty_worktree`, `_rejects_unknown_base_ref`, `_rejects_nonexistent_path`).
 - Swift: v2 `fleet.state` RPC + `TeamOrchestrator.fleetState()`(approvals = review_ready 파생 포함), per-agent `waiting_input`, `DashboardController` fleet push + `focusAgentPane` 딥링크 핸들러 — **구현됨, macOS 빌드 검증 필요**.
-- 대시보드: `mission` 프리셋 + Fleet 매트릭스(상태 칩·active task·heartbeat 인라인)/Review Queue(읽기 전용)/Watch Verdicts 카드, 칸반·Gantt·요약 타일 공유 — **구현됨(JS 문법 검증만 수행), 시각 확인 필요**.
+- Swift(P2): **`team.task.approve`/`team.task.reject`** v2 RPC (+ 인프로세스 진입점, 대시보드 버튼에서 소켓 없이 직접 호출) — `WorktreeApprovalHelper`가 `tm-agent task finish-worktree`(`tm_agent.rs:8673`)와 **동일한 lock 파일 프로토콜**(`$TMPDIR/term-mesh-worktree-locks/<team>-<task>.lock`, O_EXCL 원자적 생성, 동일 `sanitize_branch_component` 정규화)을 공유해 CLI·GUI 동시 finish를 방지. 승인 실패 시 `blocked`+사유, 성공 시 `completed`+`worktree_finished_at/mode/removed`. Reject는 reassign 경로(기존 `dispatchTaskToAssignee` 재사용) 또는 `assigned` 복귀 + `tm-agent send` 통지 — **구현됨, macOS 빌드 검증 필요**.
+- 대시보드: `mission` 프리셋 + Fleet 매트릭스(상태 칩·active task·heartbeat 인라인)/Review Queue/Watch Verdicts 카드, 칸반·Gantt·요약 타일 공유. Review Queue(P2): worktree 태스크는 Approve/Reject, 비worktree 태스크는 기존 `teamTaskAction`(done) 재사용 + Reject, HTTP 대시보드는 Approve/Reject 미노출(§9 결정대로 WKWebView 전용) — **구현됨(JS 문법 검증만 수행), 시각 확인 필요**.
+- **git-kit 경로 해석**: PATH(`which git-kit`) 우선, 실패 시 `/opt/homebrew/bin`, `/usr/local/bin`, `~/.cargo/bin`, `~/.local/bin` 순으로 탐색(`AgentRolePreset.ProviderDetector`와 동일 2단 패턴). 못 찾으면 에러 메시지로 안내(0.141.0 launchd PATH 이슈 재발 방지).
 - **설계 변경(§3)**: `waiting_input`을 `agent_state`의 새 값으로 덮어쓰지 않고 **별도 boolean 필드**로 추가했다. 근거: `tm-agent`가 `agent_state == "idle"`을 위임 대상 선정에 하드매칭(`tm_agent.rs:3449` 등)하므로 상태값 변경은 fan-out 회귀를 유발한다. `running`/`assigned_stale` 값도 유지. enum 통합은 소비자(tm-agent·dashboard) 동시 마이그레이션이 가능할 때 재검토.
 - 매핑 근거: notification `surfaceId` == bonsplit panel id (`TabManager.focusedSurfaceId == focusedPanelId`) — per-agent waiting_input은 `hasUnreadNotification(forTabId: workspaceId, surfaceId: panelId)`로 도출.
 상위 문서: `docs/strategy-differentiation-roadmap.md` §B-2, §B-3

@@ -125,6 +125,8 @@ final class DashboardController: NSObject, WKNavigationDelegate {
             config.userContentController.add(handler, name: "teamTaskCreate")
             config.userContentController.add(handler, name: "switchPreset")
             config.userContentController.add(handler, name: "focusAgentPane")
+            config.userContentController.add(handler, name: "approveTask")
+            config.userContentController.add(handler, name: "rejectTask")
         }
 
         let wv = WKWebView(frame: .zero, configuration: config)
@@ -778,6 +780,19 @@ final class DashboardController: NSObject, WKNavigationDelegate {
         webView.evaluateJavaScript("if(window.updateInstanceStatus)updateInstanceStatus(\(instanceJson));") { _, _ in }
     }
 
+    /// Mission Control Review Queue — deliver the `team.task.approve`/
+    /// `team.task.reject` result back to the dashboard. `raw` is already a
+    /// single-line JSON string from `v2Ok`/`v2Error` (id-less since these are
+    /// called in-process, not over the socket), so it can be interpolated
+    /// directly as a JS object literal — same technique `fetchAndPush`
+    /// already uses for daemon RPC results.
+    fileprivate func pushApprovalResult(_ raw: String) {
+        guard let webView else { return }
+        webView.evaluateJavaScript("if(window.onFleetApprovalResult)onFleetApprovalResult(\(raw));") { _, error in
+            if let error { Logger.app.error("dashboard approval result push error: \(error, privacy: .public)") }
+        }
+    }
+
     private func currentTeamPayload() -> [String: Any] {
         let teamData = TeamOrchestrator.shared.listTeams()
         let teamTasks = teamData.flatMap { team -> [[String: Any]] in
@@ -961,6 +976,31 @@ private class DashboardMessageHandler: NSObject, WKScriptMessageHandler {
             Task { @MainActor in
                 NSApp.activate(ignoringOtherApps: true)
                 self.controller?.tabManager?.focusTabFromNotification(tabId, surfaceId: panelId)
+            }
+        case "approveTask":
+            // Mission Control Review Queue — Approve. Runs the same
+            // git-kit-backed flow as `tm-agent task finish-worktree`
+            // (TerminalController.asyncTeamTaskApprove); WKWebView-only,
+            // since the subprocess runs in this app process.
+            guard let dict = message.body as? [String: Any],
+                  let teamName = dict["team_name"] as? String,
+                  let taskId = dict["task_id"] as? String else { return }
+            Task { @MainActor in
+                let raw = await TerminalController.shared.asyncTeamTaskApprove(
+                    params: ["team_name": teamName, "task_id": taskId], id: nil
+                )
+                self.controller?.pushApprovalResult(raw)
+            }
+        case "rejectTask":
+            guard let dict = message.body as? [String: Any],
+                  let teamName = dict["team_name"] as? String,
+                  let taskId = dict["task_id"] as? String else { return }
+            var params: [String: Any] = ["team_name": teamName, "task_id": taskId]
+            if let reason = dict["reason"] as? String { params["reason"] = reason }
+            if let reassignTo = dict["reassign_to"] as? String { params["reassign_to"] = reassignTo }
+            Task { @MainActor in
+                let raw = await TerminalController.shared.asyncTeamTaskReject(params: params, id: nil)
+                self.controller?.pushApprovalResult(raw)
             }
         default:
             break

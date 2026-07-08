@@ -1,5 +1,6 @@
 import AppKit
 import Carbon.HIToolbox
+import Darwin
 import Foundation
 import os
 import Bonsplit
@@ -2057,6 +2058,10 @@ class TerminalController {
             return await asyncTeamTaskUnblock(params: params, id: id)
         case "team.task.split":
             return await asyncTeamTaskSplit(params: params, id: id)
+        case "team.task.approve":
+            return await asyncTeamTaskApprove(params: params, id: id)
+        case "team.task.reject":
+            return await asyncTeamTaskReject(params: params, id: id)
         case "team.delegate":
             return await asyncTeamDelegate(params: params, id: id)
         case "team.send_key":
@@ -3034,6 +3039,144 @@ class TerminalController {
             )
         }
         return v2Ok(id: id, result: ["task": store.taskDictionary(task), "dispatched": dispatched])
+    }
+
+    /// Mission Control approval queue — Approve. Mirrors `tm-agent task
+    /// finish-worktree --to parent` (`tm_agent.rs:8673`): same lock file
+    /// protocol (mutual exclusion with the CLI), same stale-worktree guard,
+    /// same `git-kit wt finish` contract. Design:
+    /// docs/design/mission-control-approval-queue.md §6.4.
+    ///
+    /// `push`/`cleanup` default to `false`/`true` (matching the CLI's
+    /// `finish-worktree` flag defaults). On success the task transitions to
+    /// `completed` exactly like `team.task.done`; on failure it transitions
+    /// to `blocked` with the git-kit error as `blocked_reason` (never left in
+    /// `review_ready` — that would strand it in the approval queue forever).
+    /// Not `private`: called directly (in-process) by
+    /// `DashboardController.handleTeamTaskApprove` for the Mission Control
+    /// Review Queue's Approve button, in addition to the v2 socket path.
+    func asyncTeamTaskApprove(params: [String: Any], id: Any?) async -> String {
+        guard let teamName = params["team_name"] as? String else {
+            return v2Error(id: id, code: "invalid_params", message: "Missing team_name")
+        }
+        guard let taskId = params["task_id"] as? String else {
+            return v2Error(id: id, code: "invalid_params", message: "Missing task_id")
+        }
+        let push = params["push"] as? Bool ?? false
+        let cleanup = params["cleanup"] as? Bool ?? true
+        let store = TeamDataStore.shared
+
+        guard let task = store.getTask(teamName: teamName, taskId: taskId) else {
+            return v2Error(id: id, code: "not_found", message: "Task not found")
+        }
+        guard let worktreePath = task.worktreePath?.nilIfBlankTC else {
+            return v2Error(
+                id: id, code: "invalid_state",
+                message: "Task has no worktree — nothing to finish. Use team.task.done for non-worktree tasks."
+            )
+        }
+
+        let outcome = await WorktreeApprovalHelper.finish(
+            teamName: teamName, taskId: taskId, worktreePath: worktreePath,
+            baseRef: task.worktreeParent, push: push, cleanup: cleanup
+        )
+
+        switch outcome {
+        case .success(let mode, let removed):
+            guard let updated = store.updateTask(
+                teamName: teamName, taskId: taskId, status: "completed",
+                worktreeFinishedAt: Date(), worktreeFinishMode: mode, worktreeRemoved: removed
+            ) else {
+                return v2Error(id: id, code: "not_found", message: "Task not found (race during finish)")
+            }
+            let notified = await MainActor.run {
+                let tabManager = TeamOrchestrator.shared.resolveTabManager(teamName: teamName) ?? self.tabManager
+                guard let tabManager else { return false }
+                return TeamOrchestrator.shared.notifyTaskLifecycleEvent(
+                    teamName: teamName, task: updated, event: "completed",
+                    note: "Approved and merged to \(task.worktreeParent ?? "parent")", tabManager: tabManager
+                )
+            }
+            return v2Ok(id: id, result: ["task": store.taskDictionary(updated), "notified": notified])
+        case .failure(let reason):
+            let blocked = store.updateTask(
+                teamName: teamName, taskId: taskId, status: "blocked", blockedReason: reason
+            )
+            return v2Error(
+                id: id, code: "approve_failed", message: reason,
+                data: blocked.map { ["task": store.taskDictionary($0)] }
+            )
+        }
+    }
+
+    /// Mission Control approval queue — Reject. With `reassign_to`, routes
+    /// the task to a different agent (reuses the existing reassign +
+    /// dispatch path, same as `team.task.reassign`). Without it, bounces the
+    /// task back to its current assignee as `assigned` with the rejection
+    /// reason delivered as a pane message — no new persisted field, since the
+    /// worker's next `tm-agent task review` overwrites `review_summary`
+    /// anyway. The worktree (if any) is left untouched for rework.
+    /// Not `private`: called directly (in-process) by
+    /// `DashboardController.handleTeamTaskReject` for the Mission Control
+    /// Review Queue's Reject button, in addition to the v2 socket path.
+    func asyncTeamTaskReject(params: [String: Any], id: Any?) async -> String {
+        guard let teamName = params["team_name"] as? String else {
+            return v2Error(id: id, code: "invalid_params", message: "Missing team_name")
+        }
+        guard let taskId = params["task_id"] as? String else {
+            return v2Error(id: id, code: "invalid_params", message: "Missing task_id")
+        }
+        let reason = (params["reason"] as? String)?.nilIfBlankTC ?? "Changes requested"
+        let reassignTo = (params["reassign_to"] as? String)?.nilIfBlankTC
+        let store = TeamDataStore.shared
+
+        if let reassignTo {
+            guard let task = store.reassignTask(
+                teamName: teamName, taskId: taskId, assignee: reassignTo
+            ) else {
+                return v2Error(id: id, code: "not_found", message: "Task not found")
+            }
+            let dispatched = await MainActor.run {
+                let tabManager = TeamOrchestrator.shared.resolveTabManager(teamName: teamName) ?? self.tabManager
+                guard let tabManager else { return false }
+                return TeamOrchestrator.shared.dispatchTaskToAssignee(
+                    teamName: teamName, task: task, tabManager: tabManager
+                )
+            }
+            // Follow-up so the new assignee sees *why* this landed on them —
+            // dispatchTaskToAssignee only sends the task capsule, not the
+            // rejection reason.
+            if dispatched {
+                _ = await asyncTeamSend(
+                    params: [
+                        "team_name": teamName, "agent_name": reassignTo,
+                        "text": "This task was reassigned to you after review rejection: \(reason)",
+                    ],
+                    id: nil
+                )
+            }
+            return v2Ok(id: id, result: ["task": store.taskDictionary(task), "dispatched": dispatched])
+        }
+
+        guard let task = store.updateTask(
+            teamName: teamName, taskId: taskId, status: "assigned"
+        ) else {
+            return v2Error(id: id, code: "not_found", message: "Task not found")
+        }
+        let notified: Bool
+        if let assignee = task.assignee?.nilIfBlankTC {
+            let sendResult = await asyncTeamSend(
+                params: [
+                    "team_name": teamName, "agent_name": assignee,
+                    "text": "Review feedback on task '\(task.title)': \(reason)\n\nPlease address and resubmit with `tm-agent task review \(taskId) '<summary>'`.",
+                ],
+                id: nil
+            )
+            notified = sendResult.contains("\"ok\":true")
+        } else {
+            notified = false
+        }
+        return v2Ok(id: id, result: ["task": store.taskDictionary(task), "notified": notified])
     }
 
     private func asyncTeamTaskSplit(params: [String: Any], id: Any?) async -> String {
@@ -5248,5 +5391,206 @@ class TerminalController {
 
     deinit {
         stop()
+    }
+}
+
+// MARK: - Mission Control approval queue — worktree finish helper
+
+/// Off-main helper backing `team.task.approve`. Mirrors `tm-agent task
+/// finish-worktree` (`daemon/term-mesh-cli/src/tm_agent.rs:8673`) exactly —
+/// same lock file protocol (mutual exclusion with the CLI, so a leader
+/// running the CLI command and clicking Approve in the same second can't
+/// double-finish a worktree), same dirty-worktree guard, same `git-kit wt
+/// finish` contract. See docs/design/mission-control-approval-queue.md §6.4.
+private enum WorktreeApprovalHelper {
+    enum Outcome {
+        case success(mode: String?, removed: Bool?)
+        case failure(String)
+    }
+
+    /// Acquire the cross-process lock, verify the worktree isn't dirty (via
+    /// the daemon's git2 `worktree.diff_summary`), run `git-kit wt finish`,
+    /// release the lock. Runs entirely off the calling actor — this may take
+    /// real wall-clock time (subprocess exec + a socket round-trip).
+    static func finish(
+        teamName: String, taskId: String, worktreePath: String,
+        baseRef: String?, push: Bool, cleanup: Bool
+    ) async -> Outcome {
+        await withCheckedContinuation { continuation in
+            DispatchQueue.global(qos: .utility).async {
+                continuation.resume(returning: finishSync(
+                    teamName: teamName, taskId: taskId, worktreePath: worktreePath,
+                    baseRef: baseRef, push: push, cleanup: cleanup
+                ))
+            }
+        }
+    }
+
+    private static func finishSync(
+        teamName: String, taskId: String, worktreePath: String,
+        baseRef: String?, push: Bool, cleanup: Bool
+    ) -> Outcome {
+        let lock: TaskWorktreeLock
+        switch acquireLock(teamName: teamName, taskId: taskId) {
+        case .success(let l): lock = l
+        case .failure(let e): return .failure(e)
+        }
+        defer { lock.release() }
+
+        // Stale-worktree guard: refuse to finish with uncommitted changes.
+        // Best-effort — if base_ref is missing/unresolvable, skip straight to
+        // git-kit (which gates on a clean tree itself as the final backstop).
+        if let baseRef = baseRef?.nilIfBlankTC {
+            let diffParams: [String: Any] = ["path": worktreePath, "base_ref": baseRef]
+            if let raw = TermMeshDaemon.shared.rpcCallRaw(method: "worktree.diff_summary", params: diffParams),
+               let data = raw.data(using: .utf8),
+               let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+                if let result = obj["result"] as? [String: Any] {
+                    if (result["dirty"] as? Bool) == true {
+                        return .failure("Worktree has uncommitted changes — ask the agent to commit before approving.")
+                    }
+                } else if let err = obj["error"] as? String {
+                    Logger.team.warning("[task.approve] diff_summary check skipped: \(err, privacy: .public)")
+                }
+            }
+        }
+
+        guard let gitKitPath = resolveGitKitPath() else {
+            return .failure("git-kit not found on PATH — install it or set its location in Settings > CLI Paths.")
+        }
+
+        var args = ["wt", "finish", "--to", "parent", "--json"]
+        if cleanup { args.append("--cleanup") }
+        if push { args.append("--push") }
+
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: gitKitPath)
+        process.arguments = args
+        process.currentDirectoryURL = URL(fileURLWithPath: worktreePath)
+        var env = ProcessInfo.processInfo.environment
+        env["GK_AGENT"] = "1"
+        env["NO_COLOR"] = "1"
+        process.environment = env
+        let stdoutPipe = Pipe()
+        let stderrPipe = Pipe()
+        process.standardOutput = stdoutPipe
+        process.standardError = stderrPipe
+        do {
+            try process.run()
+        } catch {
+            return .failure("failed to launch git-kit: \(error.localizedDescription)")
+        }
+        process.waitUntilExit()
+        let outData = stdoutPipe.fileHandleForReading.readDataToEndOfFile()
+        let errData = stderrPipe.fileHandleForReading.readDataToEndOfFile()
+        let errStr = String(data: errData, encoding: .utf8) ?? ""
+
+        guard let obj = try? JSONSerialization.jsonObject(with: outData) as? [String: Any] else {
+            return .failure("git-kit wt finish produced no parseable output. stderr: \(String(errStr.prefix(500)))")
+        }
+
+        // GK_AGENT envelope: {ok, result} or {ok:false, error:{code,message}}.
+        if (obj["ok"] as? Bool) == false {
+            let message = ((obj["error"] as? [String: Any])?["message"] as? String)?.nilIfBlankTC
+                ?? errStr.nilIfBlankTC
+                ?? "git-kit wt finish failed"
+            return .failure(message)
+        }
+        let result = (obj["result"] as? [String: Any]) ?? obj
+        return .success(mode: result["mode"] as? String, removed: result["removed"] as? Bool)
+    }
+
+    private static func acquireLock(teamName: String, taskId: String) -> Result<TaskWorktreeLock, String> {
+        let dir = (NSTemporaryDirectory() as NSString).appendingPathComponent("term-mesh-worktree-locks")
+        try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true, attributes: nil)
+        let team = sanitizeBranchComponent(teamName)
+        let task = sanitizeBranchComponent(taskId)
+        let path = (dir as NSString).appendingPathComponent("\(team)-\(task).lock")
+        // O_EXCL: atomic exclusive create, matching Rust's
+        // `OpenOptions::create_new(true)` — the same primitive the CLI uses,
+        // so the two processes truly contend on one lock.
+        let fd = open(path, O_WRONLY | O_CREAT | O_EXCL, 0o644)
+        guard fd >= 0 else {
+            return .failure("another worktree finish is already running for task \(taskId)")
+        }
+        let content = "pid=\(ProcessInfo.processInfo.processIdentifier)\n"
+        _ = content.withCString { write(fd, $0, strlen($0)) }
+        close(fd)
+        return .success(TaskWorktreeLock(path: path))
+    }
+
+    /// Same normalization as the Rust CLI's `sanitize_branch_component`
+    /// (`tm_agent.rs:8481`) so both sides derive the identical lock filename
+    /// for the same `(team, task)` pair.
+    private static func sanitizeBranchComponent(_ raw: String) -> String {
+        var out = ""
+        var lastDash = false
+        for ch in raw {
+            let keep = (ch.isASCII && (ch.isLetter || ch.isNumber)) || ch == "_" || ch == "-"
+            if keep {
+                out.append(contentsOf: ch.lowercased())
+                lastDash = false
+            } else if !lastDash {
+                out.append("-")
+                lastDash = true
+            }
+        }
+        while out.hasPrefix("-") { out.removeFirst() }
+        while out.hasSuffix("-") { out.removeLast() }
+        return String(out.prefix(48))
+    }
+
+    /// Resolve the `git-kit` binary: PATH first (`which`, respects
+    /// Homebrew/cargo installs and any shell profile PATH additions), then
+    /// common install locations as a fallback — the same two-tier pattern
+    /// `AgentRolePreset.ProviderDetector` uses for CLI discovery.
+    private static func resolveGitKitPath() -> String? {
+        if let fromPath = whichGitKit() { return fromPath }
+        let home = NSHomeDirectory()
+        let candidates = [
+            "/opt/homebrew/bin/git-kit",
+            "/usr/local/bin/git-kit",
+            (home as NSString).appendingPathComponent(".cargo/bin/git-kit"),
+            (home as NSString).appendingPathComponent(".local/bin/git-kit"),
+        ]
+        return candidates.first { FileManager.default.isExecutableFile(atPath: $0) }
+    }
+
+    private static func whichGitKit() -> String? {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/which")
+        process.arguments = ["git-kit"]
+        let pipe = Pipe()
+        process.standardOutput = pipe
+        process.standardError = Pipe()
+        do {
+            try process.run()
+        } catch { return nil }
+        process.waitUntilExit()
+        guard process.terminationStatus == 0 else { return nil }
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        return String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfBlankTC
+    }
+}
+
+/// Guards the exclusive lock file for the lifetime of a worktree-finish
+/// operation; removes it on release (mirrors Rust's `Drop for
+/// TaskWorktreeLock`, `tm_agent.rs:8572`).
+private final class TaskWorktreeLock {
+    private let path: String
+    private var released = false
+    init(path: String) { self.path = path }
+    func release() {
+        guard !released else { return }
+        released = true
+        try? FileManager.default.removeItem(atPath: path)
+    }
+    deinit { release() }
+}
+
+private extension String {
+    var nilIfBlankTC: String? {
+        let trimmed = trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? nil : trimmed
     }
 }
