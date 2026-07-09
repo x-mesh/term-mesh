@@ -35,7 +35,23 @@ done
 # daemon bins are already linker-signed. Surface failures instead of swallowing.
 /usr/bin/codesign --force --sign - --timestamp=none --generate-entitlement-der "$APP_PATH" \
   || echo "warning: codesign re-sign failed; Finder/Spotlight/Raycast launch may be rejected" >&2
+
+# Install into /Applications so Launchpad / Spotlight / Raycast resolve and launch
+# this dogfood build — they only index standard locations, never DerivedData.
+# The brew cask normally owns this path; a dogfood build deliberately overwrites
+# it. Run `brew reinstall --cask term-mesh` to restore the release build later.
+INSTALL_PATH="/Applications/term-mesh.app"
+rm -rf "$INSTALL_PATH"
+cp -R "$APP_PATH" "$INSTALL_PATH"
+# cp -R re-materializes the bundle, so re-seal in place to keep the signature valid.
+/usr/bin/codesign --force --sign - --timestamp=none --generate-entitlement-der "$INSTALL_PATH" \
+  || echo "warning: codesign re-sign of installed app failed; Launchpad launch may be rejected" >&2
+xattr -dr com.apple.quarantine "$INSTALL_PATH" 2>/dev/null || true
+# Point LaunchServices at THIS bundle so it stops resolving the old damaged shell.
+LSREGISTER=/System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/LaunchServices.framework/Versions/A/Support/lsregister
+"$LSREGISTER" -f "$INSTALL_PATH" 2>/dev/null || true
+
 # Dev shells (including CI/Codex) often force-disable paging by exporting these.
 # Don't leak that into term-mesh, otherwise `git diff` won't page even with PAGER=less.
-env -u GIT_PAGER -u GH_PAGER open "$APP_PATH"
+env -u GIT_PAGER -u GH_PAGER open "$INSTALL_PATH"
 osascript -e 'tell application "term-mesh" to activate' || true
