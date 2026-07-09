@@ -742,6 +742,18 @@ final class DashboardController: NSObject, WKNavigationDelegate {
                 // attention × approvals + panel_runs) + daemon watch enrichment.
                 var fleet = TeamOrchestrator.shared.fleetState()
                 fleet["watch"] = watchMap
+                // Enrich each x-kit panel run with its durable event log (events.jsonl) so the
+                // card shows every model's real stdout/stderr, not just a status chip. The socket
+                // only advertises the file PATH (log_path); the bytes are read here off disk — the
+                // same local-file pattern the web dashboard uses. Best-effort per run.
+                if var runs = fleet["panel_runs"] as? [[String: Any]] {
+                    for i in runs.indices {
+                        if let lp = runs[i]["log_path"] as? String, !lp.isEmpty {
+                            runs[i]["events"] = Self.readPanelEventLog(path: lp, limit: 40)
+                        }
+                    }
+                    fleet["panel_runs"] = runs
+                }
                 if let fleetJson = Self.dashboardJSONString(fleet) {
                     webView.evaluateJavaScript("if(window.updateFleet)updateFleet(\(fleetJson));") { _, _ in }
                 }
@@ -771,6 +783,35 @@ final class DashboardController: NSObject, WKNavigationDelegate {
               let data = try? JSONSerialization.data(withJSONObject: value),
               let string = String(data: data, encoding: .utf8) else { return nil }
         return string
+    }
+
+    /// Read the last `limit` records from an x-panel run's events.jsonl — the durable,
+    /// milestone-only log written by x-panel-cli's writeEvent (spawn/stdout/stderr/exit/…).
+    /// Best-effort: a missing/unreadable file yields []. Only the fields the log pane renders
+    /// are kept, and each `text` is capped, so a huge stdout record can't bloat the WKWebView
+    /// payload. Control-char sanitization is unnecessary here — the JS side escapeHTML's every
+    /// field into an HTML pane (no terminal to hijack).
+    private static func readPanelEventLog(path: String, limit: Int = 40) -> [[String: Any]] {
+        guard let data = FileManager.default.contents(atPath: path),
+              let text = String(data: data, encoding: .utf8) else { return [] }
+        let lines = text.split(separator: "\n", omittingEmptySubsequences: true).suffix(limit)
+        var out: [[String: Any]] = []
+        for line in lines {
+            guard let d = line.data(using: .utf8),
+                  let obj = try? JSONSerialization.jsonObject(with: d) as? [String: Any] else { continue }
+            var rec: [String: Any] = ["type": obj["type"] as? String ?? "event"]
+            if let seq = obj["seq"] as? NSNumber { rec["seq"] = seq.intValue }
+            if let at = obj["at"] as? String { rec["at"] = at }
+            if let model = obj["model"] as? String { rec["model"] = model }
+            if let phase = obj["phase"] as? String { rec["phase"] = phase }
+            if let t = obj["text"] as? String { rec["text"] = String(t.prefix(2000)) }
+            if let bytes = obj["bytes"] as? NSNumber { rec["bytes"] = bytes.intValue }
+            if let code = obj["code"] as? NSNumber { rec["code"] = code.intValue }
+            if let ok = obj["ok"] as? Bool { rec["ok"] = ok }
+            if let err = obj["error"] as? String { rec["error"] = String(err.prefix(200)) }
+            out.append(rec)
+        }
+        return out
     }
 
     private func pushInstanceStatus() {

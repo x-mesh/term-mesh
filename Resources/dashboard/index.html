@@ -1320,6 +1320,12 @@
     .fleet-row:hover { background: rgba(127,127,127,0.08); }
     .fleet-row.clickable { cursor:pointer; }
     .fleet-chip { flex:0 0 auto; min-width:86px; text-align:center; padding:1px 8px; border-radius:9px; font-size:10px; font-weight:600; text-transform:uppercase; letter-spacing:.04em; }
+    .fleet-row.xk-clickable { cursor:pointer; }
+    .fleet-row.xk-clickable:hover { background:rgba(255,255,255,.05); }
+    .xk-log-pane { margin:2px 0 8px 14px; padding:6px 8px; border-left:2px solid rgba(255,255,255,.14); max-height:300px; overflow:auto; }
+    .xk-log-row { padding:2px 0; font-size:11px; }
+    .xk-log-meta { margin-left:6px; color:var(--muted,#8a8f98); font-family:var(--mono,ui-monospace,monospace); }
+    .xk-log-text { margin:2px 0 4px; padding:4px 6px; background:rgba(0,0,0,.28); border-radius:4px; white-space:pre-wrap; word-break:break-word; font-family:var(--mono,ui-monospace,monospace); font-size:11px; max-height:160px; overflow:auto; }
     .fleet-chip.working { background:rgba(52,199,89,.18); color:#34c759; }
     .fleet-chip.idle { background:rgba(127,127,127,.15); color:#8e8e93; }
     .fleet-chip.waiting { background:rgba(255,159,10,.2); color:#ff9f0a; }
@@ -3066,15 +3072,54 @@ function updatePanelRuns(runs) {
     const meta = [];
     if (r.elapsed_ms) meta.push(Math.round(r.elapsed_ms / 1000) + 's');
     if (r.source) meta.push(r.source);
-    html += '<div class="fleet-row">'
+    // Durable event log (events.jsonl, enriched by DashboardController). When present the row
+    // becomes a click-to-expand toggle onto a pane of each model's real stdout/stderr lines.
+    const events = r.events || [];
+    const hasLog = events.length > 0;
+    const safe = String(r.run || '').replace(/[^a-zA-Z0-9_-]/g, '');
+    const open = hasLog && _xkLogOpen.has(safe);
+    html += '<div class="fleet-row' + (hasLog ? ' xk-clickable' : '') + '"'
+      + (hasLog ? " onclick=\"toggleXkLog('" + safe + "')\"" : '') + '>'
       + '<span class="fleet-chip ' + chip.cls + '">' + escapeHTML(chip.text) + '</span>'
       + '<span class="fleet-name">' + escapeHTML(r.run_kind || 'run') + '</span>'
       + '<span class="fleet-task">' + escapeHTML(r.title || r.run || '') + (models ? ' — ' + models : '') + '</span>'
-      + '<span class="fleet-heartbeat">' + escapeHTML(meta.join(' · ')) + '</span>'
+      + '<span class="fleet-heartbeat">' + escapeHTML(meta.join(' · ')) + (hasLog ? ' ' + (open ? '▾' : '▸') : '') + '</span>'
       + '</div>';
+    if (hasLog) {
+      html += '<div class="xk-log-pane" id="xk-log-' + safe + '"' + (open ? '' : ' style="display:none"') + '>'
+        + xkPanelEventRows(events) + '</div>';
+    }
   }
   el.innerHTML = html;
   if ((card.dataset.presets || '').includes(currentPreset)) card.style.display = '';
+}
+
+// Expanded panel-run log ids survive the 2s re-render (innerHTML is rebuilt each push, so
+// the open/closed state must live outside the DOM or every tick would collapse the pane).
+let _xkLogOpen = new Set();
+function toggleXkLog(safe) {
+  if (_xkLogOpen.has(safe)) _xkLogOpen.delete(safe); else _xkLogOpen.add(safe);
+  const pane = document.getElementById('xk-log-' + safe);
+  if (pane) pane.style.display = _xkLogOpen.has(safe) ? '' : 'none';
+}
+
+function xkPanelEventBadge(type) {
+  const t = String(type || 'event');
+  const cls = /error|missing|timeout/.test(t) ? 'blocked'
+    : t === 'stderr' ? 'working'
+    : /stdout|json_parsed|model_done|run_done|exit/.test(t) ? 'idle'
+    : 'idle';
+  return '<span class="fleet-chip ' + cls + '">' + escapeHTML(t) + '</span>';
+}
+
+function xkPanelEventRows(events) {
+  return (events || []).slice(-40).map(ev => {
+    const meta = [ev.model, ev.phase, ev.bytes ? ev.bytes + 'b' : '', ev.code != null ? 'exit ' + ev.code : '', ev.error || '']
+      .filter(Boolean).map(escapeHTML).join(' · ');
+    const body = ev.text ? '<pre class="xk-log-text">' + escapeHTML(ev.text) + '</pre>' : '';
+    return '<div class="xk-log-row">' + xkPanelEventBadge(ev.type)
+      + '<span class="xk-log-meta">' + meta + '</span>' + body + '</div>';
+  }).join('');
 }
 
 function fleetStateChip(agent) {

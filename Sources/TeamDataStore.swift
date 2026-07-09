@@ -884,6 +884,7 @@ final class TeamDataStore: ObservableObject, @unchecked Sendable {
         var modelStates: [String: String]    // model → last reported state
         var elapsedMs: Int
         var tail: String?
+        var logPath: String?                  // absolute path to this run's events.jsonl (review/panel only)
         var firstSeenAt: Date
         var updatedAt: Date
 
@@ -919,7 +920,7 @@ final class TeamDataStore: ObservableObject, @unchecked Sendable {
             updated = XkPanelRun(
                 run: run, source: "", runKind: "run", title: run,
                 phase: phase ?? "starting", modelStates: [:], elapsedMs: 0,
-                tail: nil, firstSeenAt: now, updatedAt: now
+                tail: nil, logPath: nil, firstSeenAt: now, updatedAt: now
             )
         }
         if let source = (payload["source"] as? String)?.teamDataNilIfBlank { updated.source = source }
@@ -936,6 +937,10 @@ final class TeamDataStore: ObservableObject, @unchecked Sendable {
             updated.elapsedMs = max(updated.elapsedMs, elapsed)
         }
         if let tail = (payload["tail"] as? String)?.teamDataNilIfBlank { updated.tail = tail }
+        // log_path rides the run-level frame (empty model) once — the socket advertises the
+        // durable events.jsonl PATH; the dashboard reads the bytes off disk (richer per-model
+        // stdout/stderr than the 256-char socket tail). review/panel runs only; cross omits it.
+        if let lp = (payload["log_path"] as? String)?.teamDataNilIfBlank { updated.logPath = lp }
         updated.updatedAt = now
         xkPanelRuns[run] = updated
         pruneXkPanelRunsUnsafe(now: now)
@@ -986,6 +991,7 @@ final class TeamDataStore: ObservableObject, @unchecked Sendable {
                     "elapsed_ms": run.elapsedMs,
                     "age_seconds": Int(now.timeIntervalSince(run.updatedAt)),
                     "tail": run.tail as Any? ?? NSNull(),
+                    "log_path": run.logPath as Any? ?? NSNull(),
                 ]
             }
     }
