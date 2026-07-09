@@ -27,6 +27,14 @@ for bin in term-meshd term-mesh-run tm-agent term-mesh-peer-relay; do
     chmod +x "$BIN_DIR/$bin"
   fi
 done
+# Re-sign AFTER copying daemon binaries into Contents/Resources/bin. The cp adds
+# files the app's resource seal (from the Xcode build) doesn't cover, so the
+# bundle signature becomes invalid ("a sealed resource is missing or invalid").
+# `open` from a terminal still launches it, but LaunchServices — Finder,
+# Spotlight, Raycast — rejects it as "damaged". Ad-hoc re-seal fixes it; the
+# daemon bins are already linker-signed. Surface failures instead of swallowing.
+/usr/bin/codesign --force --sign - --timestamp=none --generate-entitlement-der "$APP_PATH" \
+  || echo "warning: codesign re-sign failed; Finder/Spotlight/Raycast launch may be rejected" >&2
 # Dev shells (including CI/Codex) often force-disable paging by exporting these.
 # Don't leak that into term-mesh, otherwise `git diff` won't page even with PAGER=less.
 env -u GIT_PAGER -u GH_PAGER open "$APP_PATH"
