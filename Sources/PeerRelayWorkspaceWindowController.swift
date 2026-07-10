@@ -772,7 +772,35 @@ final class PeerRelayWorkspaceWindowController: NSWindowController, NSWindowDele
             let weakTransport = transport
             await session.startHeartbeat(
                 intervalSeconds: 10,
-                deadAfterSeconds: 30
+                deadAfterSeconds: 30,
+                onFirstMiss: { [weak self] in
+                    // P6: optimistic early warning — a Pong is overdue by
+                    // one interval (~10-15s), well before the 30s dead
+                    // threshold that drives the existing tunnel-restart
+                    // chain below. Soft "reconnecting" banner only; does
+                    // not touch the tunnel or tearDownPeerSessions.
+                    Task { await MainActor.run { [weak self] in
+                        guard let self, !self.isClosing else { return }
+                        #if DEBUG
+                        dlog("peer.heartbeat.first_miss")
+                        #endif
+                        self.bannerPresenter?.showReconnecting(attempt: 0)
+                    } }
+                },
+                onMissRecovered: { [weak self] in
+                    // The outage resolved on its own (a fresh Pong landed
+                    // before `deadAfter`), so `onDead` never fires and
+                    // nothing else would clear the banner above. Reuse
+                    // the existing success presentation instead of
+                    // adding a new banner kind.
+                    Task { await MainActor.run { [weak self] in
+                        guard let self, !self.isClosing else { return }
+                        #if DEBUG
+                        dlog("peer.heartbeat.recovered")
+                        #endif
+                        self.bannerPresenter?.showReconnected()
+                    } }
+                }
             ) {
                 Task { await weakTransport.close() }
             }
@@ -1634,6 +1662,19 @@ final class PeerRelayWorkspaceWindowController: NSWindowController, NSWindowDele
     ) async throws -> PaneSlot {
         let chosen = surfaceInfo ?? makeFallbackSurfaceInfo(from: pane)
         let session = try await makePaneSession(for: chosen)
+        // P6 (Q2): on the workspace path `onDisconnect` was an orphan
+        // callback — nothing assigned it, so a per-pane relay hiccup
+        // (this pane's local relay socket/pump failing while the shared
+        // subscription session and sibling panes stay healthy) left zero
+        // trace. dlog-only ground truth; deliberately NOT wired to
+        // `bannerPresenter` — that banner is tunnel/workspace-scoped, and
+        // firing it for one pane's local relay failure would misreport a
+        // full disconnect.
+        #if DEBUG
+        session.onDisconnect = {
+            dlog("relay.pane.disconnect surface=\(Self.shortSurfaceID(pane.surfaceID)) kind=workspace")
+        }
+        #endif
         do {
             try session.prepareListener()
         } catch {
