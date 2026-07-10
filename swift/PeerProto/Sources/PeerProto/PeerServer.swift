@@ -225,7 +225,11 @@ public actor PeerServer {
     private let provider: any PeerSurfaceProvider
     private var listenerFd: Int32 = -1
     private var acceptTask: Task<Void, Never>?
-    private var activeSessions: [PeerServerSession] = []
+    // Internal (not private) so `@testable import PeerProto` tests can
+    // inspect a live session's `hasClientCapability(_:)` after a real
+    // handshake — see PeerServerTests.swift. No visibility change outside
+    // the package: external consumers still only see the `public` members.
+    var activeSessions: [PeerServerSession] = []
 
     public init(
         socketPath: String,
@@ -847,6 +851,16 @@ actor PeerServerSession {
     private var pendingInbound = Data()
     private var attachments: [Data: PeerSurfaceAttachment] = [:]
     private var relayTasks: [Data: Task<Void, Never>] = [:]
+    /// Parsed once out of the client's Hello and kept for the life of the
+    /// session — plumbing only for now (see P3, docs/peer-perf-proposal.md):
+    /// nothing branches on it yet, but future wire changes (P8 and later)
+    /// need somewhere to ask "does this client support X" before using it.
+    private var clientCapabilities = PeerCapabilities()
+
+    /// Whether the connected client advertised `capability` in its Hello.
+    func hasClientCapability(_ capability: String) -> Bool {
+        clientCapabilities.has(capability)
+    }
 
     init(
         connection: AcceptedUnixConnection,
@@ -920,12 +934,14 @@ actor PeerServerSession {
                 )
                 return
             }
+            clientCapabilities = PeerCapabilities(clientHello.capabilities)
             try await sendEnvelope { env in
                 var h = Termmesh_Peer_V1_Hello()
                 h.protocolVersion = self.config.protocolVersion
                 h.displayName = self.config.hostDisplayName
                 h.appVersion = self.config.hostAppVersion
                 h.peerID = randomPeerBytes(count: 16)
+                h.capabilities = PeerCapability.supported
                 env.hello = h
             }
             try await sendEnvelope { env in

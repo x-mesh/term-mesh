@@ -1165,6 +1165,22 @@ class termmesh:
         the exact per-scenario timing/sizes."""
         return dict(self._call("debug.peer.coalesce_probe", {}) or {})
 
+    def capabilities_probe(self) -> dict:
+        """Exercise the P3 capability plumbing via
+        `debug.peer.capabilities_probe` (DEBUG-only). No live 2-node peer
+        session required (same situation as `coalesce_probe`/
+        `peer_demux_probe`) -- this build's self-advertised
+        `Hello.capabilities` list is returned directly, plus a best-effort
+        `round_trip_*` set of booleans from a real, throwaway PeerServer +
+        PeerSession handshake completed entirely within the app process
+        against a temp Unix socket. Returns a dict with key
+        `self_advertised` (list[str], always present) and optional
+        `round_trip_ptydata_coalesce_v1` / `round_trip_replay_ring_v1` /
+        `round_trip_unknown_capability` (bool, present only if the
+        throwaway loopback could be set up) -- see
+        `TerminalController+Debug.swift`'s `v2DebugPeerCapabilitiesProbe`."""
+        return dict(self._call("debug.peer.capabilities_probe", {}) or {})
+
     def screenshot(self, label: str = "") -> dict:
         params: Dict[str, Any] = {}
         if label:

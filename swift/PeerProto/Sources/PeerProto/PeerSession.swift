@@ -52,19 +52,25 @@ public struct PeerSessionOptions: Sendable {
     public var appVersion: String
     public var authMethod: String
     public var clientProtocolVersion: String
+    /// Feature flags advertised to the host in this session's Hello.
+    /// Defaults to everything this build supports (`PeerCapability.supported`);
+    /// tests override it to exercise the host's handling of arbitrary input.
+    public var capabilities: [String]
 
     public init(
         displayName: String = "term-mesh-swift",
         peerID: Data = PeerIdentity.defaultPeerID(),
         appVersion: String = "0.0.1",
         authMethod: String = "ssh-passthrough",
-        clientProtocolVersion: String = "1.0.0"
+        clientProtocolVersion: String = "1.0.0",
+        capabilities: [String] = PeerCapability.supported
     ) {
         self.displayName = displayName
         self.peerID = peerID
         self.appVersion = appVersion
         self.authMethod = authMethod
         self.clientProtocolVersion = clientProtocolVersion
+        self.capabilities = capabilities
     }
 }
 
@@ -73,6 +79,15 @@ public struct PeerSessionInfo: Sendable, Equatable {
     public let hostAppVersion: String
     public let hostProtocolVersion: String
     public let sessionID: Data
+    /// The host's advertised feature flags, parsed from its Hello.
+    /// Plumbing only for now (see P3, docs/peer-perf-proposal.md) — a hook
+    /// for future wire changes (P8 and later) to query before using them.
+    public let hostCapabilities: PeerCapabilities
+
+    /// Whether the host advertised `capability` in its Hello.
+    public func hasHostCapability(_ capability: String) -> Bool {
+        hostCapabilities.has(capability)
+    }
 }
 
 public typealias PeerReadFn = @Sendable () async throws -> Data
@@ -175,7 +190,8 @@ public actor PeerSession {
             hostDisplayName: host.displayName,
             hostAppVersion: host.appVersion,
             hostProtocolVersion: host.protocolVersion,
-            sessionID: result.sessionID
+            sessionID: result.sessionID,
+            hostCapabilities: PeerCapabilities(host.capabilities)
         )
     }
 
@@ -434,6 +450,7 @@ public actor PeerSession {
             hello.peerID = options.peerID
             hello.displayName = options.displayName
             hello.appVersion = options.appVersion
+            hello.capabilities = options.capabilities
             env.hello = hello
         }
     }

@@ -49,6 +49,20 @@ private final class CoalesceProbeCounter: @unchecked Sendable {
         maxFrame = max(maxFrame, n)
     }
 }
+
+/// Mutable result box for `v2DebugPeerCapabilitiesProbe` (Phase P3), filled
+/// by a detached probe Task and read after a semaphore hand-off (same
+/// shape as `PeerDemuxProbeResult`/`CoalesceProbeResult` above).
+/// `@unchecked Sendable` because the semaphore serialises the single
+/// writer → single reader. `roundTrip*` fields stay nil if the throwaway
+/// loopback handshake itself couldn't be set up (best-effort bonus check,
+/// not the probe's core guarantee).
+private final class CapabilitiesProbeResult: @unchecked Sendable {
+    var selfAdvertised: [String] = []
+    var roundTripSawPtyDataCoalesce: Bool?
+    var roundTripSawReplayRing: Bool?
+    var roundTripSawUnknown: Bool?
+}
 #endif
 
 extension TerminalController {
@@ -803,6 +817,85 @@ extension TerminalController {
             bytesTotal: counter.bytes,
             maxFrameBytes: counter.maxFrame
         )
+    }
+
+    /// Test-only: proves the P3 capability plumbing works. There is no
+    /// live 2-node peer session in this test environment (the same
+    /// situation `debug.peer.demux_probe`/`debug.peer.coalesce_probe` are
+    /// in), so this reports two things:
+    ///   1. `self_advertised` -- this build's `PeerCapability.supported`
+    ///      list, i.e. what any real Hello this app sends will contain.
+    ///      Guaranteed, side-effect-free.
+    ///   2. As a best-effort bonus, `round_trip_*` booleans from a real,
+    ///      throwaway `PeerServer` + `PeerSession` handshake completed
+    ///      entirely within this process against a temp Unix socket --
+    ///      proving the full generate -> wire -> parse -> store path, not
+    ///      just that the constant exists. If the throwaway loopback
+    ///      can't be set up for any reason, the `round_trip_*` fields are
+    ///      simply omitted -- `self_advertised` alone already covers the
+    ///      probe's core guarantee (see tests_v2/test_peer_capabilities.py
+    ///      for why a real 2-node/2-machine check isn't possible here).
+    func v2DebugPeerCapabilitiesProbe(params: [String: Any]) -> V2CallResult {
+        let box = CapabilitiesProbeResult()
+        box.selfAdvertised = PeerCapability.supported
+        let sem = DispatchSemaphore(value: 0)
+        Task.detached {
+            let sockPath = "/tmp/tm-peer-caps-probe-\(UUID().uuidString.prefix(8)).sock"
+            defer { try? FileManager.default.removeItem(atPath: sockPath) }
+            let provider = StaticSurfaceProvider(surfaces: [])
+            let server = PeerServer(socketPath: sockPath, provider: provider)
+            do {
+                try await server.start()
+            } catch {
+                sem.signal()
+                return
+            }
+            defer { Task { await server.stop() } }
+
+            let deadline = Date().addingTimeInterval(2)
+            while !FileManager.default.fileExists(atPath: sockPath) {
+                if Date() > deadline {
+                    sem.signal()
+                    return
+                }
+                try? await Task.sleep(nanoseconds: 20_000_000)
+            }
+
+            do {
+                let transport = try await UnixSocketTransport.connect(socketPath: sockPath)
+                let session = PeerSession(
+                    read: { try await transport.read() },
+                    write: { try await transport.write($0) }
+                )
+                let info = try await session.handshake()
+                box.roundTripSawPtyDataCoalesce = info.hasHostCapability(PeerCapability.ptyDataCoalesceV1)
+                box.roundTripSawReplayRing = info.hasHostCapability(PeerCapability.replayRingV1)
+                box.roundTripSawUnknown = info.hasHostCapability("totally.unknown.v1")
+                try? await session.sendGoodbye(reason: "capabilities-probe done")
+                await transport.close()
+            } catch {
+                // Best-effort bonus check only -- self_advertised above
+                // already covers the probe's core guarantee.
+            }
+            sem.signal()
+        }
+        if sem.wait(timeout: .now() + 5) == .timedOut {
+            return .err(code: "internal_error", message: "capabilities probe timed out", data: nil)
+        }
+        var result: [String: Any] = [
+            "ok": true,
+            "self_advertised": box.selfAdvertised,
+        ]
+        if let coalesce = box.roundTripSawPtyDataCoalesce {
+            result["round_trip_ptydata_coalesce_v1"] = coalesce
+        }
+        if let replay = box.roundTripSawReplayRing {
+            result["round_trip_replay_ring_v1"] = replay
+        }
+        if let unknown = box.roundTripSawUnknown {
+            result["round_trip_unknown_capability"] = unknown
+        }
+        return .ok(result)
     }
 
     func v2DebugFlashCount(params: [String: Any]) -> V2CallResult {
