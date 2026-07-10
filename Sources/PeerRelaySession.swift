@@ -389,6 +389,25 @@ final class PeerRelaySession {
     private var pumpTask: Task<Void, Never>?
     private var isTorndown = false
 
+    // ── Session ownership (P1 narrow session sharing) ────────────────
+    //
+    // ownsSession == true is the classic path: this instance opened its
+    // own transport + PeerSession + handshake and tears them all down on
+    // disconnect. ownsSession == false is the shared path: the pane
+    // reuses the workspace's already-authenticated subscription session,
+    // so teardown must only close the local relay socket + deregister
+    // this surface from the demux — never stop the shared session's
+    // heartbeat, send it a Goodbye, or close its transport (that would
+    // kill every sibling pane).
+    private let ownsSession: Bool
+    // Shared path only: host→relay PtyData for THIS surface arrives here
+    // (already de-multiplexed by surface_id) instead of via
+    // `session.receiveNextMessage()`. nil on the owned-session path.
+    private let ptyStream: AsyncStream<PeerPtyChunk>?
+    // Shared path only: deregister this surface from the demux so its
+    // stream finishes and the host→relay pump loop exits. nil otherwise.
+    private let onSharedDetach: (@Sendable () async -> Void)?
+
     var onError: (@MainActor (Error) -> Void)?
     var onDisconnect: (@MainActor () -> Void)?
 
@@ -526,7 +545,64 @@ final class PeerRelaySession {
             remoteCols: UInt32(surface.cols),
             remoteRows: UInt32(surface.rows),
             session: connection.session,
-            transport: connection.transport
+            transport: connection.transport,
+            ownsSession: true,
+            ptyStream: nil,
+            onSharedDetach: nil
+        )
+    }
+
+    /// P1 narrow session sharing: attach a pane onto an already-handshaked
+    /// session (the workspace subscription session) instead of opening a
+    /// fresh transport + handshake. The single receive loop that owns
+    /// `sharedSession` routes this surface's PtyData through `demux`; the
+    /// returned session consumes that stream rather than reading frames
+    /// directly (which would steal sibling panes' frames). Teardown never
+    /// touches the shared session — see `ownsSession`.
+    ///
+    /// The consumer is registered with the demux BEFORE AttachSurface so
+    /// the host's initial replay bytes are buffered, not dropped. On a
+    /// failed attach the registration is rolled back and the error is
+    /// rethrown so the caller can fall back to the owned-session path.
+    static func attachShared(
+        sharedSession: PeerSession,
+        demux: PeerSessionDemux,
+        hostSockPath: String,
+        hostDisplayName: String,
+        surface: Termmesh_Peer_V1_SurfaceInfo
+    ) async throws -> PeerRelaySession {
+        let surfaceID = surface.surfaceID
+        let ptyStream = await demux.register(surfaceID: surfaceID)
+        let outcome: PeerAttachOutcome
+        do {
+            outcome = try await sharedSession.attachSurface(
+                id: surfaceID,
+                mode: .coWrite,
+                cols: UInt32(surface.cols),
+                rows: UInt32(surface.rows)
+            )
+        } catch {
+            await demux.deregister(surfaceID: surfaceID)
+            throw error
+        }
+
+        let relaySockPath = try Self.makeRelaySocketPath()
+
+        return PeerRelaySession(
+            hostSockPath: hostSockPath,
+            hostDisplayName: hostDisplayName,
+            relaySockPath: relaySockPath,
+            relaySecret: Self.makeRelaySecret(),
+            surfaceID: outcome.surfaceID,
+            remoteCols: UInt32(surface.cols),
+            remoteRows: UInt32(surface.rows),
+            session: sharedSession,
+            transport: nil,
+            ownsSession: false,
+            ptyStream: ptyStream,
+            onSharedDetach: { [weak demux] in
+                await demux?.deregister(surfaceID: surfaceID)
+            }
         )
     }
 
@@ -556,7 +632,10 @@ final class PeerRelaySession {
         remoteCols: UInt32,
         remoteRows: UInt32,
         session: PeerSession,
-        transport: UnixSocketTransport
+        transport: UnixSocketTransport?,
+        ownsSession: Bool,
+        ptyStream: AsyncStream<PeerPtyChunk>?,
+        onSharedDetach: (@Sendable () async -> Void)?
     ) {
         self.hostSockPath = hostSockPath
         self.hostDisplayName = hostDisplayName
@@ -567,6 +646,9 @@ final class PeerRelaySession {
         self.remoteRows = remoteRows
         self.session = session
         self.transport = transport
+        self.ownsSession = ownsSession
+        self.ptyStream = ptyStream
+        self.onSharedDetach = onSharedDetach
         self.relayBinaryPath = Self.findRelayBinary()
     }
 
@@ -699,7 +781,11 @@ final class PeerRelaySession {
         // so the pump's `receiveNextMessage()` unblocks with an error
         // and `disconnect()` runs through the normal teardown path
         // instead of leaving the user staring at a hung terminal.
-        if let session, let transport {
+        // Only the owned-session path drives its own heartbeat. On the
+        // shared path the workspace controller owns the subscription
+        // session's heartbeat, so a per-pane one would double-ping and,
+        // worse, close the shared transport for every sibling on a miss.
+        if ownsSession, let session, let transport {
             let weakTransport = transport
             await session.startHeartbeat(
                 intervalSeconds: 10,
@@ -818,10 +904,33 @@ final class PeerRelaySession {
         }
         let reader = RelayFrameReader(relay: relay)
         let resizeCoalescer = RelayResizeCoalescer(session: session, surfaceID: surfaceID)
+        // Capture the sharing mode for the detached pumps. On the shared
+        // path host→relay bytes arrive pre-demuxed via `ptyStream`; on the
+        // owned path this task reads frames itself and filters by surface_id.
+        let ptyStream = self.ptyStream
+        let ownsSession = self.ownsSession
+        let mySurfaceID = surfaceID
 
         pumpTask = Task.detached(priority: .userInitiated) {
-            // Host → relay: receive PtyData frames, write to relay socket.
+            // Host → relay: deliver PtyData frames to the relay socket.
             let hostToRelay = Task.detached(priority: .userInitiated) {
+                if let ptyStream {
+                    // Shared session: the workspace demux already routed only
+                    // THIS surface's PtyData here — no sibling frame to steal
+                    // and nothing to filter. Stream end == demux deregistered
+                    // this surface (pane close) or the shared session died.
+                    for await chunk in ptyStream {
+                        if Task.isCancelled { break }
+                        do {
+                            try await writer.enqueue(type: kTypePtyData, payload: chunk.payload)
+                        } catch {
+                            break
+                        }
+                    }
+                    disconnect()
+                    return
+                }
+                // Owned session: read frames directly.
                 // Labeled so a relay-write failure breaks the pump loop, not
                 // just the switch — a bare `break` inside the switch would keep
                 // looping and silently drop frames to a dead writer.
@@ -834,7 +943,11 @@ final class PeerRelaySession {
                         break pumpLoop
                     }
                     switch msg {
-                    case .ptyData(_, _, let data):
+                    // Forward only this surface's output. Other-surface PtyData
+                    // (never expected on a single-attach owned session, but the
+                    // guard makes a shared session's stray frame a drop, not a
+                    // mis-echo to the wrong pane's relay) falls to `default`.
+                    case .ptyData(let sid, _, let data) where sid == mySurfaceID:
                         do {
                             try await writer.enqueue(type: kTypePtyData, payload: data)
                         } catch {
@@ -879,7 +992,13 @@ final class PeerRelaySession {
                             await resizeCoalescer.submit(cols: cols, rows: rows)
                         case kTypeGoodbye:
                             await resizeCoalescer.flushNow()
-                            try? await session.sendGoodbye(reason: "relay disconnected")
+                            // Owned session only: a Goodbye on the shared
+                            // subscription session would tear it down for every
+                            // sibling pane. On the shared path disconnect() below
+                            // just deregisters this surface from the demux.
+                            if ownsSession {
+                                try? await session.sendGoodbye(reason: "relay disconnected")
+                            }
                             // Tear down now so the sibling hostToRelay task unblocks
                             // immediately instead of hanging until the heartbeat (~30s).
                             disconnect()
@@ -918,10 +1037,21 @@ final class PeerRelaySession {
         let session = self.session
         self.session = nil
         self.transport = nil
-        Task {
-            await session?.stopHeartbeat()
-            try? await session?.sendGoodbye(reason: "relay-session teardown")
-            await transport?.close()
+        if ownsSession {
+            // Owned path: this instance created the transport + heartbeat,
+            // so it tears them all down.
+            Task {
+                await session?.stopHeartbeat()
+                try? await session?.sendGoodbye(reason: "relay-session teardown")
+                await transport?.close()
+            }
+        } else {
+            // Shared path: leave the subscription session/transport/heartbeat
+            // alone (the workspace controller owns them and its siblings still
+            // use them). Only deregister this surface from the demux so its
+            // PtyData stream finishes.
+            let detach = onSharedDetach
+            Task { await detach?() }
         }
         onDisconnect?()
     }

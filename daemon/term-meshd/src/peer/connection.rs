@@ -17,6 +17,7 @@ use peer_proto::v1::{
     workspace_update, AttachMode, AttachResult, AuthChallenge, AuthResult, Envelope, Error, Hello,
     Pong, PtyData, SurfaceList, WorkspaceMeta, WorkspaceUpdate,
 };
+use peer_proto::{capability, PeerCapabilities};
 use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::UnixStream;
 use tokio::sync::{broadcast, mpsc, Notify};
@@ -70,6 +71,15 @@ async fn reader_loop(
 ) -> anyhow::Result<()> {
     let mut state = HandshakeState::Init;
     let mut attached: HashMap<Vec<u8>, AttachEntry> = HashMap::new();
+    // Parsed once out of the client's Hello and kept for the rest of the
+    // connection — plumbing only for now (see P3, docs/peer-perf-proposal.md):
+    // nothing branches on it yet, but future wire changes (P8 and later)
+    // need somewhere to ask "does this peer support X" before using it.
+    // The `default()` placeholder is intentionally never read before the
+    // Init/Hello arm overwrites it — a connection that drops before
+    // sending Hello never reaches any arm that would consult it either.
+    #[allow(unused_assignments)]
+    let mut peer_capabilities = PeerCapabilities::default();
 
     loop {
         let env = match read_envelope(&mut reader).await {
@@ -107,6 +117,13 @@ async fn reader_loop(
                     "peer connected: name={:?} app_version={:?}",
                     hello.display_name,
                     hello.app_version
+                );
+                peer_capabilities = PeerCapabilities::from_hello(hello.capabilities);
+                tracing::debug!(
+                    "peer capabilities: {:?} (ptydata.coalesce.v1={} replay.ring.v1={})",
+                    peer_capabilities,
+                    peer_capabilities.has(capability::PTYDATA_COALESCE_V1),
+                    peer_capabilities.has(capability::REPLAY_RING_V1)
                 );
 
                 send(&outgoing_tx, host_hello(&seq_counter)).await?;
@@ -424,7 +441,7 @@ fn host_hello(seq_counter: &AtomicU64) -> Envelope {
             protocol_version: PROTOCOL_VERSION.into(),
             peer_id,
             display_name: display,
-            capabilities: vec![],
+            capabilities: capability::supported_vec(),
             app_version: env!("CARGO_PKG_VERSION").into(),
         })),
     }

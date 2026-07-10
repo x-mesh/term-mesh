@@ -20,6 +20,23 @@ actor AsyncFlag {
     }
 }
 
+/// Thread-safe counter a `Sendable` callback can increment and an async
+/// test body can read back. Used to assert exactly-once firing of
+/// `onFirstMiss` / `onMissRecovered`.
+actor Counter {
+    private(set) var value = 0
+    func increment() { value += 1 }
+}
+
+/// Toggle used by heartbeat tests that need to simulate a transient Pong
+/// outage (pause replies, then resume) without tearing down the mock
+/// transport. See `testHeartbeatFirstMissThenRecovers`.
+actor PongGate {
+    private var replying = true
+    func setReplying(_ value: Bool) { replying = value }
+    func shouldReply() -> Bool { replying }
+}
+
 /// In-memory paired channel: one side's writes appear on the other side's
 /// reads. Used to run a "server" coroutine alongside the `PeerSession`
 /// client in a single test process, no Unix socket required.
@@ -275,6 +292,102 @@ final class PeerSessionTests: XCTestCase {
 
         let fired = await deadFlag.wait(timeoutSeconds: 0.7)
         XCTAssertFalse(fired, "heartbeat must not declare dead while Pongs are arriving")
+
+        await session.stopHeartbeat()
+        drainTask.cancel()
+        pongTask.cancel()
+    }
+
+    /// P6: `onFirstMiss` must fire exactly once when a Pong is skipped for
+    /// longer than one ping interval, and `onMissRecovered` must fire
+    /// exactly once when Pongs resume — all without ever declaring the
+    /// session dead. Guards the early-warning banner hook: no firing
+    /// during healthy traffic, no re-firing while a single outage
+    /// persists across several ticks, and no stuck banner once the
+    /// outage clears on its own.
+    func testHeartbeatFirstMissThenRecovers() async throws {
+        let transport = MockTransport()
+        let session = PeerSession(
+            read: { await transport.clientRead() },
+            write: { await transport.clientWrite($0) }
+        )
+
+        let gate = PongGate()
+        let pongTask = Task<Void, Never> {
+            var pending = Data()
+            var serverSeq: UInt64 = 0
+            while !Task.isCancelled {
+                let chunk = await transport.serverRead()
+                if chunk.isEmpty { break }
+                pending.append(chunk)
+                while let env = try? decodeFrame(from: &pending) {
+                    if case .ping(let p) = env.payload {
+                        guard await gate.shouldReply() else { continue }
+                        var reply = Termmesh_Peer_V1_Envelope()
+                        serverSeq += 1
+                        reply.seq = serverSeq
+                        var pong = Termmesh_Peer_V1_Pong()
+                        pong.nonce = p.nonce
+                        reply.pong = pong
+                        if let frame = try? encodeFrame(reply) {
+                            await transport.serverWrite(frame)
+                        }
+                    }
+                }
+            }
+        }
+
+        // Drain Pongs on the client side so receiveNextMessage updates
+        // lastPongAt — same reasoning as testHeartbeatStaysAliveWhilePongsArrive.
+        let drainTask = Task<Void, Never> {
+            while !Task.isCancelled {
+                _ = try? await session.receiveNextMessage()
+            }
+        }
+
+        let firstMissCount = Counter()
+        let recoveredCount = Counter()
+        let deadFlag = AsyncFlag()
+
+        // Interval/dead-after are scaled up from the other heartbeat tests
+        // (0.1s / 1.0s instead of 0.05s / 0.3s) to leave a wide margin
+        // between "one miss episode" and "declared dead" — this test
+        // exercises a transient outage that must NOT cross the dead
+        // threshold, so it needs more headroom against scheduler jitter.
+        await session.startHeartbeat(
+            intervalSeconds: 0.1,
+            deadAfterSeconds: 1.0,
+            onFirstMiss: { Task { await firstMissCount.increment() } },
+            onMissRecovered: { Task { await recoveredCount.increment() } }
+        ) {
+            Task { await deadFlag.signal() }
+        }
+
+        // Healthy traffic: no miss should be reported.
+        try await Task.sleep(nanoseconds: 250_000_000) // 0.25s
+        var misses = await firstMissCount.value
+        XCTAssertEqual(misses, 0, "must not fire while Pongs are flowing normally")
+
+        // Pause Pongs for several ping intervals (well under the 1.0s dead
+        // threshold) to force exactly one first-miss detection.
+        await gate.setReplying(false)
+        try await Task.sleep(nanoseconds: 350_000_000) // 0.35s ≈ 3-4 ticks
+        misses = await firstMissCount.value
+        var recoveries = await recoveredCount.value
+        XCTAssertEqual(misses, 1, "must fire exactly once per miss episode, not once per tick")
+        XCTAssertEqual(recoveries, 0)
+
+        // Resume — the outage must resolve on its own without ever
+        // declaring the session dead.
+        await gate.setReplying(true)
+        try await Task.sleep(nanoseconds: 350_000_000) // 0.35s
+
+        misses = await firstMissCount.value
+        recoveries = await recoveredCount.value
+        XCTAssertEqual(misses, 1, "must not refire while recovering from the same episode")
+        XCTAssertEqual(recoveries, 1, "must fire once a fresh Pong arrives after a miss")
+        let declaredDead = await deadFlag.wait(timeoutSeconds: 0.05)
+        XCTAssertFalse(declaredDead, "a transient miss that recovers must never reach onDead")
 
         await session.stopHeartbeat()
         drainTask.cancel()

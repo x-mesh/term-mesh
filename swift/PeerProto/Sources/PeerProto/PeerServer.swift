@@ -225,7 +225,11 @@ public actor PeerServer {
     private let provider: any PeerSurfaceProvider
     private var listenerFd: Int32 = -1
     private var acceptTask: Task<Void, Never>?
-    private var activeSessions: [PeerServerSession] = []
+    // Internal (not private) so `@testable import PeerProto` tests can
+    // inspect a live session's `hasClientCapability(_:)` after a real
+    // handshake — see PeerServerTests.swift. No visibility change outside
+    // the package: external consumers still only see the `public` members.
+    var activeSessions: [PeerServerSession] = []
 
     public init(
         socketPath: String,
@@ -660,6 +664,178 @@ private final class AtomicFlag: @unchecked Sendable {
     }
 }
 
+// MARK: - PtyDataCoalescer
+
+/// Batches `pumpByteStream`'s per-chunk PTY output into fewer, larger
+/// `PtyData` sends (Phase P7). Before this, Ghostty's PTY tap firing
+/// "thousands of times per second" (`PtyTapHub.broadcast` —
+/// `Sources/GhosttyPaneSurfaceProvider.swift`) meant one Envelope encode +
+/// framed `write()` syscall per chunk, with no batching at all.
+///
+/// Leading-edge coalescing — same idea as `RelayResizeCoalescer`
+/// (`Sources/PeerRelaySession.swift:311-356`) but with a zero-latency
+/// first send instead of always waiting out the delay: the first chunk
+/// after an idle period is sent unbuffered immediately (an isolated
+/// keystroke echo incurs no added latency), which also arms a short
+/// collection window. Chunks that arrive while the window is armed are
+/// merged into one payload and flushed when the window elapses or the
+/// byte cap is hit, whichever comes first. A non-empty window flush
+/// re-arms immediately (hitting the window/cap with bytes still pending
+/// is itself evidence the source is still producing), so a sustained
+/// burst settles into roughly one send per window instead of reverting
+/// to a fresh unbuffered send for every single chunk.
+///
+/// Transport-layer batching only — this changes send *cadence*, never
+/// content or ordering. Every byte submitted leaves via `send` in the
+/// same order it arrived, just grouped into fewer envelopes. The client
+/// re-parses the reassembled byte stream regardless of how the sender
+/// chunked it (`sendPeerInputBytes`'s ESC/bracketed-paste state machine
+/// lives on the separate client→host *input* path), so merging frames
+/// here cannot desync it — see the P7 proposal's forbidden-contract audit
+/// (`docs/peer-perf-proposal.md` §P7, F1-F4: disjoint code paths).
+public actor PtyDataCoalescer {
+    /// Default coalescing window. P7 spec range is 4-8ms; 6ms is the
+    /// midpoint — short enough that even a chunk that waits out the full
+    /// window adds imperceptible latency to typing echo.
+    public static let defaultWindowMs: UInt64 = 6
+    /// Default forced-flush byte cap. Matches `PtyTapHub.replayCapacityBytes`
+    /// / Rust's `REPLAY_CAPACITY_BYTES` (64KB) so one coalesced frame never
+    /// exceeds one replay buffer's worth of bytes (P7 proposal audit note
+    /// on sizing this against the replay ring's double-clone cost).
+    public static let defaultMaxBytes = 64 * 1024
+
+    private let windowNs: UInt64
+    private let maxBytes: Int
+    private let send: @Sendable (Data, UInt64) async -> Bool
+
+    private var armed = false
+    private var pending = Data()
+    private var pendingStartSeq: UInt64 = 0
+    private var flushTask: Task<Void, Never>?
+    private var stopped = false
+
+    /// - Parameters:
+    ///   - windowMs: coalescing window once armed by a leading-edge send.
+    ///   - maxBytes: forced-flush cap, checked after every submitted chunk.
+    ///   - send: performs the actual framed send for one merged payload
+    ///     starting at byte offset `startSeq`. Returns `false` on failure
+    ///     (e.g. connection gone); the coalescer then stops permanently,
+    ///     mirroring `pumpByteStream`'s original catch-and-return.
+    public init(
+        windowMs: UInt64 = PtyDataCoalescer.defaultWindowMs,
+        maxBytes: Int = PtyDataCoalescer.defaultMaxBytes,
+        send: @escaping @Sendable (Data, UInt64) async -> Bool
+    ) {
+        self.windowNs = windowMs * 1_000_000
+        self.maxBytes = maxBytes
+        self.send = send
+    }
+
+    /// Submit one chunk as it arrives from the byte producer. `startSeq`
+    /// is the running byte-offset counter's value BEFORE this chunk (the
+    /// caller advances its own counter by `bytes.count` after calling
+    /// this) — `PtyData.byteSeq` marks "offset of this payload's first
+    /// byte" both before and after coalescing, so a merged frame's seq is
+    /// simply its first constituent chunk's seq; no receiver-visible
+    /// change to the field's meaning (confirmed against
+    /// `proto/peer/v1/peer.proto:311` and `PeerSessionDemux.route` — seq
+    /// is carried through as opaque metadata, never used for a per-chunk
+    /// contiguity assert on either side, so merging chunks under this
+    /// semantic is safe).
+    /// Returns `false` once the coalescer has permanently stopped (a
+    /// prior send failed) — the caller should stop pumping.
+    @discardableResult
+    public func submit(_ bytes: Data, startSeq: UInt64) async -> Bool {
+        guard !stopped else { return false }
+        guard !bytes.isEmpty else { return true }
+
+        guard armed else {
+            // Idle → active: send unbuffered (leading edge) so an
+            // isolated write incurs zero coalescing delay, then arm the
+            // window to catch whatever follows within it.
+            guard await send(bytes, startSeq) else {
+                stopped = true
+                return false
+            }
+            arm()
+            return true
+        }
+
+        if pending.isEmpty { pendingStartSeq = startSeq }
+        pending.append(bytes)
+        guard pending.count >= maxBytes else { return true }
+
+        // Byte cap hit mid-window: flush now instead of waiting out the
+        // rest of the window, then keep coalescing — hitting the cap is
+        // itself evidence the burst is still ongoing. Checked AFTER the
+        // append (not pre-split), so a flushed frame can exceed `maxBytes`
+        // by up to one chunk's worth in the worst case — deliberately not
+        // pre-emptively splitting a single incoming chunk to shave that
+        // off, since real PTY reads are far smaller than the 64KB default
+        // cap in practice. The cap's job is bounding unbounded growth
+        // during a sustained burst, not guaranteeing an exact ceiling.
+        flushTask?.cancel()
+        flushTask = nil
+        guard await flushLocked() else { return false }
+        arm()
+        return true
+    }
+
+    /// Drains any buffered-but-unflushed bytes immediately, bypassing the
+    /// window. Callers MUST await this before discarding the coalescer
+    /// (stream finished, cancelled, or a send failed) so in-flight
+    /// coalesced bytes are never silently lost on pane/session teardown —
+    /// see `pumpByteStream`'s call site for why this alone covers every
+    /// teardown path.
+    public func flushRemaining() async {
+        flushTask?.cancel()
+        flushTask = nil
+        armed = false
+        _ = await flushLocked()
+    }
+
+    private func arm() {
+        armed = true
+        flushTask?.cancel()
+        let ns = windowNs
+        flushTask = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: ns)
+            guard !Task.isCancelled else { return }
+            await self?.windowElapsed()
+        }
+    }
+
+    private func windowElapsed() async {
+        flushTask = nil
+        guard !pending.isEmpty else {
+            // Nothing arrived during the window: the burst already ended
+            // (or was a single already-sent isolated chunk). Go fully
+            // idle so the next chunk gets its own fresh leading-edge send
+            // rather than silently waiting out another window.
+            armed = false
+            return
+        }
+        guard await flushLocked() else { return }
+        // Still receiving data as of this flush — keep the window
+        // rolling rather than reverting to per-chunk leading-edge sends,
+        // so a sustained burst settles into ~1 send per window.
+        arm()
+    }
+
+    @discardableResult
+    private func flushLocked() async -> Bool {
+        guard !pending.isEmpty else { return true }
+        let payload = pending
+        let seq = pendingStartSeq
+        pending = Data()
+        guard await send(payload, seq) else {
+            stopped = true
+            return false
+        }
+        return true
+    }
+}
+
 // MARK: - PeerServerSession
 
 /// Per-connection state machine. Mirrors the Rust `connection::run`
@@ -675,6 +851,16 @@ actor PeerServerSession {
     private var pendingInbound = Data()
     private var attachments: [Data: PeerSurfaceAttachment] = [:]
     private var relayTasks: [Data: Task<Void, Never>] = [:]
+    /// Parsed once out of the client's Hello and kept for the life of the
+    /// session — plumbing only for now (see P3, docs/peer-perf-proposal.md):
+    /// nothing branches on it yet, but future wire changes (P8 and later)
+    /// need somewhere to ask "does this client support X" before using it.
+    private var clientCapabilities = PeerCapabilities()
+
+    /// Whether the connected client advertised `capability` in its Hello.
+    func hasClientCapability(_ capability: String) -> Bool {
+        clientCapabilities.has(capability)
+    }
 
     init(
         connection: AcceptedUnixConnection,
@@ -748,12 +934,14 @@ actor PeerServerSession {
                 )
                 return
             }
+            clientCapabilities = PeerCapabilities(clientHello.capabilities)
             try await sendEnvelope { env in
                 var h = Termmesh_Peer_V1_Hello()
                 h.protocolVersion = self.config.protocolVersion
                 h.displayName = self.config.hostDisplayName
                 h.appVersion = self.config.hostAppVersion
                 h.peerID = randomPeerBytes(count: 16)
+                h.capabilities = PeerCapability.supported
                 env.hello = h
             }
             try await sendEnvelope { env in
@@ -923,27 +1111,50 @@ actor PeerServerSession {
         relayTasks[surfaceID] = relayTask
     }
 
+    /// Phase P7: pumps `attachment.byteStream` through a `PtyDataCoalescer`
+    /// instead of sending one `PtyData` per chunk 1:1 — see that type's
+    /// doc comment for the leading-edge/window/cap design.
     private func pumpByteStream(
         surfaceID: Data,
         attachment: PeerSurfaceAttachment
     ) async {
         var byteSeq: UInt64 = 0
-        for await bytes in attachment.byteStream {
-            if Task.isCancelled { return }
-            if bytes.isEmpty { continue }
+        let coalescer = PtyDataCoalescer { [weak self] payload, seq in
+            guard let self else { return false }
             do {
-                try await sendEnvelope { env in
+                try await self.sendEnvelope { env in
                     var p = Termmesh_Peer_V1_PtyData()
                     p.surfaceID = surfaceID
-                    p.byteSeq = byteSeq
-                    p.payload = bytes
+                    p.byteSeq = seq
+                    p.payload = payload
                     env.ptyData = p
                 }
+                return true
             } catch {
-                return
+                return false
             }
-            byteSeq &+= UInt64(bytes.count)
         }
+
+        for await bytes in attachment.byteStream {
+            if Task.isCancelled { break }
+            if bytes.isEmpty { continue }
+            let startSeq = byteSeq
+            byteSeq &+= UInt64(bytes.count)
+            if await coalescer.submit(bytes, startSeq: startSeq) == false { break }
+        }
+        // Stream ended (natural finish, cancellation, or a send failure
+        // broke the loop above) — flush whatever the coalescer is still
+        // holding. Every pane-teardown path funnels through here: a
+        // peer-initiated detach finishes this specific stream via
+        // `PtyTapHub.finish(attachID:)`, and a host-side close
+        // (closeWorkspace / didCloseTab / didClosePane) finishes ALL of a
+        // surface's streams via `invalidateTapHub` -> `hub.shutdown()` ->
+        // `finishAll()` — either way `for await` above exits and this
+        // flush runs, so no separate hook is needed at those three call
+        // sites. This is what keeps in-flight coalesced bytes from being
+        // lost on close (P7 proposal audit note; hard regression gate:
+        // test_peer_input_bracketed_paste_split_close.py).
+        await coalescer.flushRemaining()
     }
 
     private func detachSurface(id: Data) async {

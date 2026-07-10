@@ -1109,6 +1109,78 @@ class termmesh:
         res = self._call("debug.peer.inject_input", {"surface_id": sid, "bytes_hex": data.hex()}) or {}
         return int(res.get("bytes") or 0)
 
+    def peer_demux_probe(self) -> dict:
+        """Exercise the real client-side PeerSessionDemux (P1 shared-session
+        fan-out) end to end and return each surface's delivered bytes. No
+        live peer server required — the probe drives register / route /
+        deregister / finishAll in-process. DEBUG-only. Returns a dict with
+        keys: a, b (delivered text per surface) and a_count, b_count."""
+        return dict(self._call("debug.peer.demux_probe", {}) or {})
+
+    def read_grid(self, surface_id: Union[str, int, None] = None) -> dict:
+        """Read a surface's current rendered grid via `debug.peer.read_grid`
+        (P5, DEBUG-only). Works on any live TerminalSurface — a regular
+        local pane or a peer relay-viewer surface — since "reading a remote
+        pane's grid" is really just reading the local surface that renders
+        it, no wire round trip needed. Returns the raw
+        {ok, grid_text, rows, cols} (or {ok: False, error: "unknown_surface"})
+        payload as-is: callers check res["ok"] rather than relying on an
+        exception, since an unknown surface_id is an expected (not
+        exceptional) outcome for this method."""
+        sid = self._resolve_surface_id(surface_id)
+        params: Dict[str, Any] = {}
+        if sid:
+            params["surface_id"] = sid
+        return dict(self._call("debug.peer.read_grid", params) or {})
+
+    def replay_probe(self, surface_id: Union[str, int, None] = None) -> dict:
+        """Arm and/or query the P4 attach-time replay decision for a surface
+        via `debug.peer.replay_probe` (DEBUG-only). The first call against a
+        given surface creates its PtyTapHub and wires the real PTY tap
+        callback, so output produced AFTER that first call accumulates into
+        the ring buffer; call again later to read the current
+        mode/bytes/chunks/bytes_text. `mode` is "buffer" when the surface's
+        complete output history since the probe first armed it fits under
+        the 64KB replay cap (ANSI/style-preserving replay), or "snapshot"
+        when it's empty or has overflowed the cap (plain-text fallback) --
+        the same decision `GhosttyPaneSurfaceProvider.attach()` makes for a
+        real peer attach. Returns the raw
+        {ok, mode, bytes, chunks, bytes_text} (or
+        {ok: False, error: "unknown_surface"}) payload as-is."""
+        sid = self._resolve_surface_id(surface_id)
+        params: Dict[str, Any] = {}
+        if sid:
+            params["surface_id"] = sid
+        return dict(self._call("debug.peer.replay_probe", params) or {})
+
+    def coalesce_probe(self) -> dict:
+        """Exercise the real `PtyDataCoalescer` (Phase P7) via
+        `debug.peer.coalesce_probe` (DEBUG-only). No live 2-node peer
+        session required -- the probe submits synthetic, precisely-timed
+        chunks directly to the same production coalescer type
+        `pumpByteStream` uses. Returns a dict with keys `burst`,
+        `isolated`, `capped`, each `{chunks_submitted, frames_sent,
+        bytes_total, max_frame_bytes}` -- see
+        `TerminalController+Debug.swift`'s `v2DebugPeerCoalesceProbe` for
+        the exact per-scenario timing/sizes."""
+        return dict(self._call("debug.peer.coalesce_probe", {}) or {})
+
+    def capabilities_probe(self) -> dict:
+        """Exercise the P3 capability plumbing via
+        `debug.peer.capabilities_probe` (DEBUG-only). No live 2-node peer
+        session required (same situation as `coalesce_probe`/
+        `peer_demux_probe`) -- this build's self-advertised
+        `Hello.capabilities` list is returned directly, plus a best-effort
+        `round_trip_*` set of booleans from a real, throwaway PeerServer +
+        PeerSession handshake completed entirely within the app process
+        against a temp Unix socket. Returns a dict with key
+        `self_advertised` (list[str], always present) and optional
+        `round_trip_ptydata_coalesce_v1` / `round_trip_replay_ring_v1` /
+        `round_trip_unknown_capability` (bool, present only if the
+        throwaway loopback could be set up) -- see
+        `TerminalController+Debug.swift`'s `v2DebugPeerCapabilitiesProbe`."""
+        return dict(self._call("debug.peer.capabilities_probe", {}) or {})
+
     def screenshot(self, label: str = "") -> dict:
         params: Dict[str, Any] = {}
         if label:

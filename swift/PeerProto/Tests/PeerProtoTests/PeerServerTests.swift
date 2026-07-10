@@ -62,6 +62,24 @@ final class PeerServerTests: XCTestCase {
         XCTAssertEqual(info.hostAppVersion, "c3c3.1")
         XCTAssertEqual(info.hostProtocolVersion, "1.0.0")
 
+        // P3 capability plumbing: the host's real Hello.capabilities
+        // (PeerCapability.supported) must reach the client intact, and
+        // the client's own advertised capabilities (also
+        // PeerCapability.supported, the PeerSessionOptions default) must
+        // reach the host's PeerServerSession. Real round trip through
+        // real actors over a real Unix socket -- not a mock.
+        XCTAssertTrue(info.hasHostCapability(PeerCapability.ptyDataCoalesceV1))
+        XCTAssertTrue(info.hasHostCapability(PeerCapability.replayRingV1))
+        XCTAssertFalse(info.hasHostCapability("totally.unknown.v1"))
+
+        let activeSessions = await server.activeSessions
+        XCTAssertEqual(activeSessions.count, 1)
+        let hostSideSession = try XCTUnwrap(activeSessions.first)
+        let sawCoalesceCapability = await hostSideSession.hasClientCapability(PeerCapability.ptyDataCoalesceV1)
+        XCTAssertTrue(sawCoalesceCapability)
+        let sawUnknownCapability = await hostSideSession.hasClientCapability("totally.unknown.v1")
+        XCTAssertFalse(sawUnknownCapability)
+
         let surfaces = try await session.listSurfaces()
         XCTAssertEqual(surfaces.count, 2)
         XCTAssertEqual(surfaces.map(\.title), ["alpha", "bravo"])
@@ -69,6 +87,60 @@ final class PeerServerTests: XCTestCase {
 
         try await session.sendGoodbye(reason: "c3c3.1-itest done")
         await transport.close()
+        await server.stop()
+    }
+
+    /// P3 capability plumbing, adversarial input: a client's
+    /// `Hello.capabilities` is bug/attacker-controlled input arriving
+    /// straight off the wire, so the handshake must complete normally no
+    /// matter what's in it -- empty (legacy peer, must behave exactly as
+    /// before P3), full of capability strings this build has never heard
+    /// of (forward-compat), or an absurdly long list (a buggy or hostile
+    /// peer). Mirrors the Rust-side
+    /// `handshake_survives_adversarial_client_capabilities` integration
+    /// test in `daemon/term-meshd/src/peer/server.rs`, but exercises the
+    /// real Swift `PeerServer` instead.
+    func testHandshakeSurvivesAdversarialClientCapabilities() async throws {
+        let sockPath = "/tmp/tm-peer-swift-caps-\(UUID().uuidString.prefix(8)).sock"
+        defer { try? FileManager.default.removeItem(atPath: sockPath) }
+
+        let provider = StaticSurfaceProvider(surfaces: [])
+        let server = PeerServer(socketPath: sockPath, provider: provider)
+        try await server.start()
+        defer { Task { await server.stop() } }
+
+        let deadline = Date().addingTimeInterval(2)
+        while !FileManager.default.fileExists(atPath: sockPath) {
+            if Date() > deadline { return XCTFail("no socket") }
+            try await Task.sleep(nanoseconds: 50_000_000)
+        }
+
+        func handshake(withCapabilities capabilities: [String]) async throws -> PeerSessionInfo {
+            let transport = try await UnixSocketTransport.connect(socketPath: sockPath)
+            let session = PeerSession(
+                read: { try await transport.read() },
+                write: { try await transport.write($0) }
+            )
+            var options = PeerSessionOptions()
+            options.capabilities = capabilities
+            let info = try await session.handshake(options: options)
+            try await session.sendGoodbye(reason: "adversarial-capabilities-itest done")
+            await transport.close()
+            return info
+        }
+
+        // Empty: today's/legacy fallback -- must behave exactly as before P3.
+        _ = try await handshake(withCapabilities: [])
+
+        // Unknown + duplicate + empty-string entries: forward-compat, never rejected.
+        _ = try await handshake(withCapabilities: [
+            "totally.unknown.v1", "totally.unknown.v1", "",
+        ])
+
+        // Thousands of entries: must not slow down, hang, or crash the handshake.
+        let many = (0..<5000).map { "cap.\($0).v1" }
+        _ = try await handshake(withCapabilities: many)
+
         await server.stop()
     }
 

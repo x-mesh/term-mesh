@@ -20,7 +20,7 @@ use std::env;
 use std::io::{self, Read, Write};
 use std::os::unix::net::UnixStream;
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
-use std::sync::mpsc::{self, RecvTimeoutError};
+use std::sync::mpsc;
 use std::time::Duration;
 
 const TYPE_PTY_DATA: u8 = 0x01;
@@ -661,19 +661,29 @@ fn main() {
     let sigwinch_rx_fd = install_sigwinch_pipe().ok();
 
     // Writer thread: receives frames from channel, writes to socket.
+    //
+    // Blocks on `rx.recv()` instead of polling with a 100ms timeout, so an
+    // idle relay parks this thread with zero wakeups instead of waking it
+    // 10x/second just to re-check `STOPPING`. Shutdown no longer depends on
+    // that periodic check: `main()` sends an empty `Vec` as a "stop"
+    // sentinel through `tx_stop` once `STOPPING` is set. An empty payload
+    // is safe to use as a sentinel because every real frame pushed onto
+    // this channel (`resize_frame`, `send_frame`'s TYPE_KEY_INPUT payloads)
+    // is non-empty by construction — `send_frame` itself never forwards an
+    // empty payload (see its `if payload.is_empty() { return true; }`
+    // early-out below).
     let mut sock_write = sock.try_clone().unwrap();
     let writer_handle = std::thread::spawn(move || {
         loop {
-            match rx.recv_timeout(Duration::from_millis(100)) {
+            match rx.recv() {
+                Ok(frame) if frame.is_empty() => break,
                 Ok(frame) => {
                     if sock_write.write_all(&frame).is_err() {
                         break;
                     }
                     let _ = sock_write.flush();
                 }
-                Err(RecvTimeoutError::Timeout) if STOPPING.load(Ordering::Relaxed) => break,
-                Err(RecvTimeoutError::Timeout) => continue,
-                Err(RecvTimeoutError::Disconnected) => break,
+                Err(_) => break,
             }
         }
         let _ = write_frame(&mut sock_write, TYPE_GOODBYE, b"relay-eof");
@@ -837,6 +847,14 @@ fn main() {
             libc::close(wfd);
         }
     }
+
+    // Wake the writer thread out of its blocking `rx.recv()` immediately —
+    // an empty frame is the stop sentinel (see writer_handle above). This is
+    // what makes the plain shutdown fast even though the writer no longer
+    // polls: without it, the writer would only wake once every Sender clone
+    // (including the stdin thread's, which may be stuck in a blocking PTY
+    // read) has dropped.
+    let _ = tx_stop.send(Vec::new());
 
     // The stdin reader may be blocked inside the PTY read. Let process exit
     // tear it down instead of joining forever during relay shutdown.
