@@ -299,6 +299,13 @@ final class PeerRelayWorkspaceWindowController: NSWindowController, NSWindowDele
     /// send fire-and-forget `WorkspaceControl` requests (Cmd+D split,
     /// Cmd+W close, …) back to the host.
     private var subscriptionSession: PeerSession?
+    /// P1 narrow session sharing: fans this workspace's single receive
+    /// loop (the subscription loop below) out to the panes by surface_id.
+    /// Non-nil once `startSubscription` succeeds; panes attach on
+    /// `subscriptionSession` and consume their PtyData through here
+    /// instead of each opening their own session + handshake. nil forces
+    /// the per-pane fallback in `spawnPaneSlot`.
+    private var subscriptionDemux: PeerSessionDemux?
     private var keyMonitor: Any?
     private var clickMonitor: Any?
     /// surfaceID of the most recently mouse-down'd pane in this
@@ -560,9 +567,14 @@ final class PeerRelayWorkspaceWindowController: NSWindowController, NSWindowDele
         splitContentContainer?.subviews.forEach { $0.removeFromSuperview() }
         let transport = subscriptionTransport
         subscriptionTransport = nil
+        let demux = subscriptionDemux
+        subscriptionDemux = nil
         let toStop = Array(panesBySurfaceID.values)
         panesBySurfaceID.removeAll()
         Task {
+            // Finish the demux streams first so each shared pane's pump
+            // loop exits, then stop the slots and close the transport.
+            await demux?.finishAll()
             for slot in toStop { await slot.session.stop() }
             await transport?.close()
         }
@@ -646,9 +658,12 @@ final class PeerRelayWorkspaceWindowController: NSWindowController, NSWindowDele
         let transport = subscriptionTransport
         let session = subscriptionSession
         subscriptionTransport = nil
+        let demux = subscriptionDemux
+        subscriptionDemux = nil
         let toStop = Array(panesBySurfaceID.values)
         panesBySurfaceID.removeAll()
         Task {
+            await demux?.finishAll()
             await session?.stopHeartbeat()
             for slot in toStop { await slot.session.stop() }
             await transport?.close()
@@ -673,6 +688,12 @@ final class PeerRelayWorkspaceWindowController: NSWindowController, NSWindowDele
             _ = try await session.handshake()
             subscriptionTransport = transport
             subscriptionSession = session
+            // P1: this authenticated session is now shared by every pane.
+            // The single receive loop below routes PtyData to panes via the
+            // demux; panes attach on `session` instead of each dialing a new
+            // connection + handshake.
+            let demux = PeerSessionDemux()
+            subscriptionDemux = demux
             // App-level heartbeat. SSH ServerAliveInterval (15s × 3)
             // catches a dead tunnel within ~45s, but it can't catch a
             // remote daemon that's paused while its kernel still
@@ -708,6 +729,16 @@ final class PeerRelayWorkspaceWindowController: NSWindowController, NSWindowDele
                         // only signal.
                         disconnectReason = String(describing: error)
                         break
+                    }
+                    // P1 shared-session fan-out: deliver each pane's PtyData to
+                    // its own demux consumer. Because this is the *only* loop
+                    // reading the session, no pane can steal or silently drop a
+                    // sibling's frame (a naive per-pane surface_id filter on a
+                    // shared session would do both). Non-PtyData messages fall
+                    // through to the existing layout/goodbye handling.
+                    if case .ptyData(let sid, let seq, let payload) = msg {
+                        await demux.route(surfaceID: sid, byteSeq: seq, payload: payload)
+                        continue
                     }
                     if case .workspaceLayoutChanged(let wid, let layout) = msg {
                         guard wid == self.workspaceID else { continue }
@@ -1068,11 +1099,40 @@ final class PeerRelayWorkspaceWindowController: NSWindowController, NSWindowDele
         let newSurfaceIDs = collectSurfaceIDs(layout)
         let missingSurfaceIDs = newSurfaceIDs.filter { panesBySurfaceID[$0] == nil }
         let surfaceInfoByID = try await fetchSurfaceInfoByIDIfNeeded(for: Array(missingSurfaceIDs))
-        // Spawn missing slots first (async, may take time per pane).
-        for surfaceID in missingSurfaceIDs {
-            let pane = findPane(for: surfaceID, in: layout) ?? makeEmptyPaneStub(surfaceID: surfaceID)
-            let slot = try await spawnPaneSlot(pane, surfaceInfo: surfaceInfoByID[surfaceID])
-            panesBySurfaceID[surfaceID] = slot
+        // Resolve each missing leaf's spawn inputs on the actor before
+        // fanning out (findPane / makeEmptyPaneStub read controller state).
+        let spawnInputs: [(Data, Termmesh_Peer_V1_WorkspacePane, Termmesh_Peer_V1_SurfaceInfo?)] =
+            missingSurfaceIDs.map { sid in
+                (sid,
+                 findPane(for: sid, in: layout) ?? makeEmptyPaneStub(surfaceID: sid),
+                 surfaceInfoByID[sid])
+            }
+
+        // P1: spawn missing slots in parallel with a small concurrency cap
+        // so an N-pane workspace pays ~max(per-pane) instead of the
+        // sequential sum (the slow per-pane handshake/attach/accept
+        // round-trips overlap at their await points). Partial-failure
+        // tolerant: a single pane's failure is logged + that leaf left
+        // unspawned (the next layout push retries it), never rolling back
+        // the panes that did come up. Each child stores its slot on the
+        // MainActor via `spawnAndStore`, so no non-Sendable PaneSlot
+        // crosses a task boundary.
+        if !spawnInputs.isEmpty {
+            let maxConcurrent = min(4, spawnInputs.count)
+            await withTaskGroup(of: Void.self) { group in
+                var next = 0
+                func submitNext() {
+                    let (sid, pane, info) = spawnInputs[next]
+                    next += 1
+                    group.addTask {
+                        await self.spawnAndStore(surfaceID: sid, pane: pane, surfaceInfo: info)
+                    }
+                }
+                while next < maxConcurrent { submitNext() }
+                for await _ in group {
+                    if next < spawnInputs.count { submitNext() }
+                }
+            }
         }
 
         // Build the new view tree on the main actor.
@@ -1428,14 +1488,93 @@ final class PeerRelayWorkspaceWindowController: NSWindowController, NSWindowDele
             .map { ($0.surfaceID, $0) })
     }
 
+    /// Build the relay session for one pane. Prefers the shared
+    /// subscription session (P1 — one handshake per workspace, PtyData
+    /// de-multiplexed by surface_id); on ANY shared-path failure it falls
+    /// back to the classic per-pane connect + attach so a single flaky
+    /// attach never blocks the pane from coming up and the proven
+    /// single-session path stays intact. The shared session only exists
+    /// after `startSubscription` runs, so the initial layout's panes take
+    /// the fallback while later splits share.
+    private func makePaneSession(
+        for surface: Termmesh_Peer_V1_SurfaceInfo
+    ) async throws -> PeerRelaySession {
+        if let sharedSession = subscriptionSession, let demux = subscriptionDemux {
+            do {
+                return try await PeerRelaySession.attachShared(
+                    sharedSession: sharedSession,
+                    demux: demux,
+                    hostSockPath: hostSockPath,
+                    hostDisplayName: hostDisplayName ?? "",
+                    surface: surface
+                )
+            } catch {
+                NSLog("[peer-ws] shared attach failed, falling back to per-pane: %@",
+                      String(describing: error))
+            }
+        }
+        let conn = try await PeerRelaySession.connect(hostSockPath: hostSockPath)
+        do {
+            return try await PeerRelaySession.attach(conn, surface: surface)
+        } catch {
+            await conn.cancel()
+            throw error
+        }
+    }
+
+    /// Fan-out child body: spawn a pane's slot (tolerant) and, on success,
+    /// store it. Runs on the MainActor (inherited isolation), so the
+    /// `panesBySurfaceID` mutation is serialised with its siblings and the
+    /// PaneSlot never crosses a task boundary.
+    private func spawnAndStore(
+        surfaceID: Data,
+        pane: Termmesh_Peer_V1_WorkspacePane,
+        surfaceInfo: Termmesh_Peer_V1_SurfaceInfo?
+    ) async {
+        if let slot = await spawnPaneSlotTolerant(pane, surfaceInfo: surfaceInfo) {
+            panesBySurfaceID[surfaceID] = slot
+        }
+    }
+
+    /// `spawnPaneSlot` wrapped for parallel fan-out: retry once, then log
+    /// and give up (returns nil) so one failed pane cannot abort its
+    /// siblings' spawns or the layout pass. `spawnPaneSlot` only throws
+    /// before it creates the TerminalSurface (from `makePaneSession` /
+    /// `prepareListener`), and cleans up the session it built on that
+    /// path, so a retry starts from a clean slate with nothing leaked.
+    private func spawnPaneSlotTolerant(
+        _ pane: Termmesh_Peer_V1_WorkspacePane,
+        surfaceInfo: Termmesh_Peer_V1_SurfaceInfo?
+    ) async -> PaneSlot? {
+        do {
+            return try await spawnPaneSlot(pane, surfaceInfo: surfaceInfo)
+        } catch {
+            NSLog("[peer-ws] pane spawn failed, retrying once: %@", String(describing: error))
+        }
+        do {
+            return try await spawnPaneSlot(pane, surfaceInfo: surfaceInfo)
+        } catch {
+            NSLog("[peer-ws] pane spawn failed after retry, leaving leaf unspawned: %@",
+                  String(describing: error))
+            return nil
+        }
+    }
+
     private func spawnPaneSlot(
         _ pane: Termmesh_Peer_V1_WorkspacePane,
         surfaceInfo: Termmesh_Peer_V1_SurfaceInfo?
     ) async throws -> PaneSlot {
-        let conn = try await PeerRelaySession.connect(hostSockPath: hostSockPath)
         let chosen = surfaceInfo ?? makeFallbackSurfaceInfo(from: pane)
-        let session = try await PeerRelaySession.attach(conn, surface: chosen)
-        try session.prepareListener()
+        let session = try await makePaneSession(for: chosen)
+        do {
+            try session.prepareListener()
+        } catch {
+            // Clean up the session we just built so a shared attach doesn't
+            // leave a dangling demux registration (or an owned session its
+            // heartbeat/transport) behind on a listener-setup failure.
+            await session.stop()
+            throw error
+        }
 
         let surface = await MainActor.run {
             TerminalSurface(

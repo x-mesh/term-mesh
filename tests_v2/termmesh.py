@@ -1109,6 +1109,14 @@ class termmesh:
         res = self._call("debug.peer.inject_input", {"surface_id": sid, "bytes_hex": data.hex()}) or {}
         return int(res.get("bytes") or 0)
 
+    def peer_demux_probe(self) -> dict:
+        """Exercise the real client-side PeerSessionDemux (P1 shared-session
+        fan-out) end to end and return each surface's delivered bytes. No
+        live peer server required — the probe drives register / route /
+        deregister / finishAll in-process. DEBUG-only. Returns a dict with
+        keys: a, b (delivered text per surface) and a_count, b_count."""
+        return dict(self._call("debug.peer.demux_probe", {}) or {})
+
     def screenshot(self, label: str = "") -> dict:
         params: Dict[str, Any] = {}
         if label:

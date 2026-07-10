@@ -3,6 +3,19 @@ import Foundation
 import Carbon.HIToolbox
 import Bonsplit
 import WebKit
+import PeerProto
+
+#if DEBUG
+/// Mutable result box for `v2DebugPeerDemuxProbe`, filled by a detached
+/// probe Task and read after a semaphore hand-off. `@unchecked Sendable`
+/// because the semaphore serialises the single writer → single reader.
+private final class PeerDemuxProbeResult: @unchecked Sendable {
+    var a: String = ""
+    var b: String = ""
+    var aCount: Int = 0
+    var bCount: Int = 0
+}
+#endif
 
 extension TerminalController {
     // MARK: - V2 Debug / Test-only Methods
@@ -435,6 +448,58 @@ extension TerminalController {
             result = .ok(["bytes": data.count])
         }
         return result
+    }
+
+    /// Test-only: exercise the real client-side `PeerSessionDemux` end to
+    /// end so socket e2e can assert P1's PtyData isolation contract without
+    /// standing up a live 2-node peer session. Runs the exact routing the
+    /// shared subscription loop uses:
+    ///   register(A,B) → interleaved route(A/B) → deregister(B) →
+    ///   route(A,B-again) → finishAll → drain both streams.
+    /// Returns each surface's delivered bytes as text plus chunk counts, so
+    /// the caller asserts: (1) A never received B's bytes and vice-versa
+    /// (2-pane isolation); (2) A kept receiving after B detached (residual
+    /// stream continuity); (3) B's post-detach frame was dropped, not
+    /// mis-routed to A.
+    func v2DebugPeerDemuxProbe(params: [String: Any]) -> V2CallResult {
+        let sidA = Data("SURFACE_A".utf8)
+        let sidB = Data("SURFACE_B".utf8)
+        let box = PeerDemuxProbeResult()
+        let sem = DispatchSemaphore(value: 0)
+        Task.detached {
+            let demux = PeerSessionDemux()
+            let streamA = await demux.register(surfaceID: sidA)
+            let streamB = await demux.register(surfaceID: sidB)
+            // Interleave two surfaces' PtyData on the single shared loop.
+            await demux.route(surfaceID: sidA, byteSeq: 1, payload: Data("a1".utf8))
+            await demux.route(surfaceID: sidB, byteSeq: 1, payload: Data("b1".utf8))
+            await demux.route(surfaceID: sidA, byteSeq: 2, payload: Data("a2".utf8))
+            await demux.route(surfaceID: sidB, byteSeq: 2, payload: Data("b2".utf8))
+            // Detach B (pane close): its stream finishes and later B frames
+            // must be dropped, never delivered to the surviving A consumer.
+            await demux.deregister(surfaceID: sidB)
+            await demux.route(surfaceID: sidA, byteSeq: 3, payload: Data("a3".utf8))
+            await demux.route(surfaceID: sidB, byteSeq: 3, payload: Data("bX".utf8))
+            await demux.finishAll()
+            var aBytes = Data(); var aCount = 0
+            for await chunk in streamA { aBytes.append(chunk.payload); aCount += 1 }
+            var bBytes = Data(); var bCount = 0
+            for await chunk in streamB { bBytes.append(chunk.payload); bCount += 1 }
+            box.a = String(decoding: aBytes, as: UTF8.self)
+            box.b = String(decoding: bBytes, as: UTF8.self)
+            box.aCount = aCount
+            box.bCount = bCount
+            sem.signal()
+        }
+        if sem.wait(timeout: .now() + 5) == .timedOut {
+            return .err(code: "internal_error", message: "demux probe timed out", data: nil)
+        }
+        return .ok([
+            "a": box.a,
+            "b": box.b,
+            "a_count": box.aCount,
+            "b_count": box.bCount,
+        ])
     }
 
     /// Decode an even-length hex string into Data. Returns nil on any
