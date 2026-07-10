@@ -19,7 +19,7 @@ use peer_proto::v1::envelope::Payload;
 use peer_proto::v1::{
     AttachMode, AttachSurface, Auth, Envelope, Goodbye, Hello, Input, ListSurfaces, Resize,
 };
-use peer_proto::MAX_FRAME_BYTES;
+use peer_proto::{capability, PeerCapabilities, MAX_FRAME_BYTES};
 use prost::Message;
 
 const PROTOCOL_VERSION: &str = "1.0.0";
@@ -34,7 +34,7 @@ const DETACH_KEY: u8 = 0x1d;
 fn connect_and_authenticate(
     socket_path: &Path,
     emit_banners: bool,
-) -> anyhow::Result<(UnixStream, UnixStream, Arc<AtomicU64>)> {
+) -> anyhow::Result<(UnixStream, UnixStream, Arc<AtomicU64>, PeerCapabilities)> {
     let stream = UnixStream::connect(socket_path)
         .map_err(|e| anyhow::anyhow!("connect {}: {e}", socket_path.display()))?;
     let read_stream = stream.try_clone()?;
@@ -53,7 +53,7 @@ fn connect_and_authenticate(
                 peer_id,
                 display_name: std::env::var("TERMMESH_PEER_CLIENT_NAME")
                     .unwrap_or_else(|_| "tm-agent-peer".into()),
-                capabilities: vec![],
+                capabilities: capability::supported_vec(),
                 app_version: env!("CARGO_PKG_VERSION").into(),
             })),
         },
@@ -68,7 +68,16 @@ fn connect_and_authenticate(
             "[peer] connected to {} ({}), protocol {}",
             h.display_name, h.app_version, h.protocol_version
         );
+        if !h.capabilities.is_empty() {
+            eprintln!("[peer] host capabilities: {}", h.capabilities.join(", "));
+        }
     }
+    // Parsed once here and handed to the caller — plumbing only for now
+    // (see P3, docs/peer-perf-proposal.md): neither list_cmd nor
+    // attach_cmd branches on it yet, but future wire changes (P8 and
+    // later) need somewhere to ask "does the host support X" before
+    // using it.
+    let host_capabilities = PeerCapabilities::from_hello(h.capabilities);
 
     let challenge = read_envelope(&mut read_ref)?;
     match challenge.payload {
@@ -102,7 +111,7 @@ fn connect_and_authenticate(
 
     // Both read halves on the same underlying socket; return one pair to the caller.
     drop(read_ref);
-    Ok((read_stream, write_stream, seq))
+    Ok((read_stream, write_stream, seq, host_capabilities))
 }
 
 fn list_surfaces(
@@ -126,7 +135,7 @@ fn list_surfaces(
 }
 
 pub fn list_cmd(socket_path: &Path) -> anyhow::Result<()> {
-    let (mut read_stream, mut write_stream, seq) =
+    let (mut read_stream, mut write_stream, seq, _host_capabilities) =
         connect_and_authenticate(socket_path, /* emit_banners */ false)?;
     let surfaces = list_surfaces(&mut read_stream, &mut write_stream, &seq)?;
     if surfaces.is_empty() {
@@ -158,7 +167,7 @@ pub fn list_cmd(socket_path: &Path) -> anyhow::Result<()> {
 }
 
 pub fn attach_cmd(socket_path: &Path, name: Option<&str>) -> anyhow::Result<()> {
-    let (mut read_stream_init, mut write_stream, seq) =
+    let (mut read_stream_init, mut write_stream, seq, _host_capabilities) =
         connect_and_authenticate(socket_path, /* emit_banners */ true)?;
 
     let surfaces = list_surfaces(&mut read_stream_init, &mut write_stream, &seq)?;

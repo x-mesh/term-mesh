@@ -52,19 +52,25 @@ public struct PeerSessionOptions: Sendable {
     public var appVersion: String
     public var authMethod: String
     public var clientProtocolVersion: String
+    /// Feature flags advertised to the host in this session's Hello.
+    /// Defaults to everything this build supports (`PeerCapability.supported`);
+    /// tests override it to exercise the host's handling of arbitrary input.
+    public var capabilities: [String]
 
     public init(
         displayName: String = "term-mesh-swift",
         peerID: Data = PeerIdentity.defaultPeerID(),
         appVersion: String = "0.0.1",
         authMethod: String = "ssh-passthrough",
-        clientProtocolVersion: String = "1.0.0"
+        clientProtocolVersion: String = "1.0.0",
+        capabilities: [String] = PeerCapability.supported
     ) {
         self.displayName = displayName
         self.peerID = peerID
         self.appVersion = appVersion
         self.authMethod = authMethod
         self.clientProtocolVersion = clientProtocolVersion
+        self.capabilities = capabilities
     }
 }
 
@@ -73,6 +79,15 @@ public struct PeerSessionInfo: Sendable, Equatable {
     public let hostAppVersion: String
     public let hostProtocolVersion: String
     public let sessionID: Data
+    /// The host's advertised feature flags, parsed from its Hello.
+    /// Plumbing only for now (see P3, docs/peer-perf-proposal.md) — a hook
+    /// for future wire changes (P8 and later) to query before using them.
+    public let hostCapabilities: PeerCapabilities
+
+    /// Whether the host advertised `capability` in its Hello.
+    public func hasHostCapability(_ capability: String) -> Bool {
+        hostCapabilities.has(capability)
+    }
 }
 
 public typealias PeerReadFn = @Sendable () async throws -> Data
@@ -95,6 +110,22 @@ public actor PeerSession {
     private var heartbeatTask: Task<Void, Never>?
     private var lastPongAt: Date = Date()
     private var pingCounter: UInt64 = 0
+    /// Set once `tickHeartbeat` observes a tick with no Pong since the
+    /// previous one, and cleared as soon as a fresh Pong lands. Bounds
+    /// `onFirstMiss`/`onMissRecovered` to exactly one firing per miss
+    /// episode instead of once per tick while the gap persists.
+    private var missNotified = false
+    /// Whether a Pong has arrived since the previous tick. Reset to
+    /// `false` at the top of every tick (right before that tick's own
+    /// Ping goes out) and set `true` by `receiveNextMessage()` whenever
+    /// a Pong is processed. Starts `true` so the very first tick — before
+    /// any Ping has had a chance to be answered — never misreads as a
+    /// miss. This is a discrete per-tick signal rather than a
+    /// `elapsed > intervalSeconds` time comparison because the latter
+    /// hovers right at its own threshold in the healthy steady state
+    /// (each tick's elapsed-since-last-Pong is naturally ~one interval)
+    /// and false-positives on ordinary scheduler jitter.
+    private var pongSeenSinceLastTick = true
 
     public init(read: @escaping PeerReadFn, write: @escaping PeerWriteFn) {
         self.read = read
@@ -109,23 +140,45 @@ public actor PeerSession {
     /// with an error and the existing disconnect path runs. Calling
     /// `startHeartbeat` while a heartbeat is already running cancels
     /// the previous one before starting the new one.
+    ///
+    /// `onFirstMiss` (P6) is an optimistic early signal: it fires once
+    /// when a Pong is overdue by more than one ping interval — well
+    /// before `deadAfter` would declare the session dead — early enough
+    /// for a caller to show a soft "reconnecting" banner. It does not
+    /// repeat on every subsequent tick of the same outage. If the outage
+    /// resolves on its own (a fresh Pong lands before `deadAfter`),
+    /// `onMissRecovered` fires once so the caller can clear that banner
+    /// without ever going through the full dead/reconnect path. Both
+    /// default to `nil` so existing callers that only care about
+    /// `onDead` are source-compatible and unaffected.
     public func startHeartbeat(
         intervalSeconds: TimeInterval = 10,
         deadAfterSeconds: TimeInterval = 30,
+        onFirstMiss: (@Sendable () -> Void)? = nil,
+        onMissRecovered: (@Sendable () -> Void)? = nil,
         onDead: @escaping @Sendable () -> Void
     ) {
         heartbeatTask?.cancel()
         lastPongAt = Date()
+        missNotified = false
+        pongSeenSinceLastTick = true
         let intervalNs = UInt64(max(intervalSeconds, 0.1) * 1_000_000_000)
         heartbeatTask = Task { [weak self] in
             while !Task.isCancelled {
                 try? await Task.sleep(nanoseconds: intervalNs)
                 if Task.isCancelled { return }
                 guard let self else { return }
-                let alive = await self.tickHeartbeat(deadAfterSeconds: deadAfterSeconds)
-                if !alive {
+                let result = await self.tickHeartbeat(deadAfterSeconds: deadAfterSeconds)
+                switch result {
+                case .dead:
                     onDead()
                     return
+                case .firstMiss:
+                    onFirstMiss?()
+                case .recovered:
+                    onMissRecovered?()
+                case .alive:
+                    break
                 }
             }
         }
@@ -138,10 +191,31 @@ public actor PeerSession {
         heartbeatTask = nil
     }
 
-    private func tickHeartbeat(deadAfterSeconds: TimeInterval) async -> Bool {
+    /// Outcome of a single heartbeat tick, folding the P6 first-miss/
+    /// recovered edge detection in alongside the original alive/dead
+    /// check.
+    private enum HeartbeatTick {
+        case alive
+        case firstMiss
+        case recovered
+        case dead
+    }
+
+    private func tickHeartbeat(deadAfterSeconds: TimeInterval) async -> HeartbeatTick {
         if Date().timeIntervalSince(lastPongAt) > deadAfterSeconds {
-            return false
+            return .dead
         }
+        var result: HeartbeatTick = .alive
+        if pongSeenSinceLastTick {
+            if missNotified {
+                missNotified = false
+                result = .recovered
+            }
+        } else if !missNotified {
+            missNotified = true
+            result = .firstMiss
+        }
+        pongSeenSinceLastTick = false
         pingCounter &+= 1
         let nonce = pingCounter
         do {
@@ -150,9 +224,9 @@ public actor PeerSession {
                 p.nonce = nonce
                 env.ping = p
             }
-            return true
+            return result
         } catch {
-            return false
+            return .dead
         }
     }
 
@@ -175,7 +249,8 @@ public actor PeerSession {
             hostDisplayName: host.displayName,
             hostAppVersion: host.appVersion,
             hostProtocolVersion: host.protocolVersion,
-            sessionID: result.sessionID
+            sessionID: result.sessionID,
+            hostCapabilities: PeerCapabilities(host.capabilities)
         )
     }
 
@@ -328,9 +403,12 @@ public actor PeerSession {
         switch env.payload {
         case .pong:
             // Liveness reply to a heartbeat Ping — refresh the timestamp
-            // the heartbeat task checks. Surfaced to callers as `.other`
+            // the heartbeat task checks, and mark a Pong as seen for the
+            // P6 first-miss/recovered edge detection (see
+            // `pongSeenSinceLastTick`). Surfaced to callers as `.other`
             // since they don't need to act on it.
             lastPongAt = Date()
+            pongSeenSinceLastTick = true
             return .other
         case .ptyData(let p):
             return .ptyData(surfaceID: p.surfaceID, byteSeq: p.byteSeq, payload: p.payload)
@@ -434,6 +512,7 @@ public actor PeerSession {
             hello.peerID = options.peerID
             hello.displayName = options.displayName
             hello.appVersion = options.appVersion
+            hello.capabilities = options.capabilities
             env.hello = hello
         }
     }

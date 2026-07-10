@@ -341,7 +341,7 @@ mod integration_tests {
                     protocol_version: PROTOCOL_VERSION.into(),
                     peer_id: vec![0x11; 16],
                     display_name: "integration-test".into(),
-                    capabilities: vec![],
+                    capabilities: peer_proto::capability::supported_vec(),
                     app_version: "test".into(),
                 })),
             },
@@ -704,7 +704,7 @@ mod integration_tests {
                     protocol_version: PROTOCOL_VERSION.into(),
                     peer_id,
                     display_name: display.into(),
-                    capabilities: vec![],
+                    capabilities: peer_proto::capability::supported_vec(),
                     app_version: "test".into(),
                 })),
             },
@@ -1052,7 +1052,7 @@ mod integration_tests {
                     protocol_version: PROTOCOL_VERSION.into(),
                     peer_id: vec![0; 16],
                     display_name: "list-test".into(),
-                    capabilities: vec![],
+                    capabilities: peer_proto::capability::supported_vec(),
                     app_version: "test".into(),
                 })),
             },
@@ -1258,7 +1258,7 @@ mod integration_tests {
                     protocol_version: PROTOCOL_VERSION.into(),
                     peer_id: vec![0x22; 16],
                     display_name: "integration-test".into(),
-                    capabilities: vec![],
+                    capabilities: peer_proto::capability::supported_vec(),
                     app_version: "test".into(),
                 })),
             },
@@ -1311,6 +1311,117 @@ mod integration_tests {
 
         drop(reader);
         drop(writer);
+        shutdown_tx.send(true).unwrap();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(3), server_task).await;
+    }
+
+    /// Connects, sends a Hello with the given `capabilities`, drives the
+    /// rest of the handshake (Auth), and reports whether it was accepted.
+    /// Used by the adversarial-capabilities test below to check several
+    /// payloads against the same running server without repeating the
+    /// connect/Hello/Auth boilerplate each time.
+    async fn handshake_with_capabilities(
+        sock_path: &std::path::Path,
+        capabilities: Vec<String>,
+    ) -> bool {
+        let stream = UnixStream::connect(sock_path).await.unwrap();
+        let (mut reader, mut writer) = stream.into_split();
+        write_envelope(
+            &mut writer,
+            &Envelope {
+                seq: 1,
+                correlation_id: 0,
+                payload: Some(Payload::Hello(Hello {
+                    protocol_version: PROTOCOL_VERSION.into(),
+                    peer_id: vec![0x55; 16],
+                    display_name: "adversarial-capabilities-test".into(),
+                    capabilities,
+                    app_version: "test".into(),
+                })),
+            },
+        )
+        .await
+        .unwrap();
+        let _ = read_envelope(&mut reader).await.unwrap(); // host hello
+        let _ = read_envelope(&mut reader).await.unwrap(); // auth challenge
+
+        write_envelope(
+            &mut writer,
+            &Envelope {
+                seq: 2,
+                correlation_id: 0,
+                payload: Some(Payload::Auth(Auth {
+                    method: "ssh-passthrough".into(),
+                    token_id: vec![],
+                    signature: vec![],
+                })),
+            },
+        )
+        .await
+        .unwrap();
+
+        let result = read_envelope(&mut reader).await.unwrap();
+        matches!(result.payload, Some(Payload::AuthResult(r)) if r.accepted)
+    }
+
+    /// P3 capability plumbing: a client's `Hello.capabilities` is
+    /// attacker/bug-controlled input arriving straight off the wire, so
+    /// the handshake must complete normally no matter what's in it --
+    /// empty (today's/legacy behavior, must be unchanged), full of
+    /// capability strings this build has never heard of (forward-compat),
+    /// or an absurdly long list (a buggy or hostile peer). None of these
+    /// should reject, slow, or crash the handshake. This exercises the
+    /// real `connection::run` path end to end (not just `PeerCapabilities`
+    /// in isolation, which `peer-proto`'s own unit tests already cover) --
+    /// the field arrives over the wire before any validation could reject
+    /// it structurally.
+    #[tokio::test]
+    async fn handshake_survives_adversarial_client_capabilities() {
+        let tmp = TempDir::new().unwrap();
+        let sock_path = tmp.path().join("peer.sock");
+
+        let manager = Arc::new(PtyManager::new());
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let sock_path_task = sock_path.clone();
+        let server_task = tokio::spawn(async move {
+            serve_with_manager(sock_path_task, shutdown_rx, manager)
+                .await
+                .unwrap();
+        });
+        for _ in 0..50 {
+            if sock_path.exists() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+
+        // Empty: today's/legacy fallback -- must behave exactly as before P3.
+        assert!(
+            handshake_with_capabilities(&sock_path, vec![]).await,
+            "handshake with empty capabilities (legacy peer) should still succeed"
+        );
+
+        // Unknown + duplicate + empty-string entries: forward-compat, never rejected.
+        assert!(
+            handshake_with_capabilities(
+                &sock_path,
+                vec![
+                    "totally.unknown.v1".into(),
+                    "totally.unknown.v1".into(),
+                    "".into(),
+                ]
+            )
+            .await,
+            "handshake with unknown/duplicate capability strings should still succeed"
+        );
+
+        // Thousands of entries: must not slow down, hang, or crash the handshake.
+        let many: Vec<String> = (0..5000).map(|i| format!("cap.{i}.v1")).collect();
+        assert!(
+            handshake_with_capabilities(&sock_path, many).await,
+            "handshake with a very large capabilities list should still succeed"
+        );
+
         shutdown_tx.send(true).unwrap();
         let _ = tokio::time::timeout(std::time::Duration::from_secs(3), server_task).await;
     }

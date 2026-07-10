@@ -3,6 +3,67 @@ import Foundation
 import Carbon.HIToolbox
 import Bonsplit
 import WebKit
+import PeerProto
+
+#if DEBUG
+/// Mutable result box for `v2DebugPeerDemuxProbe`, filled by a detached
+/// probe Task and read after a semaphore hand-off. `@unchecked Sendable`
+/// because the semaphore serialises the single writer → single reader.
+private final class PeerDemuxProbeResult: @unchecked Sendable {
+    var a: String = ""
+    var b: String = ""
+    var aCount: Int = 0
+    var bCount: Int = 0
+}
+
+/// One scenario's outcome for `v2DebugPeerCoalesceProbe` (Phase P7).
+private struct CoalesceScenarioResult {
+    var chunksSubmitted: Int
+    var framesSent: Int
+    var bytesTotal: Int
+    var maxFrameBytes: Int
+}
+
+/// Mutable result box for `v2DebugPeerCoalesceProbe`, filled by a
+/// detached probe Task and read after a semaphore hand-off (same shape
+/// as `PeerDemuxProbeResult` above). `@unchecked Sendable` because the
+/// semaphore serialises the single writer → single reader.
+private final class CoalesceProbeResult: @unchecked Sendable {
+    var burst: CoalesceScenarioResult?
+    var isolated: CoalesceScenarioResult?
+    var capped: CoalesceScenarioResult?
+}
+
+/// Thread-safe call counter for `v2DebugPeerCoalesceProbe`'s synthetic
+/// `PtyDataCoalescer.send` closures. `@unchecked Sendable` — all mutation
+/// goes through `lock`.
+private final class CoalesceProbeCounter: @unchecked Sendable {
+    private let lock = NSLock()
+    private(set) var frames = 0
+    private(set) var bytes = 0
+    private(set) var maxFrame = 0
+    func record(_ n: Int) {
+        lock.lock(); defer { lock.unlock() }
+        frames += 1
+        bytes += n
+        maxFrame = max(maxFrame, n)
+    }
+}
+
+/// Mutable result box for `v2DebugPeerCapabilitiesProbe` (Phase P3), filled
+/// by a detached probe Task and read after a semaphore hand-off (same
+/// shape as `PeerDemuxProbeResult`/`CoalesceProbeResult` above).
+/// `@unchecked Sendable` because the semaphore serialises the single
+/// writer → single reader. `roundTrip*` fields stay nil if the throwaway
+/// loopback handshake itself couldn't be set up (best-effort bonus check,
+/// not the probe's core guarantee).
+private final class CapabilitiesProbeResult: @unchecked Sendable {
+    var selfAdvertised: [String] = []
+    var roundTripSawPtyDataCoalesce: Bool?
+    var roundTripSawReplayRing: Bool?
+    var roundTripSawUnknown: Bool?
+}
+#endif
 
 extension TerminalController {
     // MARK: - V2 Debug / Test-only Methods
@@ -437,6 +498,183 @@ extension TerminalController {
         return result
     }
 
+    /// Test-only: exercise the real client-side `PeerSessionDemux` end to
+    /// end so socket e2e can assert P1's PtyData isolation contract without
+    /// standing up a live 2-node peer session. Runs the exact routing the
+    /// shared subscription loop uses:
+    ///   register(A,B) → interleaved route(A/B) → deregister(B) →
+    ///   route(A,B-again) → finishAll → drain both streams.
+    /// Returns each surface's delivered bytes as text plus chunk counts, so
+    /// the caller asserts: (1) A never received B's bytes and vice-versa
+    /// (2-pane isolation); (2) A kept receiving after B detached (residual
+    /// stream continuity); (3) B's post-detach frame was dropped, not
+    /// mis-routed to A.
+    func v2DebugPeerDemuxProbe(params: [String: Any]) -> V2CallResult {
+        let sidA = Data("SURFACE_A".utf8)
+        let sidB = Data("SURFACE_B".utf8)
+        let box = PeerDemuxProbeResult()
+        let sem = DispatchSemaphore(value: 0)
+        Task.detached {
+            let demux = PeerSessionDemux()
+            let streamA = await demux.register(surfaceID: sidA)
+            let streamB = await demux.register(surfaceID: sidB)
+            // Interleave two surfaces' PtyData on the single shared loop.
+            await demux.route(surfaceID: sidA, byteSeq: 1, payload: Data("a1".utf8))
+            await demux.route(surfaceID: sidB, byteSeq: 1, payload: Data("b1".utf8))
+            await demux.route(surfaceID: sidA, byteSeq: 2, payload: Data("a2".utf8))
+            await demux.route(surfaceID: sidB, byteSeq: 2, payload: Data("b2".utf8))
+            // Detach B (pane close): its stream finishes and later B frames
+            // must be dropped, never delivered to the surviving A consumer.
+            await demux.deregister(surfaceID: sidB)
+            await demux.route(surfaceID: sidA, byteSeq: 3, payload: Data("a3".utf8))
+            await demux.route(surfaceID: sidB, byteSeq: 3, payload: Data("bX".utf8))
+            await demux.finishAll()
+            var aBytes = Data(); var aCount = 0
+            for await chunk in streamA { aBytes.append(chunk.payload); aCount += 1 }
+            var bBytes = Data(); var bCount = 0
+            for await chunk in streamB { bBytes.append(chunk.payload); bCount += 1 }
+            box.a = String(decoding: aBytes, as: UTF8.self)
+            box.b = String(decoding: bBytes, as: UTF8.self)
+            box.aCount = aCount
+            box.bCount = bCount
+            sem.signal()
+        }
+        if sem.wait(timeout: .now() + 5) == .timedOut {
+            return .err(code: "internal_error", message: "demux probe timed out", data: nil)
+        }
+        return .ok([
+            "a": box.a,
+            "b": box.b,
+            "a_count": box.aCount,
+            "b_count": box.bCount,
+        ])
+    }
+
+    /// Private serial queue for `v2DebugPeerReadGrid`'s background read hop.
+    /// Deliberately separate from `AutoReplyPoller`'s `pollQueue` — that queue
+    /// is owned by the auto-reply poll loop's own batching/coalescing state;
+    /// sharing it here would mix an unrelated caller's work items into that
+    /// loop's ownership.
+    private static let debugReadGridQueue = DispatchQueue(label: "term-mesh.debug.read-grid", qos: .userInitiated)
+
+    /// Test-only: read a surface's currently rendered grid (viewport text +
+    /// dimensions) — the render-axis regression infra P5 proposes. Clones
+    /// `AutoReplyPoller.tick()`'s threading pattern rather than the legacy
+    /// `v2DebugReadTerminalText` wrapper: resolve the surface and acquire a
+    /// `SurfaceReadLease` on the MainActor, then hop the actual
+    /// `ghostty_surface_read_text` call onto a private serial queue so a slow
+    /// read never blocks socket dispatch or the main thread; release the
+    /// lease immediately after, mirroring `AutoReplyPoller.swift:162-178`.
+    ///
+    /// Works on any live `TerminalSurface`: a regular local pane (resolved
+    /// exactly how `AutoReplyPoller` resolves an agent panel — panel UUID via
+    /// `AppDelegate.locateSurface`) or, as a fallback, a peer relay-viewer
+    /// surface (resolved via
+    /// `PeerRelayWorkspaceWindowController.debugRelaySurface`). The latter
+    /// works because "reading a remote pane's grid" is really just reading
+    /// the local surface that renders it — no wire round trip needed.
+    ///
+    /// params: `surface_id`. Returns `{ok: true, grid_text, rows, cols}` on
+    /// success, or `{ok: false, error: "unknown_surface"}` when neither
+    /// lookup resolves — an expected outcome here, not a JSON-RPC error.
+    func v2DebugPeerReadGrid(params: [String: Any]) -> V2CallResult {
+        guard let surfaceArg = v2String(params, "surface_id") else {
+            return .err(code: "invalid_params", message: "Missing surface_id", data: nil)
+        }
+
+        struct LeaseBox: @unchecked Sendable {
+            let lease: SurfaceReadLease
+        }
+        var box: LeaseBox?
+        _ = v2MainExec(timeout: 5) {
+            if let surface = self.resolveGridSurface(surfaceArg), let lease = surface.beginReadLease() {
+                box = LeaseBox(lease: lease)
+            }
+        }
+        guard let box else {
+            return .ok(["ok": false, "error": "unknown_surface"])
+        }
+
+        struct ReadResult: @unchecked Sendable {
+            var gridText: String = ""
+            var cols: Int = 0
+            var rows: Int = 0
+        }
+        let sem = DispatchSemaphore(value: 0)
+        var out = ReadResult()
+        Self.debugReadGridQueue.async {
+            let ptr = box.lease.surface
+            let size = ghostty_surface_size(ptr)
+            out.cols = Int(size.columns)
+            out.rows = Int(size.rows)
+            out.gridText = Self.readViewportGridText(ptr) ?? ""
+            box.lease.release()
+            sem.signal()
+        }
+        if sem.wait(timeout: .now() + 5) == .timedOut {
+            box.lease.release()
+            return .err(code: "internal_error", message: "read_grid timed out", data: nil)
+        }
+        return .ok([
+            "ok": true,
+            "grid_text": out.gridText,
+            "rows": out.rows,
+            "cols": out.cols,
+        ])
+    }
+
+    /// Read the surface's current VIEWPORT (not full scrollback) as plain
+    /// text — the "grid" P5 wants to diff render output against. Mirrors
+    /// `readPaneSnapshot`'s selection (`GhosttyPaneSurfaceProvider.swift`)
+    /// but without its ANSI clear/home + bare-LF-to-CRLF framing: this is a
+    /// raw introspection read, not a byte stream meant to replay into
+    /// another terminal. `nonisolated` so it can run on
+    /// `debugReadGridQueue` (a plain background queue, not the MainActor),
+    /// matching `AutoReplyPoller.readScrollback`'s pattern.
+    nonisolated private static func readViewportGridText(_ surface: ghostty_surface_t) -> String? {
+        let topLeft = ghostty_point_s(
+            tag: GHOSTTY_POINT_VIEWPORT,
+            coord: GHOSTTY_POINT_COORD_TOP_LEFT,
+            x: 0, y: 0
+        )
+        let bottomRight = ghostty_point_s(
+            tag: GHOSTTY_POINT_VIEWPORT,
+            coord: GHOSTTY_POINT_COORD_BOTTOM_RIGHT,
+            x: 0, y: 0
+        )
+        let selection = ghostty_selection_s(
+            top_left: topLeft,
+            bottom_right: bottomRight,
+            rectangle: true
+        )
+        var text = ghostty_text_s()
+        guard ghostty_surface_read_text(surface, selection, &text) else { return nil }
+        defer { ghostty_surface_free_text(surface, &text) }
+        guard let ptr = text.text, text.text_len > 0 else { return "" }
+        let data = Data(bytes: ptr, count: Int(text.text_len))
+        return String(data: data, encoding: .utf8)
+    }
+
+    /// A3 resolution order: regular local surface first (exactly how
+    /// `AutoReplyPoller.tick()` resolves an agent panel — panel UUID via
+    /// `AppDelegate.locateSurface` -> `workspace.panels[uuid] as? TerminalPanel`),
+    /// falling back to a peer relay-viewer surface keyed by the same UUID
+    /// string reinterpreted as the peer wire surfaceID's raw bytes (see
+    /// `PeerRelayWorkspaceWindowController.debugRelaySurface`). Must run on
+    /// the MainActor — both lookups touch MainActor-only state — so this is
+    /// only ever called from inside a `v2MainExec` body.
+    private func resolveGridSurface(_ surfaceArg: String) -> TerminalSurface? {
+        guard let uuid = UUID(uuidString: surfaceArg) else { return nil }
+        if let appDelegate = AppDelegate.shared,
+           let located = appDelegate.locateSurface(surfaceId: uuid),
+           let workspace = located.tabManager.tabs.first(where: { $0.id == located.workspaceId }),
+           let panel = workspace.panels[uuid] as? TerminalPanel {
+            return panel.surface
+        }
+        let peerSurfaceID = withUnsafeBytes(of: uuid.uuid) { Data($0) }
+        return PeerRelayWorkspaceWindowController.debugRelaySurface(forSurfaceID: peerSurfaceID)
+    }
+
     /// Decode an even-length hex string into Data. Returns nil on any
     /// non-hex character or odd length.
     static func dataFromHex(_ hex: String) -> Data? {
@@ -458,6 +696,206 @@ extension TerminalController {
             i += 2
         }
         return out
+    }
+
+    /// Test-only: arm (creating its `PtyTapHub` if needed) and/or query the
+    /// Phase P4 attach-time replay decision for a surface — see
+    /// `GhosttyPaneSurfaceProvider.debugReplayProbe`. The first call against
+    /// a given surface_id wires the real PTY tap callback so subsequent
+    /// output on that surface accumulates into the ring buffer; a later
+    /// call reports the current buffer-vs-snapshot mode. Uses the DEBUG-only
+    /// `GhosttyPaneSurfaceProvider.debugProbeShared` singleton (not
+    /// whatever provider `PeerServerHost` uses for real hosting) so the hub
+    /// persists across separate socket round-trips. params: `surface_id`.
+    /// Returns `{ok: true, mode, bytes, chunks, bytes_text}` or
+    /// `{ok: false, error: "unknown_surface"}` — an expected outcome here,
+    /// not an RPC-level error, mirroring `v2DebugPeerReadGrid`'s contract.
+    func v2DebugPeerReplayProbe(params: [String: Any]) -> V2CallResult {
+        guard let surfaceArg = v2String(params, "surface_id"),
+              let uuid = UUID(uuidString: surfaceArg) else {
+            return .err(code: "invalid_params", message: "Missing/invalid surface_id", data: nil)
+        }
+        let peerSurfaceID = withUnsafeBytes(of: uuid.uuid) { Data($0) }
+        var result: (mode: String, bytes: Int, chunks: Int, text: String)?
+        _ = v2MainExec(timeout: 5) {
+            result = GhosttyPaneSurfaceProvider.debugProbeShared.debugReplayProbe(surfaceID: peerSurfaceID)
+        }
+        guard let result else {
+            return .ok(["ok": false, "error": "unknown_surface"])
+        }
+        return .ok([
+            "ok": true,
+            "mode": result.mode,
+            "bytes": result.bytes,
+            "chunks": result.chunks,
+            "bytes_text": result.text,
+        ])
+    }
+
+    /// Test-only: exercises the real `PtyDataCoalescer` (Phase P7) with
+    /// synthetic, precisely-timed chunk submissions. `pumpByteStream`'s
+    /// owning `PeerServerSession` actor is package-internal to PeerProto
+    /// (and there is no live 2-node peer session in this test environment
+    /// either way), so this drives the exact same production
+    /// `PtyDataCoalescer` type `pumpByteStream` uses directly — mirrors
+    /// `debug.peer.demux_probe`'s approach of exercising a real PeerProto
+    /// type with synthetic input rather than a live session.
+    ///
+    /// Runs three fixed scenarios, each against a fresh coalescer:
+    ///   burst:    5x 100-byte chunks ~1ms apart (all inside the 6ms
+    ///             default window) -> expect fewer frames sent than
+    ///             chunks submitted (coalescing merged them).
+    ///   isolated: 3x 50-byte chunks ~30ms apart (each outside the 6ms
+    ///             window, with margin for scheduling jitter) -> expect
+    ///             one frame per chunk (leading-edge sends every isolated
+    ///             write immediately, no merging).
+    ///   capped:   12x 8KB chunks back-to-back (~0.5ms apart, ~96KB
+    ///             total -- comfortably over the 64KB default cap within
+    ///             a single window) -> expect the byte cap to force a
+    ///             flush before the window would otherwise elapse, and no
+    ///             single sent frame to exceed the cap.
+    /// Returns each scenario's chunk/frame counts + byte totals so the
+    /// caller asserts merging occurred where expected (or correctly
+    /// didn't for isolated writes).
+    func v2DebugPeerCoalesceProbe(params: [String: Any]) -> V2CallResult {
+        let box = CoalesceProbeResult()
+        let sem = DispatchSemaphore(value: 0)
+        Task.detached {
+            box.burst = await Self.runCoalesceScenario(chunkCount: 5, chunkSize: 100, gapNs: 1_000_000)
+            box.isolated = await Self.runCoalesceScenario(chunkCount: 3, chunkSize: 50, gapNs: 30_000_000)
+            box.capped = await Self.runCoalesceScenario(chunkCount: 12, chunkSize: 8 * 1024, gapNs: 500_000)
+            sem.signal()
+        }
+        if sem.wait(timeout: .now() + 10) == .timedOut {
+            return .err(code: "internal_error", message: "coalesce probe timed out", data: nil)
+        }
+        guard let burst = box.burst, let isolated = box.isolated, let capped = box.capped else {
+            return .err(code: "internal_error", message: "coalesce probe produced no result", data: nil)
+        }
+        func encode(_ r: CoalesceScenarioResult) -> [String: Any] {
+            [
+                "chunks_submitted": r.chunksSubmitted,
+                "frames_sent": r.framesSent,
+                "bytes_total": r.bytesTotal,
+                "max_frame_bytes": r.maxFrameBytes,
+            ]
+        }
+        return .ok([
+            "ok": true,
+            "burst": encode(burst),
+            "isolated": encode(isolated),
+            "capped": encode(capped),
+        ])
+    }
+
+    /// Submits `chunkCount` synthetic chunks of `chunkSize` bytes to a
+    /// fresh `PtyDataCoalescer`, `gapNs` apart, then flushes and reports
+    /// how many frames the coalescer actually sent.
+    private static func runCoalesceScenario(
+        chunkCount: Int,
+        chunkSize: Int,
+        gapNs: UInt64
+    ) async -> CoalesceScenarioResult {
+        let counter = CoalesceProbeCounter()
+        let coalescer = PtyDataCoalescer { payload, _ in
+            counter.record(payload.count)
+            return true
+        }
+        var seq: UInt64 = 0
+        for i in 0..<chunkCount {
+            let chunk = Data(repeating: UInt8(65 + (i % 26)), count: chunkSize)
+            await coalescer.submit(chunk, startSeq: seq)
+            seq &+= UInt64(chunk.count)
+            if i < chunkCount - 1 {
+                try? await Task.sleep(nanoseconds: gapNs)
+            }
+        }
+        await coalescer.flushRemaining()
+        return CoalesceScenarioResult(
+            chunksSubmitted: chunkCount,
+            framesSent: counter.frames,
+            bytesTotal: counter.bytes,
+            maxFrameBytes: counter.maxFrame
+        )
+    }
+
+    /// Test-only: proves the P3 capability plumbing works. There is no
+    /// live 2-node peer session in this test environment (the same
+    /// situation `debug.peer.demux_probe`/`debug.peer.coalesce_probe` are
+    /// in), so this reports two things:
+    ///   1. `self_advertised` -- this build's `PeerCapability.supported`
+    ///      list, i.e. what any real Hello this app sends will contain.
+    ///      Guaranteed, side-effect-free.
+    ///   2. As a best-effort bonus, `round_trip_*` booleans from a real,
+    ///      throwaway `PeerServer` + `PeerSession` handshake completed
+    ///      entirely within this process against a temp Unix socket --
+    ///      proving the full generate -> wire -> parse -> store path, not
+    ///      just that the constant exists. If the throwaway loopback
+    ///      can't be set up for any reason, the `round_trip_*` fields are
+    ///      simply omitted -- `self_advertised` alone already covers the
+    ///      probe's core guarantee (see tests_v2/test_peer_capabilities.py
+    ///      for why a real 2-node/2-machine check isn't possible here).
+    func v2DebugPeerCapabilitiesProbe(params: [String: Any]) -> V2CallResult {
+        let box = CapabilitiesProbeResult()
+        box.selfAdvertised = PeerCapability.supported
+        let sem = DispatchSemaphore(value: 0)
+        Task.detached {
+            let sockPath = "/tmp/tm-peer-caps-probe-\(UUID().uuidString.prefix(8)).sock"
+            defer { try? FileManager.default.removeItem(atPath: sockPath) }
+            let provider = StaticSurfaceProvider(surfaces: [])
+            let server = PeerServer(socketPath: sockPath, provider: provider)
+            do {
+                try await server.start()
+            } catch {
+                sem.signal()
+                return
+            }
+            defer { Task { await server.stop() } }
+
+            let deadline = Date().addingTimeInterval(2)
+            while !FileManager.default.fileExists(atPath: sockPath) {
+                if Date() > deadline {
+                    sem.signal()
+                    return
+                }
+                try? await Task.sleep(nanoseconds: 20_000_000)
+            }
+
+            do {
+                let transport = try await UnixSocketTransport.connect(socketPath: sockPath)
+                let session = PeerSession(
+                    read: { try await transport.read() },
+                    write: { try await transport.write($0) }
+                )
+                let info = try await session.handshake()
+                box.roundTripSawPtyDataCoalesce = info.hasHostCapability(PeerCapability.ptyDataCoalesceV1)
+                box.roundTripSawReplayRing = info.hasHostCapability(PeerCapability.replayRingV1)
+                box.roundTripSawUnknown = info.hasHostCapability("totally.unknown.v1")
+                try? await session.sendGoodbye(reason: "capabilities-probe done")
+                await transport.close()
+            } catch {
+                // Best-effort bonus check only -- self_advertised above
+                // already covers the probe's core guarantee.
+            }
+            sem.signal()
+        }
+        if sem.wait(timeout: .now() + 5) == .timedOut {
+            return .err(code: "internal_error", message: "capabilities probe timed out", data: nil)
+        }
+        var result: [String: Any] = [
+            "ok": true,
+            "self_advertised": box.selfAdvertised,
+        ]
+        if let coalesce = box.roundTripSawPtyDataCoalesce {
+            result["round_trip_ptydata_coalesce_v1"] = coalesce
+        }
+        if let replay = box.roundTripSawReplayRing {
+            result["round_trip_replay_ring_v1"] = replay
+        }
+        if let unknown = box.roundTripSawUnknown {
+            result["round_trip_unknown_capability"] = unknown
+        }
+        return .ok(result)
     }
 
     func v2DebugFlashCount(params: [String: Any]) -> V2CallResult {
