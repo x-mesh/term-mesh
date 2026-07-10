@@ -502,6 +502,131 @@ extension TerminalController {
         ])
     }
 
+    /// Private serial queue for `v2DebugPeerReadGrid`'s background read hop.
+    /// Deliberately separate from `AutoReplyPoller`'s `pollQueue` — that queue
+    /// is owned by the auto-reply poll loop's own batching/coalescing state;
+    /// sharing it here would mix an unrelated caller's work items into that
+    /// loop's ownership.
+    private static let debugReadGridQueue = DispatchQueue(label: "term-mesh.debug.read-grid", qos: .userInitiated)
+
+    /// Test-only: read a surface's currently rendered grid (viewport text +
+    /// dimensions) — the render-axis regression infra P5 proposes. Clones
+    /// `AutoReplyPoller.tick()`'s threading pattern rather than the legacy
+    /// `v2DebugReadTerminalText` wrapper: resolve the surface and acquire a
+    /// `SurfaceReadLease` on the MainActor, then hop the actual
+    /// `ghostty_surface_read_text` call onto a private serial queue so a slow
+    /// read never blocks socket dispatch or the main thread; release the
+    /// lease immediately after, mirroring `AutoReplyPoller.swift:162-178`.
+    ///
+    /// Works on any live `TerminalSurface`: a regular local pane (resolved
+    /// exactly how `AutoReplyPoller` resolves an agent panel — panel UUID via
+    /// `AppDelegate.locateSurface`) or, as a fallback, a peer relay-viewer
+    /// surface (resolved via
+    /// `PeerRelayWorkspaceWindowController.debugRelaySurface`). The latter
+    /// works because "reading a remote pane's grid" is really just reading
+    /// the local surface that renders it — no wire round trip needed.
+    ///
+    /// params: `surface_id`. Returns `{ok: true, grid_text, rows, cols}` on
+    /// success, or `{ok: false, error: "unknown_surface"}` when neither
+    /// lookup resolves — an expected outcome here, not a JSON-RPC error.
+    func v2DebugPeerReadGrid(params: [String: Any]) -> V2CallResult {
+        guard let surfaceArg = v2String(params, "surface_id") else {
+            return .err(code: "invalid_params", message: "Missing surface_id", data: nil)
+        }
+
+        struct LeaseBox: @unchecked Sendable {
+            let lease: SurfaceReadLease
+        }
+        var box: LeaseBox?
+        _ = v2MainExec(timeout: 5) {
+            if let surface = self.resolveGridSurface(surfaceArg), let lease = surface.beginReadLease() {
+                box = LeaseBox(lease: lease)
+            }
+        }
+        guard let box else {
+            return .ok(["ok": false, "error": "unknown_surface"])
+        }
+
+        struct ReadResult: @unchecked Sendable {
+            var gridText: String = ""
+            var cols: Int = 0
+            var rows: Int = 0
+        }
+        let sem = DispatchSemaphore(value: 0)
+        var out = ReadResult()
+        Self.debugReadGridQueue.async {
+            let ptr = box.lease.surface
+            let size = ghostty_surface_size(ptr)
+            out.cols = Int(size.columns)
+            out.rows = Int(size.rows)
+            out.gridText = Self.readViewportGridText(ptr) ?? ""
+            box.lease.release()
+            sem.signal()
+        }
+        if sem.wait(timeout: .now() + 5) == .timedOut {
+            box.lease.release()
+            return .err(code: "internal_error", message: "read_grid timed out", data: nil)
+        }
+        return .ok([
+            "ok": true,
+            "grid_text": out.gridText,
+            "rows": out.rows,
+            "cols": out.cols,
+        ])
+    }
+
+    /// Read the surface's current VIEWPORT (not full scrollback) as plain
+    /// text — the "grid" P5 wants to diff render output against. Mirrors
+    /// `readPaneSnapshot`'s selection (`GhosttyPaneSurfaceProvider.swift`)
+    /// but without its ANSI clear/home + bare-LF-to-CRLF framing: this is a
+    /// raw introspection read, not a byte stream meant to replay into
+    /// another terminal. `nonisolated` so it can run on
+    /// `debugReadGridQueue` (a plain background queue, not the MainActor),
+    /// matching `AutoReplyPoller.readScrollback`'s pattern.
+    nonisolated private static func readViewportGridText(_ surface: ghostty_surface_t) -> String? {
+        let topLeft = ghostty_point_s(
+            tag: GHOSTTY_POINT_VIEWPORT,
+            coord: GHOSTTY_POINT_COORD_TOP_LEFT,
+            x: 0, y: 0
+        )
+        let bottomRight = ghostty_point_s(
+            tag: GHOSTTY_POINT_VIEWPORT,
+            coord: GHOSTTY_POINT_COORD_BOTTOM_RIGHT,
+            x: 0, y: 0
+        )
+        let selection = ghostty_selection_s(
+            top_left: topLeft,
+            bottom_right: bottomRight,
+            rectangle: true
+        )
+        var text = ghostty_text_s()
+        guard ghostty_surface_read_text(surface, selection, &text) else { return nil }
+        defer { ghostty_surface_free_text(surface, &text) }
+        guard let ptr = text.text, text.text_len > 0 else { return "" }
+        let data = Data(bytes: ptr, count: Int(text.text_len))
+        return String(data: data, encoding: .utf8)
+    }
+
+    /// A3 resolution order: regular local surface first (exactly how
+    /// `AutoReplyPoller.tick()` resolves an agent panel — panel UUID via
+    /// `AppDelegate.locateSurface` -> `workspace.panels[uuid] as? TerminalPanel`),
+    /// falling back to a peer relay-viewer surface keyed by the same UUID
+    /// string reinterpreted as the peer wire surfaceID's raw bytes (see
+    /// `PeerRelayWorkspaceWindowController.debugRelaySurface`). Must run on
+    /// the MainActor — both lookups touch MainActor-only state — so this is
+    /// only ever called from inside a `v2MainExec` body.
+    private func resolveGridSurface(_ surfaceArg: String) -> TerminalSurface? {
+        guard let uuid = UUID(uuidString: surfaceArg) else { return nil }
+        if let appDelegate = AppDelegate.shared,
+           let located = appDelegate.locateSurface(surfaceId: uuid),
+           let workspace = located.tabManager.tabs.first(where: { $0.id == located.workspaceId }),
+           let panel = workspace.panels[uuid] as? TerminalPanel {
+            return panel.surface
+        }
+        let peerSurfaceID = withUnsafeBytes(of: uuid.uuid) { Data($0) }
+        return PeerRelayWorkspaceWindowController.debugRelaySurface(forSurfaceID: peerSurfaceID)
+    }
+
     /// Decode an even-length hex string into Data. Returns nil on any
     /// non-hex character or odd length.
     static func dataFromHex(_ hex: String) -> Data? {

@@ -1117,6 +1117,22 @@ class termmesh:
         keys: a, b (delivered text per surface) and a_count, b_count."""
         return dict(self._call("debug.peer.demux_probe", {}) or {})
 
+    def read_grid(self, surface_id: Union[str, int, None] = None) -> dict:
+        """Read a surface's current rendered grid via `debug.peer.read_grid`
+        (P5, DEBUG-only). Works on any live TerminalSurface — a regular
+        local pane or a peer relay-viewer surface — since "reading a remote
+        pane's grid" is really just reading the local surface that renders
+        it, no wire round trip needed. Returns the raw
+        {ok, grid_text, rows, cols} (or {ok: False, error: "unknown_surface"})
+        payload as-is: callers check res["ok"] rather than relying on an
+        exception, since an unknown surface_id is an expected (not
+        exceptional) outcome for this method."""
+        sid = self._resolve_surface_id(surface_id)
+        params: Dict[str, Any] = {}
+        if sid:
+            params["surface_id"] = sid
+        return dict(self._call("debug.peer.read_grid", params) or {})
+
     def screenshot(self, label: str = "") -> dict:
         params: Dict[str, Any] = {}
         if label:

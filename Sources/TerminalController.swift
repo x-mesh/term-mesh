@@ -1214,6 +1214,8 @@ class TerminalController {
             return v2Result(id: id, self.v2DebugPeerInjectInput(params: params))
         case "debug.peer.demux_probe":
             return v2Result(id: id, self.v2DebugPeerDemuxProbe(params: params))
+        case "debug.peer.read_grid":
+            return v2Result(id: id, self.v2DebugPeerReadGrid(params: params))
         case "debug.panel_snapshot":
             return v2Result(id: id, self.v2DebugPanelSnapshot(params: params))
         case "debug.panel_snapshot.reset":
@@ -1431,6 +1433,7 @@ class TerminalController {
             "debug.flash.count",
             "debug.flash.reset",
             "debug.peer.inject_input",
+            "debug.peer.read_grid",
             "debug.panel_snapshot",
             "debug.panel_snapshot.reset",
             "debug.window.screenshot",

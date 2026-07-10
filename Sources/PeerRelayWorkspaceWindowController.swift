@@ -289,6 +289,25 @@ final class PeerRelayWorkspaceWindowController: NSWindowController, NSWindowDele
     private var baseTitle: String
     private var currentLayout: Termmesh_Peer_V1_WorkspaceLayout
     private var panesBySurfaceID: [Data: PaneSlot] = [:]
+    /// Registry mirroring `panesBySurfaceID` 1:1 (populated/cleared at the
+    /// same call sites: `spawnAndStore`, and all three removal sites —
+    /// `close()`/`invalidate()`-style teardown ×2 plus the stale-pane
+    /// sweep), keyed by the same wire surfaceID `Data` but holding only the
+    /// `TerminalSurface`. Lets debug/test tooling (e.g. `debug.peer.read_grid`,
+    /// P5) resolve "the local surface currently rendering peer surface X"
+    /// without reaching into window-controller internals or a wire round
+    /// trip — "reading a remote pane's grid" really is just reading this
+    /// surface like any other local pane. `static` (not per-instance) since
+    /// surfaceIDs are globally unique (derived from the remote host's own
+    /// panel UUID) and a debug caller has no window-controller handle to
+    /// scope the lookup to.
+    private static var relaySurfacesByID: [Data: TerminalSurface] = [:]
+
+    /// Test/debug accessor for `relaySurfacesByID` — see its declaration.
+    static func debugRelaySurface(forSurfaceID surfaceID: Data) -> TerminalSurface? {
+        relaySurfacesByID[surfaceID]
+    }
+
     /// Splits the renderer needs to apply divider positions to after
     /// the next layout pass. Cleared after each `applyPendingDividerPositions`.
     private var pendingDividerSetters: [(NSSplitView, CGFloat)] = []
@@ -612,6 +631,7 @@ final class PeerRelayWorkspaceWindowController: NSWindowController, NSWindowDele
         subscriptionDemux = nil
         let toStop = Array(panesBySurfaceID.values)
         panesBySurfaceID.removeAll()
+        for slot in toStop { Self.relaySurfacesByID.removeValue(forKey: slot.surfaceID) }
         Task {
             // Finish the demux streams first so each shared pane's pump
             // loop exits, then stop the slots and close the transport.
@@ -707,6 +727,7 @@ final class PeerRelayWorkspaceWindowController: NSWindowController, NSWindowDele
         subscriptionDemux = nil
         let toStop = Array(panesBySurfaceID.values)
         panesBySurfaceID.removeAll()
+        for slot in toStop { Self.relaySurfacesByID.removeValue(forKey: slot.surfaceID) }
         Task {
             await demux?.finishAll()
             await session?.stopHeartbeat()
@@ -1200,6 +1221,7 @@ final class PeerRelayWorkspaceWindowController: NSWindowController, NSWindowDele
         let toRemove = Set(panesBySurfaceID.keys).subtracting(liveSurfaceIDs)
         for sid in toRemove {
             if let slot = panesBySurfaceID.removeValue(forKey: sid) {
+                Self.relaySurfacesByID.removeValue(forKey: sid)
                 Task { await slot.session.stop() }
             }
         }
@@ -1578,6 +1600,7 @@ final class PeerRelayWorkspaceWindowController: NSWindowController, NSWindowDele
     ) async {
         if let slot = await spawnPaneSlotTolerant(pane, surfaceInfo: surfaceInfo) {
             panesBySurfaceID[surfaceID] = slot
+            Self.relaySurfacesByID[surfaceID] = slot.surface
         }
     }
 
