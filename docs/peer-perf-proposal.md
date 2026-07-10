@@ -635,3 +635,32 @@ relay 창이 열려 attach된 채로 입출력이 전혀 없는 상태에서도 
 | C16 | R2가 명시적으로 기각 결론 — vim 등 TUI 오표시 위험이 실증된 버그 패턴(vim ESC freeze)과 정확히 겹치고 CONTEXT[C2] 버전 사각지대까지 상속. t3 신규발견(client 100ms+host 120ms 이중 ESC 홀드)이 "client가 host보다 적은 정보로 더 빨리 판단해야 하는" 구조적 어려움을 실증 | (a) TUI를 감지 가능한 좁은 컨텍스트로 스코프 제한 + (b) mosh 스타일 "미확정 문자 시각적 구분+정정" UI를 레이턴시 완화책이 아닌 별도 제품기능 프로젝트로 설계할 경우에 한해 재검토 |
 | C19 | R11(draft.md 189행 부근, §분석 t4)이 이미 "채택 — 2단계"로 결정하며 문서화된 전체 배압 정책(unacked_bytes>8MiB+ERR_INTERNAL+GridSnapshot 재요청)은 "이번 제안서 범위 밖 후속 프로젝트로 분리"를 명시. P9(C17+R11 2단계 자동재스냅샷)의 경량 대안으로 이미 대체됨. C20의 하드 선행조건 대상도 아님(매트릭스 C19 비고) | P9의 경량 자동재스냅샷 운영 중 한계가 드러나거나, P3(C20) 완료 후 완전한 배압 프로토콜이 실제로 필요해지면 재검토 |
 | C21 | matrix가 이미 "조사 필요 카테고리로 하향"으로 판단 — C4와 동일한 FFI(cell-level grid export) 불확실성을 상속, R4 원문이 "후보1·2(C15/C3) 어느 쪽도 리사이즈를 해결 못 하며 후보3만이 유일한 해"라 명시 | cell-level grid export API(libghostty FFI) 존재 확인 후, 또는 단기 완화(코얼레싱 윈도우 조정, effort S)만이라도 P4 적용 후 별도 검토 가능 |
+
+---
+
+## 부록D — 구현 후 실측 발견 (2026-07-10, feat/peer-perf-p1-p7)
+
+P1-P7 구현 후 **실제 2-머신 peer 세션**(dev 맥 → `ssh -L` 터널 → 서브 맥의 Swift 호스트, Rust CLI 피어 클라이언트)으로 검증한 결과.
+
+### 라이브로 확인된 것
+- **P3 동작 확인**: 호스트가 `Hello.capabilities`로 `ptydata.coalesce.v1, replay.ring.v1`을 광고하고 클라이언트가 이를 파싱·표시. 4개 구현체 플러밍이 실제 와이어에서 왕복함.
+- **P4 메커니즘 동작 확인**: 뷰어가 이미 붙어 있는 상태에서 두 번째 attach → 링버퍼 원본 바이트(874B) 재생, SGR 색상 보존, 스냅샷 시그니처(`ESC[2J ESC[H`) 없음.
+
+### 발견된 간극 — P4가 단일 뷰어 첫 attach에서는 발동하지 않음
+
+| 상황 | 실측 결과 |
+|------|-----------|
+| 뷰어 1명이 붙어 있는 동안 2번째 attach | 버퍼 재생 (ANSI 보존) ✅ |
+| **뷰어 없는 surface에 처음 attach** | 스냅샷 폴백 (색 소실) ❌ |
+
+**원인**: `PtyTapHub`는 attach 시 생성되고 **마지막 detach에서 제거**되며 pty tap 콜백까지 해제된다(`Sources/GhosttyPaneSurfaceProvider.swift`의 `hubEmpty` 분기 → `ghostty_surface_clear_pty_data_callback` + `tapHubs.removeValue`). 따라서 링버퍼는 attach 중에만 채워지고, **유일한 뷰어가 붙는 순간 버퍼는 항상 비어 있다**.
+
+probe 기반 e2e(`tests_v2/test_peer_attach_replay.py`)가 이 간극을 놓친 이유: 테스트가 출력 생성 전에 `debug.peer.replay_probe`로 hub를 의도적으로 arm한다(테스트 주석에 명시). 실사용 경로에는 그 arm 단계가 없다.
+
+**회귀는 아님**: base(0fd6bd97)는 모든 attach가 스냅샷이었으므로 브랜치가 더 나빠진 경우는 없다. 멀티뷰어·형제 재접속에서는 개선된다.
+
+### 후속 과제 (P4 2단계 후보와 별개)
+1. **hub 유지** — 마지막 detach 후에도 hub+링버퍼를 유지(수명 = surface 또는 TTL). 재접속부터 색 보존. 단 `hubEmpty` 분기의 FIX A(pending escape tail 해제, 포인터 재사용 대비) 타이밍 재검토 필요.
+2. **사전 arm** — peer 서버 기동 시 모든 surface에 tap 설치. 최초 attach도 색 보존하나, 모든 pane의 PTY hot path에 64KB 링버퍼 적재 비용이 상시 발생 → 금지계약(F9 hot path) 감사 대상.
+
+두 방향 모두 PTY hot path를 건드리므로 별도 설계·감사 사이클을 권고한다.
