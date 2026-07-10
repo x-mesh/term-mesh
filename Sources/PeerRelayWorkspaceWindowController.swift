@@ -308,6 +308,13 @@ final class PeerRelayWorkspaceWindowController: NSWindowController, NSWindowDele
     private var subscriptionDemux: PeerSessionDemux?
     private var keyMonitor: Any?
     private var clickMonitor: Any?
+    /// P2: reclaims GPU resources (~40MB Metal swap chain per pane) for
+    /// every owned `TerminalSurface` while this window is occluded
+    /// (minimized, covered, another Space). Mirrors the workspace-
+    /// selection-driven pattern in `GhosttySurfaceScrollView.setVisibleInUI`,
+    /// which this window's panes bypass since they're created directly
+    /// rather than mounted through that portal.
+    private var occlusionObserver: NSObjectProtocol?
     /// surfaceID of the most recently mouse-down'd pane in this
     /// window. NSWindow.firstResponder doesn't always swing reliably
     /// when Ghostty surfaces sit inside an NSSplitView we built ourselves,
@@ -396,6 +403,14 @@ final class PeerRelayWorkspaceWindowController: NSWindowController, NSWindowDele
         super.init(window: window)
         window.delegate = self
 
+        occlusionObserver = NotificationCenter.default.addObserver(
+            forName: NSWindow.didChangeOcclusionStateNotification,
+            object: window,
+            queue: .main
+        ) { [weak self] _ in
+            self?.updateRendererRealizedForOcclusion()
+        }
+
         let model = PeerRelayWorkspaceSidebarModel()
         model.workspaces = [PeerRelayWorkspaceSummary(
             id: self.workspaceID,
@@ -409,6 +424,32 @@ final class PeerRelayWorkspaceWindowController: NSWindowController, NSWindowDele
     }
 
     required init?(coder: NSCoder) { fatalError("not used") }
+
+    deinit {
+        if let occlusionObserver {
+            NotificationCenter.default.removeObserver(occlusionObserver)
+        }
+    }
+
+    /// P2: toggle every owned pane's renderer realization to match window
+    /// occlusion. Uses the debounced `setSurfaceVisibleForRenderer` (not
+    /// `setRendererRealized` directly) so a brief occlusion flap doesn't
+    /// thrash each pane's swap chain; becoming visible still realizes
+    /// immediately. Panes spawned while the window is already occluded
+    /// start realized (a fresh `TerminalSurface` defaults to realized) and
+    /// only reclaim on the next occlusion transition — acceptable for this
+    /// pass since it matches the existing workspace-selection pattern's
+    /// same characteristic.
+    private func updateRendererRealizedForOcclusion() {
+        guard let window else { return }
+        let visible = window.occlusionState.contains(.visible)
+        for slot in panesBySurfaceID.values {
+            slot.surface.setSurfaceVisibleForRenderer(visible)
+        }
+        #if DEBUG
+        dlog("relay.occlusion realized=\(visible ? 1 : 0) panes=\(panesBySurfaceID.count) kind=workspace")
+        #endif
+    }
 
     /// Attach an `PeerSSHTunnel` so the window observes its state and
     /// re-establishes the relay when the tunnel auto-restarts. Must be
@@ -634,6 +675,10 @@ final class PeerRelayWorkspaceWindowController: NSWindowController, NSWindowDele
             tunnel.onStateChange = nil
             tunnel.stop()
             sshTunnel = nil
+        }
+        if let occlusionObserver {
+            NotificationCenter.default.removeObserver(occlusionObserver)
+            self.occlusionObserver = nil
         }
         startTask?.cancel()
         startTask = nil

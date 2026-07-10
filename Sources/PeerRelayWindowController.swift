@@ -14,6 +14,7 @@
 
 import AppKit
 import SwiftUI
+import Bonsplit
 
 @MainActor
 final class PeerRelayWindowController: NSWindowController, NSWindowDelegate {
@@ -25,6 +26,13 @@ final class PeerRelayWindowController: NSWindowController, NSWindowDelegate {
     private var startTask: Task<Void, Never>?
     private var isClosing = false
     private var disconnectOverlay: NSView?
+    /// P2: reclaims the renderer's GPU resources (~40MB Metal swap chain)
+    /// while this window is occluded (minimized, covered, another Space),
+    /// mirroring the workspace-selection-driven pattern in
+    /// `GhosttySurfaceScrollView.setVisibleInUI`. Without this the relay
+    /// window's surface — created directly, not through the portal that
+    /// drives that pattern — never releases GPU memory in the background.
+    private var occlusionObserver: NSObjectProtocol?
 
     var onClose: (@MainActor () -> Void)?
 
@@ -101,9 +109,37 @@ final class PeerRelayWindowController: NSWindowController, NSWindowDelegate {
                 detail: "The peer relay closed. Close this window and reconnect from Connect to Peer."
             )
         }
+
+        occlusionObserver = NotificationCenter.default.addObserver(
+            forName: NSWindow.didChangeOcclusionStateNotification,
+            object: window,
+            queue: .main
+        ) { [weak self] _ in
+            self?.updateRendererRealizedForOcclusion()
+        }
     }
 
     required init?(coder: NSCoder) { fatalError("not used") }
+
+    deinit {
+        if let occlusionObserver {
+            NotificationCenter.default.removeObserver(occlusionObserver)
+        }
+    }
+
+    /// P2: toggle the surface's renderer realization to match window
+    /// occlusion. Uses the debounced `setSurfaceVisibleForRenderer` (not
+    /// `setRendererRealized` directly) so a brief occlusion flap — Mission
+    /// Control, a quick window drag over this one — doesn't thrash the
+    /// swap chain; becoming visible still realizes immediately.
+    private func updateRendererRealizedForOcclusion() {
+        guard let window else { return }
+        let visible = window.occlusionState.contains(.visible)
+        terminalSurface.setSurfaceVisibleForRenderer(visible)
+        #if DEBUG
+        dlog("relay.occlusion realized=\(visible ? 1 : 0) kind=pane")
+        #endif
+    }
 
     // ── Show ─────────────────────────────────────────────────────────
 
@@ -190,6 +226,10 @@ final class PeerRelayWindowController: NSWindowController, NSWindowDelegate {
     func windowWillClose(_ notification: Notification) {
         guard !isClosing else { return }
         isClosing = true
+        if let occlusionObserver {
+            NotificationCenter.default.removeObserver(occlusionObserver)
+            self.occlusionObserver = nil
+        }
         startTask?.cancel()
         startTask = nil
         let s = relaySession
