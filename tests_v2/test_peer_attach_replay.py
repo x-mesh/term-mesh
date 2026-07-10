@@ -70,6 +70,17 @@ def main() -> int:
                 f"marker {marker1!r} never echoed to the surface. "
                 f"screen:\n{c.read_terminal_text(sid1)}"
             )
+        # The render wait above can match the *typed command's echo* (which
+        # carries the marker as literal backslash-033 text) before the shell
+        # has executed printf. Poll the probe itself until the raw ESC byte
+        # from printf's OUTPUT lands in the ring buffer — only then are the
+        # style-preservation asserts meaningful. A timeout here means the
+        # buffer genuinely lost the escape (real P4 failure, not a race).
+        if not _wait(
+            lambda: "\x1b[31m" in str(c.replay_probe(sid1).get("bytes_text") or ""),
+            timeout_s=8,
+        ):
+            pass  # fall through — the asserts below produce the diagnostic
 
         probe1 = c.replay_probe(sid1)
         if probe1.get("ok") is not True:
