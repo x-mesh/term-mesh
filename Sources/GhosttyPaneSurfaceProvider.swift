@@ -35,10 +35,73 @@ private func ptyTapCallback(
 
 // MARK: - PtyTapHub
 
+/// Bounded recent-output history for attach-time ANSI-preserving replay
+/// (Phase P4). Ports the Rust `ReplayBuffer`
+/// (`daemon/term-meshd/src/peer/surface.rs:52-75`) 1:1 in cap and eviction
+/// semantics — "drop the oldest whole chunks until back under the byte
+/// cap" — so both implementations share identical truncation behavior.
+/// Chunks are stored with a lazily-compacted head index instead of
+/// `removeFirst()` per evict, so `push` stays O(1) amortized on both ends
+/// (no per-chunk element shift): required because `push` runs inside
+/// `PtyTapHub.broadcast(_:)`'s lock, called directly from Ghostty's IO
+/// reader thread (see file header — must be non-blocking).
+private struct ReplayBuffer {
+    private var chunks: [Data] = []
+    private var head: Int = 0
+    private(set) var totalBytes: Int = 0
+    /// Sticky once true: at least one chunk was evicted to stay under cap,
+    /// so the buffer can no longer certify it holds the surface's
+    /// *complete* output history. Never resets.
+    private(set) var hasEvicted: Bool = false
+
+    var isEmpty: Bool { head >= chunks.count }
+    var chunkCount: Int { chunks.count - head }
+
+    mutating func push(_ data: Data) {
+        guard !data.isEmpty else { return }
+        chunks.append(data)
+        totalBytes += data.count
+        while totalBytes > PtyTapHub.replayCapacityBytes, head < chunks.count {
+            totalBytes -= chunks[head].count
+            head += 1
+            hasEvicted = true
+        }
+        // Lazy compaction: reclaim consumed head slots once they dominate
+        // the backing array, so a long-lived surface's `chunks` array
+        // doesn't grow unboundedly even though live bytes stay capped.
+        // Threshold of 64 keeps this off the common path.
+        if head > 64, head * 2 > chunks.count {
+            chunks.removeFirst(head)
+            head = 0
+        }
+    }
+
+    /// Non-empty AND never evicted ⇒ certifiably the surface's complete
+    /// output history — safe to replay verbatim in place of a plain-text
+    /// snapshot. Deliberately conservative: reaching this exact byte cap
+    /// without ever evicting still reads as "safe" here (only an actual
+    /// eviction flips `hasEvicted`), which is fine — the eviction check is
+    /// the correctness boundary, not the byte count.
+    var isSafeForCompleteReplay: Bool { !isEmpty && !hasEvicted }
+
+    func concatenatedBytes() -> Data {
+        var out = Data()
+        out.reserveCapacity(totalBytes)
+        for i in head..<chunks.count { out.append(chunks[i]) }
+        return out
+    }
+}
+
 /// One Ghostty PTY callback per surface, fan-out to bounded per-peer streams.
 final class PtyTapHub: @unchecked Sendable {
+    /// Bytes of recent PTY output retained for attach-time replay. Mirrors
+    /// the Rust `REPLAY_CAPACITY_BYTES` constant exactly
+    /// (`daemon/term-meshd/src/peer/surface.rs:43`).
+    static let replayCapacityBytes = 64 * 1024
+
     private let lock = NSLock()
     private var continuations: [UUID: AsyncStream<Data>.Continuation] = [:]
+    private var replay = ReplayBuffer()
 
     let surfaceID: UUID
     let surfacePtr: ghostty_surface_t
@@ -86,11 +149,30 @@ final class PtyTapHub: @unchecked Sendable {
         // the per-chunk `Array(continuations.values)` allocation that
         // showed up on tail-following workloads (cat /dev/urandom etc.)
         // where the PTY callback fires thousands of times per second.
+        // Phase P4: `replay.push` joins the same lock scope — it's an
+        // O(1)-amortized Data append (+ occasional whole-chunk evict), so
+        // it doesn't change the non-blocking contract this scope already
+        // had to satisfy.
         lock.lock()
+        replay.push(bytes)
         for continuation in continuations.values {
             continuation.yield(bytes)
         }
         lock.unlock()
+    }
+
+    /// Attach-time replay decision (Phase P4): a locked snapshot of the
+    /// ring buffer's current state. Takes the same lock `broadcast(_:)`
+    /// pushes under, so this never races a concurrent PTY callback on
+    /// Ghostty's IO thread — the returned `bytes`/`chunkCount` are a
+    /// consistent point-in-time copy, not a torn read.
+    func replaySnapshot() -> (bytes: Data, chunkCount: Int, isSafeForCompleteReplay: Bool) {
+        lock.lock()
+        let bytes = replay.concatenatedBytes()
+        let chunkCount = replay.chunkCount
+        let safe = replay.isSafeForCompleteReplay
+        lock.unlock()
+        return (bytes, chunkCount, safe)
     }
 
     @discardableResult
@@ -170,13 +252,68 @@ final class GhosttyPaneSurfaceProvider: PeerSurfaceProvider {
         guard let (sfcPtr, ts) = findSurface(id: surfaceID)
         else { return nil }
 
-        // Send a snapshot of the current viewport so the relay window
-        // shows existing content immediately instead of starting blank.
-        // Yielded before the callback is registered so it's guaranteed
-        // to land before any new PTY bytes. ANSI styling is lost (text
-        // only); fullscreen TUIs (vim, less, htop) won't redraw without
-        // SIGWINCH and require manual refresh.
-        var snapshot = readPaneSnapshot(sfcPtr)
+        // Hub must exist before its replay buffer can be consulted below —
+        // a brand-new hub's buffer is trivially empty, which the mode
+        // decision already treats as a snapshot fallback, so creating it
+        // early (before computing `snapshot`) is safe.
+        let hub: PtyTapHub
+        if let existing = tapHubs[ts.id] {
+            hub = existing
+        } else {
+            hub = PtyTapHub(surfaceID: ts.id, surfacePtr: sfcPtr, surfaceRef: ts)
+            tapHubs[ts.id] = hub
+            // Register the C tap under renderer_state.mutex in Ghostty.
+            let hubPtr = Unmanaged.passUnretained(hub).toOpaque()
+            ghostty_surface_set_pty_data_callback(sfcPtr, ptyTapCallback, hubPtr)
+        }
+
+        // Phase P4: prefer the hub's ring-buffer replay (raw PTY bytes —
+        // ANSI/style preserved) over the plain-text viewport snapshot
+        // below, but ONLY when the buffer is certifiably the surface's
+        // *complete* output history (non-empty, never evicted anything to
+        // stay under the byte cap). A pane opened hours ago (vim/htop/log
+        // tail) can easily outlive the 64KB cap; replaying a buffer that
+        // already dropped its oldest bytes risks starting mid-escape-
+        // sequence or mid-frame — worse than the plain-text fallback.
+        // `readPaneSnapshot` reads Ghostty's live cell grid directly, so it
+        // stays coherent regardless of how long the pane has been open —
+        // the safe fallback whenever the buffer can't certify completeness.
+        //
+        // Known gap (dedup scope-out — matches why Rust's PtySurface
+        // carries a `byte_seq`): `hub.replaySnapshot()` below and
+        // `hub.makeStream()`'s continuation registration further down are
+        // two SEPARATE lock acquisitions, not one atomic step. Any
+        // `broadcast()` landing in the brief (synchronous, non-blocking)
+        // window between them is neither in this replay copy (already
+        // taken) nor delivered live (continuation not registered yet) —
+        // silently missed for this attach. Rust has the identical seam
+        // (`replay_snapshot()` and `subscribe()` are also two independent
+        // calls — daemon/term-meshd/src/peer/surface.rs:257-266), which is
+        // exactly why each chunk there carries a `byte_seq` for a future
+        // dedup/gap-fill pass. No *duplication* risk to a single new
+        // consumer either way: every byte in the replay copy already
+        // finished broadcasting (past tense — this consumer wasn't
+        // registered yet), so it can never also arrive live for it.
+        // Closing the gap itself (seq-tagged chunks + reconciliation) is
+        // out of scope for this phase.
+        let replaySnap = hub.replaySnapshot()
+        var snapshot: Data?
+        let usedBufferReplay: Bool
+        if replaySnap.isSafeForCompleteReplay {
+            snapshot = replaySnap.bytes
+            usedBufferReplay = true
+        } else {
+            // Send a snapshot of the current viewport so the relay window
+            // shows existing content immediately instead of starting
+            // blank. ANSI styling is lost (text only); fullscreen TUIs
+            // (vim, less, htop) won't redraw without SIGWINCH and require
+            // manual refresh.
+            snapshot = readPaneSnapshot(sfcPtr)
+            usedBufferReplay = false
+        }
+        #if DEBUG
+        dlog("peer.replay.attach mode=\(usedBufferReplay ? "buffer" : "snapshot") bytes=\(snapshot?.count ?? 0) chunks=\(replaySnap.chunkCount)")
+        #endif
 
         // Replay mouse-mode state the viewer missed. Apps that enabled
         // mouse reporting before this attach (Claude Code, vim, htop)
@@ -192,23 +329,14 @@ final class GhosttyPaneSurfaceProvider: PeerSurfaceProvider {
         // (1006). Attach-only on purpose: a later mode change on the
         // host streams through the tap, and the resize-path snapshot
         // re-send must not overwrite an exact mode (e.g. ?1003h) with
-        // this guess.
+        // this guess. Applies uniformly whether `snapshot` came from the
+        // buffer replay or the plain-text fallback above.
         if ghostty_surface_mouse_captured(sfcPtr) {
-            var replay = Data("\u{1b}[?1002h\u{1b}[?1006h".utf8)
-            if let existing = snapshot { replay.append(existing) }
-            snapshot = replay
+            var prefixed = Data("\u{1b}[?1002h\u{1b}[?1006h".utf8)
+            if let existing = snapshot { prefixed.append(existing) }
+            snapshot = prefixed
         }
 
-        let hub: PtyTapHub
-        if let existing = tapHubs[ts.id] {
-            hub = existing
-        } else {
-            hub = PtyTapHub(surfaceID: ts.id, surfacePtr: sfcPtr, surfaceRef: ts)
-            tapHubs[ts.id] = hub
-            // Register the C tap under renderer_state.mutex in Ghostty.
-            let hubPtr = Unmanaged.passUnretained(hub).toOpaque()
-            ghostty_surface_set_pty_data_callback(sfcPtr, ptyTapCallback, hubPtr)
-        }
         let (attachID, stream) = hub.makeStream(initialBytes: snapshot)
 
         // Light up the peer-attached ring on the host pane and bump
@@ -227,6 +355,15 @@ final class GhosttyPaneSurfaceProvider: PeerSurfaceProvider {
         // (broadcast from the first attach's redraw), so emitting
         // Ctrl-L on every attach would just stack form-feeds and
         // multiply the host's local flicker.
+        //
+        // Phase P4 note: this flag exists to compensate for the plain-text
+        // snapshot's lost styling. When `usedBufferReplay` was true above,
+        // `snapshot` already carries the surface's real ANSI bytes verbatim
+        // — the redraw this flag forces is largely redundant for that
+        // attach (though still harmless/off by default). Left as-is rather
+        // than conditioning on `usedBufferReplay`: this setting is a
+        // blanket host-visible-flicker tradeoff the user opts into, not a
+        // per-attach optimization worth the added branching here.
         if isFirstAttach && PeerFederationSettings.forceRedrawOnAttach {
             // Defer briefly so the snapshot lands first; the redraw
             // bytes that come back through the PTY tap will then
@@ -972,6 +1109,55 @@ private func peerEscapePrefixCouldComplete(_ tail: [UInt8]) -> Bool {
 @MainActor
 func debugInjectPeerInput(_ surface: ghostty_surface_t, bytes: Data) {
     sendPeerInputBytes(surface, bytes: bytes)
+}
+#endif
+
+#if DEBUG
+/// Debug/test-only extension backing `debug.peer.replay_probe` (Phase P4).
+/// Exercises the exact `PtyTapHub`/`ReplayBuffer` decision `attach()` uses
+/// so socket e2e can assert the buffer-vs-snapshot replay contract against a
+/// live surface's real ring-buffer state, without standing up a live 2-node
+/// peer session or a full `PeerSurfaceAttachment` (stream/input/resize/detach).
+extension GhosttyPaneSurfaceProvider {
+    /// Test-scoped singleton, deliberately separate from whatever
+    /// `GhosttyPaneSurfaceProvider` instance `PeerServerHost` creates for
+    /// real peer hosting (`Sources/PeerServerHost.swift:257`). Its own
+    /// `tapHubs` dict is what lets repeated `debug.peer.replay_probe` calls
+    /// against the same surface observe the same accumulating buffer across
+    /// separate socket round-trips — a fresh instance per call would
+    /// re-create (and so reset) the hub every time. No state is shared with
+    /// production hosting; this exists purely for the test probe.
+    static let debugProbeShared = GhosttyPaneSurfaceProvider()
+
+    /// Ensure a `PtyTapHub` exists for `surfaceID` (creating + wiring the C
+    /// PTY tap callback on first call — exactly `attach()`'s hub lookup — so
+    /// real PTY output starts accumulating into its replay buffer from that
+    /// point on), then report the same buffer-vs-snapshot decision
+    /// `attach()` consults via `PtyTapHub.replaySnapshot()`. Returns `nil`
+    /// when `surfaceID` doesn't resolve to a live surface (test-visible as
+    /// `{ok: false, error: "unknown_surface"}`, not an RPC-level error).
+    /// `text` is a best-effort lossy UTF-8 decode of the replayed bytes so a
+    /// caller can assert on actual content (e.g. a marker + its raw ANSI
+    /// escape survived), not just the byte count.
+    func debugReplayProbe(surfaceID: Data) -> (mode: String, bytes: Int, chunks: Int, text: String)? {
+        guard let (sfcPtr, ts) = findSurface(id: surfaceID) else { return nil }
+        let hub: PtyTapHub
+        if let existing = tapHubs[ts.id] {
+            hub = existing
+        } else {
+            hub = PtyTapHub(surfaceID: ts.id, surfacePtr: sfcPtr, surfaceRef: ts)
+            tapHubs[ts.id] = hub
+            let hubPtr = Unmanaged.passUnretained(hub).toOpaque()
+            ghostty_surface_set_pty_data_callback(sfcPtr, ptyTapCallback, hubPtr)
+        }
+        let snap = hub.replaySnapshot()
+        return (
+            mode: snap.isSafeForCompleteReplay ? "buffer" : "snapshot",
+            bytes: snap.bytes.count,
+            chunks: snap.chunkCount,
+            text: String(decoding: snap.bytes, as: UTF8.self)
+        )
+    }
 }
 #endif
 

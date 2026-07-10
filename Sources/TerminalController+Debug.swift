@@ -650,6 +650,40 @@ extension TerminalController {
         return out
     }
 
+    /// Test-only: arm (creating its `PtyTapHub` if needed) and/or query the
+    /// Phase P4 attach-time replay decision for a surface — see
+    /// `GhosttyPaneSurfaceProvider.debugReplayProbe`. The first call against
+    /// a given surface_id wires the real PTY tap callback so subsequent
+    /// output on that surface accumulates into the ring buffer; a later
+    /// call reports the current buffer-vs-snapshot mode. Uses the DEBUG-only
+    /// `GhosttyPaneSurfaceProvider.debugProbeShared` singleton (not
+    /// whatever provider `PeerServerHost` uses for real hosting) so the hub
+    /// persists across separate socket round-trips. params: `surface_id`.
+    /// Returns `{ok: true, mode, bytes, chunks, bytes_text}` or
+    /// `{ok: false, error: "unknown_surface"}` — an expected outcome here,
+    /// not an RPC-level error, mirroring `v2DebugPeerReadGrid`'s contract.
+    func v2DebugPeerReplayProbe(params: [String: Any]) -> V2CallResult {
+        guard let surfaceArg = v2String(params, "surface_id"),
+              let uuid = UUID(uuidString: surfaceArg) else {
+            return .err(code: "invalid_params", message: "Missing/invalid surface_id", data: nil)
+        }
+        let peerSurfaceID = withUnsafeBytes(of: uuid.uuid) { Data($0) }
+        var result: (mode: String, bytes: Int, chunks: Int, text: String)?
+        _ = v2MainExec(timeout: 5) {
+            result = GhosttyPaneSurfaceProvider.debugProbeShared.debugReplayProbe(surfaceID: peerSurfaceID)
+        }
+        guard let result else {
+            return .ok(["ok": false, "error": "unknown_surface"])
+        }
+        return .ok([
+            "ok": true,
+            "mode": result.mode,
+            "bytes": result.bytes,
+            "chunks": result.chunks,
+            "bytes_text": result.text,
+        ])
+    }
+
     func v2DebugFlashCount(params: [String: Any]) -> V2CallResult {
         guard let surfaceId = v2String(params, "surface_id") else {
             return .err(code: "invalid_params", message: "Missing surface_id", data: nil)

@@ -1133,6 +1133,26 @@ class termmesh:
             params["surface_id"] = sid
         return dict(self._call("debug.peer.read_grid", params) or {})
 
+    def replay_probe(self, surface_id: Union[str, int, None] = None) -> dict:
+        """Arm and/or query the P4 attach-time replay decision for a surface
+        via `debug.peer.replay_probe` (DEBUG-only). The first call against a
+        given surface creates its PtyTapHub and wires the real PTY tap
+        callback, so output produced AFTER that first call accumulates into
+        the ring buffer; call again later to read the current
+        mode/bytes/chunks/bytes_text. `mode` is "buffer" when the surface's
+        complete output history since the probe first armed it fits under
+        the 64KB replay cap (ANSI/style-preserving replay), or "snapshot"
+        when it's empty or has overflowed the cap (plain-text fallback) --
+        the same decision `GhosttyPaneSurfaceProvider.attach()` makes for a
+        real peer attach. Returns the raw
+        {ok, mode, bytes, chunks, bytes_text} (or
+        {ok: False, error: "unknown_surface"}) payload as-is."""
+        sid = self._resolve_surface_id(surface_id)
+        params: Dict[str, Any] = {}
+        if sid:
+            params["surface_id"] = sid
+        return dict(self._call("debug.peer.replay_probe", params) or {})
+
     def screenshot(self, label: str = "") -> dict:
         params: Dict[str, Any] = {}
         if label:
