@@ -1153,6 +1153,18 @@ class termmesh:
             params["surface_id"] = sid
         return dict(self._call("debug.peer.replay_probe", params) or {})
 
+    def coalesce_probe(self) -> dict:
+        """Exercise the real `PtyDataCoalescer` (Phase P7) via
+        `debug.peer.coalesce_probe` (DEBUG-only). No live 2-node peer
+        session required -- the probe submits synthetic, precisely-timed
+        chunks directly to the same production coalescer type
+        `pumpByteStream` uses. Returns a dict with keys `burst`,
+        `isolated`, `capped`, each `{chunks_submitted, frames_sent,
+        bytes_total, max_frame_bytes}` -- see
+        `TerminalController+Debug.swift`'s `v2DebugPeerCoalesceProbe` for
+        the exact per-scenario timing/sizes."""
+        return dict(self._call("debug.peer.coalesce_probe", {}) or {})
+
     def screenshot(self, label: str = "") -> dict:
         params: Dict[str, Any] = {}
         if label:

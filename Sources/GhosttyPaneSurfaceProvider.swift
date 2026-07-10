@@ -102,6 +102,15 @@ final class PtyTapHub: @unchecked Sendable {
     private let lock = NSLock()
     private var continuations: [UUID: AsyncStream<Data>.Continuation] = [:]
     private var replay = ReplayBuffer()
+    /// Cumulative count of `broadcast()` yields dropped by ANY consumer's
+    /// `bufferingNewest(256)` stream (a slow/stalled peer's buffer
+    /// overflowing while PTY output keeps arriving). `AsyncStream`
+    /// silently overwrites on overflow, but `Continuation.yield(_:)`'s
+    /// `YieldResult` DOES report `.dropped` per call — this counts that
+    /// directly rather than approximating via a separate push/consume
+    /// tally (R11 phase 1: counter + dlog; phase 2 auto-resnapshot is
+    /// out of scope here).
+    private var dropCount: UInt64 = 0
 
     let surfaceID: UUID
     let surfacePtr: ghostty_surface_t
@@ -152,13 +161,26 @@ final class PtyTapHub: @unchecked Sendable {
         // Phase P4: `replay.push` joins the same lock scope — it's an
         // O(1)-amortized Data append (+ occasional whole-chunk evict), so
         // it doesn't change the non-blocking contract this scope already
-        // had to satisfy.
+        // had to satisfy. Phase P7/R11: checking `yield`'s `YieldResult`
+        // for `.dropped` is the same O(1)-per-consumer shape this loop
+        // already had; the actual `dlog` call (I/O-adjacent) is deferred
+        // until after `unlock()` below so logging never happens while
+        // holding the lock, even though drops are expected to be rare.
         lock.lock()
         replay.push(bytes)
+        var droppedCount: UInt64?
         for continuation in continuations.values {
-            continuation.yield(bytes)
+            if case .dropped = continuation.yield(bytes) {
+                dropCount &+= 1
+                droppedCount = dropCount
+            }
         }
         lock.unlock()
+        #if DEBUG
+        if let droppedCount {
+            dlog("peer.broadcast.drop count=\(droppedCount) surface=\(surfaceID.uuidString.prefix(8))")
+        }
+        #endif
     }
 
     /// Attach-time replay decision (Phase P4): a locked snapshot of the

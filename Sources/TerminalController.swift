@@ -1218,6 +1218,8 @@ class TerminalController {
             return v2Result(id: id, self.v2DebugPeerReadGrid(params: params))
         case "debug.peer.replay_probe":
             return v2Result(id: id, self.v2DebugPeerReplayProbe(params: params))
+        case "debug.peer.coalesce_probe":
+            return v2Result(id: id, self.v2DebugPeerCoalesceProbe(params: params))
         case "debug.panel_snapshot":
             return v2Result(id: id, self.v2DebugPanelSnapshot(params: params))
         case "debug.panel_snapshot.reset":
@@ -1437,6 +1439,7 @@ class TerminalController {
             "debug.peer.inject_input",
             "debug.peer.read_grid",
             "debug.peer.replay_probe",
+            "debug.peer.coalesce_probe",
             "debug.panel_snapshot",
             "debug.panel_snapshot.reset",
             "debug.window.screenshot",

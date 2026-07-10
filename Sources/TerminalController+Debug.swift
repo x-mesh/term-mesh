@@ -15,6 +15,40 @@ private final class PeerDemuxProbeResult: @unchecked Sendable {
     var aCount: Int = 0
     var bCount: Int = 0
 }
+
+/// One scenario's outcome for `v2DebugPeerCoalesceProbe` (Phase P7).
+private struct CoalesceScenarioResult {
+    var chunksSubmitted: Int
+    var framesSent: Int
+    var bytesTotal: Int
+    var maxFrameBytes: Int
+}
+
+/// Mutable result box for `v2DebugPeerCoalesceProbe`, filled by a
+/// detached probe Task and read after a semaphore hand-off (same shape
+/// as `PeerDemuxProbeResult` above). `@unchecked Sendable` because the
+/// semaphore serialises the single writer → single reader.
+private final class CoalesceProbeResult: @unchecked Sendable {
+    var burst: CoalesceScenarioResult?
+    var isolated: CoalesceScenarioResult?
+    var capped: CoalesceScenarioResult?
+}
+
+/// Thread-safe call counter for `v2DebugPeerCoalesceProbe`'s synthetic
+/// `PtyDataCoalescer.send` closures. `@unchecked Sendable` — all mutation
+/// goes through `lock`.
+private final class CoalesceProbeCounter: @unchecked Sendable {
+    private let lock = NSLock()
+    private(set) var frames = 0
+    private(set) var bytes = 0
+    private(set) var maxFrame = 0
+    func record(_ n: Int) {
+        lock.lock(); defer { lock.unlock() }
+        frames += 1
+        bytes += n
+        maxFrame = max(maxFrame, n)
+    }
+}
 #endif
 
 extension TerminalController {
@@ -682,6 +716,93 @@ extension TerminalController {
             "chunks": result.chunks,
             "bytes_text": result.text,
         ])
+    }
+
+    /// Test-only: exercises the real `PtyDataCoalescer` (Phase P7) with
+    /// synthetic, precisely-timed chunk submissions. `pumpByteStream`'s
+    /// owning `PeerServerSession` actor is package-internal to PeerProto
+    /// (and there is no live 2-node peer session in this test environment
+    /// either way), so this drives the exact same production
+    /// `PtyDataCoalescer` type `pumpByteStream` uses directly — mirrors
+    /// `debug.peer.demux_probe`'s approach of exercising a real PeerProto
+    /// type with synthetic input rather than a live session.
+    ///
+    /// Runs three fixed scenarios, each against a fresh coalescer:
+    ///   burst:    5x 100-byte chunks ~1ms apart (all inside the 6ms
+    ///             default window) -> expect fewer frames sent than
+    ///             chunks submitted (coalescing merged them).
+    ///   isolated: 3x 50-byte chunks ~30ms apart (each outside the 6ms
+    ///             window, with margin for scheduling jitter) -> expect
+    ///             one frame per chunk (leading-edge sends every isolated
+    ///             write immediately, no merging).
+    ///   capped:   12x 8KB chunks back-to-back (~0.5ms apart, ~96KB
+    ///             total -- comfortably over the 64KB default cap within
+    ///             a single window) -> expect the byte cap to force a
+    ///             flush before the window would otherwise elapse, and no
+    ///             single sent frame to exceed the cap.
+    /// Returns each scenario's chunk/frame counts + byte totals so the
+    /// caller asserts merging occurred where expected (or correctly
+    /// didn't for isolated writes).
+    func v2DebugPeerCoalesceProbe(params: [String: Any]) -> V2CallResult {
+        let box = CoalesceProbeResult()
+        let sem = DispatchSemaphore(value: 0)
+        Task.detached {
+            box.burst = await Self.runCoalesceScenario(chunkCount: 5, chunkSize: 100, gapNs: 1_000_000)
+            box.isolated = await Self.runCoalesceScenario(chunkCount: 3, chunkSize: 50, gapNs: 30_000_000)
+            box.capped = await Self.runCoalesceScenario(chunkCount: 12, chunkSize: 8 * 1024, gapNs: 500_000)
+            sem.signal()
+        }
+        if sem.wait(timeout: .now() + 10) == .timedOut {
+            return .err(code: "internal_error", message: "coalesce probe timed out", data: nil)
+        }
+        guard let burst = box.burst, let isolated = box.isolated, let capped = box.capped else {
+            return .err(code: "internal_error", message: "coalesce probe produced no result", data: nil)
+        }
+        func encode(_ r: CoalesceScenarioResult) -> [String: Any] {
+            [
+                "chunks_submitted": r.chunksSubmitted,
+                "frames_sent": r.framesSent,
+                "bytes_total": r.bytesTotal,
+                "max_frame_bytes": r.maxFrameBytes,
+            ]
+        }
+        return .ok([
+            "ok": true,
+            "burst": encode(burst),
+            "isolated": encode(isolated),
+            "capped": encode(capped),
+        ])
+    }
+
+    /// Submits `chunkCount` synthetic chunks of `chunkSize` bytes to a
+    /// fresh `PtyDataCoalescer`, `gapNs` apart, then flushes and reports
+    /// how many frames the coalescer actually sent.
+    private static func runCoalesceScenario(
+        chunkCount: Int,
+        chunkSize: Int,
+        gapNs: UInt64
+    ) async -> CoalesceScenarioResult {
+        let counter = CoalesceProbeCounter()
+        let coalescer = PtyDataCoalescer { payload, _ in
+            counter.record(payload.count)
+            return true
+        }
+        var seq: UInt64 = 0
+        for i in 0..<chunkCount {
+            let chunk = Data(repeating: UInt8(65 + (i % 26)), count: chunkSize)
+            await coalescer.submit(chunk, startSeq: seq)
+            seq &+= UInt64(chunk.count)
+            if i < chunkCount - 1 {
+                try? await Task.sleep(nanoseconds: gapNs)
+            }
+        }
+        await coalescer.flushRemaining()
+        return CoalesceScenarioResult(
+            chunksSubmitted: chunkCount,
+            framesSent: counter.frames,
+            bytesTotal: counter.bytes,
+            maxFrameBytes: counter.maxFrame
+        )
     }
 
     func v2DebugFlashCount(params: [String: Any]) -> V2CallResult {
