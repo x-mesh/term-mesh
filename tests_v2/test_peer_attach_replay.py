@@ -128,6 +128,16 @@ def main() -> int:
             raise termmeshError(
                 f"mass-output burst never completed. screen:\n{c.read_terminal_text(sid2)}"
             )
+        # Same echo-race as scenario 1: the render wait can match the typed
+        # command's echo (which contains done_marker) before `yes` has pushed
+        # a single byte through the tap. Poll the probe until the eviction
+        # actually flips the mode; a timeout means the cap/eviction logic
+        # genuinely failed and the assert below reports it.
+        if not _wait(
+            lambda: c.replay_probe(sid2).get("mode") == "snapshot",
+            timeout_s=15,
+        ):
+            pass  # fall through to the assert for the diagnostic
 
         probe2 = c.replay_probe(sid2)
         if probe2.get("ok") is not True:
