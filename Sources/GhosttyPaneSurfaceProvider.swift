@@ -1386,6 +1386,53 @@ private func sendPeerInputBytes(_ surface: ghostty_surface_t, bytes: Data, final
             return
         }
 
+        // SGR mouse WHEEL report (`\e[<btn;col;rowM`) from the viewer.
+        // The attach-time DECSET replay (48efa7cd) puts the viewer surface
+        // in captured mode, so its wheel arrives here as SGR press
+        // reports — which the unrecognized-CSI branch below silently
+        // dropped: the reason peer viewers still could not scroll
+        // Claude Code / vim even after the mode replay fix. There is no
+        // verbatim-byte-injection API, so re-dispatch each report through
+        // ghostty_surface_mouse_scroll: core then re-encodes for the host
+        // pane's REAL mouse state (exact tracking mode + encoding),
+        // falls back to alternate-scroll arrow keys, or scrolls the pane
+        // viewport — identical to a local wheel tick on the host pane.
+        // One report is fed as one non-precision tick so viewer and local
+        // scroll speeds match (Surface.zig scrollCallback normalizes a
+        // tick to one row before re-encoding). Click/motion reports still
+        // fall through to the drop branch below. Report coordinates are
+        // not forwarded: ghostty uses its last-known host-side cursor
+        // position, which is irrelevant for transcript scrolling and only
+        // matters for scrolling a specific split inside a remote TUI.
+        if byte == 0x1b, let wheel = peerSgrWheelReport(arr, start: i) {
+            // ghostty's SGR encoder drops wheel reports whose host-side
+            // mouse position sits outside the pane viewport
+            // (mouse_encode.zig posOutOfViewport) — true whenever the
+            // host user's real cursor hovers some other window. Warp the
+            // surface's cursor to the viewer-reported cell first so the
+            // re-encoded report survives that guard AND carries the cell
+            // the viewer actually scrolled over.
+            movePeerMouseToReportedCell(
+                surface, surfaceKey: surfaceKey, col: wheel.col, row: wheel.row)
+            // One incoming report must re-encode as exactly ONE outgoing
+            // report. The viewer's ghostty already applied
+            // mouse-scroll-multiplier when it turned the physical wheel
+            // tick into N reports; feeding a non-precision tick here would
+            // multiply again (multiplier² ≈ 9 rows per physical tick,
+            // observed live). The precision path (scroll_mods bit 0) takes
+            // raw pixels with a default multiplier of 1, so one cell's
+            // worth of pixels scrolls exactly one row.
+            let cellSize = ghostty_surface_size(surface)
+            let dy = wheel.dy * Double(max(cellSize.cell_height_px, 1))
+            let dx = wheel.dx * Double(max(cellSize.cell_width_px, 1))
+            ghostty_surface_mouse_scroll(surface, dx, dy, 1)
+            #if DEBUG
+            dlog("peer.input.sgr_wheel dx=\(dx) dy=\(dy) cell=\(wheel.col),\(wheel.row)")
+            #endif
+            i += wheel.consumed
+            continue
+        }
+
         // Unrecognized CSI/OSC/SS3/SS2: DROP silently.
         //
         // Sending via sendPeerKeyEvent(text: ESC…) is broken for two reasons:
@@ -1569,6 +1616,104 @@ private func peerEscapeSequenceLength(_ bytes: [UInt8], start: Int) -> Int? {
     default:
         return nil
     }
+}
+
+/// Parse an SGR mouse WHEEL report (`\e[<Pb;Px;PyM`, the DECSET 1006
+/// encoding the attach-time mode replay advertises) beginning at `start`.
+/// Returns the consumed byte count plus one non-precision scroll tick for
+/// `ghostty_surface_mouse_scroll` — +y wheel-up / -y wheel-down and ±x for
+/// the horizontal pair, mirroring Surface.zig's four/five/six/seven encode
+/// directions so a report round-trips through the host at 1:1 speed.
+/// Non-wheel reports (click, motion — wheel bit 0x40 clear or motion bit
+/// 0x20 set), releases (`m`; wheels are press-only), and malformed or
+/// frame-split sequences return nil: the caller's generic unrecognized-CSI
+/// drop keeps consuming those, and FIX B's tail deferral reassembles the
+/// split heads before this parser ever sees them.
+private func peerSgrWheelReport(
+    _ bytes: [UInt8],
+    start: Int
+) -> (dx: Double, dy: Double, col: Int, row: Int, consumed: Int)? {
+    guard start + 2 < bytes.count,
+          bytes[start] == 0x1b,
+          bytes[start + 1] == 0x5b, // '['
+          bytes[start + 2] == 0x3c  // '<'
+    else { return nil }
+    var i = start + 3
+    var params: [Int] = []
+    var current = 0
+    var hasDigit = false
+    while i < bytes.count, params.count < 3 {
+        let b = bytes[i]
+        switch b {
+        case 0x30...0x39:
+            current = current * 10 + Int(b - 0x30)
+            guard current <= 0xFFFF else { return nil }
+            hasDigit = true
+        case 0x3b: // ';'
+            guard hasDigit else { return nil }
+            params.append(current)
+            current = 0
+            hasDigit = false
+        case 0x4d: // 'M' — press-type report
+            guard hasDigit else { return nil }
+            params.append(current)
+            guard params.count == 3 else { return nil }
+            let btn = params[0]
+            guard btn & 0x40 != 0, btn & 0x20 == 0 else { return nil }
+            let consumed = i - start + 1
+            let col = params[1]
+            let row = params[2]
+            switch btn & 0x03 {
+            case 0:  return (0, 1, col, row, consumed)  // wheel up    (button four)
+            case 1:  return (0, -1, col, row, consumed) // wheel down  (button five)
+            case 2:  return (1, 0, col, row, consumed)  // wheel left  (button six)
+            default: return (-1, 0, col, row, consumed) // wheel right (button seven)
+            }
+        default:
+            return nil
+        }
+        i += 1
+    }
+    return nil
+}
+
+/// Warp the host surface's cursor position to the center of the 1-based
+/// cell a viewer's SGR wheel report named, expressed in the surface view's
+/// point coordinates (top-left origin — the same convention the local
+/// mouse handlers use via `bounds.height - point.y`). Clamped into the
+/// view so an out-of-range report still lands inside the viewport. Best
+/// effort: when the surface is no longer registered (detached mid-frame)
+/// the warp is skipped and the report may be dropped by the encoder's
+/// out-of-viewport guard — the pre-fix behavior.
+@MainActor
+private func movePeerMouseToReportedCell(
+    _ surface: ghostty_surface_t,
+    surfaceKey: UInt,
+    col: Int,
+    row: Int
+) {
+    let size = ghostty_surface_size(surface)
+    guard size.width_px > 0, size.height_px > 0,
+          size.cell_width_px > 0, size.cell_height_px > 0 else { return }
+    // ghostty_surface_mouse_pos takes view POINTS (the embedded apprt
+    // multiplies by the content scale on the way in), but a peer-attached
+    // pane can be a background tab whose view has no laid-out bounds, so
+    // derive points from the surface's own pixel dimensions and the
+    // display scale instead of the view frame. Same-source consistency:
+    // the app feeds ghostty_surface_set_content_scale from the identical
+    // window/screen backingScaleFactor chain.
+    let window = peerSurfaceRefForKey[surfaceKey]?.value?.hostedView.window
+    let scale = max(
+        1.0,
+        window?.backingScaleFactor ?? NSScreen.main?.backingScaleFactor ?? 2.0
+    )
+    let cellW = CGFloat(size.cell_width_px) / scale
+    let cellH = CGFloat(size.cell_height_px) / scale
+    let maxX = CGFloat(size.width_px) / scale - 1
+    let maxY = CGFloat(size.height_px) / scale - 1
+    let x = min(max((CGFloat(col) - 0.5) * cellW, 0), maxX)
+    let y = min(max((CGFloat(row) - 0.5) * cellH, 0), maxY)
+    ghostty_surface_mouse_pos(surface, Double(x), Double(y), GHOSTTY_MODS_NONE)
 }
 
 private func peerCsiKeySequence(
