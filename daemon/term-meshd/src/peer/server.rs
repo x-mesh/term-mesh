@@ -1425,4 +1425,260 @@ mod integration_tests {
         shutdown_tx.send(true).unwrap();
         let _ = tokio::time::timeout(std::time::Duration::from_secs(3), server_task).await;
     }
+
+    /// Attach-time mode replay (peer-headless-mode-replay): when the PTY
+    /// already has mouse-tracking DECSET modes active before a client ever
+    /// attaches, `spawn_attach_relay` (connection.rs) must inject those
+    /// DECSET bytes as the very first PtyData frame, ahead of the replay
+    /// snapshot. Otherwise a viewer that attaches late never sees the
+    /// enabling escape and mouse/scroll routing silently breaks. Modes are
+    /// observed by `QueryFilter` in the PTY reader loop and mirrored into
+    /// `PtySurface::modes` (surface.rs); `mode_replay_bytes()` serializes
+    /// them back out in ascending order for the prefix frame.
+    #[tokio::test]
+    async fn attach_replays_active_mode_prefix_before_snapshot() {
+        let tmp = TempDir::new().unwrap();
+        let sock_path = tmp.path().join("peer.sock");
+
+        const MARKER: &[u8] = b"MODEMARKER-preattach";
+        // 1002 = button-event mouse tracking, 1006 = SGR extended
+        // coordinates -- both are in QueryFilter's tracked-mode set, and
+        // BTreeSet iteration order in mode_replay_bytes() matches the
+        // ascending order the child sets them in here.
+        const MODE_PREFIX: &[u8] = b"\x1b[?1002h\x1b[?1006h";
+
+        let manager = Arc::new(PtyManager::new());
+        let surface = PtySurface::spawn(
+            surface_id_from_name("mode-preattach"),
+            "mode-preattach".into(),
+            "/bin/sh",
+            &[
+                "-c",
+                "printf '\\033[?1002h\\033[?1006h'; printf 'MODEMARKER-preattach'; sleep 5",
+            ],
+            80,
+            24,
+            None,
+        )
+        .expect("spawn mode-preattach surface");
+
+        // Poll until both the DECSET pair has been observed by QueryFilter
+        // (mode_replay_bytes non-empty) AND the marker has landed in the
+        // replay snapshot. These two printf calls usually land in the same
+        // read() as one chunk, but nothing guarantees that, so poll for
+        // both independently rather than assuming a single-chunk race.
+        for _ in 0..100 {
+            let modes_ready = !surface.mode_replay_bytes().is_empty();
+            let marker_ready = surface
+                .replay_snapshot()
+                .iter()
+                .flat_map(|chunk| chunk.bytes.iter().copied())
+                .collect::<Vec<_>>()
+                .windows(MARKER.len())
+                .any(|w| w == MARKER);
+            if modes_ready && marker_ready {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(
+            !surface.mode_replay_bytes().is_empty(),
+            "mode was never observed by QueryFilter before insert"
+        );
+        manager.insert_surface(surface);
+
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let sp_task = sock_path.clone();
+        let server_task = tokio::spawn(async move {
+            serve_with_manager(sp_task, shutdown_rx, manager)
+                .await
+                .unwrap();
+        });
+
+        for _ in 0..50 {
+            if sock_path.exists() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+
+        let (mut reader, writer, _surface_id) = attach_one(&sock_path, "mode-replay-test").await;
+
+        // Collect every PtyData frame after attach (ignoring the
+        // WorkspaceUpdate.meta push that precedes them), tracking each
+        // frame's byte_seq, until the marker shows up in the concatenated
+        // payload bytes.
+        let mut frames: Vec<(u64, Vec<u8>)> = Vec::new();
+        let mut aggregated = Vec::<u8>::new();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            let env = match tokio::time::timeout(remaining, read_envelope(&mut reader)).await {
+                Ok(Ok(e)) => e,
+                _ => break,
+            };
+            if let Some(Payload::PtyData(p)) = env.payload {
+                aggregated.extend_from_slice(&p.payload);
+                frames.push((p.byte_seq, p.payload));
+                if aggregated.windows(MARKER.len()).any(|w| w == MARKER) {
+                    break;
+                }
+            }
+        }
+        assert!(
+            aggregated.windows(MARKER.len()).any(|w| w == MARKER),
+            "marker never arrived after attach; saw {} PtyData frame(s)",
+            frames.len()
+        );
+
+        // The mode prefix must precede the marker in what the client
+        // actually received. We check first-occurrence index rather than
+        // "is it the first frame's content" because the snapshot chunk
+        // itself still carries the *original*, unstripped DECSET bytes the
+        // child wrote (QueryFilter only strips terminal queries, not mode
+        // toggles) -- so the prefix can legitimately appear a second time
+        // inside the snapshot. Since the injected prefix frame is always
+        // enqueued before the snapshot chunks, the first occurrence must be
+        // the injected one.
+        let prefix_idx = aggregated
+            .windows(MODE_PREFIX.len())
+            .position(|w| w == MODE_PREFIX)
+            .expect("mode prefix bytes never appeared in attach stream");
+        let marker_idx = aggregated
+            .windows(MARKER.len())
+            .position(|w| w == MARKER)
+            .expect("marker bytes never appeared in attach stream");
+        assert!(
+            prefix_idx < marker_idx,
+            "mode prefix (idx {prefix_idx}) did not precede marker (idx {marker_idx})"
+        );
+
+        // byte_seq continuity: the first PtyData frame on attach starts at
+        // 0 (spawn_attach_relay's attach_seq), and each subsequent frame's
+        // byte_seq matches the accumulated payload length so far.
+        assert_eq!(
+            frames.first().map(|(seq, _)| *seq),
+            Some(0),
+            "first PtyData frame on attach must start at byte_seq 0"
+        );
+        let mut running = 0u64;
+        for (seq, payload) in &frames {
+            assert_eq!(
+                *seq, running,
+                "byte_seq gap/overlap detected in attach frame sequence"
+            );
+            running += payload.len() as u64;
+        }
+
+        drop(reader);
+        drop(writer);
+        shutdown_tx.send(true).unwrap();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(3), server_task).await;
+    }
+
+    /// Companion to `attach_replays_active_mode_prefix_before_snapshot`: a
+    /// surface whose child never toggles a tracked mouse mode must NOT get
+    /// an injected mode-prefix frame at all -- the first PtyData frame on
+    /// attach is just the ordinary snapshot/live output, with no leading
+    /// `ESC[?` bytes.
+    #[tokio::test]
+    async fn attach_omits_mode_prefix_for_plain_shell() {
+        let tmp = TempDir::new().unwrap();
+        let sock_path = tmp.path().join("peer.sock");
+
+        const MARKER: &[u8] = b"PLAINMARKER-nomodes";
+
+        let manager = Arc::new(PtyManager::new());
+        let surface = PtySurface::spawn(
+            surface_id_from_name("plain-shell"),
+            "plain-shell".into(),
+            "/bin/sh",
+            &["-c", "printf 'PLAINMARKER-nomodes'; sleep 5"],
+            80,
+            24,
+            None,
+        )
+        .expect("spawn plain-shell surface");
+
+        for _ in 0..50 {
+            let replay_ready = surface
+                .replay_snapshot()
+                .iter()
+                .flat_map(|chunk| chunk.bytes.iter().copied())
+                .collect::<Vec<_>>()
+                .windows(MARKER.len())
+                .any(|w| w == MARKER);
+            if replay_ready {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(
+            surface.mode_replay_bytes().is_empty(),
+            "plain shell must not have any tracked mode active before attach"
+        );
+        manager.insert_surface(surface);
+
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let sp_task = sock_path.clone();
+        let server_task = tokio::spawn(async move {
+            serve_with_manager(sp_task, shutdown_rx, manager)
+                .await
+                .unwrap();
+        });
+
+        for _ in 0..50 {
+            if sock_path.exists() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+
+        let (mut reader, writer, _surface_id) =
+            attach_one(&sock_path, "plain-shell-test").await;
+
+        // Capture the first PtyData frame's payload and keep draining until
+        // the marker arrives, mirroring `wait_for_marker`'s loop but also
+        // retaining the first frame for the no-prefix assertion below.
+        let mut first_pty_payload: Option<Vec<u8>> = None;
+        let mut aggregated = Vec::<u8>::new();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            let env = match tokio::time::timeout(remaining, read_envelope(&mut reader)).await {
+                Ok(Ok(e)) => e,
+                _ => break,
+            };
+            if let Some(Payload::PtyData(p)) = env.payload {
+                if first_pty_payload.is_none() {
+                    first_pty_payload = Some(p.payload.clone());
+                }
+                aggregated.extend_from_slice(&p.payload);
+                if aggregated.windows(MARKER.len()).any(|w| w == MARKER) {
+                    break;
+                }
+            }
+        }
+        assert!(
+            aggregated.windows(MARKER.len()).any(|w| w == MARKER),
+            "marker never arrived after attach"
+        );
+
+        let first_payload = first_pty_payload.expect("no PtyData frame arrived after attach");
+        assert!(
+            !first_payload.starts_with(b"\x1b[?"),
+            "unexpected mode-prefix escape on a surface with no active mode: {first_payload:?}"
+        );
+
+        drop(reader);
+        drop(writer);
+        shutdown_tx.send(true).unwrap();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(3), server_task).await;
+    }
 }

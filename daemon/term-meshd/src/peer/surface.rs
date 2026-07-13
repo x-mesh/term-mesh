@@ -8,7 +8,7 @@
 //! we eagerly spawn a single default surface running `$SHELL -l`, with
 //! a stable surface_id so clients can list + attach deterministically.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
@@ -19,7 +19,7 @@ use tokio::io::Interest;
 use tokio::sync::{broadcast, Notify};
 
 use super::pty;
-use super::query_filter::QueryFilter;
+use super::query_filter::{ModeEvent, QueryFilter};
 
 /// Wrapper so a PTY master fd can be handed to `AsyncFd::new` without
 /// implying ownership — closing the fd is the surface's Drop's job.
@@ -97,6 +97,11 @@ pub struct PtySurface {
     /// bytes against live broadcast bytes at attach time.
     byte_seq: AtomicU64,
     replay: Mutex<ReplayBuffer>,
+    /// DEC private (mouse-tracking) modes currently enabled on this PTY,
+    /// mirrored from DECSET/DECRST bytes observed by the reader loop.
+    /// Exists for attach-time mode replay: a relay that attaches after the
+    /// PTY already toggled mouse reporting on needs to be told so too.
+    modes: Mutex<BTreeSet<u16>>,
     master_fd: RawFd,
     pid: libc::pid_t,
 }
@@ -135,6 +140,7 @@ impl PtySurface {
             dead_notify: Notify::new(),
             byte_seq: AtomicU64::new(0),
             replay: Mutex::new(ReplayBuffer::default()),
+            modes: Mutex::new(BTreeSet::new()),
             master_fd: child.master_fd,
             pid: child.pid,
         });
@@ -211,7 +217,7 @@ impl PtySurface {
                         break;
                     }
                     Ok(Ok(n)) => {
-                        let (bytes, responses) = filter.process(&buf[..n]);
+                        let (bytes, responses, mode_events) = filter.process(&buf[..n]);
                         if !responses.is_empty() {
                             // Synthesised reply to a terminal query
                             // (DA1/DA2/DSR/OSC 10·11). Write back to the
@@ -222,6 +228,23 @@ impl PtySurface {
                                     "query reply write failed on surface {:?}: {e}",
                                     hex_short(&reader_surface.surface_id)
                                 );
+                            }
+                        }
+                        if !mode_events.is_empty() {
+                            // Only take the lock when a mode actually
+                            // transitioned — most PTY output carries no
+                            // DECSET/DECRST, so the hot path stays lock-free.
+                            if let Ok(mut modes) = reader_surface.modes.lock() {
+                                for event in mode_events {
+                                    match event {
+                                        ModeEvent::Set(mode) => {
+                                            modes.insert(mode);
+                                        }
+                                        ModeEvent::Reset(mode) => {
+                                            modes.remove(&mode);
+                                        }
+                                    }
+                                }
                             }
                         }
                         if bytes.is_empty() {
@@ -263,6 +286,23 @@ impl PtySurface {
             .lock()
             .map(|replay| replay.snapshot())
             .unwrap_or_default()
+    }
+
+    /// Serializes currently-active tracked modes (mouse-tracking DECSET) as
+    /// `ESC[?{mode}h` sequences in ascending numeric order — free thanks to
+    /// `BTreeSet`'s ordering. Used for attach-time mode replay so a relay
+    /// that attaches after the PTY already toggled a mode on isn't left
+    /// out of sync. Empty when no tracked mode is currently active.
+    pub fn mode_replay_bytes(&self) -> Vec<u8> {
+        let modes = match self.modes.lock() {
+            Ok(modes) => modes,
+            Err(_) => return Vec::new(),
+        };
+        let mut out = Vec::with_capacity(modes.len() * 8);
+        for mode in modes.iter() {
+            out.extend_from_slice(format!("\x1B[?{mode}h").as_bytes());
+        }
+        out
     }
 
     pub fn write_all(&self, bytes: &[u8]) -> std::io::Result<()> {
@@ -510,4 +550,53 @@ fn spawn_from_spec(surface_id: &[u8], spec: &SpawnSpec) -> std::io::Result<Arc<P
 fn hex_short(bytes: &[u8]) -> String {
     let n = bytes.len().min(4);
     bytes[..n].iter().map(|b| format!("{b:02x}")).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `/bin/cat` is a lightweight, deterministic long-lived child — same
+    /// pattern used by `peer::server`'s `cat_manager()` test helper. We
+    /// only need a real `PtySurface` to exercise `modes`/`mode_replay_bytes`;
+    /// no PTY I/O is involved in these tests.
+    fn cat_surface() -> Arc<PtySurface> {
+        PtySurface::spawn(
+            surface_id_from_name("mode-replay-test"),
+            "cat".into(),
+            "/bin/cat",
+            &[],
+            80,
+            24,
+            None,
+        )
+        .expect("spawn /bin/cat")
+    }
+
+    #[tokio::test]
+    async fn mode_replay_bytes_serializes_ascending() {
+        let surface = cat_surface();
+        {
+            // Insert out of numeric order to prove BTreeSet ordering,
+            // not insertion order, drives the serialized sequence.
+            let mut modes = surface.modes.lock().unwrap();
+            modes.insert(1006);
+            modes.insert(1002);
+        }
+        assert_eq!(
+            surface.mode_replay_bytes(),
+            b"\x1B[?1002h\x1B[?1006h".to_vec()
+        );
+    }
+
+    #[tokio::test]
+    async fn mode_replay_bytes_empty_after_reset() {
+        let surface = cat_surface();
+        {
+            let mut modes = surface.modes.lock().unwrap();
+            modes.insert(1000);
+            modes.remove(&1000);
+        }
+        assert!(surface.mode_replay_bytes().is_empty());
+    }
 }

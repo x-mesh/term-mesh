@@ -17,6 +17,25 @@
 
 const MAX_PENDING: usize = 256;
 
+/// DEC private modes the peer relay cares about (mouse-tracking
+/// protocols). `CSI ? Pm h` (DECSET) and `CSI ? Pm l` (DECRST) toggle
+/// these; every other private mode is ignored.
+fn is_tracked_mode(mode: u16) -> bool {
+    matches!(mode, 1000 | 1002 | 1003 | 1005 | 1006 | 1015 | 1016)
+}
+
+/// A DECSET/DECRST transition for a mode the relay tracks (mouse
+/// reporting). Surfaced from `process()` alongside the filtered bytes
+/// so callers can mirror mouse-mode state without re-parsing the
+/// stream themselves.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModeEvent {
+    /// `CSI ? Pm h` — mode `Pm` enabled.
+    Set(u16),
+    /// `CSI ? Pm l` — mode `Pm` disabled.
+    Reset(u16),
+}
+
 #[derive(Debug)]
 enum State {
     Ground,
@@ -48,9 +67,14 @@ impl QueryFilter {
     /// - `out`: bytes safe to broadcast to clients (queries removed).
     /// - `responses`: bytes to write back to the PTY master so the
     ///   originating program sees a synthesized reply on its stdin.
-    pub fn process(&mut self, input: &[u8]) -> (Vec<u8>, Vec<u8>) {
+    /// - `mode_events`: DECSET/DECRST transitions for tracked mouse
+    ///   modes, in the order their terminating `h`/`l` byte completed
+    ///   reassembly. A sequence split across `process()` calls only
+    ///   yields its event(s) once the final byte lands.
+    pub fn process(&mut self, input: &[u8]) -> (Vec<u8>, Vec<u8>, Vec<ModeEvent>) {
         let mut out = Vec::with_capacity(input.len());
         let mut responses = Vec::new();
+        let mut mode_events = Vec::new();
 
         for &b in input {
             match self.state {
@@ -85,6 +109,13 @@ impl QueryFilter {
                             responses.extend_from_slice(reply);
                         } else {
                             out.extend_from_slice(&self.pending);
+                            // DECSET/DECRST are never intercepted above
+                            // (csi_query_reply only matches 'c'/'n'), so
+                            // this is the one place a fully-reassembled
+                            // mode toggle can be recognised — never on
+                            // the overflow-flush path below, which is
+                            // not a complete sequence.
+                            parse_mode_events(&self.pending, &mut mode_events);
                         }
                         self.pending.clear();
                         self.state = State::Ground;
@@ -142,7 +173,40 @@ impl QueryFilter {
             }
         }
 
-        (out, responses)
+        (out, responses, mode_events)
+    }
+}
+
+/// Recognises `CSI ? Pm h|l` (DECSET/DECRST) in a fully-reassembled CSI
+/// sequence and pushes a [`ModeEvent`] for each tracked mode among the
+/// (possibly `;`-separated) parameters. `pending` holds the full
+/// sequence: ESC '[' params... final. Non-DEC-private sequences
+/// (missing the leading `?`), non-`h`/`l` finals, and untracked modes
+/// are silently ignored — this only adds events, it never changes what
+/// the caller does with the bytes themselves.
+fn parse_mode_events(pending: &[u8], events: &mut Vec<ModeEvent>) {
+    if pending.len() < 3 {
+        return;
+    }
+    let final_byte = pending[pending.len() - 1];
+    let is_set = match final_byte {
+        b'h' => true,
+        b'l' => false,
+        _ => return,
+    };
+    let body = &pending[2..pending.len() - 1];
+    let Some(params) = body.strip_prefix(b"?") else {
+        return; // not a DEC private-mode sequence
+    };
+    for param in params.split(|&b| b == b';') {
+        // Non-numeric or out-of-u16-range parameters are ignored rather
+        // than treated as errors — a malformed/unknown param shouldn't
+        // stop the rest of the (independent) params from being parsed.
+        if let Ok(mode) = std::str::from_utf8(param).unwrap_or_default().parse::<u16>() {
+            if is_tracked_mode(mode) {
+                events.push(if is_set { ModeEvent::Set(mode) } else { ModeEvent::Reset(mode) });
+            }
+        }
     }
 }
 
@@ -204,14 +268,14 @@ fn osc_query_reply(body: &[u8]) -> Option<Vec<u8>> {
 mod tests {
     use super::*;
 
-    fn process(filter: &mut QueryFilter, input: &[u8]) -> (Vec<u8>, Vec<u8>) {
+    fn process(filter: &mut QueryFilter, input: &[u8]) -> (Vec<u8>, Vec<u8>, Vec<ModeEvent>) {
         filter.process(input)
     }
 
     #[test]
     fn passes_plain_text_unchanged() {
         let mut f = QueryFilter::default();
-        let (out, resp) = process(&mut f, b"hello world\n");
+        let (out, resp, _events) = process(&mut f, b"hello world\n");
         assert_eq!(out, b"hello world\n");
         assert!(resp.is_empty());
     }
@@ -220,7 +284,7 @@ mod tests {
     fn passes_non_query_csi_through() {
         let mut f = QueryFilter::default();
         // Cursor up — not a query.
-        let (out, resp) = process(&mut f, b"\x1B[2A");
+        let (out, resp, _events) = process(&mut f, b"\x1B[2A");
         assert_eq!(out, b"\x1B[2A");
         assert!(resp.is_empty());
     }
@@ -228,7 +292,7 @@ mod tests {
     #[test]
     fn intercepts_da1_no_param() {
         let mut f = QueryFilter::default();
-        let (out, resp) = process(&mut f, b"\x1B[c");
+        let (out, resp, _events) = process(&mut f, b"\x1B[c");
         assert!(out.is_empty(), "DA1 should be stripped");
         assert_eq!(resp, b"\x1B[?1;2c");
     }
@@ -236,7 +300,7 @@ mod tests {
     #[test]
     fn intercepts_da1_zero_param() {
         let mut f = QueryFilter::default();
-        let (out, resp) = process(&mut f, b"\x1B[0c");
+        let (out, resp, _events) = process(&mut f, b"\x1B[0c");
         assert!(out.is_empty());
         assert_eq!(resp, b"\x1B[?1;2c");
     }
@@ -244,7 +308,7 @@ mod tests {
     #[test]
     fn intercepts_da2() {
         let mut f = QueryFilter::default();
-        let (out, resp) = process(&mut f, b"\x1B[>c");
+        let (out, resp, _events) = process(&mut f, b"\x1B[>c");
         assert!(out.is_empty());
         assert_eq!(resp, b"\x1B[>1;95;0c");
     }
@@ -252,7 +316,7 @@ mod tests {
     #[test]
     fn intercepts_dsr_status() {
         let mut f = QueryFilter::default();
-        let (out, resp) = process(&mut f, b"\x1B[5n");
+        let (out, resp, _events) = process(&mut f, b"\x1B[5n");
         assert!(out.is_empty());
         assert_eq!(resp, b"\x1B[0n");
     }
@@ -260,7 +324,7 @@ mod tests {
     #[test]
     fn intercepts_dsr_cpr() {
         let mut f = QueryFilter::default();
-        let (out, resp) = process(&mut f, b"\x1B[6n");
+        let (out, resp, _events) = process(&mut f, b"\x1B[6n");
         assert!(out.is_empty());
         assert_eq!(resp, b"\x1B[1;1R");
     }
@@ -268,7 +332,7 @@ mod tests {
     #[test]
     fn intercepts_osc_11_with_bel() {
         let mut f = QueryFilter::default();
-        let (out, resp) = process(&mut f, b"\x1B]11;?\x07");
+        let (out, resp, _events) = process(&mut f, b"\x1B]11;?\x07");
         assert!(out.is_empty(), "OSC 11 query should be stripped");
         assert_eq!(resp, b"\x1B]11;rgb:1010/1414/1818\x07");
     }
@@ -276,7 +340,7 @@ mod tests {
     #[test]
     fn intercepts_osc_10_with_st() {
         let mut f = QueryFilter::default();
-        let (out, resp) = process(&mut f, b"\x1B]10;?\x1B\\");
+        let (out, resp, _events) = process(&mut f, b"\x1B]10;?\x1B\\");
         assert!(out.is_empty());
         assert_eq!(resp, b"\x1B]10;rgb:e5e5/e5e5/e5e5\x07");
     }
@@ -285,7 +349,7 @@ mod tests {
     fn passes_osc_set_through() {
         let mut f = QueryFilter::default();
         // Window title set — OSC 0;title BEL — should not be stripped.
-        let (out, resp) = process(&mut f, b"\x1B]0;hello\x07");
+        let (out, resp, _events) = process(&mut f, b"\x1B]0;hello\x07");
         assert_eq!(out, b"\x1B]0;hello\x07");
         assert!(resp.is_empty());
     }
@@ -293,10 +357,10 @@ mod tests {
     #[test]
     fn handles_query_split_across_chunks() {
         let mut f = QueryFilter::default();
-        let (o1, r1) = process(&mut f, b"abc\x1B[");
+        let (o1, r1, _events) = process(&mut f, b"abc\x1B[");
         assert_eq!(o1, b"abc");
         assert!(r1.is_empty());
-        let (o2, r2) = process(&mut f, b"6n def");
+        let (o2, r2, _events) = process(&mut f, b"6n def");
         assert_eq!(o2, b" def");
         assert_eq!(r2, b"\x1B[1;1R");
     }
@@ -304,10 +368,10 @@ mod tests {
     #[test]
     fn handles_osc_split_across_chunks() {
         let mut f = QueryFilter::default();
-        let (o1, r1) = process(&mut f, b"\x1B]11;");
+        let (o1, r1, _events) = process(&mut f, b"\x1B]11;");
         assert!(o1.is_empty());
         assert!(r1.is_empty());
-        let (o2, r2) = process(&mut f, b"?\x07");
+        let (o2, r2, _events) = process(&mut f, b"?\x07");
         assert!(o2.is_empty());
         assert_eq!(r2, b"\x1B]11;rgb:1010/1414/1818\x07");
     }
@@ -315,7 +379,7 @@ mod tests {
     #[test]
     fn intercepts_back_to_back_queries() {
         let mut f = QueryFilter::default();
-        let (out, resp) = process(&mut f, b"\x1B[c\x1B[6n");
+        let (out, resp, _events) = process(&mut f, b"\x1B[c\x1B[6n");
         assert!(out.is_empty());
         assert_eq!(resp, b"\x1B[?1;2c\x1B[1;1R");
     }
@@ -326,7 +390,7 @@ mod tests {
         let mut input = vec![0x1B, b'['];
         input.extend(std::iter::repeat(b'9').take(MAX_PENDING + 10));
         input.push(b'c');
-        let (out, _resp) = process(&mut f, &input);
+        let (out, _resp, _events) = process(&mut f, &input);
         // Either flushed mid-stream or recognised; just ensure nothing
         // is silently lost (length must be at least the param run).
         assert!(out.len() >= MAX_PENDING);
@@ -335,9 +399,55 @@ mod tests {
     #[test]
     fn esc_alone_is_not_swallowed() {
         let mut f = QueryFilter::default();
-        let (out, resp) = process(&mut f, b"\x1Bc");
+        let (out, resp, _events) = process(&mut f, b"\x1Bc");
         // ESC c is "Reset to Initial State" — emit unchanged.
         assert_eq!(out, b"\x1Bc");
         assert!(resp.is_empty());
+    }
+
+    #[test]
+    fn tracks_decset_mouse_modes() {
+        let mut f = QueryFilter::default();
+        // SGR mouse reporting (1006) alongside button-event tracking
+        // (1002) — a common pair TUIs enable together. Each `;`-separated
+        // parameter must be judged independently.
+        let (out, resp, events) = process(&mut f, b"\x1B[?1002;1006h");
+        assert_eq!(
+            out, b"\x1B[?1002;1006h",
+            "DECSET is not a query reply — bytes must still pass through"
+        );
+        assert!(resp.is_empty());
+        assert_eq!(events, vec![ModeEvent::Set(1002), ModeEvent::Set(1006)]);
+    }
+
+    #[test]
+    fn tracks_decrst_mouse_mode() {
+        let mut f = QueryFilter::default();
+        let (out, resp, events) = process(&mut f, b"\x1B[?1000l");
+        assert_eq!(
+            out, b"\x1B[?1000l",
+            "DECRST is not a query reply — bytes must still pass through"
+        );
+        assert!(resp.is_empty());
+        assert_eq!(events, vec![ModeEvent::Reset(1000)]);
+    }
+
+    #[test]
+    fn tracks_mode_split_across_chunks() {
+        let mut f = QueryFilter::default();
+        // Split mid-parameter, mirroring handles_query_split_across_chunks:
+        // no event may surface until the final `h`/`l` byte reassembles
+        // the whole sequence.
+        let (o1, r1, e1) = process(&mut f, b"\x1B[?100");
+        assert!(o1.is_empty());
+        assert!(r1.is_empty());
+        assert!(
+            e1.is_empty(),
+            "must not report an event before reassembly completes"
+        );
+        let (o2, r2, e2) = process(&mut f, b"6h");
+        assert_eq!(o2, b"\x1B[?1006h", "reassembled bytes still pass through");
+        assert!(r2.is_empty());
+        assert_eq!(e2, vec![ModeEvent::Set(1006)]);
     }
 }
