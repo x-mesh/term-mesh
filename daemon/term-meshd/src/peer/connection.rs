@@ -361,6 +361,28 @@ fn spawn_attach_relay(
             .map(|chunk| chunk.seq + chunk.bytes.len() as u64)
             .unwrap_or(0);
 
+        // Prepend any currently-active mouse-tracking DECSET sequences ahead of the
+        // snapshot: without this, a viewer attaching after the PTY already turned a
+        // mouse mode on never sees the enabling escape and scroll dies on attach.
+        // Swift-side counterpart: GhosttyPaneSurfaceProvider.attach's mouse-mode replay.
+        let mode_prefix = surface_for_task.mode_replay_bytes();
+        if !mode_prefix.is_empty() {
+            let len = mode_prefix.len() as u64;
+            let env = Envelope {
+                seq: seq_counter.fetch_add(1, Ordering::Relaxed) + 1,
+                correlation_id: 0,
+                payload: Some(Payload::PtyData(PtyData {
+                    surface_id: surface_for_task.surface_id.clone(),
+                    byte_seq: attach_seq,
+                    payload: mode_prefix,
+                })),
+            };
+            attach_seq += len;
+            if outgoing_tx.send(env).await.is_err() {
+                return;
+            }
+        }
+
         for chunk in replay {
             let len = chunk.bytes.len() as u64;
             let env = Envelope {
