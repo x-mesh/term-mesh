@@ -35,6 +35,7 @@
 			CVB00085 /* PeerRelayWindowController.swift in Sources */ = {isa = PBXBuildFile; fileRef = CVS00085 /* PeerRelayWindowController.swift */; };
 			CVB00086 /* PeerRelayWorkspaceWindowController.swift in Sources */ = {isa = PBXBuildFile; fileRef = CVS00086 /* PeerRelayWorkspaceWindowController.swift */; };
 			CVB00087 /* PeerSSHTunnel.swift in Sources */ = {isa = PBXBuildFile; fileRef = CVS00087 /* PeerSSHTunnel.swift */; };
+			CVB00096 /* PeerSocketProber.swift in Sources */ = {isa = PBXBuildFile; fileRef = CVS00096 /* PeerSocketProber.swift */; };
 			CVB00088 /* PeerBonjour.swift in Sources */ = {isa = PBXBuildFile; fileRef = CVS00088 /* PeerBonjour.swift */; };
 			CVB00089 /* PeerFederationSettings.swift in Sources */ = {isa = PBXBuildFile; fileRef = CVS00089 /* PeerFederationSettings.swift */; };
 			CVB00090 /* PeerRelayBanner.swift in Sources */ = {isa = PBXBuildFile; fileRef = CVS00090 /* PeerRelayBanner.swift */; };
@@ -178,6 +179,7 @@
 				F7000000A1B2C3D4E5F60718 /* IMEHistoryTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = F7000001A1B2C3D4E5F60718 /* IMEHistoryTests.swift */; };
 				F8000000A1B2C3D4E5F60718 /* IMESendKeyTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = F8000001A1B2C3D4E5F60718 /* IMESendKeyTests.swift */; };
 				F9000000A1B2C3D4E5F60718 /* AutoReplyDetectorTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = F9000001A1B2C3D4E5F60718 /* AutoReplyDetectorTests.swift */; };
+				FA000000A1B2C3D4E5F60718 /* PeerSocketProberTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = FA000001A1B2C3D4E5F60718 /* PeerSocketProberTests.swift */; };
 		/* End PBXBuildFile section */
 
 /* Begin PBXCopyFilesBuildPhase section */
@@ -262,6 +264,7 @@
 			CVS00085 /* PeerRelayWindowController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PeerRelayWindowController.swift; sourceTree = "<group>"; };
 			CVS00086 /* PeerRelayWorkspaceWindowController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PeerRelayWorkspaceWindowController.swift; sourceTree = "<group>"; };
 			CVS00087 /* PeerSSHTunnel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PeerSSHTunnel.swift; sourceTree = "<group>"; };
+			CVS00096 /* PeerSocketProber.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PeerSocketProber.swift; sourceTree = "<group>"; };
 			CVS00088 /* PeerBonjour.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PeerBonjour.swift; sourceTree = "<group>"; };
 			CVS00089 /* PeerFederationSettings.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PeerFederationSettings.swift; sourceTree = "<group>"; };
 			CVS00090 /* PeerRelayBanner.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PeerRelayBanner.swift; sourceTree = "<group>"; };
@@ -405,6 +408,7 @@
 			F7000001A1B2C3D4E5F60718 /* IMEHistoryTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = IMEHistoryTests.swift; sourceTree = "<group>"; };
 			F8000001A1B2C3D4E5F60718 /* IMESendKeyTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = IMESendKeyTests.swift; sourceTree = "<group>"; };
 			F9000001A1B2C3D4E5F60718 /* AutoReplyDetectorTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AutoReplyDetectorTests.swift; sourceTree = "<group>"; };
+			FA000001A1B2C3D4E5F60718 /* PeerSocketProberTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PeerSocketProberTests.swift; sourceTree = "<group>"; };
 		/* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -538,6 +542,7 @@
 				CVS00085 /* PeerRelayWindowController.swift */,
 				CVS00086 /* PeerRelayWorkspaceWindowController.swift */,
 				CVS00087 /* PeerSSHTunnel.swift */,
+				CVS00096 /* PeerSocketProber.swift */,
 				CVS00088 /* PeerBonjour.swift */,
 				CVS00089 /* PeerFederationSettings.swift */,
 				CVS00090 /* PeerRelayBanner.swift */,
@@ -711,6 +716,7 @@
 				F7000001A1B2C3D4E5F60718 /* IMEHistoryTests.swift */,
 				F8000001A1B2C3D4E5F60718 /* IMESendKeyTests.swift */,
 				F9000001A1B2C3D4E5F60718 /* AutoReplyDetectorTests.swift */,
+				FA000001A1B2C3D4E5F60718 /* PeerSocketProberTests.swift */,
 			);
 			path = termMeshTests;
 			sourceTree = "<group>";
@@ -878,6 +884,7 @@
 				CVB00085 /* PeerRelayWindowController.swift in Sources */,
 				CVB00086 /* PeerRelayWorkspaceWindowController.swift in Sources */,
 				CVB00087 /* PeerSSHTunnel.swift in Sources */,
+				CVB00096 /* PeerSocketProber.swift in Sources */,
 				CVB00088 /* PeerBonjour.swift in Sources */,
 				CVB00089 /* PeerFederationSettings.swift in Sources */,
 				CVB00090 /* PeerRelayBanner.swift in Sources */,
@@ -1023,6 +1030,7 @@
 				F7000000A1B2C3D4E5F60718 /* IMEHistoryTests.swift in Sources */,
 				F8000000A1B2C3D4E5F60718 /* IMESendKeyTests.swift in Sources */,
 				F9000000A1B2C3D4E5F60718 /* AutoReplyDetectorTests.swift in Sources */,
+				FA000000A1B2C3D4E5F60718 /* PeerSocketProberTests.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};

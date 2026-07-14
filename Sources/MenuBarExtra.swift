@@ -37,6 +37,8 @@ final class MenuBarExtraController: NSObject, NSMenuDelegate {
     private let profileSubmenu = NSMenu(title: "CLI Profile")
     private var profileObserver: NSObjectProtocol?
 
+    private let recentPeerItem = PeerMenu.recentHostsItem()
+
     private var notificationItems: [NSMenuItem] = []
     private let maxInlineNotificationItems = 6
 
@@ -163,6 +165,7 @@ final class MenuBarExtraController: NSObject, NSMenuDelegate {
         menu.addItem(PeerMenu.relayItem())
         menu.addItem(PeerMenu.relayWorkspaceItem())
         menu.addItem(PeerMenu.relayWorkspaceSSHItem())
+        menu.addItem(recentPeerItem)
         menu.addItem(PeerMenu.connectionsItem())
         menu.addItem(PeerServerMenu.startItem())
         menu.addItem(PeerServerMenu.stopItem())
@@ -176,6 +179,9 @@ final class MenuBarExtraController: NSObject, NSMenuDelegate {
     func menuWillOpen(_ menu: NSMenu) {
         refreshUI()
         updateProfileSubmenu()
+        if let submenu = recentPeerItem.submenu {
+            PeerMenu.updateRecentHostsSubmenu(submenu)
+        }
     }
 
     func refreshForDebugControls() {

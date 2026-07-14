@@ -134,19 +134,34 @@ loginctl enable-linger $USER   # keep it running after you log out
 
 ## Connecting from the Mac
 
-Peer menu → connect, then fill in two fields:
+Peer menu → connect. Only the SSH target is required:
 
 | Field | Value |
 |---|---|
 | SSH target | `root@jw-server` — whatever `ssh` already accepts |
-| Remote socket | `/run/user/1000/tm-peer.sock` — the `TERMMESH_PEER_SOCKET` you set |
+| Remote socket | *optional* — leave empty to auto-detect (see below), or type the `TERMMESH_PEER_SOCKET` you set, e.g. `/run/user/1000/tm-peer.sock` |
+
+**Auto-detect:** when the socket field is left empty, the app runs one
+short-lived ssh command against the target that checks, in order:
+
+1. `TERMMESH_PEER_SOCKET` in `~/.config/term-mesh/peer.env` (what the
+   installer writes and the systemd unit reads; last assignment wins)
+2. `$XDG_RUNTIME_DIR/tm-peer.sock`
+3. `/run/user/<uid>/tm-peer.sock` (the installer default)
+4. `/tmp/term-mesh-peer-<uid>/peer.sock` (the macOS host default)
+
+The first live socket wins and is what gets stored in the recent-hosts
+list. Hosts with a custom socket path outside `peer.env` still need the
+path typed once — after that, recents carry it.
 
 The app spawns and owns the `ssh -N -T -L …` process, and reconnects with
 exponential backoff (capped at 30 s) across sleep/wake, network blips, and
 server reboots. There is no separate auth step: the protocol's `ssh-passthrough`
 method trusts the SSH transport, so if you can `ssh` in, you are authenticated.
 
-Recent hosts are remembered (8 max) and offered in the connect dialog.
+Recent hosts are remembered (8 max), offered in the connect dialog, and
+listed under the menu bar's **Connect to Recent Peer** submenu for
+one-click reconnects that skip the dialog entirely.
 
 ## Dashboard forwarding
 

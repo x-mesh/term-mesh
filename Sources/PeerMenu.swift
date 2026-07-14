@@ -71,6 +71,45 @@ enum PeerMenu {
         item.target = PeerClientCoordinator.shared
         return item
     }
+
+    /// Submenu holder for one-click reconnects. The submenu content is
+    /// rebuilt on every menu open via `updateRecentHostsSubmenu` (same
+    /// pattern as the CLI-profile submenu) so it always reflects the
+    /// current recent-hosts list.
+    static func recentHostsItem() -> NSMenuItem {
+        let item = NSMenuItem(title: "Connect to Recent Peer", action: nil, keyEquivalent: "")
+        let submenu = NSMenu(title: "Connect to Recent Peer")
+        // The owning status-bar menu disables auto-enablement; mirror
+        // that here so the "(no recent hosts)" placeholder stays dim
+        // and host entries stay clickable.
+        submenu.autoenablesItems = false
+        item.submenu = submenu
+        return item
+    }
+
+    static func updateRecentHostsSubmenu(_ menu: NSMenu) {
+        menu.removeAllItems()
+        let recents = PeerFederationSettings.loadRecentHosts()
+        guard !recents.isEmpty else {
+            let empty = NSMenuItem(title: "(no recent hosts)", action: nil, keyEquivalent: "")
+            empty.isEnabled = false
+            menu.addItem(empty)
+            return
+        }
+        for host in recents {
+            let title = PeerClientCoordinator.menuSafeTitle(
+                "\(host.sshTarget)  ·  \(host.remoteSocket)", maxLength: 80
+            )
+            let item = NSMenuItem(
+                title: title,
+                action: #selector(PeerClientCoordinator.connectRecentHost(_:)),
+                keyEquivalent: ""
+            )
+            item.target = PeerClientCoordinator.shared
+            item.representedObject = host
+            menu.addItem(item)
+        }
+    }
 }
 
 @MainActor
@@ -208,7 +247,7 @@ final class PeerClientCoordinator: NSObject {
     private func promptAndRunRelayWorkspaceSSHAsync() async {
         let alert = NSAlert()
         alert.messageText = "Connect to Remote Peer Workspace via SSH"
-        alert.informativeText = "Tunnels the host's peer socket through `ssh -L`. Pick a host advertised on this LAN, or type an SSH target (user@host or ssh-config alias) and the path of the remote peer server's Unix socket."
+        alert.informativeText = "Tunnels the host's peer socket through `ssh -L`. Pick a host advertised on this LAN, or type an SSH target (user@host or ssh-config alias) and the path of the remote peer server's Unix socket. Leave the socket path empty to auto-detect it on the remote host."
 
         let stack = NSStackView(frame: NSRect(x: 0, y: 0, width: 380, height: 60))
         stack.orientation = .vertical
@@ -246,13 +285,11 @@ final class PeerClientCoordinator: NSObject {
         targetField.placeholderString = "user@mac-mini.local"
         let remoteLabel = NSTextField(labelWithString: "Remote peer socket:")
         let remoteField = NSTextField(frame: NSRect(x: 0, y: 0, width: 380, height: 24))
-        // Pre-fill with this machine's *effective* socketPath (the
-        // value stored in UserDefaults when the user has overridden
-        // it; otherwise the per-uid default). When the remote side is
-        // the same user on a similarly-configured Mac, this will be
-        // the correct remote path; the user can still edit it.
-        remoteField.stringValue = PeerHostCoordinator.shared.currentSocketPath
-            ?? PeerFederationSettings.socketPath
+        // Deliberately NOT prefilled with this Mac's own socket path:
+        // an empty field is the auto-detect trigger, and the probe's
+        // candidate list already covers the macOS per-uid default that
+        // the old prefill guessed at.
+        remoteField.placeholderString = "(leave empty to auto-detect)"
 
         // Pre-fill from the most recent host so a re-connect is
         // one-keystroke (Cmd+T → Cmd+Return).
@@ -320,17 +357,53 @@ final class PeerClientCoordinator: NSObject {
         guard resp == .alertFirstButtonReturn else { return }
         let target = targetField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
         let remote = remoteField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !target.isEmpty, !remote.isEmpty else {
+        guard !target.isEmpty else {
             self.showAlert(
-                title: "Peer Socket Required",
-                body: "Enter both an SSH target and the remote peer socket path."
+                title: "SSH Target Required",
+                body: "Enter an SSH target (user@host or ssh-config alias)."
             )
             return
         }
+        await connectWorkspaceSSH(target: target, remote: remote)
+    }
 
+    /// One-click reconnect from the menu bar's recent-hosts submenu.
+    /// The menu item carries a `RecentHost` as its representedObject.
+    @objc func connectRecentHost(_ sender: NSMenuItem) {
+        guard let host = sender.representedObject as? PeerFederationSettings.RecentHost
+        else { return }
+        Task { @MainActor in
+            await self.connectWorkspaceSSH(
+                target: host.sshTarget, remote: host.remoteSocket
+            )
+        }
+    }
+
+    /// Shared tail of the SSH connect flow — optional socket auto-detect,
+    /// tunnel bring-up, recent-host bookkeeping, workspace relay. Used by
+    /// both the connect dialog and the one-click recent-hosts menu.
+    /// `remote` may be empty: the socket path is then resolved on the
+    /// remote host via `PeerSocketProber`.
+    @MainActor
+    private func connectWorkspaceSSH(target: String, remote: String) async {
+        // Keyed by target + remote-as-typed; an empty remote still dedupes
+        // concurrent auto-detect submissions for the same target.
         let flow = ConnectionFlow.workspaceSSH(target: target, remote: remote)
         guard beginConnectionFlow(flow) else { return }
         defer { finishConnectionFlow(flow) }
+
+        var remote = remote
+        if remote.isEmpty {
+            do {
+                remote = try await PeerSocketProber.probe(sshTarget: target)
+            } catch {
+                self.showAlert(
+                    title: "Socket Auto-Detect Failed",
+                    body: Self.probeFailureBody(error, target: target)
+                )
+                return
+            }
+        }
 
         let tunnel = PeerSSHTunnel(
             sshTarget: target,
@@ -346,8 +419,9 @@ final class PeerClientCoordinator: NSObject {
                            body: String(describing: error))
             return
         }
-        // Tunnel is up — remember the host so the next connect
-        // dialog has it ready in the recent picker.
+        // Tunnel is up — remember the host (with the *resolved* socket
+        // path) so the next connect dialog and the recent-hosts menu
+        // have it ready.
         PeerFederationSettings.rememberRecentHost(
             .init(sshTarget: target, remoteSocket: remote)
         )
@@ -356,6 +430,26 @@ final class PeerClientCoordinator: NSObject {
             titleSuffix: " · \(target)",
             tunnel: tunnel
         )
+    }
+
+    private static func probeFailureBody(_ error: Error, target: String) -> String {
+        guard let probeError = error as? PeerSocketProbeError else {
+            return String(describing: error)
+        }
+        switch probeError {
+        case .noSocketFound:
+            let candidates = PeerSocketProber.candidateSummary
+                .map { "  • \($0)" }
+                .joined(separator: "\n")
+            return "Reached \(target), but no peer socket exists at any default location:\n\(candidates)\n\nIs term-meshd running on the host? Otherwise enter the socket path manually."
+        case .sshFailed(_, let stderr):
+            let detail = stderr.isEmpty ? "(no stderr)" : stderr
+            return "Could not reach the host over ssh: \(detail)\n\nVerify that `ssh \(target)` works in a terminal."
+        case .timedOut:
+            return "The auto-detect probe timed out. Check the connection to \(target), or enter the socket path manually."
+        case .invalidResult, .spawnFailed:
+            return String(describing: probeError)
+        }
     }
 
     /// Shared workflow: enumerate workspaces over a `PeerRelayConnection`
@@ -863,7 +957,7 @@ final class PeerClientCoordinator: NSObject {
         return nil
     }
 
-    private static func menuSafeTitle(_ value: String, maxLength: Int) -> String {
+    static func menuSafeTitle(_ value: String, maxLength: Int) -> String {
         let singleLine = value
             .replacingOccurrences(of: "\n", with: " ")
             .replacingOccurrences(of: "\r", with: " ")

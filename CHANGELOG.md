@@ -4,6 +4,10 @@ All notable changes to term-mesh are documented here.
 
 ## [Unreleased]
 
+### Added
+- **피어 연결 시 원격 소켓 경로 자동 탐지** — SSH 연결 다이얼로그에서 소켓 필드를 비워두면 ssh로 원격 호스트의 기본 위치(`peer.env`의 `TERMMESH_PEER_SOCKET` → `$XDG_RUNTIME_DIR/tm-peer.sock` → `/run/user/<uid>/tm-peer.sock` → `/tmp/term-mesh-peer-<uid>/peer.sock`)를 순서대로 확인해 첫 번째 살아있는 소켓을 자동으로 사용한다. Linux 설치기 기본 구성이면 SSH target만 입력하면 된다.
+- **메뉴바 "Connect to Recent Peer" 서브메뉴** — 최근 접속한 피어 호스트(8개)를 메뉴바에서 원클릭으로 재접속. 다이얼로그를 거치지 않는다.
+
 ## [0.153.0] - 2026-07-13
 
 ### Fixed
