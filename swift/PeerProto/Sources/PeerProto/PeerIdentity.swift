@@ -29,19 +29,44 @@ public enum PeerIdentity {
     public static let account = "default"
     public static let byteCount = 16
 
+    /// In-memory cache for `defaultPeerID()`. `SecItemCopyMatching` is a
+    /// synchronous IPC to securityd — seconds-slow on unsigned dev
+    /// builds awaiting keychain authorization — and the peer ID gets
+    /// evaluated as a handshake default argument, sometimes on the main
+    /// actor. Cache after the first load so only one call ever pays;
+    /// `warmUp()` lets the app pay it off-main at startup.
+    private static let cacheLock = NSLock()
+    nonisolated(unsafe) private static var cachedID: Data?
+
     public static func loadOrCreate() throws -> Data {
         try loadOrCreate(service: service, account: account)
     }
 
     public static func regenerate() throws -> Data {
-        try regenerate(service: service, account: account)
+        cacheLock.lock()
+        cachedID = nil
+        cacheLock.unlock()
+        return try regenerate(service: service, account: account)
     }
 
     public static func defaultPeerID() -> Data {
-        if let id = try? loadOrCreate() {
-            return id
+        cacheLock.lock()
+        if let cachedID {
+            cacheLock.unlock()
+            return cachedID
         }
-        return (try? makeRandomID()) ?? Data(count: byteCount)
+        cacheLock.unlock()
+        let id = (try? loadOrCreate()) ?? ((try? makeRandomID()) ?? Data(count: byteCount))
+        cacheLock.lock()
+        cachedID = id
+        cacheLock.unlock()
+        return id
+    }
+
+    /// Prime the keychain-backed cache off the critical path (call from
+    /// a background queue during app startup).
+    public static func warmUp() {
+        _ = defaultPeerID()
     }
 
     public static func hexString(_ data: Data) -> String {

@@ -39,24 +39,29 @@ enum PeerPaneHostSpec {
     var hostKey: PeerPaneHostKey {
         switch self {
         case .direct(let sockPath): return .direct(sockPath: sockPath)
-        case .ssh(let target, _): return .ssh(target: target)
+        case .ssh(let target, let remoteSockPath):
+            return .ssh(target: target, remoteSockPath: remoteSockPath)
         }
     }
 }
 
 enum PeerPaneHostKey: Hashable, CustomStringConvertible {
     case direct(sockPath: String)
-    case ssh(target: String)
+    /// Keyed by target AND remote socket: one machine can host several
+    /// daemons on different sockets, and pooling them onto one tunnel
+    /// would silently connect a pane to the wrong peer. (The tunnel's
+    /// *local* socket stays out of the key — it is reconnect-ephemeral.)
+    case ssh(target: String, remoteSockPath: String)
 
     var sshTarget: String? {
-        if case .ssh(let target) = self { return target }
+        if case .ssh(let target, _) = self { return target }
         return nil
     }
 
     var description: String {
         switch self {
         case .direct(let sockPath): return sockPath
-        case .ssh(let target): return "ssh:\(target)"
+        case .ssh(let target, let remoteSockPath): return "ssh:\(target):\(remoteSockPath)"
         }
     }
 
@@ -64,7 +69,7 @@ enum PeerPaneHostKey: Hashable, CustomStringConvertible {
     /// targets (user@ stripped), socket basename for direct paths.
     var shortLabel: String {
         switch self {
-        case .ssh(let target):
+        case .ssh(let target, _):
             return target.split(separator: "@").last.map(String.init) ?? target
         case .direct(let sockPath):
             return (sockPath as NSString).lastPathComponent
@@ -327,14 +332,20 @@ final class PeerPaneSession {
 
     /// Idempotent. Must run on every close path — stops the pane's
     /// relay session and drops the host-lease ref (last one stops the
-    /// shared tunnel).
+    /// shared tunnel). The lease release is sequenced AFTER the relay
+    /// session's own stop, so a last-pane teardown doesn't yank the
+    /// tunnel out from under the session mid-shutdown (broken-pipe
+    /// noise instead of an orderly Goodbye).
     func teardown() {
         guard !isTorndown else { return }
         isTorndown = true
-        let session = relaySession
-        Task { await session.stop() }
-        PeerPaneHostRegistry.shared.release(lease)
         PeerClientCoordinator.shared.deregisterPaneSession(self)
+        let session = relaySession
+        let lease = lease
+        Task { @MainActor in
+            await session.stop()
+            PeerPaneHostRegistry.shared.release(lease)
+        }
         #if DEBUG
         dlog("peer.pane.teardown key=\(lease.key) surface=\(surfaceTitle)")
         #endif

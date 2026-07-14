@@ -688,16 +688,27 @@ final class PeerClientCoordinator: NSObject {
     }
     #endif
 
+    /// Panels with a reconnect currently in flight — repeated banner
+    /// clicks must not spawn concurrent reconnect tasks (double panes,
+    /// double sessions).
+    private var reconnectingPanelIds: Set<UUID> = []
+
     /// Reconnect action for a remote pane's disconnect banner: re-lease
     /// the host, find the original surface again (by id, then by title),
-    /// attach a fresh session, and swap the dead pane for a new one.
-    /// The old pane is closed only after the new attach succeeds, so a
-    /// failed reconnect leaves the banner (and its Retry) in place.
+    /// attach a fresh session, and swap the dead pane IN PLACE — the new
+    /// pane splits off the dead one (so it lands adjacent, not wherever
+    /// focus happens to be) and only then is the dead pane closed. Any
+    /// failure before that leaves the old pane and its banner (with
+    /// Retry) untouched.
     func reconnectRemotePane(
         oldSession: PeerPaneSession,
         panelId: UUID,
         workspace: Workspace
     ) async {
+        guard !reconnectingPanelIds.contains(panelId) else { return }
+        reconnectingPanelIds.insert(panelId)
+        defer { reconnectingPanelIds.remove(panelId) }
+
         let spec = oldSession.originSpec
         let wanted = oldSession.originSurface
         oldSession.teardown()
@@ -743,14 +754,19 @@ final class PeerClientCoordinator: NSObject {
         }
         registry.release(lease)
 
-        _ = workspace.closePanel(panelId, force: true)
-        if workspace.openRemotePane(session: session) == nil {
+        // Replacement first, removal second: split the new pane off the
+        // dead one so it inherits the slot's neighborhood, then close
+        // the dead pane. If the split fails the old pane (and banner)
+        // survive for another retry.
+        guard workspace.openRemotePane(session: session, from: panelId) != nil else {
             session.teardown()
             self.showAlert(
                 title: "Reconnect Failed",
                 body: "Could not open a replacement pane in the workspace."
             )
+            return
         }
+        _ = workspace.closePanel(panelId, force: true)
     }
 
     private static func probeFailureBody(_ error: Error, target: String) -> String {

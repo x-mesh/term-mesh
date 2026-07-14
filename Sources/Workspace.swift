@@ -501,7 +501,7 @@ final class Workspace: Identifiable, ObservableObject {
         // workspaces stay legible even for non-focused panes (Phase 1
         // remote pane primitive, always-on signal).
         if let hostKey = (panels[panelId] as? TerminalPanel)?.remoteHostKey,
-           !base.hasSuffix(hostKey.shortLabel)
+           !base.hasSuffix(" ⌁ \(hostKey.shortLabel)")
         {
             return "\(base) ⌁ \(hostKey.shortLabel)"
         }
@@ -2051,9 +2051,10 @@ final class Workspace: Identifiable, ObservableObject {
     func openRemotePane(
         session: PeerPaneSession,
         orientation: SplitOrientation = .horizontal,
-        focus: Bool = true
+        focus: Bool = true,
+        from explicitSourcePanelId: UUID? = nil
     ) -> TerminalPanel? {
-        guard let sourcePanelId = focusedPanelId,
+        guard let sourcePanelId = explicitSourcePanelId ?? focusedPanelId,
               let panel = newTerminalSplit(
                   from: sourcePanelId,
                   orientation: orientation,
@@ -2117,6 +2118,10 @@ final class Workspace: Identifiable, ObservableObject {
                 try await session.start()
             } catch {
                 NSLog("[peer-pane] relay start failed: %@", String(describing: error))
+                // Banner BEFORE teardown — showBanner refuses to draw on a
+                // torn-down session, and a start failure with no visible
+                // error (just a dead shell) is undebuggable for the user.
+                showBanner("relay start failed: \(String(describing: error))")
                 session.teardown()
                 _ = panel
             }

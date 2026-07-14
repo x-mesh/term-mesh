@@ -612,9 +612,12 @@ final class GhosttySurfaceScrollView: NSView {
         inactiveOverlayView.frame = terminalBounds
         if let banner = peerDisconnectBannerView {
             let height: CGFloat = 32
+            // Sit just below the 2pt host strip so the always-on host
+            // signal stays visible while the banner is up.
+            let stripInset: CGFloat = peerHostStripView == nil ? 0 : 2
             banner.frame = NSRect(
                 x: terminalBounds.minX,
-                y: terminalBounds.maxY - height,
+                y: terminalBounds.maxY - height - stripInset,
                 width: terminalBounds.width,
                 height: height
             )
