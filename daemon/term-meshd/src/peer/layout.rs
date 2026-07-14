@@ -710,7 +710,15 @@ impl PeerHost {
             .map(|s| s.cwd.clone())
             .filter(|c| !c.is_empty());
         let n = self.ephemeral_counter.fetch_add(1, Ordering::Relaxed);
-        let surface_id = surface_id_from_name(&format!("split-{n}"));
+        // `\0`-prefixed: surface_id_from_name is a deterministic hash, and
+        // a plain "split-{n}" could collide with an operator's own
+        // TERMMESH_PEER_SURFACES entry of the same name (register_and_spawn
+        // would then overwrite that declared surface's live PTY). An
+        // environment variable's value cannot contain an embedded NUL on
+        // any POSIX system, so parse_surfaces_env can never hand back a
+        // name that produces this prefix -- the collision is structurally
+        // impossible, not just unlikely.
+        let surface_id = surface_id_from_name(&format!("\0split-{n}"));
         let spec = SpawnSpec {
             title: format!("shell {n}"),
             command: "/bin/sh".into(),
@@ -1004,6 +1012,23 @@ mod tests {
             cursor = split.first.as_ref().expect("first child");
         }
         assert_eq!(depth, 512);
+    }
+
+    /// F5 regression: an ephemeral split's id must never collide with a
+    /// declared `TERMMESH_PEER_SURFACES` name, even one deliberately
+    /// chosen to match the ephemeral naming scheme. Structural, not
+    /// probabilistic: a `\0` can never appear in an env var's value, so
+    /// hashing it into the ephemeral name makes the collision impossible
+    /// regardless of what an operator names their declared surfaces.
+    #[test]
+    fn ephemeral_ids_cannot_collide_with_declared_names() {
+        for guess in ["split-1", "split-2", "split-0", "split-100"] {
+            assert_ne!(
+                surface_id_from_name(guess),
+                surface_id_from_name(&format!("\0{guess}")),
+                "a declared surface literally named {guess:?} would collide with an ephemeral id"
+            );
+        }
     }
 
     /// F4 regression: SplitPane must stop forking shells once the

@@ -746,18 +746,33 @@ mod tests {
         assert!(result.is_ok(), "cat did not echo — hangup() signalled it despite dead=true");
     }
 
+    /// F6 regression: asserting a hardcoded "/bin/bash" result meant this
+    /// test failed on exactly the minimal/musl environments (no bash)
+    /// docs/peer-linux-host.md targets, where resolve_login_shell falling
+    /// through to /bin/sh is the CORRECT behavior, not a bug. Assert the
+    /// property instead: never the blocker itself, and always one of the
+    /// two real fallback candidates.
     #[test]
     fn login_shell_falls_back_past_blockers() {
+        let assert_falls_back = |candidate: Option<&str>| {
+            let result = resolve_login_shell(candidate);
+            assert_ne!(Some(result.as_str()), candidate, "must not echo back a blocked candidate");
+            assert!(
+                matches!(result.as_str(), "/bin/bash" | "/bin/sh"),
+                "fallback must be /bin/bash or /bin/sh, got {result:?}"
+            );
+        };
         // Deliberate login blockers (F: systemd service accounts).
-        assert_eq!(resolve_login_shell(Some("/bin/false")), "/bin/bash");
-        assert_eq!(resolve_login_shell(Some("/usr/sbin/nologin")), "/bin/bash");
+        assert_falls_back(Some("/bin/false"));
+        assert_falls_back(Some("/usr/sbin/nologin"));
         // Nonexistent / relative / empty candidates.
-        assert_eq!(resolve_login_shell(Some("/no/such/shell")), "/bin/bash");
-        assert_eq!(resolve_login_shell(Some("zsh")), "/bin/bash");
-        assert_eq!(resolve_login_shell(Some("")), "/bin/bash");
+        assert_falls_back(Some("/no/such/shell"));
+        assert_falls_back(Some("zsh"));
+        assert_falls_back(Some(""));
         // No candidate at all (SHELL unset under systemd).
-        assert_eq!(resolve_login_shell(None), "/bin/bash");
-        // A usable candidate wins as-is.
+        assert_falls_back(None);
+        // A usable candidate wins as-is — the one case with an exact
+        // expected value, since /bin/sh is universally present.
         assert_eq!(resolve_login_shell(Some("/bin/sh")), "/bin/sh");
     }
 }
