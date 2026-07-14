@@ -361,12 +361,11 @@ impl LayoutStore {
         }
     }
 
-    /// Drop a surface wherever it appears — used when an ephemeral
-    /// (split-spawned) surface's shell exits on its own (the dead-watcher
-    /// wiring lands with the lifecycle task; only tests call this so far). Unlike
-    /// `close_pane` this may empty the tree entirely: a self-exit is not
-    /// a user request, so there is nothing to refuse.
-    #[allow(dead_code)]
+    /// Drop a surface wherever it appears — the dead-watcher path for an
+    /// ephemeral (split-spawned) shell that exited on its own. A sole
+    /// surviving pane is kept as a dead pane rather than emptying the
+    /// tree: a self-exit is not a user request, so there is nothing to
+    /// refuse — and nothing left to render if we removed everything.
     pub fn remove_surface(&mut self, surface_id: &[u8]) -> bool {
         match self.close_pane(surface_id) {
             Ok(_) => true,
@@ -627,6 +626,9 @@ impl PeerHost {
         if !self.layout.lock().unwrap().surface_ids().iter().any(|s| s == pane_id) {
             return false;
         }
+        // A dead source pane revives first, same as attach would do — the
+        // user is clearly working in it. No-op when it is alive.
+        self.pty.get_or_respawn(pane_id);
         let Some(new_id) = self.spawn_ephemeral(pane_id) else { return false };
         match self.layout.lock().unwrap().split_pane(pane_id, orientation, new_id.clone()) {
             Ok(changed) => changed,
@@ -643,6 +645,7 @@ impl PeerHost {
         if !self.layout.lock().unwrap().surface_ids().iter().any(|s| s == pane_id) {
             return false;
         }
+        self.pty.get_or_respawn(pane_id);
         let Some(new_id) = self.spawn_ephemeral(pane_id) else { return false };
         match self.layout.lock().unwrap().add_tab(pane_id, new_id.clone()) {
             Ok(changed) => changed,
@@ -672,7 +675,8 @@ impl PeerHost {
 
     /// Fork a login shell for a split/new-tab pane, inheriting the source
     /// pane's cwd. Registered with a respawn spec so a dead ephemeral
-    /// pane revives on attach just like declared surfaces do.
+    /// pane revives on attach just like declared surfaces do, and watched
+    /// so a shell that exits on its own removes its pane from the tree.
     fn spawn_ephemeral(self: &Arc<Self>, source_pane: &[u8]) -> Option<SurfaceId> {
         let cwd = self
             .pty
@@ -683,11 +687,10 @@ impl PeerHost {
             .filter(|c| !c.is_empty());
         let n = self.ephemeral_counter.fetch_add(1, Ordering::Relaxed);
         let surface_id = surface_id_from_name(&format!("split-{n}"));
-        let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".into());
         let spec = SpawnSpec {
             title: format!("shell {n}"),
             command: "/bin/sh".into(),
-            args: vec!["-c".into(), format!("{shell} -l")],
+            args: vec!["-c".into(), super::surface::login_shell_cmd()],
             cols: 80,
             rows: 24,
             cwd,
@@ -695,11 +698,39 @@ impl PeerHost {
         self.pty.register_and_spawn(surface_id.clone(), spec);
         // register_and_spawn logs-and-continues on failure; only report a
         // surface that actually exists.
-        if self.pty.list().iter().any(|s| s.surface_id == surface_id) {
-            Some(surface_id)
-        } else {
-            None
-        }
+        let surface = self.pty.list().into_iter().find(|s| s.surface_id == surface_id)?;
+        self.watch_ephemeral(surface);
+        Some(surface_id)
+    }
+
+    /// Remove an ephemeral pane from the tree when its shell exits on its
+    /// own (typed `exit`, crashed, got HUP'd from inside). Declared
+    /// surfaces deliberately have no watcher — their dead pane stays
+    /// visible and revives on the next attach.
+    ///
+    /// A user-initiated ClosePane races this: close removes the pane and
+    /// hangs the shell up, then the watcher fires and finds nothing —
+    /// remove_surface returns false and no second push goes out.
+    fn watch_ephemeral(self: &Arc<Self>, surface: Arc<PtySurface>) {
+        let host = Arc::downgrade(self);
+        let sid = surface.surface_id.clone();
+        tokio::spawn(async move {
+            // Register interest before checking the flag: notify_waiters
+            // only wakes CURRENT waiters, so the reverse order would miss
+            // a death landing between check and await.
+            let notified = surface.dead_notify.notified();
+            if !surface.dead.load(Ordering::Acquire) {
+                notified.await;
+            }
+            let Some(host) = host.upgrade() else { return };
+            let removed = host.layout.lock().unwrap().remove_surface(&sid);
+            if removed {
+                // Out of the tree → out of the roster (it is already dead;
+                // remove only drops the map entry and re-signals a corpse).
+                host.pty.remove(&sid);
+                host.schedule_layout_push();
+            }
+        });
     }
 
     /// Debounced fan-out of the current tree to every connection. The
@@ -931,6 +962,61 @@ mod tests {
             cursor = split.first.as_ref().expect("first child");
         }
         assert_eq!(depth, 512);
+    }
+
+    /// R8 end to end inside the daemon: split spawns a real login shell,
+    /// hanging that shell up (as if the user typed `exit`) must remove
+    /// its pane from the tree and schedule a push — without touching the
+    /// surviving pane.
+    #[tokio::test]
+    async fn ephemeral_self_exit_removes_pane() {
+        let manager = Arc::new(PtyManager::new());
+        let base = PtySurface::spawn(
+            sid("base"),
+            "cat".into(),
+            "/bin/cat",
+            &[],
+            80,
+            24,
+            None,
+        )
+        .expect("spawn /bin/cat");
+        manager.insert_surface(base);
+        let host = Arc::new(PeerHost::new(manager));
+        assert_eq!(host.layout.lock().unwrap().surface_ids().len(), 1);
+
+        host.apply_control(WorkspaceControl {
+            kind: Some(workspace_control::Kind::SplitPane(peer_proto::v1::SplitPaneRequest {
+                pane_id: sid("base"),
+                orientation: "horizontal".into(),
+            })),
+        });
+        assert_eq!(host.layout.lock().unwrap().surface_ids().len(), 2, "split landed");
+
+        // The ephemeral shell "exits": SIGHUP → PTY reader EOF →
+        // dead_notify → watcher prunes the pane.
+        let ephemeral = host
+            .pty
+            .list()
+            .into_iter()
+            .find(|s| s.surface_id != sid("base"))
+            .expect("ephemeral surface exists");
+        ephemeral.hangup();
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if host.layout.lock().unwrap().surface_ids() == vec![sid("base")] {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "watcher never pruned the dead ephemeral pane; tree = {:?}",
+                host.layout.lock().unwrap().surface_ids()
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        // Roster pruned too.
+        assert!(host.pty.list().iter().all(|s| s.surface_id == sid("base")));
     }
 
     #[test]

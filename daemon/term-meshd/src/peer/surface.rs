@@ -434,9 +434,52 @@ pub fn parse_surfaces_env() -> Option<Vec<(String, String)>> {
     }
 }
 
-fn default_shell_cmd() -> String {
-    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".into());
+/// A shell candidate is usable when it is an absolute path to an
+/// executable regular file whose name isn't a deliberate login blocker.
+/// The blockers matter on servers: a systemd unit often has no SHELL at
+/// all, and service accounts carry /usr/sbin/nologin or /bin/false —
+/// spawning either gives an instantly-exiting pane that looks like a
+/// daemon bug.
+fn is_usable_shell(path: &str) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    if !path.starts_with('/') {
+        return false;
+    }
+    let base = path.rsplit('/').next().unwrap_or("");
+    if matches!(base, "nologin" | "false") {
+        return false;
+    }
+    match std::fs::metadata(path) {
+        Ok(md) => md.is_file() && md.permissions().mode() & 0o111 != 0,
+        Err(_) => false,
+    }
+}
+
+/// Pick the login shell for a new pane: the candidate (normally `$SHELL`)
+/// when usable, else `/bin/bash`, else `/bin/sh`. The final `/bin/sh`
+/// fallthrough is unconditional — POSIX guarantees its presence, and a
+/// broken pane beats a spawn that never happens.
+pub(crate) fn resolve_login_shell(candidate: Option<&str>) -> String {
+    if let Some(c) = candidate {
+        if is_usable_shell(c) {
+            return c.to_string();
+        }
+    }
+    if is_usable_shell("/bin/bash") {
+        return "/bin/bash".to_string();
+    }
+    "/bin/sh".to_string()
+}
+
+/// `<shell> -l` command line for a new pane, shared by the startup
+/// fallback surface and split/new-tab spawns.
+pub(crate) fn login_shell_cmd() -> String {
+    let shell = resolve_login_shell(std::env::var("SHELL").ok().as_deref());
     format!("{shell} -l")
+}
+
+fn default_shell_cmd() -> String {
+    login_shell_cmd()
 }
 
 impl PtyManager {
@@ -628,5 +671,20 @@ mod tests {
             modes.remove(&1000);
         }
         assert!(surface.mode_replay_bytes().is_empty());
+    }
+
+    #[test]
+    fn login_shell_falls_back_past_blockers() {
+        // Deliberate login blockers (F: systemd service accounts).
+        assert_eq!(resolve_login_shell(Some("/bin/false")), "/bin/bash");
+        assert_eq!(resolve_login_shell(Some("/usr/sbin/nologin")), "/bin/bash");
+        // Nonexistent / relative / empty candidates.
+        assert_eq!(resolve_login_shell(Some("/no/such/shell")), "/bin/bash");
+        assert_eq!(resolve_login_shell(Some("zsh")), "/bin/bash");
+        assert_eq!(resolve_login_shell(Some("")), "/bin/bash");
+        // No candidate at all (SHELL unset under systemd).
+        assert_eq!(resolve_login_shell(None), "/bin/bash");
+        // A usable candidate wins as-is.
+        assert_eq!(resolve_login_shell(Some("/bin/sh")), "/bin/sh");
     }
 }
