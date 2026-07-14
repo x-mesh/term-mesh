@@ -16,6 +16,8 @@ enum PeerFederationSettings {
     static let displayNameKey    = "peerFederationDisplayName"
     static let recentHostsKey    = "peerFederationRecentHosts"
     static let forceRedrawKey    = "peerFederationForceRedrawOnAttach"
+    static let forwardDashboardKey = "peerFederationForwardDashboard"
+    static let remoteDashboardPortKey = "peerFederationRemoteDashboardPort"
 
     static var defaultSocketPath: String {
         let uid = getuid()
@@ -45,6 +47,30 @@ enum PeerFederationSettings {
     /// host's local viewer too.
     static var forceRedrawOnAttach: Bool {
         UserDefaults.standard.bool(forKey: forceRedrawKey)
+    }
+
+    /// The remote host's HTTP dashboard port. `term-meshd` binds it to
+    /// 127.0.0.1:9876 by default, so it is unreachable from off-box —
+    /// the SSH tunnel is what makes it viewable here.
+    static let defaultRemoteDashboardPort = 9876
+
+    /// When on, the peer SSH tunnel also forwards the remote dashboard
+    /// to a free local port. Off by default: the remote dashboard is
+    /// typically unauthenticated (no `TERM_MESH_HTTP_PASSWORD`), and its
+    /// routes include `/api/agents/spawn` / `/api/process/stop` — forwarding
+    /// it onto the Mac's own loopback makes those reachable to any local
+    /// process, or a webpage's `no-cors` POST, with no further action from
+    /// the user. Loopback-only framing describes the network hop; it does
+    /// not describe the local-process trust boundary this crosses, so the
+    /// forward is opt-in. Skipped silently when no local port is free (the
+    /// peer forward must not be taken down with it).
+    static var forwardDashboard: Bool {
+        UserDefaults.standard.object(forKey: forwardDashboardKey) as? Bool ?? false
+    }
+
+    static var remoteDashboardPort: Int {
+        let v = UserDefaults.standard.integer(forKey: remoteDashboardPortKey)
+        return (1...65535).contains(v) ? v : defaultRemoteDashboardPort
     }
 
     static var peerIDHex: String {

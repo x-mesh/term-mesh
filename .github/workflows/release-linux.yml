@@ -1,0 +1,87 @@
+name: release-linux
+
+# Builds term-meshd for Linux (x86_64 + aarch64) whenever a version tag is
+# pushed, and attaches the binaries to that tag's GitHub Release alongside
+# the macOS DMG (published separately by scripts/publish-github-release.sh
+# via /release). Runs on native runners for both architectures — no cross
+# compilation, no Docker — so build behavior matches a real Linux host
+# exactly (see docs/peer-linux-host.md's own build notes).
+#
+# term-meshd/src/http.rs embeds two repo-root paths at compile time
+# (Resources/dashboard/index.html, Assets.xcassets/AppIcon.appiconset/128.png).
+# A full checkout (not a sparse one scoped to daemon/) keeps both present;
+# omitting either breaks the build with a confusing include_str!/include_bytes!
+# error, not a missing-file-at-runtime one. See docs/peer-linux-host.md
+# "Build" section for the same pitfall found the hard way against a real
+# Linux box before this workflow existed.
+#
+# Only term-meshd ships here — it's the peer host binary install.sh
+# installs. tm-agent (the peer client / team-ops CLI) is a macOS-side tool
+# and isn't part of this release surface.
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to (re)build and upload assets for"
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-latest
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+          submodules: false
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: daemon -> target
+
+      - name: build term-meshd (release)
+        working-directory: daemon
+        run: cargo build --release -p term-meshd
+
+      - name: package
+        id: package
+        run: |
+          set -euo pipefail
+          VERSION="${{ inputs.tag || github.ref_name }}"
+          VERSION="${VERSION#v}"
+          ASSET="term-meshd-linux-${{ matrix.arch }}.tar.gz"
+          tar -czf "$ASSET" -C daemon/target/release term-meshd
+          echo "asset=$ASSET" >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          sha256sum "$ASSET" > "$ASSET.sha256"
+
+      - name: upload to release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.tag || github.ref_name }}
+          files: |
+            ${{ steps.package.outputs.asset }}
+            ${{ steps.package.outputs.asset }}.sha256
+          # The macOS DMG (uploaded separately, locally, via /release) may
+          # land before or after this job — softprops/action-gh-release
+          # creates the release if missing and otherwise only appends/
+          # replaces the files listed above, so the two never race on
+          # each other's assets.
+          fail_on_unmatched_files: true

@@ -15,7 +15,7 @@ use std::sync::Arc;
 use peer_proto::v1::envelope::Payload;
 use peer_proto::v1::{
     workspace_update, AttachMode, AttachResult, AuthChallenge, AuthResult, Envelope, Error, Hello,
-    Pong, PtyData, SurfaceList, WorkspaceMeta, WorkspaceUpdate,
+    Pong, PtyData, SurfaceList, Workspace, WorkspaceList, WorkspaceMeta, WorkspaceUpdate,
 };
 use peer_proto::{capability, PeerCapabilities};
 use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
@@ -24,7 +24,8 @@ use tokio::sync::{broadcast, mpsc, Notify};
 use tokio::task::JoinHandle;
 
 use super::framing::{read_envelope, write_envelope};
-use super::surface::{PtyManager, PtySurface};
+use super::layout::{self, PeerHost};
+use super::surface::PtySurface;
 
 pub const PROTOCOL_VERSION: &str = "1.0.0";
 pub const HOST_DISPLAY_NAME_ENV: &str = "TERMMESH_PEER_DISPLAY_NAME";
@@ -42,13 +43,13 @@ struct AttachEntry {
     cancel: Arc<Notify>,
 }
 
-pub async fn run(stream: UnixStream, manager: Arc<PtyManager>) -> anyhow::Result<()> {
+pub async fn run(stream: UnixStream, host: Arc<PeerHost>) -> anyhow::Result<()> {
     let (reader, writer) = stream.into_split();
     let (outgoing_tx, outgoing_rx) = mpsc::channel::<Envelope>(128);
     let seq_counter = Arc::new(AtomicU64::new(0));
 
     let writer_task = tokio::spawn(writer_loop(writer, outgoing_rx));
-    let result = reader_loop(reader, outgoing_tx.clone(), seq_counter, manager).await;
+    let result = reader_loop(reader, outgoing_tx.clone(), seq_counter, host).await;
     drop(outgoing_tx);
     let _ = writer_task.await;
     result
@@ -67,10 +68,15 @@ async fn reader_loop(
     mut reader: OwnedReadHalf,
     outgoing_tx: mpsc::Sender<Envelope>,
     seq_counter: Arc<AtomicU64>,
-    manager: Arc<PtyManager>,
+    host: Arc<PeerHost>,
 ) -> anyhow::Result<()> {
+    let manager = host.pty.clone();
     let mut state = HandshakeState::Init;
     let mut attached: HashMap<Vec<u8>, AttachEntry> = HashMap::new();
+    // RAII registration with the layout broadcaster; populated when the
+    // handshake reaches Ready, dropped (= unregistered) with this frame.
+    // Underscore: the binding exists for its Drop, it is never read.
+    let mut _broadcast_guard: Option<layout::BroadcastGuard> = None;
     // Parsed once out of the client's Hello and kept for the rest of the
     // connection — plumbing only for now (see P3, docs/peer-perf-proposal.md):
     // nothing branches on it yet, but future wire changes (P8 and later)
@@ -169,6 +175,11 @@ async fn reader_loop(
                 };
                 send(&outgoing_tx, accept).await?;
                 state = HandshakeState::Ready;
+                // From Ready on, this connection receives layout pushes
+                // triggered by any connection's WorkspaceControl. The guard
+                // unregisters on connection teardown (any exit path).
+                _broadcast_guard =
+                    Some(host.clients.register(outgoing_tx.clone(), seq_counter.clone()));
                 tracing::info!("peer authenticated (ssh-passthrough)");
             }
 
@@ -185,6 +196,48 @@ async fn reader_loop(
                     payload: Some(Payload::SurfaceList(SurfaceList { surfaces })),
                 };
                 send(&outgoing_tx, reply).await?;
+            }
+
+            (HandshakeState::Ready, Payload::ListWorkspaces(_)) => {
+                // A daemon-only host has no bonsplit windows to mirror — it
+                // owns a flat set of forkpty surfaces arranged in the host's
+                // authoritative layout tree. Clients (the macOS app) enter
+                // every peer session through ListWorkspaces, and leaving it
+                // unanswered stalls them until their 10s read timeout fires.
+                //
+                // The snapshot comes from the same LayoutStore that
+                // WorkspaceControl mutations edit and WorkspaceLayoutChanged
+                // pushes serialize, so a reconnecting client sees the
+                // arrangement it (or another viewer) actually made — not a
+                // fresh re-tile.
+                let reply = Envelope {
+                    seq: next_seq(&seq_counter),
+                    correlation_id: env.seq,
+                    payload: Some(Payload::WorkspaceList(WorkspaceList {
+                        workspaces: vec![Workspace {
+                            workspace_id: host.workspace_id.clone(),
+                            title: hostname_or(layout::DAEMON_WORKSPACE),
+                            layout: host.layout_snapshot(),
+                            // Empty window_id: clients read that as the legacy
+                            // "single implied window" flat list, which is what
+                            // a daemon host actually is.
+                            window_id: Vec::new(),
+                            window_title: String::new(),
+                        }],
+                    })),
+                };
+                send(&outgoing_tx, reply).await?;
+            }
+
+            (HandshakeState::Ready, Payload::WorkspaceControl(ctl)) => {
+                // Fire-and-forget by protocol design (peer.proto Workspace
+                // control header): NEVER answer this — not on success, not
+                // on refusal. The only observable result is the
+                // WorkspaceLayoutChanged push apply_control schedules when
+                // the tree actually changed; an invalid or refused command
+                // (unknown ids, last-pane close, garbage orientation) is a
+                // silent no-op exactly like the Swift host's perform*.
+                host.apply_control(ctl);
             }
 
             (HandshakeState::Ready, Payload::AttachSurface(req)) => {
@@ -473,6 +526,45 @@ fn next_seq(seq_counter: &AtomicU64) -> u64 {
     seq_counter.fetch_add(1, Ordering::Relaxed) + 1
 }
 
+/// Best-effort hostname for the synthesised workspace title, in priority
+/// order: `gethostname(2)`, then `/etc/hostname`, then `fallback`.
+///
+/// `$HOSTNAME` was the prior primary source, but bash keeps it as a shell
+/// (non-exported) variable, not an environment variable — a systemd unit
+/// (`docs/peer-linux-host.md`'s documented deployment) never sees it, so
+/// that branch was dead in the deployment this daemon actually targets.
+/// `gethostname(2)` is a real syscall with no such gap. Both fallback
+/// paths are trimmed identically so trailing whitespace can't leak into
+/// the title from either source.
+fn hostname_or(fallback: &str) -> String {
+    gethostname_string()
+        .or_else(|| {
+            std::fs::read_to_string("/etc/hostname")
+                .ok()
+                .map(|h| h.trim().to_string())
+                .filter(|h| !h.is_empty())
+        })
+        .unwrap_or_else(|| fallback.to_string())
+}
+
+/// `gethostname(2)` via a fixed-size stack buffer — `HOST_NAME_MAX` on
+/// Linux is 64 bytes; 256 leaves headroom without an allocation dance.
+/// `None` on syscall failure or a non-UTF-8 / empty result.
+fn gethostname_string() -> Option<String> {
+    let mut buf = [0u8; 256];
+    // Safety: buf is a valid, correctly-sized byte buffer for the
+    // duration of the call; gethostname writes at most buf.len() bytes
+    // (NUL-terminated) and returns non-zero on failure without touching
+    // buf's contents in a way we rely on.
+    let rc = unsafe { libc::gethostname(buf.as_mut_ptr() as *mut libc::c_char, buf.len()) };
+    if rc != 0 {
+        return None;
+    }
+    let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+    let s = std::str::from_utf8(&buf[..end]).ok()?.trim().to_string();
+    (!s.is_empty()).then_some(s)
+}
+
 fn random_peer_bytes(len: usize) -> Vec<u8> {
     // CSPRNG via getrandom(3) so auth nonces / session ids don't
     // carry the structural fixed bits of UUIDv4 (version+variant
@@ -532,4 +624,28 @@ async fn send_error(tx: &mpsc::Sender<Envelope>, code: u32, message: &str) {
         })),
     };
     let _ = tx.send(env).await;
+}
+
+#[cfg(test)]
+mod hostname_tests {
+    use super::{gethostname_string, hostname_or};
+
+    /// F8 regression: gethostname(2) is a real syscall (unlike the prior
+    /// $HOSTNAME env read, dead under the systemd deployment
+    /// docs/peer-linux-host.md documents) — it must succeed on any host
+    /// this test runs on and return a non-empty, trimmed name.
+    #[test]
+    fn gethostname_succeeds_and_is_trimmed() {
+        let name = gethostname_string().expect("gethostname(2) should succeed");
+        assert!(!name.is_empty());
+        assert_eq!(name, name.trim(), "must already be trimmed");
+    }
+
+    /// hostname_or must prefer the real hostname over the fallback when
+    /// gethostname(2) succeeds — which it always does on a real machine.
+    #[test]
+    fn hostname_or_prefers_real_hostname_over_fallback() {
+        let result = hostname_or("unreachable-fallback-sentinel");
+        assert_ne!(result, "unreachable-fallback-sentinel");
+    }
 }
