@@ -16,6 +16,8 @@ enum PeerFederationSettings {
     static let displayNameKey    = "peerFederationDisplayName"
     static let recentHostsKey    = "peerFederationRecentHosts"
     static let forceRedrawKey    = "peerFederationForceRedrawOnAttach"
+    static let forwardDashboardKey = "peerFederationForwardDashboard"
+    static let remoteDashboardPortKey = "peerFederationRemoteDashboardPort"
 
     static var defaultSocketPath: String {
         let uid = getuid()
@@ -45,6 +47,25 @@ enum PeerFederationSettings {
     /// host's local viewer too.
     static var forceRedrawOnAttach: Bool {
         UserDefaults.standard.bool(forKey: forceRedrawKey)
+    }
+
+    /// The remote host's HTTP dashboard port. `term-meshd` binds it to
+    /// 127.0.0.1:9876 by default, so it is unreachable from off-box —
+    /// the SSH tunnel is what makes it viewable here.
+    static let defaultRemoteDashboardPort = 9876
+
+    /// When on, the peer SSH tunnel also forwards the remote dashboard
+    /// to a free local port. On by default: the forward is loopback-only
+    /// on both ends and rides the tunnel that peer already opens, so it
+    /// costs no extra exposure. Skipped silently when no local port is
+    /// free (the peer forward must not be taken down with it).
+    static var forwardDashboard: Bool {
+        UserDefaults.standard.object(forKey: forwardDashboardKey) as? Bool ?? true
+    }
+
+    static var remoteDashboardPort: Int {
+        let v = UserDefaults.standard.integer(forKey: remoteDashboardPortKey)
+        return (1...65535).contains(v) ? v : defaultRemoteDashboardPort
     }
 
     static var peerIDHex: String {
