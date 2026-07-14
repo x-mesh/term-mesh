@@ -247,6 +247,17 @@ extension Workspace: BonsplitDelegate {
             return true
         }
 
+        // Live mirror: a user tab-close forwards to the host; the
+        // host's layout push performs the actual removal. The
+        // reconciler's own closes carry forceCloseTabIds (handled
+        // above), so they never reach this branch.
+        if mirrorForwardsLocalActions {
+            if let panelId = panelIdFromSurfaceId(tab.id) {
+                peerMirror?.forwardClose(panelId: panelId)
+            }
+            return false
+        }
+
         if let panelId = panelIdFromSurfaceId(tab.id),
            pinnedPanelIds.contains(panelId) {
             clearStagedClosedBrowserRestoreSnapshot(for: tab.id)
@@ -298,6 +309,14 @@ extension Workspace: BonsplitDelegate {
     }
 
     func splitTabBar(_ controller: BonsplitController, didCloseTab tabId: TabID, fromPane pane: PaneID) {
+        // Live mirror self-heal: a close that reached the tree outside
+        // the reconciler (force-close paths bypass the shouldCloseTab
+        // veto) diverged from the host — snap back on the next tick.
+        // Reconciler closes run under isApplyingRemoteLayout; forwarded
+        // closes never mutate locally.
+        if mirrorForwardsLocalActions {
+            peerMirror?.scheduleResync()
+        }
         forceCloseTabIds.remove(tabId)
         let selectTabId = postCloseSelectTabId.removeValue(forKey: tabId)
         let closedBrowserRestoreSnapshot = pendingClosedBrowserRestoreSnapshots.removeValue(forKey: tabId)
@@ -422,6 +441,13 @@ extension Workspace: BonsplitDelegate {
     }
 
     func splitTabBar(_ controller: BonsplitController, didMoveTab tab: Bonsplit.Tab, fromPane source: PaneID, toPane destination: PaneID) {
+        // Live mirror self-heal: moveTab has NO veto hook, so a user tab
+        // drag can mutate the mirrored tree directly. Snap back to the
+        // last authoritative layout. Reconciler-driven moves run under
+        // isApplyingRemoteLayout and skip this.
+        if mirrorForwardsLocalActions {
+            peerMirror?.scheduleResync()
+        }
 #if DEBUG
         let movedPanel = panelIdFromSurfaceId(tab.id)?.uuidString.prefix(5) ?? "unknown"
         dlog(
@@ -503,7 +529,50 @@ extension Workspace: BonsplitDelegate {
         scheduleFocusReconcile()
     }
 
+    /// Live mirror: bonsplit-UI splits (tab-bar buttons, drag-to-edge)
+    /// forward to the host instead of splitting locally. Programmatic
+    /// splits from the reconciler run under isApplyingRemoteLayout and
+    /// pass through. No panel exists before this veto on the UI paths,
+    /// so nothing leaks.
+    func splitTabBar(_ controller: BonsplitController, shouldSplitPane pane: PaneID, orientation: SplitOrientation) -> Bool {
+        if mirrorForwardsLocalActions {
+            if let tab = controller.selectedTab(inPane: pane),
+               let panelId = panelIdFromSurfaceId(tab.id)
+            {
+                peerMirror?.forwardSplit(panelId: panelId, orientation: orientation)
+            }
+            return false
+        }
+        return true
+    }
+
+    /// Live mirror: bonsplit-originated tab creation forwards as a
+    /// host-side new-tab. The reconciler's newRemoteTerminalTab runs
+    /// under isApplyingRemoteLayout and passes through.
+    func splitTabBar(_ controller: BonsplitController, shouldCreateTab tab: Bonsplit.Tab, inPane pane: PaneID) -> Bool {
+        if mirrorForwardsLocalActions {
+            if let selected = controller.selectedTab(inPane: pane),
+               let panelId = panelIdFromSurfaceId(selected.id)
+            {
+                peerMirror?.forwardNewTab(panelId: panelId)
+            }
+            return false
+        }
+        return true
+    }
+
     func splitTabBar(_ controller: BonsplitController, shouldClosePane pane: PaneID) -> Bool {
+        // Live mirror: forward the pane's selected tab close to the
+        // host; the layout push removes the pane when its last surface
+        // goes.
+        if mirrorForwardsLocalActions {
+            if let tab = controller.selectedTab(inPane: pane),
+               let panelId = panelIdFromSurfaceId(tab.id)
+            {
+                peerMirror?.forwardClose(panelId: panelId)
+            }
+            return false
+        }
         // Check if any panel in this pane needs close confirmation
         let tabs = controller.tabs(inPane: pane)
         for tab in tabs {
@@ -754,6 +823,14 @@ extension Workspace: BonsplitDelegate {
         scheduleTerminalGeometryReconcile()
         scheduleFocusReconcile()
         postPeerLayoutChange()
+        // Live mirror: a user divider drag surfaces here — diff the
+        // current tree's ratios against the last host layout and
+        // forward the changed splits (debounced). Reconciler-driven
+        // geometry runs under isApplyingRemoteLayout / fromExternal and
+        // never reaches the forward.
+        if mirrorForwardsLocalActions {
+            peerMirror?.handleLocalGeometryChange()
+        }
     }
 
     /// Notify any peer-federation observers (PeerServer broadcast) so

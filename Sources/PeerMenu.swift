@@ -160,7 +160,8 @@ final class PeerClientCoordinator: NSObject {
         let infos = (openConsoles.map { $0.connectionInfo }
             + openRelays.map { $0.connectionInfo }
             + openWorkspaceRelays.map { $0.connectionInfo }
-            + openPaneSessions.map { $0.connectionInfo })
+            + openPaneSessions.map { $0.connectionInfo }
+            + openWorkspaceMirrors.map { $0.connectionInfo })
             .sorted { $0.connectedAt < $1.connectedAt }
 #if DEBUG
         dlog("peer.connections.active count=\(infos.count) consoles=\(openConsoles.count) relays=\(openRelays.count) workspaces=\(openWorkspaceRelays.count)")
@@ -196,6 +197,18 @@ final class PeerClientCoordinator: NSObject {
             } else {
                 session.teardown()
             }
+            return
+        }
+        if let mirror = openWorkspaceMirrors.first(where: { ObjectIdentifier($0) == id }) {
+            // Closing the workspace tab tears everything down through
+            // TabManager.closeWorkspace → panel closes + mirror teardown.
+            if let workspace = mirror.workspace,
+               let tabManager = AppDelegate.shared?.tabManager
+            {
+                tabManager.closeWorkspace(workspace)
+            } else {
+                mirror.teardown()
+            }
         }
     }
 
@@ -219,6 +232,27 @@ final class PeerClientCoordinator: NSObject {
         openPaneSessions.removeAll { $0 === session }
         guard openPaneSessions.count != before else { return }
         postRelaysChanged()
+    }
+
+    // MARK: - Live workspace mirrors (Phase 2B)
+
+    private var openWorkspaceMirrors: [PeerWorkspaceMirrorController] = []
+
+    func registerWorkspaceMirror(_ mirror: PeerWorkspaceMirrorController) {
+        guard !openWorkspaceMirrors.contains(where: { $0 === mirror }) else { return }
+        openWorkspaceMirrors.append(mirror)
+        postRelaysChanged()
+    }
+
+    func deregisterWorkspaceMirror(_ mirror: PeerWorkspaceMirrorController) {
+        let before = openWorkspaceMirrors.count
+        openWorkspaceMirrors.removeAll { $0 === mirror }
+        guard openWorkspaceMirrors.count != before else { return }
+        postRelaysChanged()
+    }
+
+    func workspaceMirror(forWorkspaceId id: UUID) -> PeerWorkspaceMirrorController? {
+        openWorkspaceMirrors.first { $0.workspace?.id == id }
     }
 
     fileprivate func postRelaysChanged() {
@@ -619,7 +653,8 @@ final class PeerClientCoordinator: NSObject {
     func openRemoteWorkspaceMirror(
         spec: PeerPaneHostSpec,
         workspaceID: Data?,
-        pickFirstWithoutPrompt: Bool = false
+        pickFirstWithoutPrompt: Bool = false,
+        live: Bool = true
     ) async {
         let flowKey = spec.hostKey.description
         guard !mirrorOpensInFlight.contains(flowKey) else { return }
@@ -716,6 +751,39 @@ final class PeerClientCoordinator: NSObject {
             return
         }
         workspace.bindRemotePane(session: firstSession, to: firstPanel)
+
+        if live {
+            // Phase 2B live mirror: the controller owns the browse lease
+            // ref from here (released in its teardown). Initial build
+            // runs through the reconciler — one code path for open,
+            // pushes, and reconnect.
+            let mirror = PeerWorkspaceMirrorController(
+                workspace: workspace,
+                lease: lease,
+                spec: spec,
+                hostWorkspaceID: chosen.workspaceID,
+                hostWorkspaceTitle: chosen.title
+            )
+            mirror.panelBySurfaceID[firstLeaf.surfaceID] = firstPanel.id
+            workspace.peerMirror = mirror
+            registerWorkspaceMirror(mirror)
+            do {
+                try await mirror.start()
+            } catch {
+                self.showAlert(
+                    title: "Live Mirror Failed",
+                    body: "\(String(describing: error))\n\nThe workspace stays open with the first pane only; close it and retry."
+                )
+                // Keep the workspace (first pane is live); drop mirror mode.
+                workspace.peerMirror = nil
+                mirror.teardown()
+                return
+            }
+            #if DEBUG
+            dlog("peer.mirror.live.open host=\(spec.hostKey) workspace=\(chosen.title)")
+            #endif
+            return
+        }
 
         await materializeLayout(
             chosen.layout, seed: firstPanel,
@@ -904,7 +972,7 @@ final class PeerClientCoordinator: NSObject {
     /// happy path (first workspace auto-picked). Outcome polled via
     /// `debug.peer.pane_status` — session count reflects mirrored
     /// leaves.
-    func debugOpenWorkspaceMirror(sockPath: String?) {
+    func debugOpenWorkspaceMirror(sockPath: String?, live: Bool = false) {
         debugLastPaneOpenResult = nil
         Task { @MainActor in
             var resolvedSock = sockPath
@@ -917,18 +985,49 @@ final class PeerClientCoordinator: NSObject {
                 return
             }
             let before = self.openPaneSessions.count
+            // Mirror the currently-SELECTED workspace: hosts key
+            // workspaces by raw UUID bytes, so the loopback e2e can
+            // seed a specific workspace, select it, and mirror exactly
+            // it — first-listed would race with session-restored tabs.
+            let selectedID = (AppDelegate.shared?.tabManager?.selectedWorkspace?.id.uuid)
+                .map { withUnsafeBytes(of: $0) { Data($0) } }
             await self.openRemoteWorkspaceMirror(
                 spec: .direct(sockPath: hostSock),
-                workspaceID: nil,
-                pickFirstWithoutPrompt: true
+                workspaceID: selectedID,
+                pickFirstWithoutPrompt: true,
+                live: live
             )
             let opened = self.openPaneSessions.count - before
             self.debugLastPaneOpenResult = [
                 "ok": opened > 0,
                 "mirror": true,
+                "live": live,
                 "panes_opened": opened,
             ]
         }
+    }
+
+    /// Snapshot of live-mirror state for e2e assertions.
+    func debugMirrorStatus() -> [String: Any] {
+        [
+            "mirrors": openWorkspaceMirrors.map { mirror -> [String: Any] in
+                var entry: [String: Any] = [
+                    "host_key": String(describing: mirror.spec.hostKey),
+                    "subscription_alive": mirror.subscriptionAlive,
+                    "applying": mirror.isApplyingRemoteLayout,
+                    "leaf_count": mirror.panelBySurfaceID.count,
+                    "split_map_count": mirror.hostSplitToLocal.count,
+                    "torn_down": mirror.isTornDown,
+                ]
+                if let layout = mirror.lastAppliedLayout {
+                    entry["shape"] = PeerWorkspaceMirrorController.shapeHash(layout)
+                }
+                if let workspaceId = mirror.workspace?.id.uuidString {
+                    entry["workspace_id"] = workspaceId
+                }
+                return entry
+            }
+        ]
     }
 
     /// Snapshot of remote-pane state for e2e assertions.

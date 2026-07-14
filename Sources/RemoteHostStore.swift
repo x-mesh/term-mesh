@@ -212,15 +212,17 @@ final class RemoteHostStore: ObservableObject {
         }
     }
 
-    /// Phase 2A: open this host workspace as a main-window workspace
-    /// mirror (snapshot placement — one remote pane per layout leaf).
-    func openWorkspaceAsMirror(_ workspace: WorkspaceSummary) {
+    /// Open this host workspace as a main-window workspace mirror.
+    /// live=true (Phase 2B): host-authoritative layout sync; false
+    /// (Phase 2A): one-shot snapshot placement, local layout afterwards.
+    func openWorkspaceAsMirror(_ workspace: WorkspaceSummary, live: Bool = true) {
         let sockPath = workspace.hostSockPath
         guard !sockPath.isEmpty else { return }
         Task {
             await PeerClientCoordinator.shared.openRemoteWorkspaceMirror(
                 spec: .direct(sockPath: sockPath),
-                workspaceID: workspace.id
+                workspaceID: workspace.id,
+                live: live
             )
         }
     }

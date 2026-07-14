@@ -752,20 +752,37 @@ extension TerminalController {
         return .ok(["ok": true, "started": true])
     }
 
-    /// Test-only: fire-and-forget headless workspace mirror (Phase 2A).
-    /// Same polling contract as open_remote_pane.
+    /// Test-only: fire-and-forget headless workspace mirror (2A
+    /// snapshot by default; {live: true} for the 2B live mirror). Same
+    /// polling contract as open_remote_pane.
     func v2DebugPeerOpenWorkspaceMirror(params: [String: Any]) -> V2CallResult {
         let sockPath = v2String(params, "sock_path")
+        let live = (params["live"] as? Bool) ?? false
         if Thread.isMainThread {
             MainActor.assumeIsolated {
-                PeerClientCoordinator.shared.debugOpenWorkspaceMirror(sockPath: sockPath)
+                PeerClientCoordinator.shared.debugOpenWorkspaceMirror(sockPath: sockPath, live: live)
             }
         } else {
             DispatchQueue.main.async {
-                PeerClientCoordinator.shared.debugOpenWorkspaceMirror(sockPath: sockPath)
+                PeerClientCoordinator.shared.debugOpenWorkspaceMirror(sockPath: sockPath, live: live)
             }
         }
         return .ok(["ok": true, "started": true])
+    }
+
+    /// Test-only: live-mirror state snapshot (subscription health, leaf
+    /// count, shape hash) for e2e convergence assertions.
+    func v2DebugPeerMirrorStatus(params _: [String: Any]) -> V2CallResult {
+        var status: [String: Any] = [:]
+        let ok = v2MainExec(timeout: 5) {
+            MainActor.assumeIsolated {
+                status = PeerClientCoordinator.shared.debugMirrorStatus()
+            }
+        }
+        guard ok else {
+            return .err(code: "internal_error", message: "mirror status timed out", data: nil)
+        }
+        return .ok(["ok": true, "status": status])
     }
 
     /// Test-only: snapshot of remote-pane sessions + host-lease count

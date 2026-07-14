@@ -848,11 +848,15 @@ struct RemoteWorkspaceRowView: View {
             store.openWorkspace(workspace)
         }
         .contextMenu {
-            // Phase 2A: materialize this host workspace's split layout
-            // as a NEW main-window workspace (remote pane per leaf)
-            // instead of a separate relay window.
-            Button("Open as Workspace in Main Window") {
-                store.openWorkspaceAsMirror(workspace)
+            // Live mirror (Phase 2B): host-authoritative layout sync —
+            // splits/closes follow the host and local actions forward.
+            Button("Open as Live Workspace in Main Window") {
+                store.openWorkspaceAsMirror(workspace, live: true)
+            }
+            // Snapshot (Phase 2A): copy the layout once, then the local
+            // workspace owns it.
+            Button("Open as Snapshot Workspace") {
+                store.openWorkspaceAsMirror(workspace, live: false)
             }
         }
         .onHover { isHovering = $0 }

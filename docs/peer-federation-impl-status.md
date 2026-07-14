@@ -56,7 +56,12 @@ Phase P  — Remote pane primitive (main-window pane mixing)
   P-3    — Entry UX (dialog checkbox + sidebar context menu) + roster       ✅ DONE
   P-4    — Disconnect banner + Reconnect (re-attach + pane swap)            ✅ DONE
   P-5    — Host signals (titlebar gradient / pane strip / tab chip)         ✅ DONE
-  P-6    — Workspace mirror on pane primitive (layout adapter)              ⬜ TODO (Phase 2)
+  P-6    — Snapshot workspace mirror (layout copied once, local after)      ✅ DONE
+  P-7    — Live workspace mirror (host-authoritative, bidirectional)        ✅ DONE
+    P-7a   Reconcile engine (collapse+rebuild via splitPane(movingTab:))    ✅ DONE
+    P-7b   Forward gates (split/close/new-tab/divider → WorkspaceControl)   ✅ DONE
+    P-7c   Reconnect + resync + session-persistence exclusion               ✅ DONE
+    P-7d   Multi-tab panes (v1 mirrors the active tab per pane only)        ⬜ TODO
 ```
 
 Phase P coexists with the relay windows (C-4 / W) — they remain the

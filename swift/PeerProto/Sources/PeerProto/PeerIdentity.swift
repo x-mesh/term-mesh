@@ -50,16 +50,17 @@ public enum PeerIdentity {
     }
 
     public static func defaultPeerID() -> Data {
+        // The keychain load runs INSIDE the lock, not around it: two
+        // threads entering SecItemCopyMatching concurrently (e.g. the
+        // startup warm-up and a handshake's default argument) contend on
+        // securityd's own mutex and stall for seconds on unsigned dev
+        // builds. Serializing here means exactly one keychain call ever
+        // happens; every later caller reads the cache.
         cacheLock.lock()
-        if let cachedID {
-            cacheLock.unlock()
-            return cachedID
-        }
-        cacheLock.unlock()
+        defer { cacheLock.unlock() }
+        if let cachedID { return cachedID }
         let id = (try? loadOrCreate()) ?? ((try? makeRandomID()) ?? Data(count: byteCount))
-        cacheLock.lock()
         cachedID = id
-        cacheLock.unlock()
         return id
     }
 
