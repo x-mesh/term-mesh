@@ -202,31 +202,32 @@ impl LayoutStore {
     /// Remove the pane containing `pane_id`, promoting its sibling. The
     /// removed pane's surfaces are returned so the caller can kill their
     /// PTYs (outside the layout lock).
+    ///
+    /// Delegates uniformly to `close_in` regardless of whether `root` is
+    /// itself a `Pane` or a `Split` — a bare-`Pane` root with more than
+    /// one tab (grown via `add_tab` without ever splitting) must remove
+    /// just that tab like any other multi-tab pane, not be refused as the
+    /// "last pane". `close_in`'s `Split` branch always resolves a child's
+    /// `RemoveMe` into `Closed` by promoting the sibling in its place, so
+    /// `RemoveMe` reaching *this* level means `root` itself has no parent
+    /// to promote into: it was a `Pane` that just lost its last tab. That
+    /// is the only real "last pane" case, and `close_in` leaves the node
+    /// unmutated on that path, so putting `root` back is always safe.
     pub fn close_pane(&mut self, pane_id: &[u8]) -> Result<Vec<SurfaceId>, LayoutError> {
-        match self.root.take() {
-            None => Err(LayoutError::NotFound),
-            Some(LayoutNode::Pane { active, tabs }) => {
-                // Sole pane in the workspace: refuse, put it back untouched.
-                let found = tabs.iter().any(|t| t == pane_id);
-                self.root = Some(LayoutNode::Pane { active, tabs });
-                Err(if found { LayoutError::LastPane } else { LayoutError::NotFound })
+        let Some(mut root) = self.root.take() else { return Err(LayoutError::NotFound) };
+        match Self::close_in(&mut root, pane_id) {
+            CloseOutcome::NotHere => {
+                self.root = Some(root);
+                Err(LayoutError::NotFound)
             }
-            Some(mut root) => match Self::close_in(&mut root, pane_id) {
-                CloseOutcome::NotHere => {
-                    self.root = Some(root);
-                    Err(LayoutError::NotFound)
-                }
-                CloseOutcome::Closed(removed) => {
-                    self.root = Some(root);
-                    Ok(removed)
-                }
-                CloseOutcome::RemoveMe(removed) => {
-                    // Root itself was the split whose child died — its
-                    // sibling was already promoted into `root` by close_in.
-                    self.root = Some(root);
-                    Ok(removed)
-                }
-            },
+            CloseOutcome::Closed(removed) => {
+                self.root = Some(root);
+                Ok(removed)
+            }
+            CloseOutcome::RemoveMe(_) => {
+                self.root = Some(root);
+                Err(LayoutError::LastPane)
+            }
         }
     }
 
@@ -616,10 +617,26 @@ impl PeerHost {
         }
     }
 
+    /// Ceiling on total registered `PtyManager` surfaces (declared +
+    /// ephemeral) a `SplitPane`/`NewTab` may push past. `HandshakeState::Ready`
+    /// requires only the ssh-passthrough handshake — the entire trust model
+    /// documented for a daemon host — so without this, any peer that can
+    /// open the socket could loop split requests to exhaust the daemon
+    /// uid's PIDs/fds/PTYs. Counting `self.pty.list()` rather than the
+    /// layout tree matters: it is only a faithful, un-inflatable count
+    /// because closing an ephemeral surface now also drops its spec (see
+    /// `PtyManager::remove`) — before that fix, a closed-then-directly-
+    /// reattached surface would respawn outside the tree and bypass a
+    /// tree-based cap entirely.
+    const MAX_PEER_SURFACES: usize = 64;
+
     fn split_pane(self: &Arc<Self>, pane_id: &[u8], orientation: &str) -> bool {
         let Some(orientation) = Orientation::parse(orientation) else {
             return false; // F4
         };
+        if self.pty.list().len() >= Self::MAX_PEER_SURFACES {
+            return false;
+        }
         // Cheap existence probe before paying for a fork. The tree can
         // still change before the insert below — that race is resolved by
         // rolling the spawn back.
@@ -642,6 +659,9 @@ impl PeerHost {
     }
 
     fn new_tab(self: &Arc<Self>, pane_id: &[u8]) -> bool {
+        if self.pty.list().len() >= Self::MAX_PEER_SURFACES {
+            return false;
+        }
         if !self.layout.lock().unwrap().surface_ids().iter().any(|s| s == pane_id) {
             return false;
         }
@@ -663,10 +683,11 @@ impl PeerHost {
             // "nothing happened", same as the Swift host.
             Err(_) => return false,
         };
-        // PTYs die outside the layout lock. The spec (when one exists)
-        // stays registered: a daemon restart resets the tree anyway, and
-        // declared surfaces reappearing after a restart is the agreed
-        // semantic.
+        // PTYs die outside the layout lock. `PtyManager::remove` decides
+        // spec fate: declared surfaces keep theirs (a restart brings them
+        // back via TERMMESH_PEER_SURFACES anyway), ephemeral ones lose
+        // theirs so a closed split/new-tab pane cannot respawn via a raw
+        // AttachSurface for the same id.
         for sid in removed {
             self.pty.remove(&sid);
         }
@@ -674,9 +695,12 @@ impl PeerHost {
     }
 
     /// Fork a login shell for a split/new-tab pane, inheriting the source
-    /// pane's cwd. Registered with a respawn spec so a dead ephemeral
-    /// pane revives on attach just like declared surfaces do, and watched
-    /// so a shell that exits on its own removes its pane from the tree.
+    /// pane's cwd. Registered *ephemeral* — the pane revives on attach
+    /// while it's still dead-but-present in the tree (same as declared
+    /// surfaces), but the respawn spec is dropped the moment it's
+    /// actually removed (explicit close, or the dead-watcher below), so
+    /// closing it is permanent for this daemon lifetime and a raw
+    /// `AttachSurface` for the same id can't resurrect it.
     fn spawn_ephemeral(self: &Arc<Self>, source_pane: &[u8]) -> Option<SurfaceId> {
         let cwd = self
             .pty
@@ -695,9 +719,9 @@ impl PeerHost {
             rows: 24,
             cwd,
         };
-        self.pty.register_and_spawn(surface_id.clone(), spec);
-        // register_and_spawn logs-and-continues on failure; only report a
-        // surface that actually exists.
+        self.pty.register_and_spawn_ephemeral(surface_id.clone(), spec);
+        // register_and_spawn_ephemeral logs-and-continues on failure; only
+        // report a surface that actually exists.
         let surface = self.pty.list().into_iter().find(|s| s.surface_id == surface_id)?;
         self.watch_ephemeral(surface);
         Some(surface_id)
@@ -850,6 +874,24 @@ mod tests {
         assert_eq!(store.surface_ids(), vec![sid("a")]);
     }
 
+    /// F1 regression: a single-pane workspace (root is a bare Pane, the
+    /// common default — one declared surface, never split) grown to
+    /// multiple tabs via add_tab must let non-last tabs close normally.
+    /// The pre-fix code refused every close as LastPane the moment root
+    /// was a Pane, regardless of tabs.len().
+    #[test]
+    fn close_tab_in_single_pane_workspace_when_not_last() {
+        let mut store = store_with(&["a"]);
+        store.add_tab(&sid("a"), sid("b")).unwrap();
+        // root is still a bare Pane (no split ever happened), now with 2 tabs.
+        let removed = store.close_pane(&sid("a")).unwrap();
+        assert_eq!(removed, vec![sid("a")]);
+        assert_eq!(store.surface_ids(), vec![sid("b")]);
+        // Only the true last tab is refused.
+        assert_eq!(store.close_pane(&sid("b")).unwrap_err(), LayoutError::LastPane);
+        assert_eq!(store.surface_ids(), vec![sid("b")]);
+    }
+
     #[test]
     fn double_close_second_is_notfound() {
         let mut store = store_with(&["a", "b", "c"]);
@@ -962,6 +1004,31 @@ mod tests {
             cursor = split.first.as_ref().expect("first child");
         }
         assert_eq!(depth, 512);
+    }
+
+    /// F4 regression: SplitPane must stop forking shells once the
+    /// registered-surface ceiling is hit, rather than letting any peer
+    /// that can reach Ready (ssh-passthrough is the entire trust model)
+    /// exhaust the daemon uid's PIDs/PTYs. Splits the same base pane far
+    /// past the cap and confirms the surface count halts exactly there.
+    #[tokio::test]
+    async fn split_pane_stops_at_surface_cap() {
+        let manager = Arc::new(PtyManager::new());
+        let base = PtySurface::spawn(sid("base"), "cat".into(), "/bin/cat", &[], 80, 24, None)
+            .expect("spawn /bin/cat");
+        manager.insert_surface(base);
+        let host = Arc::new(PeerHost::new(manager));
+
+        for _ in 0..(PeerHost::MAX_PEER_SURFACES + 20) {
+            host.apply_control(WorkspaceControl {
+                kind: Some(workspace_control::Kind::SplitPane(peer_proto::v1::SplitPaneRequest {
+                    pane_id: sid("base"),
+                    orientation: "horizontal".into(),
+                })),
+            });
+        }
+
+        assert_eq!(host.pty.list().len(), PeerHost::MAX_PEER_SURFACES);
     }
 
     /// R8 end to end inside the daemon: split spawns a real login shell,

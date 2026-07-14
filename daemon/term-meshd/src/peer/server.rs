@@ -1996,4 +1996,103 @@ mod integration_tests {
         shutdown_tx.send(true).unwrap();
         let _ = tokio::time::timeout(std::time::Duration::from_secs(3), server_task).await;
     }
+
+    /// F2 regression: closing an ephemeral (split-spawned) pane must be
+    /// permanent for this daemon lifetime — a raw AttachSurface for the
+    /// same id, bypassing WorkspaceControl entirely, must not resurrect
+    /// it. Before the fix, remove() left the respawn spec in place and
+    /// get_or_respawn happily revived it.
+    #[tokio::test]
+    async fn closed_ephemeral_pane_does_not_respawn_via_direct_attach() {
+        let tmp = TempDir::new().unwrap();
+        let sock_path = tmp.path().join("peer.sock");
+        let manager = cat_manager();
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let sock_path_task = sock_path.clone();
+        let server_task = tokio::spawn(async move {
+            serve_with_manager(sock_path_task, shutdown_rx, manager).await.unwrap();
+        });
+        for _ in 0..50 {
+            if sock_path.exists() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+
+        let (mut reader, mut writer) = handshake(&sock_path).await;
+        let base_pane = first_pane_id(&mut reader, &mut writer).await;
+
+        write_envelope(
+            &mut writer,
+            &control(
+                4,
+                workspace_control::Kind::SplitPane(SplitPaneRequest {
+                    pane_id: base_pane.clone(),
+                    orientation: "horizontal".into(),
+                }),
+            ),
+        )
+        .await
+        .unwrap();
+        let layout = next_layout_push(&mut reader, PUSH_WINDOW).await.expect("split pushed");
+        assert_eq!(count_panes(&layout), 2);
+        // The ephemeral pane is whichever leaf isn't the original base pane.
+        let ephemeral_id = other_pane(&layout, &base_pane);
+
+        write_envelope(
+            &mut writer,
+            &control(
+                5,
+                workspace_control::Kind::ClosePane(ClosePaneRequest {
+                    pane_id: ephemeral_id.clone(),
+                }),
+            ),
+        )
+        .await
+        .unwrap();
+        let after_close = next_layout_push(&mut reader, PUSH_WINDOW).await.expect("close pushed");
+        assert_eq!(count_panes(&after_close), 1, "ephemeral pane removed from the tree");
+
+        // Directly attach the closed id, bypassing WorkspaceControl.
+        write_envelope(
+            &mut writer,
+            &Envelope {
+                seq: 6,
+                correlation_id: 0,
+                payload: Some(Payload::AttachSurface(AttachSurface {
+                    surface_id: ephemeral_id,
+                    mode: AttachMode::CoWrite as i32,
+                    client_cols: 80,
+                    client_rows: 24,
+                    resume_from_seq: 0,
+                })),
+            },
+        )
+        .await
+        .unwrap();
+        let attach_reply = read_envelope(&mut reader).await.unwrap();
+        match attach_reply.payload {
+            Some(Payload::AttachResult(r)) => {
+                assert!(!r.accepted, "closed ephemeral surface must not respawn via direct attach")
+            }
+            other => panic!("expected AttachResult, got {other:?}"),
+        }
+
+        shutdown_tx.send(true).unwrap();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(3), server_task).await;
+    }
+
+    fn other_pane(layout: &peer_proto::v1::WorkspaceLayout, known: &[u8]) -> Vec<u8> {
+        match layout.node.as_ref().unwrap() {
+            peer_proto::v1::workspace_layout::Node::Pane(p) => p.surface_id.clone(),
+            peer_proto::v1::workspace_layout::Node::Split(s) => {
+                let first = other_pane(s.first.as_ref().unwrap(), known);
+                if first != known {
+                    first
+                } else {
+                    other_pane(s.second.as_ref().unwrap(), known)
+                }
+            }
+        }
+    }
 }
