@@ -1,0 +1,18 @@
+# Cap default test parallelism for this workspace.
+#
+# Several term-meshd integration tests (peer/*, headless/*) fork real OS
+# processes (PTY children via forkpty, `/bin/sh` children) and poll for
+# state with fixed wall-clock budgets (500ms-3s). Under this machine's
+# full default parallelism (one thread per core, 16 here), enough tests
+# fork/exec concurrently that OS scheduling latency occasionally exceeds
+# those budgets — a different test fails each run, never the same one
+# twice. Confirmed empirically: 5/5 full-suite runs failed at the cargo
+# default thread count, 0/5 failed at --test-threads=2 (suite still
+# finishes in ~9s either way, so the cost of capping is negligible).
+#
+# This is CPU-oversubscription flakiness, not a logic race in any one
+# test — see the mem-mesh incident memory for the reproduction data
+# (`--test-threads=4` and `=8` also still failed intermittently; only
+# `=2` was clean across repeated runs).
+[env]
+RUST_TEST_THREADS = "2"
