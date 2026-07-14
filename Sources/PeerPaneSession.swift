@@ -58,6 +58,11 @@ enum PeerPaneHostKey: Hashable, CustomStringConvertible {
         return nil
     }
 
+    var remoteSockPath: String? {
+        if case .ssh(_, let remoteSockPath) = self { return remoteSockPath }
+        return nil
+    }
+
     var description: String {
         switch self {
         case .direct(let sockPath): return sockPath
@@ -226,6 +231,7 @@ final class PeerPaneSession {
             hostSockPath: relaySession.hostSockPath,
             hostDisplayName: relaySession.hostDisplayName,
             sshTarget: lease.key.sshTarget,
+            remoteSockPath: lease.key.remoteSockPath,
             targetTitle: surfaceTitle.isEmpty ? "<surface>" : surfaceTitle,
             connectedAt: connectedAt
         )

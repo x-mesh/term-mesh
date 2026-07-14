@@ -779,12 +779,12 @@ struct RemoteHostGroupView: View {
                             .padding(.bottom, 1)
                             .frame(maxWidth: .infinity, alignment: .leading)
                         ForEach(group.items) { workspace in
-                            RemoteWorkspaceRowView(workspace: workspace, store: store)
+                            RemoteWorkspaceRowView(workspace: workspace, host: host, store: store)
                         }
                     }
                 } else {
                     ForEach(host.workspaces) { workspace in
-                        RemoteWorkspaceRowView(workspace: workspace, store: store)
+                        RemoteWorkspaceRowView(workspace: workspace, host: host, store: store)
                     }
                 }
             }
@@ -820,6 +820,11 @@ struct RemoteHostGroupView: View {
 
 struct RemoteWorkspaceRowView: View {
     let workspace: WorkspaceSummary
+    /// The host group this row is rendered under. Passed explicitly so the
+    /// mirror open uses THIS host's spec (SSH vs direct) — a workspace.id can
+    /// be shared across host groups (same daemon reached two ways), so an
+    /// id-based reverse lookup could pick the wrong (non-SSH) host.
+    let host: HostEntry
     let store: RemoteHostStore
     @State private var isHovering = false
 
@@ -851,12 +856,12 @@ struct RemoteWorkspaceRowView: View {
             // Live mirror (Phase 2B): host-authoritative layout sync —
             // splits/closes follow the host and local actions forward.
             Button("Open as Live Workspace in Main Window") {
-                store.openWorkspaceAsMirror(workspace, live: true)
+                store.openWorkspaceAsMirror(workspace, host: host, live: true)
             }
             // Snapshot (Phase 2A): copy the layout once, then the local
             // workspace owns it.
             Button("Open as Snapshot Workspace") {
-                store.openWorkspaceAsMirror(workspace, live: false)
+                store.openWorkspaceAsMirror(workspace, host: host, live: false)
             }
         }
         .onHover { isHovering = $0 }

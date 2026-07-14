@@ -53,6 +53,23 @@ struct HostEntry: Identifiable {
     /// The most-recently-used ephemeral sock path. Updated on each reconnect so
     /// that fetchWorkspaces always connects over the current live tunnel.
     var activeSockPath: String
+    /// SSH reach info when this host was opened over an `ssh -L` tunnel.
+    /// Present → sidebar pane/mirror opens derive an `.ssh` spec that leases
+    /// its own tunnel (surviving the origin relay closing + reconnects);
+    /// nil → direct-socket host that rides the shared live socket.
+    var sshTarget: String?
+    var remoteSockPath: String?
+
+    /// Host spec for opening a pane/mirror from this entry. Prefers an owned
+    /// `.ssh` tunnel when both SSH fields are known; otherwise falls back to
+    /// `.direct` on the live local socket (legacy Phase-1 behavior).
+    var paneHostSpec: PeerPaneHostSpec {
+        if let sshTarget, !sshTarget.isEmpty,
+           let remoteSockPath, !remoteSockPath.isEmpty {
+            return .ssh(target: sshTarget, remoteSockPath: remoteSockPath)
+        }
+        return .direct(sockPath: activeSockPath)
+    }
 }
 
 @MainActor
@@ -111,7 +128,9 @@ final class RemoteHostStore: ObservableObject {
                     displayName: conn.hostDisplay,
                     isConnected: true,
                     workspaces: [],
-                    activeSockPath: conn.hostSockPath
+                    activeSockPath: conn.hostSockPath,
+                    sshTarget: conn.sshTarget,
+                    remoteSockPath: conn.remoteSockPath
                 )
                 // Pass the actual (possibly ephemeral) sock path for the relay
                 // connection, but store results under the stable key.
@@ -120,6 +139,14 @@ final class RemoteHostStore: ObservableObject {
                 hosts[key]?.isConnected = true
                 if !conn.hostDisplay.isEmpty {
                     hosts[key]?.displayName = conn.hostDisplay
+                }
+                // Backfill SSH reach info once a connection carrying it arrives
+                // (e.g. a direct-first entry later joined by its SSH tunnel).
+                if let ssh = conn.sshTarget, !ssh.isEmpty {
+                    hosts[key]?.sshTarget = ssh
+                }
+                if let remote = conn.remoteSockPath, !remote.isEmpty {
+                    hosts[key]?.remoteSockPath = remote
                 }
                 // P1 fix: SSH reconnects produce a new ephemeral hostSockPath.
                 // If it changed, refresh activeSockPath and re-fetch workspaces so
@@ -203,24 +230,29 @@ final class RemoteHostStore: ObservableObject {
     }
 
     /// Phase 1 remote pane primitive: surface picker + attach into the
-    /// current workspace, riding this host's live local socket.
+    /// current workspace. SSH hosts lease their own tunnel (`.ssh` spec) so
+    /// the pane survives the origin relay closing and reconnects; direct
+    /// hosts ride the shared live socket (`.direct`).
     func openSurfaceAsPane(_ host: HostEntry) {
-        let sockPath = host.activeSockPath
-        guard !sockPath.isEmpty else { return }
+        let spec = host.paneHostSpec
         Task {
-            await PeerClientCoordinator.shared.openRemotePaneDirect(sockPath: sockPath)
+            await PeerClientCoordinator.shared.openRemotePane(spec: spec)
         }
     }
 
     /// Open this host workspace as a main-window workspace mirror.
     /// live=true (Phase 2B): host-authoritative layout sync; false
     /// (Phase 2A): one-shot snapshot placement, local layout afterwards.
-    func openWorkspaceAsMirror(_ workspace: WorkspaceSummary, live: Bool = true) {
-        let sockPath = workspace.hostSockPath
-        guard !sockPath.isEmpty else { return }
+    /// `host` is the sidebar group the row was rendered under — its spec
+    /// decides SSH vs direct. SSH hosts open over an owned `.ssh` tunnel so
+    /// the mirror survives the origin relay closing and daemon/network
+    /// reconnects (the tunnel's local socket is re-derived per reconnect);
+    /// direct hosts fall back to `.direct` on the live socket.
+    func openWorkspaceAsMirror(_ workspace: WorkspaceSummary, host: HostEntry, live: Bool = true) {
+        let spec = host.paneHostSpec
         Task {
             await PeerClientCoordinator.shared.openRemoteWorkspaceMirror(
-                spec: .direct(sockPath: sockPath),
+                spec: spec,
                 workspaceID: workspace.id,
                 live: live
             )

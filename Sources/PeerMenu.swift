@@ -544,13 +544,14 @@ final class PeerClientCoordinator: NSObject {
         }
     }
 
-    /// Direct-socket variant — used by the sidebar's Remote Hosts
-    /// section to ride an already-live connection's local socket.
-    /// Limitation (Phase 1): a lease keyed on an ephemeral tunnel socket
-    /// owns no tunnel of its own, so if the connection that created the
-    /// tunnel closes, panes opened this way disconnect with it.
-    func openRemotePaneDirect(sockPath: String) async {
-        await openRemotePaneFlow(spec: .direct(sockPath: sockPath))
+    /// Sidebar entry — open a chosen surface as a pane in the current
+    /// workspace using an explicit host spec. SSH hosts pass `.ssh(...)`
+    /// so the pane leases its own tunnel and survives the origin relay
+    /// closing plus reconnects (the tunnel's ephemeral local socket is
+    /// re-derived per reconnect); direct hosts pass `.direct(...)` and
+    /// still ride the shared live socket.
+    func openRemotePane(spec: PeerPaneHostSpec) async {
+        await openRemotePaneFlow(spec: spec)
     }
 
     /// Shared tail: lease → list surfaces → pick → attach → split into
@@ -1751,6 +1752,7 @@ final class PeerConsoleWindowController: NSWindowController, NSWindowDelegate {
             hostSockPath: hostSockPath,
             hostDisplayName: hostName,
             sshTarget: nil,
+            remoteSockPath: nil,
             targetTitle: surfaceTitle.isEmpty ? "<surface>" : surfaceTitle,
             connectedAt: connectedAt
         )
