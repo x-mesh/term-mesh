@@ -14,8 +14,9 @@ use std::sync::Arc;
 
 use peer_proto::v1::envelope::Payload;
 use peer_proto::v1::{
-    workspace_update, AttachMode, AttachResult, AuthChallenge, AuthResult, Envelope, Error, Hello,
-    Pong, PtyData, SurfaceList, WorkspaceMeta, WorkspaceUpdate,
+    workspace_layout, workspace_update, AttachMode, AttachResult, AuthChallenge, AuthResult,
+    Envelope, Error, Hello, PaneTab, Pong, PtyData, SurfaceList, Workspace, WorkspaceLayout,
+    WorkspaceList, WorkspaceMeta, WorkspacePane, WorkspaceSplit, WorkspaceUpdate,
 };
 use peer_proto::{capability, PeerCapabilities};
 use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
@@ -183,6 +184,36 @@ async fn reader_loop(
                     seq: next_seq(&seq_counter),
                     correlation_id: env.seq,
                     payload: Some(Payload::SurfaceList(SurfaceList { surfaces })),
+                };
+                send(&outgoing_tx, reply).await?;
+            }
+
+            (HandshakeState::Ready, Payload::ListWorkspaces(_)) => {
+                // A daemon-only host has no bonsplit windows to mirror — it
+                // owns a flat set of forkpty surfaces. Clients (the macOS app)
+                // enter every peer session through ListWorkspaces though, and
+                // leaving it unanswered stalls them until their 10s read
+                // timeout fires, which reads as "the host is broken".
+                //
+                // So synthesise one workspace whose layout tiles the surfaces.
+                // The app then renders them as panes over its normal path, with
+                // no client-side special case for daemon hosts.
+                let surfaces = manager.list();
+                let reply = Envelope {
+                    seq: next_seq(&seq_counter),
+                    correlation_id: env.seq,
+                    payload: Some(Payload::WorkspaceList(WorkspaceList {
+                        workspaces: vec![Workspace {
+                            workspace_id: super::surface::surface_id_from_name(DAEMON_WORKSPACE),
+                            title: hostname_or(DAEMON_WORKSPACE),
+                            layout: tile_surfaces(&surfaces),
+                            // Empty window_id: clients read that as the legacy
+                            // "single implied window" flat list, which is what
+                            // a daemon host actually is.
+                            window_id: Vec::new(),
+                            window_title: String::new(),
+                        }],
+                    })),
                 };
                 send(&outgoing_tx, reply).await?;
             }
@@ -471,6 +502,76 @@ fn host_hello(seq_counter: &AtomicU64) -> Envelope {
 
 fn next_seq(seq_counter: &AtomicU64) -> u64 {
     seq_counter.fetch_add(1, Ordering::Relaxed) + 1
+}
+
+/// Name of the single workspace a daemon-only host synthesises. Hashed
+/// through `surface_id_from_name`, so the id is stable across restarts
+/// and the client can keep referring to the same workspace.
+const DAEMON_WORKSPACE: &str = "term-meshd";
+
+fn hostname_or(fallback: &str) -> String {
+    std::env::var("HOSTNAME")
+        .ok()
+        .filter(|h| !h.is_empty())
+        .or_else(|| {
+            std::fs::read_to_string("/etc/hostname")
+                .ok()
+                .map(|h| h.trim().to_string())
+                .filter(|h| !h.is_empty())
+        })
+        .unwrap_or_else(|| fallback.to_string())
+}
+
+/// Lay the host's surfaces out as a balanced split tree so every one of
+/// them is visible at once — the daemon has no bonsplit layout of its own
+/// to mirror, and tiling beats stacking them as tabs because tab
+/// switching needs `WorkspaceControl`, which a daemon host does not serve.
+///
+/// Splits alternate orientation by depth, so 4 surfaces land in a 2x2
+/// rather than four thin columns. Returns `None` when there are no
+/// surfaces; the client renders that as an empty workspace.
+fn tile_surfaces(surfaces: &[Arc<PtySurface>]) -> Option<WorkspaceLayout> {
+    fn build(surfaces: &[Arc<PtySurface>], depth: usize) -> Option<WorkspaceLayout> {
+        match surfaces.len() {
+            0 => None,
+            1 => {
+                let info = surfaces[0].info();
+                Some(WorkspaceLayout {
+                    node: Some(workspace_layout::Node::Pane(WorkspacePane {
+                        surface_id: info.surface_id.clone(),
+                        title: info.title.clone(),
+                        cols: info.cols,
+                        rows: info.rows,
+                        cwd: info.cwd.clone(),
+                        // The pane holds exactly one surface, and the active
+                        // tab must also appear in `tabs` per the schema.
+                        tabs: vec![PaneTab {
+                            surface_id: info.surface_id,
+                            title: info.title,
+                        }],
+                    })),
+                })
+            }
+            n => {
+                let mid = n / 2;
+                let first = build(&surfaces[..mid], depth + 1)?;
+                let second = build(&surfaces[mid..], depth + 1)?;
+                Some(WorkspaceLayout {
+                    node: Some(workspace_layout::Node::Split(Box::new(WorkspaceSplit {
+                        orientation: if depth % 2 == 0 { "horizontal" } else { "vertical" }
+                            .to_string(),
+                        divider_position: 0.5,
+                        first: Some(Box::new(first)),
+                        second: Some(Box::new(second)),
+                        // The daemon has no stable bonsplit split ids to hand
+                        // out; the schema allows this to be empty.
+                        split_id: Vec::new(),
+                    }))),
+                })
+            }
+        }
+    }
+    build(surfaces, 0)
 }
 
 fn random_peer_bytes(len: usize) -> Vec<u8> {
