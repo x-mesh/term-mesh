@@ -73,6 +73,10 @@ async fn reader_loop(
     let manager = host.pty.clone();
     let mut state = HandshakeState::Init;
     let mut attached: HashMap<Vec<u8>, AttachEntry> = HashMap::new();
+    // RAII registration with the layout broadcaster; populated when the
+    // handshake reaches Ready, dropped (= unregistered) with this frame.
+    // Underscore: the binding exists for its Drop, it is never read.
+    let mut _broadcast_guard: Option<layout::BroadcastGuard> = None;
     // Parsed once out of the client's Hello and kept for the rest of the
     // connection — plumbing only for now (see P3, docs/peer-perf-proposal.md):
     // nothing branches on it yet, but future wire changes (P8 and later)
@@ -171,6 +175,11 @@ async fn reader_loop(
                 };
                 send(&outgoing_tx, accept).await?;
                 state = HandshakeState::Ready;
+                // From Ready on, this connection receives layout pushes
+                // triggered by any connection's WorkspaceControl. The guard
+                // unregisters on connection teardown (any exit path).
+                _broadcast_guard =
+                    Some(host.clients.register(outgoing_tx.clone(), seq_counter.clone()));
                 tracing::info!("peer authenticated (ssh-passthrough)");
             }
 
@@ -218,6 +227,17 @@ async fn reader_loop(
                     })),
                 };
                 send(&outgoing_tx, reply).await?;
+            }
+
+            (HandshakeState::Ready, Payload::WorkspaceControl(ctl)) => {
+                // Fire-and-forget by protocol design (peer.proto Workspace
+                // control header): NEVER answer this — not on success, not
+                // on refusal. The only observable result is the
+                // WorkspaceLayoutChanged push apply_control schedules when
+                // the tree actually changed; an invalid or refused command
+                // (unknown ids, last-pane close, garbage orientation) is a
+                // silent no-op exactly like the Swift host's perform*.
+                host.apply_control(ctl);
             }
 
             (HandshakeState::Ready, Payload::AttachSurface(req)) => {

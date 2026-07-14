@@ -277,6 +277,16 @@ impl PtySurface {
         Ok(surface)
     }
 
+    /// Ask the child to exit now (SIGHUP, what it would get on a real
+    /// terminal hangup). fd/reap cleanup still happens in `Drop`; this
+    /// only decouples "the shell dies" from "the last viewer detaches".
+    pub fn hangup(&self) {
+        // Safety: signalling a child pid we spawned and still own.
+        unsafe {
+            libc::kill(self.pid, libc::SIGHUP);
+        }
+    }
+
     pub fn subscribe(&self) -> broadcast::Receiver<PtyChunk> {
         self.broadcast_tx.subscribe()
     }
@@ -484,6 +494,26 @@ impl PtyManager {
         // Stable ordering for UI/CLI display.
         v.sort_by(|a, b| a.title.cmp(&b.title));
         v
+    }
+
+    /// Close a pane's surface: hang the child up and drop it from the
+    /// roster. The respawn spec (when one exists) is deliberately kept —
+    /// closing a declared surface removes it for this daemon lifetime
+    /// only; a restart brings the `TERMMESH_PEER_SURFACES` set back.
+    ///
+    /// The SIGHUP is explicit rather than left to `Drop` because attach
+    /// relays hold `Arc` clones: waiting for the last clone would keep
+    /// the shell running until every viewer detaches, which is not what
+    /// "close" means.
+    pub fn remove(&self, surface_id: &[u8]) -> bool {
+        let removed = self.surfaces.write().unwrap().remove(surface_id);
+        match removed {
+            Some(surface) => {
+                surface.hangup();
+                true
+            }
+            None => false,
+        }
     }
 
     /// Return a live surface for `surface_id`, respawning if the

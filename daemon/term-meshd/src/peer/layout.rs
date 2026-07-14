@@ -16,15 +16,18 @@
 //! outside the lock.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use peer_proto::v1::{
-    workspace_layout, Envelope, PaneTab, WorkspaceLayout, WorkspacePane, WorkspaceSplit,
+    envelope::Payload, workspace_control, workspace_layout, workspace_update, Envelope, PaneTab,
+    WorkspaceControl, WorkspaceLayout, WorkspaceLayoutChanged, WorkspacePane, WorkspaceSplit,
+    WorkspaceUpdate,
 };
 use tokio::sync::mpsc;
 
-use super::surface::{surface_id_from_name, PtyManager, PtySurface};
+use super::surface::{surface_id_from_name, PtyManager, PtySurface, SpawnSpec};
 
 pub type SurfaceId = Vec<u8>;
 
@@ -359,9 +362,11 @@ impl LayoutStore {
     }
 
     /// Drop a surface wherever it appears — used when an ephemeral
-    /// (split-spawned) surface's shell exits on its own. Unlike
+    /// (split-spawned) surface's shell exits on its own (the dead-watcher
+    /// wiring lands with the lifecycle task; only tests call this so far). Unlike
     /// `close_pane` this may empty the tree entirely: a self-exit is not
     /// a user request, so there is nothing to refuse.
+    #[allow(dead_code)]
     pub fn remove_surface(&mut self, surface_id: &[u8]) -> bool {
         match self.close_pane(surface_id) {
             Ok(_) => true,
@@ -478,8 +483,16 @@ pub const DAEMON_WORKSPACE: &str = "term-meshd";
 /// change; that is acceptable for a cosmetic push and avoids unbounded
 /// buffering.
 pub struct Broadcaster {
-    clients: Mutex<HashMap<u64, mpsc::Sender<Envelope>>>,
+    clients: Mutex<HashMap<u64, RegisteredClient>>,
     next_id: AtomicU64,
+}
+
+#[derive(Clone)]
+struct RegisteredClient {
+    tx: mpsc::Sender<Envelope>,
+    /// The connection's own outgoing seq counter — pushes must continue
+    /// each connection's monotonic sequence, not share a global one.
+    seq: Arc<AtomicU64>,
 }
 
 impl Broadcaster {
@@ -487,19 +500,29 @@ impl Broadcaster {
         Self { clients: Mutex::new(HashMap::new()), next_id: AtomicU64::new(1) }
     }
 
-    pub fn register(self: &Arc<Self>, tx: mpsc::Sender<Envelope>) -> BroadcastGuard {
+    pub fn register(
+        self: &Arc<Self>,
+        tx: mpsc::Sender<Envelope>,
+        seq: Arc<AtomicU64>,
+    ) -> BroadcastGuard {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-        self.clients.lock().unwrap().insert(id, tx);
+        self.clients.lock().unwrap().insert(id, RegisteredClient { tx, seq });
         BroadcastGuard { broadcaster: Arc::clone(self), id }
     }
 
-    /// Fan an envelope out to every registered connection. Clone-then-send:
-    /// the guard is released before any channel interaction.
-    pub fn broadcast(&self, env: &Envelope) {
-        let senders: Vec<mpsc::Sender<Envelope>> =
+    /// Fan a payload out to every registered connection, stamping each
+    /// envelope with that connection's next seq. Clone-then-send: the
+    /// guard is released before any channel interaction.
+    pub fn broadcast(&self, payload: &peer_proto::v1::envelope::Payload) {
+        let clients: Vec<RegisteredClient> =
             self.clients.lock().unwrap().values().cloned().collect();
-        for tx in senders {
-            if tx.try_send(env.clone()).is_err() {
+        for client in clients {
+            let env = Envelope {
+                seq: client.seq.fetch_add(1, Ordering::Relaxed) + 1,
+                correlation_id: 0,
+                payload: Some(payload.clone()),
+            };
+            if client.tx.try_send(env).is_err() {
                 tracing::debug!("layout push skipped: peer outgoing channel full or closed");
             }
         }
@@ -532,7 +555,19 @@ pub struct PeerHost {
     pub layout: Mutex<LayoutStore>,
     pub clients: Arc<Broadcaster>,
     pub workspace_id: Vec<u8>,
+    /// Names split/new-tab surfaces (`split-1`, `split-2`, …). Lifetime
+    /// of this daemon only, like the tree itself.
+    ephemeral_counter: AtomicU64,
+    /// True while a debounced layout push is pending — collapses a burst
+    /// of mutations (divider drags especially) into one push.
+    push_scheduled: AtomicBool,
 }
+
+/// Debounce window for layout pushes. Mirrors the Swift host's 120 ms
+/// (`PeerServerHost.scheduleLayoutBroadcast`); the client itself debounces
+/// divider sends at 150 ms, so anything in this range coalesces a drag
+/// into a handful of pushes instead of hundreds.
+const PUSH_DEBOUNCE: Duration = Duration::from_millis(120);
 
 impl PeerHost {
     pub fn new(pty: Arc<PtyManager>) -> Self {
@@ -542,7 +577,151 @@ impl PeerHost {
             layout: Mutex::new(layout),
             clients: Arc::new(Broadcaster::new()),
             workspace_id: surface_id_from_name(DAEMON_WORKSPACE),
+            ephemeral_counter: AtomicU64::new(1),
+            push_scheduled: AtomicBool::new(false),
         }
+    }
+
+    /// Apply one WorkspaceControl command. Fire-and-forget end to end:
+    /// nothing is ever sent back to the requester specifically — a
+    /// mutation that changed the tree schedules a push to everyone, and
+    /// anything invalid (unknown ids, bad orientation, last-pane close,
+    /// F1–F8 adversarial shapes) drops silently, exactly like the Swift
+    /// host's `perform*` guards.
+    pub fn apply_control(self: &Arc<Self>, ctl: WorkspaceControl) {
+        use workspace_control::Kind;
+        let changed = match ctl.kind {
+            // F8: a kind this build predates. Ignore, don't disconnect.
+            None => false,
+            // R10: the daemon has no keyboard focus to move, and the Swift
+            // host deliberately no-ops this too.
+            Some(Kind::FocusPane(_)) => false,
+            Some(Kind::SplitPane(req)) => self.split_pane(&req.pane_id, &req.orientation),
+            Some(Kind::ClosePane(req)) => self.close_pane(&req.pane_id),
+            Some(Kind::SetDivider(req)) => self
+                .layout
+                .lock()
+                .unwrap()
+                .set_divider(&req.split_id, req.ratio)
+                .unwrap_or(false),
+            Some(Kind::NewTab(req)) => self.new_tab(&req.pane_id),
+            Some(Kind::ActivateTab(req)) => self
+                .layout
+                .lock()
+                .unwrap()
+                .activate_tab(&req.pane_id, &req.surface_id)
+                .unwrap_or(false),
+        };
+        if changed {
+            self.schedule_layout_push();
+        }
+    }
+
+    fn split_pane(self: &Arc<Self>, pane_id: &[u8], orientation: &str) -> bool {
+        let Some(orientation) = Orientation::parse(orientation) else {
+            return false; // F4
+        };
+        // Cheap existence probe before paying for a fork. The tree can
+        // still change before the insert below — that race is resolved by
+        // rolling the spawn back.
+        if !self.layout.lock().unwrap().surface_ids().iter().any(|s| s == pane_id) {
+            return false;
+        }
+        let Some(new_id) = self.spawn_ephemeral(pane_id) else { return false };
+        match self.layout.lock().unwrap().split_pane(pane_id, orientation, new_id.clone()) {
+            Ok(changed) => changed,
+            Err(_) => {
+                // Source pane vanished between probe and insert; don't
+                // leak the shell we spawned for it.
+                self.pty.remove(&new_id);
+                false
+            }
+        }
+    }
+
+    fn new_tab(self: &Arc<Self>, pane_id: &[u8]) -> bool {
+        if !self.layout.lock().unwrap().surface_ids().iter().any(|s| s == pane_id) {
+            return false;
+        }
+        let Some(new_id) = self.spawn_ephemeral(pane_id) else { return false };
+        match self.layout.lock().unwrap().add_tab(pane_id, new_id.clone()) {
+            Ok(changed) => changed,
+            Err(_) => {
+                self.pty.remove(&new_id);
+                false
+            }
+        }
+    }
+
+    fn close_pane(self: &Arc<Self>, pane_id: &[u8]) -> bool {
+        let removed = match self.layout.lock().unwrap().close_pane(pane_id) {
+            Ok(removed) => removed,
+            // LastPane / NotFound: silent no-op — the client observes
+            // "nothing happened", same as the Swift host.
+            Err(_) => return false,
+        };
+        // PTYs die outside the layout lock. The spec (when one exists)
+        // stays registered: a daemon restart resets the tree anyway, and
+        // declared surfaces reappearing after a restart is the agreed
+        // semantic.
+        for sid in removed {
+            self.pty.remove(&sid);
+        }
+        true
+    }
+
+    /// Fork a login shell for a split/new-tab pane, inheriting the source
+    /// pane's cwd. Registered with a respawn spec so a dead ephemeral
+    /// pane revives on attach just like declared surfaces do.
+    fn spawn_ephemeral(self: &Arc<Self>, source_pane: &[u8]) -> Option<SurfaceId> {
+        let cwd = self
+            .pty
+            .list()
+            .into_iter()
+            .find(|s| s.surface_id == source_pane)
+            .map(|s| s.cwd.clone())
+            .filter(|c| !c.is_empty());
+        let n = self.ephemeral_counter.fetch_add(1, Ordering::Relaxed);
+        let surface_id = surface_id_from_name(&format!("split-{n}"));
+        let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".into());
+        let spec = SpawnSpec {
+            title: format!("shell {n}"),
+            command: "/bin/sh".into(),
+            args: vec!["-c".into(), format!("{shell} -l")],
+            cols: 80,
+            rows: 24,
+            cwd,
+        };
+        self.pty.register_and_spawn(surface_id.clone(), spec);
+        // register_and_spawn logs-and-continues on failure; only report a
+        // surface that actually exists.
+        if self.pty.list().iter().any(|s| s.surface_id == surface_id) {
+            Some(surface_id)
+        } else {
+            None
+        }
+    }
+
+    /// Debounced fan-out of the current tree to every connection. The
+    /// snapshot is taken when the timer fires, so a burst of mutations
+    /// yields one push carrying the final state.
+    pub fn schedule_layout_push(self: &Arc<Self>) {
+        if self.push_scheduled.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let host = Arc::clone(self);
+        tokio::spawn(async move {
+            tokio::time::sleep(PUSH_DEBOUNCE).await;
+            host.push_scheduled.store(false, Ordering::Release);
+            let layout = host.layout_snapshot();
+            let payload = Payload::WorkspaceUpdate(WorkspaceUpdate {
+                kind: Some(workspace_update::Kind::WorkspaceLayout(WorkspaceLayoutChanged {
+                    workspace_id: host.workspace_id.clone(),
+                    layout,
+                })),
+            });
+            host.clients.broadcast(&payload);
+        });
     }
 
     /// Wire snapshot of the current tree. Reseeds first when the tree is

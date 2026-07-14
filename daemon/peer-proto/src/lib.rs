@@ -31,11 +31,16 @@ pub mod capability {
     pub const PTYDATA_COALESCE_V1: &str = "ptydata.coalesce.v1";
     /// Attach-time ANSI-preserving raw-byte replay ring (P4).
     pub const REPLAY_RING_V1: &str = "replay.ring.v1";
+    /// The host applies `WorkspaceControl` (split/close/tab/divider) and
+    /// pushes `WorkspaceLayoutChanged` to every connection. Daemon hosts
+    /// gained this after shipping without it, so a client that wants to
+    /// grey out pane controls against an older daemon can key off this.
+    pub const WORKSPACE_CONTROL_V1: &str = "workspace.control.v1";
 
     /// Every capability this build supports. Single source of truth for
     /// populating outgoing `Hello.capabilities` — callers should use
     /// [`supported_vec`] rather than hand-rolling the list.
-    pub const SUPPORTED: &[&str] = &[PTYDATA_COALESCE_V1, REPLAY_RING_V1];
+    pub const SUPPORTED: &[&str] = &[PTYDATA_COALESCE_V1, REPLAY_RING_V1, WORKSPACE_CONTROL_V1];
 
     /// `Hello.capabilities` value for an outgoing handshake message.
     pub fn supported_vec() -> Vec<String> {
