@@ -201,4 +201,14 @@ final class RemoteHostStore: ObservableObject {
             }
         }
     }
+
+    /// Phase 1 remote pane primitive: surface picker + attach into the
+    /// current workspace, riding this host's live local socket.
+    func openSurfaceAsPane(_ host: HostEntry) {
+        let sockPath = host.activeSockPath
+        guard !sockPath.isEmpty else { return }
+        Task {
+            await PeerClientCoordinator.shared.openRemotePaneDirect(sockPath: sockPath)
+        }
+    }
 }

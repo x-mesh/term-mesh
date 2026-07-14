@@ -490,11 +490,22 @@ final class Workspace: Identifiable, ObservableObject {
     func resolvedPanelTitle(panelId: UUID, fallback: String) -> String {
         let trimmedFallback = fallback.trimmingCharacters(in: .whitespacesAndNewlines)
         let fallbackTitle = trimmedFallback.isEmpty ? "Tab" : trimmedFallback
+        let base: String
         if let custom = panelCustomTitles[panelId]?.trimmingCharacters(in: .whitespacesAndNewlines),
            !custom.isEmpty {
-            return custom
+            base = custom
+        } else {
+            base = fallbackTitle
         }
-        return fallbackTitle
+        // Remote panes carry a host chip in the tab title so mixed
+        // workspaces stay legible even for non-focused panes (Phase 1
+        // remote pane primitive, always-on signal).
+        if let hostKey = (panels[panelId] as? TerminalPanel)?.remoteHostKey,
+           !base.hasSuffix(hostKey.shortLabel)
+        {
+            return "\(base) ⌁ \(hostKey.shortLabel)"
+        }
+        return base
     }
 
     func syncPinnedStateForTab(_ tabId: TabID, panelId: UUID) {
@@ -2024,6 +2035,93 @@ final class Workspace: Identifiable, ObservableObject {
     func newTerminalSurfaceInFocusedPane(focus: Bool? = nil) -> TerminalPanel? {
         guard let focusedPaneId = bonsplitController.focusedPaneId else { return nil }
         return newTerminalSurface(inPane: focusedPaneId, focus: focus)
+    }
+
+    // MARK: - Remote peer panes (Phase 1 remote pane primitive)
+
+    /// Host a remote peer surface as a NORMAL Bonsplit pane: split from
+    /// the focused panel with the relay binary as the pane's shell, hand
+    /// the panel ownership of `session`, and start pumping. Layout stays
+    /// local — this is the pane-mixing model, not a workspace mirror.
+    ///
+    /// Returns nil when there is no focused terminal panel to split from
+    /// (the caller should surface that to the user). On a relay start
+    /// failure the session is torn down; the pane shows the exited relay
+    /// process (t4 replaces this with a reconnect banner).
+    func openRemotePane(
+        session: PeerPaneSession,
+        orientation: SplitOrientation = .horizontal,
+        focus: Bool = true
+    ) -> TerminalPanel? {
+        guard let sourcePanelId = focusedPanelId,
+              let panel = newTerminalSplit(
+                  from: sourcePanelId,
+                  orientation: orientation,
+                  focus: focus,
+                  command: session.relayLaunchCommand,
+                  environment: session.relayEnvironment
+              )
+        else { return nil }
+        panel.peerPaneSession = session
+        if !session.surfaceTitle.isEmpty {
+            panel.updateTitle(session.surfaceTitle)
+        }
+        // Always-on host signal: 2pt strip in the host's accent color
+        // (the focused-pane titlebar gradient complements this).
+        panel.hostedView.setPeerHostStrip(
+            color: PeerHostAccent.primaryColor(for: session.lease.key)
+        )
+        let panelId = panel.id
+        session.requestPaneClose = { [weak self] in
+            _ = self?.closePanel(panelId, force: true)
+        }
+        // Disconnect banner (portal-layer overlay): keep the pane's slot,
+        // offer Reconnect (attach a fresh session + swap the pane) and
+        // Close. Skipped when the pane itself initiated teardown.
+        let hostLabel = String(describing: session.lease.key)
+        let showBanner: @MainActor (String) -> Void = { [weak self, weak panel] reason in
+            guard let self, let panel,
+                  let current = panel.peerPaneSession, !current.isTorndown
+            else { return }
+            panel.hostedView.showPeerDisconnectBanner(
+                reason: "Remote pane disconnected — \(reason)",
+                onReconnect: { [weak self, weak panel] in
+                    guard let self, let panel,
+                          let session = panel.peerPaneSession else { return }
+                    Task { @MainActor in
+                        await PeerClientCoordinator.shared.reconnectRemotePane(
+                            oldSession: session,
+                            panelId: panel.id,
+                            workspace: self
+                        )
+                    }
+                },
+                onClosePane: { [weak self] in
+                    _ = self?.closePanel(panelId, force: true)
+                }
+            )
+        }
+        session.relaySession.onDisconnect = { showBanner(hostLabel) }
+        session.relaySession.onError = { error in
+            showBanner("\(hostLabel): \(String(describing: error))")
+        }
+        PeerTitlebarAccentController.refresh()
+        #if DEBUG
+        dlog("peer.pane.open workspace=\(id.uuidString.prefix(8)) host=\(session.lease.key) title=\(session.surfaceTitle)")
+        #endif
+        // Accept the relay binary's connection once Ghostty spawns it as
+        // the pane's shell. Weak panel: if the pane closes mid-start,
+        // close() already ran teardown and start() unblocks with an error.
+        Task { [weak panel] in
+            do {
+                try await session.start()
+            } catch {
+                NSLog("[peer-pane] relay start failed: %@", String(describing: error))
+                session.teardown()
+                _ = panel
+            }
+        }
+        return panel
     }
 
     // MARK: - Flash/Notification Support

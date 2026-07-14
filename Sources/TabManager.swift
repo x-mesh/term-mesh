@@ -28,6 +28,9 @@ class TabManager: ObservableObject {
             sentryBreadcrumb("workspace.switch", data: [
                 "tabCount": tabs.count
             ])
+            // Titlebar accent tracks the focused pane of the newly
+            // selected workspace (remote pane → host gradient).
+            PeerTitlebarAccentController.refresh()
             let previousTabId = oldValue
             if let previousTabId,
                let previousPanelId = focusedPanelId(for: previousTabId) {

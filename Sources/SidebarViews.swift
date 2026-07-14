@@ -801,6 +801,18 @@ struct RemoteHostGroupView: View {
             }
             .padding(.horizontal, 10)
             .padding(.vertical, 3)
+            .contentShape(Rectangle())
+            .contextMenu {
+                // Phase 1 remote pane primitive: pick one of this host's
+                // surfaces and open it as a pane in the current
+                // workspace. Rides the live connection's local socket,
+                // so it is only offered while connected.
+                if host.isConnected {
+                    Button("Open Surface as Pane…") {
+                        store.openSurfaceAsPane(host)
+                    }
+                }
+            }
         }
         .padding(.horizontal, 6)
     }

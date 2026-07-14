@@ -418,6 +418,7 @@ extension Workspace: BonsplitDelegate {
         // surface_id, so a tab selection change effectively rewrites
         // the pane's surface in the relay client's view.
         postPeerLayoutChange()
+        PeerTitlebarAccentController.refresh()
     }
 
     func splitTabBar(_ controller: BonsplitController, didMoveTab tab: Bonsplit.Tab, fromPane source: PaneID, toPane destination: PaneID) {
@@ -451,6 +452,9 @@ extension Workspace: BonsplitDelegate {
            let terminalPanel = panels[panelId] as? TerminalPanel {
             terminalPanel.applyWindowBackgroundIfActive()
         }
+        // Titlebar accent follows the focused pane's host (remote pane
+        // → host gradient, local pane → none).
+        PeerTitlebarAccentController.refresh()
     }
 
     func splitTabBar(_ controller: BonsplitController, didClosePane paneId: PaneID) {

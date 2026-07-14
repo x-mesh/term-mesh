@@ -159,7 +159,8 @@ final class PeerClientCoordinator: NSObject {
     func activeConnections() -> [PeerRelayConnectionInfo] {
         let infos = (openConsoles.map { $0.connectionInfo }
             + openRelays.map { $0.connectionInfo }
-            + openWorkspaceRelays.map { $0.connectionInfo })
+            + openWorkspaceRelays.map { $0.connectionInfo }
+            + openPaneSessions.map { $0.connectionInfo })
             .sorted { $0.connectedAt < $1.connectedAt }
 #if DEBUG
         dlog("peer.connections.active count=\(infos.count) consoles=\(openConsoles.count) relays=\(openRelays.count) workspaces=\(openWorkspaceRelays.count)")
@@ -184,7 +185,40 @@ final class PeerClientCoordinator: NSObject {
         }
         if let ctrl = openConsoles.first(where: { ObjectIdentifier($0) == id }) {
             ctrl.window?.performClose(nil)
+            return
         }
+        if let session = openPaneSessions.first(where: { ObjectIdentifier($0) == id }) {
+            // Prefer closing the hosting pane (which tears the session
+            // down through TerminalPanel.close()); fall back to a bare
+            // teardown when the pane hook is gone.
+            if let closePane = session.requestPaneClose {
+                closePane()
+            } else {
+                session.teardown()
+            }
+        }
+    }
+
+    // MARK: - Remote pane roster (Phase 1 remote pane primitive)
+
+    /// Main-window remote panes, kept in the same roster that feeds the
+    /// Connections panel and the sidebar's Remote Hosts section. Strong
+    /// references are safe: `PeerPaneSession.teardown()` always
+    /// deregisters, and the hosting TerminalPanel always tears down on
+    /// close.
+    private var openPaneSessions: [PeerPaneSession] = []
+
+    func registerPaneSession(_ session: PeerPaneSession) {
+        guard !openPaneSessions.contains(where: { $0 === session }) else { return }
+        openPaneSessions.append(session)
+        postRelaysChanged()
+    }
+
+    func deregisterPaneSession(_ session: PeerPaneSession) {
+        let before = openPaneSessions.count
+        openPaneSessions.removeAll { $0 === session }
+        guard openPaneSessions.count != before else { return }
+        postRelaysChanged()
     }
 
     fileprivate func postRelaysChanged() {
@@ -298,16 +332,26 @@ final class PeerClientCoordinator: NSObject {
             remoteField.stringValue = mostRecent.remoteSocket
         }
 
+        // Phase 1 remote pane primitive: opt into hosting the remote
+        // surface as a pane in the current workspace instead of a
+        // separate relay window.
+        let paneCheckbox = NSButton(
+            checkboxWithTitle: "Open as a pane in the current workspace",
+            target: nil, action: nil
+        )
+        paneCheckbox.state = .off
+
         let arranged: [NSView] = [
             recentLabel, recentPopup,
             discoveredLabel, discoveredPopup,
             targetLabel, targetField,
             remoteLabel, remoteField,
+            paneCheckbox,
         ]
         for v in arranged {
             stack.addArrangedSubview(v)
         }
-        stack.frame = NSRect(x: 0, y: 0, width: 380, height: 230)
+        stack.frame = NSRect(x: 0, y: 0, width: 380, height: 254)
         alert.accessoryView = stack
         alert.addButton(withTitle: "Connect")
         alert.addButton(withTitle: "Cancel")
@@ -364,7 +408,11 @@ final class PeerClientCoordinator: NSObject {
             )
             return
         }
-        await connectWorkspaceSSH(target: target, remote: remote)
+        if paneCheckbox.state == .on {
+            await connectRemotePaneSSH(target: target, remote: remote)
+        } else {
+            await connectWorkspaceSSH(target: target, remote: remote)
+        }
     }
 
     /// One-click reconnect from the menu bar's recent-hosts submenu.
@@ -430,6 +478,277 @@ final class PeerClientCoordinator: NSObject {
             titleSuffix: " · \(target)",
             tunnel: tunnel
         )
+    }
+
+    // MARK: - Remote pane flow (Phase 1 remote pane primitive)
+
+    /// SSH variant of the pane flow: resolve the socket (auto-detect
+    /// when the field was empty), lease the host (shared tunnel), then
+    /// open one chosen surface as a pane in the current workspace.
+    private func connectRemotePaneSSH(target: String, remote: String) async {
+        let flow = ConnectionFlow.workspaceSSH(target: target, remote: remote)
+        guard beginConnectionFlow(flow) else { return }
+        defer { finishConnectionFlow(flow) }
+
+        var remote = remote
+        if remote.isEmpty {
+            do {
+                remote = try await PeerSocketProber.probe(sshTarget: target)
+            } catch {
+                self.showAlert(
+                    title: "Socket Auto-Detect Failed",
+                    body: Self.probeFailureBody(error, target: target)
+                )
+                return
+            }
+        }
+        let opened = await openRemotePaneFlow(spec: .ssh(target: target, remoteSockPath: remote))
+        if opened {
+            PeerFederationSettings.rememberRecentHost(
+                .init(sshTarget: target, remoteSocket: remote)
+            )
+        }
+    }
+
+    /// Direct-socket variant — used by the sidebar's Remote Hosts
+    /// section to ride an already-live connection's local socket.
+    /// Limitation (Phase 1): a lease keyed on an ephemeral tunnel socket
+    /// owns no tunnel of its own, so if the connection that created the
+    /// tunnel closes, panes opened this way disconnect with it.
+    func openRemotePaneDirect(sockPath: String) async {
+        await openRemotePaneFlow(spec: .direct(sockPath: sockPath))
+    }
+
+    /// Shared tail: lease → list surfaces → pick → attach → split into
+    /// the current workspace. Returns true when a pane actually opened.
+    /// Balances the browse ref on every exit; an attached pane holds its
+    /// own lease ref until teardown.
+    @discardableResult
+    private func openRemotePaneFlow(spec: PeerPaneHostSpec) async -> Bool {
+        let lease: PeerPaneHostLease
+        do {
+            lease = try await PeerPaneHostRegistry.shared.acquire(spec)
+        } catch {
+            self.showAlert(title: "Peer Connection Failed", body: String(describing: error))
+            return false
+        }
+        let registry = PeerPaneHostRegistry.shared
+
+        let surfaces: [Termmesh_Peer_V1_SurfaceInfo]
+        do {
+            surfaces = try await PeerPaneSession.listSurfaces(on: lease)
+        } catch {
+            registry.release(lease)
+            self.showAlert(title: "Surface List Failed", body: String(describing: error))
+            return false
+        }
+        let attachable = surfaces.filter { $0.attachable }
+        guard !attachable.isEmpty else {
+            registry.release(lease)
+            self.showAlert(
+                title: "No Attachable Surfaces",
+                body: "The host reports no surfaces that allow per-surface attach."
+            )
+            return false
+        }
+
+        let chosen: Termmesh_Peer_V1_SurfaceInfo?
+        if attachable.count == 1 {
+            chosen = attachable[0]
+        } else {
+            chosen = await promptForSurfaceSelection(from: attachable)
+        }
+        guard let chosen else {
+            registry.release(lease)
+            return false
+        }
+
+        guard let workspace = Self.currentWorkspaceForPaneOpen() else {
+            registry.release(lease)
+            self.showAlert(
+                title: "No Active Workspace",
+                body: "Open a terminal workspace first, then add the remote pane."
+            )
+            return false
+        }
+
+        let session: PeerPaneSession
+        do {
+            session = try await PeerPaneSession.attach(
+                lease: lease,
+                surface: chosen,
+                title: chosen.title.isEmpty ? chosen.workspaceName : chosen.title,
+                spec: spec
+            )
+        } catch {
+            registry.release(lease)
+            self.showAlert(title: "Attach Failed", body: String(describing: error))
+            return false
+        }
+        // Browse ref done — the pane session holds its own ref now.
+        registry.release(lease)
+
+        guard workspace.openRemotePane(session: session) != nil else {
+            session.teardown()
+            self.showAlert(
+                title: "Pane Open Failed",
+                body: "No focused terminal pane to split from in the current workspace."
+            )
+            return false
+        }
+        return true
+    }
+
+    private static func currentWorkspaceForPaneOpen() -> Workspace? {
+        (NSApp.delegate as? AppDelegate)?.tabManager?.selectedWorkspace
+    }
+
+    #if DEBUG
+    // MARK: - Remote pane debug hooks (tests_v2 socket e2e)
+
+    /// Result of the last `debug.peer.open_remote_pane`, polled via
+    /// `debug.peer.pane_status`. The open command is fire-and-forget
+    /// because the flow is async and the socket handler must not block
+    /// the main thread.
+    private(set) var debugLastPaneOpenResult: [String: Any]?
+
+    /// Headless remote-pane open: no pickers, no alerts. With a nil
+    /// sockPath, brings up the in-app peer server and mirrors one of
+    /// this instance's own surfaces (loopback self-mirror).
+    func debugOpenRemotePane(sockPath: String?) {
+        debugLastPaneOpenResult = nil
+        Task { @MainActor in
+            var resolvedSock = sockPath
+            if resolvedSock == nil {
+                _ = await PeerHostCoordinator.shared.setRunning(true)
+                resolvedSock = PeerHostCoordinator.shared.currentSocketPath
+            }
+            guard let hostSock = resolvedSock, !hostSock.isEmpty else {
+                self.debugLastPaneOpenResult = ["ok": false, "error": "no_host_socket"]
+                return
+            }
+            let spec = PeerPaneHostSpec.direct(sockPath: hostSock)
+            let registry = PeerPaneHostRegistry.shared
+            do {
+                let lease = try await registry.acquire(spec)
+                do {
+                    let surfaces = try await PeerPaneSession.listSurfaces(on: lease)
+                    guard let chosen = surfaces.first(where: { $0.attachable }) else {
+                        registry.release(lease)
+                        self.debugLastPaneOpenResult = ["ok": false, "error": "no_attachable_surface"]
+                        return
+                    }
+                    guard let workspace = Self.currentWorkspaceForPaneOpen() else {
+                        registry.release(lease)
+                        self.debugLastPaneOpenResult = ["ok": false, "error": "no_active_workspace"]
+                        return
+                    }
+                    let session = try await PeerPaneSession.attach(
+                        lease: lease,
+                        surface: chosen,
+                        title: chosen.title.isEmpty ? chosen.workspaceName : chosen.title,
+                        spec: spec
+                    )
+                    registry.release(lease)
+                    guard let panel = workspace.openRemotePane(session: session) else {
+                        session.teardown()
+                        self.debugLastPaneOpenResult = ["ok": false, "error": "no_focused_terminal_pane"]
+                        return
+                    }
+                    self.debugLastPaneOpenResult = [
+                        "ok": true,
+                        "panel_id": panel.id.uuidString,
+                        "host_key": String(describing: session.lease.key),
+                    ]
+                } catch {
+                    registry.release(lease)
+                    self.debugLastPaneOpenResult = ["ok": false, "error": String(describing: error)]
+                }
+            } catch {
+                self.debugLastPaneOpenResult = ["ok": false, "error": String(describing: error)]
+            }
+        }
+    }
+
+    /// Snapshot of remote-pane state for e2e assertions.
+    func debugPaneStatus() -> [String: Any] {
+        [
+            "pane_sessions": openPaneSessions.map { session in
+                [
+                    "host_key": String(describing: session.lease.key),
+                    "title": session.surfaceTitle,
+                    "torn_down": session.isTorndown,
+                ] as [String: Any]
+            },
+            "lease_count": PeerPaneHostRegistry.shared.activeLeaseCount,
+            "last_open_result": debugLastPaneOpenResult ?? NSNull(),
+        ]
+    }
+    #endif
+
+    /// Reconnect action for a remote pane's disconnect banner: re-lease
+    /// the host, find the original surface again (by id, then by title),
+    /// attach a fresh session, and swap the dead pane for a new one.
+    /// The old pane is closed only after the new attach succeeds, so a
+    /// failed reconnect leaves the banner (and its Retry) in place.
+    func reconnectRemotePane(
+        oldSession: PeerPaneSession,
+        panelId: UUID,
+        workspace: Workspace
+    ) async {
+        let spec = oldSession.originSpec
+        let wanted = oldSession.originSurface
+        oldSession.teardown()
+
+        let registry = PeerPaneHostRegistry.shared
+        let lease: PeerPaneHostLease
+        do {
+            lease = try await registry.acquire(spec)
+        } catch {
+            self.showAlert(title: "Reconnect Failed", body: String(describing: error))
+            return
+        }
+        let surfaces: [Termmesh_Peer_V1_SurfaceInfo]
+        do {
+            surfaces = try await PeerPaneSession.listSurfaces(on: lease)
+        } catch {
+            registry.release(lease)
+            self.showAlert(title: "Reconnect Failed", body: String(describing: error))
+            return
+        }
+        let match = surfaces.first { $0.surfaceID == wanted.surfaceID && $0.attachable }
+            ?? surfaces.first { $0.title == wanted.title && $0.attachable }
+        guard let match else {
+            registry.release(lease)
+            self.showAlert(
+                title: "Surface Gone",
+                body: "The remote surface no longer exists on the host."
+            )
+            return
+        }
+        let session: PeerPaneSession
+        do {
+            session = try await PeerPaneSession.attach(
+                lease: lease,
+                surface: match,
+                title: match.title.isEmpty ? match.workspaceName : match.title,
+                spec: spec
+            )
+        } catch {
+            registry.release(lease)
+            self.showAlert(title: "Reconnect Failed", body: String(describing: error))
+            return
+        }
+        registry.release(lease)
+
+        _ = workspace.closePanel(panelId, force: true)
+        if workspace.openRemotePane(session: session) == nil {
+            session.teardown()
+            self.showAlert(
+                title: "Reconnect Failed",
+                body: "Could not open a replacement pane in the workspace."
+            )
+        }
     }
 
     private static func probeFailureBody(_ error: Error, target: String) -> String {
