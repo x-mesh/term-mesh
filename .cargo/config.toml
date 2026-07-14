@@ -1,4 +1,4 @@
-# Cap default test parallelism for this workspace.
+# Cap default test parallelism for the daemon/ cargo workspace.
 #
 # Several term-meshd integration tests (peer/*, headless/*) fork real OS
 # processes (PTY children via forkpty, `/bin/sh` children) and poll for
@@ -14,5 +14,15 @@
 # test — see the mem-mesh incident memory for the reproduction data
 # (`--test-threads=4` and `=8` also still failed intermittently; only
 # `=2` was clean across repeated runs).
+#
+# Lives at the REPO ROOT, not daemon/.cargo/, on purpose. Cargo's config
+# search is cwd-based, not manifest-path-based: `cargo test --manifest-path
+# daemon/Cargo.toml -p term-meshd` invoked from the repo root would walk up
+# from the repo root and never see a config under daemon/.cargo/, silently
+# reintroducing the exact flakiness this file exists to fix. A cross-vendor
+# review of the original daemon/-scoped placement caught this (4/5 vendors
+# concurred) before it shipped; verified by empirically reproducing the
+# flakiness from a repo-root invocation with the old placement, then
+# confirming it clean here from both invocation styles.
 [env]
 RUST_TEST_THREADS = "2"
