@@ -12,6 +12,7 @@ use tokio::sync::{watch, Semaphore};
 use tokio::task::JoinSet;
 
 use super::connection;
+use super::layout::PeerHost;
 use super::surface::PtyManager;
 use crate::supervisor::{shutdown_supervised, spawn_supervised};
 
@@ -28,6 +29,10 @@ pub async fn serve_with_manager(
     mut shutdown_rx: watch::Receiver<bool>,
     manager: Arc<PtyManager>,
 ) -> anyhow::Result<()> {
+    // The host owns the layout tree the manager's surfaces are arranged
+    // in; connections share it so WorkspaceControl mutations made over
+    // one connection are visible (and pushable) to all of them.
+    let host = Arc::new(PeerHost::new(manager));
     if path.exists() {
         std::fs::remove_file(&path)?;
     }
@@ -70,10 +75,10 @@ pub async fn serve_with_manager(
                             drop(stream);
                             continue;
                         };
-                        let manager = manager.clone();
+                        let host = host.clone();
                         spawn_supervised(&mut connection_tasks, async move {
                             let _permit = permit;
-                            if let Err(e) = connection::run(stream, manager).await {
+                            if let Err(e) = connection::run(stream, host).await {
                                 tracing::warn!("peer connection ended with error: {e}");
                             }
                         });
@@ -1680,5 +1685,414 @@ mod integration_tests {
         drop(writer);
         shutdown_tx.send(true).unwrap();
         let _ = tokio::time::timeout(std::time::Duration::from_secs(3), server_task).await;
+    }
+
+    // ---- WorkspaceControl (layout mutation + broadcast) ----
+
+    use peer_proto::v1::workspace_control;
+    use peer_proto::v1::{
+        ActivateTabRequest, ClosePaneRequest, ListWorkspaces, SplitPaneRequest, WorkspaceControl,
+    };
+    use tokio::net::unix::{OwnedReadHalf as TestReadHalf, OwnedWriteHalf as TestWriteHalf};
+
+    async fn handshake(sock_path: &std::path::Path) -> (TestReadHalf, TestWriteHalf) {
+        let stream = UnixStream::connect(sock_path).await.unwrap();
+        let (mut reader, mut writer) = stream.into_split();
+        write_envelope(
+            &mut writer,
+            &Envelope {
+                seq: 1,
+                correlation_id: 0,
+                payload: Some(Payload::Hello(Hello {
+                    protocol_version: PROTOCOL_VERSION.into(),
+                    peer_id: vec![0x22; 16],
+                    display_name: "wc-test".into(),
+                    capabilities: peer_proto::capability::supported_vec(),
+                    app_version: "test".into(),
+                })),
+            },
+        )
+        .await
+        .unwrap();
+        let _ = read_envelope(&mut reader).await.unwrap();
+        let _ = read_envelope(&mut reader).await.unwrap();
+        write_envelope(
+            &mut writer,
+            &Envelope {
+                seq: 2,
+                correlation_id: 0,
+                payload: Some(Payload::Auth(Auth {
+                    method: "ssh-passthrough".into(),
+                    token_id: vec![],
+                    signature: vec![],
+                })),
+            },
+        )
+        .await
+        .unwrap();
+        let _ = read_envelope(&mut reader).await.unwrap();
+        (reader, writer)
+    }
+
+    /// First pane's surface id from a fresh ListWorkspaces round trip.
+    async fn first_pane_id(reader: &mut TestReadHalf, writer: &mut TestWriteHalf) -> Vec<u8> {
+        write_envelope(
+            writer,
+            &Envelope {
+                seq: 3,
+                correlation_id: 0,
+                payload: Some(Payload::ListWorkspaces(ListWorkspaces {})),
+            },
+        )
+        .await
+        .unwrap();
+        loop {
+            let env = read_envelope(reader).await.unwrap();
+            if let Some(Payload::WorkspaceList(wl)) = env.payload {
+                let layout = wl.workspaces[0].layout.clone().expect("layout present");
+                return leftmost_pane(&layout);
+            }
+        }
+    }
+
+    fn leftmost_pane(layout: &peer_proto::v1::WorkspaceLayout) -> Vec<u8> {
+        match layout.node.as_ref().unwrap() {
+            peer_proto::v1::workspace_layout::Node::Pane(p) => p.surface_id.clone(),
+            peer_proto::v1::workspace_layout::Node::Split(s) => {
+                leftmost_pane(s.first.as_ref().unwrap())
+            }
+        }
+    }
+
+    fn count_panes(layout: &peer_proto::v1::WorkspaceLayout) -> usize {
+        match layout.node.as_ref().unwrap() {
+            peer_proto::v1::workspace_layout::Node::Pane(_) => 1,
+            peer_proto::v1::workspace_layout::Node::Split(s) => {
+                count_panes(s.first.as_ref().unwrap()) + count_panes(s.second.as_ref().unwrap())
+            }
+        }
+    }
+
+    /// Wait for the next layout push, skipping unrelated frames. `None`
+    /// on timeout — which some tests treat as the expected outcome.
+    async fn next_layout_push(
+        reader: &mut TestReadHalf,
+        window: std::time::Duration,
+    ) -> Option<peer_proto::v1::WorkspaceLayout> {
+        let deadline = tokio::time::Instant::now() + window;
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                return None;
+            }
+            match tokio::time::timeout(remaining, read_envelope(reader)).await {
+                Err(_) | Ok(Err(_)) => return None,
+                Ok(Ok(env)) => {
+                    if let Some(Payload::WorkspaceUpdate(wu)) = env.payload {
+                        if let Some(peer_proto::v1::workspace_update::Kind::WorkspaceLayout(wlc)) =
+                            wu.kind
+                        {
+                            return wlc.layout;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fn control(seq: u64, kind: workspace_control::Kind) -> Envelope {
+        Envelope {
+            seq,
+            correlation_id: 0,
+            payload: Some(Payload::WorkspaceControl(WorkspaceControl { kind: Some(kind) })),
+        }
+    }
+
+    const PUSH_WINDOW: std::time::Duration = std::time::Duration::from_secs(3);
+
+    /// One client splits; the mutation lands in the tree and the layout
+    /// push reaches BOTH connections — the requester and a bystander.
+    #[tokio::test]
+    async fn workspace_control_split_pushes_to_all_clients() {
+        let tmp = TempDir::new().unwrap();
+        let sock_path = tmp.path().join("peer.sock");
+        let manager = cat_manager();
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let sock_path_task = sock_path.clone();
+        let server_task = tokio::spawn(async move {
+            serve_with_manager(sock_path_task, shutdown_rx, manager).await.unwrap();
+        });
+        for _ in 0..50 {
+            if sock_path.exists() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+
+        let (mut r1, mut w1) = handshake(&sock_path).await;
+        let (mut r2, _w2) = handshake(&sock_path).await;
+
+        let pane = first_pane_id(&mut r1, &mut w1).await;
+        write_envelope(
+            &mut w1,
+            &control(
+                4,
+                workspace_control::Kind::SplitPane(SplitPaneRequest {
+                    pane_id: pane.clone(),
+                    orientation: "horizontal".into(),
+                }),
+            ),
+        )
+        .await
+        .unwrap();
+
+        let l1 = next_layout_push(&mut r1, PUSH_WINDOW).await.expect("requester got push");
+        let l2 = next_layout_push(&mut r2, PUSH_WINDOW).await.expect("bystander got push");
+        assert_eq!(count_panes(&l1), 2);
+        assert_eq!(count_panes(&l2), 2);
+        // The original pane survived with its identity intact.
+        assert_eq!(leftmost_pane(&l1), pane);
+
+        shutdown_tx.send(true).unwrap();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(3), server_task).await;
+    }
+
+    /// Requests that change nothing must not fan a push out: activating
+    /// the already-active tab, closing the last pane (refused), and a
+    /// garbage orientation are all silent no-ops.
+    #[tokio::test]
+    async fn workspace_control_noop_requests_do_not_push() {
+        let tmp = TempDir::new().unwrap();
+        let sock_path = tmp.path().join("peer.sock");
+        let manager = cat_manager();
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let sock_path_task = sock_path.clone();
+        let server_task = tokio::spawn(async move {
+            serve_with_manager(sock_path_task, shutdown_rx, manager).await.unwrap();
+        });
+        for _ in 0..50 {
+            if sock_path.exists() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+
+        let (mut reader, mut writer) = handshake(&sock_path).await;
+        let pane = first_pane_id(&mut reader, &mut writer).await;
+
+        // Re-activating the active tab.
+        write_envelope(
+            &mut writer,
+            &control(
+                4,
+                workspace_control::Kind::ActivateTab(ActivateTabRequest {
+                    pane_id: pane.clone(),
+                    surface_id: pane.clone(),
+                }),
+            ),
+        )
+        .await
+        .unwrap();
+        // Closing the sole pane (refused).
+        write_envelope(
+            &mut writer,
+            &control(
+                5,
+                workspace_control::Kind::ClosePane(ClosePaneRequest { pane_id: pane.clone() }),
+            ),
+        )
+        .await
+        .unwrap();
+        // Garbage orientation (F4).
+        write_envelope(
+            &mut writer,
+            &control(
+                6,
+                workspace_control::Kind::SplitPane(SplitPaneRequest {
+                    pane_id: pane.clone(),
+                    orientation: "diagonal".into(),
+                }),
+            ),
+        )
+        .await
+        .unwrap();
+
+        // Well past the 120ms debounce: nothing may arrive.
+        let push = next_layout_push(&mut reader, std::time::Duration::from_millis(600)).await;
+        assert!(push.is_none(), "no-op control leaked a layout push: {push:?}");
+
+        // The tree is intact: the pane is still there and closable-checks
+        // did not corrupt anything.
+        let still = first_pane_id(&mut reader, &mut writer).await;
+        assert_eq!(still, pane);
+
+        shutdown_tx.send(true).unwrap();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(3), server_task).await;
+    }
+
+    /// Two clients mutate concurrently; the layout Mutex serializes them
+    /// and the debounced push carries a tree containing both splits.
+    #[tokio::test]
+    async fn workspace_control_concurrent_splits_serialize() {
+        let tmp = TempDir::new().unwrap();
+        let sock_path = tmp.path().join("peer.sock");
+        let manager = cat_manager();
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let sock_path_task = sock_path.clone();
+        let server_task = tokio::spawn(async move {
+            serve_with_manager(sock_path_task, shutdown_rx, manager).await.unwrap();
+        });
+        for _ in 0..50 {
+            if sock_path.exists() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+
+        let (mut r1, mut w1) = handshake(&sock_path).await;
+        let (mut r2, mut w2) = handshake(&sock_path).await;
+        let pane = first_pane_id(&mut r1, &mut w1).await;
+
+        // Both clients split the same pane at once.
+        let split = |pane_id: Vec<u8>, orientation: &str| {
+            control(
+                7,
+                workspace_control::Kind::SplitPane(SplitPaneRequest {
+                    pane_id,
+                    orientation: orientation.into(),
+                }),
+            )
+        };
+        let env_h = split(pane.clone(), "horizontal");
+        let env_v = split(pane.clone(), "vertical");
+        let (a, b) = tokio::join!(
+            write_envelope(&mut w1, &env_h),
+            write_envelope(&mut w2, &env_v),
+        );
+        a.unwrap();
+        b.unwrap();
+
+        // Eventually a push whose tree holds all 3 panes reaches both
+        // clients (the debounce may fold the two mutations into one push).
+        let deadline = tokio::time::Instant::now() + PUSH_WINDOW;
+        let mut latest = None;
+        while tokio::time::Instant::now() < deadline {
+            match next_layout_push(&mut r1, std::time::Duration::from_millis(500)).await {
+                Some(l) => {
+                    let done = count_panes(&l) == 3;
+                    latest = Some(l);
+                    if done {
+                        break;
+                    }
+                }
+                None => break,
+            }
+        }
+        let l1 = latest.expect("client 1 got a push");
+        assert_eq!(count_panes(&l1), 3, "both splits landed");
+        let l2 = next_layout_push(&mut r2, PUSH_WINDOW).await.expect("client 2 got a push");
+        assert_eq!(count_panes(&l2), 3);
+
+        shutdown_tx.send(true).unwrap();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(3), server_task).await;
+    }
+
+    /// F2 regression: closing an ephemeral (split-spawned) pane must be
+    /// permanent for this daemon lifetime — a raw AttachSurface for the
+    /// same id, bypassing WorkspaceControl entirely, must not resurrect
+    /// it. Before the fix, remove() left the respawn spec in place and
+    /// get_or_respawn happily revived it.
+    #[tokio::test]
+    async fn closed_ephemeral_pane_does_not_respawn_via_direct_attach() {
+        let tmp = TempDir::new().unwrap();
+        let sock_path = tmp.path().join("peer.sock");
+        let manager = cat_manager();
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let sock_path_task = sock_path.clone();
+        let server_task = tokio::spawn(async move {
+            serve_with_manager(sock_path_task, shutdown_rx, manager).await.unwrap();
+        });
+        for _ in 0..50 {
+            if sock_path.exists() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+
+        let (mut reader, mut writer) = handshake(&sock_path).await;
+        let base_pane = first_pane_id(&mut reader, &mut writer).await;
+
+        write_envelope(
+            &mut writer,
+            &control(
+                4,
+                workspace_control::Kind::SplitPane(SplitPaneRequest {
+                    pane_id: base_pane.clone(),
+                    orientation: "horizontal".into(),
+                }),
+            ),
+        )
+        .await
+        .unwrap();
+        let layout = next_layout_push(&mut reader, PUSH_WINDOW).await.expect("split pushed");
+        assert_eq!(count_panes(&layout), 2);
+        // The ephemeral pane is whichever leaf isn't the original base pane.
+        let ephemeral_id = other_pane(&layout, &base_pane);
+
+        write_envelope(
+            &mut writer,
+            &control(
+                5,
+                workspace_control::Kind::ClosePane(ClosePaneRequest {
+                    pane_id: ephemeral_id.clone(),
+                }),
+            ),
+        )
+        .await
+        .unwrap();
+        let after_close = next_layout_push(&mut reader, PUSH_WINDOW).await.expect("close pushed");
+        assert_eq!(count_panes(&after_close), 1, "ephemeral pane removed from the tree");
+
+        // Directly attach the closed id, bypassing WorkspaceControl.
+        write_envelope(
+            &mut writer,
+            &Envelope {
+                seq: 6,
+                correlation_id: 0,
+                payload: Some(Payload::AttachSurface(AttachSurface {
+                    surface_id: ephemeral_id,
+                    mode: AttachMode::CoWrite as i32,
+                    client_cols: 80,
+                    client_rows: 24,
+                    resume_from_seq: 0,
+                })),
+            },
+        )
+        .await
+        .unwrap();
+        let attach_reply = read_envelope(&mut reader).await.unwrap();
+        match attach_reply.payload {
+            Some(Payload::AttachResult(r)) => {
+                assert!(!r.accepted, "closed ephemeral surface must not respawn via direct attach")
+            }
+            other => panic!("expected AttachResult, got {other:?}"),
+        }
+
+        shutdown_tx.send(true).unwrap();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(3), server_task).await;
+    }
+
+    fn other_pane(layout: &peer_proto::v1::WorkspaceLayout, known: &[u8]) -> Vec<u8> {
+        match layout.node.as_ref().unwrap() {
+            peer_proto::v1::workspace_layout::Node::Pane(p) => p.surface_id.clone(),
+            peer_proto::v1::workspace_layout::Node::Split(s) => {
+                let first = other_pane(s.first.as_ref().unwrap(), known);
+                if first != known {
+                    first
+                } else {
+                    other_pane(s.second.as_ref().unwrap(), known)
+                }
+            }
+        }
     }
 }

@@ -277,6 +277,28 @@ impl PtySurface {
         Ok(surface)
     }
 
+    /// Ask the child to exit now (SIGHUP, what it would get on a real
+    /// terminal hangup). fd/reap cleanup still happens in `Drop`; this
+    /// only decouples "the shell dies" from "the last viewer detaches".
+    ///
+    /// No-ops once `dead` is already true. The reader loop's
+    /// `child_has_exited` check reaps the child via `waitpid(WNOHANG)`
+    /// independently of `Drop` (on EIO, to disambiguate a real exit from
+    /// the fork/exec EIO glitch) — well before `PtyManager::remove()`
+    /// might call this. Signalling a pid after it's been reaped risks the
+    /// OS having recycled it to an unrelated process under the same uid;
+    /// `dead` is the only signal we have that the reap may have already
+    /// happened, so treat it as authoritative here.
+    pub fn hangup(&self) {
+        if self.dead.load(Ordering::Acquire) {
+            return;
+        }
+        // Safety: signalling a child pid we spawned and still own.
+        unsafe {
+            libc::kill(self.pid, libc::SIGHUP);
+        }
+    }
+
     pub fn subscribe(&self) -> broadcast::Receiver<PtyChunk> {
         self.broadcast_tx.subscribe()
     }
@@ -368,6 +390,13 @@ pub struct PtyManager {
     /// `insert_surface` (test-only path) does not populate this; production
     /// surfaces registered via `spawn_default` do.
     specs: RwLock<HashMap<Vec<u8>, SpawnSpec>>,
+    /// Surface ids whose spec must NOT survive `remove()` — split/new-tab
+    /// panes registered via `register_and_spawn_ephemeral`. Declared
+    /// surfaces (`TERMMESH_PEER_SURFACES`, via the plain `register_and_spawn`)
+    /// are the ones meant to come back after a restart; an ephemeral pane
+    /// that was just closed must not be resurrectable by a raw
+    /// `AttachSurface` for the same id while the daemon keeps running.
+    ephemeral_specs: RwLock<std::collections::HashSet<Vec<u8>>>,
 }
 
 /// Namespace UUID used to derive stable 16-byte `surface_id`s from
@@ -424,9 +453,52 @@ pub fn parse_surfaces_env() -> Option<Vec<(String, String)>> {
     }
 }
 
-fn default_shell_cmd() -> String {
-    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".into());
+/// A shell candidate is usable when it is an absolute path to an
+/// executable regular file whose name isn't a deliberate login blocker.
+/// The blockers matter on servers: a systemd unit often has no SHELL at
+/// all, and service accounts carry /usr/sbin/nologin or /bin/false —
+/// spawning either gives an instantly-exiting pane that looks like a
+/// daemon bug.
+fn is_usable_shell(path: &str) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    if !path.starts_with('/') {
+        return false;
+    }
+    let base = path.rsplit('/').next().unwrap_or("");
+    if matches!(base, "nologin" | "false") {
+        return false;
+    }
+    match std::fs::metadata(path) {
+        Ok(md) => md.is_file() && md.permissions().mode() & 0o111 != 0,
+        Err(_) => false,
+    }
+}
+
+/// Pick the login shell for a new pane: the candidate (normally `$SHELL`)
+/// when usable, else `/bin/bash`, else `/bin/sh`. The final `/bin/sh`
+/// fallthrough is unconditional — POSIX guarantees its presence, and a
+/// broken pane beats a spawn that never happens.
+pub(crate) fn resolve_login_shell(candidate: Option<&str>) -> String {
+    if let Some(c) = candidate {
+        if is_usable_shell(c) {
+            return c.to_string();
+        }
+    }
+    if is_usable_shell("/bin/bash") {
+        return "/bin/bash".to_string();
+    }
+    "/bin/sh".to_string()
+}
+
+/// `<shell> -l` command line for a new pane, shared by the startup
+/// fallback surface and split/new-tab spawns.
+pub(crate) fn login_shell_cmd() -> String {
+    let shell = resolve_login_shell(std::env::var("SHELL").ok().as_deref());
     format!("{shell} -l")
+}
+
+fn default_shell_cmd() -> String {
+    login_shell_cmd()
 }
 
 impl PtyManager {
@@ -434,6 +506,7 @@ impl PtyManager {
         Self {
             surfaces: RwLock::new(HashMap::new()),
             specs: RwLock::new(HashMap::new()),
+            ephemeral_specs: RwLock::new(std::collections::HashSet::new()),
         }
     }
 
@@ -462,15 +535,35 @@ impl PtyManager {
     }
 
     /// Register a respawn spec under `surface_id` and spawn its first
-    /// instance. Errors are logged; the server runs on regardless.
+    /// instance. Errors are logged; the server runs on regardless. The
+    /// spec (and therefore respawn-via-`get_or_respawn`) survives a
+    /// `remove()` — this is the declared-surface path
+    /// (`TERMMESH_PEER_SURFACES`), where "closed" means "gone until the
+    /// next restart brings the config back", not "gone forever".
     pub fn register_and_spawn(&self, surface_id: Vec<u8>, spec: SpawnSpec) {
+        self.register_and_spawn_inner(surface_id, spec, false);
+    }
+
+    /// Same as `register_and_spawn`, but the spec is dropped along with
+    /// the surface on `remove()` (explicit `ClosePane` or the ephemeral
+    /// dead-watcher) — so a `split`/`new_tab`-spawned pane cannot be
+    /// resurrected by a raw `AttachSurface` for the same id after it was
+    /// closed. Use for panes created outside `TERMMESH_PEER_SURFACES`.
+    pub fn register_and_spawn_ephemeral(&self, surface_id: Vec<u8>, spec: SpawnSpec) {
+        self.register_and_spawn_inner(surface_id, spec, true);
+    }
+
+    fn register_and_spawn_inner(&self, surface_id: Vec<u8>, spec: SpawnSpec, ephemeral: bool) {
         match spawn_from_spec(&surface_id, &spec) {
             Ok(surface) => {
                 self.surfaces
                     .write()
                     .unwrap()
                     .insert(surface_id.clone(), surface);
-                self.specs.write().unwrap().insert(surface_id, spec);
+                self.specs.write().unwrap().insert(surface_id.clone(), spec);
+                if ephemeral {
+                    self.ephemeral_specs.write().unwrap().insert(surface_id);
+                }
                 tracing::info!("spawned default PTY surface");
             }
             Err(e) => {
@@ -484,6 +577,32 @@ impl PtyManager {
         // Stable ordering for UI/CLI display.
         v.sort_by(|a, b| a.title.cmp(&b.title));
         v
+    }
+
+    /// Close a pane's surface: hang the child up and drop it from the
+    /// roster. The respawn spec is kept for a *declared* surface (closing
+    /// it removes it for this daemon lifetime only; a restart brings the
+    /// `TERMMESH_PEER_SURFACES` set back) but purged for an *ephemeral*
+    /// one (`register_and_spawn_ephemeral`) — otherwise a raw
+    /// `AttachSurface` for the same id would resurrect a supposedly-closed
+    /// split/new-tab pane, invisible in the layout tree, indefinitely.
+    ///
+    /// The SIGHUP is explicit rather than left to `Drop` because attach
+    /// relays hold `Arc` clones: waiting for the last clone would keep
+    /// the shell running until every viewer detaches, which is not what
+    /// "close" means.
+    pub fn remove(&self, surface_id: &[u8]) -> bool {
+        let removed = self.surfaces.write().unwrap().remove(surface_id);
+        if self.ephemeral_specs.write().unwrap().remove(surface_id) {
+            self.specs.write().unwrap().remove(surface_id);
+        }
+        match removed {
+            Some(surface) => {
+                surface.hangup();
+                true
+            }
+            None => false,
+        }
     }
 
     /// Return a live surface for `surface_id`, respawning if the
@@ -598,5 +717,62 @@ mod tests {
             modes.remove(&1000);
         }
         assert!(surface.mode_replay_bytes().is_empty());
+    }
+
+    /// F3 regression: once `dead` is true, `hangup()` must not signal the
+    /// pid at all (it may already be reaped and recycled). Proven
+    /// behaviorally: mark a live /bin/cat surface dead (simulating the
+    /// reader loop having already reaped it via `child_has_exited`), call
+    /// `hangup()`, then confirm the process is still alive and echoing —
+    /// if the (incorrect) SIGHUP had actually been sent, cat's default
+    /// disposition terminates it and the echo would never arrive.
+    #[tokio::test]
+    async fn hangup_noops_once_already_dead() {
+        let surface = cat_surface();
+        surface.dead.store(true, Ordering::Release);
+        surface.hangup();
+
+        let mut rx = surface.subscribe();
+        surface.write_all(b"still-alive\n").expect("write to cat");
+        let result = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                let chunk = rx.recv().await.expect("broadcast channel");
+                if chunk.bytes.windows(11).any(|w| w == b"still-alive") {
+                    return;
+                }
+            }
+        })
+        .await;
+        assert!(result.is_ok(), "cat did not echo — hangup() signalled it despite dead=true");
+    }
+
+    /// F6 regression: asserting a hardcoded "/bin/bash" result meant this
+    /// test failed on exactly the minimal/musl environments (no bash)
+    /// docs/peer-linux-host.md targets, where resolve_login_shell falling
+    /// through to /bin/sh is the CORRECT behavior, not a bug. Assert the
+    /// property instead: never the blocker itself, and always one of the
+    /// two real fallback candidates.
+    #[test]
+    fn login_shell_falls_back_past_blockers() {
+        let assert_falls_back = |candidate: Option<&str>| {
+            let result = resolve_login_shell(candidate);
+            assert_ne!(Some(result.as_str()), candidate, "must not echo back a blocked candidate");
+            assert!(
+                matches!(result.as_str(), "/bin/bash" | "/bin/sh"),
+                "fallback must be /bin/bash or /bin/sh, got {result:?}"
+            );
+        };
+        // Deliberate login blockers (F: systemd service accounts).
+        assert_falls_back(Some("/bin/false"));
+        assert_falls_back(Some("/usr/sbin/nologin"));
+        // Nonexistent / relative / empty candidates.
+        assert_falls_back(Some("/no/such/shell"));
+        assert_falls_back(Some("zsh"));
+        assert_falls_back(Some(""));
+        // No candidate at all (SHELL unset under systemd).
+        assert_falls_back(None);
+        // A usable candidate wins as-is — the one case with an exact
+        // expected value, since /bin/sh is universally present.
+        assert_eq!(resolve_login_shell(Some("/bin/sh")), "/bin/sh");
     }
 }
