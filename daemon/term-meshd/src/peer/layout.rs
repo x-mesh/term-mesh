@@ -15,13 +15,16 @@
 //! `.await`, and mutations return owned snapshots so broadcasting happens
 //! outside the lock.
 
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 use peer_proto::v1::{
-    workspace_layout, PaneTab, WorkspaceLayout, WorkspacePane, WorkspaceSplit,
+    workspace_layout, Envelope, PaneTab, WorkspaceLayout, WorkspacePane, WorkspaceSplit,
 };
+use tokio::sync::mpsc;
 
-use super::surface::{PtyManager, PtySurface};
+use super::surface::{surface_id_from_name, PtyManager, PtySurface};
 
 pub type SurfaceId = Vec<u8>;
 
@@ -456,6 +459,106 @@ enum CloseOutcome {
     Closed(Vec<SurfaceId>),
     /// This whole node must be removed; the parent promotes the sibling.
     RemoveMe(Vec<SurfaceId>),
+}
+
+/// Name of the single workspace a daemon-only host synthesises. Hashed
+/// through `surface_id_from_name`, so the id is stable across restarts
+/// and the client can keep referring to the same workspace.
+pub const DAEMON_WORKSPACE: &str = "term-meshd";
+
+/// Outgoing handles of every connection that reached `Ready`, so a layout
+/// mutation made over one connection can push the new tree to all of
+/// them. Registration hands back an RAII guard; a dropped connection
+/// unregisters itself even on panic.
+///
+/// The lock is only ever held to copy the sender list out — sending
+/// happens after the guard is dropped, and with `try_send`, so one slow
+/// client (its 128-slot channel full) skips its push instead of stalling
+/// everyone else's. A skipped client is stale until the next layout
+/// change; that is acceptable for a cosmetic push and avoids unbounded
+/// buffering.
+pub struct Broadcaster {
+    clients: Mutex<HashMap<u64, mpsc::Sender<Envelope>>>,
+    next_id: AtomicU64,
+}
+
+impl Broadcaster {
+    pub fn new() -> Self {
+        Self { clients: Mutex::new(HashMap::new()), next_id: AtomicU64::new(1) }
+    }
+
+    pub fn register(self: &Arc<Self>, tx: mpsc::Sender<Envelope>) -> BroadcastGuard {
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        self.clients.lock().unwrap().insert(id, tx);
+        BroadcastGuard { broadcaster: Arc::clone(self), id }
+    }
+
+    /// Fan an envelope out to every registered connection. Clone-then-send:
+    /// the guard is released before any channel interaction.
+    pub fn broadcast(&self, env: &Envelope) {
+        let senders: Vec<mpsc::Sender<Envelope>> =
+            self.clients.lock().unwrap().values().cloned().collect();
+        for tx in senders {
+            if tx.try_send(env.clone()).is_err() {
+                tracing::debug!("layout push skipped: peer outgoing channel full or closed");
+            }
+        }
+    }
+}
+
+pub struct BroadcastGuard {
+    broadcaster: Arc<Broadcaster>,
+    id: u64,
+}
+
+impl Drop for BroadcastGuard {
+    fn drop(&mut self) {
+        self.broadcaster.clients.lock().unwrap().remove(&self.id);
+    }
+}
+
+/// Shared state of one daemon peer host: the PTYs, the layout tree they
+/// are arranged in, and the connections to push layout changes to. This
+/// is what `connection::run` receives instead of a bare `PtyManager`.
+///
+/// Lock discipline (as everywhere in `peer::`): guards never cross an
+/// `.await`, and mutation results are broadcast after unlock. Nesting is
+/// one-directional — the layout guard may wrap the manager's short
+/// internal locks (snapshot reads pane metadata), but no code path takes
+/// the layout lock while holding a manager guard, so the order is
+/// consistent and cannot deadlock.
+pub struct PeerHost {
+    pub pty: Arc<PtyManager>,
+    pub layout: Mutex<LayoutStore>,
+    pub clients: Arc<Broadcaster>,
+    pub workspace_id: Vec<u8>,
+}
+
+impl PeerHost {
+    pub fn new(pty: Arc<PtyManager>) -> Self {
+        let layout = LayoutStore::balanced_from_surfaces(&pty.list());
+        Self {
+            pty,
+            layout: Mutex::new(layout),
+            clients: Arc::new(Broadcaster::new()),
+            workspace_id: surface_id_from_name(DAEMON_WORKSPACE),
+        }
+    }
+
+    /// Wire snapshot of the current tree. Reseeds first when the tree is
+    /// empty but surfaces exist — covers hosts whose manager was populated
+    /// after construction (the test harness does this; production spawns
+    /// surfaces before `PeerHost::new`).
+    pub fn layout_snapshot(&self) -> Option<WorkspaceLayout> {
+        let mut layout = self.layout.lock().unwrap();
+        if layout.is_empty() {
+            let surfaces = self.pty.list();
+            if !surfaces.is_empty() {
+                *layout = LayoutStore::balanced_from_surfaces(&surfaces);
+            }
+        }
+        layout.snapshot_proto(&self.pty)
+    }
 }
 
 #[cfg(test)]

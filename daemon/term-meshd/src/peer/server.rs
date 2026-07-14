@@ -12,6 +12,7 @@ use tokio::sync::{watch, Semaphore};
 use tokio::task::JoinSet;
 
 use super::connection;
+use super::layout::PeerHost;
 use super::surface::PtyManager;
 use crate::supervisor::{shutdown_supervised, spawn_supervised};
 
@@ -28,6 +29,10 @@ pub async fn serve_with_manager(
     mut shutdown_rx: watch::Receiver<bool>,
     manager: Arc<PtyManager>,
 ) -> anyhow::Result<()> {
+    // The host owns the layout tree the manager's surfaces are arranged
+    // in; connections share it so WorkspaceControl mutations made over
+    // one connection are visible (and pushable) to all of them.
+    let host = Arc::new(PeerHost::new(manager));
     if path.exists() {
         std::fs::remove_file(&path)?;
     }
@@ -70,10 +75,10 @@ pub async fn serve_with_manager(
                             drop(stream);
                             continue;
                         };
-                        let manager = manager.clone();
+                        let host = host.clone();
                         spawn_supervised(&mut connection_tasks, async move {
                             let _permit = permit;
-                            if let Err(e) = connection::run(stream, manager).await {
+                            if let Err(e) = connection::run(stream, host).await {
                                 tracing::warn!("peer connection ended with error: {e}");
                             }
                         });
