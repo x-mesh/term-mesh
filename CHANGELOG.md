@@ -4,6 +4,16 @@ All notable changes to term-mesh are documented here.
 
 ## [Unreleased]
 
+## [0.154.0] - 2026-07-14
+
+### Added
+- **Linux 서버를 GUI 없이 tmux 대체 호스트로 쓸 수 있게 됨** — `term-meshd` 데몬만 설치하면 셸이 SSH 접속과 무관하게 계속 살아있고, split/close/tab/divider 같은 pane 조작이 macOS 앱에서 그대로 동작한다. 설치는 한 줄 스크립트로 systemd 사용자 서비스로 등록되며 로그아웃·재부팅에도 유지된다.
+- **원격 피어 호스트의 대시보드를 SSH 터널로 그대로 볼 수 있음** — 피어 연결 시 같은 SSH 프로세스가 원격 호스트의 대시보드(포트 9876)도 함께 로컬 `http://127.0.0.1:19876`으로 전달한다. 추가 네트워크 노출 없이 여러 호스트를 동시에 연결해도 각각 다른 로컬 포트로 열린다.
+
+### Thanks to 1 contributor!
+
+- [@JINWOO-J](https://github.com/JINWOO-J)
+
 ## [0.153.0] - 2026-07-13
 
 ### Fixed
