@@ -180,6 +180,9 @@ Verified on Ubuntu 25.10 / x86-64 (2026-07-14):
   → auth → attach → live PTY stream, via `tm-agent peer list` / `peer attach`.
 - Peer socket and dashboard forward coexist on one ssh process; the dashboard
   lands on 19877 when 19876 is taken.
+- The macOS app connects end-to-end: `ListWorkspaces` returns the synthesised
+  workspace, the surfaces render as tiled panes, and the dashboard is reachable
+  at `http://127.0.0.1:19876` while the Mac's own daemon keeps 9876.
 
 Known gaps versus tmux:
 
@@ -188,6 +191,12 @@ Known gaps versus tmux:
 - **No screen re-sync.** `GridSnapshot` is defined in the protocol but neither
   host implements sending it; the stream is raw `PtyData` bytes only. If it
   desynchronizes, there is no protocol-level repair.
-- **No workspace/split layout mirroring.** The Rust host does not handle
-  `ListWorkspaces` / `WorkspaceControl` — those are Swift-host only. A Linux host
-  exposes a flat list of surfaces; you arrange panes on the Mac side.
+- **No layout to mirror, so one is synthesised.** A daemon host has no bonsplit
+  windows — it owns a flat set of forkpty surfaces. It answers `ListWorkspaces`
+  with a single workspace that tiles those surfaces into a balanced split tree
+  (orientation alternates by depth, so four surfaces land in a 2x2). You get every
+  surface on screen at once, but the arrangement is the daemon's, not something you
+  laid out and it remembered.
+- **No tab switching.** `WorkspaceControl` is Swift-host only, which is why the
+  surfaces are tiled rather than stacked as tabs — a tab strip you could not
+  switch would be worse than panes you can see.
