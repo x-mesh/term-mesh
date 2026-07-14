@@ -55,12 +55,17 @@ enum PeerFederationSettings {
     static let defaultRemoteDashboardPort = 9876
 
     /// When on, the peer SSH tunnel also forwards the remote dashboard
-    /// to a free local port. On by default: the forward is loopback-only
-    /// on both ends and rides the tunnel that peer already opens, so it
-    /// costs no extra exposure. Skipped silently when no local port is
-    /// free (the peer forward must not be taken down with it).
+    /// to a free local port. Off by default: the remote dashboard is
+    /// typically unauthenticated (no `TERM_MESH_HTTP_PASSWORD`), and its
+    /// routes include `/api/agents/spawn` / `/api/process/stop` — forwarding
+    /// it onto the Mac's own loopback makes those reachable to any local
+    /// process, or a webpage's `no-cors` POST, with no further action from
+    /// the user. Loopback-only framing describes the network hop; it does
+    /// not describe the local-process trust boundary this crosses, so the
+    /// forward is opt-in. Skipped silently when no local port is free (the
+    /// peer forward must not be taken down with it).
     static var forwardDashboard: Bool {
-        UserDefaults.standard.object(forKey: forwardDashboardKey) as? Bool ?? true
+        UserDefaults.standard.object(forKey: forwardDashboardKey) as? Bool ?? false
     }
 
     static var remoteDashboardPort: Int {
