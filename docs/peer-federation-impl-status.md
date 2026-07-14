@@ -50,7 +50,20 @@ Phase D  — Production integration
   D-7a   — Divider drag sync (relay → host)                                 ✅ DONE
   D-7b   — Focus sync (relay click → host pane focus)                       ✅ DONE
   D-7c   — Cmd+T new tab forwarding                                         ✅ DONE
+Phase P  — Remote pane primitive (main-window pane mixing)
+  P-1    — PeerPaneSession + per-host tunnel lease registry                 ✅ DONE
+  P-2    — Workspace.openRemotePane (portal-mounted relay pane)             ✅ DONE
+  P-3    — Entry UX (dialog checkbox + sidebar context menu) + roster       ✅ DONE
+  P-4    — Disconnect banner + Reconnect (re-attach + pane swap)            ✅ DONE
+  P-5    — Host signals (titlebar gradient / pane strip / tab chip)         ✅ DONE
+  P-6    — Workspace mirror on pane primitive (layout adapter)              ⬜ TODO (Phase 2)
 ```
+
+Phase P coexists with the relay windows (C-4 / W) — they remain the
+fallback and the multi-viewer layout-consistent path. Pane mixing keeps
+layout ownership local (Bonsplit); see
+`.xm/build/projects/peer-remote-pane-phase1/context/` for the decision
+record (notably D1: per-pane owned sessions over shared-session RPC).
 
 ---
 

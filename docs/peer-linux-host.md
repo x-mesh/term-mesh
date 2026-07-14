@@ -163,6 +163,17 @@ Recent hosts are remembered (8 max), offered in the connect dialog, and
 listed under the menu bar's **Connect to Recent Peer** submenu for
 one-click reconnects that skip the dialog entirely.
 
+### Open as a pane instead of a window
+
+Check **"Open as a pane in the current workspace"** in the connect
+dialog (or right-click a connected host in the sidebar's Remote Hosts
+section → *Open Surface as Pane…*) to host a remote surface as a normal
+Bonsplit pane next to your local ones — one workspace can mix panes
+from several hosts. The focused pane's host tints the titlebar, every
+remote pane carries a colored top strip and a `title ⌁ host` tab chip,
+and a disconnect shows an in-pane banner with Reconnect. Panes to the
+same host share one SSH tunnel; closing the last pane closes it.
+
 ## Dashboard forwarding
 
 `term-meshd` serves an HTTP dashboard — sessions, fleet, team, agent spawn,

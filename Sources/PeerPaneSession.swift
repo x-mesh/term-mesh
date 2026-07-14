@@ -289,6 +289,15 @@ final class PeerPaneSession {
             await conn.cancel()
             throw error
         }
+        do {
+            // Bind the local relay socket BEFORE Ghostty spawns the relay
+            // binary as the pane's shell — the binary connects immediately
+            // on launch, and an unbound socket kills the session at start().
+            try relay.prepareListener()
+        } catch {
+            await relay.stop()
+            throw error
+        }
         PeerPaneHostRegistry.shared.retain(lease)
         let paneSession = PeerPaneSession(
             lease: lease,

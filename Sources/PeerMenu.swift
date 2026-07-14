@@ -600,7 +600,9 @@ final class PeerClientCoordinator: NSObject {
     }
 
     private static func currentWorkspaceForPaneOpen() -> Workspace? {
-        (NSApp.delegate as? AppDelegate)?.tabManager?.selectedWorkspace
+        // NSApp.delegate is the SwiftUI adaptor shim, not our type —
+        // AppDelegate.shared is the canonical accessor.
+        AppDelegate.shared?.tabManager?.selectedWorkspace
     }
 
     #if DEBUG

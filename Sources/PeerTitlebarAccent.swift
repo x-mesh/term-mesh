@@ -138,7 +138,9 @@ extension NSWindow {
 @MainActor
 enum PeerTitlebarAccentController {
     static func refresh() {
-        guard let appDelegate = NSApp.delegate as? AppDelegate else { return }
+        // NSApp.delegate is the SwiftUI adaptor shim, not our type —
+        // AppDelegate.shared is the canonical accessor.
+        guard let appDelegate = AppDelegate.shared else { return }
         for context in appDelegate.mainWindowContexts.values {
             guard let window = context.window else { continue }
             let hostKey: PeerPaneHostKey? = {
