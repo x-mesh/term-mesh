@@ -847,6 +847,14 @@ struct RemoteWorkspaceRowView: View {
         .onTapGesture {
             store.openWorkspace(workspace)
         }
+        .contextMenu {
+            // Phase 2A: materialize this host workspace's split layout
+            // as a NEW main-window workspace (remote pane per leaf)
+            // instead of a separate relay window.
+            Button("Open as Workspace in Main Window") {
+                store.openWorkspaceAsMirror(workspace)
+            }
+        }
         .onHover { isHovering = $0 }
     }
 }

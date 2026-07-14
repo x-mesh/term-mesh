@@ -211,4 +211,17 @@ final class RemoteHostStore: ObservableObject {
             await PeerClientCoordinator.shared.openRemotePaneDirect(sockPath: sockPath)
         }
     }
+
+    /// Phase 2A: open this host workspace as a main-window workspace
+    /// mirror (snapshot placement — one remote pane per layout leaf).
+    func openWorkspaceAsMirror(_ workspace: WorkspaceSummary) {
+        let sockPath = workspace.hostSockPath
+        guard !sockPath.isEmpty else { return }
+        Task {
+            await PeerClientCoordinator.shared.openRemoteWorkspaceMirror(
+                spec: .direct(sockPath: sockPath),
+                workspaceID: workspace.id
+            )
+        }
+    }
 }

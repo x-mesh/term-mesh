@@ -2063,6 +2063,16 @@ final class Workspace: Identifiable, ObservableObject {
                   environment: session.relayEnvironment
               )
         else { return nil }
+        bindRemotePane(session: session, to: panel)
+        return panel
+    }
+
+    /// Wire a remote session to a panel whose Ghostty surface was
+    /// created with the session's relay command/env: session ownership,
+    /// host signals, disconnect banner, and relay start. Split out of
+    /// `openRemotePane` so the workspace-mirror flow can bind a fresh
+    /// workspace's INITIAL panel the same way.
+    func bindRemotePane(session: PeerPaneSession, to panel: TerminalPanel) {
         panel.peerPaneSession = session
         if !session.surfaceTitle.isEmpty {
             panel.updateTitle(session.surfaceTitle)
@@ -2126,7 +2136,6 @@ final class Workspace: Identifiable, ObservableObject {
                 _ = panel
             }
         }
-        return panel
     }
 
     // MARK: - Flash/Notification Support

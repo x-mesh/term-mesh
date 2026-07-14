@@ -752,6 +752,22 @@ extension TerminalController {
         return .ok(["ok": true, "started": true])
     }
 
+    /// Test-only: fire-and-forget headless workspace mirror (Phase 2A).
+    /// Same polling contract as open_remote_pane.
+    func v2DebugPeerOpenWorkspaceMirror(params: [String: Any]) -> V2CallResult {
+        let sockPath = v2String(params, "sock_path")
+        if Thread.isMainThread {
+            MainActor.assumeIsolated {
+                PeerClientCoordinator.shared.debugOpenWorkspaceMirror(sockPath: sockPath)
+            }
+        } else {
+            DispatchQueue.main.async {
+                PeerClientCoordinator.shared.debugOpenWorkspaceMirror(sockPath: sockPath)
+            }
+        }
+        return .ok(["ok": true, "started": true])
+    }
+
     /// Test-only: snapshot of remote-pane sessions + host-lease count
     /// for e2e assertions (pane open landed, teardown released lease).
     func v2DebugPeerPaneStatus(params _: [String: Any]) -> V2CallResult {

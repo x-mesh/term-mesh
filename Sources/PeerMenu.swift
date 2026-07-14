@@ -605,6 +605,234 @@ final class PeerClientCoordinator: NSObject {
         AppDelegate.shared?.tabManager?.selectedWorkspace
     }
 
+    // MARK: - Remote workspace mirror (Phase 2A — snapshot placement)
+
+    /// Mirror opens currently in flight, keyed by host key description —
+    /// a double click must not materialize two copies.
+    private var mirrorOpensInFlight: Set<String> = []
+
+    /// Open a host workspace as a NEW main-window workspace: read its
+    /// split tree once and materialize one Phase-1 remote pane per leaf
+    /// in the same shape (orientation + divider ratios). Layout is
+    /// local-owned afterwards — this is the snapshot model; live
+    /// host↔local layout sync is Phase 2B.
+    func openRemoteWorkspaceMirror(
+        spec: PeerPaneHostSpec,
+        workspaceID: Data?,
+        pickFirstWithoutPrompt: Bool = false
+    ) async {
+        let flowKey = spec.hostKey.description
+        guard !mirrorOpensInFlight.contains(flowKey) else { return }
+        mirrorOpensInFlight.insert(flowKey)
+        defer { mirrorOpensInFlight.remove(flowKey) }
+
+        let registry = PeerPaneHostRegistry.shared
+        let lease: PeerPaneHostLease
+        do {
+            lease = try await registry.acquire(spec)
+        } catch {
+            self.showAlert(title: "Peer Connection Failed", body: String(describing: error))
+            return
+        }
+
+        let workspaces: [Termmesh_Peer_V1_Workspace]
+        do {
+            let conn = try await PeerRelaySession.connect(hostSockPath: lease.hostSockPath)
+            do {
+                workspaces = try await conn.session.listWorkspaces()
+            } catch {
+                await conn.cancel()
+                throw error
+            }
+            await conn.cancel()
+        } catch {
+            registry.release(lease)
+            self.showAlert(title: "Workspace List Failed", body: String(describing: error))
+            return
+        }
+        guard !workspaces.isEmpty else {
+            registry.release(lease)
+            self.showAlert(
+                title: "No Workspaces",
+                body: "The host reports no workspaces (older hosts may not expose layouts)."
+            )
+            return
+        }
+
+        let chosen: Termmesh_Peer_V1_Workspace?
+        if let workspaceID {
+            chosen = workspaces.first { $0.workspaceID == workspaceID } ?? workspaces.first
+        } else if workspaces.count == 1 || pickFirstWithoutPrompt {
+            chosen = workspaces[0]
+        } else {
+            chosen = await promptForWorkspaceSelection(from: workspaces)
+        }
+        guard let chosen else {
+            registry.release(lease)
+            return
+        }
+
+        guard let tabManager = AppDelegate.shared?.tabManager else {
+            registry.release(lease)
+            self.showAlert(title: "No Main Window", body: "Open a term-mesh window first.")
+            return
+        }
+
+        // First leaf seeds the new workspace's initial pane; every other
+        // leaf is split off recursively in the host tree's shape.
+        guard let firstLeaf = Self.firstLeafPane(chosen.layout) else {
+            registry.release(lease)
+            self.showAlert(title: "Empty Workspace", body: "The chosen workspace has no panes.")
+            return
+        }
+
+        let firstSession: PeerPaneSession
+        do {
+            firstSession = try await PeerPaneSession.attach(
+                lease: lease,
+                surface: Self.surfaceInfo(fromLeaf: firstLeaf),
+                title: firstLeaf.title,
+                spec: spec
+            )
+        } catch {
+            registry.release(lease)
+            self.showAlert(title: "Attach Failed", body: String(describing: error))
+            return
+        }
+
+        let workspace = tabManager.addWorkspace(
+            select: true,
+            command: firstSession.relayLaunchCommand,
+            environment: firstSession.relayEnvironment
+        )
+        let hostChip = spec.hostKey.shortLabel
+        workspace.title = "\(chosen.title.isEmpty ? "Workspace" : chosen.title) ⌁ \(hostChip)"
+        guard let firstPanel = workspace.panels.values
+            .compactMap({ $0 as? TerminalPanel }).first
+        else {
+            firstSession.teardown()
+            registry.release(lease)
+            self.showAlert(title: "Mirror Failed", body: "New workspace has no terminal panel.")
+            return
+        }
+        workspace.bindRemotePane(session: firstSession, to: firstPanel)
+
+        await materializeLayout(
+            chosen.layout, seed: firstPanel,
+            workspace: workspace, lease: lease, spec: spec
+        )
+
+        // Copy the host's divider ratios onto the (shape-identical by
+        // construction) local tree. A skipped leaf breaks the shape
+        // match — the walk just stops descending that branch.
+        Self.applyDividerRatios(
+            host: chosen.layout,
+            local: workspace.bonsplitController.treeSnapshot(),
+            controller: workspace.bonsplitController
+        )
+
+        // Browse ref done — each pane session holds its own lease ref.
+        registry.release(lease)
+        #if DEBUG
+        dlog("peer.mirror.open host=\(spec.hostKey) workspace=\(chosen.title) leaves=\(Self.countLeafPanes(chosen.layout))")
+        #endif
+    }
+
+    /// Pre-order split materialization: split the seed's region for the
+    /// top split (new pane = second subtree's first leaf), then recurse
+    /// into both regions. A failed leaf attach logs and skips its
+    /// subtree — the rest of the workspace still opens.
+    private func materializeLayout(
+        _ node: Termmesh_Peer_V1_WorkspaceLayout,
+        seed: TerminalPanel,
+        workspace: Workspace,
+        lease: PeerPaneHostLease,
+        spec: PeerPaneHostSpec
+    ) async {
+        guard case .split(let split) = node.node else { return }
+        guard let secondLeaf = Self.firstLeafPane(split.second) else {
+            await materializeLayout(split.first, seed: seed, workspace: workspace, lease: lease, spec: spec)
+            return
+        }
+        let session: PeerPaneSession
+        do {
+            session = try await PeerPaneSession.attach(
+                lease: lease,
+                surface: Self.surfaceInfo(fromLeaf: secondLeaf),
+                title: secondLeaf.title,
+                spec: spec
+            )
+        } catch {
+            NSLog("[peer-mirror] leaf attach failed, skipping subtree: %@", String(describing: error))
+            await materializeLayout(split.first, seed: seed, workspace: workspace, lease: lease, spec: spec)
+            return
+        }
+        let orientation = SplitOrientation(rawValue: split.orientation) ?? .horizontal
+        guard let newPanel = workspace.openRemotePane(
+            session: session, orientation: orientation, focus: false, from: seed.id
+        ) else {
+            session.teardown()
+            NSLog("[peer-mirror] split failed, skipping subtree")
+            await materializeLayout(split.first, seed: seed, workspace: workspace, lease: lease, spec: spec)
+            return
+        }
+        await materializeLayout(split.first, seed: seed, workspace: workspace, lease: lease, spec: spec)
+        await materializeLayout(split.second, seed: newPanel, workspace: workspace, lease: lease, spec: spec)
+    }
+
+    private static func applyDividerRatios(
+        host: Termmesh_Peer_V1_WorkspaceLayout,
+        local: ExternalTreeNode,
+        controller: BonsplitController
+    ) {
+        guard case .split(let hostSplit) = host.node,
+              case .split(let localSplit) = local
+        else { return }
+        if hostSplit.dividerPosition > 0, hostSplit.dividerPosition < 1,
+           let splitId = UUID(uuidString: localSplit.id)
+        {
+            _ = controller.setDividerPosition(
+                CGFloat(hostSplit.dividerPosition), forSplit: splitId
+            )
+        }
+        applyDividerRatios(host: hostSplit.first, local: localSplit.first, controller: controller)
+        applyDividerRatios(host: hostSplit.second, local: localSplit.second, controller: controller)
+    }
+
+    private static func firstLeafPane(
+        _ node: Termmesh_Peer_V1_WorkspaceLayout
+    ) -> Termmesh_Peer_V1_WorkspacePane? {
+        switch node.node {
+        case .pane(let pane): return pane
+        case .split(let split):
+            return firstLeafPane(split.first) ?? firstLeafPane(split.second)
+        case .none: return nil
+        }
+    }
+
+    private static func countLeafPanes(_ node: Termmesh_Peer_V1_WorkspaceLayout) -> Int {
+        switch node.node {
+        case .pane: return 1
+        case .split(let split):
+            return countLeafPanes(split.first) + countLeafPanes(split.second)
+        case .none: return 0
+        }
+    }
+
+    /// AttachSurface only needs id + geometry; the layout leaf carries
+    /// both, so the mirror never has to cross-reference ListSurfaces.
+    private static func surfaceInfo(
+        fromLeaf leaf: Termmesh_Peer_V1_WorkspacePane
+    ) -> Termmesh_Peer_V1_SurfaceInfo {
+        var info = Termmesh_Peer_V1_SurfaceInfo()
+        info.surfaceID = leaf.surfaceID
+        info.title = leaf.title
+        info.cols = leaf.cols
+        info.rows = leaf.rows
+        info.attachable = true
+        return info
+    }
+
     #if DEBUG
     // MARK: - Remote pane debug hooks (tests_v2 socket e2e)
 
@@ -669,6 +897,37 @@ final class PeerClientCoordinator: NSObject {
             } catch {
                 self.debugLastPaneOpenResult = ["ok": false, "error": String(describing: error)]
             }
+        }
+    }
+
+    /// Test-only headless workspace mirror: no pickers/alerts on the
+    /// happy path (first workspace auto-picked). Outcome polled via
+    /// `debug.peer.pane_status` — session count reflects mirrored
+    /// leaves.
+    func debugOpenWorkspaceMirror(sockPath: String?) {
+        debugLastPaneOpenResult = nil
+        Task { @MainActor in
+            var resolvedSock = sockPath
+            if resolvedSock == nil {
+                _ = await PeerHostCoordinator.shared.setRunning(true)
+                resolvedSock = PeerHostCoordinator.shared.currentSocketPath
+            }
+            guard let hostSock = resolvedSock, !hostSock.isEmpty else {
+                self.debugLastPaneOpenResult = ["ok": false, "error": "no_host_socket"]
+                return
+            }
+            let before = self.openPaneSessions.count
+            await self.openRemoteWorkspaceMirror(
+                spec: .direct(sockPath: hostSock),
+                workspaceID: nil,
+                pickFirstWithoutPrompt: true
+            )
+            let opened = self.openPaneSessions.count - before
+            self.debugLastPaneOpenResult = [
+                "ok": opened > 0,
+                "mirror": true,
+                "panes_opened": opened,
+            ]
         }
     }
 

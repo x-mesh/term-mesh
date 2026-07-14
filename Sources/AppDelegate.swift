@@ -3,6 +3,7 @@ import SwiftUI
 import Bonsplit
 import CoreServices
 import UserNotifications
+import PeerProto
 import Sentry
 import WebKit
 import Combine
