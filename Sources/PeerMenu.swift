@@ -332,7 +332,13 @@ final class PeerClientCoordinator: NSObject {
         guard beginConnectionFlow(flow) else { return }
         defer { finishConnectionFlow(flow) }
 
-        let tunnel = PeerSSHTunnel(sshTarget: target, remoteSockPath: remote)
+        let tunnel = PeerSSHTunnel(
+            sshTarget: target,
+            remoteSockPath: remote,
+            dashboardRemotePort: PeerFederationSettings.forwardDashboard
+                ? PeerFederationSettings.remoteDashboardPort
+                : nil
+        )
         do {
             try await tunnel.start()
         } catch {

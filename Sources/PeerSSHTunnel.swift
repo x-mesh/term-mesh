@@ -49,8 +49,15 @@ final class PeerSSHTunnel: @unchecked Sendable {
     let remoteSockPath: String
     let localSockPath: String
 
+    /// Remote HTTP dashboard port to forward alongside the peer socket.
+    /// `nil` disables the forward entirely.
+    let dashboardRemotePort: Int?
+
     private var process: Process?
     private let lock = NSLock()
+    /// Local port the remote dashboard is reachable on while the tunnel
+    /// is up. `nil` whenever the forward is disabled or was skipped.
+    private var dashboardPort: Int?
     /// Caller wants the tunnel running. Cleared by `stop()` so the
     /// auto-restart loop knows when to give up.
     private var wantsRunning = false
@@ -61,9 +68,10 @@ final class PeerSSHTunnel: @unchecked Sendable {
     /// actor; observers can safely touch UI state directly.
     var onStateChange: (@MainActor (PeerSSHTunnelState) -> Void)?
 
-    init(sshTarget: String, remoteSockPath: String) {
+    init(sshTarget: String, remoteSockPath: String, dashboardRemotePort: Int? = nil) {
         self.sshTarget = sshTarget
         self.remoteSockPath = remoteSockPath
+        self.dashboardRemotePort = dashboardRemotePort
         let uuid = UUID().uuidString.lowercased().prefix(8)
         // Embed the owning app's PID in the filename so the startup
         // sweep can distinguish "left over from a dead app instance"
@@ -80,6 +88,81 @@ final class PeerSSHTunnel: @unchecked Sendable {
         lock.lock(); defer { lock.unlock() }
         return state
     }
+
+    /// Local port serving the remote dashboard, or `nil` when the
+    /// forward is off or could not be established.
+    var dashboardLocalPort: Int? {
+        lock.lock(); defer { lock.unlock() }
+        return dashboardPort
+    }
+
+    /// Loopback URL for the remote host's dashboard while the tunnel is
+    /// up. `nil` when the forward is off or was skipped.
+    var dashboardURL: URL? {
+        dashboardLocalPort.flatMap { URL(string: "http://127.0.0.1:\($0)/") }
+    }
+
+    /// First loopback port at or above `Self.dashboardPortBase` that
+    /// nothing is bound to, preferring `preferred` so the dashboard URL
+    /// survives a reconnect. Falls back to a `target`-derived slot before
+    /// scanning sequentially, so a given host consistently prefers "its
+    /// own" port across reconnects and across separate `PeerSSHTunnel`
+    /// instances — a stale browser tab left open on a freed port is far
+    /// less likely to silently start driving a *different* host's
+    /// dashboard the next time that port comes free. This narrows the
+    /// window rather than closing it (the scan range is finite and hash
+    /// collisions are possible), which is why `dashboardURL` is still
+    /// best-effort, not a durable per-host identity.
+    ///
+    /// Returns `nil` when the whole scan range is taken — the caller then
+    /// drops the forward rather than risk `ExitOnForwardFailure` taking
+    /// the peer tunnel down with it.
+    ///
+    /// This is a bind probe, so it races anything that grabs the port in
+    /// the window between the probe and ssh's own bind. That race is why
+    /// `spawnOnce` retries without the forward instead of trusting it.
+    private static func claimLocalPort(preferring preferred: Int?, target: String) -> Int? {
+        var candidates: [Int] = []
+        if let preferred { candidates.append(preferred) }
+        let hashed = preferredPort(for: target)
+        if hashed != preferred { candidates.append(hashed) }
+        candidates += (dashboardPortBase..<(dashboardPortBase + dashboardPortScanRange))
+            .filter { $0 != preferred && $0 != hashed }
+        return candidates.first(where: isLoopbackPortFree)
+    }
+
+    /// Stable-within-this-process-launch starting slot for `target`.
+    /// `Hasher` reseeds every launch (hash-flooding protection), so this
+    /// intentionally does not persist across app restarts — a restart
+    /// already invalidates any tab left open on an old dashboard URL.
+    private static func preferredPort(for target: String) -> Int {
+        var hasher = Hasher()
+        hasher.combine(target)
+        let offset = abs(hasher.finalize()) % dashboardPortScanRange
+        return dashboardPortBase + offset
+    }
+
+    private static func isLoopbackPortFree(_ port: Int) -> Bool {
+        let fd = socket(AF_INET, SOCK_STREAM, 0)
+        guard fd >= 0 else { return false }
+        defer { close(fd) }
+        var addr = sockaddr_in()
+        addr.sin_family = sa_family_t(AF_INET)
+        addr.sin_port = in_port_t(UInt16(port).bigEndian)
+        addr.sin_addr.s_addr = INADDR_LOOPBACK.bigEndian
+        let bound = withUnsafePointer(to: &addr) {
+            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                Darwin.bind(fd, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
+            }
+        }
+        return bound == 0
+    }
+
+    /// Local dashboard ports start here rather than at the remote's 9876:
+    /// the app's own term-meshd already holds 9876 on this machine, and
+    /// several peer hosts can be connected at once.
+    private static let dashboardPortBase = 19876
+    private static let dashboardPortScanRange = 100
 
     /// Spawns `ssh -N -T -L local:remote target` and waits up to 10s
     /// for the local socket to materialise. Throws on spawn failure or
@@ -156,6 +239,7 @@ final class PeerSSHTunnel: @unchecked Sendable {
         process = nil
         let task = restartTask
         restartTask = nil
+        dashboardPort = nil
         lock.unlock()
         task?.cancel()
         // Only unlink the local socket once we've actually reaped ssh.
@@ -212,7 +296,77 @@ final class PeerSSHTunnel: @unchecked Sendable {
 
     // MARK: - Internals
 
+    /// Brings the tunnel up, forwarding the remote dashboard when one is
+    /// configured. The dashboard forward is strictly best-effort: the peer
+    /// socket is the reason this tunnel exists, and `ExitOnForwardFailure=yes`
+    /// means a dashboard bind that loses a race would take the peer forward
+    /// down with it. So a spawn carrying the dashboard that fails is retried
+    /// once without it.
     private func spawnOnce() async throws {
+        guard dashboardRemotePort != nil else {
+            try await spawnAttempt(dashboardLocalPort: nil)
+            return
+        }
+
+        lock.lock()
+        let previous = dashboardPort
+        lock.unlock()
+
+        if let port = Self.claimLocalPort(preferring: previous, target: sshTarget) {
+            do {
+                try await spawnAttempt(dashboardLocalPort: port)
+                return
+            } catch {
+                // A caller-initiated stop/cancel racing this attempt must
+                // propagate immediately rather than spawn a second,
+                // unowned ssh: `stop()` already reaped the first process
+                // and nothing is left to kill the retry. Check
+                // Task.isCancelled (covers cancellation from any source,
+                // not just our own restartTask) and wantsRunning (covers
+                // stop() clearing intent without the cancellation token
+                // reaching this frame, e.g. during the first start()).
+                if Task.isCancelled { throw error }
+                lock.lock()
+                let stillWants = wantsRunning
+                lock.unlock()
+                guard stillWants else { throw error }
+
+                // Only retry without the dashboard when the failure looks
+                // like the dashboard forward itself losing its bind race
+                // (ExitOnForwardFailure kills ssh, which stderr reports as
+                // a listen/bind/forwarding failure). Anything else — bad
+                // target, auth failure, ssh missing, the generic 10s
+                // socket-wait timeout — is not a dashboard problem, and
+                // retrying it would just pay the same timeout twice.
+                guard Self.looksLikeForwardBindFailure(error) else { throw error }
+            }
+        }
+        try await spawnAttempt(dashboardLocalPort: nil)
+    }
+
+    /// Best-effort classifier for "ssh exited because a `-L` forward
+    /// couldn't bind" vs. every other `spawnAttempt` failure (missing
+    /// binary, bad target, auth failure, generic timeout). Matches the
+    /// stderr substrings OpenSSH actually emits for `ExitOnForwardFailure`
+    /// rejections. False negatives just skip the retry (safe: the caller
+    /// still gets a connection attempt, minus the redundant one); this is
+    /// deliberately not exhaustive across OpenSSH versions/locales.
+    private static func looksLikeForwardBindFailure(_ error: Error) -> Bool {
+        let message: String
+        switch error {
+        case PeerSSHTunnelError.spawnFailed(let detail): message = detail
+        default: return false
+        }
+        let signals = ["cannot listen", "address already in use", "could not request local forwarding", "bind:"]
+        let lowered = message.lowercased()
+        return signals.contains { lowered.contains($0) }
+    }
+
+    private func spawnAttempt(dashboardLocalPort: Int?) async throws {
+        lock.lock()
+        dashboardPort = dashboardLocalPort
+        lock.unlock()
+
         try? FileManager.default.removeItem(atPath: localSockPath)
 
         // Reject inputs that could be reinterpreted as ssh options.
@@ -224,6 +378,24 @@ final class PeerSSHTunnel: @unchecked Sendable {
         // the forward target.
         try Self.validateSshTarget(sshTarget)
         try Self.validateRemoteSockPath(remoteSockPath)
+
+        // Forward the remote dashboard onto a loopback port here. Both
+        // ends stay on 127.0.0.1: term-meshd binds its dashboard to
+        // loopback, and so does this end of the forward, so nothing is
+        // exposed off-box that was not already. The local bind address is
+        // explicit (`127.0.0.1:<port>:...`) rather than left to ssh's
+        // default for two reasons: (1) an unqualified `-L port:...` lets
+        // ssh bind `::1` as well as `127.0.0.1`, so `isLoopbackPortFree`'s
+        // v4-only probe could pass on a port that's actually taken on v6
+        // and kill the whole tunnel via ExitOnForwardFailure; (2) per
+        // ssh_config(5), `GatewayPorts` governs the bind address of local
+        // (`-L`) forwards, not only remote ones — a user whose own
+        // ~/.ssh/config sets `GatewayPorts yes` for unrelated reasons
+        // would otherwise have this specific forward bind 0.0.0.0.
+        var dashboardArgs: [String] = []
+        if let dashboardLocalPort, let remotePort = dashboardRemotePort {
+            dashboardArgs = ["-L", "127.0.0.1:\(dashboardLocalPort):127.0.0.1:\(remotePort)"]
+        }
 
         let proc = Process()
         proc.executableURL = URL(fileURLWithPath: "/usr/bin/ssh")
@@ -247,6 +419,7 @@ final class PeerSSHTunnel: @unchecked Sendable {
             "-o", "StrictHostKeyChecking=accept-new",
             "-o", "BatchMode=no",
             "-L", "\(localSockPath):\(remoteSockPath)",
+        ] + dashboardArgs + [
             // `--` ends ssh option parsing so the trailing target is
             // always treated positionally, even if it sneaks past the
             // validator above.

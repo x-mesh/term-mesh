@@ -14,8 +14,9 @@ use std::sync::Arc;
 
 use peer_proto::v1::envelope::Payload;
 use peer_proto::v1::{
-    workspace_update, AttachMode, AttachResult, AuthChallenge, AuthResult, Envelope, Error, Hello,
-    Pong, PtyData, SurfaceList, WorkspaceMeta, WorkspaceUpdate,
+    workspace_layout, workspace_update, AttachMode, AttachResult, AuthChallenge, AuthResult,
+    Envelope, Error, Hello, PaneTab, Pong, PtyData, SurfaceList, Workspace, WorkspaceLayout,
+    WorkspaceList, WorkspaceMeta, WorkspacePane, WorkspaceSplit, WorkspaceUpdate,
 };
 use peer_proto::{capability, PeerCapabilities};
 use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
@@ -183,6 +184,36 @@ async fn reader_loop(
                     seq: next_seq(&seq_counter),
                     correlation_id: env.seq,
                     payload: Some(Payload::SurfaceList(SurfaceList { surfaces })),
+                };
+                send(&outgoing_tx, reply).await?;
+            }
+
+            (HandshakeState::Ready, Payload::ListWorkspaces(_)) => {
+                // A daemon-only host has no bonsplit windows to mirror — it
+                // owns a flat set of forkpty surfaces. Clients (the macOS app)
+                // enter every peer session through ListWorkspaces though, and
+                // leaving it unanswered stalls them until their 10s read
+                // timeout fires, which reads as "the host is broken".
+                //
+                // So synthesise one workspace whose layout tiles the surfaces.
+                // The app then renders them as panes over its normal path, with
+                // no client-side special case for daemon hosts.
+                let surfaces = manager.list();
+                let reply = Envelope {
+                    seq: next_seq(&seq_counter),
+                    correlation_id: env.seq,
+                    payload: Some(Payload::WorkspaceList(WorkspaceList {
+                        workspaces: vec![Workspace {
+                            workspace_id: super::surface::surface_id_from_name(DAEMON_WORKSPACE),
+                            title: hostname_or(DAEMON_WORKSPACE),
+                            layout: tile_surfaces(&surfaces),
+                            // Empty window_id: clients read that as the legacy
+                            // "single implied window" flat list, which is what
+                            // a daemon host actually is.
+                            window_id: Vec::new(),
+                            window_title: String::new(),
+                        }],
+                    })),
                 };
                 send(&outgoing_tx, reply).await?;
             }
@@ -473,6 +504,102 @@ fn next_seq(seq_counter: &AtomicU64) -> u64 {
     seq_counter.fetch_add(1, Ordering::Relaxed) + 1
 }
 
+/// Name of the single workspace a daemon-only host synthesises. Hashed
+/// through `surface_id_from_name`, so the id is stable across restarts
+/// and the client can keep referring to the same workspace.
+const DAEMON_WORKSPACE: &str = "term-meshd";
+
+/// Best-effort hostname for the synthesised workspace title, in priority
+/// order: `gethostname(2)`, then `/etc/hostname`, then `fallback`.
+///
+/// `$HOSTNAME` was the prior primary source, but bash keeps it as a shell
+/// (non-exported) variable, not an environment variable — a systemd unit
+/// (`docs/peer-linux-host.md`'s documented deployment) never sees it, so
+/// that branch was dead in the deployment this daemon actually targets.
+/// `gethostname(2)` is a real syscall with no such gap. Both fallback
+/// paths are trimmed identically so trailing whitespace can't leak into
+/// the title from either source.
+fn hostname_or(fallback: &str) -> String {
+    gethostname_string()
+        .or_else(|| {
+            std::fs::read_to_string("/etc/hostname")
+                .ok()
+                .map(|h| h.trim().to_string())
+                .filter(|h| !h.is_empty())
+        })
+        .unwrap_or_else(|| fallback.to_string())
+}
+
+/// `gethostname(2)` via a fixed-size stack buffer — `HOST_NAME_MAX` on
+/// Linux is 64 bytes; 256 leaves headroom without an allocation dance.
+/// `None` on syscall failure or a non-UTF-8 / empty result.
+fn gethostname_string() -> Option<String> {
+    let mut buf = [0u8; 256];
+    // Safety: buf is a valid, correctly-sized byte buffer for the
+    // duration of the call; gethostname writes at most buf.len() bytes
+    // (NUL-terminated) and returns non-zero on failure without touching
+    // buf's contents in a way we rely on.
+    let rc = unsafe { libc::gethostname(buf.as_mut_ptr() as *mut libc::c_char, buf.len()) };
+    if rc != 0 {
+        return None;
+    }
+    let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+    let s = std::str::from_utf8(&buf[..end]).ok()?.trim().to_string();
+    (!s.is_empty()).then_some(s)
+}
+
+/// Lay the host's surfaces out as a balanced split tree so every one of
+/// them is visible at once — the daemon has no bonsplit layout of its own
+/// to mirror, and tiling beats stacking them as tabs because tab
+/// switching needs `WorkspaceControl`, which a daemon host does not serve.
+///
+/// Splits alternate orientation by depth, so 4 surfaces land in a 2x2
+/// rather than four thin columns. Returns `None` when there are no
+/// surfaces; the client renders that as an empty workspace.
+fn tile_surfaces(surfaces: &[Arc<PtySurface>]) -> Option<WorkspaceLayout> {
+    fn build(surfaces: &[Arc<PtySurface>], depth: usize) -> Option<WorkspaceLayout> {
+        match surfaces.len() {
+            0 => None,
+            1 => {
+                let info = surfaces[0].info();
+                Some(WorkspaceLayout {
+                    node: Some(workspace_layout::Node::Pane(WorkspacePane {
+                        surface_id: info.surface_id.clone(),
+                        title: info.title.clone(),
+                        cols: info.cols,
+                        rows: info.rows,
+                        cwd: info.cwd.clone(),
+                        // The pane holds exactly one surface, and the active
+                        // tab must also appear in `tabs` per the schema.
+                        tabs: vec![PaneTab {
+                            surface_id: info.surface_id,
+                            title: info.title,
+                        }],
+                    })),
+                })
+            }
+            n => {
+                let mid = n / 2;
+                let first = build(&surfaces[..mid], depth + 1)?;
+                let second = build(&surfaces[mid..], depth + 1)?;
+                Some(WorkspaceLayout {
+                    node: Some(workspace_layout::Node::Split(Box::new(WorkspaceSplit {
+                        orientation: if depth % 2 == 0 { "horizontal" } else { "vertical" }
+                            .to_string(),
+                        divider_position: 0.5,
+                        first: Some(Box::new(first)),
+                        second: Some(Box::new(second)),
+                        // The daemon has no stable bonsplit split ids to hand
+                        // out; the schema allows this to be empty.
+                        split_id: Vec::new(),
+                    }))),
+                })
+            }
+        }
+    }
+    build(surfaces, 0)
+}
+
 fn random_peer_bytes(len: usize) -> Vec<u8> {
     // CSPRNG via getrandom(3) so auth nonces / session ids don't
     // carry the structural fixed bits of UUIDv4 (version+variant
@@ -532,4 +659,28 @@ async fn send_error(tx: &mpsc::Sender<Envelope>, code: u32, message: &str) {
         })),
     };
     let _ = tx.send(env).await;
+}
+
+#[cfg(test)]
+mod hostname_tests {
+    use super::{gethostname_string, hostname_or};
+
+    /// F8 regression: gethostname(2) is a real syscall (unlike the prior
+    /// $HOSTNAME env read, dead under the systemd deployment
+    /// docs/peer-linux-host.md documents) — it must succeed on any host
+    /// this test runs on and return a non-empty, trimmed name.
+    #[test]
+    fn gethostname_succeeds_and_is_trimmed() {
+        let name = gethostname_string().expect("gethostname(2) should succeed");
+        assert!(!name.is_empty());
+        assert_eq!(name, name.trim(), "must already be trimmed");
+    }
+
+    /// hostname_or must prefer the real hostname over the fallback when
+    /// gethostname(2) succeeds — which it always does on a real machine.
+    #[test]
+    fn hostname_or_prefers_real_hostname_over_fallback() {
+        let result = hostname_or("unreachable-fallback-sentinel");
+        assert_ne!(result, "unreachable-fallback-sentinel");
+    }
 }
