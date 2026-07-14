@@ -183,6 +183,15 @@ Verified on Ubuntu 25.10 / x86-64 (2026-07-14):
 - The macOS app connects end-to-end: `ListWorkspaces` returns the synthesised
   workspace, the surfaces render as tiled panes, and the dashboard is reachable
   at `http://127.0.0.1:19876` while the Mac's own daemon keeps 9876.
+- **Pane operations work like tmux** (verified live 2026-07-14): the daemon
+  serves all six `WorkspaceControl` verbs and advertises
+  `workspace.control.v1`. Cmd+D / Cmd+Shift+D split (the new pane runs
+  `$SHELL -l` in the source pane's cwd), Cmd+W closes (silently refused on the
+  last pane), Cmd+T opens a tab, divider drags land without rebuilding the
+  other panes, a shell that exits removes its own pane, the arrangement
+  survives reconnects for the daemon's lifetime, and every connected viewer
+  sees the same tree (`WorkspaceLayoutChanged` broadcast, 120 ms debounce).
+  The startup tiling is only the seed layout; everything after it is yours.
 
 Known gaps versus tmux:
 
@@ -191,12 +200,19 @@ Known gaps versus tmux:
 - **No screen re-sync.** `GridSnapshot` is defined in the protocol but neither
   host implements sending it; the stream is raw `PtyData` bytes only. If it
   desynchronizes, there is no protocol-level repair.
-- **No layout to mirror, so one is synthesised.** A daemon host has no bonsplit
-  windows — it owns a flat set of forkpty surfaces. It answers `ListWorkspaces`
-  with a single workspace that tiles those surfaces into a balanced split tree
-  (orientation alternates by depth, so four surfaces land in a 2x2). You get every
-  surface on screen at once, but the arrangement is the daemon's, not something you
-  laid out and it remembered.
-- **No tab switching.** `WorkspaceControl` is Swift-host only, which is why the
-  surfaces are tiled rather than stacked as tabs — a tab strip you could not
-  switch would be worse than panes you can see.
+- **Layout resets on daemon restart.** The tree is memory-only by design: the
+  PTYs are children of the daemon, so a restart kills the shells anyway —
+  persisting the layout past them would restore panes onto dead surfaces.
+  Declared (`TERMMESH_PEER_SURFACES`) surfaces come back re-tiled; panes you
+  split off do not.
+
+## Running one daemon at a time
+
+Restart the daemon by killing the old instance **and waiting for it to exit**
+before binding the new one. A TERM'd daemon's shutdown cleanup unlinks its
+socket path — if a new daemon already bound the same path, the straggler
+deletes the new socket file out from under it. The daemon keeps serving its
+(now unlinked) inode, but every new connect through the path gets ENOENT,
+which the Mac side surfaces as `unexpectedEof`. The `start-peer.sh` pattern
+that avoids this: `kill -9` every `term-meshd`, poll until none remain, then
+remove the socket file and start exactly one.
