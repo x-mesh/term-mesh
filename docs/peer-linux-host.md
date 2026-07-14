@@ -25,7 +25,49 @@ local shim that Ghostty spawns as the "shell" of a remote pane. Nothing but
 
 ## Server setup
 
-### Build
+### Quick install (recommended)
+
+One command installs the latest release, registers it as a `systemd --user`
+service, and enables lingering (so it survives logout and boots on reboot
+without an interactive login):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/x-mesh/term-mesh/main/scripts/install-linux.sh | bash
+```
+
+This installs `term-meshd` to `~/.local/bin`, writes a starter config to
+`~/.config/term-mesh/peer.env` (just `TERMMESH_PEER_SOCKET`, pointing at
+`$XDG_RUNTIME_DIR`), and writes/enables
+`~/.config/systemd/user/term-meshd.service`. The peer socket is live
+immediately — no separate "declare surfaces" step is required; a single
+default `$SHELL -l` surface starts if `TERMMESH_PEER_SURFACES` is unset (see
+[Run](#run) below for the format).
+
+To add surfaces or change the socket path, edit the config and restart:
+
+```bash
+$EDITOR ~/.config/term-mesh/peer.env
+systemctl --user restart term-meshd
+```
+
+Re-running the install command is safe — it updates the binary, replaces the
+unit file, and restarts the service, but never touches an existing
+`peer.env`. Supports both `x86_64` and `aarch64`; the script detects the
+architecture and fetches the matching release asset. Requires systemd (most
+mainstream distros) — see [Build from source](#build-from-source) for hosts
+without it.
+
+Useful commands once installed:
+
+```bash
+systemctl --user status term-meshd
+journalctl --user -u term-meshd -f
+```
+
+### Build from source
+
+Only needed if you're not using the installer above — e.g. building from a
+branch, or on a host without systemd.
 
 `term-meshd` needs three paths from the repo root, because `src/http.rs` embeds
 the dashboard at compile time via `include_str!` / `include_bytes!`:
@@ -35,7 +77,8 @@ daemon/          proto/          Resources/dashboard/          Assets.xcassets/
 ```
 
 Ship all four or the build fails on a missing `index.html` / `128.png`, even
-though neither has anything to do with peer.
+though neither has anything to do with peer. `.github/workflows/release-linux.yml`
+builds exactly this way for both architectures on every tagged release.
 
 ```bash
 # from a checkout on the server (or rsync/git archive these four paths)
@@ -64,24 +107,27 @@ top=htop'
 Surfaces respawn on their own: if a shell exits, the next attach brings it back
 from the same spec (`PtyManager::get_or_respawn`).
 
-For a real tmux replacement, run it under systemd so it survives logout:
+For a real tmux replacement without the installer, register it under systemd
+by hand the same way `install-linux.sh` does:
 
 ```ini
 # ~/.config/systemd/user/term-meshd.service
 [Unit]
 Description=term-mesh peer host
+After=network.target
 
 [Service]
-Environment=TERMMESH_PEER_SOCKET=%t/tm-peer.sock
-Environment=TERMMESH_PEER_SURFACES=shell=/bin/zsh -l
-ExecStart=%h/bin/term-meshd
+EnvironmentFile=-%h/.config/term-mesh/peer.env
+ExecStart=%h/.local/bin/term-meshd
 Restart=always
+RestartSec=2
 
 [Install]
 WantedBy=default.target
 ```
 
 ```bash
+systemctl --user daemon-reload
 systemctl --user enable --now term-meshd
 loginctl enable-linger $USER   # keep it running after you log out
 ```
@@ -192,6 +238,13 @@ Verified on Ubuntu 25.10 / x86-64 (2026-07-14):
   survives reconnects for the daemon's lifetime, and every connected viewer
   sees the same tree (`WorkspaceLayoutChanged` broadcast, 120 ms debounce).
   The startup tiling is only the seed layout; everything after it is yours.
+- **`install-linux.sh`'s systemd integration is verified live** (2026-07-14):
+  install, re-run (config preserved, unit replaced, service restarted rather
+  than double-started), `EnvironmentFile` correctly feeds `TERMMESH_PEER_SOCKET`
+  into the running daemon, lingering enabled, and a real `tm-agent peer attach`
+  against the systemd-managed instance. The download step itself (the actual
+  GitHub release asset fetch) is exercised by `.github/workflows/release-linux.yml`
+  on each tagged release, not separately re-verified per doc update.
 
 Known gaps versus tmux:
 
