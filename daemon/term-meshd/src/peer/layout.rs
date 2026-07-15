@@ -66,6 +66,12 @@ fn split_id_bytes(id: u64) -> Vec<u8> {
     id.to_be_bytes().to_vec()
 }
 
+/// Short hex of a workspace id for log lines — enough to correlate
+/// create/remove without dumping the full 16 bytes.
+fn hex_prefix(id: &[u8]) -> String {
+    id.iter().take(4).map(|b| format!("{b:02x}")).collect()
+}
+
 #[derive(Debug)]
 pub enum LayoutNode {
     Split {
@@ -809,6 +815,14 @@ impl PeerHost {
             }
         }
         self.persist_workspaces();
+        // Audit line: a workspace delete kills real host processes, so
+        // make the surface count visible in the journal for monitoring
+        // (journalctl --user -u term-meshd | grep 'peer workspace').
+        tracing::info!(
+            "peer workspace removed: id={} surfaces_killed={}",
+            hex_prefix(workspace_id),
+            removed_surfaces.len()
+        );
         self.clients.broadcast(&Payload::WorkspaceUpdate(WorkspaceUpdate {
             kind: Some(workspace_update::Kind::WorkspaceRemoved(WorkspaceRemoved {
                 workspace_id: workspace_id.to_vec(),
@@ -839,6 +853,11 @@ impl PeerHost {
             );
         }
         self.persist_workspaces();
+        tracing::info!(
+            "peer workspace created: id={} total={}",
+            hex_prefix(&id),
+            self.workspaces.lock().unwrap().len()
+        );
         self.schedule_layout_push(id.clone());
         id
     }
