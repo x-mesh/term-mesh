@@ -112,9 +112,22 @@ enum PeerSocketProber {
     /// on its own actor after `await`.
     static func probe(
         sshTarget: String,
+        port: Int? = nil,
+        identityFile: String? = nil,
         timeoutSeconds: TimeInterval = 15.0
     ) async throws -> String {
         try PeerSSHTunnel.validateSshTarget(sshTarget)
+        if let port { try PeerSSHTunnel.validatePort(port) }
+        if let identityFile { try PeerSSHTunnel.validateIdentityFile(identityFile) }
+
+        // Same optional auth surface as PeerSSHTunnel.spawnAttempt so
+        // auto-detect works on hosts reachable only with an explicit
+        // port or identity file.
+        var authArgs: [String] = []
+        if let port { authArgs += ["-p", String(port)] }
+        if let identityFile {
+            authArgs += ["-i", (identityFile as NSString).expandingTildeInPath]
+        }
 
         let proc = Process()
         proc.executableURL = URL(fileURLWithPath: "/usr/bin/ssh")
@@ -133,6 +146,7 @@ enum PeerSocketProber {
             "-o", "ConnectTimeout=10",
             "-o", "StrictHostKeyChecking=accept-new",
             "-o", "BatchMode=no",
+        ] + authArgs + [
             "--",
             sshTarget,
             remoteCommand,

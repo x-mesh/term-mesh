@@ -1,5 +1,7 @@
 import Foundation
 import AppKit
+import Bonsplit
+import Combine
 import PeerProto
 
 struct WorkspaceSummary: Identifiable, Equatable {
@@ -45,10 +47,21 @@ func groupWorkspacesByWindow<T>(
     return groups
 }
 
+/// Sidebar-visible lifecycle of a host entry. `saved` covers both a
+/// never-connected profile and a disconnected one; `failed` carries the
+/// short reason shown inline (row icon + tooltip — never an NSAlert,
+/// which would activate the app and violate the socket focus policy).
+enum HostConnectionState: Equatable {
+    case saved
+    case connecting
+    case connected
+    case failed(String)
+}
+
 struct HostEntry: Identifiable {
     let id: String         // stable dedup key (stableKey)
     var displayName: String
-    var isConnected: Bool
+    var connectionState: HostConnectionState
     var workspaces: [WorkspaceSummary]
     /// The most-recently-used ephemeral sock path. Updated on each reconnect so
     /// that fetchWorkspaces always connects over the current live tunnel.
@@ -59,6 +72,15 @@ struct HostEntry: Identifiable {
     /// nil → direct-socket host that rides the shared live socket.
     var sshTarget: String?
     var remoteSockPath: String?
+    /// Optional auth parameters from the backing profile.
+    var sshPort: Int?
+    var identityFile: String?
+    /// Backing saved profile, when this entry derives from one.
+    var profileID: UUID?
+    var colorHex: String?
+    var symbolName: String?
+
+    var isConnected: Bool { connectionState == .connected }
 
     /// Host spec for opening a pane/mirror from this entry. Prefers an owned
     /// `.ssh` tunnel when both SSH fields are known; otherwise falls back to
@@ -66,7 +88,12 @@ struct HostEntry: Identifiable {
     var paneHostSpec: PeerPaneHostSpec {
         if let sshTarget, !sshTarget.isEmpty,
            let remoteSockPath, !remoteSockPath.isEmpty {
-            return .ssh(target: sshTarget, remoteSockPath: remoteSockPath)
+            return .ssh(
+                target: sshTarget,
+                remoteSockPath: remoteSockPath,
+                port: sshPort,
+                identityFile: identityFile
+            )
         }
         return .direct(sockPath: activeSockPath)
     }
@@ -76,14 +103,40 @@ struct HostEntry: Identifiable {
 final class RemoteHostStore: ObservableObject {
     static let shared = RemoteHostStore()
 
-    @Published private(set) var hosts: [String: HostEntry] = [:]
+    /// Fired after a successful sidebar connect so the mounted host
+    /// group force-expands (its fold state is view-local @State).
+    struct ExpandSignal: Equatable {
+        var key: String = ""
+        var generation: Int = 0
+    }
 
+    @Published private(set) var hosts: [String: HostEntry] = [:]
+    @Published private(set) var expandSignal = ExpandSignal()
+
+    /// Connected (or connecting) first, then saved/failed; name-sorted
+    /// within each band so entries don't shuffle on reconnect.
     var sortedHosts: [HostEntry] {
-        hosts.values.sorted { $0.displayName < $1.displayName }
+        func rank(_ e: HostEntry) -> Int {
+            switch e.connectionState {
+            case .connected, .connecting: return 0
+            case .saved, .failed: return 1
+            }
+        }
+        return hosts.values.sorted {
+            if rank($0) != rank($1) { return rank($0) < rank($1) }
+            return $0.displayName.localizedCaseInsensitiveCompare($1.displayName) == .orderedAscending
+        }
     }
 
     private var observer: NSObjectProtocol?
     private var fetchTasks: [String: Task<Void, Never>] = [:]
+    /// Sidebar-held lease per host key: one ref that keeps the tunnel
+    /// alive while the user browses workspaces. Panes/mirrors opened
+    /// from here hold their own refs, so a sidebar disconnect never
+    /// kills them (registry refcount semantics).
+    private var sidebarLeases: [String: PeerPaneHostLease] = [:]
+    private var connectTasks: [String: Task<Void, Never>] = [:]
+    private var profileCancellable: AnyCancellable?
 
     private init() {
         observer = NotificationCenter.default.addObserver(
@@ -91,15 +144,73 @@ final class RemoteHostStore: ObservableObject {
             object: nil,
             queue: .main
         ) { [weak self] _ in
-            Task { @MainActor in self?.syncFromCoordinator() }
+            Task { @MainActor in self?.rebuild() }
         }
+        // objectWillChange fires before the profile list mutates; the
+        // main-queue hop reads the post-change state.
+        profileCancellable = PeerHostProfileStore.shared.objectWillChange
+            .sink { [weak self] _ in
+                DispatchQueue.main.async { self?.rebuild() }
+            }
         // Catch connections that opened before the sidebar first rendered.
-        syncFromCoordinator()
+        rebuild()
     }
 
     deinit {
         if let token = observer {
             NotificationCenter.default.removeObserver(token)
+        }
+    }
+
+    private func rebuild() {
+        syncFromProfiles()
+        syncFromCoordinator()
+    }
+
+    /// Saved profiles are always visible: ensure an entry per profile
+    /// and refresh profile-derived metadata on existing ones. Entries
+    /// whose backing profile was deleted stay only while connected.
+    private func syncFromProfiles() {
+        let profiles = PeerHostProfileStore.shared.profiles
+        var profileKeys = Set<String>()
+        for p in profiles {
+            let key = p.stableKey
+            profileKeys.insert(key)
+            if hosts[key] == nil {
+                hosts[key] = HostEntry(
+                    id: key,
+                    displayName: p.effectiveDisplayName,
+                    connectionState: .saved,
+                    workspaces: [],
+                    activeSockPath: "",
+                    sshTarget: p.sshTarget,
+                    remoteSockPath: p.remoteSocket.isEmpty ? nil : p.remoteSocket,
+                    sshPort: p.sshPort,
+                    identityFile: p.identityFile,
+                    profileID: p.id,
+                    colorHex: p.colorHex,
+                    symbolName: p.symbolName
+                )
+            } else {
+                hosts[key]?.profileID = p.id
+                hosts[key]?.displayName = p.effectiveDisplayName
+                hosts[key]?.colorHex = p.colorHex
+                hosts[key]?.symbolName = p.symbolName
+                hosts[key]?.sshPort = p.sshPort
+                hosts[key]?.identityFile = p.identityFile
+                if hosts[key]?.remoteSockPath == nil, !p.remoteSocket.isEmpty {
+                    hosts[key]?.remoteSockPath = p.remoteSocket
+                }
+            }
+        }
+        for (key, entry) in hosts where entry.profileID != nil && !profileKeys.contains(key) {
+            if entry.isConnected || sidebarLeases[key] != nil {
+                hosts[key]?.profileID = nil
+                hosts[key]?.colorHex = nil
+                hosts[key]?.symbolName = nil
+            } else {
+                hosts[key] = nil
+            }
         }
     }
 
@@ -115,6 +226,17 @@ final class RemoteHostStore: ObservableObject {
         // one entry; needs remoteSockPath in connectionInfo to distinguish them.
         func stableKey(for conn: PeerRelayConnectionInfo) -> String {
             if let ssh = conn.sshTarget, !ssh.isEmpty { return "ssh:\(ssh)" }
+            // Borrowed-socket connections carry no SSH identity — e.g. a
+            // relay window opened from the sidebar rides an existing
+            // tunnel's local socket (openWorkspaceRelayForSidebar attaches
+            // no tunnel, so connectionInfo.sshTarget is nil). Fold such a
+            // connection into the entry that owns that socket instead of
+            // materializing a doppelgänger keyed by the ephemeral path.
+            if let owner = hosts.values.first(where: {
+                !$0.activeSockPath.isEmpty && $0.activeSockPath == conn.hostSockPath
+            }) {
+                return owner.id
+            }
             return conn.hostSockPath
         }
 
@@ -126,7 +248,7 @@ final class RemoteHostStore: ObservableObject {
                 hosts[key] = HostEntry(
                     id: key,
                     displayName: conn.hostDisplay,
-                    isConnected: true,
+                    connectionState: .connected,
                     workspaces: [],
                     activeSockPath: conn.hostSockPath,
                     sshTarget: conn.sshTarget,
@@ -136,8 +258,10 @@ final class RemoteHostStore: ObservableObject {
                 // connection, but store results under the stable key.
                 fetchWorkspaces(for: conn.hostSockPath, key: key)
             } else {
-                hosts[key]?.isConnected = true
-                if !conn.hostDisplay.isEmpty {
+                hosts[key]?.connectionState = .connected
+                // A profile-named entry keeps its user-chosen name; ad-hoc
+                // entries keep tracking the connection's display string.
+                if !conn.hostDisplay.isEmpty, hosts[key]?.profileID == nil {
                     hosts[key]?.displayName = conn.hostDisplay
                 }
                 // Backfill SSH reach info once a connection carrying it arrives
@@ -159,9 +283,108 @@ final class RemoteHostStore: ObservableObject {
             }
         }
 
-        for key in hosts.keys where !activeKeys.contains(key) {
-            hosts[key]?.isConnected = false
+        // Keys with a live sidebar lease stay connected — that lease is
+        // not a pane/mirror, so it never appears in activeConnections().
+        // Only a `.connected` state downgrades; an in-flight `.connecting`
+        // or surfaced `.failed` is owned by connectSavedHost.
+        for key in hosts.keys
+        where !activeKeys.contains(key) && sidebarLeases[key] == nil {
+            if hosts[key]?.connectionState == .connected {
+                hosts[key]?.connectionState = .saved
+            }
         }
+    }
+
+    // MARK: - Sidebar connect / disconnect (saved hosts)
+
+    var hasAnySidebarLease: Bool { !sidebarLeases.isEmpty }
+
+    func hasSidebarLease(for key: String) -> Bool {
+        sidebarLeases[key] != nil
+    }
+
+    /// Click-to-connect for a saved host: resolve the remote socket
+    /// (auto-detect when the profile left it empty), lease the host —
+    /// the sidebar holds one ref so the tunnel stays up while the user
+    /// browses — then fetch the workspace roster and force-expand the
+    /// group. Failures surface inline on the row (icon + tooltip); no
+    /// NSAlert here, which would activate the app and violate the
+    /// socket focus policy.
+    func connectSavedHost(_ host: HostEntry) {
+        let key = host.id
+        guard let target = host.sshTarget, !target.isEmpty else { return }
+        guard sidebarLeases[key] == nil, connectTasks[key] == nil else { return }
+        hosts[key]?.connectionState = .connecting
+        #if DEBUG
+        dlog("peer.sidebar.connect start key=\(key)")
+        #endif
+        connectTasks[key] = Task { [weak self] in
+            guard let self else { return }
+            defer { self.connectTasks[key] = nil }
+            do {
+                let profile = PeerHostProfileStore.shared.profile(id: host.profileID)
+                var socket = host.remoteSockPath ?? ""
+                if socket.isEmpty {
+                    socket = try await PeerSocketProber.probe(
+                        sshTarget: target,
+                        port: profile?.sshPort,
+                        identityFile: profile?.identityFile
+                    )
+                }
+                let spec = PeerPaneHostSpec.ssh(
+                    target: target,
+                    remoteSockPath: socket,
+                    port: profile?.sshPort,
+                    identityFile: profile?.identityFile
+                )
+                let lease = try await PeerPaneHostRegistry.shared.acquire(spec)
+                // The entry may have been deleted while connecting.
+                guard self.hosts[key] != nil else {
+                    PeerPaneHostRegistry.shared.release(lease)
+                    return
+                }
+                self.sidebarLeases[key] = lease
+                self.hosts[key]?.connectionState = .connected
+                self.hosts[key]?.activeSockPath = lease.hostSockPath
+                self.hosts[key]?.remoteSockPath = socket
+                PeerHostProfileStore.shared.recordConnection(
+                    sshTarget: target, resolvedSocket: socket
+                )
+                self.fetchWorkspaces(for: lease.hostSockPath, key: key)
+                SidebarLayoutSettings.setHostCollapsed(key, false)
+                self.expandSignal = ExpandSignal(
+                    key: key, generation: self.expandSignal.generation + 1
+                )
+                #if DEBUG
+                dlog("peer.sidebar.connect ok key=\(key) sock=\(lease.hostSockPath)")
+                #endif
+            } catch {
+                self.hosts[key]?.connectionState = .failed(String(describing: error))
+                #if DEBUG
+                dlog("peer.sidebar.connect fail key=\(key) error=\(error)")
+                #endif
+            }
+        }
+    }
+
+    /// Release the sidebar's lease ref. Panes/mirrors opened from this
+    /// host hold their own refs and survive; rebuild() re-promotes the
+    /// entry if such a connection is still live.
+    func disconnectSavedHost(_ host: HostEntry) {
+        let key = host.id
+        guard let lease = sidebarLeases[key] else { return }
+        sidebarLeases[key] = nil
+        PeerPaneHostRegistry.shared.release(lease)
+        fetchTasks[key]?.cancel()
+        hosts[key]?.workspaces = []
+        hosts[key]?.activeSockPath = ""
+        if hosts[key]?.connectionState == .connected {
+            hosts[key]?.connectionState = .saved
+        }
+        #if DEBUG
+        dlog("peer.sidebar.disconnect key=\(key)")
+        #endif
+        rebuild()
     }
 
     private func fetchWorkspaces(for hostSockPath: String, key: String) {
@@ -201,9 +424,13 @@ final class RemoteHostStore: ObservableObject {
         }
     }
 
-    func openWorkspace(_ workspace: WorkspaceSummary) {
+    /// `host` is the sidebar group the row was rendered under — used for
+    /// the relay window's display name. (The old `hosts[path]` lookup was
+    /// always nil for SSH hosts: `hosts` is keyed by stableKey, not by
+    /// sock path.)
+    func openWorkspace(_ workspace: WorkspaceSummary, host: HostEntry) {
         let path = workspace.hostSockPath
-        let displayName = hosts[path]?.displayName
+        let displayName = host.displayName
         Task {
             do {
                 let conn = try await PeerRelaySession.connect(hostSockPath: path)

@@ -507,6 +507,9 @@ final class PeerClientCoordinator: NSObject {
         PeerFederationSettings.rememberRecentHost(
             .init(sshTarget: target, remoteSocket: remote)
         )
+        PeerHostProfileStore.shared.recordConnection(
+            sshTarget: target, resolvedSocket: remote
+        )
         await self.openWorkspaceRelay(
             hostSockPath: tunnel.localSockPath,
             titleSuffix: " · \(target)",
@@ -536,10 +539,15 @@ final class PeerClientCoordinator: NSObject {
                 return
             }
         }
-        let opened = await openRemotePaneFlow(spec: .ssh(target: target, remoteSockPath: remote))
+        let opened = await openRemotePaneFlow(
+            spec: .ssh(target: target, remoteSockPath: remote, port: nil, identityFile: nil)
+        )
         if opened {
             PeerFederationSettings.rememberRecentHost(
                 .init(sshTarget: target, remoteSocket: remote)
+            )
+            PeerHostProfileStore.shared.recordConnection(
+                sshTarget: target, resolvedSocket: remote
             )
         }
     }
@@ -657,6 +665,26 @@ final class PeerClientCoordinator: NSObject {
         pickFirstWithoutPrompt: Bool = false,
         live: Bool = true
     ) async {
+        // Live-mirror dedupe: a second live mirror of the same host
+        // workspace is meaningless (both would be host-authoritative
+        // copies), so re-clicking the sidebar row focuses the existing
+        // mirror tab instead of materializing another one. Sidebar click
+        // is explicit user focus intent, so selecting here respects the
+        // socket focus policy.
+        if live, let workspaceID,
+           let existing = openWorkspaceMirrors.first(where: {
+               !$0.isTornDown
+                   && $0.lease.key == spec.hostKey
+                   && $0.hostWorkspaceID == workspaceID
+           }),
+           let mirrorWorkspace = existing.workspace {
+            AppDelegate.shared?.tabManager?.selectWorkspace(mirrorWorkspace)
+            #if DEBUG
+            dlog("peer.mirror.dedupe focus existing host=\(spec.hostKey)")
+            #endif
+            return
+        }
+
         let flowKey = spec.hostKey.description
         guard !mirrorOpensInFlight.contains(flowKey) else { return }
         mirrorOpensInFlight.insert(flowKey)

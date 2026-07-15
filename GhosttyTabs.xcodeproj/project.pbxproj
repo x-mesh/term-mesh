@@ -36,6 +36,8 @@
 			CVB00086 /* PeerRelayWorkspaceWindowController.swift in Sources */ = {isa = PBXBuildFile; fileRef = CVS00086 /* PeerRelayWorkspaceWindowController.swift */; };
 			CVB00087 /* PeerSSHTunnel.swift in Sources */ = {isa = PBXBuildFile; fileRef = CVS00087 /* PeerSSHTunnel.swift */; };
 			CVB00096 /* PeerSocketProber.swift in Sources */ = {isa = PBXBuildFile; fileRef = CVS00096 /* PeerSocketProber.swift */; };
+			CVB00100 /* PeerHostProfile.swift in Sources */ = {isa = PBXBuildFile; fileRef = CVS00100 /* PeerHostProfile.swift */; };
+			CVB00101 /* PeerHostProfileStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = CVS00101 /* PeerHostProfileStore.swift */; };
 			CVB00097 /* PeerPaneSession.swift in Sources */ = {isa = PBXBuildFile; fileRef = CVS00097 /* PeerPaneSession.swift */; };
 			CVB00098 /* PeerTitlebarAccent.swift in Sources */ = {isa = PBXBuildFile; fileRef = CVS00098 /* PeerTitlebarAccent.swift */; };
 			CVB00099 /* PeerWorkspaceMirror.swift in Sources */ = {isa = PBXBuildFile; fileRef = CVS00099 /* PeerWorkspaceMirror.swift */; };
@@ -271,6 +273,8 @@
 			CVS00086 /* PeerRelayWorkspaceWindowController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PeerRelayWorkspaceWindowController.swift; sourceTree = "<group>"; };
 			CVS00087 /* PeerSSHTunnel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PeerSSHTunnel.swift; sourceTree = "<group>"; };
 			CVS00096 /* PeerSocketProber.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PeerSocketProber.swift; sourceTree = "<group>"; };
+			CVS00100 /* PeerHostProfile.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PeerHostProfile.swift; sourceTree = "<group>"; };
+			CVS00101 /* PeerHostProfileStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PeerHostProfileStore.swift; sourceTree = "<group>"; };
 			CVS00097 /* PeerPaneSession.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PeerPaneSession.swift; sourceTree = "<group>"; };
 			CVS00098 /* PeerTitlebarAccent.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PeerTitlebarAccent.swift; sourceTree = "<group>"; };
 			CVS00099 /* PeerWorkspaceMirror.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PeerWorkspaceMirror.swift; sourceTree = "<group>"; };
@@ -555,6 +559,8 @@
 				CVS00086 /* PeerRelayWorkspaceWindowController.swift */,
 				CVS00087 /* PeerSSHTunnel.swift */,
 				CVS00096 /* PeerSocketProber.swift */,
+				CVS00100 /* PeerHostProfile.swift */,
+				CVS00101 /* PeerHostProfileStore.swift */,
 				CVS00097 /* PeerPaneSession.swift */,
 				CVS00098 /* PeerTitlebarAccent.swift */,
 				CVS00099 /* PeerWorkspaceMirror.swift */,
@@ -903,6 +909,8 @@
 				CVB00086 /* PeerRelayWorkspaceWindowController.swift in Sources */,
 				CVB00087 /* PeerSSHTunnel.swift in Sources */,
 				CVB00096 /* PeerSocketProber.swift in Sources */,
+				CVB00100 /* PeerHostProfile.swift in Sources */,
+				CVB00101 /* PeerHostProfileStore.swift in Sources */,
 				CVB00097 /* PeerPaneSession.swift in Sources */,
 				CVB00098 /* PeerTitlebarAccent.swift in Sources */,
 				CVB00099 /* PeerWorkspaceMirror.swift in Sources */,

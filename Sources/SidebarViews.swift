@@ -835,10 +835,65 @@ struct RemoteHostGroupView: View {
         _isExpanded = State(initialValue: !SidebarLayoutSettings.isHostCollapsed(host.id))
     }
 
+    private var emptyBodyText: String {
+        switch host.connectionState {
+        case .connecting: return "Connecting…"
+        case .connected: return "Loading…"
+        case .saved: return "Not connected"
+        case .failed: return "Connection failed"
+        }
+    }
+
+    /// Profile tag color, resolved through the failable NSColor hex
+    /// initializer used elsewhere in the app.
+    private var hostTint: Color? {
+        host.colorHex.flatMap { NSColor(hex: $0) }.map { Color(nsColor: $0) }
+    }
+
+    @ViewBuilder
+    private var hostStatusIcon: some View {
+        switch host.connectionState {
+        case .connecting:
+            ProgressView()
+                .controlSize(.mini)
+                .frame(width: 11, height: 11)
+        case .connected:
+            Image(systemName: host.symbolName ?? "network")
+                .font(.system(size: 9))
+                .foregroundColor(hostTint ?? .secondary)
+        case .saved:
+            Image(systemName: host.symbolName ?? "network.slash")
+                .font(.system(size: 9))
+                .foregroundColor(Color.secondary.opacity(0.4))
+        case .failed(let reason):
+            Image(systemName: "exclamationmark.triangle")
+                .font(.system(size: 9))
+                .foregroundColor(.red)
+                .help(reason)
+        }
+    }
+
+    /// Row tap: saved/failed SSH hosts connect (+ auto-expand on
+    /// success); a connected host just toggles its fold.
+    private func handleRowTap() {
+        switch host.connectionState {
+        case .saved, .failed:
+            if host.sshTarget != nil {
+                store.connectSavedHost(host)
+            } else {
+                withAnimation(.easeInOut(duration: 0.15)) { isExpanded.toggle() }
+            }
+        case .connected:
+            withAnimation(.easeInOut(duration: 0.15)) { isExpanded.toggle() }
+        case .connecting:
+            break
+        }
+    }
+
     var body: some View {
         DisclosureGroup(isExpanded: $isExpanded) {
             if host.workspaces.isEmpty {
-                Text(host.isConnected ? "Loading…" : "Disconnected")
+                Text(emptyBodyText)
                     .font(.system(size: 10))
                     .foregroundColor(.secondary)
                     .padding(.leading, 20)
@@ -876,9 +931,7 @@ struct RemoteHostGroupView: View {
             }
         } label: {
             HStack(spacing: 5) {
-                Image(systemName: host.isConnected ? "network" : "network.slash")
-                    .font(.system(size: 9))
-                    .foregroundColor(host.isConnected ? .secondary : Color.secondary.opacity(0.4))
+                hostStatusIcon
                 Text(host.displayName)
                     .font(.system(size: 11, weight: .semibold))
                     .foregroundColor(host.isConnected ? .primary : .secondary)
@@ -888,21 +941,34 @@ struct RemoteHostGroupView: View {
             .padding(.horizontal, 10)
             .padding(.vertical, 3)
             .contentShape(Rectangle())
+            .onTapGesture { handleRowTap() }
             .contextMenu {
-                // Phase 1 remote pane primitive: pick one of this host's
-                // surfaces and open it as a pane in the current
-                // workspace. Rides the live connection's local socket,
-                // so it is only offered while connected.
-                if host.isConnected {
+                switch host.connectionState {
+                case .saved, .failed:
+                    if host.sshTarget != nil {
+                        Button("Connect") { store.connectSavedHost(host) }
+                    }
+                case .connected:
+                    // Phase 1 remote pane primitive: pick one of this
+                    // host's surfaces and open it as a pane in the
+                    // current workspace.
                     Button("Open Surface as Pane…") {
                         store.openSurfaceAsPane(host)
                     }
+                    if store.hasSidebarLease(for: host.id) {
+                        Button("Disconnect") { store.disconnectSavedHost(host) }
+                    }
+                case .connecting:
+                    EmptyView()
                 }
             }
         }
         .padding(.horizontal, 6)
         .onChange(of: isExpanded) { newValue in
             SidebarLayoutSettings.setHostCollapsed(host.id, !newValue)
+        }
+        .onChange(of: store.expandSignal) { signal in
+            if signal.key == host.id { isExpanded = true }
         }
     }
 }
@@ -939,7 +1005,10 @@ struct RemoteWorkspaceRowView: View {
         )
         .contentShape(Rectangle())
         .onTapGesture {
-            store.openWorkspace(workspace)
+            // Default click = live workspace mirror in the main window
+            // (host-authoritative sync). The legacy relay window and the
+            // one-shot snapshot are demoted to the context menu.
+            store.openWorkspaceAsMirror(workspace, host: host, live: true)
         }
         .contextMenu {
             // Live mirror (Phase 2B): host-authoritative layout sync —
@@ -951,6 +1020,10 @@ struct RemoteWorkspaceRowView: View {
             // workspace owns it.
             Button("Open as Snapshot Workspace") {
                 store.openWorkspaceAsMirror(workspace, host: host, live: false)
+            }
+            // Legacy standalone viewer window.
+            Button("Open in Relay Window") {
+                store.openWorkspace(workspace, host: host)
             }
         }
         .onHover { isHovering = $0 }

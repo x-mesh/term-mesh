@@ -34,13 +34,17 @@ import PeerProto
 /// `RemoteHostStore.stableKey`.
 enum PeerPaneHostSpec {
     case direct(sockPath: String)
-    case ssh(target: String, remoteSockPath: String)
+    /// `port`/`identityFile` are optional auth parameters from a saved
+    /// host profile (nil = ssh defaults / ssh-config). They ride the
+    /// spec so tunnel creation sees them; only `port` joins the pooling
+    /// key (see PeerPaneHostKey).
+    case ssh(target: String, remoteSockPath: String, port: Int?, identityFile: String?)
 
     var hostKey: PeerPaneHostKey {
         switch self {
         case .direct(let sockPath): return .direct(sockPath: sockPath)
-        case .ssh(let target, let remoteSockPath):
-            return .ssh(target: target, remoteSockPath: remoteSockPath)
+        case .ssh(let target, let remoteSockPath, let port, _):
+            return .ssh(target: target, remoteSockPath: remoteSockPath, port: port)
         }
     }
 }
@@ -51,22 +55,26 @@ enum PeerPaneHostKey: Hashable, CustomStringConvertible {
     /// daemons on different sockets, and pooling them onto one tunnel
     /// would silently connect a pane to the wrong peer. (The tunnel's
     /// *local* socket stays out of the key — it is reconnect-ephemeral.)
-    case ssh(target: String, remoteSockPath: String)
+    /// `port` is part of the key (different sshd = different host);
+    /// identityFile is NOT (it doesn't change which host is reached).
+    case ssh(target: String, remoteSockPath: String, port: Int?)
 
     var sshTarget: String? {
-        if case .ssh(let target, _) = self { return target }
+        if case .ssh(let target, _, _) = self { return target }
         return nil
     }
 
     var remoteSockPath: String? {
-        if case .ssh(_, let remoteSockPath) = self { return remoteSockPath }
+        if case .ssh(_, let remoteSockPath, _) = self { return remoteSockPath }
         return nil
     }
 
     var description: String {
         switch self {
         case .direct(let sockPath): return sockPath
-        case .ssh(let target, let remoteSockPath): return "ssh:\(target):\(remoteSockPath)"
+        case .ssh(let target, let remoteSockPath, let port):
+            let portPart = port.map { "#\($0)" } ?? ""
+            return "ssh:\(target)\(portPart):\(remoteSockPath)"
         }
     }
 
@@ -74,7 +82,7 @@ enum PeerPaneHostKey: Hashable, CustomStringConvertible {
     /// targets (user@ stripped), socket basename for direct paths.
     var shortLabel: String {
         switch self {
-        case .ssh(let target, _):
+        case .ssh(let target, _, _):
             return target.split(separator: "@").last.map(String.init) ?? target
         case .direct(let sockPath):
             return (sockPath as NSString).lastPathComponent
@@ -186,13 +194,15 @@ final class PeerPaneHostRegistry {
         switch spec {
         case .direct:
             return PeerPaneHostLease(key: spec.hostKey, tunnel: nil)
-        case .ssh(let target, let remoteSockPath):
+        case .ssh(let target, let remoteSockPath, let port, let identityFile):
             let tunnel = PeerSSHTunnel(
                 sshTarget: target,
                 remoteSockPath: remoteSockPath,
                 dashboardRemotePort: PeerFederationSettings.forwardDashboard
                     ? PeerFederationSettings.remoteDashboardPort
-                    : nil
+                    : nil,
+                port: port,
+                identityFile: identityFile
             )
             try await tunnel.start()
             return PeerPaneHostLease(key: spec.hostKey, tunnel: tunnel)
