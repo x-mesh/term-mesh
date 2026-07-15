@@ -2,14 +2,24 @@
 
 All notable changes to term-mesh are documented here.
 
-## [Unreleased]
+## [0.155.0] - 2026-07-15
 
 ### Added
-- **호스트 workspace 라이브 미러** — 사이드바 원격 workspace 우클릭 → "Open as Live Workspace in Main Window"로 호스트의 split 레이아웃을 메인 윈도우 workspace에 실시간 동기화한다. 호스트에서 pane을 나누거나 닫으면 로컬이 즉시 따라오고, 로컬에서 Cmd+D/Cmd+W/divider를 조작하면 호스트로 전달돼 호스트가 레이아웃의 주인으로 유지된다(양방향 수렴). 재접속 시 자동 재동기화. 한 번만 복제하는 기존 방식은 "Open as Snapshot Workspace"로 남아 있다.
-- **원격 peer surface를 메인 윈도우 pane으로** — 별도 relay 창 없이, 연결 다이얼로그의 "Open as a pane in the current workspace" 체크박스(또는 사이드바 Remote Hosts 우클릭)로 원격 surface가 현재 workspace의 일반 Bonsplit pane으로 열린다. 한 workspace에 로컬 pane과 여러 서버의 원격 pane을 자유롭게 혼합할 수 있고, split/zoom/탭 이동이 로컬 pane과 동일하게 동작한다. 같은 호스트의 pane들은 SSH 터널 하나를 공유하며 마지막 pane을 닫으면 터널도 정리된다.
+- **원격 호스트에서 여러 워크스페이스 관리** — Linux 피어 호스트 하나에 이름 붙은 워크스페이스를 여러 개 만들고 전환할 수 있다. 사이드바 호스트 옆 + 버튼으로 새 워크스페이스를 만들고, 우클릭으로 이름 변경·삭제가 가능하다(마지막 하나는 삭제할 수 없다). 호스트 이름 옆에 워크스페이스 개수가 표시된다(예: `jw-server (3)`).
+- **Peer Host를 리치 프로파일로 저장** — 이름, SSH 대상, 포트, 식별 키, 색상, 아이콘을 사이드바에서 직접 추가·편집·삭제한다. 연결 테스트와 원격 설치를 도와주는 진단(doctor) 기능이 추가됐다.
+- **호스트 workspace 라이브 미러** — 사이드바 원격 workspace 우클릭 → "Open as Live Workspace in Main Window"로 호스트의 split 레이아웃을 메인 윈도우 workspace에 실시간 동기화한다. 호스트에서 pane을 나누거나 닫으면 로컬이 즉시 따라오고, 로컬에서 Cmd+D/Cmd+W/divider를 조작하면 호스트로 전달돼 호스트가 레이아웃의 주인으로 유지된다(양방향 수렴). 재접속 시 자동 재동기화.
+- **원격 peer surface를 메인 윈도우 pane으로** — 별도 relay 창 없이, 연결 다이얼로그의 "Open as a pane in the current workspace" 체크박스(또는 사이드바 Peer Hosts 우클릭)로 원격 surface가 현재 workspace의 일반 Bonsplit pane으로 열린다. 한 workspace에 로컬 pane과 여러 서버의 원격 pane을 자유롭게 혼합할 수 있고, split/zoom/탭 이동이 로컬 pane과 동일하게 동작한다. 같은 호스트의 pane들은 SSH 터널 하나를 공유하며 마지막 pane을 닫으면 터널도 정리된다.
 - **입력 대상 호스트 시각 신호** — 포커스된 pane이 원격이면 타이틀바에 호스트별 색 그라데이션이 켜지고(로컬 포커스로 돌아오면 원상복구), 모든 원격 pane은 상단 컬러 스트립과 탭 제목의 `이름 ⌁ 호스트` 칩으로 상시 식별된다. 원격 끊김 시 pane 자리에 배너가 뜨고 Reconnect 한 번으로 재접속된다.
-- **피어 연결 시 원격 소켓 경로 자동 탐지** — SSH 연결 다이얼로그에서 소켓 필드를 비워두면 ssh로 원격 호스트의 기본 위치(`peer.env`의 `TERMMESH_PEER_SOCKET` → `$XDG_RUNTIME_DIR/tm-peer.sock` → `/run/user/<uid>/tm-peer.sock` → `/tmp/term-mesh-peer-<uid>/peer.sock`)를 순서대로 확인해 첫 번째 살아있는 소켓을 자동으로 사용한다. Linux 설치기 기본 구성이면 SSH target만 입력하면 된다.
-- **메뉴바 "Connect to Recent Peer" 서브메뉴** — 최근 접속한 피어 호스트(8개)를 메뉴바에서 원클릭으로 재접속. 다이얼로그를 거치지 않는다.
+- **피어 연결 시 원격 소켓 경로 자동 탐지** — 소켓 필드를 비워두면 ssh로 원격 호스트의 기본 위치(`peer.env`의 `TERMMESH_PEER_SOCKET` → `$XDG_RUNTIME_DIR/tm-peer.sock` → `/run/user/<uid>/tm-peer.sock` → `/tmp/term-mesh-peer-<uid>/peer.sock`)를 순서대로 확인해 첫 번째 살아있는 소켓을 자동으로 사용한다. Linux 설치기 기본 구성이면 SSH target만 입력하면 된다.
+- **사이드바 레이아웃 상태 유지** — 사이드바 너비와 섹션·호스트 접힘 상태가 앱을 재시작해도 유지된다.
+
+### Changed
+- **Peer 관련 진입점이 사이드바 중심으로 재편** — "Remote Hosts"가 "Peer Hosts"로 이름이 바뀌고, 흩어져 있던 연결 다이얼로그 대신 사이드바에서 호스트를 관리·연결한다. 피어 워크스페이스는 사이드바와 pane 상단 스트립이 같은 호스트 색상 그라데이션으로 표시돼 어느 워크스페이스가 원격인지 한눈에 구분된다.
+- **"Open as Snapshot Workspace" 제거** — 한 번만 복제되던 스냅샷 모드가 라이브 미러와 혼동을 줘서 제거됐다. 실시간으로 동기화되는 Live Mirror만 남는다.
+
+### Thanks to 1 contributor!
+
+- [@JINWOO-J](https://github.com/JINWOO-J)
 
 ## [0.154.0] - 2026-07-14
 
