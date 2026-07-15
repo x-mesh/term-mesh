@@ -803,7 +803,10 @@ struct SidebarRemoteHostsSection: View {
                 .padding(.top, 4)
                 .padding(.bottom, 2)
 
-            SidebarSectionHeader(title: "Remote Hosts", isCollapsed: $isCollapsed)
+            // "Peer Hosts", not "Remote Hosts" — plain "hosts" read as
+            // direct-SSH terminal access; these entries are term-mesh
+            // peer daemons (Peer menu / Peer Connections vocabulary).
+            SidebarSectionHeader(title: "Peer Hosts", isCollapsed: $isCollapsed)
                 .overlay(alignment: .trailing) {
                     Button {
                         editorContext = PeerHostEditorContext(
@@ -819,7 +822,7 @@ struct SidebarRemoteHostsSection: View {
                     }
                     .buttonStyle(.plain)
                     .padding(.trailing, 12)
-                    .help("Add Remote Host…")
+                    .help("Add Peer Host…")
                 }
 
             if !isCollapsed {

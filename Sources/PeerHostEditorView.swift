@@ -65,7 +65,7 @@ struct PeerHostEditorView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
-            Text(isNew ? "Add Remote Host" : "Edit Remote Host")
+            Text(isNew ? "Add Peer Host" : "Edit Peer Host")
                 .font(.headline)
 
             if !discovered.isEmpty {

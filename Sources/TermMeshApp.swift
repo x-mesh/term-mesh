@@ -688,7 +688,7 @@ struct TermMeshApp: App {
                 // Sidebar-first peer UX: connecting/opening lives in the
                 // sidebar; the menu keeps host management. Raw socket
                 // dialogs stay as DEBUG-only tools.
-                Button("Add Remote Host…") {
+                Button("Add Peer Host…") {
                     PeerClientCoordinator.shared.addRemoteHost(nil)
                 }
 

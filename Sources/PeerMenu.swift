@@ -46,7 +46,7 @@ enum PeerMenu {
     /// opens the saved-host editor sheet in the main window's sidebar.
     static func addRemoteHostItem() -> NSMenuItem {
         let item = NSMenuItem(
-            title: "Add Remote Host…",
+            title: "Add Peer Host…",
             action: #selector(PeerClientCoordinator.addRemoteHost(_:)),
             keyEquivalent: ""
         )

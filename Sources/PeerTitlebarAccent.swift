@@ -79,12 +79,19 @@ enum PeerHostAccent {
     /// Deterministic host → gradient assignment (djb2 over the stable
     /// host key), so a host keeps its color across panes, reconnects,
     /// and app restarts without any persistence.
+    ///
+    /// palette[0] (the purple family) is RESERVED and never assigned to
+    /// a host: it is both the relay window's identity gradient and the
+    /// sidebar's local selected-row gradient, so a host hashing onto it
+    /// would be indistinguishable from local UI. One palette feeds every
+    /// per-host signal (sidebar row, pane host strip) so they always
+    /// agree in hue.
     static func colors(for key: PeerPaneHostKey) -> [NSColor] {
         var hash: UInt64 = 5381
         for byte in key.description.utf8 {
             hash = (hash &* 33) &+ UInt64(byte)
         }
-        return palette[Int(hash % UInt64(palette.count))]
+        return palette[Int(hash % UInt64(palette.count - 1)) + 1]
     }
 
     static func primaryColor(for key: PeerPaneHostKey) -> NSColor {
@@ -132,9 +139,17 @@ extension NSWindow {
 
 // MARK: - Main-window refresh
 
-/// Re-evaluates every main window's titlebar accent from its focused
-/// pane. Called from the focus funnels (bonsplit didFocusPane /
-/// didSelectTab, workspace switch, remote pane open).
+/// Called from the focus funnels (bonsplit didFocusPane / didSelectTab,
+/// workspace switch, remote pane open).
+///
+/// Decision (2026-07-15): the MAIN window titlebar stays at its default
+/// look — no per-host gradient. The "keys go to a remote host" signal
+/// lives in the per-pane 2pt host strip (always on) and the sidebar's
+/// peer-accent row (see TabItemView.peerAccentNSColors). refresh() now
+/// only REMOVES accents so anything installed by an older build or a
+/// stale focus race is cleaned up on the next focus change. Standalone
+/// relay WINDOWS keep their own gradient — there the whole window is
+/// remote, installed directly by PeerRelayWorkspaceWindowController.
 @MainActor
 enum PeerTitlebarAccentController {
     static func refresh() {
@@ -142,21 +157,7 @@ enum PeerTitlebarAccentController {
         // AppDelegate.shared is the canonical accessor.
         guard let appDelegate = AppDelegate.shared else { return }
         for context in appDelegate.mainWindowContexts.values {
-            guard let window = context.window else { continue }
-            let hostKey: PeerPaneHostKey? = {
-                guard let workspace = context.tabManager.selectedWorkspace,
-                      let panelId = workspace.focusedPanelId,
-                      let panel = workspace.terminalPanel(for: panelId)
-                else { return nil }
-                return panel.remoteHostKey
-            }()
-            if let hostKey {
-                window.installPeerTitlebarGradientAccent(
-                    colors: PeerHostAccent.colors(for: hostKey)
-                )
-            } else {
-                window.removePeerTitlebarGradientAccent()
-            }
+            context.window?.removePeerTitlebarGradientAccent()
         }
     }
 }
