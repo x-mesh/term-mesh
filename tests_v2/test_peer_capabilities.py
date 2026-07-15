@@ -41,7 +41,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent))
 from termmesh import termmesh, termmeshError
 
-EXPECTED_CAPABILITIES = ["ptydata.coalesce.v1", "replay.ring.v1"]
+EXPECTED_CAPABILITIES = ["ptydata.coalesce.v1", "replay.ring.v1", "workspace.lifecycle.v1"]
 
 
 def main() -> int:
