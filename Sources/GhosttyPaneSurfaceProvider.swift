@@ -1903,12 +1903,25 @@ private func peerKittyUKeyEvent(
 }
 
 /// Digits-only parse of a CSI parameter slice. nil for empty / non-digit.
+/// Accumulate one ASCII digit into a base-10 value, rejecting overflow.
+/// These parsers run on CSI/kitty sequences the remote host controls, so a
+/// crafted long-digit field would otherwise trap Swift's checked Int
+/// arithmetic and crash the app (untrusted-input DoS). Returns nil on a
+/// non-digit byte or on overflow.
+private func peerAppendDigit(_ value: Int, _ byte: UInt8) -> Int? {
+    guard byte >= 0x30, byte <= 0x39 else { return nil }
+    let (product, mulOverflow) = value.multipliedReportingOverflow(by: 10)
+    guard !mulOverflow else { return nil }
+    let (sum, addOverflow) = product.addingReportingOverflow(Int(byte - 0x30))
+    return addOverflow ? nil : sum
+}
+
 private func peerParseDigits(_ bytes: [UInt8]) -> Int? {
     guard !bytes.isEmpty else { return nil }
     var value = 0
     for b in bytes {
-        guard b >= 0x30, b <= 0x39 else { return nil }
-        value = value * 10 + Int(b - 0x30)
+        guard let next = peerAppendDigit(value, b) else { return nil }
+        value = next
     }
     return value
 }
@@ -1977,8 +1990,8 @@ private func peerCsiParams(_ body: [UInt8]) -> [Int] {
         guard !part.isEmpty else { return nil }
         var value = 0
         for byte in part {
-            guard byte >= 0x30, byte <= 0x39 else { return nil }
-            value = value * 10 + Int(byte - 0x30)
+            guard let next = peerAppendDigit(value, byte) else { return nil }
+            value = next
         }
         return value
     }
