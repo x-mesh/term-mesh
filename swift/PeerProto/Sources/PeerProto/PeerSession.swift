@@ -377,9 +377,15 @@ public actor PeerSession {
 
     /// Ask the host to update a split's divider ratio. Fire-and-forget;
     /// the resulting layout flows back via WorkspaceLayoutChanged.
-    public func requestSetDivider(splitID: Data, ratio: Double) async throws {
+    ///
+    /// `workspaceID` disambiguates `splitID`, which is only unique WITHIN
+    /// a workspace's tree (each LayoutStore has its own counter) — pass
+    /// `Data()` only for legacy callers that don't know their workspace id;
+    /// the host falls back to first-match (single-workspace behavior).
+    public func requestSetDivider(workspaceID: Data, splitID: Data, ratio: Double) async throws {
         try await sendEnvelope { env in
             var req = Termmesh_Peer_V1_SetDividerPositionRequest()
+            req.workspaceID = workspaceID
             req.splitID = splitID
             req.ratio = ratio
             var ctl = Termmesh_Peer_V1_WorkspaceControl()

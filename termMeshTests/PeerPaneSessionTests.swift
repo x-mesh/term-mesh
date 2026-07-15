@@ -11,8 +11,8 @@ final class PeerPaneSessionTests: XCTestCase {
     // MARK: - Host key identity
 
     func test_hostKey_identityAndLabels() {
-        let ssh = PeerPaneHostSpec.ssh(target: "root@jw-server", remoteSockPath: "/run/user/0/tm-peer.sock")
-        XCTAssertEqual(ssh.hostKey, .ssh(target: "root@jw-server", remoteSockPath: "/run/user/0/tm-peer.sock"))
+        let ssh = PeerPaneHostSpec.ssh(target: "root@jw-server", remoteSockPath: "/run/user/0/tm-peer.sock", port: nil, identityFile: nil)
+        XCTAssertEqual(ssh.hostKey, .ssh(target: "root@jw-server", remoteSockPath: "/run/user/0/tm-peer.sock", port: nil))
         XCTAssertEqual(ssh.hostKey.description, "ssh:root@jw-server:/run/user/0/tm-peer.sock")
         XCTAssertEqual(ssh.hostKey.shortLabel, "jw-server")
         XCTAssertEqual(ssh.hostKey.sshTarget, "root@jw-server")
@@ -28,9 +28,9 @@ final class PeerPaneSessionTests: XCTestCase {
         // pooling them onto one tunnel would connect a pane to the wrong
         // peer (cross-vendor panel finding, 2026-07-15). Same target +
         // same remote socket still pools.
-        let a = PeerPaneHostSpec.ssh(target: "root@jw-server", remoteSockPath: "/run/user/0/a.sock")
-        let b = PeerPaneHostSpec.ssh(target: "root@jw-server", remoteSockPath: "/run/user/0/b.sock")
-        let a2 = PeerPaneHostSpec.ssh(target: "root@jw-server", remoteSockPath: "/run/user/0/a.sock")
+        let a = PeerPaneHostSpec.ssh(target: "root@jw-server", remoteSockPath: "/run/user/0/a.sock", port: nil, identityFile: nil)
+        let b = PeerPaneHostSpec.ssh(target: "root@jw-server", remoteSockPath: "/run/user/0/b.sock", port: nil, identityFile: nil)
+        let a2 = PeerPaneHostSpec.ssh(target: "root@jw-server", remoteSockPath: "/run/user/0/a.sock", port: nil, identityFile: nil)
         XCTAssertNotEqual(a.hostKey, b.hostKey)
         XCTAssertEqual(a.hostKey, a2.hostKey)
     }
@@ -38,7 +38,7 @@ final class PeerPaneSessionTests: XCTestCase {
     // MARK: - Host accent determinism
 
     func test_hostAccent_isDeterministicPerHost() {
-        let key = PeerPaneHostKey.ssh(target: "root@jw-server", remoteSockPath: "/run/user/0/tm-peer.sock")
+        let key = PeerPaneHostKey.ssh(target: "root@jw-server", remoteSockPath: "/run/user/0/tm-peer.sock", port: nil)
         XCTAssertEqual(PeerHostAccent.colors(for: key), PeerHostAccent.colors(for: key))
         XCTAssertEqual(
             PeerHostAccent.primaryColor(for: key),

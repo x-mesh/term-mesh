@@ -356,6 +356,12 @@ message SetDividerPositionRequest {
   bytes split_id = 1;
   // Fraction in [0.0, 1.0] of the first child.
   double ratio = 2;
+  // Owning workspace. split_id is unique only WITHIN a workspace's tree
+  // (each LayoutStore has its own counter), so two workspaces routinely
+  // share a split_id — without this, the host would resize whichever
+  // tree matches first. Empty = legacy client; the host falls back to
+  // first-match (single-workspace behavior).
+  bytes workspace_id = 3;
 }
 
 message NewTabRequest {

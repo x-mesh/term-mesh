@@ -1417,7 +1417,7 @@ final class PeerRelayWorkspaceWindowController: NSWindowController, NSWindowDele
 
     private func sendDividerUpdate(splitID: Data, ratio: Double) async {
         guard let session = subscriptionSession else { return }
-        try? await session.requestSetDivider(splitID: splitID, ratio: ratio)
+        try? await session.requestSetDivider(workspaceID: workspaceID, splitID: splitID, ratio: ratio)
     }
 
     /// Recursively builds an NSView hierarchy from a layout proto,

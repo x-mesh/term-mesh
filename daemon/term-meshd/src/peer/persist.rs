@@ -17,10 +17,16 @@
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde::{Deserialize, Serialize};
 
 use super::connection::random_peer_bytes;
+
+/// Per-process counter mixed into every `save` tmp filename so concurrent
+/// `save` calls (multiple connection lifecycles persisting around the same
+/// tick) never share a tmp path — see `save`'s doc comment.
+static SAVE_TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// `TERMMESH_PEER_WORKSPACES` — comma-separated workspace names that must
 /// exist after boot, beyond the default. Names already present (by name,
@@ -119,6 +125,17 @@ pub fn load(path: &Path) -> Vec<PersistedWorkspace> {
 
 /// Atomically persist the full workspace collection (`.tmp` write +
 /// `fsync` + `rename`), creating the parent directory as needed.
+///
+/// The tmp filename is unique per call (`pid.counter`), not a fixed
+/// `*.json.tmp`: two `save`s racing (e.g. a create and a rename landing
+/// close together across connection lifecycles) would otherwise both
+/// write through the *same* tmp path, and whichever `rename` won the race
+/// — not whichever snapshot was actually newer — is what survived,
+/// silently reverting the other write. A unique tmp per call means each
+/// `rename` carries its own independent snapshot straight to `path`; the
+/// last one to finish still wins (`rename` is atomic, last-writer-wins by
+/// design here), but every writer's *own* data always makes it, never a
+/// stale one clobbering a fresh one via a shared tmp file.
 pub fn save(path: &Path, entries: &[PersistedWorkspace]) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -127,13 +144,18 @@ pub fn save(path: &Path, entries: &[PersistedWorkspace]) -> std::io::Result<()> 
         entries.iter().map(PersistedWorkspaceJson::from).collect();
     let bytes = serde_json::to_vec_pretty(&json)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
-    let tmp = path.with_extension("json.tmp");
+    let counter = SAVE_TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let tmp = path.with_extension(format!("json.{}.{counter}.tmp", std::process::id()));
     {
         let mut f = std::fs::File::create(&tmp)?;
         f.write_all(&bytes)?;
         f.sync_all()?;
     }
-    std::fs::rename(&tmp, path)
+    let result = std::fs::rename(&tmp, path);
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    result
 }
 
 /// Parse `TERMMESH_PEER_WORKSPACES` into the list of workspace names the
@@ -479,5 +501,75 @@ mod tests {
         let _guard = EnvGuard::new();
         std::env::set_var(WORKSPACES_ENV, " , , ");
         assert_eq!(parse_workspaces_env(), None);
+    }
+
+    /// P2-2 regression: `save` used to open a fixed `*.json.tmp` path, so
+    /// concurrent saves (multiple connection lifecycles persisting around
+    /// the same tick) could both write through the SAME tmp file — one
+    /// `rename` could pick up the other's half-written bytes, or an older
+    /// snapshot could win the rename race and silently clobber a newer
+    /// one. With a unique tmp name per call, every writer's `rename`
+    /// carries its own complete, independent snapshot straight to `path`;
+    /// the file on disk after all writers finish must always be exactly
+    /// one writer's full, valid snapshot — never a corrupt blend, and
+    /// never a leftover tmp file.
+    #[test]
+    fn concurrent_saves_never_corrupt_the_final_file() {
+        use std::sync::Arc;
+        use std::thread;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = Arc::new(dir.path().join("peer-workspaces.json"));
+
+        let handles: Vec<_> = (0..16)
+            .map(|i| {
+                let path = Arc::clone(&path);
+                thread::spawn(move || {
+                    let entries = vec![sample(&format!("writer-{i}"), true)];
+                    save(&path, &entries).unwrap();
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        let loaded = load(&path);
+        assert_eq!(
+            loaded.len(),
+            1,
+            "final file must be exactly one writer's complete snapshot, not a merge/corruption"
+        );
+        assert!(
+            loaded[0].name.starts_with("writer-"),
+            "final entry must be a genuine writer's data: {:?}",
+            loaded[0].name
+        );
+        assert!(loaded[0].is_default);
+        assert_eq!(loaded[0].id.len(), 16);
+
+        // No stray tmp files left behind — a unique name per call means no
+        // two writers' tmp paths ever collided.
+        let leftover: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().contains(".tmp"))
+            .collect();
+        assert!(leftover.is_empty(), "no tmp files should survive concurrent saves: {leftover:?}");
+    }
+
+    /// Two `save` calls in direct succession must never reuse the same tmp
+    /// filename — the collision `SAVE_TMP_COUNTER` exists to rule out.
+    #[test]
+    fn successive_saves_use_distinct_tmp_names() {
+        let before = SAVE_TMP_COUNTER.load(Ordering::Relaxed);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("peer-workspaces.json");
+
+        save(&path, &[sample("a", true)]).unwrap();
+        save(&path, &[sample("b", true)]).unwrap();
+
+        let after = SAVE_TMP_COUNTER.load(Ordering::Relaxed);
+        assert!(after - before >= 2, "each save must consume its own counter value");
     }
 }

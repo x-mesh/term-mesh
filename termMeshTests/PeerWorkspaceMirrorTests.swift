@@ -108,6 +108,38 @@ final class PeerWorkspaceMirrorTests: XCTestCase {
         XCTAssertFalse(PeerWorkspaceMirrorController.isDividerOnlyDelta(a, b))
     }
 
+    // MARK: - allTargetLeavesMapped (P2-1: fast-path retry guard)
+
+    func test_allTargetLeavesMapped_trueWhenEveryLeafHasAPanel() {
+        let layout = split("horizontal", 0.5, id: 9, leaf(1), leaf(2))
+        let leaves = PeerWorkspaceMirrorController.preorderLeaves(layout)
+        let panelBySurfaceID: [Data: UUID] = [
+            Data([1]): UUID(),
+            Data([2]): UUID(),
+        ]
+        XCTAssertTrue(
+            PeerWorkspaceMirrorController.allTargetLeavesMapped(leaves, panelBySurfaceID: panelBySurfaceID)
+        )
+    }
+
+    func test_allTargetLeavesMapped_falseWhenALeafAttachIsMissing() {
+        // Mirrors a leaf whose PeerPaneSession.attach() failed on a
+        // prior reconcile pass: it never made it into panelBySurfaceID,
+        // so the fast paths must not treat this layout as fully applied.
+        let layout = split("horizontal", 0.5, id: 9, leaf(1), leaf(2))
+        let leaves = PeerWorkspaceMirrorController.preorderLeaves(layout)
+        let panelBySurfaceID: [Data: UUID] = [Data([1]): UUID()]
+        XCTAssertFalse(
+            PeerWorkspaceMirrorController.allTargetLeavesMapped(leaves, panelBySurfaceID: panelBySurfaceID)
+        )
+    }
+
+    func test_allTargetLeavesMapped_trueForEmptyLeaves() {
+        XCTAssertTrue(
+            PeerWorkspaceMirrorController.allTargetLeavesMapped([], panelBySurfaceID: [:])
+        )
+    }
+
     // MARK: - walkParallelSplits mismatch detection
 
     func test_walkParallelSplits_flagsShapeMismatch() {

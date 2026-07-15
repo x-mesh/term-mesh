@@ -43,7 +43,12 @@ extension PeerWorkspaceMirrorController {
     func reconcile(target: Termmesh_Peer_V1_WorkspaceLayout) async throws {
         guard let workspace, !isTornDown else { return }
 
-        if let last = lastAppliedLayout {
+        // Fast paths below must only fire once every target leaf is
+        // actually mirrored — see `allTargetLeavesMapped`.
+        let targetLeaves = Self.preorderLeaves(target)
+        let allLeavesMapped = Self.allTargetLeavesMapped(targetLeaves, panelBySurfaceID: panelBySurfaceID)
+
+        if let last = lastAppliedLayout, allLeavesMapped {
             if Self.layoutsEquivalent(last, target) {
                 recordApplied(target)
                 return
@@ -56,7 +61,6 @@ extension PeerWorkspaceMirrorController {
         }
 
         // ── Phase A (async, no tree mutation): sessions for new leaves.
-        let targetLeaves = Self.preorderLeaves(target)
         guard !targetLeaves.isEmpty else { return }
         let activeIDs = Set(targetLeaves.map(\.surfaceID))
         let missing = targetLeaves.filter { panelBySurfaceID[$0.surfaceID] == nil }
@@ -255,6 +259,19 @@ extension PeerWorkspaceMirrorController {
         _ node: Termmesh_Peer_V1_WorkspaceLayout
     ) -> Termmesh_Peer_V1_WorkspacePane? {
         preorderLeaves(node).first
+    }
+
+    /// True when every target leaf already has a mirrored local panel.
+    /// The no-op/divider-only fast paths in `reconcile` must only fire
+    /// when this holds — otherwise a leaf whose attach failed on a
+    /// prior pass (see the `missing` loop above) would never get
+    /// retried, because an identical subsequent host push would keep
+    /// short-circuiting before Phase A/B ever runs again.
+    nonisolated static func allTargetLeavesMapped(
+        _ leaves: [Termmesh_Peer_V1_WorkspacePane],
+        panelBySurfaceID: [Data: UUID]
+    ) -> Bool {
+        leaves.allSatisfy { panelBySurfaceID[$0.surfaceID] != nil }
     }
 
     /// Structure + leaf surfaceIDs + divider ratios (ε) all match —

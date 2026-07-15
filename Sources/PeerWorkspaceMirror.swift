@@ -254,7 +254,7 @@ final class PeerWorkspaceMirrorController {
             #if DEBUG
             dlog("peer.mirror.forward divider ratio=\(String(format: "%.3f", ratio))")
             #endif
-            try? await session.requestSetDivider(splitID: hostSplitID, ratio: ratio)
+            try? await session.requestSetDivider(workspaceID: self.hostWorkspaceID, splitID: hostSplitID, ratio: ratio)
         }
     }
 
@@ -302,10 +302,30 @@ final class PeerWorkspaceMirrorController {
     /// Full respawn: every pane session is presumed dead (reconnect) —
     /// clear the leaf map so the reconciler treats all target leaves as
     /// missing and all current panels as stale.
+    ///
+    /// Runs `listWorkspaces()` on a throwaway one-shot connection rather
+    /// than the live `subscriptionSession`. This can fire while that
+    /// session's receive loop is still running (e.g. a single mirrored
+    /// pane's own disconnect banner "Reconnect", independent of the
+    /// layout-sync subscription's health), and `listWorkspaces()` is a
+    /// response-waiting RPC — sharing the session with `readFrame()` in
+    /// `startReceiveLoop` would let the two reads consume each other's
+    /// frames (single-reader invariant, see file header / D1). A fresh
+    /// connection sidesteps that by construction: it never starts a
+    /// receive loop of its own.
     func forceResync() async {
-        guard !isTornDown, let session = subscriptionSession else { return }
+        guard !isTornDown, subscriptionSession != nil else { return }
         do {
-            let workspaces = try await session.listWorkspaces()
+            let transport = try await UnixSocketTransport.connect(socketPath: lease.hostSockPath)
+            let oneShot = PeerSession(
+                read: { try await transport.read() },
+                write: { try await transport.write($0) }
+            )
+            _ = try await oneShot.handshake()
+            let workspaces = try await oneShot.listWorkspaces()
+            try? await oneShot.sendGoodbye(reason: "resync probe")
+            await transport.close()
+            guard !isTornDown else { return }
             guard let target = Self.matchWorkspace(workspaces, id: hostWorkspaceID) else {
                 markHostWorkspaceGone()
                 return

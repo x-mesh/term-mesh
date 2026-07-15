@@ -590,10 +590,12 @@ public nonisolated struct Termmesh_Peer_V1_Workspace: Sendable {
   /// May be empty; clients fall back to a short window_id hex suffix.
   public var windowTitle: String = String()
 
-  /// True for the daemon's protected default workspace (owns the static
-  /// TERMMESH_PEER_SURFACES shells; at least one always exists).
-  /// DeleteWorkspaceRequest against it is refused (IsDefault), so clients
-  /// disable the delete affordance. Legacy hosts leave it false.
+  /// True for the daemon's current default workspace (owns the static
+  /// TERMMESH_PEER_SURFACES shells; un-namespaced control commands land
+  /// here). The default is deletable — the host only refuses removing the
+  /// LAST workspace (LastWorkspace), promoting a survivor if the deleted
+  /// one was default. Clients surface this so the delete confirmation can
+  /// warn "the default is being replaced". Legacy hosts leave it false.
   public var isDefault: Bool = false
 
   public var unknownFields = SwiftProtobuf.UnknownStorage()
@@ -940,6 +942,13 @@ public nonisolated struct Termmesh_Peer_V1_SetDividerPositionRequest: Sendable {
 
   /// Fraction in [0.0, 1.0] of the first child.
   public var ratio: Double = 0
+
+  /// Owning workspace. split_id is unique only WITHIN a workspace's tree
+  /// (each LayoutStore has its own counter), so two workspaces routinely
+  /// share a split_id — without this, the host would resize whichever
+  /// tree matches first. Empty = legacy client; the host falls back to
+  /// first-match (single-workspace behavior).
+  public var workspaceID: Data = Data()
 
   public var unknownFields = SwiftProtobuf.UnknownStorage()
 
@@ -3163,7 +3172,7 @@ nonisolated extension Termmesh_Peer_V1_FocusPaneRequest: SwiftProtobuf.Message, 
 
 nonisolated extension Termmesh_Peer_V1_SetDividerPositionRequest: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
   public static let protoMessageName: String = _protobuf_package + ".SetDividerPositionRequest"
-  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{3}split_id\0\u{1}ratio\0")
+  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{3}split_id\0\u{1}ratio\0\u{3}workspace_id\0")
 
   public mutating func decodeMessage<D: SwiftProtobuf.Decoder>(decoder: inout D) throws {
     while let fieldNumber = try decoder.nextFieldNumber() {
@@ -3173,6 +3182,7 @@ nonisolated extension Termmesh_Peer_V1_SetDividerPositionRequest: SwiftProtobuf.
       switch fieldNumber {
       case 1: try { try decoder.decodeSingularBytesField(value: &self.splitID) }()
       case 2: try { try decoder.decodeSingularDoubleField(value: &self.ratio) }()
+      case 3: try { try decoder.decodeSingularBytesField(value: &self.workspaceID) }()
       default: break
       }
     }
@@ -3185,12 +3195,16 @@ nonisolated extension Termmesh_Peer_V1_SetDividerPositionRequest: SwiftProtobuf.
     if self.ratio.bitPattern != 0 {
       try visitor.visitSingularDoubleField(value: self.ratio, fieldNumber: 2)
     }
+    if !self.workspaceID.isEmpty {
+      try visitor.visitSingularBytesField(value: self.workspaceID, fieldNumber: 3)
+    }
     try unknownFields.traverse(visitor: &visitor)
   }
 
   public static func ==(lhs: Termmesh_Peer_V1_SetDividerPositionRequest, rhs: Termmesh_Peer_V1_SetDividerPositionRequest) -> Bool {
     if lhs.splitID != rhs.splitID {return false}
     if lhs.ratio != rhs.ratio {return false}
+    if lhs.workspaceID != rhs.workspaceID {return false}
     if lhs.unknownFields != rhs.unknownFields {return false}
     return true
   }

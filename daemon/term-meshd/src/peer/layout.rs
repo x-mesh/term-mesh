@@ -936,7 +936,18 @@ impl PeerHost {
         // immediately — an empty tree is un-attachable, which raced the
         // client's open ("no panes"). Best-effort: on spawn failure the
         // workspace stays empty and the client's open-time seed retries.
-        if let Some(sid) = self.spawn_ephemeral(&[], &id) {
+        // Gated by the same MAX_PEER_SURFACES cap as split/new_tab: without
+        // this check, CreateWorkspaceRequest was an uncapped PTY spawn —
+        // looping it bypassed the cap entirely. At-cap, the workspace is
+        // still created (empty); `new_tab`'s open-time seed fallback also
+        // checks the cap, so it won't silently backfill one either.
+        if self.pty.list().len() >= Self::MAX_PEER_SURFACES {
+            tracing::info!(
+                "peer workspace created empty: id={} reason=max_peer_surfaces cap={}",
+                hex_prefix(&id),
+                Self::MAX_PEER_SURFACES
+            );
+        } else if let Some(sid) = self.spawn_ephemeral(&[], &id) {
             self.with_store(&id, |store| store.seed_first_pane(sid));
         }
         tracing::info!(
@@ -1039,7 +1050,9 @@ impl PeerHost {
             Some(Kind::FocusPane(_)) => None,
             Some(Kind::SplitPane(req)) => self.split_pane(&req.pane_id, &req.orientation),
             Some(Kind::ClosePane(req)) => self.close_pane(&req.pane_id),
-            Some(Kind::SetDivider(req)) => self.set_divider(&req.split_id, req.ratio),
+            Some(Kind::SetDivider(req)) => {
+                self.set_divider(&req.workspace_id, &req.split_id, req.ratio)
+            }
             Some(Kind::NewTab(req)) => self.new_tab(&req.pane_id, &req.workspace_id),
             Some(Kind::ActivateTab(req)) => self.activate_tab(&req.pane_id, &req.surface_id),
         };
@@ -1171,15 +1184,28 @@ impl PeerHost {
         Some(ws_id)
     }
 
-    /// `SetDividerPositionRequest` carries only a `split_id`, which is
-    /// unique within one workspace's tree but not across workspaces (each
-    /// `LayoutStore` keeps its own counter) — and the wire has no
-    /// workspace_id to disambiguate with, so there is no reverse index to
-    /// consult; this degrades gracefully by matching whichever tree's
-    /// split id hits first and stamping the resulting push with THAT
-    /// workspace's id.
-    fn set_divider(&self, split_id: &[u8], ratio: f64) -> Option<Vec<u8>> {
+    /// `split_id` is unique only WITHIN one workspace's tree (each
+    /// `LayoutStore` keeps its own counter) — two workspaces routinely
+    /// share a split_id. `SetDividerPositionRequest.workspace_id` (proto
+    /// field 3) disambiguates: when non-empty and it names a workspace
+    /// this host currently serves, the resize is scoped to THAT
+    /// workspace's store only — a hit or miss there never spills into any
+    /// other tree. Empty `workspace_id` means a legacy client (pre field-3)
+    /// or a caller that genuinely doesn't know it; degrade to the old
+    /// behavior of matching whichever tree's split id hits first, which
+    /// stays correct as long as there is exactly one workspace (the
+    /// pre-M2 case this fallback exists for).
+    fn set_divider(&self, workspace_id: &[u8], split_id: &[u8], ratio: f64) -> Option<Vec<u8>> {
         let mut workspaces = self.workspaces.lock().unwrap();
+        if !workspace_id.is_empty() {
+            return match workspaces.get_mut(workspace_id) {
+                Some(entry) => match entry.store.set_divider(split_id, ratio) {
+                    Ok(true) => Some(entry.id.clone()),
+                    Ok(false) | Err(_) => None,
+                },
+                None => None,
+            };
+        }
         for entry in workspaces.values_mut() {
             match entry.store.set_divider(split_id, ratio) {
                 Ok(true) => return Some(entry.id.clone()),
@@ -1404,6 +1430,21 @@ mod tests {
             walk(root, &mut out);
         }
         out
+    }
+
+    /// Current divider ratio for `split_id` in `store`, or `None` if no
+    /// split with that id exists in the tree.
+    fn divider_ratio(store: &LayoutStore, split_id: &[u8]) -> Option<f64> {
+        fn walk(node: &LayoutNode, target: &[u8]) -> Option<f64> {
+            if let LayoutNode::Split { id, divider, first, second, .. } = node {
+                if split_id_bytes(*id) == target {
+                    return Some(*divider);
+                }
+                return walk(first, target).or_else(|| walk(second, target));
+            }
+            None
+        }
+        store.root.as_ref().and_then(|root| walk(root, split_id))
     }
 
     #[test]
@@ -1782,6 +1823,90 @@ mod tests {
         assert_ne!(ws2_id, host.default_id());
     }
 
+    /// P1-1 regression: `split_id` is only unique WITHIN one workspace's
+    /// tree, so two independently-built workspaces routinely mint the same
+    /// id (each `LayoutStore`'s counter starts at 1). Passing a non-empty
+    /// `workspace_id` to `PeerHost::set_divider` must scope the resize to
+    /// that workspace's store only — the other workspace's divider, which
+    /// shares the same split_id, must stay exactly as it was.
+    #[test]
+    fn set_divider_scoped_to_workspace_id_leaves_other_workspace_untouched() {
+        let manager = Arc::new(PtyManager::new());
+        let host = PeerHost::new(manager);
+        let default_id = host.default_id();
+
+        {
+            let mut workspaces = host.workspaces.lock().unwrap();
+            workspaces.get_mut(&default_id).unwrap().store = store_with(&["a", "b"]);
+        }
+        let ws2_id = surface_id_from_name("second");
+        {
+            let mut workspaces = host.workspaces.lock().unwrap();
+            workspaces.insert(
+                ws2_id.clone(),
+                WorkspaceEntry {
+                    id: ws2_id.clone(),
+                    name: "second".into(),
+                    is_default: false,
+                    store: store_with(&["x", "y"]),
+                },
+            );
+        }
+
+        let (default_split, ws2_split) = {
+            let workspaces = host.workspaces.lock().unwrap();
+            (
+                split_ids(&workspaces.get(&default_id).unwrap().store)[0].clone(),
+                split_ids(&workspaces.get(&ws2_id).unwrap().store)[0].clone(),
+            )
+        };
+        assert_eq!(
+            default_split, ws2_split,
+            "test setup requires colliding split ids across workspaces — each \
+             LayoutStore's counter independently starts at 1"
+        );
+        let split_id = default_split;
+
+        // Scoped to ws2: only ws2's divider moves.
+        let changed = host.set_divider(&ws2_id, &split_id, 0.3);
+        assert_eq!(changed, Some(ws2_id.clone()));
+
+        let workspaces = host.workspaces.lock().unwrap();
+        assert_eq!(divider_ratio(&workspaces.get(&ws2_id).unwrap().store, &split_id), Some(0.3));
+        assert_ne!(
+            divider_ratio(&workspaces.get(&default_id).unwrap().store, &split_id),
+            Some(0.3),
+            "default workspace's divider (same split_id, different workspace) must be untouched"
+        );
+        // An unknown workspace_id (that still names no store) resolves to
+        // nothing rather than silently falling back to first-match.
+        drop(workspaces);
+        assert_eq!(host.set_divider(&sid("ghost-workspace"), &split_id, 0.7), None);
+    }
+
+    /// Legacy-client fallback: an empty `workspace_id` (pre field-3 clients)
+    /// still degrades to matching whichever tree's split_id hits first —
+    /// the single-workspace-compatible behavior this path exists for.
+    #[test]
+    fn set_divider_empty_workspace_id_falls_back_to_first_match() {
+        let manager = Arc::new(PtyManager::new());
+        let host = PeerHost::new(manager);
+        let default_id = host.default_id();
+        {
+            let mut workspaces = host.workspaces.lock().unwrap();
+            workspaces.get_mut(&default_id).unwrap().store = store_with(&["a", "b"]);
+        }
+        let split_id = {
+            let workspaces = host.workspaces.lock().unwrap();
+            split_ids(&workspaces.get(&default_id).unwrap().store)[0].clone()
+        };
+
+        let changed = host.set_divider(&[], &split_id, 0.3);
+        assert_eq!(changed, Some(default_id.clone()));
+        let workspaces = host.workspaces.lock().unwrap();
+        assert_eq!(divider_ratio(&workspaces.get(&default_id).unwrap().store, &split_id), Some(0.3));
+    }
+
     /// Multi-workspace regression: `watch_ephemeral` must prune the dead
     /// pane from the workspace that actually owns it (via the reverse
     /// index), not always the default — and must leave every other
@@ -2057,6 +2182,54 @@ mod tests {
         );
         let default_entry = roster.iter().find(|e| e.id == default_id).expect("default untouched");
         assert_eq!(default_entry.title, DAEMON_WORKSPACE);
+    }
+
+    /// P1-2 regression: `create_workspace`'s "seed a first pane" step was
+    /// an unconditional `spawn_ephemeral` — unlike `split_pane`/`new_tab`,
+    /// it never checked `MAX_PEER_SURFACES`, so looping `CreateWorkspace`
+    /// bypassed the registered-surface cap entirely (uncapped PTY spawn).
+    /// At the cap, the workspace must still be created — just left empty,
+    /// exactly like a non-default workspace restored from
+    /// `peer-workspaces.json` — and no additional PTY may be spawned.
+    #[tokio::test]
+    async fn create_workspace_at_max_peer_surfaces_skips_seed_and_stays_empty() {
+        let manager = Arc::new(PtyManager::new());
+        let base = PtySurface::spawn(sid("base"), "cat".into(), "/bin/cat", &[], 80, 24, None)
+            .expect("spawn /bin/cat");
+        manager.insert_surface(base);
+        let host = Arc::new(PeerHost::new(Arc::clone(&manager)));
+
+        // Drive the surface count up to the cap via the same mechanism
+        // `split_pane_stops_at_surface_cap` uses — real spawns halt exactly
+        // at MAX_PEER_SURFACES because split_pane's own cap check runs
+        // before spawn_ephemeral.
+        for _ in 0..(PeerHost::MAX_PEER_SURFACES + 20) {
+            host.apply_control(WorkspaceControl {
+                kind: Some(workspace_control::Kind::SplitPane(peer_proto::v1::SplitPaneRequest {
+                    pane_id: sid("base"),
+                    orientation: "horizontal".into(),
+                })),
+            });
+        }
+        assert_eq!(
+            host.pty.list().len(),
+            PeerHost::MAX_PEER_SURFACES,
+            "test setup requires the cap already hit"
+        );
+
+        let new_id = host.create_workspace("overflow".into());
+
+        assert_eq!(
+            host.pty.list().len(),
+            PeerHost::MAX_PEER_SURFACES,
+            "create_workspace must not spawn past the cap"
+        );
+        let roster = host.list_workspaces();
+        let created = roster.iter().find(|e| e.id == new_id).expect("workspace still created");
+        assert!(
+            created.layout.is_none(),
+            "seed must be skipped (not merely failed) once the cap is already hit"
+        );
     }
 
     /// `rename_workspace` changes only the name, leaving the id (and
