@@ -1433,6 +1433,37 @@ private func sendPeerInputBytes(_ surface: ghostty_surface_t, bytes: Data, final
             continue
         }
 
+        // SGR mouse BUTTON / MOTION / RELEASE report (press / drag / release)
+        // from the viewer. The wheel branch above already claimed wheel
+        // reports; here we re-dispatch button and motion through the host
+        // pane's REAL mouse state via ghostty_surface_mouse_button /
+        // _mouse_pos — the same APIs the local mouse handlers use. The host
+        // core re-encodes for the host app's actual mouse mode (1000/1002/1003
+        // + SGR/legacy) or drops it when the app never enabled tracking,
+        // identical to a local click/drag on the host pane. Without this,
+        // click/motion/release fell through to the drop branch below — the
+        // reason peer viewers could scroll but never select/drag in claude/vim.
+        if byte == 0x1b, let m = peerSgrButtonReport(arr, start: i) {
+            movePeerMouseToReportedCell(
+                surface, surfaceKey: surfaceKey, col: m.col, row: m.row)
+            // Motion reports carry no button transition: the pos warp above is
+            // enough — with a button still held from an earlier press, the host
+            // core emits the drag-motion report itself. Press/release forward a
+            // real button event (skip the no-button pure-motion case).
+            if !m.motion, let button = m.button {
+                _ = ghostty_surface_mouse_button(
+                    surface,
+                    m.press ? GHOSTTY_MOUSE_PRESS : GHOSTTY_MOUSE_RELEASE,
+                    button,
+                    m.mods)
+            }
+            #if DEBUG
+            dlog("peer.input.sgr_button press=\(m.press) motion=\(m.motion) cell=\(m.col),\(m.row)")
+            #endif
+            i += m.consumed
+            continue
+        }
+
         // Unrecognized CSI/OSC/SS3/SS2: DROP silently.
         //
         // Sending via sendPeerKeyEvent(text: ESC…) is broken for two reasons:
@@ -1716,6 +1747,75 @@ private func movePeerMouseToReportedCell(
     ghostty_surface_mouse_pos(surface, Double(x), Double(y), GHOSTTY_MODS_NONE)
 }
 
+/// Parse an SGR mouse BUTTON / MOTION / RELEASE report (`\e[<Pb;Px;Py` + `M`
+/// press-or-motion / `m` release, DECSET 1006). Wheel reports (Pb bit 0x40)
+/// are excluded — `peerSgrWheelReport` owns those. Returns the button (nil for
+/// a no-button pure-motion report, Pb low bits == 3), whether this is a motion
+/// report (Pb bit 0x20), the press/release state, the 1-based cell, decoded key
+/// modifiers (Pb bits 0x04/0x08/0x10 → Shift/Alt/Ctrl), and the consumed byte
+/// count. Malformed / frame-split sequences return nil (the caller's generic
+/// unrecognized-CSI drop consumes those; FIX B reassembles split heads before
+/// this parser sees them).
+private func peerSgrButtonReport(
+    _ bytes: [UInt8],
+    start: Int
+) -> (press: Bool, motion: Bool, button: ghostty_input_mouse_button_e?,
+      col: Int, row: Int, mods: ghostty_input_mods_e, consumed: Int)? {
+    guard start + 2 < bytes.count,
+          bytes[start] == 0x1b,
+          bytes[start + 1] == 0x5b, // '['
+          bytes[start + 2] == 0x3c  // '<'
+    else { return nil }
+    var i = start + 3
+    var params: [Int] = []
+    var current = 0
+    var hasDigit = false
+    while i < bytes.count, params.count < 3 {
+        let b = bytes[i]
+        switch b {
+        case 0x30...0x39:
+            current = current * 10 + Int(b - 0x30)
+            guard current <= 0xFFFF else { return nil }
+            hasDigit = true
+        case 0x3b: // ';'
+            guard hasDigit else { return nil }
+            params.append(current)
+            current = 0
+            hasDigit = false
+        case 0x4d, 0x6d: // 'M' press/motion, 'm' release
+            guard hasDigit else { return nil }
+            params.append(current)
+            guard params.count == 3 else { return nil }
+            let pb = params[0]
+            guard pb & 0x40 == 0 else { return nil } // wheel → peerSgrWheelReport
+            let button: ghostty_input_mouse_button_e?
+            switch pb & 0x03 {
+            case 0:  button = GHOSTTY_MOUSE_LEFT
+            case 1:  button = GHOSTTY_MOUSE_MIDDLE
+            case 2:  button = GHOSTTY_MOUSE_RIGHT
+            default: button = nil // 3 = no button held (pure motion / mode 1003)
+            }
+            var rawMods = GHOSTTY_MODS_NONE.rawValue
+            if (pb & 0x04) != 0 { rawMods |= GHOSTTY_MODS_SHIFT.rawValue }
+            if (pb & 0x08) != 0 { rawMods |= GHOSTTY_MODS_ALT.rawValue }
+            if (pb & 0x10) != 0 { rawMods |= GHOSTTY_MODS_CTRL.rawValue }
+            return (
+                press: b == 0x4d,
+                motion: (pb & 0x20) != 0,
+                button: button,
+                col: params[1],
+                row: params[2],
+                mods: ghostty_input_mods_e(rawValue: rawMods),
+                consumed: i - start + 1
+            )
+        default:
+            return nil
+        }
+        i += 1
+    }
+    return nil
+}
+
 private func peerCsiKeySequence(
     _ bytes: [UInt8],
     start: Int
@@ -1738,6 +1838,25 @@ private func peerCsiKeySequence(
     case 0x41, 0x42, 0x43, 0x44, 0x48, 0x46: // A/B/C/D/H/F
         keycode = peerCsiFinalKeycode(final)
         modifierParam = params.dropFirst().first
+    case 0x5a: // 'Z' — CBT / back-tab (Shift+Tab). Bare `\e[Z` carries an
+               // implicit Shift; OR in any explicit `1;mod` param modifier.
+        // Without this the sequence fell through to the unrecognized-CSI drop,
+        // so Shift+Tab never reached the host pane (menus/vim/claude reverse
+        // navigation was dead over the relay).
+        let extra = peerCsiModifier(params.dropFirst().first).rawValue
+        let mods = ghostty_input_mods_e(rawValue: extra | GHOSTTY_MODS_SHIFT.rawValue)
+        return (0x30, mods, finalIndex - start + 1) // kVK_Tab + Shift
+    case 0x75: // 'u' — kitty keyboard protocol: CSI codepoint[:alt];mods[:event] u
+        // Modified keys the relay leaves untranslated (Alt+<key>, kitty-form
+        // Shift+Tab `9;2u`, Shift+<key> in report-all mode) reach here verbatim
+        // and used to hit the unrecognized-CSI drop. Map the codepoint to a
+        // keycode and the kitty modifier flags to ghostty mods so the host
+        // pane's own encoder regenerates the right sequence for its mode.
+        // Unmappable codepoints fall through to the drop branch (no regression).
+        guard let ev = peerKittyUKeyEvent(bytes, bodyStart: bodyStart, finalIndex: finalIndex) else {
+            return nil
+        }
+        return (ev.keycode, ev.mods, finalIndex - start + 1)
     case 0x7e: // '~'
         guard let first = params.first else { return nil }
         keycode = peerCsiTildeKeycode(first)
@@ -1748,6 +1867,108 @@ private func peerCsiKeySequence(
 
     guard let keycode else { return nil }
     return (keycode, peerCsiModifier(modifierParam), finalIndex - start + 1)
+}
+
+/// Parse a kitty keyboard-protocol key report body (`codepoint[:alt];mods[:event]`)
+/// into a (keycode, mods) key event for the subset we can faithfully replay:
+/// control keys, ASCII letters, digits, space. The relay already translates the
+/// common unmodified control keys and Ctrl+letter to legacy bytes; what reaches
+/// here is mainly Alt/Shift-modified keys and kitty-form Shift+Tab. Key-release
+/// events (kitty event type 3) and unmappable codepoints return nil (dropped —
+/// no worse than the pre-fix behaviour). Release events are already stripped by
+/// the relay, but the event-type guard keeps this correct if that ever changes.
+private func peerKittyUKeyEvent(
+    _ bytes: [UInt8],
+    bodyStart: Int,
+    finalIndex: Int
+) -> (keycode: UInt32, mods: ghostty_input_mods_e)? {
+    guard bodyStart < finalIndex else { return nil }
+    let body = Array(bytes[bodyStart..<finalIndex])
+    let sections = body.split(separator: 0x3b, omittingEmptySubsequences: false).map(Array.init)
+    guard let cpSection = sections.first else { return nil }
+    // codepoint = digits before an optional `:alternate` sub-parameter.
+    let cpDigits = cpSection.split(separator: 0x3a, omittingEmptySubsequences: false)
+        .first.map(Array.init) ?? cpSection
+    guard let cp = peerParseDigits(cpDigits) else { return nil }
+    var modValue = 1
+    if sections.count > 1 {
+        let sub = sections[1].split(separator: 0x3a, omittingEmptySubsequences: false).map(Array.init)
+        if let m = sub.first, let mv = peerParseDigits(m) { modValue = mv }
+        if sub.count > 1, peerParseDigits(sub[1]) == 3 {
+            return nil // key-release event: not a press
+        }
+    }
+    guard let keycode = peerKittyCodepointKeycode(cp) else { return nil }
+    return (keycode, peerCsiModifier(modValue))
+}
+
+/// Digits-only parse of a CSI parameter slice. nil for empty / non-digit.
+private func peerParseDigits(_ bytes: [UInt8]) -> Int? {
+    guard !bytes.isEmpty else { return nil }
+    var value = 0
+    for b in bytes {
+        guard b >= 0x30, b <= 0x39 else { return nil }
+        value = value * 10 + Int(b - 0x30)
+    }
+    return value
+}
+
+/// Map a kitty codepoint to its macOS virtual keycode for the replayable
+/// subset (control keys, digits, ASCII letters). Returns nil for anything else.
+private func peerKittyCodepointKeycode(_ cp: Int) -> UInt32? {
+    switch cp {
+    case 9:    return 0x30 // Tab
+    case 13:   return 0x24 // Return
+    case 27:   return 0x35 // Escape
+    case 32:   return 0x31 // Space
+    case 127:  return 0x33 // Delete (Backspace)
+    case 0x30: return 0x1D // 0
+    case 0x31: return 0x12 // 1
+    case 0x32: return 0x13 // 2
+    case 0x33: return 0x14 // 3
+    case 0x34: return 0x15 // 4
+    case 0x35: return 0x17 // 5
+    case 0x36: return 0x16 // 6
+    case 0x37: return 0x1A // 7
+    case 0x38: return 0x1C // 8
+    case 0x39: return 0x19 // 9
+    case 0x41...0x5a: return peerLetterKeycode(cp + 0x20) // A-Z → lowercase
+    case 0x61...0x7a: return peerLetterKeycode(cp)        // a-z
+    default:   return nil
+    }
+}
+
+/// ASCII lowercase-letter codepoint → kVK_ANSI_* keycode.
+private func peerLetterKeycode(_ cp: Int) -> UInt32? {
+    switch cp {
+    case 0x61: return 0x00 // a
+    case 0x62: return 0x0B // b
+    case 0x63: return 0x08 // c
+    case 0x64: return 0x02 // d
+    case 0x65: return 0x0E // e
+    case 0x66: return 0x03 // f
+    case 0x67: return 0x05 // g
+    case 0x68: return 0x04 // h
+    case 0x69: return 0x22 // i
+    case 0x6a: return 0x26 // j
+    case 0x6b: return 0x28 // k
+    case 0x6c: return 0x25 // l
+    case 0x6d: return 0x2E // m
+    case 0x6e: return 0x2D // n
+    case 0x6f: return 0x1F // o
+    case 0x70: return 0x23 // p
+    case 0x71: return 0x0C // q
+    case 0x72: return 0x0F // r
+    case 0x73: return 0x01 // s
+    case 0x74: return 0x11 // t
+    case 0x75: return 0x20 // u
+    case 0x76: return 0x09 // v
+    case 0x77: return 0x0D // w
+    case 0x78: return 0x07 // x
+    case 0x79: return 0x10 // y
+    case 0x7a: return 0x06 // z
+    default:   return nil
+    }
 }
 
 private func peerCsiParams(_ body: [UInt8]) -> [Int] {
