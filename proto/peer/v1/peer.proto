@@ -203,6 +203,13 @@ message Workspace {
   // used for the section header in the client's workspace picker/sidebar.
   // May be empty; clients fall back to a short window_id hex suffix.
   string window_title = 5;
+  // True for the daemon's current default workspace (owns the static
+  // TERMMESH_PEER_SURFACES shells; un-namespaced control commands land
+  // here). The default is deletable — the host only refuses removing the
+  // LAST workspace (LastWorkspace), promoting a survivor if the deleted
+  // one was default. Clients surface this so the delete confirmation can
+  // warn "the default is being replaced". Legacy hosts leave it false.
+  bool is_default = 6;
 }
 
 // Recursive node: either a split (interior) or a pane (leaf).

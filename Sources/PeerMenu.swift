@@ -741,17 +741,31 @@ final class PeerClientCoordinator: NSObject {
             let conn = try await PeerRelaySession.connect(hostSockPath: lease.hostSockPath)
             defer { Task { await conn.cancel() } }
             try await conn.session.requestNewTab(workspaceID: workspace.workspaceID)
-            // The daemon applies NewTab asynchronously; poll briefly.
-            for _ in 0..<10 {
-                try await Task.sleep(nanoseconds: 300_000_000)
+            // The daemon applies NewTab asynchronously; poll until the
+            // seeded pane appears (25 × 200ms = 5s), re-nudging with
+            // another NewTab midway in case the first was dropped.
+            for attempt in 0..<25 {
+                try await Task.sleep(nanoseconds: 200_000_000)
+                if attempt == 12 {
+                    try? await conn.session.requestNewTab(workspaceID: workspace.workspaceID)
+                }
                 let workspaces = try await conn.session.listWorkspaces()
                 if let updated = workspaces.first(where: { $0.workspaceID == workspace.workspaceID }),
                    firstLeafPane(updated.layout) != nil {
+                    #if DEBUG
+                    dlog("peer.mirror.seed ok workspace=\(workspace.title) attempt=\(attempt)")
+                    #endif
                     return updated
                 }
             }
+            #if DEBUG
+            dlog("peer.mirror.seed timeout workspace=\(workspace.title)")
+            #endif
             return nil
         } catch {
+            #if DEBUG
+            dlog("peer.mirror.seed error workspace=\(workspace.title) error=\(error)")
+            #endif
             return nil
         }
     }

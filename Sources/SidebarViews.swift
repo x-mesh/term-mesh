@@ -1113,20 +1113,83 @@ struct RemoteWorkspaceRowView: View {
     let host: HostEntry
     let store: RemoteHostStore
     @State private var isHovering = false
-    @State private var showRenameAlert = false
+    @State private var isRenaming = false
     @State private var renameTitle = ""
     @State private var showDeleteConfirm = false
+    @FocusState private var renameFieldFocused: Bool
+
+    private var canManage: Bool { host.supportsWorkspaceLifecycle == true }
+
+    /// Row fill: an accent wash while renaming (so the mode reads at a
+    /// glance), a faint hover highlight otherwise.
+    private var rowBackgroundFill: Color {
+        if isRenaming { return Color.accentColor.opacity(0.12) }
+        return isHovering ? Color.primary.opacity(0.07) : Color.clear
+    }
+
+    /// Enter Finder-style inline rename: swap the label for a focused,
+    /// pre-selected text field.
+    private func beginRename() {
+        renameTitle = workspace.title
+        isRenaming = true
+    }
+
+    /// Row tap: open the live workspace mirror. Rename is a context-menu
+    /// action (the slow-second-click gesture was dropped — it fought the
+    /// click-to-open primary action and felt unpredictable).
+    private func handleTap() {
+        guard !isRenaming else { return }
+        store.openWorkspaceAsMirror(workspace, host: host, live: true)
+    }
+
+    /// Commit the edit if it changed and is non-empty; always exit edit mode.
+    private func commitRename() {
+        let title = renameTitle.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !title.isEmpty, title != workspace.title {
+            store.renameWorkspace(workspace, host: host, title: title)
+        }
+        isRenaming = false
+    }
 
     var body: some View {
         HStack(spacing: 5) {
             Image(systemName: "terminal")
                 .font(.system(size: 9))
                 .foregroundColor(.secondary)
-            Text(workspace.title)
-                .font(.system(size: 11.5))
-                .foregroundColor(.primary)
-                .lineLimit(1)
-                .truncationMode(.tail)
+            if isRenaming {
+                // Finder-style inline edit: Enter commits, Esc cancels,
+                // focus loss commits (matching macOS rename behavior).
+                // Distinct field chrome (filled background + accent ring)
+                // so entering rename reads clearly in both light and dark
+                // — a bare inline field was too easy to miss.
+                TextField("", text: $renameTitle)
+                    .textFieldStyle(.plain)
+                    .font(.system(size: 11.5))
+                    .foregroundColor(.primary)
+                    .focused($renameFieldFocused)
+                    .padding(.horizontal, 5)
+                    .padding(.vertical, 2)
+                    .background(
+                        RoundedRectangle(cornerRadius: 4)
+                            .fill(Color(nsColor: .textBackgroundColor))
+                            .overlay(
+                                RoundedRectangle(cornerRadius: 4)
+                                    .strokeBorder(Color.accentColor, lineWidth: 1.5)
+                            )
+                    )
+                    .onSubmit { commitRename() }
+                    .onExitCommand { isRenaming = false }   // Esc = cancel
+                    .onChange(of: renameFieldFocused) { focused in
+                        if !focused && isRenaming { commitRename() }
+                    }
+                    .onAppear { renameFieldFocused = true }
+            } else {
+                Text(workspace.title)
+                    .font(.system(size: 11.5))
+                    .foregroundColor(.primary)
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+            }
             Spacer()
         }
         .padding(.leading, 20)
@@ -1134,16 +1197,11 @@ struct RemoteWorkspaceRowView: View {
         .padding(.vertical, 5)
         .background(
             RoundedRectangle(cornerRadius: 5)
-                .fill(isHovering ? Color.primary.opacity(0.07) : Color.clear)
+                .fill(rowBackgroundFill)
                 .padding(.horizontal, 4)
         )
         .contentShape(Rectangle())
-        .onTapGesture {
-            // Default click = live workspace mirror in the main window
-            // (host-authoritative sync). The legacy relay window and the
-            // one-shot snapshot are demoted to the context menu.
-            store.openWorkspaceAsMirror(workspace, host: host, live: true)
-        }
+        .onTapGesture { handleTap() }
         .contextMenu {
             // Live mirror (Phase 2B): host-authoritative layout sync —
             // splits/closes follow the host and local actions forward.
@@ -1159,31 +1217,20 @@ struct RemoteWorkspaceRowView: View {
             // live, users read the near-identical workspace as a broken
             // mirror. The code path stays for a future, clearer surface.
             Divider()
-            // Always shown, disabled (not hidden) when the host hasn't
-            // negotiated workspace.lifecycle.v1 — keeps the menu shape
-            // stable across host capability tiers.
-            Button("Rename…") {
-                renameTitle = workspace.title
-                showRenameAlert = true
-            }
-            .disabled(host.supportsWorkspaceLifecycle != true)
+            // Rename opens Finder-style inline edit (no modal). Always
+            // shown, disabled when the host hasn't negotiated
+            // workspace.lifecycle.v1 — keeps the menu shape stable.
+            Button("Rename") { beginRename() }
+                .disabled(!canManage)
+            // Any workspace (including the default) can be deleted, but
+            // the host refuses to remove the LAST one — disable delete
+            // then so the action never silently no-ops.
             Button("Delete…", role: .destructive) {
                 showDeleteConfirm = true
             }
-            .disabled(host.supportsWorkspaceLifecycle != true)
+            .disabled(!canManage || host.workspaces.count <= 1)
         }
         .onHover { isHovering = $0 }
-        .alert("Rename Workspace", isPresented: $showRenameAlert) {
-            TextField("Workspace name", text: $renameTitle)
-            Button("Rename") {
-                let title = renameTitle.trimmingCharacters(in: .whitespacesAndNewlines)
-                guard !title.isEmpty else { return }
-                store.renameWorkspace(workspace, host: host, title: title)
-            }
-            Button("Cancel", role: .cancel) {}
-        } message: {
-            Text("Renames this workspace on \"\(host.displayName)\".")
-        }
         .confirmationDialog(
             "Delete \"\(workspace.title)\"?",
             isPresented: $showDeleteConfirm
@@ -1193,7 +1240,9 @@ struct RemoteWorkspaceRowView: View {
             }
             Button("Cancel", role: .cancel) {}
         } message: {
-            Text("All panes on the host for this workspace are closed.")
+            Text(workspace.isDefault
+                 ? "All panes on the host for this workspace are closed. This is the default workspace — another one is promoted in its place."
+                 : "All panes on the host for this workspace are closed.")
         }
     }
 }

@@ -228,6 +228,7 @@ async fn reader_loop(
                         // a daemon host actually is.
                         window_id: Vec::new(),
                         window_title: String::new(),
+                        is_default: e.is_default,
                     })
                     .collect();
                 let reply = Envelope {
@@ -273,9 +274,12 @@ async fn reader_loop(
 
             // Fire-and-forget: the only observable result of a successful
             // delete is the WorkspaceRemoved push `PeerHost::remove_workspace`
-            // broadcasts itself. An empty/unknown id or the default
-            // workspace's id is safely refused (no-op), never treated as
-            // "delete all" or "delete current".
+            // broadcasts itself. An empty/unknown id is safely refused
+            // (no-op), never treated as "delete all" or "delete current".
+            // M3: the default workspace is deletable like any other — it
+            // promotes a survivor to take its place — so the only id-based
+            // refusal left is `LastWorkspace` (this would empty the
+            // collection, and un-namespaced control always needs a home).
             (HandshakeState::Ready, Payload::DeleteWorkspaceRequest(req)) => {
                 if let Err(e) = host.remove_workspace(&req.workspace_id) {
                     tracing::warn!(

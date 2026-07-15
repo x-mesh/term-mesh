@@ -35,6 +35,11 @@ pub async fn serve(path: PathBuf, shutdown_rx: watch::Receiver<bool>) -> anyhow:
     let default_name_fallback = connection::hostname_or(DAEMON_WORKSPACE);
     let entries = persist::boot(&workspaces_path, &default_name_fallback);
     let host = Arc::new(PeerHost::with_workspaces(manager, entries));
+    // Restored non-default workspaces come back with an empty tree
+    // (only {id, name} is persisted — shells are daemon children). Seed
+    // each a first pane so every workspace is immediately attachable,
+    // instead of surfacing "no panes" on the client's first open.
+    host.seed_empty_workspaces();
     // M2: create/rename/delete workspace-lifecycle RPCs persist through
     // this path — wired here (rather than baked into `with_workspaces`)
     // so that constructor stays I/O-free for every test/embedder caller.
@@ -2347,7 +2352,7 @@ mod integration_tests {
             .find(|w| w.workspace_id == new_id)
             .expect("new workspace present in roster");
         assert_eq!(created.title, "dev");
-        assert!(created.layout.is_none(), "freshly created workspace has no panes yet");
+        assert!(created.layout.is_some(), "a created workspace is seeded with its first pane");
 
         shutdown_tx.send(true).unwrap();
         let _ = tokio::time::timeout(std::time::Duration::from_secs(3), server_task).await;
@@ -2546,11 +2551,16 @@ mod integration_tests {
         let _ = tokio::time::timeout(std::time::Duration::from_secs(3), server_task).await;
     }
 
-    /// (d) Deleting the default workspace must be refused: no
-    /// `WorkspaceRemoved` push, no roster change, and the connection
+    /// (d) M3: deleting the ONLY workspace left must be refused — even
+    /// though it happens to be the default (a fresh boot has exactly one
+    /// workspace, so this is unavoidably the `LastWorkspace` case, not a
+    /// default-specific refusal; deleting the default when another
+    /// workspace exists is now allowed, see `layout::tests::
+    /// remove_default_workspace_promotes_survivor_and_tears_down_old_default_surfaces`).
+    /// No `WorkspaceRemoved` push, no roster change, and the connection
     /// stays healthy (proven by a Ping/Pong round trip right after).
     #[tokio::test]
-    async fn delete_default_workspace_is_refused() {
+    async fn delete_last_workspace_is_refused() {
         use peer_proto::v1::{DeleteWorkspaceRequest, Ping, Pong};
 
         let tmp = TempDir::new().unwrap();
@@ -2594,7 +2604,7 @@ mod integration_tests {
         .unwrap();
 
         let removed = next_workspace_removed(&mut reader, std::time::Duration::from_millis(500)).await;
-        assert!(removed.is_none(), "default workspace deletion must be refused, got {removed:?}");
+        assert!(removed.is_none(), "last workspace deletion must be refused, got {removed:?}");
 
         write_envelope(
             &mut writer,

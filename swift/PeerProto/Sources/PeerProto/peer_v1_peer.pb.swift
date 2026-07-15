@@ -590,6 +590,12 @@ public nonisolated struct Termmesh_Peer_V1_Workspace: Sendable {
   /// May be empty; clients fall back to a short window_id hex suffix.
   public var windowTitle: String = String()
 
+  /// True for the daemon's protected default workspace (owns the static
+  /// TERMMESH_PEER_SURFACES shells; at least one always exists).
+  /// DeleteWorkspaceRequest against it is refused (IsDefault), so clients
+  /// disable the delete affordance. Legacy hosts leave it false.
+  public var isDefault: Bool = false
+
   public var unknownFields = SwiftProtobuf.UnknownStorage()
 
   public init() {}
@@ -2412,7 +2418,7 @@ nonisolated extension Termmesh_Peer_V1_WorkspaceList: SwiftProtobuf.Message, Swi
 
 nonisolated extension Termmesh_Peer_V1_Workspace: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
   public static let protoMessageName: String = _protobuf_package + ".Workspace"
-  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{3}workspace_id\0\u{1}title\0\u{1}layout\0\u{3}window_id\0\u{3}window_title\0")
+  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{3}workspace_id\0\u{1}title\0\u{1}layout\0\u{3}window_id\0\u{3}window_title\0\u{3}is_default\0")
 
   public mutating func decodeMessage<D: SwiftProtobuf.Decoder>(decoder: inout D) throws {
     while let fieldNumber = try decoder.nextFieldNumber() {
@@ -2425,6 +2431,7 @@ nonisolated extension Termmesh_Peer_V1_Workspace: SwiftProtobuf.Message, SwiftPr
       case 3: try { try decoder.decodeSingularMessageField(value: &self._layout) }()
       case 4: try { try decoder.decodeSingularBytesField(value: &self.windowID) }()
       case 5: try { try decoder.decodeSingularStringField(value: &self.windowTitle) }()
+      case 6: try { try decoder.decodeSingularBoolField(value: &self.isDefault) }()
       default: break
       }
     }
@@ -2450,6 +2457,9 @@ nonisolated extension Termmesh_Peer_V1_Workspace: SwiftProtobuf.Message, SwiftPr
     if !self.windowTitle.isEmpty {
       try visitor.visitSingularStringField(value: self.windowTitle, fieldNumber: 5)
     }
+    if self.isDefault != false {
+      try visitor.visitSingularBoolField(value: self.isDefault, fieldNumber: 6)
+    }
     try unknownFields.traverse(visitor: &visitor)
   }
 
@@ -2459,6 +2469,7 @@ nonisolated extension Termmesh_Peer_V1_Workspace: SwiftProtobuf.Message, SwiftPr
     if lhs._layout != rhs._layout {return false}
     if lhs.windowID != rhs.windowID {return false}
     if lhs.windowTitle != rhs.windowTitle {return false}
+    if lhs.isDefault != rhs.isDefault {return false}
     if lhs.unknownFields != rhs.unknownFields {return false}
     return true
   }

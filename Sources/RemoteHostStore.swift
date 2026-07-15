@@ -13,6 +13,9 @@ struct WorkspaceSummary: Identifiable, Equatable {
     let windowID: Data
     /// Human-readable window label (window title bar text) for grouping.
     let windowTitle: String
+    /// The daemon's protected default workspace — delete is refused on
+    /// the host (IsDefault), so the sidebar disables the affordance.
+    let isDefault: Bool
 }
 
 /// Human label for a host window in the peer workspace UI. Uses the window's
@@ -452,7 +455,8 @@ final class RemoteHostStore: ObservableObject {
                         title: $0.title.isEmpty ? "<workspace>" : $0.title,
                         hostSockPath: path,
                         windowID: $0.windowID,
-                        windowTitle: $0.windowTitle
+                        windowTitle: $0.windowTitle,
+                        isDefault: $0.isDefault
                     )
                 }
                 self.hosts[key]?.workspaces = summaries
@@ -549,11 +553,10 @@ final class RemoteHostStore: ObservableObject {
             do {
                 let conn = try await PeerRelaySession.connect(hostSockPath: path)
                 do {
-                    // Seed the first pane at creation so the workspace is
-                    // born with a shell — otherwise it lists empty and a
-                    // click races the async NewTab spawn ("no panes").
-                    let newID = try await conn.session.createWorkspace(title: title)
-                    try await conn.session.requestNewTab(workspaceID: newID)
+                    // The daemon seeds the first pane at creation, so the
+                    // workspace is born with a shell — no client-side
+                    // NewTab needed here.
+                    _ = try await conn.session.createWorkspace(title: title)
                 } catch {
                     #if DEBUG
                     dlog("peer.sidebar.createWorkspace rpc-fail key=\(key) error=\(error)")
