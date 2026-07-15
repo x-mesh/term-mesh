@@ -346,4 +346,27 @@ final class RelayResizeCoalescerHealTests: XCTestCase {
         XCTAssertTrue(cols.isEmpty, "no size known → no resize nudge; got \(cols)")
         await coalescer.cancel()
     }
+
+    /// Regression: a 0-column size (e.g. a transient 0-col resize from the
+    /// relay) must not trap `size.cols - 1` (UInt32 underflow) — the heal
+    /// simply no-ops. Test completing without a crash is half the assertion.
+    func testHealDoesNotCrashOnZeroColumnSize() async throws {
+        let collector = ResizeColsCollector()
+        let session = makeSession(collector)
+        let coalescer = RelayResizeCoalescer(
+            session: session,
+            surfaceID: Data(repeating: 0xC3, count: 16),
+            initialCols: 80,
+            initialRows: 24,
+            healDebounceMs: 40,
+            healMaxWaitSeconds: 1000
+        )
+        await coalescer.submit(cols: 0, rows: 24)  // 0-col size — must not trap the heal
+        await coalescer.noteGapForHeal()
+        try await Task.sleep(nanoseconds: 300_000_000)
+
+        let cols = await collector.cols()
+        XCTAssertFalse(cols.contains(79), "a 0-col size must produce no nudge; got \(cols)")
+        await coalescer.cancel()
+    }
 }

@@ -339,10 +339,16 @@ actor RelayResizeCoalescer {
     private var flushTask: Task<Void, Never>?
     /// Most recent size seen — the baseline for a P9.2 heal nudge.
     private var lastSize: (cols: UInt32, rows: UInt32)?
-    /// Trailing-debounce task for the gap heal: reset on every gap so it fires
-    /// once after the drop burst settles, rather than per dropped chunk.
+    /// The single trailing-debounce task for the current gap episode. Started
+    /// once per episode and self-reschedules off `lastGapAt`, rather than being
+    /// cancelled + recreated on every gap (the hot pump loop drops thousands of
+    /// chunks/sec — per-gap Task churn is exactly what this path exists to
+    /// survive).
     private var healTask: Task<Void, Never>?
-    private let healDebounceNs: UInt64
+    private let healDebounceSeconds: TimeInterval
+    /// Timestamp of the most recent gap — the trailing debounce fires once this
+    /// is `healDebounceSeconds` in the past (drops have settled).
+    private var lastGapAt: Date = .distantPast
     /// Start of the current gap episode (nil = no active drops). Gates the
     /// throttle so a short burst heals only via the trailing debounce.
     private var gapEpisodeStart: Date?
@@ -365,7 +371,7 @@ actor RelayResizeCoalescer {
         self.session = session
         self.surfaceID = surfaceID
         self.delayNs = delayMs * 1_000_000
-        self.healDebounceNs = healDebounceMs * 1_000_000
+        self.healDebounceSeconds = TimeInterval(healDebounceMs) / 1000.0
         self.healMaxWait = healMaxWaitSeconds
         // Seed so a gap heal always has a size to nudge, even before the
         // relay's first resize frame reaches `submit` — for some mirror panes
@@ -424,6 +430,7 @@ actor RelayResizeCoalescer {
 
     func noteGapForHeal() {
         let now = Date()
+        lastGapAt = now
         if gapEpisodeStart == nil { gapEpisodeStart = now }
         // Throttle path: once an episode has run past `healMaxWait`, heal at
         // most once per `healMaxWait` even while drops keep streaming. A slow-
@@ -435,15 +442,30 @@ actor RelayResizeCoalescer {
            now.timeIntervalSince(lastHealAt) >= healMaxWait {
             Task { [weak self] in await self?.performGapHeal(reason: "throttle") }
         }
-        // Trailing-debounce path: one more heal once drops settle, then close
-        // the episode. Reset on every gap so it fires exactly once, at the tail.
-        healTask?.cancel()
-        healTask = Task { [weak self] in
-            try? await Task.sleep(nanoseconds: healDebounceNs)
-            guard let self, !Task.isCancelled else { return }
-            await self.performGapHeal(reason: "settle")
-            await self.endGapEpisode()
+        // Trailing-debounce path: start exactly ONE task per episode; it
+        // self-reschedules off `lastGapAt` (updated above) rather than being
+        // cancelled + recreated on every gap. Subsequent gaps only touch
+        // `lastGapAt`, so no Task allocation scales with the drop rate.
+        if healTask == nil {
+            healTask = Task { [weak self] in await self?.runTrailingDebounce() }
         }
+    }
+
+    private func runTrailingDebounce() async {
+        while true {
+            let remaining = healDebounceSeconds - Date().timeIntervalSince(lastGapAt)
+            guard remaining > 0 else { break }
+            try? await Task.sleep(nanoseconds: UInt64(remaining * 1_000_000_000))
+            if Task.isCancelled {
+                healTask = nil
+                return
+            }
+        }
+        // Clear before healing so a gap arriving during the async heal starts a
+        // fresh debounce task instead of being dropped.
+        healTask = nil
+        await performGapHeal(reason: "settle")
+        endGapEpisode()
     }
 
     private func endGapEpisode() {
@@ -454,9 +476,10 @@ actor RelayResizeCoalescer {
         // Update first so the throttle window advances even when there is no
         // size to nudge yet (avoids a tight retry loop before the first resize).
         lastHealAt = Date()
-        guard let size = lastSize else { return }
-        let shrunk = max(1, size.cols - 1)
-        guard shrunk != size.cols else { return }
+        // Need ≥2 columns to nudge (shrink by one, then restore). A 0/1-col size
+        // can't be nudged — and `size.cols - 1` on a UInt32 0 would trap (crash).
+        guard let size = lastSize, size.cols > 1 else { return }
+        let shrunk = size.cols - 1
         #if DEBUG
         dlog("peer.relay.gap.heal nudge redraw reason=\(reason) cols=\(size.cols) rows=\(size.rows)")
         #endif
@@ -1066,7 +1089,10 @@ final class PeerRelaySession {
                 // just the switch — a bare `break` inside the switch would keep
                 // looping and silently drop frames to a dead writer.
                 var endReason = "hostToRelay-loop-end"
-                var expectedByteSeq: UInt64 = 0
+                // nil until the first PtyData establishes the baseline — without
+                // this the initial frame (whose byte_seq may be the attach's
+                // non-zero initial_seq) reads as a spurious gap vs 0.
+                var expectedByteSeq: UInt64?
                 var gapBytesTotal: UInt64 = 0
                 var gapCount = 0
                 pumpLoop: while !Task.isCancelled {
@@ -1088,8 +1114,8 @@ final class PeerRelaySession {
                         // the previous frame means the host's broadcast dropped
                         // (Lagged) the bytes in between under load — the terminal
                         // is now truncated. Surface it here (heal = P9.2).
-                        if byteSeq > expectedByteSeq {
-                            let gap = byteSeq - expectedByteSeq
+                        if let expected = expectedByteSeq, byteSeq > expected {
+                            let gap = byteSeq - expected
                             gapBytesTotal += gap
                             gapCount += 1
                             #if DEBUG
