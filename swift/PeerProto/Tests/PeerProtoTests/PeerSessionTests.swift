@@ -174,6 +174,137 @@ actor MockHost {
     }
 }
 
+/// Drives the handshake plus the create → rename → delete → WorkspaceRemoved-push
+/// sequence for `testWorkspaceLifecycleRPCs` / `testCreateWorkspaceRejected`.
+/// Handshake steps are duplicated from `MockHost` rather than shared, since this
+/// host's post-handshake behavior (workspace-lifecycle RPCs) has nothing to do
+/// with `ListSurfaces`.
+actor LifecycleMockHost {
+    let transport: MockTransport
+    var pendingInbound = Data()
+    var seq: UInt64 = 0
+    let assignedWorkspaceID: Data
+    let createAccepted: Bool
+    let createRejectReason: String
+
+    private(set) var receivedCreateTitle: String?
+    private(set) var receivedRename: (workspaceID: Data, title: String)?
+    private(set) var receivedDeleteWorkspaceID: Data?
+
+    init(
+        transport: MockTransport,
+        assignedWorkspaceID: Data,
+        createAccepted: Bool = true,
+        createRejectReason: String = ""
+    ) {
+        self.transport = transport
+        self.assignedWorkspaceID = assignedWorkspaceID
+        self.createAccepted = createAccepted
+        self.createRejectReason = createRejectReason
+    }
+
+    func run() async throws {
+        // 1-5: same handshake as MockHost.run().
+        _ = try await readExpecting { env in
+            if case .hello = env.payload { return true } else { return false }
+        }
+        var hostHello = Termmesh_Peer_V1_Hello()
+        hostHello.protocolVersion = "1.0.0"
+        hostHello.displayName = "mock-host"
+        hostHello.peerID = Data(count: 16)
+        hostHello.appVersion = "test"
+        try await sendEnvelope { $0.hello = hostHello }
+
+        var challenge = Termmesh_Peer_V1_AuthChallenge()
+        challenge.nonce = Data(count: 32)
+        challenge.supportedMethods = ["ssh-passthrough"]
+        try await sendEnvelope { $0.authChallenge = challenge }
+
+        _ = try await readExpecting { env in
+            if case .auth = env.payload { return true } else { return false }
+        }
+        var result = Termmesh_Peer_V1_AuthResult()
+        result.accepted = true
+        result.sessionID = Data(count: 16)
+        try await sendEnvelope { $0.authResult = result }
+
+        // CreateWorkspaceRequest -> CreateWorkspaceResponse
+        let createEnv = try await readExpecting { env in
+            if case .createWorkspaceRequest = env.payload { return true } else { return false }
+        }
+        guard case .createWorkspaceRequest(let createReq) = createEnv.payload else {
+            throw PeerSessionError.unexpectedMessage("expected CreateWorkspaceRequest")
+        }
+        receivedCreateTitle = createReq.title
+        var resp = Termmesh_Peer_V1_CreateWorkspaceResponse()
+        resp.accepted = createAccepted
+        if createAccepted {
+            resp.workspaceID = assignedWorkspaceID
+        } else {
+            resp.reason = createRejectReason
+        }
+        try await sendEnvelope { $0.createWorkspaceResponse = resp }
+        guard createAccepted else { return }
+
+        // RenameWorkspaceRequest (fire-and-forget)
+        let renameEnv = try await readExpecting { env in
+            if case .renameWorkspaceRequest = env.payload { return true } else { return false }
+        }
+        guard case .renameWorkspaceRequest(let renameReq) = renameEnv.payload else {
+            throw PeerSessionError.unexpectedMessage("expected RenameWorkspaceRequest")
+        }
+        receivedRename = (renameReq.workspaceID, renameReq.title)
+
+        // DeleteWorkspaceRequest (fire-and-forget)
+        let deleteEnv = try await readExpecting { env in
+            if case .deleteWorkspaceRequest = env.payload { return true } else { return false }
+        }
+        guard case .deleteWorkspaceRequest(let deleteReq) = deleteEnv.payload else {
+            throw PeerSessionError.unexpectedMessage("expected DeleteWorkspaceRequest")
+        }
+        receivedDeleteWorkspaceID = deleteReq.workspaceID
+
+        // Push WorkspaceRemoved for the deleted workspace, as the real host does.
+        var removed = Termmesh_Peer_V1_WorkspaceRemoved()
+        removed.workspaceID = deleteReq.workspaceID
+        var update = Termmesh_Peer_V1_WorkspaceUpdate()
+        update.workspaceRemoved = removed
+        try await sendEnvelope { $0.workspaceUpdate = update }
+    }
+
+    private func nextSeq() -> UInt64 {
+        seq += 1
+        return seq
+    }
+
+    private func sendEnvelope(configure: (inout Termmesh_Peer_V1_Envelope) -> Void) async throws {
+        var env = Termmesh_Peer_V1_Envelope()
+        env.seq = nextSeq()
+        configure(&env)
+        let data = try encodeFrame(env)
+        await transport.serverWrite(data)
+    }
+
+    private func readFrame() async throws -> Termmesh_Peer_V1_Envelope {
+        while true {
+            if let env = try decodeFrame(from: &pendingInbound) {
+                return env
+            }
+            let chunk = await transport.serverRead()
+            if chunk.isEmpty { throw PeerSessionError.unexpectedEof }
+            pendingInbound.append(chunk)
+        }
+    }
+
+    private func readExpecting(_ match: (Termmesh_Peer_V1_Envelope) -> Bool) async throws -> Termmesh_Peer_V1_Envelope {
+        let env = try await readFrame()
+        if !match(env) {
+            throw PeerSessionError.unexpectedMessage(String(describing: env.payload))
+        }
+        return env
+    }
+}
+
 final class PeerSessionTests: XCTestCase {
     func testHandshakeAndListRoundTrip() async throws {
         let transport = MockTransport()
@@ -218,6 +349,75 @@ final class PeerSessionTests: XCTestCase {
         XCTAssertTrue(surfaces[0].attachable)
         XCTAssertEqual(surfaces[1].title, "bravo")
         XCTAssertFalse(surfaces[1].attachable)
+
+        try await hostTask.value
+    }
+
+    /// Round-trips the three workspace-lifecycle RPCs added for t5:
+    /// `createWorkspace` (response-waiting), `renameWorkspace` /
+    /// `deleteWorkspace` (fire-and-forget), and confirms the resulting
+    /// `WorkspaceUpdate.workspaceRemoved` push decodes to
+    /// `.workspaceRemoved(workspaceID:)` via `receiveNextMessage()`.
+    func testWorkspaceLifecycleRPCs() async throws {
+        let transport = MockTransport()
+        let assignedID = Data(repeating: 0xC1, count: 16)
+        let host = LifecycleMockHost(transport: transport, assignedWorkspaceID: assignedID)
+        let hostTask = Task { try await host.run() }
+
+        let session = PeerSession(
+            read: { await transport.clientRead() },
+            write: { await transport.clientWrite($0) }
+        )
+        _ = try await session.handshake()
+
+        let workspaceID = try await session.createWorkspace(title: "scratch")
+        XCTAssertEqual(workspaceID, assignedID)
+
+        try await session.renameWorkspace(workspaceID: workspaceID, title: "renamed")
+        try await session.deleteWorkspace(workspaceID: workspaceID)
+
+        let msg = try await session.receiveNextMessage()
+        guard case .workspaceRemoved(let removedID) = msg else {
+            XCTFail("expected .workspaceRemoved, got \(msg)")
+            return
+        }
+        XCTAssertEqual(removedID, workspaceID)
+
+        try await hostTask.value
+        let receivedCreateTitle = await host.receivedCreateTitle
+        XCTAssertEqual(receivedCreateTitle, "scratch")
+        let receivedRename = await host.receivedRename
+        XCTAssertEqual(receivedRename?.workspaceID, workspaceID)
+        XCTAssertEqual(receivedRename?.title, "renamed")
+        let receivedDeleteWorkspaceID = await host.receivedDeleteWorkspaceID
+        XCTAssertEqual(receivedDeleteWorkspaceID, workspaceID)
+    }
+
+    /// `createWorkspace` must surface a host rejection (`accepted == false`)
+    /// as `PeerSessionError.createWorkspaceRejected`, not silently return an
+    /// empty id.
+    func testCreateWorkspaceRejected() async throws {
+        let transport = MockTransport()
+        let host = LifecycleMockHost(
+            transport: transport,
+            assignedWorkspaceID: Data(),
+            createAccepted: false,
+            createRejectReason: "quota exceeded"
+        )
+        let hostTask = Task { try await host.run() }
+
+        let session = PeerSession(
+            read: { await transport.clientRead() },
+            write: { await transport.clientWrite($0) }
+        )
+        _ = try await session.handshake()
+
+        do {
+            _ = try await session.createWorkspace(title: "scratch")
+            XCTFail("expected createWorkspaceRejected")
+        } catch PeerSessionError.createWorkspaceRejected(let reason) {
+            XCTAssertEqual(reason, "quota exceeded")
+        }
 
         try await hostTask.value
     }

@@ -131,4 +131,61 @@ final class PeerWorkspaceMirrorTests: XCTestCase {
         XCTAssertTrue(mismatch)
         XCTAssertEqual(visited, 0)
     }
+
+    // MARK: - receiveLoopAction (t5: WorkspaceRemoved mirror routing)
+
+    func test_receiveLoopAction_appliesLayoutForOwnWorkspace() {
+        let hostID = Data([1])
+        let layout = leaf(1)
+        let action = PeerWorkspaceMirrorController.receiveLoopAction(
+            for: .workspaceLayoutChanged(workspaceID: hostID, layout: layout),
+            hostWorkspaceID: hostID
+        )
+        XCTAssertEqual(action, .applyLayout(layout))
+    }
+
+    func test_receiveLoopAction_ignoresLayoutForForeignWorkspace() {
+        let hostID = Data([1])
+        let action = PeerWorkspaceMirrorController.receiveLoopAction(
+            for: .workspaceLayoutChanged(workspaceID: Data([2]), layout: leaf(1)),
+            hostWorkspaceID: hostID
+        )
+        XCTAssertEqual(action, .ignore)
+    }
+
+    func test_receiveLoopAction_marksHostGoneForOwnWorkspaceRemoved() {
+        let hostID = Data([1])
+        let action = PeerWorkspaceMirrorController.receiveLoopAction(
+            for: .workspaceRemoved(workspaceID: hostID),
+            hostWorkspaceID: hostID
+        )
+        XCTAssertEqual(action, .hostGone)
+    }
+
+    func test_receiveLoopAction_ignoresForeignWorkspaceRemoved() {
+        // A DeleteWorkspaceRequest against some OTHER workspace on the same
+        // host must not tear down this mirror.
+        let hostID = Data([1])
+        let action = PeerWorkspaceMirrorController.receiveLoopAction(
+            for: .workspaceRemoved(workspaceID: Data([9])),
+            hostWorkspaceID: hostID
+        )
+        XCTAssertEqual(action, .ignore)
+    }
+
+    func test_receiveLoopAction_goodbyeIsAlwaysLost() {
+        let action = PeerWorkspaceMirrorController.receiveLoopAction(
+            for: .goodbye(reason: "bye"),
+            hostWorkspaceID: Data([1])
+        )
+        XCTAssertEqual(action, .lost(reason: "host closed connection: bye"))
+    }
+
+    func test_receiveLoopAction_ignoresOtherMessages() {
+        let action = PeerWorkspaceMirrorController.receiveLoopAction(
+            for: .other,
+            hostWorkspaceID: Data([1])
+        )
+        XCTAssertEqual(action, .ignore)
+    }
 }

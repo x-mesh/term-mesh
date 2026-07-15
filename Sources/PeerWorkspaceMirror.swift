@@ -117,10 +117,45 @@ final class PeerWorkspaceMirrorController {
         startReceiveLoop(session: session)
     }
 
+    /// Pure routing decision for one incoming message, keyed against the
+    /// workspace this controller mirrors. Extracted from the receive loop
+    /// below so `PeerWorkspaceMirrorTests` can exercise the branching
+    /// (including "foreign workspace removed is ignored") without a live
+    /// `PeerSession` + `Workspace` + AppKit stack.
+    enum ReceiveLoopAction: Equatable {
+        case applyLayout(Termmesh_Peer_V1_WorkspaceLayout)
+        /// Our own mirrored workspace was deleted on the host. Must NOT
+        /// route through `handleConnectionLost`/`reconnectLoop` — the
+        /// workspace is gone for good, so reconnecting would just
+        /// rediscover the same absence. Reuses the `markHostWorkspaceGone()`
+        /// path that `reconnectLoop`/`forceResync` already use for that
+        /// same "workspace not found" outcome.
+        case hostGone
+        case lost(reason: String)
+        case ignore
+    }
+
+    nonisolated static func receiveLoopAction(
+        for msg: PeerIncomingMessage,
+        hostWorkspaceID: Data
+    ) -> ReceiveLoopAction {
+        switch msg {
+        case .workspaceLayoutChanged(let wid, let layout) where wid == hostWorkspaceID:
+            return .applyLayout(layout)
+        case .workspaceRemoved(let wid) where wid == hostWorkspaceID:
+            return .hostGone
+        case .goodbye(let reason):
+            return .lost(reason: "host closed connection: \(reason)")
+        default:
+            return .ignore
+        }
+    }
+
     private func startReceiveLoop(session: PeerSession) {
         receiveTask?.cancel()
         receiveTask = Task { [weak self] in
             var lostReason: String?
+            var hostGone = false
             while let self, !Task.isCancelled, !self.isTornDown {
                 let msg: PeerIncomingMessage
                 do {
@@ -129,22 +164,27 @@ final class PeerWorkspaceMirrorController {
                     lostReason = String(describing: error)
                     break
                 }
-                switch msg {
-                case .workspaceLayoutChanged(let wid, let layout)
-                    where wid == self.hostWorkspaceID:
-                    self.scheduleApply(layout)
-                case .goodbye(let reason):
-                    lostReason = "host closed connection: \(reason)"
-                case .error(let code, let message):
+                if case .error(let code, let message) = msg {
                     #if DEBUG
                     dlog("peer.mirror.error code=\(code) msg=\(message)")
                     #endif
-                default:
+                }
+                switch Self.receiveLoopAction(for: msg, hostWorkspaceID: self.hostWorkspaceID) {
+                case .applyLayout(let layout):
+                    self.scheduleApply(layout)
+                case .hostGone:
+                    hostGone = true
+                case .lost(let reason):
+                    lostReason = reason
+                case .ignore:
                     break
                 }
-                if lostReason != nil { break }
+                if hostGone || lostReason != nil { break }
             }
-            if let self, let reason = lostReason, !self.isTornDown {
+            guard let self, !self.isTornDown else { return }
+            if hostGone {
+                self.markHostWorkspaceGone()
+            } else if let reason = lostReason {
                 self.handleConnectionLost(reason: reason)
             }
         }
