@@ -221,3 +221,152 @@ final class PeerWorkspaceMirrorTests: XCTestCase {
         XCTAssertEqual(action, .ignore)
     }
 }
+
+/// Deterministic coverage for the P9.2 gap heal in `RelayResizeCoalescer`.
+///
+/// The heal nudges the remote terminal size (shrink one column, then restore)
+/// so the host SIGWINCHes the child and it redraws state a broadcast-Lag drop
+/// truncated. Its two firing paths — a trailing debounce (one heal once a burst
+/// settles) and a maxWait throttle (periodic heals while drops stream with no
+/// lull, the slow-network case) — are impractical to verify through the flaky
+/// live workspace-mirror path, so they are exercised directly here. Each heal
+/// emits exactly two `Resize` frames: `cols-1` then `cols`.
+final class RelayResizeCoalescerHealTests: XCTestCase {
+
+    /// Accumulates the `cols` of every `Resize` frame the coalescer sends.
+    private actor ResizeColsCollector {
+        private var pending = Data()
+        private var collected: [UInt32] = []
+
+        func add(_ data: Data) {
+            pending.append(data)
+            while let env = try? decodeFrame(from: &pending) {
+                if case .resize(let r)? = env.payload {
+                    collected.append(r.cols)
+                }
+            }
+        }
+
+        func cols() -> [UInt32] { collected }
+    }
+
+    /// A `PeerSession` whose writes flow to `collector`; its read never
+    /// completes (the heal path only ever writes).
+    private func makeSession(_ collector: ResizeColsCollector) -> PeerSession {
+        PeerSession(
+            read: {
+                try await Task.sleep(nanoseconds: 3_600_000_000_000)
+                return Data()
+            },
+            write: { await collector.add($0) }
+        )
+    }
+
+    /// A single gap, then quiet: the trailing debounce must fire exactly one
+    /// heal — a `cols-1` → `cols` nudge — after the burst settles.
+    func testSettleDebounceNudgesOnceAfterBurstSettles() async throws {
+        let collector = ResizeColsCollector()
+        let session = makeSession(collector)
+        // Short debounce; throttle effectively disabled so ONLY the trailing
+        // debounce can fire.
+        let coalescer = RelayResizeCoalescer(
+            session: session,
+            surfaceID: Data(repeating: 0xC0, count: 16),
+            initialCols: 80,
+            initialRows: 24,
+            healDebounceMs: 40,
+            healMaxWaitSeconds: 1000
+        )
+
+        await coalescer.noteGapForHeal()
+        try await Task.sleep(nanoseconds: 300_000_000)  // well past the 40ms debounce
+
+        let cols = await collector.cols()
+        XCTAssertEqual(cols, [79, 80], "settle heal must nudge cols 79→80 exactly once")
+        await coalescer.cancel()
+    }
+
+    /// Continuous drops with no lull: the trailing debounce never gets to fire,
+    /// so the throttle must keep issuing periodic heals — the slow-network case
+    /// a single trailing debounce would otherwise miss entirely.
+    func testThrottleNudgesRepeatedlyUnderContinuousDrops() async throws {
+        let collector = ResizeColsCollector()
+        let session = makeSession(collector)
+        // Short throttle; debounce effectively disabled so the trailing path
+        // CANNOT fire during the test — every heal here is a throttle heal.
+        let coalescer = RelayResizeCoalescer(
+            session: session,
+            surfaceID: Data(repeating: 0xC1, count: 16),
+            initialCols: 80,
+            initialRows: 24,
+            healDebounceMs: 1_000_000,
+            healMaxWaitSeconds: 0.1
+        )
+
+        // Stream gaps every ~15ms for ~0.5s — never a 100ms lull.
+        let deadline = Date().addingTimeInterval(0.5)
+        while Date() < deadline {
+            await coalescer.noteGapForHeal()
+            try await Task.sleep(nanoseconds: 15_000_000)
+        }
+        try await Task.sleep(nanoseconds: 200_000_000)  // let the final throttle land
+
+        let cols = await collector.cols()
+        // ~0.5s at a 0.1s throttle → several heals, each a 2-frame nudge.
+        XCTAssertGreaterThanOrEqual(
+            cols.count, 4,
+            "throttle must fire repeatedly under continuous drops; got \(cols)"
+        )
+        XCTAssertEqual(cols.count % 2, 0, "heals come in resize pairs; got \(cols)")
+        for i in stride(from: 0, to: cols.count, by: 2) {
+            XCTAssertEqual(cols[i], 79, "nudge shrink frame; got \(cols)")
+            XCTAssertEqual(cols[i + 1], 80, "nudge restore frame; got \(cols)")
+        }
+        await coalescer.cancel()
+    }
+
+    /// No known size (nil seed) must not crash or emit a bogus resize — the
+    /// heal simply no-ops until a size is available.
+    func testHealNoOpsWithoutAKnownSize() async throws {
+        let collector = ResizeColsCollector()
+        let session = makeSession(collector)
+        let coalescer = RelayResizeCoalescer(
+            session: session,
+            surfaceID: Data(repeating: 0xC2, count: 16),
+            initialCols: 0,      // invalid → no seed
+            initialRows: 0,
+            healDebounceMs: 40,
+            healMaxWaitSeconds: 1000
+        )
+
+        await coalescer.noteGapForHeal()
+        try await Task.sleep(nanoseconds: 300_000_000)
+
+        let cols = await collector.cols()
+        XCTAssertTrue(cols.isEmpty, "no size known → no resize nudge; got \(cols)")
+        await coalescer.cancel()
+    }
+
+    /// Regression: a 0-column size (e.g. a transient 0-col resize from the
+    /// relay) must not trap `size.cols - 1` (UInt32 underflow) — the heal
+    /// simply no-ops. Test completing without a crash is half the assertion.
+    func testHealDoesNotCrashOnZeroColumnSize() async throws {
+        let collector = ResizeColsCollector()
+        let session = makeSession(collector)
+        let coalescer = RelayResizeCoalescer(
+            session: session,
+            surfaceID: Data(repeating: 0xC3, count: 16),
+            initialCols: 80,
+            initialRows: 24,
+            healDebounceMs: 40,
+            healMaxWaitSeconds: 1000
+        )
+        await coalescer.submit(cols: 0, rows: 24)  // 0-col size — must not trap the heal
+        await coalescer.noteGapForHeal()
+        try await Task.sleep(nanoseconds: 300_000_000)
+
+        let cols = await collector.cols()
+        XCTAssertFalse(cols.contains(79), "a 0-col size must produce no nudge; got \(cols)")
+        await coalescer.cancel()
+    }
+}

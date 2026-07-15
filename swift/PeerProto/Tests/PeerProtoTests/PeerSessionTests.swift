@@ -498,6 +498,77 @@ final class PeerSessionTests: XCTestCase {
         pongTask.cancel()
     }
 
+    /// Regression for the measured pane-close root cause: under a sustained
+    /// host→client output flood the pump loop is too backpressured to
+    /// *process* the Pong within `deadAfterSeconds`, yet the connection is
+    /// plainly alive — bytes keep arriving. The heartbeat must key liveness
+    /// off inbound bytes (`lastInboundAt`), not only processed Pongs, so it
+    /// does NOT false-positive as dead and close a healthy relay pane.
+    ///
+    /// Here the server replies to every Ping with a PtyData frame but NEVER a
+    /// Pong: `lastPongAt` goes stale past the deadline while inbound bytes
+    /// stay fresh. Before the fix this declared dead; after it, it stays alive.
+    func testHeartbeatStaysAliveWhileBytesFlowWithoutPong() async throws {
+        let transport = MockTransport()
+        let session = PeerSession(
+            read: { await transport.clientRead() },
+            write: { await transport.clientWrite($0) }
+        )
+
+        let floodTask = Task<Void, Never> {
+            var pending = Data()
+            var serverSeq: UInt64 = 0
+            let surfaceID = Data(repeating: 0xAB, count: 16)
+            while !Task.isCancelled {
+                let chunk = await transport.serverRead()
+                if chunk.isEmpty { break }
+                pending.append(chunk)
+                while let env = try? decodeFrame(from: &pending) {
+                    // Reply to each Ping with bytes (PtyData) but no Pong.
+                    if case .ping = env.payload {
+                        var reply = Termmesh_Peer_V1_Envelope()
+                        serverSeq += 1
+                        reply.seq = serverSeq
+                        var pty = Termmesh_Peer_V1_PtyData()
+                        pty.surfaceID = surfaceID
+                        pty.byteSeq = serverSeq * 8
+                        pty.payload = Data(repeating: 0x2E, count: 8)
+                        reply.ptyData = pty
+                        if let frame = try? encodeFrame(reply) {
+                            await transport.serverWrite(frame)
+                        }
+                    }
+                }
+            }
+        }
+
+        // Client drains frames so reads happen (refreshing lastInboundAt),
+        // but no Pong ever arrives so lastPongAt stays stale.
+        let drainTask = Task<Void, Never> {
+            while !Task.isCancelled {
+                _ = try? await session.receiveNextMessage()
+            }
+        }
+
+        let deadFlag = AsyncFlag()
+        await session.startHeartbeat(intervalSeconds: 0.05, deadAfterSeconds: 0.3) {
+            Task { await deadFlag.signal() }
+        }
+
+        // Wait well beyond deadAfterSeconds. Without the inbound-liveness fix
+        // the heartbeat would declare dead (no Pong ever); with it, the steady
+        // inbound bytes keep it alive.
+        let fired = await deadFlag.wait(timeoutSeconds: 1.0)
+        XCTAssertFalse(
+            fired,
+            "heartbeat must not declare dead while inbound bytes flow, even without a processed Pong"
+        )
+
+        await session.stopHeartbeat()
+        drainTask.cancel()
+        floodTask.cancel()
+    }
+
     /// P6: `onFirstMiss` must fire exactly once when a Pong is skipped for
     /// longer than one ping interval, and `onMissRecovered` must fire
     /// exactly once when Pongs resume — all without ever declaring the

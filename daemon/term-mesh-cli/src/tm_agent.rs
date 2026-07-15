@@ -842,6 +842,27 @@ enum PeerCommand {
         #[arg(long)]
         name: Option<String>,
     },
+    /// Benchmark peer-relay latency/throughput (P8 measurement harness).
+    ///
+    /// Point it at a forwarded `ssh -L` socket vs the host's real socket to
+    /// isolate the SSH tunnel's contribution. Not interactive — prints
+    /// metrics and exits. See docs/peer-p8-measurement.md.
+    Bench {
+        /// Path to the host's peer-federation unix socket.
+        socket: PathBuf,
+        /// Which measurements: rtt | wire | throughput | all.
+        #[arg(long, default_value = "all")]
+        mode: String,
+        /// Samples per latency mode (after 3 warmup samples).
+        #[arg(long, default_value_t = 30)]
+        iterations: usize,
+        /// Surface to attach to for rtt/throughput; defaults to the first.
+        #[arg(long)]
+        name: Option<String>,
+        /// Emit a single JSON line instead of a human table.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -4157,6 +4178,21 @@ fn main() {
             PeerCommand::Attach { socket, name } => {
                 if let Err(e) = peer::attach_cmd(socket, name.as_deref()) {
                     eprintln!("peer attach failed: {e:#}");
+                    process::exit(1);
+                }
+                return;
+            }
+            PeerCommand::Bench {
+                socket,
+                mode,
+                iterations,
+                name,
+                json,
+            } => {
+                if let Err(e) =
+                    peer::bench_cmd(socket, mode, *iterations, name.as_deref(), *json)
+                {
+                    eprintln!("peer bench failed: {e:#}");
                     process::exit(1);
                 }
                 return;

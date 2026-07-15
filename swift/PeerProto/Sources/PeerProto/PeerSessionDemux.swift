@@ -53,7 +53,25 @@ public actor PeerSessionDemux {
 
     private var continuations: [Data: AsyncStream<PeerPtyChunk>.Continuation] = [:]
 
+    /// Per-surface count of chunks dropped by the `bufferingNewest` policy
+    /// (a slow pane whose relay is backed up). This is an app-side
+    /// truncation source distinct from the host's broadcast `Lagged` drop;
+    /// surfacing it makes the "heavy output → content truncated" half of
+    /// the pane-close symptom measurable rather than silent.
+    private var droppedCount: [Data: Int] = [:]
+
+    /// Optional observer fired (rate-limited) when `route` drops a chunk.
+    /// The app module sets this to a `dlog` closure; the demux itself stays
+    /// logging-agnostic so it can live in the transport-only PeerProto lib.
+    private var onDrop: (@Sendable (_ surfaceID: Data, _ totalDropped: Int) -> Void)?
+
     public init() {}
+
+    /// Install the drop observer (see `onDrop`). Actor-isolated setter so
+    /// the app can wire a `dlog` closure without exposing mutable state.
+    public func setOnDrop(_ handler: @escaping @Sendable (_ surfaceID: Data, _ totalDropped: Int) -> Void) {
+        onDrop = handler
+    }
 
     /// Register a consumer for `surfaceID` and return its stream. Call
     /// this BEFORE issuing the AttachSurface RPC so the host's initial
@@ -82,7 +100,18 @@ public actor PeerSessionDemux {
     /// no consumer is (or is no longer) registered — a frame for a pane
     /// that detached is discarded here rather than leaking to a sibling.
     public func route(surfaceID: Data, byteSeq: UInt64, payload: Data) {
-        continuations[surfaceID]?.yield(PeerPtyChunk(byteSeq: byteSeq, payload: payload))
+        guard let continuation = continuations[surfaceID] else { return }
+        let result = continuation.yield(PeerPtyChunk(byteSeq: byteSeq, payload: payload))
+        // `.bufferingNewest(256)` returns `.dropped(evictedOldest)` when the
+        // consumer (this pane's hostToRelay pump) can't keep up. Count and
+        // report it — this is silent content loss otherwise.
+        if case .dropped = result {
+            let n = (droppedCount[surfaceID] ?? 0) + 1
+            droppedCount[surfaceID] = n
+            if n == 1 || n % 128 == 0 {
+                onDrop?(surfaceID, n)
+            }
+        }
     }
 
     /// Finish every stream (host went away / controller teardown) so all
