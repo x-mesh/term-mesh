@@ -35,7 +35,9 @@ struct ContentView: View {
     @Environment(\.daemonService) private var daemonService
     @Environment(\.configProvider) private var configProvider
     @Environment(\.browserHistoryService) private var browserHistory
-    @State private var sidebarWidth: CGFloat = 200
+    // Live width stays @State (avoids a defaults write per drag frame);
+    // the persisted value is read once here and committed on drag end.
+    @State private var sidebarWidth: CGFloat = SidebarLayoutSettings.loadWidth() ?? 200
     @State private var lastClampedWidth: CGFloat = 0
     @State private var hoveredResizerHandles: Set<SidebarResizerHandle> = []
     @State private var isResizerDragging = false
@@ -331,6 +333,9 @@ struct ContentView: View {
                         if isResizerDragging {
                             isResizerDragging = false
                             sidebarDragStartWidth = nil
+                            // Commit user intent only — transient window-resize
+                            // clamps never overwrite the saved width.
+                            SidebarLayoutSettings.saveWidth(sidebarWidth)
                         }
                         activateSidebarResizerCursor()
                         scheduleSidebarResizerCursorRelease()

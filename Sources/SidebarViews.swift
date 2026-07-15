@@ -27,6 +27,8 @@ struct VerticalTabsSidebar: View {
     @ObservedObject private var remoteHostStore = RemoteHostStore.shared
     @State private var draggedTabId: UUID?
     @State private var dropIndicator: SidebarDropIndicator?
+    @AppStorage(SidebarLayoutSettings.localTabsCollapsedKey)
+    private var localTabsCollapsed = false
 
     /// Space at top of sidebar for traffic light buttons
     private let trafficLightPadding: CGFloat = 28
@@ -41,23 +43,29 @@ struct VerticalTabsSidebar: View {
                         Spacer()
                             .frame(height: trafficLightPadding)
 
-                        LazyVStack(spacing: tabRowSpacing) {
-                            ForEach(Array(tabManager.tabs.enumerated()), id: \.element.id) { index, tab in
-                                TabItemView(
-                                    tab: tab,
-                                    index: index,
-                                    rowSpacing: tabRowSpacing,
-                                    selection: $selection,
-                                    selectedTabIds: $selectedTabIds,
-                                    lastSidebarSelectionIndex: $lastSidebarSelectionIndex,
-                                    showsCommandShortcutHints: commandKeyMonitor.isCommandPressed,
-                                    dragAutoScrollController: dragAutoScrollController,
-                                    draggedTabId: $draggedTabId,
-                                    dropIndicator: $dropIndicator
-                                )
+                        SidebarSectionHeader(title: "Workspaces", isCollapsed: $localTabsCollapsed)
+                            .padding(.top, 4)
+
+                        if !localTabsCollapsed {
+                            LazyVStack(spacing: tabRowSpacing) {
+                                ForEach(Array(tabManager.tabs.enumerated()), id: \.element.id) { index, tab in
+                                    TabItemView(
+                                        tab: tab,
+                                        index: index,
+                                        rowSpacing: tabRowSpacing,
+                                        selection: $selection,
+                                        selectedTabIds: $selectedTabIds,
+                                        lastSidebarSelectionIndex: $lastSidebarSelectionIndex,
+                                        showsCommandShortcutHints: commandKeyMonitor.isCommandPressed,
+                                        dragAutoScrollController: dragAutoScrollController,
+                                        draggedTabId: $draggedTabId,
+                                        dropIndicator: $dropIndicator
+                                    )
+                                }
                             }
+                            .padding(.bottom, 8)
+                            .padding(.top, 2)
                         }
-                        .padding(.vertical, 8)
 
                         SidebarRemoteHostsSection(store: remoteHostStore)
 
@@ -709,10 +717,82 @@ extension NSColor {
     }
 }
 
+// MARK: - Sidebar layout persistence
+
+/// Persisted sidebar layout state: width, section collapse, and per-host
+/// group collapse. Imperative UserDefaults helpers are used where a view
+/// needs the value at init time (width, per-key host folding); the two
+/// section flags are consumed directly via @AppStorage on the same keys.
+enum SidebarLayoutSettings {
+    static let widthKey = "sidebar.width"
+    static let localTabsCollapsedKey = "sidebar.section.localTabs.collapsed"
+    static let remoteHostsCollapsedKey = "sidebar.section.remoteHosts.collapsed"
+    static let collapsedHostKeysKey = "sidebar.remoteHost.collapsedKeys"
+
+    /// Last user-committed sidebar width (saved on drag end only, so
+    /// transient window-resize clamps never overwrite user intent).
+    /// nil when the user has never resized the sidebar.
+    static func loadWidth() -> CGFloat? {
+        let raw = UserDefaults.standard.double(forKey: widthKey)
+        return raw > 0 ? CGFloat(raw) : nil
+    }
+
+    static func saveWidth(_ width: CGFloat) {
+        UserDefaults.standard.set(Double(width), forKey: widthKey)
+    }
+
+    /// Collapsed host groups, stored as an array of stable host keys.
+    /// Default (expanded) needs no entry, so the list only holds hosts
+    /// the user explicitly folded — no per-launch key accumulation.
+    private static func collapsedHostKeys() -> Set<String> {
+        Set(UserDefaults.standard.stringArray(forKey: collapsedHostKeysKey) ?? [])
+    }
+
+    static func isHostCollapsed(_ hostKey: String) -> Bool {
+        collapsedHostKeys().contains(hostKey)
+    }
+
+    static func setHostCollapsed(_ hostKey: String, _ collapsed: Bool) {
+        var keys = collapsedHostKeys()
+        if collapsed { keys.insert(hostKey) } else { keys.remove(hostKey) }
+        UserDefaults.standard.set(Array(keys).sorted(), forKey: collapsedHostKeysKey)
+    }
+}
+
+/// Collapsible sidebar section header: chevron + caption title. The whole
+/// row toggles `isCollapsed`; persistence is the caller's @AppStorage.
+struct SidebarSectionHeader: View {
+    let title: String
+    @Binding var isCollapsed: Bool
+
+    var body: some View {
+        Button {
+            withAnimation(.easeInOut(duration: 0.15)) { isCollapsed.toggle() }
+        } label: {
+            HStack(spacing: 4) {
+                Image(systemName: "chevron.right")
+                    .font(.system(size: 8, weight: .semibold))
+                    .rotationEffect(.degrees(isCollapsed ? 0 : 90))
+                    .foregroundColor(Color.secondary.opacity(0.7))
+                Text(title)
+                    .font(.system(size: 10, weight: .semibold))
+                    .foregroundColor(.secondary)
+                Spacer(minLength: 0)
+            }
+            .padding(.horizontal, 16)
+            .padding(.vertical, 4)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+    }
+}
+
 // MARK: - Remote Hosts Sidebar
 
 struct SidebarRemoteHostsSection: View {
     @ObservedObject var store: RemoteHostStore
+    @AppStorage(SidebarLayoutSettings.remoteHostsCollapsedKey)
+    private var isCollapsed = false
 
     var body: some View {
         VStack(spacing: 0) {
@@ -721,22 +801,21 @@ struct SidebarRemoteHostsSection: View {
                 .padding(.top, 4)
                 .padding(.bottom, 2)
 
-            if store.sortedHosts.isEmpty {
-                VStack(alignment: .leading, spacing: 3) {
-                    Text("Remote Hosts")
-                        .font(.system(size: 10, weight: .semibold))
-                        .foregroundColor(.secondary)
+            SidebarSectionHeader(title: "Remote Hosts", isCollapsed: $isCollapsed)
+
+            if !isCollapsed {
+                if store.sortedHosts.isEmpty {
                     Text("Use Peer menu → Connect to Host…")
                         .font(.system(size: 10))
                         .foregroundColor(Color.secondary.opacity(0.6))
                         .fixedSize(horizontal: false, vertical: true)
-                }
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .padding(.horizontal, 16)
-                .padding(.vertical, 8)
-            } else {
-                ForEach(store.sortedHosts) { host in
-                    RemoteHostGroupView(host: host, store: store)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(.horizontal, 16)
+                        .padding(.vertical, 4)
+                } else {
+                    ForEach(store.sortedHosts) { host in
+                        RemoteHostGroupView(host: host, store: store)
+                    }
                 }
             }
         }
@@ -747,7 +826,14 @@ struct SidebarRemoteHostsSection: View {
 struct RemoteHostGroupView: View {
     let host: HostEntry
     let store: RemoteHostStore
-    @State private var isExpanded = true
+    @State private var isExpanded: Bool
+
+    init(host: HostEntry, store: RemoteHostStore) {
+        self.host = host
+        self.store = store
+        // Fold state persists per stable host key; default is expanded.
+        _isExpanded = State(initialValue: !SidebarLayoutSettings.isHostCollapsed(host.id))
+    }
 
     var body: some View {
         DisclosureGroup(isExpanded: $isExpanded) {
@@ -815,6 +901,9 @@ struct RemoteHostGroupView: View {
             }
         }
         .padding(.horizontal, 6)
+        .onChange(of: isExpanded) { newValue in
+            SidebarLayoutSettings.setHostCollapsed(host.id, !newValue)
+        }
     }
 }
 
