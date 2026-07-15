@@ -36,6 +36,10 @@ private typealias RelayFrame = (type: UInt8, payload: Data)
 struct PeerRelayConnection: Sendable {
     let hostSockPath: String
     let hostDisplayName: String
+    /// Negotiated during handshake (part of `connect()`, no extra round
+    /// trip). Callers gate optional RPCs (e.g. workspace CRUD) on this
+    /// rather than assuming every host build supports them.
+    let hostCapabilities: PeerCapabilities
     let session: PeerSession
     let transport: UnixSocketTransport
     let surfaces: [Termmesh_Peer_V1_SurfaceInfo]
@@ -485,6 +489,7 @@ final class PeerRelaySession {
         return PeerRelayConnection(
             hostSockPath: hostSockPath,
             hostDisplayName: connection.hostDisplayName,
+            hostCapabilities: connection.hostCapabilities,
             session: connection.session,
             transport: connection.transport,
             surfaces: surfaces
@@ -509,6 +514,7 @@ final class PeerRelaySession {
         return PeerRelayConnection(
             hostSockPath: hostSockPath,
             hostDisplayName: info.hostDisplayName,
+            hostCapabilities: info.hostCapabilities,
             session: session,
             transport: transport,
             surfaces: []

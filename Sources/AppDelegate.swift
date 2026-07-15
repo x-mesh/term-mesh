@@ -3,6 +3,7 @@ import SwiftUI
 import Bonsplit
 import CoreServices
 import UserNotifications
+import PeerProto
 import Sentry
 import WebKit
 import Combine
@@ -259,6 +260,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         // before a user opens a fresh relay window — otherwise stale
         // /tmp/tm-peer-relay-*.sock files accumulate indefinitely.
         PeerRelaySession.sweepStaleRelaySockets()
+
+        // Prime the peer identity keychain cache off-main: the first
+        // SecItemCopyMatching can stall for seconds on dev builds
+        // (securityd authorization), and it otherwise fires lazily as a
+        // handshake default argument — sometimes on the main actor.
+        DispatchQueue.global(qos: .utility).async {
+            PeerIdentity.warmUp()
+        }
 
         // Same idea for SSH tunnel listen sockets: a previous app
         // instance can leave /tmp/tm-peer-ssh-*.sock files (and even

@@ -732,6 +732,74 @@ extension TerminalController {
         ])
     }
 
+    /// Test-only: fire-and-forget headless remote-pane open (Phase 1
+    /// remote pane primitive). With no `sock_path`, brings the in-app
+    /// peer server up and loopback-mirrors one of this instance's own
+    /// surfaces. The async flow's outcome lands in
+    /// `debug.peer.pane_status`'s `last_open_result`, which the test
+    /// polls — the socket handler must not block on the attach.
+    func v2DebugPeerOpenRemotePane(params: [String: Any]) -> V2CallResult {
+        let sockPath = v2String(params, "sock_path")
+        if Thread.isMainThread {
+            MainActor.assumeIsolated {
+                PeerClientCoordinator.shared.debugOpenRemotePane(sockPath: sockPath)
+            }
+        } else {
+            DispatchQueue.main.async {
+                PeerClientCoordinator.shared.debugOpenRemotePane(sockPath: sockPath)
+            }
+        }
+        return .ok(["ok": true, "started": true])
+    }
+
+    /// Test-only: fire-and-forget headless workspace mirror (2A
+    /// snapshot by default; {live: true} for the 2B live mirror). Same
+    /// polling contract as open_remote_pane.
+    func v2DebugPeerOpenWorkspaceMirror(params: [String: Any]) -> V2CallResult {
+        let sockPath = v2String(params, "sock_path")
+        let live = (params["live"] as? Bool) ?? false
+        if Thread.isMainThread {
+            MainActor.assumeIsolated {
+                PeerClientCoordinator.shared.debugOpenWorkspaceMirror(sockPath: sockPath, live: live)
+            }
+        } else {
+            DispatchQueue.main.async {
+                PeerClientCoordinator.shared.debugOpenWorkspaceMirror(sockPath: sockPath, live: live)
+            }
+        }
+        return .ok(["ok": true, "started": true])
+    }
+
+    /// Test-only: live-mirror state snapshot (subscription health, leaf
+    /// count, shape hash) for e2e convergence assertions.
+    func v2DebugPeerMirrorStatus(params _: [String: Any]) -> V2CallResult {
+        var status: [String: Any] = [:]
+        let ok = v2MainExec(timeout: 5) {
+            MainActor.assumeIsolated {
+                status = PeerClientCoordinator.shared.debugMirrorStatus()
+            }
+        }
+        guard ok else {
+            return .err(code: "internal_error", message: "mirror status timed out", data: nil)
+        }
+        return .ok(["ok": true, "status": status])
+    }
+
+    /// Test-only: snapshot of remote-pane sessions + host-lease count
+    /// for e2e assertions (pane open landed, teardown released lease).
+    func v2DebugPeerPaneStatus(params _: [String: Any]) -> V2CallResult {
+        var status: [String: Any] = [:]
+        let ok = v2MainExec(timeout: 5) {
+            MainActor.assumeIsolated {
+                status = PeerClientCoordinator.shared.debugPaneStatus()
+            }
+        }
+        guard ok else {
+            return .err(code: "internal_error", message: "pane status timed out", data: nil)
+        }
+        return .ok(["ok": true, "status": status])
+    }
+
     /// Test-only: exercises the real `PtyDataCoalescer` (Phase P7) with
     /// synthetic, precisely-timed chunk submissions. `pumpByteStream`'s
     /// owning `PeerServerSession` actor is package-internal to PeerProto

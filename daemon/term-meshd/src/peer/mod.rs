@@ -8,6 +8,7 @@
 pub mod connection;
 pub mod framing;
 pub mod layout;
+pub mod persist;
 pub mod pty;
 pub mod query_filter;
 pub mod server;

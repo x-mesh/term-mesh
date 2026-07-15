@@ -21,45 +21,9 @@ import PeerProto
 /// forwarded to the remote host instead of triggering a local split.
 final class PeerRelayWorkspaceWindow: NSWindow {}
 
-@MainActor
-private final class PeerTitlebarGradientView: NSView {
-    private static let colors: [NSColor] = [
-        NSColor(srgbRed: 0.95, green: 0.45, blue: 0.55, alpha: 0.92),
-        NSColor(srgbRed: 0.55, green: 0.45, blue: 0.95, alpha: 0.92),
-        NSColor(srgbRed: 0.45, green: 0.55, blue: 0.95, alpha: 0.92),
-    ]
-
-    override var isOpaque: Bool { false }
-
-    override func draw(_ dirtyRect: NSRect) {
-        NSGradient(colors: Self.colors)?.draw(in: bounds, angle: 0)
-        NSColor.black.withAlphaComponent(0.14).setFill()
-        NSBezierPath(rect: NSRect(x: 0, y: 0, width: bounds.width, height: 1)).fill()
-    }
-
-    override func hitTest(_ point: NSPoint) -> NSView? { nil }
-}
-
-@MainActor
-extension NSWindow {
-    func installPeerTitlebarGradientAccent() {
-        titlebarAppearsTransparent = true
-
-        guard let titlebarView = standardWindowButton(.closeButton)?.superview else { return }
-
-        let identifier = NSUserInterfaceItemIdentifier("term-mesh.peer.titlebarGradientAccent")
-        if let existing = titlebarView.subviews.first(where: { $0.identifier == identifier }) {
-            existing.frame = titlebarView.bounds
-            existing.needsDisplay = true
-            return
-        }
-
-        let accent = PeerTitlebarGradientView(frame: titlebarView.bounds)
-        accent.identifier = identifier
-        accent.autoresizingMask = [.width, .height]
-        titlebarView.addSubview(accent, positioned: .below, relativeTo: nil)
-    }
-}
+// PeerTitlebarGradientView + installPeerTitlebarGradientAccent moved to
+// PeerTitlebarAccent.swift (parameterized by host color so the main
+// window can share the accent for focused remote panes).
 
 /// Minimum extent (pt) for any pane inside a peer-workspace split, so a
 /// divider drag (or a remote layout pushing a near-edge ratio) can never
@@ -224,6 +188,11 @@ struct PeerRelayConnectionInfo: Sendable {
     /// SSH target if the relay was opened over an `ssh -L` tunnel,
     /// otherwise nil (direct Unix-socket connection).
     let sshTarget: String?
+    /// Remote (host-side) socket path when reached over SSH; nil for direct.
+    /// Paired with `sshTarget` so the sidebar can re-derive an `.ssh` spec
+    /// that owns its own tunnel instead of borrowing this connection's
+    /// reconnect-ephemeral local socket.
+    let remoteSockPath: String?
     let targetTitle: String
     let connectedAt: Date
 
@@ -282,6 +251,7 @@ final class PeerRelayWorkspaceWindowController: NSWindowController, NSWindowDele
             hostSockPath: hostSockPath,
             hostDisplayName: hostDisplayName,
             sshTarget: sshTunnel?.sshTarget,
+            remoteSockPath: sshTunnel?.remoteSockPath,
             targetTitle: workspaceTitle,
             connectedAt: connectedAt
         )
@@ -1447,7 +1417,7 @@ final class PeerRelayWorkspaceWindowController: NSWindowController, NSWindowDele
 
     private func sendDividerUpdate(splitID: Data, ratio: Double) async {
         guard let session = subscriptionSession else { return }
-        try? await session.requestSetDivider(splitID: splitID, ratio: ratio)
+        try? await session.requestSetDivider(workspaceID: workspaceID, splitID: splitID, ratio: ratio)
     }
 
     /// Recursively builds an NSView hierarchy from a layout proto,

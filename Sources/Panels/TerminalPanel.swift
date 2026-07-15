@@ -25,6 +25,16 @@ final class TerminalPanel: Panel, ObservableObject {
     /// Agent session ID bound to this panel (F-06). nil = plain terminal.
     var agentSessionId: String?
 
+    /// Remote peer session when this pane hosts a remote surface
+    /// (Phase 1 remote pane primitive). The panel owns the session:
+    /// `close()` tears it down, releasing the shared host lease.
+    /// nil = local terminal.
+    var peerPaneSession: PeerPaneSession?
+
+    /// Host identity for visual signals (titlebar tint, pane strip,
+    /// tab chip). nil = local pane.
+    var remoteHostKey: PeerPaneHostKey? { peerPaneSession?.lease.key }
+
     /// Injected daemon service (defaults to singleton for backward compatibility).
     var daemon: any DaemonService = TermMeshDaemon.shared
 
@@ -154,6 +164,11 @@ final class TerminalPanel: Panel, ObservableObject {
     }
 
     func close() {
+        // Remote pane: stop the relay session and release the shared
+        // host lease (the last pane on a host stops its SSH tunnel).
+        // Must precede the surface close so the relay binary's exit is
+        // an orderly teardown, not a broken-pipe surprise.
+        peerPaneSession?.teardown()
         // Terminate agent session if bound (kills agent process + unbinds panel)
         if let sessionId = agentSessionId {
             DispatchQueue.global(qos: .utility).async {

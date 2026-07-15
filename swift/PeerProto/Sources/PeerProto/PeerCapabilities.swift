@@ -18,11 +18,17 @@ public enum PeerCapability {
     public static let ptyDataCoalesceV1 = "ptydata.coalesce.v1"
     /// Attach-time ANSI-preserving raw-byte replay ring (P4).
     public static let replayRingV1 = "replay.ring.v1"
+    /// The host supports workspace-level lifecycle RPCs:
+    /// `CreateWorkspaceRequest`/`Response`, `RenameWorkspaceRequest`,
+    /// `DeleteWorkspaceRequest`, and the `WorkspaceRemoved` push (see
+    /// `proto/peer/v1/peer.proto`'s "Workspace lifecycle" section).
+    /// Mirrors `WORKSPACE_LIFECYCLE_V1` on the Rust side.
+    public static let workspaceLifecycleV1 = "workspace.lifecycle.v1"
 
     /// Every capability this build supports. Single source of truth for
     /// populating outgoing `Hello.capabilities` — don't hand-roll the list
     /// at each call site.
-    public static let supported: [String] = [ptyDataCoalesceV1, replayRingV1]
+    public static let supported: [String] = [ptyDataCoalesceV1, replayRingV1, workspaceLifecycleV1]
 }
 
 /// The other side's advertised feature flags, parsed once out of its

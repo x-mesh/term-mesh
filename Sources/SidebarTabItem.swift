@@ -125,7 +125,7 @@ struct TabItemView: View {
     }
 
     private var showsLeadingRail: Bool {
-        explicitRailColor != nil
+        explicitRailColor != nil || peerRailColor != nil
     }
 
     private var activeBorderLineWidth: CGFloat {
@@ -661,15 +661,27 @@ struct TabItemView: View {
         }
     }
 
+    /// Host-accent colors when this row is a live peer-mirror workspace;
+    /// nil for local workspaces. Decision (2026-07-15): the peer signal
+    /// lives on the sidebar row (selected = host-accent gradient,
+    /// unselected = accent rail), not on the main-window titlebar. The
+    /// sidebar palette never hashes onto the purple family, which is the
+    /// local selected-row gradient below.
+    private var peerAccentNSColors: [NSColor]? {
+        guard let mirror = tab.peerMirror else { return nil }
+        return PeerHostAccent.colors(for: mirror.lease.key)
+    }
+
     private var activeTabGradientOrColor: AnyShapeStyle {
         if isActive && resolvedCustomTabColor == nil {
+            let colors = peerAccentNSColors?.map { Color(nsColor: $0) } ?? [
+                Color(red: 0.95, green: 0.45, blue: 0.55),  // soft pink
+                Color(red: 0.55, green: 0.45, blue: 0.95),  // soft purple
+                Color(red: 0.45, green: 0.55, blue: 0.95),  // soft blue
+            ]
             return AnyShapeStyle(
                 LinearGradient(
-                    colors: [
-                        Color(red: 0.95, green: 0.45, blue: 0.55),  // soft pink
-                        Color(red: 0.55, green: 0.45, blue: 0.95),  // soft purple
-                        Color(red: 0.45, green: 0.55, blue: 0.95),  // soft blue
-                    ],
+                    colors: colors,
                     startPoint: .leading,
                     endPoint: .trailing
                 )
@@ -678,8 +690,16 @@ struct TabItemView: View {
         return AnyShapeStyle(backgroundColor)
     }
 
+    /// Unselected peer-mirror rows keep an always-on accent rail so the
+    /// host identity reads without selecting the row.
+    private var peerRailColor: Color? {
+        guard !isActive, let colors = peerAccentNSColors, let first = colors.first
+        else { return nil }
+        return Color(nsColor: first).opacity(0.9)
+    }
+
     private var railColor: Color {
-        explicitRailColor ?? .clear
+        explicitRailColor ?? peerRailColor ?? .clear
     }
 
     private var explicitRailColor: Color? {

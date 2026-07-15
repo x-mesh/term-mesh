@@ -32,16 +32,6 @@ enum PeerMenu {
         return item
     }
 
-    static func relayItem() -> NSMenuItem {
-        let item = NSMenuItem(
-            title: "Connect to Peer via Ghostty Relay…",
-            action: #selector(PeerClientCoordinator.promptAndRunRelay(_:)),
-            keyEquivalent: ""
-        )
-        item.target = PeerClientCoordinator.shared
-        return item
-    }
-
     static func relayWorkspaceItem() -> NSMenuItem {
         let item = NSMenuItem(
             title: "Connect to Peer Workspace via Ghostty Relay…",
@@ -52,10 +42,12 @@ enum PeerMenu {
         return item
     }
 
-    static func relayWorkspaceSSHItem() -> NSMenuItem {
+    /// The sidebar-first replacement for the legacy SSH connect dialog:
+    /// opens the saved-host editor sheet in the main window's sidebar.
+    static func addRemoteHostItem() -> NSMenuItem {
         let item = NSMenuItem(
-            title: "Connect to Remote Peer Workspace (SSH)…",
-            action: #selector(PeerClientCoordinator.promptAndRunRelayWorkspaceSSH(_:)),
+            title: "Add Peer Host…",
+            action: #selector(PeerClientCoordinator.addRemoteHost(_:)),
             keyEquivalent: ""
         )
         item.target = PeerClientCoordinator.shared
@@ -71,6 +63,7 @@ enum PeerMenu {
         item.target = PeerClientCoordinator.shared
         return item
     }
+
 }
 
 @MainActor
@@ -120,7 +113,9 @@ final class PeerClientCoordinator: NSObject {
     func activeConnections() -> [PeerRelayConnectionInfo] {
         let infos = (openConsoles.map { $0.connectionInfo }
             + openRelays.map { $0.connectionInfo }
-            + openWorkspaceRelays.map { $0.connectionInfo })
+            + openWorkspaceRelays.map { $0.connectionInfo }
+            + openPaneSessions.map { $0.connectionInfo }
+            + openWorkspaceMirrors.map { $0.connectionInfo })
             .sorted { $0.connectedAt < $1.connectedAt }
 #if DEBUG
         dlog("peer.connections.active count=\(infos.count) consoles=\(openConsoles.count) relays=\(openRelays.count) workspaces=\(openWorkspaceRelays.count)")
@@ -145,7 +140,73 @@ final class PeerClientCoordinator: NSObject {
         }
         if let ctrl = openConsoles.first(where: { ObjectIdentifier($0) == id }) {
             ctrl.window?.performClose(nil)
+            return
         }
+        if let session = openPaneSessions.first(where: { ObjectIdentifier($0) == id }) {
+            // Prefer closing the hosting pane (which tears the session
+            // down through TerminalPanel.close()); fall back to a bare
+            // teardown when the pane hook is gone.
+            if let closePane = session.requestPaneClose {
+                closePane()
+            } else {
+                session.teardown()
+            }
+            return
+        }
+        if let mirror = openWorkspaceMirrors.first(where: { ObjectIdentifier($0) == id }) {
+            // Closing the workspace tab tears everything down through
+            // TabManager.closeWorkspace → panel closes + mirror teardown.
+            if let workspace = mirror.workspace,
+               let tabManager = AppDelegate.shared?.tabManager
+            {
+                tabManager.closeWorkspace(workspace)
+            } else {
+                mirror.teardown()
+            }
+        }
+    }
+
+    // MARK: - Remote pane roster (Phase 1 remote pane primitive)
+
+    /// Main-window remote panes, kept in the same roster that feeds the
+    /// Connections panel and the sidebar's Remote Hosts section. Strong
+    /// references are safe: `PeerPaneSession.teardown()` always
+    /// deregisters, and the hosting TerminalPanel always tears down on
+    /// close.
+    private var openPaneSessions: [PeerPaneSession] = []
+
+    func registerPaneSession(_ session: PeerPaneSession) {
+        guard !openPaneSessions.contains(where: { $0 === session }) else { return }
+        openPaneSessions.append(session)
+        postRelaysChanged()
+    }
+
+    func deregisterPaneSession(_ session: PeerPaneSession) {
+        let before = openPaneSessions.count
+        openPaneSessions.removeAll { $0 === session }
+        guard openPaneSessions.count != before else { return }
+        postRelaysChanged()
+    }
+
+    // MARK: - Live workspace mirrors (Phase 2B)
+
+    private var openWorkspaceMirrors: [PeerWorkspaceMirrorController] = []
+
+    func registerWorkspaceMirror(_ mirror: PeerWorkspaceMirrorController) {
+        guard !openWorkspaceMirrors.contains(where: { $0 === mirror }) else { return }
+        openWorkspaceMirrors.append(mirror)
+        postRelaysChanged()
+    }
+
+    func deregisterWorkspaceMirror(_ mirror: PeerWorkspaceMirrorController) {
+        let before = openWorkspaceMirrors.count
+        openWorkspaceMirrors.removeAll { $0 === mirror }
+        guard openWorkspaceMirrors.count != before else { return }
+        postRelaysChanged()
+    }
+
+    func workspaceMirror(forWorkspaceId id: UUID) -> PeerWorkspaceMirrorController? {
+        openWorkspaceMirrors.first { $0.workspace?.id == id }
     }
 
     fileprivate func postRelaysChanged() {
@@ -169,6 +230,22 @@ final class PeerClientCoordinator: NSObject {
 
     private func finishConnectionFlow(_ flow: ConnectionFlow) {
         activeConnectionFlows.remove(flow)
+    }
+
+    /// Posted by menu entries that want the saved-host editor; the
+    /// sidebar's Remote Hosts section listens and presents its sheet.
+    static let addRemoteHostRequestedNotification =
+        Notification.Name("PeerAddRemoteHostRequested")
+
+    /// Menu-bar / main-menu entry point for adding a saved host. The
+    /// editor sheet lives in the main window's sidebar, so activate the
+    /// app first (explicit user intent from a menu — not a socket
+    /// command, so the focus policy allows it).
+    @objc func addRemoteHost(_ sender: Any?) {
+        NSApp.activate(ignoringOtherApps: true)
+        NotificationCenter.default.post(
+            name: Self.addRemoteHostRequestedNotification, object: nil
+        )
     }
 
     @objc func showConnections(_ sender: Any?) {
@@ -198,139 +275,33 @@ final class PeerClientCoordinator: NSObject {
         postRelaysChanged()
     }
 
-    @objc func promptAndRunRelayWorkspaceSSH(_ sender: Any?) {
-        Task { @MainActor in
-            await self.promptAndRunRelayWorkspaceSSHAsync()
-        }
-    }
-
+    /// Shared tail of the SSH workspace-relay connect flow — optional
+    /// socket auto-detect, tunnel bring-up, recent-host bookkeeping,
+    /// workspace relay window. The legacy connect dialog is gone
+    /// (sidebar-first UX); kept for programmatic callers and future
+    /// sidebar "open in relay window against a fresh tunnel" flows.
+    /// `remote` may be empty: the socket path is then resolved on the
+    /// remote host via `PeerSocketProber`.
     @MainActor
-    private func promptAndRunRelayWorkspaceSSHAsync() async {
-        let alert = NSAlert()
-        alert.messageText = "Connect to Remote Peer Workspace via SSH"
-        alert.informativeText = "Tunnels the host's peer socket through `ssh -L`. Pick a host advertised on this LAN, or type an SSH target (user@host or ssh-config alias) and the path of the remote peer server's Unix socket."
-
-        let stack = NSStackView(frame: NSRect(x: 0, y: 0, width: 380, height: 60))
-        stack.orientation = .vertical
-        stack.alignment = .leading
-        stack.spacing = 4
-
-        // Recent hosts (most recently successful connect bubbles to
-        // the top). Pick fills target + remote fields.
-        let recentLabel = NSTextField(labelWithString: "Recent:")
-        let recentPopup = NSPopUpButton(
-            frame: NSRect(x: 0, y: 0, width: 380, height: 26),
-            pullsDown: false
-        )
-        let recents = PeerFederationSettings.loadRecentHosts()
-        let recentMenu = NSMenu()
-        recentMenu.addItem(withTitle: recents.isEmpty ? "(no recent hosts)" : "(pick a recent host…)",
-                           action: nil, keyEquivalent: "")
-        for r in recents {
-            let title = Self.menuSafeTitle("\(r.sshTarget)  ·  \(r.remoteSocket)", maxLength: 110)
-            recentMenu.addItem(withTitle: title, action: nil, keyEquivalent: "")
-        }
-        recentPopup.menu = recentMenu
-
-        // Bonjour-discovered hosts populate this popup live; selecting
-        // one autofills the SSH target / remote socket fields.
-        let discoveredLabel = NSTextField(labelWithString: "Discovered on LAN:")
-        let discoveredPopup = NSPopUpButton(
-            frame: NSRect(x: 0, y: 0, width: 380, height: 26),
-            pullsDown: false
-        )
-        discoveredPopup.menu?.addItem(withTitle: "(searching…)", action: nil, keyEquivalent: "")
-
-        let targetLabel = NSTextField(labelWithString: "SSH target (user@host):")
-        let targetField = NSTextField(frame: NSRect(x: 0, y: 0, width: 380, height: 24))
-        targetField.placeholderString = "user@mac-mini.local"
-        let remoteLabel = NSTextField(labelWithString: "Remote peer socket:")
-        let remoteField = NSTextField(frame: NSRect(x: 0, y: 0, width: 380, height: 24))
-        // Pre-fill with this machine's *effective* socketPath (the
-        // value stored in UserDefaults when the user has overridden
-        // it; otherwise the per-uid default). When the remote side is
-        // the same user on a similarly-configured Mac, this will be
-        // the correct remote path; the user can still edit it.
-        remoteField.stringValue = PeerHostCoordinator.shared.currentSocketPath
-            ?? PeerFederationSettings.socketPath
-
-        // Pre-fill from the most recent host so a re-connect is
-        // one-keystroke (Cmd+T → Cmd+Return).
-        if let mostRecent = recents.first {
-            targetField.stringValue = mostRecent.sshTarget
-            remoteField.stringValue = mostRecent.remoteSocket
-        }
-
-        let arranged: [NSView] = [
-            recentLabel, recentPopup,
-            discoveredLabel, discoveredPopup,
-            targetLabel, targetField,
-            remoteLabel, remoteField,
-        ]
-        for v in arranged {
-            stack.addArrangedSubview(v)
-        }
-        stack.frame = NSRect(x: 0, y: 0, width: 380, height: 230)
-        alert.accessoryView = stack
-        alert.addButton(withTitle: "Connect")
-        alert.addButton(withTitle: "Cancel")
-
-        // Live Bonjour browse: rebuild the popup as services arrive
-        // and resolve. Strong ref kept until the dialog closes.
-        var discoveredPeers: [DiscoveredPeer] = []
-        let browser = PeerBonjourBrowser()
-        browser.start { peers in
-            discoveredPeers = peers
-            let menu = discoveredPopup.menu ?? NSMenu()
-            menu.removeAllItems()
-            if peers.isEmpty {
-                menu.addItem(withTitle: "(no LAN hosts found)", action: nil, keyEquivalent: "")
-            } else {
-                menu.addItem(withTitle: "(pick a host…)", action: nil, keyEquivalent: "")
-                for p in peers {
-                    let label = "\(p.serviceName)  ·  \(p.hostname)\(p.socketPath.map { "  ·  \($0)" } ?? "")"
-                    menu.addItem(withTitle: Self.menuSafeTitle(label, maxLength: 110),
-                                 action: nil, keyEquivalent: "")
-                }
-            }
-            discoveredPopup.menu = menu
-        }
-        // Adapter target so the popup's action stays @objc-compatible.
-        let proxy = SSHDialogPopupProxy(
-            popup: discoveredPopup,
-            target: targetField,
-            remote: remoteField,
-            peersProvider: { discoveredPeers }
-        )
-        discoveredPopup.target = proxy
-        discoveredPopup.action = #selector(SSHDialogPopupProxy.didPick(_:))
-
-        let recentProxy = RecentHostPopupProxy(
-            popup: recentPopup,
-            target: targetField,
-            remote: remoteField,
-            recents: recents
-        )
-        recentPopup.target = recentProxy
-        recentPopup.action = #selector(RecentHostPopupProxy.didPick(_:))
-
-        defer { browser.stop(); _ = proxy; _ = recentProxy } // tear down after modal dismissal
-
-        let resp = await Self.runModalAsSheet(alert)
-        guard resp == .alertFirstButtonReturn else { return }
-        let target = targetField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
-        let remote = remoteField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !target.isEmpty, !remote.isEmpty else {
-            self.showAlert(
-                title: "Peer Socket Required",
-                body: "Enter both an SSH target and the remote peer socket path."
-            )
-            return
-        }
-
+    private func connectWorkspaceSSH(target: String, remote: String) async {
+        // Keyed by target + remote-as-typed; an empty remote still dedupes
+        // concurrent auto-detect submissions for the same target.
         let flow = ConnectionFlow.workspaceSSH(target: target, remote: remote)
         guard beginConnectionFlow(flow) else { return }
         defer { finishConnectionFlow(flow) }
+
+        var remote = remote
+        if remote.isEmpty {
+            do {
+                remote = try await PeerSocketProber.probe(sshTarget: target)
+            } catch {
+                self.showAlert(
+                    title: "Socket Auto-Detect Failed",
+                    body: Self.probeFailureBody(error, target: target)
+                )
+                return
+            }
+        }
 
         let tunnel = PeerSSHTunnel(
             sshTarget: target,
@@ -346,16 +317,737 @@ final class PeerClientCoordinator: NSObject {
                            body: String(describing: error))
             return
         }
-        // Tunnel is up — remember the host so the next connect
-        // dialog has it ready in the recent picker.
+        // Tunnel is up — remember the host (with the *resolved* socket
+        // path) so the next connect dialog and the recent-hosts menu
+        // have it ready.
         PeerFederationSettings.rememberRecentHost(
             .init(sshTarget: target, remoteSocket: remote)
+        )
+        PeerHostProfileStore.shared.recordConnection(
+            sshTarget: target, resolvedSocket: remote
         )
         await self.openWorkspaceRelay(
             hostSockPath: tunnel.localSockPath,
             titleSuffix: " · \(target)",
             tunnel: tunnel
         )
+    }
+
+    // MARK: - Remote pane flow (Phase 1 remote pane primitive)
+
+    /// SSH variant of the pane flow: resolve the socket (auto-detect
+    /// when the field was empty), lease the host (shared tunnel), then
+    /// open one chosen surface as a pane in the current workspace.
+    private func connectRemotePaneSSH(target: String, remote: String) async {
+        let flow = ConnectionFlow.workspaceSSH(target: target, remote: remote)
+        guard beginConnectionFlow(flow) else { return }
+        defer { finishConnectionFlow(flow) }
+
+        var remote = remote
+        if remote.isEmpty {
+            do {
+                remote = try await PeerSocketProber.probe(sshTarget: target)
+            } catch {
+                self.showAlert(
+                    title: "Socket Auto-Detect Failed",
+                    body: Self.probeFailureBody(error, target: target)
+                )
+                return
+            }
+        }
+        let opened = await openRemotePaneFlow(
+            spec: .ssh(target: target, remoteSockPath: remote, port: nil, identityFile: nil)
+        )
+        if opened {
+            PeerFederationSettings.rememberRecentHost(
+                .init(sshTarget: target, remoteSocket: remote)
+            )
+            PeerHostProfileStore.shared.recordConnection(
+                sshTarget: target, resolvedSocket: remote
+            )
+        }
+    }
+
+    /// Sidebar entry — open a chosen surface as a pane in the current
+    /// workspace using an explicit host spec. SSH hosts pass `.ssh(...)`
+    /// so the pane leases its own tunnel and survives the origin relay
+    /// closing plus reconnects (the tunnel's ephemeral local socket is
+    /// re-derived per reconnect); direct hosts pass `.direct(...)` and
+    /// still ride the shared live socket.
+    func openRemotePane(spec: PeerPaneHostSpec) async {
+        await openRemotePaneFlow(spec: spec)
+    }
+
+    /// Shared tail: lease → list surfaces → pick → attach → split into
+    /// the current workspace. Returns true when a pane actually opened.
+    /// Balances the browse ref on every exit; an attached pane holds its
+    /// own lease ref until teardown.
+    @discardableResult
+    private func openRemotePaneFlow(spec: PeerPaneHostSpec) async -> Bool {
+        let lease: PeerPaneHostLease
+        do {
+            lease = try await PeerPaneHostRegistry.shared.acquire(spec)
+        } catch {
+            self.showAlert(title: "Peer Connection Failed", body: String(describing: error))
+            return false
+        }
+        let registry = PeerPaneHostRegistry.shared
+
+        let surfaces: [Termmesh_Peer_V1_SurfaceInfo]
+        do {
+            surfaces = try await PeerPaneSession.listSurfaces(on: lease)
+        } catch {
+            registry.release(lease)
+            self.showAlert(title: "Surface List Failed", body: String(describing: error))
+            return false
+        }
+        let attachable = surfaces.filter { $0.attachable }
+        guard !attachable.isEmpty else {
+            registry.release(lease)
+            self.showAlert(
+                title: "No Attachable Surfaces",
+                body: "The host reports no surfaces that allow per-surface attach."
+            )
+            return false
+        }
+
+        let chosen: Termmesh_Peer_V1_SurfaceInfo?
+        if attachable.count == 1 {
+            chosen = attachable[0]
+        } else {
+            chosen = await promptForSurfaceSelection(from: attachable)
+        }
+        guard let chosen else {
+            registry.release(lease)
+            return false
+        }
+
+        guard let workspace = Self.currentWorkspaceForPaneOpen() else {
+            registry.release(lease)
+            self.showAlert(
+                title: "No Active Workspace",
+                body: "Open a terminal workspace first, then add the remote pane."
+            )
+            return false
+        }
+
+        let session: PeerPaneSession
+        do {
+            session = try await PeerPaneSession.attach(
+                lease: lease,
+                surface: chosen,
+                title: chosen.title.isEmpty ? chosen.workspaceName : chosen.title,
+                spec: spec
+            )
+        } catch {
+            registry.release(lease)
+            self.showAlert(title: "Attach Failed", body: String(describing: error))
+            return false
+        }
+        // Browse ref done — the pane session holds its own ref now.
+        registry.release(lease)
+
+        guard workspace.openRemotePane(session: session) != nil else {
+            session.teardown()
+            self.showAlert(
+                title: "Pane Open Failed",
+                body: "No focused terminal pane to split from in the current workspace."
+            )
+            return false
+        }
+        return true
+    }
+
+    private static func currentWorkspaceForPaneOpen() -> Workspace? {
+        // NSApp.delegate is the SwiftUI adaptor shim, not our type —
+        // AppDelegate.shared is the canonical accessor.
+        AppDelegate.shared?.tabManager?.selectedWorkspace
+    }
+
+    // MARK: - Remote workspace mirror (Phase 2A — snapshot placement)
+
+    /// Mirror opens currently in flight, keyed by host key description —
+    /// a double click must not materialize two copies.
+    private var mirrorOpensInFlight: Set<String> = []
+
+    /// Open a host workspace as a NEW main-window workspace: read its
+    /// split tree once and materialize one Phase-1 remote pane per leaf
+    /// in the same shape (orientation + divider ratios). Layout is
+    /// local-owned afterwards — this is the snapshot model; live
+    /// host↔local layout sync is Phase 2B.
+    func openRemoteWorkspaceMirror(
+        spec: PeerPaneHostSpec,
+        workspaceID: Data?,
+        pickFirstWithoutPrompt: Bool = false,
+        live: Bool = true
+    ) async {
+        // Live-mirror dedupe: a second live mirror of the same host
+        // workspace is meaningless (both would be host-authoritative
+        // copies), so re-clicking the sidebar row focuses the existing
+        // mirror tab instead of materializing another one. Sidebar click
+        // is explicit user focus intent, so selecting here respects the
+        // socket focus policy.
+        if live, let workspaceID,
+           let existing = openWorkspaceMirrors.first(where: {
+               !$0.isTornDown
+                   && $0.lease.key == spec.hostKey
+                   && $0.hostWorkspaceID == workspaceID
+           }),
+           let mirrorWorkspace = existing.workspace {
+            AppDelegate.shared?.tabManager?.selectWorkspace(mirrorWorkspace)
+            #if DEBUG
+            dlog("peer.mirror.dedupe focus existing host=\(spec.hostKey)")
+            #endif
+            return
+        }
+
+        let flowKey = spec.hostKey.description
+        guard !mirrorOpensInFlight.contains(flowKey) else { return }
+        mirrorOpensInFlight.insert(flowKey)
+        defer { mirrorOpensInFlight.remove(flowKey) }
+
+        let registry = PeerPaneHostRegistry.shared
+        let lease: PeerPaneHostLease
+        do {
+            lease = try await registry.acquire(spec)
+        } catch {
+            self.showAlert(title: "Peer Connection Failed", body: String(describing: error))
+            return
+        }
+
+        let workspaces: [Termmesh_Peer_V1_Workspace]
+        do {
+            let conn = try await PeerRelaySession.connect(hostSockPath: lease.hostSockPath)
+            do {
+                workspaces = try await conn.session.listWorkspaces()
+            } catch {
+                await conn.cancel()
+                throw error
+            }
+            await conn.cancel()
+        } catch {
+            registry.release(lease)
+            self.showAlert(title: "Workspace List Failed", body: String(describing: error))
+            return
+        }
+        guard !workspaces.isEmpty else {
+            registry.release(lease)
+            self.showAlert(
+                title: "No Workspaces",
+                body: "The host reports no workspaces (older hosts may not expose layouts)."
+            )
+            return
+        }
+
+        let chosen: Termmesh_Peer_V1_Workspace?
+        if let workspaceID {
+            chosen = workspaces.first { $0.workspaceID == workspaceID } ?? workspaces.first
+        } else if workspaces.count == 1 || pickFirstWithoutPrompt {
+            chosen = workspaces[0]
+        } else {
+            chosen = await promptForWorkspaceSelection(from: workspaces)
+        }
+        guard let chosen else {
+            registry.release(lease)
+            return
+        }
+
+        guard let tabManager = AppDelegate.shared?.tabManager else {
+            registry.release(lease)
+            self.showAlert(title: "No Main Window", body: "Open a term-mesh window first.")
+            return
+        }
+
+        // First leaf seeds the new workspace's initial pane; every other
+        // leaf is split off recursively in the host tree's shape.
+        // A freshly created (empty) workspace has no leaf yet — ask the
+        // host to seed its first pane (NewTab targeted by workspace id,
+        // workspace.lifecycle.v1 hosts spawn an ephemeral shell) and
+        // re-list until it appears. Hosts that predate the field ignore
+        // the request (F8) and we fall through to the alert.
+        var resolved = chosen
+        if Self.firstLeafPane(resolved.layout) == nil {
+            resolved = await Self.seedEmptyWorkspace(chosen, lease: lease) ?? chosen
+        }
+        guard let firstLeaf = Self.firstLeafPane(resolved.layout) else {
+            registry.release(lease)
+            self.showAlert(title: "Empty Workspace", body: "The chosen workspace has no panes.")
+            return
+        }
+
+        let firstSession: PeerPaneSession
+        do {
+            firstSession = try await PeerPaneSession.attach(
+                lease: lease,
+                surface: Self.surfaceInfo(fromLeaf: firstLeaf),
+                title: firstLeaf.title,
+                spec: spec
+            )
+        } catch {
+            registry.release(lease)
+            self.showAlert(title: "Attach Failed", body: String(describing: error))
+            return
+        }
+
+        let workspace = tabManager.addWorkspace(
+            select: true,
+            command: firstSession.relayLaunchCommand,
+            environment: firstSession.relayEnvironment
+        )
+        let hostChip = spec.hostKey.shortLabel
+        // Distinct sidebar markers per mode — identical titles made the
+        // two modes impossible to tell apart (or A/B test) in the tab
+        // list: ⌁ = live host-synced mirror, ⧉ = detached layout copy.
+        let mirrorBaseTitle = chosen.title.isEmpty ? "Workspace" : chosen.title
+        workspace.title = live
+            ? "\(mirrorBaseTitle) ⌁ \(hostChip)"
+            : "\(mirrorBaseTitle) ⧉ \(hostChip) (copy)"
+        guard let firstPanel = workspace.panels.values
+            .compactMap({ $0 as? TerminalPanel }).first
+        else {
+            firstSession.teardown()
+            registry.release(lease)
+            self.showAlert(title: "Mirror Failed", body: "New workspace has no terminal panel.")
+            return
+        }
+        workspace.bindRemotePane(session: firstSession, to: firstPanel)
+
+        if live {
+            // Phase 2B live mirror: the controller owns the browse lease
+            // ref from here (released in its teardown). Initial build
+            // runs through the reconciler — one code path for open,
+            // pushes, and reconnect.
+            let mirror = PeerWorkspaceMirrorController(
+                workspace: workspace,
+                lease: lease,
+                spec: spec,
+                hostWorkspaceID: chosen.workspaceID,
+                hostWorkspaceTitle: chosen.title
+            )
+            mirror.panelBySurfaceID[firstLeaf.surfaceID] = firstPanel.id
+            workspace.peerMirror = mirror
+            registerWorkspaceMirror(mirror)
+            do {
+                try await mirror.start()
+            } catch {
+                self.showAlert(
+                    title: "Live Mirror Failed",
+                    body: "\(String(describing: error))\n\nThe workspace stays open with the first pane only; close it and retry."
+                )
+                // Keep the workspace (first pane is live); drop mirror mode.
+                workspace.peerMirror = nil
+                mirror.teardown()
+                return
+            }
+            #if DEBUG
+            dlog("peer.mirror.live.open host=\(spec.hostKey) workspace=\(chosen.title)")
+            #endif
+            return
+        }
+
+        await materializeLayout(
+            resolved.layout, seed: firstPanel,
+            workspace: workspace, lease: lease, spec: spec
+        )
+
+        // Copy the host's divider ratios onto the (shape-identical by
+        // construction) local tree. A skipped leaf breaks the shape
+        // match — the walk just stops descending that branch.
+        Self.applyDividerRatios(
+            host: resolved.layout,
+            local: workspace.bonsplitController.treeSnapshot(),
+            controller: workspace.bonsplitController
+        )
+
+        // Browse ref done — each pane session holds its own lease ref.
+        registry.release(lease)
+        #if DEBUG
+        dlog("peer.mirror.open host=\(spec.hostKey) workspace=\(chosen.title) leaves=\(Self.countLeafPanes(resolved.layout))")
+        #endif
+    }
+
+    /// Pre-order split materialization: split the seed's region for the
+    /// top split (new pane = second subtree's first leaf), then recurse
+    /// into both regions. A failed leaf attach logs and skips its
+    /// subtree — the rest of the workspace still opens.
+    private func materializeLayout(
+        _ node: Termmesh_Peer_V1_WorkspaceLayout,
+        seed: TerminalPanel,
+        workspace: Workspace,
+        lease: PeerPaneHostLease,
+        spec: PeerPaneHostSpec
+    ) async {
+        guard case .split(let split) = node.node else { return }
+        guard let secondLeaf = Self.firstLeafPane(split.second) else {
+            await materializeLayout(split.first, seed: seed, workspace: workspace, lease: lease, spec: spec)
+            return
+        }
+        let session: PeerPaneSession
+        do {
+            session = try await PeerPaneSession.attach(
+                lease: lease,
+                surface: Self.surfaceInfo(fromLeaf: secondLeaf),
+                title: secondLeaf.title,
+                spec: spec
+            )
+        } catch {
+            NSLog("[peer-mirror] leaf attach failed, skipping subtree: %@", String(describing: error))
+            await materializeLayout(split.first, seed: seed, workspace: workspace, lease: lease, spec: spec)
+            return
+        }
+        let orientation = SplitOrientation(rawValue: split.orientation) ?? .horizontal
+        guard let newPanel = workspace.openRemotePane(
+            session: session, orientation: orientation, focus: false, from: seed.id
+        ) else {
+            session.teardown()
+            NSLog("[peer-mirror] split failed, skipping subtree")
+            await materializeLayout(split.first, seed: seed, workspace: workspace, lease: lease, spec: spec)
+            return
+        }
+        await materializeLayout(split.first, seed: seed, workspace: workspace, lease: lease, spec: spec)
+        await materializeLayout(split.second, seed: newPanel, workspace: workspace, lease: lease, spec: spec)
+    }
+
+    private static func applyDividerRatios(
+        host: Termmesh_Peer_V1_WorkspaceLayout,
+        local: ExternalTreeNode,
+        controller: BonsplitController
+    ) {
+        guard case .split(let hostSplit) = host.node,
+              case .split(let localSplit) = local
+        else { return }
+        if hostSplit.dividerPosition > 0, hostSplit.dividerPosition < 1,
+           let splitId = UUID(uuidString: localSplit.id)
+        {
+            _ = controller.setDividerPosition(
+                CGFloat(hostSplit.dividerPosition), forSplit: splitId
+            )
+        }
+        applyDividerRatios(host: hostSplit.first, local: localSplit.first, controller: controller)
+        applyDividerRatios(host: hostSplit.second, local: localSplit.second, controller: controller)
+    }
+
+    /// Ask the host to spawn the first pane of an empty workspace
+    /// (NewTab targeted by workspace id), then poll the roster until
+    /// the seeded pane shows up. Returns the refreshed workspace, or
+    /// nil when the host never seeded one (old daemon — the field is
+    /// ignored per F8 — or spawn failure); the caller falls back to
+    /// its existing empty-workspace alert.
+    private static func seedEmptyWorkspace(
+        _ workspace: Termmesh_Peer_V1_Workspace,
+        lease: PeerPaneHostLease
+    ) async -> Termmesh_Peer_V1_Workspace? {
+        do {
+            let conn = try await PeerRelaySession.connect(hostSockPath: lease.hostSockPath)
+            defer { Task { await conn.cancel() } }
+            try await conn.session.requestNewTab(workspaceID: workspace.workspaceID)
+            // The daemon applies NewTab asynchronously; poll until the
+            // seeded pane appears (25 × 200ms = 5s), re-nudging with
+            // another NewTab midway in case the first was dropped.
+            for attempt in 0..<25 {
+                try await Task.sleep(nanoseconds: 200_000_000)
+                if attempt == 12 {
+                    try? await conn.session.requestNewTab(workspaceID: workspace.workspaceID)
+                }
+                let workspaces = try await conn.session.listWorkspaces()
+                if let updated = workspaces.first(where: { $0.workspaceID == workspace.workspaceID }),
+                   firstLeafPane(updated.layout) != nil {
+                    #if DEBUG
+                    dlog("peer.mirror.seed ok workspace=\(workspace.title) attempt=\(attempt)")
+                    #endif
+                    return updated
+                }
+            }
+            #if DEBUG
+            dlog("peer.mirror.seed timeout workspace=\(workspace.title)")
+            #endif
+            return nil
+        } catch {
+            #if DEBUG
+            dlog("peer.mirror.seed error workspace=\(workspace.title) error=\(error)")
+            #endif
+            return nil
+        }
+    }
+
+    private static func firstLeafPane(
+        _ node: Termmesh_Peer_V1_WorkspaceLayout
+    ) -> Termmesh_Peer_V1_WorkspacePane? {
+        switch node.node {
+        case .pane(let pane): return pane
+        case .split(let split):
+            return firstLeafPane(split.first) ?? firstLeafPane(split.second)
+        case .none: return nil
+        }
+    }
+
+    private static func countLeafPanes(_ node: Termmesh_Peer_V1_WorkspaceLayout) -> Int {
+        switch node.node {
+        case .pane: return 1
+        case .split(let split):
+            return countLeafPanes(split.first) + countLeafPanes(split.second)
+        case .none: return 0
+        }
+    }
+
+    /// AttachSurface only needs id + geometry; the layout leaf carries
+    /// both, so the mirror never has to cross-reference ListSurfaces.
+    private static func surfaceInfo(
+        fromLeaf leaf: Termmesh_Peer_V1_WorkspacePane
+    ) -> Termmesh_Peer_V1_SurfaceInfo {
+        var info = Termmesh_Peer_V1_SurfaceInfo()
+        info.surfaceID = leaf.surfaceID
+        info.title = leaf.title
+        info.cols = leaf.cols
+        info.rows = leaf.rows
+        info.attachable = true
+        return info
+    }
+
+    #if DEBUG
+    // MARK: - Remote pane debug hooks (tests_v2 socket e2e)
+
+    /// Result of the last `debug.peer.open_remote_pane`, polled via
+    /// `debug.peer.pane_status`. The open command is fire-and-forget
+    /// because the flow is async and the socket handler must not block
+    /// the main thread.
+    private(set) var debugLastPaneOpenResult: [String: Any]?
+
+    /// Headless remote-pane open: no pickers, no alerts. With a nil
+    /// sockPath, brings up the in-app peer server and mirrors one of
+    /// this instance's own surfaces (loopback self-mirror).
+    func debugOpenRemotePane(sockPath: String?) {
+        debugLastPaneOpenResult = nil
+        Task { @MainActor in
+            var resolvedSock = sockPath
+            if resolvedSock == nil {
+                _ = await PeerHostCoordinator.shared.setRunning(true)
+                resolvedSock = PeerHostCoordinator.shared.currentSocketPath
+            }
+            guard let hostSock = resolvedSock, !hostSock.isEmpty else {
+                self.debugLastPaneOpenResult = ["ok": false, "error": "no_host_socket"]
+                return
+            }
+            let spec = PeerPaneHostSpec.direct(sockPath: hostSock)
+            let registry = PeerPaneHostRegistry.shared
+            do {
+                let lease = try await registry.acquire(spec)
+                do {
+                    let surfaces = try await PeerPaneSession.listSurfaces(on: lease)
+                    guard let chosen = surfaces.first(where: { $0.attachable }) else {
+                        registry.release(lease)
+                        self.debugLastPaneOpenResult = ["ok": false, "error": "no_attachable_surface"]
+                        return
+                    }
+                    guard let workspace = Self.currentWorkspaceForPaneOpen() else {
+                        registry.release(lease)
+                        self.debugLastPaneOpenResult = ["ok": false, "error": "no_active_workspace"]
+                        return
+                    }
+                    let session = try await PeerPaneSession.attach(
+                        lease: lease,
+                        surface: chosen,
+                        title: chosen.title.isEmpty ? chosen.workspaceName : chosen.title,
+                        spec: spec
+                    )
+                    registry.release(lease)
+                    guard let panel = workspace.openRemotePane(session: session) else {
+                        session.teardown()
+                        self.debugLastPaneOpenResult = ["ok": false, "error": "no_focused_terminal_pane"]
+                        return
+                    }
+                    self.debugLastPaneOpenResult = [
+                        "ok": true,
+                        "panel_id": panel.id.uuidString,
+                        "host_key": String(describing: session.lease.key),
+                    ]
+                } catch {
+                    registry.release(lease)
+                    self.debugLastPaneOpenResult = ["ok": false, "error": String(describing: error)]
+                }
+            } catch {
+                self.debugLastPaneOpenResult = ["ok": false, "error": String(describing: error)]
+            }
+        }
+    }
+
+    /// Test-only headless workspace mirror: no pickers/alerts on the
+    /// happy path (first workspace auto-picked). Outcome polled via
+    /// `debug.peer.pane_status` — session count reflects mirrored
+    /// leaves.
+    func debugOpenWorkspaceMirror(sockPath: String?, live: Bool = false) {
+        debugLastPaneOpenResult = nil
+        Task { @MainActor in
+            var resolvedSock = sockPath
+            if resolvedSock == nil {
+                _ = await PeerHostCoordinator.shared.setRunning(true)
+                resolvedSock = PeerHostCoordinator.shared.currentSocketPath
+            }
+            guard let hostSock = resolvedSock, !hostSock.isEmpty else {
+                self.debugLastPaneOpenResult = ["ok": false, "error": "no_host_socket"]
+                return
+            }
+            let before = self.openPaneSessions.count
+            // Mirror the currently-SELECTED workspace: hosts key
+            // workspaces by raw UUID bytes, so the loopback e2e can
+            // seed a specific workspace, select it, and mirror exactly
+            // it — first-listed would race with session-restored tabs.
+            let selectedID = (AppDelegate.shared?.tabManager?.selectedWorkspace?.id.uuid)
+                .map { withUnsafeBytes(of: $0) { Data($0) } }
+            await self.openRemoteWorkspaceMirror(
+                spec: .direct(sockPath: hostSock),
+                workspaceID: selectedID,
+                pickFirstWithoutPrompt: true,
+                live: live
+            )
+            let opened = self.openPaneSessions.count - before
+            self.debugLastPaneOpenResult = [
+                "ok": opened > 0,
+                "mirror": true,
+                "live": live,
+                "panes_opened": opened,
+            ]
+        }
+    }
+
+    /// Snapshot of live-mirror state for e2e assertions.
+    func debugMirrorStatus() -> [String: Any] {
+        [
+            "mirrors": openWorkspaceMirrors.map { mirror -> [String: Any] in
+                var entry: [String: Any] = [
+                    "host_key": String(describing: mirror.spec.hostKey),
+                    "subscription_alive": mirror.subscriptionAlive,
+                    "applying": mirror.isApplyingRemoteLayout,
+                    "leaf_count": mirror.panelBySurfaceID.count,
+                    "split_map_count": mirror.hostSplitToLocal.count,
+                    "torn_down": mirror.isTornDown,
+                ]
+                if let layout = mirror.lastAppliedLayout {
+                    entry["shape"] = PeerWorkspaceMirrorController.shapeHash(layout)
+                }
+                if let workspaceId = mirror.workspace?.id.uuidString {
+                    entry["workspace_id"] = workspaceId
+                }
+                return entry
+            }
+        ]
+    }
+
+    /// Snapshot of remote-pane state for e2e assertions.
+    func debugPaneStatus() -> [String: Any] {
+        [
+            "pane_sessions": openPaneSessions.map { session in
+                [
+                    "host_key": String(describing: session.lease.key),
+                    "title": session.surfaceTitle,
+                    "torn_down": session.isTorndown,
+                ] as [String: Any]
+            },
+            "lease_count": PeerPaneHostRegistry.shared.activeLeaseCount,
+            "last_open_result": debugLastPaneOpenResult ?? NSNull(),
+        ]
+    }
+    #endif
+
+    /// Panels with a reconnect currently in flight — repeated banner
+    /// clicks must not spawn concurrent reconnect tasks (double panes,
+    /// double sessions).
+    private var reconnectingPanelIds: Set<UUID> = []
+
+    /// Reconnect action for a remote pane's disconnect banner: re-lease
+    /// the host, find the original surface again (by id, then by title),
+    /// attach a fresh session, and swap the dead pane IN PLACE — the new
+    /// pane splits off the dead one (so it lands adjacent, not wherever
+    /// focus happens to be) and only then is the dead pane closed. Any
+    /// failure before that leaves the old pane and its banner (with
+    /// Retry) untouched.
+    func reconnectRemotePane(
+        oldSession: PeerPaneSession,
+        panelId: UUID,
+        workspace: Workspace
+    ) async {
+        guard !reconnectingPanelIds.contains(panelId) else { return }
+        reconnectingPanelIds.insert(panelId)
+        defer { reconnectingPanelIds.remove(panelId) }
+
+        let spec = oldSession.originSpec
+        let wanted = oldSession.originSurface
+        oldSession.teardown()
+
+        let registry = PeerPaneHostRegistry.shared
+        let lease: PeerPaneHostLease
+        do {
+            lease = try await registry.acquire(spec)
+        } catch {
+            self.showAlert(title: "Reconnect Failed", body: String(describing: error))
+            return
+        }
+        let surfaces: [Termmesh_Peer_V1_SurfaceInfo]
+        do {
+            surfaces = try await PeerPaneSession.listSurfaces(on: lease)
+        } catch {
+            registry.release(lease)
+            self.showAlert(title: "Reconnect Failed", body: String(describing: error))
+            return
+        }
+        let match = surfaces.first { $0.surfaceID == wanted.surfaceID && $0.attachable }
+            ?? surfaces.first { $0.title == wanted.title && $0.attachable }
+        guard let match else {
+            registry.release(lease)
+            self.showAlert(
+                title: "Surface Gone",
+                body: "The remote surface no longer exists on the host."
+            )
+            return
+        }
+        let session: PeerPaneSession
+        do {
+            session = try await PeerPaneSession.attach(
+                lease: lease,
+                surface: match,
+                title: match.title.isEmpty ? match.workspaceName : match.title,
+                spec: spec
+            )
+        } catch {
+            registry.release(lease)
+            self.showAlert(title: "Reconnect Failed", body: String(describing: error))
+            return
+        }
+        registry.release(lease)
+
+        // Replacement first, removal second: split the new pane off the
+        // dead one so it inherits the slot's neighborhood, then close
+        // the dead pane. If the split fails the old pane (and banner)
+        // survive for another retry.
+        guard workspace.openRemotePane(session: session, from: panelId) != nil else {
+            session.teardown()
+            self.showAlert(
+                title: "Reconnect Failed",
+                body: "Could not open a replacement pane in the workspace."
+            )
+            return
+        }
+        _ = workspace.closePanel(panelId, force: true)
+    }
+
+    private static func probeFailureBody(_ error: Error, target: String) -> String {
+        guard let probeError = error as? PeerSocketProbeError else {
+            return String(describing: error)
+        }
+        switch probeError {
+        case .noSocketFound:
+            let candidates = PeerSocketProber.candidateSummary
+                .map { "  • \($0)" }
+                .joined(separator: "\n")
+            return "Reached \(target), but no peer socket exists at any default location:\n\(candidates)\n\nIs term-meshd running on the host? Otherwise enter the socket path manually."
+        case .sshFailed(_, let stderr):
+            let detail = stderr.isEmpty ? "(no stderr)" : stderr
+            return "Could not reach the host over ssh: \(detail)\n\nVerify that `ssh \(target)` works in a terminal."
+        case .timedOut:
+            return "The auto-detect probe timed out. Check the connection to \(target), or enter the socket path manually."
+        case .invalidResult, .spawnFailed:
+            return String(describing: probeError)
+        }
     }
 
     /// Shared workflow: enumerate workspaces over a `PeerRelayConnection`
@@ -605,92 +1297,6 @@ final class PeerClientCoordinator: NSObject {
         }
     }
 
-    @objc func promptAndRunRelay(_ sender: Any?) {
-        let alert = NSAlert()
-        alert.messageText = "Connect to Peer via Ghostty Relay"
-        alert.informativeText = "Path to a Swift peer server socket (e.g. TERMMESH_DEBUG_PEER_SERVER_PATH).\nOpens remote pane in a real Ghostty surface."
-
-        let input = NSTextField(frame: NSRect(x: 0, y: 0, width: 360, height: 24))
-        input.stringValue = ProcessInfo.processInfo.environment["TERMMESH_DEBUG_PEER_SERVER_PATH"]
-            ?? PeerHostCoordinator.shared.currentSocketPath
-            ?? PeerFederationSettings.socketPath
-        alert.accessoryView = input
-        alert.addButton(withTitle: "Connect")
-        alert.addButton(withTitle: "Cancel")
-
-        Task { @MainActor in
-            let resp = await Self.runModalAsSheet(alert)
-            guard resp == .alertFirstButtonReturn else { return }
-            let path = self.normalizedSocketPath(from: input.stringValue)
-            guard !path.isEmpty else {
-                self.showAlert(title: "Peer Socket Required", body: "Enter a peer socket path.")
-                return
-            }
-            guard self.validateLocalSocketPathForConnect(path) else { return }
-            await self.runRelayFlow(path: path)
-        }
-    }
-
-    /// Body of the legacy single-pane relay flow, extracted so the
-    /// promptAndRunRelay sheet completion can call it cleanly.
-    /// The body stays async end-to-end so duplicate-connect guards remain
-    /// active until connect, list, selection, and attach have all finished.
-    private func runRelayFlow(path: String) async {
-        let flow = ConnectionFlow.relayPane(path)
-        guard beginConnectionFlow(flow) else { return }
-        defer { finishConnectionFlow(flow) }
-
-        let connection: PeerRelayConnection
-        do {
-            connection = try await PeerRelaySession.connectAndList(hostSockPath: path)
-        } catch {
-            self.showAlert(title: "Peer Relay Failed", body: String(describing: error))
-            return
-        }
-
-        // Pick a surface — auto-skip the dialog when there's nothing
-        // to choose between.
-        let attachable = connection.surfaces.filter { $0.attachable }
-        let pickFrom = attachable.isEmpty ? connection.surfaces : attachable
-        guard !pickFrom.isEmpty else {
-            await connection.cancel()
-            self.showAlert(title: "Peer Relay Failed",
-                           body: "Host has no surfaces to attach to.")
-            return
-        }
-
-        let chosen: Termmesh_Peer_V1_SurfaceInfo?
-        if pickFrom.count == 1 {
-            chosen = pickFrom[0]
-        } else {
-            chosen = await self.promptForSurfaceSelection(from: pickFrom)
-        }
-        guard let chosen else {
-            await connection.cancel()
-            return
-        }
-
-        do {
-            let session = try await PeerRelaySession.attach(connection, surface: chosen)
-            try session.prepareListener()
-            let controller = PeerRelayWindowController(
-                session: session,
-                surfaceTitle: chosen.title
-            )
-            self.openRelays.append(controller)
-            controller.onClose = { [weak self, weak controller] in
-                guard let self, let controller else { return }
-                self.openRelays.removeAll { $0 === controller }
-                self.postRelaysChanged()
-            }
-            controller.show()
-            self.postRelaysChanged()
-        } catch {
-            await connection.cancel()
-            self.showAlert(title: "Peer Relay Failed", body: String(describing: error))
-        }
-    }
-
     /// Show an NSAlert with an NSPopUpButton listing the available
     /// surfaces. Returns the user's pick, or nil if Cancel was clicked.
     private func promptForSurfaceSelection(
@@ -863,7 +1469,7 @@ final class PeerClientCoordinator: NSObject {
         return nil
     }
 
-    private static func menuSafeTitle(_ value: String, maxLength: Int) -> String {
+    static func menuSafeTitle(_ value: String, maxLength: Int) -> String {
         let singleLine = value
             .replacingOccurrences(of: "\n", with: " ")
             .replacingOccurrences(of: "\r", with: " ")
@@ -962,6 +1568,7 @@ final class PeerConsoleWindowController: NSWindowController, NSWindowDelegate {
             hostSockPath: hostSockPath,
             hostDisplayName: hostName,
             sshTarget: nil,
+            remoteSockPath: nil,
             targetTitle: surfaceTitle.isEmpty ? "<surface>" : surfaceTitle,
             connectedAt: connectedAt
         )
@@ -1147,72 +1754,5 @@ final class PeerConsoleWindowController: NSWindowController, NSWindowDelegate {
 
     private static var monospaceFont: NSFont {
         NSFont.monospacedSystemFont(ofSize: 12, weight: .regular)
-    }
-}
-
-/// Glue between the SSH-dialog Bonjour popup (NSPopUpButton, plain
-/// NSObject target) and the surrounding text fields. Lives alongside
-/// the dialog stack and rewrites the SSH target / remote-socket
-/// fields whenever the user picks a discovered peer.
-@MainActor
-final class SSHDialogPopupProxy: NSObject {
-    private weak var popup: NSPopUpButton?
-    private weak var targetField: NSTextField?
-    private weak var remoteField: NSTextField?
-    private let peersProvider: () -> [DiscoveredPeer]
-
-    init(popup: NSPopUpButton,
-         target: NSTextField,
-         remote: NSTextField,
-         peersProvider: @escaping () -> [DiscoveredPeer]) {
-        self.popup = popup
-        self.targetField = target
-        self.remoteField = remote
-        self.peersProvider = peersProvider
-        super.init()
-    }
-
-    @objc func didPick(_ sender: NSPopUpButton) {
-        let peers = peersProvider()
-        // Index 0 is the placeholder ("pick a host…" / "no hosts");
-        // discovered entries start at 1.
-        let idx = sender.indexOfSelectedItem - 1
-        guard idx >= 0, idx < peers.count else { return }
-        let peer = peers[idx]
-        targetField?.stringValue = peer.hostname
-        if let sock = peer.socketPath, !sock.isEmpty {
-            remoteField?.stringValue = sock
-        }
-    }
-}
-
-/// Glue between the SSH-dialog "Recent" popup and the surrounding
-/// fields. `recents` is captured at construction time — we don't
-/// re-read defaults mid-modal so the menu items stay in sync with
-/// the popup's index.
-@MainActor
-final class RecentHostPopupProxy: NSObject {
-    private weak var popup: NSPopUpButton?
-    private weak var targetField: NSTextField?
-    private weak var remoteField: NSTextField?
-    private let recents: [PeerFederationSettings.RecentHost]
-
-    init(popup: NSPopUpButton,
-         target: NSTextField,
-         remote: NSTextField,
-         recents: [PeerFederationSettings.RecentHost]) {
-        self.popup = popup
-        self.targetField = target
-        self.remoteField = remote
-        self.recents = recents
-        super.init()
-    }
-
-    @objc func didPick(_ sender: NSPopUpButton) {
-        let idx = sender.indexOfSelectedItem - 1
-        guard idx >= 0, idx < recents.count else { return }
-        let entry = recents[idx]
-        targetField?.stringValue = entry.sshTarget
-        remoteField?.stringValue = entry.remoteSocket
     }
 }

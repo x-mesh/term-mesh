@@ -43,6 +43,7 @@ final class PeerRelayWindowController: NSWindowController, NSWindowDelegate {
             hostSockPath: relaySession.hostSockPath,
             hostDisplayName: relaySession.hostDisplayName,
             sshTarget: nil,
+            remoteSockPath: nil,
             targetTitle: surfaceTitle.isEmpty ? "<surface>" : surfaceTitle,
             connectedAt: connectedAt
         )

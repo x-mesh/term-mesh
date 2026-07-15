@@ -27,6 +27,8 @@ struct VerticalTabsSidebar: View {
     @ObservedObject private var remoteHostStore = RemoteHostStore.shared
     @State private var draggedTabId: UUID?
     @State private var dropIndicator: SidebarDropIndicator?
+    @AppStorage(SidebarLayoutSettings.localTabsCollapsedKey)
+    private var localTabsCollapsed = false
 
     /// Space at top of sidebar for traffic light buttons
     private let trafficLightPadding: CGFloat = 28
@@ -41,23 +43,29 @@ struct VerticalTabsSidebar: View {
                         Spacer()
                             .frame(height: trafficLightPadding)
 
-                        LazyVStack(spacing: tabRowSpacing) {
-                            ForEach(Array(tabManager.tabs.enumerated()), id: \.element.id) { index, tab in
-                                TabItemView(
-                                    tab: tab,
-                                    index: index,
-                                    rowSpacing: tabRowSpacing,
-                                    selection: $selection,
-                                    selectedTabIds: $selectedTabIds,
-                                    lastSidebarSelectionIndex: $lastSidebarSelectionIndex,
-                                    showsCommandShortcutHints: commandKeyMonitor.isCommandPressed,
-                                    dragAutoScrollController: dragAutoScrollController,
-                                    draggedTabId: $draggedTabId,
-                                    dropIndicator: $dropIndicator
-                                )
+                        SidebarSectionHeader(title: "Workspaces", isCollapsed: $localTabsCollapsed)
+                            .padding(.top, 4)
+
+                        if !localTabsCollapsed {
+                            LazyVStack(spacing: tabRowSpacing) {
+                                ForEach(Array(tabManager.tabs.enumerated()), id: \.element.id) { index, tab in
+                                    TabItemView(
+                                        tab: tab,
+                                        index: index,
+                                        rowSpacing: tabRowSpacing,
+                                        selection: $selection,
+                                        selectedTabIds: $selectedTabIds,
+                                        lastSidebarSelectionIndex: $lastSidebarSelectionIndex,
+                                        showsCommandShortcutHints: commandKeyMonitor.isCommandPressed,
+                                        dragAutoScrollController: dragAutoScrollController,
+                                        draggedTabId: $draggedTabId,
+                                        dropIndicator: $dropIndicator
+                                    )
+                                }
                             }
+                            .padding(.bottom, 8)
+                            .padding(.top, 2)
                         }
-                        .padding(.vertical, 8)
 
                         SidebarRemoteHostsSection(store: remoteHostStore)
 
@@ -709,10 +717,84 @@ extension NSColor {
     }
 }
 
+// MARK: - Sidebar layout persistence
+
+/// Persisted sidebar layout state: width, section collapse, and per-host
+/// group collapse. Imperative UserDefaults helpers are used where a view
+/// needs the value at init time (width, per-key host folding); the two
+/// section flags are consumed directly via @AppStorage on the same keys.
+enum SidebarLayoutSettings {
+    static let widthKey = "sidebar.width"
+    static let localTabsCollapsedKey = "sidebar.section.localTabs.collapsed"
+    static let remoteHostsCollapsedKey = "sidebar.section.remoteHosts.collapsed"
+    static let collapsedHostKeysKey = "sidebar.remoteHost.collapsedKeys"
+
+    /// Last user-committed sidebar width (saved on drag end only, so
+    /// transient window-resize clamps never overwrite user intent).
+    /// nil when the user has never resized the sidebar.
+    static func loadWidth() -> CGFloat? {
+        let raw = UserDefaults.standard.double(forKey: widthKey)
+        return raw > 0 ? CGFloat(raw) : nil
+    }
+
+    static func saveWidth(_ width: CGFloat) {
+        UserDefaults.standard.set(Double(width), forKey: widthKey)
+    }
+
+    /// Collapsed host groups, stored as an array of stable host keys.
+    /// Default (expanded) needs no entry, so the list only holds hosts
+    /// the user explicitly folded — no per-launch key accumulation.
+    private static func collapsedHostKeys() -> Set<String> {
+        Set(UserDefaults.standard.stringArray(forKey: collapsedHostKeysKey) ?? [])
+    }
+
+    static func isHostCollapsed(_ hostKey: String) -> Bool {
+        collapsedHostKeys().contains(hostKey)
+    }
+
+    static func setHostCollapsed(_ hostKey: String, _ collapsed: Bool) {
+        var keys = collapsedHostKeys()
+        if collapsed { keys.insert(hostKey) } else { keys.remove(hostKey) }
+        UserDefaults.standard.set(Array(keys).sorted(), forKey: collapsedHostKeysKey)
+    }
+}
+
+/// Collapsible sidebar section header: chevron + caption title. The whole
+/// row toggles `isCollapsed`; persistence is the caller's @AppStorage.
+struct SidebarSectionHeader: View {
+    let title: String
+    @Binding var isCollapsed: Bool
+
+    var body: some View {
+        Button {
+            withAnimation(.easeInOut(duration: 0.15)) { isCollapsed.toggle() }
+        } label: {
+            HStack(spacing: 4) {
+                Image(systemName: "chevron.right")
+                    .font(.system(size: 8, weight: .semibold))
+                    .rotationEffect(.degrees(isCollapsed ? 0 : 90))
+                    .foregroundColor(Color.secondary.opacity(0.7))
+                Text(title)
+                    .font(.system(size: 10, weight: .semibold))
+                    .foregroundColor(.secondary)
+                Spacer(minLength: 0)
+            }
+            .padding(.horizontal, 16)
+            .padding(.vertical, 4)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+    }
+}
+
 // MARK: - Remote Hosts Sidebar
 
 struct SidebarRemoteHostsSection: View {
     @ObservedObject var store: RemoteHostStore
+    @AppStorage(SidebarLayoutSettings.remoteHostsCollapsedKey)
+    private var isCollapsed = false
+    /// Non-nil presents the add/edit sheet.
+    @State private var editorContext: PeerHostEditorContext?
 
     var body: some View {
         VStack(spacing: 0) {
@@ -721,38 +803,170 @@ struct SidebarRemoteHostsSection: View {
                 .padding(.top, 4)
                 .padding(.bottom, 2)
 
-            if store.sortedHosts.isEmpty {
-                VStack(alignment: .leading, spacing: 3) {
-                    Text("Remote Hosts")
-                        .font(.system(size: 10, weight: .semibold))
-                        .foregroundColor(.secondary)
-                    Text("Use Peer menu → Connect to Host…")
+            // "Peer Hosts", not "Remote Hosts" — plain "hosts" read as
+            // direct-SSH terminal access; these entries are term-mesh
+            // peer daemons (Peer menu / Peer Connections vocabulary).
+            SidebarSectionHeader(title: "Peer Hosts", isCollapsed: $isCollapsed)
+                .overlay(alignment: .trailing) {
+                    Button {
+                        editorContext = PeerHostEditorContext(
+                            profile: PeerHostProfile(sshTarget: ""),
+                            isNew: true
+                        )
+                    } label: {
+                        Image(systemName: "plus")
+                            .font(.system(size: 9, weight: .semibold))
+                            .foregroundColor(.secondary)
+                            .frame(width: 18, height: 18)
+                            .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                    .padding(.trailing, 12)
+                    .help("Add Peer Host…")
+                }
+
+            if !isCollapsed {
+                if store.sortedHosts.isEmpty {
+                    Text("No saved hosts — click + to add")
                         .font(.system(size: 10))
                         .foregroundColor(Color.secondary.opacity(0.6))
                         .fixedSize(horizontal: false, vertical: true)
-                }
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .padding(.horizontal, 16)
-                .padding(.vertical, 8)
-            } else {
-                ForEach(store.sortedHosts) { host in
-                    RemoteHostGroupView(host: host, store: store)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(.horizontal, 16)
+                        .padding(.vertical, 4)
+                } else {
+                    ForEach(store.sortedHosts) { host in
+                        RemoteHostGroupView(host: host, store: store) { context in
+                            editorContext = context
+                        }
+                    }
                 }
             }
         }
         .padding(.bottom, 4)
+        .sheet(item: $editorContext) { context in
+            PeerHostEditorView(
+                context: context,
+                onSave: { profile in
+                    PeerHostProfileStore.shared.upsert(profile)
+                    editorContext = nil
+                },
+                onCancel: { editorContext = nil }
+            )
+        }
+        // Menu-bar / main-menu "Add Remote Host…" routes here — the
+        // sheet is sidebar-hosted, so menus just ask for it.
+        .onReceive(NotificationCenter.default.publisher(
+            for: PeerClientCoordinator.addRemoteHostRequestedNotification
+        )) { _ in
+            guard editorContext == nil else { return }
+            editorContext = PeerHostEditorContext(
+                profile: PeerHostProfile(sshTarget: ""),
+                isNew: true
+            )
+        }
     }
 }
 
 struct RemoteHostGroupView: View {
     let host: HostEntry
     let store: RemoteHostStore
-    @State private var isExpanded = true
+    /// Opens the shared add/edit sheet (owned by the section view).
+    let onEdit: (PeerHostEditorContext) -> Void
+    @State private var isExpanded: Bool
+    @State private var showDeleteConfirm = false
+    @State private var showNewWorkspaceAlert = false
+    @State private var newWorkspaceTitle = ""
+
+    init(host: HostEntry, store: RemoteHostStore,
+         onEdit: @escaping (PeerHostEditorContext) -> Void) {
+        self.host = host
+        self.store = store
+        self.onEdit = onEdit
+        // Fold state persists per stable host key; default is expanded.
+        _isExpanded = State(initialValue: !SidebarLayoutSettings.isHostCollapsed(host.id))
+    }
+
+    /// Profile-management items shared by every connection state.
+    @ViewBuilder
+    private var profileMenuItems: some View {
+        if let profileID = host.profileID,
+           let profile = PeerHostProfileStore.shared.profile(id: profileID) {
+            Divider()
+            Button("Edit…") {
+                onEdit(PeerHostEditorContext(profile: profile, isNew: false))
+            }
+            Button("Delete…", role: .destructive) {
+                showDeleteConfirm = true
+            }
+        } else if let draft = store.profileDraft(for: host) {
+            // Ad-hoc SSH connection → offer promotion to a saved host.
+            Divider()
+            Button("Save as Host…") {
+                onEdit(PeerHostEditorContext(profile: draft, isNew: true))
+            }
+        }
+    }
+
+    private var emptyBodyText: String {
+        switch host.connectionState {
+        case .connecting: return "Connecting…"
+        case .connected: return "Loading…"
+        case .saved: return "Not connected"
+        case .failed: return "Connection failed"
+        }
+    }
+
+    /// Profile tag color, resolved through the failable NSColor hex
+    /// initializer used elsewhere in the app.
+    private var hostTint: Color? {
+        host.colorHex.flatMap { NSColor(hex: $0) }.map { Color(nsColor: $0) }
+    }
+
+    @ViewBuilder
+    private var hostStatusIcon: some View {
+        switch host.connectionState {
+        case .connecting:
+            ProgressView()
+                .controlSize(.mini)
+                .frame(width: 11, height: 11)
+        case .connected:
+            Image(systemName: host.symbolName ?? "network")
+                .font(.system(size: 9))
+                .foregroundColor(hostTint ?? .secondary)
+        case .saved:
+            Image(systemName: host.symbolName ?? "network.slash")
+                .font(.system(size: 9))
+                .foregroundColor(Color.secondary.opacity(0.4))
+        case .failed(let reason):
+            Image(systemName: "exclamationmark.triangle")
+                .font(.system(size: 9))
+                .foregroundColor(.red)
+                .help(reason)
+        }
+    }
+
+    /// Row tap: saved/failed SSH hosts connect (+ auto-expand on
+    /// success); a connected host just toggles its fold.
+    private func handleRowTap() {
+        switch host.connectionState {
+        case .saved, .failed:
+            if host.sshTarget != nil {
+                store.connectSavedHost(host)
+            } else {
+                withAnimation(.easeInOut(duration: 0.15)) { isExpanded.toggle() }
+            }
+        case .connected:
+            withAnimation(.easeInOut(duration: 0.15)) { isExpanded.toggle() }
+        case .connecting:
+            break
+        }
+    }
 
     var body: some View {
         DisclosureGroup(isExpanded: $isExpanded) {
             if host.workspaces.isEmpty {
-                Text(host.isConnected ? "Loading…" : "Disconnected")
+                Text(emptyBodyText)
                     .font(.system(size: 10))
                     .foregroundColor(.secondary)
                     .padding(.leading, 20)
@@ -779,48 +993,203 @@ struct RemoteHostGroupView: View {
                             .padding(.bottom, 1)
                             .frame(maxWidth: .infinity, alignment: .leading)
                         ForEach(group.items) { workspace in
-                            RemoteWorkspaceRowView(workspace: workspace, store: store)
+                            RemoteWorkspaceRowView(workspace: workspace, host: host, store: store)
                         }
                     }
                 } else {
                     ForEach(host.workspaces) { workspace in
-                        RemoteWorkspaceRowView(workspace: workspace, store: store)
+                        RemoteWorkspaceRowView(workspace: workspace, host: host, store: store)
                     }
                 }
             }
         } label: {
             HStack(spacing: 5) {
-                Image(systemName: host.isConnected ? "network" : "network.slash")
-                    .font(.system(size: 9))
-                    .foregroundColor(host.isConnected ? .secondary : Color.secondary.opacity(0.4))
+                hostStatusIcon
                 Text(host.displayName)
                     .font(.system(size: 11, weight: .semibold))
                     .foregroundColor(host.isConnected ? .primary : .secondary)
                     .lineLimit(1)
                     .truncationMode(.tail)
+                // Workspace count, shown once connected and known —
+                // "jw-server (3)". Hidden while saved/connecting so the
+                // row doesn't flash a stale/zero count.
+                if host.isConnected, !host.workspaces.isEmpty {
+                    Text("(\(host.workspaces.count))")
+                        .font(.system(size: 10))
+                        .foregroundColor(Color.secondary.opacity(0.7))
+                }
+                // Inline "+" = New Workspace…, mirroring the section
+                // header's add-host affordance. Only rendered when the
+                // connected host actually supports workspace CRUD.
+                if host.isConnected, host.supportsWorkspaceLifecycle == true {
+                    Spacer(minLength: 4)
+                    Button {
+                        newWorkspaceTitle = ""
+                        showNewWorkspaceAlert = true
+                    } label: {
+                        Image(systemName: "plus")
+                            .font(.system(size: 8, weight: .semibold))
+                            .foregroundColor(.secondary)
+                            .frame(width: 16, height: 16)
+                            .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                    .help("New Workspace…")
+                }
             }
             .padding(.horizontal, 10)
             .padding(.vertical, 3)
+            .contentShape(Rectangle())
+            .onTapGesture { handleRowTap() }
+            .contextMenu {
+                switch host.connectionState {
+                case .saved, .failed:
+                    if host.sshTarget != nil {
+                        Button("Connect") { store.connectSavedHost(host) }
+                    }
+                case .connected:
+                    // Phase 1 remote pane primitive: pick one of this
+                    // host's surfaces and open it as a pane in the
+                    // current workspace.
+                    Button("Open Surface as Pane…") {
+                        store.openSurfaceAsPane(host)
+                    }
+                    // Gated on the host's negotiated capability — always
+                    // shown so the menu shape is stable, but disabled
+                    // (not hidden) when the host build predates
+                    // workspace CRUD or the capability isn't known yet.
+                    Button("New Workspace…") {
+                        newWorkspaceTitle = ""
+                        showNewWorkspaceAlert = true
+                    }
+                    .disabled(host.supportsWorkspaceLifecycle != true)
+                    if store.hasSidebarLease(for: host.id) {
+                        Button("Disconnect") { store.disconnectSavedHost(host) }
+                    }
+                case .connecting:
+                    EmptyView()
+                }
+                profileMenuItems
+            }
+            .confirmationDialog(
+                "Delete \"\(host.displayName)\"?",
+                isPresented: $showDeleteConfirm
+            ) {
+                Button("Delete", role: .destructive) {
+                    store.deleteProfile(for: host)
+                }
+                Button("Cancel", role: .cancel) {}
+            } message: {
+                Text("The saved host profile is removed. Open panes and mirrors stay connected.")
+            }
+            .alert("New Workspace", isPresented: $showNewWorkspaceAlert) {
+                TextField("Workspace name", text: $newWorkspaceTitle)
+                Button("Create") {
+                    let title = newWorkspaceTitle.trimmingCharacters(in: .whitespacesAndNewlines)
+                    guard !title.isEmpty else { return }
+                    store.createWorkspace(host: host, title: title)
+                }
+                Button("Cancel", role: .cancel) {}
+            } message: {
+                Text("Creates a new workspace on \"\(host.displayName)\".")
+            }
         }
         .padding(.horizontal, 6)
+        .onChange(of: isExpanded) { newValue in
+            SidebarLayoutSettings.setHostCollapsed(host.id, !newValue)
+        }
+        .onChange(of: store.expandSignal) { signal in
+            if signal.key == host.id { isExpanded = true }
+        }
     }
 }
 
 struct RemoteWorkspaceRowView: View {
     let workspace: WorkspaceSummary
+    /// The host group this row is rendered under. Passed explicitly so the
+    /// mirror open uses THIS host's spec (SSH vs direct) — a workspace.id can
+    /// be shared across host groups (same daemon reached two ways), so an
+    /// id-based reverse lookup could pick the wrong (non-SSH) host.
+    let host: HostEntry
     let store: RemoteHostStore
     @State private var isHovering = false
+    @State private var isRenaming = false
+    @State private var renameTitle = ""
+    @State private var showDeleteConfirm = false
+    @FocusState private var renameFieldFocused: Bool
+
+    private var canManage: Bool { host.supportsWorkspaceLifecycle == true }
+
+    /// Row fill: an accent wash while renaming (so the mode reads at a
+    /// glance), a faint hover highlight otherwise.
+    private var rowBackgroundFill: Color {
+        if isRenaming { return Color.accentColor.opacity(0.12) }
+        return isHovering ? Color.primary.opacity(0.07) : Color.clear
+    }
+
+    /// Enter Finder-style inline rename: swap the label for a focused,
+    /// pre-selected text field.
+    private func beginRename() {
+        renameTitle = workspace.title
+        isRenaming = true
+    }
+
+    /// Row tap: open the live workspace mirror. Rename is a context-menu
+    /// action (the slow-second-click gesture was dropped — it fought the
+    /// click-to-open primary action and felt unpredictable).
+    private func handleTap() {
+        guard !isRenaming else { return }
+        store.openWorkspaceAsMirror(workspace, host: host, live: true)
+    }
+
+    /// Commit the edit if it changed and is non-empty; always exit edit mode.
+    private func commitRename() {
+        let title = renameTitle.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !title.isEmpty, title != workspace.title {
+            store.renameWorkspace(workspace, host: host, title: title)
+        }
+        isRenaming = false
+    }
 
     var body: some View {
         HStack(spacing: 5) {
             Image(systemName: "terminal")
                 .font(.system(size: 9))
                 .foregroundColor(.secondary)
-            Text(workspace.title)
-                .font(.system(size: 11.5))
-                .foregroundColor(.primary)
-                .lineLimit(1)
-                .truncationMode(.tail)
+            if isRenaming {
+                // Finder-style inline edit: Enter commits, Esc cancels,
+                // focus loss commits (matching macOS rename behavior).
+                // Distinct field chrome (filled background + accent ring)
+                // so entering rename reads clearly in both light and dark
+                // — a bare inline field was too easy to miss.
+                TextField("", text: $renameTitle)
+                    .textFieldStyle(.plain)
+                    .font(.system(size: 11.5))
+                    .foregroundColor(.primary)
+                    .focused($renameFieldFocused)
+                    .padding(.horizontal, 5)
+                    .padding(.vertical, 2)
+                    .background(
+                        RoundedRectangle(cornerRadius: 4)
+                            .fill(Color(nsColor: .textBackgroundColor))
+                            .overlay(
+                                RoundedRectangle(cornerRadius: 4)
+                                    .strokeBorder(Color.accentColor, lineWidth: 1.5)
+                            )
+                    )
+                    .onSubmit { commitRename() }
+                    .onExitCommand { isRenaming = false }   // Esc = cancel
+                    .onChange(of: renameFieldFocused) { focused in
+                        if !focused && isRenaming { commitRename() }
+                    }
+                    .onAppear { renameFieldFocused = true }
+            } else {
+                Text(workspace.title)
+                    .font(.system(size: 11.5))
+                    .foregroundColor(.primary)
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+            }
             Spacer()
         }
         .padding(.leading, 20)
@@ -828,13 +1197,52 @@ struct RemoteWorkspaceRowView: View {
         .padding(.vertical, 5)
         .background(
             RoundedRectangle(cornerRadius: 5)
-                .fill(isHovering ? Color.primary.opacity(0.07) : Color.clear)
+                .fill(rowBackgroundFill)
                 .padding(.horizontal, 4)
         )
         .contentShape(Rectangle())
-        .onTapGesture {
-            store.openWorkspace(workspace)
+        .onTapGesture { handleTap() }
+        .contextMenu {
+            // Live mirror (Phase 2B): host-authoritative layout sync —
+            // splits/closes follow the host and local actions forward.
+            Button("Open as Live Workspace in Main Window") {
+                store.openWorkspaceAsMirror(workspace, host: host, live: true)
+            }
+            // Legacy standalone viewer window.
+            Button("Open in Relay Window") {
+                store.openWorkspace(workspace, host: host)
+            }
+            // Snapshot mode (live: false — detached layout copy) is
+            // intentionally NOT offered: with content always streaming
+            // live, users read the near-identical workspace as a broken
+            // mirror. The code path stays for a future, clearer surface.
+            Divider()
+            // Rename opens Finder-style inline edit (no modal). Always
+            // shown, disabled when the host hasn't negotiated
+            // workspace.lifecycle.v1 — keeps the menu shape stable.
+            Button("Rename") { beginRename() }
+                .disabled(!canManage)
+            // Any workspace (including the default) can be deleted, but
+            // the host refuses to remove the LAST one — disable delete
+            // then so the action never silently no-ops.
+            Button("Delete…", role: .destructive) {
+                showDeleteConfirm = true
+            }
+            .disabled(!canManage || host.workspaces.count <= 1)
         }
         .onHover { isHovering = $0 }
+        .confirmationDialog(
+            "Delete \"\(workspace.title)\"?",
+            isPresented: $showDeleteConfirm
+        ) {
+            Button("Delete", role: .destructive) {
+                store.deleteWorkspace(workspace, host: host)
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text(workspace.isDefault
+                 ? "All panes on the host for this workspace are closed. This is the default workspace — another one is promoted in its place."
+                 : "All panes on the host for this workspace are closed.")
+        }
     }
 }

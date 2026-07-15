@@ -34,12 +34,12 @@ import SwiftProtobuf
 // incompatible with the version of SwiftProtobuf to which you are linking.
 // Please ensure that you are building against the same version of the API
 // that was used to generate this file.
-fileprivate struct _GeneratedWithProtocGenSwiftVersion: SwiftProtobuf.ProtobufAPIVersionCheck {
+fileprivate nonisolated struct _GeneratedWithProtocGenSwiftVersion: SwiftProtobuf.ProtobufAPIVersionCheck {
   struct _2: SwiftProtobuf.ProtobufAPIVersion_2 {}
   typealias Version = _2
 }
 
-public enum Termmesh_Peer_V1_AttachMode: SwiftProtobuf.Enum, Swift.CaseIterable {
+public nonisolated enum Termmesh_Peer_V1_AttachMode: SwiftProtobuf.Enum, Swift.CaseIterable {
   public typealias RawValue = Int
   case unspecified // = 0
   case readOnly // = 1
@@ -83,7 +83,7 @@ public enum Termmesh_Peer_V1_AttachMode: SwiftProtobuf.Enum, Swift.CaseIterable 
 
 /// Every frame on the wire is a length-prefixed Envelope.
 /// Frames larger than 16 MiB must be rejected with ERR_FRAME_TOO_LARGE.
-public struct Termmesh_Peer_V1_Envelope: Sendable {
+public nonisolated struct Termmesh_Peer_V1_Envelope: Sendable {
   // SwiftProtobuf.Message conformance is added in an extension below. See the
   // `Message` and `Message+*Additions` files in the SwiftProtobuf library for
   // methods supported on all messages.
@@ -192,6 +192,23 @@ public struct Termmesh_Peer_V1_Envelope: Sendable {
     set {payload = .workspaceControl(newValue)}
   }
 
+  /// Gated behind capability "workspace.lifecycle.v1" (Hello.capabilities).
+  public var createWorkspaceRequest: Termmesh_Peer_V1_CreateWorkspaceRequest {
+    get {
+      if case .createWorkspaceRequest(let v)? = payload {return v}
+      return Termmesh_Peer_V1_CreateWorkspaceRequest()
+    }
+    set {payload = .createWorkspaceRequest(newValue)}
+  }
+
+  public var createWorkspaceResponse: Termmesh_Peer_V1_CreateWorkspaceResponse {
+    get {
+      if case .createWorkspaceResponse(let v)? = payload {return v}
+      return Termmesh_Peer_V1_CreateWorkspaceResponse()
+    }
+    set {payload = .createWorkspaceResponse(newValue)}
+  }
+
   public var ptyData: Termmesh_Peer_V1_PtyData {
     get {
       if case .ptyData(let v)? = payload {return v}
@@ -240,6 +257,23 @@ public struct Termmesh_Peer_V1_Envelope: Sendable {
     set {payload = .workspaceUpdate(newValue)}
   }
 
+  /// Gated behind capability "workspace.lifecycle.v1" (Hello.capabilities).
+  public var renameWorkspaceRequest: Termmesh_Peer_V1_RenameWorkspaceRequest {
+    get {
+      if case .renameWorkspaceRequest(let v)? = payload {return v}
+      return Termmesh_Peer_V1_RenameWorkspaceRequest()
+    }
+    set {payload = .renameWorkspaceRequest(newValue)}
+  }
+
+  public var deleteWorkspaceRequest: Termmesh_Peer_V1_DeleteWorkspaceRequest {
+    get {
+      if case .deleteWorkspaceRequest(let v)? = payload {return v}
+      return Termmesh_Peer_V1_DeleteWorkspaceRequest()
+    }
+    set {payload = .deleteWorkspaceRequest(newValue)}
+  }
+
   public var ping: Termmesh_Peer_V1_Ping {
     get {
       if case .ping(let v)? = payload {return v}
@@ -274,7 +308,7 @@ public struct Termmesh_Peer_V1_Envelope: Sendable {
 
   public var unknownFields = SwiftProtobuf.UnknownStorage()
 
-  public enum OneOf_Payload: Equatable, Sendable {
+  public nonisolated enum OneOf_Payload: Equatable, Sendable {
     case hello(Termmesh_Peer_V1_Hello)
     case authChallenge(Termmesh_Peer_V1_AuthChallenge)
     case auth(Termmesh_Peer_V1_Auth)
@@ -287,12 +321,18 @@ public struct Termmesh_Peer_V1_Envelope: Sendable {
     case listWorkspaces(Termmesh_Peer_V1_ListWorkspaces)
     case workspaceList(Termmesh_Peer_V1_WorkspaceList)
     case workspaceControl(Termmesh_Peer_V1_WorkspaceControl)
+    /// Gated behind capability "workspace.lifecycle.v1" (Hello.capabilities).
+    case createWorkspaceRequest(Termmesh_Peer_V1_CreateWorkspaceRequest)
+    case createWorkspaceResponse(Termmesh_Peer_V1_CreateWorkspaceResponse)
     case ptyData(Termmesh_Peer_V1_PtyData)
     case input(Termmesh_Peer_V1_Input)
     case resize(Termmesh_Peer_V1_Resize)
     case gridSnapshot(Termmesh_Peer_V1_GridSnapshot)
     case dataAck(Termmesh_Peer_V1_DataAck)
     case workspaceUpdate(Termmesh_Peer_V1_WorkspaceUpdate)
+    /// Gated behind capability "workspace.lifecycle.v1" (Hello.capabilities).
+    case renameWorkspaceRequest(Termmesh_Peer_V1_RenameWorkspaceRequest)
+    case deleteWorkspaceRequest(Termmesh_Peer_V1_DeleteWorkspaceRequest)
     case ping(Termmesh_Peer_V1_Ping)
     case pong(Termmesh_Peer_V1_Pong)
     case goodbye(Termmesh_Peer_V1_Goodbye)
@@ -303,7 +343,7 @@ public struct Termmesh_Peer_V1_Envelope: Sendable {
   public init() {}
 }
 
-public struct Termmesh_Peer_V1_Hello: Sendable {
+public nonisolated struct Termmesh_Peer_V1_Hello: Sendable {
   // SwiftProtobuf.Message conformance is added in an extension below. See the
   // `Message` and `Message+*Additions` files in the SwiftProtobuf library for
   // methods supported on all messages.
@@ -328,7 +368,7 @@ public struct Termmesh_Peer_V1_Hello: Sendable {
   public init() {}
 }
 
-public struct Termmesh_Peer_V1_AuthChallenge: Sendable {
+public nonisolated struct Termmesh_Peer_V1_AuthChallenge: Sendable {
   // SwiftProtobuf.Message conformance is added in an extension below. See the
   // `Message` and `Message+*Additions` files in the SwiftProtobuf library for
   // methods supported on all messages.
@@ -344,7 +384,7 @@ public struct Termmesh_Peer_V1_AuthChallenge: Sendable {
   public init() {}
 }
 
-public struct Termmesh_Peer_V1_Auth: Sendable {
+public nonisolated struct Termmesh_Peer_V1_Auth: Sendable {
   // SwiftProtobuf.Message conformance is added in an extension below. See the
   // `Message` and `Message+*Additions` files in the SwiftProtobuf library for
   // methods supported on all messages.
@@ -364,7 +404,7 @@ public struct Termmesh_Peer_V1_Auth: Sendable {
   public init() {}
 }
 
-public struct Termmesh_Peer_V1_AuthResult: Sendable {
+public nonisolated struct Termmesh_Peer_V1_AuthResult: Sendable {
   // SwiftProtobuf.Message conformance is added in an extension below. See the
   // `Message` and `Message+*Additions` files in the SwiftProtobuf library for
   // methods supported on all messages.
@@ -382,7 +422,7 @@ public struct Termmesh_Peer_V1_AuthResult: Sendable {
   public init() {}
 }
 
-public struct Termmesh_Peer_V1_ListSurfaces: Sendable {
+public nonisolated struct Termmesh_Peer_V1_ListSurfaces: Sendable {
   // SwiftProtobuf.Message conformance is added in an extension below. See the
   // `Message` and `Message+*Additions` files in the SwiftProtobuf library for
   // methods supported on all messages.
@@ -392,7 +432,7 @@ public struct Termmesh_Peer_V1_ListSurfaces: Sendable {
   public init() {}
 }
 
-public struct Termmesh_Peer_V1_SurfaceList: Sendable {
+public nonisolated struct Termmesh_Peer_V1_SurfaceList: Sendable {
   // SwiftProtobuf.Message conformance is added in an extension below. See the
   // `Message` and `Message+*Additions` files in the SwiftProtobuf library for
   // methods supported on all messages.
@@ -404,7 +444,7 @@ public struct Termmesh_Peer_V1_SurfaceList: Sendable {
   public init() {}
 }
 
-public struct Termmesh_Peer_V1_SurfaceInfo: Sendable {
+public nonisolated struct Termmesh_Peer_V1_SurfaceInfo: Sendable {
   // SwiftProtobuf.Message conformance is added in an extension below. See the
   // `Message` and `Message+*Additions` files in the SwiftProtobuf library for
   // methods supported on all messages.
@@ -438,7 +478,7 @@ public struct Termmesh_Peer_V1_SurfaceInfo: Sendable {
   public init() {}
 }
 
-public struct Termmesh_Peer_V1_AttachSurface: Sendable {
+public nonisolated struct Termmesh_Peer_V1_AttachSurface: Sendable {
   // SwiftProtobuf.Message conformance is added in an extension below. See the
   // `Message` and `Message+*Additions` files in the SwiftProtobuf library for
   // methods supported on all messages.
@@ -460,7 +500,7 @@ public struct Termmesh_Peer_V1_AttachSurface: Sendable {
   public init() {}
 }
 
-public struct Termmesh_Peer_V1_AttachResult: Sendable {
+public nonisolated struct Termmesh_Peer_V1_AttachResult: Sendable {
   // SwiftProtobuf.Message conformance is added in an extension below. See the
   // `Message` and `Message+*Additions` files in the SwiftProtobuf library for
   // methods supported on all messages.
@@ -483,7 +523,7 @@ public struct Termmesh_Peer_V1_AttachResult: Sendable {
   public init() {}
 }
 
-public struct Termmesh_Peer_V1_DetachSurface: Sendable {
+public nonisolated struct Termmesh_Peer_V1_DetachSurface: Sendable {
   // SwiftProtobuf.Message conformance is added in an extension below. See the
   // `Message` and `Message+*Additions` files in the SwiftProtobuf library for
   // methods supported on all messages.
@@ -495,7 +535,7 @@ public struct Termmesh_Peer_V1_DetachSurface: Sendable {
   public init() {}
 }
 
-public struct Termmesh_Peer_V1_ListWorkspaces: Sendable {
+public nonisolated struct Termmesh_Peer_V1_ListWorkspaces: Sendable {
   // SwiftProtobuf.Message conformance is added in an extension below. See the
   // `Message` and `Message+*Additions` files in the SwiftProtobuf library for
   // methods supported on all messages.
@@ -505,7 +545,7 @@ public struct Termmesh_Peer_V1_ListWorkspaces: Sendable {
   public init() {}
 }
 
-public struct Termmesh_Peer_V1_WorkspaceList: Sendable {
+public nonisolated struct Termmesh_Peer_V1_WorkspaceList: Sendable {
   // SwiftProtobuf.Message conformance is added in an extension below. See the
   // `Message` and `Message+*Additions` files in the SwiftProtobuf library for
   // methods supported on all messages.
@@ -517,7 +557,7 @@ public struct Termmesh_Peer_V1_WorkspaceList: Sendable {
   public init() {}
 }
 
-public struct Termmesh_Peer_V1_Workspace: Sendable {
+public nonisolated struct Termmesh_Peer_V1_Workspace: Sendable {
   // SwiftProtobuf.Message conformance is added in an extension below. See the
   // `Message` and `Message+*Additions` files in the SwiftProtobuf library for
   // methods supported on all messages.
@@ -550,6 +590,14 @@ public struct Termmesh_Peer_V1_Workspace: Sendable {
   /// May be empty; clients fall back to a short window_id hex suffix.
   public var windowTitle: String = String()
 
+  /// True for the daemon's current default workspace (owns the static
+  /// TERMMESH_PEER_SURFACES shells; un-namespaced control commands land
+  /// here). The default is deletable — the host only refuses removing the
+  /// LAST workspace (LastWorkspace), promoting a survivor if the deleted
+  /// one was default. Clients surface this so the delete confirmation can
+  /// warn "the default is being replaced". Legacy hosts leave it false.
+  public var isDefault: Bool = false
+
   public var unknownFields = SwiftProtobuf.UnknownStorage()
 
   public init() {}
@@ -558,7 +606,7 @@ public struct Termmesh_Peer_V1_Workspace: Sendable {
 }
 
 /// Recursive node: either a split (interior) or a pane (leaf).
-public struct Termmesh_Peer_V1_WorkspaceLayout: @unchecked Sendable {
+public nonisolated struct Termmesh_Peer_V1_WorkspaceLayout: @unchecked Sendable {
   // SwiftProtobuf.Message conformance is added in an extension below. See the
   // `Message` and `Message+*Additions` files in the SwiftProtobuf library for
   // methods supported on all messages.
@@ -586,7 +634,7 @@ public struct Termmesh_Peer_V1_WorkspaceLayout: @unchecked Sendable {
 
   public var unknownFields = SwiftProtobuf.UnknownStorage()
 
-  public enum OneOf_Node: Equatable, Sendable {
+  public nonisolated enum OneOf_Node: Equatable, Sendable {
     case split(Termmesh_Peer_V1_WorkspaceSplit)
     case pane(Termmesh_Peer_V1_WorkspacePane)
 
@@ -597,7 +645,7 @@ public struct Termmesh_Peer_V1_WorkspaceLayout: @unchecked Sendable {
   fileprivate var _storage = _StorageClass.defaultInstance
 }
 
-public struct Termmesh_Peer_V1_WorkspaceSplit: @unchecked Sendable {
+public nonisolated struct Termmesh_Peer_V1_WorkspaceSplit: @unchecked Sendable {
   // SwiftProtobuf.Message conformance is added in an extension below. See the
   // `Message` and `Message+*Additions` files in the SwiftProtobuf library for
   // methods supported on all messages.
@@ -648,7 +696,7 @@ public struct Termmesh_Peer_V1_WorkspaceSplit: @unchecked Sendable {
   fileprivate var _storage = _StorageClass.defaultInstance
 }
 
-public struct Termmesh_Peer_V1_WorkspacePane: Sendable {
+public nonisolated struct Termmesh_Peer_V1_WorkspacePane: Sendable {
   // SwiftProtobuf.Message conformance is added in an extension below. See the
   // `Message` and `Message+*Additions` files in the SwiftProtobuf library for
   // methods supported on all messages.
@@ -679,7 +727,7 @@ public struct Termmesh_Peer_V1_WorkspacePane: Sendable {
   public init() {}
 }
 
-public struct Termmesh_Peer_V1_PaneTab: Sendable {
+public nonisolated struct Termmesh_Peer_V1_PaneTab: Sendable {
   // SwiftProtobuf.Message conformance is added in an extension below. See the
   // `Message` and `Message+*Additions` files in the SwiftProtobuf library for
   // methods supported on all messages.
@@ -693,7 +741,88 @@ public struct Termmesh_Peer_V1_PaneTab: Sendable {
   public init() {}
 }
 
-public struct Termmesh_Peer_V1_WorkspaceControl: Sendable {
+public nonisolated struct Termmesh_Peer_V1_CreateWorkspaceRequest: Sendable {
+  // SwiftProtobuf.Message conformance is added in an extension below. See the
+  // `Message` and `Message+*Additions` files in the SwiftProtobuf library for
+  // methods supported on all messages.
+
+  /// Human-readable title for the new, initially pane-less workspace.
+  /// May be empty; the host may substitute a default title.
+  public var title: String = String()
+
+  public var unknownFields = SwiftProtobuf.UnknownStorage()
+
+  public init() {}
+}
+
+public nonisolated struct Termmesh_Peer_V1_CreateWorkspaceResponse: Sendable {
+  // SwiftProtobuf.Message conformance is added in an extension below. See the
+  // `Message` and `Message+*Additions` files in the SwiftProtobuf library for
+  // methods supported on all messages.
+
+  public var accepted: Bool = false
+
+  /// Human-readable reason on failure; empty on success.
+  public var reason: String = String()
+
+  /// Host-assigned id of the newly created workspace. Empty when
+  /// accepted == false.
+  public var workspaceID: Data = Data()
+
+  public var unknownFields = SwiftProtobuf.UnknownStorage()
+
+  public init() {}
+}
+
+public nonisolated struct Termmesh_Peer_V1_RenameWorkspaceRequest: Sendable {
+  // SwiftProtobuf.Message conformance is added in an extension below. See the
+  // `Message` and `Message+*Additions` files in the SwiftProtobuf library for
+  // methods supported on all messages.
+
+  /// Must reference an existing workspace_id. Empty or unknown ids must
+  /// be safely rejected by the host, never silently applied to an
+  /// unrelated (e.g. "current") workspace.
+  public var workspaceID: Data = Data()
+
+  public var title: String = String()
+
+  public var unknownFields = SwiftProtobuf.UnknownStorage()
+
+  public init() {}
+}
+
+public nonisolated struct Termmesh_Peer_V1_DeleteWorkspaceRequest: Sendable {
+  // SwiftProtobuf.Message conformance is added in an extension below. See the
+  // `Message` and `Message+*Additions` files in the SwiftProtobuf library for
+  // methods supported on all messages.
+
+  /// Must reference an existing workspace_id. Empty or unknown ids must
+  /// be safely rejected by the host (no-op + error reply), never
+  /// interpreted as "delete all" or "delete current".
+  public var workspaceID: Data = Data()
+
+  public var unknownFields = SwiftProtobuf.UnknownStorage()
+
+  public init() {}
+}
+
+/// Pushed by the host to every attached client when a workspace is
+/// deleted (via DeleteWorkspaceRequest or a host-local UI action), so
+/// clients can drop it from their sidebar/roster without polling
+/// ListWorkspaces.
+public nonisolated struct Termmesh_Peer_V1_WorkspaceRemoved: Sendable {
+  // SwiftProtobuf.Message conformance is added in an extension below. See the
+  // `Message` and `Message+*Additions` files in the SwiftProtobuf library for
+  // methods supported on all messages.
+
+  public var workspaceID: Data = Data()
+
+  public var unknownFields = SwiftProtobuf.UnknownStorage()
+
+  public init() {}
+}
+
+public nonisolated struct Termmesh_Peer_V1_WorkspaceControl: Sendable {
   // SwiftProtobuf.Message conformance is added in an extension below. See the
   // `Message` and `Message+*Additions` files in the SwiftProtobuf library for
   // methods supported on all messages.
@@ -750,7 +879,7 @@ public struct Termmesh_Peer_V1_WorkspaceControl: Sendable {
 
   public var unknownFields = SwiftProtobuf.UnknownStorage()
 
-  public enum OneOf_Kind: Equatable, Sendable {
+  public nonisolated enum OneOf_Kind: Equatable, Sendable {
     case splitPane(Termmesh_Peer_V1_SplitPaneRequest)
     case closePane(Termmesh_Peer_V1_ClosePaneRequest)
     case focusPane(Termmesh_Peer_V1_FocusPaneRequest)
@@ -763,7 +892,7 @@ public struct Termmesh_Peer_V1_WorkspaceControl: Sendable {
   public init() {}
 }
 
-public struct Termmesh_Peer_V1_SplitPaneRequest: Sendable {
+public nonisolated struct Termmesh_Peer_V1_SplitPaneRequest: Sendable {
   // SwiftProtobuf.Message conformance is added in an extension below. See the
   // `Message` and `Message+*Additions` files in the SwiftProtobuf library for
   // methods supported on all messages.
@@ -780,7 +909,7 @@ public struct Termmesh_Peer_V1_SplitPaneRequest: Sendable {
   public init() {}
 }
 
-public struct Termmesh_Peer_V1_ClosePaneRequest: Sendable {
+public nonisolated struct Termmesh_Peer_V1_ClosePaneRequest: Sendable {
   // SwiftProtobuf.Message conformance is added in an extension below. See the
   // `Message` and `Message+*Additions` files in the SwiftProtobuf library for
   // methods supported on all messages.
@@ -792,7 +921,7 @@ public struct Termmesh_Peer_V1_ClosePaneRequest: Sendable {
   public init() {}
 }
 
-public struct Termmesh_Peer_V1_FocusPaneRequest: Sendable {
+public nonisolated struct Termmesh_Peer_V1_FocusPaneRequest: Sendable {
   // SwiftProtobuf.Message conformance is added in an extension below. See the
   // `Message` and `Message+*Additions` files in the SwiftProtobuf library for
   // methods supported on all messages.
@@ -804,7 +933,7 @@ public struct Termmesh_Peer_V1_FocusPaneRequest: Sendable {
   public init() {}
 }
 
-public struct Termmesh_Peer_V1_SetDividerPositionRequest: Sendable {
+public nonisolated struct Termmesh_Peer_V1_SetDividerPositionRequest: Sendable {
   // SwiftProtobuf.Message conformance is added in an extension below. See the
   // `Message` and `Message+*Additions` files in the SwiftProtobuf library for
   // methods supported on all messages.
@@ -814,12 +943,19 @@ public struct Termmesh_Peer_V1_SetDividerPositionRequest: Sendable {
   /// Fraction in [0.0, 1.0] of the first child.
   public var ratio: Double = 0
 
+  /// Owning workspace. split_id is unique only WITHIN a workspace's tree
+  /// (each LayoutStore has its own counter), so two workspaces routinely
+  /// share a split_id — without this, the host would resize whichever
+  /// tree matches first. Empty = legacy client; the host falls back to
+  /// first-match (single-workspace behavior).
+  public var workspaceID: Data = Data()
+
   public var unknownFields = SwiftProtobuf.UnknownStorage()
 
   public init() {}
 }
 
-public struct Termmesh_Peer_V1_NewTabRequest: Sendable {
+public nonisolated struct Termmesh_Peer_V1_NewTabRequest: Sendable {
   // SwiftProtobuf.Message conformance is added in an extension below. See the
   // `Message` and `Message+*Additions` files in the SwiftProtobuf library for
   // methods supported on all messages.
@@ -829,12 +965,18 @@ public struct Termmesh_Peer_V1_NewTabRequest: Sendable {
   /// pane id and creates a new tab there.
   public var paneID: Data = Data()
 
+  /// Target workspace for the "empty workspace" case, where pane_id is
+  /// empty/unresolvable because the workspace has no panes yet (e.g.
+  /// right after CreateWorkspaceRequest). Ignored when pane_id resolves
+  /// to an existing pane. Gated behind capability "workspace.lifecycle.v1".
+  public var workspaceID: Data = Data()
+
   public var unknownFields = SwiftProtobuf.UnknownStorage()
 
   public init() {}
 }
 
-public struct Termmesh_Peer_V1_ActivateTabRequest: Sendable {
+public nonisolated struct Termmesh_Peer_V1_ActivateTabRequest: Sendable {
   // SwiftProtobuf.Message conformance is added in an extension below. See the
   // `Message` and `Message+*Additions` files in the SwiftProtobuf library for
   // methods supported on all messages.
@@ -851,7 +993,7 @@ public struct Termmesh_Peer_V1_ActivateTabRequest: Sendable {
   public init() {}
 }
 
-public struct Termmesh_Peer_V1_PtyData: Sendable {
+public nonisolated struct Termmesh_Peer_V1_PtyData: Sendable {
   // SwiftProtobuf.Message conformance is added in an extension below. See the
   // `Message` and `Message+*Additions` files in the SwiftProtobuf library for
   // methods supported on all messages.
@@ -868,7 +1010,7 @@ public struct Termmesh_Peer_V1_PtyData: Sendable {
   public init() {}
 }
 
-public struct Termmesh_Peer_V1_Input: Sendable {
+public nonisolated struct Termmesh_Peer_V1_Input: Sendable {
   // SwiftProtobuf.Message conformance is added in an extension below. See the
   // `Message` and `Message+*Additions` files in the SwiftProtobuf library for
   // methods supported on all messages.
@@ -904,7 +1046,7 @@ public struct Termmesh_Peer_V1_Input: Sendable {
 
   public var unknownFields = SwiftProtobuf.UnknownStorage()
 
-  public enum OneOf_Kind: Equatable, Sendable {
+  public nonisolated enum OneOf_Kind: Equatable, Sendable {
     /// Raw key bytes already encoded in the terminal's expected form.
     case keys(Data)
     case mouse(Termmesh_Peer_V1_MouseEvent)
@@ -915,7 +1057,7 @@ public struct Termmesh_Peer_V1_Input: Sendable {
   public init() {}
 }
 
-public struct Termmesh_Peer_V1_MouseEvent: Sendable {
+public nonisolated struct Termmesh_Peer_V1_MouseEvent: Sendable {
   // SwiftProtobuf.Message conformance is added in an extension below. See the
   // `Message` and `Message+*Additions` files in the SwiftProtobuf library for
   // methods supported on all messages.
@@ -937,7 +1079,7 @@ public struct Termmesh_Peer_V1_MouseEvent: Sendable {
   public init() {}
 }
 
-public struct Termmesh_Peer_V1_Paste: Sendable {
+public nonisolated struct Termmesh_Peer_V1_Paste: Sendable {
   // SwiftProtobuf.Message conformance is added in an extension below. See the
   // `Message` and `Message+*Additions` files in the SwiftProtobuf library for
   // methods supported on all messages.
@@ -949,7 +1091,7 @@ public struct Termmesh_Peer_V1_Paste: Sendable {
   public init() {}
 }
 
-public struct Termmesh_Peer_V1_Resize: Sendable {
+public nonisolated struct Termmesh_Peer_V1_Resize: Sendable {
   // SwiftProtobuf.Message conformance is added in an extension below. See the
   // `Message` and `Message+*Additions` files in the SwiftProtobuf library for
   // methods supported on all messages.
@@ -972,7 +1114,7 @@ public struct Termmesh_Peer_V1_Resize: Sendable {
 /// Periodic visible-screen keyframe. Scrollback is NOT included here;
 /// clients reconnecting within the host ring buffer get bytes replayed,
 /// clients outside accept scrollback loss.
-public struct Termmesh_Peer_V1_GridSnapshot: Sendable {
+public nonisolated struct Termmesh_Peer_V1_GridSnapshot: Sendable {
   // SwiftProtobuf.Message conformance is added in an extension below. See the
   // `Message` and `Message+*Additions` files in the SwiftProtobuf library for
   // methods supported on all messages.
@@ -1006,7 +1148,7 @@ public struct Termmesh_Peer_V1_GridSnapshot: Sendable {
   fileprivate var _cursor: Termmesh_Peer_V1_CursorState? = nil
 }
 
-public struct Termmesh_Peer_V1_CursorState: Sendable {
+public nonisolated struct Termmesh_Peer_V1_CursorState: Sendable {
   // SwiftProtobuf.Message conformance is added in an extension below. See the
   // `Message` and `Message+*Additions` files in the SwiftProtobuf library for
   // methods supported on all messages.
@@ -1025,7 +1167,7 @@ public struct Termmesh_Peer_V1_CursorState: Sendable {
   public init() {}
 }
 
-public struct Termmesh_Peer_V1_GridRow: Sendable {
+public nonisolated struct Termmesh_Peer_V1_GridRow: Sendable {
   // SwiftProtobuf.Message conformance is added in an extension below. See the
   // `Message` and `Message+*Additions` files in the SwiftProtobuf library for
   // methods supported on all messages.
@@ -1037,7 +1179,7 @@ public struct Termmesh_Peer_V1_GridRow: Sendable {
   public init() {}
 }
 
-public struct Termmesh_Peer_V1_Cell: Sendable {
+public nonisolated struct Termmesh_Peer_V1_Cell: Sendable {
   // SwiftProtobuf.Message conformance is added in an extension below. See the
   // `Message` and `Message+*Additions` files in the SwiftProtobuf library for
   // methods supported on all messages.
@@ -1061,7 +1203,7 @@ public struct Termmesh_Peer_V1_Cell: Sendable {
 
 /// Advisory: clients may send periodically for RTT measurement and so the
 /// host can trim its reconnect ring buffer. Not required for correctness.
-public struct Termmesh_Peer_V1_DataAck: Sendable {
+public nonisolated struct Termmesh_Peer_V1_DataAck: Sendable {
   // SwiftProtobuf.Message conformance is added in an extension below. See the
   // `Message` and `Message+*Additions` files in the SwiftProtobuf library for
   // methods supported on all messages.
@@ -1075,7 +1217,7 @@ public struct Termmesh_Peer_V1_DataAck: Sendable {
   public init() {}
 }
 
-public struct Termmesh_Peer_V1_WorkspaceUpdate: Sendable {
+public nonisolated struct Termmesh_Peer_V1_WorkspaceUpdate: Sendable {
   // SwiftProtobuf.Message conformance is added in an extension below. See the
   // `Message` and `Message+*Additions` files in the SwiftProtobuf library for
   // methods supported on all messages.
@@ -1134,9 +1276,19 @@ public struct Termmesh_Peer_V1_WorkspaceUpdate: Sendable {
     set {kind = .workspaceLayout(newValue)}
   }
 
+  /// Pushed when a workspace itself (not a pane inside one) is
+  /// deleted. Gated behind capability "workspace.lifecycle.v1".
+  public var workspaceRemoved: Termmesh_Peer_V1_WorkspaceRemoved {
+    get {
+      if case .workspaceRemoved(let v)? = kind {return v}
+      return Termmesh_Peer_V1_WorkspaceRemoved()
+    }
+    set {kind = .workspaceRemoved(newValue)}
+  }
+
   public var unknownFields = SwiftProtobuf.UnknownStorage()
 
-  public enum OneOf_Kind: Equatable, Sendable {
+  public nonisolated enum OneOf_Kind: Equatable, Sendable {
     case added(Termmesh_Peer_V1_SurfaceAdded)
     case removed(Termmesh_Peer_V1_SurfaceRemoved)
     case retitled(Termmesh_Peer_V1_SurfaceRetitled)
@@ -1147,13 +1299,16 @@ public struct Termmesh_Peer_V1_WorkspaceUpdate: Sendable {
     /// refreshed `WorkspaceLayout` so attached clients can diff
     /// against their current state and patch the layout in place.
     case workspaceLayout(Termmesh_Peer_V1_WorkspaceLayoutChanged)
+    /// Pushed when a workspace itself (not a pane inside one) is
+    /// deleted. Gated behind capability "workspace.lifecycle.v1".
+    case workspaceRemoved(Termmesh_Peer_V1_WorkspaceRemoved)
 
   }
 
   public init() {}
 }
 
-public struct Termmesh_Peer_V1_SurfaceAdded: Sendable {
+public nonisolated struct Termmesh_Peer_V1_SurfaceAdded: Sendable {
   // SwiftProtobuf.Message conformance is added in an extension below. See the
   // `Message` and `Message+*Additions` files in the SwiftProtobuf library for
   // methods supported on all messages.
@@ -1176,7 +1331,7 @@ public struct Termmesh_Peer_V1_SurfaceAdded: Sendable {
   fileprivate var _surface: Termmesh_Peer_V1_SurfaceInfo? = nil
 }
 
-public struct Termmesh_Peer_V1_SurfaceRemoved: Sendable {
+public nonisolated struct Termmesh_Peer_V1_SurfaceRemoved: Sendable {
   // SwiftProtobuf.Message conformance is added in an extension below. See the
   // `Message` and `Message+*Additions` files in the SwiftProtobuf library for
   // methods supported on all messages.
@@ -1188,7 +1343,7 @@ public struct Termmesh_Peer_V1_SurfaceRemoved: Sendable {
   public init() {}
 }
 
-public struct Termmesh_Peer_V1_SurfaceRetitled: Sendable {
+public nonisolated struct Termmesh_Peer_V1_SurfaceRetitled: Sendable {
   // SwiftProtobuf.Message conformance is added in an extension below. See the
   // `Message` and `Message+*Additions` files in the SwiftProtobuf library for
   // methods supported on all messages.
@@ -1202,7 +1357,7 @@ public struct Termmesh_Peer_V1_SurfaceRetitled: Sendable {
   public init() {}
 }
 
-public struct Termmesh_Peer_V1_WorkspaceMeta: Sendable {
+public nonisolated struct Termmesh_Peer_V1_WorkspaceMeta: Sendable {
   // SwiftProtobuf.Message conformance is added in an extension below. See the
   // `Message` and `Message+*Additions` files in the SwiftProtobuf library for
   // methods supported on all messages.
@@ -1220,7 +1375,7 @@ public struct Termmesh_Peer_V1_WorkspaceMeta: Sendable {
   public init() {}
 }
 
-public struct Termmesh_Peer_V1_SplitChanged: Sendable {
+public nonisolated struct Termmesh_Peer_V1_SplitChanged: Sendable {
   // SwiftProtobuf.Message conformance is added in an extension below. See the
   // `Message` and `Message+*Additions` files in the SwiftProtobuf library for
   // methods supported on all messages.
@@ -1236,7 +1391,7 @@ public struct Termmesh_Peer_V1_SplitChanged: Sendable {
   public init() {}
 }
 
-public struct Termmesh_Peer_V1_WorkspaceLayoutChanged: Sendable {
+public nonisolated struct Termmesh_Peer_V1_WorkspaceLayoutChanged: Sendable {
   // SwiftProtobuf.Message conformance is added in an extension below. See the
   // `Message` and `Message+*Additions` files in the SwiftProtobuf library for
   // methods supported on all messages.
@@ -1259,7 +1414,7 @@ public struct Termmesh_Peer_V1_WorkspaceLayoutChanged: Sendable {
   fileprivate var _layout: Termmesh_Peer_V1_WorkspaceLayout? = nil
 }
 
-public struct Termmesh_Peer_V1_Ping: Sendable {
+public nonisolated struct Termmesh_Peer_V1_Ping: Sendable {
   // SwiftProtobuf.Message conformance is added in an extension below. See the
   // `Message` and `Message+*Additions` files in the SwiftProtobuf library for
   // methods supported on all messages.
@@ -1271,7 +1426,7 @@ public struct Termmesh_Peer_V1_Ping: Sendable {
   public init() {}
 }
 
-public struct Termmesh_Peer_V1_Pong: Sendable {
+public nonisolated struct Termmesh_Peer_V1_Pong: Sendable {
   // SwiftProtobuf.Message conformance is added in an extension below. See the
   // `Message` and `Message+*Additions` files in the SwiftProtobuf library for
   // methods supported on all messages.
@@ -1283,7 +1438,7 @@ public struct Termmesh_Peer_V1_Pong: Sendable {
   public init() {}
 }
 
-public struct Termmesh_Peer_V1_Goodbye: Sendable {
+public nonisolated struct Termmesh_Peer_V1_Goodbye: Sendable {
   // SwiftProtobuf.Message conformance is added in an extension below. See the
   // `Message` and `Message+*Additions` files in the SwiftProtobuf library for
   // methods supported on all messages.
@@ -1295,7 +1450,7 @@ public struct Termmesh_Peer_V1_Goodbye: Sendable {
   public init() {}
 }
 
-public struct Termmesh_Peer_V1_Error: Sendable {
+public nonisolated struct Termmesh_Peer_V1_Error: Sendable {
   // SwiftProtobuf.Message conformance is added in an extension below. See the
   // `Message` and `Message+*Additions` files in the SwiftProtobuf library for
   // methods supported on all messages.
@@ -1316,15 +1471,15 @@ public struct Termmesh_Peer_V1_Error: Sendable {
 
 // MARK: - Code below here is support for the SwiftProtobuf runtime.
 
-fileprivate let _protobuf_package = "termmesh.peer.v1"
+fileprivate nonisolated let _protobuf_package = "termmesh.peer.v1"
 
-extension Termmesh_Peer_V1_AttachMode: SwiftProtobuf._ProtoNameProviding {
+nonisolated extension Termmesh_Peer_V1_AttachMode: SwiftProtobuf._ProtoNameProviding {
   public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{2}\0ATTACH_MODE_UNSPECIFIED\0\u{1}ATTACH_MODE_READ_ONLY\0\u{1}ATTACH_MODE_CO_WRITE\0\u{1}ATTACH_MODE_TAKE_OVER\0")
 }
 
-extension Termmesh_Peer_V1_Envelope: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
+nonisolated extension Termmesh_Peer_V1_Envelope: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
   public static let protoMessageName: String = _protobuf_package + ".Envelope"
-  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{1}seq\0\u{3}correlation_id\0\u{2}\u{8}hello\0\u{3}auth_challenge\0\u{1}auth\0\u{3}auth_result\0\u{4}\u{7}list_surfaces\0\u{3}surface_list\0\u{3}attach_surface\0\u{3}attach_result\0\u{3}detach_surface\0\u{3}list_workspaces\0\u{3}workspace_list\0\u{3}workspace_control\0\u{4}\u{3}pty_data\0\u{1}input\0\u{1}resize\0\u{3}grid_snapshot\0\u{3}data_ack\0\u{4}\u{6}workspace_update\0\u{2}\u{a}ping\0\u{1}pong\0\u{2}\u{9}goodbye\0\u{2}'error\0")
+  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{1}seq\0\u{3}correlation_id\0\u{2}\u{8}hello\0\u{3}auth_challenge\0\u{1}auth\0\u{3}auth_result\0\u{4}\u{7}list_surfaces\0\u{3}surface_list\0\u{3}attach_surface\0\u{3}attach_result\0\u{3}detach_surface\0\u{3}list_workspaces\0\u{3}workspace_list\0\u{3}workspace_control\0\u{3}create_workspace_request\0\u{3}create_workspace_response\0\u{3}pty_data\0\u{1}input\0\u{1}resize\0\u{3}grid_snapshot\0\u{3}data_ack\0\u{4}\u{6}workspace_update\0\u{3}rename_workspace_request\0\u{3}delete_workspace_request\0\u{2}\u{8}ping\0\u{1}pong\0\u{2}\u{9}goodbye\0\u{2}'error\0")
 
   public mutating func decodeMessage<D: SwiftProtobuf.Decoder>(decoder: inout D) throws {
     while let fieldNumber = try decoder.nextFieldNumber() {
@@ -1490,6 +1645,32 @@ extension Termmesh_Peer_V1_Envelope: SwiftProtobuf.Message, SwiftProtobuf._Messa
           self.payload = .workspaceControl(v)
         }
       }()
+      case 28: try {
+        var v: Termmesh_Peer_V1_CreateWorkspaceRequest?
+        var hadOneofValue = false
+        if let current = self.payload {
+          hadOneofValue = true
+          if case .createWorkspaceRequest(let m) = current {v = m}
+        }
+        try decoder.decodeSingularMessageField(value: &v)
+        if let v = v {
+          if hadOneofValue {try decoder.handleConflictingOneOf()}
+          self.payload = .createWorkspaceRequest(v)
+        }
+      }()
+      case 29: try {
+        var v: Termmesh_Peer_V1_CreateWorkspaceResponse?
+        var hadOneofValue = false
+        if let current = self.payload {
+          hadOneofValue = true
+          if case .createWorkspaceResponse(let m) = current {v = m}
+        }
+        try decoder.decodeSingularMessageField(value: &v)
+        if let v = v {
+          if hadOneofValue {try decoder.handleConflictingOneOf()}
+          self.payload = .createWorkspaceResponse(v)
+        }
+      }()
       case 30: try {
         var v: Termmesh_Peer_V1_PtyData?
         var hadOneofValue = false
@@ -1566,6 +1747,32 @@ extension Termmesh_Peer_V1_Envelope: SwiftProtobuf.Message, SwiftProtobuf._Messa
         if let v = v {
           if hadOneofValue {try decoder.handleConflictingOneOf()}
           self.payload = .workspaceUpdate(v)
+        }
+      }()
+      case 41: try {
+        var v: Termmesh_Peer_V1_RenameWorkspaceRequest?
+        var hadOneofValue = false
+        if let current = self.payload {
+          hadOneofValue = true
+          if case .renameWorkspaceRequest(let m) = current {v = m}
+        }
+        try decoder.decodeSingularMessageField(value: &v)
+        if let v = v {
+          if hadOneofValue {try decoder.handleConflictingOneOf()}
+          self.payload = .renameWorkspaceRequest(v)
+        }
+      }()
+      case 42: try {
+        var v: Termmesh_Peer_V1_DeleteWorkspaceRequest?
+        var hadOneofValue = false
+        if let current = self.payload {
+          hadOneofValue = true
+          if case .deleteWorkspaceRequest(let m) = current {v = m}
+        }
+        try decoder.decodeSingularMessageField(value: &v)
+        if let v = v {
+          if hadOneofValue {try decoder.handleConflictingOneOf()}
+          self.payload = .deleteWorkspaceRequest(v)
         }
       }()
       case 50: try {
@@ -1685,6 +1892,14 @@ extension Termmesh_Peer_V1_Envelope: SwiftProtobuf.Message, SwiftProtobuf._Messa
       guard case .workspaceControl(let v)? = self.payload else { preconditionFailure() }
       try visitor.visitSingularMessageField(value: v, fieldNumber: 27)
     }()
+    case .createWorkspaceRequest?: try {
+      guard case .createWorkspaceRequest(let v)? = self.payload else { preconditionFailure() }
+      try visitor.visitSingularMessageField(value: v, fieldNumber: 28)
+    }()
+    case .createWorkspaceResponse?: try {
+      guard case .createWorkspaceResponse(let v)? = self.payload else { preconditionFailure() }
+      try visitor.visitSingularMessageField(value: v, fieldNumber: 29)
+    }()
     case .ptyData?: try {
       guard case .ptyData(let v)? = self.payload else { preconditionFailure() }
       try visitor.visitSingularMessageField(value: v, fieldNumber: 30)
@@ -1708,6 +1923,14 @@ extension Termmesh_Peer_V1_Envelope: SwiftProtobuf.Message, SwiftProtobuf._Messa
     case .workspaceUpdate?: try {
       guard case .workspaceUpdate(let v)? = self.payload else { preconditionFailure() }
       try visitor.visitSingularMessageField(value: v, fieldNumber: 40)
+    }()
+    case .renameWorkspaceRequest?: try {
+      guard case .renameWorkspaceRequest(let v)? = self.payload else { preconditionFailure() }
+      try visitor.visitSingularMessageField(value: v, fieldNumber: 41)
+    }()
+    case .deleteWorkspaceRequest?: try {
+      guard case .deleteWorkspaceRequest(let v)? = self.payload else { preconditionFailure() }
+      try visitor.visitSingularMessageField(value: v, fieldNumber: 42)
     }()
     case .ping?: try {
       guard case .ping(let v)? = self.payload else { preconditionFailure() }
@@ -1739,7 +1962,7 @@ extension Termmesh_Peer_V1_Envelope: SwiftProtobuf.Message, SwiftProtobuf._Messa
   }
 }
 
-extension Termmesh_Peer_V1_Hello: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
+nonisolated extension Termmesh_Peer_V1_Hello: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
   public static let protoMessageName: String = _protobuf_package + ".Hello"
   public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{3}protocol_version\0\u{3}peer_id\0\u{3}display_name\0\u{1}capabilities\0\u{3}app_version\0")
 
@@ -1789,7 +2012,7 @@ extension Termmesh_Peer_V1_Hello: SwiftProtobuf.Message, SwiftProtobuf._MessageI
   }
 }
 
-extension Termmesh_Peer_V1_AuthChallenge: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
+nonisolated extension Termmesh_Peer_V1_AuthChallenge: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
   public static let protoMessageName: String = _protobuf_package + ".AuthChallenge"
   public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{1}nonce\0\u{3}supported_methods\0")
 
@@ -1824,7 +2047,7 @@ extension Termmesh_Peer_V1_AuthChallenge: SwiftProtobuf.Message, SwiftProtobuf._
   }
 }
 
-extension Termmesh_Peer_V1_Auth: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
+nonisolated extension Termmesh_Peer_V1_Auth: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
   public static let protoMessageName: String = _protobuf_package + ".Auth"
   public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{1}method\0\u{3}token_id\0\u{1}signature\0")
 
@@ -1864,7 +2087,7 @@ extension Termmesh_Peer_V1_Auth: SwiftProtobuf.Message, SwiftProtobuf._MessageIm
   }
 }
 
-extension Termmesh_Peer_V1_AuthResult: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
+nonisolated extension Termmesh_Peer_V1_AuthResult: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
   public static let protoMessageName: String = _protobuf_package + ".AuthResult"
   public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{1}accepted\0\u{1}reason\0\u{3}session_id\0")
 
@@ -1904,7 +2127,7 @@ extension Termmesh_Peer_V1_AuthResult: SwiftProtobuf.Message, SwiftProtobuf._Mes
   }
 }
 
-extension Termmesh_Peer_V1_ListSurfaces: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
+nonisolated extension Termmesh_Peer_V1_ListSurfaces: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
   public static let protoMessageName: String = _protobuf_package + ".ListSurfaces"
   public static let _protobuf_nameMap = SwiftProtobuf._NameMap()
 
@@ -1923,7 +2146,7 @@ extension Termmesh_Peer_V1_ListSurfaces: SwiftProtobuf.Message, SwiftProtobuf._M
   }
 }
 
-extension Termmesh_Peer_V1_SurfaceList: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
+nonisolated extension Termmesh_Peer_V1_SurfaceList: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
   public static let protoMessageName: String = _protobuf_package + ".SurfaceList"
   public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{1}surfaces\0")
 
@@ -1953,7 +2176,7 @@ extension Termmesh_Peer_V1_SurfaceList: SwiftProtobuf.Message, SwiftProtobuf._Me
   }
 }
 
-extension Termmesh_Peer_V1_SurfaceInfo: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
+nonisolated extension Termmesh_Peer_V1_SurfaceInfo: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
   public static let protoMessageName: String = _protobuf_package + ".SurfaceInfo"
   public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{3}surface_id\0\u{3}workspace_name\0\u{1}title\0\u{1}cols\0\u{1}rows\0\u{3}surface_type\0\u{1}attachable\0\u{1}cwd\0\u{1}branch\0")
 
@@ -2023,7 +2246,7 @@ extension Termmesh_Peer_V1_SurfaceInfo: SwiftProtobuf.Message, SwiftProtobuf._Me
   }
 }
 
-extension Termmesh_Peer_V1_AttachSurface: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
+nonisolated extension Termmesh_Peer_V1_AttachSurface: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
   public static let protoMessageName: String = _protobuf_package + ".AttachSurface"
   public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{3}surface_id\0\u{1}mode\0\u{3}client_cols\0\u{3}client_rows\0\u{3}resume_from_seq\0")
 
@@ -2073,7 +2296,7 @@ extension Termmesh_Peer_V1_AttachSurface: SwiftProtobuf.Message, SwiftProtobuf._
   }
 }
 
-extension Termmesh_Peer_V1_AttachResult: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
+nonisolated extension Termmesh_Peer_V1_AttachResult: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
   public static let protoMessageName: String = _protobuf_package + ".AttachResult"
   public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{1}accepted\0\u{1}reason\0\u{3}surface_id\0\u{3}initial_seq\0\u{3}granted_mode\0")
 
@@ -2123,7 +2346,7 @@ extension Termmesh_Peer_V1_AttachResult: SwiftProtobuf.Message, SwiftProtobuf._M
   }
 }
 
-extension Termmesh_Peer_V1_DetachSurface: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
+nonisolated extension Termmesh_Peer_V1_DetachSurface: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
   public static let protoMessageName: String = _protobuf_package + ".DetachSurface"
   public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{3}surface_id\0")
 
@@ -2153,7 +2376,7 @@ extension Termmesh_Peer_V1_DetachSurface: SwiftProtobuf.Message, SwiftProtobuf._
   }
 }
 
-extension Termmesh_Peer_V1_ListWorkspaces: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
+nonisolated extension Termmesh_Peer_V1_ListWorkspaces: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
   public static let protoMessageName: String = _protobuf_package + ".ListWorkspaces"
   public static let _protobuf_nameMap = SwiftProtobuf._NameMap()
 
@@ -2172,7 +2395,7 @@ extension Termmesh_Peer_V1_ListWorkspaces: SwiftProtobuf.Message, SwiftProtobuf.
   }
 }
 
-extension Termmesh_Peer_V1_WorkspaceList: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
+nonisolated extension Termmesh_Peer_V1_WorkspaceList: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
   public static let protoMessageName: String = _protobuf_package + ".WorkspaceList"
   public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{1}workspaces\0")
 
@@ -2202,9 +2425,9 @@ extension Termmesh_Peer_V1_WorkspaceList: SwiftProtobuf.Message, SwiftProtobuf._
   }
 }
 
-extension Termmesh_Peer_V1_Workspace: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
+nonisolated extension Termmesh_Peer_V1_Workspace: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
   public static let protoMessageName: String = _protobuf_package + ".Workspace"
-  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{3}workspace_id\0\u{1}title\0\u{1}layout\0\u{3}window_id\0\u{3}window_title\0")
+  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{3}workspace_id\0\u{1}title\0\u{1}layout\0\u{3}window_id\0\u{3}window_title\0\u{3}is_default\0")
 
   public mutating func decodeMessage<D: SwiftProtobuf.Decoder>(decoder: inout D) throws {
     while let fieldNumber = try decoder.nextFieldNumber() {
@@ -2217,6 +2440,7 @@ extension Termmesh_Peer_V1_Workspace: SwiftProtobuf.Message, SwiftProtobuf._Mess
       case 3: try { try decoder.decodeSingularMessageField(value: &self._layout) }()
       case 4: try { try decoder.decodeSingularBytesField(value: &self.windowID) }()
       case 5: try { try decoder.decodeSingularStringField(value: &self.windowTitle) }()
+      case 6: try { try decoder.decodeSingularBoolField(value: &self.isDefault) }()
       default: break
       }
     }
@@ -2242,6 +2466,9 @@ extension Termmesh_Peer_V1_Workspace: SwiftProtobuf.Message, SwiftProtobuf._Mess
     if !self.windowTitle.isEmpty {
       try visitor.visitSingularStringField(value: self.windowTitle, fieldNumber: 5)
     }
+    if self.isDefault != false {
+      try visitor.visitSingularBoolField(value: self.isDefault, fieldNumber: 6)
+    }
     try unknownFields.traverse(visitor: &visitor)
   }
 
@@ -2251,12 +2478,13 @@ extension Termmesh_Peer_V1_Workspace: SwiftProtobuf.Message, SwiftProtobuf._Mess
     if lhs._layout != rhs._layout {return false}
     if lhs.windowID != rhs.windowID {return false}
     if lhs.windowTitle != rhs.windowTitle {return false}
+    if lhs.isDefault != rhs.isDefault {return false}
     if lhs.unknownFields != rhs.unknownFields {return false}
     return true
   }
 }
 
-extension Termmesh_Peer_V1_WorkspaceLayout: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
+nonisolated extension Termmesh_Peer_V1_WorkspaceLayout: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
   public static let protoMessageName: String = _protobuf_package + ".WorkspaceLayout"
   public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{1}split\0\u{1}pane\0")
 
@@ -2359,7 +2587,7 @@ extension Termmesh_Peer_V1_WorkspaceLayout: SwiftProtobuf.Message, SwiftProtobuf
   }
 }
 
-extension Termmesh_Peer_V1_WorkspaceSplit: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
+nonisolated extension Termmesh_Peer_V1_WorkspaceSplit: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
   public static let protoMessageName: String = _protobuf_package + ".WorkspaceSplit"
   public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{1}orientation\0\u{3}divider_position\0\u{1}first\0\u{1}second\0\u{3}split_id\0")
 
@@ -2457,7 +2685,7 @@ extension Termmesh_Peer_V1_WorkspaceSplit: SwiftProtobuf.Message, SwiftProtobuf.
   }
 }
 
-extension Termmesh_Peer_V1_WorkspacePane: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
+nonisolated extension Termmesh_Peer_V1_WorkspacePane: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
   public static let protoMessageName: String = _protobuf_package + ".WorkspacePane"
   public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{3}surface_id\0\u{1}title\0\u{1}cols\0\u{1}rows\0\u{1}cwd\0\u{1}tabs\0")
 
@@ -2512,7 +2740,7 @@ extension Termmesh_Peer_V1_WorkspacePane: SwiftProtobuf.Message, SwiftProtobuf._
   }
 }
 
-extension Termmesh_Peer_V1_PaneTab: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
+nonisolated extension Termmesh_Peer_V1_PaneTab: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
   public static let protoMessageName: String = _protobuf_package + ".PaneTab"
   public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{3}surface_id\0\u{1}title\0")
 
@@ -2547,7 +2775,172 @@ extension Termmesh_Peer_V1_PaneTab: SwiftProtobuf.Message, SwiftProtobuf._Messag
   }
 }
 
-extension Termmesh_Peer_V1_WorkspaceControl: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
+nonisolated extension Termmesh_Peer_V1_CreateWorkspaceRequest: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
+  public static let protoMessageName: String = _protobuf_package + ".CreateWorkspaceRequest"
+  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{1}title\0")
+
+  public mutating func decodeMessage<D: SwiftProtobuf.Decoder>(decoder: inout D) throws {
+    while let fieldNumber = try decoder.nextFieldNumber() {
+      // The use of inline closures is to circumvent an issue where the compiler
+      // allocates stack space for every case branch when no optimizations are
+      // enabled. https://github.com/apple/swift-protobuf/issues/1034
+      switch fieldNumber {
+      case 1: try { try decoder.decodeSingularStringField(value: &self.title) }()
+      default: break
+      }
+    }
+  }
+
+  public func traverse<V: SwiftProtobuf.Visitor>(visitor: inout V) throws {
+    if !self.title.isEmpty {
+      try visitor.visitSingularStringField(value: self.title, fieldNumber: 1)
+    }
+    try unknownFields.traverse(visitor: &visitor)
+  }
+
+  public static func ==(lhs: Termmesh_Peer_V1_CreateWorkspaceRequest, rhs: Termmesh_Peer_V1_CreateWorkspaceRequest) -> Bool {
+    if lhs.title != rhs.title {return false}
+    if lhs.unknownFields != rhs.unknownFields {return false}
+    return true
+  }
+}
+
+nonisolated extension Termmesh_Peer_V1_CreateWorkspaceResponse: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
+  public static let protoMessageName: String = _protobuf_package + ".CreateWorkspaceResponse"
+  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{1}accepted\0\u{1}reason\0\u{3}workspace_id\0")
+
+  public mutating func decodeMessage<D: SwiftProtobuf.Decoder>(decoder: inout D) throws {
+    while let fieldNumber = try decoder.nextFieldNumber() {
+      // The use of inline closures is to circumvent an issue where the compiler
+      // allocates stack space for every case branch when no optimizations are
+      // enabled. https://github.com/apple/swift-protobuf/issues/1034
+      switch fieldNumber {
+      case 1: try { try decoder.decodeSingularBoolField(value: &self.accepted) }()
+      case 2: try { try decoder.decodeSingularStringField(value: &self.reason) }()
+      case 3: try { try decoder.decodeSingularBytesField(value: &self.workspaceID) }()
+      default: break
+      }
+    }
+  }
+
+  public func traverse<V: SwiftProtobuf.Visitor>(visitor: inout V) throws {
+    if self.accepted != false {
+      try visitor.visitSingularBoolField(value: self.accepted, fieldNumber: 1)
+    }
+    if !self.reason.isEmpty {
+      try visitor.visitSingularStringField(value: self.reason, fieldNumber: 2)
+    }
+    if !self.workspaceID.isEmpty {
+      try visitor.visitSingularBytesField(value: self.workspaceID, fieldNumber: 3)
+    }
+    try unknownFields.traverse(visitor: &visitor)
+  }
+
+  public static func ==(lhs: Termmesh_Peer_V1_CreateWorkspaceResponse, rhs: Termmesh_Peer_V1_CreateWorkspaceResponse) -> Bool {
+    if lhs.accepted != rhs.accepted {return false}
+    if lhs.reason != rhs.reason {return false}
+    if lhs.workspaceID != rhs.workspaceID {return false}
+    if lhs.unknownFields != rhs.unknownFields {return false}
+    return true
+  }
+}
+
+nonisolated extension Termmesh_Peer_V1_RenameWorkspaceRequest: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
+  public static let protoMessageName: String = _protobuf_package + ".RenameWorkspaceRequest"
+  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{3}workspace_id\0\u{1}title\0")
+
+  public mutating func decodeMessage<D: SwiftProtobuf.Decoder>(decoder: inout D) throws {
+    while let fieldNumber = try decoder.nextFieldNumber() {
+      // The use of inline closures is to circumvent an issue where the compiler
+      // allocates stack space for every case branch when no optimizations are
+      // enabled. https://github.com/apple/swift-protobuf/issues/1034
+      switch fieldNumber {
+      case 1: try { try decoder.decodeSingularBytesField(value: &self.workspaceID) }()
+      case 2: try { try decoder.decodeSingularStringField(value: &self.title) }()
+      default: break
+      }
+    }
+  }
+
+  public func traverse<V: SwiftProtobuf.Visitor>(visitor: inout V) throws {
+    if !self.workspaceID.isEmpty {
+      try visitor.visitSingularBytesField(value: self.workspaceID, fieldNumber: 1)
+    }
+    if !self.title.isEmpty {
+      try visitor.visitSingularStringField(value: self.title, fieldNumber: 2)
+    }
+    try unknownFields.traverse(visitor: &visitor)
+  }
+
+  public static func ==(lhs: Termmesh_Peer_V1_RenameWorkspaceRequest, rhs: Termmesh_Peer_V1_RenameWorkspaceRequest) -> Bool {
+    if lhs.workspaceID != rhs.workspaceID {return false}
+    if lhs.title != rhs.title {return false}
+    if lhs.unknownFields != rhs.unknownFields {return false}
+    return true
+  }
+}
+
+nonisolated extension Termmesh_Peer_V1_DeleteWorkspaceRequest: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
+  public static let protoMessageName: String = _protobuf_package + ".DeleteWorkspaceRequest"
+  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{3}workspace_id\0")
+
+  public mutating func decodeMessage<D: SwiftProtobuf.Decoder>(decoder: inout D) throws {
+    while let fieldNumber = try decoder.nextFieldNumber() {
+      // The use of inline closures is to circumvent an issue where the compiler
+      // allocates stack space for every case branch when no optimizations are
+      // enabled. https://github.com/apple/swift-protobuf/issues/1034
+      switch fieldNumber {
+      case 1: try { try decoder.decodeSingularBytesField(value: &self.workspaceID) }()
+      default: break
+      }
+    }
+  }
+
+  public func traverse<V: SwiftProtobuf.Visitor>(visitor: inout V) throws {
+    if !self.workspaceID.isEmpty {
+      try visitor.visitSingularBytesField(value: self.workspaceID, fieldNumber: 1)
+    }
+    try unknownFields.traverse(visitor: &visitor)
+  }
+
+  public static func ==(lhs: Termmesh_Peer_V1_DeleteWorkspaceRequest, rhs: Termmesh_Peer_V1_DeleteWorkspaceRequest) -> Bool {
+    if lhs.workspaceID != rhs.workspaceID {return false}
+    if lhs.unknownFields != rhs.unknownFields {return false}
+    return true
+  }
+}
+
+nonisolated extension Termmesh_Peer_V1_WorkspaceRemoved: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
+  public static let protoMessageName: String = _protobuf_package + ".WorkspaceRemoved"
+  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{3}workspace_id\0")
+
+  public mutating func decodeMessage<D: SwiftProtobuf.Decoder>(decoder: inout D) throws {
+    while let fieldNumber = try decoder.nextFieldNumber() {
+      // The use of inline closures is to circumvent an issue where the compiler
+      // allocates stack space for every case branch when no optimizations are
+      // enabled. https://github.com/apple/swift-protobuf/issues/1034
+      switch fieldNumber {
+      case 1: try { try decoder.decodeSingularBytesField(value: &self.workspaceID) }()
+      default: break
+      }
+    }
+  }
+
+  public func traverse<V: SwiftProtobuf.Visitor>(visitor: inout V) throws {
+    if !self.workspaceID.isEmpty {
+      try visitor.visitSingularBytesField(value: self.workspaceID, fieldNumber: 1)
+    }
+    try unknownFields.traverse(visitor: &visitor)
+  }
+
+  public static func ==(lhs: Termmesh_Peer_V1_WorkspaceRemoved, rhs: Termmesh_Peer_V1_WorkspaceRemoved) -> Bool {
+    if lhs.workspaceID != rhs.workspaceID {return false}
+    if lhs.unknownFields != rhs.unknownFields {return false}
+    return true
+  }
+}
+
+nonisolated extension Termmesh_Peer_V1_WorkspaceControl: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
   public static let protoMessageName: String = _protobuf_package + ".WorkspaceControl"
   public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{3}split_pane\0\u{3}close_pane\0\u{3}focus_pane\0\u{3}set_divider\0\u{3}new_tab\0\u{3}activate_tab\0")
 
@@ -2682,7 +3075,7 @@ extension Termmesh_Peer_V1_WorkspaceControl: SwiftProtobuf.Message, SwiftProtobu
   }
 }
 
-extension Termmesh_Peer_V1_SplitPaneRequest: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
+nonisolated extension Termmesh_Peer_V1_SplitPaneRequest: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
   public static let protoMessageName: String = _protobuf_package + ".SplitPaneRequest"
   public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{3}pane_id\0\u{1}orientation\0")
 
@@ -2717,7 +3110,7 @@ extension Termmesh_Peer_V1_SplitPaneRequest: SwiftProtobuf.Message, SwiftProtobu
   }
 }
 
-extension Termmesh_Peer_V1_ClosePaneRequest: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
+nonisolated extension Termmesh_Peer_V1_ClosePaneRequest: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
   public static let protoMessageName: String = _protobuf_package + ".ClosePaneRequest"
   public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{3}pane_id\0")
 
@@ -2747,7 +3140,7 @@ extension Termmesh_Peer_V1_ClosePaneRequest: SwiftProtobuf.Message, SwiftProtobu
   }
 }
 
-extension Termmesh_Peer_V1_FocusPaneRequest: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
+nonisolated extension Termmesh_Peer_V1_FocusPaneRequest: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
   public static let protoMessageName: String = _protobuf_package + ".FocusPaneRequest"
   public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{3}pane_id\0")
 
@@ -2777,9 +3170,9 @@ extension Termmesh_Peer_V1_FocusPaneRequest: SwiftProtobuf.Message, SwiftProtobu
   }
 }
 
-extension Termmesh_Peer_V1_SetDividerPositionRequest: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
+nonisolated extension Termmesh_Peer_V1_SetDividerPositionRequest: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
   public static let protoMessageName: String = _protobuf_package + ".SetDividerPositionRequest"
-  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{3}split_id\0\u{1}ratio\0")
+  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{3}split_id\0\u{1}ratio\0\u{3}workspace_id\0")
 
   public mutating func decodeMessage<D: SwiftProtobuf.Decoder>(decoder: inout D) throws {
     while let fieldNumber = try decoder.nextFieldNumber() {
@@ -2789,6 +3182,7 @@ extension Termmesh_Peer_V1_SetDividerPositionRequest: SwiftProtobuf.Message, Swi
       switch fieldNumber {
       case 1: try { try decoder.decodeSingularBytesField(value: &self.splitID) }()
       case 2: try { try decoder.decodeSingularDoubleField(value: &self.ratio) }()
+      case 3: try { try decoder.decodeSingularBytesField(value: &self.workspaceID) }()
       default: break
       }
     }
@@ -2801,20 +3195,24 @@ extension Termmesh_Peer_V1_SetDividerPositionRequest: SwiftProtobuf.Message, Swi
     if self.ratio.bitPattern != 0 {
       try visitor.visitSingularDoubleField(value: self.ratio, fieldNumber: 2)
     }
+    if !self.workspaceID.isEmpty {
+      try visitor.visitSingularBytesField(value: self.workspaceID, fieldNumber: 3)
+    }
     try unknownFields.traverse(visitor: &visitor)
   }
 
   public static func ==(lhs: Termmesh_Peer_V1_SetDividerPositionRequest, rhs: Termmesh_Peer_V1_SetDividerPositionRequest) -> Bool {
     if lhs.splitID != rhs.splitID {return false}
     if lhs.ratio != rhs.ratio {return false}
+    if lhs.workspaceID != rhs.workspaceID {return false}
     if lhs.unknownFields != rhs.unknownFields {return false}
     return true
   }
 }
 
-extension Termmesh_Peer_V1_NewTabRequest: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
+nonisolated extension Termmesh_Peer_V1_NewTabRequest: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
   public static let protoMessageName: String = _protobuf_package + ".NewTabRequest"
-  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{3}pane_id\0")
+  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{3}pane_id\0\u{3}workspace_id\0")
 
   public mutating func decodeMessage<D: SwiftProtobuf.Decoder>(decoder: inout D) throws {
     while let fieldNumber = try decoder.nextFieldNumber() {
@@ -2823,6 +3221,7 @@ extension Termmesh_Peer_V1_NewTabRequest: SwiftProtobuf.Message, SwiftProtobuf._
       // enabled. https://github.com/apple/swift-protobuf/issues/1034
       switch fieldNumber {
       case 1: try { try decoder.decodeSingularBytesField(value: &self.paneID) }()
+      case 2: try { try decoder.decodeSingularBytesField(value: &self.workspaceID) }()
       default: break
       }
     }
@@ -2832,17 +3231,21 @@ extension Termmesh_Peer_V1_NewTabRequest: SwiftProtobuf.Message, SwiftProtobuf._
     if !self.paneID.isEmpty {
       try visitor.visitSingularBytesField(value: self.paneID, fieldNumber: 1)
     }
+    if !self.workspaceID.isEmpty {
+      try visitor.visitSingularBytesField(value: self.workspaceID, fieldNumber: 2)
+    }
     try unknownFields.traverse(visitor: &visitor)
   }
 
   public static func ==(lhs: Termmesh_Peer_V1_NewTabRequest, rhs: Termmesh_Peer_V1_NewTabRequest) -> Bool {
     if lhs.paneID != rhs.paneID {return false}
+    if lhs.workspaceID != rhs.workspaceID {return false}
     if lhs.unknownFields != rhs.unknownFields {return false}
     return true
   }
 }
 
-extension Termmesh_Peer_V1_ActivateTabRequest: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
+nonisolated extension Termmesh_Peer_V1_ActivateTabRequest: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
   public static let protoMessageName: String = _protobuf_package + ".ActivateTabRequest"
   public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{3}pane_id\0\u{3}surface_id\0")
 
@@ -2877,7 +3280,7 @@ extension Termmesh_Peer_V1_ActivateTabRequest: SwiftProtobuf.Message, SwiftProto
   }
 }
 
-extension Termmesh_Peer_V1_PtyData: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
+nonisolated extension Termmesh_Peer_V1_PtyData: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
   public static let protoMessageName: String = _protobuf_package + ".PtyData"
   public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{3}surface_id\0\u{3}byte_seq\0\u{1}payload\0")
 
@@ -2917,7 +3320,7 @@ extension Termmesh_Peer_V1_PtyData: SwiftProtobuf.Message, SwiftProtobuf._Messag
   }
 }
 
-extension Termmesh_Peer_V1_Input: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
+nonisolated extension Termmesh_Peer_V1_Input: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
   public static let protoMessageName: String = _protobuf_package + ".Input"
   public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{3}surface_id\0\u{2}\u{9}keys\0\u{1}mouse\0\u{1}paste\0")
 
@@ -3001,7 +3404,7 @@ extension Termmesh_Peer_V1_Input: SwiftProtobuf.Message, SwiftProtobuf._MessageI
   }
 }
 
-extension Termmesh_Peer_V1_MouseEvent: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
+nonisolated extension Termmesh_Peer_V1_MouseEvent: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
   public static let protoMessageName: String = _protobuf_package + ".MouseEvent"
   public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{1}col\0\u{1}row\0\u{1}button\0\u{1}modifiers\0\u{1}pressed\0")
 
@@ -3051,7 +3454,7 @@ extension Termmesh_Peer_V1_MouseEvent: SwiftProtobuf.Message, SwiftProtobuf._Mes
   }
 }
 
-extension Termmesh_Peer_V1_Paste: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
+nonisolated extension Termmesh_Peer_V1_Paste: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
   public static let protoMessageName: String = _protobuf_package + ".Paste"
   public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{1}text\0")
 
@@ -3081,7 +3484,7 @@ extension Termmesh_Peer_V1_Paste: SwiftProtobuf.Message, SwiftProtobuf._MessageI
   }
 }
 
-extension Termmesh_Peer_V1_Resize: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
+nonisolated extension Termmesh_Peer_V1_Resize: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
   public static let protoMessageName: String = _protobuf_package + ".Resize"
   public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{3}surface_id\0\u{1}cols\0\u{1}rows\0\u{3}pixel_width\0\u{3}pixel_height\0")
 
@@ -3131,7 +3534,7 @@ extension Termmesh_Peer_V1_Resize: SwiftProtobuf.Message, SwiftProtobuf._Message
   }
 }
 
-extension Termmesh_Peer_V1_GridSnapshot: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
+nonisolated extension Termmesh_Peer_V1_GridSnapshot: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
   public static let protoMessageName: String = _protobuf_package + ".GridSnapshot"
   public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{3}surface_id\0\u{3}byte_seq\0\u{1}cols\0\u{1}rows\0\u{3}alt_screen\0\u{1}cursor\0\u{3}rows_data\0")
 
@@ -3195,7 +3598,7 @@ extension Termmesh_Peer_V1_GridSnapshot: SwiftProtobuf.Message, SwiftProtobuf._M
   }
 }
 
-extension Termmesh_Peer_V1_CursorState: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
+nonisolated extension Termmesh_Peer_V1_CursorState: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
   public static let protoMessageName: String = _protobuf_package + ".CursorState"
   public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{1}col\0\u{1}row\0\u{1}visible\0\u{1}style\0")
 
@@ -3240,7 +3643,7 @@ extension Termmesh_Peer_V1_CursorState: SwiftProtobuf.Message, SwiftProtobuf._Me
   }
 }
 
-extension Termmesh_Peer_V1_GridRow: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
+nonisolated extension Termmesh_Peer_V1_GridRow: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
   public static let protoMessageName: String = _protobuf_package + ".GridRow"
   public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{1}cells\0")
 
@@ -3270,7 +3673,7 @@ extension Termmesh_Peer_V1_GridRow: SwiftProtobuf.Message, SwiftProtobuf._Messag
   }
 }
 
-extension Termmesh_Peer_V1_Cell: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
+nonisolated extension Termmesh_Peer_V1_Cell: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
   public static let protoMessageName: String = _protobuf_package + ".Cell"
   public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{1}text\0\u{3}fg_rgba\0\u{3}bg_rgba\0\u{1}attrs\0\u{3}is_continuation\0")
 
@@ -3320,7 +3723,7 @@ extension Termmesh_Peer_V1_Cell: SwiftProtobuf.Message, SwiftProtobuf._MessageIm
   }
 }
 
-extension Termmesh_Peer_V1_DataAck: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
+nonisolated extension Termmesh_Peer_V1_DataAck: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
   public static let protoMessageName: String = _protobuf_package + ".DataAck"
   public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{3}surface_id\0\u{3}ack_seq\0")
 
@@ -3355,9 +3758,9 @@ extension Termmesh_Peer_V1_DataAck: SwiftProtobuf.Message, SwiftProtobuf._Messag
   }
 }
 
-extension Termmesh_Peer_V1_WorkspaceUpdate: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
+nonisolated extension Termmesh_Peer_V1_WorkspaceUpdate: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
   public static let protoMessageName: String = _protobuf_package + ".WorkspaceUpdate"
-  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{1}added\0\u{1}removed\0\u{1}retitled\0\u{1}meta\0\u{1}split\0\u{3}workspace_layout\0")
+  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{1}added\0\u{1}removed\0\u{1}retitled\0\u{1}meta\0\u{1}split\0\u{3}workspace_layout\0\u{3}workspace_removed\0")
 
   public mutating func decodeMessage<D: SwiftProtobuf.Decoder>(decoder: inout D) throws {
     while let fieldNumber = try decoder.nextFieldNumber() {
@@ -3443,6 +3846,19 @@ extension Termmesh_Peer_V1_WorkspaceUpdate: SwiftProtobuf.Message, SwiftProtobuf
           self.kind = .workspaceLayout(v)
         }
       }()
+      case 7: try {
+        var v: Termmesh_Peer_V1_WorkspaceRemoved?
+        var hadOneofValue = false
+        if let current = self.kind {
+          hadOneofValue = true
+          if case .workspaceRemoved(let m) = current {v = m}
+        }
+        try decoder.decodeSingularMessageField(value: &v)
+        if let v = v {
+          if hadOneofValue {try decoder.handleConflictingOneOf()}
+          self.kind = .workspaceRemoved(v)
+        }
+      }()
       default: break
       }
     }
@@ -3478,6 +3894,10 @@ extension Termmesh_Peer_V1_WorkspaceUpdate: SwiftProtobuf.Message, SwiftProtobuf
       guard case .workspaceLayout(let v)? = self.kind else { preconditionFailure() }
       try visitor.visitSingularMessageField(value: v, fieldNumber: 6)
     }()
+    case .workspaceRemoved?: try {
+      guard case .workspaceRemoved(let v)? = self.kind else { preconditionFailure() }
+      try visitor.visitSingularMessageField(value: v, fieldNumber: 7)
+    }()
     case nil: break
     }
     try unknownFields.traverse(visitor: &visitor)
@@ -3490,7 +3910,7 @@ extension Termmesh_Peer_V1_WorkspaceUpdate: SwiftProtobuf.Message, SwiftProtobuf
   }
 }
 
-extension Termmesh_Peer_V1_SurfaceAdded: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
+nonisolated extension Termmesh_Peer_V1_SurfaceAdded: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
   public static let protoMessageName: String = _protobuf_package + ".SurfaceAdded"
   public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{1}surface\0\u{3}pane_id\0")
 
@@ -3529,7 +3949,7 @@ extension Termmesh_Peer_V1_SurfaceAdded: SwiftProtobuf.Message, SwiftProtobuf._M
   }
 }
 
-extension Termmesh_Peer_V1_SurfaceRemoved: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
+nonisolated extension Termmesh_Peer_V1_SurfaceRemoved: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
   public static let protoMessageName: String = _protobuf_package + ".SurfaceRemoved"
   public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{3}surface_id\0")
 
@@ -3559,7 +3979,7 @@ extension Termmesh_Peer_V1_SurfaceRemoved: SwiftProtobuf.Message, SwiftProtobuf.
   }
 }
 
-extension Termmesh_Peer_V1_SurfaceRetitled: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
+nonisolated extension Termmesh_Peer_V1_SurfaceRetitled: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
   public static let protoMessageName: String = _protobuf_package + ".SurfaceRetitled"
   public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{3}surface_id\0\u{1}title\0")
 
@@ -3594,7 +4014,7 @@ extension Termmesh_Peer_V1_SurfaceRetitled: SwiftProtobuf.Message, SwiftProtobuf
   }
 }
 
-extension Termmesh_Peer_V1_WorkspaceMeta: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
+nonisolated extension Termmesh_Peer_V1_WorkspaceMeta: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
   public static let protoMessageName: String = _protobuf_package + ".WorkspaceMeta"
   public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{1}branch\0\u{1}cwd\0\u{1}ports\0\u{3}latest_notification\0")
 
@@ -3639,7 +4059,7 @@ extension Termmesh_Peer_V1_WorkspaceMeta: SwiftProtobuf.Message, SwiftProtobuf._
   }
 }
 
-extension Termmesh_Peer_V1_SplitChanged: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
+nonisolated extension Termmesh_Peer_V1_SplitChanged: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
   public static let protoMessageName: String = _protobuf_package + ".SplitChanged"
   public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{3}pane_id\0\u{1}snapshot\0")
 
@@ -3674,7 +4094,7 @@ extension Termmesh_Peer_V1_SplitChanged: SwiftProtobuf.Message, SwiftProtobuf._M
   }
 }
 
-extension Termmesh_Peer_V1_WorkspaceLayoutChanged: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
+nonisolated extension Termmesh_Peer_V1_WorkspaceLayoutChanged: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
   public static let protoMessageName: String = _protobuf_package + ".WorkspaceLayoutChanged"
   public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{3}workspace_id\0\u{1}layout\0")
 
@@ -3713,7 +4133,7 @@ extension Termmesh_Peer_V1_WorkspaceLayoutChanged: SwiftProtobuf.Message, SwiftP
   }
 }
 
-extension Termmesh_Peer_V1_Ping: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
+nonisolated extension Termmesh_Peer_V1_Ping: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
   public static let protoMessageName: String = _protobuf_package + ".Ping"
   public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{1}nonce\0")
 
@@ -3743,7 +4163,7 @@ extension Termmesh_Peer_V1_Ping: SwiftProtobuf.Message, SwiftProtobuf._MessageIm
   }
 }
 
-extension Termmesh_Peer_V1_Pong: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
+nonisolated extension Termmesh_Peer_V1_Pong: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
   public static let protoMessageName: String = _protobuf_package + ".Pong"
   public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{1}nonce\0")
 
@@ -3773,7 +4193,7 @@ extension Termmesh_Peer_V1_Pong: SwiftProtobuf.Message, SwiftProtobuf._MessageIm
   }
 }
 
-extension Termmesh_Peer_V1_Goodbye: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
+nonisolated extension Termmesh_Peer_V1_Goodbye: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
   public static let protoMessageName: String = _protobuf_package + ".Goodbye"
   public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{1}reason\0")
 
@@ -3803,7 +4223,7 @@ extension Termmesh_Peer_V1_Goodbye: SwiftProtobuf.Message, SwiftProtobuf._Messag
   }
 }
 
-extension Termmesh_Peer_V1_Error: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
+nonisolated extension Termmesh_Peer_V1_Error: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
   public static let protoMessageName: String = _protobuf_package + ".Error"
   public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{1}code\0\u{1}message\0\u{3}correlation_id_bytes\0")
 

@@ -15,18 +15,20 @@
 //! `.await`, and mutations return owned snapshots so broadcasting happens
 //! outside the lock.
 
-use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use peer_proto::v1::{
     envelope::Payload, workspace_control, workspace_layout, workspace_update, Envelope, PaneTab,
-    WorkspaceControl, WorkspaceLayout, WorkspaceLayoutChanged, WorkspacePane, WorkspaceSplit,
-    WorkspaceUpdate,
+    WorkspaceControl, WorkspaceLayout, WorkspaceLayoutChanged, WorkspacePane, WorkspaceRemoved,
+    WorkspaceSplit, WorkspaceUpdate,
 };
 use tokio::sync::mpsc;
 
+use super::persist::PersistedWorkspace;
 use super::surface::{surface_id_from_name, PtyManager, PtySurface, SpawnSpec};
 
 pub type SurfaceId = Vec<u8>;
@@ -62,6 +64,12 @@ impl Orientation {
 /// so a counter is enough — no UUID needed.
 fn split_id_bytes(id: u64) -> Vec<u8> {
     id.to_be_bytes().to_vec()
+}
+
+/// Short hex of a workspace id for log lines — enough to correlate
+/// create/remove without dumping the full 16 bytes.
+fn hex_prefix(id: &[u8]) -> String {
+    id.iter().take(4).map(|b| format!("{b:02x}")).collect()
 }
 
 #[derive(Debug)]
@@ -452,6 +460,22 @@ impl LayoutStore {
         }
     }
 
+    /// Seed a brand-new workspace's tree with its very first pane. Used by
+    /// `PeerHost::new_tab` when a `NewTabRequest` carries `workspace_id`
+    /// instead of a resolvable `pane_id` — the client's "create the first
+    /// pane in this (till now empty) workspace" case, right after
+    /// `CreateWorkspaceRequest`. Refuses (returns `false`, tree
+    /// untouched) once the tree already has content — that path goes
+    /// through `add_tab`/`split_pane` instead, which know how to target
+    /// an existing pane.
+    pub fn seed_first_pane(&mut self, surface_id: SurfaceId) -> bool {
+        if self.root.is_some() {
+            return false;
+        }
+        self.root = Some(LayoutNode::Pane { active: surface_id.clone(), tabs: vec![surface_id] });
+        true
+    }
+
     pub fn is_empty(&self) -> bool {
         self.root.is_none()
     }
@@ -466,9 +490,16 @@ enum CloseOutcome {
     RemoveMe(Vec<SurfaceId>),
 }
 
-/// Name of the single workspace a daemon-only host synthesises. Hashed
-/// through `surface_id_from_name`, so the id is stable across restarts
-/// and the client can keep referring to the same workspace.
+/// Fallback name for the default workspace a daemon-only host always has.
+/// Used only as the last-resort name (constructors that skip persistence
+/// entirely, e.g. `PeerHost::new`) or as a defensive title in
+/// `default_workspace_title` — production boot (`persist::boot`) instead
+/// names the default workspace from a persisted rename, the hostname, or
+/// `TERMMESH_PEER_WORKSPACE_TITLE`. M1 dropped the prior
+/// `surface_id_from_name(DAEMON_WORKSPACE)` id derivation: a workspace's
+/// id is now a random 16 bytes assigned once at creation (see
+/// `persist::PersistedWorkspace`), so it survives a rename unchanged
+/// instead of being re-derivable from (and therefore coupled to) the name.
 pub const DAEMON_WORKSPACE: &str = "term-meshd";
 
 /// Outgoing handles of every connection that reached `Ready`, so a layout
@@ -540,27 +571,81 @@ impl Drop for BroadcastGuard {
     }
 }
 
-/// Shared state of one daemon peer host: the PTYs, the layout tree they
-/// are arranged in, and the connections to push layout changes to. This
-/// is what `connection::run` receives instead of a bare `PtyManager`.
+/// One named workspace on a daemon host: its stable id, display name, and
+/// the split tree its surfaces are arranged in. A daemon boots with
+/// exactly one (`DAEMON_WORKSPACE`); the collection exists so a later task
+/// (Create/Rename/Delete workspace RPCs) can grow it without another pass
+/// over this module's locking/broadcast plumbing.
+pub struct WorkspaceEntry {
+    pub id: Vec<u8>,
+    pub name: String,
+    /// True for exactly one entry in a host's collection at all times.
+    /// Invariant enforced by `PeerHost::with_workspaces` (promotes the
+    /// first entry if none is marked) and `PeerHost::remove_workspace`
+    /// (refuses to remove the entry carrying this flag).
+    pub is_default: bool,
+    pub store: LayoutStore,
+}
+
+/// One roster entry as returned by `PeerHost::list_workspaces` — the
+/// generic (N-workspace) counterpart to the single hardcoded `Workspace`
+/// connection.rs's `ListWorkspaces` handler used to build before M2.
+pub struct WorkspaceRosterEntry {
+    pub id: Vec<u8>,
+    pub title: String,
+    pub layout: Option<WorkspaceLayout>,
+    pub is_default: bool,
+}
+
+/// Shared state of one daemon peer host: the PTYs, the workspaces they are
+/// arranged into, and the connections to push layout changes to. This is
+/// what `connection::run` receives instead of a bare `PtyManager`.
 ///
 /// Lock discipline (as everywhere in `peer::`): guards never cross an
 /// `.await`, and mutation results are broadcast after unlock. Nesting is
-/// one-directional — the layout guard may wrap the manager's short
-/// internal locks (snapshot reads pane metadata), but no code path takes
-/// the layout lock while holding a manager guard, so the order is
-/// consistent and cannot deadlock.
+/// one-directional — a method may hold `workspaces` and, separately (never
+/// nested), `surface_workspace` — but no code path takes either lock while
+/// holding a manager guard, so the order is consistent and cannot
+/// deadlock.
 pub struct PeerHost {
     pub pty: Arc<PtyManager>,
-    pub layout: Mutex<LayoutStore>,
+    /// Every workspace this host currently serves, keyed by workspace id.
+    /// Invariant: never empty after `new()` returns — `DAEMON_WORKSPACE`
+    /// always exists.
+    pub workspaces: Mutex<HashMap<Vec<u8>, WorkspaceEntry>>,
     pub clients: Arc<Broadcaster>,
-    pub workspace_id: Vec<u8>,
+    /// Id of the current default entry. Before M3 this was stable for the
+    /// daemon's lifetime; M3 lets the default workspace itself be deleted
+    /// (`remove_workspace`), promoting a survivor and updating this field,
+    /// so it is now a `Mutex` rather than a plain field. Not `pub` — every
+    /// reader goes through `default_id()` so the lock discipline lives in
+    /// one place; `connection.rs`/`server.rs` never touched the field
+    /// directly even when it was public (verified before this change).
+    workspace_id: Mutex<Vec<u8>>,
+    /// Reverse index from surface id to the workspace whose tree currently
+    /// contains it. `surface_id` is globally unique across all workspaces,
+    /// so this is a simple flat map. Used to route `apply_control`
+    /// mutations and `watch_ephemeral` removals to the right tree without
+    /// scanning every workspace.
+    surface_workspace: Mutex<HashMap<SurfaceId, Vec<u8>>>,
     /// Names split/new-tab surfaces (`split-1`, `split-2`, …). Lifetime
-    /// of this daemon only, like the tree itself.
+    /// of this daemon only, like the tree itself. Host-wide (not
+    /// per-workspace) so ephemeral ids never collide across workspaces.
     ephemeral_counter: AtomicU64,
-    /// True while a debounced layout push is pending — collapses a burst
-    /// of mutations (divider drags especially) into one push.
-    push_scheduled: AtomicBool,
+    /// Workspace ids with a debounced layout push currently pending —
+    /// collapses a burst of mutations (divider drags especially) against
+    /// the SAME workspace into one push, while still letting a different
+    /// workspace's mutation schedule (and fire) its own push
+    /// independently. Keyed by workspace id rather than a single flag
+    /// because M2 made pushes per-workspace (see `schedule_layout_push`).
+    pending_pushes: Mutex<HashSet<Vec<u8>>>,
+    /// On-disk path the workspace collection is persisted to after every
+    /// create/rename/delete. `None` for hosts built without a
+    /// persistence path (every test constructor: `new`/`with_workspaces`
+    /// default to this) — those mutate in memory only, exactly like
+    /// before M1/M2. Production boot (`server::serve`) sets this via
+    /// `set_persist_path` right after construction.
+    persist_path: Mutex<Option<PathBuf>>,
 }
 
 /// Debounce window for layout pushes. Mirrors the Swift host's 120 ms
@@ -569,17 +654,381 @@ pub struct PeerHost {
 /// into a handful of pushes instead of hundreds.
 const PUSH_DEBOUNCE: Duration = Duration::from_millis(120);
 
+/// Failure modes for `PeerHost::remove_workspace`, wired up to
+/// `DeleteWorkspaceRequest` in `connection.rs`. Through M2 the collection-
+/// level invariant here was "the default workspace can never be removed";
+/// M3 relaxes that to "the LAST workspace can never be removed" — the
+/// default is deletable like any other entry as long as a survivor can be
+/// promoted to take its place (see `remove_workspace`).
+#[derive(Debug, PartialEq, Eq)]
+pub enum RemoveWorkspaceError {
+    NotFound,
+    /// Refusing to remove the only workspace left — un-namespaced control
+    /// (and `default_id()`) always needs a home to resolve to.
+    LastWorkspace,
+}
+
 impl PeerHost {
+    /// Convenience constructor for callers that don't care about
+    /// persistence (every existing test, and any future in-process
+    /// caller that just wants a working host): a single default
+    /// workspace, freshly random id, `DAEMON_WORKSPACE` as its name.
+    /// Production boot goes through `with_workspaces` instead, seeded by
+    /// `persist::boot` (see `server::serve`) — so in a non-test build this
+    /// constructor's only caller is `server::serve_with_manager`, itself
+    /// test-only for the same reason. Kept `pub` (not `#[cfg(test)]`)
+    /// because it is the documented entry point for any future in-process
+    /// embedder that wants a working host without touching persistence.
+    #[allow(dead_code)]
     pub fn new(pty: Arc<PtyManager>) -> Self {
-        let layout = LayoutStore::balanced_from_surfaces(&pty.list());
+        Self::with_workspaces(
+            pty,
+            vec![PersistedWorkspace {
+                id: super::connection::random_peer_bytes(16),
+                name: DAEMON_WORKSPACE.to_string(),
+                is_default: true,
+            }],
+        )
+    }
+
+    /// Build a host from an already-resolved workspace collection — the
+    /// result of `persist::boot`, or a hand-built single entry (`new`).
+    /// The manager's current surfaces are tiled into the default entry's
+    /// tree exactly like the pre-M1 constructor did; every other entry
+    /// starts as an empty workspace (M1 boots named workspaces empty —
+    /// only the default one ever inherits startup surfaces).
+    ///
+    /// Exactly one entry must be `is_default`; if none is (defensive —
+    /// `persist::boot` already guards this, but a hand-built `Vec`
+    /// passed by some future caller might not), the first entry is
+    /// promoted so the collection is never left without a home for
+    /// un-namespaced control commands.
+    pub fn with_workspaces(pty: Arc<PtyManager>, mut entries: Vec<PersistedWorkspace>) -> Self {
+        debug_assert!(!entries.is_empty(), "workspace collection must never be empty");
+        if !entries.iter().any(|e| e.is_default) {
+            if let Some(first) = entries.first_mut() {
+                first.is_default = true;
+            }
+        }
+
+        let surfaces = pty.list();
+        let mut surface_workspace = HashMap::new();
+        let mut workspaces = HashMap::new();
+        let mut default_id = None;
+        for entry in entries {
+            let store = if entry.is_default {
+                default_id = Some(entry.id.clone());
+                for surface in &surfaces {
+                    surface_workspace.insert(surface.surface_id.clone(), entry.id.clone());
+                }
+                LayoutStore::balanced_from_surfaces(&surfaces)
+            } else {
+                LayoutStore { root: None, next_split_id: 1 }
+            };
+            workspaces.insert(
+                entry.id.clone(),
+                WorkspaceEntry { id: entry.id, name: entry.name, is_default: entry.is_default, store },
+            );
+        }
+        // Guaranteed by the promotion above: some entry is always default.
+        let workspace_id = default_id.expect("workspace collection must contain a default entry");
+
         Self {
             pty,
-            layout: Mutex::new(layout),
+            workspaces: Mutex::new(workspaces),
             clients: Arc::new(Broadcaster::new()),
-            workspace_id: surface_id_from_name(DAEMON_WORKSPACE),
+            workspace_id: Mutex::new(workspace_id),
+            surface_workspace: Mutex::new(surface_workspace),
             ephemeral_counter: AtomicU64::new(1),
-            push_scheduled: AtomicBool::new(false),
+            pending_pushes: Mutex::new(HashSet::new()),
+            persist_path: Mutex::new(None),
         }
+    }
+
+    /// Wire the on-disk persistence path after construction. Kept out of
+    /// `with_workspaces` itself so that constructor stays I/O-free (every
+    /// existing test calls it directly and must not race real disk
+    /// access) — production boot (`server::serve`) calls this once right
+    /// after building the host, and every workspace-lifecycle mutation
+    /// below (`create_workspace`/`rename_workspace`/`remove_workspace`)
+    /// persists through it via `persist_workspaces`.
+    pub fn set_persist_path(&self, path: PathBuf) {
+        *self.persist_path.lock().unwrap() = Some(path);
+    }
+
+    /// Best-effort save of the full workspace collection to
+    /// `persist_path`, if one was set. Matches `persist::boot`'s policy
+    /// of logging on failure rather than propagating it — an RPC that
+    /// already mutated in-memory state must not roll back just because
+    /// the disk write failed; the next successful mutation retries the
+    /// same save.
+    fn persist_workspaces(&self) {
+        let path = self.persist_path.lock().unwrap().clone();
+        let Some(path) = path else { return };
+        let entries: Vec<PersistedWorkspace> = self
+            .workspaces
+            .lock()
+            .unwrap()
+            .values()
+            .map(|e| PersistedWorkspace { id: e.id.clone(), name: e.name.clone(), is_default: e.is_default })
+            .collect();
+        if let Err(e) = super::persist::save(&path, &entries) {
+            tracing::warn!("peer-workspaces.json save failed ({}): {e}", path.display());
+        }
+    }
+
+    /// Current default workspace id. Reads through the `Mutex` so callers
+    /// never touch the field's lock discipline directly — see the field's
+    /// doc comment for why it became a `Mutex` in M3.
+    pub fn default_id(&self) -> Vec<u8> {
+        self.workspace_id.lock().unwrap().clone()
+    }
+
+    /// Display title for the default workspace: its persisted (or
+    /// renamed, or `TERMMESH_PEER_WORKSPACE_TITLE`-overridden) `name`.
+    /// Falls back to `DAEMON_WORKSPACE` only in the should-never-happen
+    /// case where the default entry is missing from the collection.
+    pub fn default_workspace_title(&self) -> String {
+        self.workspaces
+            .lock()
+            .unwrap()
+            .get(&self.default_id())
+            .map(|entry| entry.name.clone())
+            .unwrap_or_else(|| DAEMON_WORKSPACE.to_string())
+    }
+
+    /// Delete a workspace, default or not: every surface currently in its
+    /// tree is torn down exactly like `close_pane` tears down a single
+    /// pane (dropped from `pty` — ephemeral specs are lost so a closed
+    /// id can't respawn, declared specs keep theirs — and out of the
+    /// reverse index), the now-empty collection entry is removed, and the
+    /// remaining collection is persisted. Refuses (no removal, no side
+    /// effects at all) only when `workspace_id` is empty, unknown, or
+    /// names the LAST workspace left — un-namespaced control always needs
+    /// a home to resolve to (`RemoveWorkspaceError::LastWorkspace`).
+    ///
+    /// If the removed entry WAS the default, the survivor with the
+    /// lexicographically lowest id is deterministically promoted in its
+    /// place (`is_default = true`, `default_id()` updated) — deterministic
+    /// because `workspaces` is a `HashMap` with no stable iteration order.
+    /// The promoted entry keeps its own tree untouched: the old default's
+    /// surfaces (including any static `TERMMESH_PEER_SURFACES` shells) are
+    /// simply gone, not re-parented — a restart brings declared surfaces
+    /// back via env, matching how a self-exited ephemeral pane is handled
+    /// elsewhere in this file.
+    ///
+    /// Every connected client is told about the deletion via a
+    /// `WorkspaceRemoved` broadcast regardless of whether a promotion also
+    /// happened; the wire has no separate "default changed" push (see
+    /// `WorkspaceLayoutChanged`'s fields), so a client that cares about
+    /// `is_default` re-derives it from its next `ListWorkspaces` roster.
+    pub fn remove_workspace(&self, workspace_id: &[u8]) -> Result<(), RemoveWorkspaceError> {
+        if workspace_id.is_empty() {
+            return Err(RemoveWorkspaceError::NotFound);
+        }
+        let (removed_surfaces, promoted) = {
+            let mut workspaces = self.workspaces.lock().unwrap();
+            if !workspaces.contains_key(workspace_id) {
+                return Err(RemoveWorkspaceError::NotFound);
+            }
+            if workspaces.len() == 1 {
+                return Err(RemoveWorkspaceError::LastWorkspace);
+            }
+            let entry = workspaces.remove(workspace_id).expect("checked present above");
+            let removed_surfaces = entry.store.surface_ids();
+            let promoted = if entry.is_default {
+                // Deterministic pick among survivors: lowest workspace id.
+                let new_default_id = workspaces
+                    .keys()
+                    .min()
+                    .cloned()
+                    .expect("collection has >1 entry before removal, so a survivor remains");
+                if let Some(new_default) = workspaces.get_mut(&new_default_id) {
+                    new_default.is_default = true;
+                }
+                *self.workspace_id.lock().unwrap() = new_default_id.clone();
+                Some(new_default_id)
+            } else {
+                None
+            };
+            (removed_surfaces, promoted)
+        };
+        {
+            let mut index = self.surface_workspace.lock().unwrap();
+            for sid in &removed_surfaces {
+                self.pty.remove(sid);
+                index.remove(sid);
+            }
+        }
+        self.persist_workspaces();
+        // Audit line: a workspace delete kills real host processes, so
+        // make the surface count (and any default promotion) visible in
+        // the journal for monitoring
+        // (journalctl --user -u term-meshd | grep 'peer workspace').
+        match &promoted {
+            Some(new_default_id) => tracing::info!(
+                "peer workspace removed: id={} surfaces_killed={} promoted_default={}",
+                hex_prefix(workspace_id),
+                removed_surfaces.len(),
+                hex_prefix(new_default_id)
+            ),
+            None => tracing::info!(
+                "peer workspace removed: id={} surfaces_killed={}",
+                hex_prefix(workspace_id),
+                removed_surfaces.len()
+            ),
+        }
+        self.clients.broadcast(&Payload::WorkspaceUpdate(WorkspaceUpdate {
+            kind: Some(workspace_update::Kind::WorkspaceRemoved(WorkspaceRemoved {
+                workspace_id: workspace_id.to_vec(),
+            })),
+        }));
+        Ok(())
+    }
+
+    /// Create a new, initially pane-less workspace with a random 16-byte
+    /// id and persist it immediately. `title` is used verbatim (an empty
+    /// title is accepted as-is, matching `RenameWorkspaceRequest`'s
+    /// contract of never second-guessing the caller). Schedules a
+    /// (debounced, empty-layout) `WorkspaceLayoutChanged` push under the
+    /// new id so already-connected bystanders learn a new workspace_id
+    /// exists — the "roster 반영 push" this RPC's contract calls for.
+    /// Seed a first pane into every workspace that boots empty. A
+    /// non-default workspace restored from `peer-workspaces.json` has
+    /// only {id, name} persisted (shells are daemon children, never
+    /// serialized), so it comes back with an empty tree — un-attachable,
+    /// which surfaced as "no panes" when a client opened it. Called once
+    /// after boot so every workspace is usable, exactly like a freshly
+    /// created one. The default keeps its static TERMMESH_PEER_SURFACES
+    /// shells and is skipped when already populated.
+    pub fn seed_empty_workspaces(self: &Arc<Self>) {
+        let empty_ids: Vec<Vec<u8>> = {
+            let workspaces = self.workspaces.lock().unwrap();
+            workspaces
+                .values()
+                .filter(|e| e.store.is_empty())
+                .map(|e| e.id.clone())
+                .collect()
+        };
+        for id in empty_ids {
+            if let Some(sid) = self.spawn_ephemeral(&[], &id) {
+                self.with_store(&id, |store| store.seed_first_pane(sid));
+            }
+        }
+    }
+
+    pub fn create_workspace(self: &Arc<Self>, title: String) -> Vec<u8> {
+        let id = super::connection::random_peer_bytes(16);
+        {
+            let mut workspaces = self.workspaces.lock().unwrap();
+            workspaces.insert(
+                id.clone(),
+                WorkspaceEntry {
+                    id: id.clone(),
+                    name: title,
+                    is_default: false,
+                    store: LayoutStore { root: None, next_split_id: 1 },
+                },
+            );
+        }
+        self.persist_workspaces();
+        // Seed the first pane so a freshly created workspace is usable
+        // immediately — an empty tree is un-attachable, which raced the
+        // client's open ("no panes"). Best-effort: on spawn failure the
+        // workspace stays empty and the client's open-time seed retries.
+        // Gated by the same MAX_PEER_SURFACES cap as split/new_tab: without
+        // this check, CreateWorkspaceRequest was an uncapped PTY spawn —
+        // looping it bypassed the cap entirely. At-cap, the workspace is
+        // still created (empty); `new_tab`'s open-time seed fallback also
+        // checks the cap, so it won't silently backfill one either.
+        if self.pty.list().len() >= Self::MAX_PEER_SURFACES {
+            tracing::info!(
+                "peer workspace created empty: id={} reason=max_peer_surfaces cap={}",
+                hex_prefix(&id),
+                Self::MAX_PEER_SURFACES
+            );
+        } else if let Some(sid) = self.spawn_ephemeral(&[], &id) {
+            self.with_store(&id, |store| store.seed_first_pane(sid));
+        }
+        tracing::info!(
+            "peer workspace created: id={} total={}",
+            hex_prefix(&id),
+            self.workspaces.lock().unwrap().len()
+        );
+        self.schedule_layout_push(id.clone());
+        id
+    }
+
+    /// Rename an existing workspace's display name in place; its id
+    /// never changes. Returns `false` (no-op, nothing persisted) for an
+    /// empty or unknown `workspace_id` — connection.rs logs the warning,
+    /// this method itself stays silent so it composes cleanly with any
+    /// future non-RPC caller.
+    pub fn rename_workspace(&self, workspace_id: &[u8], title: String) -> bool {
+        if workspace_id.is_empty() {
+            return false;
+        }
+        let renamed = {
+            let mut workspaces = self.workspaces.lock().unwrap();
+            match workspaces.get_mut(workspace_id) {
+                Some(entry) => {
+                    entry.name = title;
+                    true
+                }
+                None => false,
+            }
+        };
+        if renamed {
+            self.persist_workspaces();
+        }
+        renamed
+    }
+
+    /// Every workspace this host currently serves, as roster entries
+    /// ready for `WorkspaceList` — the N-workspace successor to the
+    /// single hardcoded entry `ListWorkspaces` used to build before M2.
+    /// Sorted by title for a stable, deterministic wire order (`HashMap`
+    /// iteration itself is not).
+    pub fn list_workspaces(&self) -> Vec<WorkspaceRosterEntry> {
+        let default_id = self.default_id();
+        let ids: Vec<Vec<u8>> = self.workspaces.lock().unwrap().keys().cloned().collect();
+        let mut out: Vec<WorkspaceRosterEntry> = ids
+            .into_iter()
+            .map(|id| {
+                // The default entry goes through `default_workspace_title`
+                // for its should-never-happen fallback; every other entry
+                // is a plain read of its own persisted name.
+                let title = if id == default_id {
+                    self.default_workspace_title()
+                } else {
+                    self.workspaces
+                        .lock()
+                        .unwrap()
+                        .get(&id)
+                        .map(|entry| entry.name.clone())
+                        .unwrap_or_default()
+                };
+                let layout = self.layout_snapshot_for(&id);
+                let is_default = id == default_id;
+                WorkspaceRosterEntry { id, title, layout, is_default }
+            })
+            .collect();
+        out.sort_by(|a, b| a.title.cmp(&b.title));
+        out
+    }
+
+    /// Workspace id currently hosting `surface_id`, if any.
+    fn workspace_id_for_surface(&self, surface_id: &[u8]) -> Option<Vec<u8>> {
+        self.surface_workspace.lock().unwrap().get(surface_id).cloned()
+    }
+
+    /// Run `f` against the named workspace's store, if that workspace
+    /// still exists. `None` means the workspace vanished between lookup
+    /// and this call (never happens today — workspaces are never removed
+    /// — but callers treat it the same as "target not found").
+    fn with_store<T>(&self, workspace_id: &[u8], f: impl FnOnce(&mut LayoutStore) -> T) -> Option<T> {
+        let mut workspaces = self.workspaces.lock().unwrap();
+        workspaces.get_mut(workspace_id).map(|entry| f(&mut entry.store))
     }
 
     /// Apply one WorkspaceControl command. Fire-and-forget end to end:
@@ -590,30 +1039,25 @@ impl PeerHost {
     /// host's `perform*` guards.
     pub fn apply_control(self: &Arc<Self>, ctl: WorkspaceControl) {
         use workspace_control::Kind;
-        let changed = match ctl.kind {
+        // `Some(ws_id)` means the tree of workspace `ws_id` changed and
+        // must be pushed; `None` covers both "nothing changed" and
+        // "invalid/unresolvable request" — both are silent no-ops.
+        let changed_workspace = match ctl.kind {
             // F8: a kind this build predates. Ignore, don't disconnect.
-            None => false,
+            None => None,
             // R10: the daemon has no keyboard focus to move, and the Swift
             // host deliberately no-ops this too.
-            Some(Kind::FocusPane(_)) => false,
+            Some(Kind::FocusPane(_)) => None,
             Some(Kind::SplitPane(req)) => self.split_pane(&req.pane_id, &req.orientation),
             Some(Kind::ClosePane(req)) => self.close_pane(&req.pane_id),
-            Some(Kind::SetDivider(req)) => self
-                .layout
-                .lock()
-                .unwrap()
-                .set_divider(&req.split_id, req.ratio)
-                .unwrap_or(false),
-            Some(Kind::NewTab(req)) => self.new_tab(&req.pane_id),
-            Some(Kind::ActivateTab(req)) => self
-                .layout
-                .lock()
-                .unwrap()
-                .activate_tab(&req.pane_id, &req.surface_id)
-                .unwrap_or(false),
+            Some(Kind::SetDivider(req)) => {
+                self.set_divider(&req.workspace_id, &req.split_id, req.ratio)
+            }
+            Some(Kind::NewTab(req)) => self.new_tab(&req.pane_id, &req.workspace_id),
+            Some(Kind::ActivateTab(req)) => self.activate_tab(&req.pane_id, &req.surface_id),
         };
-        if changed {
-            self.schedule_layout_push();
+        if let Some(ws_id) = changed_workspace {
+            self.schedule_layout_push(ws_id);
         }
     }
 
@@ -630,68 +1074,155 @@ impl PeerHost {
     /// tree-based cap entirely.
     const MAX_PEER_SURFACES: usize = 64;
 
-    fn split_pane(self: &Arc<Self>, pane_id: &[u8], orientation: &str) -> bool {
-        let Some(orientation) = Orientation::parse(orientation) else {
-            return false; // F4
-        };
+    /// Returns the workspace id whose tree changed, or `None` for any
+    /// invalid/unresolvable/no-op request (F4 garbage orientation, unknown
+    /// pane, or the source pane's workspace vanishing between probe and
+    /// insert).
+    fn split_pane(self: &Arc<Self>, pane_id: &[u8], orientation: &str) -> Option<Vec<u8>> {
+        let orientation = Orientation::parse(orientation)?; // F4
         if self.pty.list().len() >= Self::MAX_PEER_SURFACES {
-            return false;
+            return None;
         }
         // Cheap existence probe before paying for a fork. The tree can
         // still change before the insert below — that race is resolved by
         // rolling the spawn back.
-        if !self.layout.lock().unwrap().surface_ids().iter().any(|s| s == pane_id) {
-            return false;
+        let ws_id = self.workspace_id_for_surface(pane_id)?;
+        if !self
+            .with_store(&ws_id, |store| store.surface_ids().iter().any(|s| s == pane_id))
+            .unwrap_or(false)
+        {
+            return None;
         }
         // A dead source pane revives first, same as attach would do — the
         // user is clearly working in it. No-op when it is alive.
         self.pty.get_or_respawn(pane_id);
-        let Some(new_id) = self.spawn_ephemeral(pane_id) else { return false };
-        match self.layout.lock().unwrap().split_pane(pane_id, orientation, new_id.clone()) {
-            Ok(changed) => changed,
-            Err(_) => {
-                // Source pane vanished between probe and insert; don't
-                // leak the shell we spawned for it.
+        let new_id = self.spawn_ephemeral(pane_id, &ws_id)?;
+        match self.with_store(&ws_id, |store| store.split_pane(pane_id, orientation, new_id.clone())) {
+            Some(Ok(true)) => Some(ws_id),
+            Some(Ok(false)) => None,
+            _ => {
+                // Source pane (or its workspace) vanished between probe and
+                // insert; don't leak the shell we spawned for it.
                 self.pty.remove(&new_id);
-                false
+                self.surface_workspace.lock().unwrap().remove(&new_id);
+                None
             }
         }
     }
 
-    fn new_tab(self: &Arc<Self>, pane_id: &[u8]) -> bool {
+    /// `pane_id` resolving to an existing pane always wins (matches every
+    /// other `WorkspaceControl` kind); `workspace_id` is only consulted as
+    /// the "first pane of an empty workspace" fallback the proto
+    /// documents for right after `CreateWorkspaceRequest`, when there is
+    /// no pane_id to reference yet. Returns the workspace id whose tree
+    /// changed, or `None` for a no-op/invalid request.
+    fn new_tab(self: &Arc<Self>, pane_id: &[u8], workspace_id: &[u8]) -> Option<Vec<u8>> {
         if self.pty.list().len() >= Self::MAX_PEER_SURFACES {
-            return false;
+            return None;
         }
-        if !self.layout.lock().unwrap().surface_ids().iter().any(|s| s == pane_id) {
-            return false;
+        if let Some(ws_id) = self.workspace_id_for_surface(pane_id) {
+            if self
+                .with_store(&ws_id, |store| store.surface_ids().iter().any(|s| s == pane_id))
+                .unwrap_or(false)
+            {
+                self.pty.get_or_respawn(pane_id);
+                let new_id = self.spawn_ephemeral(pane_id, &ws_id)?;
+                return match self.with_store(&ws_id, |store| store.add_tab(pane_id, new_id.clone())) {
+                    Some(Ok(true)) => Some(ws_id),
+                    _ => {
+                        self.pty.remove(&new_id);
+                        self.surface_workspace.lock().unwrap().remove(&new_id);
+                        None
+                    }
+                };
+            }
         }
-        self.pty.get_or_respawn(pane_id);
-        let Some(new_id) = self.spawn_ephemeral(pane_id) else { return false };
-        match self.layout.lock().unwrap().add_tab(pane_id, new_id.clone()) {
-            Ok(changed) => changed,
-            Err(_) => {
+
+        if workspace_id.is_empty() {
+            return None;
+        }
+        let is_empty_target = self
+            .workspaces
+            .lock()
+            .unwrap()
+            .get(workspace_id)
+            .map(|entry| entry.store.is_empty())
+            .unwrap_or(false);
+        if !is_empty_target {
+            return None;
+        }
+        let new_id = self.spawn_ephemeral(&[], workspace_id)?;
+        match self.with_store(workspace_id, |store| store.seed_first_pane(new_id.clone())) {
+            Some(true) => Some(workspace_id.to_vec()),
+            _ => {
                 self.pty.remove(&new_id);
-                false
+                self.surface_workspace.lock().unwrap().remove(&new_id);
+                None
             }
         }
     }
 
-    fn close_pane(self: &Arc<Self>, pane_id: &[u8]) -> bool {
-        let removed = match self.layout.lock().unwrap().close_pane(pane_id) {
-            Ok(removed) => removed,
-            // LastPane / NotFound: silent no-op — the client observes
-            // "nothing happened", same as the Swift host.
-            Err(_) => return false,
+    fn close_pane(self: &Arc<Self>, pane_id: &[u8]) -> Option<Vec<u8>> {
+        let ws_id = self.workspace_id_for_surface(pane_id)?;
+        let removed = match self.with_store(&ws_id, |store| store.close_pane(pane_id)) {
+            Some(Ok(removed)) => removed,
+            // LastPane / NotFound / workspace already gone: silent no-op —
+            // the client observes "nothing happened", same as the Swift host.
+            _ => return None,
         };
         // PTYs die outside the layout lock. `PtyManager::remove` decides
         // spec fate: declared surfaces keep theirs (a restart brings them
         // back via TERMMESH_PEER_SURFACES anyway), ephemeral ones lose
         // theirs so a closed split/new-tab pane cannot respawn via a raw
         // AttachSurface for the same id.
+        let mut index = self.surface_workspace.lock().unwrap();
         for sid in removed {
             self.pty.remove(&sid);
+            index.remove(&sid);
         }
-        true
+        drop(index);
+        Some(ws_id)
+    }
+
+    /// `split_id` is unique only WITHIN one workspace's tree (each
+    /// `LayoutStore` keeps its own counter) — two workspaces routinely
+    /// share a split_id. `SetDividerPositionRequest.workspace_id` (proto
+    /// field 3) disambiguates: when non-empty and it names a workspace
+    /// this host currently serves, the resize is scoped to THAT
+    /// workspace's store only — a hit or miss there never spills into any
+    /// other tree. Empty `workspace_id` means a legacy client (pre field-3)
+    /// or a caller that genuinely doesn't know it; degrade to the old
+    /// behavior of matching whichever tree's split id hits first, which
+    /// stays correct as long as there is exactly one workspace (the
+    /// pre-M2 case this fallback exists for).
+    fn set_divider(&self, workspace_id: &[u8], split_id: &[u8], ratio: f64) -> Option<Vec<u8>> {
+        let mut workspaces = self.workspaces.lock().unwrap();
+        if !workspace_id.is_empty() {
+            return match workspaces.get_mut(workspace_id) {
+                Some(entry) => match entry.store.set_divider(split_id, ratio) {
+                    Ok(true) => Some(entry.id.clone()),
+                    Ok(false) | Err(_) => None,
+                },
+                None => None,
+            };
+        }
+        for entry in workspaces.values_mut() {
+            match entry.store.set_divider(split_id, ratio) {
+                Ok(true) => return Some(entry.id.clone()),
+                Ok(false) => return None,
+                Err(_) => continue,
+            }
+        }
+        None
+    }
+
+    fn activate_tab(&self, pane_id: &[u8], surface_id: &[u8]) -> Option<Vec<u8>> {
+        let ws_id = self.workspace_id_for_surface(pane_id)?;
+        let changed = self
+            .with_store(&ws_id, |store| store.activate_tab(pane_id, surface_id))
+            .and_then(|r| r.ok())
+            .unwrap_or(false);
+        changed.then_some(ws_id)
     }
 
     /// Fork a login shell for a split/new-tab pane, inheriting the source
@@ -701,7 +1232,7 @@ impl PeerHost {
     /// actually removed (explicit close, or the dead-watcher below), so
     /// closing it is permanent for this daemon lifetime and a raw
     /// `AttachSurface` for the same id can't resurrect it.
-    fn spawn_ephemeral(self: &Arc<Self>, source_pane: &[u8]) -> Option<SurfaceId> {
+    fn spawn_ephemeral(self: &Arc<Self>, source_pane: &[u8], workspace_id: &[u8]) -> Option<SurfaceId> {
         let cwd = self
             .pty
             .list()
@@ -731,6 +1262,10 @@ impl PeerHost {
         // register_and_spawn_ephemeral logs-and-continues on failure; only
         // report a surface that actually exists.
         let surface = self.pty.list().into_iter().find(|s| s.surface_id == surface_id)?;
+        self.surface_workspace
+            .lock()
+            .unwrap()
+            .insert(surface_id.clone(), workspace_id.to_vec());
         self.watch_ephemeral(surface);
         Some(surface_id)
     }
@@ -755,31 +1290,43 @@ impl PeerHost {
                 notified.await;
             }
             let Some(host) = host.upgrade() else { return };
-            let removed = host.layout.lock().unwrap().remove_surface(&sid);
+            // Route the removal to whichever workspace's tree currently
+            // holds this surface (the reverse index), not always the
+            // default — a dead ephemeral pane can belong to any workspace.
+            let Some(ws_id) = host.workspace_id_for_surface(&sid) else { return };
+            let removed = host.with_store(&ws_id, |store| store.remove_surface(&sid)).unwrap_or(false);
             if removed {
                 // Out of the tree → out of the roster (it is already dead;
-                // remove only drops the map entry and re-signals a corpse).
+                // remove only drops the map entry and re-signals a corpse)
+                // and out of the reverse index.
                 host.pty.remove(&sid);
-                host.schedule_layout_push();
+                host.surface_workspace.lock().unwrap().remove(&sid);
+                host.schedule_layout_push(ws_id);
             }
         });
     }
 
-    /// Debounced fan-out of the current tree to every connection. The
-    /// snapshot is taken when the timer fires, so a burst of mutations
-    /// yields one push carrying the final state.
-    pub fn schedule_layout_push(self: &Arc<Self>) {
-        if self.push_scheduled.swap(true, Ordering::AcqRel) {
-            return;
+    /// Debounced fan-out of `workspace_id`'s current tree to every
+    /// connection. The snapshot is taken when the timer fires, so a burst
+    /// of mutations against the SAME workspace yields one push carrying
+    /// the final state. Per-workspace debounce (`pending_pushes`) means a
+    /// concurrent burst against a DIFFERENT workspace schedules and fires
+    /// its own push independently instead of being swallowed by this one.
+    pub fn schedule_layout_push(self: &Arc<Self>, workspace_id: Vec<u8>) {
+        {
+            let mut pending = self.pending_pushes.lock().unwrap();
+            if !pending.insert(workspace_id.clone()) {
+                return;
+            }
         }
         let host = Arc::clone(self);
         tokio::spawn(async move {
             tokio::time::sleep(PUSH_DEBOUNCE).await;
-            host.push_scheduled.store(false, Ordering::Release);
-            let layout = host.layout_snapshot();
+            host.pending_pushes.lock().unwrap().remove(&workspace_id);
+            let layout = host.layout_snapshot_for(&workspace_id);
             let payload = Payload::WorkspaceUpdate(WorkspaceUpdate {
                 kind: Some(workspace_update::Kind::WorkspaceLayout(WorkspaceLayoutChanged {
-                    workspace_id: host.workspace_id.clone(),
+                    workspace_id: workspace_id.clone(),
                     layout,
                 })),
             });
@@ -787,19 +1334,64 @@ impl PeerHost {
         });
     }
 
-    /// Wire snapshot of the current tree. Reseeds first when the tree is
-    /// empty but surfaces exist — covers hosts whose manager was populated
-    /// after construction (the test harness does this; production spawns
-    /// surfaces before `PeerHost::new`).
+    /// Wire snapshot of any single workspace's tree by id — the generic
+    /// counterpart to `layout_snapshot` (default-workspace-only, and the
+    /// only one that carries the reseed special case below). Scoped
+    /// `WorkspaceLayoutChanged` pushes (`schedule_layout_push`) and
+    /// `list_workspaces` both go through this so a mutation to — or a
+    /// listing of — a non-default workspace is reported under ITS id
+    /// instead of being misattributed to the default workspace.
+    pub fn layout_snapshot_for(&self, workspace_id: &[u8]) -> Option<WorkspaceLayout> {
+        if workspace_id == self.default_id() {
+            return self.layout_snapshot();
+        }
+        self.workspaces
+            .lock()
+            .unwrap()
+            .get(workspace_id)
+            .and_then(|entry| entry.store.snapshot_proto(&self.pty))
+    }
+
+    /// Wire snapshot of the default workspace's tree. Reseeds first when
+    /// that tree is empty but surfaces exist — covers hosts whose manager
+    /// was populated after construction (the test harness does this;
+    /// production spawns surfaces before `PeerHost::new`).
     pub fn layout_snapshot(&self) -> Option<WorkspaceLayout> {
-        let mut layout = self.layout.lock().unwrap();
-        if layout.is_empty() {
+        // Captured once: a concurrent `remove_workspace` promotion could
+        // otherwise change the default mid-function, splitting the reseed
+        // check from the final read across two different workspaces.
+        let default_id = self.default_id();
+        let needs_reseed = self
+            .workspaces
+            .lock()
+            .unwrap()
+            .get(&default_id)
+            .map(|entry| entry.store.is_empty())
+            .unwrap_or(false);
+        if needs_reseed {
             let surfaces = self.pty.list();
             if !surfaces.is_empty() {
-                *layout = LayoutStore::balanced_from_surfaces(&surfaces);
+                {
+                    let mut workspaces = self.workspaces.lock().unwrap();
+                    if let Some(entry) = workspaces.get_mut(&default_id) {
+                        if entry.store.is_empty() {
+                            entry.store = LayoutStore::balanced_from_surfaces(&surfaces);
+                        }
+                    }
+                }
+                let mut index = self.surface_workspace.lock().unwrap();
+                for surface in &surfaces {
+                    index
+                        .entry(surface.surface_id.clone())
+                        .or_insert_with(|| default_id.clone());
+                }
             }
         }
-        layout.snapshot_proto(&self.pty)
+        self.workspaces
+            .lock()
+            .unwrap()
+            .get(&default_id)
+            .and_then(|entry| entry.store.snapshot_proto(&self.pty))
     }
 }
 
@@ -820,6 +1412,11 @@ mod tests {
         store
     }
 
+    /// Surface ids currently in `host`'s default workspace tree.
+    fn default_surface_ids(host: &PeerHost) -> Vec<SurfaceId> {
+        host.workspaces.lock().unwrap().get(&host.default_id()).unwrap().store.surface_ids()
+    }
+
     fn split_ids(store: &LayoutStore) -> Vec<Vec<u8>> {
         fn walk(node: &LayoutNode, out: &mut Vec<Vec<u8>>) {
             if let LayoutNode::Split { id, first, second, .. } = node {
@@ -833,6 +1430,21 @@ mod tests {
             walk(root, &mut out);
         }
         out
+    }
+
+    /// Current divider ratio for `split_id` in `store`, or `None` if no
+    /// split with that id exists in the tree.
+    fn divider_ratio(store: &LayoutStore, split_id: &[u8]) -> Option<f64> {
+        fn walk(node: &LayoutNode, target: &[u8]) -> Option<f64> {
+            if let LayoutNode::Split { id, divider, first, second, .. } = node {
+                if split_id_bytes(*id) == target {
+                    return Some(*divider);
+                }
+                return walk(first, target).or_else(|| walk(second, target));
+            }
+            None
+        }
+        store.root.as_ref().and_then(|root| walk(root, split_id))
     }
 
     #[test]
@@ -1075,7 +1687,7 @@ mod tests {
         .expect("spawn /bin/cat");
         manager.insert_surface(base);
         let host = Arc::new(PeerHost::new(manager));
-        assert_eq!(host.layout.lock().unwrap().surface_ids().len(), 1);
+        assert_eq!(default_surface_ids(&host).len(), 1);
 
         host.apply_control(WorkspaceControl {
             kind: Some(workspace_control::Kind::SplitPane(peer_proto::v1::SplitPaneRequest {
@@ -1083,7 +1695,7 @@ mod tests {
                 orientation: "horizontal".into(),
             })),
         });
-        assert_eq!(host.layout.lock().unwrap().surface_ids().len(), 2, "split landed");
+        assert_eq!(default_surface_ids(&host).len(), 2, "split landed");
 
         // The ephemeral shell "exits": SIGHUP → PTY reader EOF →
         // dead_notify → watcher prunes the pane.
@@ -1097,13 +1709,13 @@ mod tests {
 
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
         loop {
-            if host.layout.lock().unwrap().surface_ids() == vec![sid("base")] {
+            if default_surface_ids(&host) == vec![sid("base")] {
                 break;
             }
             assert!(
                 tokio::time::Instant::now() < deadline,
                 "watcher never pruned the dead ephemeral pane; tree = {:?}",
-                host.layout.lock().unwrap().surface_ids()
+                default_surface_ids(&host)
             );
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
@@ -1125,5 +1737,564 @@ mod tests {
             }
             other => panic!("expected split root, got {other:?}"),
         }
+    }
+
+    // ---- M1: workspace collection ----------------------------------
+
+    /// A freshly booted host always has exactly one workspace — the
+    /// default (`DAEMON_WORKSPACE`) — matching the pre-M1 single-workspace
+    /// behavior, just expressed through the collection now. M1 dropped the
+    /// deterministic `surface_id_from_name(DAEMON_WORKSPACE)` id
+    /// derivation in favor of a random 16-byte id assigned at creation
+    /// (see the `layout::DAEMON_WORKSPACE` doc comment), so this only
+    /// checks the id's shape and the entry/host agreement, not a fixed
+    /// value.
+    #[test]
+    fn default_workspace_exists_after_boot() {
+        let manager = Arc::new(PtyManager::new());
+        let host = PeerHost::new(manager);
+
+        let default_id = host.default_id();
+        let workspaces = host.workspaces.lock().unwrap();
+        assert_eq!(workspaces.len(), 1);
+        let entry = workspaces.get(&default_id).expect("default workspace present");
+        assert_eq!(entry.id, default_id);
+        assert_eq!(entry.name, DAEMON_WORKSPACE);
+        assert!(entry.is_default);
+        assert_eq!(default_id.len(), 16, "id must be a random 16-byte value");
+        assert_ne!(
+            default_id,
+            surface_id_from_name(DAEMON_WORKSPACE),
+            "id must no longer be derivable from the workspace name"
+        );
+    }
+
+    /// Two hosts constructed via `new` must not collide on workspace id —
+    /// the whole point of moving off a deterministic name-derived id.
+    #[test]
+    fn default_workspace_id_is_random_across_hosts() {
+        let host_a = PeerHost::new(Arc::new(PtyManager::new()));
+        let host_b = PeerHost::new(Arc::new(PtyManager::new()));
+        assert_ne!(host_a.default_id(), host_b.default_id());
+    }
+
+    /// Booting with surfaces already registered seeds the default
+    /// workspace's tree AND the surface→workspace reverse index for every
+    /// one of them — the index is not an afterthought populated lazily.
+    #[tokio::test]
+    async fn boot_seeds_reverse_index_for_declared_surfaces() {
+        let manager = Arc::new(PtyManager::new());
+        let base = PtySurface::spawn(sid("base"), "cat".into(), "/bin/cat", &[], 80, 24, None)
+            .expect("spawn /bin/cat");
+        manager.insert_surface(base);
+        let host = PeerHost::new(Arc::clone(&manager));
+
+        assert_eq!(host.workspace_id_for_surface(&sid("base")), Some(host.default_id()));
+        assert_eq!(host.workspace_id_for_surface(&sid("ghost")), None);
+    }
+
+    /// With multiple workspace entries present, the reverse index must
+    /// resolve each surface to the workspace that actually owns it, not
+    /// always the default — this is the routing primitive `apply_control`
+    /// and `watch_ephemeral` depend on.
+    #[test]
+    fn reverse_index_resolves_correct_workspace_across_entries() {
+        let manager = Arc::new(PtyManager::new());
+        let host = PeerHost::new(manager);
+
+        // Manually add a second workspace and wire the reverse index for a
+        // surface homed there. Production only ever creates the default
+        // workspace at boot (Create-workspace RPCs are a later task); this
+        // simulates the resulting shape directly.
+        let ws2_id = surface_id_from_name("second");
+        {
+            let mut workspaces = host.workspaces.lock().unwrap();
+            let store2 = store_with(&["x"]);
+            workspaces.insert(
+                ws2_id.clone(),
+                WorkspaceEntry { id: ws2_id.clone(), name: "second".into(), is_default: false, store: store2 },
+            );
+        }
+        host.surface_workspace.lock().unwrap().insert(sid("x"), ws2_id.clone());
+
+        assert_eq!(host.workspaces.lock().unwrap().len(), 2);
+        assert_eq!(host.workspace_id_for_surface(&sid("x")), Some(ws2_id.clone()));
+        assert_eq!(host.workspace_id_for_surface(&sid("nowhere")), None);
+        assert_ne!(ws2_id, host.default_id());
+    }
+
+    /// P1-1 regression: `split_id` is only unique WITHIN one workspace's
+    /// tree, so two independently-built workspaces routinely mint the same
+    /// id (each `LayoutStore`'s counter starts at 1). Passing a non-empty
+    /// `workspace_id` to `PeerHost::set_divider` must scope the resize to
+    /// that workspace's store only — the other workspace's divider, which
+    /// shares the same split_id, must stay exactly as it was.
+    #[test]
+    fn set_divider_scoped_to_workspace_id_leaves_other_workspace_untouched() {
+        let manager = Arc::new(PtyManager::new());
+        let host = PeerHost::new(manager);
+        let default_id = host.default_id();
+
+        {
+            let mut workspaces = host.workspaces.lock().unwrap();
+            workspaces.get_mut(&default_id).unwrap().store = store_with(&["a", "b"]);
+        }
+        let ws2_id = surface_id_from_name("second");
+        {
+            let mut workspaces = host.workspaces.lock().unwrap();
+            workspaces.insert(
+                ws2_id.clone(),
+                WorkspaceEntry {
+                    id: ws2_id.clone(),
+                    name: "second".into(),
+                    is_default: false,
+                    store: store_with(&["x", "y"]),
+                },
+            );
+        }
+
+        let (default_split, ws2_split) = {
+            let workspaces = host.workspaces.lock().unwrap();
+            (
+                split_ids(&workspaces.get(&default_id).unwrap().store)[0].clone(),
+                split_ids(&workspaces.get(&ws2_id).unwrap().store)[0].clone(),
+            )
+        };
+        assert_eq!(
+            default_split, ws2_split,
+            "test setup requires colliding split ids across workspaces — each \
+             LayoutStore's counter independently starts at 1"
+        );
+        let split_id = default_split;
+
+        // Scoped to ws2: only ws2's divider moves.
+        let changed = host.set_divider(&ws2_id, &split_id, 0.3);
+        assert_eq!(changed, Some(ws2_id.clone()));
+
+        let workspaces = host.workspaces.lock().unwrap();
+        assert_eq!(divider_ratio(&workspaces.get(&ws2_id).unwrap().store, &split_id), Some(0.3));
+        assert_ne!(
+            divider_ratio(&workspaces.get(&default_id).unwrap().store, &split_id),
+            Some(0.3),
+            "default workspace's divider (same split_id, different workspace) must be untouched"
+        );
+        // An unknown workspace_id (that still names no store) resolves to
+        // nothing rather than silently falling back to first-match.
+        drop(workspaces);
+        assert_eq!(host.set_divider(&sid("ghost-workspace"), &split_id, 0.7), None);
+    }
+
+    /// Legacy-client fallback: an empty `workspace_id` (pre field-3 clients)
+    /// still degrades to matching whichever tree's split_id hits first —
+    /// the single-workspace-compatible behavior this path exists for.
+    #[test]
+    fn set_divider_empty_workspace_id_falls_back_to_first_match() {
+        let manager = Arc::new(PtyManager::new());
+        let host = PeerHost::new(manager);
+        let default_id = host.default_id();
+        {
+            let mut workspaces = host.workspaces.lock().unwrap();
+            workspaces.get_mut(&default_id).unwrap().store = store_with(&["a", "b"]);
+        }
+        let split_id = {
+            let workspaces = host.workspaces.lock().unwrap();
+            split_ids(&workspaces.get(&default_id).unwrap().store)[0].clone()
+        };
+
+        let changed = host.set_divider(&[], &split_id, 0.3);
+        assert_eq!(changed, Some(default_id.clone()));
+        let workspaces = host.workspaces.lock().unwrap();
+        assert_eq!(divider_ratio(&workspaces.get(&default_id).unwrap().store, &split_id), Some(0.3));
+    }
+
+    /// Multi-workspace regression: `watch_ephemeral` must prune the dead
+    /// pane from the workspace that actually owns it (via the reverse
+    /// index), not always the default — and must leave every other
+    /// workspace's tree, and the reverse index entries for its own
+    /// surfaces, untouched.
+    #[tokio::test]
+    async fn watch_ephemeral_prunes_only_the_owning_workspace() {
+        let manager = Arc::new(PtyManager::new());
+        let base_a = PtySurface::spawn(sid("base-a"), "cat".into(), "/bin/cat", &[], 80, 24, None)
+            .expect("spawn base-a");
+        manager.insert_surface(base_a);
+        let host = Arc::new(PeerHost::new(Arc::clone(&manager)));
+        // Default workspace was seeded from the manager's contents at
+        // construction time — base-a only.
+
+        let base_b = PtySurface::spawn(sid("base-b"), "cat".into(), "/bin/cat", &[], 80, 24, None)
+            .expect("spawn base-b");
+        manager.insert_surface(base_b);
+
+        // Second workspace, manually populated with base-b — stands in for
+        // a future Create/attach-workspace RPC not built in this task.
+        let ws2_id = surface_id_from_name("second");
+        {
+            let mut workspaces = host.workspaces.lock().unwrap();
+            let surfaces_b: Vec<_> =
+                manager.list().into_iter().filter(|s| s.surface_id == sid("base-b")).collect();
+            let store2 = LayoutStore::balanced_from_surfaces(&surfaces_b);
+            workspaces.insert(
+                ws2_id.clone(),
+                WorkspaceEntry { id: ws2_id.clone(), name: "second".into(), is_default: false, store: store2 },
+            );
+        }
+        host.surface_workspace.lock().unwrap().insert(sid("base-b"), ws2_id.clone());
+
+        let ephemeral_id =
+            host.spawn_ephemeral(&sid("base-b"), &ws2_id).expect("spawn ephemeral in ws2");
+        {
+            let mut workspaces = host.workspaces.lock().unwrap();
+            workspaces
+                .get_mut(&ws2_id)
+                .unwrap()
+                .store
+                .split_pane(&sid("base-b"), Orientation::Horizontal, ephemeral_id.clone())
+                .unwrap();
+        }
+
+        let ephemeral_surface = manager
+            .list()
+            .into_iter()
+            .find(|s| s.surface_id == ephemeral_id)
+            .expect("ephemeral surface exists");
+        ephemeral_surface.hangup();
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let ws2_ids = host.workspaces.lock().unwrap().get(&ws2_id).unwrap().store.surface_ids();
+            if ws2_ids == vec![sid("base-b")] {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "watcher never pruned ws2's ephemeral pane; ws2 tree = {ws2_ids:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        // Default workspace's tree (base-a only) is untouched.
+        assert_eq!(default_surface_ids(&host), vec![sid("base-a")]);
+        // Reverse index entry for the pruned surface is gone; base-a's and
+        // base-b's own entries are untouched.
+        let index = host.surface_workspace.lock().unwrap();
+        assert!(!index.contains_key(&ephemeral_id));
+        assert_eq!(index.get(&sid("base-a")), Some(&host.default_id()));
+        assert_eq!(index.get(&sid("base-b")), Some(&ws2_id));
+    }
+
+    // ---- M1: with_workspaces / persistence-driven boot --------------
+
+    fn persisted(name: &str, is_default: bool) -> PersistedWorkspace {
+        PersistedWorkspace { id: sid(name), name: name.to_string(), is_default }
+    }
+
+    /// `with_workspaces` seeds the default entry's tree from the
+    /// manager's current surfaces (matching `new`'s behavior) but leaves
+    /// every non-default entry an empty workspace — M1's boot-from-env
+    /// contract creates named workspaces empty, not pre-tiled.
+    #[tokio::test]
+    async fn with_workspaces_seeds_default_only() {
+        let manager = Arc::new(PtyManager::new());
+        let base = PtySurface::spawn(sid("base"), "cat".into(), "/bin/cat", &[], 80, 24, None)
+            .expect("spawn /bin/cat");
+        manager.insert_surface(base);
+
+        let host = PeerHost::with_workspaces(
+            Arc::clone(&manager),
+            vec![persisted("term-meshd", true), persisted("dev", false)],
+        );
+
+        let workspaces = host.workspaces.lock().unwrap();
+        assert_eq!(workspaces.len(), 2);
+        assert_eq!(host.default_id(), sid("term-meshd"));
+
+        let default_entry = workspaces.get(&sid("term-meshd")).unwrap();
+        assert!(default_entry.is_default);
+        assert_eq!(default_entry.store.surface_ids(), vec![sid("base")]);
+
+        let dev_entry = workspaces.get(&sid("dev")).unwrap();
+        assert!(!dev_entry.is_default);
+        assert!(dev_entry.store.is_empty(), "non-default entries boot empty");
+
+        // Reverse index only covers the default workspace's surfaces.
+        assert_eq!(host.workspace_id_for_surface(&sid("base")), Some(sid("term-meshd")));
+    }
+
+    /// A collection with no entry marked `is_default` (a hand-built `Vec`
+    /// bypassing `persist::boot`'s own guard) must still produce a usable
+    /// host: the first entry is promoted rather than leaving
+    /// `workspace_id` unset.
+    #[test]
+    fn with_workspaces_promotes_first_entry_when_none_marked_default() {
+        let manager = Arc::new(PtyManager::new());
+        let host = PeerHost::with_workspaces(manager, vec![persisted("orphan", false)]);
+
+        assert_eq!(host.default_id(), sid("orphan"));
+        let workspaces = host.workspaces.lock().unwrap();
+        assert!(workspaces.get(&sid("orphan")).unwrap().is_default);
+    }
+
+    /// `default_workspace_title` surfaces whatever name the default entry
+    /// currently carries — the mechanism `TERMMESH_PEER_WORKSPACE_TITLE`
+    /// and a future rename RPC both flow through, and what
+    /// `connection.rs`'s `ListWorkspaces` handler now reads directly
+    /// instead of always calling `hostname_or`.
+    #[test]
+    fn default_workspace_title_reflects_persisted_name() {
+        let manager = Arc::new(PtyManager::new());
+        let host = PeerHost::with_workspaces(manager, vec![persisted("my-custom-title", true)]);
+        assert_eq!(host.default_workspace_title(), "my-custom-title");
+    }
+
+    /// M3: an unknown id is still refused as `NotFound`, and removing a
+    /// non-default workspace still works exactly as before. Once only one
+    /// workspace is left, removing THAT one (even though it happens to be
+    /// the default) is refused as `LastWorkspace` — the collection-level
+    /// invariant is now "never zero workspaces", not "never touch default".
+    #[test]
+    fn remove_workspace_refuses_unknown_and_last_but_removes_non_default() {
+        let manager = Arc::new(PtyManager::new());
+        let host = PeerHost::with_workspaces(
+            manager,
+            vec![persisted("term-meshd", true), persisted("dev", false)],
+        );
+
+        assert_eq!(
+            host.remove_workspace(&sid("ghost")),
+            Err(RemoveWorkspaceError::NotFound)
+        );
+        assert_eq!(host.remove_workspace(&sid("dev")), Ok(()));
+        assert_eq!(host.workspaces.lock().unwrap().len(), 1, "default survives, dev is gone");
+        // Removing it again is now NotFound, not a second success.
+        assert_eq!(
+            host.remove_workspace(&sid("dev")),
+            Err(RemoveWorkspaceError::NotFound)
+        );
+        // Only the default is left now — refused as the LAST workspace,
+        // not because it is the default.
+        assert_eq!(
+            host.remove_workspace(&sid("term-meshd")),
+            Err(RemoveWorkspaceError::LastWorkspace)
+        );
+    }
+
+    /// M3(b): the very last remaining workspace can never be removed,
+    /// regardless of `is_default` — un-namespaced control and
+    /// `default_id()` always need a home to resolve to.
+    #[test]
+    fn remove_last_workspace_is_refused() {
+        let manager = Arc::new(PtyManager::new());
+        let host = PeerHost::new(manager);
+        let default_id = host.default_id();
+
+        assert_eq!(
+            host.remove_workspace(&default_id),
+            Err(RemoveWorkspaceError::LastWorkspace)
+        );
+        assert_eq!(host.workspaces.lock().unwrap().len(), 1, "the last workspace survives");
+    }
+
+    /// M3(a): deleting the DEFAULT workspace is now allowed once another
+    /// workspace exists to take over. The old default's own surfaces
+    /// (standing in for static `TERMMESH_PEER_SURFACES` shells) are torn
+    /// down exactly like any other workspace delete rather than re-homed,
+    /// and the sole survivor is promoted (`is_default = true`,
+    /// `default_id()` updated) with its own tree left untouched.
+    #[tokio::test]
+    async fn remove_default_workspace_promotes_survivor_and_tears_down_old_default_surfaces() {
+        let manager = Arc::new(PtyManager::new());
+        let base = PtySurface::spawn(sid("base"), "cat".into(), "/bin/cat", &[], 80, 24, None)
+            .expect("spawn /bin/cat");
+        manager.insert_surface(base);
+        // `PeerHost::new` seeds the sole (default) workspace's tree from
+        // the manager's current surfaces — "base" stands in for a
+        // declared TERMMESH_PEER_SURFACES shell owned by the default.
+        let host = Arc::new(PeerHost::new(Arc::clone(&manager)));
+        let old_default_id = host.default_id();
+        assert_eq!(default_surface_ids(&host), vec![sid("base")]);
+
+        let dev_id = host.create_workspace("dev".into());
+
+        assert_eq!(host.remove_workspace(&old_default_id), Ok(()));
+
+        // Old default's surface was torn down, not re-homed into "dev".
+        assert!(!manager.list().iter().any(|s| s.surface_id == sid("base")));
+        assert!(!host.surface_workspace.lock().unwrap().contains_key(&sid("base")));
+
+        // "dev" is the only survivor, so it is unambiguously promoted.
+        assert_eq!(host.default_id(), dev_id);
+        let workspaces = host.workspaces.lock().unwrap();
+        assert_eq!(workspaces.len(), 1);
+        let dev_entry = workspaces.get(&dev_id).unwrap();
+        assert!(dev_entry.is_default);
+        assert!(
+            !dev_entry.store.is_empty(),
+            "promoted default keeps its own tree (its create-seeded pane), no re-parenting of the old default's panes"
+        );
+    }
+
+    /// M3: when more than one survivor remains after the default is
+    /// removed, promotion is deterministic — the lowest workspace id wins,
+    /// matching `HashMap`'s unstable iteration order being unusable here.
+    #[test]
+    fn remove_default_workspace_promotes_lowest_id_survivor_deterministically() {
+        let manager = Arc::new(PtyManager::new());
+        let host = PeerHost::with_workspaces(
+            manager,
+            vec![persisted("term-meshd", true), persisted("alpha", false), persisted("bravo", false)],
+        );
+        let default_id = host.default_id();
+        let expected_new_default = [sid("alpha"), sid("bravo")].into_iter().min().unwrap();
+
+        assert_eq!(host.remove_workspace(&default_id), Ok(()));
+
+        assert_eq!(host.default_id(), expected_new_default);
+        let workspaces = host.workspaces.lock().unwrap();
+        assert_eq!(workspaces.len(), 2);
+        assert!(workspaces.get(&expected_new_default).unwrap().is_default);
+    }
+
+    // ---- M2: create/rename/delete workspace lifecycle -----------------
+
+    /// `create_workspace` assigns a random 16-byte id, adds an empty
+    /// entry `list_workspaces` immediately reflects (title verbatim,
+    /// `layout: None`), and never touches the default workspace.
+    // `create_workspace` schedules a debounced layout push (`tokio::spawn`
+    // under the hood), so this needs a live Tokio runtime even though
+    // nothing in the test body itself awaits.
+    #[tokio::test]
+    async fn create_workspace_adds_empty_entry_without_disturbing_default() {
+        let host = Arc::new(PeerHost::new(Arc::new(PtyManager::new())));
+        let default_id = host.default_id();
+
+        let new_id = host.create_workspace("scratch".into());
+        assert_eq!(new_id.len(), 16, "id must be a random 16-byte value");
+        assert_ne!(new_id, default_id);
+
+        let roster = host.list_workspaces();
+        assert_eq!(roster.len(), 2);
+        let created = roster.iter().find(|e| e.id == new_id).expect("new entry present");
+        assert_eq!(created.title, "scratch");
+        assert!(
+            created.layout.is_some(),
+            "a created workspace is seeded with its first pane so it is usable immediately"
+        );
+        let default_entry = roster.iter().find(|e| e.id == default_id).expect("default untouched");
+        assert_eq!(default_entry.title, DAEMON_WORKSPACE);
+    }
+
+    /// P1-2 regression: `create_workspace`'s "seed a first pane" step was
+    /// an unconditional `spawn_ephemeral` — unlike `split_pane`/`new_tab`,
+    /// it never checked `MAX_PEER_SURFACES`, so looping `CreateWorkspace`
+    /// bypassed the registered-surface cap entirely (uncapped PTY spawn).
+    /// At the cap, the workspace must still be created — just left empty,
+    /// exactly like a non-default workspace restored from
+    /// `peer-workspaces.json` — and no additional PTY may be spawned.
+    #[tokio::test]
+    async fn create_workspace_at_max_peer_surfaces_skips_seed_and_stays_empty() {
+        let manager = Arc::new(PtyManager::new());
+        let base = PtySurface::spawn(sid("base"), "cat".into(), "/bin/cat", &[], 80, 24, None)
+            .expect("spawn /bin/cat");
+        manager.insert_surface(base);
+        let host = Arc::new(PeerHost::new(Arc::clone(&manager)));
+
+        // Drive the surface count up to the cap via the same mechanism
+        // `split_pane_stops_at_surface_cap` uses — real spawns halt exactly
+        // at MAX_PEER_SURFACES because split_pane's own cap check runs
+        // before spawn_ephemeral.
+        for _ in 0..(PeerHost::MAX_PEER_SURFACES + 20) {
+            host.apply_control(WorkspaceControl {
+                kind: Some(workspace_control::Kind::SplitPane(peer_proto::v1::SplitPaneRequest {
+                    pane_id: sid("base"),
+                    orientation: "horizontal".into(),
+                })),
+            });
+        }
+        assert_eq!(
+            host.pty.list().len(),
+            PeerHost::MAX_PEER_SURFACES,
+            "test setup requires the cap already hit"
+        );
+
+        let new_id = host.create_workspace("overflow".into());
+
+        assert_eq!(
+            host.pty.list().len(),
+            PeerHost::MAX_PEER_SURFACES,
+            "create_workspace must not spawn past the cap"
+        );
+        let roster = host.list_workspaces();
+        let created = roster.iter().find(|e| e.id == new_id).expect("workspace still created");
+        assert!(
+            created.layout.is_none(),
+            "seed must be skipped (not merely failed) once the cap is already hit"
+        );
+    }
+
+    /// `rename_workspace` changes only the name, leaving the id (and
+    /// every other entry) untouched; an unknown or empty id is a no-op.
+    #[test]
+    fn rename_workspace_changes_title_not_id() {
+        let host = Arc::new(PeerHost::new(Arc::new(PtyManager::new())));
+        let default_id = host.default_id();
+
+        assert!(host.rename_workspace(&default_id, "renamed".into()));
+        assert_eq!(host.default_workspace_title(), "renamed");
+        assert_eq!(host.default_id(), default_id, "id must survive a rename unchanged");
+
+        assert!(!host.rename_workspace(&sid("ghost"), "hijack".into()), "unknown id is a no-op");
+        assert!(!host.rename_workspace(&[], "hijack".into()), "empty id is a no-op");
+        assert_eq!(host.default_workspace_title(), "renamed", "no-op must not have applied");
+    }
+
+    /// `remove_workspace` on a non-default workspace with live surfaces
+    /// must drop every one of them from `pty`, drop their reverse-index
+    /// entries, and broadcast a `WorkspaceRemoved` push to every
+    /// registered connection.
+    #[tokio::test]
+    async fn remove_workspace_tears_down_surfaces_and_broadcasts_removal() {
+        let manager = Arc::new(PtyManager::new());
+        let host = Arc::new(PeerHost::new(Arc::clone(&manager)));
+
+        // Second workspace built directly (not via `create_workspace`, which
+        // would itself schedule a debounced push and race the assertions
+        // below) — the same manual-construction pattern used by
+        // `reverse_index_resolves_correct_workspace_across_entries`.
+        let ws2_id = sid("second");
+        let extra = PtySurface::spawn(sid("extra"), "cat".into(), "/bin/cat", &[], 80, 24, None)
+            .expect("spawn /bin/cat");
+        manager.insert_surface(extra);
+        {
+            let mut workspaces = host.workspaces.lock().unwrap();
+            let mut store2 = LayoutStore { root: None, next_split_id: 1 };
+            store2.seed_first_pane(sid("extra"));
+            workspaces.insert(
+                ws2_id.clone(),
+                WorkspaceEntry { id: ws2_id.clone(), name: "second".into(), is_default: false, store: store2 },
+            );
+        }
+        host.surface_workspace.lock().unwrap().insert(sid("extra"), ws2_id.clone());
+
+        let (tx, mut rx) = mpsc::channel(8);
+        let guard = host.clients.register(tx, Arc::new(AtomicU64::new(0)));
+
+        assert_eq!(host.remove_workspace(&ws2_id), Ok(()));
+
+        assert!(
+            !manager.list().iter().any(|s| s.surface_id == sid("extra")),
+            "the deleted workspace's surface must be torn down from pty"
+        );
+        assert!(!host.surface_workspace.lock().unwrap().contains_key(&sid("extra")));
+        assert!(!host.workspaces.lock().unwrap().contains_key(&ws2_id));
+
+        let env = rx.recv().await.expect("WorkspaceRemoved broadcast");
+        match env.payload {
+            Some(Payload::WorkspaceUpdate(WorkspaceUpdate {
+                kind: Some(workspace_update::Kind::WorkspaceRemoved(WorkspaceRemoved { workspace_id })),
+            })) => assert_eq!(workspace_id, ws2_id),
+            other => panic!("expected WorkspaceUpdate.workspace_removed, got {other:?}"),
+        }
+        drop(guard);
     }
 }

@@ -49,6 +49,11 @@ final class PeerSSHTunnel: @unchecked Sendable {
     let remoteSockPath: String
     let localSockPath: String
 
+    /// Explicit SSH port (`-p`). nil = ssh default / ssh-config value.
+    let port: Int?
+    /// Identity file (`-i`). nil = default key chain / ssh-config value.
+    let identityFile: String?
+
     /// Remote HTTP dashboard port to forward alongside the peer socket.
     /// `nil` disables the forward entirely.
     let dashboardRemotePort: Int?
@@ -68,10 +73,18 @@ final class PeerSSHTunnel: @unchecked Sendable {
     /// actor; observers can safely touch UI state directly.
     var onStateChange: (@MainActor (PeerSSHTunnelState) -> Void)?
 
-    init(sshTarget: String, remoteSockPath: String, dashboardRemotePort: Int? = nil) {
+    init(
+        sshTarget: String,
+        remoteSockPath: String,
+        dashboardRemotePort: Int? = nil,
+        port: Int? = nil,
+        identityFile: String? = nil
+    ) {
         self.sshTarget = sshTarget
         self.remoteSockPath = remoteSockPath
         self.dashboardRemotePort = dashboardRemotePort
+        self.port = port
+        self.identityFile = identityFile
         let uuid = UUID().uuidString.lowercased().prefix(8)
         // Embed the owning app's PID in the filename so the startup
         // sweep can distinguish "left over from a dead app instance"
@@ -378,6 +391,18 @@ final class PeerSSHTunnel: @unchecked Sendable {
         // the forward target.
         try Self.validateSshTarget(sshTarget)
         try Self.validateRemoteSockPath(remoteSockPath)
+        if let port { try Self.validatePort(port) }
+        if let identityFile { try Self.validateIdentityFile(identityFile) }
+
+        // Optional auth parameters from a saved host profile. Values are
+        // validated above and formatted here (Int → String, tilde
+        // expansion), so nothing user-controlled can reach option
+        // position unchecked.
+        var authArgs: [String] = []
+        if let port { authArgs += ["-p", String(port)] }
+        if let identityFile {
+            authArgs += ["-i", (identityFile as NSString).expandingTildeInPath]
+        }
 
         // Forward the remote dashboard onto a loopback port here. Both
         // ends stay on 127.0.0.1: term-meshd binds its dashboard to
@@ -418,6 +443,7 @@ final class PeerSSHTunnel: @unchecked Sendable {
             "-o", "StreamLocalBindMask=0177",
             "-o", "StrictHostKeyChecking=accept-new",
             "-o", "BatchMode=no",
+        ] + authArgs + [
             "-L", "\(localSockPath):\(remoteSockPath)",
         ] + dashboardArgs + [
             // `--` ends ssh option parsing so the trailing target is
@@ -770,6 +796,50 @@ final class PeerSSHTunnel: @unchecked Sendable {
         if value.contains(where: { banned.contains($0) }) {
             throw PeerSSHTunnelError.invalidArgument(
                 "SSH target contains whitespace or control characters"
+            )
+        }
+    }
+
+    /// Reject ports outside the TCP range. The value is always
+    /// formatted via `String(_: Int)` so it can never carry an
+    /// option-injection payload; the range check fails fast on
+    /// nonsense saved-profile values.
+    static func validatePort(_ value: Int) throws {
+        guard (1...65535).contains(value) else {
+            throw PeerSSHTunnelError.invalidArgument(
+                "SSH port must be 1-65535 (got \(value))"
+            )
+        }
+    }
+
+    /// Reject identity-file paths that could be reinterpreted as ssh
+    /// options or that don't point at an existing file. `-i`'s value
+    /// position makes injection unlikely, but the same posture as the
+    /// other argv inputs is kept: no leading '-', no control
+    /// characters, absolute after tilde expansion, must exist.
+    static func validateIdentityFile(_ value: String) throws {
+        guard !value.isEmpty else {
+            throw PeerSSHTunnelError.invalidArgument("Identity file path is empty")
+        }
+        if value.hasPrefix("-") {
+            throw PeerSSHTunnelError.invalidArgument(
+                "Identity file path may not start with '-'"
+            )
+        }
+        if value.contains(where: { $0 == "\n" || $0 == "\r" || $0 == "\0" }) {
+            throw PeerSSHTunnelError.invalidArgument(
+                "Identity file path contains control characters"
+            )
+        }
+        let expanded = (value as NSString).expandingTildeInPath
+        guard expanded.hasPrefix("/") else {
+            throw PeerSSHTunnelError.invalidArgument(
+                "Identity file path must be absolute (or ~-relative)"
+            )
+        }
+        guard FileManager.default.fileExists(atPath: expanded) else {
+            throw PeerSSHTunnelError.invalidArgument(
+                "Identity file not found: \(expanded)"
             )
         }
     }

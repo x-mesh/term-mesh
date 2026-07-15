@@ -121,6 +121,60 @@ private final class GhosttyScrollView: NSScrollView {
     }
 }
 
+/// Phase 1 remote pane primitive: banner shown across the top of a
+/// remote pane when its relay session disconnects. Lives in the AppKit
+/// portal layer (a GhosttySurfaceScrollView subview) per the terminal
+/// overlay layering contract — SwiftUI overlays mounted in the panel
+/// container render UNDER the portal-hosted terminal view.
+private final class PeerPaneDisconnectBanner: NSVisualEffectView {
+    private let onReconnect: (() -> Void)?
+    private let onClosePane: (() -> Void)?
+
+    init(reason: String, onReconnect: (() -> Void)?, onClosePane: (() -> Void)?) {
+        self.onReconnect = onReconnect
+        self.onClosePane = onClosePane
+        super.init(frame: .zero)
+        blendingMode = .withinWindow
+        material = .hudWindow
+        state = .active
+
+        let label = NSTextField(labelWithString: reason)
+        label.font = .systemFont(ofSize: 11, weight: .medium)
+        label.lineBreakMode = .byTruncatingTail
+        label.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+
+        let reconnectButton = NSButton(
+            title: "Reconnect", target: self, action: #selector(reconnectPressed)
+        )
+        reconnectButton.bezelStyle = .rounded
+        reconnectButton.controlSize = .small
+        let closeButton = NSButton(
+            title: "Close Pane", target: self, action: #selector(closePressed)
+        )
+        closeButton.bezelStyle = .rounded
+        closeButton.controlSize = .small
+
+        let stack = NSStackView(views: [label, NSView(), reconnectButton, closeButton])
+        stack.orientation = .horizontal
+        stack.alignment = .centerY
+        stack.spacing = 8
+        stack.edgeInsets = NSEdgeInsets(top: 4, left: 10, bottom: 4, right: 10)
+        stack.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(stack)
+        NSLayoutConstraint.activate([
+            stack.topAnchor.constraint(equalTo: topAnchor),
+            stack.bottomAnchor.constraint(equalTo: bottomAnchor),
+            stack.leadingAnchor.constraint(equalTo: leadingAnchor),
+            stack.trailingAnchor.constraint(equalTo: trailingAnchor),
+        ])
+    }
+
+    required init?(coder: NSCoder) { fatalError("not used") }
+
+    @objc private func reconnectPressed() { onReconnect?() }
+    @objc private func closePressed() { onClosePane?() }
+}
+
 private final class GhosttyFlashOverlayView: NSView {
     override var acceptsFirstResponder: Bool { false }
 
@@ -556,6 +610,27 @@ final class GhosttySurfaceScrollView: NSView {
         surfaceView.frame.size = targetSize
         documentView.frame.size.width = scrollView.bounds.width
         inactiveOverlayView.frame = terminalBounds
+        if let banner = peerDisconnectBannerView {
+            let height: CGFloat = 32
+            // Sit just below the 2pt host strip so the always-on host
+            // signal stays visible while the banner is up.
+            let stripInset: CGFloat = peerHostStripView == nil ? 0 : 2
+            banner.frame = NSRect(
+                x: terminalBounds.minX,
+                y: terminalBounds.maxY - height - stripInset,
+                width: terminalBounds.width,
+                height: height
+            )
+        }
+        if let strip = peerHostStripView {
+            let height: CGFloat = 2
+            strip.frame = NSRect(
+                x: terminalBounds.minX,
+                y: terminalBounds.maxY - height,
+                width: terminalBounds.width,
+                height: height
+            )
+        }
         if let zone = activeDropZone {
             dropZoneOverlayView.frame = dropZoneOverlayFrame(for: zone, in: bounds.size)
         }
@@ -628,6 +703,56 @@ final class GhosttySurfaceScrollView: NSView {
         CATransaction.setDisableActions(true)
         layer.backgroundColor = color.cgColor
         CATransaction.commit()
+    }
+
+    // MARK: - Peer disconnect banner (Phase 1 remote pane primitive)
+
+    private var peerDisconnectBannerView: NSView?
+
+    /// Show (or replace) the remote-pane disconnect banner. Portal-layer
+    /// hosted so it renders above the Metal surface; see the layering
+    /// contract in the banner class comment.
+    func showPeerDisconnectBanner(
+        reason: String,
+        onReconnect: (() -> Void)?,
+        onClosePane: (() -> Void)?
+    ) {
+        hidePeerDisconnectBanner()
+        let banner = PeerPaneDisconnectBanner(
+            reason: reason,
+            onReconnect: onReconnect,
+            onClosePane: onClosePane
+        )
+        addSubview(banner, positioned: .above, relativeTo: nil)
+        peerDisconnectBannerView = banner
+        needsLayout = true
+    }
+
+    func hidePeerDisconnectBanner() {
+        peerDisconnectBannerView?.removeFromSuperview()
+        peerDisconnectBannerView = nil
+    }
+
+    // MARK: - Peer host strip (always-on remote-pane signal)
+
+    private var peerHostStripView: NSView?
+
+    /// 2pt host-colored strip along the pane's top edge, shown for
+    /// remote panes regardless of focus. nil removes it.
+    func setPeerHostStrip(color: NSColor?) {
+        if let color {
+            if peerHostStripView == nil {
+                let strip = NSView(frame: .zero)
+                strip.wantsLayer = true
+                addSubview(strip, positioned: .above, relativeTo: nil)
+                peerHostStripView = strip
+            }
+            peerHostStripView?.layer?.backgroundColor = color.cgColor
+        } else {
+            peerHostStripView?.removeFromSuperview()
+            peerHostStripView = nil
+        }
+        needsLayout = true
     }
 
     func setInactiveOverlay(color: NSColor, opacity: CGFloat, visible: Bool) {

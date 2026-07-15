@@ -1153,6 +1153,24 @@ class termmesh:
             params["surface_id"] = sid
         return dict(self._call("debug.peer.replay_probe", params) or {})
 
+    def peer_open_remote_pane(self, sock_path: Optional[str] = None) -> dict:
+        """Fire-and-forget headless remote-pane open via
+        `debug.peer.open_remote_pane` (DEBUG-only, Phase 1 remote pane
+        primitive). With no sock_path the app brings up its own peer
+        server and loopback-mirrors one of its surfaces. Poll
+        `peer_pane_status()['last_open_result']` for the outcome."""
+        params: Dict[str, Any] = {}
+        if sock_path:
+            params["sock_path"] = sock_path
+        return dict(self._call("debug.peer.open_remote_pane", params) or {})
+
+    def peer_pane_status(self) -> dict:
+        """Snapshot of remote-pane sessions + host-lease count via
+        `debug.peer.pane_status` (DEBUG-only). Returns the inner status
+        dict: {pane_sessions: [...], lease_count: N, last_open_result}."""
+        reply = dict(self._call("debug.peer.pane_status", {}) or {})
+        return dict(reply.get("status") or {})
+
     def coalesce_probe(self) -> dict:
         """Exercise the real `PtyDataCoalescer` (Phase P7) via
         `debug.peer.coalesce_probe` (DEBUG-only). No live 2-node peer

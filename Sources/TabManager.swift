@@ -28,6 +28,9 @@ class TabManager: ObservableObject {
             sentryBreadcrumb("workspace.switch", data: [
                 "tabCount": tabs.count
             ])
+            // Titlebar accent tracks the focused pane of the newly
+            // selected workspace (remote pane → host gradient).
+            PeerTitlebarAccentController.refresh()
             let previousTabId = oldValue
             if let previousTabId,
                let previousPanelId = focusedPanelId(for: previousTabId) {
@@ -397,7 +400,10 @@ class TabManager: ObservableObject {
         let teamWorkspaceIds = Set(
             TeamOrchestrator.shared.teams.values.map { $0.workspaceId }
         )
-        let nonTeamTabs = tabs.filter { !teamWorkspaceIds.contains($0.id) }
+        // Peer mirror workspaces are excluded too: restoring one would
+        // resurrect dead local shells for panes whose content lives on
+        // a remote host.
+        let nonTeamTabs = tabs.filter { !teamWorkspaceIds.contains($0.id) && !$0.isPeerMirror }
 
         let encoder = JSONEncoder()
         let workspaceStates = nonTeamTabs.map { workspace -> SavedWorkspaceState in
@@ -906,6 +912,11 @@ class TabManager: ObservableObject {
 
     func closeWorkspace(_ workspace: Workspace) {
         sentryBreadcrumb("workspace.close", data: ["tabCount": max(0, tabs.count - 1)])
+
+        // Live mirror: drop the layout-sync plane first (subscription,
+        // heartbeat, lease ref). Pane sessions tear down below via each
+        // panel's close(). Never forwards anything upstream.
+        workspace.peerMirror?.teardown()
 
         // Panel cleanup runs unconditionally regardless of how many tabs remain.
         // Previously guarded behind `tabs.count > 1`, which silently skipped all

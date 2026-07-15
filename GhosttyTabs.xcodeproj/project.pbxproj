@@ -35,6 +35,15 @@
 			CVB00085 /* PeerRelayWindowController.swift in Sources */ = {isa = PBXBuildFile; fileRef = CVS00085 /* PeerRelayWindowController.swift */; };
 			CVB00086 /* PeerRelayWorkspaceWindowController.swift in Sources */ = {isa = PBXBuildFile; fileRef = CVS00086 /* PeerRelayWorkspaceWindowController.swift */; };
 			CVB00087 /* PeerSSHTunnel.swift in Sources */ = {isa = PBXBuildFile; fileRef = CVS00087 /* PeerSSHTunnel.swift */; };
+			CVB00096 /* PeerSocketProber.swift in Sources */ = {isa = PBXBuildFile; fileRef = CVS00096 /* PeerSocketProber.swift */; };
+			CVB00100 /* PeerHostProfile.swift in Sources */ = {isa = PBXBuildFile; fileRef = CVS00100 /* PeerHostProfile.swift */; };
+			CVB00101 /* PeerHostProfileStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = CVS00101 /* PeerHostProfileStore.swift */; };
+			CVB00102 /* PeerHostEditorView.swift in Sources */ = {isa = PBXBuildFile; fileRef = CVS00102 /* PeerHostEditorView.swift */; };
+			CVB00103 /* PeerHostDoctor.swift in Sources */ = {isa = PBXBuildFile; fileRef = CVS00103 /* PeerHostDoctor.swift */; };
+			CVB00097 /* PeerPaneSession.swift in Sources */ = {isa = PBXBuildFile; fileRef = CVS00097 /* PeerPaneSession.swift */; };
+			CVB00098 /* PeerTitlebarAccent.swift in Sources */ = {isa = PBXBuildFile; fileRef = CVS00098 /* PeerTitlebarAccent.swift */; };
+			CVB00099 /* PeerWorkspaceMirror.swift in Sources */ = {isa = PBXBuildFile; fileRef = CVS00099 /* PeerWorkspaceMirror.swift */; };
+			CVB0009A /* PeerWorkspaceMirror+Reconcile.swift in Sources */ = {isa = PBXBuildFile; fileRef = CVS0009A /* PeerWorkspaceMirror+Reconcile.swift */; };
 			CVB00088 /* PeerBonjour.swift in Sources */ = {isa = PBXBuildFile; fileRef = CVS00088 /* PeerBonjour.swift */; };
 			CVB00089 /* PeerFederationSettings.swift in Sources */ = {isa = PBXBuildFile; fileRef = CVS00089 /* PeerFederationSettings.swift */; };
 			CVB00090 /* PeerRelayBanner.swift in Sources */ = {isa = PBXBuildFile; fileRef = CVS00090 /* PeerRelayBanner.swift */; };
@@ -178,6 +187,9 @@
 				F7000000A1B2C3D4E5F60718 /* IMEHistoryTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = F7000001A1B2C3D4E5F60718 /* IMEHistoryTests.swift */; };
 				F8000000A1B2C3D4E5F60718 /* IMESendKeyTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = F8000001A1B2C3D4E5F60718 /* IMESendKeyTests.swift */; };
 				F9000000A1B2C3D4E5F60718 /* AutoReplyDetectorTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = F9000001A1B2C3D4E5F60718 /* AutoReplyDetectorTests.swift */; };
+				FA000000A1B2C3D4E5F60718 /* PeerSocketProberTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = FA000001A1B2C3D4E5F60718 /* PeerSocketProberTests.swift */; };
+				FB000000A1B2C3D4E5F60718 /* PeerPaneSessionTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = FB000001A1B2C3D4E5F60718 /* PeerPaneSessionTests.swift */; };
+				FC000000A1B2C3D4E5F60718 /* PeerWorkspaceMirrorTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = FC000001A1B2C3D4E5F60718 /* PeerWorkspaceMirrorTests.swift */; };
 		/* End PBXBuildFile section */
 
 /* Begin PBXCopyFilesBuildPhase section */
@@ -262,6 +274,15 @@
 			CVS00085 /* PeerRelayWindowController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PeerRelayWindowController.swift; sourceTree = "<group>"; };
 			CVS00086 /* PeerRelayWorkspaceWindowController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PeerRelayWorkspaceWindowController.swift; sourceTree = "<group>"; };
 			CVS00087 /* PeerSSHTunnel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PeerSSHTunnel.swift; sourceTree = "<group>"; };
+			CVS00096 /* PeerSocketProber.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PeerSocketProber.swift; sourceTree = "<group>"; };
+			CVS00100 /* PeerHostProfile.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PeerHostProfile.swift; sourceTree = "<group>"; };
+			CVS00101 /* PeerHostProfileStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PeerHostProfileStore.swift; sourceTree = "<group>"; };
+			CVS00102 /* PeerHostEditorView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PeerHostEditorView.swift; sourceTree = "<group>"; };
+			CVS00103 /* PeerHostDoctor.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PeerHostDoctor.swift; sourceTree = "<group>"; };
+			CVS00097 /* PeerPaneSession.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PeerPaneSession.swift; sourceTree = "<group>"; };
+			CVS00098 /* PeerTitlebarAccent.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PeerTitlebarAccent.swift; sourceTree = "<group>"; };
+			CVS00099 /* PeerWorkspaceMirror.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PeerWorkspaceMirror.swift; sourceTree = "<group>"; };
+			CVS0009A /* PeerWorkspaceMirror+Reconcile.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "PeerWorkspaceMirror+Reconcile.swift"; sourceTree = "<group>"; };
 			CVS00088 /* PeerBonjour.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PeerBonjour.swift; sourceTree = "<group>"; };
 			CVS00089 /* PeerFederationSettings.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PeerFederationSettings.swift; sourceTree = "<group>"; };
 			CVS00090 /* PeerRelayBanner.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PeerRelayBanner.swift; sourceTree = "<group>"; };
@@ -405,6 +426,9 @@
 			F7000001A1B2C3D4E5F60718 /* IMEHistoryTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = IMEHistoryTests.swift; sourceTree = "<group>"; };
 			F8000001A1B2C3D4E5F60718 /* IMESendKeyTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = IMESendKeyTests.swift; sourceTree = "<group>"; };
 			F9000001A1B2C3D4E5F60718 /* AutoReplyDetectorTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AutoReplyDetectorTests.swift; sourceTree = "<group>"; };
+			FA000001A1B2C3D4E5F60718 /* PeerSocketProberTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PeerSocketProberTests.swift; sourceTree = "<group>"; };
+			FB000001A1B2C3D4E5F60718 /* PeerPaneSessionTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PeerPaneSessionTests.swift; sourceTree = "<group>"; };
+			FC000001A1B2C3D4E5F60718 /* PeerWorkspaceMirrorTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PeerWorkspaceMirrorTests.swift; sourceTree = "<group>"; };
 		/* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -538,6 +562,15 @@
 				CVS00085 /* PeerRelayWindowController.swift */,
 				CVS00086 /* PeerRelayWorkspaceWindowController.swift */,
 				CVS00087 /* PeerSSHTunnel.swift */,
+				CVS00096 /* PeerSocketProber.swift */,
+				CVS00100 /* PeerHostProfile.swift */,
+				CVS00101 /* PeerHostProfileStore.swift */,
+				CVS00102 /* PeerHostEditorView.swift */,
+				CVS00103 /* PeerHostDoctor.swift */,
+				CVS00097 /* PeerPaneSession.swift */,
+				CVS00098 /* PeerTitlebarAccent.swift */,
+				CVS00099 /* PeerWorkspaceMirror.swift */,
+				CVS0009A /* PeerWorkspaceMirror+Reconcile.swift */,
 				CVS00088 /* PeerBonjour.swift */,
 				CVS00089 /* PeerFederationSettings.swift */,
 				CVS00090 /* PeerRelayBanner.swift */,
@@ -711,6 +744,9 @@
 				F7000001A1B2C3D4E5F60718 /* IMEHistoryTests.swift */,
 				F8000001A1B2C3D4E5F60718 /* IMESendKeyTests.swift */,
 				F9000001A1B2C3D4E5F60718 /* AutoReplyDetectorTests.swift */,
+				FA000001A1B2C3D4E5F60718 /* PeerSocketProberTests.swift */,
+				FB000001A1B2C3D4E5F60718 /* PeerPaneSessionTests.swift */,
+				FC000001A1B2C3D4E5F60718 /* PeerWorkspaceMirrorTests.swift */,
 			);
 			path = termMeshTests;
 			sourceTree = "<group>";
@@ -878,6 +914,15 @@
 				CVB00085 /* PeerRelayWindowController.swift in Sources */,
 				CVB00086 /* PeerRelayWorkspaceWindowController.swift in Sources */,
 				CVB00087 /* PeerSSHTunnel.swift in Sources */,
+				CVB00096 /* PeerSocketProber.swift in Sources */,
+				CVB00100 /* PeerHostProfile.swift in Sources */,
+				CVB00101 /* PeerHostProfileStore.swift in Sources */,
+				CVB00102 /* PeerHostEditorView.swift in Sources */,
+				CVB00103 /* PeerHostDoctor.swift in Sources */,
+				CVB00097 /* PeerPaneSession.swift in Sources */,
+				CVB00098 /* PeerTitlebarAccent.swift in Sources */,
+				CVB00099 /* PeerWorkspaceMirror.swift in Sources */,
+				CVB0009A /* PeerWorkspaceMirror+Reconcile.swift in Sources */,
 				CVB00088 /* PeerBonjour.swift in Sources */,
 				CVB00089 /* PeerFederationSettings.swift in Sources */,
 				CVB00090 /* PeerRelayBanner.swift in Sources */,
@@ -1023,6 +1068,9 @@
 				F7000000A1B2C3D4E5F60718 /* IMEHistoryTests.swift in Sources */,
 				F8000000A1B2C3D4E5F60718 /* IMESendKeyTests.swift in Sources */,
 				F9000000A1B2C3D4E5F60718 /* AutoReplyDetectorTests.swift in Sources */,
+				FA000000A1B2C3D4E5F60718 /* PeerSocketProberTests.swift in Sources */,
+				FB000000A1B2C3D4E5F60718 /* PeerPaneSessionTests.swift in Sources */,
+				FC000000A1B2C3D4E5F60718 /* PeerWorkspaceMirrorTests.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -1123,7 +1171,7 @@
 				CODE_SIGN_ENTITLEMENTS = "";
 				CODE_SIGN_STYLE = Automatic;
 				COMBINE_HIDPI_IMAGES = YES;
-				CURRENT_PROJECT_VERSION = 211;
+				CURRENT_PROJECT_VERSION = 212;
 				DEVELOPMENT_TEAM = "";
 				ENABLE_HARDENED_RUNTIME = NO;
 				GENERATE_INFOPLIST_FILE = NO;
@@ -1132,7 +1180,7 @@
 					"$(inherited)",
 					"@executable_path/../Frameworks",
 				);
-				MARKETING_VERSION = 0.154.0;
+				MARKETING_VERSION = 0.155.0;
 				OTHER_LDFLAGS = (
 					"-lc++",
 					"-framework",
@@ -1162,7 +1210,7 @@
 				CODE_SIGN_ENTITLEMENTS = "";
 				CODE_SIGN_STYLE = Automatic;
 				COMBINE_HIDPI_IMAGES = YES;
-				CURRENT_PROJECT_VERSION = 211;
+				CURRENT_PROJECT_VERSION = 212;
 				DEVELOPMENT_TEAM = "";
 				ENABLE_HARDENED_RUNTIME = NO;
 				GENERATE_INFOPLIST_FILE = NO;
@@ -1171,7 +1219,7 @@
 					"$(inherited)",
 					"@executable_path/../Frameworks",
 				);
-				MARKETING_VERSION = 0.154.0;
+				MARKETING_VERSION = 0.155.0;
 				OTHER_LDFLAGS = (
 					"-lc++",
 					"-framework",
@@ -1225,10 +1273,10 @@
 			isa = XCBuildConfiguration;
 			buildSettings = {
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 211;
+				CURRENT_PROJECT_VERSION = 212;
 				GENERATE_INFOPLIST_FILE = YES;
 				MACOSX_DEPLOYMENT_TARGET = 14.0;
-				MARKETING_VERSION = 0.154.0;
+				MARKETING_VERSION = 0.155.0;
 				ONLY_ACTIVE_ARCH = YES;
 				PRODUCT_BUNDLE_IDENTIFIER = com.termmesh.appuitests;
 				PRODUCT_NAME = "$(TARGET_NAME)";
@@ -1242,10 +1290,10 @@
 			isa = XCBuildConfiguration;
 			buildSettings = {
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 211;
+				CURRENT_PROJECT_VERSION = 212;
 				GENERATE_INFOPLIST_FILE = YES;
 				MACOSX_DEPLOYMENT_TARGET = 14.0;
-				MARKETING_VERSION = 0.154.0;
+				MARKETING_VERSION = 0.155.0;
 				ONLY_ACTIVE_ARCH = YES;
 				PRODUCT_BUNDLE_IDENTIFIER = com.termmesh.appuitests;
 				PRODUCT_NAME = "$(TARGET_NAME)";
@@ -1259,10 +1307,10 @@
 			buildSettings = {
 				BUNDLE_LOADER = "$(TEST_HOST)";
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 211;
+				CURRENT_PROJECT_VERSION = 212;
 				GENERATE_INFOPLIST_FILE = YES;
 				MACOSX_DEPLOYMENT_TARGET = 14.0;
-				MARKETING_VERSION = 0.154.0;
+				MARKETING_VERSION = 0.155.0;
 				ONLY_ACTIVE_ARCH = YES;
 				PRODUCT_BUNDLE_IDENTIFIER = com.termmesh.apptests;
 				PRODUCT_NAME = "$(TARGET_NAME)";
@@ -1278,10 +1326,10 @@
 			buildSettings = {
 				BUNDLE_LOADER = "$(TEST_HOST)";
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 211;
+				CURRENT_PROJECT_VERSION = 212;
 				GENERATE_INFOPLIST_FILE = YES;
 				MACOSX_DEPLOYMENT_TARGET = 14.0;
-				MARKETING_VERSION = 0.154.0;
+				MARKETING_VERSION = 0.155.0;
 				ONLY_ACTIVE_ARCH = YES;
 				PRODUCT_BUNDLE_IDENTIFIER = com.termmesh.apptests;
 				PRODUCT_NAME = "$(TARGET_NAME)";

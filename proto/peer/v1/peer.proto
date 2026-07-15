@@ -42,6 +42,9 @@ message Envelope {
     ListWorkspaces list_workspaces = 25;
     WorkspaceList workspace_list = 26;
     WorkspaceControl workspace_control = 27;
+    // Gated behind capability "workspace.lifecycle.v1" (Hello.capabilities).
+    CreateWorkspaceRequest create_workspace_request = 28;
+    CreateWorkspaceResponse create_workspace_response = 29;
 
     PtyData pty_data = 30;
     Input input = 31;
@@ -50,6 +53,10 @@ message Envelope {
     DataAck data_ack = 34;
 
     WorkspaceUpdate workspace_update = 40;
+
+    // Gated behind capability "workspace.lifecycle.v1" (Hello.capabilities).
+    RenameWorkspaceRequest rename_workspace_request = 41;
+    DeleteWorkspaceRequest delete_workspace_request = 42;
 
     Ping ping = 50;
     Pong pong = 51;
@@ -196,6 +203,13 @@ message Workspace {
   // used for the section header in the client's workspace picker/sidebar.
   // May be empty; clients fall back to a short window_id hex suffix.
   string window_title = 5;
+  // True for the daemon's current default workspace (owns the static
+  // TERMMESH_PEER_SURFACES shells; un-namespaced control commands land
+  // here). The default is deletable — the host only refuses removing the
+  // LAST workspace (LastWorkspace), promoting a survivor if the deleted
+  // one was default. Clients surface this so the delete confirmation can
+  // warn "the default is being replaced". Legacy hosts leave it false.
+  bool is_default = 6;
 }
 
 // Recursive node: either a split (interior) or a pane (leaf).
@@ -244,6 +258,64 @@ message PaneTab {
 }
 
 // ============================================================
+// Workspace lifecycle (create/rename/delete)
+// ============================================================
+//
+// Gated behind capability "workspace.lifecycle.v1" (Hello.capabilities,
+// evolution rule 3). A host that doesn't advertise this capability may
+// not implement these Envelope payloads yet: senders must check the
+// peer's advertised capabilities before use, and hosts that receive one
+// of these payloads without support are expected to fall through the
+// unhandled-payload path (connection stays alive, no reply is sent —
+// see docs/peer-federation-protocol.md and the F8 regression test),
+// never crash or drop the connection.
+//
+// RenameWorkspaceRequest and DeleteWorkspaceRequest reference an
+// existing workspace_id (as surfaced by WorkspaceList/Workspace.workspace_id
+// or a prior CreateWorkspaceResponse). Hosts MUST safely reject an empty
+// or unknown workspace_id — respond with Error (or a false `accepted`
+// on the paired response, where one exists) rather than treating it as
+// "the current workspace" or "all workspaces".
+
+message CreateWorkspaceRequest {
+  // Human-readable title for the new, initially pane-less workspace.
+  // May be empty; the host may substitute a default title.
+  string title = 1;
+}
+
+message CreateWorkspaceResponse {
+  bool accepted = 1;
+  // Human-readable reason on failure; empty on success.
+  string reason = 2;
+  // Host-assigned id of the newly created workspace. Empty when
+  // accepted == false.
+  bytes workspace_id = 3;
+}
+
+message RenameWorkspaceRequest {
+  // Must reference an existing workspace_id. Empty or unknown ids must
+  // be safely rejected by the host, never silently applied to an
+  // unrelated (e.g. "current") workspace.
+  bytes workspace_id = 1;
+  string title = 2;
+}
+
+message DeleteWorkspaceRequest {
+  // Must reference an existing workspace_id. Empty or unknown ids must
+  // be safely rejected by the host (no-op + error reply), never
+  // interpreted as "delete all" or "delete current".
+  bytes workspace_id = 1;
+}
+
+// Pushed by the host to every attached client when a workspace is
+// deleted (via DeleteWorkspaceRequest or a host-local UI action), so
+// clients can drop it from their sidebar/roster without polling
+// ListWorkspaces.
+message WorkspaceRemoved {
+  bytes workspace_id = 1;
+}
+
+// ============================================================
 // Workspace control (client → host)
 // ============================================================
 //
@@ -284,6 +356,12 @@ message SetDividerPositionRequest {
   bytes split_id = 1;
   // Fraction in [0.0, 1.0] of the first child.
   double ratio = 2;
+  // Owning workspace. split_id is unique only WITHIN a workspace's tree
+  // (each LayoutStore has its own counter), so two workspaces routinely
+  // share a split_id — without this, the host would resize whichever
+  // tree matches first. Empty = legacy client; the host falls back to
+  // first-match (single-workspace behavior).
+  bytes workspace_id = 3;
 }
 
 message NewTabRequest {
@@ -291,6 +369,11 @@ message NewTabRequest {
   // new terminal tab should appear. The host resolves it back to the
   // pane id and creates a new tab there.
   bytes pane_id = 1;
+  // Target workspace for the "empty workspace" case, where pane_id is
+  // empty/unresolvable because the workspace has no panes yet (e.g.
+  // right after CreateWorkspaceRequest). Ignored when pane_id resolves
+  // to an existing pane. Gated behind capability "workspace.lifecycle.v1".
+  bytes workspace_id = 2;
 }
 
 message ActivateTabRequest {
@@ -403,6 +486,9 @@ message WorkspaceUpdate {
     // refreshed `WorkspaceLayout` so attached clients can diff
     // against their current state and patch the layout in place.
     WorkspaceLayoutChanged workspace_layout = 6;
+    // Pushed when a workspace itself (not a pane inside one) is
+    // deleted. Gated behind capability "workspace.lifecycle.v1".
+    WorkspaceRemoved workspace_removed = 7;
   }
 }
 

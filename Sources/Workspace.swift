@@ -490,11 +490,22 @@ final class Workspace: Identifiable, ObservableObject {
     func resolvedPanelTitle(panelId: UUID, fallback: String) -> String {
         let trimmedFallback = fallback.trimmingCharacters(in: .whitespacesAndNewlines)
         let fallbackTitle = trimmedFallback.isEmpty ? "Tab" : trimmedFallback
+        let base: String
         if let custom = panelCustomTitles[panelId]?.trimmingCharacters(in: .whitespacesAndNewlines),
            !custom.isEmpty {
-            return custom
+            base = custom
+        } else {
+            base = fallbackTitle
         }
-        return fallbackTitle
+        // Remote panes carry a host chip in the tab title so mixed
+        // workspaces stay legible even for non-focused panes (Phase 1
+        // remote pane primitive, always-on signal).
+        if let hostKey = (panels[panelId] as? TerminalPanel)?.remoteHostKey,
+           !base.hasSuffix(" ⌁ \(hostKey.shortLabel)")
+        {
+            return "\(base) ⌁ \(hostKey.shortLabel)"
+        }
+        return base
     }
 
     func syncPinnedStateForTab(_ tabId: TabID, panelId: UUID) {
@@ -1035,6 +1046,14 @@ final class Workspace: Identifiable, ObservableObject {
         command: String? = nil,
         environment: [String: String] = [:]
     ) -> TerminalPanel? {
+        // Live mirror: the host owns the layout — forward the split and
+        // create nothing locally (the host's layout push materializes
+        // the new pane). Gated at ENTRY, before any panel exists, so no
+        // surface can leak on the forwarded path.
+        if mirrorForwardsLocalActions {
+            peerMirror?.forwardSplit(panelId: panelId, orientation: orientation)
+            return nil
+        }
         // Find the pane containing the source panel
         guard let sourceTabId = surfaceIdFromPanelId(panelId) else { return nil }
         var sourcePaneId: PaneID?
@@ -1224,6 +1243,16 @@ final class Workspace: Identifiable, ObservableObject {
     ///                    false = never focus (used for internal placeholder repair paths).
     @discardableResult
     func newTerminalSurface(inPane paneId: PaneID, focus: Bool? = nil) -> TerminalPanel? {
+        // Live mirror: forward as a host-side new-tab (keyed by the
+        // pane's selected panel), create nothing locally.
+        if mirrorForwardsLocalActions {
+            if let tab = bonsplitController.selectedTab(inPane: paneId),
+               let panelId = panelIdFromSurfaceId(tab.id)
+            {
+                peerMirror?.forwardNewTab(panelId: panelId)
+            }
+            return nil
+        }
         let shouldFocusNewTab = focus ?? (bonsplitController.focusedPaneId == paneId)
 
         let inheritedConfig = inheritedTerminalConfig(inPane: paneId)
@@ -1268,6 +1297,43 @@ final class Workspace: Identifiable, ObservableObject {
         return newPanel
     }
 
+    /// Phase 2B reconciler helper: a remote-pane tab (relay command/env)
+    /// added to an EXISTING pane without splitting — the reconciler
+    /// places it via `splitPane(movingTab:)` afterwards. Mirrors
+    /// `newTerminalSurface(inPane:)`'s panel bookkeeping; never focuses.
+    func newRemoteTerminalTab(
+        inPane paneId: PaneID,
+        command: String,
+        environment: [String: String]
+    ) -> TerminalPanel? {
+        let newPanel = TerminalPanel(
+            workspaceId: id,
+            context: GHOSTTY_SURFACE_CONTEXT_SPLIT,
+            configTemplate: inheritedTerminalConfig(inPane: paneId),
+            portOrdinal: portOrdinal,
+            command: command,
+            environment: environment
+        )
+        panels[newPanel.id] = newPanel
+        panelTitles[newPanel.id] = newPanel.displayTitle
+
+        guard let newTabId = bonsplitController.createTab(
+            title: newPanel.displayTitle,
+            icon: newPanel.displayIcon,
+            kind: SurfaceKind.terminal,
+            isDirty: newPanel.isDirty,
+            isPinned: false,
+            inPane: paneId
+        ) else {
+            panels.removeValue(forKey: newPanel.id)
+            panelTitles.removeValue(forKey: newPanel.id)
+            newPanel.close()
+            return nil
+        }
+        surfaceIdToPanelId[newTabId] = newPanel.id
+        return newPanel
+    }
+
     /// Create a new browser panel split
     @discardableResult
     func newBrowserSplit(
@@ -1277,6 +1343,8 @@ final class Workspace: Identifiable, ObservableObject {
         url: URL? = nil,
         focus: Bool = true
     ) -> BrowserPanel? {
+        // Live mirror: the host has no browser surfaces — refuse.
+        if mirrorForwardsLocalActions { NSSound.beep(); return nil }
         // Find the pane containing the source panel
         guard let sourceTabId = surfaceIdFromPanelId(panelId) else { return nil }
         var sourcePaneId: PaneID?
@@ -1351,6 +1419,8 @@ final class Workspace: Identifiable, ObservableObject {
         insertAtEnd: Bool = false,
         bypassInsecureHTTPHostOnce: String? = nil
     ) -> BrowserPanel? {
+        // Live mirror: the host has no browser surfaces — refuse.
+        if mirrorForwardsLocalActions { NSSound.beep(); return nil }
         let shouldFocusNewTab = focus ?? (bonsplitController.focusedPaneId == paneId)
 
         let browserPanel = BrowserPanel(
@@ -1399,6 +1469,14 @@ final class Workspace: Identifiable, ObservableObject {
     /// Close a panel.
     /// Returns true when a bonsplit tab close request was issued.
     func closePanel(_ panelId: UUID, force: Bool = false) -> Bool {
+        // Live mirror: every close — socket force-closes included —
+        // forwards to the host; the layout push performs the removal.
+        // The reconciler's own closes run under isApplyingRemoteLayout
+        // and pass through (with force, so no confirm gating).
+        if mirrorForwardsLocalActions {
+            peerMirror?.forwardClose(panelId: panelId)
+            return false
+        }
         if let tabId = surfaceIdFromPanelId(panelId) {
             if force {
                 forceCloseTabIds.insert(tabId)
@@ -1629,6 +1707,8 @@ final class Workspace: Identifiable, ObservableObject {
 
     @discardableResult
     func moveSurface(panelId: UUID, toPane paneId: PaneID, atIndex index: Int? = nil, focus: Bool = true) -> Bool {
+        // Live mirror: layout is host-owned — no local pane moves.
+        if mirrorForwardsLocalActions { return false }
         guard let tabId = surfaceIdFromPanelId(panelId) else { return false }
         guard bonsplitController.allPaneIds.contains(paneId) else { return false }
         guard bonsplitController.moveTab(tabId, toPane: paneId, atIndex: index) else { return false }
@@ -1646,6 +1726,9 @@ final class Workspace: Identifiable, ObservableObject {
 
     @discardableResult
     func reorderSurface(panelId: UUID, toIndex index: Int) -> Bool {
+        // Live mirror: single-tab panes; reorder is meaningless and the
+        // layout is host-owned.
+        if mirrorForwardsLocalActions { return false }
         guard let tabId = surfaceIdFromPanelId(panelId) else { return false }
         guard bonsplitController.reorderTab(tabId, toIndex: index) else { return false }
 
@@ -1659,6 +1742,9 @@ final class Workspace: Identifiable, ObservableObject {
     }
 
     func detachSurface(panelId: UUID) -> DetachedSurfaceTransfer? {
+        // Live mirror: panes cannot leave the mirrored workspace — their
+        // sessions are bound to this workspace's host lease.
+        if mirrorForwardsLocalActions { return nil }
         guard let tabId = surfaceIdFromPanelId(panelId) else { return nil }
         guard panels[panelId] != nil else { return nil }
 
@@ -2024,6 +2110,130 @@ final class Workspace: Identifiable, ObservableObject {
     func newTerminalSurfaceInFocusedPane(focus: Bool? = nil) -> TerminalPanel? {
         guard let focusedPaneId = bonsplitController.focusedPaneId else { return nil }
         return newTerminalSurface(inPane: focusedPaneId, focus: focus)
+    }
+
+    // MARK: - Remote peer panes (Phase 1 remote pane primitive)
+
+    /// Phase 2B live mirror: non-nil when this workspace mirrors a host
+    /// workspace. The HOST owns the layout — local structural actions
+    /// forward to it instead of mutating the local tree (see the entry
+    /// gates below and the delegate vetoes in
+    /// Workspace+BonsplitDelegate). The controller's reconciler is the
+    /// only writer, marked by `isApplyingRemoteLayout`.
+    weak var peerMirror: PeerWorkspaceMirrorController?
+    var isPeerMirror: Bool { peerMirror != nil }
+
+    /// True when a local structural action must forward to the mirror
+    /// host instead of applying (mirror mode, and not currently inside
+    /// the reconciler's own mutation pass).
+    var mirrorForwardsLocalActions: Bool {
+        guard let peerMirror else { return false }
+        return !peerMirror.isApplyingRemoteLayout && !peerMirror.isTornDown
+    }
+
+    /// Host a remote peer surface as a NORMAL Bonsplit pane: split from
+    /// the focused panel with the relay binary as the pane's shell, hand
+    /// the panel ownership of `session`, and start pumping. Layout stays
+    /// local — this is the pane-mixing model, not a workspace mirror.
+    ///
+    /// Returns nil when there is no focused terminal panel to split from
+    /// (the caller should surface that to the user). On a relay start
+    /// failure the session is torn down; the pane shows the exited relay
+    /// process (t4 replaces this with a reconnect banner).
+    func openRemotePane(
+        session: PeerPaneSession,
+        orientation: SplitOrientation = .horizontal,
+        focus: Bool = true,
+        from explicitSourcePanelId: UUID? = nil
+    ) -> TerminalPanel? {
+        guard let sourcePanelId = explicitSourcePanelId ?? focusedPanelId,
+              let panel = newTerminalSplit(
+                  from: sourcePanelId,
+                  orientation: orientation,
+                  focus: focus,
+                  command: session.relayLaunchCommand,
+                  environment: session.relayEnvironment
+              )
+        else { return nil }
+        bindRemotePane(session: session, to: panel)
+        return panel
+    }
+
+    /// Wire a remote session to a panel whose Ghostty surface was
+    /// created with the session's relay command/env: session ownership,
+    /// host signals, disconnect banner, and relay start. Split out of
+    /// `openRemotePane` so the workspace-mirror flow can bind a fresh
+    /// workspace's INITIAL panel the same way.
+    func bindRemotePane(session: PeerPaneSession, to panel: TerminalPanel) {
+        panel.peerPaneSession = session
+        if !session.surfaceTitle.isEmpty {
+            panel.updateTitle(session.surfaceTitle)
+        }
+        // Always-on host signal: 2pt strip in the host's accent color
+        // (the focused-pane titlebar gradient complements this).
+        panel.hostedView.setPeerHostStrip(
+            color: PeerHostAccent.primaryColor(for: session.lease.key)
+        )
+        let panelId = panel.id
+        session.requestPaneClose = { [weak self] in
+            _ = self?.closePanel(panelId, force: true)
+        }
+        // Disconnect banner (portal-layer overlay): keep the pane's slot,
+        // offer Reconnect (attach a fresh session + swap the pane) and
+        // Close. Skipped when the pane itself initiated teardown.
+        let hostLabel = String(describing: session.lease.key)
+        let showBanner: @MainActor (String) -> Void = { [weak self, weak panel] reason in
+            guard let self, let panel,
+                  let current = panel.peerPaneSession, !current.isTorndown
+            else { return }
+            panel.hostedView.showPeerDisconnectBanner(
+                reason: "Remote pane disconnected — \(reason)",
+                onReconnect: { [weak self, weak panel] in
+                    guard let self, let panel,
+                          let session = panel.peerPaneSession else { return }
+                    // Live mirror: individual pane reconnects would fight
+                    // the reconciler — resync the whole mirror instead.
+                    if let mirror = self.peerMirror {
+                        Task { @MainActor in await mirror.forceResync() }
+                        return
+                    }
+                    Task { @MainActor in
+                        await PeerClientCoordinator.shared.reconnectRemotePane(
+                            oldSession: session,
+                            panelId: panel.id,
+                            workspace: self
+                        )
+                    }
+                },
+                onClosePane: { [weak self] in
+                    _ = self?.closePanel(panelId, force: true)
+                }
+            )
+        }
+        session.relaySession.onDisconnect = { showBanner(hostLabel) }
+        session.relaySession.onError = { error in
+            showBanner("\(hostLabel): \(String(describing: error))")
+        }
+        PeerTitlebarAccentController.refresh()
+        #if DEBUG
+        dlog("peer.pane.open workspace=\(id.uuidString.prefix(8)) host=\(session.lease.key) title=\(session.surfaceTitle)")
+        #endif
+        // Accept the relay binary's connection once Ghostty spawns it as
+        // the pane's shell. Weak panel: if the pane closes mid-start,
+        // close() already ran teardown and start() unblocks with an error.
+        Task { [weak panel] in
+            do {
+                try await session.start()
+            } catch {
+                NSLog("[peer-pane] relay start failed: %@", String(describing: error))
+                // Banner BEFORE teardown — showBanner refuses to draw on a
+                // torn-down session, and a start failure with no visible
+                // error (just a dead shell) is undebuggable for the user.
+                showBanner("relay start failed: \(String(describing: error))")
+                session.teardown()
+                _ = panel
+            }
+        }
     }
 
     // MARK: - Flash/Notification Support

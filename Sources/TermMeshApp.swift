@@ -685,21 +685,23 @@ struct TermMeshApp: App {
 
                 Divider()
 
-                Button("Connect to Peer…") {
-                    PeerClientCoordinator.shared.promptAndRun(nil)
+                // Sidebar-first peer UX: connecting/opening lives in the
+                // sidebar; the menu keeps host management. Raw socket
+                // dialogs stay as DEBUG-only tools.
+                Button("Add Peer Host…") {
+                    PeerClientCoordinator.shared.addRemoteHost(nil)
                 }
 
-                Menu("Via Relay") {
-                    Button("Connect via Relay…") {
-                        PeerClientCoordinator.shared.promptAndRunRelay(nil)
+#if DEBUG
+                Menu("Debug Connect") {
+                    Button("Connect to Peer…") {
+                        PeerClientCoordinator.shared.promptAndRun(nil)
                     }
                     Button("Connect to Workspace via Relay…") {
                         PeerClientCoordinator.shared.promptAndRunRelayWorkspace(nil)
                     }
-                    Button("Remote Workspace (SSH)…") {
-                        PeerClientCoordinator.shared.promptAndRunRelayWorkspaceSSH(nil)
-                    }
                 }
+#endif
 
                 Button("Show Peer Connections…") {
                     PeerClientCoordinator.shared.showConnections(nil)

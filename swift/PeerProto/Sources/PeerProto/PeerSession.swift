@@ -21,6 +21,7 @@ public enum PeerSessionError: Error, Equatable {
     case protocolVersionMismatch(host: String, client: String)
     case authRejected(reason: String)
     case attachRejected(reason: String)
+    case createWorkspaceRejected(reason: String)
     case unexpectedMessage(String)
 }
 
@@ -41,6 +42,9 @@ public enum PeerIncomingMessage: Sendable {
     case workspaceSurfaceRemoved(surfaceID: Data)
     case workspaceSurfaceRetitled(surfaceID: Data, title: String)
     case workspaceLayoutChanged(workspaceID: Data, layout: Termmesh_Peer_V1_WorkspaceLayout)
+    /// Pushed when a workspace itself (not a pane inside one) was deleted
+    /// on the host. Gated behind capability "workspace.lifecycle.v1".
+    case workspaceRemoved(workspaceID: Data)
     case error(code: UInt32, message: String)
     case goodbye(reason: String)
     case other
@@ -282,6 +286,60 @@ public actor PeerSession {
         return list.workspaces
     }
 
+    // MARK: - Workspace lifecycle (create / rename / delete)
+
+    /// Ask the host to create a new, initially pane-less workspace and
+    /// wait for its `CreateWorkspaceResponse`. This is a response-waiting
+    /// RPC like `listWorkspaces()` above — it reads exactly one reply
+    /// frame off the wire, so it must only be called on a session whose
+    /// receive loop is NOT already running (single-reader invariant; see
+    /// the file header of `PeerWorkspaceMirrorController`). Intended for
+    /// a one-shot connection (e.g. the sidebar's "New Workspace" action),
+    /// never on a live workspace-mirror subscription session.
+    ///
+    /// Returns the host-assigned workspace id on success.
+    public func createWorkspace(title: String) async throws -> Data {
+        try await sendEnvelope { env in
+            var req = Termmesh_Peer_V1_CreateWorkspaceRequest()
+            req.title = title
+            env.createWorkspaceRequest = req
+        }
+        let reply = try await readFrame()
+        guard case .createWorkspaceResponse(let r) = reply.payload else {
+            throw PeerSessionError.unexpectedMessage(
+                "expected CreateWorkspaceResponse, got \(String(describing: reply.payload))"
+            )
+        }
+        if !r.accepted {
+            throw PeerSessionError.createWorkspaceRejected(reason: r.reason)
+        }
+        return r.workspaceID
+    }
+
+    /// Ask the host to rename an existing workspace. Fire-and-forget, like
+    /// the WorkspaceControl requests below — there is no dedicated
+    /// response; callers observe the rename via a subsequent
+    /// `listWorkspaces()` or the sidebar's own refresh.
+    public func renameWorkspace(workspaceID: Data, title: String) async throws {
+        try await sendEnvelope { env in
+            var req = Termmesh_Peer_V1_RenameWorkspaceRequest()
+            req.workspaceID = workspaceID
+            req.title = title
+            env.renameWorkspaceRequest = req
+        }
+    }
+
+    /// Ask the host to delete an existing workspace. Fire-and-forget; the
+    /// host pushes `WorkspaceUpdate.workspaceRemoved` to every attached
+    /// client (including this one, if subscribed) once the delete lands.
+    public func deleteWorkspace(workspaceID: Data) async throws {
+        try await sendEnvelope { env in
+            var req = Termmesh_Peer_V1_DeleteWorkspaceRequest()
+            req.workspaceID = workspaceID
+            env.deleteWorkspaceRequest = req
+        }
+    }
+
     /// Ask the host to split a pane. Fire-and-forget; the new layout
     /// arrives via the next `WorkspaceLayoutChanged` push.
     public func requestSplitPane(paneID: Data, orientation: String) async throws {
@@ -319,9 +377,15 @@ public actor PeerSession {
 
     /// Ask the host to update a split's divider ratio. Fire-and-forget;
     /// the resulting layout flows back via WorkspaceLayoutChanged.
-    public func requestSetDivider(splitID: Data, ratio: Double) async throws {
+    ///
+    /// `workspaceID` disambiguates `splitID`, which is only unique WITHIN
+    /// a workspace's tree (each LayoutStore has its own counter) — pass
+    /// `Data()` only for legacy callers that don't know their workspace id;
+    /// the host falls back to first-match (single-workspace behavior).
+    public func requestSetDivider(workspaceID: Data, splitID: Data, ratio: Double) async throws {
         try await sendEnvelope { env in
             var req = Termmesh_Peer_V1_SetDividerPositionRequest()
+            req.workspaceID = workspaceID
             req.splitID = splitID
             req.ratio = ratio
             var ctl = Termmesh_Peer_V1_WorkspaceControl()
@@ -336,6 +400,20 @@ public actor PeerSession {
         try await sendEnvelope { env in
             var req = Termmesh_Peer_V1_NewTabRequest()
             req.paneID = paneID
+            var ctl = Termmesh_Peer_V1_WorkspaceControl()
+            ctl.newTab = req
+            env.workspaceControl = ctl
+        }
+    }
+
+    /// Seed the first pane of an EMPTY workspace: the same fire-and-
+    /// forget NewTab write, targeted by workspace id instead of an
+    /// existing pane (multi-workspace hosts spawn an ephemeral shell;
+    /// older hosts ignore the unknown field — F8).
+    public func requestNewTab(workspaceID: Data) async throws {
+        try await sendEnvelope { env in
+            var req = Termmesh_Peer_V1_NewTabRequest()
+            req.workspaceID = workspaceID
             var ctl = Termmesh_Peer_V1_WorkspaceControl()
             ctl.newTab = req
             env.workspaceControl = ctl
@@ -429,6 +507,8 @@ public actor PeerSession {
                 return .workspaceSurfaceRetitled(surfaceID: rt.surfaceID, title: rt.title)
             case .workspaceLayout(let wl):
                 return .workspaceLayoutChanged(workspaceID: wl.workspaceID, layout: wl.layout)
+            case .workspaceRemoved(let wr):
+                return .workspaceRemoved(workspaceID: wr.workspaceID)
             default:
                 return .other
             }

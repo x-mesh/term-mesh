@@ -14,8 +14,9 @@ use std::sync::Arc;
 
 use peer_proto::v1::envelope::Payload;
 use peer_proto::v1::{
-    workspace_update, AttachMode, AttachResult, AuthChallenge, AuthResult, Envelope, Error, Hello,
-    Pong, PtyData, SurfaceList, Workspace, WorkspaceList, WorkspaceMeta, WorkspaceUpdate,
+    workspace_update, AttachMode, AttachResult, AuthChallenge, AuthResult, CreateWorkspaceResponse,
+    Envelope, Error, Hello, Pong, PtyData, SurfaceList, Workspace, WorkspaceList, WorkspaceMeta,
+    WorkspaceUpdate,
 };
 use peer_proto::{capability, PeerCapabilities};
 use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
@@ -200,33 +201,92 @@ async fn reader_loop(
 
             (HandshakeState::Ready, Payload::ListWorkspaces(_)) => {
                 // A daemon-only host has no bonsplit windows to mirror — it
-                // owns a flat set of forkpty surfaces arranged in the host's
-                // authoritative layout tree. Clients (the macOS app) enter
+                // owns a flat set of forkpty surfaces arranged into one or
+                // more named workspace trees. Clients (the macOS app) enter
                 // every peer session through ListWorkspaces, and leaving it
                 // unanswered stalls them until their 10s read timeout fires.
                 //
-                // The snapshot comes from the same LayoutStore that
-                // WorkspaceControl mutations edit and WorkspaceLayoutChanged
-                // pushes serialize, so a reconnecting client sees the
-                // arrangement it (or another viewer) actually made — not a
-                // fresh re-tile.
+                // M2: the roster can hold more than the single default
+                // workspace (CreateWorkspaceRequest/DeleteWorkspaceRequest
+                // grow/shrink it at runtime). Each entry's layout comes from
+                // the same LayoutStore that WorkspaceControl mutations edit
+                // and WorkspaceLayoutChanged pushes serialize, so a
+                // reconnecting client sees the arrangement it (or another
+                // viewer) actually made — not a fresh re-tile. A freshly
+                // created, still-pane-less workspace serializes with
+                // `layout: None`, which is exactly how a client is expected
+                // to render an empty workspace.
+                let workspaces = host
+                    .list_workspaces()
+                    .into_iter()
+                    .map(|e| Workspace {
+                        workspace_id: e.id,
+                        title: e.title,
+                        layout: e.layout,
+                        // Empty window_id: clients read that as the legacy
+                        // "single implied window" flat list, which is what
+                        // a daemon host actually is.
+                        window_id: Vec::new(),
+                        window_title: String::new(),
+                        is_default: e.is_default,
+                    })
+                    .collect();
                 let reply = Envelope {
                     seq: next_seq(&seq_counter),
                     correlation_id: env.seq,
-                    payload: Some(Payload::WorkspaceList(WorkspaceList {
-                        workspaces: vec![Workspace {
-                            workspace_id: host.workspace_id.clone(),
-                            title: hostname_or(layout::DAEMON_WORKSPACE),
-                            layout: host.layout_snapshot(),
-                            // Empty window_id: clients read that as the legacy
-                            // "single implied window" flat list, which is what
-                            // a daemon host actually is.
-                            window_id: Vec::new(),
-                            window_title: String::new(),
-                        }],
+                    payload: Some(Payload::WorkspaceList(WorkspaceList { workspaces })),
+                };
+                send(&outgoing_tx, reply).await?;
+            }
+
+            // Gated behind capability "workspace.lifecycle.v1" (see
+            // peer.proto's "Workspace lifecycle" section). Unlike
+            // WorkspaceControl, CreateWorkspaceRequest is a paired RPC —
+            // the requester needs the host-assigned workspace_id back
+            // immediately to address the workspace it just asked for
+            // (e.g. a follow-up NewTabRequest.workspace_id).
+            (HandshakeState::Ready, Payload::CreateWorkspaceRequest(req)) => {
+                let workspace_id = host.create_workspace(req.title);
+                let reply = Envelope {
+                    seq: next_seq(&seq_counter),
+                    correlation_id: env.seq,
+                    payload: Some(Payload::CreateWorkspaceResponse(CreateWorkspaceResponse {
+                        accepted: true,
+                        reason: String::new(),
+                        workspace_id,
                     })),
                 };
                 send(&outgoing_tx, reply).await?;
+            }
+
+            // Fire-and-forget like WorkspaceControl: no reply, paired or
+            // otherwise. An empty or unknown workspace_id is adversarial-
+            // or-stale input and must be safely ignored, never applied to
+            // "the current" or "the default" workspace.
+            (HandshakeState::Ready, Payload::RenameWorkspaceRequest(req)) => {
+                if !host.rename_workspace(&req.workspace_id, req.title) {
+                    tracing::warn!(
+                        "RenameWorkspaceRequest for unknown/empty workspace_id {:?} ignored",
+                        req.workspace_id
+                    );
+                }
+            }
+
+            // Fire-and-forget: the only observable result of a successful
+            // delete is the WorkspaceRemoved push `PeerHost::remove_workspace`
+            // broadcasts itself. An empty/unknown id is safely refused
+            // (no-op), never treated as "delete all" or "delete current".
+            // M3: the default workspace is deletable like any other — it
+            // promotes a survivor to take its place — so the only id-based
+            // refusal left is `LastWorkspace` (this would empty the
+            // collection, and un-namespaced control always needs a home).
+            (HandshakeState::Ready, Payload::DeleteWorkspaceRequest(req)) => {
+                if let Err(e) = host.remove_workspace(&req.workspace_id) {
+                    tracing::warn!(
+                        "DeleteWorkspaceRequest for workspace_id {:?} ignored: {e:?}",
+                        req.workspace_id
+                    );
+                }
             }
 
             (HandshakeState::Ready, Payload::WorkspaceControl(ctl)) => {
@@ -536,7 +596,7 @@ fn next_seq(seq_counter: &AtomicU64) -> u64 {
 /// `gethostname(2)` is a real syscall with no such gap. Both fallback
 /// paths are trimmed identically so trailing whitespace can't leak into
 /// the title from either source.
-fn hostname_or(fallback: &str) -> String {
+pub(crate) fn hostname_or(fallback: &str) -> String {
     gethostname_string()
         .or_else(|| {
             std::fs::read_to_string("/etc/hostname")
@@ -565,7 +625,12 @@ fn gethostname_string() -> Option<String> {
     (!s.is_empty()).then_some(s)
 }
 
-fn random_peer_bytes(len: usize) -> Vec<u8> {
+/// CSPRNG-backed random bytes, shared across `peer::` for anything that
+/// needs an unguessable id: auth nonces / session ids here, and (M1)
+/// workspace ids in `persist`/`layout` — a workspace's id must never be
+/// re-derivable from its name so a rename can't accidentally change
+/// which workspace a reconnecting client refers to.
+pub(crate) fn random_peer_bytes(len: usize) -> Vec<u8> {
     // CSPRNG via getrandom(3) so auth nonces / session ids don't
     // carry the structural fixed bits of UUIDv4 (version+variant
     // nibbles) and don't depend on uuid crate internals to use a
