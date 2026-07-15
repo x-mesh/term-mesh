@@ -851,6 +851,17 @@ struct SidebarRemoteHostsSection: View {
                 onCancel: { editorContext = nil }
             )
         }
+        // Menu-bar / main-menu "Add Remote Host…" routes here — the
+        // sheet is sidebar-hosted, so menus just ask for it.
+        .onReceive(NotificationCenter.default.publisher(
+            for: PeerClientCoordinator.addRemoteHostRequestedNotification
+        )) { _ in
+            guard editorContext == nil else { return }
+            editorContext = PeerHostEditorContext(
+                profile: PeerHostProfile(sshTarget: ""),
+                isNew: true
+            )
+        }
     }
 }
 

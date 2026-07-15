@@ -37,7 +37,6 @@ final class MenuBarExtraController: NSObject, NSMenuDelegate {
     private let profileSubmenu = NSMenu(title: "CLI Profile")
     private var profileObserver: NSObjectProtocol?
 
-    private let recentPeerItem = PeerMenu.recentHostsItem()
 
     private var notificationItems: [NSMenuItem] = []
     private let maxInlineNotificationItems = 6
@@ -161,12 +160,15 @@ final class MenuBarExtraController: NSObject, NSMenuDelegate {
 
         menu.addItem(.separator())
 
-        menu.addItem(PeerMenu.item())
-        menu.addItem(PeerMenu.relayItem())
-        menu.addItem(PeerMenu.relayWorkspaceItem())
-        menu.addItem(PeerMenu.relayWorkspaceSSHItem())
-        menu.addItem(recentPeerItem)
+        // Sidebar-first peer UX: connecting/opening lives in the sidebar;
+        // the menu keeps host management + server controls. The raw
+        // socket-path connect dialogs stay as DEBUG-only tools.
+        menu.addItem(PeerMenu.addRemoteHostItem())
         menu.addItem(PeerMenu.connectionsItem())
+#if DEBUG
+        menu.addItem(PeerMenu.item())
+        menu.addItem(PeerMenu.relayWorkspaceItem())
+#endif
         menu.addItem(PeerServerMenu.startItem())
         menu.addItem(PeerServerMenu.stopItem())
         menu.addItem(.separator())
@@ -179,9 +181,6 @@ final class MenuBarExtraController: NSObject, NSMenuDelegate {
     func menuWillOpen(_ menu: NSMenu) {
         refreshUI()
         updateProfileSubmenu()
-        if let submenu = recentPeerItem.submenu {
-            PeerMenu.updateRecentHostsSubmenu(submenu)
-        }
     }
 
     func refreshForDebugControls() {

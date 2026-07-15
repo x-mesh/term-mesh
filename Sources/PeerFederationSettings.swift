@@ -80,8 +80,12 @@ enum PeerFederationSettings {
     // MARK: - Recent SSH hosts
 
     /// SSH target + remote socket path used by the most recent
-    /// successful relay-workspace attach. Persisted across launches
-    /// so the connect dialog can offer a "recent" picker.
+    /// successful relay-workspace attach. Persisted across launches.
+    /// LEGACY: the connect dialog and recent-hosts menu that consumed
+    /// this list are gone (sidebar-first UX; saved profiles in
+    /// PeerHostProfileStore replaced it, with a one-time migration on
+    /// first load). Kept as the migration source and for downgrade
+    /// compatibility — do not add new consumers.
     struct RecentHost: Codable, Equatable {
         var sshTarget: String
         var remoteSocket: String

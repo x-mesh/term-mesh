@@ -32,16 +32,6 @@ enum PeerMenu {
         return item
     }
 
-    static func relayItem() -> NSMenuItem {
-        let item = NSMenuItem(
-            title: "Connect to Peer via Ghostty Relay…",
-            action: #selector(PeerClientCoordinator.promptAndRunRelay(_:)),
-            keyEquivalent: ""
-        )
-        item.target = PeerClientCoordinator.shared
-        return item
-    }
-
     static func relayWorkspaceItem() -> NSMenuItem {
         let item = NSMenuItem(
             title: "Connect to Peer Workspace via Ghostty Relay…",
@@ -52,10 +42,12 @@ enum PeerMenu {
         return item
     }
 
-    static func relayWorkspaceSSHItem() -> NSMenuItem {
+    /// The sidebar-first replacement for the legacy SSH connect dialog:
+    /// opens the saved-host editor sheet in the main window's sidebar.
+    static func addRemoteHostItem() -> NSMenuItem {
         let item = NSMenuItem(
-            title: "Connect to Remote Peer Workspace (SSH)…",
-            action: #selector(PeerClientCoordinator.promptAndRunRelayWorkspaceSSH(_:)),
+            title: "Add Remote Host…",
+            action: #selector(PeerClientCoordinator.addRemoteHost(_:)),
             keyEquivalent: ""
         )
         item.target = PeerClientCoordinator.shared
@@ -72,44 +64,6 @@ enum PeerMenu {
         return item
     }
 
-    /// Submenu holder for one-click reconnects. The submenu content is
-    /// rebuilt on every menu open via `updateRecentHostsSubmenu` (same
-    /// pattern as the CLI-profile submenu) so it always reflects the
-    /// current recent-hosts list.
-    static func recentHostsItem() -> NSMenuItem {
-        let item = NSMenuItem(title: "Connect to Recent Peer", action: nil, keyEquivalent: "")
-        let submenu = NSMenu(title: "Connect to Recent Peer")
-        // The owning status-bar menu disables auto-enablement; mirror
-        // that here so the "(no recent hosts)" placeholder stays dim
-        // and host entries stay clickable.
-        submenu.autoenablesItems = false
-        item.submenu = submenu
-        return item
-    }
-
-    static func updateRecentHostsSubmenu(_ menu: NSMenu) {
-        menu.removeAllItems()
-        let recents = PeerFederationSettings.loadRecentHosts()
-        guard !recents.isEmpty else {
-            let empty = NSMenuItem(title: "(no recent hosts)", action: nil, keyEquivalent: "")
-            empty.isEnabled = false
-            menu.addItem(empty)
-            return
-        }
-        for host in recents {
-            let title = PeerClientCoordinator.menuSafeTitle(
-                "\(host.sshTarget)  ·  \(host.remoteSocket)", maxLength: 80
-            )
-            let item = NSMenuItem(
-                title: title,
-                action: #selector(PeerClientCoordinator.connectRecentHost(_:)),
-                keyEquivalent: ""
-            )
-            item.target = PeerClientCoordinator.shared
-            item.representedObject = host
-            menu.addItem(item)
-        }
-    }
 }
 
 @MainActor
@@ -278,6 +232,22 @@ final class PeerClientCoordinator: NSObject {
         activeConnectionFlows.remove(flow)
     }
 
+    /// Posted by menu entries that want the saved-host editor; the
+    /// sidebar's Remote Hosts section listens and presents its sheet.
+    static let addRemoteHostRequestedNotification =
+        Notification.Name("PeerAddRemoteHostRequested")
+
+    /// Menu-bar / main-menu entry point for adding a saved host. The
+    /// editor sheet lives in the main window's sidebar, so activate the
+    /// app first (explicit user intent from a menu — not a socket
+    /// command, so the focus policy allows it).
+    @objc func addRemoteHost(_ sender: Any?) {
+        NSApp.activate(ignoringOtherApps: true)
+        NotificationCenter.default.post(
+            name: Self.addRemoteHostRequestedNotification, object: nil
+        )
+    }
+
     @objc func showConnections(_ sender: Any?) {
         PeerConnectionsWindowController.shared.showAndFocus()
     }
@@ -305,165 +275,11 @@ final class PeerClientCoordinator: NSObject {
         postRelaysChanged()
     }
 
-    @objc func promptAndRunRelayWorkspaceSSH(_ sender: Any?) {
-        Task { @MainActor in
-            await self.promptAndRunRelayWorkspaceSSHAsync()
-        }
-    }
-
-    @MainActor
-    private func promptAndRunRelayWorkspaceSSHAsync() async {
-        let alert = NSAlert()
-        alert.messageText = "Connect to Remote Peer Workspace via SSH"
-        alert.informativeText = "Tunnels the host's peer socket through `ssh -L`. Pick a host advertised on this LAN, or type an SSH target (user@host or ssh-config alias) and the path of the remote peer server's Unix socket. Leave the socket path empty to auto-detect it on the remote host."
-
-        let stack = NSStackView(frame: NSRect(x: 0, y: 0, width: 380, height: 60))
-        stack.orientation = .vertical
-        stack.alignment = .leading
-        stack.spacing = 4
-
-        // Recent hosts (most recently successful connect bubbles to
-        // the top). Pick fills target + remote fields.
-        let recentLabel = NSTextField(labelWithString: "Recent:")
-        let recentPopup = NSPopUpButton(
-            frame: NSRect(x: 0, y: 0, width: 380, height: 26),
-            pullsDown: false
-        )
-        let recents = PeerFederationSettings.loadRecentHosts()
-        let recentMenu = NSMenu()
-        recentMenu.addItem(withTitle: recents.isEmpty ? "(no recent hosts)" : "(pick a recent host…)",
-                           action: nil, keyEquivalent: "")
-        for r in recents {
-            let title = Self.menuSafeTitle("\(r.sshTarget)  ·  \(r.remoteSocket)", maxLength: 110)
-            recentMenu.addItem(withTitle: title, action: nil, keyEquivalent: "")
-        }
-        recentPopup.menu = recentMenu
-
-        // Bonjour-discovered hosts populate this popup live; selecting
-        // one autofills the SSH target / remote socket fields.
-        let discoveredLabel = NSTextField(labelWithString: "Discovered on LAN:")
-        let discoveredPopup = NSPopUpButton(
-            frame: NSRect(x: 0, y: 0, width: 380, height: 26),
-            pullsDown: false
-        )
-        discoveredPopup.menu?.addItem(withTitle: "(searching…)", action: nil, keyEquivalent: "")
-
-        let targetLabel = NSTextField(labelWithString: "SSH target (user@host):")
-        let targetField = NSTextField(frame: NSRect(x: 0, y: 0, width: 380, height: 24))
-        targetField.placeholderString = "user@mac-mini.local"
-        let remoteLabel = NSTextField(labelWithString: "Remote peer socket:")
-        let remoteField = NSTextField(frame: NSRect(x: 0, y: 0, width: 380, height: 24))
-        // Deliberately NOT prefilled with this Mac's own socket path:
-        // an empty field is the auto-detect trigger, and the probe's
-        // candidate list already covers the macOS per-uid default that
-        // the old prefill guessed at.
-        remoteField.placeholderString = "(leave empty to auto-detect)"
-
-        // Pre-fill from the most recent host so a re-connect is
-        // one-keystroke (Cmd+T → Cmd+Return).
-        if let mostRecent = recents.first {
-            targetField.stringValue = mostRecent.sshTarget
-            remoteField.stringValue = mostRecent.remoteSocket
-        }
-
-        // Phase 1 remote pane primitive: opt into hosting the remote
-        // surface as a pane in the current workspace instead of a
-        // separate relay window.
-        let paneCheckbox = NSButton(
-            checkboxWithTitle: "Open as a pane in the current workspace",
-            target: nil, action: nil
-        )
-        paneCheckbox.state = .off
-
-        let arranged: [NSView] = [
-            recentLabel, recentPopup,
-            discoveredLabel, discoveredPopup,
-            targetLabel, targetField,
-            remoteLabel, remoteField,
-            paneCheckbox,
-        ]
-        for v in arranged {
-            stack.addArrangedSubview(v)
-        }
-        stack.frame = NSRect(x: 0, y: 0, width: 380, height: 254)
-        alert.accessoryView = stack
-        alert.addButton(withTitle: "Connect")
-        alert.addButton(withTitle: "Cancel")
-
-        // Live Bonjour browse: rebuild the popup as services arrive
-        // and resolve. Strong ref kept until the dialog closes.
-        var discoveredPeers: [DiscoveredPeer] = []
-        let browser = PeerBonjourBrowser()
-        browser.start { peers in
-            discoveredPeers = peers
-            let menu = discoveredPopup.menu ?? NSMenu()
-            menu.removeAllItems()
-            if peers.isEmpty {
-                menu.addItem(withTitle: "(no LAN hosts found)", action: nil, keyEquivalent: "")
-            } else {
-                menu.addItem(withTitle: "(pick a host…)", action: nil, keyEquivalent: "")
-                for p in peers {
-                    let label = "\(p.serviceName)  ·  \(p.hostname)\(p.socketPath.map { "  ·  \($0)" } ?? "")"
-                    menu.addItem(withTitle: Self.menuSafeTitle(label, maxLength: 110),
-                                 action: nil, keyEquivalent: "")
-                }
-            }
-            discoveredPopup.menu = menu
-        }
-        // Adapter target so the popup's action stays @objc-compatible.
-        let proxy = SSHDialogPopupProxy(
-            popup: discoveredPopup,
-            target: targetField,
-            remote: remoteField,
-            peersProvider: { discoveredPeers }
-        )
-        discoveredPopup.target = proxy
-        discoveredPopup.action = #selector(SSHDialogPopupProxy.didPick(_:))
-
-        let recentProxy = RecentHostPopupProxy(
-            popup: recentPopup,
-            target: targetField,
-            remote: remoteField,
-            recents: recents
-        )
-        recentPopup.target = recentProxy
-        recentPopup.action = #selector(RecentHostPopupProxy.didPick(_:))
-
-        defer { browser.stop(); _ = proxy; _ = recentProxy } // tear down after modal dismissal
-
-        let resp = await Self.runModalAsSheet(alert)
-        guard resp == .alertFirstButtonReturn else { return }
-        let target = targetField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
-        let remote = remoteField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !target.isEmpty else {
-            self.showAlert(
-                title: "SSH Target Required",
-                body: "Enter an SSH target (user@host or ssh-config alias)."
-            )
-            return
-        }
-        if paneCheckbox.state == .on {
-            await connectRemotePaneSSH(target: target, remote: remote)
-        } else {
-            await connectWorkspaceSSH(target: target, remote: remote)
-        }
-    }
-
-    /// One-click reconnect from the menu bar's recent-hosts submenu.
-    /// The menu item carries a `RecentHost` as its representedObject.
-    @objc func connectRecentHost(_ sender: NSMenuItem) {
-        guard let host = sender.representedObject as? PeerFederationSettings.RecentHost
-        else { return }
-        Task { @MainActor in
-            await self.connectWorkspaceSSH(
-                target: host.sshTarget, remote: host.remoteSocket
-            )
-        }
-    }
-
-    /// Shared tail of the SSH connect flow — optional socket auto-detect,
-    /// tunnel bring-up, recent-host bookkeeping, workspace relay. Used by
-    /// both the connect dialog and the one-click recent-hosts menu.
+    /// Shared tail of the SSH workspace-relay connect flow — optional
+    /// socket auto-detect, tunnel bring-up, recent-host bookkeeping,
+    /// workspace relay window. The legacy connect dialog is gone
+    /// (sidebar-first UX); kept for programmatic callers and future
+    /// sidebar "open in relay window against a fresh tunnel" flows.
     /// `remote` may be empty: the socket path is then resolved on the
     /// remote host via `PeerSocketProber`.
     @MainActor
@@ -1429,92 +1245,6 @@ final class PeerClientCoordinator: NSObject {
         }
     }
 
-    @objc func promptAndRunRelay(_ sender: Any?) {
-        let alert = NSAlert()
-        alert.messageText = "Connect to Peer via Ghostty Relay"
-        alert.informativeText = "Path to a Swift peer server socket (e.g. TERMMESH_DEBUG_PEER_SERVER_PATH).\nOpens remote pane in a real Ghostty surface."
-
-        let input = NSTextField(frame: NSRect(x: 0, y: 0, width: 360, height: 24))
-        input.stringValue = ProcessInfo.processInfo.environment["TERMMESH_DEBUG_PEER_SERVER_PATH"]
-            ?? PeerHostCoordinator.shared.currentSocketPath
-            ?? PeerFederationSettings.socketPath
-        alert.accessoryView = input
-        alert.addButton(withTitle: "Connect")
-        alert.addButton(withTitle: "Cancel")
-
-        Task { @MainActor in
-            let resp = await Self.runModalAsSheet(alert)
-            guard resp == .alertFirstButtonReturn else { return }
-            let path = self.normalizedSocketPath(from: input.stringValue)
-            guard !path.isEmpty else {
-                self.showAlert(title: "Peer Socket Required", body: "Enter a peer socket path.")
-                return
-            }
-            guard self.validateLocalSocketPathForConnect(path) else { return }
-            await self.runRelayFlow(path: path)
-        }
-    }
-
-    /// Body of the legacy single-pane relay flow, extracted so the
-    /// promptAndRunRelay sheet completion can call it cleanly.
-    /// The body stays async end-to-end so duplicate-connect guards remain
-    /// active until connect, list, selection, and attach have all finished.
-    private func runRelayFlow(path: String) async {
-        let flow = ConnectionFlow.relayPane(path)
-        guard beginConnectionFlow(flow) else { return }
-        defer { finishConnectionFlow(flow) }
-
-        let connection: PeerRelayConnection
-        do {
-            connection = try await PeerRelaySession.connectAndList(hostSockPath: path)
-        } catch {
-            self.showAlert(title: "Peer Relay Failed", body: String(describing: error))
-            return
-        }
-
-        // Pick a surface — auto-skip the dialog when there's nothing
-        // to choose between.
-        let attachable = connection.surfaces.filter { $0.attachable }
-        let pickFrom = attachable.isEmpty ? connection.surfaces : attachable
-        guard !pickFrom.isEmpty else {
-            await connection.cancel()
-            self.showAlert(title: "Peer Relay Failed",
-                           body: "Host has no surfaces to attach to.")
-            return
-        }
-
-        let chosen: Termmesh_Peer_V1_SurfaceInfo?
-        if pickFrom.count == 1 {
-            chosen = pickFrom[0]
-        } else {
-            chosen = await self.promptForSurfaceSelection(from: pickFrom)
-        }
-        guard let chosen else {
-            await connection.cancel()
-            return
-        }
-
-        do {
-            let session = try await PeerRelaySession.attach(connection, surface: chosen)
-            try session.prepareListener()
-            let controller = PeerRelayWindowController(
-                session: session,
-                surfaceTitle: chosen.title
-            )
-            self.openRelays.append(controller)
-            controller.onClose = { [weak self, weak controller] in
-                guard let self, let controller else { return }
-                self.openRelays.removeAll { $0 === controller }
-                self.postRelaysChanged()
-            }
-            controller.show()
-            self.postRelaysChanged()
-        } catch {
-            await connection.cancel()
-            self.showAlert(title: "Peer Relay Failed", body: String(describing: error))
-        }
-    }
-
     /// Show an NSAlert with an NSPopUpButton listing the available
     /// surfaces. Returns the user's pick, or nil if Cancel was clicked.
     private func promptForSurfaceSelection(
@@ -1972,72 +1702,5 @@ final class PeerConsoleWindowController: NSWindowController, NSWindowDelegate {
 
     private static var monospaceFont: NSFont {
         NSFont.monospacedSystemFont(ofSize: 12, weight: .regular)
-    }
-}
-
-/// Glue between the SSH-dialog Bonjour popup (NSPopUpButton, plain
-/// NSObject target) and the surrounding text fields. Lives alongside
-/// the dialog stack and rewrites the SSH target / remote-socket
-/// fields whenever the user picks a discovered peer.
-@MainActor
-final class SSHDialogPopupProxy: NSObject {
-    private weak var popup: NSPopUpButton?
-    private weak var targetField: NSTextField?
-    private weak var remoteField: NSTextField?
-    private let peersProvider: () -> [DiscoveredPeer]
-
-    init(popup: NSPopUpButton,
-         target: NSTextField,
-         remote: NSTextField,
-         peersProvider: @escaping () -> [DiscoveredPeer]) {
-        self.popup = popup
-        self.targetField = target
-        self.remoteField = remote
-        self.peersProvider = peersProvider
-        super.init()
-    }
-
-    @objc func didPick(_ sender: NSPopUpButton) {
-        let peers = peersProvider()
-        // Index 0 is the placeholder ("pick a host…" / "no hosts");
-        // discovered entries start at 1.
-        let idx = sender.indexOfSelectedItem - 1
-        guard idx >= 0, idx < peers.count else { return }
-        let peer = peers[idx]
-        targetField?.stringValue = peer.hostname
-        if let sock = peer.socketPath, !sock.isEmpty {
-            remoteField?.stringValue = sock
-        }
-    }
-}
-
-/// Glue between the SSH-dialog "Recent" popup and the surrounding
-/// fields. `recents` is captured at construction time — we don't
-/// re-read defaults mid-modal so the menu items stay in sync with
-/// the popup's index.
-@MainActor
-final class RecentHostPopupProxy: NSObject {
-    private weak var popup: NSPopUpButton?
-    private weak var targetField: NSTextField?
-    private weak var remoteField: NSTextField?
-    private let recents: [PeerFederationSettings.RecentHost]
-
-    init(popup: NSPopUpButton,
-         target: NSTextField,
-         remote: NSTextField,
-         recents: [PeerFederationSettings.RecentHost]) {
-        self.popup = popup
-        self.targetField = target
-        self.remoteField = remote
-        self.recents = recents
-        super.init()
-    }
-
-    @objc func didPick(_ sender: NSPopUpButton) {
-        let idx = sender.indexOfSelectedItem - 1
-        guard idx >= 0, idx < recents.count else { return }
-        let entry = recents[idx]
-        targetField?.stringValue = entry.sshTarget
-        remoteField?.stringValue = entry.remoteSocket
     }
 }
