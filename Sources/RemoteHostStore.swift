@@ -79,6 +79,12 @@ struct HostEntry: Identifiable {
     var profileID: UUID?
     var colorHex: String?
     var symbolName: String?
+    /// Cached from the one-shot session's handshake capabilities each time
+    /// `fetchWorkspaces` reconnects. nil = not yet known (or host never
+    /// connected); false = host build predates workspace CRUD. Sidebar
+    /// CRUD menu items gate on `== true` rather than treating nil as
+    /// permissive, so a stale/unknown host defaults to disabled.
+    var supportsWorkspaceLifecycle: Bool?
 
     var isConnected: Bool { connectionState == .connected }
 
@@ -402,6 +408,7 @@ final class RemoteHostStore: ObservableObject {
         fetchTasks[key]?.cancel()
         hosts[key]?.workspaces = []
         hosts[key]?.activeSockPath = ""
+        hosts[key]?.supportsWorkspaceLifecycle = nil
         if hosts[key]?.connectionState == .connected {
             hosts[key]?.connectionState = .saved
         }
@@ -418,6 +425,13 @@ final class RemoteHostStore: ObservableObject {
         fetchTasks[key] = Task {
             do {
                 let conn = try await PeerRelaySession.connect(hostSockPath: path)
+                // Record capability regardless of what listWorkspaces below does —
+                // it's already known from this connection's handshake, and the
+                // sidebar CRUD menu gates on it independently of the roster fetch.
+                if !Task.isCancelled, self.hosts[key]?.activeSockPath == path {
+                    self.hosts[key]?.supportsWorkspaceLifecycle =
+                        conn.hostCapabilities.has(PeerCapability.workspaceLifecycleV1)
+                }
                 let workspaces: [Termmesh_Peer_V1_Workspace]
                 do {
                     workspaces = try await conn.session.listWorkspaces()
@@ -507,6 +521,105 @@ final class RemoteHostStore: ObservableObject {
                 workspaceID: workspace.id,
                 live: live
             )
+        }
+    }
+
+    // MARK: - Workspace CRUD (workspace.lifecycle.v1)
+    //
+    // Each op opens its own one-shot connection (mirrors fetchWorkspaces'
+    // connect → RPC → cancel pattern), never reusing a live subscription
+    // session — createWorkspace in particular must run on a session whose
+    // receive loop isn't already pumping (PeerSession's single-reader
+    // invariant). Failures are logged inline, never surfaced via NSAlert
+    // (socket focus policy: no app-activation side effects from sidebar
+    // actions). Callers are expected to have already gated the triggering
+    // UI on `host.supportsWorkspaceLifecycle == true`; these methods don't
+    // re-check it themselves so a stale cache can't silently no-op an
+    // explicit user action — the host-side RPC is the real gate.
+
+    /// Creates a workspace on `host`, then re-fetches the roster so the new
+    /// entry appears. The RPC's returned workspace id isn't consumed
+    /// directly — the sidebar always reflects the host's own listing.
+    func createWorkspace(host: HostEntry, title: String) {
+        let path = host.activeSockPath
+        let key = host.id
+        guard !path.isEmpty else { return }
+        Task { [weak self] in
+            guard let self else { return }
+            do {
+                let conn = try await PeerRelaySession.connect(hostSockPath: path)
+                do {
+                    _ = try await conn.session.createWorkspace(title: title)
+                } catch {
+                    #if DEBUG
+                    dlog("peer.sidebar.createWorkspace rpc-fail key=\(key) error=\(error)")
+                    #endif
+                }
+                await conn.cancel()
+            } catch {
+                #if DEBUG
+                dlog("peer.sidebar.createWorkspace connect-fail key=\(key) error=\(error)")
+                #endif
+                return
+            }
+            self.fetchWorkspaces(for: path, key: key)
+        }
+    }
+
+    /// Renames `workspace` on `host`. The rename RPC is fire-and-forget
+    /// (no reply frame) — the re-fetch below is what surfaces the result.
+    func renameWorkspace(_ workspace: WorkspaceSummary, host: HostEntry, title: String) {
+        let path = host.activeSockPath
+        let key = host.id
+        guard !path.isEmpty else { return }
+        Task { [weak self] in
+            guard let self else { return }
+            do {
+                let conn = try await PeerRelaySession.connect(hostSockPath: path)
+                do {
+                    try await conn.session.renameWorkspace(workspaceID: workspace.id, title: title)
+                } catch {
+                    #if DEBUG
+                    dlog("peer.sidebar.renameWorkspace rpc-fail key=\(key) error=\(error)")
+                    #endif
+                }
+                await conn.cancel()
+            } catch {
+                #if DEBUG
+                dlog("peer.sidebar.renameWorkspace connect-fail key=\(key) error=\(error)")
+                #endif
+                return
+            }
+            self.fetchWorkspaces(for: path, key: key)
+        }
+    }
+
+    /// Deletes `workspace` on `host`. Fire-and-forget RPC — the host pushes
+    /// `WorkspaceUpdate.workspaceRemoved` to any attached mirror sessions
+    /// (t5 auto-closes those), and this sidebar's own re-fetch drops the row.
+    func deleteWorkspace(_ workspace: WorkspaceSummary, host: HostEntry) {
+        let path = host.activeSockPath
+        let key = host.id
+        guard !path.isEmpty else { return }
+        Task { [weak self] in
+            guard let self else { return }
+            do {
+                let conn = try await PeerRelaySession.connect(hostSockPath: path)
+                do {
+                    try await conn.session.deleteWorkspace(workspaceID: workspace.id)
+                } catch {
+                    #if DEBUG
+                    dlog("peer.sidebar.deleteWorkspace rpc-fail key=\(key) error=\(error)")
+                    #endif
+                }
+                await conn.cancel()
+            } catch {
+                #if DEBUG
+                dlog("peer.sidebar.deleteWorkspace connect-fail key=\(key) error=\(error)")
+                #endif
+                return
+            }
+            self.fetchWorkspaces(for: path, key: key)
         }
     }
 }

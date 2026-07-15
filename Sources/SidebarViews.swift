@@ -875,6 +875,8 @@ struct RemoteHostGroupView: View {
     let onEdit: (PeerHostEditorContext) -> Void
     @State private var isExpanded: Bool
     @State private var showDeleteConfirm = false
+    @State private var showNewWorkspaceAlert = false
+    @State private var newWorkspaceTitle = ""
 
     init(host: HostEntry, store: RemoteHostStore,
          onEdit: @escaping (PeerHostEditorContext) -> Void) {
@@ -1026,6 +1028,15 @@ struct RemoteHostGroupView: View {
                     Button("Open Surface as Pane…") {
                         store.openSurfaceAsPane(host)
                     }
+                    // Gated on the host's negotiated capability — always
+                    // shown so the menu shape is stable, but disabled
+                    // (not hidden) when the host build predates
+                    // workspace CRUD or the capability isn't known yet.
+                    Button("New Workspace…") {
+                        newWorkspaceTitle = ""
+                        showNewWorkspaceAlert = true
+                    }
+                    .disabled(host.supportsWorkspaceLifecycle != true)
                     if store.hasSidebarLease(for: host.id) {
                         Button("Disconnect") { store.disconnectSavedHost(host) }
                     }
@@ -1044,6 +1055,17 @@ struct RemoteHostGroupView: View {
                 Button("Cancel", role: .cancel) {}
             } message: {
                 Text("The saved host profile is removed. Open panes and mirrors stay connected.")
+            }
+            .alert("New Workspace", isPresented: $showNewWorkspaceAlert) {
+                TextField("Workspace name", text: $newWorkspaceTitle)
+                Button("Create") {
+                    let title = newWorkspaceTitle.trimmingCharacters(in: .whitespacesAndNewlines)
+                    guard !title.isEmpty else { return }
+                    store.createWorkspace(host: host, title: title)
+                }
+                Button("Cancel", role: .cancel) {}
+            } message: {
+                Text("Creates a new workspace on \"\(host.displayName)\".")
             }
         }
         .padding(.horizontal, 6)
@@ -1065,6 +1087,9 @@ struct RemoteWorkspaceRowView: View {
     let host: HostEntry
     let store: RemoteHostStore
     @State private var isHovering = false
+    @State private var showRenameAlert = false
+    @State private var renameTitle = ""
+    @State private var showDeleteConfirm = false
 
     var body: some View {
         HStack(spacing: 5) {
@@ -1107,7 +1132,42 @@ struct RemoteWorkspaceRowView: View {
             // intentionally NOT offered: with content always streaming
             // live, users read the near-identical workspace as a broken
             // mirror. The code path stays for a future, clearer surface.
+            Divider()
+            // Always shown, disabled (not hidden) when the host hasn't
+            // negotiated workspace.lifecycle.v1 — keeps the menu shape
+            // stable across host capability tiers.
+            Button("Rename…") {
+                renameTitle = workspace.title
+                showRenameAlert = true
+            }
+            .disabled(host.supportsWorkspaceLifecycle != true)
+            Button("Delete…", role: .destructive) {
+                showDeleteConfirm = true
+            }
+            .disabled(host.supportsWorkspaceLifecycle != true)
         }
         .onHover { isHovering = $0 }
+        .alert("Rename Workspace", isPresented: $showRenameAlert) {
+            TextField("Workspace name", text: $renameTitle)
+            Button("Rename") {
+                let title = renameTitle.trimmingCharacters(in: .whitespacesAndNewlines)
+                guard !title.isEmpty else { return }
+                store.renameWorkspace(workspace, host: host, title: title)
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("Renames this workspace on \"\(host.displayName)\".")
+        }
+        .confirmationDialog(
+            "Delete \"\(workspace.title)\"?",
+            isPresented: $showDeleteConfirm
+        ) {
+            Button("Delete", role: .destructive) {
+                store.deleteWorkspace(workspace, host: host)
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("All panes on the host for this workspace are closed.")
+        }
     }
 }
