@@ -513,6 +513,14 @@ fn spawn_attach_relay(
             }
         }
 
+        // Absolute host byte offset of the end of the last chunk we forwarded.
+        // Used to turn a broadcast `Lagged` drop into a visible gap: when the
+        // next delivered chunk's absolute `seq` jumps past this, the broadcast
+        // silently discarded the bytes in between. We advance the client-facing
+        // `attach_seq` by exactly that gap so the client sees a `byte_seq`
+        // discontinuity (P9 drop detection) instead of a seamless-but-corrupt
+        // stream. Starts at the end of the replay snapshot.
+        let mut last_abs_end = live_min_seq;
         loop {
             tokio::select! {
                 biased;
@@ -527,6 +535,12 @@ fn spawn_attach_relay(
                             if chunk.seq < live_min_seq {
                                 continue;
                             }
+                            // Account for any bytes the broadcast dropped between
+                            // the last forwarded chunk and this one, so the gap
+                            // surfaces as a byte_seq jump on the client.
+                            if chunk.seq > last_abs_end {
+                                attach_seq += chunk.seq - last_abs_end;
+                            }
                             let len = chunk.bytes.len() as u64;
                             let env = Envelope {
                                 seq: seq_counter.fetch_add(1, Ordering::Relaxed) + 1,
@@ -538,13 +552,17 @@ fn spawn_attach_relay(
                                 })),
                             };
                             attach_seq += len;
+                            last_abs_end = chunk.seq + len;
                             if outgoing_tx.send(env).await.is_err() {
                                 break;
                             }
                         }
                         Err(broadcast::error::RecvError::Lagged(n)) => {
                             tracing::warn!("attach relay lagged, missed {n} chunks");
-                            // Protocol-level re-sync (GridSnapshot) lands in a later phase.
+                            // The dropped bytes are accounted for on the next
+                            // delivered chunk via its absolute `seq` (see
+                            // `last_abs_end`), which advances `attach_seq` so the
+                            // client detects the gap. Heal (re-snapshot) is P9.2.
                             continue;
                         }
                         Err(broadcast::error::RecvError::Closed) => {

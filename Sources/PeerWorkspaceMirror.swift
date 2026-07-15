@@ -105,7 +105,23 @@ final class PeerWorkspaceMirrorController {
         // Hung-connection detection: a dead transport unblocks the
         // receive loop's read with an error, entering the reconnect path.
         let weakTransport = transport
-        await session.startHeartbeat(intervalSeconds: 10, deadAfterSeconds: 30) {
+        await session.startHeartbeat(
+            intervalSeconds: 10,
+            deadAfterSeconds: 30,
+            onFirstMiss: {
+                #if DEBUG
+                dlog("peer.mirror.heartbeat.firstMiss — subscription pong overdue (output backpressure starving the shared receive loop?)")
+                #endif
+            },
+            onMissRecovered: {
+                #if DEBUG
+                dlog("peer.mirror.heartbeat.recovered")
+                #endif
+            }
+        ) {
+            #if DEBUG
+            dlog("peer.mirror.heartbeat.dead — no pong for 30s, closing subscription transport (ALL mirrored panes in this workspace will drop)")
+            #endif
             Task { await weakTransport.close() }
         }
 
@@ -388,7 +404,23 @@ final class PeerWorkspaceMirrorController {
                 subscriptionSession = session
                 subscriptionAlive = true
                 let weakTransport = transport
-                await session.startHeartbeat(intervalSeconds: 10, deadAfterSeconds: 30) {
+                await session.startHeartbeat(
+                    intervalSeconds: 10,
+                    deadAfterSeconds: 30,
+                    onFirstMiss: {
+                        #if DEBUG
+                        dlog("peer.mirror.heartbeat.firstMiss (post-reconnect) — subscription pong overdue")
+                        #endif
+                    },
+                    onMissRecovered: {
+                        #if DEBUG
+                        dlog("peer.mirror.heartbeat.recovered (post-reconnect)")
+                        #endif
+                    }
+                ) {
+                    #if DEBUG
+                    dlog("peer.mirror.heartbeat.dead (post-reconnect) — closing subscription transport (ALL mirrored panes drop)")
+                    #endif
                     Task { await weakTransport.close() }
                 }
                 markAllPanesStale()

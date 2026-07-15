@@ -32,6 +32,48 @@ const MAX_FRAME_BYTES: usize = 1024 * 1024;
 const MAX_RESPONSE_PENDING: usize = 256;
 const RESIZE_COALESCE_MS: u64 = 16;
 
+// ── Debug logging (measurement instrumentation) ─────────────────────
+//
+// Zero-plumbing on/off: touch `/tmp/term-mesh-relay-debug.on` (or set
+// TERMMESH_PEER_RELAY_DEBUG) and every relay process — no matter which
+// spawn path (owned pane / workspace mirror / relay window) launched it —
+// appends its lifecycle + exit cause (with errno) to a shared log file.
+// Used to pin down the "heavy input → truncate → pane closes" symptom:
+// the exit-cause line says whether the relay died on a GOODBYE from the
+// app (app tore us down), a socket EOF/EPIPE, or a stray EAGAIN.
+const RELAY_DEBUG_MARKER: &str = "/tmp/term-mesh-relay-debug.on";
+const RELAY_DEBUG_LOG: &str = "/tmp/term-mesh-relay-debug.log";
+
+fn relay_debug_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::path::Path::new(RELAY_DEBUG_MARKER).exists()
+            || env::var("TERMMESH_PEER_RELAY_DEBUG").is_ok()
+    })
+}
+
+fn rlog(msg: &str) {
+    if !relay_debug_enabled() {
+        return;
+    }
+    let path = env::var("TERMMESH_PEER_RELAY_DEBUG_PATH")
+        .unwrap_or_else(|_| RELAY_DEBUG_LOG.to_string());
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+    {
+        let _ = writeln!(f, "[relay pid={}] {}", std::process::id(), msg);
+    }
+}
+
+fn errno_of(e: &io::Error) -> String {
+    match e.raw_os_error() {
+        Some(code) => format!("errno={code}"),
+        None => "errno=none".to_string(),
+    }
+}
+
 // ── SIGWINCH self-pipe ─────────────────────────────────────────────
 
 static SIGWINCH_PIPE_WRITE: AtomicI32 = AtomicI32::new(-1);
@@ -641,6 +683,7 @@ fn main() {
         eprintln!("[relay] auth handshake failed: {e}");
         std::process::exit(1);
     }
+    rlog(&format!("started: connected + authed to {socket_path}"));
 
     // Put stdin in raw mode so each keystroke (Tab, Ctrl-C, arrow keys)
     // is forwarded immediately instead of waiting for a newline flush.
@@ -676,14 +719,21 @@ fn main() {
     let writer_handle = std::thread::spawn(move || {
         loop {
             match rx.recv() {
-                Ok(frame) if frame.is_empty() => break,
+                Ok(frame) if frame.is_empty() => {
+                    rlog("writer exit: stop sentinel");
+                    break;
+                }
                 Ok(frame) => {
-                    if sock_write.write_all(&frame).is_err() {
+                    if let Err(e) = sock_write.write_all(&frame) {
+                        rlog(&format!("writer exit: write_all err={e} {}", errno_of(&e)));
                         break;
                     }
                     let _ = sock_write.flush();
                 }
-                Err(_) => break,
+                Err(_) => {
+                    rlog("writer exit: channel closed (all senders dropped)");
+                    break;
+                }
             }
         }
         let _ = write_frame(&mut sock_write, TYPE_GOODBYE, b"relay-eof");
@@ -786,16 +836,19 @@ fn main() {
                 if err.raw_os_error() == Some(libc::EINTR) {
                     continue;
                 }
+                rlog(&format!("stdin exit: poll err={err} {}", errno_of(&err)));
                 break;
             }
             if ret == 0 {
                 let flushed = response_filter.flush_pending_escape();
                 if !send_frame(&tx_stdin, &flushed) {
+                    rlog("stdin exit: send_frame failed (channel closed) after esc flush");
                     break;
                 }
                 continue;
             }
             if pfd.revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) != 0 {
+                rlog(&format!("stdin exit: poll revents={:#x}", pfd.revents));
                 break;
             }
             if pfd.revents & libc::POLLIN == 0 {
@@ -803,17 +856,22 @@ fn main() {
             }
             let n = unsafe { libc::read(stdin_fd, buf.as_mut_ptr() as *mut _, buf.len()) };
             if n == 0 {
+                rlog("stdin exit: read EOF (n=0)");
                 break;
             }
             if n < 0 {
                 let err = io::Error::last_os_error();
                 match err.raw_os_error() {
                     Some(libc::EINTR) | Some(libc::EAGAIN) => continue,
-                    _ => break,
+                    _ => {
+                        rlog(&format!("stdin exit: read err={err} {}", errno_of(&err)));
+                        break;
+                    }
                 }
             }
             let filtered = response_filter.process(&buf[..n as usize]);
             if !send_frame(&tx_stdin, &filtered) {
+                rlog("stdin exit: send_frame failed (channel closed)");
                 break;
             }
         }
@@ -821,19 +879,45 @@ fn main() {
 
     // Socket reader (main thread): receives PtyData and writes to stdout.
     let stdout = io::stdout();
+    let mut total_out: u64 = 0;
+    let mut next_mark: u64 = 1 << 20; // log cumulative throughput every 1 MiB
     loop {
         match read_frame(&mut sock) {
-            Err(_) => break,
+            Err(e) => {
+                rlog(&format!(
+                    "socket-reader exit: read_frame err={e} {} total_out={total_out}",
+                    errno_of(&e)
+                ));
+                break;
+            }
             Ok((TYPE_PTY_DATA, payload)) => {
                 let mut out = stdout.lock();
-                if out.write_all(&payload).is_err() {
+                if let Err(e) = out.write_all(&payload) {
+                    rlog(&format!(
+                        "socket-reader exit: stdout write_all err={e} {} total_out={total_out}",
+                        errno_of(&e)
+                    ));
                     break;
                 }
-                if out.flush().is_err() {
+                if let Err(e) = out.flush() {
+                    rlog(&format!(
+                        "socket-reader exit: stdout flush err={e} {} total_out={total_out}",
+                        errno_of(&e)
+                    ));
                     break;
+                }
+                total_out += payload.len() as u64;
+                if total_out >= next_mark {
+                    rlog(&format!("pty out cumulative={total_out} bytes"));
+                    next_mark += 1 << 20;
                 }
             }
-            Ok((TYPE_GOODBYE, _)) => break,
+            Ok((TYPE_GOODBYE, _)) => {
+                rlog(&format!(
+                    "socket-reader exit: received GOODBYE from app total_out={total_out}"
+                ));
+                break;
+            }
             Ok((_, _)) => {}
         }
     }
@@ -866,6 +950,7 @@ fn main() {
     if let Some(h) = sigwinch_handle {
         let _ = h.join();
     }
+    rlog("main exit: process terminating");
 }
 
 #[cfg(test)]

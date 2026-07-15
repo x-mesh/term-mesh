@@ -729,6 +729,13 @@ final class PeerRelayWorkspaceWindowController: NSWindowController, NSWindowDele
             // demux; panes attach on `session` instead of each dialing a new
             // connection + handshake.
             let demux = PeerSessionDemux()
+            #if DEBUG
+            // Measurement: app-side truncation source for the shared path —
+            // a slow pane's stream drops its oldest chunks under output load.
+            await demux.setOnDrop { surfaceID, total in
+                dlog("peer.relay.demux.drop surface=\(surfaceID.map { String(format: "%02x", $0) }.joined().prefix(8)) totalDropped=\(total)")
+            }
+            #endif
             subscriptionDemux = demux
             // App-level heartbeat. SSH ServerAliveInterval (15s × 3)
             // catches a dead tunnel within ~45s, but it can't catch a

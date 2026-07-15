@@ -113,6 +113,15 @@ public actor PeerSession {
     /// macOS).
     private var heartbeatTask: Task<Void, Never>?
     private var lastPongAt: Date = Date()
+    /// Timestamp of the most recent inbound bytes from the host (ANY frame,
+    /// not just a processed Pong). Under a heavy host→client output flood the
+    /// pump loop can be blocked draining PtyData to the relay, so a Pong
+    /// sitting behind that flood is not *processed* for many seconds even
+    /// though the connection is plainly alive — bytes keep arriving. Liveness
+    /// keys off this so backpressure can no longer be misread as a dead
+    /// session and kill a healthy relay pane (measured pane-close root cause).
+    /// See `tickHeartbeat` and `readFrame`.
+    private var lastInboundAt: Date = Date()
     private var pingCounter: UInt64 = 0
     /// Set once `tickHeartbeat` observes a tick with no Pong since the
     /// previous one, and cleared as soon as a fresh Pong lands. Bounds
@@ -164,6 +173,7 @@ public actor PeerSession {
     ) {
         heartbeatTask?.cancel()
         lastPongAt = Date()
+        lastInboundAt = Date()
         missNotified = false
         pongSeenSinceLastTick = true
         let intervalNs = UInt64(max(intervalSeconds, 0.1) * 1_000_000_000)
@@ -206,7 +216,15 @@ public actor PeerSession {
     }
 
     private func tickHeartbeat(deadAfterSeconds: TimeInterval) async -> HeartbeatTick {
-        if Date().timeIntervalSince(lastPongAt) > deadAfterSeconds {
+        // Only declare the session dead when BOTH the last processed Pong AND
+        // the last inbound bytes are older than the deadline. A sustained
+        // host→client flood blocks the pump loop from *processing* the Pong in
+        // time, but bytes are still arriving, so `lastInboundAt` stays fresh —
+        // backpressure no longer false-positives as death (which used to send a
+        // Goodbye and close a perfectly healthy relay pane).
+        let now = Date()
+        if now.timeIntervalSince(lastPongAt) > deadAfterSeconds
+            && now.timeIntervalSince(lastInboundAt) > deadAfterSeconds {
             return .dead
         }
         var result: HeartbeatTick = .alive
@@ -646,6 +664,10 @@ public actor PeerSession {
                 throw PeerSessionError.unexpectedEof
             }
             pendingInbound.append(chunk)
+            // Inbound liveness: any bytes from the host prove the session is
+            // alive, even when the pump loop is too backpressured to reach the
+            // Pong buried behind a PtyData flood. See `tickHeartbeat`.
+            lastInboundAt = Date()
         }
     }
 }

@@ -173,6 +173,16 @@ private actor RelayFrameSlots {
             available -= 1
             return
         }
+        #if DEBUG
+        // Slots exhausted: the relay socket write side is backed up (relay
+        // not draining → its stdout to Ghostty is blocked). Log only the
+        // onset edge (0→1 waiter) so a sustained stall is one line, not one
+        // per frame. This is the app→relay choke point in the "heavy output
+        // → truncate → pane closes" chain.
+        if waiters.isEmpty {
+            dlog("peer.relay.backpressure.stall limit=\(limit) — relay socket write side backed up")
+        }
+        #endif
         try await withCheckedThrowingContinuation { continuation in
             waiters.append(continuation)
         }
@@ -186,6 +196,12 @@ private actor RelayFrameSlots {
         if waiters.isEmpty {
             available = min(limit, available + 1)
         } else {
+            #if DEBUG
+            // Drain edge: last waiter about to be resumed → backpressure cleared.
+            if waiters.count == 1 {
+                dlog("peer.relay.backpressure.drained")
+            }
+            #endif
             waiters.removeFirst().resume()
         }
     }
@@ -312,21 +328,57 @@ private final class RelayFrameReader: @unchecked Sendable {
     }
 }
 
-private actor RelayResizeCoalescer {
+// `internal` (not `private`) so `@testable import` can exercise the P9.2 gap
+// heal logic directly — the trailing-debounce/throttle timing is impractical
+// to verify through the flaky live workspace-mirror path.
+actor RelayResizeCoalescer {
     private let session: PeerSession
     private let surfaceID: Data
     private let delayNs: UInt64
     private var pending: (cols: UInt32, rows: UInt32)?
     private var flushTask: Task<Void, Never>?
+    /// Most recent size seen — the baseline for a P9.2 heal nudge.
+    private var lastSize: (cols: UInt32, rows: UInt32)?
+    /// Trailing-debounce task for the gap heal: reset on every gap so it fires
+    /// once after the drop burst settles, rather than per dropped chunk.
+    private var healTask: Task<Void, Never>?
+    private let healDebounceNs: UInt64
+    /// Start of the current gap episode (nil = no active drops). Gates the
+    /// throttle so a short burst heals only via the trailing debounce.
+    private var gapEpisodeStart: Date?
+    /// Last time a heal actually ran. Bounds the throttle to one heal per
+    /// `healMaxWait` so a long CONTINUOUS-drop flood (slow network, no lull for
+    /// the trailing debounce to ever fire) still gets periodic redraws instead
+    /// of staying corrupt until the very end.
+    private var lastHealAt: Date = .distantPast
+    private let healMaxWait: TimeInterval
 
-    init(session: PeerSession, surfaceID: Data, delayMs: UInt64 = 24) {
+    init(
+        session: PeerSession,
+        surfaceID: Data,
+        initialCols: UInt32,
+        initialRows: UInt32,
+        delayMs: UInt64 = 24,
+        healDebounceMs: UInt64 = 400,
+        healMaxWaitSeconds: TimeInterval = 2.0
+    ) {
         self.session = session
         self.surfaceID = surfaceID
         self.delayNs = delayMs * 1_000_000
+        self.healDebounceNs = healDebounceMs * 1_000_000
+        self.healMaxWait = healMaxWaitSeconds
+        // Seed so a gap heal always has a size to nudge, even before the
+        // relay's first resize frame reaches `submit` — for some mirror panes
+        // that resize lags or never arrives, which silently no-op'd the heal
+        // (performGapHeal returned at the `lastSize == nil` guard).
+        if initialCols > 0 && initialRows > 0 {
+            self.lastSize = (initialCols, initialRows)
+        }
     }
 
     func submit(cols: UInt32, rows: UInt32) {
         pending = (cols, rows)
+        lastSize = (cols, rows)
         guard flushTask == nil else { return }
         let delayNs = self.delayNs
         flushTask = Task { [weak self] in
@@ -345,6 +397,9 @@ private actor RelayResizeCoalescer {
     func cancel() {
         flushTask?.cancel()
         flushTask = nil
+        healTask?.cancel()
+        healTask = nil
+        gapEpisodeStart = nil
         pending = nil
     }
 
@@ -355,6 +410,57 @@ private actor RelayResizeCoalescer {
         }
         pending = nil
         flushTask = nil
+        try? await session.sendResize(surfaceID: surfaceID, cols: size.cols, rows: size.rows)
+    }
+
+    // ── P9.2 gap heal ────────────────────────────────────────────────
+    //
+    // A host broadcast-Lag drop (P9.1) leaves the terminal truncated mid-
+    // stream — a full-screen TUI stays corrupt until it redraws. Nudging the
+    // remote size (shrink 1 col, then restore) makes the host apply
+    // TIOCSWINSZ twice, so the child gets SIGWINCH and redraws its true state.
+    // A shell ignores it. Debounced so a burst of thousands of gaps triggers
+    // exactly one heal, once output settles (no point healing mid-flood).
+
+    func noteGapForHeal() {
+        let now = Date()
+        if gapEpisodeStart == nil { gapEpisodeStart = now }
+        // Throttle path: once an episode has run past `healMaxWait`, heal at
+        // most once per `healMaxWait` even while drops keep streaming. A slow-
+        // network flood produces continuous gaps with no lull, so the trailing
+        // debounce below never fires until the very end — this guarantees
+        // periodic redraws throughout instead of a single (or missed) one.
+        if let episodeStart = gapEpisodeStart,
+           now.timeIntervalSince(episodeStart) >= healMaxWait,
+           now.timeIntervalSince(lastHealAt) >= healMaxWait {
+            Task { [weak self] in await self?.performGapHeal(reason: "throttle") }
+        }
+        // Trailing-debounce path: one more heal once drops settle, then close
+        // the episode. Reset on every gap so it fires exactly once, at the tail.
+        healTask?.cancel()
+        healTask = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: healDebounceNs)
+            guard let self, !Task.isCancelled else { return }
+            await self.performGapHeal(reason: "settle")
+            await self.endGapEpisode()
+        }
+    }
+
+    private func endGapEpisode() {
+        gapEpisodeStart = nil
+    }
+
+    private func performGapHeal(reason: String) async {
+        // Update first so the throttle window advances even when there is no
+        // size to nudge yet (avoids a tight retry loop before the first resize).
+        lastHealAt = Date()
+        guard let size = lastSize else { return }
+        let shrunk = max(1, size.cols - 1)
+        guard shrunk != size.cols else { return }
+        #if DEBUG
+        dlog("peer.relay.gap.heal nudge redraw reason=\(reason) cols=\(size.cols) rows=\(size.rows)")
+        #endif
+        try? await session.sendResize(surfaceID: surfaceID, cols: shrunk, rows: size.rows)
         try? await session.sendResize(surfaceID: surfaceID, cols: size.cols, rows: size.rows)
     }
 }
@@ -795,8 +901,21 @@ final class PeerRelaySession {
             let weakTransport = transport
             await session.startHeartbeat(
                 intervalSeconds: 10,
-                deadAfterSeconds: 30
+                deadAfterSeconds: 30,
+                onFirstMiss: {
+                    #if DEBUG
+                    dlog("peer.relay.heartbeat.firstMiss — pong overdue > 1 interval (output backpressure starving the receive loop?)")
+                    #endif
+                },
+                onMissRecovered: {
+                    #if DEBUG
+                    dlog("peer.relay.heartbeat.recovered")
+                    #endif
+                }
             ) {
+                #if DEBUG
+                dlog("peer.relay.heartbeat.dead — no pong for 30s, closing transport (this will end hostToRelay with receive-error → pane closes)")
+                #endif
                 Task { await weakTransport.close() }
             }
         }
@@ -893,9 +1012,9 @@ final class PeerRelaySession {
     private func startPumping(relay: RelaySocket) {
         guard let session else { return }
         let surfaceID = self.surfaceID
-        let disconnect: @Sendable () -> Void = { [weak self] in
+        let disconnect: @Sendable (String) -> Void = { [weak self] reason in
             Task { @MainActor in
-                self?.disconnect()
+                self?.disconnect(reason: reason)
             }
         }
         let writer = RelayFrameWriter(relay: relay) { [weak self] error in
@@ -906,10 +1025,15 @@ final class PeerRelaySession {
             dlog("peer.relay.writer.failure error=\(error)")
             #endif
             Task { @MainActor in self?.onError?(error) }
-            disconnect()
+            disconnect("writer-failure")
         }
         let reader = RelayFrameReader(relay: relay)
-        let resizeCoalescer = RelayResizeCoalescer(session: session, surfaceID: surfaceID)
+        let resizeCoalescer = RelayResizeCoalescer(
+            session: session,
+            surfaceID: surfaceID,
+            initialCols: remoteCols,
+            initialRows: remoteRows
+        )
         // Capture the sharing mode for the detached pumps. On the shared
         // path host→relay bytes arrive pre-demuxed via `ptyStream`; on the
         // owned path this task reads frames itself and filters by surface_id.
@@ -930,22 +1054,28 @@ final class PeerRelaySession {
                         do {
                             try await writer.enqueue(type: kTypePtyData, payload: chunk.payload)
                         } catch {
-                            break
+                            disconnect("hostToRelay-enqueue-failed")
+                            return
                         }
                     }
-                    disconnect()
+                    disconnect("hostToRelay-ptyStream-end")
                     return
                 }
                 // Owned session: read frames directly.
                 // Labeled so a relay-write failure breaks the pump loop, not
                 // just the switch — a bare `break` inside the switch would keep
                 // looping and silently drop frames to a dead writer.
+                var endReason = "hostToRelay-loop-end"
+                var expectedByteSeq: UInt64 = 0
+                var gapBytesTotal: UInt64 = 0
+                var gapCount = 0
                 pumpLoop: while !Task.isCancelled {
                     let msg: PeerIncomingMessage
                     do {
                         msg = try await session.receiveNextMessage()
                     } catch {
                         try? await writer.enqueue(type: kTypeGoodbye, payload: Data("host-error".utf8))
+                        endReason = "hostToRelay-receive-error"
                         break pumpLoop
                     }
                     switch msg {
@@ -953,23 +1083,47 @@ final class PeerRelaySession {
                     // (never expected on a single-attach owned session, but the
                     // guard makes a shared session's stray frame a drop, not a
                     // mis-echo to the wrong pane's relay) falls to `default`.
-                    case .ptyData(let sid, _, let data) where sid == mySurfaceID:
+                    case .ptyData(let sid, let byteSeq, let data) where sid == mySurfaceID:
+                        // P9 gap detection: a byte_seq that jumps past the end of
+                        // the previous frame means the host's broadcast dropped
+                        // (Lagged) the bytes in between under load — the terminal
+                        // is now truncated. Surface it here (heal = P9.2).
+                        if byteSeq > expectedByteSeq {
+                            let gap = byteSeq - expectedByteSeq
+                            gapBytesTotal += gap
+                            gapCount += 1
+                            #if DEBUG
+                            // Rate-limited: a heavy flood drops thousands of
+                            // chunks/sec; logging every one floods the debug
+                            // ring (opening its circuit breaker and dropping
+                            // OTHER events, including the heal logs). One line
+                            // per 500 gaps is enough to see truncation happening.
+                            if gapCount == 1 || gapCount % 500 == 0 {
+                                dlog("peer.relay.gap #\(gapCount) dropped=\(gap) totalDropped=\(gapBytesTotal) — host broadcast Lag (content truncated)")
+                            }
+                            #endif
+                            // P9.2: schedule a debounced redraw heal so a TUI
+                            // corrupted by the drop recovers once output settles.
+                            await resizeCoalescer.noteGapForHeal()
+                        }
+                        expectedByteSeq = byteSeq + UInt64(data.count)
                         do {
                             try await writer.enqueue(type: kTypePtyData, payload: data)
                         } catch {
+                            endReason = "hostToRelay-enqueue-failed"
                             break pumpLoop
                         }
                     case .goodbye:
                         try? await writer.enqueue(type: kTypeGoodbye, payload: Data("host-goodbye".utf8))
                         // Tear down now so the sibling relayToHost task unblocks
                         // immediately instead of hanging until the heartbeat (~30s).
-                        disconnect()
+                        disconnect("host-goodbye")
                         return
                     default:
                         break
                     }
                 }
-                disconnect()
+                disconnect(endReason)
             }
 
             // Relay → host: read frames from relay socket, forward to PeerSession.
@@ -1007,7 +1161,7 @@ final class PeerRelaySession {
                             }
                             // Tear down now so the sibling hostToRelay task unblocks
                             // immediately instead of hanging until the heartbeat (~30s).
-                            disconnect()
+                            disconnect("relay-goodbye")
                             return
                         default:
                             break
@@ -1018,7 +1172,7 @@ final class PeerRelaySession {
                     // fd is closed. `disconnect()` below owns the user-visible state.
                 }
                 await resizeCoalescer.flushNow()
-                disconnect()
+                disconnect("relayToHost-end")
             }
 
             _ = await hostToRelay.result
@@ -1029,12 +1183,19 @@ final class PeerRelaySession {
         }
     }
 
-    private func disconnect() {
+    private func disconnect(reason: String) {
         // Multiple teardown paths (writer onFailure, hostToRelay end,
         // relayToHost end) all funnel here; without this guard onDisconnect?()
         // fires 2-3 times per session.
         guard !isTorndown else { return }
         isTorndown = true
+        #if DEBUG
+        // Which teardown path fired first is the key signal for the
+        // "heavy input → truncate → pane closes" investigation: e.g. a
+        // `hostToRelay-receive-error` right after a `heartbeat.dead` means
+        // the heartbeat starved and killed the session under output load.
+        dlog("peer.relay.disconnect reason=\(reason) ownsSession=\(ownsSession)")
+        #endif
         pumpTask?.cancel()
         pumpTask = nil
         relaySocket?.close()
@@ -1063,6 +1224,6 @@ final class PeerRelaySession {
     }
 
     func stop() async {
-        disconnect()
+        disconnect(reason: "stop")
     }
 }
