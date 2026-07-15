@@ -216,7 +216,15 @@ async fn reader_loop(
                     payload: Some(Payload::WorkspaceList(WorkspaceList {
                         workspaces: vec![Workspace {
                             workspace_id: host.workspace_id.clone(),
-                            title: hostname_or(layout::DAEMON_WORKSPACE),
+                            // M1: the default workspace's persisted `name`
+                            // (settable via TERMMESH_PEER_WORKSPACE_TITLE at
+                            // boot, or a future rename RPC) is now the
+                            // title's single source of truth. hostname_or
+                            // is still what seeds that name on a fresh boot
+                            // with no override (see persist::boot), so the
+                            // legacy "hostname, else DAEMON_WORKSPACE"
+                            // fallback is preserved for a first-ever boot.
+                            title: host.default_workspace_title(),
                             layout: host.layout_snapshot(),
                             // Empty window_id: clients read that as the legacy
                             // "single implied window" flat list, which is what
@@ -536,7 +544,7 @@ fn next_seq(seq_counter: &AtomicU64) -> u64 {
 /// `gethostname(2)` is a real syscall with no such gap. Both fallback
 /// paths are trimmed identically so trailing whitespace can't leak into
 /// the title from either source.
-fn hostname_or(fallback: &str) -> String {
+pub(crate) fn hostname_or(fallback: &str) -> String {
     gethostname_string()
         .or_else(|| {
             std::fs::read_to_string("/etc/hostname")
@@ -565,7 +573,12 @@ fn gethostname_string() -> Option<String> {
     (!s.is_empty()).then_some(s)
 }
 
-fn random_peer_bytes(len: usize) -> Vec<u8> {
+/// CSPRNG-backed random bytes, shared across `peer::` for anything that
+/// needs an unguessable id: auth nonces / session ids here, and (M1)
+/// workspace ids in `persist`/`layout` — a workspace's id must never be
+/// re-derivable from its name so a rename can't accidentally change
+/// which workspace a reconnecting client refers to.
+pub(crate) fn random_peer_bytes(len: usize) -> Vec<u8> {
     // CSPRNG via getrandom(3) so auth nonces / session ids don't
     // carry the structural fixed bits of UUIDv4 (version+variant
     // nibbles) and don't depend on uuid crate internals to use a

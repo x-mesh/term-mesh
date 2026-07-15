@@ -12,27 +12,60 @@ use tokio::sync::{watch, Semaphore};
 use tokio::task::JoinSet;
 
 use super::connection;
-use super::layout::PeerHost;
+use super::layout::{PeerHost, DAEMON_WORKSPACE};
+use super::persist;
 use super::surface::PtyManager;
 use crate::supervisor::{shutdown_supervised, spawn_supervised};
 
 const MAX_PEER_CONNECTIONS: usize = 16;
 
+/// Production entry point (the only caller is `main.rs`). Unlike
+/// `serve_with_manager` (used throughout this module's own tests, and by
+/// any other in-process caller that just wants a working host), this
+/// boots the host through the M1 persistence path: a named-workspace
+/// collection loaded from `persist::default_workspaces_path()`,
+/// reconciled against `TERMMESH_PEER_WORKSPACES` /
+/// `TERMMESH_PEER_WORKSPACE_TITLE`, and persisted back. Keeping that
+/// disk I/O out of `serve_with_manager` means the ~20 tests that call it
+/// directly never touch (or race on) the real on-disk workspaces file.
 pub async fn serve(path: PathBuf, shutdown_rx: watch::Receiver<bool>) -> anyhow::Result<()> {
     let manager = Arc::new(PtyManager::new());
     manager.spawn_from_config();
-    serve_with_manager(path, shutdown_rx, manager).await
+    let workspaces_path = persist::default_workspaces_path();
+    let default_name_fallback = connection::hostname_or(DAEMON_WORKSPACE);
+    let entries = persist::boot(&workspaces_path, &default_name_fallback);
+    let host = Arc::new(PeerHost::with_workspaces(manager, entries));
+    serve_with_host(path, shutdown_rx, host).await
 }
 
+/// Test/embedding entry point: builds a host with `PeerHost::new` (a
+/// single default workspace, no persistence, no env vars) around
+/// `manager` and serves it. Behavior is unchanged from before M1 for
+/// every existing caller of this function. `main.rs` calls `serve`
+/// instead, so in a non-test build this function's only callers are this
+/// module's own integration tests — `#[allow(dead_code)]` for the same
+/// reason `PeerHost::new` carries it.
+#[allow(dead_code)]
 pub async fn serve_with_manager(
     path: PathBuf,
-    mut shutdown_rx: watch::Receiver<bool>,
+    shutdown_rx: watch::Receiver<bool>,
     manager: Arc<PtyManager>,
 ) -> anyhow::Result<()> {
     // The host owns the layout tree the manager's surfaces are arranged
     // in; connections share it so WorkspaceControl mutations made over
     // one connection are visible (and pushable) to all of them.
     let host = Arc::new(PeerHost::new(manager));
+    serve_with_host(path, shutdown_rx, host).await
+}
+
+/// Shared accept loop, parameterized on an already-constructed host so
+/// `serve` (persistence-backed) and `serve_with_manager` (persistence-
+/// free) can share every bit of socket/connection plumbing below.
+async fn serve_with_host(
+    path: PathBuf,
+    mut shutdown_rx: watch::Receiver<bool>,
+    host: Arc<PeerHost>,
+) -> anyhow::Result<()> {
     if path.exists() {
         std::fs::remove_file(&path)?;
     }

@@ -27,6 +27,7 @@ use peer_proto::v1::{
 };
 use tokio::sync::mpsc;
 
+use super::persist::PersistedWorkspace;
 use super::surface::{surface_id_from_name, PtyManager, PtySurface, SpawnSpec};
 
 pub type SurfaceId = Vec<u8>;
@@ -466,9 +467,16 @@ enum CloseOutcome {
     RemoveMe(Vec<SurfaceId>),
 }
 
-/// Name of the single workspace a daemon-only host synthesises. Hashed
-/// through `surface_id_from_name`, so the id is stable across restarts
-/// and the client can keep referring to the same workspace.
+/// Fallback name for the default workspace a daemon-only host always has.
+/// Used only as the last-resort name (constructors that skip persistence
+/// entirely, e.g. `PeerHost::new`) or as a defensive title in
+/// `default_workspace_title` — production boot (`persist::boot`) instead
+/// names the default workspace from a persisted rename, the hostname, or
+/// `TERMMESH_PEER_WORKSPACE_TITLE`. M1 dropped the prior
+/// `surface_id_from_name(DAEMON_WORKSPACE)` id derivation: a workspace's
+/// id is now a random 16 bytes assigned once at creation (see
+/// `persist::PersistedWorkspace`), so it survives a rename unchanged
+/// instead of being re-derivable from (and therefore coupled to) the name.
 pub const DAEMON_WORKSPACE: &str = "term-meshd";
 
 /// Outgoing handles of every connection that reached `Ready`, so a layout
@@ -548,6 +556,11 @@ impl Drop for BroadcastGuard {
 pub struct WorkspaceEntry {
     pub id: Vec<u8>,
     pub name: String,
+    /// True for exactly one entry in a host's collection at all times.
+    /// Invariant enforced by `PeerHost::with_workspaces` (promotes the
+    /// first entry if none is marked) and `PeerHost::remove_workspace`
+    /// (refuses to remove the entry carrying this flag).
+    pub is_default: bool,
     pub store: LayoutStore,
 }
 
@@ -594,20 +607,81 @@ pub struct PeerHost {
 /// into a handful of pushes instead of hundreds.
 const PUSH_DEBOUNCE: Duration = Duration::from_millis(120);
 
+/// Failure modes for `PeerHost::remove_workspace`. The mutation itself
+/// (an actual delete RPC) is a later task's job; this method exists now
+/// so the collection-level invariant — the default workspace can never
+/// be removed — has a signature and enforcement point from the start.
+#[derive(Debug, PartialEq, Eq)]
+pub enum RemoveWorkspaceError {
+    NotFound,
+    IsDefault,
+}
+
 impl PeerHost {
+    /// Convenience constructor for callers that don't care about
+    /// persistence (every existing test, and any future in-process
+    /// caller that just wants a working host): a single default
+    /// workspace, freshly random id, `DAEMON_WORKSPACE` as its name.
+    /// Production boot goes through `with_workspaces` instead, seeded by
+    /// `persist::boot` (see `server::serve`) — so in a non-test build this
+    /// constructor's only caller is `server::serve_with_manager`, itself
+    /// test-only for the same reason. Kept `pub` (not `#[cfg(test)]`)
+    /// because it is the documented entry point for any future in-process
+    /// embedder that wants a working host without touching persistence.
+    #[allow(dead_code)]
     pub fn new(pty: Arc<PtyManager>) -> Self {
-        let surfaces = pty.list();
-        let workspace_id = surface_id_from_name(DAEMON_WORKSPACE);
-        let store = LayoutStore::balanced_from_surfaces(&surfaces);
-        let mut surface_workspace = HashMap::new();
-        for surface in &surfaces {
-            surface_workspace.insert(surface.surface_id.clone(), workspace_id.clone());
+        Self::with_workspaces(
+            pty,
+            vec![PersistedWorkspace {
+                id: super::connection::random_peer_bytes(16),
+                name: DAEMON_WORKSPACE.to_string(),
+                is_default: true,
+            }],
+        )
+    }
+
+    /// Build a host from an already-resolved workspace collection — the
+    /// result of `persist::boot`, or a hand-built single entry (`new`).
+    /// The manager's current surfaces are tiled into the default entry's
+    /// tree exactly like the pre-M1 constructor did; every other entry
+    /// starts as an empty workspace (M1 boots named workspaces empty —
+    /// only the default one ever inherits startup surfaces).
+    ///
+    /// Exactly one entry must be `is_default`; if none is (defensive —
+    /// `persist::boot` already guards this, but a hand-built `Vec`
+    /// passed by some future caller might not), the first entry is
+    /// promoted so the collection is never left without a home for
+    /// un-namespaced control commands.
+    pub fn with_workspaces(pty: Arc<PtyManager>, mut entries: Vec<PersistedWorkspace>) -> Self {
+        debug_assert!(!entries.is_empty(), "workspace collection must never be empty");
+        if !entries.iter().any(|e| e.is_default) {
+            if let Some(first) = entries.first_mut() {
+                first.is_default = true;
+            }
         }
+
+        let surfaces = pty.list();
+        let mut surface_workspace = HashMap::new();
         let mut workspaces = HashMap::new();
-        workspaces.insert(
-            workspace_id.clone(),
-            WorkspaceEntry { id: workspace_id.clone(), name: DAEMON_WORKSPACE.to_string(), store },
-        );
+        let mut default_id = None;
+        for entry in entries {
+            let store = if entry.is_default {
+                default_id = Some(entry.id.clone());
+                for surface in &surfaces {
+                    surface_workspace.insert(surface.surface_id.clone(), entry.id.clone());
+                }
+                LayoutStore::balanced_from_surfaces(&surfaces)
+            } else {
+                LayoutStore { root: None, next_split_id: 1 }
+            };
+            workspaces.insert(
+                entry.id.clone(),
+                WorkspaceEntry { id: entry.id, name: entry.name, is_default: entry.is_default, store },
+            );
+        }
+        // Guaranteed by the promotion above: some entry is always default.
+        let workspace_id = default_id.expect("workspace collection must contain a default entry");
+
         Self {
             pty,
             workspaces: Mutex::new(workspaces),
@@ -616,6 +690,40 @@ impl PeerHost {
             surface_workspace: Mutex::new(surface_workspace),
             ephemeral_counter: AtomicU64::new(1),
             push_scheduled: AtomicBool::new(false),
+        }
+    }
+
+    /// Display title for the default workspace: its persisted (or
+    /// renamed, or `TERMMESH_PEER_WORKSPACE_TITLE`-overridden) `name`.
+    /// Falls back to `DAEMON_WORKSPACE` only in the should-never-happen
+    /// case where the default entry is missing from the collection.
+    pub fn default_workspace_title(&self) -> String {
+        self.workspaces
+            .lock()
+            .unwrap()
+            .get(&self.workspace_id)
+            .map(|entry| entry.name.clone())
+            .unwrap_or_else(|| DAEMON_WORKSPACE.to_string())
+    }
+
+    /// Remove a non-default workspace from the collection. Refuses when
+    /// `workspace_id` is unknown or names the default entry — deleting
+    /// the default is out of scope for every caller until a later task
+    /// adds an explicit "promote a new default first" flow.
+    ///
+    /// Not yet called from any RPC handler (that wiring is a later
+    /// task's job); this establishes the invariant/signature so the
+    /// delete RPC has a ready-made, already-tested enforcement point.
+    #[allow(dead_code)]
+    pub fn remove_workspace(&self, workspace_id: &[u8]) -> Result<(), RemoveWorkspaceError> {
+        let mut workspaces = self.workspaces.lock().unwrap();
+        match workspaces.get(workspace_id) {
+            None => Err(RemoveWorkspaceError::NotFound),
+            Some(entry) if entry.is_default => Err(RemoveWorkspaceError::IsDefault),
+            Some(_) => {
+                workspaces.remove(workspace_id);
+                Ok(())
+            }
         }
     }
 
@@ -1249,7 +1357,12 @@ mod tests {
 
     /// A freshly booted host always has exactly one workspace — the
     /// default (`DAEMON_WORKSPACE`) — matching the pre-M1 single-workspace
-    /// behavior, just expressed through the collection now.
+    /// behavior, just expressed through the collection now. M1 dropped the
+    /// deterministic `surface_id_from_name(DAEMON_WORKSPACE)` id
+    /// derivation in favor of a random 16-byte id assigned at creation
+    /// (see the `layout::DAEMON_WORKSPACE` doc comment), so this only
+    /// checks the id's shape and the entry/host agreement, not a fixed
+    /// value.
     #[test]
     fn default_workspace_exists_after_boot() {
         let manager = Arc::new(PtyManager::new());
@@ -1260,7 +1373,22 @@ mod tests {
         let entry = workspaces.get(&host.workspace_id).expect("default workspace present");
         assert_eq!(entry.id, host.workspace_id);
         assert_eq!(entry.name, DAEMON_WORKSPACE);
-        assert_eq!(host.workspace_id, surface_id_from_name(DAEMON_WORKSPACE));
+        assert!(entry.is_default);
+        assert_eq!(host.workspace_id.len(), 16, "id must be a random 16-byte value");
+        assert_ne!(
+            host.workspace_id,
+            surface_id_from_name(DAEMON_WORKSPACE),
+            "id must no longer be derivable from the workspace name"
+        );
+    }
+
+    /// Two hosts constructed via `new` must not collide on workspace id —
+    /// the whole point of moving off a deterministic name-derived id.
+    #[test]
+    fn default_workspace_id_is_random_across_hosts() {
+        let host_a = PeerHost::new(Arc::new(PtyManager::new()));
+        let host_b = PeerHost::new(Arc::new(PtyManager::new()));
+        assert_ne!(host_a.workspace_id, host_b.workspace_id);
     }
 
     /// Booting with surfaces already registered seeds the default
@@ -1297,7 +1425,7 @@ mod tests {
             let store2 = store_with(&["x"]);
             workspaces.insert(
                 ws2_id.clone(),
-                WorkspaceEntry { id: ws2_id.clone(), name: "second".into(), store: store2 },
+                WorkspaceEntry { id: ws2_id.clone(), name: "second".into(), is_default: false, store: store2 },
             );
         }
         host.surface_workspace.lock().unwrap().insert(sid("x"), ws2_id.clone());
@@ -1337,7 +1465,7 @@ mod tests {
             let store2 = LayoutStore::balanced_from_surfaces(&surfaces_b);
             workspaces.insert(
                 ws2_id.clone(),
-                WorkspaceEntry { id: ws2_id.clone(), name: "second".into(), store: store2 },
+                WorkspaceEntry { id: ws2_id.clone(), name: "second".into(), is_default: false, store: store2 },
             );
         }
         host.surface_workspace.lock().unwrap().insert(sid("base-b"), ws2_id.clone());
@@ -1382,5 +1510,94 @@ mod tests {
         assert!(!index.contains_key(&ephemeral_id));
         assert_eq!(index.get(&sid("base-a")), Some(&host.workspace_id));
         assert_eq!(index.get(&sid("base-b")), Some(&ws2_id));
+    }
+
+    // ---- M1: with_workspaces / persistence-driven boot --------------
+
+    fn persisted(name: &str, is_default: bool) -> PersistedWorkspace {
+        PersistedWorkspace { id: sid(name), name: name.to_string(), is_default }
+    }
+
+    /// `with_workspaces` seeds the default entry's tree from the
+    /// manager's current surfaces (matching `new`'s behavior) but leaves
+    /// every non-default entry an empty workspace — M1's boot-from-env
+    /// contract creates named workspaces empty, not pre-tiled.
+    #[tokio::test]
+    async fn with_workspaces_seeds_default_only() {
+        let manager = Arc::new(PtyManager::new());
+        let base = PtySurface::spawn(sid("base"), "cat".into(), "/bin/cat", &[], 80, 24, None)
+            .expect("spawn /bin/cat");
+        manager.insert_surface(base);
+
+        let host = PeerHost::with_workspaces(
+            Arc::clone(&manager),
+            vec![persisted("term-meshd", true), persisted("dev", false)],
+        );
+
+        let workspaces = host.workspaces.lock().unwrap();
+        assert_eq!(workspaces.len(), 2);
+        assert_eq!(host.workspace_id, sid("term-meshd"));
+
+        let default_entry = workspaces.get(&sid("term-meshd")).unwrap();
+        assert!(default_entry.is_default);
+        assert_eq!(default_entry.store.surface_ids(), vec![sid("base")]);
+
+        let dev_entry = workspaces.get(&sid("dev")).unwrap();
+        assert!(!dev_entry.is_default);
+        assert!(dev_entry.store.is_empty(), "non-default entries boot empty");
+
+        // Reverse index only covers the default workspace's surfaces.
+        assert_eq!(host.workspace_id_for_surface(&sid("base")), Some(sid("term-meshd")));
+    }
+
+    /// A collection with no entry marked `is_default` (a hand-built `Vec`
+    /// bypassing `persist::boot`'s own guard) must still produce a usable
+    /// host: the first entry is promoted rather than leaving
+    /// `workspace_id` unset.
+    #[test]
+    fn with_workspaces_promotes_first_entry_when_none_marked_default() {
+        let manager = Arc::new(PtyManager::new());
+        let host = PeerHost::with_workspaces(manager, vec![persisted("orphan", false)]);
+
+        assert_eq!(host.workspace_id, sid("orphan"));
+        let workspaces = host.workspaces.lock().unwrap();
+        assert!(workspaces.get(&sid("orphan")).unwrap().is_default);
+    }
+
+    /// `default_workspace_title` surfaces whatever name the default entry
+    /// currently carries — the mechanism `TERMMESH_PEER_WORKSPACE_TITLE`
+    /// and a future rename RPC both flow through, and what
+    /// `connection.rs`'s `ListWorkspaces` handler now reads directly
+    /// instead of always calling `hostname_or`.
+    #[test]
+    fn default_workspace_title_reflects_persisted_name() {
+        let manager = Arc::new(PtyManager::new());
+        let host = PeerHost::with_workspaces(manager, vec![persisted("my-custom-title", true)]);
+        assert_eq!(host.default_workspace_title(), "my-custom-title");
+    }
+
+    #[test]
+    fn remove_workspace_refuses_default_and_unknown_but_removes_others() {
+        let manager = Arc::new(PtyManager::new());
+        let host = PeerHost::with_workspaces(
+            manager,
+            vec![persisted("term-meshd", true), persisted("dev", false)],
+        );
+
+        assert_eq!(
+            host.remove_workspace(&sid("term-meshd")),
+            Err(RemoveWorkspaceError::IsDefault)
+        );
+        assert_eq!(
+            host.remove_workspace(&sid("ghost")),
+            Err(RemoveWorkspaceError::NotFound)
+        );
+        assert_eq!(host.remove_workspace(&sid("dev")), Ok(()));
+        assert_eq!(host.workspaces.lock().unwrap().len(), 1, "default survives, dev is gone");
+        // Removing it again is now NotFound, not a second success.
+        assert_eq!(
+            host.remove_workspace(&sid("dev")),
+            Err(RemoveWorkspaceError::NotFound)
+        );
     }
 }
