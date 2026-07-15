@@ -770,7 +770,13 @@ final class PeerClientCoordinator: NSObject {
             environment: firstSession.relayEnvironment
         )
         let hostChip = spec.hostKey.shortLabel
-        workspace.title = "\(chosen.title.isEmpty ? "Workspace" : chosen.title) ⌁ \(hostChip)"
+        // Distinct sidebar markers per mode — identical titles made the
+        // two modes impossible to tell apart (or A/B test) in the tab
+        // list: ⌁ = live host-synced mirror, ⧉ = detached layout copy.
+        let mirrorBaseTitle = chosen.title.isEmpty ? "Workspace" : chosen.title
+        workspace.title = live
+            ? "\(mirrorBaseTitle) ⌁ \(hostChip)"
+            : "\(mirrorBaseTitle) ⧉ \(hostChip) (copy)"
         guard let firstPanel = workspace.panels.values
             .compactMap({ $0 as? TerminalPanel }).first
         else {

@@ -1016,15 +1016,14 @@ struct RemoteWorkspaceRowView: View {
             Button("Open as Live Workspace in Main Window") {
                 store.openWorkspaceAsMirror(workspace, host: host, live: true)
             }
-            // Snapshot (Phase 2A): copy the layout once, then the local
-            // workspace owns it.
-            Button("Open as Snapshot Workspace") {
-                store.openWorkspaceAsMirror(workspace, host: host, live: false)
-            }
             // Legacy standalone viewer window.
             Button("Open in Relay Window") {
                 store.openWorkspace(workspace, host: host)
             }
+            // Snapshot mode (live: false — detached layout copy) is
+            // intentionally NOT offered: with content always streaming
+            // live, users read the near-identical workspace as a broken
+            // mirror. The code path stays for a future, clearer surface.
         }
         .onHover { isHovering = $0 }
     }
