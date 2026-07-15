@@ -1010,6 +1010,32 @@ struct RemoteHostGroupView: View {
                     .foregroundColor(host.isConnected ? .primary : .secondary)
                     .lineLimit(1)
                     .truncationMode(.tail)
+                // Workspace count, shown once connected and known —
+                // "jw-server (3)". Hidden while saved/connecting so the
+                // row doesn't flash a stale/zero count.
+                if host.isConnected, !host.workspaces.isEmpty {
+                    Text("(\(host.workspaces.count))")
+                        .font(.system(size: 10))
+                        .foregroundColor(Color.secondary.opacity(0.7))
+                }
+                // Inline "+" = New Workspace…, mirroring the section
+                // header's add-host affordance. Only rendered when the
+                // connected host actually supports workspace CRUD.
+                if host.isConnected, host.supportsWorkspaceLifecycle == true {
+                    Spacer(minLength: 4)
+                    Button {
+                        newWorkspaceTitle = ""
+                        showNewWorkspaceAlert = true
+                    } label: {
+                        Image(systemName: "plus")
+                            .font(.system(size: 8, weight: .semibold))
+                            .foregroundColor(.secondary)
+                            .frame(width: 16, height: 16)
+                            .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                    .help("New Workspace…")
+                }
             }
             .padding(.horizontal, 10)
             .padding(.vertical, 3)

@@ -549,7 +549,11 @@ final class RemoteHostStore: ObservableObject {
             do {
                 let conn = try await PeerRelaySession.connect(hostSockPath: path)
                 do {
-                    _ = try await conn.session.createWorkspace(title: title)
+                    // Seed the first pane at creation so the workspace is
+                    // born with a shell — otherwise it lists empty and a
+                    // click races the async NewTab spawn ("no panes").
+                    let newID = try await conn.session.createWorkspace(title: title)
+                    try await conn.session.requestNewTab(workspaceID: newID)
                 } catch {
                     #if DEBUG
                     dlog("peer.sidebar.createWorkspace rpc-fail key=\(key) error=\(error)")
@@ -562,6 +566,9 @@ final class RemoteHostStore: ObservableObject {
                 #endif
                 return
             }
+            // Small settle for the daemon to apply NewTab before the
+            // roster refetch, so the row lands already populated.
+            try? await Task.sleep(nanoseconds: 400_000_000)
             self.fetchWorkspaces(for: path, key: key)
         }
     }

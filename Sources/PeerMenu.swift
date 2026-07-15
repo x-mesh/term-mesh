@@ -560,7 +560,16 @@ final class PeerClientCoordinator: NSObject {
 
         // First leaf seeds the new workspace's initial pane; every other
         // leaf is split off recursively in the host tree's shape.
-        guard let firstLeaf = Self.firstLeafPane(chosen.layout) else {
+        // A freshly created (empty) workspace has no leaf yet — ask the
+        // host to seed its first pane (NewTab targeted by workspace id,
+        // workspace.lifecycle.v1 hosts spawn an ephemeral shell) and
+        // re-list until it appears. Hosts that predate the field ignore
+        // the request (F8) and we fall through to the alert.
+        var resolved = chosen
+        if Self.firstLeafPane(resolved.layout) == nil {
+            resolved = await Self.seedEmptyWorkspace(chosen, lease: lease) ?? chosen
+        }
+        guard let firstLeaf = Self.firstLeafPane(resolved.layout) else {
             registry.release(lease)
             self.showAlert(title: "Empty Workspace", body: "The chosen workspace has no panes.")
             return
@@ -637,7 +646,7 @@ final class PeerClientCoordinator: NSObject {
         }
 
         await materializeLayout(
-            chosen.layout, seed: firstPanel,
+            resolved.layout, seed: firstPanel,
             workspace: workspace, lease: lease, spec: spec
         )
 
@@ -645,7 +654,7 @@ final class PeerClientCoordinator: NSObject {
         // construction) local tree. A skipped leaf breaks the shape
         // match — the walk just stops descending that branch.
         Self.applyDividerRatios(
-            host: chosen.layout,
+            host: resolved.layout,
             local: workspace.bonsplitController.treeSnapshot(),
             controller: workspace.bonsplitController
         )
@@ -653,7 +662,7 @@ final class PeerClientCoordinator: NSObject {
         // Browse ref done — each pane session holds its own lease ref.
         registry.release(lease)
         #if DEBUG
-        dlog("peer.mirror.open host=\(spec.hostKey) workspace=\(chosen.title) leaves=\(Self.countLeafPanes(chosen.layout))")
+        dlog("peer.mirror.open host=\(spec.hostKey) workspace=\(chosen.title) leaves=\(Self.countLeafPanes(resolved.layout))")
         #endif
     }
 
@@ -716,6 +725,35 @@ final class PeerClientCoordinator: NSObject {
         }
         applyDividerRatios(host: hostSplit.first, local: localSplit.first, controller: controller)
         applyDividerRatios(host: hostSplit.second, local: localSplit.second, controller: controller)
+    }
+
+    /// Ask the host to spawn the first pane of an empty workspace
+    /// (NewTab targeted by workspace id), then poll the roster until
+    /// the seeded pane shows up. Returns the refreshed workspace, or
+    /// nil when the host never seeded one (old daemon — the field is
+    /// ignored per F8 — or spawn failure); the caller falls back to
+    /// its existing empty-workspace alert.
+    private static func seedEmptyWorkspace(
+        _ workspace: Termmesh_Peer_V1_Workspace,
+        lease: PeerPaneHostLease
+    ) async -> Termmesh_Peer_V1_Workspace? {
+        do {
+            let conn = try await PeerRelaySession.connect(hostSockPath: lease.hostSockPath)
+            defer { Task { await conn.cancel() } }
+            try await conn.session.requestNewTab(workspaceID: workspace.workspaceID)
+            // The daemon applies NewTab asynchronously; poll briefly.
+            for _ in 0..<10 {
+                try await Task.sleep(nanoseconds: 300_000_000)
+                let workspaces = try await conn.session.listWorkspaces()
+                if let updated = workspaces.first(where: { $0.workspaceID == workspace.workspaceID }),
+                   firstLeafPane(updated.layout) != nil {
+                    return updated
+                }
+            }
+            return nil
+        } catch {
+            return nil
+        }
     }
 
     private static func firstLeafPane(

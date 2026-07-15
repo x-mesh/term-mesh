@@ -400,6 +400,20 @@ public actor PeerSession {
         }
     }
 
+    /// Seed the first pane of an EMPTY workspace: the same fire-and-
+    /// forget NewTab write, targeted by workspace id instead of an
+    /// existing pane (multi-workspace hosts spawn an ephemeral shell;
+    /// older hosts ignore the unknown field — F8).
+    public func requestNewTab(workspaceID: Data) async throws {
+        try await sendEnvelope { env in
+            var req = Termmesh_Peer_V1_NewTabRequest()
+            req.workspaceID = workspaceID
+            var ctl = Termmesh_Peer_V1_WorkspaceControl()
+            ctl.newTab = req
+            env.workspaceControl = ctl
+        }
+    }
+
     /// Ask the host to switch the active tab in the bonsplit pane
     /// hosting `paneID` to the tab whose surface is `surfaceID`.
     /// Fire-and-forget; the host pushes the resulting layout via
