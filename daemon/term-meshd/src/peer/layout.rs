@@ -540,23 +540,48 @@ impl Drop for BroadcastGuard {
     }
 }
 
-/// Shared state of one daemon peer host: the PTYs, the layout tree they
-/// are arranged in, and the connections to push layout changes to. This
-/// is what `connection::run` receives instead of a bare `PtyManager`.
+/// One named workspace on a daemon host: its stable id, display name, and
+/// the split tree its surfaces are arranged in. A daemon boots with
+/// exactly one (`DAEMON_WORKSPACE`); the collection exists so a later task
+/// (Create/Rename/Delete workspace RPCs) can grow it without another pass
+/// over this module's locking/broadcast plumbing.
+pub struct WorkspaceEntry {
+    pub id: Vec<u8>,
+    pub name: String,
+    pub store: LayoutStore,
+}
+
+/// Shared state of one daemon peer host: the PTYs, the workspaces they are
+/// arranged into, and the connections to push layout changes to. This is
+/// what `connection::run` receives instead of a bare `PtyManager`.
 ///
 /// Lock discipline (as everywhere in `peer::`): guards never cross an
 /// `.await`, and mutation results are broadcast after unlock. Nesting is
-/// one-directional — the layout guard may wrap the manager's short
-/// internal locks (snapshot reads pane metadata), but no code path takes
-/// the layout lock while holding a manager guard, so the order is
-/// consistent and cannot deadlock.
+/// one-directional — a method may hold `workspaces` and, separately (never
+/// nested), `surface_workspace` — but no code path takes either lock while
+/// holding a manager guard, so the order is consistent and cannot
+/// deadlock.
 pub struct PeerHost {
     pub pty: Arc<PtyManager>,
-    pub layout: Mutex<LayoutStore>,
+    /// Every workspace this host currently serves, keyed by workspace id.
+    /// Invariant: never empty after `new()` returns — `DAEMON_WORKSPACE`
+    /// always exists.
+    pub workspaces: Mutex<HashMap<Vec<u8>, WorkspaceEntry>>,
     pub clients: Arc<Broadcaster>,
+    /// Id of the default (`DAEMON_WORKSPACE`) entry. Stable for the
+    /// daemon's lifetime, so this stays a plain field rather than a
+    /// lookup — `connection.rs`'s `ListWorkspaces`/`WorkspaceControl`
+    /// handlers read it directly, and predate multi-workspace wire support.
     pub workspace_id: Vec<u8>,
+    /// Reverse index from surface id to the workspace whose tree currently
+    /// contains it. `surface_id` is globally unique across all workspaces,
+    /// so this is a simple flat map. Used to route `apply_control`
+    /// mutations and `watch_ephemeral` removals to the right tree without
+    /// scanning every workspace.
+    surface_workspace: Mutex<HashMap<SurfaceId, Vec<u8>>>,
     /// Names split/new-tab surfaces (`split-1`, `split-2`, …). Lifetime
-    /// of this daemon only, like the tree itself.
+    /// of this daemon only, like the tree itself. Host-wide (not
+    /// per-workspace) so ephemeral ids never collide across workspaces.
     ephemeral_counter: AtomicU64,
     /// True while a debounced layout push is pending — collapses a burst
     /// of mutations (divider drags especially) into one push.
@@ -571,15 +596,41 @@ const PUSH_DEBOUNCE: Duration = Duration::from_millis(120);
 
 impl PeerHost {
     pub fn new(pty: Arc<PtyManager>) -> Self {
-        let layout = LayoutStore::balanced_from_surfaces(&pty.list());
+        let surfaces = pty.list();
+        let workspace_id = surface_id_from_name(DAEMON_WORKSPACE);
+        let store = LayoutStore::balanced_from_surfaces(&surfaces);
+        let mut surface_workspace = HashMap::new();
+        for surface in &surfaces {
+            surface_workspace.insert(surface.surface_id.clone(), workspace_id.clone());
+        }
+        let mut workspaces = HashMap::new();
+        workspaces.insert(
+            workspace_id.clone(),
+            WorkspaceEntry { id: workspace_id.clone(), name: DAEMON_WORKSPACE.to_string(), store },
+        );
         Self {
             pty,
-            layout: Mutex::new(layout),
+            workspaces: Mutex::new(workspaces),
             clients: Arc::new(Broadcaster::new()),
-            workspace_id: surface_id_from_name(DAEMON_WORKSPACE),
+            workspace_id,
+            surface_workspace: Mutex::new(surface_workspace),
             ephemeral_counter: AtomicU64::new(1),
             push_scheduled: AtomicBool::new(false),
         }
+    }
+
+    /// Workspace id currently hosting `surface_id`, if any.
+    fn workspace_id_for_surface(&self, surface_id: &[u8]) -> Option<Vec<u8>> {
+        self.surface_workspace.lock().unwrap().get(surface_id).cloned()
+    }
+
+    /// Run `f` against the named workspace's store, if that workspace
+    /// still exists. `None` means the workspace vanished between lookup
+    /// and this call (never happens today — workspaces are never removed
+    /// — but callers treat it the same as "target not found").
+    fn with_store<T>(&self, workspace_id: &[u8], f: impl FnOnce(&mut LayoutStore) -> T) -> Option<T> {
+        let mut workspaces = self.workspaces.lock().unwrap();
+        workspaces.get_mut(workspace_id).map(|entry| f(&mut entry.store))
     }
 
     /// Apply one WorkspaceControl command. Fire-and-forget end to end:
@@ -598,19 +649,9 @@ impl PeerHost {
             Some(Kind::FocusPane(_)) => false,
             Some(Kind::SplitPane(req)) => self.split_pane(&req.pane_id, &req.orientation),
             Some(Kind::ClosePane(req)) => self.close_pane(&req.pane_id),
-            Some(Kind::SetDivider(req)) => self
-                .layout
-                .lock()
-                .unwrap()
-                .set_divider(&req.split_id, req.ratio)
-                .unwrap_or(false),
+            Some(Kind::SetDivider(req)) => self.set_divider(&req.split_id, req.ratio),
             Some(Kind::NewTab(req)) => self.new_tab(&req.pane_id),
-            Some(Kind::ActivateTab(req)) => self
-                .layout
-                .lock()
-                .unwrap()
-                .activate_tab(&req.pane_id, &req.surface_id)
-                .unwrap_or(false),
+            Some(Kind::ActivateTab(req)) => self.activate_tab(&req.pane_id, &req.surface_id),
         };
         if changed {
             self.schedule_layout_push();
@@ -640,19 +681,24 @@ impl PeerHost {
         // Cheap existence probe before paying for a fork. The tree can
         // still change before the insert below — that race is resolved by
         // rolling the spawn back.
-        if !self.layout.lock().unwrap().surface_ids().iter().any(|s| s == pane_id) {
+        let Some(ws_id) = self.workspace_id_for_surface(pane_id) else { return false };
+        if !self
+            .with_store(&ws_id, |store| store.surface_ids().iter().any(|s| s == pane_id))
+            .unwrap_or(false)
+        {
             return false;
         }
         // A dead source pane revives first, same as attach would do — the
         // user is clearly working in it. No-op when it is alive.
         self.pty.get_or_respawn(pane_id);
-        let Some(new_id) = self.spawn_ephemeral(pane_id) else { return false };
-        match self.layout.lock().unwrap().split_pane(pane_id, orientation, new_id.clone()) {
-            Ok(changed) => changed,
-            Err(_) => {
-                // Source pane vanished between probe and insert; don't
-                // leak the shell we spawned for it.
+        let Some(new_id) = self.spawn_ephemeral(pane_id, &ws_id) else { return false };
+        match self.with_store(&ws_id, |store| store.split_pane(pane_id, orientation, new_id.clone())) {
+            Some(Ok(changed)) => changed,
+            _ => {
+                // Source pane (or its workspace) vanished between probe and
+                // insert; don't leak the shell we spawned for it.
                 self.pty.remove(&new_id);
+                self.surface_workspace.lock().unwrap().remove(&new_id);
                 false
             }
         }
@@ -662,36 +708,70 @@ impl PeerHost {
         if self.pty.list().len() >= Self::MAX_PEER_SURFACES {
             return false;
         }
-        if !self.layout.lock().unwrap().surface_ids().iter().any(|s| s == pane_id) {
+        let Some(ws_id) = self.workspace_id_for_surface(pane_id) else { return false };
+        if !self
+            .with_store(&ws_id, |store| store.surface_ids().iter().any(|s| s == pane_id))
+            .unwrap_or(false)
+        {
             return false;
         }
         self.pty.get_or_respawn(pane_id);
-        let Some(new_id) = self.spawn_ephemeral(pane_id) else { return false };
-        match self.layout.lock().unwrap().add_tab(pane_id, new_id.clone()) {
-            Ok(changed) => changed,
-            Err(_) => {
+        let Some(new_id) = self.spawn_ephemeral(pane_id, &ws_id) else { return false };
+        match self.with_store(&ws_id, |store| store.add_tab(pane_id, new_id.clone())) {
+            Some(Ok(changed)) => changed,
+            _ => {
                 self.pty.remove(&new_id);
+                self.surface_workspace.lock().unwrap().remove(&new_id);
                 false
             }
         }
     }
 
     fn close_pane(self: &Arc<Self>, pane_id: &[u8]) -> bool {
-        let removed = match self.layout.lock().unwrap().close_pane(pane_id) {
-            Ok(removed) => removed,
-            // LastPane / NotFound: silent no-op — the client observes
-            // "nothing happened", same as the Swift host.
-            Err(_) => return false,
+        let Some(ws_id) = self.workspace_id_for_surface(pane_id) else { return false };
+        let removed = match self.with_store(&ws_id, |store| store.close_pane(pane_id)) {
+            Some(Ok(removed)) => removed,
+            // LastPane / NotFound / workspace already gone: silent no-op —
+            // the client observes "nothing happened", same as the Swift host.
+            _ => return false,
         };
         // PTYs die outside the layout lock. `PtyManager::remove` decides
         // spec fate: declared surfaces keep theirs (a restart brings them
         // back via TERMMESH_PEER_SURFACES anyway), ephemeral ones lose
         // theirs so a closed split/new-tab pane cannot respawn via a raw
         // AttachSurface for the same id.
+        let mut index = self.surface_workspace.lock().unwrap();
         for sid in removed {
             self.pty.remove(&sid);
+            index.remove(&sid);
         }
+        drop(index);
         true
+    }
+
+    /// `SetDividerPositionRequest` carries only a `split_id`, which is
+    /// unique within one workspace's tree but not across workspaces (each
+    /// `LayoutStore` keeps its own counter) — and the wire has no
+    /// workspace_id to disambiguate with, so there is no reverse index to
+    /// consult. With exactly one workspace ever populated today this is
+    /// moot; once Create-workspace RPCs land this degrades gracefully by
+    /// matching whichever tree's split id hits first.
+    fn set_divider(&self, split_id: &[u8], ratio: f64) -> bool {
+        let mut workspaces = self.workspaces.lock().unwrap();
+        for entry in workspaces.values_mut() {
+            match entry.store.set_divider(split_id, ratio) {
+                Ok(changed) => return changed,
+                Err(_) => continue,
+            }
+        }
+        false
+    }
+
+    fn activate_tab(&self, pane_id: &[u8], surface_id: &[u8]) -> bool {
+        let Some(ws_id) = self.workspace_id_for_surface(pane_id) else { return false };
+        self.with_store(&ws_id, |store| store.activate_tab(pane_id, surface_id))
+            .and_then(|r| r.ok())
+            .unwrap_or(false)
     }
 
     /// Fork a login shell for a split/new-tab pane, inheriting the source
@@ -701,7 +781,7 @@ impl PeerHost {
     /// actually removed (explicit close, or the dead-watcher below), so
     /// closing it is permanent for this daemon lifetime and a raw
     /// `AttachSurface` for the same id can't resurrect it.
-    fn spawn_ephemeral(self: &Arc<Self>, source_pane: &[u8]) -> Option<SurfaceId> {
+    fn spawn_ephemeral(self: &Arc<Self>, source_pane: &[u8], workspace_id: &[u8]) -> Option<SurfaceId> {
         let cwd = self
             .pty
             .list()
@@ -731,6 +811,10 @@ impl PeerHost {
         // register_and_spawn_ephemeral logs-and-continues on failure; only
         // report a surface that actually exists.
         let surface = self.pty.list().into_iter().find(|s| s.surface_id == surface_id)?;
+        self.surface_workspace
+            .lock()
+            .unwrap()
+            .insert(surface_id.clone(), workspace_id.to_vec());
         self.watch_ephemeral(surface);
         Some(surface_id)
     }
@@ -755,11 +839,17 @@ impl PeerHost {
                 notified.await;
             }
             let Some(host) = host.upgrade() else { return };
-            let removed = host.layout.lock().unwrap().remove_surface(&sid);
+            // Route the removal to whichever workspace's tree currently
+            // holds this surface (the reverse index), not always the
+            // default — a dead ephemeral pane can belong to any workspace.
+            let Some(ws_id) = host.workspace_id_for_surface(&sid) else { return };
+            let removed = host.with_store(&ws_id, |store| store.remove_surface(&sid)).unwrap_or(false);
             if removed {
                 // Out of the tree → out of the roster (it is already dead;
-                // remove only drops the map entry and re-signals a corpse).
+                // remove only drops the map entry and re-signals a corpse)
+                // and out of the reverse index.
                 host.pty.remove(&sid);
+                host.surface_workspace.lock().unwrap().remove(&sid);
                 host.schedule_layout_push();
             }
         });
@@ -787,19 +877,42 @@ impl PeerHost {
         });
     }
 
-    /// Wire snapshot of the current tree. Reseeds first when the tree is
-    /// empty but surfaces exist — covers hosts whose manager was populated
-    /// after construction (the test harness does this; production spawns
-    /// surfaces before `PeerHost::new`).
+    /// Wire snapshot of the default workspace's tree. Reseeds first when
+    /// that tree is empty but surfaces exist — covers hosts whose manager
+    /// was populated after construction (the test harness does this;
+    /// production spawns surfaces before `PeerHost::new`).
     pub fn layout_snapshot(&self) -> Option<WorkspaceLayout> {
-        let mut layout = self.layout.lock().unwrap();
-        if layout.is_empty() {
+        let needs_reseed = self
+            .workspaces
+            .lock()
+            .unwrap()
+            .get(&self.workspace_id)
+            .map(|entry| entry.store.is_empty())
+            .unwrap_or(false);
+        if needs_reseed {
             let surfaces = self.pty.list();
             if !surfaces.is_empty() {
-                *layout = LayoutStore::balanced_from_surfaces(&surfaces);
+                {
+                    let mut workspaces = self.workspaces.lock().unwrap();
+                    if let Some(entry) = workspaces.get_mut(&self.workspace_id) {
+                        if entry.store.is_empty() {
+                            entry.store = LayoutStore::balanced_from_surfaces(&surfaces);
+                        }
+                    }
+                }
+                let mut index = self.surface_workspace.lock().unwrap();
+                for surface in &surfaces {
+                    index
+                        .entry(surface.surface_id.clone())
+                        .or_insert_with(|| self.workspace_id.clone());
+                }
             }
         }
-        layout.snapshot_proto(&self.pty)
+        self.workspaces
+            .lock()
+            .unwrap()
+            .get(&self.workspace_id)
+            .and_then(|entry| entry.store.snapshot_proto(&self.pty))
     }
 }
 
@@ -818,6 +931,11 @@ mod tests {
         let ids: Vec<SurfaceId> = names.iter().map(|n| sid(n)).collect();
         store.root = store.build_balanced(&ids, 0);
         store
+    }
+
+    /// Surface ids currently in `host`'s default workspace tree.
+    fn default_surface_ids(host: &PeerHost) -> Vec<SurfaceId> {
+        host.workspaces.lock().unwrap().get(&host.workspace_id).unwrap().store.surface_ids()
     }
 
     fn split_ids(store: &LayoutStore) -> Vec<Vec<u8>> {
@@ -1075,7 +1193,7 @@ mod tests {
         .expect("spawn /bin/cat");
         manager.insert_surface(base);
         let host = Arc::new(PeerHost::new(manager));
-        assert_eq!(host.layout.lock().unwrap().surface_ids().len(), 1);
+        assert_eq!(default_surface_ids(&host).len(), 1);
 
         host.apply_control(WorkspaceControl {
             kind: Some(workspace_control::Kind::SplitPane(peer_proto::v1::SplitPaneRequest {
@@ -1083,7 +1201,7 @@ mod tests {
                 orientation: "horizontal".into(),
             })),
         });
-        assert_eq!(host.layout.lock().unwrap().surface_ids().len(), 2, "split landed");
+        assert_eq!(default_surface_ids(&host).len(), 2, "split landed");
 
         // The ephemeral shell "exits": SIGHUP → PTY reader EOF →
         // dead_notify → watcher prunes the pane.
@@ -1097,13 +1215,13 @@ mod tests {
 
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
         loop {
-            if host.layout.lock().unwrap().surface_ids() == vec![sid("base")] {
+            if default_surface_ids(&host) == vec![sid("base")] {
                 break;
             }
             assert!(
                 tokio::time::Instant::now() < deadline,
                 "watcher never pruned the dead ephemeral pane; tree = {:?}",
-                host.layout.lock().unwrap().surface_ids()
+                default_surface_ids(&host)
             );
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
@@ -1125,5 +1243,144 @@ mod tests {
             }
             other => panic!("expected split root, got {other:?}"),
         }
+    }
+
+    // ---- M1: workspace collection ----------------------------------
+
+    /// A freshly booted host always has exactly one workspace — the
+    /// default (`DAEMON_WORKSPACE`) — matching the pre-M1 single-workspace
+    /// behavior, just expressed through the collection now.
+    #[test]
+    fn default_workspace_exists_after_boot() {
+        let manager = Arc::new(PtyManager::new());
+        let host = PeerHost::new(manager);
+
+        let workspaces = host.workspaces.lock().unwrap();
+        assert_eq!(workspaces.len(), 1);
+        let entry = workspaces.get(&host.workspace_id).expect("default workspace present");
+        assert_eq!(entry.id, host.workspace_id);
+        assert_eq!(entry.name, DAEMON_WORKSPACE);
+        assert_eq!(host.workspace_id, surface_id_from_name(DAEMON_WORKSPACE));
+    }
+
+    /// Booting with surfaces already registered seeds the default
+    /// workspace's tree AND the surface→workspace reverse index for every
+    /// one of them — the index is not an afterthought populated lazily.
+    #[tokio::test]
+    async fn boot_seeds_reverse_index_for_declared_surfaces() {
+        let manager = Arc::new(PtyManager::new());
+        let base = PtySurface::spawn(sid("base"), "cat".into(), "/bin/cat", &[], 80, 24, None)
+            .expect("spawn /bin/cat");
+        manager.insert_surface(base);
+        let host = PeerHost::new(Arc::clone(&manager));
+
+        assert_eq!(host.workspace_id_for_surface(&sid("base")), Some(host.workspace_id.clone()));
+        assert_eq!(host.workspace_id_for_surface(&sid("ghost")), None);
+    }
+
+    /// With multiple workspace entries present, the reverse index must
+    /// resolve each surface to the workspace that actually owns it, not
+    /// always the default — this is the routing primitive `apply_control`
+    /// and `watch_ephemeral` depend on.
+    #[test]
+    fn reverse_index_resolves_correct_workspace_across_entries() {
+        let manager = Arc::new(PtyManager::new());
+        let host = PeerHost::new(manager);
+
+        // Manually add a second workspace and wire the reverse index for a
+        // surface homed there. Production only ever creates the default
+        // workspace at boot (Create-workspace RPCs are a later task); this
+        // simulates the resulting shape directly.
+        let ws2_id = surface_id_from_name("second");
+        {
+            let mut workspaces = host.workspaces.lock().unwrap();
+            let store2 = store_with(&["x"]);
+            workspaces.insert(
+                ws2_id.clone(),
+                WorkspaceEntry { id: ws2_id.clone(), name: "second".into(), store: store2 },
+            );
+        }
+        host.surface_workspace.lock().unwrap().insert(sid("x"), ws2_id.clone());
+
+        assert_eq!(host.workspaces.lock().unwrap().len(), 2);
+        assert_eq!(host.workspace_id_for_surface(&sid("x")), Some(ws2_id.clone()));
+        assert_eq!(host.workspace_id_for_surface(&sid("nowhere")), None);
+        assert_ne!(ws2_id, host.workspace_id);
+    }
+
+    /// Multi-workspace regression: `watch_ephemeral` must prune the dead
+    /// pane from the workspace that actually owns it (via the reverse
+    /// index), not always the default — and must leave every other
+    /// workspace's tree, and the reverse index entries for its own
+    /// surfaces, untouched.
+    #[tokio::test]
+    async fn watch_ephemeral_prunes_only_the_owning_workspace() {
+        let manager = Arc::new(PtyManager::new());
+        let base_a = PtySurface::spawn(sid("base-a"), "cat".into(), "/bin/cat", &[], 80, 24, None)
+            .expect("spawn base-a");
+        manager.insert_surface(base_a);
+        let host = Arc::new(PeerHost::new(Arc::clone(&manager)));
+        // Default workspace was seeded from the manager's contents at
+        // construction time — base-a only.
+
+        let base_b = PtySurface::spawn(sid("base-b"), "cat".into(), "/bin/cat", &[], 80, 24, None)
+            .expect("spawn base-b");
+        manager.insert_surface(base_b);
+
+        // Second workspace, manually populated with base-b — stands in for
+        // a future Create/attach-workspace RPC not built in this task.
+        let ws2_id = surface_id_from_name("second");
+        {
+            let mut workspaces = host.workspaces.lock().unwrap();
+            let surfaces_b: Vec<_> =
+                manager.list().into_iter().filter(|s| s.surface_id == sid("base-b")).collect();
+            let store2 = LayoutStore::balanced_from_surfaces(&surfaces_b);
+            workspaces.insert(
+                ws2_id.clone(),
+                WorkspaceEntry { id: ws2_id.clone(), name: "second".into(), store: store2 },
+            );
+        }
+        host.surface_workspace.lock().unwrap().insert(sid("base-b"), ws2_id.clone());
+
+        let ephemeral_id =
+            host.spawn_ephemeral(&sid("base-b"), &ws2_id).expect("spawn ephemeral in ws2");
+        {
+            let mut workspaces = host.workspaces.lock().unwrap();
+            workspaces
+                .get_mut(&ws2_id)
+                .unwrap()
+                .store
+                .split_pane(&sid("base-b"), Orientation::Horizontal, ephemeral_id.clone())
+                .unwrap();
+        }
+
+        let ephemeral_surface = manager
+            .list()
+            .into_iter()
+            .find(|s| s.surface_id == ephemeral_id)
+            .expect("ephemeral surface exists");
+        ephemeral_surface.hangup();
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let ws2_ids = host.workspaces.lock().unwrap().get(&ws2_id).unwrap().store.surface_ids();
+            if ws2_ids == vec![sid("base-b")] {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "watcher never pruned ws2's ephemeral pane; ws2 tree = {ws2_ids:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        // Default workspace's tree (base-a only) is untouched.
+        assert_eq!(default_surface_ids(&host), vec![sid("base-a")]);
+        // Reverse index entry for the pruned surface is gone; base-a's and
+        // base-b's own entries are untouched.
+        let index = host.surface_workspace.lock().unwrap();
+        assert!(!index.contains_key(&ephemeral_id));
+        assert_eq!(index.get(&sid("base-a")), Some(&host.workspace_id));
+        assert_eq!(index.get(&sid("base-b")), Some(&ws2_id));
     }
 }

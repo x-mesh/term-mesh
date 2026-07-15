@@ -2095,4 +2095,90 @@ mod integration_tests {
             }
         }
     }
+
+    // ---- M2 workspace-lifecycle wire (proto-only; handlers land in a later task) ----
+
+    /// F8 regression: M2 adds `CreateWorkspaceRequest`/`RenameWorkspaceRequest`/
+    /// `DeleteWorkspaceRequest` Envelope payloads gated behind capability
+    /// "workspace.lifecycle.v1", but intentionally ships wire definitions
+    /// only -- connection.rs has no handler arm for them yet (that's a
+    /// separate task). A daemon in that state must fall through the
+    /// Ready-state catch-all (`(HandshakeState::Ready, other) => { debug!
+    /// (...) }`) and keep the connection alive, exactly like it already
+    /// does for any other payload type it doesn't recognize. This proves
+    /// the new proto fields are safe to ship ahead of the handlers: an
+    /// old/partial daemon receiving one from a newer client neither
+    /// errors out nor drops the socket.
+    #[tokio::test]
+    async fn unhandled_workspace_lifecycle_payload_does_not_break_connection() {
+        use peer_proto::v1::{CreateWorkspaceRequest, Ping, Pong};
+
+        let tmp = TempDir::new().unwrap();
+        let sock_path = tmp.path().join("peer.sock");
+        let manager = Arc::new(PtyManager::new());
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let sock_path_task = sock_path.clone();
+        let server_task = tokio::spawn(async move {
+            serve_with_manager(sock_path_task, shutdown_rx, manager)
+                .await
+                .unwrap();
+        });
+        for _ in 0..50 {
+            if sock_path.exists() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+
+        let (mut reader, mut writer) = handshake(&sock_path).await;
+
+        // A brand-new (M2) Envelope payload this daemon build's
+        // connection.rs has no handler arm for yet.
+        write_envelope(
+            &mut writer,
+            &Envelope {
+                seq: 3,
+                correlation_id: 0,
+                payload: Some(Payload::CreateWorkspaceRequest(CreateWorkspaceRequest {
+                    title: "unhandled-probe".into(),
+                })),
+            },
+        )
+        .await
+        .unwrap();
+
+        // The connection must survive: a subsequent Ping still gets a
+        // Pong, proving the unhandled payload fell through the catch-all
+        // arm instead of erroring the reader loop or dropping the socket.
+        write_envelope(
+            &mut writer,
+            &Envelope {
+                seq: 4,
+                correlation_id: 0,
+                payload: Some(Payload::Ping(Ping { nonce: 424242 })),
+            },
+        )
+        .await
+        .unwrap();
+
+        let reply = tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            read_envelope(&mut reader),
+        )
+        .await
+        .expect("connection died / timed out after unhandled workspace-lifecycle payload")
+        .expect("read_envelope failed after unhandled workspace-lifecycle payload");
+        match reply.payload {
+            Some(Payload::Pong(Pong { nonce })) => assert_eq!(nonce, 424242),
+            other => panic!(
+                "expected Pong after unhandled CreateWorkspaceRequest, got {other:?} \
+                 -- connection.rs's Ready-state catch-all did not pass through cleanly"
+            ),
+        }
+
+        drop(reader);
+        drop(writer);
+        shutdown_tx.send(true).unwrap();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(3), server_task).await;
+    }
 }

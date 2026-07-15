@@ -36,11 +36,24 @@ pub mod capability {
     /// gained this after shipping without it, so a client that wants to
     /// grey out pane controls against an older daemon can key off this.
     pub const WORKSPACE_CONTROL_V1: &str = "workspace.control.v1";
+    /// The host supports workspace-level lifecycle RPCs:
+    /// `CreateWorkspaceRequest`/`Response`, `RenameWorkspaceRequest`,
+    /// `DeleteWorkspaceRequest`, and the `WorkspaceRemoved` push (see
+    /// `proto/peer/v1/peer.proto`'s "Workspace lifecycle" section). A
+    /// client should not send these payloads to a peer that hasn't
+    /// advertised this — older daemons silently drop them via the
+    /// Ready-state unhandled-payload path instead of acting on them.
+    pub const WORKSPACE_LIFECYCLE_V1: &str = "workspace.lifecycle.v1";
 
     /// Every capability this build supports. Single source of truth for
     /// populating outgoing `Hello.capabilities` — callers should use
     /// [`supported_vec`] rather than hand-rolling the list.
-    pub const SUPPORTED: &[&str] = &[PTYDATA_COALESCE_V1, REPLAY_RING_V1, WORKSPACE_CONTROL_V1];
+    pub const SUPPORTED: &[&str] = &[
+        PTYDATA_COALESCE_V1,
+        REPLAY_RING_V1,
+        WORKSPACE_CONTROL_V1,
+        WORKSPACE_LIFECYCLE_V1,
+    ];
 
     /// `Hello.capabilities` value for an outgoing handshake message.
     pub fn supported_vec() -> Vec<String> {
