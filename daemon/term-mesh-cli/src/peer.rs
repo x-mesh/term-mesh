@@ -14,6 +14,7 @@ use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc};
+use std::time::{Duration, Instant};
 
 use peer_proto::v1::envelope::Payload;
 use peer_proto::v1::{
@@ -400,6 +401,400 @@ pub fn attach_cmd(socket_path: &Path, name: Option<&str>) -> anyhow::Result<()> 
         eprintln!("[peer] detached.");
     }
     Ok(())
+}
+
+// ── benchmark (P8 measurement harness) ────────────────────────────
+//
+// Measures peer-relay latency/throughput so the P8 transport question
+// (is the SSH tunnel a meaningful cost on LAN?) can be decided from
+// numbers instead of estimates. See docs/peer-p8-measurement.md.
+//
+// This is NOT an interactive client: no raw mode, no SIGWINCH. It drives
+// the remote surface programmatically and prints metrics as JSON (--json)
+// or a human table. The SSH-vs-direct comparison is done by pointing it at
+// different sockets (a forwarded `ssh -L` socket vs the host's real one),
+// so this code contains no transport logic of its own.
+
+/// Which measurements to run.
+#[derive(Clone, Copy)]
+enum BenchMode {
+    /// Input→echo round-trip through the remote PTY (felt typing latency).
+    Rtt,
+    /// Ping/Pong round-trip (pure wire+framing, no PTY echo).
+    Wire,
+    /// Large host→client burst, measured as bytes/sec.
+    Throughput,
+    /// All of the above.
+    All,
+}
+
+impl BenchMode {
+    fn parse(s: &str) -> anyhow::Result<Self> {
+        match s {
+            "rtt" => Ok(BenchMode::Rtt),
+            "wire" => Ok(BenchMode::Wire),
+            "throughput" | "tput" => Ok(BenchMode::Throughput),
+            "all" => Ok(BenchMode::All),
+            other => anyhow::bail!("unknown bench mode {other:?} (rtt|wire|throughput|all)"),
+        }
+    }
+    fn wants_wire(self) -> bool {
+        matches!(self, BenchMode::Wire | BenchMode::All)
+    }
+    fn wants_rtt(self) -> bool {
+        matches!(self, BenchMode::Rtt | BenchMode::All)
+    }
+    fn wants_throughput(self) -> bool {
+        matches!(self, BenchMode::Throughput | BenchMode::All)
+    }
+}
+
+#[derive(Default)]
+struct BenchResults {
+    wire_ms: Option<Vec<f64>>,
+    rtt_ms: Option<Vec<f64>>,
+    /// (bytes, seconds)
+    throughput: Option<(u64, f64)>,
+}
+
+/// (min, p50, p95, p99, max, n) over a non-empty sample set.
+fn stats(samples: &[f64]) -> Option<(f64, f64, f64, f64, f64, usize)> {
+    if samples.is_empty() {
+        return None;
+    }
+    let mut v = samples.to_vec();
+    v.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let n = v.len();
+    let pick = |q: f64| v[(((n - 1) as f64) * q).round() as usize];
+    Some((v[0], pick(0.50), pick(0.95), pick(0.99), v[n - 1], n))
+}
+
+impl BenchResults {
+    fn print(&self, socket_path: &Path, json: bool) {
+        if json {
+            let mut parts: Vec<String> = Vec::new();
+            parts.push(format!("\"socket\":{:?}", socket_path.display().to_string()));
+            let stat_json = |label: &str, s: &Option<Vec<f64>>| -> Option<String> {
+                let (min, p50, p95, p99, max, n) = stats(s.as_deref()?)?;
+                Some(format!(
+                    "\"{label}\":{{\"min_ms\":{min:.3},\"p50_ms\":{p50:.3},\"p95_ms\":{p95:.3},\"p99_ms\":{p99:.3},\"max_ms\":{max:.3},\"n\":{n}}}"
+                ))
+            };
+            if let Some(j) = stat_json("wire_ms", &self.wire_ms) {
+                parts.push(j);
+            }
+            if let Some(j) = stat_json("rtt_ms", &self.rtt_ms) {
+                parts.push(j);
+            }
+            if let Some((bytes, secs)) = self.throughput {
+                let mbps = if secs > 0.0 {
+                    (bytes as f64) / secs / 1_000_000.0
+                } else {
+                    0.0
+                };
+                parts.push(format!(
+                    "\"throughput\":{{\"bytes\":{bytes},\"secs\":{secs:.4},\"mb_per_s\":{mbps:.3}}}"
+                ));
+            }
+            println!("{{{}}}", parts.join(","));
+            return;
+        }
+
+        println!("peer bench — {}", socket_path.display());
+        let print_stat = |label: &str, s: &Option<Vec<f64>>| {
+            if let Some((min, p50, p95, p99, max, n)) = s.as_deref().and_then(stats) {
+                println!(
+                    "  {label:<10} n={n:<4} min={min:6.2}  p50={p50:6.2}  p95={p95:6.2}  p99={p99:6.2}  max={max:7.2}   (ms)"
+                );
+            }
+        };
+        print_stat("wire", &self.wire_ms);
+        print_stat("rtt", &self.rtt_ms);
+        if let Some((bytes, secs)) = self.throughput {
+            let mbps = if secs > 0.0 {
+                (bytes as f64) / secs / 1_000_000.0
+            } else {
+                0.0
+            };
+            println!("  throughput  {bytes} bytes in {secs:.3}s = {mbps:.2} MB/s");
+        }
+    }
+}
+
+pub fn bench_cmd(
+    socket_path: &Path,
+    mode: &str,
+    iterations: usize,
+    name: Option<&str>,
+    json: bool,
+) -> anyhow::Result<()> {
+    let mode = BenchMode::parse(mode)?;
+    let mut results = BenchResults::default();
+
+    // Wire RTT needs only the handshake — no attach.
+    if mode.wants_wire() {
+        let (mut read_stream, mut write_stream, seq, _caps) =
+            connect_and_authenticate(socket_path, /* emit_banners */ false)?;
+        read_stream.set_read_timeout(Some(Duration::from_secs(10))).ok();
+        results.wire_ms = Some(bench_wire(&mut read_stream, &mut write_stream, &seq, iterations)?);
+        let _ = write_envelope(&mut write_stream, &goodbye_env(&seq, "bench wire done"));
+    }
+
+    // RTT + throughput need an attached surface.
+    if mode.wants_rtt() || mode.wants_throughput() {
+        let (mut read_stream, mut write_stream, seq, _caps) =
+            connect_and_authenticate(socket_path, /* emit_banners */ false)?;
+        let surface_id = perform_attach(&mut read_stream, &mut write_stream, &seq, name)?;
+
+        // Reader thread forwards raw PtyData payload bytes; timing is stamped
+        // on the main thread when a marker is observed (same-process channel
+        // transfer is negligible relative to the network round-trips measured).
+        let (tx, rx) = mpsc::channel::<Vec<u8>>();
+        let reader_handle = std::thread::spawn(move || loop {
+            match read_envelope(&mut read_stream) {
+                Ok(env) => match env.payload {
+                    Some(Payload::PtyData(p)) => {
+                        if tx.send(p.payload).is_err() {
+                            break;
+                        }
+                    }
+                    Some(Payload::Goodbye(_)) | Some(Payload::Error(_)) => break,
+                    _ => {}
+                },
+                Err(_) => break,
+            }
+        });
+
+        if mode.wants_rtt() {
+            results.rtt_ms =
+                Some(bench_rtt(&mut write_stream, &seq, &surface_id, &rx, iterations)?);
+        }
+        if mode.wants_throughput() {
+            results.throughput =
+                Some(bench_throughput(&mut write_stream, &seq, &surface_id, &rx)?);
+        }
+
+        let _ = write_envelope(&mut write_stream, &goodbye_env(&seq, "bench done"));
+        drop(write_stream);
+        let _ = reader_handle.join();
+    }
+
+    results.print(socket_path, json);
+    Ok(())
+}
+
+fn perform_attach(
+    read_stream: &mut UnixStream,
+    write_stream: &mut UnixStream,
+    seq: &AtomicU64,
+    name: Option<&str>,
+) -> anyhow::Result<Vec<u8>> {
+    let surfaces = list_surfaces(read_stream, write_stream, seq)?;
+    let chosen = match name {
+        Some(n) => {
+            let n_lower = n.to_ascii_lowercase();
+            surfaces
+                .iter()
+                .find(|s| s.title == n || hex_short(&s.surface_id).starts_with(&n_lower))
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("surface \"{n}\" not found on host"))?
+        }
+        None => surfaces
+            .first()
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("host reports no attachable surfaces"))?,
+    };
+    let (cols, rows) = term_size().unwrap_or((DEFAULT_COLS, DEFAULT_ROWS));
+    write_envelope(
+        write_stream,
+        &Envelope {
+            seq: next_seq(seq),
+            correlation_id: 0,
+            payload: Some(Payload::AttachSurface(AttachSurface {
+                surface_id: chosen.surface_id.clone(),
+                mode: AttachMode::CoWrite as i32,
+                client_cols: cols,
+                client_rows: rows,
+                resume_from_seq: 0,
+            })),
+        },
+    )?;
+    match read_envelope(read_stream)?.payload {
+        Some(Payload::AttachResult(r)) if r.accepted => Ok(chosen.surface_id),
+        Some(Payload::AttachResult(r)) => anyhow::bail!("attach rejected: {}", r.reason),
+        other => anyhow::bail!("expected AttachResult, got {other:?}"),
+    }
+}
+
+fn bench_wire(
+    read_stream: &mut UnixStream,
+    write_stream: &mut UnixStream,
+    seq: &AtomicU64,
+    iterations: usize,
+) -> anyhow::Result<Vec<f64>> {
+    const WARMUP: usize = 3;
+    let mut samples = Vec::with_capacity(iterations);
+    for i in 0..(iterations + WARMUP) {
+        let nonce = next_seq(seq);
+        let t0 = Instant::now();
+        write_envelope(
+            write_stream,
+            &Envelope {
+                seq: next_seq(seq),
+                correlation_id: 0,
+                payload: Some(Payload::Ping(peer_proto::v1::Ping { nonce })),
+            },
+        )?;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if Instant::now() > deadline {
+                anyhow::bail!("wire ping {nonce} timed out");
+            }
+            match read_envelope(read_stream)?.payload {
+                Some(Payload::Pong(p)) if p.nonce == nonce => {
+                    if i >= WARMUP {
+                        samples.push(t0.elapsed().as_secs_f64() * 1000.0);
+                    }
+                    break;
+                }
+                _ => continue,
+            }
+        }
+    }
+    Ok(samples)
+}
+
+fn bench_rtt(
+    write_stream: &mut UnixStream,
+    seq: &AtomicU64,
+    surface_id: &[u8],
+    rx: &mpsc::Receiver<Vec<u8>>,
+    iterations: usize,
+) -> anyhow::Result<Vec<f64>> {
+    const WARMUP: usize = 3;
+    // Let the attach viewport snapshot drain before the first sample.
+    drain(rx);
+    std::thread::sleep(Duration::from_millis(200));
+    drain(rx);
+
+    let mut samples = Vec::with_capacity(iterations);
+    for i in 0..(iterations + WARMUP) {
+        // Unique, alphanumeric-only token so ANSI/interleaved echo (e.g. zsh
+        // syntax highlighting) can be tolerated via alphanumeric filtering.
+        let token = format!("TMBR{}Q{}", i, next_seq(seq));
+        let needle = token.as_bytes().to_vec();
+        drain(rx);
+        let t0 = Instant::now();
+        send_keys(write_stream, seq, surface_id, token.as_bytes())?;
+
+        let mut acc: Vec<u8> = Vec::new();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut found = false;
+        while Instant::now() < deadline {
+            match rx.recv_timeout(Duration::from_millis(200)) {
+                Ok(bytes) => {
+                    acc.extend(bytes.iter().filter(|b| b.is_ascii_alphanumeric()));
+                    if contains(&acc, &needle) {
+                        if i >= WARMUP {
+                            samples.push(t0.elapsed().as_secs_f64() * 1000.0);
+                        }
+                        found = true;
+                        break;
+                    }
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    anyhow::bail!("host disconnected during rtt bench")
+                }
+            }
+        }
+        if !found && i >= WARMUP {
+            eprintln!("[bench] rtt sample {i} timed out (no echo observed)");
+        }
+        // Clear the remote input line so it doesn't accumulate between samples.
+        send_keys(write_stream, seq, surface_id, b"\x15")?;
+        std::thread::sleep(Duration::from_millis(30));
+    }
+    if samples.is_empty() {
+        anyhow::bail!(
+            "no rtt samples — echo never observed. Is the surface a shell with terminal echo on?"
+        );
+    }
+    Ok(samples)
+}
+
+fn bench_throughput(
+    write_stream: &mut UnixStream,
+    seq: &AtomicU64,
+    surface_id: &[u8],
+    rx: &mpsc::Receiver<Vec<u8>>,
+) -> anyhow::Result<(u64, f64)> {
+    drain(rx);
+    // ~589 KB of host→client output. Marker-free: we time from the first
+    // output byte to the last, detecting burst end by a 400ms idle gap. Both
+    // A/B conditions measure identically so the comparison stays fair.
+    send_keys(write_stream, seq, surface_id, b"seq 1 100000\r")?;
+
+    let first = match rx.recv_timeout(Duration::from_secs(10)) {
+        Ok(b) => b,
+        Err(_) => anyhow::bail!("throughput: no output within 10s"),
+    };
+    let t0 = Instant::now();
+    let mut total = first.len() as u64;
+    let mut last = Instant::now();
+    loop {
+        match rx.recv_timeout(Duration::from_millis(400)) {
+            Ok(b) => {
+                total += b.len() as u64;
+                last = Instant::now();
+            }
+            Err(_) => break, // idle gap ⇒ burst finished (or disconnect)
+        }
+    }
+    let secs = last.saturating_duration_since(t0).as_secs_f64();
+    Ok((total, secs))
+}
+
+fn send_keys(
+    write_stream: &mut UnixStream,
+    seq: &AtomicU64,
+    surface_id: &[u8],
+    bytes: &[u8],
+) -> io::Result<()> {
+    write_envelope(
+        write_stream,
+        &Envelope {
+            seq: next_seq(seq),
+            correlation_id: 0,
+            payload: Some(Payload::Input(Input {
+                surface_id: surface_id.to_vec(),
+                kind: Some(peer_proto::v1::input::Kind::Keys(bytes.to_vec())),
+            })),
+        },
+    )
+}
+
+fn goodbye_env(seq: &AtomicU64, reason: &str) -> Envelope {
+    Envelope {
+        seq: next_seq(seq),
+        correlation_id: 0,
+        payload: Some(Payload::Goodbye(Goodbye {
+            reason: reason.into(),
+        })),
+    }
+}
+
+/// Discard any already-buffered PtyData without blocking.
+fn drain(rx: &mpsc::Receiver<Vec<u8>>) {
+    while rx.try_recv().is_ok() {}
+}
+
+/// Contiguous-subslice search.
+fn contains(haystack: &[u8], needle: &[u8]) -> bool {
+    if needle.is_empty() || haystack.len() < needle.len() {
+        return false;
+    }
+    haystack.windows(needle.len()).any(|w| w == needle)
 }
 
 // ── framing (sync) ────────────────────────────────────────────────
