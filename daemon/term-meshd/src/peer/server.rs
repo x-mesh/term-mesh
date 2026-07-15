@@ -35,6 +35,10 @@ pub async fn serve(path: PathBuf, shutdown_rx: watch::Receiver<bool>) -> anyhow:
     let default_name_fallback = connection::hostname_or(DAEMON_WORKSPACE);
     let entries = persist::boot(&workspaces_path, &default_name_fallback);
     let host = Arc::new(PeerHost::with_workspaces(manager, entries));
+    // M2: create/rename/delete workspace-lifecycle RPCs persist through
+    // this path — wired here (rather than baked into `with_workspaces`)
+    // so that constructor stays I/O-free for every test/embedder caller.
+    host.set_persist_path(workspaces_path);
     serve_with_host(path, shutdown_rx, host).await
 }
 
@@ -2129,22 +2133,19 @@ mod integration_tests {
         }
     }
 
-    // ---- M2 workspace-lifecycle wire (proto-only; handlers land in a later task) ----
+    // ---- M2 workspace-lifecycle wire (handlers now live in this build) ----
 
-    /// F8 regression: M2 adds `CreateWorkspaceRequest`/`RenameWorkspaceRequest`/
-    /// `DeleteWorkspaceRequest` Envelope payloads gated behind capability
-    /// "workspace.lifecycle.v1", but intentionally ships wire definitions
-    /// only -- connection.rs has no handler arm for them yet (that's a
-    /// separate task). A daemon in that state must fall through the
-    /// Ready-state catch-all (`(HandshakeState::Ready, other) => { debug!
-    /// (...) }`) and keep the connection alive, exactly like it already
-    /// does for any other payload type it doesn't recognize. This proves
-    /// the new proto fields are safe to ship ahead of the handlers: an
-    /// old/partial daemon receiving one from a newer client neither
-    /// errors out nor drops the socket.
+    /// M2 handler-arrival regression: `CreateWorkspaceRequest` used to fall
+    /// through the Ready-state catch-all because connection.rs had no
+    /// handler arm for it yet (see this test's pre-M2 history: it used to
+    /// assert the OPPOSITE — that the payload was silently ignored). Now
+    /// that the handler is wired up, the daemon must answer with an
+    /// accepted `CreateWorkspaceResponse` carrying a fresh workspace_id,
+    /// and the connection must stay perfectly healthy afterward — proven
+    /// by a normal Ping/Pong round trip immediately following it.
     #[tokio::test]
-    async fn unhandled_workspace_lifecycle_payload_does_not_break_connection() {
-        use peer_proto::v1::{CreateWorkspaceRequest, Ping, Pong};
+    async fn create_workspace_request_is_now_handled_and_connection_stays_healthy() {
+        use peer_proto::v1::{CreateWorkspaceRequest, CreateWorkspaceResponse, Ping, Pong};
 
         let tmp = TempDir::new().unwrap();
         let sock_path = tmp.path().join("peer.sock");
@@ -2165,24 +2166,33 @@ mod integration_tests {
 
         let (mut reader, mut writer) = handshake(&sock_path).await;
 
-        // A brand-new (M2) Envelope payload this daemon build's
-        // connection.rs has no handler arm for yet.
         write_envelope(
             &mut writer,
             &Envelope {
                 seq: 3,
                 correlation_id: 0,
                 payload: Some(Payload::CreateWorkspaceRequest(CreateWorkspaceRequest {
-                    title: "unhandled-probe".into(),
+                    title: "handled-probe".into(),
                 })),
             },
         )
         .await
         .unwrap();
+        let create_reply = read_envelope(&mut reader).await.unwrap();
+        match create_reply.payload {
+            Some(Payload::CreateWorkspaceResponse(CreateWorkspaceResponse {
+                accepted,
+                workspace_id,
+                ..
+            })) => {
+                assert!(accepted, "CreateWorkspaceRequest must now be accepted");
+                assert!(!workspace_id.is_empty(), "a real workspace_id must be assigned");
+            }
+            other => panic!("expected CreateWorkspaceResponse, got {other:?}"),
+        }
 
-        // The connection must survive: a subsequent Ping still gets a
-        // Pong, proving the unhandled payload fell through the catch-all
-        // arm instead of erroring the reader loop or dropping the socket.
+        // The connection must stay healthy: a subsequent Ping still gets a
+        // Pong right after.
         write_envelope(
             &mut writer,
             &Envelope {
@@ -2199,18 +2209,476 @@ mod integration_tests {
             read_envelope(&mut reader),
         )
         .await
-        .expect("connection died / timed out after unhandled workspace-lifecycle payload")
-        .expect("read_envelope failed after unhandled workspace-lifecycle payload");
+        .expect("connection died / timed out after CreateWorkspaceRequest")
+        .expect("read_envelope failed after CreateWorkspaceRequest");
         match reply.payload {
             Some(Payload::Pong(Pong { nonce })) => assert_eq!(nonce, 424242),
-            other => panic!(
-                "expected Pong after unhandled CreateWorkspaceRequest, got {other:?} \
-                 -- connection.rs's Ready-state catch-all did not pass through cleanly"
-            ),
+            other => panic!("expected Pong after CreateWorkspaceRequest, got {other:?}"),
         }
 
         drop(reader);
         drop(writer);
+        shutdown_tx.send(true).unwrap();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(3), server_task).await;
+    }
+
+    /// Like `next_layout_push`, but also returns the workspace_id the push
+    /// was stamped with, and skips a transient empty-layout push (e.g. the
+    /// one `CreateWorkspaceRequest` itself schedules for a still pane-less
+    /// workspace) so callers reliably observe the push that actually
+    /// carries the pane/tree change they triggered.
+    async fn next_scoped_layout_push(
+        reader: &mut TestReadHalf,
+        window: std::time::Duration,
+    ) -> Option<(Vec<u8>, peer_proto::v1::WorkspaceLayout)> {
+        let deadline = tokio::time::Instant::now() + window;
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                return None;
+            }
+            match tokio::time::timeout(remaining, read_envelope(reader)).await {
+                Err(_) | Ok(Err(_)) => return None,
+                Ok(Ok(env)) => {
+                    if let Some(Payload::WorkspaceUpdate(wu)) = env.payload {
+                        if let Some(peer_proto::v1::workspace_update::Kind::WorkspaceLayout(wlc)) =
+                            wu.kind
+                        {
+                            if let Some(layout) = wlc.layout {
+                                return Some((wlc.workspace_id, layout));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Waits for a `WorkspaceUpdate.workspace_removed` push, returning the
+    /// removed workspace_id. `None` on timeout.
+    async fn next_workspace_removed(
+        reader: &mut TestReadHalf,
+        window: std::time::Duration,
+    ) -> Option<Vec<u8>> {
+        let deadline = tokio::time::Instant::now() + window;
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                return None;
+            }
+            match tokio::time::timeout(remaining, read_envelope(reader)).await {
+                Err(_) | Ok(Err(_)) => return None,
+                Ok(Ok(env)) => {
+                    if let Some(Payload::WorkspaceUpdate(wu)) = env.payload {
+                        if let Some(peer_proto::v1::workspace_update::Kind::WorkspaceRemoved(wr)) =
+                            wu.kind
+                        {
+                            return Some(wr.workspace_id);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// (a) `CreateWorkspaceRequest` returns a fresh, non-empty workspace_id,
+    /// and a subsequent `ListWorkspaces` reflects the daemon's full
+    /// N-workspace roster (default + the new one), each with the title it
+    /// was created/booted with.
+    #[tokio::test]
+    async fn create_workspace_adds_to_roster() {
+        use peer_proto::v1::{CreateWorkspaceRequest, CreateWorkspaceResponse};
+
+        let tmp = TempDir::new().unwrap();
+        let sock_path = tmp.path().join("peer.sock");
+        let manager = cat_manager();
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let sock_path_task = sock_path.clone();
+        let server_task = tokio::spawn(async move {
+            serve_with_manager(sock_path_task, shutdown_rx, manager).await.unwrap();
+        });
+        for _ in 0..50 {
+            if sock_path.exists() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+
+        let (mut reader, mut writer) = handshake(&sock_path).await;
+
+        write_envelope(
+            &mut writer,
+            &Envelope {
+                seq: 3,
+                correlation_id: 0,
+                payload: Some(Payload::CreateWorkspaceRequest(CreateWorkspaceRequest {
+                    title: "dev".into(),
+                })),
+            },
+        )
+        .await
+        .unwrap();
+        let new_id = match read_envelope(&mut reader).await.unwrap().payload {
+            Some(Payload::CreateWorkspaceResponse(CreateWorkspaceResponse {
+                accepted,
+                workspace_id,
+                ..
+            })) => {
+                assert!(accepted);
+                assert!(!workspace_id.is_empty());
+                workspace_id
+            }
+            other => panic!("expected CreateWorkspaceResponse, got {other:?}"),
+        };
+
+        write_envelope(
+            &mut writer,
+            &Envelope { seq: 4, correlation_id: 0, payload: Some(Payload::ListWorkspaces(ListWorkspaces {})) },
+        )
+        .await
+        .unwrap();
+        let workspaces = match read_envelope(&mut reader).await.unwrap().payload {
+            Some(Payload::WorkspaceList(wl)) => wl.workspaces,
+            other => panic!("expected WorkspaceList, got {other:?}"),
+        };
+        assert_eq!(workspaces.len(), 2, "default + newly created workspace");
+        let created = workspaces
+            .iter()
+            .find(|w| w.workspace_id == new_id)
+            .expect("new workspace present in roster");
+        assert_eq!(created.title, "dev");
+        assert!(created.layout.is_none(), "freshly created workspace has no panes yet");
+
+        shutdown_tx.send(true).unwrap();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(3), server_task).await;
+    }
+
+    /// (b) Mutating a NON-default workspace's tree scopes the resulting
+    /// `WorkspaceLayoutChanged` push to THAT workspace's id, never always
+    /// the default (`schedule_layout_push`'s per-workspace stamping),
+    /// exercised end to end: seed a brand-new workspace's first pane via
+    /// `NewTabRequest.workspace_id`, then split that pane, and confirm
+    /// both resulting pushes carry the new workspace's id.
+    #[tokio::test]
+    async fn workspace_control_push_is_scoped_to_target_workspace() {
+        use peer_proto::v1::{CreateWorkspaceRequest, CreateWorkspaceResponse, NewTabRequest};
+
+        let tmp = TempDir::new().unwrap();
+        let sock_path = tmp.path().join("peer.sock");
+        let manager = cat_manager();
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let sock_path_task = sock_path.clone();
+        let server_task = tokio::spawn(async move {
+            serve_with_manager(sock_path_task, shutdown_rx, manager).await.unwrap();
+        });
+        for _ in 0..50 {
+            if sock_path.exists() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+
+        let (mut reader, mut writer) = handshake(&sock_path).await;
+
+        write_envelope(
+            &mut writer,
+            &Envelope {
+                seq: 3,
+                correlation_id: 0,
+                payload: Some(Payload::CreateWorkspaceRequest(CreateWorkspaceRequest {
+                    title: "second".into(),
+                })),
+            },
+        )
+        .await
+        .unwrap();
+        let ws2 = match read_envelope(&mut reader).await.unwrap().payload {
+            Some(Payload::CreateWorkspaceResponse(CreateWorkspaceResponse { workspace_id, .. })) => {
+                workspace_id
+            }
+            other => panic!("expected CreateWorkspaceResponse, got {other:?}"),
+        };
+
+        // Seed ws2's first pane via NewTabRequest.workspace_id (pane_id is
+        // empty/unresolvable since ws2 has no panes yet).
+        write_envelope(
+            &mut writer,
+            &control(
+                4,
+                workspace_control::Kind::NewTab(NewTabRequest {
+                    pane_id: vec![],
+                    workspace_id: ws2.clone(),
+                }),
+            ),
+        )
+        .await
+        .unwrap();
+        let (push_ws, layout) =
+            next_scoped_layout_push(&mut reader, PUSH_WINDOW).await.expect("seed pane push");
+        assert_eq!(push_ws, ws2, "seed-pane push must be stamped with ws2's id, not the default");
+        let seeded_pane = leftmost_pane(&layout);
+
+        // Now split that pane; the resulting push must ALSO carry ws2's id.
+        write_envelope(
+            &mut writer,
+            &control(
+                5,
+                workspace_control::Kind::SplitPane(SplitPaneRequest {
+                    pane_id: seeded_pane,
+                    orientation: "horizontal".into(),
+                }),
+            ),
+        )
+        .await
+        .unwrap();
+        let (push_ws2, layout2) =
+            next_scoped_layout_push(&mut reader, PUSH_WINDOW).await.expect("split push");
+        assert_eq!(push_ws2, ws2, "split push must also be stamped with ws2's id");
+        assert_eq!(count_panes(&layout2), 2);
+
+        shutdown_tx.send(true).unwrap();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(3), server_task).await;
+    }
+
+    /// (c) `DeleteWorkspaceRequest` tears down every surface the target
+    /// workspace's tree held, broadcasts `WorkspaceRemoved`, and drops the
+    /// workspace from a subsequent `ListWorkspaces` roster.
+    #[tokio::test]
+    async fn delete_workspace_tears_down_surfaces_and_broadcasts_removal() {
+        use peer_proto::v1::{
+            CreateWorkspaceRequest, CreateWorkspaceResponse, DeleteWorkspaceRequest, NewTabRequest,
+        };
+
+        let tmp = TempDir::new().unwrap();
+        let sock_path = tmp.path().join("peer.sock");
+        let manager = cat_manager();
+        let manager_check = manager.clone();
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let sock_path_task = sock_path.clone();
+        let server_task = tokio::spawn(async move {
+            serve_with_manager(sock_path_task, shutdown_rx, manager).await.unwrap();
+        });
+        for _ in 0..50 {
+            if sock_path.exists() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+
+        let (mut reader, mut writer) = handshake(&sock_path).await;
+
+        write_envelope(
+            &mut writer,
+            &Envelope {
+                seq: 3,
+                correlation_id: 0,
+                payload: Some(Payload::CreateWorkspaceRequest(CreateWorkspaceRequest {
+                    title: "scratch".into(),
+                })),
+            },
+        )
+        .await
+        .unwrap();
+        let ws2 = match read_envelope(&mut reader).await.unwrap().payload {
+            Some(Payload::CreateWorkspaceResponse(CreateWorkspaceResponse { workspace_id, .. })) => {
+                workspace_id
+            }
+            other => panic!("expected CreateWorkspaceResponse, got {other:?}"),
+        };
+
+        write_envelope(
+            &mut writer,
+            &control(
+                4,
+                workspace_control::Kind::NewTab(NewTabRequest {
+                    pane_id: vec![],
+                    workspace_id: ws2.clone(),
+                }),
+            ),
+        )
+        .await
+        .unwrap();
+        let (_, layout) =
+            next_scoped_layout_push(&mut reader, PUSH_WINDOW).await.expect("seed pane push");
+        let seeded_pane = leftmost_pane(&layout);
+
+        assert!(
+            manager_check.list().iter().any(|s| s.surface_id == seeded_pane),
+            "seeded pane must be a real, registered PTY before delete"
+        );
+
+        write_envelope(
+            &mut writer,
+            &Envelope {
+                seq: 5,
+                correlation_id: 0,
+                payload: Some(Payload::DeleteWorkspaceRequest(DeleteWorkspaceRequest {
+                    workspace_id: ws2.clone(),
+                })),
+            },
+        )
+        .await
+        .unwrap();
+
+        let removed = next_workspace_removed(&mut reader, PUSH_WINDOW)
+            .await
+            .expect("WorkspaceRemoved push");
+        assert_eq!(removed, ws2);
+
+        assert!(
+            !manager_check.list().iter().any(|s| s.surface_id == seeded_pane),
+            "deleted workspace's pane must be torn down from the PTY manager"
+        );
+
+        write_envelope(
+            &mut writer,
+            &Envelope { seq: 6, correlation_id: 0, payload: Some(Payload::ListWorkspaces(ListWorkspaces {})) },
+        )
+        .await
+        .unwrap();
+        let workspaces = match read_envelope(&mut reader).await.unwrap().payload {
+            Some(Payload::WorkspaceList(wl)) => wl.workspaces,
+            other => panic!("expected WorkspaceList, got {other:?}"),
+        };
+        assert_eq!(workspaces.len(), 1, "only the default workspace remains");
+
+        shutdown_tx.send(true).unwrap();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(3), server_task).await;
+    }
+
+    /// (d) Deleting the default workspace must be refused: no
+    /// `WorkspaceRemoved` push, no roster change, and the connection
+    /// stays healthy (proven by a Ping/Pong round trip right after).
+    #[tokio::test]
+    async fn delete_default_workspace_is_refused() {
+        use peer_proto::v1::{DeleteWorkspaceRequest, Ping, Pong};
+
+        let tmp = TempDir::new().unwrap();
+        let sock_path = tmp.path().join("peer.sock");
+        let manager = cat_manager();
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let sock_path_task = sock_path.clone();
+        let server_task = tokio::spawn(async move {
+            serve_with_manager(sock_path_task, shutdown_rx, manager).await.unwrap();
+        });
+        for _ in 0..50 {
+            if sock_path.exists() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+
+        let (mut reader, mut writer) = handshake(&sock_path).await;
+        write_envelope(
+            &mut writer,
+            &Envelope { seq: 3, correlation_id: 0, payload: Some(Payload::ListWorkspaces(ListWorkspaces {})) },
+        )
+        .await
+        .unwrap();
+        let default_id = match read_envelope(&mut reader).await.unwrap().payload {
+            Some(Payload::WorkspaceList(wl)) => wl.workspaces[0].workspace_id.clone(),
+            other => panic!("expected WorkspaceList, got {other:?}"),
+        };
+
+        write_envelope(
+            &mut writer,
+            &Envelope {
+                seq: 4,
+                correlation_id: 0,
+                payload: Some(Payload::DeleteWorkspaceRequest(DeleteWorkspaceRequest {
+                    workspace_id: default_id,
+                })),
+            },
+        )
+        .await
+        .unwrap();
+
+        let removed = next_workspace_removed(&mut reader, std::time::Duration::from_millis(500)).await;
+        assert!(removed.is_none(), "default workspace deletion must be refused, got {removed:?}");
+
+        write_envelope(
+            &mut writer,
+            &Envelope { seq: 5, correlation_id: 0, payload: Some(Payload::Ping(Ping { nonce: 99 })) },
+        )
+        .await
+        .unwrap();
+        match read_envelope(&mut reader).await.unwrap().payload {
+            Some(Payload::Pong(Pong { nonce })) => assert_eq!(nonce, 99),
+            other => panic!("expected Pong, got {other:?}"),
+        }
+
+        shutdown_tx.send(true).unwrap();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(3), server_task).await;
+    }
+
+    /// (e) `RenameWorkspaceRequest`/`DeleteWorkspaceRequest` against an
+    /// unknown workspace_id are silent no-ops: no `WorkspaceRemoved`
+    /// push, no roster change, and the default workspace's title is not
+    /// hijacked by the bogus rename.
+    #[tokio::test]
+    async fn rename_and_delete_unknown_workspace_id_are_noops() {
+        use peer_proto::v1::{DeleteWorkspaceRequest, RenameWorkspaceRequest};
+
+        let tmp = TempDir::new().unwrap();
+        let sock_path = tmp.path().join("peer.sock");
+        let manager = cat_manager();
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let sock_path_task = sock_path.clone();
+        let server_task = tokio::spawn(async move {
+            serve_with_manager(sock_path_task, shutdown_rx, manager).await.unwrap();
+        });
+        for _ in 0..50 {
+            if sock_path.exists() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+
+        let (mut reader, mut writer) = handshake(&sock_path).await;
+        let ghost_id = vec![0xEE; 16];
+
+        write_envelope(
+            &mut writer,
+            &Envelope {
+                seq: 3,
+                correlation_id: 0,
+                payload: Some(Payload::RenameWorkspaceRequest(RenameWorkspaceRequest {
+                    workspace_id: ghost_id.clone(),
+                    title: "hijacked".into(),
+                })),
+            },
+        )
+        .await
+        .unwrap();
+        write_envelope(
+            &mut writer,
+            &Envelope {
+                seq: 4,
+                correlation_id: 0,
+                payload: Some(Payload::DeleteWorkspaceRequest(DeleteWorkspaceRequest {
+                    workspace_id: ghost_id,
+                })),
+            },
+        )
+        .await
+        .unwrap();
+
+        let removed = next_workspace_removed(&mut reader, std::time::Duration::from_millis(500)).await;
+        assert!(removed.is_none(), "unknown workspace_id delete must be a silent no-op");
+
+        write_envelope(
+            &mut writer,
+            &Envelope { seq: 5, correlation_id: 0, payload: Some(Payload::ListWorkspaces(ListWorkspaces {})) },
+        )
+        .await
+        .unwrap();
+        let workspaces = match read_envelope(&mut reader).await.unwrap().payload {
+            Some(Payload::WorkspaceList(wl)) => wl.workspaces,
+            other => panic!("expected WorkspaceList, got {other:?}"),
+        };
+        assert_eq!(workspaces.len(), 1, "roster untouched by no-op rename/delete");
+        assert_eq!(workspaces[0].title, DAEMON_WORKSPACE, "default title must not have been hijacked");
+
         shutdown_tx.send(true).unwrap();
         let _ = tokio::time::timeout(std::time::Duration::from_secs(3), server_task).await;
     }
