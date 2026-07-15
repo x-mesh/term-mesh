@@ -793,6 +793,8 @@ struct SidebarRemoteHostsSection: View {
     @ObservedObject var store: RemoteHostStore
     @AppStorage(SidebarLayoutSettings.remoteHostsCollapsedKey)
     private var isCollapsed = false
+    /// Non-nil presents the add/edit sheet.
+    @State private var editorContext: PeerHostEditorContext?
 
     var body: some View {
         VStack(spacing: 0) {
@@ -802,10 +804,27 @@ struct SidebarRemoteHostsSection: View {
                 .padding(.bottom, 2)
 
             SidebarSectionHeader(title: "Remote Hosts", isCollapsed: $isCollapsed)
+                .overlay(alignment: .trailing) {
+                    Button {
+                        editorContext = PeerHostEditorContext(
+                            profile: PeerHostProfile(sshTarget: ""),
+                            isNew: true
+                        )
+                    } label: {
+                        Image(systemName: "plus")
+                            .font(.system(size: 9, weight: .semibold))
+                            .foregroundColor(.secondary)
+                            .frame(width: 18, height: 18)
+                            .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                    .padding(.trailing, 12)
+                    .help("Add Remote Host…")
+                }
 
             if !isCollapsed {
                 if store.sortedHosts.isEmpty {
-                    Text("Use Peer menu → Connect to Host…")
+                    Text("No saved hosts — click + to add")
                         .font(.system(size: 10))
                         .foregroundColor(Color.secondary.opacity(0.6))
                         .fixedSize(horizontal: false, vertical: true)
@@ -814,25 +833,63 @@ struct SidebarRemoteHostsSection: View {
                         .padding(.vertical, 4)
                 } else {
                     ForEach(store.sortedHosts) { host in
-                        RemoteHostGroupView(host: host, store: store)
+                        RemoteHostGroupView(host: host, store: store) { context in
+                            editorContext = context
+                        }
                     }
                 }
             }
         }
         .padding(.bottom, 4)
+        .sheet(item: $editorContext) { context in
+            PeerHostEditorView(
+                context: context,
+                onSave: { profile in
+                    PeerHostProfileStore.shared.upsert(profile)
+                    editorContext = nil
+                },
+                onCancel: { editorContext = nil }
+            )
+        }
     }
 }
 
 struct RemoteHostGroupView: View {
     let host: HostEntry
     let store: RemoteHostStore
+    /// Opens the shared add/edit sheet (owned by the section view).
+    let onEdit: (PeerHostEditorContext) -> Void
     @State private var isExpanded: Bool
+    @State private var showDeleteConfirm = false
 
-    init(host: HostEntry, store: RemoteHostStore) {
+    init(host: HostEntry, store: RemoteHostStore,
+         onEdit: @escaping (PeerHostEditorContext) -> Void) {
         self.host = host
         self.store = store
+        self.onEdit = onEdit
         // Fold state persists per stable host key; default is expanded.
         _isExpanded = State(initialValue: !SidebarLayoutSettings.isHostCollapsed(host.id))
+    }
+
+    /// Profile-management items shared by every connection state.
+    @ViewBuilder
+    private var profileMenuItems: some View {
+        if let profileID = host.profileID,
+           let profile = PeerHostProfileStore.shared.profile(id: profileID) {
+            Divider()
+            Button("Edit…") {
+                onEdit(PeerHostEditorContext(profile: profile, isNew: false))
+            }
+            Button("Delete…", role: .destructive) {
+                showDeleteConfirm = true
+            }
+        } else if let draft = store.profileDraft(for: host) {
+            // Ad-hoc SSH connection → offer promotion to a saved host.
+            Divider()
+            Button("Save as Host…") {
+                onEdit(PeerHostEditorContext(profile: draft, isNew: true))
+            }
+        }
     }
 
     private var emptyBodyText: String {
@@ -961,6 +1018,18 @@ struct RemoteHostGroupView: View {
                 case .connecting:
                     EmptyView()
                 }
+                profileMenuItems
+            }
+            .confirmationDialog(
+                "Delete \"\(host.displayName)\"?",
+                isPresented: $showDeleteConfirm
+            ) {
+                Button("Delete", role: .destructive) {
+                    store.deleteProfile(for: host)
+                }
+                Button("Cancel", role: .cancel) {}
+            } message: {
+                Text("The saved host profile is removed. Open panes and mirrors stay connected.")
             }
         }
         .padding(.horizontal, 6)

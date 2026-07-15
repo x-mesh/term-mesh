@@ -367,6 +367,30 @@ final class RemoteHostStore: ObservableObject {
         }
     }
 
+    /// Delete the backing profile. Releases the sidebar lease first so
+    /// the tunnel ref is balanced; panes/mirrors keep their own refs
+    /// and the entry survives as ad-hoc while they live (rebuild rule).
+    func deleteProfile(for host: HostEntry) {
+        guard let profileID = host.profileID else { return }
+        if hasSidebarLease(for: host.id) {
+            disconnectSavedHost(host)
+        }
+        PeerHostProfileStore.shared.delete(id: profileID)
+    }
+
+    /// Promote an ad-hoc connected SSH entry to a saved profile draft
+    /// (shown in the editor before persisting). nil for direct-socket
+    /// entries — V1 profiles are SSH-only.
+    func profileDraft(for host: HostEntry) -> PeerHostProfile? {
+        guard host.profileID == nil,
+              let target = host.sshTarget, !target.isEmpty else { return nil }
+        return PeerHostProfile(
+            displayName: host.displayName,
+            sshTarget: target,
+            remoteSocket: host.remoteSockPath ?? ""
+        )
+    }
+
     /// Release the sidebar's lease ref. Panes/mirrors opened from this
     /// host hold their own refs and survive; rebuild() re-promotes the
     /// entry if such a connection is still live.
