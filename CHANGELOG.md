@@ -2,6 +2,21 @@
 
 All notable changes to term-mesh are documented here.
 
+## [0.157.0] - 2026-07-17
+
+### Added
+- **호스트 편집기에서 원격 term-meshd 버전 확인 + 원클릭 업데이트** — Peer Host 편집기의 Test 버튼이 원격 term-meshd 버전을 확인해 최신·업데이트 가능·레거시 상태를 표시하고, 구버전이면 Update 버튼으로 기존 설치 경로를 재사용해 바로 업데이트한다. 업데이트가 진행되는 동안 같은 호스트로의 중복 설치는 차단되고, 실패한 설치는 곧바로 재시도할 수 있다. 이 릴리즈부터 term-meshd 버전이 앱 버전과 동기화되어(`daemon.status`에 노출) 버전 비교가 의미를 갖는다 — 그 이전에 설치된 데몬은 "legacy"로 표시된다.
+- **피어 replay 버퍼 크기 설정 가능** — 뷰어가 pane에 붙을 때 재생되는 최근 출력 버퍼가 64 KiB에서 기본 1 MiB로 커졌고, `TERMMESH_PEER_REPLAY_BYTES` 환경 변수 또는 `tm-agent daemon replay-capacity --set 2mb`로 실행 중에도 조정할 수 있다(4 KiB–64 MiB).
+
+### Fixed
+- **사이드바에서 편집한 호스트 소켓 경로가 무시되던 문제 수정** — 저장된 호스트의 소켓 경로를 수정해도 연결이 수정 전에 캐시된 경로로 조용히 터널링하던 것을 고쳤다. 비워두면(자동 탐지) 기존처럼 탐지된 경로를 재사용한다.
+- **term-meshd가 중지 요청(SIGTERM) 후 종료되지 않던 문제 수정** — 파일 감시 스레드가 프로세스 종료를 막아 서비스 중지·재시작이 영원히 걸리던 것을 고쳤다. 앱 쪽에도 SIGKILL 폴백이 추가되어 구버전 데몬도 확실히 정리된다.
+- **라이브 미러 pane에서 대량 출력 시 잘린 화면이 복구되지 않던 문제 수정** — 출력 드롭 감지와 자동 화면 복구가 일반 relay pane에만 적용되고 workspace 라이브 미러 pane에는 빠져 있던 것을 고쳤다.
+
+### Thanks to 1 contributor!
+
+- [@JINWOO-J](https://github.com/JINWOO-J)
+
 ## [0.156.0] - 2026-07-16
 
 ### Fixed
