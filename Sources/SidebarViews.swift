@@ -1212,6 +1212,15 @@ struct RemoteWorkspaceRowView: View {
             Button("Open in Relay Window") {
                 store.openWorkspace(workspace, host: host)
             }
+            // Phase 1.5 remote pane primitive, scoped to this workspace's
+            // surfaces: single-surface workspaces attach directly (no
+            // picker), multi-surface workspaces fall through to a picker
+            // restricted to this workspace. Surface count isn't cached in
+            // WorkspaceSummary, so the branch is resolved at click time —
+            // see RemoteHostStore.openWorkspaceSurfaceAsPane.
+            Button("Open as Pane in Current Workspace…") {
+                store.openWorkspaceSurfaceAsPane(workspace, host: host)
+            }
             // Snapshot mode (live: false — detached layout copy) is
             // intentionally NOT offered: with content always streaming
             // live, users read the near-identical workspace as a broken

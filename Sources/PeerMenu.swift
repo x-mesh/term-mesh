@@ -378,12 +378,26 @@ final class PeerClientCoordinator: NSObject {
         await openRemotePaneFlow(spec: spec)
     }
 
+    /// Sidebar workspace-row entry — same tail as `openRemotePane`, but
+    /// the surface candidates are resolved from a single remote
+    /// workspace's layout tree instead of the host's flat surface list.
+    func openWorkspaceSurfaceAsPane(spec: PeerPaneHostSpec, workspaceID: Data) async {
+        await openRemotePaneFlow(spec: spec, workspaceID: workspaceID)
+    }
+
     /// Shared tail: lease → list surfaces → pick → attach → split into
     /// the current workspace. Returns true when a pane actually opened.
     /// Balances the browse ref on every exit; an attached pane holds its
     /// own lease ref until teardown.
+    ///
+    /// `workspaceID` nil (host context menu) resolves candidates from the
+    /// host's flat `ListSurfaces` roster, filtered to `attachable`. Set
+    /// (workspace-row entry) it resolves candidates from that one
+    /// workspace's layout tree via a fresh `ListWorkspaces` round-trip —
+    /// `SurfaceInfo` carries no workspace id, so a flat surface list can't
+    /// be scoped after the fact.
     @discardableResult
-    private func openRemotePaneFlow(spec: PeerPaneHostSpec) async -> Bool {
+    private func openRemotePaneFlow(spec: PeerPaneHostSpec, workspaceID: Data? = nil) async -> Bool {
         let lease: PeerPaneHostLease
         do {
             lease = try await PeerPaneHostRegistry.shared.acquire(spec)
@@ -395,7 +409,23 @@ final class PeerClientCoordinator: NSObject {
 
         let surfaces: [Termmesh_Peer_V1_SurfaceInfo]
         do {
-            surfaces = try await PeerPaneSession.listSurfaces(on: lease)
+            if let workspaceID {
+                guard let leaves = try await Self.leafSurfaces(forWorkspace: workspaceID, lease: lease) else {
+                    // Stale sidebar row: the workspace was deleted (or
+                    // never existed on this host) between the click and
+                    // this round-trip. No-op with an error rather than
+                    // falling back to some other workspace's panes.
+                    registry.release(lease)
+                    self.showAlert(
+                        title: "Workspace Unavailable",
+                        body: "This remote workspace is no longer available on the host."
+                    )
+                    return false
+                }
+                surfaces = leaves
+            } else {
+                surfaces = try await PeerPaneSession.listSurfaces(on: lease)
+            }
         } catch {
             registry.release(lease)
             self.showAlert(title: "Surface List Failed", body: String(describing: error))
@@ -406,7 +436,9 @@ final class PeerClientCoordinator: NSObject {
             registry.release(lease)
             self.showAlert(
                 title: "No Attachable Surfaces",
-                body: "The host reports no surfaces that allow per-surface attach."
+                body: workspaceID == nil
+                    ? "The host reports no surfaces that allow per-surface attach."
+                    : "This workspace has no panes to attach."
             )
             return false
         }
@@ -415,7 +447,26 @@ final class PeerClientCoordinator: NSObject {
         if attachable.count == 1 {
             chosen = attachable[0]
         } else {
-            chosen = await promptForSurfaceSelection(from: attachable)
+            // Multi-candidate picker: backfill workspace names on the flat
+            // host-level roster before showing it. ListSurfaces never
+            // carries a workspace id, so `workspaceName` is always empty
+            // coming from that RPC — the workspace-scoped roster (from
+            // `leafSurfaces`) already has it stamped and skips this. A
+            // failed/old-host lookup just leaves names blank; it must
+            // never block the picker itself.
+            let candidates: [Termmesh_Peer_V1_SurfaceInfo]
+            if workspaceID == nil {
+                let names = await Self.surfaceWorkspaceNames(lease: lease)
+                candidates = names.isEmpty ? attachable : attachable.map { s in
+                    guard s.workspaceName.isEmpty, let name = names[s.surfaceID] else { return s }
+                    var stamped = s
+                    stamped.workspaceName = name
+                    return stamped
+                }
+            } else {
+                candidates = attachable
+            }
+            chosen = await promptForSurfaceSelection(from: candidates)
         }
         guard let chosen else {
             registry.release(lease)
@@ -455,7 +506,76 @@ final class PeerClientCoordinator: NSObject {
             )
             return false
         }
+        #if DEBUG
+        let surfaceHex = chosen.surfaceID.prefix(4).map { String(format: "%02x", $0) }.joined()
+        dlog("peer.sidebar.openAsPane host=\(spec.hostKey) workspaceScoped=\(workspaceID != nil) surface=\(surfaceHex)")
+        #endif
         return true
+    }
+
+    /// Resolve the surfaces belonging to `workspaceID` via a fresh
+    /// `ListWorkspaces` round-trip on `lease`'s host (mirrors the
+    /// connect/list/cancel shape `openRemoteWorkspaceMirror` already
+    /// uses). Returns nil — not an empty array — when the workspace isn't
+    /// in the roster, so the caller can tell "gone" apart from "empty".
+    private static func leafSurfaces(
+        forWorkspace workspaceID: Data,
+        lease: PeerPaneHostLease
+    ) async throws -> [Termmesh_Peer_V1_SurfaceInfo]? {
+        let conn = try await PeerRelaySession.connect(hostSockPath: lease.hostSockPath)
+        let workspaces: [Termmesh_Peer_V1_Workspace]
+        do {
+            workspaces = try await conn.session.listWorkspaces()
+        } catch {
+            await conn.cancel()
+            throw error
+        }
+        await conn.cancel()
+        guard let match = workspaces.first(where: { $0.workspaceID == workspaceID }) else {
+            return nil
+        }
+        // Stamp the owning workspace's title onto each synthetic
+        // SurfaceInfo so the picker can show it and the attach-title
+        // fallback (chosen.workspaceName when a leaf's own title is
+        // empty) still resolves to something useful.
+        return collectLeafPanes(match.layout).map { leaf in
+            var info = surfaceInfo(fromLeaf: leaf)
+            info.workspaceName = match.title
+            return info
+        }
+    }
+
+    /// Best-effort surface_id → owning-workspace-title map, built from a
+    /// fresh `ListWorkspaces` round-trip. Backfills `workspaceName` on the
+    /// flat host-level `ListSurfaces` roster, which never carries it
+    /// (daemon doesn't populate that field on that RPC). Never throws — a
+    /// stale/old host or a transient RPC error just means no names get
+    /// backfilled; the caller falls back to the un-annotated roster
+    /// rather than the picker failing outright.
+    private static func surfaceWorkspaceNames(lease: PeerPaneHostLease) async -> [Data: String] {
+        do {
+            let conn = try await PeerRelaySession.connect(hostSockPath: lease.hostSockPath)
+            let workspaces: [Termmesh_Peer_V1_Workspace]
+            do {
+                workspaces = try await conn.session.listWorkspaces()
+            } catch {
+                await conn.cancel()
+                throw error
+            }
+            await conn.cancel()
+            var names: [Data: String] = [:]
+            for ws in workspaces where !ws.title.isEmpty {
+                for leaf in collectLeafPanes(ws.layout) {
+                    names[leaf.surfaceID] = ws.title
+                }
+            }
+            return names
+        } catch {
+            #if DEBUG
+            dlog("peer.sidebar.surfaceWorkspaceNames failed error=\(error)")
+            #endif
+            return [:]
+        }
     }
 
     private static func currentWorkspaceForPaneOpen() -> Workspace? {
@@ -790,6 +910,20 @@ final class PeerClientCoordinator: NSObject {
         }
     }
 
+    /// All leaf panes in a workspace's layout tree, left-to-right —
+    /// `firstLeafPane`'s sibling for callers that need the full roster
+    /// (e.g. the workspace-scoped pane-open picker) rather than just one.
+    private static func collectLeafPanes(
+        _ node: Termmesh_Peer_V1_WorkspaceLayout
+    ) -> [Termmesh_Peer_V1_WorkspacePane] {
+        switch node.node {
+        case .pane(let pane): return [pane]
+        case .split(let split):
+            return collectLeafPanes(split.first) + collectLeafPanes(split.second)
+        case .none: return []
+        }
+    }
+
     /// AttachSurface only needs id + geometry; the layout leaf carries
     /// both, so the mirror never has to cross-reference ListSurfaces.
     private static func surfaceInfo(
@@ -800,6 +934,7 @@ final class PeerClientCoordinator: NSObject {
         info.title = leaf.title
         info.cols = leaf.cols
         info.rows = leaf.rows
+        info.cwd = leaf.cwd
         info.attachable = true
         return info
     }
@@ -1323,8 +1458,16 @@ final class PeerClientCoordinator: NSObject {
             )
             let detail = s.cwd.isEmpty ? "" : "  ·  \(Self.abbreviatedMenuPath(s.cwd))"
             let dims = "  (\(s.cols)×\(s.rows))"
+            // Which remote workspace this surface lives in — only known
+            // when the host populated it (flat host-level ListSurfaces
+            // today never does) or the caller pre-stamped it (the
+            // workspace-scoped pane-open picker always does). Omitted
+            // rather than shown blank when unmapped.
+            let workspaceLabel = s.workspaceName.isEmpty
+                ? ""
+                : "  ·  \(Self.menuSafeTitle(s.workspaceName, maxLength: 32))"
             let idHex = s.surfaceID.prefix(4).map { String(format: "%02x", $0) }.joined()
-            let display = "\(title)\(detail)\(dims)  [\(idHex)]"
+            let display = "\(title)\(detail)\(dims)\(workspaceLabel)  [\(idHex)]"
             let item = NSMenuItem(title: display, action: nil, keyEquivalent: "")
             popup.menu?.addItem(item)
         }

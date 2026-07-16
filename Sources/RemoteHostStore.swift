@@ -525,6 +525,19 @@ final class RemoteHostStore: ObservableObject {
         }
     }
 
+    /// Sidebar workspace row entry — like `openSurfaceAsPane`, but scoped
+    /// to a single remote workspace's surfaces instead of the whole host.
+    /// A one-surface workspace attaches directly with no picker; a
+    /// multi-surface one opens a picker restricted to that workspace.
+    func openWorkspaceSurfaceAsPane(_ workspace: WorkspaceSummary, host: HostEntry) {
+        let spec = host.paneHostSpec
+        Task {
+            await PeerClientCoordinator.shared.openWorkspaceSurfaceAsPane(
+                spec: spec, workspaceID: workspace.id
+            )
+        }
+    }
+
     /// Open this host workspace as a main-window workspace mirror.
     /// live=true (Phase 2B): host-authoritative layout sync; false
     /// (Phase 2A): one-shot snapshot placement, local layout afterwards.
