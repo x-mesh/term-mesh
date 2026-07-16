@@ -622,7 +622,9 @@ final class RemoteHostStore: ObservableObject {
 
     /// Deletes `workspace` on `host`. Fire-and-forget RPC — the host pushes
     /// `WorkspaceUpdate.workspaceRemoved` to any attached mirror sessions
-    /// (t5 auto-closes those), and this sidebar's own re-fetch drops the row.
+    /// (`PeerWorkspaceMirrorController.markHostWorkspaceGone()` auto-closes
+    /// those via `TabManager.closeWorkspace`), and this sidebar's own
+    /// re-fetch drops the row.
     func deleteWorkspace(_ workspace: WorkspaceSummary, host: HostEntry) {
         let path = host.activeSockPath
         let key = host.id
