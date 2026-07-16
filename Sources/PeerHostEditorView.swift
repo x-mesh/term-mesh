@@ -4,6 +4,7 @@
 //  NSAlert connect dialogs stay untouched until Phase 4 retires them.
 
 import AppKit
+import Bonsplit
 import SwiftUI
 
 /// Sheet payload: one type for both "add" and "edit" so `.sheet(item:)`
@@ -28,6 +29,9 @@ struct PeerHostEditorView: View {
     @State private var bonjourBrowser = PeerBonjourBrowser()
 
     /// Test / install flow state (the sheet's "doctor").
+    ///
+    /// Existing case signatures are a frozen interface contract — do not
+    /// change them. The version-check states below are additive only.
     enum DoctorState: Equatable {
         case idle
         case testing
@@ -38,9 +42,31 @@ struct PeerHostEditorView: View {
         case installFailed(String)
         case diagnosing              // installed but still no socket
         case diagnosed(String)       // compact failure reason
+        /// Connected, version known, and at/above the latest release.
+        case okUpToDate(socket: String, version: String)
+        /// Connected, version known, and behind the latest release.
+        case updateAvailable(socket: String, remote: String, latest: String)
+        /// Connected, but the installed version predates
+        /// `PeerDaemonVersion.versionSyncFloor` — comparing it against
+        /// `latest` would misreport, so this is a recommendation, not a
+        /// version-ordering claim (see PeerDaemonVersion.Comparison.legacy).
+        case legacyDaemon(socket: String, remote: String)
+        /// Connected, but the remote version couldn't be determined
+        /// (probe failed, or the latest-release lookup failed) — never
+        /// blocks a successful Test result on its own.
+        case okVersionUnknown(socket: String)
     }
     @State private var doctorState: DoctorState = .idle
     @State private var showInstallConfirm = false
+    @State private var showUpdateConfirm = false
+    /// Suppresses the Update button after one update attempt this sheet
+    /// session, even if the post-update retest still reports
+    /// outdated/legacy — avoids nagging the user in a retry loop.
+    @State private var updateAttempted = false
+    /// Version reported by a binary found on the host while term-meshd
+    /// itself isn't running (`.daemonMissing`). Kept out of that case's
+    /// associated value since its signature must not change.
+    @State private var daemonMissingVersion: String?
 
     /// Fixed tag palette (one-dark hues) + nil for "no color".
     private static let colorChoices: [String?] = [
@@ -122,6 +148,10 @@ struct PeerHostEditorView: View {
                     Button("Install term-meshd…") { showInstallConfirm = true }
                         .disabled(doctorBusy)
                 }
+                if showsUpdateButton {
+                    Button("Update term-meshd…") { showUpdateConfirm = true }
+                        .disabled(doctorBusy)
+                }
                 Spacer()
                 Button("Cancel", action: onCancel)
                     .keyboardShortcut(.cancelAction)
@@ -147,11 +177,33 @@ struct PeerHostEditorView: View {
         } message: {
             Text("Runs the official install script over SSH: downloads the latest release binary and registers a systemd user service.")
         }
+        .confirmationDialog(
+            "Update term-meshd on \"\(profile.sshTarget)\"?",
+            isPresented: $showUpdateConfirm
+        ) {
+            Button("Update") {
+                updateAttempted = true
+                runInstall()
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("Updating restarts the remote daemon and terminates all sessions on this host.")
+        }
     }
 
     private var doctorBusy: Bool {
         switch doctorState {
         case .testing, .installing, .diagnosing: return true
+        default: return false
+        }
+    }
+
+    /// Shown for `.updateAvailable`/`.legacyDaemon`, suppressed after one
+    /// update attempt this session (see `updateAttempted`).
+    private var showsUpdateButton: Bool {
+        guard !updateAttempted else { return false }
+        switch doctorState {
+        case .updateAvailable, .legacyDaemon: return true
         default: return false
         }
     }
@@ -168,9 +220,24 @@ struct PeerHostEditorView: View {
             Label("Connected — daemon socket: \(path)", systemImage: "checkmark.circle.fill")
                 .font(.caption).foregroundColor(.green)
         case .daemonMissing:
-            Label("SSH OK, but term-meshd is not running on the host.",
+            Label(daemonMissingStatusText,
                   systemImage: "exclamationmark.triangle.fill")
                 .font(.caption).foregroundColor(.orange)
+        case .okUpToDate(_, let version):
+            Label("term-meshd v\(version) — up to date", systemImage: "checkmark.seal")
+                .font(.caption).foregroundColor(.green)
+        case .updateAvailable(_, let remote, let latest):
+            Label("Update available: v\(remote) → v\(latest)", systemImage: "arrow.up.circle")
+                .font(.caption).foregroundColor(.orange)
+        case .legacyDaemon(_, let remote):
+            Label("Legacy daemon (v\(remote)) — update recommended (version reporting predates v\(PeerDaemonVersion.versionSyncFloor))",
+                  systemImage: "exclamationmark.arrow.circlepath")
+                .font(.caption).foregroundColor(.orange)
+                .fixedSize(horizontal: false, vertical: true)
+        case .okVersionUnknown(let path):
+            Label("Connected — daemon socket: \(path) — version unknown",
+                  systemImage: "questionmark.circle")
+                .font(.caption).foregroundColor(.secondary)
         case .sshFailed(let msg):
             Label("SSH failed: \(msg)", systemImage: "xmark.circle.fill")
                 .font(.caption).foregroundColor(.red)
@@ -194,19 +261,42 @@ struct PeerHostEditorView: View {
         }
     }
 
+    /// `.daemonMissing`'s base copy, plus (when a binary was found on the
+    /// host despite the daemon not running) the version it reports.
+    private var daemonMissingStatusText: String {
+        guard let version = daemonMissingVersion else {
+            return "SSH OK, but term-meshd is not running on the host."
+        }
+        return "SSH OK, term-meshd v\(version) is installed but not running on the host."
+    }
+
     // MARK: - Doctor actions
 
     private func runTest() {
         guard let draft = validatedDraft() else { return }
         doctorState = .testing
+        daemonMissingVersion = nil
         Task {
             let result = await PeerHostDoctor.test(
                 sshTarget: draft.sshTarget, port: draft.sshPort,
                 identityFile: draft.identityFile
             )
             switch result {
-            case .ok(let path): doctorState = .ok(path)
-            case .daemonMissing: doctorState = .daemonMissing
+            case .ok(let path):
+                doctorState = await resolveConnectedState(socketPath: path, draft: draft)
+            case .daemonMissing:
+                doctorState = .daemonMissing
+                // Binary may still be present with the service just not
+                // running — surface that without touching the frozen
+                // `.daemonMissing` case's signature. exit 44 (no binary)
+                // resolves to nil here, leaving the plain message as-is.
+                daemonMissingVersion = await PeerHostDoctor.checkVersion(
+                    sshTarget: draft.sshTarget, port: draft.sshPort,
+                    identityFile: draft.identityFile
+                )
+                #if DEBUG
+                dlog("peer.doctor.version state=daemonMissing remote=\(daemonMissingVersion ?? "nil") latest=n/a")
+                #endif
             case .sshFailed(let msg): doctorState = .sshFailed(msg)
             }
         }
@@ -215,6 +305,7 @@ struct PeerHostEditorView: View {
     private func runInstall() {
         guard let draft = validatedDraft() else { return }
         doctorState = .installing
+        daemonMissingVersion = nil
         Task {
             do {
                 _ = try await PeerHostDoctor.install(
@@ -233,7 +324,7 @@ struct PeerHostEditorView: View {
             )
             switch result {
             case .ok(let path):
-                doctorState = .ok(path)
+                doctorState = await resolveConnectedState(socketPath: path, draft: draft)
             case .daemonMissing:
                 doctorState = .diagnosing
                 let raw = await PeerHostDoctor.diagnose(
@@ -244,6 +335,54 @@ struct PeerHostEditorView: View {
             case .sshFailed(let msg):
                 doctorState = .sshFailed(msg)
             }
+        }
+    }
+
+    /// Resolves the post-connect version-comparison state for a live
+    /// socket — shared by `runTest()` and the post-install retest in
+    /// `runInstall()` so both paths render identical outcomes. A failed
+    /// version probe or a failed latest-release lookup never downgrades
+    /// a successful Test result; it only narrows the state to
+    /// `.okVersionUnknown`.
+    private func resolveConnectedState(
+        socketPath: String,
+        draft: PeerHostProfile
+    ) async -> DoctorState {
+        guard let installed = await PeerHostDoctor.checkVersion(
+            sshTarget: draft.sshTarget, port: draft.sshPort, identityFile: draft.identityFile
+        ) else {
+            #if DEBUG
+            dlog("peer.doctor.version state=unknown remote=nil latest=n/a")
+            #endif
+            return .okVersionUnknown(socket: socketPath)
+        }
+        guard let latest = await PeerDaemonVersion.fetchLatestRelease() else {
+            #if DEBUG
+            dlog("peer.doctor.version state=unknown remote=\(installed) latest=nil")
+            #endif
+            return .okVersionUnknown(socket: socketPath)
+        }
+        switch PeerDaemonVersion.compare(installed: installed, latest: latest) {
+        case .upToDate:
+            #if DEBUG
+            dlog("peer.doctor.version state=upToDate remote=\(installed) latest=\(latest)")
+            #endif
+            return .okUpToDate(socket: socketPath, version: installed)
+        case .outdated(let latestTag):
+            #if DEBUG
+            dlog("peer.doctor.version state=outdated remote=\(installed) latest=\(latestTag)")
+            #endif
+            return .updateAvailable(socket: socketPath, remote: installed, latest: latestTag)
+        case .legacy:
+            #if DEBUG
+            dlog("peer.doctor.version state=legacy remote=\(installed) latest=\(latest)")
+            #endif
+            return .legacyDaemon(socket: socketPath, remote: installed)
+        case .unknown:
+            #if DEBUG
+            dlog("peer.doctor.version state=unknown remote=\(installed) latest=\(latest)")
+            #endif
+            return .okVersionUnknown(socket: socketPath)
         }
     }
 
