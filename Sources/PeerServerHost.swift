@@ -4,6 +4,7 @@
 //  to real PTYs via `tm-agent peer list / peer attach`.
 
 import AppKit
+import Bonsplit
 import PeerProto
 
 @MainActor
@@ -44,6 +45,7 @@ final class PeerHostCoordinator: NSObject {
     private var socketPath: String?
     private var provider: GhosttyPaneSurfaceProvider?
     private var layoutObserver: NSObjectProtocol?
+    private var workspaceClosedObserver: NSObjectProtocol?
     private var bonjour: PeerBonjourPublisher?
     private var lifecycle: Lifecycle = .stopped
     private var startDialogOpen = false
@@ -181,7 +183,7 @@ final class PeerHostCoordinator: NSObject {
         self.provider = nil
         let oldPath = socketPath
         socketPath = nil
-        uninstallLayoutChangeBridge()
+        uninstallPeerBridges()
         bonjour?.stop()
         bonjour = nil
         await server.stop()
@@ -219,7 +221,7 @@ final class PeerHostCoordinator: NSObject {
         server = nil
         provider = nil
         socketPath = nil
-        uninstallLayoutChangeBridge()
+        uninstallPeerBridges()
         bonjour?.stop()
         bonjour = nil
         lifecycle = .stopped
@@ -238,6 +240,7 @@ final class PeerHostCoordinator: NSObject {
         }
         lifecycle = .running(path)
         installLayoutChangeBridge(server: server, provider: provider)
+        installWorkspaceClosedBridge(server: server)
         // LAN discovery: advertise via Bonjour so other macs on
         // the same network can pick this host out of a list
         // instead of typing an SSH alias by hand. The TXT record
@@ -343,10 +346,40 @@ final class PeerHostCoordinator: NSObject {
         layoutBroadcastDebounce[workspaceID] = task
     }
 
-    private func uninstallLayoutChangeBridge() {
+    /// Bridge from `TabManager.closeWorkspace`'s `.peerWorkspaceDidClose`
+    /// post to the peer server's `WorkspaceRemoved` broadcast. Covers
+    /// both a peer-initiated `DeleteWorkspaceRequest`
+    /// (`GhosttyPaneSurfaceProvider.deleteWorkspace` calls
+    /// `closeWorkspace` directly) and a host-local close (Cmd+W,
+    /// sidebar, tab-bar) — `closeWorkspace` is the single choke point
+    /// for both, so one observer covers the whole contract described
+    /// on `WorkspaceRemoved` in peer.proto ("via DeleteWorkspaceRequest
+    /// or a host-local UI action").
+    private func installWorkspaceClosedBridge(server: PeerServer) {
+        workspaceClosedObserver = NotificationCenter.default.addObserver(
+            forName: .peerWorkspaceDidClose,
+            object: nil,
+            queue: .main
+        ) { [weak server] note in
+            guard let server,
+                  let workspaceID = note.userInfo?["workspaceID"] as? UUID
+            else { return }
+            let idBytes = withUnsafeBytes(of: workspaceID.uuid) { Data($0) }
+            #if DEBUG
+            dlog("peer.host.broadcastWorkspaceRemoved id=\(workspaceID.uuidString.prefix(8))")
+            #endif
+            Task { await server.broadcastWorkspaceRemoved(workspaceID: idBytes) }
+        }
+    }
+
+    private func uninstallPeerBridges() {
         if let observer = layoutObserver {
             NotificationCenter.default.removeObserver(observer)
             layoutObserver = nil
+        }
+        if let observer = workspaceClosedObserver {
+            NotificationCenter.default.removeObserver(observer)
+            workspaceClosedObserver = nil
         }
         for (_, task) in layoutBroadcastDebounce { task.cancel() }
         layoutBroadcastDebounce.removeAll()
@@ -383,6 +416,19 @@ extension Notification.Name {
     /// `PeerHostCoordinator` which pushes the refreshed layout
     /// to attached peer clients.
     static let peerWorkspaceLayoutDidChange = Notification.Name("PeerWorkspaceLayoutDidChange")
+
+    /// Posted by `TabManager.closeWorkspace` whenever a workspace
+    /// itself (not a pane inside one) is torn down — via a peer
+    /// `DeleteWorkspaceRequest` (`GhosttyPaneSurfaceProvider
+    /// .deleteWorkspace`) or a host-local UI close (Cmd+W, sidebar,
+    /// tab-bar close). userInfo carries `["workspaceID": UUID]` — the
+    /// id of the workspace that was actually removed (for the
+    /// "closed the window's last tab" case, this is the ORIGINAL
+    /// workspace's id, not its blank replacement). Observed by
+    /// `PeerHostCoordinator`, which broadcasts `WorkspaceRemoved` to
+    /// every attached peer session so viewers drop it from their
+    /// roster without polling `ListWorkspaces`.
+    static let peerWorkspaceDidClose = Notification.Name("PeerWorkspaceDidClose")
 
     /// Posted by `PeerHostCoordinator` whenever the local peer
     /// server starts or stops. Observed by the status-bar icon to

@@ -970,6 +970,20 @@ class TabManager: ObservableObject {
             selectedTabId = replacement.id
         }
 
+        // Peer federation: tell PeerHostCoordinator this workspace_id is
+        // gone regardless of how it was closed — peer-initiated
+        // DeleteWorkspaceRequest (GhosttyPaneSurfaceProvider.deleteWorkspace
+        // calls closeWorkspace directly) or host-local UI (Cmd+W, sidebar,
+        // tab-bar). Fires the ORIGINAL workspace's id even in the
+        // last-tab self-heal branch above — the id that's actually gone,
+        // not its blank replacement. No-op when no peer server is running
+        // (NotificationCenter post with zero observers).
+        NotificationCenter.default.post(
+            name: .peerWorkspaceDidClose,
+            object: nil,
+            userInfo: ["workspaceID": workspace.id]
+        )
+
         scheduleSessionSave()
     }
 

@@ -325,6 +325,14 @@ final class GhosttyPaneSurfaceProvider: PeerSurfaceProvider {
         await MainActor.run { applyWorkspaceControl(control) }
     }
 
+    func renameWorkspace(id workspaceID: Data, title: String) async -> Bool {
+        await MainActor.run { performRenameWorkspace(workspaceIDBytes: workspaceID, title: title) }
+    }
+
+    func deleteWorkspace(id workspaceID: Data) async -> Bool {
+        await MainActor.run { performDeleteWorkspace(workspaceIDBytes: workspaceID) }
+    }
+
     func attach(
         surfaceID: Data,
         clientCols: UInt32,
@@ -636,6 +644,89 @@ final class GhosttyPaneSurfaceProvider: PeerSurfaceProvider {
             }
         }
         _ = panel  // silence unused
+    }
+
+    /// Rename an existing workspace's display name in place; its id
+    /// never changes. Returns `false` (no-op) for an empty/unknown
+    /// `workspaceIDBytes` — mirrors the Rust host's
+    /// `PeerHost::rename_workspace` contract (`connection.rs`'s
+    /// `RenameWorkspaceRequest` handler) of never guessing "the
+    /// current" or "the default" workspace. Delegates the actual
+    /// title update to `Workspace.setCustomTitle(_:)` — the same
+    /// entry point the tab-bar's inline rename UI uses — so a
+    /// whitespace-only/empty title clears back to the process title
+    /// exactly like a host-local rename would, instead of hand-rolling
+    /// a second, slightly different empty-title rule here.
+    private func performRenameWorkspace(workspaceIDBytes: Data, title: String) -> Bool {
+        guard !workspaceIDBytes.isEmpty,
+              let target = uuidFromSurfaceID(workspaceIDBytes),
+              let (_, workspace) = workspaceForID(target)
+        else {
+            #if DEBUG
+            dlog("peer.host.renameWorkspace ignored id=\(workspaceIDBytes.map { String(format: "%02x", $0) }.joined().prefix(8)) reason=unknown_or_empty")
+            #endif
+            return false
+        }
+        workspace.setCustomTitle(title)
+        #if DEBUG
+        dlog("peer.host.renameWorkspace id=\(target.uuidString.prefix(8)) title=\(title)")
+        #endif
+        return true
+    }
+
+    /// Delete an existing workspace: tears down every pane inside it
+    /// via `TabManager.closeWorkspace` and drops it from that window's
+    /// roster. Returns `false` (no-op) for an empty/unknown
+    /// `workspaceIDBytes` — same "never delete all/current" contract as
+    /// `performRenameWorkspace` and the Rust host's
+    /// `PeerHost::remove_workspace`.
+    ///
+    /// Unlike the Rust daemon host (a single flat workspace collection
+    /// that refuses to remove its LAST entry — `RemoveWorkspaceError
+    /// .LastWorkspace` — because un-namespaced control always needs a
+    /// home), term-mesh.app is multi-window: `TabManager.closeWorkspace`
+    /// already guarantees each *window* keeps at least one tab by
+    /// replacing the closed one with a fresh blank workspace when it
+    /// was the window's last tab. That self-heal is the Mac-side
+    /// equivalent of the Rust refusal — it never leaves a window with
+    /// zero workspaces — so no separate last-workspace guard is needed
+    /// here.
+    ///
+    /// The caller (`PeerServerSession.dispatch`) does not itself
+    /// broadcast `WorkspaceRemoved` — `TabManager.closeWorkspace` posts
+    /// `.peerWorkspaceDidClose`, which `PeerHostCoordinator` observes
+    /// and forwards to `PeerServer.broadcastWorkspaceRemoved`, so a
+    /// host-local close (Cmd+W, sidebar) broadcasts through the exact
+    /// same path as a peer-initiated `DeleteWorkspaceRequest`.
+    private func performDeleteWorkspace(workspaceIDBytes: Data) -> Bool {
+        guard !workspaceIDBytes.isEmpty,
+              let target = uuidFromSurfaceID(workspaceIDBytes),
+              let (tabManager, workspace) = workspaceForID(target)
+        else {
+            #if DEBUG
+            dlog("peer.host.deleteWorkspace ignored id=\(workspaceIDBytes.map { String(format: "%02x", $0) }.joined().prefix(8)) reason=unknown_or_empty")
+            #endif
+            return false
+        }
+        #if DEBUG
+        dlog("peer.host.deleteWorkspace id=\(target.uuidString.prefix(8)) paneCount=\(workspace.panels.count)")
+        #endif
+        tabManager.closeWorkspace(workspace)
+        return true
+    }
+
+    /// Find the live `Workspace` (across every host window) whose id
+    /// matches `target`, plus the `TabManager` that owns it. Shared
+    /// lookup for rename/delete — both address a workspace by its wire
+    /// `workspace_id`, not by a pane inside it (contrast
+    /// `workspaceContaining(panelUUID:)` below).
+    private func workspaceForID(_ target: UUID) -> (tabManager: TabManager, workspace: Workspace)? {
+        for ctx in allWindowContexts() {
+            if let workspace = ctx.tabManager.tabs.first(where: { $0.id == target }) {
+                return (ctx.tabManager, workspace)
+            }
+        }
+        return nil
     }
 
     private func uuidFromSurfaceID(_ data: Data) -> UUID? {

@@ -133,10 +133,31 @@ public protocol PeerSurfaceProvider: AnyObject, Sendable {
     /// resulting layout change is observable via the same
     /// `WorkspaceLayoutChanged` push path.
     func handleWorkspaceControl(_ control: Termmesh_Peer_V1_WorkspaceControl) async
+
+    /// Rename an existing workspace in place; the id never changes.
+    /// Returns `false` (no-op) for an empty or unknown `workspaceID` —
+    /// mirrors the Rust host's `PeerHost::rename_workspace` contract
+    /// of never guessing "the current" or "the default" workspace.
+    /// Gated behind capability "workspace.lifecycle.v1". Default no-op
+    /// for providers with no real workspace tree.
+    func renameWorkspace(id workspaceID: Data, title: String) async -> Bool
+
+    /// Delete an existing workspace: tears down every pane inside it
+    /// and removes it from the roster. Returns `false` (no-op) for an
+    /// empty or unknown `workspaceID` — same "never delete all/current"
+    /// contract as `renameWorkspace`. Callers are responsible for
+    /// broadcasting the resulting `WorkspaceRemoved` push (see
+    /// `PeerServer.broadcastWorkspaceRemoved`); this method only
+    /// mutates local state. Gated behind capability
+    /// "workspace.lifecycle.v1". Default no-op for providers with no
+    /// real workspace tree.
+    func deleteWorkspace(id workspaceID: Data) async -> Bool
 }
 
 public extension PeerSurfaceProvider {
     func listWorkspaces() async -> [Termmesh_Peer_V1_Workspace] { [] }
+    func renameWorkspace(id workspaceID: Data, title: String) async -> Bool { false }
+    func deleteWorkspace(id workspaceID: Data) async -> Bool { false }
     func handleWorkspaceControl(_ control: Termmesh_Peer_V1_WorkspaceControl) async {}
 }
 
@@ -386,6 +407,18 @@ public actor PeerServer {
     ) async {
         for session in activeSessions {
             try? await session.pushWorkspaceLayoutChanged(workspaceID: workspaceID, layout: layout)
+        }
+    }
+
+    /// Push a `WorkspaceRemoved` update to every connected session.
+    /// Callers (term-mesh.app's `PeerHostCoordinator`) invoke this
+    /// once a workspace is actually gone — via a peer
+    /// `DeleteWorkspaceRequest` or a host-local UI close (Cmd+W,
+    /// sidebar close) — so already-attached clients drop it from their
+    /// roster without polling `ListWorkspaces`.
+    public func broadcastWorkspaceRemoved(workspaceID: Data) async {
+        for session in activeSessions {
+            try? await session.pushWorkspaceRemoved(workspaceID: workspaceID)
         }
     }
 
@@ -939,6 +972,22 @@ actor PeerServerSession {
         }
     }
 
+    /// Server-initiated push notifying the client that `workspaceID`
+    /// itself (not a pane inside it) was deleted — via a peer
+    /// `DeleteWorkspaceRequest` or a host-local UI close. Sent only
+    /// after the session reaches `.ready`, matching
+    /// `pushWorkspaceLayoutChanged`.
+    func pushWorkspaceRemoved(workspaceID: Data) async throws {
+        guard state == .ready else { return }
+        try await sendEnvelope { env in
+            var removed = Termmesh_Peer_V1_WorkspaceRemoved()
+            removed.workspaceID = workspaceID
+            var wu = Termmesh_Peer_V1_WorkspaceUpdate()
+            wu.workspaceRemoved = removed
+            env.workspaceUpdate = wu
+        }
+    }
+
     private func teardownAttachments() async {
         for (_, task) in relayTasks {
             task.cancel()
@@ -1024,6 +1073,20 @@ actor PeerServerSession {
             // Fire-and-forget; the resulting layout update flows back
             // via the existing WorkspaceLayoutChanged push.
             await provider.handleWorkspaceControl(ctl)
+
+        case (.ready, .renameWorkspaceRequest(let req)):
+            // Fire-and-forget like WorkspaceControl: no reply, paired
+            // or otherwise. An empty/unknown workspace_id is a silent
+            // no-op — matches the Rust host's connection.rs handler.
+            _ = await provider.renameWorkspace(id: req.workspaceID, title: req.title)
+
+        case (.ready, .deleteWorkspaceRequest(let req)):
+            // Fire-and-forget: the only observable result of a
+            // successful delete is the WorkspaceRemoved push the
+            // provider's caller (term-mesh.app's PeerHostCoordinator)
+            // broadcasts once the underlying TabManager mutation
+            // completes — see GhosttyPaneSurfaceProvider.deleteWorkspace.
+            _ = await provider.deleteWorkspace(id: req.workspaceID)
 
         case (.ready, .attachSurface(let req)):
             try await handleAttach(req, correlationID: env.seq)
