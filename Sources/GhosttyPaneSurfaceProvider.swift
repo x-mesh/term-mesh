@@ -231,7 +231,12 @@ final class PtyTapHub: @unchecked Sendable {
         }
         lock.unlock()
         #if DEBUG
-        if let droppedCount {
+        // Rate-limited (first + every 500th): a flood drops thousands of
+        // chunks/sec, and one line per drop rewrites the entire 500-entry
+        // debug ring with drop spam — evicting the very gap/heal events
+        // needed to diagnose the flood. Same pattern as the P9 gap log in
+        // PeerRelaySession.
+        if let droppedCount, droppedCount == 1 || droppedCount % 500 == 0 {
             dlog("peer.broadcast.drop count=\(droppedCount) surface=\(surfaceID.uuidString.prefix(8))")
         }
         #endif

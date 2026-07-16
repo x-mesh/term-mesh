@@ -1072,8 +1072,33 @@ final class PeerRelaySession {
                     // THIS surface's PtyData here — no sibling frame to steal
                     // and nothing to filter. Stream end == demux deregistered
                     // this surface (pane close) or the shared session died.
+                    //
+                    // P9 gap detection on the SHARED path too: the demux
+                    // carries each frame's byte_seq, and a jump past the
+                    // previous frame's end means bytes were dropped upstream
+                    // (host tap overflow, or the demux's own bounded buffer)
+                    // — the mirror pane is now truncated. Before this the
+                    // check lived only on the owned path below, so workspace
+                    // mirror panes never detected drops and never healed.
+                    var expectedByteSeq: UInt64?
+                    var gapBytesTotal: UInt64 = 0
+                    var gapCount = 0
                     for await chunk in ptyStream {
                         if Task.isCancelled { break }
+                        if let expected = expectedByteSeq, chunk.byteSeq > expected {
+                            let gap = chunk.byteSeq - expected
+                            gapBytesTotal += gap
+                            gapCount += 1
+                            #if DEBUG
+                            // Rate-limited like the owned path: one line per
+                            // 500 gaps keeps a flood from wiping the ring.
+                            if gapCount == 1 || gapCount % 500 == 0 {
+                                dlog("peer.relay.gap #\(gapCount) dropped=\(gap) totalDropped=\(gapBytesTotal) — shared-path drop (content truncated)")
+                            }
+                            #endif
+                            await resizeCoalescer.noteGapForHeal()
+                        }
+                        expectedByteSeq = chunk.byteSeq + UInt64(chunk.payload.count)
                         do {
                             try await writer.enqueue(type: kTypePtyData, payload: chunk.payload)
                         } catch {
