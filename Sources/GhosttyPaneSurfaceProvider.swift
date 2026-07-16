@@ -100,8 +100,17 @@ final class PtyTapHub: @unchecked Sendable {
     static let replayCapacityBytes = 64 * 1024
 
     private let lock = NSLock()
-    private var continuations: [UUID: AsyncStream<Data>.Continuation] = [:]
+    private var continuations: [UUID: AsyncStream<PtyTapChunk>.Continuation] = [:]
     private var replay = ReplayBuffer()
+    /// Cumulative bytes ever broadcast through this hub. Advanced under
+    /// `lock` for EVERY chunk — including ones a consumer's bounded
+    /// buffer then drops — and stamped onto each `PtyTapChunk.seq`, so a
+    /// drop shows up downstream as a seq hole (`PeerServer.pumpByteStream`
+    /// forwards it into `PtyData.byte_seq`, which is what the viewer's P9
+    /// gap detection keys on). Before this, drops were invisible on the
+    /// wire: the pump counted only delivered chunks, seq stayed
+    /// contiguous, and flood truncation could never trigger a heal.
+    private var tapSeq: UInt64 = 0
     /// Cumulative count of `broadcast()` yields dropped by ANY consumer's
     /// `bufferingNewest(256)` stream (a slow/stalled peer's buffer
     /// overflowing while PTY output keeps arriving). `AsyncStream`
@@ -137,17 +146,57 @@ final class PtyTapHub: @unchecked Sendable {
         #endif
     }
 
-    func makeStream(initialBytes: Data?) -> (UUID, AsyncStream<Data>) {
+    /// Atomically — one `lock` hold shared with `broadcast(_:)` — decides
+    /// the attach-time backlog (ring replay vs the caller-supplied
+    /// viewport fallback), registers the consumer continuation, and
+    /// stamps the initial chunk against the tap's cumulative counter.
+    /// This closes the P4-era seam where `replaySnapshot()` and
+    /// registration were two separate lock acquisitions: a `broadcast()`
+    /// landing between them was neither in the replay copy nor delivered
+    /// live. Now nothing can interleave, and even if a producer-side
+    /// drop hits immediately after, the seq stamps make it visible.
+    ///
+    /// `fallbackSnapshot` must be computed BEFORE calling (it reads
+    /// Ghostty's grid on MainActor — never under this lock, which the IO
+    /// reader thread contends on).
+    func makeStream(
+        fallbackSnapshot: Data?,
+        mousePrefix: Data?
+    ) -> (
+        attachID: UUID,
+        stream: AsyncStream<PtyTapChunk>,
+        usedBufferReplay: Bool,
+        initialByteCount: Int,
+        replayChunkCount: Int
+    ) {
         let attachID = UUID()
-        let stream = AsyncStream<Data>(bufferingPolicy: .bufferingNewest(256)) { continuation in
-            lock.lock()
+        lock.lock()
+        let usedBufferReplay = replay.isSafeForCompleteReplay
+        var initial = usedBufferReplay ? replay.concatenatedBytes() : (fallbackSnapshot ?? Data())
+        if let mousePrefix, !mousePrefix.isEmpty {
+            initial = mousePrefix + initial
+        }
+        let replayChunkCount = replay.chunkCount
+        let stream = AsyncStream<PtyTapChunk>(bufferingPolicy: .bufferingNewest(256)) { continuation in
+            // The build closure runs synchronously inside init — still
+            // under the outer lock hold, so registration + initial yield
+            // are atomic with any concurrent broadcast().
             continuations[attachID] = continuation
-            lock.unlock()
-            if let initialBytes {
-                continuation.yield(initialBytes)
+            if !initial.isEmpty {
+                // Stamp so the chunk's END lands exactly on the current
+                // tap offset: ring-replay bytes genuinely ARE the tap
+                // stream's last `initial.count` bytes; for the viewport
+                // fallback (and the mouse-mode prefix) the stamp is
+                // synthetic but establishes the same baseline — the first
+                // live chunk compares against `tapSeq`, so there is no
+                // false gap. (`&-` may wrap on a fresh hub; the pump only
+                // uses chunk END offsets, and `wrap &+ count` round-trips
+                // back to `tapSeq`.)
+                continuation.yield(PtyTapChunk(bytes: initial, seq: tapSeq &- UInt64(initial.count)))
             }
         }
-        return (attachID, stream)
+        lock.unlock()
+        return (attachID, stream, usedBufferReplay, initial.count, replayChunkCount)
     }
 
     func broadcast(_ bytes: Data) {
@@ -168,16 +217,26 @@ final class PtyTapHub: @unchecked Sendable {
         // holding the lock, even though drops are expected to be rare.
         lock.lock()
         replay.push(bytes)
+        // Stamp BEFORE fan-out and advance unconditionally: a dropped
+        // yield must still consume tap offsets, or the drop is invisible
+        // in the seq stream (see `tapSeq` doc).
+        let chunk = PtyTapChunk(bytes: bytes, seq: tapSeq)
+        tapSeq &+= UInt64(bytes.count)
         var droppedCount: UInt64?
         for continuation in continuations.values {
-            if case .dropped = continuation.yield(bytes) {
+            if case .dropped = continuation.yield(chunk) {
                 dropCount &+= 1
                 droppedCount = dropCount
             }
         }
         lock.unlock()
         #if DEBUG
-        if let droppedCount {
+        // Rate-limited (first + every 500th): a flood drops thousands of
+        // chunks/sec, and one line per drop rewrites the entire 500-entry
+        // debug ring with drop spam — evicting the very gap/heal events
+        // needed to diagnose the flood. Same pattern as the P9 gap log in
+        // PeerRelaySession.
+        if let droppedCount, droppedCount == 1 || droppedCount % 500 == 0 {
             dlog("peer.broadcast.drop count=\(droppedCount) surface=\(surfaceID.uuidString.prefix(8))")
         }
         #endif
@@ -289,53 +348,30 @@ final class GhosttyPaneSurfaceProvider: PeerSurfaceProvider {
             ghostty_surface_set_pty_data_callback(sfcPtr, ptyTapCallback, hubPtr)
         }
 
-        // Phase P4: prefer the hub's ring-buffer replay (raw PTY bytes —
-        // ANSI/style preserved) over the plain-text viewport snapshot
-        // below, but ONLY when the buffer is certifiably the surface's
-        // *complete* output history (non-empty, never evicted anything to
-        // stay under the byte cap). A pane opened hours ago (vim/htop/log
-        // tail) can easily outlive the 64KB cap; replaying a buffer that
-        // already dropped its oldest bytes risks starting mid-escape-
-        // sequence or mid-frame — worse than the plain-text fallback.
-        // `readPaneSnapshot` reads Ghostty's live cell grid directly, so it
-        // stays coherent regardless of how long the pane has been open —
-        // the safe fallback whenever the buffer can't certify completeness.
+        // Phase P4: prefer the hub ring's replay (raw PTY bytes — ANSI/
+        // style preserved) over the plain-text viewport snapshot, but ONLY
+        // when the ring is certifiably the surface's *complete* output
+        // history (non-empty, never evicted anything to stay under the
+        // byte cap). A pane opened hours ago (vim/htop/log tail) easily
+        // outlives the 64KB cap; replaying an evicted ring risks starting
+        // mid-escape-sequence or mid-frame — worse than the fallback.
         //
-        // Known gap (dedup scope-out — matches why Rust's PtySurface
-        // carries a `byte_seq`): `hub.replaySnapshot()` below and
-        // `hub.makeStream()`'s continuation registration further down are
-        // two SEPARATE lock acquisitions, not one atomic step. Any
-        // `broadcast()` landing in the brief (synchronous, non-blocking)
-        // window between them is neither in this replay copy (already
-        // taken) nor delivered live (continuation not registered yet) —
-        // silently missed for this attach. Rust has the identical seam
-        // (`replay_snapshot()` and `subscribe()` are also two independent
-        // calls — daemon/term-meshd/src/peer/surface.rs:257-266), which is
-        // exactly why each chunk there carries a `byte_seq` for a future
-        // dedup/gap-fill pass. No *duplication* risk to a single new
-        // consumer either way: every byte in the replay copy already
-        // finished broadcasting (past tense — this consumer wasn't
-        // registered yet), so it can never also arrive live for it.
-        // Closing the gap itself (seq-tagged chunks + reconciliation) is
-        // out of scope for this phase.
-        let replaySnap = hub.replaySnapshot()
-        var snapshot: Data?
-        let usedBufferReplay: Bool
-        if replaySnap.isSafeForCompleteReplay {
-            snapshot = replaySnap.bytes
-            usedBufferReplay = true
-        } else {
-            // Send a snapshot of the current viewport so the relay window
-            // shows existing content immediately instead of starting
-            // blank. ANSI styling is lost (text only); fullscreen TUIs
-            // (vim, less, htop) won't redraw without SIGWINCH and require
-            // manual refresh.
-            snapshot = readPaneSnapshot(sfcPtr)
-            usedBufferReplay = false
-        }
-        #if DEBUG
-        dlog("peer.replay.attach mode=\(usedBufferReplay ? "buffer" : "snapshot") bytes=\(snapshot?.count ?? 0) chunks=\(replaySnap.chunkCount)")
-        #endif
+        // The replay-vs-fallback decision now happens INSIDE `makeStream`
+        // under the hub lock, atomically with continuation registration —
+        // closing the old seam where a `broadcast()` between the separate
+        // `replaySnapshot()` and registration lock holds was neither in
+        // the replay copy nor delivered live. Any producer-side drop from
+        // here on is visible downstream anyway: chunks carry tap seqs and
+        // the pump forwards discontinuities as `byte_seq` holes.
+        //
+        // The viewport fallback is computed unconditionally up front: it
+        // reads Ghostty's live cell grid on MainActor and must never run
+        // under the hub lock (contended by Ghostty's IO reader thread).
+        // Cost is one grid read per attach — attaches are user-driven and
+        // rare. ANSI styling is lost on this path (text only); fullscreen
+        // TUIs (vim, less, htop) won't redraw without SIGWINCH and
+        // require manual refresh.
+        let fallbackSnapshot = readPaneSnapshot(sfcPtr)
 
         // Replay mouse-mode state the viewer missed. Apps that enabled
         // mouse reporting before this attach (Claude Code, vim, htop)
@@ -351,15 +387,17 @@ final class GhosttyPaneSurfaceProvider: PeerSurfaceProvider {
         // (1006). Attach-only on purpose: a later mode change on the
         // host streams through the tap, and the resize-path snapshot
         // re-send must not overwrite an exact mode (e.g. ?1003h) with
-        // this guess. Applies uniformly whether `snapshot` came from the
-        // buffer replay or the plain-text fallback above.
-        if ghostty_surface_mouse_captured(sfcPtr) {
-            var prefixed = Data("\u{1b}[?1002h\u{1b}[?1006h".utf8)
-            if let existing = snapshot { prefixed.append(existing) }
-            snapshot = prefixed
-        }
+        // this guess. Applies uniformly whether the initial bytes come
+        // from the buffer replay or the plain-text fallback.
+        let mousePrefix: Data? = ghostty_surface_mouse_captured(sfcPtr)
+            ? Data("\u{1b}[?1002h\u{1b}[?1006h".utf8)
+            : nil
 
-        let (attachID, stream) = hub.makeStream(initialBytes: snapshot)
+        let (attachID, stream, usedBufferReplay, initialByteCount, replayChunkCount) =
+            hub.makeStream(fallbackSnapshot: fallbackSnapshot, mousePrefix: mousePrefix)
+        #if DEBUG
+        dlog("peer.replay.attach mode=\(usedBufferReplay ? "buffer" : "snapshot") bytes=\(initialByteCount) chunks=\(replayChunkCount)")
+        #endif
 
         // Light up the peer-attached ring on the host pane and bump
         // the per-surface ref count so concurrent attaches all share

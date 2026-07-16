@@ -29,14 +29,36 @@ private let maxPeerServerSessions = 64
 
 // MARK: - PeerSurfaceProvider
 
+/// One host→client PTY chunk plus its offset in the producer's cumulative
+/// byte stream. `seq` is the tap-relative offset of `bytes`' first byte.
+///
+/// Producers MUST advance their running offset for every byte that enters
+/// the tap — including chunks a bounded stream buffer later drops — so
+/// `pumpByteStream` can forward producer-side drops as `PtyData.byte_seq`
+/// holes. Without this the wire seq stays contiguous across a drop and the
+/// viewer's gap detection (P9, `PeerRelaySession.swift`) mathematically
+/// never fires: silent truncation with no heal. A producer with no drop
+/// path (e.g. `EchoSurfaceProvider`) just counts delivered bytes.
+public struct PtyTapChunk: Sendable {
+    public let bytes: Data
+    public let seq: UInt64
+
+    public init(bytes: Data, seq: UInt64) {
+        self.bytes = bytes
+        self.seq = seq
+    }
+}
+
 /// Returned by `PeerSurfaceProvider.attach`. Carries the per-attach state
 /// the server needs to pump bytes to the client and route client inputs
 /// back to the surface's underlying byte producer (e.g. a PTY).
 public struct PeerSurfaceAttachment: Sendable {
     /// Host → client byte stream. Each element is a chunk that becomes
-    /// one `PtyData` frame. The session continues until this stream
-    /// finishes, then ends the attach from the server side.
-    public let byteStream: AsyncStream<Data>
+    /// one `PtyData` frame (before P7 coalescing). The session continues
+    /// until this stream finishes, then ends the attach from the server
+    /// side. Chunk `seq` discontinuities are forwarded as wire `byte_seq`
+    /// holes — see `PtyTapChunk`.
+    public let byteStream: AsyncStream<PtyTapChunk>
     /// Client → host: raw keystroke bytes from an Input frame.
     public let input: @Sendable (Data) async -> Void
     /// Client → host: resize from a Resize frame (cols, rows).
@@ -50,7 +72,7 @@ public struct PeerSurfaceAttachment: Sendable {
     public let detach: @Sendable () async -> Void
 
     public init(
-        byteStream: AsyncStream<Data>,
+        byteStream: AsyncStream<PtyTapChunk>,
         input: @escaping @Sendable (Data) async -> Void,
         resize: @escaping @Sendable (UInt32, UInt32) async -> Void = { _, _ in },
         workspaceMeta: PeerWorkspaceMeta? = nil,
@@ -149,7 +171,10 @@ public actor StaticSurfaceProvider: PeerSurfaceProvider {
 /// without a real PTY on the provider side.
 public actor EchoSurfaceProvider: PeerSurfaceProvider {
     private let surfaces: [Termmesh_Peer_V1_SurfaceInfo]
-    private var continuations: [Data: AsyncStream<Data>.Continuation] = [:]
+    private var continuations: [Data: AsyncStream<PtyTapChunk>.Continuation] = [:]
+    /// Per-surface running byte offset for `PtyTapChunk.seq`. The echo
+    /// path has no drop point, so counting delivered bytes is exact.
+    private var echoSeqs: [Data: UInt64] = [:]
 
     public init(surfaces: [Termmesh_Peer_V1_SurfaceInfo]) {
         self.surfaces = surfaces
@@ -165,7 +190,7 @@ public actor EchoSurfaceProvider: PeerSurfaceProvider {
         clientRows: UInt32
     ) async -> PeerSurfaceAttachment? {
         guard surfaces.contains(where: { $0.surfaceID == surfaceID }) else { return nil }
-        let (stream, continuation) = AsyncStream.makeStream(of: Data.self)
+        let (stream, continuation) = AsyncStream.makeStream(of: PtyTapChunk.self)
         continuations[surfaceID] = continuation
 
         let input: @Sendable (Data) async -> Void = { [weak self] bytes in
@@ -184,12 +209,15 @@ public actor EchoSurfaceProvider: PeerSurfaceProvider {
     }
 
     private func yield(surfaceID: Data, bytes: Data) {
-        continuations[surfaceID]?.yield(bytes)
+        let seq = echoSeqs[surfaceID] ?? 0
+        echoSeqs[surfaceID] = seq &+ UInt64(bytes.count)
+        continuations[surfaceID]?.yield(PtyTapChunk(bytes: bytes, seq: seq))
     }
 
     private func finish(surfaceID: Data) {
         continuations[surfaceID]?.finish()
         continuations.removeValue(forKey: surfaceID)
+        echoSeqs.removeValue(forKey: surfaceID)
     }
 }
 
@@ -1118,7 +1146,17 @@ actor PeerServerSession {
         surfaceID: Data,
         attachment: PeerSurfaceAttachment
     ) async {
-        var byteSeq: UInt64 = 0
+        // Wire seq accounting: rebases the producer's tap-relative chunk
+        // seqs to a per-attach 0-based wire seq, PRESERVING inter-chunk
+        // holes. A chunk the producer's bounded buffer dropped never
+        // arrives here — its width shows up as `chunk.seq > lastTapEnd`
+        // and is added to `wireSeq`, so the viewer sees a `byte_seq` jump
+        // and its P9 gap heal fires. The old `byteSeq &+= bytes.count`
+        // counter only counted DELIVERED chunks: drops left the wire seq
+        // contiguous and truncation was undetectable downstream.
+        var wireSeq: UInt64 = 0
+        var lastTapEnd: UInt64?
+        var sendFailed = false
         let coalescer = PtyDataCoalescer { [weak self] payload, seq in
             guard let self else { return false }
             do {
@@ -1135,12 +1173,23 @@ actor PeerServerSession {
             }
         }
 
-        for await bytes in attachment.byteStream {
+        for await chunk in attachment.byteStream {
             if Task.isCancelled { break }
-            if bytes.isEmpty { continue }
-            let startSeq = byteSeq
-            byteSeq &+= UInt64(bytes.count)
-            if await coalescer.submit(bytes, startSeq: startSeq) == false { break }
+            if chunk.bytes.isEmpty { continue }
+            if let prevEnd = lastTapEnd, chunk.seq > prevEnd {
+                // Producer-side drop between the previous chunk and this
+                // one — forward the hole to the wire. (A `seq` at or below
+                // `prevEnd` — synthetic snapshot stamps, wrap — is treated
+                // as contiguous; only forward jumps are meaningful.)
+                wireSeq &+= (chunk.seq - prevEnd)
+            }
+            lastTapEnd = chunk.seq &+ UInt64(chunk.bytes.count)
+            let startSeq = wireSeq
+            wireSeq &+= UInt64(chunk.bytes.count)
+            if await coalescer.submit(chunk.bytes, startSeq: startSeq) == false {
+                sendFailed = true
+                break
+            }
         }
         // Stream ended (natural finish, cancellation, or a send failure
         // broke the loop above) — flush whatever the coalescer is still
@@ -1155,6 +1204,15 @@ actor PeerServerSession {
         // lost on close (P7 proposal audit note; hard regression gate:
         // test_peer_input_bracketed_paste_split_close.py).
         await coalescer.flushRemaining()
+        // A send failure means this attach can never deliver another byte,
+        // but the attach registry still lists it — the host keeps the pane
+        // "attached" while the stream is permanently dead (zombie pane:
+        // heartbeat fine, output frozen forever). Detach so the provider
+        // releases per-attach resources and the client's next attach starts
+        // a live pump instead of piling onto a corpse.
+        if sendFailed {
+            await detachSurface(id: surfaceID)
+        }
     }
 
     private func detachSurface(id: Data) async {

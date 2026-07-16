@@ -207,7 +207,14 @@ final class RemoteHostStore: ObservableObject {
                 hosts[key]?.symbolName = p.symbolName
                 hosts[key]?.sshPort = p.sshPort
                 hosts[key]?.identityFile = p.identityFile
-                if hosts[key]?.remoteSockPath == nil, !p.remoteSocket.isEmpty {
+                // A non-empty profile socket is the user's explicit choice
+                // and must WIN over whatever this row cached from an earlier
+                // resolution — the old nil-only fill meant editing the
+                // socket path in the profile editor never reached the
+                // sidebar row, which kept tunneling to the stale path.
+                // An empty profile socket means auto-detect: keep the
+                // resolved path so reconnects skip a redundant probe.
+                if !p.remoteSocket.isEmpty {
                     hosts[key]?.remoteSockPath = p.remoteSocket
                 }
             }
@@ -278,7 +285,16 @@ final class RemoteHostStore: ObservableObject {
                 if let ssh = conn.sshTarget, !ssh.isEmpty {
                     hosts[key]?.sshTarget = ssh
                 }
-                if let remote = conn.remoteSockPath, !remote.isEmpty {
+                // Track the connection's resolved socket only when the
+                // profile doesn't pin one explicitly — an explicit profile
+                // socket must keep winning even while an older connection
+                // (opened before the profile edit) is still alive on the
+                // previous path, or the next connect silently reuses the
+                // stale socket the user just edited away.
+                let pinnedSocket = hosts[key].flatMap {
+                    PeerHostProfileStore.shared.profile(id: $0.profileID)?.remoteSocket
+                } ?? ""
+                if pinnedSocket.isEmpty, let remote = conn.remoteSockPath, !remote.isEmpty {
                     hosts[key]?.remoteSockPath = remote
                 }
                 // P1 fix: SSH reconnects produce a new ephemeral hostSockPath.
