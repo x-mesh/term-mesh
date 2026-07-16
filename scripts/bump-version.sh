@@ -25,6 +25,9 @@ PBX_TMP=""
 DAEMON_TOML_TMP=""
 CLI_TOML_TMP=""
 DAEMON_LOCK_TMP=""
+DAEMON_TOML_FOUND_TMP=""
+CLI_TOML_FOUND_TMP=""
+LOCK_COUNT_FILE=""
 
 cleanup_tmp() {
   # Preserve the script's real exit status: without this, the last
@@ -32,7 +35,8 @@ cleanup_tmp() {
   # silently become the script's reported exit code.
   local rc=$?
   local f
-  for f in "$PBX_TMP" "$DAEMON_TOML_TMP" "$CLI_TOML_TMP" "$DAEMON_LOCK_TMP"; do
+  for f in "$PBX_TMP" "$DAEMON_TOML_TMP" "$CLI_TOML_TMP" "$DAEMON_LOCK_TMP" \
+           "$DAEMON_TOML_FOUND_TMP" "$CLI_TOML_FOUND_TMP" "$LOCK_COUNT_FILE"; do
     [[ -n "$f" && -f "$f" ]] && rm -f "$f"
   done
   exit "$rc"
@@ -113,27 +117,48 @@ if ! grep -q "MARKETING_VERSION = $NEW_MARKETING;" "$PBX_TMP" \
   exit 1
 fi
 
+# Rewrites the FIRST `version = "X.Y.Z"` line found while scanning inside
+# the [package] table only. TOML allows other tables (e.g. a future
+# [dependencies.foo]) to carry their own bare `version = "..."` line in
+# the same format, and those must never be touched — so the match is
+# gated on section membership, not a bare pattern search over the whole
+# file (which is what a plain sed replace would do, replacing every
+# matching line in the stream, not just the intended one).
+AWK_PACKAGE_VERSION_PROGRAM='
+  BEGIN { in_package = 0; done = 0 }
+  /^\[/ {
+    in_package = ($0 == "[package]") ? 1 : 0
+  }
+  in_package == 1 && done == 0 && /^version = "[0-9]+\.[0-9]+\.[0-9]+"$/ {
+    print "version = \"" new_version "\""
+    done = 1
+    next
+  }
+  { print }
+  END { print done > result_file }
+'
+
 # 2. daemon/term-meshd/Cargo.toml
-if ! grep -Eq '^version = "[0-9]+\.[0-9]+\.[0-9]+"$' "$DAEMON_TOML"; then
-  echo "Error: no [package] version line found in $DAEMON_TOML. No files changed." >&2
-  exit 1
-fi
 DAEMON_TOML_TMP="$(mktemp)"
-sed -E "s/^version = \"[0-9]+\.[0-9]+\.[0-9]+\"\$/version = \"$NEW_MARKETING\"/" "$DAEMON_TOML" > "$DAEMON_TOML_TMP"
-if ! grep -q "^version = \"$NEW_MARKETING\"\$" "$DAEMON_TOML_TMP"; then
-  echo "Error: failed to stage $DAEMON_TOML update. No files changed." >&2
+DAEMON_TOML_FOUND_TMP="$(mktemp)"
+awk -v new_version="$NEW_MARKETING" -v result_file="$DAEMON_TOML_FOUND_TMP" \
+  "$AWK_PACKAGE_VERSION_PROGRAM" "$DAEMON_TOML" > "$DAEMON_TOML_TMP"
+DAEMON_TOML_FOUND="$(cat "$DAEMON_TOML_FOUND_TMP")"
+rm -f "$DAEMON_TOML_FOUND_TMP"; DAEMON_TOML_FOUND_TMP=""
+if [[ "$DAEMON_TOML_FOUND" != "1" ]]; then
+  echo "Error: no version line found inside [package] in $DAEMON_TOML. No files changed." >&2
   exit 1
 fi
 
 # 3. daemon/term-mesh-cli/Cargo.toml
-if ! grep -Eq '^version = "[0-9]+\.[0-9]+\.[0-9]+"$' "$CLI_TOML"; then
-  echo "Error: no [package] version line found in $CLI_TOML. No files changed." >&2
-  exit 1
-fi
 CLI_TOML_TMP="$(mktemp)"
-sed -E "s/^version = \"[0-9]+\.[0-9]+\.[0-9]+\"\$/version = \"$NEW_MARKETING\"/" "$CLI_TOML" > "$CLI_TOML_TMP"
-if ! grep -q "^version = \"$NEW_MARKETING\"\$" "$CLI_TOML_TMP"; then
-  echo "Error: failed to stage $CLI_TOML update. No files changed." >&2
+CLI_TOML_FOUND_TMP="$(mktemp)"
+awk -v new_version="$NEW_MARKETING" -v result_file="$CLI_TOML_FOUND_TMP" \
+  "$AWK_PACKAGE_VERSION_PROGRAM" "$CLI_TOML" > "$CLI_TOML_TMP"
+CLI_TOML_FOUND="$(cat "$CLI_TOML_FOUND_TMP")"
+rm -f "$CLI_TOML_FOUND_TMP"; CLI_TOML_FOUND_TMP=""
+if [[ "$CLI_TOML_FOUND" != "1" ]]; then
+  echo "Error: no version line found inside [package] in $CLI_TOML. No files changed." >&2
   exit 1
 fi
 
@@ -144,7 +169,12 @@ fi
 #    `name = "..."` line, not a blind version-string match.
 DAEMON_LOCK_TMP="$(mktemp)"
 LOCK_COUNT_FILE="$(mktemp)"
-awk -v new_version="$NEW_MARKETING" '
+# NOTE: the updated-package count is written to $LOCK_COUNT_FILE via an
+# awk variable (result_file), not by redirecting awk's own stderr. Real
+# awk diagnostics (syntax errors, read failures) must stay on stderr so
+# they're visible instead of silently mixing into the count file and
+# corrupting the `-ne 2` numeric comparison below.
+awk -v new_version="$NEW_MARKETING" -v result_file="$LOCK_COUNT_FILE" '
   BEGIN {
     target["term-meshd"] = 1
     target["term-mesh-cli"] = 1
@@ -167,10 +197,10 @@ awk -v new_version="$NEW_MARKETING" '
     }
     print
   }
-  END { print updated > "/dev/stderr" }
-' "$DAEMON_LOCK" > "$DAEMON_LOCK_TMP" 2>"$LOCK_COUNT_FILE"
+  END { print updated > result_file }
+' "$DAEMON_LOCK" > "$DAEMON_LOCK_TMP"
 LOCK_UPDATED_COUNT="$(cat "$LOCK_COUNT_FILE")"
-rm -f "$LOCK_COUNT_FILE"
+rm -f "$LOCK_COUNT_FILE"; LOCK_COUNT_FILE=""
 if [[ "$LOCK_UPDATED_COUNT" -ne 2 ]]; then
   echo "Error: expected to update 2 package entries in $DAEMON_LOCK, updated $LOCK_UPDATED_COUNT. No files changed." >&2
   exit 1
