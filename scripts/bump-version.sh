@@ -1,19 +1,58 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Bump MARKETING_VERSION and CURRENT_PROJECT_VERSION in the Xcode project.
+# Bump MARKETING_VERSION and CURRENT_PROJECT_VERSION in the Xcode project,
+# and keep the daemon's Cargo package versions (term-meshd, term-mesh-cli,
+# and their Cargo.lock entries) in sync with it.
+#
 # Usage:
 #   ./scripts/bump-version.sh           # Auto-bump minor (0.15.0 -> 0.16.0)
 #   ./scripts/bump-version.sh 0.16.0    # Set specific version
 #   ./scripts/bump-version.sh patch     # Bump patch (0.15.0 -> 0.15.1)
 #   ./scripts/bump-version.sh major     # Bump major (0.15.0 -> 1.0.0)
+#
+# All-or-nothing: every update is written to a temp file and validated
+# first. The real files are only touched once every target has staged
+# cleanly, so a rejected version string or an unexpected file layout never
+# leaves a partial version bump behind.
 
 PROJECT_FILE="GhosttyTabs.xcodeproj/project.pbxproj"
+DAEMON_TOML="daemon/term-meshd/Cargo.toml"
+CLI_TOML="daemon/term-mesh-cli/Cargo.toml"
+DAEMON_LOCK="daemon/Cargo.lock"
+
+PBX_TMP=""
+DAEMON_TOML_TMP=""
+CLI_TOML_TMP=""
+DAEMON_LOCK_TMP=""
+DAEMON_TOML_FOUND_TMP=""
+CLI_TOML_FOUND_TMP=""
+LOCK_COUNT_FILE=""
+
+cleanup_tmp() {
+  # Preserve the script's real exit status: without this, the last
+  # command run inside the trap (e.g. a no-op `[[ ]]` test) would
+  # silently become the script's reported exit code.
+  local rc=$?
+  local f
+  for f in "$PBX_TMP" "$DAEMON_TOML_TMP" "$CLI_TOML_TMP" "$DAEMON_LOCK_TMP" \
+           "$DAEMON_TOML_FOUND_TMP" "$CLI_TOML_FOUND_TMP" "$LOCK_COUNT_FILE"; do
+    [[ -n "$f" && -f "$f" ]] && rm -f "$f"
+  done
+  exit "$rc"
+}
+trap cleanup_tmp EXIT
 
 if [[ ! -f "$PROJECT_FILE" ]]; then
   echo "Error: $PROJECT_FILE not found. Run from repo root." >&2
   exit 1
 fi
+for f in "$DAEMON_TOML" "$CLI_TOML" "$DAEMON_LOCK"; do
+  if [[ ! -f "$f" ]]; then
+    echo "Error: $f not found. Run from repo root." >&2
+    exit 1
+  fi
+done
 
 # Get current versions
 CURRENT_MARKETING=$(grep -m1 'MARKETING_VERSION = ' "$PROJECT_FILE" | sed 's/.*= \(.*\);/\1/')
@@ -65,9 +104,113 @@ NEW_BUILD=$((MIN_BUILD + 1))
 
 echo "New:     MARKETING_VERSION=$NEW_MARKETING, CURRENT_PROJECT_VERSION=$NEW_BUILD"
 
-# Update project file
-sed -i '' "s/MARKETING_VERSION = $CURRENT_MARKETING;/MARKETING_VERSION = $NEW_MARKETING;/g" "$PROJECT_FILE"
-sed -i '' "s/CURRENT_PROJECT_VERSION = $CURRENT_BUILD;/CURRENT_PROJECT_VERSION = $NEW_BUILD;/g" "$PROJECT_FILE"
+# --- Stage every file update in temp copies first (all-or-nothing) ---
+
+# 1. Xcode project file
+PBX_TMP="$(mktemp)"
+sed "s/MARKETING_VERSION = $CURRENT_MARKETING;/MARKETING_VERSION = $NEW_MARKETING;/g; \
+     s/CURRENT_PROJECT_VERSION = $CURRENT_BUILD;/CURRENT_PROJECT_VERSION = $NEW_BUILD;/g" \
+  "$PROJECT_FILE" > "$PBX_TMP"
+if ! grep -q "MARKETING_VERSION = $NEW_MARKETING;" "$PBX_TMP" \
+    || ! grep -q "CURRENT_PROJECT_VERSION = $NEW_BUILD;" "$PBX_TMP"; then
+  echo "Error: failed to stage $PROJECT_FILE update (pattern not found). No files changed." >&2
+  exit 1
+fi
+
+# Rewrites the FIRST `version = "X.Y.Z"` line found while scanning inside
+# the [package] table only. TOML allows other tables (e.g. a future
+# [dependencies.foo]) to carry their own bare `version = "..."` line in
+# the same format, and those must never be touched — so the match is
+# gated on section membership, not a bare pattern search over the whole
+# file (which is what a plain sed replace would do, replacing every
+# matching line in the stream, not just the intended one).
+AWK_PACKAGE_VERSION_PROGRAM='
+  BEGIN { in_package = 0; done = 0 }
+  /^\[/ {
+    in_package = ($0 == "[package]") ? 1 : 0
+  }
+  in_package == 1 && done == 0 && /^version = "[0-9]+\.[0-9]+\.[0-9]+"$/ {
+    print "version = \"" new_version "\""
+    done = 1
+    next
+  }
+  { print }
+  END { print done > result_file }
+'
+
+# 2. daemon/term-meshd/Cargo.toml
+DAEMON_TOML_TMP="$(mktemp)"
+DAEMON_TOML_FOUND_TMP="$(mktemp)"
+awk -v new_version="$NEW_MARKETING" -v result_file="$DAEMON_TOML_FOUND_TMP" \
+  "$AWK_PACKAGE_VERSION_PROGRAM" "$DAEMON_TOML" > "$DAEMON_TOML_TMP"
+DAEMON_TOML_FOUND="$(cat "$DAEMON_TOML_FOUND_TMP")"
+rm -f "$DAEMON_TOML_FOUND_TMP"; DAEMON_TOML_FOUND_TMP=""
+if [[ "$DAEMON_TOML_FOUND" != "1" ]]; then
+  echo "Error: no version line found inside [package] in $DAEMON_TOML. No files changed." >&2
+  exit 1
+fi
+
+# 3. daemon/term-mesh-cli/Cargo.toml
+CLI_TOML_TMP="$(mktemp)"
+CLI_TOML_FOUND_TMP="$(mktemp)"
+awk -v new_version="$NEW_MARKETING" -v result_file="$CLI_TOML_FOUND_TMP" \
+  "$AWK_PACKAGE_VERSION_PROGRAM" "$CLI_TOML" > "$CLI_TOML_TMP"
+CLI_TOML_FOUND="$(cat "$CLI_TOML_FOUND_TMP")"
+rm -f "$CLI_TOML_FOUND_TMP"; CLI_TOML_FOUND_TMP=""
+if [[ "$CLI_TOML_FOUND" != "1" ]]; then
+  echo "Error: no version line found inside [package] in $CLI_TOML. No files changed." >&2
+  exit 1
+fi
+
+# 4. daemon/Cargo.lock — only the version line directly under the
+#    term-meshd / term-mesh-cli [[package]] entries. Third-party crate
+#    versions (including any that happen to also read "0.72.0") are
+#    left untouched because the rewrite is keyed off the preceding
+#    `name = "..."` line, not a blind version-string match.
+DAEMON_LOCK_TMP="$(mktemp)"
+LOCK_COUNT_FILE="$(mktemp)"
+# NOTE: the updated-package count is written to $LOCK_COUNT_FILE via an
+# awk variable (result_file), not by redirecting awk's own stderr. Real
+# awk diagnostics (syntax errors, read failures) must stay on stderr so
+# they're visible instead of silently mixing into the count file and
+# corrupting the `-ne 2` numeric comparison below.
+awk -v new_version="$NEW_MARKETING" -v result_file="$LOCK_COUNT_FILE" '
+  BEGIN {
+    target["term-meshd"] = 1
+    target["term-mesh-cli"] = 1
+    want_version = 0
+    updated = 0
+  }
+  want_version == 1 && /^version = "[0-9]+\.[0-9]+\.[0-9]+"$/ {
+    print "version = \"" new_version "\""
+    updated++
+    want_version = 0
+    next
+  }
+  {
+    want_version = 0
+    if ($0 ~ /^name = "/) {
+      name = $0
+      sub(/^name = "/, "", name)
+      sub(/"$/, "", name)
+      if (name in target) want_version = 1
+    }
+    print
+  }
+  END { print updated > result_file }
+' "$DAEMON_LOCK" > "$DAEMON_LOCK_TMP"
+LOCK_UPDATED_COUNT="$(cat "$LOCK_COUNT_FILE")"
+rm -f "$LOCK_COUNT_FILE"; LOCK_COUNT_FILE=""
+if [[ "$LOCK_UPDATED_COUNT" -ne 2 ]]; then
+  echo "Error: expected to update 2 package entries in $DAEMON_LOCK, updated $LOCK_UPDATED_COUNT. No files changed." >&2
+  exit 1
+fi
+
+# --- Every staged file validated above — apply all at once ---
+mv "$PBX_TMP" "$PROJECT_FILE"; PBX_TMP=""
+mv "$DAEMON_TOML_TMP" "$DAEMON_TOML"; DAEMON_TOML_TMP=""
+mv "$CLI_TOML_TMP" "$CLI_TOML"; CLI_TOML_TMP=""
+mv "$DAEMON_LOCK_TMP" "$DAEMON_LOCK"; DAEMON_LOCK_TMP=""
 
 # Verify
 UPDATED_MARKETING=$(grep -m1 'MARKETING_VERSION = ' "$PROJECT_FILE" | sed 's/.*= \(.*\);/\1/')
@@ -78,4 +221,13 @@ if [[ "$UPDATED_MARKETING" != "$NEW_MARKETING" ]] || [[ "$UPDATED_BUILD" != "$NE
   exit 1
 fi
 
+UPDATED_DAEMON_VERSION=$(grep -m1 -E '^version = "' "$DAEMON_TOML" | sed -E 's/^version = "(.*)"$/\1/')
+UPDATED_CLI_VERSION=$(grep -m1 -E '^version = "' "$CLI_TOML" | sed -E 's/^version = "(.*)"$/\1/')
+
+if [[ "$UPDATED_DAEMON_VERSION" != "$NEW_MARKETING" ]] || [[ "$UPDATED_CLI_VERSION" != "$NEW_MARKETING" ]]; then
+  echo "Error: daemon Cargo.toml version update failed!" >&2
+  exit 1
+fi
+
 echo "Updated $PROJECT_FILE successfully."
+echo "Updated $DAEMON_TOML, $CLI_TOML, and $DAEMON_LOCK to version $NEW_MARKETING."

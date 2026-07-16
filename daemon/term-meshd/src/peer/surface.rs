@@ -10,7 +10,7 @@
 
 use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::os::unix::io::{AsRawFd, RawFd};
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
 use peer_proto::v1::SurfaceInfo;
@@ -37,10 +37,82 @@ const READ_BUF_SIZE: usize = 4096;
 /// chunks, it starts getting `RecvError::Lagged` on `recv()`; the connection
 /// layer handles that as a gap (eventual reconnect will re-snapshot).
 const BROADCAST_CAPACITY: usize = 1024;
-/// Bytes of recent PTY output replayed to a newly attached relay. This covers
-/// the common "shell prompt printed before the SSH relay attached" case without
-/// turning the daemon into an unbounded terminal scrollback store.
-const REPLAY_CAPACITY_BYTES: usize = 64 * 1024;
+/// Default bytes of recent PTY output replayed to a newly attached relay.
+/// This covers the common "shell prompt printed before the SSH relay
+/// attached" case without turning the daemon into an unbounded terminal
+/// scrollback store. Overridable at startup via `TERMMESH_PEER_REPLAY_BYTES`
+/// and at runtime via the `peer.replay_capacity` RPC / `tm-agent daemon
+/// replay-capacity --set`.
+const REPLAY_CAPACITY_DEFAULT_BYTES: usize = 1024 * 1024; // 1 MiB
+/// Lower bound accepted for the replay capacity (env or RPC/CLI set).
+const REPLAY_CAPACITY_MIN_BYTES: usize = 4 * 1024; // 4 KiB
+/// Upper bound accepted for the replay capacity (env or RPC/CLI set).
+const REPLAY_CAPACITY_MAX_BYTES: usize = 64 * 1024 * 1024; // 64 MiB
+
+/// Process-wide replay buffer capacity, in bytes. Every `PtySurface`'s
+/// `ReplayBuffer::push` reads this on each call, so a runtime change via
+/// `set_replay_capacity` takes effect for all surfaces on their next PTY
+/// write without needing to walk/trim existing buffers up front.
+static REPLAY_CAPACITY: AtomicUsize = AtomicUsize::new(REPLAY_CAPACITY_DEFAULT_BYTES);
+
+/// Parse a `TERMMESH_PEER_REPLAY_BYTES`-style value (plain byte count, no
+/// suffix) and clamp it to `[REPLAY_CAPACITY_MIN_BYTES,
+/// REPLAY_CAPACITY_MAX_BYTES]`. Returns `(clamped_value, was_clamped)` on
+/// success. Split out of `init_replay_capacity_from_env` so it's testable
+/// without touching process env vars.
+fn parse_and_clamp_replay_bytes(raw: &str) -> Result<(usize, bool), String> {
+    let n: usize = raw
+        .trim()
+        .parse()
+        .map_err(|e| format!("not a byte count: {e}"))?;
+    let clamped = n.clamp(REPLAY_CAPACITY_MIN_BYTES, REPLAY_CAPACITY_MAX_BYTES);
+    Ok((clamped, clamped != n))
+}
+
+/// Read `TERMMESH_PEER_REPLAY_BYTES` and apply it to the process-wide replay
+/// capacity. Called once at daemon startup. Unset keeps the compiled-in
+/// default; unparsable or out-of-range values fall back to the default (resp.
+/// clamp to range) with a `tracing::warn!`.
+pub fn init_replay_capacity_from_env() {
+    let Ok(raw) = std::env::var("TERMMESH_PEER_REPLAY_BYTES") else {
+        return;
+    };
+    match parse_and_clamp_replay_bytes(&raw) {
+        Ok((clamped, was_clamped)) => {
+            if was_clamped {
+                tracing::warn!(
+                    "TERMMESH_PEER_REPLAY_BYTES={raw:?} out of range [{REPLAY_CAPACITY_MIN_BYTES}, {REPLAY_CAPACITY_MAX_BYTES}], clamped to {clamped}"
+                );
+            }
+            REPLAY_CAPACITY.store(clamped, Ordering::Relaxed);
+        }
+        Err(e) => {
+            tracing::warn!(
+                "TERMMESH_PEER_REPLAY_BYTES={raw:?} invalid ({e}), using default {REPLAY_CAPACITY_DEFAULT_BYTES}"
+            );
+        }
+    }
+}
+
+/// Current replay buffer capacity, in bytes.
+pub fn replay_capacity() -> usize {
+    REPLAY_CAPACITY.load(Ordering::Relaxed)
+}
+
+/// Set the replay buffer capacity at runtime. Rejects values outside
+/// `[REPLAY_CAPACITY_MIN_BYTES, REPLAY_CAPACITY_MAX_BYTES]` with an error
+/// message instead of silently clamping, since this is an explicit
+/// user-triggered action (RPC/CLI) rather than a background env read.
+/// Returns `(old, new)` on success.
+pub fn set_replay_capacity(bytes: usize) -> Result<(usize, usize), String> {
+    if !(REPLAY_CAPACITY_MIN_BYTES..=REPLAY_CAPACITY_MAX_BYTES).contains(&bytes) {
+        return Err(format!(
+            "replay capacity must be between {REPLAY_CAPACITY_MIN_BYTES} and {REPLAY_CAPACITY_MAX_BYTES} bytes (got {bytes})"
+        ));
+    }
+    let old = REPLAY_CAPACITY.swap(bytes, Ordering::Relaxed);
+    Ok((old, bytes))
+}
 
 #[derive(Clone, Debug)]
 pub struct PtyChunk {
@@ -61,7 +133,12 @@ impl ReplayBuffer {
         }
         self.bytes += chunk.bytes.len();
         self.chunks.push_back(chunk);
-        while self.bytes > REPLAY_CAPACITY_BYTES {
+        // Read the process-wide capacity on every push (not cached) so a
+        // runtime `set_replay_capacity` call takes effect immediately for
+        // every surface's next write, without needing to walk and trim
+        // existing buffers up front.
+        let capacity = replay_capacity();
+        while self.bytes > capacity {
             let Some(front) = self.chunks.pop_front() else {
                 break;
             };
@@ -774,5 +851,85 @@ mod tests {
         // A usable candidate wins as-is — the one case with an exact
         // expected value, since /bin/sh is universally present.
         assert_eq!(resolve_login_shell(Some("/bin/sh")), "/bin/sh");
+    }
+
+    // ── Replay capacity (t11: TERMMESH_PEER_REPLAY_BYTES env + RPC/CLI) ──
+
+    #[test]
+    fn parse_replay_bytes_accepts_plain_integer() {
+        assert_eq!(parse_and_clamp_replay_bytes("262144"), Ok((262144, false)));
+        // Leading/trailing whitespace (e.g. from a shell env file) is trimmed.
+        assert_eq!(parse_and_clamp_replay_bytes(" 262144 \n"), Ok((262144, false)));
+    }
+
+    #[test]
+    fn parse_replay_bytes_rejects_garbage() {
+        // No suffix support at this layer — "2mb"/"256kb" are the CLI's job
+        // (it converts to a plain byte count before calling the RPC).
+        assert!(parse_and_clamp_replay_bytes("2mb").is_err());
+        assert!(parse_and_clamp_replay_bytes("not-a-number").is_err());
+        assert!(parse_and_clamp_replay_bytes("").is_err());
+        assert!(parse_and_clamp_replay_bytes("-1").is_err());
+    }
+
+    #[test]
+    fn parse_replay_bytes_clamps_out_of_range() {
+        let (low, was_clamped) = parse_and_clamp_replay_bytes("1").unwrap();
+        assert_eq!(low, REPLAY_CAPACITY_MIN_BYTES);
+        assert!(was_clamped);
+
+        let (high, was_clamped) = parse_and_clamp_replay_bytes("999999999999").unwrap();
+        assert_eq!(high, REPLAY_CAPACITY_MAX_BYTES);
+        assert!(was_clamped);
+    }
+
+    #[test]
+    fn parse_replay_bytes_in_range_not_clamped() {
+        let mid = (REPLAY_CAPACITY_MIN_BYTES + REPLAY_CAPACITY_MAX_BYTES) / 2;
+        let (v, was_clamped) = parse_and_clamp_replay_bytes(&mid.to_string()).unwrap();
+        assert_eq!(v, mid);
+        assert!(!was_clamped);
+    }
+
+    #[test]
+    fn set_replay_capacity_rejects_out_of_range() {
+        assert!(set_replay_capacity(REPLAY_CAPACITY_MIN_BYTES - 1).is_err());
+        assert!(set_replay_capacity(REPLAY_CAPACITY_MAX_BYTES + 1).is_err());
+    }
+
+    #[test]
+    fn set_replay_capacity_accepts_boundaries_and_reports_old_new() {
+        let original = replay_capacity();
+        let (old, new) = set_replay_capacity(REPLAY_CAPACITY_MIN_BYTES).unwrap();
+        assert_eq!(old, original);
+        assert_eq!(new, REPLAY_CAPACITY_MIN_BYTES);
+        assert_eq!(replay_capacity(), REPLAY_CAPACITY_MIN_BYTES);
+        // Restore — REPLAY_CAPACITY is process-wide, shared with other tests.
+        set_replay_capacity(original).unwrap();
+    }
+
+    /// Proves `ReplayBuffer::push`'s eviction loop reads the *live* static
+    /// on every call rather than a value baked in at buffer-creation time —
+    /// the whole point of moving off the old compile-time `const`.
+    #[test]
+    fn replay_buffer_eviction_follows_runtime_capacity_change() {
+        let original = replay_capacity();
+        let (_old, new) = set_replay_capacity(REPLAY_CAPACITY_MIN_BYTES).unwrap();
+        assert_eq!(new, REPLAY_CAPACITY_MIN_BYTES);
+
+        let mut buf = ReplayBuffer::default();
+        // 8 chunks of 1024 bytes each; MIN (4096) only fits the last 4.
+        for seq in 0..8u64 {
+            buf.push(PtyChunk { seq, bytes: vec![0u8; 1024] });
+        }
+        assert!(
+            buf.bytes <= REPLAY_CAPACITY_MIN_BYTES,
+            "expected eviction down to the lowered capacity, got {} bytes",
+            buf.bytes
+        );
+        let kept: Vec<u64> = buf.snapshot().iter().map(|c| c.seq).collect();
+        assert_eq!(kept, vec![4, 5, 6, 7], "oldest chunks must be evicted first (FIFO)");
+
+        set_replay_capacity(original).unwrap();
     }
 }

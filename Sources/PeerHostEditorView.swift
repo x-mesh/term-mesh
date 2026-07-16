@@ -4,6 +4,7 @@
 //  NSAlert connect dialogs stay untouched until Phase 4 retires them.
 
 import AppKit
+import Bonsplit
 import SwiftUI
 
 /// Sheet payload: one type for both "add" and "edit" so `.sheet(item:)`
@@ -28,6 +29,9 @@ struct PeerHostEditorView: View {
     @State private var bonjourBrowser = PeerBonjourBrowser()
 
     /// Test / install flow state (the sheet's "doctor").
+    ///
+    /// Existing case signatures are a frozen interface contract — do not
+    /// change them. The version-check states below are additive only.
     enum DoctorState: Equatable {
         case idle
         case testing
@@ -38,9 +42,70 @@ struct PeerHostEditorView: View {
         case installFailed(String)
         case diagnosing              // installed but still no socket
         case diagnosed(String)       // compact failure reason
+        /// Connected, version known, and at/above the latest release.
+        case okUpToDate(socket: String, version: String)
+        /// Connected, version known, and behind the latest release.
+        case updateAvailable(socket: String, remote: String, latest: String)
+        /// Connected, but the installed version predates
+        /// `PeerDaemonVersion.versionSyncFloor` — comparing it against
+        /// `latest` would misreport, so this is a recommendation, not a
+        /// version-ordering claim (see PeerDaemonVersion.Comparison.legacy).
+        case legacyDaemon(socket: String, remote: String)
+        /// Connected, but the remote version couldn't be determined
+        /// (probe failed, or the latest-release lookup failed) — never
+        /// blocks a successful Test result on its own.
+        case okVersionUnknown(socket: String)
     }
     @State private var doctorState: DoctorState = .idle
     @State private var showInstallConfirm = false
+    @State private var showUpdateConfirm = false
+    /// Suppresses the Update button after one SUCCESSFUL update attempt
+    /// this sheet session, even if the post-update retest still reports
+    /// outdated/legacy — avoids nagging the user in a retry loop. Reset
+    /// on a FAILED install (see `runInstall()`'s catch block) since a
+    /// failure isn't the "still outdated after a real update" case this
+    /// exists to suppress — the user should be able to just retry.
+    @State private var updateAttempted = false
+    /// Version reported by a binary found on the host while term-meshd
+    /// itself isn't running (`.daemonMissing`). Kept out of that case's
+    /// associated value since its signature must not change.
+    @State private var daemonMissingVersion: String?
+    /// The exact (sshTarget, port, identityFile) — as a validated
+    /// `PeerHostProfile` — that the last `runTest()` actually probed.
+    /// `runInstall()` reads ONLY this, never a fresh `validatedDraft()`,
+    /// so Install/Update always targets what was tested even if the form
+    /// fields changed afterward. Cleared by `invalidateDoctorState()`;
+    /// the Install/Update buttons also require it to be non-nil (see
+    /// `showsUpdateButton`) as a second line of defense.
+    @State private var testedDraft: PeerHostProfile?
+    /// Bumped by `invalidateDoctorState()` and at the start of every
+    /// `runTest()`. Each `runTest()`/`runInstall()` Task captures the
+    /// value at launch and re-checks it after every `await` before
+    /// touching `doctorState`/`testedDraft`/`daemonMissingVersion` — a
+    /// mismatch means a newer Test or a field edit superseded this Task
+    /// while it was suspended, so its result is discarded rather than
+    /// written. This, not the resets in `invalidateDoctorState()`, is
+    /// what actually stops a late-arriving response from clobbering a
+    /// fresher state (SwiftUI state writes alone can't prevent an
+    /// already-in-flight Task from waking up later and writing anyway).
+    @State private var doctorGeneration = 0
+    /// True for exactly as long as the remote install/update SSH script
+    /// is actually running — from `runInstall()`'s launch of
+    /// `PeerHostDoctor.install` until that call returns, success or
+    /// failure. A different layer from `doctorGeneration`: the generation
+    /// guard discards a STALE RESULT, but does nothing about a SIDE
+    /// EFFECT already under way on the remote host. Without this latch,
+    /// `invalidateDoctorState()` resetting `doctorState` to `.idle`
+    /// mid-install would re-enable the buttons and let the user kick off
+    /// a second concurrent install script against the same host.
+    /// `doctorBusy` ORs this in so Test/Install/Update stay locked until
+    /// the remote script actually exits — deliberately not cancelled
+    /// (the script can't be cancelled once started; refusing new actions
+    /// until it finishes is the only honest guard). `invalidateDoctorState()`
+    /// intentionally does NOT touch this flag: a field edit still resets
+    /// the visible doctor state, but the buttons stay locked until the
+    /// in-flight install/update completes.
+    @State private var installInFlight = false
 
     /// Fixed tag palette (one-dark hues) + nil for "no color".
     private static let colorChoices: [String?] = [
@@ -118,8 +183,12 @@ struct PeerHostEditorView: View {
                 Button("Test", action: runTest)
                     .disabled(doctorBusy
                               || profile.sshTarget.trimmingCharacters(in: .whitespaces).isEmpty)
-                if case .daemonMissing = doctorState {
+                if case .daemonMissing = doctorState, testedDraft != nil {
                     Button("Install term-meshd…") { showInstallConfirm = true }
+                        .disabled(doctorBusy)
+                }
+                if showsUpdateButton {
+                    Button("Update term-meshd…") { showUpdateConfirm = true }
                         .disabled(doctorBusy)
                 }
                 Spacer()
@@ -138,6 +207,12 @@ struct PeerHostEditorView: View {
             }
         }
         .onDisappear { bonjourBrowser.stop() }
+        // A stale doctorState/testedDraft is worse than none: any edit to
+        // a field the doctor actually probes invalidates the last Test so
+        // Install/Update can never fire against a since-changed target.
+        .onChange(of: profile.sshTarget) { invalidateDoctorState() }
+        .onChange(of: portText) { invalidateDoctorState() }
+        .onChange(of: profile.identityFile) { invalidateDoctorState() }
         .confirmationDialog(
             "Install term-meshd on \"\(profile.sshTarget)\"?",
             isPresented: $showInstallConfirm
@@ -147,11 +222,39 @@ struct PeerHostEditorView: View {
         } message: {
             Text("Runs the official install script over SSH: downloads the latest release binary and registers a systemd user service.")
         }
+        .confirmationDialog(
+            "Update term-meshd on \"\(profile.sshTarget)\"?",
+            isPresented: $showUpdateConfirm
+        ) {
+            Button("Update") {
+                updateAttempted = true
+                runInstall()
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("Updating restarts the remote daemon and terminates all sessions on this host.")
+        }
     }
 
     private var doctorBusy: Bool {
+        // installInFlight can outlive `.installing` in doctorState (e.g.
+        // right after invalidateDoctorState() resets state mid-install)
+        // so it's checked independently, not folded into the switch.
+        if installInFlight { return true }
         switch doctorState {
         case .testing, .installing, .diagnosing: return true
+        default: return false
+        }
+    }
+
+    /// Shown for `.updateAvailable`/`.legacyDaemon`, suppressed after one
+    /// update attempt this session (see `updateAttempted`), and only
+    /// when there's an actual tested target to act on (`testedDraft`) —
+    /// belt-and-suspenders alongside the generation guard in `runInstall`.
+    private var showsUpdateButton: Bool {
+        guard !updateAttempted, testedDraft != nil else { return false }
+        switch doctorState {
+        case .updateAvailable, .legacyDaemon: return true
         default: return false
         }
     }
@@ -168,9 +271,24 @@ struct PeerHostEditorView: View {
             Label("Connected — daemon socket: \(path)", systemImage: "checkmark.circle.fill")
                 .font(.caption).foregroundColor(.green)
         case .daemonMissing:
-            Label("SSH OK, but term-meshd is not running on the host.",
+            Label(daemonMissingStatusText,
                   systemImage: "exclamationmark.triangle.fill")
                 .font(.caption).foregroundColor(.orange)
+        case .okUpToDate(_, let version):
+            Label("term-meshd v\(displayVersion(version)) — up to date", systemImage: "checkmark.seal")
+                .font(.caption).foregroundColor(.green)
+        case .updateAvailable(_, let remote, let latest):
+            Label("Update available: v\(displayVersion(remote)) → v\(displayVersion(latest))", systemImage: "arrow.up.circle")
+                .font(.caption).foregroundColor(.orange)
+        case .legacyDaemon(_, let remote):
+            Label("Legacy daemon (v\(displayVersion(remote))) — update recommended (version reporting predates v\(displayVersion(PeerDaemonVersion.versionSyncFloor)))",
+                  systemImage: "exclamationmark.arrow.circlepath")
+                .font(.caption).foregroundColor(.orange)
+                .fixedSize(horizontal: false, vertical: true)
+        case .okVersionUnknown(let path):
+            Label("Connected — daemon socket: \(path) — version unknown",
+                  systemImage: "questionmark.circle")
+                .font(.caption).foregroundColor(.secondary)
         case .sshFailed(let msg):
             Label("SSH failed: \(msg)", systemImage: "xmark.circle.fill")
                 .font(.caption).foregroundColor(.red)
@@ -194,56 +312,211 @@ struct PeerHostEditorView: View {
         }
     }
 
+    /// `.daemonMissing`'s base copy, plus (when a binary was found on the
+    /// host despite the daemon not running) the version it reports.
+    private var daemonMissingStatusText: String {
+        guard let version = daemonMissingVersion else {
+            return "SSH OK, but term-meshd is not running on the host."
+        }
+        return "SSH OK, term-meshd v\(displayVersion(version)) is installed but not running on the host."
+    }
+
+    /// Strips any existing "v"/"V" prefix so callers can prepend exactly
+    /// one. `term-meshd --version` prints a bare `CARGO_PKG_VERSION`
+    /// (e.g. "0.156.0"), but a GitHub release tag (`latest`, from
+    /// `PeerDaemonVersion.fetchLatestRelease`) already carries the repo's
+    /// "vX.Y.Z" tag format — prepending "v" to both unconditionally would
+    /// double up on the tag side ("vv0.157.0"). Applied to every rendered
+    /// version regardless of source, so a future format change on either
+    /// side can't silently reintroduce the duplicate.
+    private func displayVersion(_ raw: String) -> String {
+        var s = raw
+        if s.hasPrefix("v") || s.hasPrefix("V") { s.removeFirst() }
+        return s
+    }
+
+    /// Invalidates the doctor flow when a field it actually probes (SSH
+    /// target, port, identity file) changes. The `doctorGeneration` bump
+    /// is what actually matters: any `runTest()`/`runInstall()` Task
+    /// still in flight re-checks it after every `await` and discards its
+    /// result on mismatch (see `doctorGeneration`'s doc comment), so a
+    /// stale response can never write over what this function resets.
+    /// The resets below are the visible half — immediate UI feedback
+    /// that the last Test/Install no longer applies to the edited target.
+    private func invalidateDoctorState() {
+        doctorGeneration += 1
+        doctorState = .idle
+        testedDraft = nil
+        daemonMissingVersion = nil
+        updateAttempted = false
+        showInstallConfirm = false
+        showUpdateConfirm = false
+    }
+
     // MARK: - Doctor actions
 
     private func runTest() {
         guard let draft = validatedDraft() else { return }
+        // Bump FIRST, then capture — immediately invalidates any Task
+        // still in flight from a prior Test/Install/Update click, so a
+        // rapid re-click can't race its own predecessor. See
+        // `doctorGeneration`'s doc comment for the full guard discipline.
+        doctorGeneration += 1
+        let gen = doctorGeneration
         doctorState = .testing
+        daemonMissingVersion = nil
+        // Snapshot NOW — this is the exact target Install/Update must use
+        // later, even if the form fields change before the user acts on
+        // the result (see `testedDraft`/`invalidateDoctorState()`).
+        testedDraft = draft
         Task {
             let result = await PeerHostDoctor.test(
                 sshTarget: draft.sshTarget, port: draft.sshPort,
                 identityFile: draft.identityFile
             )
+            // A field edit (→ invalidateDoctorState) or a fresh Test
+            // could have superseded this response while it was in
+            // flight — discard rather than write a stale doctorState.
+            guard gen == doctorGeneration else { return }
             switch result {
-            case .ok(let path): doctorState = .ok(path)
-            case .daemonMissing: doctorState = .daemonMissing
+            case .ok(let path):
+                let resolved = await resolveConnectedState(socketPath: path, draft: draft)
+                guard gen == doctorGeneration else { return }
+                doctorState = resolved
+            case .daemonMissing:
+                // Binary may still be present with the service just not
+                // running — surface that without touching the frozen
+                // `.daemonMissing` case's signature. exit 44 (no binary)
+                // resolves to nil here, leaving the plain message as-is.
+                // Stay on `.testing` (busy) until this probe finishes too
+                // — same discipline as the `.ok` branch above: only the
+                // terminal assignment mutates doctorState, so the Test
+                // button stays disabled while this runs. The generation
+                // guard below is the actual safety net either way.
+                let version = await PeerHostDoctor.checkVersion(
+                    sshTarget: draft.sshTarget, port: draft.sshPort,
+                    identityFile: draft.identityFile
+                )
+                guard gen == doctorGeneration else { return }
+                #if DEBUG
+                dlog("peer.doctor.version state=daemonMissing remote=\(version ?? "nil") latest=n/a")
+                #endif
+                daemonMissingVersion = version
+                doctorState = .daemonMissing
             case .sshFailed(let msg): doctorState = .sshFailed(msg)
             }
         }
     }
 
     private func runInstall() {
-        guard let draft = validatedDraft() else { return }
+        // ONLY the last Test's validated target — never re-derive from
+        // the live form, which may have been edited since (see
+        // `testedDraft`). No test on file means nothing to install onto.
+        // Backstopped by the Install/Update buttons only rendering when
+        // `testedDraft != nil` (see `showsUpdateButton`) — this guard is
+        // the second line of defense, not the only one.
+        guard let draft = testedDraft else { return }
+        // Capture (not bump — this Task inherits whatever generation the
+        // Test that produced `testedDraft` is still running under; see
+        // `doctorGeneration`'s doc comment).
+        let gen = doctorGeneration
         doctorState = .installing
+        daemonMissingVersion = nil
+        installInFlight = true
         Task {
             do {
+                // `defer` fires the instant this call returns or throws —
+                // i.e. exactly when the remote script actually finishes,
+                // regardless of the generation check below or which exit
+                // path is taken. See `installInFlight`'s doc comment.
+                defer { installInFlight = false }
                 _ = try await PeerHostDoctor.install(
                     sshTarget: draft.sshTarget, port: draft.sshPort,
                     identityFile: draft.identityFile
                 )
             } catch {
+                guard gen == doctorGeneration else { return }
                 doctorState = .installFailed(String(describing: error))
+                // A FAILED attempt shouldn't count against future
+                // re-prompting — updateAttempted only exists to suppress
+                // the Update button after a SUCCESSFUL update still
+                // reports outdated/legacy (see its doc comment). No-op
+                // when this run came from the plain Install flow.
+                updateAttempted = false
                 return
             }
+            guard gen == doctorGeneration else { return }
             // Re-test; if the daemon still isn't up, surface why
             // (e.g. release binary built against a newer glibc).
             let result = await PeerHostDoctor.test(
                 sshTarget: draft.sshTarget, port: draft.sshPort,
                 identityFile: draft.identityFile
             )
+            guard gen == doctorGeneration else { return }
             switch result {
             case .ok(let path):
-                doctorState = .ok(path)
+                let resolved = await resolveConnectedState(socketPath: path, draft: draft)
+                guard gen == doctorGeneration else { return }
+                doctorState = resolved
             case .daemonMissing:
                 doctorState = .diagnosing
                 let raw = await PeerHostDoctor.diagnose(
                     sshTarget: draft.sshTarget, port: draft.sshPort,
                     identityFile: draft.identityFile
                 )
+                guard gen == doctorGeneration else { return }
                 doctorState = .diagnosed(PeerHostDoctor.summarizeDiagnosis(raw))
             case .sshFailed(let msg):
                 doctorState = .sshFailed(msg)
             }
+        }
+    }
+
+    /// Resolves the post-connect version-comparison state for a live
+    /// socket — shared by `runTest()` and the post-install retest in
+    /// `runInstall()` so both paths render identical outcomes. A failed
+    /// version probe or a failed latest-release lookup never downgrades
+    /// a successful Test result; it only narrows the state to
+    /// `.okVersionUnknown`.
+    private func resolveConnectedState(
+        socketPath: String,
+        draft: PeerHostProfile
+    ) async -> DoctorState {
+        guard let installed = await PeerHostDoctor.checkVersion(
+            sshTarget: draft.sshTarget, port: draft.sshPort, identityFile: draft.identityFile
+        ) else {
+            #if DEBUG
+            dlog("peer.doctor.version state=unknown remote=nil latest=n/a")
+            #endif
+            return .okVersionUnknown(socket: socketPath)
+        }
+        guard let latest = await PeerDaemonVersion.fetchLatestRelease() else {
+            #if DEBUG
+            dlog("peer.doctor.version state=unknown remote=\(installed) latest=nil")
+            #endif
+            return .okVersionUnknown(socket: socketPath)
+        }
+        switch PeerDaemonVersion.compare(installed: installed, latest: latest) {
+        case .upToDate:
+            #if DEBUG
+            dlog("peer.doctor.version state=upToDate remote=\(installed) latest=\(latest)")
+            #endif
+            return .okUpToDate(socket: socketPath, version: installed)
+        case .outdated(let latestTag):
+            #if DEBUG
+            dlog("peer.doctor.version state=outdated remote=\(installed) latest=\(latestTag)")
+            #endif
+            return .updateAvailable(socket: socketPath, remote: installed, latest: latestTag)
+        case .legacy:
+            #if DEBUG
+            dlog("peer.doctor.version state=legacy remote=\(installed) latest=\(latest)")
+            #endif
+            return .legacyDaemon(socket: socketPath, remote: installed)
+        case .unknown:
+            #if DEBUG
+            dlog("peer.doctor.version state=unknown remote=\(installed) latest=\(latest)")
+            #endif
+            return .okVersionUnknown(socket: socketPath)
         }
     }
 
