@@ -59,9 +59,12 @@ struct PeerHostEditorView: View {
     @State private var doctorState: DoctorState = .idle
     @State private var showInstallConfirm = false
     @State private var showUpdateConfirm = false
-    /// Suppresses the Update button after one update attempt this sheet
-    /// session, even if the post-update retest still reports
-    /// outdated/legacy — avoids nagging the user in a retry loop.
+    /// Suppresses the Update button after one SUCCESSFUL update attempt
+    /// this sheet session, even if the post-update retest still reports
+    /// outdated/legacy — avoids nagging the user in a retry loop. Reset
+    /// on a FAILED install (see `runInstall()`'s catch block) since a
+    /// failure isn't the "still outdated after a real update" case this
+    /// exists to suppress — the user should be able to just retry.
     @State private var updateAttempted = false
     /// Version reported by a binary found on the host while term-meshd
     /// itself isn't running (`.daemonMissing`). Kept out of that case's
@@ -86,6 +89,23 @@ struct PeerHostEditorView: View {
     /// fresher state (SwiftUI state writes alone can't prevent an
     /// already-in-flight Task from waking up later and writing anyway).
     @State private var doctorGeneration = 0
+    /// True for exactly as long as the remote install/update SSH script
+    /// is actually running — from `runInstall()`'s launch of
+    /// `PeerHostDoctor.install` until that call returns, success or
+    /// failure. A different layer from `doctorGeneration`: the generation
+    /// guard discards a STALE RESULT, but does nothing about a SIDE
+    /// EFFECT already under way on the remote host. Without this latch,
+    /// `invalidateDoctorState()` resetting `doctorState` to `.idle`
+    /// mid-install would re-enable the buttons and let the user kick off
+    /// a second concurrent install script against the same host.
+    /// `doctorBusy` ORs this in so Test/Install/Update stay locked until
+    /// the remote script actually exits — deliberately not cancelled
+    /// (the script can't be cancelled once started; refusing new actions
+    /// until it finishes is the only honest guard). `invalidateDoctorState()`
+    /// intentionally does NOT touch this flag: a field edit still resets
+    /// the visible doctor state, but the buttons stay locked until the
+    /// in-flight install/update completes.
+    @State private var installInFlight = false
 
     /// Fixed tag palette (one-dark hues) + nil for "no color".
     private static let colorChoices: [String?] = [
@@ -217,6 +237,10 @@ struct PeerHostEditorView: View {
     }
 
     private var doctorBusy: Bool {
+        // installInFlight can outlive `.installing` in doctorState (e.g.
+        // right after invalidateDoctorState() resets state mid-install)
+        // so it's checked independently, not folded into the switch.
+        if installInFlight { return true }
         switch doctorState {
         case .testing, .installing, .diagnosing: return true
         default: return false
@@ -398,8 +422,14 @@ struct PeerHostEditorView: View {
         let gen = doctorGeneration
         doctorState = .installing
         daemonMissingVersion = nil
+        installInFlight = true
         Task {
             do {
+                // `defer` fires the instant this call returns or throws —
+                // i.e. exactly when the remote script actually finishes,
+                // regardless of the generation check below or which exit
+                // path is taken. See `installInFlight`'s doc comment.
+                defer { installInFlight = false }
                 _ = try await PeerHostDoctor.install(
                     sshTarget: draft.sshTarget, port: draft.sshPort,
                     identityFile: draft.identityFile
@@ -407,6 +437,12 @@ struct PeerHostEditorView: View {
             } catch {
                 guard gen == doctorGeneration else { return }
                 doctorState = .installFailed(String(describing: error))
+                // A FAILED attempt shouldn't count against future
+                // re-prompting — updateAttempted only exists to suppress
+                // the Update button after a SUCCESSFUL update still
+                // reports outdated/legacy (see its doc comment). No-op
+                // when this run came from the plain Install flow.
+                updateAttempted = false
                 return
             }
             guard gen == doctorGeneration else { return }
