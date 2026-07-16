@@ -2,6 +2,15 @@
 
 All notable changes to term-mesh are documented here.
 
+## [0.158.0] - 2026-07-17
+
+### Fixed
+- **원격에서 삭제된 workspace의 미러가 좀비로 남던 문제 수정** — 호스트에서 workspace를 삭제하면 뷰어에 열려 있던 라이브 미러 workspace가 입력도 안 되고 닫히지도 않는 멈춘 상태로 남던 것을 고쳤다. 이제 삭제 통지를 받으면 미러 workspace가 자동으로 닫히고 알림으로 안내한다.
+
+### Thanks to 1 contributor!
+
+- [@JINWOO-J](https://github.com/JINWOO-J)
+
 ## [0.157.0] - 2026-07-17
 
 ### Added
