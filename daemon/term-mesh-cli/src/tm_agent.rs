@@ -812,12 +812,37 @@ enum Commands {
 
     /// Peer-federation operations (attach to a remote term-mesh host).
     Peer(PeerCommands),
+
+    /// Daemon-local diagnostics/configuration (talks directly to the
+    /// term-meshd socket — no team/app socket required).
+    Daemon(DaemonCommands),
 }
 
 #[derive(clap::Args)]
 struct PeerCommands {
     #[command(subcommand)]
     command: PeerCommand,
+}
+
+#[derive(clap::Args)]
+struct DaemonCommands {
+    #[command(subcommand)]
+    command: DaemonCommand,
+}
+
+#[derive(Subcommand)]
+enum DaemonCommand {
+    /// Get or set the peer PTY-surface replay buffer capacity — bytes of
+    /// recent PTY output replayed to a newly attached relay
+    /// (`peer.replay_capacity` RPC). Omit `--set` to just print the current
+    /// value.
+    ReplayCapacity {
+        /// New capacity: plain byte count, or with a k/kb (KiB) or m/mb
+        /// (MiB) suffix, e.g. `262144`, `256kb`, `2mb`. Omit to only read
+        /// the current value.
+        #[arg(long)]
+        set: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -4243,6 +4268,23 @@ fn main() {
         return;
     }
 
+    // Daemon commands talk directly to term-meshd, bypassing team/app socket
+    // resolution — same reasoning as XmbBridge/XkBridge above.
+    if let Commands::Daemon(ref daemon_cmd) = cli.command {
+        match &daemon_cmd.command {
+            DaemonCommand::ReplayCapacity { set } => {
+                let sock = detect_daemon_socket()
+                    .or_else(detect_socket)
+                    .unwrap_or_else(|| {
+                        eprintln!("Error: no daemon socket found");
+                        process::exit(1);
+                    });
+                cmd_daemon_replay_capacity(&sock, set.as_deref());
+                return;
+            }
+        }
+    }
+
     // `watch <on|off|status>` controls the term-meshd (daemon) drift-watch
     // scheduler via the `watch.*` RPCs, so resolve the daemon socket directly
     // (falling back to the app socket). Bare `watch` (no subcommand) is the event
@@ -4819,6 +4861,7 @@ fn main() {
         Commands::Peer(_) => unreachable!("peer commands exit before detect_socket()"),
         Commands::Runbook(_) => unreachable!("runbook commands exit before detect_socket()"),
         Commands::Doctor { .. } => unreachable!("doctor command exits before detect_socket()"),
+        Commands::Daemon(_) => unreachable!("daemon command exits before detect_socket()"),
         Commands::Status => {
             // Inject version info into the team.status response JSON
             let mut status = rpc_call(&sock, "team.status", json!({ "team_name": team }))
@@ -5760,6 +5803,105 @@ fn print_result(result: Result<Value, String>) {
             eprintln!("Error: {e}");
             process::exit(1);
         }
+    }
+}
+
+/// Parse a `tm-agent daemon replay-capacity --set` value: a plain byte
+/// count, or a byte count with a `k`/`kb` (KiB, ×1024) or `m`/`mb` (MiB,
+/// ×1024²) suffix — case-insensitive (e.g. `262144`, `256kb`, `2mb`, `2M`).
+fn parse_byte_size(raw: &str) -> Result<usize, String> {
+    let s = raw.trim();
+    if s.is_empty() {
+        return Err("empty value".to_string());
+    }
+    let lower = s.to_ascii_lowercase();
+    let (digits, multiplier) = if let Some(prefix) = lower
+        .strip_suffix("kb")
+        .or_else(|| lower.strip_suffix('k'))
+    {
+        (prefix, 1024usize)
+    } else if let Some(prefix) = lower
+        .strip_suffix("mb")
+        .or_else(|| lower.strip_suffix('m'))
+    {
+        (prefix, 1024usize * 1024)
+    } else {
+        (lower.as_str(), 1usize)
+    };
+    let n: usize = digits
+        .trim()
+        .parse()
+        .map_err(|e| format!("invalid byte size {raw:?}: {e}"))?;
+    n.checked_mul(multiplier)
+        .ok_or_else(|| format!("byte size overflow: {raw:?}"))
+}
+
+/// `tm-agent daemon replay-capacity [--set <value>]` — get or set the peer
+/// PTY-surface replay buffer capacity via the `peer.replay_capacity` RPC.
+fn cmd_daemon_replay_capacity(sock: &PathBuf, set: Option<&str>) {
+    let params = match set {
+        Some(raw) => match parse_byte_size(raw) {
+            Ok(bytes) => json!({ "bytes": bytes }),
+            Err(e) => {
+                eprintln!("Error: {e}");
+                process::exit(1);
+            }
+        },
+        None => json!({}),
+    };
+    match rpc_call(sock, "peer.replay_capacity", params) {
+        Ok(resp) if resp["error"].is_null() => {
+            println!("{}", pretty(&resp["result"]));
+        }
+        Ok(resp) => {
+            let msg = resp["error"]["message"]
+                .as_str()
+                .unwrap_or("peer.replay_capacity failed");
+            eprintln!("Error: {msg}");
+            process::exit(1);
+        }
+        Err(e) => {
+            eprintln!("Error: {e}");
+            process::exit(1);
+        }
+    }
+}
+
+#[cfg(test)]
+mod daemon_replay_capacity_tests {
+    use super::*;
+
+    #[test]
+    fn parse_byte_size_plain_digits() {
+        assert_eq!(parse_byte_size("262144"), Ok(262144));
+    }
+
+    #[test]
+    fn parse_byte_size_kb_and_k_suffix() {
+        assert_eq!(parse_byte_size("256kb"), Ok(256 * 1024));
+        assert_eq!(parse_byte_size("256KB"), Ok(256 * 1024));
+        assert_eq!(parse_byte_size("256k"), Ok(256 * 1024));
+        assert_eq!(parse_byte_size("256K"), Ok(256 * 1024));
+    }
+
+    #[test]
+    fn parse_byte_size_mb_and_m_suffix() {
+        assert_eq!(parse_byte_size("2mb"), Ok(2 * 1024 * 1024));
+        assert_eq!(parse_byte_size("2MB"), Ok(2 * 1024 * 1024));
+        assert_eq!(parse_byte_size("2m"), Ok(2 * 1024 * 1024));
+        assert_eq!(parse_byte_size("2M"), Ok(2 * 1024 * 1024));
+    }
+
+    #[test]
+    fn parse_byte_size_trims_whitespace() {
+        assert_eq!(parse_byte_size(" 2mb \n"), Ok(2 * 1024 * 1024));
+    }
+
+    #[test]
+    fn parse_byte_size_rejects_garbage_and_empty() {
+        assert!(parse_byte_size("").is_err());
+        assert!(parse_byte_size("not-a-number").is_err());
+        assert!(parse_byte_size("kb").is_err()); // suffix with no digits
     }
 }
 
