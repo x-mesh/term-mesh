@@ -176,7 +176,16 @@ impl UsageTracker {
         if claude_dir.exists() {
             let tracker_fsevent = self.clone();
             let watch_dir = claude_dir.clone();
-            tokio::task::spawn_blocking(move || {
+            // Detached OS thread, not tokio::task::spawn_blocking: the `for
+            // event in rx` loop below never returns (the notify Watcher lives
+            // in this closure and keeps its channel sender open for the
+            // process lifetime). A spawn_blocking task is tracked by the
+            // tokio runtime and its Drop waits for all blocking tasks to
+            // finish, so on SIGTERM the runtime shutdown would hang forever
+            // waiting on a loop that never exits — the process logs "shutdown
+            // complete" but never actually terminates. A plain OS thread is
+            // untracked by tokio and does not block process exit.
+            std::thread::spawn(move || {
                 let (tx, rx) = std::sync::mpsc::channel::<Event>();
                 let mut watcher: RecommendedWatcher = Watcher::new(
                     move |res: Result<Event, notify::Error>| {
