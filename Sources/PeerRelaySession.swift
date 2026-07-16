@@ -36,6 +36,12 @@ private typealias RelayFrame = (type: UInt8, payload: Data)
 struct PeerRelayConnection: Sendable {
     let hostSockPath: String
     let hostDisplayName: String
+    /// The host's advertised app version (`PeerSessionInfo.hostAppVersion`),
+    /// carried through for version-visibility logging/UX. Optional so a
+    /// future caller that cannot re-derive it from a live handshake (e.g. a
+    /// cached/reconstructed connection) can represent "unknown" rather than
+    /// a misleading empty string.
+    let hostAppVersion: String?
     /// Negotiated during handshake (part of `connect()`, no extra round
     /// trip). Callers gate optional RPCs (e.g. workspace CRUD) on this
     /// rather than assuming every host build supports them.
@@ -618,6 +624,7 @@ final class PeerRelaySession {
         return PeerRelayConnection(
             hostSockPath: hostSockPath,
             hostDisplayName: connection.hostDisplayName,
+            hostAppVersion: connection.hostAppVersion,
             hostCapabilities: connection.hostCapabilities,
             session: connection.session,
             transport: connection.transport,
@@ -640,9 +647,13 @@ final class PeerRelaySession {
             throw error
         }
         await transport.setReadTimeoutSeconds(nil)
+        #if DEBUG
+        dlog("peer.relay.hostVersion displayName=\(info.hostDisplayName) appVersion=\(info.hostAppVersion) protocolVersion=\(info.hostProtocolVersion)")
+        #endif
         return PeerRelayConnection(
             hostSockPath: hostSockPath,
             hostDisplayName: info.hostDisplayName,
+            hostAppVersion: info.hostAppVersion,
             hostCapabilities: info.hostCapabilities,
             session: session,
             transport: transport,
