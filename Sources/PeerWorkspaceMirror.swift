@@ -439,11 +439,44 @@ final class PeerWorkspaceMirrorController {
         }
     }
 
+    /// The mirrored workspace was deleted on the host. Auto-close the
+    /// local mirror to match: with the host gone every structural action
+    /// just forwards upstream and silently no-ops (`mirrorForwardsLocalActions`),
+    /// so leaving the tab open would only produce an unresponsive zombie.
+    ///
+    /// Idempotent/re-entrant-safe: gated on `isTornDown`, which
+    /// `TabManager.closeWorkspace` below sets synchronously (via
+    /// `workspace.peerMirror?.teardown()`) before this method could ever
+    /// be re-entered — the receive loop, `reconnectLoop`, and
+    /// `forceResync` all re-check `isTornDown` around their own calls
+    /// into this method too, so a stale/duplicate hostGone signal is a
+    /// no-op here rather than a double close or double notification.
     private func markHostWorkspaceGone() {
-        markWorkspaceTitle(suffix: "host workspace closed")
+        guard !isTornDown else { return }
+        let title = hostWorkspaceTitle.isEmpty ? "Workspace" : hostWorkspaceTitle
+        let hostLabel = spec.hostKey.shortLabel
         #if DEBUG
-        dlog("peer.mirror.host_workspace_gone")
+        dlog("peer.mirror.hostGone action=autoclose host=\(spec.hostKey) workspace=\(title)")
         #endif
+        guard let workspace, let tabManager = AppDelegate.shared?.tabManager else {
+            // No window/TabManager context (headless/test) — just release
+            // the layout-sync plane; there's no tab to close or notify.
+            teardown()
+            return
+        }
+        // Same path the roster's manual disconnect uses (PeerMenu.swift)
+        // to close a mirror workspace: TabManager owns tab removal, and
+        // cascades into `teardown()` via `workspace.peerMirror?.teardown()`
+        // (idempotent), releasing the subscription/heartbeat/lease as
+        // part of the same close.
+        tabManager.closeWorkspace(workspace)
+        tabManager.notifications.addNotification(
+            tabId: workspace.id,
+            surfaceId: nil,
+            title: "Workspace closed",
+            subtitle: hostLabel,
+            body: "“\(title)” was deleted on \(hostLabel)."
+        )
     }
 
     private func markWorkspaceTitle(suffix: String?) {
