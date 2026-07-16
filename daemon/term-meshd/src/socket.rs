@@ -1361,6 +1361,7 @@ async fn dispatch(req: &Request, ctx: &Context) -> Response {
 
             Ok(serde_json::json!({
                 "pid": std::process::id(),
+                "version": env!("CARGO_PKG_VERSION"),
                 "uptime_secs": uptime_secs,
                 "subsystems": {
                     "socket": { "status": "running" },
