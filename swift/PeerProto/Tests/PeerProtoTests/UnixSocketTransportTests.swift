@@ -122,6 +122,19 @@ final class UnixSocketTransportTests: XCTestCase {
         return fd
     }
 
+    private static func terminate(_ process: Process) {
+        guard process.isRunning else { return }
+        process.terminate()
+        let deadline = Date().addingTimeInterval(1)
+        while process.isRunning && Date() < deadline {
+            usleep(10_000)
+        }
+        if process.isRunning {
+            Darwin.kill(process.processIdentifier, SIGKILL)
+        }
+        process.waitUntilExit()
+    }
+
     /// Spawn a daemon with a `cat` surface, run handshake + attach, send
     /// a keystroke, and verify the echo comes back through PtyData.
     /// Exercises attachSurface + sendInput + receiveNextMessage
@@ -135,7 +148,15 @@ final class UnixSocketTransportTests: XCTestCase {
         }
 
         let sockPath = "/tmp/tm-peer-swift-c3c-\(UUID().uuidString.prefix(8)).sock"
-        defer { try? fm.removeItem(atPath: sockPath) }
+        let logURL = fm.temporaryDirectory
+            .appendingPathComponent("tm-peer-swift-c3c-\(UUID().uuidString).log")
+        fm.createFile(atPath: logURL.path, contents: nil)
+        let logHandle = try FileHandle(forWritingTo: logURL)
+        defer {
+            try? logHandle.close()
+            try? fm.removeItem(atPath: logURL.path)
+            try? fm.removeItem(atPath: sockPath)
+        }
 
         let process = Process()
         process.executableURL = URL(fileURLWithPath: Self.daemonPath)
@@ -148,21 +169,18 @@ final class UnixSocketTransportTests: XCTestCase {
             // also echoes typed characters, so MARKER arrives at least once.
             "TERMMESH_PEER_SURFACES": "echo=/bin/cat",
         ]
-        let stderrPipe = Pipe()
-        process.standardError = stderrPipe
-        process.standardOutput = Pipe()
+        process.standardError = logHandle
+        process.standardOutput = logHandle
         try process.run()
         defer {
-            if process.isRunning {
-                process.terminate()
-                process.waitUntilExit()
-            }
+            Self.terminate(process)
         }
 
         let deadline = Date().addingTimeInterval(5)
         while !fm.fileExists(atPath: sockPath) {
             if Date() > deadline {
-                let data = stderrPipe.fileHandleForReading.availableData
+                try? logHandle.synchronize()
+                let data = (try? Data(contentsOf: logURL)) ?? Data()
                 XCTFail("socket never appeared; stderr:\n\(String(data: data, encoding: .utf8) ?? "")")
                 return
             }
@@ -234,7 +252,13 @@ final class UnixSocketTransportTests: XCTestCase {
 
         // Temp socket path — unique per test run.
         let sockPath = "/tmp/tm-peer-swift-itest-\(UUID().uuidString.prefix(8)).sock"
+        let logURL = fm.temporaryDirectory
+            .appendingPathComponent("tm-peer-swift-itest-\(UUID().uuidString).log")
+        fm.createFile(atPath: logURL.path, contents: nil)
+        let logHandle = try FileHandle(forWritingTo: logURL)
         defer {
+            try? logHandle.close()
+            try? fm.removeItem(atPath: logURL.path)
             try? fm.removeItem(atPath: sockPath)
         }
 
@@ -252,17 +276,12 @@ final class UnixSocketTransportTests: XCTestCase {
                 """,
         ]
         // Capture output so failures come with diagnostics.
-        let stderrPipe = Pipe()
-        let stdoutPipe = Pipe()
-        process.standardError = stderrPipe
-        process.standardOutput = stdoutPipe
+        process.standardError = logHandle
+        process.standardOutput = logHandle
 
         try process.run()
         defer {
-            if process.isRunning {
-                process.terminate()
-                process.waitUntilExit()
-            }
+            Self.terminate(process)
         }
 
         // Wait for the socket to appear. 3 seconds is plenty; the daemon
@@ -270,7 +289,8 @@ final class UnixSocketTransportTests: XCTestCase {
         let deadline = Date().addingTimeInterval(5)
         while !fm.fileExists(atPath: sockPath) {
             if Date() > deadline {
-                let stderrData = stderrPipe.fileHandleForReading.availableData
+                try? logHandle.synchronize()
+                let stderrData = (try? Data(contentsOf: logURL)) ?? Data()
                 let stderrText = String(data: stderrData, encoding: .utf8) ?? "<binary>"
                 XCTFail("peer socket \(sockPath) never appeared within 5s; daemon stderr:\n\(stderrText)")
                 return
