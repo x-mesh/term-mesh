@@ -273,6 +273,23 @@ extension Workspace: BonsplitDelegate {
             return true
         }
 
+        if let remotePane = retrievalStore.pane(panelID: panelId) {
+            let action = RemotePaneSafetyPolicy.closeAction(
+                lifetime: remotePane.lifetime,
+                bindingRole: remotePane.bindingRole,
+                hasUncollectedChanges: remotePane.hasUncollectedChanges,
+                state: remotePane.state
+            )
+            switch action {
+            case .requireCheckpoint, .blockForRecovery:
+                clearStagedClosedBrowserRestoreSnapshot(for: tab.id)
+                retrievalStore.requestClose(panelID: panelId)
+                return false
+            case .detachBinding, .terminateSession:
+                break
+            }
+        }
+
         // If confirmation is required, Bonsplit will call into this delegate and we must return false.
         // Show an app-level confirmation, then re-attempt the close with forceCloseTabIds to bypass
         // this gating on the second pass.
@@ -376,6 +393,7 @@ extension Workspace: BonsplitDelegate {
         TerminalController.shared.v2CleanupSurface(panelId)
 
         panels.removeValue(forKey: panelId)
+        retrievalStore.removeBinding(panelID: panelId)
         surfaceIdToPanelId.removeValue(forKey: tabId)
         panelDirectories.removeValue(forKey: panelId)
         panelGitBranches.removeValue(forKey: panelId)

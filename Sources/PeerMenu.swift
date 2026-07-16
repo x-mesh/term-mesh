@@ -422,6 +422,11 @@ final class PeerClientCoordinator: NSObject {
             return false
         }
 
+        guard let lifetime = await promptForRemotePaneLifetime(surface: chosen) else {
+            registry.release(lease)
+            return false
+        }
+
         guard let workspace = Self.currentWorkspaceForPaneOpen() else {
             registry.release(lease)
             self.showAlert(
@@ -447,7 +452,7 @@ final class PeerClientCoordinator: NSObject {
         // Browse ref done — the pane session holds its own ref now.
         registry.release(lease)
 
-        guard workspace.openRemotePane(session: session) != nil else {
+        guard workspace.openRemotePane(session: session, lifetime: lifetime) != nil else {
             session.teardown()
             self.showAlert(
                 title: "Pane Open Failed",
@@ -1337,6 +1342,31 @@ final class PeerClientCoordinator: NSObject {
         let idx = popup.indexOfSelectedItem
         guard idx >= 0, idx < surfaces.count else { return nil }
         return surfaces[idx]
+    }
+
+    private func promptForRemotePaneLifetime(
+        surface: Termmesh_Peer_V1_SurfaceInfo
+    ) async -> RemotePaneLifetime? {
+        let alert = NSAlert()
+        alert.messageText = "Open remote pane"
+        alert.informativeText = "Temporary collects changes before close. Keep Alive can be linked into another Workspace and keeps the remote PTY running when removed locally."
+
+        let popup = NSPopUpButton(
+            frame: NSRect(x: 0, y: 0, width: 360, height: 26),
+            pullsDown: false
+        )
+        popup.addItems(withTitles: ["Temporary — collect, then close", "Keep Alive — reusable across Workspaces"])
+        popup.selectItem(at: 0)
+        popup.toolTip = surface.cwd.isEmpty
+            ? "No remote project directory was reported"
+            : "Current Project: \(surface.cwd)"
+        alert.accessoryView = popup
+        alert.addButton(withTitle: "Open")
+        alert.addButton(withTitle: "Cancel")
+
+        let response = await Self.runModalAsSheet(alert)
+        guard response == .alertFirstButtonReturn else { return nil }
+        return popup.indexOfSelectedItem == 1 ? .keepAlive : .temporary
     }
 
     @objc func promptAndRun(_ sender: Any?) {

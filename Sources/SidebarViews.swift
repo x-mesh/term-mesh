@@ -69,6 +69,10 @@ struct VerticalTabsSidebar: View {
 
                         SidebarRemoteHostsSection(store: remoteHostStore)
 
+                        if let selectedWorkspace = tabManager.tabs.first(where: { $0.id == tabManager.selectedTabId }) {
+                            WorkspaceRetrievalSidebarSection(workspace: selectedWorkspace)
+                        }
+
                         SidebarEmptyArea(
                             rowSpacing: tabRowSpacing,
                             selection: $selection,

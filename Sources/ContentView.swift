@@ -403,21 +403,23 @@ struct ContentView: View {
                     let isInputActive = isSelectedWorkspace
                     let isVisible = isSelectedWorkspace || isRetiringWorkspace
                     let portalPriority = isSelectedWorkspace ? 2 : (isRetiringWorkspace ? 1 : 0)
-                    WorkspaceContentView(
-                        workspace: tab,
-                        isWorkspaceVisible: isVisible,
-                        isWorkspaceInputActive: isInputActive,
-                        workspacePortalPriority: portalPriority,
-                        onThemeRefreshRequest: { reason, eventId, source, payloadHex in
-                            scheduleTitlebarThemeRefreshFromWorkspace(
-                                workspaceId: tab.id,
-                                reason: reason,
-                                backgroundEventId: eventId,
-                                backgroundSource: source,
-                                notificationPayloadHex: payloadHex
-                            )
-                        }
-                    )
+                    WorkspaceRetrievalChrome(workspace: tab) {
+                        WorkspaceContentView(
+                            workspace: tab,
+                            isWorkspaceVisible: isVisible,
+                            isWorkspaceInputActive: isInputActive,
+                            workspacePortalPriority: portalPriority,
+                            onThemeRefreshRequest: { reason, eventId, source, payloadHex in
+                                scheduleTitlebarThemeRefreshFromWorkspace(
+                                    workspaceId: tab.id,
+                                    reason: reason,
+                                    backgroundEventId: eventId,
+                                    backgroundSource: source,
+                                    notificationPayloadHex: payloadHex
+                                )
+                            }
+                        )
+                    }
                     .opacity(isVisible ? 1 : 0)
                     .allowsHitTesting(isSelectedWorkspace)
                     .zIndex(isSelectedWorkspace ? 2 : (isRetiringWorkspace ? 1 : 0))

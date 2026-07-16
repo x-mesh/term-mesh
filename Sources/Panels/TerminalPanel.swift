@@ -31,6 +31,12 @@ final class TerminalPanel: Panel, ObservableObject {
     /// nil = local terminal.
     var peerPaneSession: PeerPaneSession?
 
+    /// Workspace retrieval metadata is deliberately separate from the relay
+    /// session: closing a local binding does not imply closing the host PTY.
+    var remotePaneID: RemotePaneID?
+    var remotePaneLifetime: RemotePaneLifetime = .temporary
+    var remotePaneBindingRole: PaneBindingRole = .owned
+
     /// Host identity for visual signals (titlebar tint, pane strip,
     /// tab chip). nil = local pane.
     var remoteHostKey: PeerPaneHostKey? { peerPaneSession?.lease.key }

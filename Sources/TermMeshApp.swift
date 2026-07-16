@@ -714,6 +714,27 @@ struct TermMeshApp: App {
                 }
             }
 
+            CommandMenu("Remote Work") {
+                Button("Toggle Activity Drawer") {
+                    AppDelegate.shared?.tabManager?.selectedWorkspace?
+                        .retrievalStore.togglePresentation(.drawer)
+                }
+                .keyboardShortcut("d", modifiers: [.command, .control])
+
+                Button("Toggle Changes Inspector") {
+                    AppDelegate.shared?.tabManager?.selectedWorkspace?
+                        .retrievalStore.togglePresentation(.inspector)
+                }
+                .keyboardShortcut("i", modifiers: [.command, .control])
+
+                Button("Checkpoint Now") {
+                    guard let workspace = AppDelegate.shared?.tabManager?.selectedWorkspace,
+                          let panelID = workspace.retrievalStore.selectedPane?.panelID else { return }
+                    Task { await workspace.checkpointRemotePane(panelID: panelID, closeAfterCheckpoint: false) }
+                }
+                .keyboardShortcut("k", modifiers: [.command, .control])
+            }
+
 #if DEBUG
             CommandMenu("Debug") {
                 Button("New Tab With Lorem Search Text") {

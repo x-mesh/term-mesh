@@ -415,6 +415,13 @@ final class PeerRelaySession {
     var onError: (@MainActor (Error) -> Void)?
     var onDisconnect: (@MainActor () -> Void)?
 
+    /// Explicit host-side termination. Ordinary local pane close must not call
+    /// this; it only detaches the relay and leaves the remote PTY alive.
+    func requestRemoteClose() async throws {
+        guard let session else { return }
+        try await session.requestClosePane(paneID: surfaceID)
+    }
+
     // ── Stale-socket sweep ──────────────────────────────────────────
     //
     // Per-session sockets land in a private per-user directory.
