@@ -270,9 +270,11 @@ final class TermMeshDaemon: ObservableObject {
     func stopDaemon() {
         // Case 1: We spawned the daemon — terminate directly
         if let proc = daemonProcess, proc.isRunning {
+            let pid = proc.processIdentifier
             proc.terminate()
             daemonProcess = nil
             Logger.daemon.info("daemon stopped (tracked process)")
+            Self.ensureTerminated(pid: pid)
         }
 
         // Case 2: Kill daemon listening on our socket (isolated — won't affect other instances).
@@ -296,12 +298,31 @@ final class TermMeshDaemon: ObservableObject {
                 if let pid = Int32(line.trimmingCharacters(in: .whitespaces)) {
                     kill(pid, SIGTERM)
                     Logger.daemon.info("daemon killed (pid: \(pid, privacy: .public), socket: \(path, privacy: .public))")
+                    Self.ensureTerminated(pid: pid)
                 }
             }
         }
 
         // Clean up socket file
         try? FileManager.default.removeItem(atPath: path)
+    }
+
+    /// Poll `pid` after a SIGTERM and escalate to SIGKILL if it hasn't exited
+    /// within ~1.5s. Guards against a daemon that ignores/hangs on SIGTERM
+    /// (e.g. a runtime shutdown stuck on a non-terminating background task).
+    /// Called from applicationWillTerminate, so the normal case — the process
+    /// already gone — must return immediately without sleeping.
+    private static func ensureTerminated(pid: Int32) {
+        let pollIntervalUsec: useconds_t = 100_000  // 100ms
+        let maxPolls = 15  // 15 * 100ms = 1.5s
+        for _ in 0..<maxPolls {
+            if kill(pid, 0) != 0 && errno == ESRCH { return }  // already gone
+            usleep(pollIntervalUsec)
+        }
+        if kill(pid, 0) == 0 || errno != ESRCH {
+            kill(pid, SIGKILL)
+            Logger.daemon.warning("daemon did not exit after SIGTERM, sent SIGKILL (pid: \(pid, privacy: .public))")
+        }
     }
 
     // MARK: - Restart
