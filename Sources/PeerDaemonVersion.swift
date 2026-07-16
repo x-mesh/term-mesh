@@ -17,13 +17,55 @@ enum PeerDaemonVersion {
 
     /// Result of comparing an installed version string against the
     /// latest known release.
+    ///
+    /// UI contract (t3): `.outdated` and `.legacy` both name `latest`
+    /// as the update target, but the two must NOT render with the same
+    /// copy. `.outdated` is a precise "you're behind" claim ("update to
+    /// vX.Y.Z"); `.legacy` is not a comparison at all — show it as
+    /// "legacy daemon — update recommended (version reporting predates
+    /// v\(versionSyncFloor))" instead of implying any ordering was computed.
     enum Comparison: Equatable {
         case upToDate
         case outdated(latest: String)
+        /// `installed` parses as semver but is below `versionSyncFloor`
+        /// — see that constant's doc for why ordering it against
+        /// `latest` would misreport a pre-sync daemon as outdated (or,
+        /// worse, as up to date) essentially at random.
+        case legacy(latest: String)
         /// Either side failed to parse as semver — no claim is made,
         /// the caller must not offer an update on this result.
         case unknown
     }
+
+    /// First app release where `scripts/bump-version.sh` syncs the
+    /// daemon's own Cargo package version with the app's
+    /// MARKETING_VERSION (see that script's daemon Cargo.toml/Cargo.lock
+    /// rewrite, introduced alongside `daemon.status` version reporting —
+    /// t1 commit e58c008b). `main`'s latest tag at the time this floor
+    /// was picked was v0.156.0, so v0.157.0 (the next default minor
+    /// bump) is the first release where the two numbering schemes agree.
+    ///
+    /// Below this floor, `term-meshd --version` reports its own
+    /// pre-sync Cargo version (observed in the wild: "0.72.0") — a
+    /// number from a completely unrelated series, not a lagging point
+    /// on the app's release train. Numerically comparing "0.72.0"
+    /// against an app release tag like "0.156.0" always reads as
+    /// "wildly outdated" even seconds after a legitimate update, so
+    /// `compare` refuses to run that comparison below this floor and
+    /// returns `.legacy` instead.
+    static let versionSyncFloor = "0.157.0"
+
+    /// `versionSyncFloor` is a fixed literal under this file's own
+    /// control, so a parse failure here is a code bug, not a runtime
+    /// condition — asserted by unit test
+    /// (test_versionSyncFloor_isParsable) rather than threaded through
+    /// `compare` as another optional to unwrap.
+    private static let versionSyncFloorComponents: [Int] = {
+        guard let components = parseComponents(versionSyncFloor) else {
+            preconditionFailure("versionSyncFloor must be a parsable semver string")
+        }
+        return components
+    }()
 
     /// Fetches the repo's latest release tag (e.g. "v0.156.0"). Returns
     /// nil on any network, HTTP, or parse failure — callers treat that
@@ -87,10 +129,18 @@ enum PeerDaemonVersion {
 
     /// Compares raw version strings end-to-end. `.unknown` whenever
     /// either side fails to parse — this function never guesses.
+    /// `installed` strictly below `versionSyncFloor` short-circuits to
+    /// `.legacy` before the numeric comparison runs at all — see
+    /// `versionSyncFloor` for why that comparison isn't meaningful down
+    /// there. `installed == versionSyncFloor` is NOT legacy: the sync
+    /// release itself gets the precise comparison.
     static func compare(installed: String, latest: String) -> Comparison {
         guard let installedComponents = parseComponents(installed),
               let latestComponents = parseComponents(latest) else {
             return .unknown
+        }
+        if compareComponents(installedComponents, versionSyncFloorComponents) == .orderedAscending {
+            return .legacy(latest: latest)
         }
         switch compareComponents(installedComponents, latestComponents) {
         case .orderedAscending:

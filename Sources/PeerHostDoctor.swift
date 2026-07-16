@@ -227,6 +227,17 @@ enum PeerHostDoctor {
             if Date() > deadline {
                 timedOut = true
                 proc.terminate()
+                // ssh can ignore SIGTERM outright (documented hazard —
+                // see PeerSocketProber.probe's identical escalation).
+                // Without this, a stuck child never closes its pipe
+                // fds, so the `await outData`/`await errData` below
+                // would block on EOF forever instead of honoring
+                // timeoutSeconds — the top-of-function defer can't help
+                // either, since it only runs once this call returns.
+                if await !waitForExit(proc, timeout: 2.0) {
+                    kill(proc.processIdentifier, SIGKILL)
+                    _ = await waitForExit(proc, timeout: 1.0)
+                }
                 break
             }
             try await Task.sleep(nanoseconds: 200_000_000)
@@ -252,5 +263,20 @@ enum PeerHostDoctor {
                 continuation.resume(returning: data)
             }
         }
+    }
+
+    /// Async twin of PeerSSHTunnel.waitForExit / PeerSocketProber's
+    /// private helper of the same name — polls `isRunning` without
+    /// blocking a thread. Not `private` (unlike PeerSocketProber's
+    /// copy) so the SIGTERM→SIGKILL escalation it enables is directly
+    /// unit-testable against a real child process without going
+    /// through ssh.
+    static func waitForExit(_ proc: Process, timeout: TimeInterval) async -> Bool {
+        let deadline = Date().addingTimeInterval(timeout)
+        while proc.isRunning {
+            if Date() > deadline { return false }
+            try? await Task.sleep(nanoseconds: 50_000_000)
+        }
+        return true
     }
 }

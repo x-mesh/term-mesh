@@ -1,3 +1,4 @@
+import Darwin
 import XCTest
 
 #if canImport(term_mesh_DEV)
@@ -185,18 +186,74 @@ final class PeerDaemonVersionTests: XCTestCase {
     // MARK: - PeerDaemonVersion.compare (numeric, not lexicographic)
 
     func test_compare_digitBoundary_notLexicographic() {
-        // A string compare would put "0.9.0" AFTER "0.100.0" ("9" > "1"
-        // as characters) — the numeric comparison must not.
+        // A string compare would put "0.157.9" AFTER "0.157.100" ("9" >
+        // "1" as characters) — the numeric comparison must not. Both
+        // sides sit at/above versionSyncFloor so this exercises the
+        // precise-comparison branch, not the legacy short-circuit.
         XCTAssertEqual(
-            PeerDaemonVersion.compare(installed: "0.9.0", latest: "0.100.0"),
-            .outdated(latest: "0.100.0")
+            PeerDaemonVersion.compare(installed: "0.157.9", latest: "0.157.100"),
+            .outdated(latest: "0.157.100")
         )
     }
 
     func test_compare_sameVersionIsUpToDate() {
+        // Above versionSyncFloor, so this exercises the precise
+        // comparison branch rather than the legacy short-circuit.
         XCTAssertEqual(
-            PeerDaemonVersion.compare(installed: "0.156.0", latest: "v0.156.0"),
+            PeerDaemonVersion.compare(installed: "0.160.0", latest: "v0.160.0"),
             .upToDate
+        )
+    }
+
+    // MARK: - PeerDaemonVersion.compare — versionSyncFloor / .legacy
+
+    func test_versionSyncFloor_isParsable() {
+        // Precondition the compare() implementation force-unwraps —
+        // guards against a future edit turning the floor literal into
+        // something parseComponents can't handle.
+        XCTAssertNotNil(PeerDaemonVersion.parseComponents(PeerDaemonVersion.versionSyncFloor))
+    }
+
+    func test_compare_belowSyncFloor_isLegacy() {
+        // The real-world case that motivated this: a daemon reporting
+        // "0.72.0" predates the version-sync release and used an
+        // unrelated Cargo numbering scheme entirely — numeric ordering
+        // against a v0.156.x app release tag is not a meaningful
+        // "outdated" signal (or "up to date" — either would be a
+        // coincidence), so this must NOT be .outdated/.upToDate.
+        XCTAssertEqual(
+            PeerDaemonVersion.compare(installed: "0.72.0", latest: "0.156.0"),
+            .legacy(latest: "0.156.0")
+        )
+    }
+
+    func test_compare_belowSyncFloor_isLegacyEvenWhenNumericallyAheadOfLatest() {
+        // Guards against a naive "legacy iff outdated" implementation:
+        // a legacy build can numerically exceed `latest` (unrelated
+        // series) and must still report .legacy, not .upToDate.
+        XCTAssertEqual(
+            PeerDaemonVersion.compare(installed: "0.72.0", latest: "0.50.0"),
+            .legacy(latest: "0.50.0")
+        )
+    }
+
+    func test_compare_atSyncFloor_isPreciseNotLegacy() {
+        // installed == versionSyncFloor is NOT "below floor" — the
+        // sync release itself must get the precise comparison, not the
+        // legacy tone.
+        XCTAssertEqual(
+            PeerDaemonVersion.compare(
+                installed: PeerDaemonVersion.versionSyncFloor,
+                latest: PeerDaemonVersion.versionSyncFloor
+            ),
+            .upToDate
+        )
+    }
+
+    func test_compare_aboveSyncFloor_belowLatestIsOutdated() {
+        XCTAssertEqual(
+            PeerDaemonVersion.compare(installed: "0.157.0", latest: "0.160.0"),
+            .outdated(latest: "0.160.0")
         )
     }
 
@@ -225,6 +282,46 @@ final class PeerDaemonVersionTests: XCTestCase {
             PeerDaemonVersion.compare(installed: "0.156.0", latest: "garbage"),
             .unknown
         )
+    }
+
+    // MARK: - PeerHostDoctor.waitForExit (runRemote's SIGTERM→SIGKILL escalation)
+
+    /// Exercises the exact building block runRemote's timeout branch
+    /// relies on to stay bounded: an ssh child that ignores SIGTERM
+    /// outright is a documented hazard (see PeerSocketProber.probe's
+    /// identical escalation) — without it, runRemote would await pipe
+    /// EOF that never arrives and hang past its stated timeoutSeconds.
+    /// SIG_IGN survives exec, so a plain `sh -c 'trap "" TERM; sleep N'`
+    /// reproduces a SIGTERM-ignoring child without any special binary.
+    func test_waitForExit_escalatesPastSigtermIgnoringChild() async throws {
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: "/bin/sh")
+        proc.arguments = ["-c", "trap '' TERM; sleep 30"]
+        try proc.run()
+        defer { if proc.isRunning { kill(proc.processIdentifier, SIGKILL) } }
+
+        // Let the trap install before signaling.
+        try await Task.sleep(nanoseconds: 100_000_000)
+        proc.terminate()
+
+        let exitedAfterTerm = await PeerHostDoctor.waitForExit(proc, timeout: 0.5)
+        XCTAssertFalse(exitedAfterTerm, "child traps SIGTERM — must still be running")
+        XCTAssertTrue(proc.isRunning)
+
+        kill(proc.processIdentifier, SIGKILL)
+        let exitedAfterKill = await PeerHostDoctor.waitForExit(proc, timeout: 2.0)
+        XCTAssertTrue(exitedAfterKill, "SIGKILL must reap even a SIGTERM-ignoring child")
+    }
+
+    func test_waitForExit_trueWhenAlreadyExited() async throws {
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: "/bin/sh")
+        proc.arguments = ["-c", "exit 0"]
+        try proc.run()
+        proc.waitUntilExit()
+
+        let exited = await PeerHostDoctor.waitForExit(proc, timeout: 1.0)
+        XCTAssertTrue(exited)
     }
 
     // MARK: - Helpers (mirrors PeerSocketProberTests' local script runner)
