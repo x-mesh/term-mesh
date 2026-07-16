@@ -55,6 +55,11 @@ async fn main() -> anyhow::Result<()> {
     START_TIME.get_or_init(Instant::now);
     tracing::info!("term-meshd starting");
 
+    // Peer PTY-surface replay buffer capacity (TERMMESH_PEER_REPLAY_BYTES
+    // env override; further adjustable at runtime via the
+    // peer.replay_capacity RPC / `tm-agent daemon replay-capacity --set`).
+    peer::surface::init_replay_capacity_from_env();
+
     // 1. Detect orphan worktrees from previous crashed sessions
     worktree::detect_orphan_worktrees();
 

@@ -64,6 +64,16 @@ impl RpcClient {
 }
 
 fn default_socket_path() -> PathBuf {
+    // Priority 1: explicit override for tagged/isolated daemon instances —
+    // same env var and same priority as term-meshd's own
+    // socket::default_socket_path() (daemon/term-meshd/src/socket.rs), so a
+    // caller pointing at an isolated daemon via this env var reaches it
+    // through either binary consistently.
+    if let Ok(p) = std::env::var("TERMMESH_DAEMON_UNIX_PATH") {
+        if !p.is_empty() {
+            return PathBuf::from(p);
+        }
+    }
     if let Ok(dir) = std::env::var("TMPDIR") {
         return PathBuf::from(dir).join("term-meshd.sock");
     }

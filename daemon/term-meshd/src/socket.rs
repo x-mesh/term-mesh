@@ -12,6 +12,7 @@ use crate::agent::AgentSessionManager;
 use crate::headless::HeadlessManager;
 use crate::monitor::{Anomaly, MonitorHandle, SystemSnapshot};
 use crate::pane_tracker::PaneTracker;
+use crate::peer::surface;
 use crate::supervisor::{shutdown_supervised, spawn_supervised};
 use crate::tokens::UsageTracker;
 use crate::watcher::WatcherHandle;
@@ -2948,6 +2949,26 @@ async fn dispatch(req: &Request, ctx: &Context) -> Response {
                         Some(id) => Ok(serde_json::json!({ "agent_id": id, "headless": true })),
                         None => Ok(serde_json::json!({ "agent_id": null, "headless": false })),
                     }
+                }
+                Err(e) => Err(format!("invalid params: {e}")),
+            }
+        }
+
+        // --- Peer (host-side PTY surfaces) ---
+        // Combined get/set: omit `bytes` to read the current capacity,
+        // supply it to change it. The replay buffer capacity is a
+        // process-wide static (crate::peer::surface), not per-team/session
+        // state, so unlike most RPCs above this has no ctx dependency.
+        "peer.replay_capacity" => {
+            #[derive(Deserialize)]
+            struct P {
+                bytes: Option<usize>,
+            }
+            match serde_json::from_value::<P>(req.params.clone()) {
+                Ok(P { bytes: Some(bytes) }) => surface::set_replay_capacity(bytes)
+                    .map(|(old, new)| serde_json::json!({"old": old, "new": new})),
+                Ok(P { bytes: None }) => {
+                    Ok(serde_json::json!({"bytes": surface::replay_capacity()}))
                 }
                 Err(e) => Err(format!("invalid params: {e}")),
             }
