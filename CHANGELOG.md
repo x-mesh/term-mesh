@@ -2,6 +2,16 @@
 
 All notable changes to term-mesh are documented here.
 
+## [0.159.0] - 2026-07-17
+
+### Added
+- **원격 workspace를 우클릭 한 번으로 현재 workspace의 pane으로** — 사이드바 Peer Hosts의 원격 workspace 항목에 "Open as Pane in Current Workspace" 메뉴가 생겼다. pane이 하나뿐인 workspace는 선택 창 없이 즉시 열리고, 여러 개면 그 workspace의 pane만 추려서 보여준다.
+- **원격 surface 선택 창에 workspace 이름 표시** — "Open Surface as Pane…"에서 shell을 고를 때 각 항목에 소속 workspace 이름이 함께 표시되어 원하는 pane을 찾기 쉬워졌다.
+
+### Thanks to 1 contributor!
+
+- [@JINWOO-J](https://github.com/JINWOO-J)
+
 ## [0.158.0] - 2026-07-17
 
 ### Fixed
