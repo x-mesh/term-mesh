@@ -1684,8 +1684,7 @@ mod integration_tests {
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
 
-        let (mut reader, writer, _surface_id) =
-            attach_one(&sock_path, "plain-shell-test").await;
+        let (mut reader, writer, _surface_id) = attach_one(&sock_path, "plain-shell-test").await;
 
         // Capture the first PtyData frame's payload and keep draining until
         // the marker arrives, mirroring `wait_for_marker`'s loop but also
@@ -1846,7 +1845,9 @@ mod integration_tests {
         Envelope {
             seq,
             correlation_id: 0,
-            payload: Some(Payload::WorkspaceControl(WorkspaceControl { kind: Some(kind) })),
+            payload: Some(Payload::WorkspaceControl(WorkspaceControl {
+                kind: Some(kind),
+            })),
         }
     }
 
@@ -1862,7 +1863,9 @@ mod integration_tests {
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let sock_path_task = sock_path.clone();
         let server_task = tokio::spawn(async move {
-            serve_with_manager(sock_path_task, shutdown_rx, manager).await.unwrap();
+            serve_with_manager(sock_path_task, shutdown_rx, manager)
+                .await
+                .unwrap();
         });
         for _ in 0..50 {
             if sock_path.exists() {
@@ -1888,8 +1891,12 @@ mod integration_tests {
         .await
         .unwrap();
 
-        let l1 = next_layout_push(&mut r1, PUSH_WINDOW).await.expect("requester got push");
-        let l2 = next_layout_push(&mut r2, PUSH_WINDOW).await.expect("bystander got push");
+        let l1 = next_layout_push(&mut r1, PUSH_WINDOW)
+            .await
+            .expect("requester got push");
+        let l2 = next_layout_push(&mut r2, PUSH_WINDOW)
+            .await
+            .expect("bystander got push");
         assert_eq!(count_panes(&l1), 2);
         assert_eq!(count_panes(&l2), 2);
         // The original pane survived with its identity intact.
@@ -1910,7 +1917,9 @@ mod integration_tests {
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let sock_path_task = sock_path.clone();
         let server_task = tokio::spawn(async move {
-            serve_with_manager(sock_path_task, shutdown_rx, manager).await.unwrap();
+            serve_with_manager(sock_path_task, shutdown_rx, manager)
+                .await
+                .unwrap();
         });
         for _ in 0..50 {
             if sock_path.exists() {
@@ -1940,7 +1949,9 @@ mod integration_tests {
             &mut writer,
             &control(
                 5,
-                workspace_control::Kind::ClosePane(ClosePaneRequest { pane_id: pane.clone() }),
+                workspace_control::Kind::ClosePane(ClosePaneRequest {
+                    pane_id: pane.clone(),
+                }),
             ),
         )
         .await
@@ -1961,7 +1972,10 @@ mod integration_tests {
 
         // Well past the 120ms debounce: nothing may arrive.
         let push = next_layout_push(&mut reader, std::time::Duration::from_millis(600)).await;
-        assert!(push.is_none(), "no-op control leaked a layout push: {push:?}");
+        assert!(
+            push.is_none(),
+            "no-op control leaked a layout push: {push:?}"
+        );
 
         // The tree is intact: the pane is still there and closable-checks
         // did not corrupt anything.
@@ -1982,7 +1996,9 @@ mod integration_tests {
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let sock_path_task = sock_path.clone();
         let server_task = tokio::spawn(async move {
-            serve_with_manager(sock_path_task, shutdown_rx, manager).await.unwrap();
+            serve_with_manager(sock_path_task, shutdown_rx, manager)
+                .await
+                .unwrap();
         });
         for _ in 0..50 {
             if sock_path.exists() {
@@ -2032,7 +2048,9 @@ mod integration_tests {
         }
         let l1 = latest.expect("client 1 got a push");
         assert_eq!(count_panes(&l1), 3, "both splits landed");
-        let l2 = next_layout_push(&mut r2, PUSH_WINDOW).await.expect("client 2 got a push");
+        let l2 = next_layout_push(&mut r2, PUSH_WINDOW)
+            .await
+            .expect("client 2 got a push");
         assert_eq!(count_panes(&l2), 3);
 
         shutdown_tx.send(true).unwrap();
@@ -2052,7 +2070,9 @@ mod integration_tests {
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let sock_path_task = sock_path.clone();
         let server_task = tokio::spawn(async move {
-            serve_with_manager(sock_path_task, shutdown_rx, manager).await.unwrap();
+            serve_with_manager(sock_path_task, shutdown_rx, manager)
+                .await
+                .unwrap();
         });
         for _ in 0..50 {
             if sock_path.exists() {
@@ -2076,7 +2096,9 @@ mod integration_tests {
         )
         .await
         .unwrap();
-        let layout = next_layout_push(&mut reader, PUSH_WINDOW).await.expect("split pushed");
+        let layout = next_layout_push(&mut reader, PUSH_WINDOW)
+            .await
+            .expect("split pushed");
         assert_eq!(count_panes(&layout), 2);
         // The ephemeral pane is whichever leaf isn't the original base pane.
         let ephemeral_id = other_pane(&layout, &base_pane);
@@ -2092,8 +2114,14 @@ mod integration_tests {
         )
         .await
         .unwrap();
-        let after_close = next_layout_push(&mut reader, PUSH_WINDOW).await.expect("close pushed");
-        assert_eq!(count_panes(&after_close), 1, "ephemeral pane removed from the tree");
+        let after_close = next_layout_push(&mut reader, PUSH_WINDOW)
+            .await
+            .expect("close pushed");
+        assert_eq!(
+            count_panes(&after_close),
+            1,
+            "ephemeral pane removed from the tree"
+        );
 
         // Directly attach the closed id, bypassing WorkspaceControl.
         write_envelope(
@@ -2115,7 +2143,10 @@ mod integration_tests {
         let attach_reply = read_envelope(&mut reader).await.unwrap();
         match attach_reply.payload {
             Some(Payload::AttachResult(r)) => {
-                assert!(!r.accepted, "closed ephemeral surface must not respawn via direct attach")
+                assert!(
+                    !r.accepted,
+                    "closed ephemeral surface must not respawn via direct attach"
+                )
             }
             other => panic!("expected AttachResult, got {other:?}"),
         }
@@ -2191,7 +2222,10 @@ mod integration_tests {
                 ..
             })) => {
                 assert!(accepted, "CreateWorkspaceRequest must now be accepted");
-                assert!(!workspace_id.is_empty(), "a real workspace_id must be assigned");
+                assert!(
+                    !workspace_id.is_empty(),
+                    "a real workspace_id must be assigned"
+                );
             }
             other => panic!("expected CreateWorkspaceResponse, got {other:?}"),
         }
@@ -2300,7 +2334,9 @@ mod integration_tests {
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let sock_path_task = sock_path.clone();
         let server_task = tokio::spawn(async move {
-            serve_with_manager(sock_path_task, shutdown_rx, manager).await.unwrap();
+            serve_with_manager(sock_path_task, shutdown_rx, manager)
+                .await
+                .unwrap();
         });
         for _ in 0..50 {
             if sock_path.exists() {
@@ -2338,7 +2374,11 @@ mod integration_tests {
 
         write_envelope(
             &mut writer,
-            &Envelope { seq: 4, correlation_id: 0, payload: Some(Payload::ListWorkspaces(ListWorkspaces {})) },
+            &Envelope {
+                seq: 4,
+                correlation_id: 0,
+                payload: Some(Payload::ListWorkspaces(ListWorkspaces {})),
+            },
         )
         .await
         .unwrap();
@@ -2352,7 +2392,10 @@ mod integration_tests {
             .find(|w| w.workspace_id == new_id)
             .expect("new workspace present in roster");
         assert_eq!(created.title, "dev");
-        assert!(created.layout.is_some(), "a created workspace is seeded with its first pane");
+        assert!(
+            created.layout.is_some(),
+            "a created workspace is seeded with its first pane"
+        );
 
         shutdown_tx.send(true).unwrap();
         let _ = tokio::time::timeout(std::time::Duration::from_secs(3), server_task).await;
@@ -2374,7 +2417,9 @@ mod integration_tests {
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let sock_path_task = sock_path.clone();
         let server_task = tokio::spawn(async move {
-            serve_with_manager(sock_path_task, shutdown_rx, manager).await.unwrap();
+            serve_with_manager(sock_path_task, shutdown_rx, manager)
+                .await
+                .unwrap();
         });
         for _ in 0..50 {
             if sock_path.exists() {
@@ -2398,9 +2443,10 @@ mod integration_tests {
         .await
         .unwrap();
         let ws2 = match read_envelope(&mut reader).await.unwrap().payload {
-            Some(Payload::CreateWorkspaceResponse(CreateWorkspaceResponse { workspace_id, .. })) => {
-                workspace_id
-            }
+            Some(Payload::CreateWorkspaceResponse(CreateWorkspaceResponse {
+                workspace_id,
+                ..
+            })) => workspace_id,
             other => panic!("expected CreateWorkspaceResponse, got {other:?}"),
         };
 
@@ -2418,9 +2464,13 @@ mod integration_tests {
         )
         .await
         .unwrap();
-        let (push_ws, layout) =
-            next_scoped_layout_push(&mut reader, PUSH_WINDOW).await.expect("seed pane push");
-        assert_eq!(push_ws, ws2, "seed-pane push must be stamped with ws2's id, not the default");
+        let (push_ws, layout) = next_scoped_layout_push(&mut reader, PUSH_WINDOW)
+            .await
+            .expect("seed pane push");
+        assert_eq!(
+            push_ws, ws2,
+            "seed-pane push must be stamped with ws2's id, not the default"
+        );
         let seeded_pane = leftmost_pane(&layout);
 
         // Now split that pane; the resulting push must ALSO carry ws2's id.
@@ -2436,9 +2486,13 @@ mod integration_tests {
         )
         .await
         .unwrap();
-        let (push_ws2, layout2) =
-            next_scoped_layout_push(&mut reader, PUSH_WINDOW).await.expect("split push");
-        assert_eq!(push_ws2, ws2, "split push must also be stamped with ws2's id");
+        let (push_ws2, layout2) = next_scoped_layout_push(&mut reader, PUSH_WINDOW)
+            .await
+            .expect("split push");
+        assert_eq!(
+            push_ws2, ws2,
+            "split push must also be stamped with ws2's id"
+        );
         assert_eq!(count_panes(&layout2), 2);
 
         shutdown_tx.send(true).unwrap();
@@ -2461,7 +2515,9 @@ mod integration_tests {
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let sock_path_task = sock_path.clone();
         let server_task = tokio::spawn(async move {
-            serve_with_manager(sock_path_task, shutdown_rx, manager).await.unwrap();
+            serve_with_manager(sock_path_task, shutdown_rx, manager)
+                .await
+                .unwrap();
         });
         for _ in 0..50 {
             if sock_path.exists() {
@@ -2485,9 +2541,10 @@ mod integration_tests {
         .await
         .unwrap();
         let ws2 = match read_envelope(&mut reader).await.unwrap().payload {
-            Some(Payload::CreateWorkspaceResponse(CreateWorkspaceResponse { workspace_id, .. })) => {
-                workspace_id
-            }
+            Some(Payload::CreateWorkspaceResponse(CreateWorkspaceResponse {
+                workspace_id,
+                ..
+            })) => workspace_id,
             other => panic!("expected CreateWorkspaceResponse, got {other:?}"),
         };
 
@@ -2503,12 +2560,16 @@ mod integration_tests {
         )
         .await
         .unwrap();
-        let (_, layout) =
-            next_scoped_layout_push(&mut reader, PUSH_WINDOW).await.expect("seed pane push");
+        let (_, layout) = next_scoped_layout_push(&mut reader, PUSH_WINDOW)
+            .await
+            .expect("seed pane push");
         let seeded_pane = leftmost_pane(&layout);
 
         assert!(
-            manager_check.list().iter().any(|s| s.surface_id == seeded_pane),
+            manager_check
+                .list()
+                .iter()
+                .any(|s| s.surface_id == seeded_pane),
             "seeded pane must be a real, registered PTY before delete"
         );
 
@@ -2531,13 +2592,20 @@ mod integration_tests {
         assert_eq!(removed, ws2);
 
         assert!(
-            !manager_check.list().iter().any(|s| s.surface_id == seeded_pane),
+            !manager_check
+                .list()
+                .iter()
+                .any(|s| s.surface_id == seeded_pane),
             "deleted workspace's pane must be torn down from the PTY manager"
         );
 
         write_envelope(
             &mut writer,
-            &Envelope { seq: 6, correlation_id: 0, payload: Some(Payload::ListWorkspaces(ListWorkspaces {})) },
+            &Envelope {
+                seq: 6,
+                correlation_id: 0,
+                payload: Some(Payload::ListWorkspaces(ListWorkspaces {})),
+            },
         )
         .await
         .unwrap();
@@ -2569,7 +2637,9 @@ mod integration_tests {
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let sock_path_task = sock_path.clone();
         let server_task = tokio::spawn(async move {
-            serve_with_manager(sock_path_task, shutdown_rx, manager).await.unwrap();
+            serve_with_manager(sock_path_task, shutdown_rx, manager)
+                .await
+                .unwrap();
         });
         for _ in 0..50 {
             if sock_path.exists() {
@@ -2581,7 +2651,11 @@ mod integration_tests {
         let (mut reader, mut writer) = handshake(&sock_path).await;
         write_envelope(
             &mut writer,
-            &Envelope { seq: 3, correlation_id: 0, payload: Some(Payload::ListWorkspaces(ListWorkspaces {})) },
+            &Envelope {
+                seq: 3,
+                correlation_id: 0,
+                payload: Some(Payload::ListWorkspaces(ListWorkspaces {})),
+            },
         )
         .await
         .unwrap();
@@ -2603,12 +2677,20 @@ mod integration_tests {
         .await
         .unwrap();
 
-        let removed = next_workspace_removed(&mut reader, std::time::Duration::from_millis(500)).await;
-        assert!(removed.is_none(), "last workspace deletion must be refused, got {removed:?}");
+        let removed =
+            next_workspace_removed(&mut reader, std::time::Duration::from_millis(500)).await;
+        assert!(
+            removed.is_none(),
+            "last workspace deletion must be refused, got {removed:?}"
+        );
 
         write_envelope(
             &mut writer,
-            &Envelope { seq: 5, correlation_id: 0, payload: Some(Payload::Ping(Ping { nonce: 99 })) },
+            &Envelope {
+                seq: 5,
+                correlation_id: 0,
+                payload: Some(Payload::Ping(Ping { nonce: 99 })),
+            },
         )
         .await
         .unwrap();
@@ -2635,7 +2717,9 @@ mod integration_tests {
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let sock_path_task = sock_path.clone();
         let server_task = tokio::spawn(async move {
-            serve_with_manager(sock_path_task, shutdown_rx, manager).await.unwrap();
+            serve_with_manager(sock_path_task, shutdown_rx, manager)
+                .await
+                .unwrap();
         });
         for _ in 0..50 {
             if sock_path.exists() {
@@ -2673,12 +2757,20 @@ mod integration_tests {
         .await
         .unwrap();
 
-        let removed = next_workspace_removed(&mut reader, std::time::Duration::from_millis(500)).await;
-        assert!(removed.is_none(), "unknown workspace_id delete must be a silent no-op");
+        let removed =
+            next_workspace_removed(&mut reader, std::time::Duration::from_millis(500)).await;
+        assert!(
+            removed.is_none(),
+            "unknown workspace_id delete must be a silent no-op"
+        );
 
         write_envelope(
             &mut writer,
-            &Envelope { seq: 5, correlation_id: 0, payload: Some(Payload::ListWorkspaces(ListWorkspaces {})) },
+            &Envelope {
+                seq: 5,
+                correlation_id: 0,
+                payload: Some(Payload::ListWorkspaces(ListWorkspaces {})),
+            },
         )
         .await
         .unwrap();
@@ -2686,8 +2778,15 @@ mod integration_tests {
             Some(Payload::WorkspaceList(wl)) => wl.workspaces,
             other => panic!("expected WorkspaceList, got {other:?}"),
         };
-        assert_eq!(workspaces.len(), 1, "roster untouched by no-op rename/delete");
-        assert_eq!(workspaces[0].title, DAEMON_WORKSPACE, "default title must not have been hijacked");
+        assert_eq!(
+            workspaces.len(),
+            1,
+            "roster untouched by no-op rename/delete"
+        );
+        assert_eq!(
+            workspaces[0].title, DAEMON_WORKSPACE,
+            "default title must not have been hijacked"
+        );
 
         shutdown_tx.send(true).unwrap();
         let _ = tokio::time::timeout(std::time::Duration::from_secs(3), server_task).await;

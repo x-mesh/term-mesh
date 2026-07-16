@@ -15,6 +15,8 @@ mod pane_tracker;
 mod peer;
 mod socket;
 mod supervisor;
+#[allow(dead_code)]
+mod sync;
 mod tokens;
 // watcher Phase 2 (P1): autonomous drift-watch scheduler. The file is
 // `watch.rs` but the module is named `drift_watch` so it does not collide with
@@ -85,8 +87,8 @@ async fn main() -> anyhow::Result<()> {
     // up by the periodic watcher on its next 30s tick.
     {
         const STARTUP_ASSIGNED_THRESHOLD_MS: u64 = 360_000;
-        let blocked = agent_manager
-            .sweep_assigned_timeouts(STARTUP_ASSIGNED_THRESHOLD_MS, "startup_sweep");
+        let blocked =
+            agent_manager.sweep_assigned_timeouts(STARTUP_ASSIGNED_THRESHOLD_MS, "startup_sweep");
         if !blocked.is_empty() {
             tracing::info!(
                 "startup sweep: force-blocked {} assigned-state zombie task(s): {:?}",
@@ -133,9 +135,7 @@ async fn main() -> anyhow::Result<()> {
         }
         let zombies = headless::meta::sweep_zombie_pane_archives();
         if zombies > 0 {
-            tracing::info!(
-                "headless gc: removed {zombies} zombie pane archive(s) on startup"
-            );
+            tracing::info!("headless gc: removed {zombies} zombie pane archive(s) on startup");
         }
     });
 
@@ -192,7 +192,9 @@ async fn main() -> anyhow::Result<()> {
     // R4: keep runner + sink alive in outer scope so socket::serve can use them
     // for watch.trigger_now without going through the scheduler's interval loop.
     let watch_runner_for_serve: Option<std::sync::Arc<dyn headless::one_shot::WatchCheckRunner>>;
-    let watch_sink_for_serve: Option<tokio::sync::mpsc::UnboundedSender<headless::one_shot::WatchCheckOutcome>>;
+    let watch_sink_for_serve: Option<
+        tokio::sync::mpsc::UnboundedSender<headless::one_shot::WatchCheckOutcome>,
+    >;
     {
         // P10: populate the registry from persisted /watch config (P6's loader),
         // so `/watch on` survives a daemon restart (R13). The daemon cwd is the

@@ -179,8 +179,10 @@ async fn reader_loop(
                 // From Ready on, this connection receives layout pushes
                 // triggered by any connection's WorkspaceControl. The guard
                 // unregisters on connection teardown (any exit path).
-                _broadcast_guard =
-                    Some(host.clients.register(outgoing_tx.clone(), seq_counter.clone()));
+                _broadcast_guard = Some(
+                    host.clients
+                        .register(outgoing_tx.clone(), seq_counter.clone()),
+                );
                 tracing::info!("peer authenticated (ssh-passthrough)");
             }
 

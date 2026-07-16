@@ -251,7 +251,9 @@ impl UsageTracker {
                 .filter_map(|p| p.file_stem().and_then(|s| s.to_str()).map(str::to_owned))
                 .collect();
             state.sessions.retain(|sid, _| alive.contains(sid));
-            state.session_started_at.retain(|sid, _| alive.contains(sid));
+            state
+                .session_started_at
+                .retain(|sid, _| alive.contains(sid));
             state
                 .latest_session_per_cwd
                 .retain(|_, sid| alive.contains(sid));

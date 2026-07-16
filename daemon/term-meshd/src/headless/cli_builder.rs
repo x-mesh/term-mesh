@@ -475,7 +475,10 @@ mod tests {
     fn compose_agent_path_skips_empty_segments() {
         let out = compose_agent_path("", "::/usr/bin:");
         let parts: Vec<&str> = out.split(':').collect();
-        assert!(!parts.iter().any(|p| p.is_empty()), "no empty PATH segments");
+        assert!(
+            !parts.iter().any(|p| p.is_empty()),
+            "no empty PATH segments"
+        );
         assert!(parts.contains(&"/usr/bin"));
     }
 

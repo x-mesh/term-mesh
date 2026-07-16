@@ -743,7 +743,10 @@ mod tests {
             }
         })
         .await;
-        assert!(result.is_ok(), "cat did not echo — hangup() signalled it despite dead=true");
+        assert!(
+            result.is_ok(),
+            "cat did not echo — hangup() signalled it despite dead=true"
+        );
     }
 
     /// F6 regression: asserting a hardcoded "/bin/bash" result meant this
@@ -756,7 +759,11 @@ mod tests {
     fn login_shell_falls_back_past_blockers() {
         let assert_falls_back = |candidate: Option<&str>| {
             let result = resolve_login_shell(candidate);
-            assert_ne!(Some(result.as_str()), candidate, "must not echo back a blocked candidate");
+            assert_ne!(
+                Some(result.as_str()),
+                candidate,
+                "must not echo back a blocked candidate"
+            );
             assert!(
                 matches!(result.as_str(), "/bin/bash" | "/bin/sh"),
                 "fallback must be /bin/bash or /bin/sh, got {result:?}"

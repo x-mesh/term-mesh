@@ -202,9 +202,16 @@ fn parse_mode_events(pending: &[u8], events: &mut Vec<ModeEvent>) {
         // Non-numeric or out-of-u16-range parameters are ignored rather
         // than treated as errors — a malformed/unknown param shouldn't
         // stop the rest of the (independent) params from being parsed.
-        if let Ok(mode) = std::str::from_utf8(param).unwrap_or_default().parse::<u16>() {
+        if let Ok(mode) = std::str::from_utf8(param)
+            .unwrap_or_default()
+            .parse::<u16>()
+        {
             if is_tracked_mode(mode) {
-                events.push(if is_set { ModeEvent::Set(mode) } else { ModeEvent::Reset(mode) });
+                events.push(if is_set {
+                    ModeEvent::Set(mode)
+                } else {
+                    ModeEvent::Reset(mode)
+                });
             }
         }
     }
