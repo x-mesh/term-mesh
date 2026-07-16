@@ -489,7 +489,10 @@ async fn fetch_live_team_state(state: &Arc<HttpState>) -> Option<serde_json::Val
         };
         obj.insert("socket_path".to_string(), serde_json::json!(socket_label));
         if let Some(primary) = primary_socket {
-            obj.insert("primary_socket_path".to_string(), serde_json::json!(primary));
+            obj.insert(
+                "primary_socket_path".to_string(),
+                serde_json::json!(primary),
+            );
         }
         obj.insert(
             "active_socket_paths".to_string(),
@@ -517,8 +520,7 @@ async fn fetch_team_payload_from_socket(
     String,
 > {
     let mut teams = rpc_team_socket(socket_path, "team.list", serde_json::json!({}))
-        .await
-        ?
+        .await?
         .as_array()
         .cloned()
         .ok_or_else(|| "team.list did not return an array".to_string())?;
@@ -526,7 +528,10 @@ async fn fetch_team_payload_from_socket(
     let mut tasks = Vec::new();
     let mut attention = Vec::new();
     for team in &mut teams {
-        let Some(team_name) = team.get("team_name").and_then(|v| v.as_str()).map(str::to_string)
+        let Some(team_name) = team
+            .get("team_name")
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
         else {
             continue;
         };
@@ -641,9 +646,9 @@ async fn team_socket_path_for_team(
         if teams
             .as_array()
             .map(|teams| {
-                teams.iter().any(|team| {
-                    team.get("team_name").and_then(|v| v.as_str()) == Some(team_name)
-                })
+                teams
+                    .iter()
+                    .any(|team| team.get("team_name").and_then(|v| v.as_str()) == Some(team_name))
             })
             .unwrap_or(false)
         {

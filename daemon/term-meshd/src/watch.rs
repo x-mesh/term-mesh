@@ -238,7 +238,9 @@ pub(crate) fn resolve_spec(spec: &str, working_dir: &str) -> Result<String, Stri
         }
         // Reject names that could escape the specs directory.
         if name.contains('/') || name.contains('\\') || name.contains("..") {
-            return Err(format!("invalid preset name (no path separators allowed): {name}"));
+            return Err(format!(
+                "invalid preset name (no path separators allowed): {name}"
+            ));
         }
         let preset_path = format!(".xm/watch/specs/{name}.md");
         return resolve_spec(&format!("@{preset_path}"), working_dir);
@@ -262,13 +264,16 @@ pub(crate) fn resolve_spec(spec: &str, working_dir: &str) -> Result<String, Stri
     }
 
     // Reject paths containing ".." components (parent dir traversal).
-    if candidate.components().any(|c| c == std::path::Component::ParentDir) {
+    if candidate
+        .components()
+        .any(|c| c == std::path::Component::ParentDir)
+    {
         return Err(format!("parent dir (..) not allowed in spec path: {path}"));
     }
 
     // Canonicalize working_dir to resolve symlinks.
-    let working_canonical = std::fs::canonicalize(working_dir)
-        .map_err(|e| format!("working_dir canonicalize: {e}"))?;
+    let working_canonical =
+        std::fs::canonicalize(working_dir).map_err(|e| format!("working_dir canonicalize: {e}"))?;
 
     // Join and canonicalize the full path.
     let full_path = working_canonical.join(path);
@@ -419,7 +424,10 @@ async fn sweep_once(
     // One tokio::spawn per team runs workers sequentially within that team.
     let mut by_team: HashMap<String, Vec<WatchCheckInput>> = HashMap::new();
     for input in to_fire {
-        by_team.entry(input.team_name.clone()).or_default().push(input);
+        by_team
+            .entry(input.team_name.clone())
+            .or_default()
+            .push(input);
     }
     for (team_id, inputs) in by_team {
         let runner = Arc::clone(runner);
@@ -582,8 +590,15 @@ mod tests {
 
     #[test]
     fn record_tick_outcome_success_advances_success_and_clears_streak() {
-        let mut st =
-            WatchState::enabled(1, Some("executor".into()), "claude", "sonnet", "critic", "spec", "/tmp");
+        let mut st = WatchState::enabled(
+            1,
+            Some("executor".into()),
+            "claude",
+            "sonnet",
+            "critic",
+            "spec",
+            "/tmp",
+        );
         st.consecutive_failures = 3;
         st.last_error = Some("prev failure".into());
         assert_eq!(st.last_success_ts, 0);
@@ -591,23 +606,39 @@ mod tests {
         record_tick_outcome(&mut st, None);
 
         assert!(st.last_success_ts > 0, "success must stamp last_success_ts");
-        assert_eq!(st.consecutive_failures, 0, "success clears the failure streak");
+        assert_eq!(
+            st.consecutive_failures, 0,
+            "success clears the failure streak"
+        );
         assert!(st.last_error.is_none(), "success clears last_error");
     }
 
     #[test]
     fn record_tick_outcome_failure_records_error_and_increments_streak() {
-        let mut st =
-            WatchState::enabled(1, Some("executor".into()), "claude", "sonnet", "critic", "spec", "/tmp");
+        let mut st = WatchState::enabled(
+            1,
+            Some("executor".into()),
+            "claude",
+            "sonnet",
+            "critic",
+            "spec",
+            "/tmp",
+        );
         // A 100%-failing watch: last_success_ts must stay at 0 (never healthy) and
         // the failure streak must grow so status can report it.
         record_tick_outcome(&mut st, Some("spawn failed: codex".into()));
-        assert_eq!(st.last_success_ts, 0, "a failed tick must not look successful");
+        assert_eq!(
+            st.last_success_ts, 0,
+            "a failed tick must not look successful"
+        );
         assert_eq!(st.consecutive_failures, 1);
         assert_eq!(st.last_error.as_deref(), Some("spawn failed: codex"));
 
         record_tick_outcome(&mut st, Some("spawn failed: codex".into()));
-        assert_eq!(st.consecutive_failures, 2, "consecutive failures accumulate");
+        assert_eq!(
+            st.consecutive_failures, 2,
+            "consecutive failures accumulate"
+        );
         assert_eq!(st.last_success_ts, 0);
     }
 
@@ -670,7 +701,15 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn watch_interval_ticks_without_sleeping() {
         let granularity = Duration::from_secs(1);
-        let st = WatchState::enabled(1, Some("executor".into()), "claude", "sonnet", "critic", "spec", "/tmp");
+        let st = WatchState::enabled(
+            1,
+            Some("executor".into()),
+            "claude",
+            "sonnet",
+            "critic",
+            "spec",
+            "/tmp",
+        );
         let registry = registry_with("t1", st);
         let (runner, calls) = fake(false);
         let (tx, mut rx) = mpsc::unbounded_channel();
@@ -697,7 +736,15 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn watch_scheduler_skips_immediate_tick() {
         let interval = Duration::from_secs(5);
-        let st = WatchState::enabled(5, Some("executor".into()), "claude", "sonnet", "critic", "spec", "/tmp");
+        let st = WatchState::enabled(
+            5,
+            Some("executor".into()),
+            "claude",
+            "sonnet",
+            "critic",
+            "spec",
+            "/tmp",
+        );
         let registry = registry_with("t1", st);
         let (runner, _calls) = fake(false);
         let (tx, mut rx) = mpsc::unbounded_channel();
@@ -729,7 +776,15 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn watch_off_stops_ticks() {
         let granularity = Duration::from_secs(1);
-        let mut st = WatchState::enabled(1, Some("executor".into()), "claude", "sonnet", "critic", "spec", "/tmp");
+        let mut st = WatchState::enabled(
+            1,
+            Some("executor".into()),
+            "claude",
+            "sonnet",
+            "critic",
+            "spec",
+            "/tmp",
+        );
         st.enabled = false; // disabled from the start
         let registry = registry_with("t1", st);
         let (runner, calls) = fake(false);
@@ -748,7 +803,10 @@ mod tests {
             advance(granularity).await;
             settle().await;
         }
-        assert!(rx.try_recv().is_err(), "disabled team must not produce checks");
+        assert!(
+            rx.try_recv().is_err(),
+            "disabled team must not produce checks"
+        );
         assert_eq!(calls.load(Ordering::SeqCst), 0);
     }
 
@@ -775,7 +833,15 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn watch_in_flight_overrun_skip() {
         let granularity = Duration::from_secs(1);
-        let st = WatchState::enabled(1, Some("executor".into()), "claude", "sonnet", "critic", "spec", "/tmp");
+        let st = WatchState::enabled(
+            1,
+            Some("executor".into()),
+            "claude",
+            "sonnet",
+            "critic",
+            "spec",
+            "/tmp",
+        );
         let registry = registry_with("t1", st);
         // pending runner: the first check never completes, so in_flight stays set.
         let (runner, calls) = fake(true);

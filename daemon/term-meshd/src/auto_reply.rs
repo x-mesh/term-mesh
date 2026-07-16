@@ -72,11 +72,15 @@ pub struct AutoReplyDetector {
 }
 
 impl Default for AutoReplyDetector {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl AutoReplyDetector {
-    pub fn new() -> Self { Self::with_config(DetectorConfig::default()) }
+    pub fn new() -> Self {
+        Self::with_config(DetectorConfig::default())
+    }
 
     pub fn with_config(config: DetectorConfig) -> Self {
         Self {
@@ -121,7 +125,9 @@ impl AutoReplyDetector {
 
     /// Periodic check. Returns event when debounce or hard_cap fires.
     pub fn tick(&mut self, now: Instant) -> Option<AutoReplyEvent> {
-        if self.committed { return None; }
+        if self.committed {
+            return None;
+        }
 
         let Some(anchor) = self.status_block_start() else {
             self.status_seen_at = None;
@@ -131,14 +137,18 @@ impl AutoReplyDetector {
             self.status_seen_at = None;
             return None;
         };
-        let Some(status_at) = self.status_seen_at else { return None; };
+        let Some(status_at) = self.status_seen_at else {
+            return None;
+        };
 
         let files = self.scan_field_from("FILES", anchor);
         let verify = self.scan_field_from("VERIFY", anchor);
         let next = self.scan_field_from("NEXT", anchor);
         let full_report = self.scan_field_from("FULL_REPORT", anchor);
         let others = [&files, &verify, &next, &full_report]
-            .iter().filter(|v| v.is_some()).count();
+            .iter()
+            .filter(|v| v.is_some())
+            .count();
 
         let last = self.last_input_at.unwrap_or(now);
         let idle = now.duration_since(last);
@@ -161,7 +171,9 @@ impl AutoReplyDetector {
 
     /// Force emit on agent exit. Requires STATUS + ≥1 other field.
     pub fn flush(&mut self) -> Option<AutoReplyEvent> {
-        if self.committed { return None; }
+        if self.committed {
+            return None;
+        }
         let anchor = self.status_block_start()?;
         let status = self.scan_field_from("STATUS", anchor)?;
         let files = self.scan_field_from("FILES", anchor);
@@ -169,8 +181,12 @@ impl AutoReplyDetector {
         let next = self.scan_field_from("NEXT", anchor);
         let full_report = self.scan_field_from("FULL_REPORT", anchor);
         let others = [&files, &verify, &next, &full_report]
-            .iter().filter(|v| v.is_some()).count();
-        if others == 0 { return None; }
+            .iter()
+            .filter(|v| v.is_some())
+            .count();
+        if others == 0 {
+            return None;
+        }
         self.emit(
             status,
             files.unwrap_or_else(|| "n/a".to_string()),
@@ -180,43 +196,71 @@ impl AutoReplyDetector {
         )
     }
 
-    fn emit(&mut self, status: String, files: String, verify: String, next: String, full_report: String) -> Option<AutoReplyEvent> {
+    fn emit(
+        &mut self,
+        status: String,
+        files: String,
+        verify: String,
+        next: String,
+        full_report: String,
+    ) -> Option<AutoReplyEvent> {
         let header_prefixes = ["STATUS:", "FILES:", "VERIFY:", "NEXT:", "FULL_REPORT:"];
 
         // Body starts after the LAST header line in the buffer so noise lines
         // interspersed between headers are not mistaken for body content.
-        let last_header_pos = self.line_buffer
+        let last_header_pos = self
+            .line_buffer
             .iter()
             .rposition(|l| header_prefixes.iter().any(|p| l.starts_with(p)))
             .unwrap_or(0);
 
-        let status_pos = self.line_buffer
+        let status_pos = self
+            .line_buffer
             .iter()
             .rposition(|l| l.starts_with("STATUS:"))
             .unwrap_or(0);
 
-        let body_lines: Vec<&str> = self.line_buffer.iter()
+        let body_lines: Vec<&str> = self
+            .line_buffer
+            .iter()
             .skip(last_header_pos + 1)
             .map(|s| s.as_str())
             .collect();
 
         let body_start = body_lines.iter().position(|l| !l.is_empty()).unwrap_or(0);
-        let body_end = body_lines.iter().rposition(|l| !l.is_empty()).map(|i| i + 1).unwrap_or(0);
+        let body_end = body_lines
+            .iter()
+            .rposition(|l| !l.is_empty())
+            .map(|i| i + 1)
+            .unwrap_or(0);
         let body = if body_start < body_end {
             body_lines[body_start..body_end].join("\n")
         } else {
             String::new()
         };
 
-        let raw = self.line_buffer.iter().skip(status_pos)
-            .cloned().collect::<Vec<_>>().join("\n");
+        let raw = self
+            .line_buffer
+            .iter()
+            .skip(status_pos)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join("\n");
 
         self.committed = true;
         self.line_buffer.clear();
         self.status_seen_at = None;
         self.last_input_at = None;
 
-        Some(AutoReplyEvent { status, files, verify, next, full_report, body, raw })
+        Some(AutoReplyEvent {
+            status,
+            files,
+            verify,
+            next,
+            full_report,
+            body,
+            raw,
+        })
     }
 
     /// Returns the buffer index from which field scans should start.
@@ -234,7 +278,11 @@ impl AutoReplyDetector {
             }
         }
         latest?;
-        if prev.is_some() { latest } else { Some(0) }
+        if prev.is_some() {
+            latest
+        } else {
+            Some(0)
+        }
     }
 
     fn scan_field(&self, name: &str) -> Option<String> {
@@ -245,10 +293,14 @@ impl AutoReplyDetector {
     fn scan_field_from(&self, name: &str, from_idx: usize) -> Option<String> {
         let prefix = format!("{name}:");
         for (idx, line) in self.line_buffer.iter().enumerate().rev() {
-            if idx < from_idx { break; }
+            if idx < from_idx {
+                break;
+            }
             if let Some(rest) = line.strip_prefix(&prefix) {
                 let val = rest.strip_prefix(' ').unwrap_or(rest);
-                if !val.is_empty() { return Some(val.to_string()); }
+                if !val.is_empty() {
+                    return Some(val.to_string());
+                }
             }
         }
         None
@@ -264,14 +316,21 @@ fn strip_ansi(s: &str) -> String {
                 Some('[') => {
                     iter.next();
                     while let Some(c) = iter.next() {
-                        if (0x40..=0x7eu32).contains(&(c as u32)) { break; }
+                        if (0x40..=0x7eu32).contains(&(c as u32)) {
+                            break;
+                        }
                     }
                 }
                 Some(']') => {
                     iter.next();
                     while let Some(c) = iter.next() {
-                        if c == '\u{0007}' { break; }
-                        if c == '\u{001b}' && iter.peek() == Some(&'\\') { iter.next(); break; }
+                        if c == '\u{0007}' {
+                            break;
+                        }
+                        if c == '\u{001b}' && iter.peek() == Some(&'\\') {
+                            iter.next();
+                            break;
+                        }
                     }
                 }
                 _ => {}
@@ -287,7 +346,9 @@ fn strip_ansi(s: &str) -> String {
 mod tests {
     use super::*;
 
-    fn t0() -> Instant { Instant::now() }
+    fn t0() -> Instant {
+        Instant::now()
+    }
 
     fn drain(d: &mut AutoReplyDetector, t: Instant) -> Option<AutoReplyEvent> {
         d.tick(t + Duration::from_secs(10))
@@ -310,7 +371,8 @@ mod tests {
 
     #[test]
     fn out_of_order_still_commits() {
-        let input = "NEXT: NONE\nFILES: src/foo.rs\nFULL_REPORT: n/a\nVERIFY: cargo test\nSTATUS: DONE\n";
+        let input =
+            "NEXT: NONE\nFILES: src/foo.rs\nFULL_REPORT: n/a\nVERIFY: cargo test\nSTATUS: DONE\n";
         let mut d = AutoReplyDetector::new();
         let t = t0();
         d.push_bytes(input.as_bytes(), t);
@@ -361,7 +423,10 @@ mod tests {
         let t = t0();
         d.push_bytes(input.as_bytes(), t);
         // STATUS + 0 others — hard_cap fires but others < 2 → no commit
-        assert!(d.tick(t + Duration::from_secs(10)).is_none(), "STATUS-only must not partial commit");
+        assert!(
+            d.tick(t + Duration::from_secs(10)).is_none(),
+            "STATUS-only must not partial commit"
+        );
     }
 
     #[test]
@@ -419,11 +484,17 @@ mod tests {
     #[test]
     fn content_hash_stable() {
         let mut a = AutoReplyDetector::new();
-        a.push_bytes(b"STATUS: DONE\nFILES: x\nVERIFY: y\nNEXT: z\nFULL_REPORT: n/a\nbody\n", t0());
+        a.push_bytes(
+            b"STATUS: DONE\nFILES: x\nVERIFY: y\nNEXT: z\nFULL_REPORT: n/a\nbody\n",
+            t0(),
+        );
         let ev_a = a.flush().unwrap();
 
         let mut b = AutoReplyDetector::new();
-        b.push_bytes(b"STATUS: DONE   \nFILES: x\nVERIFY: y\nNEXT: z\nFULL_REPORT: n/a\nbody\n", t0());
+        b.push_bytes(
+            b"STATUS: DONE   \nFILES: x\nVERIFY: y\nNEXT: z\nFULL_REPORT: n/a\nbody\n",
+            t0(),
+        );
         let ev_b = b.flush().unwrap();
         assert_eq!(ev_a.status, ev_b.status);
         assert_eq!(ev_a.content_hash(), ev_b.content_hash());
@@ -431,7 +502,8 @@ mod tests {
 
     #[test]
     fn typewriter_chunks() {
-        let input = "STATUS: DONE\nFILES: none\nVERIFY: n/a\nNEXT: NONE\nFULL_REPORT: n/a\n\nbody line\n";
+        let input =
+            "STATUS: DONE\nFILES: none\nVERIFY: n/a\nNEXT: NONE\nFULL_REPORT: n/a\n\nbody line\n";
         let mut d = AutoReplyDetector::new();
         let t = t0();
         for byte in input.as_bytes() {

@@ -114,7 +114,10 @@ impl LayoutStore {
     /// (orientation alternates by depth, so 4 surfaces make a 2x2). This
     /// is the old stateless `tile_surfaces` demoted to a constructor.
     pub fn balanced_from_surfaces(surfaces: &[Arc<PtySurface>]) -> Self {
-        let mut store = Self { root: None, next_split_id: 1 };
+        let mut store = Self {
+            root: None,
+            next_split_id: 1,
+        };
         let ids: Vec<SurfaceId> = surfaces.iter().map(|s| s.surface_id.clone()).collect();
         store.root = store.build_balanced(&ids, 0);
         store
@@ -123,7 +126,10 @@ impl LayoutStore {
     fn build_balanced(&mut self, ids: &[SurfaceId], depth: usize) -> Option<LayoutNode> {
         match ids.len() {
             0 => None,
-            1 => Some(LayoutNode::Pane { active: ids[0].clone(), tabs: vec![ids[0].clone()] }),
+            1 => Some(LayoutNode::Pane {
+                active: ids[0].clone(),
+                tabs: vec![ids[0].clone()],
+            }),
             n => {
                 let mid = n / 2;
                 let first = self.build_balanced(&ids[..mid], depth + 1)?;
@@ -159,7 +165,9 @@ impl LayoutStore {
         new_surface: SurfaceId,
     ) -> Result<bool, LayoutError> {
         let id = self.take_split_id();
-        let Some(root) = self.root.as_mut() else { return Err(LayoutError::NotFound) };
+        let Some(root) = self.root.as_mut() else {
+            return Err(LayoutError::NotFound);
+        };
         if !Self::split_in(root, pane_id, orientation, &new_surface, id) {
             // The reserved id is simply skipped; gaps are harmless.
             return Err(LayoutError::NotFound);
@@ -181,7 +189,10 @@ impl LayoutStore {
                 }
                 let old = std::mem::replace(
                     node,
-                    LayoutNode::Pane { active: new_surface.clone(), tabs: vec![new_surface.clone()] },
+                    LayoutNode::Pane {
+                        active: new_surface.clone(),
+                        tabs: vec![new_surface.clone()],
+                    },
                 );
                 let new_pane = std::mem::replace(
                     node,
@@ -222,7 +233,9 @@ impl LayoutStore {
     /// is the only real "last pane" case, and `close_in` leaves the node
     /// unmutated on that path, so putting `root` back is always safe.
     pub fn close_pane(&mut self, pane_id: &[u8]) -> Result<Vec<SurfaceId>, LayoutError> {
-        let Some(mut root) = self.root.take() else { return Err(LayoutError::NotFound) };
+        let Some(mut root) = self.root.take() else {
+            return Err(LayoutError::NotFound);
+        };
         match Self::close_in(&mut root, pane_id) {
             CloseOutcome::NotHere => {
                 self.root = Some(root);
@@ -269,7 +282,10 @@ impl LayoutStore {
                     },
                 };
                 // Promote the surviving sibling over this split node.
-                let placeholder = LayoutNode::Pane { active: Vec::new(), tabs: Vec::new() };
+                let placeholder = LayoutNode::Pane {
+                    active: Vec::new(),
+                    tabs: Vec::new(),
+                };
                 let sibling = if promote_second {
                     std::mem::replace(second.as_mut(), placeholder)
                 } else {
@@ -288,7 +304,9 @@ impl LayoutStore {
             return Err(LayoutError::NotFound);
         }
         let clamped = ratio.clamp(0.05, 0.95);
-        let Some(root) = self.root.as_mut() else { return Err(LayoutError::NotFound) };
+        let Some(root) = self.root.as_mut() else {
+            return Err(LayoutError::NotFound);
+        };
         match Self::set_divider_in(root, split_id, clamped) {
             None => Err(LayoutError::NotFound),
             Some(changed) => Ok(changed),
@@ -298,7 +316,13 @@ impl LayoutStore {
     fn set_divider_in(node: &mut LayoutNode, split_id: &[u8], ratio: f64) -> Option<bool> {
         match node {
             LayoutNode::Pane { .. } => None,
-            LayoutNode::Split { id, divider, first, second, .. } => {
+            LayoutNode::Split {
+                id,
+                divider,
+                first,
+                second,
+                ..
+            } => {
                 if split_id_bytes(*id) == split_id {
                     let changed = (*divider - ratio).abs() > f64::EPSILON;
                     *divider = ratio;
@@ -314,7 +338,9 @@ impl LayoutStore {
     /// Add `new_surface` as a tab of the pane containing `pane_id` and
     /// make it active (the Swift host's `newTerminalSurface(focus: true)`).
     pub fn add_tab(&mut self, pane_id: &[u8], new_surface: SurfaceId) -> Result<bool, LayoutError> {
-        let Some(root) = self.root.as_mut() else { return Err(LayoutError::NotFound) };
+        let Some(root) = self.root.as_mut() else {
+            return Err(LayoutError::NotFound);
+        };
         if Self::add_tab_in(root, pane_id, &new_surface) {
             Ok(true)
         } else {
@@ -343,7 +369,9 @@ impl LayoutStore {
     /// `pane_id`. F5: a surface that is not one of the pane's tabs is
     /// adversarial input and is dropped.
     pub fn activate_tab(&mut self, pane_id: &[u8], surface_id: &[u8]) -> Result<bool, LayoutError> {
-        let Some(root) = self.root.as_mut() else { return Err(LayoutError::NotFound) };
+        let Some(root) = self.root.as_mut() else {
+            return Err(LayoutError::NotFound);
+        };
         match Self::activate_in(root, pane_id, surface_id) {
             None => Err(LayoutError::NotFound),
             Some(changed) => Ok(changed),
@@ -394,7 +422,10 @@ impl LayoutStore {
             .into_iter()
             .map(|s| {
                 let info = s.info();
-                (info.surface_id.clone(), (info.title, info.cols, info.rows, info.cwd))
+                (
+                    info.surface_id.clone(),
+                    (info.title, info.cols, info.rows, info.cwd),
+                )
             })
             .collect();
         self.root.as_ref().map(|n| Self::node_to_proto(n, &meta))
@@ -427,7 +458,13 @@ impl LayoutStore {
                     })),
                 }
             }
-            LayoutNode::Split { id, orientation, divider, first, second } => WorkspaceLayout {
+            LayoutNode::Split {
+                id,
+                orientation,
+                divider,
+                first,
+                second,
+            } => WorkspaceLayout {
                 node: Some(workspace_layout::Node::Split(Box::new(WorkspaceSplit {
                     orientation: orientation.as_str().to_string(),
                     divider_position: *divider,
@@ -472,7 +509,10 @@ impl LayoutStore {
         if self.root.is_some() {
             return false;
         }
-        self.root = Some(LayoutNode::Pane { active: surface_id.clone(), tabs: vec![surface_id] });
+        self.root = Some(LayoutNode::Pane {
+            active: surface_id.clone(),
+            tabs: vec![surface_id],
+        });
         true
     }
 
@@ -528,7 +568,10 @@ struct RegisteredClient {
 
 impl Broadcaster {
     pub fn new() -> Self {
-        Self { clients: Mutex::new(HashMap::new()), next_id: AtomicU64::new(1) }
+        Self {
+            clients: Mutex::new(HashMap::new()),
+            next_id: AtomicU64::new(1),
+        }
     }
 
     pub fn register(
@@ -537,8 +580,14 @@ impl Broadcaster {
         seq: Arc<AtomicU64>,
     ) -> BroadcastGuard {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-        self.clients.lock().unwrap().insert(id, RegisteredClient { tx, seq });
-        BroadcastGuard { broadcaster: Arc::clone(self), id }
+        self.clients
+            .lock()
+            .unwrap()
+            .insert(id, RegisteredClient { tx, seq });
+        BroadcastGuard {
+            broadcaster: Arc::clone(self),
+            id,
+        }
     }
 
     /// Fan a payload out to every registered connection, stamping each
@@ -704,7 +753,10 @@ impl PeerHost {
     /// promoted so the collection is never left without a home for
     /// un-namespaced control commands.
     pub fn with_workspaces(pty: Arc<PtyManager>, mut entries: Vec<PersistedWorkspace>) -> Self {
-        debug_assert!(!entries.is_empty(), "workspace collection must never be empty");
+        debug_assert!(
+            !entries.is_empty(),
+            "workspace collection must never be empty"
+        );
         if !entries.iter().any(|e| e.is_default) {
             if let Some(first) = entries.first_mut() {
                 first.is_default = true;
@@ -723,11 +775,19 @@ impl PeerHost {
                 }
                 LayoutStore::balanced_from_surfaces(&surfaces)
             } else {
-                LayoutStore { root: None, next_split_id: 1 }
+                LayoutStore {
+                    root: None,
+                    next_split_id: 1,
+                }
             };
             workspaces.insert(
                 entry.id.clone(),
-                WorkspaceEntry { id: entry.id, name: entry.name, is_default: entry.is_default, store },
+                WorkspaceEntry {
+                    id: entry.id,
+                    name: entry.name,
+                    is_default: entry.is_default,
+                    store,
+                },
             );
         }
         // Guaranteed by the promotion above: some entry is always default.
@@ -770,7 +830,11 @@ impl PeerHost {
             .lock()
             .unwrap()
             .values()
-            .map(|e| PersistedWorkspace { id: e.id.clone(), name: e.name.clone(), is_default: e.is_default })
+            .map(|e| PersistedWorkspace {
+                id: e.id.clone(),
+                name: e.name.clone(),
+                is_default: e.is_default,
+            })
             .collect();
         if let Err(e) = super::persist::save(&path, &entries) {
             tracing::warn!("peer-workspaces.json save failed ({}): {e}", path.display());
@@ -834,7 +898,9 @@ impl PeerHost {
             if workspaces.len() == 1 {
                 return Err(RemoveWorkspaceError::LastWorkspace);
             }
-            let entry = workspaces.remove(workspace_id).expect("checked present above");
+            let entry = workspaces
+                .remove(workspace_id)
+                .expect("checked present above");
             let removed_surfaces = entry.store.surface_ids();
             let promoted = if entry.is_default {
                 // Deterministic pick among survivors: lowest workspace id.
@@ -878,11 +944,12 @@ impl PeerHost {
                 removed_surfaces.len()
             ),
         }
-        self.clients.broadcast(&Payload::WorkspaceUpdate(WorkspaceUpdate {
-            kind: Some(workspace_update::Kind::WorkspaceRemoved(WorkspaceRemoved {
-                workspace_id: workspace_id.to_vec(),
-            })),
-        }));
+        self.clients
+            .broadcast(&Payload::WorkspaceUpdate(WorkspaceUpdate {
+                kind: Some(workspace_update::Kind::WorkspaceRemoved(WorkspaceRemoved {
+                    workspace_id: workspace_id.to_vec(),
+                })),
+            }));
         Ok(())
     }
 
@@ -927,7 +994,10 @@ impl PeerHost {
                     id: id.clone(),
                     name: title,
                     is_default: false,
-                    store: LayoutStore { root: None, next_split_id: 1 },
+                    store: LayoutStore {
+                        root: None,
+                        next_split_id: 1,
+                    },
                 },
             );
         }
@@ -1010,7 +1080,12 @@ impl PeerHost {
                 };
                 let layout = self.layout_snapshot_for(&id);
                 let is_default = id == default_id;
-                WorkspaceRosterEntry { id, title, layout, is_default }
+                WorkspaceRosterEntry {
+                    id,
+                    title,
+                    layout,
+                    is_default,
+                }
             })
             .collect();
         out.sort_by(|a, b| a.title.cmp(&b.title));
@@ -1019,16 +1094,26 @@ impl PeerHost {
 
     /// Workspace id currently hosting `surface_id`, if any.
     fn workspace_id_for_surface(&self, surface_id: &[u8]) -> Option<Vec<u8>> {
-        self.surface_workspace.lock().unwrap().get(surface_id).cloned()
+        self.surface_workspace
+            .lock()
+            .unwrap()
+            .get(surface_id)
+            .cloned()
     }
 
     /// Run `f` against the named workspace's store, if that workspace
     /// still exists. `None` means the workspace vanished between lookup
     /// and this call (never happens today — workspaces are never removed
     /// — but callers treat it the same as "target not found").
-    fn with_store<T>(&self, workspace_id: &[u8], f: impl FnOnce(&mut LayoutStore) -> T) -> Option<T> {
+    fn with_store<T>(
+        &self,
+        workspace_id: &[u8],
+        f: impl FnOnce(&mut LayoutStore) -> T,
+    ) -> Option<T> {
         let mut workspaces = self.workspaces.lock().unwrap();
-        workspaces.get_mut(workspace_id).map(|entry| f(&mut entry.store))
+        workspaces
+            .get_mut(workspace_id)
+            .map(|entry| f(&mut entry.store))
     }
 
     /// Apply one WorkspaceControl command. Fire-and-forget end to end:
@@ -1088,7 +1173,9 @@ impl PeerHost {
         // rolling the spawn back.
         let ws_id = self.workspace_id_for_surface(pane_id)?;
         if !self
-            .with_store(&ws_id, |store| store.surface_ids().iter().any(|s| s == pane_id))
+            .with_store(&ws_id, |store| {
+                store.surface_ids().iter().any(|s| s == pane_id)
+            })
             .unwrap_or(false)
         {
             return None;
@@ -1097,7 +1184,9 @@ impl PeerHost {
         // user is clearly working in it. No-op when it is alive.
         self.pty.get_or_respawn(pane_id);
         let new_id = self.spawn_ephemeral(pane_id, &ws_id)?;
-        match self.with_store(&ws_id, |store| store.split_pane(pane_id, orientation, new_id.clone())) {
+        match self.with_store(&ws_id, |store| {
+            store.split_pane(pane_id, orientation, new_id.clone())
+        }) {
             Some(Ok(true)) => Some(ws_id),
             Some(Ok(false)) => None,
             _ => {
@@ -1122,12 +1211,15 @@ impl PeerHost {
         }
         if let Some(ws_id) = self.workspace_id_for_surface(pane_id) {
             if self
-                .with_store(&ws_id, |store| store.surface_ids().iter().any(|s| s == pane_id))
+                .with_store(&ws_id, |store| {
+                    store.surface_ids().iter().any(|s| s == pane_id)
+                })
                 .unwrap_or(false)
             {
                 self.pty.get_or_respawn(pane_id);
                 let new_id = self.spawn_ephemeral(pane_id, &ws_id)?;
-                return match self.with_store(&ws_id, |store| store.add_tab(pane_id, new_id.clone())) {
+                return match self.with_store(&ws_id, |store| store.add_tab(pane_id, new_id.clone()))
+                {
                     Some(Ok(true)) => Some(ws_id),
                     _ => {
                         self.pty.remove(&new_id);
@@ -1232,7 +1324,11 @@ impl PeerHost {
     /// actually removed (explicit close, or the dead-watcher below), so
     /// closing it is permanent for this daemon lifetime and a raw
     /// `AttachSurface` for the same id can't resurrect it.
-    fn spawn_ephemeral(self: &Arc<Self>, source_pane: &[u8], workspace_id: &[u8]) -> Option<SurfaceId> {
+    fn spawn_ephemeral(
+        self: &Arc<Self>,
+        source_pane: &[u8],
+        workspace_id: &[u8],
+    ) -> Option<SurfaceId> {
         let cwd = self
             .pty
             .list()
@@ -1258,10 +1354,15 @@ impl PeerHost {
             rows: 24,
             cwd,
         };
-        self.pty.register_and_spawn_ephemeral(surface_id.clone(), spec);
+        self.pty
+            .register_and_spawn_ephemeral(surface_id.clone(), spec);
         // register_and_spawn_ephemeral logs-and-continues on failure; only
         // report a surface that actually exists.
-        let surface = self.pty.list().into_iter().find(|s| s.surface_id == surface_id)?;
+        let surface = self
+            .pty
+            .list()
+            .into_iter()
+            .find(|s| s.surface_id == surface_id)?;
         self.surface_workspace
             .lock()
             .unwrap()
@@ -1293,8 +1394,12 @@ impl PeerHost {
             // Route the removal to whichever workspace's tree currently
             // holds this surface (the reverse index), not always the
             // default — a dead ephemeral pane can belong to any workspace.
-            let Some(ws_id) = host.workspace_id_for_surface(&sid) else { return };
-            let removed = host.with_store(&ws_id, |store| store.remove_surface(&sid)).unwrap_or(false);
+            let Some(ws_id) = host.workspace_id_for_surface(&sid) else {
+                return;
+            };
+            let removed = host
+                .with_store(&ws_id, |store| store.remove_surface(&sid))
+                .unwrap_or(false);
             if removed {
                 // Out of the tree → out of the roster (it is already dead;
                 // remove only drops the map entry and re-signals a corpse)
@@ -1325,10 +1430,12 @@ impl PeerHost {
             host.pending_pushes.lock().unwrap().remove(&workspace_id);
             let layout = host.layout_snapshot_for(&workspace_id);
             let payload = Payload::WorkspaceUpdate(WorkspaceUpdate {
-                kind: Some(workspace_update::Kind::WorkspaceLayout(WorkspaceLayoutChanged {
-                    workspace_id: workspace_id.clone(),
-                    layout,
-                })),
+                kind: Some(workspace_update::Kind::WorkspaceLayout(
+                    WorkspaceLayoutChanged {
+                        workspace_id: workspace_id.clone(),
+                        layout,
+                    },
+                )),
             });
             host.clients.broadcast(&payload);
         });
@@ -1406,7 +1513,10 @@ mod tests {
 
     /// Build a store with N single-tab panes without spawning PTYs.
     fn store_with(names: &[&str]) -> LayoutStore {
-        let mut store = LayoutStore { root: None, next_split_id: 1 };
+        let mut store = LayoutStore {
+            root: None,
+            next_split_id: 1,
+        };
         let ids: Vec<SurfaceId> = names.iter().map(|n| sid(n)).collect();
         store.root = store.build_balanced(&ids, 0);
         store
@@ -1414,12 +1524,21 @@ mod tests {
 
     /// Surface ids currently in `host`'s default workspace tree.
     fn default_surface_ids(host: &PeerHost) -> Vec<SurfaceId> {
-        host.workspaces.lock().unwrap().get(&host.default_id()).unwrap().store.surface_ids()
+        host.workspaces
+            .lock()
+            .unwrap()
+            .get(&host.default_id())
+            .unwrap()
+            .store
+            .surface_ids()
     }
 
     fn split_ids(store: &LayoutStore) -> Vec<Vec<u8>> {
         fn walk(node: &LayoutNode, out: &mut Vec<Vec<u8>>) {
-            if let LayoutNode::Split { id, first, second, .. } = node {
+            if let LayoutNode::Split {
+                id, first, second, ..
+            } = node
+            {
                 out.push(split_id_bytes(*id));
                 walk(first, out);
                 walk(second, out);
@@ -1436,7 +1555,14 @@ mod tests {
     /// split with that id exists in the tree.
     fn divider_ratio(store: &LayoutStore, split_id: &[u8]) -> Option<f64> {
         fn walk(node: &LayoutNode, target: &[u8]) -> Option<f64> {
-            if let LayoutNode::Split { id, divider, first, second, .. } = node {
+            if let LayoutNode::Split {
+                id,
+                divider,
+                first,
+                second,
+                ..
+            } = node
+            {
                 if split_id_bytes(*id) == target {
                     return Some(*divider);
                 }
@@ -1460,7 +1586,9 @@ mod tests {
     #[test]
     fn split_adds_pane_and_changes_tree() {
         let mut store = store_with(&["a"]);
-        let changed = store.split_pane(&sid("a"), Orientation::Horizontal, sid("b")).unwrap();
+        let changed = store
+            .split_pane(&sid("a"), Orientation::Horizontal, sid("b"))
+            .unwrap();
         assert!(changed);
         assert_eq!(store.surface_ids(), vec![sid("a"), sid("b")]);
         assert_eq!(split_ids(&store).len(), 1);
@@ -1471,7 +1599,9 @@ mod tests {
         let mut store = store_with(&["a"]);
         let before = store.surface_ids();
         assert_eq!(
-            store.split_pane(&sid("ghost"), Orientation::Vertical, sid("b")).unwrap_err(),
+            store
+                .split_pane(&sid("ghost"), Orientation::Vertical, sid("b"))
+                .unwrap_err(),
             LayoutError::NotFound
         );
         assert_eq!(store.surface_ids(), before);
@@ -1490,7 +1620,10 @@ mod tests {
     #[test]
     fn close_last_pane_is_refused() {
         let mut store = store_with(&["a"]);
-        assert_eq!(store.close_pane(&sid("a")).unwrap_err(), LayoutError::LastPane);
+        assert_eq!(
+            store.close_pane(&sid("a")).unwrap_err(),
+            LayoutError::LastPane
+        );
         assert_eq!(store.surface_ids(), vec![sid("a")]);
     }
 
@@ -1508,7 +1641,10 @@ mod tests {
         assert_eq!(removed, vec![sid("a")]);
         assert_eq!(store.surface_ids(), vec![sid("b")]);
         // Only the true last tab is refused.
-        assert_eq!(store.close_pane(&sid("b")).unwrap_err(), LayoutError::LastPane);
+        assert_eq!(
+            store.close_pane(&sid("b")).unwrap_err(),
+            LayoutError::LastPane
+        );
         assert_eq!(store.surface_ids(), vec![sid("b")]);
     }
 
@@ -1516,7 +1652,10 @@ mod tests {
     fn double_close_second_is_notfound() {
         let mut store = store_with(&["a", "b", "c"]);
         store.close_pane(&sid("a")).unwrap();
-        assert_eq!(store.close_pane(&sid("a")).unwrap_err(), LayoutError::NotFound);
+        assert_eq!(
+            store.close_pane(&sid("a")).unwrap_err(),
+            LayoutError::NotFound
+        );
         assert_eq!(store.surface_ids(), vec![sid("b"), sid("c")]);
     }
 
@@ -1524,7 +1663,9 @@ mod tests {
     fn split_ids_stable_across_unrelated_mutations() {
         let mut store = store_with(&["a", "b"]);
         let before = split_ids(&store);
-        store.split_pane(&sid("b"), Orientation::Vertical, sid("c")).unwrap();
+        store
+            .split_pane(&sid("b"), Orientation::Vertical, sid("c"))
+            .unwrap();
         let after = split_ids(&store);
         // The original split's id survives; one new id appended.
         assert!(after.contains(&before[0]));
@@ -1550,12 +1691,27 @@ mod tests {
     fn divider_rejects_nan_inf_and_unknown_id() {
         let mut store = store_with(&["a", "b"]);
         let split = split_ids(&store)[0].clone();
-        assert_eq!(store.set_divider(&split, f64::NAN).unwrap_err(), LayoutError::NotFound);
-        assert_eq!(store.set_divider(&split, f64::INFINITY).unwrap_err(), LayoutError::NotFound);
-        assert_eq!(store.set_divider(&[1, 2, 3], 0.5).unwrap_err(), LayoutError::NotFound);
+        assert_eq!(
+            store.set_divider(&split, f64::NAN).unwrap_err(),
+            LayoutError::NotFound
+        );
+        assert_eq!(
+            store.set_divider(&split, f64::INFINITY).unwrap_err(),
+            LayoutError::NotFound
+        );
+        assert_eq!(
+            store.set_divider(&[1, 2, 3], 0.5).unwrap_err(),
+            LayoutError::NotFound
+        );
         // F1: absurd id lengths.
-        assert_eq!(store.set_divider(&[], 0.5).unwrap_err(), LayoutError::NotFound);
-        assert_eq!(store.set_divider(&vec![0u8; 1024], 0.5).unwrap_err(), LayoutError::NotFound);
+        assert_eq!(
+            store.set_divider(&[], 0.5).unwrap_err(),
+            LayoutError::NotFound
+        );
+        assert_eq!(
+            store.set_divider(&vec![0u8; 1024], 0.5).unwrap_err(),
+            LayoutError::NotFound
+        );
     }
 
     #[test]
@@ -1658,10 +1814,12 @@ mod tests {
 
         for _ in 0..(PeerHost::MAX_PEER_SURFACES + 20) {
             host.apply_control(WorkspaceControl {
-                kind: Some(workspace_control::Kind::SplitPane(peer_proto::v1::SplitPaneRequest {
-                    pane_id: sid("base"),
-                    orientation: "horizontal".into(),
-                })),
+                kind: Some(workspace_control::Kind::SplitPane(
+                    peer_proto::v1::SplitPaneRequest {
+                        pane_id: sid("base"),
+                        orientation: "horizontal".into(),
+                    },
+                )),
             });
         }
 
@@ -1675,25 +1833,19 @@ mod tests {
     #[tokio::test]
     async fn ephemeral_self_exit_removes_pane() {
         let manager = Arc::new(PtyManager::new());
-        let base = PtySurface::spawn(
-            sid("base"),
-            "cat".into(),
-            "/bin/cat",
-            &[],
-            80,
-            24,
-            None,
-        )
-        .expect("spawn /bin/cat");
+        let base = PtySurface::spawn(sid("base"), "cat".into(), "/bin/cat", &[], 80, 24, None)
+            .expect("spawn /bin/cat");
         manager.insert_surface(base);
         let host = Arc::new(PeerHost::new(manager));
         assert_eq!(default_surface_ids(&host).len(), 1);
 
         host.apply_control(WorkspaceControl {
-            kind: Some(workspace_control::Kind::SplitPane(peer_proto::v1::SplitPaneRequest {
-                pane_id: sid("base"),
-                orientation: "horizontal".into(),
-            })),
+            kind: Some(workspace_control::Kind::SplitPane(
+                peer_proto::v1::SplitPaneRequest {
+                    pane_id: sid("base"),
+                    orientation: "horizontal".into(),
+                },
+            )),
         });
         assert_eq!(default_surface_ids(&host).len(), 2, "split landed");
 
@@ -1757,7 +1909,9 @@ mod tests {
         let default_id = host.default_id();
         let workspaces = host.workspaces.lock().unwrap();
         assert_eq!(workspaces.len(), 1);
-        let entry = workspaces.get(&default_id).expect("default workspace present");
+        let entry = workspaces
+            .get(&default_id)
+            .expect("default workspace present");
         assert_eq!(entry.id, default_id);
         assert_eq!(entry.name, DAEMON_WORKSPACE);
         assert!(entry.is_default);
@@ -1789,7 +1943,10 @@ mod tests {
         manager.insert_surface(base);
         let host = PeerHost::new(Arc::clone(&manager));
 
-        assert_eq!(host.workspace_id_for_surface(&sid("base")), Some(host.default_id()));
+        assert_eq!(
+            host.workspace_id_for_surface(&sid("base")),
+            Some(host.default_id())
+        );
         assert_eq!(host.workspace_id_for_surface(&sid("ghost")), None);
     }
 
@@ -1812,13 +1969,24 @@ mod tests {
             let store2 = store_with(&["x"]);
             workspaces.insert(
                 ws2_id.clone(),
-                WorkspaceEntry { id: ws2_id.clone(), name: "second".into(), is_default: false, store: store2 },
+                WorkspaceEntry {
+                    id: ws2_id.clone(),
+                    name: "second".into(),
+                    is_default: false,
+                    store: store2,
+                },
             );
         }
-        host.surface_workspace.lock().unwrap().insert(sid("x"), ws2_id.clone());
+        host.surface_workspace
+            .lock()
+            .unwrap()
+            .insert(sid("x"), ws2_id.clone());
 
         assert_eq!(host.workspaces.lock().unwrap().len(), 2);
-        assert_eq!(host.workspace_id_for_surface(&sid("x")), Some(ws2_id.clone()));
+        assert_eq!(
+            host.workspace_id_for_surface(&sid("x")),
+            Some(ws2_id.clone())
+        );
         assert_eq!(host.workspace_id_for_surface(&sid("nowhere")), None);
         assert_ne!(ws2_id, host.default_id());
     }
@@ -1872,7 +2040,10 @@ mod tests {
         assert_eq!(changed, Some(ws2_id.clone()));
 
         let workspaces = host.workspaces.lock().unwrap();
-        assert_eq!(divider_ratio(&workspaces.get(&ws2_id).unwrap().store, &split_id), Some(0.3));
+        assert_eq!(
+            divider_ratio(&workspaces.get(&ws2_id).unwrap().store, &split_id),
+            Some(0.3)
+        );
         assert_ne!(
             divider_ratio(&workspaces.get(&default_id).unwrap().store, &split_id),
             Some(0.3),
@@ -1881,7 +2052,10 @@ mod tests {
         // An unknown workspace_id (that still names no store) resolves to
         // nothing rather than silently falling back to first-match.
         drop(workspaces);
-        assert_eq!(host.set_divider(&sid("ghost-workspace"), &split_id, 0.7), None);
+        assert_eq!(
+            host.set_divider(&sid("ghost-workspace"), &split_id, 0.7),
+            None
+        );
     }
 
     /// Legacy-client fallback: an empty `workspace_id` (pre field-3 clients)
@@ -1904,7 +2078,10 @@ mod tests {
         let changed = host.set_divider(&[], &split_id, 0.3);
         assert_eq!(changed, Some(default_id.clone()));
         let workspaces = host.workspaces.lock().unwrap();
-        assert_eq!(divider_ratio(&workspaces.get(&default_id).unwrap().store, &split_id), Some(0.3));
+        assert_eq!(
+            divider_ratio(&workspaces.get(&default_id).unwrap().store, &split_id),
+            Some(0.3)
+        );
     }
 
     /// Multi-workspace regression: `watch_ephemeral` must prune the dead
@@ -1931,25 +2108,41 @@ mod tests {
         let ws2_id = surface_id_from_name("second");
         {
             let mut workspaces = host.workspaces.lock().unwrap();
-            let surfaces_b: Vec<_> =
-                manager.list().into_iter().filter(|s| s.surface_id == sid("base-b")).collect();
+            let surfaces_b: Vec<_> = manager
+                .list()
+                .into_iter()
+                .filter(|s| s.surface_id == sid("base-b"))
+                .collect();
             let store2 = LayoutStore::balanced_from_surfaces(&surfaces_b);
             workspaces.insert(
                 ws2_id.clone(),
-                WorkspaceEntry { id: ws2_id.clone(), name: "second".into(), is_default: false, store: store2 },
+                WorkspaceEntry {
+                    id: ws2_id.clone(),
+                    name: "second".into(),
+                    is_default: false,
+                    store: store2,
+                },
             );
         }
-        host.surface_workspace.lock().unwrap().insert(sid("base-b"), ws2_id.clone());
+        host.surface_workspace
+            .lock()
+            .unwrap()
+            .insert(sid("base-b"), ws2_id.clone());
 
-        let ephemeral_id =
-            host.spawn_ephemeral(&sid("base-b"), &ws2_id).expect("spawn ephemeral in ws2");
+        let ephemeral_id = host
+            .spawn_ephemeral(&sid("base-b"), &ws2_id)
+            .expect("spawn ephemeral in ws2");
         {
             let mut workspaces = host.workspaces.lock().unwrap();
             workspaces
                 .get_mut(&ws2_id)
                 .unwrap()
                 .store
-                .split_pane(&sid("base-b"), Orientation::Horizontal, ephemeral_id.clone())
+                .split_pane(
+                    &sid("base-b"),
+                    Orientation::Horizontal,
+                    ephemeral_id.clone(),
+                )
                 .unwrap();
         }
 
@@ -1962,7 +2155,14 @@ mod tests {
 
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
         loop {
-            let ws2_ids = host.workspaces.lock().unwrap().get(&ws2_id).unwrap().store.surface_ids();
+            let ws2_ids = host
+                .workspaces
+                .lock()
+                .unwrap()
+                .get(&ws2_id)
+                .unwrap()
+                .store
+                .surface_ids();
             if ws2_ids == vec![sid("base-b")] {
                 break;
             }
@@ -1986,7 +2186,11 @@ mod tests {
     // ---- M1: with_workspaces / persistence-driven boot --------------
 
     fn persisted(name: &str, is_default: bool) -> PersistedWorkspace {
-        PersistedWorkspace { id: sid(name), name: name.to_string(), is_default }
+        PersistedWorkspace {
+            id: sid(name),
+            name: name.to_string(),
+            is_default,
+        }
     }
 
     /// `with_workspaces` seeds the default entry's tree from the
@@ -2018,7 +2222,10 @@ mod tests {
         assert!(dev_entry.store.is_empty(), "non-default entries boot empty");
 
         // Reverse index only covers the default workspace's surfaces.
-        assert_eq!(host.workspace_id_for_surface(&sid("base")), Some(sid("term-meshd")));
+        assert_eq!(
+            host.workspace_id_for_surface(&sid("base")),
+            Some(sid("term-meshd"))
+        );
     }
 
     /// A collection with no entry marked `is_default` (a hand-built `Vec`
@@ -2065,7 +2272,11 @@ mod tests {
             Err(RemoveWorkspaceError::NotFound)
         );
         assert_eq!(host.remove_workspace(&sid("dev")), Ok(()));
-        assert_eq!(host.workspaces.lock().unwrap().len(), 1, "default survives, dev is gone");
+        assert_eq!(
+            host.workspaces.lock().unwrap().len(),
+            1,
+            "default survives, dev is gone"
+        );
         // Removing it again is now NotFound, not a second success.
         assert_eq!(
             host.remove_workspace(&sid("dev")),
@@ -2092,7 +2303,11 @@ mod tests {
             host.remove_workspace(&default_id),
             Err(RemoveWorkspaceError::LastWorkspace)
         );
-        assert_eq!(host.workspaces.lock().unwrap().len(), 1, "the last workspace survives");
+        assert_eq!(
+            host.workspaces.lock().unwrap().len(),
+            1,
+            "the last workspace survives"
+        );
     }
 
     /// M3(a): deleting the DEFAULT workspace is now allowed once another
@@ -2120,7 +2335,11 @@ mod tests {
 
         // Old default's surface was torn down, not re-homed into "dev".
         assert!(!manager.list().iter().any(|s| s.surface_id == sid("base")));
-        assert!(!host.surface_workspace.lock().unwrap().contains_key(&sid("base")));
+        assert!(!host
+            .surface_workspace
+            .lock()
+            .unwrap()
+            .contains_key(&sid("base")));
 
         // "dev" is the only survivor, so it is unambiguously promoted.
         assert_eq!(host.default_id(), dev_id);
@@ -2142,7 +2361,11 @@ mod tests {
         let manager = Arc::new(PtyManager::new());
         let host = PeerHost::with_workspaces(
             manager,
-            vec![persisted("term-meshd", true), persisted("alpha", false), persisted("bravo", false)],
+            vec![
+                persisted("term-meshd", true),
+                persisted("alpha", false),
+                persisted("bravo", false),
+            ],
         );
         let default_id = host.default_id();
         let expected_new_default = [sid("alpha"), sid("bravo")].into_iter().min().unwrap();
@@ -2174,13 +2397,19 @@ mod tests {
 
         let roster = host.list_workspaces();
         assert_eq!(roster.len(), 2);
-        let created = roster.iter().find(|e| e.id == new_id).expect("new entry present");
+        let created = roster
+            .iter()
+            .find(|e| e.id == new_id)
+            .expect("new entry present");
         assert_eq!(created.title, "scratch");
         assert!(
             created.layout.is_some(),
             "a created workspace is seeded with its first pane so it is usable immediately"
         );
-        let default_entry = roster.iter().find(|e| e.id == default_id).expect("default untouched");
+        let default_entry = roster
+            .iter()
+            .find(|e| e.id == default_id)
+            .expect("default untouched");
         assert_eq!(default_entry.title, DAEMON_WORKSPACE);
     }
 
@@ -2205,10 +2434,12 @@ mod tests {
         // before spawn_ephemeral.
         for _ in 0..(PeerHost::MAX_PEER_SURFACES + 20) {
             host.apply_control(WorkspaceControl {
-                kind: Some(workspace_control::Kind::SplitPane(peer_proto::v1::SplitPaneRequest {
-                    pane_id: sid("base"),
-                    orientation: "horizontal".into(),
-                })),
+                kind: Some(workspace_control::Kind::SplitPane(
+                    peer_proto::v1::SplitPaneRequest {
+                        pane_id: sid("base"),
+                        orientation: "horizontal".into(),
+                    },
+                )),
             });
         }
         assert_eq!(
@@ -2225,7 +2456,10 @@ mod tests {
             "create_workspace must not spawn past the cap"
         );
         let roster = host.list_workspaces();
-        let created = roster.iter().find(|e| e.id == new_id).expect("workspace still created");
+        let created = roster
+            .iter()
+            .find(|e| e.id == new_id)
+            .expect("workspace still created");
         assert!(
             created.layout.is_none(),
             "seed must be skipped (not merely failed) once the cap is already hit"
@@ -2241,11 +2475,25 @@ mod tests {
 
         assert!(host.rename_workspace(&default_id, "renamed".into()));
         assert_eq!(host.default_workspace_title(), "renamed");
-        assert_eq!(host.default_id(), default_id, "id must survive a rename unchanged");
+        assert_eq!(
+            host.default_id(),
+            default_id,
+            "id must survive a rename unchanged"
+        );
 
-        assert!(!host.rename_workspace(&sid("ghost"), "hijack".into()), "unknown id is a no-op");
-        assert!(!host.rename_workspace(&[], "hijack".into()), "empty id is a no-op");
-        assert_eq!(host.default_workspace_title(), "renamed", "no-op must not have applied");
+        assert!(
+            !host.rename_workspace(&sid("ghost"), "hijack".into()),
+            "unknown id is a no-op"
+        );
+        assert!(
+            !host.rename_workspace(&[], "hijack".into()),
+            "empty id is a no-op"
+        );
+        assert_eq!(
+            host.default_workspace_title(),
+            "renamed",
+            "no-op must not have applied"
+        );
     }
 
     /// `remove_workspace` on a non-default workspace with live surfaces
@@ -2267,14 +2515,25 @@ mod tests {
         manager.insert_surface(extra);
         {
             let mut workspaces = host.workspaces.lock().unwrap();
-            let mut store2 = LayoutStore { root: None, next_split_id: 1 };
+            let mut store2 = LayoutStore {
+                root: None,
+                next_split_id: 1,
+            };
             store2.seed_first_pane(sid("extra"));
             workspaces.insert(
                 ws2_id.clone(),
-                WorkspaceEntry { id: ws2_id.clone(), name: "second".into(), is_default: false, store: store2 },
+                WorkspaceEntry {
+                    id: ws2_id.clone(),
+                    name: "second".into(),
+                    is_default: false,
+                    store: store2,
+                },
             );
         }
-        host.surface_workspace.lock().unwrap().insert(sid("extra"), ws2_id.clone());
+        host.surface_workspace
+            .lock()
+            .unwrap()
+            .insert(sid("extra"), ws2_id.clone());
 
         let (tx, mut rx) = mpsc::channel(8);
         let guard = host.clients.register(tx, Arc::new(AtomicU64::new(0)));
@@ -2285,13 +2544,18 @@ mod tests {
             !manager.list().iter().any(|s| s.surface_id == sid("extra")),
             "the deleted workspace's surface must be torn down from pty"
         );
-        assert!(!host.surface_workspace.lock().unwrap().contains_key(&sid("extra")));
+        assert!(!host
+            .surface_workspace
+            .lock()
+            .unwrap()
+            .contains_key(&sid("extra")));
         assert!(!host.workspaces.lock().unwrap().contains_key(&ws2_id));
 
         let env = rx.recv().await.expect("WorkspaceRemoved broadcast");
         match env.payload {
             Some(Payload::WorkspaceUpdate(WorkspaceUpdate {
-                kind: Some(workspace_update::Kind::WorkspaceRemoved(WorkspaceRemoved { workspace_id })),
+                kind:
+                    Some(workspace_update::Kind::WorkspaceRemoved(WorkspaceRemoved { workspace_id })),
             })) => assert_eq!(workspace_id, ws2_id),
             other => panic!("expected WorkspaceUpdate.workspace_removed, got {other:?}"),
         }

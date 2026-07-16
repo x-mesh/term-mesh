@@ -555,7 +555,10 @@ mod tests {
             .filter_map(|e| e.ok())
             .filter(|e| e.file_name().to_string_lossy().contains(".tmp"))
             .collect();
-        assert!(leftover.is_empty(), "no tmp files should survive concurrent saves: {leftover:?}");
+        assert!(
+            leftover.is_empty(),
+            "no tmp files should survive concurrent saves: {leftover:?}"
+        );
     }
 
     /// Two `save` calls in direct succession must never reuse the same tmp
@@ -570,6 +573,9 @@ mod tests {
         save(&path, &[sample("b", true)]).unwrap();
 
         let after = SAVE_TMP_COUNTER.load(Ordering::Relaxed);
-        assert!(after - before >= 2, "each save must consume its own counter value");
+        assert!(
+            after - before >= 2,
+            "each save must consume its own counter value"
+        );
     }
 }

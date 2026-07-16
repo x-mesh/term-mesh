@@ -40,6 +40,32 @@ enum WorktreePolicyArg {
     Off,
 }
 
+#[cfg(test)]
+mod project_sync_cli_tests {
+    use super::*;
+
+    #[test]
+    fn parses_project_and_conflict_command_groups() {
+        let project =
+            Cli::try_parse_from(["tm-agent", "project", "scan", "00", "--request-id", "r1"])
+                .unwrap();
+        assert!(matches!(project.command, Commands::Project(_)));
+
+        let conflict =
+            Cli::try_parse_from(["tm-agent", "conflict", "resolve", "00", "c1", "local"]).unwrap();
+        assert!(matches!(conflict.command, Commands::Conflict(_)));
+    }
+
+    #[test]
+    fn daemon_errors_preserve_stable_machine_code() {
+        let error = decode_daemon_response(json!({
+            "error": { "code": -32601, "message": "USER_PRESENCE_REQUIRED: approve locally" }
+        }))
+        .unwrap_err();
+        assert_eq!(error, "USER_PRESENCE_REQUIRED: approve locally");
+    }
+}
+
 fn worktree_policy_name(policy: WorktreePolicyArg) -> &'static str {
     match policy {
         WorktreePolicyArg::Auto => "auto",
@@ -285,6 +311,16 @@ enum Commands {
     /// Install per-agent runbooks into local agent tool configs
     #[command(subcommand)]
     Runbook(RunbookCommands),
+    /// Project registry and local scan operations
+    Project(ProjectCommands),
+    /// Device pairing and recovery operations
+    Pairing(PairingCommands),
+    /// Project synchronization operations
+    Sync(SyncCommands),
+    /// Synchronization conflict operations
+    Conflict(ConflictCommands),
+    /// Project garbage-collection status
+    Gc(GcCommands),
 
     // ── Simple RPC wrappers ────────────────────────────────────────
     /// Destroy the current team
@@ -888,6 +924,121 @@ enum PeerCommand {
         #[arg(long)]
         json: bool,
     },
+}
+
+#[derive(clap::Args)]
+struct ProjectCommands {
+    #[command(subcommand)]
+    command: ProjectCommand,
+}
+
+#[derive(Subcommand)]
+enum ProjectCommand {
+    Add {
+        path: PathBuf,
+    },
+    List,
+    Status {
+        project: String,
+    },
+    Pause {
+        project: String,
+    },
+    Resume {
+        project: String,
+    },
+    Scan {
+        project: String,
+        #[arg(long)]
+        request_id: Option<String>,
+    },
+}
+
+#[derive(clap::Args)]
+struct PairingCommands {
+    #[command(subcommand)]
+    command: PairingCommand,
+}
+
+#[derive(Subcommand)]
+enum PairingCommand {
+    List {
+        project: String,
+    },
+    Approve {
+        project: String,
+        request: String,
+    },
+    Revoke {
+        project: String,
+        device: String,
+    },
+    #[command(name = "recovery-export")]
+    RecoveryExport {
+        project: String,
+    },
+    #[command(name = "recovery-import")]
+    RecoveryImport {
+        project: String,
+    },
+}
+
+#[derive(clap::Args)]
+struct SyncCommands {
+    #[command(subcommand)]
+    command: SyncCommand,
+}
+
+#[derive(Subcommand)]
+enum SyncCommand {
+    Start {
+        project: String,
+        #[arg(long)]
+        peer: Option<String>,
+        #[arg(long)]
+        request_id: Option<String>,
+    },
+    Status {
+        project: String,
+        operation: String,
+    },
+    Cancel {
+        project: String,
+        operation: String,
+    },
+}
+
+#[derive(clap::Args)]
+struct ConflictCommands {
+    #[command(subcommand)]
+    command: ConflictCommand,
+}
+
+#[derive(Subcommand)]
+enum ConflictCommand {
+    List {
+        project: String,
+    },
+    Get {
+        project: String,
+        conflict: String,
+    },
+    Resolve {
+        project: String,
+        conflict: String,
+        choice: String,
+    },
+}
+
+#[derive(clap::Args)]
+struct GcCommands {
+    #[command(subcommand)]
+    command: GcCommand,
+}
+
+#[derive(Subcommand)]
+enum GcCommand {
+    Status { project: String },
 }
 
 #[derive(Subcommand)]
@@ -2919,6 +3070,130 @@ fn rpc_call(sock: &PathBuf, method: &str, params: Value) -> Result<Value, String
     rpc_call_timeout(sock, method, params, timeout)
 }
 
+fn daemon_result(sock: &PathBuf, method: &str, params: Value) -> Result<Value, String> {
+    decode_daemon_response(rpc_call(sock, method, params)?)
+}
+
+fn decode_daemon_response(response: Value) -> Result<Value, String> {
+    if let Some(error) = response.get("error").filter(|value| !value.is_null()) {
+        let message = error
+            .get("message")
+            .and_then(Value::as_str)
+            .unwrap_or("RPC_ERROR: daemon request failed");
+        return Err(message.to_string());
+    }
+    response
+        .get("result")
+        .cloned()
+        .ok_or_else(|| "PROTOCOL_ERROR: daemon response has no result".to_string())
+}
+
+fn local_request_id() -> String {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    format!("tm-agent-{}-{nanos}", process::id())
+}
+
+fn run_project_sync_command(sock: &PathBuf, command: &Commands) -> Result<Value, String> {
+    let (method, params) = match command {
+        Commands::Project(group) => match &group.command {
+            ProjectCommand::Add { path } => (
+                "project.add",
+                json!({ "root_path": path.to_string_lossy() }),
+            ),
+            ProjectCommand::List => ("project.list", json!({})),
+            ProjectCommand::Status { project } => {
+                ("project.status", json!({ "project_id": project }))
+            }
+            ProjectCommand::Pause { project } => {
+                ("project.pause", json!({ "project_id": project }))
+            }
+            ProjectCommand::Resume { project } => {
+                ("project.resume", json!({ "project_id": project }))
+            }
+            ProjectCommand::Scan {
+                project,
+                request_id,
+            } => (
+                "project.scan",
+                json!({
+                    "project_id": project,
+                    "request_id": request_id.clone().unwrap_or_else(local_request_id),
+                    "kind": "manifest_scan",
+                }),
+            ),
+        },
+        Commands::Pairing(group) => match &group.command {
+            PairingCommand::List { project } => ("pairing.list", json!({ "project_id": project })),
+            PairingCommand::Approve { project, request } => (
+                "pairing.approve",
+                json!({ "project_id": project, "request_id": request }),
+            ),
+            PairingCommand::Revoke { project, device } => (
+                "pairing.revoke",
+                json!({ "project_id": project, "device_id": device }),
+            ),
+            PairingCommand::RecoveryExport { project } => {
+                ("pairing.recovery_export", json!({ "project_id": project }))
+            }
+            PairingCommand::RecoveryImport { project } => {
+                ("pairing.recovery_import", json!({ "project_id": project }))
+            }
+        },
+        Commands::Sync(group) => match &group.command {
+            SyncCommand::Start {
+                project,
+                peer,
+                request_id,
+            } => (
+                "sync.start",
+                json!({
+                    "project_id": project,
+                    "peer_id": peer,
+                    "request_id": request_id.clone().unwrap_or_else(local_request_id),
+                    "kind": "manifest_scan",
+                }),
+            ),
+            SyncCommand::Status { project, operation } => (
+                "sync.status",
+                json!({ "project_id": project, "operation_id": operation }),
+            ),
+            SyncCommand::Cancel { project, operation } => (
+                "sync.cancel",
+                json!({ "project_id": project, "operation_id": operation }),
+            ),
+        },
+        Commands::Conflict(group) => match &group.command {
+            ConflictCommand::List { project } => {
+                ("conflict.list", json!({ "project_id": project }))
+            }
+            ConflictCommand::Get { project, conflict } => (
+                "conflict.get",
+                json!({ "project_id": project, "conflict_id": conflict }),
+            ),
+            ConflictCommand::Resolve {
+                project,
+                conflict,
+                choice,
+            } => (
+                "conflict.resolve",
+                json!({
+                    "project_id": project,
+                    "conflict_id": conflict,
+                    "choice": choice,
+                }),
+            ),
+        },
+        Commands::Gc(group) => match &group.command {
+            GcCommand::Status { project } => ("gc.status", json!({ "project_id": project })),
+        },
+        _ => return Err("INTERNAL_ERROR: unsupported project sync command".to_string()),
+    };
+    daemon_result(sock, method, params)
+}
+
 fn rpc_call_timeout(
     sock: &PathBuf,
     method: &str,
@@ -4229,6 +4504,22 @@ fn main() {
     // They must work before term-mesh is running so onboarding can bootstrap itself.
     if let Commands::Runbook(ref runbook_cmd) = cli.command {
         print_result(run_runbook_command(runbook_cmd));
+        return;
+    }
+
+    if matches!(
+        cli.command,
+        Commands::Project(_)
+            | Commands::Pairing(_)
+            | Commands::Sync(_)
+            | Commands::Conflict(_)
+            | Commands::Gc(_)
+    ) {
+        let sock = detect_watch_socket().unwrap_or_else(|| {
+            eprintln!("Error: DAEMON_UNAVAILABLE: no term-meshd socket found");
+            process::exit(1);
+        });
+        print_result(run_project_sync_command(&sock, &cli.command));
         return;
     }
 
@@ -5791,6 +6082,11 @@ fn main() {
             }
             return;
         }
+        Commands::Project(_)
+        | Commands::Pairing(_)
+        | Commands::Sync(_)
+        | Commands::Conflict(_)
+        | Commands::Gc(_) => unreachable!("project sync commands return before app socket routing"),
     };
 
     print_result(result);
@@ -10185,10 +10481,12 @@ fn run_xk_bridge(sock: &PathBuf, timeout_secs: u32, leader_session: Option<&str>
     let xm_root = resolve_xk_xm_root();
     match &xm_root {
         Some(p) => eprintln!("[xk-bridge] .xm root: {}", p.display()),
-        None => eprintln!(
+        None => {
+            eprintln!(
             "[xk-bridge] warning: no .xm directory found from {} — trace/metric writeback disabled",
             env::current_dir().map(|p| p.display().to_string()).unwrap_or_default()
-        ),
+        )
+        }
     }
     // T2: xk_run (x-panel run telemetry, XK-EVENTS-v1) is mirrored onto the team
     // task board so a leader `tm-agent wait`s on a panel instead of polling files.
@@ -10252,7 +10550,10 @@ fn handle_xk_reply(event: &Value, state: &mut XkBridgeState) -> Result<(), Strin
         );
         return Ok(());
     };
-    let agent = event.get("agent").and_then(Value::as_str).unwrap_or("agent");
+    let agent = event
+        .get("agent")
+        .and_then(Value::as_str)
+        .unwrap_or("agent");
     let team = event.get("team").and_then(Value::as_str).unwrap_or("");
 
     // 1) build plugin → x-build tasks.json transition (reuses xmb machinery).
@@ -10310,10 +10611,7 @@ fn handle_xk_reply(event: &Value, state: &mut XkBridgeState) -> Result<(), Strin
                 "timestamp": ts,
             });
             // Path matches x-build's cost engine (ROOT = .xm/build).
-            let metrics_path = root
-                .join("build")
-                .join("metrics")
-                .join("sessions.jsonl");
+            let metrics_path = root.join("build").join("metrics").join("sessions.jsonl");
             if let Err(e) = xk_append_jsonl(&metrics_path, &metric) {
                 eprintln!("[xk-bridge] metrics: {e}");
             }
@@ -10415,7 +10713,11 @@ fn handle_xk_run(event: &Value, state: &mut XkBridgeState) -> Result<(), String>
                 .and_then(Value::as_str)
                 .filter(|s| !s.is_empty())
                 .unwrap_or(run);
-            let ns = if run_kind == "cross" { "cross" } else { "panel" };
+            let ns = if run_kind == "cross" {
+                "cross"
+            } else {
+                "panel"
+            };
             let created = rpc_call(
                 &app_sock,
                 "team.task.create",
@@ -10707,17 +11009,11 @@ mod xk_bridge_tests {
 
         // Path form (as written by trace subcommand `start`)
         fs::write(traces.join(".active"), ".xm/traces/op-1.jsonl\n").expect("marker");
-        assert_eq!(
-            xk_active_trace_path(&dir),
-            Some(traces.join("op-1.jsonl"))
-        );
+        assert_eq!(xk_active_trace_path(&dir), Some(traces.join("op-1.jsonl")));
 
         // Bare filename form
         fs::write(traces.join(".active"), "op-1.jsonl").expect("marker");
-        assert_eq!(
-            xk_active_trace_path(&dir),
-            Some(traces.join("op-1.jsonl"))
-        );
+        assert_eq!(xk_active_trace_path(&dir), Some(traces.join("op-1.jsonl")));
 
         // Stale marker (file gone) → None
         fs::write(traces.join(".active"), "gone.jsonl").expect("marker");
@@ -10856,7 +11152,10 @@ mod xk_bridge_tests {
         // done → completed
         handle_xk_run(&xk_run_event("done", ""), &mut state).expect("done");
         let calls = calls.lock().unwrap();
-        let methods: Vec<&str> = calls.iter().map(|c| c["method"].as_str().unwrap()).collect();
+        let methods: Vec<&str> = calls
+            .iter()
+            .map(|c| c["method"].as_str().unwrap())
+            .collect();
         assert_eq!(
             methods,
             vec!["team.task.create", "team.task.update", "team.task.update"],
@@ -11695,24 +11994,29 @@ fn run_claim(sock: &PathBuf, team: &str, agent: &str) {
                 let goal = details.clone().unwrap_or_else(|| title.clone());
                 let policy = parse_worktree_policy_name(task["worktree_policy"].as_str());
 
-                if task["worktree_path"].as_str().filter(|s| !s.is_empty()).is_none()
+                if task["worktree_path"]
+                    .as_str()
+                    .filter(|s| !s.is_empty())
+                    .is_none()
                     && should_acquire_worktree(policy, agent, &goal, &title, details.as_deref())
                 {
                     let branch = worktree_branch_for_task(team, &task, &goal);
                     match gk_wt_acquire(&branch, None) {
-                        Ok(meta) => match update_task_with_worktree(sock, team, &task_id, &meta, policy)
-                        {
-                            Ok(updated) => {
-                                task = updated["result"].clone();
-                                v["result"] = task.clone();
+                        Ok(meta) => {
+                            match update_task_with_worktree(sock, team, &task_id, &meta, policy) {
+                                Ok(updated) => {
+                                    task = updated["result"].clone();
+                                    v["result"] = task.clone();
+                                }
+                                Err(e) => {
+                                    let reason =
+                                        format!("task.update worktree metadata failed: {e}");
+                                    block_task_for_worktree_error(sock, team, &task_id, &reason);
+                                    eprintln!("Error: {reason}");
+                                    process::exit(1);
+                                }
                             }
-                            Err(e) => {
-                                let reason = format!("task.update worktree metadata failed: {e}");
-                                block_task_for_worktree_error(sock, team, &task_id, &reason);
-                                eprintln!("Error: {reason}");
-                                process::exit(1);
-                            }
-                        },
+                        }
                         Err(e) => {
                             let reason = format!("worktree acquire failed: {e}");
                             block_task_for_worktree_error(sock, team, &task_id, &reason);
@@ -11722,7 +12026,8 @@ fn run_claim(sock: &PathBuf, team: &str, agent: &str) {
                     }
                 }
 
-                let instruction = format_task_instruction(sock, team, &task, &goal, false, None, None);
+                let instruction =
+                    format_task_instruction(sock, team, &task, &goal, false, None, None);
                 let send_text = format!("{instruction}\n");
                 let send_result = if let Some(daemon_sock) = detect_daemon_socket() {
                     if let Some(agent_id) = is_headless_agent(&daemon_sock, team, agent) {
