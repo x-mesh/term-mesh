@@ -395,12 +395,22 @@ final class RemoteHostStore: ObservableObject {
     /// Delete the backing profile. Releases the sidebar lease first so
     /// the tunnel ref is balanced; panes/mirrors keep their own refs
     /// and the entry survives as ad-hoc while they live (rebuild rule).
+    /// Removes every saved profile for this host's sshTarget, not just
+    /// the one id this row happens to be bound to — a leftover
+    /// duplicate profile would otherwise resurrect the row on the next
+    /// profile sync. Falls back to the id-based delete when the host
+    /// has no sshTarget (shouldn't happen for a profile-backed entry,
+    /// but keeps the old behavior as a safety net).
     func deleteProfile(for host: HostEntry) {
         guard let profileID = host.profileID else { return }
         if hasSidebarLease(for: host.id) {
             disconnectSavedHost(host)
         }
-        PeerHostProfileStore.shared.delete(id: profileID)
+        if let target = host.sshTarget, !target.isEmpty {
+            PeerHostProfileStore.shared.deleteAll(forSSHTarget: target)
+        } else {
+            PeerHostProfileStore.shared.delete(id: profileID)
+        }
     }
 
     /// Promote an ad-hoc connected SSH entry to a saved profile draft
