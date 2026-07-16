@@ -1,0 +1,102 @@
+//  PeerDaemonVersion: compares a peer host's installed term-meshd
+//  version against the project's latest GitHub release, so the relay
+//  "Test" flow (PeerHostDoctor) can offer an update when the remote
+//  binary is stale.
+//
+//  Two independent pieces, kept separate on purpose: fetchLatestRelease
+//  does the network call (unauthenticated GitHub REST, same pattern as
+//  BrewReleaseNotesService.fetch), while parseComponents/compare are
+//  pure semver math — unit-testable without any network access.
+
+import Foundation
+
+enum PeerDaemonVersion {
+    /// Repo whose releases are the source of truth for the latest
+    /// term-meshd build (matches BrewReleaseNotesService.defaultRepo).
+    static let defaultRepo = "x-mesh/term-mesh"
+
+    /// Result of comparing an installed version string against the
+    /// latest known release.
+    enum Comparison: Equatable {
+        case upToDate
+        case outdated(latest: String)
+        /// Either side failed to parse as semver — no claim is made,
+        /// the caller must not offer an update on this result.
+        case unknown
+    }
+
+    /// Fetches the repo's latest release tag (e.g. "v0.156.0"). Returns
+    /// nil on any network, HTTP, or parse failure — callers treat that
+    /// the same as "can't tell", never as "up to date".
+    static func fetchLatestRelease(repo: String = defaultRepo) async -> String? {
+        guard let url = URL(string: "https://api.github.com/repos/\(repo)/releases/latest") else {
+            return nil
+        }
+        var request = URLRequest(url: url, timeoutInterval: 10)
+        request.setValue("application/vnd.github+json", forHTTPHeaderField: "Accept")
+        request.setValue("term-mesh-peer-doctor", forHTTPHeaderField: "User-Agent")
+        do {
+            let (data, response) = try await URLSession.shared.data(for: request)
+            guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
+                return nil
+            }
+            guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let tag = json["tag_name"] as? String else {
+                return nil
+            }
+            return tag
+        } catch {
+            return nil
+        }
+    }
+
+    /// Parses a semver-ish string into numeric components. Strips a
+    /// leading "v"/"V", then drops any prerelease suffix (`-rc1`,
+    /// `-beta.2`, …) and build metadata (`+build5`) — those identifiers
+    /// are excluded from ordering entirely, not compared. Returns nil
+    /// when what remains isn't a dotted run of integers (unparsable).
+    static func parseComponents(_ raw: String) -> [Int]? {
+        var s = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        if s.hasPrefix("v") || s.hasPrefix("V") { s.removeFirst() }
+        if let plusIdx = s.firstIndex(of: "+") { s = String(s[s.startIndex..<plusIdx]) }
+        if let dashIdx = s.firstIndex(of: "-") { s = String(s[s.startIndex..<dashIdx]) }
+        guard !s.isEmpty else { return nil }
+
+        let parts = s.split(separator: ".", omittingEmptySubsequences: false)
+        var components: [Int] = []
+        components.reserveCapacity(parts.count)
+        for part in parts {
+            guard let n = Int(part) else { return nil }
+            components.append(n)
+        }
+        return components.isEmpty ? nil : components
+    }
+
+    /// Numeric component-by-component comparison — never a string
+    /// compare, so `0.9.0 < 0.100.0` holds. A shorter array is padded
+    /// with zeros (`1.2` == `1.2.0`).
+    static func compareComponents(_ a: [Int], _ b: [Int]) -> ComparisonResult {
+        let count = max(a.count, b.count)
+        for i in 0..<count {
+            let ai = i < a.count ? a[i] : 0
+            let bi = i < b.count ? b[i] : 0
+            if ai != bi { return ai < bi ? .orderedAscending : .orderedDescending }
+        }
+        return .orderedSame
+    }
+
+    /// Compares raw version strings end-to-end. `.unknown` whenever
+    /// either side fails to parse — this function never guesses.
+    static func compare(installed: String, latest: String) -> Comparison {
+        guard let installedComponents = parseComponents(installed),
+              let latestComponents = parseComponents(latest) else {
+            return .unknown
+        }
+        switch compareComponents(installedComponents, latestComponents) {
+        case .orderedAscending:
+            return .outdated(latest: latest)
+        case .orderedSame, .orderedDescending:
+            return .upToDate
+        }
+    }
+}

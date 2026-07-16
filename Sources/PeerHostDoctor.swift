@@ -31,6 +31,20 @@ enum PeerHostDoctor {
     static let diagnoseCommand =
         #"sh -c 'systemctl --user is-active term-meshd 2>&1; journalctl --user -u term-meshd --no-pager -n 6 2>&1 | tail -n 6'"#
 
+    /// Sentinel exit code for "no term-meshd binary found" — distinct
+    /// from PeerSocketProber.noSocketExitCode (43) so the two probes'
+    /// failure spaces never collide on the same wire.
+    static let versionMissingExitCode: Int32 = 44
+
+    /// Fixed version-probe command: resolves term-meshd off PATH first,
+    /// falling back to the installer's default `~/.local/bin/term-meshd`
+    /// (a non-login ssh session often has a bare PATH that skips it),
+    /// then prints `--version` or exits with `versionMissingExitCode`
+    /// when no binary is found either way. No single quotes in the body
+    /// (same sh -c '…' wrapper constraint as remoteCommand/diagnoseCommand).
+    static let versionProbeCommand =
+        #"sh -c 'b=$(command -v term-meshd 2>/dev/null); [ -x "$b" ] || b="$HOME/.local/bin/term-meshd"; [ -x "$b" ] && "$b" --version || exit 44'"#
+
     /// Test reachability: SSH + peer-socket presence. An explicit
     /// `remoteSocket` is NOT trusted blindly — the probe checks the
     /// default candidates, which covers the explicit path's host too;
@@ -78,6 +92,65 @@ enum PeerHostDoctor {
             sshTarget: sshTarget, port: port, identityFile: identityFile,
             command: diagnoseCommand, timeoutSeconds: 20
         )) ?? "diagnosis unavailable"
+    }
+
+    /// Probes the remote term-meshd version. Covers the "daemon down"
+    /// case that a live-socket probe cannot: this shells out directly
+    /// rather than going through the peer socket. Returns nil whenever
+    /// no reliable version could be read — binary missing (exit 44),
+    /// ssh/timeout failure, or output that doesn't match the expected
+    /// `term-meshd X.Y.Z` shape. Never throws; the caller only cares
+    /// about "known version" vs "unknown".
+    static func checkVersion(
+        sshTarget: String,
+        port: Int?,
+        identityFile: String?
+    ) async -> String? {
+        do {
+            let output = try await runRemote(
+                sshTarget: sshTarget, port: port, identityFile: identityFile,
+                command: versionProbeCommand, timeoutSeconds: 15
+            )
+            return classifyVersionOutput(exitCode: 0, timedOut: false, stdout: output)
+        } catch PeerSocketProbeError.sshFailed(let exit, _) {
+            return classifyVersionOutput(exitCode: exit, timedOut: false, stdout: "")
+        } catch PeerSocketProbeError.timedOut {
+            return classifyVersionOutput(exitCode: -1, timedOut: true, stdout: "")
+        } catch {
+            return nil
+        }
+    }
+
+    /// Pure classification of a finished version-probe run — mirrors
+    /// PeerSocketProber.classify so the exit-code handling (in
+    /// particular versionMissingExitCode → nil) and the output parsing
+    /// are unit-testable without spawning ssh.
+    static func classifyVersionOutput(
+        exitCode: Int32,
+        timedOut: Bool,
+        stdout: String
+    ) -> String? {
+        guard !timedOut, exitCode == 0 else { return nil }
+        return parseVersionLine(from: stdout)
+    }
+
+    /// Extracts the version from a `term-meshd X.Y.Z` line. A non-login
+    /// shell can still print MOTD/banner text ahead of the real output,
+    /// so this scans every line and keeps the LAST match rather than
+    /// the first. Returns nil when no line matches.
+    static func parseVersionLine(from output: String) -> String? {
+        guard let regex = try? NSRegularExpression(pattern: #"^term-meshd\s+(\S+)\s*$"#) else {
+            return nil
+        }
+        var found: String?
+        for rawLine in output.split(separator: "\n", omittingEmptySubsequences: true) {
+            let line = rawLine.trimmingCharacters(in: .whitespacesAndNewlines)
+            let range = NSRange(line.startIndex..., in: line)
+            guard let match = regex.firstMatch(in: line, range: range),
+                  let versionRange = Range(match.range(at: 1), in: line) else { continue }
+            found = String(line[versionRange])
+        }
+        return found
     }
 
     /// Compact human line out of a diagnosis dump — surfaces the known

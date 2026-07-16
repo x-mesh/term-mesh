@@ -40,6 +40,7 @@
 			CVB00101 /* PeerHostProfileStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = CVS00101 /* PeerHostProfileStore.swift */; };
 			CVB00102 /* PeerHostEditorView.swift in Sources */ = {isa = PBXBuildFile; fileRef = CVS00102 /* PeerHostEditorView.swift */; };
 			CVB00103 /* PeerHostDoctor.swift in Sources */ = {isa = PBXBuildFile; fileRef = CVS00103 /* PeerHostDoctor.swift */; };
+			CVB00104 /* PeerDaemonVersion.swift in Sources */ = {isa = PBXBuildFile; fileRef = CVS00104 /* PeerDaemonVersion.swift */; };
 			CVB00097 /* PeerPaneSession.swift in Sources */ = {isa = PBXBuildFile; fileRef = CVS00097 /* PeerPaneSession.swift */; };
 			CVB00098 /* PeerTitlebarAccent.swift in Sources */ = {isa = PBXBuildFile; fileRef = CVS00098 /* PeerTitlebarAccent.swift */; };
 			CVB00099 /* PeerWorkspaceMirror.swift in Sources */ = {isa = PBXBuildFile; fileRef = CVS00099 /* PeerWorkspaceMirror.swift */; };
@@ -190,6 +191,7 @@
 				FA000000A1B2C3D4E5F60718 /* PeerSocketProberTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = FA000001A1B2C3D4E5F60718 /* PeerSocketProberTests.swift */; };
 				FB000000A1B2C3D4E5F60718 /* PeerPaneSessionTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = FB000001A1B2C3D4E5F60718 /* PeerPaneSessionTests.swift */; };
 				FC000000A1B2C3D4E5F60718 /* PeerWorkspaceMirrorTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = FC000001A1B2C3D4E5F60718 /* PeerWorkspaceMirrorTests.swift */; };
+				FD000000A1B2C3D4E5F60718 /* PeerDaemonVersionTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = FD000001A1B2C3D4E5F60718 /* PeerDaemonVersionTests.swift */; };
 		/* End PBXBuildFile section */
 
 /* Begin PBXCopyFilesBuildPhase section */
@@ -279,6 +281,7 @@
 			CVS00101 /* PeerHostProfileStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PeerHostProfileStore.swift; sourceTree = "<group>"; };
 			CVS00102 /* PeerHostEditorView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PeerHostEditorView.swift; sourceTree = "<group>"; };
 			CVS00103 /* PeerHostDoctor.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PeerHostDoctor.swift; sourceTree = "<group>"; };
+			CVS00104 /* PeerDaemonVersion.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PeerDaemonVersion.swift; sourceTree = "<group>"; };
 			CVS00097 /* PeerPaneSession.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PeerPaneSession.swift; sourceTree = "<group>"; };
 			CVS00098 /* PeerTitlebarAccent.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PeerTitlebarAccent.swift; sourceTree = "<group>"; };
 			CVS00099 /* PeerWorkspaceMirror.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PeerWorkspaceMirror.swift; sourceTree = "<group>"; };
@@ -429,6 +432,7 @@
 			FA000001A1B2C3D4E5F60718 /* PeerSocketProberTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PeerSocketProberTests.swift; sourceTree = "<group>"; };
 			FB000001A1B2C3D4E5F60718 /* PeerPaneSessionTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PeerPaneSessionTests.swift; sourceTree = "<group>"; };
 			FC000001A1B2C3D4E5F60718 /* PeerWorkspaceMirrorTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PeerWorkspaceMirrorTests.swift; sourceTree = "<group>"; };
+			FD000001A1B2C3D4E5F60718 /* PeerDaemonVersionTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PeerDaemonVersionTests.swift; sourceTree = "<group>"; };
 		/* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -567,6 +571,7 @@
 				CVS00101 /* PeerHostProfileStore.swift */,
 				CVS00102 /* PeerHostEditorView.swift */,
 				CVS00103 /* PeerHostDoctor.swift */,
+				CVS00104 /* PeerDaemonVersion.swift */,
 				CVS00097 /* PeerPaneSession.swift */,
 				CVS00098 /* PeerTitlebarAccent.swift */,
 				CVS00099 /* PeerWorkspaceMirror.swift */,
@@ -747,6 +752,7 @@
 				FA000001A1B2C3D4E5F60718 /* PeerSocketProberTests.swift */,
 				FB000001A1B2C3D4E5F60718 /* PeerPaneSessionTests.swift */,
 				FC000001A1B2C3D4E5F60718 /* PeerWorkspaceMirrorTests.swift */,
+				FD000001A1B2C3D4E5F60718 /* PeerDaemonVersionTests.swift */,
 			);
 			path = termMeshTests;
 			sourceTree = "<group>";
@@ -919,6 +925,7 @@
 				CVB00101 /* PeerHostProfileStore.swift in Sources */,
 				CVB00102 /* PeerHostEditorView.swift in Sources */,
 				CVB00103 /* PeerHostDoctor.swift in Sources */,
+				CVB00104 /* PeerDaemonVersion.swift in Sources */,
 				CVB00097 /* PeerPaneSession.swift in Sources */,
 				CVB00098 /* PeerTitlebarAccent.swift in Sources */,
 				CVB00099 /* PeerWorkspaceMirror.swift in Sources */,
@@ -1071,6 +1078,7 @@
 				FA000000A1B2C3D4E5F60718 /* PeerSocketProberTests.swift in Sources */,
 				FB000000A1B2C3D4E5F60718 /* PeerPaneSessionTests.swift in Sources */,
 				FC000000A1B2C3D4E5F60718 /* PeerWorkspaceMirrorTests.swift in Sources */,
+				FD000000A1B2C3D4E5F60718 /* PeerDaemonVersionTests.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
