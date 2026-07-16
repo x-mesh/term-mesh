@@ -71,8 +71,21 @@ struct PeerHostEditorView: View {
     /// `PeerHostProfile` — that the last `runTest()` actually probed.
     /// `runInstall()` reads ONLY this, never a fresh `validatedDraft()`,
     /// so Install/Update always targets what was tested even if the form
-    /// fields changed afterward. Cleared by `invalidateDoctorState()`.
+    /// fields changed afterward. Cleared by `invalidateDoctorState()`;
+    /// the Install/Update buttons also require it to be non-nil (see
+    /// `showsUpdateButton`) as a second line of defense.
     @State private var testedDraft: PeerHostProfile?
+    /// Bumped by `invalidateDoctorState()` and at the start of every
+    /// `runTest()`. Each `runTest()`/`runInstall()` Task captures the
+    /// value at launch and re-checks it after every `await` before
+    /// touching `doctorState`/`testedDraft`/`daemonMissingVersion` — a
+    /// mismatch means a newer Test or a field edit superseded this Task
+    /// while it was suspended, so its result is discarded rather than
+    /// written. This, not the resets in `invalidateDoctorState()`, is
+    /// what actually stops a late-arriving response from clobbering a
+    /// fresher state (SwiftUI state writes alone can't prevent an
+    /// already-in-flight Task from waking up later and writing anyway).
+    @State private var doctorGeneration = 0
 
     /// Fixed tag palette (one-dark hues) + nil for "no color".
     private static let colorChoices: [String?] = [
@@ -150,7 +163,7 @@ struct PeerHostEditorView: View {
                 Button("Test", action: runTest)
                     .disabled(doctorBusy
                               || profile.sshTarget.trimmingCharacters(in: .whitespaces).isEmpty)
-                if case .daemonMissing = doctorState {
+                if case .daemonMissing = doctorState, testedDraft != nil {
                     Button("Install term-meshd…") { showInstallConfirm = true }
                         .disabled(doctorBusy)
                 }
@@ -211,9 +224,11 @@ struct PeerHostEditorView: View {
     }
 
     /// Shown for `.updateAvailable`/`.legacyDaemon`, suppressed after one
-    /// update attempt this session (see `updateAttempted`).
+    /// update attempt this session (see `updateAttempted`), and only
+    /// when there's an actual tested target to act on (`testedDraft`) —
+    /// belt-and-suspenders alongside the generation guard in `runInstall`.
     private var showsUpdateButton: Bool {
-        guard !updateAttempted else { return false }
+        guard !updateAttempted, testedDraft != nil else { return false }
         switch doctorState {
         case .updateAvailable, .legacyDaemon: return true
         default: return false
@@ -297,10 +312,15 @@ struct PeerHostEditorView: View {
     }
 
     /// Invalidates the doctor flow when a field it actually probes (SSH
-    /// target, port, identity file) changes — a `testedDraft` snapshot
-    /// from before the edit must never be used for a later Install/Update,
-    /// and a stale status label is worse than none.
+    /// target, port, identity file) changes. The `doctorGeneration` bump
+    /// is what actually matters: any `runTest()`/`runInstall()` Task
+    /// still in flight re-checks it after every `await` and discards its
+    /// result on mismatch (see `doctorGeneration`'s doc comment), so a
+    /// stale response can never write over what this function resets.
+    /// The resets below are the visible half — immediate UI feedback
+    /// that the last Test/Install no longer applies to the edited target.
     private func invalidateDoctorState() {
+        doctorGeneration += 1
         doctorState = .idle
         testedDraft = nil
         daemonMissingVersion = nil
@@ -313,6 +333,12 @@ struct PeerHostEditorView: View {
 
     private func runTest() {
         guard let draft = validatedDraft() else { return }
+        // Bump FIRST, then capture — immediately invalidates any Task
+        // still in flight from a prior Test/Install/Update click, so a
+        // rapid re-click can't race its own predecessor. See
+        // `doctorGeneration`'s doc comment for the full guard discipline.
+        doctorGeneration += 1
+        let gen = doctorGeneration
         doctorState = .testing
         daemonMissingVersion = nil
         // Snapshot NOW — this is the exact target Install/Update must use
@@ -324,9 +350,15 @@ struct PeerHostEditorView: View {
                 sshTarget: draft.sshTarget, port: draft.sshPort,
                 identityFile: draft.identityFile
             )
+            // A field edit (→ invalidateDoctorState) or a fresh Test
+            // could have superseded this response while it was in
+            // flight — discard rather than write a stale doctorState.
+            guard gen == doctorGeneration else { return }
             switch result {
             case .ok(let path):
-                doctorState = await resolveConnectedState(socketPath: path, draft: draft)
+                let resolved = await resolveConnectedState(socketPath: path, draft: draft)
+                guard gen == doctorGeneration else { return }
+                doctorState = resolved
             case .daemonMissing:
                 // Binary may still be present with the service just not
                 // running — surface that without touching the frozen
@@ -335,12 +367,13 @@ struct PeerHostEditorView: View {
                 // Stay on `.testing` (busy) until this probe finishes too
                 // — same discipline as the `.ok` branch above: only the
                 // terminal assignment mutates doctorState, so the Test
-                // button stays disabled and a second Test can't race a
-                // late-arriving response into a stale UI state.
+                // button stays disabled while this runs. The generation
+                // guard below is the actual safety net either way.
                 let version = await PeerHostDoctor.checkVersion(
                     sshTarget: draft.sshTarget, port: draft.sshPort,
                     identityFile: draft.identityFile
                 )
+                guard gen == doctorGeneration else { return }
                 #if DEBUG
                 dlog("peer.doctor.version state=daemonMissing remote=\(version ?? "nil") latest=n/a")
                 #endif
@@ -355,7 +388,14 @@ struct PeerHostEditorView: View {
         // ONLY the last Test's validated target — never re-derive from
         // the live form, which may have been edited since (see
         // `testedDraft`). No test on file means nothing to install onto.
+        // Backstopped by the Install/Update buttons only rendering when
+        // `testedDraft != nil` (see `showsUpdateButton`) — this guard is
+        // the second line of defense, not the only one.
         guard let draft = testedDraft else { return }
+        // Capture (not bump — this Task inherits whatever generation the
+        // Test that produced `testedDraft` is still running under; see
+        // `doctorGeneration`'s doc comment).
+        let gen = doctorGeneration
         doctorState = .installing
         daemonMissingVersion = nil
         Task {
@@ -365,24 +405,30 @@ struct PeerHostEditorView: View {
                     identityFile: draft.identityFile
                 )
             } catch {
+                guard gen == doctorGeneration else { return }
                 doctorState = .installFailed(String(describing: error))
                 return
             }
+            guard gen == doctorGeneration else { return }
             // Re-test; if the daemon still isn't up, surface why
             // (e.g. release binary built against a newer glibc).
             let result = await PeerHostDoctor.test(
                 sshTarget: draft.sshTarget, port: draft.sshPort,
                 identityFile: draft.identityFile
             )
+            guard gen == doctorGeneration else { return }
             switch result {
             case .ok(let path):
-                doctorState = await resolveConnectedState(socketPath: path, draft: draft)
+                let resolved = await resolveConnectedState(socketPath: path, draft: draft)
+                guard gen == doctorGeneration else { return }
+                doctorState = resolved
             case .daemonMissing:
                 doctorState = .diagnosing
                 let raw = await PeerHostDoctor.diagnose(
                     sshTarget: draft.sshTarget, port: draft.sshPort,
                     identityFile: draft.identityFile
                 )
+                guard gen == doctorGeneration else { return }
                 doctorState = .diagnosed(PeerHostDoctor.summarizeDiagnosis(raw))
             case .sshFailed(let msg):
                 doctorState = .sshFailed(msg)
