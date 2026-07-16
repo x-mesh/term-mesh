@@ -67,6 +67,12 @@ struct PeerHostEditorView: View {
     /// itself isn't running (`.daemonMissing`). Kept out of that case's
     /// associated value since its signature must not change.
     @State private var daemonMissingVersion: String?
+    /// The exact (sshTarget, port, identityFile) — as a validated
+    /// `PeerHostProfile` — that the last `runTest()` actually probed.
+    /// `runInstall()` reads ONLY this, never a fresh `validatedDraft()`,
+    /// so Install/Update always targets what was tested even if the form
+    /// fields changed afterward. Cleared by `invalidateDoctorState()`.
+    @State private var testedDraft: PeerHostProfile?
 
     /// Fixed tag palette (one-dark hues) + nil for "no color".
     private static let colorChoices: [String?] = [
@@ -168,6 +174,12 @@ struct PeerHostEditorView: View {
             }
         }
         .onDisappear { bonjourBrowser.stop() }
+        // A stale doctorState/testedDraft is worse than none: any edit to
+        // a field the doctor actually probes invalidates the last Test so
+        // Install/Update can never fire against a since-changed target.
+        .onChange(of: profile.sshTarget) { invalidateDoctorState() }
+        .onChange(of: portText) { invalidateDoctorState() }
+        .onChange(of: profile.identityFile) { invalidateDoctorState() }
         .confirmationDialog(
             "Install term-meshd on \"\(profile.sshTarget)\"?",
             isPresented: $showInstallConfirm
@@ -224,13 +236,13 @@ struct PeerHostEditorView: View {
                   systemImage: "exclamationmark.triangle.fill")
                 .font(.caption).foregroundColor(.orange)
         case .okUpToDate(_, let version):
-            Label("term-meshd v\(version) — up to date", systemImage: "checkmark.seal")
+            Label("term-meshd v\(displayVersion(version)) — up to date", systemImage: "checkmark.seal")
                 .font(.caption).foregroundColor(.green)
         case .updateAvailable(_, let remote, let latest):
-            Label("Update available: v\(remote) → v\(latest)", systemImage: "arrow.up.circle")
+            Label("Update available: v\(displayVersion(remote)) → v\(displayVersion(latest))", systemImage: "arrow.up.circle")
                 .font(.caption).foregroundColor(.orange)
         case .legacyDaemon(_, let remote):
-            Label("Legacy daemon (v\(remote)) — update recommended (version reporting predates v\(PeerDaemonVersion.versionSyncFloor))",
+            Label("Legacy daemon (v\(displayVersion(remote))) — update recommended (version reporting predates v\(displayVersion(PeerDaemonVersion.versionSyncFloor)))",
                   systemImage: "exclamationmark.arrow.circlepath")
                 .font(.caption).foregroundColor(.orange)
                 .fixedSize(horizontal: false, vertical: true)
@@ -267,7 +279,34 @@ struct PeerHostEditorView: View {
         guard let version = daemonMissingVersion else {
             return "SSH OK, but term-meshd is not running on the host."
         }
-        return "SSH OK, term-meshd v\(version) is installed but not running on the host."
+        return "SSH OK, term-meshd v\(displayVersion(version)) is installed but not running on the host."
+    }
+
+    /// Strips any existing "v"/"V" prefix so callers can prepend exactly
+    /// one. `term-meshd --version` prints a bare `CARGO_PKG_VERSION`
+    /// (e.g. "0.156.0"), but a GitHub release tag (`latest`, from
+    /// `PeerDaemonVersion.fetchLatestRelease`) already carries the repo's
+    /// "vX.Y.Z" tag format — prepending "v" to both unconditionally would
+    /// double up on the tag side ("vv0.157.0"). Applied to every rendered
+    /// version regardless of source, so a future format change on either
+    /// side can't silently reintroduce the duplicate.
+    private func displayVersion(_ raw: String) -> String {
+        var s = raw
+        if s.hasPrefix("v") || s.hasPrefix("V") { s.removeFirst() }
+        return s
+    }
+
+    /// Invalidates the doctor flow when a field it actually probes (SSH
+    /// target, port, identity file) changes — a `testedDraft` snapshot
+    /// from before the edit must never be used for a later Install/Update,
+    /// and a stale status label is worse than none.
+    private func invalidateDoctorState() {
+        doctorState = .idle
+        testedDraft = nil
+        daemonMissingVersion = nil
+        updateAttempted = false
+        showInstallConfirm = false
+        showUpdateConfirm = false
     }
 
     // MARK: - Doctor actions
@@ -276,6 +315,10 @@ struct PeerHostEditorView: View {
         guard let draft = validatedDraft() else { return }
         doctorState = .testing
         daemonMissingVersion = nil
+        // Snapshot NOW — this is the exact target Install/Update must use
+        // later, even if the form fields change before the user acts on
+        // the result (see `testedDraft`/`invalidateDoctorState()`).
+        testedDraft = draft
         Task {
             let result = await PeerHostDoctor.test(
                 sshTarget: draft.sshTarget, port: draft.sshPort,
@@ -285,25 +328,34 @@ struct PeerHostEditorView: View {
             case .ok(let path):
                 doctorState = await resolveConnectedState(socketPath: path, draft: draft)
             case .daemonMissing:
-                doctorState = .daemonMissing
                 // Binary may still be present with the service just not
                 // running — surface that without touching the frozen
                 // `.daemonMissing` case's signature. exit 44 (no binary)
                 // resolves to nil here, leaving the plain message as-is.
-                daemonMissingVersion = await PeerHostDoctor.checkVersion(
+                // Stay on `.testing` (busy) until this probe finishes too
+                // — same discipline as the `.ok` branch above: only the
+                // terminal assignment mutates doctorState, so the Test
+                // button stays disabled and a second Test can't race a
+                // late-arriving response into a stale UI state.
+                let version = await PeerHostDoctor.checkVersion(
                     sshTarget: draft.sshTarget, port: draft.sshPort,
                     identityFile: draft.identityFile
                 )
                 #if DEBUG
-                dlog("peer.doctor.version state=daemonMissing remote=\(daemonMissingVersion ?? "nil") latest=n/a")
+                dlog("peer.doctor.version state=daemonMissing remote=\(version ?? "nil") latest=n/a")
                 #endif
+                daemonMissingVersion = version
+                doctorState = .daemonMissing
             case .sshFailed(let msg): doctorState = .sshFailed(msg)
             }
         }
     }
 
     private func runInstall() {
-        guard let draft = validatedDraft() else { return }
+        // ONLY the last Test's validated target — never re-derive from
+        // the live form, which may have been edited since (see
+        // `testedDraft`). No test on file means nothing to install onto.
+        guard let draft = testedDraft else { return }
         doctorState = .installing
         daemonMissingVersion = nil
         Task {
