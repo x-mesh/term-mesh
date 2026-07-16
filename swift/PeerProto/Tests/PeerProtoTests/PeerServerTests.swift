@@ -268,4 +268,107 @@ final class PeerServerTests: XCTestCase {
         await transport.close()
         await server.stop()
     }
+
+    /// End-to-end: real `PeerServer` dispatch of
+    /// `RenameWorkspaceRequest`/`DeleteWorkspaceRequest` (fire-and-forget,
+    /// per peer.proto's "Workspace lifecycle" section) reaches the
+    /// provider with the exact wire arguments, and `PeerServer
+    /// .broadcastWorkspaceRemoved` — the API term-mesh.app's
+    /// PeerHostCoordinator calls once `TabManager.closeWorkspace`
+    /// actually tears a workspace down — decodes as `.workspaceRemoved`
+    /// on the client. Regression guard for the Mac host gap where these
+    /// two Envelope payloads fell through the `case (.ready, _): break`
+    /// catch-all despite the host already advertising
+    /// "workspace.lifecycle.v1" in its Hello.capabilities.
+    func testWorkspaceLifecycleReachesProviderAndBroadcastsRemoval() async throws {
+        let sockPath = "/tmp/tm-peer-swift-wslc-\(UUID().uuidString.prefix(8)).sock"
+        defer { try? FileManager.default.removeItem(atPath: sockPath) }
+
+        let provider = RecordingWorkspaceProvider()
+        let server = PeerServer(socketPath: sockPath, provider: provider)
+        try await server.start()
+        defer { Task { await server.stop() } }
+
+        let deadline = Date().addingTimeInterval(2)
+        while !FileManager.default.fileExists(atPath: sockPath) {
+            if Date() > deadline { return XCTFail("no socket") }
+            try await Task.sleep(nanoseconds: 50_000_000)
+        }
+
+        let transport = try await UnixSocketTransport.connect(socketPath: sockPath)
+        let session = PeerSession(
+            read: { try await transport.read() },
+            write: { try await transport.write($0) }
+        )
+        _ = try await session.handshake()
+
+        let workspaceID = Data(repeating: 0x5A, count: 16)
+        try await session.renameWorkspace(workspaceID: workspaceID, title: "renamed-via-server")
+        try await session.deleteWorkspace(workspaceID: workspaceID)
+
+        // Both RPCs are fire-and-forget on the wire; poll the provider
+        // (actor-isolated) instead of asserting on an ordered reply.
+        let sawBoth = await Task {
+            let hardDeadline = Date().addingTimeInterval(2)
+            while Date() < hardDeadline {
+                if await provider.renamed != nil, await provider.deleted != nil {
+                    return true
+                }
+                try? await Task.sleep(nanoseconds: 20_000_000)
+            }
+            return false
+        }.value
+        XCTAssertTrue(sawBoth, "provider never observed both rename and delete calls")
+
+        let renamed = await provider.renamed
+        XCTAssertEqual(renamed?.id, workspaceID)
+        XCTAssertEqual(renamed?.title, "renamed-via-server")
+        let deleted = await provider.deleted
+        XCTAssertEqual(deleted, workspaceID)
+
+        // Mirrors PeerHostCoordinator's install*Bridge → broadcastWorkspaceRemoved
+        // call once TabManager.closeWorkspace actually tears the workspace
+        // down (real app code lives outside this package, so simulate the
+        // call the app layer makes after a successful delete).
+        await server.broadcastWorkspaceRemoved(workspaceID: workspaceID)
+
+        let msg = try await session.receiveNextMessage()
+        guard case .workspaceRemoved(let removedID) = msg else {
+            XCTFail("expected .workspaceRemoved, got \(msg)")
+            return
+        }
+        XCTAssertEqual(removedID, workspaceID)
+
+        try await session.sendGoodbye(reason: "workspace-lifecycle itest done")
+        await transport.close()
+        await server.stop()
+    }
+}
+
+/// Test-only `PeerSurfaceProvider` that records `renameWorkspace`/
+/// `deleteWorkspace` calls instead of driving a real workspace tree —
+/// stands in for `GhosttyPaneSurfaceProvider` (app-layer, not part of
+/// this package) to prove `PeerServerSession.dispatch` actually invokes
+/// the provider with the wire-decoded arguments.
+private actor RecordingWorkspaceProvider: PeerSurfaceProvider {
+    private(set) var renamed: (id: Data, title: String)?
+    private(set) var deleted: Data?
+
+    func listSurfaces() async -> [Termmesh_Peer_V1_SurfaceInfo] { [] }
+
+    func attach(
+        surfaceID: Data,
+        clientCols: UInt32,
+        clientRows: UInt32
+    ) async -> PeerSurfaceAttachment? { nil }
+
+    func renameWorkspace(id workspaceID: Data, title: String) async -> Bool {
+        renamed = (workspaceID, title)
+        return true
+    }
+
+    func deleteWorkspace(id workspaceID: Data) async -> Bool {
+        deleted = workspaceID
+        return true
+    }
 }
