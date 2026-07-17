@@ -56,8 +56,8 @@ fn rlog(msg: &str) {
     if !relay_debug_enabled() {
         return;
     }
-    let path = env::var("TERMMESH_PEER_RELAY_DEBUG_PATH")
-        .unwrap_or_else(|_| RELAY_DEBUG_LOG.to_string());
+    let path =
+        env::var("TERMMESH_PEER_RELAY_DEBUG_PATH").unwrap_or_else(|_| RELAY_DEBUG_LOG.to_string());
     if let Ok(mut f) = std::fs::OpenOptions::new()
         .create(true)
         .append(true)

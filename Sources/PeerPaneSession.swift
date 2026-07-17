@@ -337,6 +337,73 @@ final class PeerPaneSession {
         return paneSession
     }
 
+    /// Saved-profile path: handshake → ensure → attach the exact returned id.
+    /// The same open connection owns both RPCs, so no list/picker race can
+    /// redirect the attachment to a different surface.
+    static func ensureAndAttach(
+        lease: PeerPaneHostLease,
+        surfaceSpec: PeerRunnerSurfaceSpec,
+        attachment: PeerRunnerAttachment,
+        hostSpec: PeerPaneHostSpec,
+        onEnsured: () -> Void = {}
+    ) async throws -> (session: PeerPaneSession, outcome: PeerEnsureSurfaceOutcome) {
+        let conn = try await PeerRelaySession.connect(hostSockPath: lease.hostSockPath)
+        if lease.hostDisplayName.isEmpty {
+            lease.hostDisplayName = conn.hostDisplayName
+        }
+
+        let outcome: PeerEnsureSurfaceOutcome
+        do {
+            outcome = try await PeerRelaySession.ensureSurface(conn, spec: surfaceSpec)
+        } catch {
+            await conn.cancel()
+            throw error
+        }
+        onEnsured()
+
+        var exactSurface = Termmesh_Peer_V1_SurfaceInfo()
+        exactSurface.surfaceID = outcome.surfaceID
+        // A logical key is control-plane identity and may be sensitive. Never
+        // promote it into pane titles because connection-roster diagnostics
+        // log titles. An empty display title gets a fixed safe fallback.
+        exactSurface.title = attachment.title.isEmpty ? "Runner" : attachment.title
+        exactSurface.cols = max(attachment.cols, 1)
+        exactSurface.rows = max(attachment.rows, 1)
+        exactSurface.surfaceType = "terminal"
+        exactSurface.attachable = true
+        exactSurface.cwd = surfaceSpec.cwd
+
+        let relay: PeerRelaySession
+        do {
+            relay = try await PeerRelaySession.attach(conn, surface: exactSurface)
+        } catch {
+            await conn.cancel()
+            throw error
+        }
+        do {
+            try relay.prepareListener()
+        } catch {
+            await relay.stop()
+            throw error
+        }
+
+        PeerPaneHostRegistry.shared.retain(lease)
+        let paneSession = PeerPaneSession(
+            lease: lease,
+            relaySession: relay,
+            surfaceTitle: exactSurface.title,
+            originSpec: hostSpec,
+            originSurface: exactSurface
+        )
+        PeerClientCoordinator.shared.registerPaneSession(paneSession)
+        #if DEBUG
+        let surfaceMarker = outcome.surfaceID.prefix(4)
+            .map { String(format: "%02x", $0) }.joined()
+        dlog("peer.pane.ensureAttach surface=\(surfaceMarker) result=\(outcome.result) generation=\(outcome.generation)")
+        #endif
+        return (paneSession, outcome)
+    }
+
     // ── Lifecycle ────────────────────────────────────────────────────
 
     /// Accept the relay binary's connection and start pumping. Call

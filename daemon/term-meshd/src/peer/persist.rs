@@ -15,6 +15,7 @@
 //! back to a single fresh default workspace, exactly like a first-ever
 //! boot on a clean machine.
 
+use std::collections::HashSet;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -82,6 +83,132 @@ pub fn default_workspaces_path() -> PathBuf {
         .join("peer-workspaces.json")
 }
 
+/// Logical ensured-surface records intentionally live outside
+/// `peer-workspaces.json`: workspace identity and runner lifecycle have
+/// different recovery rules and must never make each other's file unreadable.
+pub fn ensured_surfaces_path(workspaces_path: &Path) -> PathBuf {
+    workspaces_path.with_file_name("peer-ensured-surfaces.json")
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PersistedEnsuredSurface {
+    pub key: String,
+    pub surface_id: Vec<u8>,
+    pub spec_hash: [u8; 32],
+    pub generation: u64,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct EnsuredSurfaceFile {
+    version: u32,
+    records: Vec<EnsuredSurfaceJson>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct EnsuredSurfaceJson {
+    key: String,
+    surface_id: String,
+    spec_hash: String,
+    generation: u64,
+}
+
+/// Load valid v1 logical records. A torn/corrupt whole file is treated as an
+/// empty registry; malformed individual entries are skipped so one hand-edited
+/// record cannot discard every unrelated runner. The stable id is re-derived
+/// from `key`, rejecting records from another namespace.
+pub fn load_ensured_surfaces(path: &Path) -> Vec<PersistedEnsuredSurface> {
+    let Ok(bytes) = std::fs::read(path) else {
+        return Vec::new();
+    };
+    let file: EnsuredSurfaceFile = match serde_json::from_slice(&bytes) {
+        Ok(file) => file,
+        Err(error) => {
+            tracing::warn!(
+                "peer-ensured-surfaces.json corrupt ({}): {error}; starting with no logical runner records",
+                path.display()
+            );
+            return Vec::new();
+        }
+    };
+    if file.version != 1 {
+        tracing::warn!(
+            "peer-ensured-surfaces.json unsupported version {} ({}); starting empty",
+            file.version,
+            path.display()
+        );
+        return Vec::new();
+    }
+
+    let mut keys = HashSet::new();
+    let mut ids = HashSet::new();
+    file.records
+        .into_iter()
+        .filter_map(|record| {
+            let surface_id = hex::decode(&record.surface_id).ok()?;
+            let spec_hash: [u8; 32] = hex::decode(&record.spec_hash).ok()?.try_into().ok()?;
+            if record.key.is_empty()
+                || record.key.len() > 256
+                || record.generation == 0
+                || surface_id != super::surface::surface_id_from_name(&record.key)
+                || !keys.insert(record.key.clone())
+                || !ids.insert(surface_id.clone())
+            {
+                tracing::warn!(
+                    "skipping invalid ensured-surface record in {}",
+                    path.display()
+                );
+                return None;
+            }
+            Some(PersistedEnsuredSurface {
+                key: record.key,
+                surface_id,
+                spec_hash,
+                generation: record.generation,
+            })
+        })
+        .collect()
+}
+
+/// Crash-safe v1 save: unique temp file, file `fsync`, atomic `rename`, then
+/// parent-directory `fsync` so the rename itself survives a host crash.
+pub fn save_ensured_surfaces(
+    path: &Path,
+    records: &[PersistedEnsuredSurface],
+) -> std::io::Result<()> {
+    let file = EnsuredSurfaceFile {
+        version: 1,
+        records: records
+            .iter()
+            .map(|record| EnsuredSurfaceJson {
+                key: record.key.clone(),
+                surface_id: hex::encode(&record.surface_id),
+                spec_hash: hex::encode(record.spec_hash),
+                generation: record.generation,
+            })
+            .collect(),
+    };
+    let bytes = serde_json::to_vec_pretty(&file)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::Other, error))?;
+    atomic_save(path, &bytes)
+}
+
+fn atomic_save(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    std::fs::create_dir_all(parent)?;
+    let counter = SAVE_TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let tmp = path.with_extension(format!("json.{}.{counter}.tmp", std::process::id()));
+    {
+        let mut file = std::fs::File::create(&tmp)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+    }
+    if let Err(error) = std::fs::rename(&tmp, path) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(error);
+    }
+    std::fs::File::open(parent)?.sync_all()
+}
+
 /// Load the persisted workspace collection from `path`. A missing file
 /// yields an empty vec (the normal first-ever-boot case); a present but
 /// unparseable file (bad JSON, or an entry whose `id` isn't valid hex)
@@ -137,25 +264,11 @@ pub fn load(path: &Path) -> Vec<PersistedWorkspace> {
 /// design here), but every writer's *own* data always makes it, never a
 /// stale one clobbering a fresh one via a shared tmp file.
 pub fn save(path: &Path, entries: &[PersistedWorkspace]) -> std::io::Result<()> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
     let json: Vec<PersistedWorkspaceJson> =
         entries.iter().map(PersistedWorkspaceJson::from).collect();
     let bytes = serde_json::to_vec_pretty(&json)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
-    let counter = SAVE_TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
-    let tmp = path.with_extension(format!("json.{}.{counter}.tmp", std::process::id()));
-    {
-        let mut f = std::fs::File::create(&tmp)?;
-        f.write_all(&bytes)?;
-        f.sync_all()?;
-    }
-    let result = std::fs::rename(&tmp, path);
-    if result.is_err() {
-        let _ = std::fs::remove_file(&tmp);
-    }
-    result
+    atomic_save(path, &bytes)
 }
 
 /// Parse `TERMMESH_PEER_WORKSPACES` into the list of workspace names the
@@ -577,5 +690,62 @@ mod tests {
             after - before >= 2,
             "each save must consume its own counter value"
         );
+    }
+
+    #[test]
+    fn ensured_records_use_separate_versioned_namespace() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace_path = dir.path().join("peer-workspaces.json");
+        let ensured_path = ensured_surfaces_path(&workspace_path);
+        let key = "runner";
+        let record = PersistedEnsuredSurface {
+            key: key.into(),
+            surface_id: super::super::surface::surface_id_from_name(key),
+            spec_hash: [7; 32],
+            generation: 3,
+        };
+
+        save_ensured_surfaces(&ensured_path, std::slice::from_ref(&record)).unwrap();
+
+        assert_eq!(load_ensured_surfaces(&ensured_path), vec![record]);
+        assert!(!workspace_path.exists());
+        assert_eq!(
+            ensured_path.file_name().unwrap(),
+            "peer-ensured-surfaces.json"
+        );
+    }
+
+    #[test]
+    fn ensured_load_recovers_valid_records_from_partially_invalid_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("peer-ensured-surfaces.json");
+        let key = "valid-runner";
+        let valid_id = super::super::surface::surface_id_from_name(key);
+        std::fs::write(
+            &path,
+            format!(
+                r#"{{"version":1,"records":[{{"key":"{key}","surface_id":"{}","spec_hash":"{}","generation":2}},{{"key":"bad","surface_id":"00","spec_hash":"nope","generation":0}}]}}"#,
+                hex::encode(&valid_id),
+                hex::encode([9; 32])
+            ),
+        )
+        .unwrap();
+
+        let loaded = load_ensured_surfaces(&path);
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].key, key);
+        assert_eq!(loaded[0].generation, 2);
+    }
+
+    #[test]
+    fn corrupt_ensured_file_recovers_as_empty_without_touching_workspaces() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace_path = dir.path().join("peer-workspaces.json");
+        let ensured_path = ensured_surfaces_path(&workspace_path);
+        save(&workspace_path, &[sample("kept", true)]).unwrap();
+        std::fs::write(&ensured_path, b"{torn").unwrap();
+
+        assert!(load_ensured_surfaces(&ensured_path).is_empty());
+        assert_eq!(load(&workspace_path)[0].name, "kept");
     }
 }

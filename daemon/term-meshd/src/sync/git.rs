@@ -2520,6 +2520,16 @@ fn directory_names(directory: &File) -> Result<Vec<String>, GitError> {
     directory_names_bounded(directory, usize::MAX)
 }
 
+#[cfg(target_os = "macos")]
+unsafe fn clear_errno() {
+    unsafe { *libc::__error() = 0 };
+}
+
+#[cfg(target_os = "linux")]
+unsafe fn clear_errno() {
+    unsafe { *libc::__errno_location() = 0 };
+}
+
 fn directory_names_bounded(directory: &File, limit: usize) -> Result<Vec<String>, GitError> {
     let current = c_name(".")?;
     let duplicate = unsafe {
@@ -2539,7 +2549,7 @@ fn directory_names_bounded(directory: &File, limit: usize) -> Result<Vec<String>
     }
     let mut names = Vec::new();
     loop {
-        unsafe { *libc::__error() = 0 };
+        unsafe { clear_errno() };
         let entry = unsafe { libc::readdir(stream) };
         if entry.is_null() {
             let error = io::Error::last_os_error();
@@ -2603,7 +2613,7 @@ fn for_each_directory_name(
     }
     let mut count = 0usize;
     loop {
-        unsafe { *libc::__error() = 0 };
+        unsafe { clear_errno() };
         let entry = unsafe { libc::readdir(stream) };
         if entry.is_null() {
             let error = io::Error::last_os_error();

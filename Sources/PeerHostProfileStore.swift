@@ -39,6 +39,12 @@ final class PeerHostProfileStore: ObservableObject {
         profiles.first { $0.sshTarget == target }
     }
 
+    /// Profiles that have an explicit process recipe. Plain saved hosts stay
+    /// on the existing surface-picker path.
+    var savedRunnerProfiles: [PeerHostProfile] {
+        profiles.filter { $0.savedRunner != nil }
+    }
+
     /// Insert or replace (by id) and persist. Also clears out any other
     /// profile that already claims the same non-empty `sshTarget` — e.g.
     /// the editor changed this profile's target onto one another saved

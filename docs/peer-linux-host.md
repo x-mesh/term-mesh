@@ -1,7 +1,7 @@
 # Linux Server as a Peer Host (tmux replacement)
 
-Last updated: July 14, 2026
-Status: verified end-to-end on 2026-07-14 (Ubuntu 25.10, x86-64)
+Last updated: July 17, 2026
+Status: peer host and deterministic runner verified end-to-end (Ubuntu 25.10, x86-64)
 
 A Linux box can serve terminal sessions to term-mesh on your Mac with **only
 `term-meshd` installed** — no GUI app, no relay binary on the server. The daemon
@@ -271,6 +271,394 @@ Verified on Ubuntu 25.10 / x86-64 (2026-07-14):
   against the systemd-managed instance. The download step itself (the actual
   GitHub release asset fetch) is exercised by `.github/workflows/release-linux.yml`
   on each tagged release, not separately re-verified per doc update.
+
+### Deterministic runner verification on jw-server
+
+Verified on `root@jw-server:/app/runner` (Ubuntu x86-64, 2026-07-17).
+`/app/runner` was only the child cwd. The final source build lived at
+`/tmp/term-mesh-terminate-build-20260717-095335-44485`.
+
+The installed binary and both backups were measured together:
+
+```bash
+ssh root@jw-server 'sha256sum \
+  /root/.local/bin/term-meshd \
+  /root/.local/bin/term-meshd.backup-terminate-20260717-005536 \
+  /root/.local/bin/term-meshd.backup-20260717-002500'
+```
+
+```text
+572fe367f76484a2823150398d52c09327ae7633f34d2e309897eee1962c3a6c  /root/.local/bin/term-meshd
+f47a87c6a396211378457c71dcf9ed978071ee2d9438c730767254e4fefa2e34  /root/.local/bin/term-meshd.backup-terminate-20260717-005536
+f83f2d439702846f01ff26bacb24f9d5ab423d1e90864b02ebcd62a7920d6ff5  /root/.local/bin/term-meshd.backup-20260717-002500
+```
+
+The fixed runner command is public and reproducible:
+
+```bash
+daemon/target/release/tm-agent peer ensure \
+  --host root@jw-server \
+  --remote-socket /run/user/0/tm-peer.sock \
+  --key runner-smoke \
+  --cwd /app/runner \
+  --executable /bin/sh \
+  --arg=-lc \
+  --arg='exec sleep 3600' \
+  --policy on-daemon-restart
+```
+
+The initial sequential/concurrent campaign snapshot used checked-in
+`tests_v2/peer_client.py:PeerClient.list_surfaces` through an SSH Unix-socket
+forward. `SurfaceInfo` carries the full ID, title, and cwd but not the PID, so
+the daemon's direct-child `ps` output was captured in the same snapshot. This
+is the complete command (run from the repository root):
+
+```bash
+export SOCK="/tmp/tm-peer-jw-snapshot-$$.sock"
+export CTL="/tmp/tm-peer-jw-snapshot-control-$$"
+cleanup() {
+  ssh -S "$CTL" -O exit root@jw-server >/dev/null 2>&1 || true
+  rm -f "$SOCK" "$CTL"
+}
+trap cleanup EXIT
+ssh -M -S "$CTL" -fN \
+  -o ExitOnForwardFailure=yes \
+  -o StreamLocalBindUnlink=yes \
+  -L "$SOCK:/run/user/0/tm-peer.sock" root@jw-server
+python3 - <<'PY'
+import os
+import sys
+
+sys.path.insert(0, "tests_v2")
+from peer_client import PeerClient
+
+with PeerClient(os.environ["SOCK"], display_name="jw-runner-snapshot") as client:
+    client.handshake()
+    print("protocol surfaces:")
+    for surface in client.list_surfaces():
+        print(
+            f"surface title={surface.title} surface_id={surface.surface_id.hex()} "
+            f"cwd={surface.cwd}"
+        )
+PY
+ssh root@jw-server '
+  main=$(systemctl --user show term-meshd.service -p MainPID --value)
+  printf "daemon children (MainPID=%s):\n" "$main"
+  ps -o pid=,ppid=,stat=,args= --ppid "$main"
+  printf "daemon child cwd:\n"
+  for pid in $(pgrep -P "$main"); do
+    printf "pid=%s cwd=" "$pid"
+    readlink "/proc/$pid/cwd"
+  done
+'
+cleanup
+trap - EXIT
+```
+
+The command's original output was:
+
+```text
+protocol surfaces:
+surface title=runner-smoke surface_id=0728f1f76e3d57619135659f6b477043 cwd=/app/runner
+surface title=shell surface_id=a3c249ca37b65c958e0fec5cc950da43 cwd=/root
+daemon children (MainPID=1029049):
+1029082 1029049 Ss   /bin/sh -c /bin/bash -l
+1041564 1029049 Ss+  sleep 3600
+daemon child cwd:
+pid=1029082 cwd=/root
+pid=1041564 cwd=/app/runner
+```
+
+The shared exact cwd deterministically correlates protocol surface
+`runner-smoke` with PID `1041564`, and surface `shell` with PID `1029082`.
+The same command remains a complete pre/post snapshot: after termination its
+protocol, raw `ps`, and `/proc/<pid>/cwd` sections omit only the terminated
+runner while retaining unrelated children.
+
+Ten sequential calls used one authenticated connection. This complete command
+asserts all ten `REUSED` results and one full surface/instance/PID identity:
+
+```bash
+export SOCK="/tmp/tm-peer-jw-sequential-$$.sock"
+export CTL="/tmp/tm-peer-jw-sequential-control-$$"
+cleanup() {
+  ssh -S "$CTL" -O exit root@jw-server >/dev/null 2>&1 || true
+  rm -f "$SOCK" "$CTL"
+}
+trap cleanup EXIT
+ssh -M -S "$CTL" -fN \
+  -o ExitOnForwardFailure=yes \
+  -o StreamLocalBindUnlink=yes \
+  -L "$SOCK:/run/user/0/tm-peer.sock" root@jw-server
+python3 - <<'PY'
+import os
+import sys
+
+sys.path.insert(0, "tests_v2")
+from peer_client import PeerClient, pb
+
+with PeerClient(os.environ["SOCK"], display_name="jw-runner-sequential") as client:
+    client.handshake()
+    outcomes = [
+        client.ensure_surface(
+            key="runner-smoke",
+            cwd="/app/runner",
+            executable="/bin/sh",
+            args=["-lc", "exec sleep 3600"],
+        )
+        for _ in range(10)
+    ]
+
+assert len(outcomes) == 10
+assert all(r.result == pb.ENSURE_SURFACE_RESULT_REUSED for r in outcomes)
+identities = {(r.surface_id.hex(), r.instance_id.hex(), r.pid) for r in outcomes}
+assert len(identities) == 1, identities
+first = outcomes[0]
+print("count=10 results=REUSED:10")
+print(f"surface_id={first.surface_id.hex()}")
+print(f"instance_id={first.instance_id.hex()}")
+print(f"generation={first.generation}")
+print(f"pid={first.pid}")
+print(f"spec_hash={first.spec_hash.hex()}")
+PY
+cleanup
+trap - EXIT
+```
+
+The observed output was:
+
+```text
+count=10 results=REUSED:10
+surface_id=0728f1f76e3d57619135659f6b477043
+instance_id=0dd54c7aff464268970bce68d3ba14e5
+generation=3
+pid=1041564
+spec_hash=4e85640a9a0ac4087812418e8b4ac0749a4a3b03dac79ed45979234061d68251
+```
+
+Twenty concurrent requests used the checked-in
+`PeerClient.ensure_same_surface_concurrently` helper on one authenticated
+connection. This is the complete tunnel creation, helper import, 20-call, and
+identity assertion command (run from the repository root):
+
+```bash
+export SOCK="/tmp/tm-peer-jw-runner-$$.sock"
+export CTL="/tmp/tm-peer-jw-control-$$"
+cleanup() {
+  ssh -S "$CTL" -O exit root@jw-server >/dev/null 2>&1 || true
+  rm -f "$SOCK" "$CTL"
+}
+trap cleanup EXIT
+ssh -M -S "$CTL" -fN \
+  -o ExitOnForwardFailure=yes \
+  -o StreamLocalBindUnlink=yes \
+  -L "$SOCK:/run/user/0/tm-peer.sock" root@jw-server
+python3 - <<'PY'
+import os
+import sys
+
+sys.path.insert(0, "tests_v2")
+from peer_client import PeerClient, pb
+
+with PeerClient(os.environ["SOCK"], display_name="jw-runner-concurrent") as client:
+    client.handshake()
+    outcomes = client.ensure_same_surface_concurrently(
+        20,
+        key="runner-smoke",
+        cwd="/app/runner",
+        executable="/bin/sh",
+        args=["-lc", "exec sleep 3600"],
+    )
+
+assert len(outcomes) == 20
+assert all(r.result == pb.ENSURE_SURFACE_RESULT_REUSED for r in outcomes)
+identities = {(r.surface_id.hex(), r.instance_id.hex(), r.pid) for r in outcomes}
+assert len(identities) == 1, identities
+surface_id, instance_id, pid = identities.pop()
+print(f"count={len(outcomes)} results=REUSED:20")
+print(f"surface_id={surface_id}")
+print(f"instance_id={instance_id}")
+print(f"pid={pid}")
+PY
+cleanup
+trap - EXIT
+```
+
+The observed output was:
+
+```text
+count=20 results=REUSED:20
+surface_id=0728f1f76e3d57619135659f6b477043
+instance_id=0dd54c7aff464268970bce68d3ba14e5
+pid=1041564
+```
+
+The conflict check changed only the requested argument:
+
+```bash
+daemon/target/release/tm-agent peer ensure \
+  --host root@jw-server \
+  --remote-socket /run/user/0/tm-peer.sock \
+  --key runner-smoke --cwd /app/runner --executable /bin/sh \
+  --arg=-lc --arg='exec sleep 3599' --policy on-daemon-restart
+```
+
+It returned `SPEC_CONFLICT`; surface
+`0728f1f76e3d57619135659f6b477043` kept PID `1041564` and its original
+instance. Exact attach and stdin-EOF detach used:
+
+```bash
+daemon/target/release/tm-agent peer attach \
+  --host root@jw-server \
+  --surface-id 0728f1f76e3d57619135659f6b477043 </dev/null
+```
+
+The next ensure returned `REUSED`, PID `1041564`, and instance
+`0dd54c7aff464268970bce68d3ba14e5`, proving detach did not terminate it.
+
+The restart/terminate tail was rerun from a clean, runner-absent state. Its
+current full snapshot before `runner-smoke` ensure was:
+
+```text
+protocol surfaces:
+surface title=shell surface_id=a3c249ca37b65c958e0fec5cc950da43 cwd=/root
+surface title=shell 1 surface_id=9fb438c217455fcd8bdf9f80eeb164d5 cwd=/root
+daemon children (MainPID=1042968):
+1043000 1042968 Ss   /bin/sh -c /bin/bash -l
+1059373 1042968 Ss   /bin/sh -c /bin/bash -l
+daemon child cwd:
+pid=1043000 cwd=/root
+pid=1059373 cwd=/root
+```
+
+The fixed ensure command created the runner before restart:
+
+```json
+{"disposition":"CREATED","generation":1,"host":"root@jw-server","instance_id":"723cebd9fabd425391159abef93416b1","ok":true,"pid":1083428,"request_id":"55e894a6f2ffab92a3c1cd72a9eb2588","result":"CREATED","spec_hash":"4e85640a9a0ac4087812418e8b4ac0749a4a3b03dac79ed45979234061d68251","surface_id":"0728f1f76e3d57619135659f6b477043"}
+```
+
+Restart verification then used:
+
+```bash
+ssh root@jw-server 'systemctl --user restart term-meshd.service'
+daemon/target/release/tm-agent peer ensure \
+  --host root@jw-server \
+  --remote-socket /run/user/0/tm-peer.sock \
+  --key runner-smoke \
+  --cwd /app/runner \
+  --executable /bin/sh \
+  --arg=-lc \
+  --arg='exec sleep 3600' \
+  --policy on-daemon-restart
+```
+
+The service PID check produced:
+
+```text
+old_main_pid=1042968
+service=active
+new_main_pid=1083594
+```
+
+The observed raw CLI output was:
+
+```json
+{"disposition":"RECREATED","generation":2,"host":"root@jw-server","instance_id":"86495fb5026e47cba99a9bc2119bc37f","ok":true,"pid":1083799,"request_id":"14d06e3c31a48de258df695547812af8","result":"RECREATED","spec_hash":"4e85640a9a0ac4087812418e8b4ac0749a4a3b03dac79ed45979234061d68251","surface_id":"0728f1f76e3d57619135659f6b477043"}
+```
+
+The stable surface ID plus changed generation, instance, and PID prove that
+the declared runner was recreated after daemon restart.
+
+Rerunning the complete `PeerClient.list_surfaces` plus remote direct-child
+`ps` snapshot command above immediately before termination produced:
+
+```text
+protocol surfaces:
+surface title=runner-smoke surface_id=0728f1f76e3d57619135659f6b477043 cwd=/app/runner
+surface title=shell surface_id=a3c249ca37b65c958e0fec5cc950da43 cwd=/root
+daemon children (MainPID=1083594):
+1083621 1083594 Ss   /bin/sh -c /bin/bash -l
+1083799 1083594 Ss+  sleep 3600
+daemon child cwd:
+pid=1083621 cwd=/root
+pid=1083799 cwd=/app/runner
+```
+
+Only that exact runner was then terminated:
+
+```bash
+daemon/target/release/tm-agent peer terminate \
+  --host root@jw-server \
+  --remote-socket /run/user/0/tm-peer.sock \
+  --surface-id 0728f1f76e3d57619135659f6b477043
+```
+
+The first response was correlated and exact:
+
+```json
+{"host":"root@jw-server","ok":true,"request_id":"d8ac6f2789148261d481300f3c6cef02","result":"TERMINATED","surface_id":"0728f1f76e3d57619135659f6b477043"}
+```
+
+Rerunning the same complete snapshot command after termination produced:
+
+```text
+protocol surfaces:
+surface title=shell surface_id=a3c249ca37b65c958e0fec5cc950da43 cwd=/root
+daemon children (MainPID=1083594):
+1083621 1083594 Ss   /bin/sh -c /bin/bash -l
+daemon child cwd:
+pid=1083621 cwd=/root
+```
+
+The unrelated surface set and process were unchanged. Repeating the exact CLI
+command produced a fresh request ID and this second raw response:
+
+```json
+{"host":"root@jw-server","ok":true,"request_id":"39b4477c7925608e1fdbfe62bdd992c0","result":"NOT_FOUND","surface_id":"0728f1f76e3d57619135659f6b477043"}
+```
+
+The terminated child was checked directly:
+
+```bash
+ssh root@jw-server 'kill -0 1083799'; echo $?
+```
+
+```text
+bash: line 1: kill: (1083799) - No such process
+1
+```
+
+This proves both that the runner exited and that resource idempotency is
+separate from request-ID replay protection. The final deliberate state had no
+`runner-smoke`; only the unrelated `shell` surface remained at PID `1083621`
+at the end of this test.
+
+The final service was active at PID `1083594`; its installed SHA-256 remained
+`572fe367f76484a2823150398d52c09327ae7633f34d2e309897eee1962c3a6c`.
+`journalctl --user -u term-meshd.service` logged request hashes, results,
+surface IDs, cwd, error codes, and elapsed time without command arguments or
+environment values.
+
+The rollback procedure below was verified syntactically but was **not
+executed**, because the deployed build passed. To roll back to the immediately
+previous build, then compare the installed hash with the measured expected
+hash:
+
+```bash
+install -m 755 /root/.local/bin/term-meshd.backup-terminate-20260717-005536 \
+  /root/.local/bin/.term-meshd.rollback
+mv -f /root/.local/bin/.term-meshd.rollback /root/.local/bin/term-meshd
+systemctl --user restart term-meshd.service
+systemctl --user is-active term-meshd.service
+actual=$(sha256sum /root/.local/bin/term-meshd | awk '{print $1}')
+expected=f47a87c6a396211378457c71dcf9ed978071ee2d9438c730767254e4fefa2e34
+test "$actual" = "$expected"
+printf '%s  %s\n' "$actual" /root/.local/bin/term-meshd
+```
+
+To return all the way to the original build, substitute
+`/root/.local/bin/term-meshd.backup-20260717-002500`; its expected SHA-256 is
+`f83f2d439702846f01ff26bacb24f9d5ab423d1e90864b02ebcd62a7920d6ff5`.
 
 Known gaps versus tmux:
 

@@ -336,13 +336,24 @@ fn open_shm(context: &Context) -> Result<File, ()> {
     Ok(file)
 }
 
-fn set_shm_lock(fd: c_int, start: c_int, count: c_int, lock_type: i16) -> io::Result<()> {
+fn set_shm_lock(
+    fd: c_int,
+    start: c_int,
+    count: c_int,
+    lock_type: impl TryInto<libc::c_short>,
+) -> io::Result<()> {
+    let lock_type = lock_type.try_into().map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "fcntl lock type does not fit c_short",
+        )
+    })?;
     let mut lock = libc::flock {
         l_start: start as libc::off_t,
         l_len: count as libc::off_t,
         l_pid: 0,
         l_type: lock_type,
-        l_whence: libc::SEEK_SET as i16,
+        l_whence: libc::SEEK_SET as libc::c_short,
     };
     if unsafe { libc::fcntl(fd, libc::F_SETLK, &mut lock) } == 0 {
         Ok(())

@@ -158,6 +158,9 @@ enum RelayError: Error, Sendable {
     case noRelayBinary(String)
     case listenerSetupFailed(String)
     case acceptTimedOut
+    case capabilityUnavailable(String)
+    case ensureRejected(code: String, stage: String, safeContext: String)
+    case surfaceIDMismatch
 }
 
 private actor RelayFrameSlots {
@@ -642,10 +645,10 @@ final class PeerRelaySession {
     static func connect(hostSockPath: String) async throws -> PeerRelayConnection {
         let transport = try await UnixSocketTransport.connect(socketPath: hostSockPath)
         await transport.setReadTimeoutSeconds(setupReadTimeoutSeconds)
-        let session = PeerSession(
-            read: { try await transport.read() },
-            write: { try await transport.write($0) }
-        )
+        // The transport-aware initializer gives PeerSession a close hook.
+        // Cancelling a correlated ensure then shuts down the socket, which
+        // wakes a suspended read before the caller releases its tunnel lease.
+        let session = PeerSession(transport: transport)
         let info: PeerSessionInfo
         do {
             info = try await session.handshake()
@@ -686,6 +689,9 @@ final class PeerRelaySession {
             throw error
         }
         await connection.transport.setReadTimeoutSeconds(nil)
+        guard outcome.surfaceID == surface.surfaceID else {
+            throw RelayError.surfaceIDMismatch
+        }
 
         let relaySockPath = try Self.makeRelaySocketPath()
 
@@ -703,6 +709,89 @@ final class PeerRelaySession {
             ptyStream: nil,
             onSharedDetach: nil
         )
+    }
+
+    /// Reconcile a saved process recipe over the already-handshaked
+    /// connection. This is deliberately separate from `connectAndList`: no
+    /// surface roster is fetched and no picker can influence the returned id.
+    static func ensureSurface(
+        _ connection: PeerRelayConnection,
+        spec: PeerRunnerSurfaceSpec
+    ) async throws -> PeerEnsureSurfaceOutcome {
+        guard connection.hostCapabilities.has(PeerCapability.surfaceEnsureV1) else {
+            throw RelayError.capabilityUnavailable(PeerCapability.surfaceEnsureV1)
+        }
+        await connection.transport.setReadTimeoutSeconds(setupReadTimeoutSeconds)
+        let outcome: PeerEnsureSurfaceOutcome
+        do {
+            outcome = try await connection.session.ensureSurface(
+                key: spec.key,
+                cwd: spec.cwd,
+                executable: spec.executable,
+                args: spec.args,
+                restartPolicy: spec.restartPolicy.wireValue
+            )
+        } catch {
+            await connection.transport.setReadTimeoutSeconds(nil)
+            throw error
+        }
+        await connection.transport.setReadTimeoutSeconds(nil)
+
+        switch outcome.result {
+        case .created, .reused, .recreated:
+            guard !outcome.surfaceID.isEmpty else {
+                throw RelayError.ensureRejected(
+                    code: "MALFORMED_RESPONSE", stage: "ensure", safeContext: "missing surface_id"
+                )
+            }
+            return outcome
+        case .specConflict, .failed, .unspecified, .UNRECOGNIZED:
+            let failure = outcome.error
+            throw RelayError.ensureRejected(
+                code: failure.map { Self.ensureErrorCode($0.code) }
+                    ?? Self.ensureResultErrorCode(outcome.result),
+                stage: failure?.stage.isEmpty == false ? failure!.stage : "ensure",
+                safeContext: failure?.safeContext ?? ""
+            )
+        }
+    }
+
+    private static func ensureResultErrorCode(
+        _ result: Termmesh_Peer_V1_EnsureSurfaceResult
+    ) -> String {
+        switch result {
+        case .specConflict: return "SPEC_CONFLICT"
+        case .failed: return "ENSURE_FAILED"
+        case .unspecified: return "MALFORMED_RESPONSE"
+        case .UNRECOGNIZED(let raw): return "UNRECOGNIZED_RESULT_\(raw)"
+        case .created, .reused, .recreated: return "ENSURE_FAILED"
+        }
+    }
+
+    private static func ensureErrorCode(
+        _ code: Termmesh_Peer_V1_EnsureSurfaceErrorCode
+    ) -> String {
+        switch code {
+        case .unspecified: return "ENSURE_FAILED"
+        case .invalidRequest: return "INVALID_REQUEST"
+        case .requestTooLarge: return "REQUEST_TOO_LARGE"
+        case .duplicateRequestID: return "DUPLICATE_REQUEST_ID"
+        case .cwdNotFound: return "CWD_NOT_FOUND"
+        case .cwdNotDirectory: return "CWD_NOT_DIRECTORY"
+        case .cwdPermissionDenied: return "CWD_PERMISSION_DENIED"
+        case .commandNotFound: return "COMMAND_NOT_FOUND"
+        case .commandExited: return "COMMAND_EXITED"
+        case .specConflict: return "SPEC_CONFLICT"
+        case .internal: return "INTERNAL"
+        case .commandPermissionDenied: return "COMMAND_PERMISSION_DENIED"
+        case .commandSignaled: return "COMMAND_SIGNALED"
+        case .commandExecError: return "COMMAND_EXEC_ERROR"
+        case .cwdError: return "CWD_ERROR"
+        case .execHandshakeTruncated: return "EXEC_HANDSHAKE_TRUNCATED"
+        case .execHandshakeInvalidStage: return "EXEC_HANDSHAKE_INVALID_STAGE"
+        case .execHandshakeTimeout: return "EXEC_HANDSHAKE_TIMEOUT"
+        case .UNRECOGNIZED(let raw): return "UNRECOGNIZED_\(raw)"
+        }
     }
 
     /// P1 narrow session sharing: attach a pane onto an already-handshaked

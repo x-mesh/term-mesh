@@ -43,6 +43,7 @@ enum WorktreePolicyArg {
 #[cfg(test)]
 mod project_sync_cli_tests {
     use super::*;
+    use clap::CommandFactory;
 
     #[test]
     fn parses_project_and_conflict_command_groups() {
@@ -63,6 +64,116 @@ mod project_sync_cli_tests {
         }))
         .unwrap_err();
         assert_eq!(error, "USER_PRESENCE_REQUIRED: approve locally");
+    }
+
+    #[test]
+    fn peer_ensure_requires_all_identity_and_policy_flags() {
+        let parsed = Cli::try_parse_from([
+            "tm-agent",
+            "peer",
+            "ensure",
+            "--host",
+            "root@jw-server",
+            "--key",
+            "runner-smoke",
+            "--cwd",
+            "/app/runner",
+            "--executable",
+            "/bin/sh",
+            "--arg=-lc",
+            "--arg",
+            "exec sleep 60",
+            "--policy",
+            "on-daemon-restart",
+        ])
+        .unwrap();
+        assert!(matches!(parsed.command, Commands::Peer(_)));
+
+        let missing_policy = Cli::try_parse_from([
+            "tm-agent",
+            "peer",
+            "ensure",
+            "--host",
+            "root@jw-server",
+            "--key",
+            "runner-smoke",
+            "--cwd",
+            "/app/runner",
+            "--executable",
+            "/bin/sh",
+        ]);
+        assert!(missing_policy.is_err());
+    }
+
+    #[test]
+    fn peer_attach_accepts_exact_surface_id_with_host() {
+        let parsed = Cli::try_parse_from([
+            "tm-agent",
+            "peer",
+            "attach",
+            "--host",
+            "root@jw-server",
+            "--surface-id",
+            "00112233445566778899aabbccddeeff",
+        ])
+        .unwrap();
+        assert!(matches!(parsed.command, Commands::Peer(_)));
+    }
+
+    #[test]
+    fn peer_terminate_requires_host_and_exact_surface_flag() {
+        let parsed = Cli::try_parse_from([
+            "tm-agent",
+            "peer",
+            "terminate",
+            "--host",
+            "root@jw-server",
+            "--surface-id",
+            "00112233445566778899aabbccddeeff",
+            "--remote-socket",
+            "/run/user/0/tm-peer.sock",
+        ])
+        .unwrap();
+        assert!(matches!(parsed.command, Commands::Peer(_)));
+        assert!(Cli::try_parse_from(
+            ["tm-agent", "peer", "terminate", "--host", "root@jw-server",]
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn peer_help_names_the_implemented_contract() {
+        let mut command = Cli::command();
+        let peer = command
+            .find_subcommand_mut("peer")
+            .unwrap()
+            .find_subcommand_mut("ensure")
+            .unwrap();
+        let mut help = Vec::new();
+        peer.write_long_help(&mut help).unwrap();
+        let help = String::from_utf8(help).unwrap();
+        for flag in [
+            "--host",
+            "--key",
+            "--cwd",
+            "--executable",
+            "--arg",
+            "--policy",
+        ] {
+            assert!(help.contains(flag), "missing {flag} from help: {help}");
+        }
+
+        let terminate = command
+            .find_subcommand_mut("peer")
+            .unwrap()
+            .find_subcommand_mut("terminate")
+            .unwrap();
+        let mut help = Vec::new();
+        terminate.write_long_help(&mut help).unwrap();
+        let help = String::from_utf8(help).unwrap();
+        for flag in ["--host", "--surface-id", "--remote-socket"] {
+            assert!(help.contains(flag), "missing {flag} from help: {help}");
+        }
     }
 }
 
@@ -883,6 +994,51 @@ enum DaemonCommand {
 
 #[derive(Subcommand)]
 enum PeerCommand {
+    /// Check that a remote term-meshd peer socket is reachable and authenticates.
+    Status {
+        /// Explicit SSH target, for example root@jw-server.
+        #[arg(long)]
+        host: String,
+        /// Explicit remote peer socket; omit to auto-detect it.
+        #[arg(long)]
+        remote_socket: Option<String>,
+    },
+    /// Create or reuse one deterministic remote PTY surface.
+    Ensure {
+        /// Explicit SSH target, for example root@jw-server.
+        #[arg(long)]
+        host: String,
+        /// Explicit remote peer socket; omit to auto-detect it.
+        #[arg(long)]
+        remote_socket: Option<String>,
+        /// Caller-owned logical surface key.
+        #[arg(long)]
+        key: String,
+        /// Absolute working directory on the remote host.
+        #[arg(long)]
+        cwd: PathBuf,
+        /// Absolute executable path on the remote host.
+        #[arg(long)]
+        executable: PathBuf,
+        /// One executable argument; repeat for multiple arguments.
+        #[arg(long = "arg", visible_alias = "args", allow_hyphen_values = true)]
+        args: Vec<String>,
+        /// Lifecycle policy: never or on-daemon-restart.
+        #[arg(long, value_enum)]
+        policy: PeerRestartPolicyArg,
+    },
+    /// Terminate one exact ensured remote surface.
+    Terminate {
+        /// Explicit SSH target, for example root@jw-server.
+        #[arg(long)]
+        host: String,
+        /// Exact full surface ID returned by `peer ensure`.
+        #[arg(long)]
+        surface_id: String,
+        /// Explicit remote peer socket; omit to auto-detect it.
+        #[arg(long)]
+        remote_socket: Option<String>,
+    },
     /// List the surfaces a peer-federation host exposes.
     ///
     /// Prints one surface per line: `<title>  <cols>x<rows>  <status>  <id>`
@@ -893,15 +1049,22 @@ enum PeerCommand {
     },
     /// Attach to a surface exposed by a peer-federation host.
     ///
-    /// Without `--name`, attaches to the first surface listed by the host.
+    /// Without `--name` or `--surface-id`, attaches to the first surface listed by the host.
     /// Stream PtyData from the host to stdout; relay stdin as Input.
     /// Ctrl-] detaches in interactive mode; stdin EOF detaches otherwise.
     Attach {
-        /// Path to the host's peer-federation unix socket.
-        socket: PathBuf,
+        /// Local peer-federation Unix socket (legacy direct mode).
+        #[arg(conflicts_with = "host")]
+        socket: Option<PathBuf>,
+        /// Explicit SSH target. Opens a temporary forwarded socket.
+        #[arg(long, conflicts_with = "socket", required_unless_present = "socket")]
+        host: Option<String>,
         /// Title of the surface to attach to; defaults to the first listed.
-        #[arg(long)]
+        #[arg(long, conflicts_with = "surface_id")]
         name: Option<String>,
+        /// Full surface ID returned by `peer ensure`; skips picker selection.
+        #[arg(long, conflicts_with = "name")]
+        surface_id: Option<String>,
     },
     /// Benchmark peer-relay latency/throughput (P8 measurement harness).
     ///
@@ -924,6 +1087,12 @@ enum PeerCommand {
         #[arg(long)]
         json: bool,
     },
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum PeerRestartPolicyArg {
+    Never,
+    OnDaemonRestart,
 }
 
 #[derive(clap::Args)]
@@ -4468,6 +4637,46 @@ fn main() {
     // is no running term-mesh daemon in the environment.
     if let Commands::Peer(ref peer_cmd) = cli.command {
         match &peer_cmd.command {
+            PeerCommand::Status {
+                host,
+                remote_socket,
+            } => {
+                process::exit(peer::status_cmd(host, remote_socket.as_deref()));
+            }
+            PeerCommand::Ensure {
+                host,
+                remote_socket,
+                key,
+                cwd,
+                executable,
+                args,
+                policy,
+            } => {
+                let policy = match policy {
+                    PeerRestartPolicyArg::Never => peer::RestartPolicy::Never,
+                    PeerRestartPolicyArg::OnDaemonRestart => peer::RestartPolicy::OnDaemonRestart,
+                };
+                process::exit(peer::ensure_cmd(
+                    host,
+                    remote_socket.as_deref(),
+                    key,
+                    cwd,
+                    executable,
+                    args,
+                    policy,
+                ));
+            }
+            PeerCommand::Terminate {
+                host,
+                surface_id,
+                remote_socket,
+            } => {
+                process::exit(peer::terminate_cmd(
+                    host,
+                    remote_socket.as_deref(),
+                    surface_id,
+                ));
+            }
             PeerCommand::List { socket } => {
                 if let Err(e) = peer::list_cmd(socket) {
                     eprintln!("peer list failed: {e:#}");
@@ -4475,8 +4684,22 @@ fn main() {
                 }
                 return;
             }
-            PeerCommand::Attach { socket, name } => {
-                if let Err(e) = peer::attach_cmd(socket, name.as_deref()) {
+            PeerCommand::Attach {
+                socket,
+                host,
+                name,
+                surface_id,
+            } => {
+                let result = if let Some(host) = host {
+                    peer::attach_host_cmd(host, name.as_deref(), surface_id.as_deref())
+                } else {
+                    peer::attach_cmd(
+                        socket.as_deref().expect("clap requires socket or host"),
+                        name.as_deref(),
+                        surface_id.as_deref(),
+                    )
+                };
+                if let Err(e) = result {
                     eprintln!("peer attach failed: {e:#}");
                     process::exit(1);
                 }
@@ -4489,9 +4712,7 @@ fn main() {
                 name,
                 json,
             } => {
-                if let Err(e) =
-                    peer::bench_cmd(socket, mode, *iterations, name.as_deref(), *json)
-                {
+                if let Err(e) = peer::bench_cmd(socket, mode, *iterations, name.as_deref(), *json) {
                     eprintln!("peer bench failed: {e:#}");
                     process::exit(1);
                 }
@@ -6111,19 +6332,14 @@ fn parse_byte_size(raw: &str) -> Result<usize, String> {
         return Err("empty value".to_string());
     }
     let lower = s.to_ascii_lowercase();
-    let (digits, multiplier) = if let Some(prefix) = lower
-        .strip_suffix("kb")
-        .or_else(|| lower.strip_suffix('k'))
-    {
-        (prefix, 1024usize)
-    } else if let Some(prefix) = lower
-        .strip_suffix("mb")
-        .or_else(|| lower.strip_suffix('m'))
-    {
-        (prefix, 1024usize * 1024)
-    } else {
-        (lower.as_str(), 1usize)
-    };
+    let (digits, multiplier) =
+        if let Some(prefix) = lower.strip_suffix("kb").or_else(|| lower.strip_suffix('k')) {
+            (prefix, 1024usize)
+        } else if let Some(prefix) = lower.strip_suffix("mb").or_else(|| lower.strip_suffix('m')) {
+            (prefix, 1024usize * 1024)
+        } else {
+            (lower.as_str(), 1usize)
+        };
     let n: usize = digits
         .trim()
         .parse()

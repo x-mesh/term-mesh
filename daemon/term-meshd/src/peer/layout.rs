@@ -18,7 +18,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
 use peer_proto::v1::{
@@ -29,7 +29,10 @@ use peer_proto::v1::{
 use tokio::sync::mpsc;
 
 use super::persist::PersistedWorkspace;
-use super::surface::{surface_id_from_name, PtyManager, PtySurface, SpawnSpec};
+use super::surface::{
+    surface_id_from_name, EnsureError, EnsureOutcome, PtyManager, PtySurface, SpawnSpec,
+    SurfaceSpec,
+};
 
 pub type SurfaceId = Vec<u8>;
 
@@ -516,6 +519,41 @@ impl LayoutStore {
         true
     }
 
+    /// Register a daemon-owned surface in the first pane of this workspace.
+    /// Ensured runners use this deterministic placement rather than requiring
+    /// a client-side picker or an inferred pane target.
+    pub fn register_surface(&mut self, surface_id: SurfaceId) -> bool {
+        if self.surface_ids().iter().any(|id| id == &surface_id) {
+            return false;
+        }
+        let Some(root) = self.root.as_mut() else {
+            return self.seed_first_pane(surface_id);
+        };
+        Self::register_in_first_pane(root, &surface_id);
+        true
+    }
+
+    fn register_in_first_pane(node: &mut LayoutNode, surface_id: &SurfaceId) {
+        match node {
+            LayoutNode::Pane { active, tabs } => {
+                tabs.push(surface_id.clone());
+                *active = surface_id.clone();
+            }
+            LayoutNode::Split { first, .. } => Self::register_in_first_pane(first, surface_id),
+        }
+    }
+
+    /// Explicit runner termination may leave a named workspace empty. This
+    /// differs from interactive ClosePane, which still refuses its last pane.
+    pub fn remove_surface_allow_empty(&mut self, surface_id: &[u8]) -> bool {
+        if matches!(&self.root, Some(LayoutNode::Pane { tabs, .. }) if tabs.len() == 1 && tabs[0] == surface_id)
+        {
+            self.root = None;
+            return true;
+        }
+        self.close_pane(surface_id).is_ok()
+    }
+
     pub fn is_empty(&self) -> bool {
         self.root.is_none()
     }
@@ -695,6 +733,12 @@ pub struct PeerHost {
     /// before M1/M2. Production boot (`server::serve`) sets this via
     /// `set_persist_path` right after construction.
     persist_path: Mutex<Option<PathBuf>>,
+    /// Serializes each workspace mutation through the snapshot+save boundary,
+    /// preventing an older concurrent snapshot from winning the final rename.
+    workspace_persistence: Mutex<()>,
+    /// Host-level lifecycle boundary covering PTY, layout, and reverse index.
+    /// The manager's per-id lock remains authoritative for PTY internals.
+    surface_lifecycle: Mutex<HashMap<SurfaceId, Weak<Mutex<()>>>>,
 }
 
 /// Debounce window for layout pushes. Mirrors the Swift host's 120 ms
@@ -802,7 +846,20 @@ impl PeerHost {
             ephemeral_counter: AtomicU64::new(1),
             pending_pushes: Mutex::new(HashSet::new()),
             persist_path: Mutex::new(None),
+            workspace_persistence: Mutex::new(()),
+            surface_lifecycle: Mutex::new(HashMap::new()),
         }
+    }
+
+    fn surface_lifecycle_lock(&self, surface_id: &[u8]) -> Arc<Mutex<()>> {
+        let mut locks = self.surface_lifecycle.lock().unwrap();
+        locks.retain(|_, lock| lock.strong_count() > 0);
+        if let Some(lock) = locks.get(surface_id).and_then(Weak::upgrade) {
+            return lock;
+        }
+        let lock = Arc::new(Mutex::new(()));
+        locks.insert(surface_id.to_vec(), Arc::downgrade(&lock));
+        lock
     }
 
     /// Wire the on-disk persistence path after construction. Kept out of
@@ -813,7 +870,64 @@ impl PeerHost {
     /// below (`create_workspace`/`rename_workspace`/`remove_workspace`)
     /// persists through it via `persist_workspaces`.
     pub fn set_persist_path(&self, path: PathBuf) {
+        self.pty
+            .set_ensured_persist_path(super::persist::ensured_surfaces_path(&path));
         *self.persist_path.lock().unwrap() = Some(path);
+    }
+
+    /// Deterministically ensure a runner and expose it in the default
+    /// workspace. The manager owns process/persistence; the host owns only
+    /// workspace placement and client visibility.
+    pub fn ensure_surface(
+        self: &Arc<Self>,
+        key: &str,
+        spec: &SurfaceSpec,
+    ) -> Result<EnsureOutcome, EnsureError> {
+        let surface_id = surface_id_from_name(key);
+        let lifecycle = self.surface_lifecycle_lock(&surface_id);
+        let _lifecycle_guard = lifecycle
+            .lock()
+            .map_err(|_| EnsureError::Internal("host surface lifecycle lock poisoned"))?;
+        let outcome = self.pty.ensure(key, spec)?;
+        let workspace_id = self.default_id();
+        let changed = {
+            let mut workspaces = self.workspaces.lock().unwrap();
+            workspaces
+                .get_mut(&workspace_id)
+                .is_some_and(|entry| entry.store.register_surface(outcome.surface_id.clone()))
+        };
+        self.surface_workspace
+            .lock()
+            .unwrap()
+            .insert(outcome.surface_id.clone(), workspace_id.clone());
+        if changed {
+            self.schedule_layout_push(workspace_id);
+        }
+        Ok(outcome)
+    }
+
+    /// Remove an ensured runner from runtime, logical persistence, and the
+    /// workspace roster. Repeating termination is a harmless no-op.
+    pub fn terminate_surface(self: &Arc<Self>, surface_id: &[u8]) -> Result<bool, EnsureError> {
+        let lifecycle = self.surface_lifecycle_lock(surface_id);
+        let _lifecycle_guard = lifecycle
+            .lock()
+            .map_err(|_| EnsureError::Internal("host surface lifecycle lock poisoned"))?;
+        let workspace_id = self.workspace_id_for_surface(surface_id);
+        // Durable PTY/logical-state deletion commits first. On failure the
+        // manager restores the live process, so layout/index remain untouched.
+        let runtime_removed = self.pty.terminate_ensured(surface_id)?;
+        let layout_removed = workspace_id.as_ref().is_some_and(|workspace_id| {
+            self.with_store(workspace_id, |store| {
+                store.remove_surface_allow_empty(surface_id)
+            })
+            .unwrap_or(false)
+        });
+        self.surface_workspace.lock().unwrap().remove(surface_id);
+        if layout_removed {
+            self.schedule_layout_push(workspace_id.expect("checked above"));
+        }
+        Ok(runtime_removed || layout_removed)
     }
 
     /// Best-effort save of the full workspace collection to
@@ -887,6 +1001,7 @@ impl PeerHost {
     /// `WorkspaceLayoutChanged`'s fields), so a client that cares about
     /// `is_default` re-derives it from its next `ListWorkspaces` roster.
     pub fn remove_workspace(&self, workspace_id: &[u8]) -> Result<(), RemoveWorkspaceError> {
+        let _persistence_guard = self.workspace_persistence.lock().unwrap();
         if workspace_id.is_empty() {
             return Err(RemoveWorkspaceError::NotFound);
         }
@@ -985,6 +1100,7 @@ impl PeerHost {
     }
 
     pub fn create_workspace(self: &Arc<Self>, title: String) -> Vec<u8> {
+        let _persistence_guard = self.workspace_persistence.lock().unwrap();
         let id = super::connection::random_peer_bytes(16);
         {
             let mut workspaces = self.workspaces.lock().unwrap();
@@ -1035,6 +1151,7 @@ impl PeerHost {
     /// this method itself stays silent so it composes cleanly with any
     /// future non-RPC caller.
     pub fn rename_workspace(&self, workspace_id: &[u8], title: String) -> bool {
+        let _persistence_guard = self.workspace_persistence.lock().unwrap();
         if workspace_id.is_empty() {
             return false;
         }
@@ -2560,5 +2677,198 @@ mod tests {
             other => panic!("expected WorkspaceUpdate.workspace_removed, got {other:?}"),
         }
         drop(guard);
+    }
+
+    #[tokio::test]
+    async fn ensured_surface_is_visible_in_workspace_and_termination_cleans_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace_path = dir.path().join("peer-workspaces.json");
+        let manager = Arc::new(PtyManager::new());
+        let host = Arc::new(PeerHost::new(Arc::clone(&manager)));
+        host.set_persist_path(workspace_path.clone());
+        let spec = SurfaceSpec {
+            cwd: "/tmp".into(),
+            executable: "/bin/cat".into(),
+            args: Vec::new(),
+            restart_policy: super::super::surface::EnsureRestartPolicy::OnDaemonRestart,
+        };
+
+        let created = host
+            .ensure_surface("workspace-runner", &spec)
+            .expect("ensure");
+        let workspace_id = host.default_id();
+        assert_eq!(
+            host.with_store(&workspace_id, |store| store.surface_ids())
+                .unwrap(),
+            vec![created.surface_id.clone()]
+        );
+        assert_eq!(
+            host.workspace_id_for_surface(&created.surface_id),
+            Some(workspace_id.clone())
+        );
+        assert!(host.layout_snapshot_for(&workspace_id).is_some());
+
+        assert!(host.terminate_surface(&created.surface_id).unwrap());
+        assert!(!host.terminate_surface(&created.surface_id).unwrap());
+        assert!(host
+            .with_store(&workspace_id, |store| store.surface_ids())
+            .unwrap()
+            .is_empty());
+        assert!(crate::peer::persist::load_ensured_surfaces(
+            &crate::peer::persist::ensured_surfaces_path(&workspace_path)
+        )
+        .is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn ensure_and_terminate_race_never_leaves_cross_registry_stale_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let host = Arc::new(PeerHost::new(Arc::new(PtyManager::new())));
+        host.set_persist_path(dir.path().join("peer-workspaces.json"));
+        let spec = SurfaceSpec {
+            cwd: "/tmp".into(),
+            executable: "/bin/cat".into(),
+            args: Vec::new(),
+            restart_policy: super::super::surface::EnsureRestartPolicy::OnDaemonRestart,
+        };
+
+        // Keep the process count low: this module already has PTY-cap stress
+        // tests running in parallel, and macOS returns ENXIO when the test
+        // process exhausts its configured PTYs.
+        for index in 0..2 {
+            let key = format!("host-race-{index}");
+            let initial = host.ensure_surface(&key, &spec).expect("initial ensure");
+            let surface_id = initial.surface_id.clone();
+            let barrier = Arc::new(std::sync::Barrier::new(2));
+            let ensuring = {
+                let host = Arc::clone(&host);
+                let barrier = Arc::clone(&barrier);
+                let key = key.clone();
+                let spec = spec.clone();
+                tokio::task::spawn_blocking(move || {
+                    barrier.wait();
+                    host.ensure_surface(&key, &spec)
+                })
+            };
+            let terminating = {
+                let host = Arc::clone(&host);
+                let barrier = Arc::clone(&barrier);
+                let surface_id = surface_id.clone();
+                tokio::task::spawn_blocking(move || {
+                    barrier.wait();
+                    host.terminate_surface(&surface_id)
+                })
+            };
+            ensuring.await.expect("ensure join").expect("ensure result");
+            terminating
+                .await
+                .expect("terminate join")
+                .expect("terminate result");
+
+            let in_runtime = host.pty.list().iter().any(|surface| {
+                surface.surface_id == surface_id && !surface.dead.load(Ordering::Acquire)
+            });
+            let in_layout = host
+                .with_store(&host.default_id(), |store| {
+                    store.surface_ids().contains(&surface_id)
+                })
+                .unwrap();
+            let in_index = host
+                .surface_workspace
+                .lock()
+                .unwrap()
+                .contains_key(&surface_id);
+            assert_eq!(in_runtime, in_layout, "runtime/layout diverged at {index}");
+            assert_eq!(in_runtime, in_index, "runtime/index diverged at {index}");
+            if in_runtime {
+                host.terminate_surface(&surface_id).unwrap();
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn terminate_save_failure_is_reported_and_leaves_live_layout_intact() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace_path = dir.path().join("peer-workspaces.json");
+        let ensured_path = crate::peer::persist::ensured_surfaces_path(&workspace_path);
+        let host = Arc::new(PeerHost::new(Arc::new(PtyManager::new())));
+        host.set_persist_path(workspace_path);
+        let spec = SurfaceSpec {
+            cwd: "/tmp".into(),
+            executable: "/bin/cat".into(),
+            args: Vec::new(),
+            restart_policy: super::super::surface::EnsureRestartPolicy::OnDaemonRestart,
+        };
+        let created = host
+            .ensure_surface("save-failure-runner", &spec)
+            .expect("ensure");
+        std::fs::remove_file(&ensured_path).unwrap();
+        std::fs::create_dir(&ensured_path).unwrap();
+
+        assert!(matches!(
+            host.terminate_surface(&created.surface_id),
+            Err(EnsureError::Persistence(_))
+        ));
+        assert!(host
+            .pty
+            .list()
+            .iter()
+            .any(|surface| surface.surface_id == created.surface_id
+                && !surface.dead.load(Ordering::Acquire)));
+        assert!(host
+            .with_store(&host.default_id(), |store| {
+                store.surface_ids().contains(&created.surface_id)
+            })
+            .unwrap());
+
+        std::fs::remove_dir(&ensured_path).unwrap();
+        assert!(host.terminate_surface(&created.surface_id).unwrap());
+        assert!(crate::peer::persist::load_ensured_surfaces(&ensured_path).is_empty());
+    }
+
+    #[test]
+    fn concurrent_workspace_mutations_persist_latest_complete_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("peer-workspaces.json");
+        let entries: Vec<_> = (0..16)
+            .map(|index| PersistedWorkspace {
+                id: sid(&format!("workspace-{index}")),
+                name: format!("before-{index}"),
+                is_default: index == 0,
+            })
+            .collect();
+        let host = Arc::new(PeerHost::with_workspaces(
+            Arc::new(PtyManager::new()),
+            entries.clone(),
+        ));
+        host.set_persist_path(path.clone());
+        let barrier = Arc::new(std::sync::Barrier::new(entries.len()));
+        let workers: Vec<_> = entries
+            .iter()
+            .enumerate()
+            .map(|(index, entry)| {
+                let host = Arc::clone(&host);
+                let barrier = Arc::clone(&barrier);
+                let id = entry.id.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    assert!(host.rename_workspace(&id, format!("after-{index}")));
+                })
+            })
+            .collect();
+        for worker in workers {
+            worker.join().unwrap();
+        }
+
+        let persisted = crate::peer::persist::load(&path);
+        assert_eq!(persisted.len(), entries.len());
+        for index in 0..entries.len() {
+            let id = &entries[index].id;
+            assert_eq!(
+                persisted.iter().find(|entry| &entry.id == id).unwrap().name,
+                format!("after-{index}")
+            );
+        }
     }
 }

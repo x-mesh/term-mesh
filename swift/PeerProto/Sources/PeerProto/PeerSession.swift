@@ -22,7 +22,23 @@ public enum PeerSessionError: Error, Equatable {
     case authRejected(reason: String)
     case attachRejected(reason: String)
     case createWorkspaceRejected(reason: String)
+    case invalidEnsureRequest(String)
+    case duplicateEnsureRequestID
+    case malformedEnsureResponse(String)
+    case sessionClosed(reason: String)
+    case concurrentReceiveOperation
     case unexpectedMessage(String)
+}
+
+public struct PeerEnsureSurfaceOutcome: Sendable, Equatable {
+    public let requestID: Data
+    public let result: Termmesh_Peer_V1_EnsureSurfaceResult
+    public let surfaceID: Data
+    public let instanceID: Data
+    public let generation: UInt64
+    public let pid: UInt32
+    public let specHash: Data
+    public let error: Termmesh_Peer_V1_EnsureSurfaceError?
 }
 
 /// Post-handshake result of a successful AttachSurface.
@@ -96,12 +112,23 @@ public struct PeerSessionInfo: Sendable, Equatable {
 
 public typealias PeerReadFn = @Sendable () async throws -> Data
 public typealias PeerWriteFn = @Sendable (Data) async throws -> Void
+public typealias PeerCloseFn = @Sendable () async -> Void
 
 public actor PeerSession {
     private let read: PeerReadFn
     private let write: PeerWriteFn
+    private let closeTransport: PeerCloseFn?
     private var seq: UInt64 = 0
     private var pendingInbound = Data()
+    private let demux = PeerSessionDemux()
+    private var activeEnsureRequestIDs: Set<Data> = []
+    private var inboundPumpTask: Task<Void, Never>?
+    private var bufferedIncomingMessages: [PeerIncomingMessage] = []
+    private var incomingWaiters: [UUID: CheckedContinuation<PeerIncomingMessage, Error>] = [:]
+    private var inboundTerminalError: Error?
+    private var didCloseTransport = false
+    private var directResponseRPCInFlight = false
+    private var inboundReadInProgress = false
 
     /// Heartbeat state. SSH `ServerAliveInterval` only catches dead
     /// TCP; it does not catch a remote daemon that has paused (laptop
@@ -140,9 +167,23 @@ public actor PeerSession {
     /// and false-positives on ordinary scheduler jitter.
     private var pongSeenSinceLastTick = true
 
-    public init(read: @escaping PeerReadFn, write: @escaping PeerWriteFn) {
+    public init(
+        read: @escaping PeerReadFn,
+        write: @escaping PeerWriteFn,
+        close: PeerCloseFn? = nil
+    ) {
         self.read = read
         self.write = write
+        self.closeTransport = close
+    }
+
+    /// Preferred production initializer. `UnixSocketTransport.close()` calls
+    /// `NWConnection.cancel()`, which completes an outstanding `receive` and
+    /// lets the session's single inbound pump release its actor promptly.
+    public init(transport: UnixSocketTransport) {
+        self.read = { try await transport.read() }
+        self.write = { try await transport.write($0) }
+        self.closeTransport = { await transport.close() }
     }
 
     /// Begin sending Ping frames every `interval` seconds. If no Pong
@@ -256,6 +297,8 @@ public actor PeerSession {
 
     @discardableResult
     public func handshake(options: PeerSessionOptions = .init()) async throws -> PeerSessionInfo {
+        try beginDirectResponseRPC()
+        defer { directResponseRPCInFlight = false }
         try await sendHello(options: options)
         let host = try await expectHello()
         if majorComponent(of: host.protocolVersion) != majorComponent(of: options.clientProtocolVersion) {
@@ -279,6 +322,8 @@ public actor PeerSession {
     // MARK: - ListSurfaces
 
     public func listSurfaces() async throws -> [Termmesh_Peer_V1_SurfaceInfo] {
+        try beginDirectResponseRPC()
+        defer { directResponseRPCInFlight = false }
         try await sendEnvelope { env in
             env.listSurfaces = Termmesh_Peer_V1_ListSurfaces()
         }
@@ -294,6 +339,8 @@ public actor PeerSession {
     /// layouts return an empty list, in which case the caller should
     /// fall back to per-surface attach.
     public func listWorkspaces() async throws -> [Termmesh_Peer_V1_Workspace] {
+        try beginDirectResponseRPC()
+        defer { directResponseRPCInFlight = false }
         try await sendEnvelope { env in
             env.listWorkspaces = Termmesh_Peer_V1_ListWorkspaces()
         }
@@ -317,6 +364,8 @@ public actor PeerSession {
     ///
     /// Returns the host-assigned workspace id on success.
     public func createWorkspace(title: String) async throws -> Data {
+        try beginDirectResponseRPC()
+        defer { directResponseRPCInFlight = false }
         try await sendEnvelope { env in
             var req = Termmesh_Peer_V1_CreateWorkspaceRequest()
             req.title = title
@@ -455,6 +504,238 @@ public actor PeerSession {
 
     // MARK: - AttachSurface
 
+    /// Reconcile one logical runner key to a daemon-owned PTY. Calls may run
+    /// concurrently: request ids, not arrival order, select the continuation.
+    public func ensureSurface(
+        requestID suppliedRequestID: Data? = nil,
+        key: String,
+        cwd: String,
+        executable: String,
+        args: [String] = [],
+        restartPolicy: Termmesh_Peer_V1_EnsureSurfaceRestartPolicy = .never
+    ) async throws -> PeerEnsureSurfaceOutcome {
+        if let inboundTerminalError { throw inboundTerminalError }
+        guard !directResponseRPCInFlight else {
+            throw PeerSessionError.concurrentReceiveOperation
+        }
+        let requestID = suppliedRequestID ?? Self.makeEnsureRequestID()
+        try Self.validateEnsureRequest(
+            requestID: requestID,
+            key: key,
+            cwd: cwd,
+            executable: executable,
+            args: args,
+            restartPolicy: restartPolicy
+        )
+
+        return try await withTaskCancellationHandler {
+            try Task.checkCancellation()
+            return try await performEnsureSurface(
+                requestID: requestID,
+                key: key,
+                cwd: cwd,
+                executable: executable,
+                args: args,
+                restartPolicy: restartPolicy
+            )
+        } onCancel: {
+            Task { await self.cancelEnsure(requestID: requestID) }
+        }
+    }
+
+    private func performEnsureSurface(
+        requestID: Data,
+        key: String,
+        cwd: String,
+        executable: String,
+        args: [String],
+        restartPolicy: Termmesh_Peer_V1_EnsureSurfaceRestartPolicy
+    ) async throws -> PeerEnsureSurfaceOutcome {
+        guard activeEnsureRequestIDs.insert(requestID).inserted else {
+            throw PeerSessionError.duplicateEnsureRequestID
+        }
+        let responses: AsyncThrowingStream<Termmesh_Peer_V1_EnsureSurfaceResponse, Error>
+        do {
+            responses = try await demux.registerEnsure(requestID: requestID)
+            try await sendEnsureRequest(
+                requestID: requestID,
+                key: key,
+                cwd: cwd,
+                executable: executable,
+                args: args,
+                restartPolicy: restartPolicy
+            )
+        } catch {
+            activeEnsureRequestIDs.remove(requestID)
+            await demux.failEnsure(requestID: requestID, error: error)
+            if Task.isCancelled { throw CancellationError() }
+            throw error
+        }
+        startInboundPumpIfNeeded()
+
+        let response: Termmesh_Peer_V1_EnsureSurfaceResponse
+        do {
+            var iterator = responses.makeAsyncIterator()
+            guard let next = try await iterator.next() else {
+                throw CancellationError()
+            }
+            response = next
+        } catch {
+            activeEnsureRequestIDs.remove(requestID)
+            if Task.isCancelled {
+                await cancelEnsure(requestID: requestID)
+                throw CancellationError()
+            }
+            throw error
+        }
+        return PeerEnsureSurfaceOutcome(
+            requestID: response.requestID,
+            result: response.result,
+            surfaceID: response.surfaceID,
+            instanceID: response.instanceID,
+            generation: response.generation,
+            pid: response.pid,
+            specHash: response.specHash,
+            error: response.hasError ? response.error : nil
+        )
+    }
+
+    private func cancelEnsure(requestID: Data) async {
+        activeEnsureRequestIDs.remove(requestID)
+        await demux.cancelEnsure(requestID: requestID)
+        // A cancelled write closure is not guaranteed to observe cooperative
+        // Task cancellation. Close the whole transport even when sibling
+        // ensures exist so the suspended write and every waiter terminate.
+        await terminateInbound(with: PeerSessionError.sessionClosed(reason: "request cancelled"))
+    }
+
+    private func startInboundPumpIfNeeded() {
+        guard inboundPumpTask == nil, inboundTerminalError == nil else { return }
+        inboundPumpTask = Task { [weak self] in
+            await self?.runInboundPump()
+        }
+    }
+
+    private func runInboundPump() async {
+        while !Task.isCancelled {
+            guard !activeEnsureRequestIDs.isEmpty || !incomingWaiters.isEmpty else {
+                inboundPumpTask = nil
+                return
+            }
+            let envelope: Termmesh_Peer_V1_Envelope
+            do {
+                guard !directResponseRPCInFlight else {
+                    inboundPumpTask = nil
+                    return
+                }
+                inboundReadInProgress = true
+                envelope = try await readFrame()
+                inboundReadInProgress = false
+            } catch {
+                inboundReadInProgress = false
+                await terminateInbound(with: error)
+                return
+            }
+
+            if case .ensureSurfaceResponse(let response) = envelope.payload {
+                if response.requestID.count == 16 {
+                    activeEnsureRequestIDs.remove(response.requestID)
+                } else {
+                    activeEnsureRequestIDs.removeAll()
+                }
+                await demux.routeEnsureResponse(response)
+                continue
+            }
+
+            let message = classifyIncoming(envelope)
+            if let key = incomingWaiters.keys.first,
+               let continuation = incomingWaiters.removeValue(forKey: key) {
+                continuation.resume(returning: message)
+            } else {
+                bufferedIncomingMessages.append(message)
+            }
+            if case .goodbye(let reason) = message {
+                await terminateInbound(with: PeerSessionError.sessionClosed(reason: reason))
+                return
+            }
+        }
+    }
+
+    private func terminateInbound(with error: Error) async {
+        guard inboundTerminalError == nil else { return }
+        let task = inboundPumpTask
+        inboundPumpTask = nil
+        inboundTerminalError = error
+        activeEnsureRequestIDs.removeAll()
+        await demux.failAllEnsures(error: error)
+        let waiters = incomingWaiters.values
+        incomingWaiters.removeAll()
+        for continuation in waiters {
+            continuation.resume(throwing: error)
+        }
+        task?.cancel()
+        if !didCloseTransport {
+            didCloseTransport = true
+            await closeTransport?()
+        }
+    }
+
+    private func sendEnsureRequest(
+        requestID: Data,
+        key: String,
+        cwd: String,
+        executable: String,
+        args: [String],
+        restartPolicy: Termmesh_Peer_V1_EnsureSurfaceRestartPolicy
+    ) async throws {
+        try await sendEnvelope { env in
+            var request = Termmesh_Peer_V1_EnsureSurfaceRequest()
+            request.requestID = requestID
+            request.key = key
+            request.cwd = cwd
+            request.executable = executable
+            request.args = args
+            request.restartPolicy = restartPolicy
+            env.ensureSurfaceRequest = request
+        }
+    }
+
+    private static func makeEnsureRequestID() -> Data {
+        var uuid = UUID().uuid
+        return withUnsafeBytes(of: &uuid) { Data($0) }
+    }
+
+    private static func validateEnsureRequest(
+        requestID: Data,
+        key: String,
+        cwd: String,
+        executable: String,
+        args: [String],
+        restartPolicy: Termmesh_Peer_V1_EnsureSurfaceRestartPolicy
+    ) throws {
+        guard requestID.count == 16 else {
+            throw PeerSessionError.invalidEnsureRequest("request_id must be 16 bytes")
+        }
+        guard !key.isEmpty, key.utf8.count <= 256 else {
+            throw PeerSessionError.invalidEnsureRequest("key must be 1...256 UTF-8 bytes")
+        }
+        guard !cwd.isEmpty, cwd.utf8.count <= 4096 else {
+            throw PeerSessionError.invalidEnsureRequest("cwd must be 1...4096 UTF-8 bytes")
+        }
+        guard !executable.isEmpty, executable.utf8.count <= 4096 else {
+            throw PeerSessionError.invalidEnsureRequest("executable must be 1...4096 UTF-8 bytes")
+        }
+        guard args.count <= 256, args.allSatisfy({ $0.utf8.count <= 65_536 }) else {
+            throw PeerSessionError.invalidEnsureRequest("args exceed protocol limits")
+        }
+        switch restartPolicy {
+        case .never, .onDaemonRestart:
+            break
+        case .unspecified, .UNRECOGNIZED:
+            throw PeerSessionError.invalidEnsureRequest("restart_policy must be recognized and specified")
+        }
+    }
+
     public func attachSurface(
         id: Data,
         mode: Termmesh_Peer_V1_AttachMode = .coWrite,
@@ -462,6 +743,8 @@ public actor PeerSession {
         rows: UInt32 = 24,
         resumeFromSeq: UInt64 = 0
     ) async throws -> PeerAttachOutcome {
+        try beginDirectResponseRPC()
+        defer { directResponseRPCInFlight = false }
         try await sendEnvelope { env in
             var req = Termmesh_Peer_V1_AttachSurface()
             req.surfaceID = id
@@ -495,7 +778,33 @@ public actor PeerSession {
     /// as the protocol grows (Phase 2.4b's WorkspaceUpdate.meta is
     /// already surfaced here).
     public func receiveNextMessage() async throws -> PeerIncomingMessage {
-        let env = try await readFrame()
+        if !bufferedIncomingMessages.isEmpty {
+            return bufferedIncomingMessages.removeFirst()
+        }
+        if let inboundTerminalError { throw inboundTerminalError }
+        guard !directResponseRPCInFlight else {
+            throw PeerSessionError.concurrentReceiveOperation
+        }
+        let waiterID = UUID()
+        return try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { continuation in
+                incomingWaiters[waiterID] = continuation
+                startInboundPumpIfNeeded()
+            }
+        } onCancel: {
+            Task { await self.cancelIncomingWaiter(waiterID) }
+        }
+    }
+
+    private func cancelIncomingWaiter(_ waiterID: UUID) async {
+        let continuation = incomingWaiters.removeValue(forKey: waiterID)
+        continuation?.resume(throwing: CancellationError())
+        if continuation != nil, incomingWaiters.isEmpty, activeEnsureRequestIDs.isEmpty {
+            await terminateInbound(with: PeerSessionError.sessionClosed(reason: "receive cancelled"))
+        }
+    }
+
+    private func classifyIncoming(_ env: Termmesh_Peer_V1_Envelope) -> PeerIncomingMessage {
         switch env.payload {
         case .pong:
             // Liveness reply to a heartbeat Ping — refresh the timestamp
@@ -581,6 +890,14 @@ public actor PeerSession {
             gb.reason = reason
             env.goodbye = gb
         }
+        await terminateInbound(with: PeerSessionError.unexpectedEof)
+    }
+
+    /// Stop the single inbound reader and close its transport. Supplying a
+    /// `close` callback backed by `UnixSocketTransport.close()` is what turns
+    /// task cancellation into an actual unblock of Network.framework receive.
+    public func close(reason: String = "client closed") async {
+        await terminateInbound(with: PeerSessionError.sessionClosed(reason: reason))
     }
 
     // MARK: - Private: envelope plumbing
@@ -588,6 +905,17 @@ public actor PeerSession {
     private func nextSeq() -> UInt64 {
         seq += 1
         return seq
+    }
+
+    private func beginDirectResponseRPC() throws {
+        if let inboundTerminalError { throw inboundTerminalError }
+        guard !directResponseRPCInFlight,
+              activeEnsureRequestIDs.isEmpty,
+              incomingWaiters.isEmpty,
+              !inboundReadInProgress else {
+            throw PeerSessionError.concurrentReceiveOperation
+        }
+        directResponseRPCInFlight = true
     }
 
     private func sendEnvelope(configure: (inout Termmesh_Peer_V1_Envelope) -> Void) async throws {
