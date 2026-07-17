@@ -293,12 +293,12 @@ The single biggest missing piece. Reusable across both peers.
 - **Explicit-endpoint connect**: `sync.start` threads its currently-discarded
   `peer_id` into the spec; runner resolves it to `addr:port` + pinned identity
   and `SyncEndpoint::client.connect` / daemon listener `accept`. No discovery.
-- **v0 trust/identity provisioning** (Decision D3 — a real blocker): pairing
-  mutation is stubbed (`USER_PRESENCE_REQUIRED`), so two devices can't yet enter
-  each other's `TrustStore` through the product path. v0 needs a **test/dev-grade
-  trust-seeding path** (or a minimal local-bootstrap pairing) to provision
-  `DeviceTlsIdentity` + approved cert hashes. Scope this explicitly as
-  non-production for S0–S3.
+- **v0 trust/identity provisioning** (Decision D3 — RESOLVED): a
+  `sync/trust_bootstrap.rs` helper that provisions each daemon's
+  `DeviceTlsIdentity` and applies recovery-key-signed `DeviceGrant` records via
+  `apply_control_record` (the real trust mechanism; mirrors `tests/quic_router.rs`
+  `fn grant`). Only dev-grade concession: the recovery key is supplied directly,
+  not through the interactive user-presence flow. See §6 D3 for the exact recipe.
 - **Check:** `tests/sync_e2e.rs` spins two `SyncEndpoint`s (loopback), completes
   auth, and round-trips a control-lane message through the pump both directions.
   Assert delivery + lane integrity. No project data yet.
@@ -362,13 +362,35 @@ matrix row's e2e (all currently listed deferred).
   `open_with_runner_and_limits` and dispatch by `spec.kind` (map keyed by
   `OperationKind`, or a thin composite runner). Prefer the map — explicit and
   each runner stays single-purpose.
-- **D3 — v0 trust/identity provisioning (blocker).** Pairing mutation is stubbed
-  (`USER_PRESENCE_REQUIRED`), so there's no product path to get two devices into
-  each other's `TrustStore`. Options: (a) a **test/dev-only trust-seeding** entry
-  that provisions `DeviceTlsIdentity` + approved cert hashes (fastest to e2e,
-  clearly non-production); (b) a **minimal local-bootstrap pairing** that skips
-  user-presence for an explicit-endpoint bootstrap. Recommendation: (a) for
-  S0–S3, then (b)/real user-presence in S4. Must be confirmed — it gates all e2e.
+- **D3 — v0 trust/identity provisioning (blocker) — RESOLVED.** The concern was
+  that pairing mutation is stubbed (`USER_PRESENCE_REQUIRED`), so no product path
+  seeds two devices into each other's `TrustStore`. **Investigation resolved it:**
+  a device is approved by applying a **recovery-key-signed `DeviceGrant`
+  `CanonicalRecord` via `TrustStore::apply_control_record`** (`trust.rs:314,339`)
+  — real ed25519 crypto, verified against the `recovery_signing_public` the store
+  was opened with. **`USER_PRESENCE_REQUIRED` guards only the interactive
+  recovery-key export/import (O2), not grant application.** So **no TrustStore
+  backdoor is needed** — v0 uses the *real* trust mechanism with only one
+  dev-grade concession: the recovery key is supplied directly instead of through
+  the interactive user-presence/Keychain flow.
+
+  **Confirmed v0 recipe** (mirrors `tests/quic_router.rs:96–129`, helper
+  `fn grant` at `:54`):
+  1. Create/load the project recovery signing keypair (ed25519). Public half →
+     `TrustStore::open(path, project_id, recovery.verifying_key())` on each daemon.
+  2. Each daemon `DeviceTlsIdentity::generate()` (persist via `keychain.rs`).
+  3. Build a `DeviceGrant` (`ControlFields` + `DeviceGrantPayload {..,
+     tls_certificate_hash: identity.certificate_hash()}`), **sign with the
+     recovery private key**, at a **monotonically advancing roster epoch** per
+     device (A@1, B@2, …).
+  4. Apply **every** grant to **every** participating daemon's `TrustStore`
+     (`apply_control_record`) so each daemon trusts itself + the peer.
+
+  **Decision:** ship this as a `sync/trust_bootstrap.rs` dev/test helper (+ a
+  hidden `tm-agent sync bootstrap-trust` for the hardware e2e). Non-production
+  only because the recovery key is dev-managed. Production (S4) wires
+  `pairing.approve` to drive the *same* `apply_control_record` behind a real
+  local user-presence + Keychain flow. **This unblocks S0–S3.**
 - **D4 — where the lane↔QUIC pump lives.** New reusable `SyncConnection`
   (wrapping `AuthenticatedConnection` + `StreamRouter`), not runner-private, so
   both accept and connect sides share it and future features reuse it.
@@ -392,8 +414,10 @@ The math is built and unit-tested; **three composition gaps** remain, in order:
 (2) a **network-sync `OperationRunner`** that drives scan→manifest-exchange→
 reconcile→**build ApplyPlan**→chunk-transfer→apply and commits the oplog, and
 (3) a **cross-machine e2e** that proves a file on A appears byte-identical on B.
-Blocker to confirm first: v0 trust/identity provisioning (D3), since pairing is
-stubbed. Everything else (conflict, GC, fault-injection, scale, Bonjour) is S4+.
+The one-time blocker (D3, v0 trust provisioning) is **resolved**: apply
+recovery-key-signed `DeviceGrant` records via `apply_control_record` — real
+crypto, only the recovery key is dev-supplied. Everything else (conflict, GC,
+fault-injection, scale, Bonjour) is S4+.
 
 ---
 _§2 + §6 are filled from a five-layer interface survey (all `file:line`-cited);
