@@ -115,18 +115,16 @@ pub async fn exchange_manifests(
 }
 
 /// Receive a peer's manifest, reassembled from batch messages until the final
-/// flag. Non-`SyncOperation` lane traffic is ignored (not fatal), and the total
-/// is bounded against [`MAX_MANIFEST_ENTRIES`].
+/// flag. The manifest rides the `SyncOperation` lane; the total is bounded
+/// against [`MAX_MANIFEST_ENTRIES`].
 async fn recv_manifest(connection: &mut SyncConnection) -> Result<Vec<ManifestEntry>, String> {
     let mut entries = Vec::new();
     loop {
-        let (lane, payload) = tokio::time::timeout(EXCHANGE_TIMEOUT, connection.recv())
-            .await
-            .map_err(|_| "sync_exchange_failed".to_string())?
-            .ok_or_else(|| "sync_exchange_failed".to_string())?;
-        if lane != StreamLane::SyncOperation {
-            continue;
-        }
+        let payload =
+            tokio::time::timeout(EXCHANGE_TIMEOUT, connection.recv_lane(StreamLane::SyncOperation))
+                .await
+                .map_err(|_| "sync_exchange_failed".to_string())?
+                .ok_or_else(|| "sync_exchange_failed".to_string())?;
         let (is_final, batch) =
             decode_manifest_batch(&payload).map_err(|_| "sync_exchange_failed".to_string())?;
         entries.extend(batch);

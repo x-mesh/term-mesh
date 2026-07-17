@@ -169,16 +169,23 @@ impl<'a> Reader<'a> {
 
 // ── orchestration ───────────────────────────────────────────────────────────
 
+/// The next control message on the `SyncOperation` lane (request / header / done).
 async fn recv_syncop(connection: &mut SyncConnection) -> Result<Vec<u8>, String> {
-    loop {
-        let (lane, payload) = timeout(FETCH_TIMEOUT, connection.recv())
-            .await
-            .map_err(|_| "fetch_timeout".to_string())?
-            .ok_or_else(|| "fetch_closed".to_string())?;
-        if lane == StreamLane::SyncOperation {
-            return Ok(payload);
-        }
-    }
+    recv_on(connection, StreamLane::SyncOperation).await
+}
+
+/// The next chunk envelope on the `Blob` lane. Bulk transfer rides the Blob lane
+/// so a large file's chunks do not head-of-line block control traffic; the
+/// per-lane demux keeps the two from clobbering each other.
+async fn recv_blob(connection: &mut SyncConnection) -> Result<Vec<u8>, String> {
+    recv_on(connection, StreamLane::Blob).await
+}
+
+async fn recv_on(connection: &mut SyncConnection, lane: StreamLane) -> Result<Vec<u8>, String> {
+    timeout(FETCH_TIMEOUT, connection.recv_lane(lane))
+        .await
+        .map_err(|_| "fetch_timeout".to_string())?
+        .ok_or_else(|| "fetch_closed".to_string())
 }
 
 /// Number of `CHUNK_SIZE` chunks for a plaintext of `len` bytes.
@@ -219,10 +226,10 @@ pub async fn run_fetch_pull(
                 let mut staging = cas
                     .begin_stage(domain, object_id, length)
                     .map_err(|_| "cas_stage_failed".to_string())?;
-                // The header is immediately followed by exactly this object's
-                // chunks on the ordered lane.
+                // The header (SyncOperation lane) is followed by exactly this
+                // object's chunks on the Blob lane, in send order.
                 for _ in 0..expected {
-                    match decode_incoming(&recv_syncop(connection).await?)? {
+                    match decode_incoming(&recv_blob(connection).await?)? {
                         Incoming::Chunk {
                             object_id: chunk_object,
                             index,
@@ -281,12 +288,14 @@ pub async fn respond_to_fetch(
             .get_live(domain, object_id)
             .map_err(|_| "cas_read_failed".to_string())?
             .ok_or_else(|| "cas_object_missing".to_string())?;
+        // The header rode the SyncOperation lane; the bulk chunks ride the Blob
+        // lane so they do not head-of-line block control traffic.
         for index in 0..chunks(content.len() as u64) {
             let (_len, envelope) = live
                 .read_encrypted_chunk(index)
                 .map_err(|_| "cas_read_failed".to_string())?;
             sender
-                .send(StreamLane::SyncOperation, encode_chunk(object_id, index, &envelope))
+                .send(StreamLane::Blob, encode_chunk(object_id, index, &envelope))
                 .await
                 .map_err(|_| "fetch_send_failed".to_string())?;
         }

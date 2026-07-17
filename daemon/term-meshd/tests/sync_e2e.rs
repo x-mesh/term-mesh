@@ -134,4 +134,31 @@ async fn s0_two_daemons_bootstrap_trust_and_round_trip_lane_messages() {
     let (lane, payload) = recv_one(&mut server_conn).await;
     assert_eq!(lane, StreamLane::SyncOperation);
     assert_eq!(payload, op);
+
+    // Per-lane demux independence: draining one lane never consumes or discards
+    // another's messages. Enqueue a Blob frame and a SyncOperation frame, then
+    // pull SyncOperation *specifically* — the Blob frame must still be waiting on
+    // its own lane afterward. The old single-channel demux forced a filter-and-
+    // drop, so a reader after control would have lost the blob; per-lane inboxes
+    // are what let bulk transfer and control share one connection.
+    let blob = b"s0-blob-chunk".to_vec();
+    let ctrl = b"s0-syncop-after-blob".to_vec();
+    client_conn.send(StreamLane::Blob, blob.clone()).await.unwrap();
+    client_conn.send(StreamLane::SyncOperation, ctrl.clone()).await.unwrap();
+    let got_ctrl = tokio::time::timeout(
+        Duration::from_secs(5),
+        server_conn.recv_lane(StreamLane::SyncOperation),
+    )
+    .await
+    .expect("syncop recv timed out")
+    .expect("syncop lane closed");
+    assert_eq!(got_ctrl, ctrl, "recv_lane returned the SyncOperation frame");
+    let got_blob = tokio::time::timeout(
+        Duration::from_secs(5),
+        server_conn.recv_lane(StreamLane::Blob),
+    )
+    .await
+    .expect("blob recv timed out")
+    .expect("blob lane closed");
+    assert_eq!(got_blob, blob, "the Blob frame survived on its own lane");
 }

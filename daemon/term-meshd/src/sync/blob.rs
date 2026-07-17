@@ -135,13 +135,10 @@ pub async fn recv_object(
         .map_err(|_| "cas_stage_failed".to_string())?;
     let mut received = 0u32;
     while received < expected {
-        let (lane, payload) = timeout(BLOB_TIMEOUT, connection.recv())
+        let payload = timeout(BLOB_TIMEOUT, connection.recv_lane(StreamLane::Blob))
             .await
             .map_err(|_| "blob_recv_timeout".to_string())?
             .ok_or_else(|| "blob_recv_closed".to_string())?;
-        if lane != StreamLane::Blob {
-            continue;
-        }
         let (chunk_object, index, envelope) = parse_chunk(&payload)?;
         if chunk_object != object_id {
             continue;

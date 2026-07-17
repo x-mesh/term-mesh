@@ -37,6 +37,38 @@ pub enum SyncConnectionError {
     Closed,
 }
 
+/// The receiving end of the per-lane inbound queues. Each [`StreamLane`] lands in
+/// its own channel so a consumer can drain one lane (e.g. Blob chunks) without
+/// discarding another lane's messages (e.g. SyncOperation control): the earlier
+/// single-channel demux forced callers to filter-and-drop, so bulk transfer and
+/// control could not share a connection. Bounded, so a stalled reader applies
+/// back-pressure rather than growing without limit.
+struct LaneInbound {
+    control: mpsc::Receiver<Vec<u8>>,
+    terminal: mpsc::Receiver<Vec<u8>>,
+    sync_operation: mpsc::Receiver<Vec<u8>>,
+    blob: mpsc::Receiver<Vec<u8>>,
+}
+
+/// The sending end the demux routes each decoded message into, by lane.
+struct LaneOutbound {
+    control: mpsc::Sender<Vec<u8>>,
+    terminal: mpsc::Sender<Vec<u8>>,
+    sync_operation: mpsc::Sender<Vec<u8>>,
+    blob: mpsc::Sender<Vec<u8>>,
+}
+
+impl LaneOutbound {
+    fn for_lane(&self, lane: StreamLane) -> &mpsc::Sender<Vec<u8>> {
+        match lane {
+            StreamLane::Control => &self.control,
+            StreamLane::Terminal => &self.terminal,
+            StreamLane::SyncOperation => &self.sync_operation,
+            StreamLane::Blob => &self.blob,
+        }
+    }
+}
+
 /// An authenticated peer connection with a running lane↔QUIC pump.
 ///
 /// Enqueue outbound messages with [`SyncConnection::send`] (lane-prioritized and
@@ -50,7 +82,7 @@ pub struct SyncConnection {
     /// cheap clones.
     auth: AuthenticatedConnection,
     outbound: StreamRouterSender,
-    inbound: mpsc::Receiver<(StreamLane, Vec<u8>)>,
+    inbound: LaneInbound,
     send_pump: JoinHandle<()>,
     recv_demux: JoinHandle<()>,
 }
@@ -59,13 +91,27 @@ impl SyncConnection {
     /// Start the pump over an authenticated connection.
     pub fn start(auth: AuthenticatedConnection) -> Self {
         let (outbound, router) = StreamRouter::bounded();
-        let (inbound_tx, inbound) = mpsc::channel(INBOUND_CAPACITY);
+        let (control_tx, control) = mpsc::channel(INBOUND_CAPACITY);
+        let (terminal_tx, terminal) = mpsc::channel(INBOUND_CAPACITY);
+        let (sync_operation_tx, sync_operation) = mpsc::channel(INBOUND_CAPACITY);
+        let (blob_tx, blob) = mpsc::channel(INBOUND_CAPACITY);
+        let senders = LaneOutbound {
+            control: control_tx,
+            terminal: terminal_tx,
+            sync_operation: sync_operation_tx,
+            blob: blob_tx,
+        };
         let send_pump = tokio::spawn(send_loop(auth.connection.clone(), router));
-        let recv_demux = tokio::spawn(recv_loop(auth.connection.clone(), inbound_tx));
+        let recv_demux = tokio::spawn(recv_loop(auth.connection.clone(), senders));
         Self {
             auth,
             outbound,
-            inbound,
+            inbound: LaneInbound {
+                control,
+                terminal,
+                sync_operation,
+                blob,
+            },
             send_pump,
             recv_demux,
         }
@@ -91,10 +137,31 @@ impl SyncConnection {
             .map_err(|_| SyncConnectionError::Closed)
     }
 
-    /// Receive the next inbound `(lane, payload)`, or `None` once the peer closed
-    /// the connection and all in-flight messages have drained.
+    /// Receive the next inbound message on `lane` specifically, or `None` once the
+    /// connection closed and that lane's queue has drained. Messages on other
+    /// lanes stay queued in their own channels — they are not consumed or lost —
+    /// so a caller can drain one lane while another lane's traffic accumulates.
+    pub async fn recv_lane(&mut self, lane: StreamLane) -> Option<Vec<u8>> {
+        match lane {
+            StreamLane::Control => self.inbound.control.recv().await,
+            StreamLane::Terminal => self.inbound.terminal.recv().await,
+            StreamLane::SyncOperation => self.inbound.sync_operation.recv().await,
+            StreamLane::Blob => self.inbound.blob.recv().await,
+        }
+    }
+
+    /// Receive the next inbound `(lane, payload)` from whichever lane has one
+    /// ready, or `None` once the peer closed the connection and every lane has
+    /// drained. Use [`SyncConnection::recv_lane`] when a caller wants one lane
+    /// specifically without draining the others.
     pub async fn recv(&mut self) -> Option<(StreamLane, Vec<u8>)> {
-        self.inbound.recv().await
+        tokio::select! {
+            Some(payload) = self.inbound.control.recv() => Some((StreamLane::Control, payload)),
+            Some(payload) = self.inbound.terminal.recv() => Some((StreamLane::Terminal, payload)),
+            Some(payload) = self.inbound.sync_operation.recv() => Some((StreamLane::SyncOperation, payload)),
+            Some(payload) = self.inbound.blob.recv() => Some((StreamLane::Blob, payload)),
+            else => None,
+        }
     }
 }
 
@@ -132,19 +199,22 @@ async fn write_message(
     Ok(())
 }
 
-/// Accept inbound uni streams and deliver each decoded message to `inbound`.
-/// Reads streams sequentially: correct + ordered for S0, and the blob lane's own
-/// back-pressure lives in S2's transfer loop, not here. Exits when the peer
-/// closes the connection or the inbound receiver is dropped.
-async fn recv_loop(connection: Connection, inbound: mpsc::Sender<(StreamLane, Vec<u8>)>) {
+/// Accept inbound uni streams and deliver each decoded message to its lane's
+/// queue. Reads streams sequentially, so per-lane order matches send order (the
+/// fetch/manifest protocols rely on it) — a big blob stream still blocks reading
+/// the next stream, which per-lane concurrent reads would fix, but that is a
+/// throughput optimization, not a correctness need. Exits when the peer closes
+/// the connection or a lane's receiver is dropped (the whole `SyncConnection`
+/// went away).
+async fn recv_loop(connection: Connection, lanes: LaneOutbound) {
     loop {
         let stream = match connection.accept_uni().await {
             Ok(stream) => stream,
             Err(_) => break,
         };
         match read_message(stream).await {
-            Ok(message) => {
-                if inbound.send(message).await.is_err() {
+            Ok((lane, payload)) => {
+                if lanes.for_lane(lane).send(payload).await.is_err() {
                     break;
                 }
             }
