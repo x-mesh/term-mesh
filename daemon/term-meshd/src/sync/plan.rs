@@ -19,6 +19,11 @@ use super::{EntryKind, ManifestEntry};
 const MAX_ENTRIES: usize = 4_000_000;
 const MAX_PATH_BYTES: usize = 4096;
 
+/// Target encoded size per manifest batch message. Kept well under the
+/// `SyncOperation` lane's 8 MiB message cap so a large manifest is streamed as
+/// many bounded messages rather than one oversized one the router would reject.
+const MANIFEST_BATCH_BYTES: usize = 512 * 1024;
+
 /// One entry the destination must transfer from the source to converge.
 /// Mirrors the source `ManifestEntry`; carried separately so S2 can attach the
 /// resolved CAS object id without mutating the manifest type.
@@ -210,6 +215,54 @@ pub fn decode_entries(input: &[u8]) -> Result<Vec<ManifestEntry>, ManifestWireEr
     Ok(entries)
 }
 
+/// Encoded byte length one entry contributes to [`encode_entries`] (excludes
+/// the list's leading count). Used to size batches by bytes rather than a fixed
+/// entry count, so batches stay bounded regardless of path length.
+fn entry_encoded_len(entry: &ManifestEntry) -> usize {
+    1 + 1 + 8 + 32 + 4 + entry.relative_path.len() + 4 + entry.symlink_target.as_deref().map_or(0, str::len)
+}
+
+/// Split a manifest into batch messages for the `SyncOperation` lane, each
+/// framed `[final: u8][encode_entries(chunk)]`. Batches are cut on a byte budget
+/// ([`MANIFEST_BATCH_BYTES`]) so no single message approaches the lane cap; the
+/// last batch (and only it) carries `final = 1`. An empty manifest yields one
+/// final empty batch, so the receiver always sees a terminator.
+pub fn encode_manifest_batches(entries: &[ManifestEntry]) -> Vec<Vec<u8>> {
+    let mut groups: Vec<Vec<&ManifestEntry>> = vec![Vec::new()];
+    let mut group_bytes = 0usize;
+    for entry in entries {
+        let len = entry_encoded_len(entry);
+        let current = groups.last_mut().unwrap();
+        if !current.is_empty() && group_bytes + len > MANIFEST_BATCH_BYTES {
+            groups.push(Vec::new());
+            group_bytes = 0;
+        }
+        groups.last_mut().unwrap().push(entry);
+        group_bytes += len;
+    }
+    let last = groups.len() - 1;
+    groups
+        .into_iter()
+        .enumerate()
+        .map(|(index, group)| {
+            let owned: Vec<ManifestEntry> = group.into_iter().cloned().collect();
+            let mut message = Vec::with_capacity(1 + owned.len() * 96);
+            message.push(u8::from(index == last));
+            message.extend_from_slice(&encode_entries(&owned));
+            message
+        })
+        .collect()
+}
+
+/// Decode one batch message from [`encode_manifest_batches`]:
+/// `(is_final, entries)`.
+pub fn decode_manifest_batch(
+    payload: &[u8],
+) -> Result<(bool, Vec<ManifestEntry>), ManifestWireError> {
+    let (flag, rest) = payload.split_first().ok_or(ManifestWireError::Truncated)?;
+    Ok((*flag != 0, decode_entries(rest)?))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -301,5 +354,56 @@ mod tests {
             decode_entries(&[0, 0, 0, 5]),
             Err(ManifestWireError::Truncated)
         );
+    }
+
+    /// Reassemble a batched manifest by feeding batches to `decode_manifest_batch`
+    /// until the final flag, mirroring the receiver loop.
+    fn reassemble(batches: &[Vec<u8>]) -> Vec<ManifestEntry> {
+        let mut out = Vec::new();
+        let mut saw_final = false;
+        for batch in batches {
+            let (is_final, entries) = decode_manifest_batch(batch).unwrap();
+            out.extend(entries);
+            if is_final {
+                saw_final = true;
+                break;
+            }
+        }
+        assert!(saw_final, "batch stream must end with a final batch");
+        out
+    }
+
+    #[test]
+    fn small_manifest_is_a_single_final_batch() {
+        let entries = vec![file("a", 1, false), file("b", 2, true)];
+        let batches = encode_manifest_batches(&entries);
+        assert_eq!(batches.len(), 1);
+        assert_eq!(batches[0][0], 1, "the only batch is final");
+        assert_eq!(reassemble(&batches), entries);
+    }
+
+    #[test]
+    fn empty_manifest_still_emits_one_final_batch() {
+        let batches = encode_manifest_batches(&[]);
+        assert_eq!(batches.len(), 1);
+        assert_eq!(batches[0][0], 1);
+        assert_eq!(reassemble(&batches), Vec::<ManifestEntry>::new());
+    }
+
+    #[test]
+    fn large_manifest_spans_many_batches_and_round_trips() {
+        // Long paths force several 512 KiB batches well before MAX_ENTRIES.
+        let entries: Vec<ManifestEntry> = (0..40_000)
+            .map(|i| file(&format!("deeply/nested/path/segment/file-{i:08}.dat"), (i % 251) as u8, i % 2 == 0))
+            .collect();
+        let batches = encode_manifest_batches(&entries);
+        assert!(batches.len() > 1, "a large manifest must page into >1 batch");
+        // Only the last batch is final.
+        for (index, batch) in batches.iter().enumerate() {
+            let expected = u8::from(index == batches.len() - 1);
+            assert_eq!(batch[0], expected, "final flag wrong at batch {index}");
+            assert!(batch.len() <= MANIFEST_BATCH_BYTES + 4096, "batch {index} exceeds budget");
+        }
+        assert_eq!(reassemble(&batches), entries);
     }
 }

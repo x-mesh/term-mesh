@@ -21,15 +21,19 @@ use std::time::Duration;
 use sync_protocol::{SyncHello, PROJECT_SYNC_CAPABILITY, PROTOCOL_V1};
 
 use super::{
-    decode_entries, diff_manifests, encode_entries, DeviceTlsIdentity, ManifestBuilder,
-    ManifestEntry, ManifestScanner, OperationResult, OperationSpec, ScanCheckpoint, ScanError,
-    ScanLimits, ScanObserver, ScanReason, StreamLane, SyncConnection, SyncEndpoint, SyncTransport,
-    TrustStore,
+    decode_manifest_batch, diff_manifests, encode_manifest_batches, DeviceTlsIdentity,
+    ManifestBuilder, ManifestEntry, ManifestScanner, OperationResult, OperationSpec, ScanCheckpoint,
+    ScanError, ScanLimits, ScanObserver, ScanReason, StreamLane, SyncConnection, SyncEndpoint,
+    SyncTransport, TrustStore,
 };
 
-/// How long to wait for the peer's manifest on the sync-operation lane before
-/// failing the operation.
+/// How long to wait for the next manifest batch on the sync-operation lane
+/// before failing the operation.
 const EXCHANGE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Cap on the total entries accepted from a peer's manifest across all batches
+/// (untrusted input); matches `plan.rs`'s per-batch `MAX_ENTRIES`.
+const MAX_MANIFEST_ENTRIES: usize = 4_000_000;
 
 /// Resolves a peer id (as supplied to `sync.start`) to a QUIC endpoint address.
 ///
@@ -89,18 +93,49 @@ pub async fn exchange_manifests(
     connection: &mut SyncConnection,
     local: &[ManifestEntry],
 ) -> Result<Vec<ManifestEntry>, String> {
-    connection
-        .send(StreamLane::SyncOperation, encode_entries(local))
-        .await
-        .map_err(|_| "sync_exchange_failed".to_string())?;
-    let (lane, payload) = tokio::time::timeout(EXCHANGE_TIMEOUT, connection.recv())
-        .await
-        .map_err(|_| "sync_exchange_failed".to_string())?
-        .ok_or_else(|| "sync_exchange_failed".to_string())?;
-    if lane != StreamLane::SyncOperation {
-        return Err("sync_exchange_failed".to_string());
+    let sender = connection.sender();
+    let batches = encode_manifest_batches(local);
+    // Send all local batches and receive all remote batches CONCURRENTLY. A
+    // large manifest pages into many messages; "send everything, then receive"
+    // would fill both peers' flow-control windows and deadlock, so the two
+    // directions run together.
+    let send = async move {
+        for batch in batches {
+            sender
+                .send(StreamLane::SyncOperation, batch)
+                .await
+                .map_err(|_| "sync_exchange_failed".to_string())?;
+        }
+        Ok::<(), String>(())
+    };
+    let (send_result, recv_result) = tokio::join!(send, recv_manifest(connection));
+    send_result?;
+    recv_result
+}
+
+/// Receive a peer's manifest, reassembled from batch messages until the final
+/// flag. Non-`SyncOperation` lane traffic is ignored (not fatal), and the total
+/// is bounded against [`MAX_MANIFEST_ENTRIES`].
+async fn recv_manifest(connection: &mut SyncConnection) -> Result<Vec<ManifestEntry>, String> {
+    let mut entries = Vec::new();
+    loop {
+        let (lane, payload) = tokio::time::timeout(EXCHANGE_TIMEOUT, connection.recv())
+            .await
+            .map_err(|_| "sync_exchange_failed".to_string())?
+            .ok_or_else(|| "sync_exchange_failed".to_string())?;
+        if lane != StreamLane::SyncOperation {
+            continue;
+        }
+        let (is_final, batch) =
+            decode_manifest_batch(&payload).map_err(|_| "sync_exchange_failed".to_string())?;
+        entries.extend(batch);
+        if entries.len() > MAX_MANIFEST_ENTRIES {
+            return Err("sync_exchange_failed".to_string());
+        }
+        if is_final {
+            return Ok(entries);
+        }
     }
-    decode_entries(&payload).map_err(|_| "sync_exchange_failed".to_string())
 }
 
 /// Dials a peer and drives the manifest exchange for an `OperationKind::Sync`

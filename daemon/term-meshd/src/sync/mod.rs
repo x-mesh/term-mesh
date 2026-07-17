@@ -121,7 +121,8 @@ pub use network_runner::{
 };
 #[allow(unused_imports)]
 pub use plan::{
-    decode_entries, diff_manifests, encode_entries, FetchEntry, ManifestDiff, ManifestWireError,
+    decode_entries, decode_manifest_batch, diff_manifests, encode_entries, encode_manifest_batches,
+    FetchEntry, ManifestDiff, ManifestWireError,
 };
 #[allow(unused_imports)]
 pub use sync_connection::{SyncConnection, SyncConnectionError};
