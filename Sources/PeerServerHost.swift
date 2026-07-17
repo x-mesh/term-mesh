@@ -360,10 +360,23 @@ final class PeerHostCoordinator: NSObject {
             forName: .peerWorkspaceDidClose,
             object: nil,
             queue: .main
-        ) { [weak server] note in
+        ) { [weak self, weak server] note in
             guard let server,
                   let workspaceID = note.userInfo?["workspaceID"] as? UUID
             else { return }
+            // Defense-in-depth, not a correctness fix: any layout-change
+            // broadcast still pending for this exact workspace_id can
+            // never actually resurrect it on the wire even if left to
+            // fire — scheduleLayoutBroadcast's debounced task re-queries
+            // provider.listWorkspaces() live at fire-time (never a cached
+            // snapshot), and by the time that 120 ms debounce elapses,
+            // TabManager.closeWorkspace's synchronous tabs.remove(at:)
+            // has long since made the workspace genuinely absent, so the
+            // task's own `guard let updated = ... else { return }` no-ops.
+            // Cancelling here just avoids a redundant listWorkspaces()
+            // call and closes the narrow theoretical window where an
+            // in-flight broadcast Task races this one on the wire.
+            self?.layoutBroadcastDebounce.removeValue(forKey: workspaceID)?.cancel()
             let idBytes = withUnsafeBytes(of: workspaceID.uuid) { Data($0) }
             #if DEBUG
             dlog("peer.host.broadcastWorkspaceRemoved id=\(workspaceID.uuidString.prefix(8))")

@@ -968,6 +968,21 @@ class TabManager: ObservableObject {
             let replacement = addWorkspace(select: true)
             tabs.remove(at: tabs.firstIndex(where: { $0.id == workspace.id }) ?? index)
             selectedTabId = replacement.id
+
+            // Peer federation: the WorkspaceRemoved push below only tells
+            // attached clients the OLD workspace_id is gone — without this,
+            // a push-only viewer's roster goes from "1 workspace" to "0"
+            // and never learns the replacement exists (it never gets a
+            // ListWorkspaces re-poll). `replacement`'s own bonsplit
+            // delegate hasn't fired yet (wired up after Workspace.init
+            // returns), so nothing else announces it — post the same
+            // layout-changed signal a normal new-tab/split does.
+            // PeerHostCoordinator's existing debounce (120 ms) plus
+            // GhosttyPaneSurfaceProvider.listWorkspaces()'s own lazy-surface
+            // poll (up to 300 ms) already tolerate the replacement's
+            // ghostty_surface_t not being ready yet at this exact instant —
+            // no extra "wait for pane" step is needed here.
+            replacement.postPeerLayoutChange()
         }
 
         // Peer federation: tell PeerHostCoordinator this workspace_id is

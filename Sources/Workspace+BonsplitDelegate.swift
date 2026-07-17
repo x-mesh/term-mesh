@@ -839,7 +839,15 @@ extension Workspace: BonsplitDelegate {
     /// every bonsplit delegate event that can change what a relay
     /// client should render: split tree changes, tab selection, tab
     /// close.
-    fileprivate func postPeerLayoutChange() {
+    ///
+    /// Not `fileprivate`: `TabManager.closeWorkspace`'s last-tab
+    /// self-heal branch also calls this directly on a just-created
+    /// replacement workspace — that workspace's own bonsplit delegate
+    /// callbacks never fire during `Workspace.init()` (the delegate is
+    /// wired up after `self` exists), so without an explicit call here
+    /// a self-healed workspace would never announce itself to already
+    /// attached peers.
+    func postPeerLayoutChange() {
         NotificationCenter.default.post(
             name: .peerWorkspaceLayoutDidChange,
             object: nil,
