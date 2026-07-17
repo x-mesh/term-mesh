@@ -2131,6 +2131,30 @@ final class Workspace: Identifiable, ObservableObject {
         return !peerMirror.isApplyingRemoteLayout && !peerMirror.isTornDown
     }
 
+    /// Host key of this workspace's "dominant" remote pane, for the
+    /// titlebar/sidebar host chip (pane-mixing model — a workspace can
+    /// hold a mix of local and remote panes, unlike `peerMirror` above).
+    /// Prefers the focused panel's host so the chip tracks "where my
+    /// keystrokes go right now" (same rationale as
+    /// `PeerTitlebarAccentController`); falls back to the first remote
+    /// panel found so a workspace with only remote panes (none focused,
+    /// or focus on a local pane) still shows a chip. `panels` is
+    /// unordered, so a workspace mixing panes from DIFFERENT hosts has
+    /// no stable "first" beyond focus — rare in practice (splitting a
+    /// remote pane normally stays on the same host). nil for purely
+    /// local workspaces.
+    var dominantRemoteHostKey: PeerPaneHostKey? {
+        if let focusedPanelId, let hostKey = (panels[focusedPanelId] as? TerminalPanel)?.remoteHostKey {
+            return hostKey
+        }
+        for panel in panels.values {
+            if let hostKey = (panel as? TerminalPanel)?.remoteHostKey {
+                return hostKey
+            }
+        }
+        return nil
+    }
+
     /// Host a remote peer surface as a NORMAL Bonsplit pane: split from
     /// the focused panel with the relay binary as the pane's shell, hand
     /// the panel ownership of `session`, and start pumping. Layout stays
