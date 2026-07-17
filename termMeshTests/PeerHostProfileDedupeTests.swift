@@ -89,6 +89,51 @@ final class PeerHostProfileDedupeTests: XCTestCase {
         XCTAssertEqual(result[1].sshTarget, "host-b")
     }
 
+    /// Regression for a panel-review finding: the previous
+    /// `pickSurvivor` picked the max `lastConnectedAt` via
+    /// `.filter(...).max(by:)` and returned immediately once ANY
+    /// profile in the group had a date — so two duplicates sharing the
+    /// EXACT SAME timestamp never fell through to the `remoteSocket`
+    /// tiebreaker at all. Both entries here have an identical
+    /// `lastConnectedAt`; only `remoteSocket` distinguishes them, so the
+    /// one with a non-empty socket must win.
+    func test_dedupedBySSHTarget_tiedLastConnectedAt_fallsBackToNonEmptyRemoteSocket() {
+        let sameInstant = Date(timeIntervalSince1970: 500)
+        let noSocket = profile(
+            sshTarget: "host-a", remoteSocket: "", lastConnectedAt: sameInstant
+        )
+        let withSocket = profile(
+            sshTarget: "host-a", remoteSocket: "sockTied", lastConnectedAt: sameInstant
+        )
+
+        guard let result = PeerHostProfileStore.dedupedBySSHTarget([noSocket, withSocket]) else {
+            return XCTFail("expected a merge")
+        }
+        XCTAssertEqual(result.count, 1)
+        XCTAssertEqual(result[0].id, withSocket.id, "tied lastConnectedAt must fall back to remoteSocket")
+        XCTAssertEqual(result[0].remoteSocket, "sockTied")
+    }
+
+    /// Same tie-break contract, but with the socket-bearing duplicate
+    /// listed FIRST — proves the fix isn't accidentally order-dependent
+    /// (a naive "only replace on later index wins ties" implementation
+    /// could pass the test above by luck while still being wrong here).
+    func test_dedupedBySSHTarget_tiedLastConnectedAt_socketFirstStillWins() {
+        let sameInstant = Date(timeIntervalSince1970: 500)
+        let withSocket = profile(
+            sshTarget: "host-a", remoteSocket: "sockTied", lastConnectedAt: sameInstant
+        )
+        let noSocket = profile(
+            sshTarget: "host-a", remoteSocket: "", lastConnectedAt: sameInstant
+        )
+
+        guard let result = PeerHostProfileStore.dedupedBySSHTarget([withSocket, noSocket]) else {
+            return XCTFail("expected a merge")
+        }
+        XCTAssertEqual(result.count, 1)
+        XCTAssertEqual(result[0].id, withSocket.id, "tied lastConnectedAt must fall back to remoteSocket")
+    }
+
     func test_dedupedBySSHTarget_fallsBackToNonEmptyRemoteSocket_whenNeitherHasLastConnectedAt() {
         let noSocket = profile(sshTarget: "host-a", remoteSocket: "")
         let withSocket = profile(sshTarget: "host-a", remoteSocket: "sockB")

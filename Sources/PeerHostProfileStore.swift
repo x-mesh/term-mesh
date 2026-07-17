@@ -176,16 +176,45 @@ final class PeerHostProfileStore: ObservableObject {
         return result
     }
 
+    /// Single-pass multi-key selection, replacing `best` only on a
+    /// STRICT improvement — that's what makes tier 3 ("first entry in
+    /// array order") fall out for free on a full tie, instead of
+    /// needing its own branch.
+    ///
+    /// The previous implementation used `group.filter(...).max(by:
+    /// lastConnectedAt <)`, which returns as soon as ANY profile in the
+    /// group has a non-nil `lastConnectedAt` — so two dated duplicates
+    /// with the exact same timestamp (or, less obviously, ANY group
+    /// where more than one entry has a date) never fell through to the
+    /// `remoteSocket` tier at all: `max(by:)` picks between them on
+    /// date alone and returns immediately, regardless of ties.
     nonisolated private static func pickSurvivor(_ group: [PeerHostProfile]) -> PeerHostProfile {
-        if let mostRecent = group
-            .filter({ $0.lastConnectedAt != nil })
-            .max(by: { $0.lastConnectedAt! < $1.lastConnectedAt! }) {
-            return mostRecent
+        var best = group[0]
+        for candidate in group.dropFirst() where isBetterSurvivor(candidate, than: best) {
+            best = candidate
         }
-        if let withSocket = group.first(where: { !$0.remoteSocket.isEmpty }) {
-            return withSocket
+        return best
+    }
+
+    /// `true` iff `candidate` should replace `current` under the
+    /// documented tier order: (1) more recent `lastConnectedAt` (nil
+    /// sorts last), (2) on a tie there, a non-empty `remoteSocket`,
+    /// (3) on a further tie, keep `current` (earlier array order) —
+    /// expressed here as "no more comparisons left, not better."
+    nonisolated private static func isBetterSurvivor(
+        _ candidate: PeerHostProfile, than current: PeerHostProfile
+    ) -> Bool {
+        switch (candidate.lastConnectedAt, current.lastConnectedAt) {
+        case let (c?, b?) where c != b:
+            return c > b
+        case (.some, nil):
+            return true
+        case (nil, .some):
+            return false
+        default:
+            break // both nil, or an exact date tie — fall through to tier 2
         }
-        return group[0]
+        return !candidate.remoteSocket.isEmpty && current.remoteSocket.isEmpty
     }
 
     nonisolated private static func backfill(
