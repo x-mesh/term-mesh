@@ -345,7 +345,12 @@ impl HeadlessOneShotRunner {
             message.len(),
             !input.delta.trim().is_empty()
         );
-        let _ = self.manager.lock().await.send_message(&agent_id, &message).await;
+        let _ = self
+            .manager
+            .lock()
+            .await
+            .send_message(&agent_id, &message)
+            .await;
 
         // 3. Wait for the settled verdict (or timeout). For claude we wait for the
         // terminal stream-json result event (a mid-turn thinking/tool pause must
@@ -386,7 +391,10 @@ impl HeadlessOneShotRunner {
                     check_id,
                     verdict_text.chars().take(200).collect::<String>()
                 );
-                Some(format!("collection failed: {}", verdict_text.chars().take(100).collect::<String>()))
+                Some(format!(
+                    "collection failed: {}",
+                    verdict_text.chars().take(100).collect::<String>()
+                ))
             }
             _ => None,
         };
@@ -396,7 +404,7 @@ impl HeadlessOneShotRunner {
             drift_kind,
             target,
             spawned: true,
-            reported: reported && !collection_error,  // Don't mark as reported if it's an error
+            reported: reported && !collection_error, // Don't mark as reported if it's an error
             terminated,
             exit_status: status,
             panel_id: None,
@@ -440,7 +448,13 @@ impl HeadlessOneShotRunner {
         // 1. Recycle (hard restart) → drop accumulated context = stateless check.
         if let Err(e) = app_recycle_pane(app_socket, &input.team_name, WATCHER).await {
             let msg = format!("recycle failed: {e}");
-            return make(false, false, WatchExitStatus::SpawnFailed, msg.clone(), Some(msg));
+            return make(
+                false,
+                false,
+                WatchExitStatus::SpawnFailed,
+                msg.clone(),
+                Some(msg),
+            );
         }
         // 2. Wait for the respawned CLI to finish cold-starting, then add an
         //    input-ready buffer: live testing showed the prompt is dropped when it
@@ -496,8 +510,7 @@ impl HeadlessOneShotRunner {
                 // parse/RPC failure (pane mid-transition, app momentarily busy)
                 // must not kill the whole tick. Keep the last error for the
                 // timeout message.
-                if let Err(e) =
-                    app_send_pane(app_socket, &input.team_name, WATCHER, &message).await
+                if let Err(e) = app_send_pane(app_socket, &input.team_name, WATCHER, &message).await
                 {
                     last_send_err = Some(format!("send: {e}"));
                 } else if let Err(e) =
@@ -530,7 +543,13 @@ impl HeadlessOneShotRunner {
                         "verdict timeout (watcher wrote no reply before reply_timeout)".to_string()
                     }
                 };
-                return make(true, false, WatchExitStatus::Timeout, String::new(), Some(msg));
+                return make(
+                    true,
+                    false,
+                    WatchExitStatus::Timeout,
+                    String::new(),
+                    Some(msg),
+                );
             }
             tokio::time::sleep(Duration::from_millis(400)).await;
         }
@@ -615,7 +634,10 @@ pub(crate) fn extract_verdict_text(raw_lines: &[String]) -> String {
 /// app) AND a live app socket is available to drive recycle/send/read on the
 /// pane. Otherwise the tick uses the headless one-shot spawn.
 fn should_use_gui_pane_path(is_headless_team: bool, app_socket_path: Option<&str>) -> bool {
-    !is_headless_team && app_socket_path.map(|s| !s.trim().is_empty()).unwrap_or(false)
+    !is_headless_team
+        && app_socket_path
+            .map(|s| !s.trim().is_empty())
+            .unwrap_or(false)
 }
 
 // ── §4 P2b-1: daemon → Swift-app RPC client ─────────────────────────────────
@@ -648,13 +670,24 @@ async fn call_app_rpc(
     wr.flush().await.map_err(|e| format!("flush: {e}"))?;
     let mut resp = String::new();
     let mut reader = BufReader::new(rd);
-    match timeout(Duration::from_secs(timeout_secs), reader.read_line(&mut resp)).await {
+    match timeout(
+        Duration::from_secs(timeout_secs),
+        reader.read_line(&mut resp),
+    )
+    .await
+    {
         Ok(Ok(_)) => {}
         Ok(Err(e)) => return Err(format!("read: {e}")),
-        Err(_) => return Err(format!("app rpc '{method}' timed out after {timeout_secs}s")),
+        Err(_) => {
+            return Err(format!(
+                "app rpc '{method}' timed out after {timeout_secs}s"
+            ))
+        }
     }
     if resp.trim().is_empty() {
-        return Err(format!("app rpc '{method}': empty response (app unreachable?)"));
+        return Err(format!(
+            "app rpc '{method}': empty response (app unreachable?)"
+        ));
     }
     serde_json::from_str(&resp).map_err(|e| format!("parse '{method}' response: {e}"))
 }
@@ -688,7 +721,12 @@ async fn app_recycle_pane(app_socket: &str, team: &str, agent: &str) -> Result<(
 
 /// §4 GUI path: send the review prompt text to the watcher pane.
 #[allow(dead_code)]
-async fn app_send_pane(app_socket: &str, team: &str, agent: &str, text: &str) -> Result<(), String> {
+async fn app_send_pane(
+    app_socket: &str,
+    team: &str,
+    agent: &str,
+    text: &str,
+) -> Result<(), String> {
     let v = call_app_rpc(
         app_socket,
         "team.send",
@@ -969,7 +1007,8 @@ mod tests {
         // Only the terminal turn.completed settles; earlier codex events must not.
         let pre = vec![
             r#"{"type":"thread.started"}"#.to_string(),
-            r#"{"type":"item.completed","item":{"type":"agent_message","text":"partial"}}"#.to_string(),
+            r#"{"type":"item.completed","item":{"type":"agent_message","text":"partial"}}"#
+                .to_string(),
         ];
         assert!(!has_result_event(&pre));
     }
@@ -1005,7 +1044,9 @@ mod tests {
         // ~/.term-mesh/results/<team>/<agent>-reply.md (canonical, full content).
         let p = watcher_reply_path("ws-abc123", "watcher").expect("home dir");
         assert!(p.ends_with("watcher-reply.md"));
-        assert!(p.to_string_lossy().contains(".term-mesh/results/ws-abc123/"));
+        assert!(p
+            .to_string_lossy()
+            .contains(".term-mesh/results/ws-abc123/"));
     }
 
     #[test]
@@ -1089,7 +1130,10 @@ mod tests {
 
         assert!(outcome.spawned && outcome.reported && outcome.terminated);
         assert_eq!(outcome.exit_status, WatchExitStatus::Replied);
-        assert!(outcome.panel_id.is_none(), "headless watcher must not own a pane");
+        assert!(
+            outcome.panel_id.is_none(),
+            "headless watcher must not own a pane"
+        );
         assert_eq!(outcome.verdict_text, "[VERDICT] on-track");
 
         let got = runner.received.lock().await;
@@ -1132,7 +1176,10 @@ mod tests {
 
         assert!(outcome.spawned, "spawn should succeed with the fake CLI");
         assert!(outcome.terminated, "the one-shot watcher must be reaped");
-        assert!(outcome.panel_id.is_none(), "headless one-shot never owns a pane");
+        assert!(
+            outcome.panel_id.is_none(),
+            "headless one-shot never owns a pane"
+        );
         // Fake CLI emits no verdict → timeout, no settled report.
         assert_eq!(outcome.exit_status, WatchExitStatus::Timeout);
         assert!(!outcome.reported);

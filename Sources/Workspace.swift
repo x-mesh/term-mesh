@@ -11,6 +11,7 @@ import CoreText
 @MainActor
 final class Workspace: Identifiable, ObservableObject {
     let id: UUID
+    lazy var retrievalStore = WorkspaceRetrievalStore(workspaceID: id)
     @Published var title: String
     @Published var customTitle: String?
     @Published var isPinned: Bool = false
@@ -2168,7 +2169,9 @@ final class Workspace: Identifiable, ObservableObject {
         session: PeerPaneSession,
         orientation: SplitOrientation = .horizontal,
         focus: Bool = true,
-        from explicitSourcePanelId: UUID? = nil
+        from explicitSourcePanelId: UUID? = nil,
+        lifetime: RemotePaneLifetime = .temporary,
+        bindingRole: PaneBindingRole = .owned
     ) -> TerminalPanel? {
         guard let sourcePanelId = explicitSourcePanelId ?? focusedPanelId,
               let panel = newTerminalSplit(
@@ -2179,7 +2182,12 @@ final class Workspace: Identifiable, ObservableObject {
                   environment: session.relayEnvironment
               )
         else { return nil }
-        bindRemotePane(session: session, to: panel)
+        bindRemotePane(
+            session: session,
+            to: panel,
+            lifetime: lifetime,
+            bindingRole: bindingRole
+        )
         return panel
     }
 
@@ -2188,8 +2196,33 @@ final class Workspace: Identifiable, ObservableObject {
     /// host signals, disconnect banner, and relay start. Split out of
     /// `openRemotePane` so the workspace-mirror flow can bind a fresh
     /// workspace's INITIAL panel the same way.
-    func bindRemotePane(session: PeerPaneSession, to panel: TerminalPanel) {
+    func bindRemotePane(
+        session: PeerPaneSession,
+        to panel: TerminalPanel,
+        lifetime: RemotePaneLifetime = .temporary,
+        bindingRole: PaneBindingRole = .owned
+    ) {
         panel.peerPaneSession = session
+        let remotePaneID = Self.remotePaneID(from: session.originSurface.surfaceID)
+        panel.remotePaneID = remotePaneID
+        panel.remotePaneLifetime = lifetime
+        panel.remotePaneBindingRole = bindingRole
+        retrievalStore.registerPane(
+            WorkspaceRemotePaneRecord(
+                id: remotePaneID,
+                panelID: panel.id,
+                sessionID: RemoteSessionID(),
+                hostLabel: session.lease.key.shortLabel,
+                sshTarget: session.lease.key.sshTarget,
+                title: session.surfaceTitle.isEmpty ? "Remote Terminal" : session.surfaceTitle,
+                remoteRoot: session.originSurface.cwd,
+                lifetime: lifetime,
+                bindingRole: bindingRole,
+                state: .running,
+                hasUncollectedChanges: true
+            ),
+            localOrigin: currentDirectory
+        )
         if !session.surfaceTitle.isEmpty {
             panel.updateTitle(session.surfaceTitle)
         }
@@ -2258,6 +2291,152 @@ final class Workspace: Identifiable, ObservableObject {
                 _ = panel
             }
         }
+    }
+
+    func checkpointRemotePane(panelID: UUID, closeAfterCheckpoint: Bool) async {
+        guard let pane = retrievalStore.pane(panelID: panelID),
+              let binding = retrievalStore.projectBinding(for: pane),
+              let sshTarget = pane.sshTarget else {
+            retrievalStore.failCheckpoint(
+                panelID: panelID,
+                message: "Checkpoint requires an SSH peer and a Git project path on both machines."
+            )
+            return
+        }
+        retrievalStore.beginCheckpoint(panelID: panelID)
+        do {
+            let result = try await RemoteGitCheckpointService.shared.checkpointAndFetch(
+                paneID: pane.id,
+                projectBindingID: binding.id,
+                sshTarget: sshTarget,
+                remoteRoot: binding.remoteRoot,
+                localOrigin: binding.localRoot,
+                boundary: .checkpointNow
+            )
+            retrievalStore.completeCheckpoint(panelID: panelID, result: result)
+            retrievalStore.pendingClosePanelID = nil
+            if closeAfterCheckpoint {
+                _ = closePanel(panelID, force: true)
+            }
+        } catch {
+            retrievalStore.failCheckpoint(panelID: panelID, message: error.localizedDescription)
+        }
+    }
+
+    func seedRemoteProject(panelID: UUID) async {
+        guard let pane = retrievalStore.pane(panelID: panelID),
+              let binding = retrievalStore.projectBinding(for: pane),
+              let sshTarget = pane.sshTarget else {
+            retrievalStore.errorMessage = "Project preparation requires an SSH peer and local/remote project paths."
+            return
+        }
+        retrievalStore.errorMessage = nil
+        do {
+            try await RemoteGitCheckpointService.shared.seedProjectIfNeeded(
+                sshTarget: sshTarget,
+                remoteRoot: binding.remoteRoot,
+                localOrigin: binding.localRoot
+            )
+            retrievalStore.recordActivity(
+                paneID: pane.id,
+                message: "Current Project is ready at \(binding.remoteRoot)"
+            )
+        } catch {
+            retrievalStore.errorMessage = error.localizedDescription
+            retrievalStore.recordActivity(paneID: pane.id, message: "Project preparation failed")
+        }
+    }
+
+    func validateChangeset(_ changesetID: ChangesetID) async {
+        guard let changeset = retrievalStore.incoming.first(where: { $0.id == changesetID }),
+              let binding = retrievalStore.projectBindings.first(where: { $0.id == changeset.projectBindingID }) else { return }
+        retrievalStore.setChangesetState(changesetID, state: .validating)
+        do {
+            try await RemoteGitCheckpointService.shared.validate(changeset, localOrigin: binding.localRoot)
+            // `git diff --check` proves the patch is structurally clean, but it
+            // does not prove the project builds or its tests pass.
+            retrievalStore.setChangesetState(changesetID, state: .unverified)
+        } catch {
+            retrievalStore.setChangesetState(changesetID, state: .failed, error: error.localizedDescription)
+        }
+    }
+
+    func applyChangeset(_ changesetID: ChangesetID) async {
+        guard let changeset = retrievalStore.incoming.first(where: { $0.id == changesetID }),
+              changeset.state == .validated,
+              let binding = retrievalStore.projectBindings.first(where: { $0.id == changeset.projectBindingID }) else { return }
+        retrievalStore.setChangesetState(changesetID, state: .applying)
+        do {
+            try await RemoteGitCheckpointService.shared.apply(changeset, localOrigin: binding.localRoot)
+            retrievalStore.setChangesetState(changesetID, state: .applied)
+        } catch {
+            retrievalStore.setChangesetState(changesetID, state: .failed, error: error.localizedDescription)
+        }
+    }
+
+    func discardChangeset(_ changesetID: ChangesetID) async {
+        guard let changeset = retrievalStore.incoming.first(where: { $0.id == changesetID }),
+              let binding = retrievalStore.projectBindings.first(where: { $0.id == changeset.projectBindingID }) else { return }
+        do {
+            try await RemoteGitCheckpointService.shared.discard(changeset, localOrigin: binding.localRoot)
+            retrievalStore.setChangesetState(changesetID, state: .discarded)
+        } catch {
+            retrievalStore.setChangesetState(changesetID, state: .failed, error: error.localizedDescription)
+        }
+    }
+
+    func promoteRemotePane(panelID: UUID) {
+        guard let panel = terminalPanel(for: panelID) else { return }
+        panel.remotePaneLifetime = .keepAlive
+        retrievalStore.promote(panelID: panelID)
+    }
+
+    func linkRemotePane(panelID: UUID, to targetWorkspace: Workspace) async {
+        guard targetWorkspace.id != id,
+              let panel = terminalPanel(for: panelID),
+              let sourceSession = panel.peerPaneSession else { return }
+        promoteRemotePane(panelID: panelID)
+        do {
+            let linkedSession = try await PeerPaneSession.attach(
+                lease: sourceSession.lease,
+                surface: sourceSession.originSurface,
+                title: sourceSession.surfaceTitle,
+                spec: sourceSession.originSpec
+            )
+            guard targetWorkspace.openRemotePane(
+                session: linkedSession,
+                lifetime: .keepAlive,
+                bindingRole: .linked
+            ) != nil else {
+                linkedSession.teardown()
+                return
+            }
+        } catch {
+            retrievalStore.errorMessage = error.localizedDescription
+        }
+    }
+
+    func terminateRemotePane(panelID: UUID) async {
+        guard let panel = terminalPanel(for: panelID),
+              let session = panel.peerPaneSession else { return }
+        do {
+            try await session.relaySession.requestRemoteClose()
+            _ = closePanel(panelID, force: true)
+        } catch {
+            retrievalStore.errorMessage = error.localizedDescription
+        }
+    }
+
+    private static func remotePaneID(from data: Data) -> RemotePaneID {
+        let bytes = Array(data.prefix(16))
+        guard bytes.count == 16 else { return RemotePaneID() }
+        let uuid = UUID(uuid: (
+            bytes[0], bytes[1], bytes[2], bytes[3],
+            bytes[4], bytes[5], bytes[6], bytes[7],
+            bytes[8], bytes[9], bytes[10], bytes[11],
+            bytes[12], bytes[13], bytes[14], bytes[15]
+        ))
+        return RemotePaneID(rawValue: uuid)
     }
 
     // MARK: - Flash/Notification Support

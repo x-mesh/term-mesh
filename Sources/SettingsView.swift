@@ -18,6 +18,7 @@ enum SettingsSection: String, CaseIterable, Identifiable {
     case imeInputBar = "imeInputBar"
     case keyboardShortcuts = "keyboardShortcuts"
     case peerFederation = "peerFederation"
+    case projectSync = "projectSync"
     case reset = "reset"
 
     var id: String { rawValue }
@@ -39,6 +40,7 @@ enum SettingsSection: String, CaseIterable, Identifiable {
         case .imeInputBar: return "IME Input Bar"
         case .keyboardShortcuts: return "Keyboard Shortcuts"
         case .peerFederation: return "Peer Federation"
+        case .projectSync: return "Project Sync"
         case .reset: return "Reset"
         }
     }
@@ -60,6 +62,7 @@ enum SettingsSection: String, CaseIterable, Identifiable {
         case .imeInputBar: return "keyboard"
         case .keyboardShortcuts: return "command"
         case .peerFederation: return "antenna.radiowaves.left.and.right"
+        case .projectSync: return "arrow.triangle.2.circlepath"
         case .reset: return "arrow.counterclockwise"
         }
     }
@@ -68,7 +71,7 @@ enum SettingsSection: String, CaseIterable, Identifiable {
         switch self {
         case .app, .terminal, .workspaceColors: return .general
         case .automation, .agentTeams, .agentRunbooks, .agentCLIPaths, .agentModels, .worktrees: return .agents
-        case .dashboard, .services, .peerFederation: return .network
+        case .dashboard, .services, .peerFederation, .projectSync: return .network
         case .browser: return .browser
         case .imeInputBar, .keyboardShortcuts: return .input
         case .reset: return .system
@@ -92,6 +95,7 @@ enum SettingsSection: String, CaseIterable, Identifiable {
         case .imeInputBar: return ["ime", "input", "bar", "font", "height", "cjk"]
         case .keyboardShortcuts: return ["keyboard", "shortcut", "keybinding", "hotkey"]
         case .peerFederation: return ["peer", "federation", "remote", "ssh", "relay", "share", "bonjour", "lan"]
+        case .projectSync: return ["project", "sync", "manifest", "device", "conflict", "recovery", "gc"]
         case .reset: return ["reset", "clear", "defaults"]
         }
     }
@@ -337,8 +341,9 @@ struct SettingsView: View {
 
     /// Sections that match the current search query.
     private var visibleSections: [SettingsSection] {
-        guard isSearching else { return SettingsSection.allCases }
-        return SettingsSection.allCases.filter { sectionMatchesSearch($0) }
+        let workspaceFirstSections = SettingsSection.allCases.filter { $0 != .projectSync }
+        guard isSearching else { return workspaceFirstSections }
+        return workspaceFirstSections.filter { sectionMatchesSearch($0) }
     }
 
     private func sectionMatchesSearch(_ section: SettingsSection) -> Bool {
@@ -654,6 +659,8 @@ struct SettingsView: View {
             sectionKeyboardShortcuts
         case .peerFederation:
             sectionPeerFederation
+        case .projectSync:
+            ProjectSyncPanelView()
         case .reset:
             sectionReset
         }

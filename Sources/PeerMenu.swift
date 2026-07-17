@@ -45,12 +45,11 @@ enum PeerMenu {
     /// The sidebar-first replacement for the legacy SSH connect dialog:
     /// opens the saved-host editor sheet in the main window's sidebar.
     static func addRemoteHostItem() -> NSMenuItem {
-        let item = NSMenuItem(
-            title: "Add Peer Host…",
-            action: #selector(PeerClientCoordinator.addRemoteHost(_:)),
-            keyEquivalent: ""
-        )
-        item.target = PeerClientCoordinator.shared
+        let item = NSMenuItem(title: "Peer Hosts", action: nil, keyEquivalent: "")
+        let submenu = NSMenu(title: "Peer Hosts")
+        submenu.delegate = PeerClientCoordinator.shared
+        item.submenu = submenu
+        PeerClientCoordinator.shared.populatePeerHostsMenu(submenu)
         return item
     }
 
@@ -67,7 +66,7 @@ enum PeerMenu {
 }
 
 @MainActor
-final class PeerClientCoordinator: NSObject {
+final class PeerClientCoordinator: NSObject, NSMenuDelegate {
     static let shared = PeerClientCoordinator()
     private static let setupReadTimeoutSeconds: TimeInterval = 10
 
@@ -85,6 +84,11 @@ final class PeerClientCoordinator: NSObject {
     /// forwarded socket out from under the relay sessions.
     private var sshTunnels: [ObjectIdentifier: PeerSSHTunnel] = [:]
     private var activeConnectionFlows: Set<ConnectionFlow> = []
+    private var savedRunnerStatuses: [UUID: PeerSavedRunnerStatus] = [:]
+    private var savedRunnerProfilesInFlight: Set<UUID> = []
+
+    static let savedRunnerStatusDidChangeNotification =
+        Notification.Name("PeerSavedRunnerStatusDidChange")
 
     private enum ConnectionFlow: Hashable {
         case console(String)
@@ -246,6 +250,314 @@ final class PeerClientCoordinator: NSObject {
         NotificationCenter.default.post(
             name: Self.addRemoteHostRequestedNotification, object: nil
         )
+    }
+
+    func populatePeerHostsMenu(_ menu: NSMenu) {
+        menu.removeAllItems()
+        let add = NSMenuItem(
+            title: "Add Peer Host…",
+            action: #selector(addRemoteHost(_:)),
+            keyEquivalent: ""
+        )
+        add.target = self
+        menu.addItem(add)
+
+        let profiles = PeerHostProfileStore.shared.savedRunnerProfiles
+        guard !profiles.isEmpty else { return }
+        menu.addItem(.separator())
+        for profile in profiles {
+            guard let runner = profile.savedRunner else { continue }
+            let item = NSMenuItem(
+                title: "Run \(profile.effectiveDisplayName) · \(runner.surface.cwd)",
+                action: #selector(runSavedProfileFromMenu(_:)),
+                keyEquivalent: ""
+            )
+            item.target = self
+            item.representedObject = profile.id.uuidString
+            item.isEnabled = !savedRunnerProfilesInFlight.contains(profile.id)
+            menu.addItem(item)
+        }
+    }
+
+    @objc private func runSavedProfileFromMenu(_ sender: NSMenuItem) {
+        guard let rawID = sender.representedObject as? String,
+              let id = UUID(uuidString: rawID),
+              let profile = PeerHostProfileStore.shared.profile(id: id)
+        else { return }
+        Task { await openSavedRunner(profile: profile) }
+    }
+
+    /// Picker-free saved MachineProfile launch. Stage updates contain only
+    /// allowlisted machine/cwd/error fields, so UI and diagnostics never echo
+    /// executable arguments, identity-file contents, or SSH stderr.
+    func openSavedRunner(profile: PeerHostProfile) async {
+        guard savedRunnerProfilesInFlight.insert(profile.id).inserted else {
+            return
+        }
+        defer { savedRunnerProfilesInFlight.remove(profile.id) }
+        await performOpenSavedRunner(profile: profile)
+    }
+
+    private func performOpenSavedRunner(profile: PeerHostProfile) async {
+        guard let runner = profile.savedRunner else { return }
+        let machine = profile.effectiveDisplayName
+        let cwd = runner.surface.cwd
+        var stage: PeerSavedRunnerStage = .probe
+        updateSavedRunnerStatus(profileID: profile.id, stage: stage, machine: machine, cwd: cwd)
+
+        let resolvedSocket: String
+        do {
+            let probed = try await PeerSocketProber.probe(
+                sshTarget: profile.sshTarget,
+                port: profile.sshPort,
+                identityFile: profile.identityFile
+            )
+            resolvedSocket = profile.remoteSocket.isEmpty ? probed : profile.remoteSocket
+        } catch {
+            failSavedRunner(
+                profileID: profile.id, stage: stage, machine: machine, cwd: cwd,
+                code: Self.safeProbeErrorCode(error), context: "SSH or daemon socket probe failed"
+            )
+            return
+        }
+        guard !Task.isCancelled else {
+            failSavedRunner(
+                profileID: profile.id, stage: stage, machine: machine, cwd: cwd,
+                code: "CANCELLED", context: "Launch cancelled"
+            )
+            return
+        }
+
+        let hostSpec = PeerPaneHostSpec.ssh(
+            target: profile.sshTarget,
+            remoteSockPath: resolvedSocket,
+            port: profile.sshPort,
+            identityFile: profile.identityFile
+        )
+        stage = .lease
+        updateSavedRunnerStatus(profileID: profile.id, stage: stage, machine: machine, cwd: cwd)
+        let lease: PeerPaneHostLease
+        do {
+            lease = try await PeerPaneHostRegistry.shared.acquire(hostSpec)
+        } catch {
+            failSavedRunner(
+                profileID: profile.id, stage: stage, machine: machine, cwd: cwd,
+                code: "TUNNEL_FAILED", context: "SSH tunnel could not be established"
+            )
+            return
+        }
+
+        let registry = PeerPaneHostRegistry.shared
+        guard !Task.isCancelled else {
+            registry.release(lease)
+            failSavedRunner(
+                profileID: profile.id, stage: stage, machine: machine, cwd: cwd,
+                code: "CANCELLED", context: "Launch cancelled"
+            )
+            return
+        }
+        guard let workspace = Self.currentWorkspaceForPaneOpen() else {
+            registry.release(lease)
+            failSavedRunner(
+                profileID: profile.id, stage: .openPane, machine: machine, cwd: cwd,
+                code: "NO_ACTIVE_WORKSPACE", context: "Open a terminal workspace first"
+            )
+            return
+        }
+
+        stage = .ensure
+        updateSavedRunnerStatus(profileID: profile.id, stage: stage, machine: machine, cwd: cwd)
+        let ensured: (session: PeerPaneSession, outcome: PeerEnsureSurfaceOutcome)
+        do {
+            ensured = try await PeerPaneSession.ensureAndAttach(
+                lease: lease,
+                surfaceSpec: runner.surface,
+                attachment: runner.attachment,
+                hostSpec: hostSpec,
+                onEnsured: {
+                    stage = .attach
+                    self.updateSavedRunnerStatus(
+                        profileID: profile.id, stage: stage,
+                        machine: machine, cwd: cwd
+                    )
+                }
+            )
+        } catch {
+            registry.release(lease)
+            let safe = Self.safeRunnerError(error, fallbackStage: stage)
+            failSavedRunner(
+                profileID: profile.id, stage: safe.stage, machine: machine, cwd: cwd,
+                code: safe.code, context: safe.context
+            )
+            return
+        }
+        guard !Task.isCancelled else {
+            ensured.session.teardown()
+            registry.release(lease)
+            failSavedRunner(
+                profileID: profile.id, stage: stage, machine: machine, cwd: cwd,
+                code: "CANCELLED", context: "Launch cancelled"
+            )
+            return
+        }
+        registry.release(lease)
+
+        guard workspace.openRemotePane(
+            session: ensured.session,
+            lifetime: runner.attachment.lifetime
+        ) != nil else {
+            ensured.session.teardown()
+            failSavedRunner(
+                profileID: profile.id, stage: .openPane, machine: machine, cwd: cwd,
+                code: "PANE_OPEN_FAILED", context: "No focused terminal pane is available"
+            )
+            return
+        }
+        PeerHostProfileStore.shared.recordConnection(
+            sshTarget: profile.sshTarget, resolvedSocket: resolvedSocket
+        )
+        updateSavedRunnerStatus(
+            profileID: profile.id, stage: .ready, machine: machine, cwd: cwd,
+            context: Self.ensureResultName(ensured.outcome.result)
+        )
+    }
+
+    func savedRunnerStatus(profileID: UUID) -> PeerSavedRunnerStatus? {
+        savedRunnerStatuses[profileID]
+    }
+
+    private func updateSavedRunnerStatus(
+        profileID: UUID,
+        stage: PeerSavedRunnerStage,
+        machine: String,
+        cwd: String,
+        code: String? = nil,
+        context: String? = nil
+    ) {
+        savedRunnerStatuses[profileID] = PeerSavedRunnerStatus(
+            stage: stage, machine: machine, cwd: cwd,
+            errorCode: code, safeContext: context
+        )
+        NotificationCenter.default.post(
+            name: Self.savedRunnerStatusDidChangeNotification,
+            object: self,
+            userInfo: ["profileID": profileID]
+        )
+        #if DEBUG
+        dlog("peer.runner.stage stage=\(stage.rawValue) machine=\(machine) cwd=\(cwd) code=\(code ?? "none")")
+        #endif
+    }
+
+    private func failSavedRunner(
+        profileID: UUID,
+        stage: PeerSavedRunnerStage,
+        machine: String,
+        cwd: String,
+        code: String,
+        context: String
+    ) {
+        updateSavedRunnerStatus(
+            profileID: profileID, stage: stage, machine: machine, cwd: cwd,
+            code: code, context: context
+        )
+        showAlert(
+            title: "Remote Runner Failed",
+            body: "Stage: \(stage.rawValue)\nMachine: \(machine)\nCWD: \(cwd)\nError: \(code)\n\(context)"
+        )
+    }
+
+    private static func safeProbeErrorCode(_ error: Error) -> String {
+        guard let probeError = error as? PeerSocketProbeError else {
+            return "PROBE_FAILED"
+        }
+        switch probeError {
+        case .noSocketFound: return "DAEMON_UNAVAILABLE"
+        case .timedOut: return "PROBE_TIMEOUT"
+        case .sshFailed: return "SSH_FAILED"
+        case .invalidResult: return "REMOTE_SOCKET_INVALID"
+        case .spawnFailed: return "SSH_SPAWN_FAILED"
+        }
+    }
+
+    static func safeRunnerError(
+        _ error: Error,
+        fallbackStage: PeerSavedRunnerStage
+    ) -> (stage: PeerSavedRunnerStage, code: String, context: String) {
+        if case RelayError.capabilityUnavailable = error {
+            return (.ensure, "CAPABILITY_UNAVAILABLE", "Host does not support surface.ensure.v1")
+        }
+        if case RelayError.ensureRejected(let code, let wireStage, _) = error {
+            let stage: PeerSavedRunnerStage = wireStage == "attach" ? .attach : .ensure
+            return (stage, code, sanitizedRunnerContext(for: code))
+        }
+        if case PeerSessionError.attachRejected = error {
+            return (.attach, "ATTACH_REJECTED", "Host rejected the exact surface attachment")
+        }
+        if case RelayError.surfaceIDMismatch = error {
+            return (.attach, "SURFACE_ID_MISMATCH", "Host attached a different surface id")
+        }
+        if error is CancellationError {
+            return (fallbackStage, "CANCELLED", "Launch cancelled")
+        }
+        let code = fallbackStage == .ensure
+            ? "ENSURE_TRANSPORT_FAILED"
+            : "ATTACH_FAILED"
+        return (fallbackStage, code, "Peer request failed")
+    }
+
+    /// Deterministic UI allowlist for daemon failures. Peer-provided
+    /// `safe_context` is intentionally never returned: the peer is a trust
+    /// boundary and can put executable arguments, stderr, or secrets in that
+    /// field despite the protocol contract.
+    static func sanitizedRunnerContext(for code: String) -> String {
+        switch code {
+        case "INVALID_REQUEST", "REQUEST_TOO_LARGE":
+            return "The saved runner specification is invalid"
+        case "DUPLICATE_REQUEST_ID":
+            return "The request identifier was already used"
+        case "CWD_NOT_FOUND":
+            return "The configured working directory does not exist"
+        case "CWD_NOT_DIRECTORY":
+            return "The configured working directory is not a directory"
+        case "CWD_PERMISSION_DENIED", "CWD_ERROR":
+            return "The configured working directory cannot be accessed"
+        case "COMMAND_NOT_FOUND":
+            return "The configured executable does not exist"
+        case "COMMAND_PERMISSION_DENIED":
+            return "The configured executable cannot be launched"
+        case "COMMAND_EXITED", "COMMAND_SIGNALED":
+            return "The remote process stopped during startup"
+        case "COMMAND_EXEC_ERROR", "EXEC_HANDSHAKE_TRUNCATED",
+             "EXEC_HANDSHAKE_INVALID_STAGE", "EXEC_HANDSHAKE_TIMEOUT":
+            return "The remote process could not complete startup"
+        case "SPEC_CONFLICT":
+            return "This runner key already has a different specification"
+        case "MALFORMED_RESPONSE":
+            return "The host returned an invalid ensure response"
+        case "INTERNAL", "ENSURE_FAILED":
+            return "The host could not ensure the remote runner"
+        default:
+            return "The remote runner request failed"
+        }
+    }
+
+    func menuNeedsUpdate(_ menu: NSMenu) {
+        guard menu.title == "Peer Hosts" else { return }
+        populatePeerHostsMenu(menu)
+    }
+
+    private static func ensureResultName(
+        _ result: Termmesh_Peer_V1_EnsureSurfaceResult
+    ) -> String {
+        switch result {
+        case .created: return "CREATED"
+        case .reused: return "REUSED"
+        case .recreated: return "RECREATED"
+        case .specConflict: return "SPEC_CONFLICT"
+        case .failed: return "FAILED"
+        case .unspecified: return "UNSPECIFIED"
+        case .UNRECOGNIZED(let raw): return "UNRECOGNIZED_\(raw)"
+        }
     }
 
     @objc func showConnections(_ sender: Any?) {
@@ -473,6 +785,11 @@ final class PeerClientCoordinator: NSObject {
             return false
         }
 
+        guard let lifetime = await promptForRemotePaneLifetime(surface: chosen) else {
+            registry.release(lease)
+            return false
+        }
+
         guard let workspace = Self.currentWorkspaceForPaneOpen() else {
             registry.release(lease)
             self.showAlert(
@@ -498,7 +815,7 @@ final class PeerClientCoordinator: NSObject {
         // Browse ref done — the pane session holds its own ref now.
         registry.release(lease)
 
-        guard workspace.openRemotePane(session: session) != nil else {
+        guard workspace.openRemotePane(session: session, lifetime: lifetime) != nil else {
             session.teardown()
             self.showAlert(
                 title: "Pane Open Failed",
@@ -1510,6 +1827,31 @@ final class PeerClientCoordinator: NSObject {
         let idx = popup.indexOfSelectedItem
         guard idx >= 0, idx < surfaces.count else { return nil }
         return surfaces[idx]
+    }
+
+    private func promptForRemotePaneLifetime(
+        surface: Termmesh_Peer_V1_SurfaceInfo
+    ) async -> RemotePaneLifetime? {
+        let alert = NSAlert()
+        alert.messageText = "Open remote pane"
+        alert.informativeText = "Temporary collects changes before close. Keep Alive can be linked into another Workspace and keeps the remote PTY running when removed locally."
+
+        let popup = NSPopUpButton(
+            frame: NSRect(x: 0, y: 0, width: 360, height: 26),
+            pullsDown: false
+        )
+        popup.addItems(withTitles: ["Temporary — collect, then close", "Keep Alive — reusable across Workspaces"])
+        popup.selectItem(at: 0)
+        popup.toolTip = surface.cwd.isEmpty
+            ? "No remote project directory was reported"
+            : "Current Project: \(surface.cwd)"
+        alert.accessoryView = popup
+        alert.addButton(withTitle: "Open")
+        alert.addButton(withTitle: "Cancel")
+
+        let response = await Self.runModalAsSheet(alert)
+        guard response == .alertFirstButtonReturn else { return nil }
+        return popup.indexOfSelectedItem == 1 ? .keepAlive : .temporary
     }
 
     @objc func promptAndRun(_ sender: Any?) {

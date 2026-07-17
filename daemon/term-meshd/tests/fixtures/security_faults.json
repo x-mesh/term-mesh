@@ -1,0 +1,122 @@
+{
+  "version": 1,
+  "suite": "t15-security-fault",
+  "required_threats": [
+    "forged_signature",
+    "stale_epoch",
+    "revoked_device",
+    "replay",
+    "downgrade",
+    "cross_project",
+    "path_traversal",
+    "symlink_escape",
+    "case_nfc_collision",
+    "decompression_limit",
+    "disk_full",
+    "sqlite_corrupt",
+    "cas_bitflip",
+    "packet_loss",
+    "sleep_wake"
+  ],
+  "cases": [
+    {
+      "id": "auth-record-binding",
+      "domain": "authentication",
+      "package": "term-meshd",
+      "target": "oplog_gc",
+      "filter": "forged_stale_revoked_and_cross_project_records_fail_before_mutation",
+      "threats": ["forged_signature", "stale_epoch", "revoked_device", "cross_project"],
+      "invariant": "untrusted records fail before durable mutation"
+    },
+    {
+      "id": "durable-replay",
+      "domain": "authentication",
+      "package": "term-meshd",
+      "target": "oplog_gc",
+      "filter": "duplicate_is_idempotent_and_payload_mismatch_is_durably_quarantined",
+      "threats": ["replay"],
+      "invariant": "exact replay is idempotent and mismatched replay is quarantined"
+    },
+    {
+      "id": "wire-downgrade",
+      "domain": "protocol",
+      "package": "sync-protocol",
+      "target": "vectors",
+      "filter": "downgrade_and_unsupported_peers_fail_closed",
+      "threats": ["downgrade"],
+      "invariant": "unsupported negotiation never establishes a session"
+    },
+    {
+      "id": "sandbox-escape-corpus",
+      "domain": "filesystem",
+      "package": "term-meshd",
+      "target": "apply_crash",
+      "filter": "traversal_unicode_and_symlink_ancestor_corpus_cannot_escape_root",
+      "threats": ["path_traversal", "symlink_escape"],
+      "invariant": "descriptor-relative apply never mutates outside the project root"
+    },
+    {
+      "id": "canonical-name-collision",
+      "domain": "filesystem",
+      "package": "term-meshd",
+      "target": "conflict_matrix",
+      "filter": "scanner_canonical_key_detects_case_nfc_and_composite_collisions",
+      "threats": ["case_nfc_collision"],
+      "invariant": "case-folded NFC aliases are typed conflicts"
+    },
+    {
+      "id": "inflate-budget",
+      "domain": "resource_limits",
+      "package": "term-meshd",
+      "target": "sync_rpc",
+      "filter": "sync::git::tests::declared_inflated_aggregate_is_charged_before_inflate",
+      "threats": ["decompression_limit"],
+      "invariant": "declared inflated bytes are charged before allocation"
+    },
+    {
+      "id": "disk-full-atomicity",
+      "domain": "storage",
+      "package": "term-meshd",
+      "target": "apply_crash",
+      "filter": "disk_full_and_permission_failpoints_never_advance_visible_state",
+      "threats": ["disk_full"],
+      "invariant": "failed durable writes never advance visible generation"
+    },
+    {
+      "id": "sqlite-corruption",
+      "domain": "storage",
+      "package": "term-meshd",
+      "target": "project_registry",
+      "filter": "corrupt_registry_is_quarantined_without_replacement",
+      "threats": ["sqlite_corrupt"],
+      "invariant": "corrupt SQLite bytes are quarantined without replacement"
+    },
+    {
+      "id": "cas-live-bitflip",
+      "domain": "storage",
+      "package": "term-meshd",
+      "target": "cas_integrity",
+      "filter": "chunk_count_overflow_and_live_bitflip_fail_closed",
+      "threats": ["cas_bitflip"],
+      "invariant": "tampered live objects never return plaintext"
+    },
+    {
+      "id": "resume-convergence",
+      "domain": "availability",
+      "package": "term-meshd",
+      "target": "security_fault_suite",
+      "filter": "packet_loss_and_sleep_wake_resume_converge_with_integrity_metrics",
+      "threats": ["packet_loss", "sleep_wake"],
+      "invariant": "resume retransmits only missing chunks and converges to one digest"
+    },
+    {
+      "id": "fixture-report-integrity",
+      "domain": "reporting",
+      "package": "term-meshd",
+      "target": "security_fault_suite",
+      "filter": "adversarial_fixture_has_complete_unique_fault_contract",
+      "threats": [],
+      "invariant": "every required threat maps to one deterministic test contract"
+    }
+  ]
+}

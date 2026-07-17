@@ -709,7 +709,12 @@ impl HeadlessManager {
         // observes their stdout and synthesises the reply when the agent forgets.
         // Disable via TERMMESH_AUTO_REPLY=off.
         let auto_reply_enabled = std::env::var("TERMMESH_AUTO_REPLY")
-            .map(|v| !matches!(v.trim().to_lowercase().as_str(), "off" | "0" | "false" | "no"))
+            .map(|v| {
+                !matches!(
+                    v.trim().to_lowercase().as_str(),
+                    "off" | "0" | "false" | "no"
+                )
+            })
             .unwrap_or(true);
         let ar_team = args.team_name.clone();
         let ar_agent = args.name.clone();
@@ -778,7 +783,8 @@ impl HeadlessManager {
                         ar_socket.as_deref(),
                         &ar_last_hash,
                         ev,
-                    ).await;
+                    )
+                    .await;
                 }
             }
             tracing::debug!("stdout reader exited for {id_clone}");
@@ -909,7 +915,11 @@ impl HeadlessManager {
         self.teams.contains_key(team_name)
     }
 
-    pub async fn read_output(&mut self, agent_id: &str, lines: usize) -> Result<Vec<String>, String> {
+    pub async fn read_output(
+        &mut self,
+        agent_id: &str,
+        lines: usize,
+    ) -> Result<Vec<String>, String> {
         self.reap_exited_agents();
         let agent = self
             .agents
@@ -1408,8 +1418,7 @@ impl HeadlessManager {
             leader: meta::LeaderMeta {
                 mode: params.leader_mode.clone(),
                 model: params.leader_model.clone(),
-                session_id: Some(params.leader_session_id.clone())
-                    .filter(|s| !s.is_empty()),
+                session_id: Some(params.leader_session_id.clone()).filter(|s| !s.is_empty()),
             },
             agents: params.agents.iter().map(|a| a.name.clone()).collect(),
             worktree: match (
@@ -1686,8 +1695,8 @@ impl HeadlessManager {
         // Find the archived dir for this UUID — or, Restore Fleet Layer 1, a
         // live snapshot dir (crash / quit-while-live). Archived wins when both
         // somehow exist (archive is the more deliberate state).
-        let archived_entries = meta::list_archived_teams()
-            .map_err(|e| format!("scan archived: {e}"))?;
+        let archived_entries =
+            meta::list_archived_teams().map_err(|e| format!("scan archived: {e}"))?;
         let live_dir = match archived_entries
             .into_iter()
             .find(|e| e.team_uuid == team_uuid)
@@ -1750,10 +1759,12 @@ impl HeadlessManager {
     /// `deleted: false` (without error) when the uuid has no archive — keeps
     /// the UI idempotent (clicking delete after another machine already swept
     /// shouldn't surface as an error).
-    pub fn delete_archive(&self, params: DeleteArchiveParams) -> Result<DeleteArchiveResult, String> {
+    pub fn delete_archive(
+        &self,
+        params: DeleteArchiveParams,
+    ) -> Result<DeleteArchiveResult, String> {
         let team_uuid = meta::parse_uuid(&params.team_uuid)?;
-        let entries = meta::list_archived_teams()
-            .map_err(|e| format!("scan archived: {e}"))?;
+        let entries = meta::list_archived_teams().map_err(|e| format!("scan archived: {e}"))?;
         let entry = match entries.into_iter().find(|e| e.team_uuid == team_uuid) {
             Some(e) => e,
             None => {
@@ -1877,11 +1888,19 @@ impl HeadlessManager {
         tracing::info!("auto-recycle: terminating agent {id}");
         let _ = self.terminate(&id).await;
 
-        tracing::info!("auto-recycle: respawning agent {}@{}", args.name, args.team_name);
+        tracing::info!(
+            "auto-recycle: respawning agent {}@{}",
+            args.name,
+            args.team_name
+        );
         self.spawn_internal(args)
             .await
             .map(|info| {
-                tracing::info!("auto-recycle: respawned agent {} (pid={})", info.id, info.pid);
+                tracing::info!(
+                    "auto-recycle: respawned agent {} (pid={})",
+                    info.id,
+                    info.pid
+                );
             })
             .map_err(|e| format!("cli_spawn_failed: {e}"))
     }
@@ -1905,7 +1924,10 @@ impl HeadlessManager {
         };
         agent.completed_task_count += 1;
         // Mark dirty so the 30s flush persists the new count.
-        agent.usage.flush_dirty.store(true, std::sync::atomic::Ordering::Release);
+        agent
+            .usage
+            .flush_dirty
+            .store(true, std::sync::atomic::Ordering::Release);
         let count = agent.completed_task_count;
         if count % threshold == 0 {
             tracing::info!(
@@ -2309,7 +2331,13 @@ impl HeadlessManager {
                     // flush. The dirty bit is consumed (no point retrying).
                     return None;
                 }
-                Some((a.team_uuid.clone(), a.name.clone(), a.usage.snapshot(), a.completed_task_count, a.auto_recycle_every))
+                Some((
+                    a.team_uuid.clone(),
+                    a.name.clone(),
+                    a.usage.snapshot(),
+                    a.completed_task_count,
+                    a.auto_recycle_every,
+                ))
             })
             .collect();
 
@@ -2355,7 +2383,13 @@ impl HeadlessManager {
                 if a.team_uuid.is_empty() {
                     return None;
                 }
-                Some((a.team_uuid.clone(), a.name.clone(), a.usage.snapshot(), a.completed_task_count, a.auto_recycle_every))
+                Some((
+                    a.team_uuid.clone(),
+                    a.name.clone(),
+                    a.usage.snapshot(),
+                    a.completed_task_count,
+                    a.auto_recycle_every,
+                ))
             })
             .collect();
         for (team_uuid, name, snap, completed, recycle_every) in candidates {
@@ -3292,18 +3326,14 @@ async fn try_emit_auto_reply(
     event: crate::auto_reply::AutoReplyEvent,
 ) {
     let Some(sock) = socket_path else {
-        tracing::debug!(
-            "auto-reply skipped: no app socket configured (agent={agent_name})"
-        );
+        tracing::debug!("auto-reply skipped: no app socket configured (agent={agent_name})");
         return;
     };
     let hash = event.content_hash();
     {
         let mut guard = last_hash.lock().expect("auto-reply hash lock poisoned");
         if *guard == Some(hash) {
-            tracing::debug!(
-                "auto-reply skipped: duplicate content hash (agent={agent_name})"
-            );
+            tracing::debug!("auto-reply skipped: duplicate content hash (agent={agent_name})");
             return;
         }
         *guard = Some(hash);
@@ -3327,8 +3357,8 @@ async fn try_emit_auto_reply(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
     use std::cell::RefCell;
+    use std::sync::Mutex;
 
     /// Test-only mutex protecting TERMMESH_HEADLESS_ROOT env var access.
     /// When tests set the env var, they must hold this lock to prevent
@@ -3364,7 +3394,6 @@ mod tests {
         }
     }
 
-
     /// Get headless root path from thread-local cache, or fallback to env var.
     fn test_headless_root() -> std::path::PathBuf {
         TEST_HEADLESS_ROOT.with(|root| {
@@ -3397,7 +3426,10 @@ mod tests {
     /// Read agent meta using cached headless root to avoid race conditions.
     fn test_read_agent_meta(team_uuid: &str, name: &str) -> Result<meta::AgentMeta, String> {
         let root = test_headless_root();
-        let path = root.join(team_uuid).join("agents").join(format!("{name}.json"));
+        let path = root
+            .join(team_uuid)
+            .join("agents")
+            .join(format!("{name}.json"));
         std::fs::read(&path)
             .map_err(|e| format!("read {}: {}", path.display(), e))
             .and_then(|bytes| {
@@ -3461,7 +3493,7 @@ mod tests {
     /// NOTE: Uses serial_test to prevent parallel test interference via env vars.
     #[tokio::test]
     async fn create_team_folds_watcher_spec_into_persisted_instructions() {
-        let root = scoped_root();  // Acquire lock for duration of test
+        let root = scoped_root(); // Acquire lock for duration of test
         let root_path = root.path().to_path_buf();
         const SENTINEL: &str = "SPEC-SENTINEL-F1-7f3a";
 
@@ -4205,8 +4237,7 @@ mod tests {
         let _scope = scoped_root();
         let team_uuid = "33333333-4444-5555-6666-777777777777".to_string();
         let destroyed_at = 1_000_000u64;
-        let archived = meta::headless_root()
-            .join(format!("{team_uuid}.archived.{destroyed_at}"));
+        let archived = meta::headless_root().join(format!("{team_uuid}.archived.{destroyed_at}"));
         std::fs::create_dir_all(archived.join("agents")).unwrap();
 
         let team_meta = meta::TeamMeta {
@@ -4297,8 +4328,7 @@ mod tests {
         // pane-mode but with leader session_id → must NOT be removed.
         let team_uuid = "44444444-5555-6666-7777-888888888888".to_string();
         let destroyed_at = 1_000_001u64;
-        let archived = meta::headless_root()
-            .join(format!("{team_uuid}.archived.{destroyed_at}"));
+        let archived = meta::headless_root().join(format!("{team_uuid}.archived.{destroyed_at}"));
         std::fs::create_dir_all(archived.join("agents")).unwrap();
         let team_meta = meta::TeamMeta {
             schema: meta::SCHEMA_VERSION,
@@ -4377,7 +4407,11 @@ mod tests {
         mgr.reap_exited_agents();
 
         let a = mgr.agents.get(&agent_id).expect("agent still present");
-        assert_eq!(a.status, AgentStatus::Terminated, "status should be Terminated after reap");
+        assert_eq!(
+            a.status,
+            AgentStatus::Terminated,
+            "status should be Terminated after reap"
+        );
         assert!(a.child.is_none(), "child handle should be cleared");
         assert!(a.stdin.is_none(), "stdin handle should be cleared");
     }

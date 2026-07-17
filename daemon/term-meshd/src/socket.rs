@@ -220,9 +220,13 @@ pub struct Context {
     /// R4: runner + sink cloned into Context so `watch.trigger_now` can fire
     /// checks directly without routing through the scheduler's interval loop.
     pub watch_runner: Option<Arc<dyn crate::headless::one_shot::WatchCheckRunner>>,
-    pub watch_sink: Option<tokio::sync::mpsc::UnboundedSender<crate::headless::one_shot::WatchCheckOutcome>>,
+    pub watch_sink:
+        Option<tokio::sync::mpsc::UnboundedSender<crate::headless::one_shot::WatchCheckOutcome>>,
     pub pane_tracker: PaneTracker,
     pub event_tx: EventSender,
+    pub project_registry: Arc<crate::sync::ProjectRegistry>,
+    pub paused_sync_projects: Arc<RwLock<HashSet<String>>>,
+    pub operation_manager: crate::sync::OperationManager,
 }
 
 pub fn default_socket_path() -> PathBuf {
@@ -250,7 +254,9 @@ pub async fn serve(
     headless: Arc<tokio::sync::Mutex<HeadlessManager>>,
     watch_registry: crate::drift_watch::WatchRegistry,
     watch_runner: Option<Arc<dyn crate::headless::one_shot::WatchCheckRunner>>,
-    watch_sink: Option<tokio::sync::mpsc::UnboundedSender<crate::headless::one_shot::WatchCheckOutcome>>,
+    watch_sink: Option<
+        tokio::sync::mpsc::UnboundedSender<crate::headless::one_shot::WatchCheckOutcome>,
+    >,
     mut shutdown_rx: watch::Receiver<bool>,
 ) -> anyhow::Result<()> {
     if path.exists() {
@@ -264,6 +270,13 @@ pub async fn serve(
     let owner_uid = current_uid();
     let (event_tx, _) = tokio::sync::broadcast::channel(256);
     let pane_tracker = PaneTracker::new().start();
+    let project_registry = Arc::new(crate::sync::ProjectRegistry::open(
+        crate::sync::default_registry_db_path(),
+    )?);
+    let operation_manager = crate::sync::OperationManager::open(
+        crate::sync::default_operation_db_path(),
+        project_registry.clone(),
+    )?;
     let ctx = Arc::new(Context {
         monitor_rx,
         monitor_handle,
@@ -278,6 +291,9 @@ pub async fn serve(
         watch_sink,
         pane_tracker,
         event_tx,
+        project_registry,
+        paused_sync_projects: Arc::new(RwLock::new(HashSet::new())),
+        operation_manager,
     });
     let heartbeat_task = tokio::spawn(run_heartbeat_staleness_watcher(
         ctx.clone(),
@@ -386,7 +402,7 @@ async fn handle_connection(
     mut shutdown_rx: watch::Receiver<bool>,
 ) -> anyhow::Result<()> {
     let (reader, mut writer) = stream.into_split();
-    let mut lines = BufReader::new(reader).lines();
+    let mut reader = BufReader::new(reader);
 
     loop {
         let line = tokio::select! {
@@ -396,10 +412,29 @@ async fn handle_connection(
                 }
                 continue;
             }
-            line = timeout(Duration::from_secs(60), lines.next_line()) => {
+            line = timeout(
+                Duration::from_secs(60),
+                read_bounded_line(&mut reader, crate::sync::MAX_OPERATION_ENVELOPE_BYTES),
+            ) => {
                 match line.map_err(|_| anyhow::anyhow!("read timeout"))?? {
-                    Some(line) => line,
-                    None => break,
+                    BoundedLine::Line(line) => line,
+                    BoundedLine::TooLarge => {
+                        let resp = Response {
+                            id: None,
+                            result: None,
+                            error: Some(RpcError {
+                                code: -32600,
+                                message: "request envelope exceeds 64 KiB".to_string(),
+                            }),
+                        };
+                        let mut buf = serde_json::to_vec(&resp)?;
+                        buf.push(b'\n');
+                        timeout(Duration::from_secs(5), writer.write_all(&buf))
+                            .await
+                            .map_err(|_| anyhow::anyhow!("write timeout"))??;
+                        continue;
+                    }
+                    BoundedLine::Eof => break,
                 }
             }
         };
@@ -424,17 +459,17 @@ async fn handle_connection(
             }
         };
 
-        tracing::debug!("req: {} {:?}", req.method, req.params);
+        tracing::debug!("req method={}", req.method);
 
         // Streaming handlers hold the writer for their lifetime and must
         // exit handle_connection entirely — they cannot share the loop.
         if req.method == "events.subscribe" {
-            return stream_subscribe_events(req, writer, lines, ctx, shutdown_rx).await;
+            return stream_subscribe_events(req, writer, reader, ctx, shutdown_rx).await;
         }
 
         let resp = dispatch(&req, ctx).await;
 
-        let mut buf = serde_json::to_vec(&resp)?;
+        let mut buf = serialize_bounded_response(&resp, req.id.clone())?;
         buf.push(b'\n');
         timeout(Duration::from_secs(5), writer.write_all(&buf))
             .await
@@ -444,8 +479,96 @@ async fn handle_connection(
     Ok(())
 }
 
-/// Streaming handler for `events.subscribe`. Takes ownership of the writer and
-/// streams JSONL events until the timeout expires or the client disconnects.
+fn serialize_bounded_response(
+    response: &Response,
+    id: Option<serde_json::Value>,
+) -> Result<Vec<u8>, serde_json::Error> {
+    if let BoundedSerialization::Payload(encoded) = serialize_bounded(response)? {
+        return Ok(encoded);
+    }
+    serde_json::to_vec(&Response {
+        id,
+        result: None,
+        error: Some(RpcError {
+            code: -32603,
+            message: "response envelope exceeds 64 KiB".to_string(),
+        }),
+    })
+}
+
+enum BoundedSerialization {
+    Payload(Vec<u8>),
+    TooLarge,
+}
+
+fn serialize_bounded<T: serde::Serialize>(
+    value: &T,
+) -> Result<BoundedSerialization, serde_json::Error> {
+    let encoded = serde_json::to_vec(value)?;
+    if encoded.len() <= crate::sync::MAX_OPERATION_ENVELOPE_BYTES {
+        Ok(BoundedSerialization::Payload(encoded))
+    } else {
+        Ok(BoundedSerialization::TooLarge)
+    }
+}
+
+enum BoundedLine {
+    Line(String),
+    TooLarge,
+    Eof,
+}
+
+async fn read_bounded_line<R: tokio::io::AsyncBufRead + Unpin>(
+    reader: &mut R,
+    limit: usize,
+) -> std::io::Result<BoundedLine> {
+    let mut bytes = Vec::with_capacity(limit.min(8 * 1024));
+    let mut too_large = false;
+    loop {
+        let available = reader.fill_buf().await?;
+        if available.is_empty() {
+            if too_large {
+                return Ok(BoundedLine::TooLarge);
+            }
+            if bytes.is_empty() {
+                return Ok(BoundedLine::Eof);
+            }
+            if bytes.len() > limit {
+                return Ok(BoundedLine::TooLarge);
+            }
+            return String::from_utf8(bytes)
+                .map(BoundedLine::Line)
+                .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidData));
+        }
+        let newline = available.iter().position(|byte| *byte == b'\n');
+        let consumed = newline.map_or(available.len(), |index| index + 1);
+        let payload = newline.map_or(available, |index| &available[..index]);
+        if !too_large {
+            if bytes.len().saturating_add(payload.len()) > limit.saturating_add(1) {
+                too_large = true;
+                bytes.clear();
+            } else {
+                bytes.extend_from_slice(payload);
+            }
+        }
+        reader.consume(consumed);
+        if newline.is_some() {
+            if too_large {
+                return Ok(BoundedLine::TooLarge);
+            }
+            if bytes.last() == Some(&b'\r') {
+                bytes.pop();
+            }
+            if bytes.len() > limit {
+                return Ok(BoundedLine::TooLarge);
+            }
+            return String::from_utf8(bytes)
+                .map(BoundedLine::Line)
+                .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidData));
+        }
+    }
+}
+
 /// Streaming handler for `events.subscribe`. Takes ownership of the writer and
 /// streams JSONL events until the timeout expires or the client disconnects.
 ///
@@ -453,7 +576,7 @@ async fn handle_connection(
 async fn stream_subscribe_events(
     req: Request,
     mut writer: tokio::net::unix::OwnedWriteHalf,
-    mut lines: tokio::io::Lines<BufReader<tokio::net::unix::OwnedReadHalf>>,
+    mut reader: BufReader<tokio::net::unix::OwnedReadHalf>,
     ctx: &Context,
     mut shutdown_rx: watch::Receiver<bool>,
 ) -> anyhow::Result<()> {
@@ -488,7 +611,7 @@ async fn stream_subscribe_events(
 
     // Send initial subscription ack.
     let ack = serde_json::json!({
-        "id": req.id,
+        "id": req.id.clone(),
         "result": {
             "status": "subscribed",
             "filter": filter_kinds.iter().collect::<Vec<_>>(),
@@ -496,7 +619,20 @@ async fn stream_subscribe_events(
         },
         "error": null,
     });
-    let mut buf = serde_json::to_vec(&ack)?;
+    let mut buf = match serialize_bounded(&ack)? {
+        BoundedSerialization::Payload(payload) => payload,
+        BoundedSerialization::TooLarge => serialize_bounded_response(
+            &Response {
+                id: req.id.clone(),
+                result: None,
+                error: Some(RpcError {
+                    code: -32603,
+                    message: "subscription ack exceeds 64 KiB".to_string(),
+                }),
+            },
+            req.id.clone(),
+        )?,
+    };
     buf.push(b'\n');
     timeout(Duration::from_secs(5), writer.write_all(&buf))
         .await
@@ -531,7 +667,7 @@ async fn stream_subscribe_events(
                 }
                 _ = tokio::time::sleep_until(dl) => break,
                 _ = ping_interval.tick() => {
-                    Some(serde_json::to_vec(&serde_json::json!({"kind":"keepalive","ts_ms":ts_ms()}))?)
+                    bounded_subscriber_payload(&serde_json::json!({"kind":"keepalive","ts_ms":ts_ms()}))?
                 }
                 recv = event_rx.recv() => {
                     match recv {
@@ -543,11 +679,10 @@ async fn stream_subscribe_events(
                         Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                     }
                 }
-                read_result = lines.next_line() => {
+                read_result = read_bounded_line(&mut reader, crate::sync::MAX_OPERATION_ENVELOPE_BYTES) => {
                     match read_result {
-                        Ok(None) => break,   // client disconnected (EOF)
-                        Err(_) => break,     // read error → treat as disconnect
-                        Ok(Some(_)) => None, // ignore unexpected input from client
+                        Ok(BoundedLine::Eof | BoundedLine::TooLarge) | Err(_) => break,
+                        Ok(BoundedLine::Line(_)) => None,
                     }
                 }
             }
@@ -560,7 +695,7 @@ async fn stream_subscribe_events(
                     None
                 }
                 _ = ping_interval.tick() => {
-                    Some(serde_json::to_vec(&serde_json::json!({"kind":"keepalive","ts_ms":ts_ms()}))?)
+                    bounded_subscriber_payload(&serde_json::json!({"kind":"keepalive","ts_ms":ts_ms()}))?
                 }
                 recv = event_rx.recv() => {
                     match recv {
@@ -572,11 +707,10 @@ async fn stream_subscribe_events(
                         Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                     }
                 }
-                read_result = lines.next_line() => {
+                read_result = read_bounded_line(&mut reader, crate::sync::MAX_OPERATION_ENVELOPE_BYTES) => {
                     match read_result {
-                        Ok(None) => break,   // client disconnected (EOF)
-                        Err(_) => break,     // read error → treat as disconnect
-                        Ok(Some(_)) => None, // ignore unexpected input from client
+                        Ok(BoundedLine::Eof | BoundedLine::TooLarge) | Err(_) => break,
+                        Ok(BoundedLine::Line(_)) => None,
                     }
                 }
             }
@@ -623,7 +757,32 @@ fn filter_and_serialize(
     // leader_session_id filtering is intentionally relaxed in W-2: any subscriber
     // without a leader_session_id filter receives all events (generous default).
     // Per-leader scoping can be tightened in a follow-up without protocol changes.
-    serde_json::to_vec(ev).ok()
+    bounded_subscriber_payload(ev).ok().flatten()
+}
+
+static OVERSIZED_SUBSCRIBER_EVENTS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+fn bounded_subscriber_payload<T: serde::Serialize>(
+    value: &T,
+) -> Result<Option<Vec<u8>>, serde_json::Error> {
+    match serialize_bounded(value)? {
+        BoundedSerialization::Payload(payload) => Ok(Some(payload)),
+        BoundedSerialization::TooLarge => {
+            let count =
+                OVERSIZED_SUBSCRIBER_EVENTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+            let error = serde_json::json!({
+                "kind": "error",
+                "code": "event_too_large",
+                "dropped": true,
+                "oversized_event_count": count,
+            });
+            match serialize_bounded(&error)? {
+                BoundedSerialization::Payload(payload) => Ok(Some(payload)),
+                BoundedSerialization::TooLarge => Ok(None),
+            }
+        }
+    }
 }
 
 /// XK-EVENTS-v1 caps (contract §4 rule 4): whole event and redacted tail.
@@ -1114,10 +1273,7 @@ fn assigned_threshold_for_cli(cli: &str) -> u64 {
     }
 }
 
-async fn run_assigned_timeout_watcher(
-    ctx: Arc<Context>,
-    mut shutdown_rx: watch::Receiver<bool>,
-) {
+async fn run_assigned_timeout_watcher(ctx: Arc<Context>, mut shutdown_rx: watch::Receiver<bool>) {
     let mut interval = tokio::time::interval(Duration::from_secs(30));
     interval.tick().await; // consume immediate first tick
     let mut notified: HashSet<String> = HashSet::new();
@@ -1341,6 +1497,225 @@ async fn dispatch(req: &Request, ctx: &Context) -> Response {
     let result = match req.method.as_str() {
         // --- General ---
         "ping" => Ok(serde_json::json!({"status": "pong"})),
+
+        // --- Durable sync operations (off-main, non-focus) ---
+        "operation.start" => {
+            match serde_json::from_value::<crate::sync::OperationStartParams>(req.params.clone()) {
+                Ok(params) => ctx
+                    .operation_manager
+                    .start(params)
+                    .await
+                    .map_err(|error| error.to_string())
+                    .and_then(operation_json),
+                Err(_) => Err("invalid params".to_string()),
+            }
+        }
+        "operation.status" => {
+            match serde_json::from_value::<crate::sync::OperationIdParams>(req.params.clone()) {
+                Ok(params) => ctx
+                    .operation_manager
+                    .status(&params.operation_id, &params.project_id)
+                    .map_err(|error| error.to_string())
+                    .and_then(operation_json),
+                Err(_) => Err("invalid params".to_string()),
+            }
+        }
+        "operation.cancel" => {
+            match serde_json::from_value::<crate::sync::OperationIdParams>(req.params.clone()) {
+                Ok(params) => ctx
+                    .operation_manager
+                    .cancel(&params.operation_id, &params.project_id)
+                    .map_err(|error| error.to_string())
+                    .and_then(operation_json),
+                Err(_) => Err("invalid params".to_string()),
+            }
+        }
+        "operation.retry" => {
+            match serde_json::from_value::<crate::sync::OperationRetryParams>(req.params.clone()) {
+                Ok(params) => ctx
+                    .operation_manager
+                    .retry(params)
+                    .await
+                    .map_err(|error| error.to_string())
+                    .and_then(operation_json),
+                Err(_) => Err("invalid params".to_string()),
+            }
+        }
+
+        // --- Mesh project control plane (off-main, non-focus) ---
+        "project.add" => match serde_json::from_value::<ProjectAddParams>(req.params.clone()) {
+            Ok(params) => {
+                let registry = ctx.project_registry.clone();
+                tokio::task::spawn_blocking(move || registry.add(&params.root_path))
+                    .await
+                    .map_err(|_| "PROJECT_STORAGE_ERROR: registry worker failed".to_string())
+                    .and_then(|result| result.map_err(registry_error))
+                    .map(|record| project_json(record, false))
+            }
+            Err(_) => Err("INVALID_PARAMS: root_path is required".to_string()),
+        },
+        "project.list" => {
+            let registry = ctx.project_registry.clone();
+            let paused = ctx
+                .paused_sync_projects
+                .read()
+                .map_err(|_| "PROJECT_STATE_ERROR: pause state unavailable".to_string())
+                .map(|set| set.clone());
+            match paused {
+                Err(error) => Err(error),
+                Ok(paused) => tokio::task::spawn_blocking(move || registry.list())
+                    .await
+                    .map_err(|_| "PROJECT_STORAGE_ERROR: registry worker failed".to_string())
+                    .and_then(|result| result.map_err(registry_error))
+                    .map(|records| {
+                        let projects = records
+                            .into_iter()
+                            .map(|record| {
+                                let is_paused = paused.contains(&record.project_id.to_string());
+                                project_json(record, is_paused)
+                            })
+                            .collect::<Vec<_>>();
+                        serde_json::json!({ "projects": projects })
+                    }),
+            }
+        }
+        "project.status" => match project_id_param(&req.params) {
+            Ok(project_id) => match load_project(ctx, project_id).await {
+                Ok(record) => ctx
+                    .paused_sync_projects
+                    .read()
+                    .map_err(|_| "PROJECT_STATE_ERROR: pause state unavailable".to_string())
+                    .map(|paused| project_json(record, paused.contains(&project_id.to_string()))),
+                Err(error) => Err(error),
+            },
+            Err(error) => Err(error),
+        },
+        "project.pause" | "project.resume" => match project_id_param(&req.params) {
+            Ok(project_id) => match load_project(ctx, project_id).await {
+                Ok(record) => {
+                    let paused = req.method == "project.pause";
+                    let update = ctx.paused_sync_projects.write().map_err(|_| {
+                        "PROJECT_STATE_ERROR: pause state unavailable".to_string()
+                    });
+                    match update {
+                        Ok(mut state) => {
+                            if paused {
+                                state.insert(project_id.to_string());
+                            } else {
+                                state.remove(&project_id.to_string());
+                            }
+                            Ok(project_json(record, paused))
+                        }
+                        Err(error) => Err(error),
+                    }
+                }
+                Err(error) => Err(error),
+            },
+            Err(error) => Err(error),
+        },
+        "project.scan" => {
+            match serde_json::from_value::<crate::sync::OperationStartParams>(req.params.clone()) {
+                Ok(params) => match sync_is_paused(ctx, &params.project_id) {
+                    Ok(true) => Err("PROJECT_PAUSED: resume the project before scanning".to_string()),
+                    Ok(false) => ctx
+                        .operation_manager
+                        .start(params)
+                        .await
+                        .map_err(|error| format!("OPERATION_ERROR: {error}"))
+                        .and_then(operation_json),
+                    Err(error) => Err(error),
+                },
+                Err(_) => Err("INVALID_PARAMS: project_id and request_id are required".to_string()),
+            }
+        }
+        "sync.start" => match serde_json::from_value::<SyncStartParams>(req.params.clone()) {
+            Ok(params) => match sync_is_paused(ctx, &params.project_id) {
+                Ok(true) => Err("PROJECT_PAUSED: resume the project before syncing".to_string()),
+                Ok(false) => ctx
+                    .operation_manager
+                    .start(crate::sync::OperationStartParams {
+                        request_id: params.request_id,
+                        project_id: params.project_id,
+                        kind: params.kind,
+                    })
+                    .await
+                    .map_err(|error| format!("OPERATION_ERROR: {error}"))
+                    .and_then(operation_json),
+                Err(error) => Err(error),
+            },
+            Err(_) => Err("INVALID_PARAMS: project_id and request_id are required".to_string()),
+        },
+        "sync.status" | "sync.cancel" => {
+            match serde_json::from_value::<crate::sync::OperationIdParams>(req.params.clone()) {
+                Ok(params) => {
+                    let result = if req.method == "sync.status" {
+                        ctx.operation_manager
+                            .status(&params.operation_id, &params.project_id)
+                    } else {
+                        ctx.operation_manager
+                            .cancel(&params.operation_id, &params.project_id)
+                    };
+                    result
+                        .map_err(|error| format!("OPERATION_ERROR: {error}"))
+                        .and_then(operation_json)
+                }
+                Err(_) => Err("INVALID_PARAMS: project_id and operation_id are required".to_string()),
+            }
+        }
+        "pairing.list" => match project_id_param(&req.params) {
+            Ok(project_id) => match load_project(ctx, project_id).await {
+                Ok(_) => Ok(serde_json::json!({
+                    "project_id": project_id.to_string(),
+                    "devices": [],
+                    "state": "not_configured",
+                    "user_presence_required": true,
+                })),
+                Err(error) => Err(error),
+            },
+            Err(error) => Err(error),
+        },
+        "pairing.approve" | "pairing.revoke" | "pairing.recovery_export" | "pairing.recovery_import" => {
+            match project_id_param(&req.params) {
+                Ok(project_id) => match load_project(ctx, project_id).await {
+                    Ok(_) => Err(format!(
+                        "USER_PRESENCE_REQUIRED: {} must run through an authenticated local user-presence flow",
+                        req.method
+                    )),
+                    Err(error) => Err(error),
+                },
+                Err(error) => Err(error),
+            }
+        }
+        "conflict.list" => match project_id_param(&req.params) {
+            Ok(project_id) => match load_project(ctx, project_id).await {
+                Ok(_) => Ok(serde_json::json!({
+                    "project_id": project_id.to_string(),
+                    "conflicts": [],
+                })),
+                Err(error) => Err(error),
+            },
+            Err(error) => Err(error),
+        },
+        "conflict.get" | "conflict.resolve" => match project_id_param(&req.params) {
+            Ok(project_id) => match load_project(ctx, project_id).await {
+                Ok(_) => Err("CONFLICT_NOT_FOUND: no durable conflict record matches the request".to_string()),
+                Err(error) => Err(error),
+            },
+            Err(error) => Err(error),
+        },
+        "gc.status" => match project_id_param(&req.params) {
+            Ok(project_id) => match load_project(ctx, project_id).await {
+                Ok(_) => Ok(serde_json::json!({
+                    "project_id": project_id.to_string(),
+                    "state": "idle",
+                    "eligible": false,
+                    "retention_days": 90,
+                    "reason": "gc_coordinator_not_initialized",
+                })),
+                Err(error) => Err(error),
+            },
+            Err(error) => Err(error),
+        },
 
         "daemon.status" => {
             let uptime_secs = crate::START_TIME
@@ -1799,7 +2174,8 @@ async fn dispatch(req: &Request, ctx: &Context) -> Response {
                     } else {
                         String::new()
                     };
-                    let task_team_name = req.params
+                    let task_team_name = req
+                        .params
                         .get("team_name")
                         .and_then(|v| v.as_str())
                         .unwrap_or_default()
@@ -1843,7 +2219,8 @@ async fn dispatch(req: &Request, ctx: &Context) -> Response {
                                     let headless = ctx.headless.clone();
                                     tokio::spawn(async move {
                                         let mut mgr = headless.lock().await;
-                                        mgr.handle_auto_recycle_completion_by_name(&assignee, &tn).await;
+                                        mgr.handle_auto_recycle_completion_by_name(&assignee, &tn)
+                                            .await;
                                     });
                                 }
                             }
@@ -1948,54 +2325,54 @@ async fn dispatch(req: &Request, ctx: &Context) -> Response {
             if req.params.get("kind").and_then(|v| v.as_str()) == Some("xk_run") {
                 publish_xk_run(&req.params, &ctx.event_tx)
             } else {
-            #[derive(Deserialize)]
-            struct P {
-                kind: String,
-                #[serde(default)]
-                team: String,
-                #[serde(default)]
-                agent: String,
-                #[serde(default)]
-                task_id: String,
-                #[serde(default)]
-                status: String,
-                #[serde(default)]
-                prev_status: String,
-                #[serde(default)]
-                header: String,
-            }
-            match serde_json::from_value::<P>(req.params.clone()) {
-                Ok(p) => {
-                    let ts_ms = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_millis() as u64;
-                    let ev_res: Result<DaemonEvent, String> = match p.kind.as_str() {
-                        "task_status" => Ok(DaemonEvent::TaskStatus {
-                            team: p.team,
-                            agent: p.agent,
-                            task_id: p.task_id,
-                            status: p.status,
-                            prev_status: p.prev_status,
-                            ts_ms,
-                        }),
-                        "reply" => Ok(DaemonEvent::Reply {
-                            team: p.team,
-                            agent: p.agent,
-                            task_id: p.task_id,
-                            header: p.header,
-                            ts_ms,
-                        }),
-                        other => Err(format!("events.publish: unknown kind '{other}'")),
-                    };
-                    ev_res.map(|ev| {
-                        // Err means no subscribers — fine to ignore.
-                        let _ = ctx.event_tx.send(ev);
-                        serde_json::json!({"published": true})
-                    })
+                #[derive(Deserialize)]
+                struct P {
+                    kind: String,
+                    #[serde(default)]
+                    team: String,
+                    #[serde(default)]
+                    agent: String,
+                    #[serde(default)]
+                    task_id: String,
+                    #[serde(default)]
+                    status: String,
+                    #[serde(default)]
+                    prev_status: String,
+                    #[serde(default)]
+                    header: String,
                 }
-                Err(e) => Err(format!("invalid params: {e}")),
-            }
+                match serde_json::from_value::<P>(req.params.clone()) {
+                    Ok(p) => {
+                        let ts_ms = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_millis() as u64;
+                        let ev_res: Result<DaemonEvent, String> = match p.kind.as_str() {
+                            "task_status" => Ok(DaemonEvent::TaskStatus {
+                                team: p.team,
+                                agent: p.agent,
+                                task_id: p.task_id,
+                                status: p.status,
+                                prev_status: p.prev_status,
+                                ts_ms,
+                            }),
+                            "reply" => Ok(DaemonEvent::Reply {
+                                team: p.team,
+                                agent: p.agent,
+                                task_id: p.task_id,
+                                header: p.header,
+                                ts_ms,
+                            }),
+                            other => Err(format!("events.publish: unknown kind '{other}'")),
+                        };
+                        ev_res.map(|ev| {
+                            // Err means no subscribers — fine to ignore.
+                            let _ = ctx.event_tx.send(ev);
+                            serde_json::json!({"published": true})
+                        })
+                    }
+                    Err(e) => Err(format!("invalid params: {e}")),
+                }
             }
         }
 
@@ -2416,7 +2793,11 @@ async fn dispatch(req: &Request, ctx: &Context) -> Response {
                         None => Err(format!("no watch state found for team '{}'", p.team_id)),
                         Some(st) => {
                             if let Some(v) = p.target {
-                                st.target = if v.is_empty() || v == "all" { None } else { Some(v) };
+                                st.target = if v.is_empty() || v == "all" {
+                                    None
+                                } else {
+                                    Some(v)
+                                };
                             }
                             // Mirror watch.on cost guard: clamp positive values up to the
                             // minimum so a partial update cannot bypass the 30s floor.
@@ -2425,12 +2806,24 @@ async fn dispatch(req: &Request, ctx: &Context) -> Response {
                                     st.interval_secs = v.max(MIN_WATCH_INTERVAL_SECS);
                                 }
                             }
-                            if let Some(v) = p.exec_to_dir_ratio { st.exec_to_dir_ratio = v; }
-                            if let Some(v) = p.stance { st.stance = v; }
-                            if let Some(v) = p.spec { st.spec = v; }
-                            if let Some(v) = p.cli { st.cli = v; }
-                            if let Some(v) = p.model { st.model = v; }
-                            if let Some(v) = p.reply_timeout_secs { st.reply_timeout_secs = v; }
+                            if let Some(v) = p.exec_to_dir_ratio {
+                                st.exec_to_dir_ratio = v;
+                            }
+                            if let Some(v) = p.stance {
+                                st.stance = v;
+                            }
+                            if let Some(v) = p.spec {
+                                st.spec = v;
+                            }
+                            if let Some(v) = p.cli {
+                                st.cli = v;
+                            }
+                            if let Some(v) = p.model {
+                                st.model = v;
+                            }
+                            if let Some(v) = p.reply_timeout_secs {
+                                st.reply_timeout_secs = v;
+                            }
                             if let Some(mut workers) = p.workers {
                                 let had_dup = {
                                     let mut s = std::collections::HashSet::new();
@@ -2474,34 +2867,34 @@ async fn dispatch(req: &Request, ctx: &Context) -> Response {
             }
             match serde_json::from_value::<P>(req.params.clone()) {
                 Ok(p) if p.team_id.is_empty() => Err("team_id required".to_string()),
-                Ok(p) => {
-                    match (&ctx.watch_runner, &ctx.watch_sink) {
-                        (Some(runner), Some(sink)) => {
-                            match crate::drift_watch::trigger_now(
-                                &p.team_id,
-                                &ctx.watch_registry,
-                                runner,
-                                sink,
-                            )
-                            .await
-                            {
-                                Ok(n) => Ok(serde_json::json!({
-                                    "status": "ok",
-                                    "team_id": p.team_id,
-                                    "triggered": true,
-                                    "check_count": n,
-                                })),
-                                Err(reason) => Ok(serde_json::json!({
-                                    "status": "rejected",
-                                    "team_id": p.team_id,
-                                    "triggered": false,
-                                    "reason": reason,
-                                })),
-                            }
+                Ok(p) => match (&ctx.watch_runner, &ctx.watch_sink) {
+                    (Some(runner), Some(sink)) => {
+                        match crate::drift_watch::trigger_now(
+                            &p.team_id,
+                            &ctx.watch_registry,
+                            runner,
+                            sink,
+                        )
+                        .await
+                        {
+                            Ok(n) => Ok(serde_json::json!({
+                                "status": "ok",
+                                "team_id": p.team_id,
+                                "triggered": true,
+                                "check_count": n,
+                            })),
+                            Err(reason) => Ok(serde_json::json!({
+                                "status": "rejected",
+                                "team_id": p.team_id,
+                                "triggered": false,
+                                "reason": reason,
+                            })),
                         }
-                        _ => Err("watch runner not available (headless watch not initialised)".to_string()),
                     }
-                }
+                    _ => Err(
+                        "watch runner not available (headless watch not initialised)".to_string(),
+                    ),
+                },
                 Err(e) => Err(format!("invalid params: {e}")),
             }
         }
@@ -2595,8 +2988,10 @@ async fn dispatch(req: &Request, ctx: &Context) -> Response {
                     "duplicate_name_warning": st.duplicate_name_warning,
                 })
             }
-            let params: P = serde_json::from_value(req.params.clone())
-                .unwrap_or(P { team_id: None, working_directory: None });
+            let params: P = serde_json::from_value(req.params.clone()).unwrap_or(P {
+                team_id: None,
+                working_directory: None,
+            });
             // Snapshot in-memory registry under the lock, then drop before file I/O.
             let in_mem: std::collections::HashMap<String, crate::drift_watch::WatchState> = {
                 let reg = ctx.watch_registry.lock().await;
@@ -2605,7 +3000,8 @@ async fn dispatch(req: &Request, ctx: &Context) -> Response {
             // Config.json fallback: teams persisted but absent from the registry
             // (e.g. daemon restarted from a different cwd). In-memory wins on collision.
             let config_fallback: std::collections::HashMap<String, crate::drift_watch::WatchState> =
-                params.working_directory
+                params
+                    .working_directory
                     .as_deref()
                     .filter(|wd| !wd.is_empty())
                     .map(|wd| {
@@ -2616,7 +3012,8 @@ async fn dispatch(req: &Request, ctx: &Context) -> Response {
                     .unwrap_or_default();
             match params.team_id {
                 Some(tid) => {
-                    let state = in_mem.get(&tid)
+                    let state = in_mem
+                        .get(&tid)
                         .or_else(|| config_fallback.get(&tid))
                         .map(|st| serialize_state(&tid, st));
                     Ok(serde_json::json!({ "status": "ok", "watch": state }))
@@ -2666,8 +3063,7 @@ async fn dispatch(req: &Request, ctx: &Context) -> Response {
                 .as_deref()
                 .filter(|s| !s.is_empty())
                 .map(|s| s.to_string());
-            let resolved: Result<(Option<String>, String), String> = if let Some(wd) = explicit_wd
-            {
+            let resolved: Result<(Option<String>, String), String> = if let Some(wd) = explicit_wd {
                 Ok((params.team_id.clone(), wd))
             } else {
                 let reg = ctx.watch_registry.lock().await;
@@ -2799,8 +3195,7 @@ async fn dispatch(req: &Request, ctx: &Context) -> Response {
             match serde_json::from_value::<crate::headless::ResumePaneParams>(req.params.clone()) {
                 Ok(p) => {
                     let mgr = ctx.headless.lock().await;
-                    mgr.resume_pane(p)
-                        .map(|r| serde_json::to_value(r).unwrap())
+                    mgr.resume_pane(p).map(|r| serde_json::to_value(r).unwrap())
                 }
                 Err(e) => Err(format!("invalid params: {e}")),
             }
@@ -2808,7 +3203,8 @@ async fn dispatch(req: &Request, ctx: &Context) -> Response {
         "team.delete_archive" => {
             // On-demand archive removal from the resume picker. Works for both
             // pane-mode and headless archives — both live in the same directory.
-            match serde_json::from_value::<crate::headless::DeleteArchiveParams>(req.params.clone()) {
+            match serde_json::from_value::<crate::headless::DeleteArchiveParams>(req.params.clone())
+            {
                 Ok(p) => {
                     let mgr = ctx.headless.lock().await;
                     mgr.delete_archive(p)
@@ -2992,6 +3388,111 @@ async fn dispatch(req: &Request, ctx: &Context) -> Response {
                 message: msg,
             }),
         },
+    }
+}
+
+fn operation_json(record: crate::sync::OperationRecord) -> Result<serde_json::Value, String> {
+    let value =
+        serde_json::to_value(record).map_err(|_| "operation response failed".to_string())?;
+    let encoded =
+        serde_json::to_vec(&value).map_err(|_| "operation response failed".to_string())?;
+    if encoded.len() > crate::sync::MAX_OPERATION_ENVELOPE_BYTES {
+        return Err("operation response exceeds 64 KiB".to_string());
+    }
+    Ok(value)
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProjectAddParams {
+    root_path: PathBuf,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SyncStartParams {
+    request_id: String,
+    project_id: String,
+    kind: crate::sync::OperationKind,
+    #[serde(rename = "peer_id")]
+    _peer_id: Option<String>,
+}
+
+fn parse_project_id(value: &str) -> Result<crate::sync::ProjectId, String> {
+    let decoded = hex::decode(value).map_err(|_| {
+        "INVALID_PROJECT_ID: expected 64 lowercase hexadecimal characters".to_string()
+    })?;
+    let bytes: [u8; crate::sync::PROJECT_ID_BYTES] = decoded.try_into().map_err(|_| {
+        "INVALID_PROJECT_ID: expected 64 lowercase hexadecimal characters".to_string()
+    })?;
+    Ok(crate::sync::ProjectId::from_bytes(bytes))
+}
+
+fn project_id_param(params: &serde_json::Value) -> Result<crate::sync::ProjectId, String> {
+    let project_id = params
+        .get("project_id")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| "INVALID_PARAMS: project_id is required".to_string())?;
+    parse_project_id(project_id)
+}
+
+async fn load_project(
+    ctx: &Context,
+    project_id: crate::sync::ProjectId,
+) -> Result<crate::sync::ProjectRecord, String> {
+    let registry = ctx.project_registry.clone();
+    tokio::task::spawn_blocking(move || registry.get(project_id))
+        .await
+        .map_err(|_| "PROJECT_STORAGE_ERROR: registry worker failed".to_string())?
+        .map_err(registry_error)?
+        .ok_or_else(|| format!("PROJECT_NOT_FOUND: project {project_id} was not found"))
+}
+
+fn sync_is_paused(ctx: &Context, project_id: &str) -> Result<bool, String> {
+    let project_id = parse_project_id(project_id)?.to_string();
+    ctx.paused_sync_projects
+        .read()
+        .map(|paused| paused.contains(&project_id))
+        .map_err(|_| "PROJECT_STATE_ERROR: pause state unavailable".to_string())
+}
+
+fn project_json(record: crate::sync::ProjectRecord, paused: bool) -> serde_json::Value {
+    serde_json::json!({
+        "project_id": record.project_id.to_string(),
+        "root_path": record.root_path,
+        "active_manifest": record.active_manifest.map(hex::encode),
+        "roster_epoch": record.roster_epoch,
+        "paused": paused,
+    })
+}
+
+fn registry_error(error: crate::sync::RegistryError) -> String {
+    use crate::sync::RegistryError;
+    match error {
+        RegistryError::ProjectNotFound(project_id) => {
+            format!("PROJECT_NOT_FOUND: project {project_id} was not found")
+        }
+        RegistryError::RootNotDirectory(path) => {
+            format!(
+                "INVALID_PROJECT_ROOT: {} is not a directory",
+                path.display()
+            )
+        }
+        RegistryError::NonUtf8Path(path) => {
+            format!(
+                "INVALID_PROJECT_ROOT: {} is not valid UTF-8",
+                path.display()
+            )
+        }
+        RegistryError::InvalidRoot => "INVALID_PROJECT_ROOT: project root is invalid".to_string(),
+        RegistryError::RootIdentityChanged(path) => format!(
+            "PROJECT_ROOT_CHANGED: {} changed after registration",
+            path.display()
+        ),
+        RegistryError::Security | RegistryError::Quarantined { .. } => {
+            "PROJECT_STORAGE_QUARANTINED: registry integrity check failed".to_string()
+        }
+        other => format!("PROJECT_STORAGE_ERROR: {other}"),
     }
 }
 
@@ -3258,12 +3759,7 @@ async fn query_gui_team_workers(app_socket: &str, team_id: &str) -> Vec<String> 
     let _ = wr.flush().await;
     let mut resp = String::new();
     let mut reader = BufReader::new(rd);
-    if let Ok(Ok(_)) = timeout(
-        Duration::from_secs(3),
-        reader.read_line(&mut resp),
-    )
-    .await
-    {
+    if let Ok(Ok(_)) = timeout(Duration::from_secs(3), reader.read_line(&mut resp)).await {
         if let Ok(v) = serde_json::from_str::<serde_json::Value>(&resp) {
             if let Some(agents) = v["result"]["agents"].as_array() {
                 return agents
@@ -3281,6 +3777,77 @@ async fn query_gui_team_workers(app_socket: &str, team_id: &str) -> Vec<String> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn bounded_line_reader_drains_oversized_envelopes_without_allocating_them() {
+        let input = format!("{}\nok\n", "x".repeat(17));
+        let mut reader = BufReader::new(input.as_bytes());
+        assert!(matches!(
+            read_bounded_line(&mut reader, 16).await.unwrap(),
+            BoundedLine::TooLarge
+        ));
+        match read_bounded_line(&mut reader, 16).await.unwrap() {
+            BoundedLine::Line(line) => assert_eq!(line, "ok"),
+            _ => panic!("oversized line must be fully drained"),
+        }
+    }
+
+    #[tokio::test]
+    async fn bounded_line_reader_has_exact_crlf_utf8_and_eof_semantics() {
+        let exact = format!("{}\r\n", "x".repeat(16));
+        let mut reader = BufReader::with_capacity(1, exact.as_bytes());
+        assert!(matches!(
+            read_bounded_line(&mut reader, 16).await.unwrap(),
+            BoundedLine::Line(line) if line.len() == 16
+        ));
+
+        let utf8 = "é\n";
+        let mut reader = BufReader::new(utf8.as_bytes());
+        assert!(matches!(
+            read_bounded_line(&mut reader, 2).await.unwrap(),
+            BoundedLine::Line(line) if line == "é"
+        ));
+        let mut reader = BufReader::new(utf8.as_bytes());
+        assert!(matches!(
+            read_bounded_line(&mut reader, 1).await.unwrap(),
+            BoundedLine::TooLarge
+        ));
+
+        let mut reader = BufReader::new(&b"eof"[..]);
+        assert!(matches!(
+            read_bounded_line(&mut reader, 3).await.unwrap(),
+            BoundedLine::Line(line) if line == "eof"
+        ));
+    }
+
+    #[test]
+    fn oversized_responses_are_replaced_by_a_bounded_error() {
+        let response = Response {
+            id: Some(json!(7)),
+            result: Some(json!("x".repeat(crate::sync::MAX_OPERATION_ENVELOPE_BYTES))),
+            error: None,
+        };
+        let encoded = serialize_bounded_response(&response, Some(json!(7))).unwrap();
+        assert!(encoded.len() <= crate::sync::MAX_OPERATION_ENVELOPE_BYTES);
+        let decoded: serde_json::Value = serde_json::from_slice(&encoded).unwrap();
+        assert_eq!(decoded["id"], 7);
+        assert_eq!(decoded["error"]["code"], -32603);
+        assert!(decoded["result"].is_null());
+    }
+
+    #[test]
+    fn subscriber_payload_accepts_actual_max_and_bounds_max_plus_one() {
+        let exact = "x".repeat(crate::sync::MAX_OPERATION_ENVELOPE_BYTES - 2);
+        let encoded = bounded_subscriber_payload(&exact).unwrap().unwrap();
+        assert_eq!(encoded.len(), crate::sync::MAX_OPERATION_ENVELOPE_BYTES);
+
+        let oversized = format!("{exact}x");
+        let encoded = bounded_subscriber_payload(&oversized).unwrap().unwrap();
+        assert!(encoded.len() <= crate::sync::MAX_OPERATION_ENVELOPE_BYTES);
+        let decoded: serde_json::Value = serde_json::from_slice(&encoded).unwrap();
+        assert_eq!(decoded["code"], "event_too_large");
+        assert_eq!(decoded["dropped"], true);
+    }
     use serde_json::json;
 
     // ── xk_run publish/subscribe (XK-EVENTS-v1) ──
@@ -3344,7 +3911,12 @@ mod tests {
         publish_xk_run(&valid_xk_params(), &tx).unwrap();
         let ev = rx.try_recv().unwrap();
         // Default subscriber filter set (events.subscribe with no kinds param).
-        let default_set = xk_kinds(&["task_status", "reply", "heartbeat_stale", "agent_usage_tick"]);
+        let default_set = xk_kinds(&[
+            "task_status",
+            "reply",
+            "heartbeat_stale",
+            "agent_usage_tick",
+        ]);
         assert!(
             filter_and_serialize(&ev, &default_set, None).is_none(),
             "default subscribers must not receive xk_run"
@@ -3575,11 +4147,11 @@ mod tests {
     fn watch_on_clamps_interval_to_minimum() {
         // Test that watch.on request with interval < MIN_WATCH_INTERVAL_SECS
         // results in the interval being clamped to 30
-        let requested_interval = 5u64;  // < 30
+        let requested_interval = 5u64; // < 30
         let clamped = if requested_interval == 0 {
-            300  // DEFAULT_WATCH_INTERVAL_SECS
+            300 // DEFAULT_WATCH_INTERVAL_SECS
         } else {
-            requested_interval.max(30)  // MIN_WATCH_INTERVAL_SECS
+            requested_interval.max(30) // MIN_WATCH_INTERVAL_SECS
         };
         assert_eq!(clamped, 30, "interval 5 should be clamped to 30");
 
@@ -3606,7 +4178,7 @@ mod tests {
     fn watch_state_enabled_construction() {
         // Test that WatchState::enabled applies defaults correctly
         let st = drift_watch::WatchState::enabled(
-            0,  // 0 triggers default
+            0, // 0 triggers default
             Some("executor".into()),
             "claude",
             "sonnet",

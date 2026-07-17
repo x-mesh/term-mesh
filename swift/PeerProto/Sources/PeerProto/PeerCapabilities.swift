@@ -24,11 +24,17 @@ public enum PeerCapability {
     /// `proto/peer/v1/peer.proto`'s "Workspace lifecycle" section).
     /// Mirrors `WORKSPACE_LIFECYCLE_V1` on the Rust side.
     public static let workspaceLifecycleV1 = "workspace.lifecycle.v1"
+    /// Deterministic daemon-owned surface reconciliation via
+    /// `EnsureSurfaceRequest`/`EnsureSurfaceResponse`.
+    public static let surfaceEnsureV1 = "surface.ensure.v1"
+    /// Exact ensured-surface termination via
+    /// `TerminateSurfaceRequest`/`TerminateSurfaceResponse`.
+    public static let surfaceTerminateV1 = "surface.terminate.v1"
 
     /// Every capability this build supports. Single source of truth for
     /// populating outgoing `Hello.capabilities` — don't hand-roll the list
     /// at each call site.
-    public static let supported: [String] = [ptyDataCoalesceV1, replayRingV1, workspaceLifecycleV1]
+    public static let supported: [String] = [ptyDataCoalesceV1, replayRingV1, workspaceLifecycleV1, surfaceEnsureV1, surfaceTerminateV1]
 }
 
 /// The other side's advertised feature flags, parsed once out of its

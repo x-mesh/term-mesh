@@ -53,6 +53,11 @@ public actor PeerSessionDemux {
 
     private var continuations: [Data: AsyncStream<PeerPtyChunk>.Continuation] = [:]
 
+    /// Pending request/response RPCs share the same peer connection, but the
+    /// daemon may complete them out of order.  Keep their continuations here
+    /// rather than coupling completion order to wire order.
+    private var ensureWaiters: [Data: AsyncThrowingStream<Termmesh_Peer_V1_EnsureSurfaceResponse, Error>.Continuation] = [:]
+
     /// Per-surface count of chunks dropped by the `bufferingNewest` policy
     /// (a slow pane whose relay is backed up). This is an app-side
     /// truncation source distinct from the host's broadcast `Lagged` drop;
@@ -66,6 +71,74 @@ public actor PeerSessionDemux {
     private var onDrop: (@Sendable (_ surfaceID: Data, _ totalDropped: Int) -> Void)?
 
     public init() {}
+
+    func registerEnsure(
+        requestID: Data
+    ) throws -> AsyncThrowingStream<Termmesh_Peer_V1_EnsureSurfaceResponse, Error> {
+        guard ensureWaiters[requestID] == nil else {
+            throw PeerSessionError.duplicateEnsureRequestID
+        }
+        var captured: AsyncThrowingStream<Termmesh_Peer_V1_EnsureSurfaceResponse, Error>.Continuation!
+        let stream = AsyncThrowingStream<Termmesh_Peer_V1_EnsureSurfaceResponse, Error> { continuation in
+            captured = continuation
+        }
+        ensureWaiters[requestID] = captured
+        return stream
+    }
+
+    /// Completes at most one waiter. Duplicate, late, and unknown responses
+    /// are harmless no-ops because the continuation is removed before resume.
+    func routeEnsureResponse(_ response: Termmesh_Peer_V1_EnsureSurfaceResponse) {
+        guard response.requestID.count == 16 else {
+            failAllEnsures(error: PeerSessionError.malformedEnsureResponse("request_id must be 16 bytes"))
+            return
+        }
+        guard let continuation = ensureWaiters.removeValue(forKey: response.requestID) else {
+            return
+        }
+        if let reason = Self.ensureResponseValidationError(response) {
+            continuation.finish(throwing: PeerSessionError.malformedEnsureResponse(reason))
+        } else {
+            continuation.yield(response)
+            continuation.finish()
+        }
+    }
+
+    var pendingEnsureCount: Int { ensureWaiters.count }
+
+    func failAllEnsures(error: Error) {
+        let waiters = ensureWaiters.values
+        ensureWaiters.removeAll()
+        for continuation in waiters {
+            continuation.finish(throwing: error)
+        }
+    }
+
+    func failEnsure(requestID: Data, error: Error) {
+        ensureWaiters.removeValue(forKey: requestID)?.finish(throwing: error)
+    }
+
+    func cancelEnsure(requestID: Data) {
+        ensureWaiters.removeValue(forKey: requestID)?.finish(throwing: CancellationError())
+    }
+
+    private static func ensureResponseValidationError(
+        _ response: Termmesh_Peer_V1_EnsureSurfaceResponse
+    ) -> String? {
+        switch response.result {
+        case .created, .reused, .recreated:
+            guard response.surfaceID.count == 16 else { return "surface_id must be 16 bytes" }
+            guard response.instanceID.count == 16 else { return "instance_id must be 16 bytes" }
+            guard response.specHash.count == 32 else { return "spec_hash must be 32 bytes" }
+            guard !response.hasError else { return "successful response must not contain error" }
+        case .specConflict, .failed:
+            guard response.hasError else { return "failure response must contain error" }
+            guard response.error.code != .unspecified else { return "failure error code must be specified" }
+        case .unspecified, .UNRECOGNIZED:
+            return "result must be recognized and specified"
+        }
+        return nil
+    }
 
     /// Install the drop observer (see `onDrop`). Actor-isolated setter so
     /// the app can wire a `dlog` closure without exposing mutable state.

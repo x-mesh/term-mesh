@@ -493,10 +493,14 @@ pub fn sweep_zombie_pane_archives() -> usize {
             continue;
         }
         let agent_metas = read_all_agent_metas(&entry.archived_dir, &entry.team_uuid);
-        let all_sessions_missing = team_meta.agents.iter().all(|name| match agent_metas.get(name) {
-            Some(m) => m.session_id.is_none(),
-            None => true,
-        });
+        let all_sessions_missing =
+            team_meta
+                .agents
+                .iter()
+                .all(|name| match agent_metas.get(name) {
+                    Some(m) => m.session_id.is_none(),
+                    None => true,
+                });
         if !all_sessions_missing {
             continue;
         }

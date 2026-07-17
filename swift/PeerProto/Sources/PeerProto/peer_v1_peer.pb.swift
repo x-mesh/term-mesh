@@ -81,6 +81,289 @@ public nonisolated enum Termmesh_Peer_V1_AttachMode: SwiftProtobuf.Enum, Swift.C
 
 }
 
+public nonisolated enum Termmesh_Peer_V1_EnsureSurfaceRestartPolicy: SwiftProtobuf.Enum, Swift.CaseIterable {
+  public typealias RawValue = Int
+  case unspecified // = 0
+
+  /// The logical key is forgotten when its process exits.
+  case never // = 1
+
+  /// Preserve the logical key/spec and recreate the process after daemon start.
+  case onDaemonRestart // = 2
+  case UNRECOGNIZED(Int)
+
+  public init() {
+    self = .unspecified
+  }
+
+  public init?(rawValue: Int) {
+    switch rawValue {
+    case 0: self = .unspecified
+    case 1: self = .never
+    case 2: self = .onDaemonRestart
+    default: self = .UNRECOGNIZED(rawValue)
+    }
+  }
+
+  public var rawValue: Int {
+    switch self {
+    case .unspecified: return 0
+    case .never: return 1
+    case .onDaemonRestart: return 2
+    case .UNRECOGNIZED(let i): return i
+    }
+  }
+
+  // The compiler won't synthesize support with the UNRECOGNIZED case.
+  public static let allCases: [Termmesh_Peer_V1_EnsureSurfaceRestartPolicy] = [
+    .unspecified,
+    .never,
+    .onDaemonRestart,
+  ]
+
+}
+
+public nonisolated enum Termmesh_Peer_V1_EnsureSurfaceResult: SwiftProtobuf.Enum, Swift.CaseIterable {
+  public typealias RawValue = Int
+  case unspecified // = 0
+  case created // = 1
+  case reused // = 2
+  case recreated // = 3
+  case specConflict // = 4
+  case failed // = 5
+  case UNRECOGNIZED(Int)
+
+  public init() {
+    self = .unspecified
+  }
+
+  public init?(rawValue: Int) {
+    switch rawValue {
+    case 0: self = .unspecified
+    case 1: self = .created
+    case 2: self = .reused
+    case 3: self = .recreated
+    case 4: self = .specConflict
+    case 5: self = .failed
+    default: self = .UNRECOGNIZED(rawValue)
+    }
+  }
+
+  public var rawValue: Int {
+    switch self {
+    case .unspecified: return 0
+    case .created: return 1
+    case .reused: return 2
+    case .recreated: return 3
+    case .specConflict: return 4
+    case .failed: return 5
+    case .UNRECOGNIZED(let i): return i
+    }
+  }
+
+  // The compiler won't synthesize support with the UNRECOGNIZED case.
+  public static let allCases: [Termmesh_Peer_V1_EnsureSurfaceResult] = [
+    .unspecified,
+    .created,
+    .reused,
+    .recreated,
+    .specConflict,
+    .failed,
+  ]
+
+}
+
+public nonisolated enum Termmesh_Peer_V1_EnsureSurfaceErrorCode: SwiftProtobuf.Enum, Swift.CaseIterable {
+  public typealias RawValue = Int
+  case unspecified // = 0
+  case invalidRequest // = 1
+
+  /// The decoded request violates a field limit above. Frames over 16 MiB are
+  /// rejected earlier by framing as ERR_FRAME_TOO_LARGE.
+  case requestTooLarge // = 2
+  case duplicateRequestID // = 3
+  case cwdNotFound // = 4
+  case cwdNotDirectory // = 5
+  case cwdPermissionDenied // = 6
+  case commandNotFound // = 7
+  case commandExited // = 8
+  case specConflict // = 9
+  case `internal` // = 10
+  case commandPermissionDenied // = 11
+  case commandSignaled // = 12
+
+  /// exec(3) failed with an errno other than not-found or permission-denied.
+  case commandExecError // = 13
+
+  /// chdir(2) failed with an errno not covered by the specific cwd codes.
+  case cwdError // = 14
+  case execHandshakeTruncated // = 15
+  case execHandshakeInvalidStage // = 16
+  case execHandshakeTimeout // = 17
+  case UNRECOGNIZED(Int)
+
+  public init() {
+    self = .unspecified
+  }
+
+  public init?(rawValue: Int) {
+    switch rawValue {
+    case 0: self = .unspecified
+    case 1: self = .invalidRequest
+    case 2: self = .requestTooLarge
+    case 3: self = .duplicateRequestID
+    case 4: self = .cwdNotFound
+    case 5: self = .cwdNotDirectory
+    case 6: self = .cwdPermissionDenied
+    case 7: self = .commandNotFound
+    case 8: self = .commandExited
+    case 9: self = .specConflict
+    case 10: self = .internal
+    case 11: self = .commandPermissionDenied
+    case 12: self = .commandSignaled
+    case 13: self = .commandExecError
+    case 14: self = .cwdError
+    case 15: self = .execHandshakeTruncated
+    case 16: self = .execHandshakeInvalidStage
+    case 17: self = .execHandshakeTimeout
+    default: self = .UNRECOGNIZED(rawValue)
+    }
+  }
+
+  public var rawValue: Int {
+    switch self {
+    case .unspecified: return 0
+    case .invalidRequest: return 1
+    case .requestTooLarge: return 2
+    case .duplicateRequestID: return 3
+    case .cwdNotFound: return 4
+    case .cwdNotDirectory: return 5
+    case .cwdPermissionDenied: return 6
+    case .commandNotFound: return 7
+    case .commandExited: return 8
+    case .specConflict: return 9
+    case .internal: return 10
+    case .commandPermissionDenied: return 11
+    case .commandSignaled: return 12
+    case .commandExecError: return 13
+    case .cwdError: return 14
+    case .execHandshakeTruncated: return 15
+    case .execHandshakeInvalidStage: return 16
+    case .execHandshakeTimeout: return 17
+    case .UNRECOGNIZED(let i): return i
+    }
+  }
+
+  // The compiler won't synthesize support with the UNRECOGNIZED case.
+  public static let allCases: [Termmesh_Peer_V1_EnsureSurfaceErrorCode] = [
+    .unspecified,
+    .invalidRequest,
+    .requestTooLarge,
+    .duplicateRequestID,
+    .cwdNotFound,
+    .cwdNotDirectory,
+    .cwdPermissionDenied,
+    .commandNotFound,
+    .commandExited,
+    .specConflict,
+    .internal,
+    .commandPermissionDenied,
+    .commandSignaled,
+    .commandExecError,
+    .cwdError,
+    .execHandshakeTruncated,
+    .execHandshakeInvalidStage,
+    .execHandshakeTimeout,
+  ]
+
+}
+
+public nonisolated enum Termmesh_Peer_V1_TerminateSurfaceResult: SwiftProtobuf.Enum, Swift.CaseIterable {
+  public typealias RawValue = Int
+  case unspecified // = 0
+  case terminated // = 1
+
+  /// Idempotent success: the exact surface does not exist or is not ensured.
+  case notFound // = 2
+  case failed // = 3
+  case UNRECOGNIZED(Int)
+
+  public init() {
+    self = .unspecified
+  }
+
+  public init?(rawValue: Int) {
+    switch rawValue {
+    case 0: self = .unspecified
+    case 1: self = .terminated
+    case 2: self = .notFound
+    case 3: self = .failed
+    default: self = .UNRECOGNIZED(rawValue)
+    }
+  }
+
+  public var rawValue: Int {
+    switch self {
+    case .unspecified: return 0
+    case .terminated: return 1
+    case .notFound: return 2
+    case .failed: return 3
+    case .UNRECOGNIZED(let i): return i
+    }
+  }
+
+  // The compiler won't synthesize support with the UNRECOGNIZED case.
+  public static let allCases: [Termmesh_Peer_V1_TerminateSurfaceResult] = [
+    .unspecified,
+    .terminated,
+    .notFound,
+    .failed,
+  ]
+
+}
+
+public nonisolated enum Termmesh_Peer_V1_TerminateSurfaceErrorCode: SwiftProtobuf.Enum, Swift.CaseIterable {
+  public typealias RawValue = Int
+  case unspecified // = 0
+  case invalidRequest // = 1
+  case duplicateRequestID // = 2
+  case `internal` // = 3
+  case UNRECOGNIZED(Int)
+
+  public init() {
+    self = .unspecified
+  }
+
+  public init?(rawValue: Int) {
+    switch rawValue {
+    case 0: self = .unspecified
+    case 1: self = .invalidRequest
+    case 2: self = .duplicateRequestID
+    case 3: self = .internal
+    default: self = .UNRECOGNIZED(rawValue)
+    }
+  }
+
+  public var rawValue: Int {
+    switch self {
+    case .unspecified: return 0
+    case .invalidRequest: return 1
+    case .duplicateRequestID: return 2
+    case .internal: return 3
+    case .UNRECOGNIZED(let i): return i
+    }
+  }
+
+  // The compiler won't synthesize support with the UNRECOGNIZED case.
+  public static let allCases: [Termmesh_Peer_V1_TerminateSurfaceErrorCode] = [
+    .unspecified,
+    .invalidRequest,
+    .duplicateRequestID,
+    .internal,
+  ]
+
+}
+
 /// Every frame on the wire is a length-prefixed Envelope.
 /// Frames larger than 16 MiB must be rejected with ERR_FRAME_TOO_LARGE.
 public nonisolated struct Termmesh_Peer_V1_Envelope: Sendable {
@@ -274,6 +557,40 @@ public nonisolated struct Termmesh_Peer_V1_Envelope: Sendable {
     set {payload = .deleteWorkspaceRequest(newValue)}
   }
 
+  /// Gated behind capability "surface.ensure.v1" (Hello.capabilities).
+  public var ensureSurfaceRequest: Termmesh_Peer_V1_EnsureSurfaceRequest {
+    get {
+      if case .ensureSurfaceRequest(let v)? = payload {return v}
+      return Termmesh_Peer_V1_EnsureSurfaceRequest()
+    }
+    set {payload = .ensureSurfaceRequest(newValue)}
+  }
+
+  public var ensureSurfaceResponse: Termmesh_Peer_V1_EnsureSurfaceResponse {
+    get {
+      if case .ensureSurfaceResponse(let v)? = payload {return v}
+      return Termmesh_Peer_V1_EnsureSurfaceResponse()
+    }
+    set {payload = .ensureSurfaceResponse(newValue)}
+  }
+
+  /// Gated behind capability "surface.terminate.v1" (Hello.capabilities).
+  public var terminateSurfaceRequest: Termmesh_Peer_V1_TerminateSurfaceRequest {
+    get {
+      if case .terminateSurfaceRequest(let v)? = payload {return v}
+      return Termmesh_Peer_V1_TerminateSurfaceRequest()
+    }
+    set {payload = .terminateSurfaceRequest(newValue)}
+  }
+
+  public var terminateSurfaceResponse: Termmesh_Peer_V1_TerminateSurfaceResponse {
+    get {
+      if case .terminateSurfaceResponse(let v)? = payload {return v}
+      return Termmesh_Peer_V1_TerminateSurfaceResponse()
+    }
+    set {payload = .terminateSurfaceResponse(newValue)}
+  }
+
   public var ping: Termmesh_Peer_V1_Ping {
     get {
       if case .ping(let v)? = payload {return v}
@@ -333,6 +650,12 @@ public nonisolated struct Termmesh_Peer_V1_Envelope: Sendable {
     /// Gated behind capability "workspace.lifecycle.v1" (Hello.capabilities).
     case renameWorkspaceRequest(Termmesh_Peer_V1_RenameWorkspaceRequest)
     case deleteWorkspaceRequest(Termmesh_Peer_V1_DeleteWorkspaceRequest)
+    /// Gated behind capability "surface.ensure.v1" (Hello.capabilities).
+    case ensureSurfaceRequest(Termmesh_Peer_V1_EnsureSurfaceRequest)
+    case ensureSurfaceResponse(Termmesh_Peer_V1_EnsureSurfaceResponse)
+    /// Gated behind capability "surface.terminate.v1" (Hello.capabilities).
+    case terminateSurfaceRequest(Termmesh_Peer_V1_TerminateSurfaceRequest)
+    case terminateSurfaceResponse(Termmesh_Peer_V1_TerminateSurfaceResponse)
     case ping(Termmesh_Peer_V1_Ping)
     case pong(Termmesh_Peer_V1_Pong)
     case goodbye(Termmesh_Peer_V1_Goodbye)
@@ -533,6 +856,171 @@ public nonisolated struct Termmesh_Peer_V1_DetachSurface: Sendable {
   public var unknownFields = SwiftProtobuf.UnknownStorage()
 
   public init() {}
+}
+
+public nonisolated struct Termmesh_Peer_V1_EnsureSurfaceRequest: Sendable {
+  // SwiftProtobuf.Message conformance is added in an extension below. See the
+  // `Message` and `Message+*Additions` files in the SwiftProtobuf library for
+  // methods supported on all messages.
+
+  /// Exactly 16 opaque bytes. A daemon MUST reject reuse of a request_id,
+  /// including reuse with identical content, as DUPLICATE_REQUEST_ID. Retrying
+  /// an identical spec with a fresh request_id is safe and returns REUSED.
+  public var requestID: Data = Data()
+
+  /// Caller-scoped logical identity. UTF-8, non-empty, at most 256 bytes.
+  public var key: String = String()
+
+  /// Absolute existing directory. UTF-8, non-empty, at most 4096 bytes.
+  public var cwd: String = String()
+
+  /// Absolute executable path. UTF-8, non-empty, at most 4096 bytes.
+  public var executable: String = String()
+
+  /// Arguments exclude argv[0]. At most 256 entries, each at most 64 KiB.
+  public var args: [String] = []
+
+  public var restartPolicy: Termmesh_Peer_V1_EnsureSurfaceRestartPolicy = .unspecified
+
+  public var unknownFields = SwiftProtobuf.UnknownStorage()
+
+  public init() {}
+}
+
+public nonisolated struct Termmesh_Peer_V1_EnsureSurfaceError: Sendable {
+  // SwiftProtobuf.Message conformance is added in an extension below. See the
+  // `Message` and `Message+*Additions` files in the SwiftProtobuf library for
+  // methods supported on all messages.
+
+  public var code: Termmesh_Peer_V1_EnsureSurfaceErrorCode = .unspecified
+
+  /// Stable machine-readable stage, e.g. "validate", "chdir", or "exec".
+  public var stage: String = String()
+
+  /// Redacted diagnostic context. MUST NOT contain args or environment values.
+  public var safeContext: String = String()
+
+  /// Child exit status when code is COMMAND_EXITED; zero otherwise.
+  public var exitCode: Int32 = 0
+
+  /// Terminating signal when code is COMMAND_SIGNALED; zero otherwise.
+  public var signal: Int32 = 0
+
+  /// Unix errno for CWD_ERROR or COMMAND_EXEC_ERROR; zero otherwise.
+  public var osError: Int32 = 0
+
+  public var unknownFields = SwiftProtobuf.UnknownStorage()
+
+  public init() {}
+}
+
+public nonisolated struct Termmesh_Peer_V1_EnsureSurfaceResponse: Sendable {
+  // SwiftProtobuf.Message conformance is added in an extension below. See the
+  // `Message` and `Message+*Additions` files in the SwiftProtobuf library for
+  // methods supported on all messages.
+
+  /// Echoes EnsureSurfaceRequest.request_id exactly.
+  public var requestID: Data = Data()
+
+  public var result: Termmesh_Peer_V1_EnsureSurfaceResult = .unspecified
+
+  /// Stable for a logical key, including across daemon recreation.
+  public var surfaceID: Data = Data()
+
+  /// Unique to one live PTY process instance.
+  public var instanceID: Data = Data()
+
+  /// Monotonically increases whenever a key is recreated.
+  public var generation: UInt64 = 0
+
+  /// Host process id for diagnostics; zero when no process is running.
+  public var pid: UInt32 = 0
+
+  /// Canonical hash of cwd/executable/args/restart_policy. Never raw secrets.
+  public var specHash: Data = Data()
+
+  /// Present for SPEC_CONFLICT and FAILED; absent on success.
+  public var error: Termmesh_Peer_V1_EnsureSurfaceError {
+    get {_error ?? Termmesh_Peer_V1_EnsureSurfaceError()}
+    set {_error = newValue}
+  }
+  /// Returns true if `error` has been explicitly set.
+  public var hasError: Bool {self._error != nil}
+  /// Clears the value of `error`. Subsequent reads from it will return its default value.
+  public mutating func clearError() {self._error = nil}
+
+  public var unknownFields = SwiftProtobuf.UnknownStorage()
+
+  public init() {}
+
+  fileprivate var _error: Termmesh_Peer_V1_EnsureSurfaceError? = nil
+}
+
+/// TerminateSurface removes exactly one ensured surface from the live PTY
+/// registry, durable ensured-state, and workspace layout. It never selects a
+/// surface by name or by current attachment.
+public nonisolated struct Termmesh_Peer_V1_TerminateSurfaceRequest: Sendable {
+  // SwiftProtobuf.Message conformance is added in an extension below. See the
+  // `Message` and `Message+*Additions` files in the SwiftProtobuf library for
+  // methods supported on all messages.
+
+  /// Exactly 16 opaque bytes; one-shot for the authenticated connection.
+  public var requestID: Data = Data()
+
+  /// Exact 16-byte SurfaceInfo.surface_id returned by EnsureSurfaceResponse.
+  public var surfaceID: Data = Data()
+
+  public var unknownFields = SwiftProtobuf.UnknownStorage()
+
+  public init() {}
+}
+
+public nonisolated struct Termmesh_Peer_V1_TerminateSurfaceError: Sendable {
+  // SwiftProtobuf.Message conformance is added in an extension below. See the
+  // `Message` and `Message+*Additions` files in the SwiftProtobuf library for
+  // methods supported on all messages.
+
+  public var code: Termmesh_Peer_V1_TerminateSurfaceErrorCode = .unspecified
+
+  /// Stable machine-readable stage: "validate", "terminate", or "internal".
+  public var stage: String = String()
+
+  /// Redacted diagnostic context; never command, args, env, or secrets.
+  public var safeContext: String = String()
+
+  public var unknownFields = SwiftProtobuf.UnknownStorage()
+
+  public init() {}
+}
+
+public nonisolated struct Termmesh_Peer_V1_TerminateSurfaceResponse: Sendable {
+  // SwiftProtobuf.Message conformance is added in an extension below. See the
+  // `Message` and `Message+*Additions` files in the SwiftProtobuf library for
+  // methods supported on all messages.
+
+  /// Echoes TerminateSurfaceRequest.request_id exactly.
+  public var requestID: Data = Data()
+
+  public var result: Termmesh_Peer_V1_TerminateSurfaceResult = .unspecified
+
+  /// Echoes the exact requested surface_id on every result.
+  public var surfaceID: Data = Data()
+
+  /// Present only for FAILED; absent for TERMINATED and NOT_FOUND.
+  public var error: Termmesh_Peer_V1_TerminateSurfaceError {
+    get {_error ?? Termmesh_Peer_V1_TerminateSurfaceError()}
+    set {_error = newValue}
+  }
+  /// Returns true if `error` has been explicitly set.
+  public var hasError: Bool {self._error != nil}
+  /// Clears the value of `error`. Subsequent reads from it will return its default value.
+  public mutating func clearError() {self._error = nil}
+
+  public var unknownFields = SwiftProtobuf.UnknownStorage()
+
+  public init() {}
+
+  fileprivate var _error: Termmesh_Peer_V1_TerminateSurfaceError? = nil
 }
 
 public nonisolated struct Termmesh_Peer_V1_ListWorkspaces: Sendable {
@@ -1477,9 +1965,29 @@ nonisolated extension Termmesh_Peer_V1_AttachMode: SwiftProtobuf._ProtoNameProvi
   public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{2}\0ATTACH_MODE_UNSPECIFIED\0\u{1}ATTACH_MODE_READ_ONLY\0\u{1}ATTACH_MODE_CO_WRITE\0\u{1}ATTACH_MODE_TAKE_OVER\0")
 }
 
+nonisolated extension Termmesh_Peer_V1_EnsureSurfaceRestartPolicy: SwiftProtobuf._ProtoNameProviding {
+  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{2}\0ENSURE_SURFACE_RESTART_POLICY_UNSPECIFIED\0\u{1}ENSURE_SURFACE_RESTART_POLICY_NEVER\0\u{1}ENSURE_SURFACE_RESTART_POLICY_ON_DAEMON_RESTART\0")
+}
+
+nonisolated extension Termmesh_Peer_V1_EnsureSurfaceResult: SwiftProtobuf._ProtoNameProviding {
+  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{2}\0ENSURE_SURFACE_RESULT_UNSPECIFIED\0\u{1}ENSURE_SURFACE_RESULT_CREATED\0\u{1}ENSURE_SURFACE_RESULT_REUSED\0\u{1}ENSURE_SURFACE_RESULT_RECREATED\0\u{1}ENSURE_SURFACE_RESULT_SPEC_CONFLICT\0\u{1}ENSURE_SURFACE_RESULT_FAILED\0")
+}
+
+nonisolated extension Termmesh_Peer_V1_EnsureSurfaceErrorCode: SwiftProtobuf._ProtoNameProviding {
+  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{2}\0ENSURE_SURFACE_ERROR_CODE_UNSPECIFIED\0\u{1}ENSURE_SURFACE_ERROR_CODE_INVALID_REQUEST\0\u{1}ENSURE_SURFACE_ERROR_CODE_REQUEST_TOO_LARGE\0\u{1}ENSURE_SURFACE_ERROR_CODE_DUPLICATE_REQUEST_ID\0\u{1}ENSURE_SURFACE_ERROR_CODE_CWD_NOT_FOUND\0\u{1}ENSURE_SURFACE_ERROR_CODE_CWD_NOT_DIRECTORY\0\u{1}ENSURE_SURFACE_ERROR_CODE_CWD_PERMISSION_DENIED\0\u{1}ENSURE_SURFACE_ERROR_CODE_COMMAND_NOT_FOUND\0\u{1}ENSURE_SURFACE_ERROR_CODE_COMMAND_EXITED\0\u{1}ENSURE_SURFACE_ERROR_CODE_SPEC_CONFLICT\0\u{1}ENSURE_SURFACE_ERROR_CODE_INTERNAL\0\u{1}ENSURE_SURFACE_ERROR_CODE_COMMAND_PERMISSION_DENIED\0\u{1}ENSURE_SURFACE_ERROR_CODE_COMMAND_SIGNALED\0\u{1}ENSURE_SURFACE_ERROR_CODE_COMMAND_EXEC_ERROR\0\u{1}ENSURE_SURFACE_ERROR_CODE_CWD_ERROR\0\u{1}ENSURE_SURFACE_ERROR_CODE_EXEC_HANDSHAKE_TRUNCATED\0\u{1}ENSURE_SURFACE_ERROR_CODE_EXEC_HANDSHAKE_INVALID_STAGE\0\u{1}ENSURE_SURFACE_ERROR_CODE_EXEC_HANDSHAKE_TIMEOUT\0")
+}
+
+nonisolated extension Termmesh_Peer_V1_TerminateSurfaceResult: SwiftProtobuf._ProtoNameProviding {
+  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{2}\0TERMINATE_SURFACE_RESULT_UNSPECIFIED\0\u{1}TERMINATE_SURFACE_RESULT_TERMINATED\0\u{1}TERMINATE_SURFACE_RESULT_NOT_FOUND\0\u{1}TERMINATE_SURFACE_RESULT_FAILED\0")
+}
+
+nonisolated extension Termmesh_Peer_V1_TerminateSurfaceErrorCode: SwiftProtobuf._ProtoNameProviding {
+  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{2}\0TERMINATE_SURFACE_ERROR_CODE_UNSPECIFIED\0\u{1}TERMINATE_SURFACE_ERROR_CODE_INVALID_REQUEST\0\u{1}TERMINATE_SURFACE_ERROR_CODE_DUPLICATE_REQUEST_ID\0\u{1}TERMINATE_SURFACE_ERROR_CODE_INTERNAL\0")
+}
+
 nonisolated extension Termmesh_Peer_V1_Envelope: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
   public static let protoMessageName: String = _protobuf_package + ".Envelope"
-  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{1}seq\0\u{3}correlation_id\0\u{2}\u{8}hello\0\u{3}auth_challenge\0\u{1}auth\0\u{3}auth_result\0\u{4}\u{7}list_surfaces\0\u{3}surface_list\0\u{3}attach_surface\0\u{3}attach_result\0\u{3}detach_surface\0\u{3}list_workspaces\0\u{3}workspace_list\0\u{3}workspace_control\0\u{3}create_workspace_request\0\u{3}create_workspace_response\0\u{3}pty_data\0\u{1}input\0\u{1}resize\0\u{3}grid_snapshot\0\u{3}data_ack\0\u{4}\u{6}workspace_update\0\u{3}rename_workspace_request\0\u{3}delete_workspace_request\0\u{2}\u{8}ping\0\u{1}pong\0\u{2}\u{9}goodbye\0\u{2}'error\0")
+  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{1}seq\0\u{3}correlation_id\0\u{2}\u{8}hello\0\u{3}auth_challenge\0\u{1}auth\0\u{3}auth_result\0\u{4}\u{7}list_surfaces\0\u{3}surface_list\0\u{3}attach_surface\0\u{3}attach_result\0\u{3}detach_surface\0\u{3}list_workspaces\0\u{3}workspace_list\0\u{3}workspace_control\0\u{3}create_workspace_request\0\u{3}create_workspace_response\0\u{3}pty_data\0\u{1}input\0\u{1}resize\0\u{3}grid_snapshot\0\u{3}data_ack\0\u{4}\u{6}workspace_update\0\u{3}rename_workspace_request\0\u{3}delete_workspace_request\0\u{3}ensure_surface_request\0\u{3}ensure_surface_response\0\u{3}terminate_surface_request\0\u{3}terminate_surface_response\0\u{2}\u{4}ping\0\u{1}pong\0\u{2}\u{9}goodbye\0\u{2}'error\0")
 
   public mutating func decodeMessage<D: SwiftProtobuf.Decoder>(decoder: inout D) throws {
     while let fieldNumber = try decoder.nextFieldNumber() {
@@ -1775,6 +2283,58 @@ nonisolated extension Termmesh_Peer_V1_Envelope: SwiftProtobuf.Message, SwiftPro
           self.payload = .deleteWorkspaceRequest(v)
         }
       }()
+      case 43: try {
+        var v: Termmesh_Peer_V1_EnsureSurfaceRequest?
+        var hadOneofValue = false
+        if let current = self.payload {
+          hadOneofValue = true
+          if case .ensureSurfaceRequest(let m) = current {v = m}
+        }
+        try decoder.decodeSingularMessageField(value: &v)
+        if let v = v {
+          if hadOneofValue {try decoder.handleConflictingOneOf()}
+          self.payload = .ensureSurfaceRequest(v)
+        }
+      }()
+      case 44: try {
+        var v: Termmesh_Peer_V1_EnsureSurfaceResponse?
+        var hadOneofValue = false
+        if let current = self.payload {
+          hadOneofValue = true
+          if case .ensureSurfaceResponse(let m) = current {v = m}
+        }
+        try decoder.decodeSingularMessageField(value: &v)
+        if let v = v {
+          if hadOneofValue {try decoder.handleConflictingOneOf()}
+          self.payload = .ensureSurfaceResponse(v)
+        }
+      }()
+      case 45: try {
+        var v: Termmesh_Peer_V1_TerminateSurfaceRequest?
+        var hadOneofValue = false
+        if let current = self.payload {
+          hadOneofValue = true
+          if case .terminateSurfaceRequest(let m) = current {v = m}
+        }
+        try decoder.decodeSingularMessageField(value: &v)
+        if let v = v {
+          if hadOneofValue {try decoder.handleConflictingOneOf()}
+          self.payload = .terminateSurfaceRequest(v)
+        }
+      }()
+      case 46: try {
+        var v: Termmesh_Peer_V1_TerminateSurfaceResponse?
+        var hadOneofValue = false
+        if let current = self.payload {
+          hadOneofValue = true
+          if case .terminateSurfaceResponse(let m) = current {v = m}
+        }
+        try decoder.decodeSingularMessageField(value: &v)
+        if let v = v {
+          if hadOneofValue {try decoder.handleConflictingOneOf()}
+          self.payload = .terminateSurfaceResponse(v)
+        }
+      }()
       case 50: try {
         var v: Termmesh_Peer_V1_Ping?
         var hadOneofValue = false
@@ -1931,6 +2491,22 @@ nonisolated extension Termmesh_Peer_V1_Envelope: SwiftProtobuf.Message, SwiftPro
     case .deleteWorkspaceRequest?: try {
       guard case .deleteWorkspaceRequest(let v)? = self.payload else { preconditionFailure() }
       try visitor.visitSingularMessageField(value: v, fieldNumber: 42)
+    }()
+    case .ensureSurfaceRequest?: try {
+      guard case .ensureSurfaceRequest(let v)? = self.payload else { preconditionFailure() }
+      try visitor.visitSingularMessageField(value: v, fieldNumber: 43)
+    }()
+    case .ensureSurfaceResponse?: try {
+      guard case .ensureSurfaceResponse(let v)? = self.payload else { preconditionFailure() }
+      try visitor.visitSingularMessageField(value: v, fieldNumber: 44)
+    }()
+    case .terminateSurfaceRequest?: try {
+      guard case .terminateSurfaceRequest(let v)? = self.payload else { preconditionFailure() }
+      try visitor.visitSingularMessageField(value: v, fieldNumber: 45)
+    }()
+    case .terminateSurfaceResponse?: try {
+      guard case .terminateSurfaceResponse(let v)? = self.payload else { preconditionFailure() }
+      try visitor.visitSingularMessageField(value: v, fieldNumber: 46)
     }()
     case .ping?: try {
       guard case .ping(let v)? = self.payload else { preconditionFailure() }
@@ -2371,6 +2947,309 @@ nonisolated extension Termmesh_Peer_V1_DetachSurface: SwiftProtobuf.Message, Swi
 
   public static func ==(lhs: Termmesh_Peer_V1_DetachSurface, rhs: Termmesh_Peer_V1_DetachSurface) -> Bool {
     if lhs.surfaceID != rhs.surfaceID {return false}
+    if lhs.unknownFields != rhs.unknownFields {return false}
+    return true
+  }
+}
+
+nonisolated extension Termmesh_Peer_V1_EnsureSurfaceRequest: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
+  public static let protoMessageName: String = _protobuf_package + ".EnsureSurfaceRequest"
+  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{3}request_id\0\u{1}key\0\u{1}cwd\0\u{1}executable\0\u{1}args\0\u{3}restart_policy\0")
+
+  public mutating func decodeMessage<D: SwiftProtobuf.Decoder>(decoder: inout D) throws {
+    while let fieldNumber = try decoder.nextFieldNumber() {
+      // The use of inline closures is to circumvent an issue where the compiler
+      // allocates stack space for every case branch when no optimizations are
+      // enabled. https://github.com/apple/swift-protobuf/issues/1034
+      switch fieldNumber {
+      case 1: try { try decoder.decodeSingularBytesField(value: &self.requestID) }()
+      case 2: try { try decoder.decodeSingularStringField(value: &self.key) }()
+      case 3: try { try decoder.decodeSingularStringField(value: &self.cwd) }()
+      case 4: try { try decoder.decodeSingularStringField(value: &self.executable) }()
+      case 5: try { try decoder.decodeRepeatedStringField(value: &self.args) }()
+      case 6: try { try decoder.decodeSingularEnumField(value: &self.restartPolicy) }()
+      default: break
+      }
+    }
+  }
+
+  public func traverse<V: SwiftProtobuf.Visitor>(visitor: inout V) throws {
+    if !self.requestID.isEmpty {
+      try visitor.visitSingularBytesField(value: self.requestID, fieldNumber: 1)
+    }
+    if !self.key.isEmpty {
+      try visitor.visitSingularStringField(value: self.key, fieldNumber: 2)
+    }
+    if !self.cwd.isEmpty {
+      try visitor.visitSingularStringField(value: self.cwd, fieldNumber: 3)
+    }
+    if !self.executable.isEmpty {
+      try visitor.visitSingularStringField(value: self.executable, fieldNumber: 4)
+    }
+    if !self.args.isEmpty {
+      try visitor.visitRepeatedStringField(value: self.args, fieldNumber: 5)
+    }
+    if self.restartPolicy != .unspecified {
+      try visitor.visitSingularEnumField(value: self.restartPolicy, fieldNumber: 6)
+    }
+    try unknownFields.traverse(visitor: &visitor)
+  }
+
+  public static func ==(lhs: Termmesh_Peer_V1_EnsureSurfaceRequest, rhs: Termmesh_Peer_V1_EnsureSurfaceRequest) -> Bool {
+    if lhs.requestID != rhs.requestID {return false}
+    if lhs.key != rhs.key {return false}
+    if lhs.cwd != rhs.cwd {return false}
+    if lhs.executable != rhs.executable {return false}
+    if lhs.args != rhs.args {return false}
+    if lhs.restartPolicy != rhs.restartPolicy {return false}
+    if lhs.unknownFields != rhs.unknownFields {return false}
+    return true
+  }
+}
+
+nonisolated extension Termmesh_Peer_V1_EnsureSurfaceError: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
+  public static let protoMessageName: String = _protobuf_package + ".EnsureSurfaceError"
+  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{1}code\0\u{1}stage\0\u{3}safe_context\0\u{3}exit_code\0\u{1}signal\0\u{3}os_error\0")
+
+  public mutating func decodeMessage<D: SwiftProtobuf.Decoder>(decoder: inout D) throws {
+    while let fieldNumber = try decoder.nextFieldNumber() {
+      // The use of inline closures is to circumvent an issue where the compiler
+      // allocates stack space for every case branch when no optimizations are
+      // enabled. https://github.com/apple/swift-protobuf/issues/1034
+      switch fieldNumber {
+      case 1: try { try decoder.decodeSingularEnumField(value: &self.code) }()
+      case 2: try { try decoder.decodeSingularStringField(value: &self.stage) }()
+      case 3: try { try decoder.decodeSingularStringField(value: &self.safeContext) }()
+      case 4: try { try decoder.decodeSingularInt32Field(value: &self.exitCode) }()
+      case 5: try { try decoder.decodeSingularInt32Field(value: &self.signal) }()
+      case 6: try { try decoder.decodeSingularInt32Field(value: &self.osError) }()
+      default: break
+      }
+    }
+  }
+
+  public func traverse<V: SwiftProtobuf.Visitor>(visitor: inout V) throws {
+    if self.code != .unspecified {
+      try visitor.visitSingularEnumField(value: self.code, fieldNumber: 1)
+    }
+    if !self.stage.isEmpty {
+      try visitor.visitSingularStringField(value: self.stage, fieldNumber: 2)
+    }
+    if !self.safeContext.isEmpty {
+      try visitor.visitSingularStringField(value: self.safeContext, fieldNumber: 3)
+    }
+    if self.exitCode != 0 {
+      try visitor.visitSingularInt32Field(value: self.exitCode, fieldNumber: 4)
+    }
+    if self.signal != 0 {
+      try visitor.visitSingularInt32Field(value: self.signal, fieldNumber: 5)
+    }
+    if self.osError != 0 {
+      try visitor.visitSingularInt32Field(value: self.osError, fieldNumber: 6)
+    }
+    try unknownFields.traverse(visitor: &visitor)
+  }
+
+  public static func ==(lhs: Termmesh_Peer_V1_EnsureSurfaceError, rhs: Termmesh_Peer_V1_EnsureSurfaceError) -> Bool {
+    if lhs.code != rhs.code {return false}
+    if lhs.stage != rhs.stage {return false}
+    if lhs.safeContext != rhs.safeContext {return false}
+    if lhs.exitCode != rhs.exitCode {return false}
+    if lhs.signal != rhs.signal {return false}
+    if lhs.osError != rhs.osError {return false}
+    if lhs.unknownFields != rhs.unknownFields {return false}
+    return true
+  }
+}
+
+nonisolated extension Termmesh_Peer_V1_EnsureSurfaceResponse: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
+  public static let protoMessageName: String = _protobuf_package + ".EnsureSurfaceResponse"
+  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{3}request_id\0\u{1}result\0\u{3}surface_id\0\u{3}instance_id\0\u{1}generation\0\u{1}pid\0\u{3}spec_hash\0\u{1}error\0")
+
+  public mutating func decodeMessage<D: SwiftProtobuf.Decoder>(decoder: inout D) throws {
+    while let fieldNumber = try decoder.nextFieldNumber() {
+      // The use of inline closures is to circumvent an issue where the compiler
+      // allocates stack space for every case branch when no optimizations are
+      // enabled. https://github.com/apple/swift-protobuf/issues/1034
+      switch fieldNumber {
+      case 1: try { try decoder.decodeSingularBytesField(value: &self.requestID) }()
+      case 2: try { try decoder.decodeSingularEnumField(value: &self.result) }()
+      case 3: try { try decoder.decodeSingularBytesField(value: &self.surfaceID) }()
+      case 4: try { try decoder.decodeSingularBytesField(value: &self.instanceID) }()
+      case 5: try { try decoder.decodeSingularUInt64Field(value: &self.generation) }()
+      case 6: try { try decoder.decodeSingularUInt32Field(value: &self.pid) }()
+      case 7: try { try decoder.decodeSingularBytesField(value: &self.specHash) }()
+      case 8: try { try decoder.decodeSingularMessageField(value: &self._error) }()
+      default: break
+      }
+    }
+  }
+
+  public func traverse<V: SwiftProtobuf.Visitor>(visitor: inout V) throws {
+    // The use of inline closures is to circumvent an issue where the compiler
+    // allocates stack space for every if/case branch local when no optimizations
+    // are enabled. https://github.com/apple/swift-protobuf/issues/1034 and
+    // https://github.com/apple/swift-protobuf/issues/1182
+    if !self.requestID.isEmpty {
+      try visitor.visitSingularBytesField(value: self.requestID, fieldNumber: 1)
+    }
+    if self.result != .unspecified {
+      try visitor.visitSingularEnumField(value: self.result, fieldNumber: 2)
+    }
+    if !self.surfaceID.isEmpty {
+      try visitor.visitSingularBytesField(value: self.surfaceID, fieldNumber: 3)
+    }
+    if !self.instanceID.isEmpty {
+      try visitor.visitSingularBytesField(value: self.instanceID, fieldNumber: 4)
+    }
+    if self.generation != 0 {
+      try visitor.visitSingularUInt64Field(value: self.generation, fieldNumber: 5)
+    }
+    if self.pid != 0 {
+      try visitor.visitSingularUInt32Field(value: self.pid, fieldNumber: 6)
+    }
+    if !self.specHash.isEmpty {
+      try visitor.visitSingularBytesField(value: self.specHash, fieldNumber: 7)
+    }
+    try { if let v = self._error {
+      try visitor.visitSingularMessageField(value: v, fieldNumber: 8)
+    } }()
+    try unknownFields.traverse(visitor: &visitor)
+  }
+
+  public static func ==(lhs: Termmesh_Peer_V1_EnsureSurfaceResponse, rhs: Termmesh_Peer_V1_EnsureSurfaceResponse) -> Bool {
+    if lhs.requestID != rhs.requestID {return false}
+    if lhs.result != rhs.result {return false}
+    if lhs.surfaceID != rhs.surfaceID {return false}
+    if lhs.instanceID != rhs.instanceID {return false}
+    if lhs.generation != rhs.generation {return false}
+    if lhs.pid != rhs.pid {return false}
+    if lhs.specHash != rhs.specHash {return false}
+    if lhs._error != rhs._error {return false}
+    if lhs.unknownFields != rhs.unknownFields {return false}
+    return true
+  }
+}
+
+nonisolated extension Termmesh_Peer_V1_TerminateSurfaceRequest: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
+  public static let protoMessageName: String = _protobuf_package + ".TerminateSurfaceRequest"
+  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{3}request_id\0\u{3}surface_id\0")
+
+  public mutating func decodeMessage<D: SwiftProtobuf.Decoder>(decoder: inout D) throws {
+    while let fieldNumber = try decoder.nextFieldNumber() {
+      // The use of inline closures is to circumvent an issue where the compiler
+      // allocates stack space for every case branch when no optimizations are
+      // enabled. https://github.com/apple/swift-protobuf/issues/1034
+      switch fieldNumber {
+      case 1: try { try decoder.decodeSingularBytesField(value: &self.requestID) }()
+      case 2: try { try decoder.decodeSingularBytesField(value: &self.surfaceID) }()
+      default: break
+      }
+    }
+  }
+
+  public func traverse<V: SwiftProtobuf.Visitor>(visitor: inout V) throws {
+    if !self.requestID.isEmpty {
+      try visitor.visitSingularBytesField(value: self.requestID, fieldNumber: 1)
+    }
+    if !self.surfaceID.isEmpty {
+      try visitor.visitSingularBytesField(value: self.surfaceID, fieldNumber: 2)
+    }
+    try unknownFields.traverse(visitor: &visitor)
+  }
+
+  public static func ==(lhs: Termmesh_Peer_V1_TerminateSurfaceRequest, rhs: Termmesh_Peer_V1_TerminateSurfaceRequest) -> Bool {
+    if lhs.requestID != rhs.requestID {return false}
+    if lhs.surfaceID != rhs.surfaceID {return false}
+    if lhs.unknownFields != rhs.unknownFields {return false}
+    return true
+  }
+}
+
+nonisolated extension Termmesh_Peer_V1_TerminateSurfaceError: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
+  public static let protoMessageName: String = _protobuf_package + ".TerminateSurfaceError"
+  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{1}code\0\u{1}stage\0\u{3}safe_context\0")
+
+  public mutating func decodeMessage<D: SwiftProtobuf.Decoder>(decoder: inout D) throws {
+    while let fieldNumber = try decoder.nextFieldNumber() {
+      // The use of inline closures is to circumvent an issue where the compiler
+      // allocates stack space for every case branch when no optimizations are
+      // enabled. https://github.com/apple/swift-protobuf/issues/1034
+      switch fieldNumber {
+      case 1: try { try decoder.decodeSingularEnumField(value: &self.code) }()
+      case 2: try { try decoder.decodeSingularStringField(value: &self.stage) }()
+      case 3: try { try decoder.decodeSingularStringField(value: &self.safeContext) }()
+      default: break
+      }
+    }
+  }
+
+  public func traverse<V: SwiftProtobuf.Visitor>(visitor: inout V) throws {
+    if self.code != .unspecified {
+      try visitor.visitSingularEnumField(value: self.code, fieldNumber: 1)
+    }
+    if !self.stage.isEmpty {
+      try visitor.visitSingularStringField(value: self.stage, fieldNumber: 2)
+    }
+    if !self.safeContext.isEmpty {
+      try visitor.visitSingularStringField(value: self.safeContext, fieldNumber: 3)
+    }
+    try unknownFields.traverse(visitor: &visitor)
+  }
+
+  public static func ==(lhs: Termmesh_Peer_V1_TerminateSurfaceError, rhs: Termmesh_Peer_V1_TerminateSurfaceError) -> Bool {
+    if lhs.code != rhs.code {return false}
+    if lhs.stage != rhs.stage {return false}
+    if lhs.safeContext != rhs.safeContext {return false}
+    if lhs.unknownFields != rhs.unknownFields {return false}
+    return true
+  }
+}
+
+nonisolated extension Termmesh_Peer_V1_TerminateSurfaceResponse: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
+  public static let protoMessageName: String = _protobuf_package + ".TerminateSurfaceResponse"
+  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{3}request_id\0\u{1}result\0\u{3}surface_id\0\u{1}error\0")
+
+  public mutating func decodeMessage<D: SwiftProtobuf.Decoder>(decoder: inout D) throws {
+    while let fieldNumber = try decoder.nextFieldNumber() {
+      // The use of inline closures is to circumvent an issue where the compiler
+      // allocates stack space for every case branch when no optimizations are
+      // enabled. https://github.com/apple/swift-protobuf/issues/1034
+      switch fieldNumber {
+      case 1: try { try decoder.decodeSingularBytesField(value: &self.requestID) }()
+      case 2: try { try decoder.decodeSingularEnumField(value: &self.result) }()
+      case 3: try { try decoder.decodeSingularBytesField(value: &self.surfaceID) }()
+      case 4: try { try decoder.decodeSingularMessageField(value: &self._error) }()
+      default: break
+      }
+    }
+  }
+
+  public func traverse<V: SwiftProtobuf.Visitor>(visitor: inout V) throws {
+    // The use of inline closures is to circumvent an issue where the compiler
+    // allocates stack space for every if/case branch local when no optimizations
+    // are enabled. https://github.com/apple/swift-protobuf/issues/1034 and
+    // https://github.com/apple/swift-protobuf/issues/1182
+    if !self.requestID.isEmpty {
+      try visitor.visitSingularBytesField(value: self.requestID, fieldNumber: 1)
+    }
+    if self.result != .unspecified {
+      try visitor.visitSingularEnumField(value: self.result, fieldNumber: 2)
+    }
+    if !self.surfaceID.isEmpty {
+      try visitor.visitSingularBytesField(value: self.surfaceID, fieldNumber: 3)
+    }
+    try { if let v = self._error {
+      try visitor.visitSingularMessageField(value: v, fieldNumber: 4)
+    } }()
+    try unknownFields.traverse(visitor: &visitor)
+  }
+
+  public static func ==(lhs: Termmesh_Peer_V1_TerminateSurfaceResponse, rhs: Termmesh_Peer_V1_TerminateSurfaceResponse) -> Bool {
+    if lhs.requestID != rhs.requestID {return false}
+    if lhs.result != rhs.result {return false}
+    if lhs.surfaceID != rhs.surfaceID {return false}
+    if lhs._error != rhs._error {return false}
     if lhs.unknownFields != rhs.unknownFields {return false}
     return true
   }

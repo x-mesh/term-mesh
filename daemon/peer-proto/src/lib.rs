@@ -44,6 +44,12 @@ pub mod capability {
     /// advertised this — older daemons silently drop them via the
     /// Ready-state unhandled-payload path instead of acting on them.
     pub const WORKSPACE_LIFECYCLE_V1: &str = "workspace.lifecycle.v1";
+    /// The host can deterministically create or reuse a daemon-owned PTY
+    /// surface from an explicit `EnsureSurfaceRequest` specification.
+    pub const SURFACE_ENSURE_V1: &str = "surface.ensure.v1";
+    /// The host can terminate one exact ensured surface and remove its
+    /// runtime, persistence, and layout state.
+    pub const SURFACE_TERMINATE_V1: &str = "surface.terminate.v1";
 
     /// Every capability this build supports. Single source of truth for
     /// populating outgoing `Hello.capabilities` — callers should use
@@ -53,6 +59,8 @@ pub mod capability {
         REPLAY_RING_V1,
         WORKSPACE_CONTROL_V1,
         WORKSPACE_LIFECYCLE_V1,
+        SURFACE_ENSURE_V1,
+        SURFACE_TERMINATE_V1,
     ];
 
     /// `Hello.capabilities` value for an outgoing handshake message.
@@ -312,5 +320,241 @@ mod tests {
         let large = PeerCapabilities::from_hello(many);
         assert!(large.has("cap.42.v1"));
         assert!(!large.has("cap.99999.v1"));
+    }
+
+    #[test]
+    fn ensure_surface_request_and_response_round_trip() {
+        let request_id = vec![0x11; 16];
+        let request = Envelope {
+            seq: 7,
+            correlation_id: 0,
+            payload: Some(envelope::Payload::EnsureSurfaceRequest(
+                EnsureSurfaceRequest {
+                    request_id: request_id.clone(),
+                    key: "runner-smoke".into(),
+                    cwd: "/app/runner".into(),
+                    executable: "/bin/sh".into(),
+                    args: vec!["-lc".into(), "exec cargo test".into()],
+                    restart_policy: EnsureSurfaceRestartPolicy::OnDaemonRestart as i32,
+                },
+            )),
+        };
+        let decoded = Envelope::decode(request.encode_to_vec().as_slice()).expect("decode");
+        match decoded.payload.unwrap() {
+            envelope::Payload::EnsureSurfaceRequest(value) => {
+                assert_eq!(value.request_id, request_id);
+                assert_eq!(value.key, "runner-smoke");
+                assert_eq!(value.cwd, "/app/runner");
+                assert_eq!(
+                    value.restart_policy,
+                    EnsureSurfaceRestartPolicy::OnDaemonRestart as i32
+                );
+            }
+            _ => panic!("wrong variant"),
+        }
+
+        let response = Envelope {
+            seq: 8,
+            correlation_id: 7,
+            payload: Some(envelope::Payload::EnsureSurfaceResponse(
+                EnsureSurfaceResponse {
+                    request_id: vec![0x11; 16],
+                    result: EnsureSurfaceResult::Created as i32,
+                    surface_id: vec![0x22; 16],
+                    instance_id: vec![0x33; 16],
+                    generation: 1,
+                    pid: 4242,
+                    spec_hash: vec![0x44; 32],
+                    error: None,
+                },
+            )),
+        };
+        let decoded = Envelope::decode(response.encode_to_vec().as_slice()).expect("decode");
+        match decoded.payload.unwrap() {
+            envelope::Payload::EnsureSurfaceResponse(value) => {
+                assert_eq!(value.result, EnsureSurfaceResult::Created as i32);
+                assert_eq!(value.surface_id, vec![0x22; 16]);
+                assert_eq!(value.instance_id, vec![0x33; 16]);
+                assert_eq!(value.generation, 1);
+                assert_eq!(value.pid, 4242);
+                assert!(value.error.is_none());
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn ensure_surface_failure_taxonomy_round_trips() {
+        let response = EnsureSurfaceResponse {
+            request_id: vec![0x55; 16],
+            result: EnsureSurfaceResult::Failed as i32,
+            error: Some(EnsureSurfaceError {
+                code: EnsureSurfaceErrorCode::DuplicateRequestId as i32,
+                stage: "validate".into(),
+                safe_context: "request_id already consumed".into(),
+                exit_code: 0,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let decoded =
+            EnsureSurfaceResponse::decode(response.encode_to_vec().as_slice()).expect("decode");
+        assert_eq!(decoded.result, EnsureSurfaceResult::Failed as i32);
+        assert_eq!(
+            decoded.error.unwrap().code,
+            EnsureSurfaceErrorCode::DuplicateRequestId as i32
+        );
+    }
+
+    #[test]
+    fn ensure_surface_non_executable_response_round_trips() {
+        let response = EnsureSurfaceResponse {
+            request_id: vec![0x71; 16],
+            result: EnsureSurfaceResult::Failed as i32,
+            error: Some(EnsureSurfaceError {
+                code: EnsureSurfaceErrorCode::CommandPermissionDenied as i32,
+                stage: "exec".into(),
+                safe_context: "executable is not runnable".into(),
+                os_error: 13,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let decoded =
+            EnsureSurfaceResponse::decode(response.encode_to_vec().as_slice()).expect("decode");
+        let error = decoded.error.expect("structured error");
+        assert_eq!(
+            error.code,
+            EnsureSurfaceErrorCode::CommandPermissionDenied as i32
+        );
+        assert_eq!(error.stage, "exec");
+        assert_eq!(error.os_error, 13);
+    }
+
+    #[test]
+    fn ensure_surface_signaled_response_round_trips() {
+        let response = EnsureSurfaceResponse {
+            request_id: vec![0x72; 16],
+            result: EnsureSurfaceResult::Failed as i32,
+            error: Some(EnsureSurfaceError {
+                code: EnsureSurfaceErrorCode::CommandSignaled as i32,
+                stage: "startup".into(),
+                safe_context: "command terminated during startup".into(),
+                signal: 15,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let decoded =
+            EnsureSurfaceResponse::decode(response.encode_to_vec().as_slice()).expect("decode");
+        let error = decoded.error.expect("structured error");
+        assert_eq!(error.code, EnsureSurfaceErrorCode::CommandSignaled as i32);
+        assert_eq!(error.signal, 15);
+        assert_eq!(error.exit_code, 0);
+    }
+
+    #[test]
+    fn ensure_surface_exec_errno_response_round_trips() {
+        let response = EnsureSurfaceResponse {
+            request_id: vec![0x73; 16],
+            result: EnsureSurfaceResult::Failed as i32,
+            error: Some(EnsureSurfaceError {
+                code: EnsureSurfaceErrorCode::CommandExecError as i32,
+                stage: "exec".into(),
+                safe_context: "exec failed".into(),
+                os_error: 8,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let decoded =
+            EnsureSurfaceResponse::decode(response.encode_to_vec().as_slice()).expect("decode");
+        let error = decoded.error.expect("structured error");
+        assert_eq!(error.code, EnsureSurfaceErrorCode::CommandExecError as i32);
+        assert_eq!(error.os_error, 8);
+        assert_eq!(error.signal, 0);
+    }
+
+    #[test]
+    fn ensure_surface_exec_handshake_timeout_response_round_trips() {
+        let response = EnsureSurfaceResponse {
+            request_id: vec![0x74; 16],
+            result: EnsureSurfaceResult::Failed as i32,
+            error: Some(EnsureSurfaceError {
+                code: EnsureSurfaceErrorCode::ExecHandshakeTimeout as i32,
+                stage: "exec_handshake".into(),
+                safe_context: "exec readiness deadline exceeded".into(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let decoded =
+            EnsureSurfaceResponse::decode(response.encode_to_vec().as_slice()).expect("decode");
+        let error = decoded.error.expect("structured error");
+        assert_eq!(
+            error.code,
+            EnsureSurfaceErrorCode::ExecHandshakeTimeout as i32
+        );
+        assert_eq!(error.stage, "exec_handshake");
+    }
+
+    #[test]
+    fn ensure_surface_oversized_request_is_visible_to_framing() {
+        let envelope = Envelope {
+            seq: 1,
+            correlation_id: 0,
+            payload: Some(envelope::Payload::EnsureSurfaceRequest(
+                EnsureSurfaceRequest {
+                    request_id: vec![0x66; 16],
+                    key: "oversized".into(),
+                    cwd: "/app/runner".into(),
+                    executable: "/bin/sh".into(),
+                    args: vec!["x".repeat(MAX_FRAME_BYTES as usize)],
+                    restart_policy: EnsureSurfaceRestartPolicy::Never as i32,
+                },
+            )),
+        };
+        assert!(envelope.encoded_len() > MAX_FRAME_BYTES as usize);
+    }
+
+    #[test]
+    fn terminate_surface_contract_round_trips() {
+        let request = Envelope {
+            seq: 9,
+            correlation_id: 0,
+            payload: Some(envelope::Payload::TerminateSurfaceRequest(
+                TerminateSurfaceRequest {
+                    request_id: vec![0x81; 16],
+                    surface_id: vec![0x82; 16],
+                },
+            )),
+        };
+        let decoded = Envelope::decode(request.encode_to_vec().as_slice()).expect("decode request");
+        assert!(matches!(
+            decoded.payload,
+            Some(envelope::Payload::TerminateSurfaceRequest(value))
+                if value.request_id == vec![0x81; 16] && value.surface_id == vec![0x82; 16]
+        ));
+
+        for result in [
+            TerminateSurfaceResult::Terminated,
+            TerminateSurfaceResult::NotFound,
+            TerminateSurfaceResult::Failed,
+        ] {
+            let response = TerminateSurfaceResponse {
+                request_id: vec![0x81; 16],
+                result: result as i32,
+                surface_id: vec![0x82; 16],
+                error: (result == TerminateSurfaceResult::Failed).then(|| TerminateSurfaceError {
+                    code: TerminateSurfaceErrorCode::Internal as i32,
+                    stage: "terminate".into(),
+                    safe_context: "surface termination failed".into(),
+                }),
+            };
+            let decoded = TerminateSurfaceResponse::decode(response.encode_to_vec().as_slice())
+                .expect("decode response");
+            assert_eq!(decoded.result, result as i32);
+            assert_eq!(decoded.surface_id, vec![0x82; 16]);
+        }
     }
 }

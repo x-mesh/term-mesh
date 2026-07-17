@@ -8,25 +8,32 @@
 //! Each attach spawns a subscriber relay task that pumps broadcast bytes
 //! into the connection's outgoing channel wrapped as `PtyData` frames.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::Instant;
 
 use peer_proto::v1::envelope::Payload;
 use peer_proto::v1::{
     workspace_update, AttachMode, AttachResult, AuthChallenge, AuthResult, CreateWorkspaceResponse,
-    Envelope, Error, Hello, Pong, PtyData, SurfaceList, Workspace, WorkspaceList, WorkspaceMeta,
-    WorkspaceUpdate,
+    EnsureSurfaceError as WireEnsureError, EnsureSurfaceErrorCode, EnsureSurfaceRequest,
+    EnsureSurfaceResponse, EnsureSurfaceRestartPolicy, EnsureSurfaceResult, Envelope, Error, Hello,
+    Pong, PtyData, SurfaceList, TerminateSurfaceError as WireTerminateError,
+    TerminateSurfaceErrorCode, TerminateSurfaceRequest, TerminateSurfaceResponse,
+    TerminateSurfaceResult, Workspace, WorkspaceList, WorkspaceMeta, WorkspaceUpdate,
 };
 use peer_proto::{capability, PeerCapabilities};
+use sha2::{Digest, Sha256};
 use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::UnixStream;
-use tokio::sync::{broadcast, mpsc, Notify};
+use tokio::sync::{broadcast, mpsc, Notify, OwnedSemaphorePermit, Semaphore};
 use tokio::task::JoinHandle;
 
 use super::framing::{read_envelope, write_envelope};
 use super::layout::{self, PeerHost};
-use super::surface::PtySurface;
+use super::surface::{
+    EnsureDisposition, EnsureError, EnsureOutcome, EnsureRestartPolicy, PtySurface, SurfaceSpec,
+};
 
 pub const PROTOCOL_VERSION: &str = "1.0.0";
 pub const HOST_DISPLAY_NAME_ENV: &str = "TERMMESH_PEER_DISPLAY_NAME";
@@ -74,6 +81,21 @@ async fn reader_loop(
     let manager = host.pty.clone();
     let mut state = HandshakeState::Init;
     let mut attached: HashMap<Vec<u8>, AttachEntry> = HashMap::new();
+    // Request ids are one-shot for the authenticated connection. Insert before
+    // starting work so two back-to-back frames cannot race through ensure.
+    let mut lifecycle_request_ids: HashSet<Vec<u8>> = HashSet::new();
+    // Acquired by the reader before an ensure task is spawned. Waiting here
+    // applies socket backpressure instead of accumulating unbounded queued
+    // tasks while keeping up to this many independent keys concurrent.
+    let ensure_work_gate = EnsureWorkGate::new();
+    let ensure_worker: EnsureWorker = {
+        let host = host.clone();
+        Arc::new(move |key, spec| host.ensure_surface(&key, &spec))
+    };
+    let terminate_worker: TerminateWorker = {
+        let host = host.clone();
+        Arc::new(move |surface_id| host.terminate_surface(&surface_id))
+    };
     // RAII registration with the layout broadcaster; populated when the
     // handshake reaches Ready, dropped (= unregistered) with this frame.
     // Underscore: the binding exists for its Drop, it is never read.
@@ -179,8 +201,10 @@ async fn reader_loop(
                 // From Ready on, this connection receives layout pushes
                 // triggered by any connection's WorkspaceControl. The guard
                 // unregisters on connection teardown (any exit path).
-                _broadcast_guard =
-                    Some(host.clients.register(outgoing_tx.clone(), seq_counter.clone()));
+                _broadcast_guard = Some(
+                    host.clients
+                        .register(outgoing_tx.clone(), seq_counter.clone()),
+                );
                 tracing::info!("peer authenticated (ssh-passthrough)");
             }
 
@@ -197,6 +221,32 @@ async fn reader_loop(
                     payload: Some(Payload::SurfaceList(SurfaceList { surfaces })),
                 };
                 send(&outgoing_tx, reply).await?;
+            }
+
+            (HandshakeState::Ready, Payload::EnsureSurfaceRequest(req)) => {
+                dispatch_ensure_surface(
+                    req,
+                    env.seq,
+                    &mut lifecycle_request_ids,
+                    &ensure_work_gate,
+                    &outgoing_tx,
+                    &seq_counter,
+                    ensure_worker.clone(),
+                )
+                .await?;
+            }
+
+            (HandshakeState::Ready, Payload::TerminateSurfaceRequest(req)) => {
+                dispatch_terminate_surface(
+                    req,
+                    env.seq,
+                    &mut lifecycle_request_ids,
+                    &ensure_work_gate,
+                    &outgoing_tx,
+                    &seq_counter,
+                    terminate_worker.clone(),
+                )
+                .await?;
             }
 
             (HandshakeState::Ready, Payload::ListWorkspaces(_)) => {
@@ -690,6 +740,698 @@ fn major_compatible(a: &str, b: &str) -> bool {
     a.split('.').next() == b.split('.').next()
 }
 
+const ENSURE_KEY_MAX_BYTES: usize = 256;
+const ENSURE_PATH_MAX_BYTES: usize = 4096;
+const ENSURE_ARG_MAX_COUNT: usize = 256;
+const ENSURE_ARG_MAX_BYTES: usize = 64 * 1024;
+const ENSURE_REQUEST_ID_BUDGET: usize = 65_536;
+const ENSURE_CONCURRENCY_LIMIT: usize = 16;
+
+#[derive(Clone)]
+struct EnsureWorkGate {
+    permits: Arc<Semaphore>,
+}
+
+impl EnsureWorkGate {
+    fn new() -> Self {
+        Self {
+            permits: Arc::new(Semaphore::new(ENSURE_CONCURRENCY_LIMIT)),
+        }
+    }
+
+    async fn acquire(&self) -> Result<OwnedSemaphorePermit, tokio::sync::AcquireError> {
+        self.permits.clone().acquire_owned().await
+    }
+}
+
+type EnsureWorker =
+    Arc<dyn Fn(String, SurfaceSpec) -> Result<EnsureOutcome, EnsureError> + Send + Sync + 'static>;
+type TerminateWorker = Arc<dyn Fn(Vec<u8>) -> Result<bool, EnsureError> + Send + Sync + 'static>;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RequestIdAdmission {
+    Accepted,
+    Duplicate,
+    Exhausted,
+    Invalid,
+}
+
+fn admit_ensure_request_id(seen: &mut HashSet<Vec<u8>>, request_id: &[u8]) -> RequestIdAdmission {
+    if request_id.len() != 16 {
+        return RequestIdAdmission::Invalid;
+    }
+    if seen.contains(request_id) {
+        return RequestIdAdmission::Duplicate;
+    }
+    if seen.len() >= ENSURE_REQUEST_ID_BUDGET {
+        return RequestIdAdmission::Exhausted;
+    }
+    seen.insert(request_id.to_vec());
+    RequestIdAdmission::Accepted
+}
+
+/// Exact Ready-state dispatch path used by `reader_loop`. It owns request-id
+/// admission, backpressure placement, worker spawn, and correlated response
+/// enqueue so those ordering invariants can be exercised without a real PTY.
+async fn dispatch_ensure_surface(
+    req: EnsureSurfaceRequest,
+    correlation_id: u64,
+    ensure_request_ids: &mut HashSet<Vec<u8>>,
+    ensure_work_gate: &EnsureWorkGate,
+    outgoing_tx: &mpsc::Sender<Envelope>,
+    seq_counter: &Arc<AtomicU64>,
+    ensure_worker: EnsureWorker,
+) -> anyhow::Result<()> {
+    let request_id = req.request_id.clone();
+    match admit_ensure_request_id(ensure_request_ids, &request_id) {
+        RequestIdAdmission::Exhausted => {
+            let response = failed_ensure_response(
+                request_id,
+                EnsureSurfaceErrorCode::RequestTooLarge,
+                "validate",
+                "connection request_id budget exhausted",
+            );
+            return send_ensure_response(outgoing_tx, seq_counter, correlation_id, response).await;
+        }
+        RequestIdAdmission::Duplicate => {
+            let response = failed_ensure_response(
+                request_id,
+                EnsureSurfaceErrorCode::DuplicateRequestId,
+                "validate",
+                "request_id already consumed",
+            );
+            return send_ensure_response(outgoing_tx, seq_counter, correlation_id, response).await;
+        }
+        RequestIdAdmission::Accepted => {}
+        // Invalid-length ids are deliberately not inserted into the one-shot
+        // set; validation returns INVALID_REQUEST for each malformed frame.
+        RequestIdAdmission::Invalid => {}
+    }
+
+    let Ok(ensure_permit) = ensure_work_gate.acquire().await else {
+        let response = failed_ensure_response(
+            request_id,
+            EnsureSurfaceErrorCode::Internal,
+            "internal",
+            "ensure concurrency gate closed",
+        );
+        return send_ensure_response(outgoing_tx, seq_counter, correlation_id, response).await;
+    };
+
+    let tx = outgoing_tx.clone();
+    let seq = seq_counter.clone();
+    tokio::spawn(async move {
+        let started = Instant::now();
+        let request_hash = ensure_request_id_hash(&request_id);
+        let safe_cwd = safe_log_cwd(&req.cwd);
+        let response = match validate_ensure_request(req) {
+            Ok((key, spec)) => {
+                match tokio::task::spawn_blocking(move || ensure_worker(key, spec)).await {
+                    Ok(result) => ensure_response_from_result(request_id, result),
+                    Err(_) => failed_ensure_response(
+                        request_id,
+                        EnsureSurfaceErrorCode::Internal,
+                        "internal",
+                        "ensure worker failed",
+                    ),
+                }
+            }
+            Err(response) => response,
+        };
+        tracing::info!(
+            request_id_hash = %request_hash,
+            result = ?EnsureSurfaceResult::try_from(response.result).ok(),
+            surface_id = %short_id(&response.surface_id),
+            cwd = %safe_cwd,
+            error_code = ?response.error.as_ref().and_then(|error| EnsureSurfaceErrorCode::try_from(error.code).ok()),
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            "peer ensure completed"
+        );
+        let _ =
+            send_ensure_response_with_permit(&tx, &seq, correlation_id, response, ensure_permit)
+                .await;
+    });
+    Ok(())
+}
+
+async fn dispatch_terminate_surface(
+    req: TerminateSurfaceRequest,
+    correlation_id: u64,
+    lifecycle_request_ids: &mut HashSet<Vec<u8>>,
+    work_gate: &EnsureWorkGate,
+    outgoing_tx: &mpsc::Sender<Envelope>,
+    seq_counter: &Arc<AtomicU64>,
+    terminate_worker: TerminateWorker,
+) -> anyhow::Result<()> {
+    let request_id = req.request_id.clone();
+    let surface_id = req.surface_id.clone();
+    match admit_ensure_request_id(lifecycle_request_ids, &request_id) {
+        RequestIdAdmission::Duplicate => {
+            return send_terminate_response(
+                outgoing_tx,
+                seq_counter,
+                correlation_id,
+                failed_terminate_response(
+                    request_id,
+                    surface_id,
+                    TerminateSurfaceErrorCode::DuplicateRequestId,
+                    "validate",
+                    "request_id already consumed",
+                ),
+            )
+            .await;
+        }
+        RequestIdAdmission::Exhausted => {
+            return send_terminate_response(
+                outgoing_tx,
+                seq_counter,
+                correlation_id,
+                failed_terminate_response(
+                    request_id,
+                    surface_id,
+                    TerminateSurfaceErrorCode::Internal,
+                    "internal",
+                    "connection request_id budget exhausted",
+                ),
+            )
+            .await;
+        }
+        RequestIdAdmission::Accepted => {}
+        RequestIdAdmission::Invalid => {
+            return send_terminate_response(
+                outgoing_tx,
+                seq_counter,
+                correlation_id,
+                failed_terminate_response(
+                    request_id,
+                    surface_id,
+                    TerminateSurfaceErrorCode::InvalidRequest,
+                    "validate",
+                    "request_id must be exactly 16 bytes",
+                ),
+            )
+            .await;
+        }
+    }
+    if surface_id.len() != 16 {
+        return send_terminate_response(
+            outgoing_tx,
+            seq_counter,
+            correlation_id,
+            failed_terminate_response(
+                request_id,
+                surface_id,
+                TerminateSurfaceErrorCode::InvalidRequest,
+                "validate",
+                "surface_id must be exactly 16 bytes",
+            ),
+        )
+        .await;
+    }
+
+    let Ok(permit) = work_gate.acquire().await else {
+        return send_terminate_response(
+            outgoing_tx,
+            seq_counter,
+            correlation_id,
+            failed_terminate_response(
+                request_id,
+                surface_id,
+                TerminateSurfaceErrorCode::Internal,
+                "internal",
+                "surface lifecycle gate closed",
+            ),
+        )
+        .await;
+    };
+    let tx = outgoing_tx.clone();
+    let seq = seq_counter.clone();
+    tokio::spawn(async move {
+        let response = match tokio::task::spawn_blocking({
+            let surface_id = surface_id.clone();
+            move || terminate_worker(surface_id)
+        })
+        .await
+        {
+            Ok(Ok(true)) => TerminateSurfaceResponse {
+                request_id,
+                result: TerminateSurfaceResult::Terminated as i32,
+                surface_id,
+                error: None,
+            },
+            Ok(Ok(false)) => TerminateSurfaceResponse {
+                request_id,
+                result: TerminateSurfaceResult::NotFound as i32,
+                surface_id,
+                error: None,
+            },
+            Ok(Err(_)) | Err(_) => failed_terminate_response(
+                request_id,
+                surface_id,
+                TerminateSurfaceErrorCode::Internal,
+                "terminate",
+                "surface termination failed",
+            ),
+        };
+        let _ =
+            send_terminate_response_with_permit(&tx, &seq, correlation_id, response, permit).await;
+    });
+    Ok(())
+}
+
+fn failed_terminate_response(
+    request_id: Vec<u8>,
+    surface_id: Vec<u8>,
+    code: TerminateSurfaceErrorCode,
+    stage: &'static str,
+    safe_context: &'static str,
+) -> TerminateSurfaceResponse {
+    TerminateSurfaceResponse {
+        request_id,
+        result: TerminateSurfaceResult::Failed as i32,
+        surface_id,
+        error: Some(WireTerminateError {
+            code: code as i32,
+            stage: stage.into(),
+            safe_context: safe_context.into(),
+        }),
+    }
+}
+
+fn validate_ensure_request(
+    req: EnsureSurfaceRequest,
+) -> Result<(String, SurfaceSpec), EnsureSurfaceResponse> {
+    let request_id = req.request_id.clone();
+    let invalid = |context: &'static str| {
+        failed_ensure_response(
+            request_id.clone(),
+            EnsureSurfaceErrorCode::InvalidRequest,
+            "validate",
+            context,
+        )
+    };
+    let too_large = |context: &'static str| {
+        failed_ensure_response(
+            request_id.clone(),
+            EnsureSurfaceErrorCode::RequestTooLarge,
+            "validate",
+            context,
+        )
+    };
+
+    if req.request_id.len() != 16 {
+        return Err(invalid("request_id must be exactly 16 bytes"));
+    }
+    if req.key.is_empty() {
+        return Err(invalid("key must not be empty"));
+    }
+    if req.key.len() > ENSURE_KEY_MAX_BYTES {
+        return Err(too_large("key exceeds 256 UTF-8 bytes"));
+    }
+    if req.key.contains('\0') {
+        return Err(invalid("key contains NUL"));
+    }
+    if req.cwd.is_empty() || !std::path::Path::new(&req.cwd).is_absolute() {
+        return Err(invalid("cwd must be an absolute path"));
+    }
+    if req.cwd.len() > ENSURE_PATH_MAX_BYTES {
+        return Err(too_large("cwd exceeds 4096 UTF-8 bytes"));
+    }
+    if req.cwd.contains('\0') {
+        return Err(invalid("cwd contains NUL"));
+    }
+    if req.executable.is_empty() || !std::path::Path::new(&req.executable).is_absolute() {
+        return Err(invalid("executable must be an absolute path"));
+    }
+    if req.executable.len() > ENSURE_PATH_MAX_BYTES {
+        return Err(too_large("executable exceeds 4096 UTF-8 bytes"));
+    }
+    if req.executable.contains('\0') {
+        return Err(invalid("executable contains NUL"));
+    }
+    if req.args.len() > ENSURE_ARG_MAX_COUNT {
+        return Err(too_large("args exceed 256 entries"));
+    }
+    if req.args.iter().any(|arg| arg.len() > ENSURE_ARG_MAX_BYTES) {
+        return Err(too_large("argument exceeds 65536 UTF-8 bytes"));
+    }
+    if req.args.iter().any(|arg| arg.contains('\0')) {
+        return Err(invalid("argument contains NUL"));
+    }
+
+    let restart_policy = match EnsureSurfaceRestartPolicy::try_from(req.restart_policy) {
+        Ok(EnsureSurfaceRestartPolicy::Never) => EnsureRestartPolicy::Never,
+        Ok(EnsureSurfaceRestartPolicy::OnDaemonRestart) => EnsureRestartPolicy::OnDaemonRestart,
+        _ => return Err(invalid("restart_policy is invalid or unspecified")),
+    };
+    Ok((
+        req.key,
+        SurfaceSpec {
+            cwd: req.cwd,
+            executable: req.executable,
+            args: req.args,
+            restart_policy,
+        },
+    ))
+}
+
+fn ensure_response_from_result(
+    request_id: Vec<u8>,
+    result: Result<super::surface::EnsureOutcome, EnsureError>,
+) -> EnsureSurfaceResponse {
+    match result {
+        Ok(outcome) => EnsureSurfaceResponse {
+            request_id,
+            result: match outcome.disposition {
+                EnsureDisposition::Created => EnsureSurfaceResult::Created,
+                EnsureDisposition::Reused => EnsureSurfaceResult::Reused,
+                EnsureDisposition::Recreated => EnsureSurfaceResult::Recreated,
+            } as i32,
+            surface_id: outcome.surface_id,
+            instance_id: outcome.instance_id,
+            generation: outcome.generation,
+            pid: u32::try_from(outcome.pid).unwrap_or_default(),
+            spec_hash: outcome.spec_hash.to_vec(),
+            error: None,
+        },
+        Err(EnsureError::SpecConflict {
+            surface_id,
+            requested_spec_hash,
+            ..
+        }) => EnsureSurfaceResponse {
+            request_id,
+            result: EnsureSurfaceResult::SpecConflict as i32,
+            surface_id,
+            spec_hash: requested_spec_hash.to_vec(),
+            error: Some(wire_ensure_error(
+                EnsureSurfaceErrorCode::SpecConflict,
+                "reconcile",
+                "existing surface uses a different specification",
+                0,
+                0,
+                0,
+            )),
+            ..Default::default()
+        },
+        Err(EnsureError::Spawn(error)) => spawn_error_response(request_id, &error),
+        Err(EnsureError::InvalidKey(reason)) => failed_ensure_response(
+            request_id,
+            EnsureSurfaceErrorCode::InvalidRequest,
+            "validate",
+            reason,
+        ),
+        Err(EnsureError::NotRunning(surface_id)) => EnsureSurfaceResponse {
+            request_id,
+            result: EnsureSurfaceResult::Failed as i32,
+            surface_id,
+            error: Some(wire_ensure_error(
+                EnsureSurfaceErrorCode::Internal,
+                "reconcile",
+                "surface is not running",
+                0,
+                0,
+                0,
+            )),
+            ..Default::default()
+        },
+        Err(EnsureError::Persistence(_)) => failed_ensure_response(
+            request_id,
+            EnsureSurfaceErrorCode::Internal,
+            "persist",
+            "surface state could not be persisted",
+        ),
+        Err(EnsureError::Internal(_)) => failed_ensure_response(
+            request_id,
+            EnsureSurfaceErrorCode::Internal,
+            "internal",
+            "surface ensure failed",
+        ),
+    }
+}
+
+fn spawn_error_response(request_id: Vec<u8>, error: &std::io::Error) -> EnsureSurfaceResponse {
+    let message = error.to_string();
+    let (code, stage, context, exit_code, signal, os_error) = if message == "CWD_NOT_FOUND" {
+        (
+            EnsureSurfaceErrorCode::CwdNotFound,
+            "chdir",
+            "cwd not found",
+            0,
+            0,
+            0,
+        )
+    } else if message == "CWD_NOT_DIRECTORY" {
+        (
+            EnsureSurfaceErrorCode::CwdNotDirectory,
+            "chdir",
+            "cwd is not a directory",
+            0,
+            0,
+            0,
+        )
+    } else if message == "CWD_PERMISSION_DENIED" {
+        (
+            EnsureSurfaceErrorCode::CwdPermissionDenied,
+            "chdir",
+            "cwd is inaccessible",
+            0,
+            0,
+            0,
+        )
+    } else if message == "COMMAND_NOT_FOUND" {
+        (
+            EnsureSurfaceErrorCode::CommandNotFound,
+            "exec",
+            "command not found",
+            0,
+            0,
+            0,
+        )
+    } else if message == "COMMAND_PERMISSION_DENIED" {
+        (
+            EnsureSurfaceErrorCode::CommandPermissionDenied,
+            "exec",
+            "command is not executable",
+            0,
+            0,
+            0,
+        )
+    } else if message == "EXEC_HANDSHAKE_TRUNCATED" {
+        (
+            EnsureSurfaceErrorCode::ExecHandshakeTruncated,
+            "exec_handshake",
+            "exec handshake truncated",
+            0,
+            0,
+            0,
+        )
+    } else if message == "EXEC_HANDSHAKE_INVALID_STAGE" {
+        (
+            EnsureSurfaceErrorCode::ExecHandshakeInvalidStage,
+            "exec_handshake",
+            "exec handshake reported an invalid stage",
+            0,
+            0,
+            0,
+        )
+    } else if message == "EXEC_HANDSHAKE_TIMEOUT" {
+        (
+            EnsureSurfaceErrorCode::ExecHandshakeTimeout,
+            "exec_handshake",
+            "exec readiness deadline exceeded",
+            0,
+            0,
+            0,
+        )
+    } else if message == "COMMAND_EXITED(unknown)" {
+        (
+            EnsureSurfaceErrorCode::CommandExited,
+            "startup",
+            "command exited during startup",
+            0,
+            0,
+            0,
+        )
+    } else if let Some(value) = coded_number(&message, "COMMAND_EXITED(") {
+        (
+            EnsureSurfaceErrorCode::CommandExited,
+            "startup",
+            "command exited during startup",
+            value,
+            0,
+            0,
+        )
+    } else if let Some(value) = coded_number(&message, "COMMAND_SIGNALED(") {
+        (
+            EnsureSurfaceErrorCode::CommandSignaled,
+            "startup",
+            "command terminated during startup",
+            0,
+            value,
+            0,
+        )
+    } else if let Some(value) = coded_number(&message, "COMMAND_EXEC_ERROR(") {
+        (
+            EnsureSurfaceErrorCode::CommandExecError,
+            "exec",
+            "exec failed",
+            0,
+            0,
+            value,
+        )
+    } else if let Some(value) = coded_number(&message, "CWD_ERROR(") {
+        (
+            EnsureSurfaceErrorCode::CwdError,
+            "chdir",
+            "chdir failed",
+            0,
+            0,
+            value,
+        )
+    } else {
+        (
+            EnsureSurfaceErrorCode::Internal,
+            "spawn",
+            "surface spawn failed",
+            0,
+            0,
+            error.raw_os_error().unwrap_or_default(),
+        )
+    };
+
+    EnsureSurfaceResponse {
+        request_id,
+        result: EnsureSurfaceResult::Failed as i32,
+        error: Some(wire_ensure_error(
+            code, stage, context, exit_code, signal, os_error,
+        )),
+        ..Default::default()
+    }
+}
+
+fn coded_number(message: &str, prefix: &str) -> Option<i32> {
+    message
+        .strip_prefix(prefix)?
+        .strip_suffix(')')?
+        .parse()
+        .ok()
+}
+
+fn failed_ensure_response(
+    request_id: Vec<u8>,
+    code: EnsureSurfaceErrorCode,
+    stage: &'static str,
+    context: &'static str,
+) -> EnsureSurfaceResponse {
+    EnsureSurfaceResponse {
+        request_id,
+        result: EnsureSurfaceResult::Failed as i32,
+        error: Some(wire_ensure_error(code, stage, context, 0, 0, 0)),
+        ..Default::default()
+    }
+}
+
+fn wire_ensure_error(
+    code: EnsureSurfaceErrorCode,
+    stage: &'static str,
+    safe_context: &'static str,
+    exit_code: i32,
+    signal: i32,
+    os_error: i32,
+) -> WireEnsureError {
+    WireEnsureError {
+        code: code as i32,
+        stage: stage.into(),
+        safe_context: safe_context.into(),
+        exit_code,
+        signal,
+        os_error,
+    }
+}
+
+async fn send_ensure_response(
+    tx: &mpsc::Sender<Envelope>,
+    seq_counter: &AtomicU64,
+    correlation_id: u64,
+    response: EnsureSurfaceResponse,
+) -> anyhow::Result<()> {
+    send(
+        tx,
+        Envelope {
+            seq: next_seq(seq_counter),
+            correlation_id,
+            payload: Some(Payload::EnsureSurfaceResponse(response)),
+        },
+    )
+    .await
+}
+
+/// Keep one concurrency slot owned until the correlated response has entered
+/// the writer queue. Dropping it after host work but before this await would
+/// let the reader admit more work while completed responses still accumulate.
+async fn send_ensure_response_with_permit(
+    tx: &mpsc::Sender<Envelope>,
+    seq_counter: &AtomicU64,
+    correlation_id: u64,
+    response: EnsureSurfaceResponse,
+    _permit: OwnedSemaphorePermit,
+) -> anyhow::Result<()> {
+    send_ensure_response(tx, seq_counter, correlation_id, response).await
+}
+
+async fn send_terminate_response(
+    tx: &mpsc::Sender<Envelope>,
+    seq_counter: &AtomicU64,
+    correlation_id: u64,
+    response: TerminateSurfaceResponse,
+) -> anyhow::Result<()> {
+    send(
+        tx,
+        Envelope {
+            seq: next_seq(seq_counter),
+            correlation_id,
+            payload: Some(Payload::TerminateSurfaceResponse(response)),
+        },
+    )
+    .await
+}
+
+async fn send_terminate_response_with_permit(
+    tx: &mpsc::Sender<Envelope>,
+    seq_counter: &AtomicU64,
+    correlation_id: u64,
+    response: TerminateSurfaceResponse,
+    _permit: OwnedSemaphorePermit,
+) -> anyhow::Result<()> {
+    send_terminate_response(tx, seq_counter, correlation_id, response).await
+}
+
+fn ensure_request_id_hash(request_id: &[u8]) -> String {
+    let digest = Sha256::digest(request_id);
+    digest[..6]
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+fn short_id(id: &[u8]) -> String {
+    id.iter()
+        .take(6)
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+fn safe_log_cwd(cwd: &str) -> String {
+    if cwd.len() <= ENSURE_PATH_MAX_BYTES
+        && cwd.starts_with('/')
+        && !cwd.contains(['\n', '\r', '\0'])
+    {
+        cwd.to_string()
+    } else {
+        "<invalid>".into()
+    }
+}
+
 async fn send(tx: &mpsc::Sender<Envelope>, env: Envelope) -> anyhow::Result<()> {
     tx.send(env)
         .await
@@ -730,5 +1472,546 @@ mod hostname_tests {
     fn hostname_or_prefers_real_hostname_over_fallback() {
         let result = hostname_or("unreachable-fallback-sentinel");
         assert_ne!(result, "unreachable-fallback-sentinel");
+    }
+}
+
+#[cfg(test)]
+mod ensure_tests {
+    use std::collections::HashSet;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Condvar, Mutex};
+    use std::time::Duration;
+
+    use peer_proto::v1::envelope::Payload;
+    use peer_proto::v1::{
+        EnsureSurfaceErrorCode, EnsureSurfaceRequest, EnsureSurfaceResponse,
+        EnsureSurfaceRestartPolicy, EnsureSurfaceResult,
+    };
+    use tokio::sync::mpsc;
+
+    use super::{
+        admit_ensure_request_id, dispatch_ensure_surface, ensure_response_from_result,
+        send_ensure_response, spawn_error_response, validate_ensure_request, EnsureWorkGate,
+        EnsureWorker, HandshakeState, RequestIdAdmission, ENSURE_CONCURRENCY_LIMIT,
+        ENSURE_REQUEST_ID_BUDGET,
+    };
+    use crate::peer::surface::EnsureError;
+
+    fn valid_request() -> EnsureSurfaceRequest {
+        EnsureSurfaceRequest {
+            request_id: vec![0x11; 16],
+            key: "runner-smoke".into(),
+            cwd: "/app/runner".into(),
+            executable: "/bin/sh".into(),
+            args: vec!["-lc".into(), "exec cargo test".into()],
+            restart_policy: EnsureSurfaceRestartPolicy::OnDaemonRestart as i32,
+        }
+    }
+
+    #[test]
+    fn validates_wire_limits_and_restart_policy_without_echoing_input() {
+        let (_, spec) = validate_ensure_request(valid_request()).expect("valid request");
+        assert_eq!(spec.cwd, "/app/runner");
+
+        let mut malformed = valid_request();
+        malformed.request_id.pop();
+        let error = validate_ensure_request(malformed)
+            .expect_err("short request id")
+            .error
+            .expect("structured error");
+        assert_eq!(error.code, EnsureSurfaceErrorCode::InvalidRequest as i32);
+
+        let mut oversized = valid_request();
+        oversized.args = vec!["x".repeat(65_537)];
+        let error = validate_ensure_request(oversized)
+            .expect_err("oversized arg")
+            .error
+            .expect("structured error");
+        assert_eq!(error.code, EnsureSurfaceErrorCode::RequestTooLarge as i32);
+        assert!(error.safe_context.len() < 128);
+        assert!(!error.safe_context.contains(&"x".repeat(256)));
+
+        let mut unspecified = valid_request();
+        unspecified.restart_policy = EnsureSurfaceRestartPolicy::Unspecified as i32;
+        let error = validate_ensure_request(unspecified)
+            .expect_err("unspecified policy")
+            .error
+            .expect("structured error");
+        assert_eq!(error.code, EnsureSurfaceErrorCode::InvalidRequest as i32);
+    }
+
+    #[test]
+    fn request_ids_are_one_shot_and_connection_memory_is_bounded() {
+        let mut seen = HashSet::new();
+        let id = vec![0x22; 16];
+        assert_eq!(
+            admit_ensure_request_id(&mut seen, &id),
+            RequestIdAdmission::Accepted
+        );
+        assert_eq!(
+            admit_ensure_request_id(&mut seen, &id),
+            RequestIdAdmission::Duplicate
+        );
+        seen.clear();
+        for value in 0..ENSURE_REQUEST_ID_BUDGET {
+            let mut unique = vec![0u8; 16];
+            unique[..8].copy_from_slice(&(value as u64).to_be_bytes());
+            assert_eq!(
+                admit_ensure_request_id(&mut seen, &unique),
+                RequestIdAdmission::Accepted
+            );
+        }
+        assert_eq!(
+            admit_ensure_request_id(&mut seen, &[0xff; 16]),
+            RequestIdAdmission::Exhausted
+        );
+    }
+
+    #[test]
+    fn stable_spawn_taxonomy_preserves_numeric_details() {
+        let exited = std::io::Error::other("COMMAND_EXITED(42)");
+        let response = spawn_error_response(vec![1; 16], &exited);
+        let error = response.error.expect("exit error");
+        assert_eq!(error.code, EnsureSurfaceErrorCode::CommandExited as i32);
+        assert_eq!(error.exit_code, 42);
+
+        let signaled = std::io::Error::other("COMMAND_SIGNALED(15)");
+        let response = spawn_error_response(vec![2; 16], &signaled);
+        let error = response.error.expect("signal error");
+        assert_eq!(error.code, EnsureSurfaceErrorCode::CommandSignaled as i32);
+        assert_eq!(error.signal, 15);
+
+        let exec = std::io::Error::other("COMMAND_EXEC_ERROR(8)");
+        let response = spawn_error_response(vec![3; 16], &exec);
+        let error = response.error.expect("exec error");
+        assert_eq!(error.code, EnsureSurfaceErrorCode::CommandExecError as i32);
+        assert_eq!(error.os_error, 8);
+    }
+
+    #[test]
+    fn conflict_maps_to_wire_result_without_live_process_claim() {
+        let response = ensure_response_from_result(
+            vec![4; 16],
+            Err(EnsureError::SpecConflict {
+                surface_id: vec![5; 16],
+                existing_spec_hash: [6; 32],
+                requested_spec_hash: [7; 32],
+            }),
+        );
+        assert_eq!(response.result, EnsureSurfaceResult::SpecConflict as i32);
+        assert_eq!(response.surface_id, vec![5; 16]);
+        assert_eq!(response.pid, 0);
+        assert_eq!(response.spec_hash, vec![7; 32]);
+    }
+
+    #[tokio::test]
+    async fn concurrent_responses_may_reorder_but_keep_exact_correlation() {
+        let (tx, mut rx) = mpsc::channel(2);
+        let seq = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+
+        let slow_tx = tx.clone();
+        let slow_seq = seq.clone();
+        let slow = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            send_ensure_response(
+                &slow_tx,
+                &slow_seq,
+                101,
+                EnsureSurfaceResponse {
+                    request_id: vec![1; 16],
+                    result: EnsureSurfaceResult::Reused as i32,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("slow response");
+        });
+        send_ensure_response(
+            &tx,
+            &seq,
+            202,
+            EnsureSurfaceResponse {
+                request_id: vec![2; 16],
+                result: EnsureSurfaceResult::Created as i32,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("fast response");
+
+        let first = rx.recv().await.expect("first");
+        let second = rx.recv().await.expect("second");
+        slow.await.expect("slow task");
+        assert_eq!((first.correlation_id, second.correlation_id), (202, 101));
+        assert!(matches!(
+            first.payload,
+            Some(Payload::EnsureSurfaceResponse(_))
+        ));
+        assert!(matches!(
+            second.payload,
+            Some(Payload::EnsureSurfaceResponse(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn ready_dispatch_backpressures_seventeenth_frame_until_response_enqueue() {
+        let state = HandshakeState::Ready;
+        assert_eq!(state, HandshakeState::Ready, "exercise authenticated path");
+        let gate = EnsureWorkGate::new();
+        let mut frames = Vec::new();
+        for value in 0..=ENSURE_CONCURRENCY_LIMIT {
+            let mut request = valid_request();
+            request.request_id = (value as u128).to_be_bytes().to_vec();
+            validate_ensure_request(request.clone()).expect("all 17 requests are valid");
+            frames.push(peer_proto::v1::Envelope {
+                seq: value as u64 + 1,
+                correlation_id: 0,
+                payload: Some(Payload::EnsureSurfaceRequest(request)),
+            });
+        }
+
+        let (tx, mut rx) = mpsc::channel(1);
+        tx.send(peer_proto::v1::Envelope::default())
+            .await
+            .expect("prefill writer queue");
+        let seq = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let entered = Arc::new(AtomicUsize::new(0));
+        let releases = Arc::new((Mutex::new(0usize), Condvar::new()));
+        let worker: EnsureWorker = Arc::new({
+            let entered = entered.clone();
+            let releases = releases.clone();
+            move |_, _| {
+                entered.fetch_add(1, Ordering::SeqCst);
+                let (lock, wake) = &*releases;
+                let mut available = lock.lock().expect("release lock");
+                while *available == 0 {
+                    available = wake.wait(available).expect("release wait");
+                }
+                *available -= 1;
+                Err(EnsureError::Internal("test worker completed"))
+            }
+        });
+
+        let mut seen = HashSet::new();
+        for frame in frames.drain(..ENSURE_CONCURRENCY_LIMIT) {
+            let correlation_id = frame.seq;
+            let Payload::EnsureSurfaceRequest(request) = frame.payload.expect("payload") else {
+                panic!("wrong payload");
+            };
+            dispatch_ensure_surface(
+                request,
+                correlation_id,
+                &mut seen,
+                &gate,
+                &tx,
+                &seq,
+                worker.clone(),
+            )
+            .await
+            .expect("dispatch first 16 Ready frames");
+        }
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while entered.load(Ordering::SeqCst) != ENSURE_CONCURRENCY_LIMIT {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("first 16 workers enter");
+
+        let frame = frames.pop().expect("17th frame");
+        let correlation_id = frame.seq;
+        let Payload::EnsureSurfaceRequest(request) = frame.payload.expect("payload") else {
+            panic!("wrong payload");
+        };
+        let seventeenth =
+            dispatch_ensure_surface(request, correlation_id, &mut seen, &gate, &tx, &seq, worker);
+        tokio::pin!(seventeenth);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), &mut seventeenth)
+                .await
+                .is_err(),
+            "production dispatch must block before spawning worker 17"
+        );
+        assert_eq!(entered.load(Ordering::SeqCst), ENSURE_CONCURRENCY_LIMIT);
+
+        // Complete one worker while the writer queue is full. The production
+        // response helper must retain its permit across the blocked enqueue.
+        {
+            let (lock, wake) = &*releases;
+            *lock.lock().expect("release lock") += 1;
+            wake.notify_one();
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), &mut seventeenth)
+                .await
+                .is_err(),
+            "worker 17 must wait until response enqueue, not worker return"
+        );
+        assert_eq!(entered.load(Ordering::SeqCst), ENSURE_CONCURRENCY_LIMIT);
+
+        rx.recv().await.expect("drain writer queue capacity");
+        tokio::time::timeout(Duration::from_secs(1), &mut seventeenth)
+            .await
+            .expect("response enqueue releases capacity")
+            .expect("17th Ready frame dispatches");
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while entered.load(Ordering::SeqCst) != ENSURE_CONCURRENCY_LIMIT + 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("17th worker enters after enqueue");
+        let response = rx.recv().await.expect("correlated response queued");
+        assert!((1..=ENSURE_CONCURRENCY_LIMIT as u64).contains(&response.correlation_id));
+
+        // Release the remaining 16 workers and drain their responses so no
+        // blocking worker or dispatch task leaks out of the test runtime.
+        {
+            let (lock, wake) = &*releases;
+            *lock.lock().expect("release lock") += ENSURE_CONCURRENCY_LIMIT;
+            wake.notify_all();
+        }
+        for _ in 0..ENSURE_CONCURRENCY_LIMIT {
+            rx.recv().await.expect("remaining correlated response");
+        }
+    }
+}
+
+#[cfg(test)]
+mod terminate_tests {
+    use std::collections::HashSet;
+    use std::sync::atomic::AtomicU64;
+    use std::sync::{Arc, Mutex};
+
+    use peer_proto::v1::envelope::Payload;
+    use peer_proto::v1::{
+        EnsureSurfaceErrorCode, EnsureSurfaceRequest, EnsureSurfaceRestartPolicy,
+        EnsureSurfaceResult, TerminateSurfaceErrorCode, TerminateSurfaceRequest,
+        TerminateSurfaceResult,
+    };
+    use tokio::sync::mpsc;
+
+    use super::{
+        dispatch_ensure_surface, dispatch_terminate_surface, EnsureWorkGate, EnsureWorker,
+        TerminateWorker,
+    };
+
+    #[tokio::test]
+    async fn ready_terminate_is_exact_correlated_idempotent_and_one_shot() {
+        let exact_surface = vec![0x91; 16];
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let worker: TerminateWorker = Arc::new({
+            let exact_surface = exact_surface.clone();
+            let observed = observed.clone();
+            move |surface_id| {
+                observed
+                    .lock()
+                    .expect("observed lock")
+                    .push(surface_id.clone());
+                Ok(surface_id == exact_surface)
+            }
+        });
+        let gate = EnsureWorkGate::new();
+        let (tx, mut rx) = mpsc::channel(8);
+        let seq = Arc::new(AtomicU64::new(0));
+        let mut seen = HashSet::new();
+        let request = TerminateSurfaceRequest {
+            request_id: vec![1; 16],
+            surface_id: exact_surface.clone(),
+        };
+
+        dispatch_terminate_surface(
+            request.clone(),
+            501,
+            &mut seen,
+            &gate,
+            &tx,
+            &seq,
+            worker.clone(),
+        )
+        .await
+        .expect("dispatch terminate");
+        let response = rx.recv().await.expect("terminated response");
+        assert_eq!(response.correlation_id, 501);
+        let Some(Payload::TerminateSurfaceResponse(response)) = response.payload else {
+            panic!("wrong response payload");
+        };
+        assert_eq!(response.result, TerminateSurfaceResult::Terminated as i32);
+        assert_eq!(response.surface_id, exact_surface);
+
+        dispatch_terminate_surface(request, 502, &mut seen, &gate, &tx, &seq, worker.clone())
+            .await
+            .expect("dispatch duplicate");
+        let response = rx.recv().await.expect("duplicate response");
+        assert_eq!(response.correlation_id, 502);
+        let Some(Payload::TerminateSurfaceResponse(response)) = response.payload else {
+            panic!("wrong duplicate payload");
+        };
+        assert_eq!(response.result, TerminateSurfaceResult::Failed as i32);
+        assert_eq!(
+            response.error.expect("duplicate error").code,
+            TerminateSurfaceErrorCode::DuplicateRequestId as i32
+        );
+
+        dispatch_terminate_surface(
+            TerminateSurfaceRequest {
+                request_id: vec![2; 16],
+                surface_id: vec![0x92; 16],
+            },
+            503,
+            &mut seen,
+            &gate,
+            &tx,
+            &seq,
+            worker,
+        )
+        .await
+        .expect("dispatch missing");
+        let response = rx.recv().await.expect("not-found response");
+        let Some(Payload::TerminateSurfaceResponse(response)) = response.payload else {
+            panic!("wrong not-found payload");
+        };
+        assert_eq!(response.result, TerminateSurfaceResult::NotFound as i32);
+        assert!(response.error.is_none());
+        assert_eq!(observed.lock().expect("observed lock").len(), 2);
+    }
+
+    #[tokio::test]
+    async fn malformed_terminate_returns_one_correlated_failure_without_worker() {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let worker: TerminateWorker = Arc::new({
+            let calls = calls.clone();
+            move |_| {
+                calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(true)
+            }
+        });
+        let gate = EnsureWorkGate::new();
+        let (tx, mut rx) = mpsc::channel(2);
+        let seq = Arc::new(AtomicU64::new(0));
+        let mut seen = HashSet::new();
+        dispatch_terminate_surface(
+            TerminateSurfaceRequest {
+                request_id: vec![3; 16],
+                surface_id: vec![4; 15],
+            },
+            601,
+            &mut seen,
+            &gate,
+            &tx,
+            &seq,
+            worker,
+        )
+        .await
+        .expect("malformed response");
+        let response = rx.recv().await.expect("failure response");
+        assert_eq!(response.correlation_id, 601);
+        let Some(Payload::TerminateSurfaceResponse(response)) = response.payload else {
+            panic!("wrong failure payload");
+        };
+        assert_eq!(response.result, TerminateSurfaceResult::Failed as i32);
+        assert_eq!(
+            response.error.expect("invalid error").code,
+            TerminateSurfaceErrorCode::InvalidRequest as i32
+        );
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert!(rx.try_recv().is_err(), "exactly one response");
+    }
+
+    #[tokio::test]
+    async fn request_id_is_one_shot_across_ensure_and_terminate_both_directions() {
+        let gate = EnsureWorkGate::new();
+        let (tx, mut rx) = mpsc::channel(8);
+        let seq = Arc::new(AtomicU64::new(0));
+        let ensure_worker: EnsureWorker =
+            Arc::new(|_, _| Err(super::EnsureError::Internal("test ensure completed")));
+        let terminate_worker: TerminateWorker = Arc::new(|_| Ok(false));
+        let ensure_request = |request_id: Vec<u8>| EnsureSurfaceRequest {
+            request_id,
+            key: "cross-operation".into(),
+            cwd: "/app/runner".into(),
+            executable: "/bin/sh".into(),
+            args: Vec::new(),
+            restart_policy: EnsureSurfaceRestartPolicy::OnDaemonRestart as i32,
+        };
+
+        let first_id = vec![0xa1; 16];
+        let mut seen = HashSet::new();
+        dispatch_ensure_surface(
+            ensure_request(first_id.clone()),
+            701,
+            &mut seen,
+            &gate,
+            &tx,
+            &seq,
+            ensure_worker.clone(),
+        )
+        .await
+        .expect("ensure first");
+        let ensure_response = rx.recv().await.expect("ensure response");
+        assert_eq!(ensure_response.correlation_id, 701);
+        dispatch_terminate_surface(
+            TerminateSurfaceRequest {
+                request_id: first_id,
+                surface_id: vec![0xb1; 16],
+            },
+            702,
+            &mut seen,
+            &gate,
+            &tx,
+            &seq,
+            terminate_worker.clone(),
+        )
+        .await
+        .expect("terminate duplicate");
+        let duplicate = rx.recv().await.expect("terminate duplicate response");
+        let Some(Payload::TerminateSurfaceResponse(duplicate)) = duplicate.payload else {
+            panic!("wrong terminate duplicate payload");
+        };
+        assert_eq!(duplicate.result, TerminateSurfaceResult::Failed as i32);
+        assert_eq!(
+            duplicate.error.expect("duplicate error").code,
+            TerminateSurfaceErrorCode::DuplicateRequestId as i32
+        );
+
+        let second_id = vec![0xa2; 16];
+        let mut seen = HashSet::new();
+        dispatch_terminate_surface(
+            TerminateSurfaceRequest {
+                request_id: second_id.clone(),
+                surface_id: vec![0xb2; 16],
+            },
+            703,
+            &mut seen,
+            &gate,
+            &tx,
+            &seq,
+            terminate_worker,
+        )
+        .await
+        .expect("terminate first");
+        let terminate_response = rx.recv().await.expect("terminate response");
+        assert_eq!(terminate_response.correlation_id, 703);
+        dispatch_ensure_surface(
+            ensure_request(second_id),
+            704,
+            &mut seen,
+            &gate,
+            &tx,
+            &seq,
+            ensure_worker,
+        )
+        .await
+        .expect("ensure duplicate");
+        let duplicate = rx.recv().await.expect("ensure duplicate response");
+        let Some(Payload::EnsureSurfaceResponse(duplicate)) = duplicate.payload else {
+            panic!("wrong ensure duplicate payload");
+        };
+        assert_eq!(duplicate.result, EnsureSurfaceResult::Failed as i32);
+        assert_eq!(
+            duplicate.error.expect("duplicate error").code,
+            EnsureSurfaceErrorCode::DuplicateRequestId as i32
+        );
     }
 }
