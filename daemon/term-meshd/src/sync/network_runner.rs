@@ -250,7 +250,7 @@ impl NetworkSyncRunner {
         // (durable per-operation ids arrive with oplog tracking — see plan.rs).
         let mut operation_id = [0u8; 16];
         getrandom::getrandom(&mut operation_id).map_err(|_| "sync_apply_failed".to_string())?;
-        let plan = build_apply_plan(project, operation_id, &diff.fetch, &resolved);
+        let plan = build_apply_plan(project, operation_id, &diff.fetch, &resolved, &local_entries);
         if !plan.entries.is_empty() {
             let store = self
                 .apply_store

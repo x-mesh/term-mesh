@@ -129,7 +129,7 @@ async fn fetch_pulls_and_applies_a_missing_file() {
 
     // Apply the fetched object to B's filesystem.
     let apply_store = ApplyStore::open(state_dir(temporary.path(), "apply-state").join("apply.db")).unwrap();
-    let plan = build_apply_plan(project_id, [9; 16], &diff.fetch, &resolved);
+    let plan = build_apply_plan(project_id, [9; 16], &diff.fetch, &resolved, &dest_entries);
     apply_store.apply(dest_root.path(), &cas_dest, domain, &plan).expect("apply");
 
     let applied = std::fs::read(dest_root.path().join("extra.txt")).expect("applied file exists");

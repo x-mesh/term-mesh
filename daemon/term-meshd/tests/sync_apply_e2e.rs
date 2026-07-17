@@ -185,8 +185,8 @@ async fn nested_directory_file_and_symlink_apply_together() {
     let mut object_ids = std::collections::HashMap::new();
     object_ids.insert("sub/report.txt".to_string(), object_id);
 
-    // Build + apply the plan onto an empty destination root.
-    let plan = build_apply_plan(project_id, [9; 16], &diff.fetch, &object_ids);
+    // Build + apply the plan onto an empty destination root (no local entries).
+    let plan = build_apply_plan(project_id, [9; 16], &diff.fetch, &object_ids, &[]);
     let apply_store =
         ApplyStore::open(state_dir(temporary.path(), "apply-state").join("apply.db")).unwrap();
     let dest_root = tempfile::tempdir().unwrap();
@@ -202,4 +202,57 @@ async fn nested_directory_file_and_symlink_apply_together() {
     assert_eq!(applied, content, "nested file differs from source");
     let link = std::fs::read_link(dest_root.path().join("sub/link")).expect("symlink exists");
     assert_eq!(link, std::path::Path::new("report.txt"), "symlink target");
+}
+
+/// Phase S2c follow-up: a file that already exists on the destination with older
+/// bytes is overwritten with the source's bytes, guarded by a `Present`
+/// precondition over the destination's current fingerprint (so a concurrently
+/// edited file would be refused instead of clobbered).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn file_overwrite_replaces_existing_content() {
+    let temporary = tempfile::tempdir().unwrap();
+    let project = [0x42; 32];
+    let project_id = ProjectId::from_bytes(project);
+    let domain = ObjectDomain {
+        project_id,
+        object_type: ObjectType::FILE,
+        version: 1,
+    };
+
+    // Destination already holds report.txt with the OLD content.
+    let dest_root = tempfile::tempdir().unwrap();
+    let old = b"old-content".to_vec();
+    std::fs::write(dest_root.path().join("report.txt"), &old).unwrap();
+    let dest_entries = scan_project_entries(&File::open(dest_root.path()).unwrap()).unwrap();
+
+    // Source has report.txt with NEW content; the diff is exactly one overwrite.
+    let source_root = tempfile::tempdir().unwrap();
+    let new = b"brand-new-content".to_vec();
+    std::fs::write(source_root.path().join("report.txt"), &new).unwrap();
+    let source_entries = scan_project_entries(&File::open(source_root.path()).unwrap()).unwrap();
+    let diff = diff_manifests(&dest_entries, &source_entries);
+    assert_eq!(diff.fetch.len(), 1);
+
+    // Stage the new bytes into the destination CAS, as the fetch would.
+    let cas_dest = cas(&temporary.path().join("cas_dest"));
+    let key = ProjectKey::new(KEY_BYTES);
+    let object_id = put_plaintext(&cas_dest, domain, &key, KEY_ID, &new).unwrap();
+    let mut object_ids = std::collections::HashMap::new();
+    object_ids.insert("report.txt".to_string(), object_id);
+
+    // The plan guards the overwrite with the destination's current fingerprint.
+    let plan = build_apply_plan(project_id, [3; 16], &diff.fetch, &object_ids, &dest_entries);
+    assert!(
+        matches!(plan.entries[0].precondition, ApplyPrecondition::Present(_)),
+        "an existing path must be overwritten under a Present precondition"
+    );
+
+    let apply_store =
+        ApplyStore::open(state_dir(temporary.path(), "apply-state").join("apply.db")).unwrap();
+    apply_store
+        .apply(dest_root.path(), &cas_dest, domain, &plan)
+        .expect("overwrite applies to destination filesystem");
+
+    let applied = std::fs::read(dest_root.path().join("report.txt")).expect("file exists");
+    assert_eq!(applied, new, "overwrite did not replace the old content");
 }

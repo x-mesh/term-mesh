@@ -15,7 +15,7 @@ use std::collections::{HashMap, HashSet};
 
 use super::{
     ApplyAction, ApplyPlan, ApplyPlanEntry, ApplyPrecondition, EntryKind, ManifestEntry, ObjectId,
-    ProjectId,
+    PathFingerprint, PathKind, ProjectId,
 };
 
 /// Upper bounds applied when decoding a peer's manifest (untrusted input).
@@ -101,25 +101,74 @@ fn fetch_of(entry: &ManifestEntry) -> FetchEntry {
     }
 }
 
-/// Build an [`ApplyPlan`] from a diff's fetch list and the CAS object ids the
-/// fetch resolved (path → object id). File entries carry their transferred
-/// object id; directory and symlink entries carry no bytes (a symlink's target
-/// is inline, a directory only its mode). Directories are ordered first — a
-/// parent before each of its children — so a file or symlink always has its
-/// parent directory to land in. Every entry uses an `Absent` precondition
-/// (add-only sync); overwrite via `Present(fingerprint)`, plus
-/// `target_manifest_root`/`frontier` tracking, arrive with oplog/visible-state.
+/// The precondition [`PathFingerprint`] a locally-present manifest `entry` must
+/// still match for an overwrite to be safe. A file's manifest hash is the plain
+/// BLAKE3 of its bytes and a symlink's is the plain BLAKE3 of its target, both
+/// exactly what `ApplyStore` recomputes on disk, so File and Symlink fingerprints
+/// reconstruct faithfully. A directory's on-disk fingerprint folds in every
+/// child, which the manifest entry does not carry, so it returns `None` — a path
+/// currently held by a directory cannot yet be safely overwritten.
+fn manifest_fingerprint(entry: &ManifestEntry) -> Option<PathFingerprint> {
+    match entry.kind {
+        EntryKind::File => Some(PathFingerprint {
+            kind: PathKind::File,
+            content_hash: entry.content_hash,
+            length: entry.length,
+            executable: entry.executable,
+            symlink_target: None,
+        }),
+        EntryKind::Symlink => {
+            let target = entry.symlink_target.clone()?;
+            Some(PathFingerprint {
+                kind: PathKind::Symlink,
+                content_hash: *blake3::hash(target.as_bytes()).as_bytes(),
+                length: target.len() as u64,
+                executable: false,
+                symlink_target: Some(target),
+            })
+        }
+        EntryKind::Directory => None,
+    }
+}
+
+/// Build an [`ApplyPlan`] from a diff's fetch list, the CAS object ids the fetch
+/// resolved (path → object id), and the destination's own scanned manifest
+/// `local`. File entries carry their transferred object id; directory and symlink
+/// entries carry no bytes (a symlink's target is inline, a directory only its
+/// mode). Directories are ordered first — a parent before each of its children —
+/// so a file or symlink always has its parent directory to land in.
+///
+/// The precondition is taken from the destination's current state at each path:
+/// absent → an add (`Absent`); present → an overwrite guarded by the current
+/// [`PathFingerprint`] (`Present`), so a concurrently-changed file is refused
+/// rather than clobbered. A path currently held by a directory is skipped (its
+/// on-disk fingerprint is not reconstructible from the manifest — see
+/// [`manifest_fingerprint`]). `target_manifest_root`/`frontier` remain
+/// placeholders until oplog/visible-state tracking lands.
 pub fn build_apply_plan(
     project: ProjectId,
     operation_id: [u8; 16],
     fetch: &[FetchEntry],
     object_ids: &HashMap<String, ObjectId>,
+    local: &[ManifestEntry],
 ) -> ApplyPlan {
+    let local_by_path: HashMap<&str, &ManifestEntry> = local
+        .iter()
+        .map(|entry| (entry.relative_path.as_str(), entry))
+        .collect();
     // Directories are collected apart from files/symlinks so they can be applied
     // first: a leaf can only be installed once its parent directory exists.
     let mut directories = Vec::new();
     let mut leaves = Vec::new();
     for entry in fetch {
+        let precondition = match local_by_path.get(entry.relative_path.as_str()) {
+            None => ApplyPrecondition::Absent,
+            Some(local_entry) => match manifest_fingerprint(local_entry) {
+                Some(fingerprint) => ApplyPrecondition::Present(fingerprint),
+                // Local path is a directory: defer (cannot reconstruct its fp).
+                None => continue,
+            },
+        };
         let action = match entry.kind {
             EntryKind::Directory => ApplyAction::Directory {
                 executable: entry.executable,
@@ -149,7 +198,7 @@ pub fn build_apply_plan(
         let plan_entry = ApplyPlanEntry {
             relative_path: entry.relative_path.clone(),
             action,
-            precondition: ApplyPrecondition::Absent,
+            precondition,
         };
         if matches!(plan_entry.action, ApplyAction::Directory { .. }) {
             directories.push(plan_entry);
@@ -395,6 +444,7 @@ mod tests {
             [1; 16],
             &diff.fetch,
             &object_ids,
+            &[], // empty destination — every entry is an add
         );
 
         let paths: Vec<&str> = plan
@@ -462,8 +512,77 @@ mod tests {
             [1; 16],
             &[broken],
             &HashMap::new(),
+            &[],
         );
         assert!(plan.entries.is_empty());
+    }
+
+    #[test]
+    fn overwrite_carries_the_local_fingerprint_precondition() {
+        // Local holds `f` (content 1) and a symlink `s -> old`; remote changed
+        // both. Each overwrite must be guarded by the LOCAL fingerprint so a
+        // concurrently-edited destination is refused, not clobbered.
+        let local = vec![file("f", 1, false), symlink("s", "old")];
+        let remote = vec![file("f", 9, false), symlink("s", "new")];
+        let diff = diff_manifests(&local, &remote);
+        assert_eq!(diff.fetch.len(), 2);
+
+        let mut object_ids = HashMap::new();
+        object_ids.insert("f".to_string(), ObjectId([7; 32]));
+        let plan = build_apply_plan(
+            ProjectId::from_bytes([0x42; 32]),
+            [1; 16],
+            &diff.fetch,
+            &object_ids,
+            &local,
+        );
+
+        let f = plan.entries.iter().find(|e| e.relative_path == "f").unwrap();
+        assert_eq!(
+            f.precondition,
+            ApplyPrecondition::Present(PathFingerprint {
+                kind: PathKind::File,
+                content_hash: [1; 32],
+                length: 10,
+                executable: false,
+                symlink_target: None,
+            })
+        );
+        let s = plan.entries.iter().find(|e| e.relative_path == "s").unwrap();
+        // The symlink precondition hashes the LOCAL (old) target, not the remote.
+        assert_eq!(
+            s.precondition,
+            ApplyPrecondition::Present(PathFingerprint {
+                kind: PathKind::Symlink,
+                content_hash: *blake3::hash(b"old").as_bytes(),
+                length: 3,
+                executable: false,
+                symlink_target: Some("old".to_string()),
+            })
+        );
+    }
+
+    #[test]
+    fn overwrite_skips_a_path_currently_held_by_a_directory() {
+        // Remote wants a file where the local tree still has a directory; a
+        // directory's on-disk fingerprint is not reconstructible, so the entry
+        // is deferred rather than emitted with an unverifiable precondition.
+        let local = vec![dir("d")];
+        let remote = vec![file("d", 1, false)];
+        let diff = diff_manifests(&local, &remote);
+        let mut object_ids = HashMap::new();
+        object_ids.insert("d".to_string(), ObjectId([7; 32]));
+        let plan = build_apply_plan(
+            ProjectId::from_bytes([0x42; 32]),
+            [1; 16],
+            &diff.fetch,
+            &object_ids,
+            &local,
+        );
+        assert!(
+            plan.entries.is_empty(),
+            "a file-over-directory overwrite is deferred"
+        );
     }
 
     #[test]
