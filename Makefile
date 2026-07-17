@@ -192,6 +192,18 @@ stop:
 	@-pkill -f term-meshd 2>/dev/null || true
 	@echo "==> Stopped"
 
+# Report stale term-meshd daemons, sockets, tag dirs, and debug logs (dry run).
+cleanup-dry:
+	@./scripts/cleanup-daemons.sh
+
+# Remove stale leftovers only — active daemons/sockets/open logs are kept.
+cleanup:
+	@./scripts/cleanup-daemons.sh --kill
+
+# Kill ALL term-meshd processes and remove their sockets. Destructive.
+cleanup-all:
+	@./scripts/cleanup-daemons.sh --all
+
 prod:
 	@echo "==> Generating BuildInfo.swift..."
 	@./scripts/generate-build-info.sh
