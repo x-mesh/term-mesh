@@ -20,7 +20,7 @@ use sync::{
     BootstrapDevice, CasError, CasLimits, CasStore, DeviceTlsIdentity, KeyId, NetworkSyncRunner,
     ObjectDomain, ObjectType, OperationKind, OperationManager, OperationStartParams, OperationState,
     PeerAddressResolver, ProjectId, ProjectKey, ProjectKeyMaterial, ProjectKeyProvider,
-    ProjectRegistry, SyncConnection, SyncEndpoint, TrustStore,
+    ProjectRegistry, SyncConnection, SyncContext, SyncContextProvider, SyncEndpoint, TrustStore,
 };
 use sync_protocol::{SyncHello, PROJECT_SYNC_CAPABILITY, PROTOCOL_V1};
 
@@ -34,6 +34,16 @@ struct FixedResolver(SocketAddr);
 impl PeerAddressResolver for FixedResolver {
     fn resolve(&self, _peer_id: &str) -> Option<SocketAddr> {
         Some(self.0)
+    }
+}
+
+/// Returns one pre-built context for every project (the test syncs a single
+/// project); the daemon's real provider opens per-project stores by id.
+struct FixedContextProvider(Arc<SyncContext>);
+
+impl SyncContextProvider for FixedContextProvider {
+    fn context_for(&self, _project_id: &str) -> Result<Arc<SyncContext>, String> {
+        Ok(self.0.clone())
     }
 }
 
@@ -169,22 +179,26 @@ async fn sync_operation_exchanges_manifests_and_finds_the_diff() {
         }
     });
 
-    // The initiator's CAS (shares the peer's project key) plus an apply store to
-    // land fetched objects on disk.
+    // The initiator's per-project context: identity + roster coordinates, the
+    // trust store, and the CAS (shares the peer's project key) + apply store the
+    // fetched objects land through.
     let cas_runner = Arc::new(cas_store(&temporary.path().join("cas_runner")));
     let apply_store = Arc::new(Mutex::new(
         ApplyStore::open(state_dir(temporary.path(), "apply-state").join("apply.db")).unwrap(),
     ));
+    let context = Arc::new(SyncContext {
+        identity: identity_a,
+        trust: trust_a,
+        device_id: device_a,
+        project_id: project,
+        roster_epoch: 2,
+        cas: cas_runner,
+        apply_store,
+    });
     let runner = NetworkSyncRunner::new(
-        identity_a,
-        trust_a,
-        device_a,
-        project,
-        2,
+        Arc::new(FixedContextProvider(context)),
         Arc::new(FixedResolver(server_addr)),
         tokio::runtime::Handle::current(),
-        cas_runner,
-        apply_store,
     );
 
     // Register the runner's local tree as a project so the manager can hold its

@@ -155,63 +155,67 @@ async fn recv_manifest(connection: &mut SyncConnection) -> Result<Vec<ManifestEn
     }
 }
 
-/// Dials a peer and drives the manifest exchange for an `OperationKind::Sync`
-/// operation. Constructed with the local device identity + trust store + this
-/// device's roster coordinates, and injected into the `OperationManager` via
+/// Everything a sync operation needs that is scoped to a single project: this
+/// device's TLS identity + roster coordinates, the project's trust store, and
+/// the CAS + apply store the fetched objects flow through. One daemon syncs many
+/// projects, so the runner does not own these — it resolves them per operation
+/// from a [`SyncContextProvider`] keyed by the operation's project.
+pub struct SyncContext {
+    pub identity: DeviceTlsIdentity,
+    pub trust: Arc<TrustStore>,
+    pub device_id: [u8; 32],
+    pub project_id: [u8; 32],
+    pub roster_epoch: u64,
+    /// CAS the initiator stages fetched objects into before applying them; its
+    /// key provider must decrypt what the peer sends (both sides share the key).
+    pub cas: Arc<CasStore>,
+    /// Applies the fetched objects to the working tree. `Mutex` because
+    /// `ApplyStore` owns a rusqlite `Connection` (`Send` but not `Sync`) while a
+    /// `SyncTransport` must be `Sync`.
+    pub apply_store: Arc<Mutex<ApplyStore>>,
+}
+
+/// Resolves the per-project [`SyncContext`] for an operation. The daemon's
+/// implementation opens (and caches) each project's stores and loads its device
+/// identity; a project not yet provisioned for sync returns an error rather than
+/// a context. Tests inject a fixed context.
+pub trait SyncContextProvider: Send + Sync + 'static {
+    /// `project_id` is the operation's project id string (`OperationSpec::project_id`).
+    fn context_for(&self, project_id: &str) -> Result<Arc<SyncContext>, String>;
+}
+
+/// Dials a peer and drives a full `OperationKind::Sync` operation: it resolves
+/// the operation's per-project [`SyncContext`], scans and exchanges manifests,
+/// then fetches and applies the diff. Injected into the `OperationManager` via
 /// [`OperationManager::open_with_sync_transport`](super::OperationManager::open_with_sync_transport).
 pub struct NetworkSyncRunner {
-    identity: DeviceTlsIdentity,
-    trust: Arc<TrustStore>,
-    device_id: [u8; 32],
-    project_id: [u8; 32],
-    roster_epoch: u64,
+    provider: Arc<dyn SyncContextProvider>,
     resolver: Arc<dyn PeerAddressResolver>,
     handle: tokio::runtime::Handle,
-    /// CAS the initiator stages fetched objects into before applying them; its
-    /// key provider must be able to decrypt what the peer sends (both sides
-    /// share the same project key).
-    cas: Arc<CasStore>,
-    /// Applies the fetched objects to the working tree. Wrapped in a `Mutex`
-    /// because `ApplyStore` owns a rusqlite `Connection` (`Send` but not
-    /// `Sync`), while a `SyncTransport` must be `Sync`.
-    apply_store: Arc<Mutex<ApplyStore>>,
 }
 
 impl NetworkSyncRunner {
-    #[allow(clippy::too_many_arguments)]
     pub fn new(
-        identity: DeviceTlsIdentity,
-        trust: Arc<TrustStore>,
-        device_id: [u8; 32],
-        project_id: [u8; 32],
-        roster_epoch: u64,
+        provider: Arc<dyn SyncContextProvider>,
         resolver: Arc<dyn PeerAddressResolver>,
         handle: tokio::runtime::Handle,
-        cas: Arc<CasStore>,
-        apply_store: Arc<Mutex<ApplyStore>>,
     ) -> Self {
         Self {
-            identity,
-            trust,
-            device_id,
-            project_id,
-            roster_epoch,
+            provider,
             resolver,
             handle,
-            cas,
-            apply_store,
         }
     }
 
     /// A fresh `SyncHello` with a random nonce so repeated operations are not
     /// rejected by the peer's replay cache.
-    fn hello(&self) -> Result<SyncHello, String> {
+    fn hello(ctx: &SyncContext) -> Result<SyncHello, String> {
         let mut nonce = [0u8; 32];
         getrandom::getrandom(&mut nonce).map_err(|_| "sync_connect_failed".to_string())?;
         Ok(SyncHello {
-            project_id: self.project_id,
-            device_id: self.device_id,
-            roster_epoch: self.roster_epoch,
+            project_id: ctx.project_id,
+            device_id: ctx.device_id,
+            roster_epoch: ctx.roster_epoch,
             selected_version: PROTOCOL_V1,
             version_offers: vec![PROTOCOL_V1],
             capabilities: vec![PROJECT_SYNC_CAPABILITY.into()],
@@ -221,6 +225,7 @@ impl NetworkSyncRunner {
 
     async fn exchange(
         &self,
+        ctx: &SyncContext,
         spec: &OperationSpec,
         addr: SocketAddr,
         cancelled: Arc<AtomicBool>,
@@ -243,13 +248,14 @@ impl NetworkSyncRunner {
         // poll.
         tokio::select! {
             biased;
-            result = self.exchange_over_network(spec, addr, &local_entries, &cancelled) => result,
+            result = self.exchange_over_network(ctx, spec, addr, &local_entries, &cancelled) => result,
             () = cancelled_watch(&cancelled) => Err("cancelled".to_string()),
         }
     }
 
     async fn exchange_over_network(
         &self,
+        ctx: &SyncContext,
         spec: &OperationSpec,
         addr: SocketAddr,
         local_entries: &[ManifestEntry],
@@ -257,12 +263,12 @@ impl NetworkSyncRunner {
     ) -> Result<OperationResult, String> {
         let client = SyncEndpoint::client(
             SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0)),
-            self.trust.clone(),
-            &self.identity,
+            ctx.trust.clone(),
+            &ctx.identity,
         )
         .map_err(|_| "sync_connect_failed".to_string())?;
         let auth = client
-            .connect(addr, self.hello()?)
+            .connect(addr, Self::hello(ctx)?)
             .await
             .map_err(|_| "sync_connect_failed".to_string())?;
         if cancelled.load(Ordering::Acquire) {
@@ -278,13 +284,13 @@ impl NetworkSyncRunner {
         // S2 last mile: pull the files we lack from the peer, staging each into
         // the CAS, then apply them to the working tree so the local project
         // converges to the peer's.
-        let project = ProjectId::from_bytes(self.project_id);
+        let project = ProjectId::from_bytes(ctx.project_id);
         let domain = ObjectDomain {
             project_id: project,
             object_type: ObjectType::FILE,
             version: 1,
         };
-        let resolved = run_fetch_pull(&mut connection, &self.cas, domain, &diff.fetch).await?;
+        let resolved = run_fetch_pull(&mut connection, &ctx.cas, domain, &diff.fetch).await?;
         // `operation_id` seeds apply's deterministic temp/backup/trash names; a
         // fresh random id per run keeps concurrent applies from colliding
         // (durable per-operation ids arrive with oplog tracking — see plan.rs).
@@ -292,12 +298,12 @@ impl NetworkSyncRunner {
         getrandom::getrandom(&mut operation_id).map_err(|_| "sync_apply_failed".to_string())?;
         let plan = build_apply_plan(project, operation_id, &diff.fetch, &resolved, local_entries);
         if !plan.entries.is_empty() {
-            let store = self
+            let store = ctx
                 .apply_store
                 .lock()
                 .map_err(|_| "sync_apply_failed".to_string())?;
             store
-                .apply(spec.held_root.canonical_path(), &self.cas, domain, &plan)
+                .apply(spec.held_root.canonical_path(), &ctx.cas, domain, &plan)
                 .map_err(|_| "sync_apply_failed".to_string())?;
         }
 
@@ -333,6 +339,9 @@ impl SyncTransport for NetworkSyncRunner {
             .peer
             .as_deref()
             .ok_or_else(|| "sync_peer_unspecified".to_string())?;
+        // Resolve this operation's per-project context (identity, trust, stores).
+        // A project not provisioned for sync fails here rather than dialing.
+        let ctx = self.provider.context_for(&spec.project_id)?;
         let addr = self
             .resolver
             .resolve(peer_id)
@@ -343,6 +352,6 @@ impl SyncTransport for NetworkSyncRunner {
         // The runner is invoked from `spawn_blocking`, so blocking on the async
         // transport here does not stall a runtime worker.
         self.handle
-            .block_on(self.exchange(spec, addr, cancelled.clone()))
+            .block_on(self.exchange(&ctx, spec, addr, cancelled.clone()))
     }
 }

@@ -121,7 +121,8 @@ pub use scanner::{
 pub use stream_router::{RoutedFrame, RouterError, StreamLane, StreamRouter, StreamRouterSender};
 #[allow(unused_imports)]
 pub use network_runner::{
-    exchange_manifests, scan_project_entries, NetworkSyncRunner, PeerAddressResolver,
+    exchange_manifests, scan_project_entries, scan_project_entries_cancellable, NetworkSyncRunner,
+    PeerAddressResolver, SyncContext, SyncContextProvider,
 };
 #[allow(unused_imports)]
 pub use fetch::{respond_to_fetch, run_fetch_pull};
