@@ -7,6 +7,7 @@ mod git;
 mod keychain;
 mod manifest;
 mod merge;
+mod network_runner;
 mod operation;
 mod oplog;
 mod path_sandbox;
@@ -113,6 +114,8 @@ pub use scanner::{
 };
 #[allow(unused_imports)]
 pub use stream_router::{RoutedFrame, RouterError, StreamLane, StreamRouter, StreamRouterSender};
+#[allow(unused_imports)]
+pub use network_runner::{NetworkSyncRunner, PeerAddressResolver};
 #[allow(unused_imports)]
 pub use sync_connection::{SyncConnection, SyncConnectionError};
 #[allow(unused_imports)]
