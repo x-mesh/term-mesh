@@ -1,4 +1,5 @@
 mod apply;
+mod blob;
 mod cas;
 mod conflict;
 mod crypto;
@@ -29,6 +30,8 @@ mod trust;
 mod trust_bootstrap;
 mod trust_recovery;
 
+#[allow(unused_imports)]
+pub use blob::{chunk_count_for, put_plaintext, recv_object, send_object};
 #[allow(unused_imports)]
 pub use apply::{
     ApplyAction, ApplyBoundary, ApplyCrashHook, ApplyError, ApplyIoPoint, ApplyPlan,
