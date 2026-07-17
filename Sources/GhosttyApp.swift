@@ -523,6 +523,13 @@ class GhosttyApp {
         let contents = """
         # term-mesh baseline defaults. User config overrides these.
         shell-integration-features = ssh-env,ssh-terminfo
+        # Viewport scrollback keys. Ghostty's built-in defaults for these are
+        # not present in term-mesh's programmatically-built config, so restore
+        # them explicitly (Shift+PageUp/Down page-scroll, Shift+Home/End jump).
+        keybind = shift+page_up=scroll_page_up
+        keybind = shift+page_down=scroll_page_down
+        keybind = shift+home=scroll_to_top
+        keybind = shift+end=scroll_to_bottom
         """
         guard let url = Self.baselineDefaultsURL() else { return }
         do {
