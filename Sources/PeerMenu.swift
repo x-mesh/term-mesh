@@ -638,6 +638,29 @@ final class PeerClientCoordinator: NSObject {
         let workspaces: [Termmesh_Peer_V1_Workspace]
         do {
             let conn = try await PeerRelaySession.connect(hostSockPath: lease.hostSockPath)
+            // Live mirror needs the host to support workspace-lifecycle RPCs
+            // and the layout-changed / WorkspaceRemoved push it subscribes to
+            // (`workspace.lifecycle.v1`). An older host (e.g. a term-meshd that
+            // predates that capability) still completes the handshake, so the
+            // mirror used to build the workspace and only fail later inside
+            // `start()` when it hit the missing subscription — leaving a dead
+            // first-pane-only workspace behind on every retry (the duplicate-
+            // zombie accumulation the user hit against a 0.72.0 host). Refuse
+            // up front, before any workspace is materialized, with an
+            // actionable "update the host" message.
+            if live, !conn.hostCapabilities.has(PeerCapability.workspaceLifecycleV1) {
+                let ver = conn.hostAppVersion.map { "term-meshd \($0)" }
+                    ?? "an older term-meshd build"
+                await conn.cancel()
+                registry.release(lease)
+                self.showAlert(
+                    title: "Host Too Old for Live Mirror",
+                    body: "This host is running \(ver), which doesn't support "
+                        + "live workspace mirroring (needs workspace.lifecycle.v1). "
+                        + "Update the host's term-meshd and reconnect."
+                )
+                return
+            }
             do {
                 workspaces = try await conn.session.listWorkspaces()
             } catch {
@@ -750,13 +773,20 @@ final class PeerClientCoordinator: NSObject {
             do {
                 try await mirror.start()
             } catch {
-                self.showAlert(
-                    title: "Live Mirror Failed",
-                    body: "\(String(describing: error))\n\nThe workspace stays open with the first pane only; close it and retry."
-                )
-                // Keep the workspace (first pane is live); drop mirror mode.
+                // Mirror couldn't initialize (listWorkspaces / subscribe /
+                // reconcile failed): `startReceiveLoop` never ran, so there is
+                // no reconnect machinery — the workspace is a frozen zombie,
+                // not a live mirror. Leaving it open made every retry stack
+                // another dead workspace (the duplicate-pane accumulation).
+                // Close it, matching the host-gone auto-close path, and
+                // surface an actionable error.
                 workspace.peerMirror = nil
                 mirror.teardown()
+                AppDelegate.shared?.tabManager?.closeWorkspace(workspace)
+                self.showAlert(
+                    title: "Live Mirror Failed",
+                    body: "\(String(describing: error))\n\nThe workspace was closed. Reconnect to retry."
+                )
                 return
             }
             #if DEBUG
