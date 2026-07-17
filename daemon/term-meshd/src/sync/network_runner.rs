@@ -236,8 +236,13 @@ impl NetworkSyncRunner {
         // Race the network portion against a cancellation watcher: a cancel
         // during a long await — connect, the up-to-30s manifest exchange, or the
         // fetch — is then observed within ~100ms instead of only at the step
-        // boundaries (dropping the future tears down the connection).
+        // boundaries (dropping the future tears down the connection). `biased`
+        // polls the work branch first, so a run that has *just* completed (and
+        // already applied to disk) is reported as its real result rather than
+        // being spuriously relabelled "cancelled" when the flag flips in the same
+        // poll.
         tokio::select! {
+            biased;
             result = self.exchange_over_network(spec, addr, &local_entries, &cancelled) => result,
             () = cancelled_watch(&cancelled) => Err("cancelled".to_string()),
         }
@@ -266,7 +271,6 @@ impl NetworkSyncRunner {
         let mut connection = SyncConnection::start(auth);
         let remote_entries = exchange_manifests(&mut connection, local_entries).await?;
         let diff = diff_manifests(local_entries, &remote_entries);
-        let fetched = diff.fetch.len() as u64;
         if cancelled.load(Ordering::Acquire) {
             return Err("cancelled".to_string());
         }
@@ -299,10 +303,12 @@ impl NetworkSyncRunner {
 
         Ok(OperationResult {
             // Local manifest root (identifies the tree this diff was computed
-            // against); `entries` reports how many paths were fetched to
-            // converge (0 when the trees already matched).
+            // against); `entries` reports how many paths were actually applied to
+            // converge — plan entries, not the raw fetch list, since the plan
+            // skips paths it cannot yet apply (a dir-held path, a target-less
+            // symlink). 0 when the trees already matched.
             manifest_root: hex::encode(manifest_root(local_entries)?),
-            entries: fetched,
+            entries: plan.entries.len() as u64,
         })
     }
 }
