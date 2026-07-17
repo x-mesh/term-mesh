@@ -818,6 +818,18 @@ fn normalize_runner_error(code: &str) -> &'static str {
         "sync_peer_unknown" => "sync_peer_unknown",
         "sync_connect_failed" => "sync_connect_failed",
         "sync_exchange_failed" => "sync_exchange_failed",
+        // S2 fetch + apply pipeline.
+        "fetch_send_failed" => "fetch_send_failed",
+        "fetch_out_of_order" => "fetch_out_of_order",
+        "fetch_timeout" => "fetch_timeout",
+        "fetch_closed" => "fetch_closed",
+        "fetch_bad_message" => "fetch_bad_message",
+        "fetch_truncated" => "fetch_truncated",
+        "fetch_too_large" => "fetch_too_large",
+        "cas_stage_failed" => "cas_stage_failed",
+        "cas_write_failed" => "cas_write_failed",
+        "cas_finish_failed" => "cas_finish_failed",
+        "sync_apply_failed" => "sync_apply_failed",
         _ => "operation_failed",
     }
 }

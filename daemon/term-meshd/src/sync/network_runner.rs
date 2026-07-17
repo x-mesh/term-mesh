@@ -21,10 +21,11 @@ use std::time::Duration;
 use sync_protocol::{SyncHello, PROJECT_SYNC_CAPABILITY, PROTOCOL_V1};
 
 use super::{
-    decode_manifest_batch, diff_manifests, encode_manifest_batches, DeviceTlsIdentity,
-    ManifestBuilder, ManifestEntry, ManifestScanner, OperationResult, OperationSpec, ScanCheckpoint,
-    ScanError, ScanLimits, ScanObserver, ScanReason, StreamLane, SyncConnection, SyncEndpoint,
-    SyncTransport, TrustStore,
+    build_apply_plan, decode_manifest_batch, diff_manifests, encode_manifest_batches,
+    run_fetch_pull, ApplyStore, CasStore, DeviceTlsIdentity, ManifestBuilder, ManifestEntry,
+    ManifestScanner, ObjectDomain, ObjectType, OperationResult, OperationSpec, ProjectId,
+    ScanCheckpoint, ScanError, ScanLimits, ScanObserver, ScanReason, StreamLane, SyncConnection,
+    SyncEndpoint, SyncTransport, TrustStore,
 };
 
 /// How long to wait for the next manifest batch on the sync-operation lane
@@ -150,6 +151,14 @@ pub struct NetworkSyncRunner {
     roster_epoch: u64,
     resolver: Arc<dyn PeerAddressResolver>,
     handle: tokio::runtime::Handle,
+    /// CAS the initiator stages fetched objects into before applying them; its
+    /// key provider must be able to decrypt what the peer sends (both sides
+    /// share the same project key).
+    cas: Arc<CasStore>,
+    /// Applies the fetched objects to the working tree. Wrapped in a `Mutex`
+    /// because `ApplyStore` owns a rusqlite `Connection` (`Send` but not
+    /// `Sync`), while a `SyncTransport` must be `Sync`.
+    apply_store: Arc<Mutex<ApplyStore>>,
 }
 
 impl NetworkSyncRunner {
@@ -162,6 +171,8 @@ impl NetworkSyncRunner {
         roster_epoch: u64,
         resolver: Arc<dyn PeerAddressResolver>,
         handle: tokio::runtime::Handle,
+        cas: Arc<CasStore>,
+        apply_store: Arc<Mutex<ApplyStore>>,
     ) -> Self {
         Self {
             identity,
@@ -171,6 +182,8 @@ impl NetworkSyncRunner {
             roster_epoch,
             resolver,
             handle,
+            cas,
+            apply_store,
         }
     }
 
@@ -217,12 +230,43 @@ impl NetworkSyncRunner {
         let mut connection = SyncConnection::start(auth);
         let remote_entries = exchange_manifests(&mut connection, &local_entries).await?;
         let diff = diff_manifests(&local_entries, &remote_entries);
+        let fetched = diff.fetch.len() as u64;
+        if cancelled.load(Ordering::Acquire) {
+            return Err("cancelled".to_string());
+        }
+
+        // S2 last mile: pull the files we lack from the peer over the ordered
+        // SyncOperation lane, staging each into the CAS, then apply them to the
+        // working tree so the local project converges to the peer's.
+        let project = ProjectId::from_bytes(self.project_id);
+        let domain = ObjectDomain {
+            project_id: project,
+            object_type: ObjectType::FILE,
+            version: 1,
+        };
+        let resolved = run_fetch_pull(&mut connection, &self.cas, domain, &diff.fetch).await?;
+        // `operation_id` seeds apply's deterministic temp/backup/trash names; a
+        // fresh random id per run keeps concurrent applies from colliding
+        // (durable per-operation ids arrive with oplog tracking — see plan.rs).
+        let mut operation_id = [0u8; 16];
+        getrandom::getrandom(&mut operation_id).map_err(|_| "sync_apply_failed".to_string())?;
+        let plan = build_apply_plan(project, operation_id, &diff.fetch, &resolved);
+        if !plan.entries.is_empty() {
+            let store = self
+                .apply_store
+                .lock()
+                .map_err(|_| "sync_apply_failed".to_string())?;
+            store
+                .apply(spec.held_root.canonical_path(), &self.cas, domain, &plan)
+                .map_err(|_| "sync_apply_failed".to_string())?;
+        }
+
         Ok(OperationResult {
             // Local manifest root (identifies the tree this diff was computed
-            // against); `entries` reports how many paths must be fetched to
-            // converge (0 when the trees already match).
+            // against); `entries` reports how many paths were fetched to
+            // converge (0 when the trees already matched).
             manifest_root: hex::encode(manifest_root(&local_entries)?),
-            entries: diff.fetch.len() as u64,
+            entries: fetched,
         })
     }
 }
