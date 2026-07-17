@@ -13,10 +13,11 @@ use std::sync::Arc;
 
 use ed25519_dalek::SigningKey;
 use sync::{
-    put_plaintext, recv_object, scan_project_entries, seed_trust_store, send_object, ApplyAction,
-    ApplyPlan, ApplyPlanEntry, ApplyPrecondition, ApplyStore, BootstrapDevice, CasError, CasLimits,
-    CasStore, DeviceTlsIdentity, EntryKind, KeyId, ObjectDomain, ObjectType, ProjectId, ProjectKey,
-    ProjectKeyMaterial, ProjectKeyProvider, SyncConnection, SyncEndpoint, TrustStore,
+    build_apply_plan, diff_manifests, put_plaintext, recv_object, scan_project_entries,
+    seed_trust_store, send_object, ApplyAction, ApplyPlan, ApplyPlanEntry, ApplyPrecondition,
+    ApplyStore, BootstrapDevice, CasError, CasLimits, CasStore, DeviceTlsIdentity, EntryKind, KeyId,
+    ObjectDomain, ObjectType, ProjectId, ProjectKey, ProjectKeyMaterial, ProjectKeyProvider,
+    SyncConnection, SyncEndpoint, TrustStore,
 };
 use sync_protocol::{SyncHello, PROJECT_SYNC_CAPABILITY, PROTOCOL_V1};
 
@@ -149,4 +150,56 @@ async fn transferred_object_is_applied_to_the_destination_filesystem() {
     // The file exists on B's disk, byte-identical to A's.
     let applied = std::fs::read(dest_root.path().join("report.txt")).expect("applied file exists");
     assert_eq!(applied, content, "applied file differs from source");
+}
+
+/// Phase S2c follow-up: a directory, a file nested inside it, and a symlink
+/// beside the file all apply together onto an empty destination. Proves
+/// `build_apply_plan` emits the directory first so the nested leaf has a parent
+/// to land in (add-only, `Absent` preconditions).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn nested_directory_file_and_symlink_apply_together() {
+    let temporary = tempfile::tempdir().unwrap();
+    let project = [0x42; 32];
+    let project_id = ProjectId::from_bytes(project);
+    let domain = ObjectDomain {
+        project_id,
+        object_type: ObjectType::FILE,
+        version: 1,
+    };
+
+    // Source tree: `sub/report.txt` plus a `sub/link -> report.txt` symlink.
+    let source_root = tempfile::tempdir().unwrap();
+    std::fs::create_dir(source_root.path().join("sub")).unwrap();
+    let content = b"nested-report".to_vec();
+    std::fs::write(source_root.path().join("sub/report.txt"), &content).unwrap();
+    std::os::unix::fs::symlink("report.txt", source_root.path().join("sub/link")).unwrap();
+
+    // Empty destination: every path (dir, file, symlink) is fetched.
+    let source_entries = scan_project_entries(&File::open(source_root.path()).unwrap()).unwrap();
+    let diff = diff_manifests(&[], &source_entries);
+
+    // Stage the file's bytes into the destination CAS, as the fetch would.
+    let cas_dest = cas(&temporary.path().join("cas_dest"));
+    let key = ProjectKey::new(KEY_BYTES);
+    let object_id = put_plaintext(&cas_dest, domain, &key, KEY_ID, &content).unwrap();
+    let mut object_ids = std::collections::HashMap::new();
+    object_ids.insert("sub/report.txt".to_string(), object_id);
+
+    // Build + apply the plan onto an empty destination root.
+    let plan = build_apply_plan(project_id, [9; 16], &diff.fetch, &object_ids);
+    let apply_store =
+        ApplyStore::open(state_dir(temporary.path(), "apply-state").join("apply.db")).unwrap();
+    let dest_root = tempfile::tempdir().unwrap();
+    apply_store
+        .apply(dest_root.path(), &cas_dest, domain, &plan)
+        .expect("apply nested tree to destination filesystem");
+
+    // The directory was created, the nested file carries the source bytes, and
+    // the symlink points where it did on the source.
+    assert!(dest_root.path().join("sub").is_dir(), "sub/ created first");
+    let applied =
+        std::fs::read(dest_root.path().join("sub/report.txt")).expect("nested file exists");
+    assert_eq!(applied, content, "nested file differs from source");
+    let link = std::fs::read_link(dest_root.path().join("sub/link")).expect("symlink exists");
+    assert_eq!(link, std::path::Path::new("report.txt"), "symlink target");
 }

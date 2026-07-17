@@ -446,12 +446,13 @@ impl ApplyStore {
                     hook.after_io(ApplyIoPoint::TempFsync)?;
                     sandbox.sync_temp_work(hook)?;
                 }
-                ApplyAction::Directory { executable } => {
-                    sandbox.create_temp_directory(
-                        &temp,
-                        if *executable { 0o700 } else { 0o600 },
-                        hook,
-                    )?;
+                ApplyAction::Directory { executable: _ } => {
+                    // A directory must carry its owner search (x) bit or nothing
+                    // can be created inside it. The manifest does not track
+                    // directory permission bits (the scanner always reports a
+                    // directory as non-executable), so create it private but
+                    // traversable rather than deriving a mode that omits x.
+                    sandbox.create_temp_directory(&temp, 0o700, hook)?;
                 }
                 ApplyAction::Symlink { target } => {
                     sandbox.create_temp_symlink(&temp, target, hook)?;

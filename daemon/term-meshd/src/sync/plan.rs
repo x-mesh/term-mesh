@@ -102,36 +102,67 @@ fn fetch_of(entry: &ManifestEntry) -> FetchEntry {
 }
 
 /// Build an [`ApplyPlan`] from a diff's fetch list and the CAS object ids the
-/// fetch resolved (path → object id). Only `File` entries are emitted here (with
-/// their transferred object id); directory/symlink handling is a later phase, so
-/// nested paths whose parent directory is absent are not yet supported. Every
-/// entry uses an `Absent` precondition (add-only sync). `target_manifest_root`
-/// and `frontier` are placeholders until oplog/visible-state tracking lands.
+/// fetch resolved (path → object id). File entries carry their transferred
+/// object id; directory and symlink entries carry no bytes (a symlink's target
+/// is inline, a directory only its mode). Directories are ordered first — a
+/// parent before each of its children — so a file or symlink always has its
+/// parent directory to land in. Every entry uses an `Absent` precondition
+/// (add-only sync); overwrite via `Present(fingerprint)`, plus
+/// `target_manifest_root`/`frontier` tracking, arrive with oplog/visible-state.
 pub fn build_apply_plan(
     project: ProjectId,
     operation_id: [u8; 16],
     fetch: &[FetchEntry],
     object_ids: &HashMap<String, ObjectId>,
 ) -> ApplyPlan {
-    let mut entries = Vec::new();
+    // Directories are collected apart from files/symlinks so they can be applied
+    // first: a leaf can only be installed once its parent directory exists.
+    let mut directories = Vec::new();
+    let mut leaves = Vec::new();
     for entry in fetch {
-        if entry.kind != EntryKind::File {
-            continue;
-        }
-        let Some(object_id) = object_ids.get(&entry.relative_path) else {
-            continue;
-        };
-        entries.push(ApplyPlanEntry {
-            relative_path: entry.relative_path.clone(),
-            action: ApplyAction::File {
-                object_id: *object_id,
-                content_hash: entry.content_hash,
-                length: entry.length,
+        let action = match entry.kind {
+            EntryKind::Directory => ApplyAction::Directory {
                 executable: entry.executable,
             },
+            EntryKind::Symlink => {
+                // A symlink carries its target inline; skip a malformed entry
+                // that lost it rather than install a target-less symlink.
+                let Some(target) = entry.symlink_target.clone() else {
+                    continue;
+                };
+                ApplyAction::Symlink { target }
+            }
+            EntryKind::File => {
+                // A file's bytes come from the fetch; without a resolved CAS
+                // object there is nothing to install, so skip it.
+                let Some(object_id) = object_ids.get(&entry.relative_path) else {
+                    continue;
+                };
+                ApplyAction::File {
+                    object_id: *object_id,
+                    content_hash: entry.content_hash,
+                    length: entry.length,
+                    executable: entry.executable,
+                }
+            }
+        };
+        let plan_entry = ApplyPlanEntry {
+            relative_path: entry.relative_path.clone(),
+            action,
             precondition: ApplyPrecondition::Absent,
-        });
+        };
+        if matches!(plan_entry.action, ApplyAction::Directory { .. }) {
+            directories.push(plan_entry);
+        } else {
+            leaves.push(plan_entry);
+        }
     }
+    // Sort directories by path so a parent (a shorter '/'-separated prefix)
+    // always precedes its children; the leaves then land into them.
+    directories.sort_by(|a, b| a.relative_path.cmp(&b.relative_path));
+    let mut entries = directories;
+    entries.extend(leaves);
+
     ApplyPlan {
         operation_id,
         project,
@@ -330,6 +361,109 @@ mod tests {
             content_hash: [0; 32],
             symlink_target: Some(target.to_string()),
         }
+    }
+
+    fn dir(path: &str) -> ManifestEntry {
+        ManifestEntry {
+            relative_path: path.to_string(),
+            kind: EntryKind::Directory,
+            executable: true, // directories are searchable
+            length: 0,
+            content_hash: [0; 32],
+            symlink_target: None,
+        }
+    }
+
+    #[test]
+    fn apply_plan_orders_directories_first_and_carries_symlinks() {
+        // Remote holds a nested file, its two ancestor directories, and a
+        // symlink; the local tree is empty, so every path is fetched. The dirs
+        // are listed out of order to prove the plan re-orders them.
+        let remote = vec![
+            file("dir/deep/a.txt", 1, false),
+            dir("dir/deep"),
+            symlink("dir/link", "a.txt"),
+            dir("dir"),
+        ];
+        let diff = diff_manifests(&[], &remote);
+        // Only the file resolves to a CAS object; dirs/symlinks carry no bytes.
+        let mut object_ids = HashMap::new();
+        object_ids.insert("dir/deep/a.txt".to_string(), ObjectId([7; 32]));
+
+        let plan = build_apply_plan(
+            ProjectId::from_bytes([0x42; 32]),
+            [1; 16],
+            &diff.fetch,
+            &object_ids,
+        );
+
+        let paths: Vec<&str> = plan
+            .entries
+            .iter()
+            .map(|e| e.relative_path.as_str())
+            .collect();
+        // Both directories come first, parent before child, then the leaves.
+        assert_eq!(&paths[..2], &["dir", "dir/deep"], "dirs first, parent first");
+        let first_leaf = plan
+            .entries
+            .iter()
+            .position(|e| !matches!(e.action, ApplyAction::Directory { .. }))
+            .unwrap();
+        assert!(
+            plan.entries[..first_leaf]
+                .iter()
+                .all(|e| matches!(e.action, ApplyAction::Directory { .. })),
+            "no leaf may precede a directory"
+        );
+
+        // The symlink carries its inline target; the file its resolved object id.
+        let link = plan
+            .entries
+            .iter()
+            .find(|e| e.relative_path == "dir/link")
+            .unwrap();
+        assert_eq!(
+            link.action,
+            ApplyAction::Symlink {
+                target: "a.txt".to_string()
+            }
+        );
+        let f = plan
+            .entries
+            .iter()
+            .find(|e| e.relative_path == "dir/deep/a.txt")
+            .unwrap();
+        assert_eq!(
+            f.action,
+            ApplyAction::File {
+                object_id: ObjectId([7; 32]),
+                content_hash: [1; 32],
+                length: 10,
+                executable: false,
+            }
+        );
+
+        // Add-only sync: every entry expects an absent path, and all four are kept.
+        assert_eq!(plan.entries.len(), 4);
+        assert!(plan
+            .entries
+            .iter()
+            .all(|e| e.precondition == ApplyPrecondition::Absent));
+    }
+
+    #[test]
+    fn apply_plan_skips_a_symlink_that_lost_its_target() {
+        // A symlink FetchEntry with no inline target is malformed; it must be
+        // dropped, not emitted as a target-less symlink.
+        let mut broken = fetch_of(&symlink("bad", "x"));
+        broken.symlink_target = None;
+        let plan = build_apply_plan(
+            ProjectId::from_bytes([0x42; 32]),
+            [1; 16],
+            &[broken],
+            &HashMap::new(),
+        );
+        assert!(plan.entries.is_empty());
     }
 
     #[test]
