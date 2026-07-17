@@ -475,13 +475,20 @@ async fn client_side_revocation_independently_rejects_server_certificate() {
 async fn router_latency_artifact_has_no_wall_clock_gate() {
     let (sender, mut router) = StreamRouter::bounded();
     let started = Instant::now();
+    let mut drained = 0usize;
     for _ in 0..128 {
         sender
             .send(StreamLane::Control, vec![1; 1024])
             .await
             .unwrap();
-        drop(router.next().await.unwrap());
+        let frame = router.next().await.unwrap();
+        assert_eq!(frame.payload().len(), 1024, "router must forward the full payload");
+        drained += 1;
     }
+    // Functional assertion: every enqueued frame routed through. The latency
+    // artifact below is written for offline analysis only — deliberately NOT
+    // gated on wall-clock time (would be flaky under CI load).
+    assert_eq!(drained, 128, "all frames must route through the bounded router");
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .unwrap()

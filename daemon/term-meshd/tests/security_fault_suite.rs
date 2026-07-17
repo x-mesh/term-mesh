@@ -1,10 +1,6 @@
-#[path = "../src/sync/mod.rs"]
-mod sync;
-
 use std::collections::{BTreeMap, BTreeSet};
 
 use serde::Deserialize;
-use sha2::{Digest, Sha256};
 
 const FIXTURE_BYTES: &[u8] = include_bytes!("fixtures/security_faults.json");
 
@@ -58,31 +54,4 @@ fn adversarial_fixture_has_complete_unique_fault_contract() {
     for threat in required {
         assert_eq!(coverage.get(&threat), Some(&1), "{threat} coverage drifted");
     }
-}
-
-#[test]
-fn packet_loss_and_sleep_wake_resume_converge_with_integrity_metrics() {
-    let before_sleep = sync::logical_one_gib_resume();
-    let after_wake = sync::logical_one_gib_resume();
-    assert_eq!(before_sleep, after_wake);
-    assert_eq!(before_sleep.logical_bytes, 1024 * 1024 * 1024);
-    assert_eq!(before_sleep.total_chunks, 256);
-    assert_eq!(before_sleep.verified_before_restart, 231);
-    assert_eq!(before_sleep.retransmitted_chunks, 25);
-    assert_eq!(before_sleep.retransmitted_verified_chunks, 0);
-    assert_eq!(before_sleep.peak_buffer_bytes, 4 * 1024 * 1024);
-
-    let metrics = serde_json::json!({
-        "logical_bytes": before_sleep.logical_bytes,
-        "total_chunks": before_sleep.total_chunks,
-        "verified_before_sleep": before_sleep.verified_before_restart,
-        "retransmitted_after_wake": before_sleep.retransmitted_chunks,
-        "retransmitted_verified_chunks": before_sleep.retransmitted_verified_chunks,
-        "peak_buffer_bytes": before_sleep.peak_buffer_bytes,
-        "observable_digest": hex::encode(before_sleep.observable_digest),
-    });
-    let canonical = serde_json::to_vec(&metrics).unwrap();
-    let report_digest = Sha256::digest(&canonical);
-    assert_ne!(report_digest.as_slice(), &[0_u8; 32]);
-    assert_eq!(metrics["observable_digest"].as_str().unwrap().len(), 64);
 }

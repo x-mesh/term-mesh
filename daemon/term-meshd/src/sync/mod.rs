@@ -113,7 +113,7 @@ pub use scanner::{
 pub use stream_router::{RoutedFrame, RouterError, StreamLane, StreamRouter, StreamRouterSender};
 #[allow(unused_imports)]
 pub use transfer::{
-    logical_one_gib_resume, LogicalTransferReport, TransferCheckpoint, TransferError,
+    logical_transfer_fixture, LogicalTransferReport, TransferCheckpoint, TransferError,
     TransferSession, WireTrace,
 };
 #[allow(unused_imports)]

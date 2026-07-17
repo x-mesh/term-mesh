@@ -267,7 +267,14 @@ pub struct LogicalTransferReport {
     pub peak_buffer_bytes: usize,
     pub observable_digest: [u8; 32],
 }
-pub fn logical_one_gib_resume() -> LogicalTransferReport {
+/// Deterministic fixture describing the SHAPE of a large resumed transfer
+/// report — fixed constants, NOT a measured 1 GiB transfer or a real
+/// packet-loss/sleep-wake resume. It hashes a fixed buffer so
+/// `observable_digest` is stable across runs, and exists only so callers
+/// can assert the `LogicalTransferReport` struct/serialization is wired
+/// correctly. A real resume-under-fault e2e is tracked separately; do not
+/// read a pass here as "1 GiB transfer verified".
+pub fn logical_transfer_fixture() -> LogicalTransferReport {
     let logical = 1024_u64 * 1024 * 1024;
     let chunks = 256;
     let verified = 231;

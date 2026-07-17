@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use ed25519_dalek::{Signer, SigningKey};
 use sync::{
-    logical_one_gib_resume, BaselineCrashHook, BaselineInstallPhase, EntryKind, HeadDecision,
+    logical_transfer_fixture, BaselineCrashHook, BaselineInstallPhase, EntryKind, HeadDecision,
     KeyId, ManifestBuilder, ManifestEntry, ManifestIndex, ManifestScanner, ObjectId, OplogStore,
     OplogTrustError, OplogTrustProvider, ProjectId, ProjectKey, ReconcileError,
     ReconcileOrchestrator, ReconcileStore, ResumeToken, ScanLimits, ScanObserver, StageId,
@@ -1734,7 +1734,7 @@ fn checkpoint_mac_and_exact_resume_boundary_are_enforced() {
     tampered[40] ^= 1;
     assert!(TransferCheckpoint::decode(&tampered, &key).is_err());
     assert!(TransferCheckpoint::decode(&bytes, &ProjectKey::new([8; 32])).is_err());
-    let report = logical_one_gib_resume();
+    let report = logical_transfer_fixture();
     assert_eq!(
         (
             report.logical_bytes,
