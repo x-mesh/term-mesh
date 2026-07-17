@@ -15,6 +15,7 @@ mod oplog;
 mod path_sandbox;
 mod plan;
 mod project_lock;
+mod provisioning;
 mod reconcile;
 mod registry;
 mod rotation;
@@ -127,6 +128,11 @@ pub use network_runner::{
 };
 #[allow(unused_imports)]
 pub use fetch::{respond_to_fetch, run_fetch_pull};
+#[allow(unused_imports)]
+pub use provisioning::{
+    default_provisioning_db_path, LocalCoordinates, ProvisioningError, ProvisioningPeerResolver,
+    SyncProvisioningStore,
+};
 #[allow(unused_imports)]
 pub use plan::{
     build_apply_plan, decode_entries, decode_manifest_batch, diff_manifests, encode_entries,
