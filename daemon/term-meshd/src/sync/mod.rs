@@ -19,10 +19,12 @@ mod schema;
 mod secure_sqlite;
 mod sqlite_openat_vfs;
 mod stream_router;
+mod sync_connection;
 mod transfer;
 mod transport;
 mod transport_auth;
 mod trust;
+mod trust_bootstrap;
 mod trust_recovery;
 
 #[allow(unused_imports)]
@@ -112,6 +114,8 @@ pub use scanner::{
 #[allow(unused_imports)]
 pub use stream_router::{RoutedFrame, RouterError, StreamLane, StreamRouter, StreamRouterSender};
 #[allow(unused_imports)]
+pub use sync_connection::{SyncConnection, SyncConnectionError};
+#[allow(unused_imports)]
 pub use transfer::{
     logical_transfer_fixture, LogicalTransferReport, TransferCheckpoint, TransferError,
     TransferSession, WireTrace,
@@ -122,6 +126,8 @@ pub use transport::{AuthenticatedConnection, SyncEndpoint, TransportError};
 pub use trust::{
     TransportPeerSnapshot, TrustError, TrustGcCoordinator, TrustRootProvider, TrustStore,
 };
+#[allow(unused_imports)]
+pub use trust_bootstrap::{seed_trust_store, BootstrapDevice};
 #[allow(unused_imports)]
 pub use trust_recovery::{
     authorize_revoke, device_secret_item, export_recovery, import_recovery, project_dek_item,
