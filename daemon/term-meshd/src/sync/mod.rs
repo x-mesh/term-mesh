@@ -66,8 +66,9 @@ pub use git::{
 pub use keychain::MacOsKeychain;
 #[allow(unused_imports)]
 pub use keychain::{
-    load_device_tls_identity, persist_device_tls_identity, DeviceTlsIdentity, KeychainBackend,
-    KeychainError, KeychainItem, KeychainProtection, PeerIdentityProvider, PresenceAction,
+    generate_project_key, load_device_tls_identity, load_project_key, persist_device_tls_identity,
+    persist_project_key, DeviceTlsIdentity, KeychainBackend, KeychainError, KeychainItem,
+    KeychainProjectKeyProvider, KeychainProtection, PeerIdentityProvider, PresenceAction,
     PresenceCapability, PresenceGrantContext, RandomSource, SystemRandom, UserPresenceAuthorizer,
 };
 #[allow(unused_imports)]

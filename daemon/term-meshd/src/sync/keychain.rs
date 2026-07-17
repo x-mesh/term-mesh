@@ -1,6 +1,9 @@
 use std::fmt;
-use std::sync::Mutex;
+use std::io;
+use std::sync::{Arc, Mutex};
 use zeroize::Zeroizing;
+
+use super::{CasError, KeyId, ProjectId, ProjectKey, ProjectKeyMaterial, ProjectKeyProvider};
 
 const TLS_IDENTITY_MAGIC: &[u8; 4] = b"TMID";
 const TLS_IDENTITY_VERSION: u16 = 1;
@@ -86,6 +89,113 @@ pub fn load_device_tls_identity(
             Ok(identity)
         }
         Err(error) => Err(error),
+    }
+}
+
+// ── Project key (CAS data-encryption key) ────────────────────────────────────
+//
+// The CAS encrypts every chunk under a per-project DEK. `bootstrap-trust`
+// generates one random DEK per project and stores it here (both peers must hold
+// the same DEK to decrypt each other's objects); `KeychainProjectKeyProvider`
+// hands it to `CasStore`. v0 has exactly one key per project (no rotation).
+
+const PROJECT_KEY_MAGIC: &[u8; 4] = b"TMDK";
+const PROJECT_KEY_VERSION: u16 = 1;
+/// magic(4) + version(2) + key_id(16) + key(32).
+const PROJECT_KEY_ENCODED_LEN: usize = 4 + 2 + 16 + 32;
+
+fn project_key_item(project_id: [u8; 32]) -> KeychainItem {
+    KeychainItem {
+        service: format!("term-mesh.sync.dek.{}", hex::encode(project_id)),
+        account: "project-key-v1".into(),
+        protection: KeychainProtection::AfterFirstUnlockThisDeviceOnly,
+    }
+}
+
+fn encode_project_key(material: &ProjectKeyMaterial) -> Vec<u8> {
+    let mut out = Vec::with_capacity(PROJECT_KEY_ENCODED_LEN);
+    out.extend_from_slice(PROJECT_KEY_MAGIC);
+    out.extend_from_slice(&PROJECT_KEY_VERSION.to_be_bytes());
+    out.extend_from_slice(&material.key_id.0);
+    out.extend_from_slice(material.key.expose_for_wrapping());
+    out
+}
+
+fn decode_project_key(input: &[u8]) -> Result<ProjectKeyMaterial, KeychainError> {
+    if input.len() != PROJECT_KEY_ENCODED_LEN
+        || &input[..4] != PROJECT_KEY_MAGIC
+        || u16::from_be_bytes([input[4], input[5]]) != PROJECT_KEY_VERSION
+    {
+        return Err(KeychainError::InvalidProjectKey);
+    }
+    let mut key_id = [0u8; 16];
+    key_id.copy_from_slice(&input[6..22]);
+    let mut key = [0u8; 32];
+    key.copy_from_slice(&input[22..54]);
+    Ok(ProjectKeyMaterial {
+        key_id: KeyId(key_id),
+        key: ProjectKey::new(key),
+    })
+}
+
+/// A fresh random project DEK (16-byte key id + 32-byte key). The two peers of a
+/// project share one DEK, so bootstrap generates it once and provisions it into
+/// each daemon's keychain.
+pub fn generate_project_key() -> Result<ProjectKeyMaterial, KeychainError> {
+    let mut key_id = [0u8; 16];
+    getrandom::getrandom(&mut key_id).map_err(|error| KeychainError::Random(error.to_string()))?;
+    let mut key = [0u8; 32];
+    getrandom::getrandom(&mut key).map_err(|error| KeychainError::Random(error.to_string()))?;
+    Ok(ProjectKeyMaterial {
+        key_id: KeyId(key_id),
+        key: ProjectKey::new(key),
+    })
+}
+
+pub fn persist_project_key(
+    backend: &dyn KeychainBackend,
+    project_id: [u8; 32],
+    material: &ProjectKeyMaterial,
+) -> Result<(), KeychainError> {
+    backend.put(&project_key_item(project_id), &encode_project_key(material))
+}
+
+pub fn load_project_key(
+    backend: &dyn KeychainBackend,
+    project_id: [u8; 32],
+) -> Result<ProjectKeyMaterial, KeychainError> {
+    let raw = backend.get(&project_key_item(project_id))?;
+    decode_project_key(&raw)
+}
+
+/// A [`ProjectKeyProvider`] backed by the keychain: `CasStore` reads each
+/// project's DEK (provisioned by `bootstrap-trust`) through this. A project with
+/// no provisioned key, or a request for an unknown key id, surfaces as a
+/// `CasError` so the CAS operation fails cleanly rather than with a wrong key.
+pub struct KeychainProjectKeyProvider {
+    backend: Arc<dyn KeychainBackend>,
+}
+
+impl KeychainProjectKeyProvider {
+    pub fn new(backend: Arc<dyn KeychainBackend>) -> Self {
+        Self { backend }
+    }
+}
+
+impl ProjectKeyProvider for KeychainProjectKeyProvider {
+    fn current_project_key(&self, project_id: ProjectId) -> Result<ProjectKeyMaterial, CasError> {
+        load_project_key(self.backend.as_ref(), *project_id.as_bytes())
+            .map_err(|_| CasError::Io(io::Error::other("project_key_unavailable")))
+    }
+
+    fn project_key(&self, project_id: ProjectId, key_id: KeyId) -> Result<ProjectKey, CasError> {
+        let material = load_project_key(self.backend.as_ref(), *project_id.as_bytes())
+            .map_err(|_| CasError::Io(io::Error::other("project_key_unavailable")))?;
+        if material.key_id == key_id {
+            Ok(material.key)
+        } else {
+            Err(CasError::Io(io::Error::other("project_key_id_unknown")))
+        }
     }
 }
 
@@ -460,6 +570,7 @@ pub enum KeychainError {
     Poisoned,
     Certificate(String),
     InvalidTlsIdentity,
+    InvalidProjectKey,
 }
 
 impl fmt::Display for KeychainError {
@@ -524,6 +635,34 @@ mod tests {
             load_device_tls_identity(&backend, [1; 32], [3; 32]),
             Err(KeychainError::NotFound)
         ));
+    }
+
+    #[test]
+    fn project_key_round_trips_and_provider_answers_only_the_current_id() {
+        let backend = std::sync::Arc::new(MemoryKeychain::default());
+        let material = generate_project_key().unwrap();
+        let key_id = material.key_id;
+        let key_bytes = *material.key.expose_for_wrapping();
+        persist_project_key(backend.as_ref(), [7; 32], &material).unwrap();
+
+        // Round-trips through the keychain, byte-for-byte.
+        let loaded = load_project_key(backend.as_ref(), [7; 32]).unwrap();
+        assert_eq!(loaded.key_id, key_id);
+        assert_eq!(loaded.key.expose_for_wrapping(), &key_bytes);
+
+        let provider = KeychainProjectKeyProvider::new(backend.clone());
+        let project = ProjectId::from_bytes([7; 32]);
+        // Current key resolves; the same key id resolves to the same bytes.
+        assert_eq!(provider.current_project_key(project).unwrap().key_id, key_id);
+        assert_eq!(
+            provider.project_key(project, key_id).unwrap().expose_for_wrapping(),
+            &key_bytes
+        );
+        // An unknown key id and an unprovisioned project both fail cleanly.
+        assert!(provider.project_key(project, KeyId([0xff; 16])).is_err());
+        assert!(provider
+            .current_project_key(ProjectId::from_bytes([9; 32]))
+            .is_err());
     }
 
     #[test]
