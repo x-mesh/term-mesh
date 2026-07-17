@@ -1,0 +1,305 @@
+//! Manifest diff + wire codec for the mesh sync runner (Phase S1 of
+//! `docs/design/mesh-project-sync-wiring-plan.md`).
+//!
+//! `reconcile.rs` decides head/frontier relations and moves oplog/manifest
+//! pages; it does not emit a file-level plan. This module is the runner's own
+//! diff: given the destination's and the source's scanned manifest entries, it
+//! computes what the destination must fetch/overwrite and delete to converge.
+//!
+//! S1 proves the *diff* — the set of paths + content hashes that differ. It does
+//! not resolve CAS object ids or move bytes; S2 turns `fetch` entries into CAS
+//! transfers and a real `ApplyPlan`. The entry wire codec here is the minimal
+//! encoding the two peers swap their manifests over the SyncOperation lane.
+
+use std::collections::{HashMap, HashSet};
+
+use super::{EntryKind, ManifestEntry};
+
+/// Upper bounds applied when decoding a peer's manifest (untrusted input).
+const MAX_ENTRIES: usize = 4_000_000;
+const MAX_PATH_BYTES: usize = 4096;
+
+/// One entry the destination must transfer from the source to converge.
+/// Mirrors the source `ManifestEntry`; carried separately so S2 can attach the
+/// resolved CAS object id without mutating the manifest type.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FetchEntry {
+    pub relative_path: String,
+    pub kind: EntryKind,
+    pub executable: bool,
+    pub length: u64,
+    pub content_hash: [u8; 32],
+    pub symlink_target: Option<String>,
+}
+
+/// The changes that make a local (destination) manifest converge to a remote
+/// (source) manifest. Content bytes are unresolved (that is S2).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ManifestDiff {
+    /// Paths present-or-changed on the source that the destination must pull.
+    pub fetch: Vec<FetchEntry>,
+    /// Paths present on the destination but gone from the source.
+    pub delete: Vec<String>,
+}
+
+impl ManifestDiff {
+    pub fn is_empty(&self) -> bool {
+        self.fetch.is_empty() && self.delete.is_empty()
+    }
+}
+
+/// Diff `local` (destination) against `remote` (source): what would make local
+/// converge to remote. Path-keyed, so it is independent of the manifests'
+/// iteration order; `fetch` follows `remote` order and `delete` follows `local`
+/// order for deterministic output.
+///
+/// - path only in remote → fetch (add)
+/// - path in both, entry differs → fetch (overwrite)
+/// - path in both, entry equal → skip
+/// - path only in local → delete
+pub fn diff_manifests(local: &[ManifestEntry], remote: &[ManifestEntry]) -> ManifestDiff {
+    let local_by_path: HashMap<&str, &ManifestEntry> = local
+        .iter()
+        .map(|entry| (entry.relative_path.as_str(), entry))
+        .collect();
+    let remote_paths: HashSet<&str> = remote
+        .iter()
+        .map(|entry| entry.relative_path.as_str())
+        .collect();
+
+    let mut diff = ManifestDiff::default();
+    for entry in remote {
+        match local_by_path.get(entry.relative_path.as_str()) {
+            Some(local_entry) if *local_entry == entry => {}
+            _ => diff.fetch.push(fetch_of(entry)),
+        }
+    }
+    for entry in local {
+        if !remote_paths.contains(entry.relative_path.as_str()) {
+            diff.delete.push(entry.relative_path.clone());
+        }
+    }
+    diff
+}
+
+fn fetch_of(entry: &ManifestEntry) -> FetchEntry {
+    FetchEntry {
+        relative_path: entry.relative_path.clone(),
+        kind: entry.kind,
+        executable: entry.executable,
+        length: entry.length,
+        content_hash: entry.content_hash,
+        symlink_target: entry.symlink_target.clone(),
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum ManifestWireError {
+    Truncated,
+    TooLarge,
+    BadKind(u8),
+    BadUtf8,
+}
+
+fn kind_to_byte(kind: EntryKind) -> u8 {
+    match kind {
+        EntryKind::File => 1,
+        EntryKind::Directory => 2,
+        EntryKind::Symlink => 3,
+    }
+}
+
+fn kind_from_byte(byte: u8) -> Result<EntryKind, ManifestWireError> {
+    match byte {
+        1 => Ok(EntryKind::File),
+        2 => Ok(EntryKind::Directory),
+        3 => Ok(EntryKind::Symlink),
+        other => Err(ManifestWireError::BadKind(other)),
+    }
+}
+
+/// Encode a manifest entry list for the SyncOperation lane:
+/// `[count u32][ per entry: kind u8, exec u8, length u64, hash [32],
+///   path_len u32, path, target_len u32, target ]`, all big-endian.
+pub fn encode_entries(entries: &[ManifestEntry]) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.extend_from_slice(&(entries.len() as u32).to_be_bytes());
+    for entry in entries {
+        out.push(kind_to_byte(entry.kind));
+        out.push(u8::from(entry.executable));
+        out.extend_from_slice(&entry.length.to_be_bytes());
+        out.extend_from_slice(&entry.content_hash);
+        let path = entry.relative_path.as_bytes();
+        out.extend_from_slice(&(path.len() as u32).to_be_bytes());
+        out.extend_from_slice(path);
+        let target = entry.symlink_target.as_deref().unwrap_or("").as_bytes();
+        out.extend_from_slice(&(target.len() as u32).to_be_bytes());
+        out.extend_from_slice(target);
+    }
+    out
+}
+
+struct Reader<'a> {
+    input: &'a [u8],
+    offset: usize,
+}
+
+impl<'a> Reader<'a> {
+    fn take(&mut self, n: usize) -> Result<&'a [u8], ManifestWireError> {
+        let end = self
+            .offset
+            .checked_add(n)
+            .ok_or(ManifestWireError::Truncated)?;
+        let slice = self
+            .input
+            .get(self.offset..end)
+            .ok_or(ManifestWireError::Truncated)?;
+        self.offset = end;
+        Ok(slice)
+    }
+    fn u32(&mut self) -> Result<u32, ManifestWireError> {
+        Ok(u32::from_be_bytes(self.take(4)?.try_into().unwrap()))
+    }
+    fn u64(&mut self) -> Result<u64, ManifestWireError> {
+        Ok(u64::from_be_bytes(self.take(8)?.try_into().unwrap()))
+    }
+    fn u8(&mut self) -> Result<u8, ManifestWireError> {
+        Ok(self.take(1)?[0])
+    }
+    fn string(&mut self, len: usize) -> Result<String, ManifestWireError> {
+        if len > MAX_PATH_BYTES {
+            return Err(ManifestWireError::TooLarge);
+        }
+        std::str::from_utf8(self.take(len)?)
+            .map(str::to_owned)
+            .map_err(|_| ManifestWireError::BadUtf8)
+    }
+}
+
+/// Decode what [`encode_entries`] produced. Bounds every length against
+/// `MAX_ENTRIES` / `MAX_PATH_BYTES` since the bytes come from a peer.
+pub fn decode_entries(input: &[u8]) -> Result<Vec<ManifestEntry>, ManifestWireError> {
+    let mut reader = Reader { input, offset: 0 };
+    let count = reader.u32()? as usize;
+    if count > MAX_ENTRIES {
+        return Err(ManifestWireError::TooLarge);
+    }
+    let mut entries = Vec::with_capacity(count.min(1024));
+    for _ in 0..count {
+        let kind = kind_from_byte(reader.u8()?)?;
+        let executable = reader.u8()? != 0;
+        let length = reader.u64()?;
+        let content_hash: [u8; 32] = reader.take(32)?.try_into().unwrap();
+        let path_len = reader.u32()? as usize;
+        let relative_path = reader.string(path_len)?;
+        let target_len = reader.u32()? as usize;
+        let symlink_target = if target_len == 0 {
+            None
+        } else {
+            Some(reader.string(target_len)?)
+        };
+        entries.push(ManifestEntry {
+            relative_path,
+            kind,
+            executable,
+            length,
+            content_hash,
+            symlink_target,
+        });
+    }
+    Ok(entries)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn file(path: &str, hash: u8, exec: bool) -> ManifestEntry {
+        ManifestEntry {
+            relative_path: path.to_string(),
+            kind: EntryKind::File,
+            executable: exec,
+            length: 10,
+            content_hash: [hash; 32],
+            symlink_target: None,
+        }
+    }
+
+    fn symlink(path: &str, target: &str) -> ManifestEntry {
+        ManifestEntry {
+            relative_path: path.to_string(),
+            kind: EntryKind::Symlink,
+            executable: false,
+            length: 0,
+            content_hash: [0; 32],
+            symlink_target: Some(target.to_string()),
+        }
+    }
+
+    #[test]
+    fn identical_manifests_diff_to_nothing() {
+        let m = vec![file("a", 1, false), file("b", 2, false)];
+        assert!(diff_manifests(&m, &m).is_empty());
+    }
+
+    #[test]
+    fn remote_only_path_is_fetched() {
+        let local = vec![file("a", 1, false)];
+        let remote = vec![file("a", 1, false), file("b", 2, false)];
+        let diff = diff_manifests(&local, &remote);
+        assert_eq!(diff.delete, Vec::<String>::new());
+        assert_eq!(diff.fetch.len(), 1);
+        assert_eq!(diff.fetch[0].relative_path, "b");
+    }
+
+    #[test]
+    fn local_only_path_is_deleted() {
+        let local = vec![file("a", 1, false), file("gone", 9, false)];
+        let remote = vec![file("a", 1, false)];
+        let diff = diff_manifests(&local, &remote);
+        assert!(diff.fetch.is_empty());
+        assert_eq!(diff.delete, vec!["gone".to_string()]);
+    }
+
+    #[test]
+    fn changed_content_or_exec_bit_is_fetched() {
+        let local = vec![file("a", 1, false), file("b", 2, false)];
+        // a: content changed; b: exec bit changed.
+        let remote = vec![file("a", 7, false), file("b", 2, true)];
+        let diff = diff_manifests(&local, &remote);
+        assert!(diff.delete.is_empty());
+        let paths: Vec<_> = diff.fetch.iter().map(|e| e.relative_path.as_str()).collect();
+        assert_eq!(paths, vec!["a", "b"]);
+    }
+
+    #[test]
+    fn mixed_add_change_delete() {
+        let local = vec![file("keep", 1, false), file("drop", 2, false), file("change", 3, false)];
+        let remote = vec![file("keep", 1, false), file("change", 8, false), file("add", 4, false)];
+        let diff = diff_manifests(&local, &remote);
+        let fetch: Vec<_> = diff.fetch.iter().map(|e| e.relative_path.as_str()).collect();
+        assert_eq!(fetch, vec!["change", "add"]);
+        assert_eq!(diff.delete, vec!["drop".to_string()]);
+    }
+
+    #[test]
+    fn wire_codec_round_trips() {
+        let entries = vec![
+            file("dir/a.txt", 1, false),
+            file("dir/b.sh", 2, true),
+            symlink("link", "dir/a.txt"),
+        ];
+        let decoded = decode_entries(&encode_entries(&entries)).unwrap();
+        assert_eq!(decoded, entries);
+    }
+
+    #[test]
+    fn decode_rejects_truncated_and_oversized() {
+        assert_eq!(decode_entries(&[0, 0, 0]), Err(ManifestWireError::Truncated));
+        // Claims 5 entries but carries none.
+        assert_eq!(
+            decode_entries(&[0, 0, 0, 5]),
+            Err(ManifestWireError::Truncated)
+        );
+    }
+}

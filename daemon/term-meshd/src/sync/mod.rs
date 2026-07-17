@@ -11,6 +11,7 @@ mod network_runner;
 mod operation;
 mod oplog;
 mod path_sandbox;
+mod plan;
 mod project_lock;
 mod reconcile;
 mod registry;
@@ -115,7 +116,13 @@ pub use scanner::{
 #[allow(unused_imports)]
 pub use stream_router::{RoutedFrame, RouterError, StreamLane, StreamRouter, StreamRouterSender};
 #[allow(unused_imports)]
-pub use network_runner::{NetworkSyncRunner, PeerAddressResolver};
+pub use network_runner::{
+    exchange_manifests, scan_project_entries, NetworkSyncRunner, PeerAddressResolver,
+};
+#[allow(unused_imports)]
+pub use plan::{
+    decode_entries, diff_manifests, encode_entries, FetchEntry, ManifestDiff, ManifestWireError,
+};
 #[allow(unused_imports)]
 pub use sync_connection::{SyncConnection, SyncConnectionError};
 #[allow(unused_imports)]

@@ -1,21 +1,23 @@
-//! Phase S0b end-to-end check: an `OperationKind::Sync` operation, driven
-//! through the real `OperationManager`, dispatches to `NetworkSyncRunner`, which
-//! dials a live peer over QUIC and completes a lane exchange — proving the
-//! operation machinery drives the S0 transport pipe. (`docs/design/
-//! mesh-project-sync-wiring-plan.md`, phase S0b.)
+//! Phase S0b + S1 end-to-end check: a `Sync` operation, driven through the real
+//! `OperationManager`, dispatches to `NetworkSyncRunner`, which dials a live
+//! peer over QUIC, swaps manifests, and computes the diff between the two
+//! project trees. Proves the operation machinery drives the transport pipe
+//! (S0b) and that the manifest exchange finds exactly the differing files (S1).
+//! No bytes are moved (that is S2). (`docs/design/mesh-project-sync-wiring-plan.md`.)
 
 #[path = "../src/sync/mod.rs"]
 mod sync;
 
+use std::fs::File;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 
 use ed25519_dalek::SigningKey;
 use sync::{
-    seed_trust_store, BootstrapDevice, DeviceTlsIdentity, NetworkSyncRunner, OperationKind,
-    OperationManager, OperationStartParams, OperationState, PeerAddressResolver, ProjectRegistry,
-    SyncConnection, SyncEndpoint, TrustStore,
+    exchange_manifests, scan_project_entries, seed_trust_store, BootstrapDevice, DeviceTlsIdentity,
+    NetworkSyncRunner, OperationKind, OperationManager, OperationStartParams, OperationState,
+    PeerAddressResolver, ProjectRegistry, SyncConnection, SyncEndpoint, TrustStore,
 };
 use sync_protocol::{SyncHello, PROJECT_SYNC_CAPABILITY, PROTOCOL_V1};
 
@@ -25,15 +27,6 @@ impl PeerAddressResolver for FixedResolver {
     fn resolve(&self, _peer_id: &str) -> Option<SocketAddr> {
         Some(self.0)
     }
-}
-
-/// A dedicated 0700 state directory for a SecureSqlite store under `base`.
-fn state_dir(base: &std::path::Path, name: &str) -> std::path::PathBuf {
-    use std::os::unix::fs::PermissionsExt;
-    let dir = base.join(name);
-    std::fs::create_dir_all(&dir).unwrap();
-    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
-    dir
 }
 
 fn hello(project: [u8; 32], device: [u8; 32], epoch: u64, nonce: u8) -> SyncHello {
@@ -48,13 +41,22 @@ fn hello(project: [u8; 32], device: [u8; 32], epoch: u64, nonce: u8) -> SyncHell
     }
 }
 
+/// A dedicated 0700 state directory for a SecureSqlite store under `base`.
+fn state_dir(base: &std::path::Path, name: &str) -> std::path::PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = base.join(name);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+    dir
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn sync_operation_dispatches_to_network_runner_and_reaches_a_peer() {
+async fn sync_operation_exchanges_manifests_and_finds_the_diff() {
     let temporary = tempfile::tempdir().unwrap();
     let recovery = SigningKey::from_bytes(&[0x41; 32]);
     let project = [0x42; 32];
-    let device_a = [0x43; 32]; // the local device the runner speaks as
-    let device_b = [0x44; 32]; // the peer (echo server)
+    let device_a = [0x43; 32]; // local device (the runner)
+    let device_b = [0x44; 32]; // peer (source of truth)
     let identity_a = DeviceTlsIdentity::generate().unwrap();
     let identity_b = DeviceTlsIdentity::generate().unwrap();
     let project_id = sync::ProjectId::from_bytes(project);
@@ -90,7 +92,16 @@ async fn sync_operation_dispatches_to_network_runner_and_reaches_a_peer() {
     seed_trust_store(&trust_a, project_id, &recovery, &roster).unwrap();
     seed_trust_store(&trust_b, project_id, &recovery, &roster).unwrap();
 
-    // Peer: an echo server that reflects whatever the runner sends.
+    // Two project trees sharing `shared.txt` (identical bytes → not in the
+    // diff); the peer additionally has `extra.txt`, which the runner lacks.
+    let local_root = tempfile::tempdir().unwrap();
+    std::fs::write(local_root.path().join("shared.txt"), b"same-content").unwrap();
+    let peer_root = tempfile::tempdir().unwrap();
+    std::fs::write(peer_root.path().join("shared.txt"), b"same-content").unwrap();
+    std::fs::write(peer_root.path().join("extra.txt"), b"only-on-the-peer").unwrap();
+    let peer_root_path = peer_root.path().to_path_buf();
+
+    // Peer: accept, then run the symmetric manifest exchange from its own tree.
     let server = SyncEndpoint::server(
         SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
         trust_b.clone(),
@@ -101,15 +112,12 @@ async fn sync_operation_dispatches_to_network_runner_and_reaches_a_peer() {
     let _server_task = tokio::spawn(async move {
         if let Ok(auth) = server.accept(hello(project, device_b, 2, 7)).await {
             let mut connection = SyncConnection::start(auth);
-            while let Some((lane, payload)) = connection.recv().await {
-                if connection.send(lane, payload).await.is_err() {
-                    break;
-                }
-            }
+            let root = File::open(&peer_root_path).unwrap();
+            let entries = scan_project_entries(&root).unwrap();
+            let _ = exchange_manifests(&mut connection, &entries).await;
         }
     });
 
-    // The runner, speaking as device A, resolving any peer id to the server.
     let runner = NetworkSyncRunner::new(
         identity_a,
         trust_a,
@@ -120,16 +128,11 @@ async fn sync_operation_dispatches_to_network_runner_and_reaches_a_peer() {
         tokio::runtime::Handle::current(),
     );
 
-    // A registered local project (any real root) so the manager can resolve a
-    // held root for the operation. Its id is independent of the mesh project id
-    // the runner authenticates with.
-    let root_dir = tempfile::tempdir().unwrap();
-    // Each SecureSqlite store needs its own 0700 directory (it validates the
-    // parent dir mode + owner), so give the registry and operations DBs
-    // dedicated state dirs — the same convention the sync_rpc tests use.
+    // Register the runner's local tree as a project so the manager can hold its
+    // root for the operation. Each SecureSqlite store gets its own 0700 dir.
     let registry_state = state_dir(temporary.path(), "registry-state");
     let registry = Arc::new(ProjectRegistry::open(registry_state.join("registry.db")).unwrap());
-    let record = registry.add(root_dir.path()).unwrap();
+    let record = registry.add(local_root.path()).unwrap();
     let op_project_id = record.project_id.to_string();
 
     let ops_state = state_dir(temporary.path(), "sync-state");
@@ -150,7 +153,6 @@ async fn sync_operation_dispatches_to_network_runner_and_reaches_a_peer() {
         .await
         .unwrap();
 
-    // Poll to completion.
     let mut finished = None;
     for _ in 0..150 {
         let record = manager
@@ -170,8 +172,7 @@ async fn sync_operation_dispatches_to_network_runner_and_reaches_a_peer() {
         record.error_code
     );
     let result = record.result.expect("succeeded operation carries a result");
-    // The runner reports the peer's pinned certificate hash — proof it actually
-    // completed the mutual-pinned handshake with device B.
-    assert_eq!(result.manifest_root, hex::encode(identity_b.certificate_hash()));
-    assert_eq!(result.entries, 1);
+    // The diff must be exactly one fetch: the peer's `extra.txt`. `shared.txt`
+    // is byte-identical on both sides and must not appear.
+    assert_eq!(result.entries, 1, "expected exactly one file to fetch (extra.txt)");
 }

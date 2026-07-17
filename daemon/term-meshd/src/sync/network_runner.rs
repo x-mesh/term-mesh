@@ -1,32 +1,35 @@
 //! `NetworkSyncRunner` — the concrete [`SyncTransport`] behind
-//! `OperationKind::Sync` (Phase S0b of the mesh-project-sync wiring plan).
+//! `OperationKind::Sync` (Phases S0b–S1 of the mesh-project-sync wiring plan).
 //!
 //! It closes the loop from the operation machinery to the transport pump: given
-//! a `Sync` operation carrying a peer id, it resolves the peer to a QUIC
-//! endpoint, completes the mutual-pinned handshake, and drives a
-//! [`SyncConnection`] to exchange a message both ways. S0b proves the operation
-//! → runner → live-peer path end-to-end; S1+ replaces the placeholder control
-//! exchange with real manifest-shard / oplog / chunk traffic.
+//! a `Sync` operation carrying a peer id, it scans the local project, dials the
+//! peer, completes the mutual-pinned QUIC handshake, swaps manifests over the
+//! `SyncOperation` lane, and computes the [`ManifestDiff`](super::ManifestDiff)
+//! that would make the local tree converge to the peer's. S1 proves the diff;
+//! S2 turns `fetch` entries into CAS transfers + a real `ApplyPlan`.
 //!
 //! [`OperationRunner::run`](super::OperationRunner) is synchronous, so this
 //! bridges into async QUIC I/O with `Handle::block_on` and polls the `cancelled`
-//! flag around the blocking connect.
+//! flag around the connect.
 
+use std::fs::File;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use sync_protocol::{SyncHello, PROJECT_SYNC_CAPABILITY, PROTOCOL_V1};
 
 use super::{
-    DeviceTlsIdentity, OperationResult, OperationSpec, StreamLane, SyncConnection, SyncEndpoint,
-    SyncTransport, TrustStore,
+    decode_entries, diff_manifests, encode_entries, DeviceTlsIdentity, ManifestBuilder,
+    ManifestEntry, ManifestScanner, OperationResult, OperationSpec, ScanCheckpoint, ScanError,
+    ScanLimits, ScanObserver, ScanReason, StreamLane, SyncConnection, SyncEndpoint, SyncTransport,
+    TrustStore,
 };
 
-/// How long to wait for the peer's reply on the control lane before failing the
-/// operation.
-const EXCHANGE_TIMEOUT: Duration = Duration::from_secs(10);
+/// How long to wait for the peer's manifest on the sync-operation lane before
+/// failing the operation.
+const EXCHANGE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Resolves a peer id (as supplied to `sync.start`) to a QUIC endpoint address.
 ///
@@ -37,7 +40,70 @@ pub trait PeerAddressResolver: Send + Sync + 'static {
     fn resolve(&self, peer_id: &str) -> Option<SocketAddr>;
 }
 
-/// Dials a peer and drives the sync exchange for an `OperationKind::Sync`
+/// Accumulates every `ManifestEntry` the scanner emits, in scan (canonical)
+/// order.
+struct CollectingObserver {
+    entries: Arc<Mutex<Vec<ManifestEntry>>>,
+}
+
+impl ScanObserver for CollectingObserver {
+    fn checkpoint(&self, _checkpoint: ScanCheckpoint, _relative_path: &str) {}
+    fn entry(&self, entry: &ManifestEntry) -> Result<(), ScanError> {
+        self.entries.lock().unwrap().push(entry.clone());
+        Ok(())
+    }
+}
+
+/// Scan a project root (held directory descriptor) into its full manifest entry
+/// list, in canonical order. Shared by the runner and by test peers.
+pub fn scan_project_entries(root: &File) -> Result<Vec<ManifestEntry>, String> {
+    let entries = Arc::new(Mutex::new(Vec::new()));
+    let observer = Box::new(CollectingObserver {
+        entries: entries.clone(),
+    });
+    let scanner = ManifestScanner::with_observer(ScanLimits::default(), observer)
+        .map_err(|_| "scan_initialization_failed".to_string())?;
+    scanner
+        .scan_descriptor(root, ScanReason::Initial)
+        .map_err(|_| "manifest_scan_failed".to_string())?;
+    let collected = entries.lock().unwrap().clone();
+    Ok(collected)
+}
+
+/// The canonical manifest root over `entries` (BLAKE3 rolling hash). Entries
+/// must be in canonical order (as [`scan_project_entries`] returns them).
+fn manifest_root(entries: &[ManifestEntry]) -> Result<[u8; 32], String> {
+    let mut builder = ManifestBuilder::new();
+    for entry in entries {
+        builder
+            .push(entry)
+            .map_err(|_| "manifest_scan_failed".to_string())?;
+    }
+    Ok(builder.finish().root.0)
+}
+
+/// Symmetric manifest swap over the `SyncOperation` lane: send `local`, receive
+/// the peer's. Both sides call this; each sends first (non-blocking enqueue)
+/// then awaits the other's, so there is no ordering deadlock.
+pub async fn exchange_manifests(
+    connection: &mut SyncConnection,
+    local: &[ManifestEntry],
+) -> Result<Vec<ManifestEntry>, String> {
+    connection
+        .send(StreamLane::SyncOperation, encode_entries(local))
+        .await
+        .map_err(|_| "sync_exchange_failed".to_string())?;
+    let (lane, payload) = tokio::time::timeout(EXCHANGE_TIMEOUT, connection.recv())
+        .await
+        .map_err(|_| "sync_exchange_failed".to_string())?
+        .ok_or_else(|| "sync_exchange_failed".to_string())?;
+    if lane != StreamLane::SyncOperation {
+        return Err("sync_exchange_failed".to_string());
+    }
+    decode_entries(&payload).map_err(|_| "sync_exchange_failed".to_string())
+}
+
+/// Dials a peer and drives the manifest exchange for an `OperationKind::Sync`
 /// operation. Constructed with the local device identity + trust store + this
 /// device's roster coordinates, and injected into the `OperationManager` via
 /// [`OperationManager::open_with_sync_transport`](super::OperationManager::open_with_sync_transport).
@@ -91,9 +157,15 @@ impl NetworkSyncRunner {
 
     async fn exchange(
         &self,
+        spec: &OperationSpec,
         addr: SocketAddr,
         cancelled: Arc<AtomicBool>,
     ) -> Result<OperationResult, String> {
+        // Scan the local project before dialing so the manifest is ready to swap.
+        let local_entries = scan_project_entries(spec.held_root.descriptor())?;
+        if cancelled.load(Ordering::Acquire) {
+            return Err("cancelled".to_string());
+        }
         let client = SyncEndpoint::client(
             SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0)),
             self.trust.clone(),
@@ -104,26 +176,18 @@ impl NetworkSyncRunner {
             .connect(addr, self.hello()?)
             .await
             .map_err(|_| "sync_connect_failed".to_string())?;
-        let peer_certificate = auth.peer.certificate_hash;
         if cancelled.load(Ordering::Acquire) {
             return Err("cancelled".to_string());
         }
-        let connection = SyncConnection::start(auth);
-        // S0b placeholder exchange: prove the pump carries a message both ways
-        // over the operation-driven connection. S1 replaces this with a
-        // manifest shard-root exchange.
-        connection
-            .send(StreamLane::Control, b"sync-operation-hello".to_vec())
-            .await
-            .map_err(|_| "sync_exchange_failed".to_string())?;
-        let mut connection = connection;
-        let (_lane, _payload) = tokio::time::timeout(EXCHANGE_TIMEOUT, connection.recv())
-            .await
-            .map_err(|_| "sync_exchange_failed".to_string())?
-            .ok_or_else(|| "sync_exchange_failed".to_string())?;
+        let mut connection = SyncConnection::start(auth);
+        let remote_entries = exchange_manifests(&mut connection, &local_entries).await?;
+        let diff = diff_manifests(&local_entries, &remote_entries);
         Ok(OperationResult {
-            manifest_root: hex::encode(peer_certificate),
-            entries: 1,
+            // Local manifest root (identifies the tree this diff was computed
+            // against); `entries` reports how many paths must be fetched to
+            // converge (0 when the trees already match).
+            manifest_root: hex::encode(manifest_root(&local_entries)?),
+            entries: diff.fetch.len() as u64,
         })
     }
 }
@@ -147,6 +211,7 @@ impl SyncTransport for NetworkSyncRunner {
         }
         // The runner is invoked from `spawn_blocking`, so blocking on the async
         // transport here does not stall a runtime worker.
-        self.handle.block_on(self.exchange(addr, cancelled.clone()))
+        self.handle
+            .block_on(self.exchange(spec, addr, cancelled.clone()))
     }
 }
