@@ -51,6 +51,15 @@ const REPLAY_CAPACITY_MIN_BYTES: usize = 4 * 1024; // 4 KiB
 /// Upper bound accepted for the replay capacity (env or RPC/CLI set).
 const REPLAY_CAPACITY_MAX_BYTES: usize = 64 * 1024 * 1024; // 64 MiB
 
+/// Grace window a forced terminate (`shutdown_forcibly`) gives a child to
+/// honor SIGHUP and exit on its own before escalating to SIGKILL: poll
+/// `FORCE_KILL_GRACE_POLLS` times, `FORCE_KILL_GRACE_INTERVAL` apart
+/// (≈100 ms total worst case). A cooperative shell exits on the first poll;
+/// only a child that ignores/outlives SIGHUP (observed: macOS forkpty
+/// session leaders) pays the full window before it is force-killed.
+const FORCE_KILL_GRACE_POLLS: u32 = 10;
+const FORCE_KILL_GRACE_INTERVAL: std::time::Duration = std::time::Duration::from_millis(10);
+
 /// Process-wide replay buffer capacity, in bytes. Every `PtySurface`'s
 /// `ReplayBuffer::push` reads this on each call, so a runtime change via
 /// `set_replay_capacity` takes effect for all surfaces on their next PTY
@@ -397,6 +406,87 @@ impl PtySurface {
             self.signal_owners.fetch_add(1, Ordering::Relaxed);
         }
         child.state = ChildState::Signaled;
+    }
+
+    /// Destructive teardown for an explicit `terminate`: SIGHUP first (a
+    /// shell still gets the signal a real hangup delivers, so its EXIT trap
+    /// runs), then, if the child is still alive after a brief grace window,
+    /// SIGKILL and reap. Unlike `hangup()`, this GUARANTEES the process is
+    /// gone before it returns.
+    ///
+    /// `hangup()` alone is not enough for a terminate: it relies on the
+    /// child honoring SIGHUP so the reader hits EOF and the reader's Arc →
+    /// `Drop` → reap chain unwinds. A child that ignores or outlives SIGHUP
+    /// (a macOS forkpty session leader was observed surviving it) then leaks
+    /// as an orphan while the still-blocked reader keeps the surface Arc
+    /// alive forever — so a terminate that reported success left a live
+    /// process behind. SIGKILL cannot be caught or ignored, so escalating to
+    /// it is the platform-independent guarantee (the same
+    /// SIGHUP-then-SIGKILL shape the daemon's own shutdown fix uses).
+    ///
+    /// The lifecycle lock is held for the whole grace window on purpose: it
+    /// is what proves the pid has not been reaped, so no concurrent path can
+    /// reap-and-recycle it out from under the SIGKILL. The window is bounded
+    /// (`FORCE_KILL_GRACE_POLLS` × `FORCE_KILL_GRACE_INTERVAL`) and only the
+    /// terminate path takes it, so contention is a non-issue.
+    pub fn shutdown_forcibly(&self) {
+        let Ok(mut child) = self.child.lock() else {
+            return;
+        };
+        if child.state == ChildState::Reaped {
+            return;
+        }
+        if child.state == ChildState::Running {
+            // Safety: the mutex proves this child has not been reaped, so its
+            // pid cannot yet have been recycled to an unrelated process.
+            if unsafe { libc::kill(child.pid, libc::SIGHUP) } == 0 {
+                self.signal_owners.fetch_add(1, Ordering::Relaxed);
+            }
+            child.state = ChildState::Signaled;
+        }
+        for _ in 0..FORCE_KILL_GRACE_POLLS {
+            if Self::observe_exit_locked(&mut child, &self.reap_owners) {
+                return;
+            }
+            std::thread::sleep(FORCE_KILL_GRACE_INTERVAL);
+        }
+        // Still running after the grace window — force it.
+        // Safety: still holding the lifecycle lock, so the pid is not yet
+        // reaped/recycled.
+        unsafe {
+            libc::kill(child.pid, libc::SIGKILL);
+        }
+        Self::reap_blocking_locked(&mut child, &self.reap_owners);
+    }
+
+    /// Blocking companion to `observe_exit_locked`, used only right after a
+    /// SIGKILL where a prompt exit is guaranteed: waits (no `WNOHANG`) until
+    /// the child is reaped so a later caller can never re-signal a recycled
+    /// pid. Retries on `EINTR`; treats `ECHILD` (already reaped elsewhere) as
+    /// done.
+    fn reap_blocking_locked(child: &mut ChildLifecycle, reap_owners: &AtomicUsize) {
+        if child.state == ChildState::Reaped {
+            return;
+        }
+        loop {
+            let mut status = 0;
+            // Safety: all waitpid calls for this surface are serialized by
+            // `child`; no second owner can reap concurrently.
+            let result = unsafe { libc::waitpid(child.pid, &mut status, 0) };
+            if result == child.pid
+                || (result < 0
+                    && std::io::Error::last_os_error().raw_os_error() == Some(libc::ECHILD))
+            {
+                child.state = ChildState::Reaped;
+                reap_owners.fetch_add(1, Ordering::Relaxed);
+                return;
+            }
+            if result < 0
+                && std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted
+            {
+                return;
+            }
+        }
     }
 
     fn child_has_exited(&self) -> bool {
@@ -1319,7 +1409,12 @@ impl PtyManager {
             }
             drop(persist_guard);
             if let Some(surface) = &removed {
-                surface.hangup();
+                // Destructive terminate: guarantee the process is gone (SIGHUP
+                // → grace → SIGKILL → reap), not just signaled. `hangup()`
+                // alone let a SIGHUP-ignoring child (macOS forkpty session
+                // leader) survive as an orphan while its reader kept the
+                // surface Arc — and never Drop — alive.
+                surface.shutdown_forcibly();
             }
             Ok(removed.is_some() || logical_removed.is_some())
         })();
@@ -1539,6 +1634,68 @@ mod tests {
         assert_eq!(surface.child.lock().unwrap().state, ChildState::Reaped);
         surface.hangup();
         assert_eq!(surface.signal_owners.load(Ordering::Relaxed), 1);
+    }
+
+    /// A destructive terminate must leave no live process, even when the
+    /// child ignores SIGHUP. `hangup()` alone reaped only children that
+    /// honored SIGHUP (the reader hit EOF and unwound the Arc/Drop chain); a
+    /// child that traps HUP — the shape a macOS forkpty session leader takes
+    /// — kept the reader blocked and the surface Arc alive forever, so the
+    /// runner reported TERMINATED while the process leaked as an orphan.
+    /// `shutdown_forcibly` escalates to SIGKILL, so here a HUP-ignoring child
+    /// is gone and reaped before the call returns.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn shutdown_forcibly_kills_a_sighup_ignoring_child() {
+        let surface = PtySurface::spawn(
+            surface_id_from_name("force-kill-hup-ignorer"),
+            "hup-ignorer".into(),
+            "/bin/sh",
+            &["-c", "trap '' HUP; read _line"],
+            80,
+            24,
+            None,
+        )
+        .expect("spawn /bin/sh HUP-ignorer");
+
+        let pid = surface.pid();
+        assert!(pid > 0, "spawned child must have a real pid");
+        // The child is alive and signalable before we terminate it.
+        assert_eq!(
+            unsafe { libc::kill(pid, 0) },
+            0,
+            "child should be alive pre-terminate"
+        );
+
+        // Blocking teardown off the async workers, mirroring how the runner's
+        // sync terminate path reaches this.
+        let s = surface.clone();
+        tokio::task::spawn_blocking(move || s.shutdown_forcibly())
+            .await
+            .expect("shutdown_forcibly join");
+
+        // The child was force-killed and reaped exactly once.
+        assert_eq!(surface.child.lock().unwrap().state, ChildState::Reaped);
+        assert_eq!(surface.reap_owners.load(Ordering::Relaxed), 1);
+        // Its pid is gone: `kill(pid, 0)` now fails with ESRCH. The number is
+        // not recycled in the microseconds between reap and this check.
+        assert_eq!(
+            unsafe { libc::kill(pid, 0) },
+            -1,
+            "terminated child must no longer be signalable"
+        );
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::ESRCH),
+            "terminated child pid must be gone (ESRCH)"
+        );
+
+        // Idempotent: a second forced shutdown on the reaped surface is a
+        // no-op (no re-signal of a now-recycled pid, no second reap).
+        let s2 = surface.clone();
+        tokio::task::spawn_blocking(move || s2.shutdown_forcibly())
+            .await
+            .expect("second shutdown_forcibly join");
+        assert_eq!(surface.reap_owners.load(Ordering::Relaxed), 1);
     }
 
     /// F6 regression: asserting a hardcoded "/bin/bash" result meant this
