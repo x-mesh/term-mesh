@@ -33,6 +33,18 @@ final class PeerDaemonVersionTests: XCTestCase {
         XCTAssertEqual(PeerHostDoctor.versionMissingExitCode, 44)
     }
 
+    /// OS-aware unification: the Darwin branch must ask the app bundle
+    /// for its own version rather than looking for term-meshd.
+    func test_versionProbeCommand_containsDarwinAppBranch() {
+        let cmd = PeerHostDoctor.versionProbeCommand
+        XCTAssertTrue(cmd.contains(#"uname -s"#))
+        XCTAssertTrue(cmd.contains("Darwin"))
+        XCTAssertTrue(cmd.contains("/usr/bin/defaults read"))
+        XCTAssertTrue(cmd.contains("/Applications/term-mesh.app/Contents/Info.plist"))
+        XCTAssertTrue(cmd.contains("CFBundleShortVersionString"))
+        XCTAssertTrue(cmd.contains("term-mesh-app"))
+    }
+
     // MARK: - classifyVersionOutput (checkVersion's exit-code mapping, ssh-free)
 
     func test_classifyVersionOutput_missingBinaryExitCodeIsNil() {
@@ -41,7 +53,7 @@ final class PeerDaemonVersionTests: XCTestCase {
             timedOut: false,
             stdout: ""
         )
-        XCTAssertNil(result, "exit 44 (binary not found) must map to nil")
+        XCTAssertNil(result, "exit 44 (binary/app not found) must map to nil")
     }
 
     func test_classifyVersionOutput_timedOutIsNilEvenWithExitZero() {
@@ -62,7 +74,18 @@ final class PeerDaemonVersionTests: XCTestCase {
         let result = PeerHostDoctor.classifyVersionOutput(
             exitCode: 0, timedOut: false, stdout: "term-meshd 0.156.0\n"
         )
-        XCTAssertEqual(result, "0.156.0")
+        XCTAssertEqual(result?.version, "0.156.0")
+        XCTAssertEqual(result?.hostKind, .daemon)
+    }
+
+    /// Mac probe output: same classification path, but the `term-mesh-app`
+    /// prefix must resolve to `.hostKind == .app` instead of `.daemon`.
+    func test_classifyVersionOutput_macAppLine() {
+        let result = PeerHostDoctor.classifyVersionOutput(
+            exitCode: 0, timedOut: false, stdout: "term-mesh-app 0.159.0\n"
+        )
+        XCTAssertEqual(result?.version, "0.159.0")
+        XCTAssertEqual(result?.hostKind, .app)
     }
 
     func test_classifyVersionOutput_motdPrefixedOutput_picksLastMatchingLine() {
@@ -76,7 +99,8 @@ final class PeerDaemonVersionTests: XCTestCase {
         let result = PeerHostDoctor.classifyVersionOutput(
             exitCode: 0, timedOut: false, stdout: stdout
         )
-        XCTAssertEqual(result, "0.156.0")
+        XCTAssertEqual(result?.version, "0.156.0")
+        XCTAssertEqual(result?.hostKind, .daemon)
     }
 
     func test_classifyVersionOutput_noMatchingLineIsNil() {
@@ -86,7 +110,39 @@ final class PeerDaemonVersionTests: XCTestCase {
         XCTAssertNil(result)
     }
 
-    // MARK: - parseVersionLine
+    // MARK: - parseHostVersionLine (OS-aware: daemon vs app prefix)
+
+    func test_parseHostVersionLine_daemonPrefix() {
+        let result = PeerHostDoctor.parseHostVersionLine(from: "term-meshd 0.156.0\n")
+        XCTAssertEqual(result?.version, "0.156.0")
+        XCTAssertEqual(result?.hostKind, .daemon)
+    }
+
+    func test_parseHostVersionLine_appPrefix() {
+        let result = PeerHostDoctor.parseHostVersionLine(from: "term-mesh-app 0.159.0\n")
+        XCTAssertEqual(result?.version, "0.159.0")
+        XCTAssertEqual(result?.hostKind, .app)
+    }
+
+    /// The two prefixes never legitimately co-occur in one real probe
+    /// run (a single host only ever takes one branch), but the regex's
+    /// "last match wins" behavior must still hold across either prefix
+    /// consistently, not just within one.
+    func test_parseHostVersionLine_lastMatchWinsAcrossMixedPrefixes() {
+        let stdout = """
+        term-meshd 0.9.0
+        term-mesh-app 0.159.0
+        """
+        let result = PeerHostDoctor.parseHostVersionLine(from: stdout)
+        XCTAssertEqual(result?.version, "0.159.0")
+        XCTAssertEqual(result?.hostKind, .app)
+    }
+
+    func test_parseHostVersionLine_emptyStringIsNil() {
+        XCTAssertNil(PeerHostDoctor.parseHostVersionLine(from: ""))
+    }
+
+    // MARK: - parseVersionLine (back-compat daemon-only view)
 
     func test_parseVersionLine_trimsWhitespace() {
         XCTAssertEqual(
@@ -99,18 +155,34 @@ final class PeerDaemonVersionTests: XCTestCase {
         XCTAssertNil(PeerHostDoctor.parseVersionLine(from: ""))
     }
 
+    /// `parseVersionLine` is documented as a daemon-only view — it must
+    /// still resolve to a version when an app-prefixed line is the only
+    /// match (it delegates to `parseHostVersionLine` under the hood),
+    /// but callers relying on it never see which kind produced it.
+    func test_parseVersionLine_alsoResolvesAppPrefixedVersion() {
+        XCTAssertEqual(
+            PeerHostDoctor.parseVersionLine(from: "term-mesh-app 0.159.0\n"),
+            "0.159.0"
+        )
+    }
+
     // MARK: - Local end-to-end of the probe script body (no ssh)
 
     /// Runs the script body under /bin/sh exactly as a remote POSIX
     /// shell would, with PATH and HOME pointed at a scratch dir that
     /// has neither `term-meshd` on PATH nor `~/.local/bin/term-meshd`.
     /// Exercises the real fallback + sentinel logic, not just the
-    /// string literal.
+    /// string literal. Forces the non-Darwin (else) branch via a fake
+    /// `uname` prepended to PATH — the suite always runs on a real
+    /// macOS host, so without this override `uname -s` would genuinely
+    /// report "Darwin" and the script would always skip these
+    /// term-meshd fixtures for the Mac-app branch instead.
     func test_script_exits44WhenBinaryMissing() throws {
         let scratch = try makeScratchDir()
         defer { try? FileManager.default.removeItem(atPath: scratch) }
+        let unameDir = try fakeUnameDir(in: scratch, reporting: "Linux")
 
-        let run = try runScriptBody(home: scratch, path: "/usr/bin:/bin")
+        let run = try runScriptBody(home: scratch, path: "\(unameDir):/usr/bin:/bin")
         XCTAssertEqual(run.exit, PeerHostDoctor.versionMissingExitCode,
                        "stdout: \(run.stdout) stderr: \(run.stderr)")
         XCTAssertEqual(run.stdout, "")
@@ -122,6 +194,7 @@ final class PeerDaemonVersionTests: XCTestCase {
     func test_script_printsVersionWhenOnPath() throws {
         let scratch = try makeScratchDir()
         defer { try? FileManager.default.removeItem(atPath: scratch) }
+        let unameDir = try fakeUnameDir(in: scratch, reporting: "Linux")
 
         let binDir = scratch + "/bin"
         try FileManager.default.createDirectory(atPath: binDir, withIntermediateDirectories: true)
@@ -130,7 +203,7 @@ final class PeerDaemonVersionTests: XCTestCase {
         try script.write(toFile: fakeBinary, atomically: true, encoding: .utf8)
         try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: fakeBinary)
 
-        let run = try runScriptBody(home: scratch, path: "\(binDir):/usr/bin:/bin")
+        let run = try runScriptBody(home: scratch, path: "\(unameDir):\(binDir):/usr/bin:/bin")
         XCTAssertEqual(run.exit, 0, "stderr: \(run.stderr)")
         XCTAssertEqual(run.stdout, "term-meshd 9.9.9")
         XCTAssertEqual(PeerHostDoctor.parseVersionLine(from: run.stdout), "9.9.9")
@@ -142,6 +215,7 @@ final class PeerDaemonVersionTests: XCTestCase {
     func test_script_fallsBackToLocalBin() throws {
         let scratch = try makeScratchDir()
         defer { try? FileManager.default.removeItem(atPath: scratch) }
+        let unameDir = try fakeUnameDir(in: scratch, reporting: "Linux")
 
         let localBinDir = scratch + "/.local/bin"
         try FileManager.default.createDirectory(atPath: localBinDir, withIntermediateDirectories: true)
@@ -150,11 +224,42 @@ final class PeerDaemonVersionTests: XCTestCase {
         try script.write(toFile: fakeBinary, atomically: true, encoding: .utf8)
         try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: fakeBinary)
 
-        // Deliberately bare PATH — command -v must fail so the
-        // $HOME/.local/bin fallback is what's exercised here.
-        let run = try runScriptBody(home: scratch, path: "/usr/bin:/bin")
+        // Deliberately bare PATH (besides the fake uname) — command -v
+        // must fail so the $HOME/.local/bin fallback is what's
+        // exercised here.
+        let run = try runScriptBody(home: scratch, path: "\(unameDir):/usr/bin:/bin")
         XCTAssertEqual(run.exit, 0, "stderr: \(run.stderr)")
         XCTAssertEqual(run.stdout, "term-meshd 1.2.3")
+    }
+
+    /// Darwin branch: reads the app bundle's own version instead of
+    /// looking for term-meshd. The plist path is a fixed literal in the
+    /// production command (security contract — every remote command is
+    /// a fixed string, never built from per-host input), so this can't
+    /// point at a scratch fixture; it runs against whatever is actually
+    /// installed at /Applications/term-mesh.app on the test machine,
+    /// skips when that's absent (e.g. a CI runner without the app
+    /// installed), and is self-verifying against a live `defaults read`
+    /// of the same plist rather than a hardcoded version string that
+    /// would go stale every release.
+    func test_script_darwinBranch_printsAppVersionFromPlist() throws {
+        let plistPath = "/Applications/term-mesh.app/Contents/Info.plist"
+        guard FileManager.default.fileExists(atPath: plistPath) else {
+            throw XCTSkip("term-mesh.app not installed at /Applications — skipping live Darwin probe")
+        }
+        guard let expected = try readPlistVersion(plistPath), !expected.isEmpty else {
+            throw XCTSkip("could not read CFBundleShortVersionString from the installed app — skipping")
+        }
+
+        let scratch = try makeScratchDir()
+        defer { try? FileManager.default.removeItem(atPath: scratch) }
+        let unameDir = try fakeUnameDir(in: scratch, reporting: "Darwin")
+
+        let run = try runScriptBody(home: scratch, path: "\(unameDir):/usr/bin:/bin")
+        XCTAssertEqual(run.exit, 0, "stderr: \(run.stderr)")
+        XCTAssertEqual(run.stdout, "term-mesh-app \(expected)")
+        XCTAssertEqual(PeerHostDoctor.parseHostVersionLine(from: run.stdout)?.hostKind, .app)
+        XCTAssertEqual(PeerHostDoctor.parseHostVersionLine(from: run.stdout)?.version, expected)
     }
 
     // MARK: - PeerDaemonVersion.parseComponents
@@ -365,5 +470,42 @@ final class PeerDaemonVersionTests: XCTestCase {
             stdout: stdout.trimmingCharacters(in: .whitespacesAndNewlines),
             stderr: stderr.trimmingCharacters(in: .whitespacesAndNewlines)
         )
+    }
+
+    /// Creates a scratch bin dir containing a fake `uname` that always
+    /// prints `os` regardless of arguments (the script only ever calls
+    /// `uname -s`) — lets the Linux/Darwin branch of
+    /// `versionProbeCommand` be exercised deterministically. Without
+    /// this override, `uname -s` on the actual test host (always macOS
+    /// per this project's build/test conventions) would genuinely
+    /// report "Darwin" and the else (Linux) branch could never be
+    /// reached via a live shell run.
+    private func fakeUnameDir(in scratch: String, reporting os: String) throws -> String {
+        let dir = scratch + "/fakeuname"
+        try FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+        let bin = dir + "/uname"
+        try "#!/bin/sh\necho \"\(os)\"\n".write(toFile: bin, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: bin)
+        return dir
+    }
+
+    /// Reads a plist key via the real `/usr/bin/defaults` — used only
+    /// to make `test_script_darwinBranch_printsAppVersionFromPlist`
+    /// self-verifying against whatever is actually installed, instead
+    /// of asserting a hardcoded version string that would go stale
+    /// every release. Returns nil on any read failure.
+    private func readPlistVersion(_ plistPath: String) throws -> String? {
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: "/usr/bin/defaults")
+        proc.arguments = ["read", plistPath, "CFBundleShortVersionString"]
+        let out = Pipe()
+        proc.standardOutput = out
+        proc.standardError = Pipe()
+        try proc.run()
+        proc.waitUntilExit()
+        guard proc.terminationStatus == 0 else { return nil }
+        let data = out.fileHandleForReading.readDataToEndOfFile()
+        return String(data: data, encoding: .utf8)?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
     }
 }
