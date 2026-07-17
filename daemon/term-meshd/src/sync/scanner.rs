@@ -96,6 +96,20 @@ impl ManifestScanner {
         Ok(scanner)
     }
 
+    /// Both an entry observer and a cancellation flag: the scan streams every
+    /// entry to `observer` while polling `cancellation` so a long walk can be
+    /// interrupted (e.g. a cancelled sync operation).
+    pub fn with_observer_and_cancellation(
+        limits: ScanLimits,
+        observer: Box<dyn ScanObserver>,
+        cancellation: Arc<AtomicBool>,
+    ) -> Result<Self, ScanError> {
+        let mut scanner = Self::new(limits)?;
+        scanner.observer = Some(observer);
+        scanner.cancellation = Some(cancellation);
+        Ok(scanner)
+    }
+
     pub fn with_cancellation(
         limits: ScanLimits,
         cancellation: Arc<AtomicBool>,

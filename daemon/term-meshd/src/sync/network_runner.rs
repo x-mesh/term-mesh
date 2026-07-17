@@ -62,15 +62,33 @@ impl ScanObserver for CollectingObserver {
 /// Scan a project root (held directory descriptor) into its full manifest entry
 /// list, in canonical order. Shared by the runner and by test peers.
 pub fn scan_project_entries(root: &File) -> Result<Vec<ManifestEntry>, String> {
+    scan_project_entries_cancellable(root, None)
+}
+
+/// As [`scan_project_entries`], but polls `cancellation` (when given) so a long
+/// walk of a large project stops promptly on a cancelled operation instead of
+/// running to completion first.
+pub fn scan_project_entries_cancellable(
+    root: &File,
+    cancellation: Option<Arc<AtomicBool>>,
+) -> Result<Vec<ManifestEntry>, String> {
     let entries = Arc::new(Mutex::new(Vec::new()));
     let observer = Box::new(CollectingObserver {
         entries: entries.clone(),
     });
-    let scanner = ManifestScanner::with_observer(ScanLimits::default(), observer)
-        .map_err(|_| "scan_initialization_failed".to_string())?;
+    let scanner = match cancellation {
+        Some(flag) => {
+            ManifestScanner::with_observer_and_cancellation(ScanLimits::default(), observer, flag)
+        }
+        None => ManifestScanner::with_observer(ScanLimits::default(), observer),
+    }
+    .map_err(|_| "scan_initialization_failed".to_string())?;
     scanner
         .scan_descriptor(root, ScanReason::Initial)
-        .map_err(|_| "manifest_scan_failed".to_string())?;
+        .map_err(|error| match error {
+            ScanError::Cancelled => "cancelled".to_string(),
+            _ => "manifest_scan_failed".to_string(),
+        })?;
     let collected = entries.lock().unwrap().clone();
     Ok(collected)
 }
@@ -208,10 +226,30 @@ impl NetworkSyncRunner {
         cancelled: Arc<AtomicBool>,
     ) -> Result<OperationResult, String> {
         // Scan the local project before dialing so the manifest is ready to swap.
-        let local_entries = scan_project_entries(spec.held_root.descriptor())?;
+        // The scan is itself cancellation-aware, so a large tree's walk stops
+        // promptly rather than running to completion after a cancel.
+        let local_entries =
+            scan_project_entries_cancellable(spec.held_root.descriptor(), Some(cancelled.clone()))?;
         if cancelled.load(Ordering::Acquire) {
             return Err("cancelled".to_string());
         }
+        // Race the network portion against a cancellation watcher: a cancel
+        // during a long await — connect, the up-to-30s manifest exchange, or the
+        // fetch — is then observed within ~100ms instead of only at the step
+        // boundaries (dropping the future tears down the connection).
+        tokio::select! {
+            result = self.exchange_over_network(spec, addr, &local_entries, &cancelled) => result,
+            () = cancelled_watch(&cancelled) => Err("cancelled".to_string()),
+        }
+    }
+
+    async fn exchange_over_network(
+        &self,
+        spec: &OperationSpec,
+        addr: SocketAddr,
+        local_entries: &[ManifestEntry],
+        cancelled: &Arc<AtomicBool>,
+    ) -> Result<OperationResult, String> {
         let client = SyncEndpoint::client(
             SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0)),
             self.trust.clone(),
@@ -226,16 +264,16 @@ impl NetworkSyncRunner {
             return Err("cancelled".to_string());
         }
         let mut connection = SyncConnection::start(auth);
-        let remote_entries = exchange_manifests(&mut connection, &local_entries).await?;
-        let diff = diff_manifests(&local_entries, &remote_entries);
+        let remote_entries = exchange_manifests(&mut connection, local_entries).await?;
+        let diff = diff_manifests(local_entries, &remote_entries);
         let fetched = diff.fetch.len() as u64;
         if cancelled.load(Ordering::Acquire) {
             return Err("cancelled".to_string());
         }
 
-        // S2 last mile: pull the files we lack from the peer over the ordered
-        // SyncOperation lane, staging each into the CAS, then apply them to the
-        // working tree so the local project converges to the peer's.
+        // S2 last mile: pull the files we lack from the peer, staging each into
+        // the CAS, then apply them to the working tree so the local project
+        // converges to the peer's.
         let project = ProjectId::from_bytes(self.project_id);
         let domain = ObjectDomain {
             project_id: project,
@@ -248,7 +286,7 @@ impl NetworkSyncRunner {
         // (durable per-operation ids arrive with oplog tracking — see plan.rs).
         let mut operation_id = [0u8; 16];
         getrandom::getrandom(&mut operation_id).map_err(|_| "sync_apply_failed".to_string())?;
-        let plan = build_apply_plan(project, operation_id, &diff.fetch, &resolved, &local_entries);
+        let plan = build_apply_plan(project, operation_id, &diff.fetch, &resolved, local_entries);
         if !plan.entries.is_empty() {
             let store = self
                 .apply_store
@@ -263,9 +301,19 @@ impl NetworkSyncRunner {
             // Local manifest root (identifies the tree this diff was computed
             // against); `entries` reports how many paths were fetched to
             // converge (0 when the trees already matched).
-            manifest_root: hex::encode(manifest_root(&local_entries)?),
+            manifest_root: hex::encode(manifest_root(local_entries)?),
             entries: fetched,
         })
+    }
+}
+
+/// Resolves once `flag` is set, polling it every ~100ms. Lets an async body be
+/// raced against cancellation with `select!` even though the flag is a plain
+/// atomic rather than a future — the runner is handed an `Arc<AtomicBool>`, not
+/// a cancellation token.
+async fn cancelled_watch(flag: &AtomicBool) {
+    while !flag.load(Ordering::Acquire) {
+        tokio::time::sleep(Duration::from_millis(100)).await;
     }
 }
 
