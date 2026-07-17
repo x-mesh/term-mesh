@@ -13,7 +13,10 @@
 
 use std::collections::{HashMap, HashSet};
 
-use super::{EntryKind, ManifestEntry};
+use super::{
+    ApplyAction, ApplyPlan, ApplyPlanEntry, ApplyPrecondition, EntryKind, ManifestEntry, ObjectId,
+    ProjectId,
+};
 
 /// Upper bounds applied when decoding a peer's manifest (untrusted input).
 const MAX_ENTRIES: usize = 4_000_000;
@@ -95,6 +98,46 @@ fn fetch_of(entry: &ManifestEntry) -> FetchEntry {
         length: entry.length,
         content_hash: entry.content_hash,
         symlink_target: entry.symlink_target.clone(),
+    }
+}
+
+/// Build an [`ApplyPlan`] from a diff's fetch list and the CAS object ids the
+/// fetch resolved (path → object id). Only `File` entries are emitted here (with
+/// their transferred object id); directory/symlink handling is a later phase, so
+/// nested paths whose parent directory is absent are not yet supported. Every
+/// entry uses an `Absent` precondition (add-only sync). `target_manifest_root`
+/// and `frontier` are placeholders until oplog/visible-state tracking lands.
+pub fn build_apply_plan(
+    project: ProjectId,
+    operation_id: [u8; 16],
+    fetch: &[FetchEntry],
+    object_ids: &HashMap<String, ObjectId>,
+) -> ApplyPlan {
+    let mut entries = Vec::new();
+    for entry in fetch {
+        if entry.kind != EntryKind::File {
+            continue;
+        }
+        let Some(object_id) = object_ids.get(&entry.relative_path) else {
+            continue;
+        };
+        entries.push(ApplyPlanEntry {
+            relative_path: entry.relative_path.clone(),
+            action: ApplyAction::File {
+                object_id: *object_id,
+                content_hash: entry.content_hash,
+                length: entry.length,
+                executable: entry.executable,
+            },
+            precondition: ApplyPrecondition::Absent,
+        });
+    }
+    ApplyPlan {
+        operation_id,
+        project,
+        target_manifest_root: [0; 32],
+        frontier: Vec::new(),
+        entries,
     }
 }
 

@@ -3,6 +3,7 @@ mod blob;
 mod cas;
 mod conflict;
 mod crypto;
+mod fetch;
 mod gc;
 mod git;
 mod keychain;
@@ -123,9 +124,11 @@ pub use network_runner::{
     exchange_manifests, scan_project_entries, NetworkSyncRunner, PeerAddressResolver,
 };
 #[allow(unused_imports)]
+pub use fetch::{respond_to_fetch, run_fetch_pull};
+#[allow(unused_imports)]
 pub use plan::{
-    decode_entries, decode_manifest_batch, diff_manifests, encode_entries, encode_manifest_batches,
-    FetchEntry, ManifestDiff, ManifestWireError,
+    build_apply_plan, decode_entries, decode_manifest_batch, diff_manifests, encode_entries,
+    encode_manifest_batches, FetchEntry, ManifestDiff, ManifestWireError,
 };
 #[allow(unused_imports)]
 pub use sync_connection::{SyncConnection, SyncConnectionError};
