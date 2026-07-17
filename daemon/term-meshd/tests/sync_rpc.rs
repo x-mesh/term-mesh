@@ -83,6 +83,7 @@ fn params(request_byte: u8, project_id: &str) -> OperationStartParams {
         request_id: format!("{request_byte:02x}").repeat(16),
         project_id: project_id.to_string(),
         kind: OperationKind::ManifestScan,
+        peer: None,
     }
 }
 

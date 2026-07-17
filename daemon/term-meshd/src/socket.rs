@@ -1636,7 +1636,17 @@ async fn dispatch(req: &Request, ctx: &Context) -> Response {
                     .start(crate::sync::OperationStartParams {
                         request_id: params.request_id,
                         project_id: params.project_id,
-                        kind: params.kind,
+                        // A peer target makes this a network sync; without one it
+                        // stays a local scan (backward compatible). The peer id is
+                        // resolved by the SyncTransport, which is only present once
+                        // the daemon provisions peer identity + trust — until then
+                        // a Sync operation fails `sync_transport_not_configured`.
+                        kind: if params.peer_id.is_some() {
+                            crate::sync::OperationKind::Sync
+                        } else {
+                            params.kind
+                        },
+                        peer: params.peer_id,
                     })
                     .await
                     .map_err(|error| format!("OPERATION_ERROR: {error}"))
@@ -3414,8 +3424,7 @@ struct SyncStartParams {
     request_id: String,
     project_id: String,
     kind: crate::sync::OperationKind,
-    #[serde(rename = "peer_id")]
-    _peer_id: Option<String>,
+    peer_id: Option<String>,
 }
 
 fn parse_project_id(value: &str) -> Result<crate::sync::ProjectId, String> {

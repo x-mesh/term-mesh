@@ -75,7 +75,7 @@ pub use merge::{
 pub use operation::{
     default_operation_db_path, OperationError, OperationIdParams, OperationKind, OperationManager,
     OperationRecord, OperationResult, OperationRetryParams, OperationRunner, OperationSpec,
-    OperationStartParams, OperationState, MAX_OPERATION_ENVELOPE_BYTES,
+    OperationStartParams, OperationState, SyncTransport, MAX_OPERATION_ENVELOPE_BYTES,
 };
 #[allow(unused_imports)]
 pub use oplog::{

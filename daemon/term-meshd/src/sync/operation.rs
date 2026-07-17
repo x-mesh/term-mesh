@@ -17,8 +17,28 @@ const MAX_PROJECT_ID_BYTES: usize = 64;
 const DEFAULT_MAX_WORKERS: usize = 2;
 const DEFAULT_MAX_QUEUED: usize = 64;
 const OPERATION_APPLICATION_ID: i64 = 0x544d_4f50;
-const OPERATION_SCHEMA_VERSION: i64 = 1;
+const OPERATION_SCHEMA_VERSION: i64 = 2;
 const OPERATION_SCHEMA: &str = "CREATE TABLE sync_operations(
+ operation_id TEXT PRIMARY KEY NOT NULL CHECK(length(operation_id)=32),
+ request_id TEXT NOT NULL UNIQUE CHECK(length(request_id)=32),
+ project_id TEXT NOT NULL CHECK(length(project_id)=64),
+ kind TEXT NOT NULL CHECK(kind IN ('manifest_scan','sync')),
+ root TEXT NOT NULL CHECK(length(root)>0 AND length(root)<=4096),
+ state TEXT NOT NULL CHECK(state IN ('pending','running','cancel_requested','succeeded','failed','cancelled','interrupted')),
+ result_root TEXT CHECK(result_root IS NULL OR length(result_root)=64),
+ result_entries INTEGER CHECK(result_entries IS NULL OR result_entries>=0),
+ error_code TEXT CHECK(error_code IS NULL OR length(error_code)<=64),
+ created_at_ms INTEGER NOT NULL CHECK(created_at_ms>=0),
+ updated_at_ms INTEGER NOT NULL CHECK(updated_at_ms>=created_at_ms)
+) STRICT;";
+
+/// Schema version 1 — identical to [`OPERATION_SCHEMA`] except the `kind` CHECK
+/// admitted only `'manifest_scan'`. Kept verbatim so an existing v1 database
+/// (every 0.159.0 daemon opens this store at startup) is recognized and
+/// migrated in place rather than rejected as a schema mismatch. SQLite cannot
+/// `ALTER` a CHECK, so the v1→v2 migration rebuilds the table (see
+/// `migrate_operations_v1_to_v2`).
+const OPERATION_SCHEMA_V1: &str = "CREATE TABLE sync_operations(
  operation_id TEXT PRIMARY KEY NOT NULL CHECK(length(operation_id)=32),
  request_id TEXT NOT NULL UNIQUE CHECK(length(request_id)=32),
  project_id TEXT NOT NULL CHECK(length(project_id)=64),
@@ -36,18 +56,22 @@ const OPERATION_SCHEMA: &str = "CREATE TABLE sync_operations(
 #[serde(rename_all = "snake_case")]
 pub enum OperationKind {
     ManifestScan,
+    /// Network sync against a peer (Phase S0b+). Drives `NetworkSyncRunner`.
+    Sync,
 }
 
 impl OperationKind {
     fn as_str(self) -> &'static str {
         match self {
             Self::ManifestScan => "manifest_scan",
+            Self::Sync => "sync",
         }
     }
 
     fn parse(value: &str) -> Result<Self, OperationError> {
         match value {
             "manifest_scan" => Ok(Self::ManifestScan),
+            "sync" => Ok(Self::Sync),
             _ => Err(OperationError::CorruptState),
         }
     }
@@ -105,6 +129,10 @@ pub struct OperationStartParams {
     pub request_id: String,
     pub project_id: String,
     pub kind: OperationKind,
+    /// Target peer id for `OperationKind::Sync` (ignored by `ManifestScan`).
+    /// Absent for a local scan; carried through to `OperationSpec::peer`.
+    #[serde(default)]
+    pub peer: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -151,6 +179,9 @@ pub struct OperationSpec {
     pub kind: OperationKind,
     pub root: PathBuf,
     pub held_root: HeldProjectRoot,
+    /// Target peer id for a `Sync` operation (`None` for a local scan). The
+    /// `SyncTransport` resolves it to an endpoint + trust context.
+    pub peer: Option<String>,
 }
 
 pub trait OperationRunner: Send + Sync + 'static {
@@ -161,9 +192,59 @@ pub trait OperationRunner: Send + Sync + 'static {
     ) -> Result<OperationResult, String>;
 }
 
-struct ManifestScanRunner;
+/// The scan half of the runner, extracted so both the direct manifest-scan path
+/// and the composite runner share one implementation.
+fn run_manifest_scan(
+    spec: &OperationSpec,
+    cancelled: &Arc<AtomicBool>,
+) -> Result<OperationResult, String> {
+    spec.held_root
+        .revalidate()
+        .map_err(|_| "root_identity_changed".to_string())?;
+    let scanner = ManifestScanner::with_cancellation(ScanLimits::default(), cancelled.clone())
+        .map_err(|_| "scan_initialization_failed".to_string())?;
+    let (manifest, _) = scanner
+        .scan_descriptor(spec.held_root.descriptor(), ScanReason::Initial)
+        .map_err(|error| match error {
+            ScanError::Cancelled => "cancelled".to_string(),
+            _ => "manifest_scan_failed".to_string(),
+        })?;
+    if cancelled.load(Ordering::Acquire) {
+        return Err("cancelled".to_string());
+    }
+    spec.held_root
+        .revalidate()
+        .map_err(|_| "root_identity_changed".to_string())?;
+    Ok(OperationResult {
+        manifest_root: hex::encode(manifest.root.0),
+        entries: manifest.entry_count,
+    })
+}
 
-impl OperationRunner for ManifestScanRunner {
+/// The peer half of a sync operation: connect to a peer, exchange state, and
+/// report a result. Kept as a trait so `operation.rs` stays free of transport
+/// (QUIC/trust) types — the concrete implementation lives outside this module
+/// and is injected at manager construction. Synchronous to match
+/// [`OperationRunner`]; the implementation bridges into async QUIC I/O itself
+/// and polls `cancelled` between steps.
+pub trait SyncTransport: Send + Sync + 'static {
+    fn run_sync(
+        &self,
+        spec: &OperationSpec,
+        cancelled: &Arc<AtomicBool>,
+    ) -> Result<OperationResult, String>;
+}
+
+/// The single [`OperationRunner`] the manager holds; dispatches by
+/// [`OperationKind`]. `ManifestScan` always runs locally. `Sync` requires a
+/// [`SyncTransport`] — absent until the daemon provisions peer identity + trust,
+/// in which case a sync operation fails with `sync_transport_not_configured`
+/// rather than silently no-opping.
+struct CompositeRunner {
+    transport: Option<Arc<dyn SyncTransport>>,
+}
+
+impl OperationRunner for CompositeRunner {
     fn run(
         &self,
         spec: &OperationSpec,
@@ -173,30 +254,11 @@ impl OperationRunner for ManifestScanRunner {
             return Err("cancelled".to_string());
         }
         match spec.kind {
-            OperationKind::ManifestScan => {
-                spec.held_root
-                    .revalidate()
-                    .map_err(|_| "root_identity_changed".to_string())?;
-                let scanner =
-                    ManifestScanner::with_cancellation(ScanLimits::default(), cancelled.clone())
-                        .map_err(|_| "scan_initialization_failed".to_string())?;
-                let (manifest, _) = scanner
-                    .scan_descriptor(spec.held_root.descriptor(), ScanReason::Initial)
-                    .map_err(|error| match error {
-                        ScanError::Cancelled => "cancelled".to_string(),
-                        _ => "manifest_scan_failed".to_string(),
-                    })?;
-                if cancelled.load(Ordering::Acquire) {
-                    return Err("cancelled".to_string());
-                }
-                spec.held_root
-                    .revalidate()
-                    .map_err(|_| "root_identity_changed".to_string())?;
-                Ok(OperationResult {
-                    manifest_root: hex::encode(manifest.root.0),
-                    entries: manifest.entry_count,
-                })
-            }
+            OperationKind::ManifestScan => run_manifest_scan(spec, &cancelled),
+            OperationKind::Sync => match &self.transport {
+                Some(transport) => transport.run_sync(spec, &cancelled),
+                None => Err("sync_transport_not_configured".to_string()),
+            },
         }
     }
 }
@@ -252,7 +314,26 @@ impl OperationManager {
         Self::open_with_runner_and_limits(
             path,
             registry,
-            Arc::new(ManifestScanRunner),
+            Arc::new(CompositeRunner { transport: None }),
+            DEFAULT_MAX_WORKERS,
+            DEFAULT_MAX_QUEUED,
+        )
+    }
+
+    /// Like [`open`](Self::open) but with a [`SyncTransport`] wired in, so
+    /// `OperationKind::Sync` operations connect to a peer instead of failing
+    /// `sync_transport_not_configured`. `ManifestScan` behavior is unchanged.
+    pub fn open_with_sync_transport(
+        path: impl AsRef<Path>,
+        registry: Arc<ProjectRegistry>,
+        transport: Arc<dyn SyncTransport>,
+    ) -> Result<Self, OperationError> {
+        Self::open_with_runner_and_limits(
+            path,
+            registry,
+            Arc::new(CompositeRunner {
+                transport: Some(transport),
+            }),
             DEFAULT_MAX_WORKERS,
             DEFAULT_MAX_QUEUED,
         )
@@ -351,6 +432,7 @@ impl OperationManager {
             kind: params.kind,
             root: held_root.canonical_path().to_path_buf(),
             held_root,
+            peer: params.peer.clone(),
         };
 
         let operation_id = random_id()?;
@@ -662,6 +744,10 @@ impl OperationManager {
             request_id: params.request_id,
             project_id: source.project_id,
             kind: source.kind,
+            // The peer target is not persisted on the operation record, so a
+            // retried Sync operation fails `sync_peer_unspecified` until peer
+            // durability lands — retry is aimed at local scans for now.
+            peer: None,
         })
         .await
     }
@@ -727,6 +813,11 @@ fn normalize_runner_error(code: &str) -> &'static str {
         "root_identity_changed" => "root_identity_changed",
         "manifest_scan_failed" => "manifest_scan_failed",
         "scan_initialization_failed" => "scan_initialization_failed",
+        "sync_transport_not_configured" => "sync_transport_not_configured",
+        "sync_peer_unspecified" => "sync_peer_unspecified",
+        "sync_peer_unknown" => "sync_peer_unknown",
+        "sync_connect_failed" => "sync_connect_failed",
+        "sync_exchange_failed" => "sync_exchange_failed",
         _ => "operation_failed",
     }
 }
@@ -779,6 +870,26 @@ fn map_secure_error(error: SecureSqliteError) -> OperationError {
     }
 }
 
+/// Rebuild `sync_operations` from the v1 CHECK (`kind IN ('manifest_scan')`) to
+/// v2 (`… ,'sync'`). SQLite cannot `ALTER` a CHECK constraint, so rename the old
+/// table aside, recreate it from [`OPERATION_SCHEMA`], copy every row (the column
+/// set is unchanged, so `SELECT *` is exact), drop the old table, and stamp the
+/// new `user_version`. All in one transaction: a failure rolls back to the
+/// intact v1 table when the connection is dropped by the caller.
+fn migrate_operations_v1_to_v2(connection: &Connection) -> Result<(), OperationError> {
+    connection
+        .execute_batch(&format!(
+            "BEGIN IMMEDIATE;
+             ALTER TABLE sync_operations RENAME TO sync_operations_migrating_v1;
+             {OPERATION_SCHEMA}
+             INSERT INTO sync_operations SELECT * FROM sync_operations_migrating_v1;
+             DROP TABLE sync_operations_migrating_v1;
+             PRAGMA user_version={OPERATION_SCHEMA_VERSION};
+             COMMIT;"
+        ))
+        .map_err(|_| OperationError::Schema)
+}
+
 fn initialize_or_validate_schema(connection: &Connection) -> Result<(), OperationError> {
     let actual: Option<String> = connection
         .query_row(
@@ -800,7 +911,12 @@ fn initialize_or_validate_schema(connection: &Connection) -> Result<(), Operatio
                     .split_whitespace()
                     .collect::<String>()
             };
-            if normalize(&actual) != normalize(OPERATION_SCHEMA) {
+            let normalized = normalize(&actual);
+            if normalized == normalize(OPERATION_SCHEMA) {
+                // Already the current schema.
+            } else if normalized == normalize(OPERATION_SCHEMA_V1) {
+                migrate_operations_v1_to_v2(connection)?;
+            } else {
                 return Err(OperationError::Schema);
             }
         }
@@ -918,4 +1034,61 @@ pub fn default_operation_db_path() -> PathBuf {
         .join("term-mesh")
         .join("sync")
         .join("sync_operations.db")
+}
+
+#[cfg(test)]
+mod migration_tests {
+    use super::{initialize_or_validate_schema, OPERATION_APPLICATION_ID, OPERATION_SCHEMA_V1};
+    use rusqlite::Connection;
+
+    fn insert(conn: &Connection, op: u8, req: u8, kind: &str) -> rusqlite::Result<usize> {
+        conn.execute(
+            "INSERT INTO sync_operations(operation_id,request_id,project_id,kind,root,state,created_at_ms,updated_at_ms)
+             VALUES(?1,?2,?3,?4,'/tmp/project','succeeded',1,1)",
+            rusqlite::params![
+                format!("{op:02x}").repeat(16),
+                format!("{req:02x}").repeat(16),
+                "a".repeat(64),
+                kind,
+            ],
+        )
+    }
+
+    /// Every 0.159.0 daemon opens the operations store at startup with the v1
+    /// schema; adding `OperationKind::Sync` widened the `kind` CHECK, which
+    /// SQLite cannot alter in place. This proves the v1→v2 rebuild migration
+    /// runs on open, preserves existing rows, and admits the new `sync` kind —
+    /// so an updated daemon migrates instead of failing `Schema` at startup.
+    #[test]
+    fn v1_operations_db_migrates_to_v2_preserving_rows_and_admitting_sync() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(&format!(
+            "{OPERATION_SCHEMA_V1} PRAGMA application_id={OPERATION_APPLICATION_ID}; PRAGMA user_version=1;"
+        ))
+        .unwrap();
+        insert(&conn, 0x11, 0x22, "manifest_scan").unwrap();
+        // The v1 CHECK rejects a 'sync' kind — this is exactly what the
+        // migration must relax.
+        assert!(insert(&conn, 0x33, 0x44, "sync").is_err());
+
+        // Opening/validating migrates v1 -> v2 in place.
+        initialize_or_validate_schema(&conn).unwrap();
+
+        let version: i64 = conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, 2, "schema version bumped to v2");
+        let scans: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM sync_operations WHERE kind='manifest_scan'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(scans, 1, "existing manifest_scan row preserved across rebuild");
+        // The widened CHECK now admits 'sync'.
+        insert(&conn, 0x55, 0x66, "sync").unwrap();
+        // Re-validating an already-v2 database is a no-op (no double migration).
+        initialize_or_validate_schema(&conn).unwrap();
+    }
 }
