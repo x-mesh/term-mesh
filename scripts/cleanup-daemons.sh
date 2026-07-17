@@ -32,8 +32,12 @@ echo "=== Daemon / peer / tunnel sockets ==="
 SOCKETS=()
 # Standard locations: daemon sockets, peer host sockets, app-side SSH tunnel
 # sockets, and test/tagged leftovers. Active ones (with a listener) are kept.
+# TMPDIR is unset in non-interactive SSH shells — resolve the real macOS
+# per-user temp dir (where the app's daemon binds) instead of falling back
+# to /tmp, or every daemon looks like an orphan when run remotely.
+USER_TMP="${TMPDIR:-$(getconf DARWIN_USER_TEMP_DIR 2>/dev/null || echo /tmp)}"
 for pattern in /tmp/term-meshd*.sock \
-               "${TMPDIR:-/tmp}"/term-meshd*.sock \
+               "$USER_TMP"/term-meshd*.sock \
                "$HOME/Library/Application Support/term-mesh/term-meshd"*.sock \
                /tmp/term-mesh-peer-*.sock \
                /tmp/term-mesh-peer-*/peer.sock \
