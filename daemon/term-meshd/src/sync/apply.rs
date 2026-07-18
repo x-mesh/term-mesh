@@ -1,3 +1,4 @@
+use std::collections::{BTreeMap, HashSet};
 use std::fs::File;
 use std::io::{self, Write};
 use std::mem::ManuallyDrop;
@@ -19,13 +20,21 @@ use super::{
 };
 
 const APP_ID: i64 = 0x544d_4150;
-const VERSION: i64 = 3;
+/// Bump whenever `APPLY_SCHEMA` changes. `migrate_additive` brings an older
+/// database up to it by creating whatever it lacks, so a version bump is only a
+/// signal — the migration itself reads the actual table set.
+const VERSION: i64 = 4;
 const APPLY_SCHEMA: &[(&str, &str)] = &[
     ("operations", "CREATE TABLE operations(operation_id BLOB PRIMARY KEY CHECK(length(operation_id)=16),project BLOB NOT NULL CHECK(length(project)=32),target_root BLOB NOT NULL CHECK(length(target_root)=32),frontier BLOB NOT NULL,phase TEXT NOT NULL CHECK(phase IN('prepared','applying','committed','rolled_back','blocked')),created_at_ms INTEGER NOT NULL CHECK(created_at_ms>=0)) STRICT"),
     ("entries", "CREATE TABLE entries(operation_id BLOB NOT NULL CHECK(length(operation_id)=16),ordinal INTEGER NOT NULL CHECK(ordinal>=0),path TEXT NOT NULL,action TEXT NOT NULL CHECK(action IN('file','directory','symlink','delete')),expected_absent INTEGER NOT NULL CHECK(expected_absent IN(0,1)),original_digest BLOB CHECK(original_digest IS NULL OR length(original_digest)=32),temp_name TEXT NOT NULL,backup_name TEXT NOT NULL,installed_digest BLOB CHECK(installed_digest IS NULL OR length(installed_digest)=32),installed_dev INTEGER CHECK(installed_dev IS NULL OR installed_dev>=0),installed_ino INTEGER CHECK(installed_ino IS NULL OR installed_ino>=0),phase TEXT NOT NULL CHECK(phase IN('planned','temp_durable','backup_intent','backup_durable','install_intent','installed_durable')),recovery_phase TEXT NOT NULL CHECK(recovery_phase IN('none','rollback_intent','rollback_durable','cleanup_intent','cleanup_durable')),PRIMARY KEY(operation_id,ordinal),UNIQUE(operation_id,path),FOREIGN KEY(operation_id) REFERENCES operations(operation_id)) STRICT"),
     ("visible_state", "CREATE TABLE visible_state(project BLOB PRIMARY KEY CHECK(length(project)=32),manifest_root BLOB NOT NULL CHECK(length(manifest_root)=32),frontier BLOB NOT NULL,generation INTEGER NOT NULL CHECK(generation>0)) STRICT"),
     // The last-synced BASE manifest per project (bidirectional three-way anchor).
     ("base_manifests", "CREATE TABLE base_manifests(project BLOB PRIMARY KEY CHECK(length(project)=32),entries BLOB NOT NULL) STRICT"),
+    // The CAS object behind each BASE file, so a three-way merge can read what
+    // the two peers last agreed a path contained. The manifest's content_hash is
+    // not an ObjectId (an ObjectId also binds the domain and length), so the base
+    // bytes are unaddressable without this side table.
+    ("base_objects", "CREATE TABLE base_objects(project BLOB NOT NULL CHECK(length(project)=32),path TEXT NOT NULL,object_id BLOB NOT NULL CHECK(length(object_id)=32),PRIMARY KEY(project,path)) STRICT"),
     ("one_active_operation", "CREATE UNIQUE INDEX one_active_operation ON operations(project) WHERE phase NOT IN('committed','rolled_back')"),
 ];
 
@@ -192,7 +201,8 @@ impl ApplyStore {
             vfs.name(),
         )?;
         configure(&connection)?;
-        if connection.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))? == 0 {
+        let user_version = connection.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))?;
+        if user_version == 0 {
             let tx = connection.unchecked_transaction()?;
             for (_, sql) in APPLY_SCHEMA {
                 tx.execute_batch(sql)?;
@@ -200,6 +210,8 @@ impl ApplyStore {
             tx.pragma_update(None, "application_id", APP_ID)?;
             tx.pragma_update(None, "user_version", VERSION)?;
             tx.commit()?;
+        } else if user_version < VERSION {
+            migrate_additive(&connection)?;
         }
         validate_schema(&connection)?;
         validate_database_files(&state_dir, &database_name)?;
@@ -285,6 +297,61 @@ impl ApplyStore {
             None => Ok(Vec::new()),
             Some(bytes) => decode_entries(&bytes).map_err(|_| ApplyError::Corrupt),
         }
+    }
+
+    /// Record the CAS object behind each BASE file, replacing the project's whole
+    /// set (the base manifest is written whole, so its object map moves with it).
+    ///
+    /// Only FILE paths belong here — directories and symlinks carry no content to
+    /// three-way merge, and their base state is fully described by the manifest.
+    pub fn save_base_objects(
+        &self,
+        project: ProjectId,
+        objects: &BTreeMap<String, ObjectId>,
+    ) -> Result<(), ApplyError> {
+        let mut connection = self.connection.lock().map_err(|_| ApplyError::Poisoned)?;
+        let tx = connection.transaction()?;
+        tx.execute(
+            "DELETE FROM base_objects WHERE project=?1",
+            [project.as_bytes().as_slice()],
+        )?;
+        {
+            let mut statement =
+                tx.prepare("INSERT INTO base_objects(project,path,object_id)VALUES(?1,?2,?3)")?;
+            for (path, object_id) in objects {
+                statement.execute(rusqlite::params![
+                    project.as_bytes().as_slice(),
+                    path,
+                    object_id.0.as_slice()
+                ])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// The CAS object behind each BASE file for `project`. A path missing from the
+    /// map has no recoverable base content — the caller must treat that as "base
+    /// unknown" rather than "base absent", because the two differ: a file deleted
+    /// locally and modified remotely is a conflict only if we know it was in the
+    /// base.
+    pub fn load_base_objects(
+        &self,
+        project: ProjectId,
+    ) -> Result<BTreeMap<String, ObjectId>, ApplyError> {
+        let connection = self.connection.lock().map_err(|_| ApplyError::Poisoned)?;
+        let mut statement =
+            connection.prepare("SELECT path,object_id FROM base_objects WHERE project=?1")?;
+        let rows = statement.query_map([project.as_bytes().as_slice()], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?))
+        })?;
+        let mut objects = BTreeMap::new();
+        for row in rows {
+            let (path, raw) = row?;
+            let bytes: [u8; 32] = raw.try_into().map_err(|_| ApplyError::Corrupt)?;
+            objects.insert(path, ObjectId(bytes));
+        }
+        Ok(objects)
     }
 
     pub fn visible_state(&self, project: ProjectId) -> Result<Option<VisibleState>, ApplyError> {
@@ -1140,8 +1207,31 @@ fn validate_database_files(directory: &File, database: &str) -> Result<(), Apply
 }
 
 fn validate_schema(connection: &Connection) -> Result<(), ApplyError> {
+    validate_schema_at(connection, VERSION, false)
+}
+
+/// Schema check shared by the pre-open guard and the post-open assertion.
+///
+/// `allow_older` accepts any known version from 1 up to [`VERSION`] and tolerates
+/// objects that version had not introduced yet; the objects that ARE present must
+/// still match `APPLY_SCHEMA` exactly. The pre-open guard needs that leniency
+/// because it runs before `migrate_additive` — being strict there would make a
+/// legitimately older database indistinguishable from a corrupt one and get it
+/// quarantined. Every open still ends with the strict check, so a database that
+/// failed to migrate cleanly never gets used.
+fn validate_schema_at(
+    connection: &Connection,
+    expected_version: i64,
+    allow_older: bool,
+) -> Result<(), ApplyError> {
+    let version = connection.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))?;
+    let version_ok = if allow_older {
+        (1..=expected_version).contains(&version)
+    } else {
+        version == expected_version
+    };
     if connection.query_row("PRAGMA application_id", [], |row| row.get::<_, i64>(0))? != APP_ID
-        || connection.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))? != VERSION
+        || !version_ok
         || connection.query_row("PRAGMA quick_check", [], |row| row.get::<_, String>(0))? != "ok"
     {
         return Err(ApplyError::Schema);
@@ -1157,7 +1247,8 @@ fn validate_schema(connection: &Connection) -> Result<(), ApplyError> {
         ))
     })?;
     let actual = rows.collect::<Result<Vec<_>, _>>()?;
-    if actual.len() != APPLY_SCHEMA.len() {
+    let complete = actual.len() == APPLY_SCHEMA.len();
+    if !complete && !(allow_older && actual.len() < APPLY_SCHEMA.len()) {
         return Err(ApplyError::Schema);
     }
     for (kind, name, sql) in actual {
@@ -1177,6 +1268,33 @@ fn validate_schema(connection: &Connection) -> Result<(), ApplyError> {
     Ok(())
 }
 
+/// Bring a database opened at an older `user_version` up to [`VERSION`] by
+/// creating every `APPLY_SCHEMA` object it is missing, using the schema's own
+/// SQL text (`validate_schema` compares that text exactly, so a `CREATE TABLE IF
+/// NOT EXISTS` variant would fail validation even though the table is correct).
+///
+/// Additive only: it never drops or rewrites an existing object, so an in-flight
+/// apply journal survives the upgrade. A future non-additive change needs its own
+/// step here — `validate_schema` runs right after and rejects any drift this
+/// missed rather than letting a half-migrated database through.
+fn migrate_additive(connection: &Connection) -> Result<(), ApplyError> {
+    let existing: HashSet<String> = {
+        let mut statement =
+            connection.prepare("SELECT name FROM sqlite_master WHERE name NOT LIKE 'sqlite_%'")?;
+        let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
+        rows.collect::<Result<_, _>>()?
+    };
+    let tx = connection.unchecked_transaction()?;
+    for (name, sql) in APPLY_SCHEMA {
+        if !existing.contains(*name) {
+            tx.execute_batch(sql)?;
+        }
+    }
+    tx.pragma_update(None, "user_version", VERSION)?;
+    tx.commit()?;
+    Ok(())
+}
+
 fn preflight_existing(path: &Path, vfs: &str) -> Result<(), ApplyError> {
     let connection = Connection::open_with_flags_and_vfs(
         path,
@@ -1185,7 +1303,10 @@ fn preflight_existing(path: &Path, vfs: &str) -> Result<(), ApplyError> {
             | OpenFlags::SQLITE_OPEN_NOFOLLOW,
         vfs,
     )?;
-    validate_schema(&connection)
+    // Lenient: this runs before any migration, so an older-but-ours database must
+    // pass. A failure here quarantines the file, which a version upgrade must
+    // never trigger.
+    validate_schema_at(&connection, VERSION, true)
 }
 
 fn quarantine_database_set_at(directory: &File, database: &str) -> Result<(), ApplyError> {

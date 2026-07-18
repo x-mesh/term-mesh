@@ -327,7 +327,7 @@ impl NetworkSyncRunner {
             .cas
             .current_project_key(project)
             .map_err(|_| "sync_key_unavailable".to_string())?;
-        run_push(
+        let pushed = run_push(
             &mut connection,
             &ctx.cas,
             spec.held_root.canonical_path(),
@@ -341,14 +341,34 @@ impl NetworkSyncRunner {
         // Advance the base for the paths that just converged (fetch → the remote
         // value, push → the local value). Unchanged/delete/conflict paths keep
         // their old base so deferred work still shows up as a diff next time.
+        //
+        // The base's CAS objects move with it. Every path that enters the base
+        // does so through a fetch or a push, and both put the content in CAS, so
+        // the object id is always known here — a path identical on both sides is
+        // skipped by the reconcile and never reaches the base at all.
         {
             let mut base_map: std::collections::HashMap<String, ManifestEntry> = base
                 .iter()
                 .map(|entry| (entry.relative_path.clone(), entry.clone()))
                 .collect();
+            let mut object_map = {
+                let store = ctx
+                    .apply_store
+                    .lock()
+                    .map_err(|_| "sync_apply_failed".to_string())?;
+                store
+                    .load_base_objects(project)
+                    .map_err(|_| "sync_apply_failed".to_string())?
+            };
             for entry in plan.fetch.iter().chain(plan.push.iter()) {
                 base_map.insert(entry.relative_path.clone(), fetch_to_manifest(entry));
             }
+            for (path, object_id) in resolved.iter().chain(pushed.iter()) {
+                object_map.insert(path.clone(), *object_id);
+            }
+            // Drop objects for paths no longer in the base, so the table cannot
+            // grow forever with ids whose base entry is gone.
+            object_map.retain(|path, _| base_map.contains_key(path));
             let base_prime: Vec<ManifestEntry> = base_map.into_values().collect();
             let store = ctx
                 .apply_store
@@ -356,6 +376,9 @@ impl NetworkSyncRunner {
                 .map_err(|_| "sync_apply_failed".to_string())?;
             store
                 .save_base_manifest(project, &base_prime)
+                .map_err(|_| "sync_apply_failed".to_string())?;
+            store
+                .save_base_objects(project, &object_map)
                 .map_err(|_| "sync_apply_failed".to_string())?;
         }
 

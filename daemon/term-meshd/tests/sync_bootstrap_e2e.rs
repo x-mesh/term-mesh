@@ -27,11 +27,11 @@ use sync::{
     ensure_device_identity, exchange_manifests, generate_project_key, load_device_tls_identity,
     load_project_key, receive_push, respond_to_fetch, run_bootstrap_trust, scan_project_entries,
     serve_project, ApplyStore, BootstrapDevice, CasLimits, CasStore, DaemonBootstrapPaths,
-    KeychainBackend, KeychainError,
-    KeychainItem, KeychainProjectKeyProvider, LocalCoordinates, NetworkSyncRunner, ObjectDomain,
-    ObjectType, OperationKind, OperationManager, OperationStartParams, OperationState, ProjectId,
-    ProjectRegistry, ProvisioningPeerResolver, ProvisioningSyncContextProvider, SyncConnection,
-    SyncContextProvider, SyncEndpoint, SyncProvisioningStore, TrustStore,
+    KeychainBackend, KeychainError, KeychainItem, KeychainProjectKeyProvider, LocalCoordinates,
+    NetworkSyncRunner, ObjectDomain, ObjectId, ObjectType, OperationKind, OperationManager,
+    OperationStartParams, OperationState, ProjectId, ProjectRegistry, ProvisioningPeerResolver,
+    ProvisioningSyncContextProvider, SyncConnection, SyncContextProvider, SyncEndpoint,
+    SyncProvisioningStore, TrustStore,
 };
 use sync_protocol::{SyncHello, PROJECT_SYNC_CAPABILITY, PROTOCOL_V1};
 use zeroize::Zeroizing;
@@ -541,7 +541,7 @@ async fn bidirectional_sync_converges_both_trees() {
     let provisioning_a = Arc::new(SyncProvisioningStore::open(state_a.join("prov.db")).unwrap());
     let provider = Arc::new(ProvisioningSyncContextProvider::new(keychain_a.clone(), provisioning_a.clone(), &state_a));
     let resolver = Arc::new(ProvisioningPeerResolver::new(provisioning_a));
-    let runner = NetworkSyncRunner::new(provider, resolver, tokio::runtime::Handle::current());
+    let runner = NetworkSyncRunner::new(provider.clone(), resolver, tokio::runtime::Handle::current());
 
     let ops_state = state_dir(temporary.path(), "sync-state");
     let manager = OperationManager::open_with_sync_transport(ops_state.join("operations.db"), registry_a, Arc::new(runner)).unwrap();
@@ -575,5 +575,42 @@ async fn bidirectional_sync_converges_both_trees() {
     assert_eq!(b_got_a, b"lives-on-A");
     // shared.txt untouched on both.
     assert_eq!(std::fs::read(local_root.path().join("shared.txt")).unwrap(), b"same-content");
+
+    // The base advanced to the converged state, and each base FILE carries the CAS
+    // object it landed on — the anchor a later three-way merge reads to tell "I
+    // changed this" apart from "they changed this".
+    let context_a = provider.context_for(&op_project_id).unwrap();
+    let (base, base_objects) = {
+        let store = context_a.apply_store.lock().unwrap();
+        (
+            store.load_base_manifest(project).unwrap(),
+            store.load_base_objects(project).unwrap(),
+        )
+    };
+    let base_paths: Vec<&str> = base.iter().map(|e| e.relative_path.as_str()).collect();
+    assert!(base_paths.contains(&"a-only.txt"), "pushed path in base: {base_paths:?}");
+    assert!(base_paths.contains(&"b-only.txt"), "fetched path in base: {base_paths:?}");
+    // `shared.txt` was identical on both sides, so the reconcile skipped it and it
+    // never entered the base — which is exactly why every base path has an object.
+    assert_eq!(
+        base_objects.keys().map(String::as_str).collect::<Vec<_>>(),
+        vec!["a-only.txt", "b-only.txt"],
+    );
+    // Each recorded id is the content address of the agreed bytes, and the object
+    // it names is really in CAS — so a later merge can read the base, not just
+    // learn that one existed.
+    let domain = ObjectDomain { project_id: project, object_type: ObjectType::FILE, version: 1 };
+    for (path, expected) in [("a-only.txt", &b"lives-on-A"[..]), ("b-only.txt", &b"lives-on-B"[..])] {
+        assert_eq!(
+            base_objects[path],
+            ObjectId::for_plaintext(domain, expected),
+            "base object for {path} does not address the agreed content",
+        );
+        assert!(
+            context_a.cas.get_live(domain, base_objects[path]).unwrap().is_some(),
+            "base object for {path} missing from CAS",
+        );
+    }
+
     stop.store(true, std::sync::atomic::Ordering::Release);
 }

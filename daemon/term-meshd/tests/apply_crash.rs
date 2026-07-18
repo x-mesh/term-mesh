@@ -1584,11 +1584,12 @@ fn sqlite_dms_truncates_stale_shm_and_survives_opener_crash_reopen_race() {
     holder.wait().unwrap();
     drop(concurrent);
     let reopened = ApplyStore::open(&database).unwrap();
+    // The current apply schema version — bump alongside `VERSION` in apply.rs.
     assert_eq!(
         reopened
             .sqlite_test_query_i64("PRAGMA user_version")
             .unwrap(),
-        3
+        4
     );
 }
 
@@ -1926,4 +1927,62 @@ fn rollback_recreated_installed_target_preserves_target_and_backup_then_blocks()
         .path();
     assert_eq!(fs::read(backup).unwrap(), b"subprocess old");
     assert!(reopened.visible_state(project).unwrap().is_none());
+}
+
+/// The base object map is what makes a three-way merge possible: it names the
+/// CAS object each base file held, which the manifest's `content_hash` cannot do
+/// (an `ObjectId` also binds the domain and length).
+#[test]
+fn base_objects_round_trip_and_replace_the_previous_set() {
+    let temporary = tempfile::tempdir().unwrap();
+    let project = ProjectId::from_bytes([9; 32]);
+    let store = ApplyStore::open(temporary.path().join("state/apply.sqlite")).unwrap();
+
+    assert!(store.load_base_objects(project).unwrap().is_empty());
+
+    let mut objects = BTreeMap::new();
+    objects.insert("a.txt".to_string(), ObjectId([1; 32]));
+    objects.insert("dir/b.txt".to_string(), ObjectId([2; 32]));
+    store.save_base_objects(project, &objects).unwrap();
+    assert_eq!(store.load_base_objects(project).unwrap(), objects);
+
+    // A save replaces the whole set — the base manifest is written whole, so a
+    // path dropped from the base must not keep a stale object id.
+    let mut next = BTreeMap::new();
+    next.insert("dir/b.txt".to_string(), ObjectId([3; 32]));
+    store.save_base_objects(project, &next).unwrap();
+    assert_eq!(store.load_base_objects(project).unwrap(), next);
+
+    // Scoped per project.
+    let other = ProjectId::from_bytes([10; 32]);
+    assert!(store.load_base_objects(other).unwrap().is_empty());
+}
+
+/// A database written before the base tables existed must still open. The schema
+/// check compares the table set exactly, so without an additive migration an
+/// older `apply.sqlite` would fail to open at all — taking its in-flight apply
+/// journal, and the crash recovery that depends on it, with it.
+#[test]
+fn a_database_predating_the_base_tables_migrates_on_open() {
+    let temporary = tempfile::tempdir().unwrap();
+    let database = temporary.path().join("state/apply.sqlite");
+    let project = ProjectId::from_bytes([11; 32]);
+
+    let store = ApplyStore::open(&database).unwrap();
+    // Rewind to what a pre-base-manifest database looked like.
+    store
+        .sqlite_test_execute_batch(
+            "DROP TABLE base_objects; DROP TABLE base_manifests; PRAGMA user_version=3;",
+        )
+        .unwrap();
+    drop(store);
+
+    let reopened = ApplyStore::open(&database).unwrap();
+    assert!(reopened.load_base_manifest(project).unwrap().is_empty());
+    assert!(reopened.load_base_objects(project).unwrap().is_empty());
+
+    let mut objects = BTreeMap::new();
+    objects.insert("a.txt".to_string(), ObjectId([7; 32]));
+    reopened.save_base_objects(project, &objects).unwrap();
+    assert_eq!(reopened.load_base_objects(project).unwrap(), objects);
 }

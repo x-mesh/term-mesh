@@ -413,6 +413,9 @@ pub async fn respond_to_fetch(
 /// (HEADER immediately followed by its chunks), then DONE — and finally *wait for
 /// the peer's apply ack*, so a successful return means the peer has the files on
 /// disk, not merely that the bytes left this machine.
+///
+/// Returns the CAS object each pushed FILE landed on, so the caller can record
+/// them as the new base objects for those paths.
 pub async fn run_push(
     connection: &mut SyncConnection,
     cas: &CasStore,
@@ -421,8 +424,9 @@ pub async fn run_push(
     key: &ProjectKey,
     key_id: KeyId,
     push: &[FetchEntry],
-) -> Result<(), String> {
+) -> Result<HashMap<String, ObjectId>, String> {
     let sender = connection.sender();
+    let mut pushed = HashMap::new();
     sender
         .send(StreamLane::SyncOperation, encode_push_manifest(push))
         .await
@@ -434,6 +438,7 @@ pub async fn run_push(
         let content =
             std::fs::read(root.join(&entry.relative_path)).map_err(|_| "push_read_failed".to_string())?;
         let object_id = put_plaintext(cas, domain, key, key_id, &content)?;
+        pushed.insert(entry.relative_path.clone(), object_id);
         sender
             .send(
                 StreamLane::SyncOperation,
@@ -470,7 +475,7 @@ pub async fn run_push(
     // let the operation be marked succeeded while the peer has not written a
     // single file yet — and a failing apply would be lost entirely.
     decode_push_ack(&recv_syncop(connection).await?)?;
-    Ok(())
+    Ok(pushed)
 }
 
 /// Responder side of a PUSH (mirror of [`run_fetch_pull`] + apply): receive the
