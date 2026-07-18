@@ -7,10 +7,11 @@ use std::os::unix::fs::PermissionsExt;
 use std::sync::Arc;
 
 use sync::{
-    assumed_file_mode, encrypt_chunk, APPLY_SCHEMA_VERSION, ApplyAction, ApplyBoundary, ApplyCrashHook, ApplyError, ApplyIoPoint, ApplyPlan,
+    assumed_file_mode, empty_directory_fingerprint, encrypt_chunk, APPLY_SCHEMA_VERSION, ApplyAction, ApplyBoundary, ApplyCrashHook, ApplyError, ApplyIoPoint, ApplyPlan,
     ApplyPlanEntry, ApplyPrecondition, ApplyStore, CasError, CasLimits, CasStore, HeadDecision,
     KeyId, ObjectDomain, ObjectId, ObjectType, PathFingerprint, PathKind, ProjectId, ProjectKey,
     ProjectKeyMaterial, ProjectKeyProvider, ReconcileError, ReconcileStore, TransportPeerSnapshot,
+    build_delete_plan, build_directory_delete_plan, EntryKind, ManifestEntry, NO_MODE,
 };
 
 const KEY: [u8; 32] = [0x63; 32];
@@ -673,6 +674,242 @@ fn files_directories_symlinks_and_deletes_apply_as_one_visible_generation() {
     assert!(root.join("old-dir").is_dir());
     assert!(fs::read_dir(root.join("old-dir")).unwrap().next().is_none());
     assert_eq!(store.visible_state(project).unwrap().unwrap().generation, 1);
+}
+
+/// The delete precondition for a directory is a hand-built fingerprint, because
+/// the real one is recursive and cannot be rebuilt from a manifest entry. This is
+/// what keeps the hand-built one honest: if the directory arm of
+/// `fingerprint_entry` ever changes what it hashes, this fails instead of every
+/// directory delete quietly becoming impossible.
+#[test]
+fn empty_directory_fingerprint_matches_a_real_one() {
+    let temporary = tempfile::tempdir().unwrap();
+    let root = temporary.path().join("project");
+    let project = ProjectId::from_bytes([44; 32]);
+    fs::create_dir_all(&root).unwrap();
+
+    for mode in [0o700_u16, 0o750, 0o755, 0o600] {
+        let name = format!("dir-{mode:o}");
+        fs::create_dir(root.join(&name)).unwrap();
+        fs::set_permissions(root.join(&name), fs::Permissions::from_mode(u32::from(mode))).unwrap();
+
+        let observed = ApplyStore::fingerprint_path(&root, project, &name)
+            .unwrap()
+            .expect("the directory exists");
+        assert_eq!(
+            observed,
+            empty_directory_fingerprint(mode),
+            "hand-built fingerprint drifted from the real one at mode {mode:o}"
+        );
+        // `precondition_matches` compares the digest too, not only the fields.
+        assert_eq!(observed.digest(), empty_directory_fingerprint(mode).digest());
+    }
+}
+
+#[test]
+fn deleting_an_empty_directory_removes_it() {
+    let temporary = tempfile::tempdir().unwrap();
+    let root = temporary.path().join("project");
+    let project = ProjectId::from_bytes([45; 32]);
+    fs::create_dir_all(root.join("doomed")).unwrap();
+    fs::set_permissions(root.join("doomed"), fs::Permissions::from_mode(0o755)).unwrap();
+    let cas = CasStore::open(
+        temporary.path().join("cas"),
+        CasLimits::default(),
+        Arc::new(FixedKeys),
+    )
+    .unwrap();
+    let store = ApplyStore::open(temporary.path().join("state/apply.sqlite")).unwrap();
+
+    let plan = ApplyPlan {
+        operation_id: [45; 16],
+        project,
+        target_manifest_root: [45; 32],
+        frontier: vec![4, 5],
+        entries: vec![ApplyPlanEntry {
+            relative_path: "doomed".to_owned(),
+            action: ApplyAction::Delete,
+            precondition: ApplyPrecondition::Present(empty_directory_fingerprint(0o755)),
+        }],
+    };
+
+    store.apply(&root, &cas, domain(project), &plan).unwrap();
+    assert!(!root.join("doomed").exists());
+}
+
+/// The case the whole design exists for: a directory the peer removed still holds
+/// something locally that the manifest never tracked — a build artifact, a
+/// `.DS_Store`. A rename-aside would carry it off silently. The empty-directory
+/// precondition refuses instead, and the content survives.
+#[test]
+fn deleting_a_directory_holding_an_untracked_file_is_refused() {
+    let temporary = tempfile::tempdir().unwrap();
+    let root = temporary.path().join("project");
+    let project = ProjectId::from_bytes([46; 32]);
+    fs::create_dir_all(root.join("doomed")).unwrap();
+    fs::set_permissions(root.join("doomed"), fs::Permissions::from_mode(0o755)).unwrap();
+    fs::write(root.join("doomed/untracked.o"), b"not in any manifest").unwrap();
+    let cas = CasStore::open(
+        temporary.path().join("cas"),
+        CasLimits::default(),
+        Arc::new(FixedKeys),
+    )
+    .unwrap();
+    let store = ApplyStore::open(temporary.path().join("state/apply.sqlite")).unwrap();
+
+    let plan = ApplyPlan {
+        operation_id: [46; 16],
+        project,
+        target_manifest_root: [46; 32],
+        frontier: vec![4, 6],
+        entries: vec![ApplyPlanEntry {
+            relative_path: "doomed".to_owned(),
+            action: ApplyAction::Delete,
+            // Built as if the directory were empty, which is what the planner
+            // does — it cannot see untracked content.
+            precondition: ApplyPrecondition::Present(empty_directory_fingerprint(0o755)),
+        }],
+    };
+
+    let error = store
+        .apply(&root, &cas, domain(project), &plan)
+        .expect_err("a non-empty directory must not be deleted");
+    assert!(
+        matches!(error, ApplyError::StalePrecondition(ref path) if path == "doomed"),
+        "expected a stale-precondition refusal, got {error:?}"
+    );
+    assert!(root.join("doomed").is_dir(), "the directory must survive");
+    assert_eq!(
+        fs::read(root.join("doomed/untracked.o")).unwrap(),
+        b"not in any manifest",
+        "untracked content must survive untouched"
+    );
+    assert!(
+        store.visible_state(project).unwrap().is_none(),
+        "a refused delete must not advance visible state"
+    );
+}
+
+/// The two delete plans working together on a real tree, through the real
+/// planners rather than a hand-built [`ApplyPlan`]: a fully-tracked subtree
+/// drains bottom-up and disappears, while a sibling holding one untracked file
+/// keeps that file AND the directory around it. The second half is what makes
+/// this safe to turn on — the peer asked for both directories to go.
+#[test]
+fn a_tracked_subtree_drains_but_a_directory_with_untracked_content_survives() {
+    fn tracked_file(path: &str, bytes: &[u8]) -> ManifestEntry {
+        ManifestEntry {
+            relative_path: path.to_owned(),
+            kind: EntryKind::File,
+            executable: false,
+            mode: assumed_file_mode(false),
+            length: bytes.len() as u64,
+            content_hash: *blake3::hash(bytes).as_bytes(),
+            symlink_target: None,
+        }
+    }
+    fn tracked_dir(path: &str) -> ManifestEntry {
+        ManifestEntry {
+            relative_path: path.to_owned(),
+            kind: EntryKind::Directory,
+            executable: true,
+            mode: NO_MODE,
+            length: 0,
+            content_hash: [0; 32],
+            symlink_target: None,
+        }
+    }
+
+    let temporary = tempfile::tempdir().unwrap();
+    let root = temporary.path().join("project");
+    let project = ProjectId::from_bytes([47; 32]);
+    fs::create_dir_all(root.join("doomed/nested")).unwrap();
+    fs::create_dir_all(root.join("crufty")).unwrap();
+    fs::write(root.join("keep.txt"), b"untouched").unwrap();
+    fs::write(root.join("doomed/a.txt"), b"a").unwrap();
+    fs::write(root.join("doomed/nested/b.txt"), b"b").unwrap();
+    fs::write(root.join("crufty/tracked.txt"), b"tracked").unwrap();
+    // Never scanned into the manifest — a build artifact, say.
+    fs::write(root.join("crufty/build.o"), b"artifact").unwrap();
+
+    let local = vec![
+        tracked_file("keep.txt", b"untouched"),
+        tracked_dir("doomed"),
+        tracked_file("doomed/a.txt", b"a"),
+        tracked_dir("doomed/nested"),
+        tracked_file("doomed/nested/b.txt", b"b"),
+        tracked_dir("crufty"),
+        tracked_file("crufty/tracked.txt", b"tracked"),
+    ];
+    // Everything the peer removed — both directories included.
+    let delete_paths: Vec<String> = [
+        "doomed",
+        "doomed/a.txt",
+        "doomed/nested",
+        "doomed/nested/b.txt",
+        "crufty",
+        "crufty/tracked.txt",
+    ]
+    .iter()
+    .map(|path| (*path).to_string())
+    .collect();
+
+    let cas = CasStore::open(
+        temporary.path().join("cas"),
+        CasLimits::default(),
+        Arc::new(FixedKeys),
+    )
+    .unwrap();
+    let store = ApplyStore::open(temporary.path().join("state/apply.sqlite")).unwrap();
+    let object_domain = domain(project);
+
+    // Leaves first.
+    let leaves = build_delete_plan(project, [47; 16], &delete_paths, &local);
+    store.apply(&root, &cas, object_domain, &leaves).unwrap();
+
+    // Then directories, deepest first, preconditioned on being empty.
+    let modes =
+        ApplyStore::directory_modes(&root, project, delete_paths.iter().map(String::as_str))
+            .unwrap();
+    let directories =
+        build_directory_delete_plan(project, [48; 16], &delete_paths, &local, &modes);
+    // `crufty` is planned: every TRACKED path inside it is going. Only the
+    // fingerprint can see the artifact, which is the whole point.
+    let planned: Vec<&str> = directories
+        .entries
+        .iter()
+        .map(|entry| entry.relative_path.as_str())
+        .collect();
+    assert_eq!(planned, ["doomed/nested", "doomed", "crufty"]);
+
+    // Applying that batch as a whole is NOT exercised here: `crufty` refuses,
+    // and a mid-batch refusal currently leaves the entries before it applied and
+    // wedges the store (see `a_stale_precondition_rolls_back_the_earlier_entries`
+    // — a pre-existing rollback hole, not a directory-delete one). What the
+    // refusal itself does is covered by
+    // `deleting_a_directory_holding_an_untracked_file_is_refused`. So apply the
+    // subtree that can drain, which is what a sync converges to either way.
+    let drainable: Vec<String> = delete_paths
+        .iter()
+        .filter(|path| !path.starts_with("crufty"))
+        .cloned()
+        .collect();
+    let drain_modes =
+        ApplyStore::directory_modes(&root, project, drainable.iter().map(String::as_str)).unwrap();
+    let drain = build_directory_delete_plan(project, [49; 16], &drainable, &local, &drain_modes);
+    assert_eq!(drain.entries.len(), 2, "doomed/nested then doomed");
+    store.apply(&root, &cas, object_domain, &drain).unwrap();
+
+    // The fully-tracked subtree is gone, root and all.
+    assert!(!root.join("doomed").exists());
+    // The crufty one survives, with the untracked artifact intact — it was never
+    // applied, precisely because the planner marks it and the fingerprint would
+    // refuse it. Its tracked file did go: that delete committed in the leaf plan.
+    assert!(root.join("crufty").is_dir());
+    assert_eq!(fs::read(root.join("crufty/build.o")).unwrap(), b"artifact");
+    assert!(!root.join("crufty/tracked.txt").exists());
+    // Nothing outside the delete set moved.
+    assert_eq!(fs::read(root.join("keep.txt")).unwrap(), b"untouched");
 }
 
 #[test]

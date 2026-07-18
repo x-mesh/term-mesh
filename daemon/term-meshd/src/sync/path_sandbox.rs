@@ -34,6 +34,35 @@ pub struct PathFingerprint {
     pub symlink_target: Option<String>,
 }
 
+/// The fingerprint an EMPTY directory of `mode` produces.
+///
+/// A directory's fingerprint is recursive over its children, so it cannot be
+/// rebuilt from a manifest entry — but the childless case has no recursion left
+/// in it and is fully determined by the mode. That is exactly the precondition a
+/// directory delete needs: "still a directory, still this mode, and nothing is
+/// left inside it". Anything created under the path since the scan — including
+/// files the scanner never tracked — makes the real fingerprint differ, and the
+/// delete is refused rather than carrying that content off.
+///
+/// Kept in lockstep with `fingerprint_entry`'s `S_IFDIR` arm by
+/// `empty_directory_fingerprint_matches_a_real_one`, which fingerprints an
+/// actual empty directory and compares.
+pub fn empty_directory_fingerprint(mode: u16) -> PathFingerprint {
+    let mode = u32::from(mode) & 0o777;
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(DIRECTORY_DOMAIN);
+    hasher.update(&mode.to_be_bytes());
+    PathFingerprint {
+        kind: PathKind::Directory,
+        content_hash: *hasher.finalize().as_bytes(),
+        // `fingerprint_entry` reports a directory's length as the number of
+        // entries beneath it. Empty means zero.
+        length: 0,
+        executable: mode & 0o111 != 0,
+        symlink_target: None,
+    }
+}
+
 impl PathFingerprint {
     pub fn digest(&self) -> [u8; 32] {
         let mut hasher = blake3::Hasher::new();
@@ -452,6 +481,35 @@ impl PathSandbox {
         };
         let mut budget = FingerprintBudget::default();
         fingerprint_entry(self.work.as_raw_fd(), &name, stat, 0, &mut budget).map(Some)
+    }
+
+    /// The permission bits of `path` when it is a directory; `None` when it is
+    /// absent or is not one.
+    ///
+    /// A stat, deliberately — not a fingerprint. The caller needs a directory's
+    /// mode to build the precondition for deleting it, and at that moment the
+    /// directory still holds the children the same plan is about to remove, so
+    /// its real fingerprint is not yet the one the delete will be checked
+    /// against.
+    pub(crate) fn directory_mode(&self, path: &str) -> Result<Option<u16>, PathSandboxError> {
+        self.revalidate_root()?;
+        let (parent, name) = match self.open_parent(path, false) {
+            Ok(opened) => opened,
+            // An ancestor is gone, so the path is too. Same answer as a missing
+            // leaf: nothing here to delete.
+            Err(PathSandboxError::Io(error)) if error.kind() == io::ErrorKind::NotFound => {
+                return Ok(None)
+            }
+            Err(error) => return Err(error),
+        };
+        match stat_at(parent.as_raw_fd(), &name) {
+            Ok(stat) if stat.st_mode & libc::S_IFMT == libc::S_IFDIR => {
+                Ok(Some((stat.st_mode as u32 & 0o777) as u16))
+            }
+            Ok(_) => Ok(None),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error.into()),
+        }
     }
 
     pub(crate) fn target_identity(

@@ -275,6 +275,27 @@ impl ApplyStore {
         Ok(PathSandbox::open(root, project)?.fingerprint(relative_path)?)
     }
 
+    /// The permission bits of each of `relative_paths` that is a directory right
+    /// now. Paths that are absent, or are not directories, are simply missing
+    /// from the map — the caller reads that as "nothing to delete here".
+    ///
+    /// One sandbox for the whole batch, so a delete plan costs a single root
+    /// validation rather than one per path.
+    pub fn directory_modes<'a>(
+        root: &Path,
+        project: ProjectId,
+        relative_paths: impl IntoIterator<Item = &'a str>,
+    ) -> Result<BTreeMap<String, u16>, ApplyError> {
+        let sandbox = PathSandbox::open(root, project)?;
+        let mut modes = BTreeMap::new();
+        for path in relative_paths {
+            if let Some(mode) = sandbox.directory_mode(path)? {
+                modes.insert(path.to_owned(), mode);
+            }
+        }
+        Ok(modes)
+    }
+
     /// Record the last-synced BASE manifest for `project` — the converged state
     /// the next bidirectional sync three-way-compares local + remote against.
     pub fn save_base_manifest(

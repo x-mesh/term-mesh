@@ -19,8 +19,8 @@ use std::path::Path;
 use tokio::time::{timeout, Duration};
 
 use super::{
-    build_apply_plan, build_delete_plan, check_delete_guard, mode_matches_executable,
-    put_plaintext, ApplyStore, CasStore,
+    build_apply_plan, build_delete_plan, build_directory_delete_plan, check_delete_guard,
+    mode_matches_executable, put_plaintext, ApplyStore, CasStore,
     EncryptedChunk, EntryKind, FetchEntry,
     KeyId, ManifestEntry, ObjectDomain, ObjectId, ProjectId, ProjectKey, StreamLane, SyncConnection,
 };
@@ -616,6 +616,31 @@ async fn receive_push_inner(
             store
                 .apply(root, cas, domain, &delete_plan)
                 .map_err(|_| "push_apply_failed".to_string())?;
+        }
+
+        // Directories, once the leaves above are gone. Non-fatal for the same
+        // reason as on the initiator side: the precondition refuses a directory
+        // holding anything the scanner never tracked, and that must leave the
+        // path outstanding rather than fail every push forever.
+        let modes =
+            ApplyStore::directory_modes(root, project, delete_paths.iter().map(String::as_str))
+                .map_err(|_| "push_apply_failed".to_string())?;
+        let mut directory_id = [0u8; 16];
+        getrandom::getrandom(&mut directory_id).map_err(|_| "push_apply_failed".to_string())?;
+        let directory_plan =
+            build_directory_delete_plan(project, directory_id, &delete_paths, local, &modes);
+        if !directory_plan.entries.is_empty() {
+            let store = apply_store
+                .lock()
+                .map_err(|_| "push_apply_failed".to_string())?;
+            match store.apply(root, cas, domain, &directory_plan) {
+                Ok(_) => applied += directory_plan.entries.len() as u64,
+                Err(error) => tracing::warn!(
+                    ?error,
+                    directories = directory_plan.entries.len(),
+                    "directory delete refused; leaving the paths outstanding"
+                ),
+            }
         }
     }
     Ok(applied)

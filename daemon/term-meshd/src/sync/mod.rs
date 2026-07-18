@@ -106,7 +106,9 @@ pub use oplog::{
     TombstonePayload,
 };
 #[allow(unused_imports)]
-pub use path_sandbox::{PathFingerprint, PathKind, PathSandboxError};
+pub use path_sandbox::{
+    empty_directory_fingerprint, PathFingerprint, PathKind, PathSandboxError,
+};
 #[allow(unused_imports)]
 pub use reconcile::{
     BaselineCrashHook, BaselineInstallPhase, CompletedManifestHandle, FrontierRelation,
@@ -149,7 +151,7 @@ pub use provisioning::{
 };
 #[allow(unused_imports)]
 pub use plan::{
-    build_delete_plan, check_delete_guard,
+    build_delete_plan, build_directory_delete_plan, check_delete_guard,
     build_apply_plan, decode_entries, decode_manifest_batch, diff_manifests, encode_entries,
     encode_manifest_batches, reconcile_bidirectional, BidiPlan, ConflictPath, FetchEntry,
     ManifestDiff, ManifestWireError,

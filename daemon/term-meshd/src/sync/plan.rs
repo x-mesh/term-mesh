@@ -11,11 +11,11 @@
 //! transfers and a real `ApplyPlan`. The entry wire codec here is the minimal
 //! encoding the two peers swap their manifests over the SyncOperation lane.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use super::{
-    mode_matches_executable, ApplyAction, ApplyPlan, ApplyPlanEntry, ApplyPrecondition, EntryKind, ManifestEntry, ObjectId,
-    PathFingerprint, PathKind, ProjectId,
+    empty_directory_fingerprint, mode_matches_executable, ApplyAction, ApplyPlan, ApplyPlanEntry,
+    ApplyPrecondition, EntryKind, ManifestEntry, ObjectId, PathFingerprint, PathKind, ProjectId,
 };
 
 /// Upper bounds applied when decoding a peer's manifest (untrusted input).
@@ -380,12 +380,9 @@ pub fn check_delete_guard(deletes: usize, present: usize) -> Result<(), String> 
     Ok(())
 }
 
-/// An [`ApplyPlan`] that removes `paths` from the working tree.
-///
-/// Only files and symlinks. A directory's precondition cannot be derived from a
-/// manifest entry, and removing one by its CURRENT state would carry off anything
-/// created inside it since the scan — so an emptied directory is left in place
-/// (it stays listed and simply re-appears as a no-op delete on later syncs).
+/// An [`ApplyPlan`] that removes the file and symlink `paths` from the working
+/// tree. Directories are [`build_directory_delete_plan`]'s job and must be
+/// applied AFTER this one, so a directory is empty by the time it is removed.
 ///
 /// Each precondition is the entry's state as the manifest recorded it, so a path
 /// modified between the scan and the apply is refused rather than deleted.
@@ -403,7 +400,8 @@ pub fn build_delete_plan(
         .iter()
         .filter_map(|path| {
             let entry = local_by_path.get(path.as_str())?;
-            // Absent locally already: nothing to remove.
+            // Absent locally already: nothing to remove. A directory yields no
+            // manifest fingerprint and is handled by the directory plan.
             let fingerprint = manifest_fingerprint(entry)?;
             Some(ApplyPlanEntry {
                 relative_path: path.clone(),
@@ -413,6 +411,73 @@ pub fn build_delete_plan(
         })
         .collect();
     entries.sort_by(|a, b| a.relative_path.cmp(&b.relative_path));
+    ApplyPlan {
+        operation_id,
+        project,
+        target_manifest_root: [0; 32],
+        frontier: Vec::new(),
+        entries,
+    }
+}
+
+/// An [`ApplyPlan`] that removes the directory `paths` from the working tree,
+/// deepest first. Apply it AFTER [`build_delete_plan`] — a directory can only go
+/// once the leaves inside it have.
+///
+/// `directory_modes` is each path's CURRENT mode on disk (see
+/// [`ApplyStore::directory_modes`](super::ApplyStore::directory_modes)); the
+/// precondition is the fingerprint of an EMPTY directory carrying it. So the
+/// delete lands only when nothing is left inside, and anything the scanner never
+/// tracked — a build artifact, a `.DS_Store`, a file created since the scan —
+/// makes the fingerprint differ and saves the directory instead of sweeping it
+/// away with a rename.
+///
+/// Two filters keep that refusal rare rather than routine. A directory is only
+/// planned when every tracked entry beneath it is being deleted in the same
+/// batch, which is a pure manifest question answered here; the fingerprint then
+/// covers what the manifest could not see. A directory left out either way stays
+/// listed and re-appears as an outstanding delete on the next sync.
+pub fn build_directory_delete_plan(
+    project: ProjectId,
+    operation_id: [u8; 16],
+    paths: &[String],
+    local: &[ManifestEntry],
+    directory_modes: &BTreeMap<String, u16>,
+) -> ApplyPlan {
+    let deleting: HashSet<&str> = paths.iter().map(String::as_str).collect();
+    let local_by_path: HashMap<&str, &ManifestEntry> = local
+        .iter()
+        .map(|entry| (entry.relative_path.as_str(), entry))
+        .collect();
+    let mut entries: Vec<ApplyPlanEntry> = paths
+        .iter()
+        .filter_map(|path| {
+            let entry = local_by_path.get(path.as_str())?;
+            if entry.kind != EntryKind::Directory {
+                return None;
+            }
+            // Every tracked path inside it must be going too, or the directory
+            // cannot end up empty and the delete would only fail at apply.
+            let prefix = format!("{path}/");
+            let survivor = local.iter().any(|candidate| {
+                candidate.relative_path.starts_with(&prefix)
+                    && !deleting.contains(candidate.relative_path.as_str())
+            });
+            if survivor {
+                return None;
+            }
+            // Not a directory on disk any more (or gone): leave it outstanding.
+            let mode = *directory_modes.get(path.as_str())?;
+            Some(ApplyPlanEntry {
+                relative_path: path.clone(),
+                action: ApplyAction::Delete,
+                precondition: ApplyPrecondition::Present(empty_directory_fingerprint(mode)),
+            })
+        })
+        .collect();
+    // Descending, so every descendant precedes its ancestor: a path is a strict
+    // prefix of anything beneath it, and a prefix always sorts first.
+    entries.sort_by(|a, b| b.relative_path.cmp(&a.relative_path));
     ApplyPlan {
         operation_id,
         project,
@@ -774,6 +839,108 @@ mod tests {
             plan.entries[0].precondition,
             ApplyPrecondition::Present(_)
         ));
+    }
+
+    fn modes(paths: &[(&str, u16)]) -> BTreeMap<String, u16> {
+        paths
+            .iter()
+            .map(|(path, mode)| ((*path).to_string(), *mode))
+            .collect()
+    }
+
+    #[test]
+    fn directory_delete_plan_orders_children_before_their_parents() {
+        let local = vec![
+            dir("a"),
+            dir("a/b"),
+            dir("a/b/c"),
+            file("a/b/c/leaf", 1, false),
+        ];
+        let paths = vec![
+            "a".to_string(),
+            "a/b".to_string(),
+            "a/b/c".to_string(),
+            "a/b/c/leaf".to_string(),
+        ];
+        let plan = build_directory_delete_plan(
+            ProjectId::from_bytes([7; 32]),
+            [1; 16],
+            &paths,
+            &local,
+            &modes(&[("a", 0o755), ("a/b", 0o755), ("a/b/c", 0o700)]),
+        );
+
+        // Deepest first. The reverse order would leave every parent non-empty at
+        // the moment it is removed, so each delete would be refused.
+        let ordered: Vec<&str> = plan
+            .entries
+            .iter()
+            .map(|entry| entry.relative_path.as_str())
+            .collect();
+        assert_eq!(ordered, ["a/b/c", "a/b", "a"]);
+        // The file is the leaf plan's job, not this one's.
+        assert!(!ordered.contains(&"a/b/c/leaf"));
+    }
+
+    #[test]
+    fn directory_delete_plan_skips_a_directory_something_tracked_survives_in() {
+        let local = vec![dir("keep"), file("keep/stays", 1, false), dir("go")];
+        // Only the directories are being deleted — `keep/stays` is not, so
+        // `keep` cannot end up empty and must not be planned.
+        let paths = vec!["keep".to_string(), "go".to_string()];
+        let plan = build_directory_delete_plan(
+            ProjectId::from_bytes([7; 32]),
+            [1; 16],
+            &paths,
+            &local,
+            &modes(&[("keep", 0o755), ("go", 0o755)]),
+        );
+
+        let ordered: Vec<&str> = plan
+            .entries
+            .iter()
+            .map(|entry| entry.relative_path.as_str())
+            .collect();
+        assert_eq!(ordered, ["go"]);
+    }
+
+    #[test]
+    fn directory_delete_plan_skips_a_path_that_is_no_longer_a_directory() {
+        let local = vec![dir("gone"), dir("swapped")];
+        let paths = vec!["gone".to_string(), "swapped".to_string()];
+        // `gone` vanished and `swapped` is a file now, so neither reports a
+        // directory mode. Both stay outstanding rather than being planned
+        // against a precondition that could never match.
+        let plan = build_directory_delete_plan(
+            ProjectId::from_bytes([7; 32]),
+            [1; 16],
+            &paths,
+            &local,
+            &modes(&[]),
+        );
+        assert!(plan.entries.is_empty());
+    }
+
+    #[test]
+    fn directory_delete_plan_preconditions_on_an_empty_directory_of_that_mode() {
+        let local = vec![dir("d")];
+        let paths = vec!["d".to_string()];
+        let plan = build_directory_delete_plan(
+            ProjectId::from_bytes([7; 32]),
+            [1; 16],
+            &paths,
+            &local,
+            &modes(&[("d", 0o750)]),
+        );
+
+        assert_eq!(plan.entries.len(), 1);
+        let ApplyPrecondition::Present(fingerprint) = &plan.entries[0].precondition else {
+            panic!("a directory delete must be preconditioned on its current state");
+        };
+        // Not just "is a directory": the mode is bound too, and the fingerprint
+        // is the EMPTY one, so anything left inside refuses the delete.
+        assert_eq!(*fingerprint, empty_directory_fingerprint(0o750));
+        assert_ne!(*fingerprint, empty_directory_fingerprint(0o755));
     }
 
     #[test]
