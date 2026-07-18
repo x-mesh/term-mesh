@@ -273,10 +273,7 @@ pub async fn serve(
     let project_registry = Arc::new(crate::sync::ProjectRegistry::open(
         crate::sync::default_registry_db_path(),
     )?);
-    let operation_manager = crate::sync::OperationManager::open(
-        crate::sync::default_operation_db_path(),
-        project_registry.clone(),
-    )?;
+    let operation_manager = build_sync_operation_manager(project_registry.clone())?;
     let ctx = Arc::new(Context {
         monitor_rx,
         monitor_handle,
@@ -3615,6 +3612,53 @@ async fn handle_sync_bootstrap_trust(
         "roster_size": roster_size,
         "peers_size": peers_size,
     }))
+}
+
+/// Build the `OperationManager` with the network sync transport wired in (P0).
+///
+/// On macOS the transport resolves each project's `SyncContext` from the keychain
+/// + provisioning + per-project stores (`ProvisioningSyncContextProvider`) and
+/// peer addresses from the provisioning address book, so `sync.start` with a peer
+/// over a bootstrapped project actually dials and syncs. A project not
+/// provisioned for sync fails cleanly (`sync_project_not_provisioned`); peerless
+/// scan operations are unaffected (the composite runner routes them to the scan
+/// runner). Off macOS there is no keychain backend yet, so the manager opens
+/// without a transport and peer syncs report `sync_transport_not_configured`.
+fn build_sync_operation_manager(
+    project_registry: Arc<crate::sync::ProjectRegistry>,
+) -> anyhow::Result<crate::sync::OperationManager> {
+    let operation_db = crate::sync::default_operation_db_path();
+    #[cfg(target_os = "macos")]
+    {
+        let keychain: Arc<dyn crate::sync::KeychainBackend> = Arc::new(crate::sync::MacOsKeychain);
+        let provisioning = Arc::new(
+            crate::sync::SyncProvisioningStore::open(crate::sync::default_provisioning_db_path())
+                .map_err(|error| anyhow::anyhow!("open sync provisioning store: {error:?}"))?,
+        );
+        let provider = Arc::new(crate::sync::ProvisioningSyncContextProvider::new(
+            keychain,
+            provisioning.clone(),
+            crate::sync::default_sync_state_root(),
+        ));
+        let resolver = Arc::new(crate::sync::ProvisioningPeerResolver::new(provisioning));
+        let runner = Arc::new(crate::sync::NetworkSyncRunner::new(
+            provider,
+            resolver,
+            tokio::runtime::Handle::current(),
+        ));
+        Ok(crate::sync::OperationManager::open_with_sync_transport(
+            operation_db,
+            project_registry,
+            runner,
+        )?)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        Ok(crate::sync::OperationManager::open(
+            operation_db,
+            project_registry,
+        )?)
+    }
 }
 
 fn parse_project_id(value: &str) -> Result<crate::sync::ProjectId, String> {
