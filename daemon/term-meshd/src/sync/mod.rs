@@ -140,7 +140,8 @@ pub use provisioning::{
 #[allow(unused_imports)]
 pub use plan::{
     build_apply_plan, decode_entries, decode_manifest_batch, diff_manifests, encode_entries,
-    encode_manifest_batches, FetchEntry, ManifestDiff, ManifestWireError,
+    encode_manifest_batches, reconcile_bidirectional, BidiPlan, ConflictPath, FetchEntry,
+    ManifestDiff, ManifestWireError,
 };
 #[allow(unused_imports)]
 pub use sync_connection::{SyncConnection, SyncConnectionError};

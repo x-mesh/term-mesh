@@ -101,6 +101,123 @@ fn fetch_of(entry: &ManifestEntry) -> FetchEntry {
     }
 }
 
+/// One path that diverged on BOTH sides since the base — a conflict. Carries the
+/// three manifest states (`None` = absent) so the resolver can three-way merge or
+/// preserve both.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConflictPath {
+    pub relative_path: String,
+    pub base: Option<FetchEntry>,
+    pub local: Option<FetchEntry>,
+    pub remote: Option<FetchEntry>,
+}
+
+/// A bidirectional reconciliation from a three-way comparison of the last-synced
+/// BASE manifest, the LOCAL tree, and the REMOTE tree. Where [`diff_manifests`]
+/// is one-way (local converges to remote), this converges BOTH sides and flags
+/// paths that changed divergently on both as conflicts — never last-writer-wins.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct BidiPlan {
+    /// Remote-only changes the local tree pulls (local ← remote).
+    pub fetch: Vec<FetchEntry>,
+    /// Local-only changes the remote receives (remote ← local).
+    pub push: Vec<FetchEntry>,
+    /// Paths deleted locally that the remote must also delete.
+    pub delete_remote: Vec<String>,
+    /// Paths deleted remotely that the local must also delete.
+    pub delete_local: Vec<String>,
+    /// Paths changed on both sides since the base.
+    pub conflicts: Vec<ConflictPath>,
+}
+
+impl BidiPlan {
+    pub fn is_empty(&self) -> bool {
+        self.fetch.is_empty()
+            && self.push.is_empty()
+            && self.delete_remote.is_empty()
+            && self.delete_local.is_empty()
+            && self.conflicts.is_empty()
+    }
+}
+
+fn index_by_path(entries: &[ManifestEntry]) -> HashMap<&str, &ManifestEntry> {
+    entries
+        .iter()
+        .map(|entry| (entry.relative_path.as_str(), entry))
+        .collect()
+}
+
+/// Two optional manifest states are "equal" when both are absent or both present
+/// with identical entries. A change is any inequality.
+fn manifest_state_eq(a: Option<&ManifestEntry>, b: Option<&ManifestEntry>) -> bool {
+    match (a, b) {
+        (None, None) => true,
+        (Some(x), Some(y)) => x == y,
+        _ => false,
+    }
+}
+
+/// Reconcile `local` and `remote` against their last-synced `base`. Each path in
+/// the union of the three is classified:
+/// - `local` and `remote` already equal → converged (skip);
+/// - only `remote` changed since base → fetch (present) or delete-local (gone);
+/// - only `local` changed since base → push (present) or delete-remote (gone);
+/// - both changed since base → conflict (carries base/local/remote states).
+///
+/// Output is path-sorted for deterministic results independent of scan order.
+/// The base being empty makes every add on either side a candidate: an add on one
+/// side alone is a push/fetch, an add of the SAME path on both is a conflict.
+pub fn reconcile_bidirectional(
+    base: &[ManifestEntry],
+    local: &[ManifestEntry],
+    remote: &[ManifestEntry],
+) -> BidiPlan {
+    let base_by = index_by_path(base);
+    let local_by = index_by_path(local);
+    let remote_by = index_by_path(remote);
+
+    let mut paths: Vec<&str> = base_by
+        .keys()
+        .chain(local_by.keys())
+        .chain(remote_by.keys())
+        .copied()
+        .collect();
+    paths.sort_unstable();
+    paths.dedup();
+
+    let mut plan = BidiPlan::default();
+    for path in paths {
+        let base_entry = base_by.get(path).copied();
+        let local_entry = local_by.get(path).copied();
+        let remote_entry = remote_by.get(path).copied();
+
+        if manifest_state_eq(local_entry, remote_entry) {
+            continue; // already converged (equal, or both absent)
+        }
+        let local_changed = !manifest_state_eq(base_entry, local_entry);
+        let remote_changed = !manifest_state_eq(base_entry, remote_entry);
+        match (local_changed, remote_changed) {
+            (true, true) => plan.conflicts.push(ConflictPath {
+                relative_path: path.to_string(),
+                base: base_entry.map(fetch_of),
+                local: local_entry.map(fetch_of),
+                remote: remote_entry.map(fetch_of),
+            }),
+            (false, true) => match remote_entry {
+                Some(entry) => plan.fetch.push(fetch_of(entry)),
+                None => plan.delete_local.push(path.to_string()),
+            },
+            (true, false) => match local_entry {
+                Some(entry) => plan.push.push(fetch_of(entry)),
+                None => plan.delete_remote.push(path.to_string()),
+            },
+            // local==base && remote==base ⇒ local==remote, excluded above.
+            (false, false) => {}
+        }
+    }
+    plan
+}
+
 /// The precondition [`PathFingerprint`] a locally-present manifest `entry` must
 /// still match for an overwrite to be safe. A file's manifest hash is the plain
 /// BLAKE3 of its bytes and a symlink's is the plain BLAKE3 of its target, both
@@ -421,6 +538,90 @@ mod tests {
             content_hash: [0; 32],
             symlink_target: None,
         }
+    }
+
+    fn paths(entries: &[FetchEntry]) -> Vec<&str> {
+        entries.iter().map(|e| e.relative_path.as_str()).collect()
+    }
+
+    #[test]
+    fn bidi_converged_is_empty() {
+        let m = vec![file("a", 1, false), file("b", 2, false)];
+        assert!(reconcile_bidirectional(&m, &m, &m).is_empty());
+    }
+
+    #[test]
+    fn bidi_remote_only_change_fetches_local_only_change_pushes() {
+        let base = vec![file("a", 1, false), file("b", 1, false)];
+        // local changed b; remote changed a; base is the common ancestor.
+        let local = vec![file("a", 1, false), file("b", 9, false)];
+        let remote = vec![file("a", 9, false), file("b", 1, false)];
+        let plan = reconcile_bidirectional(&base, &local, &remote);
+        assert_eq!(paths(&plan.fetch), ["a"], "remote-only change → fetch");
+        assert_eq!(paths(&plan.push), ["b"], "local-only change → push");
+        assert!(plan.conflicts.is_empty());
+    }
+
+    #[test]
+    fn bidi_add_on_one_side_only() {
+        // base empty; local added a, remote added b → push a, fetch b (no conflict).
+        let plan = reconcile_bidirectional(&[], &[file("a", 1, false)], &[file("b", 2, false)]);
+        assert_eq!(paths(&plan.push), ["a"]);
+        assert_eq!(paths(&plan.fetch), ["b"]);
+        assert!(plan.conflicts.is_empty());
+    }
+
+    #[test]
+    fn bidi_both_change_same_path_conflicts() {
+        let base = vec![file("a", 1, false)];
+        let local = vec![file("a", 2, false)];
+        let remote = vec![file("a", 3, false)];
+        let plan = reconcile_bidirectional(&base, &local, &remote);
+        assert!(plan.fetch.is_empty() && plan.push.is_empty());
+        assert_eq!(plan.conflicts.len(), 1);
+        let c = &plan.conflicts[0];
+        assert_eq!(c.relative_path, "a");
+        assert_eq!(c.base.as_ref().unwrap().content_hash, [1; 32]);
+        assert_eq!(c.local.as_ref().unwrap().content_hash, [2; 32]);
+        assert_eq!(c.remote.as_ref().unwrap().content_hash, [3; 32]);
+    }
+
+    #[test]
+    fn bidi_add_add_same_path_different_content_conflicts() {
+        // no base; both added the same path with different content.
+        let plan = reconcile_bidirectional(&[], &[file("a", 2, false)], &[file("a", 3, false)]);
+        assert_eq!(plan.conflicts.len(), 1);
+        assert!(plan.conflicts[0].base.is_none());
+    }
+
+    #[test]
+    fn bidi_delete_propagates_both_directions() {
+        let base = vec![file("a", 1, false), file("b", 1, false)];
+        // local deleted a; remote deleted b (each the other still has).
+        let local = vec![file("b", 1, false)];
+        let remote = vec![file("a", 1, false)];
+        let plan = reconcile_bidirectional(&base, &local, &remote);
+        assert_eq!(plan.delete_remote, ["a"], "local deleted a → remote deletes a");
+        assert_eq!(plan.delete_local, ["b"], "remote deleted b → local deletes b");
+        assert!(plan.conflicts.is_empty() && plan.fetch.is_empty() && plan.push.is_empty());
+    }
+
+    #[test]
+    fn bidi_delete_modify_conflicts() {
+        let base = vec![file("a", 1, false)];
+        // local deleted a; remote modified a → both changed → conflict.
+        let plan = reconcile_bidirectional(&base, &[], &[file("a", 9, false)]);
+        assert_eq!(plan.conflicts.len(), 1);
+        let c = &plan.conflicts[0];
+        assert!(c.local.is_none() && c.remote.is_some());
+    }
+
+    #[test]
+    fn bidi_both_made_same_change_is_converged() {
+        let base = vec![file("a", 1, false)];
+        let same = vec![file("a", 5, false)];
+        // both independently changed a to the SAME content → nothing to do.
+        assert!(reconcile_bidirectional(&base, &same, &same).is_empty());
     }
 
     #[test]
