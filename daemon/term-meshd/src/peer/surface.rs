@@ -581,6 +581,24 @@ impl PtySurface {
         Ok(())
     }
 
+    /// True when the shell has handed the terminal's foreground process
+    /// group to a child — i.e. a command is running — and false when the
+    /// shell sits at its prompt (idle) or the child is gone.
+    ///
+    /// `forkpty` makes our child a session leader, so its pgid == its pid;
+    /// a foreground command runs in a different pgrp that the shell
+    /// `tcsetpgrp`s onto the master. So `tcgetpgrp(master) != shell_pid`
+    /// means "busy". One syscall, no stored state, evaluated at snapshot
+    /// time only (ListWorkspaces / layout push) — never polled.
+    pub fn is_busy(&self) -> bool {
+        let shell_pgid = match self.child.lock() {
+            Ok(child) if child.state == ChildState::Running => child.pid,
+            _ => return false,
+        };
+        let fg = unsafe { libc::tcgetpgrp(self.master_fd) };
+        fg > 0 && fg != shell_pgid
+    }
+
     pub fn info(&self) -> SurfaceInfo {
         SurfaceInfo {
             surface_id: self.surface_id.clone(),

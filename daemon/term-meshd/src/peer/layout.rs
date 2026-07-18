@@ -420,14 +420,18 @@ impl LayoutStore {
     /// metadata) so the tree and the wire never disagree about shape.
     pub fn snapshot_proto(&self, manager: &PtyManager) -> Option<WorkspaceLayout> {
         // One list() = one manager lock acquisition for the whole tree.
-        let meta: std::collections::HashMap<SurfaceId, (String, u32, u32, String)> = manager
+        // Tuple carries (title, cols, rows, cwd, busy). `busy` is the
+        // active surface's foreground-process state; computed here (one
+        // tcgetpgrp per live surface) so it rides the SAME snapshot the
+        // wire already builds — no separate polling path.
+        let meta: std::collections::HashMap<SurfaceId, (String, u32, u32, String, bool)> = manager
             .list()
             .into_iter()
             .map(|s| {
                 let info = s.info();
                 (
                     info.surface_id.clone(),
-                    (info.title, info.cols, info.rows, info.cwd),
+                    (info.title, info.cols, info.rows, info.cwd, s.is_busy()),
                 )
             })
             .collect();
@@ -436,14 +440,14 @@ impl LayoutStore {
 
     fn node_to_proto(
         node: &LayoutNode,
-        meta_map: &std::collections::HashMap<SurfaceId, (String, u32, u32, String)>,
+        meta_map: &std::collections::HashMap<SurfaceId, (String, u32, u32, String, bool)>,
     ) -> WorkspaceLayout {
         match node {
             LayoutNode::Pane { active, tabs } => {
-                let meta = |sid: &SurfaceId| -> (String, u32, u32, String) {
+                let meta = |sid: &SurfaceId| -> (String, u32, u32, String, bool) {
                     meta_map.get(sid).cloned().unwrap_or_default()
                 };
-                let (title, cols, rows, cwd) = meta(active);
+                let (title, cols, rows, cwd, busy) = meta(active);
                 WorkspaceLayout {
                     node: Some(workspace_layout::Node::Pane(WorkspacePane {
                         surface_id: active.clone(),
@@ -458,6 +462,7 @@ impl LayoutStore {
                                 title: meta(sid).0,
                             })
                             .collect(),
+                        busy,
                     })),
                 }
             }

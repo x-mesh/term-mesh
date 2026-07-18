@@ -405,6 +405,15 @@ message WorkspacePane {
   // ask the host to switch the active tab via
   // WorkspaceControl.activate_tab.
   repeated PaneTab tabs = 6;
+  // Activity indicator: true when the pane's ACTIVE surface has a
+  // foreground process group distinct from its shell — i.e. a command is
+  // running — and false when the shell sits at its prompt (idle). Derived
+  // host-side from tcgetpgrp(pty_master) != shell_pgid at serialization
+  // time (ListWorkspaces + every WorkspaceLayoutChanged push), so it costs
+  // one syscall per pane on an event that already fires — no polling.
+  // Field-additive and backward compatible: hosts that predate this leave
+  // it false, which clients render as idle.
+  bool busy = 7;
 }
 
 message PaneTab {

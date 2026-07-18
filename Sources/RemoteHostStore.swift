@@ -16,6 +16,38 @@ struct WorkspaceSummary: Identifiable, Equatable {
     /// The daemon's protected default workspace — delete is refused on
     /// the host (IsDefault), so the sidebar disables the affordance.
     let isDefault: Bool
+    /// Leaf panes in this workspace's layout tree.
+    let paneCount: Int
+    /// Surfaces (Σ tabs across leaf panes; a leaf always has ≥1).
+    let surfaceCount: Int
+    /// Leaf panes whose active surface is busy (a foreground command is
+    /// running). 0 on hosts that predate the `busy` field.
+    let busyCount: Int
+}
+
+/// Fold a peer workspace layout tree into (panes, surfaces, busy panes).
+/// The tree comes free with every `ListWorkspaces` roster fetch, so these
+/// counts cost nothing beyond a walk — no extra RPC, no host change.
+func peerLayoutCounts(
+    _ layout: Termmesh_Peer_V1_WorkspaceLayout?
+) -> (panes: Int, surfaces: Int, busy: Int) {
+    func walk(_ node: Termmesh_Peer_V1_WorkspaceLayout) -> (Int, Int, Int) {
+        switch node.node {
+        case .pane(let p):
+            // tabs includes the active surface, so its count is the pane's
+            // surface count; a well-formed leaf never has zero.
+            return (1, max(p.tabs.count, 1), p.busy ? 1 : 0)
+        case .split(let s):
+            let a = walk(s.first)
+            let b = walk(s.second)
+            return (a.0 + b.0, a.1 + b.1, a.2 + b.2)
+        case .none:
+            return (0, 0, 0)
+        }
+    }
+    guard let layout else { return (0, 0, 0) }
+    let r = walk(layout)
+    return (r.0, r.1, r.2)
 }
 
 /// Human label for a host window in the peer workspace UI. Uses the window's
@@ -475,14 +507,18 @@ final class RemoteHostStore: ObservableObject {
                 if Task.isCancelled || self.hosts[key]?.activeSockPath != path {
                     return
                 }
-                let summaries = workspaces.map {
-                    WorkspaceSummary(
-                        id: $0.workspaceID,
-                        title: $0.title.isEmpty ? "<workspace>" : $0.title,
+                let summaries = workspaces.map { ws -> WorkspaceSummary in
+                    let counts = peerLayoutCounts(ws.hasLayout ? ws.layout : nil)
+                    return WorkspaceSummary(
+                        id: ws.workspaceID,
+                        title: ws.title.isEmpty ? "<workspace>" : ws.title,
                         hostSockPath: path,
-                        windowID: $0.windowID,
-                        windowTitle: $0.windowTitle,
-                        isDefault: $0.isDefault
+                        windowID: ws.windowID,
+                        windowTitle: ws.windowTitle,
+                        isDefault: ws.isDefault,
+                        paneCount: counts.panes,
+                        surfaceCount: counts.surfaces,
+                        busyCount: counts.busy
                     )
                 }
                 self.hosts[key]?.workspaces = summaries

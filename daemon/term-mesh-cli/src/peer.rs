@@ -21,10 +21,12 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use peer_proto::v1::envelope::Payload;
+use peer_proto::v1::workspace_layout::Node as LayoutNode;
 use peer_proto::v1::{
     AttachMode, AttachSurface, Auth, EnsureSurfaceRequest, EnsureSurfaceResponse,
     EnsureSurfaceRestartPolicy, EnsureSurfaceResult, Envelope, Goodbye, Hello, Input, ListSurfaces,
-    Resize, TerminateSurfaceRequest, TerminateSurfaceResponse, TerminateSurfaceResult,
+    ListWorkspaces, Resize, TerminateSurfaceRequest, TerminateSurfaceResponse,
+    TerminateSurfaceResult, Workspace, WorkspaceLayout,
 };
 use peer_proto::{capability, PeerCapabilities, MAX_FRAME_BYTES};
 use prost::Message;
@@ -1188,6 +1190,280 @@ pub fn list_cmd(socket_path: &Path) -> anyhow::Result<()> {
         );
     }
     Ok(())
+}
+
+/// Candidate paths for THIS host's own peer socket, in priority order —
+/// the local counterpart to `REMOTE_SOCKET_PROBE` (which runs over ssh).
+fn probe_local_peer_socket() -> anyhow::Result<PathBuf> {
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    if let Ok(p) = std::env::var("TERMMESH_PEER_SOCKET") {
+        if !p.is_empty() {
+            candidates.push(PathBuf::from(p));
+        }
+    }
+    if let Ok(home) = std::env::var("HOME") {
+        let env_file = PathBuf::from(&home).join(".config/term-mesh/peer.env");
+        if let Ok(contents) = std::fs::read_to_string(&env_file) {
+            // Last assignment wins, matching the remote probe's `tail -n 1`.
+            if let Some(v) = contents
+                .lines()
+                .filter_map(|l| l.strip_prefix("TERMMESH_PEER_SOCKET="))
+                .last()
+            {
+                let v = v.trim().trim_matches('"');
+                if !v.is_empty() {
+                    candidates.push(PathBuf::from(v));
+                }
+            }
+        }
+    }
+    if let Ok(xdg) = std::env::var("XDG_RUNTIME_DIR") {
+        if !xdg.is_empty() {
+            candidates.push(PathBuf::from(xdg).join("tm-peer.sock"));
+        }
+    }
+    let uid = unsafe { libc::getuid() };
+    candidates.push(PathBuf::from(format!("/run/user/{uid}/tm-peer.sock")));
+    candidates.push(PathBuf::from(format!("/tmp/term-mesh-peer-{uid}/peer.sock")));
+
+    for c in &candidates {
+        if std::fs::metadata(c)
+            .map(|m| m.file_type().is_socket())
+            .unwrap_or(false)
+        {
+            return Ok(c.clone());
+        }
+    }
+    anyhow::bail!(
+        "no term-mesh peer socket found (looked at TERMMESH_PEER_SOCKET, \
+         ~/.config/term-mesh/peer.env, $XDG_RUNTIME_DIR/tm-peer.sock, \
+         /run/user/{uid}/tm-peer.sock, /tmp/term-mesh-peer-{uid}/peer.sock) — \
+         is term-meshd running with peer federation enabled?"
+    )
+}
+
+/// Roster query: ListWorkspaces -> WorkspaceList, skipping any layout
+/// push the host may interleave before the reply lands.
+fn list_workspaces(
+    read_stream: &mut UnixStream,
+    write_stream: &mut UnixStream,
+    seq: &AtomicU64,
+) -> anyhow::Result<Vec<Workspace>> {
+    write_envelope(
+        write_stream,
+        &Envelope {
+            seq: next_seq(seq),
+            correlation_id: 0,
+            payload: Some(Payload::ListWorkspaces(ListWorkspaces {})),
+        },
+    )?;
+    loop {
+        let reply = read_envelope(read_stream)?;
+        match reply.payload {
+            Some(Payload::WorkspaceList(wl)) => return Ok(wl.workspaces),
+            // A fresh connection can see a proactive WorkspaceLayoutChanged
+            // push before our reply; skip anything that is not the answer.
+            Some(_) => continue,
+            None => anyhow::bail!("empty envelope while awaiting WorkspaceList"),
+        }
+    }
+}
+
+#[derive(Default, Clone, Copy)]
+struct WsCounts {
+    panes: u32,
+    surfaces: u32,
+    busy: u32,
+}
+
+/// Fold a workspace's split tree into (panes, surfaces, busy panes).
+fn count_layout(layout: &Option<WorkspaceLayout>) -> WsCounts {
+    fn walk(node: &WorkspaceLayout, c: &mut WsCounts) {
+        match &node.node {
+            Some(LayoutNode::Pane(p)) => {
+                c.panes += 1;
+                // tabs always includes the active surface, so its length is
+                // the surface count for this pane; guard the empty case.
+                c.surfaces += (p.tabs.len().max(1)) as u32;
+                if p.busy {
+                    c.busy += 1;
+                }
+            }
+            Some(LayoutNode::Split(s)) => {
+                if let Some(f) = s.first.as_deref() {
+                    walk(f, c);
+                }
+                if let Some(sec) = s.second.as_deref() {
+                    walk(sec, c);
+                }
+            }
+            None => {}
+        }
+    }
+    let mut c = WsCounts::default();
+    if let Some(l) = layout {
+        walk(l, &mut c);
+    }
+    c
+}
+
+fn print_layout_tree(layout: &Option<WorkspaceLayout>, indent: usize) {
+    fn walk(node: &WorkspaceLayout, indent: usize) {
+        let pad = "  ".repeat(indent);
+        match &node.node {
+            Some(LayoutNode::Pane(p)) => {
+                let busy = if p.busy { "● busy" } else { "○ idle" };
+                let title = if p.title.is_empty() {
+                    "-"
+                } else {
+                    p.title.as_str()
+                };
+                let cwd = if p.cwd.is_empty() {
+                    String::new()
+                } else {
+                    format!("  {}", p.cwd)
+                };
+                let tabs = p.tabs.len().max(1);
+                println!(
+                    "{pad}{busy}  {title}  ({tabs} tab{s}){cwd}  [{id}]",
+                    s = if tabs == 1 { "" } else { "s" },
+                    id = hex_short(&p.surface_id),
+                );
+            }
+            Some(LayoutNode::Split(s)) => {
+                println!("{pad}⊟ split ({})", s.orientation);
+                if let Some(f) = s.first.as_deref() {
+                    walk(f, indent + 1);
+                }
+                if let Some(sec) = s.second.as_deref() {
+                    walk(sec, indent + 1);
+                }
+            }
+            None => {}
+        }
+    }
+    match layout {
+        Some(l) => walk(l, indent),
+        None => println!("{}(empty)", "  ".repeat(indent)),
+    }
+}
+
+fn truncate_str(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        s.to_string()
+    } else {
+        let mut out: String = s.chars().take(max.saturating_sub(1)).collect();
+        out.push('…');
+        out
+    }
+}
+
+/// `tm-agent ls` — inventory of THIS host's daemon: every workspace and,
+/// per workspace, its pane / surface / busy counts. One-shot local peer
+/// query against the daemon's own peer socket (no ssh, no daemon change).
+pub fn ls_cmd(socket_path: &Path, json_out: bool, tree: bool) -> anyhow::Result<()> {
+    let (mut read_stream, mut write_stream, seq, _caps) =
+        connect_and_authenticate(socket_path, /* emit_banners */ false)?;
+    let workspaces = list_workspaces(&mut read_stream, &mut write_stream, &seq)?;
+
+    let mut total = WsCounts::default();
+    let rows: Vec<(&Workspace, WsCounts)> = workspaces
+        .iter()
+        .map(|w| {
+            let c = count_layout(&w.layout);
+            total.panes += c.panes;
+            total.surfaces += c.surfaces;
+            total.busy += c.busy;
+            (w, c)
+        })
+        .collect();
+
+    if json_out {
+        let items: Vec<Value> = rows
+            .iter()
+            .map(|(w, c)| {
+                json!({
+                    "id": hex_short(&w.workspace_id),
+                    "title": w.title,
+                    "panes": c.panes,
+                    "surfaces": c.surfaces,
+                    "busy": c.busy,
+                    "default": w.is_default,
+                })
+            })
+            .collect();
+        let out = json!({
+            "workspaces": workspaces.len(),
+            "panes": total.panes,
+            "surfaces": total.surfaces,
+            "busy": total.busy,
+            "items": items,
+        });
+        println!("{}", serde_json::to_string_pretty(&out)?);
+        return Ok(());
+    }
+
+    println!(
+        "term-meshd — {} workspace{} · {} panes · {} surfaces · {} busy",
+        workspaces.len(),
+        if workspaces.len() == 1 { "" } else { "s" },
+        total.panes,
+        total.surfaces,
+        total.busy,
+    );
+    if workspaces.is_empty() {
+        return Ok(());
+    }
+    println!(
+        "{:<24} {:>5} {:>8} {:>4}  {}",
+        "WORKSPACE", "PANES", "SURFACES", "BUSY", "DEFAULT"
+    );
+    for (w, c) in &rows {
+        let title = if w.title.is_empty() {
+            "<untitled>"
+        } else {
+            w.title.as_str()
+        };
+        println!(
+            "{title:<24} {panes:>5} {surf:>8} {busy:>4}  {def}",
+            title = truncate_str(title, 24),
+            panes = c.panes,
+            surf = c.surfaces,
+            busy = c.busy,
+            def = if w.is_default { "*" } else { "" },
+        );
+    }
+    if tree {
+        for (w, _) in &rows {
+            let title = if w.title.is_empty() {
+                "<untitled>"
+            } else {
+                w.title.as_str()
+            };
+            println!("\n{title} [{}]", hex_short(&w.workspace_id));
+            print_layout_tree(&w.layout, 1);
+        }
+    }
+    Ok(())
+}
+
+/// `tm-agent ls` entry point: probe the local daemon's peer socket, then
+/// print its inventory. Returns a process exit code.
+pub fn ls_local_cmd(json_out: bool, tree: bool) -> i32 {
+    let socket = match probe_local_peer_socket() {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("tm-agent ls: {e:#}");
+            return 1;
+        }
+    };
+    match ls_cmd(&socket, json_out, tree) {
+        Ok(()) => 0,
+        Err(e) => {
+            eprintln!("tm-agent ls: {e:#}");
+            1
+        }
+    }
 }
 
 pub fn attach_host_cmd(

@@ -284,6 +284,8 @@ public nonisolated enum Termmesh_Peer_V1_TerminateSurfaceResult: SwiftProtobuf.E
   case terminated // = 1
 
   /// Idempotent success: the exact surface does not exist or is not ensured.
+  /// A fresh-id retry after a successful terminate whose response was dropped
+  /// therefore returns NOT_FOUND.
   case notFound // = 2
   case failed // = 3
   case UNRECOGNIZED(Int)
@@ -863,9 +865,9 @@ public nonisolated struct Termmesh_Peer_V1_EnsureSurfaceRequest: Sendable {
   // `Message` and `Message+*Additions` files in the SwiftProtobuf library for
   // methods supported on all messages.
 
-  /// Exactly 16 opaque bytes. A daemon MUST reject reuse of a request_id,
-  /// including reuse with identical content, as DUPLICATE_REQUEST_ID. Retrying
-  /// an identical spec with a fresh request_id is safe and returns REUSED.
+  /// Exactly 16 opaque bytes. A daemon MUST reject reuse of a request_id from
+  /// either EnsureSurface or TerminateSurface as DUPLICATE_REQUEST_ID. Retrying
+  /// a dropped request with a fresh request_id is safe and returns REUSED.
   public var requestID: Data = Data()
 
   /// Caller-scoped logical identity. UTF-8, non-empty, at most 256 bytes.
@@ -964,7 +966,10 @@ public nonisolated struct Termmesh_Peer_V1_TerminateSurfaceRequest: Sendable {
   // `Message` and `Message+*Additions` files in the SwiftProtobuf library for
   // methods supported on all messages.
 
-  /// Exactly 16 opaque bytes; one-shot for the authenticated connection.
+  /// Exactly 16 opaque bytes; one-shot across EnsureSurface and
+  /// TerminateSurface for the authenticated connection. If a response is
+  /// dropped, retry with a fresh request_id. Reusing this id is always
+  /// DUPLICATE_REQUEST_ID and is never a response-replay mechanism.
   public var requestID: Data = Data()
 
   /// Exact 16-byte SurfaceInfo.surface_id returned by EnsureSurfaceResponse.
@@ -1209,6 +1214,16 @@ public nonisolated struct Termmesh_Peer_V1_WorkspacePane: Sendable {
   /// ask the host to switch the active tab via
   /// WorkspaceControl.activate_tab.
   public var tabs: [Termmesh_Peer_V1_PaneTab] = []
+
+  /// Activity indicator: true when the pane's ACTIVE surface has a
+  /// foreground process group distinct from its shell — i.e. a command is
+  /// running — and false when the shell sits at its prompt (idle). Derived
+  /// host-side from tcgetpgrp(pty_master) != shell_pgid at serialization
+  /// time (ListWorkspaces + every WorkspaceLayoutChanged push), so it costs
+  /// one syscall per pane on an event that already fires — no polling.
+  /// Field-additive and backward compatible: hosts that predate this leave
+  /// it false, which clients render as idle.
+  public var busy: Bool = false
 
   public var unknownFields = SwiftProtobuf.UnknownStorage()
 
@@ -3566,7 +3581,7 @@ nonisolated extension Termmesh_Peer_V1_WorkspaceSplit: SwiftProtobuf.Message, Sw
 
 nonisolated extension Termmesh_Peer_V1_WorkspacePane: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
   public static let protoMessageName: String = _protobuf_package + ".WorkspacePane"
-  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{3}surface_id\0\u{1}title\0\u{1}cols\0\u{1}rows\0\u{1}cwd\0\u{1}tabs\0")
+  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{3}surface_id\0\u{1}title\0\u{1}cols\0\u{1}rows\0\u{1}cwd\0\u{1}tabs\0\u{1}busy\0")
 
   public mutating func decodeMessage<D: SwiftProtobuf.Decoder>(decoder: inout D) throws {
     while let fieldNumber = try decoder.nextFieldNumber() {
@@ -3580,6 +3595,7 @@ nonisolated extension Termmesh_Peer_V1_WorkspacePane: SwiftProtobuf.Message, Swi
       case 4: try { try decoder.decodeSingularUInt32Field(value: &self.rows) }()
       case 5: try { try decoder.decodeSingularStringField(value: &self.cwd) }()
       case 6: try { try decoder.decodeRepeatedMessageField(value: &self.tabs) }()
+      case 7: try { try decoder.decodeSingularBoolField(value: &self.busy) }()
       default: break
       }
     }
@@ -3604,6 +3620,9 @@ nonisolated extension Termmesh_Peer_V1_WorkspacePane: SwiftProtobuf.Message, Swi
     if !self.tabs.isEmpty {
       try visitor.visitRepeatedMessageField(value: self.tabs, fieldNumber: 6)
     }
+    if self.busy != false {
+      try visitor.visitSingularBoolField(value: self.busy, fieldNumber: 7)
+    }
     try unknownFields.traverse(visitor: &visitor)
   }
 
@@ -3614,6 +3633,7 @@ nonisolated extension Termmesh_Peer_V1_WorkspacePane: SwiftProtobuf.Message, Swi
     if lhs.rows != rhs.rows {return false}
     if lhs.cwd != rhs.cwd {return false}
     if lhs.tabs != rhs.tabs {return false}
+    if lhs.busy != rhs.busy {return false}
     if lhs.unknownFields != rhs.unknownFields {return false}
     return true
   }
