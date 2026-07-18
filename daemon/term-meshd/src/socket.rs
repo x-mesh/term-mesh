@@ -270,10 +270,19 @@ pub async fn serve(
     let owner_uid = current_uid();
     let (event_tx, _) = tokio::sync::broadcast::channel(256);
     let pane_tracker = PaneTracker::new().start();
-    let project_registry = Arc::new(crate::sync::ProjectRegistry::open(
-        crate::sync::default_registry_db_path(),
-    )?);
-    let operation_manager = build_sync_operation_manager(project_registry.clone())?;
+    let project_registry = Arc::new(
+        crate::sync::ProjectRegistry::open(crate::sync::default_registry_db_path()).map_err(
+            |error| {
+                tracing::error!("project registry open failed: {error:?}");
+                error
+            },
+        )?,
+    );
+    let operation_manager = build_sync_operation_manager(project_registry.clone())
+        .map_err(|error| {
+            tracing::error!("sync operation manager setup failed: {error:?}");
+            error
+        })?;
     let ctx = Arc::new(Context {
         monitor_rx,
         monitor_handle,
