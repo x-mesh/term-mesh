@@ -895,6 +895,14 @@ final class PeerRelaySession {
     }
 
     deinit {
+        // Defense-in-depth: if a session is dropped WITHOUT disconnect()
+        // (e.g. an owner deallocated without calling teardown/stop), the
+        // detached pumpTask keeps the RelaySocket alive off-object, so the
+        // relay helper never gets EOF and leaks. Cancelling the pump and
+        // closing the socket here forces EOF → the relay exits. Both are
+        // idempotent (no-ops after disconnect() already ran).
+        pumpTask?.cancel()
+        relaySocket?.close()
         if listenerFd >= 0 { Darwin.close(listenerFd) }
         try? FileManager.default.removeItem(atPath: relaySockPath)
     }

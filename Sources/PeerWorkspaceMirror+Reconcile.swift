@@ -140,6 +140,16 @@ extension PeerWorkspaceMirrorController {
                 _ = controller.closeTab(tab.id, inPane: anchor)
             }
 
+            // B3b — reap panels displaced by markAllPanesStale() (resync /
+            // reconnect). That wiped panelBySurfaceID before this reconcile,
+            // so the loop above never sees them; closing here — after B2
+            // spawned their replacements — preserves spawn-before-close and
+            // frees each old pane's relay helper process (v0.159 relay leak).
+            for panelId in pendingStalePanelIds {
+                _ = workspace2.closePanel(panelId, force: true)
+            }
+            pendingStalePanelIds.removeAll()
+
             // B4 — pre-order rebuild.
             buildSplits(node: target, currentPane: anchor, workspace: workspace2)
 
