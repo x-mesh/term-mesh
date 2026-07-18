@@ -1,5 +1,6 @@
 mod apply;
 mod blob;
+mod bootstrap;
 mod cas;
 mod conflict;
 mod crypto;
@@ -153,6 +154,10 @@ pub use trust::{
 };
 #[allow(unused_imports)]
 pub use trust_bootstrap::{seed_trust_store, BootstrapDevice};
+#[allow(unused_imports)]
+pub use bootstrap::{
+    bootstrap_two_daemons, provision_daemon, BootstrapError, BootstrapPeer, DaemonProvisioning,
+};
 #[allow(unused_imports)]
 pub use trust_recovery::{
     authorize_revoke, device_secret_item, export_recovery, import_recovery, project_dek_item,
