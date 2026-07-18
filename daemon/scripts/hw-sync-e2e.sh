@@ -126,7 +126,8 @@ echo "-- bootstrap-trust A + start --"
 PEERS_A="$(jq -cn --arg id "$PEER_B_ID" --arg addr "$PEER_B_ADDR" '[{peer_id:$id,addr:$addr}]')"
 desc "$DEVICE_A" 1 "$PEERS_A" | a sync bootstrap-trust --descriptor - >/dev/null
 
-OP="$(a sync start "$PROJECT_ID" --peer "$PEER_B_ID" | jq -r .operation_id)"
+# sync.start requires a 32-hex (16-byte) request id; the CLI's auto id is not hex.
+OP="$(a sync start "$PROJECT_ID" --peer "$PEER_B_ID" --request-id "$(openssl rand -hex 16)" | jq -r .operation_id)"
 [ -n "$OP" ] && [ "$OP" != null ] || die "sync start returned no operation id"
 echo "   operation $OP"
 

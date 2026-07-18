@@ -195,6 +195,11 @@ unsafe extern "C" fn open(
         )
     };
     if fd < 0 {
+        tracing::warn!(
+            "openat VFS: openat failed errno={:?} child={:?}",
+            std::io::Error::last_os_error().raw_os_error(),
+            String::from_utf8_lossy(child.as_bytes())
+        );
         return ffi::SQLITE_CANTOPEN;
     }
     let mut stat = std::mem::MaybeUninit::uninit();
@@ -212,7 +217,24 @@ unsafe extern "C" fn open(
         unsafe { libc::close(fd) };
         return ffi::SQLITE_CANTOPEN;
     }
-    let descriptor = match CString::new(format!("/dev/fd/{fd}")) {
+    // Hand the file we just secured (openat + stat checks) to the base VFS so it
+    // can drive real I/O on it. The base VFS only opens by *path*, and SQLite's
+    // unix layer opens every file with O_NOFOLLOW unconditionally (sqlite3.c
+    // `robust_open`, "openFlags |= O_NOFOLLOW"). On macOS `/dev/fd/N` is a device
+    // node, so that re-open works; on Linux `/dev/fd/N` (and `/proc/self/fd/N`)
+    // are symlinks, and O_NOFOLLOW rejects them with ELOOP. So on Linux we hand it
+    // the descriptor's REAL path instead — a regular file (not a symlink), which
+    // O_NOFOLLOW accepts. This is safe: the state dir is enforced 0700 + owned
+    // (SecureSqlite::open), so no other user can swap the file between our openat
+    // and this re-open, and O_NOFOLLOW still rejects a final-component symlink.
+    #[cfg(target_os = "macos")]
+    let descriptor_path = format!("/dev/fd/{fd}");
+    #[cfg(not(target_os = "macos"))]
+    let descriptor_path = std::fs::read_link(format!("/proc/self/fd/{fd}"))
+        .ok()
+        .and_then(|path| path.into_os_string().into_string().ok())
+        .unwrap_or_else(|| format!("/dev/fd/{fd}"));
+    let descriptor = match CString::new(descriptor_path) {
         Ok(value) => value,
         Err(_) => {
             unsafe { libc::close(fd) };
@@ -235,6 +257,12 @@ unsafe extern "C" fn open(
         )
     };
     if result != ffi::SQLITE_OK {
+        tracing::warn!(
+            "openat VFS: delegated open of {:?} failed result={} errno={:?}",
+            descriptor,
+            result,
+            std::io::Error::last_os_error().raw_os_error()
+        );
         unsafe { libc::close(fd) };
         return result;
     }
