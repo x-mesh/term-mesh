@@ -59,6 +59,24 @@ impl ApplyCrashHook for FailIo {
     }
 }
 
+/// Fails the apply at one I/O point and then the ROLLBACK at another, so the
+/// unwind itself cannot finish. Both points are chosen to be ones
+/// `rollback_operation` does not diagnose and block on by itself.
+struct FailApplyThenRollback(ApplyIoPoint, ApplyIoPoint);
+impl ApplyCrashHook for FailApplyThenRollback {
+    fn after_boundary(&self, _: ApplyBoundary) -> Result<(), ApplyError> {
+        Ok(())
+    }
+
+    fn before_io(&self, point: ApplyIoPoint) -> Result<(), ApplyError> {
+        if point == self.0 || point == self.1 {
+            Err(ApplyError::Io(std::io::Error::from_raw_os_error(libc::EIO)))
+        } else {
+            Ok(())
+        }
+    }
+}
+
 struct EditAfterPrecheck(std::path::PathBuf);
 impl ApplyCrashHook for EditAfterPrecheck {
     fn after_boundary(&self, boundary: ApplyBoundary) -> Result<(), ApplyError> {
@@ -882,13 +900,19 @@ fn a_tracked_subtree_drains_but_a_directory_with_untracked_content_survives() {
         .collect();
     assert_eq!(planned, ["doomed/nested", "doomed", "crufty"]);
 
-    // Applying that batch as a whole is NOT exercised here: `crufty` refuses,
-    // and a mid-batch refusal currently leaves the entries before it applied and
-    // wedges the store (see `a_stale_precondition_rolls_back_the_earlier_entries`
-    // — a pre-existing rollback hole, not a directory-delete one). What the
-    // refusal itself does is covered by
-    // `deleting_a_directory_holding_an_untracked_file_is_refused`. So apply the
-    // subtree that can drain, which is what a sync converges to either way.
+    // `crufty` refuses, and the batch is atomic, so nothing lands — including
+    // the two `doomed` directories ordered before it.
+    assert!(
+        store.apply(&root, &cas, object_domain, &directories).is_err(),
+        "the batch must refuse rather than sweep crufty/build.o away"
+    );
+    assert!(
+        root.join("doomed/nested").is_dir(),
+        "a refused batch must roll back the directories it already removed"
+    );
+
+    // Re-run without the directory that cannot be emptied — what the next sync
+    // does anyway, since `crufty` stays outstanding in the base.
     let drainable: Vec<String> = delete_paths
         .iter()
         .filter(|path| !path.starts_with("crufty"))
@@ -902,14 +926,169 @@ fn a_tracked_subtree_drains_but_a_directory_with_untracked_content_survives() {
 
     // The fully-tracked subtree is gone, root and all.
     assert!(!root.join("doomed").exists());
-    // The crufty one survives, with the untracked artifact intact — it was never
-    // applied, precisely because the planner marks it and the fingerprint would
-    // refuse it. Its tracked file did go: that delete committed in the leaf plan.
+    // The crufty one survives, with the untracked artifact intact. Its tracked
+    // file did go — that delete committed in the leaf plan above.
     assert!(root.join("crufty").is_dir());
     assert_eq!(fs::read(root.join("crufty/build.o")).unwrap(), b"artifact");
     assert!(!root.join("crufty/tracked.txt").exists());
     // Nothing outside the delete set moved.
     assert_eq!(fs::read(root.join("keep.txt")).unwrap(), b"untouched");
+}
+
+/// A refused precondition on ONE entry must not leave the entries before it
+/// applied. The existing stale-precondition tests all use single-entry plans, so
+/// the rollback path that walks back over earlier entries went unexercised: it
+/// aborted on the refused entry itself (whose whole problem is that it does not
+/// match `original_digest`) and never reached them.
+#[test]
+fn a_stale_precondition_rolls_back_the_earlier_entries() {
+    let temporary = tempfile::tempdir().unwrap();
+    let root = temporary.path().join("project");
+    let project = ProjectId::from_bytes([77; 32]);
+    fs::create_dir_all(&root).unwrap();
+    fs::write(root.join("first"), b"first").unwrap();
+    fs::write(root.join("second"), b"actual on disk").unwrap();
+    let cas = CasStore::open(
+        temporary.path().join("cas"),
+        CasLimits::default(),
+        Arc::new(FixedKeys),
+    )
+    .unwrap();
+    let store = ApplyStore::open(temporary.path().join("state/apply.sqlite")).unwrap();
+
+    let plan = ApplyPlan {
+        operation_id: [77; 16],
+        project,
+        target_manifest_root: [77; 32],
+        frontier: vec![7, 7],
+        entries: vec![
+            ApplyPlanEntry {
+                relative_path: "first".to_owned(),
+                action: ApplyAction::Delete,
+                precondition: ApplyPrecondition::Present(fingerprint(b"first")),
+            },
+            ApplyPlanEntry {
+                relative_path: "second".to_owned(),
+                action: ApplyAction::Delete,
+                // Stale — the disk says "actual on disk".
+                precondition: ApplyPrecondition::Present(fingerprint(b"stale expectation")),
+            },
+        ],
+    };
+
+    assert!(matches!(
+        store.apply(&root, &cas, domain(project), &plan),
+        Err(ApplyError::StalePrecondition(ref path)) if path == "second"
+    ));
+    assert_eq!(
+        fs::read(root.join("first")).unwrap(),
+        b"first",
+        "the entry applied before the refusal must be rolled back"
+    );
+    assert_eq!(fs::read(root.join("second")).unwrap(), b"actual on disk");
+    assert!(store.visible_state(project).unwrap().is_none());
+
+    // And the store is still usable: an aborted operation must not wedge the
+    // project into failing every later apply during recovery.
+    let next = ApplyPlan {
+        operation_id: [78; 16],
+        project,
+        target_manifest_root: [78; 32],
+        frontier: vec![7, 8],
+        entries: vec![ApplyPlanEntry {
+            relative_path: "second".to_owned(),
+            action: ApplyAction::Delete,
+            precondition: ApplyPrecondition::Present(fingerprint(b"actual on disk")),
+        }],
+    };
+    store.apply(&root, &cas, domain(project), &next).unwrap();
+    assert!(!root.join("second").exists());
+    assert_eq!(store.visible_state(project).unwrap().unwrap().generation, 1);
+}
+
+/// A rollback that cannot finish must block its operation. Otherwise it stays in
+/// `applying`, every later `apply` re-enters recovery, hits the same
+/// unfinishable rollback, and the project can never sync again.
+#[test]
+fn an_unfinishable_rollback_blocks_instead_of_wedging_the_project() {
+    let temporary = tempfile::tempdir().unwrap();
+    let root = temporary.path().join("project");
+    let project = ProjectId::from_bytes([79; 32]);
+    fs::create_dir_all(&root).unwrap();
+    let cas = CasStore::open(
+        temporary.path().join("cas"),
+        CasLimits::default(),
+        Arc::new(FixedKeys),
+    )
+    .unwrap();
+    let object_domain = domain(project);
+    let bytes = b"freshly added";
+    let object_id = install(&cas, object_domain, bytes);
+    let store = ApplyStore::open(temporary.path().join("state/apply.sqlite")).unwrap();
+
+    // An ADD, so the unwind moves the installed file to trash rather than
+    // restoring a backup. That matters: the restore path diagnoses its own
+    // failures and blocks itself, so it would mask what this test is about.
+    let plan = ApplyPlan {
+        operation_id: [79; 16],
+        project,
+        target_manifest_root: [79; 32],
+        frontier: vec![7, 9],
+        entries: vec![ApplyPlanEntry {
+            relative_path: "added.txt".to_owned(),
+            action: ApplyAction::File {
+                object_id,
+                content_hash: *blake3::hash(bytes).as_bytes(),
+                length: bytes.len() as u64,
+                executable: false,
+                mode: assumed_file_mode(false),
+            },
+            precondition: ApplyPrecondition::Absent,
+        }],
+    };
+
+    // The post-install fsync fails, so the operation unwinds; the unwind's own
+    // fsync then fails too, so the rollback cannot complete.
+    assert!(store
+        .apply_with_hook(
+            &root,
+            &cas,
+            object_domain,
+            &plan,
+            &FailApplyThenRollback(
+                ApplyIoPoint::InstallParentFsync,
+                ApplyIoPoint::RollbackRestoreParentFsync,
+            ),
+        )
+        .is_err());
+    assert!(store.visible_state(project).unwrap().is_none());
+
+    // The operation must be BLOCKED, not left in `applying`. That is the whole
+    // fix: recovery skips a blocked operation, so a later apply on this project
+    // runs instead of re-entering the same unfinishable rollback every time.
+    // Asserting the phase rather than "a later recover succeeds" is deliberate —
+    // the injected failure lives only in this call's hook, so a retried rollback
+    // would spuriously succeed and prove nothing.
+    assert_eq!(
+        store
+            .sqlite_test_query_i64("SELECT COUNT(*) FROM operations WHERE phase='blocked'")
+            .unwrap(),
+        1,
+        "an unfinishable rollback must leave the operation blocked"
+    );
+    assert_eq!(
+        store
+            .sqlite_test_query_i64("SELECT COUNT(*) FROM operations WHERE phase='applying'")
+            .unwrap(),
+        0,
+        "leaving it in `applying` is what wedges recovery"
+    );
+
+    // And the project is still usable.
+    let reopened = ApplyStore::open(temporary.path().join("state/apply.sqlite")).unwrap();
+    reopened
+        .recover(&root, project)
+        .expect("a blocked operation must be skipped by recovery, not retried");
 }
 
 #[test]

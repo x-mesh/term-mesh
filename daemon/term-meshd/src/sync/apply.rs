@@ -506,7 +506,17 @@ impl ApplyStore {
                 self.mark_blocked(plan.operation_id)?;
                 return Err(error);
             }
-            let _ = self.rollback_operation(&sandbox, plan.operation_id, hook);
+            // A rollback that cannot finish leaves the operation half-applied.
+            // Mark it blocked so it needs a human rather than being retried
+            // forever: `recover_locked` skips a blocked operation, so the next
+            // apply on this project can still run instead of dying in recovery
+            // on the same unfinishable rollback every time.
+            if self
+                .rollback_operation(&sandbox, plan.operation_id, hook)
+                .is_err()
+            {
+                let _ = self.mark_blocked(plan.operation_id);
+            }
             return Err(error);
         }
         let state = self.commit_visible(plan)?;
@@ -555,8 +565,16 @@ impl ApplyStore {
                 continue;
             } else if phase == "committed" {
                 self.cleanup_operation(sandbox, operation, hook)?;
-            } else {
-                self.rollback_operation(sandbox, operation, hook)?;
+            } else if let Err(error) = self.rollback_operation(sandbox, operation, hook) {
+                // Same reasoning as in `apply_with_hook`: surface the failure,
+                // but block the operation on the way out so recovery is not the
+                // thing that makes the project permanently unusable. Ignore the
+                // result — `rollback_operation` blocks the operation itself on
+                // the paths it can diagnose, and `mark_blocked` only matches an
+                // operation still in 'prepared'/'applying', so a second call is
+                // a no-op that must not mask the real error.
+                let _ = self.mark_blocked(operation);
+                return Err(error);
             }
         }
         Ok(())
@@ -851,12 +869,30 @@ impl ApplyStore {
                 sandbox.remove_rollback_trash(&entry.trash, hook)?;
             }
             sandbox.remove_work_entry(&entry.temp)?;
-            sandbox.finalize_rollback_target(
-                &entry.path,
-                entry.expected_absent,
-                entry.original_digest,
-                hook,
-            )?;
+            // Only re-verify a target this operation actually moved.
+            //
+            // `finalize_rollback_target` asserts the path is back to
+            // `original_digest`. For an entry we never reached — the one whose
+            // precondition was just refused, or anything after it — that
+            // assertion is not merely redundant: a refused precondition means
+            // the path deliberately does NOT match, so it fails, aborts the
+            // whole rollback, and leaves every EARLIER entry applied. The
+            // operation stops being atomic and the store wedges on the next
+            // recovery. A backup, a trash entry, or an install-phase entry are
+            // the three ways this operation can have touched the target; with
+            // none of them, there is nothing of ours to verify.
+            let touched_target = backup_exists
+                || trash_exists
+                || entry.phase == "install_intent"
+                || entry.phase == "installed_durable";
+            if touched_target {
+                sandbox.finalize_rollback_target(
+                    &entry.path,
+                    entry.expected_absent,
+                    entry.original_digest,
+                    hook,
+                )?;
+            }
             self.transition_recovery(
                 operation,
                 entry.ordinal,
