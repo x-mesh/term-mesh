@@ -21,11 +21,11 @@ use std::time::Duration;
 use sync_protocol::{SyncHello, PROJECT_SYNC_CAPABILITY, PROTOCOL_V1};
 
 use super::{
-    build_apply_plan, decode_manifest_batch, diff_manifests, encode_manifest_batches,
-    run_fetch_pull, ApplyStore, CasStore, DeviceTlsIdentity, ManifestBuilder, ManifestEntry,
-    ManifestScanner, ObjectDomain, ObjectType, OperationResult, OperationSpec, ProjectId,
-    ScanCheckpoint, ScanError, ScanLimits, ScanObserver, ScanReason, StreamLane, SyncConnection,
-    SyncEndpoint, SyncTransport, TrustStore,
+    build_apply_plan, decode_manifest_batch, encode_manifest_batches, reconcile_bidirectional,
+    run_fetch_pull, run_push, ApplyStore, CasStore, DeviceTlsIdentity, FetchEntry, ManifestBuilder,
+    ManifestEntry, ManifestScanner, ObjectDomain, ObjectType, OperationResult, OperationSpec,
+    ProjectId, ScanCheckpoint, ScanError, ScanLimits, ScanObserver, ScanReason, StreamLane,
+    SyncConnection, SyncEndpoint, SyncTransport, TrustStore,
 };
 
 /// How long to wait for the next manifest batch on the sync-operation lane
@@ -276,46 +276,107 @@ impl NetworkSyncRunner {
         }
         let mut connection = SyncConnection::start(auth);
         let remote_entries = exchange_manifests(&mut connection, local_entries).await?;
-        let diff = diff_manifests(local_entries, &remote_entries);
         if cancelled.load(Ordering::Acquire) {
             return Err("cancelled".to_string());
         }
 
-        // S2 last mile: pull the files we lack from the peer, staging each into
-        // the CAS, then apply them to the working tree so the local project
-        // converges to the peer's.
         let project = ProjectId::from_bytes(ctx.project_id);
         let domain = ObjectDomain {
             project_id: project,
             object_type: ObjectType::FILE,
             version: 1,
         };
-        let resolved = run_fetch_pull(&mut connection, &ctx.cas, domain, &diff.fetch).await?;
-        // `operation_id` seeds apply's deterministic temp/backup/trash names; a
-        // fresh random id per run keeps concurrent applies from colliding
-        // (durable per-operation ids arrive with oplog tracking — see plan.rs).
-        let mut operation_id = [0u8; 16];
-        getrandom::getrandom(&mut operation_id).map_err(|_| "sync_apply_failed".to_string())?;
-        let plan = build_apply_plan(project, operation_id, &diff.fetch, &resolved, local_entries);
-        if !plan.entries.is_empty() {
+
+        // Three-way against the last-synced base: what the local must pull from
+        // the peer, and what it must push to the peer, converging both sides.
+        // (Deletes + conflicts are computed but their application is deferred to a
+        // follow-up; this wires the fetch/push core of bidirectional sync.)
+        let base = {
             let store = ctx
                 .apply_store
                 .lock()
                 .map_err(|_| "sync_apply_failed".to_string())?;
             store
-                .apply(spec.held_root.canonical_path(), &ctx.cas, domain, &plan)
+                .load_base_manifest(project)
+                .map_err(|_| "sync_apply_failed".to_string())?
+        };
+        let plan = reconcile_bidirectional(&base, local_entries, &remote_entries);
+
+        // FETCH: pull remote-only changes and apply them to the local tree.
+        let resolved = run_fetch_pull(&mut connection, &ctx.cas, domain, &plan.fetch).await?;
+        // `operation_id` seeds apply's deterministic temp/backup/trash names; a
+        // fresh random id per run keeps concurrent applies from colliding.
+        let mut operation_id = [0u8; 16];
+        getrandom::getrandom(&mut operation_id).map_err(|_| "sync_apply_failed".to_string())?;
+        let apply_plan = build_apply_plan(project, operation_id, &plan.fetch, &resolved, local_entries);
+        if !apply_plan.entries.is_empty() {
+            let store = ctx
+                .apply_store
+                .lock()
+                .map_err(|_| "sync_apply_failed".to_string())?;
+            store
+                .apply(spec.held_root.canonical_path(), &ctx.cas, domain, &apply_plan)
+                .map_err(|_| "sync_apply_failed".to_string())?;
+        }
+        if cancelled.load(Ordering::Acquire) {
+            return Err("cancelled".to_string());
+        }
+
+        // PUSH: stream local-only changes to the peer, which applies them.
+        let dek = ctx
+            .cas
+            .current_project_key(project)
+            .map_err(|_| "sync_key_unavailable".to_string())?;
+        run_push(
+            &mut connection,
+            &ctx.cas,
+            spec.held_root.canonical_path(),
+            domain,
+            &dek.key,
+            dek.key_id,
+            &plan.push,
+        )
+        .await?;
+
+        // Advance the base for the paths that just converged (fetch → the remote
+        // value, push → the local value). Unchanged/delete/conflict paths keep
+        // their old base so deferred work still shows up as a diff next time.
+        {
+            let mut base_map: std::collections::HashMap<String, ManifestEntry> = base
+                .iter()
+                .map(|entry| (entry.relative_path.clone(), entry.clone()))
+                .collect();
+            for entry in plan.fetch.iter().chain(plan.push.iter()) {
+                base_map.insert(entry.relative_path.clone(), fetch_to_manifest(entry));
+            }
+            let base_prime: Vec<ManifestEntry> = base_map.into_values().collect();
+            let store = ctx
+                .apply_store
+                .lock()
+                .map_err(|_| "sync_apply_failed".to_string())?;
+            store
+                .save_base_manifest(project, &base_prime)
                 .map_err(|_| "sync_apply_failed".to_string())?;
         }
 
         Ok(OperationResult {
-            // Local manifest root (identifies the tree this diff was computed
-            // against); `entries` reports how many paths were actually applied to
-            // converge — plan entries, not the raw fetch list, since the plan
-            // skips paths it cannot yet apply (a dir-held path, a target-less
-            // symlink). 0 when the trees already matched.
             manifest_root: hex::encode(manifest_root(local_entries)?),
-            entries: plan.entries.len() as u64,
+            // Paths that moved this run: fetched-and-applied + pushed.
+            entries: (apply_plan.entries.len() + plan.push.len()) as u64,
         })
+    }
+}
+
+/// A pushed/fetched `FetchEntry` back to a `ManifestEntry` (identical fields) so
+/// it can seed the advanced base manifest.
+fn fetch_to_manifest(entry: &FetchEntry) -> ManifestEntry {
+    ManifestEntry {
+        relative_path: entry.relative_path.clone(),
+        kind: entry.kind,
+        executable: entry.executable,
+        length: entry.length,
+        content_hash: entry.content_hash,
+        symlink_target: entry.symlink_target.clone(),
     }
 }
 

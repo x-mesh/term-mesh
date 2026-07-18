@@ -25,8 +25,9 @@ use std::time::Duration;
 use ed25519_dalek::SigningKey;
 use sync::{
     ensure_device_identity, exchange_manifests, generate_project_key, load_device_tls_identity,
-    load_project_key, respond_to_fetch, run_bootstrap_trust, scan_project_entries, serve_project,
-    BootstrapDevice, CasLimits, CasStore, DaemonBootstrapPaths, KeychainBackend, KeychainError,
+    load_project_key, receive_push, respond_to_fetch, run_bootstrap_trust, scan_project_entries,
+    serve_project, ApplyStore, BootstrapDevice, CasLimits, CasStore, DaemonBootstrapPaths,
+    KeychainBackend, KeychainError,
     KeychainItem, KeychainProjectKeyProvider, LocalCoordinates, NetworkSyncRunner, ObjectDomain,
     ObjectType, OperationKind, OperationManager, OperationStartParams, OperationState, ProjectId,
     ProjectRegistry, ProvisioningPeerResolver, ProvisioningSyncContextProvider, SyncConnection,
@@ -213,6 +214,12 @@ async fn bootstrap_then_sync_moves_a_file_from_peer_to_initiator() {
         object_type: ObjectType::FILE,
         version: 1,
     };
+    // A responder must serve BOTH phases, exactly like `serve_connection`: the
+    // initiator always runs a push phase (empty here) and blocks on its ack, so a
+    // fetch-only responder would hang it until the fetch timeout.
+    let responder_apply = std::sync::Mutex::new(
+        ApplyStore::open(state_dir(temporary.path(), "responder-apply").join("apply.db")).unwrap(),
+    );
     let _server_task = tokio::spawn(async move {
         if let Ok(auth) = server.accept(hello(project_bytes, device_b, 2, 7)).await {
             let mut connection = SyncConnection::start(auth);
@@ -226,6 +233,16 @@ async fn bootstrap_then_sync_moves_a_file_from_peer_to_initiator() {
                     domain,
                     &dek_b.key,
                     dek_b.key_id,
+                    &entries,
+                )
+                .await;
+                let _ = receive_push(
+                    &mut connection,
+                    &cas_source,
+                    &peer_root_path,
+                    domain,
+                    &responder_apply,
+                    project,
                     &entries,
                 )
                 .await;
@@ -431,5 +448,132 @@ async fn serve_project_responds_to_a_real_sync() {
     let applied = std::fs::read(local_root.path().join("extra.txt"))
         .expect("extra.txt applied to the initiator's project root");
     assert_eq!(applied, b"only-on-the-peer");
+    stop.store(true, std::sync::atomic::Ordering::Release);
+}
+
+/// Bidirectional: the initiator (A) holds a file the peer (B) lacks and B holds a
+/// file A lacks. One sync converges BOTH trees — A fetches B's file and pushes its
+/// own, driven by the real runner + `serve_project` responder.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn bidirectional_sync_converges_both_trees() {
+    let temporary = tempfile::tempdir().unwrap();
+    let recovery = SigningKey::from_bytes(&[0x61; 32]);
+    let device_a = [0x63; 32];
+    let device_b = [0x64; 32];
+
+    let keychain_a: Arc<dyn KeychainBackend> = Arc::new(MemoryKeychain::default());
+    let keychain_b: Arc<dyn KeychainBackend> = Arc::new(MemoryKeychain::default());
+    let state_a = temporary.path().join("daemon-a");
+    let state_b = temporary.path().join("daemon-b");
+
+    // A has a-only.txt; B has b-only.txt; both share shared.txt.
+    //
+    // Each tree gets its OWN parent directory. `PathSandbox` puts its apply work
+    // directory (`.term-mesh-apply-<project>`) in the *parent* of the root, so two
+    // roots for the same project sharing a parent — which sibling `tempdir()`s
+    // under $TMPDIR would be — would make A's fetch-apply and B's push-apply
+    // collide in one work directory. Real peers are on different machines; only
+    // this in-process test can produce that aliasing.
+    let a_home = tempfile::tempdir().unwrap();
+    let local_root = tempfile::tempdir_in(a_home.path()).unwrap();
+    std::fs::write(local_root.path().join("shared.txt"), b"same-content").unwrap();
+    std::fs::write(local_root.path().join("a-only.txt"), b"lives-on-A").unwrap();
+    let b_home = tempfile::tempdir().unwrap();
+    let peer_root = tempfile::tempdir_in(b_home.path()).unwrap();
+    std::fs::write(peer_root.path().join("shared.txt"), b"same-content").unwrap();
+    std::fs::write(peer_root.path().join("b-only.txt"), b"lives-on-B").unwrap();
+
+    let registry_a_state = state_dir(temporary.path(), "registry-a");
+    let registry_a = Arc::new(ProjectRegistry::open(registry_a_state.join("registry.db")).unwrap());
+    let project = registry_a.add(local_root.path()).unwrap().project_id;
+    let project_bytes = *project.as_bytes();
+    let op_project_id = project.to_string();
+
+    let registry_b_state = state_dir(temporary.path(), "registry-b");
+    let registry_b = Arc::new(ProjectRegistry::open(registry_b_state.join("registry.db")).unwrap());
+    registry_b.add_with_id(peer_root.path(), project).unwrap();
+
+    let hash_a = ensure_device_identity(&*keychain_a, project, device_a).unwrap().certificate_hash();
+    let hash_b = ensure_device_identity(&*keychain_b, project, device_b).unwrap().certificate_hash();
+    let dek = generate_project_key().unwrap();
+    let roster = [
+        BootstrapDevice { device_id: device_a, certificate_hash: hash_a, epoch: 1 },
+        BootstrapDevice { device_id: device_b, certificate_hash: hash_b, epoch: 2 },
+    ];
+    run_bootstrap_trust(
+        &*keychain_b,
+        &bootstrap_paths(&state_b, project),
+        project,
+        &recovery,
+        &dek,
+        LocalCoordinates { device_id: device_b, roster_epoch: 2 },
+        &roster,
+        &[],
+    )
+    .unwrap();
+
+    let provisioning_b = Arc::new(SyncProvisioningStore::open(state_b.join("prov.db")).unwrap());
+    let provider_b = ProvisioningSyncContextProvider::new(keychain_b.clone(), provisioning_b, &state_b);
+    let context_b = provider_b.context_for(&op_project_id).unwrap();
+    let root_b = registry_b.resolve_root(project).unwrap();
+    let dek_b = load_project_key(&*keychain_b, project_bytes).unwrap();
+    let server = SyncEndpoint::server(
+        SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+        context_b.trust.clone(),
+        &context_b.identity,
+    )
+    .unwrap();
+    let server_addr = server.local_addr().unwrap();
+    let stop = Arc::new(AtomicBool::new(false));
+    let _server_task = tokio::spawn(serve_project(server, context_b, root_b, dek_b.key, dek_b.key_id, stop.clone()));
+
+    run_bootstrap_trust(
+        &*keychain_a,
+        &bootstrap_paths(&state_a, project),
+        project,
+        &recovery,
+        &dek,
+        LocalCoordinates { device_id: device_a, roster_epoch: 1 },
+        &roster,
+        &[("peer-b".to_string(), server_addr)],
+    )
+    .unwrap();
+    let provisioning_a = Arc::new(SyncProvisioningStore::open(state_a.join("prov.db")).unwrap());
+    let provider = Arc::new(ProvisioningSyncContextProvider::new(keychain_a.clone(), provisioning_a.clone(), &state_a));
+    let resolver = Arc::new(ProvisioningPeerResolver::new(provisioning_a));
+    let runner = NetworkSyncRunner::new(provider, resolver, tokio::runtime::Handle::current());
+
+    let ops_state = state_dir(temporary.path(), "sync-state");
+    let manager = OperationManager::open_with_sync_transport(ops_state.join("operations.db"), registry_a, Arc::new(runner)).unwrap();
+
+    let started = manager
+        .start(OperationStartParams {
+            request_id: "ab".repeat(16),
+            project_id: op_project_id.clone(),
+            kind: OperationKind::Sync,
+            peer: Some("peer-b".to_string()),
+        })
+        .await
+        .unwrap();
+
+    let mut finished = None;
+    for _ in 0..150 {
+        let record = manager.status(&started.operation_id, &op_project_id).unwrap();
+        if record.state.is_terminal() {
+            finished = Some(record);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let record = finished.expect("sync operation did not terminate in time");
+    assert_eq!(record.state, OperationState::Succeeded, "sync op failed: {:?}", record.error_code);
+
+    // A fetched B's file; B applied A's pushed file — both trees converged.
+    let a_got_b = std::fs::read(local_root.path().join("b-only.txt")).expect("A fetched b-only.txt");
+    assert_eq!(a_got_b, b"lives-on-B");
+    let b_got_a = std::fs::read(peer_root.path().join("a-only.txt")).expect("B received the pushed a-only.txt");
+    assert_eq!(b_got_a, b"lives-on-A");
+    // shared.txt untouched on both.
+    assert_eq!(std::fs::read(local_root.path().join("shared.txt")).unwrap(), b"same-content");
     stop.store(true, std::sync::atomic::Ordering::Release);
 }

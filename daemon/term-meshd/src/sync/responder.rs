@@ -20,8 +20,9 @@ use std::time::Duration;
 use sync_protocol::{SyncHello, PROJECT_SYNC_CAPABILITY, PROTOCOL_V1};
 
 use super::{
-    exchange_manifests, respond_to_fetch, scan_project_entries, HeldProjectRoot, KeyId,
-    ObjectDomain, ObjectType, ProjectId, ProjectKey, SyncConnection, SyncContext, SyncEndpoint,
+    exchange_manifests, receive_push, respond_to_fetch, scan_project_entries, HeldProjectRoot,
+    KeyId, ObjectDomain, ObjectType, ProjectId, ProjectKey, SyncConnection, SyncContext,
+    SyncEndpoint,
 };
 
 /// A fresh `SyncHello` (random nonce, so repeat connections are not replay-
@@ -99,6 +100,7 @@ async fn serve_connection(
     if exchange_manifests(&mut connection, &entries).await.is_err() {
         return;
     }
+    // Fetch phase: serve what the initiator pulls.
     let _ = respond_to_fetch(
         &mut connection,
         context.cas.as_ref(),
@@ -106,6 +108,18 @@ async fn serve_connection(
         domain,
         dek_key,
         dek_key_id,
+        &entries,
+    )
+    .await;
+    // Push phase: apply what the initiator pushes (it has already reconciled, so
+    // the responder trusts the push and applies onto its current tree).
+    let _ = receive_push(
+        &mut connection,
+        context.cas.as_ref(),
+        root.canonical_path(),
+        domain,
+        context.apply_store.as_ref(),
+        ProjectId::from_bytes(context.project_id),
         &entries,
     )
     .await;

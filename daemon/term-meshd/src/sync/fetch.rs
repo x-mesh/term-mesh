@@ -31,6 +31,7 @@ const TAG_HEADER: u8 = 2;
 const TAG_CHUNK: u8 = 3;
 const TAG_DONE: u8 = 4;
 const TAG_PUSH_MANIFEST: u8 = 5;
+const TAG_PUSH_ACK: u8 = 6;
 
 // ── wire codec ──────────────────────────────────────────────────────────────
 
@@ -81,6 +82,34 @@ fn encode_chunk(object_id: ObjectId, index: u32, envelope: &EncryptedChunk) -> V
 
 fn encode_done() -> Vec<u8> {
     vec![TAG_DONE]
+}
+
+/// The responder's verdict on a completed push: whether the apply succeeded and
+/// how many plan entries landed. Sending the bytes is not the same as the peer
+/// having them on disk, so `run_push` waits for this before reporting success —
+/// otherwise a caller (an operation, a test) can observe "sync succeeded" while
+/// the peer's apply is still in flight or has already failed.
+fn encode_push_ack(applied: Option<u64>) -> Vec<u8> {
+    let mut out = vec![TAG_PUSH_ACK];
+    match applied {
+        Some(count) => {
+            out.push(1);
+            out.extend_from_slice(&count.to_be_bytes());
+        }
+        None => out.push(0),
+    }
+    out
+}
+
+fn decode_push_ack(payload: &[u8]) -> Result<u64, String> {
+    let mut r = Reader::new(payload);
+    if r.u8()? != TAG_PUSH_ACK {
+        return Err("push_bad_message".into());
+    }
+    if r.u8()? == 0 {
+        return Err("push_rejected".into());
+    }
+    r.u64()
 }
 
 fn kind_from_u8(value: u8) -> Result<EntryKind, String> {
@@ -381,7 +410,9 @@ pub async fn respond_to_fetch(
 /// Initiator side of a PUSH (mirror of [`respond_to_fetch`]): send the peer the
 /// local-changed entries it should apply. First the push manifest (the full set
 /// so the peer can create ancestors + symlinks), then each FILE's content
-/// (HEADER on the SyncOperation lane + chunks on the Blob lane), then DONE.
+/// (HEADER immediately followed by its chunks), then DONE — and finally *wait for
+/// the peer's apply ack*, so a successful return means the peer has the files on
+/// disk, not merely that the bytes left this machine.
 pub async fn run_push(
     connection: &mut SyncConnection,
     cas: &CasStore,
@@ -414,12 +445,19 @@ pub async fn run_push(
             .get_live(domain, object_id)
             .map_err(|_| "cas_read_failed".to_string())?
             .ok_or_else(|| "cas_object_missing".to_string())?;
+        // Push rides the ordered SyncOperation lane end to end, so a header is
+        // immediately followed by exactly its object's chunks and the receiver
+        // never reassembles across lanes. Moving bulk push to the Blob lane (as
+        // the fetch direction does) is a head-of-line-blocking optimization.
         for index in 0..chunks(content.len() as u64) {
             let (_len, envelope) = live
                 .read_encrypted_chunk(index)
                 .map_err(|_| "cas_read_failed".to_string())?;
             sender
-                .send(StreamLane::Blob, encode_chunk(object_id, index, &envelope))
+                .send(
+                    StreamLane::SyncOperation,
+                    encode_chunk(object_id, index, &envelope),
+                )
                 .await
                 .map_err(|_| "push_send_failed".to_string())?;
         }
@@ -428,6 +466,10 @@ pub async fn run_push(
         .send(StreamLane::SyncOperation, encode_done())
         .await
         .map_err(|_| "push_send_failed".to_string())?;
+    // Wait for the peer to report its apply. Returning at "all bytes sent" would
+    // let the operation be marked succeeded while the peer has not written a
+    // single file yet — and a failing apply would be lost entirely.
+    decode_push_ack(&recv_syncop(connection).await?)?;
     Ok(())
 }
 
@@ -436,12 +478,37 @@ pub async fn run_push(
 /// to the working tree at `root` (the initiator has already reconciled, so the
 /// responder trusts the push). `local` is the responder's current manifest.
 /// Returns the number of plan entries applied.
+///
+/// Always answers with a push ack — success or failure — because `run_push`
+/// blocks on it; returning early without one would hang the initiator until its
+/// fetch timeout.
 pub async fn receive_push(
     connection: &mut SyncConnection,
     cas: &CasStore,
     root: &Path,
     domain: ObjectDomain,
-    apply_store: &ApplyStore,
+    apply_store: &std::sync::Mutex<ApplyStore>,
+    project: ProjectId,
+    local: &[ManifestEntry],
+) -> Result<u64, String> {
+    let outcome =
+        receive_push_inner(connection, cas, root, domain, apply_store, project, local).await;
+    let _ = connection
+        .sender()
+        .send(
+            StreamLane::SyncOperation,
+            encode_push_ack(outcome.as_ref().ok().copied()),
+        )
+        .await;
+    outcome
+}
+
+async fn receive_push_inner(
+    connection: &mut SyncConnection,
+    cas: &CasStore,
+    root: &Path,
+    domain: ObjectDomain,
+    apply_store: &std::sync::Mutex<ApplyStore>,
     project: ProjectId,
     local: &[ManifestEntry],
 ) -> Result<u64, String> {
@@ -459,8 +526,10 @@ pub async fn receive_push(
                 let mut staging = cas
                     .begin_stage(domain, object_id, length)
                     .map_err(|_| "cas_stage_failed".to_string())?;
+                // Chunks ride the ordered SyncOperation lane immediately after the
+                // header (see `run_push`).
                 for _ in 0..chunks(length) {
-                    match decode_incoming(&recv_blob(connection).await?)? {
+                    match decode_incoming(&recv_syncop(connection).await?)? {
                         Incoming::Chunk {
                             object_id: chunk_object,
                             index,
@@ -483,7 +552,12 @@ pub async fn receive_push(
     let plan = build_apply_plan(project, operation_id, &push_entries, &resolved, local);
     let applied = plan.entries.len() as u64;
     if !plan.entries.is_empty() {
-        apply_store
+        // Lock only for the (synchronous) apply — never across the network recv
+        // above, so the guard is not held over an await.
+        let store = apply_store
+            .lock()
+            .map_err(|_| "push_apply_failed".to_string())?;
+        store
             .apply(root, cas, domain, &plan)
             .map_err(|_| "push_apply_failed".to_string())?;
     }

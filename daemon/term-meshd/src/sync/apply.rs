@@ -13,7 +13,10 @@ use rusqlite::{params, Connection, OpenFlags, OptionalExtension, TransactionBeha
 use super::path_sandbox::{PathFingerprint, PathIdentity, PathSandbox, PathSandboxError};
 use super::project_lock::{acquire_project_file_lease_at, ProjectLockError};
 use super::sqlite_openat_vfs::OpenAtVfs;
-use super::{CasError, CasStore, ObjectDomain, ObjectId, ObjectType, ProjectId};
+use super::{
+    decode_entries, encode_entries, CasError, CasStore, ManifestEntry, ObjectDomain, ObjectId,
+    ObjectType, ProjectId,
+};
 
 const APP_ID: i64 = 0x544d_4150;
 const VERSION: i64 = 3;
@@ -21,6 +24,8 @@ const APPLY_SCHEMA: &[(&str, &str)] = &[
     ("operations", "CREATE TABLE operations(operation_id BLOB PRIMARY KEY CHECK(length(operation_id)=16),project BLOB NOT NULL CHECK(length(project)=32),target_root BLOB NOT NULL CHECK(length(target_root)=32),frontier BLOB NOT NULL,phase TEXT NOT NULL CHECK(phase IN('prepared','applying','committed','rolled_back','blocked')),created_at_ms INTEGER NOT NULL CHECK(created_at_ms>=0)) STRICT"),
     ("entries", "CREATE TABLE entries(operation_id BLOB NOT NULL CHECK(length(operation_id)=16),ordinal INTEGER NOT NULL CHECK(ordinal>=0),path TEXT NOT NULL,action TEXT NOT NULL CHECK(action IN('file','directory','symlink','delete')),expected_absent INTEGER NOT NULL CHECK(expected_absent IN(0,1)),original_digest BLOB CHECK(original_digest IS NULL OR length(original_digest)=32),temp_name TEXT NOT NULL,backup_name TEXT NOT NULL,installed_digest BLOB CHECK(installed_digest IS NULL OR length(installed_digest)=32),installed_dev INTEGER CHECK(installed_dev IS NULL OR installed_dev>=0),installed_ino INTEGER CHECK(installed_ino IS NULL OR installed_ino>=0),phase TEXT NOT NULL CHECK(phase IN('planned','temp_durable','backup_intent','backup_durable','install_intent','installed_durable')),recovery_phase TEXT NOT NULL CHECK(recovery_phase IN('none','rollback_intent','rollback_durable','cleanup_intent','cleanup_durable')),PRIMARY KEY(operation_id,ordinal),UNIQUE(operation_id,path),FOREIGN KEY(operation_id) REFERENCES operations(operation_id)) STRICT"),
     ("visible_state", "CREATE TABLE visible_state(project BLOB PRIMARY KEY CHECK(length(project)=32),manifest_root BLOB NOT NULL CHECK(length(manifest_root)=32),frontier BLOB NOT NULL,generation INTEGER NOT NULL CHECK(generation>0)) STRICT"),
+    // The last-synced BASE manifest per project (bidirectional three-way anchor).
+    ("base_manifests", "CREATE TABLE base_manifests(project BLOB PRIMARY KEY CHECK(length(project)=32),entries BLOB NOT NULL) STRICT"),
     ("one_active_operation", "CREATE UNIQUE INDEX one_active_operation ON operations(project) WHERE phase NOT IN('committed','rolled_back')"),
 ];
 
@@ -246,6 +251,40 @@ impl ApplyStore {
         relative_path: &str,
     ) -> Result<Option<PathFingerprint>, ApplyError> {
         Ok(PathSandbox::open(root, project)?.fingerprint(relative_path)?)
+    }
+
+    /// Record the last-synced BASE manifest for `project` — the converged state
+    /// the next bidirectional sync three-way-compares local + remote against.
+    pub fn save_base_manifest(
+        &self,
+        project: ProjectId,
+        entries: &[ManifestEntry],
+    ) -> Result<(), ApplyError> {
+        let encoded = encode_entries(entries);
+        let connection = self.connection.lock().map_err(|_| ApplyError::Poisoned)?;
+        connection.execute(
+            "INSERT INTO base_manifests(project,entries)VALUES(?1,?2)\
+             ON CONFLICT(project)DO UPDATE SET entries=excluded.entries",
+            rusqlite::params![project.as_bytes().as_slice(), encoded],
+        )?;
+        Ok(())
+    }
+
+    /// The last-synced BASE manifest for `project`, or an empty manifest if this
+    /// project has never synced (first sync → every change is an add).
+    pub fn load_base_manifest(&self, project: ProjectId) -> Result<Vec<ManifestEntry>, ApplyError> {
+        let connection = self.connection.lock().map_err(|_| ApplyError::Poisoned)?;
+        let encoded: Option<Vec<u8>> = connection
+            .query_row(
+                "SELECT entries FROM base_manifests WHERE project=?1",
+                [project.as_bytes().as_slice()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        match encoded {
+            None => Ok(Vec::new()),
+            Some(bytes) => decode_entries(&bytes).map_err(|_| ApplyError::Corrupt),
+        }
     }
 
     pub fn visible_state(&self, project: ProjectId) -> Result<Option<VisibleState>, ApplyError> {

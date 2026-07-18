@@ -16,7 +16,8 @@ use std::time::Duration;
 
 use ed25519_dalek::SigningKey;
 use sync::{
-    exchange_manifests, respond_to_fetch, scan_project_entries, seed_trust_store, ApplyStore,
+    exchange_manifests, receive_push, respond_to_fetch, scan_project_entries, seed_trust_store,
+    ApplyStore,
     BootstrapDevice, CasError, CasLimits, CasStore, DeviceTlsIdentity, KeyId, NetworkSyncRunner,
     ObjectDomain, ObjectType, OperationKind, OperationManager, OperationStartParams, OperationState,
     PeerAddressResolver, ProjectId, ProjectKey, ProjectKeyMaterial, ProjectKeyProvider,
@@ -152,6 +153,12 @@ async fn sync_operation_exchanges_manifests_and_finds_the_diff() {
         object_type: ObjectType::FILE,
         version: 1,
     };
+    // A responder must serve BOTH phases, exactly like `serve_connection`: the
+    // initiator always runs a push phase (empty here) and blocks on its ack, so a
+    // fetch-only responder would hang it until the fetch timeout.
+    let responder_apply = Mutex::new(
+        ApplyStore::open(state_dir(temporary.path(), "responder-apply").join("apply.db")).unwrap(),
+    );
     let _server_task = tokio::spawn(async move {
         if let Ok(auth) = server.accept(hello(project, device_b, 2, 7)).await {
             let mut connection = SyncConnection::start(auth);
@@ -166,6 +173,16 @@ async fn sync_operation_exchanges_manifests_and_finds_the_diff() {
                     domain,
                     &responder_key,
                     KEY_ID,
+                    &entries,
+                )
+                .await;
+                let _ = receive_push(
+                    &mut connection,
+                    &cas_source,
+                    &peer_root_path,
+                    domain,
+                    &responder_apply,
+                    project_id,
                     &entries,
                 )
                 .await;

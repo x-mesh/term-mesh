@@ -106,7 +106,9 @@ async fn push_streams_and_applies_a_local_file_to_the_peer() {
     let mut conn_source = SyncConnection::start(accepted.unwrap()); // A (pusher)
     let mut conn_dest = SyncConnection::start(connected.unwrap()); // B (receiver)
 
-    let apply_store = ApplyStore::open(state_dir(temporary.path(), "apply-state").join("apply.db")).unwrap();
+    let apply_store = std::sync::Mutex::new(
+        ApplyStore::open(state_dir(temporary.path(), "apply-state").join("apply.db")).unwrap(),
+    );
     let source_root_path = source_root.path().to_path_buf();
     let dest_root_path = dest_root.path().to_path_buf();
     let key = ProjectKey::new(KEY_BYTES);
