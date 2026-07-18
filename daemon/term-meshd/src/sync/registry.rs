@@ -137,9 +137,21 @@ impl ProjectRegistry {
     }
 
     pub fn add(&self, root: &Path) -> Result<ProjectRecord, RegistryError> {
+        self.add_with_id(root, random_project_id()?)
+    }
+
+    /// Register `root` under an explicit `project_id`. Cross-machine sync needs
+    /// both daemons to hold the SAME project id (the trust store, DEK, and
+    /// `SyncHello` are all keyed by it), so the responder registers its tree under
+    /// the id the initiator assigned. [`add`](Self::add) picks a random id; this
+    /// pins a chosen one.
+    pub fn add_with_id(
+        &self,
+        root: &Path,
+        project_id: ProjectId,
+    ) -> Result<ProjectRecord, RegistryError> {
         let root = canonical_root(root)?;
         let root_text = path_text(&root)?;
-        let project_id = random_project_id()?;
         let created_at_ms = now_ms()?;
         self.connection()?.execute(
             "INSERT INTO sync_projects

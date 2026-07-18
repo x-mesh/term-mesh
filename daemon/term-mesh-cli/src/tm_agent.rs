@@ -1105,6 +1105,10 @@ struct ProjectCommands {
 enum ProjectCommand {
     Add {
         path: PathBuf,
+        /// Explicit project id (64 hex) — register under a chosen id so a second
+        /// machine can share it for cross-machine sync. Omitted → random.
+        #[arg(long)]
+        id: Option<String>,
     },
     List,
     Status {
@@ -1189,6 +1193,14 @@ enum SyncCommand {
     BootstrapTrust {
         #[arg(long)]
         descriptor: String,
+    },
+    /// Dev/test — responder: bind a listener for a provisioned project and serve
+    /// incoming syncs. Prints the bound address for the initiator's address book.
+    Serve {
+        #[arg(long)]
+        project: String,
+        #[arg(long)]
+        bind: String,
     },
 }
 
@@ -3283,9 +3295,9 @@ fn local_request_id() -> String {
 fn run_project_sync_command(sock: &PathBuf, command: &Commands) -> Result<Value, String> {
     let (method, params) = match command {
         Commands::Project(group) => match &group.command {
-            ProjectCommand::Add { path } => (
+            ProjectCommand::Add { path, id } => (
                 "project.add",
-                json!({ "root_path": path.to_string_lossy() }),
+                json!({ "root_path": path.to_string_lossy(), "project_id": id }),
             ),
             ProjectCommand::List => ("project.list", json!({})),
             ProjectCommand::Status { project } => {
@@ -3369,6 +3381,10 @@ fn run_project_sync_command(sock: &PathBuf, command: &Commands) -> Result<Value,
                     .map_err(|error| format!("descriptor is not valid JSON: {error}"))?;
                 ("sync.bootstrap_trust", params)
             }
+            SyncCommand::Serve { project, bind } => (
+                "sync.serve",
+                json!({ "project_id": project, "bind_addr": bind }),
+            ),
         },
         Commands::Conflict(group) => match &group.command {
             ConflictCommand::List { project } => {

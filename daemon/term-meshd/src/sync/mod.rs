@@ -20,6 +20,7 @@ mod project_lock;
 mod provisioning;
 mod reconcile;
 mod registry;
+mod responder;
 mod rotation;
 mod scanner;
 mod schema;
@@ -164,6 +165,8 @@ pub use bootstrap::{
 };
 #[allow(unused_imports)]
 pub use context_provider::ProvisioningSyncContextProvider;
+#[allow(unused_imports)]
+pub use responder::serve_project;
 #[allow(unused_imports)]
 pub use trust_recovery::{
     authorize_revoke, device_secret_item, export_recovery, import_recovery, project_dek_item,

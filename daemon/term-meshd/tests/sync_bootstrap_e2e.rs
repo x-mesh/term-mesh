@@ -18,18 +18,19 @@ mod sync;
 use std::collections::HashMap;
 use std::fs::File;
 use std::net::{Ipv4Addr, SocketAddr};
+use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use ed25519_dalek::SigningKey;
 use sync::{
     ensure_device_identity, exchange_manifests, generate_project_key, load_device_tls_identity,
-    load_project_key, respond_to_fetch, run_bootstrap_trust, scan_project_entries, BootstrapDevice,
-    CasLimits, CasStore, DaemonBootstrapPaths, KeychainBackend, KeychainError, KeychainItem,
-    KeychainProjectKeyProvider, LocalCoordinates, NetworkSyncRunner, ObjectDomain, ObjectType,
-    OperationKind, OperationManager, OperationStartParams, OperationState, ProjectId,
+    load_project_key, respond_to_fetch, run_bootstrap_trust, scan_project_entries, serve_project,
+    BootstrapDevice, CasLimits, CasStore, DaemonBootstrapPaths, KeychainBackend, KeychainError,
+    KeychainItem, KeychainProjectKeyProvider, LocalCoordinates, NetworkSyncRunner, ObjectDomain,
+    ObjectType, OperationKind, OperationManager, OperationStartParams, OperationState, ProjectId,
     ProjectRegistry, ProvisioningPeerResolver, ProvisioningSyncContextProvider, SyncConnection,
-    SyncEndpoint, SyncProvisioningStore, TrustStore,
+    SyncContextProvider, SyncEndpoint, SyncProvisioningStore, TrustStore,
 };
 use sync_protocol::{SyncHello, PROJECT_SYNC_CAPABILITY, PROTOCOL_V1};
 use zeroize::Zeroizing;
@@ -287,4 +288,148 @@ async fn bootstrap_then_sync_moves_a_file_from_peer_to_initiator() {
     let applied = std::fs::read(local_root.path().join("extra.txt"))
         .expect("extra.txt applied to the initiator's project root");
     assert_eq!(applied, b"only-on-the-peer", "applied file differs from the peer");
+}
+
+/// As above, but the peer is served by the REAL daemon responder (`serve_project`)
+/// resolving its context from provisioned stores — not a hand-driven task. This
+/// is the in-process proof of the accept half before the hardware e2e.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn serve_project_responds_to_a_real_sync() {
+    let temporary = tempfile::tempdir().unwrap();
+    let recovery = SigningKey::from_bytes(&[0x51; 32]);
+    let device_a = [0x53; 32];
+    let device_b = [0x54; 32];
+
+    let keychain_a: Arc<dyn KeychainBackend> = Arc::new(MemoryKeychain::default());
+    let keychain_b: Arc<dyn KeychainBackend> = Arc::new(MemoryKeychain::default());
+    let state_a = temporary.path().join("daemon-a");
+    let state_b = temporary.path().join("daemon-b");
+
+    let local_root = tempfile::tempdir().unwrap();
+    std::fs::write(local_root.path().join("shared.txt"), b"same-content").unwrap();
+    let peer_root = tempfile::tempdir().unwrap();
+    std::fs::write(peer_root.path().join("shared.txt"), b"same-content").unwrap();
+    std::fs::write(peer_root.path().join("extra.txt"), b"only-on-the-peer").unwrap();
+
+    // A assigns the project id; B registers ITS tree under the SAME id
+    // (`add_with_id`) so the responder can resolve its root.
+    let registry_a_state = state_dir(temporary.path(), "registry-a");
+    let registry_a = Arc::new(ProjectRegistry::open(registry_a_state.join("registry.db")).unwrap());
+    let project = registry_a.add(local_root.path()).unwrap().project_id;
+    let project_bytes = *project.as_bytes();
+    let op_project_id = project.to_string();
+
+    let registry_b_state = state_dir(temporary.path(), "registry-b");
+    let registry_b = Arc::new(ProjectRegistry::open(registry_b_state.join("registry.db")).unwrap());
+    registry_b.add_with_id(peer_root.path(), project).unwrap();
+
+    // Provision both daemons for the project.
+    let hash_a = ensure_device_identity(&*keychain_a, project, device_a)
+        .unwrap()
+        .certificate_hash();
+    let hash_b = ensure_device_identity(&*keychain_b, project, device_b)
+        .unwrap()
+        .certificate_hash();
+    let dek = generate_project_key().unwrap();
+    let roster = [
+        BootstrapDevice { device_id: device_a, certificate_hash: hash_a, epoch: 1 },
+        BootstrapDevice { device_id: device_b, certificate_hash: hash_b, epoch: 2 },
+    ];
+    run_bootstrap_trust(
+        &*keychain_b,
+        &bootstrap_paths(&state_b, project),
+        project,
+        &recovery,
+        &dek,
+        LocalCoordinates { device_id: device_b, roster_epoch: 2 },
+        &roster,
+        &[],
+    )
+    .unwrap();
+
+    // Peer (B): resolve its context + root + DEK from the provisioned stores and
+    // hand them to the real daemon responder.
+    let provisioning_b = Arc::new(SyncProvisioningStore::open(state_b.join("prov.db")).unwrap());
+    let provider_b =
+        ProvisioningSyncContextProvider::new(keychain_b.clone(), provisioning_b, &state_b);
+    let context_b = provider_b.context_for(&op_project_id).unwrap();
+    let root_b = registry_b.resolve_root(project).unwrap();
+    let dek_b = load_project_key(&*keychain_b, project_bytes).unwrap();
+    let server = SyncEndpoint::server(
+        SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+        context_b.trust.clone(),
+        &context_b.identity,
+    )
+    .unwrap();
+    let server_addr = server.local_addr().unwrap();
+    let stop = Arc::new(AtomicBool::new(false));
+    let _server_task = tokio::spawn(serve_project(
+        server,
+        context_b,
+        root_b,
+        dek_b.key,
+        dek_b.key_id,
+        stop.clone(),
+    ));
+
+    // Initiator (A): provision with B's address, build the real provider + runner.
+    run_bootstrap_trust(
+        &*keychain_a,
+        &bootstrap_paths(&state_a, project),
+        project,
+        &recovery,
+        &dek,
+        LocalCoordinates { device_id: device_a, roster_epoch: 1 },
+        &roster,
+        &[("peer-b".to_string(), server_addr)],
+    )
+    .unwrap();
+    let provisioning_a = Arc::new(SyncProvisioningStore::open(state_a.join("prov.db")).unwrap());
+    let provider = Arc::new(ProvisioningSyncContextProvider::new(
+        keychain_a.clone(),
+        provisioning_a.clone(),
+        &state_a,
+    ));
+    let resolver = Arc::new(ProvisioningPeerResolver::new(provisioning_a));
+    let runner = NetworkSyncRunner::new(provider, resolver, tokio::runtime::Handle::current());
+
+    let ops_state = state_dir(temporary.path(), "sync-state");
+    let manager = OperationManager::open_with_sync_transport(
+        ops_state.join("operations.db"),
+        registry_a,
+        Arc::new(runner),
+    )
+    .unwrap();
+
+    let started = manager
+        .start(OperationStartParams {
+            request_id: "ef".repeat(16),
+            project_id: op_project_id.clone(),
+            kind: OperationKind::Sync,
+            peer: Some("peer-b".to_string()),
+        })
+        .await
+        .unwrap();
+
+    let mut finished = None;
+    for _ in 0..150 {
+        let record = manager.status(&started.operation_id, &op_project_id).unwrap();
+        if record.state.is_terminal() {
+            finished = Some(record);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let record = finished.expect("sync operation did not terminate in time");
+    assert_eq!(
+        record.state,
+        OperationState::Succeeded,
+        "sync op failed: {:?}",
+        record.error_code
+    );
+    assert_eq!(record.result.unwrap().entries, 1);
+    let applied = std::fs::read(local_root.path().join("extra.txt"))
+        .expect("extra.txt applied to the initiator's project root");
+    assert_eq!(applied, b"only-on-the-peer");
+    stop.store(true, std::sync::atomic::Ordering::Release);
 }

@@ -1541,14 +1541,21 @@ async fn dispatch(req: &Request, ctx: &Context) -> Response {
 
         // --- Mesh project control plane (off-main, non-focus) ---
         "project.add" => match serde_json::from_value::<ProjectAddParams>(req.params.clone()) {
-            Ok(params) => {
-                let registry = ctx.project_registry.clone();
-                tokio::task::spawn_blocking(move || registry.add(&params.root_path))
+            Ok(params) => match params.project_id.as_deref().map(parse_project_id).transpose() {
+                Ok(explicit_id) => {
+                    let registry = ctx.project_registry.clone();
+                    let root_path = params.root_path;
+                    tokio::task::spawn_blocking(move || match explicit_id {
+                        Some(id) => registry.add_with_id(&root_path, id),
+                        None => registry.add(&root_path),
+                    })
                     .await
                     .map_err(|_| "PROJECT_STORAGE_ERROR: registry worker failed".to_string())
                     .and_then(|result| result.map_err(registry_error))
                     .map(|record| project_json(record, false))
-            }
+                }
+                Err(error) => Err(error),
+            },
             Err(_) => Err("INVALID_PARAMS: root_path is required".to_string()),
         },
         "project.list" => {
@@ -1704,6 +1711,21 @@ async fn dispatch(req: &Request, ctx: &Context) -> Response {
             {
                 Err("SYNC_BOOTSTRAP_UNSUPPORTED: keychain-backed bootstrap requires macOS"
                     .to_string())
+            }
+        }
+        // Start the responder listener for a provisioned project (piece 6): bind a
+        // per-project QUIC endpoint and serve incoming syncs in a background task.
+        "sync.serve" => {
+            #[cfg(target_os = "macos")]
+            {
+                match serde_json::from_value::<SyncServeParams>(req.params.clone()) {
+                    Ok(params) => handle_sync_serve(ctx, params).await,
+                    Err(_) => Err("INVALID_PARAMS: project_id and bind_addr are required".to_string()),
+                }
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                Err("SYNC_BOOTSTRAP_UNSUPPORTED: keychain-backed sync requires macOS".to_string())
             }
         }
         "pairing.list" => match project_id_param(&req.params) {
@@ -3450,6 +3472,10 @@ fn operation_json(record: crate::sync::OperationRecord) -> Result<serde_json::Va
 #[serde(deny_unknown_fields)]
 struct ProjectAddParams {
     root_path: PathBuf,
+    /// Optional explicit project id (64 hex). Cross-machine sync registers the
+    /// responder's tree under the id the initiator assigned; omitted → random.
+    #[serde(default)]
+    project_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -3611,6 +3637,78 @@ async fn handle_sync_bootstrap_trust(
         "certificate_hash": hex::encode(hash),
         "roster_size": roster_size,
         "peers_size": peers_size,
+    }))
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SyncServeParams {
+    project_id: String,
+    bind_addr: String,
+}
+
+/// Start the responder listener for a provisioned, registered project: resolve
+/// its `SyncContext` + DEK + root from the stores bootstrap wrote, bind a
+/// per-project QUIC endpoint, and spawn the accept loop. Returns the bound
+/// address (the initiator's peer address book points at it). The listener runs
+/// until daemon shutdown (v0 has no stop RPC).
+#[cfg(target_os = "macos")]
+async fn handle_sync_serve(
+    ctx: &Context,
+    params: SyncServeParams,
+) -> Result<serde_json::Value, String> {
+    use crate::sync::SyncContextProvider;
+
+    let project_id = parse_project_id(&params.project_id)?;
+    let bind: std::net::SocketAddr = params.bind_addr.parse().map_err(|_| {
+        format!("INVALID_PARAMS: bind_addr '{}' is not a socket address", params.bind_addr)
+    })?;
+    let project_bytes = *project_id.as_bytes();
+    let registry = ctx.project_registry.clone();
+
+    // Open the provisioned stores + resolve context/DEK/root off the runtime.
+    let (context, dek, root) = tokio::task::spawn_blocking(move || {
+        let keychain: Arc<dyn crate::sync::KeychainBackend> = Arc::new(crate::sync::MacOsKeychain);
+        let provisioning = Arc::new(
+            crate::sync::SyncProvisioningStore::open(crate::sync::default_provisioning_db_path())
+                .map_err(|error| format!("SYNC_SERVE_PROVISIONING: {error:?}"))?,
+        );
+        let provider = crate::sync::ProvisioningSyncContextProvider::new(
+            keychain.clone(),
+            provisioning,
+            crate::sync::default_sync_state_root(),
+        );
+        let context = provider.context_for(&project_id.to_string())?;
+        let dek = crate::sync::load_project_key(keychain.as_ref(), project_bytes)
+            .map_err(|error| format!("SYNC_SERVE_KEYCHAIN: {error:?}"))?;
+        let root = registry
+            .resolve_root(project_id)
+            .map_err(|error| format!("SYNC_SERVE_ROOT: {error:?}"))?;
+        Ok::<_, String>((context, dek, root))
+    })
+    .await
+    .map_err(|_| "SYNC_SERVE_ERROR: setup worker failed".to_string())??;
+
+    // Bind the per-project QUIC listener (needs the runtime) + spawn the loop.
+    let server = crate::sync::SyncEndpoint::server(bind, context.trust.clone(), &context.identity)
+        .map_err(|error| format!("SYNC_SERVE_BIND_FAILED: {error:?}"))?;
+    let bound = server
+        .local_addr()
+        .map_err(|error| format!("SYNC_SERVE_BIND_FAILED: {error:?}"))?;
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    tokio::spawn(crate::sync::serve_project(
+        server,
+        context,
+        root,
+        dek.key,
+        dek.key_id,
+        stop,
+    ));
+
+    Ok(serde_json::json!({
+        "project_id": project_id.to_string(),
+        "bound_addr": bound.to_string(),
     }))
 }
 
