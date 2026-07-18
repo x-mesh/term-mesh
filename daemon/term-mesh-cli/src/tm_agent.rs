@@ -438,6 +438,15 @@ enum Commands {
     Destroy,
     /// List all teams
     List,
+    /// List this host's own workspaces with pane/surface/busy counts
+    Ls {
+        /// Emit machine-readable JSON instead of a table
+        #[arg(long)]
+        json: bool,
+        /// Also print each workspace's split/pane tree
+        #[arg(long)]
+        tree: bool,
+    },
     /// Read an agent's terminal output
     Read {
         agent: String,
@@ -4684,6 +4693,12 @@ fn is_leap(y: u32) -> bool {
 fn main() {
     let cli = Cli::parse();
 
+    // `ls` queries the host's own peer socket, not the team control
+    // socket — handle it before detect_socket() (same rationale as Peer).
+    if let Commands::Ls { json, tree } = &cli.command {
+        process::exit(peer::ls_local_cmd(*json, *tree));
+    }
+
     // Peer commands carry their own socket path — handle them before
     // the daemon-socket detection that would otherwise fail when there
     // is no running term-mesh daemon in the environment.
@@ -5423,6 +5438,7 @@ fn main() {
         ),
         Commands::TaskClear2 => rpc_call(&sock, "team.task.clear", json!({ "team_name": team })),
         Commands::Peer(_) => unreachable!("peer commands exit before detect_socket()"),
+        Commands::Ls { .. } => unreachable!("ls exits before detect_socket()"),
         Commands::Runbook(_) => unreachable!("runbook commands exit before detect_socket()"),
         Commands::Doctor { .. } => unreachable!("doctor command exits before detect_socket()"),
         Commands::Daemon(_) => unreachable!("daemon command exits before detect_socket()"),
