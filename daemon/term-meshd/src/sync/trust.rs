@@ -124,6 +124,27 @@ impl TrustStore {
         Self::open_inner(path.into(), project_id, recovery_signing_public, Some(keys))
     }
 
+    /// Reopen an EXISTING per-project trust store. The recovery signing public
+    /// key is bound in `trust_meta` when the store is created and validated from
+    /// there, so a reopen needs only the path + project id — the sync-context
+    /// provider (P0) reconstructs the store this way without holding the recovery
+    /// key. Errors if the store was never provisioned.
+    pub fn open_existing(
+        path: impl Into<PathBuf>,
+        project_id: ProjectId,
+    ) -> Result<Self, TrustError> {
+        let path = path.into();
+        if !path.exists() {
+            return Err(TrustError::Io(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "trust store not provisioned",
+            )));
+        }
+        // On reopen `open_inner` reads the bound recovery key from `trust_meta`
+        // and ignores this argument, so a placeholder is safe and never stored.
+        Self::open_inner(path, project_id, [0u8; 32], None)
+    }
+
     fn open_inner(
         path: PathBuf,
         project_id: ProjectId,

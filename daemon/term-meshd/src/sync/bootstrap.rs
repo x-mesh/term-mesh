@@ -257,13 +257,29 @@ pub fn default_sync_state_root() -> PathBuf {
         .join("sync")
 }
 
-/// The per-project trust store path the bootstrap writes and the sync-context
-/// registry (P0) reads: `<sync state>/projects/<hex(project_id)>/trust.sqlite3`.
-pub fn default_project_trust_db_path(project_id: ProjectId) -> PathBuf {
+/// The per-project state directory holding a project's trust store, CAS, and
+/// apply store: `<sync state>/projects/<hex(project_id)>`.
+pub fn default_project_dir(project_id: ProjectId) -> PathBuf {
     default_sync_state_root()
         .join("projects")
         .join(hex::encode(project_id.as_bytes()))
-        .join("trust.sqlite3")
+}
+
+/// The per-project trust store path the bootstrap writes and the sync-context
+/// registry (P0) reads: `<project dir>/trust.sqlite3`.
+pub fn default_project_trust_db_path(project_id: ProjectId) -> PathBuf {
+    default_project_dir(project_id).join("trust.sqlite3")
+}
+
+/// The per-project CAS root the sync-context provider opens: `<project dir>/cas`.
+pub fn default_project_cas_dir(project_id: ProjectId) -> PathBuf {
+    default_project_dir(project_id).join("cas")
+}
+
+/// The per-project apply store the sync-context provider opens:
+/// `<project dir>/apply.db`.
+pub fn default_project_apply_db_path(project_id: ProjectId) -> PathBuf {
+    default_project_dir(project_id).join("apply.db")
 }
 
 /// Load this daemon's TLS identity for `(project_id, device_id)`, generating and

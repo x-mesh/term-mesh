@@ -2,6 +2,7 @@ mod apply;
 mod blob;
 mod bootstrap;
 mod cas;
+mod context_provider;
 mod conflict;
 mod crypto;
 mod fetch;
@@ -156,10 +157,13 @@ pub use trust::{
 pub use trust_bootstrap::{seed_trust_store, BootstrapDevice};
 #[allow(unused_imports)]
 pub use bootstrap::{
-    bootstrap_two_daemons, default_project_trust_db_path, default_sync_state_root,
+    bootstrap_two_daemons, default_project_apply_db_path, default_project_cas_dir,
+    default_project_dir, default_project_trust_db_path, default_sync_state_root,
     ensure_device_identity, provision_daemon, run_bootstrap_trust, BootstrapError, BootstrapPeer,
     DaemonBootstrapPaths, DaemonProvisioning,
 };
+#[allow(unused_imports)]
+pub use context_provider::ProvisioningSyncContextProvider;
 #[allow(unused_imports)]
 pub use trust_recovery::{
     authorize_revoke, device_secret_item, export_recovery, import_recovery, project_dek_item,
