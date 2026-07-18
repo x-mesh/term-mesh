@@ -15,7 +15,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
 use sync::{
-    put_plaintext, scan_conflicts, CasError, CasLimits, CasStore, ConflictKind, ConflictPath,
+    assumed_file_mode, put_plaintext, scan_conflicts, CasError, CasLimits, CasStore, ConflictKind, ConflictPath,
     ConflictSide, EntryKind, FetchEntry, KeyId, ObjectDomain, ObjectId, ObjectType, ProjectId,
     ProjectKey, ProjectKeyMaterial, ProjectKeyProvider, UnclassifiedReason,
 };
@@ -114,6 +114,7 @@ fn entry(path: &str, bytes: &[u8], executable: bool) -> FetchEntry {
         relative_path: path.to_string(),
         kind: EntryKind::File,
         executable,
+        mode: assumed_file_mode(executable),
         length: bytes.len() as u64,
         content_hash: *blake3::hash(bytes).as_bytes(),
         symlink_target: None,
@@ -541,6 +542,7 @@ fn resolvable() -> Resolvable {
                 relative_path: "notes.txt".into(),
                 kind: Kind::File,
                 executable: false,
+                mode: assumed_file_mode(false),
                 length: base.length,
                 content_hash: base.content_hash,
                 symlink_target: None,
@@ -681,6 +683,7 @@ fn manifest(path: &str, bytes: &[u8]) -> ManifestEntry {
         relative_path: path.to_string(),
         kind: Kind::File,
         executable: false,
+        mode: assumed_file_mode(false),
         length: bytes.len() as u64,
         content_hash: *blake3::hash(bytes).as_bytes(),
         symlink_target: None,

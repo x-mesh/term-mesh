@@ -8,8 +8,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use sync::{
-    EntryKind, ManifestBuilder, ManifestEntry, ManifestError, ManifestScanner, ScanCheckpoint,
-    ScanError, ScanLimits, ScanObserver, ScanReason,
+    assumed_file_mode, EntryKind, ManifestBuilder, ManifestEntry, ManifestError, ManifestScanner, ScanCheckpoint,
+    ScanError, ScanLimits, ScanObserver, ScanReason, NO_MODE,
 };
 
 #[test]
@@ -44,6 +44,7 @@ fn invalid_paths_are_rejected_by_canonical_manifest_builder() {
                 relative_path: path.to_string(),
                 kind: EntryKind::File,
                 executable: false,
+                mode: assumed_file_mode(false),
                 length: 0,
                 content_hash: [0; 32],
                 symlink_target: None,
@@ -93,6 +94,7 @@ fn canonical_builder_rejects_duplicate_order_and_nonzero_structural_fields() {
         relative_path: path.to_string(),
         kind: EntryKind::File,
         executable: false,
+        mode: assumed_file_mode(false),
         length: 0,
         content_hash: [1; 32],
         symlink_target: None,
@@ -117,6 +119,7 @@ fn canonical_builder_rejects_duplicate_order_and_nonzero_structural_fields() {
             relative_path: "dir".to_string(),
             kind: EntryKind::Directory,
             executable: true,
+            mode: NO_MODE,
             length: 1,
             content_hash: [1; 32],
             symlink_target: None,

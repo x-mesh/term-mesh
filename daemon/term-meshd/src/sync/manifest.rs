@@ -16,9 +16,48 @@ pub struct ManifestEntry {
     pub relative_path: String,
     pub kind: EntryKind,
     pub executable: bool,
+    /// POSIX permission bits (`0o777`) for a FILE; `0` for directories and
+    /// symlinks, whose modes this manifest does not track.
+    ///
+    /// setuid/setgid/sticky are deliberately excluded — a peer must not be able
+    /// to push a setuid binary onto another machine. `executable` is kept as the
+    /// classification input (`merge_file` reasons about it), and is always
+    /// derivable from these bits; both the scanner and the wire decoder enforce
+    /// that they agree, so the two can never drift apart.
+    pub mode: u16,
     pub length: u64,
     pub content_hash: [u8; 32],
     pub symlink_target: Option<String>,
+}
+
+/// Permission bits to assume when only the executable bit is known.
+///
+/// Deliberately private (`0o700`/`0o600`) rather than the conventional
+/// `0o755`/`0o644`: guessing WIDER than the source would hand out read access
+/// the original file never granted. Callers that know the real mode pass it.
+pub fn assumed_file_mode(executable: bool) -> u16 {
+    if executable {
+        0o700
+    } else {
+        0o600
+    }
+}
+
+/// The `mode` a non-file entry carries: none. Directory and symlink permissions
+/// are not tracked (see [`ManifestEntry::mode`]).
+pub const NO_MODE: u16 = 0;
+
+/// Whether `mode` agrees with `executable`. The two are stored separately —
+/// `merge_file` classifies on `executable` — so every boundary that accepts them
+/// from outside checks they describe the same file.
+pub fn mode_matches_executable(kind: EntryKind, mode: u16, executable: bool) -> bool {
+    match kind {
+        EntryKind::File => mode & 0o777 == mode && (mode & 0o111 != 0) == executable,
+        // Non-files carry no mode at all. Their executable bit is not checked:
+        // it means nothing here (a directory's search bit is not something this
+        // manifest installs), so it is left to the scanner to report.
+        _ => mode == NO_MODE,
+    }
 }
 
 pub(crate) fn decode_index_entry(input: &[u8]) -> Result<ManifestEntry, ManifestError> {
@@ -63,10 +102,18 @@ pub(crate) fn decode_index_entry(input: &[u8]) -> Result<ManifestEntry, Manifest
     } else {
         return Err(ManifestError::InvalidEntry("target"));
     };
+    // This index format predates mode tracking and belongs to the dormant
+    // reconcile engine; assume the conservative mode rather than widen.
+    let mode = if kind == EntryKind::File {
+        assumed_file_mode(executable)
+    } else {
+        NO_MODE
+    };
     let entry = ManifestEntry {
         relative_path,
         kind,
         executable,
+        mode,
         length,
         content_hash,
         symlink_target,

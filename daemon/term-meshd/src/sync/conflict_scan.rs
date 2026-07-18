@@ -222,7 +222,7 @@ use std::sync::Mutex;
 
 use super::{
     put_plaintext, ApplyAction, ApplyPlan, ApplyPlanEntry, ApplyPrecondition, ApplyStore,
-    ConflictResolution, KeyId, ManifestEntry, ProjectKey,
+    assumed_file_mode, ConflictResolution, KeyId, ManifestEntry, ProjectKey,
 };
 
 /// What a resolution changed.
@@ -305,6 +305,9 @@ pub fn resolve_conflict(
                 content_hash: *blake3::hash(content.bytes()).as_bytes(),
                 length: content.bytes().len() as u64,
                 executable: content.executable(),
+                // A conflict record does not carry the mode; assume the
+                // conservative one rather than widen (see `rebase_onto_remote`).
+                mode: assumed_file_mode(content.executable()),
             },
         };
         entries.push(ApplyPlanEntry {
@@ -369,6 +372,10 @@ fn rebase_onto_remote(
             relative_path: path.clone(),
             kind: EntryKind::File,
             executable: content.executable(),
+            // The peer's real mode is not part of a conflict record, so assume
+            // the conservative one. If it differs, the next reconcile sees a mode
+            // change and converges — it never widens permissions on its own.
+            mode: assumed_file_mode(content.executable()),
             length: content.bytes().len() as u64,
             content_hash: *blake3::hash(content.bytes()).as_bytes(),
             symlink_target: None,

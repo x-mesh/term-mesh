@@ -18,6 +18,7 @@ mod sync;
 use std::collections::HashMap;
 use std::fs::File;
 use std::net::{Ipv4Addr, SocketAddr};
+use std::os::unix::fs::PermissionsExt;
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -84,7 +85,6 @@ fn hello(project: [u8; 32], device: [u8; 32], epoch: u64, nonce: u8) -> SyncHell
 
 /// A dedicated 0700 state directory for a SecureSqlite store under `base`.
 fn state_dir(base: &std::path::Path, name: &str) -> std::path::PathBuf {
-    use std::os::unix::fs::PermissionsExt;
     let dir = base.join(name);
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
@@ -486,6 +486,21 @@ async fn bidirectional_sync_converges_conflicts_and_propagates_deletes() {
     let local_root = tempfile::tempdir_in(a_home.path()).unwrap();
     std::fs::write(local_root.path().join("shared.txt"), b"same-content").unwrap();
     std::fs::write(local_root.path().join("a-only.txt"), b"lives-on-A").unwrap();
+    // Distinct permissions per file: sync must reproduce each one rather than
+    // install everything at a fixed default. Creating all files 0600 quietly
+    // narrows a shared file; creating all of them 0644 quietly widens a private
+    // one — both are wrong, so the mode has to travel with the file.
+    std::fs::set_permissions(
+        local_root.path().join("a-only.txt"),
+        std::fs::Permissions::from_mode(0o755),
+    )
+    .unwrap();
+    std::fs::write(local_root.path().join("private.txt"), b"secret").unwrap();
+    std::fs::set_permissions(
+        local_root.path().join("private.txt"),
+        std::fs::Permissions::from_mode(0o600),
+    )
+    .unwrap();
     let b_home = tempfile::tempdir().unwrap();
     let peer_root = tempfile::tempdir_in(b_home.path()).unwrap();
     std::fs::write(peer_root.path().join("shared.txt"), b"same-content").unwrap();
@@ -577,6 +592,26 @@ async fn bidirectional_sync_converges_conflicts_and_propagates_deletes() {
     assert_eq!(record.state, OperationState::Succeeded, "sync op failed: {:?}", record.error_code);
 
     // A fetched B's file; B applied A's pushed file — both trees converged.
+    // Modes travelled with the content, in both directions.
+    let mode_of = |path: &std::path::Path| {
+        std::fs::metadata(path).unwrap().permissions().mode() & 0o777
+    };
+    assert_eq!(
+        mode_of(&peer_root.path().join("a-only.txt")),
+        0o755,
+        "the pushed executable lost its permissions on the peer",
+    );
+    assert_eq!(
+        mode_of(&local_root.path().join("b-only.txt")),
+        0o644,
+        "the fetched file did not land with the peer's permissions",
+    );
+    assert_eq!(
+        mode_of(&peer_root.path().join("private.txt")),
+        0o600,
+        "an owner-only file must not be widened by syncing it",
+    );
+
     let a_got_b = std::fs::read(local_root.path().join("b-only.txt")).expect("A fetched b-only.txt");
     assert_eq!(a_got_b, b"lives-on-B");
     let b_got_a = std::fs::read(peer_root.path().join("a-only.txt")).expect("B received the pushed a-only.txt");
@@ -602,7 +637,7 @@ async fn bidirectional_sync_converges_conflicts_and_propagates_deletes() {
     // never entered the base — which is exactly why every base path has an object.
     assert_eq!(
         base_objects.keys().map(String::as_str).collect::<Vec<_>>(),
-        vec!["a-only.txt", "b-only.txt"],
+        vec!["a-only.txt", "b-only.txt", "private.txt"],
     );
     // Each recorded id is the content address of the agreed bytes, and the object
     // it names is really in CAS — so a later merge can read the base, not just

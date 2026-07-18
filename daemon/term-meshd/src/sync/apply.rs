@@ -51,6 +51,10 @@ pub enum ApplyAction {
         content_hash: [u8; 32],
         length: u64,
         executable: bool,
+        /// Permission bits to install with. Masked to `0o777` on use, so a
+        /// setuid/setgid/sticky bit can never be created here even if one
+        /// reached this far.
+        mode: u16,
     },
     Directory {
         executable: bool,
@@ -573,10 +577,15 @@ impl ApplyStore {
                     object_id,
                     content_hash,
                     length,
-                    executable,
+                    executable: _,
+                    mode,
                 } => {
                     let mut file =
-                        sandbox.create_temp_file(&temp, if *executable { 0o700 } else { 0o600 })?;
+                        // Install with the source's own permissions rather than a
+                        // fixed default: creating everything 0600 quietly
+                        // narrowed a shared file, and creating everything 0644
+                        // would just as quietly widen a private one.
+                        sandbox.create_temp_file(&temp, u32::from(*mode) & 0o777)?;
                     hook.before_io(ApplyIoPoint::TempWrite)?;
                     let mut writer = HashingWriter::new(&mut file);
                     let copied = cas.copy_verified_plaintext(domain, *object_id, &mut writer)?;
@@ -585,8 +594,11 @@ impl ApplyStore {
                     if copied != *length || written != *length || actual_hash != *content_hash {
                         return Err(ApplyError::Binding);
                     }
+                    // Authoritative: `O_CREAT`'s mode is masked by the process
+                    // umask, so the file only really gets the source's
+                    // permissions here.
                     if unsafe {
-                        libc::fchmod(file.as_raw_fd(), if *executable { 0o700 } else { 0o600 })
+                        libc::fchmod(file.as_raw_fd(), (u32::from(*mode) & 0o777) as libc::mode_t)
                     } != 0
                     {
                         return Err(io::Error::last_os_error().into());
@@ -1114,6 +1126,7 @@ fn validate_plan(plan: &ApplyPlan) -> Result<(), ApplyError> {
             ApplyAction::File {
                 length,
                 executable: _,
+                mode: _,
                 object_id: _,
                 content_hash: _,
             } if *length > 50 * 1024 * 1024 * 1024 => return Err(ApplyError::Limit),

@@ -19,7 +19,8 @@ use std::path::Path;
 use tokio::time::{timeout, Duration};
 
 use super::{
-    build_apply_plan, build_delete_plan, check_delete_guard, put_plaintext, ApplyStore, CasStore,
+    build_apply_plan, build_delete_plan, check_delete_guard, mode_matches_executable,
+    put_plaintext, ApplyStore, CasStore,
     EncryptedChunk, EntryKind, FetchEntry,
     KeyId, ManifestEntry, ObjectDomain, ObjectId, ProjectId, ProjectKey, StreamLane, SyncConnection,
 };
@@ -134,6 +135,7 @@ fn encode_push_manifest(entries: &[FetchEntry], deletes: &[String]) -> Vec<u8> {
         out.extend_from_slice(entry.relative_path.as_bytes());
         out.push(entry.kind as u8);
         out.push(entry.executable as u8);
+        out.extend_from_slice(&entry.mode.to_be_bytes());
         out.extend_from_slice(&entry.length.to_be_bytes());
         out.extend_from_slice(&entry.content_hash);
         match &entry.symlink_target {
@@ -168,6 +170,12 @@ fn decode_push_manifest(payload: &[u8]) -> Result<(Vec<FetchEntry>, Vec<String>)
         let relative_path = r.string(path_len)?;
         let kind = kind_from_u8(r.u8()?)?;
         let executable = r.u8()? != 0;
+        let mode = r.u16()?;
+        // Untrusted: reject a mode outside 0o777 or one disagreeing with the
+        // executable bit, rather than installing it on this machine.
+        if !mode_matches_executable(kind, mode, executable) {
+            return Err("push_bad_mode".into());
+        }
         let length = r.u64()?;
         let content_hash = r.array::<32>()?;
         let symlink_target = if r.u8()? != 0 {
@@ -180,6 +188,7 @@ fn decode_push_manifest(payload: &[u8]) -> Result<(Vec<FetchEntry>, Vec<String>)
             relative_path,
             kind,
             executable,
+            mode,
             length,
             content_hash,
             symlink_target,
@@ -264,6 +273,9 @@ impl<'a> Reader<'a> {
     }
     fn u8(&mut self) -> Result<u8, String> {
         Ok(self.take(1)?[0])
+    }
+    fn u16(&mut self) -> Result<u16, String> {
+        Ok(u16::from_be_bytes(self.take(2)?.try_into().unwrap()))
     }
     fn u32(&mut self) -> Result<u32, String> {
         Ok(u32::from_be_bytes(self.take(4)?.try_into().unwrap()))

@@ -14,7 +14,7 @@
 use std::collections::{HashMap, HashSet};
 
 use super::{
-    ApplyAction, ApplyPlan, ApplyPlanEntry, ApplyPrecondition, EntryKind, ManifestEntry, ObjectId,
+    mode_matches_executable, ApplyAction, ApplyPlan, ApplyPlanEntry, ApplyPrecondition, EntryKind, ManifestEntry, ObjectId,
     PathFingerprint, PathKind, ProjectId,
 };
 
@@ -35,6 +35,9 @@ pub struct FetchEntry {
     pub relative_path: String,
     pub kind: EntryKind,
     pub executable: bool,
+    /// Permission bits, carried so the peer installs the file as it exists here
+    /// rather than at a fixed default. See [`ManifestEntry::mode`].
+    pub mode: u16,
     pub length: u64,
     pub content_hash: [u8; 32],
     pub symlink_target: Option<String>,
@@ -95,6 +98,7 @@ fn fetch_of(entry: &ManifestEntry) -> FetchEntry {
         relative_path: entry.relative_path.clone(),
         kind: entry.kind,
         executable: entry.executable,
+        mode: entry.mode,
         length: entry.length,
         content_hash: entry.content_hash,
         symlink_target: entry.symlink_target.clone(),
@@ -321,6 +325,7 @@ pub fn build_apply_plan(
                     content_hash: entry.content_hash,
                     length: entry.length,
                     executable: entry.executable,
+                    mode: entry.mode,
                 }
             }
         };
@@ -419,6 +424,8 @@ pub fn build_delete_plan(
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum ManifestWireError {
+    /// A mode outside `0o777`, or one that disagrees with the executable bit.
+    BadMode(u16),
     Truncated,
     TooLarge,
     BadKind(u8),
@@ -451,6 +458,7 @@ pub fn encode_entries(entries: &[ManifestEntry]) -> Vec<u8> {
     for entry in entries {
         out.push(kind_to_byte(entry.kind));
         out.push(u8::from(entry.executable));
+        out.extend_from_slice(&entry.mode.to_be_bytes());
         out.extend_from_slice(&entry.length.to_be_bytes());
         out.extend_from_slice(&entry.content_hash);
         let path = entry.relative_path.as_bytes();
@@ -480,6 +488,9 @@ impl<'a> Reader<'a> {
             .ok_or(ManifestWireError::Truncated)?;
         self.offset = end;
         Ok(slice)
+    }
+    fn u16(&mut self) -> Result<u16, ManifestWireError> {
+        Ok(u16::from_be_bytes(self.take(2)?.try_into().unwrap()))
     }
     fn u32(&mut self) -> Result<u32, ManifestWireError> {
         Ok(u32::from_be_bytes(self.take(4)?.try_into().unwrap()))
@@ -512,6 +523,13 @@ pub fn decode_entries(input: &[u8]) -> Result<Vec<ManifestEntry>, ManifestWireEr
     for _ in 0..count {
         let kind = kind_from_byte(reader.u8()?)?;
         let executable = reader.u8()? != 0;
+        let mode = reader.u16()?;
+        // Untrusted input: a mode that disagrees with the executable bit (or sets
+        // setuid/setgid/sticky, which are outside 0o777) is rejected rather than
+        // applied to a file on this machine.
+        if !mode_matches_executable(kind, mode, executable) {
+            return Err(ManifestWireError::BadMode(mode));
+        }
         let length = reader.u64()?;
         let content_hash: [u8; 32] = reader.take(32)?.try_into().unwrap();
         let path_len = reader.u32()? as usize;
@@ -526,6 +544,7 @@ pub fn decode_entries(input: &[u8]) -> Result<Vec<ManifestEntry>, ManifestWireEr
             relative_path,
             kind,
             executable,
+            mode,
             length,
             content_hash,
             symlink_target,
@@ -537,8 +556,11 @@ pub fn decode_entries(input: &[u8]) -> Result<Vec<ManifestEntry>, ManifestWireEr
 /// Encoded byte length one entry contributes to [`encode_entries`] (excludes
 /// the list's leading count). Used to size batches by bytes rather than a fixed
 /// entry count, so batches stay bounded regardless of path length.
+/// Must stay in step with [`encode_entries`]: kind(1) + executable(1) + mode(2)
+/// + length(8) + hash(32) + path len(4) + path + target len(4) + target.
 fn entry_encoded_len(entry: &ManifestEntry) -> usize {
-    1 + 1 + 8 + 32 + 4 + entry.relative_path.len() + 4 + entry.symlink_target.as_deref().map_or(0, str::len)
+    1 + 1 + 2 + 8 + 32 + 4 + entry.relative_path.len() + 4
+        + entry.symlink_target.as_deref().map_or(0, str::len)
 }
 
 /// Split a manifest into batch messages for the `SyncOperation` lane, each
@@ -585,12 +607,14 @@ pub fn decode_manifest_batch(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sync::{assumed_file_mode, NO_MODE};
 
     fn file(path: &str, hash: u8, exec: bool) -> ManifestEntry {
         ManifestEntry {
             relative_path: path.to_string(),
             kind: EntryKind::File,
             executable: exec,
+            mode: assumed_file_mode(exec),
             length: 10,
             content_hash: [hash; 32],
             symlink_target: None,
@@ -602,6 +626,7 @@ mod tests {
             relative_path: path.to_string(),
             kind: EntryKind::Symlink,
             executable: false,
+            mode: NO_MODE,
             length: 0,
             content_hash: [0; 32],
             symlink_target: Some(target.to_string()),
@@ -613,6 +638,7 @@ mod tests {
             relative_path: path.to_string(),
             kind: EntryKind::Directory,
             executable: true, // directories are searchable
+            mode: NO_MODE,
             length: 0,
             content_hash: [0; 32],
             symlink_target: None,
@@ -729,6 +755,7 @@ mod tests {
                 relative_path: "adir".into(),
                 kind: EntryKind::Directory,
                 executable: true,
+                mode: NO_MODE,
                 length: 0,
                 content_hash: [0; 32],
                 symlink_target: None,
@@ -853,6 +880,7 @@ mod tests {
                 content_hash: [1; 32],
                 length: 10,
                 executable: false,
+                mode: assumed_file_mode(false),
             }
         );
 

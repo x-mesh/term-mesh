@@ -139,6 +139,7 @@ async fn transferred_object_is_applied_to_the_destination_filesystem() {
                 content_hash: entry.content_hash,
                 length: entry.length,
                 executable: entry.executable,
+                mode: entry.mode,
             },
             precondition: ApplyPrecondition::Absent,
         }],

@@ -504,6 +504,7 @@ fn fetch_to_manifest(entry: &FetchEntry) -> ManifestEntry {
         relative_path: entry.relative_path.clone(),
         kind: entry.kind,
         executable: entry.executable,
+        mode: entry.mode,
         length: entry.length,
         content_hash: entry.content_hash,
         symlink_target: entry.symlink_target.clone(),

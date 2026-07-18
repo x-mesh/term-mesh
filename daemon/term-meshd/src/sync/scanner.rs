@@ -157,6 +157,7 @@ impl ManifestScanner {
                 relative_path: format!("synthetic/{index:016x}"),
                 kind: EntryKind::File,
                 executable: false,
+                mode: crate::sync::assumed_file_mode(false),
                 length: index,
                 content_hash: *blake3::hash(&index.to_be_bytes()).as_bytes(),
                 symlink_target: None,
@@ -261,6 +262,7 @@ impl ManifestScanner {
                     relative_path: relative,
                     kind: EntryKind::Symlink,
                     executable: false,
+                    mode: crate::sync::NO_MODE,
                     length: 0,
                     content_hash: [0; 32],
                     symlink_target: Some(target),
@@ -277,6 +279,7 @@ impl ManifestScanner {
                     relative_path: relative.clone(),
                     kind: EntryKind::Directory,
                     executable: false,
+                    mode: crate::sync::NO_MODE,
                     length: 0,
                     content_hash: [0; 32],
                     symlink_target: None,
@@ -297,7 +300,10 @@ impl ManifestScanner {
                     libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
                 )?;
                 let opened = ensure_kind(&file_fd, libc::S_IFREG)?;
-                let executable = opened.st_mode & 0o111 != 0;
+                // Permission bits only: setuid/setgid/sticky are never carried
+                // across machines (see `ManifestEntry::mode`).
+                let mode = (opened.st_mode & 0o777) as u16;
+                let executable = mode & 0o111 != 0;
                 let length = u64::try_from(opened.st_size).map_err(|_| ScanError::InvalidSize)?;
                 let content_hash = hash_file(
                     file_fd,
@@ -311,6 +317,7 @@ impl ManifestScanner {
                     relative_path: relative,
                     kind: EntryKind::File,
                     executable,
+                    mode,
                     length,
                     content_hash,
                     symlink_target: None,

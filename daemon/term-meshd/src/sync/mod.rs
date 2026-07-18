@@ -80,7 +80,10 @@ pub use keychain::{
     PresenceCapability, PresenceGrantContext, RandomSource, SystemRandom, UserPresenceAuthorizer,
 };
 #[allow(unused_imports)]
-pub use manifest::{EntryKind, Manifest, ManifestBuilder, ManifestEntry, ManifestError};
+pub use manifest::{
+    assumed_file_mode, mode_matches_executable, EntryKind, Manifest, ManifestBuilder,
+    ManifestEntry, ManifestError, NO_MODE,
+};
 #[allow(unused_imports)]
 pub use conflict_scan::{
     resolve_conflict, scan_conflicts, summarize_conflicts, ConflictScan, ConflictSummary,
