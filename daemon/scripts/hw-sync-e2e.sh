@@ -119,14 +119,14 @@ echo "-- bootstrap-trust A + start --"
 PEERS_A="$(jq -cn --arg id "$PEER_B_ID" --arg addr "$PEER_B_ADDR" '[{peer_id:$id,addr:$addr}]')"
 desc "$DEVICE_A" 1 "$PEERS_A" | a sync bootstrap-trust --descriptor - >/dev/null
 
-OP="$(a sync start --project "$PROJECT_ID" --peer "$PEER_B_ID" | jq -r .operation_id)"
+OP="$(a sync start "$PROJECT_ID" --peer "$PEER_B_ID" | jq -r .operation_id)"
 [ -n "$OP" ] && [ "$OP" != null ] || die "sync start returned no operation id"
 echo "   operation $OP"
 
 # 5. Poll until terminal.
 STATE=""
 for _ in $(seq 1 60); do
-  STATE="$(a sync status --project "$PROJECT_ID" --operation "$OP" | jq -r .state)"
+  STATE="$(a sync status "$PROJECT_ID" "$OP" | jq -r .state)"
   case "$STATE" in
     succeeded|failed|cancelled|interrupted) break ;;
   esac

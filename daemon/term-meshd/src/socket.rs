@@ -3560,8 +3560,12 @@ async fn handle_sync_bootstrap_identity(
     let project_id = parse_project_id(&params.project_id)?;
     let device_id = parse_hex_bytes::<32>(&params.device_id, "device_id")?;
     let hash = tokio::task::spawn_blocking(move || {
-        crate::sync::ensure_device_identity(&crate::sync::MacOsKeychain, project_id, device_id)
-            .map(|identity| identity.certificate_hash())
+        crate::sync::ensure_device_identity(
+            crate::sync::daemon_keychain().as_ref(),
+            project_id,
+            device_id,
+        )
+        .map(|identity| identity.certificate_hash())
     })
     .await
     .map_err(|_| "SYNC_BOOTSTRAP_ERROR: identity worker failed".to_string())?
@@ -3617,7 +3621,7 @@ async fn handle_sync_bootstrap_trust(
             roster_epoch: local_epoch,
         };
         crate::sync::run_bootstrap_trust(
-            &crate::sync::MacOsKeychain,
+            crate::sync::daemon_keychain().as_ref(),
             &paths,
             project_id,
             &recovery,
@@ -3669,7 +3673,7 @@ async fn handle_sync_serve(
 
     // Open the provisioned stores + resolve context/DEK/root off the runtime.
     let (context, dek, root) = tokio::task::spawn_blocking(move || {
-        let keychain: Arc<dyn crate::sync::KeychainBackend> = Arc::new(crate::sync::MacOsKeychain);
+        let keychain = crate::sync::daemon_keychain();
         let provisioning = Arc::new(
             crate::sync::SyncProvisioningStore::open(crate::sync::default_provisioning_db_path())
                 .map_err(|error| format!("SYNC_SERVE_PROVISIONING: {error:?}"))?,
@@ -3728,7 +3732,7 @@ fn build_sync_operation_manager(
     let operation_db = crate::sync::default_operation_db_path();
     #[cfg(target_os = "macos")]
     {
-        let keychain: Arc<dyn crate::sync::KeychainBackend> = Arc::new(crate::sync::MacOsKeychain);
+        let keychain = crate::sync::daemon_keychain();
         let provisioning = Arc::new(
             crate::sync::SyncProvisioningStore::open(crate::sync::default_provisioning_db_path())
                 .map_err(|error| anyhow::anyhow!("open sync provisioning store: {error:?}"))?,

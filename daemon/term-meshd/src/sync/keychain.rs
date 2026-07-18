@@ -1,5 +1,6 @@
 use std::fmt;
 use std::io;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use zeroize::Zeroizing;
 
@@ -556,6 +557,87 @@ impl KeychainBackend for MacOsKeychain {
     }
 }
 
+/// A dev/test file-backed keychain: each item is a `0600` file under a `0700`
+/// directory, named by a BLAKE3 of its `(service, account)`. Unlike
+/// [`MacOsKeychain`] it needs no code-signing entitlement, so a standalone
+/// (unsigned) daemon — or a Linux daemon with no OS keychain — can still store
+/// the sync TLS identity + DEK. Dev-grade: the secrets sit in plaintext on disk,
+/// so it is selected only when `TERMMESH_SYNC_KEYCHAIN_DIR` is set, never as the
+/// production default (see [`daemon_keychain`]). It is cross-platform (pure
+/// `std::fs`), which is what makes the hardware sync e2e runnable on unsigned
+/// binaries.
+pub struct FileKeychain {
+    dir: PathBuf,
+}
+
+impl FileKeychain {
+    pub fn new(dir: impl Into<PathBuf>) -> Self {
+        Self { dir: dir.into() }
+    }
+
+    fn item_path(&self, item: &KeychainItem) -> PathBuf {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(item.service.as_bytes());
+        hasher.update(&[0]);
+        hasher.update(item.account.as_bytes());
+        self.dir.join(hex::encode(hasher.finalize().as_bytes()))
+    }
+
+    fn ensure_dir(&self) -> Result<(), KeychainError> {
+        std::fs::create_dir_all(&self.dir).map_err(|error| KeychainError::Platform(error.to_string()))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&self.dir, std::fs::Permissions::from_mode(0o700));
+        }
+        Ok(())
+    }
+}
+
+impl KeychainBackend for FileKeychain {
+    fn put(&self, item: &KeychainItem, secret: &[u8]) -> Result<(), KeychainError> {
+        self.ensure_dir()?;
+        let path = self.item_path(item);
+        std::fs::write(&path, secret).map_err(|error| KeychainError::Platform(error.to_string()))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+        }
+        Ok(())
+    }
+
+    fn get(&self, item: &KeychainItem) -> Result<Zeroizing<Vec<u8>>, KeychainError> {
+        match std::fs::read(self.item_path(item)) {
+            Ok(bytes) => Ok(Zeroizing::new(bytes)),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Err(KeychainError::NotFound),
+            Err(error) => Err(KeychainError::Platform(error.to_string())),
+        }
+    }
+
+    fn delete(&self, item: &KeychainItem) -> Result<(), KeychainError> {
+        match std::fs::remove_file(self.item_path(item)) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(KeychainError::Platform(error.to_string())),
+        }
+    }
+}
+
+/// The keychain backend the daemon uses for sync. When
+/// `TERMMESH_SYNC_KEYCHAIN_DIR` is set it is a [`FileKeychain`] there (dev/e2e,
+/// unsigned binaries, future Linux); otherwise the OS keychain. Production leaves
+/// the env unset and gets [`MacOsKeychain`].
+#[cfg(target_os = "macos")]
+pub fn daemon_keychain() -> Arc<dyn KeychainBackend> {
+    if let Some(dir) = std::env::var_os("TERMMESH_SYNC_KEYCHAIN_DIR") {
+        if !dir.is_empty() {
+            return Arc::new(FileKeychain::new(dir));
+        }
+    }
+    Arc::new(MacOsKeychain)
+}
+
 #[derive(Debug, PartialEq, Eq)]
 pub enum KeychainError {
     NotFound,
@@ -620,6 +702,31 @@ mod tests {
                 .remove(&(item.service.clone(), item.account.clone()));
             Ok(())
         }
+    }
+
+    #[test]
+    fn file_keychain_round_trips_and_reports_not_found() {
+        let dir = tempfile::tempdir().unwrap();
+        let backend = FileKeychain::new(dir.path().join("kc"));
+        let item = KeychainItem {
+            service: "term-mesh.sync.dek.abcd".into(),
+            account: "project-key-v1".into(),
+            protection: KeychainProtection::AfterFirstUnlockThisDeviceOnly,
+        };
+        // Absent until put.
+        assert!(matches!(backend.get(&item), Err(KeychainError::NotFound)));
+        backend.put(&item, b"secret-bytes").unwrap();
+        assert_eq!(backend.get(&item).unwrap().as_slice(), b"secret-bytes");
+        // A different (service, account) is a different file.
+        let other = KeychainItem {
+            account: "other".into(),
+            ..item.clone()
+        };
+        assert!(matches!(backend.get(&other), Err(KeychainError::NotFound)));
+        // Delete is idempotent.
+        backend.delete(&item).unwrap();
+        assert!(matches!(backend.get(&item), Err(KeychainError::NotFound)));
+        backend.delete(&item).unwrap();
     }
 
     #[test]
