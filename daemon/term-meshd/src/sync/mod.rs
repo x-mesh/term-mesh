@@ -4,6 +4,7 @@ mod bootstrap;
 mod cas;
 mod context_provider;
 mod conflict;
+mod conflict_scan;
 mod crypto;
 mod fetch;
 mod gc;
@@ -79,6 +80,9 @@ pub use keychain::{
 #[allow(unused_imports)]
 pub use manifest::{EntryKind, Manifest, ManifestBuilder, ManifestEntry, ManifestError};
 #[allow(unused_imports)]
+pub use conflict_scan::{
+    scan_conflicts, ConflictScan, Unclassified, UnclassifiedReason,
+};
 pub use merge::{
     detect_path_conflicts, merge_file, MergeOutcome, PathChange, ThreeWayFile,
     MAX_PATH_CHANGE_COUNT, MAX_PATH_CHANGE_TOTAL_BYTES,

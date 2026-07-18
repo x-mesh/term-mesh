@@ -829,7 +829,27 @@ fn normalize_runner_error(code: &str) -> &'static str {
         "cas_stage_failed" => "cas_stage_failed",
         "cas_write_failed" => "cas_write_failed",
         "cas_finish_failed" => "cas_finish_failed",
+        "cas_read_failed" => "cas_read_failed",
+        "cas_object_missing" => "cas_object_missing",
         "sync_apply_failed" => "sync_apply_failed",
+        "sync_key_unavailable" => "sync_key_unavailable",
+        // Push phase (the send half of bidirectional sync).
+        "push_send_failed" => "push_send_failed",
+        "push_read_failed" => "push_read_failed",
+        "push_rejected" => "push_rejected",
+        "push_out_of_order" => "push_out_of_order",
+        "push_apply_failed" => "push_apply_failed",
+        "push_bad_message" => "push_bad_message",
+        "push_bad_kind" => "push_bad_kind",
+        "push_too_large" => "push_too_large",
+        // Conflict scan (reading the three sides of a divergent path).
+        "conflict_domain_invalid" => "conflict_domain_invalid",
+        "conflict_read_failed" => "conflict_read_failed",
+        "conflict_cas_read_failed" => "conflict_cas_read_failed",
+        "conflict_content_invalid" => "conflict_content_invalid",
+        "conflict_input_invalid" => "conflict_input_invalid",
+        "conflict_merge_failed" => "conflict_merge_failed",
+        "conflict_insert_failed" => "conflict_insert_failed",
         _ => "operation_failed",
     }
 }

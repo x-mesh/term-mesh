@@ -22,7 +22,8 @@ use sync_protocol::{SyncHello, PROJECT_SYNC_CAPABILITY, PROTOCOL_V1};
 
 use super::{
     build_apply_plan, decode_manifest_batch, encode_manifest_batches, reconcile_bidirectional,
-    run_fetch_pull, run_push, ApplyStore, CasStore, DeviceTlsIdentity, FetchEntry, ManifestBuilder,
+    run_fetch_pull, run_push, scan_conflicts, ApplyStore, CasStore, DeviceTlsIdentity, FetchEntry,
+    ManifestBuilder,
     ManifestEntry, ManifestScanner, ObjectDomain, ObjectType, OperationResult, OperationSpec,
     ProjectId, ScanCheckpoint, ScanError, ScanLimits, ScanObserver, ScanReason, StreamLane,
     SyncConnection, SyncEndpoint, SyncTransport, TrustStore,
@@ -291,23 +292,42 @@ impl NetworkSyncRunner {
         // the peer, and what it must push to the peer, converging both sides.
         // (Deletes + conflicts are computed but their application is deferred to a
         // follow-up; this wires the fetch/push core of bidirectional sync.)
-        let base = {
+        let (base, base_objects_before) = {
             let store = ctx
                 .apply_store
                 .lock()
                 .map_err(|_| "sync_apply_failed".to_string())?;
-            store
-                .load_base_manifest(project)
-                .map_err(|_| "sync_apply_failed".to_string())?
+            (
+                store
+                    .load_base_manifest(project)
+                    .map_err(|_| "sync_apply_failed".to_string())?,
+                // Snapshot: the conflict scan reads the base as it stood BEFORE
+                // this run advances it.
+                store
+                    .load_base_objects(project)
+                    .map_err(|_| "sync_apply_failed".to_string())?,
+            )
         };
         let plan = reconcile_bidirectional(&base, local_entries, &remote_entries);
 
-        // FETCH: pull remote-only changes and apply them to the local tree.
-        let resolved = run_fetch_pull(&mut connection, &ctx.cas, domain, &plan.fetch).await?;
+        // FETCH: pull remote-only changes, plus the peer's side of every
+        // conflicting path. The conflicting ones are requested but deliberately
+        // kept OUT of the apply plan below — they are staged in CAS only, so the
+        // three-way scan can read them without overwriting the local edit.
+        let mut wanted = plan.fetch.clone();
+        wanted.extend(
+            plan.conflicts
+                .iter()
+                .filter_map(|conflict| conflict.remote.clone()),
+        );
+        let resolved = run_fetch_pull(&mut connection, &ctx.cas, domain, &wanted).await?;
         // `operation_id` seeds apply's deterministic temp/backup/trash names; a
         // fresh random id per run keeps concurrent applies from colliding.
         let mut operation_id = [0u8; 16];
         getrandom::getrandom(&mut operation_id).map_err(|_| "sync_apply_failed".to_string())?;
+        // Built from `plan.fetch`, NOT `wanted`: a conflicting path must not be
+        // applied. `build_apply_plan` iterates the entries it is given, so the
+        // extra staged objects in `resolved` are simply unused here.
         let apply_plan = build_apply_plan(project, operation_id, &plan.fetch, &resolved, local_entries);
         if !apply_plan.entries.is_empty() {
             let store = ctx
@@ -351,20 +371,19 @@ impl NetworkSyncRunner {
                 .iter()
                 .map(|entry| (entry.relative_path.clone(), entry.clone()))
                 .collect();
-            let mut object_map = {
-                let store = ctx
-                    .apply_store
-                    .lock()
-                    .map_err(|_| "sync_apply_failed".to_string())?;
-                store
-                    .load_base_objects(project)
-                    .map_err(|_| "sync_apply_failed".to_string())?
-            };
+            let mut object_map = base_objects_before.clone();
             for entry in plan.fetch.iter().chain(plan.push.iter()) {
                 base_map.insert(entry.relative_path.clone(), fetch_to_manifest(entry));
             }
-            for (path, object_id) in resolved.iter().chain(pushed.iter()) {
-                object_map.insert(path.clone(), *object_id);
+            // Only the paths whose base entry just advanced. `resolved` also holds
+            // the staged REMOTE side of every conflicting path — adopting those
+            // would leave the base manifest on the old content while its object
+            // pointed at the peer's, quietly resolving a conflict nobody decided.
+            for entry in plan.fetch.iter().chain(plan.push.iter()) {
+                let path = &entry.relative_path;
+                if let Some(object_id) = resolved.get(path).or_else(|| pushed.get(path)) {
+                    object_map.insert(path.clone(), *object_id);
+                }
             }
             // Drop objects for paths no longer in the base, so the table cannot
             // grow forever with ids whose base entry is gone.
@@ -381,6 +400,24 @@ impl NetworkSyncRunner {
                 .save_base_objects(project, &object_map)
                 .map_err(|_| "sync_apply_failed".to_string())?;
         }
+
+        // Classify what diverged on both sides. Reading the base needs the object
+        // map as it was BEFORE this run advanced it, which is why the scan takes
+        // `base_objects_before` rather than re-reading the store.
+        let scan = scan_conflicts(
+            &plan.conflicts,
+            &ctx.cas,
+            domain,
+            spec.held_root.canonical_path(),
+            &resolved,
+            &base_objects_before,
+        )?;
+
+        // Conflicting paths were left untouched on both peers. Surfacing the set
+        // (persisting the records, reporting the count on the operation, offering
+        // a resolution) is BD-4c; classifying them here is what makes that
+        // possible, and doing it now keeps the staged remote content in reach.
+        let _ = scan.outstanding();
 
         Ok(OperationResult {
             manifest_root: hex::encode(manifest_root(local_entries)?),

@@ -442,6 +442,12 @@ impl ConflictSet {
         self.unresolved.get(&conflict_id)
     }
 
+    /// The unresolved conflicts in conflict-id order. Stable across calls, so a
+    /// listing a user acts on does not reshuffle between reading and resolving.
+    pub fn iter(&self) -> impl Iterator<Item = &ConflictRecord> {
+        self.unresolved.values()
+    }
+
     pub fn len(&self) -> usize {
         self.unresolved.len()
     }

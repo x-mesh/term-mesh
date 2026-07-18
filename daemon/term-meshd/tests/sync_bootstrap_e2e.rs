@@ -454,8 +454,12 @@ async fn serve_project_responds_to_a_real_sync() {
 /// Bidirectional: the initiator (A) holds a file the peer (B) lacks and B holds a
 /// file A lacks. One sync converges BOTH trees — A fetches B's file and pushes its
 /// own, driven by the real runner + `serve_project` responder.
+///
+/// Then, with a base established, both peers edit the SAME file differently. That
+/// path must survive untouched on both sides: a conflict is reported, not applied
+/// in either direction.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn bidirectional_sync_converges_both_trees() {
+async fn bidirectional_sync_converges_both_trees_then_leaves_a_divergent_edit_alone() {
     let temporary = tempfile::tempdir().unwrap();
     let recovery = SigningKey::from_bytes(&[0x61; 32]);
     let device_a = [0x63; 32];
@@ -611,6 +615,81 @@ async fn bidirectional_sync_converges_both_trees() {
             "base object for {path} missing from CAS",
         );
     }
+
+    // ── Second sync: both peers edit the same file differently. ───────────────
+    // `a-only.txt` is in the base now, so the reconcile can tell that BOTH sides
+    // moved away from the agreed content — the one case where neither version may
+    // be applied.
+    std::fs::write(local_root.path().join("a-only.txt"), b"edited-by-A").unwrap();
+    std::fs::write(peer_root.path().join("a-only.txt"), b"edited-by-B").unwrap();
+
+    let second = manager
+        .start(OperationStartParams {
+            request_id: "cd".repeat(16),
+            project_id: op_project_id.clone(),
+            kind: OperationKind::Sync,
+            peer: Some("peer-b".to_string()),
+        })
+        .await
+        .unwrap();
+    let mut finished = None;
+    for _ in 0..150 {
+        let record = manager.status(&second.operation_id, &op_project_id).unwrap();
+        if record.state.is_terminal() {
+            finished = Some(record);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let record = finished.expect("second sync did not terminate in time");
+    // The run still succeeds — a conflict blocks one path, not the whole sync.
+    assert_eq!(
+        record.state,
+        OperationState::Succeeded,
+        "second sync failed: {:?}",
+        record.error_code
+    );
+
+    // Neither side was overwritten. This is the guarantee: pulling the peer's
+    // side of a conflict stages it in CAS for classification but never applies it.
+    assert_eq!(
+        std::fs::read(local_root.path().join("a-only.txt")).unwrap(),
+        b"edited-by-A",
+        "A's edit was clobbered by the peer's version",
+    );
+    assert_eq!(
+        std::fs::read(peer_root.path().join("a-only.txt")).unwrap(),
+        b"edited-by-B",
+        "B's edit was clobbered by the pushed version",
+    );
+
+    // The base for the conflicting path did NOT advance — it still holds what the
+    // two peers last agreed on, so the next run sees the same divergence rather
+    // than silently adopting one side.
+    let (base_after, base_objects_after) = {
+        let store = context_a.apply_store.lock().unwrap();
+        (
+            store.load_base_manifest(project).unwrap(),
+            store.load_base_objects(project).unwrap(),
+        )
+    };
+    let conflicted = base_after
+        .iter()
+        .find(|entry| entry.relative_path == "a-only.txt")
+        .expect("a-only.txt still in the base");
+    assert_eq!(
+        conflicted.content_hash,
+        *blake3::hash(b"lives-on-A").as_bytes(),
+        "the base advanced to one side of an unresolved conflict",
+    );
+    // The base OBJECT must not drift away from the base manifest either. The
+    // peer's version was staged in CAS for classification, and adopting it here
+    // would resolve the conflict behind the user's back.
+    assert_eq!(
+        base_objects_after["a-only.txt"],
+        ObjectId::for_plaintext(domain, b"lives-on-A"),
+        "the base object adopted the peer's side of an unresolved conflict",
+    );
 
     stop.store(true, std::sync::atomic::Ordering::Release);
 }
