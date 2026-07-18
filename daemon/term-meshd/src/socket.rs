@@ -1672,6 +1672,43 @@ async fn dispatch(req: &Request, ctx: &Context) -> Response {
                 Err(_) => Err("INVALID_PARAMS: project_id and operation_id are required".to_string()),
             }
         }
+        // Dev/test-grade explicit-endpoint bootstrap (wiring-plan §6 D3). Two
+        // phases: `bootstrap_identity` ensures this daemon's TLS identity and
+        // returns its cert hash so the driver can assemble the roster; then
+        // `bootstrap_trust` applies the roster + shared DEK + peer address book.
+        // Both are keychain-backed, hence macOS-only for now.
+        "sync.bootstrap_identity" => {
+            #[cfg(target_os = "macos")]
+            {
+                match serde_json::from_value::<SyncBootstrapIdentityParams>(req.params.clone()) {
+                    Ok(params) => handle_sync_bootstrap_identity(params).await,
+                    Err(_) => {
+                        Err("INVALID_PARAMS: project_id and device_id are required".to_string())
+                    }
+                }
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                Err("SYNC_BOOTSTRAP_UNSUPPORTED: keychain-backed bootstrap requires macOS"
+                    .to_string())
+            }
+        }
+        "sync.bootstrap_trust" => {
+            #[cfg(target_os = "macos")]
+            {
+                match serde_json::from_value::<SyncBootstrapTrustParams>(req.params.clone()) {
+                    Ok(params) => handle_sync_bootstrap_trust(params).await,
+                    Err(_) => {
+                        Err("INVALID_PARAMS: bootstrap-trust descriptor is malformed".to_string())
+                    }
+                }
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                Err("SYNC_BOOTSTRAP_UNSUPPORTED: keychain-backed bootstrap requires macOS"
+                    .to_string())
+            }
+        }
         "pairing.list" => match project_id_param(&req.params) {
             Ok(project_id) => match load_project(ctx, project_id).await {
                 Ok(_) => Ok(serde_json::json!({
@@ -3425,6 +3462,159 @@ struct SyncStartParams {
     project_id: String,
     kind: crate::sync::OperationKind,
     peer_id: Option<String>,
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SyncBootstrapIdentityParams {
+    project_id: String,
+    device_id: String,
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BootstrapRosterEntry {
+    device_id: String,
+    certificate_hash: String,
+    epoch: u64,
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BootstrapPeerEntry {
+    peer_id: String,
+    addr: String,
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SyncBootstrapTrustParams {
+    project_id: String,
+    /// 32-byte ed25519 recovery seed, hex. Dev-grade: the driver holds it.
+    recovery: String,
+    /// Shared project DEK — 16-byte key id + 32-byte key, both hex.
+    dek_key_id: String,
+    dek_key: String,
+    /// This daemon's own device id + roster epoch.
+    device_id: String,
+    epoch: u64,
+    roster: Vec<BootstrapRosterEntry>,
+    peers: Vec<BootstrapPeerEntry>,
+}
+
+/// Parse exactly `N` bytes of lowercase hex, naming the field in the error.
+#[cfg(target_os = "macos")]
+fn parse_hex_bytes<const N: usize>(value: &str, field: &str) -> Result<[u8; N], String> {
+    let decoded = hex::decode(value)
+        .map_err(|_| format!("INVALID_PARAMS: {field} must be {} hex characters", N * 2))?;
+    decoded
+        .try_into()
+        .map_err(|_| format!("INVALID_PARAMS: {field} must be {} hex characters", N * 2))
+}
+
+#[cfg(target_os = "macos")]
+fn bootstrap_error(error: crate::sync::BootstrapError) -> String {
+    use crate::sync::BootstrapError::{InvalidRoster, Keychain, Provisioning, Storage, Trust};
+    match error {
+        InvalidRoster => "SYNC_BOOTSTRAP_INVALID_ROSTER: the roster does not match this daemon's identity or epochs".to_string(),
+        Storage => "SYNC_BOOTSTRAP_STORAGE: the per-project store directory could not be created".to_string(),
+        Trust(_) => "SYNC_BOOTSTRAP_TRUST: applying trust grants failed".to_string(),
+        Keychain(_) => "SYNC_BOOTSTRAP_KEYCHAIN: keychain access failed".to_string(),
+        Provisioning(_) => "SYNC_BOOTSTRAP_PROVISIONING: writing provisioning coordinates failed".to_string(),
+    }
+}
+
+/// Identity phase: ensure `(project, device)`'s TLS identity, return its cert
+/// hash. Keychain + generation is blocking, so it runs on a blocking worker.
+#[cfg(target_os = "macos")]
+async fn handle_sync_bootstrap_identity(
+    params: SyncBootstrapIdentityParams,
+) -> Result<serde_json::Value, String> {
+    let project_id = parse_project_id(&params.project_id)?;
+    let device_id = parse_hex_bytes::<32>(&params.device_id, "device_id")?;
+    let hash = tokio::task::spawn_blocking(move || {
+        crate::sync::ensure_device_identity(&crate::sync::MacOsKeychain, project_id, device_id)
+            .map(|identity| identity.certificate_hash())
+    })
+    .await
+    .map_err(|_| "SYNC_BOOTSTRAP_ERROR: identity worker failed".to_string())?
+    .map_err(bootstrap_error)?;
+    Ok(serde_json::json!({
+        "project_id": project_id.to_string(),
+        "device_id": hex::encode(device_id),
+        "certificate_hash": hex::encode(hash),
+    }))
+}
+
+/// Apply phase: open this daemon's per-project trust store + the provisioning
+/// store and provision the project from the descriptor. Blocking I/O runs on a
+/// blocking worker.
+#[cfg(target_os = "macos")]
+async fn handle_sync_bootstrap_trust(
+    params: SyncBootstrapTrustParams,
+) -> Result<serde_json::Value, String> {
+    let project_id = parse_project_id(&params.project_id)?;
+    let recovery_seed = parse_hex_bytes::<32>(&params.recovery, "recovery")?;
+    let dek_key_id = parse_hex_bytes::<16>(&params.dek_key_id, "dek_key_id")?;
+    let dek_key = parse_hex_bytes::<32>(&params.dek_key, "dek_key")?;
+    let local_device = parse_hex_bytes::<32>(&params.device_id, "device_id")?;
+    let local_epoch = params.epoch;
+
+    let mut roster = Vec::with_capacity(params.roster.len());
+    for entry in &params.roster {
+        roster.push(crate::sync::BootstrapDevice {
+            device_id: parse_hex_bytes::<32>(&entry.device_id, "roster.device_id")?,
+            certificate_hash: parse_hex_bytes::<32>(&entry.certificate_hash, "roster.certificate_hash")?,
+            epoch: entry.epoch,
+        });
+    }
+    let mut peers = Vec::with_capacity(params.peers.len());
+    for entry in &params.peers {
+        let addr: std::net::SocketAddr = entry.addr.parse().map_err(|_| {
+            format!("INVALID_PARAMS: peer addr '{}' is not a socket address", entry.addr)
+        })?;
+        peers.push((entry.peer_id.clone(), addr));
+    }
+    let roster_size = roster.len();
+    let peers_size = peers.len();
+
+    let hash = tokio::task::spawn_blocking(move || {
+        let recovery = ed25519_dalek::SigningKey::from_bytes(&recovery_seed);
+        let dek = crate::sync::ProjectKeyMaterial {
+            key_id: crate::sync::KeyId(dek_key_id),
+            key: crate::sync::ProjectKey::new(dek_key),
+        };
+        let paths = crate::sync::DaemonBootstrapPaths::defaults(project_id);
+        let local = crate::sync::LocalCoordinates {
+            device_id: local_device,
+            roster_epoch: local_epoch,
+        };
+        crate::sync::run_bootstrap_trust(
+            &crate::sync::MacOsKeychain,
+            &paths,
+            project_id,
+            &recovery,
+            &dek,
+            local,
+            &roster,
+            &peers,
+        )
+    })
+    .await
+    .map_err(|_| "SYNC_BOOTSTRAP_ERROR: bootstrap worker failed".to_string())?
+    .map_err(bootstrap_error)?;
+
+    Ok(serde_json::json!({
+        "project_id": project_id.to_string(),
+        "device_id": hex::encode(local_device),
+        "certificate_hash": hex::encode(hash),
+        "roster_size": roster_size,
+        "peers_size": peers_size,
+    }))
 }
 
 fn parse_project_id(value: &str) -> Result<crate::sync::ProjectId, String> {

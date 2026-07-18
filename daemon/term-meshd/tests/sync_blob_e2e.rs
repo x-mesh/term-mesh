@@ -86,12 +86,12 @@ async fn encrypted_object_transfers_over_blob_lane_byte_identically() {
     let roster = [
         BootstrapDevice {
             device_id: device_a,
-            identity: &identity_a,
+            certificate_hash: identity_a.certificate_hash(),
             epoch: 1,
         },
         BootstrapDevice {
             device_id: device_b,
-            identity: &identity_b,
+            certificate_hash: identity_b.certificate_hash(),
             epoch: 2,
         },
     ];

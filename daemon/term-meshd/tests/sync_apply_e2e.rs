@@ -80,8 +80,8 @@ async fn transferred_object_is_applied_to_the_destination_filesystem() {
         TrustStore::open(temporary.path().join("trust_b.sqlite3"), project_id, recovery.verifying_key().to_bytes()).unwrap(),
     );
     let roster = [
-        BootstrapDevice { device_id: device_a, identity: &identity_a, epoch: 1 },
-        BootstrapDevice { device_id: device_b, identity: &identity_b, epoch: 2 },
+        BootstrapDevice { device_id: device_a, certificate_hash: identity_a.certificate_hash(), epoch: 1 },
+        BootstrapDevice { device_id: device_b, certificate_hash: identity_b.certificate_hash(), epoch: 2 },
     ];
     seed_trust_store(&trust_a, project_id, &recovery, &roster).unwrap();
     seed_trust_store(&trust_b, project_id, &recovery, &roster).unwrap();

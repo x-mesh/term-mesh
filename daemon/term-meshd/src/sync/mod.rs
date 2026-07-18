@@ -156,7 +156,9 @@ pub use trust::{
 pub use trust_bootstrap::{seed_trust_store, BootstrapDevice};
 #[allow(unused_imports)]
 pub use bootstrap::{
-    bootstrap_two_daemons, provision_daemon, BootstrapError, BootstrapPeer, DaemonProvisioning,
+    bootstrap_two_daemons, default_project_trust_db_path, default_sync_state_root,
+    ensure_device_identity, provision_daemon, run_bootstrap_trust, BootstrapError, BootstrapPeer,
+    DaemonBootstrapPaths, DaemonProvisioning,
 };
 #[allow(unused_imports)]
 pub use trust_recovery::{

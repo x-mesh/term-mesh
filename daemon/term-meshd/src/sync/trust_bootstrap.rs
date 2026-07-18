@@ -20,18 +20,26 @@
 use ed25519_dalek::{Signer, SigningKey};
 use sync_protocol::{CanonicalRecord, ControlFields, DeviceGrantPayload, RecordKind};
 
-use super::{DeviceTlsIdentity, ProjectId, TrustError, TrustStore};
+use super::{ProjectId, TrustError, TrustStore};
 
 /// One device participating in a bootstrapped roster.
-pub struct BootstrapDevice<'a> {
+///
+/// A grant needs only the device's *certificate hash*, not its private TLS key —
+/// so a daemon can grant a **remote** peer it knows only by hash (the private key
+/// never leaves the peer's machine). The local device supplies the full identity
+/// elsewhere (to persist its private half); here every roster member, local or
+/// remote, is just `(device_id, certificate_hash, epoch)`.
+#[derive(Debug, Clone, Copy)]
+pub struct BootstrapDevice {
     /// Stable 32-byte device id. In this dev bootstrap it also seeds the
     /// device's control signing key (`SigningKey::from_bytes(device_id)`),
     /// matching the roster-test convention; production derives that key
     /// independently and grants carry its public half.
     pub device_id: [u8; 32],
-    /// The device's own TLS identity — its certificate hash is pinned into
-    /// every roster member's trust store so the QUIC handshake can authorize it.
-    pub identity: &'a DeviceTlsIdentity,
+    /// The device's TLS certificate hash (`DeviceTlsIdentity::certificate_hash`),
+    /// pinned into every roster member's trust store so the QUIC handshake can
+    /// authorize it.
+    pub certificate_hash: [u8; 32],
     /// Monotonic roster epoch at which this device is granted. Must be `> 0` and
     /// strictly increasing across the roster (grants apply in epoch order).
     pub epoch: u64,
@@ -46,7 +54,7 @@ pub struct BootstrapDevice<'a> {
 fn signed_grant(
     recovery: &SigningKey,
     project_id: [u8; 32],
-    device: &BootstrapDevice<'_>,
+    device: &BootstrapDevice,
 ) -> CanonicalRecord {
     let signing = SigningKey::from_bytes(&device.device_id);
     let fields = ControlFields {
@@ -63,7 +71,7 @@ fn signed_grant(
         ephemeral_public_key: [3; 32],
         wrap_nonce: [4; 24],
         wrapped_dek: [5; 48],
-        tls_certificate_hash: device.identity.certificate_hash(),
+        tls_certificate_hash: device.certificate_hash,
     }
     .encode();
     let mut record = CanonicalRecord {
@@ -93,10 +101,10 @@ pub fn seed_trust_store(
     store: &TrustStore,
     project_id: ProjectId,
     recovery: &SigningKey,
-    devices: &[BootstrapDevice<'_>],
+    devices: &[BootstrapDevice],
 ) -> Result<(), TrustError> {
     let project_bytes = *project_id.as_bytes();
-    let mut ordered: Vec<&BootstrapDevice<'_>> = devices.iter().collect();
+    let mut ordered: Vec<&BootstrapDevice> = devices.iter().collect();
     ordered.sort_by_key(|device| device.epoch);
     for device in ordered {
         store.apply_control_record(&signed_grant(recovery, project_bytes, device))?;

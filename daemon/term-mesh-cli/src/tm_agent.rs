@@ -1175,6 +1175,21 @@ enum SyncCommand {
         project: String,
         operation: String,
     },
+    /// Dev/test bootstrap — identity phase: ensure this daemon's TLS identity for
+    /// a project and print its certificate hash (feeds the roster).
+    BootstrapIdentity {
+        #[arg(long)]
+        project: String,
+        #[arg(long)]
+        device: String,
+    },
+    /// Dev/test bootstrap — apply phase: provision this daemon from a JSON
+    /// descriptor (`{project_id, recovery, dek_key_id, dek_key, device_id, epoch,
+    /// roster[], peers[]}`). Pass a file path, or `-` to read stdin.
+    BootstrapTrust {
+        #[arg(long)]
+        descriptor: String,
+    },
 }
 
 #[derive(clap::Args)]
@@ -3333,6 +3348,27 @@ fn run_project_sync_command(sock: &PathBuf, command: &Commands) -> Result<Value,
                 "sync.cancel",
                 json!({ "project_id": project, "operation_id": operation }),
             ),
+            SyncCommand::BootstrapIdentity { project, device } => (
+                "sync.bootstrap_identity",
+                json!({ "project_id": project, "device_id": device }),
+            ),
+            SyncCommand::BootstrapTrust { descriptor } => {
+                // The descriptor JSON matches the RPC params 1:1, so forward it
+                // verbatim (file path, or `-` for stdin).
+                let raw = if descriptor == "-" {
+                    let mut buf = String::new();
+                    std::io::Read::read_to_string(&mut std::io::stdin(), &mut buf)
+                        .map_err(|error| format!("failed to read descriptor from stdin: {error}"))?;
+                    buf
+                } else {
+                    std::fs::read_to_string(descriptor).map_err(|error| {
+                        format!("failed to read descriptor '{descriptor}': {error}")
+                    })?
+                };
+                let params: Value = serde_json::from_str(&raw)
+                    .map_err(|error| format!("descriptor is not valid JSON: {error}"))?;
+                ("sync.bootstrap_trust", params)
+            }
         },
         Commands::Conflict(group) => match &group.command {
             ConflictCommand::List { project } => {

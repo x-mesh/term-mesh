@@ -26,12 +26,14 @@
 //! this writes; `tm-agent sync bootstrap-trust` (piece 4) drives it.
 
 use std::net::SocketAddr;
+use std::path::PathBuf;
 
 use ed25519_dalek::SigningKey;
 
 use super::{
-    generate_project_key, persist_device_tls_identity, persist_project_key, seed_trust_store,
-    BootstrapDevice, DeviceTlsIdentity, KeychainBackend, KeychainError, LocalCoordinates, ProjectId,
+    default_provisioning_db_path, generate_project_key, load_device_tls_identity,
+    persist_device_tls_identity, persist_project_key, seed_trust_store, BootstrapDevice,
+    DeviceTlsIdentity, KeychainBackend, KeychainError, LocalCoordinates, ProjectId,
     ProjectKeyMaterial, ProvisioningError, SyncProvisioningStore, TrustError, TrustStore,
 };
 
@@ -41,8 +43,12 @@ use super::{
 #[derive(Debug)]
 pub enum BootstrapError {
     /// Roster epochs must be non-zero and distinct across devices (grants apply
-    /// in strictly-ascending epoch order — see [`BootstrapDevice::epoch`]).
+    /// in strictly-ascending epoch order — see [`BootstrapDevice::epoch`]); also
+    /// raised when the local daemon's roster entry does not match the identity it
+    /// actually holds.
     InvalidRoster,
+    /// Filesystem setup for a per-project store directory failed.
+    Storage,
     Trust(TrustError),
     Keychain(KeychainError),
     Provisioning(ProvisioningError),
@@ -106,7 +112,7 @@ pub fn provision_daemon(
     project_id: ProjectId,
     recovery: &SigningKey,
     dek: &ProjectKeyMaterial,
-    roster: &[BootstrapDevice<'_>],
+    roster: &[BootstrapDevice],
     daemon: &DaemonProvisioning<'_>,
 ) -> Result<(), BootstrapError> {
     let project_bytes = *project_id.as_bytes();
@@ -182,12 +188,12 @@ pub fn bootstrap_two_daemons(
     let roster = [
         BootstrapDevice {
             device_id: a.device_id,
-            identity: a.identity,
+            certificate_hash: a.identity.certificate_hash(),
             epoch: a.epoch,
         },
         BootstrapDevice {
             device_id: b.device_id,
-            identity: b.identity,
+            certificate_hash: b.identity.certificate_hash(),
             epoch: b.epoch,
         },
     ];
@@ -225,6 +231,141 @@ pub fn bootstrap_two_daemons(
     )?;
 
     Ok(dek)
+}
+
+// ── Daemon-facing orchestration (piece 4: the `sync.bootstrap_trust` RPC) ─────
+//
+// The socket handler is a thin adapter over these: it parses the hex descriptor,
+// builds a `MacOsKeychain`, and calls `ensure_device_identity` (identity phase)
+// or `run_bootstrap_trust` (apply phase). Keeping the store-opening + path layout
+// here — not in `socket.rs` — makes the daemon bootstrap unit-testable with a
+// temp dir + an in-memory keychain, and gives the P0 sync-context registry one
+// source of truth for where each project's trust store lives.
+
+/// Root of the daemon's per-project sync state, mirroring the provisioning
+/// store's location. `TERMMESH_SYNC_STATE_DIR` overrides it (tests, isolated
+/// daemons); otherwise it is `<data-local>/term-mesh/sync`.
+pub fn default_sync_state_root() -> PathBuf {
+    if let Some(dir) = std::env::var_os("TERMMESH_SYNC_STATE_DIR") {
+        if !dir.is_empty() {
+            return PathBuf::from(dir);
+        }
+    }
+    dirs::data_local_dir()
+        .unwrap_or_else(|| PathBuf::from("/tmp"))
+        .join("term-mesh")
+        .join("sync")
+}
+
+/// The per-project trust store path the bootstrap writes and the sync-context
+/// registry (P0) reads: `<sync state>/projects/<hex(project_id)>/trust.sqlite3`.
+pub fn default_project_trust_db_path(project_id: ProjectId) -> PathBuf {
+    default_sync_state_root()
+        .join("projects")
+        .join(hex::encode(project_id.as_bytes()))
+        .join("trust.sqlite3")
+}
+
+/// Load this daemon's TLS identity for `(project_id, device_id)`, generating and
+/// persisting a fresh one when none exists. The identity phase of the bootstrap
+/// calls this and reports the certificate hash so the driver can assemble the
+/// roster from every daemon's real hash before applying trust.
+pub fn ensure_device_identity(
+    keychain: &dyn KeychainBackend,
+    project_id: ProjectId,
+    device_id: [u8; 32],
+) -> Result<DeviceTlsIdentity, BootstrapError> {
+    let project_bytes = *project_id.as_bytes();
+    match load_device_tls_identity(keychain, project_bytes, device_id) {
+        Ok(identity) => Ok(identity),
+        Err(KeychainError::NotFound) => {
+            let identity = DeviceTlsIdentity::generate()?;
+            persist_device_tls_identity(keychain, project_bytes, device_id, &identity)?;
+            Ok(identity)
+        }
+        Err(error) => Err(BootstrapError::Keychain(error)),
+    }
+}
+
+/// Where one daemon's bootstrap writes its stores. `defaults` derives them from
+/// the daemon's state dir; tests inject temp paths.
+pub struct DaemonBootstrapPaths {
+    pub trust_db: PathBuf,
+    pub provisioning_db: PathBuf,
+}
+
+impl DaemonBootstrapPaths {
+    pub fn defaults(project_id: ProjectId) -> Self {
+        Self {
+            trust_db: default_project_trust_db_path(project_id),
+            provisioning_db: default_provisioning_db_path(),
+        }
+    }
+}
+
+/// Apply a bootstrap descriptor to THIS daemon (the `sync.bootstrap_trust` apply
+/// phase): ensure its TLS identity, open its per-project trust store + the
+/// provisioning store at `paths`, and provision the project (trust grants + DEK +
+/// coordinates + peer address book). Returns the daemon's own certificate hash.
+///
+/// `roster` must include this daemon's own entry, and that entry's certificate
+/// hash + epoch must match the identity this daemon actually holds — otherwise it
+/// would be granted a certificate no peer will accept at handshake time, so the
+/// mismatch is rejected (`InvalidRoster`) rather than silently provisioned.
+pub fn run_bootstrap_trust(
+    keychain: &dyn KeychainBackend,
+    paths: &DaemonBootstrapPaths,
+    project_id: ProjectId,
+    recovery: &SigningKey,
+    dek: &ProjectKeyMaterial,
+    local: LocalCoordinates,
+    roster: &[BootstrapDevice],
+    peers: &[(String, SocketAddr)],
+) -> Result<[u8; 32], BootstrapError> {
+    let identity = ensure_device_identity(keychain, project_id, local.device_id)?;
+    let local_hash = identity.certificate_hash();
+
+    let own = roster
+        .iter()
+        .find(|device| device.device_id == local.device_id)
+        .ok_or(BootstrapError::InvalidRoster)?;
+    if own.certificate_hash != local_hash || own.epoch != local.roster_epoch {
+        return Err(BootstrapError::InvalidRoster);
+    }
+
+    // SQLite creates the db file, not the per-project directory; make it 0700
+    // like the provisioning store's parent.
+    if let Some(parent) = paths.trust_db.parent() {
+        std::fs::create_dir_all(parent).map_err(|_| BootstrapError::Storage)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700));
+        }
+    }
+    let trust = TrustStore::open(
+        &paths.trust_db,
+        project_id,
+        recovery.verifying_key().to_bytes(),
+    )?;
+    let provisioning = SyncProvisioningStore::open(&paths.provisioning_db)?;
+
+    provision_daemon(
+        project_id,
+        recovery,
+        dek,
+        roster,
+        &DaemonProvisioning {
+            keychain,
+            trust: &trust,
+            provisioning: &provisioning,
+            device_id: local.device_id,
+            identity: &identity,
+            roster_epoch: local.roster_epoch,
+            peers,
+        },
+    )?;
+    Ok(local_hash)
 }
 
 #[cfg(test)]
@@ -293,8 +434,8 @@ mod tests {
         let dek = generate_project_key().unwrap();
 
         let roster = [
-            BootstrapDevice { device_id: device_self, identity: &identity_self, epoch: 1 },
-            BootstrapDevice { device_id: device_peer, identity: &identity_peer, epoch: 2 },
+            BootstrapDevice { device_id: device_self, certificate_hash: identity_self.certificate_hash(), epoch: 1 },
+            BootstrapDevice { device_id: device_peer, certificate_hash: identity_peer.certificate_hash(), epoch: 2 },
         ];
         let addr: SocketAddr = "10.0.0.9:4433".parse().unwrap();
         provision_daemon(
@@ -438,5 +579,102 @@ mod tests {
 
         assert!(matches!(build(0, 2), Err(BootstrapError::InvalidRoster)));
         assert!(matches!(build(1, 1), Err(BootstrapError::InvalidRoster)));
+    }
+
+    #[test]
+    fn ensure_device_identity_generates_then_loads_stably() {
+        let keychain = MemoryKeychain::default();
+        let project = ProjectId::from_bytes([0x71; 32]);
+        let device = [0x72; 32];
+        // First call generates + persists; the second loads the same identity.
+        let first = ensure_device_identity(&keychain, project, device).unwrap();
+        let second = ensure_device_identity(&keychain, project, device).unwrap();
+        assert_eq!(first.certificate_hash(), second.certificate_hash());
+    }
+
+    fn temp_paths(dir: &std::path::Path) -> DaemonBootstrapPaths {
+        DaemonBootstrapPaths {
+            trust_db: dir.join("projects").join("p").join("trust.sqlite3"),
+            provisioning_db: dir.join("prov.db"),
+        }
+    }
+
+    #[test]
+    fn run_bootstrap_trust_provisions_this_daemon_and_grants_a_hash_only_peer() {
+        let dir = tempfile::tempdir().unwrap();
+        let recovery = SigningKey::from_bytes(&[0x73; 32]);
+        let project = ProjectId::from_bytes([0x74; 32]);
+        let keychain = MemoryKeychain::default();
+        let local_device = [0x75; 32];
+        let peer_device = [0x76; 32];
+        let peer_hash = [0xab; 32]; // a remote peer known ONLY by certificate hash
+
+        // Identity phase: this daemon's real cert hash feeds the roster.
+        let local_hash = ensure_device_identity(&keychain, project, local_device)
+            .unwrap()
+            .certificate_hash();
+
+        let paths = temp_paths(dir.path());
+        let dek = generate_project_key().unwrap();
+        let roster = [
+            BootstrapDevice { device_id: local_device, certificate_hash: local_hash, epoch: 1 },
+            BootstrapDevice { device_id: peer_device, certificate_hash: peer_hash, epoch: 2 },
+        ];
+        let addr: SocketAddr = "127.0.0.1:7000".parse().unwrap();
+
+        let returned = run_bootstrap_trust(
+            &keychain,
+            &paths,
+            project,
+            &recovery,
+            &dek,
+            LocalCoordinates { device_id: local_device, roster_epoch: 1 },
+            &roster,
+            &[("peer".to_string(), addr)],
+        )
+        .unwrap();
+        assert_eq!(returned, local_hash);
+
+        // Provisioning + DEK landed; the remote peer was granted from its hash
+        // (no identity object needed on this side).
+        let prov = SyncProvisioningStore::open(&paths.provisioning_db).unwrap();
+        assert_eq!(
+            prov.local(*project.as_bytes()).unwrap().unwrap().device_id,
+            local_device
+        );
+        assert_eq!(prov.peer_addr("peer").unwrap(), Some(addr));
+        assert_eq!(
+            load_project_key(&keychain, *project.as_bytes()).unwrap().key_id,
+            dek.key_id
+        );
+        // The trust store opened at the standard per-project path.
+        assert!(paths.trust_db.exists());
+    }
+
+    #[test]
+    fn run_bootstrap_trust_rejects_local_hash_mismatch() {
+        let dir = tempfile::tempdir().unwrap();
+        let recovery = SigningKey::from_bytes(&[0x77; 32]);
+        let project = ProjectId::from_bytes([0x78; 32]);
+        let keychain = MemoryKeychain::default();
+        let local_device = [0x79; 32];
+        ensure_device_identity(&keychain, project, local_device).unwrap();
+
+        let paths = temp_paths(dir.path());
+        let dek = generate_project_key().unwrap();
+        // Roster claims a WRONG cert hash for the local device — the daemon must
+        // refuse rather than grant a certificate it cannot present.
+        let roster = [BootstrapDevice { device_id: local_device, certificate_hash: [0x00; 32], epoch: 1 }];
+        let result = run_bootstrap_trust(
+            &keychain,
+            &paths,
+            project,
+            &recovery,
+            &dek,
+            LocalCoordinates { device_id: local_device, roster_epoch: 1 },
+            &roster,
+            &[],
+        );
+        assert!(matches!(result, Err(BootstrapError::InvalidRoster)));
     }
 }
