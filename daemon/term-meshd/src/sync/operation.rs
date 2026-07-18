@@ -850,6 +850,7 @@ fn normalize_runner_error(code: &str) -> &'static str {
         "conflict_input_invalid" => "conflict_input_invalid",
         "conflict_merge_failed" => "conflict_merge_failed",
         "conflict_insert_failed" => "conflict_insert_failed",
+        "conflict_store_failed" => "conflict_store_failed",
         _ => "operation_failed",
     }
 }

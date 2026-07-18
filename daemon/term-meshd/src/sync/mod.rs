@@ -40,6 +40,7 @@ mod trust_recovery;
 pub use blob::{chunk_count_for, put_plaintext, recv_object, send_object};
 #[allow(unused_imports)]
 pub use apply::{
+    APPLY_SCHEMA_VERSION,
     ApplyAction, ApplyBoundary, ApplyCrashHook, ApplyError, ApplyIoPoint, ApplyPlan,
     ApplyPlanEntry, ApplyPrecondition, ApplyStore, VisibleState,
 };
@@ -51,7 +52,8 @@ pub use cas::{
 };
 #[allow(unused_imports)]
 pub use conflict::{
-    ConflictContent, ConflictError, ConflictKind, ConflictPathOrigin, ConflictRecord,
+    decode_conflict_set, encode_conflict_set, ConflictContent, ConflictError, ConflictKind,
+    ConflictPathOrigin, ConflictRecord,
     ConflictResolution, ConflictSet, ConflictSide, ResolutionPrecondition, ResolvedConflict,
     MAX_CONFLICT_CONTENT_BYTES, MAX_CONFLICT_COUNT, MAX_CONFLICT_PATH_BYTES,
     MAX_CONFLICT_TOTAL_BYTES,

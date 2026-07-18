@@ -413,11 +413,19 @@ impl NetworkSyncRunner {
             &base_objects_before,
         )?;
 
-        // Conflicting paths were left untouched on both peers. Surfacing the set
-        // (persisting the records, reporting the count on the operation, offering
-        // a resolution) is BD-4c; classifying them here is what makes that
-        // possible, and doing it now keeps the staged remote content in reach.
-        let _ = scan.outstanding();
+        // Conflicting paths were left untouched on both peers; record what they
+        // are so a user can resolve them later, from another process. Whole-set
+        // replacement, so a conflict that has since been resolved or edited away
+        // does not linger.
+        {
+            let store = ctx
+                .apply_store
+                .lock()
+                .map_err(|_| "sync_apply_failed".to_string())?;
+            store
+                .save_conflicts(project, &scan.set)
+                .map_err(|_| "conflict_store_failed".to_string())?;
+        }
 
         Ok(OperationResult {
             manifest_root: hex::encode(manifest_root(local_entries)?),

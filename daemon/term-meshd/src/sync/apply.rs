@@ -15,15 +15,18 @@ use super::path_sandbox::{PathFingerprint, PathIdentity, PathSandbox, PathSandbo
 use super::project_lock::{acquire_project_file_lease_at, ProjectLockError};
 use super::sqlite_openat_vfs::OpenAtVfs;
 use super::{
-    decode_entries, encode_entries, CasError, CasStore, ManifestEntry, ObjectDomain, ObjectId,
-    ObjectType, ProjectId,
+    decode_conflict_set, decode_entries, encode_conflict_set, encode_entries, CasError, CasStore,
+    ConflictSet, ManifestEntry, ObjectDomain, ObjectId, ObjectType, ProjectId,
 };
 
 const APP_ID: i64 = 0x544d_4150;
 /// Bump whenever `APPLY_SCHEMA` changes. `migrate_additive` brings an older
 /// database up to it by creating whatever it lacks, so a version bump is only a
 /// signal — the migration itself reads the actual table set.
-const VERSION: i64 = 4;
+///
+/// Public so tests assert against it rather than a literal that silently rots.
+pub const APPLY_SCHEMA_VERSION: i64 = 5;
+const VERSION: i64 = APPLY_SCHEMA_VERSION;
 const APPLY_SCHEMA: &[(&str, &str)] = &[
     ("operations", "CREATE TABLE operations(operation_id BLOB PRIMARY KEY CHECK(length(operation_id)=16),project BLOB NOT NULL CHECK(length(project)=32),target_root BLOB NOT NULL CHECK(length(target_root)=32),frontier BLOB NOT NULL,phase TEXT NOT NULL CHECK(phase IN('prepared','applying','committed','rolled_back','blocked')),created_at_ms INTEGER NOT NULL CHECK(created_at_ms>=0)) STRICT"),
     ("entries", "CREATE TABLE entries(operation_id BLOB NOT NULL CHECK(length(operation_id)=16),ordinal INTEGER NOT NULL CHECK(ordinal>=0),path TEXT NOT NULL,action TEXT NOT NULL CHECK(action IN('file','directory','symlink','delete')),expected_absent INTEGER NOT NULL CHECK(expected_absent IN(0,1)),original_digest BLOB CHECK(original_digest IS NULL OR length(original_digest)=32),temp_name TEXT NOT NULL,backup_name TEXT NOT NULL,installed_digest BLOB CHECK(installed_digest IS NULL OR length(installed_digest)=32),installed_dev INTEGER CHECK(installed_dev IS NULL OR installed_dev>=0),installed_ino INTEGER CHECK(installed_ino IS NULL OR installed_ino>=0),phase TEXT NOT NULL CHECK(phase IN('planned','temp_durable','backup_intent','backup_durable','install_intent','installed_durable')),recovery_phase TEXT NOT NULL CHECK(recovery_phase IN('none','rollback_intent','rollback_durable','cleanup_intent','cleanup_durable')),PRIMARY KEY(operation_id,ordinal),UNIQUE(operation_id,path),FOREIGN KEY(operation_id) REFERENCES operations(operation_id)) STRICT"),
@@ -35,6 +38,9 @@ const APPLY_SCHEMA: &[(&str, &str)] = &[
     // not an ObjectId (an ObjectId also binds the domain and length), so the base
     // bytes are unaddressable without this side table.
     ("base_objects", "CREATE TABLE base_objects(project BLOB NOT NULL CHECK(length(project)=32),path TEXT NOT NULL,object_id BLOB NOT NULL CHECK(length(object_id)=32),PRIMARY KEY(project,path)) STRICT"),
+    // Unresolved conflicts per project. They outlive the sync operation that
+    // found them — a user resolves them later, from another process.
+    ("conflicts", "CREATE TABLE conflicts(project BLOB PRIMARY KEY CHECK(length(project)=32),records BLOB NOT NULL) STRICT"),
     ("one_active_operation", "CREATE UNIQUE INDEX one_active_operation ON operations(project) WHERE phase NOT IN('committed','rolled_back')"),
 ];
 
@@ -352,6 +358,44 @@ impl ApplyStore {
             objects.insert(path, ObjectId(bytes));
         }
         Ok(objects)
+    }
+
+    /// Replace the project's unresolved conflicts with `set`.
+    ///
+    /// Whole-set replacement, because the set always reflects the latest scan: a
+    /// conflict the user has since resolved (or edited away) must not linger, and
+    /// an unchanged one re-derives the same content-addressed id, so re-storing it
+    /// is a no-op from the caller's perspective.
+    pub fn save_conflicts(
+        &self,
+        project: ProjectId,
+        set: &ConflictSet,
+    ) -> Result<(), ApplyError> {
+        let encoded = encode_conflict_set(set);
+        let connection = self.connection.lock().map_err(|_| ApplyError::Poisoned)?;
+        connection.execute(
+            "INSERT INTO conflicts(project,records)VALUES(?1,?2)\
+             ON CONFLICT(project)DO UPDATE SET records=excluded.records",
+            rusqlite::params![project.as_bytes().as_slice(), encoded],
+        )?;
+        Ok(())
+    }
+
+    /// The project's unresolved conflicts, or an empty set when it has none.
+    /// Every stored record is re-validated on the way out (see the codec note).
+    pub fn load_conflicts(&self, domain: ObjectDomain) -> Result<ConflictSet, ApplyError> {
+        let connection = self.connection.lock().map_err(|_| ApplyError::Poisoned)?;
+        let encoded: Option<Vec<u8>> = connection
+            .query_row(
+                "SELECT records FROM conflicts WHERE project=?1",
+                [domain.project_id.as_bytes().as_slice()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        match encoded {
+            None => ConflictSet::new(domain).map_err(|_| ApplyError::Corrupt),
+            Some(bytes) => decode_conflict_set(&bytes, domain).map_err(|_| ApplyError::Corrupt),
+        }
     }
 
     pub fn visible_state(&self, project: ProjectId) -> Result<Option<VisibleState>, ApplyError> {

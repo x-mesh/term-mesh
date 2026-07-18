@@ -320,3 +320,156 @@ fn outstanding_counts_classified_and_unclassified_together() {
     assert_eq!(scan.unclassified.len(), 1);
     assert_eq!(scan.outstanding(), 2);
 }
+
+// ── persistence (BD-4c) ─────────────────────────────────────────────────────
+
+use sync::{decode_conflict_set, encode_conflict_set, ApplyStore, ConflictSet};
+
+fn state_dir(base: &std::path::Path, name: &str) -> std::path::PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = base.join(name);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+    dir
+}
+
+/// A conflict outlives the operation that found it, so every field a resolution
+/// needs — all three sides' bytes included — must survive the round trip.
+#[test]
+fn a_conflict_set_round_trips_through_the_codec() {
+    let mut fixture = Fixture::new();
+    let base = fixture.base("notes.txt", b"start\n");
+    let remote = fixture.remote("notes.txt", b"start\ntheirs\n");
+    let local = fixture.local("notes.txt", b"start\nmine\n");
+    let gone_base = fixture.base("gone.txt", b"was here\n");
+    let gone_remote = fixture.remote("gone.txt", b"was here\nedited\n");
+
+    let scan = fixture.scan(&[
+        ConflictPath {
+            relative_path: "notes.txt".into(),
+            base: Some(base),
+            local: Some(local),
+            remote: Some(remote),
+        },
+        ConflictPath {
+            relative_path: "gone.txt".into(),
+            base: Some(gone_base),
+            local: None,
+            remote: Some(gone_remote),
+        },
+    ]);
+    assert_eq!(scan.set.len(), 2);
+
+    let restored = decode_conflict_set(&encode_conflict_set(&scan.set), fixture.domain).unwrap();
+    assert_eq!(restored.len(), 2);
+    for original in scan.set.iter() {
+        // The id is recomputed on decode, so matching ids prove the rebuilt
+        // record is byte-for-byte the same conflict, not merely similar.
+        let same = restored
+            .get(original.conflict_id())
+            .expect("conflict id survived the round trip");
+        assert_eq!(same.kind(), original.kind());
+        assert_eq!(same.paths(), original.paths());
+        assert_eq!(same.base().map(|c| c.bytes()), original.base().map(|c| c.bytes()));
+        assert_eq!(same.local().map(|c| c.bytes()), original.local().map(|c| c.bytes()));
+        assert_eq!(same.remote().map(|c| c.bytes()), original.remote().map(|c| c.bytes()));
+        // The precondition a resolution is checked against must also survive, or
+        // every restored conflict would be unresolvable.
+        assert_eq!(same.precondition(), original.precondition());
+    }
+}
+
+#[test]
+fn an_empty_conflict_set_round_trips() {
+    let fixture = Fixture::new();
+    let empty = ConflictSet::new(fixture.domain).unwrap();
+    let restored = decode_conflict_set(&encode_conflict_set(&empty), fixture.domain).unwrap();
+    assert!(restored.is_empty());
+}
+
+/// The codec rebuilds through the validating constructor rather than trusting
+/// the stored bytes, so tampering is rejected instead of loaded.
+#[test]
+fn a_tampered_or_foreign_encoding_is_rejected() {
+    let mut fixture = Fixture::new();
+    let base = fixture.base("notes.txt", b"start\n");
+    let remote = fixture.remote("notes.txt", b"start\ntheirs\n");
+    let local = fixture.local("notes.txt", b"start\nmine\n");
+    let scan = fixture.scan(&[ConflictPath {
+        relative_path: "notes.txt".into(),
+        base: Some(base),
+        local: Some(local),
+        remote: Some(remote),
+    }]);
+    let encoded = encode_conflict_set(&scan.set);
+
+    // Content bytes edited without updating their address: the constructor
+    // re-derives the content root and refuses.
+    let mut flipped = encoded.clone();
+    let last = flipped.len() - 1;
+    flipped[last] ^= 0xff;
+    assert!(decode_conflict_set(&flipped, fixture.domain).is_err());
+
+    // Truncated.
+    assert!(decode_conflict_set(&encoded[..encoded.len() / 2], fixture.domain).is_err());
+
+    // Trailing garbage — a decoder that stopped at the last record would accept
+    // this and silently drop whatever followed.
+    let mut extended = encoded.clone();
+    extended.push(0);
+    assert!(decode_conflict_set(&extended, fixture.domain).is_err());
+
+    // Stored under a different project: adopting it would attach one project's
+    // conflicts to another.
+    let other = ObjectDomain {
+        project_id: ProjectId::from_bytes([0x99; 32]),
+        object_type: ObjectType::FILE,
+        version: 1,
+    };
+    assert!(decode_conflict_set(&encoded, other).is_err());
+
+    // Unknown codec version.
+    let mut wrong_version = encoded.clone();
+    wrong_version[0] = 99;
+    assert!(decode_conflict_set(&wrong_version, fixture.domain).is_err());
+}
+
+/// Conflicts must survive the process that found them — resolution happens later.
+#[test]
+fn stored_conflicts_survive_a_store_reopen_and_are_replaced_wholesale() {
+    let mut fixture = Fixture::new();
+    let temporary = tempfile::tempdir().unwrap();
+    let database = state_dir(temporary.path(), "apply-state").join("apply.db");
+    let project = fixture.domain.project_id;
+
+    let base = fixture.base("notes.txt", b"start\n");
+    let remote = fixture.remote("notes.txt", b"start\ntheirs\n");
+    let local = fixture.local("notes.txt", b"start\nmine\n");
+    let scan = fixture.scan(&[ConflictPath {
+        relative_path: "notes.txt".into(),
+        base: Some(base),
+        local: Some(local),
+        remote: Some(remote),
+    }]);
+
+    let store = ApplyStore::open(&database).unwrap();
+    assert!(
+        store.load_conflicts(fixture.domain).unwrap().is_empty(),
+        "a project with no stored conflicts loads an empty set, not an error"
+    );
+    store.save_conflicts(project, &scan.set).unwrap();
+    drop(store);
+
+    let reopened = ApplyStore::open(&database).unwrap();
+    let loaded = reopened.load_conflicts(fixture.domain).unwrap();
+    assert_eq!(loaded.len(), 1);
+    let record = loaded.iter().next().unwrap();
+    assert_eq!(record.paths(), ["notes.txt".to_string()]);
+    assert_eq!(record.local().unwrap().bytes(), b"start\nmine\n");
+
+    // A later sync replaces the set, so a conflict that is gone stays gone.
+    reopened
+        .save_conflicts(project, &ConflictSet::new(fixture.domain).unwrap())
+        .unwrap();
+    assert!(reopened.load_conflicts(fixture.domain).unwrap().is_empty());
+}

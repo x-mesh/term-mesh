@@ -26,7 +26,8 @@ use ed25519_dalek::SigningKey;
 use sync::{
     ensure_device_identity, exchange_manifests, generate_project_key, load_device_tls_identity,
     load_project_key, receive_push, respond_to_fetch, run_bootstrap_trust, scan_project_entries,
-    serve_project, ApplyStore, BootstrapDevice, CasLimits, CasStore, DaemonBootstrapPaths,
+    serve_project, ApplyStore, BootstrapDevice, CasLimits, CasStore, ConflictKind,
+    DaemonBootstrapPaths,
     KeychainBackend, KeychainError, KeychainItem, KeychainProjectKeyProvider, LocalCoordinates,
     NetworkSyncRunner, ObjectDomain, ObjectId, ObjectType, OperationKind, OperationManager,
     OperationStartParams, OperationState, ProjectId, ProjectRegistry, ProvisioningPeerResolver,
@@ -690,6 +691,21 @@ async fn bidirectional_sync_converges_both_trees_then_leaves_a_divergent_edit_al
         ObjectId::for_plaintext(domain, b"lives-on-A"),
         "the base object adopted the peer's side of an unresolved conflict",
     );
+
+    // The conflict was recorded, classified, and stored — it outlives the
+    // operation, so it can be listed and resolved from another process later.
+    let stored = {
+        let store = context_a.apply_store.lock().unwrap();
+        store.load_conflicts(domain).unwrap()
+    };
+    assert_eq!(stored.len(), 1, "one unresolved conflict recorded");
+    let record = stored.iter().next().unwrap();
+    assert_eq!(record.paths(), ["a-only.txt".to_string()]);
+    assert_eq!(record.kind(), &ConflictKind::Text);
+    // All three sides are on hand, so resolving needs no second round trip.
+    assert_eq!(record.base().unwrap().bytes(), b"lives-on-A");
+    assert_eq!(record.local().unwrap().bytes(), b"edited-by-A");
+    assert_eq!(record.remote().unwrap().bytes(), b"edited-by-B");
 
     stop.store(true, std::sync::atomic::Ordering::Release);
 }

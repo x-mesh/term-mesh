@@ -7,7 +7,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::sync::Arc;
 
 use sync::{
-    encrypt_chunk, ApplyAction, ApplyBoundary, ApplyCrashHook, ApplyError, ApplyIoPoint, ApplyPlan,
+    encrypt_chunk, APPLY_SCHEMA_VERSION, ApplyAction, ApplyBoundary, ApplyCrashHook, ApplyError, ApplyIoPoint, ApplyPlan,
     ApplyPlanEntry, ApplyPrecondition, ApplyStore, CasError, CasLimits, CasStore, HeadDecision,
     KeyId, ObjectDomain, ObjectId, ObjectType, PathFingerprint, PathKind, ProjectId, ProjectKey,
     ProjectKeyMaterial, ProjectKeyProvider, ReconcileError, ReconcileStore, TransportPeerSnapshot,
@@ -1584,12 +1584,12 @@ fn sqlite_dms_truncates_stale_shm_and_survives_opener_crash_reopen_race() {
     holder.wait().unwrap();
     drop(concurrent);
     let reopened = ApplyStore::open(&database).unwrap();
-    // The current apply schema version — bump alongside `VERSION` in apply.rs.
     assert_eq!(
         reopened
             .sqlite_test_query_i64("PRAGMA user_version")
             .unwrap(),
-        4
+        APPLY_SCHEMA_VERSION,
+        "the schema version must survive the crash/reopen race intact",
     );
 }
 

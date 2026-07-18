@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 use std::fmt;
 
-use super::{ObjectDomain, ObjectId, ObjectType};
+use super::{ObjectDomain, ObjectId, ObjectType, ProjectId};
 
 const CONFLICT_ID_DOMAIN: &[u8] = b"term-mesh conflict v1\0";
 const CONFLICT_STATE_DOMAIN: &[u8] = b"term-mesh conflict state v1\0";
@@ -769,3 +769,215 @@ impl fmt::Display for ConflictError {
 }
 
 impl std::error::Error for ConflictError {}
+
+// ── persistence codec ───────────────────────────────────────────────────────
+//
+// Unresolved conflicts must outlive the sync operation that found them — a user
+// resolves them later, from a different process. The encoding carries the
+// CONSTRUCTOR INPUTS rather than the built record: decoding rebuilds through
+// `new_with_origins`, so a stored row runs the full validation again and its
+// `conflict_id` is recomputed canonically. A corrupted or tampered row therefore
+// cannot smuggle in a mismatched id, an impossible shape, or content whose bytes
+// disagree with their address — it fails to decode instead.
+
+const CONFLICT_CODEC_VERSION: u8 = 1;
+/// Bound on a stored set, mirroring the in-memory `ConflictSet` limits so a
+/// corrupt length prefix cannot drive a huge allocation before validation.
+const MAX_ENCODED_CONFLICT_BYTES: usize = MAX_CONFLICT_TOTAL_BYTES + 1024 * 1024;
+
+impl ConflictSide {
+    fn from_tag(tag: u8) -> Option<Self> {
+        match tag {
+            1 => Some(Self::Local),
+            2 => Some(Self::Remote),
+            _ => None,
+        }
+    }
+}
+
+impl ConflictKind {
+    fn from_tag(tag: u8) -> Option<Self> {
+        Some(match tag {
+            1 => Self::Text,
+            2 => Self::Binary,
+            3 => Self::AddAddText,
+            4 => Self::AddAddBinary,
+            5 => Self::DeleteModify { deleted: ConflictSide::Local },
+            6 => Self::DeleteModify { deleted: ConflictSide::Remote },
+            7 => Self::RenameCycle,
+            8 => Self::ExecutableBit,
+            9 => Self::CaseCollision,
+            10 => Self::UnicodeNormalization,
+            11 => Self::UnicodeCaseCollision,
+            12 => Self::ExactPathCollision,
+            _ => return None,
+        })
+    }
+}
+
+fn put_str(out: &mut Vec<u8>, value: &str) {
+    out.extend_from_slice(&(value.len() as u32).to_be_bytes());
+    out.extend_from_slice(value.as_bytes());
+}
+
+fn put_content(out: &mut Vec<u8>, content: Option<&ConflictContent>) {
+    match content {
+        None => out.push(0),
+        Some(content) => {
+            out.push(1);
+            out.extend_from_slice(&content.content_root.0);
+            out.push(u8::from(content.executable));
+            out.extend_from_slice(&(content.bytes.len() as u32).to_be_bytes());
+            out.extend_from_slice(&content.bytes);
+        }
+    }
+}
+
+/// Encode every unresolved conflict in `set` for storage.
+pub fn encode_conflict_set(set: &ConflictSet) -> Vec<u8> {
+    let mut out = vec![CONFLICT_CODEC_VERSION];
+    let domain = set.expected_domain;
+    out.extend_from_slice(domain.project_id.as_bytes());
+    out.extend_from_slice(&domain.object_type.get().to_be_bytes());
+    out.extend_from_slice(&domain.version.to_be_bytes());
+    out.extend_from_slice(&(set.unresolved.len() as u32).to_be_bytes());
+    for record in set.unresolved.values() {
+        out.push(record.kind.tag());
+        out.extend_from_slice(&(record.paths.len() as u32).to_be_bytes());
+        for path in &record.paths {
+            put_str(&mut out, path);
+        }
+        out.extend_from_slice(&(record.path_origins.len() as u32).to_be_bytes());
+        for origin in &record.path_origins {
+            put_str(&mut out, &origin.source_path);
+            put_str(&mut out, &origin.target_path);
+            out.push(origin.side.tag());
+        }
+        put_content(&mut out, record.base.as_ref());
+        put_content(&mut out, record.local.as_ref());
+        put_content(&mut out, record.remote.as_ref());
+    }
+    out
+}
+
+/// Rebuild a stored conflict set, re-validating every record.
+///
+/// `expected_domain` is the project the caller is loading for; a set stored under
+/// a different domain is rejected rather than adopted, so a mixed-up row cannot
+/// attach one project's conflicts to another.
+pub fn decode_conflict_set(
+    input: &[u8],
+    expected_domain: ObjectDomain,
+) -> Result<ConflictSet, ConflictError> {
+    if input.len() > MAX_ENCODED_CONFLICT_BYTES {
+        return Err(ConflictError::BudgetExceeded);
+    }
+    let mut reader = CodecReader { input, offset: 0 };
+    if reader.u8()? != CONFLICT_CODEC_VERSION {
+        return Err(ConflictError::NonCanonicalConflict);
+    }
+    let domain = ObjectDomain {
+        project_id: ProjectId::from_bytes(reader.array::<32>()?),
+        object_type: ObjectType::new(reader.u16()?)
+            .map_err(|_| ConflictError::InvalidObjectDomain)?,
+        version: reader.u16()?,
+    };
+    if domain != expected_domain {
+        return Err(ConflictError::InvalidObjectDomain);
+    }
+    let mut set = ConflictSet::new(domain)?;
+    let count = reader.u32()? as usize;
+    if count > MAX_CONFLICT_COUNT {
+        return Err(ConflictError::BudgetExceeded);
+    }
+    for _ in 0..count {
+        let kind = ConflictKind::from_tag(reader.u8()?)
+            .ok_or(ConflictError::InvalidConflictShape)?;
+        let path_count = reader.u32()? as usize;
+        if path_count > MAX_CONFLICT_COUNT {
+            return Err(ConflictError::BudgetExceeded);
+        }
+        let mut paths = Vec::with_capacity(path_count.min(64));
+        for _ in 0..path_count {
+            paths.push(reader.string()?);
+        }
+        let origin_count = reader.u32()? as usize;
+        if origin_count > MAX_CONFLICT_COUNT {
+            return Err(ConflictError::BudgetExceeded);
+        }
+        let mut origins = Vec::with_capacity(origin_count.min(64));
+        for _ in 0..origin_count {
+            let source_path = reader.string()?;
+            let target_path = reader.string()?;
+            let side =
+                ConflictSide::from_tag(reader.u8()?).ok_or(ConflictError::InvalidConflictShape)?;
+            origins.push(ConflictPathOrigin { source_path, target_path, side });
+        }
+        let base = reader.content(domain)?;
+        let local = reader.content(domain)?;
+        let remote = reader.content(domain)?;
+        // Rebuilt, not trusted: this re-runs every shape/content check and
+        // recomputes the conflict id from the canonical digest.
+        set.insert(ConflictRecord::new_with_origins(
+            domain, kind, paths, origins, base, local, remote,
+        )?)?;
+    }
+    if reader.offset != input.len() {
+        return Err(ConflictError::NonCanonicalConflict);
+    }
+    Ok(set)
+}
+
+struct CodecReader<'a> {
+    input: &'a [u8],
+    offset: usize,
+}
+
+impl<'a> CodecReader<'a> {
+    fn take(&mut self, n: usize) -> Result<&'a [u8], ConflictError> {
+        let end = self
+            .offset
+            .checked_add(n)
+            .ok_or(ConflictError::BudgetExceeded)?;
+        let slice = self
+            .input
+            .get(self.offset..end)
+            .ok_or(ConflictError::NonCanonicalConflict)?;
+        self.offset = end;
+        Ok(slice)
+    }
+    fn u8(&mut self) -> Result<u8, ConflictError> {
+        Ok(self.take(1)?[0])
+    }
+    fn u16(&mut self) -> Result<u16, ConflictError> {
+        Ok(u16::from_be_bytes(self.take(2)?.try_into().unwrap()))
+    }
+    fn u32(&mut self) -> Result<u32, ConflictError> {
+        Ok(u32::from_be_bytes(self.take(4)?.try_into().unwrap()))
+    }
+    fn array<const N: usize>(&mut self) -> Result<[u8; N], ConflictError> {
+        Ok(self.take(N)?.try_into().unwrap())
+    }
+    fn string(&mut self) -> Result<String, ConflictError> {
+        let len = self.u32()? as usize;
+        if len > MAX_CONFLICT_PATH_BYTES {
+            return Err(ConflictError::BudgetExceeded);
+        }
+        String::from_utf8(self.take(len)?.to_vec()).map_err(|_| ConflictError::InvalidPath)
+    }
+    fn content(&mut self, domain: ObjectDomain) -> Result<Option<ConflictContent>, ConflictError> {
+        if self.u8()? == 0 {
+            return Ok(None);
+        }
+        let content_root = ObjectId(self.array::<32>()?);
+        let executable = self.u8()? != 0;
+        let len = self.u32()? as usize;
+        if len > MAX_CONFLICT_CONTENT_BYTES {
+            return Err(ConflictError::BudgetExceeded);
+        }
+        let bytes = self.take(len)?.to_vec();
+        // `ConflictContent::new` re-derives the address, so bytes that do not
+        // match their recorded `content_root` are rejected here.
+        ConflictContent::new(domain, content_root, bytes, executable).map(Some)
+    }
+}
