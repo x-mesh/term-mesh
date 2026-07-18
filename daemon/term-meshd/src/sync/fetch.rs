@@ -19,7 +19,8 @@ use std::path::Path;
 use tokio::time::{timeout, Duration};
 
 use super::{
-    build_apply_plan, put_plaintext, ApplyStore, CasStore, EncryptedChunk, EntryKind, FetchEntry,
+    build_apply_plan, build_delete_plan, check_delete_guard, put_plaintext, ApplyStore, CasStore,
+    EncryptedChunk, EntryKind, FetchEntry,
     KeyId, ManifestEntry, ObjectDomain, ObjectId, ProjectId, ProjectKey, StreamLane, SyncConnection,
 };
 
@@ -122,10 +123,10 @@ fn kind_from_u8(value: u8) -> Result<EntryKind, String> {
 }
 
 /// The push manifest: the full set of entries the initiator is pushing (files,
-/// dirs, symlinks), so the responder can build an apply plan that creates
-/// ancestors + symlinks, not just the file bytes. One message on the
-/// SyncOperation lane (bounded like the request).
-fn encode_push_manifest(entries: &[FetchEntry]) -> Vec<u8> {
+/// dirs, symlinks) plus the paths it wants REMOVED, so the responder can build an
+/// apply plan that creates ancestors + symlinks and drops what the initiator
+/// deleted. One message on the SyncOperation lane (bounded like the request).
+fn encode_push_manifest(entries: &[FetchEntry], deletes: &[String]) -> Vec<u8> {
     let mut out = vec![TAG_PUSH_MANIFEST];
     out.extend_from_slice(&(entries.len() as u32).to_be_bytes());
     for entry in entries {
@@ -144,10 +145,15 @@ fn encode_push_manifest(entries: &[FetchEntry]) -> Vec<u8> {
             None => out.push(0),
         }
     }
+    out.extend_from_slice(&(deletes.len() as u32).to_be_bytes());
+    for path in deletes {
+        out.extend_from_slice(&(path.len() as u32).to_be_bytes());
+        out.extend_from_slice(path.as_bytes());
+    }
     out
 }
 
-fn decode_push_manifest(payload: &[u8]) -> Result<Vec<FetchEntry>, String> {
+fn decode_push_manifest(payload: &[u8]) -> Result<(Vec<FetchEntry>, Vec<String>), String> {
     let mut r = Reader::new(payload);
     if r.u8()? != TAG_PUSH_MANIFEST {
         return Err("push_bad_message".into());
@@ -179,7 +185,21 @@ fn decode_push_manifest(payload: &[u8]) -> Result<Vec<FetchEntry>, String> {
             symlink_target,
         });
     }
-    Ok(entries)
+    let delete_count = r.u32()? as usize;
+    if delete_count > 4_000_000 {
+        return Err("push_too_large".into());
+    }
+    let mut deletes = Vec::with_capacity(delete_count.min(1024));
+    for _ in 0..delete_count {
+        let len = r.u32()? as usize;
+        deletes.push(r.string(len)?);
+    }
+    // Reject trailing bytes: a peer speaking a longer message than this build
+    // understands must fail loudly, not have the tail silently ignored.
+    if r.offset != payload.len() {
+        return Err("push_bad_message".into());
+    }
+    Ok((entries, deletes))
 }
 
 /// A decoded fetch-phase message from the initiator's perspective.
@@ -424,11 +444,12 @@ pub async fn run_push(
     key: &ProjectKey,
     key_id: KeyId,
     push: &[FetchEntry],
+    deletes: &[String],
 ) -> Result<HashMap<String, ObjectId>, String> {
     let sender = connection.sender();
     let mut pushed = HashMap::new();
     sender
-        .send(StreamLane::SyncOperation, encode_push_manifest(push))
+        .send(StreamLane::SyncOperation, encode_push_manifest(push, deletes))
         .await
         .map_err(|_| "push_send_failed".to_string())?;
     for entry in push {
@@ -517,7 +538,7 @@ async fn receive_push_inner(
     project: ProjectId,
     local: &[ManifestEntry],
 ) -> Result<u64, String> {
-    let push_entries = decode_push_manifest(&recv_syncop(connection).await?)?;
+    let (push_entries, delete_paths) = decode_push_manifest(&recv_syncop(connection).await?)?;
 
     let mut resolved = HashMap::new();
     loop {
@@ -555,7 +576,7 @@ async fn receive_push_inner(
     let mut operation_id = [0u8; 16];
     getrandom::getrandom(&mut operation_id).map_err(|_| "push_apply_failed".to_string())?;
     let plan = build_apply_plan(project, operation_id, &push_entries, &resolved, local);
-    let applied = plan.entries.len() as u64;
+    let mut applied = plan.entries.len() as u64;
     if !plan.entries.is_empty() {
         // Lock only for the (synchronous) apply — never across the network recv
         // above, so the guard is not held over an await.
@@ -565,6 +586,25 @@ async fn receive_push_inner(
         store
             .apply(root, cas, domain, &plan)
             .map_err(|_| "push_apply_failed".to_string())?;
+    }
+
+    // Deletes the initiator propagated. Guarded on this side too: the responder
+    // trusts the push, so the bound is the only thing standing between a peer
+    // with a broken manifest and an emptied tree.
+    if !delete_paths.is_empty() {
+        check_delete_guard(delete_paths.len(), local.len())?;
+        let mut delete_id = [0u8; 16];
+        getrandom::getrandom(&mut delete_id).map_err(|_| "push_apply_failed".to_string())?;
+        let delete_plan = build_delete_plan(project, delete_id, &delete_paths, local);
+        if !delete_plan.entries.is_empty() {
+            applied += delete_plan.entries.len() as u64;
+            let store = apply_store
+                .lock()
+                .map_err(|_| "push_apply_failed".to_string())?;
+            store
+                .apply(root, cas, domain, &delete_plan)
+                .map_err(|_| "push_apply_failed".to_string())?;
+        }
     }
     Ok(applied)
 }

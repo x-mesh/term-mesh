@@ -459,8 +459,11 @@ async fn serve_project_responds_to_a_real_sync() {
 /// Then, with a base established, both peers edit the SAME file differently. That
 /// path must survive untouched on both sides: a conflict is reported, not applied
 /// in either direction.
+///
+/// Finally each peer deletes a different file, and both deletions propagate —
+/// while the unresolved conflict stays put.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn bidirectional_sync_converges_both_trees_then_leaves_a_divergent_edit_alone() {
+async fn bidirectional_sync_converges_conflicts_and_propagates_deletes() {
     let temporary = tempfile::tempdir().unwrap();
     let recovery = SigningKey::from_bytes(&[0x61; 32]);
     let device_a = [0x63; 32];
@@ -706,6 +709,67 @@ async fn bidirectional_sync_converges_both_trees_then_leaves_a_divergent_edit_al
     assert_eq!(record.base().unwrap().bytes(), b"lives-on-A");
     assert_eq!(record.local().unwrap().bytes(), b"edited-by-A");
     assert_eq!(record.remote().unwrap().bytes(), b"edited-by-B");
+
+    // ── Third sync: a deletion on each side propagates to the other. ──────────
+    // `b-only.txt` is in the base and untouched since, so removing it locally is
+    // an unambiguous delete (had either side edited it, it would be a conflict).
+    // `shared.txt` never entered the base — both peers always had it identically —
+    // so deleting it on B alone still reads as a remote-side change from A's view.
+    std::fs::remove_file(local_root.path().join("b-only.txt")).unwrap();
+    std::fs::write(peer_root.path().join("gets-deleted.txt"), b"doomed").unwrap();
+
+    // Give B's copy a base first: one sync fetches it, the next can delete it.
+    for (request, _label) in [("de".repeat(16), "seed"), ("ef".repeat(16), "delete")] {
+        if request.starts_with("ef") {
+            std::fs::remove_file(peer_root.path().join("gets-deleted.txt")).unwrap();
+        }
+        let op = manager
+            .start(OperationStartParams {
+                request_id: request,
+                project_id: op_project_id.clone(),
+                kind: OperationKind::Sync,
+                peer: Some("peer-b".to_string()),
+            })
+            .await
+            .unwrap();
+        let mut done = None;
+        for _ in 0..150 {
+            let record = manager.status(&op.operation_id, &op_project_id).unwrap();
+            if record.state.is_terminal() {
+                done = Some(record);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        let record = done.expect("sync did not terminate in time");
+        assert_eq!(
+            record.state,
+            OperationState::Succeeded,
+            "sync failed: {:?}",
+            record.error_code
+        );
+    }
+
+    // A's deletion reached B (delete_remote, carried in the push manifest)...
+    assert!(
+        !peer_root.path().join("b-only.txt").exists(),
+        "A's delete did not propagate to the peer"
+    );
+    // ...and B's deletion reached A (delete_local, applied from the reconcile).
+    assert!(
+        !local_root.path().join("gets-deleted.txt").exists(),
+        "the peer's delete did not propagate to A"
+    );
+    // Deletions do not take neighbours with them.
+    assert_eq!(
+        std::fs::read(local_root.path().join("shared.txt")).unwrap(),
+        b"same-content"
+    );
+    assert_eq!(
+        std::fs::read(local_root.path().join("a-only.txt")).unwrap(),
+        b"edited-by-A",
+        "the unresolved conflict is still untouched",
+    );
 
     stop.store(true, std::sync::atomic::Ordering::Release);
 }

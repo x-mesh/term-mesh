@@ -146,6 +146,7 @@ pub use provisioning::{
 };
 #[allow(unused_imports)]
 pub use plan::{
+    build_delete_plan, check_delete_guard,
     build_apply_plan, decode_entries, decode_manifest_batch, diff_manifests, encode_entries,
     encode_manifest_batches, reconcile_bidirectional, BidiPlan, ConflictPath, FetchEntry,
     ManifestDiff, ManifestWireError,

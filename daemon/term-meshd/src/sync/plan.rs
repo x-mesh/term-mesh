@@ -338,6 +338,73 @@ pub fn build_apply_plan(
     }
 }
 
+/// A delete batch is refused when it would remove essentially the whole tree.
+///
+/// Deletes are the one direction that destroys work, and "the peer has nothing"
+/// is exactly what a partial or empty remote manifest looks like — a real bug of
+/// that shape (a re-scanned directory descriptor coming back empty) shipped in
+/// this codebase and was harmless ONLY because deletes were not applied yet. The
+/// guard keeps that class of failure recoverable: an ordinary cleanup passes, a
+/// wipe stops the operation with a distinct error the caller can act on.
+///
+/// Deliberately loose. It is a catastrophe backstop, not a policy knob: blocking
+/// a legitimate large deletion is its own kind of broken.
+const DELETE_GUARD_MIN_ENTRIES: usize = 10;
+const DELETE_GUARD_RATIO_NUMERATOR: usize = 9;
+const DELETE_GUARD_RATIO_DENOMINATOR: usize = 10;
+
+/// `Err` when deleting `deletes` of `present` tracked entries looks like a wipe.
+pub fn check_delete_guard(deletes: usize, present: usize) -> Result<(), String> {
+    if deletes >= DELETE_GUARD_MIN_ENTRIES
+        && deletes * DELETE_GUARD_RATIO_DENOMINATOR >= present * DELETE_GUARD_RATIO_NUMERATOR
+    {
+        return Err("delete_guard_tripped".to_string());
+    }
+    Ok(())
+}
+
+/// An [`ApplyPlan`] that removes `paths` from the working tree.
+///
+/// Only files and symlinks. A directory's precondition cannot be derived from a
+/// manifest entry, and removing one by its CURRENT state would carry off anything
+/// created inside it since the scan — so an emptied directory is left in place
+/// (it stays listed and simply re-appears as a no-op delete on later syncs).
+///
+/// Each precondition is the entry's state as the manifest recorded it, so a path
+/// modified between the scan and the apply is refused rather than deleted.
+pub fn build_delete_plan(
+    project: ProjectId,
+    operation_id: [u8; 16],
+    paths: &[String],
+    local: &[ManifestEntry],
+) -> ApplyPlan {
+    let local_by_path: HashMap<&str, &ManifestEntry> = local
+        .iter()
+        .map(|entry| (entry.relative_path.as_str(), entry))
+        .collect();
+    let mut entries: Vec<ApplyPlanEntry> = paths
+        .iter()
+        .filter_map(|path| {
+            let entry = local_by_path.get(path.as_str())?;
+            // Absent locally already: nothing to remove.
+            let fingerprint = manifest_fingerprint(entry)?;
+            Some(ApplyPlanEntry {
+                relative_path: path.clone(),
+                action: ApplyAction::Delete,
+                precondition: ApplyPrecondition::Present(fingerprint),
+            })
+        })
+        .collect();
+    entries.sort_by(|a, b| a.relative_path.cmp(&b.relative_path));
+    ApplyPlan {
+        operation_id,
+        project,
+        target_manifest_root: [0; 32],
+        frontier: Vec::new(),
+        entries,
+    }
+}
+
 #[derive(Debug, PartialEq, Eq)]
 pub enum ManifestWireError {
     Truncated,
@@ -604,6 +671,54 @@ mod tests {
         assert_eq!(plan.delete_remote, ["a"], "local deleted a → remote deletes a");
         assert_eq!(plan.delete_local, ["b"], "remote deleted b → local deletes b");
         assert!(plan.conflicts.is_empty() && plan.fetch.is_empty() && plan.push.is_empty());
+    }
+
+    #[test]
+    fn delete_plan_covers_files_and_symlinks_and_skips_directories() {
+        let local = vec![
+            file("keep", 1, false),
+            file("doomed", 2, false),
+            ManifestEntry {
+                relative_path: "adir".into(),
+                kind: EntryKind::Directory,
+                executable: true,
+                length: 0,
+                content_hash: [0; 32],
+                symlink_target: None,
+            },
+        ];
+        let paths = vec!["doomed".to_string(), "adir".to_string(), "never-existed".to_string()];
+        let plan = build_delete_plan(ProjectId::from_bytes([7; 32]), [1; 16], &paths, &local);
+
+        // The directory and the unknown path are skipped; only the file is planned.
+        assert_eq!(plan.entries.len(), 1);
+        assert_eq!(plan.entries[0].relative_path, "doomed");
+        assert!(matches!(plan.entries[0].action, ApplyAction::Delete));
+        // Preconditioned on the state the manifest recorded, so a file modified
+        // between the scan and the apply is refused rather than deleted.
+        assert!(matches!(
+            plan.entries[0].precondition,
+            ApplyPrecondition::Present(_)
+        ));
+    }
+
+    #[test]
+    fn the_delete_guard_allows_ordinary_cleanups_and_stops_a_wipe() {
+        // Small batches always pass, whatever the ratio — deleting the only two
+        // files in a two-file project is a normal thing to do.
+        assert!(check_delete_guard(2, 2).is_ok());
+        assert!(check_delete_guard(9, 9).is_ok());
+        // A big but partial cleanup passes.
+        assert!(check_delete_guard(50, 1000).is_ok());
+        assert!(check_delete_guard(500, 1000).is_ok());
+        // Wiping essentially everything does not. This is the shape a partial or
+        // empty peer manifest takes, which is exactly what must not go through.
+        assert!(check_delete_guard(1000, 1000).is_err());
+        assert!(check_delete_guard(950, 1000).is_err());
+        assert_eq!(
+            check_delete_guard(1000, 1000).unwrap_err(),
+            "delete_guard_tripped"
+        );
     }
 
     #[test]

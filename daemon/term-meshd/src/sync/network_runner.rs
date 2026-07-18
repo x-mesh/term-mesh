@@ -22,8 +22,8 @@ use sync_protocol::{SyncHello, PROJECT_SYNC_CAPABILITY, PROTOCOL_V1};
 
 use super::{
     build_apply_plan, decode_manifest_batch, encode_manifest_batches, reconcile_bidirectional,
-    run_fetch_pull, run_push, scan_conflicts, ApplyStore, CasStore, DeviceTlsIdentity, FetchEntry,
-    ManifestBuilder,
+    build_delete_plan, check_delete_guard, run_fetch_pull, run_push, scan_conflicts, ApplyStore,
+    CasStore, DeviceTlsIdentity, EntryKind, FetchEntry, ManifestBuilder,
     ManifestEntry, ManifestScanner, ObjectDomain, ObjectType, OperationResult, OperationSpec,
     ProjectId, ScanCheckpoint, ScanError, ScanLimits, ScanObserver, ScanReason, StreamLane,
     SyncConnection, SyncEndpoint, SyncTransport, TrustStore,
@@ -338,6 +338,31 @@ impl NetworkSyncRunner {
                 .apply(spec.held_root.canonical_path(), &ctx.cas, domain, &apply_plan)
                 .map_err(|_| "sync_apply_failed".to_string())?;
         }
+        // DELETE (local): paths the peer removed and this side had not touched
+        // since the base. Guarded, because "the peer has nothing" is what a
+        // partial manifest also looks like.
+        let deleted_locally = if plan.delete_local.is_empty() {
+            0
+        } else {
+            check_delete_guard(plan.delete_local.len(), local_entries.len())?;
+            let mut delete_id = [0u8; 16];
+            getrandom::getrandom(&mut delete_id).map_err(|_| "sync_apply_failed".to_string())?;
+            let delete_plan =
+                build_delete_plan(project, delete_id, &plan.delete_local, local_entries);
+            if delete_plan.entries.is_empty() {
+                0
+            } else {
+                let applied = delete_plan.entries.len();
+                let store = ctx
+                    .apply_store
+                    .lock()
+                    .map_err(|_| "sync_apply_failed".to_string())?;
+                store
+                    .apply(spec.held_root.canonical_path(), &ctx.cas, domain, &delete_plan)
+                    .map_err(|_| "sync_apply_failed".to_string())?;
+                applied
+            }
+        };
         if cancelled.load(Ordering::Acquire) {
             return Err("cancelled".to_string());
         }
@@ -355,6 +380,7 @@ impl NetworkSyncRunner {
             &dek.key,
             dek.key_id,
             &plan.push,
+            &plan.delete_remote,
         )
         .await?;
 
@@ -374,6 +400,15 @@ impl NetworkSyncRunner {
             let mut object_map = base_objects_before.clone();
             for entry in plan.fetch.iter().chain(plan.push.iter()) {
                 base_map.insert(entry.relative_path.clone(), fetch_to_manifest(entry));
+            }
+            // A propagated delete converged too: drop it from the base so it is
+            // not re-proposed forever. Only the paths actually removed — a delete
+            // the plan skipped (a directory) must stay outstanding.
+            for path in applied_delete_paths(&plan.delete_local, local_entries)
+                .into_iter()
+                .chain(plan.delete_remote.iter().cloned())
+            {
+                base_map.remove(&path);
             }
             // Only the paths whose base entry just advanced. `resolved` also holds
             // the staged REMOTE side of every conflicting path — adopting those
@@ -429,10 +464,29 @@ impl NetworkSyncRunner {
 
         Ok(OperationResult {
             manifest_root: hex::encode(manifest_root(local_entries)?),
-            // Paths that moved this run: fetched-and-applied + pushed.
-            entries: (apply_plan.entries.len() + plan.push.len()) as u64,
+            // Paths that moved this run: fetched-and-applied + pushed + deleted.
+            entries: (apply_plan.entries.len() + plan.push.len() + deleted_locally) as u64,
         })
     }
+}
+
+/// The subset of `paths` that `build_delete_plan` actually removes — files and
+/// symlinks present locally. Kept in step with that builder so the base only
+/// forgets what really went away.
+fn applied_delete_paths(paths: &[String], local: &[ManifestEntry]) -> Vec<String> {
+    let by_path: std::collections::HashMap<&str, &ManifestEntry> = local
+        .iter()
+        .map(|entry| (entry.relative_path.as_str(), entry))
+        .collect();
+    paths
+        .iter()
+        .filter(|path| {
+            by_path
+                .get(path.as_str())
+                .is_some_and(|entry| entry.kind != EntryKind::Directory)
+        })
+        .cloned()
+        .collect()
 }
 
 /// A pushed/fetched `FetchEntry` back to a `ManifestEntry` (identical fields) so

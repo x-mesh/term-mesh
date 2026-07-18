@@ -115,7 +115,7 @@ async fn push_streams_and_applies_a_local_file_to_the_peer() {
 
     // A pushes while B receives + applies.
     let (pushed, received) = tokio::join!(
-        run_push(&mut conn_source, &cas_source, &source_root_path, domain, &key, KEY_ID, &push_entries),
+        run_push(&mut conn_source, &cas_source, &source_root_path, domain, &key, KEY_ID, &push_entries, &[]),
         receive_push(&mut conn_dest, &cas_dest, &dest_root_path, domain, &apply_store, project_id, &dest_entries),
     );
     pushed.expect("run_push");
