@@ -211,3 +211,211 @@ fn content(
     ConflictContent::new(domain, object_id, bytes, executable)
         .map_err(|_| "conflict_content_invalid".to_string())
 }
+
+// ── resolution (BD-4c) ──────────────────────────────────────────────────────
+
+use std::sync::Mutex;
+
+use super::{
+    put_plaintext, ApplyAction, ApplyPlan, ApplyPlanEntry, ApplyPrecondition, ApplyStore,
+    ConflictResolution, KeyId, ManifestEntry, ProjectKey,
+};
+
+/// What a resolution changed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolutionOutcome {
+    /// Paths written (or deleted) in the working tree.
+    pub paths: Vec<String>,
+    /// Conflicts still unresolved for this project.
+    pub remaining: usize,
+}
+
+/// Apply a decision to one conflict: write the chosen content to the working
+/// tree, drop the conflict from the stored set, and re-anchor the base so the
+/// decision actually propagates.
+///
+/// **The base rule is the subtle part.** After resolving, the peer still holds
+/// its own version, so what the base says next decides who wins:
+///
+/// - base ← the resolved content: the peer's version now reads as a remote
+///   change and the next sync FETCHES it, silently undoing the resolution;
+/// - base ← unchanged: both sides still differ from it, so the same conflict is
+///   raised again, forever;
+/// - base ← the REMOTE side's content (what the peer currently has): only the
+///   local tree differs from the base, so the next sync PUSHES the decision to
+///   the peer. Choosing "keep remote" then leaves both sides equal to the base
+///   and converges with no transfer at all.
+///
+/// The third is the only one that makes a resolution stick, so that is what this
+/// does. If the peer has moved on since the conflict was recorded, the next
+/// reconcile sees a genuine new divergence and raises a fresh conflict — which is
+/// correct, not a regression.
+#[allow(clippy::too_many_arguments)]
+pub fn resolve_conflict(
+    apply_store: &Mutex<ApplyStore>,
+    cas: &CasStore,
+    domain: ObjectDomain,
+    root: &Path,
+    conflict_id: [u8; 32],
+    resolution: ConflictResolution,
+    key: &ProjectKey,
+    key_id: KeyId,
+) -> Result<ResolutionOutcome, String> {
+    let project = domain.project_id;
+    let store = apply_store
+        .lock()
+        .map_err(|_| "conflict_store_failed".to_string())?;
+    let mut set = store
+        .load_conflicts(domain)
+        .map_err(|_| "conflict_store_failed".to_string())?;
+    let record = set
+        .get(conflict_id)
+        .ok_or_else(|| "conflict_not_found".to_string())?;
+    // The peer's side as it stood when the conflict was recorded — captured
+    // before `resolve` consumes the record, because it becomes the new base.
+    let remote_side = record.remote().cloned();
+    let precondition = record.precondition();
+    let resolved = set
+        .resolve(precondition, resolution)
+        .map_err(|_| "conflict_resolution_rejected".to_string())?;
+
+    let mut entries = Vec::with_capacity(resolved.paths().len());
+    for path in resolved.paths() {
+        let current = ApplyStore::fingerprint_path(root, project, path)
+            .map_err(|_| "conflict_apply_failed".to_string())?;
+        let precondition = match current {
+            Some(fingerprint) => ApplyPrecondition::Present(fingerprint),
+            None => ApplyPrecondition::Absent,
+        };
+        let action = match resolved.content() {
+            None => {
+                // Deleting a path that is already gone is a no-op, not an error:
+                // the user's decision is already reflected on disk.
+                if precondition == ApplyPrecondition::Absent {
+                    continue;
+                }
+                ApplyAction::Delete
+            }
+            Some(content) => ApplyAction::File {
+                object_id: put_plaintext(cas, domain, key, key_id, content.bytes())?,
+                content_hash: *blake3::hash(content.bytes()).as_bytes(),
+                length: content.bytes().len() as u64,
+                executable: content.executable(),
+            },
+        };
+        entries.push(ApplyPlanEntry {
+            relative_path: path.clone(),
+            action,
+            precondition,
+        });
+    }
+
+    if !entries.is_empty() {
+        let mut operation_id = [0u8; 16];
+        getrandom::getrandom(&mut operation_id)
+            .map_err(|_| "conflict_apply_failed".to_string())?;
+        store
+            .apply(
+                root,
+                cas,
+                domain,
+                &ApplyPlan {
+                    operation_id,
+                    project,
+                    target_manifest_root: [0; 32],
+                    frontier: Vec::new(),
+                    entries,
+                },
+            )
+            .map_err(|_| "conflict_apply_failed".to_string())?;
+    }
+
+    rebase_onto_remote(&store, cas, domain, resolved.paths(), remote_side.as_ref())?;
+    store
+        .save_conflicts(project, &set)
+        .map_err(|_| "conflict_store_failed".to_string())?;
+    Ok(ResolutionOutcome {
+        paths: resolved.paths().to_vec(),
+        remaining: set.len(),
+    })
+}
+
+/// Re-anchor the base for `paths` to the peer's side (see [`resolve_conflict`]).
+/// A remote side that was absent removes the path from the base entirely, so the
+/// local decision reads as an add or a delete rather than a modification.
+fn rebase_onto_remote(
+    store: &ApplyStore,
+    cas: &CasStore,
+    domain: ObjectDomain,
+    paths: &[String],
+    remote: Option<&ConflictContent>,
+) -> Result<(), String> {
+    let project = domain.project_id;
+    let mut base = store
+        .load_base_manifest(project)
+        .map_err(|_| "conflict_store_failed".to_string())?;
+    let mut objects = store
+        .load_base_objects(project)
+        .map_err(|_| "conflict_store_failed".to_string())?;
+    for path in paths {
+        base.retain(|entry| &entry.relative_path != path);
+        objects.remove(path);
+        let Some(content) = remote else { continue };
+        base.push(ManifestEntry {
+            relative_path: path.clone(),
+            kind: EntryKind::File,
+            executable: content.executable(),
+            length: content.bytes().len() as u64,
+            content_hash: *blake3::hash(content.bytes()).as_bytes(),
+            symlink_target: None,
+        });
+        // The base must be READABLE later, so the peer's bytes go into CAS under
+        // this daemon's current key rather than relying on the staged copy the
+        // sync happened to leave behind.
+        let material = cas
+            .current_project_key(project)
+            .map_err(|_| "conflict_apply_failed".to_string())?;
+        let object_id = put_plaintext(
+            cas,
+            domain,
+            &material.key,
+            material.key_id,
+            content.bytes(),
+        )?;
+        objects.insert(path.clone(), object_id);
+    }
+    base.sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
+    store
+        .save_base_manifest(project, &base)
+        .map_err(|_| "conflict_store_failed".to_string())?;
+    store
+        .save_base_objects(project, &objects)
+        .map_err(|_| "conflict_store_failed".to_string())?;
+    Ok(())
+}
+
+/// A conflict rendered for listing over the socket. Content bytes are summarized
+/// rather than inlined — a listing must stay small even when a conflict holds
+/// megabytes on three sides.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ConflictSummary {
+    pub conflict_id: String,
+    pub kind: String,
+    pub paths: Vec<String>,
+    pub base_bytes: Option<u64>,
+    pub local_bytes: Option<u64>,
+    pub remote_bytes: Option<u64>,
+}
+
+pub fn summarize_conflicts(set: &ConflictSet) -> Vec<ConflictSummary> {
+    set.iter()
+        .map(|record| ConflictSummary {
+            conflict_id: hex::encode(record.conflict_id()),
+            kind: format!("{:?}", record.kind()),
+            paths: record.paths().to_vec(),
+            base_bytes: record.base().map(|c| c.bytes().len() as u64),
+            local_bytes: record.local().map(|c| c.bytes().len() as u64),
+            remote_bytes: record.remote().map(|c| c.bytes().len() as u64),
+        })
+        .collect()
+}

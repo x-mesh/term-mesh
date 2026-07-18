@@ -1710,6 +1710,24 @@ async fn dispatch(req: &Request, ctx: &Context) -> Response {
             Ok(params) => handle_sync_serve(ctx, params).await,
             Err(_) => Err("INVALID_PARAMS: project_id and bind_addr are required".to_string()),
         },
+        // Conflicts recorded by the bidirectional reconcile (BD-4c). Listing is
+        // read-only; resolving writes the chosen side and re-anchors the base.
+        "conflict.list" => match serde_json::from_value::<ConflictListParams>(req.params.clone()) {
+            Ok(params) => handle_conflict_list(ctx, params).await,
+            Err(_) => Err("INVALID_PARAMS: project_id is required".to_string()),
+        },
+        "conflict.get" => match serde_json::from_value::<ConflictGetParams>(req.params.clone()) {
+            Ok(params) => handle_conflict_get(ctx, params).await,
+            Err(_) => Err("INVALID_PARAMS: project_id and conflict_id are required".to_string()),
+        },
+        "conflict.resolve" => {
+            match serde_json::from_value::<ConflictResolveParams>(req.params.clone()) {
+                Ok(params) => handle_conflict_resolve(ctx, params).await,
+                Err(_) => Err(
+                    "INVALID_PARAMS: project_id, conflict_id and choice are required".to_string(),
+                ),
+            }
+        }
         "pairing.list" => match project_id_param(&req.params) {
             Ok(project_id) => match load_project(ctx, project_id).await {
                 Ok(_) => Ok(serde_json::json!({
@@ -1734,23 +1752,6 @@ async fn dispatch(req: &Request, ctx: &Context) -> Response {
                 Err(error) => Err(error),
             }
         }
-        "conflict.list" => match project_id_param(&req.params) {
-            Ok(project_id) => match load_project(ctx, project_id).await {
-                Ok(_) => Ok(serde_json::json!({
-                    "project_id": project_id.to_string(),
-                    "conflicts": [],
-                })),
-                Err(error) => Err(error),
-            },
-            Err(error) => Err(error),
-        },
-        "conflict.get" | "conflict.resolve" => match project_id_param(&req.params) {
-            Ok(project_id) => match load_project(ctx, project_id).await {
-                Ok(_) => Err("CONFLICT_NOT_FOUND: no durable conflict record matches the request".to_string()),
-                Err(error) => Err(error),
-            },
-            Err(error) => Err(error),
-        },
         "gc.status" => match project_id_param(&req.params) {
             Ok(project_id) => match load_project(ctx, project_id).await {
                 Ok(_) => Ok(serde_json::json!({
@@ -3616,6 +3617,175 @@ async fn handle_sync_bootstrap_trust(
         "roster_size": roster_size,
         "peers_size": peers_size,
     }))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ConflictListParams {
+    project_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ConflictGetParams {
+    project_id: String,
+    conflict_id: String,
+}
+
+/// One conflict by id, or `CONFLICT_NOT_FOUND`.
+async fn handle_conflict_get(
+    ctx: &Context,
+    params: ConflictGetParams,
+) -> Result<serde_json::Value, String> {
+    let wanted = params.conflict_id.to_ascii_lowercase();
+    let (context, domain, _root) = conflict_context(ctx, &params.project_id).await?;
+    tokio::task::spawn_blocking(move || {
+        let store = context
+            .apply_store
+            .lock()
+            .map_err(|_| "CONFLICT_STORE: apply store is poisoned".to_string())?;
+        let set = store
+            .load_conflicts(domain)
+            .map_err(|error| format!("CONFLICT_STORE: {error:?}"))?;
+        crate::sync::summarize_conflicts(&set)
+            .into_iter()
+            .find(|summary| summary.conflict_id == wanted)
+            .map(|summary| serde_json::json!({
+                "project_id": domain.project_id.to_string(),
+                "conflict": summary,
+            }))
+            .ok_or_else(|| {
+                "CONFLICT_NOT_FOUND: no durable conflict record matches the request".to_string()
+            })
+    })
+    .await
+    .map_err(|_| "CONFLICT_ERROR: get worker failed".to_string())?
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ConflictResolveParams {
+    project_id: String,
+    /// Hex conflict id from `conflict.list`.
+    conflict_id: String,
+    /// `keep_local` | `keep_remote` | `keep_base` | `delete`. Named `choice` to
+    /// match what `tm-agent conflict resolve` already sends.
+    choice: String,
+}
+
+/// Everything a conflict command needs, resolved from the provisioned stores.
+async fn conflict_context(
+    ctx: &Context,
+    project_id_text: &str,
+) -> Result<
+    (
+        std::sync::Arc<crate::sync::SyncContext>,
+        crate::sync::ObjectDomain,
+        crate::sync::HeldProjectRoot,
+    ),
+    String,
+> {
+    use crate::sync::SyncContextProvider;
+
+    let project_id = parse_project_id(project_id_text)?;
+    let registry = ctx.project_registry.clone();
+    tokio::task::spawn_blocking(move || {
+        let provisioning = std::sync::Arc::new(
+            crate::sync::SyncProvisioningStore::open(crate::sync::default_provisioning_db_path())
+                .map_err(|error| format!("CONFLICT_PROVISIONING: {error:?}"))?,
+        );
+        let provider = crate::sync::ProvisioningSyncContextProvider::new(
+            crate::sync::daemon_keychain(),
+            provisioning,
+            crate::sync::default_sync_state_root(),
+        );
+        let context = provider.context_for(&project_id.to_string())?;
+        let root = registry
+            .resolve_root(project_id)
+            .map_err(|error| format!("CONFLICT_ROOT: {error:?}"))?;
+        let domain = crate::sync::ObjectDomain {
+            project_id,
+            object_type: crate::sync::ObjectType::FILE,
+            version: 1,
+        };
+        Ok::<_, String>((context, domain, root))
+    })
+    .await
+    .map_err(|_| "CONFLICT_ERROR: setup worker failed".to_string())?
+}
+
+/// The project's unresolved conflicts. Read-only: listing never touches the tree.
+async fn handle_conflict_list(
+    ctx: &Context,
+    params: ConflictListParams,
+) -> Result<serde_json::Value, String> {
+    let (context, domain, _root) = conflict_context(ctx, &params.project_id).await?;
+    tokio::task::spawn_blocking(move || {
+        let store = context
+            .apply_store
+            .lock()
+            .map_err(|_| "CONFLICT_STORE: apply store is poisoned".to_string())?;
+        let set = store
+            .load_conflicts(domain)
+            .map_err(|error| format!("CONFLICT_STORE: {error:?}"))?;
+        Ok::<_, String>(serde_json::json!({
+            "project_id": domain.project_id.to_string(),
+            "conflicts": crate::sync::summarize_conflicts(&set),
+        }))
+    })
+    .await
+    .map_err(|_| "CONFLICT_ERROR: list worker failed".to_string())?
+}
+
+/// Decide one conflict: write the chosen side to the working tree, drop the
+/// conflict, and re-anchor the base so the decision propagates to the peer on the
+/// next sync (see `resolve_conflict`).
+async fn handle_conflict_resolve(
+    ctx: &Context,
+    params: ConflictResolveParams,
+) -> Result<serde_json::Value, String> {
+    let resolution = match params.choice.as_str() {
+        "keep_local" => crate::sync::ConflictResolution::KeepLocal,
+        "keep_remote" => crate::sync::ConflictResolution::KeepRemote,
+        "keep_base" => crate::sync::ConflictResolution::KeepBase,
+        "delete" => crate::sync::ConflictResolution::Delete,
+        other => {
+            return Err(format!(
+                "INVALID_PARAMS: choice '{other}' must be keep_local, keep_remote, keep_base, or delete"
+            ))
+        }
+    };
+    let raw = hex::decode(&params.conflict_id)
+        .map_err(|_| "INVALID_PARAMS: conflict_id must be hex".to_string())?;
+    let conflict_id: [u8; 32] = raw
+        .try_into()
+        .map_err(|_| "INVALID_PARAMS: conflict_id must be 32 bytes".to_string())?;
+
+    let (context, domain, root) = conflict_context(ctx, &params.project_id).await?;
+    tokio::task::spawn_blocking(move || {
+        let material = context
+            .cas
+            .current_project_key(domain.project_id)
+            .map_err(|error| format!("CONFLICT_KEY: {error:?}"))?;
+        let outcome = crate::sync::resolve_conflict(
+            context.apply_store.as_ref(),
+            context.cas.as_ref(),
+            domain,
+            root.canonical_path(),
+            conflict_id,
+            resolution,
+            &material.key,
+            material.key_id,
+        )
+        .map_err(|code| format!("CONFLICT_RESOLVE_FAILED: {code}"))?;
+        Ok::<_, String>(serde_json::json!({
+            "project_id": domain.project_id.to_string(),
+            "paths": outcome.paths,
+            "remaining": outcome.remaining,
+        }))
+    })
+    .await
+    .map_err(|_| "CONFLICT_ERROR: resolve worker failed".to_string())?
 }
 
 #[derive(Debug, Deserialize)]

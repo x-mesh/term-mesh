@@ -473,3 +473,188 @@ fn stored_conflicts_survive_a_store_reopen_and_are_replaced_wholesale() {
         .unwrap();
     assert!(reopened.load_conflicts(fixture.domain).unwrap().is_empty());
 }
+
+// ── resolution (BD-4c) ──────────────────────────────────────────────────────
+
+use sync::{
+    reconcile_bidirectional, resolve_conflict, ConflictResolution, EntryKind as Kind, ManifestEntry,
+};
+
+/// A store + a scanned conflict, ready to resolve.
+struct Resolvable {
+    fixture: Fixture,
+    store: std::sync::Mutex<ApplyStore>,
+    conflict_id: [u8; 32],
+    _temporary: tempfile::TempDir,
+}
+
+fn resolvable() -> Resolvable {
+    let mut fixture = Fixture::new();
+    let temporary = tempfile::tempdir().unwrap();
+    let database = state_dir(temporary.path(), "apply-state").join("apply.db");
+
+    let base = fixture.base("notes.txt", b"start\n");
+    let remote = fixture.remote("notes.txt", b"start\ntheirs\n");
+    let local = fixture.local("notes.txt", b"start\nmine\n");
+    let scan = fixture.scan(&[ConflictPath {
+        relative_path: "notes.txt".into(),
+        base: Some(base.clone()),
+        local: Some(local),
+        remote: Some(remote),
+    }]);
+    let conflict_id = scan.set.iter().next().unwrap().conflict_id();
+
+    let store = ApplyStore::open(&database).unwrap();
+    // The base as a prior sync would have left it.
+    store
+        .save_base_manifest(
+            fixture.domain.project_id,
+            &[ManifestEntry {
+                relative_path: "notes.txt".into(),
+                kind: Kind::File,
+                executable: false,
+                length: base.length,
+                content_hash: base.content_hash,
+                symlink_target: None,
+            }],
+        )
+        .unwrap();
+    store
+        .save_base_objects(fixture.domain.project_id, &fixture.base_objects)
+        .unwrap();
+    store.save_conflicts(fixture.domain.project_id, &scan.set).unwrap();
+
+    Resolvable {
+        fixture,
+        store: std::sync::Mutex::new(store),
+        conflict_id,
+        _temporary: temporary,
+    }
+}
+
+fn resolve(r: &Resolvable, resolution: ConflictResolution) -> sync::ResolutionOutcome {
+    resolve_conflict(
+        &r.store,
+        &r.fixture.cas,
+        r.fixture.domain,
+        &r.fixture.root,
+        r.conflict_id,
+        resolution,
+        &ProjectKey::new(KEY_BYTES),
+        KEY_ID,
+    )
+    .unwrap()
+}
+
+/// The local tree and the stored set both reflect the decision.
+#[test]
+fn keeping_the_local_side_writes_it_and_clears_the_conflict() {
+    let r = resolvable();
+    let outcome = resolve(&r, ConflictResolution::KeepLocal);
+
+    assert_eq!(outcome.paths, ["notes.txt".to_string()]);
+    assert_eq!(outcome.remaining, 0);
+    assert_eq!(
+        std::fs::read(r.fixture.root.join("notes.txt")).unwrap(),
+        b"start\nmine\n"
+    );
+    let store = r.store.lock().unwrap();
+    assert!(store.load_conflicts(r.fixture.domain).unwrap().is_empty());
+}
+
+#[test]
+fn keeping_the_remote_side_overwrites_the_local_file() {
+    let r = resolvable();
+    resolve(&r, ConflictResolution::KeepRemote);
+    assert_eq!(
+        std::fs::read(r.fixture.root.join("notes.txt")).unwrap(),
+        b"start\ntheirs\n"
+    );
+}
+
+#[test]
+fn resolving_to_delete_removes_the_file() {
+    let r = resolvable();
+    let outcome = resolve(&r, ConflictResolution::Delete);
+    assert!(!r.fixture.root.join("notes.txt").exists());
+    assert_eq!(outcome.remaining, 0);
+}
+
+/// The point of the base rule. After resolving locally the peer still holds its
+/// own version, so the next reconcile must PUSH the decision — not fetch the
+/// peer's version back over it, and not raise the same conflict again.
+#[test]
+fn a_local_resolution_is_pushed_on_the_next_reconcile_not_undone() {
+    let r = resolvable();
+    resolve(&r, ConflictResolution::KeepLocal);
+
+    let (base, _) = {
+        let store = r.store.lock().unwrap();
+        (
+            store.load_base_manifest(r.fixture.domain.project_id).unwrap(),
+            store.load_base_objects(r.fixture.domain.project_id).unwrap(),
+        )
+    };
+    // The peer is unchanged; the local tree now holds the resolved content.
+    let local = vec![manifest("notes.txt", b"start\nmine\n")];
+    let remote = vec![manifest("notes.txt", b"start\ntheirs\n")];
+    let plan = reconcile_bidirectional(&base, &local, &remote);
+
+    assert_eq!(
+        plan.push.iter().map(|e| e.relative_path.as_str()).collect::<Vec<_>>(),
+        ["notes.txt"],
+        "the resolution must propagate to the peer",
+    );
+    assert!(plan.fetch.is_empty(), "the peer's version must not come back");
+    assert!(plan.conflicts.is_empty(), "the conflict must not be raised again");
+}
+
+/// Choosing the peer's side needs no transfer at all: both trees already agree.
+#[test]
+fn resolving_to_the_remote_side_converges_with_no_further_work() {
+    let r = resolvable();
+    resolve(&r, ConflictResolution::KeepRemote);
+
+    let base = {
+        let store = r.store.lock().unwrap();
+        store.load_base_manifest(r.fixture.domain.project_id).unwrap()
+    };
+    let local = vec![manifest("notes.txt", b"start\ntheirs\n")];
+    let remote = vec![manifest("notes.txt", b"start\ntheirs\n")];
+    let plan = reconcile_bidirectional(&base, &local, &remote);
+    assert!(plan.is_empty(), "already converged: {plan:?}");
+}
+
+/// Resolving twice must not double-apply: the conflict is gone the second time.
+#[test]
+fn resolving_an_unknown_or_already_resolved_conflict_is_rejected() {
+    let r = resolvable();
+    resolve(&r, ConflictResolution::KeepLocal);
+    let again = resolve_conflict(
+        &r.store,
+        &r.fixture.cas,
+        r.fixture.domain,
+        &r.fixture.root,
+        r.conflict_id,
+        ConflictResolution::KeepRemote,
+        &ProjectKey::new(KEY_BYTES),
+        KEY_ID,
+    );
+    assert_eq!(again.unwrap_err(), "conflict_not_found");
+    // The first decision stands.
+    assert_eq!(
+        std::fs::read(r.fixture.root.join("notes.txt")).unwrap(),
+        b"start\nmine\n"
+    );
+}
+
+fn manifest(path: &str, bytes: &[u8]) -> ManifestEntry {
+    ManifestEntry {
+        relative_path: path.to_string(),
+        kind: Kind::File,
+        executable: false,
+        length: bytes.len() as u64,
+        content_hash: *blake3::hash(bytes).as_bytes(),
+        symlink_target: None,
+    }
+}

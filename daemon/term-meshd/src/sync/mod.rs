@@ -83,7 +83,8 @@ pub use keychain::{
 pub use manifest::{EntryKind, Manifest, ManifestBuilder, ManifestEntry, ManifestError};
 #[allow(unused_imports)]
 pub use conflict_scan::{
-    scan_conflicts, ConflictScan, Unclassified, UnclassifiedReason,
+    resolve_conflict, scan_conflicts, summarize_conflicts, ConflictScan, ConflictSummary,
+    ResolutionOutcome, Unclassified, UnclassifiedReason,
 };
 pub use merge::{
     detect_path_conflicts, merge_file, MergeOutcome, PathChange, ThreeWayFile,
