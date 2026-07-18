@@ -56,16 +56,23 @@ while [ $# -gt 0 ]; do
   esac
 done
 
-[ -n "$PEER_SSH" ]     || die "--peer-ssh is required"
-[ -n "$PEER_ADDR" ]    || die "--peer-addr is required (B's reachable IP)"
+[ -n "$PEER_ADDR" ]    || die "--peer-addr is required (B's reachable IP; 127.0.0.1 for same-host)"
 [ -n "$LOCAL_PATH" ]   || die "--local-path is required"
 [ -n "$REMOTE_PATH" ]  || die "--remote-path is required"
 command -v jq >/dev/null      || die "jq is required"
 command -v openssl >/dev/null || die "openssl is required"
 
-# A drives its own daemon locally; B's daemon over ssh.
+# A drives its own daemon locally; B's daemon over ssh — unless --peer-ssh is
+# empty (both daemons on this host, distinguished only by socket), in which case
+# B runs locally too.
 a() { $TM_AGENT "$@"; }
-b() { ssh "$PEER_SSH" "$REMOTE_TM_AGENT" "$@"; }
+if [ -n "$PEER_SSH" ]; then
+  b() { ssh "$PEER_SSH" "$REMOTE_TM_AGENT" "$@"; }
+  remote_sum() { ssh "$PEER_SSH" "shasum -a 256 '$1'" 2>/dev/null | awk '{print $1}'; }
+else
+  b() { $REMOTE_TM_AGENT "$@"; }
+  remote_sum() { shasum -a 256 "$1" 2>/dev/null | awk '{print $1}'; }
+fi
 
 # Deterministic device ids (they also seed the dev control signing key); the
 # recovery seed + DEK are fresh random per run.
@@ -138,8 +145,8 @@ echo "   final state: $STATE"
 # 6. Verify: a file that was only on B is now on A, byte-identical.
 if [ -n "$VERIFY_FILE" ]; then
   echo "-- verify $VERIFY_FILE --"
-  LOCAL_SUM="$(shasum -a 256 "$LOCAL_PATH/$VERIFY_FILE"  | awk '{print $1}')"
-  REMOTE_SUM="$(ssh "$PEER_SSH" "shasum -a 256 '$REMOTE_PATH/$VERIFY_FILE'" | awk '{print $1}')"
+  LOCAL_SUM="$(shasum -a 256 "$LOCAL_PATH/$VERIFY_FILE" 2>/dev/null | awk '{print $1}')"
+  REMOTE_SUM="$(remote_sum "$REMOTE_PATH/$VERIFY_FILE")"
   [ -n "$LOCAL_SUM" ] || die "$VERIFY_FILE did not appear on A"
   [ "$LOCAL_SUM" = "$REMOTE_SUM" ] || die "checksum mismatch: A=$LOCAL_SUM B=$REMOTE_SUM"
   echo "   OK — $VERIFY_FILE identical on A and B ($LOCAL_SUM)"
