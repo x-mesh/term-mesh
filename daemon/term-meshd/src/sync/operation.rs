@@ -851,7 +851,21 @@ fn normalize_runner_error(code: &str) -> &'static str {
         "conflict_merge_failed" => "conflict_merge_failed",
         "conflict_insert_failed" => "conflict_insert_failed",
         "conflict_store_failed" => "conflict_store_failed",
-        _ => "operation_failed",
+        // Deletes refused because the batch looked like a tree wipe. Distinct
+        // from a generic failure: the operator needs to know the data is intact
+        // and why nothing was removed.
+        "delete_guard_tripped" => "delete_guard_tripped",
+        // Unmapped codes collapse to a generic failure so internals never reach
+        // the socket — but that also hides a code someone forgot to add here,
+        // which has happened twice. Log it so the gap shows up in the daemon log
+        // instead of only as a mystifying `operation_failed`.
+        other => {
+            tracing::warn!(
+                code = other,
+                "sync runner returned an unmapped error code; reported as operation_failed"
+            );
+            "operation_failed"
+        }
     }
 }
 
