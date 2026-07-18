@@ -717,6 +717,10 @@ async fn bidirectional_sync_converges_conflicts_and_propagates_deletes() {
     // so deleting it on B alone still reads as a remote-side change from A's view.
     std::fs::remove_file(local_root.path().join("b-only.txt")).unwrap();
     std::fs::write(peer_root.path().join("gets-deleted.txt"), b"doomed").unwrap();
+    // `shared.txt` was identical on both peers from the very first sync, so it was
+    // never transferred. It still belongs to the agreed state, and deleting it on
+    // one side must propagate rather than be pushed back.
+    std::fs::remove_file(peer_root.path().join("shared.txt")).unwrap();
 
     // Give B's copy a base first: one sync fetches it, the next can delete it.
     for (request, _label) in [("de".repeat(16), "seed"), ("ef".repeat(16), "delete")] {
@@ -760,11 +764,18 @@ async fn bidirectional_sync_converges_conflicts_and_propagates_deletes() {
         !local_root.path().join("gets-deleted.txt").exists(),
         "the peer's delete did not propagate to A"
     );
-    // Deletions do not take neighbours with them.
-    assert_eq!(
-        std::fs::read(local_root.path().join("shared.txt")).unwrap(),
-        b"same-content"
+    // A path both peers already had is agreed state too: deleting it propagates
+    // instead of coming back. Before the base recorded converged paths, A saw
+    // this as a file the peer never had and pushed it straight back.
+    assert!(
+        !local_root.path().join("shared.txt").exists(),
+        "the peer's delete of a never-transferred file did not reach A"
     );
+    assert!(
+        !peer_root.path().join("shared.txt").exists(),
+        "shared.txt was resurrected on the peer"
+    );
+    // Deletions do not take neighbours with them.
     assert_eq!(
         std::fs::read(local_root.path().join("a-only.txt")).unwrap(),
         b"edited-by-A",

@@ -203,6 +203,34 @@ fn a_base_whose_content_is_missing_is_unclassified_rather_than_merged() {
     );
 }
 
+/// A base entry with no recoverable content is now common, not exceptional: a
+/// path both peers already had enters the base without ever passing through CAS.
+/// With both sides present, falling back to `base = None` is honest (we have no
+/// recorded base) and safe — no `merge_file` early return fires.
+#[test]
+fn a_missing_base_with_both_sides_present_is_classified_as_add_add() {
+    let mut fixture = Fixture::new();
+    // A base ENTRY with no staged object, as a converged path now produces.
+    let base = entry("notes.txt", b"agreed\n", false);
+    let remote = fixture.remote("notes.txt", b"theirs\n");
+    let local = fixture.local("notes.txt", b"mine\n");
+
+    let scan = fixture.scan(&[ConflictPath {
+        relative_path: "notes.txt".into(),
+        base: Some(base),
+        local: Some(local),
+        remote: Some(remote),
+    }]);
+
+    assert_eq!(scan.set.len(), 1, "still a usable, resolvable conflict");
+    assert!(scan.unclassified.is_empty());
+    let record = scan.set.iter().next().unwrap();
+    assert_eq!(record.kind(), &ConflictKind::AddAddText);
+    assert!(record.base().is_none(), "no base is recorded, and none is claimed");
+    assert_eq!(record.local().unwrap().bytes(), b"mine\n");
+    assert_eq!(record.remote().unwrap().bytes(), b"theirs\n");
+}
+
 /// With no base at all — a path neither peer had agreed on — both sides adding it
 /// is a legitimate add/add, and `base = None` is the truth rather than a gap.
 #[test]

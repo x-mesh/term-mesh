@@ -398,6 +398,14 @@ impl NetworkSyncRunner {
                 .map(|entry| (entry.relative_path.clone(), entry.clone()))
                 .collect();
             let mut object_map = base_objects_before.clone();
+            // Paths the two sides already agree on are agreed state: without them
+            // the base only knows what it moved, and deleting a file both peers
+            // had from the start looks to the other side like an unknown addition
+            // and gets pushed back. They carry no CAS object (nothing was
+            // transferred), which `scan_conflicts` accounts for.
+            for entry in &plan.converged {
+                base_map.insert(entry.relative_path.clone(), entry.clone());
+            }
             for entry in plan.fetch.iter().chain(plan.push.iter()) {
                 base_map.insert(entry.relative_path.clone(), fetch_to_manifest(entry));
             }

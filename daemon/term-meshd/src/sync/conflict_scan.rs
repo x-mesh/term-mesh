@@ -37,9 +37,11 @@ pub enum UnclassifiedReason {
     /// kind-level conflicts (a path that is a directory here and a file there)
     /// need their own classification.
     NotAFile,
-    /// The base manifest says this path had a base, but its content is no longer
-    /// readable from CAS. Merging on `base = None` would misclassify — see the
-    /// module note on the delete/modify early return.
+    /// The base manifest says this path had a base, its content is not
+    /// recoverable, AND one side is absent. Fabricating `base = None` there hits
+    /// `merge_file`'s `local == base` early return and resurrects a deletion —
+    /// see the module note. (With both sides present the same fabrication is
+    /// harmless, so that case is classified as an add/add instead.)
     BaseContentUnavailable,
     /// The peer's side of the conflict was never staged, so there is nothing to
     /// compare against (a fetch that skipped the path, e.g. it vanished between
@@ -117,27 +119,29 @@ pub fn scan_conflicts(
         };
         let base = match conflict.base.as_ref() {
             None => None,
-            Some(entry) => match base_objects.get(&path) {
-                None => {
-                    scan.unclassified.push(Unclassified {
-                        relative_path: path,
-                        reason: UnclassifiedReason::BaseContentUnavailable,
-                    });
-                    continue;
-                }
-                Some(object_id) => match read_plaintext(cas, domain, *object_id) {
-                    // The base entry exists but its object was collected or is
-                    // damaged: report rather than merge on a fabricated `None`.
-                    Err(_) => {
+            Some(entry) => {
+                // A base entry has no CAS object when the path was never
+                // transferred (both peers already had it) — or when its object was
+                // collected. Either way the base BYTES are gone.
+                let recovered = base_objects
+                    .get(&path)
+                    .and_then(|object_id| read_plaintext(cas, domain, *object_id).ok());
+                match recovered {
+                    Some(bytes) => Some(content(domain, bytes, entry.executable)?),
+                    // Falling back to `base = None` is only safe with both sides
+                    // present: then no early return fires and the conflict reads
+                    // as an add/add, which is honest — we have no recorded base.
+                    // With a side missing it would resurrect a deletion, so stop.
+                    None if conflict.local.is_none() || conflict.remote.is_none() => {
                         scan.unclassified.push(Unclassified {
                             relative_path: path,
                             reason: UnclassifiedReason::BaseContentUnavailable,
                         });
                         continue;
                     }
-                    Ok(bytes) => Some(content(domain, bytes, entry.executable)?),
-                },
-            },
+                    None => None,
+                }
+            }
         };
 
         let input = ThreeWayFile::new(domain, path.clone(), base, local, remote)

@@ -128,9 +128,15 @@ pub struct BidiPlan {
     pub delete_local: Vec<String>,
     /// Paths changed on both sides since the base.
     pub conflicts: Vec<ConflictPath>,
+    /// Paths the two sides ALREADY agree on. Nothing to transfer, but they are
+    /// agreed state and belong in the base — without them, deleting a file that
+    /// both peers happened to have from the start reads to the other side as
+    /// "a file I have and they never did", and gets pushed straight back.
+    pub converged: Vec<ManifestEntry>,
 }
 
 impl BidiPlan {
+    /// No work to do. `converged` is not work — it is what agreement looks like.
     pub fn is_empty(&self) -> bool {
         self.fetch.is_empty()
             && self.push.is_empty()
@@ -192,7 +198,13 @@ pub fn reconcile_bidirectional(
         let remote_entry = remote_by.get(path).copied();
 
         if manifest_state_eq(local_entry, remote_entry) {
-            continue; // already converged (equal, or both absent)
+            // Already converged. Record the agreed entry (if the path exists at
+            // all) so the base knows about it; a later delete on either side then
+            // reads as a real change rather than an unknown addition.
+            if let Some(entry) = local_entry {
+                plan.converged.push(entry.clone());
+            }
+            continue;
         }
         let local_changed = !manifest_state_eq(base_entry, local_entry);
         let remote_changed = !manifest_state_eq(base_entry, remote_entry);
@@ -671,6 +683,41 @@ mod tests {
         assert_eq!(plan.delete_remote, ["a"], "local deleted a → remote deletes a");
         assert_eq!(plan.delete_local, ["b"], "remote deleted b → local deletes b");
         assert!(plan.conflicts.is_empty() && plan.fetch.is_empty() && plan.push.is_empty());
+    }
+
+    /// A file both peers happened to have from the start must still enter the
+    /// base. Otherwise deleting it later looks to the other side like a file it
+    /// never had, and the delete is undone by a push.
+    #[test]
+    fn a_path_both_sides_already_agree_on_enters_the_base() {
+        let local = vec![file("shared", 1, false), file("mine", 2, false)];
+        let remote = vec![file("shared", 1, false)];
+        let plan = reconcile_bidirectional(&[], &local, &remote);
+
+        assert_eq!(
+            plan.converged.iter().map(|e| e.relative_path.as_str()).collect::<Vec<_>>(),
+            ["shared"],
+        );
+        assert_eq!(plan.push.len(), 1, "the local-only file still pushes");
+        // Converged paths are agreement, not work.
+        assert!(!plan.is_empty());
+        assert!(reconcile_bidirectional(&[], &remote, &remote).is_empty());
+    }
+
+    /// The bug this fixes, expressed as the reconcile sees it: with `shared` in
+    /// the base, deleting it remotely is a delete rather than a local addition.
+    #[test]
+    fn deleting_a_previously_agreed_path_propagates_instead_of_resurrecting() {
+        let agreed = vec![file("shared", 1, false)];
+        // Before: the path never reached the base, so the reconcile pushes it back.
+        let without_base = reconcile_bidirectional(&[], &agreed, &[]);
+        assert_eq!(without_base.push.len(), 1, "no base ⇒ looks like an addition");
+        assert!(without_base.delete_local.is_empty());
+
+        // After: the same delete against a base that recorded the agreement.
+        let with_base = reconcile_bidirectional(&agreed, &agreed, &[]);
+        assert_eq!(with_base.delete_local, ["shared"]);
+        assert!(with_base.push.is_empty(), "must not push the file back");
     }
 
     #[test]
