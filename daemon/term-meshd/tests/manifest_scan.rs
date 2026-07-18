@@ -310,3 +310,35 @@ fn cancellation_is_observed_before_directory_walk() {
         Err(ScanError::Cancelled)
     ));
 }
+
+/// Scanning the SAME held directory descriptor twice must give the same answer.
+///
+/// A daemon holds its project root open and re-scans that descriptor for every
+/// incoming sync connection. The scanner used to hand the directory stream a
+/// `dup` of it, and a dup shares the original's file offset — so walking the
+/// stream to EOF left the caller's descriptor at EOF, and the second scan
+/// returned an EMPTY manifest. To a peer that reads as "everything was deleted".
+#[test]
+fn rescanning_one_held_descriptor_does_not_exhaust_it() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("project");
+    fs::create_dir_all(root.join("nested")).unwrap();
+    fs::write(root.join("top.txt"), b"top\n").unwrap();
+    fs::write(root.join("nested/leaf.txt"), b"leaf\n").unwrap();
+
+    let held = fs::File::open(&root).unwrap();
+    let scanner = ManifestScanner::new(ScanLimits::default()).unwrap();
+    let first = scanner.scan_descriptor(&held, ScanReason::Initial).unwrap().0;
+    let second = scanner.scan_descriptor(&held, ScanReason::Initial).unwrap().0;
+    let third = scanner.scan_descriptor(&held, ScanReason::Initial).unwrap().0;
+
+    assert_eq!(first.entry_count, 3, "nested dir + two files");
+    assert_eq!(first, second);
+    assert_eq!(second, third);
+
+    // A change between scans is still picked up — the descriptor is re-read, not
+    // cached.
+    fs::write(root.join("added.txt"), b"added\n").unwrap();
+    let fourth = scanner.scan_descriptor(&held, ScanReason::Initial).unwrap().0;
+    assert_eq!(fourth.entry_count, 4);
+}

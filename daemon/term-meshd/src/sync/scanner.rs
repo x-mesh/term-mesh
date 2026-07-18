@@ -181,13 +181,29 @@ impl ManifestScanner {
 
         let directory_before = ensure_kind(directory_fd, libc::S_IFDIR)?;
         pipeline.observe_resources(buffered_ancestors, open_files + 1)?;
-        let duplicated = unsafe { libc::dup(directory_fd.as_raw_fd()) };
-        if duplicated < 0 {
+        // `openat(fd, ".")` rather than `dup(fd)`: a dup SHARES the original's
+        // file offset, so `readdir` walking the stream to EOF leaves the caller's
+        // descriptor at EOF too — and the next scan of that same descriptor
+        // returns NOTHING. (A responder re-scanning its held project root per
+        // connection would answer the second peer with an empty manifest, which
+        // reads as "the peer deleted everything".) `openat` gives the stream its
+        // own open file description starting at offset 0, and resolving "."
+        // against an already-open directory fd keeps the traversal anchored to
+        // this inode — no path is re-resolved, so the swap hardening still holds.
+        let dot = c"."; // relative to `directory_fd`, never the process cwd
+        let stream_fd = unsafe {
+            libc::openat(
+                directory_fd.as_raw_fd(),
+                dot.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+            )
+        };
+        if stream_fd < 0 {
             return Err(ScanError::Io(std::io::Error::last_os_error()));
         }
-        let stream = unsafe { libc::fdopendir(duplicated) };
+        let stream = unsafe { libc::fdopendir(stream_fd) };
         if stream.is_null() {
-            unsafe { libc::close(duplicated) };
+            unsafe { libc::close(stream_fd) };
             return Err(ScanError::Io(std::io::Error::last_os_error()));
         }
         let stream = DirectoryStream(stream);
