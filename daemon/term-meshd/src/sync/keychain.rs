@@ -626,16 +626,26 @@ impl KeychainBackend for FileKeychain {
 
 /// The keychain backend the daemon uses for sync. When
 /// `TERMMESH_SYNC_KEYCHAIN_DIR` is set it is a [`FileKeychain`] there (dev/e2e,
-/// unsigned binaries, future Linux); otherwise the OS keychain. Production leaves
-/// the env unset and gets [`MacOsKeychain`].
-#[cfg(target_os = "macos")]
+/// unsigned binaries, Linux); otherwise the OS keychain on macOS. On non-macOS
+/// with the env unset there is no OS keychain, so it falls back to a
+/// [`FileKeychain`] under the sync state dir. Production on macOS leaves the env
+/// unset and gets [`MacOsKeychain`].
 pub fn daemon_keychain() -> Arc<dyn KeychainBackend> {
     if let Some(dir) = std::env::var_os("TERMMESH_SYNC_KEYCHAIN_DIR") {
         if !dir.is_empty() {
             return Arc::new(FileKeychain::new(dir));
         }
     }
-    Arc::new(MacOsKeychain)
+    #[cfg(target_os = "macos")]
+    {
+        Arc::new(MacOsKeychain)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        Arc::new(FileKeychain::new(
+            super::default_sync_state_root().join("keychain"),
+        ))
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]

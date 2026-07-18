@@ -67,11 +67,11 @@ pub use git::{
 };
 #[cfg(target_os = "macos")]
 #[allow(unused_imports)]
-pub use keychain::{daemon_keychain, MacOsKeychain};
+pub use keychain::MacOsKeychain;
 #[allow(unused_imports)]
 pub use keychain::{
-    generate_project_key, load_device_tls_identity, load_project_key, persist_device_tls_identity,
-    FileKeychain,
+    daemon_keychain, generate_project_key, load_device_tls_identity, load_project_key,
+    persist_device_tls_identity, FileKeychain,
     persist_project_key, DeviceTlsIdentity, KeychainBackend, KeychainError, KeychainItem,
     KeychainProjectKeyProvider, KeychainProtection, PeerIdentityProvider, PresenceAction,
     PresenceCapability, PresenceGrantContext, RandomSource, SystemRandom, UserPresenceAuthorizer,

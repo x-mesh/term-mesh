@@ -1682,52 +1682,25 @@ async fn dispatch(req: &Request, ctx: &Context) -> Response {
         // `bootstrap_trust` applies the roster + shared DEK + peer address book.
         // Both are keychain-backed, hence macOS-only for now.
         "sync.bootstrap_identity" => {
-            #[cfg(target_os = "macos")]
-            {
-                match serde_json::from_value::<SyncBootstrapIdentityParams>(req.params.clone()) {
-                    Ok(params) => handle_sync_bootstrap_identity(params).await,
-                    Err(_) => {
-                        Err("INVALID_PARAMS: project_id and device_id are required".to_string())
-                    }
-                }
-            }
-            #[cfg(not(target_os = "macos"))]
-            {
-                Err("SYNC_BOOTSTRAP_UNSUPPORTED: keychain-backed bootstrap requires macOS"
-                    .to_string())
+            match serde_json::from_value::<SyncBootstrapIdentityParams>(req.params.clone()) {
+                Ok(params) => handle_sync_bootstrap_identity(params).await,
+                Err(_) => Err("INVALID_PARAMS: project_id and device_id are required".to_string()),
             }
         }
         "sync.bootstrap_trust" => {
-            #[cfg(target_os = "macos")]
-            {
-                match serde_json::from_value::<SyncBootstrapTrustParams>(req.params.clone()) {
-                    Ok(params) => handle_sync_bootstrap_trust(params).await,
-                    Err(_) => {
-                        Err("INVALID_PARAMS: bootstrap-trust descriptor is malformed".to_string())
-                    }
+            match serde_json::from_value::<SyncBootstrapTrustParams>(req.params.clone()) {
+                Ok(params) => handle_sync_bootstrap_trust(params).await,
+                Err(_) => {
+                    Err("INVALID_PARAMS: bootstrap-trust descriptor is malformed".to_string())
                 }
-            }
-            #[cfg(not(target_os = "macos"))]
-            {
-                Err("SYNC_BOOTSTRAP_UNSUPPORTED: keychain-backed bootstrap requires macOS"
-                    .to_string())
             }
         }
         // Start the responder listener for a provisioned project (piece 6): bind a
         // per-project QUIC endpoint and serve incoming syncs in a background task.
-        "sync.serve" => {
-            #[cfg(target_os = "macos")]
-            {
-                match serde_json::from_value::<SyncServeParams>(req.params.clone()) {
-                    Ok(params) => handle_sync_serve(ctx, params).await,
-                    Err(_) => Err("INVALID_PARAMS: project_id and bind_addr are required".to_string()),
-                }
-            }
-            #[cfg(not(target_os = "macos"))]
-            {
-                Err("SYNC_BOOTSTRAP_UNSUPPORTED: keychain-backed sync requires macOS".to_string())
-            }
-        }
+        "sync.serve" => match serde_json::from_value::<SyncServeParams>(req.params.clone()) {
+            Ok(params) => handle_sync_serve(ctx, params).await,
+            Err(_) => Err("INVALID_PARAMS: project_id and bind_addr are required".to_string()),
+        },
         "pairing.list" => match project_id_param(&req.params) {
             Ok(project_id) => match load_project(ctx, project_id).await {
                 Ok(_) => Ok(serde_json::json!({
@@ -3487,7 +3460,6 @@ struct SyncStartParams {
     peer_id: Option<String>,
 }
 
-#[cfg(target_os = "macos")]
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct SyncBootstrapIdentityParams {
@@ -3495,7 +3467,6 @@ struct SyncBootstrapIdentityParams {
     device_id: String,
 }
 
-#[cfg(target_os = "macos")]
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct BootstrapRosterEntry {
@@ -3504,7 +3475,6 @@ struct BootstrapRosterEntry {
     epoch: u64,
 }
 
-#[cfg(target_os = "macos")]
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct BootstrapPeerEntry {
@@ -3512,7 +3482,6 @@ struct BootstrapPeerEntry {
     addr: String,
 }
 
-#[cfg(target_os = "macos")]
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct SyncBootstrapTrustParams {
@@ -3530,7 +3499,6 @@ struct SyncBootstrapTrustParams {
 }
 
 /// Parse exactly `N` bytes of lowercase hex, naming the field in the error.
-#[cfg(target_os = "macos")]
 fn parse_hex_bytes<const N: usize>(value: &str, field: &str) -> Result<[u8; N], String> {
     let decoded = hex::decode(value)
         .map_err(|_| format!("INVALID_PARAMS: {field} must be {} hex characters", N * 2))?;
@@ -3539,7 +3507,6 @@ fn parse_hex_bytes<const N: usize>(value: &str, field: &str) -> Result<[u8; N], 
         .map_err(|_| format!("INVALID_PARAMS: {field} must be {} hex characters", N * 2))
 }
 
-#[cfg(target_os = "macos")]
 fn bootstrap_error(error: crate::sync::BootstrapError) -> String {
     use crate::sync::BootstrapError::{InvalidRoster, Keychain, Provisioning, Storage, Trust};
     match error {
@@ -3553,7 +3520,6 @@ fn bootstrap_error(error: crate::sync::BootstrapError) -> String {
 
 /// Identity phase: ensure `(project, device)`'s TLS identity, return its cert
 /// hash. Keychain + generation is blocking, so it runs on a blocking worker.
-#[cfg(target_os = "macos")]
 async fn handle_sync_bootstrap_identity(
     params: SyncBootstrapIdentityParams,
 ) -> Result<serde_json::Value, String> {
@@ -3580,7 +3546,6 @@ async fn handle_sync_bootstrap_identity(
 /// Apply phase: open this daemon's per-project trust store + the provisioning
 /// store and provision the project from the descriptor. Blocking I/O runs on a
 /// blocking worker.
-#[cfg(target_os = "macos")]
 async fn handle_sync_bootstrap_trust(
     params: SyncBootstrapTrustParams,
 ) -> Result<serde_json::Value, String> {
@@ -3644,7 +3609,6 @@ async fn handle_sync_bootstrap_trust(
     }))
 }
 
-#[cfg(target_os = "macos")]
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct SyncServeParams {
@@ -3657,7 +3621,6 @@ struct SyncServeParams {
 /// per-project QUIC endpoint, and spawn the accept loop. Returns the bound
 /// address (the initiator's peer address book points at it). The listener runs
 /// until daemon shutdown (v0 has no stop RPC).
-#[cfg(target_os = "macos")]
 async fn handle_sync_serve(
     ctx: &Context,
     params: SyncServeParams,
@@ -3718,49 +3681,39 @@ async fn handle_sync_serve(
 
 /// Build the `OperationManager` with the network sync transport wired in (P0).
 ///
-/// On macOS the transport resolves each project's `SyncContext` from the keychain
-/// + provisioning + per-project stores (`ProvisioningSyncContextProvider`) and
-/// peer addresses from the provisioning address book, so `sync.start` with a peer
-/// over a bootstrapped project actually dials and syncs. A project not
-/// provisioned for sync fails cleanly (`sync_project_not_provisioned`); peerless
-/// scan operations are unaffected (the composite runner routes them to the scan
-/// runner). Off macOS there is no keychain backend yet, so the manager opens
-/// without a transport and peer syncs report `sync_transport_not_configured`.
+/// The transport resolves each project's `SyncContext` from the keychain +
+/// provisioning + per-project stores (`ProvisioningSyncContextProvider`) and peer
+/// addresses from the provisioning address book, so `sync.start` with a peer over
+/// a bootstrapped project actually dials and syncs. A project not provisioned for
+/// sync fails cleanly (`sync_project_not_provisioned`); peerless scan operations
+/// are unaffected (the composite runner routes them to the scan runner). The
+/// keychain backend is `daemon_keychain()`, so this works on macOS (OS keychain)
+/// and on Linux / unsigned binaries (file keychain via `TERMMESH_SYNC_KEYCHAIN_DIR`).
 fn build_sync_operation_manager(
     project_registry: Arc<crate::sync::ProjectRegistry>,
 ) -> anyhow::Result<crate::sync::OperationManager> {
     let operation_db = crate::sync::default_operation_db_path();
-    #[cfg(target_os = "macos")]
-    {
-        let keychain = crate::sync::daemon_keychain();
-        let provisioning = Arc::new(
-            crate::sync::SyncProvisioningStore::open(crate::sync::default_provisioning_db_path())
-                .map_err(|error| anyhow::anyhow!("open sync provisioning store: {error:?}"))?,
-        );
-        let provider = Arc::new(crate::sync::ProvisioningSyncContextProvider::new(
-            keychain,
-            provisioning.clone(),
-            crate::sync::default_sync_state_root(),
-        ));
-        let resolver = Arc::new(crate::sync::ProvisioningPeerResolver::new(provisioning));
-        let runner = Arc::new(crate::sync::NetworkSyncRunner::new(
-            provider,
-            resolver,
-            tokio::runtime::Handle::current(),
-        ));
-        Ok(crate::sync::OperationManager::open_with_sync_transport(
-            operation_db,
-            project_registry,
-            runner,
-        )?)
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        Ok(crate::sync::OperationManager::open(
-            operation_db,
-            project_registry,
-        )?)
-    }
+    let keychain = crate::sync::daemon_keychain();
+    let provisioning = Arc::new(
+        crate::sync::SyncProvisioningStore::open(crate::sync::default_provisioning_db_path())
+            .map_err(|error| anyhow::anyhow!("open sync provisioning store: {error:?}"))?,
+    );
+    let provider = Arc::new(crate::sync::ProvisioningSyncContextProvider::new(
+        keychain,
+        provisioning.clone(),
+        crate::sync::default_sync_state_root(),
+    ));
+    let resolver = Arc::new(crate::sync::ProvisioningPeerResolver::new(provisioning));
+    let runner = Arc::new(crate::sync::NetworkSyncRunner::new(
+        provider,
+        resolver,
+        tokio::runtime::Handle::current(),
+    ));
+    Ok(crate::sync::OperationManager::open_with_sync_transport(
+        operation_db,
+        project_registry,
+        runner,
+    )?)
 }
 
 fn parse_project_id(value: &str) -> Result<crate::sync::ProjectId, String> {
