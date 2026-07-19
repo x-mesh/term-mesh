@@ -4,6 +4,7 @@ private enum RetrievalDrawerTab: String, CaseIterable {
     case activity = "Live Activity"
     case incoming = "Incoming"
     case checkpoints = "Checkpoints"
+    case mirror = "Mirror"
 }
 
 struct WorkspaceRetrievalSidebarSection: View {
@@ -225,11 +226,27 @@ private struct RetrievalPresentationBar: View {
 private struct RetrievalActivityDrawer: View {
     @ObservedObject var workspace: Workspace
     @ObservedObject private var store: WorkspaceRetrievalStore
+    @StateObject private var mirrors = SyncMirrorStore()
     @State private var selectedTab: RetrievalDrawerTab = .activity
 
     init(workspace: Workspace) {
         self.workspace = workspace
         self.store = workspace.retrievalStore
+    }
+
+    /// Resolve a binding's peer label to the ssh target and the address this
+    /// side dials for QUIC.
+    ///
+    /// Both come from the pane that created the binding, which already carries
+    /// a validated ssh target. The dialable address is that target's host part:
+    /// an ssh-config alias only works here when it also resolves as a hostname
+    /// (MagicDNS names do). A peer whose alias is ssh-only will need an explicit
+    /// address before this can reach it.
+    private func peerEndpoint(for label: String) -> (sshTarget: String, address: String)? {
+        guard let target = store.panes.first(where: { $0.hostLabel == label })?.sshTarget,
+              !target.isEmpty else { return nil }
+        let host = target.split(separator: "@").last.map(String.init) ?? target
+        return (target, host)
     }
 
     var body: some View {
@@ -273,6 +290,8 @@ private struct RetrievalActivityDrawer: View {
                 case .activity: activityList
                 case .incoming: incomingList
                 case .checkpoints: checkpointList
+                case .mirror:
+                    SyncMirrorTab(store: store, mirrors: mirrors, peerLookup: peerEndpoint)
                 }
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
