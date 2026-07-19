@@ -538,9 +538,12 @@ fn host_stats_from(snapshot: &SystemSnapshot) -> HostStats {
         .iter()
         .fold((0f64, 0f64), |(rx, tx), io| (rx + io.rx_rate, tx + io.tx_rate));
     HostStats {
-        // `load_avg` is [1m, 5m, 15m]; the 1-minute figure is the one that
-        // tracks what a person is doing to the machine right now.
+        // `load_avg` is [1m, 5m, 15m]. All three travel: the 1-minute
+        // figure says how busy the machine is, and the other two say
+        // whether that is a spike or a trend.
         load_1m: snapshot.load_avg[0],
+        load_5m: snapshot.load_avg[1],
+        load_15m: snapshot.load_avg[2],
         cpu_count: snapshot.cpu_count as u32,
         memory_percent: snapshot.memory_percent,
         memory_used_bytes: snapshot.used_memory_bytes,

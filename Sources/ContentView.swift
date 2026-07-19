@@ -54,9 +54,9 @@ struct ContentView: View {
     @State private var titlebarDirBasename: String = ""
     @State private var titlebarHostKey: PeerPaneHostKey? = nil
     /// Pre-rendered by `PeerHostStats`, never composed here: this view's
-    /// update is a measured hot path (TERM-MESH-1K/1N), so it may read a
-    /// finished string but must not build one.
-    @State private var titlebarHostStats: String = ""
+    /// update is a measured hot path (TERM-MESH-1K/1N), so it may read
+    /// finished strings but must not build them.
+    @State private var titlebarHostStats: [PeerHostStats.Group] = []
     @State private var titlebarPorts: [Int] = []
     @State private var titlebarSessionStart: Date? = nil
     @State private var titlebarTag: String? = nil
@@ -600,14 +600,17 @@ struct ContentView: View {
                 // How loaded that machine is, when it tells us. Dimmer than
                 // the host name: it is context for the pane, not its identity,
                 // and it changes every couple of seconds.
-                if !titlebarHostStats.isEmpty {
-                    Text(titlebarHostStats)
+                //
+                // One view per reading, each with its own priority, so a
+                // narrow window drops whole groups from the right instead of
+                // cutting the last one mid-number. All of them rank below the
+                // branch and directory, which say where you are.
+                ForEach(titlebarHostStats, id: \.text) { group in
+                    Text(group.text)
                         .font(.system(size: 10, weight: .regular, design: .monospaced))
                         .foregroundColor(titlebarColor(opacity: 0.55))
-                        // First to go when the window is too narrow — the
-                        // branch and directory say where you are, which
-                        // matters more than how busy the box is.
-                        .layoutPriority(-1)
+                        .fixedSize()
+                        .layoutPriority(group.dropPriority)
                 }
             }
         }
@@ -1034,7 +1037,7 @@ struct ContentView: View {
             if titlebarIsWorktree { titlebarIsWorktree = false }
             if !titlebarDirBasename.isEmpty { titlebarDirBasename = "" }
             if titlebarHostKey != nil { titlebarHostKey = nil }
-            if !titlebarHostStats.isEmpty { titlebarHostStats = "" }
+            if !titlebarHostStats.isEmpty { titlebarHostStats = [] }
             if !titlebarPorts.isEmpty { titlebarPorts = [] }
             if titlebarSessionStart != nil { titlebarSessionStart = nil }
             if titlebarTag != nil { titlebarTag = nil }
@@ -1136,7 +1139,7 @@ struct ContentView: View {
         // already-formatted string; the store returns nothing once a
         // sample ages out, so a dead link empties the field rather than
         // freezing on its last reading.
-        let hostStats = snapHostKey.flatMap { PeerHostStatsStore.shared.stats(for: $0)?.summary } ?? ""
+        let hostStats = snapHostKey.flatMap { PeerHostStatsStore.shared.stats(for: $0)?.groups } ?? []
         if titlebarHostStats != hostStats { titlebarHostStats = hostStats }
 
         // Listening ports

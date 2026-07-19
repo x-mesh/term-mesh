@@ -8,11 +8,23 @@ import PeerProto
 /// (TERM-MESH-1K/1N), so the work it does per update has to stay down to
 /// reading a value someone else already computed.
 struct PeerHostStats: Equatable, Sendable {
-    /// Ready to concatenate: `load 1.2  mem 45%  ↓2.1M ↑1.0M`.
-    let summary: String
+    /// The groups, in reading order, each already rendered.
+    ///
+    /// Kept apart rather than joined into one string so the titlebar can
+    /// drop them one at a time as the window narrows. A single string can
+    /// only be truncated mid-word, which would cut the last group in half
+    /// and leave something unreadable behind.
+    let groups: [Group]
     /// When the host's sample arrived. A stale one is worse than none —
     /// a frozen number reads as a calm machine rather than a lost link.
     let receivedAt: Date
+
+    /// One labelled reading. `dropPriority` orders what goes first when
+    /// there is not enough room: lower drops earlier.
+    struct Group: Equatable, Sendable {
+        let text: String
+        let dropPriority: Double
+    }
 
     /// Past this, the host has missed several of its own sampling ticks
     /// (it samples every ~2s) and whatever we hold no longer describes it.
@@ -20,20 +32,45 @@ struct PeerHostStats: Equatable, Sendable {
 
     var isStale: Bool { Date().timeIntervalSince(receivedAt) > Self.staleAfter }
 
+    /// Everything on one line, for logs and tests.
+    var summary: String { groups.map(\.text).joined(separator: "  ") }
+
     init(_ wire: Termmesh_Peer_V1_HostStats, receivedAt: Date = Date()) {
-        var parts: [String] = []
-        // Load first: it is the one number that says "this machine is
-        // struggling" regardless of what it is struggling with.
-        parts.append("load \(Self.oneDecimal(wire.load1M))")
+        var groups: [Group] = []
+        // Three figures, not one: the first says how busy the machine is,
+        // the other two say whether that is a spike or a trend. Kept
+        // together as one group because reading them apart means nothing.
+        groups.append(
+            Group(
+                text: "load \(Self.oneDecimal(wire.load1M)) \(Self.oneDecimal(wire.load5M)) \(Self.oneDecimal(wire.load15M))",
+                dropPriority: 0
+            )
+        )
         if wire.memoryPercent > 0 {
-            parts.append("mem \(Int(wire.memoryPercent.rounded()))%")
+            groups.append(Group(text: "mem \(Int(wire.memoryPercent.rounded()))%", dropPriority: -1))
         }
-        // Only when something is actually moving — an idle host would
-        // otherwise carry two permanent `↓0B ↑0B` that never mean anything.
+        // Network before disk: a remote pane's responsiveness rides on the
+        // link, so it is the one a person reaches for first.
         if wire.netRxBytesPerSec > 0 || wire.netTxBytesPerSec > 0 {
-            parts.append("↓\(Self.rate(wire.netRxBytesPerSec)) ↑\(Self.rate(wire.netTxBytesPerSec))")
+            groups.append(
+                Group(
+                    text: "net ↓\(Self.rate(wire.netRxBytesPerSec)) ↑\(Self.rate(wire.netTxBytesPerSec))",
+                    dropPriority: -2
+                )
+            )
         }
-        self.summary = parts.joined(separator: "  ")
+        // Read/write rather than arrows: ↓↑ already mean "over the wire"
+        // one group to the left, and reusing them here would read as more
+        // network traffic.
+        if wire.diskReadBytesPerSec > 0 || wire.diskWriteBytesPerSec > 0 {
+            groups.append(
+                Group(
+                    text: "io \(Self.rate(wire.diskReadBytesPerSec))/\(Self.rate(wire.diskWriteBytesPerSec))",
+                    dropPriority: -3
+                )
+            )
+        }
+        self.groups = groups
         self.receivedAt = receivedAt
     }
 

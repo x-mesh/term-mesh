@@ -1952,8 +1952,12 @@ public nonisolated struct Termmesh_Peer_V1_HostStats: Sendable {
   // `Message` and `Message+*Additions` files in the SwiftProtobuf library for
   // methods supported on all messages.
 
-  /// 1-minute load average. Not normalized by core count; pair with
-  /// `cpu_count` to judge whether it is high.
+  /// Load averages over the last 1, 5 and 15 minutes. None are normalized
+  /// by core count; pair with `cpu_count` to judge whether they are high.
+  ///
+  /// All three are worth carrying: one figure says how busy the machine is,
+  /// but the three together say whether it is climbing, settled, or on its
+  /// way back down — which is what tells you to wait or to go look.
   public var load1M: Double = 0
 
   public var cpuCount: UInt32 = 0
@@ -1974,6 +1978,10 @@ public nonisolated struct Termmesh_Peer_V1_HostStats: Sendable {
   public var netRxBytesPerSec: UInt64 = 0
 
   public var netTxBytesPerSec: UInt64 = 0
+
+  public var load5M: Double = 0
+
+  public var load15M: Double = 0
 
   public var unknownFields = SwiftProtobuf.UnknownStorage()
 
@@ -5114,7 +5122,7 @@ nonisolated extension Termmesh_Peer_V1_WorkspaceLayoutChanged: SwiftProtobuf.Mes
 
 nonisolated extension Termmesh_Peer_V1_HostStats: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
   public static let protoMessageName: String = _protobuf_package + ".HostStats"
-  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{3}load_1m\0\u{3}cpu_count\0\u{3}memory_percent\0\u{3}memory_used_bytes\0\u{3}memory_total_bytes\0\u{3}disk_read_bytes_per_sec\0\u{3}disk_write_bytes_per_sec\0\u{3}net_rx_bytes_per_sec\0\u{3}net_tx_bytes_per_sec\0")
+  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{3}load_1m\0\u{3}cpu_count\0\u{3}memory_percent\0\u{3}memory_used_bytes\0\u{3}memory_total_bytes\0\u{3}disk_read_bytes_per_sec\0\u{3}disk_write_bytes_per_sec\0\u{3}net_rx_bytes_per_sec\0\u{3}net_tx_bytes_per_sec\0\u{3}load_5m\0\u{3}load_15m\0")
 
   public mutating func decodeMessage<D: SwiftProtobuf.Decoder>(decoder: inout D) throws {
     while let fieldNumber = try decoder.nextFieldNumber() {
@@ -5131,6 +5139,8 @@ nonisolated extension Termmesh_Peer_V1_HostStats: SwiftProtobuf.Message, SwiftPr
       case 7: try { try decoder.decodeSingularUInt64Field(value: &self.diskWriteBytesPerSec) }()
       case 8: try { try decoder.decodeSingularUInt64Field(value: &self.netRxBytesPerSec) }()
       case 9: try { try decoder.decodeSingularUInt64Field(value: &self.netTxBytesPerSec) }()
+      case 10: try { try decoder.decodeSingularDoubleField(value: &self.load5M) }()
+      case 11: try { try decoder.decodeSingularDoubleField(value: &self.load15M) }()
       default: break
       }
     }
@@ -5164,6 +5174,12 @@ nonisolated extension Termmesh_Peer_V1_HostStats: SwiftProtobuf.Message, SwiftPr
     if self.netTxBytesPerSec != 0 {
       try visitor.visitSingularUInt64Field(value: self.netTxBytesPerSec, fieldNumber: 9)
     }
+    if self.load5M.bitPattern != 0 {
+      try visitor.visitSingularDoubleField(value: self.load5M, fieldNumber: 10)
+    }
+    if self.load15M.bitPattern != 0 {
+      try visitor.visitSingularDoubleField(value: self.load15M, fieldNumber: 11)
+    }
     try unknownFields.traverse(visitor: &visitor)
   }
 
@@ -5177,6 +5193,8 @@ nonisolated extension Termmesh_Peer_V1_HostStats: SwiftProtobuf.Message, SwiftPr
     if lhs.diskWriteBytesPerSec != rhs.diskWriteBytesPerSec {return false}
     if lhs.netRxBytesPerSec != rhs.netRxBytesPerSec {return false}
     if lhs.netTxBytesPerSec != rhs.netTxBytesPerSec {return false}
+    if lhs.load5M != rhs.load5M {return false}
+    if lhs.load15M != rhs.load15M {return false}
     if lhs.unknownFields != rhs.unknownFields {return false}
     return true
   }

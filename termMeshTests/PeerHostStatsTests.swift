@@ -13,24 +13,60 @@ final class PeerHostStatsTests: XCTestCase {
 
     private func wire(
         load: Double = 1.0,
+        load5: Double = 0,
+        load15: Double = 0,
         memoryPercent: Float = 40,
         rx: UInt64 = 0,
-        tx: UInt64 = 0
+        tx: UInt64 = 0,
+        diskRead: UInt64 = 0,
+        diskWrite: UInt64 = 0
     ) -> Termmesh_Peer_V1_HostStats {
         var stats = Termmesh_Peer_V1_HostStats()
         stats.load1M = load
+        stats.load5M = load5
+        stats.load15M = load15
         stats.memoryPercent = memoryPercent
         stats.netRxBytesPerSec = rx
         stats.netTxBytesPerSec = tx
+        stats.diskReadBytesPerSec = diskRead
+        stats.diskWriteBytesPerSec = diskWrite
         return stats
     }
 
-    func testSummaryLeadsWithLoad() {
-        let summary = PeerHostStats(wire(load: 1.25)).summary
+    func testSummaryLeadsWithAllThreeLoadAverages() {
+        let summary = PeerHostStats(wire(load: 1.25, load5: 2.0, load15: 0.5)).summary
 
-        // One decimal: the second one is noise at this refresh rate, and
-        // the titlebar pays for every character.
-        XCTAssertTrue(summary.hasPrefix("load 1.2"), "got \(summary)")
+        // One decimal each: the second is noise at this refresh rate, and
+        // the titlebar pays for every character. All three together are
+        // what say whether the machine is climbing or settling.
+        XCTAssertTrue(summary.hasPrefix("load 1.2 2.0 0.5"), "got \(summary)")
+    }
+
+    func testDiskAppearsWhenItIsDoingSomething() {
+        let summary = PeerHostStats(wire(diskRead: 1_200_000, diskWrite: 340_000)).summary
+
+        // Read/write, not arrows — those already mean "over the wire" in
+        // the network group and would read as more traffic here.
+        XCTAssertTrue(summary.contains("io 1.2M/340K"), "got \(summary)")
+    }
+
+    func testIdleHostShowsOnlyWhatIsHappening() {
+        let groups = PeerHostStats(wire()).groups
+
+        // Load and memory always mean something; zero-rate disk and
+        // network are just noise taking up titlebar width.
+        XCTAssertEqual(groups.count, 2, "got \(groups.map(\.text))")
+    }
+
+    /// The order is what a person reaches for first, and the priorities
+    /// are the reverse of that — a narrow window sheds from the right.
+    func testGroupsAreOrderedAndPrioritisedForNarrowWindows() {
+        let groups = PeerHostStats(
+            wire(load: 1, load5: 1, load15: 1, rx: 10, tx: 10, diskRead: 10, diskWrite: 10)
+        ).groups
+
+        XCTAssertEqual(groups.map { $0.text.prefix(3) }.map(String.init), ["loa", "mem", "net", "io "])
+        XCTAssertEqual(groups.map(\.dropPriority), [0, -1, -2, -3])
     }
 
     func testSummaryOmitsNetworkWhenNothingIsMoving() {

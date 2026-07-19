@@ -715,8 +715,12 @@ message WorkspaceLayoutChanged {
 // host that cannot measure it — a viewer must render what it has rather
 // than wait for a complete set.
 message HostStats {
-  // 1-minute load average. Not normalized by core count; pair with
-  // `cpu_count` to judge whether it is high.
+  // Load averages over the last 1, 5 and 15 minutes. None are normalized
+  // by core count; pair with `cpu_count` to judge whether they are high.
+  //
+  // All three are worth carrying: one figure says how busy the machine is,
+  // but the three together say whether it is climbing, settled, or on its
+  // way back down — which is what tells you to wait or to go look.
   double load_1m = 1;
   uint32 cpu_count = 2;
   // Percentage of physical memory in use, 0-100.
@@ -729,6 +733,8 @@ message HostStats {
   uint64 disk_write_bytes_per_sec = 7;
   uint64 net_rx_bytes_per_sec = 8;
   uint64 net_tx_bytes_per_sec = 9;
+  double load_5m = 10;
+  double load_15m = 11;
 }
 
 // ============================================================
