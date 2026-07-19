@@ -629,12 +629,21 @@ impl PtySurface {
     /// Best-effort by construction: a dead child, a platform without a lookup,
     /// or a permission failure all fall back to the spawn directory, so callers
     /// always get a usable path rather than an empty one.
+    ///
+    /// The lookup runs while the lifecycle lock is held, which is what makes a
+    /// bare pid safe to use: reaping takes the same lock, so the child cannot
+    /// be waited on — and its pid therefore cannot be recycled onto some
+    /// unrelated process — between the state check and the read. The cost is a
+    /// single filesystem-ish syscall under the lock, and this is only ever
+    /// called when a snapshot is taken, never in a loop.
     pub fn current_cwd(&self) -> String {
-        let pid = match self.child.lock() {
-            Ok(child) if child.state == ChildState::Running => child.pid,
-            _ => return self.cwd.clone(),
+        let Ok(child) = self.child.lock() else {
+            return self.cwd.clone();
         };
-        process_cwd(pid).unwrap_or_else(|| self.cwd.clone())
+        if child.state != ChildState::Running {
+            return self.cwd.clone();
+        }
+        process_cwd(child.pid).unwrap_or_else(|| self.cwd.clone())
     }
 
     pub fn info(&self) -> SurfaceInfo {
@@ -2440,13 +2449,23 @@ mod tests {
         // The shell chdir()s on its own schedule, so poll rather than sleep a
         // fixed amount: fast when it is prompt, still correct when it is slow.
         let mut observed = String::new();
-        for _ in 0..100 {
+        for i in 0..100 {
             observed = surface.current_cwd();
+            if i < 4 || i % 25 == 0 {
+                let c = surface.child.lock().unwrap();
+                eprintln!(
+                    "PROBE i={i} state={:?} raw={:?} observed={:?}",
+                    c.state,
+                    super::process_cwd(c.pid),
+                    observed
+                );
+            }
             if observed == expected.to_string_lossy() {
                 break;
             }
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
+        eprintln!("PROBE expected={:?} spawn_cwd={:?}", expected, surface.cwd);
         assert_eq!(observed, expected.to_string_lossy());
         // The spawn directory is what the old code would have reported, so
         // stating it separately makes the regression unmistakable.
