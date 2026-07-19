@@ -143,7 +143,7 @@ pub use network_runner::{
     PeerAddressResolver, SyncContext, SyncContextProvider,
 };
 #[allow(unused_imports)]
-pub use fetch::{receive_push, respond_to_fetch, run_fetch_pull, run_push};
+pub use fetch::{apply_deletes, receive_push, respond_to_fetch, run_fetch_pull, run_push};
 #[allow(unused_imports)]
 pub use provisioning::{
     default_provisioning_db_path, LocalCoordinates, ProvisioningError, ProvisioningPeerResolver,

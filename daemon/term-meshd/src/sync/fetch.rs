@@ -20,7 +20,7 @@ use tokio::time::{timeout, Duration};
 
 use super::{
     build_apply_plan, build_delete_plan, build_directory_delete_plan, check_delete_guard,
-    mode_matches_executable, put_plaintext, ApplyStore, CasStore,
+    mode_matches_executable, put_plaintext, ApplyPlan, ApplyStore, CasStore,
     EncryptedChunk, EntryKind, FetchEntry,
     KeyId, ManifestEntry, ObjectDomain, ObjectId, ProjectId, ProjectKey, StreamLane, SyncConnection,
 };
@@ -605,43 +605,88 @@ async fn receive_push_inner(
     // with a broken manifest and an emptied tree.
     if !delete_paths.is_empty() {
         check_delete_guard(delete_paths.len(), local.len())?;
-        let mut delete_id = [0u8; 16];
-        getrandom::getrandom(&mut delete_id).map_err(|_| "push_apply_failed".to_string())?;
-        let delete_plan = build_delete_plan(project, delete_id, &delete_paths, local);
-        if !delete_plan.entries.is_empty() {
-            applied += delete_plan.entries.len() as u64;
-            let store = apply_store
-                .lock()
-                .map_err(|_| "push_apply_failed".to_string())?;
-            store
-                .apply(root, cas, domain, &delete_plan)
-                .map_err(|_| "push_apply_failed".to_string())?;
-        }
-
-        // Directories, once the leaves above are gone. Non-fatal for the same
-        // reason as on the initiator side: the precondition refuses a directory
-        // holding anything the scanner never tracked, and that must leave the
-        // path outstanding rather than fail every push forever.
-        let modes =
-            ApplyStore::directory_modes(root, project, delete_paths.iter().map(String::as_str))
-                .map_err(|_| "push_apply_failed".to_string())?;
-        let mut directory_id = [0u8; 16];
-        getrandom::getrandom(&mut directory_id).map_err(|_| "push_apply_failed".to_string())?;
-        let directory_plan =
-            build_directory_delete_plan(project, directory_id, &delete_paths, local, &modes);
-        if !directory_plan.entries.is_empty() {
-            let store = apply_store
-                .lock()
-                .map_err(|_| "push_apply_failed".to_string())?;
-            match store.apply(root, cas, domain, &directory_plan) {
-                Ok(_) => applied += directory_plan.entries.len() as u64,
-                Err(error) => tracing::warn!(
-                    ?error,
-                    directories = directory_plan.entries.len(),
-                    "directory delete refused; leaving the paths outstanding"
-                ),
-            }
-        }
+        applied += apply_deletes(
+            root,
+            cas,
+            apply_store,
+            domain,
+            project,
+            &delete_paths,
+            local,
+            "push_apply_failed",
+        )?
+        .len() as u64;
     }
     Ok(applied)
+}
+
+/// Remove `paths` from the working tree, returning the ones that really went.
+///
+/// Leaves first and directories after, because a directory can only go once it
+/// is empty. Shared by both sides — the initiator applying what the peer
+/// deleted, and the responder applying what the initiator pushed — so the two
+/// cannot drift on a rule this destructive.
+///
+/// Each directory is its own apply. That costs one journal cycle per directory,
+/// and it is the whole point: an apply is atomic, so batching them means one
+/// refusal takes down every other directory in the batch. A single nested git
+/// repo (the scanner skips `.git`, so its content is untracked by construction)
+/// would then block every directory delete in the project, on every sync,
+/// forever — which is exactly what the hardware e2e caught. Per-directory, a
+/// refusal costs only that path, which stays outstanding for the next run.
+///
+/// A directory refusal is never fatal for the same reason: it means the
+/// directory still holds something, and keeping it is the correct answer.
+#[allow(clippy::too_many_arguments)]
+pub fn apply_deletes(
+    root: &Path,
+    cas: &CasStore,
+    apply_store: &std::sync::Mutex<ApplyStore>,
+    domain: ObjectDomain,
+    project: ProjectId,
+    paths: &[String],
+    local: &[ManifestEntry],
+    failure_code: &str,
+) -> Result<Vec<String>, String> {
+    let mut removed: Vec<String> = Vec::new();
+
+    let mut leaf_id = [0u8; 16];
+    getrandom::getrandom(&mut leaf_id).map_err(|_| failure_code.to_string())?;
+    let leaf_plan = build_delete_plan(project, leaf_id, paths, local);
+    if !leaf_plan.entries.is_empty() {
+        let store = apply_store.lock().map_err(|_| failure_code.to_string())?;
+        store
+            .apply(root, cas, domain, &leaf_plan)
+            .map_err(|_| failure_code.to_string())?;
+        removed.extend(leaf_plan.entries.iter().map(|e| e.relative_path.clone()));
+    }
+
+    let modes = ApplyStore::directory_modes(root, project, paths.iter().map(String::as_str))
+        .map_err(|_| failure_code.to_string())?;
+    let mut directory_id = [0u8; 16];
+    getrandom::getrandom(&mut directory_id).map_err(|_| failure_code.to_string())?;
+    let directory_plan = build_directory_delete_plan(project, directory_id, paths, local, &modes);
+    // Deepest-first, as the plan ordered them: a parent is only reachable once
+    // its children have gone, so the sequence must stay in that order.
+    for entry in &directory_plan.entries {
+        let mut one_id = [0u8; 16];
+        getrandom::getrandom(&mut one_id).map_err(|_| failure_code.to_string())?;
+        let one = ApplyPlan {
+            operation_id: one_id,
+            project,
+            target_manifest_root: directory_plan.target_manifest_root,
+            frontier: directory_plan.frontier.clone(),
+            entries: vec![entry.clone()],
+        };
+        let store = apply_store.lock().map_err(|_| failure_code.to_string())?;
+        match store.apply(root, cas, domain, &one) {
+            Ok(_) => removed.push(entry.relative_path.clone()),
+            Err(error) => tracing::warn!(
+                ?error,
+                path = %entry.relative_path,
+                "directory delete refused; leaving the path outstanding"
+            ),
+        }
+    }
+    Ok(removed)
 }

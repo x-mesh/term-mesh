@@ -12,6 +12,7 @@
 //! bridges into async QUIC I/O with `Handle::block_on` and polls the `cancelled`
 //! flag around the connect.
 
+use std::collections::HashSet;
 use std::fs::File;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -22,7 +23,7 @@ use sync_protocol::{SyncHello, PROJECT_SYNC_CAPABILITY, PROTOCOL_V1};
 
 use super::{
     build_apply_plan, decode_manifest_batch, encode_manifest_batches, reconcile_bidirectional,
-    build_delete_plan, build_directory_delete_plan, check_delete_guard, run_fetch_pull, run_push,
+    apply_deletes, check_delete_guard, run_fetch_pull, run_push,
     scan_conflicts, ApplyStore, CasStore, DeviceTlsIdentity, FetchEntry, ManifestBuilder,
     ManifestEntry, ManifestScanner, ObjectDomain, ObjectType, OperationResult, OperationSpec,
     ProjectId, ScanCheckpoint, ScanError, ScanLimits, ScanObserver, ScanReason, StreamLane,
@@ -401,17 +402,36 @@ impl NetworkSyncRunner {
             for entry in plan.fetch.iter().chain(plan.push.iter()) {
                 base_map.insert(entry.relative_path.clone(), fetch_to_manifest(entry));
             }
-            // A propagated delete converged too: drop it from the base so it is
-            // not re-proposed forever. Only the paths actually removed — a delete
-            // the plans skipped (a directory that could not be emptied) must stay
-            // outstanding.
-            for path in removed_locally
-                .iter()
-                .cloned()
-                .chain(plan.delete_remote.iter().cloned())
-            {
-                base_map.remove(&path);
+            // Deletes this side actually performed have converged, so the base
+            // forgets them. A delete the plans skipped — a directory that could
+            // not be emptied — is NOT in this list and stays outstanding.
+            for path in &removed_locally {
+                base_map.remove(path);
             }
+            // A delete pushed to the peer is only converged once the peer really
+            // dropped it, and the push ack carries a count rather than per-path
+            // results — so `delete_remote` cannot be forgotten here. Dropping it
+            // regardless was a resurrection bug: the peer refused a directory,
+            // the base forgot it anyway, and on the next pass the peer's copy
+            // read as an unknown addition and was fetched straight back.
+            //
+            // Instead, forget what both manifests agree is gone. That converges
+            // one pass later than the optimistic version (these manifests were
+            // exchanged before this run's deletes landed) at the cost of one
+            // idempotent re-proposal, and it is self-correcting either way: a
+            // delete the peer honoured disappears from its next manifest, while
+            // one it refused keeps being re-proposed instead of coming back.
+            let remote_paths: HashSet<&str> = remote_entries
+                .iter()
+                .map(|entry| entry.relative_path.as_str())
+                .collect();
+            let local_paths: HashSet<&str> = local_entries
+                .iter()
+                .map(|entry| entry.relative_path.as_str())
+                .collect();
+            base_map.retain(|path, _| {
+                remote_paths.contains(path.as_str()) || local_paths.contains(path.as_str())
+            });
             // Only the paths whose base entry just advanced. `resolved` also holds
             // the staged REMOTE side of every conflicting path — adopting those
             // would leave the base manifest on the old content while its object
@@ -474,10 +494,10 @@ impl NetworkSyncRunner {
 
 /// Remove `paths` locally, returning the ones that really went away.
 ///
-/// Two applies, leaves before directories, because a directory can only be
-/// removed once it is empty. The caller feeds the returned paths to the base, so
-/// a delete that did not land stays outstanding and is re-proposed next sync
-/// instead of being forgotten.
+/// Delegates to [`apply_deletes`], which both sides share so the initiator and
+/// the responder cannot drift on a rule this destructive. The caller feeds the
+/// returned paths to the base, so a delete that did not land stays outstanding
+/// and is re-proposed next sync instead of being forgotten.
 fn apply_local_deletes(
     ctx: &SyncContext,
     root: &std::path::Path,
@@ -486,56 +506,18 @@ fn apply_local_deletes(
     paths: &[String],
     local: &[ManifestEntry],
 ) -> Result<Vec<String>, String> {
-    let mut leaf_id = [0u8; 16];
-    getrandom::getrandom(&mut leaf_id).map_err(|_| "sync_apply_failed".to_string())?;
-    let leaf_plan = build_delete_plan(project, leaf_id, paths, local);
-    let mut removed: Vec<String> = Vec::new();
-    if !leaf_plan.entries.is_empty() {
-        let store = ctx
-            .apply_store
-            .lock()
-            .map_err(|_| "sync_apply_failed".to_string())?;
-        store
-            .apply(root, &ctx.cas, domain, &leaf_plan)
-            .map_err(|_| "sync_apply_failed".to_string())?;
-        removed.extend(leaf_plan.entries.iter().map(|e| e.relative_path.clone()));
-    }
-
-    let modes = ApplyStore::directory_modes(root, project, paths.iter().map(String::as_str))
-        .map_err(|_| "sync_apply_failed".to_string())?;
-    let mut directory_id = [0u8; 16];
-    getrandom::getrandom(&mut directory_id).map_err(|_| "sync_apply_failed".to_string())?;
-    let directory_plan =
-        build_directory_delete_plan(project, directory_id, paths, local, &modes);
-    if !directory_plan.entries.is_empty() {
-        let store = ctx
-            .apply_store
-            .lock()
-            .map_err(|_| "sync_apply_failed".to_string())?;
-        // Deliberately not fatal. The precondition refuses a directory that is
-        // not empty, and untracked content the scanner never saw — a build
-        // artifact, a `.DS_Store` — is exactly the case that trips it. Failing
-        // the whole sync over one such directory, every single run, would be
-        // worse than leaving it in place: the leaf deletes above already
-        // committed, and the directory simply stays outstanding.
-        match store.apply(root, &ctx.cas, domain, &directory_plan) {
-            Ok(_) => {
-                removed.extend(
-                    directory_plan
-                        .entries
-                        .iter()
-                        .map(|e| e.relative_path.clone()),
-                );
-            }
-            Err(error) => tracing::warn!(
-                ?error,
-                directories = directory_plan.entries.len(),
-                "directory delete refused; leaving the paths outstanding"
-            ),
-        }
-    }
-    Ok(removed)
+    apply_deletes(
+        root,
+        &ctx.cas,
+        &ctx.apply_store,
+        domain,
+        project,
+        paths,
+        local,
+        "sync_apply_failed",
+    )
 }
+
 
 /// A pushed/fetched `FetchEntry` back to a `ManifestEntry` (identical fields) so
 /// it can seed the advanced base manifest.
