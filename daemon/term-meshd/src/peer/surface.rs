@@ -995,9 +995,17 @@ pub(crate) fn resolve_login_shell(candidate: Option<&str>) -> String {
 
 /// `<shell> -l` command line for a new pane, shared by the startup
 /// fallback surface and split/new-tab spawns.
+/// The login shell, phrased so that `sh -c` replaces itself with it instead of
+/// staying alive as a parent.
+///
+/// Without `exec` a pane is two processes — the `sh` that was asked to start a
+/// shell, and the shell — and the one we hold the pid of is the wrapper, which
+/// never leaves the directory it started in. Anything asking the OS where this
+/// pane is (see [`PtySurface::current_cwd`]) would read the wrapper and always
+/// answer with the spawn directory.
 pub(crate) fn login_shell_cmd() -> String {
     let shell = resolve_login_shell(std::env::var("SHELL").ok().as_deref());
-    format!("{shell} -l")
+    format!("exec {shell} -l")
 }
 
 fn default_shell_cmd() -> String {
@@ -2443,5 +2451,47 @@ mod tests {
         // The spawn directory is what the old code would have reported, so
         // stating it separately makes the regression unmistakable.
         assert_ne!(observed, surface.cwd);
+    }
+
+    /// Panes are not spawned as a bare shell — they go through `sh -c`, which
+    /// is the case the test above does not reach. If that `sh` stays alive as a
+    /// parent then the pid we hold is the wrapper's, and a wrapper never
+    /// leaves the directory it started in no matter where the shell goes.
+    #[tokio::test]
+    async fn current_cwd_follows_the_shell_started_through_a_wrapper() {
+        assert!(
+            login_shell_cmd().starts_with("exec "),
+            "the login shell must replace the wrapper, not run under it"
+        );
+
+        let start = tempfile::tempdir().unwrap();
+        let moved_to = tempfile::tempdir().unwrap();
+        let expected = std::fs::canonicalize(moved_to.path()).unwrap();
+
+        // Same shape as a real pane: /bin/sh -c "exec <shell>".
+        let surface = PtySurface::spawn(
+            surface_id_from_name("cwd-wrapper-test"),
+            "sh".into(),
+            "/bin/sh",
+            &["-c", "exec /bin/sh"],
+            80,
+            24,
+            Some(start.path().to_str().unwrap()),
+        )
+        .expect("spawn wrapped /bin/sh");
+
+        surface
+            .write_all(format!("cd {}\n", expected.display()).as_bytes())
+            .expect("write cd");
+
+        let mut observed = String::new();
+        for _ in 0..100 {
+            observed = surface.current_cwd();
+            if observed == expected.to_string_lossy() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert_eq!(observed, expected.to_string_lossy());
     }
 }
