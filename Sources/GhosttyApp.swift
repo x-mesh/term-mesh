@@ -1017,7 +1017,17 @@ class GhosttyApp {
             return true
         }
 
-        guard let surfaceView = callbackContext?.surfaceView else { return false }
+        // Every surface-targeted action dies here when the view cannot be
+        // resolved, before any case runs — which made a missing PWD look like
+        // ghostty never sending one. Say so for the actions we depend on.
+        guard let surfaceView = callbackContext?.surfaceView else {
+            #if DEBUG
+            if action.tag == GHOSTTY_ACTION_PWD {
+                dlog("pwd.dropped no surfaceView (tab=\(callbackTabId?.uuidString.prefix(8) ?? "<nil>") surface=\(callbackSurfaceId?.uuidString.prefix(8) ?? "<nil>"))")
+            }
+            #endif
+            return false
+        }
         if action.tag == GHOSTTY_ACTION_RELOAD_CONFIG ||
             action.tag == GHOSTTY_ACTION_CONFIG_CHANGE ||
             action.tag == GHOSTTY_ACTION_COLOR_CHANGE {
@@ -1175,9 +1185,15 @@ class GhosttyApp {
             }
             return true
         case GHOSTTY_ACTION_PWD:
+            let pwd = action.action.pwd.pwd.flatMap { String(cString: $0) } ?? ""
+            // The only place a working directory is learned (OSC 7). It fed
+            // nothing for remote panes and there was no way to see why, so say
+            // what arrived and which half of the guard rejected it.
+            #if DEBUG
+            dlog("pwd.action pwd=\(pwd) tabId=\(surfaceView.tabId?.uuidString.prefix(8) ?? "<nil>") surfaceId=\(surfaceView.terminalSurface?.id.uuidString.prefix(8) ?? "<nil>")")
+            #endif
             guard let tabId = surfaceView.tabId,
                   let surfaceId = surfaceView.terminalSurface?.id else { return true }
-            let pwd = action.action.pwd.pwd.flatMap { String(cString: $0) } ?? ""
             DispatchQueue.main.async {
                 AppDelegate.shared?.tabManager?.updateSurfaceDirectory(
                     tabId: tabId,

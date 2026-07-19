@@ -2293,58 +2293,136 @@ final class Workspace: Identifiable, ObservableObject {
         }
     }
 
-    func checkpointRemotePane(panelID: UUID, closeAfterCheckpoint: Bool) async {
-        guard let pane = retrievalStore.pane(panelID: panelID),
-              let binding = retrievalStore.projectBinding(for: pane),
-              let sshTarget = pane.sshTarget else {
-            retrievalStore.failCheckpoint(
-                panelID: panelID,
-                message: "Checkpoint requires an SSH peer and a Git project path on both machines."
-            )
+    /// Prepare the selected project pair on its peer.
+    ///
+    /// Takes no pane: the subject is two folders, and a pane is only where the
+    /// work happens to be visible.
+    func seedRemoteProject() async {
+        RemoteWorkLog.info("Prepare Project → \(retrievalStore.targetDescription)")
+        logDiagnosticContext()
+        guard let binding = retrievalStore.selectedBinding else {
+            let why = "No project is bound yet. Add one with the + button — a remote shell only binds a project automatically when it was spawned inside one."
+            RemoteWorkLog.info(why)
+            retrievalStore.errorMessage = why
             return
         }
-        retrievalStore.beginCheckpoint(panelID: panelID)
+        guard let sshTarget = sshTarget(for: binding) else {
+            let why = "No connected peer matches \(binding.peerID), so its project cannot be reached."
+            RemoteWorkLog.info(why)
+            retrievalStore.errorMessage = why
+            return
+        }
+        retrievalStore.errorMessage = nil
+
+        let plan = RemoteGitCheckpointService.shared.seedPlan(
+            sshTarget: sshTarget, remoteRoot: binding.remoteRoot, localOrigin: binding.localRoot
+        )
+        if retrievalStore.dryRun {
+            RemoteWorkLog.info("Dry run — Prepare Project would:")
+            for (index, step) in plan.enumerated() { RemoteWorkLog.info("  \(index + 1). \(step)") }
+            return
+        }
+        for (index, step) in plan.enumerated() { RemoteWorkLog.debug("step \(index + 1): \(step)") }
+
+        do {
+            try await RemoteGitCheckpointService.shared.seedProjectIfNeeded(
+                sshTarget: sshTarget, remoteRoot: binding.remoteRoot, localOrigin: binding.localRoot
+            )
+            RemoteWorkLog.info("Project is ready at \(binding.remoteRoot)")
+        } catch {
+            RemoteWorkLog.info("Project preparation failed: \(error.localizedDescription)")
+            retrievalStore.errorMessage = error.localizedDescription
+        }
+    }
+
+    /// Capture a checkpoint of the selected project pair.
+    func checkpointProject(closeAfterCheckpoint: Bool = false) async {
+        RemoteWorkLog.info("Checkpoint\(closeAfterCheckpoint ? " and close" : "") → \(retrievalStore.targetDescription)")
+        logDiagnosticContext()
+        guard let binding = retrievalStore.selectedBinding else {
+            let why = "No project is bound yet, so there is nothing to check point."
+            RemoteWorkLog.info(why)
+            retrievalStore.errorMessage = why
+            return
+        }
+        guard let sshTarget = sshTarget(for: binding) else {
+            let why = "No connected peer matches \(binding.peerID)."
+            RemoteWorkLog.info(why)
+            retrievalStore.errorMessage = why
+            return
+        }
+        let pane = retrievalStore.pane(for: binding)
+
+        let plan = RemoteGitCheckpointService.shared.checkpointPlan(
+            sshTarget: sshTarget, remoteRoot: binding.remoteRoot, localOrigin: binding.localRoot
+        )
+        if retrievalStore.dryRun {
+            RemoteWorkLog.info("Dry run — Checkpoint would:")
+            for (index, step) in plan.enumerated() { RemoteWorkLog.info("  \(index + 1). \(step)") }
+            if closeAfterCheckpoint, let pane { RemoteWorkLog.info("  \(plan.count + 1). close \(pane.title)") }
+            return
+        }
+        for (index, step) in plan.enumerated() { RemoteWorkLog.debug("step \(index + 1): \(step)") }
+
+        if let pane { retrievalStore.beginCheckpoint(panelID: pane.panelID) }
         do {
             let result = try await RemoteGitCheckpointService.shared.checkpointAndFetch(
-                paneID: pane.id,
+                paneID: pane?.id ?? RemotePaneID(),
                 projectBindingID: binding.id,
                 sshTarget: sshTarget,
                 remoteRoot: binding.remoteRoot,
                 localOrigin: binding.localRoot,
                 boundary: .checkpointNow
             )
-            retrievalStore.completeCheckpoint(panelID: panelID, result: result)
-            retrievalStore.pendingClosePanelID = nil
-            if closeAfterCheckpoint {
-                _ = closePanel(panelID, force: true)
+            RemoteWorkLog.info("Checkpoint captured; it is now under Incoming")
+            if let pane {
+                retrievalStore.completeCheckpoint(panelID: pane.panelID, result: result)
+                retrievalStore.pendingClosePanelID = nil
+                if closeAfterCheckpoint { _ = closePanel(pane.panelID, force: true) }
             }
         } catch {
-            retrievalStore.failCheckpoint(panelID: panelID, message: error.localizedDescription)
+            RemoteWorkLog.info("Checkpoint failed: \(error.localizedDescription)")
+            if let pane {
+                retrievalStore.failCheckpoint(panelID: pane.panelID, message: error.localizedDescription)
+            } else {
+                retrievalStore.errorMessage = error.localizedDescription
+            }
         }
     }
 
-    func seedRemoteProject(panelID: UUID) async {
-        guard let pane = retrievalStore.pane(panelID: panelID),
-              let binding = retrievalStore.projectBinding(for: pane),
-              let sshTarget = pane.sshTarget else {
-            retrievalStore.errorMessage = "Project preparation requires an SSH peer and local/remote project paths."
-            return
+    /// The ssh target for a binding's peer, from the panes attached to it.
+    private func sshTarget(for binding: ProjectBinding) -> String? {
+        retrievalStore.panes.first { $0.hostLabel == binding.peerID }?.sshTarget
+    }
+
+    private func logDiagnosticContext() {
+        RemoteWorkLog.debug("dryRun=\(retrievalStore.dryRun) bindings=\(retrievalStore.projectBindings.count) panes=\(retrievalStore.panes.count) workspaceDir=\(currentDirectory)")
+        for b in retrievalStore.projectBindings {
+            RemoteWorkLog.debug("  project \(b.peerID): \(b.remoteRoot) ↔ \(b.localRoot)\(b.id == retrievalStore.selectedBinding?.id ? "  ← target" : "")")
         }
-        retrievalStore.errorMessage = nil
-        do {
-            try await RemoteGitCheckpointService.shared.seedProjectIfNeeded(
-                sshTarget: sshTarget,
-                remoteRoot: binding.remoteRoot,
-                localOrigin: binding.localRoot
-            )
-            retrievalStore.recordActivity(
-                paneID: pane.id,
-                message: "Current Project is ready at \(binding.remoteRoot)"
-            )
-        } catch {
-            retrievalStore.errorMessage = error.localizedDescription
-            retrievalStore.recordActivity(paneID: pane.id, message: "Project preparation failed")
+        for pane in retrievalStore.panes {
+            RemoteWorkLog.debug("  pane \(pane.title) host=\(pane.hostLabel) remoteRoot=\(pane.remoteRoot.isEmpty ? "<empty>" : pane.remoteRoot)")
         }
+    }
+
+    /// Entry point for the close-confirmation sheet, which knows a pane rather
+    /// than a project. Selects that pane's project and runs the same action.
+    func checkpointRemotePane(panelID: UUID, closeAfterCheckpoint: Bool) async {
+        if let pane = retrievalStore.pane(panelID: panelID),
+           let binding = retrievalStore.projectBinding(for: pane) {
+            retrievalStore.selectedBindingID = binding.id
+        }
+        await checkpointProject(closeAfterCheckpoint: closeAfterCheckpoint)
+    }
+
+    private func resolvedPane(panelID: UUID, action: String) -> WorkspaceRemotePaneRecord? {
+        guard let pane = retrievalStore.pane(panelID: panelID) else {
+            let why = "\(action) needs a remote pane, and that one is no longer open."
+            RemoteWorkLog.info(why)
+            retrievalStore.errorMessage = why
+            return nil
+        }
+        return pane
     }
 
     func validateChangeset(_ changesetID: ChangesetID) async {

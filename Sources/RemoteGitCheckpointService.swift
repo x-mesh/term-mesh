@@ -56,6 +56,33 @@ protocol RemoteGitCheckpointServicing: Sendable {
 }
 
 final class RemoteGitCheckpointService: RemoteGitCheckpointServicing, @unchecked Sendable {
+    /// The steps `seedProjectIfNeeded` would take, in order, without taking
+    /// them.
+    ///
+    /// Written from the same values the real call uses so the two cannot drift
+    /// into describing different work. Preconditions are listed as steps
+    /// because they are where this usually stops.
+    nonisolated func seedPlan(sshTarget: String, remoteRoot: String, localOrigin: String) -> [String] {
+        [
+            "check local origin \(localOrigin) is a clean Git worktree",
+            "read local HEAD (git -C \(localOrigin) rev-parse HEAD)",
+            "ssh \(sshTarget): if \(remoteRoot) is a worktree, require its HEAD to equal that base",
+            "ssh \(sshTarget): otherwise require \(remoteRoot) to be absent or empty, then git init -b term-mesh-base",
+            "git push \(sshTarget):\(remoteRoot) HEAD:refs/heads/term-mesh-base (only when freshly initialised)",
+            "verify the remote HEAD now equals the local base",
+        ]
+    }
+
+    /// The steps `checkpointAndFetch` would take, in order, without taking them.
+    nonisolated func checkpointPlan(sshTarget: String, remoteRoot: String, localOrigin: String) -> [String] {
+        [
+            "ssh \(sshTarget): commit the current state of \(remoteRoot) onto a fresh refs/term-mesh/checkpoints/<id>",
+            "fetch that ref into refs/term-mesh/incoming/<id> in \(localOrigin)",
+            "record the checkpoint so it appears under Incoming for review",
+        ]
+    }
+
+
     static let shared = RemoteGitCheckpointService()
 
     private let queue = DispatchQueue(label: "com.termmesh.remote-checkpoint", qos: .utility)

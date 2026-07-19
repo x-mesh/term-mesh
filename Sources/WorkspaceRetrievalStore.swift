@@ -11,6 +11,26 @@ final class WorkspaceRetrievalStore: ObservableObject {
     @Published var selectedChangesetID: ChangesetID?
     @Published var pendingClosePanelID: UUID?
     @Published var errorMessage: String?
+    /// How much the remote-work path reports into Live Activity.
+    @Published var logLevel: RemoteWorkLogLevel = .info {
+        didSet {
+            RemoteWorkLog.level = logLevel
+            UserDefaults.standard.set(logLevel.rawValue, forKey: Self.logLevelKey)
+        }
+    }
+    /// Describe what an action would do, and do nothing.
+    ///
+    /// These actions reach across a network and rewrite a Git worktree on
+    /// another machine, and their preconditions are strict enough that a
+    /// refusal is the common outcome. Being able to ask "what would this do,
+    /// and would it even get past the guards" without committing to it is the
+    /// difference between reading a plan and discovering it afterwards.
+    @Published var dryRun: Bool = false {
+        didSet { UserDefaults.standard.set(dryRun, forKey: Self.dryRunKey) }
+    }
+
+    private static let logLevelKey = "termmesh.remotework.logLevel"
+    private static let dryRunKey = "termmesh.remotework.dryRun"
     @Published var visiblePresentations: Set<WorkspaceRetrievalPresentation> {
         didSet { persistPresentations() }
     }
@@ -51,6 +71,129 @@ final class WorkspaceRetrievalStore: ObservableObject {
 
     var selectedPane: WorkspaceRemotePaneRecord? {
         panes.first { $0.id == selectedPaneID } ?? panes.first
+    }
+
+    /// The project pair the actions operate on.
+    ///
+    /// A project pair, not a pane: preparing a project and taking a checkpoint
+    /// are about two folders, and the pane is only how one of them came to be
+    /// known. Targeting a pane made the subject of the action impossible to
+    /// state — "Prepare Project → shell 11" says nothing about which folders
+    /// are involved.
+    @Published var selectedBindingID: ProjectBindingID?
+
+    var selectedBinding: ProjectBinding? {
+        projectBindings.first { $0.id == selectedBindingID } ?? projectBindings.first
+    }
+
+    /// Where a remote pane's shell is RIGHT NOW, when the terminal has told us.
+    ///
+    /// `pane.remoteRoot` is the directory the pane was spawned in and, as the
+    /// protocol says, does not follow a later `cd` — so a shell the user has
+    /// navigated somewhere else reports a stale path or none at all. The
+    /// terminal itself does know: a shell emitting OSC 7 updates the panel's
+    /// directory on every `cd`, remote panes included, because that sequence
+    /// rides the relay like any other output.
+    var liveDirectoryForPane: ((UUID) -> String?)?
+
+    func currentDirectory(of pane: WorkspaceRemotePaneRecord) -> String {
+        let live = liveDirectoryForPane?(pane.panelID)
+        RemoteWorkLog.debug(
+            "cwd lookup panel=\(pane.panelID.uuidString.prefix(8)) live=\(live ?? "<none>") spawn=\(pane.remoteRoot.isEmpty ? "<empty>" : pane.remoteRoot)"
+        )
+        if let live, live.hasPrefix("/") { return live }
+        // Nothing live means the shell never reported one: OSC 7 is how a
+        // terminal learns the working directory, and a shell that does not emit
+        // it leaves only the spawn-time value, which does not follow `cd`.
+        RemoteWorkLog.debug("cwd falling back to the spawn-time directory (no OSC 7 seen for this pane)")
+        return pane.remoteRoot
+    }
+
+    /// Bind a folder pair by hand, for a remote shell that was opened without a
+    /// project — which is every shell that did not spawn inside one, because
+    /// the remote directory is captured at spawn and does not follow a `cd`.
+    @discardableResult
+    func addBinding(peerID: String, localRoot: String, remoteRoot: String) -> ProjectBinding? {
+        let local = localRoot.trimmingCharacters(in: .whitespacesAndNewlines)
+        let remote = remoteRoot.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !peerID.isEmpty, local.hasPrefix("/"), remote.hasPrefix("/") else {
+            errorMessage = "A project needs a peer and absolute local and remote paths."
+            return nil
+        }
+        if let existing = projectBindings.first(where: { $0.peerID == peerID && $0.remoteRoot == remote }) {
+            selectedBindingID = existing.id
+            return existing
+        }
+        let binding = ProjectBinding(
+            workspaceID: workspaceID, peerID: peerID, localRoot: local, remoteRoot: remote
+        )
+        projectBindings.append(binding)
+        selectedBindingID = binding.id
+        persistRecoveryState()
+        return binding
+    }
+
+    /// Re-point an existing project at different folders.
+    ///
+    /// Keeps the id so anything already referring to this project — a
+    /// checkpoint record, the current selection — still resolves. The peer's
+    /// folder may already have been seeded from the OLD local repository, so a
+    /// changed pair usually needs Prepare Project run again; that is a decision
+    /// for the user, not something to do silently on their behalf.
+    @discardableResult
+    func updateBinding(
+        id: ProjectBindingID,
+        peerID: String,
+        localRoot: String,
+        remoteRoot: String
+    ) -> Bool {
+        let local = localRoot.trimmingCharacters(in: .whitespacesAndNewlines)
+        let remote = remoteRoot.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !peerID.isEmpty, local.hasPrefix("/"), remote.hasPrefix("/") else {
+            errorMessage = "A project needs a peer and absolute local and remote paths."
+            return false
+        }
+        guard let index = projectBindings.firstIndex(where: { $0.id == id }) else { return false }
+        let clash = projectBindings.contains {
+            $0.id != id && $0.peerID == peerID && $0.remoteRoot == remote
+        }
+        guard !clash else {
+            errorMessage = "\(peerID) already has a project bound to \(remote)."
+            return false
+        }
+        projectBindings[index] = ProjectBinding(
+            id: id, workspaceID: workspaceID, peerID: peerID, localRoot: local, remoteRoot: remote
+        )
+        persistRecoveryState()
+        return true
+    }
+
+    func removeBinding(id: ProjectBindingID) {
+        projectBindings.removeAll { $0.id == id }
+        if selectedBindingID == id { selectedBindingID = projectBindings.first?.id }
+        persistRecoveryState()
+    }
+
+    /// A pane on the same host as `binding`, when one is attached. Used only to
+    /// hang activity and checkpoint state off something visible; the action
+    /// itself needs no pane.
+    func pane(for binding: ProjectBinding) -> WorkspaceRemotePaneRecord? {
+        panes.first { $0.hostLabel == binding.peerID && $0.remoteRoot == binding.remoteRoot }
+            ?? panes.first { $0.hostLabel == binding.peerID }
+    }
+
+    /// How the current target was arrived at, for the log and the header.
+    ///
+    /// The selection is sticky, not the focused pane — it is set when a pane
+    /// registers or when one is picked, and otherwise falls through to whatever
+    /// happens to be first. Actions that reach across a network should say
+    /// which pane they mean and why, rather than leaving it to be inferred.
+    var targetDescription: String {
+        guard let binding = selectedBinding else { return "no project bound" }
+        let how = selectedBindingID == nil
+            ? "defaulted to the only/first of \(projectBindings.count)"
+            : "explicitly selected"
+        return "\(binding.peerID): \(binding.remoteRoot) ↔ \(binding.localRoot) (\(how))"
     }
 
     var selectedChangeset: IncomingChangeset? {
@@ -132,6 +275,21 @@ final class WorkspaceRetrievalStore: ObservableObject {
     func failCheckpoint(panelID: UUID, message: String) {
         errorMessage = message
         updatePane(panelID: panelID) { pane in pane.state = .recoveryRequired }
+    }
+
+    /// Restore the drawer's diagnostic settings and route the log into Live
+    /// Activity for the currently selected pane.
+    func adoptLogSettings() {
+        if let raw = UserDefaults.standard.string(forKey: Self.logLevelKey),
+           let restored = RemoteWorkLogLevel(rawValue: raw) {
+            logLevel = restored
+        }
+        dryRun = UserDefaults.standard.bool(forKey: Self.dryRunKey)
+        RemoteWorkLog.level = logLevel
+        RemoteWorkLog.sink = { [weak self] message in
+            guard let self, let paneID = self.selectedPane?.id ?? self.panes.first?.id else { return }
+            self.recordActivity(paneID: paneID, message: message)
+        }
     }
 
     func recordActivity(paneID: RemotePaneID, message: String) {

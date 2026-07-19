@@ -1,3 +1,4 @@
+import AppKit
 import SwiftUI
 
 private enum RetrievalDrawerTab: String, CaseIterable {
@@ -70,7 +71,12 @@ struct WorkspaceRetrievalSidebarSection: View {
                     .accessibilityLabel("\(pane.title), \(pane.hostLabel), \(lifetimeLabel(pane.lifetime)), \(pane.state.rawValue)")
                     .contextMenu {
                         Button("Prepare Current Project") {
-                            Task { await workspace.seedRemoteProject(panelID: pane.panelID) }
+                            // Select this pane's project first: the action is
+                            // about a folder pair, and the menu names a pane.
+                            if let binding = store.projectBinding(for: pane) {
+                                store.selectedBindingID = binding.id
+                            }
+                            Task { await workspace.seedRemoteProject() }
                         }
                         if pane.lifetime == .temporary {
                             Button("Keep Alive") {
@@ -226,6 +232,8 @@ private struct RetrievalActivityDrawer: View {
     @ObservedObject var workspace: Workspace
     @ObservedObject private var store: WorkspaceRetrievalStore
     @State private var selectedTab: RetrievalDrawerTab = .activity
+    @State private var isEditingProject = false
+    @State private var editingBinding: ProjectBinding?
 
     init(workspace: Workspace) {
         self.workspace = workspace
@@ -243,17 +251,75 @@ private struct RetrievalActivityDrawer: View {
                 .pickerStyle(.segmented)
                 .frame(maxWidth: 440)
 
+                // Which pane the buttons act on. It was previously implicit —
+                // the last pane to register, or the first in the list — so a
+                // press could act on something other than what the user was
+                // looking at, with nothing on screen to say so.
+                if store.projectBindings.isEmpty {
+                    Text("No project bound")
+                        .font(.system(size: 11))
+                        .foregroundStyle(.secondary)
+                } else {
+                    Picker("Project", selection: Binding(
+                        get: { store.selectedBinding?.id },
+                        set: { store.selectedBindingID = $0 }
+                    )) {
+                        ForEach(store.projectBindings, id: \.id) { binding in
+                            Text("\(binding.peerID): \(binding.remoteRoot)").tag(Optional(binding.id))
+                        }
+                    }
+                    .frame(maxWidth: 260)
+                    .help("The project folder pair these actions act on.")
+                    .accessibilityIdentifier("retrieval.target")
+                }
+                Button {
+                    editingBinding = nil
+                    isEditingProject = true
+                } label: {
+                    Image(systemName: "plus")
+                }
+                .buttonStyle(.borderless)
+                .help("Bind a local folder to a folder on a peer.")
+                .accessibilityIdentifier("retrieval.addProject")
+                if let selected = store.selectedBinding {
+                    Button {
+                        editingBinding = selected
+                        isEditingProject = true
+                    } label: {
+                        Image(systemName: "pencil")
+                    }
+                    .buttonStyle(.borderless)
+                    .help("Change or remove this project's folders.")
+                    .accessibilityIdentifier("retrieval.editProject")
+                }
+
                 Spacer()
+
+                // Diagnostics live next to the buttons they explain: these
+                // actions cross a network and rewrite a Git worktree on another
+                // machine, and their preconditions refuse more often than they
+                // pass.
+                Toggle("Dry run", isOn: $store.dryRun)
+                    .toggleStyle(.checkbox)
+                    .help("Report what each action would do, without doing it.")
+                    .accessibilityIdentifier("retrieval.dryRun")
+                Picker("", selection: $store.logLevel) {
+                    ForEach(RemoteWorkLogLevel.allCases) { level in
+                        Text(level.label).tag(level)
+                    }
+                }
+                .pickerStyle(.segmented)
+                .frame(width: 116)
+                .help("How much the actions report into Live Activity.")
+
                 Button("Prepare Project") {
-                    guard let panelID = store.selectedPane?.panelID else { return }
-                    Task { await workspace.seedRemoteProject(panelID: panelID) }
+                    Task { await workspace.seedRemoteProject() }
                 }
-                .disabled(store.selectedPane?.sshTarget == nil)
+                .disabled(store.selectedBinding == nil)
                 Button("Checkpoint Now") {
-                    guard let panelID = store.selectedPane?.panelID else { return }
-                    Task { await workspace.checkpointRemotePane(panelID: panelID, closeAfterCheckpoint: false) }
+                    Task { await workspace.checkpointProject() }
                 }
-                .disabled(store.selectedPane == nil || store.selectedPane?.state == .checkpointing)
+                .disabled(store.selectedBinding == nil)
                 .accessibilityIdentifier("retrieval.checkpointNow")
                 Button {
                     store.visiblePresentations.remove(.drawer)
@@ -265,8 +331,62 @@ private struct RetrievalActivityDrawer: View {
             }
             .padding(.horizontal, 12)
             .frame(height: 38)
+            .onAppear {
+                store.adoptLogSettings()
+                // The drawer is where the live directory is needed, and the
+                // workspace is what knows it.
+                store.liveDirectoryForPane = { [weak workspace] panelID in
+                    guard let workspace else { return nil }
+                    let table = workspace.surfaceDirectories
+                    let hit = table[panelID]
+                    if hit == nil, !table.isEmpty {
+                        // The writer keys this table by the surface id and the
+                        // reader by the panel id. If those are different
+                        // namespaces the lookup silently misses, so show both
+                        // rather than leaving it to be guessed.
+                        let keys = table.keys.map { $0.uuidString.prefix(8) }.joined(separator: ", ")
+                        RemoteWorkLog.debug("cwd table has \(table.count) entr(ies) keyed [\(keys)] — none match panel \(panelID.uuidString.prefix(8))")
+                    }
+                    return hit
+                }
+            }
+            .sheet(isPresented: $isEditingProject) {
+                ProjectBindingSheet(
+                    store: store,
+                    isPresented: $isEditingProject,
+                    editing: editingBinding
+                )
+            }
 
             Divider()
+
+            // Failures used to be written to `errorMessage` and rendered only
+            // inside the close-confirmation sheet, so a button that refused to
+            // act looked like a button that did nothing. Show it here, where the
+            // press happened.
+            if let message = store.errorMessage {
+                HStack(alignment: .top, spacing: 8) {
+                    Image(systemName: "exclamationmark.triangle.fill")
+                        .foregroundStyle(.orange)
+                    Text(message)
+                        .font(.system(size: 11))
+                        .foregroundStyle(.primary)
+                        .textSelection(.enabled)
+                        .fixedSize(horizontal: false, vertical: true)
+                    Spacer(minLength: 4)
+                    Button {
+                        store.errorMessage = nil
+                    } label: {
+                        Image(systemName: "xmark")
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityLabel("Dismiss")
+                }
+                .padding(.horizontal, 12)
+                .padding(.vertical, 8)
+                .background(Color.orange.opacity(0.12))
+                Divider()
+            }
 
             Group {
                 switch selectedTab {
@@ -284,6 +404,37 @@ private struct RetrievalActivityDrawer: View {
     }
 
     private var activityList: some View {
+        VStack(spacing: 0) {
+            HStack {
+                Text("\(store.activity.count) event(s)")
+                    .font(.system(size: 10))
+                    .foregroundStyle(.secondary)
+                Spacer()
+                Button("Copy All") {
+                    let text = store.activity.reversed().map { event in
+                        let stamp = event.occurredAt.formatted(date: .omitted, time: .standard)
+                        return "\(stamp)  \(event.message)"
+                    }.joined(separator: "\n")
+                    NSPasteboard.general.clearContents()
+                    NSPasteboard.general.setString(text, forType: .string)
+                }
+                .controlSize(.small)
+                .disabled(store.activity.isEmpty)
+                .accessibilityIdentifier("retrieval.copyActivity")
+                Button("Reveal Log") {
+                    NSWorkspace.shared.selectFile(RemoteWorkLog.path, inFileViewerRootedAtPath: "")
+                }
+                .controlSize(.small)
+                .help(RemoteWorkLog.path)
+            }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 6)
+            Divider()
+            activityEvents
+        }
+    }
+
+    private var activityEvents: some View {
         ScrollView {
             LazyVStack(alignment: .leading, spacing: 8) {
                 ForEach(store.activity.prefix(40)) { event in
@@ -293,6 +444,8 @@ private struct RetrievalActivityDrawer: View {
                             .foregroundStyle(.secondary)
                         Text(event.message)
                             .font(.system(size: 11))
+                            .textSelection(.enabled)
+                            .fixedSize(horizontal: false, vertical: true)
                     }
                 }
             }
@@ -524,5 +677,164 @@ private struct RetrievalCloseGate: View {
             .shadow(color: .black.opacity(0.28), radius: 8, y: 4)
         }
         .accessibilityIdentifier("retrieval.closeGate")
+    }
+}
+
+/// Bind a local folder to one on a peer.
+///
+/// Needed because the automatic binding only happens when a remote pane spawns
+/// inside a project directory — a shell opened anywhere else never gets one,
+/// and the remote path is captured at spawn and does not follow a later `cd`.
+/// Without this the actions had no subject and simply refused.
+private struct ProjectBindingSheet: View {
+    @ObservedObject var store: WorkspaceRetrievalStore
+    @Binding var isPresented: Bool
+    /// nil adds a project; a value edits that one.
+    let editing: ProjectBinding?
+
+    @State private var peerID: String = ""
+    @State private var localRoot: String = ""
+    @State private var remoteRoot: String = ""
+    @State private var confirmingDelete = false
+
+    /// Hosts with a pane attached — the only ones an action could reach.
+    private var hosts: [String] {
+        Array(Set(store.panes.map(\.hostLabel))).sorted()
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            Text(editing == nil ? "Bind a Project" : "Edit Project")
+                .font(.headline)
+            Text("Prepare Project and Checkpoint act on a pair of folders — one here, one on a peer.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+
+            Grid(alignment: .leading, horizontalSpacing: 10, verticalSpacing: 10) {
+                GridRow {
+                    Text("Peer").font(.caption).foregroundStyle(.secondary)
+                    if hosts.isEmpty {
+                        Text("No peer is connected.").font(.caption).foregroundStyle(.orange)
+                    } else {
+                        Picker("", selection: $peerID) {
+                            ForEach(hosts, id: \.self) { Text($0).tag($0) }
+                        }
+                        .labelsHidden()
+                        .frame(width: 260, alignment: .leading)
+                    }
+                }
+                GridRow {
+                    Text("On the peer").font(.caption).foregroundStyle(.secondary)
+                    TextField("/absolute/path/on/peer", text: $remoteRoot)
+                        .textFieldStyle(.roundedBorder)
+                        .font(.system(.caption, design: .monospaced))
+                        .frame(width: 320)
+                }
+                GridRow {
+                    Text("This Mac").font(.caption).foregroundStyle(.secondary)
+                    HStack(spacing: 6) {
+                        TextField("/absolute/path/here", text: $localRoot)
+                            .textFieldStyle(.roundedBorder)
+                            .font(.system(.caption, design: .monospaced))
+                            .frame(width: 250)
+                        Button("Choose…", action: chooseLocal).controlSize(.small)
+                    }
+                }
+            }
+
+            VStack(alignment: .leading, spacing: 3) {
+                Text("Prepare Project seeds the peer FROM this Mac, once.")
+                Text("Checkpoint brings the peer's work BACK as a commit, for review under Incoming. It never writes your working tree.")
+            }
+            .font(.caption2)
+            .foregroundStyle(.secondary)
+            .fixedSize(horizontal: false, vertical: true)
+
+            Text("The local folder must be a Git repository: a checkpoint is a commit, fetched home for review.")
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+
+            if let editing, pathsChanged(from: editing) {
+                Label(
+                    "The peer folder was seeded from the previous local repository. Run Prepare Project again after saving.",
+                    systemImage: "info.circle"
+                )
+                .font(.caption2)
+                .foregroundStyle(.orange)
+                .fixedSize(horizontal: false, vertical: true)
+            }
+
+            HStack {
+                if let editing {
+                    Button("Remove", role: .destructive) { confirmingDelete = true }
+                        .confirmationDialog(
+                            "Remove this project binding?",
+                            isPresented: $confirmingDelete,
+                            titleVisibility: .visible
+                        ) {
+                            Button("Remove", role: .destructive) {
+                                store.removeBinding(id: editing.id)
+                                RemoteWorkLog.info("Removed project \(editing.peerID): \(editing.remoteRoot)")
+                                isPresented = false
+                            }
+                            Button("Cancel", role: .cancel) {}
+                        } message: {
+                            Text("Nothing on either machine is deleted — only this pairing is forgotten.")
+                        }
+                }
+                Spacer()
+                Button("Cancel") { isPresented = false }
+                Button(editing == nil ? "Bind" : "Save") {
+                    if let editing {
+                        let ok = store.updateBinding(
+                            id: editing.id, peerID: peerID, localRoot: localRoot, remoteRoot: remoteRoot
+                        )
+                        if ok {
+                            RemoteWorkLog.info("Project now \(peerID): \(remoteRoot) ↔ \(localRoot)")
+                            isPresented = false
+                        }
+                    } else {
+                        store.addBinding(peerID: peerID, localRoot: localRoot, remoteRoot: remoteRoot)
+                        RemoteWorkLog.info("Bound project \(peerID): \(remoteRoot) ↔ \(localRoot)")
+                        isPresented = false
+                    }
+                }
+                .keyboardShortcut(.defaultAction)
+                .disabled(peerID.isEmpty || !localRoot.hasPrefix("/") || !remoteRoot.hasPrefix("/"))
+            }
+        }
+        .padding(18)
+        .frame(width: 460)
+        .onAppear {
+            if let editing {
+                peerID = editing.peerID
+                localRoot = editing.localRoot
+                remoteRoot = editing.remoteRoot
+                return
+            }
+            // Default to the pane the user is looking at: its host, and the
+            // directory it was spawned in. That is almost always the project
+            // being bound, and typing an absolute remote path by hand is the
+            // step most likely to be got wrong.
+            let source = store.selectedPane ?? store.panes.first
+            if peerID.isEmpty { peerID = source?.hostLabel ?? hosts.first ?? "" }
+            if remoteRoot.isEmpty, let source {
+                remoteRoot = store.currentDirectory(of: source)
+            }
+        }
+    }
+
+    private func pathsChanged(from binding: ProjectBinding) -> Bool {
+        localRoot != binding.localRoot || remoteRoot != binding.remoteRoot
+    }
+
+    private func chooseLocal() {
+        let panel = NSOpenPanel()
+        panel.canChooseDirectories = true
+        panel.canChooseFiles = false
+        panel.allowsMultipleSelection = false
+        if panel.runModal() == .OK, let url = panel.url { localRoot = url.path }
     }
 }
