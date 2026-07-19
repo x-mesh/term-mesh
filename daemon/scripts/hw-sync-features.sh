@@ -189,12 +189,24 @@ echo "-- directory deletes --"
 #               alone, rather than the directory being renamed away with the
 #               user's work inside it.
 mkdir -p "$LOCAL_PATH/dir-drain/nested" "$LOCAL_PATH/dir-keep"
+chmod 0755 "$LOCAL_PATH/dir-drain"
+chmod 0750 "$LOCAL_PATH/dir-keep"
 printf 'leaf'  > "$LOCAL_PATH/dir-drain/nested/leaf.txt"
 printf 'tracked' > "$LOCAL_PATH/dir-keep/tracked.txt"
 sync_must_succeed "directory seed sync failed"
 remote_exists "$REMOTE_PATH/dir-drain/nested/leaf.txt" || die "the seeded subtree never reached the peer"
 remote_exists "$REMOTE_PATH/dir-keep/tracked.txt"      || die "dir-keep never reached the peer"
 ok "seeded a nested subtree on the peer"
+
+# Directory permissions travel with the directory, like a file's do. Distinct
+# modes per directory: installing everything at one default would narrow a
+# shared directory or widen a private one. 0o750 also proves the search bit is
+# not simply forced on for everyone.
+[ "$(remote_mode "$REMOTE_PATH/dir-drain")" = "drwxr-xr-x" ] \
+  || die "a pushed directory lost its mode: $(remote_mode "$REMOTE_PATH/dir-drain")"
+[ "$(remote_mode "$REMOTE_PATH/dir-keep")" = "drwxr-x---" ] \
+  || die "a group-only directory was widened by syncing: $(remote_mode "$REMOTE_PATH/dir-keep")"
+ok "directory permissions preserved (0755, 0750)"
 
 # Untracked-by-construction: `.git` is the one name the scanner skips, so this
 # file exists on the peer's disk and in no manifest.

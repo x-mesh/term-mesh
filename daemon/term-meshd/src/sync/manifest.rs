@@ -16,8 +16,9 @@ pub struct ManifestEntry {
     pub relative_path: String,
     pub kind: EntryKind,
     pub executable: bool,
-    /// POSIX permission bits (`0o777`) for a FILE; `0` for directories and
-    /// symlinks, whose modes this manifest does not track.
+    /// POSIX permission bits (`0o777`) for a FILE or a DIRECTORY; `0` for
+    /// symlinks, whose own mode is meaningless, and for a directory whose
+    /// source did not report one.
     ///
     /// setuid/setgid/sticky are deliberately excluded — a peer must not be able
     /// to push a setuid binary onto another machine. `executable` is kept as the
@@ -43,8 +44,37 @@ pub fn assumed_file_mode(executable: bool) -> u16 {
     }
 }
 
-/// The `mode` a non-file entry carries: none. Directory and symlink permissions
-/// are not tracked (see [`ManifestEntry::mode`]).
+/// Strip a directory's permission bits from `entries`, for a peer that does not
+/// understand them (no `DIRECTORY_MODE_CAPABILITY`).
+///
+/// Such a peer rejects a directory whose mode or search bit is set — both its
+/// manifest decoder and its push decoder treat those as canonically zero — so
+/// sending one fails the whole exchange. Blanking costs nothing semantically:
+/// the reconcile is deliberately blind to a directory's mode either way, so
+/// both sides classify exactly as they did before this existed.
+pub fn blank_directory_modes(entries: &[ManifestEntry]) -> Vec<ManifestEntry> {
+    entries
+        .iter()
+        .map(|entry| {
+            if entry.kind == EntryKind::Directory {
+                ManifestEntry {
+                    executable: false,
+                    mode: NO_MODE,
+                    ..entry.clone()
+                }
+            } else {
+                entry.clone()
+            }
+        })
+        .collect()
+}
+
+/// The `mode` an entry carries when its permissions are unknown.
+///
+/// A symlink always uses it — its own mode means nothing, the target's applies.
+/// A directory uses it only when the source could not tell us: a peer without
+/// `DIRECTORY_MODE_CAPABILITY` sends this, and the receiver then installs its
+/// own conservative default rather than a mode it invented.
 pub const NO_MODE: u16 = 0;
 
 /// Whether `mode` agrees with `executable`. The two are stored separately —
@@ -53,10 +83,13 @@ pub const NO_MODE: u16 = 0;
 pub fn mode_matches_executable(kind: EntryKind, mode: u16, executable: bool) -> bool {
     match kind {
         EntryKind::File => mode & 0o777 == mode && (mode & 0o111 != 0) == executable,
-        // Non-files carry no mode at all. Their executable bit is not checked:
-        // it means nothing here (a directory's search bit is not something this
-        // manifest installs), so it is left to the scanner to report.
-        _ => mode == NO_MODE,
+        // A directory carries its real permission bits, or NO_MODE from a peer
+        // that does not track them (see `DIRECTORY_MODE_CAPABILITY`). Its
+        // executable bit is not cross-checked: a directory's x bit is a search
+        // bit, and the scanner reports it independently of the mode.
+        EntryKind::Directory => mode == NO_MODE || mode & 0o777 == mode,
+        // A symlink's own mode is meaningless — the target's applies.
+        EntryKind::Symlink => mode == NO_MODE,
     }
 }
 
@@ -234,11 +267,11 @@ fn validate_entry_shape(entry: &ManifestEntry) -> Result<(), ManifestError> {
     let zero_hash = entry.content_hash == [0; 32];
     match entry.kind {
         EntryKind::File if entry.symlink_target.is_none() => Ok(()),
+        // A directory carries permission bits and the search bit they imply.
+        // Everything else about it is still canonically zero: it has no content
+        // and no target, so nothing else may vary.
         EntryKind::Directory
-            if !entry.executable
-                && entry.length == 0
-                && zero_hash
-                && entry.symlink_target.is_none() =>
+            if entry.length == 0 && zero_hash && entry.symlink_target.is_none() =>
         {
             Ok(())
         }

@@ -648,7 +648,10 @@ fn files_directories_symlinks_and_deletes_apply_as_one_visible_generation() {
         entries: vec![
             ApplyPlanEntry {
                 relative_path: "new-dir".to_owned(),
-                action: ApplyAction::Directory { executable: true },
+                action: ApplyAction::Directory {
+                    executable: true,
+                    mode: 0o755,
+                },
                 precondition: ApplyPrecondition::Absent,
             },
             ApplyPlanEntry {
@@ -676,7 +679,10 @@ fn files_directories_symlinks_and_deletes_apply_as_one_visible_generation() {
             },
             ApplyPlanEntry {
                 relative_path: "old-dir".to_owned(),
-                action: ApplyAction::Directory { executable: true },
+                action: ApplyAction::Directory {
+                    executable: true,
+                    mode: 0o755,
+                },
                 precondition: ApplyPrecondition::Present(old_directory),
             },
         ],
@@ -1089,6 +1095,119 @@ fn an_unfinishable_rollback_blocks_instead_of_wedging_the_project() {
     reopened
         .recover(&root, project)
         .expect("a blocked operation must be skipped by recovery, not retried");
+}
+
+/// A directory is installed with the mode its source reported, and a source
+/// mode that would lock the apply out of its own tree is only applied once the
+/// leaves are in. `0o500` has no owner-write: creating at it would make the
+/// child install fail, so the mode has to land afterwards.
+#[test]
+fn a_directory_gets_its_source_mode_after_its_children_land() {
+    let temporary = tempfile::tempdir().unwrap();
+    let root = temporary.path().join("project");
+    let project = ProjectId::from_bytes([51; 32]);
+    fs::create_dir_all(&root).unwrap();
+    let cas = CasStore::open(
+        temporary.path().join("cas"),
+        CasLimits::default(),
+        Arc::new(FixedKeys),
+    )
+    .unwrap();
+    let object_domain = domain(project);
+    let contents = b"inside";
+    let object_id = install(&cas, object_domain, contents);
+    let store = ApplyStore::open(temporary.path().join("state/apply.sqlite")).unwrap();
+
+    let plan = ApplyPlan {
+        operation_id: [51; 16],
+        project,
+        target_manifest_root: [51; 32],
+        frontier: vec![5, 1],
+        entries: vec![
+            ApplyPlanEntry {
+                relative_path: "wide".to_owned(),
+                action: ApplyAction::Directory {
+                    executable: true,
+                    mode: 0o755,
+                },
+                precondition: ApplyPrecondition::Absent,
+            },
+            ApplyPlanEntry {
+                relative_path: "locked".to_owned(),
+                action: ApplyAction::Directory {
+                    executable: true,
+                    mode: 0o500,
+                },
+                precondition: ApplyPrecondition::Absent,
+            },
+            ApplyPlanEntry {
+                relative_path: "locked/file".to_owned(),
+                action: ApplyAction::File {
+                    object_id,
+                    content_hash: *blake3::hash(contents).as_bytes(),
+                    length: contents.len() as u64,
+                    executable: false,
+                    mode: assumed_file_mode(false),
+                },
+                precondition: ApplyPrecondition::Absent,
+            },
+        ],
+    };
+
+    store.apply(&root, &cas, object_domain, &plan).unwrap();
+
+    let mode_of = |name: &str| {
+        fs::metadata(root.join(name)).unwrap().permissions().mode() & 0o777
+    };
+    assert_eq!(mode_of("wide"), 0o755, "a shared directory must not be narrowed");
+    assert_eq!(
+        mode_of("locked"),
+        0o500,
+        "the source mode must be restored after the children land"
+    );
+    // The child really did land, which is what the deferred chmod buys.
+    assert_eq!(fs::read(root.join("locked/file")).unwrap(), contents);
+}
+
+/// A peer that does not report directory modes sends `NO_MODE`. Guessing wider
+/// than the source would hand out access the original never granted, so the
+/// fallback is private-but-traversable — the same reasoning `assumed_file_mode`
+/// uses for files.
+#[test]
+fn a_directory_without_a_reported_mode_is_installed_private() {
+    let temporary = tempfile::tempdir().unwrap();
+    let root = temporary.path().join("project");
+    let project = ProjectId::from_bytes([52; 32]);
+    fs::create_dir_all(&root).unwrap();
+    let cas = CasStore::open(
+        temporary.path().join("cas"),
+        CasLimits::default(),
+        Arc::new(FixedKeys),
+    )
+    .unwrap();
+    let store = ApplyStore::open(temporary.path().join("state/apply.sqlite")).unwrap();
+
+    let plan = ApplyPlan {
+        operation_id: [52; 16],
+        project,
+        target_manifest_root: [52; 32],
+        frontier: vec![5, 2],
+        entries: vec![ApplyPlanEntry {
+            relative_path: "unknown-mode".to_owned(),
+            action: ApplyAction::Directory {
+                executable: false,
+                mode: NO_MODE,
+            },
+            precondition: ApplyPrecondition::Absent,
+        }],
+    };
+
+    store.apply(&root, &cas, domain(project), &plan).unwrap();
+    assert_eq!(
+        fs::metadata(root.join("unknown-mode")).unwrap().permissions().mode() & 0o777,
+        0o700,
+        "an unreported directory mode must not be widened to 0o755"
+    );
 }
 
 #[test]

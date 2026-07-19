@@ -17,7 +17,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use sync_protocol::{SyncHello, PROJECT_SYNC_CAPABILITY, PROTOCOL_V1};
+use sync_protocol::{
+    SyncHello, DIRECTORY_MODE_CAPABILITY, PROJECT_SYNC_CAPABILITY, PROTOCOL_V1,
+};
 
 use super::{
     exchange_manifests, receive_push, respond_to_fetch, scan_project_entries, HeldProjectRoot,
@@ -38,7 +40,12 @@ fn server_hello(context: &SyncContext) -> Option<SyncHello> {
         roster_epoch: context.roster_epoch,
         selected_version: PROTOCOL_V1,
         version_offers: vec![PROTOCOL_V1],
-        capabilities: vec![PROJECT_SYNC_CAPABILITY.into()],
+        // Must stay unique and ASCII-sorted: `validate_hello_parts`
+            // rejects any other order.
+            capabilities: vec![
+                DIRECTORY_MODE_CAPABILITY.into(),
+                PROJECT_SYNC_CAPABILITY.into(),
+            ],
         nonce,
     })
 }

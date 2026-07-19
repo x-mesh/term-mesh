@@ -58,6 +58,14 @@ pub enum ApplyAction {
     },
     Directory {
         executable: bool,
+        /// Permission bits to end up with, or [`NO_MODE`](super::NO_MODE) when
+        /// the source did not report any (a peer without
+        /// `DIRECTORY_MODE_CAPABILITY`), in which case a conservative private
+        /// default is installed instead of an invented mode.
+        ///
+        /// Masked to `0o777` on use, so setuid/setgid/sticky can never be
+        /// created here even if one reached this far.
+        mode: u16,
     },
     Symlink {
         target: String,
@@ -519,6 +527,7 @@ impl ApplyStore {
             }
             return Err(error);
         }
+        self.restore_directory_modes(&sandbox, plan)?;
         let state = self.commit_visible(plan)?;
         hook.after_boundary(ApplyBoundary::Committed)?;
         self.cleanup_operation(&sandbox, plan.operation_id, hook)?;
@@ -647,13 +656,14 @@ impl ApplyStore {
                     hook.after_io(ApplyIoPoint::TempFsync)?;
                     sandbox.sync_temp_work(hook)?;
                 }
-                ApplyAction::Directory { executable: _ } => {
-                    // A directory must carry its owner search (x) bit or nothing
-                    // can be created inside it. The manifest does not track
-                    // directory permission bits (the scanner always reports a
-                    // directory as non-executable), so create it private but
-                    // traversable rather than deriving a mode that omits x.
-                    sandbox.create_temp_directory(&temp, 0o700, hook)?;
+                ApplyAction::Directory { executable: _, mode } => {
+                    // Create with the owner bits forced on: this operation still
+                    // has to write the leaves into it, and a source mode without
+                    // owner-write or owner-search would lock us out of our own
+                    // install. The real mode is restored once the leaves have
+                    // landed (see `restore_directory_modes`).
+                    let target = directory_target_mode(*mode);
+                    sandbox.create_temp_directory(&temp, target | 0o700, hook)?;
                 }
                 ApplyAction::Symlink { target } => {
                     sandbox.create_temp_symlink(&temp, target, hook)?;
@@ -719,6 +729,40 @@ impl ApplyStore {
                 "installed_durable",
             )?;
             hook.after_boundary(ApplyBoundary::InstalledDurable(ordinal))?;
+        }
+        Ok(())
+    }
+
+    /// Put every installed directory on its real mode, once the whole plan has
+    /// landed.
+    ///
+    /// Deferred on purpose. Directories are applied before the leaves that go
+    /// inside them, so a directory has to stay owner-writable and owner-search
+    /// for as long as this operation is still installing into it; a source mode
+    /// like `0o555` would otherwise lock the apply out of its own tree. Setting
+    /// the final mode here — after the last entry — is the only point where
+    /// both the real mode and a complete subtree are true at once.
+    ///
+    /// Deliberately outside the journal. A crash between install and chmod
+    /// leaves a directory owner-widened, which is visible to the next scan as a
+    /// mode change and re-proposed like any other — narrowing later is safe,
+    /// whereas journaling a chmod would need its own rollback record for a
+    /// state the next sync already repairs.
+    fn restore_directory_modes(
+        &self,
+        sandbox: &PathSandbox,
+        plan: &ApplyPlan,
+    ) -> Result<(), ApplyError> {
+        for entry in &plan.entries {
+            let ApplyAction::Directory { mode, .. } = &entry.action else {
+                continue;
+            };
+            let target = directory_target_mode(*mode);
+            if target == target | 0o700 {
+                // Creation already used exactly this mode.
+                continue;
+            }
+            sandbox.set_directory_mode(&entry.relative_path, target)?;
         }
         Ok(())
     }
@@ -1203,6 +1247,21 @@ fn precondition_matches(expected: &ApplyPrecondition, actual: Option<&PathFinger
             expected == actual && expected.digest() == actual.digest()
         }
         _ => false,
+    }
+}
+
+/// The permission bits to install a directory with.
+///
+/// `NO_MODE` means the source did not report one — a peer without
+/// `DIRECTORY_MODE_CAPABILITY`. Fall back to private-but-traversable rather
+/// than inventing `0o755`: guessing wider than the source would hand out access
+/// the original directory never granted, the same reasoning `assumed_file_mode`
+/// uses.
+fn directory_target_mode(mode: u16) -> u32 {
+    if mode == super::NO_MODE {
+        0o700
+    } else {
+        u32::from(mode) & 0o777
     }
 }
 

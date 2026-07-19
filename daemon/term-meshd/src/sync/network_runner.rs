@@ -19,12 +19,15 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use sync_protocol::{SyncHello, PROJECT_SYNC_CAPABILITY, PROTOCOL_V1};
+use sync_protocol::{
+    SyncHello, DIRECTORY_MODE_CAPABILITY, PROJECT_SYNC_CAPABILITY, PROTOCOL_V1,
+};
 
 use super::{
     build_apply_plan, decode_manifest_batch, encode_manifest_batches, reconcile_bidirectional,
     apply_deletes, check_delete_guard, run_fetch_pull, run_push,
-    scan_conflicts, ApplyStore, CasStore, DeviceTlsIdentity, FetchEntry, ManifestBuilder,
+    blank_directory_modes, scan_conflicts, ApplyStore, CasStore, DeviceTlsIdentity, FetchEntry,
+    ManifestBuilder,
     ManifestEntry, ManifestScanner, ObjectDomain, ObjectType, OperationResult, OperationSpec,
     ProjectId, ScanCheckpoint, ScanError, ScanLimits, ScanObserver, ScanReason, StreamLane,
     SyncConnection, SyncEndpoint, SyncTransport, TrustStore,
@@ -115,6 +118,16 @@ pub async fn exchange_manifests(
     local: &[ManifestEntry],
 ) -> Result<Vec<ManifestEntry>, String> {
     let sender = connection.sender();
+    // A peer without the capability rejects a directory that carries permission
+    // bits, so send it the shape it understands. The reconcile ignores a
+    // directory's mode either way, so this changes no classification.
+    let blanked;
+    let local = if connection.peer_supports(DIRECTORY_MODE_CAPABILITY) {
+        local
+    } else {
+        blanked = blank_directory_modes(local);
+        &blanked
+    };
     let batches = encode_manifest_batches(local);
     // Send all local batches and receive all remote batches CONCURRENTLY. A
     // large manifest pages into many messages; "send everything, then receive"
@@ -220,7 +233,12 @@ impl NetworkSyncRunner {
             roster_epoch: ctx.roster_epoch,
             selected_version: PROTOCOL_V1,
             version_offers: vec![PROTOCOL_V1],
-            capabilities: vec![PROJECT_SYNC_CAPABILITY.into()],
+            // Must stay unique and ASCII-sorted: `validate_hello_parts`
+            // rejects any other order.
+            capabilities: vec![
+                DIRECTORY_MODE_CAPABILITY.into(),
+                PROJECT_SYNC_CAPABILITY.into(),
+            ],
             nonce,
         })
     }

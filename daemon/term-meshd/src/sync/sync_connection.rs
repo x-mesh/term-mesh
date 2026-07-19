@@ -122,6 +122,15 @@ impl SyncConnection {
         &self.auth.peer
     }
 
+    /// Whether the peer advertised `capability` in its hello. Used to keep a
+    /// wire choice off the link until the far side has said it understands it.
+    pub fn peer_supports(&self, capability: &str) -> bool {
+        self.auth
+            .peer_capabilities
+            .iter()
+            .any(|advertised| advertised == capability)
+    }
+
     /// A cloneable handle for enqueuing outbound messages from other tasks.
     pub fn sender(&self) -> StreamRouterSender {
         self.outbound.clone()

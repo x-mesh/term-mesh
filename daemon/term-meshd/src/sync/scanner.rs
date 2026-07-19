@@ -274,12 +274,17 @@ impl ManifestScanner {
                     &name,
                     libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
                 )?;
-                ensure_kind(&child_fd, libc::S_IFDIR)?;
+                let opened = ensure_kind(&child_fd, libc::S_IFDIR)?;
+                // Permission bits only, as for a file: setuid/setgid/sticky are
+                // never carried across machines. `executable` reports the search
+                // bit as observed; it is not derived from `mode`, because the two
+                // mean different things for a directory.
+                let mode = (opened.st_mode & 0o777) as u16;
                 pipeline.push(ManifestEntry {
                     relative_path: relative.clone(),
                     kind: EntryKind::Directory,
-                    executable: false,
-                    mode: crate::sync::NO_MODE,
+                    executable: mode & 0o111 != 0,
+                    mode,
                     length: 0,
                     content_hash: [0; 32],
                     symlink_target: None,

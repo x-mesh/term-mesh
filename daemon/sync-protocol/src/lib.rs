@@ -25,6 +25,16 @@ pub const KEY_ID_BYTES: usize = 16;
 pub const CONTROL_NONCE_BYTES: usize = 32;
 pub const SYNC_ALPN: &[u8] = b"term-mesh-sync/1";
 pub const PROJECT_SYNC_CAPABILITY: &str = "project-sync.v1";
+
+/// Advertised by a peer that records real directory permission bits in its
+/// manifest and installs them on apply.
+///
+/// Gated rather than versioned because the wire is backward-compatible in only
+/// one direction: a build without this rejects any non-zero directory mode
+/// outright (`push_bad_mode`), so sending one to a peer that has not advertised
+/// it fails the whole push. Absent the capability both sides keep sending
+/// `NO_MODE`, which every build understands.
+pub const DIRECTORY_MODE_CAPABILITY: &str = "dir-mode.v1";
 pub const MAX_CAPABILITIES: usize = 16;
 pub const MAX_CAPABILITY_BYTES: usize = 64;
 pub const MAX_SYNC_HELLO_BYTES: usize = 2048;

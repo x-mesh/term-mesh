@@ -16,6 +16,7 @@
 use std::collections::HashMap;
 use std::path::Path;
 
+use sync_protocol::DIRECTORY_MODE_CAPABILITY;
 use tokio::time::{timeout, Duration};
 
 use super::{
@@ -24,6 +25,25 @@ use super::{
     EncryptedChunk, EntryKind, FetchEntry,
     KeyId, ManifestEntry, ObjectDomain, ObjectId, ProjectId, ProjectKey, StreamLane, SyncConnection,
 };
+
+/// [`blank_directory_modes`](super::blank_directory_modes) for the fetch-entry
+/// shape the push wire uses.
+fn blank_directory_fetch_modes(entries: &[FetchEntry]) -> Vec<FetchEntry> {
+    entries
+        .iter()
+        .map(|entry| {
+            if entry.kind == EntryKind::Directory {
+                FetchEntry {
+                    executable: false,
+                    mode: super::NO_MODE,
+                    ..entry.clone()
+                }
+            } else {
+                entry.clone()
+            }
+        })
+        .collect()
+}
 
 const FETCH_TIMEOUT: Duration = Duration::from_secs(60);
 const NONCE_LEN: usize = 24;
@@ -458,6 +478,16 @@ pub async fn run_push(
     push: &[FetchEntry],
     deletes: &[String],
 ) -> Result<HashMap<String, ObjectId>, String> {
+    // Same capability gate as the manifest exchange: a peer that does not
+    // understand directory permission bits rejects the whole push if one
+    // carries them.
+    let blanked;
+    let push = if connection.peer_supports(DIRECTORY_MODE_CAPABILITY) {
+        push
+    } else {
+        blanked = blank_directory_fetch_modes(push);
+        &blanked
+    };
     let sender = connection.sender();
     let mut pushed = HashMap::new();
     sender

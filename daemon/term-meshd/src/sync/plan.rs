@@ -162,9 +162,34 @@ fn index_by_path(entries: &[ManifestEntry]) -> HashMap<&str, &ManifestEntry> {
 fn manifest_state_eq(a: Option<&ManifestEntry>, b: Option<&ManifestEntry>) -> bool {
     match (a, b) {
         (None, None) => true,
-        (Some(x), Some(y)) => x == y,
+        (Some(x), Some(y)) => directory_mode_blind_eq(x, y),
         _ => false,
     }
+}
+
+/// Entry equality that ignores a DIRECTORY's permission bits.
+///
+/// A directory's mode is carried when the directory is created, and only then:
+/// `build_apply_plan` skips a path the destination already holds as a directory,
+/// because a directory's precondition cannot be rebuilt from a manifest entry
+/// (its real fingerprint is recursive over the subtree). Comparing modes here
+/// would therefore classify a chmod as a change that no apply can consume — the
+/// base would advance as if it had converged while nothing moved, and the two
+/// sides would push the difference back and forth forever.
+///
+/// So a directory chmod does NOT propagate to a peer that already has the
+/// directory. Being blind to it is a smaller wrong than flapping on it, and the
+/// mode still lands wherever the directory is created.
+fn directory_mode_blind_eq(x: &ManifestEntry, y: &ManifestEntry) -> bool {
+    if x.kind == EntryKind::Directory && y.kind == EntryKind::Directory {
+        // `executable` is derived from the mode for a directory, so it has to
+        // be excluded with it.
+        return x.relative_path == y.relative_path
+            && x.length == y.length
+            && x.content_hash == y.content_hash
+            && x.symlink_target == y.symlink_target;
+    }
+    x == y
 }
 
 /// Reconcile `local` and `remote` against their last-synced `base`. Each path in
@@ -305,6 +330,7 @@ pub fn build_apply_plan(
         let action = match entry.kind {
             EntryKind::Directory => ApplyAction::Directory {
                 executable: entry.executable,
+                mode: entry.mode,
             },
             EntryKind::Symlink => {
                 // A symlink carries its target inline; skip a malformed entry

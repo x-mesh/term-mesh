@@ -60,6 +60,10 @@ impl HelloReplayCache {
 pub struct AuthenticatedConnection {
     pub connection: quinn::Connection,
     pub peer: TransportPeerSnapshot,
+    /// What the peer advertised in its hello. Kept past the handshake because
+    /// some wire choices are only safe once the far side has said it
+    /// understands them — see `DIRECTORY_MODE_CAPABILITY`.
+    pub peer_capabilities: Vec<String>,
     _permit: OwnedSemaphorePermit,
 }
 
@@ -151,6 +155,7 @@ impl SyncEndpoint {
         Ok(AuthenticatedConnection {
             connection,
             peer,
+            peer_capabilities: response.capabilities,
             _permit: permit,
         })
     }
@@ -180,6 +185,7 @@ impl SyncEndpoint {
         Ok(AuthenticatedConnection {
             connection,
             peer,
+            peer_capabilities: request.capabilities,
             _permit: permit,
         })
     }

@@ -81,7 +81,8 @@ pub use keychain::{
 };
 #[allow(unused_imports)]
 pub use manifest::{
-    assumed_file_mode, mode_matches_executable, EntryKind, Manifest, ManifestBuilder,
+    assumed_file_mode, blank_directory_modes, mode_matches_executable, EntryKind, Manifest,
+    ManifestBuilder,
     ManifestEntry, ManifestError, NO_MODE,
 };
 #[allow(unused_imports)]

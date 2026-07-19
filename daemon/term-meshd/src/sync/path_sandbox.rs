@@ -512,6 +512,22 @@ impl PathSandbox {
         }
     }
 
+    /// `chmod` an installed directory to `mode`.
+    ///
+    /// Opens the path with `O_DIRECTORY|O_NOFOLLOW` and chmods the DESCRIPTOR,
+    /// not the name: a path-based chmod could be redirected between the check
+    /// and the call, and this runs on a tree the peer's manifest named.
+    pub(crate) fn set_directory_mode(&self, path: &str, mode: u32) -> Result<(), PathSandboxError> {
+        self.revalidate_root()?;
+        let (parent, name) = self.open_parent(path, false)?;
+        let directory = open_directory_at(parent.as_raw_fd(), &name)?;
+        if unsafe { libc::fchmod(directory.as_raw_fd(), (mode & 0o777) as libc::mode_t) } != 0 {
+            return Err(PathSandboxError::Io(io::Error::last_os_error()));
+        }
+        directory.sync_all()?;
+        Ok(())
+    }
+
     pub(crate) fn target_identity(
         &self,
         path: &str,
