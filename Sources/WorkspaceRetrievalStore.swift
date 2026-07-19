@@ -130,6 +130,22 @@ final class WorkspaceRetrievalStore: ObservableObject {
     /// and a host that has gone away still yields its most recent answer.
     private var observedDirectories: [UUID: String] = [:]
 
+    /// Whether the host's answer should land in a field that was seeded with
+    /// `seed`.
+    ///
+    /// The comparison is against the seed and nothing else. Comparing against
+    /// the pane's spawn directory instead looks equivalent and is not: once a
+    /// directory has been remembered from an earlier look, the seed is that
+    /// remembered one, the spawn test fails, and the answer just fetched from
+    /// the host is thrown away — so a pane that has moved keeps suggesting
+    /// where it used to be.
+    ///
+    /// A field holding anything else is what the user typed while the host was
+    /// being asked, and that is their answer, not a placeholder to correct.
+    static func shouldAdoptHostAnswer(field: String, seed: String) -> Bool {
+        field == seed
+    }
+
     /// Bind a folder pair by hand, naming the local folder and the remote one.
     ///
     /// Explicit rather than inferred: a pane's directory says where a shell is,
