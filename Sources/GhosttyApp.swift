@@ -364,6 +364,27 @@ class GhosttyApp {
             let pasteboard = GhosttyPasteboardHelper.pasteboard(for: location)
             let value = pasteboard.flatMap { GhosttyPasteboardHelper.stringContents(from: $0) } ?? ""
 
+            // A picture or a Finder file pastes as a local PATH, which is what a
+            // CLI agent can act on. That path is meaningless on a peer, so when
+            // one is connected the bytes are sent across first and the peer's
+            // path is pasted instead. Off the main thread and completed later —
+            // ghostty keeps the request alive because we returned true — so a
+            // multi-megabyte screenshot does not freeze the UI.
+            // The clipboard callback already runs on the main actor, which is
+            // where the connection list lives; only the copy itself moves off it.
+            if let localPath = RemotePasteTransfer.localPath(from: value),
+               let target = MainActor.assumeIsolated({ RemotePasteTransfer.destination() }) {
+                DispatchQueue.global(qos: .userInitiated).async {
+                    let pasted = RemotePasteTransfer.send(localPath: localPath, to: target) ?? value
+                    DispatchQueue.main.async {
+                        pasted.withCString { ptr in
+                            ghostty_surface_complete_clipboard_request(surface, ptr, state, false)
+                        }
+                    }
+                }
+                return true
+            }
+
             value.withCString { ptr in
                 ghostty_surface_complete_clipboard_request(surface, ptr, state, false)
             }
