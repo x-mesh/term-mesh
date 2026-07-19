@@ -28,9 +28,17 @@ const NONCE_LEN: usize = 24;
 const HEADER_LEN: usize = 32 + 4 + NONCE_LEN;
 
 /// Number of `CHUNK_SIZE` chunks a plaintext of `len` bytes occupies.
+/// Chunks an object of `len` bytes occupies.
+///
+/// A zero-length object still has ONE chunk — an empty one. That is what the
+/// CAS counts (`validate_chunk_count`), and the two must agree: when this said
+/// zero, a sender wrote no chunk for an empty file, the receiver waited for
+/// none, and only the CAS objected, failing the whole transfer with
+/// `IncompleteObject`. An empty file is ordinary (`__init__.py`, `.gitkeep`),
+/// so a single one anywhere in a project broke its sync.
 pub fn chunk_count_for(len: u64) -> u32 {
     if len == 0 {
-        0
+        1
     } else {
         len.div_ceil(CHUNK_SIZE as u64) as u32
     }
@@ -51,16 +59,15 @@ pub fn put_plaintext(
     let mut staging = cas
         .begin_stage(domain, object_id, len)
         .map_err(|_| "cas_stage_failed".to_string())?;
-    // `chunks()` yields nothing for an empty slice, but the CAS counts a
-    // zero-length object as ONE chunk (`validate_chunk_count`) — so iterating
-    // the slice directly writes no chunk for an empty file and `finish` then
-    // rejects it as incomplete. An empty file is ordinary (`__init__.py`,
-    // `.gitkeep`), so it has to carry its one empty chunk.
+    // Not `plaintext.chunks(..)`: that yields nothing for an empty slice, while
+    // an empty object still owns one empty chunk. `chunk_count_for` is the one
+    // answer both the wire and the CAS use.
     let chunks: Vec<&[u8]> = if plaintext.is_empty() {
         vec![&[]]
     } else {
         plaintext.chunks(CHUNK_SIZE).collect()
     };
+    debug_assert_eq!(chunks.len() as u32, chunk_count_for(len));
     for (index, chunk) in chunks.into_iter().enumerate() {
         let envelope =
             encrypt_chunk_for_key(key, key_id, domain, object_id, len, index as u32, chunk)
